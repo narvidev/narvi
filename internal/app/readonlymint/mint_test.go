@@ -221,3 +221,47 @@ func TestMint_Success_LedgerFailureFailsTheMint(t *testing.T) {
 		t.Errorf("error = %v, typed as a scope refusal; a ledger failure is a different fault and callers map the two to different statuses", err)
 	}
 }
+
+// TestMintUnrecorded runs the same mint and scope check as Mint and never
+// touches a ledger: it takes none. A read-only token is returned as-is; an
+// over-scoped one is refused with *ErrRefusedByScopeCheck carrying what
+// GitHub granted, and no token; a failed mint is a plain error.
+func TestMintUnrecorded(t *testing.T) {
+	overScoped := readOnlyToken()
+	overScoped.Permissions = map[string]string{"contents": "write", "metadata": "read"}
+
+	tests := []struct {
+		name        string
+		minter      *fakeMinter
+		wantToken   bool
+		wantRefusal bool
+	}{
+		{name: "read-only token: returned", minter: &fakeMinter{token: readOnlyToken()}, wantToken: true},
+		{name: "over-scoped token: refused", minter: &fakeMinter{token: overScoped}, wantRefusal: true},
+		{name: "mint fails: a plain error", minter: &fakeMinter{err: errors.New("simulated GitHub API failure")}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := readonlymint.MintUnrecorded(context.Background(), tc.minter, "acme", []string{"widgets"})
+			if tc.minter.sawOwner != "acme" || len(tc.minter.sawRepoNames) != 1 || tc.minter.sawRepoNames[0] != "widgets" {
+				t.Errorf("minter saw owner=%q repoNames=%v, want owner=acme repoNames=[widgets]", tc.minter.sawOwner, tc.minter.sawRepoNames)
+			}
+			if tc.wantToken {
+				if err != nil || got.Value != tc.minter.token.Value {
+					t.Fatalf("MintUnrecorded() = %+v, %v; want the minter's own token and no error", got, err)
+				}
+				return
+			}
+			if err == nil || got.Value != "" {
+				t.Fatalf("MintUnrecorded() = %+v, %v; want no token and an error", got, err)
+			}
+			var refused *readonlymint.ErrRefusedByScopeCheck
+			if errors.As(err, &refused) != tc.wantRefusal {
+				t.Fatalf("error = %v; typed as a scope refusal: %v, want %v", err, !tc.wantRefusal, tc.wantRefusal)
+			}
+			if tc.wantRefusal && refused.GrantedPermissions["contents"] != "write" {
+				t.Errorf("refusal GrantedPermissions = %v, want what GitHub granted (contents: write)", refused.GrantedPermissions)
+			}
+		})
+	}
+}

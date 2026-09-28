@@ -200,6 +200,7 @@ type AgentRuntime interface {
 ### 5.1 Persistence
 - Postgres is the ONLY store. No cache with authority. Uniqueness by constraints, not convention.
 - **Outbox pattern** for every outbound side effect (Slack/Linear/GitHub notifications, webhooks): written in the same tx as the state change; a retry worker delivers with exponential backoff + dead-letter after N attempts. Never 2-attempts-then-drop.
+- **A delivery this process's own shutdown cuts short is not a failed attempt (amendment).** Recognised from the process's own shutdown state, never from a cancellation error, and recorded on a context that outlives the shutdown in the failure class §44.2 introduces, which gives back the attempt the claim counted; logged as an interruption, not an error. Bounded: a row interrupted more times in a row than `internal/platform/timeouts.go` allows (a consecutive count on the row, reset when an attempt completes), or a delivery that outlived its own delivery timeout, counts normally, and until the formal review and bot comments have a receipt (Step 190) their delivery kinds are left out of the rule, so a delivery that hangs until a liveness restart still reaches dead-letter.
 - Dedupe/coalescing (webhook events, concurrent PR @mentions) via `INSERT ... ON CONFLICT` atomic claims. Never eventually-consistent storage for coordination.
 - No connection is held per session. A replica's Postgres connections are its query pool plus one lock connection, whatever it hosts; `replicas × (NARVI_DB_POOL_MAX_CONNS + 1)` must fit under `max_connections` with headroom. A transaction-mode connection pooler is unsupported (session-level advisory locks).
 - A human applying a label or clicking a button is a legitimate, deliberate command — the two are equivalent in kind, and neither needs Postgres's own blessing to act. What is never legitimate is treating a label the BOT ITSELF writes back onto an externally-editable surface as durable trigger state: a GitHub/Slack/Linear label is mutable by anyone with triage rights, forgeable, and — the decisive reason — a second copy of a fact Postgres already owns. Durable trigger state lives in Postgres and is only ever read back from there; a bot-written label may still exist as a human-facing status indicator, but the system itself must never treat it as authority (§24 applies this to review re-triggering specifically; the principle is general).
@@ -428,7 +429,7 @@ The two-mode knowledge capability: approved-plan durability; the per-repository 
 The path from an emitted metric to a backend that can evaluate an alert on it: a config-gated OTLP exporter in `platform.SetupOTel`, and the relay that carries the four sandbox-emitted histograms out of the sandbox.
 *Exit: an alert defined on a control-plane instrument fires from a real backend rather than from a process's own stdout, which is what closes P6's own exit criterion above. Step 112 gates no phase.*
 
-**Phase 11 — Named gaps (Steps 113-131)**
+**Phase 11 — Named gaps (Steps 113-131, and the rows appended since: 152-156, 160-161, 171-179, 189, 198-205)**
 Real, non-speculative work that each shipping Step declared it was leaving out. A holding list until the owner chose to work it through in full, at which point it gained an execution order and a milestone like any other; the filing rule still governs what may enter it.
 *Exit: every row either shipped, or closed by a recorded decision saying why it will not be — never a silent omission.*
 
@@ -448,8 +449,8 @@ Two capabilities that compose work this system already performs into more than o
 The four controls that make the autonomy this system already grants bounded and legible: a spend cap that refuses the next turn, one persisted freeze every automatic action consults, session-level bounds in the timeout ladder, and one per-repository level that constrains the automation-enabling toggles rather than replacing them. Nothing here is a defect in a shipped Step; each is a control the design assumed and never named.
 *Exit: a session at its cap or bound stops taking turns without being marked failed and resumes on an audited raise; the freeze stops every automatic action without severing a running turn or losing a candidate; a repository's level answers what it may do in one field and one audit row. §9.3 scenario 15 green, gating this phase.*
 
-**Phase 16 — External-client prerequisites (Steps 157-159; additive; gated on a product decision)**
-What this repository owes an external client before one can be built honestly: a stable, versioned `/contracts` policy with CI that fails a breaking change (Step 157, worth doing regardless), native-client authentication (158) and a cursor-resumable event stream (159) — the latter two not to be started on speculation. Specified in `docs/IMPLEMENTATION_PLAN.md`'s own Phase 16 block rather than in a section here.
+**Phase 16 — External-client prerequisites (Steps 157-159, 180-183; additive; gated on a product decision)**
+What this repository owes an external client before one can be built honestly: a stable, versioned `/contracts` policy with CI that fails a breaking change (Step 157, worth doing regardless), native-client authentication (158) and a cursor-resumable event stream (159) — the latter two not to be started on speculation. The MCP surface existing clients use (180-183) is specified in §43; the rest in `docs/IMPLEMENTATION_PLAN.md`'s own Phase 16 block.
 *Exit: a script client in this repository's own tests authenticates as a native client, follows a session to completion, survives a drop and catches up from its own offset without re-pulling; under no client decision, Step 157 alone.*
 
 **Phase 17 — Claims parity (Steps 162-165; additive; see §41)**
@@ -459,6 +460,25 @@ The three sentences in `docs/FOUNDATIONS.md` that are true of the plan and false
 **Phase 18 — Kubernetes-native sandbox provider (Steps 166-170; additive; see §42)**
 The third `SandboxProvider`: pods in the operator's own cluster, with the three decisions a pod needs before it is a sandbox — a RuntimeClass that is a boundary (Kata by default, fail-closed on absence, `runc` never), an egress policy that can name a host, and a lifetime Narvi sets itself. Gated on Phase 17's Step 163, the selection switch it plugs into.
 *Exit: §9.3 scenario 16 green on `kind`; an acceptance run on the target cluster recorded with the RuntimeClass handler, node type and date — the boundary is proven there and nowhere else.*
+
+**Phase 19: Adopted product capabilities (Steps 184-188; additive)**
+Five capabilities adopted by owner decision on 2026-09-17 and 2026-09-18, grouped by that provenance
+alone: none gates another, and each lands whenever its own dependencies allow. Specified in
+`docs/IMPLEMENTATION_PLAN.md`'s own Phase 19 block and in `docs/DECISIONS.md`.
+*Exit: as the implementation plan's Phase 19 block states, row by row.*
+
+**Phase 20: GitHub App pool (Steps 190-197; additive; see §44)**
+A pool of GitHub Apps with roles, budgets and retirement, headed by the three Steps that repair shipped
+GitHub writes: the create-once formal review, GitHub's own rate-limit deadlines, and a publish App for
+the review check.
+*Exit: a verdict leaves one formal review on the commit it reviewed; the review check is still updated
+a day after boot; a rate limit delays and loses nothing; several Apps process an event once and drain
+cleanly on retirement.*
+
+**Phase 21: Adopted on 2026-09-28 (Steps 206-215; additive; see §21.5, §45)**
+Review quality measured with stated populations, a second agent runtime with provider accounts, the
+scope and publication decisions of the same day, and the unresolved-conversation gate.
+*Exit: as the implementation plan's Phase 21 milestone states.*
 
 ## 11. Working conventions for the implementing agent
 
@@ -1015,7 +1035,7 @@ Every row also carries **`head_sha`**: the commit the verdict was actually produ
 
 **Stacked PRs: review scope is the PR's own increment, never the cumulative stack diff.** When a PR carries GitHub's own stack context (§17.6) — today, only ever the origin+sentinel-fix pair §17 registers — a review verdict still covers exactly the diff against **that PR's own** base (its immediate parent in the stack, not the stack's ultimate base), with position, size, and the stack's ultimate base supplied to the review only as context, never as additional diff to verdict over. This falls directly out of `head_sha`'s own design above: a verdict is pinned to one commit of one PR, and a verdict computed over a cumulative multi-PR diff could not be honestly attributed to any single `head_sha`, nor tracked for staleness the same way — a change to a PR below it in the stack would invalidate a cumulative verdict with no mechanism here to detect that and re-trigger it. The accepted residual: a defect that only manifests in composition with the not-yet-merged PR(s) below a given PR in the stack may go unreported at this review level — the same class of gap §15's aggregate-diff review exists to catch for merged, released work, never for an open, in-progress stack.
 
-**Head equality is necessary and not sufficient, and the paragraph above is about the wrong failure.** Its accepted residual concerns a defect this review level may MISS. The distinct hazard, found by an upstream-parity analysis and verified here, is a verdict that is PRESENTED AS CURRENT when the code it covered no longer is: before Step 173, `review_verdicts` persisted `head_sha` and nothing else about the context, and the eligibility engine compared that one value against the live head. A PR evaluated while based on another PR's branch, then retargeted — or whose parent moved beneath it — kept an unchanged head, so the equality held and the stale verdict read as fresh. Nothing downstream caught it: no base-branch gate existed in the eligibility engine or in the merge-time revalidation, and the GitHub decoder read `base.ref` while never reading `base.sha` at all. (A separate, still-unshipped gate — Step 142's own trunk allowlist — is a different concern and does not close this one.) So the freshness claim this section made was, at the time, narrower than it read. **Closed by Step 173, below, not merely proposed by it**: the paragraph that follows is not a plan for future work, it is what this repository's own `review_verdicts` schema, `internal/domain/autoapproval.ComputeEligible`, and `githubapi`'s pull-request decoders already do today.
+**Head equality is necessary and not sufficient, and the paragraph above is about the wrong failure.** Its accepted residual concerns a defect this review level may MISS. The distinct hazard, found by an analysis and verified here, is a verdict that is PRESENTED AS CURRENT when the code it covered no longer is: before Step 173, `review_verdicts` persisted `head_sha` and nothing else about the context, and the eligibility engine compared that one value against the live head. A PR evaluated while based on another PR's branch, then retargeted — or whose parent moved beneath it — kept an unchanged head, so the equality held and the stale verdict read as fresh. Nothing downstream caught it: no base-branch gate existed in the eligibility engine or in the merge-time revalidation, and the GitHub decoder read `base.ref` while never reading `base.sha` at all. (A separate, still-unshipped gate — Step 142's own trunk allowlist — is a different concern and does not close this one.) So the freshness claim this section made was, at the time, narrower than it read. **Closed by Step 173, below, not merely proposed by it**: the paragraph that follows is not a plan for future work, it is what this repository's own `review_verdicts` schema, `internal/domain/autoapproval.ComputeEligible`, and `githubapi`'s pull-request decoders already do today.
 
 What the verdict must therefore carry, beside `head_sha`, is the rest of what it reviewed: `base_ref`, `base_sha`, the ordered ancestor chain, and a policy version — the last because a verdict produced under one set of rules is not evidence under another, and nothing else records which rules applied. Two further properties fall out of that and are cheap only now. An **attempt identifier distinct from the context**: two attempts over identical code share a context, and exactly one of them may publish the current result, which a context alone cannot express. And **`not_assessed` as a first-class outcome** — a review that did not complete has no risk level, and inventing one (or letting its absence read as low) is the same defect as a truncated scan rendering as a clean one. The chain is per PR and never a whole-stack revision: changing the fifth PR invalidates it and its descendants, never the four beneath it, and a stack's own identity cannot stand in for this, since a restructure dissolves and recreates it. Step 173 carries this; §39.3's own reuse of head-only freshness is amended with it, not after it.
 
@@ -1070,6 +1090,47 @@ expensive to retrofit:
   the same external result must resolve to a single one, by the atomic-claim idiom §5.1 already
   establishes. Two active identities for one pull request is worse than none: each is individually
   plausible, and which one a reader sees depends on timing.
+
+**The formal review is an emission too (amendment).** The rules above were first
+applied to the check. The formal review whose body is the verdict is a separate write, and it needs
+three properties of its own. It names the commit it reviewed (`commit_id`, the verdict's own head,
+never whatever head the pull request has when the write is delivered). It is created once per
+recorded verdict, found again by a marker in its body naming that verdict, on reviews this deployment
+authored, every page of the listing read, rather than posted a second time when a retry cannot tell whether the first write landed: an outbox delivers at least
+once, never exactly once, so a write GitHub does not make idempotent needs a receipt of its own. And
+its blocking force follows verdicts, not attempts. Unlike the check, a formal review is never refused
+as superseded: it is published as history, and only its blocking force changes. A pending
+`REQUEST_CHANGES` is posted as a comment only once a newer whole verdict has been recorded, because an
+attempt that recorded no verdict (it failed or never started) proves nothing about the code, a
+narrowed verdict answers only part of the question, and letting either remove a block would make the
+block fail open. A narrowed verdict's own review is always a comment: an answer to part of the
+question never blocks the whole. A `REQUEST_CHANGES` already on GitHub stays until a person dismisses
+it: this system posts no approval and dismisses nothing. The verdict's anchorable findings ride the same write
+as inline comments (Step 213), so there is one receipt and no second write to lose.
+
+**A narrowed request never stands for the whole (amendment, decided 2026-09-28).** A review asked
+about part of a pull request answers its question and never becomes the verdict this section's
+readers take for the pull request. Scope is a property of the request and of the verdict it produces,
+not of the context: two attempts on identical code still share a context. **One rule decides a
+verdict's kind**, applied once by the verdict endpoint and recorded, and every reader reads the
+recorded kind rather than re-deriving it: a verdict takes the kind of the turn it is attributed to (a
+reminder's verdict is the reminded turn's, §36.2), and a turn records its review mode (whole, narrowed,
+delta) when it is inserted, whole exactly when it is a review attempt (`turns.is_review_attempt`: the
+mention that opens the review session, the label, the button, the automatic lane), a delta turn never
+being one. Verdicts recorded before the mode exists read as whole, which is today's behavior. Every
+reader that orders verdicts or attempts (the check publisher's supersession, the latest-verdict
+reads, and through them MCP's result, acceptance applicability and auto-merge discovery, the
+automatic lane's comparison, a train's gate, the lifting of a block) reads whole verdicts only, since
+supersession by time alone would let a narrowed verdict replace a whole review. The endpoint's effects
+follow the kind from one table: a whole verdict does everything; a narrowed one records its findings
+(still open for eligibility) and posts a formal review that is only ever a comment, and emits no check,
+syncs no label and runs no autofix; a delta one is only recorded (§24.8). A follow-up mention is a
+review attempt only when its text after the handle, ignoring case, whitespace, trailing punctuation
+and quoted reply lines, is `review`, the re-run command a verdict itself recommends, never by a
+model's reading; anything else is narrowed, and its answer says so and renders the re-run guidance.
+The mention that opens a review session is always a whole review whatever its text: the requester's
+words are carried as an untrusted question answered beside the standard review, never as a scope
+(Step 212).
 
 **`not_assessed` is a state, and GitHub's own vocabulary does not have one for it.** Step 174
 already forbids an unassessed verdict from satisfying Narvi's own auto-merge. That does not settle
@@ -1131,11 +1192,58 @@ No per-PR human label is required or consulted for this decision — the LLM's v
 
 Once armed, auto-merge reuses the decision inbox's **existing** server-side re-validation-at-click contract unchanged (§16.2, Step 60: re-check CI, approval state, `Authorize` before calling the SCM) — merging is simply machine-initiated instead of human-clicked, the same checks either way. This is a deliberate reuse, not a parallel merge path: the inbox's Merge endpoint was already built to never trust its own rendered queue as authority, exactly the property an unattended merge needs.
 
+**CI green means the required checks, not the checks that reported (amendment).**
+Eligibility reads CI over the check runs and statuses present at the head. A check the base branch
+requires but that has not reported yet is absent from that read, so the read can be green before the
+requirement is met. The required set is read from the base branch object's protection and from its
+rulesets, never from the admin-only protection endpoint, and each required check must be satisfied at
+the head, by the App named when one is named; a missing, pending or failed one makes the pull request
+ineligible and is named. A check run and a commit status carrying the same required name must both
+pass. `narvi/review` is taken out of the required set: it is the review this eligibility already
+reads. An answer that the feature is unavailable on the repository's plan means that source declares
+nothing; any other failed read of the requirements makes the pull request ineligible. The required
+set is added to today's read, never substituted for it: every check present at the head must still
+pass, so a failing check the base does not require keeps blocking. A base that requires nothing keeps
+today's read alone, which reads unknown when there is no check at all.
+
+**An unresolved conversation blocks too (amendment, decided 2026-09-28).** Through a per-repository
+setting on by default, eligibility also requires that no review conversation is unresolved, read live
+from GitHub's thread state, every page of it; a failed or incomplete read makes the pull request
+ineligible. A thread this system started for one of its own findings, in which no person has replied,
+does not count, because the verdict's class already weighs that finding (Step 215).
+
 ### 21.3 Deterministic digest
 A daily digest is **entirely deterministic, never LLM-narrated** — it renders from the same `review_verdicts`/analytics read model above via a template, not a model call; a digest is a compliance/status artifact, and a fixed rendering is easier to trust and to test than a fresh narration every day. Scope is **per-repo/per-channel from day one**, built entirely from EXISTING session-thread association tables (`slack_thread_sessions`/`linear_agent_sessions`, joined through `github_pr_sessions`) rather than inventing a second, separate repo↔channel mechanism: every Slack channel or Linear organization that has recently threaded a review session for a repo receives that repo's own digest — a **repo-level fan-out to every such channel**, not the decision inbox's own per-person, identity-graph-backed assignment scoping (§16.2's CODEOWNERS-through-the-identity-graph provenance) — that per-user scoping is **not built** for the digest; a channel's digest shows every repo it has recently discussed, not what any one person's own inbox would show. Sending is **claim-before-act per (date, channel)**: a `digest_send_state(date, channel)` row plus `SELECT ... FOR UPDATE SKIP LOCKED` (the same idiom §5.1 already uses for PR-mention coalescing) guarantees at-most-one send per channel per day even with concurrent ticks — no separate storage-layer serialization mechanism needed, Postgres already does this.
 
 ### 21.4 Phasing
 Step 62, Phase 5, after Step 45 (verdict shape) and Step 47 (posting path) — designing the verdict schema once, before any of persistence/analytics/digest/auto-approval builds on it, avoids the parallel-reinvention trap a shared schema exists to prevent. UI: Settings → Analytics gains the review-risk section and the per-repo auto-merge toggle with calibration stats (§12.2 items 5-6, Step 86); the decision inbox's `ready_to_merge` row (§16.1, Step 87) gains the "(auto)" 1-click-confirm variant.
+
+### 21.5 Review quality, measured (amendment)
+§21.1 records what a verdict decided. Whether its findings were right, and what each pass of a
+review actually did, has no record precise enough to argue from, and three rules close that.
+
+- **A person rules on a finding, and the ruling is its own record.** The vocabulary separates a
+  finding that was wrong (`false_positive`) from one whose facts were right and whose priority was
+  disputed (`accepted_risk`, `policy_disagreement`), one that was right and fixed after it was raised
+  (`fixed_later`), one that repeated another (`duplicate`), and one nobody could check (`unverified`).
+  Only the first counts against the reviewer, the next three count for it, and the last two leave the
+  rate. A rate is computed over ruled findings only; an unruled finding is reported as unruled, never
+  as right. Nothing infers a ruling from a thread's state: a resolved conversation says a discussion
+  ended, not that a finding was wrong or right, and reading one as a ruling is how a silently resolved
+  thread becomes a confirmed finding. A ruling is neither a rebuttal (§22) nor the acceptance of a
+  verdict (§21.1b), and it follows its finding into a later verdict by identity.
+- **Each measure is recorded where it happens, with its population.** The findings each fact-check
+  run saw, not only the ones it killed; each finding's presence in each verdict, as history; each
+  verdict's kind (whole, narrowed or delta, §21.1b's one rule); each published finding's source; the triage reason and why an input could not
+  be read. A run that did not happen is NULL, a run that removed nothing is 0,
+  and the two are never merged. Counts the reviewer reports about its own passes are recorded as
+  self-reported.
+- **Every readout states its denominator.** A rate over routed verdicts is not a rate over all
+  verdicts, repetition is measured between adjacent whole verdicts only, and a range with nothing to
+  measure, or a fact not yet recorded, renders no value rather than a zero.
+
+Phasing: Steps 206-208, Phase 21. They wait on no Phase 11 row; a fact a Phase 11 row adds (Steps 199
+and 201) appears in the readouts once recorded.
 
 ## 22. Learned false-positive patterns & rebuttal identity (new capability)
 
@@ -1305,10 +1413,32 @@ membership read against GitHub takes time, and a newer event can land during it;
 must be dropped rather than allowed to publish a decision about a shape that no longer exists. A
 read or handling failure is retried through §2's existing persistent timers, not a new mechanism.
 
+**A delta re-review, experimentally (amendment, decided 2026-09-28).** Once membership events are
+routed (Step 142), an ancestor's move invalidates a layer's verdict and launches a replacement review.
+When the layer's own patch is identical by fingerprint, a delta review runs in shadow beside that
+replacement, in a session and sandbox of its own and never in the review session, whose turns resume
+one conversation, so that neither review reads the other's reasoning and neither waits on the other.
+It is a real review turn given the last whole verdict published before the replacement and the
+ancestors' diffs (marked untrusted), asked first whether the ancestors' change can reach the
+layer and to review in full when it can or when unsure. The replacement stays the review of record
+and publishes as today; the delta verdict is only recorded, with its findings as history (no open
+finding, no review, comment, check, label or autofix, and out of the digest), and the pair is the
+measurement, compared finding by finding per instruction version. Per repository, off by default,
+bounded by a cap per period and spending none of §24.6's budget, and carried in the verdict's
+provenance. Letting a delta verdict replace the full review is a later decision taken on that readout
+(Step 214).
+
 **An unknown base is unknown, never fresh.** The native stack context can report a base this system
 cannot resolve — absent, null, or naming something it cannot see. That is a third state beside
 "matches" and "differs", and it must never satisfy a freshness check: an absent value is not evidence
 that a review still covers the code. §21.1's amended context rule is what this feeds.
+
+**A parent closed without merging ends the wait it created (amendment).** The deferral above
+waits for a parent to merge and for the provider to re-target its child. A parent closed unmerged
+does neither: the child keeps a base that will never merge, no re-target follows, and the deferral
+would hold forever while its notice still says it is waiting for the parent. The close is routed like
+the other membership events above, and the notice is replaced by one naming the closed parent and
+what unblocks the pull request: re-targeting it, or an explicit trigger, which stays ungated.
 
 One question this section does **not** settle, deliberately: whether a trigger policy should look at
 a PR's direct parent or at the stack's ultimate target. The review's diff is the increment against
@@ -1317,6 +1447,51 @@ honestly cover a cumulative multi-PR diff. Whether the *gate* consults the ultim
 separate decision, and silently substituting one base for the other everywhere would change what
 §24.3 gates on without saying so. Step 142 carries the lifecycle; that choice is named there as a
 decision, not assumed.
+
+### 24.9 One automatic review at a time, and a queued review checks its context (amendment)
+This amends §24.3 steps 3 and 4. §24.2's debounce collapses a burst of pushes into one review, but
+only a burst that lands inside one quiet window. A review takes far longer than that window, and
+pushes arriving during it, each more than a window after the last, each fire the debounce: each firing
+inserts its own review turn behind the running one, with a prompt built for the head of that moment.
+Every one of those turns spends a slot of §24.6's budget, the running review's verdict is stale when
+it lands, and the queued ones run in full on diffs that no longer exist. Two rules close it.
+
+- **Automatic reviews hold while any turn of the review session is pending, dispatched or
+  processing, or a human request is owed**, the lane's and a review §24.8's membership routing
+  launches alike. The firing keeps `pending_retrigger_head_sha` as the latest target instead of
+  clearing it, spends no budget, and upserts the debounce timer at a fixed backstop of its own in
+  `internal/platform/timeouts.go` (a pending turn has no deadline to borrow), again while the hold
+  lasts, so the status surface (§43.20) keeps reading scheduled work. Every write that ends a turn of
+  the review session upserts that timer to now in the same transaction as that write. There is more
+  than one such write today (the processing turn's completion, the turn-deadline timer, a failed
+  dispatch), and the rule below adds one, so the set is pinned by a test that fails when a terminal
+  write exists without the hook: no ending can lose the wake-up, and the next review covers the head
+  as it is then. A human trigger (the label, the button, a mention) is never held.
+- **A queued review attempt checks its context when it is dispatched.** At dispatch, the context the
+  turn recorded (head, base, ancestor chain) is compared with the live one through the comparison
+  §21.1b shares. A moved context does not start. The turn ends with a turn-level reason of its own,
+  `context_moved`: today the abandon transition makes a turn failed and a failed last turn makes the
+  session failed, so the session's status derivation skips a turn ended that way and every reader of
+  attempts excludes it (enumerated and pinned by a test); it notifies nobody, publishes no
+  not-assessed check and fails nothing. The work is re-armed in the dispatching transaction, never by
+  a call back into the actor handling the dispatch. An automatic request goes back to the lane as its
+  pending target. A human request becomes a row of an owed-requests table keeping its requester,
+  trigger and text, and the same transaction upserts a named session timer, classified in §43.20's
+  timer table, whose handler is the consumer: outside any transaction it refetches the context,
+  composes the prompt for the new head and checks the requester's authorization again through an
+  injected port, then deletes the row and inserts the turn in one transaction, on the human path,
+  which never passes through the lane's opt-in, hold, budget, trunk gate or "already reviewed"
+  comparison. A prompt built for an old head never runs against a new one, and a crash between the two
+  steps leaves the row and its timer. A request that meets a moved context more times in a row than
+  `internal/platform/timeouts.go` allows (a count kept with it, reset when one of its turns starts) is
+  dropped: a human requester is told once, an automatic drop is shown on the status surface. A
+  comparison that cannot be made lets the turn start, as today, and the turn records that its context
+  was unconfirmed at start: an unknown is never read as fresh, and the verdict's own freshness check
+  still stands behind it. A reminder turn (§36.2) is not a review attempt and is not checked.
+
+The first shape is the ordinary case when an agent pushes fixes while a review runs. Phasing: Step
+198, Phase 11.
+
 ## 25. Configurable workflow engine per lane + visual canvas editor (new capability)
 
 Problem this solves: today each of Narvi's three lanes (review, request/build, plan) is one fixed
@@ -1837,6 +2012,17 @@ reject-don't-repair posture the endpoint already applies to invalid payloads —
 verdict whose digest is semantically empty raises the `Shippable` floor (§26.2's composition). The
 light path requests the full digest but does not hard-require it.
 
+**The readout names what raised it (amendment).** `Shippable` is the maximum of a
+risk baseline and the raise-only floors `ComputeShippable` composes, and the rendered verdict prints
+the class alone. The
+function that computes the class returns its blockers beside it (every input that on its own would
+keep the class above `auto`: the risk baseline when it is, and each floor that is), the two computed
+together so they cannot disagree (no
+blockers exactly when the class is `auto`), and the readout names them, marked as decided by the
+server and not asserted by the reviewer. A counter-review reported done but not corroborated reaches
+the function as a value of its own rather than as skipped, with the same floor, so its blocker says
+what happened.
+
 ### 26.2 Description adequacy: does the PR tell the truth? (Step 67)
 
 Confirmed gap: a PR's title and body enter review context only as untrusted input blocks (§5.2) —
@@ -1894,7 +2080,8 @@ trust agent judgment for routing; deterministic fallbacks throughout, §18):
   alongside the other per-repo review settings. **Any triage error fails open to light** — a
   review must never be blocked by its own router.
 - **Re-review on push** (§24): depth re-evaluated on the delta, but floored at the PR's previous
-  depth — once deep, a PR stays deep, with one explicit exception: a repo configured
+  depth — once deep, a PR stays deep, with one explicit exception (and a second, below: a depth
+  chosen because an input could not be read is never a floor): a repo configured
   `reviewDepth.mode: always_light` (the per-repo config above) skips this floor entirely, using the
   fresh, unfloored decision as-is (`reviewtriage.Floor`'s own doc comment, depth.go, "D9"). An
   admin's explicit, deliberate cost-control choice outranks this history-based "always add rigor"
@@ -1945,6 +2132,23 @@ pass is the one v1 consumer of this second axis (light path runs it same as deep
 the axis is binary-on, not size-gated); further gating *within* the deep path (skipping
 `architecture-scribe` or `counter-reviewer` themselves below some size) is named, not designed —
 §26.9 resolves why it stays out of v1.
+
+**An unreadable input is not a small change (amendment).** The router sizes a
+review from the additions, deletions and changed paths its context carries. A pull request that could
+not be read leaves all three empty, and a diff that could not be read leaves the paths empty, so the
+review can route light under the reason a one-line fix gets, and a sensitive path it touches is invisible.
+The fail-open rule above covers the router's own errors; an input that could not be read is a
+different case. The decision record already notes an empty or truncated diff but not why it is empty,
+a change that is genuinely empty or a read that failed; it records the cause in every case, and an
+unreadable input routes deep (decided 2026-09-28): a missing size costs a thorough review, a missing
+scope costs a finding. An explicit
+`always_light` override still wins, being an admin's decision, and the cause is recorded under it too;
+a truncated file list counts as unreadable;
+and a depth chosen for an unreadable input is never the next review's floor. The size that routes
+counts source changes only: test, documentation and generated files, matched by patterns the
+deployment configures (never by markers the pull request carries), are left out of the count, while
+the path signals keep reading every changed path. The paths are the pull request's own, so production code placed under a test
+directory shrinks the count; the path signals still see it. The cost budget (§26.7) is unaffected.
 
 ### 26.4 The deep path: adversarial counter-review (Step 69)
 
@@ -2114,7 +2318,8 @@ overlap — counter-review can talk itself out of a real defect just as easily a
 refute a fake one, where a mechanical, diff-only disproof cannot be argued with, the same "a
 restriction enforced at spawn time is never trusted as sufficient on its own" logic §17.4 already
 applies to its own two independent, deliberately-redundant checks. Findings counter-review itself
-surfaces are **not** re-run through fact-check: counter-review, with tool access and full context,
+surfaces are **not** re-run through fact-check (reversed by the amendment at the end of this
+section): counter-review, with tool access and full context,
 is by construction at least as rigorous as a diff-only check for a finding it produced from
 stronger evidence than fact-check could ever see — a second, weaker pass over a stronger pass's own
 output would be redundant in the direction that doesn't matter.
@@ -2167,6 +2372,19 @@ had. The asymmetry is not a nicety on top of the design; it is the specific prop
 adding this pass to the light path compatible with the invariant at all. §26.9 amends the
 invariant's own wording to say this outright, so a future reader does not have to re-derive it from
 here.
+
+**What the counter-reviewer adds is checked too (amendment).** The funnel above
+prunes before the adversarial pass, and that pass may add findings of its own, which the review
+instruction has so far exempted from the fact-check on the ground that a tool-equipped pass is at
+least as rigorous. Nothing measured that. It is the one pass that adds findings, so it is the one
+place noise enters. An added finding states the defect it quotes, the path that reaches it and the
+consequence, and it goes through the diff-only fact-check before publication; the fact-check can
+only kill a finding the diff itself disproves, so an addition resting on repository context outside
+the diff survives it. The server holds the rule: an addition counts as checked only when a
+second fact-check sub-task, run after the counter-review in the same turn, is corroborated from the
+turn's own sub-task events; any other is published marked unverified, and what the reviewer reports
+about coverage and source is recorded as self-reported. Every published finding records its source, primary or counter-review, so
+§26.5 reports precision per source and the rule can be revisited on numbers.
 
 ### 26.7 Per-review cost budget with look-ahead (Step 69 design, Step 70 wiring)
 
@@ -3204,8 +3422,8 @@ small outbound adapter — see §29.9 for why not brokered through an OpenCode p
    §13.2's `identity_link_prompts` — and returns `{verificationUrl, userCode, expiresAt}` for the
    UI to display.
 2. The user opens `auth.openai.com/codex/device` on any device and enters the code. The Settings
-   page polls `GET /api/me/chatgpt-link` while open; each poll performs **at most one** upstream
-   `deviceauth/token` attempt, throttled by the server-provided `interval` via `last_polled_at` —
+   page polls `GET /api/me/chatgpt-link` while open; each poll performs **at most one**
+   `deviceauth/token` attempt against OpenAI, throttled by the server-provided `interval` via `last_polled_at` —
    the human sitting on the page IS the polling loop, so there is no background goroutine, no
    timer, and nothing to leak when the page is abandoned (the attempt row simply expires;
    multi-pod safe because the state is a row, not memory).
@@ -3253,7 +3471,9 @@ contributes no user candidate, falling through to the static-key scopes exactly 
 known consequence — in a multiplayer session, every participant's prompts run on the creator's
 seat — is named in §29.10, not silently accepted. v1 creates `user`-scope rows ONLY via the link
 flow (`kind='oauth'`, provider `openai`): a personal static API key at user scope is structurally
-representable but deliberately has no creating endpoint — one less path to reason about.
+representable but deliberately has no creating endpoint — one less path to reason about. (Amended by
+§45.1: accounts a user connects get an endpoint, and are stored where this resolution never reads
+them; and a review session never resolves the `user` scope, row 205.)
 
 ### 29.5 Refresh: the control plane is the single refresher, pump-only
 
@@ -3492,7 +3712,7 @@ decorated port); the
 sandbox's end-of-turn `git push` (§30.4); and
 `rwx_preview_dispatch` — a public preview build executing customer code is a trace on the RWX
 cloud and on the open internet, so it is suppressed structurally even though it is naturally
-starved in shadow (the SHA it would build is never pushed); reliance on upstream starvation alone
+starved in shadow (the SHA it would build is never pushed); reliance on that starvation alone
 is never accepted anywhere in this design.
 
 **Explicitly excluded — reads.** Clones, API GETs, and bot-token reads appear in the customer's
@@ -3705,6 +3925,47 @@ recommendation:**
    same-UID agent (until §30.5 lands) can recover the sandbox bearer from `/proc` and POST the
    mint endpoint directly, so any client-side substitution is decorative. A dedicated test
    asserts a review session in shadow receives a read-only credential.
+
+   **Amendment — a review session is read-only in every mode.** A review session only clones its
+   pull request's head; it has no use for write. It now receives the read-only installation token
+   on a live repository too, through the same interception's mint and the same fail-closed scope
+   check (an over-scoped grant is refused; a failed mint or a failed `github_pr_sessions` lookup is
+   a 500, never a fall-through to a write-capable branch), and `ScmCredentials` is no longer given
+   the bot token at all — the bot token stays server-side, for the verdict path. That mint is not a
+   shadow-mode substitution, so it writes nothing to the shadow ledger (`readonlymint.MintUnrecorded`;
+   the handler logs each outcome instead), and a ledger failure cannot fail it; a review session on
+   a shadow repository, or in a build boot, is a shadow mint like any other and is recorded. The
+   server also never asks a review sandbox to push, and never opens a pull request for one:
+   `completeProcessingTurn` returns no push signal for a session with a `github_pr_sessions` row,
+   and `createPRBestEffort` opens nothing for a `push_complete` in one — no pull request, no preview,
+   so no commit status. Both lookups fail closed. That half is consistency, in the sense of the
+   WS-push paragraph below; the read-only token is the guard. Work in a review session is not
+   dropped silently: a turn there that is not a review attempt (a follow-up mention, a web prompt, a
+   plan's implementation) ends with a session-visible warning that the session is read-only, so
+   changes made in it are not pushed. `TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential`,
+   `TestScmCredentials_ReadOnlyMint_OnlyShadowAndBuildBootAreRecorded`,
+   `TestCompleteProcessingTurn_ReviewSessionNeverPushes` and
+   `TestCreatePRBestEffort_ReviewSessionNeverOpensAPullRequest` pin it. The sentinel auto-fix child
+   (§17.2) is not a review session — no `github_pr_sessions` row of its own — and this amendment
+   leaves it as it was: the server still sends the push command for its own
+   `narvi/sentinel-fix/<id>` branch (`TestSentinelAutoFixChild_IsNotAReviewSessionSoItsPushIsSent`).
+   Whether that push reaches GitHub on a live repository is a separate, pre-existing question this
+   amendment does not change: the child has no creator, so its own credential request is refused
+   there (`TestScmCredentials_SentinelFixChild_IsNotServedAsAReviewSession`).
+
+   **The GitHub App must be installed wherever a review session clones.** The mint above now serves
+   every live review session's clone, not only shadow sandboxes and build boots, so the App must be
+   installed, with read-only permissions (`contents: read`, `metadata: read`), on every repository
+   Narvi reviews. Where it is not, GitHub finds no installation for the repository; the credential
+   is still refused — never another in its place — but as a 403 with a session-visible warning
+   naming the repository and that the App must be installed on it with read access, once per
+   session and repository, rather than a bare 500. The mint is bounded (`GitHubAppMintTimeout`,
+   8 s) inside the sandbox helper's own wait (`CredentialFetchTimeout`, 10 s), so that answer
+   reaches the sandbox before it gives up. **A stated limit: a pull request from a fork.** A review
+   session clones its pull request's head from the head repository, so for a fork the App must be
+   installed on the fork owner's account too — an account the base repository's owner does not
+   control. Until it is, such a review cannot clone, and says why. The follow-up: a review session
+   reads its pull request from the base repository (Step 204).
 2. **The image-build path must never hold a write token — this is an in-repo bug, not an
    external-service caveat.** `gitclone.CleanForImageBuild`
    (`internal/sandboxagent/gitclone/sync.go:941`), the pre-snapshot cleanup for `BootModeBuild`,
@@ -5757,6 +6018,12 @@ stopped by inactivity and restored on the next prompt, exactly as now.
 - **Fencing is unchanged and load-bearing**: a rotation increments `sandbox.gen` like any other
   restore, and the superseded identity is locked out immediately rather than at its natural expiry.
   §9.3 scenario 6 already covers the stale-gen reconnect this produces.
+- **A snapshot that finds its sandbox gone keeps the last valid one (amendment).** A rotation
+  whose snapshot fails because the sandbox already exited, or is shutting down, restores from the
+  previous valid snapshot and records the failure. The failed attempt never becomes a restore point.
+  An older snapshot rewinds the workspace and the conversation, and that restore succeeds, so §35.5's
+  fresh-lineage recap does not fire for it: the rotation records a persisted warning of its own naming
+  the snapshot it fell back to, so the next turn and a reader know that work since then was lost.
 
 `RotationRunwayFloor` is a new entry in `platform/timeouts.go` and nowhere else (§11), and the gate
 itself is a pure decision function in `internal/domain/sandbox`, added to the exhaustive
@@ -5913,6 +6180,23 @@ Two postures, both stated so a later implementation cannot quietly pick the othe
   broken contract is a historical fact about that turn, and §3.2's own reconciliation scope
   (a late signal that still finds the turn `Processing`) does not extend to it.
 
+**One reminder before the verdict contract is declared broken (amendment).** A
+review turn that ends successfully without a verdict usually still holds a complete review: an agent
+that asked the author to confirm the scope and stopped, or one that wrote that it had posted a verdict
+it never submitted. Before the backstop records the broken
+contract, and only for a whole review turn (a narrowed turn carries no verdict mandate: one that ends
+without a verdict records that, fails nothing and tells its requester no answer came) when no verdict
+is recorded and nothing is queued for publication, one follow-up
+turn in the same session asks for the verdict alone: not a second review, and no question to the
+author, since nobody reads the session. The verdict it produces is the reminded turn's: the verdict
+endpoint attributes it to that turn's attempt and context, the reminded turn's not-assessed emission
+waits for the follow-up to settle, and sub-task corroboration reads the reminded turn's own events.
+Once per attempt, never for a failed or superseded turn; a follow-up that also ends without a verdict
+is backstopped exactly as above. The follow-up is not a review attempt: its verdict takes the reminded
+turn's kind (§21.1b), it opens no check of its own and emits nothing when it ends, and §24.9's dispatch-time context check does not apply to it (a head
+that moved meanwhile makes its verdict stale by the ordinary freshness rule). It is a turn of the
+review session, so §24.9's hold covers it.
+
 ### 36.3 Where it is read, and why not in the sandbox
 The detection is control-plane-side, at turn completion, over events this design already persists
 — `tool_call`/`tool_result` carry status, and the artifact-posting tools are control-plane
@@ -6027,7 +6311,8 @@ point the train's progression is a state machine over Postgres rows, driven by s
 already produces, with no live agent supervising it: no idle supervisor session is paid for over
 the train's lifetime, and the train's state is inspectable rather than resident in a conversation.
 One row per sub-issue, with a short-lived claim state between waiting and spawned, and the whole
-thing owned by the same single-writer actor discipline §2 establishes.
+thing owned by the same single-writer actor discipline §2 establishes. (Amended by §39.5b: the claim
+is a recoverable lease, and a human's explicit request may replan the links not yet started.)
 
 ### 39.2 The tracker's own dependency graph is authoritative; the model's reading is the fallback
 The sequencing signal is the tracker's **declared** dependency relation between sub-issues, fetched
@@ -6067,6 +6352,7 @@ work concurrently, with nothing anywhere reporting an inconsistency, which is pr
 this feature exists to avoid rather than to cause.
 
 ### 39.3 The gate is the recomputed verdict, never a self-reported risk level
+(Amended by §39.5b: a predecessor merged by a person also releases its successor.)
 A successor does not start because its predecessor opened a pull request. It starts because that
 PR's review came back clean — and *clean* here means §21.2's **server-recomputed** `Shippable` and
 the deterministic eligibility engine §21 already specifies, never a risk level the reviewing agent
@@ -6149,6 +6435,34 @@ visible in production.
   a link is stopped or its ticket closed, its message routing is retired: a follow-up arriving
   afterwards has no session to reach, and delivering it to the last session known is worse than
   reporting that there is none.
+
+**What makes a train recoverable, not merely correct (amendment).** The bullets above
+say what a link is. Four more say what happens when the machinery around a link fails or a human
+steps in; each answers a way a train can stall that nobody could otherwise clear.
+
+- **A spawn claim is a lease, not a one-way door.** §39.1's short-lived claim holds a session id
+  reserved before the session is created, a generation and an expiry, and the session create is
+  fenced by that generation, so a holder that wakes after its claim was recovered cannot create. An
+  expired claim is recovered by a periodic sweep as well as by whoever finds it: if the reserved
+  session exists, it is adopted as the link's session; if not, the spawn is retried a bounded number
+  of times, and then the link takes its terminal outcome with the reason. A claim only its original
+  holder could release is a link that stalls forever the first time a process dies between claiming
+  and spawning.
+- **A predecessor merged by a person clears the gate.** §39.3 advances on a verdict. A person who
+  merges the predecessor's pull request without a clean verdict (under §21.1b's acceptance, for
+  instance) has given the strongest authorization this system can observe, and a successor waiting
+  on a verdict that will not change would wait forever. A merge whose actor the provider reports as a
+  person, not an App or this system's own auto-merge, releases the successor, whose base then
+  resolves at start as the bullet on effective bases requires.
+- **Resume is the inverse of Stop.** A stopped train resumes only on an explicit, audited human action,
+  which releases the links still waiting and never a link whose ticket was closed in the meantime.
+- **Replanning, on a human's request (decided 2026-09-28).** A human's explicit request re-invokes
+  the mother, whose second submission for the same parent replaces only the links that have not
+  started: a started link's ticket, session and branch stay immutable, and a replan is refused while
+  any spawn is claimed (the sweep above keeps an abandoned claim from blocking it forever). That is
+  what makes a wrong decomposition correctable without stopping the whole train, and it amends
+  §39.1's rule to "plans once per request". An agent advancing the train itself, from the ticket or
+  through a tool, is not among the options: the train advances on server-observed facts only.
 
 ### 39.6 What this changes in §17.6, stated rather than left to be noticed
 §17.6 declines to build an N-deep stack producer, on the ground that "nothing else in this plan
@@ -6296,6 +6610,13 @@ progress** — the whole failure being bounded is an agent that believes it is a
 self-report is the one signal that cannot be trusted here, and a tool call announcing success must
 not reset this window. The check is therefore server-side and fires whether or not the agent
 cooperates, which distinguishes it from any budget the agent is asked to respect.
+
+**Attempts are counted by the server (amendment).** The attempts in this window are the turns
+this control plane dispatched within it, counted from the rows that exist, never a number of attempts
+the agent reports about itself through a tool. A self-declared counter fails both ways: an agent that
+never calls the tool never consumes it, and a diligent one that records every retry is the one it
+stops. And because expiry closes the session to new turns and lets the one in flight end rather than
+cancelling it, no reporting window before cancellation is needed here.
 
 The window resets on observed progress and on nothing else. Its expiry is not a failure and not a
 `failed` status: same shape as a bound above, a named reason, a persisted `warning`, one notice, and
@@ -6710,6 +7031,78 @@ declaring a capability false — 167 because a provider without it is a shared k
 §27.6's fail-closed rule leaves an `allowlist` Environment unspawnable until it lands. 169 and 170 are
 independent of each other and gate nothing. Scenario 16 gates the phase.
 
+### 42.9 Alternative studied: Agent Substrate, and AX above it
+
+Studied on 2026-09-28 against both projects' code (google/ax at `ac23328`, agent-substrate/substrate
+at `c7dbe9d6`); nothing was deployed or measured. Recorded here so the question is answered once and
+not reopened each time either project is announced. It changes none of Steps 166-170.
+
+**What each project is.** Agent Substrate is a Kubernetes-hosted runtime that multiplexes many
+"actors" (sandboxed workloads) onto a smaller pool of pre-started worker pods. It creates, suspends
+(a checkpoint streamed to object storage), resumes (possibly on another worker) and deletes actors,
+runs them under gVisor or a microVM (Kata on Cloud Hypervisor), resumes a suspended actor when a
+request reaches its ingress router, and sends every actor's outbound traffic through its own egress
+gateway. AX (Google's "Agent Executor") is a control plane on top of it: an `ax-server` keeping its
+own state and locks in Redis, `Task`/`Workspace`/`Model` resources, and an in-sandbox runner that
+clones repositories and runs one command. Substrate's own README presents AX as a project that
+demonstrates building on Substrate.
+
+**AX: rejected as a layer, not merely deferred.** Everything this provider could want from the pair
+lives in Substrate; AX's own Substrate client is one file of about 500 lines. What AX adds, this
+system already owns: the sandbox lifecycle (§3.2) with its state in Postgres (§5.1), and environment
+preparation (§19, §27). What AX takes away is what would make Substrate worth having. It fixes every
+actor to data-only snapshots with a cold process start on resume (`SNAPSHOT_CONTENT_SCOPE_DATA`,
+`RESUME_SOURCE_GOLDEN`), hard-codes gVisor, uses neither the egress policy nor credential injection,
+does not pass a task's CPU and memory limits on to Substrate, and never reports the task command's
+exit: the runner logs it, and nothing writes the `Completed` phase AX's own watch waits for. It pins
+Substrate's API as of 2026-09-18 and uses two message types Substrate renamed on 2026-09-22 and
+2026-09-23. Behind `SandboxProvider` it would be a third state store between this system and the
+sandbox, for no capability gained.
+
+**Agent Substrate: a candidate for what runs this provider's sandboxes, not adopted.** Mapped onto
+this section, it changes four answers, each one a capability the pod design declares absent:
+
+- **Snapshots and resume** (§42.1, §42.3): full snapshots (memory, root filesystem, durable data) or
+  data-only ones. A tagged snapshot seeded into a new actor matches §3.2's "restore = new gen", and
+  resuming the same actor matches `ResumeSandbox`. The provider could report `Snapshots: true` and
+  `Resume: true`, where the pod design reports `false` for both and runs `setup.sh` on every spawn
+  (§42.5).
+- **Egress** (§42.4): a per-actor `EgressPolicy` of hostname rules, deny by default, enforced at
+  Substrate's gateway rather than by the CNI, so a hostname allowlist would not depend on Cilium.
+  Protocols where the server speaks first, git over SSH among them, are not supported.
+- **Credentials**: the gateway can replace a placeholder request header with a secret it resolves
+  itself, so the token a `git push` uses need never enter the sandbox.
+- **Isolation** (§42.3): gVisor or a Kata microVM, never `runc`. The microVM class needs `/dev/kvm`,
+  the same node-pool fact Step 167 establishes.
+
+The costs, each a change to this section rather than an adapter detail:
+
+- **No per-actor configuration.** Environment variables live in an immutable `ActorTemplate` (at most
+  32, one golden snapshot per template), so §42.2's one `Secret` per sandbox has no equivalent and
+  `SESSION_CONFIG` delivery needs a design of its own.
+- **No per-actor lifetime cap.** §42.2's `activeDeadlineSeconds` has no equivalent; §35's deadline
+  would be this system's alone to enforce.
+- **No authorization on Substrate's control API** as of this study: any authenticated caller controls
+  every actor, snapshot and egress policy in the installation.
+- **Heavier prerequisites**: Kubernetes 1.36 with two beta APIs (`podcertificaterequests`,
+  `clustertrustbundles`) enabled at cluster creation, or 1.37 and later; object storage for
+  snapshots; a Postgres of its own.
+- **Previews** (§42.5) are routed by an `ate-target-actor` header, so a wildcard-host preview needs a
+  front proxy that maps the host to the header.
+- **Maturity**: pre-1.0, its API renamed twice in the week before this study, and an architecture
+  document that calls much of itself aspirational.
+
+**Decision.** Steps 166-170 stand as written: they depend on stable Kubernetes APIs only, and nothing
+above is needed to ship them. Substrate is re-examined when Phase 18 opens; the reopen condition is
+recorded in docs/DECISIONS.md's deferred register. If it is prototyped, it is as a `SandboxProvider`
+adapter that talks to Substrate directly, never through AX, and the prototype is done when:
+`SESSION_CONFIG` reaches the sandbox without a secret in any `ActorTemplate`; `sandbox-agent`
+reconnects after a full restore on another worker and the old gen is refused (§6.1's 403); from
+inside the sandbox the control plane and the git host are reachable and any other host is refused;
+a `git push` succeeds through an injected credential while the token is absent from the sandbox; and
+suspend and resume latency, snapshot size on a real workspace with its dependencies installed, and
+the cost of an idle session have been measured.
+
 ## 43. The MCP surface
 
 §27 ("Enterprise sandbox glue") is where rows 180-183 point today, and it is the wrong section: §27's
@@ -6734,7 +7127,10 @@ a session's live status and its transcript paging (piece (a), §43.20), the boun
 with its freshness or its absence (piece (c), §43.20); 183 adds plan read/approve/reject,
 prompt-while-running, stop, and delegate (create session). Repository discovery (`narvi_list_repositories`)
 is deliberately absent from 180 too: this codebase has no `GET /api/repos` route for it to sit over,
-and the one-adapter rule (§43.7) means a tool ships only once its HTTP twin exists.
+and the one-adapter rule (§43.7) means a tool ships only once its HTTP twin exists. A session a client
+creates over MCP (row 183) records `spawn_source = mcp` (decided 2026-09-28), set by the server from the
+authenticated principal and never read from the request, since the REST create path refuses a
+caller-supplied source other than `web`.
 
 ### 43.2 Authentication: a bearer token from this deployment's own authorization server
 
@@ -7021,7 +7417,7 @@ enabled.
 cookie gate it carried in 180 is gone (§43.2). One credential family per surface keeps one principal
 derivation to audit and makes the 401 challenge unambiguous. The access token is a third credential
 family, kept apart from the two it resembles: the model-provider OAuth link (§29, where Narvi is the
-*client*, and the secret is encrypted because it must be replayed upstream) and the deployment's own
+*client*, and the secret is encrypted because it must be replayed to the provider) and the deployment's own
 secrets (encrypted, delivered into sandboxes). An MCP access token is issued and verified by Narvi
 alone, so it is stored only as `platform.HashToken` output — irreversible, looked up by equality, never
 encrypted, never logged, never in an error or an audit row — in its own `mcp_oauth_*` tables.
@@ -7251,7 +7647,7 @@ authorize refused` with `outcome=pending_request_cap`, the `client_id`, and the 
 `client_address` — the brakes' own network key — never its query or a cookie; a request that is stored is
 not logged. So the lines name who was refused, not who holds the places: a flood faster than its requests
 lapse has its excess refused, and its networks are the ones named again and again, which the operator
-blocks upstream; a flood paced to take each place as it frees is refused only when someone else took a
+blocks in front of the proxy; a flood paced to take each place as it frees is refused only when someone else took a
 place first, so it may be named rarely or never, and then the proxy's access log, where there is one, or
 cutting the client off is the operator's answer (`docs/runbooks/mcp-client-cutoff.md`).
 
@@ -7782,8 +8178,9 @@ else no turn at all → `idle` (a session created without a prompt); else `finis
 mirroring `turn.IsTerminal`'s deny-list, so a busy session never reads settled because of a value this
 code does not recognize. A non-empty queue is therefore always `queued` or `running`, never `idle` or
 `finished`. `settled` is true for `idle`, `awaiting_approval` and `finished`: nothing progresses
-server-side until a person acts or sends new input — with one stated limit, the echo of a pull request
-review session's own push (below).
+server-side until a person acts or sends new input. (An earlier revision stated one limit here, the
+echo of a pull request review session's own push; a review session no longer pushes, so the limit is
+gone — below.)
 
 **A completed turn's delivery.** A successful turn's work is not done when the turn is: its branch is
 pushed and its pull request opened afterwards, outside the turn's own terminal transaction. The actor
@@ -7796,12 +8193,10 @@ stamped for shadow and blocked cycles that send nothing, and it stays set after 
 cannot serve. The progress is its own column, `sandboxes.pr_delivery_started_at` (migration `000145`):
 stamped with the database's `now()` in the same transaction that completes the turn — so no snapshot
 holds that completed turn without it — and only when a push will really be sent (live egress, a creator
-whose push can authenticate, at least one repository with a branch); cleared once `createPRBestEffort`
+whose push can authenticate, at least one repository with a branch, and not a pull request's review
+session, which never pushes); cleared once `createPRBestEffort`
 has returned, after the pull request's artifact row is written, so a status that no longer says
-`delivering` already lists the pull request it opened. When the session is a pull request's review
-session and the push moved that pull request's own head, the automatic re-review that push causes is
-armed only when the code host's `synchronize` for it lands, so the stamp can clear into `finished`
-first — a stated limit (below). `createPRBestEffort` clears it on every return
+`delivering` already lists the pull request it opened. `createPRBestEffort` clears it on every return
 (deferred), including the ones that open no pull request — no `SourceControl` configured, a
 `push_complete` listing no repository, a creator who may no longer open one (disabled, or now a
 viewer), a token that no longer decrypts, GitHub refusing the request — so `finished` can come with no
@@ -7835,8 +8230,9 @@ so review round 3 inventoried every mechanism that can create a turn, or change 
 reports, on a session with no new human input — every `session_timers` kind and its handler, the
 background workers, and all six places a turn is inserted (`createTurnLocked`, session creation, plan
 approval, the workflow engine's advance, the re-review debounce's handler, the composition dispatch) —
-and review round 4 added the input the server produces itself: its own output coming back as a webhook,
-which the status observes only once that webhook lands (a stated limit, below).
+and review round 4 added the input the server produces itself: its own output coming back as a webhook.
+The one such echo found, a review session's own push, no longer exists: a review session never pushes
+(below).
 
 | Mechanism | What arms it | What fires it | Can it create work from a settled snapshot? |
 |---|---|---|---|
@@ -7845,13 +8241,13 @@ which the status observes only once that webhook lands (a stated limit, below).
 | `inactivity` timer | the sandbox reaching `ready`; re-armed | timer pump → session actor | No — `ready` → `suspect` (a warning event on an extension) |
 | `terminal_grace` timer | `transitionSandboxToSuspect` (the three watchdogs, a permanent spawn failure) | timer pump → session actor | No — `suspect` → `failed`, the status re-derived with its reason unchanged, then dispatch re-run for a turn that is already pending (already `queued`) |
 | `turn_deadline` timer | a turn's dispatch; deleted at its completion | timer pump → session actor | No — it times out the turn that is processing, whose end can queue the workflow's next step in the same transaction, so it acts only while the snapshot already reads `running`; with no processing turn it deletes itself |
-| `review_retrigger_debounce` timer (§24) | the `pull_request`/`synchronize` webhook, on every push to a PR with a review session, opted in or not — the session's own push to its PR's head included, once the code host delivers it (next row) | timer pump → session actor, `ReviewRetriggerDebounce` (2 min) after the last push | **Yes** — inserts a review turn with no further input when the repository opted in, the head moved and the budget allows; otherwise declines and deletes itself |
-| A PR review session's own push to its PR's head | the session's completed turn: its push, reported by `push_complete` — or by `push_error` when the push reached the remote before its report failed | GitHub's `pull_request`/`synchronize` for that push — the server's own output echoed back — which arms the debounce above on the same session, exactly as for any other push | **Yes, through the debounce, once that webhook lands** — a stated limit, not closed: the server records nothing when the push completes or fails, so between the end of the delivery and the webhook the session can read `finished` and settled (below) |
+| `review_retrigger_debounce` timer (§24) | the `pull_request`/`synchronize` webhook, on every push to a PR with a review session, opted in or not — never the review session's own, since a review session never pushes (next row) | timer pump → session actor, `ReviewRetriggerDebounce` (2 min) after the last push | **Yes** — inserts a review turn with no further input when the repository opted in, the head moved and the budget allows; otherwise declines and deletes itself |
+| A PR review session's completed turn | — | — | No — a review session never pushes: `completeProcessingTurn` sends it no push command and starts no delivery, so its turn's end leaves nothing for the code host to echo back |
 | Release manifest check (§15) | a new review session on a release PR (`release_manifest_pending`, enqueued by the webhook) | `releasereview.Worker`, every `ReleaseManifestCheckPumpInterval` | **Yes** — when the aggregate review triggers, inserts the composition review turn on that same session |
 | A workflow's next step (§25) | a step's turn ending, or `/decide` | the same transaction | No gap — inserted in the transaction that ends the previous step's turn |
 | A plan's implementation turn (§8.1) | a person approving the plan | the same transaction | Human input |
 | Mentions, the review label, the re-review button, REST, Slack and Linear turns | a person | the request itself | Human input; the turn is inserted before the request returns |
-| A completed turn's push and pull request | the turn's completion | its `push_complete` | Covered by `delivering` (above); a PR review session's own push to its PR's head, by the row two above |
+| A completed turn's push and pull request | the turn's completion | its `push_complete` | Covered by `delivering` (above); a PR review session has none (the row two above) |
 | Dispatch and spawn retries, turn recovery | a pending or in-flight turn | the session actor | Only acts on a turn the snapshot already reads `queued` or `running` |
 | Automations (cron, GitHub including `check_run`, Linear), sentinel auto-fix, child sessions | their triggers | their pumps | Create a new session, its first turn in the same transaction — never a turn on an existing one |
 
@@ -7924,33 +8320,31 @@ waiting check's enqueue plus `ReleaseManifestCheckPumpInterval`, a running check
 `ReleaseManifestCheckTimeout`. Two stated limits err toward unsettled: a debounce whose fire then
 declines on a rule the status does not copy reads `scheduled` until it fires; and a release PR's review
 session reads `scheduled` until its check has run, whether or not the check triggers the composition
-pass. The third errs the other way, and has a paragraph of its own.
+pass. A third, which erred the other way, is closed; the next paragraph says how.
 
-**A stated limit: the echo of a review session's own push.** When a pull request's review session pushes
-to that pull request's head — a same-repository pull request whose head branch is the session's branch —
-the code host delivers `pull_request`/`synchronize` for that push, and the webhook arms the automatic
-re-review (§24) on the same session, exactly as it does for any other push. The server records nothing
-when the push completes: the delivery ends when `createPRBestEffort` returns, and until that webhook
-lands no work is armed, so the status can read `finished` and settled, and a client waiting on
-`settled` returns before the re-review exists. The same holds when the push reached the remote and the
-sandbox then reported `push_error` — reading the pushed head back failed, or the deadline fired after the
-remote accepted the update: the stamp clears on the `push_error`, and the head has moved all the same.
-It matters only where the re-review can fire (the repository opted in, the budget not spent); elsewhere
-the fire declines and the status is right to read settled. What a client sees: once the webhook lands,
-`scheduled`, then `queued` and `running` once the fire inserts the review turn — a session that read
-settled reads unsettled again with no new input from anyone. Row 182's result (c) reports each pull
-request's verdict with its freshness, its recorded context compared with the pull request's live head
-(§21.1b), so a verdict produced before the push does not read as fresh there
-(`TestResult_OwnPushMovedHeadIsNotCurrent`, piece (c) below). Review round 4
-closed the gap by performing the webhook's write in the transaction that persists `push_complete`;
-review round 5 reverted that entirely, because it changed what §24 does and how its webhook locks: the
-actor's transaction and the webhook's took the session row and the pull request's row in opposite orders
-and deadlocked (`40P01`) when a push
-and its `synchronize` were processed together; it armed a paid re-review of a pull request already merged
-or closed, which GitHub sends no `synchronize` for; and the guard it needed against reviewing the same
-head twice also kept the webhook from arming after an ordinary mention created against that head. A
-status observes the system; making one read exact is not a reason to reshape what it observes.
-`TestSessionStatus_OwnPushEchoIsAStatedLimit` pins the limit and main's webhook under it.
+**Closed: the echo of a review session's own push.** A pull request's review session is read-only: it
+never pushes (`completeProcessingTurn` returns no push signal for a session with a `github_pr_sessions`
+row, before it records any push cycle), and its sandbox is only ever served the read-only installation
+token (§30.4, amended). So its turn's end starts no delivery and leaves nothing for the code host to echo
+back: the status reads `finished` and settled at once, and it is right to — only a push by someone else
+can arm the re-review, through its own `synchronize`, as on any pull request.
+`TestSessionStatus_ReviewSessionNeverPushesSoItsTurnEndsSettled` pins it: no push command, no delivery,
+`finished` and settled with nothing armed; the signed `synchronize` of another push then arms the
+debounce from its own instant, `scheduled`, then `queued`. Row 182's result (c) still reads each verdict's
+freshness against the pull request's live head (§21.1b), so a verdict produced before any push does not
+read as fresh (`TestResult_HeadMovedAfterTheVerdictIsNotCurrent`, piece (c) below).
+
+Before, this paragraph stated a limit: a review session pushed its own work to its pull request's head,
+the code host echoed that push back as `synchronize`, and between the end of the delivery and that
+webhook the status could read `finished` and settled although a re-review was about to be armed.
+Review round 4 closed it by performing the webhook's write in the transaction that persists
+`push_complete`; review round 5 reverted that, because it changed what §24 does and how its webhook
+locks — the two transactions took the session row and the pull request's row in opposite orders and
+deadlocked (`40P01`); it armed a paid re-review of a pull request already merged or closed, which GitHub
+sends no `synchronize` for; and its guard against reviewing the same head twice kept the webhook from
+arming after an ordinary mention created against that head. A status observes the system; making one
+read exact is not a reason to reshape what it observes. The limit is now closed at its source instead:
+the push no longer exists.
 
 **Which escalation is a gate.** A workflow run escalated to `needs_review` (§25.9) stays there: no
 route or job moves a run out of it — `/decide` acts only on a step awaiting a decision — and the next
@@ -8213,11 +8607,10 @@ delivery, the real timer pump and actor: `finished`, then `scheduled` from the w
 the review turn exists — never settled in between — then `queued`),
 `TestSessionStatus_ReReviewThatCannotFireReadsSettledAtOnce` (not opted in: armed, yet `finished` right
 after the push and through the fire, which declines), `TestSessionStatus_ReReviewFireAndStatusAgree`,
-`TestSessionStatus_OwnPushEchoIsAStatedLimit` (the stated limit, with a real actor: after the
-session's own push — `push_complete` with `CreatePR` held open, or a `push_error` after the push reached
-the remote — `finished` and settled with nothing armed; the late signed `synchronize` then arms the
-debounce exactly as on main, from its own instant, even when a turn was already created against that
-head; `scheduled`, then `queued` once the fire inserts the review turn),
+`TestSessionStatus_ReviewSessionNeverPushesSoItsTurnEndsSettled` (with a real actor: a review
+session's completed turn sends no push command and starts no delivery, so the status reads `finished`
+and settled at once with nothing armed; the signed `synchronize` of another push then arms the debounce
+from its own instant; `scheduled`, then `queued` once the fire inserts the review turn),
 `TestSessionStatus_ReleaseManifestCheckIsScheduledUntilItsCompositionTurnExists` (the real worker:
 `scheduled` while the check waits and while it runs, `queued` with the composition turn, settled at once
 when nothing triggers it). MCP:
@@ -8440,9 +8833,10 @@ eligibility tables, and an exhaustive product of the freshness fields, through b
 tests pin that `computeEligibleCore` compares no freshness field itself and that `revalidateCore` makes no
 base or ancestry call of its own.
 
-The stated limit above -- a review session's own push moving its pull request's head while the status
-reads settled -- is visible here: the result reads the live head, so the pre-push verdict is `stale`
-while the status still reads `finished` (`TestResult_OwnPushMovedHeadIsNotCurrent`).
+A push that moves the pull request's head after the verdict -- never the review session's own, which
+never pushes -- is visible here before its `synchronize` arms anything: the result reads the live head,
+so the pre-push verdict is `stale` while the status still reads `finished`
+(`TestResult_HeadMovedAfterTheVerdictIsNotCurrent`).
 
 **Tests of the result.** Domain: `TestCheckFreshness_EquivalentToEligibilityPrefix`,
 `TestCheckFreshness_EveryReason`, `TestComputeEligibleCore_ComparesFreshnessOnlyThroughCheckFreshness`,
@@ -8463,7 +8857,7 @@ recorded each decided by the probe on the pull request read alone, no context wi
 and `current`, closed and still closed `not_applicable` from the live read, base moved forward, base
 rewritten, retargeted onto another base at the same commit, stacked since the verdict, no longer open;
 and `reviewScope` `none` with an empty list and a null reviewed pull request),
-`TestResult_NeverCurrentWithoutLiveConfirmation`, `TestResult_OwnPushMovedHeadIsNotCurrent`,
+`TestResult_NeverCurrentWithoutLiveConfirmation`, `TestResult_HeadMovedAfterTheVerdictIsNotCurrent`,
 `TestResult_LastRunFailureReasonOnlyWhenDerivable` (and the status's own answer for the same session),
 `TestResult_SummaryBoundedAndNoTranscript` (exactly `SessionOutcome`'s keys; the last-opened part, never
 a later turn's text; cut at 4,000 characters; exactly 4,000 not truncated; no text null),
@@ -8490,3 +8884,269 @@ unknown one, every role). On the production router, through the official SDK cli
 router's source control is the real code host adapter, so its seed resolves every review from the record
 alone -- absent, not assessed, merged per the claim -- and carries a suppressed creation; the live read is
 proven against the fake code host above.
+
+## 44. The GitHub App pool (new capability)
+
+Adopted by owner decision on 2026-09-25, without waiting for a measured saturation. This section
+specifies what that decision builds, starting with what the pool is for in this design.
+
+### 44.1 What the pool is for, and what it is not
+
+Three purposes, none of which needs a rate-limit argument:
+
+- **Roles one credential cannot hold at once.** The only GitHub App this deployment can mint tokens
+  for is refused at boot unless it is read-only (`verifyGitHubAppScopeAtBoot`, `controlplane/boot.go`),
+  because it backs §30.4's read-only mint. Every write the control plane makes on its own behalf goes
+  through `NARVI_GITHUB_BOT_TOKEN`, a static string read once at boot (`platform.Config.GitHubBotToken`).
+  GitHub's own documentation for check runs says: "To create a check run, you must use a GitHub App."
+  An App's installation token expires after one hour. So the `narvi/review` check §21.1b specifies and
+  Step 174 publishes has no durable credential today: a personal token cannot create it, and an
+  installation token pasted into the environment stops working an hour after boot. Granting
+  `checks:write` to an installation does not change that on its own. Reading and publishing need
+  different Apps, and this design has no way to hold the second.
+- **Rotation and retirement without an outage.** Replacing the one bot credential today means a
+  restart, and any write attempted between revoking the old credential and booting with the new one
+  fails. A retiring App drains instead.
+- **One identity for each kind of write.** Publication (reviews, labels, comments, checks) comes from
+  one publish App at a time, and a turn's work (a push, a pull request) from the App bound to that
+  turn, so a retry never changes the author.
+
+**What it is not: a promise of capacity.** Section H of GitHub's Terms of Service reads: "You may not
+share API tokens to exceed GitHub's rate limitations", and the same section says GitHub may offer
+subscription-based access to users who need high throughput. Whether several Apps registered by one
+operator for one workload fall under that sentence is GitHub's call, not this document's.
+Budget-aware selection (§44.6) is built, because choosing among Apps that are each needed for their
+own reason is ordinary scheduling; registering Apps in order to gain headroom is the operator's
+choice (owner decision, 2026-09-28), and the runbook (§44.8) says so beside the Terms' sentence.
+
+### 44.2 GitHub's deadlines are honored end to end
+
+This applies with one App as much as with several. It follows §21.1b's create-once formal review
+(Step 190), because it stops counting rate-limited attempts, and a write that is not idempotent
+would then be repeated more often, not less.
+
+What exists: `githubapi.APIError` carries `Status`, `Message` and `RateLimited`, and no deadline.
+`isRateLimitedResponse` sets that boolean on a 403 only, from `x-ratelimit-remaining`, the presence
+of `retry-after` and, as a fallback, the message text, then discards the values; a 429 is never
+marked. The outbox retries every failure the same way (`domain/outbox.EvaluateBackoff` over
+`platform.Timeouts.OutboxBackoffBase`, 30 seconds, doubling to `OutboxBackoffMax`, 5 minutes, with
+dead-letter at `MaxAttempts`, 10), so a primary limit reached early in its hour dead-letters about 33
+minutes later, before the reset, and the notification is lost although nothing was wrong except the
+time.
+
+The rule:
+
+- The adapter's error carries the deadline GitHub stated, typed, on a 403 or a 429 from every call
+  path: `x-ratelimit-reset` when `x-ratelimit-remaining` is `0`, `retry-after` when present, and
+  otherwise the one-minute floor GitHub's own guidance gives. The message text may still classify a
+  response; it never computes a deadline.
+- A failure of a class that must not consume an attempt (a rate limit here, a delivery this process's
+  own shutdown cut short in §5.1) takes back the attempt the claim counted and reschedules the row,
+  each cause under its own bound: a rate limit under a longer ceiling in
+  `internal/platform/timeouts.go`, measured from the first deferral the row records, that
+  dead-letters naming it; a shutdown under §5.1's bound, past which the delivery counts normally.
+- A deadline learned from one response holds every row due to use the same rate-limit owner until it
+  passes (an App installation; for a personal token, the GitHub account behind it, so two tokens of
+  one account share one budget), so a limit is not rediscovered once per row; where GitHub states
+  none, the wait doubles on each consecutive rate-limited deferral of that owner, capped, and resets
+  on a success.
+- A permission or authentication refusal is not a rate limit, and keeps its existing path.
+- Every GitHub caller that retries on its own schedule outside the outbox receives the same deadline.
+  The Step enumerates them; the auto-merge worker and the image freshness pump (§19) are two.
+
+### 44.3 Budgets are observed, never assumed
+
+Per credential (the bot token, the image-build token the freshness pump spends, and each App
+installation; two personal tokens of one GitHub account observed as the one owner they are) and per
+GitHub resource: limit, remaining, used and reset, read from the headers of
+responses to requests this system actually made, with the time observed and whether the reading came
+from a response or a probe.
+
+- **Never observed is its own state**, neither full nor empty. Reading an absent measurement as a full
+  budget is the same shape as an unassessed review rendering clean; reading it as empty would shed
+  forever the very calls that would observe it. A reading whose reset time has passed is stale and
+  counts as never observed, since GitHub has refilled that budget. Shedding does not trigger on
+  either, and selection prefers a known budget with room, then an unknown one, and never refuses on
+  unknown alone.
+- **A probe is labeled as a probe.** A rate-limit endpoint read answers a different question from a
+  response header; it is recorded beside the response-sourced reading, never merged into it.
+- **The first consumer is background shedding.** Below a floor, background GitHub reads on these
+  credentials (the image freshness pump, the auto-merge worker's polling, the release-review worker)
+  defer with a recorded reason; human-initiated work and publications do not. The decision inbox reads
+  with the viewing user's own credential, on request, and is not among them.
+  A count of `gh` commands a sandbox ran is not a count of HTTP requests and is never presented as one.
+
+### 44.4 The registry, its roles and its states
+
+Each App is registered with its id, its bot login, its private keys and webhook secret (encrypted at
+rest with `platform.EncryptToken`, never readable back through any API), its installations (account,
+repositories reached, permissions as GitHub reports them), one role and one state.
+
+- **Roles.** `read`: every sandbox clone that needs no write, which is what §30.4's read-only mint
+  serves: shadow sessions, build boots and review sessions (a review session is read-only). `publish`: the writes the control plane makes on its own behalf (formal reviews, labels,
+  comments, check runs), never `contents:write`. `work`: a push or pull request for a session that no
+  human GitHub credential covers. The bot token's writes outside publication stay on it, outside the
+  pool, until a decision moves them: auto-merge's merge, sentinel fix pull requests, description
+  autofix and the commit statuses of preview links.
+- **Eligibility is derived, never declared.** An App is eligible for a role on a repository only if an
+  active installation reaches that repository with the permissions the role needs, as GitHub reports
+  them (the installation events every App receives about itself, and a periodic re-read). An App whose
+  permissions exceed its role is refused at registration. Every boot re-reads the permissions of the
+  App serving §30.4's read-only mint and refuses to start if it can write or cannot be read, as today's
+  boot check does; any other App granted more since, or unreadable, is marked ineligible with the
+  reason, and a retired App is not read.
+- **States.** `active`; `retiring` (no new binding, existing work and checks finish); `retired`.
+- **Keys are a set, and configuration only adds.** Each App holds a set of private keys, as GitHub
+  lets an App hold several for rotation. Today's `NARVI_GITHUB_APP_ID` App becomes the `read` App,
+  seeded once with the configured key. After that the registry is authoritative: a configured key
+  already in the set is ignored, so a key rotated through the operator surface never reverts and an
+  environment still holding the old key boots; a configured key not yet in the set is added,
+  audited, which is how a key rotates before the operator surface exists, unless it matches the
+  tombstone a removed key leaves by fingerprint, in which case it is refused with a boot warning and
+  never re-added; only a configured App id that differs from the registry's `read` App refuses boot,
+  naming both. The newest active key signs, the others are its fallback. Moving the `read` role to
+  another App is an operator action (§44.8), never a configuration change.
+- **Writes are admin-only and audited** (§13.3).
+
+Which sessions may use the `work` role, and in particular whether a creator with no linked GitHub
+identity (§41.3's OIDC-only user) may push through a bounded App credential, is an open decision
+recorded in `docs/DECISIONS.md`; the registry makes either answer implementable and gives neither.
+Whatever the answer, the sandbox never holds a `work` installation token: GitHub cannot limit one to
+a branch, so the decision also says how the push is bounded (for example, made by the control plane
+for the session's own branch only).
+
+### 44.5 One publish App, and tokens minted per purpose
+
+- **Publication comes from one App at a time.** Formal reviews, labels, comments and check runs are
+  written by the deployment's `publish` App. GitHub lets only the App that created a check update it,
+  so a check stays with its creator: after the publish App changes, the checks of pull requests
+  already open are finished by the App that created them and new heads go to the new App. One active
+  check identity per pull request (§21.1b) holds throughout.
+- **The ingress knows every writer.** The publish App's bot login, read from GitHub's own App metadata
+  when the App is registered, is recognized as this system's own before that App writes anything,
+  beside the configured handle, so a comment it posts is never read as a mention from an unlinked
+  account.
+- **A check records its creator, and a head keeps it.** Each check row records the App that created
+  it, replacing today's single deployment-wide learned writer id, so a process adopts and updates a
+  run through the App that run recorded, and while that App is active every later `narvi/review`
+  check on the same head goes to it, so a restart on one head never opens a second check under
+  another. **Retirement ends in one step**: a retiring publisher re-completes, as not assessed with
+  the reason, every check it created that is still open or is the current check of an open pull
+  request's head, completed ones included, since a `success` left on a head would stay green on code
+  no active publisher could mark stale; the next review of such a head opens its check under the
+  current publisher, and the old App retires once no binding references it. A branch protection rule
+  or ruleset naming the old App as the check's source is the runbook's to change.
+- **Until a receiver is designated (§44.7), the existing webhook stays the only processed source**:
+  the publish App's own repository-event deliveries are verified and not processed.
+- **Tokens are minted per purpose.** An installation token is minted per (App, installation,
+  repositories, permissions requested), narrowed with the `repositories` and `permissions`
+  parameters GitHub's mint accepts, as §30.4's read-only mint already does, and cached until shortly
+  before GitHub's own `expires_at`. The cache key includes what was requested, so a request for less
+  never receives a cached token for more, and granted permissions are checked against the request
+  before use, as §30.4(4) does.
+- **Additive.** With no `publish` App registered, the static bot token stays in use and boot says so.
+
+### 44.6 A turn's work App is bound once, durably
+
+When a turn needs a `work` identity, one eligible App is bound to it through a claim taken
+atomically (§5.1's claim idiom) and persisted on the turn, so two dispatchers cannot bind two Apps
+and a restart finds the binding. Only an unconfirmed claim expires; a confirmed binding lasts as long
+as the turn and every write it still has pending, so a retry hours later keeps the same author.
+Selection reads §44.3's budgets, treats unknown as unknown, and never binds a retiring App.
+
+### 44.7 Webhooks from several Apps, and retirement
+
+- **One App is the receiver of repository events.** With several Apps installed on one repository,
+  GitHub sends the same event once per App, each under its own delivery id, so the per-delivery claim
+  (§5.1) would process it once per App. For each repository the designated receiver processes its
+  events where it is installed and subscribed to them with the permissions they need, and where it is
+  not, one other App meeting the same conditions, chosen deterministically, does, so no repository
+  goes unprocessed. Deliveries of repository events from every other App are verified with their own
+  secret, kept for a bounded window, and not processed. The existing webhook is the receiver until an
+  App is designated, and is never processed beside one. Events about an App itself (`installation`,
+  `installation_repositories`) reach only that App and are processed from every registered App.
+- **A change of receiver loses and doubles nothing**, planned or not (a fallback that changes because
+  installation data moved, or a receiver uninstalled from a repository, after which GitHub sends it
+  nothing more): the new receiver replays the kept deliveries of the window that no receiver
+  processed, then processes, and during the window deduplicates by a key derived from the payload
+  that separates genuinely different events (event, action, object id, the label name, the before and
+  after shas, the base of an edit, `merged` on a close, and the object's update time; never the
+  delivery id or the installation). Keys are recorded for every processed repository event, so a copy
+  processed before the window began is recognized; two identical actions within the update time's
+  resolution can collide, and only inside a change's window.
+- **Every registered App's bot login is this system's own**, in addition to the configured handle,
+  which stays recognized while the static bot token is in use; a comment from any of them never
+  re-triggers a review or an automation.
+- **Retirement drains.** A retiring App takes no new binding, work already bound to it finishes, a
+  retiring publisher re-completes its current checks as §44.5 states, and the App becomes retired once
+  nothing references it. The receiver cannot be retired before another is designated and has replayed
+  its window.
+
+### 44.8 The operator surface
+
+An admin-only Settings view with one row per App: role, state, installations and eligible
+repositories, budget with its provenance and age ("never observed" shown as such), live bindings,
+open checks it owns and recent refusals. Register, rotate a key, retire and designate the receiver are
+audited actions. A runbook under `docs/runbooks/` covers registering a second App, rotating a private
+key, changing the publish App (including a branch protection rule or ruleset that names the old App
+as the check's source), retiring an App and moving the receiver, and states that adding an App
+for rate-limit headroom is the operator's choice, quoting Section H of GitHub's Terms of Service.
+
+### 44.9 Phasing
+
+Phase 20, appended: the create-once formal review (Step 190) first, then the deadline rule (§44.2),
+then the registry, then the publish App and the budgets, then the work binding and webhooks with
+several Apps, and the operator surface last.
+
+## 45. A second agent runtime, and provider accounts (new capability)
+
+Adopted on 2026-09-28. The runtime port (§4.2) was drawn to take a second
+adapter, and a model provider's subscription is a credential users already hold. This section states
+the parity a second runtime owes, who may use an account, and the fact to establish before any code:
+what the provider's terms allow.
+
+### 45.1 Provider accounts are credentials with owners
+
+An account is a credential a user connects (the provider's sign-in, a setup token, or an API key),
+encrypted at rest and refreshed centrally like §29's ChatGPT link, but stored where automatic
+resolution never reads it: it is used only where it was explicitly selected. Today a credential at
+the user scope heads the resolution order (`scopePriority`, `internal/domain/providercredential/scope.go`)
+and is resolved from the session's creator, so a linked personal credential already takes precedence
+over every deployment key for all of its owner's sessions; for a pull request's review session,
+whose creator is merely the first linked person who triggered it, that is a defect of its own, fixed
+by row 205. New accounts, subscription or API key, do not join that resolution: connecting one
+changes nothing until its owner selects it for a session they create and run themselves; a review
+session, an automation's session, a session someone else created and any child session never use
+it, since a selection never passes to a child, and their turns keep the deployment's credentials. Automations run on triggers other people cause
+and can be edited by any maintainer, so they use deployment accounts, which an admin manages. §29's
+existing ChatGPT link keeps its current resolution for its owner's own sessions. Who may manage an account
+follows §13.3, and a default is an explicit, audited act. Letting any signed-in user
+administer every account, and making the first connected account the default of every session that
+pinned none, are both refused here, because a change of provider nobody chose is a change of where
+code and prompts go.
+
+**Before any code, a reading.** Whether the provider's terms allow a subscription credential to
+drive automated and multi-user sessions is recorded with its date in `docs/DECISIONS.md`. Where they
+do not, accounts ship for API keys only.
+
+### 45.2 A second runtime owes parity, or declares what it has
+
+The adapter translates into the same `AgentEvent` vocabulary (§7) and carries what this design
+relies on: sub-task fan-out (§7.1), cost per step (§25.15), compaction, resume by conversation id,
+plan mode with at least OpenCode's guard (its `plan` agent denies the edit tool; a guard on edits,
+not a sandbox), which a train's mother session (§39.1) relies on, the verdict tool and its raw-comment block (§8.2), the sentinel fix's edit restriction (§17.2), and
+the review sub-agents (§26.4, §26.6). What it supports is declared as an allow list in its
+capabilities, like the sandbox provider's, and anything it does not declare is refused at dispatch
+with the capability named; a session silently degraded to fewer guarantees is the failure to design
+against. Its first exit criterion is empirical, on Step 57's precedent (made a CI job by Step 163): a real turn on the pinned SDK in
+CI, which no mock stands in for.
+
+### 45.3 The choice is recorded
+
+`runtime` on a session and on an automation defaults to today's, is validated at creation against
+the runtime's declared capabilities, is recorded on the turn beside `model_id`, and never changes a
+running session.
+
+### 45.4 Phasing
+
+Steps 209-211, Phase 21: accounts and the adapter in either order, then the choice.

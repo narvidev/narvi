@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -116,7 +117,7 @@ func (c *Client) doAppRequest(ctx context.Context, method, path string, body any
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("githubapp: %s %s returned http %d", method, path, resp.StatusCode)
+		return &statusError{method: method, path: path, status: resp.StatusCode}
 	}
 
 	if out == nil {
@@ -126,6 +127,36 @@ func (c *Client) doAppRequest(ctx context.Context, method, path string, body any
 		return fmt.Errorf("githubapp: decode response for %s %s: %w", method, path, err)
 	}
 	return nil
+}
+
+// statusError is doAppRequest's non-2xx outcome: the request and the
+// status code, never the response body (see doAppRequest). Typed only so
+// MintInstallationToken can tell a missing installation (404 on the
+// installation lookup) from every other failure.
+type statusError struct {
+	method string
+	path   string
+	status int
+}
+
+func (e *statusError) Error() string {
+	return fmt.Sprintf("githubapp: %s %s returned http %d", e.method, e.path, e.status)
+}
+
+// InstallationNotFoundError reports that the GitHub App has no
+// installation covering Owner/Repo: GitHub answered the installation
+// lookup (GET /repos/{owner}/{repo}/installation) with 404. It is a
+// configuration state, not an outage -- the App has to be installed on that
+// repository (on its owner's account) before a token can be minted for it
+// -- so a caller can name the repository and the remedy instead of
+// reporting a bare failure.
+type InstallationNotFoundError struct {
+	Owner string
+	Repo  string
+}
+
+func (e *InstallationNotFoundError) Error() string {
+	return fmt.Sprintf("githubapp: the GitHub App is not installed on %s/%s", e.Owner, e.Repo)
 }
 
 // appPermissionsResponse mirrors the subset of GitHub's real GET /app
@@ -194,6 +225,10 @@ func (c *Client) MintInstallationToken(ctx context.Context, owner string, repoNa
 	installationPath := fmt.Sprintf("/repos/%s/%s/installation", url.PathEscape(owner), url.PathEscape(repoNames[0]))
 	var installation installationResponse
 	if err := c.doAppRequest(ctx, http.MethodGet, installationPath, nil, &installation); err != nil {
+		var status *statusError
+		if errors.As(err, &status) && status.status == http.StatusNotFound {
+			return Token{}, &InstallationNotFoundError{Owner: owner, Repo: repoNames[0]}
+		}
 		return Token{}, fmt.Errorf("githubapp: resolve installation for %s/%s: %w", owner, repoNames[0], err)
 	}
 	if installation.ID == 0 {

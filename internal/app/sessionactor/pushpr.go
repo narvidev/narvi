@@ -69,6 +69,7 @@ import (
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/shadowledger"
@@ -237,9 +238,9 @@ type pushSignal struct {
 	// blockedNoGitHubIdentity (review round 2, finding P1) is the SAME
 	// shape of decision as suppressedInShadow above, for a DIFFERENT
 	// reason: this session's creator passes the §13.3 viewer-guard
-	// staleness recheck but has no linked github identity at all, and
-	// this is not a review session (see
-	// pushBlockedByMissingGitHubIdentity's own doc comment) -- so
+	// staleness recheck but has no linked github identity at all (see
+	// pushBlockedByMissingGitHubIdentity's own doc comment; a review
+	// session never reaches that question, it never pushes) -- so
 	// scmcredentials.go's own step 10 is now certain to 403 the sandbox's
 	// credential fetch, unconditionally, no bot/service-account fallback
 	// existing for this case any more. Sending the push command anyway
@@ -536,6 +537,39 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 		return nil, nil
 	}
 
+	// A pull request's review session is read-only: it never pushes. Its
+	// repos[].branch is the pull request's head ref, which it checks out
+	// to read, never a branch it owns. Decided here, the one place a push
+	// cycle begins, and before anything below records one: no egress
+	// decision, no suppressed-push ledger row (nothing was suppressed),
+	// no push-blocked warning, no delivery stamp, and no signal for
+	// sendPushBestEffort. A review's output reaches GitHub through the
+	// verdict path, never through git. Its sandbox is also only ever
+	// handed a read-only credential (internal/adapters/inbound/httpapi's
+	// ScmCredentials), so this is not the only guard -- it is the one
+	// that keeps the control plane from asking.
+	//
+	// A turn here that is not a review attempt (turns.is_review_attempt
+	// false: a follow-up mention, a web prompt, a plan's implementation)
+	// may well have been asked to change code. Its end is not silent: it
+	// records a session-visible warning saying the session is a pull
+	// request review, read-only, so changes made in it are not pushed. A
+	// review attempt records nothing -- reviewing is exactly what it was
+	// for. A lookup failure fails the whole completion (rolled back, the
+	// event left unacked for redelivery): no push is ever sent on a guess.
+	review, err := a.isReviewSession(ctx, a.stores.githubPRSession.WithTx(tx))
+	if err != nil {
+		return nil, err
+	}
+	if review {
+		if !processing.IsReviewAttempt {
+			if err := a.recordSessionWarning(ctx, tx, int(sandboxRow.Gen), reviewSessionReadOnlyWarning); err != nil {
+				return nil, err
+			}
+		}
+		return nil, nil
+	}
+
 	repos, err := reposFromJSON(sessionRow.Repos)
 	if err != nil {
 		return nil, err
@@ -585,7 +619,7 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 		return &pushSignal{gen: int(sandboxRow.Gen), repos: repos, suppressedInShadow: true}, nil
 	}
 
-	// Review round 2, finding P1: a live, non-review session whose
+	// Review round 2, finding P1: a live session whose
 	// creator has no linked github identity is now certain to have its
 	// push denied by scmcredentials.go's own step 10 (no bot/
 	// service-account fallback exists for that case any more -- see that
@@ -604,11 +638,7 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 	// per-repo skip already makes that a no-op send, exactly as it always
 	// was.
 	if anyRepoHasExplicitBranch(repos) {
-		blocked, err := a.pushBlockedByMissingGitHubIdentity(ctx, tx, sessionRow.CreatedBy)
-		if err != nil {
-			return nil, err
-		}
-		if blocked {
+		if a.pushBlockedByMissingGitHubIdentity(ctx, sessionRow.CreatedBy) {
 			if err := a.recordPushBlockedNoGitHubIdentity(ctx, tx, int(sandboxRow.Gen)); err != nil {
 				return nil, err
 			}
@@ -633,40 +663,56 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 	return &pushSignal{gen: int(sandboxRow.Gen), repos: repos}, nil
 }
 
+// isReviewSession reports whether this actor's session is a pull
+// request's review session: one with a github_pr_sessions row, which
+// GitHub ingress writes in the same transaction that creates the session
+// (internal/adapters/inbound/github's coalesce.go) and which is never
+// moved to another session. internal/adapters/inbound/httpapi's
+// ScmCredentials asks the same question of the same table. prSessions is
+// the store to ask: bound to the caller's transaction where it has one. A
+// genuine lookup failure is an error, never "not a review session": both
+// callers are deciding whether something may reach the code host -- a
+// push (completeProcessingTurn), a pull request (createPRBestEffort) --
+// and that decision fails closed.
+func (a *Actor) isReviewSession(ctx context.Context, prSessions *postgres.GitHubPRSessionStore) (bool, error) {
+	_, err := prSessions.GetBySessionID(ctx, a.sessionID)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		return false, nil
+	default:
+		return false, fmt.Errorf("sessionactor: get github pr session: %w", err)
+	}
+}
+
 // pushBlockedByMissingGitHubIdentity reports whether this turn's push is
 // certain to be denied by internal/adapters/inbound/httpapi's own
 // scmcredentials.go ScmCredentials handler, step 10 (review round 2,
-// finding P1): true only for a session that is NOT a review session (a
-// review session's own github_pr_sessions row makes ScmCredentials mint
-// the bot token unconditionally instead, that handler's own step 7 -- see
-// its doc comment) AND whose creator passes the SAME §13.3 viewer-guard
-// staleness recheck creatorMayGetPRAttribution already performs (a
-// disabled/viewer/missing creator is denied for THAT unrelated reason,
-// never reaching step 10 at all) but has no linked github identity, at
-// all, for provider=github (creatorHasNoGitHubIdentity). Deliberately
-// reuses both of those already-established helpers rather than
-// re-deriving their logic a third time -- this function's own value is
-// purely in combining them with the review-session check, matching
-// ScmCredentials' own step ordering (7, then 9, then 10) exactly.
-func (a *Actor) pushBlockedByMissingGitHubIdentity(ctx context.Context, tx pgx.Tx, createdBy pgtype.UUID) (bool, error) {
-	if _, err := a.stores.githubPRSession.WithTx(tx).GetBySessionID(ctx, a.sessionID); err == nil {
-		// A review session: ScmCredentials' own step 7 always mints the
-		// bot token for it, regardless of the creator's own identity.
-		return false, nil
-	} else if !errors.Is(err, pgx.ErrNoRows) {
-		return false, fmt.Errorf("sessionactor: get github pr session: %w", err)
-	}
-
+// finding P1): true only for a session whose creator passes the SAME
+// §13.3 viewer-guard staleness recheck creatorMayGetPRAttribution already
+// performs (a disabled/viewer/missing creator is denied for THAT
+// unrelated reason, never reaching step 10 at all) but has no linked
+// github identity, at all, for provider=github
+// (creatorHasNoGitHubIdentity). Deliberately reuses both of those
+// already-established helpers rather than re-deriving their logic a
+// third time. Only ever asked about a session that is not a review
+// session: completeProcessingTurn returns before this for one, since a
+// review session never pushes at all. It has no error to return: both
+// helpers resolve their own lookup failures (creatorMayGetPRAttribution
+// denies, creatorHasNoGitHubIdentity answers false -- see their doc
+// comments).
+func (a *Actor) pushBlockedByMissingGitHubIdentity(ctx context.Context, createdBy pgtype.UUID) bool {
 	if !a.creatorMayGetPRAttribution(ctx, createdBy) {
 		// Denied for an unrelated reason (no creator at all, disabled, or
 		// viewer) -- ScmCredentials' own step 8/9 would deny this before
 		// ever reaching step 10's identity check, so telling this creator
 		// to link a github identity would not even be the true reason
 		// their push fails.
-		return false, nil
+		return false
 	}
 
-	return a.creatorHasNoGitHubIdentity(ctx, createdBy), nil
+	return a.creatorHasNoGitHubIdentity(ctx, createdBy)
 }
 
 // recordPushBlockedNoGitHubIdentity appends a session-visible "warning"
@@ -687,19 +733,37 @@ func (a *Actor) pushBlockedByMissingGitHubIdentity(ctx context.Context, tx pgx.T
 // ever appends), with a freshly minted messageId (this event
 // originates here, it does not echo any wire message's own id).
 func (a *Actor) recordPushBlockedNoGitHubIdentity(ctx context.Context, tx pgx.Tx, gen int) error {
+	return a.recordSessionWarning(ctx, tx, gen, pushBlockedNoGitHubIdentityWarning)
+}
+
+// pushBlockedNoGitHubIdentityWarning is recordPushBlockedNoGitHubIdentity's
+// session-visible text.
+const pushBlockedNoGitHubIdentityWarning = "This session's creator has no linked GitHub account, so this push could not be authenticated. Sign in with GitHub (the ordinary GitHub sign-in) to link one, then retry."
+
+// reviewSessionReadOnlyWarning is what a pull request's review session
+// records when a turn that is not a review attempt completes in it
+// (completeProcessingTurn): the session is read-only, so whatever that
+// turn changed stays in the sandbox.
+const reviewSessionReadOnlyWarning = "This session is a pull request review, which is read-only: changes made in it are not pushed, and no pull request is opened for them."
+
+// recordSessionWarning appends one session-visible "warning" wire event
+// carrying message -- recordPushBlockedNoGitHubIdentity's own mechanism
+// (see its doc comment), shared so every warning this package originates
+// is built, appended and broadcast the same way.
+func (a *Actor) recordSessionWarning(ctx context.Context, tx pgx.Tx, gen int, message string) error {
 	msg := sandboxws.Warning{
 		Type:      "warning",
 		MessageId: uuid.NewString(),
 		SessionId: a.sessionID.String(),
 		Gen:       gen,
-		Message:   "This session's creator has no linked GitHub account, so this push could not be authenticated. Sign in with GitHub (the ordinary GitHub sign-in) to link one, then retry.",
+		Message:   message,
 	}
 	raw, err := json.Marshal(msg)
 	if err != nil {
-		return fmt.Errorf("sessionactor: marshal push-blocked warning event: %w", err)
+		return fmt.Errorf("sessionactor: marshal warning event: %w", err)
 	}
 	if _, err := a.appendRawEvent(ctx, tx, "warning", msg.MessageId, raw); err != nil {
-		return fmt.Errorf("sessionactor: append push-blocked warning event: %w", err)
+		return fmt.Errorf("sessionactor: append warning event: %w", err)
 	}
 	return nil
 }
@@ -1040,6 +1104,23 @@ func redactedURLIdentity(rawURL string) string {
 // request.
 func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
 	defer a.endPRDeliveryBestEffort(ctx)
+
+	// A pull request's review session never opens a pull request: it is
+	// read-only (completeProcessingTurn sends it no push command, for the
+	// same reason). So a push_complete for one opens nothing here -- no
+	// pull request, no artifact, no preview and so no commit status, no
+	// handoff check -- whatever the event reports. Asked first, before the
+	// event is even decoded, and failing closed: a lookup that errors
+	// opens nothing either.
+	review, err := a.isReviewSession(ctx, a.stores.githubPRSession)
+	if err != nil {
+		a.logger.Error("sessionactor: review-session lookup for PR creation failed; opening nothing (fail-closed)", "error", err)
+		return
+	}
+	if review {
+		a.logger.Warn("sessionactor: push_complete arrived for a pull request's review session, which never opens a pull request; opening nothing")
+		return
+	}
 
 	if a.sourceControl == nil {
 		a.logger.Warn("sessionactor: push_complete arrived but no SourceControl is configured; skipping PR creation")

@@ -22,11 +22,15 @@ type Minter interface {
 
 // ErrRefusedByScopeCheck wraps a scmscope validation failure at mint time
 // -- returned by Mint whenever the token GitHub actually granted is not
-// read-only, after the refusal has already been durably recorded. A
-// caller receiving this error holds no token: Mint never returns a
-// non-nil githubapp.Token alongside a non-nil error.
+// read-only, after the refusal has already been durably recorded, and by
+// MintUnrecorded for the same refusal, which it does not record. A
+// caller receiving this error holds no token: neither function ever
+// returns a non-nil githubapp.Token alongside a non-nil error.
 type ErrRefusedByScopeCheck struct {
 	Reason string
+	// GrantedPermissions is what GitHub actually granted the refused
+	// token, for the caller's own log line where nothing records it.
+	GrantedPermissions map[string]string
 }
 
 func (e *ErrRefusedByScopeCheck) Error() string {
@@ -66,12 +70,12 @@ func (e *ErrRefusedByScopeCheck) Error() string {
 // successful substitution is invisible from both ends until something
 // tries to push. The ledger is the only place it is ever visible.
 func Mint(ctx context.Context, minter Minter, ledger shadowledger.Store, owner string, repoNames []string, repoFullName, host string, sessionID pgtype.UUID) (githubapp.Token, error) {
-	token, err := minter.MintInstallationToken(ctx, owner, repoNames)
+	token, scopeErr, err := mintAndValidate(ctx, minter, owner, repoNames)
 	if err != nil {
-		return githubapp.Token{}, fmt.Errorf("readonlymint: mint installation token: %w", err)
+		return githubapp.Token{}, err
 	}
 
-	if scopeErr := scmscope.ValidateReadOnly(token.Permissions); scopeErr != nil {
+	if scopeErr != nil {
 		if recordErr := shadowledger.Record(ctx, ledger, shadowledger.Entry{
 			Operation:    "scm_credential_mint_refused",
 			RepoFullName: repoFullName,
@@ -85,7 +89,7 @@ func Mint(ctx context.Context, minter Minter, ledger shadowledger.Store, owner s
 		}); recordErr != nil {
 			return githubapp.Token{}, fmt.Errorf("readonlymint: record refused mint: %w", recordErr)
 		}
-		return githubapp.Token{}, &ErrRefusedByScopeCheck{Reason: scopeErr.Error()}
+		return githubapp.Token{}, &ErrRefusedByScopeCheck{Reason: scopeErr.Error(), GrantedPermissions: token.Permissions}
 	}
 
 	if recordErr := shadowledger.Record(ctx, ledger, shadowledger.Entry{
@@ -104,4 +108,41 @@ func Mint(ctx context.Context, minter Minter, ledger shadowledger.Store, owner s
 	}
 
 	return token, nil
+}
+
+// MintUnrecorded is Mint without the shadow ledger: the same mint and the
+// same fail-closed scope check -- a token GitHub granted with anything
+// beyond read access is never returned, *ErrRefusedByScopeCheck is -- but
+// nothing is written to the ledger, on success or on refusal.
+//
+// It serves a credential that is not a shadow-mode substitution: a pull
+// request's review session, which is read-only in every egress mode
+// (internal/adapters/inbound/httpapi's ScmCredentials). The ledger records
+// what shadow mode suppressed or substituted, and the shadow operator's
+// summary reads it back; a review session's read-only clone credential is
+// neither, and on a live repository would crowd that record out. The
+// caller logs each outcome instead. With no record to write, a ledger
+// failure cannot fail this mint either.
+func MintUnrecorded(ctx context.Context, minter Minter, owner string, repoNames []string) (githubapp.Token, error) {
+	token, scopeErr, err := mintAndValidate(ctx, minter, owner, repoNames)
+	if err != nil {
+		return githubapp.Token{}, err
+	}
+	if scopeErr != nil {
+		return githubapp.Token{}, &ErrRefusedByScopeCheck{Reason: scopeErr.Error(), GrantedPermissions: token.Permissions}
+	}
+	return token, nil
+}
+
+// mintAndValidate is the one sequence Mint and MintUnrecorded share: mint,
+// then check what GitHub actually granted. err is a failed mint, and no
+// token exists; scopeErr is a minted token that is not read-only, returned
+// beside it only so the caller can describe the refusal -- neither
+// exported function ever hands such a token on.
+func mintAndValidate(ctx context.Context, minter Minter, owner string, repoNames []string) (token githubapp.Token, scopeErr, err error) {
+	token, err = minter.MintInstallationToken(ctx, owner, repoNames)
+	if err != nil {
+		return githubapp.Token{}, nil, fmt.Errorf("readonlymint: mint installation token: %w", err)
+	}
+	return token, scmscope.ValidateReadOnly(token.Permissions), nil
 }

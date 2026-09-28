@@ -11,7 +11,10 @@
 // record-or-fail semantics the rest of that ledger already enforces
 // (internal/app/shadowledger's own top doc comment) -- a refusal this
 // package cannot evidence is a hard error, never a silent 403 a caller
-// might be tempted to return anyway.
+// might be tempted to return anyway. So is a successful substitution
+// (Mint). MintUnrecorded runs the same mint and the same scope check and
+// records nothing, for a credential that is not a shadow-mode substitution
+// at all -- a pull request's review session, read-only in every mode.
 //
 // This package does not decide WHEN a caller should mint a read-only
 // credential instead of a write-capable one -- that decision (the

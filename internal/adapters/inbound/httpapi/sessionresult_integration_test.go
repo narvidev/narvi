@@ -681,13 +681,13 @@ func TestResult_NeverCurrentWithoutLiveConfirmation(t *testing.T) {
 	})
 }
 
-// TestResult_OwnPushMovedHeadIsNotCurrent pins §43.20's stated limit from
-// the result's side: a pull request review session's own push moves the
-// pull request's head after its verdict, and until the code host's
-// notification of that push arms a re-review the status reads finished and
-// settled -- but the result reads the head live, so the pre-push verdict is
-// stale there, never current.
-func TestResult_OwnPushMovedHeadIsNotCurrent(t *testing.T) {
+// TestResult_HeadMovedAfterTheVerdictIsNotCurrent: a push moves the pull
+// request's head after the review session's verdict -- someone else's push,
+// since a review session never pushes -- and until the code host's
+// notification of it arrives nothing is armed, so the status reads finished
+// and settled. The result reads the head live, so the verdict produced
+// before the push is stale there, never current.
+func TestResult_HeadMovedAfterTheVerdictIsNotCurrent(t *testing.T) {
 	ctx := context.Background()
 	host := newResultCodeHost()
 	rig, user, cookie := newResultRig(t, host)
@@ -704,12 +704,12 @@ func TestResult_OwnPushMovedHeadIsNotCurrent(t *testing.T) {
 		t.Fatalf("before the push: freshness %q (%q), want current", f.State, reasonOf(f))
 	}
 
-	// The session's own push lands on the pull request's head; nothing is
-	// recorded, and no notification has arrived to arm a re-review.
+	// A push lands on the pull request's head, and no notification of it
+	// has arrived yet to arm a re-review.
 	host.open(owner, repo, n, "after-push", "main")
 	status := getStatus(t, rig, sess.ID, cookie)
 	if status.Activity != restdtos.SessionActivityActivityFinished || !status.Settled {
-		t.Fatalf("status after the push = %q settled %v, want finished and settled -- the stated limit this test is about", status.Activity, status.Settled)
+		t.Fatalf("status after the push = %q settled %v, want finished and settled: nothing is armed until the notification arrives", status.Activity, status.Settled)
 	}
 	got, _ = getResult(t, rig, sess.ID, cookie)
 	f := got.ReviewedPullRequest.Review.Freshness

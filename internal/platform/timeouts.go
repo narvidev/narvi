@@ -2953,13 +2953,23 @@ type Timeouts struct {
 	// internal/adapters/outbound/githubapp.Client.MintInstallationToken
 	// makes per credential mint (GET the repo's installation id, then
 	// POST that installation's own access token, scoped contents:read +
-	// metadata:read) -- internal/adapters/inbound/httpapi.ScmCredentials'
-	// own shadow-substitution branch calls this synchronously inside an
-	// HTTP handler, so it must stay bounded. Not specified in the plan;
-	// chosen as 20s -- double GitHubGetPRTimeout's own 10s single-GET
-	// baseline, since this is two round trips rather than one, still
-	// comfortably inside ScmCredentialTTL (15min) so a slow mint cannot
-	// itself eat the credential's own advertised lifetime.
+	// metadata:read) -- internal/adapters/inbound/httpapi.ScmCredentials
+	// calls this synchronously inside an HTTP handler, for a shadow
+	// sandbox, a build boot and a pull request's review session, so it
+	// must stay bounded. Not specified in the plan; chosen as 8s, and the
+	// bound that matters is the caller's: the sandbox's credential helper
+	// gives up after CredentialFetchTimeout (10s). The control plane must
+	// answer first -- the read-only token, a named refusal (a repository
+	// the GitHub App is not installed on), or a 500 -- or all the sandbox
+	// ever sees is its own timeout while the server finishes a mint no one
+	// is waiting for. 8s leaves 2s of that 10s for the handler's own
+	// database reads and its response; two GitHub round trips normally
+	// take a fraction of a second. (It was 20s, double GitHubGetPRTimeout's
+	// single-GET baseline, when only a shadow sandbox minted -- already
+	// past the helper's bound.) Far inside ScmCredentialTTL (15min), so a
+	// slow mint cannot eat the credential's own advertised lifetime.
+	// TestDefaultTimeouts_GitHubAppMintFinishesBeforeCredentialFetch pins
+	// the ordering.
 	GitHubAppMintTimeout time.Duration
 
 	// LicenseNotBeforeSkew is internal/app/capability.Registry's own
@@ -3802,7 +3812,7 @@ func DefaultTimeouts() Timeouts {
 		GitHubAppJWTTTL:            9 * time.Minute,
 		GitHubAppJWTClockSkew:      60 * time.Second, // §30.4; not specified, chosen with margin under GitHub's own hard 10-minute App-JWT ceiling -- see field doc comment
 		GitHubAppScopeCheckTimeout: 10 * time.Second, // §30.4; not specified, chosen, matches RepoSHAResolutionTimeout's own "lightweight call" reasoning
-		GitHubAppMintTimeout:       20 * time.Second, // §30.4; not specified, chosen -- see field doc comment
+		GitHubAppMintTimeout:       8 * time.Second,  // §30.4; not specified, chosen strictly inside CredentialFetchTimeout -- see field doc comment
 
 		LicenseNotBeforeSkew: 5 * time.Minute, // design note section 1.5, explicit ("default 5 minutes")
 

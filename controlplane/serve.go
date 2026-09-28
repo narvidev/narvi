@@ -366,12 +366,14 @@ func serve(modules ...extension.Module) error {
 	// are read-only. An operator who pastes a broad App (or misconfigures
 	// its own permissions to include Contents: Read & write) into this
 	// slot must get a loud boot refusal, never a silent re-arming of every
-	// shadow sandbox on the first real mint.
+	// sandbox this App serves -- shadow sandboxes, build boots and every
+	// pull request review session -- on the first real mint.
 	//
 	// This client is used for the check ONLY and then discarded -- Build
 	// constructs its OWN githubAppClient (same constructor, same
 	// arguments) for the wiring that actually uses one (ScmCredentials'
-	// shadow branch, per its own doc comment). githubapp.New itself does
+	// read-only branch: a shadow sandbox, a build boot or a review
+	// session, per its own doc comment). githubapp.New itself does
 	// no I/O and holds no state a second construction could conflict
 	// with, so this is one extra allocation, not a second code path: the
 	// alternative -- threading a pre-built client into Build as a
@@ -571,8 +573,8 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	}
 
 	// githubAppClient (§30.4) mints the read-only GitHub App installation
-	// tokens ScmCredentials' own shadow branch below substitutes for the
-	// write-capable creator OAuth/bot-token credentials. Constructed once
+	// tokens ScmCredentials serves a shadow sandbox, a build boot and a
+	// review session, in place of a write-capable credential. Constructed once
 	// here, the ONE production construction site, mirroring
 	// gatedHTTPClient/liveSourceControl's own identical "one seam" pattern
 	// immediately below. Like preflightGitHubAppClient above, this signs
@@ -1252,17 +1254,19 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// Middleware entirely -- a sandbox-bearer-token-authenticated
 	// endpoint, not a browser-facing one (see that handler's own doc
 	// comment in internal/adapters/inbound/httpapi/scmcredentials.go).
-	// githubPRSessionStore/cfg.GitHubBotToken (an audit remediation)
-	// are the SAME instances review/verdict below already uses, so a
-	// review session mints the SAME bot credential either way, never the
-	// creator's own personal OAuth token. repoSettingsForEgress/
+	// githubPRSessionStore is the SAME instance review/verdict below
+	// already uses: a session with a github_pr_sessions row is a review
+	// session, and a review session is read-only -- its sandbox is only
+	// ever served githubAppClient's read-only installation token, never
+	// the bot token (which this handler is not given at all) and never
+	// the creator's own personal OAuth token. repoSettingsForEgress/
 	// shadowLedger/cfg.ShadowMode (§30.4) are the SAME instances
 	// isLiveEgress/gatedHTTPClient already use above, so this handler's
 	// own shadow-substitution branch resolves egress mode identically to
-	// every other §30 seam in this binary; githubAppClient is this Step's
-	// own read-only mint.
+	// every other §30 seam in this binary; githubAppClient is the
+	// read-only mint both branches use.
 	router.Post("/sessions/{sessionID}/scm-credentials",
-		httpapi.ScmCredentials(sessionStore, sandboxStore, identityStore, userStore, githubPRSessionStore, repoSettingsForEgress, shadowLedger, githubAppClient, cfg.GitHubBotToken, cfg.TokenEncryptionKey, cfg.Timeouts, cfg.ShadowMode))
+		httpapi.ScmCredentials(sessionStore, sandboxStore, identityStore, userStore, githubPRSessionStore, repoSettingsForEgress, shadowLedger, githubAppClient, eventStore, hub, cfg.TokenEncryptionKey, cfg.Timeouts, cfg.ShadowMode))
 
 	// provider-credentials ("provider credential injection",
 	// §25.1/§25.3): deliberately mounted OUTSIDE /api/sessions and outside
