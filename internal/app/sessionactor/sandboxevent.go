@@ -557,11 +557,11 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 			// status must read finished now, not once MCPStatusDeliveryWindow
 			// runs out. In this SAME transact as the event itself. Gated on
 			// inserted: a wire-level redelivery of an old push_error must
-			// never clear a later push's stamp. A push that reached the
-			// remote before its report failed has still moved the branch:
-			// for a pull request's review session, the code host's
-			// synchronize for it can then arm §24's re-review after this
-			// reads finished -- §43.20's stated limit.
+			// never clear a later push's stamp. (A pull request's review
+			// session never pushes -- completeProcessingTurn sends it no
+			// push command -- so no push of its own can move its pull
+			// request's head and re-arm §24's re-review behind a status
+			// that already reads finished.)
 			if inserted {
 				if err := a.stores.sandbox.WithTx(tx).EndPRDelivery(ctx, a.sessionID); err != nil {
 					return fmt.Errorf("sessionactor: clear push/PR delivery stamp on push_error: %w", err)

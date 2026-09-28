@@ -273,9 +273,9 @@ type ReadOnlyMinter interface {
 //     exactly step 6.5's outcome, on a live repository too: the read-only
 //     installation token through the SAME scope-checked mint (or its 403/
 //     500), never a write-capable credential and never the creator's own
-//     -- see this file's own top comment for the full rationale. Steps
-//     8-10 below (the creator-guard/identity/decrypt path) never run for a
-//     review session: they exist to find and gate a PER-USER OAuth
+//     -- see this file's own top comment for the full rationale. The
+//     creator-guard/identity/decrypt path (steps 8-10 below) never runs
+//     for a review session: it exists to find and gate a PER-USER OAuth
 //     credential, which a review session has no legitimate use for at
 //     all. A genuine, unexpected error from GetBySessionID OTHER than
 //     "no such row" (pgx.ErrNoRows) is a 500, matching this handler's own
