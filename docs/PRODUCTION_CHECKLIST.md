@@ -185,3 +185,34 @@ startup outright — so, as with item 1's own `NARVI_ROLLOUT_MODE` check,
 is about the two values `strconv.ParseBool` DOES accept, `true` and
 `false`, neither of which boot itself can distinguish from a deliberate
 production choice.
+
+## 10. The fleet's Postgres connections fit under `max_connections`
+
+**Why this is here.** A control-plane replica opens its query pool
+(`NARVI_DB_POOL_MAX_CONNS`, default 20) plus one lock connection that
+holds every one of its session actors' advisory locks, whatever it hosts
+(`docs/TECHNICAL_PLAN.md` §2, §5.1). No connection is held per session,
+so the total is fixed by the fleet's shape, not by its load:
+`replicas × (NARVI_DB_POOL_MAX_CONNS + 1)`, plus whatever else connects
+to the same server (migrations run on boot through a short-lived
+connection of their own, and any operator tooling). If it does not fit,
+replicas fail to connect as they scale out — a failure no single replica
+can see coming, since one process cannot know how many replicas there
+are.
+
+**Check.** On the production server: `SHOW max_connections;`,
+`SHOW superuser_reserved_connections;` and, on Postgres 16 or later,
+`SHOW reserved_connections;`. Confirm
+`max_connections − superuser_reserved_connections − reserved_connections`
+exceeds `replicas × (NARVI_DB_POOL_MAX_CONNS + 1)` with headroom, at the
+fleet's maximum replica count (a rolling deploy briefly runs one extra
+replica per surge slot). Each replica logs its own share at boot
+(`narvi control-plane: postgres connection budget`, with
+`replica_need`), and warns — never refuses — when even that one replica
+does not fit.
+
+**Also confirm** nothing between the control plane and Postgres is a
+transaction-mode connection pooler: the actor locks are session-level
+advisory locks, and a pooler that hands a backend to another client
+between transactions would move them with it. Session-mode pooling, or
+none, is required.

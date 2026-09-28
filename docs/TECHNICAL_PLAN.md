@@ -63,7 +63,7 @@ Single Go module, hexagonal architecture. Domain has zero external dependencies.
 
 - One goroutine + mailbox (channel of commands) per **active** session. All mutations of a session's state go through its actor — no other code path writes session/sandbox/turn rows.
 - **Hydration on demand**: actor loads state from Postgres on first command, evicts after idle TTL (default 30 min without commands or connected clients).
-- **Single-writer across replicas**: Postgres advisory lock keyed by session id, held for the actor's lifetime, plus a **fencing check**: every write includes the actor's `epoch` (bumped on each acquisition); writes with a stale epoch fail. A zombie actor on an old pod can never corrupt state.
+- **Single-writer across replicas**: Postgres advisory lock keyed by session id, held for the actor's lifetime, plus a **fencing check**: every write includes the actor's `epoch` (bumped on each acquisition); writes with a stale epoch fail. A zombie actor on an old pod can never corrupt state. A replica holds all its actors' locks on one dedicated connection outside its query pool, so hosting more sessions never takes a query connection. Hydration is bounded (`ActorHydrateTimeout`) and fails with a retryable `ErrActorUnavailable`; losing the lock connection stops every actor whose lock it held.
 - **Transactional writes**: state transition + appended event + outbox entries commit in ONE Postgres transaction. There is no such thing as a fire-and-forget state write.
 - **Named persistent timers**: table `session_timers(session_id, name, fires_at)`. Names: `connecting_deadline`, `liveness_check`, `inactivity`, `turn_deadline`, `terminal_grace`, and — since §40.3 — `session_deadline`. A per-pod timer pump polls due timers (`SELECT ... FOR UPDATE SKIP LOCKED`) and delivers them as actor commands. Timers survive restarts; each is armed/re-armed independently.
 
@@ -201,6 +201,7 @@ type AgentRuntime interface {
 - Postgres is the ONLY store. No cache with authority. Uniqueness by constraints, not convention.
 - **Outbox pattern** for every outbound side effect (Slack/Linear/GitHub notifications, webhooks): written in the same tx as the state change; a retry worker delivers with exponential backoff + dead-letter after N attempts. Never 2-attempts-then-drop.
 - Dedupe/coalescing (webhook events, concurrent PR @mentions) via `INSERT ... ON CONFLICT` atomic claims. Never eventually-consistent storage for coordination.
+- No connection is held per session. A replica's Postgres connections are its query pool plus one lock connection, whatever it hosts; `replicas × (NARVI_DB_POOL_MAX_CONNS + 1)` must fit under `max_connections` with headroom. A transaction-mode connection pooler is unsupported (session-level advisory locks).
 - A human applying a label or clicking a button is a legitimate, deliberate command — the two are equivalent in kind, and neither needs Postgres's own blessing to act. What is never legitimate is treating a label the BOT ITSELF writes back onto an externally-editable surface as durable trigger state: a GitHub/Slack/Linear label is mutable by anyone with triage rights, forgeable, and — the decisive reason — a second copy of a fact Postgres already owns. Durable trigger state lives in Postgres and is only ever read back from there; a bot-written label may still exist as a human-facing status indicator, but the system itself must never treat it as authority (§24 applies this to review re-triggering specifically; the principle is general).
 
 ### 5.2 Security
@@ -215,7 +216,7 @@ type AgentRuntime interface {
 - `correlation_id` minted at ingress, propagated: webhook → CP → provider → sandbox-agent → OpenCode wrapper → back.
 - `sandbox-agent` logs a **boot fingerprint** first: binary version, image digest, repo SHAs, boot mode.
 - Every state transition logs `from`, `to`, `trigger`, `gen`. Every routing/classifier decision logs its inputs and verdict.
-- OTel traces + metrics: spawn latency, boot phase durations, liveness gaps, watchdog activations (and how many were false alarms — target: ~0), outbox lag, orphan GC count.
+- OTel traces + metrics: spawn latency, boot phase durations, liveness gaps, watchdog activations (and how many were false alarms — target: ~0), outbox lag, orphan GC count, live session actors (`session_actors_live`), actor hydrations by outcome (`session_actor_hydrations`: ok, elsewhere, unavailable, error), and lock-connection losses (`session_actor_lock_conn_lost`).
 
 ### 5.4 Timeout hierarchy (single source: `platform/timeouts.go`)
 One struct, validated at boot with the invariant chain asserted in a unit test:
@@ -8079,8 +8080,9 @@ event hub reaches only the connections registered in the process whose actor per
 (cross-pod fan-out is unsolved, `wshub`'s own package doc), and any replica may serve a wait, so a hub hint would work on one replica and not on
 another; no `LISTEN/NOTIFY` exists in this codebase, and a poll of one indexed statement a second per
 wait needs none. Each read acquires a pool connection for its statement and releases it before the
-sleep: no connection or transaction is held across a sleep, which matters because the session actors
-already pin one connection each (`hydrateAndAcquire`), so waits must never add to that.
+sleep: no connection or transaction is held across a sleep, because the pool serves queries only —
+session actors hold none of it (§2, §5.1) — and a wait that held one for its whole length would take it
+from every query on the replica.
 
 Waits are capped in memory, per replica, like the other MCP brakes (owner decision D4), by three
 nested caps: `MCPWaitMaxConcurrentPerKey` (2) per key — the MCP grant the request was authenticated
