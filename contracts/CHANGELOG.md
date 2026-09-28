@@ -10,6 +10,19 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.9.1]
+
+### rest/v1/dtos.schema.json
+
+- Changed (descriptions only, annotation-only PATCH):
+  `SessionActivity.activity` and `SessionActivity.settled` no longer state
+  a limit about a pull request review session's own push: a review session
+  is read-only and never pushes, so the limit no longer exists, and
+  `activity` now says its turns are never followed by `delivering`.
+  `SessionOutcome.reviewScope`'s `reviewed` value no longer gives a review
+  session's own push as an example of a pull request it opened: it opens
+  none. No field, type, enum value or requiredness changed.
+
 ## [1.9.0]
 
 ### controlplane/testdata/routes.golden
