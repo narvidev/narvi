@@ -27,7 +27,8 @@ import (
 // non-critical, non-transitioning event still persists and bumps
 // last_seen_at with no ack; a critical event's outcome carries its ackId
 // verbatim; "ready" while Connecting transitions to Booting; "heartbeat"
-// with a nil lastBootPhase while Booting transitions to Ready; "ready"
+// with a nil lastBootPhase while Booting, after boot evidence, transitions
+// to Ready; "ready"
 // while already Ready is a silent no-op (persisted, liveness bumped,
 // status unchanged, no error); and a stale (too-low) gen is rejected
 // outright -- not persisted, last_seen_at untouched, no ack.
@@ -169,7 +170,12 @@ func TestHandleSandboxEvent_FullRoundTrip(t *testing.T) {
 	}
 
 	// --- (d) "heartbeat" with nil lastBootPhase while Booting transitions
-	// to Ready. ---
+	// to Ready, once this gen's boot has shown evidence it ran (§3.2) --
+	// here a boot_progress, as a service reporting its phase sends. ---
+	bpRaw := json.RawMessage(`{"type":"boot_progress","messageId":"bp1","sessionId":"s","gen":1,"phase":"web:ready"}`)
+	if outcome = send(t, SandboxEvent{Type: "boot_progress", Gen: 1, MessageID: "bp1", Raw: bpRaw}); !outcome.Persisted {
+		t.Error("boot_progress: Persisted = false, want true")
+	}
 	hbRaw := json.RawMessage(`{"type":"heartbeat","messageId":"h1","sessionId":"s","gen":1,"conversationId":null,"lastBootPhase":null}`)
 	outcome = send(t, SandboxEvent{Type: "heartbeat", Gen: 1, MessageID: "h1", Raw: hbRaw, LastBootPhase: nil})
 	if !outcome.Persisted {
@@ -1324,10 +1330,26 @@ func TestHandleSandboxEvent_ArmsLivenessAndInactivityOnceOnBootingToReady(t *tes
 		return row.FiresAt.Time, true
 	}
 
+	// A heartbeat of a boot in progress, as a fixed sandbox-agent sends it:
+	// a non-null phase. Boot evidence (§3.2), not a transition -- neither
+	// watchdog may be armed yet.
+	hb0Raw := json.RawMessage(`{"type":"heartbeat","messageId":"h0","sessionId":"s","gen":1,"conversationId":null,"lastBootPhase":"starting"}`)
+	booting := "starting"
+	if outcome := send(t, SandboxEvent{Type: "heartbeat", Gen: int(created.Gen), MessageID: "h0", Raw: hb0Raw, LastBootPhase: &booting}); !outcome.Persisted {
+		t.Fatal("boot-time heartbeat: Persisted = false, want true")
+	}
+	if got, err := sandboxStore.Get(ctx, sessionID); err != nil || got.Status != sqlcgen.SandboxStatusBooting {
+		t.Fatalf("status after a boot-time heartbeat = %s (err %v), want %s", got.Status, err, sqlcgen.SandboxStatusBooting)
+	}
+	if _, ok := getFiresAt(t, TimerLivenessCheck); ok {
+		t.Fatal("liveness_check armed while still Booting")
+	}
+
 	beforeHeartbeat := time.Now()
 
-	// First heartbeat, nil lastBootPhase, while Booting -> transitions to
-	// Ready (sandboxTransitionTrigger's own documented (b) mapping).
+	// Next heartbeat, nil lastBootPhase, while Booting -> transitions to
+	// Ready (sandboxTransitionTrigger's own documented (b) mapping; the
+	// heartbeat above was this gen's boot evidence).
 	hbRaw := json.RawMessage(`{"type":"heartbeat","messageId":"h1","sessionId":"s","gen":1,"conversationId":null,"lastBootPhase":null}`)
 	outcome := send(t, SandboxEvent{Type: "heartbeat", Gen: int(created.Gen), MessageID: "h1", Raw: hbRaw, LastBootPhase: nil})
 	if !outcome.Persisted {

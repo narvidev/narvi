@@ -3415,6 +3415,96 @@ type Timeouts struct {
 	// SessionResultDelayCeiling is the most delay a result ever suggests.
 	// 300 seconds.
 	SessionResultDelayCeiling time.Duration
+
+	// --- §3.2 boot-evidence fallback. Linked, by Validate, to the boot
+	// steps it must outlast and to the sandbox lifetime it must fit in.
+
+	// BootEvidenceFallback is how long a sandbox generation that has shown
+	// no boot evidence may stay Booting, its heartbeats flowing, before a
+	// heartbeat's null lastBootPhase is accepted as boot completion anyway
+	// (technical plan §3.2's boot-evidence rule;
+	// internal/app/sessionactor's handleSandboxEvent). It exists for a
+	// sandbox-agent built before boot_timing existed (2026-08-20), booting
+	// a repo with no service and no Docker: it shows no evidence at all,
+	// and every snapshot descended from a sandbox it booted keeps running
+	// it (§35.2). Without this bound such a sandbox stayed Booting for as
+	// long as it heartbeated, and every restore of its snapshot did the
+	// same. An agent built from 2026-08-20 up to the fix (2026-09-28),
+	// booting with no service and no Docker, gets here too whenever its
+	// boot is still running at the bound: its only evidence is the
+	// boot_duration it sends once its boot has ended. A fixed agent does
+	// not. internal/app/sessionactor's bootevidence.go states who gets
+	// here, and when.
+	//
+	// It must be longer than any boot that agent can still be running, or a
+	// null phase would again be read as completion mid-boot -- the defect
+	// the rule exists to close. Validate keeps it at least MinTimeoutMargin
+	// above PreEvidenceAgentBootCeiling (one repo's boot with every step at
+	// its timeout: 54m12s with these defaults), and keeps FirstConnectBudget
+	// plus it at least MinTimeoutMargin below ProviderHardCap, so it can
+	// fire within the sandbox's own lifetime. It covers one repo. Repos
+	// boot one after another, but a bound scaled by the repo count would
+	// pass ProviderHardCap from the third repo on, where it could never
+	// fire, and the hold would be unbounded again. A multi-repo boot whose
+	// steps together run past it can therefore still be read as complete
+	// before it is: after an hour, where a control plane without the rule
+	// read that same agent's boot as complete at its first heartbeat. So
+	// can a boot of the later agent that outlasts it: several long repos,
+	// or, for one built from 2026-09-24, even a single repo with every step
+	// at its timeout (PreEvidenceAgentBootCeiling does not count that
+	// agent's steps).
+	//
+	// Not specified in the plan; chosen as 60min, the ceiling rounded up.
+	BootEvidenceFallback time.Duration
+}
+
+// PreEvidenceAgentBootCeiling is the longest one repo's boot can run in a
+// sandbox-agent that shows no boot evidence (technical plan §3.2), every
+// step at its own timeout plus ProcessStopGracePeriod -- the most a step
+// takes before it is killed. BootEvidenceFallback must outlast it.
+//
+// Only an agent built before boot_timing (2026-08-20) booting a repo with
+// no service and no Docker never shows evidence: a service or dockerd
+// reports a boot_progress, and every later agent sends a boot_duration
+// once its boot has ended. The steps are therefore that agent's, counted
+// at 3738b77, the last commit before boot_timing. Every earlier agent
+// runs a subset of them, and each field below has kept the value it was
+// added with. A later agent built before the fix (2026-09-28) shows no
+// evidence until that boot_duration either, and its steps are not counted
+// here: since 2026-09-24 (b0bab4a), gitdir.Seed adds up to eleven local
+// git steps to every sync -- an init, six config writes and four
+// sparse-config steps -- which takes one repo_image repo with a moved
+// workspace, every step at its timeout, to at least 60m12s. Such a boot
+// reaches BootEvidenceFallback mid-boot. The bound is kept to the agent
+// that has no other way out of Booting; the later one does, at the end of
+// its boot.
+//
+//   - preparing the repo, the longer of: a snapshot_restore or repo_image
+//     sync -- 3 network steps (ls-remote, then the default-branch and
+//     target-branch fetches; GitFetchStepTimeout) and 10 local git steps
+//     (the local-branch probe, status, stash push, the checkout's 3 probes
+//     and the checkout itself, stash pop, and 2 sparse-checkout steps;
+//     GitSyncStepTimeout) -- or a fresh or build clone and its
+//     sparse-checkout step (RepoCloneTimeout each);
+//   - 2 SHA probes: the post-clone fingerprint and the setup-rerun
+//     ladder's diff (RepoSHADiscoveryTimeout);
+//   - 4 hooks, the most one repo runs: repo_image with a moved workspace
+//     runs sync.sh, setup.sh, then setup.sh again after
+//     SetupRerunRetryBackoff, then start.sh (HookTimeout each);
+//   - a build boot's 2 cleanup steps (GitSyncStepTimeout), added on top
+//     although a build boot runs one hook, not four.
+//
+// The local steps with no timeout of their own (purging the credential
+// cache, writing AGENTS.md, reading the image manifest) take a small
+// fraction of MinTimeoutMargin.
+func (t Timeouts) PreEvidenceAgentBootCeiling() time.Duration {
+	step := func(timeout time.Duration) time.Duration { return timeout + t.ProcessStopGracePeriod }
+	syncPrepare := 3*step(t.GitFetchStepTimeout) + 10*step(t.GitSyncStepTimeout)
+	clonePrepare := 2 * step(t.RepoCloneTimeout)
+	shaProbes := 2 * step(t.RepoSHADiscoveryTimeout)
+	hooks := 4*step(t.HookTimeout) + t.SetupRerunRetryBackoff
+	buildCleanup := 2 * step(t.GitSyncStepTimeout)
+	return max(syncPrepare, clonePrepare) + shaProbes + hooks + buildCleanup
 }
 
 // DefaultTimeouts returns the shipped defaults for every field, each
@@ -3723,6 +3813,8 @@ func DefaultTimeouts() Timeouts {
 		SessionResultDelaySettled:   300 * time.Second, // §43.20 (182c); nothing changes on its own, nothing read live
 		SessionResultDelayFloor:     30 * time.Second,  // §43.20 (182c); least suggestion, above the live-read budget
 		SessionResultDelayCeiling:   300 * time.Second, // §43.20 (182c); most suggestion
+
+		BootEvidenceFallback: 60 * time.Minute, // §3.2; not specified, chosen -- PreEvidenceAgentBootCeiling (54m12s) rounded up, see field doc comment
 	}
 }
 
@@ -3790,6 +3882,15 @@ func (t Timeouts) Validate() error {
 	// additive sum.
 	check("FirstConnectBudget > ImagePullBootP99",
 		"FirstConnectBudget", t.FirstConnectBudget, "ImagePullBootP99", t.ImagePullBootP99)
+
+	// §3.2's boot-evidence fallback: longer than any boot an agent that
+	// shows no evidence can still be running, and short enough to fire
+	// within the sandbox's own lifetime. See BootEvidenceFallback's doc
+	// comment.
+	check("BootEvidenceFallback > PreEvidenceAgentBootCeiling",
+		"BootEvidenceFallback", t.BootEvidenceFallback, "PreEvidenceAgentBootCeiling", t.PreEvidenceAgentBootCeiling())
+	check("ProviderHardCap > FirstConnectBudget + BootEvidenceFallback",
+		"ProviderHardCap", t.ProviderHardCap, "FirstConnectBudget+BootEvidenceFallback", t.FirstConnectBudget+t.BootEvidenceFallback)
 
 	// §5.3 fix (reconciler orphan-GC debounce): ReconcilerOrphanConfirmationPeriod
 	// must stay at least MinTimeoutMargin below ReconcilerInterval, or the

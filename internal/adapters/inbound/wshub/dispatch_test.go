@@ -100,7 +100,8 @@ func expectAck(t *testing.T, msgCh <-chan []byte, wantAckID string) {
 //   - a critical event ("execution_complete") persists AND produces a
 //     matching "ack" command over the same connection;
 //   - "ready" while Connecting transitions the sandbox row to Booting;
-//   - "heartbeat" with a nil lastBootPhase while Booting transitions to
+//   - "heartbeat" with a nil lastBootPhase while Booting, once the gen
+//     has shown boot evidence (a boot_progress here, §3.2), transitions to
 //     Ready;
 //   - "ready" while already Ready is a silent no-op (persisted, liveness
 //     bumped, status unchanged, no error);
@@ -174,7 +175,12 @@ func TestDispatch_EndToEnd(t *testing.T) {
 		return getSandbox(ctx, t, pool, sessionID).Status == sqlcgen.SandboxStatusBooting
 	})
 
-	// --- (d) "heartbeat" with lastBootPhase:null while Booting -> Ready. ---
+	// --- (d) "heartbeat" with lastBootPhase:null while Booting -> Ready,
+	// after this gen's boot evidence (a service's boot_progress, §3.2). ---
+	send(t, fmt.Sprintf(`{"type":"boot_progress","messageId":"bp1","sessionId":%q,"gen":1,"phase":"web:ready"}`, sid))
+	waitUntil(t, dispatchTestWait, func() bool {
+		return countEvents(ctx, t, pool, sessionID, "boot_progress") == 1
+	})
 	send(t, fmt.Sprintf(`{"type":"heartbeat","messageId":"h1","sessionId":%q,"gen":1,"conversationId":null,"lastBootPhase":null}`, sid))
 	waitUntil(t, dispatchTestWait, func() bool {
 		return getSandbox(ctx, t, pool, sessionID).Status == sqlcgen.SandboxStatusReady

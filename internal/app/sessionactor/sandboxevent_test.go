@@ -8,7 +8,7 @@ import (
 )
 
 // TestSandboxTransitionTrigger is table-driven over every (event type,
-// LastBootPhase, status) combination that matters: the two mappings this
+// LastBootPhase, status, boot evidence) combination that matters: the two mappings this
 // function itself implements, each exercised both ON its precondition and
 // OFF it (proving the precondition check, not just the trigger kind,
 // gates the decision), plus a handful of event types/status pairs this
@@ -30,6 +30,7 @@ func TestSandboxTransitionTrigger(t *testing.T) {
 		eventType     string
 		lastBootPhase *string
 		status        sandbox.State
+		bootEvidence  bool
 		wantOK        bool
 		wantKind      sandbox.TriggerKind
 	}{
@@ -59,30 +60,47 @@ func TestSandboxTransitionTrigger(t *testing.T) {
 			wantOK:    false,
 		},
 		{
-			name:      "heartbeat with nil LastBootPhase while booting fires BootComplete",
+			name:         "heartbeat with nil LastBootPhase while booting, after boot evidence, fires BootComplete",
+			eventType:    "heartbeat",
+			status:       sandbox.StateBooting,
+			bootEvidence: true,
+			wantOK:       true,
+			wantKind:     sandbox.TriggerBootComplete,
+		},
+		{
+			name:      "heartbeat with nil LastBootPhase while booting, before any boot evidence, is a no-op (§3.2: absence of information)",
 			eventType: "heartbeat",
 			status:    sandbox.StateBooting,
-			wantOK:    true,
-			wantKind:  sandbox.TriggerBootComplete,
+			wantOK:    false,
 		},
 		{
 			name:          "heartbeat with a non-nil LastBootPhase while booting is a no-op",
 			eventType:     "heartbeat",
 			lastBootPhase: &bootPhase,
 			status:        sandbox.StateBooting,
+			bootEvidence:  true,
 			wantOK:        false,
 		},
 		{
-			name:      "heartbeat with nil LastBootPhase while already ready is a no-op",
-			eventType: "heartbeat",
-			status:    sandbox.StateReady,
-			wantOK:    false,
+			name:         "heartbeat with nil LastBootPhase while already ready is a no-op",
+			eventType:    "heartbeat",
+			status:       sandbox.StateReady,
+			bootEvidence: true,
+			wantOK:       false,
 		},
 		{
-			name:      "heartbeat with nil LastBootPhase while suspect is a no-op",
-			eventType: "heartbeat",
-			status:    sandbox.StateSuspect,
-			wantOK:    false,
+			name:         "heartbeat with nil LastBootPhase while suspect is a no-op",
+			eventType:    "heartbeat",
+			status:       sandbox.StateSuspect,
+			bootEvidence: true,
+			wantOK:       false,
+		},
+		{
+			name:         "boot_timing while booting never transitions anything, even though it is evidence",
+			eventType:    "boot_timing",
+			status:       sandbox.StateBooting,
+			bootEvidence: true,
+			wantOK:       false,
 		},
 		{
 			name:      "execution_complete never transitions anything",
@@ -102,14 +120,14 @@ func TestSandboxTransitionTrigger(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			trig, ok := sandboxTransitionTrigger(tc.eventType, tc.lastBootPhase, tc.status)
+			trig, ok := sandboxTransitionTrigger(tc.eventType, tc.lastBootPhase, tc.status, tc.bootEvidence)
 			if ok != tc.wantOK {
-				t.Fatalf("sandboxTransitionTrigger(%q, %v, %s) ok = %v, want %v",
-					tc.eventType, tc.lastBootPhase, tc.status, ok, tc.wantOK)
+				t.Fatalf("sandboxTransitionTrigger(%q, %v, %s, evidence=%v) ok = %v, want %v",
+					tc.eventType, tc.lastBootPhase, tc.status, tc.bootEvidence, ok, tc.wantOK)
 			}
 			if ok && trig.Kind != tc.wantKind {
-				t.Errorf("sandboxTransitionTrigger(%q, %v, %s) kind = %s, want %s",
-					tc.eventType, tc.lastBootPhase, tc.status, trig.Kind, tc.wantKind)
+				t.Errorf("sandboxTransitionTrigger(%q, %v, %s, evidence=%v) kind = %s, want %s",
+					tc.eventType, tc.lastBootPhase, tc.status, tc.bootEvidence, trig.Kind, tc.wantKind)
 			}
 		})
 	}

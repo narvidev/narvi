@@ -221,6 +221,48 @@ SET status = $2,
 WHERE session_id = $1
 RETURNING *;
 
+-- name: MarkSandboxBootEvidence :exec
+-- Records that gen $2's boot has actually run (technical plan §3.2,
+-- migrations/000147_sandbox_boot_evidence_gen.up.sql): handleSandboxEvent
+-- (sandboxevent.go) calls it, in the transaction that stores the event, on
+-- the first event of a gen that is boot evidence. Guarded on gen so
+-- evidence can only ever be recorded for the gen that is live, never
+-- carried into the next one.
+UPDATE sandboxes
+SET boot_evidence_gen = gen,
+    updated_at = now()
+WHERE session_id = $1
+  AND gen = $2;
+
+-- name: MarkSandboxBootingSince :exec
+-- Records when gen $2 entered Booting, on this database's clock (technical
+-- plan §3.2's boot-evidence fallback,
+-- migrations/000148_sandbox_booting_since.up.sql), once per gen: a later
+-- call for the same gen keeps the first start. handleSandboxEvent
+-- (sandboxevent.go) calls it on the Connecting -> Booting edge, and again
+-- on a null-phase heartbeat that finds no start for its gen (a sandbox
+-- Booting when the column was added). Guarded on gen like
+-- MarkSandboxBootEvidence.
+UPDATE sandboxes
+SET booting_since = now(),
+    booting_since_gen = gen,
+    updated_at = now()
+WHERE session_id = $1
+  AND gen = $2
+  AND booting_since_gen IS DISTINCT FROM gen;
+
+-- name: GetSandboxBootingElapsed :one
+-- How long gen $2 has been Booting, in nanoseconds (a time.Duration),
+-- measured on this database's clock from the start MarkSandboxBootingSince
+-- recorded -- both ends on one clock, so no skew between control-plane
+-- replicas enters it. No row when that gen has no start recorded.
+SELECT (EXTRACT(EPOCH FROM (now() - booting_since)) * 1000000000)::bigint AS elapsed_nanos
+FROM sandboxes
+WHERE session_id = $1
+  AND gen = $2
+  AND booting_since_gen = gen
+  AND booting_since IS NOT NULL;
+
 -- name: ListLiveSandboxProviderIDs :many
 -- §5.3 ("reconciler + GC", §5.3): the reconciler's own "expected still
 -- alive" set -- the provider_id of every sandbox row currently in a LIVE

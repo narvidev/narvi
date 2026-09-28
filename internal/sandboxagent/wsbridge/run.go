@@ -19,7 +19,9 @@ import (
 // Run connects (retrying with exponential backoff, bounded
 // [reconnectMinBackoff, reconnectMaxBackoff], on any non-fatal failure),
 // sends "ready" as the first event on every fresh connection (including
-// after a reconnect -- it is genuinely a new connection each time), starts
+// after a reconnect -- it is genuinely a new connection each time) --
+// followed, on a connection that comes up once the boot has completed, by
+// a heartbeat carrying the boot's start phase (ReportBootStarted) -- starts
 // the heartbeat loop, runs the inbound read loop (dispatching commands,
 // handling "ack" internally -- never exposed to CommandHandler), and
 // resends every still-unacked/un-evicted buffered event after each
@@ -117,9 +119,11 @@ func nextBackoff(current, maxBackoff time.Duration) time.Duration {
 	return next
 }
 
-// runConnection drives exactly one live connection: send "ready", flush
-// the outbound buffer, then run the heartbeat loop and inbound read loop
-// concurrently via a single errgroup.WithContext(ctx) -- deliberately
+// runConnection drives exactly one live connection: send "ready" -- then,
+// once the boot has completed, the boot's start phase
+// (sendBootStartAfterReady) -- flush the outbound buffer, then run the
+// heartbeat loop and inbound read loop concurrently via a single
+// errgroup.WithContext(ctx) -- deliberately
 // cancel-on-first-error semantics (unlike internal/sandboxagent/
 // supervisor's own zero-value groups): the heartbeat loop and read loop
 // share ONE underlying connection, so either one failing (a write error,
@@ -140,13 +144,17 @@ func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn) error 
 	if err := b.sendReady(ctx, conn); err != nil {
 		return fmt.Errorf("wsbridge: send ready: %w", err)
 	}
+	var heartbeats connHeartbeats
+	if err := b.sendBootStartAfterReady(ctx, conn, &heartbeats); err != nil {
+		return fmt.Errorf("wsbridge: send boot-start heartbeat: %w", err)
+	}
 	if err := b.flushBuffer(ctx, conn); err != nil {
 		return fmt.Errorf("wsbridge: flush buffered events: %w", err)
 	}
 
 	group, groupCtx := errgroup.WithContext(ctx)
 	group.Go(func() error {
-		return b.heartbeatLoop(groupCtx, conn)
+		return b.heartbeatLoop(groupCtx, conn, &heartbeats)
 	})
 	group.Go(func() error {
 		return b.readLoop(groupCtx, conn)
@@ -238,12 +246,64 @@ func (b *Bridge) flushBuffer(ctx context.Context, conn *websocket.Conn) (err err
 	}
 }
 
-// sendHeartbeatNow builds and sends exactly one heartbeat frame directly
-// on conn -- pulled out of heartbeatLoop's own `case <-ticker.C:` arm
-// (§3.3, "turn recovery") so the new `case <-b.forceHeartbeat:` arm
-// below can send the SAME shape out-of-band, without duplicating the
-// build-and-send logic.
-func (b *Bridge) sendHeartbeatNow(ctx context.Context, conn *websocket.Conn) error {
+// connHeartbeats is one connection's share of the boot-start phase every
+// connection carries ahead of its first null heartbeat (ReportBootStarted,
+// bridge.go): whether any heartbeat has been written on that connection
+// yet. A connection's first heartbeat either carries a non-null phase --
+// boot evidence already, ahead of any null the connection writes later --
+// or reports null and goes out behind the start phase; so only a
+// connection's first heartbeat is ever preceded by it, and it never
+// follows a null. Held by one connection: runConnection sets it before the
+// heartbeat loop starts, and only that loop touches it after.
+type connHeartbeats struct {
+	sent bool
+}
+
+// sendBootStartAfterReady writes, on a connection that comes up once the
+// boot has completed, a heartbeat carrying the boot's start phase
+// (ReportBootStarted) right after "ready" -- ahead of the buffer replay,
+// so the control plane has this connection's boot evidence before
+// anything else it carries, a replayed boot_timing included. While the
+// boot still runs it writes nothing: the heartbeat loop's heartbeats carry
+// the boot's phase themselves.
+func (b *Bridge) sendBootStartAfterReady(ctx context.Context, conn *websocket.Conn, heartbeats *connHeartbeats) error {
+	phase, start := b.heartbeatBootPhases()
+	if phase != nil || start == nil {
+		return nil
+	}
+	if err := b.writeHeartbeat(ctx, conn, start); err != nil {
+		return err
+	}
+	heartbeats.sent = true
+	return nil
+}
+
+// sendHeartbeatNow builds and sends one heartbeat frame directly on conn
+// -- pulled out of heartbeatLoop's own `case <-ticker.C:` arm (§3.3, "turn
+// recovery") so the new `case <-b.forceHeartbeat:` arm below can send the
+// SAME shape out-of-band, without duplicating the build-and-send logic.
+//
+// When it is the connection's first heartbeat and would report a null
+// boot phase once ReportBootStarted has recorded a start phase, a
+// heartbeat carrying the start phase goes first, so the control plane
+// always sees this boot's evidence on a connection before that
+// connection's "boot has completed" (technical plan §3.2).
+func (b *Bridge) sendHeartbeatNow(ctx context.Context, conn *websocket.Conn, heartbeats *connHeartbeats) error {
+	phase, start := b.heartbeatBootPhases()
+	if phase == nil && start != nil && !heartbeats.sent {
+		if err := b.writeHeartbeat(ctx, conn, start); err != nil {
+			return err
+		}
+	}
+	if err := b.writeHeartbeat(ctx, conn, phase); err != nil {
+		return err
+	}
+	heartbeats.sent = true
+	return nil
+}
+
+// writeHeartbeat writes one heartbeat frame reporting lastBootPhase.
+func (b *Bridge) writeHeartbeat(ctx context.Context, conn *websocket.Conn, lastBootPhase *string) error {
 	msg := sandboxws.Heartbeat{
 		Type:      "heartbeat",
 		MessageId: b.newMessageID(),
@@ -254,7 +314,7 @@ func (b *Bridge) sendHeartbeatNow(ctx context.Context, conn *websocket.Conn) err
 		// (internal/adapters/outbound/opencode.Adapter, §7)
 		// resolves a real OpenCode conversation id.
 		ConversationId: b.getConversationID(),
-		LastBootPhase:  b.getLastBootPhase(),
+		LastBootPhase:  lastBootPhase,
 		Timestamp:      time.Now(),
 	}
 	payload, err := json.Marshal(msg)
@@ -272,14 +332,16 @@ func (b *Bridge) sendHeartbeatNow(ctx context.Context, conn *websocket.Conn) err
 // already supersede. §3.3 ("turn recovery") adds a SECOND trigger
 // alongside the regular ticker: b.forceHeartbeat, which SetConversationID
 // sends on (non-blocking) the first time it observes a genuinely new,
-// non-nil conversation id (§3.3: "at turn start... never lazily") -- both
+// non-nil conversation id (§3.3: "at turn start... never lazily"), and
+// ReportBootStarted/MarkBootComplete send on as boot starts and completes
+// (§3.2) -- both
 // arms call the SAME sendHeartbeatNow helper, so the wire shape is
 // identical regardless of which one fired. The regular ticker is NOT
 // reset when the forceHeartbeat arm fires -- its own cadence keeps running
 // independently; an extra, slightly-early heartbeat is harmless (§6.1's
 // heartbeat carries no ack/dedup concern at all, unlike the 6 critical
 // event types the outbound buffer exists for).
-func (b *Bridge) heartbeatLoop(ctx context.Context, conn *websocket.Conn) error {
+func (b *Bridge) heartbeatLoop(ctx context.Context, conn *websocket.Conn, heartbeats *connHeartbeats) error {
 	ticker := time.NewTicker(b.heartbeatInterval)
 	defer ticker.Stop()
 
@@ -288,11 +350,11 @@ func (b *Bridge) heartbeatLoop(ctx context.Context, conn *websocket.Conn) error 
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ticker.C:
-			if err := b.sendHeartbeatNow(ctx, conn); err != nil {
+			if err := b.sendHeartbeatNow(ctx, conn, heartbeats); err != nil {
 				return err
 			}
 		case <-b.forceHeartbeat:
-			if err := b.sendHeartbeatNow(ctx, conn); err != nil {
+			if err := b.sendHeartbeatNow(ctx, conn, heartbeats); err != nil {
 				return err
 			}
 		}
