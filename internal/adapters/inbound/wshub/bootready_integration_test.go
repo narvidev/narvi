@@ -12,10 +12,15 @@ package wshub_test
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -154,9 +159,16 @@ func (f bootReadyFixture) waitStatus(ctx context.Context, t *testing.T, want sql
 // stopped and drained at test cleanup.
 func (f bootReadyFixture) startBridge(t *testing.T, heartbeat time.Duration, beforeRun func(*wsbridge.Bridge)) *wsbridge.Bridge {
 	t.Helper()
+	return f.startBridgeAt(t, f.wsURL, heartbeat, beforeRun)
+}
+
+// startBridgeAt is startBridge dialing wsURL instead of the handler
+// itself -- a proxy in front of it.
+func (f bootReadyFixture) startBridgeAt(t *testing.T, wsURL string, heartbeat time.Duration, beforeRun func(*wsbridge.Bridge)) *wsbridge.Bridge {
+	t.Helper()
 	sc := sessionconfig.SessionConfig{
 		BootMode:          sessionconfig.SessionConfigBootModeFresh,
-		ControlPlaneWsUrl: f.wsURL,
+		ControlPlaneWsUrl: wsURL,
 		Gen:               1,
 		SandboxToken:      "some-token",
 		SessionId:         f.sessionID.String(),
@@ -483,5 +495,374 @@ func TestBootReady_RealBridge_FixedAgentNeverNeedsTheFallback(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// swallowingProxy is a TCP proxy between a real Bridge and the sandbox
+// handler that loses frames the agent wrote successfully -- as a dropped
+// connection, a network partition or a control-plane pod dying before its
+// read loop gets to them all do. On its first connection it forwards the
+// agent's HTTP upgrade and its first WebSocket frame, "ready", then reads
+// and discards every frame after it, and closes both sides once it has
+// discarded a null-phase heartbeat: by then the agent has written, without
+// error, both its boot's start phase and a null phase on that connection,
+// and neither has reached the control plane. Every later connection is
+// forwarded unchanged, both ways. What reaches the agent is always
+// forwarded.
+type swallowingProxy struct {
+	listener net.Listener
+	upstream string
+
+	mu        sync.Mutex
+	accepted  int
+	conns     []net.Conn
+	swallowed []string
+
+	group errgroup.Group
+}
+
+// newSwallowingProxy starts a swallowingProxy in front of the handler
+// wsURL names, and returns it with the URL to dial it at instead. It is
+// closed at test cleanup.
+func newSwallowingProxy(t *testing.T, wsURL string) (*swallowingProxy, string) {
+	t.Helper()
+	target, err := url.Parse(wsURL)
+	if err != nil {
+		t.Fatalf("parse %q: %v", wsURL, err)
+	}
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	p := &swallowingProxy{listener: listener, upstream: target.Host}
+	p.group.Go(p.accept)
+	t.Cleanup(func() {
+		_ = listener.Close()
+		p.mu.Lock()
+		for _, c := range p.conns {
+			_ = c.Close()
+		}
+		p.mu.Unlock()
+		_ = p.group.Wait()
+	})
+	proxied := *target
+	proxied.Host = listener.Addr().String()
+	return p, proxied.String()
+}
+
+func (p *swallowingProxy) accept() error {
+	for {
+		agent, err := p.listener.Accept()
+		if err != nil {
+			return nil // closed at cleanup
+		}
+		handler, err := net.Dial("tcp", p.upstream)
+		if err != nil {
+			_ = agent.Close()
+			continue
+		}
+		p.mu.Lock()
+		p.accepted++
+		first := p.accepted == 1
+		p.conns = append(p.conns, agent, handler)
+		p.mu.Unlock()
+
+		p.group.Go(func() error {
+			_, _ = io.Copy(agent, handler)
+			_ = agent.Close()
+			return nil
+		})
+		p.group.Go(func() error {
+			if first {
+				p.forwardReadyThenSwallow(agent, handler)
+			} else {
+				_, _ = io.Copy(handler, agent)
+			}
+			_ = handler.Close()
+			_ = agent.Close()
+			return nil
+		})
+	}
+}
+
+// forwardReadyThenSwallow forwards the agent's HTTP upgrade and its first
+// frame, then discards its frames, recording each, until a null-phase
+// heartbeat has been discarded.
+func (p *swallowingProxy) forwardReadyThenSwallow(agent, handler net.Conn) {
+	r := bufio.NewReader(agent)
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		if _, err := io.WriteString(handler, line); err != nil {
+			return
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+	raw, _, err := readClientFrame(r)
+	if err != nil {
+		return
+	}
+	if _, err := handler.Write(raw); err != nil {
+		return
+	}
+	for {
+		_, payload, err := readClientFrame(r)
+		if err != nil {
+			return
+		}
+		var env struct {
+			Type          string  `json:"type"`
+			LastBootPhase *string `json:"lastBootPhase"`
+			Metric        string  `json:"metric"`
+		}
+		_ = json.Unmarshal(payload, &env)
+		kind := env.Type
+		switch env.Type {
+		case "heartbeat":
+			kind += ":" + phaseOrNull(env.LastBootPhase)
+		case "boot_timing":
+			kind += ":" + env.Metric
+		}
+		p.mu.Lock()
+		p.swallowed = append(p.swallowed, kind)
+		p.mu.Unlock()
+		if env.Type == "heartbeat" && env.LastBootPhase == nil {
+			return
+		}
+	}
+}
+
+// swallowedFrames returns the kinds of the frames discarded so far.
+func (p *swallowingProxy) swallowedFrames() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.swallowed...)
+}
+
+// readClientFrame reads one WebSocket frame as a client writes it (RFC
+// 6455 §5.2: masked, and never compressed here -- the Bridge negotiates no
+// extension), returning its bytes as read and its unmasked payload.
+func readClientFrame(r *bufio.Reader) (raw, payload []byte, err error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(r, header); err != nil {
+		return nil, nil, err
+	}
+	raw = append(raw, header...)
+	length := uint64(header[1] & 0x7f)
+	switch length {
+	case 126:
+		ext := make([]byte, 2)
+		if _, err := io.ReadFull(r, ext); err != nil {
+			return nil, nil, err
+		}
+		raw = append(raw, ext...)
+		length = uint64(binary.BigEndian.Uint16(ext))
+	case 127:
+		ext := make([]byte, 8)
+		if _, err := io.ReadFull(r, ext); err != nil {
+			return nil, nil, err
+		}
+		raw = append(raw, ext...)
+		length = binary.BigEndian.Uint64(ext)
+	}
+	var key []byte
+	if header[1]&0x80 != 0 {
+		key = make([]byte, 4)
+		if _, err := io.ReadFull(r, key); err != nil {
+			return nil, nil, err
+		}
+		raw = append(raw, key...)
+	}
+	payload = make([]byte, length)
+	if _, err := io.ReadFull(r, payload); err != nil {
+		return nil, nil, err
+	}
+	raw = append(raw, payload...)
+	for i := range payload {
+		if key != nil {
+			payload[i] ^= key[i%4]
+		}
+	}
+	return raw, payload, nil
+}
+
+func phaseOrNull(phase *string) string {
+	if phase == nil {
+		return "null"
+	}
+	return *phase
+}
+
+// storedKinds returns every event stored for the fixture's session, in
+// arrival order: "ready", "heartbeat:<phase>" ("null" for a null phase),
+// "boot_timing:<metric>", or the bare type for anything else.
+func (f bootReadyFixture) storedKinds(ctx context.Context, t *testing.T) []string {
+	t.Helper()
+	rows, err := f.pool.Query(ctx, `SELECT type, COALESCE(payload->>'lastBootPhase', 'null'), COALESCE(payload->>'metric', '')
+		FROM events WHERE session_id = $1 ORDER BY id`, f.sessionID)
+	if err != nil {
+		t.Fatalf("query events: %v", err)
+	}
+	defer rows.Close()
+	var kinds []string
+	for rows.Next() {
+		var typ, phase, metric string
+		if err := rows.Scan(&typ, &phase, &metric); err != nil {
+			t.Fatalf("scan event: %v", err)
+		}
+		switch typ {
+		case "heartbeat":
+			typ += ":" + phase
+		case "boot_timing":
+			typ += ":" + metric
+		}
+		kinds = append(kinds, typ)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	return kinds
+}
+
+// upToFirstNull returns kinds up to and including its first null-phase
+// heartbeat, or all of kinds when it has none.
+func upToFirstNull(kinds []string) []string {
+	if i := slices.Index(kinds, "heartbeat:null"); i >= 0 {
+		return kinds[:i+1]
+	}
+	return kinds
+}
+
+// TestBootReady_RealBridge_StartPhaseLostInFlight: the connection the
+// agent's boot evidence went out on is lost with it in flight. The boot
+// completed before the first connection came up, in cmd/sandbox-agent's
+// order -- ReportBootStarted, the boot's boot_duration (buffered, since
+// nothing is connected yet), MarkBootComplete -- and a proxy loses
+// everything the agent writes on that connection after "ready": its start
+// phase, the boot_timing and its null phase, all written without error.
+// The next connection must carry the start phase again, ahead of its first
+// null, and that heartbeat must be the evidence the sandbox goes Ready on
+// -- ahead of the replayed boot_timing when there is one, and alone when
+// there is none: best-effort telemetry whose loss must never fail a boot
+// (§33.3), and without which the sandbox would stay Booting for the
+// fallback's whole hour. Heartbeats are never acknowledged, so an agent
+// that took a successful write of its start phase as delivered sent only
+// null phases on the next connection.
+func TestBootReady_RealBridge_StartPhaseLostInFlight(t *testing.T) {
+	ctx := context.Background()
+	start := "heartbeat:" + wsbridge.InitialBootPhase
+
+	for _, tc := range []struct {
+		name          string
+		bootTiming    bool
+		wantSwallowed []string
+		wantStored    []string
+	}{
+		{
+			name:          "boot_timing buffered",
+			bootTiming:    true,
+			wantSwallowed: []string{start, "boot_timing:boot_duration", "heartbeat:null"},
+			wantStored:    []string{"ready", "ready", start, "boot_timing:boot_duration", "heartbeat:null"},
+		},
+		{
+			name:          "no boot_timing",
+			wantSwallowed: []string{start, "heartbeat:null"},
+			wantStored:    []string{"ready", "ready", start, "heartbeat:null"},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newBootReadyFixture(ctx, t)
+			proxy, proxiedURL := newSwallowingProxy(t, f.wsURL)
+			f.startBridgeAt(t, proxiedURL, bootReadyShortHeartbeat, func(b *wsbridge.Bridge) {
+				b.ReportBootStarted()
+				if tc.bootTiming {
+					mode, failed := "fresh", false
+					if err := b.SendBestEffort(ctx, sandboxws.BootTiming{
+						Type:      "boot_timing",
+						MessageId: "bt-boot-duration",
+						SessionId: f.sessionID.String(),
+						Gen:       1,
+						Metric:    sandboxws.BootTimingMetricBootDuration,
+						Seconds:   1.5,
+						BootMode:  &mode,
+						Failed:    &failed,
+					}); err != nil {
+						t.Fatalf("SendBestEffort(boot_timing): %v", err)
+					}
+				}
+				b.MarkBootComplete()
+			})
+
+			f.waitStatus(ctx, t, sqlcgen.SandboxStatusReady)
+
+			// Connection 1 did carry the start phase, then a null phase,
+			// and the control plane got neither.
+			if got := proxy.swallowedFrames(); !slices.Equal(got, tc.wantSwallowed) {
+				t.Fatalf("frames lost on connection 1 = %v, want %v", got, tc.wantSwallowed)
+			}
+			// Connection 2 carried the start phase ahead of its first null,
+			// and it was the first evidence the control plane saw.
+			if got := upToFirstNull(f.storedKinds(ctx, t)); !slices.Equal(got, tc.wantStored) {
+				t.Errorf("stored events up to the first null phase = %v, want %v", got, tc.wantStored)
+			}
+			row := getSandbox(ctx, t, f.pool, f.sessionID)
+			if row.BootEvidenceGen == nil || *row.BootEvidenceGen != 1 {
+				t.Errorf("boot_evidence_gen at Ready = %v, want 1", row.BootEvidenceGen)
+			}
+		})
+	}
+}
+
+// TestBootReady_RealBridge_StartPhaseAgainAfterReadyIsHarmless: every
+// connection carries the boot's start phase ahead of its first null, so a
+// sandbox that went Ready on its first connection hears it again on the
+// next one. The control plane takes it in its stride -- evidence is
+// recorded once per generation and a non-null phase moves no sandbox -- so
+// the sandbox stays Ready throughout the reconnect.
+func TestBootReady_RealBridge_StartPhaseAgainAfterReadyIsHarmless(t *testing.T) {
+	ctx := context.Background()
+	start := "heartbeat:" + wsbridge.InitialBootPhase
+	f := newBootReadyFixture(ctx, t)
+	f.startBridge(t, bootReadyShortHeartbeat, func(b *wsbridge.Bridge) {
+		b.ReportBootStarted()
+		b.MarkBootComplete()
+	})
+	f.waitStatus(ctx, t, sqlcgen.SandboxStatusReady)
+
+	f.severer.severAll()
+	// Wait for connection 2's first null phase, checking the status on
+	// every poll: Ready, never back to Booting.
+	var second int
+	waitUntil(t, dispatchTestWait, func() bool {
+		if got := f.status(ctx, t); got != sqlcgen.SandboxStatusReady {
+			t.Fatalf("status during the reconnect = %s, want %s", got, sqlcgen.SandboxStatusReady)
+		}
+		kinds := f.storedKinds(ctx, t)
+		second = slices.Index(kinds[1:], "ready") + 1
+		return second > 0 && slices.Contains(kinds[second:], "heartbeat:null")
+	})
+
+	kinds := f.storedKinds(ctx, t)
+	for _, conn := range []struct {
+		name   string
+		events []string
+	}{
+		{"connection 1", kinds[:second]},
+		{"connection 2", kinds[second:]},
+	} {
+		if got, want := upToFirstNull(conn.events), []string{"ready", start, "heartbeat:null"}; !slices.Equal(got, want) {
+			t.Errorf("%s's events up to its first null phase = %v, want %v", conn.name, got, want)
+		}
+	}
+	if got := f.status(ctx, t); got != sqlcgen.SandboxStatusReady {
+		t.Errorf("status after connection 2's start phase = %s, want %s", got, sqlcgen.SandboxStatusReady)
+	}
+	row := getSandbox(ctx, t, f.pool, f.sessionID)
+	if row.BootEvidenceGen == nil || *row.BootEvidenceGen != 1 {
+		t.Errorf("boot_evidence_gen = %v, want 1", row.BootEvidenceGen)
 	}
 }

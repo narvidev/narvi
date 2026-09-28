@@ -110,12 +110,12 @@ type Bridge struct {
 	// heartbeat's null lastBootPhase is the wire's "boot has completed"
 	// (§6.1) and the control plane moves a Booting sandbox to Ready on it.
 	//
-	// It also guards bootStartOwed: the phase ReportBootStarted found, kept
-	// until a heartbeat carrying a non-null phase has been written, so that
-	// one always precedes the first null -- see ReportBootStarted.
-	bootMu        sync.Mutex
-	lastBootPhase *string
-	bootStartOwed *string
+	// It also guards bootStartPhase: the phase ReportBootStarted found,
+	// which every connection carries ahead of its first null heartbeat --
+	// see ReportBootStarted.
+	bootMu         sync.Mutex
+	lastBootPhase  *string
+	bootStartPhase *string
 
 	// convMu guards conversationID, read by the heartbeat loop and written
 	// by SetConversationID -- the OpenCode-adapter analogue of bootMu/
@@ -266,40 +266,49 @@ func (b *Bridge) setLastBootPhase(phase *string) {
 // boot (§33.3). Called while disconnected, the heartbeat is sent as soon
 // as the next connection's heartbeat loop starts.
 //
-// The phase it finds is owed to the wire until a heartbeat carrying a
-// non-null phase has been written, and a heartbeat that would report null
-// before then first writes one carrying that phase. The evidence therefore
-// never depends on when heartbeats go out relative to the boot: a boot
-// that completes before the first connection is up -- the dial backing
-// off while the control plane is briefly unreachable -- still reaches the
+// The phase it finds is the boot's start phase, and every connection
+// carries it ahead of its first null heartbeat -- every connection, not
+// only the first. Nothing on the wire acknowledges a heartbeat, and a
+// successful write only means the frame left this process: a connection
+// that drops can lose frames it wrote, the start phase included. What the
+// agent can rely on is order within one connection: the control plane
+// reads a connection's frames in the order they were written, so a null
+// that reaches it has been preceded by whatever that same connection
+// wrote before it. So a connection that comes up once the boot has
+// completed writes the start phase right after "ready", ahead of the
+// buffer replay; one whose first heartbeat would report null writes the
+// start phase just before it (sendHeartbeatNow, run.go); and one whose
+// first heartbeat carries a non-null phase has shown the evidence already.
+// Within one connection the start phase is therefore written at most once,
+// and never after a null.
+//
+// The evidence thus never depends on when heartbeats go out relative to
+// the boot, or on which connection's frames get through: a boot that
+// completes before the first connection is up -- the dial backing off
+// while the control plane is briefly unreachable -- still reaches the
 // control plane as the start phase, then null, rather than as the single
 // null heartbeat forceHeartbeat's one pending signal would otherwise
-// coalesce the two calls into.
+// coalesce the two calls into; and a connection lost with its start phase
+// in flight is followed by one that carries it again. The control plane
+// takes the repeat in its stride: it records evidence once per generation
+// and moves a sandbox on no heartbeat whose phase is non-null.
 func (b *Bridge) ReportBootStarted() {
 	b.bootMu.Lock()
 	if b.lastBootPhase != nil {
 		phase := *b.lastBootPhase
-		b.bootStartOwed = &phase
+		b.bootStartPhase = &phase
 	}
 	b.bootMu.Unlock()
 	b.signalHeartbeat()
 }
 
 // heartbeatBootPhases returns, read together, the phase the next heartbeat
-// reports and the boot-start phase still owed to the wire (nil when none
-// is: see ReportBootStarted).
-func (b *Bridge) heartbeatBootPhases() (phase, owed *string) {
+// reports and the boot's start phase (nil until ReportBootStarted has
+// recorded one).
+func (b *Bridge) heartbeatBootPhases() (phase, start *string) {
 	b.bootMu.Lock()
 	defer b.bootMu.Unlock()
-	return b.lastBootPhase, b.bootStartOwed
-}
-
-// bootStartDelivered records that a heartbeat carrying a non-null phase has
-// been written, which settles what ReportBootStarted owed.
-func (b *Bridge) bootStartDelivered() {
-	b.bootMu.Lock()
-	defer b.bootMu.Unlock()
-	b.bootStartOwed = nil
+	return b.lastBootPhase, b.bootStartPhase
 }
 
 // MarkBootComplete clears the tracked lastBootPhase to nil --
@@ -320,9 +329,10 @@ func (b *Bridge) MarkBootComplete() {
 // signalHeartbeat asks heartbeatLoop for an immediate heartbeat, without
 // blocking: forceHeartbeat's capacity-1 buffer coalesces signals raised
 // before the loop gets to them, and the one heartbeat it then sends reads
-// the state current at that moment -- preceded by the boot-start phase if
-// that is still owed (ReportBootStarted), which is what keeps the start
-// and completion signals from coalescing into a lone null.
+// the state current at that moment -- preceded by the boot's start phase
+// when it is its connection's first heartbeat and would report null
+// (ReportBootStarted), which is what keeps the start and completion
+// signals from coalescing into a lone null.
 func (b *Bridge) signalHeartbeat() {
 	select {
 	case b.forceHeartbeat <- struct{}{}:
