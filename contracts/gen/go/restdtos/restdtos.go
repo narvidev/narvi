@@ -11181,13 +11181,8 @@ type SessionActivity struct {
 	// earlier push's pull request ends the later delivery, and the later pull request
 	// can appear after 'finished'. 'scheduled' ends when its work comes due and
 	// either creates its turn ('queued' follows) or declines (the session reads
-	// whatever else it holds). One stated limit: when this session is a pull
-	// request's review session and its own push moves that pull request's head (a
-	// same-repository pull request whose head branch is the session's), the automatic
-	// re-review that push causes is armed only when the code host's notification of
-	// the push arrives -- until then activity can read 'finished', and once it lands
-	// 'scheduled', then 'queued' or 'running'. The same holds after a push that
-	// reached the remote but reported a failure.
+	// whatever else it holds). A pull request's review session is read-only and never
+	// pushes, so its turns are never followed by 'delivering'.
 	Activity SessionActivityActivity `json:"activity" yaml:"activity" mapstructure:"activity"`
 
 	// Archived corresponds to the JSON schema field "archived".
@@ -11223,10 +11218,7 @@ type SessionActivity struct {
 	// true exactly when activity is idle, awaiting_approval or finished: nothing
 	// progresses server-side until a person acts or sends new input. Never true while
 	// a turn is queued or running, while a completed turn's push and pull request are
-	// being delivered, or while work that can create a turn is scheduled. One stated
-	// limit (see activity): after a pull request review session's own push to that
-	// pull request's head, settled can be true before the code host's notification of
-	// that push arms an automatic re-review.
+	// being delivered, or while work that can create a turn is scheduled.
 	Settled bool `json:"settled" yaml:"settled" mapstructure:"settled"`
 
 	// How long to wait before reading this status again, in whole seconds (rounded
@@ -11858,8 +11850,8 @@ type SessionOutcome struct {
 	// the session would have opened in shadow mode, or a record that could not be
 	// read). 'produced': the session opened the pull requests in pullRequests and
 	// reviews none. 'reviewed': the session is the review session of
-	// reviewedPullRequest (pullRequests lists any it also opened, such as its own
-	// push's).
+	// reviewedPullRequest (pullRequests lists any pull request recorded as opened by
+	// the session; a review session is read-only and opens none).
 	ReviewScope SessionOutcomeReviewScope `json:"reviewScope" yaml:"reviewScope" mapstructure:"reviewScope"`
 
 	// The pull request this session is the review session of (the per-pull-request

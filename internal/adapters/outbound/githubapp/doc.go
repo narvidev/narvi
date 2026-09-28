@@ -1,13 +1,13 @@
 // Package githubapp implements §30.4's own lever: a GitHub App fine-grained
 // read-only installation access token, minted fresh per credential
 // request. This is the credential internal/adapters/inbound/httpapi.
-// ScmCredentials' own shadow-substitution branch hands to a shadow sandbox
-// instead of the write-capable creator OAuth token or bot token every
-// session used to receive regardless of egress mode -- a credential that
-// physically cannot write is equally harmless in a process environment, a
-// disk cache, a baked image, or a restored snapshot (§30.4's own words for
-// why this shape was chosen over the smaller fine-grained-PAT stopgap the
-// design also weighed).
+// ScmCredentials hands to a shadow sandbox, a build boot and every pull
+// request review session (read-only in every egress mode), instead of the
+// write-capable creator OAuth token or bot token each of them used to
+// receive -- a credential that physically cannot write is equally
+// harmless in a process environment, a disk cache, a baked image, or a
+// restored snapshot (§30.4's own words for why this shape was chosen over
+// the smaller fine-grained-PAT stopgap the design also weighed).
 //
 // Client authenticates as the App itself (a short-lived RS256 JWT, signed
 // with the App's own private key -- reusing internal/adapters/outbound/

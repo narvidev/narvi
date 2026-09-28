@@ -132,84 +132,10 @@ func TestCompleteProcessingTurn_NoGitHubIdentity_BlocksPushAndRecordsWarning(t *
 	}
 }
 
-// TestCompleteProcessingTurn_ReviewSession_NoGitHubIdentity_PushNotBlocked
-// proves the gate correctly EXCLUDES a review session: scmcredentials.go's
-// own step 7 always mints the bot token for a review session's sandbox,
-// regardless of the creator's own github identity, so
-// pushBlockedByMissingGitHubIdentity must never fire for one -- a push
-// command must still be sent normally.
-func TestCompleteProcessingTurn_ReviewSession_NoGitHubIdentity_PushNotBlocked(t *testing.T) {
-	ctx := context.Background()
-	pool := newTestPool(t)
-
-	userStore := narvipg.NewUserStore(pool)
-	user, err := userStore.Create(ctx, sqlcgen.CreateUserParams{
-		PrimaryEmail: "review-session-no-identity-push@example.com",
-		DisplayName:  "Review Session, No GitHub Identity",
-		Role:         sqlcgen.UserRoleMember,
-	})
-	if err != nil {
-		t.Fatalf("create user: %v", err)
-	}
-	// Deliberately NO identities row of any provider -- proving this
-	// gate's own review-session check, not merely that a github identity
-	// happens to make the push succeed anyway.
-
-	const repoFullName = "acme/review-session-no-identity-push"
-	sessionID := createTestSessionWithRepos(ctx, t, pool, user.ID, "repo", "https://github.com/"+repoFullName+".git", "feature-review")
-	if _, err := narvipg.NewRepoSettingsStore(pool).UpsertLiveEgressEnabled(ctx, repoFullName, true); err != nil {
-		t.Fatalf("promote repo to live egress: %v", err)
-	}
-
-	prSessions := narvipg.NewGitHubPRSessionStore(pool)
-	if err := prSessions.EnsureRow(ctx, repoFullName, 77); err != nil {
-		t.Fatalf("ensure github pr session row: %v", err)
-	}
-	if err := prSessions.SetSessionID(ctx, repoFullName, 77, sessionID); err != nil {
-		t.Fatalf("set github pr session id: %v", err)
-	}
-
-	sandboxStore := narvipg.NewSandboxStore(pool)
-	if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
-		t.Fatalf("create sandbox: %v", err)
-	}
-	turnStore := narvipg.NewTurnStore(pool)
-	processing := createProcessingTurn(ctx, t, turnStore, sessionID)
-
-	commander := &fakeSendCommander{}
-	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, commander, nil, "", nil, nil, "", nil, false)
-	if err != nil {
-		t.Fatalf("NewRegistry: %v", err)
-	}
-	t.Cleanup(func() { _ = r.Shutdown() })
-
-	a, err := r.GetOrSpawn(ctx, sessionID)
-	if err != nil {
-		t.Fatalf("GetOrSpawn: %v", err)
-	}
-
-	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
-		Type: "execution_complete", Gen: 1,
-		Raw: executionCompleteRaw(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeCompleted),
-	})
-
-	waitUntil(t, 5*time.Second, func() bool {
-		row, err := turnStore.Get(ctx, processing.ID)
-		return err == nil && row.Status == sqlcgen.TurnStatusCompleted
-	})
-
-	waitUntil(t, 5*time.Second, func() bool {
-		return commander.callCount() == 1
-	})
-
-	eventStore := narvipg.NewEventStore(pool)
-	events, err := eventStore.ListForSession(ctx, sessionID, 0, 100)
-	if err != nil {
-		t.Fatalf("ListForSession: %v", err)
-	}
-	for _, e := range events {
-		if e.Type == "warning" {
-			t.Errorf("a warning event was recorded for a review session, want none -- review sessions always mint the bot token (scmcredentials.go step 7) regardless of the creator's own github identity")
-		}
-	}
-}
+// A review session never reaches this gate at all: completeProcessingTurn
+// returns before it, since a review session never pushes. That case --
+// including a review session whose creator has no linked GitHub identity,
+// which gets no push and never this push-blocked warning (only the
+// read-only one, when its turn is not a review attempt) -- is covered by
+// TestCompleteProcessingTurn_ReviewSessionNeverPushes
+// (pushpr_reviewsession_integration_test.go).

@@ -58,8 +58,8 @@ const (
 //     reads running whenever it can do anything.
 //   - review_retrigger_debounce (armed by the pull_request/synchronize
 //     webhook on every push to a PR with a review session, opted in or
-//     not, the session's own push to that PR's head included once the
-//     code host delivers it; §24): when it fires, an opted-in repo whose
+//     not -- never the review session's own, since a review session never
+//     pushes; §24): when it fires, an opted-in repo whose
 //     head moved and whose budget allows gets a new review turn, inserted
 //     by the actor with no further input (reviewretrigger.go). Otherwise it
 //     declines and deletes itself. TimerCountsAsScheduledWork narrows it by

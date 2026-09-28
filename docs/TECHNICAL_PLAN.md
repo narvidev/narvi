@@ -3704,6 +3704,47 @@ recommendation:**
    same-UID agent (until §30.5 lands) can recover the sandbox bearer from `/proc` and POST the
    mint endpoint directly, so any client-side substitution is decorative. A dedicated test
    asserts a review session in shadow receives a read-only credential.
+
+   **Amendment — a review session is read-only in every mode.** A review session only clones its
+   pull request's head; it has no use for write. It now receives the read-only installation token
+   on a live repository too, through the same interception's mint and the same fail-closed scope
+   check (an over-scoped grant is refused; a failed mint or a failed `github_pr_sessions` lookup is
+   a 500, never a fall-through to a write-capable branch), and `ScmCredentials` is no longer given
+   the bot token at all — the bot token stays server-side, for the verdict path. That mint is not a
+   shadow-mode substitution, so it writes nothing to the shadow ledger (`readonlymint.MintUnrecorded`;
+   the handler logs each outcome instead), and a ledger failure cannot fail it; a review session on
+   a shadow repository, or in a build boot, is a shadow mint like any other and is recorded. The
+   server also never asks a review sandbox to push, and never opens a pull request for one:
+   `completeProcessingTurn` returns no push signal for a session with a `github_pr_sessions` row,
+   and `createPRBestEffort` opens nothing for a `push_complete` in one — no pull request, no preview,
+   so no commit status. Both lookups fail closed. That half is consistency, in the sense of the
+   WS-push paragraph below; the read-only token is the guard. Work in a review session is not
+   dropped silently: a turn there that is not a review attempt (a follow-up mention, a web prompt, a
+   plan's implementation) ends with a session-visible warning that the session is read-only, so
+   changes made in it are not pushed. `TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential`,
+   `TestScmCredentials_ReadOnlyMint_OnlyShadowAndBuildBootAreRecorded`,
+   `TestCompleteProcessingTurn_ReviewSessionNeverPushes` and
+   `TestCreatePRBestEffort_ReviewSessionNeverOpensAPullRequest` pin it. The sentinel auto-fix child
+   (§17.2) is not a review session — no `github_pr_sessions` row of its own — and this amendment
+   leaves it as it was: the server still sends the push command for its own
+   `narvi/sentinel-fix/<id>` branch (`TestSentinelAutoFixChild_IsNotAReviewSessionSoItsPushIsSent`).
+   Whether that push reaches GitHub on a live repository is a separate, pre-existing question this
+   amendment does not change: the child has no creator, so its own credential request is refused
+   there (`TestScmCredentials_SentinelFixChild_IsNotServedAsAReviewSession`).
+
+   **The GitHub App must be installed wherever a review session clones.** The mint above now serves
+   every live review session's clone, not only shadow sandboxes and build boots, so the App must be
+   installed, with read-only permissions (`contents: read`, `metadata: read`), on every repository
+   Narvi reviews. Where it is not, GitHub finds no installation for the repository; the credential
+   is still refused — never another in its place — but as a 403 with a session-visible warning
+   naming the repository and that the App must be installed on it with read access, once per
+   session and repository, rather than a bare 500. The mint is bounded (`GitHubAppMintTimeout`,
+   8 s) inside the sandbox helper's own wait (`CredentialFetchTimeout`, 10 s), so that answer
+   reaches the sandbox before it gives up. **A stated limit: a pull request from a fork.** A review
+   session clones its pull request's head from the head repository, so for a fork the App must be
+   installed on the fork owner's account too — an account the base repository's owner does not
+   control. Until it is, such a review cannot clone, and says why. The follow-up: a review session
+   reads its pull request from the base repository (a planned Step).
 2. **The image-build path must never hold a write token — this is an in-repo bug, not an
    external-service caveat.** `gitclone.CleanForImageBuild`
    (`internal/sandboxagent/gitclone/sync.go:941`), the pre-snapshot cleanup for `BootModeBuild`,
@@ -7781,8 +7822,9 @@ else no turn at all → `idle` (a session created without a prompt); else `finis
 mirroring `turn.IsTerminal`'s deny-list, so a busy session never reads settled because of a value this
 code does not recognize. A non-empty queue is therefore always `queued` or `running`, never `idle` or
 `finished`. `settled` is true for `idle`, `awaiting_approval` and `finished`: nothing progresses
-server-side until a person acts or sends new input — with one stated limit, the echo of a pull request
-review session's own push (below).
+server-side until a person acts or sends new input. (An earlier revision stated one limit here, the
+echo of a pull request review session's own push; a review session no longer pushes, so the limit is
+gone — below.)
 
 **A completed turn's delivery.** A successful turn's work is not done when the turn is: its branch is
 pushed and its pull request opened afterwards, outside the turn's own terminal transaction. The actor
@@ -7795,12 +7837,10 @@ stamped for shadow and blocked cycles that send nothing, and it stays set after 
 cannot serve. The progress is its own column, `sandboxes.pr_delivery_started_at` (migration `000145`):
 stamped with the database's `now()` in the same transaction that completes the turn — so no snapshot
 holds that completed turn without it — and only when a push will really be sent (live egress, a creator
-whose push can authenticate, at least one repository with a branch); cleared once `createPRBestEffort`
+whose push can authenticate, at least one repository with a branch, and not a pull request's review
+session, which never pushes); cleared once `createPRBestEffort`
 has returned, after the pull request's artifact row is written, so a status that no longer says
-`delivering` already lists the pull request it opened. When the session is a pull request's review
-session and the push moved that pull request's own head, the automatic re-review that push causes is
-armed only when the code host's `synchronize` for it lands, so the stamp can clear into `finished`
-first — a stated limit (below). `createPRBestEffort` clears it on every return
+`delivering` already lists the pull request it opened. `createPRBestEffort` clears it on every return
 (deferred), including the ones that open no pull request — no `SourceControl` configured, a
 `push_complete` listing no repository, a creator who may no longer open one (disabled, or now a
 viewer), a token that no longer decrypts, GitHub refusing the request — so `finished` can come with no
@@ -7834,8 +7874,9 @@ so review round 3 inventoried every mechanism that can create a turn, or change 
 reports, on a session with no new human input — every `session_timers` kind and its handler, the
 background workers, and all six places a turn is inserted (`createTurnLocked`, session creation, plan
 approval, the workflow engine's advance, the re-review debounce's handler, the composition dispatch) —
-and review round 4 added the input the server produces itself: its own output coming back as a webhook,
-which the status observes only once that webhook lands (a stated limit, below).
+and review round 4 added the input the server produces itself: its own output coming back as a webhook.
+The one such echo found, a review session's own push, no longer exists: a review session never pushes
+(below).
 
 | Mechanism | What arms it | What fires it | Can it create work from a settled snapshot? |
 |---|---|---|---|
@@ -7844,13 +7885,13 @@ which the status observes only once that webhook lands (a stated limit, below).
 | `inactivity` timer | the sandbox reaching `ready`; re-armed | timer pump → session actor | No — `ready` → `suspect` (a warning event on an extension) |
 | `terminal_grace` timer | `transitionSandboxToSuspect` (the three watchdogs, a permanent spawn failure) | timer pump → session actor | No — `suspect` → `failed`, the status re-derived with its reason unchanged, then dispatch re-run for a turn that is already pending (already `queued`) |
 | `turn_deadline` timer | a turn's dispatch; deleted at its completion | timer pump → session actor | No — it times out the turn that is processing, whose end can queue the workflow's next step in the same transaction, so it acts only while the snapshot already reads `running`; with no processing turn it deletes itself |
-| `review_retrigger_debounce` timer (§24) | the `pull_request`/`synchronize` webhook, on every push to a PR with a review session, opted in or not — the session's own push to its PR's head included, once the code host delivers it (next row) | timer pump → session actor, `ReviewRetriggerDebounce` (2 min) after the last push | **Yes** — inserts a review turn with no further input when the repository opted in, the head moved and the budget allows; otherwise declines and deletes itself |
-| A PR review session's own push to its PR's head | the session's completed turn: its push, reported by `push_complete` — or by `push_error` when the push reached the remote before its report failed | GitHub's `pull_request`/`synchronize` for that push — the server's own output echoed back — which arms the debounce above on the same session, exactly as for any other push | **Yes, through the debounce, once that webhook lands** — a stated limit, not closed: the server records nothing when the push completes or fails, so between the end of the delivery and the webhook the session can read `finished` and settled (below) |
+| `review_retrigger_debounce` timer (§24) | the `pull_request`/`synchronize` webhook, on every push to a PR with a review session, opted in or not — never the review session's own, since a review session never pushes (next row) | timer pump → session actor, `ReviewRetriggerDebounce` (2 min) after the last push | **Yes** — inserts a review turn with no further input when the repository opted in, the head moved and the budget allows; otherwise declines and deletes itself |
+| A PR review session's completed turn | — | — | No — a review session never pushes: `completeProcessingTurn` sends it no push command and starts no delivery, so its turn's end leaves nothing for the code host to echo back |
 | Release manifest check (§15) | a new review session on a release PR (`release_manifest_pending`, enqueued by the webhook) | `releasereview.Worker`, every `ReleaseManifestCheckPumpInterval` | **Yes** — when the aggregate review triggers, inserts the composition review turn on that same session |
 | A workflow's next step (§25) | a step's turn ending, or `/decide` | the same transaction | No gap — inserted in the transaction that ends the previous step's turn |
 | A plan's implementation turn (§8.1) | a person approving the plan | the same transaction | Human input |
 | Mentions, the review label, the re-review button, REST, Slack and Linear turns | a person | the request itself | Human input; the turn is inserted before the request returns |
-| A completed turn's push and pull request | the turn's completion | its `push_complete` | Covered by `delivering` (above); a PR review session's own push to its PR's head, by the row two above |
+| A completed turn's push and pull request | the turn's completion | its `push_complete` | Covered by `delivering` (above); a PR review session has none (the row two above) |
 | Dispatch and spawn retries, turn recovery | a pending or in-flight turn | the session actor | Only acts on a turn the snapshot already reads `queued` or `running` |
 | Automations (cron, GitHub including `check_run`, Linear), sentinel auto-fix, child sessions | their triggers | their pumps | Create a new session, its first turn in the same transaction — never a turn on an existing one |
 
@@ -7923,33 +7964,31 @@ waiting check's enqueue plus `ReleaseManifestCheckPumpInterval`, a running check
 `ReleaseManifestCheckTimeout`. Two stated limits err toward unsettled: a debounce whose fire then
 declines on a rule the status does not copy reads `scheduled` until it fires; and a release PR's review
 session reads `scheduled` until its check has run, whether or not the check triggers the composition
-pass. The third errs the other way, and has a paragraph of its own.
+pass. A third, which erred the other way, is closed; the next paragraph says how.
 
-**A stated limit: the echo of a review session's own push.** When a pull request's review session pushes
-to that pull request's head — a same-repository pull request whose head branch is the session's branch —
-the code host delivers `pull_request`/`synchronize` for that push, and the webhook arms the automatic
-re-review (§24) on the same session, exactly as it does for any other push. The server records nothing
-when the push completes: the delivery ends when `createPRBestEffort` returns, and until that webhook
-lands no work is armed, so the status can read `finished` and settled, and a client waiting on
-`settled` returns before the re-review exists. The same holds when the push reached the remote and the
-sandbox then reported `push_error` — reading the pushed head back failed, or the deadline fired after the
-remote accepted the update: the stamp clears on the `push_error`, and the head has moved all the same.
-It matters only where the re-review can fire (the repository opted in, the budget not spent); elsewhere
-the fire declines and the status is right to read settled. What a client sees: once the webhook lands,
-`scheduled`, then `queued` and `running` once the fire inserts the review turn — a session that read
-settled reads unsettled again with no new input from anyone. Row 182's result (c) reports each pull
-request's verdict with its freshness, its recorded context compared with the pull request's live head
-(§21.1b), so a verdict produced before the push does not read as fresh there
-(`TestResult_OwnPushMovedHeadIsNotCurrent`, piece (c) below). Review round 4
-closed the gap by performing the webhook's write in the transaction that persists `push_complete`;
-review round 5 reverted that entirely, because it changed what §24 does and how its webhook locks: the
-actor's transaction and the webhook's took the session row and the pull request's row in opposite orders
-and deadlocked (`40P01`) when a push
-and its `synchronize` were processed together; it armed a paid re-review of a pull request already merged
-or closed, which GitHub sends no `synchronize` for; and the guard it needed against reviewing the same
-head twice also kept the webhook from arming after an ordinary mention created against that head. A
-status observes the system; making one read exact is not a reason to reshape what it observes.
-`TestSessionStatus_OwnPushEchoIsAStatedLimit` pins the limit and main's webhook under it.
+**Closed: the echo of a review session's own push.** A pull request's review session is read-only: it
+never pushes (`completeProcessingTurn` returns no push signal for a session with a `github_pr_sessions`
+row, before it records any push cycle), and its sandbox is only ever served the read-only installation
+token (§30.4, amended). So its turn's end starts no delivery and leaves nothing for the code host to echo
+back: the status reads `finished` and settled at once, and it is right to — only a push by someone else
+can arm the re-review, through its own `synchronize`, as on any pull request.
+`TestSessionStatus_ReviewSessionNeverPushesSoItsTurnEndsSettled` pins it: no push command, no delivery,
+`finished` and settled with nothing armed; the signed `synchronize` of another push then arms the
+debounce from its own instant, `scheduled`, then `queued`. Row 182's result (c) still reads each verdict's
+freshness against the pull request's live head (§21.1b), so a verdict produced before any push does not
+read as fresh (`TestResult_HeadMovedAfterTheVerdictIsNotCurrent`, piece (c) below).
+
+Before, this paragraph stated a limit: a review session pushed its own work to its pull request's head,
+the code host echoed that push back as `synchronize`, and between the end of the delivery and that
+webhook the status could read `finished` and settled although a re-review was about to be armed.
+Review round 4 closed it by performing the webhook's write in the transaction that persists
+`push_complete`; review round 5 reverted that, because it changed what §24 does and how its webhook
+locks — the two transactions took the session row and the pull request's row in opposite orders and
+deadlocked (`40P01`); it armed a paid re-review of a pull request already merged or closed, which GitHub
+sends no `synchronize` for; and its guard against reviewing the same head twice kept the webhook from
+arming after an ordinary mention created against that head. A status observes the system; making one
+read exact is not a reason to reshape what it observes. The limit is now closed at its source instead:
+the push no longer exists.
 
 **Which escalation is a gate.** A workflow run escalated to `needs_review` (§25.9) stays there: no
 route or job moves a run out of it — `/decide` acts only on a step awaiting a decision — and the next
@@ -8211,11 +8250,10 @@ delivery, the real timer pump and actor: `finished`, then `scheduled` from the w
 the review turn exists — never settled in between — then `queued`),
 `TestSessionStatus_ReReviewThatCannotFireReadsSettledAtOnce` (not opted in: armed, yet `finished` right
 after the push and through the fire, which declines), `TestSessionStatus_ReReviewFireAndStatusAgree`,
-`TestSessionStatus_OwnPushEchoIsAStatedLimit` (the stated limit, with a real actor: after the
-session's own push — `push_complete` with `CreatePR` held open, or a `push_error` after the push reached
-the remote — `finished` and settled with nothing armed; the late signed `synchronize` then arms the
-debounce exactly as on main, from its own instant, even when a turn was already created against that
-head; `scheduled`, then `queued` once the fire inserts the review turn),
+`TestSessionStatus_ReviewSessionNeverPushesSoItsTurnEndsSettled` (with a real actor: a review
+session's completed turn sends no push command and starts no delivery, so the status reads `finished`
+and settled at once with nothing armed; the signed `synchronize` of another push then arms the debounce
+from its own instant; `scheduled`, then `queued` once the fire inserts the review turn),
 `TestSessionStatus_ReleaseManifestCheckIsScheduledUntilItsCompositionTurnExists` (the real worker:
 `scheduled` while the check waits and while it runs, `queued` with the composition turn, settled at once
 when nothing triggers it). MCP:
@@ -8438,9 +8476,10 @@ eligibility tables, and an exhaustive product of the freshness fields, through b
 tests pin that `computeEligibleCore` compares no freshness field itself and that `revalidateCore` makes no
 base or ancestry call of its own.
 
-The stated limit above -- a review session's own push moving its pull request's head while the status
-reads settled -- is visible here: the result reads the live head, so the pre-push verdict is `stale`
-while the status still reads `finished` (`TestResult_OwnPushMovedHeadIsNotCurrent`).
+A push that moves the pull request's head after the verdict -- never the review session's own, which
+never pushes -- is visible here before its `synchronize` arms anything: the result reads the live head,
+so the pre-push verdict is `stale` while the status still reads `finished`
+(`TestResult_HeadMovedAfterTheVerdictIsNotCurrent`).
 
 **Tests of the result.** Domain: `TestCheckFreshness_EquivalentToEligibilityPrefix`,
 `TestCheckFreshness_EveryReason`, `TestComputeEligibleCore_ComparesFreshnessOnlyThroughCheckFreshness`,
@@ -8461,7 +8500,7 @@ recorded each decided by the probe on the pull request read alone, no context wi
 and `current`, closed and still closed `not_applicable` from the live read, base moved forward, base
 rewritten, retargeted onto another base at the same commit, stacked since the verdict, no longer open;
 and `reviewScope` `none` with an empty list and a null reviewed pull request),
-`TestResult_NeverCurrentWithoutLiveConfirmation`, `TestResult_OwnPushMovedHeadIsNotCurrent`,
+`TestResult_NeverCurrentWithoutLiveConfirmation`, `TestResult_HeadMovedAfterTheVerdictIsNotCurrent`,
 `TestResult_LastRunFailureReasonOnlyWhenDerivable` (and the status's own answer for the same session),
 `TestResult_SummaryBoundedAndNoTranscript` (exactly `SessionOutcome`'s keys; the last-opened part, never
 a later turn's text; cut at 4,000 characters; exactly 4,000 not truncated; no text null),

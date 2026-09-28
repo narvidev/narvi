@@ -2264,3 +2264,29 @@ func TestTimeouts_Validate_SessionResult(t *testing.T) {
 		})
 	}
 }
+
+// TestDefaultTimeouts_GitHubAppMintFinishesBeforeCredentialFetch pins the
+// order of two bounds on one request. The sandbox's credential helper
+// (internal/sandboxagent/credentials.CPClient) gives up on the control
+// plane after CredentialFetchTimeout; the control plane's ScmCredentials
+// bounds its GitHub App mint by GitHubAppMintTimeout. The mint -- plus the
+// handler's own database reads and response, the headroom below -- must
+// end first, or a slow or failing mint reaches the sandbox only as its own
+// timeout, never as the answer the control plane was about to give.
+func TestDefaultTimeouts_GitHubAppMintFinishesBeforeCredentialFetch(t *testing.T) {
+	t.Parallel()
+
+	// What the handler does besides the mint: a handful of indexed reads
+	// on the request path, the response write, and the network between
+	// the two processes.
+	const handlerHeadroom = 2 * time.Second
+
+	to := platform.DefaultTimeouts()
+	if to.GitHubAppMintTimeout+handlerHeadroom > to.CredentialFetchTimeout {
+		t.Fatalf("GitHubAppMintTimeout (%v) + handler headroom (%v) = %v, want <= CredentialFetchTimeout (%v): the control plane must answer before the sandbox gives up",
+			to.GitHubAppMintTimeout, handlerHeadroom, to.GitHubAppMintTimeout+handlerHeadroom, to.CredentialFetchTimeout)
+	}
+	if to.GitHubAppMintTimeout <= 0 {
+		t.Fatalf("GitHubAppMintTimeout = %v, want a positive bound", to.GitHubAppMintTimeout)
+	}
+}

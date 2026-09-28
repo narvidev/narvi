@@ -354,3 +354,71 @@ func TestSessionStatus_ReReviewFireAndStatusAgree(t *testing.T) {
 		})
 	}
 }
+
+// TestSessionStatus_AFollowUpTurnAgainstThePushedHeadDoesNotStopTheReReview:
+// the synchronize webhook arms the re-review whatever turns the session
+// already has. An ordinary follow-up mention resolves the pull request's
+// live head when it is created, so its turn can carry the pushed head
+// without being a review of it. When that push's synchronize lands, it
+// still arms the debounce from its own instant, with the pushed head
+// pending, and the status reads scheduled; the fire still inserts the
+// review turn of that head, and the status reads queued or running. It
+// guards a webhook dedupe regression (review round 5's P4-P6: a guard
+// against reviewing the same head twice once kept the webhook from arming
+// after such a follow-up), and involves no push by the session itself.
+func TestSessionStatus_AFollowUpTurnAgainstThePushedHeadDoesNotStopTheReReview(t *testing.T) {
+	ctx := context.Background()
+	f := newRetriggerStatusFixture(ctx, t, true)
+
+	// The fixture's fetcher reports this as the pull request's live head.
+	const pushedHead = "sha-live-after-push"
+	head := pushedHead
+	prompt := "why did you flag this?"
+	followUp, err := f.rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: f.sessionID, Status: sqlcgen.TurnStatusCompleted, Prompt: &prompt, ReviewHeadSha: &head})
+	if err != nil {
+		t.Fatalf("create the follow-up turn against the pushed head: %v", err)
+	}
+	if followUp.IsReviewAttempt {
+		t.Fatal("the follow-up turn is a review attempt; it must be an ordinary follow-up")
+	}
+
+	debounce := platform.DefaultTimeouts().ReviewRetriggerDebounce
+	before := time.Now()
+	f.push(t, pushedHead)
+	after := time.Now()
+	timer, armed := f.debounceArmed(ctx, t)
+	if !armed || timer.FiresAt.Time.Before(before.Add(debounce).Truncate(time.Microsecond)) || timer.FiresAt.Time.After(after.Add(debounce)) {
+		t.Fatalf("the synchronize: debounce armed %v fires %v, want armed %v after the webhook's instant (between %v and %v)", armed, timer.FiresAt.Time, debounce, before.Add(debounce), after.Add(debounce))
+	}
+	var pending *string
+	if err := f.rig.pool.QueryRow(ctx, `SELECT pending_retrigger_head_sha FROM github_pr_sessions WHERE session_id = $1`, f.sessionID).Scan(&pending); err != nil {
+		t.Fatalf("read pending_retrigger_head_sha: %v", err)
+	}
+	if pending == nil || *pending != pushedHead {
+		t.Fatalf("pending head = %v, want the event's head %s", pending, pushedHead)
+	}
+	if got := f.mustRead(t); got.Activity != restdtos.SessionActivityActivityScheduled || got.Settled {
+		t.Fatalf("the synchronize: activity %q settled %v, want scheduled", got.Activity, got.Settled)
+	}
+
+	f.comeDue(ctx, t)
+	for i, got := range f.fireWhileWatching(ctx, t) {
+		if got.Settled {
+			t.Fatalf("read %d while the debounce fired: activity %q settled -- before the review turn existed", i, got.Activity)
+		}
+	}
+	turns, err := f.rig.turns.ListForSession(ctx, f.sessionID)
+	if err != nil {
+		t.Fatalf("list turns: %v", err)
+	}
+	if len(turns) != 3 {
+		t.Fatalf("%d turns after the fire, want 3: the old review, the follow-up, and the review of the pushed head", len(turns))
+	}
+	review := turns[len(turns)-1]
+	if !review.IsReviewAttempt || review.Status != sqlcgen.TurnStatusPending || review.ReviewHeadSha == nil || *review.ReviewHeadSha != pushedHead {
+		t.Fatalf("the fire's turn = %+v, want a pending review attempt of %s", review, pushedHead)
+	}
+	if got := f.mustRead(t); got.Settled || (got.Activity != restdtos.SessionActivityActivityQueued && got.Activity != restdtos.SessionActivityActivityRunning) {
+		t.Fatalf("the review turn exists: activity %q settled %v, want queued or running", got.Activity, got.Settled)
+	}
+}
