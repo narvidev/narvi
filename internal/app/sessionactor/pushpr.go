@@ -638,11 +638,7 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 	// per-repo skip already makes that a no-op send, exactly as it always
 	// was.
 	if anyRepoHasExplicitBranch(repos) {
-		blocked, err := a.pushBlockedByMissingGitHubIdentity(ctx, sessionRow.CreatedBy)
-		if err != nil {
-			return nil, err
-		}
-		if blocked {
+		if a.pushBlockedByMissingGitHubIdentity(ctx, sessionRow.CreatedBy) {
 			if err := a.recordPushBlockedNoGitHubIdentity(ctx, tx, int(sandboxRow.Gen)); err != nil {
 				return nil, err
 			}
@@ -702,18 +698,21 @@ func (a *Actor) isReviewSession(ctx context.Context, prSessions *postgres.GitHub
 // already-established helpers rather than re-deriving their logic a
 // third time. Only ever asked about a session that is not a review
 // session: completeProcessingTurn returns before this for one, since a
-// review session never pushes at all.
-func (a *Actor) pushBlockedByMissingGitHubIdentity(ctx context.Context, createdBy pgtype.UUID) (bool, error) {
+// review session never pushes at all. It has no error to return: both
+// helpers resolve their own lookup failures (creatorMayGetPRAttribution
+// denies, creatorHasNoGitHubIdentity answers false -- see their doc
+// comments).
+func (a *Actor) pushBlockedByMissingGitHubIdentity(ctx context.Context, createdBy pgtype.UUID) bool {
 	if !a.creatorMayGetPRAttribution(ctx, createdBy) {
 		// Denied for an unrelated reason (no creator at all, disabled, or
 		// viewer) -- ScmCredentials' own step 8/9 would deny this before
 		// ever reaching step 10's identity check, so telling this creator
 		// to link a github identity would not even be the true reason
 		// their push fails.
-		return false, nil
+		return false
 	}
 
-	return a.creatorHasNoGitHubIdentity(ctx, createdBy), nil
+	return a.creatorHasNoGitHubIdentity(ctx, createdBy)
 }
 
 // recordPushBlockedNoGitHubIdentity appends a session-visible "warning"
