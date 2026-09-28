@@ -272,7 +272,9 @@ func (b *Bridge) sendHeartbeatNow(ctx context.Context, conn *websocket.Conn) err
 // already supersede. §3.3 ("turn recovery") adds a SECOND trigger
 // alongside the regular ticker: b.forceHeartbeat, which SetConversationID
 // sends on (non-blocking) the first time it observes a genuinely new,
-// non-nil conversation id (§3.3: "at turn start... never lazily") -- both
+// non-nil conversation id (§3.3: "at turn start... never lazily"), and
+// ReportBootStarted/MarkBootComplete send on as boot starts and completes
+// (§3.2) -- both
 // arms call the SAME sendHeartbeatNow helper, so the wire shape is
 // identical regardless of which one fired. The regular ticker is NOT
 // reset when the forceHeartbeat arm fires -- its own cadence keeps running

@@ -2003,6 +2003,17 @@ func run() error {
 	// needed here (unlike the hook/fetch/checkout timings above): this
 	// span is measured directly around runBootSequence, in this SAME
 	// function, which already has sendBootTiming in scope.
+	//
+	// ReportBootStarted first (technical plan §3.2): a heartbeat carrying
+	// the boot phase -- never null before bridge.MarkBootComplete below --
+	// goes out as soon as the bridge is connected, so the control plane has
+	// this generation's boot evidence before any null phase can reach it,
+	// however fast the boot, without depending on the best-effort
+	// boot_timing event sent below for it (§33.3: its loss must never fail
+	// a boot).
+	if bridge != nil {
+		bridge.ReportBootStarted()
+	}
 	bootStart := time.Now()
 	bootErr := runBootSequence(ctx, sup, cfg, layout, runtimeCredential, timeouts, sandboxSecretEnv, bootDegradeNotes, reportBootProgress, onGitSync, onGitFetchTiming, onGitCheckoutTiming, onHookRerunTiming)
 	bootMode := string(cfg.BootMode)

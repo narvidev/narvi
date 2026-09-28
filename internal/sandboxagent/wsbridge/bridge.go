@@ -12,6 +12,7 @@ import (
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
+	"github.com/narvidev/narvi/internal/sandboxagent/services"
 )
 
 // CommandHandler is the pluggable dispatch target for the 5 business
@@ -104,7 +105,10 @@ type Bridge struct {
 	replayCaughtUpHook func()
 
 	// bootMu guards lastBootPhase, read by the heartbeat loop and written
-	// by SendBootProgress/MarkBootComplete.
+	// by SendBootProgress/MarkBootComplete. lastBootPhase is never nil
+	// before MarkBootComplete: New starts it at InitialBootPhase, because a
+	// heartbeat's null lastBootPhase is the wire's "boot has completed"
+	// (§6.1) and the control plane moves a Booting sandbox to Ready on it.
 	bootMu        sync.Mutex
 	lastBootPhase *string
 
@@ -125,8 +129,28 @@ type Bridge struct {
 	// current value is all a second signal would report anyway), never
 	// block the calling goroutine (cmd/sandbox-agent's own
 	// commandHandler.HandlePrompt, which must never be delayed by this).
+	// ReportBootStarted and MarkBootComplete send on it too, for the same
+	// reason: the control plane decides Booting -> Ready from the boot
+	// phase heartbeats carry (§3.2).
 	forceHeartbeat chan struct{}
 }
+
+// InitialBootPhase is what every heartbeat reports as lastBootPhase from
+// the moment a Bridge exists until SendBootProgress first names a phase:
+// boot has not completed, and nothing has reported a phase yet. The Bridge
+// dials before the boot sequence starts (cmd/sandbox-agent runs bridge.Run
+// alongside runBootSequence, so boot_progress reaches the control plane
+// during boot), and the clone, the git-dir sync and the repo hooks report
+// no phase at all -- only services and dockerd do -- so without this
+// value every heartbeat of that window carried null, which §6.1 and the
+// control plane read as "boot has completed" (technical plan §3.2).
+//
+// It is services.PhaseStarting on its own, with no "<service>:" prefix:
+// every phase SendBootProgress reports carries one, so this value can
+// never be mistaken for a service's phase. It rides only on heartbeats,
+// never on a boot_progress event, so the boot phases a session shows are
+// unchanged.
+const InitialBootPhase = string(services.PhaseStarting)
 
 // New builds a Bridge for one session, from its full SessionConfig (dial
 // URL = sc.ControlPlaneWsUrl VERBATIM -- unlike §6.4's scm-credentials
@@ -145,6 +169,7 @@ func New(
 	handler CommandHandler,
 	dialTimeout, heartbeatInterval, reconnectMinBackoff, reconnectMaxBackoff time.Duration,
 ) *Bridge {
+	initialPhase := InitialBootPhase
 	return &Bridge{
 		dialURL:      sc.ControlPlaneWsUrl,
 		sandboxToken: sc.SandboxToken,
@@ -161,6 +186,8 @@ func New(
 		reconnectMaxBackoff: reconnectMaxBackoff,
 
 		buffer: newOutboundBuffer(),
+
+		lastBootPhase: &initialPhase,
 
 		forceHeartbeat: make(chan struct{}, 1),
 	}
@@ -229,12 +256,44 @@ func (b *Bridge) setLastBootPhase(phase *string) {
 	b.lastBootPhase = phase
 }
 
-// MarkBootComplete clears the tracked lastBootPhase back to nil --
+// ReportBootStarted sends a heartbeat right away, through forceHeartbeat,
+// reporting the boot phase -- InitialBootPhase until a service reports
+// one. Call it as the boot sequence starts. That non-null heartbeat is
+// boot evidence (technical plan §3.2): the control plane reads a later
+// null phase as boot completion only once the sandbox's generation has
+// shown some. Without it, a boot that completes within the first
+// heartbeatInterval and starts no service would show none but
+// boot_timing, a best-effort telemetry event whose loss must never fail a
+// boot (§33.3). Called while disconnected, the heartbeat is sent as soon
+// as the next connection's heartbeat loop starts.
+func (b *Bridge) ReportBootStarted() {
+	b.signalHeartbeat()
+}
+
+// MarkBootComplete clears the tracked lastBootPhase to nil --
 // events.schema.json's own Heartbeat.LastBootPhase doc comment: "Null once
-// boot has completed (no more boot phases to report)." Call this once
-// main.go's own boot.RunBoot call returns successfully.
+// boot has completed (no more boot phases to report)." -- and sends a
+// heartbeat right away, through forceHeartbeat, rather than leaving the
+// control plane to learn of it up to one heartbeatInterval later: that
+// null heartbeat is what moves the sandbox Booting -> Ready (technical
+// plan §3.2). Called while disconnected, the heartbeat is sent as soon as
+// the next connection's heartbeat loop starts. Call it once the whole boot
+// sequence has succeeded, and never before: it is the only place
+// lastBootPhase becomes nil.
 func (b *Bridge) MarkBootComplete() {
 	b.setLastBootPhase(nil)
+	b.signalHeartbeat()
+}
+
+// signalHeartbeat asks heartbeatLoop for an immediate heartbeat, without
+// blocking: forceHeartbeat's capacity-1 buffer coalesces signals raised
+// before the loop gets to them, and the one heartbeat it then sends reads
+// the state current at that moment.
+func (b *Bridge) signalHeartbeat() {
+	select {
+	case b.forceHeartbeat <- struct{}{}:
+	default:
+	}
 }
 
 // SetConversationID updates what the NEXT heartbeat reports as
@@ -271,10 +330,7 @@ func (b *Bridge) SetConversationID(id *string) {
 	b.convMu.Unlock()
 
 	if id != nil && (prev == nil || *prev != *id) {
-		select {
-		case b.forceHeartbeat <- struct{}{}:
-		default:
-		}
+		b.signalHeartbeat()
 	}
 }
 
