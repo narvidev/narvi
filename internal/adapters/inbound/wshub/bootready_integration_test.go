@@ -104,12 +104,22 @@ type bootReadyFixture struct {
 
 func newBootReadyFixture(ctx context.Context, t *testing.T) bootReadyFixture {
 	t.Helper()
+	return newBootReadyFixtureWithTimeouts(ctx, t, nil)
+}
+
+// newBootReadyFixtureWithTimeouts is newBootReadyFixture with the control
+// plane's timeouts adjusted by adjust first (nil: the defaults).
+func newBootReadyFixtureWithTimeouts(ctx context.Context, t *testing.T, adjust func(*platform.Timeouts)) bootReadyFixture {
+	t.Helper()
 	pool := newTestPool(t)
 	sessionID := createTestSession(ctx, t, pool)
 	createTestSandbox(ctx, t, pool, sessionID) // gen 1, Pending
 	moveSandboxStatus(ctx, t, pool, sessionID, sqlcgen.SandboxStatusConnecting)
 
 	timeouts := platform.DefaultTimeouts()
+	if adjust != nil {
+		adjust(&timeouts)
+	}
 	registry, err := sessionactor.NewRegistry(ctx, pool, timeouts, nil, nil, nil, "", nil, nil, "", nil, false)
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
@@ -289,10 +299,14 @@ func TestBootReady_RealBridge_ReconnectMidBoot(t *testing.T) {
 // TestBootReady_PreFixAgentWire: a sandbox-agent built before the fix,
 // against this control plane -- its exact frames, written by hand since
 // that agent's Bridge no longer exists: "ready", then heartbeats with a
-// null phase all through its clone and hooks, then, its boot done, the
-// boot_timing it has sent since §33.3. The null phases before that
-// boot_timing leave the sandbox Booting; the first one after it marks it
-// Ready.
+// null phase all through its clone and hooks, then, its boot sequence
+// done, the boot_timing it has sent since §33.3. The null phases before
+// that boot_timing leave the sandbox Booting; the first one after it
+// marks it Ready. (An agent built from 2026-08-28 sends that boot_timing
+// just before its final pass re-owning the workspace, so a null phase
+// landing during that pass is read as completion too: the window §3.2
+// states for it, which nothing on its wire lets the control plane
+// close.)
 func TestBootReady_PreFixAgentWire(t *testing.T) {
 	ctx := context.Background()
 	f := newBootReadyFixture(ctx, t)
@@ -344,5 +358,130 @@ func TestBootReady_PreFixAgentWire(t *testing.T) {
 	_ = conn.Close(websocket.StatusNormalClosure, "")
 	if err := waitReader(); err != nil {
 		t.Errorf("reader goroutine error = %v", err)
+	}
+}
+
+// heartbeatPhases returns the lastBootPhase of every heartbeat stored for
+// the fixture's session, in arrival order ("null" for a null phase).
+func (f bootReadyFixture) heartbeatPhases(ctx context.Context, t *testing.T) []string {
+	t.Helper()
+	rows, err := f.pool.Query(ctx, `SELECT COALESCE(payload->>'lastBootPhase', 'null') FROM events WHERE session_id = $1 AND type = 'heartbeat' ORDER BY id`, f.sessionID)
+	if err != nil {
+		t.Fatalf("query heartbeats: %v", err)
+	}
+	defer rows.Close()
+	var phases []string
+	for rows.Next() {
+		var phase string
+		if err := rows.Scan(&phase); err != nil {
+			t.Fatalf("scan heartbeat: %v", err)
+		}
+		phases = append(phases, phase)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("heartbeats: %v", err)
+	}
+	return phases
+}
+
+// TestBootReady_RealBridge_BootDoneBeforeFirstConnection: the boot starts
+// and completes before the agent's first connection is up -- its dial
+// backing off while the control plane is briefly unreachable. The two
+// forced heartbeats would coalesce into one null; instead the start phase
+// still arrives first, so the sandbox has its boot evidence before its
+// null phase with no boot_timing at all, and goes Ready at once.
+func TestBootReady_RealBridge_BootDoneBeforeFirstConnection(t *testing.T) {
+	ctx := context.Background()
+	f := newBootReadyFixture(ctx, t)
+	f.startBridge(t, bootReadyLongHeartbeat, func(b *wsbridge.Bridge) {
+		b.ReportBootStarted()
+		b.MarkBootComplete()
+	})
+
+	f.waitStatus(ctx, t, sqlcgen.SandboxStatusReady)
+	row := getSandbox(ctx, t, f.pool, f.sessionID)
+	if row.BootEvidenceGen == nil || *row.BootEvidenceGen != 1 {
+		t.Errorf("boot_evidence_gen = %v, want 1: the start phase is this boot's evidence", row.BootEvidenceGen)
+	}
+	if got, want := strings.Join(f.heartbeatPhases(ctx, t), ","), wsbridge.InitialBootPhase+",null"; got != want {
+		t.Errorf("heartbeat phases = %s, want %s", got, want)
+	}
+	if n := countEvents(ctx, t, f.pool, f.sessionID, "boot_timing"); n != 0 {
+		t.Errorf("boot_timing events = %d, want 0: the evidence must not depend on it", n)
+	}
+}
+
+// TestBootReady_RealBridge_FixedAgentNeverNeedsTheFallback pins that §3.2's
+// boot-evidence fallback is reachable only by an agent built before the
+// fix. The control plane here accepts any null phase from a gen with no
+// evidence after 1ms of Booting, so a fixed agent that ever sent a null
+// phase without evidence first would go Ready through the fallback -- mid
+// boot, or with boot_evidence_gen still NULL. Through a boot with
+// heartbeats flowing, a reconnect in the middle of it, and a boot that
+// completes before the first connection, it never does: it is Booting
+// until MarkBootComplete, and Ready on evidence after.
+func TestBootReady_RealBridge_FixedAgentNeverNeedsTheFallback(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name string
+		// completeBeforeRun completes the boot before the first
+		// connection; otherwise the test holds it open, heartbeats
+		// flowing, and completes it itself.
+		completeBeforeRun bool
+		// reconnectMidBoot drops the connection while the boot is open.
+		reconnectMidBoot bool
+	}{
+		{name: "heartbeats flowing through the boot"},
+		{name: "a reconnect mid-boot", reconnectMidBoot: true},
+		{name: "boot completed before the first connection", completeBeforeRun: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newBootReadyFixtureWithTimeouts(ctx, t, func(to *platform.Timeouts) {
+				to.BootEvidenceFallback = time.Millisecond
+			})
+			bridge := f.startBridge(t, bootReadyShortHeartbeat, func(b *wsbridge.Bridge) {
+				b.ReportBootStarted()
+				if tc.completeBeforeRun {
+					b.MarkBootComplete()
+				}
+			})
+
+			if !tc.completeBeforeRun {
+				f.waitStatus(ctx, t, sqlcgen.SandboxStatusBooting)
+				if tc.reconnectMidBoot {
+					waitUntil(t, dispatchTestWait, func() bool {
+						return countEvents(ctx, t, f.pool, f.sessionID, "heartbeat") >= 2
+					})
+					f.severer.severAll()
+					waitUntil(t, dispatchTestWait, func() bool {
+						return countEvents(ctx, t, f.pool, f.sessionID, "ready") == 2
+					})
+				}
+				seen := countEvents(ctx, t, f.pool, f.sessionID, "heartbeat")
+				waitUntil(t, dispatchTestWait, func() bool {
+					return countEvents(ctx, t, f.pool, f.sessionID, "heartbeat") >= seen+3
+				})
+				if got := f.status(ctx, t); got != sqlcgen.SandboxStatusBooting {
+					t.Fatalf("status mid-boot = %s, want %s: the fallback must never apply to a fixed agent", got, sqlcgen.SandboxStatusBooting)
+				}
+				bridge.MarkBootComplete()
+			}
+
+			f.waitStatus(ctx, t, sqlcgen.SandboxStatusReady)
+			row := getSandbox(ctx, t, f.pool, f.sessionID)
+			if row.BootEvidenceGen == nil || *row.BootEvidenceGen != 1 {
+				t.Errorf("boot_evidence_gen at Ready = %v, want 1: Ready on evidence, not through the fallback", row.BootEvidenceGen)
+			}
+			phases := f.heartbeatPhases(ctx, t)
+			for i, phase := range phases {
+				if phase == "null" {
+					if i == 0 {
+						t.Errorf("heartbeat phases = %v: a null phase came first", phases)
+					}
+					break
+				}
+			}
+		})
 	}
 }

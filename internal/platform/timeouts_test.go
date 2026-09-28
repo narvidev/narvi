@@ -136,6 +136,32 @@ func TestValidate_CatchesEachBrokenLink(t *testing.T) {
 			},
 			wantChain: "AutomationDispatchTotalBudget > list call + one matching automation's own full retry chain (throttle + create), with margin",
 		},
+		{
+			// §3.2's boot-evidence fallback may never fire while an agent
+			// that shows no evidence can still be booting.
+			name: "BootEvidenceFallback not > PreEvidenceAgentBootCeiling",
+			mutate: func(to *platform.Timeouts) {
+				to.BootEvidenceFallback = to.PreEvidenceAgentBootCeiling()
+			},
+			wantChain: "BootEvidenceFallback > PreEvidenceAgentBootCeiling",
+		},
+		{
+			// A boot step's timeout raised without the fallback: the
+			// ceiling follows the steps, so the link breaks on its own.
+			name: "a hook timeout raised past what BootEvidenceFallback covers",
+			mutate: func(to *platform.Timeouts) {
+				to.HookTimeout = 20 * time.Minute
+			},
+			wantChain: "BootEvidenceFallback > PreEvidenceAgentBootCeiling",
+		},
+		{
+			// ... and it must fire within the sandbox's own lifetime.
+			name: "ProviderHardCap not > FirstConnectBudget + BootEvidenceFallback",
+			mutate: func(to *platform.Timeouts) {
+				to.BootEvidenceFallback = to.ProviderHardCap - to.FirstConnectBudget
+			},
+			wantChain: "ProviderHardCap > FirstConnectBudget + BootEvidenceFallback",
+		},
 	}
 
 	for _, tc := range tests {
@@ -158,6 +184,32 @@ func TestValidate_CatchesEachBrokenLink(t *testing.T) {
 				t.Fatalf("TimeoutInvariantError.Chain = %q, want %q", invErr.Chain, tc.wantChain)
 			}
 		})
+	}
+}
+
+// TestPreEvidenceAgentBootCeiling_Defaults pins the sum
+// BootEvidenceFallback must outlast (technical plan §3.2), step by step
+// with the shipped values, so a change to the steps it counts is a
+// deliberate edit here too: a sync of 3 network steps (90s) and 10 local
+// ones (30s), 2 SHA probes (5s), 4 hooks (10min) and the retry backoff
+// (2s), and 2 build-cleanup steps (30s) -- each step but the backoff plus
+// the 10s stop grace. The sync (700s) outlasts the clone and its
+// sparse-checkout (2 x 5min10s).
+func TestPreEvidenceAgentBootCeiling_Defaults(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	const grace = 10 * time.Second
+	sync := 3*(90*time.Second+grace) + 10*(30*time.Second+grace)
+	want := sync + 2*(5*time.Second+grace) + 4*(10*time.Minute+grace) + 2*time.Second + 2*(30*time.Second+grace)
+	if want != 54*time.Minute+12*time.Second {
+		t.Fatalf("hand-computed ceiling = %s, want 54m12s -- fix this test's arithmetic", want)
+	}
+	if got := to.PreEvidenceAgentBootCeiling(); got != want {
+		t.Errorf("PreEvidenceAgentBootCeiling() = %s, want %s", got, want)
+	}
+	if got := to.BootEvidenceFallback; got != 60*time.Minute {
+		t.Errorf("BootEvidenceFallback = %s, want 60m", got)
 	}
 }
 

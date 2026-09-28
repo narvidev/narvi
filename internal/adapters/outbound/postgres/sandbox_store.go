@@ -2,7 +2,9 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -71,6 +73,28 @@ func (s *SandboxStore) RecoverFromSuspect(ctx context.Context, arg sqlcgen.Recov
 // MarkSandboxBootEvidence's own generated doc comment.
 func (s *SandboxStore) MarkBootEvidence(ctx context.Context, sessionID pgtype.UUID, gen int32) error {
 	return s.q.MarkSandboxBootEvidence(ctx, sqlcgen.MarkSandboxBootEvidenceParams{SessionID: sessionID, Gen: gen})
+}
+
+// MarkBootingSince records, on the database's clock, when gen entered
+// Booting -- once per gen, and only while gen is the sandbox's live gen.
+// §3.2's boot-evidence fallback; see MarkSandboxBootingSince's own
+// generated doc comment.
+func (s *SandboxStore) MarkBootingSince(ctx context.Context, sessionID pgtype.UUID, gen int32) error {
+	return s.q.MarkSandboxBootingSince(ctx, sqlcgen.MarkSandboxBootingSinceParams{SessionID: sessionID, Gen: gen})
+}
+
+// BootingElapsed reports how long gen has been Booting, measured on the
+// database's clock from the start MarkBootingSince recorded. ok is false
+// when gen has none recorded.
+func (s *SandboxStore) BootingElapsed(ctx context.Context, sessionID pgtype.UUID, gen int32) (elapsed time.Duration, ok bool, err error) {
+	nanos, err := s.q.GetSandboxBootingElapsed(ctx, sqlcgen.GetSandboxBootingElapsedParams{SessionID: sessionID, Gen: gen})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return time.Duration(nanos), true, nil
 }
 
 // UpsertForSpawn creates the sandbox row (if none exists) or bumps its gen

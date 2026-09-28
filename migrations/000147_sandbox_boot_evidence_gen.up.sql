@@ -14,8 +14,10 @@
 -- boot actually ran: a boot_progress event, a heartbeat with a non-null
 -- lastBootPhase, or a boot_timing boot_duration with failed=false
 -- (internal/app/sessionactor's bootEvidence). A null phase is read as
--- boot completion only when boot_evidence_gen = gen; before that it is
--- absence of information. Storing the gen rather than a flag scopes the
+-- boot completion only when boot_evidence_gen = gen -- or, for an agent
+-- too old to show any evidence, once that gen has been Booting past a
+-- bound (migrations/000148_sandbox_booting_since.up.sql); before that it
+-- is absence of information. Storing the gen rather than a flag scopes the
 -- evidence to one generation with nothing to reset: UpsertSandboxForSpawn
 -- bumps gen, and the previous gen's evidence stops matching on its own.
 -- NULL means no evidence yet for any gen.

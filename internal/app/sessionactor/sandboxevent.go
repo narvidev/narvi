@@ -10,7 +10,8 @@
 // always bumps liveness (last_seen_at = max of all signals), and fires
 // the state transitions this Step's plan row (and §3.2's, "snapshots &
 // restore") scope: "ready"/Connecting, "heartbeat"-nil-phase/Booting once
-// that gen has shown boot evidence (both §3.2; bootevidence.go),
+// that gen has shown boot evidence, or has been Booting past the
+// fallback bound (both §3.2; bootevidence.go),
 // "snapshot_ready"/Snapshotting (§3.2, design decision
 // 3 -- see handleSnapshotReadyEvent below), and now Suspect-recovery
 // (§3.2, "two-phase terminalization" -- see the section right below).
@@ -143,32 +144,34 @@ func peekAckID(raw json.RawMessage) string {
 }
 
 // sandboxTransitionTrigger reports which Trigger (if any) applies for the
-// given (event type, LastBootPhase, current status, boot evidence)
-// combination -- the two (and only two) mappings this Step implements:
+// given (event type, LastBootPhase, current status, whether a null phase
+// counts as completion) combination -- the two (and only two) mappings
+// this Step implements:
 //
 //	(a) "ready" arriving while status is Connecting -> WSConnectedTrigger
 //	    (Connecting -> Booting).
 //	(b) "heartbeat" with a nil LastBootPhase arriving while status is
-//	    Booting, once this generation has shown boot evidence ->
-//	    BootCompleteTrigger (Booting -> Ready). The nil is
-//	    Heartbeat.LastBootPhase's own "Null once boot has completed (no
-//	    more boot phases to report)"; bootEvidenceSeen is what makes it
-//	    that rather than an agent that has not reported a phase yet
-//	    (§3.2's boot-evidence rule -- see bootevidence.go).
+//	    Booting, when nullPhaseIsCompletion -> BootCompleteTrigger
+//	    (Booting -> Ready). The nil is Heartbeat.LastBootPhase's own "Null
+//	    once boot has completed (no more boot phases to report)";
+//	    nullPhaseIsCompletion is what makes it that rather than an agent
+//	    that has not reported a phase yet: this generation has shown boot
+//	    evidence, or has been Booting past §3.2's fallback bound (see
+//	    bootevidence.go).
 //
 // ok is false for every other combination -- including "ready" outside
 // Connecting, "heartbeat"/nil-LastBootPhase outside Booting, or while
-// Booting before any boot evidence -- which is NOT an error (these two
-// events can legitimately arrive outside their exact expected phase:
-// reconnects, replays, a pre-fix agent mid-boot). Callers must fall
-// through to a liveness-only bump in that case, never attempt a
-// speculative sandbox.Transition call for a combination this function
-// does not name.
-func sandboxTransitionTrigger(eventType string, lastBootPhase *string, status sandbox.State, bootEvidenceSeen bool) (sandbox.Trigger, bool) {
+// Booting when a null phase does not yet count as completion -- which is
+// NOT an error (these two events can legitimately arrive outside their
+// exact expected phase: reconnects, replays, a pre-fix agent mid-boot).
+// Callers must fall through to a liveness-only bump in that case, never
+// attempt a speculative sandbox.Transition call for a combination this
+// function does not name.
+func sandboxTransitionTrigger(eventType string, lastBootPhase *string, status sandbox.State, nullPhaseIsCompletion bool) (sandbox.Trigger, bool) {
 	switch {
 	case eventType == "ready" && status == sandbox.StateConnecting:
 		return sandbox.WSConnectedTrigger(), true
-	case eventType == "heartbeat" && lastBootPhase == nil && status == sandbox.StateBooting && bootEvidenceSeen:
+	case eventType == "heartbeat" && lastBootPhase == nil && status == sandbox.StateBooting && nullPhaseIsCompletion:
 		return sandbox.BootCompleteTrigger(), true
 	default:
 		return sandbox.Trigger{}, false
@@ -251,6 +254,11 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 	// below, where the closure-local variable is out of scope. See that
 	// call site's own doc comment for why this flag must gate it.
 	var eventInserted bool
+	// bootEvidenceFallbackFired is set when this event's null phase was
+	// accepted as boot completion by §3.2's boot-evidence fallback
+	// (bootevidence.go), and counted only once transact has committed, so a
+	// rolled-back pass is never counted.
+	var bootEvidenceFallbackFired bool
 
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		now := time.Now()
@@ -382,23 +390,46 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 			}
 		}
 
+		// A null phase from a gen with no evidence is absence of
+		// information, not boot completion. A fixed agent always shows
+		// evidence before it sends one, so in practice this is an agent
+		// built before the rule; one built before boot_timing, booting a
+		// repo with no service and no Docker, never shows any. §3.2's
+		// fallback (bootevidence.go) bounds that: once this gen has been
+		// Booting longer than BootEvidenceFallback -- longer than any boot
+		// such an agent can still be running -- with its heartbeats still
+		// arriving (this is one), its null phase is accepted after all.
+		// Before that the sandbox stays Booting, logged on each such
+		// heartbeat.
+		nullPhaseIsCompletion := bootEvidenceSeen
+		if !bootEvidenceSeen && cmd.Type == "heartbeat" && cmd.LastBootPhase == nil && sandbox.State(row.Status) == sandbox.StateBooting {
+			bootingFor, err := a.unevidencedBootingFor(ctx, tx, row.Gen)
+			if err != nil {
+				return err
+			}
+			if bootingFor >= a.timeouts.BootEvidenceFallback {
+				nullPhaseIsCompletion = true
+				bootEvidenceFallbackFired = true
+				providerID := ""
+				if row.ProviderID != nil {
+					providerID = *row.ProviderID
+				}
+				a.logger.Warn("sessionactor: sandbox booting with no boot evidence past the fallback bound; accepting its null boot phase as boot complete",
+					"sandbox_id", row.ID.String(), "provider_id", providerID, "sandbox_gen", row.Gen,
+					"booting_for", bootingFor.String(), "fallback_after", a.timeouts.BootEvidenceFallback.String())
+			} else {
+				a.logger.Info("sessionactor: null-phase heartbeat while booting, but this generation has shown no boot evidence yet; staying booting",
+					"sandbox_gen", row.Gen, "booting_for", bootingFor.String(), "fallback_after", a.timeouts.BootEvidenceFallback.String())
+			}
+		}
+
 		target := row.Status
-		if trig, ok := sandboxTransitionTrigger(cmd.Type, cmd.LastBootPhase, sandbox.State(row.Status), bootEvidenceSeen); ok {
+		if trig, ok := sandboxTransitionTrigger(cmd.Type, cmd.LastBootPhase, sandbox.State(row.Status), nullPhaseIsCompletion); ok {
 			to, err := sandbox.Transition(sandbox.State(row.Status), int(row.Gen), trig)
 			if err != nil {
 				return fmt.Errorf("sessionactor: sandbox transition via %s: %w", trig.Kind, err)
 			}
 			target = sqlcgen.SandboxStatus(to)
-		} else if cmd.Type == "heartbeat" && cmd.LastBootPhase == nil && sandbox.State(row.Status) == sandbox.StateBooting {
-			// A fixed agent shows evidence before it ever sends a null
-			// phase, so in practice this is an agent built before the
-			// boot-evidence rule: a null phase with no evidence yet is
-			// absence of information, not boot completion. Logged so a sandbox that never shows
-			// evidence -- a pre-fix agent too old to send boot_timing,
-			// booting a repo with no service -- is visible rather than
-			// silently Booting.
-			a.logger.Info("sessionactor: null-phase heartbeat while booting, but this generation has shown no boot evidence yet; staying booting",
-				"sandbox_gen", row.Gen)
 		}
 		// If !ok: NOT an error (see sandboxTransitionTrigger's own doc) --
 		// target stays row.Status unchanged, falling straight through to
@@ -415,6 +446,17 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 			ImageDigest:  cmd.ImageDigest,
 		}); err != nil {
 			return fmt.Errorf("sessionactor: update sandbox status/liveness: %w", err)
+		}
+
+		// Connecting -> Booting: record when this gen's boot started, on
+		// the database's clock, for §3.2's boot-evidence fallback above. A
+		// Suspect -> Booting recovery reassigns row above and is not an
+		// edge here: that gen's boot started when it first entered
+		// Booting, and its start is already recorded.
+		if sandbox.State(row.Status) != sandbox.State(target) && sandbox.State(target) == sandbox.StateBooting {
+			if err := a.stores.sandbox.WithTx(tx).MarkBootingSince(ctx, a.sessionID, row.Gen); err != nil {
+				return fmt.Errorf("sessionactor: record booting start: %w", err)
+			}
 		}
 
 		// First-time Booting->Ready transition, this event: arm BOTH
@@ -598,6 +640,10 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 	}
 
 	if err == nil {
+		if bootEvidenceFallbackFired {
+			a.recordBootEvidenceFallback(ctx)
+		}
+
 		// §3.2 ("snapshots & restore"), design decision 1 -- CORRECTED
 		// per independent review: §3.3's own governing rule is "On
 		// terminal event: complete turn, trigger snapshot, re-derive

@@ -1,6 +1,8 @@
 // This file (bootevidence.go) is §3.2's boot-evidence rule: a heartbeat
 // whose lastBootPhase is null moves a sandbox Booting -> Ready only once
-// the same generation has shown that its boot actually ran.
+// the same generation has shown that its boot actually ran -- or, the
+// fallback below, once it has been Booting longer than any boot that
+// shows no evidence can still be running.
 //
 // The sandbox-ws contract reads a null lastBootPhase as "boot has
 // completed" (events.schema.json, Heartbeat.lastBootPhase). A
@@ -21,11 +23,35 @@
 // restart, or the actor moving to another pod, must not strand a sandbox
 // whose evidence arrived before it. Storing the gen scopes it to one
 // generation: a respawn bumps gen and the old evidence stops matching.
+//
+// The fallback. An agent built before boot_timing existed (2026-08-20),
+// booting a repo with no service and no Docker, never shows evidence: it
+// reports no phase and sends no boot_timing, and every heartbeat it sends
+// is null. Every snapshot descended from a sandbox it booted keeps running
+// it (§35.2), and a restore reuses the same snapshot. Nothing else times
+// Booting out while heartbeats flow, so without a bound such a sandbox
+// stayed Booting for its whole lifetime, and the next restore did the
+// same. Once a generation with no evidence has been Booting -- measured on
+// the database's clock from its Connecting -> Booting edge
+// (sandboxes.booting_since, migrations/000148) -- for longer than
+// platform.Timeouts.BootEvidenceFallback, which Validate keeps above the
+// longest one-repo boot of that agent, its null phase is accepted as boot
+// completion: what a control plane without the rule did at the first
+// heartbeat, only after the bound. The heartbeat that finds the bound
+// passed is the one that moves the sandbox, so heartbeats are flowing by
+// construction. It is logged at WARN and counted
+// (sandbox_boot_evidence_fallback_total). A fixed agent never gets there:
+// it shows evidence before it can send a null phase.
 
 package sessionactor
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
@@ -38,15 +64,22 @@ import (
 //   - "boot_progress": a named phase was reported. Every agent build keeps
 //     its tracked phase non-null from then until its boot completes.
 //   - "heartbeat" with a non-null lastBootPhase: the same, observed
-//     directly. A fixed agent sends one on every heartbeat of its boot,
-//     starting with the one it forces as its boot starts
-//     (wsbridge.Bridge.ReportBootStarted), so its own evidence never
+//     directly. A fixed agent sends one on every heartbeat of its boot, and
+//     the first heartbeat after its boot starts always carries the start
+//     phase, even when the boot has completed before the connection is up
+//     (wsbridge.Bridge.ReportBootStarted) -- so its own evidence never
 //     waits for the first 30s tick or depends on boot_timing.
 //   - "boot_timing" for "boot_duration" with failed=false: the agent's own
-//     statement that its boot sequence finished (§33.3). Every agent built
-//     since that event exists sends it, the fixed one included, before it
-//     marks its boot complete, so it is also what covers a pre-fix agent
-//     booting a repo with no service to report a phase.
+//     statement that its boot finished (§33.3), which covers a pre-fix
+//     agent booting a repo with no service to report a phase. The fixed
+//     agent sends it once its whole boot has succeeded, after its final
+//     pass re-owning the workspace for the agent runtime
+//     (cmd/sandbox-agent). An agent built from 2026-08-28 (53e23a4, which
+//     added that pass) up to the fix sends it just before that pass
+//     instead, so for such an agent booting a repo with no service and no
+//     Docker, a null heartbeat landing during the pass is still read as
+//     completion: the rule narrows that agent's early window to the pass,
+//     and cannot close it, since nothing on its wire marks the pass's end.
 //
 // Nothing else is: "ready" only says the agent is connected, and the
 // other boot_timing metrics, "git_sync" and a failed boot_duration speak
@@ -73,4 +106,26 @@ func bootEvidence(cmd SandboxEvent) bool {
 // boot evidence.
 func hasBootEvidence(row sqlcgen.Sandbox) bool {
 	return row.BootEvidenceGen != nil && *row.BootEvidenceGen == row.Gen
+}
+
+// unevidencedBootingFor reports how long gen has been Booting, on the
+// database's clock, for the fallback (this file's top comment). The start
+// is recorded on the Connecting -> Booting edge (handleSandboxEvent); a gen
+// found with none -- a sandbox already Booting when migration 000148 ran --
+// gets one now, in tx, which starts its clock late rather than never.
+func (a *Actor) unevidencedBootingFor(ctx context.Context, tx pgx.Tx, gen int32) (time.Duration, error) {
+	store := a.stores.sandbox.WithTx(tx)
+	if err := store.MarkBootingSince(ctx, a.sessionID, gen); err != nil {
+		return 0, fmt.Errorf("sessionactor: record booting start: %w", err)
+	}
+	bootingFor, ok, err := store.BootingElapsed(ctx, a.sessionID, gen)
+	if err != nil {
+		return 0, fmt.Errorf("sessionactor: read booting start: %w", err)
+	}
+	if !ok {
+		// Unreachable while gen is the row's live gen: the statement
+		// above recorded a start for it in this same transaction.
+		return 0, fmt.Errorf("sessionactor: no booting start recorded for gen %d", gen)
+	}
+	return bootingFor, nil
 }

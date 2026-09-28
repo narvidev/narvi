@@ -161,6 +161,18 @@ type opsMetrics struct {
 	// read error" discipline checkRolloutGate already established (see
 	// recordRolloutRefusal's own doc comment, below).
 	rolloutRefused metric.Int64Counter
+
+	// bootEvidenceFallback counts every sandbox moved Booting -> Ready by
+	// §3.2's boot-evidence fallback (bootevidence.go): a generation that
+	// showed no boot evidence, Booting past
+	// platform.Timeouts.BootEvidenceFallback with its heartbeats still
+	// arriving, whose null boot phase was then accepted as boot
+	// completion. Only a sandbox-agent built before boot_timing existed
+	// reaches it, so a non-zero rate says such agents are still booting --
+	// most likely from an old snapshot lineage -- and each of those boots
+	// held its first turn for the whole bound. Carries no attribute: which
+	// sandbox is in the WARN line logged with it.
+	bootEvidenceFallback metric.Int64Counter
 }
 
 // newOpsMetrics constructs all five instruments against meter -- the SAME
@@ -268,18 +280,39 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		return opsMetrics{}, fmt.Errorf("sessionactor: construct session_rollout_refused_total counter: %w", err)
 	}
 
+	bootEvidenceFallback, err := meter.Int64Counter(
+		"sandbox_boot_evidence_fallback_total",
+		metric.WithDescription("Count of every sandbox moved Booting -> Ready by §3.2's boot-evidence fallback: a generation that showed no boot evidence, Booting past platform.Timeouts.BootEvidenceFallback with its heartbeats still arriving, whose null boot phase was then accepted as boot completion. Only a sandbox-agent built before boot_timing existed (2026-08-20), booting a repo with no service and no Docker, reaches it -- typically restored from an old snapshot lineage -- and each such boot held its first turn for the whole bound."),
+		metric.WithUnit("{sandbox}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct sandbox_boot_evidence_fallback_total counter: %w", err)
+	}
+
 	return opsMetrics{
-		spawnDuration:       spawnDuration,
-		livenessGap:         livenessGap,
-		watchdogActivation:  watchdogActivation,
-		watchdogFalseAlarm:  watchdogFalseAlarm,
-		falseFailure:        falseFailure,
-		bootDuration:        bootDuration,
-		hookRerunDuration:   hookRerunDuration,
-		gitFetchDuration:    gitFetchDuration,
-		gitCheckoutDuration: gitCheckoutDuration,
-		rolloutRefused:      rolloutRefused,
+		spawnDuration:        spawnDuration,
+		livenessGap:          livenessGap,
+		watchdogActivation:   watchdogActivation,
+		watchdogFalseAlarm:   watchdogFalseAlarm,
+		falseFailure:         falseFailure,
+		bootDuration:         bootDuration,
+		hookRerunDuration:    hookRerunDuration,
+		gitFetchDuration:     gitFetchDuration,
+		gitCheckoutDuration:  gitCheckoutDuration,
+		rolloutRefused:       rolloutRefused,
+		bootEvidenceFallback: bootEvidenceFallback,
 	}, nil
+}
+
+// recordBootEvidenceFallback increments sandbox_boot_evidence_fallback_total
+// -- handleSandboxEvent's (sandboxevent.go) one call site, once the
+// transaction that accepted a null boot phase through §3.2's fallback has
+// committed.
+func (a *Actor) recordBootEvidenceFallback(ctx context.Context) {
+	if a.opsMetrics.bootEvidenceFallback == nil {
+		return
+	}
+	a.opsMetrics.bootEvidenceFallback.Add(ctx, 1)
 }
 
 // spawnDurationBuckets mirrors internal/app/imagebuild's own
