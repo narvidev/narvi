@@ -19,7 +19,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,11 +40,13 @@ type recordedHeartbeat struct {
 }
 
 // heartbeatRecorder is the fake control plane's record of the sandbox
-// WebSocket: when "ready" arrived, and every heartbeat after it.
+// WebSocket: when "ready" arrived, every heartbeat after it, and the kind
+// of every frame, in arrival order (frameKind).
 type heartbeatRecorder struct {
 	mu         sync.Mutex
 	readyAt    time.Time
 	heartbeats []recordedHeartbeat
+	frames     []string
 }
 
 func (r *heartbeatRecorder) record(frameType string, lastBootPhase *string, at time.Time) {
@@ -62,6 +66,20 @@ func (r *heartbeatRecorder) snapshot() (time.Time, []recordedHeartbeat) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.readyAt, append([]recordedHeartbeat(nil), r.heartbeats...)
+}
+
+// recordFrame logs one frame's kind: "heartbeat:<phase>" ("null" for a
+// null phase), "boot_timing:<metric>:failed=<failed>", or its bare type.
+func (r *heartbeatRecorder) recordFrame(kind string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.frames = append(r.frames, kind)
+}
+
+func (r *heartbeatRecorder) frameLog() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.frames...)
 }
 
 // newHeartbeatRecordingCP serves the sandbox WebSocket for sessionID,
@@ -85,9 +103,19 @@ func newHeartbeatRecordingCP(t *testing.T, sessionID string) (*fakeControlPlane,
 			var peek struct {
 				Type          string  `json:"type"`
 				LastBootPhase *string `json:"lastBootPhase"`
+				Metric        string  `json:"metric"`
+				Failed        *bool   `json:"failed"`
 			}
 			if json.Unmarshal(data, &peek) == nil {
 				rec.record(peek.Type, peek.LastBootPhase, time.Now())
+				kind := peek.Type
+				switch peek.Type {
+				case "heartbeat":
+					kind += ":" + phaseOrNull(peek.LastBootPhase)
+				case "boot_timing":
+					kind += ":" + peek.Metric + ":failed=" + strconv.FormatBool(peek.Failed != nil && *peek.Failed)
+				}
+				rec.recordFrame(kind)
 			}
 		}
 	})
@@ -131,7 +159,10 @@ func phaseOrNull(p *string) string {
 // nothing else explains it, and the boot evidence the control plane needs
 // before a null phase counts. No heartbeat is null while setup.sh runs;
 // the first null one follows the boot's completion at once, forced by
-// MarkBootComplete, and none after it carries a phase again.
+// MarkBootComplete, and none after it carries a phase again. The boot's
+// boot_duration reaches the control plane exactly once, failed=false,
+// ahead of that null: run() relays the one completeBoot builds after its
+// re-own pass, rather than dropping it or sending one of its own.
 func TestRun_BootHeartbeats_PhaseUntilBootCompletes(t *testing.T) {
 	binPath := buildSandboxAgentBinary(t)
 	gitServerURL := setUpBareRepoWithSlowSetup(t)
@@ -187,5 +218,17 @@ func TestRun_BootHeartbeats_PhaseUntilBootCompletes(t *testing.T) {
 	if gap := hbs[firstNull].at.Sub(first.at); gap < bootHeartbeatSetupSleep-time.Second {
 		t.Errorf("first null-phase heartbeat arrived %s after the boot-started one, want at least %s: null while setup.sh was still running",
 			gap, bootHeartbeatSetupSleep-time.Second)
+	}
+
+	frames := rec.frameLog()
+	firstNullFrame := slices.Index(frames, "heartbeat:null")
+	var bootDurations []int
+	for i, kind := range frames {
+		if strings.HasPrefix(kind, "boot_timing:boot_duration:") {
+			bootDurations = append(bootDurations, i)
+		}
+	}
+	if len(bootDurations) != 1 || frames[bootDurations[0]] != "boot_timing:boot_duration:failed=false" || bootDurations[0] > firstNullFrame {
+		t.Errorf("frames = %v, want exactly one boot_timing:boot_duration:failed=false, ahead of the first heartbeat:null", frames)
 	}
 }
