@@ -1251,7 +1251,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// every other §30 seam in this binary; githubAppClient is the
 	// read-only mint both branches use.
 	router.Post("/sessions/{sessionID}/scm-credentials",
-		httpapi.ScmCredentials(sessionStore, sandboxStore, identityStore, userStore, githubPRSessionStore, repoSettingsForEgress, shadowLedger, githubAppClient, cfg.TokenEncryptionKey, cfg.Timeouts, cfg.ShadowMode))
+		httpapi.ScmCredentials(sessionStore, sandboxStore, identityStore, userStore, githubPRSessionStore, repoSettingsForEgress, shadowLedger, githubAppClient, eventStore, hub, cfg.TokenEncryptionKey, cfg.Timeouts, cfg.ShadowMode))
 
 	// provider-credentials ("provider credential injection",
 	// §25.1/§25.3): deliberately mounted OUTSIDE /api/sessions and outside

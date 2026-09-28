@@ -126,15 +126,18 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
 	"github.com/narvidev/narvi/internal/adapters/inbound/wshub"
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapp"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/egressmode"
+	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/readonlymint"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowledger"
@@ -276,7 +279,12 @@ type ReadOnlyMinter interface {
 //     -- see this file's own top comment for the full rationale. It is not
 //     a shadow-mode substitution, so it writes nothing to the shadow
 //     ledger (readonlymint.MintUnrecorded; each outcome is logged
-//     instead), and a ledger failure cannot fail it. The
+//     instead), and a ledger failure cannot fail it. A repository the
+//     GitHub App is not installed on (githubapp.InstallationNotFoundError
+//     -- for a pull request from a fork, the fork owner's account) is
+//     refused like any failed mint, but as a 403, with a session-visible
+//     warning naming the repository and the remedy, once per session and
+//     repository (a shadow or build-boot mint gets the same). The
 //     creator-guard/identity/decrypt path (steps 8-10 below) never runs
 //     for a review session: it exists to find and gate a PER-USER OAuth
 //     credential, which a review session has no legitimate use for at
@@ -362,6 +370,8 @@ func ScmCredentials(
 	repoSettings egressmode.RepoSettingsReader,
 	ledger shadowledger.Store,
 	readOnlyMinter ReadOnlyMinter,
+	events *postgres.EventStore,
+	broadcaster ports.EventBroadcaster,
 	tokenEncryptionKey []byte,
 	timeouts platform.Timeouts,
 	platformShadow bool,
@@ -592,7 +602,22 @@ func ScmCredentials(
 			}
 			cancel()
 			var refused *readonlymint.ErrRefusedByScopeCheck
+			var notInstalled *githubapp.InstallationNotFoundError
 			switch {
+			case errors.As(mintErr, &notInstalled):
+				// The GitHub App is not installed on the repository this
+				// sandbox clones -- for a pull request from a fork, the
+				// fork's owner's account. Still a refusal, never a
+				// fallback to any other credential; but a configuration
+				// state someone can fix, not an outage, so it is named
+				// where the session is read (a warning, once per session
+				// and repository) and answered 403, not a bare 500.
+				notInstalledRepo := notInstalled.Owner + "/" + notInstalled.Repo
+				logger.Warn("httpapi: scm-credentials: refusing: the GitHub App is not installed on the repository this sandbox clones; serving no credential",
+					"repo", notInstalledRepo, "requested_host", req.Host, "review_session", reviewOnly)
+				recordGitHubAppNotInstalledWarning(ctx, events, broadcaster, sessionID, int(sandboxRow.Gen), notInstalledRepo)
+				writeError(w, http.StatusForbidden, "no usable git credential for this session")
+				return
 			case errors.As(mintErr, &refused):
 				// Refused -- and, for a shadow mint, recorded. 403: no
 				// credential exists to serve.
@@ -899,4 +924,57 @@ func hostReposUnparseable(rawRepos []byte, host string) bool {
 		}
 	}
 	return false
+}
+
+// githubAppNotInstalledWarning is the session-visible text
+// recordGitHubAppNotInstalledWarning records for repoFullName.
+func githubAppNotInstalledWarning(repoFullName string) string {
+	return fmt.Sprintf("Narvi's GitHub App is not installed on %s, so this session's sandbox has no read-only credential to clone it. "+
+		"Install the GitHub App on %s with read access (for a pull request from a fork, on the fork owner's account), then retry.",
+		repoFullName, repoFullName)
+}
+
+// githubAppNotInstalledWarningID is the warning's message id: derived from
+// the session and the repository, so the events table's own (session_id,
+// message_id) dedupe keeps one warning per session and repository however
+// many credential requests fail the same way -- git asks again on every
+// fetch.
+func githubAppNotInstalledWarningID(sessionID pgtype.UUID, repoFullName string) string {
+	return uuid.NewSHA1(uuid.NameSpaceURL, []byte("urn:narvi:scm-credentials:github-app-not-installed:"+sessionID.String()+":"+repoFullName)).String()
+}
+
+// recordGitHubAppNotInstalledWarning appends a session-visible "warning"
+// event naming repoFullName and the remedy -- the same wire type, and the
+// same append-then-broadcast shape, as every other warning a session shows
+// (internal/app/sessionactor's recordSessionWarning; ConfirmUpload's own
+// event append for a handler outside the actor). Broadcast only when the
+// row is new. Best-effort: the credential is refused either way, and a
+// failure here is logged, never turned into a different response.
+func recordGitHubAppNotInstalledWarning(ctx context.Context, events *postgres.EventStore, broadcaster ports.EventBroadcaster, sessionID pgtype.UUID, gen int, repoFullName string) {
+	logger := platform.Logger(ctx)
+	msg := sandboxws.Warning{
+		Type:      "warning",
+		MessageId: githubAppNotInstalledWarningID(sessionID, repoFullName),
+		SessionId: sessionID.String(),
+		Gen:       gen,
+		Message:   githubAppNotInstalledWarning(repoFullName),
+	}
+	payload, err := json.Marshal(msg)
+	if err != nil {
+		logger.Error("httpapi: scm-credentials: marshal GitHub App not-installed warning failed", "error", err)
+		return
+	}
+	row, err := events.Create(ctx, sqlcgen.CreateEventParams{
+		SessionID: sessionID,
+		Type:      "warning",
+		MessageID: msg.MessageId,
+		Payload:   payload,
+	})
+	if err != nil {
+		logger.Error("httpapi: scm-credentials: record GitHub App not-installed warning failed", "error", err, "repo", repoFullName)
+		return
+	}
+	if broadcaster != nil && row.Inserted {
+		broadcaster.Broadcast(sessionID.String(), payload)
+	}
 }

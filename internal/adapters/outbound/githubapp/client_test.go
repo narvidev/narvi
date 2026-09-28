@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -195,6 +196,47 @@ func TestClient_MintInstallationToken(t *testing.T) {
 		}
 		if mintCalled {
 			t.Error("MintInstallationToken() attempted to mint a token despite a failed installation lookup")
+		}
+		var notInstalled *githubapp.InstallationNotFoundError
+		if !errors.As(err, &notInstalled) || notInstalled.Owner != "acme" || notInstalled.Repo != "widgets" {
+			t.Errorf("MintInstallationToken() error = %v, want *InstallationNotFoundError naming acme/widgets: a 404 on the installation lookup means the App is not installed there", err)
+		}
+	})
+
+	// Only a 404 on the installation lookup means "not installed". Any
+	// other failure -- another status on the lookup, or a 404 on the mint
+	// itself -- stays an ordinary error.
+	t.Run("only a 404 on the installation lookup is a missing installation", func(t *testing.T) {
+		for _, tc := range []struct {
+			name         string
+			lookupStatus int
+			mintStatus   int
+		}{
+			{name: "lookup 500", lookupStatus: http.StatusInternalServerError, mintStatus: http.StatusCreated},
+			{name: "lookup 403", lookupStatus: http.StatusForbidden, mintStatus: http.StatusCreated},
+			{name: "lookup ok, mint 404", lookupStatus: http.StatusOK, mintStatus: http.StatusNotFound},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					if strings.Contains(r.URL.Path, "access_tokens") {
+						w.WriteHeader(tc.mintStatus)
+						return
+					}
+					w.WriteHeader(tc.lookupStatus)
+					_ = json.NewEncoder(w).Encode(map[string]any{"id": 777})
+				}))
+				defer server.Close()
+
+				client := githubapp.New(server.Client(), server.URL, 42, testPrivateKey(t), time.Minute, 60*time.Second)
+				_, err := client.MintInstallationToken(context.Background(), "acme", []string{"widgets"})
+				if err == nil {
+					t.Fatal("MintInstallationToken() error = nil, want an error")
+				}
+				var notInstalled *githubapp.InstallationNotFoundError
+				if errors.As(err, &notInstalled) {
+					t.Errorf("MintInstallationToken() error = %v, typed as a missing installation; want an ordinary failure", err)
+				}
+			})
 		}
 	})
 }

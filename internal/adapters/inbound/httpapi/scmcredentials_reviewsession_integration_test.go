@@ -4,6 +4,7 @@ package httpapi_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -13,6 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
+	"github.com/narvidev/narvi/internal/adapters/outbound/githubapp"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/provenance"
@@ -282,5 +285,110 @@ func TestScmCredentials_SentinelFixChild_IsNotServedAsAReviewSession(t *testing.
 	}
 	if status != http.StatusForbidden {
 		t.Errorf("status = %d, want %d: no creator, so step 8 refuses, as before the review-session rule", status, http.StatusForbidden)
+	}
+}
+
+// TestScmCredentials_ReviewSession_GitHubAppNotInstalled: when the GitHub
+// App is not installed on the repository a review sandbox clones (for a
+// pull request from a fork, the fork owner's account), the credential is
+// still refused -- never another credential in its place -- but the
+// refusal is explicit: a 403, not a bare 500, and a session-visible
+// warning naming the repository and that the App must be installed on it
+// with read access. git asks again on every fetch, so the warning is
+// recorded once per session and repository, and broadcast once.
+func TestScmCredentials_ReviewSession_GitHubAppNotInstalled(t *testing.T) {
+	minter := newFakeReadOnlyMinter()
+	broadcaster := &recordingBroadcaster{}
+	rig := newTestRig(t, func(r *testRig) {
+		r.readOnlyMinter = minter
+		r.broadcaster = broadcaster
+	})
+	ctx := context.Background()
+
+	repoName := fmt.Sprintf("not-installed-%d", time.Now().UnixNano())
+	repoFullName := "fork-owner/" + repoName
+	minter.Err = &githubapp.InstallationNotFoundError{Owner: "fork-owner", Repo: repoName}
+	reposJSON := `[{"name":"` + repoName + `","url":"https://github.com/` + repoFullName + `.git","branch":"feature-x"}]`
+	session := rig.createOwnedGitHubReviewSessionWithRepos(ctx, t, pgtype.UUID{}, "base-owner/"+repoName, 51, reposJSON)
+	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+
+	for i := 0; i < 2; i++ {
+		status, got := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
+		if status != http.StatusForbidden {
+			t.Fatalf("request %d: status = %d, want %d", i+1, status, http.StatusForbidden)
+		}
+		if got.Username != "" || got.Password != "" {
+			t.Fatalf("request %d: credential %q/%q served, want none", i+1, got.Username, got.Password)
+		}
+	}
+	if minter.CallCount != 2 {
+		t.Errorf("minter called %d times, want 2: each request mints afresh", minter.CallCount)
+	}
+
+	events, err := rig.events.ListForSession(ctx, session.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	var warnings []sandboxws.Warning
+	for _, e := range events {
+		if e.Type != "warning" {
+			continue
+		}
+		var w sandboxws.Warning
+		if err := json.Unmarshal(e.Payload, &w); err != nil {
+			t.Fatalf("decode warning %s: %v", e.Payload, err)
+		}
+		warnings = append(warnings, w)
+	}
+	if len(warnings) != 1 {
+		t.Fatalf("warnings = %+v, want exactly one for this session and repository", warnings)
+	}
+	w := warnings[0]
+	if w.SessionId != session.ID.String() || w.Gen != 1 {
+		t.Errorf("warning session/gen = %s/%d, want %s/1", w.SessionId, w.Gen, session.ID)
+	}
+	for _, want := range []string{repoFullName, "GitHub App", "read access", "fork"} {
+		if !strings.Contains(w.Message, want) {
+			t.Errorf("warning %q does not mention %q", w.Message, want)
+		}
+	}
+	if got := broadcaster.all(); len(got) != 1 || !strings.Contains(got[0], repoFullName) {
+		t.Errorf("broadcasts = %v, want exactly the one warning", got)
+	}
+
+	rows, err := narvipg.NewShadowSCMWriteStore(rig.pool).ListForRepo(ctx, repoFullName, 10)
+	if err != nil {
+		t.Fatalf("ListForRepo: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("shadow ledger rows = %+v, want none", rows)
+	}
+}
+
+// TestScmCredentials_ReviewSession_OtherMintFailureIsStill500: only a
+// missing installation is named; any other mint failure stays a 500 with
+// no warning, as before.
+func TestScmCredentials_ReviewSession_OtherMintFailureIsStill500(t *testing.T) {
+	minter := newFakeReadOnlyMinter()
+	minter.Err = errors.New("simulated GitHub App outage")
+	rig := newTestRig(t, func(r *testRig) { r.readOnlyMinter = minter })
+	ctx := context.Background()
+
+	repoName := fmt.Sprintf("mint-outage-%d", time.Now().UnixNano())
+	reposJSON := `[{"name":"` + repoName + `","url":"https://github.com/review-owner/` + repoName + `.git","branch":"feature-x"}]`
+	session := rig.createOwnedGitHubReviewSessionWithRepos(ctx, t, pgtype.UUID{}, "review-owner/"+repoName, 52, reposJSON)
+	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+
+	if status, _ := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token"); status != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", status, http.StatusInternalServerError)
+	}
+	events, err := rig.events.ListForSession(ctx, session.ID, 0, 100)
+	if err != nil {
+		t.Fatalf("list events: %v", err)
+	}
+	for _, e := range events {
+		if e.Type == "warning" {
+			t.Errorf("warning recorded (%s) for a mint failure that is not a missing installation", e.Payload)
+		}
 	}
 }
