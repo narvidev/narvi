@@ -62,7 +62,6 @@ func createReviewCredentialCreator(ctx context.Context, t *testing.T, rig testRi
 // reaches the shadow ledger on any outcome, and a failing ledger does not
 // fail the credential.
 func TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential(t *testing.T) {
-	const botToken = "bot-token-must-never-reach-a-review-sandbox"
 	const personalToken = "gho_creatorsOwnPersonalToken"
 
 	tests := []struct {
@@ -105,7 +104,6 @@ func TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential(t *testing.T) {
 			minter.Token.Permissions = tc.grant
 			minter.Err = tc.mintErr
 			rig := newTestRig(t, func(r *testRig) {
-				r.botToken = botToken
 				r.readOnlyMinter = minter
 				if tc.ledgerFails {
 					r.shadowLedger = failingLedgerStore{}
@@ -127,9 +125,6 @@ func TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential(t *testing.T) {
 			createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
 
 			status, got := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
-			if got.Password == botToken {
-				t.Fatal("a review sandbox received the bot token, a write-capable credential")
-			}
 			if got.Password == personalToken {
 				t.Fatal("a review sandbox received its creator's own personal GitHub token")
 			}
@@ -252,12 +247,8 @@ func TestScmCredentials_ReadOnlyMint_OnlyShadowAndBuildBootAreRecorded(t *testin
 // creator, is step 8's refusal. Pinned so that any change to what this
 // child is served is a deliberate one.
 func TestScmCredentials_SentinelFixChild_IsNotServedAsAReviewSession(t *testing.T) {
-	const botToken = "bot-token-must-never-reach-a-sandbox"
 	minter := newFakeReadOnlyMinter()
-	rig := newTestRig(t, func(r *testRig) {
-		r.botToken = botToken
-		r.readOnlyMinter = minter
-	})
+	rig := newTestRig(t, func(r *testRig) { r.readOnlyMinter = minter })
 	ctx := context.Background()
 
 	const reposJSON = `[{"name":"widgets","url":"https://github.com/sentinel-owner/widgets.git","branch":"feature-fix-me"}]`
@@ -277,8 +268,8 @@ func TestScmCredentials_SentinelFixChild_IsNotServedAsAReviewSession(t *testing.
 	createSandboxWithToken(ctx, t, rig, child.ID, "sandbox-bearer-token")
 
 	status, got := postScmCredentials(t, rig, child.ID.String(), "sandbox-bearer-token")
-	if got.Password == botToken {
-		t.Fatal("the sentinel fix child received the bot token")
+	if got.Username != "" || got.Password != "" {
+		t.Errorf("credential %q/%q served to the sentinel fix child, want none", got.Username, got.Password)
 	}
 	if minter.CallCount != 0 {
 		t.Errorf("minter called %d times, want 0: the child is not a review session", minter.CallCount)
@@ -390,5 +381,53 @@ func TestScmCredentials_ReviewSession_OtherMintFailureIsStill500(t *testing.T) {
 		if e.Type == "warning" {
 			t.Errorf("warning recorded (%s) for a mint failure that is not a missing installation", e.Payload)
 		}
+	}
+}
+
+// TestScmCredentials_ReviewSessionLookupFails_ServesNothing: whether a
+// session is a review session is asked of github_pr_sessions, and when that
+// lookup itself fails the answer is a 500 that serves nothing -- never "not
+// a review session", which would go on to the creator-token path. The
+// session here is not a review session, on a live repository, with a
+// creator whose own GitHub token that path serves: exactly what a wrong
+// answer would hand out. The control request, once the table is readable
+// again, is served that token, proving the refusal is the lookup's doing.
+// No integration test in this package runs in parallel, so no other test
+// can observe the table renamed away.
+func TestScmCredentials_ReviewSessionLookupFails_ServesNothing(t *testing.T) {
+	const personalToken = "gho_creatorTokenServedOnlyWhenTheLookupAnswers"
+	minter := newFakeReadOnlyMinter()
+	rig := newTestRig(t, func(r *testRig) { r.readOnlyMinter = minter })
+	ctx := context.Background()
+
+	session := createSessionWithGitHubIdentity(ctx, t, rig, personalToken)
+	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+
+	if _, err := rig.pool.Exec(ctx, `ALTER TABLE github_pr_sessions RENAME TO github_pr_sessions_unreadable_for_test`); err != nil {
+		t.Fatalf("rename github_pr_sessions away: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := rig.pool.Exec(context.Background(), `ALTER TABLE IF EXISTS github_pr_sessions_unreadable_for_test RENAME TO github_pr_sessions`); err != nil {
+			t.Errorf("restore github_pr_sessions: %v", err)
+		}
+	})
+
+	status, got := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
+	if _, err := rig.pool.Exec(ctx, `ALTER TABLE github_pr_sessions_unreadable_for_test RENAME TO github_pr_sessions`); err != nil {
+		t.Fatalf("restore github_pr_sessions: %v", err)
+	}
+	if status != http.StatusInternalServerError {
+		t.Errorf("status = %d, want %d: a failed review-session lookup is an error, never a fall-through", status, http.StatusInternalServerError)
+	}
+	if got.Username != "" || got.Password != "" {
+		t.Fatalf("credential %q/%q served while the review-session lookup failed, want none", got.Username, got.Password)
+	}
+	if minter.CallCount != 0 {
+		t.Errorf("minter called %d times, want 0", minter.CallCount)
+	}
+
+	status, got = postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
+	if status != http.StatusOK || got.Password != personalToken {
+		t.Fatalf("control, the table readable again: status = %d, password = %q; want 200 and the creator's own token", status, got.Password)
 	}
 }

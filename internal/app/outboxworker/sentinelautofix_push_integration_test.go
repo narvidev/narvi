@@ -59,14 +59,21 @@ func (c *recordingCommander) pushes(t *testing.T) []sandboxws.Push {
 	return out
 }
 
-// TestSentinelAutoFixChild_IsNotAReviewSessionAndStillPushesItsFixBranch
-// pins what "a review session is read-only" must leave alone: the
-// sentinel auto-fix child. The origin is a real review session (it has a
-// github_pr_sessions row); the child is spawned through the real notifier,
-// and is not one -- no github_pr_sessions row of its own, no creator -- so
-// when its turn completes the session actor still sends the push of its
-// own narvi/sentinel-fix/<id> branch, and only that branch.
-func TestSentinelAutoFixChild_IsNotAReviewSessionAndStillPushesItsFixBranch(t *testing.T) {
+// TestSentinelAutoFixChild_IsNotAReviewSessionSoItsPushIsSent pins what
+// "a review session is read-only" must leave alone: the sentinel auto-fix
+// child. The origin is a real review session (it has a github_pr_sessions
+// row); the child is spawned through the real notifier, and is not one --
+// no github_pr_sessions row of its own, no creator -- so when its turn
+// completes the session actor still sends the push command for its own
+// narvi/sentinel-fix/<id> branch, and only that branch.
+//
+// What it proves stops at the command. Whether that push reaches GitHub
+// depends on the credential the child's sandbox is served, and on a live
+// repository that request is refused today, the child having no creator
+// (internal/adapters/inbound/httpapi's
+// TestScmCredentials_SentinelFixChild_IsNotServedAsAReviewSession) -- a
+// pre-existing limit the review-session rule does not change.
+func TestSentinelAutoFixChild_IsNotAReviewSessionSoItsPushIsSent(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
 
@@ -226,7 +233,7 @@ func TestSentinelAutoFixChild_IsNotAReviewSessionAndStillPushesItsFixBranch(t *t
 	}
 	pushes := commander.pushes(t)
 	if len(pushes) != 1 || len(pushes[0].Repos) != 1 || pushes[0].Repos[0].Branch != wantBranch || pushes[0].SessionId != child.ID.String() {
-		t.Fatalf("push commands = %+v, want exactly one push of the child's own branch %q", pushes, wantBranch)
+		t.Fatalf("push commands = %+v, want exactly one push command for the child's own branch %q", pushes, wantBranch)
 	}
 }
 

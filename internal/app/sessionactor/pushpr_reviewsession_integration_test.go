@@ -448,3 +448,83 @@ func restoreGitHubPRSessions(ctx context.Context, t *testing.T, pool *pgxpool.Po
 		t.Fatalf("restore github_pr_sessions: %v", err)
 	}
 }
+
+// TestCompleteProcessingTurn_ReviewSessionLookupFails_NothingIsPushed: the
+// push decision fails closed. When the review-session lookup itself fails,
+// the turn's completion fails as a whole -- rolled back, the event neither
+// persisted nor acknowledged, so it is redelivered -- and no push command
+// is sent. The session is not a review session, on a live repository, with
+// a creator whose push would authenticate: once the table is readable
+// again, the redelivered event completes the turn and pushes, proving the
+// first delivery's silence was the lookup's doing.
+//
+// What this does not isolate: inside the completing transaction, Postgres
+// itself aborts the transaction once the lookup's statement fails, so the
+// completion would fail here even if isReviewSession swallowed the error.
+// isReviewSession's own error branch is pinned where it runs outside a
+// transaction, by TestCreatePRBestEffort_ReviewSessionNeverOpensAPullRequest's
+// lookup-failure row.
+func TestCompleteProcessingTurn_ReviewSessionLookupFails_NothingIsPushed(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	repoFullName := "acme/lookup-fails-" + uuid.NewString()[:8]
+	creator := createReviewPushFixtureCreator(ctx, t, pool, true)
+	sessionID := createTestSessionWithRepos(ctx, t, pool, creator, "repo", "https://github.com/"+repoFullName+".git", reviewPushSessionBranch)
+	if _, err := narvipg.NewRepoSettingsStore(pool).UpsertLiveEgressEnabled(ctx, repoFullName, true); err != nil {
+		t.Fatalf("promote repo to live egress: %v", err)
+	}
+	if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	turnStore := narvipg.NewTurnStore(pool)
+	processing := createProcessingTurn(ctx, t, turnStore, sessionID)
+
+	commander := &fakeSendCommander{}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, commander, nil, "", nil, testTokenEncryptionKey, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	messageID := uuid.NewString()
+	raw, err := json.Marshal(sandboxws.ExecutionComplete{
+		Type: "execution_complete", MessageId: messageID, SessionId: sessionID.String(), Gen: 1,
+		AckId: "execution_complete:" + messageID, Outcome: sandboxws.ExecutionCompleteOutcomeCompleted,
+	})
+	if err != nil {
+		t.Fatalf("marshal execution_complete: %v", err)
+	}
+	event := SandboxEvent{Type: "execution_complete", Gen: 1, MessageID: messageID, Raw: raw}
+
+	renameGitHubPRSessionsAway(ctx, t, pool)
+	outcome := sendSandboxEventForTest(ctx, t, a, event)
+	restoreGitHubPRSessions(ctx, t, pool)
+	if outcome.Persisted || outcome.AckID != "" {
+		t.Errorf("outcome = %+v, want neither persisted nor acknowledged: the completion failed", outcome)
+	}
+	if pushes := pushCommandsSent(t, commander); len(pushes) != 0 {
+		t.Fatalf("push commands = %+v, want none while the review-session lookup fails", pushes)
+	}
+	if got, err := turnStore.Get(ctx, processing.ID); err != nil || got.Status != sqlcgen.TurnStatusProcessing {
+		t.Fatalf("turn = %+v (err %v), want still processing: the failed completion rolled back", got.Status, err)
+	}
+
+	// Control: the redelivery completes the turn and pushes; a second
+	// redelivery drains the actor (see completeTurnAndDrain).
+	for i := 0; i < 2; i++ {
+		if outcome := sendSandboxEventForTest(ctx, t, a, event); !outcome.Persisted {
+			t.Fatalf("redelivery %d was not persisted", i+1)
+		}
+	}
+	if got, err := turnStore.Get(ctx, processing.ID); err != nil || got.Status != sqlcgen.TurnStatusCompleted {
+		t.Fatalf("turn = %+v (err %v), want completed by the redelivery", got.Status, err)
+	}
+	if pushes := pushCommandsSent(t, commander); len(pushes) != 1 || pushes[0].Repos[0].Branch != reviewPushSessionBranch {
+		t.Fatalf("push commands = %+v, want exactly one push of %q once the lookup answers", pushes, reviewPushSessionBranch)
+	}
+}

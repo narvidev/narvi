@@ -478,14 +478,13 @@ func TestScmCredentials_NoGitHubIdentity(t *testing.T) {
 // exactly this least-privileged principal the deployment's single static
 // write credential for a LIVE session whose branch the creator itself
 // chooses (including "main"), unaudited. This endpoint must now deny with
-// 403 regardless of whether a bot token is configured for this
-// deployment -- otherwise identical to TestScmCredentials_NoGitHubIdentity
-// above, except rig.botToken IS set here, specifically to prove its mere
-// presence can no longer change the outcome for this case (a review
-// session, step 7, is the ONLY branch that still uses it).
+// 403 -- otherwise identical to TestScmCredentials_NoGitHubIdentity above.
+// ScmCredentials is no longer given the deployment's bot token at all (a
+// review session, step 7, is served the read-only installation token), so
+// no bot fallback can exist here any more; what this pins is the refusal
+// itself: a 403 that serves no credential.
 func TestScmCredentials_NoGitHubIdentity_NeverFallsBackToBotToken_EvenWhenConfigured(t *testing.T) {
-	const realBotToken = "bot-token-must-never-cover-a-github-less-creator"
-	rig := newTestRig(t, func(r *testRig) { r.botToken = realBotToken })
+	rig := newTestRig(t)
 	ctx := context.Background()
 
 	user, err := rig.users.Create(ctx, sqlcgen.CreateUserParams{
@@ -510,8 +509,8 @@ func TestScmCredentials_NoGitHubIdentity_NeverFallsBackToBotToken_EvenWhenConfig
 	if status != http.StatusForbidden {
 		t.Fatalf("status = %d, want %d (no bot/service-account fallback exists for a live, non-review session's github-less creator, bot token configured or not)", status, http.StatusForbidden)
 	}
-	if got.Password == realBotToken {
-		t.Fatalf("Password equals the deployment's bot token -- the exact privilege-escalation gap review round 2's finding P1 closes")
+	if got.Username != "" || got.Password != "" {
+		t.Fatalf("credential %q/%q served on a refusal, want none", got.Username, got.Password)
 	}
 }
 
@@ -619,13 +618,13 @@ func TestScmCredentials_NoStoredToken(t *testing.T) {
 // covers the decrypt-failure sub-case identically), must NEVER receive
 // the bot-token fallback TestScmCredentials_NoGitHubIdentity_
 // FallsBackToBotToken proves for the "no identity at all" case --
-// otherwise identical to TestScmCredentials_NoStoredToken above, except
-// rig.botToken IS configured here. Falling back would misrepresent an
-// existing account's broken credential as "no linked account" to
-// whoever reviews the resulting push/PR.
+// otherwise identical to TestScmCredentials_NoStoredToken above. Falling
+// back would misrepresent an existing account's broken credential as "no
+// linked account" to whoever reviews the resulting push/PR. ScmCredentials
+// is no longer given the bot token at all, so this pins the refusal
+// itself: a 403 that serves no credential.
 func TestScmCredentials_GitHubIdentityNoStoredToken_NeverFallsBackToBot(t *testing.T) {
-	const realBotToken = "bot-token-must-never-cover-a-broken-existing-identity"
-	rig := newTestRig(t, func(r *testRig) { r.botToken = realBotToken })
+	rig := newTestRig(t)
 	ctx := context.Background()
 
 	user, err := rig.users.Create(ctx, sqlcgen.CreateUserParams{
@@ -655,8 +654,8 @@ func TestScmCredentials_GitHubIdentityNoStoredToken_NeverFallsBackToBot(t *testi
 	if status != http.StatusForbidden {
 		t.Errorf("status = %d, want %d (an existing-but-unusable identity must never fall back to the bot token)", status, http.StatusForbidden)
 	}
-	if got.Password == realBotToken {
-		t.Error("Password == the bot token -- an existing GitHub identity with no stored token must never receive the bot fallback")
+	if got.Username != "" || got.Password != "" {
+		t.Errorf("credential %q/%q served on a refusal, want none -- an existing GitHub identity with no stored token gets no credential at all", got.Username, got.Password)
 	}
 }
 
@@ -666,15 +665,13 @@ func TestScmCredentials_GitHubIdentityNoStoredToken_NeverFallsBackToBot(t *testi
 // configured for this deployment -- otherwise identical to
 // TestScmCredentials_TamperedCiphertext above (a real, tampered
 // access_token_encrypted value, AES-GCM's own authentication tag catching
-// it, never a mocked failure), except rig.botToken IS set here.
-// TestScmCredentials_TamperedCiphertext's own doc comment claimed this
-// exact scenario was covered "identically" -- it was not: that test's rig
-// has no bot token configured at all, so it cannot observe a bot
-// fallback (M5b survived against it, per review round 2's own
-// reproduction).
+// it, never a mocked failure). It was written when the handler still held
+// the bot token, to observe a bot fallback the plain tamper test could
+// not (M5b survived against that one, per review round 2's own
+// reproduction). ScmCredentials is no longer given the bot token at all,
+// so this now pins the refusal itself: a 403 that serves no credential.
 func TestScmCredentials_TamperedCiphertext_WithBotToken_NeverFallsBackToBot(t *testing.T) {
-	const realBotToken = "bot-token-must-never-cover-a-decrypt-failure"
-	rig := newTestRig(t, func(r *testRig) { r.botToken = realBotToken })
+	rig := newTestRig(t)
 	ctx := context.Background()
 
 	session := createSessionWithGitHubIdentity(ctx, t, rig, "gho_realGitHubAccessToken")
@@ -689,18 +686,19 @@ func TestScmCredentials_TamperedCiphertext_WithBotToken_NeverFallsBackToBot(t *t
 
 	status, got := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
 	if status != http.StatusForbidden {
-		t.Errorf("status = %d, want %d (a decrypt failure must never fall back to the bot token, bot token configured or not)", status, http.StatusForbidden)
+		t.Errorf("status = %d, want %d (a decrypt failure is refused, never served another credential)", status, http.StatusForbidden)
 	}
-	if got.Password == realBotToken {
-		t.Error("Password == the bot token -- a tampered/undecryptable existing identity must never receive the bot fallback")
+	if got.Username != "" || got.Password != "" {
+		t.Errorf("credential %q/%q served on a refusal, want none -- a tampered/undecryptable existing identity gets no credential at all", got.Username, got.Password)
 	}
 }
 
 // TestScmCredentials_IdentityLookupError_WithBotToken_NeverFallsBackToBot
 // proves review round 2's own finding P5 (mutant M5c): a GENUINE
 // identities.GetByUserAndProvider failure other than pgx.ErrNoRows must
-// never fall back to the bot token either, even when one is configured.
-// No fake/mock of postgres.IdentityStore exists in this package (its
+// never fall back to another credential either: it is a 403 that serves
+// none (the handler is no longer given the bot token at all). No
+// fake/mock of postgres.IdentityStore exists in this package (its
 // signature takes the concrete store, not an interface), so this proves
 // it against a REAL query failure: the identities table itself is
 // renamed away for the single request this test makes (restored via
@@ -715,8 +713,7 @@ func TestScmCredentials_TamperedCiphertext_WithBotToken_NeverFallsBackToBot(t *t
 // non-parallel one has returned), so no other test can observe the table
 // renamed away.
 func TestScmCredentials_IdentityLookupError_WithBotToken_NeverFallsBackToBot(t *testing.T) {
-	const realBotToken = "bot-token-must-never-cover-a-lookup-error"
-	rig := newTestRig(t, func(r *testRig) { r.botToken = realBotToken })
+	rig := newTestRig(t)
 	ctx := context.Background()
 
 	// Deliberately NO identities row of any provider -- irrelevant here,
@@ -750,8 +747,8 @@ func TestScmCredentials_IdentityLookupError_WithBotToken_NeverFallsBackToBot(t *
 	if status != http.StatusForbidden {
 		t.Errorf("status = %d, want %d (a genuine identity-lookup failure must never fall back to the bot token, and must never be a 500 either -- §5.2's own outcome-class discipline)", status, http.StatusForbidden)
 	}
-	if got.Password == realBotToken {
-		t.Error("Password == the bot token -- a genuine identity-lookup failure must never receive the bot fallback")
+	if got.Username != "" || got.Password != "" {
+		t.Errorf("credential %q/%q served on a refusal, want none -- a genuine identity-lookup failure gets no credential at all", got.Username, got.Password)
 	}
 }
 
@@ -1138,17 +1135,12 @@ func (failingLedgerStore) Create(context.Context, sqlcgen.CreateShadowSCMWritePa
 // session in shadow receives a read-only credential." This session -- a
 // github_pr_sessions row exists for it, and its repo is deliberately left
 // un-promoted (shadow is repo_settings' own default, §30.8) -- must
-// receive the read-only token and never rig.botToken, the fully
-// write-capable credential §30.4(1) says every shadow review sandbox must
-// never see. (A review session on a LIVE repository is held to the same
-// outcome: TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential.)
+// receive exactly the minted read-only token. (A review session on a LIVE
+// repository is held to the same outcome:
+// TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential.)
 func TestScmCredentials_Shadow_ReviewSessionReceivesReadOnlyCredential(t *testing.T) {
-	const realBotToken = "bot-token-must-never-reach-a-shadow-review-sandbox"
 	minter := newFakeReadOnlyMinter()
-	rig := newTestRig(t, func(r *testRig) {
-		r.botToken = realBotToken
-		r.readOnlyMinter = minter
-	})
+	rig := newTestRig(t, func(r *testRig) { r.readOnlyMinter = minter })
 	ctx := context.Background()
 
 	owner, err := rig.users.Create(ctx, sqlcgen.CreateUserParams{
@@ -1191,9 +1183,6 @@ func TestScmCredentials_Shadow_ReviewSessionReceivesReadOnlyCredential(t *testin
 	status, got := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want %d", status, http.StatusOK)
-	}
-	if got.Password == realBotToken {
-		t.Fatal("Password equals the bot token -- a shadow review sandbox received the fully write-capable credential §30.4(1) requires it never see")
 	}
 	if got.Password != minter.Token.Value {
 		t.Errorf("Password = %q, want the substituted read-only token %q", got.Password, minter.Token.Value)
@@ -1436,13 +1425,9 @@ func TestScmCredentials_Shadow_MintErrorIsInternalError(t *testing.T) {
 // the master switch ON would still have handed out a write-capable token.
 // A malformed URL decided whether a credential could write.
 func TestScmCredentials_UnparseableRepoIsNotWriteCapable(t *testing.T) {
-	const realBotToken = "bot-token-must-never-be-reached-through-an-unparseable-url"
 	const realCreatorToken = "gho_creatorTokenMustNeverBeReachedThroughAnUnparseableURL"
 	minter := newFakeReadOnlyMinter()
-	rig := newTestRig(t, func(r *testRig) {
-		r.botToken = realBotToken
-		r.readOnlyMinter = minter
-	})
+	rig := newTestRig(t, func(r *testRig) { r.readOnlyMinter = minter })
 	ctx := context.Background()
 
 	owner, err := rig.users.Create(ctx, sqlcgen.CreateUserParams{
@@ -1478,14 +1463,18 @@ func TestScmCredentials_UnparseableRepoIsNotWriteCapable(t *testing.T) {
 	// The outcome is a refusal, not a read-only token, and that is the
 	// correct end of this path: with no owner/repo the mint has nothing
 	// to scope a token TO, and no credential at all is strictly safer
-	// than a write-capable one. What this test pins is the negative --
-	// neither write-capable secret is reachable through a URL shape.
+	// than a write-capable one. What this test pins is that refusal: no
+	// credential at all, so the creator's write-capable token is not
+	// reachable through a URL shape.
 	status, got := postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
 	if status != http.StatusForbidden {
 		t.Errorf("status = %d, want %d", status, http.StatusForbidden)
 	}
-	if got.Password == realBotToken || got.Password == realCreatorToken {
-		t.Fatal("a session whose repo URL could not be read as owner/repo received a WRITE-CAPABLE credential; an unparseable URL must never decide that")
+	if got.Password == realCreatorToken {
+		t.Fatal("a session whose repo URL could not be read as owner/repo received its creator's WRITE-CAPABLE credential; an unparseable URL must never decide that")
+	}
+	if got.Username != "" || got.Password != "" {
+		t.Errorf("credential %q/%q served on a refusal, want none", got.Username, got.Password)
 	}
 	if minter.CallCount != 0 {
 		t.Errorf("readOnlyMinter called %d times, want 0: there is no owner to scope a read-only token to", minter.CallCount)
