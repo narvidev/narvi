@@ -41,6 +41,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/extension"
@@ -341,6 +342,18 @@ func serve(modules ...extension.Module) error {
 	// doc comment for why this number matters independently of host core
 	// count.
 	slog.Info("narvi control-plane: postgres pool configured", "max_conns", pool.Config().MaxConns)
+	// §5.1: this replica's connections are its pool plus the one lock
+	// connection holding every session actor's advisory lock
+	// (internal/app/sessionactor/lockholder.go). Logged beside the
+	// server's own limits, with a warning -- never a refusal -- when even
+	// this one replica does not fit (checkConnectionBudget's own doc
+	// comment).
+	checkConnectionBudget(ctx, slog.Default(), pool, cfg.Timeouts.HealthCheckTimeout)
+	unregisterPoolMetrics, err := registerPoolMetrics(otel.Meter(meterName), pool)
+	if err != nil {
+		return fmt.Errorf("register postgres pool metrics: %w", err)
+	}
+	defer unregisterPoolMetrics()
 
 	if err := applyMigrations(cfg.DatabaseURL); err != nil {
 		return fmt.Errorf("apply migrations: %w", err)
@@ -3218,6 +3231,18 @@ func (a *App) Run(ctx context.Context, addr string) error {
 		return nil
 	})
 
+	// §2: probes the one connection holding every session actor's
+	// advisory lock, so a silently dead one is found -- and the actors it
+	// held stopped -- within ActorLockProbeInterval. Beside the timer
+	// pump, on the same errgroup and with the same context.Canceled
+	// carve-out (§11: no naked goroutine).
+	group.Go(func() error {
+		if err := registry.RunLockProbe(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("session actor lock probe: %w", err)
+		}
+		return nil
+	})
+
 	// Audit-remediation (config/platform-hardening batch): purges expired
 	// ws_tokens/user_sessions rows (neither is ever deleted otherwise --
 	// see internal/adapters/outbound/postgres/expiredcleanup.go's own doc
@@ -3379,8 +3404,8 @@ func (a *App) Run(ctx context.Context, addr string) error {
 			return fmt.Errorf("http server shutdown: %w", err)
 		}
 
-		// Registry.Shutdown cancels every live actor's run loop and waits
-		// for all of them, plus the timer-pump goroutine above, to finish.
+		// Registry.Shutdown cancels every live actor's run loop, waits
+		// for all of them to finish, then closes the lock connection.
 		// Its own errgroup.Wait() will very likely surface context.Canceled
 		// from every actor whose run loop was still alive at shutdown time
 		// -- expected/benign, not a real failure, so it gets the exact same
