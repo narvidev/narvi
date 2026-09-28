@@ -85,35 +85,31 @@
 // check logged Warn and returned 403 unconditionally on ANY GetByID
 // failure, never distinguishing the two).
 //
-// Audit remediation ("server-side verdict", §8.2/§5.2 confirmed
-// finding): a REVIEW session (one with a github_pr_sessions row,
-// reviewverdict.go's own identical reverse-lookup precedent) never pushes
-// or opens a PR -- it only clones a PR's head branch read-only, for inline
-// code-review context (§8.2), and its own output reaches GitHub
-// exclusively through the verdict-posting tool (reviewverdict.go,
-// §8.2), which authenticates with cfg.GitHubBotToken, never a per-commenter
-// OAuth token. Handing such a session's SANDBOX the session CREATOR's own
-// broadly `repo`-scoped personal GitHub OAuth token (steps 7-9 below) for
-// this exact purpose was itself a confirmed credential-exposure gap: an
-// arbitrary human whose ONLY interaction with Narvi was commenting on a PR
-// had their own full, cross-repo, cross-org personal credential cached to
-// the reviewing sandbox's local disk (internal/sandboxagent/credentials.
-// Cache) merely because a review session happened to need SOME credential
-// to clone with -- a far broader blast radius than this endpoint's own
-// host-scoping (step 6) or per-session repo list ever intended to expose.
-// Fixed below (the NEW step 7, checked immediately after host-scoping,
-// before the creator/identity lookups steps 8-10 exist to serve): a review
-// session mints botToken instead, skipping the creator-guard/identity
-// path entirely -- the SAME single, statically-configured bot credential
+// A review session is read-only. A REVIEW session (one with a
+// github_pr_sessions row, reviewverdict.go's own identical reverse-lookup
+// precedent) only clones a PR's head branch, for inline code-review
+// context (§8.2). It never pushes (internal/app/sessionactor's
+// completeProcessingTurn sends no push command for one) and never opens a
+// PR, and its own output reaches GitHub exclusively through the
+// verdict-posting tool (reviewverdict.go, §8.2), which authenticates
+// server-side with cfg.GitHubBotToken. So its sandbox is served only the
+// §30.4 read-only GitHub App installation token (step 7 below), through
+// the same scope-checked mint as the shadow substitution, whatever the
+// repository's egress mode.
+//
+// How it got here, since each step closed a real gap. This endpoint first
+// served a review sandbox the session CREATOR's own broadly `repo`-scoped
+// personal GitHub OAuth token (steps 8-10 below): an arbitrary human whose
+// ONLY interaction with Narvi was commenting on a PR had their own full,
+// cross-repo, cross-org personal credential cached to the reviewing
+// sandbox's local disk (internal/sandboxagent/credentials.Cache) merely
+// because a review session needed SOME credential to clone with. An audit
+// remediation replaced it with the bot token -- the static credential
 // already trusted to read (internal/app/reviewcontext.Fetch) and post
-// (githubapi.VerdictNotifier) on this exact repo/PR, never the creator's
-// own identity. This does not claim to make a bash-capable review agent
-// structurally incapable of ever calling GitHub's API directly with
-// SOME credential (that would require OS-level process isolation between
-// sandbox-agent and the agent runtime it supervises) -- it closes
-// the STRICTLY WORSE half of that gap: an arbitrary commenter's own
-// broad, personal, cross-repo credential never reaches a review sandbox
-// at all.
+// (githubapi.VerdictNotifier) on the same repo. That was still a
+// write-capable credential, for a session with no use for write at all;
+// the read-only installation token now replaces it, and this handler is
+// no longer given the bot token.
 
 package httpapi
 
@@ -255,11 +251,9 @@ type ReadOnlyMinter interface {
 //     in-sandbox dependency probing an arbitrary host via the
 //     credential-helper protocol).
 //     6.5. §30.4's own shadow substitution -- a SINGLE, server-side-only
-//     interception covering BOTH of steps 7 and 8-10 below (§30.4(1): "a
-//     dedicated test asserts a review session in shadow receives a
-//     read-only credential" -- substituting only the creator-OAuth branch
-//     would still hand every shadow REVIEW sandbox the fully write-capable
-//     bot token). Resolved from req.ForceReadOnly (§30.4(2), a build boot)
+//     interception covering every session, review session or not
+//     (§30.4(1): "a dedicated test asserts a review session in shadow
+//     receives a read-only credential"). Resolved from req.ForceReadOnly (§30.4(2), a build boot)
 //     OR ANY of the session's own repos on req.Host resolving shadow
 //     (egressmode.Resolve, monotone toward suppression -- mirrors
 //     postgres.OutboxStore.ResolveEffectiveMode's own identical "any
@@ -270,21 +264,24 @@ type ReadOnlyMinter interface {
 //     ValidateReadOnly) before ever returning it, records a refusal into
 //     the ledger and 500s if that scope check fails AND the record itself
 //     fails (never silently), otherwise 403s the SAME generic body as
-//     every other outcome in this class -> steps 7 and 8-10 never run at
+//     every other outcome in this class -> steps 8-10 never run at
 //     all. A session whose repos on req.Host span more than one distinct
 //     owner cannot be served by one substituted credential (a GitHub App
 //     installation is per-account) -> the SAME 403, logged separately.
 //  7. This session has a github_pr_sessions row (prSessions.
-//     GetBySessionID succeeds) -> 200 with botToken, never the creator's
-//     own identity -- see this file's own top comment ("Audit remediation")
-//     for the full rationale. steps 8-10 below (the
-//     creator-guard/identity/decrypt path) are skipped entirely for a
+//     GetBySessionID succeeds): a review session, which is read-only ->
+//     exactly step 6.5's outcome, on a live repository too: the read-only
+//     installation token through the SAME scope-checked mint (or its 403/
+//     500), never a write-capable credential and never the creator's own
+//     -- see this file's own top comment for the full rationale. Steps
+//     8-10 below (the creator-guard/identity/decrypt path) never run for a
 //     review session: they exist to find and gate a PER-USER OAuth
 //     credential, which a review session has no legitimate use for at
 //     all. A genuine, unexpected error from GetBySessionID OTHER than
 //     "no such row" (pgx.ErrNoRows) is a 500, matching this handler's own
 //     established "row absent vs genuine failure" discipline (step 9's
-//     identical distinction, and sessions.Get/sandboxes.Get above).
+//     identical distinction, and sessions.Get/sandboxes.Get above) -- and
+//     never a fall-through to steps 8-10.
 //  8. The session's own created_by is NULL -> 403, the SAME generic body
 //     as steps 6/9/10 -- no bot/service-account fallback exists (§8.11),
 //     nothing further to even check once a session has no creator at all.
@@ -310,10 +307,10 @@ type ReadOnlyMinter interface {
 //     identities row for provider=github at all -> 403, the SAME generic
 //     body as every other sub-case in this class -- the ordinary case
 //     for a creator who signed in ONLY through OIDC (§41.3) and has
-//     never linked GitHub. Review round 1 (finding O5) added a botToken
-//     fallback here (mirroring step 7's review-session branch); review
-//     round 2 (finding P1, HIGH) reverted it: unlike a review session (no
-//     human creator, read-only clone), a live session's creator picks
+//     never linked GitHub. Review round 1 (finding O5) added a bot-token
+//     fallback here (mirroring what was then step 7's review-session
+//     branch); review round 2 (finding P1, HIGH) reverted it: a live
+//     session's creator picks
 //     the branch a push targets (reposource.ValidateBranch accepts
 //     "main"), so that fallback handed exactly the principal with the
 //     LEAST GitHub authority -- an OIDC-only creator -- the bot's full,
@@ -362,7 +359,6 @@ func ScmCredentials(
 	repoSettings egressmode.RepoSettingsReader,
 	ledger shadowledger.Store,
 	readOnlyMinter ReadOnlyMinter,
-	botToken string,
 	tokenEncryptionKey []byte,
 	timeouts platform.Timeouts,
 	platformShadow bool,
@@ -458,9 +454,9 @@ func ScmCredentials(
 		}
 
 		// §30.4's own shadow substitution (this func's own doc comment
-		// step 6.5): a SINGLE interception, server-side only, covering
-		// BOTH the review-bot-token branch (step 7) and the creator-OAuth
-		// branch (steps 8-10) below. hostRepoFullNames is every session
+		// step 6.5): a SINGLE interception, server-side only, ahead of
+		// every other branch below -- the review-session rule (step 7)
+		// and the creator-OAuth path (steps 8-10). hostRepoFullNames is every session
 		// repo on req.Host regardless of owner (used for the egress-mode
 		// resolution, which must see all of them -- §30.8's own "any
 		// suppressed repo suppresses the whole" rule); hostReposByOwner
@@ -515,7 +511,29 @@ func ScmCredentials(
 			shadow = true
 		}
 
-		if shadow {
+		// A pull request's review session is read-only (this func's own
+		// doc comment step 7): it only ever reads the pull request's head,
+		// it never pushes, and its output reaches GitHub through the
+		// verdict path. So its sandbox is served exactly what a shadow
+		// sandbox is -- the read-only installation token, through the SAME
+		// scope-checked mint below -- whatever the repository's egress
+		// mode. Never a write-capable credential, and never the creator's
+		// own: steps 8-10 exist to find a per-user credential, which a
+		// review session has no use for. A genuine lookup failure is a 500,
+		// never "not a review session": that would fall through to a
+		// write-capable branch.
+		readOnly := shadow
+		if !readOnly {
+			if _, err := prSessions.GetBySessionID(ctx, sessionID); err == nil {
+				readOnly = true
+			} else if !errors.Is(err, pgx.ErrNoRows) {
+				logger.Error("httpapi: scm-credentials: get github pr session failed", "error", err)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+		}
+
+		if readOnly {
 			// Both arms below refuse, and both are correct: no
 			// credential at all is strictly safer than a write-capable
 			// one. They are separated only so each log line states the
@@ -572,28 +590,6 @@ func ScmCredentials(
 				Password:  token.Value,
 				ExpiresAt: time.Now().Add(timeouts.ScmCredentialTTL),
 			})
-			return
-		}
-
-		// Review-session check (this func's own doc comment step 7,
-		// audit remediation): a session with a github_pr_sessions row
-		// never pushes/opens a PR -- see this file's own top comment for
-		// the full "why the creator's own personal OAuth token has no
-		// legitimate use here" rationale. Mints botToken directly,
-		// skipping steps 8-10's creator-guard/identity/decrypt path
-		// entirely -- that path exists to find a PER-USER credential,
-		// which is exactly what this branch avoids handing to a review
-		// sandbox at all.
-		if _, err := prSessions.GetBySessionID(ctx, sessionID); err == nil {
-			writeJSON(w, http.StatusOK, scmCredentialsResponse{
-				Username:  "x-access-token",
-				Password:  botToken,
-				ExpiresAt: time.Now().Add(timeouts.ScmCredentialTTL),
-			})
-			return
-		} else if !errors.Is(err, pgx.ErrNoRows) {
-			logger.Error("httpapi: scm-credentials: get github pr session failed", "error", err)
-			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
 
@@ -669,11 +665,9 @@ func ScmCredentials(
 			// static write credential handed this exact creator the
 			// bot's full write authority on a branch of their own
 			// choosing, unaudited -- a privilege escalation, not a
-			// convenience. The review-session branch above (step 7) is
-			// NOT this case: that session has no human creator making a
-			// push/branch choice at all, it only clones read-only, and
-			// it mints the bot token for THAT reason -- see this file's
-			// own top comment. There is no bot/service-account fallback
+			// convenience. A review session never reaches this point:
+			// step 7 above serves it the read-only installation token.
+			// There is no bot/service-account fallback
 			// for a live, non-review session's creator (§8.11's own
 			// honest gap, restored): such a creator cannot push until
 			// they link a GitHub identity via the ordinary GitHub
