@@ -3708,18 +3708,43 @@ recommendation:**
    **Amendment — a review session is read-only in every mode.** A review session only clones its
    pull request's head; it has no use for write. It now receives the read-only installation token
    on a live repository too, through the same interception's mint and the same fail-closed scope
-   check (an over-scoped grant is refused and recorded; a failed mint or a failed
-   `github_pr_sessions` lookup is a 500, never a fall-through to a write-capable branch), and
-   `ScmCredentials` is no longer given the bot token at all — the bot token stays server-side, for
-   the verdict path. The server also never asks a review sandbox to push: `completeProcessingTurn`
-   returns no push signal for a session with a `github_pr_sessions` row. That second half is
-   consistency, in the sense of the WS-push paragraph below; the read-only token is the guard.
-   `TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential` (live repository, with and without
-   a creator, an over-scoped grant, a failed mint) and
-   `TestCompleteProcessingTurn_ReviewSessionNeverPushes` pin the two halves. The sentinel auto-fix
-   child (§17.2) is not a review session — no `github_pr_sessions` row of its own — and is untouched:
-   the server still sends the push of its own `narvi/sentinel-fix/<id>` branch
-   (`TestSentinelAutoFixChild_IsNotAReviewSessionAndStillPushesItsFixBranch`).
+   check (an over-scoped grant is refused; a failed mint or a failed `github_pr_sessions` lookup is
+   a 500, never a fall-through to a write-capable branch), and `ScmCredentials` is no longer given
+   the bot token at all — the bot token stays server-side, for the verdict path. That mint is not a
+   shadow-mode substitution, so it writes nothing to the shadow ledger (`readonlymint.MintUnrecorded`;
+   the handler logs each outcome instead), and a ledger failure cannot fail it; a review session on
+   a shadow repository, or in a build boot, is a shadow mint like any other and is recorded. The
+   server also never asks a review sandbox to push, and never opens a pull request for one:
+   `completeProcessingTurn` returns no push signal for a session with a `github_pr_sessions` row,
+   and `createPRBestEffort` opens nothing for a `push_complete` in one — no pull request, no preview,
+   so no commit status. Both lookups fail closed. That half is consistency, in the sense of the
+   WS-push paragraph below; the read-only token is the guard. Work in a review session is not
+   dropped silently: a turn there that is not a review attempt (a follow-up mention, a web prompt, a
+   plan's implementation) ends with a session-visible warning that the session is read-only, so
+   changes made in it are not pushed. `TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential`,
+   `TestScmCredentials_ReadOnlyMint_OnlyShadowAndBuildBootAreRecorded`,
+   `TestCompleteProcessingTurn_ReviewSessionNeverPushes` and
+   `TestCreatePRBestEffort_ReviewSessionNeverOpensAPullRequest` pin it. The sentinel auto-fix child
+   (§17.2) is not a review session — no `github_pr_sessions` row of its own — and this amendment
+   leaves it as it was: the server still sends the push command for its own
+   `narvi/sentinel-fix/<id>` branch (`TestSentinelAutoFixChild_IsNotAReviewSessionSoItsPushIsSent`).
+   Whether that push reaches GitHub on a live repository is a separate, pre-existing question this
+   amendment does not change: the child has no creator, so its own credential request is refused
+   there (`TestScmCredentials_SentinelFixChild_IsNotServedAsAReviewSession`).
+
+   **The GitHub App must be installed wherever a review session clones.** The mint above now serves
+   every live review session's clone, not only shadow sandboxes and build boots, so the App must be
+   installed, with read-only permissions (`contents: read`, `metadata: read`), on every repository
+   Narvi reviews. Where it is not, GitHub finds no installation for the repository; the credential
+   is still refused — never another in its place — but as a 403 with a session-visible warning
+   naming the repository and that the App must be installed on it with read access, once per
+   session and repository, rather than a bare 500. The mint is bounded (`GitHubAppMintTimeout`,
+   8 s) inside the sandbox helper's own wait (`CredentialFetchTimeout`, 10 s), so that answer
+   reaches the sandbox before it gives up. **A stated limit: a pull request from a fork.** A review
+   session clones its pull request's head from the head repository, so for a fork the App must be
+   installed on the fork owner's account too — an account the base repository's owner does not
+   control. Until it is, such a review cannot clone, and says why. The follow-up: a review session
+   reads its pull request from the base repository (a planned Step).
 2. **The image-build path must never hold a write token — this is an in-repo bug, not an
    external-service caveat.** `gitclone.CleanForImageBuild`
    (`internal/sandboxagent/gitclone/sync.go:941`), the pre-snapshot cleanup for `BootModeBuild`,

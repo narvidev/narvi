@@ -130,6 +130,28 @@ pipeline below, completely unaffected — see "No slash commands, no
 free-text prompting" under "Honest negatives" for what that means for
 everything else.
 
+## The GitHub App: install it on every repository Narvi reviews
+
+A review session is read-only. Its sandbox clones the pull request's
+head with a read-only installation token of Narvi's GitHub App
+(`NARVI_GITHUB_APP_ID`/`NARVI_GITHUB_APP_PRIVATE_KEY`, technical plan
+§30.4), never with the bot token or a person's own GitHub token; it never
+pushes and never opens a pull request, and its output reaches GitHub only
+through the review it posts. So the App must be installed, with read-only
+permissions (`contents: read`, `metadata: read`), on every repository
+Narvi reviews.
+
+A pull request from a fork is cloned from the fork, so it needs the App
+installed on the fork owner's account too — a stated limit (§30.4) until a
+review session reads its pull request from the base repository (a planned
+Step). When the App is missing on the repository a review clones, the
+clone fails and the session shows a warning naming the repository and
+that the App must be installed on it with read access.
+
+A follow-up that asks a review session to change code (a later mention, a
+web prompt) is answered in the session, but nothing it changes is pushed:
+the session shows a warning saying so.
+
 ## Review verdicts and decision inbox
 
 Posting a review verdict, applying a suggested fix, and rebutting a
