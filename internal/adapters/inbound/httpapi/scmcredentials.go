@@ -270,10 +270,13 @@ type ReadOnlyMinter interface {
 //     installation is per-account) -> the SAME 403, logged separately.
 //  7. This session has a github_pr_sessions row (prSessions.
 //     GetBySessionID succeeds): a review session, which is read-only ->
-//     exactly step 6.5's outcome, on a live repository too: the read-only
+//     step 6.5's outcome on a live repository too: the read-only
 //     installation token through the SAME scope-checked mint (or its 403/
 //     500), never a write-capable credential and never the creator's own
-//     -- see this file's own top comment for the full rationale. The
+//     -- see this file's own top comment for the full rationale. It is not
+//     a shadow-mode substitution, so it writes nothing to the shadow
+//     ledger (readonlymint.MintUnrecorded; each outcome is logged
+//     instead), and a ledger failure cannot fail it. The
 //     creator-guard/identity/decrypt path (steps 8-10 below) never runs
 //     for a review session: it exists to find and gate a PER-USER OAuth
 //     credential, which a review session has no legitimate use for at
@@ -558,31 +561,60 @@ func ScmCredentials(
 			}
 
 			// One implementation of "mint, then refuse to serve what
-			// came back over-scoped" -- internal/app/readonlymint.Mint,
-			// which also owns §30.4(4)'s record-or-fail on a refusal.
-			// This handler previously inlined a second copy of that
-			// sequence; two copies of a security rule is one that can
-			// silently drift out from under the other's tests.
+			// came back over-scoped" -- internal/app/readonlymint, which
+			// also owns §30.4(4)'s record-or-fail on a refusal. This
+			// handler previously inlined a second copy of that sequence;
+			// two copies of a security rule is one that can silently
+			// drift out from under the other's tests.
+			//
+			// A shadow sandbox or a build boot is a shadow-mode
+			// substitution, recorded in the shadow ledger exactly as
+			// §30.6 requires (readonlymint.Mint). A review session on a
+			// live repository is not: it is read-only in every mode, and
+			// the ledger -- the record of what shadow mode suppressed or
+			// substituted, which the shadow operator's summary reads back
+			// -- is not the place for its ordinary clone credential. It
+			// runs the same mint and the same scope check with nothing
+			// recorded (readonlymint.MintUnrecorded), and each outcome is
+			// logged here instead; a ledger failure cannot fail it. A
+			// review session on a shadow repository, or in a build boot,
+			// is a shadow mint like any other and is recorded.
+			reviewOnly := !shadow
 			mintCtx, cancel := context.WithTimeout(ctx, timeouts.GitHubAppMintTimeout)
-			token, mintErr := readonlymint.Mint(mintCtx, readOnlyMinter, ledger, owner, repoNames, hostRepoFullNames[0], req.Host, sessionID)
+			var (
+				token   githubapp.Token
+				mintErr error
+			)
+			if reviewOnly {
+				token, mintErr = readonlymint.MintUnrecorded(mintCtx, readOnlyMinter, owner, repoNames)
+			} else {
+				token, mintErr = readonlymint.Mint(mintCtx, readOnlyMinter, ledger, owner, repoNames, hostRepoFullNames[0], req.Host, sessionID)
+			}
 			cancel()
 			var refused *readonlymint.ErrRefusedByScopeCheck
 			switch {
 			case errors.As(mintErr, &refused):
-				// Refused AND recorded. 403: no credential exists to
-				// serve, and the refusal is already durable evidence.
+				// Refused -- and, for a shadow mint, recorded. 403: no
+				// credential exists to serve.
 				logger.Warn("httpapi: scm-credentials: refusing: minted installation token failed the read-only scope check",
-					"error", mintErr, "requested_host", req.Host)
+					"error", mintErr, "requested_host", req.Host, "owner", owner, "repo_names", repoNames,
+					"granted_permissions", refused.GrantedPermissions, "review_session", reviewOnly, "recorded_in_shadow_ledger", !reviewOnly)
 				writeError(w, http.StatusForbidden, "no usable git credential for this session")
 				return
 			case mintErr != nil:
-				// Either the mint itself failed, or a refusal could not
-				// be recorded. Both are 500: "suppressed but unrecorded"
-				// is exactly the contract violation the ledger exists to
-				// prevent, so it must never present as a quiet 403.
-				logger.Error("httpapi: scm-credentials: read-only installation token unavailable", "error", mintErr)
+				// The mint itself failed, or a shadow refusal or
+				// substitution could not be recorded. Both are 500:
+				// "suppressed but unrecorded" is exactly the contract
+				// violation the ledger exists to prevent, so it must
+				// never present as a quiet 403.
+				logger.Error("httpapi: scm-credentials: read-only installation token unavailable", "error", mintErr,
+					"requested_host", req.Host, "owner", owner, "repo_names", repoNames, "review_session", reviewOnly)
 				writeError(w, http.StatusInternalServerError, "internal error")
 				return
+			}
+			if reviewOnly {
+				logger.Info("httpapi: scm-credentials: served a pull request review session its read-only installation token",
+					"requested_host", req.Host, "owner", owner, "repo_names", repoNames, "granted_permissions", token.Permissions)
 			}
 
 			writeJSON(w, http.StatusOK, scmCredentialsResponse{

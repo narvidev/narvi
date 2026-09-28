@@ -53,9 +53,11 @@ func createReviewCredentialCreator(ctx context.Context, t *testing.T, rig testRi
 // the creator's own token. Every row's repository is promoted live, so
 // nothing here is the shadow branch doing the work.
 //
-// A token GitHub grants with more than read access is refused and the
-// refusal recorded, and a mint that fails is a 500: neither falls back to a
-// write-capable credential.
+// A token GitHub grants with more than read access is refused, and a mint
+// that fails is a 500: neither falls back to a write-capable credential. A
+// review session's credential is not a shadow-mode substitution, so no row
+// reaches the shadow ledger on any outcome, and a failing ledger does not
+// fail the credential.
 func TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential(t *testing.T) {
 	const botToken = "bot-token-must-never-reach-a-review-sandbox"
 	const personalToken = "gho_creatorsOwnPersonalToken"
@@ -68,26 +70,26 @@ func TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential(t *testing.T) {
 		// grant is what the fake GitHub App mint reports granting.
 		grant   map[string]string
 		mintErr error
+		// ledgerFails: every write to the shadow ledger fails.
+		ledgerFails bool
 
 		wantStatus int
-		// wantLedgerOperation is the shadow_scm_writes row the request
-		// must leave for this session, "" for none.
-		wantLedgerOperation string
 	}{
 		{
 			name: "creator with a personal token", withCreator: true,
 			grant: map[string]string{"contents": "read", "metadata": "read"}, wantStatus: http.StatusOK,
-			wantLedgerOperation: "scm_credential_substituted",
 		},
 		{
 			name: "no creator", withCreator: false,
 			grant: map[string]string{"contents": "read", "metadata": "read"}, wantStatus: http.StatusOK,
-			wantLedgerOperation: "scm_credential_substituted",
 		},
 		{
-			name: "the minted token can write: refused and recorded", withCreator: true,
+			name: "the shadow ledger is failing: served all the same", withCreator: true,
+			grant: map[string]string{"contents": "read", "metadata": "read"}, ledgerFails: true, wantStatus: http.StatusOK,
+		},
+		{
+			name: "the minted token can write: refused", withCreator: true,
 			grant: map[string]string{"contents": "write", "metadata": "read"}, wantStatus: http.StatusForbidden,
-			wantLedgerOperation: "scm_credential_mint_refused",
 		},
 		{
 			name: "the mint fails: an error, never a fallback", withCreator: true,
@@ -102,6 +104,9 @@ func TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential(t *testing.T) {
 			rig := newTestRig(t, func(r *testRig) {
 				r.botToken = botToken
 				r.readOnlyMinter = minter
+				if tc.ledgerFails {
+					r.shadowLedger = failingLedgerStore{}
+				}
 			})
 			ctx := context.Background()
 
@@ -144,14 +149,89 @@ func TestScmCredentials_ReviewSession_ReceivesReadOnlyCredential(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ListForRepo: %v", err)
 			}
-			if tc.wantLedgerOperation == "" {
+			if len(rows) != 0 {
+				t.Errorf("shadow ledger rows = %+v, want none: a review session's credential is not a shadow-mode substitution", rows)
+			}
+		})
+	}
+}
+
+// TestScmCredentials_ReadOnlyMint_OnlyShadowAndBuildBootAreRecorded pins
+// which read-only mints reach the shadow ledger. A shadow sandbox and a
+// build boot are shadow-mode substitutions and are recorded exactly as
+// before -- a review session among them, on a shadow repository or in a
+// build boot. A review session on a live repository is read-only for its
+// own reason, not shadow, and records nothing.
+func TestScmCredentials_ReadOnlyMint_OnlyShadowAndBuildBootAreRecorded(t *testing.T) {
+	tests := []struct {
+		name string
+		// review: the session has a github_pr_sessions row.
+		review bool
+		// live: the repository is promoted to live egress.
+		live bool
+		// buildBoot: the request carries forceReadOnly, as a build boot's
+		// does.
+		buildBoot    bool
+		wantRecorded bool
+	}{
+		{name: "review session, live repository: not recorded", review: true, live: true},
+		{name: "review session, shadow repository: recorded", review: true, wantRecorded: true},
+		{name: "review session, build boot on a live repository: recorded", review: true, live: true, buildBoot: true, wantRecorded: true},
+		{name: "not a review session, shadow repository: recorded", wantRecorded: true},
+		{name: "not a review session, build boot on a live repository: recorded", live: true, buildBoot: true, wantRecorded: true},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			minter := newFakeReadOnlyMinter()
+			rig := newTestRig(t, func(r *testRig) { r.readOnlyMinter = minter })
+			ctx := context.Background()
+
+			repoName := fmt.Sprintf("ledger-scope-%d-%d", i, time.Now().UnixNano())
+			repoFullName := "ledger-owner/" + repoName
+			reposJSON := `[{"name":"` + repoName + `","url":"https://github.com/` + repoFullName + `.git","branch":"feature-x"}]`
+			if tc.live {
+				promoteRepoLive(ctx, t, rig, reposJSON)
+			}
+			session, err := rig.sessions.Create(ctx, sqlcgen.CreateSessionParams{
+				SpawnSource: sqlcgen.SessionSpawnSourceGithub,
+				Repos:       []byte(reposJSON),
+			})
+			if err != nil {
+				t.Fatalf("create session: %v", err)
+			}
+			if tc.review {
+				if err := rig.prSessions.EnsureRow(ctx, repoFullName, int32(60+i)); err != nil {
+					t.Fatalf("ensure github_pr_sessions row: %v", err)
+				}
+				if err := rig.prSessions.SetSessionID(ctx, repoFullName, int32(60+i), session.ID); err != nil {
+					t.Fatalf("set github_pr_sessions session id: %v", err)
+				}
+			}
+			createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+
+			var status int
+			var got scmCredResponse
+			if tc.buildBoot {
+				status, got = postScmCredentialsForceReadOnly(t, rig, session.ID.String(), "sandbox-bearer-token", "1", "github.com")
+			} else {
+				status, got = postScmCredentials(t, rig, session.ID.String(), "sandbox-bearer-token")
+			}
+			if status != http.StatusOK || got.Password != minter.Token.Value {
+				t.Fatalf("status = %d, password = %q; want 200 and the minted read-only token", status, got.Password)
+			}
+
+			rows, err := narvipg.NewShadowSCMWriteStore(rig.pool).ListForRepo(ctx, repoFullName, 10)
+			if err != nil {
+				t.Fatalf("ListForRepo: %v", err)
+			}
+			if !tc.wantRecorded {
 				if len(rows) != 0 {
-					t.Errorf("ledger rows = %d, want none", len(rows))
+					t.Fatalf("shadow ledger rows = %+v, want none", rows)
 				}
 				return
 			}
-			if len(rows) != 1 || rows[0].Operation != tc.wantLedgerOperation || rows[0].SessionID != session.ID {
-				t.Fatalf("ledger rows = %+v, want exactly one %q for this session", rows, tc.wantLedgerOperation)
+			if len(rows) != 1 || rows[0].Operation != "scm_credential_substituted" || rows[0].SessionID != session.ID {
+				t.Fatalf("shadow ledger rows = %+v, want exactly one scm_credential_substituted for this session", rows)
 			}
 			if strings.Contains(string(rows[0].SpecJson), minter.Token.Value) {
 				t.Errorf("ledger spec %s carries the token's own value", rows[0].SpecJson)
