@@ -146,18 +146,19 @@ func TestMain(m *testing.M) {
 		log.Fatalf("sessionactor: run migrations against shared integration-test container: %v", err)
 	}
 
-	// MaxConns=20 -- this package's own former newTestPool doc comment
-	// (integration_helpers_test.go) documents why: a real CI hang was
-	// traced to pgxpool's own low-core-count-runner default (as few as 4
-	// on a 2-4 vCPU GitHub Actions runner) being smaller than this
-	// package's own worst-case concurrent-Actor count (6, see
-	// TestRepoAccessGate_RepeatedIndeterminateFailures_
-	// CircuitBreakerSkipsFurtherNetworkCalls, repoaccessgate_integration_
-	// test.go) -- Registry.hydrateAndAcquire pins one pool connection per
-	// live Actor for that Actor's entire lifetime, and an unbounded
-	// context.Background() Acquire call blocks forever, not fails fast,
-	// once the pool is genuinely out of connections. 20 is comfortably
-	// above that worst case, independent of the host's core count.
+	// MaxConns=20, pinned so this package's tests never depend on the
+	// host's core count (pgxpool's own default is as few as 4 on a 2-4
+	// vCPU GitHub Actions runner). It was chosen when a real CI hang was
+	// traced to that default being smaller than this package's own
+	// worst-case concurrent-Actor count (6, see TestRepoAccessGate_
+	// RepeatedIndeterminateFailures_CircuitBreakerSkipsFurtherNetworkCalls,
+	// repoaccessgate_integration_test.go): each live Actor then pinned one
+	// pool connection for its whole life, acquired with no bound. Actors
+	// pin none now -- every lock lives on the Registry's own lock
+	// connection (lockholder.go), and hydration is bounded by
+	// ActorHydrateTimeout -- so nothing needs 20 any more, and nothing
+	// gains from shrinking it. lockholder_integration_test.go builds its
+	// own small pools where a saturated pool is the point.
 	pool, err := narvipg.NewPoolWithMaxConns(ctx, connStr, 20)
 	if err != nil {
 		log.Fatalf("sessionactor: open shared integration-test pool: %v", err)

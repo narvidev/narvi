@@ -1039,13 +1039,22 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 // from either step are only warn-logged, never returned -- by the time
 // this runs, the session/turn are already durably committed, so a
 // dispatch-trigger failure here must not itself surface as a
-// session-creation failure to any caller.
+// session-creation failure to any caller. That includes
+// sessionactor.ErrActorUnavailable (this replica could not hydrate the
+// actor within ActorHydrateTimeout): answering 503 would make a client
+// retry and create a duplicate, and asking a webhook sender to redeliver
+// would re-run work that is not idempotent -- so the response is
+// unchanged and the warning carries reason=actor_unavailable. The pending
+// turn is then dispatched by the next command that reaches its session
+// (a sandbox frame, a timer); a session with neither waits for one --
+// durable redelivery of a failed trigger is not built yet.
 func TriggerDispatch(ctx context.Context, registry *sessionactor.Registry, sessionID pgtype.UUID) {
 	logger := platform.Logger(ctx)
 
 	actor, spawnErr := registry.GetOrSpawn(ctx, sessionID)
 	if spawnErr != nil {
-		logger.Warn("httpapi: GetOrSpawn after session create failed", "error", spawnErr)
+		logger.Warn("httpapi: GetOrSpawn after session create failed",
+			"reason", sessionactor.SpawnFailureReason(spawnErr), "error", spawnErr)
 		return
 	}
 	if sendErr := actor.Send(ctx, sessionactor.EnsureDispatched{}); sendErr != nil {

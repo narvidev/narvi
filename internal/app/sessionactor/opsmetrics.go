@@ -179,6 +179,27 @@ type opsMetrics struct {
 	// boot ended. Carries no attribute: which sandbox is in the WARN line
 	// logged with it.
 	bootEvidenceFallback metric.Int64Counter
+
+	// The session actors themselves (§2, §5.3): how many this replica
+	// hosts, how each hydration ended, and how often the one lock
+	// connection holding all their advisory locks was lost
+	// (lockholder.go). Recorded by the Registry, never by an Actor.
+	//
+	// actorsLive is session_actors_live: +1 when an actor enters the
+	// Registry's map, -1 when it leaves (its own shutdown, or
+	// onLockLost). Each live actor is one advisory lock on the lock
+	// connection and none on the query pool.
+	actorsLive metric.Int64UpDownCounter
+
+	// hydrations is session_actor_hydrations, one per hydration attempt,
+	// tagged outcome=ok|elsewhere|unavailable|error. A non-zero
+	// unavailable rate means the query pool stayed saturated for
+	// ActorHydrateTimeout, or the lock connection was down.
+	hydrations metric.Int64Counter
+
+	// lockConnLost is session_actor_lock_conn_lost, one per lost lock
+	// connection; each loss stopped every actor this replica hosted.
+	lockConnLost metric.Int64Counter
 }
 
 // newOpsMetrics constructs all five instruments against meter -- the SAME
@@ -295,7 +316,37 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		return opsMetrics{}, fmt.Errorf("sessionactor: construct sandbox_boot_evidence_fallback_total counter: %w", err)
 	}
 
+	actorsLive, err := meter.Int64UpDownCounter(
+		"session_actors_live",
+		metric.WithDescription("Session actors this replica hosts right now (§2): each holds one advisory lock on the replica's one lock connection and no query-pool connection. +1 when an actor enters the Registry, -1 when it leaves (idle TTL, stale epoch, shutdown, or a lost lock connection)."),
+		metric.WithUnit("{actor}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct session_actors_live up-down counter: %w", err)
+	}
+
+	hydrations, err := meter.Int64Counter(
+		"session_actor_hydrations",
+		metric.WithDescription("Session actor hydrations on this replica (§2), by outcome: ok; elsewhere (another replica holds the session's advisory lock); unavailable (the query pool stayed saturated for ActorHydrateTimeout, or the lock connection could not be dialled or was lost -- retryable); error (anything else)."),
+		metric.WithUnit("{hydration}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct session_actor_hydrations counter: %w", err)
+	}
+
+	lockConnLost, err := meter.Int64Counter(
+		"session_actor_lock_conn_lost",
+		metric.WithDescription("Times this replica lost the one Postgres connection holding every one of its session actors' advisory locks (§2, §5.1). Each loss stops every actor the replica hosted; each rehydrates on its session's next command."),
+		metric.WithUnit("{connection}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct session_actor_lock_conn_lost counter: %w", err)
+	}
+
 	return opsMetrics{
+		actorsLive:           actorsLive,
+		hydrations:           hydrations,
+		lockConnLost:         lockConnLost,
 		spawnDuration:        spawnDuration,
 		livenessGap:          livenessGap,
 		watchdogActivation:   watchdogActivation,
@@ -308,6 +359,30 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		rolloutRefused:       rolloutRefused,
 		bootEvidenceFallback: bootEvidenceFallback,
 	}, nil
+}
+
+// addActorsLive moves session_actors_live by delta.
+func (m opsMetrics) addActorsLive(ctx context.Context, delta int64) {
+	if m.actorsLive == nil || delta == 0 {
+		return
+	}
+	m.actorsLive.Add(ctx, delta)
+}
+
+// recordHydration counts one hydration attempt under outcome.
+func (m opsMetrics) recordHydration(ctx context.Context, outcome string) {
+	if m.hydrations == nil {
+		return
+	}
+	m.hydrations.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
+}
+
+// recordLockConnLost counts one lost lock connection.
+func (m opsMetrics) recordLockConnLost(ctx context.Context) {
+	if m.lockConnLost == nil {
+		return
+	}
+	m.lockConnLost.Add(ctx, 1)
 }
 
 // recordBootEvidenceFallback increments sandbox_boot_evidence_fallback_total

@@ -391,8 +391,8 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 	// (actor.go) only ever uses its own ctx parameter to bound the mailbox
 	// enqueue, never threading it into command handling -- every command
 	// this Actor ever processes, including this one, runs on run(ctx)'s
-	// own process-lifetime ctx (Registry.GetOrSpawn's r.lifecycleCtx,
-	// registry.go), not the caller's.
+	// own actor-lifetime ctx (derived from the Registry's r.lifecycleCtx
+	// by Registry.start, registry.go), not the caller's.
 	//
 	// The fix: turns.correlation_id (migrations/000121) is the per-TURN
 	// fact that request-time ctx propagation cannot reach here anyway --

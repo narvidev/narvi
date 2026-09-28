@@ -2,9 +2,11 @@ package wshub
 
 import (
 	"errors"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/coder/websocket"
 	"github.com/go-chi/chi/v5"
@@ -57,7 +59,12 @@ import (
 //     is NOT one of wsbridge's own 4 "fatal" statuses, so its own
 //     already-built exponential-backoff reconnect loop is exactly the
 //     right fallback -- "try again, maybe once this pod frees the lock or
-//     another pod picks it up"); any other GetOrSpawn error -> 500.
+//     another pod picks it up"); ErrActorUnavailable -> 503 with
+//     Retry-After set to ActorHydrateTimeout in whole seconds, at least
+//     one (this replica could not hydrate the actor within that bound --
+//     its query pool stayed saturated, or its lock connection is down --
+//     and has released any lock it took, so a reconnect after the pause
+//     may land here or elsewhere); any other GetOrSpawn error -> 500.
 //  11. websocket.Accept, then the read/dispatch loop (dispatch.go) runs
 //     until conn.Read errors or ctx is done.
 func NewSandboxHandler(registry *sessionactor.Registry, sandboxes *postgres.SandboxStore, commander *SandboxRegistry, timeouts platform.Timeouts) http.HandlerFunc {
@@ -152,6 +159,12 @@ func NewSandboxHandler(registry *sessionactor.Registry, sandboxes *postgres.Sand
 				http.Error(w, "session actor owned elsewhere", http.StatusServiceUnavailable)
 				return
 			}
+			if errors.Is(err, sessionactor.ErrActorUnavailable) {
+				logger.Warn("wshub: session actor unavailable on this replica; asking the sandbox to reconnect later", "error", err)
+				setRetryAfter(w, timeouts.ActorHydrateTimeout)
+				http.Error(w, "session actor unavailable", http.StatusServiceUnavailable)
+				return
+			}
 			logger.Error("wshub: GetOrSpawn failed", "error", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 			return
@@ -199,4 +212,15 @@ func bearerToken(r *http.Request) (string, bool) {
 		return "", false
 	}
 	return token, true
+}
+
+// setRetryAfter sets Retry-After to retryAfter in whole seconds, rounded
+// up, and never below one -- mcpauth's own setRetryAfter, for the sandbox
+// handshake's 503 (step 10 above).
+func setRetryAfter(w http.ResponseWriter, retryAfter time.Duration) {
+	seconds := int64(math.Ceil(retryAfter.Seconds()))
+	if seconds < 1 {
+		seconds = 1
+	}
+	w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
 }

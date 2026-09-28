@@ -137,28 +137,30 @@ const defaultHTTPAddr = ":8080"
 // Exists because pgxpool's OWN default -- unset MaxConns resolves to
 // max(4, runtime.NumCPU()), confirmed against the vendored
 // github.com/jackc/pgx/v5@v5.10.0/pgxpool/pool.go source -- ties pool size
-// to host core count, not to this control plane's actual concurrency
-// needs. That default is a real, already-documented risk here, not a
-// hypothetical one: internal/app/sessionactor's own hydrateAndAcquire
-// (hydrate.go) pins ONE pool connection per live session Actor for that
-// Actor's entire lifetime (holding a Postgres advisory lock), never
-// released until ActorIdleTTL fires (30 min, §2) or the process shuts
-// down -- and internal/adapters/inbound/github's own coalesce.go carries
-// an identical warning ("this is NOT hypothetical") about the same
-// small-fixed-default risk in a different call path. A small container
-// (1-2 CPUs) left on the pgx default could exhaust its own pool once a
-// handful of sessions are concurrently active, and Registry.
-// hydrateAndAcquire's own pool.Acquire(ctx) call has no bounded timeout of
-// its own -- it would then hang rather than fail fast, inheriting
-// whichever caller ctx it was given (an HTTP request's, in the
-// CreateSession/CreateTurn paths that call TriggerDispatch synchronously).
+// to host core count, not to this control plane's actual query
+// concurrency. The pool serves queries only: session actors hold none of
+// its connections (§2, §5.1) -- every actor's advisory lock lives on one
+// separate lock connection per replica (internal/app/sessionactor/
+// lockholder.go), and hydrating an actor waits for a pool connection at
+// most ActorHydrateTimeout before failing with the retryable
+// sessionactor.ErrActorUnavailable. A pool too small for its query load
+// therefore queues and fails bounded hydrations rather than wedging the
+// replica; it no longer fills up with sessions. (A small fixed default is
+// a real risk on other paths too: internal/adapters/inbound/github's own
+// coalesce.go carries the same warning for a call path of its own.) Each
+// replica opens this
+// many connections plus that one lock connection, so the fleet needs
+// replicas × (NARVI_DB_POOL_MAX_CONNS + 1) under Postgres's
+// max_connections, with headroom -- logged against the server's limits
+// at boot (controlplane's checkConnectionBudget).
 const dbPoolMaxConnsEnvVarName = "NARVI_DB_POOL_MAX_CONNS"
 
 // defaultDBPoolMaxConns is the NARVI_DB_POOL_MAX_CONNS value Load assumes
 // when the variable is unset -- a fixed, documented floor (not specified by
 // the plan; chosen as comfortably larger than pgx's own CPU-tied default,
-// and Postgres's own common max_connections=100 default leaves ample room
-// for it), so a self-hosted deploy that never discovers this knob still
+// and Postgres's own common max_connections=100 default leaves room for it
+// plus each replica's one lock connection, for a few replicas), so a
+// self-hosted deploy that never discovers this knob still
 // gets a pool sized independently of host core count, matching
 // dbPoolMaxConnsEnvVarName's own doc comment above for the full reasoning.
 const defaultDBPoolMaxConns = 20
