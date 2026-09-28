@@ -69,6 +69,7 @@ import (
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/shadowledger"
@@ -547,7 +548,7 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 	// handed a read-only credential (internal/adapters/inbound/httpapi's
 	// ScmCredentials), so this is not the only guard -- it is the one
 	// that keeps the control plane from asking.
-	review, err := a.isReviewSession(ctx, tx)
+	review, err := a.isReviewSession(ctx, a.stores.githubPRSession.WithTx(tx))
 	if err != nil {
 		return nil, err
 	}
@@ -657,11 +658,14 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 // GitHub ingress writes in the same transaction that creates the session
 // (internal/adapters/inbound/github's coalesce.go) and which is never
 // moved to another session. internal/adapters/inbound/httpapi's
-// ScmCredentials asks the same question of the same table. A genuine
-// lookup failure is an error, never "not a review session": the caller is
-// deciding whether a push may be sent, and that decision fails closed.
-func (a *Actor) isReviewSession(ctx context.Context, tx pgx.Tx) (bool, error) {
-	_, err := a.stores.githubPRSession.WithTx(tx).GetBySessionID(ctx, a.sessionID)
+// ScmCredentials asks the same question of the same table. prSessions is
+// the store to ask: bound to the caller's transaction where it has one. A
+// genuine lookup failure is an error, never "not a review session": both
+// callers are deciding whether something may reach the code host -- a
+// push (completeProcessingTurn), a pull request (createPRBestEffort) --
+// and that decision fails closed.
+func (a *Actor) isReviewSession(ctx context.Context, prSessions *postgres.GitHubPRSessionStore) (bool, error) {
+	_, err := prSessions.GetBySessionID(ctx, a.sessionID)
 	switch {
 	case err == nil:
 		return true, nil
@@ -1069,6 +1073,23 @@ func redactedURLIdentity(rawURL string) string {
 // request.
 func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
 	defer a.endPRDeliveryBestEffort(ctx)
+
+	// A pull request's review session never opens a pull request: it is
+	// read-only (completeProcessingTurn sends it no push command, for the
+	// same reason). So a push_complete for one opens nothing here -- no
+	// pull request, no artifact, no preview and so no commit status, no
+	// handoff check -- whatever the event reports. Asked first, before the
+	// event is even decoded, and failing closed: a lookup that errors
+	// opens nothing either.
+	review, err := a.isReviewSession(ctx, a.stores.githubPRSession)
+	if err != nil {
+		a.logger.Error("sessionactor: review-session lookup for PR creation failed; opening nothing (fail-closed)", "error", err)
+		return
+	}
+	if review {
+		a.logger.Warn("sessionactor: push_complete arrived for a pull request's review session, which never opens a pull request; opening nothing")
+		return
+	}
 
 	if a.sourceControl == nil {
 		a.logger.Warn("sessionactor: push_complete arrived but no SourceControl is configured; skipping PR creation")

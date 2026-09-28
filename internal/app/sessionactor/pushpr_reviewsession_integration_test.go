@@ -14,6 +14,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -245,5 +246,170 @@ func TestCompleteProcessingTurn_ReviewSessionNeverPushes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// deliverPushCompleteAndDrain delivers one push_complete reporting repoName
+// pushed on branch at sha, then delivers the same event again. The pull
+// request and its preview are created after the first delivery's reply,
+// still inside that delivery's handling, and the actor handles one command
+// at a time -- so once the redelivery's reply arrives, whatever the first
+// delivery was going to open has been opened. The redelivery itself opens
+// nothing: its message id is already persisted.
+func deliverPushCompleteAndDrain(ctx context.Context, t *testing.T, a *Actor, sessionID pgtype.UUID, repoName, branch, sha string) {
+	t.Helper()
+	messageID := uuid.NewString()
+	raw := pushCompleteRawWithMessageID(t, messageID, sessionID.String(), 1, repoName, branch, sha)
+	for i := 0; i < 2; i++ {
+		outcome := sendSandboxEventForTest(ctx, t, a, SandboxEvent{Type: "push_complete", Gen: 1, MessageID: messageID, Raw: raw})
+		if !outcome.Persisted {
+			t.Fatalf("push_complete delivery %d was not persisted", i+1)
+		}
+	}
+}
+
+// TestCreatePRBestEffort_ReviewSessionNeverOpensAPullRequest: a pull
+// request's review session never opens a pull request. A push_complete
+// delivered to one opens no pull request (neither created nor suppressed),
+// records no artifact, and enqueues no preview -- no rwx_preview_dispatch
+// and no github_preview_link, the commit status a preview posts. The
+// repository is live, its preview is configured and the creator has a
+// usable GitHub token: every condition under which any other session opens
+// both. The control row is the same fixture without the github_pr_sessions
+// row, and must open one pull request and enqueue its preview: it proves
+// this harness observes both when they happen. The last row fails closed:
+// when the review-session lookup itself fails, nothing is opened either,
+// although the session has no github_pr_sessions row at all.
+func TestCreatePRBestEffort_ReviewSessionNeverOpensAPullRequest(t *testing.T) {
+	const pushedSHA = "cafef00d00000000000000000000000000000000"
+	tests := []struct {
+		name string
+		// review: the session has a github_pr_sessions row.
+		review bool
+		// lookupFails: the github_pr_sessions table is unreadable while
+		// the push_complete is handled.
+		lookupFails bool
+		wantOpened  bool
+	}{
+		{name: "control: not a review session", wantOpened: true},
+		{name: "review session", review: true},
+		{name: "the review-session lookup fails: fail closed", lookupFails: true},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+
+			user := setUpPreviewTestUserAndIdentity(ctx, t, pool, "review-pr-creator")
+			repoFullName := "review-pr-acme/repo-" + uuid.NewString()[:8]
+			session, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{
+				SpawnSource: sqlcgen.SessionSpawnSourceGithub,
+				CreatedBy:   user.ID,
+				Repos:       reposJSONForTest(t, "repo", "https://github.com/"+repoFullName+".git", reviewPushSessionBranch),
+			})
+			if err != nil {
+				t.Fatalf("create session: %v", err)
+			}
+			if tc.review {
+				prSessions := narvipg.NewGitHubPRSessionStore(pool)
+				prNumber := int32(200 + i)
+				if err := prSessions.EnsureRow(ctx, repoFullName, prNumber); err != nil {
+					t.Fatalf("ensure github_pr_sessions row: %v", err)
+				}
+				if err := prSessions.SetSessionID(ctx, repoFullName, prNumber, session.ID); err != nil {
+					t.Fatalf("set github_pr_sessions session id: %v", err)
+				}
+			}
+			repoSettings := narvipg.NewRepoSettingsStore(pool)
+			if _, err := repoSettings.UpsertLiveEgressEnabled(ctx, repoFullName, true); err != nil {
+				t.Fatalf("promote repo to live egress: %v", err)
+			}
+			if _, err := repoSettings.UpsertPreviewSettings(ctx, repoFullName, "preview-build", "myapp-pr-{pr}", "review-pr-org"); err != nil {
+				t.Fatalf("configure the repository's preview: %v", err)
+			}
+			if _, err := narvipg.NewSandboxStore(pool).Create(ctx, session.ID); err != nil {
+				t.Fatalf("create sandbox: %v", err)
+			}
+
+			sourceControl := &fakeSourceControl{
+				nextRef:           ports.PRRef{Number: 99, URL: "https://github.com/" + repoFullName + "/pull/99"},
+				defaultBranchName: "main",
+			}
+			r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false)
+			if err != nil {
+				t.Fatalf("NewRegistry: %v", err)
+			}
+			t.Cleanup(func() { _ = r.Shutdown() })
+			a, err := r.GetOrSpawn(ctx, session.ID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+
+			if tc.lookupFails {
+				// Renamed away for the delivery only, and restored before
+				// this test's own database reset runs (cleanups run last
+				// in, first out; the pool's reset was registered first).
+				renameGitHubPRSessionsAway(ctx, t, pool)
+				deliverPushCompleteAndDrain(ctx, t, a, session.ID, "repo", reviewPushSessionBranch, pushedSHA)
+				restoreGitHubPRSessions(ctx, t, pool)
+			} else {
+				deliverPushCompleteAndDrain(ctx, t, a, session.ID, "repo", reviewPushSessionBranch, pushedSHA)
+			}
+
+			artifacts, err := narvipg.NewArtifactStore(pool).ListForSession(ctx, session.ID)
+			if err != nil {
+				t.Fatalf("list artifacts: %v", err)
+			}
+			dispatches := getOutboxRowsForSessionByKind(ctx, t, pool, session.ID, ports.NotificationKindRWXPreviewDispatch)
+			links := getOutboxRowsForSessionByKind(ctx, t, pool, session.ID, ports.NotificationKindGitHubPreviewLink)
+
+			if tc.wantOpened {
+				if got := sourceControl.callCount(); got != 1 {
+					t.Fatalf("CreatePR called %d times, want 1", got)
+				}
+				if len(artifacts) != 2 || len(dispatches) != 1 || len(links) != 1 {
+					t.Fatalf("artifacts = %d, rwx_preview_dispatch = %d, github_preview_link = %d; want 2 (pr, preview), 1 and 1", len(artifacts), len(dispatches), len(links))
+				}
+				return
+			}
+			if got := sourceControl.callCount(); got != 0 {
+				t.Errorf("CreatePR called %d times, want 0: a review session never opens a pull request", got)
+			}
+			if got := sourceControl.suppressCallCount(); got != 0 {
+				t.Errorf("SuppressCreatePR called %d times, want 0: there is no pull request to suppress either", got)
+			}
+			if len(artifacts) != 0 {
+				t.Errorf("%d artifacts recorded (first: %s %s), want none", len(artifacts), artifacts[0].Type, artifacts[0].Url)
+			}
+			if len(dispatches) != 0 || len(links) != 0 {
+				t.Errorf("rwx_preview_dispatch = %d, github_preview_link = %d; want no preview enqueued", len(dispatches), len(links))
+			}
+		})
+	}
+}
+
+// renameGitHubPRSessionsAway makes every read of github_pr_sessions fail
+// with a genuine query error -- not pgx.ErrNoRows -- until
+// restoreGitHubPRSessions. A t.Cleanup restores it too, in case the test
+// fails in between; it runs before the shared database's own reset, which
+// was registered earlier. No integration test in this package runs in
+// parallel, so no other test can observe the table missing.
+func renameGitHubPRSessionsAway(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `ALTER TABLE github_pr_sessions RENAME TO github_pr_sessions_unreadable_for_test`); err != nil {
+		t.Fatalf("rename github_pr_sessions away: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := pool.Exec(context.Background(), `ALTER TABLE IF EXISTS github_pr_sessions_unreadable_for_test RENAME TO github_pr_sessions`); err != nil {
+			t.Errorf("restore github_pr_sessions: %v", err)
+		}
+	})
+}
+
+// restoreGitHubPRSessions undoes renameGitHubPRSessionsAway.
+func restoreGitHubPRSessions(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `ALTER TABLE github_pr_sessions_unreadable_for_test RENAME TO github_pr_sessions`); err != nil {
+		t.Fatalf("restore github_pr_sessions: %v", err)
 	}
 }
