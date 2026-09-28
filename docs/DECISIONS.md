@@ -43,7 +43,19 @@ to adopt, and an entry that leaves with `reject` and a reason has done its job.
 | What the check says when enforcement is off | **Exactly what it says when enforcement is on** (2026-09-18). A check that gates nothing is still a statement to every human reading the pull request | Step 174 |
 | Whether browser-side errors and user feedback are captured | **Adopt** (2026-09-17). Server traces do not cover browser failures; reading them as coverage would be a capability claimed by adjacency | Step 185 |
 | Whether session replay is adopted | **Adopt** (2026-09-17), decided separately from the line above because it is a choice about other people's data. Masking, activation and per-deployment data destination are all open inside the Step | Step 186 |
-| Whether `ProviderFailureDiagnostic.Message` (§7.3) retains a provider's own error text verbatim, even when the provider echoes request content or a masked credential fragment back into it | **Retained verbatim** (2026-09-22). Less diagnostic information is the wrong direction for an allowlist built specifically so a support conversation with the provider is possible at all; the plan row's own "neither credentials nor request content" exit criterion is met a different way — containment is JSON-string encoding at the wire/journal boundary (`json.Marshal`'s default HTML-escaping, `translate.go`), never redacting or truncating text on suspicion, since Message is untrusted PROVIDER output, not this adapter's own construction. `buildProviderFailureDiagnostic` (internal/adapters/outbound/opencode/diagnostic.go) copies `err.Data.Message` unfiltered; `hostileProviderMessage` (internal/adapters/outbound/opencode/diagnostic_test.go) is the regression test pinning it, exercised through the same real json.Unmarshal→build→marshal path the credential-allowlist test uses. Reverses if a real provider is ever observed constructing an error message FROM raw upstream secret material it should not have echoed at all, rather than merely reflecting content already visible to the requester (a request header, a fragment of the prompt) back at them — that is a different, worse failure mode a verbatim policy cannot answer for | Step 177 |
+| Whether `ProviderFailureDiagnostic.Message` (§7.3) retains a provider's own error text verbatim, even when the provider echoes request content or a masked credential fragment back into it | **Retained verbatim** (2026-09-22). Less diagnostic information is the wrong direction for an allowlist built specifically so a support conversation with the provider is possible at all; the plan row's own "neither credentials nor request content" exit criterion is met a different way — containment is JSON-string encoding at the wire/journal boundary (`json.Marshal`'s default HTML-escaping, `translate.go`), never redacting or truncating text on suspicion, since Message is untrusted PROVIDER output, not this adapter's own construction. `buildProviderFailureDiagnostic` (internal/adapters/outbound/opencode/diagnostic.go) copies `err.Data.Message` unfiltered; `hostileProviderMessage` (internal/adapters/outbound/opencode/diagnostic_test.go) is the regression test pinning it, exercised through the same real json.Unmarshal→build→marshal path the credential-allowlist test uses. Reverses if a real provider is ever observed constructing an error message FROM raw provider-side secret material it should not have echoed at all, rather than merely reflecting content already visible to the requester (a request header, a fragment of the prompt) back at them — that is a different, worse failure mode a verbatim policy cannot answer for | Step 177 |
+| Whether this deployment runs a pool of GitHub Apps | **Adopt** (2026-09-25), without waiting for a measured saturation. Justified in this design by roles one credential cannot hold (a check run can only be created by an App, and the one App this deployment mints for must stay read-only for §30.4), by rotation without an outage, and by one identity for each kind of write; adding Apps for rate-limit headroom is the operator's choice, recorded below | Phase 20 (Steps 190-197), §44 |
+| Whether review quality is measured from a human's ruling on each finding (D-10) | **Adopt** (2026-09-28): a ruling per finding with a precision role per value, the measures recorded where they happen, and readouts that state their populations. Most of the mechanisms this needs already exist here; the defects found in them are Phase 11 rows | Steps 206-208, §21.5 |
+| Whether a second agent runtime and provider accounts are adopted (D-11) | **Adopt** (2026-09-28), same request. A reading of the provider's terms on subscription credentials comes before any code (Step 209); a real turn on the real SDK in CI is the adapter's first exit criterion (Step 210); an account a user connects, subscription or API key, is used only where its owner selected it, never by automatic resolution | Steps 209-211, §45 |
+| Whether Apps may be added to the pool for rate-limit headroom | **The operator's choice** (2026-09-28). The pool stays justified by roles; the runbook states the choice beside Section H of GitHub's Terms of Service, and the plan neither promises nor forbids it | Step 197, §44.1 |
+| Which way an unreadable diff routes | **Deep** (2026-09-28). A missing size costs a thorough review, a missing scope costs a finding; §26.3's fail-open-to-light rule stays for the router's own errors | Step 199, §26.3 |
+| Whether an unresolved review conversation blocks auto-merge eligibility | **Yes**, through a per-repository setting on by default (2026-09-28), so repositories without GitHub's conversation-resolution rule are covered too; a thread this system started with no human reply does not count | Step 215, §21.2 |
+| Whether a train may be replanned | **Yes, on a human's explicit request** (2026-09-28): only links not yet started are replaced, started ones stay immutable, refused while a spawn is claimed | Step 147, §39.5b |
+| What a session created over MCP records as its source | **`spawn_source = mcp`** (2026-09-28), set by the server from the MCP grant the /mcp authentication attaches, never from the request or the principal's credential type; opened among the contracts' open enums by a prior PR, then the migration. Rejected: recording it as `web`, which makes an MCP client's sessions indistinguishable from the browser's | Step 183, §43.1 |
+| Whether a narrowed review request may stand for the whole pull request (D-13) | **Never** (2026-09-28). One rule, recorded once, gives each verdict its kind from the turn it is attributed to; a follow-up mention is whole only when its text is exactly the re-run command, never by a model's reading; the mention that opens a review session is always a whole review, its text carried as a question; every reader reads whole verdicts only | Step 212, §21.1b |
+| Whether a verdict's findings go inline on the diff (D-09) | **Adopt** (2026-09-28), in the same write as the formal review | Step 213 |
+| Whether a stack layer may be re-reviewed as a delta when only its ancestors moved (D-12) | **Adopt, experimental** (2026-09-28): off by default, capped per period, run in a shadow session of its own beside the full review, which stays the review of record, with no effect but its record, and paired with it in the readout per instruction version; letting a delta replace the full review is a later decision taken on that readout | Step 214, §24.8 |
+| What happens to a pending blocking review once a newer verdict exists | **It is posted as a comment**, its text kept visible as §21.1 keeps a stale result in history, and only once a newer WHOLE verdict has been recorded: a newer attempt that recorded no whole verdict, or a narrowed verdict, never removes a block (2026-09-28, following the review of this plan's own amendment, which had let it fail open) | Step 190, §21.1b |
 
 ## Deferred — and what reopens each
 
@@ -105,6 +117,8 @@ it gates. They are listed here so the set is visible in one place, not so it is 
 | Which cluster, and whether its node pool has the hypervisor capability — that acceptance run is what decides Kata against gVisor, not a preference | Phase 18 entirely | Step 167 |
 | Whether a trigger consults a stack's direct parent or its ultimate target | The stack policy's incremental diff, implemented by Step 142 | §24.8 — the row itself does not raise it |
 | Whether an external client is built at all | Phase 16, which is gated rather than scheduled | Phase 16 preamble |
+| Whether a provider's subscription credentials may drive automated sessions | Step 209's first exit criterion, before any code: a reading of the provider's terms, recorded with its date; API-key accounts only if they forbid it | §45.1, Step 209 |
+| Which sessions may use the pool's `work` role, in particular whether a creator with no linked GitHub identity may push through a bounded App credential | Step 195's first consumer: until decided, the binding is built and exercised by tests only. Left open when OIDC sign-in shipped: such a creator cannot push until they link GitHub. The answer must also say how the push is bounded, since the sandbox never holds a `work` installation token | §44.4, Step 195 |
 
 **What the build decision on mode B turns on.** Step 156 stops being conditional: a hosted
 embeddings provider receiving customer-derived prose is a real egress channel, and the wire-compatible
@@ -116,7 +130,7 @@ only outcome; the build branch is the one that carries more work, not less.
 ## Open, with no home until they are taken
 
 Raised by the documentation-gap inventory under `docs/analyses/`. Each is a capability an
-upstream-parity analysis found and this design does not have. **That an analysis found something is
+analysis found and this design does not have. **That an analysis found something is
 not an argument for adopting it** — these are listed as questions, with what each answer costs,
 because the alternative is that they disappear from tracking and get rediscovered in a year as
 though they were new.
@@ -317,6 +331,114 @@ request path, against whatever delivery history this deployment retains. Until e
 `automation_dispatch_dropped_total` is the honest, shipped mitigation: a drop is now OBSERVABLE
 (alertable via `AutomationDispatchDroppedAny`, deploy/observability/alerts/reliability.json), never
 retried.
+
+### D-09 - Publish a verdict's findings as inline comments on the diff - **ADOPTED 2026-09-28** - see Step 213
+
+Raised on 2026-09-25.
+
+**The question.** Whether a verdict's findings are also posted as inline review comments anchored to
+the commit that was reviewed, and whether a finding this system already raised in an open thread of
+its own is cited rather than posted a second time.
+
+**Why it could not be defaulted.** Today the formal review carries a body and an event, and the body
+is the verdict, with its findings in a collapsed appendix. Inline comments change what a reviewer
+sees on the pull request and open threads that people answer, which this system then has to read
+without ever overwriting a person's conversation.
+
+**What adoption costs, as adopted.** The comments ride the formal review's own create call, so there
+is one write and one receipt, rather than an inline review and a verdict comment written separately
+with the partial state between them accepted; Step 190's create-once write is the
+prerequisite. Anchoring on the commit actually reviewed, with a finding that cannot be anchored still
+readable in the body. Citing an open thread decided from GitHub's live thread state, never from a
+mirror of past webhooks, and never when a person has replied in it. And the review sandbox posts
+nothing itself: every inline write is the server's.
+
+### D-10 - Record a human's ruling on one finding, and measure review quality from it - **ADOPTED 2026-09-28** - see Steps 206-208
+
+Raised on 2026-09-25.
+
+**The question.** Whether a maintainer can rule on an individual finding (false positive, accepted
+risk, policy disagreement, fixed later, duplicate, unverified) as a record of its own, distinct from the
+finding's status; and whether review quality is measured from it: the nature of findings
+(a demonstrated defect against missing coverage), the light or deep routing actually applied, what
+the fact-check pass removed against what it saw, and how often consecutive verdicts repeat a finding.
+
+**Why it cannot be defaulted.** Pieces exist: rebuttals keyed on finding identity (Step 48), learned
+false-positive patterns (Step 63), acceptance of a whole verdict (Step 188), and the review depth
+persisted with each verdict (the triage decision and its reason on the turn), with the fact-check
+outcome. None of them is a ruling on one finding, and an
+accepted risk is not a false positive: folding the two corrupts every precision number built on them.
+
+**As adopted.** Steps 206-208 and §21.5 are authoritative: a ruling vocabulary kept apart from Step
+188's acceptance, denominators recorded where they are observed, each finding's presence in each
+verdict kept as history, and "not measured" kept distinct from zero on every view.
+
+### D-11 - A second agent runtime, and provider accounts managed in the product - **ADOPTED 2026-09-28** - see Steps 209-211
+
+Raised on 2026-09-25.
+
+**The question.** Whether a session or an automation may run on a second agent runtime beside OpenCode
+(one built on a provider's own agent SDK), selected per session or per automation, and whether a model
+provider's accounts, including subscription sign-in, are managed as product objects.
+
+**Why it cannot be defaulted.** The runtime port was designed to take a second adapter (§4.2), so the
+question is not whether one can exist but what parity it must reach before a session may select it:
+the review, stack and auto-fix tools this design gives its agents, credential selection, cancellation
+and resume. The easy shapes are the wrong ones: any signed-in user administering the accounts, the
+first connected account silently becoming the default for sessions that pinned none, a runtime
+missing this design's own tools, and no check running a real turn on it.
+
+**As adopted.** §45 and Steps 209-211 are authoritative. Parity is §45.2's list, declared as an allow
+list and refused at dispatch when missing; an account a user connects, subscription or API key, is
+used only where its owner selected it, never by automatic resolution (§45.1); one real end-to-end turn in CI; and a reading of the
+provider's terms before any account code.
+
+### D-12 - Re-review a stack layer as a delta when only its ancestors moved - **ADOPTED 2026-09-28, experimental** - see Step 214
+
+Raised on 2026-09-28.
+
+**The question.** When an ancestor of a stacked pull request moves and the layer's own patch is
+unchanged, whether the replacement review may be a delta turn: a real review turn whose prompt
+carries the last published whole verdict and the ancestors' diff, asked to assess first
+whether that change can reach this layer and to review in full when it can or when unsure.
+
+**Why it could not be defaulted.** Carrying the verdict forward with no turn when the files are
+disjoint is the tempting shape, and it lets a contract changed in a file the layer does not touch
+(`charge(amountCents)` becoming `charge(amountEuros)`) pass unseen. The delta turn
+answers that objection, but only by instruction: nothing shows the model re-assesses every
+interaction correctly. Nothing here re-reviews a layer on an ancestor's move today either: that
+lifecycle is §24.8's membership routing, which Step 142 builds.
+
+**As adopted.** Step 214 is authoritative: the delta review runs in a shadow session of its own beside
+the full review, which stays the review of record, so neither reads the other's reasoning, nothing
+waits on the experiment, the delta verdict has no effect but its record, and the pair is the
+measurement;
+eligibility read from the last whole verdict's attempt, never the last launch; an identical own patch
+by fingerprint; readable, bounded ancestor diffs; a cap per period; the mode and
+its instructions carried in the verdict's provenance rather than exempted from the policy version. Letting a delta verdict replace the full review is a decision of
+its own, taken later on the paired readout.
+
+### D-13 - A review asked about part of a pull request, and the verdict that covers all of it - **DECIDED 2026-09-28: never** - see Step 212
+
+Raised on 2026-09-28.
+
+**The question.** A mention can narrow what a person wants reviewed ("review only the transfer
+method"), and each mention here dispatches a review turn whose verdict joins the pull request's
+history like any other. Whether such a verdict may become the one §21.1b reads for eligibility, or
+whether a narrowed request is answered without replacing the verdict that covers the whole change.
+
+**Why it could not be defaulted.** A verdict's context records head, base, ancestors and policy, and
+the attempt beside it, but not a scope; and several readers decide by attempt time, so a focused
+verdict would replace the whole one as the current verdict.
+
+**As decided.** Step 212 is authoritative. One rule, applied once by the verdict endpoint and
+recorded, gives a verdict the kind of the turn it is attributed to: whole for a review attempt
+(`turns.is_review_attempt`) that is not a delta turn, delta for a delta turn, narrowed otherwise; the
+kind stays out of the context so two attempts on identical code still share it. A follow-up mention is
+a review attempt only when its whole text after the handle is the re-run command a verdict
+recommends, never by a model's reading. The mention that opens a review session is always a whole
+review, its text carried as a question answered beside it, which is the one case that could otherwise
+let a first "review only X" stand for the whole. Every reader reads whole verdicts only.
 
 ## Recording an outcome
 
