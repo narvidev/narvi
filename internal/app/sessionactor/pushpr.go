@@ -237,9 +237,9 @@ type pushSignal struct {
 	// blockedNoGitHubIdentity (review round 2, finding P1) is the SAME
 	// shape of decision as suppressedInShadow above, for a DIFFERENT
 	// reason: this session's creator passes the §13.3 viewer-guard
-	// staleness recheck but has no linked github identity at all, and
-	// this is not a review session (see
-	// pushBlockedByMissingGitHubIdentity's own doc comment) -- so
+	// staleness recheck but has no linked github identity at all (see
+	// pushBlockedByMissingGitHubIdentity's own doc comment; a review
+	// session never reaches that question, it never pushes) -- so
 	// scmcredentials.go's own step 10 is now certain to 403 the sandbox's
 	// credential fetch, unconditionally, no bot/service-account fallback
 	// existing for this case any more. Sending the push command anyway
@@ -536,6 +536,25 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 		return nil, nil
 	}
 
+	// A pull request's review session is read-only: it never pushes. Its
+	// repos[].branch is the pull request's head ref, which it checks out
+	// to read, never a branch it owns. Decided here, the one place a push
+	// cycle begins, and before anything below records one: no egress
+	// decision, no suppressed-push ledger row (nothing was suppressed),
+	// no push-blocked warning, no delivery stamp, and no signal for
+	// sendPushBestEffort. A review's output reaches GitHub through the
+	// verdict path, never through git. Its sandbox is also only ever
+	// handed a read-only credential (internal/adapters/inbound/httpapi's
+	// ScmCredentials), so this is not the only guard -- it is the one
+	// that keeps the control plane from asking.
+	review, err := a.isReviewSession(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+	if review {
+		return nil, nil
+	}
+
 	repos, err := reposFromJSON(sessionRow.Repos)
 	if err != nil {
 		return nil, err
@@ -585,7 +604,7 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 		return &pushSignal{gen: int(sandboxRow.Gen), repos: repos, suppressedInShadow: true}, nil
 	}
 
-	// Review round 2, finding P1: a live, non-review session whose
+	// Review round 2, finding P1: a live session whose
 	// creator has no linked github identity is now certain to have its
 	// push denied by scmcredentials.go's own step 10 (no bot/
 	// service-account fallback exists for that case any more -- see that
@@ -604,7 +623,7 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 	// per-repo skip already makes that a no-op send, exactly as it always
 	// was.
 	if anyRepoHasExplicitBranch(repos) {
-		blocked, err := a.pushBlockedByMissingGitHubIdentity(ctx, tx, sessionRow.CreatedBy)
+		blocked, err := a.pushBlockedByMissingGitHubIdentity(ctx, sessionRow.CreatedBy)
 		if err != nil {
 			return nil, err
 		}
@@ -633,30 +652,40 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 	return &pushSignal{gen: int(sandboxRow.Gen), repos: repos}, nil
 }
 
+// isReviewSession reports whether this actor's session is a pull
+// request's review session: one with a github_pr_sessions row, which
+// GitHub ingress writes in the same transaction that creates the session
+// (internal/adapters/inbound/github's coalesce.go) and which is never
+// moved to another session. internal/adapters/inbound/httpapi's
+// ScmCredentials asks the same question of the same table. A genuine
+// lookup failure is an error, never "not a review session": the caller is
+// deciding whether a push may be sent, and that decision fails closed.
+func (a *Actor) isReviewSession(ctx context.Context, tx pgx.Tx) (bool, error) {
+	_, err := a.stores.githubPRSession.WithTx(tx).GetBySessionID(ctx, a.sessionID)
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, pgx.ErrNoRows):
+		return false, nil
+	default:
+		return false, fmt.Errorf("sessionactor: get github pr session: %w", err)
+	}
+}
+
 // pushBlockedByMissingGitHubIdentity reports whether this turn's push is
 // certain to be denied by internal/adapters/inbound/httpapi's own
 // scmcredentials.go ScmCredentials handler, step 10 (review round 2,
-// finding P1): true only for a session that is NOT a review session (a
-// review session's own github_pr_sessions row makes ScmCredentials mint
-// the bot token unconditionally instead, that handler's own step 7 -- see
-// its doc comment) AND whose creator passes the SAME §13.3 viewer-guard
-// staleness recheck creatorMayGetPRAttribution already performs (a
-// disabled/viewer/missing creator is denied for THAT unrelated reason,
-// never reaching step 10 at all) but has no linked github identity, at
-// all, for provider=github (creatorHasNoGitHubIdentity). Deliberately
-// reuses both of those already-established helpers rather than
-// re-deriving their logic a third time -- this function's own value is
-// purely in combining them with the review-session check, matching
-// ScmCredentials' own step ordering (7, then 9, then 10) exactly.
-func (a *Actor) pushBlockedByMissingGitHubIdentity(ctx context.Context, tx pgx.Tx, createdBy pgtype.UUID) (bool, error) {
-	if _, err := a.stores.githubPRSession.WithTx(tx).GetBySessionID(ctx, a.sessionID); err == nil {
-		// A review session: ScmCredentials' own step 7 always mints the
-		// bot token for it, regardless of the creator's own identity.
-		return false, nil
-	} else if !errors.Is(err, pgx.ErrNoRows) {
-		return false, fmt.Errorf("sessionactor: get github pr session: %w", err)
-	}
-
+// finding P1): true only for a session whose creator passes the SAME
+// §13.3 viewer-guard staleness recheck creatorMayGetPRAttribution already
+// performs (a disabled/viewer/missing creator is denied for THAT
+// unrelated reason, never reaching step 10 at all) but has no linked
+// github identity, at all, for provider=github
+// (creatorHasNoGitHubIdentity). Deliberately reuses both of those
+// already-established helpers rather than re-deriving their logic a
+// third time. Only ever asked about a session that is not a review
+// session: completeProcessingTurn returns before this for one, since a
+// review session never pushes at all.
+func (a *Actor) pushBlockedByMissingGitHubIdentity(ctx context.Context, createdBy pgtype.UUID) (bool, error) {
 	if !a.creatorMayGetPRAttribution(ctx, createdBy) {
 		// Denied for an unrelated reason (no creator at all, disabled, or
 		// viewer) -- ScmCredentials' own step 8/9 would deny this before
