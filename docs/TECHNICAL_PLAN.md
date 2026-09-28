@@ -6750,6 +6750,78 @@ declaring a capability false — 167 because a provider without it is a shared k
 §27.6's fail-closed rule leaves an `allowlist` Environment unspawnable until it lands. 169 and 170 are
 independent of each other and gate nothing. Scenario 16 gates the phase.
 
+### 42.9 Alternative studied: Agent Substrate, and AX above it
+
+Studied on 2026-09-28 against both projects' code (google/ax at `ac23328`, agent-substrate/substrate
+at `c7dbe9d6`); nothing was deployed or measured. Recorded here so the question is answered once and
+not reopened each time either project is announced. It changes none of Steps 166-170.
+
+**What each project is.** Agent Substrate is a Kubernetes-hosted runtime that multiplexes many
+"actors" (sandboxed workloads) onto a smaller pool of pre-started worker pods. It creates, suspends
+(a checkpoint streamed to object storage), resumes (possibly on another worker) and deletes actors,
+runs them under gVisor or a microVM (Kata on Cloud Hypervisor), resumes a suspended actor when a
+request reaches its ingress router, and sends every actor's outbound traffic through its own egress
+gateway. AX (Google's "Agent Executor") is a control plane on top of it: an `ax-server` keeping its
+own state and locks in Redis, `Task`/`Workspace`/`Model` resources, and an in-sandbox runner that
+clones repositories and runs one command. Substrate's own README presents AX as a project that
+demonstrates building on Substrate.
+
+**AX: rejected as a layer, not merely deferred.** Everything this provider could want from the pair
+lives in Substrate; AX's own Substrate client is one file of about 500 lines. What AX adds, this
+system already owns: the sandbox lifecycle (§3.2) with its state in Postgres (§5.1), and environment
+preparation (§19, §27). What AX takes away is what would make Substrate worth having. It fixes every
+actor to data-only snapshots with a cold process start on resume (`SNAPSHOT_CONTENT_SCOPE_DATA`,
+`RESUME_SOURCE_GOLDEN`), hard-codes gVisor, uses neither the egress policy nor credential injection,
+does not pass a task's CPU and memory limits on to Substrate, and never reports the task command's
+exit: the runner logs it, and nothing writes the `Completed` phase AX's own watch waits for. It pins
+Substrate's API as of 2026-09-18 and uses two message types Substrate renamed on 2026-09-22 and
+2026-09-23. Behind `SandboxProvider` it would be a third state store between this system and the
+sandbox, for no capability gained.
+
+**Agent Substrate: a candidate for what runs this provider's sandboxes, not adopted.** Mapped onto
+this section, it changes four answers, each one a capability the pod design declares absent:
+
+- **Snapshots and resume** (§42.1, §42.3): full snapshots (memory, root filesystem, durable data) or
+  data-only ones. A tagged snapshot seeded into a new actor matches §3.2's "restore = new gen", and
+  resuming the same actor matches `ResumeSandbox`. The provider could report `Snapshots: true` and
+  `Resume: true`, where the pod design reports `false` for both and runs `setup.sh` on every spawn
+  (§42.5).
+- **Egress** (§42.4): a per-actor `EgressPolicy` of hostname rules, deny by default, enforced at
+  Substrate's gateway rather than by the CNI, so a hostname allowlist would not depend on Cilium.
+  Protocols where the server speaks first, git over SSH among them, are not supported.
+- **Credentials**: the gateway can replace a placeholder request header with a secret it resolves
+  itself, so the token a `git push` uses need never enter the sandbox.
+- **Isolation** (§42.3): gVisor or a Kata microVM, never `runc`. The microVM class needs `/dev/kvm`,
+  the same node-pool fact Step 167 establishes.
+
+The costs, each a change to this section rather than an adapter detail:
+
+- **No per-actor configuration.** Environment variables live in an immutable `ActorTemplate` (at most
+  32, one golden snapshot per template), so §42.2's one `Secret` per sandbox has no equivalent and
+  `SESSION_CONFIG` delivery needs a design of its own.
+- **No per-actor lifetime cap.** §42.2's `activeDeadlineSeconds` has no equivalent; §35's deadline
+  would be this system's alone to enforce.
+- **No authorization on Substrate's control API** as of this study: any authenticated caller controls
+  every actor, snapshot and egress policy in the installation.
+- **Heavier prerequisites**: Kubernetes 1.36 with two beta APIs (`podcertificaterequests`,
+  `clustertrustbundles`) enabled at cluster creation, or 1.37 and later; object storage for
+  snapshots; a Postgres of its own.
+- **Previews** (§42.5) are routed by an `ate-target-actor` header, so a wildcard-host preview needs a
+  front proxy that maps the host to the header.
+- **Maturity**: pre-1.0, its API renamed twice in the week before this study, and an architecture
+  document that calls much of itself aspirational.
+
+**Decision.** Steps 166-170 stand as written: they depend on stable Kubernetes APIs only, and nothing
+above is needed to ship them. Substrate is re-examined when Phase 18 opens; the reopen condition is
+recorded in docs/DECISIONS.md's deferred register. If it is prototyped, it is as a `SandboxProvider`
+adapter that talks to Substrate directly, never through AX, and the prototype is done when:
+`SESSION_CONFIG` reaches the sandbox without a secret in any `ActorTemplate`; `sandbox-agent`
+reconnects after a full restore on another worker and the old gen is refused (§6.1's 403); from
+inside the sandbox the control plane and the git host are reachable and any other host is refused;
+a `git push` succeeds through an injected credential while the token is absent from the sandbox; and
+suspend and resume latency, snapshot size on a real workspace with its dependencies installed, and
+the cost of an idle session have been measured.
+
 ## 43. The MCP surface
 
 §27 ("Enterprise sandbox glue") is where rows 180-183 point today, and it is the wrong section: §27's
