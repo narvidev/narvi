@@ -267,6 +267,43 @@ type Timeouts struct {
 	// reasonably quickly.
 	TimerClaimDuration time.Duration
 
+	// The session actor's lock connection and hydration bound (§2, §5.1).
+	// A replica holds every one of its actors' advisory locks on ONE
+	// dedicated connection outside its query pool
+	// (internal/app/sessionactor/lockholder.go), so hosting sessions never
+	// takes a query connection. Unlike the fields above, these three are
+	// linked -- to each other and to TimerClaimDuration -- by Validate,
+	// with no margin: they are a second apart at most, and each link is an
+	// ordering, not a race. The values are not in the plan; they are chosen.
+
+	// ActorHydrateTimeout bounds one whole hydration (Registry.GetOrSpawn
+	// for a session this replica does not yet host): the advisory lock,
+	// the epoch bump and the three reads that load the actor's state,
+	// including the wait of a caller that joined a hydration already in
+	// flight for the same session. Past it, GetOrSpawn fails with the
+	// retryable sessionactor.ErrActorUnavailable instead of waiting on a
+	// saturated query pool. 2 s: a healthy hydration is five round trips,
+	// milliseconds, and 2 s stays inside the shortest synchronous webhook
+	// deadline on the paths that hydrate. A lock statement already in
+	// flight when the bound expires runs to its own bound
+	// (ActorLockStatementTimeout) rather than being cut short: cancelling
+	// a statement mid-flight breaks the connection, and with it every
+	// other actor's lock.
+	ActorHydrateTimeout time.Duration
+
+	// ActorLockStatementTimeout bounds each statement on the lock
+	// connection -- lock, unlock, probe -- and the dial that opens it. A
+	// statement that fails or overruns means the connection is presumed
+	// lost: it is closed, and every actor locked under it is stopped. 1 s.
+	ActorLockStatementTimeout time.Duration
+
+	// ActorLockProbeInterval is how often the lock connection is probed
+	// (Registry.RunLockProbe). It is roughly how long a replica's actors
+	// can keep running after that replica has lost their locks -- another
+	// replica may already hold them by then, and only the epoch fence
+	// stops a stale actor's writes (§2). 10 s.
+	ActorLockProbeInterval time.Duration
+
 	// --- §6.4 standalone additions: no ordering relationship with
 	// either invariant chain above (or with any prior Step's standalone
 	// additions), so — per those additions' own precedent — plain fields
@@ -3549,6 +3586,10 @@ func DefaultTimeouts() Timeouts {
 		TimerPumpInterval:  5 * time.Second,  // not specified; chosen
 		TimerClaimDuration: 30 * time.Second, // not specified; chosen
 
+		ActorHydrateTimeout:       2 * time.Second,  // not specified; chosen
+		ActorLockStatementTimeout: 1 * time.Second,  // not specified; chosen
+		ActorLockProbeInterval:    10 * time.Second, // not specified; chosen
+
 		HookTimeout:               10 * time.Minute, // not specified; chosen generously (setup.sh may install deps)
 		ProcessStopGracePeriod:    10 * time.Second, // not specified; chosen
 		SupervisorShutdownTimeout: 30 * time.Second, // not specified; chosen
@@ -4197,6 +4238,26 @@ func (t Timeouts) Validate() error {
 	withinResultDelayBounds("SessionResultDelayUnsettled", t.SessionResultDelayUnsettled)
 	withinResultDelayBounds("SessionResultDelayLiveRead", t.SessionResultDelayLiveRead)
 	withinResultDelayBounds("SessionResultDelaySettled", t.SessionResultDelaySettled)
+
+	// §2, §5.1: the session actor's lock connection and hydration bound
+	// (the Actor* fields' own block comment on the struct). Orderings with
+	// no margin, like the §43.20 links above. A zero bound fails every
+	// hydration and a zero interval probes in a hot loop, so each is
+	// refused. A lock statement is one step of a hydration, so it lies
+	// below the hydration bound, or the per-statement bound never applies.
+	// A pump delivery that fails on the hydration bound ends inside its
+	// timer's claim, so the retry comes from the claim expiring, not from a
+	// second, concurrent delivery. And one probe finishes before the next
+	// is due.
+	mustBePositive("ActorHydrateTimeout", t.ActorHydrateTimeout)
+	mustBePositive("ActorLockStatementTimeout", t.ActorLockStatementTimeout)
+	mustBePositive("ActorLockProbeInterval", t.ActorLockProbeInterval)
+	strictlyBelow("ActorHydrateTimeout > ActorLockStatementTimeout",
+		"ActorLockStatementTimeout", t.ActorLockStatementTimeout, "ActorHydrateTimeout", t.ActorHydrateTimeout)
+	strictlyBelow("TimerClaimDuration > ActorHydrateTimeout",
+		"ActorHydrateTimeout", t.ActorHydrateTimeout, "TimerClaimDuration", t.TimerClaimDuration)
+	strictlyBelow("ActorLockProbeInterval > ActorLockStatementTimeout",
+		"ActorLockStatementTimeout", t.ActorLockStatementTimeout, "ActorLockProbeInterval", t.ActorLockProbeInterval)
 
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three

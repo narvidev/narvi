@@ -2264,3 +2264,124 @@ func TestTimeouts_Validate_SessionResult(t *testing.T) {
 		})
 	}
 }
+
+func TestDefaultTimeouts_ActorLockFields(t *testing.T) {
+	t.Parallel()
+	to := platform.DefaultTimeouts()
+	for _, f := range []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"ActorHydrateTimeout", to.ActorHydrateTimeout, 2 * time.Second},
+		{"ActorLockStatementTimeout", to.ActorLockStatementTimeout, time.Second},
+		{"ActorLockProbeInterval", to.ActorLockProbeInterval, 10 * time.Second},
+	} {
+		if f.got != f.want {
+			t.Errorf("%s = %v, want %v", f.name, f.got, f.want)
+		}
+	}
+}
+
+// TestTimeouts_Validate_ActorLock proves every link of the session actor's
+// lock-connection block (the Actor* fields' own doc comment) is enforced on
+// its own: each link broken alone yields exactly one error, its own, named
+// by chain; each boundary that still holds is accepted; and a zero or
+// negative value is refused by name.
+func TestTimeouts_Validate_ActorLock(t *testing.T) {
+	t.Parallel()
+
+	type want struct {
+		chain string // exactly one *TimeoutInvariantError with this Chain
+		field string // or a *TimeoutMustBePositiveError naming this field
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		want   *want
+		// exact reports that the broken link must be the ONLY error; a zero
+		// hydration bound, for one, also breaks the statement link below it.
+		exact bool
+	}{
+		{"the shipped defaults hold", func(*platform.Timeouts) {}, nil, true},
+
+		{"a statement bound equal to the hydration bound", func(to *platform.Timeouts) {
+			to.ActorLockStatementTimeout = to.ActorHydrateTimeout
+		}, &want{chain: "ActorHydrateTimeout > ActorLockStatementTimeout"}, true},
+		{"a statement bound above the hydration bound", func(to *platform.Timeouts) {
+			to.ActorHydrateTimeout = 500 * time.Millisecond
+		}, &want{chain: "ActorHydrateTimeout > ActorLockStatementTimeout"}, true},
+		{"a statement bound just below the hydration bound is accepted", func(to *platform.Timeouts) {
+			to.ActorLockStatementTimeout = to.ActorHydrateTimeout - time.Millisecond
+		}, nil, true},
+
+		{"a hydration bound equal to the timer claim", func(to *platform.Timeouts) {
+			to.ActorHydrateTimeout = to.TimerClaimDuration
+		}, &want{chain: "TimerClaimDuration > ActorHydrateTimeout"}, true},
+		{"a timer claim below the hydration bound", func(to *platform.Timeouts) {
+			to.TimerClaimDuration = to.ActorHydrateTimeout - time.Millisecond
+		}, &want{chain: "TimerClaimDuration > ActorHydrateTimeout"}, true},
+		{"a hydration bound just below the timer claim is accepted", func(to *platform.Timeouts) {
+			to.ActorHydrateTimeout = to.TimerClaimDuration - time.Millisecond
+		}, nil, true},
+
+		{"a probe interval equal to the statement bound", func(to *platform.Timeouts) {
+			to.ActorLockProbeInterval = to.ActorLockStatementTimeout
+		}, &want{chain: "ActorLockProbeInterval > ActorLockStatementTimeout"}, true},
+		{"a probe interval below the statement bound", func(to *platform.Timeouts) {
+			to.ActorLockProbeInterval = to.ActorLockStatementTimeout / 2
+		}, &want{chain: "ActorLockProbeInterval > ActorLockStatementTimeout"}, true},
+		{"a probe interval just above the statement bound is accepted", func(to *platform.Timeouts) {
+			to.ActorLockProbeInterval = to.ActorLockStatementTimeout + time.Millisecond
+		}, nil, true},
+
+		{"a zero hydration bound fails every hydration", func(to *platform.Timeouts) { to.ActorHydrateTimeout = 0 },
+			&want{field: "ActorHydrateTimeout"}, false},
+		{"a negative hydration bound", func(to *platform.Timeouts) { to.ActorHydrateTimeout = -time.Second },
+			&want{field: "ActorHydrateTimeout"}, false},
+		{"a zero statement bound", func(to *platform.Timeouts) { to.ActorLockStatementTimeout = 0 },
+			&want{field: "ActorLockStatementTimeout"}, true},
+		{"a negative statement bound", func(to *platform.Timeouts) { to.ActorLockStatementTimeout = -time.Second },
+			&want{field: "ActorLockStatementTimeout"}, true},
+		{"a zero probe interval probes in a hot loop", func(to *platform.Timeouts) { to.ActorLockProbeInterval = 0 },
+			&want{field: "ActorLockProbeInterval"}, false},
+		{"a negative probe interval", func(to *platform.Timeouts) { to.ActorLockProbeInterval = -time.Second },
+			&want{field: "ActorLockProbeInterval"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			if tc.want == nil {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			var errs []error
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				errs = joined.Unwrap()
+			} else if err != nil {
+				errs = []error{err}
+			}
+			found := 0
+			for _, e := range errs {
+				var inv *platform.TimeoutInvariantError
+				var pos *platform.TimeoutMustBePositiveError
+				switch {
+				case tc.want.chain != "" && errors.As(e, &inv) && inv.Chain == tc.want.chain:
+					found++
+				case tc.want.field != "" && errors.As(e, &pos) && pos.Field == tc.want.field:
+					found++
+				}
+			}
+			if found != 1 {
+				t.Fatalf("Validate() = %v, want the broken link %+v reported exactly once", err, *tc.want)
+			}
+			if tc.exact && len(errs) != 1 {
+				t.Fatalf("Validate() reported %d errors, want only the broken link %+v: %v", len(errs), *tc.want, err)
+			}
+		})
+	}
+}
