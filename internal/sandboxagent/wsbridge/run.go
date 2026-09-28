@@ -238,12 +238,36 @@ func (b *Bridge) flushBuffer(ctx context.Context, conn *websocket.Conn) (err err
 	}
 }
 
-// sendHeartbeatNow builds and sends exactly one heartbeat frame directly
-// on conn -- pulled out of heartbeatLoop's own `case <-ticker.C:` arm
-// (§3.3, "turn recovery") so the new `case <-b.forceHeartbeat:` arm
-// below can send the SAME shape out-of-band, without duplicating the
-// build-and-send logic.
+// sendHeartbeatNow builds and sends one heartbeat frame directly on conn
+// -- pulled out of heartbeatLoop's own `case <-ticker.C:` arm (§3.3, "turn
+// recovery") so the new `case <-b.forceHeartbeat:` arm below can send the
+// SAME shape out-of-band, without duplicating the build-and-send logic.
+//
+// When that heartbeat would report a null boot phase while the boot-start
+// phase is still owed to the wire (ReportBootStarted), a heartbeat
+// carrying the start phase goes first, so the control plane always sees
+// this boot's evidence before its "boot has completed" (technical plan
+// §3.2). Each owed phase is written once: a heartbeat carrying any
+// non-null phase settles it.
 func (b *Bridge) sendHeartbeatNow(ctx context.Context, conn *websocket.Conn) error {
+	phase, owed := b.heartbeatBootPhases()
+	if phase == nil && owed != nil {
+		if err := b.writeHeartbeat(ctx, conn, owed); err != nil {
+			return err
+		}
+		b.bootStartDelivered()
+	}
+	if err := b.writeHeartbeat(ctx, conn, phase); err != nil {
+		return err
+	}
+	if phase != nil {
+		b.bootStartDelivered()
+	}
+	return nil
+}
+
+// writeHeartbeat writes one heartbeat frame reporting lastBootPhase.
+func (b *Bridge) writeHeartbeat(ctx context.Context, conn *websocket.Conn, lastBootPhase *string) error {
 	msg := sandboxws.Heartbeat{
 		Type:      "heartbeat",
 		MessageId: b.newMessageID(),
@@ -254,7 +278,7 @@ func (b *Bridge) sendHeartbeatNow(ctx context.Context, conn *websocket.Conn) err
 		// (internal/adapters/outbound/opencode.Adapter, §7)
 		// resolves a real OpenCode conversation id.
 		ConversationId: b.getConversationID(),
-		LastBootPhase:  b.getLastBootPhase(),
+		LastBootPhase:  lastBootPhase,
 		Timestamp:      time.Now(),
 	}
 	payload, err := json.Marshal(msg)

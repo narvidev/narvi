@@ -3,7 +3,10 @@ package wsbridge_test
 import (
 	"context"
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -191,6 +194,138 @@ func TestBootHeartbeats_SentAtOnce(t *testing.T) {
 			env := nextOfType(t, frames, "heartbeat")
 			if phaseString(env.LastBootPhase) != phaseString(tc.wantPhase) {
 				t.Errorf("heartbeat lastBootPhase = %s, want %s", phaseString(env.LastBootPhase), phaseString(tc.wantPhase))
+			}
+
+			cancel()
+			if err := wait(); err != nil {
+				t.Errorf("Run() error = %v, want nil after ctx cancellation", err)
+			}
+		})
+	}
+}
+
+// gatedServer refuses every dial with 503 -- not a fatal status, so the
+// Bridge backs off and retries -- until open is called, then serves each
+// connection through next. rejected counts the refused dials.
+type gatedServer struct {
+	next     http.Handler
+	opened   atomic.Bool
+	rejected atomic.Int32
+}
+
+func (g *gatedServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !g.opened.Load() {
+		g.rejected.Add(1)
+		http.Error(w, "control plane unavailable", http.StatusServiceUnavailable)
+		return
+	}
+	g.next.ServeHTTP(w, r)
+}
+
+// TestBootHeartbeats_EvidenceBeforeNullWhateverTheTiming: the boot's start
+// phase reaches the control plane before its null phase however the boot
+// and the connection interleave -- including a boot that completes before
+// the first connection is up, where ReportBootStarted's and
+// MarkBootComplete's signals would otherwise coalesce in forceHeartbeat's
+// one pending slot into a single null heartbeat. No boot_timing is sent
+// here: the start phase alone is this boot's evidence (technical plan
+// §3.2), and the owed phase is written once, never again after it.
+func TestBootHeartbeats_EvidenceBeforeNullWhateverTheTiming(t *testing.T) {
+	t.Parallel()
+
+	initial := wsbridge.InitialBootPhase
+	for _, tc := range []struct {
+		name string
+		// before runs ahead of the first connection; after runs once it
+		// has sent "ready". gate makes every dial fail until before has run.
+		before, after func(*testing.T, *wsbridge.Bridge, <-chan []byte)
+		gate          bool
+	}{
+		{
+			name: "boot started and completed before Run",
+			before: func(_ *testing.T, b *wsbridge.Bridge, _ <-chan []byte) {
+				b.ReportBootStarted()
+				b.MarkBootComplete()
+			},
+		},
+		{
+			name: "boot started and completed while the dial backs off",
+			gate: true,
+			before: func(_ *testing.T, b *wsbridge.Bridge, _ <-chan []byte) {
+				b.ReportBootStarted()
+				b.MarkBootComplete()
+			},
+		},
+		{
+			name: "connected throughout: each call's own heartbeat, nothing owed twice",
+			after: func(t *testing.T, b *wsbridge.Bridge, frames <-chan []byte) {
+				b.ReportBootStarted()
+				if env := nextOfType(t, frames, "heartbeat"); phaseString(env.LastBootPhase) != initial {
+					t.Fatalf("heartbeat after ReportBootStarted lastBootPhase = %s, want %q", phaseString(env.LastBootPhase), initial)
+				}
+				b.MarkBootComplete()
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			frames := make(chan []byte, 32)
+			gated := &gatedServer{next: &stepServer{steps: []func(*websocket.Conn){recordFrames(frames, 0)}}}
+			if !tc.gate {
+				gated.opened.Store(true)
+			}
+			server := httptest.NewServer(gated)
+			t.Cleanup(server.Close)
+
+			bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
+				testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			var wait func() error
+			if tc.gate {
+				wait = runInBackground(ctx, bridge)
+				deadline := time.Now().Add(testWait)
+				for gated.rejected.Load() < 2 {
+					if time.Now().After(deadline) {
+						t.Fatalf("Run dialed %d times within %s, want at least 2 refused dials", gated.rejected.Load(), testWait)
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+				tc.before(t, bridge, frames)
+				gated.opened.Store(true)
+			} else {
+				if tc.before != nil {
+					tc.before(t, bridge, frames)
+				}
+				wait = runInBackground(ctx, bridge)
+			}
+
+			nextOfType(t, frames, "ready")
+			if tc.after != nil {
+				tc.after(t, bridge, frames)
+			}
+			var phases []string
+			for {
+				env := nextOfType(t, frames, "heartbeat")
+				phases = append(phases, phaseString(env.LastBootPhase))
+				if env.LastBootPhase == nil {
+					break
+				}
+			}
+			want := []string{initial, "null"}
+			if tc.after != nil {
+				want = []string{"null"} // the start phase already went out above
+			}
+			if strings.Join(phases, ",") != strings.Join(want, ",") {
+				t.Fatalf("heartbeats up to the first null = %v, want %v", phases, want)
+			}
+			// Nothing else is owed: the regular heartbeat is 10s away, so
+			// any further heartbeat here would be the start phase again.
+			select {
+			case data := <-frames:
+				t.Fatalf("unexpected frame after the null heartbeat: %s", data)
+			case <-time.After(200 * time.Millisecond):
 			}
 
 			cancel()

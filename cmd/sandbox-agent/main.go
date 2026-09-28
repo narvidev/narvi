@@ -2002,28 +2002,25 @@ func run() error {
 	// is a real data point, not one to discard. No callback threading
 	// needed here (unlike the hook/fetch/checkout timings above): this
 	// span is measured directly around runBootSequence, in this SAME
-	// function, which already has sendBootTiming in scope.
+	// function, which already has sendBootTiming in scope. The seconds are
+	// taken the moment runBootSequence returns (SLO 1 pins the metric to
+	// that bracket), but the event is sent only once the re-own pass below
+	// has run too -- see finishBootSequence.
 	//
 	// ReportBootStarted first (technical plan §3.2): a heartbeat carrying
 	// the boot phase -- never null before bridge.MarkBootComplete below --
 	// goes out as soon as the bridge is connected, so the control plane has
 	// this generation's boot evidence before any null phase can reach it,
-	// however fast the boot, without depending on the best-effort
-	// boot_timing event sent below for it (§33.3: its loss must never fail
-	// a boot).
+	// however fast the boot and whenever the connection comes up, without
+	// depending on the best-effort boot_timing event sent below for it
+	// (§33.3: its loss must never fail a boot).
 	if bridge != nil {
 		bridge.ReportBootStarted()
 	}
 	bootStart := time.Now()
 	bootErr := runBootSequence(ctx, sup, cfg, layout, runtimeCredential, timeouts, sandboxSecretEnv, bootDegradeNotes, reportBootProgress, onGitSync, onGitFetchTiming, onGitCheckoutTiming, onHookRerunTiming)
+	bootSeconds := time.Since(bootStart).Seconds()
 	bootMode := string(cfg.BootMode)
-	bootFailed := bootErr != nil
-	sendBootTiming(sandboxws.BootTiming{
-		Metric:   sandboxws.BootTimingMetricBootDuration,
-		Seconds:  time.Since(bootStart).Seconds(),
-		BootMode: &bootMode,
-		Failed:   &bootFailed,
-	})
 
 	// (TECHNICAL_PLAN.md §30.5): once boot itself succeeded, re-own
 	// cfg.WorkspaceDir to the isolated agent runtime's own uid/gid --
@@ -2054,14 +2051,24 @@ func run() error {
 	// workspace is not one worth continuing, and letting the runtime
 	// discover that itself, per-file, at arbitrary points during a turn,
 	// is exactly the silent failure mode this codebase's own conventions
-	// refuse to ship. bootFailed/sendBootTiming above are deliberately
-	// UNAFFECTED by this: that event already reported runBootSequence's
-	// own, narrower outcome before this step ever ran.
-	if bootErr == nil && cfg.SessionConfig != nil {
-		if chownErr := boot.ChownWorkspaceForRuntime(cfg.WorkspaceDir, cfg.RuntimeUID, cfg.RuntimeGID); chownErr != nil {
-			bootErr = fmt.Errorf("sandbox-agent: re-own workspace for isolated runtime: %w", chownErr)
+	// refuse to ship. The boot_duration event goes out after this pass and
+	// its failed tag covers it: a failed=false boot_duration is the
+	// control plane's boot evidence (§3.2), so it may only ever say the
+	// whole boot succeeded.
+	var reownWorkspace func() error
+	if cfg.SessionConfig != nil {
+		reownWorkspace = func() error {
+			return boot.ChownWorkspaceForRuntime(cfg.WorkspaceDir, cfg.RuntimeUID, cfg.RuntimeGID)
 		}
 	}
+	bootErr = finishBootSequence(bootErr, reownWorkspace, func(failed bool) {
+		sendBootTiming(sandboxws.BootTiming{
+			Metric:   sandboxws.BootTimingMetricBootDuration,
+			Seconds:  bootSeconds,
+			BootMode: &bootMode,
+			Failed:   &failed,
+		})
+	})
 
 	if bootErr != nil {
 		// A boot failure needs the same graceful convergence a fatal WS
@@ -2531,6 +2538,28 @@ func logRepoMissingFromManifest(manifest boot.ImageManifest, currentSHAs map[str
 // respectively, exactly like reportBootProgress/onGitSync above -- see
 // run()'s own sendBootTiming closure (this function's caller) for what
 // they relay and why.
+// finishBootSequence runs what follows runBootSequence before the boot may
+// be marked complete, in the order technical plan §3.2 needs: first, when
+// the boot so far succeeded, reown -- the pass re-owning the workspace for
+// the agent runtime (§30.5); nil when there is no live session -- whose
+// failure fails the boot like any other step; only then
+// reportBootDuration, with failed covering that pass too. A boot_duration
+// with failed=false is the agent's own statement that its boot finished,
+// and the control plane takes it as boot evidence, so it must never go out
+// while part of the boot is still to run: agents built from 2026-08-28 up
+// to 2026-09-28 sent it before this pass, and a control plane can mark
+// such an agent's sandbox Ready while the pass is still walking the
+// workspace. Returns the boot's final error.
+func finishBootSequence(bootErr error, reown func() error, reportBootDuration func(failed bool)) error {
+	if bootErr == nil && reown != nil {
+		if err := reown(); err != nil {
+			bootErr = fmt.Errorf("sandbox-agent: re-own workspace for isolated runtime: %w", err)
+		}
+	}
+	reportBootDuration(bootErr != nil)
+	return bootErr
+}
+
 func runBootSequence(
 	ctx context.Context,
 	sup *supervisor.Supervisor,
