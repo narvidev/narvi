@@ -193,8 +193,9 @@ type opsMetrics struct {
 
 	// hydrations is session_actor_hydrations, one per hydration attempt,
 	// tagged outcome=ok|elsewhere|unavailable|error. A non-zero
-	// unavailable rate means the query pool stayed saturated for
-	// ActorHydrateTimeout, or the lock connection was down.
+	// unavailable rate means hydrations failed for one of the causes
+	// ErrActorUnavailable's doc comment lists; its log line
+	// (recordHydration) tells which.
 	hydrations metric.Int64Counter
 
 	// lockConnLost is session_actor_lock_conn_lost, one per lost lock
@@ -327,7 +328,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	hydrations, err := meter.Int64Counter(
 		"session_actor_hydrations",
-		metric.WithDescription("Session actor hydrations on this replica (§2), by outcome: ok; elsewhere (another replica holds the session's advisory lock); unavailable (the query pool stayed saturated for ActorHydrateTimeout, or no working lock connection could be had within it -- retryable); error (anything else)."),
+		metric.WithDescription("Session actor hydrations on this replica (§2), by outcome: ok; elsewhere (another replica holds the session's advisory lock); unavailable (retryable: within ActorHydrateTimeout the query pool stayed saturated, or no working lock connection could be had -- busy, not dialled, or lost again on its one retry -- or it was lost before the actor was inserted, or the lock statement failed with a server-side error, or the replica shut down); error (anything else)."),
 		metric.WithUnit("{hydration}"),
 	)
 	if err != nil {
@@ -336,7 +337,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	lockConnLost, err := meter.Int64Counter(
 		"session_actor_lock_conn_lost",
-		metric.WithDescription("Times this replica lost the one Postgres connection holding every one of its session actors' advisory locks (§2, §5.1). Each loss stops every actor the replica hosted; each rehydrates on its session's next command."),
+		metric.WithDescription("Times this replica lost the one Postgres connection holding every one of its session actors' advisory locks (§2, §5.1). Each loss stops every actor the replica hosted; each rehydrates on its session's next command once the lost connection's backend has released its lock: at once if the server heard the close, otherwise when the replica's next lock connection terminates it or the server's keepalives reap it (ActorLockServerReapTime)."),
 		metric.WithUnit("{connection}"),
 	)
 	if err != nil {

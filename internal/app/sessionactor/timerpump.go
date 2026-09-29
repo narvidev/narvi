@@ -47,9 +47,9 @@ func (r *Registry) RunTimerPump(ctx context.Context) error {
 // deterministically.
 //
 // A delivery that fails with ErrActorUnavailable ends the batch: this
-// replica cannot host actors right now (its query pool stayed saturated
-// for ActorHydrateTimeout, or it had no working lock connection), so every
-// remaining delivery would most likely wait out the same bound in turn.
+// replica cannot host actors right now (that error's doc comment lists
+// every cause), so every remaining delivery would most likely fail the same
+// way in turn, most of them only after waiting out the same bound.
 // The skipped timers are already claimed, so they come back once their
 // claim expires -- on this replica or another -- with no new mechanism;
 // the tick logs once how many it skipped.

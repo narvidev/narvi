@@ -686,16 +686,15 @@ func (r *Registry) SetKnowledgeRanker(ranker ports.KnowledgeRanker) {
 // request to whichever pod actually holds the session rather than
 // hanging on a lock that may not release for the rest of that actor's
 // lifetime. Returns ErrActorUnavailable (retryable) when this replica
-// could not hydrate the actor within ActorHydrateTimeout -- its query
-// pool stayed saturated, or it could not get a working lock connection --
-// having released any lock it took. The bound is ActorHydrateTimeout,
-// whatever context the caller passed, but it bounds the waiting, not
-// every statement a hydration started: a lock statement already running
-// when the bound expires finishes under its own ActorLockStatementTimeout,
-// and a failed hydration's unlock waits its turn on the lock connection
-// and runs under that bound too. So a call can return up to about
-// ActorHydrateTimeout + 2 x ActorLockStatementTimeout after it began,
-// plus that turn.
+// could not hydrate the actor within ActorHydrateTimeout, for any of the
+// causes that error's doc comment lists, having released any lock it took.
+// The bound is ActorHydrateTimeout, whatever context the caller passed,
+// but it bounds the waiting, not every statement a hydration started: a
+// lock statement already running when the bound expires finishes under
+// its own ActorLockStatementTimeout, and a failed hydration's unlock waits
+// its turn on the lock connection and runs under that bound too. So a
+// call can return up to about ActorHydrateTimeout + 2 x
+// ActorLockStatementTimeout after it began, plus that turn.
 //
 // Concurrent calls for the SAME session share one hydration and one
 // Actor (singleflight): the lock lives on one connection shared by the
@@ -780,7 +779,9 @@ func (r *Registry) start(ctx context.Context, a *Actor) error {
 
 // recordHydration counts one hydration by outcome
 // (session_actor_hydrations) and logs an unavailable one with what an
-// operator needs to tell a saturated pool from a lost lock connection.
+// operator needs to tell its causes (ErrActorUnavailable's doc comment)
+// apart: the time it waited, the pool's use, and the error, which names
+// the step that failed.
 func (r *Registry) recordHydration(ctx context.Context, sessionID pgtype.UUID, started time.Time, err error) {
 	outcome := "ok"
 	switch {
@@ -790,7 +791,7 @@ func (r *Registry) recordHydration(ctx context.Context, sessionID pgtype.UUID, s
 	case errors.Is(err, ErrActorUnavailable):
 		outcome = "unavailable"
 		stat := r.pool.Stat()
-		platform.Logger(ctx).Warn("sessionactor: could not hydrate the session actor on this replica in time",
+		platform.Logger(ctx).Warn("sessionactor: session actor unavailable on this replica",
 			"session_id", sessionID.String(),
 			"waited_ms", time.Since(started).Milliseconds(),
 			"pool_acquired_conns", stat.AcquiredConns(),
@@ -807,8 +808,13 @@ func (r *Registry) recordHydration(ctx context.Context, sessionID pgtype.UUID, s
 // any of those sessions. Every actor locked under it leaves the map at
 // once -- GetOrSpawn must not hand one out again -- and is told to stop
 // (errLockLost); each rehydrates, under a new connection, on the next
-// command for its session. The same recovery a pod restart gives, for
-// this replica's actors only.
+// command for its session once the lost connection's backend has let its
+// lock go: at once if the server heard the connection close, and otherwise
+// when this replica's next lock connection terminates that backend, or the
+// server's keepalives reap it within ActorLockServerReapTime (lockHolder's
+// doc comment) -- until then the session answers ErrSessionActorElsewhere
+// everywhere. The same recovery a pod restart gives, for this replica's
+// actors only.
 func (r *Registry) onLockLost(ctx context.Context, loss lockLoss) {
 	r.mu.Lock()
 	var stopped []*Actor

@@ -9,27 +9,41 @@ var (
 	// this session's actor -- or this process's own previous actor for it
 	// is still shutting down and has not yet released the lock (the window
 	// between Actor.shutdown's eviction and its unlock; lockholder.go's
-	// held check). Two goroutines of this process racing to spawn the SAME
-	// session never see it: Registry.GetOrSpawn deduplicates them
-	// (singleflight), so they share one hydration and one Actor.
+	// held check) -- or a lock connection that some replica lost left its
+	// backend behind on the server, still holding the lock, until that
+	// replica's next lock connection terminates it or the server's
+	// keepalives reap it (lockHolder's doc comment). Two goroutines of this
+	// process racing to spawn the SAME session never see it:
+	// Registry.GetOrSpawn deduplicates them (singleflight), so they share
+	// one hydration and one Actor.
 	// §2's fail-fast requirement: GetOrSpawn never blocks waiting for the
 	// lock, so a caller in a later Step can route the request to whichever
 	// pod actually holds it instead of hanging.
 	ErrSessionActorElsewhere = errors.New("sessionactor: session actor is owned elsewhere")
 
 	// ErrActorUnavailable is returned by Registry.GetOrSpawn when this
-	// replica could not hydrate the session's actor in time: the query
-	// pool stayed saturated for the whole ActorHydrateTimeout bound, or no
-	// working lock connection (lockholder.go) could be had within it -- none
-	// could be dialled in time, or the one open was lost and a retry on a
-	// new one failed too -- or a server-side error failed the lock
-	// statement itself. Retryable, and distinct from
-	// ErrSessionActorElsewhere: nobody else is known to own the session --
-	// this replica just cannot host it right now. Any lock the attempt took
-	// has already been released by the time it is returned. Each caller's
-	// answer to it is stated at its own call site (§2): the timer pump stops
-	// its batch, the sandbox WS handshake answers 503 with Retry-After, and
-	// a post-commit dispatch trigger only logs it.
+	// replica could not hydrate the session's actor within
+	// ActorHydrateTimeout. This is every cause, and the one list of them:
+	//   - the query pool stayed saturated, or its statements ran slow, for
+	//     the whole bound;
+	//   - the lock connection (lockholder.go) could not be had within the
+	//     bound: other statements kept it busy, or none was open and none
+	//     could be dialled in time (a dial failed, or is still going on);
+	//   - the lock connection was lost under the lock statement, and the
+	//     one retry, on a new connection, failed too -- or the connection
+	//     had been dialled for this very call, which is not retried;
+	//   - the lock connection was lost after the lock was taken, before the
+	//     actor could be inserted (a hydration racing a loss);
+	//   - the lock statement failed with a server-side ERROR on a live
+	//     connection (the shared lock table full, say);
+	//   - the Registry shut down during the hydration, or already had.
+	// Retryable, and distinct from ErrSessionActorElsewhere: nobody else
+	// is known to own the session -- this replica just cannot host it right
+	// now. Any lock the attempt took has already been released by the time
+	// it is returned. Each caller's answer to it is stated at its own call
+	// site (§2): the timer pump stops its batch, the sandbox WS handshake
+	// answers 503 with Retry-After, and a post-commit dispatch trigger only
+	// logs it.
 	ErrActorUnavailable = errors.New("sessionactor: session actor unavailable on this replica; retry")
 
 	// ErrStaleEpoch is returned by Actor.transact when the epoch read back
@@ -63,8 +77,9 @@ var (
 // SpawnFailureReason names why Registry.GetOrSpawn failed, for a caller
 // that only logs the failure (a post-commit dispatch trigger): the row it
 // was triggered for is already committed, so the reason is what an
-// operator reading the log needs -- "actor_unavailable" (this replica was
-// saturated or had lost its lock connection; retryable),
+// operator reading the log needs -- "actor_unavailable" (this replica
+// could not host the actor in time, for any of the causes
+// ErrActorUnavailable lists; retryable),
 // "actor_elsewhere" (another replica owns the session), or "error".
 func SpawnFailureReason(err error) string {
 	switch {

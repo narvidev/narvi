@@ -2279,10 +2279,18 @@ func TestDefaultTimeouts_ActorLockFields(t *testing.T) {
 		// pgxpool v5.10.0's own fallback (pgxpool/pool.go), which this one
 		// mirrors so the lock connection dials as a pool connection does.
 		{"ActorLockConnectTimeoutFallback", to.ActorLockConnectTimeoutFallback, 2 * time.Minute},
+		{"ActorLockServerKeepaliveIdle", to.ActorLockServerKeepaliveIdle, 10 * time.Second},
+		{"ActorLockServerKeepaliveInterval", to.ActorLockServerKeepaliveInterval, 5 * time.Second},
+		// idle + interval × count: what the server keeps an orphaned lock
+		// backend for, and the tcp_user_timeout the lock connection asks for.
+		{"ActorLockServerReapTime()", to.ActorLockServerReapTime(), 25 * time.Second},
 	} {
 		if f.got != f.want {
 			t.Errorf("%s = %v, want %v", f.name, f.got, f.want)
 		}
+	}
+	if got, want := to.ActorLockServerKeepaliveCount, 3; got != want {
+		t.Errorf("ActorLockServerKeepaliveCount = %d, want %d", got, want)
 	}
 }
 
@@ -2291,13 +2299,19 @@ func TestDefaultTimeouts_ActorLockFields(t *testing.T) {
 // its own: each link broken alone yields exactly one error, its own, named
 // by chain; each boundary that still holds is accepted; and a zero or
 // negative value is refused by name. The connect-timeout fallback has no
-// link, only its sign.
+// link, only its sign. The server keepalives' reap time lies strictly
+// between one probe plus its statement and the timer claim; each keepalive
+// is positive, and the two the server reads in seconds are whole ones --
+// a fraction, and above all a value under a second, would reach the server
+// as 0, its default of hours.
 func TestTimeouts_Validate_ActorLock(t *testing.T) {
 	t.Parallel()
 
 	type want struct {
-		chain string // exactly one *TimeoutInvariantError with this Chain
-		field string // or a *TimeoutMustBePositiveError naming this field
+		chain        string // exactly one *TimeoutInvariantError with this Chain
+		field        string // or a *TimeoutMustBePositiveError naming this field
+		count        string // or a *CountMustBePositiveError naming this field
+		wholeSeconds string // or a *TimeoutMustBeWholeSecondsError naming this field
 	}
 	for _, tc := range []struct {
 		name   string
@@ -2322,9 +2336,13 @@ func TestTimeouts_Validate_ActorLock(t *testing.T) {
 		{"a hydration bound equal to the timer claim", func(to *platform.Timeouts) {
 			to.ActorHydrateTimeout = to.TimerClaimDuration
 		}, &want{chain: "TimerClaimDuration > ActorHydrateTimeout"}, true},
+		{"a hydration bound above the timer claim", func(to *platform.Timeouts) {
+			to.ActorHydrateTimeout = to.TimerClaimDuration + time.Millisecond
+		}, &want{chain: "TimerClaimDuration > ActorHydrateTimeout"}, true},
+		// A claim that short breaks the reap-time link below it too.
 		{"a timer claim below the hydration bound", func(to *platform.Timeouts) {
 			to.TimerClaimDuration = to.ActorHydrateTimeout - time.Millisecond
-		}, &want{chain: "TimerClaimDuration > ActorHydrateTimeout"}, true},
+		}, &want{chain: "TimerClaimDuration > ActorHydrateTimeout"}, false},
 		{"a hydration bound just below the timer claim is accepted", func(to *platform.Timeouts) {
 			to.ActorHydrateTimeout = to.TimerClaimDuration - time.Millisecond
 		}, nil, true},
@@ -2358,6 +2376,53 @@ func TestTimeouts_Validate_ActorLock(t *testing.T) {
 		{"a connect-timeout fallback below the hydration bound is accepted: nothing links them", func(to *platform.Timeouts) {
 			to.ActorLockConnectTimeoutFallback = to.ActorHydrateTimeout / 2
 		}, nil, true},
+
+		// The reap time (idle + interval × count, 25 s by default) against
+		// one probe and its statement (11 s by default)...
+		{"a reap time equal to one probe and its statement", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveIdle, to.ActorLockServerKeepaliveInterval, to.ActorLockServerKeepaliveCount = 5*time.Second, 2*time.Second, 3
+		}, &want{chain: "ActorLockServerReapTime > ActorLockProbeInterval + ActorLockStatementTimeout"}, true},
+		{"a reap time below one probe", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveIdle, to.ActorLockServerKeepaliveInterval, to.ActorLockServerKeepaliveCount = time.Second, time.Second, 1
+		}, &want{chain: "ActorLockServerReapTime > ActorLockProbeInterval + ActorLockStatementTimeout"}, true},
+		{"a reap time just above one probe and its statement is accepted", func(to *platform.Timeouts) {
+			to.ActorLockStatementTimeout = time.Second - time.Millisecond
+			to.ActorLockServerKeepaliveIdle, to.ActorLockServerKeepaliveInterval, to.ActorLockServerKeepaliveCount = 5*time.Second, 2*time.Second, 3
+		}, nil, true},
+		// ...and against the timer claim (30 s by default).
+		{"a reap time equal to the timer claim", func(to *platform.Timeouts) {
+			to.TimerClaimDuration = to.ActorLockServerReapTime()
+		}, &want{chain: "TimerClaimDuration > ActorLockServerReapTime"}, true},
+		{"a reap time above the timer claim", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveCount = 6
+		}, &want{chain: "TimerClaimDuration > ActorLockServerReapTime"}, true},
+		{"a reap time just below the timer claim is accepted", func(to *platform.Timeouts) {
+			to.TimerClaimDuration = to.ActorLockServerReapTime() + time.Millisecond
+		}, nil, true},
+
+		{"a zero keepalive idle reaches the server as its default", func(to *platform.Timeouts) { to.ActorLockServerKeepaliveIdle = 0 },
+			&want{field: "ActorLockServerKeepaliveIdle"}, true},
+		{"a negative keepalive idle", func(to *platform.Timeouts) { to.ActorLockServerKeepaliveIdle = -time.Second },
+			&want{field: "ActorLockServerKeepaliveIdle"}, true},
+		// A zero or negative interval shrinks the reap time below one probe too.
+		{"a zero keepalive interval reaches the server as its default", func(to *platform.Timeouts) { to.ActorLockServerKeepaliveInterval = 0 },
+			&want{field: "ActorLockServerKeepaliveInterval"}, false},
+		{"a negative keepalive interval", func(to *platform.Timeouts) { to.ActorLockServerKeepaliveInterval = -time.Second },
+			&want{field: "ActorLockServerKeepaliveInterval"}, false},
+		{"a zero keepalive count reaches the server as its default", func(to *platform.Timeouts) { to.ActorLockServerKeepaliveCount = 0 },
+			&want{count: "ActorLockServerKeepaliveCount"}, false},
+		{"a keepalive idle under a second would reach the server as 0", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveIdle = 500 * time.Millisecond
+		}, &want{wholeSeconds: "ActorLockServerKeepaliveIdle"}, true},
+		{"a keepalive idle with a fraction of a second", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveIdle = 10*time.Second + 500*time.Millisecond
+		}, &want{wholeSeconds: "ActorLockServerKeepaliveIdle"}, true},
+		{"a keepalive interval with a fraction of a second", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveInterval = 5*time.Second + time.Millisecond
+		}, &want{wholeSeconds: "ActorLockServerKeepaliveInterval"}, true},
+		{"one-second keepalives are accepted", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveIdle, to.ActorLockServerKeepaliveInterval, to.ActorLockServerKeepaliveCount = 7*time.Second, time.Second, 5
+		}, nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -2380,10 +2445,16 @@ func TestTimeouts_Validate_ActorLock(t *testing.T) {
 			for _, e := range errs {
 				var inv *platform.TimeoutInvariantError
 				var pos *platform.TimeoutMustBePositiveError
+				var cnt *platform.CountMustBePositiveError
+				var whole *platform.TimeoutMustBeWholeSecondsError
 				switch {
 				case tc.want.chain != "" && errors.As(e, &inv) && inv.Chain == tc.want.chain:
 					found++
 				case tc.want.field != "" && errors.As(e, &pos) && pos.Field == tc.want.field:
+					found++
+				case tc.want.count != "" && errors.As(e, &cnt) && cnt.Field == tc.want.count:
+					found++
+				case tc.want.wholeSeconds != "" && errors.As(e, &whole) && whole.Field == tc.want.wholeSeconds:
 					found++
 				}
 			}

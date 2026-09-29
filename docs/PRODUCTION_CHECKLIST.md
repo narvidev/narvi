@@ -215,4 +215,11 @@ does not fit.
 transaction-mode connection pooler: the actor locks are session-level
 advisory locks, and a pooler that hands a backend to another client
 between transactions would move them with it. Session-mode pooling, or
-none, is required.
+none, is required. Behind a session-mode pooler, also set the pooler's own
+client-side TCP keepalives short (PgBouncer: `tcp_keepalive`,
+`tcp_keepidle`, `tcp_keepintvl`, `tcp_keepcnt`). The lock connection asks
+the server for short keepalives on its end
+(`ActorLockServerKeepalive*` in `internal/platform/timeouts.go`), but
+through a pooler that end faces the pooler: if a replica vanishes, only
+the pooler's keepalives notice, and until they do the pooler keeps the
+server backend holding that replica's session locks.

@@ -61,10 +61,10 @@ import (
 //     right fallback -- "try again, maybe once this pod frees the lock or
 //     another pod picks it up"); ErrActorUnavailable -> 503 with
 //     Retry-After set to ActorHydrateTimeout in whole seconds, at least
-//     one (this replica could not hydrate the actor within that bound --
-//     its query pool stayed saturated, or it had no working lock
-//     connection -- and has released any lock it took, so a reconnect may
-//     land here or elsewhere). Retry-After only advises: the in-tree
+//     one (this replica could not hydrate the actor within that bound,
+//     for any of the causes ErrActorUnavailable's doc comment lists, and
+//     has released any lock it took, so a reconnect may land here or
+//     elsewhere). Retry-After only advises: the in-tree
 //     sandbox agent (wsbridge.Run) never reads it and retries a 503 on
 //     its own exponential backoff, from SandboxWSReconnectMinBackoff (1 s)
 //     up; any other GetOrSpawn error -> 500.
