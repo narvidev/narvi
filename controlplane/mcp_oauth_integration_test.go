@@ -1252,6 +1252,13 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	t.Run("PromptAndRevision_SettledSessionLikeREST_SDKClient", func(t *testing.T) {
 		sdkPromptAndRevisionOnASettledSession(t, createRig)
 	})
+	// The write twins' wiring (technical plan §43.21), on a router of its
+	// own whose configuration makes every argument they read show in what
+	// they write (newWriteTwinsRouterRig).
+	twinsRig, classifier := newWriteTwinsRouterRig(t, connStr)
+	t.Run("WriteTwins_EveryArgumentLikeREST_SDKClient", func(t *testing.T) {
+		sdkWriteTwinsLikeREST(t, twinsRig, classifier)
+	})
 	createBraked := createRouterRig(t, connStr, brakeTestTimeouts)
 	t.Run("RateLimit_MCPPerGrant429", func(t *testing.T) {
 		rateLimitMCPPerGrant(t, createBraked)

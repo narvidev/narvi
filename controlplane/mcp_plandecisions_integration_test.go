@@ -9,8 +9,9 @@
 //     every role, on a session the user started and on one they did not,
 //     its outcome and the database state it leaves -- the plan's row, the
 //     implementation turn, the approved-content snapshot, the audit row and
-//     the notices -- equal a REST approval's by the same user's cookie; the
-//     MCP audit row also carries the grant.
+//     the outbox, empty on these web sessions, which have nowhere to post a
+//     verdict -- equal a REST approval's by the same user's cookie; the MCP
+//     audit row also carries the grant.
 //   - The open-turn gate refuses an approval, over MCP as over REST, while
 //     any turn is pending, dispatched or processing, and changes nothing.
 //   - The first verdict wins across channels: a plan decided over one is
@@ -23,6 +24,15 @@
 //     O5), and nothing is queued; on an idle session the prompt and the
 //     revision tools create exactly what REST creates, and the plan list
 //     answers REST's bytes.
+//   - On a router configured so that every argument the write twins read
+//     shows in what they write (newWriteTwinsRouterRig), each write leaves
+//     what its REST twin leaves: an approval and a rejection each post one notice, compared
+//     row for row, to the plan's Slack message or its Linear session; a
+//     prompt read as a change to a plan awaiting approval is queued as a
+//     revision; and an ordinary prompt on a session the user joined, and a
+//     revision, carry the epistemic preamble and the upload note as REST's
+//     do. A twin built without an argument its /api route passes, where
+//     the handler reads it, fails one of these.
 //
 // Every approval that wins queues a turn and spawns a session actor, so
 // these run on a createRouterRig (its own pool, its registry shut down
@@ -34,17 +44,26 @@ package controlplane
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
+	"github.com/narvidev/narvi/internal/domain/turn"
+	"github.com/narvidev/narvi/internal/domain/upload"
 )
 
 // busyRefusal is REST's own open-turn refusal, shared by turn creation
@@ -64,7 +83,14 @@ const planForbidden = "not authorized to act on this session's plans"
 // plan-mode session is in once its first turn completed.
 func seedPlannedSession(ctx context.Context, t *testing.T, rig *oauthRouterRig, creator pgtype.UUID, status sqlcgen.PlanStatus) (sessionID, planID pgtype.UUID) {
 	t.Helper()
-	session, err := narvipg.NewSessionStore(rig.pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb, CreatedBy: creator})
+	return seedPlannedSessionFrom(ctx, t, rig, creator, status, sqlcgen.SessionSpawnSourceWeb)
+}
+
+// seedPlannedSessionFrom is seedPlannedSession for a session started from
+// source.
+func seedPlannedSessionFrom(ctx context.Context, t *testing.T, rig *oauthRouterRig, creator pgtype.UUID, status sqlcgen.PlanStatus, source sqlcgen.SessionSpawnSource) (sessionID, planID pgtype.UUID) {
+	t.Helper()
+	session, err := narvipg.NewSessionStore(rig.pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: source, CreatedBy: creator})
 	if err != nil {
 		t.Fatalf("create session: %v", err)
 	}
@@ -136,8 +162,11 @@ type decisionState struct {
 	Implementations []string
 	Snapshots       int
 	Audit           []string
-	Outbox          []string
-	OpenTurnStates  []string
+	// Outbox is every outbox row of the session -- each notice the decision
+	// posted -- as its kind, status, whether it carries a correlation id,
+	// and its payload with the session's own ids written as their roles.
+	Outbox         []string
+	OpenTurnStates []string
 }
 
 // readDecisionState reads decisionState for plan planID of sessionID,
@@ -213,16 +242,37 @@ func readDecisionState(ctx context.Context, t *testing.T, rig *oauthRouterRig, s
 	}
 	rows.Close()
 
-	rows, err = rig.pool.Query(ctx, `SELECT kind FROM outbox WHERE session_id = $1 ORDER BY kind`, sessionID)
+	var agentSession string
+	if err := rig.pool.QueryRow(ctx, `SELECT agent_session_id FROM linear_agent_sessions WHERE session_id = $1`, sessionID).Scan(&agentSession); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("read the Linear agent session: %v", err)
+	}
+	rows, err = rig.pool.Query(ctx, `SELECT kind, status::text, correlation_id IS NOT NULL, payload FROM outbox WHERE session_id = $1 ORDER BY kind, payload::text`, sessionID)
 	if err != nil {
 		t.Fatalf("read outbox: %v", err)
 	}
 	for rows.Next() {
-		var kind string
-		if err := rows.Scan(&kind); err != nil {
+		var kind, status string
+		var correlated bool
+		var raw []byte
+		if err := rows.Scan(&kind, &status, &correlated, &raw); err != nil {
 			t.Fatal(err)
 		}
-		st.Outbox = append(st.Outbox, kind)
+		var payload map[string]any
+		if err := json.Unmarshal(raw, &payload); err != nil {
+			t.Fatalf("decode outbox payload %s: %v", raw, err)
+		}
+		for k, v := range payload {
+			switch {
+			case v == sessionID.String():
+				payload[k] = "<session>"
+			case v == planID.String():
+				payload[k] = "<plan>"
+			case agentSession != "" && v == agentSession:
+				payload[k] = "<agent session>"
+			}
+		}
+		canon, _ := json.Marshal(payload)
+		st.Outbox = append(st.Outbox, fmt.Sprintf("%s %s correlated=%v %s", kind, status, correlated, canon))
 	}
 	rows.Close()
 
@@ -607,42 +657,8 @@ func sdkPromptAndRevisionOnASettledSession(t *testing.T, rig *oauthRouterRig) {
 				t.Fatalf("MCP %v, REST %v -- want the same answer, ids aside", got, rest)
 			}
 
-			// The turn as its creation wrote it -- never its status, which the
-			// actor moves -- with the session id, which a prompt may carry
-			// (the upload note), written as its role.
-			read := func(session pgtype.UUID, turn string) (string, map[string]any) {
-				var row string
-				if err := rig.pool.QueryRow(ctx, `SELECT 'plan_mode=' || plan_mode || ' prompt=' || coalesce(prompt, '') || ' model=' || coalesce(model_id, '') || ' effort=' || coalesce(effort, '') FROM turns WHERE id = $1`, turn).Scan(&row); err != nil {
-					t.Fatalf("read turn %s: %v", turn, err)
-				}
-				row = strings.ReplaceAll(row, session.String(), "<session>")
-				var raw []byte
-				if err := rig.pool.QueryRow(ctx, `SELECT detail_json FROM audit_log WHERE action = 'turn.create' AND resource_id = $1 AND actor_user_id = $2`, turn, flow.member.ID).Scan(&raw); err != nil {
-					t.Fatalf("read the turn.create audit row: %v", err)
-				}
-				var detail map[string]any
-				if err := json.Unmarshal(raw, &detail); err != nil {
-					t.Fatal(err)
-				}
-				if detail["session_id"] != session.String() || detail["plan_mode"] != tc.planMode {
-					t.Fatalf("audit detail %s, want the session and plan_mode %v", raw, tc.planMode)
-				}
-				delete(detail, "session_id")
-				return row, detail
-			}
-			mcpRow, mcpDetail := read(mcpSession, mcpTurn)
-			restRow, restDetail := read(restSession, restTurn)
-			stamp, _ := mcpDetail["mcp"].(map[string]any)
-			if stamp == nil || stamp["grant_id"] != grant || stamp["client_id"] != flow.client.ClientId || restDetail["mcp"] != nil {
-				t.Fatalf("MCP audit %v, REST audit %v -- want the grant stamp on the MCP row only", mcpDetail, restDetail)
-			}
-			delete(mcpDetail, "mcp")
-			a, _ := json.Marshal(mcpDetail)
-			b, _ := json.Marshal(restDetail)
-			if mcpRow != restRow || string(a) != string(b) {
-				t.Fatalf("MCP turn %q audit %s, REST turn %q audit %s -- want the same", mcpRow, a, restRow, b)
-			}
-			if !strings.Contains(mcpRow, fmt.Sprintf("plan_mode=%v prompt=", tc.planMode)) || !strings.Contains(mcpRow, tc.text) {
+			mcpRow := sameCreatedTurn(ctx, t, rig, flow, grant, mcpSession, mcpTurn, restSession, restTurn, tc.planMode)
+			if !strings.HasPrefix(mcpRow, fmt.Sprintf("plan_mode=%v ", tc.planMode)) || !strings.Contains(mcpRow, tc.text) {
 				t.Fatalf("MCP turn %q, want plan_mode %v carrying %q", mcpRow, tc.planMode, tc.text)
 			}
 
@@ -680,6 +696,281 @@ func sdkPromptAndRevisionOnASettledSession(t *testing.T, rig *oauthRouterRig) {
 			}
 		})
 	}
+}
+
+// sameCreatedTurn fails the test unless the turn MCP created on
+// mcpSession and the one REST created on restSession are the same as their
+// creation wrote them -- never their status, which the actor moves -- with
+// the session id, which a prompt may carry (the upload note), written as
+// its role; and unless their turn.create audit rows by the flow's user are
+// the same too, with plan_mode wantPlanMode, the MCP one alone carrying
+// grant. It returns the MCP turn's row.
+func sameCreatedTurn(ctx context.Context, t *testing.T, rig *oauthRouterRig, flow *sdkFlow, grant string, mcpSession pgtype.UUID, mcpTurn string, restSession pgtype.UUID, restTurn string, wantPlanMode bool) string {
+	t.Helper()
+	read := func(session pgtype.UUID, turnID string) (string, map[string]any) {
+		var row string
+		if err := rig.pool.QueryRow(ctx, `SELECT 'plan_mode=' || plan_mode || ' answer_only=' || coalesce(answer_only::text, 'null') || ' prompt=' || coalesce(prompt, '') || ' model=' || coalesce(model_id, '') || ' effort=' || coalesce(effort, '') FROM turns WHERE id = $1`, turnID).Scan(&row); err != nil {
+			t.Fatalf("read turn %s: %v", turnID, err)
+		}
+		row = strings.ReplaceAll(row, session.String(), "<session>")
+		var raw []byte
+		if err := rig.pool.QueryRow(ctx, `SELECT detail_json FROM audit_log WHERE action = 'turn.create' AND resource_id = $1 AND actor_user_id = $2`, turnID, flow.member.ID).Scan(&raw); err != nil {
+			t.Fatalf("read the turn.create audit row: %v", err)
+		}
+		var detail map[string]any
+		if err := json.Unmarshal(raw, &detail); err != nil {
+			t.Fatal(err)
+		}
+		if detail["session_id"] != session.String() || detail["plan_mode"] != wantPlanMode {
+			t.Fatalf("audit detail %s, want the session and plan_mode %v", raw, wantPlanMode)
+		}
+		delete(detail, "session_id")
+		return row, detail
+	}
+	mcpRow, mcpDetail := read(mcpSession, mcpTurn)
+	restRow, restDetail := read(restSession, restTurn)
+	stamp, _ := mcpDetail["mcp"].(map[string]any)
+	if stamp == nil || stamp["grant_id"] != grant || stamp["client_id"] != flow.client.ClientId || restDetail["mcp"] != nil {
+		t.Fatalf("MCP audit %v, REST audit %v -- want the grant stamp on the MCP row only", mcpDetail, restDetail)
+	}
+	delete(mcpDetail, "mcp")
+	a, _ := json.Marshal(mcpDetail)
+	b, _ := json.Marshal(restDetail)
+	if mcpRow != restRow || string(a) != string(b) {
+		t.Fatalf("MCP turn %q audit %s, REST turn %q audit %s -- want the same", mcpRow, a, restRow, b)
+	}
+	return mcpRow
+}
+
+// classifierFake stands in for the model provider's messages endpoint, the
+// one the intent classifier calls: it reads every plan follow-up as a
+// confident change to the plan, and counts the calls. The router under
+// test reaches it through ANTHROPIC_BASE_URL, which the provider's SDK
+// reads when the classifier's client is built (newWriteTwinsRouterRig), so
+// no classification leaves this machine.
+type classifierFake struct {
+	server *httptest.Server
+	calls  atomic.Int64
+}
+
+func newClassifierFake(t *testing.T) *classifierFake {
+	t.Helper()
+	f := &classifierFake{}
+	f.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/messages" {
+			t.Errorf("the classifier fake got %s %s, want POST /v1/messages", r.Method, r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		f.calls.Add(1)
+		verdict, _ := json.Marshal(map[string]string{"target": intentdomain.TargetAmend, "confidence": intentdomain.ConfidenceHigh, "reasoning": "test fixture"})
+		body, _ := json.Marshal(map[string]any{
+			"id": "msg_write_twins", "type": "message", "role": "assistant", "model": "claude-haiku-4-5",
+			"content":     []map[string]any{{"type": "text", "text": string(verdict)}},
+			"stop_reason": "end_turn", "stop_sequence": nil,
+			"usage": map[string]any{"input_tokens": 1, "output_tokens": 1},
+		})
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(body)
+	}))
+	t.Cleanup(f.server.Close)
+	return f
+}
+
+// newWriteTwinsRouterRig is a createRouterRig whose configuration makes
+// every argument the write twins read show in what they write: the epistemic check on by default (an implementation's and an
+// ordinary prompt's preamble), object storage configured (a prompt's upload
+// note; its endpoint is never contacted), and the intent classifier
+// answered by a classifierFake (a prompt promoted to a revision). The
+// stores show on their own: the outbox and the Linear sessions through the
+// notices, the participants through a session the user joined, the
+// registry through the dispatch after each write.
+func newWriteTwinsRouterRig(t *testing.T, connStr string) (*oauthRouterRig, *classifierFake) {
+	t.Helper()
+	fake := newClassifierFake(t)
+	t.Setenv("ANTHROPIC_BASE_URL", fake.server.URL)
+	rig := createRouterRigWith(t, connStr, map[string]string{
+		"NARVI_EPISTEMIC_CHECK_DEFAULT":        "true",
+		"NARVI_OBJECT_STORE_ENDPOINT":          "http://127.0.0.1:9",
+		"NARVI_OBJECT_STORE_REGION":            "us-east-1",
+		"NARVI_OBJECT_STORE_BUCKET":            "narvi-write-twins",
+		"NARVI_OBJECT_STORE_ACCESS_KEY_ID":     "test-access-key-id",
+		"NARVI_OBJECT_STORE_SECRET_ACCESS_KEY": "test-secret-access-key",
+	}, liftEndpointBrakes)
+	// Only this Build's classifier client reads it: a later router's is
+	// built as before.
+	if err := os.Unsetenv("ANTHROPIC_BASE_URL"); err != nil {
+		t.Fatal(err)
+	}
+	if !rig.cfg.EpistemicCheckDefault || rig.cfg.ObjectStorage == nil {
+		t.Fatalf("the router's configuration: epistemic default %v, object storage %+v -- want both on", rig.cfg.EpistemicCheckDefault, rig.cfg.ObjectStorage)
+	}
+	return rig, fake
+}
+
+// sdkWriteTwinsLikeREST is TestOAuth_ProductionRouter's
+// WriteTwins_EveryArgumentLikeREST_SDKClient (technical plan §43.21), on
+// newWriteTwinsRouterRig's router. Each write over MCP and its REST twin by
+// the same user's cookie, on two sessions seeded alike, answer the same and
+// leave the same rows, so a twin built in serve.go without an argument its
+// /api route passes -- a store, the registry, the classifier, object
+// storage, the epistemic default -- is caught wherever the handler reads
+// it (the rejection reads neither its snapshot stores nor the epistemic
+// default):
+//   - an approval and a rejection, of a plan that went to Slack and of a
+//     Linear session's plan, each leave the plan, the implementation turn
+//     (its prompt led by the epistemic preamble), the snapshot, the audit
+//     row and the outbox REST leaves -- one notice, to the plan's Slack
+//     message or to the Linear session, compared row for row;
+//   - a prompt the classifier reads as a change to a plan awaiting approval
+//     is queued as a revision of it;
+//   - an ordinary prompt on a session the user joined but did not start
+//     carries the epistemic preamble and the upload note;
+//   - a revision carries the upload note.
+func sdkWriteTwinsLikeREST(t *testing.T, rig *oauthRouterRig, classifier *classifierFake) {
+	ctx := oauthTestCtx(t)
+	flow := rig.connectSDKClient(ctx, t, nil)
+	grant := rig.grantOf(ctx, t, flow.member.ID)
+	preamble := turn.RenderEpistemicPreamble()
+
+	t.Run("decisions", func(t *testing.T) {
+		origins := []struct {
+			name, kind string
+			seed       func() (pgtype.UUID, pgtype.UUID)
+		}{
+			{"a plan that went to Slack", "slack_plan_decided", func() (pgtype.UUID, pgtype.UUID) {
+				session, plan := seedPlannedSession(ctx, t, rig, flow.member.ID, sqlcgen.PlanStatusAwaitingApproval)
+				if err := narvipg.NewPlanStore(rig.pool).SetSlackMessageRef(ctx, plan, "C-write-twins", "1700000000.000200"); err != nil {
+					t.Fatalf("record the plan's Slack message: %v", err)
+				}
+				return session, plan
+			}},
+			{"a Linear session's plan", "linear", func() (pgtype.UUID, pgtype.UUID) {
+				session, plan := seedPlannedSessionFrom(ctx, t, rig, flow.member.ID, sqlcgen.PlanStatusAwaitingApproval, sqlcgen.SessionSpawnSourceLinear)
+				agent := fmt.Sprintf("agent-write-twins-%d", time.Now().UnixNano())
+				linear := narvipg.NewLinearAgentSessionStore(rig.pool)
+				if _, err := linear.Claim(ctx, agent, "org-write-twins"); err != nil {
+					t.Fatalf("claim the Linear agent session: %v", err)
+				}
+				if err := linear.SetSessionID(ctx, agent, session); err != nil {
+					t.Fatalf("bind the Linear agent session: %v", err)
+				}
+				return session, plan
+			}},
+		}
+		for _, verdict := range []string{"approve", "reject"} {
+			for _, origin := range origins {
+				stage := verdict + ", " + origin.name
+				mcpSession, mcpPlan := origin.seed()
+				restSession, restPlan := origin.seed()
+
+				res := callTool(ctx, t, flow.session, "narvi_"+verdict+"_plan", map[string]any{"sessionId": mcpSession.String(), "planId": mcpPlan.String()})
+				var restBody json.RawMessage
+				status := rig.doJSON(t, http.MethodPost, "/api/sessions/"+restSession.String()+"/plans/"+restPlan.String()+"/"+verdict, nil, &restBody, flow.cookie)
+				if status != http.StatusOK || res.IsError {
+					t.Fatalf("%s: REST %d %s, MCP isError %v %+v -- want both to decide", stage, status, restBody, res.IsError, res.Content)
+				}
+				got, _ := structured(t, res)
+				var rest map[string]any
+				if err := json.Unmarshal(restBody, &rest); err != nil {
+					t.Fatal(err)
+				}
+				if got["planId"] != mcpPlan.String() || rest["planId"] != restPlan.String() || (got["turnId"] == nil) != (rest["turnId"] == nil) {
+					t.Fatalf("%s: MCP %v, REST %v -- want each its own plan, and a turn on both sides or neither", stage, got, rest)
+				}
+				for _, m := range []map[string]any{got, rest} {
+					delete(m, "planId")
+					delete(m, "turnId")
+				}
+				a, _ := json.Marshal(got)
+				b, _ := json.Marshal(rest)
+				if string(a) != string(b) {
+					t.Fatalf("%s: MCP %s, REST %s -- want the same body, ids aside", stage, a, b)
+				}
+
+				mcpState, mcpStamps := readDecisionState(ctx, t, rig, mcpSession, mcpPlan, flow.member.ID)
+				restState, restStamps := readDecisionState(ctx, t, rig, restSession, restPlan, flow.member.ID)
+				sameState(t, stage, mcpState, restState)
+				assertMCPStamps(ctx, t, rig, flow, stage, mcpStamps, restStamps)
+
+				wantStatus, wantText, wantImplementations := "approved", "Plan approved — implementation started.", 1
+				if verdict == "reject" {
+					wantStatus, wantText, wantImplementations = "rejected", "Plan rejected.", 0
+				}
+				text, _ := json.Marshal(wantText)
+				if mcpState.PlanStatus != wantStatus || len(mcpState.Implementations) != wantImplementations || len(mcpState.Outbox) != 1 || !strings.HasPrefix(mcpState.Outbox[0], origin.kind+" pending correlated=true ") || !strings.Contains(mcpState.Outbox[0], `"text":`+string(text)) {
+					t.Fatalf("%s: state %+v, want the plan %s, %d implementation turn(s) and one pending %s notice saying %q", stage, mcpState, wantStatus, wantImplementations, origin.kind, wantText)
+				}
+				if verdict == "approve" {
+					var prompt string
+					if err := rig.pool.QueryRow(ctx, `SELECT prompt FROM turns WHERE session_id = $1 AND NOT plan_mode`, mcpSession).Scan(&prompt); err != nil {
+						t.Fatalf("%s: read the implementation turn: %v", stage, err)
+					}
+					if !strings.HasPrefix(prompt, preamble) {
+						t.Fatalf("%s: the implementation's prompt %q, want it led by the epistemic preamble", stage, prompt)
+					}
+				}
+			}
+		}
+	})
+
+	t.Run("turns", func(t *testing.T) {
+		other, _ := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMember)
+		awaitingPlan := func() pgtype.UUID {
+			session, _ := seedPlannedSession(ctx, t, rig, flow.member.ID, sqlcgen.PlanStatusAwaitingApproval)
+			return session
+		}
+		joined := func() pgtype.UUID {
+			session, err := narvipg.NewSessionStore(rig.pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb, CreatedBy: other.ID})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := narvipg.NewParticipantStore(rig.pool).Create(ctx, session.ID, flow.member.ID); err != nil {
+				t.Fatalf("join the session: %v", err)
+			}
+			return session.ID
+		}
+		before := classifier.calls.Load()
+		for _, tc := range []struct {
+			name, tool, field, text string
+			// planMode is what the route is asked for; wantPlanMode what the
+			// turn is.
+			planMode, wantPlanMode, wantPreamble bool
+			seed                                 func() pgtype.UUID
+		}{
+			{"a prompt read as a change to the plan awaiting approval", "narvi_send_prompt", "prompt", "use the env fallback instead", false, true, false, awaitingPlan},
+			{"an ordinary prompt on a session the user joined", "narvi_send_prompt", "prompt", "add a changelog entry", false, false, true, joined},
+			{"a revision", "narvi_request_plan_revision", "feedback", "split the migration in two", true, true, false, awaitingPlan},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				mcpSession, restSession := tc.seed(), tc.seed()
+				res := callTool(ctx, t, flow.session, tc.tool, map[string]any{"sessionId": mcpSession.String(), tc.field: tc.text})
+				var rest map[string]any
+				status := rig.doJSON(t, http.MethodPost, "/api/sessions/"+restSession.String()+"/turns", []byte(fmt.Sprintf(`{"prompt":%q,"modelId":null,"effort":null,"planMode":%v}`, tc.text, tc.planMode)), &rest, flow.cookie)
+				if status != http.StatusCreated || res.IsError {
+					t.Fatalf("REST %d %v, MCP %+v -- want both to create a turn", status, rest, res.Content)
+				}
+				got, _ := structured(t, res)
+				mcpTurn, _ := got["id"].(string)
+				restTurn, _ := rest["id"].(string)
+				if mcpTurn == "" || restTurn == "" || got["status"] != rest["status"] || len(got) != len(rest) {
+					t.Fatalf("MCP %v, REST %v -- want the same answer, ids aside", got, rest)
+				}
+				row := sameCreatedTurn(ctx, t, rig, flow, grant, mcpSession, mcpTurn, restSession, restTurn, tc.wantPlanMode)
+				if !strings.HasPrefix(row, fmt.Sprintf("plan_mode=%v ", tc.wantPlanMode)) || !strings.Contains(row, tc.text) {
+					t.Fatalf("MCP turn %q, want plan_mode %v carrying %q", row, tc.wantPlanMode, tc.text)
+				}
+				if !strings.Contains(row, upload.RenderUploadToolNote("<session>")) || strings.Contains(row, preamble) != tc.wantPreamble {
+					t.Fatalf("MCP turn %q, want the upload note, and the epistemic preamble %v", row, tc.wantPreamble)
+				}
+			})
+		}
+		// The prompt read as a change to the plan asked the classifier once
+		// over each channel; nothing else asks it.
+		if n := classifier.calls.Load() - before; n != 2 {
+			t.Fatalf("the classifier was asked %d time(s), want twice", n)
+		}
+	})
 }
 
 // writeToolNames is every write tool, sorted.

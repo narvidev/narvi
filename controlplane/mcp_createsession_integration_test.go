@@ -60,6 +60,13 @@ const createRepo = "acme/widgets"
 // since pgxpool's Close waits for every connection an actor still holds.
 func createRouterRig(t *testing.T, connStr string, adjust func(*platform.Timeouts)) *oauthRouterRig {
 	t.Helper()
+	return createRouterRigWith(t, connStr, nil, adjust)
+}
+
+// createRouterRigWith is createRouterRig with env set for its Build alone
+// (newOAuthRouterRigWith's own env).
+func createRouterRigWith(t *testing.T, connStr string, env map[string]string, adjust func(*platform.Timeouts)) *oauthRouterRig {
+	t.Helper()
 	ctx := context.Background()
 	cfg, err := pgxpool.ParseConfig(connStr)
 	if err != nil {
@@ -71,7 +78,7 @@ func createRouterRig(t *testing.T, connStr string, adjust func(*platform.Timeout
 		t.Fatalf("create router pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
-	rig := newOAuthRouterRigWith(t, pool, nil, cimdfetch.GuardConfig{}, adjust)
+	rig := newOAuthRouterRigWith(t, pool, env, cimdfetch.GuardConfig{}, adjust)
 	t.Cleanup(func() { _ = rig.app.registry.Shutdown() })
 	if err := narvipg.NewGitHubPRSessionStore(pool).EnsureRow(ctx, createRepo, 1); err != nil {
 		t.Fatalf("make %s known: %v", createRepo, err)

@@ -425,9 +425,11 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 	// host adapter, which no test may reach.
 	resultID := seedResultSession(ctx, t, pool, user.ID).String()
 	// A session with two plan versions, so the plan list compares real rows
-	// (§43.21). The write twins' wiring is pinned by the production router's
-	// own parity subtests (mcp_plandecisions_integration_test.go), which
-	// compare each write with its REST twin's effect.
+	// (§43.21). The write twins' wiring is pinned apart, by
+	// TestOAuth_ProductionRouter's WriteTwins_EveryArgumentLikeREST_SDKClient
+	// (mcp_plandecisions_integration_test.go): on a router configured so that
+	// every argument they read shows in what they write, it compares each
+	// write with its REST twin's rows, the notices included.
 	plannedID := seedTwoPlanVersions(ctx, t, pool, user.ID).String()
 
 	tests := []struct {
