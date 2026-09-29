@@ -92,8 +92,8 @@ func TestMigrationCreateIdempotencyKey_UpAndDown(t *testing.T) {
 	}
 	// The pair travels together, and the hash is a SHA-256.
 	for name, tc := range map[string]struct{ key, hash string }{
-		"a key without its hash": {other, ""},
-		"a hash without its key": {"", hash},
+		"a key without its hash":     {other, ""},
+		"a hash without its key":     {"", hash},
 		"a hash of the wrong length": {other, "0011"},
 	} {
 		if err := insert(alice, tc.key, tc.hash); err == nil || !strings.Contains(err.Error(), "sessions_create_idempotency_pair_check") {
@@ -127,4 +127,22 @@ func TestMigrationCreateIdempotencyKey_UpAndDown(t *testing.T) {
 		t.Fatalf("up to 150 again: %v", err)
 	}
 	assertCleanVersion(t, connStr, 150)
+}
+
+// TestMigration000150_ConcurrentMigrators is two control planes booting at
+// once onto 000150: one applies it while the other waits on
+// golang-migrate's advisory lock, holding a snapshot. The file builds its
+// unique index plainly, in its own transaction, never CONCURRENTLY -- a
+// concurrent build would wait for that snapshot while its holder waits for
+// the build, a deadlock (000144's own reason) -- so both boots succeed, the
+// version is clean, and the index is there and valid.
+func TestMigration000150_ConcurrentMigrators(t *testing.T) {
+	ctx := context.Background()
+	connStr, db := migrationTestDatabase(ctx, t, 149)
+	concurrentMigratorsUp(ctx, t, connStr, db, 150)
+
+	var valid bool
+	if err := db.QueryRowContext(ctx, `SELECT indisvalid FROM pg_index WHERE indexrelid = 'sessions_create_idempotency_key_uniq'::regclass`).Scan(&valid); err != nil || !valid {
+		t.Fatalf("sessions_create_idempotency_key_uniq valid = %v (err %v), want a valid index", valid, err)
+	}
 }

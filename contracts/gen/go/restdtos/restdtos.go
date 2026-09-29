@@ -2169,13 +2169,20 @@ type CreateSessionRequest struct {
 	EpistemicCheckEnabled CreateSessionRequestEpistemicCheckEnabled `json:"epistemicCheckEnabled,omitempty,omitzero" yaml:"epistemicCheckEnabled,omitempty" mapstructure:"epistemicCheckEnabled,omitempty"`
 
 	// Optional (§43.8). A UUID the caller chooses for this one create request, so a
-	// retry cannot start a second session. It is scoped to the authenticated user and
-	// kept with the session it created (sessions.create_idempotency_key,
-	// migrations/000150). The same key sent again with the same request -- compared
-	// as this DTO re-encoded without the key -- answers 200 with that session as it
-	// is now, and creates, audits and dispatches nothing. The same key with a
-	// different request is refused with 409. Absent means no replay protection,
-	// exactly as before. The narvi_create_session MCP tool always sends one.
+	// retry cannot start a second session: 8-4-4-4-12 hexadecimal digits, in either
+	// case, both cases being one key; any other spelling is refused with 400. It is
+	// scoped to the authenticated user, one namespace across this route and the
+	// narvi_create_session MCP tool, and kept with the session it created
+	// (sessions.create_idempotency_key, migrations/000150). The same key sent again
+	// with the same request answers 200 with that session as it is now, and creates,
+	// audits and dispatches nothing. Requests are compared by what they ask for, not
+	// how their JSON is written: key order, whitespace, unknown fields, this key, and
+	// an optional field absent or given the value the route reads the same way (null,
+	// false, an empty list) make no difference. The same key with a different request
+	// is refused with 409, and so is a key whose session was started the other way
+	// (by this route when the call comes over MCP, or over MCP when it does not).
+	// Absent means no replay protection, exactly as before. The narvi_create_session
+	// MCP tool always sends one.
 	IdempotencyKey *string `json:"idempotencyKey,omitempty,omitzero" yaml:"idempotencyKey,omitempty" mapstructure:"idempotencyKey,omitempty"`
 
 	// Optional (row 27, 'mocking + contract drift', §14.3). Like pathScope above,
@@ -2530,7 +2537,7 @@ type CreateSessionToolRequest struct {
 	// A new UUID for each session you mean to start, reused only to retry that same
 	// call. A retry with the same key and the same arguments returns the session the
 	// first call started and starts nothing; the same key with different arguments is
-	// refused.
+	// refused, and so is a key the user already used to start a session another way.
 	IdempotencyKey string `json:"idempotencyKey" yaml:"idempotencyKey" mapstructure:"idempotencyKey"`
 
 	// The model of the first turn, an id narvi_list_models lists. Omitted means the

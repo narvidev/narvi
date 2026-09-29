@@ -133,8 +133,10 @@ start included -- it does not stop a session the app already started, which
 runs to its end like any other: no stop action exists yet, over MCP or REST.
 What bounds a runaway app meanwhile is its brakes, both per authorization
 and per control-plane replica: a burst of 30 calls to `POST /mcp`, then one
-a second, answered `429` past that; and a burst of 5 session starts, then
-one a minute, refused past that without starting anything. Both refusals
+a second, answered `429` past that; and a burst of 5 calls to
+`narvi_create_session`, then one a minute -- a retry counting as a call, so
+the app starts at most that many sessions -- refused past that without
+starting anything. Both refusals
 are logged at WARN (`mcpauth: rate limited`, `mcp: session start refused by
 the create brake`) with the `grant_id` and `client_id`, and neither is
 audited.

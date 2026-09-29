@@ -376,9 +376,10 @@ func CreateSession(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *p
 		source := recordedSpawnSource(ctx)
 
 		// §43.8: a create carrying an idempotencyKey this user has already
-		// used is a replay, answered from the session that key created --
-		// looked up only now, after authorization above, so a key is never
-		// a way to read a session its holder could not create.
+		// used is a replay, answered from the session that key created when
+		// that session records source too (replayCreate) -- looked up only
+		// now, after authorization above, so a key is never a way to read a
+		// session its holder could not create.
 		key, kerr := parseIdempotencyKey(req)
 		if kerr != nil {
 			writeError(w, http.StatusBadRequest, kerr.Error())
@@ -393,7 +394,7 @@ func CreateSession(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *p
 				return
 			}
 			requestSHA256 = sum
-			if replayCreate(w, r, sessions, createdBy, key, requestSHA256) {
+			if replayCreate(w, r, sessions, createdBy, key, source, requestSHA256) {
 				return
 			}
 		}
@@ -413,8 +414,9 @@ func CreateSession(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *p
 			// A concurrent create with the same key committed first: this
 			// one's insert waited on the unique index, failed, and rolled
 			// back. The winner is committed now, so it is read and answered
-			// like any replay -- one session either way.
-			if cerr.IdempotencyConflict && replayCreate(w, r, sessions, createdBy, key, requestSHA256) {
+			// like any replay, its source compared too -- one session
+			// either way.
+			if cerr.IdempotencyConflict && replayCreate(w, r, sessions, createdBy, key, source, requestSHA256) {
 				return
 			}
 			writeError(w, cerr.Status, cerr.Message)

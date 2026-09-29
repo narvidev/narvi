@@ -7347,19 +7347,36 @@ one), models, efforts and plan mode, and a required `idempotencyKey`; it offers 
 of the create's environment settings (path scope, mocks, Docker, egress policy). Its output is `Session`.
 
 *Idempotent create.* `CreateSessionRequest` gains an optional `idempotencyKey` (a UUID), which the tool
-always sends. The key is scoped to the authenticated user and kept with the session it created
-(`sessions.create_idempotency_key`, beside `create_request_sha256`, the SHA-256 of the request DTO
-re-encoded without the key; migration `000150`, whose CHECK keeps the two together and whose partial
-unique index is on `(created_by, create_idempotency_key)`). After authorization and the source check, the
-route looks the key up: the same hash answers `200` with that session as it is now — the first call
-answered `201` — and creates, audits and dispatches nothing; a different hash is refused `409`
-("idempotencyKey reused with a different request"); a key that is not a UUID is refused `400`. Two
-concurrent creates under one key both find nothing and both insert: the second insert waits on the
+always sends. The key is scoped to the authenticated user — one namespace across REST and MCP — and kept
+with the session it created (`sessions.create_idempotency_key`, beside `create_request_sha256`; migration
+`000150`, whose CHECK keeps the two together and whose partial unique index is on `(created_by,
+create_idempotency_key)`). The hash is the SHA-256 of the request's canonical form
+(`httpapi.createRequestFingerprint`): the decoded DTO's fields the route reads, in a fixed order, each
+set of spellings the route treats alike written one way — an absent, null or empty `pathScope`; a
+`mockConfig` as the contracts path it resolves to; an absent or empty egress allowlist — and without
+the key or `spawnSource`, which the route holds to `web`. So key order, whitespace, unknown fields and
+an optional field absent or given its default make no difference, and a test fails when a field is
+added to the DTO and not to the canonical form. After authorization and the source check, the route
+looks the key up. A session recording another source than this create would (§43.1) is refused `409`
+("idempotencyKey already used for a session started another way"), whatever the request: a replay only
+answers the surface that started the session, so the tool never returns a `web` session and a cookie
+never an `mcp` one. Otherwise the same hash answers `200` with that session as it is now — the first
+call answered `201` — and creates, audits and dispatches nothing, and a different hash is refused `409`
+("idempotencyKey reused with a different request"). The key must be spelled the way `format: uuid`, and
+so the tool's schema check, accepts it — 8-4-4-4-12 hexadecimal digits, either case, both one key since
+it is stored as a `uuid` — and any other spelling, even one Postgres would read as a UUID, is refused
+`400`.
+Two concurrent creates under one key both find nothing and both insert: the second insert waits on the
 unique index until the first commits, fails with `23505` on it, and the route reads the winner back and
-answers it as a replay, so one row results whatever the timing. Authorization runs before the lookup,
-so a key is never a way to read a session its holder could not create. A create with no key behaves
-exactly as before. Rolling migration `000150` back drops the stored keys: a retry after that is not
-recognised.
+answers it as a replay, source compared, so one row results whatever the timing. Authorization runs
+before the lookup, so a key is never a way to read a session its holder could not create. A create with
+no key behaves exactly as before. Once `000150` is applied a binary without it cannot boot (every boot
+migrates up, and golang-migrate refuses a version it has no file for), and every query of a binary with
+it that returns a whole session names the new columns: so its down migration runs with the control
+plane scaled to zero, before the older binary is deployed (the migration's header gives the sequence),
+and it drops the stored keys, so a retry after that is not recognised. The migration's one implicit
+transaction holds `ACCESS EXCLUSIVE` on `sessions` through its unique index's plain build, so reads of
+`sessions` wait for it too.
 
 *The create brake.* Every session started spawns a sandbox and spends on models, which the per-grant
 call brake (§43.6), paced in seconds, does not bound. So `narvi_create_session` also takes one start
@@ -7369,7 +7386,13 @@ twin runs. The adapter may not import `mcpauth`, so `mcp.Config.CreateBrake` nam
 needs, which `*mcpauth.RateLimiter` satisfies; `NewHandler` refuses a nil one. A refused call runs no
 twin, writes nothing and answers `isError` "too many sessions started through this authorization; retry
 in N s", logged at WARN with the grant and client. A retry under the same key takes a start from the
-bucket too: the brake runs before the twin, which alone knows it is a replay. The limits are stated,
+bucket too: the brake runs before the twin, which alone knows it is a replay. So the tool's description
+and the guide count calls, not sessions, and say it: a refused call started nothing and says how many
+seconds to wait, and the same-key retry after that wait answers the session an earlier call started.
+Charging only a call that starts a session was weighed and left: `x/time/rate` cannot give a token back
+once its reservation has acted (`Reservation.Cancel` is a no-op then), so a refund after the twin answers
+would need a bucket of the adapter's own — and it would not help the retry that matters, since with the
+bucket empty the retry is refused before the twin can tell it is one. The limits are stated,
 not hidden: both brakes are per replica, and a user with several grants has a bucket per grant.
 
 Before a tool's `BuildRequest`, its brake or its twin runs, the raw `arguments` object is validated against that SAME tool's own input
@@ -8184,9 +8207,12 @@ A change made over MCP says so. `auditlog.Record`, the one audit writer, stamps 
 {grant_id, client_id}` on every row it writes under a context that carries a `platform.MCPGrant` — every
 tool call's twin runs under the MCP request's own context — naming the user's approval of one client and
 that client's public `client_id`, never a token. It stamps a copy, never the caller's map, and the grant
-overrides a caller's own `mcp` key. That covers every write a tool makes in its own transaction —
-`session.create` today, and `session.repo_entitlement_denied` when the entitlement gate refuses a create
-over MCP — while a change made with the cookie carries no stamp. The row's actor stays the user: the
+overrides a caller's own `mcp` key. The stamp comes from the context, not from any transaction, so it
+covers every audit row a tool call writes, whatever it writes on: `session.create`, in the create's
+transaction, and `session.repo_entitlement_denied`, which the entitlement gate writes through the pool
+before that transaction opens when it refuses a create over MCP — that row, the gate's WARN line and its
+counter all say `spawn_source` `mcp`, as the rollout gate's WARN line and counter do. A change made with
+the cookie carries no stamp. The row's actor stays the user: the
 grant says through which client they acted, not who acted. The grant is read there as a label, never as
 a permission (`platform.MCPGrant`'s own doc comment lists every reader).
 
@@ -8213,9 +8239,9 @@ a permission (`platform.MCPGrant`'s own doc comment lists every reader).
 | Table growth | a TTL on every row kind, rotated refresh tokens included, swept; unused, enabled self-registered clients swept, never one whose request or grant committed while the sweep waited; dynamic registration and the authorization endpoint braked per client network (`RemoteAddr` only; IPv6 by /48, except an IPv6 address carrying an IPv4 client's address — IPv4-mapped, NAT64's well-known prefix, IPv4-compatible, Teredo — keyed as that IPv4 address; behind a proxy that hides client addresses, one network for everyone, §43.14), with bounded limiter memory that no network can use to lock out another; at most `MCPMaxPendingAuthorizationRequestsPerClient` requests of one client pending, counted and stored under the client's lock so no race exceeds it, refused past it with a page that stores nothing and a WARN line naming the client and the refused request's network — a flood for one client can hold that client at its cap, stated in §43.14, never touching a connected app or another client's cap — though behind such a proxy it also spends the one authorization brake every user shares. These bound how long each row lives and how many requests one client has waiting, not how many rows there are: while metadata documents or dynamic registration are on, a party can mint clients, each with an empty cap, and only the brakes limit how fast; switching both off is the one hard bound (§43.14) | `TestExpiredCleanup_SweepsMCPRows`, `TestExpiredCleanup_SweepsUnusedMCPClients`, `TestLockOrder_ClientRegistrationWriters`, `TestLockOrder_AuthorizationRequestWriter`, `TestAuthorize_PendingCapRefused`, `TestMCPOAuthGrantStore_PendingAuthorizationRequestCap`, `TestRateLimiter_BurstThenOnePerInterval`, `TestRateLimiter_BoundedMemoryEvictsLeastRecentlyUsed`, `TestRateLimiter_OneNetworkCannotLockOutOthers`, `TestClientAddressKey`, `TestAuthorizeRateLimited_Answer`, `TestOAuth_ProductionRouter/Register_RateLimited`, `TestOAuth_ProductionRouter/RateLimit_AuthorizeEndpoint`, `TestOAuth_ProductionRouter/Authorize_PendingCapRefused` |
 | Abuse of the token endpoint, and a brake that locks users out | the token endpoint braked per client network; a refused request is read no further — no code consumed, no refresh token rotated — and answered `429` `temporarily_unavailable`, never `invalid_grant`, so a client keeps its refresh token and is never sent back to consent by the brake; one network's flood, an IPv6 /48 spraying /64s included, never spends another's bucket, and IPv4 clients behind a translator the address names (NAT64's well-known prefix, Teredo) are each their own network — a network being only the connecting address (`RemoteAddr`), never a forwarded header: behind a proxy that hides client addresses every user is the proxy's one network, so one sender's flood refuses everyone's refresh for as long as it lasts, until trusting a forwarded header is decided (§43.14); the refusal is logged with the path and the network, never a token or a query | `TestTokenRateLimited_Answer`, `TestRateLimiter_RefusalLogCarriesNoCredential`, `TestRateLimiter_TranslatedIPv4ClientsKeepTheirOwnBuckets`, `TestOAuth_ProductionRouter/RateLimit_TokenEndpoint429`, `TestOAuth_ProductionRouter/RateLimit_OneNetworkCannotLockOutAnotherRefresh`, `TestOAuth_ProductionRouter/RateLimit_RefusedRefreshSpendsNothing_SDK` |
 | A token doing more than its user | same twins, same authz check, role read per call -- a create included: a viewer's read+write grant is refused as the viewer's cookie is | `TestParity_BearerEqualsCookieForEveryRole`, `TestOAuth_ProductionRouter/CreateSession_ViewerRefusedLikeREST_SDKClient` |
-| Forged provenance over MCP | the source a create records comes from the grant on the context, never from the body or the credential type; the body's `spawnSource` stays `web`-only on the route; the tool's input has no `spawnSource` | `TestCreateSession_RecordsMcpOnlyWithAGrant`, `TestCreateSession_NonWebSpawnSource_Rejected`, `TestCreateSessionTool_SpawnSourceArgumentRefused`, `TestOAuth_ProductionRouter/CreateSession_SDKClient` |
-| A retried create starting, and paying for, a second session | a required per-user idempotency key, kept with the session: same request answers the session, a different one `409`; a unique index settles two concurrent creates | `TestCreateSession_IdempotencyKey_Table`, `TestCreateSession_IdempotencyKey_ConcurrentReplaysCreateOne`, `TestMigrationCreateIdempotencyKey_UpAndDown`, `TestOAuth_ProductionRouter/CreateSession_SameKeyRetryCreatesOne_SDKClient` |
-| A runaway client | a per-grant brake on `/mcp` after the bearer gate, answered `429` before anything runs, and a per-grant brake on starting sessions before the twin; logged with the grant and client, never the token, never audited; one grant's flood never spends another's | `TestRateLimiter_LimitByKey`, `TestMCPCallRateLimited_Answer`, `TestCreateSessionTool_BrakeRefusesBeforeTheTwin`, `TestNewHandler_RefusesNoCreateBrake`, `TestOAuth_ProductionRouter/RateLimit_MCPPerGrant429`, `TestOAuth_ProductionRouter/RateLimit_CreateSessionPerGrant` |
+| Forged provenance over MCP | the source a create records comes from the grant on the context, never from the body or the credential type; the body's `spawnSource` stays `web`-only on the route; the tool's input has no `spawnSource`; the gates' refusals of a create over MCP are logged, counted and audited as `mcp` | `TestCreateSession_RecordsMcpOnlyWithAGrant`, `TestCreateSession_NonWebSpawnSource_Rejected`, `TestCreateSessionTool_SpawnSourceArgumentRefused`, `TestCreateSession_McpRefusalsCarryTheMcpLabel`, `TestOAuth_ProductionRouter/CreateSession_SDKClient` |
+| A retried create starting, and paying for, a second session | a required per-user idempotency key, one namespace across REST and MCP, kept with the session and spelled only as a UUID: the same request, however its JSON is written, answers the session, a different one `409`, and a session started the other way `409`; a unique index settles two concurrent creates, and the migration's plain index build never deadlocks a second booting control plane | `TestParseIdempotencyKey_Table`, `TestCreateRequestSHA256_Table`, `TestCreateRequestFingerprint_CoversTheRequest`, `TestCreateSession_IdempotencyKey_Table`, `TestCreateSession_IdempotencyKey_ConcurrentReplaysCreateOne`, `TestMigrationCreateIdempotencyKey_UpAndDown`, `TestMigration000150_ConcurrentMigrators`, `TestOAuth_ProductionRouter/CreateSession_SameKeyRetryCreatesOne_SDKClient`, `TestOAuth_ProductionRouter/CreateSession_KeyUsedAnotherWayRefused_SDKClient` |
+| A runaway client | a per-grant brake on `/mcp` after the bearer gate, answered `429` before anything runs, and a per-grant brake on starting sessions before the twin; logged with the grant and client, never the token, never audited; one grant's flood never spends another's, another user's grant of the same client included | `TestRateLimiter_LimitByKey`, `TestMCPCallRateLimited_Answer`, `TestCreateSessionTool_BrakeRefusesBeforeTheTwin`, `TestNewHandler_RefusesNoCreateBrake`, `TestOAuth_ProductionRouter/RateLimit_MCPPerGrant429`, `TestOAuth_ProductionRouter/RateLimit_CreateSessionPerGrant`, `TestOAuth_ProductionRouter/RateLimit_MCPPerGrantShippedRefill` |
 | A write that cannot be traced to the client that made it | the one audit writer stamps `detail.mcp = {grant_id, client_id}` under an MCP grant, on a copy of the caller's detail | `TestAuditRecord_StampsMCPGrant`, `TestStampMCPGrant_Table`, `TestCreateSession_RecordsMcpOnlyWithAGrant`, `TestOAuth_ProductionRouter/CreateSession_SDKClient` |
 
 The row's exit criterion is proven end to end by `TestOAuth_ProductionRouter/EndToEnd_SDKClient`, on
@@ -8278,9 +8304,12 @@ equals the REST twin's for the same request by the member's cookie (id, times an
 row records `mcp` and the member, whose `session.create` audit row carries the grant and the client, and
 whose explicit intent decision names the `mcp` surface; `CreateSession_SameKeyRetryCreatesOne_SDKClient`
 retries under the same key and finds one session, one audit row and one turn, and the same key with
-other arguments refused; `WriteTools_ReadGrantSeesNoneAndCannotCall_SDKClient` has the member uncheck
-`mcp:write` on a consent page that offered both, and `WriteTools_ScopelessGrantSeesNone` both, and in
-each the tool is not listed, a call answers an unknown tool's bytes and nothing is written;
+other arguments refused; `CreateSession_KeyUsedAnotherWayRefused_SDKClient` has a key the member used by
+cookie refused to the member's app, and one the app used refused to the cookie, the same arguments each
+time, nothing written either way; `WriteTools_ReadGrantSeesNoneAndCannotCall_SDKClient` has the member
+uncheck `mcp:write` on a consent page that offered both pre-checked (owner decision O7, asserted there),
+and `WriteTools_ScopelessGrantSeesNone` both, and in each the tool is not listed, a call answers an
+unknown tool's bytes and nothing is written;
 `CreateSession_ViewerRefusedLikeREST_SDKClient` has a viewer's read+write grant list the tool and be
 refused with the very text REST's `403` gives the viewer's cookie. These run on a router of their own,
 built on a pool of its own: every session started spawns a session actor holding a connection until the
@@ -8289,10 +8318,15 @@ shared router -- `liftEndpointBrakes` lifts the per-grant `/mcp` and session-sta
 with the token and authorization endpoints' -- and a second one keeps the shipped brakes but stretches
 the `/mcp` refill to an hour, so its proofs are the burst's: `RateLimit_MCPPerGrant429` spends one
 grant's shipped burst of 30, then finds a create answered `429` with a `Retry-After` of the interval
-the router built the brake with, no session started, another grant of the same user carrying on, one
-WARN line naming the grant and client and no token, and no audit row; `RateLimit_CreateSessionPerGrant`
-starts the shipped burst of 5 sessions through one grant, then finds the next refused with a wait of at
-most a minute and no row written, while another grant of the same user starts one.
+the router built the brake with, no session started, another grant of the same user and another user's
+grant of the same client both carrying on, one WARN line naming the grant and client and no token, and
+no audit row; `RateLimit_CreateSessionPerGrant` starts the shipped burst of 5 sessions through one grant,
+then finds the next refused with a wait of at most a minute and no row written, and so is a same-key
+retry of the last one, while another grant of the same user and another user's grant of the same client
+each start one. The shipped one-second `/mcp` refill has its own proof on the router that keeps every
+shipped value: `RateLimit_MCPPerGrantShippedRefill` sends calls back to back, faster than the refill,
+and finds at least the burst served and at most the burst plus one a second elapsed plus one, then a
+`429` with `Retry-After: 1`.
 
 ### 43.20 A session's live status, its result, and its transcript apart from them
 

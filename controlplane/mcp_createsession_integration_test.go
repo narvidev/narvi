@@ -7,14 +7,17 @@
 // for the same request by the member's cookie (id, times and source aside),
 // whose row records mcp and the member as creator, whose audit row carries
 // the grant, and whose intent decision names the mcp surface; a retry with
-// the same key yields that one session; a read-only grant, and a
-// scope-less one, neither see the tool nor can call it -- a call answers
-// exactly what an unknown tool answers, and writes nothing; a viewer is
-// refused exactly as REST refuses the viewer's cookie. Then the brakes, on
-// routers built with the shipped create brake: /mcp refuses a grant past
-// its burst with 429 before any tool runs, while another grant of the same
-// user carries on; and narvi_create_session starts no session past its own
-// burst.
+// the same key yields that one session, while a key the member used by
+// cookie is refused to the app and the other way round; a read-only grant,
+// and a scope-less one, neither see the tool nor can call it -- a call
+// answers exactly what an unknown tool answers, and writes nothing; a
+// viewer is refused exactly as REST refuses the viewer's cookie. Then the
+// brakes, on routers built with the shipped create brake: /mcp refuses a
+// grant past its burst with 429 before any tool runs, while another grant
+// of the same user, and another user's grant of the same client, carry
+// on; narvi_create_session starts no session past its own burst, a retry
+// included; and, on a router with every shipped value, /mcp refills one
+// call a second.
 //
 // Every session a create starts spawns a session actor, and every live
 // actor holds a pool connection until its registry shuts down. So the
@@ -253,6 +256,63 @@ func sdkCreateSessionSameKeyRetry(t *testing.T, rig *oauthRouterRig) {
 	}
 }
 
+// sdkCreateSessionKeyAcrossSources is TestOAuth_ProductionRouter's
+// CreateSession_KeyUsedAnotherWayRefused_SDKClient (§43.8): a user's keys are
+// one namespace across REST and MCP, but a replay only answers the source
+// that started the session. So a key the member used by cookie is refused
+// to the member's app, and a key the app used is refused to the member's
+// cookie -- each with the same arguments, each with the 409's text, and
+// neither starting, auditing or answering anything: the app never gets a
+// session whose spawnSource is web, nor the cookie one whose is mcp.
+func sdkCreateSessionKeyAcrossSources(t *testing.T, rig *oauthRouterRig) {
+	ctx := oauthTestCtx(t)
+	flow := rig.connectSDKClient(ctx, t, nil)
+	const refusal = "idempotencyKey already used for a session started another way"
+	counts := func() (sessions, audits int) {
+		t.Helper()
+		return rig.countOf(ctx, t, `SELECT count(*) FROM sessions WHERE created_by = $1`, flow.member.ID),
+			rig.countOf(ctx, t, `SELECT count(*) FROM audit_log WHERE actor_user_id = $1`, flow.member.ID)
+	}
+
+	// By cookie, then over MCP.
+	const restKey = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+	var rest map[string]any
+	if status := rig.doJSON(t, http.MethodPost, "/api/sessions", restCreateBody("one key, two ways", restKey), &rest, flow.cookie); status != http.StatusCreated || rest["spawnSource"] != "web" {
+		t.Fatalf("REST create by cookie: status %d body %v, want 201 recording web", status, rest)
+	}
+	sessionsBefore, auditsBefore := counts()
+	res, err := callCreate(ctx, flow.session, "one key, two ways", restKey)
+	if err != nil || !res.IsError || len(res.Content) != 1 {
+		t.Fatalf("the app reusing the cookie's key: res %+v err %v, want isError", res, err)
+	}
+	if text, _ := res.Content[0].(*sdkmcp.TextContent); text == nil || text.Text != refusal {
+		t.Fatalf("the app reusing the cookie's key: %+v, want %q", res.Content[0], refusal)
+	}
+	if s, a := counts(); s != sessionsBefore || a != auditsBefore {
+		t.Fatalf("the refused call wrote %d session(s) and %d audit row(s)", s-sessionsBefore, a-auditsBefore)
+	}
+
+	// Over MCP, then by cookie.
+	const mcpKey = "6d7e8f9a-0b1c-4d2e-9f3a-4b5c6d7e8f9a"
+	first, err := callCreate(ctx, flow.session, "the other way round", mcpKey)
+	if err != nil || first.IsError {
+		t.Fatalf("create over MCP: res %+v err %v", first, err)
+	}
+	if got, _ := structured(t, first); got["spawnSource"] != "mcp" {
+		t.Fatalf("create over MCP recorded %v, want mcp", got["spawnSource"])
+	}
+	sessionsBefore, auditsBefore = counts()
+	var refused struct {
+		Error string `json:"error"`
+	}
+	if status := rig.doJSON(t, http.MethodPost, "/api/sessions", restCreateBody("the other way round", mcpKey), &refused, flow.cookie); status != http.StatusConflict || refused.Error != refusal {
+		t.Fatalf("the cookie reusing the app's key: status %d error %q, want 409 %q", status, refused.Error, refusal)
+	}
+	if s, a := counts(); s != sessionsBefore || a != auditsBefore {
+		t.Fatalf("the refused request wrote %d session(s) and %d audit row(s)", s-sessionsBefore, a-auditsBefore)
+	}
+}
+
 // assertCreateHiddenLikeUnknown checks, for a flow whose grant cannot see
 // narvi_create_session, that tools/list omits it, that calling it through
 // the SDK fails, that a raw call answers exactly an unknown tool's bytes
@@ -299,9 +359,11 @@ func sdkWriteToolsReadGrant(t *testing.T, rig *oauthRouterRig) {
 	flow := rig.connectSDKClient(ctx, t, func(d *consentDriver) {
 		d.keepScopes = func([]string) []string { return []string{"mcp:read"} }
 	})
-	// The consent page offered both, pre-checked, and said what write means.
+	// The consent page offered both, pre-checked -- owner decision O7: a
+	// user who clicks Allow without changing anything grants write too --
+	// and said what write means.
 	page := flow.driver.lastPage()
-	for _, want := range []string{`value="mcp:read"`, `value="mcp:write"`, "run code in your repositories and spend on models"} {
+	for _, want := range []string{`value="mcp:read" checked`, `value="mcp:write" checked`, "run code in your repositories and spend on models"} {
 		if !strings.Contains(page, want) {
 			t.Fatalf("the consent page does not show %q", want)
 		}
@@ -367,14 +429,10 @@ func sdkCreateSessionViewer(t *testing.T, rig *oauthRouterRig) {
 }
 
 // mintScopedBearer is mintBuildBearer with the grant's and the token's
-// scopes chosen, returning the token, the grant's id and its client's
-// client_id.
+// scopes chosen, on a client of its own, returning the token, the grant's
+// id and its client's client_id.
 func mintScopedBearer(ctx context.Context, t *testing.T, rig *oauthRouterRig, userID pgtype.UUID, scopes []string) (token, grantID, clientID string) {
 	t.Helper()
-	ids, err := mcpauth.DeriveIdentifiers(rig.cfg.PublicBaseURL)
-	if err != nil {
-		t.Fatalf("DeriveIdentifiers: %v", err)
-	}
 	client, err := narvipg.NewMCPOAuthClientStore(rig.pool).Create(ctx, sqlcgen.CreateMCPOAuthClientParams{
 		ClientID:     fmt.Sprintf("narvi_mcp_c_brake_%d", time.Now().UnixNano()),
 		Kind:         sqlcgen.McpOauthClientKindPreregistered,
@@ -384,9 +442,26 @@ func mintScopedBearer(ctx context.Context, t *testing.T, rig *oauthRouterRig, us
 	if err != nil {
 		t.Fatalf("create client: %v", err)
 	}
+	token, grantID = mintScopedBearerOn(ctx, t, rig, userID, client.ClientID, scopes)
+	return token, grantID, client.ClientID
+}
+
+// mintScopedBearerOn is mintScopedBearer on the existing client whose
+// client_id is clientID -- another user of the same app -- returning the
+// token and the grant's id. A user holds one grant per client.
+func mintScopedBearerOn(ctx context.Context, t *testing.T, rig *oauthRouterRig, userID pgtype.UUID, clientID string, scopes []string) (token, grantID string) {
+	t.Helper()
+	ids, err := mcpauth.DeriveIdentifiers(rig.cfg.PublicBaseURL)
+	if err != nil {
+		t.Fatalf("DeriveIdentifiers: %v", err)
+	}
+	var clientRowID pgtype.UUID
+	if err := rig.pool.QueryRow(ctx, `SELECT id FROM mcp_oauth_clients WHERE client_id = $1`, clientID).Scan(&clientRowID); err != nil {
+		t.Fatalf("read client %s: %v", clientID, err)
+	}
 	grants := narvipg.NewMCPOAuthGrantStore(rig.pool)
 	grant, err := grants.UpsertGrant(ctx, sqlcgen.UpsertMCPOAuthGrantParams{
-		UserID: userID, ClientID: client.ID, Scopes: scopes, Resource: ids.Resource,
+		UserID: userID, ClientID: clientRowID, Scopes: scopes, Resource: ids.Resource,
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
 	})
 	if err != nil {
@@ -403,7 +478,7 @@ func mintScopedBearer(ctx context.Context, t *testing.T, rig *oauthRouterRig, us
 	}); err != nil {
 		t.Fatalf("create token: %v", err)
 	}
-	return token, grant.ID.String(), client.ClientID
+	return token, grant.ID.String()
 }
 
 // rawCall POSTs one tools/call for tool with argumentsJSON under token.
@@ -425,16 +500,19 @@ func brakeTestTimeouts(to *platform.Timeouts) {
 // RateLimit_MCPPerGrant429: one grant's burst of calls reaches the tools;
 // past it /mcp answers 429 with Retry-After and the rate-limited body,
 // before any tool runs -- a create refused there starts nothing -- while
-// another grant of the same user, from the same address, carries on. The
-// refusal is logged at WARN with the grant and client, never the token,
-// and audited nowhere.
+// another grant of the same user, and another user's grant of the same
+// client (the same app), both from the same address, carry on: the bucket
+// is the grant's, not the user's nor the app's. The refusal is logged at
+// WARN with the grant and client, never the token, and audited nowhere.
 func rateLimitMCPPerGrant(t *testing.T, rig *oauthRouterRig) {
 	ctx := oauthTestCtx(t)
 	warnings := captureWarnings(t)
 	member, _ := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMember)
+	colleague, _ := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMember)
 	both := []string{"mcp:read", "mcp:write"}
 	tokenA, grantA, clientA := mintScopedBearer(ctx, t, rig, member.ID, both)
 	tokenB, _, _ := mintScopedBearer(ctx, t, rig, member.ID, both)
+	tokenSameApp, _ := mintScopedBearerOn(ctx, t, rig, colleague.ID, clientA, both)
 	auditBefore := rig.countOf(ctx, t, `SELECT count(*) FROM audit_log`)
 
 	burst := rig.cfg.Timeouts.MCPCallRateBurst
@@ -458,6 +536,9 @@ func rateLimitMCPPerGrant(t *testing.T, rig *oauthRouterRig) {
 	if status, _, raw := rig.rawCall(t, tokenB, "narvi_list_models", `{}`); status != http.StatusOK {
 		t.Fatalf("grant B of the same user, same address: status %d body %s, want its own bucket", status, raw)
 	}
+	if status, _, raw := rig.rawCall(t, tokenSameApp, "narvi_list_models", `{}`); status != http.StatusOK {
+		t.Fatalf("another user's grant of grant A's client, same address: status %d body %s, want its own bucket", status, raw)
+	}
 	lines := warnings.matching("mcpauth: rate limited", "grant_id", grantA)
 	if len(lines) != 1 || lines[0]["client_id"] != clientA || lines[0]["path"] != "/mcp" {
 		t.Fatalf("refusal log lines for grant A = %v, want one naming the path, the grant and the client", lines)
@@ -476,13 +557,18 @@ func rateLimitMCPPerGrant(t *testing.T, rig *oauthRouterRig) {
 // rateLimitCreateSessionPerGrant is TestOAuth_ProductionRouter's
 // RateLimit_CreateSessionPerGrant: one grant starts the shipped burst of
 // sessions; the next start is refused with how long to wait, and writes no
-// row; another grant of the same user still starts one.
+// row -- and so is a retry of the last start under its own key, which
+// counts as a call because the brake runs before the route can tell it is
+// a retry (§43.8); another grant of the same user, and another user's grant
+// of the same client, each still start one.
 func rateLimitCreateSessionPerGrant(t *testing.T, rig *oauthRouterRig) {
 	ctx := oauthTestCtx(t)
 	member, _ := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMember)
+	colleague, _ := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMember)
 	both := []string{"mcp:read", "mcp:write"}
-	tokenA, _, _ := mintScopedBearer(ctx, t, rig, member.ID, both)
+	tokenA, _, clientA := mintScopedBearer(ctx, t, rig, member.ID, both)
 	tokenB, _, _ := mintScopedBearer(ctx, t, rig, member.ID, both)
+	tokenSameApp, _ := mintScopedBearerOn(ctx, t, rig, colleague.ID, clientA, both)
 	burst := rig.cfg.Timeouts.MCPCreateSessionRateBurst
 	if burst != platform.DefaultTimeouts().MCPCreateSessionRateBurst || rig.cfg.Timeouts.MCPCreateSessionRateInterval != time.Minute {
 		t.Fatalf("the router's create brake is %d per %v, want the shipped values", burst, rig.cfg.Timeouts.MCPCreateSessionRateInterval)
@@ -506,23 +592,72 @@ func rateLimitCreateSessionPerGrant(t *testing.T, rig *oauthRouterRig) {
 			t.Fatalf("start %d of grant A's burst: status %d result %v", i+1, status, result)
 		}
 	}
-	status, result := create(tokenA, burst)
-	content, _ := result["content"].([]any)
-	var text string
-	if len(content) == 1 {
-		text, _ = content[0].(map[string]any)["text"].(string)
-	}
-	var seconds int
-	if status != http.StatusOK || result["isError"] != true || !strings.HasPrefix(text, "too many sessions started through this authorization; retry in ") {
-		t.Fatalf("grant A past its burst: status %d result %v, want isError with the brake's refusal", status, result)
-	}
-	if _, err := fmt.Sscanf(strings.TrimPrefix(text, "too many sessions started through this authorization; retry in "), "%d s", &seconds); err != nil || seconds < 1 || seconds > 60 {
-		t.Fatalf("refusal %q, want a wait of one to sixty seconds", text)
+	// Past the burst: a new start, then a retry of the last one under its
+	// own key.
+	for _, i := range []int{burst, burst - 1} {
+		status, result := create(tokenA, i)
+		content, _ := result["content"].([]any)
+		var text string
+		if len(content) == 1 {
+			text, _ = content[0].(map[string]any)["text"].(string)
+		}
+		var seconds int
+		if status != http.StatusOK || result["isError"] != true || !strings.HasPrefix(text, "too many sessions started through this authorization; retry in ") {
+			t.Fatalf("grant A past its burst, call %d: status %d result %v, want isError with the brake's refusal", i, status, result)
+		}
+		if _, err := fmt.Sscanf(strings.TrimPrefix(text, "too many sessions started through this authorization; retry in "), "%d s", &seconds); err != nil || seconds < 1 || seconds > 60 {
+			t.Fatalf("refusal %q, want a wait of one to sixty seconds", text)
+		}
 	}
 	if n := rig.countOf(ctx, t, `SELECT count(*) FROM sessions WHERE created_by = $1`, member.ID); n != burst {
 		t.Fatalf("grant A started %d sessions, want exactly the burst, %d", n, burst)
 	}
 	if status, result := create(tokenB, burst+1); status != http.StatusOK || result["isError"] == true {
 		t.Fatalf("grant B of the same user: status %d result %v, want its own bucket", status, result)
+	}
+	if status, result := create(tokenSameApp, burst+2); status != http.StatusOK || result["isError"] == true {
+		t.Fatalf("another user's grant of grant A's client: status %d result %v, want its own bucket", status, result)
+	}
+	if n := rig.countOf(ctx, t, `SELECT count(*) FROM sessions WHERE created_by = $1`, colleague.ID); n != 1 {
+		t.Fatalf("the colleague started %d sessions, want 1", n)
+	}
+}
+
+// rateLimitMCPShippedRefill is TestOAuth_ProductionRouter's
+// RateLimit_MCPPerGrantShippedRefill, on a router that keeps every shipped
+// value, the /mcp refill included (RateLimit_MCPPerGrant429's router
+// stretches it to an hour): calls sent back to back, faster than the
+// one-a-second refill, are served until the burst and what refilled
+// meanwhile are spent -- at least the burst, at most the burst plus one a
+// second elapsed plus one -- then answered 429 with Retry-After 1.
+func rateLimitMCPShippedRefill(t *testing.T, rig *oauthRouterRig) {
+	ctx := oauthTestCtx(t)
+	shipped := platform.DefaultTimeouts()
+	if got := rig.cfg.Timeouts; got.MCPCallRateBurst != shipped.MCPCallRateBurst || got.MCPCallRateInterval != shipped.MCPCallRateInterval || got.MCPCallRateInterval != time.Second {
+		t.Fatalf("the router's /mcp brake is %d per %v, want the shipped %d per %v, a second", got.MCPCallRateBurst, got.MCPCallRateInterval, shipped.MCPCallRateBurst, shipped.MCPCallRateInterval)
+	}
+	member, _ := createRouterUser(ctx, t, rig.pool, sqlcgen.UserRoleMember)
+	token, _, _ := mintScopedBearer(ctx, t, rig, member.ID, []string{"mcp:read"})
+
+	start := time.Now()
+	served := 0
+	for {
+		status, header, raw := rig.rawCall(t, token, "narvi_list_models", `{}`)
+		if status == http.StatusOK {
+			served++
+			if served > 20*shipped.MCPCallRateBurst {
+				t.Fatalf("%d calls in %v and none refused: calls slower than the refill?", served, time.Since(start))
+			}
+			continue
+		}
+		elapsed := time.Since(start)
+		if status != http.StatusTooManyRequests || header.Get("Retry-After") != "1" || string(raw) != `{"error":"rate limited"}` {
+			t.Fatalf("after %d calls: status %d Retry-After %q body %s, want 429, 1, the rate-limited body", served, status, header.Get("Retry-After"), raw)
+		}
+		if most := shipped.MCPCallRateBurst + int(elapsed/shipped.MCPCallRateInterval) + 1; served < shipped.MCPCallRateBurst || served > most {
+			t.Fatalf("%d calls served in %v before the refusal, want between the burst, %d, and %d", served, elapsed, shipped.MCPCallRateBurst, most)
+		}
+		t.Logf("%d calls served in %v before the refusal", served, elapsed)
+		return
 	}
 }

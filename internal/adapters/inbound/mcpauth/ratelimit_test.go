@@ -369,8 +369,9 @@ func TestRateLimiter_RefusalLogCarriesNoCredential(t *testing.T) {
 
 // TestRateLimiter_LimitByKey is the per-grant /mcp brake (technical plan
 // §43.6): keyed by GrantKey, every call from one address spends only its
-// own grant's bucket -- a second grant on the same address is untouched,
-// and so is the same grant's user under another grant -- a refused call
+// own grant's bucket -- a grant of another client on the same address is
+// untouched, and so is another user's grant of the same client, so one
+// busy user of an app never brakes the app's other users -- a refused call
 // never reaches the handler, and is answered by MCPCallRateLimited and
 // logged at WARN with the grant and client ids and the path, never the
 // bearer token or the body. A request with no grant passes through
@@ -394,13 +395,16 @@ func TestRateLimiter_LimitByKey(t *testing.T) {
 		reached[g.GrantID]++
 		w.WriteHeader(http.StatusOK)
 	}))
+	// grant-a and grant-c are two users' grants of one client, the same
+	// app; grant-b is a grant of another client.
+	clientOf := map[string]string{"grant-a": "narvi_mcp_c_editor", "grant-b": "narvi_mcp_c_other", "grant-c": "narvi_mcp_c_editor"}
 	send := func(grantID string) *httptest.ResponseRecorder {
 		r := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"narvi_create_session","arguments":{"prompt":"secret prompt"}}}`))
 		r.Header.Set("Authorization", "Bearer "+token)
 		// One address for every request: only the grant may tell them apart.
 		r.RemoteAddr = "198.51.100.7:4000"
 		if grantID != "" {
-			r = r.WithContext(platform.WithMCPGrant(r.Context(), platform.MCPGrant{GrantID: grantID, ClientID: "narvi_mcp_c_" + grantID, Scopes: []string{"mcp:read", "mcp:write"}}))
+			r = r.WithContext(platform.WithMCPGrant(r.Context(), platform.MCPGrant{GrantID: grantID, ClientID: clientOf[grantID], Scopes: []string{"mcp:read", "mcp:write"}}))
 		}
 		rec := httptest.NewRecorder()
 		h.ServeHTTP(rec, r)
@@ -421,6 +425,11 @@ func TestRateLimiter_LimitByKey(t *testing.T) {
 			t.Fatalf("grant-b, same address, call %d: status %d, want its own bucket", i+1, rec.Code)
 		}
 	}
+	for i := range 2 {
+		if rec := send("grant-c"); rec.Code != http.StatusOK {
+			t.Fatalf("grant-c, another user of grant-a's client, same address, call %d: status %d, want its own bucket", i+1, rec.Code)
+		}
+	}
 	for i := range 5 {
 		if rec := send(""); rec.Code != http.StatusOK {
 			t.Fatalf("a request with no grant, call %d: status %d, want it passed through unbraked", i+1, rec.Code)
@@ -436,7 +445,7 @@ func TestRateLimiter_LimitByKey(t *testing.T) {
 	if err := json.Unmarshal([]byte(line), &entry); err != nil || strings.Count(line, "\n") != 0 {
 		t.Fatalf("log = %q, want exactly one JSON line", line)
 	}
-	if entry["level"] != "WARN" || entry["msg"] != "mcpauth: rate limited" || entry["path"] != "/mcp" || entry["grant_id"] != "grant-a" || entry["client_id"] != "narvi_mcp_c_grant-a" {
+	if entry["level"] != "WARN" || entry["msg"] != "mcpauth: rate limited" || entry["path"] != "/mcp" || entry["grant_id"] != "grant-a" || entry["client_id"] != "narvi_mcp_c_editor" {
 		t.Fatalf("log entry = %v, want a WARN naming the path, the grant and the client", entry)
 	}
 	if _, ok := entry["client_address"]; ok {

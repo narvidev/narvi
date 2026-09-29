@@ -3235,14 +3235,16 @@ type Timeouts struct {
 	// MCPCreateSessionRateInterval is the refill interval of the per-grant
 	// bucket narvi_create_session consults after its arguments validate and
 	// before its twin runs: after a burst of MCPCreateSessionRateBurst
-	// sessions, one grant may start one more per interval. Every session
+	// calls, one grant may make one more per interval. Every call takes
+	// one, a same-key retry included, since only the twin can tell it is
+	// one; so the bucket bounds the sessions a grant starts. Every session
 	// started spawns a sandbox and spends on models, which a call brake
 	// paced in seconds does not bound. 1 minute.
 	MCPCreateSessionRateInterval time.Duration
 
-	// MCPCreateSessionRateBurst is the per-grant burst of sessions
-	// narvi_create_session starts before MCPCreateSessionRateInterval paces
-	// it. A count, kept beside its interval. 5.
+	// MCPCreateSessionRateBurst is the per-grant burst of
+	// narvi_create_session calls before MCPCreateSessionRateInterval paces
+	// them. A count, kept beside its interval. 5.
 	MCPCreateSessionRateBurst int
 
 	// -- technical plan §43.20 (a session's status and the suggested delay

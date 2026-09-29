@@ -176,8 +176,8 @@ type oauthRouterRig struct {
 // the same loopback address, so on the shipped values this rig's many
 // flows would meet the brake whenever they ran faster than it refills --
 // an outcome decided by timing, never by the code under test. The brakes
-// themselves are proven on routers built with the shipped values (the
-// "brakes" section of TestOAuth_ProductionRouter).
+// themselves are proven on other routers (liftEndpointBrakes' own doc
+// comment lists which values each keeps).
 func newOAuthRouterRig(t *testing.T, pool *pgxpool.Pool) *oauthRouterRig {
 	t.Helper()
 	return newOAuthRouterRigWith(t, pool, nil, cimdfetch.GuardConfig{}, liftEndpointBrakes)
@@ -188,8 +188,14 @@ func newOAuthRouterRig(t *testing.T, pool *pgxpool.Pool) *oauthRouterRig {
 // says why), and the per-grant /mcp and session-start brakes with them
 // (§43.6/§43.8): a test's many calls under one grant would otherwise meet
 // them whenever they ran faster than the brakes refill. Every other timeout
-// stays as shipped; the brakes themselves are proven on routers built with
-// the shipped values.
+// stays as shipped. The brakes themselves are proven elsewhere: the token
+// and authorization endpoints' on the "brakes" router, which keeps every
+// shipped value; the create brake's burst and refill, and the /mcp brake's
+// burst, on the create router (createBraked), which keeps them but
+// stretches the /mcp refill to an hour (brakeTestTimeouts); and the /mcp
+// brake's shipped one-second refill on the "brakes" router
+// (RateLimit_MCPPerGrantShippedRefill), and on a fake clock in
+// TestRateLimiter_LimitByKey.
 func liftEndpointBrakes(to *platform.Timeouts) {
 	to.MCPTokenEndpointRateBurst = 1_000_000
 	to.MCPAuthorizeRateBurst = 1_000_000
@@ -1203,13 +1209,17 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	// test.go's top doc comment). createRig lifts the brakes like rig; the
 	// read-only and scope-less grants and the viewer start nothing, and run
 	// there too. createBraked keeps the shipped brakes but for the /mcp
-	// call brake's refill, stretched to an hour (brakeTestTimeouts).
+	// call brake's refill, stretched to an hour (brakeTestTimeouts); the
+	// shipped refill is RateLimit_MCPPerGrantShippedRefill's, below.
 	createRig := createRouterRig(t, connStr, liftEndpointBrakes)
 	t.Run("CreateSession_SDKClient", func(t *testing.T) {
 		sdkCreateSession(t, createRig)
 	})
 	t.Run("CreateSession_SameKeyRetryCreatesOne_SDKClient", func(t *testing.T) {
 		sdkCreateSessionSameKeyRetry(t, createRig)
+	})
+	t.Run("CreateSession_KeyUsedAnotherWayRefused_SDKClient", func(t *testing.T) {
+		sdkCreateSessionKeyAcrossSources(t, createRig)
 	})
 	t.Run("WriteTools_ReadGrantSeesNoneAndCannotCall_SDKClient", func(t *testing.T) {
 		sdkWriteToolsReadGrant(t, createRig)
@@ -1653,6 +1663,12 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		got.MCPMaxPendingAuthorizationRequestsPerClient != shipped.MCPMaxPendingAuthorizationRequestsPerClient {
 		t.Fatalf("the braked router's brakes are not the shipped ones: %+v", got)
 	}
+
+	// The /mcp brake's shipped refill, one call a second (§43.6): the
+	// create router's proofs stretch it to an hour.
+	t.Run("RateLimit_MCPPerGrantShippedRefill", func(t *testing.T) {
+		rateLimitMCPShippedRefill(t, braked)
+	})
 
 	// The token endpoint's brake: a network's burst reaches the handler;
 	// past it, 429 with Retry-After and temporarily_unavailable, whatever

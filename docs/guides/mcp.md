@@ -188,8 +188,11 @@ session's environment (path scope, mocks, Docker, egress policy). Each call
 carries a new `idempotencyKey` (a UUID): an app that retries a call whose
 answer it lost, with the same key and the same arguments, gets back the
 session its first call started and starts nothing; the same key with
-different arguments is refused. The session appears in your list like any
-other, its source shown as MCP.
+different arguments is refused. Your keys are yours across the app and
+`POST /api/sessions`, so a key you already used to start a session yourself
+is refused to the app too, and the other way round: a retry only ever
+answers the way the session was started. The session appears in your list
+like any other, its source shown as MCP.
 
 **Brakes, and what disconnecting does not do.** `/mcp` is braked per
 authorization — one person's approval of one app — on each server replica:
@@ -198,11 +201,14 @@ second (as shipped). Past that the app is answered `429` with a
 `Retry-After`, before the call is read, so nothing runs; another app you
 connected, and another person's use of the same app, keep their own
 brakes. Starting sessions is braked too, because each one runs code and
-spends on models: 5 per authorization, then one a minute (as shipped);
-past that the call is refused with how many seconds to wait, and no session
-is started. Disconnecting an app, or cutting off its client, stops its next
-call — it does not stop a session it already started, which runs to its end
-like any other.
+spends on models: 5 calls to `narvi_create_session` per authorization, then
+one a minute (as shipped). A retry counts as a call, since the brake runs
+before Narvi can tell the call is a retry. Past that the call is refused
+with how many seconds to wait, and starts nothing; retried after that wait
+with the same key and the same arguments, it gets back the session an
+earlier call with that key started, if one did. Disconnecting an app, or
+cutting off its client, stops its next call — it does not stop a session it
+already started, which runs to its end like any other.
 
 **Negatives.** The MCP surface is off unless the deployment sets
 `NARVI_MCP_ENABLED=true`; while it is off, `/oauth/...` answers `503` — but

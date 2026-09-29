@@ -107,10 +107,16 @@ authorized, never from the body.
 An optional `idempotencyKey` (a UUID you choose) makes a create safe to
 retry: sending the same key again with the same request answers `200` with
 the session the first request created, as it is now, and creates, audits
-and starts nothing more; the same key with a different request is refused
-with `409`. A key is yours alone — another user's identical key is a
-different key — and one that is not a UUID is refused with `400`. Without a
-key, every request creates a session, as before.
+and starts nothing more. Requests are compared by what they ask for, not by
+how the JSON is written: key order, spacing, and an optional field left
+out or given the value that means the same (`null`, `false`, `[]`) make no
+difference. The same key with a different request is refused with `409`.
+A key is yours alone — another user's identical key is a different key —
+and yours across this route and your MCP apps' `narvi_create_session`
+([mcp.md](mcp.md)): a key an app already used is refused here with `409`,
+and the other way round. The key is written as 8-4-4-4-12 hexadecimal
+digits, in either case (both are one key); any other spelling is refused
+with `400`. Without a key, every request creates a session, as before.
 
 ```json narvi-command
 {"name": "List sessions", "route": "GET /api/sessions"}

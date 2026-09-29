@@ -519,7 +519,7 @@ func toolSpecs(twins Twins) []toolSpec {
 		},
 		{
 			Name:         "narvi_create_session",
-			Description:  "Start a new session as the user who approved this client -- the same as POST /api/sessions, with the same checks: that user's own role (a viewer may not start one), and every repository must be one this deployment knows. The session clones the repositories and runs a first turn with prompt at once: this runs code in those repositories and spends on models. With planMode true, the first turn writes a plan and nothing is implemented until a person approves it. idempotencyKey is required: a new UUID for each session you mean to start, and the same one only to retry this call -- a retry with the same key and the same arguments returns the session the first call started and starts nothing; the same key with different arguments is refused. Returns the Session, whose spawnSource is mcp; follow it with narvi_wait_for_session or narvi_get_session_status. One authorization may start 5 sessions at once, then one a minute (as shipped); past that the call is refused and says how long to wait.",
+			Description:  "Start a new session as the user who approved this client -- the same as POST /api/sessions, with the same checks: that user's own role (a viewer may not start one), and every repository must be one this deployment knows. The session clones the repositories and runs a first turn with prompt at once: this runs code in those repositories and spends on models. With planMode true, the first turn writes a plan and nothing is implemented until a person approves it. idempotencyKey is required: a new UUID for each session you mean to start, and the same one only to retry this call -- a retry with the same key and the same arguments returns the session the first call started and starts nothing; the same key with different arguments is refused, and so is a key the user already used to start a session another way. Returns the Session, whose spawnSource is mcp; follow it with narvi_wait_for_session or narvi_get_session_status. One authorization may call this tool 5 times at once, then once a minute (as shipped), and a retry counts as a call: past that the call is refused, starts nothing and says how many seconds to wait. After that wait, a retry with the same key and the same arguments returns the session an earlier call with that key started, if one did.",
 			Scope:        mcpscope.Write,
 			Instruction:  "narvi_create_session (start a session as that user on repositories this deployment knows, with a first prompt; a new idempotencyKey for each session, the same one only to retry)",
 			Twin:         twin{method: http.MethodPost, pathTemplate: "/api/sessions", handler: twins.CreateSession},
@@ -686,9 +686,10 @@ func (spec toolSpec) toolHandler(ctx context.Context, inputSchemas map[string]*j
 	}
 }
 
-// createBrakeRefusal takes one session start from the calling grant's
-// bucket in brake, and returns the tool result refusing the call when the
-// bucket is empty -- nil, nil when the call may go on. A call with no grant
+// createBrakeRefusal takes one call from the calling grant's bucket in
+// brake -- a same-key retry included: only the twin can tell a call is one
+// (technical plan §43.8) -- and returns the tool result refusing the call
+// when the bucket is empty -- nil, nil when the call may go on. A call with no grant
 // on its context, or a handler built with no brake, is this package's own
 // defect (buildServer registers no tool without a grant; NewHandler refuses
 // a nil brake): -32603, never let through unbraked.

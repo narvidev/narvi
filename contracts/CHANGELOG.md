@@ -18,9 +18,13 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   (technical plan §43.8, row 183). A caller-chosen key, scoped to the
   authenticated user and kept with the session it created: the same key
   with the same request answers `200` with that session and starts
-  nothing; the same key with a different request is refused `409`. An
-  optional property added to a client-to-platform shape grades MINOR
-  (row 2). Absent, `POST /api/sessions` behaves exactly as before.
+  nothing; the same key with a different request is refused `409`, and so
+  is a key whose session was started the other way (by cookie or over
+  MCP). Requests are compared by what they ask for, however their JSON is
+  written. The key is 8-4-4-4-12 hexadecimal digits in either case, both
+  cases one key; any other spelling is refused `400`. An optional property
+  added to a client-to-platform shape grades MINOR (row 2). Absent, `POST
+  /api/sessions` behaves exactly as before.
 - Added: `CreateSessionToolRequest`, the input of the new
   `narvi_create_session` MCP tool, whose twin is `POST /api/sessions`. A
   new `$def` grades MINOR (row 32). It is self-contained and has no

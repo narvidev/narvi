@@ -3,17 +3,20 @@
 // This file proves what POST /api/sessions decides about a create beyond its
 // body (technical plan §43.1/§43.8/§43.18): the source a session records
 // (mcp exactly when an MCP grant is on the request context), a create
-// replayed under the same idempotency key, and the MCP stamp on an audit
-// row. It is in package httpapi to reach createRequestSHA256, which the
+// replayed under the same idempotency key, the MCP stamp on an audit row,
+// and the mcp label on the gates' refusals of a create over MCP. It is in
+// package httpapi to reach createRequestSHA256, which the
 // race below needs to plant a winning row the handler will recognise, and
 // it drives the real handler directly with the context each principal
 // arrives with -- the real cookie middleware for the cookie case.
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"maps"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +27,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
@@ -47,7 +53,10 @@ type createSourceRig struct {
 	identities   *narvipg.IdentityStore
 	userSessions *narvipg.UserSessionStore
 	auditLog     *narvipg.AuditLogStore
-	handler      http.HandlerFunc
+	// handler is the route in the open rollout mode; handlerIn builds it,
+	// over the same stores and registry, in another.
+	handler   http.HandlerFunc
+	handlerIn func(mode platform.RolloutMode) http.HandlerFunc
 }
 
 func newCreateSourceRig(t *testing.T) *createSourceRig {
@@ -89,7 +98,11 @@ func newCreateSourceRig(t *testing.T) *createSourceRig {
 		userSessions: narvipg.NewUserSessionStore(pool),
 		auditLog:     narvipg.NewAuditLogStore(pool),
 	}
-	r.handler = CreateSession(pool, r.sessions, narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), r.auditLog, registry, nil, false, platform.RolloutModeOpen, narvipg.NewRepoSettingsStore(pool), prSessions)
+	turns, environments, repoSettings := narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), narvipg.NewRepoSettingsStore(pool)
+	r.handlerIn = func(mode platform.RolloutMode) http.HandlerFunc {
+		return CreateSession(pool, r.sessions, turns, environments, r.auditLog, registry, nil, false, mode, repoSettings, prSessions)
+	}
+	r.handler = r.handlerIn(platform.RolloutModeOpen)
 	return r
 }
 
@@ -135,6 +148,12 @@ type principal struct {
 // post sends body to the handler as p and returns the recorded response.
 func (r *createSourceRig) post(t *testing.T, p principal, body string) *httptest.ResponseRecorder {
 	t.Helper()
+	return r.postTo(t, r.handler, p, body)
+}
+
+// postTo is post to handler.
+func (r *createSourceRig) postTo(t *testing.T, handler http.HandlerFunc, p principal, body string) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/api/sessions", strings.NewReader(body))
 	ctx := req.Context()
 	if p.user != nil {
@@ -144,10 +163,10 @@ func (r *createSourceRig) post(t *testing.T, p principal, body string) *httptest
 		ctx = platform.WithMCPGrant(ctx, *p.grant)
 	}
 	req = req.WithContext(ctx)
-	var h http.Handler = r.handler
+	var h http.Handler = handler
 	if p.cookie != "" {
 		req.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: p.cookie})
-		h = auth.Middleware(r.userSessions, r.users)(r.handler)
+		h = auth.Middleware(r.userSessions, r.users)(handler)
 	}
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -268,42 +287,56 @@ func TestCreateSession_RecordsMcpOnlyWithAGrant(t *testing.T) {
 
 // TestCreateSession_IdempotencyKey_Table is §43.8's replay, step by step on
 // one user's key: the first create answers 201; the same request again --
-// however its JSON is spelled -- answers 200 with that session and writes
-// no session, turn or audit row; the same key with a different request is
-// refused 409; another user's same key is independent; a key that is not a
-// UUID is refused 400; no key creates each time, as before; and a user who
-// may no longer create is refused 403 before the key is even looked up.
+// however its JSON is spelled, its defaults written out or left out, its
+// key in capitals -- answers 200 with that session and writes no session,
+// turn or audit row; the same key with a different request is refused 409;
+// the same key and request over MCP is refused 409 too, since the session
+// records web and a replay only answers the source that started it;
+// another user's same key is independent; a key that is not a UUID in its
+// 8-4-4-4-12 form is refused 400, even one naming the same 16 bytes; no key
+// creates each time, as before; and a user who may no longer create is
+// refused 403 before the key is even looked up.
 func TestCreateSession_IdempotencyKey_Table(t *testing.T) {
 	ctx := context.Background()
 	rig := newCreateSourceRig(t)
 	userA, principalA, _ := rig.newUser(ctx, t, sqlcgen.UserRoleMember)
 	userB, principalB, _ := rig.newUser(ctx, t, sqlcgen.UserRoleMember)
+	grantA := platform.MCPGrant{GrantID: "2d3e4f5a-6b7c-4d8e-9f0a-1b2c3d4e5f6a", ClientID: "narvi_mcp_c_idempotency", Scopes: []string{"mcp:read", "mcp:write"}}
+	asA, asB, asAOverMCP := principal{user: &principalA}, principal{user: &principalB}, principal{user: &principalA, grant: &grantA}
 	const key = "0f6c1d2e-3a4b-4c5d-8e9f-a0b1c2d3e4f5"
+	const notUUID = "idempotencyKey: must be a UUID, as 8-4-4-4-12 hexadecimal digits"
 	first := createBody("web", "fix the flaky test", key)
 	// The same request with its keys in another order and extra spaces.
 	respelled := fmt.Sprintf(`{ "planMode": false, "idempotencyKey": %q, "effort": null, "modelId": null, "repos": [ {"branch": null, "url": "https://github.com/%s", "name": "widgets"} ], "prompt": "fix the flaky test", "title": null, "spawnSource": "web" }`, key, createSourceRepo)
+	// The same request with every optional field written out as the value
+	// the route reads like its absence.
+	spelledOut := strings.TrimSuffix(first, "}") + `,"docker":false,"pathScope":[],"mockConfig":null,"buildModelId":null,"buildEffort":null,"epistemicCheckEnabled":null,"egressPolicy":null}`
 
 	var firstID string
 	steps := []struct {
 		name       string
-		who        platform.AuthenticatedUser
+		who        principal
 		body       string
 		wantStatus int
 		// wantFirst: the answer is the first create's session.
 		wantFirst bool
 		wantError string
 	}{
-		{"the first create", principalA, first, http.StatusCreated, false, ""},
-		{"the same request again", principalA, first, http.StatusOK, true, ""},
-		{"the same request spelled differently", principalA, respelled, http.StatusOK, true, ""},
-		{"the same key with a different request", principalA, createBody("web", "a different prompt", key), http.StatusConflict, false, "idempotencyKey reused with a different request"},
-		{"another user's same key", principalB, first, http.StatusCreated, false, ""},
-		{"a key that is not a UUID", principalA, createBody("web", "fix the flaky test", "not-a-uuid"), http.StatusBadRequest, false, "idempotencyKey: must be a UUID"},
+		{"the first create", asA, first, http.StatusCreated, false, ""},
+		{"the same request again", asA, first, http.StatusOK, true, ""},
+		{"the same request spelled differently", asA, respelled, http.StatusOK, true, ""},
+		{"the same request with its defaults written out", asA, spelledOut, http.StatusOK, true, ""},
+		{"the same request with the key in capitals", asA, createBody("web", "fix the flaky test", strings.ToUpper(key)), http.StatusOK, true, ""},
+		{"the same key with a different request", asA, createBody("web", "a different prompt", key), http.StatusConflict, false, "idempotencyKey reused with a different request"},
+		{"the same key and request over MCP", asAOverMCP, first, http.StatusConflict, false, "idempotencyKey already used for a session started another way"},
+		{"another user's same key", asB, first, http.StatusCreated, false, ""},
+		{"a key that is not a UUID", asA, createBody("web", "fix the flaky test", "not-a-uuid"), http.StatusBadRequest, false, notUUID},
+		{"the key without its hyphens", asA, createBody("web", "fix the flaky test", strings.ReplaceAll(key, "-", "")), http.StatusBadRequest, false, notUUID},
+		{"the key with other separators", asA, createBody("web", "fix the flaky test", strings.ReplaceAll(key, "-", "x")), http.StatusBadRequest, false, notUUID},
 	}
 	for _, step := range steps {
 		t.Run(step.name, func(t *testing.T) {
-			who := step.who
-			rec := rig.post(t, principal{user: &who}, step.body)
+			rec := rig.post(t, step.who, step.body)
 			if rec.Code != step.wantStatus {
 				t.Fatalf("status %d body %s, want %d", rec.Code, rec.Body.String(), step.wantStatus)
 			}
@@ -339,6 +372,9 @@ func TestCreateSession_IdempotencyKey_Table(t *testing.T) {
 	if n := rig.countRows(ctx, t, `SELECT count(*) FROM turns WHERE session_id = $1`, firstID); n != 1 {
 		t.Fatalf("turns for the first session = %d, want 1", n)
 	}
+	if n := rig.countRows(ctx, t, `SELECT count(*) FROM audit_log WHERE actor_user_id = $1 AND detail_json ? 'mcp'`, userA.ID); n != 0 {
+		t.Fatalf("the refused replay over MCP wrote %d audit row(s)", n)
+	}
 
 	t.Run("no key creates each time", func(t *testing.T) {
 		a := rig.post(t, principal{user: &principalA}, createBody("web", "no key", ""))
@@ -366,13 +402,13 @@ func TestCreateSession_IdempotencyKey_Table(t *testing.T) {
 // reads the winner back -- one row whatever the timing. The first subtest
 // forces that path: a transaction holding the winning insert open while
 // the request's own insert waits behind it; committed, the request answers
-// the winner (same hash) or 409 (a different one). The last fires many
-// requests at once.
+// the winner (same hash and source) or 409 (a different hash, or a winner
+// that records another source). The last fires many requests at once.
 func TestCreateSession_IdempotencyKey_ConcurrentReplaysCreateOne(t *testing.T) {
 	ctx := context.Background()
 	rig := newCreateSourceRig(t)
 
-	blockedOnTheIndex := func(t *testing.T, winnerPrompt string, wantStatus int) {
+	blockedOnTheIndex := func(t *testing.T, winnerSource sqlcgen.SessionSpawnSource, winnerPrompt string, wantStatus int, wantError string) {
 		t.Helper()
 		user, who, _ := rig.newUser(ctx, t, sqlcgen.UserRoleMember)
 		keyText := fmt.Sprintf("7d2f0a3b-%04x-4c1d-9e8f-0a1b2c3d4e5f", time.Now().UnixNano()&0xffff)
@@ -396,7 +432,7 @@ func TestCreateSession_IdempotencyKey_ConcurrentReplaysCreateOne(t *testing.T) {
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
 		winner, err := rig.sessions.WithTx(tx).Create(ctx, sqlcgen.CreateSessionParams{
-			SpawnSource: sqlcgen.SessionSpawnSourceWeb, CreatedBy: user.ID,
+			SpawnSource: winnerSource, CreatedBy: user.ID,
 			Repos:                []byte(`[{"name":"widgets","url":"https://github.com/acme/widgets","branch":null}]`),
 			CreateIdempotencyKey: key, CreateRequestSha256: hash,
 		})
@@ -431,6 +467,9 @@ func TestCreateSession_IdempotencyKey_ConcurrentReplaysCreateOne(t *testing.T) {
 		if rec.Code != wantStatus {
 			t.Fatalf("status %d body %s, want %d", rec.Code, rec.Body.String(), wantStatus)
 		}
+		if wantError != "" && !strings.Contains(rec.Body.String(), wantError) {
+			t.Fatalf("body %s, want error %q", rec.Body.String(), wantError)
+		}
 		if wantStatus == http.StatusOK {
 			if got := sessionFrom(t, rec); got.Id != winner.ID.String() {
 				t.Fatalf("answered %s, want the winner %s", got.Id, winner.ID.String())
@@ -441,10 +480,13 @@ func TestCreateSession_IdempotencyKey_ConcurrentReplaysCreateOne(t *testing.T) {
 		}
 	}
 	t.Run("blocked on the index, the same request reads the winner", func(t *testing.T) {
-		blockedOnTheIndex(t, "fix it", http.StatusOK)
+		blockedOnTheIndex(t, sqlcgen.SessionSpawnSourceWeb, "fix it", http.StatusOK, "")
 	})
 	t.Run("blocked on the index, a different request is refused", func(t *testing.T) {
-		blockedOnTheIndex(t, "something else", http.StatusConflict)
+		blockedOnTheIndex(t, sqlcgen.SessionSpawnSourceWeb, "something else", http.StatusConflict, "idempotencyKey reused with a different request")
+	})
+	t.Run("blocked on the index, a winner started over MCP is refused", func(t *testing.T) {
+		blockedOnTheIndex(t, sqlcgen.SessionSpawnSourceMcp, "fix it", http.StatusConflict, "idempotencyKey already used for a session started another way")
 	})
 
 	t.Run("many at once create one", func(t *testing.T) {
@@ -525,4 +567,159 @@ func TestAuditRecord_StampsMCPGrant(t *testing.T) {
 	if _, ok := plain["mcp"]; ok || len(plain) != 2 {
 		t.Fatalf("detail without a grant = %v, want the caller's keys alone", plain)
 	}
+}
+
+// gateMetrics is a reader on the global OTel meter provider, set once per
+// test process. The gates' counters are built from the global provider
+// (sync.OnceValue in rolloutgate.go and repoentitlementgate.go), which
+// hands every instrument made before a provider is set over to the first
+// one set, so this reader sees them whichever test used them first.
+var gateMetrics = sync.OnceValue(func() *sdkmetric.ManualReader {
+	reader := sdkmetric.NewManualReader()
+	otel.SetMeterProvider(sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader)))
+	return reader
+})
+
+// countsBySource is the counter name's value per spawn_source label, as
+// the meter named scope reports it.
+func countsBySource(ctx context.Context, t *testing.T, scope, name string) map[string]int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := gateMetrics().Collect(ctx, &rm); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	counts := map[string]int64{}
+	for _, sm := range rm.ScopeMetrics {
+		if sm.Scope.Name != scope {
+			continue
+		}
+		for _, m := range sm.Metrics {
+			if m.Name != name {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("%s is a %T, want an int64 sum", name, m.Data)
+			}
+			for _, point := range sum.DataPoints {
+				source, _ := point.Attributes.Value("spawn_source")
+				counts[source.AsString()] += point.Value
+			}
+		}
+	}
+	return counts
+}
+
+// lockedLog is a JSON log sink safe to write from any goroutine.
+type lockedLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+// entries is every line logged with msg.
+func (l *lockedLog) entries(t *testing.T, msg string) []map[string]any {
+	t.Helper()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var found []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(l.buf.String()), "\n") {
+		var entry map[string]any
+		if json.Unmarshal([]byte(line), &entry) == nil && entry["msg"] == msg {
+			found = append(found, entry)
+		}
+	}
+	return found
+}
+
+// TestCreateSession_McpRefusalsCarryTheMcpLabel is §43.1's label on the
+// gates' refusals: a create over MCP refused by the entitlement gate (a
+// repository this deployment does not know) or by the rollout gate (a
+// known repository not enrolled, in cohort mode) is logged, counted and --
+// for the entitlement gate, which audits its denials -- audited as mcp, the
+// source the session would have recorded, never as the web the body says;
+// the denial row also carries the grant (§43.18). It is written through the
+// pool before the create's transaction opens, so the stamp comes from the
+// request's context alone. Not parallel: it swaps the default logger.
+func TestCreateSession_McpRefusalsCarryTheMcpLabel(t *testing.T) {
+	ctx := context.Background()
+	rig := newCreateSourceRig(t)
+	user, principalUser, _ := rig.newUser(ctx, t, sqlcgen.UserRoleMember)
+	grant := platform.MCPGrant{GrantID: "3e4f5a6b-7c8d-4e9f-8a0b-1c2d3e4f5a6b", ClientID: "narvi_mcp_c_refusals", Scopes: []string{"mcp:read", "mcp:write"}}
+	overMCP := principal{user: &principalUser, grant: &grant}
+
+	logs := &lockedLog{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	// refused posts body over MCP to handler and checks the refusal: a 403
+	// with message, no session, the log line msg labelled mcp alone, and
+	// the counter name of meter scope one higher under mcp and nowhere
+	// else.
+	refused := func(t *testing.T, handler http.HandlerFunc, body, message, msg, scope, name string) {
+		t.Helper()
+		before := countsBySource(ctx, t, scope, name)
+		linesBefore := len(logs.entries(t, msg))
+		rec := rig.postTo(t, handler, overMCP, body)
+		if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), message) {
+			t.Fatalf("status %d body %s, want 403 %q", rec.Code, rec.Body.String(), message)
+		}
+		if n := rig.countRows(ctx, t, `SELECT count(*) FROM sessions WHERE created_by = $1`, user.ID); n != 0 {
+			t.Fatalf("a refused create wrote %d session(s)", n)
+		}
+		after := countsBySource(ctx, t, scope, name)
+		sources := map[string]bool{"mcp": true}
+		for source := range before {
+			sources[source] = true
+		}
+		for source := range after {
+			sources[source] = true
+		}
+		for source := range sources {
+			want := before[source]
+			if source == "mcp" {
+				want++
+			}
+			if after[source] != want {
+				t.Errorf("%s{spawn_source=%s} = %d, was %d: want the refusal counted once, under mcp alone", name, source, after[source], before[source])
+			}
+		}
+		lines := logs.entries(t, msg)
+		if len(lines) != linesBefore+1 || lines[len(lines)-1]["spawn_source"] != "mcp" {
+			t.Fatalf("log lines %q = %v, want one more, labelled mcp", msg, lines)
+		}
+	}
+
+	t.Run("the entitlement gate", func(t *testing.T) {
+		const unknown = "unknown-org/probe-repo"
+		body := strings.ReplaceAll(createBody("web", "not entitled", ""), createSourceRepo, unknown)
+		refused(t, rig.handler, body, "repository not entitled: "+unknown,
+			"httpapi: repo entitlement gate: session creation refused, repo not entitled",
+			repoEntitlementGateMeterName, "session_repo_entitlement_denied_total")
+
+		var raw []byte
+		if err := rig.pool.QueryRow(ctx, `SELECT detail_json FROM audit_log WHERE action = 'session.repo_entitlement_denied' AND actor_user_id = $1 AND resource_id = $2`, user.ID, unknown).Scan(&raw); err != nil {
+			t.Fatalf("read the denial audit row: %v", err)
+		}
+		var detail map[string]any
+		if err := json.Unmarshal(raw, &detail); err != nil {
+			t.Fatal(err)
+		}
+		stamp, _ := detail["mcp"].(map[string]any)
+		if detail["spawn_source"] != "mcp" || stamp["grant_id"] != grant.GrantID || stamp["client_id"] != grant.ClientID || len(stamp) != 2 || len(detail) != 2 {
+			t.Fatalf("denial audit detail = %s, want spawn_source mcp and exactly the grant and client", raw)
+		}
+	})
+
+	t.Run("the rollout gate", func(t *testing.T) {
+		refused(t, rig.handlerIn(platform.RolloutModeCohort), createBody("web", "not enrolled", ""), "repository not enrolled: "+createSourceRepo,
+			"httpapi: rollout gate: session creation refused, repo not enrolled",
+			rolloutGateMeterName, "session_rollout_refused_total")
+	})
 }
