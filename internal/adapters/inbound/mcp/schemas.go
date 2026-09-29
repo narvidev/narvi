@@ -52,7 +52,9 @@ var loadedRestDefs = sync.OnceValues(func() (map[string]json.RawMessage, error) 
 // GetSessionTranscriptToolRequest) references another $def, so the wire inputSchema
 // a client sees is byte-derived from /contracts with nothing added or
 // removed. TestToolInputSchemas_ComeFromContracts pins exactly this: each
-// tool's InputSchema deep-equals this function's own return value.
+// tool's InputSchema deep-equals this function's own return value. Unlike
+// bundleOutputSchema, it never opens an open enum
+// (TestInputSchemas_StillRefuseUnknownEnumValues).
 func inputSchema(name string) (map[string]any, error) {
 	defs, err := loadedRestDefs()
 	if err != nil {
@@ -78,8 +80,11 @@ func inputSchema(name string) (map[string]any, error) {
 // every "#/$defs/<Name>" reference name's own sub-schema contains. Used
 // for every tool's OutputSchema (Session, ListSessionsResponse,
 // ModelCatalog, SessionActivity, SessionOutcome, EventsResponse are all
-// reused UNCHANGED
-// from /contracts, never a hand-written shape -- technical plan §43.10).
+// reused from /contracts, never a hand-written shape -- technical plan
+// §43.10), unchanged except at the open enums (openBundledEnums): an
+// output shape is published with every open enum open, so a client that
+// validates structured results against it still accepts a value added
+// after it read tools/list.
 //
 // The bundled document's shape is:
 //
@@ -130,6 +135,9 @@ func bundleOutputSchema(name string) (map[string]any, error) {
 		}
 		bundledDefs[n] = v
 	}
+	if err := openBundledEnums(bundledDefs); err != nil {
+		return nil, fmt.Errorf("mcp: bundling %q: %w", name, err)
+	}
 
 	return map[string]any{
 		"$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -152,6 +160,184 @@ func bundleOutputSchema(name string) (map[string]any, error) {
 		"$ref":  "#/$defs/" + name,
 		"$defs": bundledDefs,
 	}, nil
+}
+
+// restSurface is the contracts/manifest.json surface every $def this
+// package publishes comes from (loadedRestDefs).
+const restSurface = "rest/v1/dtos.schema.json"
+
+// openEnumPath is one contracts/manifest.json openEnums entry for
+// restSurface: the $def its JSON Pointer starts in, and the reference
+// tokens that lead from that $def to the enum node, already unescaped.
+type openEnumPath struct {
+	entry  string // the manifest entry, verbatim, for error messages
+	def    string
+	tokens []string
+}
+
+// loadedOpenEnumPaths memoizes one parse of the embedded manifest's
+// openEnums list (contracts.ManifestJSON), checked against the embedded
+// rest/v1 $defs. Both are compiled in, so the answer never changes at
+// runtime.
+var loadedOpenEnumPaths = sync.OnceValues(func() ([]openEnumPath, error) {
+	defs, err := loadedRestDefs()
+	if err != nil {
+		return nil, err
+	}
+	return parseOpenEnumPaths(contracts.ManifestJSON, defs)
+})
+
+// parseOpenEnumPaths returns manifest's openEnums entries for restSurface,
+// in manifest order, once each. Every one must lead, through defs, to an
+// enum node that can be opened (openEnumPath.resolve). An entry that does
+// not -- a typo, a renamed $def or property, a node that is no longer an
+// enum -- is an error, never skipped: skipping it would leave that enum
+// published closed with nothing to say so. Entries for any other surface
+// are skipped, since this package publishes none of their $defs. An entry
+// with no surface at all is an error: tools/contractscompat refuses one
+// too (compat.Manifest.ValidateOpenEnums), and nothing here can tell which
+// surface it meant.
+func parseOpenEnumPaths(manifest string, defs map[string]json.RawMessage) ([]openEnumPath, error) {
+	var m struct {
+		OpenEnums []string `json:"openEnums"`
+	}
+	if err := json.Unmarshal([]byte(manifest), &m); err != nil {
+		return nil, fmt.Errorf("mcp: parse contracts/manifest.json: %w", err)
+	}
+	seen := map[string]bool{}
+	var out []openEnumPath
+	for _, entry := range m.OpenEnums {
+		surface, pointer, ok := strings.Cut(entry, "#")
+		if !ok || surface == "" {
+			return nil, fmt.Errorf("mcp: openEnums entry %q is not qualified by a surface path", entry)
+		}
+		if surface != restSurface || seen[entry] {
+			continue
+		}
+		seen[entry] = true
+		p, err := parseOpenEnumPointer(entry, pointer)
+		if err != nil {
+			return nil, err
+		}
+		raw, ok := defs[p.def]
+		if !ok {
+			return nil, fmt.Errorf("mcp: openEnums entry %q names $def %q, which %s does not define", entry, p.def, restSurface)
+		}
+		var def any
+		if err := json.Unmarshal(raw, &def); err != nil {
+			return nil, fmt.Errorf("mcp: openEnums entry %q: unmarshal $def %q: %w", entry, p.def, err)
+		}
+		if _, err := p.resolve(def); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, nil
+}
+
+// parseOpenEnumPointer splits pointer, the half of an openEnums entry
+// after its "#" (e.g. "/$defs/Session/properties/status"), into the $def
+// it starts in and the RFC 6901 reference tokens after that, each
+// unescaped ("~1" to "/", then "~0" to "~").
+func parseOpenEnumPointer(entry, pointer string) (openEnumPath, error) {
+	rest, ok := strings.CutPrefix(pointer, "/$defs/")
+	if !ok {
+		return openEnumPath{}, fmt.Errorf("mcp: openEnums entry %q does not point into $defs", entry)
+	}
+	raw := strings.Split(rest, "/")
+	tokens := make([]string, len(raw))
+	for i, tok := range raw {
+		tokens[i] = strings.ReplaceAll(strings.ReplaceAll(tok, "~1", "/"), "~0", "~")
+	}
+	if tokens[0] == "" {
+		return openEnumPath{}, fmt.Errorf("mcp: openEnums entry %q names no $def", entry)
+	}
+	return openEnumPath{entry: entry, def: tokens[0], tokens: tokens[1:]}, nil
+}
+
+// resolve walks p.tokens down from def (one decoded $def) and returns the
+// node they lead to. A token names a key of an object, or a decimal index
+// into an array (a "oneOf" branch, say). The node must be an object with
+// a non-empty "enum" array, a "type" (without one, dropping "enum" would
+// leave the node accepting any value at all), and no "examples" of its
+// own for the known values to overwrite; anything else is an error.
+func (p openEnumPath) resolve(def any) (map[string]any, error) {
+	node := def
+	for i, tok := range p.tokens {
+		var next any
+		found := false
+		switch t := node.(type) {
+		case map[string]any:
+			next, found = t[tok]
+		case []any:
+			if idx, ok := arrayIndex(tok); ok && idx < len(t) {
+				next, found = t[idx], true
+			}
+		}
+		if !found {
+			return nil, fmt.Errorf("mcp: openEnums entry %q does not resolve: $def %q has nothing at %q", p.entry, p.def, p.tokens[:i+1])
+		}
+		node = next
+	}
+	obj, ok := node.(map[string]any)
+	if !ok {
+		return nil, fmt.Errorf("mcp: openEnums entry %q resolves to %T, not a schema object", p.entry, node)
+	}
+	if enum, ok := obj["enum"].([]any); !ok || len(enum) == 0 {
+		return nil, fmt.Errorf("mcp: openEnums entry %q resolves to a node with no enum to open", p.entry)
+	}
+	if _, ok := obj["type"]; !ok {
+		return nil, fmt.Errorf("mcp: openEnums entry %q resolves to an enum with no type: without its enum it would accept any value", p.entry)
+	}
+	if _, ok := obj["examples"]; ok {
+		return nil, fmt.Errorf("mcp: openEnums entry %q resolves to an enum that already carries examples, which its known values would overwrite", p.entry)
+	}
+	return obj, nil
+}
+
+// arrayIndex parses tok as an RFC 6901 array index: "0", or decimal
+// digits with no leading zero.
+func arrayIndex(tok string) (int, bool) {
+	if tok == "" || (len(tok) > 1 && tok[0] == '0') {
+		return 0, false
+	}
+	for _, c := range tok {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(tok)
+	return n, err == nil
+}
+
+// openBundledEnums opens every open enum (contracts/manifest.json's
+// openEnums) that lives in one of bundledDefs, a bundle's own freshly
+// decoded $defs, shared with no other bundle. The node keeps its "type",
+// its "description" and every other keyword; it loses "enum", and the
+// values "enum" listed become its "examples" -- JSON Schema's annotation
+// for sample values, which constrains nothing -- so a reader still sees
+// the values this build knows while a validator accepts any value of the
+// type. An open enum in a $def the bundle does not hold is left alone.
+// Only output schemas come here: inputSchema and compileInputSchemas keep
+// every enum closed, since the server validates what it accepts.
+func openBundledEnums(bundledDefs map[string]any) error {
+	paths, err := loadedOpenEnumPaths()
+	if err != nil {
+		return err
+	}
+	for _, p := range paths {
+		def, ok := bundledDefs[p.def]
+		if !ok {
+			continue
+		}
+		node, err := p.resolve(def)
+		if err != nil {
+			return err
+		}
+		node["examples"] = node["enum"]
+		delete(node, "enum")
+	}
+	return nil
 }
 
 // collectDefRefs walks raw (one $def's own JSON tree) looking for every

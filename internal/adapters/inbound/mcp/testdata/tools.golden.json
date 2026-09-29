@@ -285,7 +285,7 @@
             },
             "spawnSource": {
               "description": "Matches Postgres session_spawn_source exactly. An OPEN enum (manifest.json's openEnums): a consumer MUST tolerate a value it does not recognise.",
-              "enum": [
+              "examples": [
                 "web",
                 "slack",
                 "linear",
@@ -295,7 +295,7 @@
             },
             "status": {
               "description": "Matches Postgres session_status exactly: derived each time a turn reaches a terminal state -- 'created' until one has, 'active' when another turn was still queued or running at that moment, otherwise that turn's outcome: 'completed', 'failed' or 'cancelled'. It is not re-derived when a turn is queued or dispatched, so it does not show queued or running work, and a queued or running turn can sit under any of the five values: a first turn runs its whole life under 'created', and a follow-up under whatever the last derivation left. What the session is doing now is SessionActivity.activity, GET /api/sessions/{sessionID}/status.",
-              "enum": [
+              "examples": [
                 "created",
                 "active",
                 "completed",
@@ -469,7 +469,7 @@
             },
             "spawnSource": {
               "description": "Matches Postgres session_spawn_source exactly. An OPEN enum (manifest.json's openEnums): a consumer MUST tolerate a value it does not recognise.",
-              "enum": [
+              "examples": [
                 "web",
                 "slack",
                 "linear",
@@ -479,7 +479,7 @@
             },
             "status": {
               "description": "Matches Postgres session_status exactly: derived each time a turn reaches a terminal state -- 'created' until one has, 'active' when another turn was still queued or running at that moment, otherwise that turn's outcome: 'completed', 'failed' or 'cancelled'. It is not re-derived when a turn is queued or dispatched, so it does not show queued or running work, and a queued or running turn can sit under any of the five values: a first turn runs its whole life under 'created', and a follow-up under whatever the last derivation left. What the session is doing now is SessionActivity.activity, GET /api/sessions/{sessionID}/status.",
-              "enum": [
+              "examples": [
                 "created",
                 "active",
                 "completed",
@@ -1256,7 +1256,7 @@
             },
             "kind": {
               "description": "'shadow_suppressed': the session would have opened this pull request, but outbound writes to its repository were in shadow mode, so the creation was recorded and suppressed -- no pull request exists, and there is nothing to review. 'unreadable': this server could not read the record; it may name a real pull request, whose review this result therefore cannot report (reason says what could not be read). An OPEN enum (manifest.json's openEnums): a consumer MUST tolerate a value it does not recognise.",
-              "enum": [
+              "examples": [
                 "shadow_suppressed",
                 "unreadable"
               ],
