@@ -70,13 +70,21 @@ describe('SessionHeader -- an unknown source', () => {
   })
 })
 
+// glyph is a source icon's markup without its tooltip, so two sources
+// compare by the glyph they draw alone.
+function glyph(source: Session['spawnSource']): string {
+  return renderToStaticMarkup(<SourceIcon source={source} />).replace(/title="[^"]*"/, '')
+}
+
 describe('the mcp source', () => {
-  it('draws its own glyph with its own tooltip, never the neutral one', () => {
+  it('draws its own glyph with its own tooltip, never another source\'s or the neutral one', () => {
     const html = renderToStaticMarkup(<SourceIcon source="mcp" />)
     expect(html).toContain('title="Started from an MCP client"')
     expect(html).toContain('<svg')
-    const unknown = renderToStaticMarkup(<SourceIcon source={UNKNOWN_SOURCE} />)
-    expect(html.replace(/title="[^"]*"/, '')).not.toBe(unknown.replace(/title="[^"]*"/, ''))
+    const others: Session['spawnSource'][] = ['web', 'slack', 'linear', 'github', UNKNOWN_SOURCE]
+    for (const other of others) {
+      expect(glyph('mcp'), `mcp draws the ${other} glyph`).not.toBe(glyph(other))
+    }
   })
 
   it('shows MCP as the session header tag, never other', () => {
