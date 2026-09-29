@@ -33,8 +33,12 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   request's review session, a viewer never.
   Answers `202 StopSessionResponse` once the request is written: turns open
   at that instant are cancelled -- a pending one at once, a running one
-  through the sandbox's own `stop`, or once `StopGrace` (30s) has passed
-  -- and turns created later run normally. A route added, graded MINOR
+  through the sandbox's own `stop`, or once `StopGrace` (30s) has passed,
+  also while its sandbox still delivers an earlier turn's push and pull
+  request, which then pushes nothing for it -- and turns created later run
+  normally. The stopped turn's sandbox is replaced only once such a
+  delivery is over, for at most `MCPStatusDeliveryWindow` (10 minutes),
+  and a turn created meanwhile waits for it. A route added, graded MINOR
   (row 41).
 
 ## [1.12.0]
