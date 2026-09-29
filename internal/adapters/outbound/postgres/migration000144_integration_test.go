@@ -223,6 +223,17 @@ func TestMigration000144_RebuildsAnInvalidLeftover(t *testing.T) {
 func TestMigration000144_ConcurrentMigrators(t *testing.T) {
 	ctx := context.Background()
 	connStr, db := migrationTestDatabase(ctx, t, 143)
+	concurrentMigratorsUp(ctx, t, connStr, db, 144)
+	assertTokenPartIndexBuilt(ctx, t, db)
+}
+
+// concurrentMigratorsUp is two control planes booting at once against the
+// database at connStr: both migrators queue on golang-migrate's advisory
+// lock before either starts, so whichever takes it first applies every
+// pending migration while the other waits, holding a snapshot. Both must
+// succeed, and leave the version clean and at least atLeast.
+func concurrentMigratorsUp(ctx context.Context, t *testing.T, connStr string, db *sql.DB, atLeast uint) {
+	t.Helper()
 	var dbName string
 	if err := db.QueryRowContext(ctx, "SELECT current_database()").Scan(&dbName); err != nil {
 		t.Fatalf("current_database: %v", err)
@@ -290,11 +301,10 @@ func TestMigration000144_ConcurrentMigrators(t *testing.T) {
 			t.Errorf("migrator %d: %v", i, err)
 		}
 	}
-	assertTokenPartIndexBuilt(ctx, t, db)
 	m, mdb := newMigrate(t, connStr)
 	defer func() { _ = mdb.Close() }()
 	version, dirty, err := m.Version()
-	if err != nil || dirty || version < 144 {
-		t.Errorf("migration version = %d (dirty %v, err %v), want at least 144, clean", version, dirty, err)
+	if err != nil || dirty || version < atLeast {
+		t.Errorf("migration version = %d (dirty %v, err %v), want at least %d, clean", version, dirty, err, atLeast)
 	}
 }

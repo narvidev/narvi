@@ -250,6 +250,28 @@ var toolCallArgs = map[string]struct {
 			{keywords: []string{"/properties/limit/minimum"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","limit":0}`, realRefusal: "invalid arguments: - at '/limit': minimum: got 0, want 1"},
 		},
 	},
+	"narvi_create_session": {
+		realValid: `{"prompt":"Fix the flaky test","repos":[{"name":"widgets","url":"https://github.com/acme/widgets"}],"idempotencyKey":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","title":"Flaky test","modelId":"m","effort":"high","planMode":true,"buildModelId":"b","buildEffort":"low"}`,
+		realInvalid: []keywordProbe{
+			// buildCreateSessionRequest decodes through the generated
+			// CreateSessionToolRequest: an unknown key is ignored, and a null
+			// leaves an optional pointer nil, planMode false, and a required
+			// string "" -- each carried through to the twin, which answers for
+			// what it reads (a missing key or no repos is its own 400).
+			{keywords: []string{"/additionalProperties"}, arguments: `{"prompt":"Fix the flaky test","repos":[{"name":"widgets","url":"https://github.com/acme/widgets"}],"idempotencyKey":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","spawnSource":"web"}`, realRefusal: "invalid arguments: - at '': additional properties 'spawnSource' not allowed"},
+			{keywords: []string{"/properties/title/type"}, arguments: `{"prompt":"Fix the flaky test","repos":[{"name":"widgets","url":"https://github.com/acme/widgets"}],"idempotencyKey":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","title":null}`, realRefusal: "invalid arguments: - at '/title': got null, want string"},
+			{keywords: []string{"/properties/repos/type"}, arguments: `{"prompt":"p","repos":null,"idempotencyKey":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`, realRefusal: "invalid arguments: - at '/repos': got null, want array"},
+			// The whole items keyword, probed through one element's unknown key.
+			{keywords: []string{"/properties/repos/items"}, arguments: `{"prompt":"p","repos":[{"name":"widgets","url":"https://github.com/acme/widgets","owner":"acme"}],"idempotencyKey":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`, realRefusal: "invalid arguments: - at '/repos/0': additional properties 'owner' not allowed"},
+			{keywords: []string{"/properties/modelId/type"}, arguments: `{"prompt":"Fix the flaky test","repos":[{"name":"widgets","url":"https://github.com/acme/widgets"}],"idempotencyKey":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","modelId":null}`, realRefusal: "invalid arguments: - at '/modelId': got null, want string"},
+			{keywords: []string{"/properties/effort/type"}, arguments: `{"prompt":"Fix the flaky test","repos":[{"name":"widgets","url":"https://github.com/acme/widgets"}],"idempotencyKey":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","effort":null}`, realRefusal: "invalid arguments: - at '/effort': got null, want string"},
+			{keywords: []string{"/properties/planMode/type"}, arguments: `{"prompt":"Fix the flaky test","repos":[{"name":"widgets","url":"https://github.com/acme/widgets"}],"idempotencyKey":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","planMode":null}`, realRefusal: "invalid arguments: - at '/planMode': got null, want boolean"},
+			{keywords: []string{"/properties/buildModelId/type"}, arguments: `{"prompt":"Fix the flaky test","repos":[{"name":"widgets","url":"https://github.com/acme/widgets"}],"idempotencyKey":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","buildModelId":null}`, realRefusal: "invalid arguments: - at '/buildModelId': got null, want string"},
+			{keywords: []string{"/properties/buildEffort/type"}, arguments: `{"prompt":"Fix the flaky test","repos":[{"name":"widgets","url":"https://github.com/acme/widgets"}],"idempotencyKey":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","buildEffort":null}`, realRefusal: "invalid arguments: - at '/buildEffort': got null, want string"},
+			{keywords: []string{"/properties/idempotencyKey/type"}, arguments: `{"prompt":"p","repos":[{"name":"widgets","url":"https://github.com/acme/widgets"}],"idempotencyKey":null}`, realRefusal: "invalid arguments: - at '/idempotencyKey': got null, want string"},
+			{keywords: []string{"/properties/idempotencyKey/format"}, arguments: `{"prompt":"p","repos":[{"name":"widgets","url":"https://github.com/acme/widgets"}],"idempotencyKey":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/idempotencyKey': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+		},
+	},
 }
 
 // buildRequestEnforces lists, per tool, the keywords of its real input
@@ -273,6 +295,15 @@ var buildRequestEnforces = map[string]map[string]string{
 		"/required": "restdtos.GetSessionResultToolRequest.UnmarshalJSON refuses every object without a sessionId key; " +
 			"the one value it carries through without one, null, is not an object, and required constrains objects only",
 	},
+	"narvi_create_session": {
+		"/type": "restdtos.CreateSessionToolRequest.UnmarshalJSON refuses every non-object: an array, string, number or boolean fails to decode, " +
+			"and null leaves prompt empty, which its generated minLength check refuses",
+		"/required":                    "restdtos.CreateSessionToolRequest.UnmarshalJSON refuses every object without a prompt, repos or idempotencyKey key",
+		"/properties/prompt/type":      "a non-string prompt fails to decode, and a null one leaves prompt empty, which the generated minLength check refuses",
+		"/properties/prompt/minLength": "restdtos.CreateSessionToolRequest.UnmarshalJSON refuses an empty prompt itself",
+		"/properties/repos/minItems": "restdtos.CreateSessionToolRequest.UnmarshalJSON refuses an empty repos array itself; " +
+			"the one value it carries through with no repo, null, is not an array, and minItems constrains arrays only",
+	},
 }
 
 // twinBodies is the 200 body each tool's counting twin answers with --
@@ -287,6 +318,7 @@ var twinBodies = map[string]string{
 	"narvi_wait_for_session":       `{"activity":"idle"}`,
 	"narvi_get_session_result":     `{"reviewScope":"none"}`,
 	"narvi_get_session_transcript": `{"events":[],"nextCursor":null}`,
+	"narvi_create_session":         `{"id":"created"}`,
 }
 
 // countingTwins returns Twins whose handlers each add one to
@@ -311,6 +343,8 @@ func countingTwins(calls *atomic.Int32) Twins {
 		ListEvents:       twin("narvi_get_session_transcript"),
 		// Row 182's result (piece (c)).
 		GetSessionResult: twin("narvi_get_session_result"),
+		// The one write twin (technical plan §43.8).
+		CreateSession: twin("narvi_create_session"),
 	}
 }
 
@@ -632,7 +666,7 @@ func TestInjectedSchemaMap_IncompleteMapRefusedAtConstruction(t *testing.T) {
 
 	for _, tc := range rows {
 		t.Run(tc.name, func(t *testing.T) {
-			handler, err := newHandler(Config{PublicBaseURL: testPublicBaseURL}, testTwins(), tc.schemas)
+			handler, err := newHandler(testConfig(testPublicBaseURL), testTwins(), tc.schemas)
 			if tc.wantName == "" {
 				if err != nil || handler == nil {
 					t.Fatalf("newHandler = (%v, %v), want a handler and no error", handler, err)
@@ -707,7 +741,7 @@ func TestToolHandler_MissingSchemaIsRefusedWithoutCompiling(t *testing.T) {
 				logs := swapDefaultLogger(t)
 				arguments := toolCallArgs[spec.Name].realValid
 				twinCalls.Store(0)
-				res, err := spec.toolHandler(t.Context(), m.schemas)(t.Context(), &sdkmcp.CallToolRequest{
+				res, err := spec.toolHandler(t.Context(), m.schemas, allowAllBrake{})(t.Context(), &sdkmcp.CallToolRequest{
 					Params: &sdkmcp.CallToolParamsRaw{Name: spec.Name, Arguments: json.RawMessage(arguments)},
 				})
 				if n := twinCalls.Load(); n != 0 {

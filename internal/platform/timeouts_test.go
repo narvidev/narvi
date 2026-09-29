@@ -1784,7 +1784,8 @@ func TestValidate_MCPClientRegistrationChain(t *testing.T) {
 
 // TestDefaultTimeouts_MCPEndpointBrakeFields pins the token and
 // authorization endpoints' brakes and the pending-request cap (technical
-// plan §43.14): 2 s and 10, 3 s and 10, 100.
+// plan §43.14): 2 s and 10, 3 s and 10, 100 -- and the per-grant brakes on
+// /mcp and on narvi_create_session (§43.6/§43.8): 1 s and 30, 1 min and 5.
 func TestDefaultTimeouts_MCPEndpointBrakeFields(t *testing.T) {
 	t.Parallel()
 
@@ -1796,6 +1797,8 @@ func TestDefaultTimeouts_MCPEndpointBrakeFields(t *testing.T) {
 	}{
 		{"MCPTokenEndpointRateInterval", to.MCPTokenEndpointRateInterval, 2 * time.Second},
 		{"MCPAuthorizeRateInterval", to.MCPAuthorizeRateInterval, 3 * time.Second},
+		{"MCPCallRateInterval", to.MCPCallRateInterval, time.Second},
+		{"MCPCreateSessionRateInterval", to.MCPCreateSessionRateInterval, time.Minute},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
@@ -1809,6 +1812,8 @@ func TestDefaultTimeouts_MCPEndpointBrakeFields(t *testing.T) {
 		{"MCPTokenEndpointRateBurst", to.MCPTokenEndpointRateBurst, 10},
 		{"MCPAuthorizeRateBurst", to.MCPAuthorizeRateBurst, 10},
 		{"MCPMaxPendingAuthorizationRequestsPerClient", to.MCPMaxPendingAuthorizationRequestsPerClient, 100},
+		{"MCPCallRateBurst", to.MCPCallRateBurst, 30},
+		{"MCPCreateSessionRateBurst", to.MCPCreateSessionRateBurst, 5},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s = %d, want %d", tc.name, tc.got, tc.want)
@@ -1820,8 +1825,9 @@ func TestDefaultTimeouts_MCPEndpointBrakeFields(t *testing.T) {
 }
 
 // TestValidate_MCPEndpointBrakes proves each brake and the cap is checked
-// on its own and reported by name (technical plan §43.14): a zero interval
-// is no limit at all, and a burst or cap below one refuses everything.
+// on its own and reported by name (technical plan §43.14, and the per-grant
+// brakes of §43.6/§43.8): a zero interval is no limit at all, and a burst
+// or cap below one refuses everything.
 func TestValidate_MCPEndpointBrakes(t *testing.T) {
 	t.Parallel()
 
@@ -1831,6 +1837,8 @@ func TestValidate_MCPEndpointBrakes(t *testing.T) {
 	}{
 		{"MCPTokenEndpointRateInterval", func(to *platform.Timeouts) { to.MCPTokenEndpointRateInterval = 0 }},
 		{"MCPAuthorizeRateInterval", func(to *platform.Timeouts) { to.MCPAuthorizeRateInterval = -time.Second }},
+		{"MCPCallRateInterval", func(to *platform.Timeouts) { to.MCPCallRateInterval = 0 }},
+		{"MCPCreateSessionRateInterval", func(to *platform.Timeouts) { to.MCPCreateSessionRateInterval = -time.Minute }},
 	} {
 		t.Run(tc.field, func(t *testing.T) {
 			t.Parallel()
@@ -1849,6 +1857,8 @@ func TestValidate_MCPEndpointBrakes(t *testing.T) {
 		{"MCPTokenEndpointRateBurst", func(to *platform.Timeouts) { to.MCPTokenEndpointRateBurst = 0 }},
 		{"MCPAuthorizeRateBurst", func(to *platform.Timeouts) { to.MCPAuthorizeRateBurst = 0 }},
 		{"MCPMaxPendingAuthorizationRequestsPerClient", func(to *platform.Timeouts) { to.MCPMaxPendingAuthorizationRequestsPerClient = 0 }},
+		{"MCPCallRateBurst", func(to *platform.Timeouts) { to.MCPCallRateBurst = 0 }},
+		{"MCPCreateSessionRateBurst", func(to *platform.Timeouts) { to.MCPCreateSessionRateBurst = -1 }},
 	} {
 		t.Run(tc.field, func(t *testing.T) {
 			t.Parallel()

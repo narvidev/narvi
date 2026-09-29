@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"log/slog"
 	"net/http"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
@@ -41,7 +43,49 @@ var testUser = platform.AuthenticatedUser{
 // testGrantScopes is the grant every unit test's fakeAuth attaches unless
 // a test chooses otherwise: every scope this build advertises, so the
 // full tool table is visible -- what a user who approved everything gets.
-var testGrantScopes = []string{"mcp:read"}
+var testGrantScopes = []string{"mcp:read", "mcp:write"}
+
+// testGrantID is the grant fakeAuthWithGrant attaches: the key the create
+// brake is consulted with.
+const testGrantID = "33333333-3333-3333-3333-333333333333"
+
+// allowAllBrake is a CreateBrake that never refuses, for every unit test
+// whose subject is not the brake itself.
+type allowAllBrake struct{}
+
+func (allowAllBrake) Allow(string) (bool, time.Duration) { return true, 0 }
+
+// recordingBrake is a CreateBrake that refuses once it has admitted allow
+// starts, answering retryAfter, and records every key it was asked about.
+type recordingBrake struct {
+	allow      int
+	retryAfter time.Duration
+
+	mu   sync.Mutex
+	keys []string
+}
+
+func (b *recordingBrake) Allow(key string) (bool, time.Duration) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.keys = append(b.keys, key)
+	if len(b.keys) <= b.allow {
+		return true, 0
+	}
+	return false, b.retryAfter
+}
+
+func (b *recordingBrake) asked() []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]string(nil), b.keys...)
+}
+
+// testConfig is the Config every unit test builds NewHandler with: baseURL
+// as the one trusted origin, and a brake that never refuses.
+func testConfig(baseURL string) Config {
+	return Config{PublicBaseURL: baseURL, CreateBrake: allowAllBrake{}}
+}
 
 // fakeAuth is a MINIMAL stand-in for auth.RequireMCPBearer's own
 // OBSERVABLE contract, used only by this package's own unit tests (never a
@@ -73,7 +117,7 @@ func fakeAuthWithGrant(authenticated bool, user platform.AuthenticatedUser, scop
 			}
 			ctx := platform.WithUser(r.Context(), user)
 			if scopes != nil {
-				ctx = platform.WithMCPGrant(ctx, platform.MCPGrant{GrantID: "33333333-3333-3333-3333-333333333333", ClientID: "narvi_mcp_c_unit", Scopes: *scopes})
+				ctx = platform.WithMCPGrant(ctx, platform.MCPGrant{GrantID: testGrantID, ClientID: "narvi_mcp_c_unit", Scopes: *scopes})
 			}
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
@@ -117,7 +161,7 @@ func newTestHandler(t testing.TB, enabled, authenticated bool, twins Twins) http
 // built against a base URL that actually needs either one.
 func newTestHandlerWithBaseURL(t testing.TB, enabled, authenticated bool, twins Twins, baseURL string) http.Handler {
 	t.Helper()
-	cfg := Config{PublicBaseURL: baseURL}
+	cfg := testConfig(baseURL)
 	mcpHandler, err := NewHandler(cfg, twins)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
@@ -135,7 +179,7 @@ func newTestHandlerWithBaseURL(t testing.TB, enabled, authenticated bool, twins 
 // directly.
 func newTestHandlerWithInputSchemas(t testing.TB, twins Twins, inputSchemas map[string]*jsonschema.Schema) http.Handler {
 	t.Helper()
-	cfg := Config{PublicBaseURL: testPublicBaseURL}
+	cfg := testConfig(testPublicBaseURL)
 	mcpHandler, err := newHandler(cfg, twins, inputSchemas)
 	if err != nil {
 		t.Fatalf("newHandler: %v", err)
@@ -173,7 +217,14 @@ func mountTestRouteWithAuth(t testing.TB, cfg Config, enabled bool, authGate fun
 // the grant's scopes chosen by the test (nil: no grant at all).
 func newTestHandlerWithGrant(t testing.TB, twins Twins, scopes *[]string) http.Handler {
 	t.Helper()
-	cfg := Config{PublicBaseURL: testPublicBaseURL}
+	return newTestHandlerWithGrantAndBrake(t, twins, scopes, allowAllBrake{})
+}
+
+// newTestHandlerWithGrantAndBrake is newTestHandlerWithGrant with the
+// create brake chosen by the test.
+func newTestHandlerWithGrantAndBrake(t testing.TB, twins Twins, scopes *[]string, brake CreateBrake) http.Handler {
+	t.Helper()
+	cfg := Config{PublicBaseURL: testPublicBaseURL, CreateBrake: brake}
 	mcpHandler, err := NewHandler(cfg, twins)
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)

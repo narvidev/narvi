@@ -149,10 +149,6 @@ var RouteGuideExemptions = []RouteGuideExemption{
 		Reason: "Sandbox-agent bearer route: the in-sandbox download_file tool reads back previously uploaded content here (httpapi/uploadcontent.go's UploadContent), never a browser -- distinct from its cookie-authenticated browser twin GET /api/sessions/{sessionID}/uploads/{uploadID}/content, already documented in web.md.",
 	},
 	{
-		Route:  "POST /mcp",
-		Reason: "MCP protocol endpoint (internal/adapters/inbound/mcp, technical plan §43): a JSON-RPC Streamable HTTP surface whose commands are MCP tools, not routes, called by an MCP client program with a bearer token from this deployment's own OAuth authorization server (§43.13) -- never by a page of this web app, and never with the session cookie, which it refuses. How a person connects such a client is documented in web.md's own \"Connected apps (MCP clients)\" section (GET /oauth/authorize and the consent page). It cannot be a per-surface guide file until mcp is a sessions.spawn_source value (TestNoGuideDrift's own guide-surface rule).",
-	},
-	{
 		Route:  "GET /.well-known/oauth-protected-resource/mcp",
 		Reason: "RFC 9728 protected-resource metadata for POST /mcp (internal/adapters/inbound/mcpauth's ProtectedResourceMetadata): fetched by an MCP client's own OAuth library after a 401 from /mcp, to learn which authorization server issues tokens for it -- never opened by a person browsing the app.",
 	},
@@ -162,15 +158,15 @@ var RouteGuideExemptions = []RouteGuideExemption{
 	},
 	{
 		Route:  "POST /oauth/token",
-		Reason: "OAuth token endpoint for MCP clients (internal/adapters/inbound/mcpauth's Token): the MCP client program itself exchanges an authorization code for an access token here after the person approved it on the consent page (documented in web.md), and later trades its refresh token for a new one -- no page of this web app posts to it, and it reads no cookie.",
+		Reason: "OAuth token endpoint for MCP clients (internal/adapters/inbound/mcpauth's Token): the MCP client program itself exchanges an authorization code for an access token here after the person approved it on the consent page (documented in mcp.md), and later trades its refresh token for a new one -- no page of this web app posts to it, and it reads no cookie.",
 	},
 	{
 		Route:  "POST /oauth/revoke",
-		Reason: "OAuth token revocation endpoint (RFC 7009) for MCP clients (internal/adapters/inbound/mcpauth's Revoke): an MCP client program gives back one of its own tokens here, for instance when the person signs out of it -- no page of this web app posts to it and it reads no cookie; a person disconnects an app from Settings instead (DELETE /api/me/mcp-authorizations/{authorizationID}, documented in web.md).",
+		Reason: "OAuth token revocation endpoint (RFC 7009) for MCP clients (internal/adapters/inbound/mcpauth's Revoke): an MCP client program gives back one of its own tokens here, for instance when the person signs out of it -- no page of this web app posts to it and it reads no cookie; a person disconnects an app from Settings instead (DELETE /api/me/mcp-authorizations/{authorizationID}, documented in mcp.md).",
 	},
 	{
 		Route:  "POST /oauth/register",
-		Reason: "RFC 7591 dynamic client registration for MCP clients (internal/adapters/inbound/mcpauth's Register), off unless the deployment sets NARVI_MCP_DCR_ENABLED: an MCP client program's own OAuth library registers itself here, before it opens the authorization page, when it has neither a pre-registered client ID nor a client ID metadata document -- no page of this web app posts to it and it reads no cookie. What a person then sees, the consent page, is documented in web.md.",
+		Reason: "RFC 7591 dynamic client registration for MCP clients (internal/adapters/inbound/mcpauth's Register), off unless the deployment sets NARVI_MCP_DCR_ENABLED: an MCP client program's own OAuth library registers itself here, before it opens the authorization page, when it has neither a pre-registered client ID nor a client ID metadata document -- no page of this web app posts to it and it reads no cookie. What a person then sees, the consent page, is documented in mcp.md.",
 	},
 }
 

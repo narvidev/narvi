@@ -2168,6 +2168,23 @@ type CreateSessionRequest struct {
 	// NOT carry this field.
 	EpistemicCheckEnabled CreateSessionRequestEpistemicCheckEnabled `json:"epistemicCheckEnabled,omitempty,omitzero" yaml:"epistemicCheckEnabled,omitempty" mapstructure:"epistemicCheckEnabled,omitempty"`
 
+	// Optional (§43.8). A UUID the caller chooses for this one create request, so a
+	// retry cannot start a second session: 8-4-4-4-12 hexadecimal digits, in either
+	// case, both cases being one key; any other spelling is refused with 400. It is
+	// scoped to the authenticated user, one namespace across this route and the
+	// narvi_create_session MCP tool, and kept with the session it created
+	// (sessions.create_idempotency_key, migrations/000150). The same key sent again
+	// with the same request answers 200 with that session as it is now, and creates,
+	// audits and dispatches nothing. Requests are compared by what they ask for, not
+	// how their JSON is written: key order, whitespace, unknown fields, this key, and
+	// an optional field absent or given the value the route reads the same way (null,
+	// false, an empty list) make no difference. The same key with a different request
+	// is refused with 409, and so is a key whose session was started the other way
+	// (by this route when the call comes over MCP, or over MCP when it does not).
+	// Absent means no replay protection, exactly as before. The narvi_create_session
+	// MCP tool always sends one.
+	IdempotencyKey *string `json:"idempotencyKey,omitempty,omitzero" yaml:"idempotencyKey,omitempty" mapstructure:"idempotencyKey,omitempty"`
+
 	// Optional (row 27, 'mocking + contract drift', §14.3). Like pathScope above,
 	// this key is genuinely OPTIONAL (may be absent from the request body entirely)
 	// and independent of it -- an Environment can be path-scoped, mock-configured,
@@ -2212,8 +2229,11 @@ type CreateSessionRequest struct {
 	// A closed subset of Postgres session_spawn_source: the sources an ingress
 	// surface passes in this shape. POST /api/sessions accepts only 'web' and refuses
 	// any other value with 400. 'mcp' is never accepted here: the server sets it for
-	// a session created over MCP, never from a request. Session.spawnSource, an open
-	// enum, lists every value a session can carry.
+	// a session created over MCP, never from a request. The narvi_create_session MCP
+	// tool sends 'web' here because it is the one value this route accepts, not as a
+	// statement of where the request came from: the server records 'mcp' from the MCP
+	// grant the call carries. Session.spawnSource, an open enum, lists every value a
+	// session can carry.
 	SpawnSource CreateSessionRequestSpawnSource `json:"spawnSource" yaml:"spawnSource" mapstructure:"spawnSource"`
 
 	// Title corresponds to the JSON schema field "title".
@@ -2488,6 +2508,119 @@ func (j *CreateSessionRequest) UnmarshalJSON(value []byte) error {
 		return fmt.Errorf("field %s length: must be >= %d", "repos", 1)
 	}
 	*j = CreateSessionRequest(plain)
+	return nil
+}
+
+// The narvi_create_session MCP tool's own input (technical plan §43.8) -- the tool
+// bridge's twin of POST /api/sessions. Self-contained: it references no other
+// $def. The bridge copies these fields into a CreateSessionRequest and sends that
+// DTO, never these arguments themselves. There is no spawnSource: the server
+// records mcp for a session created over MCP, from the MCP grant the call carries,
+// so a spawnSource argument is refused like any other unknown field.
+// CreateSessionRequest's environment settings (pathScope, mockConfig, docker,
+// egressPolicy, epistemicCheckEnabled) are not offered here. The answer is
+// Session: 201 for a session this call started, 200 for a retry with the same
+// idempotencyKey.
+type CreateSessionToolRequest struct {
+	// With planMode, the reasoning effort the implementation uses. Omitted means the
+	// default.
+	BuildEffort *string `json:"buildEffort,omitempty,omitzero" yaml:"buildEffort,omitempty" mapstructure:"buildEffort,omitempty"`
+
+	// With planMode, the model the implementation uses once the plan is approved.
+	// Omitted means the default.
+	BuildModelId *string `json:"buildModelId,omitempty,omitzero" yaml:"buildModelId,omitempty" mapstructure:"buildModelId,omitempty"`
+
+	// The reasoning effort of the first turn, one of that model's variants in
+	// narvi_list_models. Omitted means the default.
+	Effort *string `json:"effort,omitempty,omitzero" yaml:"effort,omitempty" mapstructure:"effort,omitempty"`
+
+	// A new UUID for each session you mean to start, reused only to retry that same
+	// call. A retry with the same key and the same arguments returns the session the
+	// first call started and starts nothing; the same key with different arguments is
+	// refused, and so is a key the user already used to start a session another way.
+	IdempotencyKey string `json:"idempotencyKey" yaml:"idempotencyKey" mapstructure:"idempotencyKey"`
+
+	// The model of the first turn, an id narvi_list_models lists. Omitted means the
+	// deployment's default.
+	ModelId *string `json:"modelId,omitempty,omitzero" yaml:"modelId,omitempty" mapstructure:"modelId,omitempty"`
+
+	// true: the first turn writes a plan and nothing is implemented until a person
+	// approves it. Omitted means false.
+	PlanMode bool `json:"planMode,omitempty,omitzero" yaml:"planMode,omitempty" mapstructure:"planMode,omitempty"`
+
+	// The first prompt. The session's first turn is queued with it at once.
+	Prompt string `json:"prompt" yaml:"prompt" mapstructure:"prompt"`
+
+	// The repositories the session works on. Each must be one this deployment already
+	// knows, or the call is refused exactly as POST /api/sessions refuses it.
+	Repos []CreateSessionToolRequestReposElem `json:"repos" yaml:"repos" mapstructure:"repos"`
+
+	// The session's title. Omitted means none.
+	Title *string `json:"title,omitempty,omitzero" yaml:"title,omitempty" mapstructure:"title,omitempty"`
+}
+
+type CreateSessionToolRequestReposElem struct {
+	// The branch to start from. Omitted means the repository's default branch.
+	Branch *string `json:"branch,omitempty,omitzero" yaml:"branch,omitempty" mapstructure:"branch,omitempty"`
+
+	// The directory the repository is checked out under.
+	Name string `json:"name" yaml:"name" mapstructure:"name"`
+
+	// The repository's clone URL, for example https://github.com/owner/repo.
+	Url string `json:"url" yaml:"url" mapstructure:"url"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *CreateSessionToolRequestReposElem) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["name"]; raw != nil && !ok {
+		return fmt.Errorf("field name in CreateSessionToolRequestReposElem: required")
+	}
+	if _, ok := raw["url"]; raw != nil && !ok {
+		return fmt.Errorf("field url in CreateSessionToolRequestReposElem: required")
+	}
+	type Plain CreateSessionToolRequestReposElem
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = CreateSessionToolRequestReposElem(plain)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *CreateSessionToolRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["idempotencyKey"]; raw != nil && !ok {
+		return fmt.Errorf("field idempotencyKey in CreateSessionToolRequest: required")
+	}
+	if _, ok := raw["prompt"]; raw != nil && !ok {
+		return fmt.Errorf("field prompt in CreateSessionToolRequest: required")
+	}
+	if _, ok := raw["repos"]; raw != nil && !ok {
+		return fmt.Errorf("field repos in CreateSessionToolRequest: required")
+	}
+	type Plain CreateSessionToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if v, ok := raw["planMode"]; !ok || v == nil {
+		plain.PlanMode = false
+	}
+	if utf8.RuneCountInString(string(plain.Prompt)) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "prompt", 1)
+	}
+	if plain.Repos != nil && len(plain.Repos) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "repos", 1)
+	}
+	*j = CreateSessionToolRequest(plain)
 	return nil
 }
 

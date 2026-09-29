@@ -390,7 +390,9 @@ func TestRefresh_CannotWidenScope(t *testing.T) {
 		}
 	})
 
-	t.Run("a scope this build does not offer", func(t *testing.T) {
+	// mcp:write is offered by this build but not held by the presented
+	// token, so it widens and is refused like a scope nobody offers.
+	t.Run("a scope the presented token does not hold, offered or not", func(t *testing.T) {
 		r := newASRig(t)
 		_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
 		pair := r.issuePair(t, cookie, "mcp:read")

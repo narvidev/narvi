@@ -2,6 +2,7 @@ package mcp
 
 import (
 	"encoding/json"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -9,6 +10,8 @@ import (
 	"testing"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
+
+	"github.com/narvidev/narvi/internal/domain/mcpscope"
 )
 
 // repoRoot locates this repo's own root directory relative to this test
@@ -43,6 +46,7 @@ var wantTwinRoutes = map[string]string{
 	"narvi_wait_for_session":       "GET /api/sessions/{sessionID}/status",
 	"narvi_get_session_result":     "GET /api/sessions/{sessionID}/result",
 	"narvi_get_session_transcript": "GET /api/sessions/{sessionID}/events",
+	"narvi_create_session":         "POST /api/sessions",
 }
 
 // TestEveryToolHasARegisteredTwin pins technical plan §43.9 item 2: a
@@ -111,6 +115,7 @@ func realToolsListTools(t testing.TB) []*sdkmcp.Tool {
 		GetSessionStatus: stubHandler(200, `{}`),
 		ListEvents:       stubHandler(200, `{}`),
 		GetSessionResult: stubHandler(200, `{}`),
+		CreateSession:    stubHandler(201, `{}`),
 	}
 	tools := make([]*sdkmcp.Tool, 0, len(toolSpecs(twins)))
 	for _, spec := range toolSpecs(twins) {
@@ -142,12 +147,13 @@ func TestToolsList_MatchesGolden(t *testing.T) {
 	}
 }
 
-// TestToolsList_ExactlySevenToolsDeterministicOrder pins the full table:
-// a grant holding every advertised scope sees exactly these seven tools,
-// in this order. Which subset a narrower grant sees is
-// TestToolsList_ScopeFilter_Table's (technical plan §43.17).
-func TestToolsList_ExactlySevenToolsDeterministicOrder(t *testing.T) {
-	want := []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_wait_for_session", "narvi_get_session_result", "narvi_get_session_transcript"}
+// TestToolsList_ExactlyEightToolsDeterministicOrder pins the full table:
+// a grant holding every advertised scope sees exactly these eight tools,
+// in this order -- the seven reads, then the one write. Which subset a
+// narrower grant sees is TestToolsList_ScopeFilter_Table's (technical plan
+// §43.17).
+func TestToolsList_ExactlyEightToolsDeterministicOrder(t *testing.T) {
+	want := []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_wait_for_session", "narvi_get_session_result", "narvi_get_session_transcript", "narvi_create_session"}
 	tools := realToolsListTools(t)
 	if len(tools) != len(want) {
 		t.Fatalf("len(tools) = %d, want %d", len(tools), len(want))
@@ -159,25 +165,72 @@ func TestToolsList_ExactlySevenToolsDeterministicOrder(t *testing.T) {
 	}
 }
 
-// TestToolAnnotations pins technical plan §43.8: every tool is
-// read-only, non-destructive, idempotent, and closed-world.
-func TestToolAnnotations(t *testing.T) {
+// TestToolAnnotations_MatchTwinMethod pins technical plan §43.8: a tool
+// whose twin is a GET is read-only, non-destructive, idempotent and
+// closed-world; a tool whose twin writes is never marked read-only, and
+// every one carries the destructive and open-world hints explicitly (a nil
+// one means "assume the worst" to a client). narvi_create_session's own
+// four are pinned too: it adds and never destroys, a retry with the same
+// idempotencyKey starts nothing more, and the run it starts reaches the
+// code host.
+func TestToolAnnotations_MatchTwinMethod(t *testing.T) {
+	twinMethod := map[string]string{}
+	for _, spec := range toolSpecs(Twins{}) {
+		twinMethod[spec.Name] = spec.Twin.method
+	}
 	for _, tool := range realToolsListTools(t) {
 		ann := tool.Annotations
-		if ann == nil {
-			t.Fatalf("%s: Annotations = nil", tool.Name)
+		if ann == nil || ann.DestructiveHint == nil || ann.OpenWorldHint == nil {
+			t.Fatalf("%s: Annotations = %+v, want every hint set explicitly", tool.Name, ann)
 		}
-		if !ann.ReadOnlyHint {
-			t.Errorf("%s: ReadOnlyHint = false, want true", tool.Name)
+		switch method := twinMethod[tool.Name]; method {
+		case http.MethodGet:
+			if !ann.ReadOnlyHint || *ann.DestructiveHint || !ann.IdempotentHint || *ann.OpenWorldHint {
+				t.Errorf("%s (a GET twin): annotations %+v, want read-only, not destructive, idempotent, closed-world", tool.Name, *ann)
+			}
+		default:
+			if ann.ReadOnlyHint {
+				t.Errorf("%s (a %s twin): ReadOnlyHint = true, want false -- a write tool is never marked read-only", tool.Name, method)
+			}
 		}
-		if ann.DestructiveHint == nil || *ann.DestructiveHint {
-			t.Errorf("%s: DestructiveHint = %v, want false", tool.Name, ann.DestructiveHint)
+	}
+	for _, tool := range realToolsListTools(t) {
+		if tool.Name != "narvi_create_session" {
+			continue
 		}
-		if !ann.IdempotentHint {
-			t.Errorf("%s: IdempotentHint = false, want true", tool.Name)
+		ann := tool.Annotations
+		if ann.ReadOnlyHint || *ann.DestructiveHint || !ann.IdempotentHint || !*ann.OpenWorldHint {
+			t.Errorf("narvi_create_session: annotations %+v, want not read-only, not destructive, idempotent, open-world", *ann)
 		}
-		if ann.OpenWorldHint == nil || *ann.OpenWorldHint {
-			t.Errorf("%s: OpenWorldHint = %v, want false", tool.Name, ann.OpenWorldHint)
+	}
+}
+
+// TestWriteTwinsRequireWriteScope is §43.17's structural guard (technical
+// plan §43.9): every tool whose twin is not a GET requires mcp:write, and
+// every GET twin requires mcp:read -- so a POST twin can never be declared
+// under the read scope, where a read-only grant would see and call it,
+// and a read can never be hidden behind the write scope by mistake. A
+// tool's BuildRequest cannot change its twin's method or path (twinCall
+// carries neither), so the method in the table is the method that runs.
+func TestWriteTwinsRequireWriteScope(t *testing.T) {
+	sawWrite := false
+	for _, spec := range toolSpecs(Twins{}) {
+		switch spec.Twin.method {
+		case http.MethodGet:
+			if spec.Scope != mcpscope.Read {
+				t.Errorf("%s: GET twin under scope %q, want %q", spec.Name, spec.Scope, mcpscope.Read)
+			}
+		default:
+			sawWrite = true
+			if spec.Scope != mcpscope.Write {
+				t.Errorf("%s: %s twin under scope %q, want %q", spec.Name, spec.Twin.method, spec.Scope, mcpscope.Write)
+			}
+			if spec.CreateBrake != (spec.Name == "narvi_create_session") {
+				t.Errorf("%s: CreateBrake = %v, want it set on the session-starting tool only", spec.Name, spec.CreateBrake)
+			}
 		}
+	}
+	if !sawWrite {
+		t.Fatal("no tool in the table writes -- this guard proves nothing without one")
 	}
 }

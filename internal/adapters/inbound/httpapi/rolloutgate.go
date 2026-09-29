@@ -176,7 +176,12 @@ func resolveTrustedRepoFullName(rawURL string) (fullName string, ok bool) {
 // "first not-enrolled repo" stops at (decision.RepoFullName) can be
 // checked for whether THAT SPECIFIC refusal was read-error-caused, not
 // merely whether ANY repo in the request happened to hit one.
-func checkRolloutGate(ctx context.Context, tx pgx.Tx, repoSettings *postgres.RepoSettingsStore, mode platform.RolloutMode, req restdtos.CreateSessionRequest) *CreateSessionError {
+//
+// spawnSource (§43.1) labels the Warn lines and the refusal counter: the
+// source the session would record (CreateSessionOnTx's spawnSourceFor),
+// which is mcp for a create bridged from an MCP tool even though its body
+// says web. It never decides anything here.
+func checkRolloutGate(ctx context.Context, tx pgx.Tx, repoSettings *postgres.RepoSettingsStore, mode platform.RolloutMode, req restdtos.CreateSessionRequest, spawnSource string) *CreateSessionError {
 	if mode != rollout.ModeCohort {
 		return nil
 	}
@@ -189,7 +194,7 @@ func checkRolloutGate(ctx context.Context, tx pgx.Tx, repoSettings *postgres.Rep
 		fullName, resolved := resolveTrustedRepoFullName(repo.Url)
 		if !resolved {
 			logger.Warn("httpapi: rollout gate: repo url could not be resolved to a trusted, host-verified owner/repo identity; treating as not enrolled",
-				"url", repo.Url, "spawn_source", string(req.SpawnSource), "rollout_mode", string(mode))
+				"url", repo.Url, "spawn_source", spawnSource, "rollout_mode", string(mode))
 			admissions = append(admissions, rollout.RepoAdmission{FullName: repo.Url, Enrolled: false})
 			readErrored = append(readErrored, false)
 			continue
@@ -217,7 +222,7 @@ func checkRolloutGate(ctx context.Context, tx pgx.Tx, repoSettings *postgres.Rep
 			// from a demonstrated policy fact -- see this function's own
 			// doc comment.
 			logger.Warn("httpapi: rollout gate: read repo_settings failed; failing closed (treating as not enrolled)",
-				"repo", fullName, "error", err, "spawn_source", string(req.SpawnSource), "rollout_mode", string(mode))
+				"repo", fullName, "error", err, "spawn_source", spawnSource, "rollout_mode", string(mode))
 			admissions = append(admissions, rollout.RepoAdmission{FullName: fullName, Enrolled: false})
 			readErrored = append(readErrored, true)
 		}
@@ -242,7 +247,7 @@ func checkRolloutGate(ctx context.Context, tx pgx.Tx, repoSettings *postgres.Rep
 	}
 
 	logger.Warn("httpapi: rollout gate: session creation refused, repo not enrolled",
-		"repo", decision.RepoFullName, "spawn_source", string(req.SpawnSource), "rollout_mode", string(mode), "transient", refusalIsTransient)
+		"repo", decision.RepoFullName, "spawn_source", spawnSource, "rollout_mode", string(mode), "transient", refusalIsTransient)
 
 	if refusalIsTransient {
 		// Fail-closed, but NOT a policy refusal: repo_settings could not be
@@ -265,7 +270,7 @@ func checkRolloutGate(ctx context.Context, tx pgx.Tx, repoSettings *postgres.Rep
 		}
 	}
 
-	recordRolloutRefusal(ctx, string(req.SpawnSource))
+	recordRolloutRefusal(ctx, spawnSource)
 
 	return &CreateSessionError{
 		Status:         http.StatusForbidden,

@@ -10,6 +10,36 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.11.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `CreateSessionRequest.idempotencyKey`, optional, `format: uuid`
+  (technical plan §43.8, row 183). A caller-chosen key, scoped to the
+  authenticated user and kept with the session it created: the same key
+  with the same request answers `200` with that session and starts
+  nothing; the same key with a different request is refused `409`, and so
+  is a key whose session was started the other way (by cookie or over
+  MCP). Requests are compared by what they ask for, however their JSON is
+  written. The key is 8-4-4-4-12 hexadecimal digits in either case, both
+  cases one key; any other spelling is refused `400`. An optional property
+  added to a client-to-platform shape grades MINOR (row 2). Absent, `POST
+  /api/sessions` behaves exactly as before.
+- Added: `CreateSessionToolRequest`, the input of the new
+  `narvi_create_session` MCP tool, whose twin is `POST /api/sessions`. A
+  new `$def` grades MINOR (row 32). It is self-contained and has no
+  `spawnSource`: the server records `mcp` from the MCP grant, so a
+  caller-supplied source is refused as an unknown argument.
+  `idempotencyKey` is required there. `CreateSessionRequest`'s environment
+  settings are not offered; adding one later is MINOR (row 2).
+- Changed (description only, annotation-only PATCH):
+  `CreateSessionRequest.spawnSource` says that the MCP tool sends `web`,
+  the one value the route accepts, and that the server records `mcp`.
+  The field stays closed with its four values.
+- The MCP tool list gains `narvi_create_session`, whose output schema
+  reuses `Session` (`internal/adapters/inbound/mcp/testdata/
+  tools.golden.json`). No route changes.
+
 ## [1.10.0]
 
 ### rest/v1/dtos.schema.json

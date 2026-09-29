@@ -15,26 +15,32 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// maxTrackedAddresses bounds how many client networks (ClientAddressKey)
-// one RateLimiter keeps a bucket for, so a spray of source addresses
-// cannot grow its memory without limit. Past it, the network seen least
-// recently is forgotten to make room (its next request starts a fresh
-// bucket) -- a newcomer is never refused because the table is full.
-const maxTrackedAddresses = 10_000
+// maxTrackedKeys bounds how many keys -- client networks
+// (ByClientAddress) or MCP grants (GrantKey) -- one RateLimiter keeps a
+// bucket for, so a spray of source addresses cannot grow its memory without
+// limit. Past it, the key seen least recently is forgotten to make room (its
+// next request starts a fresh bucket) -- a newcomer is never refused
+// because the table is full.
+const maxTrackedKeys = 10_000
 
-// RateLimiter is a per-client-network token bucket (technical plan
-// §43.14/§43.15; golang.org/x/time/rate): each network may make burst
-// requests at once, then one per interval. It lives in memory, one per
-// replica -- a brake on abuse (table growth, spam), not a correctness
-// property, so it creates no second authority over any state (§5.1). One
-// is built per route, each with its own interval, burst and table: POST
-// /oauth/register (RegisterRateLimited), POST /oauth/token
-// (TokenRateLimited) and GET /oauth/authorize (Server.AuthorizeRateLimited).
-// It runs before the route's handler, so a refused request reads no body
-// and spends nothing -- a refresh token it refuses is not rotated, and a
-// code it refuses is not consumed.
+// RateLimiter is a keyed token bucket (technical plan §43.6/§43.14/§43.15;
+// golang.org/x/time/rate): each key -- a client network, or an MCP grant --
+// may make burst requests at once, then one per interval. It lives in
+// memory, one per replica -- a brake on abuse (table growth, spam, a
+// runaway client), not a correctness property, so it creates no second
+// authority over any state (§5.1). One is built per route, each with its
+// own interval, burst, key and table: POST /oauth/register
+// (RegisterRateLimited), POST /oauth/token (TokenRateLimited) and GET
+// /oauth/authorize (Server.AuthorizeRateLimited), each by client network
+// (ByClientAddress); POST /mcp by grant (GrantKey, MCPCallRateLimited). It
+// runs before the route's handler, so a refused request reads no body and
+// spends nothing -- a refresh token it refuses is not rotated, a code it
+// refuses is not consumed, and a tool call it refuses runs no tool. Allow
+// alone is the brake narvi_create_session consults per grant, inside the
+// MCP adapter, which may not import this package: that adapter names the
+// one method it needs as an interface, which *RateLimiter satisfies.
 //
-// Its memory is bounded at maxTrackedAddresses buckets, and no one
+// Keyed by network, its memory is bounded at maxTrackedKeys buckets, and no one
 // network can use that bound to lock out another: a flood from a single
 // network -- one IPv4 address (arriving as IPv4, or through a translator
 // ClientAddressKey recognizes), or one IPv6 /48 however many addresses it
@@ -153,7 +159,8 @@ func embeddedIPv4(a netip.Addr) (netip.Addr, bool) {
 }
 
 // Allow takes one request from key's bucket. When it refuses, retryAfter
-// is how long until the bucket holds a request again.
+// is how long until the bucket holds a request again. The table forgets
+// the key seen least recently past maxTrackedKeys.
 func (l *RateLimiter) Allow(key string) (ok bool, retryAfter time.Duration) {
 	now := l.now()
 	l.mu.Lock()
@@ -163,7 +170,7 @@ func (l *RateLimiter) Allow(key string) (ok bool, retryAfter time.Duration) {
 		l.recency.MoveToFront(el)
 		bucket = el.Value.(*trackedBucket).limiter
 	} else {
-		if l.recency.Len() >= maxTrackedAddresses {
+		if l.recency.Len() >= maxTrackedKeys {
 			oldest := l.recency.Back()
 			l.recency.Remove(oldest)
 			delete(l.buckets, oldest.Value.(*trackedBucket).key)
@@ -182,18 +189,52 @@ func (l *RateLimiter) Allow(key string) (ok bool, retryAfter time.Duration) {
 	return true, 0
 }
 
-// Limit is the middleware: a request whose address (ClientAddressKey) has
-// an empty bucket is answered by refuse, with how long until it may retry,
-// and never reaches next. Each refusal is logged at WARN with the route's
-// path and the client network, and nothing else: never the query (an
-// authorization request's state or challenge) nor the body (a code, a
-// refresh token), which the limiter never reads.
-func (l *RateLimiter) Limit(refuse func(w http.ResponseWriter, r *http.Request, retryAfter time.Duration)) func(http.Handler) http.Handler {
+// KeyFunc names the bucket a request draws from, and the attributes a
+// refusal of it is logged with -- never a credential, a query or a body.
+// ok false lets the request through unbraked: it is not one the key
+// applies to.
+type KeyFunc func(r *http.Request) (key string, logAttrs []any, ok bool)
+
+// ByClientAddress is the authorization server's key: the client network
+// (ClientAddressKey), logged as client_address.
+func ByClientAddress(r *http.Request) (string, []any, bool) {
+	key := ClientAddressKey(r)
+	return key, []any{"client_address", key}, true
+}
+
+// GrantKey is POST /mcp's key (technical plan §43.6): the MCP grant
+// auth.RequireMCPBearer attached to the request, so each user's approval of
+// each client has a bucket of its own -- one runaway client spends only its
+// own, and a network full of users is never braked as one. It is logged as
+// grant_id and client_id, never the bearer token, which that gate has
+// already stripped. A request with no grant is unreachable behind that gate;
+// it is let through, unbraked, to the MCP handler, which answers it with no
+// tools at all (mcp.defectServer).
+func GrantKey(r *http.Request) (string, []any, bool) {
+	grant, ok := platform.MCPGrantFromContext(r.Context())
+	if !ok {
+		return "", nil, false
+	}
+	return grant.GrantID, []any{"grant_id", grant.GrantID, "client_id", grant.ClientID}, true
+}
+
+// LimitBy is the middleware: a request whose key (key) has an empty bucket
+// is answered by refuse, with how long until it may retry, and never
+// reaches next. Each refusal is logged at WARN with the route's path and
+// the key's own attributes, and nothing else: never the query (an
+// authorization request's state or challenge), the body (a code, a refresh
+// token, a tool call's arguments) or a credential, none of which the
+// limiter reads. A refusal is never audited (technical plan §43.18).
+func (l *RateLimiter) LimitBy(key KeyFunc, refuse func(w http.ResponseWriter, r *http.Request, retryAfter time.Duration)) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			key := ClientAddressKey(r)
-			if ok, retryAfter := l.Allow(key); !ok {
-				platform.Logger(r.Context()).Warn("mcpauth: rate limited", "path", r.URL.Path, "client_address", key)
+			k, attrs, applies := key(r)
+			if !applies {
+				next.ServeHTTP(w, r)
+				return
+			}
+			if ok, retryAfter := l.Allow(k); !ok {
+				platform.Logger(r.Context()).Warn("mcpauth: rate limited", append([]any{"path", r.URL.Path}, attrs...)...)
 				refuse(w, r, retryAfter)
 				return
 			}
@@ -210,6 +251,18 @@ func setRetryAfter(w http.ResponseWriter, retryAfter time.Duration) {
 		seconds = 1
 	}
 	w.Header().Set("Retry-After", strconv.FormatInt(seconds, 10))
+}
+
+// MCPCallRateLimited is POST /mcp's answer to a grant over its budget
+// (technical plan §43.6): 429 with Retry-After in whole seconds (rounded up)
+// and {"error":"rate limited"}, the plain JSON error every REST refusal
+// uses -- the brake runs before the JSON-RPC message is read, so there is
+// no request id to answer. No tool ran and no twin was invoked.
+func MCPCallRateLimited(w http.ResponseWriter, _ *http.Request, retryAfter time.Duration) {
+	setRetryAfter(w, retryAfter)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusTooManyRequests)
+	_, _ = w.Write([]byte(`{"error":"rate limited"}`))
 }
 
 // RegisterRateLimited is POST /oauth/register's answer to a client address

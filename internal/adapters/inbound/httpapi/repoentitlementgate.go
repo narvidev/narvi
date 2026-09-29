@@ -308,6 +308,17 @@ type RepoEntitlementDecision struct {
 //     metric and the audit trail lie to an operator about how many repos
 //     are actually being kept out by this gate.
 func ResolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSessionStore, auditLog *postgres.AuditLogStore, createdBy pgtype.UUID, req restdtos.CreateSessionRequest) (RepoEntitlementDecision, *CreateSessionError) {
+	return resolveRepoEntitlement(ctx, prSessions, auditLog, createdBy, req, string(req.SpawnSource))
+}
+
+// resolveRepoEntitlement is ResolveRepoEntitlement with the source its
+// Warn lines, denial counter and denial audit row are labelled with chosen
+// by the caller (§43.1): CreateSessionCore passes the source the session
+// would record, which is mcp for a create bridged from an MCP tool even
+// though its body says web. The label decides nothing: the github exemption
+// still reads req.SpawnSource, so a create over MCP passes exactly the gate
+// a web create does.
+func resolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSessionStore, auditLog *postgres.AuditLogStore, createdBy pgtype.UUID, req restdtos.CreateSessionRequest, spawnSource string) (RepoEntitlementDecision, *CreateSessionError) {
 	if req.SpawnSource == restdtos.CreateSessionRequestSpawnSourceGithub {
 		return RepoEntitlementDecision{admitted: true}, nil
 	}
@@ -326,7 +337,7 @@ func ResolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 	// never crash the process that was about to create a session.
 	if prSessions == nil {
 		logger.Error("httpapi: repo entitlement gate: prSessions is nil; failing closed (treating as not known)",
-			"spawn_source", string(req.SpawnSource))
+			"spawn_source", spawnSource)
 		return RepoEntitlementDecision{}, &CreateSessionError{
 			Status:  http.StatusServiceUnavailable,
 			Message: "repository entitlement could not be verified: entitlement store unavailable",
@@ -339,8 +350,8 @@ func ResolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 		fullName, resolved := resolveTrustedRepoFullName(repo.Url)
 		if !resolved {
 			logger.Warn("httpapi: repo entitlement gate: repo url could not be resolved to a trusted, host-verified owner/repo identity; treating as not known",
-				"url", repo.Url, "spawn_source", string(req.SpawnSource))
-			return RepoEntitlementDecision{}, denyRepoEntitlement(ctx, auditLog, createdBy, actor, authz.RepoAdmission{FullName: repo.Url, Known: false}, req.SpawnSource)
+				"url", repo.Url, "spawn_source", spawnSource)
+			return RepoEntitlementDecision{}, denyRepoEntitlement(ctx, auditLog, createdBy, actor, authz.RepoAdmission{FullName: repo.Url, Known: false}, spawnSource)
 		}
 
 		// Plain, pool-backed read -- deliberately not .WithTx(tx): no
@@ -354,7 +365,7 @@ func ResolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 			// Case 3 above -- fail-closed, but NOT a demonstrated policy
 			// outcome. See this function's own doc comment.
 			logger.Warn("httpapi: repo entitlement gate: read github_pr_sessions failed; failing closed (treating as not known)",
-				"repo", fullName, "error", err, "spawn_source", string(req.SpawnSource))
+				"repo", fullName, "error", err, "spawn_source", spawnSource)
 			return RepoEntitlementDecision{}, &CreateSessionError{
 				Status:  http.StatusServiceUnavailable,
 				Message: "repository entitlement could not be verified: " + fullName,
@@ -362,7 +373,7 @@ func ResolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 		}
 
 		if aerr := authz.AuthorizeRepo(actor, authz.RepoAdmission{FullName: fullName, Known: known}); aerr != nil {
-			return RepoEntitlementDecision{}, denyRepoEntitlement(ctx, auditLog, createdBy, actor, authz.RepoAdmission{FullName: fullName, Known: known}, req.SpawnSource)
+			return RepoEntitlementDecision{}, denyRepoEntitlement(ctx, auditLog, createdBy, actor, authz.RepoAdmission{FullName: fullName, Known: known}, spawnSource)
 		}
 	}
 
@@ -393,15 +404,15 @@ func ResolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 // side channel failing must never flip an already-correct 403 into a
 // 500, nor -- the opposite, more dangerous mistake -- ever let the
 // caller through because a logging nicety could not be written.
-func denyRepoEntitlement(ctx context.Context, auditLogStore *postgres.AuditLogStore, createdBy pgtype.UUID, actor authz.Actor, admission authz.RepoAdmission, spawnSource restdtos.CreateSessionRequestSpawnSource) *CreateSessionError {
+func denyRepoEntitlement(ctx context.Context, auditLogStore *postgres.AuditLogStore, createdBy pgtype.UUID, actor authz.Actor, admission authz.RepoAdmission, spawnSource string) *CreateSessionError {
 	logger := platform.Logger(ctx)
 	logger.Warn("httpapi: repo entitlement gate: session creation refused, repo not entitled",
-		"repo", admission.FullName, "spawn_source", string(spawnSource), "actor_user_id", actor.UserID)
+		"repo", admission.FullName, "spawn_source", spawnSource, "actor_user_id", actor.UserID)
 
-	recordRepoEntitlementDenial(ctx, string(spawnSource))
+	recordRepoEntitlementDenial(ctx, spawnSource)
 
 	if err := auditlog.Record(ctx, auditLogStore, createdBy, "session.repo_entitlement_denied", "repo", admission.FullName, map[string]any{
-		"spawn_source": string(spawnSource),
+		"spawn_source": spawnSource,
 	}); err != nil {
 		logger.Error("httpapi: repo entitlement gate: record denial audit log failed", "error", err, "repo", admission.FullName)
 	}

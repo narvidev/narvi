@@ -109,7 +109,8 @@ func TestBuildGetSessionTranscriptRequest_Table(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			params, query, err := buildGetSessionTranscriptRequest(json.RawMessage(tc.arguments))
+			call, err := buildGetSessionTranscriptRequest(json.RawMessage(tc.arguments))
+			params, query := call.URLParams, call.Query
 			if tc.wantErr {
 				var iae *invalidArgumentError
 				if !errors.As(err, &iae) {
@@ -199,7 +200,8 @@ func TestBuildWaitForSessionRequest_Table(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			params, query, err := buildWaitForSessionRequest(json.RawMessage(tc.arguments))
+			call, err := buildWaitForSessionRequest(json.RawMessage(tc.arguments))
+			params, query := call.URLParams, call.Query
 			if err != nil {
 				t.Fatalf("err = %v", err)
 			}

@@ -21,6 +21,8 @@ func testTwins() Twins {
 		GetSessionStatus: stubHandler(http.StatusOK, `{"activity":"idle"}`),
 		ListEvents:       stubHandler(http.StatusOK, `{"events":[],"nextCursor":null}`),
 		GetSessionResult: stubHandler(http.StatusOK, `{"reviewScope":"none"}`),
+		// The one write twin answers 201, as POST /api/sessions does.
+		CreateSession: stubHandler(http.StatusCreated, `{"id":"created"}`),
 	}
 }
 
@@ -272,7 +274,7 @@ func TestOrigin_HTTPSDefaultPortAndIPv6TrustedOrigin(t *testing.T) {
 		// no longer a valid authority (a bare "::1:8443", indistinguishable
 		// from a host with an extra port segment) the instant the IPv6
 		// literal's own brackets are dropped.
-		if _, err := NewHandler(Config{PublicBaseURL: ipv6Base}, testTwins()); err != nil {
+		if _, err := NewHandler(testConfig(ipv6Base), testTwins()); err != nil {
 			t.Fatalf("NewHandler(Config{PublicBaseURL: %q}) = %v, want nil -- a deployment configured with an IPv6 PublicBaseURL must still boot", ipv6Base, err)
 		}
 
@@ -389,7 +391,7 @@ func TestOrigin_AbsentOriginCrossSiteFetchMetadataRefused(t *testing.T) {
 // applied") would make this exact request succeed instead, failing this
 // test.
 func TestNewHandler_InnerCrossOriginProtection_RefusesCrossSite(t *testing.T) {
-	cfg := Config{PublicBaseURL: testPublicBaseURL}
+	cfg := testConfig(testPublicBaseURL)
 	mcpHandler, err := NewHandler(cfg, testTwins())
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
@@ -717,8 +719,12 @@ func TestServerDiscover_AdvertisesConstant(t *testing.T) {
 	if !reflect.DeepEqual(env.Result.Capabilities, wantCapabilities) {
 		t.Errorf("capabilities = %#v, want EXACTLY %#v (no listChanged, no logging, no resources, no prompts)", env.Result.Capabilities, wantCapabilities)
 	}
-	if !strings.Contains(strings.ToLower(env.Result.Instructions), "read-only") {
-		t.Errorf("instructions = %q, want it to say the tools are read-only", env.Result.Instructions)
+	// The test grant holds every advertised scope, the write included, so
+	// the paragraph names the reads and the write apart and never says
+	// read-only (instructionsFor; TestInstructions_NameOnlyVisibleTools
+	// covers a read-only grant).
+	if ins := env.Result.Instructions; !strings.Contains(ins, "only read and change nothing") || !strings.Contains(ins, "acts as the user who approved this client") || strings.Contains(strings.ToLower(ins), "read-only") {
+		t.Errorf("instructions = %q, want the reads and the write named apart, and no read-only claim", ins)
 	}
 	serverInfo, _ := env.Result.Meta["io.modelcontextprotocol/serverInfo"].(map[string]any)
 	if serverInfo["name"] != "narvi" {
