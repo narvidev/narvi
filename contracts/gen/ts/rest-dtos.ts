@@ -3339,6 +3339,98 @@ export interface CreateSessionToolRequest {
   idempotencyKey: string;
 }
 /**
+ * The narvi_list_plans MCP tool's own input (technical plan §43.21) -- the tool bridge's twin of GET /api/sessions/{sessionID}/plans, carrying the path parameter as a plain required field exactly like GetSessionToolRequest. The answer is ListPlansResponse: every plan version of the session, by version, each with the id narvi_approve_plan and narvi_reject_plan take.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ListPlansToolRequest".
+ */
+export interface ListPlansToolRequest {
+  /**
+   * The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).
+   */
+  sessionId: string;
+}
+/**
+ * The narvi_approve_plan MCP tool's own input (technical plan §43.21) -- the tool bridge's twin of POST /api/sessions/{sessionID}/plans/{planId}/approve, which takes no body: both path parameters are plain required fields. Self-contained: it references no other $def. The answer is PlanActionResponse, with the id of the implementation turn the approval queued.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ApprovePlanToolRequest".
+ */
+export interface ApprovePlanToolRequest {
+  /**
+   * The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).
+   */
+  sessionId: string;
+  /**
+   * The plan version to approve: a Plan.id narvi_list_plans returns for this session, whose status is awaiting_approval. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).
+   */
+  planId: string;
+}
+/**
+ * The narvi_reject_plan MCP tool's own input (technical plan §43.21) -- the tool bridge's twin of POST /api/sessions/{sessionID}/plans/{planId}/reject, which takes no body: both path parameters are plain required fields. Self-contained: it references no other $def. The answer is PlanActionResponse, with no turn.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "RejectPlanToolRequest".
+ */
+export interface RejectPlanToolRequest {
+  /**
+   * The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).
+   */
+  sessionId: string;
+  /**
+   * The plan version to reject: a Plan.id narvi_list_plans returns for this session, whose status is awaiting_approval. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).
+   */
+  planId: string;
+}
+/**
+ * The narvi_request_plan_revision MCP tool's own input (technical plan §43.21) -- the tool bridge's twin of POST /api/sessions/{sessionID}/turns with planMode true, the web's own request for changes to a plan. Self-contained: it references no other $def. The bridge sends a CreateTurnRequest whose prompt is feedback and whose planMode is true, never these arguments themselves; it offers no planMode (always true here) and no attachments. The answer is CreateTurnResponse: 201 for the plan-mode turn it queued, which writes the next plan version for approval when it completes. While any turn of the session is pending, dispatched or processing -- an approved implementation included -- the twin refuses it with 409 and queues nothing.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "RequestPlanRevisionToolRequest".
+ */
+export interface RequestPlanRevisionToolRequest {
+  /**
+   * The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).
+   */
+  sessionId: string;
+  /**
+   * What the next plan version should change. It becomes the prompt of a plan-mode turn in the session's own conversation.
+   */
+  feedback: string;
+  /**
+   * The model of the revision turn, an id narvi_list_models lists. Omitted means the deployment's default.
+   */
+  modelId?: string;
+  /**
+   * The reasoning effort of the revision turn, one of that model's variants in narvi_list_models. Omitted means the default.
+   */
+  effort?: string;
+}
+/**
+ * The narvi_send_prompt MCP tool's own input (technical plan §43.21) -- the tool bridge's twin of POST /api/sessions/{sessionID}/turns with planMode false. Self-contained: it references no other $def. The bridge sends a CreateTurnRequest whose prompt is prompt and whose planMode is false, never these arguments themselves; it offers no planMode (narvi_request_plan_revision is the plan-mode turn) and no attachments. The answer is CreateTurnResponse: 201 for the turn it queued. While any turn of the session is pending, dispatched or processing, the twin refuses it with 409 and queues nothing. While a plan awaits approval, the twin refuses it with 409 too, unless it reads the prompt as a change to that plan, which it then queues as a revision.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "SendPromptToolRequest".
+ */
+export interface SendPromptToolRequest {
+  /**
+   * The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).
+   */
+  sessionId: string;
+  /**
+   * The prompt. The turn continues the session's own conversation.
+   */
+  prompt: string;
+  /**
+   * The model of the turn, an id narvi_list_models lists. Omitted means the deployment's default.
+   */
+  modelId?: string;
+  /**
+   * The reasoning effort of the turn, one of that model's variants in narvi_list_models. Omitted means the default.
+   */
+  effort?: string;
+}
+/**
  * GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's work is doing now, and how long to wait before reading it again. Derived at read time from the session's turn queue, a completed turn's push and pull request still under way, work the server holds that can create a turn on the session with no new input, and its human gates, all read in ONE database snapshot -- never from Session.status, which is re-derived only when a turn reaches a terminal state and so can hold any of its five values while a turn is queued or running. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read. With ?waitSeconds=N (a whole number of seconds; absent or 0 is the plain read, a negative or malformed value is a 400) the route waits, at most N seconds clamped to the deployment's maximum (25 as shipped), for the session to be settled, and answers the same shape with wait set: the snapshot it answers is its latest read.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema

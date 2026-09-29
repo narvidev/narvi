@@ -272,6 +272,74 @@ var toolCallArgs = map[string]struct {
 			{keywords: []string{"/properties/idempotencyKey/format"}, arguments: `{"prompt":"p","repos":[{"name":"widgets","url":"https://github.com/acme/widgets"}],"idempotencyKey":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/idempotencyKey': 'not-a-uuid' is not valid uuid: must have 5 elements"},
 		},
 	},
+	"narvi_list_plans": {
+		realValid: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`,
+		realInvalid: []keywordProbe{
+			// buildListPlansRequest decodes through the generated
+			// ListPlansToolRequest, exactly as narvi_get_session does through
+			// its own: the same rows hold.
+			{keywords: []string{"/type"}, arguments: `null`, realRefusal: "invalid arguments: - at '': got null, want object"},
+			{keywords: []string{"/additionalProperties"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","bogus":1}`, realRefusal: "invalid arguments: - at '': additional properties 'bogus' not allowed"},
+			{keywords: []string{"/properties/sessionId/type"}, arguments: `{"sessionId":null}`, realRefusal: "invalid arguments: - at '/sessionId': got null, want string"},
+			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+		},
+	},
+	"narvi_approve_plan": {
+		realValid: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","planId":"6c2d2f3f-7c2b-4c2b-8c2b-7c2b5c2b8c2b"}`,
+		realInvalid: []keywordProbe{
+			// restdtos.ApprovePlanToolRequest.UnmarshalJSON skips its required check when the
+			// arguments decode to a nil map, and a null id leaves it "" --
+			// each carried through to the twin, which answers 400 for it.
+			{keywords: []string{"/type"}, arguments: `null`, realRefusal: "invalid arguments: - at '': got null, want object"},
+			{keywords: []string{"/additionalProperties"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","planId":"6c2d2f3f-7c2b-4c2b-8c2b-7c2b5c2b8c2b","bogus":1}`, realRefusal: "invalid arguments: - at '': additional properties 'bogus' not allowed"},
+			{keywords: []string{"/properties/sessionId/type"}, arguments: `{"sessionId":null,"planId":"6c2d2f3f-7c2b-4c2b-8c2b-7c2b5c2b8c2b"}`, realRefusal: "invalid arguments: - at '/sessionId': got null, want string"},
+			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid","planId":"6c2d2f3f-7c2b-4c2b-8c2b-7c2b5c2b8c2b"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+			{keywords: []string{"/properties/planId/type"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","planId":null}`, realRefusal: "invalid arguments: - at '/planId': got null, want string"},
+			{keywords: []string{"/properties/planId/format"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","planId":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/planId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+		},
+	},
+	"narvi_reject_plan": {
+		realValid: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","planId":"6c2d2f3f-7c2b-4c2b-8c2b-7c2b5c2b8c2b"}`,
+		realInvalid: []keywordProbe{
+			// restdtos.RejectPlanToolRequest.UnmarshalJSON skips its required check when the
+			// arguments decode to a nil map, and a null id leaves it "" --
+			// each carried through to the twin, which answers 400 for it.
+			{keywords: []string{"/type"}, arguments: `null`, realRefusal: "invalid arguments: - at '': got null, want object"},
+			{keywords: []string{"/additionalProperties"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","planId":"6c2d2f3f-7c2b-4c2b-8c2b-7c2b5c2b8c2b","bogus":1}`, realRefusal: "invalid arguments: - at '': additional properties 'bogus' not allowed"},
+			{keywords: []string{"/properties/sessionId/type"}, arguments: `{"sessionId":null,"planId":"6c2d2f3f-7c2b-4c2b-8c2b-7c2b5c2b8c2b"}`, realRefusal: "invalid arguments: - at '/sessionId': got null, want string"},
+			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid","planId":"6c2d2f3f-7c2b-4c2b-8c2b-7c2b5c2b8c2b"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+			{keywords: []string{"/properties/planId/type"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","planId":null}`, realRefusal: "invalid arguments: - at '/planId': got null, want string"},
+			{keywords: []string{"/properties/planId/format"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","planId":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/planId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+		},
+	},
+	"narvi_request_plan_revision": {
+		realValid: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","feedback":"keep the env fallback","modelId":"m","effort":"high"}`,
+		realInvalid: []keywordProbe{
+			// buildRequestPlanRevisionRequest decodes through the generated
+			// RequestPlanRevisionToolRequest: an unknown key is ignored, a null sessionId leaves it "", and a
+			// null modelId or effort leaves it nil -- each carried through to
+			// the twin. planMode is not an argument: the tool sets it.
+			{keywords: []string{"/additionalProperties"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","feedback":"keep the env fallback","planMode":true}`, realRefusal: "invalid arguments: - at '': additional properties 'planMode' not allowed"},
+			{keywords: []string{"/properties/sessionId/type"}, arguments: `{"sessionId":null,"feedback":"keep the env fallback"}`, realRefusal: "invalid arguments: - at '/sessionId': got null, want string"},
+			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid","feedback":"keep the env fallback"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+			{keywords: []string{"/properties/modelId/type"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","feedback":"keep the env fallback","modelId":null}`, realRefusal: "invalid arguments: - at '/modelId': got null, want string"},
+			{keywords: []string{"/properties/effort/type"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","feedback":"keep the env fallback","effort":null}`, realRefusal: "invalid arguments: - at '/effort': got null, want string"},
+		},
+	},
+	"narvi_send_prompt": {
+		realValid: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","prompt":"run the tests again","modelId":"m","effort":"high"}`,
+		realInvalid: []keywordProbe{
+			// buildSendPromptRequest decodes through the generated
+			// SendPromptToolRequest: an unknown key is ignored, a null sessionId leaves it "", and a
+			// null modelId or effort leaves it nil -- each carried through to
+			// the twin. planMode is not an argument: the tool sets it.
+			{keywords: []string{"/additionalProperties"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","prompt":"run the tests again","planMode":true}`, realRefusal: "invalid arguments: - at '': additional properties 'planMode' not allowed"},
+			{keywords: []string{"/properties/sessionId/type"}, arguments: `{"sessionId":null,"prompt":"run the tests again"}`, realRefusal: "invalid arguments: - at '/sessionId': got null, want string"},
+			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid","prompt":"run the tests again"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+			{keywords: []string{"/properties/modelId/type"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","prompt":"run the tests again","modelId":null}`, realRefusal: "invalid arguments: - at '/modelId': got null, want string"},
+			{keywords: []string{"/properties/effort/type"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","prompt":"run the tests again","effort":null}`, realRefusal: "invalid arguments: - at '/effort': got null, want string"},
+		},
+	},
 }
 
 // buildRequestEnforces lists, per tool, the keywords of its real input
@@ -304,12 +372,40 @@ var buildRequestEnforces = map[string]map[string]string{
 		"/properties/repos/minItems": "restdtos.CreateSessionToolRequest.UnmarshalJSON refuses an empty repos array itself; " +
 			"the one value it carries through with no repo, null, is not an array, and minItems constrains arrays only",
 	},
+	"narvi_list_plans": {
+		"/required": "restdtos.ListPlansToolRequest.UnmarshalJSON refuses every object without a sessionId key; " +
+			"the one value it carries through without one, null, is not an object, and required constrains objects only",
+	},
+	"narvi_approve_plan": {
+		"/required": "restdtos.ApprovePlanToolRequest.UnmarshalJSON refuses every object without a sessionId or planId key; " +
+			"the one value it carries through without them, null, is not an object, and required constrains objects only",
+	},
+	"narvi_reject_plan": {
+		"/required": "restdtos.RejectPlanToolRequest.UnmarshalJSON refuses every object without a sessionId or planId key; " +
+			"the one value it carries through without them, null, is not an object, and required constrains objects only",
+	},
+	"narvi_request_plan_revision": {
+		"/type": "restdtos.RequestPlanRevisionToolRequest.UnmarshalJSON refuses every non-object: an array, string, number or boolean fails to decode, " +
+			"and null leaves feedback empty, which its generated minLength check refuses",
+		"/required":                      "restdtos.RequestPlanRevisionToolRequest.UnmarshalJSON refuses every object without a sessionId or feedback key",
+		"/properties/feedback/type":      "a non-string feedback fails to decode, and a null one leaves feedback empty, which the generated minLength check refuses",
+		"/properties/feedback/minLength": "restdtos.RequestPlanRevisionToolRequest.UnmarshalJSON refuses an empty feedback itself",
+	},
+	"narvi_send_prompt": {
+		"/type": "restdtos.SendPromptToolRequest.UnmarshalJSON refuses every non-object: an array, string, number or boolean fails to decode, " +
+			"and null leaves prompt empty, which its generated minLength check refuses",
+		"/required":                    "restdtos.SendPromptToolRequest.UnmarshalJSON refuses every object without a sessionId or prompt key",
+		"/properties/prompt/type":      "a non-string prompt fails to decode, and a null one leaves prompt empty, which the generated minLength check refuses",
+		"/properties/prompt/minLength": "restdtos.SendPromptToolRequest.UnmarshalJSON refuses an empty prompt itself",
+	},
 }
 
 // twinBodies is the 200 body each tool's counting twin answers with --
 // distinct per twin, so a successful result also shows WHICH twin ran.
 // narvi_wait_for_session's twin is narvi_get_session_status' own (the
-// status route, with ?waitSeconds=), so the two share one body.
+// status route, with ?waitSeconds=), so the two share one body, and so do
+// narvi_request_plan_revision and narvi_send_prompt, whose twin is POST
+// .../turns.
 var twinBodies = map[string]string{
 	"narvi_list_models":            `{"providers":[]}`,
 	"narvi_list_sessions":          `{"sessions":[]}`,
@@ -319,6 +415,11 @@ var twinBodies = map[string]string{
 	"narvi_get_session_result":     `{"reviewScope":"none"}`,
 	"narvi_get_session_transcript": `{"events":[],"nextCursor":null}`,
 	"narvi_create_session":         `{"id":"created"}`,
+	"narvi_list_plans":             `{"plans":[]}`,
+	"narvi_approve_plan":           `{"status":"approved"}`,
+	"narvi_reject_plan":            `{"status":"rejected"}`,
+	"narvi_request_plan_revision":  `{"status":"pending"}`,
+	"narvi_send_prompt":            `{"status":"pending"}`,
 }
 
 // countingTwins returns Twins whose handlers each add one to
@@ -343,8 +444,14 @@ func countingTwins(calls *atomic.Int32) Twins {
 		ListEvents:       twin("narvi_get_session_transcript"),
 		// Row 182's result (piece (c)).
 		GetSessionResult: twin("narvi_get_session_result"),
-		// The one write twin (technical plan §43.8).
+		// The create twin (technical plan §43.8).
 		CreateSession: twin("narvi_create_session"),
+		// The plan and turn twins (technical plan §43.21); the turn twin
+		// serves both turn tools, which share one body.
+		ListPlans:   twin("narvi_list_plans"),
+		ApprovePlan: twin("narvi_approve_plan"),
+		RejectPlan:  twin("narvi_reject_plan"),
+		CreateTurn:  twin("narvi_send_prompt"),
 	}
 }
 

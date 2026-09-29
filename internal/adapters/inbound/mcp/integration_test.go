@@ -163,6 +163,15 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		t.Fatalf("make %s known: %v", parityRepo, err)
 	}
 	createSession := httpapi.CreateSession(pool, rig.sessions, rig.turns, narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), registry, nil, false, platform.RolloutModeOpen, narvipg.NewRepoSettingsStore(pool), rig.prSessions)
+	// One handler per plan and turn route for the REST route and the MCP
+	// twin alike, as controlplane wires them (technical plan §43.21).
+	plans, planDocuments := narvipg.NewPlanStore(pool), narvipg.NewPlanDocumentStore(pool)
+	participants, auditLog := narvipg.NewParticipantStore(pool), narvipg.NewAuditLogStore(pool)
+	outbox, linearAgentSessions := narvipg.NewOutboxStore(pool, false), narvipg.NewLinearAgentSessionStore(pool)
+	listPlans := httpapi.ListPlans(rig.sessions, plans, rig.turns, rig.events, planDocuments)
+	approvePlan := httpapi.ApprovePlan(pool, rig.sessions, rig.turns, plans, rig.events, planDocuments, participants, outbox, linearAgentSessions, auditLog, registry, false)
+	rejectPlan := httpapi.RejectPlan(pool, rig.sessions, rig.turns, plans, rig.events, planDocuments, participants, outbox, linearAgentSessions, auditLog, false)
+	createTurn := httpapi.CreateTurn(pool, rig.sessions, rig.turns, plans, participants, auditLog, registry, nil, nil, false)
 
 	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{PublicBaseURL: baseURL, CreateBrake: unlimitedBrake{}}, mcpadapter.Twins{
 		ListModels:       httpapi.GetModelCatalog(),
@@ -172,6 +181,10 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		ListEvents:       httpapi.ListEvents(rig.sessions, rig.events),
 		GetSessionResult: getSessionResult,
 		CreateSession:    createSession,
+		ListPlans:        listPlans,
+		ApprovePlan:      approvePlan,
+		RejectPlan:       rejectPlan,
+		CreateTurn:       createTurn,
 	})
 	if err != nil {
 		t.Fatalf("mcpadapter.NewHandler: %v", err)
@@ -198,6 +211,10 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(rig.sessions, rig.waiter, platform.DefaultTimeouts()))
 		r.Get("/{sessionID}/events", httpapi.ListEvents(rig.sessions, rig.events))
 		r.Get("/{sessionID}/result", getSessionResult)
+		r.Get("/{sessionID}/plans", listPlans)
+		r.Post("/{sessionID}/plans/{planId}/approve", approvePlan)
+		r.Post("/{sessionID}/plans/{planId}/reject", rejectPlan)
+		r.Post("/{sessionID}/turns", createTurn)
 	})
 	router.Route("/mcp", func(r chi.Router) {
 		r.Use(mcpOriginGate)
@@ -774,7 +791,7 @@ func TestParity_ToolsListIsRoleIndependent(t *testing.T) {
 	// against the same fixed slice for all four roles below. Role does not
 	// gate discovery today (technical plan §43.17): every read tool is
 	// open to every role.
-	want := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
+	want := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_plans", "narvi_list_sessions", "narvi_wait_for_session"}
 	for _, role := range []sqlcgen.UserRole{sqlcgen.UserRoleViewer, sqlcgen.UserRoleMember, sqlcgen.UserRoleMaintainer, sqlcgen.UserRoleAdmin} {
 		t.Run(string(role), func(t *testing.T) {
 			user, _ := createUserWithRole(ctx, t, rig, role)
@@ -880,6 +897,11 @@ func TestParity_BearerEqualsCookieForEveryRole(t *testing.T) {
 	// freshness the fake code host confirms live -- so the result rows
 	// compare a real review, its live freshness included.
 	othersReview := seedReviewedSession(ctx, t, rig, owner.ID)
+	// Another user's session with two plan versions, the first superseded
+	// by the second, awaiting approval -- so the plan rows compare real
+	// versions, not an empty list.
+	othersPlanned := createSessionForUser(ctx, t, rig, owner.ID)
+	seedPlanVersions(ctx, t, rig, othersPlanned.ID)
 	const unknown = "00000000-0000-0000-0000-000000000000"
 
 	for _, role := range []sqlcgen.UserRole{sqlcgen.UserRoleViewer, sqlcgen.UserRoleMember, sqlcgen.UserRoleMaintainer, sqlcgen.UserRoleAdmin} {
@@ -921,6 +943,12 @@ func TestParity_BearerEqualsCookieForEveryRole(t *testing.T) {
 				{"transcript of another user's session", "/api/sessions/" + othersSession.ID.String() + "/events?limit=2", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q,"limit":2}`, othersSession.ID.String())},
 				{"transcript of an unknown session", "/api/sessions/" + unknown + "/events", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q}`, unknown)},
 				{"transcript with a cursor naming no event id", "/api/sessions/" + othersSession.ID.String() + "/events?cursor=9999999999999999999", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q,"cursor":"9999999999999999999"}`, othersSession.ID.String())},
+				// Row 183 (technical plan §43.21): a session's plans -- the
+				// caller's own (none yet), another user's two versions, and
+				// a session that does not exist.
+				{"plans of my session", "/api/sessions/" + own.ID.String() + "/plans", "narvi_list_plans", fmt.Sprintf(`{"sessionId":%q}`, own.ID.String())},
+				{"plans of another user's session", "/api/sessions/" + othersPlanned.ID.String() + "/plans", "narvi_list_plans", fmt.Sprintf(`{"sessionId":%q}`, othersPlanned.ID.String())},
+				{"plans of an unknown session", "/api/sessions/" + unknown + "/plans", "narvi_list_plans", fmt.Sprintf(`{"sessionId":%q}`, unknown)},
 			}
 			for _, tc := range cases {
 				var restBody json.RawMessage
@@ -1073,6 +1101,26 @@ func seedBusySession(ctx context.Context, t *testing.T, r *mcpTestRig, sessionID
 			Payload:   []byte(fmt.Sprintf(`{"n":%d}`, i)),
 		}); err != nil {
 			t.Fatalf("create event %d: %v", i, err)
+		}
+	}
+}
+
+// seedPlanVersions gives sessionID two plan versions, each produced by a
+// completed plan-mode turn: v1 superseded, v2 awaiting approval -- what a
+// request for changes leaves behind.
+func seedPlanVersions(ctx context.Context, t *testing.T, r *mcpTestRig, sessionID pgtype.UUID) {
+	t.Helper()
+	plans := narvipg.NewPlanStore(r.pool)
+	for _, v := range []struct {
+		version int32
+		status  sqlcgen.PlanStatus
+	}{{1, sqlcgen.PlanStatusSuperseded}, {2, sqlcgen.PlanStatusAwaitingApproval}} {
+		producing, err := r.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+		if err != nil {
+			t.Fatalf("create plan-mode turn: %v", err)
+		}
+		if _, err := plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: sessionID, TurnID: producing.ID, Version: v.version, Status: v.status}); err != nil {
+			t.Fatalf("create plan v%d: %v", v.version, err)
 		}
 	}
 }

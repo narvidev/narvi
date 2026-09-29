@@ -1566,6 +1566,186 @@
     "annotations": {
       "destructiveHint": false,
       "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "List one session's plan versions -- the same list GET /api/sessions/{sessionID}/plans returns, by version: each plan's id, version, status (awaiting_approval, approved, rejected, or superseded by a newer version), who decided it and when, its text and, when the model wrote them, its numbered steps. The plan awaiting approval, if any, is the one narvi_approve_plan and narvi_reject_plan take. Any authenticated role may read any session's plans; there is no per-session visibility restriction in this codebase today.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_list_plans MCP tool's own input (technical plan §43.21) -- the tool bridge's twin of GET /api/sessions/{sessionID}/plans, carrying the path parameter as a plain required field exactly like GetSessionToolRequest. The answer is ListPlansResponse: every plan version of the session, by version, each with the id narvi_approve_plan and narvi_reject_plan take.",
+      "properties": {
+        "sessionId": {
+          "description": "The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "type": "object"
+    },
+    "name": "narvi_list_plans",
+    "outputSchema": {
+      "$defs": {
+        "ListPlansResponse": {
+          "additionalProperties": false,
+          "description": "GET /api/sessions/:id/plans's own response body (audit finding M3, completeness) -- every plan VERSION for the session, ordered by version, so a web client can render v1-\u003ev2 history and find the currently awaiting_approval version's own id to approve/reject. Deliberately minimal: no pagination (a session's own plan history is expected to stay small, matching ArtifactsResponse's own identical 'unbounded' precedent above) and no new WS/event notification on plan creation -- later Steps (decision inbox, plan-mode UI) are already planned to build richer surfaces; this endpoint only closes the discoverability gap.",
+          "properties": {
+            "plans": {
+              "items": {
+                "$ref": "#/$defs/Plan"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "plans"
+          ],
+          "type": "object"
+        },
+        "Plan": {
+          "additionalProperties": false,
+          "description": "One plan-mode VERSION's own REST wire shape (migrations/000034_plan_mode.up.sql), returned by GET /api/sessions/:id/plans (audit finding M3, completeness: §8.1 shipped approve/reject with no way for a web client to ever discover a planId to approve). Deliberately omits turnId and slack_channel_id/slack_message_ts, both present on the underlying plans row: turnId is an internal linkage to the producing turn's own event stream, never itself surfaced (the plan-mode UI needs what that stream CONTAINS -- content below -- never the linkage id itself); slack_channel_id/slack_message_ts (migrations/000035_plan_mode_cross_channel.up.sql) are Slack cross-channel-notify plumbing that should never leak into a REST response, mirroring PlanActionResponse's own equally minimal shape below. content (the plan-mode UI, §12.2 item 3) closes the gap this description used to name as out of scope (\"not needed for a client whose job here is discovering/approving a planId\") now that a client's job here also includes RENDERING the plan: the producing turn's own final streamed assistant text, best-effort recovered server-side by the SAME bounded event-log scan internal/domain/plan.ExtractContent already provides for the Slack/Linear cross-channel notifiers (internal/app/sessionactor/planapprovalcontent.go), just windowed per plan VERSION here (bounded above by the NEXT turn dispatched in this session, if any, so an already-decided plan's content is never contaminated by a later turn's own streamed text) rather than only ever the just-completed turn. content is ALWAYS present and is always the model's own freeform prose, verbatim, rendered as plain text by the client (never markdown-parsed) -- exactly like every other model-authored string this schema carries -- and never stops being computed once structured (below) exists: structured is additive, never a replacement. structured (§12.2 item 3's own 'numbered steps with file refs, scope estimate' shape, internal/domain/plan.ExtractStructured) is the SAME content string's own machine-recovered structure, present only when the producing turn emitted a valid ```plan-steps block and null otherwise -- covering, identically and deliberately, every plan that predates this field, any plan whose model never attempted one, and one that attempted and failed validation: none of these is a distinguishable 'real zero', because there is no honest partial rendering for any of them beyond content's own prose (see ExtractStructured's own doc comment for the full reasoning, including why a genuinely empty steps array is folded into this SAME null case rather than kept as a distinct empty-but-real structured value). A client renders structured as a numbered list when present, and content as plain prose otherwise -- both fields are model-authored and attacker-influenceable, so title/description/fileRefs entries get the SAME plain-text-only treatment content itself always has.",
+          "properties": {
+            "content": {
+              "description": "Best-effort, server-extracted plan text (see this DTO's own top doc comment) -- never empty: falls back to a fixed, honest placeholder (internal/domain/plan.ContentFallbackText) when no token event could be recovered for this version's own window, mirroring planContentFallbackText's pre-existing identical fallback for the Slack/Linear notifiers. Model-authored freeform prose -- render as plain text only, never markdown-parsed, matching every other model-authored string this schema carries.",
+              "type": "string"
+            },
+            "createdAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "decidedAt": {
+              "description": "Null while status is 'awaiting_approval'; set the moment a decision (approve/reject, from any entry point) is recorded. goJSONSchema forces the literal *time.Time type (rather than go-jsonschema's own default generated named-pointer-type wrapper, e.g. PlanModelId's own PlanPlanModelId *string above): a NAMED type whose underlying type is *time.Time (e.g. 'type PlanDecidedAt *time.Time') does NOT inherit time.Time's own UnmarshalJSON/MarshalJSON method set in Go (methods attach to the exact named type they're declared on, never promoted across a distinct named-pointer-type indirection), so encoding/json falls through to its generic struct decoder and fails on a date-time STRING value with 'cannot unmarshal string into Go struct field ... of type time.Time' -- this is the first nullable date-time field this schema has ever needed (no prior nullable-date-time property existed to surface this), caught by this batch's own new Plan round-trip test.",
+              "format": "date-time",
+              "goJSONSchema": {
+                "imports": [
+                  "time"
+                ],
+                "type": "*time.Time"
+              },
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "decidedBy": {
+              "description": "The user who decided this plan's verdict. Null while status is 'awaiting_approval', or for a decision attributed to no direct human user.",
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "planModelId": {
+              "description": "The model that produced this plan version, copied from the producing turn's own model_id AT CREATION TIME (migrations/000034_plan_mode.up.sql's own doc comment on plan_model_id). Null means that turn had no explicit model id (the default model catalog entry).",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sessionId": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "status": {
+              "description": "Matches Postgres plan_status exactly (migrations/000034_plan_mode.up.sql).",
+              "examples": [
+                "awaiting_approval",
+                "approved",
+                "rejected",
+                "superseded"
+              ],
+              "type": "string"
+            },
+            "structured": {
+              "additionalProperties": false,
+              "description": "§12.2 item 3's own structured plan document -- content's own machine-recovered structure (internal/domain/plan.ExtractStructured), present only when the producing turn emitted a valid ```plan-steps block; null covers every other case identically (see this DTO's own top doc comment for the full enumeration and why they are deliberately not distinguished). A client that gets null renders content in prose instead -- structured never replaces content, which is always present regardless.",
+              "properties": {
+                "scopeEstimate": {
+                  "description": "A short, non-empty, model-authored free-text summary of the plan's overall size (the mockup's own '6 files · 2 migrations' line, docs/design/mockups.html) -- plain text only, like every other model-authored string here.",
+                  "minLength": 1,
+                  "type": "string"
+                },
+                "steps": {
+                  "description": "Always at least one step in a non-null structured value -- ExtractStructured folds a genuinely empty steps array into the SAME null case as no structure at all, so this array is never empty here.",
+                  "items": {
+                    "$ref": "#/$defs/PlanStep"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                }
+              },
+              "required": [
+                "steps",
+                "scopeEstimate"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "version": {
+              "description": "1-based, monotonically increasing per session (internal/domain/plan.NextVersion) -- v1 is the first plan proposed, v2 a 'request changes' revision, and so on.",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "id",
+            "sessionId",
+            "version",
+            "status",
+            "planModelId",
+            "createdAt",
+            "decidedAt",
+            "decidedBy",
+            "content",
+            "structured"
+          ],
+          "type": "object"
+        },
+        "PlanStep": {
+          "additionalProperties": false,
+          "description": "One numbered step of a Plan's own structured document (§12.2 item 3: 'numbered steps with file refs') -- internal/domain/plan.Step's wire shape. Every field is model-authored, attacker-influenceable prose or a repository-relative path string; a client renders all three as plain text only (title/description) or inert text (fileRefs, never a clickable/navigable link built from an unvalidated path), never markup, matching content's own established discipline.",
+          "properties": {
+            "description": {
+              "minLength": 1,
+              "type": "string"
+            },
+            "fileRefs": {
+              "description": "Repository-relative file paths this step touches, as reported by the model -- possibly empty (a step that has not yet named specific files), never null. Not validated against the repository's real tree or resolved to a link server-side: display-only, like FilesChanged elsewhere in this schema.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "title": {
+              "minLength": 1,
+              "type": "string"
+            }
+          },
+          "required": [
+            "title",
+            "description",
+            "fileRefs"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/ListPlansResponse",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
       "openWorldHint": true,
       "readOnlyHint": false
     },
@@ -1802,6 +1982,296 @@
         }
       },
       "$ref": "#/$defs/Session",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Approve a plan awaiting approval, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/plans/{planId}/approve, with every check that route makes: that user's own role (an admin or maintainer may approve any session's plan, a member only a plan of a session they started or joined, a viewer none); no turn of the session queued or running (a request for changes being written would otherwise be overtaken by the older plan, so the call is refused and nothing changes); and the plan still awaiting approval and belonging to that session (the first decision wins, whichever channel made it: a later one is refused). Approving queues the implementation turn at once, in the session's own conversation: it runs code in the session's repositories and spends on models, and what it changes is delivered like any turn's. A plan revision requested afterwards never withdraws that approval. Returns the plan's id, its status (approved) and the implementation turn's id; follow it with narvi_wait_for_session.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_approve_plan MCP tool's own input (technical plan §43.21) -- the tool bridge's twin of POST /api/sessions/{sessionID}/plans/{planId}/approve, which takes no body: both path parameters are plain required fields. Self-contained: it references no other $def. The answer is PlanActionResponse, with the id of the implementation turn the approval queued.",
+      "properties": {
+        "planId": {
+          "description": "The plan version to approve: a Plan.id narvi_list_plans returns for this session, whose status is awaiting_approval. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).",
+          "format": "uuid",
+          "type": "string"
+        },
+        "sessionId": {
+          "description": "The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "planId"
+      ],
+      "type": "object"
+    },
+    "name": "narvi_approve_plan",
+    "outputSchema": {
+      "$defs": {
+        "PlanActionResponse": {
+          "additionalProperties": false,
+          "description": "200 response body for POST /api/sessions/:id/plans/:planId/approve and its reject twin (§12.2 item 3) -- promoted from a hand-written Go struct (internal/adapters/inbound/httpapi/planapprove.go's own planActionResponse) now that GET .../plans above gives this same area a real DTO-consuming sibling endpoint, the exact condition that struct's own doc comment named as the trigger to eventually promote it.",
+          "properties": {
+            "planId": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "status": {
+              "description": "The plan's own real, current status after this call -- always 'approved' on a winning approve and 'rejected' on a winning reject in practice (a losing/conflicting call never reaches this response body at all, see DecidePlanOnTx's own doc comment), but modeled as the full plan_status enum for forward-compatibility rather than a literal, matching CreateTurnResponse.status's own identical precedent above.",
+              "examples": [
+                "awaiting_approval",
+                "approved",
+                "rejected",
+                "superseded"
+              ],
+              "type": "string"
+            },
+            "turnId": {
+              "description": "The newly enqueued implementation turn's id, set iff this call was ApprovePlan and it won. Always null for RejectPlan (reject never dispatches a new turn).",
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "planId",
+            "status",
+            "turnId"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/PlanActionResponse",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": false
+    },
+    "description": "Reject a plan awaiting approval, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/plans/{planId}/reject, with the same checks: that user's own role (as for narvi_approve_plan), and the plan still awaiting approval and belonging to that session (the first decision wins, whichever channel made it). Nothing is queued and nothing runs; that plan version stays rejected. To change a plan rather than drop it, use narvi_request_plan_revision instead. Returns the plan's id and its status (rejected).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_reject_plan MCP tool's own input (technical plan §43.21) -- the tool bridge's twin of POST /api/sessions/{sessionID}/plans/{planId}/reject, which takes no body: both path parameters are plain required fields. Self-contained: it references no other $def. The answer is PlanActionResponse, with no turn.",
+      "properties": {
+        "planId": {
+          "description": "The plan version to reject: a Plan.id narvi_list_plans returns for this session, whose status is awaiting_approval. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).",
+          "format": "uuid",
+          "type": "string"
+        },
+        "sessionId": {
+          "description": "The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "planId"
+      ],
+      "type": "object"
+    },
+    "name": "narvi_reject_plan",
+    "outputSchema": {
+      "$defs": {
+        "PlanActionResponse": {
+          "additionalProperties": false,
+          "description": "200 response body for POST /api/sessions/:id/plans/:planId/approve and its reject twin (§12.2 item 3) -- promoted from a hand-written Go struct (internal/adapters/inbound/httpapi/planapprove.go's own planActionResponse) now that GET .../plans above gives this same area a real DTO-consuming sibling endpoint, the exact condition that struct's own doc comment named as the trigger to eventually promote it.",
+          "properties": {
+            "planId": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "status": {
+              "description": "The plan's own real, current status after this call -- always 'approved' on a winning approve and 'rejected' on a winning reject in practice (a losing/conflicting call never reaches this response body at all, see DecidePlanOnTx's own doc comment), but modeled as the full plan_status enum for forward-compatibility rather than a literal, matching CreateTurnResponse.status's own identical precedent above.",
+              "examples": [
+                "awaiting_approval",
+                "approved",
+                "rejected",
+                "superseded"
+              ],
+              "type": "string"
+            },
+            "turnId": {
+              "description": "The newly enqueued implementation turn's id, set iff this call was ApprovePlan and it won. Always null for RejectPlan (reject never dispatches a new turn).",
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "planId",
+            "status",
+            "turnId"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/PlanActionResponse",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Ask for the next version of a session's plan, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/turns with planMode true and feedback as the prompt, the web's own request for changes, with the same checks: that user's own role (an admin or maintainer on any session, a member only on a session they started or joined, a viewer never). It queues a plan-mode turn in the session's own conversation, which runs in its sandbox and spends on models; when that turn completes it writes the next plan version, awaiting approval, and the version it replaces, if one was still awaiting approval, is superseded. Refused while any turn of the session is queued or running -- an approved implementation included: nothing is queued, that implementation keeps its approval and delivers what it changes, and the call can be made again once the session has settled (narvi_wait_for_session). Returns the new turn's id and status.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_request_plan_revision MCP tool's own input (technical plan §43.21) -- the tool bridge's twin of POST /api/sessions/{sessionID}/turns with planMode true, the web's own request for changes to a plan. Self-contained: it references no other $def. The bridge sends a CreateTurnRequest whose prompt is feedback and whose planMode is true, never these arguments themselves; it offers no planMode (always true here) and no attachments. The answer is CreateTurnResponse: 201 for the plan-mode turn it queued, which writes the next plan version for approval when it completes. While any turn of the session is pending, dispatched or processing -- an approved implementation included -- the twin refuses it with 409 and queues nothing.",
+      "properties": {
+        "effort": {
+          "description": "The reasoning effort of the revision turn, one of that model's variants in narvi_list_models. Omitted means the default.",
+          "type": "string"
+        },
+        "feedback": {
+          "description": "What the next plan version should change. It becomes the prompt of a plan-mode turn in the session's own conversation.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "modelId": {
+          "description": "The model of the revision turn, an id narvi_list_models lists. Omitted means the deployment's default.",
+          "type": "string"
+        },
+        "sessionId": {
+          "description": "The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "feedback"
+      ],
+      "type": "object"
+    },
+    "name": "narvi_request_plan_revision",
+    "outputSchema": {
+      "$defs": {
+        "CreateTurnResponse": {
+          "additionalProperties": false,
+          "description": "201 response body for POST /api/sessions/:id/turns: the newly created turn's own id/status only -- callers already have the full session state via GET /api/sessions/:id or the WS stream, so this endpoint's own job is confirming the enqueue, not re-describing the whole session.",
+          "properties": {
+            "id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "status": {
+              "description": "Matches Postgres turn_status exactly (migrations/000005_turns.up.sql) -- always \"pending\" for a freshly created turn today, but modeled as the full enum for forward-compatibility rather than a literal, matching Session.status's own precedent above.",
+              "examples": [
+                "pending",
+                "dispatched",
+                "processing",
+                "completed",
+                "failed",
+                "cancelled"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "status"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/CreateTurnResponse",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Send a prompt to a session, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/turns with planMode false, with the same checks: that user's own role (an admin or maintainer on any session, a member only on a session they started or joined, a viewer never). It queues a turn in the session's own conversation, which runs code in its repositories and spends on models. Refused while any turn of the session is queued or running: nothing is queued, so wait for the session to settle (narvi_wait_for_session) and send it then. While a plan awaits approval it is refused too, unless the server reads the prompt as a change to that plan, in which case it is queued as a revision of it; to decide the plan instead, use narvi_approve_plan or narvi_reject_plan. Returns the new turn's id and status.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_send_prompt MCP tool's own input (technical plan §43.21) -- the tool bridge's twin of POST /api/sessions/{sessionID}/turns with planMode false. Self-contained: it references no other $def. The bridge sends a CreateTurnRequest whose prompt is prompt and whose planMode is false, never these arguments themselves; it offers no planMode (narvi_request_plan_revision is the plan-mode turn) and no attachments. The answer is CreateTurnResponse: 201 for the turn it queued. While any turn of the session is pending, dispatched or processing, the twin refuses it with 409 and queues nothing. While a plan awaits approval, the twin refuses it with 409 too, unless it reads the prompt as a change to that plan, which it then queues as a revision.",
+      "properties": {
+        "effort": {
+          "description": "The reasoning effort of the turn, one of that model's variants in narvi_list_models. Omitted means the default.",
+          "type": "string"
+        },
+        "modelId": {
+          "description": "The model of the turn, an id narvi_list_models lists. Omitted means the deployment's default.",
+          "type": "string"
+        },
+        "prompt": {
+          "description": "The prompt. The turn continues the session's own conversation.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "sessionId": {
+          "description": "The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId",
+        "prompt"
+      ],
+      "type": "object"
+    },
+    "name": "narvi_send_prompt",
+    "outputSchema": {
+      "$defs": {
+        "CreateTurnResponse": {
+          "additionalProperties": false,
+          "description": "201 response body for POST /api/sessions/:id/turns: the newly created turn's own id/status only -- callers already have the full session state via GET /api/sessions/:id or the WS stream, so this endpoint's own job is confirming the enqueue, not re-describing the whole session.",
+          "properties": {
+            "id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "status": {
+              "description": "Matches Postgres turn_status exactly (migrations/000005_turns.up.sql) -- always \"pending\" for a freshly created turn today, but modeled as the full enum for forward-compatibility rather than a literal, matching Session.status's own precedent above.",
+              "examples": [
+                "pending",
+                "dispatched",
+                "processing",
+                "completed",
+                "failed",
+                "cancelled"
+              ],
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "status"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/CreateTurnResponse",
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object"
     }

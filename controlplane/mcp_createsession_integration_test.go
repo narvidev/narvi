@@ -314,18 +314,29 @@ func sdkCreateSessionKeyAcrossSources(t *testing.T, rig *oauthRouterRig) {
 }
 
 // assertCreateHiddenLikeUnknown checks, for a flow whose grant cannot see
-// narvi_create_session, that tools/list omits it, that calling it through
-// the SDK fails, that a raw call answers exactly an unknown tool's bytes
-// (the name the caller sent aside), and that nothing was written.
+// the write tools, that tools/list and the instructions name none of them,
+// that calling narvi_create_session through the SDK fails, that a raw call
+// to it -- and to narvi_approve_plan -- answers exactly an unknown tool's
+// bytes (the name the caller sent aside), and that nothing was written.
 func assertCreateHiddenLikeUnknown(ctx context.Context, t *testing.T, rig *oauthRouterRig, flow *sdkFlow) {
 	t.Helper()
+	writes := map[string]bool{}
+	for _, name := range writeToolNames() {
+		writes[name] = true
+	}
 	for _, name := range toolNames(ctx, t, flow.session) {
-		if name == "narvi_create_session" {
-			t.Fatalf("tools/list names narvi_create_session under a grant without mcp:write")
+		if writes[name] {
+			t.Fatalf("tools/list names %s under a grant without mcp:write", name)
 		}
 	}
-	if init := flow.session.InitializeResult(); init == nil || strings.Contains(init.Instructions, "narvi_create_session") {
-		t.Fatalf("instructions name the write tool under a grant without mcp:write: %+v", init)
+	init := flow.session.InitializeResult()
+	if init == nil {
+		t.Fatal("no initialize result")
+	}
+	for name := range writes {
+		if strings.Contains(init.Instructions, name) {
+			t.Fatalf("instructions name the write tool %s under a grant without mcp:write: %q", name, init.Instructions)
+		}
 	}
 	if _, err := callCreate(ctx, flow.session, "must not start", "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d"); err == nil {
 		t.Fatal("calling the hidden write tool succeeded")
@@ -339,10 +350,12 @@ func assertCreateHiddenLikeUnknown(ctx context.Context, t *testing.T, rig *oauth
 		status, _, raw := rig.postMCP(t, "tools/call", tool, body, token)
 		return status, string(raw)
 	}
-	hiddenStatus, hidden := call(hiddenToken, "narvi_create_session")
 	unknownStatus, unknown := call(full, "narvi_does_not_exist")
-	if hiddenStatus != unknownStatus || hidden != strings.ReplaceAll(unknown, "narvi_does_not_exist", "narvi_create_session") {
-		t.Fatalf("the hidden write tool answers differently from an unknown tool:\n hidden:  %d %s\n unknown: %d %s", hiddenStatus, hidden, unknownStatus, unknown)
+	for _, tool := range []string{"narvi_create_session", "narvi_approve_plan"} {
+		hiddenStatus, hidden := call(hiddenToken, tool)
+		if hiddenStatus != unknownStatus || hidden != strings.ReplaceAll(unknown, "narvi_does_not_exist", tool) {
+			t.Fatalf("the hidden write tool %s answers differently from an unknown tool:\n hidden:  %d %s\n unknown: %d %s", tool, hiddenStatus, hidden, unknownStatus, unknown)
+		}
 	}
 	if n := rig.countOf(ctx, t, `SELECT count(*) FROM sessions WHERE created_by = $1`, flow.member.ID); n != 0 {
 		t.Fatalf("a grant without mcp:write started %d session(s)", n)
@@ -372,7 +385,7 @@ func sdkWriteToolsReadGrant(t *testing.T, rig *oauthRouterRig) {
 	if err := rig.pool.QueryRow(ctx, `SELECT t.scopes FROM mcp_oauth_access_tokens t JOIN mcp_oauth_grants g ON g.id = t.grant_id WHERE g.user_id = $1`, flow.member.ID).Scan(&tokenScopes); err != nil || strings.Join(tokenScopes, " ") != "mcp:read" {
 		t.Fatalf("access token scopes = %v (err %v), want [mcp:read]", tokenScopes, err)
 	}
-	want := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
+	want := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_plans", "narvi_list_sessions", "narvi_wait_for_session"}
 	if got := toolNames(ctx, t, flow.session); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("ListTools under mcp:read = %v, want the reads alone %v", got, want)
 	}

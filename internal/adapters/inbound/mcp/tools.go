@@ -62,6 +62,23 @@ type Twins struct {
 	// so the same authorization, validation, entitlement and rollout gates,
 	// audit row and dispatch as a browser's create.
 	CreateSession http.HandlerFunc
+	// ListPlans is httpapi.ListPlans(...) -- narvi_list_plans' own twin,
+	// GET /api/sessions/{sessionID}/plans (technical plan §43.21).
+	ListPlans http.HandlerFunc
+	// ApprovePlan is httpapi.ApprovePlan(...) -- narvi_approve_plan's own
+	// twin (technical plan §43.21): the same handler, so the same role and
+	// own/joined rule, open-turn gate, guarded first-verdict-wins update,
+	// plan ownership check, approved-content snapshot, audit row and
+	// cross-channel notices as a browser's approval.
+	ApprovePlan http.HandlerFunc
+	// RejectPlan is httpapi.RejectPlan(...) -- narvi_reject_plan's own twin.
+	RejectPlan http.HandlerFunc
+	// CreateTurn is httpapi.CreateTurn(...) -- the one twin of both
+	// narvi_request_plan_revision (planMode true) and narvi_send_prompt
+	// (planMode false), POST /api/sessions/{sessionID}/turns: the same
+	// handler, so the same RejectIfOpen policy -- 409 while any turn is
+	// open, nothing queued -- as a browser's prompt (technical plan §43.21).
+	CreateTurn http.HandlerFunc
 }
 
 // toolSpec is the ONLY place a tool is declared: its wire name, the
@@ -87,13 +104,20 @@ type toolSpec struct {
 	// CreateBrake is true for a tool that starts a session: its call takes
 	// one from the grant's bucket in Config.CreateBrake after its arguments
 	// validate and before its twin runs (technical plan §43.8).
-	CreateBrake  bool
-	BuildRequest func(arguments json.RawMessage) (twinCall, error)
+	CreateBrake bool
+	// RefusedWhileTurnOpen is true for a tool whose twin refuses with 409,
+	// and queues nothing, while any turn of the session is pending,
+	// dispatched or processing -- approve (the stale-plan guard) and both
+	// turn tools (RejectIfOpen). It changes nothing the tool does: the twin
+	// decides. instructionsFor says it once, naming these tools
+	// (technical plan §43.21).
+	RefusedWhileTurnOpen bool
+	BuildRequest         func(arguments json.RawMessage) (twinCall, error)
 }
 
 // countWords spells small tool counts the way the instructions paragraph
 // reads them.
-var countWords = []string{"no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"}
+var countWords = []string{"no", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen", "twenty"}
 
 // instructionsFor is server/discover's and the legacy initialize
 // handshake's own "instructions" field (technical plan §43.5), composed
@@ -101,17 +125,24 @@ var countWords = []string{"no", "one", "two", "three", "four", "five", "six", "s
 // paragraph naming every tool would describe the deployment to a client
 // that may not use any of it. With no visible tool it names none. It says
 // the tools are read-only only when no write tool is visible; otherwise it
-// names the reads and the writes apart, and says what a write can do.
+// names the reads and the writes apart, and says what a write can do. When
+// a visible tool is refused while a turn is open (RefusedWhileTurnOpen), a
+// last sentence names those tools and says that nothing is queued, so a
+// client waits for the session to settle rather than retrying in a loop
+// (technical plan §43.21).
 func instructionsFor(visible []toolSpec) string {
 	if len(visible) == 0 {
 		return "This authorization gives access to no tools on this server. The user can connect this client again and approve more access."
 	}
-	var reads, writes []string
+	var reads, writes, gated []string
 	for _, spec := range visible {
 		if spec.Annotations != nil && spec.Annotations.ReadOnlyHint {
 			reads = append(reads, spec.Instruction)
 		} else {
 			writes = append(writes, spec.Instruction)
+		}
+		if spec.RefusedWhileTurnOpen {
+			gated = append(gated, spec.Name)
 		}
 	}
 	if len(writes) == 0 {
@@ -122,6 +153,9 @@ func instructionsFor(visible []toolSpec) string {
 		text += " " + capitalize(countWord(len(reads))) + " only " + plural(len(reads), "reads and changes", "read and change") + " nothing: " + joinList(reads) + "."
 	}
 	text += " " + capitalize(countWord(len(writes))) + " " + plural(len(writes), "acts", "act") + " as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " + joinList(writes) + "."
+	if len(gated) > 0 {
+		text += " " + joinList(gated) + " " + plural(len(gated), "is", "are") + " refused while a turn of the session is queued or running, and nothing is queued: wait until the session settles, then call again."
+	}
 	return text
 }
 
@@ -434,6 +468,97 @@ func buildCreateSessionRequest(arguments json.RawMessage) (twinCall, error) {
 	}}, nil
 }
 
+// buildListPlansRequest is buildGetSessionRequest for narvi_list_plans:
+// restdtos.ListPlansToolRequest (whose generated UnmarshalJSON enforces
+// "sessionId" is present) mapped onto the twin's own chi URL param,
+// "sessionID". No query and no body: GET /api/sessions/{sessionID}/plans
+// reads neither.
+func buildListPlansRequest(arguments json.RawMessage) (twinCall, error) {
+	var in restdtos.ListPlansToolRequest
+	if err := json.Unmarshal(arguments, &in); err != nil {
+		return twinCall{}, err
+	}
+	return twinCall{URLParams: map[string]string{"sessionID": in.SessionId}}, nil
+}
+
+// planDecisionParams maps a plan decision's two ids onto the twin's own
+// chi URL params: "sessionID" and "planId", the names POST
+// /api/sessions/{sessionID}/plans/{planId}/approve|reject reads
+// (httpapi.parseSessionID, parsePlanID). Neither route reads a query or a
+// body, so the call carries none.
+func planDecisionParams(sessionID, planID string) twinCall {
+	return twinCall{URLParams: map[string]string{"sessionID": sessionID, "planId": planID}}
+}
+
+// buildApprovePlanRequest maps narvi_approve_plan's arguments, decoded
+// through restdtos.ApprovePlanToolRequest (whose generated UnmarshalJSON
+// enforces both keys are present), onto the approve route's URL params.
+// Nothing else: every check the approval makes is the twin's (technical
+// plan §43.21).
+func buildApprovePlanRequest(arguments json.RawMessage) (twinCall, error) {
+	var in restdtos.ApprovePlanToolRequest
+	if err := json.Unmarshal(arguments, &in); err != nil {
+		return twinCall{}, err
+	}
+	return planDecisionParams(in.SessionId, in.PlanId), nil
+}
+
+// buildRejectPlanRequest is buildApprovePlanRequest for narvi_reject_plan,
+// through restdtos.RejectPlanToolRequest.
+func buildRejectPlanRequest(arguments json.RawMessage) (twinCall, error) {
+	var in restdtos.RejectPlanToolRequest
+	if err := json.Unmarshal(arguments, &in); err != nil {
+		return twinCall{}, err
+	}
+	return planDecisionParams(in.SessionId, in.PlanId), nil
+}
+
+// createTurnCall is the call both turn tools make to POST
+// /api/sessions/{sessionID}/turns: sessionID as the chi URL param, and a
+// restdtos.CreateTurnRequest body that callTwin marshals -- so only that
+// DTO's own fields reach the twin. planMode is the tool's own constant,
+// never an argument: true for narvi_request_plan_revision, false for
+// narvi_send_prompt. modelID and effort are null when omitted, which the
+// route reads as the default, as for a browser that sends null; no
+// attachment is ever offered. The route's policy is RejectIfOpen whatever
+// the body says: the body cannot ask for a queue (technical plan §43.21).
+func createTurnCall(sessionID, prompt string, modelID, effort *string, planMode bool) twinCall {
+	return twinCall{
+		URLParams: map[string]string{"sessionID": sessionID},
+		Body: restdtos.CreateTurnRequest{
+			Prompt:   prompt,
+			ModelId:  restdtos.CreateTurnRequestModelId(modelID),
+			Effort:   restdtos.CreateTurnRequestEffort(effort),
+			PlanMode: planMode,
+		},
+	}
+}
+
+// buildRequestPlanRevisionRequest maps narvi_request_plan_revision's
+// arguments, decoded through restdtos.RequestPlanRevisionToolRequest (whose
+// generated UnmarshalJSON enforces both required keys and a non-empty
+// feedback), onto a plan-mode turn whose prompt is the feedback -- the
+// web's own "request changes" body.
+func buildRequestPlanRevisionRequest(arguments json.RawMessage) (twinCall, error) {
+	var in restdtos.RequestPlanRevisionToolRequest
+	if err := json.Unmarshal(arguments, &in); err != nil {
+		return twinCall{}, err
+	}
+	return createTurnCall(in.SessionId, in.Feedback, in.ModelId, in.Effort, true), nil
+}
+
+// buildSendPromptRequest maps narvi_send_prompt's arguments, decoded
+// through restdtos.SendPromptToolRequest (whose generated UnmarshalJSON
+// enforces both required keys and a non-empty prompt), onto an ordinary
+// turn: planMode false.
+func buildSendPromptRequest(arguments json.RawMessage) (twinCall, error) {
+	var in restdtos.SendPromptToolRequest
+	if err := json.Unmarshal(arguments, &in); err != nil {
+		return twinCall{}, err
+	}
+	return createTurnCall(in.SessionId, in.Prompt, in.ModelId, in.Effort, false), nil
+}
+
 // toolSpecs is the tool table itself -- registerTools below and
 // TestEveryToolHasARegisteredTwin both read this SAME function (the
 // latter with a zero-value Twins{}, since it only ever inspects Twin.
@@ -518,6 +643,17 @@ func toolSpecs(twins Twins) []toolSpec {
 			BuildRequest: buildGetSessionTranscriptRequest,
 		},
 		{
+			Name:         "narvi_list_plans",
+			Description:  "List one session's plan versions -- the same list GET /api/sessions/{sessionID}/plans returns, by version: each plan's id, version, status (awaiting_approval, approved, rejected, or superseded by a newer version), who decided it and when, its text and, when the model wrote them, its numbered steps. The plan awaiting approval, if any, is the one narvi_approve_plan and narvi_reject_plan take. Any authenticated role may read any session's plans; there is no per-session visibility restriction in this codebase today.",
+			Scope:        mcpscope.Read,
+			Instruction:  "narvi_list_plans (one session's plan versions, each with its status and the id to approve or reject it by)",
+			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}/plans", handler: twins.ListPlans},
+			InputDef:     "ListPlansToolRequest",
+			OutputDef:    "ListPlansResponse",
+			Annotations:  readOnlyAnnotations,
+			BuildRequest: buildListPlansRequest,
+		},
+		{
 			Name:         "narvi_create_session",
 			Description:  "Start a new session as the user who approved this client -- the same as POST /api/sessions, with the same checks: that user's own role (a viewer may not start one), and every repository must be one this deployment knows. The session clones the repositories and runs a first turn with prompt at once: this runs code in those repositories and spends on models. With planMode true, the first turn writes a plan and nothing is implemented until a person approves it. idempotencyKey is required: a new UUID for each session you mean to start, and the same one only to retry this call -- a retry with the same key and the same arguments returns the session the first call started and starts nothing; the same key with different arguments is refused, and so is a key the user already used to start a session another way. Returns the Session, whose spawnSource is mcp; follow it with narvi_wait_for_session or narvi_get_session_status. One authorization may call this tool 5 times at once, then once a minute (as shipped), and a retry counts as a call: past that the call is refused, starts nothing and says how many seconds to wait. After that wait, a retry with the same key and the same arguments returns the session an earlier call with that key started, if one did.",
 			Scope:        mcpscope.Write,
@@ -528,6 +664,53 @@ func toolSpecs(twins Twins) []toolSpec {
 			Annotations:  createSessionAnnotations,
 			CreateBrake:  true,
 			BuildRequest: buildCreateSessionRequest,
+		},
+		{
+			Name:                 "narvi_approve_plan",
+			Description:          "Approve a plan awaiting approval, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/plans/{planId}/approve, with every check that route makes: that user's own role (an admin or maintainer may approve any session's plan, a member only a plan of a session they started or joined, a viewer none); no turn of the session queued or running (a request for changes being written would otherwise be overtaken by the older plan, so the call is refused and nothing changes); and the plan still awaiting approval and belonging to that session (the first decision wins, whichever channel made it: a later one is refused). Approving queues the implementation turn at once, in the session's own conversation: it runs code in the session's repositories and spends on models, and what it changes is delivered like any turn's. A plan revision requested afterwards never withdraws that approval. Returns the plan's id, its status (approved) and the implementation turn's id; follow it with narvi_wait_for_session.",
+			Scope:                mcpscope.Write,
+			Instruction:          "narvi_approve_plan (approve a plan awaiting approval, which queues its implementation)",
+			Twin:                 twin{method: http.MethodPost, pathTemplate: "/api/sessions/{sessionID}/plans/{planId}/approve", handler: twins.ApprovePlan},
+			InputDef:             "ApprovePlanToolRequest",
+			OutputDef:            "PlanActionResponse",
+			Annotations:          approvePlanAnnotations,
+			RefusedWhileTurnOpen: true,
+			BuildRequest:         buildApprovePlanRequest,
+		},
+		{
+			Name:         "narvi_reject_plan",
+			Description:  "Reject a plan awaiting approval, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/plans/{planId}/reject, with the same checks: that user's own role (as for narvi_approve_plan), and the plan still awaiting approval and belonging to that session (the first decision wins, whichever channel made it). Nothing is queued and nothing runs; that plan version stays rejected. To change a plan rather than drop it, use narvi_request_plan_revision instead. Returns the plan's id and its status (rejected).",
+			Scope:        mcpscope.Write,
+			Instruction:  "narvi_reject_plan (reject a plan awaiting approval)",
+			Twin:         twin{method: http.MethodPost, pathTemplate: "/api/sessions/{sessionID}/plans/{planId}/reject", handler: twins.RejectPlan},
+			InputDef:     "RejectPlanToolRequest",
+			OutputDef:    "PlanActionResponse",
+			Annotations:  rejectPlanAnnotations,
+			BuildRequest: buildRejectPlanRequest,
+		},
+		{
+			Name:                 "narvi_request_plan_revision",
+			Description:          "Ask for the next version of a session's plan, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/turns with planMode true and feedback as the prompt, the web's own request for changes, with the same checks: that user's own role (an admin or maintainer on any session, a member only on a session they started or joined, a viewer never). It queues a plan-mode turn in the session's own conversation, which runs in its sandbox and spends on models; when that turn completes it writes the next plan version, awaiting approval, and the version it replaces, if one was still awaiting approval, is superseded. Refused while any turn of the session is queued or running -- an approved implementation included: nothing is queued, that implementation keeps its approval and delivers what it changes, and the call can be made again once the session has settled (narvi_wait_for_session). Returns the new turn's id and status.",
+			Scope:                mcpscope.Write,
+			Instruction:          "narvi_request_plan_revision (ask for the next version of a plan, with feedback)",
+			Twin:                 twin{method: http.MethodPost, pathTemplate: "/api/sessions/{sessionID}/turns", handler: twins.CreateTurn},
+			InputDef:             "RequestPlanRevisionToolRequest",
+			OutputDef:            "CreateTurnResponse",
+			Annotations:          queueTurnAnnotations,
+			RefusedWhileTurnOpen: true,
+			BuildRequest:         buildRequestPlanRevisionRequest,
+		},
+		{
+			Name:                 "narvi_send_prompt",
+			Description:          "Send a prompt to a session, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/turns with planMode false, with the same checks: that user's own role (an admin or maintainer on any session, a member only on a session they started or joined, a viewer never). It queues a turn in the session's own conversation, which runs code in its repositories and spends on models. Refused while any turn of the session is queued or running: nothing is queued, so wait for the session to settle (narvi_wait_for_session) and send it then. While a plan awaits approval it is refused too, unless the server reads the prompt as a change to that plan, in which case it is queued as a revision of it; to decide the plan instead, use narvi_approve_plan or narvi_reject_plan. Returns the new turn's id and status.",
+			Scope:                mcpscope.Write,
+			Instruction:          "narvi_send_prompt (send a prompt to a session with no turn queued or running)",
+			Twin:                 twin{method: http.MethodPost, pathTemplate: "/api/sessions/{sessionID}/turns", handler: twins.CreateTurn},
+			InputDef:             "SendPromptToolRequest",
+			OutputDef:            "CreateTurnResponse",
+			Annotations:          queueTurnAnnotations,
+			RefusedWhileTurnOpen: true,
+			BuildRequest:         buildSendPromptRequest,
 		},
 	}
 }
@@ -550,6 +733,40 @@ var createSessionAnnotations = &sdkmcp.ToolAnnotations{
 	ReadOnlyHint:    false,
 	DestructiveHint: boolPtr(false),
 	IdempotentHint:  true,
+	OpenWorldHint:   boolPtr(true),
+}
+
+// approvePlanAnnotations are narvi_approve_plan's (technical plan §43.21):
+// it writes, but destroys nothing -- it moves a plan from awaiting to
+// approved and adds a turn; a second call with the same arguments changes
+// nothing more (the first verdict wins, a later one is refused); and the
+// implementation it queues reads from and pushes to the code host.
+var approvePlanAnnotations = &sdkmcp.ToolAnnotations{
+	ReadOnlyHint:    false,
+	DestructiveHint: boolPtr(false),
+	IdempotentHint:  true,
+	OpenWorldHint:   boolPtr(true),
+}
+
+// rejectPlanAnnotations are narvi_reject_plan's: a rejection is final for
+// that plan version -- the one tool here that ends something, so it is
+// marked destructive -- a second call changes nothing more, and nothing
+// reaches outside this deployment, since no turn is queued.
+var rejectPlanAnnotations = &sdkmcp.ToolAnnotations{
+	ReadOnlyHint:    false,
+	DestructiveHint: boolPtr(true),
+	IdempotentHint:  true,
+	OpenWorldHint:   boolPtr(false),
+}
+
+// queueTurnAnnotations are shared by narvi_request_plan_revision and
+// narvi_send_prompt: each call that is accepted queues one more turn, so
+// neither is idempotent; neither destroys anything; and the turn reads
+// from the code host (and, for a prompt, can push to it).
+var queueTurnAnnotations = &sdkmcp.ToolAnnotations{
+	ReadOnlyHint:    false,
+	DestructiveHint: boolPtr(false),
+	IdempotentHint:  false,
 	OpenWorldHint:   boolPtr(true),
 }
 

@@ -31,8 +31,30 @@ const (
 	openSessionStatus     = "rest/v1/dtos.schema.json#/$defs/Session/properties/status"
 	openSessionSource     = "rest/v1/dtos.schema.json#/$defs/Session/properties/spawnSource"
 	openExcludedPRKind    = "rest/v1/dtos.schema.json#/$defs/SessionOutcomeExcludedPullRequest/properties/kind"
+	openPlanStatus        = "rest/v1/dtos.schema.json#/$defs/Plan/properties/status"
+	openPlanActionStatus  = "rest/v1/dtos.schema.json#/$defs/PlanActionResponse/properties/status"
+	openCreateTurnStatus  = "rest/v1/dtos.schema.json#/$defs/CreateTurnResponse/properties/status"
 	openEnumTestSessionID = "5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"
+	openEnumTestPlanID    = "6c2d2f3f-7c2b-4c2b-8c2b-7c2b5c2b8c2b"
+	openEnumTestTurnID    = "7d3e3a4a-8d3c-4d3c-9d3c-8d3c6d3c9d3c"
 )
+
+// openEnumTestPlan is a Plan in status, with the numbered steps structured
+// holds, so its bundle's PlanStep is exercised too.
+func openEnumTestPlan(version int, status, structured string) string {
+	return `{
+		"id": "` + openEnumTestPlanID + `",
+		"sessionId": "` + openEnumTestSessionID + `",
+		"version": ` + fmt.Sprint(version) + `,
+		"status": "` + status + `",
+		"planModelId": null,
+		"createdAt": "2026-01-01T00:00:00Z",
+		"decidedAt": null,
+		"decidedBy": null,
+		"content": "Change the retry loop.",
+		"structured": ` + structured + `
+	}`
+}
 
 const openEnumTestSession = `{
 	"id": "` + openEnumTestSessionID + `",
@@ -93,6 +115,27 @@ var openEnumBodies = map[string]struct {
 		}`,
 		at: map[string]string{
 			"/excludedPullRequests/0/kind": openExcludedPRKind,
+		},
+	},
+	// Row 183's plan and turn tools (technical plan §43.21).
+	"ListPlansResponse": {
+		body: `{"plans": [` + openEnumTestPlan(1, "superseded", "null") + `, ` +
+			openEnumTestPlan(2, "awaiting_approval", `{"steps": [{"title": "Retry", "description": "Back off.", "fileRefs": ["retry.go"]}], "scopeEstimate": "1 file"}`) + `]}`,
+		at: map[string]string{
+			"/plans/0/status": openPlanStatus,
+			"/plans/1/status": openPlanStatus,
+		},
+	},
+	"PlanActionResponse": {
+		body: `{"planId": "` + openEnumTestPlanID + `", "status": "approved", "turnId": "` + openEnumTestTurnID + `"}`,
+		at: map[string]string{
+			"/status": openPlanActionStatus,
+		},
+	},
+	"CreateTurnResponse": {
+		body: `{"id": "` + openEnumTestTurnID + `", "status": "pending"}`,
+		at: map[string]string{
+			"/status": openCreateTurnStatus,
 		},
 	},
 }

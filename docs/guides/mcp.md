@@ -161,22 +161,23 @@ the app — never add one it did not ask for:
 - **Read** (`mcp:read`): the model catalog and this deployment's sessions,
   with exactly the visibility your own account has — list them, read one,
   its live status (or wait, server-side, for it to settle), what it
-  produced and each pull request's review verdict, and its event history.
+  produced and each pull request's review verdict, its event history, and
+  its plan versions.
 - **Act as you** (`mcp:write`, which includes read): start sessions, send
   prompts, approve or reject plans, request revisions and stop sessions as
-  you. Starting a session is what an app can do today; the other actions
-  come to the same access, so an app you allow now gains them when they
-  ship, without asking you again. This can run code in your repositories
-  and spend on models, within what your own role allows.
+  you. Everything but stopping a session is what an app can do today;
+  stopping comes to the same access, so an app you allow now gains it when
+  it ships, without asking you again. This can run code in your
+  repositories and spend on models, within what your own role allows.
 
-An app sees only the tools its access covers: with read alone, the write
-tool is not listed and a call to it is answered exactly as a call to a tool
+An app sees only the tools its access covers: with read alone, no write
+tool is listed and a call to one is answered exactly as a call to a tool
 that does not exist. Access is fixed when the app receives its token: to
 give an app that has only read the right to act, connect it again and
 approve both. An app never does more than your own role allows — every tool
 runs the same route these guides document, checked against your role on
 every call — so a viewer's app can connect and read but is refused, as the
-viewer is, when it starts a session.
+viewer is, when it starts a session or decides a plan.
 
 **Starting a session** (`narvi_create_session`) is `POST /api/sessions`
 ([web.md](web.md)) called for you: the same checks — member role or above,
@@ -194,6 +195,35 @@ is refused to the app too, and the other way round: a retry only ever
 answers the way the session was started. The session appears in your list
 like any other, its source shown as MCP.
 
+**Plans, revisions and prompts** are the plan and turn routes of
+[web.md](web.md) called for you, with every check they make and nothing
+else. `narvi_list_plans` reads a session's plan versions — the list
+`GET /api/sessions/{sessionID}/plans` returns — each with the id the app
+decides it by. `narvi_approve_plan` and `narvi_reject_plan` are
+`POST .../plans/{planId}/approve` and `/reject`: an admin or maintainer may
+decide any session's plan, a member only a plan of a session they started or
+joined, and a viewer none; the first decision wins, whichever way it was
+made — from the web, a chat app or MCP — and a later one is refused; the
+audit record names the app and its authorization. Approving queues the
+implementation at once, which runs code and delivers what it changes like
+any turn. `narvi_request_plan_revision` asks for the plan's next version
+with the app's feedback, and `narvi_send_prompt` sends an ordinary prompt:
+both are `POST /api/sessions/{sessionID}/turns`, the first with plan mode
+on. An approval, a revision or a prompt is refused while any turn of the
+session is queued or running — with the same `409` the web gets — and
+nothing is queued behind it: the app waits for the session to settle
+(`narvi_wait_for_session`) and asks again. While a plan awaits approval, an
+ordinary prompt is refused too, unless Narvi reads it as a change to that
+plan, which it then queues as a revision.
+
+A revision never takes back an approval. Once you approve a plan, its
+implementation keeps that approval until it ends: a revision asked for
+while it runs is refused, as above, and where another channel does queue
+one — a mention on the code host is queued — it waits, the implementation
+finishes and opens its pull request, and only then does the revision run
+and write the next version for you to approve, the approved one staying
+approved.
+
 **Brakes, and what disconnecting does not do.** `/mcp` is braked per
 authorization — one person's approval of one app — on each server replica:
 a burst of 30 calls, then one a
@@ -208,7 +238,8 @@ with how many seconds to wait, and starts nothing; retried after that wait
 with the same key and the same arguments, it gets back the session an
 earlier call with that key started, if one did. Disconnecting an app, or
 cutting off its client, stops its next call — it does not stop a session it
-already started, which runs to its end like any other.
+already started, nor an implementation it approved: each runs to its end
+like any other.
 
 **Negatives.** The MCP surface is off unless the deployment sets
 `NARVI_MCP_ENABLED=true`; while it is off, `/oauth/...` answers `503` — but
