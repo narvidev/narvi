@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -67,7 +68,7 @@ func uniqueApplicationName() string {
 // and returns once they are all gone.
 func terminateApplicationBackends(ctx context.Context, t *testing.T, admin *pgxpool.Pool, appName string) {
 	t.Helper()
-	if appName == lockConnApplicationName {
+	if strings.HasPrefix(appName, lockConnApplicationNamePrefix) {
 		t.Fatalf("refusing to terminate every %s backend by name: terminate the lock backend by pid", appName)
 	}
 	rows, err := admin.Query(ctx, `
@@ -351,8 +352,8 @@ func TestLockHolder_DialsLikeThePoolPastAHungFirstHost(t *testing.T) {
 			lockPID := r.locks.backendPIDForTest()
 			var appName string
 			if err := admin.QueryRow(ctx, `SELECT application_name FROM pg_stat_activity WHERE pid = $1 AND datname = current_database()`,
-				int32(lockPID)).Scan(&appName); err != nil || appName != lockConnApplicationName {
-				t.Fatalf("the lock backend %d on the real host: application_name = %q, err = %v; want %q", lockPID, appName, err, lockConnApplicationName)
+				int32(lockPID)).Scan(&appName); err != nil || appName != r.locks.appNameForTest() || !isLockConnApplicationName(appName) {
+				t.Fatalf("the lock backend %d on the real host: application_name = %q, err = %v; want the dial's own %q", lockPID, appName, err, r.locks.appNameForTest())
 			}
 
 			if _, err := r.GetOrSpawn(ctx, sessionID); err != nil {

@@ -9,14 +9,15 @@
 // wait out.
 //
 // No test here terminates any backend but the one lock connection its own
-// Registry opened, found by pid AND application_name AND this test's own
-// database -- never killAdvisoryLockHolder's unscoped sweep, which is only
-// safe on newTestPoolPair's dedicated container.
+// Registry opened, found by pid AND a lock connection's application_name
+// AND this test's own database -- never killAdvisoryLockHolder's unscoped
+// sweep, which is only safe on newTestPoolPair's dedicated container.
 package sessionactor
 
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -29,13 +30,16 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// lockTestTimeouts shortens the three lock-connection timeouts: hydration
-// 300 ms, each lock statement 100 ms, a probe every 200 ms.
+// lockTestTimeouts shortens the lock connection's timeouts: hydration
+// 300 ms, each lock statement 100 ms, a probe every 2 s, each connect
+// attempt 1 s -- a valid set. No test here runs the probe loop on it at
+// that pace: each one that probes calls ProbeLockOnce itself.
 func lockTestTimeouts() platform.Timeouts {
 	to := platform.DefaultTimeouts()
 	to.ActorHydrateTimeout = 300 * time.Millisecond
 	to.ActorLockStatementTimeout = 100 * time.Millisecond
-	to.ActorLockProbeInterval = 200 * time.Millisecond
+	to.ActorLockProbeInterval = 2 * time.Second
+	to.ActorLockConnectAttemptTimeout = time.Second
 	return to
 }
 
@@ -65,7 +69,8 @@ func newLockTestRegistry(ctx context.Context, t *testing.T, pool *pgxpool.Pool, 
 }
 
 // backendPIDForTest reports the lock connection's backend pid, or 0 if
-// none is open.
+// none is open. It is the pid pgconn was handed at startup: behind a
+// pooler, the pooler's (serverPIDForTest).
 func (h *lockHolder) backendPIDForTest() uint32 {
 	h.sem <- struct{}{}
 	defer h.leave()
@@ -73,6 +78,34 @@ func (h *lockHolder) backendPIDForTest() uint32 {
 		return 0
 	}
 	return h.conn.PgConn().PID()
+}
+
+// serverPIDForTest reports the open lock connection's backend pid as the
+// server reported it at the dial, or 0 if none is open or it was not read.
+func (h *lockHolder) serverPIDForTest() uint32 {
+	h.sem <- struct{}{}
+	defer h.leave()
+	if h.conn == nil || h.backend == nil {
+		return 0
+	}
+	return uint32(h.backend.pid)
+}
+
+// appNameForTest reports the open lock connection's application_name, or
+// "" if none is open or its backend was not read.
+func (h *lockHolder) appNameForTest() string {
+	h.sem <- struct{}{}
+	defer h.leave()
+	if h.conn == nil || h.backend == nil {
+		return ""
+	}
+	return h.backend.appName
+}
+
+// isLockConnApplicationName reports whether name is one a lock
+// connection's dial gives it.
+func isLockConnApplicationName(name string) bool {
+	return strings.HasPrefix(name, lockConnApplicationNamePrefix) && len(name) > len(lockConnApplicationNamePrefix)
 }
 
 // advisoryLockHolders returns the pids holding sessionID's advisory lock
@@ -103,17 +136,17 @@ func advisoryLockHolders(ctx context.Context, t *testing.T, admin *pgxpool.Pool,
 }
 
 // terminateLockBackend terminates pid -- only if it is a lock connection
-// (application_name narvi-actor-locks) on this test's own database -- and
-// returns once the backend is gone and its locks with it.
+// (an application_name beginning narvi-actor-locks-) on this test's own
+// database -- and returns once the backend is gone and its locks with it.
 func terminateLockBackend(ctx context.Context, t *testing.T, admin *pgxpool.Pool, pid uint32) {
 	t.Helper()
 	var terminated bool
 	err := admin.QueryRow(ctx, `
 		SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity
-		WHERE pid = $1 AND application_name = $2 AND datname = current_database()`,
-		int32(pid), lockConnApplicationName).Scan(&terminated)
+		WHERE pid = $1 AND starts_with(application_name, $2) AND datname = current_database()`,
+		int32(pid), lockConnApplicationNamePrefix).Scan(&terminated)
 	if errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("pid %d is not a %s backend on this test's database; refusing to terminate it", pid, lockConnApplicationName)
+		t.Fatalf("pid %d is not a %s* backend on this test's database; refusing to terminate it", pid, lockConnApplicationNamePrefix)
 	}
 	if err != nil {
 		t.Fatalf("pg_terminate_backend(%d): %v", pid, err)
@@ -134,7 +167,8 @@ func terminateLockBackend(ctx context.Context, t *testing.T, admin *pgxpool.Pool
 // actor holds no query-pool connection: six actors on a pool of two --
 // three times the pool -- leave it with nothing out after every spawn,
 // unrelated queries and a timer-pump tick still run at once, all six locks
-// sit on the one narvi-actor-locks backend, and another pod still sees
+// sit on the one lock connection's backend, which reports the
+// application_name its dial chose, and another pod still sees
 // every session as owned. Taking the lock on a pool connection again, per
 // actor or once for the holder, fails here.
 func TestLockHolder_ActorsHoldNoPoolConnection(t *testing.T) {
@@ -188,8 +222,8 @@ func TestLockHolder_ActorsHoldNoPoolConnection(t *testing.T) {
 	if err := admin.QueryRow(ctx, `SELECT application_name FROM pg_stat_activity WHERE pid = $1`, int32(lockPID)).Scan(&appName); err != nil {
 		t.Fatalf("read the lock backend's application_name: %v", err)
 	}
-	if appName != lockConnApplicationName {
-		t.Fatalf("lock backend application_name = %q, want %q", appName, lockConnApplicationName)
+	if want := r.locks.appNameForTest(); appName != want || !isLockConnApplicationName(appName) || len(appName) > 63 {
+		t.Fatalf("lock backend application_name = %q, want the dial's own %q: %s and a nonce, 63 bytes at most", appName, want, lockConnApplicationNamePrefix)
 	}
 	for i, id := range sessions {
 		if got := advisoryLockHolders(ctx, t, admin, id); len(got) != 1 || got[0] != lockPID {

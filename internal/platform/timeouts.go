@@ -316,8 +316,7 @@ type Timeouts struct {
 	// live connection fails that statement only, except on an unlock,
 	// where any error presumes the connection lost: the unlock's outcome is
 	// unknown, and closing is the one release that is certain. It does not
-	// bound the dial itself, which follows the query pool's own connect
-	// rules (ActorLockConnectTimeoutFallback). 1 s.
+	// bound the connect itself (ActorLockConnectAttemptTimeout). 1 s.
 	ActorLockStatementTimeout time.Duration
 
 	// ActorLockProbeInterval is how often the lock connection is probed
@@ -328,15 +327,29 @@ type Timeouts struct {
 	// only the epoch fence stops a stale actor's writes (§2). 10 s.
 	ActorLockProbeInterval time.Duration
 
-	// ActorLockConnectTimeoutFallback is the per-host connect timeout the
-	// lock connection's dial uses when the database URL sets no
-	// connect_timeout: pgxpool's own fallback for the query pool's dials
-	// (pgx v5.10.0, pgxpool/pool.go), which also outlive whoever asked for
-	// them. With it, the lock connection is
-	// dialled exactly as a pool connection is -- per host, through every
-	// host of a multi-host URL -- and a host that accepts and never
-	// answers cannot hold a dial forever. 2 min, pgxpool's value.
-	ActorLockConnectTimeoutFallback time.Duration
+	// ActorLockConnectAttemptTimeout bounds each connect attempt of the lock
+	// connection's dial -- pgx makes one per address of each host in the
+	// database URL, covering the TCP connect, TLS and authentication -- when
+	// the URL sets no connect_timeout. A URL that sets one keeps it, as the
+	// query pool does. The query pool falls back to pgxpool's own 2 minutes
+	// (pgx v5.10.0, pgxpool/pool.go), but it dials one connection per
+	// acquire, while the lock connection has one dial in flight that every
+	// hydration on the replica waits for: a dial started while the network
+	// drops packets silently -- after a loss found during a partition -- sits
+	// in the kernel's SYN retransmission backoff, and after the heal it would
+	// connect only at the next retransmission, up to about a minute later,
+	// every hydration failing with ErrActorUnavailable meanwhile. Bounded,
+	// the attempt ends within this timeout of its start, and the next
+	// hydration or probe tick dials afresh; a host that accepts and never
+	// answers is passed after it too. Validate keeps it below
+	// ActorLockProbeInterval, with no margin, so an attempt never spans two
+	// probe ticks: once a partition heals, a hydration finds the lock
+	// connection within this timeout, and the probe alone brings it back
+	// within this timeout plus one interval (one address; each further
+	// address adds one attempt). A healthy connect takes milliseconds; a
+	// server slow to accept connections, such as a serverless database waking
+	// up, calls for a connect_timeout in the URL. 5 s: chosen.
+	ActorLockConnectAttemptTimeout time.Duration
 
 	// ActorLockServerKeepaliveIdle, ActorLockServerKeepaliveInterval and
 	// ActorLockServerKeepaliveCount are the TCP keepalives every lock
@@ -359,7 +372,10 @@ type Timeouts struct {
 	// value the database URL sets, for the lock connection only. Behind a
 	// session-mode pooler they guard the pooler's connection to the server,
 	// not the replica's to the pooler; the pooler's own client keepalives
-	// guard that one (docs/PRODUCTION_CHECKLIST.md, item 10).
+	// guard that one, and their reap time must lie between the same two
+	// bounds as this one, for the same reasons: a pooler that drops a
+	// client resets its backend, releasing its locks. Validate cannot see
+	// the pooler's, so docs/PRODUCTION_CHECKLIST.md, item 10, states them.
 	//
 	// Validate places the reap time between two bounds, with no margin.
 	// Above ActorLockProbeInterval + ActorLockStatementTimeout: a replica
@@ -3686,7 +3702,7 @@ func DefaultTimeouts() Timeouts {
 		ActorLockStatementTimeout: 1 * time.Second,  // not specified; chosen
 		ActorLockProbeInterval:    10 * time.Second, // not specified; chosen
 
-		ActorLockConnectTimeoutFallback: 2 * time.Minute, // pgxpool v5's own, for a dial with no connect_timeout
+		ActorLockConnectAttemptTimeout: 5 * time.Second, // not specified; chosen -- half the probe interval
 
 		ActorLockServerKeepaliveIdle:     10 * time.Second, // not specified; chosen
 		ActorLockServerKeepaliveInterval: 5 * time.Second,  // not specified; chosen
@@ -4352,19 +4368,21 @@ func (t Timeouts) Validate() error {
 	// from a second, concurrent delivery: the link orders the bound itself,
 	// and its overshoot (ActorHydrateTimeout's own comment) is a few
 	// seconds at most against a 30 s claim by default. And one probe
-	// finishes before the next is due. The connect-timeout fallback is
-	// linked to nothing -- it is pgxpool's -- but a zero one would make
-	// pgx wait on a silent host forever, so it is refused too.
+	// finishes before the next is due. A connect attempt ends within one
+	// probe interval too, so no attempt spans two probe ticks; a zero one
+	// would make pgx wait on a silent host forever, so it is refused.
 	mustBePositive("ActorHydrateTimeout", t.ActorHydrateTimeout)
 	mustBePositive("ActorLockStatementTimeout", t.ActorLockStatementTimeout)
 	mustBePositive("ActorLockProbeInterval", t.ActorLockProbeInterval)
-	mustBePositive("ActorLockConnectTimeoutFallback", t.ActorLockConnectTimeoutFallback)
+	mustBePositive("ActorLockConnectAttemptTimeout", t.ActorLockConnectAttemptTimeout)
 	strictlyBelow("ActorHydrateTimeout > ActorLockStatementTimeout",
 		"ActorLockStatementTimeout", t.ActorLockStatementTimeout, "ActorHydrateTimeout", t.ActorHydrateTimeout)
 	strictlyBelow("TimerClaimDuration > ActorHydrateTimeout",
 		"ActorHydrateTimeout", t.ActorHydrateTimeout, "TimerClaimDuration", t.TimerClaimDuration)
 	strictlyBelow("ActorLockProbeInterval > ActorLockStatementTimeout",
 		"ActorLockStatementTimeout", t.ActorLockStatementTimeout, "ActorLockProbeInterval", t.ActorLockProbeInterval)
+	strictlyBelow("ActorLockProbeInterval > ActorLockConnectAttemptTimeout",
+		"ActorLockConnectAttemptTimeout", t.ActorLockConnectAttemptTimeout, "ActorLockProbeInterval", t.ActorLockProbeInterval)
 
 	// §2, §5.1: the lock connection's server keepalives (the
 	// ActorLockServerKeepalive* fields' own doc comment). Each reaches the

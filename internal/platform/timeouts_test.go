@@ -2276,9 +2276,9 @@ func TestDefaultTimeouts_ActorLockFields(t *testing.T) {
 		{"ActorHydrateTimeout", to.ActorHydrateTimeout, 2 * time.Second},
 		{"ActorLockStatementTimeout", to.ActorLockStatementTimeout, time.Second},
 		{"ActorLockProbeInterval", to.ActorLockProbeInterval, 10 * time.Second},
-		// pgxpool v5.10.0's own fallback (pgxpool/pool.go), which this one
-		// mirrors so the lock connection dials as a pool connection does.
-		{"ActorLockConnectTimeoutFallback", to.ActorLockConnectTimeoutFallback, 2 * time.Minute},
+		// Half the probe interval: a connect stuck on a silent host ends
+		// well before the next tick, instead of pgxpool's 2 minutes.
+		{"ActorLockConnectAttemptTimeout", to.ActorLockConnectAttemptTimeout, 5 * time.Second},
 		{"ActorLockServerKeepaliveIdle", to.ActorLockServerKeepaliveIdle, 10 * time.Second},
 		{"ActorLockServerKeepaliveInterval", to.ActorLockServerKeepaliveInterval, 5 * time.Second},
 		// idle + interval × count: what the server keeps an orphaned lock
@@ -2298,8 +2298,9 @@ func TestDefaultTimeouts_ActorLockFields(t *testing.T) {
 // lock-connection block (the Actor* fields' own doc comment) is enforced on
 // its own: each link broken alone yields exactly one error, its own, named
 // by chain; each boundary that still holds is accepted; and a zero or
-// negative value is refused by name. The connect-timeout fallback has no
-// link, only its sign. The server keepalives' reap time lies strictly
+// negative value is refused by name. The connect-attempt bound lies below
+// the probe interval, and is linked to nothing else. The server
+// keepalives' reap time lies strictly
 // between one probe plus its statement and the timer claim; each keepalive
 // is positive, and the two the server reads in seconds are whole ones --
 // a fraction, and above all a value under a second, would reach the server
@@ -2347,14 +2348,19 @@ func TestTimeouts_Validate_ActorLock(t *testing.T) {
 			to.ActorHydrateTimeout = to.TimerClaimDuration - time.Millisecond
 		}, nil, true},
 
+		// Each of these three also lowers the connect-attempt bound below
+		// the probe interval, so the statement link is the only one tested.
 		{"a probe interval equal to the statement bound", func(to *platform.Timeouts) {
 			to.ActorLockProbeInterval = to.ActorLockStatementTimeout
+			to.ActorLockConnectAttemptTimeout = to.ActorLockProbeInterval / 4
 		}, &want{chain: "ActorLockProbeInterval > ActorLockStatementTimeout"}, true},
 		{"a probe interval below the statement bound", func(to *platform.Timeouts) {
 			to.ActorLockProbeInterval = to.ActorLockStatementTimeout / 2
+			to.ActorLockConnectAttemptTimeout = to.ActorLockProbeInterval / 4
 		}, &want{chain: "ActorLockProbeInterval > ActorLockStatementTimeout"}, true},
 		{"a probe interval just above the statement bound is accepted", func(to *platform.Timeouts) {
 			to.ActorLockProbeInterval = to.ActorLockStatementTimeout + time.Millisecond
+			to.ActorLockConnectAttemptTimeout = to.ActorLockProbeInterval / 4
 		}, nil, true},
 
 		{"a zero hydration bound fails every hydration", func(to *platform.Timeouts) { to.ActorHydrateTimeout = 0 },
@@ -2369,12 +2375,24 @@ func TestTimeouts_Validate_ActorLock(t *testing.T) {
 			&want{field: "ActorLockProbeInterval"}, false},
 		{"a negative probe interval", func(to *platform.Timeouts) { to.ActorLockProbeInterval = -time.Second },
 			&want{field: "ActorLockProbeInterval"}, false},
-		{"a zero connect-timeout fallback waits on a silent host forever", func(to *platform.Timeouts) { to.ActorLockConnectTimeoutFallback = 0 },
-			&want{field: "ActorLockConnectTimeoutFallback"}, true},
-		{"a negative connect-timeout fallback", func(to *platform.Timeouts) { to.ActorLockConnectTimeoutFallback = -time.Second },
-			&want{field: "ActorLockConnectTimeoutFallback"}, true},
-		{"a connect-timeout fallback below the hydration bound is accepted: nothing links them", func(to *platform.Timeouts) {
-			to.ActorLockConnectTimeoutFallback = to.ActorHydrateTimeout / 2
+		{"a zero connect-attempt bound waits on a silent host forever", func(to *platform.Timeouts) { to.ActorLockConnectAttemptTimeout = 0 },
+			&want{field: "ActorLockConnectAttemptTimeout"}, true},
+		{"a negative connect-attempt bound", func(to *platform.Timeouts) { to.ActorLockConnectAttemptTimeout = -time.Second },
+			&want{field: "ActorLockConnectAttemptTimeout"}, true},
+		// The connect-attempt bound (5 s by default) against the probe
+		// interval (10 s by default)...
+		{"a connect-attempt bound equal to the probe interval", func(to *platform.Timeouts) {
+			to.ActorLockConnectAttemptTimeout = to.ActorLockProbeInterval
+		}, &want{chain: "ActorLockProbeInterval > ActorLockConnectAttemptTimeout"}, true},
+		{"a connect-attempt bound of pgxpool's 2 minutes, above the probe interval", func(to *platform.Timeouts) {
+			to.ActorLockConnectAttemptTimeout = 2 * time.Minute
+		}, &want{chain: "ActorLockProbeInterval > ActorLockConnectAttemptTimeout"}, true},
+		{"a connect-attempt bound just below the probe interval is accepted", func(to *platform.Timeouts) {
+			to.ActorLockConnectAttemptTimeout = to.ActorLockProbeInterval - time.Millisecond
+		}, nil, true},
+		// ...and against nothing else.
+		{"a connect-attempt bound below the hydration bound is accepted: nothing links them", func(to *platform.Timeouts) {
+			to.ActorLockConnectAttemptTimeout = to.ActorHydrateTimeout / 2
 		}, nil, true},
 
 		// The reap time (idle + interval × count, 25 s by default) against

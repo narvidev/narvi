@@ -21,13 +21,14 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// actorLockConnApplicationName is sessionactor's lock connection's
-// application_name (lockholder.go), the one backend this test terminates.
-const actorLockConnApplicationName = "narvi-actor-locks"
+// actorLockConnApplicationNamePrefix begins every sessionactor lock
+// connection's application_name (lockholder.go: each dial adds a nonce of
+// its own); such a backend is the one this test terminates.
+const actorLockConnApplicationNamePrefix = "narvi-actor-locks-"
 
 // TestRun_StartsTheSessionActorLockProbe proves App.Run starts the session
 // actors' lock probe (Registry.RunLockProbe) -- nothing else does, and no
-// other test runs App.Run. With a 200 ms probe interval, on a database of
+// other test runs App.Run. With a 2 s probe interval, on a database of
 // its own (so every lock backend on it is this App's): the probe loop dials
 // the lock connection before anything hydrates; an actor takes its lock on
 // it; the backend is then terminated and nothing but the probe touches the
@@ -46,7 +47,8 @@ func TestRun_StartsTheSessionActorLockProbe(t *testing.T) {
 		t.Fatalf("platform.Load: %v", err)
 	}
 	cfg.Timeouts.ActorLockStatementTimeout = 100 * time.Millisecond
-	cfg.Timeouts.ActorLockProbeInterval = 200 * time.Millisecond
+	cfg.Timeouts.ActorLockProbeInterval = 2 * time.Second
+	cfg.Timeouts.ActorLockConnectAttemptTimeout = time.Second
 	if err := cfg.Timeouts.Validate(); err != nil {
 		t.Fatalf("adjusted timeouts: %v", err)
 	}
@@ -85,7 +87,7 @@ func TestRun_StartsTheSessionActorLockProbe(t *testing.T) {
 		t.Helper()
 		rows, err := pool.Query(ctx, `
 			SELECT pid FROM pg_stat_activity
-			WHERE application_name = $1 AND datname = current_database() ORDER BY pid`, actorLockConnApplicationName)
+			WHERE starts_with(application_name, $1) AND datname = current_database() ORDER BY pid`, actorLockConnApplicationNamePrefix)
 		if err != nil {
 			t.Fatalf("list lock backends: %v", err)
 		}
@@ -142,10 +144,10 @@ func terminateActorLockBackend(ctx context.Context, t *testing.T, pool *pgxpool.
 	var terminated bool
 	err := pool.QueryRow(ctx, `
 		SELECT pg_terminate_backend(pid, 5000) FROM pg_stat_activity
-		WHERE pid = $1 AND application_name = $2 AND datname = current_database()`,
-		pid, actorLockConnApplicationName).Scan(&terminated)
+		WHERE pid = $1 AND starts_with(application_name, $2) AND datname = current_database()`,
+		pid, actorLockConnApplicationNamePrefix).Scan(&terminated)
 	if errors.Is(err, pgx.ErrNoRows) {
-		t.Fatalf("pid %d is not a %s backend on this test's database; refusing to terminate it", pid, actorLockConnApplicationName)
+		t.Fatalf("pid %d is not a %s* backend on this test's database; refusing to terminate it", pid, actorLockConnApplicationNamePrefix)
 	}
 	if err != nil || !terminated {
 		t.Fatalf("pg_terminate_backend(%d) = (%v, %v), want (true, nil)", pid, terminated, err)

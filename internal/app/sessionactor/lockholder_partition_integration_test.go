@@ -12,7 +12,9 @@ package sessionactor
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/url"
@@ -24,6 +26,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
@@ -82,6 +85,47 @@ func (h *lockHolder) orphanForTest() *lockBackend {
 	h.sem <- struct{}{}
 	defer h.leave()
 	return h.orphan
+}
+
+// setTerminateSQLForTest makes query terminateOrphan's statement. Call it
+// before anything dials.
+func (h *lockHolder) setTerminateSQLForTest(t *testing.T, query string) {
+	t.Helper()
+	h.dialMu.Lock()
+	defer h.dialMu.Unlock()
+	if h.dialing != nil {
+		t.Fatal("setTerminateSQLForTest called with a dial already in flight")
+	}
+	h.terminateSQL = query
+}
+
+// dialFuncForTest makes every later dial of the lock connection connect
+// through dial -- the pool itself keeps its own. Call it before anything
+// dials.
+func (h *lockHolder) dialFuncForTest(t *testing.T, dial pgconn.DialFunc) {
+	t.Helper()
+	h.dialMu.Lock()
+	defer h.dialMu.Unlock()
+	if h.dialing != nil {
+		t.Fatal("dialFuncForTest called with a dial already in flight")
+	}
+	cc := h.connConfig.Copy()
+	cc.DialFunc = dial
+	h.connConfig = cc
+}
+
+// installedForTest reports whether a lock connection is installed, taking
+// sem within wait; busy reports that sem stayed held throughout.
+func (h *lockHolder) installedForTest(wait time.Duration) (installed, busy bool) {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case h.sem <- struct{}{}:
+	case <-timer.C:
+		return false, true
+	}
+	defer h.leave()
+	return h.conn != nil, false
 }
 
 // startLockProbeForTest runs r's lock probe loop until the test ends.
@@ -256,8 +300,8 @@ func lockBackendAlive(ctx context.Context, t *testing.T, admin *pgxpool.Pool, pi
 	var n int
 	if err := admin.QueryRow(ctx, `
 		SELECT count(*) FROM pg_stat_activity
-		WHERE pid = $1 AND application_name = $2 AND datname = current_database()`,
-		int32(pid), lockConnApplicationName).Scan(&n); err != nil {
+		WHERE pid = $1 AND starts_with(application_name, $2) AND datname = current_database()`,
+		int32(pid), lockConnApplicationNamePrefix).Scan(&n); err != nil {
 		t.Fatalf("look up backend %d: %v", pid, err)
 	}
 	return n == 1
@@ -276,17 +320,21 @@ func lockBackendAlive(ctx context.Context, t *testing.T, admin *pgxpool.Pool, pi
 // query pool goes straight to Postgres; only the lock connection is cut.
 // Without the terminate, the old backend holds X and Y for as long as the
 // server's keepalives allow -- forever, through this proxy -- and every
-// GetOrSpawn for them answers ErrSessionActorElsewhere.
+// GetOrSpawn for them answers ErrSessionActorElsewhere. The URL sets no
+// connect_timeout, as the deploy template's does not:
+// ActorLockConnectAttemptTimeout ends each dial the partition swallows.
+// That the terminate returns before the new connection is installed is
+// pinned by TestLockHolder_InstallsOnlyOnceTheOrphanTerminateHasReturned.
 func TestLockHolder_PartitionedBackendIsTerminatedOnRedial(t *testing.T) {
 	ctx := context.Background()
 	admin, connStr := IntegrationTestPoolAndConnStr(t)
-	// connect_timeout bounds each dial the partition swallows.
-	pool := newLockTestPool(ctx, t, withConnParams(t, connStr, map[string]string{"connect_timeout": "1"}), 4)
+	pool := newLockTestPool(ctx, t, withoutConnectTimeout(t, connStr), 4)
 	cc := pool.Config().ConnConfig
 	proxy := startPartitionProxy(t, net.JoinHostPort(cc.Host, strconv.Itoa(int(cc.Port))))
 
 	timeouts := lockTestShippedTimeouts(t)
 	timeouts.ActorLockProbeInterval = 2 * time.Second
+	timeouts.ActorLockConnectAttemptTimeout = time.Second
 	if err := timeouts.Validate(); err != nil {
 		t.Fatalf("test timeouts: %v", err)
 	}
@@ -429,30 +477,35 @@ func withDatabase(t *testing.T, connStr, database string) string {
 }
 
 // TestLockHolder_TerminatesOnlyTheLostBackend (T18) proves the backend a
-// dial terminates after a loss is the lost connection's own and no other:
-// a stand-in backend this test opens is recorded as the orphan, and the
-// next dial terminates it only when its pid, its start time, its
-// application_name and its database all match. A pid alone may have been
-// reused by an unrelated backend since the loss (the start time differs);
-// the rest keep the statement to lock connections on this database. In
-// every case the orphan is dealt with, and the new connection installed.
+// dial terminates after a loss is the one still running the lost
+// connection's session and no other: a stand-in backend this test opens,
+// named as a lock connection's dial names it, is recorded as the orphan,
+// and the next dial terminates it only when its pid, its start time, its
+// application_name -- the lost connection's own -- and its database all
+// match. A pid alone may have been reused by an unrelated backend since
+// the loss (the start time differs); another lock connection's name is a
+// backend a session-mode pooler has since handed to another client (the
+// pooler sets each client's own name: TestLockHolder_BehindASessionPooler);
+// another database is out of the statement's reach. In every case the
+// orphan is dealt with, and the new connection installed.
 func TestLockHolder_TerminatesOnlyTheLostBackend(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
 		name           string
-		appName        string // the stand-in's application_name
+		otherName      bool   // record the orphan under another lock connection's name
 		database       string // the stand-in's database, if not this test's
 		shiftStart     bool   // record a start time a microsecond off
 		wantTerminated bool
 	}{
-		{"pid, start, application_name and database all match: terminated", lockConnApplicationName, "", false, true},
-		{"another start time -- a pid reused since -- is left alone", lockConnApplicationName, "", true, false},
-		{"another application_name is left alone", uniqueApplicationName(), "", false, false},
-		{"another database is left alone", lockConnApplicationName, "postgres", false, false},
+		{"pid, start, the lost connection's own application_name and database all match: terminated", false, "", false, true},
+		{"another start time -- a pid reused since -- is left alone", false, "", true, false},
+		{"another lock connection's application_name -- a backend handed to another client since -- is left alone", true, "", false, false},
+		{"another database is left alone", false, "postgres", false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			admin, connStr := IntegrationTestPoolAndConnStr(t)
-			standInURL := withConnParams(t, connStr, map[string]string{"application_name": tc.appName})
+			standInName := newLockConnApplicationName()
+			standInURL := withConnParams(t, connStr, map[string]string{"application_name": standInName})
 			if tc.database != "" {
 				standInURL = withDatabase(t, standInURL, tc.database)
 			}
@@ -468,9 +521,12 @@ func TestLockHolder_TerminatesOnlyTheLostBackend(t *testing.T) {
 			if err := standIn.QueryRow(ctx, lockBackendQuery).Scan(&pid, &start); err != nil || !start.Valid {
 				t.Fatalf("read the stand-in's backend: pid %d, start %v, err %v", pid, start, err)
 			}
-			orphan := lockBackend{pid: pid, start: start.Time}
+			orphan := lockBackend{pid: pid, start: start.Time, appName: standInName}
 			if tc.shiftStart {
 				orphan.start = orphan.start.Add(-time.Microsecond)
+			}
+			if tc.otherName {
+				orphan.appName = newLockConnApplicationName()
 			}
 
 			r := newLockTestRegistry(ctx, t, newLockTestPool(ctx, t, connStr, 2), lockTestTimeouts())
@@ -541,7 +597,8 @@ func TestLockHolder_ARefusedTerminateDoesNotHoldUpTheDial(t *testing.T) {
 		}
 	})
 
-	standIn, err := pgx.Connect(ctx, withConnParams(t, connStr, map[string]string{"application_name": lockConnApplicationName}))
+	standInName := newLockConnApplicationName()
+	standIn, err := pgx.Connect(ctx, withConnParams(t, connStr, map[string]string{"application_name": standInName}))
 	if err != nil {
 		t.Fatalf("open the stand-in backend: %v", err)
 	}
@@ -560,7 +617,7 @@ func TestLockHolder_ARefusedTerminateDoesNotHoldUpTheDial(t *testing.T) {
 
 	logs := captureDefaultLoggerJSONSync(t)
 	r := newLockTestRegistry(ctx, t, newLockTestPool(ctx, t, withUser(t, connStr, role, password), 2), lockTestTimeouts())
-	r.locks.setOrphanForTest(lockBackend{pid: pid, start: start.Time})
+	r.locks.setOrphanForTest(lockBackend{pid: pid, start: start.Time, appName: standInName})
 	r.locks.startDial()
 	waitUntil(t, 5*time.Second, func() bool { return r.locks.backendPIDForTest() != 0 })
 	refusal := waitForLogEntry(t, logs, 5*time.Second,
@@ -608,5 +665,148 @@ func TestLockHolder_RefusedKeepalivesDoNotHoldUpTheDial(t *testing.T) {
 	}
 	if got, ours := r.locks.settingForTest(ctx, t, "tcp_keepalives_idle"), strconv.Itoa(int(timeouts.ActorLockServerKeepaliveIdle/time.Second)); got == ours {
 		t.Fatalf("the lock backend's tcp_keepalives_idle = %s, the lock connection's own: the refusal was not injected", got)
+	}
+}
+
+// logIndex returns the index of the first line in buf whose "msg" is msg,
+// or -1.
+func logIndex(t *testing.T, buf *syncLogBuffer, msg string) int {
+	t.Helper()
+	i := 0
+	for _, line := range strings.Split(buf.String(), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal([]byte(line), &entry); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		if entry["msg"] == msg {
+			return i
+		}
+		i++
+	}
+	return -1
+}
+
+// advisoryLockWaiters counts the backends waiting, not yet granted, for the
+// advisory lock on key (a bigint key, pg_locks's documented layout).
+func advisoryLockWaiters(ctx context.Context, t *testing.T, admin *pgxpool.Pool, key int64) int {
+	t.Helper()
+	var n int
+	if err := admin.QueryRow(ctx, `
+		SELECT count(*) FROM pg_locks
+		WHERE locktype = 'advisory' AND NOT granted AND objsubid = 1
+		  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+		  AND classid::bigint = (($1::bigint >> 32) & 4294967295)
+		  AND objid::bigint = ($1::bigint & 4294967295)`, key).Scan(&n); err != nil {
+		t.Fatalf("count the waiters on advisory lock %d: %v", key, err)
+	}
+	return n
+}
+
+// Log lines TestLockHolder_InstallsOnlyOnceTheOrphanTerminateHasReturned
+// orders.
+const (
+	logLockConnEstablished = "sessionactor: lock connection established"
+	logOrphanTerminated    = "sessionactor: terminated the backend a lost lock connection left behind, still holding its advisory locks"
+)
+
+// TestLockHolder_InstallsOnlyOnceTheOrphanTerminateHasReturned (T24) pins
+// the order dialAndInstall promises: a new lock connection is installed
+// only once the terminate of the backend its lost predecessor left behind
+// has returned. The terminate is held back -- its statement first waits
+// for an advisory lock this test holds -- and while it waits, no connection
+// is installed, sem is free, and nothing has logged the connection
+// established. Released, it terminates the orphan, then the connection is
+// installed, and the session the orphan held rehydrates. A dial that
+// installed first -- then terminated, on a goroutine of its own or after
+// leaving and re-entering sem -- lets a hydration find the session still
+// held by the orphan and answer ErrSessionActorElsewhere, which the timer
+// pump skips silently until the timer's claim expires. T16 cannot see
+// that: it retries until the session rehydrates.
+func TestLockHolder_InstallsOnlyOnceTheOrphanTerminateHasReturned(t *testing.T) {
+	ctx := context.Background()
+	admin, connStr := IntegrationTestPoolAndConnStr(t)
+	sessionID := createTestSession(ctx, t, admin)
+
+	// The orphan: a stand-in backend named as a lock connection's dial
+	// names one, holding the session's advisory lock.
+	orphanName := newLockConnApplicationName()
+	standIn, err := pgx.Connect(ctx, withConnParams(t, connStr, map[string]string{"application_name": orphanName}))
+	if err != nil {
+		t.Fatalf("open the stand-in backend: %v", err)
+	}
+	t.Cleanup(func() { _ = standIn.Close(context.Background()) })
+	var (
+		pid    int32
+		start  pgtype.Timestamptz
+		locked bool
+	)
+	if err := standIn.QueryRow(ctx, lockBackendQuery).Scan(&pid, &start); err != nil || !start.Valid {
+		t.Fatalf("read the stand-in's backend: pid %d, start %v, err %v", pid, start, err)
+	}
+	if err := standIn.QueryRow(ctx, tryAdvisoryLockQuery, sessionID.String()).Scan(&locked); err != nil || !locked {
+		t.Fatalf("lock the session on the stand-in = %v, %v; want it locked", locked, err)
+	}
+
+	// The gate: an advisory lock this test holds on a connection of its own.
+	gate, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		t.Fatalf("open the gate's connection: %v", err)
+	}
+	t.Cleanup(func() { _ = gate.Close(context.Background()) })
+	var gateKey int64
+	if err := gate.QueryRow(ctx, `SELECT hashtextextended($1, 0)`, orphanName+"/gate").Scan(&gateKey); err != nil {
+		t.Fatalf("derive the gate's key: %v", err)
+	}
+	if _, err := gate.Exec(ctx, `SELECT pg_advisory_lock($1)`, gateKey); err != nil {
+		t.Fatalf("take the gate: %v", err)
+	}
+	if strings.Count(terminateOrphanQuery, "WHERE ") != 1 {
+		t.Fatalf("terminateOrphanQuery has %d WHERE clauses, want 1 to gate", strings.Count(terminateOrphanQuery, "WHERE "))
+	}
+	gated := strings.Replace(terminateOrphanQuery, "WHERE ",
+		fmt.Sprintf("WHERE (SELECT count(*) FROM (SELECT pg_advisory_xact_lock(%d)) AS gate) = 1 AND ", gateKey), 1)
+
+	// A statement bound well above how long the gate is held below.
+	timeouts := lockTestShippedTimeouts(t)
+	timeouts.ActorHydrateTimeout = 4 * time.Second
+	timeouts.ActorLockStatementTimeout = 3 * time.Second
+	if err := timeouts.Validate(); err != nil {
+		t.Fatalf("test timeouts: %v", err)
+	}
+	logs := captureDefaultLoggerJSONSync(t)
+	r := newLockTestRegistry(ctx, t, newLockTestPool(ctx, t, connStr, 2), timeouts)
+	r.locks.setTerminateSQLForTest(t, gated)
+	r.locks.setOrphanForTest(lockBackend{pid: pid, start: start.Time, appName: orphanName})
+	r.locks.startDial()
+
+	waitUntil(t, 5*time.Second, func() bool { return advisoryLockWaiters(ctx, t, admin, gateKey) == 1 })
+	for i := range 4 {
+		installed, busy := r.locks.installedForTest(50 * time.Millisecond)
+		if installed || busy {
+			t.Fatalf("check %d while the orphan's terminate waits: a connection installed = %v, sem held = %v; want neither", i+1, installed, busy)
+		}
+		if logIndex(t, logs, logLockConnEstablished) >= 0 {
+			t.Fatalf("check %d while the orphan's terminate waits: %q already logged", i+1, logLockConnEstablished)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !lockBackendAlive(ctx, t, admin, uint32(pid)) {
+		t.Fatalf("the orphan %d is gone while its terminate still waits", pid)
+	}
+	if _, err := gate.Exec(ctx, `SELECT pg_advisory_unlock($1)`, gateKey); err != nil {
+		t.Fatalf("release the gate: %v", err)
+	}
+
+	waitUntil(t, 5*time.Second, func() bool { return r.locks.backendPIDForTest() != 0 })
+	terminatedAt, establishedAt := logIndex(t, logs, logOrphanTerminated), logIndex(t, logs, logLockConnEstablished)
+	if terminatedAt < 0 || establishedAt < terminatedAt {
+		t.Fatalf("log order: %q at line %d, %q at line %d; want the terminate first", logOrphanTerminated, terminatedAt, logLockConnEstablished, establishedAt)
+	}
+	waitUntil(t, 5*time.Second, func() bool { return !lockBackendAlive(ctx, t, admin, uint32(pid)) })
+	if _, err := r.GetOrSpawn(ctx, sessionID); err != nil {
+		t.Fatalf("GetOrSpawn for the session the orphan held, once the new connection is installed: %v", err)
 	}
 }

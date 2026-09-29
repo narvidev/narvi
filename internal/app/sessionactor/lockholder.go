@@ -2,9 +2,11 @@ package sessionactor
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -18,10 +20,19 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// lockConnApplicationName is the application_name the lock connection
-// reports, so pg_stat_activity and pg_locks show which backend holds a
-// replica's actor locks.
-const lockConnApplicationName = "narvi-actor-locks"
+// lockConnApplicationNamePrefix begins the application_name every lock
+// connection reports, so pg_stat_activity (and, by its pid, pg_locks) shows
+// which backends hold replicas' actor locks. Each dial appends a nonce of
+// its own (newLockConnApplicationName), so the name identifies one
+// connection's session and no other: terminateOrphan relies on that.
+const lockConnApplicationNamePrefix = "narvi-actor-locks-"
+
+// newLockConnApplicationName returns a fresh application_name for one lock
+// connection: the prefix and 26 random characters (at least 128 bits), 44
+// bytes in all, inside the 63 Postgres keeps.
+func newLockConnApplicationName() string {
+	return lockConnApplicationNamePrefix + strings.ToLower(rand.Text())
+}
 
 // lockProbeQuery is ProbeOnce's statement: it only proves the connection,
 // and so every lock on it, is still alive.
@@ -42,12 +53,20 @@ const lockBackendQuery = `SELECT pg_backend_pid(),
 	(SELECT backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid())`
 
 // terminateOrphanQuery terminates a lost lock connection's backend if it is
-// still there (terminateOrphan), matched by pid AND start time -- a pid
-// alone may since have been reused by an unrelated backend -- AND the lock
-// connection's application_name AND this database. A role may signal its
-// own backends.
+// still running that connection's session (terminateOrphan). The pid and
+// start time name the backend -- a pid alone may since have been reused by
+// an unrelated one -- but not the session: behind a session-mode pooler
+// the backend outlives it, reset and handed to whichever client the pooler
+// links next, possibly this replica's new lock connection or another
+// replica's. So the match is also on the lost connection's own
+// application_name, unique to its dial: a session-mode pooler sets each
+// client's own application_name on the backend it links (PgBouncer tracks
+// it), so a backend since handed to any other client is spared. And never
+// the backend running the statement, whatever its name. A role may signal
+// its own backends.
 const terminateOrphanQuery = `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
-	WHERE pid = $1 AND backend_start = $2 AND application_name = $3 AND datname = current_database()`
+	WHERE pid = $1 AND backend_start = $2 AND application_name = $3 AND datname = current_database()
+		AND pid <> pg_backend_pid()`
 
 // errLockHolderClosed is TryLock's error once Registry.Shutdown has closed
 // the holder: a Registry that has shut down hosts nothing.
@@ -99,8 +118,11 @@ var errLockHolderClosed = errors.New("sessionactor: lock connection closed: regi
 // server for short keepalives on its own end (prepareConn), so the server
 // reaps such a backend within ActorLockServerReapTime even if this replica
 // never comes back. And the first connection dialled after a loss
-// terminates the lost one's backend if it is still there (terminateOrphan),
-// so a replica that does come back does not wait for that.
+// terminates the lost one's backend if it is still running the lost
+// connection's session (terminateOrphan), so a replica that does come back
+// does not wait for that. Every dial names its connection afresh
+// (newLockConnApplicationName) for that match: behind a session-mode
+// pooler a backend outlives the session that locked on it.
 //
 // A statement runs on its own bound, never under its caller's
 // cancellation: pgconn answers a cancelled context by breaking the
@@ -112,22 +134,26 @@ var errLockHolderClosed = errors.New("sessionactor: lock connection closed: regi
 // The connection is dialled the way the query pool dials one of its own
 // (dialAndInstall): on its own goroutine, on the Registry's lifecycle
 // context rather than on whoever asked for it, one host after another
-// under each host's own connect_timeout. A caller only waits for the dial,
-// within its own bound, and a dial it gave up on still lands for the next
-// caller -- so a hung first host of a multi-host URL costs the dial one
-// connect_timeout, as it costs the pool, not every hydration forever.
+// under each host's own connect_timeout -- or ActorLockConnectAttemptTimeout
+// when the URL sets none. A caller only waits for the dial, within its own
+// bound, and a dial it gave up on still lands for the next caller -- so a
+// hung first host of a multi-host URL costs the dial one connect timeout,
+// not every hydration forever. And a dial started while the network drops
+// packets silently ends within that timeout of its start, so the next
+// hydration or probe after a heal dials afresh instead of waiting on a
+// connect stuck in the kernel's retransmission backoff.
 type lockHolder struct {
 	// Dial settings, fixed at construction: a copy of the query pool's
 	// own connection configuration -- TLS, runtime parameters such as
 	// search_path, and every target host with its connect_timeout -- and
-	// its connect hooks, applied as pgxpool applies them. connectFallback
-	// is pgxpool's own per-host connect timeout for a URL that sets none
-	// (ActorLockConnectTimeoutFallback).
-	connConfig      *pgx.ConnConfig
-	beforeConnect   func(context.Context, *pgx.ConnConfig) error
-	afterConnect    func(context.Context, *pgx.Conn) error
-	connectFallback time.Duration
-	stmtTimeout     time.Duration
+	// its connect hooks, applied as pgxpool applies them. connectAttempt
+	// bounds each connect attempt when the URL sets no connect_timeout
+	// (ActorLockConnectAttemptTimeout).
+	connConfig     *pgx.ConnConfig
+	beforeConnect  func(context.Context, *pgx.ConnConfig) error
+	afterConnect   func(context.Context, *pgx.Conn) error
+	connectAttempt time.Duration
+	stmtTimeout    time.Duration
 
 	// serverKeepalives is what prepareConn asks the server to apply to its
 	// end of every lock connection, from the ActorLockServer* timeouts.
@@ -140,6 +166,11 @@ type lockHolder struct {
 	// tryLockSQL is TryLock's statement: tryAdvisoryLockQuery, replaced
 	// only by a test that injects a server-side error. Read under sem.
 	tryLockSQL string
+
+	// terminateSQL is terminateOrphan's statement: terminateOrphanQuery,
+	// replaced only by a test that holds it back to observe what the dial
+	// does meanwhile. Set before anything dials; read by the dial.
+	terminateSQL string
 
 	// dialCtx is every dial's context: the Registry's lifecycle, never a
 	// caller's. dials runs each dial on its own goroutine, so a caller can
@@ -165,7 +196,8 @@ type lockHolder struct {
 	// that read failed). orphan is the backend of the last connection
 	// lost, which the server may still be keeping, until the next dial has
 	// dealt with it (terminateOrphan): a connection is only ever installed
-	// once the orphan before it has been. Both guarded by sem.
+	// once the terminate of the orphan before it has returned. Both
+	// guarded by sem.
 	backend *lockBackend
 	orphan  *lockBackend
 
@@ -192,10 +224,13 @@ type lockDial struct {
 }
 
 // lockBackend is one lock connection's backend on the server: its pid and
-// its start time, which together name it for the server's whole life.
+// its start time, which together name the backend for the server's whole
+// life, and the application_name that connection's dial set, which names
+// its session on that backend (terminateOrphanQuery).
 type lockBackend struct {
-	pid   int32
-	start time.Time
+	pid     int32
+	start   time.Time
+	appName string
 }
 
 // serverKeepalives are lockConnKeepaliveQuery's four arguments, each in the
@@ -221,10 +256,11 @@ func newServerKeepalives(t platform.Timeouts) serverKeepalives {
 }
 
 // newLockHolder builds a holder that dials, on first need, a connection
-// configured exactly like one of pool's own, but reporting
-// application_name narvi-actor-locks. Nothing is dialled here: a Registry
-// that never hydrates an actor, and never runs its lock probe, never opens
-// one. ctx is the Registry's lifecycle context; every dial runs on it.
+// configured exactly like one of pool's own, but reporting an
+// application_name of its own (newLockConnApplicationName). Nothing is
+// dialled here: a Registry that never hydrates an actor, and never runs its
+// lock probe, never opens one. ctx is the Registry's lifecycle context;
+// every dial runs on it.
 func newLockHolder(ctx context.Context, pool *pgxpool.Pool, timeouts platform.Timeouts, onLost func(context.Context, lockLoss)) *lockHolder {
 	poolConfig := pool.Config() // a copy: nothing here can touch the pool's own
 	dialCtx, stopDials := context.WithCancel(ctx)
@@ -232,11 +268,12 @@ func newLockHolder(ctx context.Context, pool *pgxpool.Pool, timeouts platform.Ti
 		connConfig:       poolConfig.ConnConfig,
 		beforeConnect:    poolConfig.BeforeConnect,
 		afterConnect:     poolConfig.AfterConnect,
-		connectFallback:  timeouts.ActorLockConnectTimeoutFallback,
+		connectAttempt:   timeouts.ActorLockConnectAttemptTimeout,
 		stmtTimeout:      timeouts.ActorLockStatementTimeout,
 		serverKeepalives: newServerKeepalives(timeouts),
 		onLost:           onLost,
 		tryLockSQL:       tryAdvisoryLockQuery,
+		terminateSQL:     terminateOrphanQuery,
 		dialCtx:          dialCtx,
 		stopDials:        stopDials,
 		sem:              make(chan struct{}, 1),
@@ -439,8 +476,9 @@ func (h *lockHolder) startDial() *lockDial {
 // dialAndInstall dials the lock connection and makes it the open one,
 // unless one is already open or the holder has closed. First, from the new
 // connection, it terminates the backend the last lost connection may have
-// left behind. The dial runs outside sem: statements on an open connection
-// never wait for it.
+// left behind, and installs the new one only once that has returned. The
+// dial runs outside sem: statements on an open connection never wait for
+// it.
 func (h *lockHolder) dialAndInstall() error {
 	ctx := h.dialCtx
 	if err := h.enter(ctx); err != nil {
@@ -455,7 +493,7 @@ func (h *lockHolder) dialAndInstall() error {
 		return nil
 	}
 
-	conn, backend, err := h.dial(ctx)
+	conn, appName, backend, err := h.dial(ctx)
 	if err != nil {
 		return err
 	}
@@ -486,47 +524,49 @@ func (h *lockHolder) dialAndInstall() error {
 		pid = int64(backend.pid)
 	}
 	platform.Logger(ctx).Info("sessionactor: lock connection established",
-		"backend_pid", pid, "generation", h.gen.Load())
+		"backend_pid", pid, "application_name", appName, "generation", h.gen.Load())
 	return nil
 }
 
 // dial opens one connection as pgxpool opens one of its own -- a copy of
 // the pool's configuration, every host tried in turn under its own
-// connect_timeout (connectFallback when the URL sets none), the pool's
-// BeforeConnect and AfterConnect hooks, and no other bound than ctx -- then
-// readies it (prepareConn) and returns it with its backend, if that could
-// be read.
-func (h *lockHolder) dial(ctx context.Context) (*pgx.Conn, *lockBackend, error) {
+// connect_timeout (connectAttempt when the URL sets none), the pool's
+// BeforeConnect and AfterConnect hooks, and no other bound than ctx -- under
+// an application_name of its own (newLockConnApplicationName), then readies
+// it (prepareConn) and returns it with that name and its backend, if that
+// could be read.
+func (h *lockHolder) dial(ctx context.Context) (*pgx.Conn, string, *lockBackend, error) {
 	cc := h.connConfig.Copy()
 	if cc.ConnectTimeout <= 0 {
-		cc.ConnectTimeout = h.connectFallback
+		cc.ConnectTimeout = h.connectAttempt
 	}
 	if h.beforeConnect != nil {
 		if err := h.beforeConnect(ctx, cc); err != nil {
-			return nil, nil, fmt.Errorf("before connect: %w", err)
+			return nil, "", nil, fmt.Errorf("before connect: %w", err)
 		}
 	}
 	if cc.RuntimeParams == nil {
 		cc.RuntimeParams = map[string]string{}
 	}
-	cc.RuntimeParams["application_name"] = lockConnApplicationName
+	appName := newLockConnApplicationName()
+	cc.RuntimeParams["application_name"] = appName
 
 	conn, err := pgx.ConnectConfig(ctx, cc)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 	if h.afterConnect != nil {
 		if err := h.afterConnect(ctx, conn); err != nil {
 			h.closeConn(conn)
-			return nil, nil, fmt.Errorf("after connect: %w", err)
+			return nil, "", nil, fmt.Errorf("after connect: %w", err)
 		}
 	}
-	backend, err := h.prepareConn(ctx, conn)
+	backend, err := h.prepareConn(ctx, conn, appName)
 	if err != nil {
 		h.closeConn(conn)
-		return nil, nil, err
+		return nil, "", nil, err
 	}
-	return conn, backend, nil
+	return conn, appName, backend, nil
 }
 
 // prepareConn readies a freshly dialled lock connection, not yet in use,
@@ -545,7 +585,8 @@ func (h *lockHolder) dial(ctx context.Context) (*pgx.Conn, *lockBackend, error) 
 //
 // Then it reads the connection's backend, which terminateOrphan needs if
 // this connection is lost: the pid the server reports, not the one pgconn
-// was handed at startup, which a pooler may have made up.
+// was handed at startup, which a pooler may have made up; its start time;
+// and appName, the application_name this connection's dial set.
 //
 // A statement that loses the connection (statementLost) fails the dial,
 // and the next one starts afresh. One the server refuses is logged and
@@ -553,7 +594,7 @@ func (h *lockHolder) dial(ctx context.Context) (*pgx.Conn, *lockBackend, error) 
 // connection's backend lasts as long as the server's own keepalives let
 // it -- since failing every dial on it would leave the replica unable to
 // host any session at all.
-func (h *lockHolder) prepareConn(ctx context.Context, conn *pgx.Conn) (*lockBackend, error) {
+func (h *lockHolder) prepareConn(ctx context.Context, conn *pgx.Conn, appName string) (*lockBackend, error) {
 	logger := platform.Logger(ctx)
 	k := h.serverKeepalives
 
@@ -588,29 +629,32 @@ func (h *lockHolder) prepareConn(ctx context.Context, conn *pgx.Conn) (*lockBack
 			"backend_pid", pid)
 		return nil, nil
 	}
-	return &lockBackend{pid: pid, start: start.Time}, nil
+	return &lockBackend{pid: pid, start: start.Time, appName: appName}, nil
 }
 
 // terminateOrphan terminates, from conn -- freshly dialled, not yet in
-// use -- the backend of the lock connection lost before it, if the server
-// still keeps it: when the loss was the network's, the server never heard
-// the lost connection close, and would keep every lock it held until its
-// keepalives reaped it. A backend already gone is the ordinary case (the
-// server heard the close, or ended the backend itself). It fails -- and so
-// fails the dial, leaving the orphan to the next one -- only when conn
-// itself is lost. Anything else is logged, and the orphan left to the
-// server's keepalives: it never holds up the new connection longer than
-// one statement.
+// use -- the backend of the lock connection lost before it, if that backend
+// is still running the lost connection's session (terminateOrphanQuery):
+// when the loss was the network's, the server -- or a pooler in between --
+// never heard the lost connection close, and would keep every lock it held
+// until keepalives reaped it. No such backend is the ordinary case: the
+// server heard the close, or ended the backend itself, or a pooler heard it
+// and has reset the backend, releasing the locks, and perhaps handed it to
+// another client since. It fails -- and so fails the dial, leaving the
+// orphan to the next one -- only when conn itself is lost. Anything else is
+// logged, and the orphan left to the server's keepalives: it never holds up
+// the new connection longer than one statement.
 func (h *lockHolder) terminateOrphan(ctx context.Context, conn *pgx.Conn, orphan lockBackend) error {
 	sctx, cancel := context.WithTimeout(ctx, h.stmtTimeout)
 	defer cancel()
-	logger := platform.Logger(ctx).With("orphan_backend_pid", orphan.pid, "orphan_backend_start", orphan.start)
+	logger := platform.Logger(ctx).With("orphan_backend_pid", orphan.pid, "orphan_backend_start", orphan.start,
+		"orphan_application_name", orphan.appName)
 
 	var terminated bool
-	err := conn.QueryRow(sctx, terminateOrphanQuery, orphan.pid, orphan.start, lockConnApplicationName).Scan(&terminated)
+	err := conn.QueryRow(sctx, h.terminateSQL, orphan.pid, orphan.start, orphan.appName).Scan(&terminated)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
-		logger.Info("sessionactor: the lost lock connection's backend had already ended")
+		logger.Info("sessionactor: no backend was left running the lost lock connection's session")
 	case err == nil && terminated:
 		logger.Warn("sessionactor: terminated the backend a lost lock connection left behind, still holding its advisory locks")
 	case err == nil:
