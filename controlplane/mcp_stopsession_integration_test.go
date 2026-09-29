@@ -55,6 +55,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	"golang.org/x/sync/errgroup"
@@ -193,19 +194,12 @@ func readStopState(ctx context.Context, t *testing.T, rig *oauthRouterRig, tr st
 		}
 		st.Sessions = append(st.Sessions, fmt.Sprintf("%s status=%s reason=%q flagged=%v", r.role, status, reason, flagged))
 
-		rows, err := rig.pool.Query(ctx, `SELECT status::text, stop_requested_at IS NOT NULL FROM turns WHERE session_id = $1 ORDER BY created_at`, r.id)
-		if err != nil {
-			t.Fatalf("read the %s turns: %v", r.role, err)
-		}
-		for rows.Next() {
+		st.Turns = append(st.Turns, collectRows(ctx, t, rig, func(row pgx.Rows) (string, error) {
 			var tstatus string
 			var tflagged bool
-			if err := rows.Scan(&tstatus, &tflagged); err != nil {
-				t.Fatal(err)
-			}
-			st.Turns = append(st.Turns, fmt.Sprintf("%s %s flagged=%v", r.role, tstatus, tflagged))
-		}
-		rows.Close()
+			err := row.Scan(&tstatus, &tflagged)
+			return fmt.Sprintf("%s %s flagged=%v", r.role, tstatus, tflagged), err
+		}, `SELECT status::text, stop_requested_at IS NOT NULL FROM turns WHERE session_id = $1 ORDER BY created_at`, r.id)...)
 
 		var synthetic int
 		if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'execution_complete' AND (payload->>'synthetic')::boolean`, r.id).Scan(&synthetic); err != nil {
@@ -213,43 +207,68 @@ func readStopState(ctx context.Context, t *testing.T, rig *oauthRouterRig, tr st
 		}
 		st.Synthetic = append(st.Synthetic, fmt.Sprintf("%s %d", r.role, synthetic))
 
-		rows, err = rig.pool.Query(ctx, `SELECT name FROM session_timers WHERE session_id = $1 ORDER BY name`, r.id)
-		if err != nil {
-			t.Fatalf("read the %s timers: %v", r.role, err)
-		}
-		for rows.Next() {
+		for _, name := range collectRows(ctx, t, rig, func(row pgx.Rows) (string, error) {
 			var name string
-			if err := rows.Scan(&name); err != nil {
-				t.Fatal(err)
-			}
+			err := row.Scan(&name)
+			return name, err
+		}, `SELECT name FROM session_timers WHERE session_id = $1 ORDER BY name`, r.id) {
 			st.Timers = append(st.Timers, r.role+" "+name)
 		}
-		rows.Close()
 
-		rows, err = rig.pool.Query(ctx, `SELECT resource_type, actor_user_id, detail_json FROM audit_log WHERE action = 'session.stop' AND resource_id = $1 ORDER BY created_at`, r.id.String())
-		if err != nil {
-			t.Fatalf("read the %s audit rows: %v", r.role, err)
+		type auditRow struct {
+			resourceType string
+			actorID      pgtype.UUID
+			raw          []byte
 		}
-		for rows.Next() {
-			var resourceType string
-			var actorID pgtype.UUID
-			var raw []byte
-			if err := rows.Scan(&resourceType, &actorID, &raw); err != nil {
-				t.Fatal(err)
-			}
+		for _, a := range collectRows(ctx, t, rig, func(row pgx.Rows) (auditRow, error) {
+			var a auditRow
+			err := row.Scan(&a.resourceType, &a.actorID, &a.raw)
+			return a, err
+		}, `SELECT resource_type, actor_user_id, detail_json FROM audit_log WHERE action = 'session.stop' AND resource_id = $1 ORDER BY created_at`, r.id.String()) {
 			var detail map[string]any
-			if err := json.Unmarshal(raw, &detail); err != nil {
-				t.Fatalf("decode audit detail %s: %v", raw, err)
+			if err := json.Unmarshal(a.raw, &detail); err != nil {
+				t.Fatalf("decode audit detail %s: %v", a.raw, err)
 			}
 			stamp, _ := detail["mcp"].(map[string]any)
 			stamps = append(stamps, stamp)
 			delete(detail, "mcp")
 			canon, _ := json.Marshal(detail)
-			st.Audit = append(st.Audit, fmt.Sprintf("session.stop %s <%s> actor=%v %s", resourceType, r.role, actorID == actor, byRole(string(canon))))
+			st.Audit = append(st.Audit, fmt.Sprintf("session.stop %s <%s> actor=%v %s", a.resourceType, r.role, a.actorID == actor, byRole(string(canon))))
 		}
-		rows.Close()
 	}
 	return st, stamps
+}
+
+// collectRows runs query on rig's pool and scans every row with scan,
+// returning them only once the rows are closed and their error checked:
+// the caller asserts on a slice, never inside an open result set. A
+// t.Fatal with rows still open would keep a pool connection acquired, and
+// the rig's pool.Close cleanup would then wait on it for ever -- the
+// package timing out instead of failing with its message.
+func collectRows[T any](ctx context.Context, t *testing.T, rig *oauthRouterRig, scan func(pgx.Rows) (T, error), query string, args ...any) []T {
+	t.Helper()
+	rows, err := rig.pool.Query(ctx, query, args...)
+	if err != nil {
+		t.Fatalf("query %q: %v", query, err)
+	}
+	var out []T
+	var scanErr error
+	for rows.Next() {
+		v, err := scan(rows)
+		if err != nil {
+			scanErr = err
+			break
+		}
+		out = append(out, v)
+	}
+	rows.Close()
+	if scanErr != nil {
+		t.Fatalf("scan a row of %q: %v", query, scanErr)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("read %q: %v", query, err)
+	}
+	return out
 }
 
 // sameStopState fails the test unless mcp and rest are the same state.
@@ -464,6 +483,14 @@ func sdkStopSessionReadGrant(t *testing.T, rig *oauthRouterRig) {
 	if strings.Join(st.Sessions, ",") != `parent status=created reason="" flagged=false` || strings.Join(st.Turns, ",") != "parent pending flagged=false" || len(st.Timers) != 0 || len(st.Audit) != 0 {
 		t.Fatalf("a grant without mcp:write left %+v, want nothing written", st)
 	}
+}
+
+// deref reads an optional string, "" for none.
+func deref(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 // exitSandboxGen is the gen of the sandbox the row's exit seeds for the
@@ -700,18 +727,11 @@ func spawnFixChild(ctx context.Context, t *testing.T, rig *oauthRouterRig, paren
 func descendantOpenTurns(ctx context.Context, t *testing.T, rig *oauthRouterRig, rootID pgtype.UUID) (open []string, sessions int) {
 	t.Helper()
 	const tree = `WITH RECURSIVE tree(id) AS (SELECT $1::uuid UNION SELECT s.id FROM sessions s JOIN tree ON s.parent_session_id = tree.id)`
-	rows, err := rig.pool.Query(ctx, tree+` SELECT t.session_id::text, t.id::text, t.status::text FROM turns t JOIN tree ON t.session_id = tree.id WHERE t.status IN ('pending', 'dispatched', 'processing') ORDER BY t.created_at`, rootID)
-	if err != nil {
-		t.Fatalf("read the tree's open turns: %v", err)
-	}
-	for rows.Next() {
+	open = collectRows(ctx, t, rig, func(row pgx.Rows) (string, error) {
 		var sessionID, turnID, status string
-		if err := rows.Scan(&sessionID, &turnID, &status); err != nil {
-			t.Fatal(err)
-		}
-		open = append(open, fmt.Sprintf("session %s turn %s %s", sessionID, turnID, status))
-	}
-	rows.Close()
+		err := row.Scan(&sessionID, &turnID, &status)
+		return fmt.Sprintf("session %s turn %s %s", sessionID, turnID, status), err
+	}, tree+` SELECT t.session_id::text, t.id::text, t.status::text FROM turns t JOIN tree ON t.session_id = tree.id WHERE t.status IN ('pending', 'dispatched', 'processing') ORDER BY t.created_at`, rootID)
 	return open, rig.countOf(ctx, t, tree+` SELECT count(*) FROM tree`, rootID)
 }
 
@@ -867,23 +887,21 @@ func sdkPlanRevisionThenStopNoOrphan(t *testing.T, rig *oauthRouterRig, provider
 	if status := planStatus(ctx, t, rig, plan); status != "approved" {
 		t.Fatalf("after the stop the plan is %s, want still approved", status)
 	}
-	rows, err := rig.pool.Query(ctx, `SELECT resource_id, detail_json->'mcp'->>'grant_id' FROM audit_log WHERE action = 'session.stop' AND resource_id = ANY($1) ORDER BY resource_id`, []string{parent.String(), child.String()})
-	if err != nil {
-		t.Fatal(err)
+	type stopRow struct {
+		resource string
+		stamp    *string
 	}
 	var stamped []string
-	for rows.Next() {
-		var resource string
-		var stamp *string
-		if err := rows.Scan(&resource, &stamp); err != nil {
-			t.Fatal(err)
+	for _, row := range collectRows(ctx, t, rig, func(r pgx.Rows) (stopRow, error) {
+		var row stopRow
+		err := r.Scan(&row.resource, &row.stamp)
+		return row, err
+	}, `SELECT resource_id, detail_json->'mcp'->>'grant_id' FROM audit_log WHERE action = 'session.stop' AND resource_id = ANY($1) ORDER BY resource_id`, []string{parent.String(), child.String()}) {
+		if row.stamp == nil || *row.stamp != grant {
+			t.Fatalf("the session.stop row of %s carries grant %v, want %s", row.resource, deref(row.stamp), grant)
 		}
-		if stamp == nil || *stamp != grant {
-			t.Fatalf("the session.stop row of %s carries grant %v, want %s", resource, stamp, grant)
-		}
-		stamped = append(stamped, resource)
+		stamped = append(stamped, row.resource)
 	}
-	rows.Close()
 	want := []string{parent.String(), child.String()}
 	sort.Strings(want)
 	if strings.Join(stamped, ",") != strings.Join(want, ",") {
