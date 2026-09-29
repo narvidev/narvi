@@ -58,3 +58,36 @@ func DeriveFailureReason(from State, trig Trigger) (FailureReason, bool) {
 		return FailureReasonNeverStarted, true
 	}
 }
+
+// ImpliedFailureReason reports the FailureReason a turn stored in state
+// necessarily carries, when the state alone determines it -- that is, when
+// every (from, trigger) edge of the transitions table reaching state implies
+// the same reason. StateCancelled is reached only through TriggerCancel, so
+// a stored cancelled turn always carries FailureReasonCancelled. StateFailed
+// is reached through three triggers implying three different reasons, so it
+// returns ("", false), as does every state no edge reaches with a reason.
+//
+// Turns store no reason of their own (see FailureReason's doc comment), so a
+// caller re-deriving a session's status from stored rows uses this for
+// every row it did not itself just transition: since a person's stop
+// (technical plan §3.3) can cancel queued turns while an older one is still
+// running, the last turn of a session can be one cancelled earlier.
+func ImpliedFailureReason(state State) (FailureReason, bool) {
+	var implied FailureReason
+	for from, byTrigger := range transitions {
+		for trig, to := range byTrigger {
+			if to != state {
+				continue
+			}
+			reason, ok := DeriveFailureReason(from, trig)
+			if !ok {
+				return "", false
+			}
+			if implied != "" && implied != reason {
+				return "", false
+			}
+			implied = reason
+		}
+	}
+	return implied, implied != ""
+}

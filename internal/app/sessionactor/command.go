@@ -27,6 +27,20 @@ const (
 	// ordinary timer pump into TimerFired, exactly like every other named
 	// timer.
 	TimerReviewRetriggerDebounce = "review_retrigger_debounce"
+
+	// TimerStop is technical plan §3.3's stop: a person's request to stop
+	// the session, armed from OUTSIDE the actor like the debounce above --
+	// POST /api/sessions/{sessionID}/stop (internal/adapters/inbound/
+	// httpapi's StopSession) upserts it to now, in the transaction that
+	// flags the session's open turns (turns.stop_requested_at) and the
+	// session. Its firing (stop.go's handleStopTimer) cancels every flagged
+	// pending turn, sends a flagged turn in flight the sandbox `stop`
+	// command and re-arms itself for the end of that turn's StopGrace, and
+	// cancels the turn itself if it is still in flight then. The timer is
+	// what makes the request survive the loss of a replica: the flags and
+	// the timer are rows, and whichever replica's pump delivers it next
+	// does the rest.
+	TimerStop = "stop"
 )
 
 // Command is the sum type an Actor's mailbox carries (§2: "one goroutine
@@ -40,7 +54,10 @@ type Command interface {
 }
 
 // TimerFired is delivered by the timer pump (timerpump.go) when a named
-// persistent timer becomes due (§2). Name is one of the 5 constants above
+// persistent timer becomes due (§2) -- and, for TimerStop only, also sent
+// by the stop route right after it arms that timer, so the actor acts at
+// once rather than at the pump's next tick (every handler already tolerates
+// a redelivered firing, since the pump's claim window can redeliver one). Name is one of the 5 constants above
 // in practice, but this type does not itself restrict it -- an unknown
 // name is handled defensively (logged, ignored) by the dispatch switch in
 // timerfired.go, the same deny-list-not-allow-list convention

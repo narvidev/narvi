@@ -10,7 +10,9 @@
 // from the SAME switch below but implemented in reviewretrigger.go, not
 // this file, since it is armed from OUTSIDE the actor entirely (see that
 // file's own top comment) rather than by any of this file's own handlers,
-// unlike the 5 timers this file's rest describes.
+// unlike the 5 timers this file's rest describes. Technical plan §3.3's
+// stop adds a 7th, stop, armed from outside the actor the same way (by
+// POST /api/sessions/{sessionID}/stop) and implemented in stop.go.
 //
 // All 5 named timers' RE-ARM/handling logic is fully wired here -- none
 // needed a SandboxProvider or AgentRuntime (neither port exists yet). The
@@ -105,6 +107,8 @@ func (a *Actor) handleTimerFired(ctx context.Context, cmd TimerFired) error {
 		return a.handleTurnDeadlineTimer(ctx)
 	case TimerReviewRetriggerDebounce:
 		return a.handleReviewRetriggerDebounceTimer(ctx)
+	case TimerStop:
+		return a.handleStopTimer(ctx)
 	default:
 		// TEXT column, not an enum (§2) -- an unrecognized name is
 		// handled defensively (deny-list-not-allow-list, same convention
@@ -736,9 +740,22 @@ func summariesWithOverride(turns []sqlcgen.Turn, overrideID pgtype.UUID, overrid
 			out[i] = turn.Summary{Status: overrideStatus, FailureReason: overrideReason}
 			continue
 		}
-		out[i] = turn.Summary{Status: turn.State(t.Status)}
+		out[i] = storedTurnSummary(t)
 	}
 	return out
+}
+
+// storedTurnSummary is one stored turn row as DeriveStatus reads it: its
+// status, and the failure reason that status alone implies
+// (turn.ImpliedFailureReason -- a cancelled turn is always cancelled). A
+// failed row's reason is not in the row, so it stays empty, exactly as
+// before. Since a person's stop can cancel queued turns before an older
+// one ends (stop.go), the last turn of a session can be one cancelled
+// earlier, and its reason must not be lost when the older one ends.
+func storedTurnSummary(t sqlcgen.Turn) turn.Summary {
+	state := turn.State(t.Status)
+	reason, _ := turn.ImpliedFailureReason(state)
+	return turn.Summary{Status: state, FailureReason: reason}
 }
 
 // summariesForRederive builds the []turn.Summary domain/session.
