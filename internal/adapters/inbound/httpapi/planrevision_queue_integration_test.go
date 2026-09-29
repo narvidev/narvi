@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,22 +23,41 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/intentclassifier"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// This file pins technical plan §43.21's rule for a plan revision queued
-// behind an approved implementation, on real Postgres through a real
-// session actor: where an ingress queues one -- CreateTurnForBot, the only
-// caller of AlwaysQueue -- the revision waits, and never withdraws the
-// authorization the running work holds. The approval is that
-// authorization: plan v1 is approved (a terminal status) and the
-// implementation turn was inserted by the approval itself; nothing the
-// revision writes is read by that turn's dispatch, its completion or its
-// delivery. So the implementation runs to its end and its branch is pushed
-// and its pull request opened; only then is the revision dispatched, and
-// when it completes it writes v2 awaiting approval while v1 stays approved.
+// This file pins technical plan §43.21(b), a plan revision queued behind
+// an approved implementation, on real Postgres through a real session
+// actor.
+//
+// No ingress queues one today. AlwaysQueue has two callers:
+// CreateTurnForBot (the code host's mention, from the coalescer's reuse
+// branch) and RetriggerReview (the re-run-review button). A re-review is
+// never plan mode; a mention is never plan mode either, and a prompt is
+// promoted to a revision only while a plan awaits approval, which none does
+// while an approved implementation is open. Both callers reach only a pull
+// request's review session, which never pushes.
+// TestMentionBehindImplementation_QueuedAsAnOrdinaryTurn pins that
+// reachable case: a mention queued behind the approved implementation, on
+// a review session, is an ordinary turn, and the classifier is never asked.
+//
+// TestRevisionQueuedBehindImplementation_LeavesItAuthorized pins the rule
+// an ingress that did queue one would keep. It calls CreateTurnForBot with
+// plan mode on, on a session that pushes -- a pairing no ingress makes
+// today. The revision waits, and never withdraws the authorization the
+// running work holds. The approval is that authorization: plan v1 is
+// approved (a terminal status) and the implementation turn was inserted by
+// the approval itself; nothing the revision writes is read by that turn's
+// dispatch, its completion or its delivery. The revision is dispatched once
+// the implementation has completed and the sandbox is ready again, and
+// waits for nothing else: the implementation's push and pull request
+// proceed independently of it, reporting back before the revision is
+// dispatched or only after it has written v2. When the revision completes
+// it writes v2 awaiting approval while v1 stays approved.
 
 // ofType returns every command of type typ the actor sent, in order.
 func (c *deliveryCommander) ofType(t *testing.T, typ string) []json.RawMessage {
@@ -242,14 +262,17 @@ func (r queuedRevisionRig) snapshotReady(ctx context.Context, t *testing.T) {
 }
 
 // TestRevisionQueuedBehindImplementation_LeavesItAuthorized: a revision
-// queued through CreateTurnForBot while the approved implementation is
-// processing, or while it is still queued behind a sandbox that is not
-// ready, leaves it authorized: it is not cancelled, v1 stays approved, the
-// implementation is dispatched first, completes, and its branch is pushed
-// and its pull request opened -- whether the push reports back before the
-// revision is dispatched or only after the revision has written v2. The
-// revision is dispatched only after the implementation completed, and
-// writes v2 awaiting approval beside v1, still approved.
+// queued through CreateTurnForBot with plan mode on (this file's top
+// comment: no ingress makes that call today) while the approved
+// implementation is processing, or while it is still queued behind a
+// sandbox that is not ready, leaves it authorized: it is not cancelled, v1
+// stays approved, and the implementation is dispatched first and
+// completes. The revision is dispatched only after the implementation
+// completed, once the sandbox's snapshot is ready, whether or not the
+// implementation's push has reported back: its branch is pushed and its
+// pull request opened before the revision is dispatched, or only after the
+// revision has written v2. The revision writes v2 awaiting approval beside
+// v1, still approved.
 func TestRevisionQueuedBehindImplementation_LeavesItAuthorized(t *testing.T) {
 	rig := newTestRig(t)
 	const feedback = "keep the env fallback"
@@ -288,7 +311,9 @@ func TestRevisionQueuedBehindImplementation_LeavesItAuthorized(t *testing.T) {
 				wantImplementation = "pending"
 			}
 
-			// The revision, queued through the one ingress that queues.
+			// The revision, queued through CreateTurnForBot with plan mode
+			// on -- the pairing no ingress makes today (this file's top
+			// comment).
 			revision, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, r.registry, r.sessionID, feedback, nil, true, false, r.userID, nil, nil, nil, nil, nil, nil, nil, nil, false)
 			if err != nil {
 				t.Fatalf("CreateTurnForBot: %v", err)
@@ -348,7 +373,9 @@ func TestRevisionQueuedBehindImplementation_LeavesItAuthorized(t *testing.T) {
 				delivered()
 			}
 
-			// The snapshot finishes: only now is the revision dispatched.
+			// The snapshot finishes and the sandbox is ready again: only now
+			// is the revision dispatched, whether or not the push has
+			// reported back.
 			r.snapshotReady(ctx, t)
 			eventually(t, 10*time.Second, func() bool { return len(r.commander.ofType(t, "prompt")) == 2 })
 			if texts := r.commander.promptTexts(t); !strings.Contains(texts[1], feedback) {
@@ -381,5 +408,99 @@ func TestRevisionQueuedBehindImplementation_LeavesItAuthorized(t *testing.T) {
 				t.Fatalf("plans at the end: %s, want v1 approved and v2 awaiting approval", got)
 			}
 		})
+	}
+}
+
+// amendingLLM is a ports.LLM that reads every plan follow-up as a
+// confident change to the plan, and counts the calls it answers.
+type amendingLLM struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (l *amendingLLM) Complete(context.Context, ports.CompletionRequest) (ports.CompletionResponse, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls++
+	raw, err := json.Marshal(map[string]string{"target": intentdomain.TargetAmend, "confidence": intentdomain.ConfidenceHigh, "reasoning": "test fixture"})
+	return ports.CompletionResponse{Raw: raw}, err
+}
+
+func (l *amendingLLM) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.calls
+}
+
+// TestMentionBehindImplementation_QueuedAsAnOrdinaryTurn pins the case
+// production reaches (technical plan §43.21(b)): a code-host mention queued
+// behind an approved, processing implementation, on a pull request's review
+// session -- the only session a mention reaches -- and without plan mode,
+// which a mention never carries. It is queued as an ordinary turn, never a
+// revision: a prompt is promoted only while a plan awaits approval, and
+// none does, so the classifier is not even asked, though it would read the
+// mention as a change to the plan. v1 stays approved and the implementation
+// processing. The control: the same call, with the same classifier, on a
+// session whose plan awaits approval is promoted to a revision.
+func TestMentionBehindImplementation_QueuedAsAnOrdinaryTurn(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	r := newQueuedRevisionRig(ctx, t, rig, true)
+	prRepo := fmt.Sprintf("example/reviewed-%d", time.Now().UnixNano())
+	prSessions := narvipg.NewGitHubPRSessionStore(rig.pool)
+	if err := prSessions.EnsureRow(ctx, prRepo, 1); err != nil {
+		t.Fatalf("EnsureRow: %v", err)
+	}
+	if err := prSessions.SetSessionID(ctx, prRepo, 1, r.sessionID); err != nil {
+		t.Fatalf("make the session a pull request's review session: %v", err)
+	}
+
+	implementation := r.approveByREST(t)
+	eventually(t, 10*time.Second, func() bool { return len(r.commander.ofType(t, "prompt")) == 1 })
+	if got := r.turnStatus(ctx, t, implementation); got != "processing" {
+		t.Fatalf("the implementation is %s after its dispatch, want processing", got)
+	}
+
+	llm := &amendingLLM{}
+	classifier := intentclassifier.New(llm, "anthropic", "claude-haiku-4-5", narvipg.NewPromptTemplateStore(rig.pool), nil, nil)
+	mention := "keep the env fallback instead"
+	mentionTurn := func(sessionID pgtype.UUID) sqlcgen.Turn {
+		t.Helper()
+		// As the coalescer's reuse branch calls it for a mention: plan mode
+		// off, the mention's own text to classify.
+		created, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, r.registry, sessionID, mention, nil, false, false, r.userID, nil, &mention, nil, nil, nil, nil, nil, nil, false)
+		if err != nil {
+			t.Fatalf("CreateTurnForBot: %v", err)
+		}
+		return created
+	}
+
+	queued := mentionTurn(r.sessionID)
+	if queued.PlanMode || queued.Status != sqlcgen.TurnStatusPending {
+		t.Fatalf("the mention = plan_mode %v, %s; want a pending ordinary turn", queued.PlanMode, queued.Status)
+	}
+	if n := llm.count(); n != 0 {
+		t.Fatalf("the classifier was asked %d time(s), want never: no plan awaits approval", n)
+	}
+	holds(t, 300*time.Millisecond, "the queue behind the implementation", func() bool {
+		return r.turnStatus(ctx, t, implementation) == "processing" &&
+			r.turnStatus(ctx, t, queued.ID) == "pending" &&
+			len(r.commander.ofType(t, "prompt")) == 1
+	})
+	if got := r.planVersions(ctx, t); got != "1 approved" {
+		t.Fatalf("plans after the mention was queued: %s, want v1 still approved", got)
+	}
+
+	// The control: a plan awaiting approval, and nothing open.
+	other, err := rig.sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb, CreatedBy: r.userID})
+	if err != nil {
+		t.Fatalf("create the control session: %v", err)
+	}
+	seedAwaitingApprovalPlan(ctx, t, rig, other.ID, 1)
+	if promoted := mentionTurn(other.ID); !promoted.PlanMode {
+		t.Fatalf("the control mention = plan_mode %v, want it promoted to a revision", promoted.PlanMode)
+	}
+	if n := llm.count(); n != 1 {
+		t.Fatalf("the classifier was asked %d time(s) in all, want once, for the control", n)
 	}
 }
