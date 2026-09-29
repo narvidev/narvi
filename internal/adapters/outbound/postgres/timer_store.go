@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
@@ -58,4 +59,11 @@ func (s *TimerStore) Claim(ctx context.Context, arg sqlcgen.ClaimDueTimerParams)
 // Delete removes a named timer for a session.
 func (s *TimerStore) Delete(ctx context.Context, arg sqlcgen.DeleteSessionTimerParams) error {
 	return s.q.DeleteSessionTimer(ctx, arg)
+}
+
+// ListForSession returns every timer armed on sessionID, by name -- the
+// stop timer's handler reads it to delete the ones whose firing creates a
+// turn (technical plan §3.3).
+func (s *TimerStore) ListForSession(ctx context.Context, sessionID pgtype.UUID) ([]sqlcgen.SessionTimer, error) {
+	return s.q.ListSessionTimers(ctx, sessionID)
 }

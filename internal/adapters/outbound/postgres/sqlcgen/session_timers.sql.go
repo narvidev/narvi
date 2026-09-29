@@ -119,6 +119,40 @@ func (q *Queries) ListDueTimers(ctx context.Context, limit int32) ([]SessionTime
 	return items, nil
 }
 
+const listSessionTimers = `-- name: ListSessionTimers :many
+SELECT id, session_id, name, fires_at, created_at FROM session_timers
+WHERE session_id = $1
+ORDER BY name
+`
+
+// Every timer armed on one session: the stop timer's handler deletes the
+// ones whose firing creates a turn (sessionactor.ClassifyTimer).
+func (q *Queries) ListSessionTimers(ctx context.Context, sessionID pgtype.UUID) ([]SessionTimer, error) {
+	rows, err := q.db.Query(ctx, listSessionTimers, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []SessionTimer
+	for rows.Next() {
+		var i SessionTimer
+		if err := rows.Scan(
+			&i.ID,
+			&i.SessionID,
+			&i.Name,
+			&i.FiresAt,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const upsertSessionTimer = `-- name: UpsertSessionTimer :one
 
 INSERT INTO session_timers (session_id, name, fires_at)

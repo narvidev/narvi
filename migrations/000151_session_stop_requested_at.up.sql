@@ -1,0 +1,57 @@
+-- Step 217 (§3.3, "stopping a session, and every session it started"): a
+-- person's request to stop a session, written as data. POST
+-- /api/sessions/{sessionID}/stop sets turns.stop_requested_at on every turn
+-- open at that instant and sessions.stop_requested_at on the session, and
+-- upserts the session's `stop` timer to now, all in one transaction under
+-- the session's actor-epoch lock. The session's actor does the rest when
+-- the timer fires, through §3.3's existing cancel transition: a flagged
+-- pending turn is cancelled and never dispatched, a flagged turn in flight
+-- is sent the sandbox `stop` command and cancelled once StopGrace passes if
+-- it has not ended. A turn created after the request carries no flag and
+-- runs normally.
+--
+-- sessions.stop_requested_at also refuses a new child session of a stopped
+-- parent (httpapi.CreateSessionOnTx reads it FOR SHARE), until the next
+-- turn a person creates on the session, or the approval of its plan,
+-- clears it. Stop is not an archive.
+--
+-- Both columns are nullable, with no default: NULL means no stop was
+-- requested. A repeated request keeps the first instant (COALESCE), so the
+-- grace a turn in flight gets runs from the first request.
+--
+-- # Locks
+--
+-- golang-migrate sends this whole file as one batch, which Postgres runs as
+-- one implicit transaction (000149 says the same of its own file). ADD
+-- COLUMN with no default is a catalog change that rewrites nothing, but
+-- each ALTER TABLE takes ACCESS EXCLUSIVE on its table and the transaction
+-- holds both until the file ends, so every query on sessions or turns
+-- waits for it. sessions is locked first, then turns: the order the
+-- session actor and the REST handlers take them in, since each locks the
+-- session row before it touches a turn.
+--
+-- # Rolling back
+--
+-- Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for. So once this migration is applied:
+--   - An older pod that is already running keeps working: every query it
+--     makes on sessions and turns names its columns, and none names these
+--     two.
+--   - An older pod that restarts does not boot ("no migration found for
+--     version 151"). That covers a rollback and an old pod restarting in
+--     the middle of a rolling deploy. A binary without 000151 cannot boot
+--     once it is applied.
+--   - Rolling the binary back is safe only to a binary that carries
+--     000151; 000150's same rule now names this version.
+--   - Rolling back further first needs the down migration. The control
+--     plane only ever migrates up, so run it with the golang-migrate CLI
+--     and this release's migrations (goto 150), with the control plane
+--     scaled to zero, then deploy the older binary. The down file says why
+--     not against live pods.
+--   - The down drops every pending stop request with its columns: a turn
+--     flagged but not yet cancelled then dispatches as if no stop had been
+--     asked for, and a stopped parent accepts new children again.
+ALTER TABLE sessions ADD COLUMN stop_requested_at timestamptz;
+
+ALTER TABLE turns ADD COLUMN stop_requested_at timestamptz;

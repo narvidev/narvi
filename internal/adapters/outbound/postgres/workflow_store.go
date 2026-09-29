@@ -214,6 +214,14 @@ func (s *WorkflowStore) FailRun(ctx context.Context, runID pgtype.UUID) (sqlcgen
 	return s.q.FailWorkflowRun(ctx, runID)
 }
 
+// CancelRun transitions runID to 'cancelled' and stamps finished_at -- the
+// consequence of a person's stop (technical plan §3.3) cancelling the turn
+// of the run's live attempt: terminal like FailRun, and never followed by
+// workflow.NextStep (workflowengine.OnTurnCompleted).
+func (s *WorkflowStore) CancelRun(ctx context.Context, runID pgtype.UUID) (sqlcgen.WorkflowRun, error) {
+	return s.q.CancelWorkflowRun(ctx, runID)
+}
+
 // SetStepRunOutcome persists the generic step-outcome-posting tool's own
 // typed payload ({status, summary, structuredPayload}, §25.6) onto
 // stepRunID -- guarded to the attempt currently actually 'running' (the

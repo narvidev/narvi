@@ -25,6 +25,33 @@ func (q *Queries) AttachTurnToWorkflowStepRun(ctx context.Context, arg AttachTur
 	return err
 }
 
+const cancelWorkflowRun = `-- name: CancelWorkflowRun :one
+UPDATE workflow_runs SET status = 'cancelled', finished_at = now(), updated_at = now() WHERE id = $1 RETURNING id, session_id, lane, workflow_definition_id, definition_version, status, created_at, updated_at, finished_at, needs_review_notified_at
+`
+
+// Technical plan §3.3's stop: an attempt whose turn a person's stop
+// cancelled ends its run here, terminal like FailWorkflowRun, and
+// workflow.NextStep is never consulted -- a custom definition's edge on
+// 'blocked' would otherwise queue the next step, and the stop would not
+// stop.
+func (q *Queries) CancelWorkflowRun(ctx context.Context, id pgtype.UUID) (WorkflowRun, error) {
+	row := q.db.QueryRow(ctx, cancelWorkflowRun, id)
+	var i WorkflowRun
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.Lane,
+		&i.WorkflowDefinitionID,
+		&i.DefinitionVersion,
+		&i.Status,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.FinishedAt,
+		&i.NeedsReviewNotifiedAt,
+	)
+	return i, err
+}
+
 const claimWorkflowRunEscalationNotice = `-- name: ClaimWorkflowRunEscalationNotice :execrows
 UPDATE workflow_runs SET needs_review_notified_at = now(), updated_at = now() WHERE id = $1 AND needs_review_notified_at IS NULL
 `

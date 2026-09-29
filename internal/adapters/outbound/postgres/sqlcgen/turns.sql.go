@@ -15,7 +15,7 @@ const createTurn = `-- name: CreateTurn :one
 
 INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, is_review_attempt)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at
 `
 
 type CreateTurnParams struct {
@@ -164,6 +164,7 @@ func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, e
 		&i.ReviewVerdictContext,
 		&i.DispatchedMessageID,
 		&i.IsReviewAttempt,
+		&i.StopRequestedAt,
 	)
 	return i, err
 }
@@ -294,7 +295,7 @@ func (q *Queries) GetPlatformCostSummaryInWindow(ctx context.Context, createdAt 
 }
 
 const getProcessingTurnForSession = `-- name: GetProcessingTurnForSession :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at FROM turns
 WHERE session_id = $1 AND status = 'processing'
 `
 
@@ -337,12 +338,13 @@ func (q *Queries) GetProcessingTurnForSession(ctx context.Context, sessionID pgt
 		&i.ReviewVerdictContext,
 		&i.DispatchedMessageID,
 		&i.IsReviewAttempt,
+		&i.StopRequestedAt,
 	)
 	return i, err
 }
 
 const getTurn = `-- name: GetTurn :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at FROM turns
 WHERE id = $1
 `
 
@@ -376,12 +378,13 @@ func (q *Queries) GetTurn(ctx context.Context, id pgtype.UUID) (Turn, error) {
 		&i.ReviewVerdictContext,
 		&i.DispatchedMessageID,
 		&i.IsReviewAttempt,
+		&i.StopRequestedAt,
 	)
 	return i, err
 }
 
 const getTurnByDispatchedMessageID = `-- name: GetTurnByDispatchedMessageID :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at FROM turns
 WHERE session_id = $1 AND dispatched_message_id = $2
 `
 
@@ -450,6 +453,7 @@ func (q *Queries) GetTurnByDispatchedMessageID(ctx context.Context, arg GetTurnB
 		&i.ReviewVerdictContext,
 		&i.DispatchedMessageID,
 		&i.IsReviewAttempt,
+		&i.StopRequestedAt,
 	)
 	return i, err
 }
@@ -565,8 +569,65 @@ func (q *Queries) ListSessionCostTotalsWithRepos(ctx context.Context) ([]ListSes
 	return items, nil
 }
 
+const listStopRequestedOpenTurns = `-- name: ListStopRequestedOpenTurns :many
+SELECT
+    id,
+    status,
+    stop_requested_at,
+    COALESCE(stop_requested_at <= now() - make_interval(secs => $1::float8), false)::boolean AS grace_elapsed
+FROM turns
+WHERE session_id = $2
+  AND stop_requested_at IS NOT NULL
+  AND status IN ('pending', 'dispatched', 'processing')
+ORDER BY created_at ASC, id ASC
+`
+
+type ListStopRequestedOpenTurnsParams struct {
+	GraceSeconds float64     `json:"grace_seconds"`
+	SessionID    pgtype.UUID `json:"session_id"`
+}
+
+type ListStopRequestedOpenTurnsRow struct {
+	ID              pgtype.UUID        `json:"id"`
+	Status          TurnStatus         `json:"status"`
+	StopRequestedAt pgtype.Timestamptz `json:"stop_requested_at"`
+	GraceElapsed    bool               `json:"grace_elapsed"`
+}
+
+// The session's flagged turns still open, oldest first, for the actor's
+// stop timer. grace_elapsed compares the flag with now() on the database's
+// own clock -- the clock that wrote it, and the one the timer pump compares
+// fires_at with -- so neither the decision between sending the sandbox
+// `stop` and cancelling, nor the instant the timer is re-armed for
+// (stop_requested_at plus the grace), depends on the skew between the
+// database and this replica.
+func (q *Queries) ListStopRequestedOpenTurns(ctx context.Context, arg ListStopRequestedOpenTurnsParams) ([]ListStopRequestedOpenTurnsRow, error) {
+	rows, err := q.db.Query(ctx, listStopRequestedOpenTurns, arg.GraceSeconds, arg.SessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListStopRequestedOpenTurnsRow
+	for rows.Next() {
+		var i ListStopRequestedOpenTurnsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Status,
+			&i.StopRequestedAt,
+			&i.GraceElapsed,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listTurnsForSession = `-- name: ListTurnsForSession :many
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at FROM turns
 WHERE session_id = $1
 ORDER BY created_at ASC
 `
@@ -610,6 +671,7 @@ func (q *Queries) ListTurnsForSession(ctx context.Context, sessionID pgtype.UUID
 			&i.ReviewVerdictContext,
 			&i.DispatchedMessageID,
 			&i.IsReviewAttempt,
+			&i.StopRequestedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -731,6 +793,39 @@ func (q *Queries) RecordTurnStepCost(ctx context.Context, arg RecordTurnStepCost
 	return result.RowsAffected(), nil
 }
 
+const requestStopOpenTurns = `-- name: RequestStopOpenTurns :many
+UPDATE turns
+SET stop_requested_at = COALESCE(stop_requested_at, now())
+WHERE session_id = $1 AND status IN ('pending', 'dispatched', 'processing')
+RETURNING id
+`
+
+// A person's stop request (technical plan §3.3, migrations/000151): flags
+// every turn of the session open at this instant, in the transaction that
+// flags the session and arms its stop timer, under the session's
+// actor-epoch lock. A turn already flagged keeps its first instant, so the
+// grace a turn in flight gets runs from the first request. The actor
+// decides what each flag means; nothing here moves a turn.
+func (q *Queries) RequestStopOpenTurns(ctx context.Context, sessionID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, requestStopOpenTurns, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const setTurnEpistemicOutcome = `-- name: SetTurnEpistemicOutcome :execrows
 UPDATE turns
 SET epistemic_outcome = $2
@@ -772,7 +867,7 @@ SET status = $2,
     dispatched_event_id = COALESCE($6, dispatched_event_id),
     dispatched_message_id = COALESCE($7, dispatched_message_id)
 WHERE id = $1
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at
 `
 
 type UpdateTurnStatusParams struct {
@@ -857,6 +952,7 @@ func (q *Queries) UpdateTurnStatus(ctx context.Context, arg UpdateTurnStatusPara
 		&i.ReviewVerdictContext,
 		&i.DispatchedMessageID,
 		&i.IsReviewAttempt,
+		&i.StopRequestedAt,
 	)
 	return i, err
 }

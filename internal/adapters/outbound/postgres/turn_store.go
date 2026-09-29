@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -172,4 +173,23 @@ func (s *TurnStore) GetPlatformCostSummaryInWindow(ctx context.Context, sinceTim
 // breakdown, spend descending -- §12.2 item 6's own "cost by model" chart.
 func (s *TurnStore) ListCostByModelInWindow(ctx context.Context, sinceTime pgtype.Timestamptz) ([]sqlcgen.ListCostByModelInWindowRow, error) {
 	return s.q.ListCostByModelInWindow(ctx, sinceTime)
+}
+
+// RequestStopOpen flags every turn of the session open at this instant with
+// a person's stop request (technical plan §3.3) and returns their ids. It
+// moves no turn: the session's actor does, through §3.3's cancel
+// transition. Meaningful only on a store built via WithTx, under the
+// session's GetActorEpochForUpdate lock.
+func (s *TurnStore) RequestStopOpen(ctx context.Context, sessionID pgtype.UUID) ([]pgtype.UUID, error) {
+	return s.q.RequestStopOpenTurns(ctx, sessionID)
+}
+
+// ListStopRequestedOpen returns the session's flagged turns still open,
+// oldest first, each with whether grace has passed since its flag on the
+// database's own clock.
+func (s *TurnStore) ListStopRequestedOpen(ctx context.Context, sessionID pgtype.UUID, grace time.Duration) ([]sqlcgen.ListStopRequestedOpenTurnsRow, error) {
+	return s.q.ListStopRequestedOpenTurns(ctx, sqlcgen.ListStopRequestedOpenTurnsParams{
+		GraceSeconds: grace.Seconds(),
+		SessionID:    sessionID,
+	})
 }
