@@ -10,6 +10,32 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.12.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `StopSessionResponse`, the `202` body of the new stop route below
+  (technical plan §3.3): `sessionId`, `requestedAt` (when the stop now in
+  force was first requested -- a repeated request answers the same
+  instant), `reachedSessionIds` (the session named first, then every
+  session it started, recursively) and `openTurns` (the turns the request
+  flagged to be cancelled, across every reached session). A new `$def`
+  grades MINOR (row 32).
+
+### controlplane/testdata/routes.golden
+
+- Added: `POST /api/sessions/{sessionID}/stop` -- a person's request to
+  stop a session and every session it started (technical plan §3.3). No
+  body. `400` for a malformed id and `404` for a session that does not
+  exist, as `GET /api/sessions/{sessionID}` answers; `403` unless
+  `authz.ActionStopSession` admits the caller: admin and maintainer on any
+  session, a member on their own or joined sessions, a viewer never.
+  Answers `202 StopSessionResponse` once the request is written: turns open
+  at that instant are cancelled -- a pending one at once, a running one
+  through the sandbox's own `stop`, or once `StopGrace` (30s) has passed
+  -- and turns created later run normally. A route added, graded MINOR
+  (row 41).
+
 ## [1.11.0]
 
 ### rest/v1/dtos.schema.json

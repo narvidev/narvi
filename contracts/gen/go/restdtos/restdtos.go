@@ -13589,6 +13589,67 @@ func (j *ShadowLedgerSummary) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// 202 response body for POST /api/sessions/{sessionID}/stop (technical plan §3.3):
+// a person's request to stop a session and every session it started, accepted and
+// written as data. No request body. Accepted is not done: every turn open at the
+// request is flagged, and the session's actor cancels each through §3.3's own
+// cancel transition -- a pending one at once, a running one once the sandbox's own
+// stop, or the grace after it (StopGrace, 30s), ends it. Turns created after the
+// request run normally. Read GET /api/sessions/{sessionID}/status to see the
+// session settle. Repeating the request is harmless: it flags whatever is open
+// then and answers the same requestedAt.
+type StopSessionResponse struct {
+	// How many turns were pending, dispatched or processing across every reached
+	// session when the request was written -- the turns it flagged to be cancelled. 0
+	// when nothing was running; the request still stands, refusing new child sessions
+	// until a person resumes the session.
+	OpenTurns int `json:"openTurns" yaml:"openTurns" mapstructure:"openTurns"`
+
+	// Every session this request reached and stopped: the session named in the path
+	// first, then every session it started, recursively (children, then their
+	// children), in the order the walk reached them. A child whose creation raced the
+	// request is either listed here or was refused.
+	ReachedSessionIds []string `json:"reachedSessionIds" yaml:"reachedSessionIds" mapstructure:"reachedSessionIds"`
+
+	// When the stop now in force on this session was first requested. A repeated
+	// request, before a person resumes the session, answers the same instant; the
+	// next turn a person creates on the session clears it.
+	RequestedAt time.Time `json:"requestedAt" yaml:"requestedAt" mapstructure:"requestedAt"`
+
+	// The session named in the path.
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *StopSessionResponse) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["openTurns"]; raw != nil && !ok {
+		return fmt.Errorf("field openTurns in StopSessionResponse: required")
+	}
+	if _, ok := raw["reachedSessionIds"]; raw != nil && !ok {
+		return fmt.Errorf("field reachedSessionIds in StopSessionResponse: required")
+	}
+	if _, ok := raw["requestedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field requestedAt in StopSessionResponse: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in StopSessionResponse: required")
+	}
+	type Plain StopSessionResponse
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 0 > plain.OpenTurns {
+		return fmt.Errorf("field %s: must be >= %v", "openTurns", 0)
+	}
+	*j = StopSessionResponse(plain)
+	return nil
+}
+
 // Request body for PUT /api/repos/{owner}/{repo}/auto-approval-settings (§21.2
 // stage 1) -- the auto-approval eligibility engine's own two per-repo-tunable
 // criteria. A SEPARATE endpoint from UpdateRepoSettingsRequest's own PUT

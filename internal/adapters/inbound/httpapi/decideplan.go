@@ -374,6 +374,13 @@ func DecidePlanOnTx(
 		if err != nil {
 			return DecidePlanOutcome{}, fmt.Errorf("httpapi: create implementation turn: %w", err)
 		}
+		// Technical plan §3.3: approving a plan is a person's act that
+		// creates a turn, so it resumes a stopped session exactly as
+		// createTurnLocked does -- the session's stop request is cleared in
+		// this same transaction.
+		if _, err := sessions.WithTx(tx).ClearStopRequest(ctx, sessionRow.ID); err != nil {
+			return DecidePlanOutcome{}, fmt.Errorf("httpapi: clear session stop request: %w", err)
+		}
 		turnIDStr := createdTurn.ID.String()
 		outcome.TurnID = &turnIDStr
 	}

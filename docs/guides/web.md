@@ -289,6 +289,35 @@ refused. This is the exact same `createTurnLocked` mechanism
 not Slack-specific, it is shared by every surface this core serves,
 including this REST endpoint.
 
+## Stopping a session
+
+```json narvi-command
+{"name": "Stop a session and every session it started", "route": "POST /api/sessions/{sessionID}/stop"}
+```
+
+No body. Answers **`202 Accepted`** with `StopSessionResponse`
+(`sessionId`, `requestedAt`, `reachedSessionIds`, `openTurns`): the request
+is written, not yet done. Every turn open at that instant is cancelled — a
+queued one at once and never dispatched, a running one through the
+sandbox's own `stop`, or once `platform.Timeouts.StopGrace` (30s) has
+passed if the agent does not answer. The session ends `cancelled`; its
+sandbox is kept and idles out. Every session it started is stopped the
+same way (`reachedSessionIds`), and a new child of it is refused until you
+resume it. Poll `GET /api/sessions/{sessionID}/status` to watch it settle.
+
+A stop does not undo what already happened: a turn that completed before
+it keeps its push and pull request, and a plan awaiting approval stays
+awaiting approval. It is not an archive either — the next prompt you send
+(`POST /api/sessions/{sessionID}/turns`), or approving the session's plan,
+runs normally and resumes the session. Repeating the request is harmless.
+
+**Negatives.** A malformed id answers `400` and an unknown session `404`,
+as `GET /api/sessions/{sessionID}` does. A member may stop only a session
+they created or joined, and a viewer none (`403`); an admin or maintainer
+may stop any session. If a session the stop reached could not be written,
+the answer is `500`: what was written stands, and repeating the request
+reaches the rest.
+
 ## Plan mode
 
 ```json narvi-command

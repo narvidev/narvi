@@ -97,6 +97,18 @@ var errRolloutRefused = errors.New("outboxworker: sentinelAutoFixNotifier: repo 
 // separate copy of this handling to remember to add.
 var errRepoEntitlementDenied = errors.New("outboxworker: sentinelAutoFixNotifier: repo not entitled")
 
+// errParentStopped is spawnClaimedChildSession's own sentinel for "a
+// person stopped the review session this fix would be a child of"
+// (httpapi.CreateSessionError.ParentStopped, technical plan §3.3's stop),
+// mirroring errRolloutRefused's shape and its reason: the parent's stop is
+// cleared only by a person's next turn on it, never by a redelivery, so
+// Deliver takes the same terminal skip instead of the outbox's
+// backoff/retry path. The claim transaction rolls back with the refusal,
+// so no fix is recorded and every addressed finding stays 'open'. The fix
+// branch createFixBranch already created before the claim stays on the
+// remote, unused -- the same as on the rollout refusal path.
+var errParentStopped = errors.New("outboxworker: sentinelAutoFixNotifier: parent session was stopped")
+
 // sentinelFixBranchName derives the distinct upstream branch name Deliver
 // creates (via SourceControl.CreateBranch) and has the fix child session
 // check out and push to -- NEVER the origin PR's own head branch. Keyed
@@ -472,6 +484,13 @@ func (n *sentinelAutoFixNotifier) Deliver(ctx context.Context, notification port
 					"repo", payload.RepoFullName, "origin_pr_number", payload.OriginPRNumber)
 				return nil
 			}
+			if errors.Is(err, errParentStopped) {
+				// (§3.3's stop): terminal-skip, mirroring the two branches
+				// above -- see errParentStopped's own doc comment.
+				platform.Logger(ctx).Warn("outboxworker: sentinelAutoFixNotifier: fix child session refused: its parent session was stopped; skipping, never retried",
+					"repo", payload.RepoFullName, "origin_pr_number", payload.OriginPRNumber)
+				return nil
+			}
 			return err
 		}
 		fixChildSessionID = spawned
@@ -665,6 +684,11 @@ func (n *sentinelAutoFixNotifier) spawnClaimedChildSession(ctx context.Context, 
 			// the identical defensive-symmetry reason that resolution
 			// itself is.
 			return pgtype.UUID{}, fmt.Errorf("outboxworker: sentinelAutoFixNotifier: spawn child session: %w", errRepoEntitlementDenied)
+		}
+		if cerr.ParentStopped {
+			// (§3.3's stop): a PERMANENT refusal until a person resumes
+			// the parent -- see errParentStopped's own doc comment.
+			return pgtype.UUID{}, fmt.Errorf("outboxworker: sentinelAutoFixNotifier: spawn child session: %w", errParentStopped)
 		}
 		return pgtype.UUID{}, fmt.Errorf("outboxworker: sentinelAutoFixNotifier: spawn child session: %s", cerr.Message)
 	}

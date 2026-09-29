@@ -118,6 +118,7 @@ POST /api/sessions/{sessionID}/release-manifest/unblock
 POST /api/sessions/{sessionID}/review/findings/{identityHash}/apply-suggestion
 POST /api/sessions/{sessionID}/review/findings/{identityHash}/rebut
 POST /api/sessions/{sessionID}/review/retrigger
+POST /api/sessions/{sessionID}/stop
 POST /api/sessions/{sessionID}/turns
 POST /api/sessions/{sessionID}/uploads
 POST /api/sessions/{sessionID}/uploads/{uploadID}/complete

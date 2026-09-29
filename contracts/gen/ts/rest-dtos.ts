@@ -508,6 +508,30 @@ export interface PlanActionResponse {
   turnId: string | null;
 }
 /**
+ * 202 response body for POST /api/sessions/{sessionID}/stop (technical plan §3.3): a person's request to stop a session and every session it started, accepted and written as data. No request body. Accepted is not done: every turn open at the request is flagged, and the session's actor cancels each through §3.3's own cancel transition -- a pending one at once, a running one once the sandbox's own stop, or the grace after it (StopGrace, 30s), ends it. Turns created after the request run normally. Read GET /api/sessions/{sessionID}/status to see the session settle. Repeating the request is harmless: it flags whatever is open then and answers the same requestedAt.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "StopSessionResponse".
+ */
+export interface StopSessionResponse {
+  /**
+   * The session named in the path.
+   */
+  sessionId: string;
+  /**
+   * When the stop now in force on this session was first requested. A repeated request, before a person resumes the session, answers the same instant; the next turn a person creates on the session clears it.
+   */
+  requestedAt: string;
+  /**
+   * Every session this request reached and stopped: the session named in the path first, then every session it started, recursively (children, then their children), in the order the walk reached them. A child whose creation raced the request is either listed here or was refused.
+   */
+  reachedSessionIds: string[];
+  /**
+   * How many turns were pending, dispatched or processing across every reached session when the request was written -- the turns it flagged to be cancelled. 0 when nothing was running; the request still stands, refusing new child sessions until a person resumes the session.
+   */
+  openTurns: number;
+}
+/**
  * Request body for POST /sessions/:id/review/verdict ('server-side verdict', §8.2/§5.2) -- the verdict-posting tool's own typed-fields call, validated server-side (internal/domain/reviewpost.ValidateVerdictInput). Mirrors internal/domain/review.Verdict's own fields exactly, EXCEPT Shippable itself, which this endpoint always recomputes server-side (review.ComputeShippable) and NEVER accepts from a caller -- see that package's own Verdict.Shippable doc comment (verdict.go) for why. factCheck/factCheckKilled and counterReview are §26.4's own additions (§26.4/§26.6, 'review deep path: adversarial counter-review + readout measurement') -- see those two properties' own doc comments below.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
