@@ -1,0 +1,26 @@
+-- Step 183 (§43.1, "plan, revision and stop over MCP"): session_spawn_source
+-- gains 'mcp', the source a session created over MCP records. The server
+-- sets it from the MCP grant the /mcp authentication attaches to the
+-- request context, never from the request body and never from the
+-- principal's credential type (docs/DECISIONS.md). This migration only
+-- makes the value exist: nothing writes it yet.
+--
+-- This is its OWN migration, deliberately, in the shape of
+-- migrations/000140_identities_oidc_provider.up.sql: Postgres forbids using a
+-- value added via ALTER TYPE ... ADD VALUE inside the same transaction that
+-- added it, and golang-migrate sends a file as one batch, which Postgres
+-- runs as one implicit transaction. No other statement in this file, or in
+-- any later migration landing in the same PR, references the literal 'mcp'.
+--
+-- IRREVERSIBLE once used: Postgres has no ALTER TYPE ... DROP VALUE. The
+-- down migration recreates the type without 'mcp', and refuses while any
+-- sessions row holds it. Rolling the binary back is always safe (every
+-- binary since contracts 1.9.2 tolerates a spawn_source it does not
+-- recognise); rolling the schema back is possible only before the first
+-- 'mcp' session exists.
+--
+-- DEPLOY ORDER: this migration and the binary that understands 'mcp' ship
+-- everywhere BEFORE any code that writes the value. An older replica
+-- reading an 'mcp' session logs an unrecognised-source WARN and skips its
+-- notification: harmless, but the gap row 183 exists to close.
+ALTER TYPE session_spawn_source ADD VALUE 'mcp';
