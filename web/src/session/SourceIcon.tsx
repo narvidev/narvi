@@ -63,7 +63,12 @@ function GithubOctocatIcon() {
 
 /** McpPlugIcon is the 'mcp' source's glyph: a plug (two prongs, a rounded body, a cord), for a session an MCP client started. */
 function McpPlugIcon() {
-  return <WebGlobeIcon />
+  return (
+    <svg width="11" height="11" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+      <path d="M5.2 1.6v2.6M8.8 1.6v2.6M7 9.6v2.8" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+      <path d="M3.4 4.2h7.2v1.8a3.6 3.6 0 0 1-7.2 0V4.2Z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" />
+    </svg>
+  )
 }
 
 /** OtherSourceIcon is the neutral glyph for a source this bundle does not know: a dashed ring, claiming no product. */
