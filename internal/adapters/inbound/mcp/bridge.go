@@ -1,13 +1,18 @@
 package mcp
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 
 	"github.com/go-chi/chi/v5"
+
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // twin is one REST route this package's tools invoke in-process --
@@ -15,8 +20,9 @@ import (
 // registers for the browser-facing route of the same name, never a
 // second implementation (doc.go's own "one authorization path" section).
 type twin struct {
-	// method is the twin's own HTTP method ("GET" for every tool so far;
-	// later tools may need "POST").
+	// method is the twin's own HTTP method: GET for every read tool, POST
+	// for narvi_create_session. TestWriteTwinsRequireWriteScope ties it to
+	// the tool's scope.
 	method string
 	// pathTemplate is the twin's own chi route pattern, e.g.
 	// "/api/sessions/{sessionID}" -- also what
@@ -26,6 +32,25 @@ type twin struct {
 	// handler is the real, already-constructed httpapi handler --
 	// httpapi.GetModelCatalog(), httpapi.ListSessions(sessionStore), etc.
 	handler http.HandlerFunc
+}
+
+// twinCall is what one tool call hands its twin (technical plan §43.7):
+// the chi URL params, the query string, and the request body. It is all a
+// tool's BuildRequest can decide -- never the method or the path, which are
+// the twin's own, and never a header.
+type twinCall struct {
+	// URLParams populates chi's own route context, the way the real router
+	// would for a path like "/api/sessions/{sessionID}".
+	URLParams map[string]string
+	// Query becomes the request's own ?query=string.
+	Query url.Values
+	// Body is the request DTO the twin decodes -- a contracts/gen/go/
+	// restdtos request value, built by the tool's BuildRequest from its
+	// validated arguments -- or nil for no body. callTwin marshals it
+	// itself, so only that DTO's own fields can ever reach the twin:
+	// never the raw arguments the client sent, which the tool's input
+	// schema governs, not the twin's.
+	Body any
 }
 
 // callTwin invokes t.handler in-process, through an httptest recorder,
@@ -68,15 +93,25 @@ type twin struct {
 // §43.16); the twin authorizes from the context principal, never from a
 // credential, and TestBridge_NoAuthorizationHeaderReachesTwin pins that
 // the request it receives carries no header at all.
-func callTwin(ctx context.Context, t twin, urlParams map[string]string, query url.Values) (status int, body []byte) {
+//
+// A body (call.Body) is the JSON encoding of that DTO, with its length set
+// and still no header -- not even Content-Type: no twin reads one (the
+// create handler decodes its body without checking it), so there is nothing
+// to add and the no-header rule stays whole
+// (TestBridge_PostTwinGetsTheDTOBodyAndNoHeader). A GET twin handed a body
+// is this package's own defect -- a read tool's BuildRequest built one --
+// and is refused with a 500, which mapOutcome answers -32603, without
+// invoking the twin (TestBridge_GetTwinWithBodyIsADefect); so is a body
+// that cannot be encoded.
+func callTwin(ctx context.Context, t twin, call twinCall) (status int, body []byte) {
 	path := t.pathTemplate
-	for name, value := range urlParams {
+	for name, value := range call.URLParams {
 		path = replaceURLParam(path, name, value)
 	}
 
 	u := &url.URL{Path: path}
-	if len(query) > 0 {
-		u.RawQuery = query.Encode()
+	if len(call.Query) > 0 {
+		u.RawQuery = call.Query.Encode()
 	}
 
 	req := &http.Request{
@@ -89,8 +124,23 @@ func callTwin(ctx context.Context, t twin, urlParams map[string]string, query ur
 		Body:       http.NoBody,
 	}
 
+	if call.Body != nil {
+		if t.method == http.MethodGet {
+			platform.Logger(ctx).Error("mcp: a GET twin was handed a request body (a read tool's BuildRequest built one)",
+				"path", t.pathTemplate)
+			return http.StatusInternalServerError, nil
+		}
+		encoded, err := json.Marshal(call.Body)
+		if err != nil {
+			platform.Logger(ctx).Error("mcp: encode twin request body failed", "path", t.pathTemplate, "error", err)
+			return http.StatusInternalServerError, nil
+		}
+		req.Body = io.NopCloser(bytes.NewReader(encoded))
+		req.ContentLength = int64(len(encoded))
+	}
+
 	rctx := chi.NewRouteContext()
-	for name, value := range urlParams {
+	for name, value := range call.URLParams {
 		// The RAW, unescaped value -- chi.URLParam is what every real
 		// handler actually reads (e.g. httpapi's own parseSessionID),
 		// never the literal path string above (that string exists

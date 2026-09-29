@@ -185,10 +185,16 @@ func newOAuthRouterRig(t *testing.T, pool *pgxpool.Pool) *oauthRouterRig {
 
 // liftEndpointBrakes raises the token and authorization endpoints' bursts
 // far past anything one test makes (newOAuthRouterRig's own doc comment
-// says why), leaving every other timeout as shipped.
+// says why), and the per-grant /mcp and session-start brakes with them
+// (§43.6/§43.8): a test's many calls under one grant would otherwise meet
+// them whenever they ran faster than the brakes refill. Every other timeout
+// stays as shipped; the brakes themselves are proven on routers built with
+// the shipped values.
 func liftEndpointBrakes(to *platform.Timeouts) {
 	to.MCPTokenEndpointRateBurst = 1_000_000
 	to.MCPAuthorizeRateBurst = 1_000_000
+	to.MCPCallRateBurst = 1_000_000
+	to.MCPCreateSessionRateBurst = 1_000_000
 }
 
 // newOAuthRouterRigWith is newOAuthRouterRig with more environment set for
@@ -721,9 +727,10 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 
 	// The exit criterion end to end (§43.19): the official SDK client
 	// discovers everything from one live 401, the member approves on the
-	// consent page, and the resulting token lists exactly the seven tools
-	// and calls one with the same bytes the REST twin gives the member's
-	// own cookie. The SDK's own RFC 9207 issuer check passes along the way.
+	// consent page, and the resulting token lists exactly the eight tools --
+	// the member kept mcp:write, so narvi_create_session among them -- and
+	// calls one with the same bytes the REST twin gives the member's own
+	// cookie. The SDK's own RFC 9207 issuer check passes along the way.
 	t.Run("EndToEnd_SDKClient", func(t *testing.T) {
 		ctx := oauthTestCtx(t)
 		flow := rig.connectSDKClient(ctx, t, nil)
@@ -745,8 +752,8 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if got := challenges[0].Params["resource_metadata"]; got != rig.server.URL+"/.well-known/oauth-protected-resource/mcp" {
 			t.Errorf("resource_metadata = %q", got)
 		}
-		if got := challenges[0].Params["scope"]; got != "mcp:read" {
-			t.Errorf("challenge scope = %q, want mcp:read", got)
+		if got := challenges[0].Params["scope"]; got != "mcp:read mcp:write" {
+			t.Errorf("challenge scope = %q, want every advertised scope, mcp:read mcp:write", got)
 		}
 		if _, ok := challenges[0].Params["error"]; ok {
 			t.Errorf("first challenge carries an error param, but no credential had been sent: %v", challenges[0].Params)
@@ -755,7 +762,9 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 			t.Fatalf("consent flow ran %d times, want 1", n)
 		}
 
-		want := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
+		// The member kept every offered scope, mcp:write included, so the
+		// write tool is listed beside the reads (§43.17).
+		want := []string{"narvi_create_session", "narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
 		if got := toolNames(ctx, t, flow.session); strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Fatalf("ListTools = %v, want %v", got, want)
 		}
@@ -788,8 +797,8 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if err := rig.pool.QueryRow(ctx, `SELECT count(*) OVER (), scopes, resource FROM mcp_oauth_grants WHERE user_id = $1`, flow.member.ID).Scan(&grants, &scopes, &resource); err != nil {
 			t.Fatalf("read grant: %v", err)
 		}
-		if grants != 1 || strings.Join(scopes, ",") != "mcp:read" || resource != rig.server.URL+"/mcp" {
-			t.Fatalf("grants = %d scopes %v resource %q, want one {mcp:read} grant for %s/mcp", grants, scopes, resource, rig.server.URL)
+		if grants != 1 || strings.Join(scopes, ",") != "mcp:read,mcp:write" || resource != rig.server.URL+"/mcp" {
+			t.Fatalf("grants = %d scopes %v resource %q, want one {mcp:read mcp:write} grant for %s/mcp", grants, scopes, resource, rig.server.URL)
 		}
 		var granted int
 		if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM audit_log WHERE action = 'mcp_authorization.granted' AND actor_user_id = $1`, flow.member.ID).Scan(&granted); err != nil || granted != 1 {
@@ -1188,6 +1197,37 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		sdkSessionResultScopeless(t, rig)
 	})
 
+	// Row 183's create over MCP (technical plan §43.8), on routers of their
+	// own over a pool of their own: every session a create starts spawns a
+	// session actor holding a connection (mcp_createsession_integration_
+	// test.go's top doc comment). createRig lifts the brakes like rig; the
+	// read-only and scope-less grants and the viewer start nothing, and run
+	// there too. createBraked keeps the shipped brakes but for the /mcp
+	// call brake's refill, stretched to an hour (brakeTestTimeouts).
+	createRig := createRouterRig(t, connStr, liftEndpointBrakes)
+	t.Run("CreateSession_SDKClient", func(t *testing.T) {
+		sdkCreateSession(t, createRig)
+	})
+	t.Run("CreateSession_SameKeyRetryCreatesOne_SDKClient", func(t *testing.T) {
+		sdkCreateSessionSameKeyRetry(t, createRig)
+	})
+	t.Run("WriteTools_ReadGrantSeesNoneAndCannotCall_SDKClient", func(t *testing.T) {
+		sdkWriteToolsReadGrant(t, createRig)
+	})
+	t.Run("WriteTools_ScopelessGrantSeesNone", func(t *testing.T) {
+		sdkWriteToolsScopeless(t, createRig)
+	})
+	t.Run("CreateSession_ViewerRefusedLikeREST_SDKClient", func(t *testing.T) {
+		sdkCreateSessionViewer(t, createRig)
+	})
+	createBraked := createRouterRig(t, connStr, brakeTestTimeouts)
+	t.Run("RateLimit_MCPPerGrant429", func(t *testing.T) {
+		rateLimitMCPPerGrant(t, createBraked)
+	})
+	t.Run("RateLimit_CreateSessionPerGrant", func(t *testing.T) {
+		rateLimitCreateSessionPerGrant(t, createBraked)
+	})
+
 	// Row 182's piece (b), the bounded wait (§43.20), and the row's own
 	// exit: on a router of its own whose wait polls every 100 ms
 	// (waitTestTimeouts), and -- for the long call -- on rig, whose wait is
@@ -1318,7 +1358,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SDK Connect with a metadata document: %v", err)
 		}
-		want := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
+		want := []string{"narvi_create_session", "narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
 		if got := toolNames(ctx, t, flow.session); strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Fatalf("ListTools = %v, want %v", got, want)
 		}
@@ -1370,8 +1410,9 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SDK Connect with dynamic registration: %v", err)
 		}
-		if got := toolNames(ctx, t, flow.session); len(got) != 7 {
-			t.Fatalf("ListTools = %v, want the seven tools", got)
+		// Every offered scope kept, mcp:write included: the eight tools.
+		if got := toolNames(ctx, t, flow.session); len(got) != 8 {
+			t.Fatalf("ListTools = %v, want the eight tools", got)
 		}
 		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
 			t.Fatalf("CallTool narvi_list_models: res %+v err %v", res, err)

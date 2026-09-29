@@ -57,24 +57,38 @@ type Twins struct {
 	// and each verdict's freshness or absence (technical plan §43.20, row
 	// 182's result).
 	GetSessionResult http.HandlerFunc
+	// CreateSession is httpapi.CreateSession(...) -- narvi_create_session's
+	// own twin, POST /api/sessions (technical plan §43.8): the same handler,
+	// so the same authorization, validation, entitlement and rollout gates,
+	// audit row and dispatch as a browser's create.
+	CreateSession http.HandlerFunc
 }
 
 // toolSpec is the ONLY place a tool is declared: its wire name, the
 // scope a grant must satisfy for the tool to exist at all for a request
 // (technical plan §43.17), the one-line fragment instructionsFor names it
 // with, its REST twin, the two contracts $def names its schemas come from
-// (verbatim for input, bundled for output -- schemas.go), and a
+// (verbatim for input, bundled for output -- schemas.go), its own
+// annotations (§43.8), whether it consults the create brake, and a
 // BuildRequest closure translating the raw `arguments` object a client
-// sent into the twin's own URL params / query string.
+// sent into the twin's own URL params, query string and body (twinCall).
 type toolSpec struct {
-	Name         string
-	Description  string
-	Scope        mcpscope.Scope
-	Instruction  string
-	Twin         twin
-	InputDef     string
-	OutputDef    string
-	BuildRequest func(arguments json.RawMessage) (urlParams map[string]string, query url.Values, err error)
+	Name        string
+	Description string
+	Scope       mcpscope.Scope
+	Instruction string
+	Twin        twin
+	InputDef    string
+	OutputDef   string
+	// Annotations are this tool's own hints: readOnlyAnnotations for every
+	// read, a write's own for a write (TestToolAnnotations_MatchTwinMethod
+	// ties them to the twin's method).
+	Annotations *sdkmcp.ToolAnnotations
+	// CreateBrake is true for a tool that starts a session: its call takes
+	// one from the grant's bucket in Config.CreateBrake after its arguments
+	// validate and before its twin runs (technical plan §43.8).
+	CreateBrake  bool
+	BuildRequest func(arguments json.RawMessage) (twinCall, error)
 }
 
 // countWords spells small tool counts the way the instructions paragraph
@@ -85,40 +99,75 @@ var countWords = []string{"no", "one", "two", "three", "four", "five", "six", "s
 // handshake's own "instructions" field (technical plan §43.5), composed
 // per request from ONLY the tools that request can see (§43.17): a fixed
 // paragraph naming every tool would describe the deployment to a client
-// that may not use any of it. With no visible tool it names none.
+// that may not use any of it. With no visible tool it names none. It says
+// the tools are read-only only when no write tool is visible; otherwise it
+// names the reads and the writes apart, and says what a write can do.
 func instructionsFor(visible []toolSpec) string {
 	if len(visible) == 0 {
 		return "This authorization gives access to no tools on this server. The user can connect this client again and approve more access."
 	}
-	fragments := make([]string, len(visible))
-	for i, spec := range visible {
-		fragments[i] = spec.Instruction
+	var reads, writes []string
+	for _, spec := range visible {
+		if spec.Annotations != nil && spec.Annotations.ReadOnlyHint {
+			reads = append(reads, spec.Instruction)
+		} else {
+			writes = append(writes, spec.Instruction)
+		}
 	}
-	var list string
+	if len(writes) == 0 {
+		return "This server exposes " + countWord(len(visible)) + " READ-ONLY " + plural(len(visible), "tool", "tools") + " over this deployment's session data: " + joinList(reads) + ". None of these tools writes anything."
+	}
+	text := "This server exposes " + countWord(len(visible)) + " " + plural(len(visible), "tool", "tools") + " over this deployment's session data."
+	if len(reads) > 0 {
+		text += " " + capitalize(countWord(len(reads))) + " only " + plural(len(reads), "reads and changes", "read and change") + " nothing: " + joinList(reads) + "."
+	}
+	text += " " + capitalize(countWord(len(writes))) + " " + plural(len(writes), "acts", "act") + " as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " + joinList(writes) + "."
+	return text
+}
+
+// countWord spells n the way the instructions paragraph reads it.
+func countWord(n int) string {
+	if n >= 0 && n < len(countWords) {
+		return countWords[n]
+	}
+	return strconv.Itoa(n)
+}
+
+// plural picks one or many by n.
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
+}
+
+// capitalize upper-cases a count word's first letter, to open a sentence.
+func capitalize(word string) string {
+	if word == "" {
+		return word
+	}
+	return strings.ToUpper(word[:1]) + word[1:]
+}
+
+// joinList joins fragments as prose: "a", "a and b", "a, b, and c".
+func joinList(fragments []string) string {
 	switch len(fragments) {
+	case 0:
+		return ""
 	case 1:
-		list = fragments[0]
+		return fragments[0]
 	case 2:
-		list = fragments[0] + " and " + fragments[1]
+		return fragments[0] + " and " + fragments[1]
 	default:
-		list = strings.Join(fragments[:len(fragments)-1], ", ") + ", and " + fragments[len(fragments)-1]
+		return strings.Join(fragments[:len(fragments)-1], ", ") + ", and " + fragments[len(fragments)-1]
 	}
-	count := strconv.Itoa(len(visible))
-	if len(visible) < len(countWords) {
-		count = countWords[len(visible)]
-	}
-	noun := "tools"
-	if len(visible) == 1 {
-		noun = "tool"
-	}
-	return "This server exposes " + count + " READ-ONLY " + noun + " over this deployment's session data: " + list + ". None of these tools writes anything."
 }
 
 // noArguments is the BuildRequest closure every argument-less tool
-// shares (only narvi_list_models today): no urlParams, no query, no
-// possible error -- the twin is invoked exactly once, unconditionally.
-func noArguments(json.RawMessage) (map[string]string, url.Values, error) {
-	return nil, nil, nil
+// shares (only narvi_list_models today): no urlParams, no query, no body,
+// no possible error -- the twin is invoked exactly once, unconditionally.
+func noArguments(json.RawMessage) (twinCall, error) {
+	return twinCall{}, nil
 }
 
 // invalidArgumentError marks a BuildRequest failure caused by an argument
@@ -204,11 +253,11 @@ type listSessionsArgs struct {
 // corresponding field unset, so the twin's OWN defaulting (filter
 // defaults "mine"; limit defaults listSessionsDefaultLimit) runs
 // completely unchanged.
-func buildListSessionsRequest(arguments json.RawMessage) (map[string]string, url.Values, error) {
+func buildListSessionsRequest(arguments json.RawMessage) (twinCall, error) {
 	var in listSessionsArgs
 	if len(arguments) > 0 {
 		if err := json.Unmarshal(arguments, &in); err != nil {
-			return nil, nil, err
+			return twinCall{}, err
 		}
 	}
 	query := url.Values{}
@@ -218,11 +267,11 @@ func buildListSessionsRequest(arguments json.RawMessage) (map[string]string, url
 	if in.Limit != nil {
 		limit, ok := intFromJSONNumber(*in.Limit)
 		if !ok {
-			return nil, nil, &invalidArgumentError{msg: fmt.Sprintf("limit %s is not representable as a bounded whole number", in.Limit.String())}
+			return twinCall{}, &invalidArgumentError{msg: fmt.Sprintf("limit %s is not representable as a bounded whole number", in.Limit.String())}
 		}
 		query.Set("limit", strconv.Itoa(limit))
 	}
-	return nil, query, nil
+	return twinCall{Query: query}, nil
 }
 
 // buildGetSessionRequest unmarshals arguments as a restdtos.
@@ -231,12 +280,12 @@ func buildListSessionsRequest(arguments json.RawMessage) (map[string]string, url
 // URL param name, "sessionID" -- GET /api/sessions/{sessionID}'s own
 // path parameter name, unrelated to the wire argument's own camelCase
 // "sessionId" spelling.
-func buildGetSessionRequest(arguments json.RawMessage) (map[string]string, url.Values, error) {
+func buildGetSessionRequest(arguments json.RawMessage) (twinCall, error) {
 	var in restdtos.GetSessionToolRequest
 	if err := json.Unmarshal(arguments, &in); err != nil {
-		return nil, nil, err
+		return twinCall{}, err
 	}
-	return map[string]string{"sessionID": in.SessionId}, nil, nil
+	return twinCall{URLParams: map[string]string{"sessionID": in.SessionId}}, nil
 }
 
 // buildGetSessionStatusRequest is buildGetSessionRequest for
@@ -244,12 +293,12 @@ func buildGetSessionRequest(arguments json.RawMessage) (map[string]string, url.V
 // generated UnmarshalJSON enforces "sessionId" is present) mapped onto the
 // twin's own chi URL param, "sessionID". No query: the status twin reads
 // none.
-func buildGetSessionStatusRequest(arguments json.RawMessage) (map[string]string, url.Values, error) {
+func buildGetSessionStatusRequest(arguments json.RawMessage) (twinCall, error) {
 	var in restdtos.GetSessionStatusToolRequest
 	if err := json.Unmarshal(arguments, &in); err != nil {
-		return nil, nil, err
+		return twinCall{}, err
 	}
-	return map[string]string{"sessionID": in.SessionId}, nil, nil
+	return twinCall{URLParams: map[string]string{"sessionID": in.SessionId}}, nil
 }
 
 // buildGetSessionResultRequest is buildGetSessionStatusRequest for
@@ -257,12 +306,12 @@ func buildGetSessionStatusRequest(arguments json.RawMessage) (map[string]string,
 // generated UnmarshalJSON enforces "sessionId" is present) mapped onto the
 // twin's own chi URL param, "sessionID". No query: the result twin reads
 // none.
-func buildGetSessionResultRequest(arguments json.RawMessage) (map[string]string, url.Values, error) {
+func buildGetSessionResultRequest(arguments json.RawMessage) (twinCall, error) {
 	var in restdtos.GetSessionResultToolRequest
 	if err := json.Unmarshal(arguments, &in); err != nil {
-		return nil, nil, err
+		return twinCall{}, err
 	}
-	return map[string]string{"sessionID": in.SessionId}, nil, nil
+	return twinCall{URLParams: map[string]string{"sessionID": in.SessionId}}, nil
 }
 
 // waitArgs is buildWaitForSessionRequest's own decode target -- not
@@ -288,11 +337,11 @@ var longestWait = strconv.FormatInt(math.MaxInt64, 10)
 // held it to a whole number of at least one), or longestWait when omitted
 // or past int64. Never an argument error: a large wait is clamped, not
 // refused.
-func buildWaitForSessionRequest(arguments json.RawMessage) (map[string]string, url.Values, error) {
+func buildWaitForSessionRequest(arguments json.RawMessage) (twinCall, error) {
 	var in waitArgs
 	if len(arguments) > 0 {
 		if err := json.Unmarshal(arguments, &in); err != nil {
-			return nil, nil, err
+			return twinCall{}, err
 		}
 	}
 	waitSeconds := longestWait
@@ -301,7 +350,7 @@ func buildWaitForSessionRequest(arguments json.RawMessage) (map[string]string, u
 			waitSeconds = strconv.Itoa(n)
 		}
 	}
-	return map[string]string{"sessionID": in.SessionID}, url.Values{"waitSeconds": {waitSeconds}}, nil
+	return twinCall{URLParams: map[string]string{"sessionID": in.SessionID}, Query: url.Values{"waitSeconds": {waitSeconds}}}, nil
 }
 
 // transcriptArgs is buildGetSessionTranscriptRequest's own decode target
@@ -323,11 +372,11 @@ type transcriptArgs struct {
 // page, clamped at 500) run unchanged otherwise. cursor is passed through
 // verbatim -- the twin itself parses it and answers 400 for a value that
 // names no event id.
-func buildGetSessionTranscriptRequest(arguments json.RawMessage) (map[string]string, url.Values, error) {
+func buildGetSessionTranscriptRequest(arguments json.RawMessage) (twinCall, error) {
 	var in transcriptArgs
 	if len(arguments) > 0 {
 		if err := json.Unmarshal(arguments, &in); err != nil {
-			return nil, nil, err
+			return twinCall{}, err
 		}
 	}
 	query := url.Values{}
@@ -337,11 +386,52 @@ func buildGetSessionTranscriptRequest(arguments json.RawMessage) (map[string]str
 	if in.Limit != nil {
 		limit, ok := intFromJSONNumber(*in.Limit)
 		if !ok {
-			return nil, nil, &invalidArgumentError{msg: fmt.Sprintf("limit %s is not representable as a bounded whole number", in.Limit.String())}
+			return twinCall{}, &invalidArgumentError{msg: fmt.Sprintf("limit %s is not representable as a bounded whole number", in.Limit.String())}
 		}
 		query.Set("limit", strconv.Itoa(limit))
 	}
-	return map[string]string{"sessionID": in.SessionID}, query, nil
+	return twinCall{URLParams: map[string]string{"sessionID": in.SessionID}, Query: query}, nil
+}
+
+// buildCreateSessionRequest maps narvi_create_session's arguments onto the
+// body of POST /api/sessions (technical plan §43.8): a
+// restdtos.CreateSessionRequest built field by field from the validated
+// restdtos.CreateSessionToolRequest, which callTwin marshals -- so only
+// that DTO's own fields can reach the twin, never an argument the client
+// added. SpawnSource is web: it is the one value that route accepts, not a
+// statement of where the call came from -- the route itself records mcp,
+// from the grant on the context. Every field the tool does not offer is
+// left at the DTO's own zero value, which the route reads as "not set", as
+// a browser that never sends it; the required-nullable ones (title,
+// prompt, modelId, effort) are null when omitted, and each repo's branch
+// is null (the repository's default branch) when omitted.
+func buildCreateSessionRequest(arguments json.RawMessage) (twinCall, error) {
+	var in restdtos.CreateSessionToolRequest
+	if err := json.Unmarshal(arguments, &in); err != nil {
+		return twinCall{}, err
+	}
+	repos := make([]restdtos.CreateSessionRequestReposElem, len(in.Repos))
+	for i, repo := range in.Repos {
+		repos[i] = restdtos.CreateSessionRequestReposElem{
+			Name:   repo.Name,
+			Url:    repo.Url,
+			Branch: restdtos.CreateSessionRequestReposElemBranch(repo.Branch),
+		}
+	}
+	prompt := in.Prompt
+	key := in.IdempotencyKey
+	return twinCall{Body: restdtos.CreateSessionRequest{
+		SpawnSource:    restdtos.CreateSessionRequestSpawnSourceWeb,
+		Title:          restdtos.CreateSessionRequestTitle(in.Title),
+		Prompt:         restdtos.CreateSessionRequestPrompt(&prompt),
+		Repos:          repos,
+		ModelId:        restdtos.CreateSessionRequestModelId(in.ModelId),
+		Effort:         restdtos.CreateSessionRequestEffort(in.Effort),
+		PlanMode:       in.PlanMode,
+		BuildModelId:   restdtos.CreateSessionRequestBuildModelId(in.BuildModelId),
+		BuildEffort:    restdtos.CreateSessionRequestBuildEffort(in.BuildEffort),
+		IdempotencyKey: &key,
+	}}, nil
 }
 
 // toolSpecs is the tool table itself -- registerTools below and
@@ -358,6 +448,7 @@ func toolSpecs(twins Twins) []toolSpec {
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/models", handler: twins.ListModels},
 			InputDef:     "ListModelsToolRequest",
 			OutputDef:    "ModelCatalog",
+			Annotations:  readOnlyAnnotations,
 			BuildRequest: noArguments,
 		},
 		{
@@ -368,6 +459,7 @@ func toolSpecs(twins Twins) []toolSpec {
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions", handler: twins.ListSessions},
 			InputDef:     "ListSessionsToolRequest",
 			OutputDef:    "ListSessionsResponse",
+			Annotations:  readOnlyAnnotations,
 			BuildRequest: buildListSessionsRequest,
 		},
 		{
@@ -378,6 +470,7 @@ func toolSpecs(twins Twins) []toolSpec {
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}", handler: twins.GetSession},
 			InputDef:     "GetSessionToolRequest",
 			OutputDef:    "Session",
+			Annotations:  readOnlyAnnotations,
 			BuildRequest: buildGetSessionRequest,
 		},
 		{
@@ -388,6 +481,7 @@ func toolSpecs(twins Twins) []toolSpec {
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}/status", handler: twins.GetSessionStatus},
 			InputDef:     "GetSessionStatusToolRequest",
 			OutputDef:    "SessionActivity",
+			Annotations:  readOnlyAnnotations,
 			BuildRequest: buildGetSessionStatusRequest,
 		},
 		{
@@ -398,6 +492,7 @@ func toolSpecs(twins Twins) []toolSpec {
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}/status", handler: twins.GetSessionStatus},
 			InputDef:     "WaitForSessionToolRequest",
 			OutputDef:    "SessionActivity",
+			Annotations:  readOnlyAnnotations,
 			BuildRequest: buildWaitForSessionRequest,
 		},
 		{
@@ -408,6 +503,7 @@ func toolSpecs(twins Twins) []toolSpec {
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}/result", handler: twins.GetSessionResult},
 			InputDef:     "GetSessionResultToolRequest",
 			OutputDef:    "SessionOutcome",
+			Annotations:  readOnlyAnnotations,
 			BuildRequest: buildGetSessionResultRequest,
 		},
 		{
@@ -418,19 +514,43 @@ func toolSpecs(twins Twins) []toolSpec {
 			Twin:         twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}/events", handler: twins.ListEvents},
 			InputDef:     "GetSessionTranscriptToolRequest",
 			OutputDef:    "EventsResponse",
+			Annotations:  readOnlyAnnotations,
 			BuildRequest: buildGetSessionTranscriptRequest,
+		},
+		{
+			Name:         "narvi_create_session",
+			Description:  "Start a new session as the user who approved this client -- the same as POST /api/sessions, with the same checks: that user's own role (a viewer may not start one), and every repository must be one this deployment knows. The session clones the repositories and runs a first turn with prompt at once: this runs code in those repositories and spends on models. With planMode true, the first turn writes a plan and nothing is implemented until a person approves it. idempotencyKey is required: a new UUID for each session you mean to start, and the same one only to retry this call -- a retry with the same key and the same arguments returns the session the first call started and starts nothing; the same key with different arguments is refused. Returns the Session, whose spawnSource is mcp; follow it with narvi_wait_for_session or narvi_get_session_status. One authorization may start 5 sessions at once, then one a minute (as shipped); past that the call is refused and says how long to wait.",
+			Scope:        mcpscope.Write,
+			Instruction:  "narvi_create_session (start a session as that user on repositories this deployment knows, with a first prompt; a new idempotencyKey for each session, the same one only to retry)",
+			Twin:         twin{method: http.MethodPost, pathTemplate: "/api/sessions", handler: twins.CreateSession},
+			InputDef:     "CreateSessionToolRequest",
+			OutputDef:    "Session",
+			Annotations:  createSessionAnnotations,
+			CreateBrake:  true,
+			BuildRequest: buildCreateSessionRequest,
 		},
 	}
 }
 
-// readOnlyAnnotations is shared by every tool in the table (technical plan
-// §43.8): every one is a plain read, never destructive, always
-// idempotent, and never reaches outside this deployment ("open world").
+// readOnlyAnnotations is shared by every read tool in the table
+// (technical plan §43.8): a plain read, never destructive, always
+// idempotent, and never reaching outside this deployment ("open world").
 var readOnlyAnnotations = &sdkmcp.ToolAnnotations{
 	ReadOnlyHint:    true,
 	DestructiveHint: boolPtr(false),
 	IdempotentHint:  true,
 	OpenWorldHint:   boolPtr(false),
+}
+
+// createSessionAnnotations are narvi_create_session's (technical plan
+// §43.8): it writes, but only adds a session, never destroys one; a retry
+// with the same idempotencyKey starts nothing more; and the run it starts
+// reads from and pushes to the code host, outside this deployment.
+var createSessionAnnotations = &sdkmcp.ToolAnnotations{
+	ReadOnlyHint:    false,
+	DestructiveHint: boolPtr(false),
+	IdempotentHint:  true,
+	OpenWorldHint:   boolPtr(true),
 }
 
 func boolPtr(b bool) *bool { return &b }
@@ -473,7 +593,13 @@ func toolInputDefs() []string {
 // mapOutcome (outcome.go) render a twin's business refusal as
 // IsError:true instead of the wrapper's own automatic, coarser
 // success/failure split.
-func (spec toolSpec) toolHandler(ctx context.Context, inputSchemas map[string]*jsonschema.Schema) sdkmcp.ToolHandler {
+//
+// brake is Config.CreateBrake, consulted only by a spec whose CreateBrake is
+// set, keyed by the grant the call is authorized by, after the arguments
+// validate and BuildRequest succeeds and before callTwin: a refused call
+// runs no twin and writes nothing, and answers isError with how long to
+// wait (technical plan §43.8).
+func (spec toolSpec) toolHandler(ctx context.Context, inputSchemas map[string]*jsonschema.Schema, brake CreateBrake) sdkmcp.ToolHandler {
 	return func(_ context.Context, req *sdkmcp.CallToolRequest) (result *sdkmcp.CallToolResult, err error) {
 		// Defense in depth against ANY future twin or argument shape
 		// that panics instead of erroring (bridge.go's own doc comment
@@ -525,7 +651,7 @@ func (spec toolSpec) toolHandler(ctx context.Context, inputSchemas map[string]*j
 			return invalid, nil
 		}
 
-		urlParams, query, buildErr := spec.BuildRequest(req.Params.Arguments)
+		call, buildErr := spec.BuildRequest(req.Params.Arguments)
 		if buildErr != nil {
 			var iae *invalidArgumentError
 			if errors.As(buildErr, &iae) {
@@ -550,9 +676,41 @@ func (spec toolSpec) toolHandler(ctx context.Context, inputSchemas map[string]*j
 			invalid.SetError(errors.New("invalid arguments"))
 			return invalid, nil
 		}
-		status, body := callTwin(ctx, spec.Twin, urlParams, query)
+		if spec.CreateBrake {
+			if refused, defect := createBrakeRefusal(ctx, spec, brake); refused != nil || defect != nil {
+				return refused, defect
+			}
+		}
+		status, body := callTwin(ctx, spec.Twin, call)
 		return mapOutcome(status, body)
 	}
+}
+
+// createBrakeRefusal takes one session start from the calling grant's
+// bucket in brake, and returns the tool result refusing the call when the
+// bucket is empty -- nil, nil when the call may go on. A call with no grant
+// on its context, or a handler built with no brake, is this package's own
+// defect (buildServer registers no tool without a grant; NewHandler refuses
+// a nil brake): -32603, never let through unbraked.
+func createBrakeRefusal(ctx context.Context, spec toolSpec, brake CreateBrake) (*sdkmcp.CallToolResult, error) {
+	grant, ok := platform.MCPGrantFromContext(ctx)
+	if !ok || brake == nil {
+		platform.Logger(ctx).Error("mcp: create brake has no grant or no brake to consult", "tool", spec.Name, "grant", ok, "brake", brake != nil)
+		return nil, &jsonrpc.Error{Code: jsonrpc.CodeInternalError, Message: "internal error"}
+	}
+	allowed, retryAfter := brake.Allow(grant.GrantID)
+	if allowed {
+		return nil, nil
+	}
+	seconds := int64(math.Ceil(retryAfter.Seconds()))
+	if seconds < 1 {
+		seconds = 1
+	}
+	platform.Logger(ctx).Warn("mcp: session start refused by the create brake",
+		"tool", spec.Name, "grant_id", grant.GrantID, "client_id", grant.ClientID, "retry_after_seconds", seconds)
+	refused := &sdkmcp.CallToolResult{}
+	refused.SetError(fmt.Errorf("too many sessions started through this authorization; retry in %d s", seconds))
+	return refused, nil
 }
 
 // buildTool resolves spec's own contracts-sourced schemas into a real
@@ -571,7 +729,7 @@ func buildTool(spec toolSpec) (*sdkmcp.Tool, error) {
 		Description:  spec.Description,
 		InputSchema:  in,
 		OutputSchema: out,
-		Annotations:  readOnlyAnnotations,
+		Annotations:  spec.Annotations,
 	}, nil
 }
 
@@ -594,13 +752,13 @@ func visibleSpecs(specs []toolSpec, granted []mcpscope.Scope) []toolSpec {
 // comment. A tool that is not added does not exist for this request: its
 // tools/call answers the SDK's own "unknown tool" error, byte-identical
 // to a name that never existed.
-func registerTools(ctx context.Context, s *sdkmcp.Server, visible []toolSpec, inputSchemas map[string]*jsonschema.Schema) error {
+func registerTools(ctx context.Context, s *sdkmcp.Server, visible []toolSpec, inputSchemas map[string]*jsonschema.Schema, brake CreateBrake) error {
 	for _, spec := range visible {
 		tool, err := buildTool(spec)
 		if err != nil {
 			return err
 		}
-		s.AddTool(tool, spec.toolHandler(ctx, inputSchemas))
+		s.AddTool(tool, spec.toolHandler(ctx, inputSchemas, brake))
 	}
 	return nil
 }

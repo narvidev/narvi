@@ -36,9 +36,15 @@ func errorTextFrom(body []byte) string {
 // forwards a *jsonrpc.Error returned this way as-is, per its own
 // documented "already a structured JSON-RPC error" branch) rather than a
 // successful tool result with IsError:true.
+//
+// 201 and 202 are successes exactly like 200 (technical plan §43.8): a
+// write twin answers 201 for what it created (POST /api/sessions) and 202
+// for what it accepted, and a caller sees its body verbatim either way. The
+// status itself is not carried: the body is the answer, and a replay of a
+// create answers 200 with the same Session shape.
 func mapOutcome(status int, body []byte) (*sdkmcp.CallToolResult, error) {
 	switch status {
-	case http.StatusOK:
+	case http.StatusOK, http.StatusCreated, http.StatusAccepted:
 		return &sdkmcp.CallToolResult{
 			Content:           []sdkmcp.Content{&sdkmcp.TextContent{Text: string(body)}},
 			StructuredContent: json.RawMessage(body),

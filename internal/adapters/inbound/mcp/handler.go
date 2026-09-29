@@ -1,8 +1,10 @@
 package mcp
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
+	"time"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 	jsonschema "github.com/santhosh-tekuri/jsonschema/v6"
@@ -26,7 +28,26 @@ type Config struct {
 	// else is refused 403; a request with no Origin/Sec-Fetch-Site header
 	// at all (every non-browser client) passes.
 	PublicBaseURL string
+
+	// CreateBrake is the per-grant brake narvi_create_session consults
+	// before its twin runs (technical plan §43.8): every session started
+	// spawns a sandbox and spends on models. controlplane passes an
+	// *mcpauth.RateLimiter built from MCPCreateSessionRateInterval/Burst,
+	// which satisfies it; this package may not import mcpauth
+	// (mcpimportban), so it names the one method it needs. Required:
+	// NewHandler refuses a nil one -- a brake every wiring must remember to
+	// pass is not a brake. RequireTrustedOrigin ignores it.
+	CreateBrake CreateBrake
 }
+
+// CreateBrake is a keyed brake: Allow takes one start from key's bucket,
+// and when it refuses, says how long until the bucket holds one again.
+type CreateBrake interface {
+	Allow(key string) (ok bool, retryAfter time.Duration)
+}
+
+// errNoCreateBrake is NewHandler's refusal of a Config with no CreateBrake.
+var errNoCreateBrake = errors.New("mcp: Config.CreateBrake is required: narvi_create_session may not start sessions unbraked")
 
 // crossOriginProtection builds the *http.CrossOriginProtection value
 // trusting cfg.PublicBaseURL's own origin, for NewHandler's own SECOND,
@@ -180,7 +201,9 @@ func NewHandler(cfg Config, twins Twins) (http.Handler, error) {
 // path a schema map of their own (toolhandler_test.go).
 //
 // It refuses to build a handler at all -- a boot failure, like a compile
-// error in NewHandler -- unless inputSchemas holds a non-nil
+// error in NewHandler -- when cfg.CreateBrake is nil (errNoCreateBrake:
+// narvi_create_session never starts sessions unbraked), and unless
+// inputSchemas holds a non-nil
 // *jsonschema.Schema for every name toolInputDefs() returns, and every
 // request validates against a private copy of those entries taken here,
 // never against inputSchemas itself (copyCompleteInputSchemas). Two
@@ -195,6 +218,9 @@ func NewHandler(cfg Config, twins Twins) (http.Handler, error) {
 //     after this returns nor anything a request does can change what a
 //     later request validates against.
 func newHandler(cfg Config, twins Twins, inputSchemas map[string]*jsonschema.Schema) (http.Handler, error) {
+	if cfg.CreateBrake == nil {
+		return nil, errNoCreateBrake
+	}
 	protection, err := crossOriginProtection(cfg)
 	if err != nil {
 		return nil, err
@@ -205,7 +231,7 @@ func newHandler(cfg Config, twins Twins, inputSchemas map[string]*jsonschema.Sch
 	}
 
 	sdkHandler := sdkmcp.NewStreamableHTTPHandler(
-		func(r *http.Request) *sdkmcp.Server { return buildServer(r, twins, schemas) },
+		func(r *http.Request) *sdkmcp.Server { return buildServer(r, twins, schemas, cfg.CreateBrake) },
 		&sdkmcp.StreamableHTTPOptions{
 			// Stateless (§43.3): the 2026-07-28 era is served ONLY in
 			// stateless mode by the pinned SDK, the protocol itself is
@@ -301,7 +327,7 @@ func implementation() *sdkmcp.Implementation {
 // httpapi.authenticatedUserID's own "should never happen" precedent -- or
 // whose tool schemas fail to resolve (a defect in this build) gets
 // defectServer: no tools at all, logged loudly server-side.
-func buildServer(r *http.Request, twins Twins, inputSchemas map[string]*jsonschema.Schema) *sdkmcp.Server {
+func buildServer(r *http.Request, twins Twins, inputSchemas map[string]*jsonschema.Schema, brake CreateBrake) *sdkmcp.Server {
 	ctx := r.Context()
 	logger := platform.Logger(ctx)
 
@@ -317,7 +343,7 @@ func buildServer(r *http.Request, twins Twins, inputSchemas map[string]*jsonsche
 
 	visible := visibleSpecs(toolSpecs(twins), mcpscope.FromStrings(grant.Scopes))
 	server := sdkmcp.NewServer(implementation(), serverOptions(instructionsFor(visible)))
-	if err := registerTools(ctx, server, visible, inputSchemas); err != nil {
+	if err := registerTools(ctx, server, visible, inputSchemas, brake); err != nil {
 		logger.Error("mcp: register tools failed", "error", err)
 		return defectServer()
 	}

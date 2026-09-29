@@ -38,6 +38,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactivity"
+	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/platform"
@@ -83,9 +84,21 @@ type mcpTestRig struct {
 	tokenClient *sqlcgen.McpOauthClient
 }
 
+// unlimitedBrake is the create brake this rig's handler is built with: its
+// subject is the bridge, not the brake (the brake has its own tests, and
+// controlplane's production router ships the real one).
+type unlimitedBrake struct{}
+
+func (unlimitedBrake) Allow(string) (bool, time.Duration) { return true, 0 }
+
+// parityRepo is the repository every create in this file names; the rig
+// makes it known to the deployment, as the entitlement gate requires.
+const parityRepo = "acme/widgets"
+
 func newMCPTestRig(t *testing.T) *mcpTestRig {
 	t.Helper()
-	pool := IntegrationTestPool(t)
+	ctx := context.Background()
+	pool, connStr := IntegrationTestPoolAndConnStr(t)
 
 	rig := &mcpTestRig{
 		pool:         pool,
@@ -125,13 +138,40 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		Timeouts:       platform.DefaultTimeouts(),
 	})
 
-	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{PublicBaseURL: baseURL}, mcpadapter.Twins{
+	// One create handler for the REST route and the MCP twin alike, as
+	// controlplane wires it (technical plan §43.8). Every live session actor
+	// holds a pool connection until its registry shuts down, and each
+	// create with a prompt spawns one, so the registry has a pool of its own
+	// on the same database; closed after the registry shuts down, and both
+	// before the shared database is reset.
+	actorCfg, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		t.Fatalf("parse actor pool config: %v", err)
+	}
+	actorCfg.MaxConns = 32
+	actorPool, err := pgxpool.NewWithConfig(ctx, actorCfg)
+	if err != nil {
+		t.Fatalf("actor pool: %v", err)
+	}
+	t.Cleanup(actorPool.Close)
+	registry, err := sessionactor.NewRegistry(ctx, actorPool, platform.DefaultTimeouts(), nil, nil, nil, baseURL, nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = registry.Shutdown() })
+	if err := rig.prSessions.EnsureRow(ctx, parityRepo, 1); err != nil {
+		t.Fatalf("make %s known: %v", parityRepo, err)
+	}
+	createSession := httpapi.CreateSession(pool, rig.sessions, rig.turns, narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), registry, nil, false, platform.RolloutModeOpen, narvipg.NewRepoSettingsStore(pool), rig.prSessions)
+
+	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{PublicBaseURL: baseURL, CreateBrake: unlimitedBrake{}}, mcpadapter.Twins{
 		ListModels:       httpapi.GetModelCatalog(),
 		ListSessions:     httpapi.ListSessions(rig.sessions),
 		GetSession:       httpapi.GetSession(rig.sessions),
 		GetSessionStatus: httpapi.GetSessionStatus(rig.sessions, rig.waiter, platform.DefaultTimeouts()),
 		ListEvents:       httpapi.ListEvents(rig.sessions, rig.events),
 		GetSessionResult: getSessionResult,
+		CreateSession:    createSession,
 	})
 	if err != nil {
 		t.Fatalf("mcpadapter.NewHandler: %v", err)
@@ -152,6 +192,7 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 	})
 	router.Route("/api/sessions", func(r chi.Router) {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
+		r.Post("/", createSession)
 		r.Get("/", httpapi.ListSessions(rig.sessions))
 		r.Get("/{sessionID}", httpapi.GetSession(rig.sessions))
 		r.Get("/{sessionID}/status", httpapi.GetSessionStatus(rig.sessions, rig.waiter, platform.DefaultTimeouts()))
@@ -820,7 +861,12 @@ func assertCanonicalJSONEqual(t *testing.T, label string, a, b []byte) {
 // every tool call made with a bearer token minted for a user answers
 // exactly what the REST twin answers that same user's cookie -- same
 // success/refusal shape, same body -- including the reads of ANOTHER
-// user's session and of a session that does not exist.
+// user's session and of a session that does not exist. narvi_create_session
+// is in the table too (§43.8), under a read+write token: a viewer is
+// refused exactly as REST refuses it, writing nothing, and every other
+// role starts a session whose body equals REST's for the same request but
+// for what differs by construction -- its id and times, and its source,
+// mcp over MCP and web by cookie.
 func TestParity_BearerEqualsCookieForEveryRole(t *testing.T) {
 	ctx := context.Background()
 	rig := newMCPTestRig(t)
@@ -906,7 +952,79 @@ func TestParity_BearerEqualsCookieForEveryRole(t *testing.T) {
 					}
 				}
 			}
+
+			assertCreateParity(ctx, t, rig, role, user.ID, cookie, mintMCPToken(ctx, t, rig, user.ID, []string{"mcp:read", "mcp:write"}))
 		})
+	}
+}
+
+// assertCreateParity is TestParity_BearerEqualsCookieForEveryRole's create
+// row: the same request, once by cookie through POST /api/sessions and once
+// through narvi_create_session with bearer (each under its own
+// idempotency key, so neither is a replay of the other).
+func assertCreateParity(ctx context.Context, t *testing.T, rig *mcpTestRig, role sqlcgen.UserRole, userID pgtype.UUID, cookie, bearer string) {
+	t.Helper()
+	const prompt = "fix the flaky test"
+	repos := `[{"name":"widgets","url":"https://github.com/` + parityRepo + `"}]`
+	restKey, mcpKey := "2b3c4d5e-6f70-4a81-9b2c-3d4e5f607182", "8a9b0c1d-2e3f-4a5b-8c6d-7e8f9a0b1c2d"
+	restRequest := fmt.Sprintf(`{"spawnSource":"web","title":"Parity","prompt":%q,"repos":[{"name":"widgets","url":"https://github.com/%s","branch":null}],"modelId":null,"effort":null,"planMode":false,"idempotencyKey":%q}`, prompt, parityRepo, restKey)
+	arguments := fmt.Sprintf(`{"title":"Parity","prompt":%q,"repos":%s,"idempotencyKey":%q}`, prompt, repos, mcpKey)
+
+	var restBody json.RawMessage
+	restStatus := rig.doJSON(t, http.MethodPost, "/api/sessions", []byte(restRequest), &restBody, cookie)
+	mcpStatus, env := rig.callTool(t, "narvi_create_session", arguments, bearer)
+	if mcpStatus != http.StatusOK || env.Result == nil {
+		t.Fatalf("create: MCP status %d result %+v, want a 200 tool result", mcpStatus, env.Result)
+	}
+	sessions := func() int {
+		var n int
+		if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE created_by = $1 AND create_idempotency_key IS NOT NULL`, userID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+
+	if role == sqlcgen.UserRoleViewer {
+		var restErr struct {
+			Error string `json:"error"`
+		}
+		_ = json.Unmarshal(restBody, &restErr)
+		if restStatus != http.StatusForbidden || !env.Result.IsError || len(env.Result.Content) != 1 || env.Result.Content[0].Text != restErr.Error {
+			t.Fatalf("create as a viewer: REST %d %q, MCP %+v -- want REST's 403 as isError, same text", restStatus, restErr.Error, env.Result)
+		}
+		if n := sessions(); n != 0 {
+			t.Fatalf("create as a viewer wrote %d session(s)", n)
+		}
+		return
+	}
+	if restStatus != http.StatusCreated || env.Result.IsError {
+		t.Fatalf("create as %s: REST %d %s, MCP %+v -- want both to start a session", role, restStatus, restBody, env.Result)
+	}
+	normalize := func(raw []byte, wantSource string) map[string]any {
+		t.Helper()
+		var m map[string]any
+		if err := json.Unmarshal(raw, &m); err != nil {
+			t.Fatalf("decode %s: %v", raw, err)
+		}
+		if m["spawnSource"] != wantSource {
+			t.Fatalf("spawnSource = %v, want %s: %s", m["spawnSource"], wantSource, raw)
+		}
+		for _, differs := range []string{"id", "createdAt", "updatedAt", "spawnSource"} {
+			delete(m, differs)
+		}
+		return m
+	}
+	mcpRaw, err := json.Marshal(env.Result.StructuredContent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	restCanon, _ := json.Marshal(normalize(restBody, "web"))
+	mcpCanon, _ := json.Marshal(normalize(mcpRaw, "mcp"))
+	if string(restCanon) != string(mcpCanon) {
+		t.Fatalf("create as %s: REST and MCP sessions differ beyond id, times and source.\nREST: %s\nMCP:  %s", role, restCanon, mcpCanon)
+	}
+	if n := sessions(); n != 2 {
+		t.Fatalf("create as %s: %d session(s) under a key, want REST's and MCP's", role, n)
 	}
 }
 

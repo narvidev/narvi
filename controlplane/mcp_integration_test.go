@@ -205,7 +205,7 @@ func TestBuild_MCPSurface_RealRouter(t *testing.T) {
 		if rec.Code != http.StatusUnauthorized {
 			t.Fatalf("status = %d, body = %s, want 401", rec.Code, rec.Body.String())
 		}
-		want := `Bearer resource_metadata="http://localhost:8080/.well-known/oauth-protected-resource/mcp", scope="mcp:read"`
+		want := `Bearer resource_metadata="http://localhost:8080/.well-known/oauth-protected-resource/mcp", scope="mcp:read mcp:write"`
 		if got := rec.Header().Get("WWW-Authenticate"); got != want {
 			t.Fatalf("WWW-Authenticate = %q, want %q", got, want)
 		}
