@@ -32,14 +32,17 @@ import (
 
 // lockTestTimeouts shortens the lock connection's timeouts: hydration
 // 300 ms, each lock statement 100 ms, a probe every 2 s, each connect
-// attempt 1 s -- a valid set. No test here runs the probe loop on it at
-// that pace: each one that probes calls ProbeLockOnce itself.
+// attempt 1 s, and 200 ms for a lost connection's backend to end -- two of
+// Postgres's looks for its end -- a valid set. No test here runs the probe
+// loop on it at that pace: each one that probes calls ProbeLockOnce
+// itself.
 func lockTestTimeouts() platform.Timeouts {
 	to := platform.DefaultTimeouts()
 	to.ActorHydrateTimeout = 300 * time.Millisecond
 	to.ActorLockStatementTimeout = 100 * time.Millisecond
 	to.ActorLockProbeInterval = 2 * time.Second
 	to.ActorLockConnectAttemptTimeout = time.Second
+	to.ActorLockOrphanTerminateWait = 200 * time.Millisecond
 	return to
 }
 

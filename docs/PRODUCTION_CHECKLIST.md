@@ -227,14 +227,16 @@ between transactions would move them with it. Session-mode pooling, or
 none, is required. Behind a session-mode pooler, three of its settings
 matter too:
 
-- **Its client-side TCP keepalives** (PgBouncer: `tcp_keepalive`,
-  `tcp_keepidle`, `tcp_keepintvl`, `tcp_keepcnt`). The lock connection
-  asks the server for short keepalives on its end
-  (`ActorLockServerKeepalive*` in `internal/platform/timeouts.go`), but
-  through a pooler that end faces the pooler: if a replica vanishes, only
-  the pooler's keepalives notice, and until they do the pooler keeps the
-  backend holding that replica's session locks. Set them so their reap
-  time, `tcp_keepidle + tcp_keepintvl × tcp_keepcnt`, lies above
+- **Its client-side TCP keepalives and user timeout** (PgBouncer:
+  `tcp_keepalive`, `tcp_keepidle`, `tcp_keepintvl`, `tcp_keepcnt`, and
+  `tcp_user_timeout`, in milliseconds). The lock connection asks the
+  server for short keepalives on its end, and for a TCP user timeout of
+  the same reap time (`ActorLockServerKeepalive*` in
+  `internal/platform/timeouts.go`), but through a pooler that end faces
+  the pooler: if a replica vanishes, only the pooler's own settings
+  notice, and until they do the pooler keeps the backend holding that
+  replica's session locks. Set the keepalives so their reap time,
+  `tcp_keepidle + tcp_keepintvl × tcp_keepcnt`, lies above
   `ActorLockProbeInterval + ActorLockStatementTimeout` (11 s at the
   shipped values) and below `TimerClaimDuration` (30 s): the bounds
   `Validate` keeps the server side's own reap time within, for the same
@@ -243,7 +245,16 @@ matter too:
   replicas, before that replica has found the loss and stopped its
   actors. Above the ceiling, a vanished replica's session locks outlive a
   timer's claim, so the first retry of those sessions' timers still finds
-  them held. The server side's 10 s, 5 s and 3 (25 s) fit.
+  them held. The server side's 10 s, 5 s and 3 (25 s) fit. Set
+  `tcp_user_timeout` between the same bounds, for the same reasons
+  (25000 fits): the keepalives only reap a connection with nothing in
+  flight. Linux sends no keepalive probe while data it sent is
+  unacknowledged, so a replica lost while the pooler's reply to one of its
+  lock statements was in flight is otherwise dropped only when TCP's
+  retransmissions give up — about 15 minutes at Linux's default
+  `tcp_retries2` — its session locks held all the while. PgBouncer's
+  default, 0, leaves it at that, and no other replica ends that backend:
+  only the lost replica's own next lock connection would.
 - **Its client idle timeout** (PgBouncer: `client_idle_timeout`). Leave it
   at 0, its default, or above the same floor: a lock connection sits idle
   between probes, and a pooler that closes an idle client resets its

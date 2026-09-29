@@ -52,11 +52,11 @@ const lockConnKeepaliveQuery = `SELECT set_config('tcp_keepalives_idle', $1, fal
 const lockBackendQuery = `SELECT pg_backend_pid(),
 	(SELECT backend_start FROM pg_stat_activity WHERE pid = pg_backend_pid())`
 
-// terminateOrphanQuery terminates a lost lock connection's backend if it is
-// still running that connection's session (terminateOrphan). The pid and
-// start time name the backend -- a pid alone may since have been reused by
-// an unrelated one -- but not the session: behind a session-mode pooler
-// the backend outlives it, reset and handed to whichever client the pooler
+// orphanBackendMatch finds a lost lock connection's backend if it is still
+// running that connection's session (terminateOrphan). The pid and start
+// time name the backend -- a pid alone may since have been reused by an
+// unrelated one -- but not the session: behind a session-mode pooler the
+// backend outlives it, reset and handed to whichever client the pooler
 // links next, possibly this replica's new lock connection or another
 // replica's. So the match is also on the lost connection's own
 // application_name, unique to its dial: a session-mode pooler sets each
@@ -64,9 +64,29 @@ const lockBackendQuery = `SELECT pg_backend_pid(),
 // it), so a backend since handed to any other client is spared. And never
 // the backend running the statement, whatever its name. A role may signal
 // its own backends.
-const terminateOrphanQuery = `SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+const orphanBackendMatch = `FROM pg_stat_activity
 	WHERE pid = $1 AND backend_start = $2 AND application_name = $3 AND datname = current_database()
 		AND pid <> pg_backend_pid()`
+
+// terminateOrphanQuery terminates the backend orphanBackendMatch finds and
+// waits up to $4 milliseconds for it to end (Postgres 14 and later): true
+// once it has ended, and with it every advisory lock it held -- a backend
+// releases them only as it exits -- or false once the wait has run out, the
+// backend still there. False also answers, in a race of microseconds, a
+// backend that ended between the match and the signal. No row: no such
+// backend.
+const terminateOrphanQuery = `SELECT pg_terminate_backend(pid, $4) ` + orphanBackendMatch
+
+// terminateOrphanNoWaitQuery is terminateOrphanQuery for a server older
+// than Postgres 14, which has no pg_terminate_backend that waits: true once
+// the backend has been signalled, whether or not it has ended yet; false if
+// it had ended already.
+const terminateOrphanNoWaitQuery = `SELECT pg_terminate_backend(pid) ` + orphanBackendMatch
+
+// sqlstateUndefinedFunction is how a server older than Postgres 14 refuses
+// terminateOrphanQuery: it has no pg_terminate_backend that takes a
+// timeout.
+const sqlstateUndefinedFunction = "42883"
 
 // errLockHolderClosed is TryLock's error once Registry.Shutdown has closed
 // the holder: a Registry that has shut down hosts nothing.
@@ -119,8 +139,10 @@ var errLockHolderClosed = errors.New("sessionactor: lock connection closed: regi
 // reaps such a backend within ActorLockServerReapTime even if this replica
 // never comes back. And the first connection dialled after a loss
 // terminates the lost one's backend if it is still running the lost
-// connection's session (terminateOrphan), so a replica that does come back
-// does not wait for that. Every dial names its connection afresh
+// connection's session, and waits for it to end before taking over
+// (terminateOrphan), so a replica that does come back does not wait for
+// that, and its first hydration does not find the orphan's sessions still
+// locked. Every dial names its connection afresh
 // (newLockConnApplicationName) for that match: behind a session-mode
 // pooler a backend outlives the session that locked on it.
 //
@@ -148,12 +170,15 @@ type lockHolder struct {
 	// search_path, and every target host with its connect_timeout -- and
 	// its connect hooks, applied as pgxpool applies them. connectAttempt
 	// bounds each connect attempt when the URL sets no connect_timeout
-	// (ActorLockConnectAttemptTimeout).
+	// (ActorLockConnectAttemptTimeout). orphanWait is how long
+	// terminateOrphan waits for the backend it signalled to end
+	// (ActorLockOrphanTerminateWait).
 	connConfig     *pgx.ConnConfig
 	beforeConnect  func(context.Context, *pgx.ConnConfig) error
 	afterConnect   func(context.Context, *pgx.Conn) error
 	connectAttempt time.Duration
 	stmtTimeout    time.Duration
+	orphanWait     time.Duration
 
 	// serverKeepalives is what prepareConn asks the server to apply to its
 	// end of every lock connection, from the ActorLockServer* timeouts.
@@ -167,10 +192,14 @@ type lockHolder struct {
 	// only by a test that injects a server-side error. Read under sem.
 	tryLockSQL string
 
-	// terminateSQL is terminateOrphan's statement: terminateOrphanQuery,
-	// replaced only by a test that holds it back to observe what the dial
-	// does meanwhile. Set before anything dials; read by the dial.
-	terminateSQL string
+	// terminateSQL and terminateNoWaitSQL are terminateOrphan's statements:
+	// terminateOrphanQuery, and terminateOrphanNoWaitQuery for a server
+	// that refuses it. terminateSQL is replaced only by a test that holds
+	// it back to observe what the dial does meanwhile, or that stands in for
+	// a server older than Postgres 14. Set before anything dials; read by
+	// the dial.
+	terminateSQL       string
+	terminateNoWaitSQL string
 
 	// dialCtx is every dial's context: the Registry's lifecycle, never a
 	// caller's. dials runs each dial on its own goroutine, so a caller can
@@ -265,19 +294,21 @@ func newLockHolder(ctx context.Context, pool *pgxpool.Pool, timeouts platform.Ti
 	poolConfig := pool.Config() // a copy: nothing here can touch the pool's own
 	dialCtx, stopDials := context.WithCancel(ctx)
 	h := &lockHolder{
-		connConfig:       poolConfig.ConnConfig,
-		beforeConnect:    poolConfig.BeforeConnect,
-		afterConnect:     poolConfig.AfterConnect,
-		connectAttempt:   timeouts.ActorLockConnectAttemptTimeout,
-		stmtTimeout:      timeouts.ActorLockStatementTimeout,
-		serverKeepalives: newServerKeepalives(timeouts),
-		onLost:           onLost,
-		tryLockSQL:       tryAdvisoryLockQuery,
-		terminateSQL:     terminateOrphanQuery,
-		dialCtx:          dialCtx,
-		stopDials:        stopDials,
-		sem:              make(chan struct{}, 1),
-		held:             make(map[pgtype.UUID]uint64),
+		connConfig:         poolConfig.ConnConfig,
+		beforeConnect:      poolConfig.BeforeConnect,
+		afterConnect:       poolConfig.AfterConnect,
+		connectAttempt:     timeouts.ActorLockConnectAttemptTimeout,
+		stmtTimeout:        timeouts.ActorLockStatementTimeout,
+		orphanWait:         timeouts.ActorLockOrphanTerminateWait,
+		serverKeepalives:   newServerKeepalives(timeouts),
+		onLost:             onLost,
+		tryLockSQL:         tryAdvisoryLockQuery,
+		terminateSQL:       terminateOrphanQuery,
+		terminateNoWaitSQL: terminateOrphanNoWaitQuery,
+		dialCtx:            dialCtx,
+		stopDials:          stopDials,
+		sem:                make(chan struct{}, 1),
+		held:               make(map[pgtype.UUID]uint64),
 	}
 	h.gen.Store(1)
 	return h
@@ -476,9 +507,10 @@ func (h *lockHolder) startDial() *lockDial {
 // dialAndInstall dials the lock connection and makes it the open one,
 // unless one is already open or the holder has closed. First, from the new
 // connection, it terminates the backend the last lost connection may have
-// left behind, and installs the new one only once that has returned. The
-// dial runs outside sem: statements on an open connection never wait for
-// it.
+// left behind, and installs the new one only once that has returned: once
+// that backend has ended, releasing its locks, or the wait for it has run
+// out (terminateOrphan). The dial runs outside sem: statements on an open
+// connection never wait for it.
 func (h *lockHolder) dialAndInstall() error {
 	ctx := h.dialCtx
 	if err := h.enter(ctx); err != nil {
@@ -640,32 +672,71 @@ func (h *lockHolder) prepareConn(ctx context.Context, conn *pgx.Conn, appName st
 // until keepalives reaped it. No such backend is the ordinary case: the
 // server heard the close, or ended the backend itself, or a pooler heard it
 // and has reset the backend, releasing the locks, and perhaps handed it to
-// another client since. It fails -- and so fails the dial, leaving the
-// orphan to the next one -- only when conn itself is lost. Anything else is
-// logged, and the orphan left to the server's keepalives: it never holds up
-// the new connection longer than one statement.
+// another client since.
+//
+// Then it waits, up to orphanWait, for that backend to end: a backend
+// releases its locks only as it exits, some time after it is signalled,
+// and a connection installed before then could tell the first hydration
+// after it that a session the orphan held is locked elsewhere. The
+// statement runs under orphanWait plus its own bound, so the wait never
+// overruns it. A server older than Postgres 14 cannot wait, and refuses
+// the statement (sqlstateUndefinedFunction): there the orphan is only
+// signalled (terminateOrphanNoWaitQuery), and that first hydration can
+// still find it holding its sessions.
+//
+// It fails -- and so fails the dial, leaving the orphan to the next one --
+// only when conn itself is lost. Anything else is logged, and the orphan
+// left to the server's keepalives: a backend still there when the wait runs
+// out, or a terminate the server refuses. So it never holds up the new
+// connection longer than orphanWait and one statement, or two statements on
+// an older server.
 func (h *lockHolder) terminateOrphan(ctx context.Context, conn *pgx.Conn, orphan lockBackend) error {
-	sctx, cancel := context.WithTimeout(ctx, h.stmtTimeout)
-	defer cancel()
 	logger := platform.Logger(ctx).With("orphan_backend_pid", orphan.pid, "orphan_backend_start", orphan.start,
 		"orphan_application_name", orphan.appName)
 
-	var terminated bool
-	err := conn.QueryRow(sctx, h.terminateSQL, orphan.pid, orphan.start, orphan.appName).Scan(&terminated)
+	waited := true
+	terminated, lost, err := h.runTerminate(ctx, conn, h.orphanWait+h.stmtTimeout, h.terminateSQL,
+		orphan.pid, orphan.start, orphan.appName, h.orphanWait.Milliseconds())
+	var pgErr *pgconn.PgError
+	if !lost && errors.As(err, &pgErr) && pgErr.Code == sqlstateUndefinedFunction {
+		logger.Info("sessionactor: this server cannot wait for a terminated backend to end (Postgres before 14); the lost lock connection's backend is only signalled",
+			"error", err)
+		waited = false
+		terminated, lost, err = h.runTerminate(ctx, conn, h.stmtTimeout, h.terminateNoWaitSQL,
+			orphan.pid, orphan.start, orphan.appName)
+	}
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		logger.Info("sessionactor: no backend was left running the lost lock connection's session")
-	case err == nil && terminated:
-		logger.Warn("sessionactor: terminated the backend a lost lock connection left behind, still holding its advisory locks")
-	case err == nil:
-		logger.Info("sessionactor: the lost lock connection's backend ended before it could be terminated")
-	case statementLost(conn.IsClosed(), sctx.Err() != nil, err):
+	case lost:
 		return fmt.Errorf("terminate the lost lock connection's backend: %w", err)
-	default:
+	case err != nil:
 		logger.Warn("sessionactor: could not terminate the backend a lost lock connection left behind; the server's keepalives will end it",
 			"error", err)
+	case terminated && waited:
+		logger.Warn("sessionactor: terminated the backend a lost lock connection left behind, still holding its advisory locks")
+	case terminated:
+		logger.Warn("sessionactor: signalled the backend a lost lock connection left behind, still holding its advisory locks, to end")
+	case waited:
+		logger.Warn("sessionactor: the backend a lost lock connection left behind was not seen to end within the wait for it; until it does, or the server's keepalives end it, its advisory locks keep its sessions from every replica",
+			"wait", h.orphanWait)
+	default:
+		logger.Info("sessionactor: the lost lock connection's backend ended before it could be terminated")
 	}
 	return nil
+}
+
+// runTerminate runs one of terminateOrphan's statements on conn under
+// bound, and reports whether a failure presumes conn lost (statementLost).
+// No row is not a failure: it is ErrNoRows, never lost.
+func (h *lockHolder) runTerminate(ctx context.Context, conn *pgx.Conn, bound time.Duration, query string, args ...any) (terminated, lost bool, err error) {
+	sctx, cancel := context.WithTimeout(ctx, bound)
+	defer cancel()
+	err = conn.QueryRow(sctx, query, args...).Scan(&terminated)
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		lost = statementLost(conn.IsClosed(), sctx.Err() != nil, err)
+	}
+	return terminated, lost, err
 }
 
 // Unlock releases sessionID's advisory lock if, and only if, it is still

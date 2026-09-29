@@ -718,13 +718,18 @@ const (
 // has returned. The terminate is held back -- its statement first waits
 // for an advisory lock this test holds -- and while it waits, no connection
 // is installed, sem is free, and nothing has logged the connection
-// established. Released, it terminates the orphan, then the connection is
-// installed, and the session the orphan held rehydrates. A dial that
-// installed first -- then terminated, on a goroutine of its own or after
-// leaving and re-entering sem -- lets a hydration find the session still
-// held by the orphan and answer ErrSessionActorElsewhere, which the timer
-// pump skips silently until the timer's claim expires. T16 cannot see
-// that: it retries until the session rehydrates.
+// established. Released, it terminates the orphan and waits for it to end,
+// then the connection is installed: the orphan is gone by then, and the
+// session it held rehydrates at the first attempt. A dial that installed
+// first -- then terminated, on a goroutine of its own or after leaving and
+// re-entering sem -- lets a hydration find the session still held by the
+// orphan and answer ErrSessionActorElsewhere, which the timer pump skips
+// silently until the timer's claim expires. So does a terminate that
+// returns before the orphan has ended; this idle stand-in ends within
+// milliseconds of its signal, so that race is
+// TestLockHolder_InstallsOnlyOnceTheOrphanHasEnded's (T26), which holds the
+// orphan's exit back. T16 cannot see either: it retries until the session
+// rehydrates.
 func TestLockHolder_InstallsOnlyOnceTheOrphanTerminateHasReturned(t *testing.T) {
 	ctx := context.Background()
 	admin, connStr := IntegrationTestPoolAndConnStr(t)
@@ -805,8 +810,261 @@ func TestLockHolder_InstallsOnlyOnceTheOrphanTerminateHasReturned(t *testing.T) 
 	if terminatedAt < 0 || establishedAt < terminatedAt {
 		t.Fatalf("log order: %q at line %d, %q at line %d; want the terminate first", logOrphanTerminated, terminatedAt, logLockConnEstablished, establishedAt)
 	}
-	waitUntil(t, 5*time.Second, func() bool { return !lockBackendAlive(ctx, t, admin, uint32(pid)) })
+	if lockBackendAlive(ctx, t, admin, uint32(pid)) {
+		t.Fatalf("the orphan %d is still there once the new connection is installed", pid)
+	}
 	if _, err := r.GetOrSpawn(ctx, sessionID); err != nil {
 		t.Fatalf("GetOrSpawn for the session the orphan held, once the new connection is installed: %v", err)
 	}
+}
+
+// Log lines the tests of the wait for an orphan to end look for.
+const (
+	logOrphanOutlastedWait = "sessionactor: the backend a lost lock connection left behind was not seen to end within the wait for it; until it does, or the server's keepalives end it, its advisory locks keep its sessions from every replica"
+	logOrphanNoWaitServer  = "sessionactor: this server cannot wait for a terminated backend to end (Postgres before 14); the lost lock connection's backend is only signalled"
+	logOrphanSignalled     = "sessionactor: signalled the backend a lost lock connection left behind, still holding its advisory locks, to end"
+	logLockDialFailed      = "sessionactor: could not dial the lock connection"
+)
+
+// lockingStandIn opens a stand-in for the backend a lost lock connection
+// left behind: named as a lock connection's dial names one, and holding
+// sessionID's advisory lock. It returns that backend as the lost connection
+// would have recorded it, and the stand-in's connection, closed when the
+// test ends.
+func lockingStandIn(ctx context.Context, t *testing.T, connStr string, sessionID pgtype.UUID) (lockBackend, *pgx.Conn) {
+	t.Helper()
+	name := newLockConnApplicationName()
+	standIn, err := pgx.Connect(ctx, withConnParams(t, connStr, map[string]string{"application_name": name}))
+	if err != nil {
+		t.Fatalf("open the stand-in backend: %v", err)
+	}
+	t.Cleanup(func() { _ = standIn.Close(context.Background()) })
+	var (
+		pid    int32
+		start  pgtype.Timestamptz
+		locked bool
+	)
+	if err := standIn.QueryRow(ctx, lockBackendQuery).Scan(&pid, &start); err != nil || !start.Valid {
+		t.Fatalf("read the stand-in's backend: pid %d, start %v, err %v", pid, start, err)
+	}
+	if err := standIn.QueryRow(ctx, tryAdvisoryLockQuery, sessionID.String()).Scan(&locked); err != nil || !locked {
+		t.Fatalf("lock the session on the stand-in = %v, %v; want it locked", locked, err)
+	}
+	return lockBackend{pid: pid, start: start.Time, appName: name}, standIn
+}
+
+// holdExitOf holds back the exit of standIn's backend until release is
+// called, or the test ends. standIn creates a temporary table, and a
+// transaction of the test's own locks it. A backend drops its temporary
+// tables as it exits, before it releases its session-level locks -- the
+// drop is registered as an exit callback after the release, and exit
+// callbacks run last-registered first -- so once signalled, the backend
+// waits on the test's lock, still holding every advisory lock it had, much
+// as a loaded server's backend is slow to exit, only for as long as the
+// test likes.
+func holdExitOf(ctx context.Context, t *testing.T, connStr string, standIn *pgx.Conn) (release func()) {
+	t.Helper()
+	if _, err := standIn.Exec(ctx, `CREATE TEMPORARY TABLE exit_gate (x int)`); err != nil {
+		t.Fatalf("create the stand-in's temporary table: %v", err)
+	}
+	var schema string
+	if err := standIn.QueryRow(ctx, `SELECT nspname FROM pg_namespace WHERE oid = pg_my_temp_schema()`).Scan(&schema); err != nil {
+		t.Fatalf("read the stand-in's temporary schema: %v", err)
+	}
+	gate, err := pgx.Connect(ctx, connStr)
+	if err != nil {
+		t.Fatalf("open the exit gate's connection: %v", err)
+	}
+	// Closed before the stand-in (t.Cleanup is LIFO), which then exits.
+	t.Cleanup(func() { _ = gate.Close(context.Background()) })
+	tx, err := gate.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin the exit gate: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `LOCK TABLE `+pgx.Identifier{schema, "exit_gate"}.Sanitize()+` IN ACCESS SHARE MODE`); err != nil {
+		t.Fatalf("lock the stand-in's temporary table: %v", err)
+	}
+	return func() {
+		t.Helper()
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("release the exit gate: %v", err)
+		}
+	}
+}
+
+// backendWaitsOnALock reports whether pid is waiting for a lock: for a
+// stand-in whose exit holdExitOf holds back, that it has been signalled.
+func backendWaitsOnALock(ctx context.Context, t *testing.T, admin *pgxpool.Pool, pid int32) bool {
+	t.Helper()
+	var n int
+	if err := admin.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock'`, pid).Scan(&n); err != nil {
+		t.Fatalf("look up backend %d's wait: %v", pid, err)
+	}
+	return n == 1
+}
+
+// TestLockHolder_InstallsOnlyOnceTheOrphanHasEnded (T26) proves the
+// terminate a dial runs after a loss returns only once the orphan it
+// signalled has ended, and released its locks, so the new connection's
+// first hydration finds the orphan's sessions free. A backend ends some
+// time after it is signalled, and releases its session locks only then --
+// milliseconds on an idle server, longer on a loaded one; here the orphan's
+// exit is held back (holdExitOf). While it is, the orphan still holds the
+// session, no connection is installed, and sem is free. Released, the
+// orphan ends; the connection is installed, and by then the orphan and its
+// lock are gone: the first GetOrSpawn succeeds. A terminate that returns
+// once the signal is sent -- pg_terminate_backend without its timeout, or
+// with 0 -- installs the connection while the orphan still holds the
+// session, and that GetOrSpawn answers ErrSessionActorElsewhere.
+func TestLockHolder_InstallsOnlyOnceTheOrphanHasEnded(t *testing.T) {
+	ctx := context.Background()
+	admin, connStr := IntegrationTestPoolAndConnStr(t)
+	sessionID := createTestSession(ctx, t, admin)
+	orphan, standIn := lockingStandIn(ctx, t, connStr, sessionID)
+	release := holdExitOf(ctx, t, connStr, standIn)
+
+	// A wait well above how long the orphan's exit is held back below.
+	timeouts := lockTestShippedTimeouts(t)
+	timeouts.ActorHydrateTimeout = 6 * time.Second
+	timeouts.ActorLockOrphanTerminateWait = 5 * time.Second
+	if err := timeouts.Validate(); err != nil {
+		t.Fatalf("test timeouts: %v", err)
+	}
+	logs := captureDefaultLoggerJSONSync(t)
+	r := newLockTestRegistry(ctx, t, newLockTestPool(ctx, t, connStr, 2), timeouts)
+	r.locks.setOrphanForTest(orphan)
+	r.locks.startDial()
+
+	waitUntil(t, 5*time.Second, func() bool { return backendWaitsOnALock(ctx, t, admin, orphan.pid) })
+	for i := range 4 {
+		installed, busy := r.locks.installedForTest(50 * time.Millisecond)
+		if installed || busy {
+			t.Fatalf("check %d while the signalled orphan's exit is held back: a connection installed = %v, sem held = %v; want neither", i+1, installed, busy)
+		}
+		if got := advisoryLockHolders(ctx, t, admin, sessionID); len(got) != 1 || got[0] != uint32(orphan.pid) {
+			t.Fatalf("check %d while the orphan's exit is held back: the session's lock is held by pids %v, want the orphan %d", i+1, got, orphan.pid)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	release()
+
+	waitUntil(t, 5*time.Second, func() bool { return r.locks.backendPIDForTest() != 0 })
+	if lockBackendAlive(ctx, t, admin, uint32(orphan.pid)) {
+		t.Fatalf("the orphan %d is still there once the new connection is installed", orphan.pid)
+	}
+	if got := advisoryLockHolders(ctx, t, admin, sessionID); len(got) != 0 {
+		t.Fatalf("once the new connection is installed, the session's lock is held by pids %v, want none", got)
+	}
+	if _, err := r.GetOrSpawn(ctx, sessionID); err != nil {
+		t.Fatalf("the first GetOrSpawn after the install, for the session the orphan held: %v", err)
+	}
+	if logIndex(t, logs, logOrphanTerminated) < 0 {
+		t.Fatalf("no %q logged", logOrphanTerminated)
+	}
+}
+
+// TestLockHolder_AnOrphanThatOutlastsTheWaitDoesNotHoldUpTheDial (T27)
+// proves the wait for an orphan to end is bounded, and that its running out
+// is logged, never a failed dial. The orphan's exit is held back past
+// ActorLockOrphanTerminateWait: the new connection is installed once the
+// wait has run out, the orphan let go and logged as still holding its
+// sessions -- GetOrSpawn for its session answers ErrSessionActorElsewhere
+// -- and once it ends, the session rehydrates. A dial that failed when the
+// wait ran out, or whose statement bound left no room for the wait, would
+// leave the replica with no lock connection for as long as the orphan
+// lasted: no session at all could be hosted.
+func TestLockHolder_AnOrphanThatOutlastsTheWaitDoesNotHoldUpTheDial(t *testing.T) {
+	ctx := context.Background()
+	admin, connStr := IntegrationTestPoolAndConnStr(t)
+	sessionID := createTestSession(ctx, t, admin)
+	orphan, standIn := lockingStandIn(ctx, t, connStr, sessionID)
+	release := holdExitOf(ctx, t, connStr, standIn)
+
+	timeouts := lockTestShippedTimeouts(t)
+	logs := captureDefaultLoggerJSONSync(t)
+	r := newLockTestRegistry(ctx, t, newLockTestPool(ctx, t, connStr, 2), timeouts)
+	r.locks.setOrphanForTest(orphan)
+	r.locks.startDial()
+
+	waitUntil(t, timeouts.ActorLockOrphanTerminateWait+timeouts.ActorLockStatementTimeout+5*time.Second,
+		func() bool { return r.locks.backendPIDForTest() != 0 })
+	outlasted := waitForLogEntry(t, logs, 5*time.Second, logOrphanOutlastedWait)
+	if got, want := outlasted["wait"], float64(timeouts.ActorLockOrphanTerminateWait); got != want {
+		t.Errorf("the log's wait = %v, want %v (nanoseconds)", got, want)
+	}
+	if got, ok := outlasted["orphan_backend_pid"].(float64); !ok || int32(got) != orphan.pid {
+		t.Errorf("the log's orphan_backend_pid = %v, want %d", outlasted["orphan_backend_pid"], orphan.pid)
+	}
+	outlastedAt, establishedAt := logIndex(t, logs, logOrphanOutlastedWait), logIndex(t, logs, logLockConnEstablished)
+	if establishedAt < outlastedAt {
+		t.Fatalf("log order: %q at line %d, %q at line %d; want the wait's end first", logOrphanOutlastedWait, outlastedAt, logLockConnEstablished, establishedAt)
+	}
+	if i := logIndex(t, logs, logLockDialFailed); i >= 0 {
+		t.Fatalf("a lock dial failed: log line %d", i)
+	}
+	if got := r.locks.orphanForTest(); got != nil {
+		t.Fatalf("the orphan %+v is still recorded after a dial let it go", *got)
+	}
+
+	if !lockBackendAlive(ctx, t, admin, uint32(orphan.pid)) {
+		t.Fatalf("the orphan %d is gone while its exit is still held back", orphan.pid)
+	}
+	if _, err := r.GetOrSpawn(ctx, sessionID); !errors.Is(err, ErrSessionActorElsewhere) {
+		t.Fatalf("GetOrSpawn for the session the orphan still holds = %v, want ErrSessionActorElsewhere", err)
+	}
+	release()
+	waitUntil(t, 5*time.Second, func() bool {
+		_, err := r.GetOrSpawn(ctx, sessionID)
+		return err == nil
+	})
+}
+
+// TestLockHolder_ServerBefore14OnlySignalsTheOrphan (T28) proves the
+// terminate after a loss still ends the orphan on a server older than
+// Postgres 14, which has no pg_terminate_backend that waits and refuses the
+// statement that calls one (SQLSTATE 42883, undefined function): the
+// refusal is logged, the orphan is signalled without the wait, and the new
+// connection installed. Only Postgres 17 runs here, so the older server is
+// stood in for by a statement that calls, in the waiting form's place, a
+// function no server has, which any server refuses the same way. A dial
+// that took the refusal for any other failed terminate would leave the
+// orphan, and every session it held, to the server's keepalives.
+func TestLockHolder_ServerBefore14OnlySignalsTheOrphan(t *testing.T) {
+	ctx := context.Background()
+	admin, connStr := IntegrationTestPoolAndConnStr(t)
+	sessionID := createTestSession(ctx, t, admin)
+	orphan, _ := lockingStandIn(ctx, t, connStr, sessionID)
+
+	const waiting = "pg_terminate_backend(pid, $4)"
+	if n := strings.Count(terminateOrphanQuery, waiting); n != 1 {
+		t.Fatalf("terminateOrphanQuery calls %s %d times, want once to stand in for", waiting, n)
+	}
+	before14 := strings.Replace(terminateOrphanQuery, waiting, "narvi_no_such_terminate(pid, $4)", 1)
+
+	logs := captureDefaultLoggerJSONSync(t)
+	r := newLockTestRegistry(ctx, t, newLockTestPool(ctx, t, connStr, 2), lockTestShippedTimeouts(t))
+	r.locks.setTerminateSQLForTest(t, before14)
+	r.locks.setOrphanForTest(orphan)
+	r.locks.startDial()
+
+	waitUntil(t, 5*time.Second, func() bool { return r.locks.backendPIDForTest() != 0 })
+	refusal := waitForLogEntry(t, logs, 5*time.Second, logOrphanNoWaitServer)
+	if got, _ := refusal["error"].(string); !strings.Contains(got, "42883") {
+		t.Errorf("the waiting terminate's refusal logged error %q, want SQLSTATE 42883 (undefined function)", got)
+	}
+	signalledAt, establishedAt := logIndex(t, logs, logOrphanSignalled), logIndex(t, logs, logLockConnEstablished)
+	if signalledAt < 0 || establishedAt < signalledAt {
+		t.Fatalf("log order: %q at line %d, %q at line %d; want the signal first", logOrphanSignalled, signalledAt, logLockConnEstablished, establishedAt)
+	}
+	if i := logIndex(t, logs, logLockDialFailed); i >= 0 {
+		t.Fatalf("a lock dial failed: log line %d", i)
+	}
+	if got := r.locks.orphanForTest(); got != nil {
+		t.Fatalf("the orphan %+v is still recorded after a dial dealt with it", *got)
+	}
+	waitUntil(t, 5*time.Second, func() bool { return !lockBackendAlive(ctx, t, admin, uint32(orphan.pid)) })
+	waitUntil(t, 5*time.Second, func() bool {
+		_, err := r.GetOrSpawn(ctx, sessionID)
+		return err == nil
+	})
 }
