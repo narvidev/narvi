@@ -128,11 +128,13 @@ func outcomeText(trig turn.Trigger, failureReason turn.FailureReason) string {
 // SAME row the caller already fetched (a.stores.session.WithTx(tx).Get)
 // moments ago -- passed in rather than re-fetched here, so this function
 // never issues a redundant second SELECT of the same row inside the same
-// transaction. A 'web'-origin session (sessionRow.SpawnSource ==
-// sqlcgen.SessionSpawnSourceWeb) enqueues NOTHING -- there is no external
-// channel to notify. A non-'web'-origin session whose own reverse-lookup
+// transaction. A 'web'- or 'mcp'-origin session (sqlcgen.
+// SessionSpawnSourceWeb, sqlcgen.SessionSpawnSourceMcp) enqueues NOTHING
+// and logs nothing -- there is no external channel to notify: the browser
+// re-reads the session, and an MCP client polls its status or waits on it
+// (technical plan §43.20). A bot-origin session whose own reverse-lookup
 // row is missing (pgx.ErrNoRows from the matching GetBySessionID call --
-// should be unreachable in practice, since every non-'web' session is
+// should be unreachable in practice, since every bot-origin session is
 // created BY that same ingress path writing its own claim row first, but
 // defensive against any future gap) also enqueues nothing, logged as a
 // warning, never a hard failure of the whole turn completion.
@@ -150,7 +152,7 @@ func outcomeText(trig turn.Trigger, failureReason turn.FailureReason) string {
 // generic behavior unchanged (GitHub plan-mode verdicts are explicitly out
 // of this Step's own scope).
 func (a *Actor) enqueueOutboxNotification(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, trig turn.Trigger, failureReason turn.FailureReason, processing sqlcgen.Turn, plan *sqlcgen.Plan) error {
-	if sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceWeb {
+	if sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceWeb || sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceMcp {
 		return nil
 	}
 

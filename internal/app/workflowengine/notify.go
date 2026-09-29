@@ -13,9 +13,11 @@
 // reusing the SAME three wire payload shapes those existing plain
 // notifiers already consume (slackapi.Payload/linearapi.Payload/
 // githubapi.Payload) -- no new payload type anywhere in this file. A
-// 'web'-origin session, or a non-web session missing its own reverse-lookup
-// row, enqueues nothing (there is no external channel to notify either
-// way) -- logged, never an error propagated to the caller: a failed/absent
+// 'web'- or 'mcp'-origin session enqueues nothing and logs nothing: neither
+// has an external channel (the browser re-reads the session, and an MCP
+// client polls its status or waits on it, technical plan §43.20). A bot-
+// origin session missing its own reverse-lookup row also enqueues nothing
+// -- logged, never an error propagated to the caller: a failed/absent
 // notification must never undo or block the state change (run escalated,
 // step awaiting decision) that already committed alongside it, exactly
 // like every other outbox-enqueue call site in this codebase treats its own
@@ -98,7 +100,7 @@ type Deps struct {
 // sessionRow's own resolved destination -- see this file's own top doc
 // comment for the full destination-resolution/no-op-cases contract. Never
 // returns an error for a "no destination" outcome (a legitimate, common
-// case -- e.g. a 'web'-origin session); only a genuine store failure
+// case -- e.g. a 'web'- or 'mcp'-origin session); only a genuine store failure
 // (a reverse-lookup query itself erroring, not merely finding no row, or
 // the outbox insert itself failing) is returned, so the caller can decide
 // whether that is worth failing its own larger operation over (both of
@@ -108,7 +110,7 @@ type Deps struct {
 func enqueueWorkflowNotice(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, text string) error {
 	logger := platform.Logger(ctx)
 
-	if sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceWeb {
+	if sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceWeb || sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceMcp {
 		return nil
 	}
 
