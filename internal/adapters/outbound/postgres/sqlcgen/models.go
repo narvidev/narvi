@@ -2333,6 +2333,7 @@ type Sandbox struct {
 	BootEvidenceGen               *int32               `json:"boot_evidence_gen"`
 	BootingSince                  pgtype.Timestamptz   `json:"booting_since"`
 	BootingSinceGen               *int32               `json:"booting_since_gen"`
+	StopRetireGen                 *int32               `json:"stop_retire_gen"`
 }
 
 type SandboxHistory struct {
@@ -2393,6 +2394,7 @@ type Session struct {
 	EpistemicCheckEnabled  *bool                 `json:"epistemic_check_enabled"`
 	CreateIdempotencyKey   pgtype.UUID           `json:"create_idempotency_key"`
 	CreateRequestSha256    []byte                `json:"create_request_sha256"`
+	StopRequestedAt        pgtype.Timestamptz    `json:"stop_requested_at"`
 }
 
 type SessionTimer struct {
@@ -2450,6 +2452,7 @@ type Turn struct {
 	ReviewVerdictContext    []byte                `json:"review_verdict_context"`
 	DispatchedMessageID     *string               `json:"dispatched_message_id"`
 	IsReviewAttempt         bool                  `json:"is_review_attempt"`
+	StopRequestedAt         pgtype.Timestamptz    `json:"stop_requested_at"`
 }
 
 type TurnStepCost struct {

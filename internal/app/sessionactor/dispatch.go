@@ -389,6 +389,24 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, er
 			return fmt.Errorf("sessionactor: list turns: %w", err)
 		}
 
+		// Technical plan §3.3's stop, the dispatch gate: a pending turn a
+		// person's stop flagged is cancelled here instead of dispatched.
+		// The stop timer cancels it too, but a dispatch can run first --
+		// a turn ending, a sandbox turning ready -- and must not start work
+		// the person asked to stop. The gate keys on the flag alone, never
+		// on anything else about the session (a newer plan, say). Turns
+		// created after the request carry no flag and dispatch normally.
+		// Only pending turns reach this gate, so none of them was in
+		// flight: the sandbox has nothing to retire here.
+		if flagged := stopFlaggedPendingTurnIDs(turns); len(flagged) > 0 {
+			if _, err := a.cancelStoppedTurns(ctx, tx, sessionRow, flagged, now); err != nil {
+				return err
+			}
+			if turns, err = a.stores.turn.WithTx(tx).ListForSession(ctx, a.sessionID); err != nil {
+				return fmt.Errorf("sessionactor: list turns: %w", err)
+			}
+		}
+
 		// NextToDispatch already encodes "no in-flight turn AND a Pending
 		// turn exists" -- both branches (a) and (b) below need exactly
 		// that same predicate, just gated on a different sandbox-status
@@ -460,6 +478,18 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, er
 		// silently leaving it unstated or attempting a half-solution.
 		status := sandbox.State(sandboxRow.Status)
 		if status == sandbox.StateReady || status == sandbox.StateSuspect {
+			// Technical plan §3.3's stop: a gen a person's stop has still
+			// to retire (retireOrHold) takes nothing more. The agent may
+			// still be running the stopped work there, and its late
+			// execution_complete names a gen, never a turn: dispatched to
+			// it, the next turn would take that end as its own. The stop
+			// timer retires the gen once its delivery is over, and then
+			// dispatches this turn to a new one.
+			if retirementOwed(sandboxRow) {
+				a.logger.Info("sessionactor: pending turn held: its sandbox gen owes a stop its retirement",
+					"turn_id", pendingID.String(), "gen", sandboxRow.Gen)
+				return nil
+			}
 			d, err := a.tryPlanDispatch(ctx, tx, sessionRow, sandboxRow, pendingID, turns, now)
 			if err != nil {
 				return err
@@ -530,6 +560,17 @@ func (a *Actor) planReenqueueOrRespawn(
 		// No turn at all, or every turn is already terminal -- nothing
 		// for this session to do this round, exactly like planDispatch's
 		// own pre-existing early return.
+		return nil, nil, nil
+	}
+
+	// Technical plan §3.3's stop: a turn in flight that a person's stop
+	// flagged is neither re-sent nor respawned for -- it would start again
+	// the work the person asked to stop. The stop timer ends it within its
+	// StopGrace, and dispatch then resumes for any unflagged pending turn,
+	// on a new gen when the old one is retired (planDispatch holds it while
+	// that retirement is owed).
+	if target, ok := findTurnByID(turns, inFlightID); ok && target.StopRequestedAt.Valid {
+		a.logger.Info("sessionactor: in-flight turn flagged by a stop; not re-sent", "turn_id", inFlightID.String())
 		return nil, nil, nil
 	}
 

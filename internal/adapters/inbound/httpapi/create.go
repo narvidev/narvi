@@ -510,6 +510,16 @@ type CreateSessionError struct {
 	// first. POST /api/sessions answers it by reading that session back
 	// (replayCreate); no other caller sends a key.
 	IdempotencyConflict bool
+
+	// ParentStopped (technical plan §3.3's stop) is true iff the session
+	// would be a child (ChildSessionOptions.ParentSessionID) of a session a
+	// person stopped and nobody has resumed since -- another permanent
+	// refusal, like RolloutRefusal: the parent's stop request is cleared
+	// only by a person's own act on it (SessionStore.ClearStopRequest's
+	// callers), never by a retry, so a caller that routes an ordinary
+	// create error down a retry path (the sentinel auto-fix outbox) checks
+	// this field and gives up instead.
+	ParentStopped bool
 }
 
 func (e *CreateSessionError) Error() string { return e.Message }
@@ -866,6 +876,30 @@ func checkSubstrateCapabilitiesUpFront(registry *sessionactor.Registry, req rest
 func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.SessionStore, turns *postgres.TurnStore, environments *postgres.EnvironmentStore, auditLog *postgres.AuditLogStore, req restdtos.CreateSessionRequest, createdBy pgtype.UUID, epistemicCheckDefault bool, rolloutMode platform.RolloutMode, repoSettings *postgres.RepoSettingsStore, entitlement RepoEntitlementDecision, childOpts ...ChildSessionOptions) (session sqlcgen.Session, hasPrompt bool, cerr *CreateSessionError) {
 	logger := platform.Logger(ctx)
 	opts := childSessionOptionsFrom(childOpts)
+
+	// Technical plan §3.3's stop, no orphan child: before anything else, a
+	// child's parent row is read FOR SHARE. The foreign key's own KEY SHARE
+	// lock does not conflict with a stop's UPDATE of the parent, and even
+	// where it waits for the stop's row lock it then inserts the child
+	// without ever reading the request; FOR SHARE conflicts with both, and
+	// once the stop commits it reads the row the stop wrote. So a spawn
+	// racing a stop either commits first -- and the stop's walk of the
+	// parent's descendants, which starts after the parent's own stop has
+	// committed, finds this child -- or waits for the stop and is refused
+	// here. A parent that no longer exists is left to the foreign key,
+	// exactly as before.
+	if opts.ParentSessionID.Valid {
+		stopRequestedAt, err := sessions.WithTx(tx).StopRequestedAtForShare(ctx, opts.ParentSessionID)
+		switch {
+		case err == nil && stopRequestedAt.Valid:
+			logger.Info("httpapi: child session refused: its parent session was stopped",
+				"parent_session_id", opts.ParentSessionID.String())
+			return sqlcgen.Session{}, false, &CreateSessionError{Status: http.StatusConflict, Message: parentStoppedMessage, ParentStopped: true}
+		case err != nil && !errors.Is(err, pgx.ErrNoRows):
+			logger.Error("httpapi: read parent session's stop request failed", "error", err)
+			return sqlcgen.Session{}, false, &CreateSessionError{Status: http.StatusInternalServerError, Message: "internal error"}
+		}
+	}
 
 	// All request validation (repos non-empty, each repo's Name/Url/
 	// Branch, pathScope, mockConfig.contractsPath) lives in

@@ -1,0 +1,95 @@
+-- Step 217 (§3.3, "stopping a session, and every session it started"): a
+-- person's request to stop a session, written as data. POST
+-- /api/sessions/{sessionID}/stop sets turns.stop_requested_at on every turn
+-- open at that instant and sessions.stop_requested_at on the session, and
+-- upserts the session's `stop` timer to now, all in one transaction under
+-- the session's actor-epoch lock. The session's actor does the rest when
+-- the timer fires, through §3.3's existing cancel transition: a flagged
+-- pending turn is cancelled and never dispatched, a flagged turn in flight
+-- is sent the sandbox `stop` command and cancelled once StopGrace passes if
+-- it has not ended, its sandbox generation then retired (not before that
+-- generation has finished delivering an earlier turn's push and pull
+-- request, within MCPStatusDeliveryWindow). A turn created after the
+-- request carries no flag and runs normally.
+--
+-- sandboxes.stop_retire_gen is the retirement such a wait leaves owed: the
+-- gen a stopped turn was cancelled on, with no word from the agent, while
+-- that gen was still delivering. Nothing is dispatched to it meanwhile
+-- (sessionactor's planDispatch), since the agent may still be running the
+-- stopped work there and its late execution_complete names a gen, never a
+-- turn. It is cleared when the stop timer retires the gen, finds nothing
+-- left to retire, or the row moves to a new gen (UpsertSandboxForSpawn).
+-- NULL means no retirement is owed.
+--
+-- sessions.stop_requested_at also refuses a new child session of a stopped
+-- parent (httpapi.CreateSessionOnTx reads it FOR SHARE), until a person's
+-- next act that sets the session going again clears it: a turn they
+-- create, their approval of its plan, or their approval or revision of a
+-- workflow step awaiting their decision. Stop is not an archive.
+--
+-- The two stop_requested_at columns are nullable, with no default: NULL
+-- means no stop was requested. A repeated request keeps each turn's first instant (COALESCE),
+-- so the grace a turn in flight gets runs from the first request that
+-- reached it, and moves the session's to its own (GREATEST), which the
+-- disarming of scheduled work is measured against.
+--
+-- # Locks
+--
+-- golang-migrate sends this whole file as one batch, which Postgres runs as
+-- one implicit transaction (000149 says the same of its own file). ADD
+-- COLUMN with no default is a catalog change that rewrites nothing, but
+-- each ALTER TABLE takes ACCESS EXCLUSIVE on its table and the transaction
+-- holds all three until the file ends, so every query on sessions, turns
+-- or sandboxes waits for it. sessions is locked first, then turns, then
+-- sandboxes: the session actor and the REST handlers lock the session row
+-- before they touch a turn or a sandbox.
+--
+-- # Rolling deploy
+--
+-- Only a binary that carries this migration knows the `stop` timer. During
+-- a rolling deploy, a stop that a newer pod accepts is written and answered
+-- 202, but a session whose actor is still hosted on an older pod is not
+-- stopped yet. That actor logs "ignoring TimerFired with unknown name" and
+-- leaves the timer armed, so the pump redelivers it every claim window and
+-- an older pod reads the session as having scheduled work. It dispatches
+-- the flagged queued turns, and lets a flagged running turn run on and push
+-- as usual. Nothing is lost: the flags and the timer are rows, and the
+-- first actor on a newer pod to host the session cancels whatever is still
+-- flagged and open. Work that ends before then keeps its result.
+--
+-- DEPLOY: finish the rollout before relying on a stop. When a stop must
+-- take effect during the deploy, terminate the pods still on the previous
+-- binary (they cannot restart anyway, see below): the session's actor then
+-- moves to an updated pod, which carries the stop out. The stop does not
+-- need repeating.
+--
+-- # Rolling back
+--
+-- Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for. So once this migration is applied:
+--   - An older pod that is already running keeps working: every query it
+--     makes on sessions, turns and sandboxes names its columns, and none
+--     names these three. It cannot carry a stop out, though (see Rolling
+--     deploy), and it does not read stop_retire_gen: it dispatches to a
+--     gen whose retirement is owed.
+--   - An older pod that restarts does not boot ("no migration found for
+--     version 151"). That covers a rollback and an old pod restarting in
+--     the middle of a rolling deploy. A binary without 000151 cannot boot
+--     once it is applied.
+--   - Rolling the binary back is safe only to a binary that carries
+--     000151; 000150's same rule now names this version.
+--   - Rolling back further first needs the down migration. The control
+--     plane only ever migrates up, so run it with the golang-migrate CLI
+--     and this release's migrations (goto 150), with the control plane
+--     scaled to zero, then deploy the older binary. The down file says why
+--     not against live pods.
+--   - The down drops every pending stop request with its columns: a turn
+--     flagged but not yet cancelled then dispatches as if no stop had been
+--     asked for, a stopped parent accepts new children again, and a gen
+--     whose retirement is owed takes the next turn.
+ALTER TABLE sessions ADD COLUMN stop_requested_at timestamptz;
+
+ALTER TABLE turns ADD COLUMN stop_requested_at timestamptz;
+
+ALTER TABLE sandboxes ADD COLUMN stop_retire_gen integer;

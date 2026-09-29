@@ -13801,6 +13801,75 @@ func (j *ShadowLedgerSummary) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// 202 response body for POST /api/sessions/{sessionID}/stop (technical plan §3.3):
+// a person's request to stop a session and every session it started, accepted and
+// written as data. No request body. Accepted is not done: every turn open at the
+// request is flagged, and the session's actor cancels each through §3.3's own
+// cancel transition -- a pending one at once, a running one once the sandbox's own
+// stop, or the grace after it (StopGrace, 30s), ends it -- also while its sandbox
+// is still delivering an earlier turn's push and pull request, and nothing is
+// pushed for it. What waits for such a delivery is the replacement of that
+// sandbox, for at most MCPStatusDeliveryWindow (10 minutes), and a turn created
+// meanwhile waits with it. Turns created after the request run normally. Read GET
+// /api/sessions/{sessionID}/status to see the session settle. Repeating the
+// request is not a no-op: it flags whatever is open at that moment -- a turn
+// created since the first request too, which then stops -- writes its own audit
+// row, and answers its own requestedAt.
+type StopSessionResponse struct {
+	// How many turns were pending, dispatched or processing across every reached
+	// session when the request was written -- the turns it flagged to be cancelled. 0
+	// when nothing was running; the request still stands, refusing new child sessions
+	// until a person resumes the session.
+	OpenTurns int `json:"openTurns" yaml:"openTurns" mapstructure:"openTurns"`
+
+	// Every session this request reached and stopped: the session named in the path
+	// first, then every session it started, recursively (children, then their
+	// children), in the order the walk reached them. A child whose creation raced the
+	// request is either listed here or was refused.
+	ReachedSessionIds []string `json:"reachedSessionIds" yaml:"reachedSessionIds" mapstructure:"reachedSessionIds"`
+
+	// When this request was made. A repeated request answers its own instant, later
+	// than the one before, and the session's scheduled work that would create a turn
+	// with no new input (a re-review) is then disarmed up to it, including what was
+	// scheduled since the earlier request. A person's next act that sets the session
+	// going again clears the stop: a turn they create, their approval of its plan, or
+	// their approval or revision of a workflow step awaiting their decision.
+	RequestedAt time.Time `json:"requestedAt" yaml:"requestedAt" mapstructure:"requestedAt"`
+
+	// The session named in the path.
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *StopSessionResponse) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["openTurns"]; raw != nil && !ok {
+		return fmt.Errorf("field openTurns in StopSessionResponse: required")
+	}
+	if _, ok := raw["reachedSessionIds"]; raw != nil && !ok {
+		return fmt.Errorf("field reachedSessionIds in StopSessionResponse: required")
+	}
+	if _, ok := raw["requestedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field requestedAt in StopSessionResponse: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in StopSessionResponse: required")
+	}
+	type Plain StopSessionResponse
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 0 > plain.OpenTurns {
+		return fmt.Errorf("field %s: must be >= %v", "openTurns", 0)
+	}
+	*j = StopSessionResponse(plain)
+	return nil
+}
+
 // Request body for PUT /api/repos/{owner}/{repo}/auto-approval-settings (§21.2
 // stage 1) -- the auto-approval eligibility engine's own two per-repo-tunable
 // criteria. A SEPARATE endpoint from UpdateRepoSettingsRequest's own PUT
@@ -15706,6 +15775,8 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
+
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
 // exists before any turn does.
@@ -15769,7 +15840,5 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 }
 
 type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
-
-type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
 
 type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict

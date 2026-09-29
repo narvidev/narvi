@@ -79,10 +79,11 @@ func roles(rs ...Role) roleSet {
 // actionRule is one matrix row: allow is the set of roles permitted
 // unconditionally; allowIfOwned is an ADDITIONAL set of roles permitted
 // only when the caller's own Resource.OwnedOrJoined is true — nil for
-// every action with no own/joined carve-out (which is most of them; only
-// ActionPromptSession/ActionApprovePlan, per §13.3 row 2, and
-// ActionDecideWorkflowStep, per §25.11's "same row as ActionApprovePlan",
-// set it).
+// every action with no own/joined carve-out (which is most of them; the
+// ones that set it are the row-2 actions acting on an existing resource --
+// ActionPromptSession/ActionApprovePlan, per §13.3 row 2, and the actions
+// placed in that row by analogy -- and ActionStopSession, per owner
+// decision O1).
 type actionRule struct {
 	allow        roleSet
 	allowIfOwned roleSet
@@ -146,9 +147,11 @@ var matrix = map[Action]actionRule{
 	// explicitly).
 	ActionMergePR: {allow: roles(RoleAdmin, RoleMaintainer), allowIfOwned: roles(RoleMember)},
 
-	// Row 3: stop/resume ANY session -- admin/maintainer only, no member
-	// own/joined escape hatch (see action.go's own doc comment on why).
-	ActionStopSession:   {allow: roles(RoleAdmin, RoleMaintainer)},
+	// Row 3: stop/resume ANY session -- admin/maintainer. Stopping also
+	// admits a member on their own or joined sessions (owner decision O1,
+	// technical plan §13.3 -- action.go's own doc comment); resuming does
+	// not.
+	ActionStopSession:   {allow: roles(RoleAdmin, RoleMaintainer), allowIfOwned: roles(RoleMember)},
 	ActionResumeSession: {allow: roles(RoleAdmin, RoleMaintainer)},
 	// §29: shadow-comparison tooling reads across ANY two turns --
 	// same row as stop/resume, same reasoning (action.go's own doc

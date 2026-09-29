@@ -61,3 +61,30 @@ func TestDeriveFailureReason(t *testing.T) {
 		})
 	}
 }
+
+// TestImpliedFailureReason pins which stored states carry their reason: a
+// cancelled turn is always cancelled, whatever it was cancelled from; a
+// failed turn could be failed, timed out or never started, so its state
+// alone says nothing; no other state carries a reason.
+func TestImpliedFailureReason(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		state  turn.State
+		want   turn.FailureReason
+		wantOK bool
+	}{
+		{turn.StateCancelled, turn.FailureReasonCancelled, true},
+		{turn.StateFailed, "", false},
+		{turn.StateCompleted, "", false},
+		{turn.StatePending, "", false},
+		{turn.StateDispatched, "", false},
+		{turn.StateProcessing, "", false},
+		{turn.State("unknown"), "", false},
+	} {
+		got, ok := turn.ImpliedFailureReason(tc.state)
+		if got != tc.want || ok != tc.wantOK {
+			t.Errorf("ImpliedFailureReason(%s) = %q, %v; want %q, %v", tc.state, got, ok, tc.want, tc.wantOK)
+		}
+	}
+}

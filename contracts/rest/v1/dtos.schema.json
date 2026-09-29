@@ -939,6 +939,42 @@
         }
       }
     },
+    "StopSessionResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "202 response body for POST /api/sessions/{sessionID}/stop (technical plan \u00a73.3): a person's request to stop a session and every session it started, accepted and written as data. No request body. Accepted is not done: every turn open at the request is flagged, and the session's actor cancels each through \u00a73.3's own cancel transition -- a pending one at once, a running one once the sandbox's own stop, or the grace after it (StopGrace, 30s), ends it -- also while its sandbox is still delivering an earlier turn's push and pull request, and nothing is pushed for it. What waits for such a delivery is the replacement of that sandbox, for at most MCPStatusDeliveryWindow (10 minutes), and a turn created meanwhile waits with it. Turns created after the request run normally. Read GET /api/sessions/{sessionID}/status to see the session settle. Repeating the request is not a no-op: it flags whatever is open at that moment -- a turn created since the first request too, which then stops -- writes its own audit row, and answers its own requestedAt.",
+      "required": [
+        "sessionId",
+        "requestedAt",
+        "reachedSessionIds",
+        "openTurns"
+      ],
+      "properties": {
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "The session named in the path."
+        },
+        "requestedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When this request was made. A repeated request answers its own instant, later than the one before, and the session's scheduled work that would create a turn with no new input (a re-review) is then disarmed up to it, including what was scheduled since the earlier request. A person's next act that sets the session going again clears the stop: a turn they create, their approval of its plan, or their approval or revision of a workflow step awaiting their decision."
+        },
+        "reachedSessionIds": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "description": "Every session this request reached and stopped: the session named in the path first, then every session it started, recursively (children, then their children), in the order the walk reached them. A child whose creation raced the request is either listed here or was refused."
+        },
+        "openTurns": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "How many turns were pending, dispatched or processing across every reached session when the request was written -- the turns it flagged to be cancelled. 0 when nothing was running; the request still stands, refusing new child sessions until a person resumes the session."
+        }
+      }
+    },
     "PostReviewVerdictRequest": {
       "type": "object",
       "additionalProperties": false,

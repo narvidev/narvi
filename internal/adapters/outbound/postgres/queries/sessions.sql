@@ -451,3 +451,51 @@ LEFT JOIN LATERAL (
     WHERE rcr.session_id = s.id
 ) releaserunning ON true
 WHERE s.id = sqlc.arg('session_id');
+
+-- name: RequestSessionStop :one
+-- A person's stop request on this session (technical plan §3.3, POST
+-- /api/sessions/{sessionID}/stop, migrations/000151). The session keeps
+-- the latest request's instant: a repeated request moves it forward, so
+-- the stop timer's handler disarms the work-creating timers armed before
+-- the latest request, not only those armed before the first
+-- (sessionactor.disarmWorkCreatingTimers). GREATEST, not a plain now(): two
+-- requests serialized by the lock below in the other order than their
+-- transactions began never move it back. Each turn keeps its own first
+-- flag (RequestStopOpenTurns), which its grace runs from. Runs under
+-- GetSessionActorEpochForUpdate's own lock, in the transaction that flags
+-- the session's open turns and arms its stop timer.
+UPDATE sessions
+SET stop_requested_at = GREATEST(stop_requested_at, now())
+WHERE id = $1
+RETURNING stop_requested_at;
+
+-- name: ClearSessionStopRequest :execrows
+-- A person's next act that sets the session going again clears the
+-- request -- stop is not an archive: the next turn a person creates on the
+-- session, the approval of its plan, or a person's decision to approve or
+-- revise a workflow step awaiting it. Turns keep their own flags; only the
+-- session's -- what refuses a new child session, and ends a workflow run
+-- whose attempt ends -- is cleared.
+UPDATE sessions
+SET stop_requested_at = NULL
+WHERE id = $1 AND stop_requested_at IS NOT NULL;
+
+-- name: GetSessionStopRequestedAtForShare :one
+-- Read by httpapi.CreateSessionOnTx before it inserts a child session of
+-- this one. FOR SHARE, not the foreign key's own KEY SHARE: KEY SHARE does
+-- not conflict with RequestSessionStop's UPDATE and never reads the
+-- request, FOR SHARE conflicts with the stop's locks and reads the row the
+-- stop committed. So a child spawn racing a stop either commits first, and
+-- the stop's walk of the parent's descendants finds it, or waits for the
+-- stop and is refused.
+SELECT stop_requested_at FROM sessions
+WHERE id = $1
+FOR SHARE;
+
+-- name: ListChildSessionIDs :many
+-- The direct children of one session (sessions_parent_session_id_idx),
+-- oldest first: the stop request's walk reads them after the parent's own
+-- stop has committed.
+SELECT id FROM sessions
+WHERE parent_session_id = $1
+ORDER BY created_at, id;

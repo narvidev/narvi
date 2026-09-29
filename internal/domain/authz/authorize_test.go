@@ -182,15 +182,20 @@ func TestAuthorize_ExhaustiveMatrix(t *testing.T) {
 		{"viewer cannot link chatgpt account", authz.RoleViewer, authz.ActionLinkChatGPTAccount, false, false},
 		{"viewer cannot link chatgpt account even if ownedOrJoined", authz.RoleViewer, authz.ActionLinkChatGPTAccount, true, false},
 
-		// Row 3a: stop/resume ANY session -- admin/maintainer ONLY. No
-		// member own/joined escape hatch at all, unlike prompt/approve
-		// above -- asserted with ownedOrJoined=true too, to prove the
-		// carve-out genuinely does not exist for this action.
+		// Row 3a: stop ANY session -- admin/maintainer; a member stops
+		// their own or joined sessions (owner decision O1, §13.3); a
+		// viewer never, owned or not.
 		{"admin stops any session", authz.RoleAdmin, authz.ActionStopSession, false, true},
+		{"admin stops any session (ownedOrJoined irrelevant)", authz.RoleAdmin, authz.ActionStopSession, true, true},
 		{"maintainer stops any session", authz.RoleMaintainer, authz.ActionStopSession, false, true},
+		{"maintainer stops any session (ownedOrJoined irrelevant)", authz.RoleMaintainer, authz.ActionStopSession, true, true},
 		{"member cannot stop a session they do not own", authz.RoleMember, authz.ActionStopSession, false, false},
-		{"member cannot stop even a session they own/joined", authz.RoleMember, authz.ActionStopSession, true, false},
+		{"member stops a session they own/joined", authz.RoleMember, authz.ActionStopSession, true, true},
 		{"viewer cannot stop any session", authz.RoleViewer, authz.ActionStopSession, false, false},
+		{"viewer cannot stop even a session they own/joined", authz.RoleViewer, authz.ActionStopSession, true, false},
+		// Resume keeps row 3's admin/maintainer-only shape: no member
+		// own/joined escape hatch -- asserted with ownedOrJoined=true too,
+		// to prove the carve-out genuinely does not exist for it.
 		{"admin resumes any session", authz.RoleAdmin, authz.ActionResumeSession, false, true},
 		{"maintainer resumes any session", authz.RoleMaintainer, authz.ActionResumeSession, false, true},
 		{"member cannot resume a session they do not own", authz.RoleMember, authz.ActionResumeSession, false, false},

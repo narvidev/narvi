@@ -14,6 +14,7 @@
 //	| View sessions / analytics                                  |  ✓    |     ✓      |   ✓    | ✓ (ro) |
 //	| Create sessions, prompt, approve plans, decide workflow     |  ✓    |     ✓      |   ✓    |   —    |
 //	  steps (§25.11) on own/joined
+//	| Stop own/joined sessions (O1), not a PR's review session    |  ✓    |     ✓      |   ✓    |   —    |
 //	| Stop/resume ANY session; approve ANY plan                   |  ✓    |     ✓      |   —    |   —    |
 //	| Manage automations, environments, repo/env secrets,          |  ✓    |     ✓      |   —    |   —    |
 //	  workflow definitions (§25.11)
@@ -30,11 +31,14 @@
 // prompting/creating a turn on an existing session, §13.3 row 2;
 // deciding a workflow run's HITL step, §25.11's "same row as
 // ActionApprovePlan") — an ADDITIONAL set of roles allowed only when the
-// caller also proves resource.OwnedOrJoined (allowIfOwned). "Stop/resume ANY session" has no own/joined carve-out
-// at all for member — the matrix's own row 3 never mentions a member
-// escape hatch the way row 2 does for create/prompt/approve, so a member
-// who created their own session still cannot stop/resume it; only
-// admin/maintainer can. This asymmetry is deliberate, not a gap — see
+// caller also proves resource.OwnedOrJoined (allowIfOwned). Stopping
+// gained the same carve-out by owner decision O1 (§13.3): a member stops
+// their own or joined sessions, the work row 2 already lets them start and
+// prompt, while "stop/resume ANY session" stays admin/maintainer. A pull
+// request's review session is outside that carve-out: the caller that
+// resolves Resource.OwnedOrJoined for a stop (httpapi's StopSession)
+// passes false for one, so stopping it takes admin or maintainer whoever
+// created or joined it (§13.3). Resuming has no member carve-out — see
 // action.go's own doc comments on ActionStopSession/ActionResumeSession.
 //
 // # What resource ownership resolution is NOT this package's job
@@ -50,7 +54,8 @@
 // features these Actions already reserve a name for)
 //
 //   - internal/adapters/inbound/httpapi's CreateSession (ActionCreateSession),
-//     CreateTurn (ActionPromptSession), ApprovePlan/RejectPlan via
+//     CreateTurn (ActionPromptSession), StopSession (ActionStopSession),
+//     ApprovePlan/RejectPlan via
 //     canActOnPlan (ActionApprovePlan) — see planauthz.go's own doc
 //     comment for why that predicate is now a thin Authorize wrapper,
 //     not a second, parallel rule set.

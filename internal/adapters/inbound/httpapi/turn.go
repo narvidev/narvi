@@ -1025,6 +1025,18 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 	// this correctly skips.
 	workflowengine.AttachTurn(ctx, workflows, resolution, created.ID)
 
+	// Technical plan §3.3: the next turn a person creates resumes a stopped
+	// session -- stop is not an archive. Every caller of this core is a
+	// person's act (a REST prompt, a Slack or Linear reply, a GitHub
+	// mention, the re-review button), so the session's stop request is
+	// cleared in the same transaction as the turn, and the session accepts
+	// new child sessions again. Turns keep their own flags: one still open
+	// is still cancelled.
+	if _, err := sessions.WithTx(tx).ClearStopRequest(ctx, sessionID); err != nil {
+		logger.Error("httpapi: clear session stop request failed", "error", err)
+		return sqlcgen.Turn{}, false, &CreateTurnError{Status: http.StatusInternalServerError, Message: "internal error"}
+	}
+
 	if err := recordAuditLog(ctx, auditLog.WithTx(tx), actorUserID, "turn.create", "turn", created.ID.String(), map[string]any{
 		"session_id": sessionID.String(),
 		"plan_mode":  planMode,

@@ -102,6 +102,10 @@ RETURNING *;
 -- rejected as stale-gen -- so its delivery is over, and the session's
 -- status must not keep reading it as under way until
 -- MCPStatusDeliveryWindow runs out.
+--
+-- stop_retire_gen (technical plan §3.3, migrations/000151) is cleared too:
+-- it names the gen a person's stop has still to retire, and a new gen owes
+-- nothing -- the one it replaces is fenced off by the bump itself.
 INSERT INTO sandboxes (session_id, gen, status, token_hash)
 VALUES ($1, 1, 'spawning', $2)
 ON CONFLICT (session_id) DO UPDATE
@@ -114,6 +118,7 @@ SET gen = sandboxes.gen + 1,
     image_decision_reason = NULL,
     image_decision_fingerprint = NULL,
     pr_delivery_started_at = NULL,
+    stop_retire_gen = NULL,
     updated_at = now()
 RETURNING *;
 
@@ -370,6 +375,38 @@ WHERE session_id = $1;
 UPDATE sandboxes
 SET pr_delivery_started_at = NULL, updated_at = now()
 WHERE session_id = $1 AND pr_delivery_started_at IS NOT NULL;
+
+-- name: GetSandboxPRDelivery :one
+-- Read by the stop timer's handler (technical plan §3.3,
+-- sessionactor.deliveryHold) before it retires the sandbox gen a stopped
+-- turn ran on: whether a completed turn's push and pull request, stamped
+-- by StartSandboxPRDelivery, are still being delivered by this sandbox,
+-- and which gen an earlier fire left a retirement owed on
+-- (stop_retire_gen). observed_at is now() on the database's clock, the
+-- clock that wrote the stamp and the one the timer pump compares fires_at
+-- with, so neither the window's end nor the instant the stop timer is
+-- re-armed for depends on the skew between the database and the replica.
+SELECT status, gen, pr_delivery_started_at, stop_retire_gen, now()::timestamptz AS observed_at
+FROM sandboxes
+WHERE session_id = $1;
+
+-- name: SetSandboxStopRetireGen :exec
+-- Technical plan §3.3 (migrations/000151): the stop timer cancelled a
+-- stopped turn in flight on gen with no word from the agent, and gen is
+-- still delivering a completed turn's push and pull request, so its
+-- retirement waits. Nothing is dispatched to gen until then
+-- (sessionactor's planDispatch). Written only while the row is at gen.
+UPDATE sandboxes
+SET stop_retire_gen = sqlc.arg('gen')::integer, updated_at = now()
+WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;
+
+-- name: ClearSandboxStopRetireGen :exec
+-- Technical plan §3.3: the retirement SetSandboxStopRetireGen left owed is
+-- done, or there is nothing left to retire (the sandbox is dead, or its
+-- gen moved on). A no-op when none is owed.
+UPDATE sandboxes
+SET stop_retire_gen = NULL, updated_at = now()
+WHERE session_id = $1 AND stop_retire_gen IS NOT NULL;
 
 -- name: ListLiveSandboxesWithSessionRepos :many
 -- §30.4's own repo-demotion sweep (internal/app/seed): every LIVE sandbox

@@ -138,3 +138,34 @@ func (s *SessionStore) List(ctx context.Context, arg sqlcgen.ListSessionsParams)
 func (s *SessionStore) ListOutcomeCountsInWindow(ctx context.Context, sinceTime pgtype.Timestamptz) ([]sqlcgen.ListSessionOutcomeCountsInWindowRow, error) {
 	return s.q.ListSessionOutcomeCountsInWindow(ctx, sinceTime)
 }
+
+// RequestStop records a person's stop request on the session (technical
+// plan §3.3, migrations/000151) and returns the instant the request now in
+// force was first made -- a repeated request keeps the first. Meaningful
+// only on a store built via WithTx, under GetActorEpochForUpdate's lock.
+func (s *SessionStore) RequestStop(ctx context.Context, id pgtype.UUID) (pgtype.Timestamptz, error) {
+	return s.q.RequestSessionStop(ctx, id)
+}
+
+// ClearStopRequest clears the session's stop request (technical plan §3.3):
+// called, in its own transaction, by each person's act that sets the
+// session going again -- httpapi's createTurnLocked, DecidePlanOnTx
+// (approve) and DecideWorkflowStep (approve, revise). Reports whether a
+// request was set.
+func (s *SessionStore) ClearStopRequest(ctx context.Context, id pgtype.UUID) (bool, error) {
+	n, err := s.q.ClearSessionStopRequest(ctx, id)
+	return n > 0, err
+}
+
+// StopRequestedAtForShare reads the session's stop request under FOR SHARE
+// -- the lock that makes a child session's insert wait for, or be seen by,
+// a concurrent stop of this parent (see GetSessionStopRequestedAtForShare's
+// own comment). Meaningful only on a store built via WithTx.
+func (s *SessionStore) StopRequestedAtForShare(ctx context.Context, id pgtype.UUID) (pgtype.Timestamptz, error) {
+	return s.q.GetSessionStopRequestedAtForShare(ctx, id)
+}
+
+// ListChildIDs returns the direct children of the session, oldest first.
+func (s *SessionStore) ListChildIDs(ctx context.Context, parentID pgtype.UUID) ([]pgtype.UUID, error) {
+	return s.q.ListChildSessionIDs(ctx, parentID)
+}

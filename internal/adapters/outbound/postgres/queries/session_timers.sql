@@ -40,3 +40,10 @@ RETURNING *;
 -- name: DeleteSessionTimer :exec
 DELETE FROM session_timers
 WHERE session_id = $1 AND name = $2;
+
+-- name: ListSessionTimers :many
+-- Every timer armed on one session: the stop timer's handler deletes the
+-- ones whose firing creates a turn (sessionactor.ClassifyTimer).
+SELECT * FROM session_timers
+WHERE session_id = $1
+ORDER BY name;

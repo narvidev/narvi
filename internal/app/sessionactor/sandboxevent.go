@@ -259,8 +259,15 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 	// (bootevidence.go), and counted only once transact has committed, so a
 	// rolled-back pass is never counted.
 	var bootEvidenceFallbackFired bool
+	// staleGen is set when the gen fence below drops this event, so the
+	// post-commit block runs none of its side effects for it either: §9.3
+	// scenario #6's "session unaffected". Without it, an old gen's late
+	// execution_complete -- a retired gen's after a stop (stop.go), say --
+	// would still start a snapshot of the current gen's sandbox, mid-turn.
+	var staleGen bool
 
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		staleGen = false
 		now := time.Now()
 
 		row, err := a.stores.sandbox.WithTx(tx).Get(ctx, a.sessionID)
@@ -277,10 +284,11 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// EXPECTED occurrence -- an old-gen sandbox reconnecting/replaying
 		// after a respawn -- never a failure: skip persisting it entirely,
 		// never touch last_seen_at, never ack. outcome stays the zero value
-		// (Persisted: false, AckID: "").
+		// (Persisted: false, AckID: ""), and nothing runs after the commit.
 		if cmd.Gen != int(row.Gen) {
 			a.logger.Warn("sessionactor: ignoring stale-gen sandbox event",
 				"event_type", cmd.Type, "event_gen", cmd.Gen, "sandbox_gen", row.Gen)
+			staleGen = true
 			return nil
 		}
 
@@ -641,7 +649,7 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 	default:
 	}
 
-	if err == nil {
+	if err == nil && !staleGen {
 		if bootEvidenceFallbackFired {
 			a.recordBootEvidenceFallback(ctx)
 		}
@@ -1060,6 +1068,15 @@ func (a *Actor) triggerSnapshotBestEffort(ctx context.Context) {
 			return fmt.Errorf("sessionactor: get sandbox: %w", err)
 		}
 		if sandbox.State(row.Status) != sandbox.StateReady {
+			return nil
+		}
+		// Technical plan §3.3's stop: a gen a person's stop has still to
+		// retire (retireOrHold) is snapshotted no more. The execution_complete
+		// that got here may be the stopped work's own late end, which
+		// completed nothing: a snapshot now would keep what the stopped work
+		// changed, for the next turn to restore and push.
+		if retirementOwed(row) {
+			a.logger.Info("sessionactor: snapshot not started: this sandbox gen owes a stop its retirement", "gen", row.Gen)
 			return nil
 		}
 

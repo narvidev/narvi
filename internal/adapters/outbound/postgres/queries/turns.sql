@@ -431,3 +431,37 @@ FROM turns
 WHERE cost_usd IS NOT NULL AND created_at >= $1
 GROUP BY COALESCE(model_id, 'unknown')
 ORDER BY total_cost_usd DESC;
+
+-- name: RequestStopOpenTurns :many
+-- A person's stop request (technical plan §3.3, migrations/000151): flags
+-- every turn of the session open at this instant, in the transaction that
+-- flags the session and arms its stop timer, under the session's
+-- actor-epoch lock. A turn already flagged keeps its first instant, so the
+-- grace a turn in flight gets runs from the first request. The actor
+-- decides what each flag means; nothing here moves a turn.
+UPDATE turns
+SET stop_requested_at = COALESCE(stop_requested_at, now())
+WHERE session_id = $1 AND status IN ('pending', 'dispatched', 'processing')
+RETURNING id;
+
+-- name: ListStopRequestedOpenTurns :many
+-- The session's flagged turns still open, oldest first, for the actor's
+-- stop timer. grace_elapsed compares the flag with now() on the database's
+-- own clock -- the clock that wrote it, and the one the timer pump compares
+-- fires_at with -- so neither the decision between sending the sandbox
+-- `stop` and cancelling, nor the instant the timer is re-armed for
+-- (stop_requested_at plus the grace), depends on the skew between the
+-- database and this replica. dispatched_sandbox_gen tells the handler
+-- whether cancelling a turn in flight would retire the sandbox's current
+-- gen (sessionactor's deliveryHold and retireStoppedGen).
+SELECT
+    id,
+    status,
+    stop_requested_at,
+    dispatched_sandbox_gen,
+    COALESCE(stop_requested_at <= now() - make_interval(secs => sqlc.arg('grace_seconds')::float8), false)::boolean AS grace_elapsed
+FROM turns
+WHERE session_id = sqlc.arg('session_id')
+  AND stop_requested_at IS NOT NULL
+  AND status IN ('pending', 'dispatched', 'processing')
+ORDER BY created_at ASC, id ASC;

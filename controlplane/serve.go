@@ -2101,6 +2101,20 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// REST API -- enqueues a new turn on an existing session, 409 if
 		// one is already in flight. See httpapi/turn.go's own doc comment.
 		r.Post("/{sessionID}/turns", httpapi.CreateTurn(pool, sessionStore, turnStore, planStore, participantStore, auditLogStore, registry, intentClassifierSvc, cfg.ObjectStorage, cfg.EpistemicCheckDefault))
+		// stop (technical plan §3.3): a person's request to stop the
+		// session and every session it started, written as data under the
+		// session's actor-epoch lock; the actor does the rest. See
+		// httpapi/stop.go's own doc comment.
+		r.Post("/{sessionID}/stop", httpapi.StopSession(httpapi.StopSessionDeps{
+			Pool:             pool,
+			Sessions:         sessionStore,
+			Turns:            turnStore,
+			Timers:           timerStore,
+			Participants:     participantStore,
+			AuditLog:         auditLogStore,
+			GitHubPRSessions: githubPRSessionStore,
+			Registry:         registry,
+		}))
 		// plans ("plan mode, web", §8.1/§12.2 item 3): the
 		// approve/reject HITL actions -- see httpapi/planapprove.go's own
 		// doc comment for the full sequencing. outboxStore/

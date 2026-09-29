@@ -89,6 +89,27 @@ type Timeouts struct {
 	// coarser supervisor cap would.
 	TurnDeadline time.Duration
 
+	// StopGrace is how long a turn in flight that a person stopped
+	// (technical plan §3.3, POST /api/sessions/{sessionID}/stop) is given to
+	// end through the sandbox's own `stop` command before the session actor
+	// cancels it itself. The actor's `stop` timer sends the command and
+	// re-arms for the turn's own stop_requested_at plus StopGrace; when it
+	// fires again and the turn is still dispatched or processing -- the
+	// agent stayed silent, or there was no sandbox to tell -- the turn is
+	// cancelled with a synthetic execution_complete, as turn_deadline ends a
+	// turn, and its sandbox gen retired. While that gen still delivers a
+	// completed turn's push and pull request, only the retirement waits --
+	// the turn is cancelled all the same, and nothing is dispatched to the
+	// gen meanwhile -- looked at again every StopGrace and never past
+	// MCPStatusDeliveryWindow from the delivery's start (sessionactor's
+	// deliveryHold). Measured on the database's clock. Not given a value
+	// in the plan; 30s, long enough for an agent to abort its run and report
+	// it, short enough that a stop reads as a stop. Validate keeps it
+	// positive -- at zero every flagged turn in flight would be cancelled at
+	// the first fire, before the agent heard of the stop -- and below
+	// TurnDeadline, which would otherwise end the turn first.
+	StopGrace time.Duration
+
 	// SSEInactivityTimeout is the OpenCode SSE inactivity timeout (§7:
 	// "SSE inactivity timeout configurable (default 120s)").
 	SSEInactivityTimeout time.Duration
@@ -3748,6 +3769,7 @@ func DefaultTimeouts() Timeouts {
 		ProviderHardCap:           2 * time.Hour,     // §5.4, explicit
 		SupervisorTurnCap:         90 * time.Minute,  // not specified; chosen with margin below ProviderHardCap
 		TurnDeadline:              60 * time.Minute,  // not specified; chosen with margin below SupervisorTurnCap
+		StopGrace:                 30 * time.Second,  // not specified; chosen (§3.3's stop)
 		SSEInactivityTimeout:      120 * time.Second, // §7, explicit
 		ProviderHTTPClientTimeout: 5 * time.Minute,   // not specified; must clear ProviderWorstColdStart (§4.1) with margin
 		ProviderWorstColdStart:    220 * time.Second, // §4.1, "220s+" floor
@@ -4271,6 +4293,15 @@ func (t Timeouts) Validate() error {
 	mustBePositive("AutomationDispatchThrottleWindow", t.AutomationDispatchThrottleWindow)
 	mustBePositive("CircuitBreakerWindow", t.CircuitBreakerWindow)
 	mustBePositive("RepoAccessCheckBreakerWindow", t.RepoAccessCheckBreakerWindow)
+
+	// §3.3's stop: a zero grace cancels every stopped turn in flight at the
+	// stop timer's first fire, before the sandbox has heard of the stop,
+	// and a grace at or past TurnDeadline lets the deadline end the turn
+	// first, as a timeout rather than a cancel. See StopGrace's own doc
+	// comment.
+	mustBePositive("StopGrace", t.StopGrace)
+	check("TurnDeadline > StopGrace",
+		"TurnDeadline", t.TurnDeadline, "StopGrace", t.StopGrace)
 
 	// §43.15: the registration rate limit. A zero refill interval is no
 	// limit at all (rate.Every(0) is rate.Inf) -- the same fail-OPEN-at-zero

@@ -126,6 +126,7 @@ var stepRefPins = []stepRefPin{
 	{"migrations/000140_identities_oidc_provider.up.sql", "164", "OIDC sign-in"},
 	{"migrations/000149_session_spawn_source_mcp.up.sql", "183", "plan, revision and stop over MCP"},
 	{"migrations/000150_session_create_idempotency_key.up.sql", "183", "plan, revision and stop over MCP"},
+	{"migrations/000151_session_stop_requested_at.up.sql", "217", "stopping a session, and every session it started"},
 	{"migrations/000031_linear_installations.up.sql", "20", "auth v1"},
 	{"migrations/000031_linear_installations.up.sql", "34", "Linear ingress"},
 	{"migrations/000032_github_pr_sessions_session_id_idx.up.sql", "32", "GitHub ingress"},

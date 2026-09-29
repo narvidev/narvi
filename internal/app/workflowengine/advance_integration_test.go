@@ -351,3 +351,75 @@ func TestDispatchSameStepRevision_NeverEscalates_RegardlessOfLoopLength(t *testi
 		t.Errorf("attempt count = %d, want %d (one workflow_step_runs row per revision round)", attempts, revisionRounds)
 	}
 }
+
+// TestApplyStepOutcome_NextAttemptLeavesAPersonsStopStanding: a workflow's
+// next attempt is a turn the engine inserts, never one a person creates, so
+// inserting it leaves a person's stop request standing (technical plan
+// §3.3: only a person's own act clears it -- a turn they create, a plan
+// they approve, or a workflow step they approve or revise). Reached here
+// through ApplyStepOutcome -- the authority a person's HITL approve also
+// calls, whose route clears the request itself, before this runs
+// (httpapi's DecideWorkflowStep; TestStopSession_HITLDecisionResumes) --
+// on a session whose request stands: the next attempt's turn is inserted,
+// and sessions.stop_requested_at keeps its instant.
+func TestApplyStepOutcome_NextAttemptLeavesAPersonsStopStanding(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessions := postgres.NewSessionStore(pool)
+	turns := postgres.NewTurnStore(pool)
+	workflows := postgres.NewWorkflowStore(pool)
+	deps := workflowengine.Deps{
+		Workflows:           workflows,
+		Turns:               turns,
+		SlackThreadSessions: postgres.NewSlackThreadSessionStore(pool),
+		LinearAgentSessions: postgres.NewLinearAgentSessionStore(pool),
+		GitHubPRSessions:    postgres.NewGitHubPRSessionStore(pool),
+		Outbox:              postgres.NewOutboxStore(pool, false),
+	}
+
+	session, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	def := seedAuditFixLoopDefinition(t, ctx, pool)
+	runID, auditStepRunID, _ := startRawRun(t, ctx, turns, workflows, session, def)
+	if _, err := workflows.FinishStepRun(ctx, auditStepRunID, "completed", string(workflow.StepOutcomeNeedsFix)); err != nil {
+		t.Fatalf("finish audit step run: %v", err)
+	}
+
+	var requestedAt pgtype.Timestamptz
+	if err := pool.QueryRow(ctx, `UPDATE sessions SET stop_requested_at = now() WHERE id = $1 RETURNING stop_requested_at`, session.ID).Scan(&requestedAt); err != nil {
+		t.Fatalf("a person's stop: %v", err)
+	}
+	sessionRow, err := sessions.Get(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("get session: %v", err)
+	}
+	runRow, err := workflows.GetRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	loaded, err := workflowengine.LoadDefinition(ctx, workflows, def.definitionID)
+	if err != nil {
+		t.Fatalf("load definition: %v", err)
+	}
+
+	if _, err := workflowengine.ApplyStepOutcome(ctx, deps, runRow, loaded, sessionRow, workflow.ID(def.auditStepID.String()), workflow.StepOutcomeNeedsFix, nil); err != nil {
+		t.Fatalf("ApplyStepOutcome: %v", err)
+	}
+
+	all, err := turns.ListForSession(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("list turns: %v", err)
+	}
+	if len(all) != 2 {
+		t.Fatalf("turns = %d, want the audit attempt and the fix attempt the engine inserted", len(all))
+	}
+	var after pgtype.Timestamptz
+	if err := pool.QueryRow(ctx, `SELECT stop_requested_at FROM sessions WHERE id = $1`, session.ID).Scan(&after); err != nil {
+		t.Fatalf("read stop request: %v", err)
+	}
+	if !after.Valid || !after.Time.Equal(requestedAt.Time) {
+		t.Fatalf("stop_requested_at = %v after the engine's next attempt, want %v: a turn the engine creates never lifts a person's stop", after, requestedAt)
+	}
+}

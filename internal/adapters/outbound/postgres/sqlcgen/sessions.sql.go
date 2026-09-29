@@ -29,11 +29,31 @@ func (q *Queries) BumpActorEpoch(ctx context.Context, id pgtype.UUID) (int64, er
 	return actor_epoch, err
 }
 
+const clearSessionStopRequest = `-- name: ClearSessionStopRequest :execrows
+UPDATE sessions
+SET stop_requested_at = NULL
+WHERE id = $1 AND stop_requested_at IS NOT NULL
+`
+
+// A person's next act that sets the session going again clears the
+// request -- stop is not an archive: the next turn a person creates on the
+// session, the approval of its plan, or a person's decision to approve or
+// revise a workflow step awaiting it. Turns keep their own flags; only the
+// session's -- what refuses a new child session, and ends a workflow run
+// whose attempt ends -- is cleared.
+func (q *Queries) ClearSessionStopRequest(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, clearSessionStopRequest, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const createSession = `-- name: CreateSession :one
 
 INSERT INTO sessions (title, spawn_source, created_by, repos, environment_id, provenance_tag, build_model_id, build_effort, parent_session_id, spawn_depth, epistemic_check_enabled, create_idempotency_key, create_request_sha256)
 VALUES ($1, $2, $3, COALESCE($4, '[]'::jsonb), $5, $6, $7, $8, $9, COALESCE($10, 0), $11, $12, $13)
-RETURNING id, title, status, failure_reason, archived, spawn_source, created_by, created_at, updated_at, actor_epoch, repos, opencode_conversation_id, environment_id, provenance_tag, intent_decision, build_model_id, parent_session_id, spawn_depth, build_effort, epistemic_check_enabled, create_idempotency_key, create_request_sha256
+RETURNING id, title, status, failure_reason, archived, spawn_source, created_by, created_at, updated_at, actor_epoch, repos, opencode_conversation_id, environment_id, provenance_tag, intent_decision, build_model_id, parent_session_id, spawn_depth, build_effort, epistemic_check_enabled, create_idempotency_key, create_request_sha256, stop_requested_at
 `
 
 type CreateSessionParams struct {
@@ -143,12 +163,13 @@ func (q *Queries) CreateSession(ctx context.Context, arg CreateSessionParams) (S
 		&i.EpistemicCheckEnabled,
 		&i.CreateIdempotencyKey,
 		&i.CreateRequestSha256,
+		&i.StopRequestedAt,
 	)
 	return i, err
 }
 
 const getSession = `-- name: GetSession :one
-SELECT id, title, status, failure_reason, archived, spawn_source, created_by, created_at, updated_at, actor_epoch, repos, opencode_conversation_id, environment_id, provenance_tag, intent_decision, build_model_id, parent_session_id, spawn_depth, build_effort, epistemic_check_enabled, create_idempotency_key, create_request_sha256 FROM sessions
+SELECT id, title, status, failure_reason, archived, spawn_source, created_by, created_at, updated_at, actor_epoch, repos, opencode_conversation_id, environment_id, provenance_tag, intent_decision, build_model_id, parent_session_id, spawn_depth, build_effort, epistemic_check_enabled, create_idempotency_key, create_request_sha256, stop_requested_at FROM sessions
 WHERE id = $1
 `
 
@@ -178,6 +199,7 @@ func (q *Queries) GetSession(ctx context.Context, id pgtype.UUID) (Session, erro
 		&i.EpistemicCheckEnabled,
 		&i.CreateIdempotencyKey,
 		&i.CreateRequestSha256,
+		&i.StopRequestedAt,
 	)
 	return i, err
 }
@@ -499,7 +521,7 @@ func (q *Queries) GetSessionActorEpochForUpdate(ctx context.Context, id pgtype.U
 }
 
 const getSessionByCreateIdempotencyKey = `-- name: GetSessionByCreateIdempotencyKey :one
-SELECT id, title, status, failure_reason, archived, spawn_source, created_by, created_at, updated_at, actor_epoch, repos, opencode_conversation_id, environment_id, provenance_tag, intent_decision, build_model_id, parent_session_id, spawn_depth, build_effort, epistemic_check_enabled, create_idempotency_key, create_request_sha256 FROM sessions
+SELECT id, title, status, failure_reason, archived, spawn_source, created_by, created_at, updated_at, actor_epoch, repos, opencode_conversation_id, environment_id, provenance_tag, intent_decision, build_model_id, parent_session_id, spawn_depth, build_effort, epistemic_check_enabled, create_idempotency_key, create_request_sha256, stop_requested_at FROM sessions
 WHERE created_by = $1 AND create_idempotency_key = $2
 `
 
@@ -539,12 +561,62 @@ func (q *Queries) GetSessionByCreateIdempotencyKey(ctx context.Context, arg GetS
 		&i.EpistemicCheckEnabled,
 		&i.CreateIdempotencyKey,
 		&i.CreateRequestSha256,
+		&i.StopRequestedAt,
 	)
 	return i, err
 }
 
+const getSessionStopRequestedAtForShare = `-- name: GetSessionStopRequestedAtForShare :one
+SELECT stop_requested_at FROM sessions
+WHERE id = $1
+FOR SHARE
+`
+
+// Read by httpapi.CreateSessionOnTx before it inserts a child session of
+// this one. FOR SHARE, not the foreign key's own KEY SHARE: KEY SHARE does
+// not conflict with RequestSessionStop's UPDATE and never reads the
+// request, FOR SHARE conflicts with the stop's locks and reads the row the
+// stop committed. So a child spawn racing a stop either commits first, and
+// the stop's walk of the parent's descendants finds it, or waits for the
+// stop and is refused.
+func (q *Queries) GetSessionStopRequestedAtForShare(ctx context.Context, id pgtype.UUID) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, getSessionStopRequestedAtForShare, id)
+	var stop_requested_at pgtype.Timestamptz
+	err := row.Scan(&stop_requested_at)
+	return stop_requested_at, err
+}
+
+const listChildSessionIDs = `-- name: ListChildSessionIDs :many
+SELECT id FROM sessions
+WHERE parent_session_id = $1
+ORDER BY created_at, id
+`
+
+// The direct children of one session (sessions_parent_session_id_idx),
+// oldest first: the stop request's walk reads them after the parent's own
+// stop has committed.
+func (q *Queries) ListChildSessionIDs(ctx context.Context, parentSessionID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, listChildSessionIDs, parentSessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var id pgtype.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listFailedSessions = `-- name: ListFailedSessions :many
-SELECT id, title, status, failure_reason, archived, spawn_source, created_by, created_at, updated_at, actor_epoch, repos, opencode_conversation_id, environment_id, provenance_tag, intent_decision, build_model_id, parent_session_id, spawn_depth, build_effort, epistemic_check_enabled, create_idempotency_key, create_request_sha256 FROM sessions
+SELECT id, title, status, failure_reason, archived, spawn_source, created_by, created_at, updated_at, actor_epoch, repos, opencode_conversation_id, environment_id, provenance_tag, intent_decision, build_model_id, parent_session_id, spawn_depth, build_effort, epistemic_check_enabled, create_idempotency_key, create_request_sha256, stop_requested_at FROM sessions
 WHERE status = 'failed' AND NOT archived
 ORDER BY updated_at DESC
 LIMIT $1
@@ -598,6 +670,7 @@ func (q *Queries) ListFailedSessions(ctx context.Context, limit int32) ([]Sessio
 			&i.EpistemicCheckEnabled,
 			&i.CreateIdempotencyKey,
 			&i.CreateRequestSha256,
+			&i.StopRequestedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -687,7 +760,7 @@ func (q *Queries) ListSessionOutcomeCountsInWindow(ctx context.Context, createdA
 }
 
 const listSessions = `-- name: ListSessions :many
-SELECT s.id, s.title, s.status, s.failure_reason, s.archived, s.spawn_source, s.created_by, s.created_at, s.updated_at, s.actor_epoch, s.repos, s.opencode_conversation_id, s.environment_id, s.provenance_tag, s.intent_decision, s.build_model_id, s.parent_session_id, s.spawn_depth, s.build_effort, s.epistemic_check_enabled, s.create_idempotency_key, s.create_request_sha256, sb.status AS sandbox_status FROM sessions s
+SELECT s.id, s.title, s.status, s.failure_reason, s.archived, s.spawn_source, s.created_by, s.created_at, s.updated_at, s.actor_epoch, s.repos, s.opencode_conversation_id, s.environment_id, s.provenance_tag, s.intent_decision, s.build_model_id, s.parent_session_id, s.spawn_depth, s.build_effort, s.epistemic_check_enabled, s.create_idempotency_key, s.create_request_sha256, s.stop_requested_at, sb.status AS sandbox_status FROM sessions s
 LEFT JOIN sandboxes sb ON sb.session_id = s.id
 WHERE NOT s.archived
   AND (
@@ -762,6 +835,7 @@ func (q *Queries) ListSessions(ctx context.Context, arg ListSessionsParams) ([]L
 			&i.Session.EpistemicCheckEnabled,
 			&i.Session.CreateIdempotencyKey,
 			&i.Session.CreateRequestSha256,
+			&i.Session.StopRequestedAt,
 			&i.SandboxStatus,
 		); err != nil {
 			return nil, err
@@ -774,11 +848,36 @@ func (q *Queries) ListSessions(ctx context.Context, arg ListSessionsParams) ([]L
 	return items, nil
 }
 
+const requestSessionStop = `-- name: RequestSessionStop :one
+UPDATE sessions
+SET stop_requested_at = GREATEST(stop_requested_at, now())
+WHERE id = $1
+RETURNING stop_requested_at
+`
+
+// A person's stop request on this session (technical plan §3.3, POST
+// /api/sessions/{sessionID}/stop, migrations/000151). The session keeps
+// the latest request's instant: a repeated request moves it forward, so
+// the stop timer's handler disarms the work-creating timers armed before
+// the latest request, not only those armed before the first
+// (sessionactor.disarmWorkCreatingTimers). GREATEST, not a plain now(): two
+// requests serialized by the lock below in the other order than their
+// transactions began never move it back. Each turn keeps its own first
+// flag (RequestStopOpenTurns), which its grace runs from. Runs under
+// GetSessionActorEpochForUpdate's own lock, in the transaction that flags
+// the session's open turns and arms its stop timer.
+func (q *Queries) RequestSessionStop(ctx context.Context, id pgtype.UUID) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, requestSessionStop, id)
+	var stop_requested_at pgtype.Timestamptz
+	err := row.Scan(&stop_requested_at)
+	return stop_requested_at, err
+}
+
 const updateSessionConversationID = `-- name: UpdateSessionConversationID :one
 UPDATE sessions
 SET opencode_conversation_id = $2, updated_at = now()
 WHERE id = $1
-RETURNING id, title, status, failure_reason, archived, spawn_source, created_by, created_at, updated_at, actor_epoch, repos, opencode_conversation_id, environment_id, provenance_tag, intent_decision, build_model_id, parent_session_id, spawn_depth, build_effort, epistemic_check_enabled, create_idempotency_key, create_request_sha256
+RETURNING id, title, status, failure_reason, archived, spawn_source, created_by, created_at, updated_at, actor_epoch, repos, opencode_conversation_id, environment_id, provenance_tag, intent_decision, build_model_id, parent_session_id, spawn_depth, build_effort, epistemic_check_enabled, create_idempotency_key, create_request_sha256, stop_requested_at
 `
 
 type UpdateSessionConversationIDParams struct {
@@ -818,6 +917,7 @@ func (q *Queries) UpdateSessionConversationID(ctx context.Context, arg UpdateSes
 		&i.EpistemicCheckEnabled,
 		&i.CreateIdempotencyKey,
 		&i.CreateRequestSha256,
+		&i.StopRequestedAt,
 	)
 	return i, err
 }
@@ -855,7 +955,7 @@ const updateSessionStatus = `-- name: UpdateSessionStatus :one
 UPDATE sessions
 SET status = $2, failure_reason = $3, updated_at = now()
 WHERE id = $1
-RETURNING id, title, status, failure_reason, archived, spawn_source, created_by, created_at, updated_at, actor_epoch, repos, opencode_conversation_id, environment_id, provenance_tag, intent_decision, build_model_id, parent_session_id, spawn_depth, build_effort, epistemic_check_enabled, create_idempotency_key, create_request_sha256
+RETURNING id, title, status, failure_reason, archived, spawn_source, created_by, created_at, updated_at, actor_epoch, repos, opencode_conversation_id, environment_id, provenance_tag, intent_decision, build_model_id, parent_session_id, spawn_depth, build_effort, epistemic_check_enabled, create_idempotency_key, create_request_sha256, stop_requested_at
 `
 
 type UpdateSessionStatusParams struct {
@@ -894,6 +994,7 @@ func (q *Queries) UpdateSessionStatus(ctx context.Context, arg UpdateSessionStat
 		&i.EpistemicCheckEnabled,
 		&i.CreateIdempotencyKey,
 		&i.CreateRequestSha256,
+		&i.StopRequestedAt,
 	)
 	return i, err
 }

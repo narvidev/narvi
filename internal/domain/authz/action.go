@@ -142,20 +142,33 @@ const (
 	ActionLinkChatGPTAccount Action = "link_chatgpt_account"
 
 	// -- Row 3: "Stop/resume ANY session; approve ANY plan" — admin,
-	// maintainer only. Deliberately no member own/joined carve-out here,
-	// unlike row 2 — the matrix names this explicitly as "ANY session",
-	// contrasted with row 2's "own/joined" qualifier; a member who
-	// created a session still cannot stop or resume it themselves.
-	// ActionApprovePlan above already covers "approve ANY plan" (the
-	// SAME action, just satisfied unconditionally for admin/maintainer
-	// via allow rather than allowIfOwned) — no separate constant needed.
+	// maintainer only. ActionApprovePlan above already covers "approve ANY
+	// plan" (the SAME action, just satisfied unconditionally for
+	// admin/maintainer via allow rather than allowIfOwned) — no separate
+	// constant needed. Stopping takes the same shape since owner decision
+	// O1 (technical plan §13.3): admin and maintainer stop ANY session,
+	// and a member stops the sessions row 2 already lets them start and
+	// prompt -- their own or joined. Resuming keeps row 3's original,
+	// admin/maintainer-only shape.
 
-	// ActionStopSession halts a running session. No caller exists yet —
-	// this feature isn't built as of this Step (see doc.go) — reserved so
-	// a future Step's call site needs no shape change here.
+	// ActionStopSession stops a session and every session it started
+	// (technical plan §3.3; POST /api/sessions/{sessionID}/stop,
+	// internal/adapters/inbound/httpapi's StopSession). Admin and
+	// maintainer on any session; a member only on their own or joined
+	// sessions (owner decision O1: a member can already start and prompt
+	// that work, and a stop only ever reduces what runs), never a pull
+	// request's review session, whose work is everyone's who asks the bot
+	// to review that PR (StopSession resolves OwnedOrJoined false for one);
+	// a viewer never. The descendants a stop reaches are authorized by this
+	// one check on the session named, since they are its work.
 	ActionStopSession Action = "stop_session"
-	// ActionResumeSession resumes a stopped session. Same "no caller yet"
-	// note as ActionStopSession.
+	// ActionResumeSession resumes a stopped session. No caller exists yet:
+	// a stop is cleared by a person's next act that sets the session going
+	// again, each under its own action -- a turn (ActionPromptSession), a
+	// plan approval (ActionApprovePlan) or a workflow step approval or
+	// revision (ActionDecideWorkflowStep) -- so nothing resumes a session
+	// through this action today. Reserved so a future call site needs no
+	// shape change here.
 	ActionResumeSession Action = "resume_session"
 	// ActionViewShadowComparison covers §8.8's own "shadow-comparison
 	// tooling for review" deliverable (GET /api/admin/shadow-compare,

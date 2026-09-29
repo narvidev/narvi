@@ -152,6 +152,14 @@ UPDATE workflow_runs SET status = 'failed', finished_at = now(), updated_at = no
 -- name: EscalateWorkflowRun :one
 UPDATE workflow_runs SET status = 'needs_review', updated_at = now() WHERE id = $1 RETURNING *;
 
+-- name: CancelWorkflowRun :one
+-- Technical plan §3.3's stop: an attempt whose turn a person's stop
+-- cancelled ends its run here, terminal like FailWorkflowRun, and
+-- workflow.NextStep is never consulted -- a custom definition's edge on
+-- 'blocked' would otherwise queue the next step, and the stop would not
+-- stop.
+UPDATE workflow_runs SET status = 'cancelled', finished_at = now(), updated_at = now() WHERE id = $1 RETURNING *;
+
 -- name: SetWorkflowStepRunOutcome :execrows
 UPDATE workflow_step_runs
 SET outcome_status = $2, outcome_summary = $3, outcome_payload = $4, updated_at = now()

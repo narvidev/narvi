@@ -10,6 +10,37 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.13.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `StopSessionResponse`, the `202` body of the new stop route below
+  (technical plan §3.3): `sessionId`, `requestedAt` (when this request
+  was made -- a repeated request answers its own, later instant),
+  `reachedSessionIds` (the session named first, then every session it
+  started, recursively) and `openTurns` (the turns the request flagged to
+  be cancelled, across every reached session). A new `$def` grades MINOR
+  (row 32).
+
+### controlplane/testdata/routes.golden
+
+- Added: `POST /api/sessions/{sessionID}/stop` -- a person's request to
+  stop a session and every session it started (technical plan §3.3). No
+  body. `400` for a malformed id and `404` for a session that does not
+  exist, as `GET /api/sessions/{sessionID}` answers; `403` unless
+  `authz.ActionStopSession` admits the caller: admin and maintainer on any
+  session, a member on their own or joined sessions except a pull
+  request's review session, a viewer never.
+  Answers `202 StopSessionResponse` once the request is written: turns open
+  at that instant are cancelled -- a pending one at once, a running one
+  through the sandbox's own `stop`, or once `StopGrace` (30s) has passed,
+  also while its sandbox still delivers an earlier turn's push and pull
+  request, which then pushes nothing for it -- and turns created later run
+  normally. The stopped turn's sandbox is replaced only once such a
+  delivery is over, for at most `MCPStatusDeliveryWindow` (10 minutes),
+  and a turn created meanwhile waits for it. A route added, graded MINOR
+  (row 41).
+
 ## [1.12.0]
 
 ### rest/v1/dtos.schema.json

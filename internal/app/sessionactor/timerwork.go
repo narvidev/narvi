@@ -17,10 +17,11 @@ const (
 	TimerWorkSandboxOnly TimerWork = iota + 1
 	// TimerWorkTurnInFlight means firing it can end a turn, and so start the
 	// workflow's next step in the same transaction, but only a turn that is
-	// processing when it fires -- which the same snapshot already reads as
-	// running. From a settled snapshot (no turn pending, dispatched or
-	// processing) it finds none and deletes itself. A session holding one
-	// can be settled.
+	// open when it fires -- processing for turn_deadline, pending,
+	// dispatched or processing for stop -- which the same snapshot already
+	// reads as queued or running. From a settled snapshot (no turn pending,
+	// dispatched or processing) it finds none and deletes itself. A session
+	// holding one can be settled.
 	TimerWorkTurnInFlight
 	// TimerWorkCreatesTurn means firing it can insert a turn with no new input.
 	// While one is armed the session is never settled; it reads scheduled
@@ -56,6 +57,21 @@ const (
 //     workflow's next step in the same transaction -- and otherwise deletes
 //     itself. The turn it acts on is in flight, so the session already
 //     reads running whenever it can do anything.
+//   - stop (armed by POST /api/sessions/{sessionID}/stop, re-armed by its
+//     own handler while a flagged turn is in flight, or while the
+//     retirement of a stopped turn's sandbox gen waits for a delivery;
+//     technical plan §3.3): cancels the turns a person's stop flagged --
+//     pending ones at once, a turn in flight once the sandbox `stop` or
+//     StopGrace ends it -- retires that gen, and deletes the session's
+//     work-creating timers. It ends turns and never creates one: an
+//     attempt it cancels ends its workflow run cancelled without
+//     consulting NextStep, so no next step is queued, and the dispatch a
+//     retirement is followed by only sends a turn already pending, which
+//     reads queued in the same snapshot. Every turn it acts on was open
+//     when the request was made, so the same snapshot already reads the
+//     session as queued or running; from a settled snapshot it finds
+//     nothing flagged open, retires at most a sandbox gen, and deletes
+//     itself.
 //   - review_retrigger_debounce (armed by the pull_request/synchronize
 //     webhook on every push to a PR with a review session, opted in or
 //     not -- never the review session's own, since a review session never
@@ -68,7 +84,7 @@ func ClassifyTimer(name string) (work TimerWork, ok bool) {
 	switch name {
 	case TimerConnectingDeadline, TimerLivenessCheck, TimerInactivity, TimerTerminalGrace:
 		return TimerWorkSandboxOnly, true
-	case TimerTurnDeadline:
+	case TimerTurnDeadline, TimerStop:
 		return TimerWorkTurnInFlight, true
 	case TimerReviewRetriggerDebounce:
 		return TimerWorkCreatesTurn, true
