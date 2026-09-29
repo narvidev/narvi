@@ -304,9 +304,14 @@ passed if the agent does not answer. When the agent answers, the sandbox
 is kept and idles out. When it does not, that sandbox is stopped and your
 next turn starts on a new one, restored from the last snapshot where there
 is one, so what the stopped turn changed in the workspace since that
-snapshot is not carried over. Every session it started is stopped the same
-way (`reachedSessionIds`), and a new child of it is refused until you
-resume it. Poll `GET /api/sessions/{sessionID}/status` to watch it settle.
+snapshot is not carried over. A sandbox still pushing an earlier turn's
+work and opening its pull request is not stopped before that is done, for
+at most `platform.Timeouts.MCPStatusDeliveryWindow` (10 minutes): until
+then the stopped turn stays running, and a prompt is refused `409` as
+while any turn runs. Every session it started is stopped
+the same way (`reachedSessionIds`), and a new child of it is refused until
+you resume it. Poll `GET /api/sessions/{sessionID}/status` to watch it
+settle.
 
 The session's status follows its last turn, as always: it reads
 `cancelled` when that turn is one the stop cancelled. A session with
@@ -314,15 +319,21 @@ nothing open when you stop it keeps its status, and a turn that completed
 before the stop reached it stays completed. A stop does not undo what
 already happened: that turn keeps its push and pull request, and a plan
 awaiting approval stays awaiting approval. While the stop stands, a
-workflow run the session is in ends `cancelled` instead of moving on to its
-next step. A stop is not an archive either — the next prompt you send
-(`POST /api/sessions/{sessionID}/turns`), or approving the session's plan,
-runs normally and resumes the session.
+workflow run the session is in ends `cancelled` when its running step
+ends, instead of moving on to its next step. A step waiting for your
+decision keeps waiting: approving or revising it
+(`POST /api/workflow-runs/{runId}/steps/{stepRunId}/decide`) resumes the
+session, and the run goes on; rejecting it ends the run `failed` and
+leaves the stop standing. A stop is not an archive either — the next
+prompt you send (`POST /api/sessions/{sessionID}/turns`), approving the
+session's plan, or approving or revising a workflow step runs normally
+and resumes the session.
 
 Repeating the request is not a no-op: it flags whatever is open at that
 moment, a turn you created since the first request included, which then
-stops too, and it writes its own audit entry. `requestedAt` stays the
-first request's instant until you resume the session.
+stops too, and it writes its own audit entry. `requestedAt` is that
+request's own instant, and a re-review that a push scheduled since your
+previous stop is called off, as one scheduled before it was.
 
 **Negatives.** A malformed id answers `400` and an unknown session `404`,
 as `GET /api/sessions/{sessionID}` does. A member may stop only a session
