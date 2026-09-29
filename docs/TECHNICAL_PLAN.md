@@ -331,7 +331,7 @@ verifying nothing about the half that carries the risk.
 
 ## 8. Feature set (exit criteria, not options)
 
-1. **Plan mode**: persistent plans, HITL approve/reject on web/Slack/Linear/GitHub, server-side implementation dispatch on approval, plan/build model split, cross-channel verdict + archive notifications. **A revision never withdraws an approval** (normative, §43.21): while any turn of the session is pending, dispatched or processing -- an approved implementation included -- a revision, like any prompt, asked for over REST or MCP is refused `409` and nothing is queued; where an ingress queues one (`AlwaysQueue`, the code host's mention ingress), it waits, the plan stays `approved`, the implementation runs to its own end and delivers, and only then is the revision dispatched, to write version N+1 awaiting approval beside the approved N. Only a stop, authorized on its own, may end a running implementation early.
+1. **Plan mode**: persistent plans, HITL approve/reject on web/Slack/Linear/GitHub, server-side implementation dispatch on approval, plan/build model split, cross-channel verdict + archive notifications. **A revision never withdraws an approval** (normative, §43.21): while any turn of the session is pending, dispatched or processing -- an approved implementation included -- a revision, like any prompt, asked for over REST or MCP is refused `409` and nothing is queued, and no ingress queues one behind an approved implementation today (§43.21(b) names which ingresses queue, drop or refuse a turn); were one queued, it would wait, the plan staying `approved`, and be dispatched only once the implementation has reached its terminal state, to write version N+1 awaiting approval beside the approved N -- the implementation's push and pull request proceeding independently of it, even after it has run. Only a stop, authorized on its own, may end a running implementation early.
 2. **Code review**: review sessions per PR with session reuse; atomic claim coalescing of concurrent @mentions; risk-map verdict with `review:*` labels — **a structured verdict from day one** (premise state, risk drivers, shippable class — server-computed, never self-reported, never re-parsed from posted text; full design and the automation policy built on it in §21); test-coverage & doc-drift sentinels; **server-side** verdict floor + formal-review gate + verdict-posting tool (raw issue comments blocked, scoped to review sessions); re-trigger via label/button, or automatically on new commits (debounced, off by default per repo, §24); inline diff pre-fetched into context (agent must not need to run `gh pr diff` repeatedly); suggestion safety (apply via validated endpoint); **criteria-driven auto-approval** (`visual-qa: pass/skip` unchanged; `review: low risk` **inverts** into a `review: needs-human` escape hatch — approval itself is deterministic and criteria-driven rather than label-triggered, §21); dedicated review model selection; optional sentinel auto-fix for coverage/doc-drift findings, merge-gated on the origin PR (§17, disabled by default); **review as a merge readout** (§26) — the verdict front-loads a diff-derived summary, the diff's architecture choices, and its risks to the stack, demoting findings to a collapsed appendix; a description-adequacy check with a third raise-only floor and graduated remediation; deterministic light/deep review triage, measurable per path; adversarial counter-review with contested-points surfacing on the deep path; a diff-only fact-check pass on both paths that kills only provably-wrong findings (§26.6); a per-path cost budget with dispatch-time look-ahead (§26.7); findings anchored to the diff by content, never a guessed line number (§22.1.1).
 3. **Unified intent classifier** (detailed design — see §18): review-vs-request and plan-vs-build across all ingress surfaces; shadow mode (log-only) → active, permanently available, never a one-time launch gate; never-throw contract with an enumerated fallback-reason taxonomy; confidence rubric anchored on textual directness, not model self-reported certainty; DB-backed editable prompt templates with assembled-prompt preview; per-session routing decision records (§18.4).
 4. **Automations**: GitHub/Linear/webhook/cron triggers with condition builder; sandbox settings honored on automation sessions; creator/status filters; `last_run` + `artifact_summary` populated; per-automation env vars/secrets.
@@ -8411,9 +8411,19 @@ delivery outranks a gate: the pull request appears whether or not a person acts 
 beside it (`awaiting` still reports that gate). Narrowing `settled` to exclude this phase instead was
 rejected: row 182's wait (b) returns on `settled`, and its result (c) reports "the pull requests the
 session produced", so a `settled` that can precede the pull request would make both wrong. One stamp
-per sandbox describes the latest cycle: should a later turn complete before an earlier turn's
-`push_complete` arrives, the earlier one's pull request clears the later stamp, and that later delivery
-reads `finished` early — the behaviour before this phase existed, and only when two pushes overlap.
+per sandbox describes the latest cycle: should a later turn complete before an earlier turn's push
+reports back, the earlier cycle's end — `createPRBestEffort` returning on its `push_complete`, or its
+`push_error` — clears the later stamp, and that later delivery reads `finished` early — the behaviour
+before this phase existed, and only when two pushes overlap. The push's egress decision (`pending_push_suppressed_in_shadow`, §30.8) is one
+column per sandbox too: the earlier cycle's pull request consumes the later cycle's decision, so the
+later pull request is gated by the shadow decorator's live read of the mode, not by the decision frozen
+at its own push. Two pushes overlap only when no snapshot was started as the earlier turn completed — a
+Docker-required environment, which is never snapshotted, or a snapshot command that could not be sent —
+and another turn was already pending then (a workflow's next step, written by the transaction that
+completes the earlier turn, for one): that turn's prompt is sent before the push command, runs beside
+the push, and completes first when the push is slow. With a snapshot, the push command precedes the next
+prompt on the sandbox's one connection, and the sandbox agent runs the push to its end before it reads
+that prompt, so the push reports back before the next turn can complete.
 
 **Work the server holds.** `settled` promises that nothing progresses server-side without new input,
 so review round 3 inventoried every mechanism that can create a turn, or change what the status
@@ -9085,21 +9095,26 @@ nothing in that route changed.
 |---|---|---|---|---|---|
 | `narvi_list_plans` | `GET /api/sessions/{sessionID}/plans` | `mcp:read` | `ListPlansToolRequest {sessionId}` | `ListPlansResponse` | yes / no / yes / no |
 | `narvi_approve_plan` | `POST /api/sessions/{sessionID}/plans/{planId}/approve` | `mcp:write` | `ApprovePlanToolRequest {sessionId, planId}` | `PlanActionResponse` | no / no / yes / yes |
-| `narvi_reject_plan` | `POST /api/sessions/{sessionID}/plans/{planId}/reject` | `mcp:write` | `RejectPlanToolRequest {sessionId, planId}` | `PlanActionResponse` | no / yes / yes / no |
+| `narvi_reject_plan` | `POST /api/sessions/{sessionID}/plans/{planId}/reject` | `mcp:write` | `RejectPlanToolRequest {sessionId, planId}` | `PlanActionResponse` | no / yes / yes / yes |
 | `narvi_request_plan_revision` | `POST /api/sessions/{sessionID}/turns` with `planMode: true` and the feedback as the prompt | `mcp:write` | `RequestPlanRevisionToolRequest {sessionId, feedback, modelId?, effort?}` | `CreateTurnResponse` | no / no / no / yes |
 | `narvi_send_prompt` | `POST /api/sessions/{sessionID}/turns` with `planMode: false` | `mcp:write` | `SendPromptToolRequest {sessionId, prompt, modelId?, effort?}` | `CreateTurnResponse` | no / no / no / yes |
 
-- **The hints.** An approval destroys nothing, a repeat changes nothing more (the first verdict wins),
-  and the implementation it queues reaches the code host. A rejection ends that version for good, so it
-  is the one tool here marked destructive; it queues nothing, so it stays inside this deployment. Each
-  accepted prompt or revision queues one more turn, so neither is idempotent.
+- **The hints.** An approval destroys nothing, and a repeat changes nothing more (the first verdict
+  wins). A rejection ends that version for good, so it is the one tool here marked destructive; a repeat
+  changes nothing more either. Both decisions are open-world: each posts its verdict to the Slack message
+  or the Linear session the plan went to (item 9 below), and an approval also queues the implementation,
+  which reads from and pushes to the code host. What makes a tool open-world here is an effect that
+  reaches outside this deployment; a read stays closed-world even where one field is read from the code
+  host (owner decision D11, §43.20). Each accepted prompt or revision queues one more turn, so neither is
+  idempotent, and that turn reads from the code host, which its branch is pushed to once it completes.
 - **The plan read.** `narvi_list_plans` is the plan read §43.1 lists: without it a client has no plan
   id to decide. Any authenticated role reads any session's plans, exactly as on REST.
 - **What each twin receives.** The ids become the twin's chi params (`sessionID`, `planId`); approve
   and reject send no body. The two turn tools send a `CreateTurnRequest` built from their arguments,
   never the arguments themselves (§43.7): `planMode` is the tool's own constant, never an argument, and
   no attachment is offered. `feedback` and `prompt` are non-empty.
-- **The wiring.** Each twin is the same constructor call its `/api` route uses (`controlplane/serve.go`).
+- **The wiring.** Each twin is the same constructor call its `/api` route uses (`controlplane/serve.go`),
+  argument for argument; `WriteTwins_EveryArgumentLikeREST_SDKClient` (below) pins it for the writes.
 
 **Approval keeps every check.** `narvi_approve_plan` runs the REST `ApprovePlan` handler through the
 bridge, so it inherits, in order:
@@ -9118,8 +9133,9 @@ bridge, so it inherits, in order:
    (§43.8);
 9. the cross-channel notices.
 
-`narvi_reject_plan` inherits 1-3 and 5-9 the same way: a rejection has no open-turn gate, snapshots
-nothing and queues nothing. A token never does more than its user: a viewer's `mcp:write` grant lists
+`narvi_reject_plan` inherits 1-3, 5, 6, 8 and 9 the same way, its audit row being `plan.reject`: a
+rejection has no open-turn gate (4), snapshots nothing (7) and queues no turn, while its notices (9)
+reach Slack or Linear like an approval's. A token never does more than its user: a viewer's `mcp:write` grant lists
 both tools and is refused with the text REST gives the viewer's cookie.
 
 **The revision rule (normative).** A plan revision is a plan-mode turn. When one is asked for while an
@@ -9130,17 +9146,54 @@ approved implementation is running:
   request is refused with `409` "a turn is already pending, dispatched, or processing for this session".
   Nothing is queued and nothing is cancelled. No MCP tool gets a queueing policy: that would let a token
   do what its user cannot do by REST.
-- **(b) Where an ingress does queue one** (`AlwaysQueue`, whose one caller is `CreateTurnForBot`: the
-  code host's mention ingress; the chat ingresses drop a turn while one is open, with a busy reply), the
-  revision waits as `pending` and never withdraws the running implementation's
-  authorization. That authorization is the approval: the plan row is `approved`, a terminal status, and
-  the implementation turn was inserted in the approval's own transaction. Nothing the revision writes is
-  read by that turn's dispatch, its completion or its delivery. So the plan stays `approved`, the
-  implementation runs to its own terminal state, and its branch is pushed and its pull request opened,
-  even if the push reports back only after the revision has run. The revision is dispatched only once
-  the implementation has reached its terminal state (the oldest pending turn first, §3.3). When it
+- **(b) Where an ingress does queue one.** Each ingress that creates a turn through `CreateTurnCore`
+  fixes one admission policy (`CreateTurnPolicy`, `httpapi/turn.go`):
+  - `RejectIfOpen`, refused `409` and nothing queued: `POST /api/sessions/{sessionID}/turns` -- the
+    browser, and the two MCP turn tools through it -- and Slack's Request-changes modal, which on that
+    `409` only logs it and acknowledges the submission, so the modal closes and the feedback is lost with
+    no reply (as before this row);
+  - `DropIfOpen`, nothing queued and a busy reply: a Slack thread reply and a Linear reply, a `revise:`
+    one included;
+  - `AlwaysQueue`, queued behind the open turn: the code host's mention (`CreateTurnForBot`, from the
+    coalescer's reuse branch) and the re-run-review button (`POST
+    /api/sessions/{sessionID}/review/retrigger`, `RetriggerReview`).
+
+  Neither `AlwaysQueue` caller queues a revision today. The re-review is never plan mode and consults no
+  classifier. A mention is never plan mode -- the code host's ingress never sets it -- and a prompt
+  becomes a revision (§23) only while a plan awaits approval, which none does while an approved
+  implementation is open: approval refuses while any turn is open, and only a completed plan-mode turn
+  writes a plan. Both callers also reach only a pull request's review session, which never pushes
+  (§43.20). The turns inserted outside `CreateTurnCore` -- the approval's implementation, a workflow's
+  next step, the re-review debounce's, the composition review's -- are never plan mode. So no ingress
+  queues a revision behind an approved implementation; this clause is the rule one that does must keep.
+
+  Such a revision waits as `pending` and never withdraws the running implementation's authorization.
+  That authorization is the approval: the plan row is `approved`, a terminal status, and the
+  implementation turn was inserted in the approval's own transaction. Nothing the revision writes is
+  read by that turn's dispatch, its completion or its delivery. So the plan stays `approved` and the
+  implementation runs to its own terminal state. The revision is dispatched once the implementation has
+  reached that state and the sandbox is ready again (the oldest pending turn first, §3.3), and waits for
+  nothing else: the implementation's push and pull request proceed independently of it. With a
+  snapshot, the revision is dispatched when `snapshot_ready` arrives, usually before the push reports
+  back and so before the pull request is opened. With no snapshot, it is dispatched before the push
+  command is even sent, and a slow push can report back, and the pull request be opened, after the
+  revision has written its version. A push that fails, or is never sent (shadow egress, or a creator
+  whose push cannot authenticate), opens no pull request, and the revision still runs. When the revision
   completes it writes plan version N+1 `awaiting_approval`, and version N stays `approved`: a new
   version supersedes only a version still awaiting approval.
+
+  **The branch they share.** While the sandbox takes a snapshot, the revision's work does not race the
+  implementation's push: the actor sends the snapshot command, then the push, on the sandbox's one
+  ordered connection, and the revision's prompt only once the sandbox is ready again, and the sandbox
+  agent reads commands one at a time, running a snapshot and a push to their end before it reads the
+  next -- so the revision starts after `git push` has returned. With no snapshot started (a
+  Docker-required environment, which is never snapshotted, or a snapshot command that could not be
+  sent), the revision's prompt is sent first: the agent starts that turn on its own goroutine, then runs
+  the push, and the two overlap. The push sends the branch's commits (`git push <remote> <branch>`; it
+  stages and commits nothing), and the revision runs OpenCode's plan agent, a guard on edits and not a
+  sandbox (§45.2), which can still commit through its shell. A commit it makes in that window can go out with the
+  implementation's push rather than with the push that follows the revision's own completion; the
+  branch ends the same either way.
 - **(c) Only a stop ends a running implementation early**, and it is authorized on its own (row 183's
   stop, not yet shipped). Revoking the grant, or narrowing the user's role, governs the next call; it
   does not abort running work, whose delivery re-checks the creator when the pull request is opened
@@ -9170,15 +9223,33 @@ query, the body only for the turn tools with the tool's own `planMode`, no heade
 `TestParity_BearerEqualsCookieForEveryRole` reads plans for every role. On the production router,
 through the official SDK client: `ApprovePlan_ParityEveryRole_SDKClient` (every role, on a session the
 user started and on one they did not, the outcome and the database state it leaves equal REST's -- the
-plan row, the implementation turn, the snapshot, the audit row and the notices);
+plan row, the implementation turn, the snapshot, the audit row and the outbox, empty on these web
+sessions, which have nowhere to post a verdict);
 `ApprovePlan_OpenTurnGate_SDKClient` (a revision pending, dispatched or processing);
 `ApprovePlan_FirstVerdictWinsAcrossRESTAndMCP`; `RevisionMidImplementation_RefusedAndStillRunning_SDKClient`
 (refused over MCP and REST with the same text; no turn inserted or audited, the implementation still
-processing, the plan still approved); `SendPrompt_WhileRunningRefusedLikeREST_SDKClient`; and
-`PromptAndRevision_SettledSessionLikeREST_SDKClient`. On a real session actor,
+processing, the plan still approved); `SendPrompt_WhileRunningRefusedLikeREST_SDKClient`;
+`PromptAndRevision_SettledSessionLikeREST_SDKClient`; and `WriteTwins_EveryArgumentLikeREST_SDKClient`,
+which pins the wiring. It runs on a router of its own whose configuration makes every argument the
+three write twins read on its paths show in what they write: the epistemic check on by default, object storage configured (its endpoint never contacted), and the intent classifier answered by
+a local fake reached through `ANTHROPIC_BASE_URL`, so no classification leaves the machine. There, an
+approval and a rejection of a plan that went to Slack and of a Linear session's plan each leave REST's
+rows, the outbox compared row for row (kind, status, correlation, payload) and required to hold one
+notice; a prompt the classifier reads as a change to a plan awaiting approval is queued as a revision;
+and an ordinary prompt on a session the user joined, and a revision, carry REST's epistemic preamble and
+upload note. A twin built without one of those arguments -- the outbox, Linear-session, plan or
+participant store, the registry, the classifier, object storage -- or without the epistemic default, or
+wired to another handler, fails it, and so does a notice an MCP decision alone drops or words
+differently (each mutation-verified). An argument a handler never reads is not pinned, since leaving it
+out changes nothing: the rejection's snapshot stores and epistemic default.
+`TestBuild_MCPSurface_TwinParity` compares the read twins' bytes. On a real session actor,
 `TestRevisionQueuedBehindImplementation_LeavesItAuthorized` queues a revision through `CreateTurnForBot`
+with plan mode on, on a session that pushes -- the pairing no ingress makes today, which (b) governs --
 while the implementation runs, while it is still queued, and with the implementation's push reporting
-back only after the revision wrote its version.
+back only after the revision wrote its version; `TestMentionBehindImplementation_QueuedAsAnOrdinaryTurn`
+pins the case production reaches: a mention, without plan mode, queued behind the approved
+implementation on a review session is an ordinary turn, and the classifier is not asked -- while the
+same mention, with the same classifier, on a session whose plan awaits approval becomes a revision.
 
 ## 44. The GitHub App pool (new capability)
 

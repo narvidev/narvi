@@ -217,12 +217,16 @@ ordinary prompt is refused too, unless Narvi reads it as a change to that
 plan, which it then queues as a revision.
 
 A revision never takes back an approval. Once you approve a plan, its
-implementation keeps that approval until it ends: a revision asked for
-while it runs is refused, as above, and where another channel does queue
-one — a mention on the code host is queued — it waits, the implementation
-finishes and opens its pull request, and only then does the revision run
-and write the next version for you to approve, the approved one staying
-approved.
+implementation keeps that approval until it ends, and no channel queues a
+revision behind it: over MCP and the web, a revision asked for while it
+runs is refused, as above; a chat app does not queue one either; and a
+mention on the code host is queued, but never as a revision. Were one
+queued, it would wait only for the implementation to end, then run and
+write the next version for you to approve, the approved one staying
+approved. The implementation's push and pull request go on independently
+of the revision: the pull request may appear only after the revision has
+started, or even after it has written the next version, and a push that
+fails opens none, while the revision still runs.
 
 **Brakes, and what disconnecting does not do.** `/mcp` is braked per
 authorization — one person's approval of one app — on each server replica:
