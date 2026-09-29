@@ -13808,8 +13808,10 @@ func (j *ShadowLedgerSummary) UnmarshalJSON(value []byte) error {
 // cancel transition -- a pending one at once, a running one once the sandbox's own
 // stop, or the grace after it (StopGrace, 30s), ends it. Turns created after the
 // request run normally. Read GET /api/sessions/{sessionID}/status to see the
-// session settle. Repeating the request is harmless: it flags whatever is open
-// then and answers the same requestedAt.
+// session settle. Repeating the request is not a no-op: it flags whatever is open
+// at that moment -- a turn created since the first request too, which then stops
+// -- and writes its own audit row; it answers the same requestedAt until a person
+// resumes the session.
 type StopSessionResponse struct {
 	// How many turns were pending, dispatched or processing across every reached
 	// session when the request was written -- the turns it flagged to be cancelled. 0

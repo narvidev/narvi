@@ -508,7 +508,7 @@ export interface PlanActionResponse {
   turnId: string | null;
 }
 /**
- * 202 response body for POST /api/sessions/{sessionID}/stop (technical plan §3.3): a person's request to stop a session and every session it started, accepted and written as data. No request body. Accepted is not done: every turn open at the request is flagged, and the session's actor cancels each through §3.3's own cancel transition -- a pending one at once, a running one once the sandbox's own stop, or the grace after it (StopGrace, 30s), ends it. Turns created after the request run normally. Read GET /api/sessions/{sessionID}/status to see the session settle. Repeating the request is harmless: it flags whatever is open then and answers the same requestedAt.
+ * 202 response body for POST /api/sessions/{sessionID}/stop (technical plan §3.3): a person's request to stop a session and every session it started, accepted and written as data. No request body. Accepted is not done: every turn open at the request is flagged, and the session's actor cancels each through §3.3's own cancel transition -- a pending one at once, a running one once the sandbox's own stop, or the grace after it (StopGrace, 30s), ends it. Turns created after the request run normally. Read GET /api/sessions/{sessionID}/status to see the session settle. Repeating the request is not a no-op: it flags whatever is open at that moment -- a turn created since the first request too, which then stops -- and writes its own audit row; it answers the same requestedAt until a person resumes the session.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "StopSessionResponse".

@@ -17,7 +17,7 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 - Added: `StopSessionResponse`, the `202` body of the new stop route below
   (technical plan §3.3): `sessionId`, `requestedAt` (when the stop now in
   force was first requested -- a repeated request answers the same
-  instant), `reachedSessionIds` (the session named first, then every
+  instant until a person resumes the session), `reachedSessionIds` (the session named first, then every
   session it started, recursively) and `openTurns` (the turns the request
   flagged to be cancelled, across every reached session). A new `$def`
   grades MINOR (row 32).
@@ -29,7 +29,8 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   body. `400` for a malformed id and `404` for a session that does not
   exist, as `GET /api/sessions/{sessionID}` answers; `403` unless
   `authz.ActionStopSession` admits the caller: admin and maintainer on any
-  session, a member on their own or joined sessions, a viewer never.
+  session, a member on their own or joined sessions except a pull
+  request's review session, a viewer never.
   Answers `202 StopSessionResponse` once the request is written: turns open
   at that instant are cancelled -- a pending one at once, a running one
   through the sandbox's own `stop`, or once `StopGrace` (30s) has passed
