@@ -2204,6 +2204,216 @@ func TestStopSession_HITLDecisionResumes(t *testing.T) {
 	}
 }
 
+// TestStopSession_DecisionAndStopOrdered: a person's decision on a workflow
+// step awaiting it and a stop of the same session, racing, are ordered by
+// the session's actor-epoch lock, which both take before any write
+// (technical plan §3.3). A stop that commits first is the request an
+// approval or a revision clears: the attempt it dispatches carries no flag,
+// and no stop is left standing. A decision that commits first inserts an
+// attempt the stop then flags: the stop stands, and cancels it. Each order
+// is forced: the first act is held inside its transaction, after its lock
+// and its writes to the session, until the second waits on a lock too.
+// Without the lock, both orders end with the stop standing over an
+// unflagged attempt, which runs and then ends the run cancelled.
+func TestStopSession_DecisionAndStopOrdered(t *testing.T) {
+	ctx := context.Background()
+
+	type stopResult struct {
+		status int
+		resp   restdtos.StopSessionResponse
+		err    error
+	}
+	type decideResult struct {
+		status int
+		raw    []byte
+		err    error
+	}
+
+	for _, verdict := range []struct {
+		name string
+		body string
+	}{
+		{"approve", `{"verdict":"approve","text":null}`},
+		{"revise", `{"verdict":"revise","text":"narrow it to the parser"}`},
+	} {
+		for _, stopFirst := range []bool{true, false} {
+			name := verdict.name + ", the decision first"
+			if stopFirst {
+				name = verdict.name + ", the stop first"
+			}
+			t.Run(name, func(t *testing.T) {
+				rig := newStopRig(t, stopRigConfig{})
+				owner, token := rig.user(ctx, t, sqlcgen.UserRoleMember)
+				session := rig.session(ctx, t, owner.ID, pgtype.UUID{})
+				rig.readySandbox(ctx, t, session.ID, 1)
+				run := rig.startHITLRun(ctx, t, session.ID)
+				agentReports(ctx, t, rig.registry, session.ID, 1, sandboxws.ExecutionCompleteOutcomeCompleted)
+				rig.agentSnapshotReady(ctx, t, session.ID, 1)
+				awaiting, _ := rig.stepRunIn(ctx, t, run.id, "awaiting_decision")
+
+				hold, err := rig.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = hold.Rollback(ctx) }()
+				if stopFirst {
+					// The stop's last write is its audit row: it waits there,
+					// having flagged the session.
+					if _, err := hold.Exec(ctx, `LOCK TABLE audit_log IN SHARE MODE`); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					// The decision's attempt is a new step run of this run:
+					// its foreign key waits on the run's row, after the
+					// decision has taken the session's lock and cleared any
+					// stop.
+					if _, err := hold.Exec(ctx, `SELECT id FROM workflow_runs WHERE id = $1 FOR UPDATE`, run.id); err != nil {
+						t.Fatal(err)
+					}
+				}
+
+				stopped := make(chan stopResult, 1)
+				decided := make(chan decideResult, 1)
+				startStop := func() {
+					go func() {
+						status, resp, err := rig.stopRequest(session.ID.String(), token)
+						stopped <- stopResult{status, resp, err}
+					}()
+				}
+				startDecision := func() {
+					go func() {
+						status, raw, err := rig.postRequest("/api/workflow-runs/"+run.id.String()+"/steps/"+awaiting.String()+"/decide", token, []byte(verdict.body))
+						decided <- decideResult{status, raw, err}
+					}()
+				}
+				first, second, secondDone := startStop, startDecision, func() bool { return len(decided) == 1 }
+				if !stopFirst {
+					first, second, secondDone = startDecision, startStop, func() bool { return len(stopped) == 1 }
+				}
+				first()
+				stopEventually(t, 10*time.Second, "the first act waits inside its transaction", func() bool { return rig.lockWaiters(ctx, t) >= 1 })
+				second()
+				// The second waits on a lock too -- or, with nothing to order
+				// the two, runs to its end.
+				stopEventually(t, 10*time.Second, "the second act waits on a lock, or ends", func() bool { return rig.lockWaiters(ctx, t) >= 2 || secondDone() })
+				if err := hold.Rollback(ctx); err != nil {
+					t.Fatal(err)
+				}
+
+				var stop stopResult
+				var decision decideResult
+				for _, wait := range []func(){
+					func() {
+						select {
+						case stop = <-stopped:
+						case <-time.After(10 * time.Second):
+							t.Fatal("the stop never answered")
+						}
+					},
+					func() {
+						select {
+						case decision = <-decided:
+						case <-time.After(10 * time.Second):
+							t.Fatal("the decision never answered")
+						}
+					},
+				} {
+					wait()
+				}
+				if stop.err != nil || decision.err != nil {
+					t.Fatalf("stop: %v; decision: %v", stop.err, decision.err)
+				}
+				if stop.status != http.StatusAccepted || decision.status != http.StatusOK {
+					t.Fatalf("stop status %d, decision status %d %s; want 202 and 200", stop.status, decision.status, decision.raw)
+				}
+				var resp restdtos.WorkflowStepDecideResponse
+				if err := json.Unmarshal(decision.raw, &resp); err != nil {
+					t.Fatal(err)
+				}
+				if resp.TurnId == nil {
+					t.Fatalf("decision %s dispatched no attempt", decision.raw)
+				}
+				var attempt pgtype.UUID
+				if err := attempt.Scan(string(*resp.TurnId)); err != nil {
+					t.Fatal(err)
+				}
+				stopStands := rig.sessionRow(ctx, t, session.ID).StopRequestedAt.Valid
+				flagged := rig.turnRow(ctx, t, attempt).StopRequestedAt.Valid
+
+				if stopFirst {
+					if stopStands || flagged || stop.resp.OpenTurns != 0 {
+						t.Fatalf("the stop first: stop standing %v, attempt flagged %v, the stop found %d open turns; want the decision to clear the stop it waited for, and its attempt unflagged", stopStands, flagged, stop.resp.OpenTurns)
+					}
+					rig.runAttempt(ctx, t, session.ID, attempt)
+					if runStatus, steps := rig.runState(ctx, t, run.id); runStatus != "running" {
+						t.Fatalf("the stop first: run %s, step runs %v once the attempt ran; want the run going on", runStatus, steps)
+					}
+					return
+				}
+				if !stopStands || !flagged || stop.resp.OpenTurns != 1 {
+					t.Fatalf("the decision first: stop standing %v, attempt flagged %v, the stop found %d open turns; want the stop to wait for the decision and flag its attempt", stopStands, flagged, stop.resp.OpenTurns)
+				}
+				pumpUntil(ctx, t, rig.registry, 10*time.Second, "the stop cancels the attempt it flagged", func() bool {
+					return rig.turnRow(ctx, t, attempt).Status == sqlcgen.TurnStatusCancelled
+				})
+				if runStatus, steps := rig.runState(ctx, t, run.id); runStatus != "cancelled" {
+					t.Fatalf("the decision first: run %s, step runs %v; want the run cancelled by the stop", runStatus, steps)
+				}
+			})
+		}
+	}
+}
+
+// TestStopSession_RepeatKeepsEachTurnsFirstFlag: a repeated stop moves the
+// session's request to its own instant, but a turn it finds already
+// flagged keeps its first flag (technical plan §3.3), so the grace of a
+// turn in flight runs from the first request: a person repeating the stop
+// cannot push a silent turn's cancel back, one grace at a time.
+// TestStopSession_RepeatDisarmsTimersArmedSinceTheFirst pins the session's
+// own instant.
+func TestStopSession_RepeatKeepsEachTurnsFirstFlag(t *testing.T) {
+	ctx := context.Background()
+	const grace = 3 * time.Second
+	rig := newStopRig(t, stopRigConfig{grace: grace})
+	owner, token := rig.user(ctx, t, sqlcgen.UserRoleMember)
+	session := rig.session(ctx, t, owner.ID, pgtype.UUID{})
+	rig.readySandbox(ctx, t, session.ID, 1)
+	running := rig.processingTurn(ctx, t, session.ID, 1)
+
+	status, first := rig.stop(t, session.ID.String(), token)
+	if status != http.StatusAccepted {
+		t.Fatalf("first stop: status %d", status)
+	}
+	flag := rig.turnRow(ctx, t, running.ID).StopRequestedAt.Time
+	stopEventually(t, 10*time.Second, "the first stop is sent and the timer armed for its grace's end", func() bool {
+		firesAt, armed := rig.stopTimer(ctx, t, session.ID)
+		return len(rig.commander.ofType(t, "stop")) == 1 && armed && firesAt.Equal(flag.Add(grace))
+	})
+
+	// Repeated inside the grace.
+	time.Sleep(grace / 2)
+	status, second := rig.stop(t, session.ID.String(), token)
+	if status != http.StatusAccepted || !second.RequestedAt.After(first.RequestedAt) {
+		t.Fatalf("second stop: status %d, requestedAt %v after %v; want 202 at its own, later instant", status, second.RequestedAt, first.RequestedAt)
+	}
+	stopEventually(t, 10*time.Second, "the repeat is handled", func() bool { return len(rig.commander.ofType(t, "stop")) == 2 })
+	if got := rig.turnRow(ctx, t, running.ID).StopRequestedAt.Time; !got.Equal(flag) {
+		t.Fatalf("the repeat moved the turn's flag from %v to %v", flag, got)
+	}
+	if firesAt, armed := rig.stopTimer(ctx, t, session.ID); !armed || !firesAt.Equal(flag.Add(grace)) {
+		t.Fatalf("stop timer armed %v for %v after the repeat, want the first flag's grace end %v", armed, firesAt, flag.Add(grace))
+	}
+
+	// The agent stays silent: the first flag's grace cancels the turn.
+	time.Sleep(time.Until(flag.Add(grace)))
+	pumpUntil(ctx, t, rig.registry, 10*time.Second, "the first flag's grace cancels the silent turn", func() bool {
+		return rig.turnRow(ctx, t, running.ID).Status == sqlcgen.TurnStatusCancelled
+	})
+	if ended := rig.turnRow(ctx, t, running.ID).CompletedAt.Time; !ended.Before(second.RequestedAt.Add(grace)) {
+		t.Fatalf("turn cancelled at %v, not before the repeat's own grace end %v: the repeat pushed its grace back", ended, second.RequestedAt.Add(grace))
+	}
+}
+
 // TestStopSession_RetirementWaitsForADelivery: a stopped turn whose grace
 // ends while its sandbox gen still delivers the push and pull request of
 // the turn that completed before it is cancelled all the same, at the
