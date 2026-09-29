@@ -14,7 +14,7 @@
 //	| View sessions / analytics                                  |  ✓    |     ✓      |   ✓    | ✓ (ro) |
 //	| Create sessions, prompt, approve plans, decide workflow     |  ✓    |     ✓      |   ✓    |   —    |
 //	  steps (§25.11) on own/joined
-//	| Stop own/joined sessions (O1)                              |  ✓    |     ✓      |   ✓    |   —    |
+//	| Stop own/joined sessions (O1), not a PR's review session    |  ✓    |     ✓      |   ✓    |   —    |
 //	| Stop/resume ANY session; approve ANY plan                   |  ✓    |     ✓      |   —    |   —    |
 //	| Manage automations, environments, repo/env secrets,          |  ✓    |     ✓      |   —    |   —    |
 //	  workflow definitions (§25.11)
@@ -34,9 +34,12 @@
 // caller also proves resource.OwnedOrJoined (allowIfOwned). Stopping
 // gained the same carve-out by owner decision O1 (§13.3): a member stops
 // their own or joined sessions, the work row 2 already lets them start and
-// prompt, while "stop/resume ANY session" stays admin/maintainer. Resuming
-// has no member carve-out — see action.go's own doc comments on
-// ActionStopSession/ActionResumeSession.
+// prompt, while "stop/resume ANY session" stays admin/maintainer. A pull
+// request's review session is outside that carve-out: the caller that
+// resolves Resource.OwnedOrJoined for a stop (httpapi's StopSession)
+// passes false for one, so stopping it takes admin or maintainer whoever
+// created or joined it (§13.3). Resuming has no member carve-out — see
+// action.go's own doc comments on ActionStopSession/ActionResumeSession.
 //
 // # What resource ownership resolution is NOT this package's job
 //

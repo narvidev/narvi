@@ -2106,13 +2106,14 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// session's actor-epoch lock; the actor does the rest. See
 		// httpapi/stop.go's own doc comment.
 		r.Post("/{sessionID}/stop", httpapi.StopSession(httpapi.StopSessionDeps{
-			Pool:         pool,
-			Sessions:     sessionStore,
-			Turns:        turnStore,
-			Timers:       timerStore,
-			Participants: participantStore,
-			AuditLog:     auditLogStore,
-			Registry:     registry,
+			Pool:             pool,
+			Sessions:         sessionStore,
+			Turns:            turnStore,
+			Timers:           timerStore,
+			Participants:     participantStore,
+			AuditLog:         auditLogStore,
+			GitHubPRSessions: githubPRSessionStore,
+			Registry:         registry,
 		}))
 		// plans ("plan mode, web", §8.1/§12.2 item 3): the
 		// approve/reject HITL actions -- see httpapi/planapprove.go's own

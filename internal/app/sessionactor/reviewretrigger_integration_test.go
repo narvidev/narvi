@@ -416,6 +416,48 @@ func TestReviewRetriggerDebounceTimer_Enqueue_CreatesReviewTurn(t *testing.T) {
 	}
 }
 
+// TestReviewRetriggerDebounceTimer_Enqueue_LeavesAPersonsStopStanding: the
+// automatic re-review is a turn the bot inserts with no person behind it,
+// so it leaves a person's stop request standing (technical plan §3.3: only
+// the next turn a person creates, or the approval of the session's plan,
+// clears it). A push after the stop armed the debounce, as new input: the
+// re-review turn is inserted, and sessions.stop_requested_at keeps its
+// instant -- a review session is the parent the sentinel auto-fix spawns
+// under, so a cleared request would let new children through.
+func TestReviewRetriggerDebounceTimer_Enqueue_LeavesAPersonsStopStanding(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newAutoRetriggerFixture(ctx, t, pool)
+	if _, err := f.repoSettings.UpsertAutoRetriggerReviewToggle(ctx, f.repoFullName, true); err != nil {
+		t.Fatalf("enable auto-retrigger-review: %v", err)
+	}
+	var requestedAt pgtype.Timestamptz
+	if err := pool.QueryRow(ctx, `UPDATE sessions SET stop_requested_at = now() WHERE id = $1 RETURNING stop_requested_at`, f.sessionID).Scan(&requestedAt); err != nil {
+		t.Fatalf("a person's stop: %v", err)
+	}
+	f.setPendingHeadSHA(ctx, t, "sha-pushed-after-the-stop")
+	f.armDebounceTimer(ctx, t)
+
+	diffFetcher := &fakeReviewDiffFetcher{nextHeadSHA: "sha-pushed-after-the-stop", nextBaseRef: "main", nextDiff: "+ line changed"}
+	r := newAutoRetriggerRegistry(ctx, t, pool, diffFetcher)
+	fireDebounceTimer(ctx, t, r, f)
+
+	turns, err := f.turns.ListForSession(ctx, f.sessionID)
+	if err != nil {
+		t.Fatalf("list turns: %v", err)
+	}
+	if len(turns) != 1 {
+		t.Fatalf("turns created = %d, want the one automatic re-review", len(turns))
+	}
+	var after pgtype.Timestamptz
+	if err := pool.QueryRow(ctx, `SELECT stop_requested_at FROM sessions WHERE id = $1`, f.sessionID).Scan(&after); err != nil {
+		t.Fatalf("read stop request: %v", err)
+	}
+	if !after.Valid || !after.Time.Equal(requestedAt.Time) {
+		t.Fatalf("stop_requested_at = %v after the automatic re-review, want %v: a turn the bot creates never lifts a person's stop", after, requestedAt)
+	}
+}
+
 // TestReviewRetriggerDebounceTimer_FlooredDeep_PromptReflectsDeepPath is
 // §26.4's own regression test for a genuine, pre-existing defect this
 // Step's own restructuring of handleReviewRetriggerDebounceTimer fixed:

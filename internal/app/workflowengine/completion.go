@@ -10,9 +10,10 @@
 //   - dispatch.go's failDispatchedTurn -- SandboxCommander.SendCommand
 //     itself failing, so the prompt never even reached the sandbox.
 //   - stop.go's cancelStoppedTurns -- a person's stop (§3.3) cancelling a
-//     flagged turn, from the stop timer or the dispatch gate. A cancel a
-//     stop asked for ends the run cancelled and never consults NextStep,
-//     whichever of these paths reports it.
+//     flagged turn, from the stop timer or the dispatch gate. While the
+//     session's stop request stands, an attempt that ends -- however it
+//     ends, whichever of these paths reports it -- ends its run cancelled
+//     and never consults NextStep; so does a cancel a stop asked for.
 //
 // All of them matter: a step's own workflow_step_runs attempt must be
 // finalized (or parked awaiting_decision) no matter WHICH of these three
@@ -94,9 +95,13 @@ func stepRunTerminalStatus(trig turn.Trigger) string {
 // and -- unless the step is HITLAfter-gated -- consults workflow.NextStep
 // (via ApplyStepOutcome, advance.go) to advance, complete, or escalate the
 // owning run. sessionRow is the SAME row the caller (pushpr.go/timerfired.go/
-// dispatch.go, all three already fetch or hold it for their own unrelated
-// reasons) already has in scope -- used for BuildModelID on an advance and
-// for notification-destination resolution. Never returns an error (see
+// dispatch.go/stop.go, all four already fetch or hold it for their own
+// unrelated reasons) already has in scope -- used for BuildModelID on an
+// advance, for notification-destination resolution, and for the session's
+// standing stop request (sessions.stop_requested_at). Every caller reads it
+// in its own transaction, after the actor-epoch lock on the session row that
+// the stop route's write also takes, so that request is the one standing
+// now. Never returns an error (see
 // doc.go's own "fail-open is load-bearing" section): any internal failure
 // is logged and this simply does nothing further -- a turn's own completion
 // (already durably persisted by the caller before this runs) must never be
@@ -122,16 +127,20 @@ func OnTurnCompleted(ctx context.Context, deps Deps, sessionRow sqlcgen.Session,
 		return
 	}
 
-	// Technical plan §3.3's stop: an attempt whose turn a person's stop
-	// cancelled -- the actor's own synthetic cancel, or the agent's
-	// execution_complete{cancelled} answering the sandbox `stop` -- ends its
-	// run cancelled, before a HITL gate or workflow.NextStep is ever
-	// reached. Consulting NextStep here would read the cancel as 'blocked',
-	// and a custom definition's edge on 'blocked' would queue the next step:
-	// the stop would not stop. A cancel no stop asked for keeps the path
-	// below.
-	if trig == turn.TriggerCancel {
-		stopped, err := turnStopRequested(ctx, deps, turnID)
+	// Technical plan §3.3's stop. While the session's stop request stands
+	// -- sessions.stop_requested_at, which only a person's next turn or
+	// plan approval clears -- an attempt that ends, however it ends, ends
+	// its run cancelled, before a HITL gate or workflow.NextStep is ever
+	// reached. An advance is a turn created with no new input: an attempt
+	// that completed before the stop reached it, failed, timed out, or was
+	// created after the request would otherwise queue the next step, and
+	// the stop would not stop. A cancel the stop asked for (the turn's own
+	// flag) ends the run the same way even once a person has resumed the
+	// session: read as 'blocked', it would let a custom definition's edge
+	// queue the next step. Any other cancel keeps the path below.
+	stopped := sessionRow.StopRequestedAt.Valid
+	if !stopped && trig == turn.TriggerCancel {
+		flagged, err := turnStopRequested(ctx, deps, turnID)
 		if err != nil {
 			// Fail toward the stop: a cancelled attempt whose stop flag
 			// cannot be read never advances its run. (Inside the caller's
@@ -139,12 +148,13 @@ func OnTurnCompleted(ctx context.Context, deps Deps, sessionRow sqlcgen.Session,
 			// caller's commit fails and the whole terminal write is retried.)
 			logger.Error("workflowengine: read cancelled turn's stop request failed; ending its run as a stop",
 				"turn_id", turnID.String(), "run_id", runRow.ID.String(), "error", err)
-			stopped = true
+			flagged = true
 		}
-		if stopped {
-			cancelStoppedRun(ctx, workflows, stepRun, runRow)
-			return
-		}
+		stopped = flagged
+	}
+	if stopped {
+		cancelStoppedRun(ctx, workflows, stepRun, runRow, trig)
+		return
 	}
 
 	def, err := LoadDefinition(ctx, workflows, runRow.WorkflowDefinitionID)
@@ -266,14 +276,16 @@ func turnStopRequested(ctx context.Context, deps Deps, turnID pgtype.UUID) (bool
 	return row.StopRequestedAt.Valid, nil
 }
 
-// cancelStoppedRun finishes stepRun cancelled -- its outcome the one posted
-// during the turn, else the implicit 'blocked' -- and ends runRow
-// cancelled. workflow.NextStep is never consulted: nothing follows a stop.
-// Fail-open like the rest of this file: a failed write is logged and the
-// run left where it is.
-func cancelStoppedRun(ctx context.Context, workflows *postgres.WorkflowStore, stepRun sqlcgen.WorkflowStepRun, runRow sqlcgen.WorkflowRun) {
+// cancelStoppedRun finishes stepRun with the status its turn really ended
+// with (stepRunTerminalStatus(trig): an attempt that completed before the
+// stop reached it stays completed) -- its outcome the one posted during the
+// turn, else the one implied by trig -- and ends runRow cancelled.
+// workflow.NextStep is never consulted: nothing follows a stop. Fail-open
+// like the rest of this file: a failed write is logged and the run left
+// where it is.
+func cancelStoppedRun(ctx context.Context, workflows *postgres.WorkflowStore, stepRun sqlcgen.WorkflowStepRun, runRow sqlcgen.WorkflowRun, trig turn.Trigger) {
 	logger := platform.Logger(ctx)
-	if _, err := workflows.FinishStepRun(ctx, stepRun.ID, stepRunTerminalStatus(turn.TriggerCancel), string(implicitOutcome(turn.TriggerCancel))); err != nil {
+	if _, err := workflows.FinishStepRun(ctx, stepRun.ID, stepRunTerminalStatus(trig), string(implicitOutcome(trig))); err != nil {
 		logger.Error("workflowengine: finish stopped step run failed", "step_run_id", stepRun.ID.String(), "error", err)
 		return
 	}

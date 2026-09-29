@@ -396,8 +396,10 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, er
 		// the person asked to stop. The gate keys on the flag alone, never
 		// on anything else about the session (a newer plan, say). Turns
 		// created after the request carry no flag and dispatch normally.
+		// Only pending turns reach this gate, so none of them was in
+		// flight: the sandbox has nothing to retire here.
 		if flagged := stopFlaggedPendingTurnIDs(turns); len(flagged) > 0 {
-			if err := a.cancelStoppedTurns(ctx, tx, sessionRow, flagged, now); err != nil {
+			if _, err := a.cancelStoppedTurns(ctx, tx, sessionRow, flagged, now); err != nil {
 				return err
 			}
 			if turns, err = a.stores.turn.WithTx(tx).ListForSession(ctx, a.sessionID); err != nil {

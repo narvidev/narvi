@@ -57,6 +57,10 @@ type StopSessionDeps struct {
 	Timers       *postgres.TimerStore
 	Participants *postgres.ParticipantStore
 	AuditLog     *postgres.AuditLogStore
+	// GitHubPRSessions tells a pull request's review session -- one a
+	// github_pr_sessions row points at -- from any other: the member rule
+	// does not reach it (see StopSession).
+	GitHubPRSessions *postgres.GitHubPRSessionStore
 	// Registry, when set, is woken after each commit so the session's actor
 	// handles its stop at once instead of at the timer pump's next tick.
 	// The timer is the request's durable half: without the wake -- this
@@ -69,11 +73,21 @@ type StopSessionDeps struct {
 // §3.3). No body. 400 on a malformed id and 404 on an unknown session, as
 // GET /api/sessions/{sessionID} answers; 403 unless authz.ActionStopSession
 // admits the caller -- admin and maintainer on any session, a member on
-// their own or joined sessions (owner decision O1), a viewer never. 202
-// with restdtos.StopSessionResponse once the request is written to the
-// session and to every session it started. 500 when a descendant could not
-// be reached: what was written stands, and repeating the request, which is
-// idempotent, reaches the rest.
+// their own or joined sessions except a pull request's review session
+// (owner decision O1 and its review-session exception, technical plan
+// §13.3), a viewer never. 202 with restdtos.StopSessionResponse once the
+// request is written to the session and to every session it started. 500
+// when a descendant could not be reached: what was written stands, and
+// repeating the request reaches the rest.
+//
+// A repeat is not a no-op. It flags every turn open at the moment it is
+// made -- including one a person created since the first request, which
+// then stops too -- writes its own session.stop audit row, and re-arms the
+// stop timer. A turn keeps the instant it was first flagged, so its grace
+// runs from the first request that reached it (RequestStopOpenTurns'
+// COALESCE). requestedAt is the first request's instant unless a person
+// resumed the session in between, which makes the repeat a new request
+// (RequestSessionStop's COALESCE over a cleared flag).
 func StopSession(deps StopSessionDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
@@ -111,6 +125,23 @@ func StopSession(deps StopSessionDeps) http.HandlerFunc {
 			}
 			ownedOrJoined = exists
 		}
+		// A pull request's review session is shared: every review attempt
+		// on that PR runs in it, a maintainer's label re-trigger and the
+		// automatic re-review included, and the sentinel auto-fix sessions
+		// it starts are its descendants. Its created_by is only whoever
+		// first mentioned the bot there. So the member rule, whose reason is
+		// that a member can already start and prompt the work a stop ends,
+		// does not reach it: stopping one takes admin or maintainer, as
+		// before O1 (technical plan §13.3).
+		if ownedOrJoined {
+			review, err := isPRReviewSession(ctx, deps.GitHubPRSessions, sessionRow.ID)
+			if err != nil {
+				logger.Error("httpapi: check review session for authorization failed", "error", err)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			ownedOrJoined = !review
+		}
 		if !authorize(w, r, authz.ActionStopSession, authz.Resource{OwnedOrJoined: ownedOrJoined}) {
 			return
 		}
@@ -140,6 +171,18 @@ func StopSession(deps StopSessionDeps) http.HandlerFunc {
 			OpenTurns:         openTurns + descendantTurns,
 		})
 	}
+}
+
+// isPRReviewSession reports whether a github_pr_sessions row points at
+// sessionID: whether it is a pull request's review session.
+func isPRReviewSession(ctx context.Context, prSessions *postgres.GitHubPRSessionStore, sessionID pgtype.UUID) (bool, error) {
+	if _, err := prSessions.GetBySessionID(ctx, sessionID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // stopDescendants applies the stop request to every session rootID started,

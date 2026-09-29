@@ -156,9 +156,11 @@ const (
 	// internal/adapters/inbound/httpapi's StopSession). Admin and
 	// maintainer on any session; a member only on their own or joined
 	// sessions (owner decision O1: a member can already start and prompt
-	// that work, and a stop only ever reduces what runs); a viewer never.
-	// The descendants a stop reaches are authorized by this one check on
-	// the session named, since they are its work.
+	// that work, and a stop only ever reduces what runs), never a pull
+	// request's review session, whose work is everyone's who asks the bot
+	// to review that PR (StopSession resolves OwnedOrJoined false for one);
+	// a viewer never. The descendants a stop reaches are authorized by this
+	// one check on the session named, since they are its work.
 	ActionStopSession Action = "stop_session"
 	// ActionResumeSession resumes a stopped session. No caller exists yet:
 	// a stop is cleared by the next turn a person creates, through
