@@ -2114,6 +2114,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			AuditLog:         auditLogStore,
 			GitHubPRSessions: githubPRSessionStore,
 			Registry:         registry,
+			Timeouts:         cfg.Timeouts,
 		}))
 		// plans ("plan mode, web", §8.1/§12.2 item 3): the
 		// approve/reject HITL actions -- see httpapi/planapprove.go's own
@@ -2863,6 +2864,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			AuditLog:         auditLogStore,
 			GitHubPRSessions: githubPRSessionStore,
 			Registry:         registry,
+			Timeouts:         cfg.Timeouts,
 		}),
 	})
 	if err != nil {

@@ -183,6 +183,7 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		AuditLog:         auditLog,
 		GitHubPRSessions: rig.prSessions,
 		Registry:         registry,
+		Timeouts:         platform.DefaultTimeouts(),
 	})
 
 	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{PublicBaseURL: baseURL, CreateBrake: unlimitedBrake{}}, mcpadapter.Twins{

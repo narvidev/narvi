@@ -485,6 +485,85 @@ func sdkStopSessionReadGrant(t *testing.T, rig *oauthRouterRig) {
 	}
 }
 
+// lockWaiters counts this database's backends waiting on a lock.
+func (r *oauthRouterRig) lockWaiters(ctx context.Context, t *testing.T) int {
+	t.Helper()
+	return r.countOf(ctx, t, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`)
+}
+
+// sdkStopSessionCallerGoneMidWalk is TestOAuth_ProductionRouter's
+// StopSession_CallerGoneMidWalk_SDKClient (technical plan §3.3, §43.22):
+// once the named session's request has committed, a client that goes away
+// does not cut the walk short. A member's session has a child and a
+// grandchild, each with a queued turn. The child's row is held, so the walk
+// waits on it after the parent's commit; the client then abandons its
+// narvi_stop_session call, which closes its connection and cancels the MCP
+// request's context -- the context the twin runs on; the row is released
+// only after that. The walk still reaches the child and the grandchild:
+// every turn of the tree ends cancelled, and each descendant's session.stop
+// row names the parent it was reached through and carries the grant.
+func sdkStopSessionCallerGoneMidWalk(t *testing.T, rig *oauthRouterRig) {
+	ctx := oauthTestCtx(t)
+	flow := rig.connectSDKClient(ctx, t, nil)
+	grant := rig.grantOf(ctx, t, flow.member.ID)
+	tr := seedStopTree(ctx, t, rig, flow.member.ID, true)
+	grandchild, err := narvipg.NewSessionStore(rig.pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, ParentSessionID: tr.child, SpawnDepth: 2})
+	if err != nil {
+		t.Fatalf("create the grandchild session: %v", err)
+	}
+	grandchildTurn := seedTurn(ctx, t, rig, grandchild.ID, sqlcgen.TurnStatusPending, false)
+
+	holder, err := rig.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var once sync.Once
+	release := func() { once.Do(func() { _ = holder.Rollback(ctx) }) }
+	t.Cleanup(release)
+	if _, err := holder.Exec(ctx, `SELECT 1 FROM sessions WHERE id = $1 FOR UPDATE`, tr.child); err != nil {
+		t.Fatalf("hold the child's row: %v", err)
+	}
+	waiters := rig.lockWaiters(ctx, t)
+
+	callCtx, hangUp := context.WithCancel(ctx)
+	defer hangUp()
+	var call errgroup.Group
+	call.Go(func() error {
+		if _, err := flow.session.CallTool(callCtx, &sdkmcp.CallToolParams{Name: "narvi_stop_session", Arguments: map[string]any{"sessionId": tr.parent.String()}}); err == nil {
+			return errors.New("narvi_stop_session answered before the client hung up")
+		}
+		return nil
+	})
+	waitFor(t, 10*time.Second, "the parent's request committed and the walk waiting on the child's row", func() bool {
+		var flagged bool
+		if err := rig.pool.QueryRow(ctx, `SELECT stop_requested_at IS NOT NULL FROM sessions WHERE id = $1`, tr.parent).Scan(&flagged); err != nil {
+			t.Fatal(err)
+		}
+		return flagged && rig.lockWaiters(ctx, t) > waiters
+	})
+	hangUp()
+	if err := call.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	// Long enough for the server to see the connection close and cancel the
+	// request's context; a walk still on that context fails here.
+	time.Sleep(500 * time.Millisecond)
+	release()
+
+	whole := []stopTree{tr, {parent: grandchild.ID, parentTurn: grandchildTurn}}
+	waitStopped(ctx, t, rig, whole...)
+	for id, via := range map[pgtype.UUID]pgtype.UUID{tr.child: tr.parent, grandchild.ID: tr.child} {
+		audits := collectRows(ctx, t, rig, func(row pgx.Rows) (string, error) {
+			var viaID, stamp *string
+			err := row.Scan(&viaID, &stamp)
+			return fmt.Sprintf("via=%v grant=%v", deref(viaID), deref(stamp)), err
+		}, `SELECT detail_json->>'via_parent_session_id', detail_json->'mcp'->>'grant_id' FROM audit_log WHERE action = 'session.stop' AND resource_id = $1`, id.String())
+		if want := fmt.Sprintf("via=%s grant=%s", via.String(), grant); strings.Join(audits, ";") != want {
+			t.Fatalf("session %s: session.stop rows %v, want one: %s", id.String(), audits, want)
+		}
+	}
+}
+
 // deref reads an optional string, "" for none.
 func deref(s *string) string {
 	if s == nil {

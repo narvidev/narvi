@@ -343,7 +343,9 @@ every review of that pull request shares (`403`); a viewer may stop none.
 An admin or maintainer may stop any session. If a session the stop
 reached could not be written, the answer is `500`: what was written
 stands, and repeating the request reaches the rest, flagging, as above,
-whatever is open by then.
+whatever is open by then. Once the session named is stopped, your
+connection dropping does not cut short the stop of the sessions it
+started.
 
 ## Plan mode
 

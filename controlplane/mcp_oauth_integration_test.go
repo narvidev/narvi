@@ -1272,6 +1272,9 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	t.Run("StopSession_ReadGrantDoesNotSeeIt", func(t *testing.T) {
 		sdkStopSessionReadGrant(t, stopRig)
 	})
+	t.Run("StopSession_CallerGoneMidWalk_SDKClient", func(t *testing.T) {
+		sdkStopSessionCallerGoneMidWalk(t, stopRig)
+	})
 	// The row's exit, on a router of its own alone, whose sandbox provider
 	// is a local fake (newExitRouterRig).
 	exitRig, exitProvider := newExitRouterRig(t, connStr)
