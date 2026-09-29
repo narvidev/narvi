@@ -62,9 +62,12 @@ import (
 //     another pod picks it up"); ErrActorUnavailable -> 503 with
 //     Retry-After set to ActorHydrateTimeout in whole seconds, at least
 //     one (this replica could not hydrate the actor within that bound --
-//     its query pool stayed saturated, or its lock connection is down --
-//     and has released any lock it took, so a reconnect after the pause
-//     may land here or elsewhere); any other GetOrSpawn error -> 500.
+//     its query pool stayed saturated, or it had no working lock
+//     connection -- and has released any lock it took, so a reconnect may
+//     land here or elsewhere). Retry-After only advises: the in-tree
+//     sandbox agent (wsbridge.Run) never reads it and retries a 503 on
+//     its own exponential backoff, from SandboxWSReconnectMinBackoff (1 s)
+//     up; any other GetOrSpawn error -> 500.
 //  11. websocket.Accept, then the read/dispatch loop (dispatch.go) runs
 //     until conn.Read errors or ctx is done.
 func NewSandboxHandler(registry *sessionactor.Registry, sandboxes *postgres.SandboxStore, commander *SandboxRegistry, timeouts platform.Timeouts) http.HandlerFunc {

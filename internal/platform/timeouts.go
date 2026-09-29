@@ -271,10 +271,11 @@ type Timeouts struct {
 	// A replica holds every one of its actors' advisory locks on ONE
 	// dedicated connection outside its query pool
 	// (internal/app/sessionactor/lockholder.go), so hosting sessions never
-	// takes a query connection. Unlike the fields above, these three are
-	// linked -- to each other and to TimerClaimDuration -- by Validate,
-	// with no margin: they are a second apart at most, and each link is an
-	// ordering, not a race. The values are not in the plan; they are chosen.
+	// takes a query connection. Unlike the fields above, the first three
+	// are linked -- to each other and to TimerClaimDuration -- by
+	// Validate, with no margin: they are a second apart at most, and each
+	// link is an ordering, not a race. The values are not in the plan;
+	// they are chosen, except the fourth's, which is pgxpool's.
 
 	// ActorHydrateTimeout bounds one whole hydration (Registry.GetOrSpawn
 	// for a session this replica does not yet host): the advisory lock,
@@ -284,25 +285,54 @@ type Timeouts struct {
 	// retryable sessionactor.ErrActorUnavailable instead of waiting on a
 	// saturated query pool. 2 s: a healthy hydration is five round trips,
 	// milliseconds, and 2 s stays inside the shortest synchronous webhook
-	// deadline on the paths that hydrate. A lock statement already in
-	// flight when the bound expires runs to its own bound
-	// (ActorLockStatementTimeout) rather than being cut short: cancelling
-	// a statement mid-flight breaks the connection, and with it every
-	// other actor's lock.
+	// deadline on the paths that hydrate.
+	//
+	// It bounds waiting, not every statement a hydration has started: a
+	// lock statement already in flight when the bound expires runs to its
+	// own bound (ActorLockStatementTimeout) rather than being cut short --
+	// cancelling a statement mid-flight breaks the connection, and with it
+	// every other actor's lock -- and a hydration that fails then releases
+	// its lock with one more statement, after waiting its turn on the lock
+	// connection. So GetOrSpawn can return up to about this bound plus two
+	// ActorLockStatementTimeouts, plus that turn, after it was called.
+	//
+	// It may be shorter than one host's connect_timeout. The lock
+	// connection is never dialled under a hydration's bound: it is dialled
+	// in the background, as the query pool dials, and a hydration only
+	// waits for the dial within its bound. While a dial is still in flight
+	// -- a first host that accepts and never answers, in a multi-host
+	// URL -- hydrations fail fast with ErrActorUnavailable and the dial
+	// goes on to the next host; the first hydration after it lands
+	// succeeds.
 	ActorHydrateTimeout time.Duration
 
 	// ActorLockStatementTimeout bounds each statement on the lock
-	// connection -- lock, unlock, probe -- and the dial that opens it. A
-	// statement that fails or overruns means the connection is presumed
-	// lost: it is closed, and every actor locked under it is stopped. 1 s.
+	// connection: lock, unlock, probe. A statement that finds the
+	// connection gone -- closed, a network error, a FATAL or PANIC from
+	// the server, or this bound overrun -- presumes it lost: it is closed,
+	// every actor locked under it is stopped, and a new one is dialled. A
+	// server-side ERROR on a live connection fails that statement only. It
+	// does not bound the dial, which follows the query pool's own connect
+	// rules (ActorLockConnectTimeoutFallback). 1 s.
 	ActorLockStatementTimeout time.Duration
 
 	// ActorLockProbeInterval is how often the lock connection is probed
-	// (Registry.RunLockProbe). It is roughly how long a replica's actors
-	// can keep running after that replica has lost their locks -- another
-	// replica may already hold them by then, and only the epoch fence
-	// stops a stale actor's writes (§2). 10 s.
+	// (Registry.RunLockProbe), and how often a dial that failed is
+	// retried when no hydration asks for one sooner. It is roughly how
+	// long a replica's actors can keep running after that replica has lost
+	// their locks -- another replica may already hold them by then, and
+	// only the epoch fence stops a stale actor's writes (§2). 10 s.
 	ActorLockProbeInterval time.Duration
+
+	// ActorLockConnectTimeoutFallback is the per-host connect timeout the
+	// lock connection's dial uses when the database URL sets no
+	// connect_timeout: pgxpool's own fallback for the query pool's dials
+	// (pgx v5.10.0, pgxpool/pool.go), which also outlive whoever asked for
+	// them. With it, the lock connection is
+	// dialled exactly as a pool connection is -- per host, through every
+	// host of a multi-host URL -- and a host that accepts and never
+	// answers cannot hold a dial forever. 2 min, pgxpool's value.
+	ActorLockConnectTimeoutFallback time.Duration
 
 	// --- §6.4 standalone additions: no ordering relationship with
 	// either invariant chain above (or with any prior Step's standalone
@@ -3600,6 +3630,8 @@ func DefaultTimeouts() Timeouts {
 		ActorLockStatementTimeout: 1 * time.Second,  // not specified; chosen
 		ActorLockProbeInterval:    10 * time.Second, // not specified; chosen
 
+		ActorLockConnectTimeoutFallback: 2 * time.Minute, // pgxpool v5's own, for a dial with no connect_timeout
+
 		HookTimeout:               10 * time.Minute, // not specified; chosen generously (setup.sh may install deps)
 		ProcessStopGracePeriod:    10 * time.Second, // not specified; chosen
 		SupervisorShutdownTimeout: 30 * time.Second, // not specified; chosen
@@ -4255,13 +4287,18 @@ func (t Timeouts) Validate() error {
 	// hydration and a zero interval probes in a hot loop, so each is
 	// refused. A lock statement is one step of a hydration, so it lies
 	// below the hydration bound, or the per-statement bound never applies.
-	// A pump delivery that fails on the hydration bound ends inside its
-	// timer's claim, so the retry comes from the claim expiring, not from a
-	// second, concurrent delivery. And one probe finishes before the next
-	// is due.
+	// A pump delivery that fails on the hydration bound should end inside
+	// its timer's claim, so the retry comes from the claim expiring, not
+	// from a second, concurrent delivery: the link orders the bound itself,
+	// and its overshoot (ActorHydrateTimeout's own comment) is a few
+	// seconds at most against a 30 s claim by default. And one probe
+	// finishes before the next is due. The connect-timeout fallback is
+	// linked to nothing -- it is pgxpool's -- but a zero one would make
+	// pgx wait on a silent host forever, so it is refused too.
 	mustBePositive("ActorHydrateTimeout", t.ActorHydrateTimeout)
 	mustBePositive("ActorLockStatementTimeout", t.ActorLockStatementTimeout)
 	mustBePositive("ActorLockProbeInterval", t.ActorLockProbeInterval)
+	mustBePositive("ActorLockConnectTimeoutFallback", t.ActorLockConnectTimeoutFallback)
 	strictlyBelow("ActorHydrateTimeout > ActorLockStatementTimeout",
 		"ActorLockStatementTimeout", t.ActorLockStatementTimeout, "ActorHydrateTimeout", t.ActorHydrateTimeout)
 	strictlyBelow("TimerClaimDuration > ActorHydrateTimeout",

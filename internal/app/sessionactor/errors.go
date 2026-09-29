@@ -19,9 +19,11 @@ var (
 
 	// ErrActorUnavailable is returned by Registry.GetOrSpawn when this
 	// replica could not hydrate the session's actor in time: the query
-	// pool stayed saturated for the whole ActorHydrateTimeout bound, or the
-	// replica's lock connection (lockholder.go) could not be dialled or was
-	// lost mid-hydration. Retryable, and distinct from
+	// pool stayed saturated for the whole ActorHydrateTimeout bound, or no
+	// working lock connection (lockholder.go) could be had within it -- none
+	// could be dialled in time, or the one open was lost and a retry on a
+	// new one failed too -- or a server-side error failed the lock
+	// statement itself. Retryable, and distinct from
 	// ErrSessionActorElsewhere: nobody else is known to own the session --
 	// this replica just cannot host it right now. Any lock the attempt took
 	// has already been released by the time it is returned. Each caller's

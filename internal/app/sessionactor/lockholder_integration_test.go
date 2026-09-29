@@ -412,9 +412,11 @@ func TestLockHolder_LockConnLostStopsActors(t *testing.T) {
 // TestLockHolder_StaleGenerationUnlockIsNoop (T4b) proves a lock from a
 // lost connection's generation can never release the same session's lock
 // taken again under the new one: after a loss and a rehydration of the
-// same session, the old actor's late unlock -- run explicitly here, and
-// again by its own shutdown -- leaves the new lock held, so another pod
-// still sees the session as owned.
+// same session, the old actor's late unlock, run explicitly here, leaves
+// the new lock held, so another pod still sees the session as owned. The
+// old actor's own shutdown runs the same unlock, but only after its done
+// channel closes, so the test cannot order it before the check and does
+// not rely on it.
 func TestLockHolder_StaleGenerationUnlockIsNoop(t *testing.T) {
 	ctx := context.Background()
 	admin, connStr := IntegrationTestPoolAndConnStr(t)

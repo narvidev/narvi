@@ -237,9 +237,10 @@ func newStoreBundle(pool *pgxpool.Pool, platformShadow bool) storeBundle {
 // however many sessions the replica hosts (§5.1).
 type Registry struct {
 	// mu guards actors. Lock order, where both are ever wanted: mu, then
-	// the lock holder's own mutex -- though no path nests them today: the
+	// the lock holder's own mutexes -- though no path nests them today: the
 	// insert-time generation check reads the holder's atomic generation,
-	// and onLockLost is called with the holder's mutex already released.
+	// and onLockLost is called with the holder's mutexes released (the
+	// re-dial that follows a loss starts only once onLockLost returns).
 	mu     sync.Mutex
 	actors map[pgtype.UUID]*Actor
 
@@ -569,7 +570,7 @@ func NewRegistry(
 		lifecycleCtx:           lifecycleCtx,
 		cancel:                 cancel,
 	}
-	r.locks = newLockHolder(pool, timeouts.ActorLockStatementTimeout, r.onLockLost)
+	r.locks = newLockHolder(lifecycleCtx, pool, timeouts, r.onLockLost)
 	return r, nil
 }
 
@@ -686,9 +687,15 @@ func (r *Registry) SetKnowledgeRanker(ranker ports.KnowledgeRanker) {
 // hanging on a lock that may not release for the rest of that actor's
 // lifetime. Returns ErrActorUnavailable (retryable) when this replica
 // could not hydrate the actor within ActorHydrateTimeout -- its query
-// pool stayed saturated, or its lock connection is down -- having
-// released any lock it took; never waits past that bound, whatever
-// context the caller passed.
+// pool stayed saturated, or it could not get a working lock connection --
+// having released any lock it took. The bound is ActorHydrateTimeout,
+// whatever context the caller passed, but it bounds the waiting, not
+// every statement a hydration started: a lock statement already running
+// when the bound expires finishes under its own ActorLockStatementTimeout,
+// and a failed hydration's unlock waits its turn on the lock connection
+// and runs under that bound too. So a call can return up to about
+// ActorHydrateTimeout + 2 x ActorLockStatementTimeout after it began,
+// plus that turn.
 //
 // Concurrent calls for the SAME session share one hydration and one
 // Actor (singleflight): the lock lives on one connection shared by the
@@ -696,9 +703,9 @@ func (r *Registry) SetKnowledgeRanker(ranker ports.KnowledgeRanker) {
 // stack rather than fail, so the in-process dedupe is required, not an
 // optimization. The shared hydration runs on the first caller's values
 // but on no caller's cancellation (hydrateAndAcquire), and a caller that
-// joined it waits at most ActorHydrateTimeout. Hydrations of DIFFERENT
-// sessions still run concurrently: nothing here holds the registry mutex
-// across I/O.
+// joined it waits for the whole of it, under the same bound. Hydrations of
+// DIFFERENT sessions still run concurrently: nothing here holds the
+// registry mutex across I/O.
 func (r *Registry) GetOrSpawn(ctx context.Context, sessionID pgtype.UUID) (*Actor, error) {
 	if a := r.lookup(sessionID); a != nil {
 		return a, nil
@@ -744,6 +751,11 @@ func (r *Registry) spawn(ctx context.Context, sessionID pgtype.UUID) (*Actor, er
 // generation, so a racing actor is either refused here or found and
 // stopped there: never left running on a lock nobody holds. A refused
 // actor needs no unlock: its lock went with the lost connection.
+//
+// The actor's own context is released the moment its run loop returns,
+// however it ends -- idle TTL, a stale epoch, a closed mailbox, as well as
+// a stop -- so no ended actor stays registered on the Registry's lifecycle
+// context until shutdown.
 func (r *Registry) start(ctx context.Context, a *Actor) error {
 	actorCtx, cancel := context.WithCancelCause(r.lifecycleCtx)
 	a.cancel = cancel
@@ -760,6 +772,7 @@ func (r *Registry) start(ctx context.Context, a *Actor) error {
 	r.mu.Unlock()
 
 	r.group.Go(func() error {
+		defer cancel(nil)
 		return a.run(actorCtx)
 	})
 	return nil
@@ -819,14 +832,19 @@ func (r *Registry) onLockLost(ctx context.Context, loss lockLoss) {
 		"error", loss.cause)
 }
 
-// RunLockProbe probes this replica's lock connection every
-// ActorLockProbeInterval until ctx is done, so a connection that died
-// silently -- no statement has run on it since -- is found, and its
-// actors stopped, within one interval rather than whenever the next
-// spawn or unlock happens to touch it. The caller starts this via its
-// own errgroup.Go exactly once per process, beside RunTimerPump (§11: no
-// naked `go` statements).
+// RunLockProbe keeps this replica's lock connection until ctx is done. It
+// starts dialling one at once, in the background, so the first hydration
+// finds it open; then, every ActorLockProbeInterval, it probes the one
+// open, so a connection that died silently -- no statement has run on it
+// since -- is found, and its actors stopped, within one interval rather
+// than whenever the next spawn or unlock happens to touch it, or dials
+// again if none is open (a dial that failed). A lost connection is
+// re-dialled at once whoever finds the loss. The caller starts this via
+// its own errgroup.Go exactly once per process, beside RunTimerPump (§11:
+// no naked `go` statements).
 func (r *Registry) RunLockProbe(ctx context.Context) error {
+	r.locks.startDial()
+
 	ticker := time.NewTicker(r.timeouts.ActorLockProbeInterval)
 	defer ticker.Stop()
 
@@ -843,9 +861,10 @@ func (r *Registry) RunLockProbe(ctx context.Context) error {
 }
 
 // ProbeLockOnce runs exactly one probe of the lock connection, if one is
-// open (RunLockProbe's tick). Exported, like PumpOnce, so a test can drive
-// one deterministically. A failed probe stops every actor locked under the
-// lost connection before returning its error.
+// open, or starts a dial if none is (RunLockProbe's tick). Exported, like
+// PumpOnce, so a test can drive one deterministically. A probe that finds
+// the connection lost stops every actor locked under it before returning
+// its error.
 func (r *Registry) ProbeLockOnce(ctx context.Context) error {
 	return r.locks.ProbeOnce(ctx)
 }

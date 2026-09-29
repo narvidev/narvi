@@ -327,7 +327,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	hydrations, err := meter.Int64Counter(
 		"session_actor_hydrations",
-		metric.WithDescription("Session actor hydrations on this replica (§2), by outcome: ok; elsewhere (another replica holds the session's advisory lock); unavailable (the query pool stayed saturated for ActorHydrateTimeout, or the lock connection could not be dialled or was lost -- retryable); error (anything else)."),
+		metric.WithDescription("Session actor hydrations on this replica (§2), by outcome: ok; elsewhere (another replica holds the session's advisory lock); unavailable (the query pool stayed saturated for ActorHydrateTimeout, or no working lock connection could be had within it -- retryable); error (anything else)."),
 		metric.WithUnit("{hydration}"),
 	)
 	if err != nil {

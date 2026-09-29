@@ -2276,6 +2276,9 @@ func TestDefaultTimeouts_ActorLockFields(t *testing.T) {
 		{"ActorHydrateTimeout", to.ActorHydrateTimeout, 2 * time.Second},
 		{"ActorLockStatementTimeout", to.ActorLockStatementTimeout, time.Second},
 		{"ActorLockProbeInterval", to.ActorLockProbeInterval, 10 * time.Second},
+		// pgxpool v5.10.0's own fallback (pgxpool/pool.go), which this one
+		// mirrors so the lock connection dials as a pool connection does.
+		{"ActorLockConnectTimeoutFallback", to.ActorLockConnectTimeoutFallback, 2 * time.Minute},
 	} {
 		if f.got != f.want {
 			t.Errorf("%s = %v, want %v", f.name, f.got, f.want)
@@ -2287,7 +2290,8 @@ func TestDefaultTimeouts_ActorLockFields(t *testing.T) {
 // lock-connection block (the Actor* fields' own doc comment) is enforced on
 // its own: each link broken alone yields exactly one error, its own, named
 // by chain; each boundary that still holds is accepted; and a zero or
-// negative value is refused by name.
+// negative value is refused by name. The connect-timeout fallback has no
+// link, only its sign.
 func TestTimeouts_Validate_ActorLock(t *testing.T) {
 	t.Parallel()
 
@@ -2347,6 +2351,13 @@ func TestTimeouts_Validate_ActorLock(t *testing.T) {
 			&want{field: "ActorLockProbeInterval"}, false},
 		{"a negative probe interval", func(to *platform.Timeouts) { to.ActorLockProbeInterval = -time.Second },
 			&want{field: "ActorLockProbeInterval"}, false},
+		{"a zero connect-timeout fallback waits on a silent host forever", func(to *platform.Timeouts) { to.ActorLockConnectTimeoutFallback = 0 },
+			&want{field: "ActorLockConnectTimeoutFallback"}, true},
+		{"a negative connect-timeout fallback", func(to *platform.Timeouts) { to.ActorLockConnectTimeoutFallback = -time.Second },
+			&want{field: "ActorLockConnectTimeoutFallback"}, true},
+		{"a connect-timeout fallback below the hydration bound is accepted: nothing links them", func(to *platform.Timeouts) {
+			to.ActorLockConnectTimeoutFallback = to.ActorHydrateTimeout / 2
+		}, nil, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()

@@ -41,8 +41,9 @@
 //   - The timer pump (timerpump.go): a single process-wide poll loop
 //     (§2: "A per-pod timer pump polls due timers (SELECT ... FOR UPDATE
 //     SKIP LOCKED) and delivers them as actor commands"). Its sibling,
-//     the lock probe (Registry.RunLockProbe), checks the lock connection
-//     on its own interval.
+//     the lock probe (Registry.RunLockProbe), keeps the lock connection:
+//     dials it at start, probes it on its own interval, and dials again
+//     when none is open.
 //   - TimerFired handling (timerfired.go): the decision+write logic for
 //     each of the 5 named timers (§2: connecting_deadline, liveness_check,
 //     inactivity, turn_deadline, terminal_grace) — see that file's own
