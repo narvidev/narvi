@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 )
 
@@ -21,7 +22,7 @@ func TestSessionToDTO_SpawnSourcePassesThrough(t *testing.T) {
 		stored string
 	}{
 		{name: "a known source", stored: "slack"},
-		{name: "a source this binary predates", stored: "mcp"},
+		{name: "a source this binary predates", stored: "a_future_source"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -44,5 +45,35 @@ func TestSessionToDTO_SpawnSourcePassesThrough(t *testing.T) {
 				t.Errorf("spawnSource on the wire = %v, want %q (body %s)", wire.SpawnSource, tc.stored, body)
 			}
 		})
+	}
+}
+
+// TestSessionToDTO_McpSource pins the REST side of the 'mcp' source
+// (technical plan §43.1): a session recorded with it reaches the wire as
+// "mcp", never coerced to another source or dropped, and the generated
+// contract names it, so a Go consumer decoding into restdtos.Session
+// accepts it rather than refusing an unknown enum value.
+func TestSessionToDTO_McpSource(t *testing.T) {
+	t.Parallel()
+	body, err := json.Marshal(sessionToDTO(sqlcgen.Session{SpawnSource: sqlcgen.SessionSpawnSourceMcp, Repos: []byte("[]")}))
+	if err != nil {
+		t.Fatalf("marshal session DTO: %v", err)
+	}
+	var wire struct {
+		SpawnSource *string `json:"spawnSource"`
+	}
+	if err := json.Unmarshal(body, &wire); err != nil {
+		t.Fatalf("unmarshal %s: %v", body, err)
+	}
+	if wire.SpawnSource == nil || *wire.SpawnSource != "mcp" {
+		t.Errorf("spawnSource on the wire = %v, want \"mcp\" (body %s)", wire.SpawnSource, body)
+	}
+
+	var source restdtos.SessionSpawnSource
+	if err := json.Unmarshal([]byte(`"mcp"`), &source); err != nil {
+		t.Fatalf("restdtos.SessionSpawnSource refuses \"mcp\": %v", err)
+	}
+	if source != restdtos.SessionSpawnSourceMcp {
+		t.Errorf("decoded %q, want %q", source, restdtos.SessionSpawnSourceMcp)
 	}
 }

@@ -12896,6 +12896,7 @@ type SessionSpawnSource string
 
 const SessionSpawnSourceGithub SessionSpawnSource = "github"
 const SessionSpawnSourceLinear SessionSpawnSource = "linear"
+const SessionSpawnSourceMcp SessionSpawnSource = "mcp"
 const SessionSpawnSourceSlack SessionSpawnSource = "slack"
 const SessionSpawnSourceWeb SessionSpawnSource = "web"
 
@@ -12904,6 +12905,7 @@ var enumValues_SessionSpawnSource = []interface{}{
 	"slack",
 	"linear",
 	"github",
+	"mcp",
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -15355,16 +15357,10 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
-
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
 // exists before any turn does.
 type WorkflowStepRunTurnId *string
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
-type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
@@ -15422,3 +15418,9 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRun(plain)
 	return nil
 }
+
+type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
+
+type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict

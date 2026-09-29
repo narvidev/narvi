@@ -45,7 +45,7 @@ export interface Session {
   /**
    * Matches Postgres session_spawn_source exactly. An OPEN enum (manifest.json's openEnums): a consumer MUST tolerate a value it does not recognise.
    */
-  spawnSource: 'web' | 'slack' | 'linear' | 'github';
+  spawnSource: 'web' | 'slack' | 'linear' | 'github' | 'mcp';
   /**
    * Null for bot/automation-created sessions with no direct human user.
    */

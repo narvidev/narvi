@@ -10,6 +10,27 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.10.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `mcp` to `Session.spawnSource` -- the source a session created
+  over MCP records (technical plan §43.1, row 183), set by the server from
+  the MCP grant the /mcp authentication attaches, never read from a
+  request. Nothing records it yet: this release makes the value exist and
+  be understood by every consumer in this repository before any path
+  writes it. The enum has been listed in `openEnums` since 1.9.2, so the
+  value added to this platform-to-client shape grades MINOR (row 11).
+  Consumers already tolerate a value they do not recognise; the web UI now
+  labels this one "MCP" instead of "other".
+- Unchanged, deliberately: `CreateSessionRequest.spawnSource` keeps its
+  four values. The REST create path refuses any caller-supplied source
+  other than `web`; an MCP session's source is never the caller's to
+  choose.
+- The MCP tool output schemas that carry a `Session` list the value among
+  the open enum's `examples` (`internal/adapters/inbound/mcp/testdata/
+  tools.golden.json`).
+
 ## [1.9.2]
 
 ### rest/v1/dtos.schema.json

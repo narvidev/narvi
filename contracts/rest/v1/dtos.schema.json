@@ -69,7 +69,8 @@
             "web",
             "slack",
             "linear",
-            "github"
+            "github",
+            "mcp"
           ],
           "description": "Matches Postgres session_spawn_source exactly. An OPEN enum (manifest.json's openEnums): a consumer MUST tolerate a value it does not recognise."
         },
