@@ -29,7 +29,7 @@ to adopt, and an entry that leaves with `reject` and a reason has done its job.
 | How `sandbox-agent` stops running git against a runtime-owned `.git` | The separate git-dir — the only one of three shapes measured against real git rather than reasoned about | Step 171 |
 | How `objects` is shared between the agent-owned git-dir and the runtime's own `.git` | A directory symlink, not `objects/info/alternates` — alternates was measured and rejected: an agent-written object never became visible to the runtime's own git through it, and this design needs both directions to stay pushable/committable from either side | Step 171 |
 | Whether `packed-refs`/`index` symlinks survive git's own lockfile-based writes (`pack-refs --all`, `gc`, a packed stash's own pop) | Yes, measured directly — git's own lockfile machinery resolves the symlink and renames the new content over the TARGET it points at, never replacing the symlink itself, so the agent-owned link is never orphaned | Step 171 |
-| How a compromised sandbox token is revoked | Explicit operator revocation, the only form that is true without network reachability | Step 152 |
+| How a repository stops being eligible for session creation (un-entitlement) | Explicit operator revocation, the only form that is true without network reachability | Step 152 |
 | How the bot token's egress is scoped | Its own independent required-set entry, never folded into another | Step 153 |
 | What a plan document reads from | The `plan_documents` snapshot is the read; recomputation is the fallback, not the reverse | Step 161 |
 | Whether this project takes an RWX account | **Yes** (2026-09-17). The real-binary test loses its skip, so `Resume` is settled empirically — Step 57's first exit criterion, never once run. Unblocks Phases 17 and 18 | Step 163 |
@@ -116,9 +116,9 @@ it gates. They are listed here so the set is visible in one place, not so it is 
 
 | Decision | What it gates | Stated in |
 |---|---|---|
-| Which cluster, and whether its node pool has the hypervisor capability — that acceptance run is what decides Kata against gVisor, not a preference | Phase 18 entirely | Step 167 |
+| Which cluster, and whether its node pool has the hypervisor capability — that acceptance run is what decides Kata against gVisor, not a preference | Step 167's first exit criterion, its acceptance run, and every Step the phase's execution order puts after it; the egress row's exit and the Phase 18 milestone also run on that cluster. Not the adapter row that opens the phase, which is gated on Step 163 and exits on `kind` in CI | Step 167 |
 | Whether a trigger consults a stack's direct parent or its ultimate target | The stack policy's incremental diff, implemented by Step 142 | §24.8 — the row itself does not raise it |
-| Whether an external client is built at all | Phase 16, which is gated rather than scheduled | Phase 16 preamble |
+| Whether a native client is built at all | Steps 158 and 159, which are not started on speculation. Steps 180-183 and 217 were opened by D-01's MCP adoption, and they and Step 157 have shipped | Phase 16 preamble |
 | Whether a provider's subscription credentials may drive automated sessions | Step 209's first exit criterion, before any code: a reading of the provider's terms, recorded with its date; API-key accounts only if they forbid it | §45.1, Step 209 |
 | Which sessions may use the pool's `work` role, in particular whether a creator with no linked GitHub identity may push through a bounded App credential | Step 195's first consumer: until decided, the binding is built and exercised by tests only. Left open when OIDC sign-in shipped: such a creator cannot push until they link GitHub. The answer must also say how the push is bounded, since the sandbox never holds a `work` installation token | §44.4, Step 195 |
 
