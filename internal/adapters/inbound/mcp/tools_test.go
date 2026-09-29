@@ -46,7 +46,12 @@ var wantTwinRoutes = map[string]string{
 	"narvi_wait_for_session":       "GET /api/sessions/{sessionID}/status",
 	"narvi_get_session_result":     "GET /api/sessions/{sessionID}/result",
 	"narvi_get_session_transcript": "GET /api/sessions/{sessionID}/events",
+	"narvi_list_plans":             "GET /api/sessions/{sessionID}/plans",
 	"narvi_create_session":         "POST /api/sessions",
+	"narvi_approve_plan":           "POST /api/sessions/{sessionID}/plans/{planId}/approve",
+	"narvi_reject_plan":            "POST /api/sessions/{sessionID}/plans/{planId}/reject",
+	"narvi_request_plan_revision":  "POST /api/sessions/{sessionID}/turns",
+	"narvi_send_prompt":            "POST /api/sessions/{sessionID}/turns",
 }
 
 // TestEveryToolHasARegisteredTwin pins technical plan §43.9 item 2: a
@@ -116,6 +121,10 @@ func realToolsListTools(t testing.TB) []*sdkmcp.Tool {
 		ListEvents:       stubHandler(200, `{}`),
 		GetSessionResult: stubHandler(200, `{}`),
 		CreateSession:    stubHandler(201, `{}`),
+		ListPlans:        stubHandler(200, `{}`),
+		ApprovePlan:      stubHandler(200, `{}`),
+		RejectPlan:       stubHandler(200, `{}`),
+		CreateTurn:       stubHandler(201, `{}`),
 	}
 	tools := make([]*sdkmcp.Tool, 0, len(toolSpecs(twins)))
 	for _, spec := range toolSpecs(twins) {
@@ -147,13 +156,16 @@ func TestToolsList_MatchesGolden(t *testing.T) {
 	}
 }
 
-// TestToolsList_ExactlyEightToolsDeterministicOrder pins the full table:
-// a grant holding every advertised scope sees exactly these eight tools,
-// in this order -- the seven reads, then the one write. Which subset a
-// narrower grant sees is TestToolsList_ScopeFilter_Table's (technical plan
-// §43.17).
-func TestToolsList_ExactlyEightToolsDeterministicOrder(t *testing.T) {
-	want := []string{"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_wait_for_session", "narvi_get_session_result", "narvi_get_session_transcript", "narvi_create_session"}
+// TestToolsList_ExactlyThirteenToolsDeterministicOrder pins the full
+// table: a grant holding every advertised scope sees exactly these
+// thirteen tools, in this order -- the eight reads, then the five writes.
+// Which subset a narrower grant sees is TestToolsList_ScopeFilter_Table's
+// (technical plan §43.17).
+func TestToolsList_ExactlyThirteenToolsDeterministicOrder(t *testing.T) {
+	want := []string{
+		"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_wait_for_session", "narvi_get_session_result", "narvi_get_session_transcript", "narvi_list_plans",
+		"narvi_create_session", "narvi_approve_plan", "narvi_reject_plan", "narvi_request_plan_revision", "narvi_send_prompt",
+	}
 	tools := realToolsListTools(t)
 	if len(tools) != len(want) {
 		t.Fatalf("len(tools) = %d, want %d", len(tools), len(want))
@@ -169,10 +181,8 @@ func TestToolsList_ExactlyEightToolsDeterministicOrder(t *testing.T) {
 // whose twin is a GET is read-only, non-destructive, idempotent and
 // closed-world; a tool whose twin writes is never marked read-only, and
 // every one carries the destructive and open-world hints explicitly (a nil
-// one means "assume the worst" to a client). narvi_create_session's own
-// four are pinned too: it adds and never destroys, a retry with the same
-// idempotencyKey starts nothing more, and the run it starts reaches the
-// code host.
+// one means "assume the worst" to a client). Every write's own four are
+// pinned too, as technical plan §43.8 and §43.21 list them.
 func TestToolAnnotations_MatchTwinMethod(t *testing.T) {
 	twinMethod := map[string]string{}
 	for _, spec := range toolSpecs(Twins{}) {
@@ -194,13 +204,53 @@ func TestToolAnnotations_MatchTwinMethod(t *testing.T) {
 			}
 		}
 	}
+	// Each write's own four hints (technical plan §43.8, §43.21): destructive
+	// only for the rejection, which ends a plan version; idempotent where a
+	// repeat changes nothing more (a same-key create, a decided plan);
+	// open-world where an effect reaches outside this deployment -- a turn
+	// that reaches the code host, or a plan verdict posted to Slack or
+	// Linear, which a rejection posts as an approval does.
+	type hints struct{ destructive, idempotent, openWorld bool }
+	wantWrites := map[string]hints{
+		"narvi_create_session":        {destructive: false, idempotent: true, openWorld: true},
+		"narvi_approve_plan":          {destructive: false, idempotent: true, openWorld: true},
+		"narvi_reject_plan":           {destructive: true, idempotent: true, openWorld: true},
+		"narvi_request_plan_revision": {destructive: false, idempotent: false, openWorld: true},
+		"narvi_send_prompt":           {destructive: false, idempotent: false, openWorld: true},
+	}
+	seen := 0
 	for _, tool := range realToolsListTools(t) {
-		if tool.Name != "narvi_create_session" {
+		want, ok := wantWrites[tool.Name]
+		if !ok {
+			if twinMethod[tool.Name] != http.MethodGet {
+				t.Errorf("%s: a write tool with no expected annotations in this test", tool.Name)
+			}
 			continue
 		}
+		seen++
 		ann := tool.Annotations
-		if ann.ReadOnlyHint || *ann.DestructiveHint || !ann.IdempotentHint || !*ann.OpenWorldHint {
-			t.Errorf("narvi_create_session: annotations %+v, want not read-only, not destructive, idempotent, open-world", *ann)
+		got := hints{destructive: *ann.DestructiveHint, idempotent: ann.IdempotentHint, openWorld: *ann.OpenWorldHint}
+		if ann.ReadOnlyHint || got != want {
+			t.Errorf("%s: annotations %+v, want not read-only and %+v", tool.Name, *ann, want)
+		}
+	}
+	if seen != len(wantWrites) {
+		t.Errorf("saw %d of the %d write tools this test pins", seen, len(wantWrites))
+	}
+}
+
+// TestRefusedWhileTurnOpen_MarksExactlyTheGatedTools pins which tools the
+// instructions say are refused while a turn is open (technical plan
+// §43.21): approve, whose twin refuses while any turn is open (the
+// stale-plan guard), and the two turn tools, whose twin is POST .../turns
+// with RejectIfOpen -- never reject, whose twin has no such gate, and never
+// a read or the create. The flag changes nothing a tool does; this keeps
+// the paragraph true.
+func TestRefusedWhileTurnOpen_MarksExactlyTheGatedTools(t *testing.T) {
+	want := map[string]bool{"narvi_approve_plan": true, "narvi_request_plan_revision": true, "narvi_send_prompt": true}
+	for _, spec := range toolSpecs(Twins{}) {
+		if spec.RefusedWhileTurnOpen != want[spec.Name] {
+			t.Errorf("%s: RefusedWhileTurnOpen = %v, want %v", spec.Name, spec.RefusedWhileTurnOpen, want[spec.Name])
 		}
 	}
 }

@@ -10,7 +10,7 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
-## [1.12.0]
+## [1.13.0]
 
 ### rest/v1/dtos.schema.json
 
@@ -35,6 +35,36 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   through the sandbox's own `stop`, or once `StopGrace` (30s) has passed
   -- and turns created later run normally. A route added, graded MINOR
   (row 41).
+
+## [1.12.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: five `$defs`, the inputs of the MCP tools that read, approve and
+  reject plans, request a plan revision and send a prompt (technical plan
+  §43.21, row 183). Each is self-contained, references no other `$def`,
+  and names the REST route its tool is bridged to:
+  - `ListPlansToolRequest` (`sessionId`), for `narvi_list_plans` over
+    `GET /api/sessions/{sessionID}/plans`;
+  - `ApprovePlanToolRequest` and `RejectPlanToolRequest` (`sessionId`,
+    `planId`), for `narvi_approve_plan` and `narvi_reject_plan` over
+    `POST /api/sessions/{sessionID}/plans/{planId}/approve` and `/reject`;
+  - `RequestPlanRevisionToolRequest` (`sessionId`, `feedback`, optional
+    `modelId` and `effort`), for `narvi_request_plan_revision` over
+    `POST /api/sessions/{sessionID}/turns` with `planMode: true` and the
+    feedback as the prompt;
+  - `SendPromptToolRequest` (`sessionId`, `prompt`, optional `modelId` and
+    `effort`), for `narvi_send_prompt` over the same route with
+    `planMode: false`.
+
+  A new `$def` grades MINOR (row 32). The feedback and the prompt are
+  non-empty. Neither turn tool offers `planMode` or `attachmentIds`;
+  adding an optional property to one later is MINOR (row 2).
+- Unchanged: the tools' outputs reuse `ListPlansResponse`,
+  `PlanActionResponse` and `CreateTurnResponse`, whose status enums are
+  already open. The MCP tool list gains the five tools
+  (`internal/adapters/inbound/mcp/testdata/tools.golden.json`). No route
+  changes.
 
 ## [1.11.0]
 

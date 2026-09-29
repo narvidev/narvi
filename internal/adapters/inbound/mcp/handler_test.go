@@ -21,8 +21,14 @@ func testTwins() Twins {
 		GetSessionStatus: stubHandler(http.StatusOK, `{"activity":"idle"}`),
 		ListEvents:       stubHandler(http.StatusOK, `{"events":[],"nextCursor":null}`),
 		GetSessionResult: stubHandler(http.StatusOK, `{"reviewScope":"none"}`),
-		// The one write twin answers 201, as POST /api/sessions does.
+		// The create twin answers 201, as POST /api/sessions does.
 		CreateSession: stubHandler(http.StatusCreated, `{"id":"created"}`),
+		// The plan twins answer their own shapes; the turn twin answers 201,
+		// as POST .../turns does, for both turn tools.
+		ListPlans:   stubHandler(http.StatusOK, `{"plans":[]}`),
+		ApprovePlan: stubHandler(http.StatusOK, `{"status":"approved"}`),
+		RejectPlan:  stubHandler(http.StatusOK, `{"status":"rejected"}`),
+		CreateTurn:  stubHandler(http.StatusCreated, `{"status":"pending"}`),
 	}
 }
 
@@ -719,12 +725,12 @@ func TestServerDiscover_AdvertisesConstant(t *testing.T) {
 	if !reflect.DeepEqual(env.Result.Capabilities, wantCapabilities) {
 		t.Errorf("capabilities = %#v, want EXACTLY %#v (no listChanged, no logging, no resources, no prompts)", env.Result.Capabilities, wantCapabilities)
 	}
-	// The test grant holds every advertised scope, the write included, so
-	// the paragraph names the reads and the write apart and never says
+	// The test grant holds every advertised scope, the writes included, so
+	// the paragraph names the reads and the writes apart and never says
 	// read-only (instructionsFor; TestInstructions_NameOnlyVisibleTools
 	// covers a read-only grant).
-	if ins := env.Result.Instructions; !strings.Contains(ins, "only read and change nothing") || !strings.Contains(ins, "acts as the user who approved this client") || strings.Contains(strings.ToLower(ins), "read-only") {
-		t.Errorf("instructions = %q, want the reads and the write named apart, and no read-only claim", ins)
+	if ins := env.Result.Instructions; !strings.Contains(ins, "only read and change nothing") || !strings.Contains(ins, "act as the user who approved this client") || strings.Contains(strings.ToLower(ins), "read-only") {
+		t.Errorf("instructions = %q, want the reads and the writes named apart, and no read-only claim", ins)
 	}
 	serverInfo, _ := env.Result.Meta["io.modelcontextprotocol/serverInfo"].(map[string]any)
 	if serverInfo["name"] != "narvi" {
