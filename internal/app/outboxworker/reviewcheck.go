@@ -369,7 +369,7 @@ func (n *reviewCheckNotifier) Deliver(ctx context.Context, notification ports.No
 	committed = true
 
 	// --- Call: GitHub, with no Postgres transaction open. ---
-	output := reviewcheck.ComputeOutput(candidate.Phase)
+	output := reviewcheck.ComputeOutputWithReason(candidate.Phase, reviewcheck.NotAssessedReason(payload.NotAssessedReason))
 
 	if existingExternalID != nil {
 		if err := n.adapter.UpdateCheckRun(ctx, payload.Owner, payload.Repo, n.botToken, *existingExternalID, string(output.Status), string(output.Conclusion), output.Title, output.Summary); err != nil {
@@ -696,6 +696,11 @@ func (n *reviewCheckNotifier) guardAgainstSupersessionDuringCall(ctx context.Con
 		"repo", repoFullName, "pr_number", prNumber, "external_id", externalID,
 		"candidate_attempt", candidate.AttemptID, "candidate_phase", candidate.Phase,
 		"current_attempt", current.AttemptID, "current_phase", current.Phase)
+	// The claim row stores no not-assessed reason
+	// (ports.ReviewCheckPayload.NotAssessedReason), so a correction
+	// publishes the current phase's plain summary; the emission that
+	// superseded this one carries its own reason, if any, on its own
+	// delivery.
 	correctedOutput := reviewcheck.ComputeOutput(current.Phase)
 	if err := n.adapter.UpdateCheckRun(ctx, owner, repo, n.botToken, externalID, string(correctedOutput.Status), string(correctedOutput.Conclusion), correctedOutput.Title, correctedOutput.Summary); err != nil {
 		logger.Warn("outboxworker: reviewCheckNotifier: self-correction PATCH failed; the check run may still show stale output until a future emission republishes it", "repo", repoFullName, "pr_number", prNumber, "error", err)

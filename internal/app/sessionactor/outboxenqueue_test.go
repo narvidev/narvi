@@ -28,7 +28,7 @@ func TestEnqueueOutboxNotification_UnknownSpawnSource(t *testing.T) {
 			a := &Actor{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
 
 			var noReason turn.FailureReason
-			if err := a.enqueueOutboxNotification(context.Background(), nil, sqlcgen.Session{SpawnSource: source}, turn.TriggerComplete, noReason, sqlcgen.Turn{}, nil); err != nil {
+			if err := a.enqueueOutboxNotification(context.Background(), nil, sqlcgen.Session{SpawnSource: source}, turn.TriggerComplete, noReason, sqlcgen.Turn{}, nil, ""); err != nil {
 				t.Fatalf("enqueueOutboxNotification = %v, want nil", err)
 			}
 
@@ -82,7 +82,7 @@ func TestEnqueueOutboxNotification_McpEnqueuesNothingNoWarn(t *testing.T) {
 				a := &Actor{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
 
 				var noReason turn.FailureReason
-				if err := a.enqueueOutboxNotification(context.Background(), nil, sqlcgen.Session{SpawnSource: tc.source}, completion.trig, noReason, sqlcgen.Turn{}, completion.plan); err != nil {
+				if err := a.enqueueOutboxNotification(context.Background(), nil, sqlcgen.Session{SpawnSource: tc.source}, completion.trig, noReason, sqlcgen.Turn{}, completion.plan, ""); err != nil {
 					t.Fatalf("enqueueOutboxNotification = %v, want nil", err)
 				}
 
@@ -95,5 +95,32 @@ func TestEnqueueOutboxNotification_McpEnqueuesNothingNoWarn(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestOutcomeText_TerminalTriggers pins what a Slack or Linear thread is
+// told for each way a turn ends: a turn given up on before it started
+// (turn.TriggerAbandon, the dispatch gate's refusal) failed, and says so
+// with its reason, never the generic "Turn finished.".
+func TestOutcomeText_TerminalTriggers(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		trig   turn.Trigger
+		reason turn.FailureReason
+		want   string
+	}{
+		{turn.TriggerComplete, "", "Turn completed successfully."},
+		{turn.TriggerCancel, turn.FailureReasonCancelled, "Turn was cancelled."},
+		{turn.TriggerFail, turn.FailureReasonFailed, "Turn failed (failed)."},
+		{turn.TriggerTimeout, turn.FailureReasonTimeout, "Turn failed (timeout)."},
+		{turn.TriggerAbandon, turn.FailureReasonNeverStarted, "Turn failed (never_started)."},
+	}
+	for _, tc := range tests {
+		t.Run(tc.trig.String(), func(t *testing.T) {
+			t.Parallel()
+			if got := outcomeText(tc.trig, tc.reason); got != tc.want {
+				t.Errorf("outcomeText(%s, %q) = %q, want %q", tc.trig, tc.reason, got, tc.want)
+			}
+		})
 	}
 }

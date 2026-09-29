@@ -39,4 +39,13 @@ type ReviewCheckPayload struct {
 	BaseRef       string `json:"base_ref,omitempty"`
 	BaseSHA       string `json:"base_sha,omitempty"`
 	PolicyVersion int    `json:"policy_version,omitempty"`
+	// NotAssessedReason is internal/domain/reviewcheck.NotAssessedReason,
+	// as a plain string: why a PhaseTerminalNotAssessed attempt ended, when
+	// the control plane refused it itself before it ran; empty otherwise.
+	// The notifier adds what it names to the check's summary
+	// (reviewcheck.ComputeOutputWithReason). A worker that predates the
+	// field ignores it and publishes the plain not-completed summary; a
+	// value this binary does not know adds nothing. Not read by the
+	// supersession decision, and not stored on the claim row.
+	NotAssessedReason string `json:"not_assessed_reason,omitempty"`
 }

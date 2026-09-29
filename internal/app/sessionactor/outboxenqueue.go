@@ -51,6 +51,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/ports"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
+	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -98,7 +99,9 @@ func outcomeText(trig turn.Trigger, failureReason turn.FailureReason) string {
 		return "Turn completed successfully."
 	case turn.TriggerCancel:
 		return "Turn was cancelled."
-	case turn.TriggerFail, turn.TriggerTimeout:
+	case turn.TriggerFail, turn.TriggerTimeout, turn.TriggerAbandon:
+		// TriggerAbandon (a turn refused before it ever started,
+		// credentialgate.go) failed too, and reads "never_started".
 		// TriggerTimeout shares this arm deliberately. It is the
 		// CONTROL-PLANE-INTERNAL failure trigger -- turn_deadline expiring
 		// with no terminal event ever arriving (handleTurnDeadlineTimer,
@@ -151,7 +154,7 @@ func outcomeText(trig turn.Trigger, failureReason turn.FailureReason) string {
 // just re-reads the plan's own status) and GitHub keeps today's existing
 // generic behavior unchanged (GitHub plan-mode verdicts are explicitly out
 // of this Step's own scope).
-func (a *Actor) enqueueOutboxNotification(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, trig turn.Trigger, failureReason turn.FailureReason, processing sqlcgen.Turn, plan *sqlcgen.Plan) error {
+func (a *Actor) enqueueOutboxNotification(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, trig turn.Trigger, failureReason turn.FailureReason, processing sqlcgen.Turn, plan *sqlcgen.Plan, notAssessed reviewcheck.NotAssessedReason) error {
 	if sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceWeb || sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceMcp {
 		return nil
 	}
@@ -250,7 +253,7 @@ func (a *Actor) enqueueOutboxNotification(ctx context.Context, tx pgx.Tx, sessio
 		if !processing.IsReviewAttempt {
 			return nil
 		}
-		if err := a.enqueueReviewCheckNotAssessed(ctx, tx, processing); err != nil {
+		if err := a.enqueueReviewCheckNotAssessed(ctx, tx, processing, notAssessed); err != nil {
 			return err
 		}
 		return nil

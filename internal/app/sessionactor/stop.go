@@ -316,7 +316,7 @@ func (a *Actor) cancelStoppedTurns(ctx context.Context, tx pgx.Tx, sessionRow sq
 		}
 
 		failureReason, _ := turn.DeriveFailureReason(from, turn.TriggerCancel)
-		if err := a.enqueueOutboxNotification(ctx, tx, sessionRow, turn.TriggerCancel, failureReason, target, nil); err != nil {
+		if err := a.enqueueOutboxNotification(ctx, tx, sessionRow, turn.TriggerCancel, failureReason, target, nil, ""); err != nil {
 			return nil, err
 		}
 		if from != turn.StatePending {

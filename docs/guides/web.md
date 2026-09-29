@@ -528,6 +528,13 @@ refusal" section for the sharpest example of this).
 {"name": "Remove a ChatGPT account link", "route": "DELETE /api/me/chatgpt-link"}
 ```
 
+**Negative.** Your link runs the sessions you create and run yourself, a
+multiplayer session you opened included. It never runs a pull request's
+review session, even one your own mention opened, nor a session the
+platform starts from another one: those run on the deployment's
+credentials, and a turn in one whose model only your link could run fails
+before it starts, naming `personal_link_only` (technical plan §29.4).
+
 ## Connected apps (MCP clients)
 
 Connecting an MCP app — an editor plugin or desktop assistant — approving

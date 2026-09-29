@@ -152,6 +152,20 @@ A follow-up that asks a review session to change code (a later mention, a
 web prompt) is answered in the session, but nothing it changes is pushed:
 the session shows a warning saying so.
 
+## Which model credentials a review runs on
+
+A review session runs on the deployment's provider credentials (the
+global, repository and environment keys an admin configures), never on a
+person's own linked account, such as a ChatGPT link — not even the account
+of the member whose mention opened the review (technical plan §29.4). The
+counter-reviewer's opposing model is chosen among the deployment's
+credentials too. A review whose model only a person's own link could run
+is not run: it fails before it starts, its `narvi/review` check closes as
+not completed and says the review's model is available only through a
+person's own provider link, and the session names the model, its provider
+and `personal_link_only`. An admin adding a deployment credential for that
+provider, or the review using another model, lets the next review run.
+
 ## Review verdicts and decision inbox
 
 Posting a review verdict, applying a suggested fix, and rebutting a

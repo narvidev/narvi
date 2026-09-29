@@ -17,10 +17,10 @@ import (
 
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/credentialscope"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/environment"
 	"github.com/narvidev/narvi/internal/domain/provenance"
-	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -228,81 +228,55 @@ func (a *Actor) reviewCounterReviewerModel(ctx context.Context, tx pgx.Tx, sessi
 }
 
 // reviewCredentialedProviders resolves the set of counterReviewerProviderPreference
-// providers (internal/app/reviewtriage) that sessionRow's own repo(s)/
-// environment/creator actually has a usable credential for -- B2 fix
-// (adversarial review of §26.4): "prefer no pin over guessing
-// when the opposing provider is not known-credentialed". Mirrors
-// httpapi.ProviderCredentialsDelivery's own resolution inputs exactly
-// (repoFullNames from sessionRow.Repos via reposource.ParseOwnerRepo,
-// environmentID from sessionRow.EnvironmentID, userID from sessionRow.
-// CreatedBy) but stops at EXISTENCE (reviewtriage.CredentialedProviders'
-// own byProvider-then-Resolve reduction) -- this function never decrypts
-// anything, and a.stores.providerCredential's own ValueEncrypted column is
-// never even read here.
+// providers (internal/app/reviewtriage) that sessionRow actually has a
+// usable credential for -- B2 fix (adversarial review of §26.4): "prefer
+// no pin over guessing when the opposing provider is not
+// known-credentialed". A thin wrapper over CounterReviewCredentialedProviders
+// (below) on this actor's own stores and transaction.
 //
-// nil (a.stores.providerCredential == nil, or any read/parse failure) is
-// the SAME safe degradation this file's own reviewCounterReviewerModel
-// already established for every other best-effort lookup: a nil map read
-// is always false in Go, so ResolveCounterReviewerModel's own credential
-// gate treats "we could not determine this" identically to "nothing is
-// credentialed" -- never a guess, and never a blocked spawn either (§10-P2).
+// nil (a.stores.providerCredential/githubPRSession == nil, or any
+// read/parse failure) is the SAME safe degradation this file's own
+// reviewCounterReviewerModel already established for every other
+// best-effort lookup: a nil map read is always false in Go, so
+// ResolveCounterReviewerModel's own credential gate treats "we could not
+// determine this" identically to "nothing is credentialed" -- never a
+// guess, and never a blocked spawn either (§10-P2).
 func (a *Actor) reviewCredentialedProviders(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session) map[string]bool {
+	if a.stores.providerCredential == nil || a.stores.githubPRSession == nil {
+		return nil
+	}
+	return CounterReviewCredentialedProviders(ctx, a.stores.githubPRSession.WithTx(tx), a.stores.providerCredential.WithTx(tx), sessionRow)
+}
+
+// CounterReviewCredentialedProviders is the counter-reviewer's credential
+// read: the providers sessionRow's own resolution reaches, keyed on
+// exactly what httpapi.ProviderCredentialsDelivery keys it on -- both load
+// the session's credentialscope.Scope and list its candidates through it,
+// so the user scope is read by the one rule (providercredential.
+// UserScopeTarget) and a pull request's review session never counts its
+// requester's personal link as a credentialed provider: its opposing model
+// is chosen among the deployment's credentials only, and with none, no
+// override is pinned (ResolveCounterReviewerModel's own fallback). It
+// stops at EXISTENCE (reviewtriage.CredentialedProviders): nothing is
+// decrypted, and ValueEncrypted is never read.
+//
+// Exported so httpapi's integration tests can run this function and the
+// delivery endpoint over the same sessions and pin that the two agree.
+// nil on any read or parse failure, logged: never a guess, never a blocked
+// spawn (§10-P2).
+func CounterReviewCredentialedProviders(ctx context.Context, prSessions credentialscope.PRSessionReader, credentials credentialscope.CandidateLister, sessionRow sqlcgen.Session) map[string]bool {
 	logger := platform.Logger(ctx)
-	if a.stores.providerCredential == nil {
-		return nil
-	}
-
-	repoFullNames, err := reviewCredentialRepoFullNames(sessionRow.Repos)
+	scope, err := credentialscope.Load(ctx, prSessions, sessionRow)
 	if err != nil {
-		logger.Warn("sessionactor: review counter-reviewer: parse session repos for credential lookup failed", "error", err)
+		logger.Warn("sessionactor: review counter-reviewer: load credential scope for opposing-model gating failed", "error", err)
 		return nil
 	}
-
-	var environmentID *string
-	if sessionRow.EnvironmentID.Valid {
-		id := sessionRow.EnvironmentID.String()
-		environmentID = &id
-	}
-	var userID *string
-	if sessionRow.CreatedBy.Valid {
-		id := sessionRow.CreatedBy.String()
-		userID = &id
-	}
-
-	rows, err := a.stores.providerCredential.WithTx(tx).ListForResolution(ctx, repoFullNames, environmentID, userID)
+	rows, err := scope.Candidates(ctx, credentials)
 	if err != nil {
 		logger.Warn("sessionactor: review counter-reviewer: list provider credentials for opposing-model gating failed", "error", err)
 		return nil
 	}
 	return appreviewtriage.CredentialedProviders(rows)
-}
-
-// reviewCredentialRepoFullNames mirrors httpapi.sessionRepoFullNames
-// exactly (providercredentialsdelivery.go) -- duplicated here rather than
-// exported cross-package: both unmarshal sessions.repos' own raw JSONB
-// bytes and keep only the repos whose clone URL parses via reposource.
-// ParseOwnerRepo, skipping (never erroring on) a malformed entry, for the
-// SAME ProviderCredentialStore.ListForResolution call each package makes
-// on its own session's own repos.
-func reviewCredentialRepoFullNames(rawRepos []byte) ([]string, error) {
-	if len(rawRepos) == 0 {
-		return nil, nil
-	}
-	var repos []struct {
-		URL string `json:"url"`
-	}
-	if err := json.Unmarshal(rawRepos, &repos); err != nil {
-		return nil, err
-	}
-	fullNames := make([]string, 0, len(repos))
-	for _, repo := range repos {
-		owner, name, err := reposource.ParseOwnerRepo(repo.URL)
-		if err != nil {
-			continue
-		}
-		fullNames = append(fullNames, owner+"/"+name)
-	}
-	return fullNames, nil
 }
 
 // assembleSessionConfig builds the real SESSION_CONFIG document (§6.4) a
