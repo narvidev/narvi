@@ -330,7 +330,7 @@ verifying nothing about the half that carries the risk.
 
 ## 8. Feature set (exit criteria, not options)
 
-1. **Plan mode**: persistent plans, HITL approve/reject on web/Slack/Linear/GitHub, server-side implementation dispatch on approval, plan/build model split, cross-channel verdict + archive notifications.
+1. **Plan mode**: persistent plans, HITL approve/reject on web/Slack/Linear/GitHub, server-side implementation dispatch on approval, plan/build model split, cross-channel verdict + archive notifications. **A revision never withdraws an approval** (normative, §43.21): while any turn of the session is pending, dispatched or processing -- an approved implementation included -- a revision, like any prompt, asked for over REST or MCP is refused `409` and nothing is queued; where an ingress queues one (`AlwaysQueue`, the code host's mention ingress), it waits, the plan stays `approved`, the implementation runs to its own end and delivers, and only then is the revision dispatched, to write version N+1 awaiting approval beside the approved N. Only a stop, authorized on its own, may end a running implementation early.
 2. **Code review**: review sessions per PR with session reuse; atomic claim coalescing of concurrent @mentions; risk-map verdict with `review:*` labels — **a structured verdict from day one** (premise state, risk drivers, shippable class — server-computed, never self-reported, never re-parsed from posted text; full design and the automation policy built on it in §21); test-coverage & doc-drift sentinels; **server-side** verdict floor + formal-review gate + verdict-posting tool (raw issue comments blocked, scoped to review sessions); re-trigger via label/button, or automatically on new commits (debounced, off by default per repo, §24); inline diff pre-fetched into context (agent must not need to run `gh pr diff` repeatedly); suggestion safety (apply via validated endpoint); **criteria-driven auto-approval** (`visual-qa: pass/skip` unchanged; `review: low risk` **inverts** into a `review: needs-human` escape hatch — approval itself is deterministic and criteria-driven rather than label-triggered, §21); dedicated review model selection; optional sentinel auto-fix for coverage/doc-drift findings, merge-gated on the origin PR (§17, disabled by default); **review as a merge readout** (§26) — the verdict front-loads a diff-derived summary, the diff's architecture choices, and its risks to the stack, demoting findings to a collapsed appendix; a description-adequacy check with a third raise-only floor and graduated remediation; deterministic light/deep review triage, measurable per path; adversarial counter-review with contested-points surfacing on the deep path; a diff-only fact-check pass on both paths that kills only provably-wrong findings (§26.6); a per-path cost budget with dispatch-time look-ahead (§26.7); findings anchored to the diff by content, never a guessed line number (§22.1.1).
 3. **Unified intent classifier** (detailed design — see §18): review-vs-request and plan-vs-build across all ingress surfaces; shadow mode (log-only) → active, permanently available, never a one-time launch gate; never-throw contract with an enumerated fallback-reason taxonomy; confidence rubric anchored on textual directness, not model self-reported certainty; DB-backed editable prompt templates with assembled-prompt preview; per-session routing decision records (§18.4).
 4. **Automations**: GitHub/Linear/webhook/cron triggers with condition builder; sandbox settings honored on automation sessions; creator/status filters; `last_run` + `artifact_summary` populated; per-automation env vars/secrets.
@@ -7123,8 +7123,9 @@ server and made the tool list depend on the token's scopes (§43.13–§43.19), 
 reachable by a real client. Everything past that is later rows' own work, not this section's: 182 adds
 a session's live status and its transcript paging (piece (a), §43.20), the bounded wait (piece (b),
 §43.20), and a session's result -- its last run, the pull requests it produced, and each one's verdict
-with its freshness or its absence (piece (c), §43.20); 183 adds plan read/approve/reject,
-prompt-while-running, stop, and delegate (create session). Repository discovery (`narvi_list_repositories`)
+with its freshness or its absence (piece (c), §43.20); 183 adds delegate (create session, §43.8), plan
+read -- `narvi_list_plans`, without which a client has no plan id to decide -- plan approve and reject,
+revision and prompt-while-running (§43.21), and stop. Repository discovery (`narvi_list_repositories`)
 is deliberately absent from 180 too: this codebase has no `GET /api/repos` route for it to sit over,
 and the one-adapter rule (§43.7) means a tool ships only once its HTTP twin exists. A session a client
 creates over MCP (row 183) records `spawn_source = mcp` (decided 2026-09-28), set by the server from the
@@ -7332,7 +7333,8 @@ the twin's own URL params, query string and body (§43.7). Every read tool adver
 true`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`. `narvi_create_session`
 advertises `readOnlyHint: false` (it writes), `destructiveHint: false` (it only adds a session),
 `idempotentHint: true` (a retry under the same key starts nothing more) and `openWorldHint: true` (the
-run it starts reads from and pushes to the code host). Two structural tests tie the table together: a
+run it starts reads from and pushes to the code host). The plan and turn tools' own hints are §43.21's.
+Two structural tests tie the table together: a
 tool whose twin is a GET requires `mcp:read` and is annotated read-only, and a tool whose twin is not a
 GET requires `mcp:write` and is never annotated read-only (`TestWriteTwinsRequireWriteScope`,
 `TestToolAnnotations_MatchTwinMethod`).
@@ -7474,7 +7476,8 @@ from it where the tool's contract differs: no `spawnSource` (refused as an unkno
 `CreateSessionRequest.idempotencyKey` as an optional property of a client-to-platform shape, and says in
 `CreateSessionRequest.spawnSource`'s description that the tool sends `web` and the server records `mcp`;
 all of it grades MINOR, and adding one of the create's environment settings to the tool later is MINOR
-too.
+too. Contracts 1.12.0 adds the inputs of the plan and turn tools the same way, five self-contained
+`$def`s whose outputs reuse `ListPlansResponse`, `PlanActionResponse` and `CreateTurnResponse` (§43.21).
 
 ### 43.11 Feature flag
 
@@ -8126,8 +8129,9 @@ The scope vocabulary is `internal/domain/mcpscope`: `mcp:read` covers every read
 and 182's status, wait, result and transcript, §43.20), `mcp:write` covers every state-changing tool and
 implies `mcp:read`. A scope is advertised — in `scopes_supported`, in the 401 challenge, and as
 acceptable at the authorization endpoint — only when at least one registered tool requires it, so no
-contract promises a scope nothing consumes. Row 183's `narvi_create_session` requires `mcp:write`, so
-both are offered now, `mcp:read mcp:write`, and a scope outside them is refused as `invalid_scope`. One
+contract promises a scope nothing consumes. Row 183's `narvi_create_session` requires `mcp:write`, and so
+do its plan decisions, revision and prompt (§43.21), so both are offered now, `mcp:read mcp:write`, and
+a scope outside them is refused as `invalid_scope`. One
 write scope covers every write, deliberately: finer per-action scopes can be added later without taking
 anything away. The consent page shows each requested scope as a checkbox, pre-checked, which the user
 can uncheck and never add to, and says what `mcp:write` risks: "Start sessions, send prompts, approve or
@@ -9069,6 +9073,110 @@ unknown one, every role). On the production router, through the official SDK cli
 router's source control is the real code host adapter, so its seed resolves every review from the record
 alone -- absent, not assessed, merged per the claim -- and carries a suppressed creation; the live read is
 proven against the fake code host above.
+
+### 43.21 Plan decisions, revisions and prompts over MCP
+
+Row 183's second piece: five tools, each bridged (§43.7) to a REST route that already exists, with
+nothing in that route changed.
+
+| Tool | HTTP twin | Scope | Input `$def` | Output `$def` | read-only / destructive / idempotent / open-world |
+|---|---|---|---|---|---|
+| `narvi_list_plans` | `GET /api/sessions/{sessionID}/plans` | `mcp:read` | `ListPlansToolRequest {sessionId}` | `ListPlansResponse` | yes / no / yes / no |
+| `narvi_approve_plan` | `POST /api/sessions/{sessionID}/plans/{planId}/approve` | `mcp:write` | `ApprovePlanToolRequest {sessionId, planId}` | `PlanActionResponse` | no / no / yes / yes |
+| `narvi_reject_plan` | `POST /api/sessions/{sessionID}/plans/{planId}/reject` | `mcp:write` | `RejectPlanToolRequest {sessionId, planId}` | `PlanActionResponse` | no / yes / yes / no |
+| `narvi_request_plan_revision` | `POST /api/sessions/{sessionID}/turns` with `planMode: true` and the feedback as the prompt | `mcp:write` | `RequestPlanRevisionToolRequest {sessionId, feedback, modelId?, effort?}` | `CreateTurnResponse` | no / no / no / yes |
+| `narvi_send_prompt` | `POST /api/sessions/{sessionID}/turns` with `planMode: false` | `mcp:write` | `SendPromptToolRequest {sessionId, prompt, modelId?, effort?}` | `CreateTurnResponse` | no / no / no / yes |
+
+- **The hints.** An approval destroys nothing, a repeat changes nothing more (the first verdict wins),
+  and the implementation it queues reaches the code host. A rejection ends that version for good, so it
+  is the one tool here marked destructive; it queues nothing, so it stays inside this deployment. Each
+  accepted prompt or revision queues one more turn, so neither is idempotent.
+- **The plan read.** `narvi_list_plans` is the plan read §43.1 lists: without it a client has no plan
+  id to decide. Any authenticated role reads any session's plans, exactly as on REST.
+- **What each twin receives.** The ids become the twin's chi params (`sessionID`, `planId`); approve
+  and reject send no body. The two turn tools send a `CreateTurnRequest` built from their arguments,
+  never the arguments themselves (§43.7): `planMode` is the tool's own constant, never an argument, and
+  no attachment is offered. `feedback` and `prompt` are non-empty.
+- **The wiring.** Each twin is the same constructor call its `/api` route uses (`controlplane/serve.go`).
+
+**Approval keeps every check.** `narvi_approve_plan` runs the REST `ApprovePlan` handler through the
+bridge, so it inherits, in order:
+
+1. the bearer gate, which re-reads the user and the role on every call and refuses a disabled user
+   (§43.16); `mcp:write` only ever subtracts;
+2. the session row lock (`lockSessionForPlanAction`);
+3. `canActOnPlan`, which renders `authz.ActionApprovePlan` with the own/joined rule: an admin or a
+   maintainer on any plan, a member only on a session they started or joined, a viewer never (§13.3);
+4. the open-turn gate: `409` while any turn of the session is pending, dispatched or processing -- the
+   stale-plan guard (§8.1);
+5. the guarded update, where the first verdict wins whichever channel made it;
+6. the check that the plan belongs to the session;
+7. the approved-content snapshot, in the approval's own transaction (§31.3);
+8. the `plan.approve` audit row, which over MCP also carries `detail.mcp = {grant_id, client_id}`
+   (§43.8);
+9. the cross-channel notices.
+
+`narvi_reject_plan` inherits 1-3 and 5-9 the same way: a rejection has no open-turn gate, snapshots
+nothing and queues nothing. A token never does more than its user: a viewer's `mcp:write` grant lists
+both tools and is refused with the text REST gives the viewer's cookie.
+
+**The revision rule (normative).** A plan revision is a plan-mode turn. When one is asked for while an
+approved implementation is running:
+
+- **(a) Admission.** REST and the MCP tool create it through `CreateTurnCore` with `RejectIfOpen`.
+  While the implementation, or any other turn of the session, is pending, dispatched or processing, the
+  request is refused with `409` "a turn is already pending, dispatched, or processing for this session".
+  Nothing is queued and nothing is cancelled. No MCP tool gets a queueing policy: that would let a token
+  do what its user cannot do by REST.
+- **(b) Where an ingress does queue one** (`AlwaysQueue`, whose one caller is `CreateTurnForBot`: the
+  code host's mention ingress; the chat ingresses drop a turn while one is open, with a busy reply), the
+  revision waits as `pending` and never withdraws the running implementation's
+  authorization. That authorization is the approval: the plan row is `approved`, a terminal status, and
+  the implementation turn was inserted in the approval's own transaction. Nothing the revision writes is
+  read by that turn's dispatch, its completion or its delivery. So the plan stays `approved`, the
+  implementation runs to its own terminal state, and its branch is pushed and its pull request opened,
+  even if the push reports back only after the revision has run. The revision is dispatched only once
+  the implementation has reached its terminal state (the oldest pending turn first, §3.3). When it
+  completes it writes plan version N+1 `awaiting_approval`, and version N stays `approved`: a new
+  version supersedes only a version still awaiting approval.
+- **(c) Only a stop ends a running implementation early**, and it is authorized on its own (row 183's
+  stop, not yet shipped). Revoking the grant, or narrowing the user's role, governs the next call; it
+  does not abort running work, whose delivery re-checks the creator when the pull request is opened
+  (§43.20). A stop's dispatch gate must key on "flagged by a stop", never on "a newer plan exists".
+
+No code changed for this rule: it held by construction, and the tests below pin it, so that a change
+which breaks it fails.
+
+**A prompt while a turn is running (owner decision O5, default taken).** `narvi_send_prompt` is
+refused with `409` while any turn is open, as REST refuses it, and nothing is queued. A queue would come
+only if REST gained one for everyone. While a plan awaits approval the route also refuses an ordinary
+prompt with `409`, unless its classifier reads the prompt as a change to that plan (§23), in which case
+the turn is queued as a revision; the tool inherits both unchanged.
+
+**The instructions.** With the writes visible, the instructions paragraph (§43.5) ends by naming the
+visible tools refused while a turn is open -- approve, revision and prompt -- and saying that nothing is
+queued, so a client waits for the session to settle rather than retrying in a loop. The mark
+(`toolSpec.RefusedWhileTurnOpen`) changes nothing a tool does: the twin decides.
+
+**Contracts.** 1.12.0, MINOR (row 32): five self-contained input `$def`s; the outputs reuse the REST
+DTOs, whose status enums are already open. No route changes.
+
+**Tests.** Unit: `TestPlanAndTurnTools_TwinGetsItsOwnRequest` (each twin's method, path, chi params, no
+query, the body only for the turn tools with the tool's own `planMode`, no header),
+`TestTurnTools_OpenTurnRefusalIsAnIsErrorAndIsNotRetried`, `TestRefusedWhileTurnOpen_MarksExactlyTheGatedTools`,
+`TestToolAnnotations_MatchTwinMethod`, the tool-list golden and the scope filter.
+`TestParity_BearerEqualsCookieForEveryRole` reads plans for every role. On the production router,
+through the official SDK client: `ApprovePlan_ParityEveryRole_SDKClient` (every role, on a session the
+user started and on one they did not, the outcome and the database state it leaves equal REST's -- the
+plan row, the implementation turn, the snapshot, the audit row and the notices);
+`ApprovePlan_OpenTurnGate_SDKClient` (a revision pending, dispatched or processing);
+`ApprovePlan_FirstVerdictWinsAcrossRESTAndMCP`; `RevisionMidImplementation_RefusedAndStillRunning_SDKClient`
+(refused over MCP and REST with the same text; no turn inserted or audited, the implementation still
+processing, the plan still approved); `SendPrompt_WhileRunningRefusedLikeREST_SDKClient`; and
+`PromptAndRevision_SettledSessionLikeREST_SDKClient`. On a real session actor,
+`TestRevisionQueuedBehindImplementation_LeavesItAuthorized` queues a revision through `CreateTurnForBot`
+while the implementation runs, while it is still queued, and with the implementation's push reporting
+back only after the revision wrote its version.
 
 ## 44. The GitHub App pool (new capability)
 
