@@ -2,14 +2,17 @@ package sessionactor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/metric"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sync/singleflight"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/ports"
@@ -226,12 +229,29 @@ func newStoreBundle(pool *pgxpool.Pool, platformShadow bool) storeBundle {
 // goroutine + mailbox per active session", scoped to THIS process --
 // other pods run their own independent Registry against the same
 // Postgres). At most one live *Actor per session id exists in this
-// process's actors map at any time; Registry's own mutex is what makes
-// that true within a process, while the Postgres advisory lock
-// (hydrateAndAcquire, hydrate.go) is what makes it true ACROSS processes.
+// process's actors map at any time; within a process that rests on
+// GetOrSpawn's singleflight plus the lock holder's held set (lockholder.go),
+// ACROSS processes on the Postgres advisory lock (hydrateAndAcquire,
+// hydrate.go). Every actor's lock lives on the replica's one lock
+// connection, never on a pool connection: the pool serves queries only,
+// however many sessions the replica hosts (§5.1).
 type Registry struct {
+	// mu guards actors. Lock order, where both are ever wanted: mu, then
+	// the lock holder's own mutexes -- though no path nests them today: the
+	// insert-time generation check reads the holder's atomic generation,
+	// and onLockLost is called with the holder's mutexes released (the
+	// re-dial that follows a loss starts only once onLockLost returns).
 	mu     sync.Mutex
 	actors map[pgtype.UUID]*Actor
+
+	// locks holds every actor's advisory lock on one dedicated connection
+	// (lockholder.go); spawns deduplicates concurrent GetOrSpawn calls for
+	// the same session, keyed by its id -- required, not an optimization:
+	// advisory locks are re-entrant per backend, so two goroutines of this
+	// process would otherwise both "win" the same lock on the shared
+	// connection.
+	locks  *lockHolder
+	spawns singleflight.Group
 
 	pool     *pgxpool.Pool
 	timeouts platform.Timeouts
@@ -524,7 +544,7 @@ func NewRegistry(
 	}
 
 	lifecycleCtx, cancel := context.WithCancel(ctx)
-	return &Registry{
+	r := &Registry{
 		actors:                 make(map[pgtype.UUID]*Actor),
 		pool:                   pool,
 		timeouts:               timeouts,
@@ -549,7 +569,9 @@ func NewRegistry(
 		epistemicCheckDefault:  epistemicCheckDefault,
 		lifecycleCtx:           lifecycleCtx,
 		cancel:                 cancel,
-	}, nil
+	}
+	r.locks = newLockHolder(lifecycleCtx, pool, timeouts, r.onLockLost)
+	return r, nil
 }
 
 // RegistryOptions bundles NewRegistry's own less-frequently-set,
@@ -663,41 +685,194 @@ func (r *Registry) SetKnowledgeRanker(ranker ports.KnowledgeRanker) {
 // blocks waiting for it, so a caller in a later Step can route the
 // request to whichever pod actually holds the session rather than
 // hanging on a lock that may not release for the rest of that actor's
-// lifetime.
+// lifetime. Returns ErrActorUnavailable (retryable) when this replica
+// could not hydrate the actor within ActorHydrateTimeout, for any of the
+// causes that error's doc comment lists, having released any lock it took.
+// The bound is ActorHydrateTimeout, whatever context the caller passed,
+// but it bounds the waiting, not every statement a hydration started: a
+// lock statement already running when the bound expires finishes under
+// its own ActorLockStatementTimeout, and a failed hydration's unlock waits
+// its turn on the lock connection and runs under that bound too. So a
+// call can return up to about ActorHydrateTimeout + 2 x
+// ActorLockStatementTimeout after it began, plus that turn.
+//
+// Concurrent calls for the SAME session share one hydration and one
+// Actor (singleflight): the lock lives on one connection shared by the
+// whole replica, where a second pg_try_advisory_lock would succeed and
+// stack rather than fail, so the in-process dedupe is required, not an
+// optimization. The shared hydration runs on the first caller's values
+// but on no caller's cancellation (hydrateAndAcquire), and a caller that
+// joined it waits for the whole of it, under the same bound. Hydrations of
+// DIFFERENT sessions still run concurrently: nothing here holds the
+// registry mutex across I/O.
 func (r *Registry) GetOrSpawn(ctx context.Context, sessionID pgtype.UUID) (*Actor, error) {
 	if a := r.lookup(sessionID); a != nil {
 		return a, nil
 	}
 
-	// Hydration + the advisory-lock attempt run WITHOUT the registry
-	// mutex held: they are the slow, I/O-bound part, and the Postgres
-	// advisory lock itself -- not this mutex -- is the mechanism that
-	// must arbitrate two concurrent attempts for the SAME sessionID,
-	// whether those two attempts come from two different processes, or
-	// two goroutines in this same process each racing past the lookup
-	// above before either has inserted into the map. Holding the mutex
-	// across this whole sequence would needlessly serialize spawning of
-	// completely UNRELATED sessions in this process, for no correctness
-	// benefit.
-	a, err := r.hydrateAndAcquire(ctx, sessionID)
+	v, err, _ := r.spawns.Do(sessionID.String(), func() (any, error) {
+		// Re-check inside the flight: a hydration for this session may
+		// have finished and inserted between the lookup above and this
+		// call becoming the flight's leader.
+		if a := r.lookup(sessionID); a != nil {
+			return a, nil
+		}
+		return r.spawn(ctx, sessionID)
+	})
 	if err != nil {
 		return nil, err
 	}
+	a, ok := v.(*Actor)
+	if !ok || a == nil {
+		return nil, fmt.Errorf("sessionactor: spawn for session %s returned no actor", sessionID.String())
+	}
+	return a, nil
+}
 
-	// No re-check-the-map-after-hydrating race is possible here: the
-	// Postgres advisory lock this call just won is the sole arbiter of
-	// ownership, so by construction no OTHER goroutine (in this process
-	// or any other) could have concurrently also won it and already
-	// inserted a competing entry for sessionID.
+// spawn hydrates sessionID's actor and starts it, recording the outcome.
+func (r *Registry) spawn(ctx context.Context, sessionID pgtype.UUID) (*Actor, error) {
+	started := time.Now()
+	a, err := r.hydrateAndAcquire(ctx, sessionID)
+	if err == nil {
+		err = r.start(ctx, a)
+	}
+	r.recordHydration(ctx, sessionID, started, err)
+	if err != nil {
+		return nil, err
+	}
+	return a, nil
+}
+
+// start inserts a freshly hydrated actor into the map and starts its run
+// loop -- unless the lock connection its lock was taken on has been lost
+// since (a hydration racing a loss). The generation check and the insert
+// happen together under r.mu, and onLockLost takes r.mu after bumping the
+// generation, so a racing actor is either refused here or found and
+// stopped there: never left running on a lock nobody holds. A refused
+// actor needs no unlock: its lock went with the lost connection.
+//
+// The actor's own context is released the moment its run loop returns,
+// however it ends -- idle TTL, a stale epoch, a closed mailbox, as well as
+// a stop -- so no ended actor stays registered on the Registry's lifecycle
+// context until shutdown.
+func (r *Registry) start(ctx context.Context, a *Actor) error {
+	actorCtx, cancel := context.WithCancelCause(r.lifecycleCtx)
+	a.cancel = cancel
+	a.stopping = actorCtx.Done()
+
 	r.mu.Lock()
-	r.actors[sessionID] = a
+	if a.lockGen != r.locks.currentGen() {
+		r.mu.Unlock()
+		cancel(errLockLost)
+		return fmt.Errorf("%w: %w", ErrActorUnavailable, errLockLost)
+	}
+	r.actors[a.sessionID] = a
+	r.opsMetrics.addActorsLive(ctx, 1)
 	r.mu.Unlock()
 
 	r.group.Go(func() error {
-		return a.run(r.lifecycleCtx)
+		defer cancel(nil)
+		return a.run(actorCtx)
 	})
+	return nil
+}
 
-	return a, nil
+// recordHydration counts one hydration by outcome
+// (session_actor_hydrations) and logs an unavailable one with what an
+// operator needs to tell its causes (ErrActorUnavailable's doc comment)
+// apart: the time it waited, the pool's use, and the error, which names
+// the step that failed.
+func (r *Registry) recordHydration(ctx context.Context, sessionID pgtype.UUID, started time.Time, err error) {
+	outcome := "ok"
+	switch {
+	case err == nil:
+	case errors.Is(err, ErrSessionActorElsewhere):
+		outcome = "elsewhere"
+	case errors.Is(err, ErrActorUnavailable):
+		outcome = "unavailable"
+		stat := r.pool.Stat()
+		platform.Logger(ctx).Warn("sessionactor: session actor unavailable on this replica",
+			"session_id", sessionID.String(),
+			"waited_ms", time.Since(started).Milliseconds(),
+			"pool_acquired_conns", stat.AcquiredConns(),
+			"pool_max_conns", stat.MaxConns(),
+			"error", err)
+	default:
+		outcome = "error"
+	}
+	r.opsMetrics.recordHydration(ctx, outcome)
+}
+
+// onLockLost is the lock holder's onLost: the connection holding every
+// lock of generation loss.gen is gone, so another replica may already hold
+// any of those sessions. Every actor locked under it leaves the map at
+// once -- GetOrSpawn must not hand one out again -- and is told to stop
+// (errLockLost); each rehydrates, under a new connection, on the next
+// command for its session once the lost connection's backend has let its
+// lock go: at once if the server heard the connection close, and otherwise
+// when this replica's next lock connection terminates that backend, or the
+// server's keepalives reap it within ActorLockServerReapTime (lockHolder's
+// doc comment) -- until then the session answers ErrSessionActorElsewhere
+// everywhere. The same recovery a pod restart gives, for this replica's
+// actors only.
+func (r *Registry) onLockLost(ctx context.Context, loss lockLoss) {
+	r.mu.Lock()
+	var stopped []*Actor
+	for id, a := range r.actors {
+		if a.lockGen == loss.gen {
+			delete(r.actors, id)
+			stopped = append(stopped, a)
+		}
+	}
+	r.opsMetrics.addActorsLive(ctx, -int64(len(stopped)))
+	r.mu.Unlock()
+
+	for _, a := range stopped {
+		a.stop(errLockLost)
+	}
+	r.opsMetrics.recordLockConnLost(ctx)
+	platform.Logger(ctx).Error("sessionactor: lock connection lost; stopped every actor whose advisory lock it held",
+		"generation", loss.gen,
+		"actors_stopped", len(stopped),
+		"locks_held", loss.held,
+		"error", loss.cause)
+}
+
+// RunLockProbe keeps this replica's lock connection until ctx is done. It
+// starts dialling one at once, in the background, so the first hydration
+// finds it open; then, every ActorLockProbeInterval, it probes the one
+// open, so a connection that died silently -- no statement has run on it
+// since -- is found, and its actors stopped, within one interval rather
+// than whenever the next spawn or unlock happens to touch it, or dials
+// again if none is open (a dial that failed). A lost connection is
+// re-dialled at once whoever finds the loss. The caller starts this via
+// its own errgroup.Go exactly once per process, beside RunTimerPump (§11:
+// no naked `go` statements).
+func (r *Registry) RunLockProbe(ctx context.Context) error {
+	r.locks.startDial()
+
+	ticker := time.NewTicker(r.timeouts.ActorLockProbeInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			// A failed probe has already been reported, with the actors it
+			// stopped (onLockLost); there is nothing to add here.
+			_ = r.ProbeLockOnce(ctx)
+		}
+	}
+}
+
+// ProbeLockOnce runs exactly one probe of the lock connection, if one is
+// open, or starts a dial if none is (RunLockProbe's tick). Exported, like
+// PumpOnce, so a test can drive one deterministically. A probe that finds
+// the connection lost stops every actor locked under it before returning
+// its error.
+func (r *Registry) ProbeLockOnce(ctx context.Context) error {
+	return r.locks.ProbeOnce(ctx)
 }
 
 func (r *Registry) lookup(sessionID pgtype.UUID) *Actor {
@@ -707,21 +882,24 @@ func (r *Registry) lookup(sessionID pgtype.UUID) *Actor {
 }
 
 // evict removes a from the registry's map, but only if a is still the
-// entry on file for sessionID -- defensive against a (should-be-
-// impossible, per GetOrSpawn's own reasoning) double-insert.
+// entry on file for sessionID -- an actor onLockLost already removed may
+// have been replaced by a fresh one for the same session by the time its
+// own shutdown gets here.
 func (r *Registry) evict(sessionID pgtype.UUID, a *Actor) {
 	r.mu.Lock()
 	if cur, ok := r.actors[sessionID]; ok && cur == a {
 		delete(r.actors, sessionID)
+		r.opsMetrics.addActorsLive(context.Background(), -1)
 	}
 	r.mu.Unlock()
 }
 
 // Shutdown cancels every live actor's run loop (each releases its
-// advisory lock and evicts itself as it exits, per Actor.shutdown) and
-// waits for all of them, plus any timer-pump goroutine started through
-// this Registry's own group, to finish.
+// advisory lock and evicts itself as it exits, per Actor.shutdown), waits
+// for all of them to finish, then closes the lock connection for good.
 func (r *Registry) Shutdown() error {
 	r.cancel()
-	return r.group.Wait()
+	err := r.group.Wait()
+	r.locks.Close()
+	return err
 }

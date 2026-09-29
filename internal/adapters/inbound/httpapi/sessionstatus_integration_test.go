@@ -216,12 +216,13 @@ func newSeen() map[restdtos.SessionActivityActivity]*atomic.Int64 {
 }
 
 // newSubtestRig is a rig of its own, with a member user, for a subtest that
-// spawns a session actor. A live session actor pins one pool connection --
-// the one holding its advisory lock (sessionactor's hydrateAndAcquire) --
-// until its Registry shuts down, which a rig's does when its test ends.
-// Subtests sharing their parent's rig would pin one more each, and the
-// package's shared pool has four connections: the fourth subtest's actor
-// would take the last one, then wait for a second that never frees.
+// spawns a session actor, so each subtest's actors are shut down when that
+// subtest ends rather than piling up on its parent's rig. It was once
+// required: a live session actor used to pin one pool connection, its
+// advisory lock's, until its Registry shut down, and the fourth subtest
+// sharing a rig took the last of the package's four. Actors hold no pool
+// connection now -- their locks live on the Registry's own lock connection
+// (sessionactor's lockholder.go).
 func newSubtestRig(ctx context.Context, t *testing.T) (testRig, sqlcgen.User, string) {
 	t.Helper()
 	rig := newTestRig(t)

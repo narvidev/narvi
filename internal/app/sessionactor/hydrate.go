@@ -7,7 +7,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -25,67 +24,78 @@ import (
 // pg_advisory_unlock MUST run on the exact same connection/session that
 // took the lock -- Postgres advisory locks are scoped to the backend
 // session holding them, not to any client-side handle -- so both queries
-// are only ever run against Actor.lockConn / the connection
-// hydrateAndAcquire is currently holding.
+// only ever run on this replica's one lock connection (lockholder.go).
 const (
 	tryAdvisoryLockQuery = `SELECT pg_try_advisory_lock(hashtextextended($1::text, 0))`
 	advisoryUnlockQuery  = `SELECT pg_advisory_unlock(hashtextextended($1::text, 0))`
 )
 
-// hydrateAndAcquire is the acquisition sequence (§2: hydration on demand,
-// single-writer advisory lock, epoch bumped on each acquisition) run once
-// per (session, process) pairing that actually wins ownership:
-//  1. acquire a DEDICATED pool connection whose only job for the rest of
-//     the Actor's life is holding the advisory lock;
-//  2. non-blocking pg_try_advisory_lock on it -- fail fast with
-//     ErrSessionActorElsewhere if another owner already holds it;
-//  3. bump the actor epoch via a short-lived, separately pool-acquired
-//     statement -- NOT on the lock connection;
-//  4. load the session/sandbox/turn rows to hydrate initial state.
-//
-// Any failure after step 2 releases the lock and its connection before
-// returning, since by that point this call already owns both.
-func (r *Registry) hydrateAndAcquire(ctx context.Context, sessionID pgtype.UUID) (*Actor, error) {
-	conn, err := r.pool.Acquire(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("sessionactor: acquire lock connection: %w", err)
-	}
+var (
+	// errHydrateBoundExpired is a hydration context's cause once
+	// ActorHydrateTimeout has run out.
+	errHydrateBoundExpired = errors.New("sessionactor: hydration exceeded ActorHydrateTimeout")
 
-	var locked bool
-	if err := conn.QueryRow(ctx, tryAdvisoryLockQuery, sessionID.String()).Scan(&locked); err != nil {
-		conn.Release()
-		return nil, fmt.Errorf("sessionactor: try advisory lock: %w", err)
+	// errRegistryShutdown is a hydration context's cause once the Registry
+	// has shut down under it.
+	errRegistryShutdown = errors.New("sessionactor: registry shut down")
+)
+
+// hydrateAndAcquire is the acquisition sequence (§2: hydration on demand,
+// single-writer advisory lock, epoch bumped on each acquisition), run once
+// per (session, process) pairing that actually wins ownership, all of it
+// under ONE bound, ActorHydrateTimeout (hydrationContext):
+//  1. take the session's advisory lock on this replica's lock connection
+//     (lockholder.go) -- never on a query-pool connection, so hosting a
+//     session never takes one -- failing fast with ErrSessionActorElsewhere
+//     if another owner already holds it;
+//  2. bump the actor epoch, then load the session/sandbox/turn rows to
+//     hydrate initial state: four short pool statements, each taking one
+//     connection and giving it back, never two at once.
+//
+// Any failure after step 1 releases the lock before returning. A failure
+// the bound or the lock connection caused is ErrActorUnavailable
+// (retryable); any other failure is returned as it is.
+func (r *Registry) hydrateAndAcquire(ctx context.Context, sessionID pgtype.UUID) (*Actor, error) {
+	hctx, cancel := r.hydrationContext(ctx)
+	defer cancel()
+
+	lockGen, locked, err := r.locks.TryLock(hctx, sessionID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: take advisory lock: %w", ErrActorUnavailable, err)
 	}
 	if !locked {
-		conn.Release()
 		return nil, ErrSessionActorElsewhere
 	}
 
-	epoch, err := r.stores.session.BumpActorEpoch(ctx, sessionID)
-	if err != nil {
-		unlockAndRelease(ctx, conn, sessionID)
-		return nil, fmt.Errorf("sessionactor: bump actor epoch: %w", err)
+	fail := func(step string, err error) error {
+		r.locks.Unlock(hctx, sessionID, lockGen)
+		if hctx.Err() != nil {
+			return fmt.Errorf("%w: %s: %w: %w", ErrActorUnavailable, step, context.Cause(hctx), err)
+		}
+		return fmt.Errorf("sessionactor: %s: %w", step, err)
 	}
 
-	sessionRow, err := r.stores.session.Get(ctx, sessionID)
+	epoch, err := r.stores.session.BumpActorEpoch(hctx, sessionID)
 	if err != nil {
-		unlockAndRelease(ctx, conn, sessionID)
-		return nil, fmt.Errorf("sessionactor: get session: %w", err)
+		return nil, fail("bump actor epoch", err)
+	}
+
+	sessionRow, err := r.stores.session.Get(hctx, sessionID)
+	if err != nil {
+		return nil, fail("get session", err)
 	}
 
 	hasSandbox := true
-	if _, err := r.stores.sandbox.Get(ctx, sessionID); err != nil {
+	if _, err := r.stores.sandbox.Get(hctx, sessionID); err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
-			unlockAndRelease(ctx, conn, sessionID)
-			return nil, fmt.Errorf("sessionactor: get sandbox: %w", err)
+			return nil, fail("get sandbox", err)
 		}
 		hasSandbox = false
 	}
 
-	turns, err := r.stores.turn.ListForSession(ctx, sessionID)
+	turns, err := r.stores.turn.ListForSession(hctx, sessionID)
 	if err != nil {
-		unlockAndRelease(ctx, conn, sessionID)
-		return nil, fmt.Errorf("sessionactor: list turns: %w", err)
+		return nil, fail("list turns", err)
 	}
 
 	logger := platform.Logger(ctx).With("session_id", sessionID.String(), "actor_epoch", epoch)
@@ -93,6 +103,7 @@ func (r *Registry) hydrateAndAcquire(ctx context.Context, sessionID pgtype.UUID)
 		"session_status", string(sessionRow.Status),
 		"has_sandbox", hasSandbox,
 		"turn_count", len(turns),
+		"lock_generation", lockGen,
 	)
 
 	return &Actor{
@@ -120,31 +131,26 @@ func (r *Registry) hydrateAndAcquire(ctx context.Context, sessionID pgtype.UUID)
 		epistemicCheckDefault:  r.epistemicCheckDefault,
 		rolloutMode:            r.rolloutMode,
 		registry:               r,
-		lockConn:               conn,
+		lockGen:                lockGen,
 		mailbox:                make(chan Command, mailboxBufferSize),
 		done:                   make(chan struct{}),
 		logger:                 logger,
 	}, nil
 }
 
-// unlockAndRelease releases the session advisory lock held on conn and
-// returns conn to the pool. If the unlock statement itself fails, conn is
-// force-closed first: releasing a connection that MIGHT still hold the
-// advisory lock back to the pool as-is risks silently leaking that lock
-// for however long the pool goes on reusing this connection --
-// pg_advisory_unlock only works on the very backend session that took the
-// lock, and pgxpool.Conn.Release only discards a connection it can itself
-// detect as broken (closed, busy, or mid-transaction). Force-closing here
-// guarantees Postgres drops every advisory lock held by this backend the
-// moment the connection itself terminates, regardless of why the unlock
-// statement failed.
-func unlockAndRelease(ctx context.Context, conn *pgxpool.Conn, sessionID pgtype.UUID) {
-	if _, err := conn.Exec(ctx, advisoryUnlockQuery, sessionID.String()); err != nil {
-		platform.Logger(ctx).Error(
-			"sessionactor: advisory unlock failed; force-closing connection to guarantee the lock is released",
-			"error", err, "session_id", sessionID.String(),
-		)
-		_ = conn.Conn().Close(context.Background())
+// hydrationContext derives a hydration's own context from the caller's:
+// it keeps the caller's values (its logger, its correlation id) but not
+// its cancellation -- a hydration that other callers joined
+// (Registry.GetOrSpawn's singleflight) must not die with whichever caller
+// happened to start it -- and adds the two things that do end it:
+// ActorHydrateTimeout, and the Registry's own shutdown.
+func (r *Registry) hydrationContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	base, cancelBase := context.WithCancelCause(context.WithoutCancel(ctx))
+	stopWatchingShutdown := context.AfterFunc(r.lifecycleCtx, func() { cancelBase(errRegistryShutdown) })
+	hctx, cancelBound := context.WithTimeoutCause(base, r.timeouts.ActorHydrateTimeout, errHydrateBoundExpired)
+	return hctx, func() {
+		cancelBound()
+		stopWatchingShutdown()
+		cancelBase(context.Canceled)
 	}
-	conn.Release()
 }

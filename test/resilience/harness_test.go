@@ -63,7 +63,10 @@ import (
 // multiple Registry "pods" racing for the same session's advisory lock
 // over time, never two pods with truly independent connection pools torn
 // down independently mid-test -- see scenario12_rolling_restart_test.go's
-// own doc comment for why a shared pool is the faithful shape here.
+// own doc comment for why a shared pool is the faithful shape here. The
+// pods still hold their locks apart: each Registry dials its own lock
+// connection (sessionactor/lockholder.go) from the pool's settings, so
+// sharing the query pool never shares a lock backend.
 type Harness struct {
 	Pool     *pgxpool.Pool
 	Timeouts platform.Timeouts
@@ -140,19 +143,20 @@ func newHarness(t *testing.T) *Harness {
 	}
 
 	// pool_max_conns is pinned explicitly (pgxpool's own default is
-	// max(4, numCPU), a HOST-dependent value) because every hydrated
-	// sessionactor.Actor holds one dedicated, Acquire()-held pooled
-	// connection (its advisory lock, hydrate.go) for its whole lifetime --
-	// and scenario #7 hydrates six actors across its subtests against ONE
-	// shared registry, on top of ordinary query traffic. On a 4-core CI
-	// runner the default pool of 4 was fully consumed by the first four
-	// subtests' actors, deadlocking the fifth inside CreateSession's own
-	// pool.Acquire -- reproduced deterministically by pinning
-	// pool_max_conns=4 locally, and invisible on a many-core dev machine
-	// where the default is comfortably larger. Appended only to the
-	// pgxpool DSN, not the shared connStr: pool_max_conns is a
-	// pgxpool-specific parameter the migrate handle's database/sql driver
-	// (sql.Open above) rejects as an unknown connection option.
+	// max(4, numCPU), a HOST-dependent value), so these scenarios run
+	// against the same pool on every machine. It was pinned when every
+	// hydrated sessionactor.Actor held one Acquire()-held pooled
+	// connection (its advisory lock) for its whole lifetime: scenario #7
+	// hydrates six actors across its subtests against ONE shared registry,
+	// and on a 4-core CI runner the default pool of 4 was fully consumed by
+	// the first four subtests' actors, deadlocking the fifth inside
+	// CreateSession's own pool.Acquire. Actors hold no pool connection now
+	// -- every lock lives on the Registry's own lock connection
+	// (sessionactor/lockholder.go) -- so 20 is headroom, no longer a
+	// requirement. Appended only to the pgxpool DSN, not the shared
+	// connStr: pool_max_conns is a pgxpool-specific parameter the migrate
+	// handle's database/sql driver (sql.Open above) rejects as an unknown
+	// connection option.
 	pool, err := narvipg.NewPool(ctx, connStr+"&pool_max_conns=20")
 	if err != nil {
 		t.Fatalf("NewPool: %v", err)

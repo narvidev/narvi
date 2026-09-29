@@ -195,12 +195,25 @@ type Actor struct {
 
 	registry *Registry
 
-	// lockConn holds the session-scoped Postgres advisory lock for this
-	// Actor's entire life (§2: "held for the actor's lifetime"). It is
-	// NEVER used for the Actor's own transactional writes -- transact
-	// (below) always acquires a FRESH connection from the pool -- so it
-	// never becomes a concurrency bottleneck.
-	lockConn *pgxpool.Conn
+	// lockGen is the lock-connection generation this Actor's advisory lock
+	// is held under (§2: "held for the actor's lifetime"). The lock itself
+	// lives on the replica's one lock connection (lockholder.go), shared
+	// with every other actor of this replica and never a query-pool
+	// connection: this Actor holds no pool connection between commands --
+	// transact (below) acquires a FRESH one per command and gives it back.
+	// shutdown unlocks under lockGen, which is a no-op if the connection
+	// this lock lived on has since been lost.
+	lockGen uint64
+
+	// cancel stops this Actor's run loop with a cause: errLockLost when
+	// its replica lost the lock connection (Registry.onLockLost); the
+	// Registry's own shutdown reaches it through the parent context.
+	// stopping is that context's Done channel, so Send can refuse a
+	// command the moment the Actor is told to stop, before its loop has
+	// even noticed. Both are set by Registry.start before the Actor is
+	// ever handed out; nil in a test that builds an Actor directly.
+	cancel   context.CancelCauseFunc
+	stopping <-chan struct{}
 
 	mailbox chan Command
 	// done is closed exactly once, the instant run's loop returns for any
@@ -216,13 +229,14 @@ type Actor struct {
 }
 
 // Send delivers cmd to the actor's mailbox, or reports ErrActorStopped if
-// the actor's run loop has already exited.
+// the actor's run loop has already exited or has been told to stop.
 //
-// The done check runs FIRST, on its own, so that once the actor is known
-// dead every Send deterministically fails -- without this priority stage,
-// a single select with a buffered mailbox case and a closed done case
-// would pick between the two pseudo-randomly, sometimes "accepting" a
-// command into a mailbox nobody will ever read again.
+// The done and stopping checks run FIRST, on their own, so that once the
+// actor is known dead or stopping every Send deterministically fails --
+// without this priority stage, a single select with a buffered mailbox
+// case and a closed done case would pick between the two
+// pseudo-randomly, sometimes "accepting" a command into a mailbox nobody
+// will ever read again.
 //
 // One narrow race is inherent to any channel-based mailbox and documented
 // rather than hidden: a Send that passes the done check just as the run
@@ -237,6 +251,8 @@ func (a *Actor) Send(ctx context.Context, cmd Command) error {
 	select {
 	case <-a.done:
 		return ErrActorStopped
+	case <-a.stopping:
+		return ErrActorStopped
 	default:
 	}
 	select {
@@ -244,17 +260,32 @@ func (a *Actor) Send(ctx context.Context, cmd Command) error {
 		return nil
 	case <-a.done:
 		return ErrActorStopped
+	case <-a.stopping:
+		return ErrActorStopped
 	case <-ctx.Done():
 		return ctx.Err()
 	}
 }
 
+// stop tells this Actor's run loop to stop, with cause (Registry.onLockLost).
+func (a *Actor) stop(cause error) {
+	if a.cancel != nil {
+		a.cancel(cause)
+	}
+}
+
 // run is the actor's own mailbox-processing loop, started exactly once by
-// Registry.GetOrSpawn via errgroup.Group.Go. It processes exactly one
-// command at a time against the mailbox channel and a shutdown signal
+// Registry.start via errgroup.Group.Go, on the Actor's own context
+// (derived from the Registry's lifecycle context). It processes exactly
+// one command at a time against the mailbox channel and a shutdown signal
 // (ctx.Done, or its own idle timer) -- this serialization is what makes
 // §2's "single writer" true even though Postgres itself would happily
 // accept concurrent connections from this same process.
+//
+// A context cancelled with errLockLost -- this replica lost the lock
+// connection holding this actor's lock (Registry.onLockLost) -- is a
+// clean stop: run returns nil for it, so the Registry's errgroup only
+// ever reports shutdown's own cancellation.
 //
 // Deferred-cleanup ordering matters here (LIFO): close(a.done) is
 // registered LAST so it runs FIRST the instant the loop exits -- marking
@@ -272,6 +303,11 @@ func (a *Actor) run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			if errors.Is(context.Cause(ctx), errLockLost) {
+				a.logger.Warn("sessionactor: run loop stopping: this replica lost the connection holding this session's advisory lock",
+					"lock_generation", a.lockGen)
+				return nil
+			}
 			a.logger.Info("sessionactor: run loop stopping: context done", "error", ctx.Err())
 			return ctx.Err()
 
@@ -324,24 +360,29 @@ func (a *Actor) run(ctx context.Context) error {
 //  1. evict from the Registry's map FIRST, so GetOrSpawn stops handing
 //     this dead actor out (a caller arriving during the remaining steps
 //     misses the map, attempts hydration, and gets a clean
-//     ErrSessionActorElsewhere until the lock below is released --
-//     fail-fast, retryable, never a silent black hole);
+//     ErrSessionActorElsewhere until the lock below is released -- the
+//     lock holder's held check refuses a second, stacked lock on the same
+//     backend -- fail-fast, retryable, never a silent black hole). An
+//     actor stopped by Registry.onLockLost was already evicted there, and
+//     this step is then a no-op;
 //  2. drain the mailbox, logging any command that slipped in through
 //     Send's inherent enqueue-vs-death race (see Send's own comment) --
 //     dropped commands are observable in logs, never silently retained;
 //  3. release the advisory lock LAST -- the slow, network-bound step,
 //     safe to do last precisely because steps 1-2 already made this
-//     actor unreachable.
+//     actor unreachable. Released under this actor's own lock generation,
+//     so it is a no-op if the lock connection it lived on was lost since
+//     (and the session perhaps locked again under a new one).
 //
 // Uses context.Background() rather than run's own ctx: by the time this
 // runs, ctx may already be Done (process shutdown, or the idle-TTL/
 // ErrStaleEpoch paths that return before any external cancellation) and
 // the unlock statement must still be attempted with a live, un-cancelled
-// context.
+// context -- it is bounded by ActorLockStatementTimeout on its own.
 func (a *Actor) shutdown() {
 	a.registry.evict(a.sessionID, a)
 	a.drainMailbox()
-	unlockAndRelease(context.Background(), a.lockConn, a.sessionID)
+	a.registry.locks.Unlock(context.Background(), a.sessionID, a.lockGen)
 }
 
 // drainMailbox empties whatever commands were still buffered (or raced
@@ -412,8 +453,8 @@ func (a *Actor) appendRawEvent(ctx context.Context, tx pgx.Tx, eventType string,
 
 // transact is the ONLY way this package writes session/turn/sandbox state
 // (§2's transactional-write rule): it acquires a FRESH connection from
-// the pool (never lockConn),
-// begins a transaction, re-reads the session's actor_epoch INSIDE that
+// the pool (never the replica's lock connection), holds it for this one
+// command only, begins a transaction, re-reads the session's actor_epoch INSIDE that
 // transaction and fences it against the epoch this Actor was hydrated
 // with -- returning ErrStaleEpoch (never running fn, never committing) if
 // they no longer match, since that proves a newer actor has since taken

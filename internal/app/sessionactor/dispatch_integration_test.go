@@ -2236,8 +2236,8 @@ func TestHandleEnsureDispatched_ProviderWithoutResumeCapability_FallsBackToResto
 //     snapshot) + a pending turn, directly via the stores -- exactly like
 //     every other resume test in this file.
 //  2. Hydrate actor A on poolA (registryA.GetOrSpawn) -- a genuine owner
-//     holding the real Postgres advisory lock on a real poolA connection,
-//     exactly like the killpod test's own step 2.
+//     holding the real Postgres advisory lock on pod A's own lock
+//     connection, exactly like the killpod test's own step 2.
 //  3. Drive actor A's own EnsureDispatched through the real mailbox
 //     (a.Send). Its fake provider's ResumeSandbox call is configured to
 //     BLOCK (resumeBlock) once called, so this call: (a) is proven to
@@ -2401,7 +2401,8 @@ func TestResilience_ConcurrentResumeAcrossActors_ResumeSandboxCalledAtMostOnce(t
 //     the zero SpawnState (StatePending), and its only legal action is
 //     SpawnActionSpawn.
 //  2. Hydrate actor A on poolA (registryA.GetOrSpawn) -- a genuine owner
-//     holding the real Postgres advisory lock on a real poolA connection.
+//     holding the real Postgres advisory lock on pod A's own lock
+//     connection.
 //  3. Drive actor A's own EnsureDispatched through the real mailbox
 //     (a.Send). Its fake provider's CreateSandbox call is configured to
 //     BLOCK (createBlock) once called, so this call: (a) is proven to have

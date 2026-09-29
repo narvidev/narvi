@@ -40,6 +40,16 @@ var instrumentMethods = map[string]bool{
 	"Float64Histogram":     true,
 	"Int64Gauge":           true,
 	"Float64Gauge":         true,
+
+	// The asynchronous (observable) constructors take the instrument's
+	// name first too -- controlplane's db_pool_* instruments, read from
+	// pgxpool.Stat() at each collection, are the first to use them.
+	"Int64ObservableCounter":         true,
+	"Float64ObservableCounter":       true,
+	"Int64ObservableUpDownCounter":   true,
+	"Float64ObservableUpDownCounter": true,
+	"Int64ObservableGauge":           true,
+	"Float64ObservableGauge":         true,
 }
 
 // ScanRegisteredInstruments walks every .go file under each of roots

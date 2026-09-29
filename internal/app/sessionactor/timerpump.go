@@ -45,16 +45,41 @@ func (r *Registry) RunTimerPump(ctx context.Context) error {
 // Actor as a TimerFired command. Exported (rather than only reachable
 // through RunTimerPump's loop) so tests can drive exactly one tick
 // deterministically.
+//
+// A delivery that fails with ErrActorUnavailable ends the batch: this
+// replica cannot host actors right now (that error's doc comment lists
+// every cause), so every remaining delivery would most likely fail the same
+// way in turn, most of them only after waiting out the same bound.
+// The skipped timers are already claimed, so they come back once their
+// claim expires -- on this replica or another -- with no new mechanism;
+// the tick logs once how many it skipped.
 func (r *Registry) PumpOnce(ctx context.Context) error {
 	claimed, err := r.claimDueTimers(ctx)
 	if err != nil {
 		return err
 	}
 
-	for _, t := range claimed {
-		r.deliver(ctx, t)
+	delivered, skipped := deliverBatch(ctx, claimed, r.deliver)
+	if skipped > 0 {
+		platform.Logger(ctx).Warn("sessionactor: timer pump: session actors unavailable on this replica; skipped the rest of this batch until their claims expire",
+			"delivered", delivered, "skipped", skipped, "claim_duration", r.timeouts.TimerClaimDuration)
 	}
 	return nil
+}
+
+// deliverBatch hands each claimed timer to deliver, in order, and stops at
+// the first that fails with ErrActorUnavailable -- that timer and every
+// one after it count as skipped. Any other failure is deliver's own to
+// report, and the batch goes on: one session's problem must never abort
+// the rest of it. Returns how many timers were handed over, and how many
+// were skipped.
+func deliverBatch(ctx context.Context, timers []sqlcgen.SessionTimer, deliver func(context.Context, sqlcgen.SessionTimer) error) (delivered, skipped int) {
+	for i, t := range timers {
+		if err := deliver(ctx, t); errors.Is(err, ErrActorUnavailable) {
+			return i, len(timers) - i
+		}
+	}
+	return len(timers), 0
 }
 
 func (r *Registry) claimDueTimers(ctx context.Context) ([]sqlcgen.SessionTimer, error) {
@@ -98,25 +123,32 @@ func (r *Registry) claimDueTimers(ctx context.Context) ([]sqlcgen.SessionTimer, 
 }
 
 // deliver hydrates (or reuses) the Actor owning t.SessionID and sends it
-// a TimerFired command. Failures are logged, never propagated: one
-// session's delivery problem must never abort the rest of the batch.
-func (r *Registry) deliver(ctx context.Context, t sqlcgen.SessionTimer) {
+// a TimerFired command, returning whatever stopped it. Failures are
+// logged here, except the two that need no line of their own:
+// ErrSessionActorElsewhere (another pod will pick the timer up) and
+// ErrActorUnavailable (the hydration logged it; PumpOnce ends the batch
+// and logs the count).
+func (r *Registry) deliver(ctx context.Context, t sqlcgen.SessionTimer) error {
 	a, err := r.GetOrSpawn(ctx, t.SessionID)
 	if err != nil {
-		if errors.Is(err, ErrSessionActorElsewhere) {
+		switch {
+		case errors.Is(err, ErrSessionActorElsewhere):
 			// Another pod owns this session; it will pick this same
 			// timer up on ITS OWN next poll tick once the claim window
 			// elapses. An accepted, documented latency trade-off, not a
 			// bug -- no cross-pod command forwarding.
-			return
+		case errors.Is(err, ErrActorUnavailable):
+		default:
+			platform.Logger(ctx).Error("sessionactor: timer pump: GetOrSpawn failed",
+				"error", err, "session_id", t.SessionID.String(), "timer_name", t.Name)
 		}
-		platform.Logger(ctx).Error("sessionactor: timer pump: GetOrSpawn failed",
-			"error", err, "session_id", t.SessionID.String(), "timer_name", t.Name)
-		return
+		return err
 	}
 
 	if err := a.Send(ctx, TimerFired{Name: t.Name}); err != nil {
 		platform.Logger(ctx).Error("sessionactor: timer pump: delivering TimerFired failed",
 			"error", err, "session_id", t.SessionID.String(), "timer_name", t.Name)
+		return err
 	}
+	return nil
 }

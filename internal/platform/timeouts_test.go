@@ -2275,6 +2275,264 @@ func TestTimeouts_Validate_SessionResult(t *testing.T) {
 	}
 }
 
+func TestDefaultTimeouts_ActorLockFields(t *testing.T) {
+	t.Parallel()
+	to := platform.DefaultTimeouts()
+	for _, f := range []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"ActorHydrateTimeout", to.ActorHydrateTimeout, 2 * time.Second},
+		{"ActorLockStatementTimeout", to.ActorLockStatementTimeout, time.Second},
+		{"ActorLockProbeInterval", to.ActorLockProbeInterval, 10 * time.Second},
+		// Half the probe interval: a connect stuck on a silent host ends
+		// well before the next tick, instead of pgxpool's 2 minutes.
+		{"ActorLockConnectAttemptTimeout", to.ActorLockConnectAttemptTimeout, 5 * time.Second},
+		// Half the hydration bound, and ten of Postgres's 100 ms looks for
+		// the backend's end.
+		{"ActorLockOrphanTerminateWait", to.ActorLockOrphanTerminateWait, time.Second},
+		{"ActorLockServerKeepaliveIdle", to.ActorLockServerKeepaliveIdle, 10 * time.Second},
+		{"ActorLockServerKeepaliveInterval", to.ActorLockServerKeepaliveInterval, 5 * time.Second},
+		// idle + interval × count: what the server keeps an orphaned lock
+		// backend for, and the tcp_user_timeout the lock connection asks for.
+		{"ActorLockServerReapTime()", to.ActorLockServerReapTime(), 25 * time.Second},
+	} {
+		if f.got != f.want {
+			t.Errorf("%s = %v, want %v", f.name, f.got, f.want)
+		}
+	}
+	if got, want := to.ActorLockServerKeepaliveCount, 3; got != want {
+		t.Errorf("ActorLockServerKeepaliveCount = %d, want %d", got, want)
+	}
+}
+
+// TestTimeouts_Validate_ActorLock proves every link of the session actor's
+// lock-connection block (the Actor* fields' own doc comment) is enforced on
+// its own: each link broken alone yields exactly one error, its own, named
+// by chain; each boundary that still holds is accepted; and a zero or
+// negative value is refused by name. The connect-attempt bound lies below
+// the probe interval, and is linked to nothing else. The wait for a lost
+// connection's backend to end lies below the hydration bound, in whole
+// milliseconds -- the server reads it in those, and 0 asks it not to wait.
+// The server keepalives' reap time lies strictly
+// between one probe plus its statement and the timer claim; each keepalive
+// is positive, and the two the server reads in seconds are whole ones --
+// a fraction, and above all a value under a second, would reach the server
+// as 0, its default of hours.
+func TestTimeouts_Validate_ActorLock(t *testing.T) {
+	t.Parallel()
+
+	type want struct {
+		chain        string // exactly one *TimeoutInvariantError with this Chain
+		field        string // or a *TimeoutMustBePositiveError naming this field
+		count        string // or a *CountMustBePositiveError naming this field
+		wholeSeconds string // or a *TimeoutMustBeWholeSecondsError naming this field
+		wholeMillis  string // or a *TimeoutMustBeWholeMillisecondsError naming this field
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		want   *want
+		// exact reports that the broken link must be the ONLY error; a zero
+		// hydration bound, for one, also breaks the statement link below it.
+		exact bool
+	}{
+		{"the shipped defaults hold", func(*platform.Timeouts) {}, nil, true},
+
+		{"a statement bound equal to the hydration bound", func(to *platform.Timeouts) {
+			to.ActorLockStatementTimeout = to.ActorHydrateTimeout
+		}, &want{chain: "ActorHydrateTimeout > ActorLockStatementTimeout"}, true},
+		// The orphan wait comes down with the hydration bound, so the
+		// statement link is the only one tested.
+		{"a statement bound above the hydration bound", func(to *platform.Timeouts) {
+			to.ActorHydrateTimeout = 500 * time.Millisecond
+			to.ActorLockOrphanTerminateWait = to.ActorHydrateTimeout / 2
+		}, &want{chain: "ActorHydrateTimeout > ActorLockStatementTimeout"}, true},
+		{"a statement bound just below the hydration bound is accepted", func(to *platform.Timeouts) {
+			to.ActorLockStatementTimeout = to.ActorHydrateTimeout - time.Millisecond
+		}, nil, true},
+
+		{"a hydration bound equal to the timer claim", func(to *platform.Timeouts) {
+			to.ActorHydrateTimeout = to.TimerClaimDuration
+		}, &want{chain: "TimerClaimDuration > ActorHydrateTimeout"}, true},
+		{"a hydration bound above the timer claim", func(to *platform.Timeouts) {
+			to.ActorHydrateTimeout = to.TimerClaimDuration + time.Millisecond
+		}, &want{chain: "TimerClaimDuration > ActorHydrateTimeout"}, true},
+		// A claim that short breaks the reap-time link below it too.
+		{"a timer claim below the hydration bound", func(to *platform.Timeouts) {
+			to.TimerClaimDuration = to.ActorHydrateTimeout - time.Millisecond
+		}, &want{chain: "TimerClaimDuration > ActorHydrateTimeout"}, false},
+		{"a hydration bound just below the timer claim is accepted", func(to *platform.Timeouts) {
+			to.ActorHydrateTimeout = to.TimerClaimDuration - time.Millisecond
+		}, nil, true},
+
+		// Each of these three also lowers the connect-attempt bound below
+		// the probe interval, so the statement link is the only one tested.
+		{"a probe interval equal to the statement bound", func(to *platform.Timeouts) {
+			to.ActorLockProbeInterval = to.ActorLockStatementTimeout
+			to.ActorLockConnectAttemptTimeout = to.ActorLockProbeInterval / 4
+		}, &want{chain: "ActorLockProbeInterval > ActorLockStatementTimeout"}, true},
+		{"a probe interval below the statement bound", func(to *platform.Timeouts) {
+			to.ActorLockProbeInterval = to.ActorLockStatementTimeout / 2
+			to.ActorLockConnectAttemptTimeout = to.ActorLockProbeInterval / 4
+		}, &want{chain: "ActorLockProbeInterval > ActorLockStatementTimeout"}, true},
+		{"a probe interval just above the statement bound is accepted", func(to *platform.Timeouts) {
+			to.ActorLockProbeInterval = to.ActorLockStatementTimeout + time.Millisecond
+			to.ActorLockConnectAttemptTimeout = to.ActorLockProbeInterval / 4
+		}, nil, true},
+
+		{"a zero hydration bound fails every hydration", func(to *platform.Timeouts) { to.ActorHydrateTimeout = 0 },
+			&want{field: "ActorHydrateTimeout"}, false},
+		{"a negative hydration bound", func(to *platform.Timeouts) { to.ActorHydrateTimeout = -time.Second },
+			&want{field: "ActorHydrateTimeout"}, false},
+		{"a zero statement bound", func(to *platform.Timeouts) { to.ActorLockStatementTimeout = 0 },
+			&want{field: "ActorLockStatementTimeout"}, true},
+		{"a negative statement bound", func(to *platform.Timeouts) { to.ActorLockStatementTimeout = -time.Second },
+			&want{field: "ActorLockStatementTimeout"}, true},
+		{"a zero probe interval probes in a hot loop", func(to *platform.Timeouts) { to.ActorLockProbeInterval = 0 },
+			&want{field: "ActorLockProbeInterval"}, false},
+		{"a negative probe interval", func(to *platform.Timeouts) { to.ActorLockProbeInterval = -time.Second },
+			&want{field: "ActorLockProbeInterval"}, false},
+		{"a zero connect-attempt bound waits on a silent host forever", func(to *platform.Timeouts) { to.ActorLockConnectAttemptTimeout = 0 },
+			&want{field: "ActorLockConnectAttemptTimeout"}, true},
+		{"a negative connect-attempt bound", func(to *platform.Timeouts) { to.ActorLockConnectAttemptTimeout = -time.Second },
+			&want{field: "ActorLockConnectAttemptTimeout"}, true},
+		// The connect-attempt bound (5 s by default) against the probe
+		// interval (10 s by default)...
+		{"a connect-attempt bound equal to the probe interval", func(to *platform.Timeouts) {
+			to.ActorLockConnectAttemptTimeout = to.ActorLockProbeInterval
+		}, &want{chain: "ActorLockProbeInterval > ActorLockConnectAttemptTimeout"}, true},
+		{"a connect-attempt bound of pgxpool's 2 minutes, above the probe interval", func(to *platform.Timeouts) {
+			to.ActorLockConnectAttemptTimeout = 2 * time.Minute
+		}, &want{chain: "ActorLockProbeInterval > ActorLockConnectAttemptTimeout"}, true},
+		{"a connect-attempt bound just below the probe interval is accepted", func(to *platform.Timeouts) {
+			to.ActorLockConnectAttemptTimeout = to.ActorLockProbeInterval - time.Millisecond
+		}, nil, true},
+		// ...and against nothing else.
+		{"a connect-attempt bound below the hydration bound is accepted: nothing links them", func(to *platform.Timeouts) {
+			to.ActorLockConnectAttemptTimeout = to.ActorHydrateTimeout / 2
+		}, nil, true},
+
+		// The wait for a lost connection's backend to end (1 s by default)
+		// against the hydration bound (2 s by default).
+		{"an orphan wait equal to the hydration bound", func(to *platform.Timeouts) {
+			to.ActorLockOrphanTerminateWait = to.ActorHydrateTimeout
+		}, &want{chain: "ActorHydrateTimeout > ActorLockOrphanTerminateWait"}, true},
+		{"an orphan wait above the hydration bound", func(to *platform.Timeouts) {
+			to.ActorLockOrphanTerminateWait = to.ActorHydrateTimeout + time.Millisecond
+		}, &want{chain: "ActorHydrateTimeout > ActorLockOrphanTerminateWait"}, true},
+		{"an orphan wait just below the hydration bound is accepted", func(to *platform.Timeouts) {
+			to.ActorLockOrphanTerminateWait = to.ActorHydrateTimeout - time.Millisecond
+		}, nil, true},
+		{"a zero orphan wait asks the server not to wait", func(to *platform.Timeouts) { to.ActorLockOrphanTerminateWait = 0 },
+			&want{field: "ActorLockOrphanTerminateWait"}, true},
+		{"a negative orphan wait", func(to *platform.Timeouts) { to.ActorLockOrphanTerminateWait = -time.Second },
+			&want{field: "ActorLockOrphanTerminateWait"}, true},
+		{"an orphan wait under a millisecond would reach the server as 0", func(to *platform.Timeouts) {
+			to.ActorLockOrphanTerminateWait = 500 * time.Microsecond
+		}, &want{wholeMillis: "ActorLockOrphanTerminateWait"}, true},
+		{"an orphan wait with a fraction of a millisecond", func(to *platform.Timeouts) {
+			to.ActorLockOrphanTerminateWait = time.Second + time.Microsecond
+		}, &want{wholeMillis: "ActorLockOrphanTerminateWait"}, true},
+		{"a one-millisecond orphan wait is accepted", func(to *platform.Timeouts) {
+			to.ActorLockOrphanTerminateWait = time.Millisecond
+		}, nil, true},
+
+		// The reap time (idle + interval × count, 25 s by default) against
+		// one probe and its statement (11 s by default)...
+		{"a reap time equal to one probe and its statement", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveIdle, to.ActorLockServerKeepaliveInterval, to.ActorLockServerKeepaliveCount = 5*time.Second, 2*time.Second, 3
+		}, &want{chain: "ActorLockServerReapTime > ActorLockProbeInterval + ActorLockStatementTimeout"}, true},
+		{"a reap time below one probe", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveIdle, to.ActorLockServerKeepaliveInterval, to.ActorLockServerKeepaliveCount = time.Second, time.Second, 1
+		}, &want{chain: "ActorLockServerReapTime > ActorLockProbeInterval + ActorLockStatementTimeout"}, true},
+		{"a reap time just above one probe and its statement is accepted", func(to *platform.Timeouts) {
+			to.ActorLockStatementTimeout = time.Second - time.Millisecond
+			to.ActorLockServerKeepaliveIdle, to.ActorLockServerKeepaliveInterval, to.ActorLockServerKeepaliveCount = 5*time.Second, 2*time.Second, 3
+		}, nil, true},
+		// ...and against the timer claim (30 s by default).
+		{"a reap time equal to the timer claim", func(to *platform.Timeouts) {
+			to.TimerClaimDuration = to.ActorLockServerReapTime()
+		}, &want{chain: "TimerClaimDuration > ActorLockServerReapTime"}, true},
+		{"a reap time above the timer claim", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveCount = 6
+		}, &want{chain: "TimerClaimDuration > ActorLockServerReapTime"}, true},
+		{"a reap time just below the timer claim is accepted", func(to *platform.Timeouts) {
+			to.TimerClaimDuration = to.ActorLockServerReapTime() + time.Millisecond
+		}, nil, true},
+
+		{"a zero keepalive idle reaches the server as its default", func(to *platform.Timeouts) { to.ActorLockServerKeepaliveIdle = 0 },
+			&want{field: "ActorLockServerKeepaliveIdle"}, true},
+		{"a negative keepalive idle", func(to *platform.Timeouts) { to.ActorLockServerKeepaliveIdle = -time.Second },
+			&want{field: "ActorLockServerKeepaliveIdle"}, true},
+		// A zero or negative interval shrinks the reap time below one probe too.
+		{"a zero keepalive interval reaches the server as its default", func(to *platform.Timeouts) { to.ActorLockServerKeepaliveInterval = 0 },
+			&want{field: "ActorLockServerKeepaliveInterval"}, false},
+		{"a negative keepalive interval", func(to *platform.Timeouts) { to.ActorLockServerKeepaliveInterval = -time.Second },
+			&want{field: "ActorLockServerKeepaliveInterval"}, false},
+		{"a zero keepalive count reaches the server as its default", func(to *platform.Timeouts) { to.ActorLockServerKeepaliveCount = 0 },
+			&want{count: "ActorLockServerKeepaliveCount"}, false},
+		{"a keepalive idle under a second would reach the server as 0", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveIdle = 500 * time.Millisecond
+		}, &want{wholeSeconds: "ActorLockServerKeepaliveIdle"}, true},
+		{"a keepalive idle with a fraction of a second", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveIdle = 10*time.Second + 500*time.Millisecond
+		}, &want{wholeSeconds: "ActorLockServerKeepaliveIdle"}, true},
+		{"a keepalive interval with a fraction of a second", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveInterval = 5*time.Second + time.Millisecond
+		}, &want{wholeSeconds: "ActorLockServerKeepaliveInterval"}, true},
+		{"one-second keepalives are accepted", func(to *platform.Timeouts) {
+			to.ActorLockServerKeepaliveIdle, to.ActorLockServerKeepaliveInterval, to.ActorLockServerKeepaliveCount = 7*time.Second, time.Second, 5
+		}, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			if tc.want == nil {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			var errs []error
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				errs = joined.Unwrap()
+			} else if err != nil {
+				errs = []error{err}
+			}
+			found := 0
+			for _, e := range errs {
+				var inv *platform.TimeoutInvariantError
+				var pos *platform.TimeoutMustBePositiveError
+				var cnt *platform.CountMustBePositiveError
+				var whole *platform.TimeoutMustBeWholeSecondsError
+				var wholeMillis *platform.TimeoutMustBeWholeMillisecondsError
+				switch {
+				case tc.want.chain != "" && errors.As(e, &inv) && inv.Chain == tc.want.chain:
+					found++
+				case tc.want.field != "" && errors.As(e, &pos) && pos.Field == tc.want.field:
+					found++
+				case tc.want.count != "" && errors.As(e, &cnt) && cnt.Field == tc.want.count:
+					found++
+				case tc.want.wholeSeconds != "" && errors.As(e, &whole) && whole.Field == tc.want.wholeSeconds:
+					found++
+				case tc.want.wholeMillis != "" && errors.As(e, &wholeMillis) && wholeMillis.Field == tc.want.wholeMillis:
+					found++
+				}
+			}
+			if found != 1 {
+				t.Fatalf("Validate() = %v, want the broken link %+v reported exactly once", err, *tc.want)
+			}
+			if tc.exact && len(errs) != 1 {
+				t.Fatalf("Validate() reported %d errors, want only the broken link %+v: %v", len(errs), *tc.want, err)
+			}
+		})
+	}
+}
+
 // TestDefaultTimeouts_GitHubAppMintFinishesBeforeCredentialFetch pins the
 // order of two bounds on one request. The sandbox's credential helper
 // (internal/sandboxagent/credentials.CPClient) gives up on the control

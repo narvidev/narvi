@@ -22,7 +22,7 @@
 // no-op log on a transient one). A real network call must never hold a
 // Postgres transaction open -- see actor.go's own transact doc comment
 // for why every write in this package already goes through a fresh
-// connection, never the long-lived advisory-lock one.
+// pool connection, never the replica's lock connection.
 //
 // The dispatch branch (a Ready/Suspect sandbox with a Pending turn ready
 // to go) is, as of this fix, split the SAME three-step way as the spawn
