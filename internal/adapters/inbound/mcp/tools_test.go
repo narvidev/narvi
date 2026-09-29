@@ -207,12 +207,14 @@ func TestToolAnnotations_MatchTwinMethod(t *testing.T) {
 	// Each write's own four hints (technical plan §43.8, §43.21): destructive
 	// only for the rejection, which ends a plan version; idempotent where a
 	// repeat changes nothing more (a same-key create, a decided plan);
-	// open-world where a turn it starts reaches the code host.
+	// open-world where an effect reaches outside this deployment -- a turn
+	// that reaches the code host, or a plan verdict posted to Slack or
+	// Linear, which a rejection posts as an approval does.
 	type hints struct{ destructive, idempotent, openWorld bool }
 	wantWrites := map[string]hints{
 		"narvi_create_session":        {destructive: false, idempotent: true, openWorld: true},
 		"narvi_approve_plan":          {destructive: false, idempotent: true, openWorld: true},
-		"narvi_reject_plan":           {destructive: true, idempotent: true, openWorld: false},
+		"narvi_reject_plan":           {destructive: true, idempotent: true, openWorld: true},
 		"narvi_request_plan_revision": {destructive: false, idempotent: false, openWorld: true},
 		"narvi_send_prompt":           {destructive: false, idempotent: false, openWorld: true},
 	}

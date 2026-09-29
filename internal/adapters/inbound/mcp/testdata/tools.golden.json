@@ -2062,10 +2062,10 @@
     "annotations": {
       "destructiveHint": true,
       "idempotentHint": true,
-      "openWorldHint": false,
+      "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Reject a plan awaiting approval, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/plans/{planId}/reject, with the same checks: that user's own role (as for narvi_approve_plan), and the plan still awaiting approval and belonging to that session (the first decision wins, whichever channel made it). Nothing is queued and nothing runs; that plan version stays rejected. To change a plan rather than drop it, use narvi_request_plan_revision instead. Returns the plan's id and its status (rejected).",
+    "description": "Reject a plan awaiting approval, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/plans/{planId}/reject, with the same checks: that user's own role (as for narvi_approve_plan), and the plan still awaiting approval and belonging to that session (the first decision wins, whichever channel made it). No turn is queued and nothing runs; that plan version stays rejected, and, as for an approval, the verdict is posted to the Slack message or the Linear session the plan went to, if it went to one. To change a plan rather than drop it, use narvi_request_plan_revision instead. Returns the plan's id and its status (rejected).",
     "inputSchema": {
       "additionalProperties": false,
       "description": "The narvi_reject_plan MCP tool's own input (technical plan §43.21) -- the tool bridge's twin of POST /api/sessions/{sessionID}/plans/{planId}/reject, which takes no body: both path parameters are plain required fields. Self-contained: it references no other $def. The answer is PlanActionResponse, with no turn.",

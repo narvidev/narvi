@@ -679,7 +679,7 @@ func toolSpecs(twins Twins) []toolSpec {
 		},
 		{
 			Name:         "narvi_reject_plan",
-			Description:  "Reject a plan awaiting approval, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/plans/{planId}/reject, with the same checks: that user's own role (as for narvi_approve_plan), and the plan still awaiting approval and belonging to that session (the first decision wins, whichever channel made it). Nothing is queued and nothing runs; that plan version stays rejected. To change a plan rather than drop it, use narvi_request_plan_revision instead. Returns the plan's id and its status (rejected).",
+			Description:  "Reject a plan awaiting approval, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/plans/{planId}/reject, with the same checks: that user's own role (as for narvi_approve_plan), and the plan still awaiting approval and belonging to that session (the first decision wins, whichever channel made it). No turn is queued and nothing runs; that plan version stays rejected, and, as for an approval, the verdict is posted to the Slack message or the Linear session the plan went to, if it went to one. To change a plan rather than drop it, use narvi_request_plan_revision instead. Returns the plan's id and its status (rejected).",
 			Scope:        mcpscope.Write,
 			Instruction:  "narvi_reject_plan (reject a plan awaiting approval)",
 			Twin:         twin{method: http.MethodPost, pathTemplate: "/api/sessions/{sessionID}/plans/{planId}/reject", handler: twins.RejectPlan},
@@ -739,8 +739,10 @@ var createSessionAnnotations = &sdkmcp.ToolAnnotations{
 // approvePlanAnnotations are narvi_approve_plan's (technical plan §43.21):
 // it writes, but destroys nothing -- it moves a plan from awaiting to
 // approved and adds a turn; a second call with the same arguments changes
-// nothing more (the first verdict wins, a later one is refused); and the
-// implementation it queues reads from and pushes to the code host.
+// nothing more (the first verdict wins, a later one is refused); and it
+// reaches outside this deployment: the implementation it queues reads from
+// and pushes to the code host, and the verdict is posted to the Slack
+// message or the Linear session the plan went to.
 var approvePlanAnnotations = &sdkmcp.ToolAnnotations{
 	ReadOnlyHint:    false,
 	DestructiveHint: boolPtr(false),
@@ -748,21 +750,24 @@ var approvePlanAnnotations = &sdkmcp.ToolAnnotations{
 	OpenWorldHint:   boolPtr(true),
 }
 
-// rejectPlanAnnotations are narvi_reject_plan's: a rejection is final for
-// that plan version -- the one tool here that ends something, so it is
-// marked destructive -- a second call changes nothing more, and nothing
-// reaches outside this deployment, since no turn is queued.
+// rejectPlanAnnotations are narvi_reject_plan's (technical plan §43.21): a
+// rejection is final for that plan version -- the one tool here that ends
+// something, so it is marked destructive -- a second call changes nothing
+// more, and, though it queues no turn, it reaches outside this deployment:
+// the verdict is posted to the Slack message or the Linear session the plan
+// went to, as an approval's is.
 var rejectPlanAnnotations = &sdkmcp.ToolAnnotations{
 	ReadOnlyHint:    false,
 	DestructiveHint: boolPtr(true),
 	IdempotentHint:  true,
-	OpenWorldHint:   boolPtr(false),
+	OpenWorldHint:   boolPtr(true),
 }
 
 // queueTurnAnnotations are shared by narvi_request_plan_revision and
 // narvi_send_prompt: each call that is accepted queues one more turn, so
 // neither is idempotent; neither destroys anything; and the turn reads
-// from the code host (and, for a prompt, can push to it).
+// from the code host, which a completed turn's branch is pushed to -- a
+// revision's as much as a prompt's.
 var queueTurnAnnotations = &sdkmcp.ToolAnnotations{
 	ReadOnlyHint:    false,
 	DestructiveHint: boolPtr(false),
