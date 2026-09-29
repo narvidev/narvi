@@ -98,10 +98,11 @@ type Timeouts struct {
 	// agent stayed silent, or there was no sandbox to tell -- the turn is
 	// cancelled with a synthetic execution_complete, as turn_deadline ends a
 	// turn, and its sandbox gen retired. While that gen still delivers a
-	// completed turn's push and pull request, the cancel waits, looked at
-	// again every StopGrace and never past MCPStatusDeliveryWindow from the
-	// delivery's start (sessionactor's deliveryHold). Measured on the
-	// database's clock. Not given a value
+	// completed turn's push and pull request, only the retirement waits --
+	// the turn is cancelled all the same, and nothing is dispatched to the
+	// gen meanwhile -- looked at again every StopGrace and never past
+	// MCPStatusDeliveryWindow from the delivery's start (sessionactor's
+	// deliveryHold). Measured on the database's clock. Not given a value
 	// in the plan; 30s, long enough for an agent to abort its run and report
 	// it, short enough that a stop reads as a stop. Validate keeps it
 	// positive -- at zero every flagged turn in flight would be cancelled at
@@ -4301,13 +4302,6 @@ func (t Timeouts) Validate() error {
 	mustBePositive("StopGrace", t.StopGrace)
 	check("TurnDeadline > StopGrace",
 		"TurnDeadline", t.TurnDeadline, "StopGrace", t.StopGrace)
-	// §3.3's stop waits for a completed turn's push and pull request before
-	// it retires their sandbox gen, at most MCPStatusDeliveryWindow from
-	// the delivery's start. The stopped turn was dispatched after that
-	// start, so its own deadline ends it first -- as a timeout, with its
-	// gen kept -- unless TurnDeadline outlasts the window.
-	check("TurnDeadline > MCPStatusDeliveryWindow",
-		"TurnDeadline", t.TurnDeadline, "MCPStatusDeliveryWindow", t.MCPStatusDeliveryWindow)
 
 	// §43.15: the registration rate limit. A zero refill interval is no
 	// limit at all (rate.Every(0) is rate.Inf) -- the same fail-OPEN-at-zero

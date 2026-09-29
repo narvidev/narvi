@@ -24,16 +24,22 @@
 //     still reports. An execution_complete names a gen, never a turn:
 //     without the retirement, the stopped work's late one would be booked
 //     against the next turn dispatched to the same gen.
-//   - One wait comes before that retirement (deliveryHold): while the gen
-//     it would retire is still delivering a completed turn's push and pull
-//     request (sandboxes.pr_delivery_started_at, within
-//     MCPStatusDeliveryWindow of its start), the stopped turn is left in
-//     flight and the timer re-armed -- every StopGrace, never past the
-//     window's end -- since stopping the sandbox would kill that delivery.
-//     The agent handles a push before the frames sent after it, the stop
-//     included, so it usually confirms the turn's end once the push is
-//     over; otherwise the first fire after the delivery ends, or after its
-//     window has run, cancels the turn and retires the gen.
+//   - The retirement waits for a delivery (deliveryHold), the cancel never
+//     does: while the gen it would retire is still delivering a completed
+//     turn's push and pull request (sandboxes.pr_delivery_started_at,
+//     within MCPStatusDeliveryWindow of its start), stopping its sandbox
+//     would kill that delivery. The stopped turn is cancelled all the same,
+//     and the retirement is left owed (sandboxes.stop_retire_gen): nothing
+//     is dispatched to that gen and no snapshot of it is started meanwhile
+//     (planDispatch, triggerSnapshotBestEffort), since the agent may still
+//     be running the stopped work there -- it runs a prompt while it
+//     handles a push, and a gen that takes no snapshot (a Docker-required
+//     session's) is sent the next turn's prompt before the previous turn's
+//     push. The stopped work's own late execution_complete then finds
+//     nothing processing, completes nothing and pushes nothing. The timer
+//     is re-armed to look again every StopGrace, never past the window's
+//     end, and the first fire after the delivery ends, or after its window
+//     has run, retires the gen and dispatches what is queued to a new one.
 //   - While the session's own request stands, the session's work-creating
 //     timers (ClassifyTimer: TimerWorkCreatesTurn) armed at or before the
 //     request -- its latest instant, which a repeated request moves forward
@@ -89,8 +95,9 @@ type retiredGen struct {
 
 // handleStopTimer implements the `stop` named timer -- see this file's own
 // top comment. Ends, like every handler, by re-arming or deleting the timer
-// that fired: re-armed only while a flagged turn is still in flight, within
-// its grace or held by deliveryHold.
+// that fired: re-armed only while a flagged turn is still in flight within
+// its grace, or while the retirement of a stopped turn's gen waits for a
+// delivery (deliveryHold).
 func (a *Actor) handleStopTimer(ctx context.Context) error {
 	var signal *stopSignal
 	var retired *retiredGen
@@ -110,31 +117,11 @@ func (a *Actor) handleStopTimer(ctx context.Context) error {
 			return fmt.Errorf("sessionactor: list stop-requested turns: %w", err)
 		}
 
-		// A turn in flight whose grace has run is cancelled below and its
-		// gen retired -- unless that gen is still delivering a completed
-		// turn's push and pull request, which the retirement would kill.
-		var elapsed []sqlcgen.ListStopRequestedOpenTurnsRow
-		for _, f := range flagged {
-			if turn.State(f.Status) != turn.StatePending && f.GraceElapsed {
-				elapsed = append(elapsed, f)
-			}
-		}
-		var heldUntil time.Time
-		if len(elapsed) > 0 {
-			if heldUntil, err = a.deliveryHold(ctx, tx, elapsed); err != nil {
-				return err
-			}
-		}
-
 		var toCancel []pgtype.UUID
-		rearmAt := heldUntil
+		var rearmAt time.Time
 		for _, f := range flagged {
-			if turn.State(f.Status) == turn.StatePending || f.GraceElapsed && heldUntil.IsZero() {
+			if turn.State(f.Status) == turn.StatePending || f.GraceElapsed {
 				toCancel = append(toCancel, f.ID)
-				continue
-			}
-			if f.GraceElapsed {
-				// Held: looked at again at heldUntil.
 				continue
 			}
 			// Dispatched or processing, inside its grace: told to stop, and
@@ -145,21 +132,26 @@ func (a *Actor) handleStopTimer(ctx context.Context) error {
 			}
 		}
 
+		var unconfirmed []sqlcgen.Turn
 		if len(toCancel) > 0 {
-			unconfirmed, err := a.cancelStoppedTurns(ctx, tx, sessionRow, toCancel, now)
-			if err != nil {
+			if unconfirmed, err = a.cancelStoppedTurns(ctx, tx, sessionRow, toCancel, now); err != nil {
 				return err
 			}
 			cancelled = true
-			// A turn in flight cancelled here ended with no word from the
-			// agent, which may still be running it: its sandbox gen is
-			// retired in this same transaction, before anything can be
-			// dispatched to it.
-			if len(unconfirmed) > 0 {
-				if retired, err = a.retireStoppedGen(ctx, tx, unconfirmed); err != nil {
-					return err
-				}
-			}
+		}
+
+		// A turn in flight cancelled here ended with no word from the agent,
+		// which may still be running it: its sandbox gen is retired in this
+		// same transaction, before anything can be dispatched to it -- or,
+		// while that gen still delivers a completed turn's push and pull
+		// request, the retirement is left owed, and so is one an earlier
+		// fire left owed.
+		var heldUntil time.Time
+		if retired, heldUntil, err = a.retireOrHold(ctx, tx, unconfirmed); err != nil {
+			return err
+		}
+		if !heldUntil.IsZero() && (rearmAt.IsZero() || heldUntil.Before(rearmAt)) {
+			rearmAt = heldUntil
 		}
 
 		if err := a.disarmWorkCreatingTimers(ctx, tx, sessionRow.StopRequestedAt); err != nil {
@@ -190,16 +182,73 @@ func (a *Actor) handleStopTimer(ctx context.Context) error {
 	if signal != nil {
 		a.sendStop(*signal)
 	}
-	if cancelled {
+	if cancelled || retired != nil {
 		// §3.3: "on terminal event ... dispatch next pending" -- a turn
 		// created after the stop, which carries no flag, runs now: on the
 		// same sandbox when the stop cancelled only queued turns, on a new
-		// gen (a restore or a respawn) when it retired the old one.
+		// gen (a restore or a respawn) when it retired the old one, and not
+		// yet while that retirement is owed (planDispatch holds it).
 		if dispatchErr := a.handleEnsureDispatched(ctx); dispatchErr != nil {
 			a.logger.Warn("sessionactor: ensure-dispatched after stop failed", "error", dispatchErr)
 		}
 	}
 	return nil
+}
+
+// retireOrHold retires the sandbox generation a stopped turn was cancelled
+// on with no word from the agent -- one of unconfirmed's, or the one an
+// earlier fire left owed (sandboxes.stop_retire_gen) -- or, while that gen
+// still delivers a completed turn's push and pull request, leaves the
+// retirement owed and returns when to look again (deliveryHold). The owed
+// gen is recorded only while the row is at it; nothing is dispatched to it
+// and no snapshot of it is started meanwhile (planDispatch,
+// triggerSnapshotBestEffort). Once not held, the record is cleared,
+// whether or not there is still something to retire (retireStoppedGen's
+// own conditions). Returns (nil, zero, nil) when nothing is owed.
+func (a *Actor) retireOrHold(ctx context.Context, tx pgx.Tx, unconfirmed []sqlcgen.Turn) (*retiredGen, time.Time, error) {
+	row, err := a.stores.sandbox.WithTx(tx).PRDelivery(ctx, a.sessionID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No sandbox: nothing to retire, nothing to wait for.
+			return nil, time.Time{}, nil
+		}
+		return nil, time.Time{}, fmt.Errorf("sessionactor: read sandbox push/PR delivery: %w", err)
+	}
+	gens := make([]*int32, 0, len(unconfirmed)+1)
+	for _, t := range unconfirmed {
+		gens = append(gens, t.DispatchedSandboxGen)
+	}
+	if row.StopRetireGen != nil {
+		gens = append(gens, row.StopRetireGen)
+	}
+	if len(gens) == 0 {
+		return nil, time.Time{}, nil
+	}
+
+	if heldUntil := a.deliveryHold(row, gens); !heldUntil.IsZero() {
+		if row.StopRetireGen == nil || *row.StopRetireGen != row.Gen {
+			if err := a.stores.sandbox.WithTx(tx).SetStopRetireGen(ctx, a.sessionID, row.Gen); err != nil {
+				return nil, time.Time{}, fmt.Errorf("sessionactor: record a stopped turn's owed gen retirement: %w", err)
+			}
+		}
+		return nil, heldUntil, nil
+	}
+
+	if row.StopRetireGen != nil {
+		if err := a.stores.sandbox.WithTx(tx).ClearStopRetireGen(ctx, a.sessionID); err != nil {
+			return nil, time.Time{}, fmt.Errorf("sessionactor: clear a stopped turn's owed gen retirement: %w", err)
+		}
+	}
+	retired, err := a.retireStoppedGen(ctx, tx, gens)
+	return retired, time.Time{}, err
+}
+
+// retirementOwed reports whether row's current gen owes a person's stop its
+// retirement (sandboxes.stop_retire_gen, retireOrHold): nothing is
+// dispatched to that gen, and no snapshot of it is started, until the stop
+// timer retires it.
+func retirementOwed(row sqlcgen.Sandbox) bool {
+	return row.StopRetireGen != nil && *row.StopRetireGen == row.Gen
 }
 
 // cancelStoppedTurns moves each turn of ids -- every one flagged by a
@@ -290,7 +339,8 @@ func (a *Actor) cancelStoppedTurns(ctx context.Context, tx pgx.Tx, sessionRow sq
 }
 
 // retireStoppedGen retires the sandbox generation a stopped turn was still
-// running on when handleStopTimer cancelled it with no word from the agent.
+// running on when handleStopTimer cancelled it with no word from the agent
+// -- dispatched, the dispatched_sandbox_gen of each such turn (retireOrHold).
 // The agent may still be running that work -- the one `stop` it was sent
 // found no live connection, or its abort outlasted the grace -- and its
 // eventual execution_complete names a gen, never a turn (pushpr.go's
@@ -309,11 +359,12 @@ func (a *Actor) cancelStoppedTurns(ctx context.Context, tx pgx.Tx, sessionRow sq
 // none is armed, and one a watchdog armed earlier is deleted.
 //
 // Returns nil when there is nothing to retire: no sandbox, one already
-// dead, or one whose gen has moved past every one of unconfirmed's own
-// dispatches -- a respawn since then already fenced that gen off, and a
-// flagged turn is never re-sent (planReenqueueOrRespawn). A turn with no
-// dispatched_sandbox_gen recorded is taken to have run on the current gen.
-func (a *Actor) retireStoppedGen(ctx context.Context, tx pgx.Tx, unconfirmed []sqlcgen.Turn) (*retiredGen, error) {
+// dead, or one whose gen has moved past every one of dispatched -- a
+// respawn since then already fenced that gen off, and a flagged turn is
+// never re-sent (planReenqueueOrRespawn). A turn with no
+// dispatched_sandbox_gen recorded (nil) is taken to have run on the
+// current gen.
+func (a *Actor) retireStoppedGen(ctx context.Context, tx pgx.Tx, dispatched []*int32) (*retiredGen, error) {
 	row, err := a.stores.sandbox.WithTx(tx).Get(ctx, a.sessionID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -322,11 +373,7 @@ func (a *Actor) retireStoppedGen(ctx context.Context, tx pgx.Tx, unconfirmed []s
 		return nil, fmt.Errorf("sessionactor: get sandbox: %w", err)
 	}
 	from := sandbox.State(row.Status)
-	gens := make([]*int32, len(unconfirmed))
-	for i, t := range unconfirmed {
-		gens[i] = t.DispatchedSandboxGen
-	}
-	if sandbox.IsDeadSandboxStatus(from) || !ranOnGen(gens, int(row.Gen)) {
+	if sandbox.IsDeadSandboxStatus(from) || !ranOnGen(dispatched, int(row.Gen)) {
 		return nil, nil
 	}
 
@@ -376,52 +423,41 @@ func ranOnGen(dispatched []*int32, gen int) bool {
 	return false
 }
 
-// deliveryHold decides whether cancelling elapsed -- flagged turns in
-// flight whose grace has run -- waits, and until when. Cancelling them
-// retires the sandbox gen they ran on (retireStoppedGen), and stopping
-// that gen's provider object would kill a completed turn's push and pull
-// request it is still delivering: §3.3 keeps those, as that turn's result.
-// The agent handles a push inline, before any frame sent after it, so the
-// stop it was sent is read only once the push is over; the gen is then
-// retired only if it still has not confirmed the turn's end.
+// deliveryHold decides whether retiring the sandbox gen of dispatched --
+// the dispatched_sandbox_gen of each turn a stop cancelled with no word
+// from the agent, and of the one an earlier fire left owed -- waits, and
+// until when. row is the sandbox's delivery read (GetSandboxPRDelivery).
+// Stopping that gen's provider object would kill a completed turn's push
+// and pull request it is still delivering: §3.3 keeps those, as that
+// turn's result. The turns themselves are cancelled either way.
 //
-// Returns the zero time -- cancel now -- when nothing would be retired (no
-// sandbox, one already dead, or one whose gen has moved past every one of
-// elapsed's own dispatches: retireStoppedGen's own conditions), or when
-// no delivery is under way: none stamped (sandboxes.pr_delivery_started_at,
-// cleared once the pull request is created, the push fails or the push
-// cannot be sent), or one stamped MCPStatusDeliveryWindow ago or more,
+// Returns the zero time -- retire now -- when nothing would be retired (a
+// sandbox already dead, or one whose gen has moved past every one of
+// dispatched: retireStoppedGen's own conditions), or when no delivery is
+// under way: none stamped (sandboxes.pr_delivery_started_at, cleared once
+// the pull request is created, the push fails or the push cannot be sent),
+// or one stamped MCPStatusDeliveryWindow ago or more,
 // session.PRDeliveryOpen's bound, which the session's status also reads.
 // Otherwise returns when to look again: StopGrace from now, so a delivery
 // that ends is noticed within one grace, and never later than the window's
-// end, so a push that never reports back holds the stop no longer than it
-// holds the session's status. Every instant is on the database's clock.
-func (a *Actor) deliveryHold(ctx context.Context, tx pgx.Tx, elapsed []sqlcgen.ListStopRequestedOpenTurnsRow) (time.Time, error) {
-	row, err := a.stores.sandbox.WithTx(tx).PRDelivery(ctx, a.sessionID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return time.Time{}, nil
-		}
-		return time.Time{}, fmt.Errorf("sessionactor: read sandbox push/PR delivery: %w", err)
-	}
-	gens := make([]*int32, len(elapsed))
-	for i, f := range elapsed {
-		gens[i] = f.DispatchedSandboxGen
-	}
-	if sandbox.IsDeadSandboxStatus(sandbox.State(row.Status)) || !ranOnGen(gens, int(row.Gen)) || !row.PrDeliveryStartedAt.Valid {
-		return time.Time{}, nil
+// end, so a push that never reports back holds the retirement no longer
+// than it holds the session's status. Every instant is on the database's
+// clock.
+func (a *Actor) deliveryHold(row sqlcgen.GetSandboxPRDeliveryRow, dispatched []*int32) time.Time {
+	if sandbox.IsDeadSandboxStatus(sandbox.State(row.Status)) || !ranOnGen(dispatched, int(row.Gen)) || !row.PrDeliveryStartedAt.Valid {
+		return time.Time{}
 	}
 	started, observed := row.PrDeliveryStartedAt.Time, row.ObservedAt.Time
 	if !session.PRDeliveryOpen(started, observed, a.timeouts.MCPStatusDeliveryWindow) {
-		return time.Time{}, nil
+		return time.Time{}
 	}
 	until := started.Add(a.timeouts.MCPStatusDeliveryWindow)
 	if next := observed.Add(a.timeouts.StopGrace); next.Before(until) {
 		until = next
 	}
-	a.logger.Info("sessionactor: a stopped turn's grace ended while its sandbox gen still delivers a completed turn's push and pull request; its cancel and the gen's retirement wait for that delivery",
+	a.logger.Info("sessionactor: a stopped turn was cancelled while its sandbox gen still delivers a completed turn's push and pull request; the gen's retirement, and every dispatch to it, wait for that delivery",
 		"gen", row.Gen, "delivery_started_at", started, "next_look", until)
-	return until, nil
+	return until
 }
 
 // stopSandboxOfRetiredGen asks the provider, after the commit, to stop the

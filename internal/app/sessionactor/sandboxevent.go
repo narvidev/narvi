@@ -1070,6 +1070,15 @@ func (a *Actor) triggerSnapshotBestEffort(ctx context.Context) {
 		if sandbox.State(row.Status) != sandbox.StateReady {
 			return nil
 		}
+		// Technical plan §3.3's stop: a gen a person's stop has still to
+		// retire (retireOrHold) is snapshotted no more. The execution_complete
+		// that got here may be the stopped work's own late end, which
+		// completed nothing: a snapshot now would keep what the stopped work
+		// changed, for the next turn to restore and push.
+		if retirementOwed(row) {
+			a.logger.Info("sessionactor: snapshot not started: this sandbox gen owes a stop its retirement", "gen", row.Gen)
+			return nil
+		}
 
 		sessionRow, err := a.stores.session.WithTx(tx).Get(ctx, a.sessionID)
 		if err != nil {

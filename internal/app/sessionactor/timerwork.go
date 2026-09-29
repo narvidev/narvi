@@ -58,15 +58,20 @@ const (
 //     itself. The turn it acts on is in flight, so the session already
 //     reads running whenever it can do anything.
 //   - stop (armed by POST /api/sessions/{sessionID}/stop, re-armed by its
-//     own handler while a flagged turn is in flight; technical plan §3.3):
-//     cancels the turns a person's stop flagged -- pending ones at once, a
-//     turn in flight once the sandbox `stop` or StopGrace ends it -- and
-//     deletes the session's work-creating timers. It ends turns and never
-//     creates one: an attempt it cancels ends its workflow run cancelled
-//     without consulting NextStep, so no next step is queued. Every turn it
-//     acts on was open when the request was made, so the same snapshot
-//     already reads the session as queued or running; from a settled
-//     snapshot it finds nothing flagged open and deletes itself.
+//     own handler while a flagged turn is in flight, or while the
+//     retirement of a stopped turn's sandbox gen waits for a delivery;
+//     technical plan §3.3): cancels the turns a person's stop flagged --
+//     pending ones at once, a turn in flight once the sandbox `stop` or
+//     StopGrace ends it -- retires that gen, and deletes the session's
+//     work-creating timers. It ends turns and never creates one: an
+//     attempt it cancels ends its workflow run cancelled without
+//     consulting NextStep, so no next step is queued, and the dispatch a
+//     retirement is followed by only sends a turn already pending, which
+//     reads queued in the same snapshot. Every turn it acts on was open
+//     when the request was made, so the same snapshot already reads the
+//     session as queued or running; from a settled snapshot it finds
+//     nothing flagged open, retires at most a sandbox gen, and deletes
+//     itself.
 //   - review_retrigger_debounce (armed by the pull_request/synchronize
 //     webhook on every push to a PR with a review session, opted in or
 //     not -- never the review session's own, since a review session never

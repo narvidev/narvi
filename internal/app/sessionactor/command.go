@@ -36,7 +36,10 @@ const (
 	// session. Its firing (stop.go's handleStopTimer) cancels every flagged
 	// pending turn, sends a flagged turn in flight the sandbox `stop`
 	// command and re-arms itself for the end of that turn's StopGrace, and
-	// cancels the turn itself if it is still in flight then. The timer is
+	// cancels the turn itself if it is still in flight then, retiring its
+	// sandbox gen -- re-arming again while that gen still delivers a
+	// completed turn's push and pull request, which the retirement waits
+	// for. The timer is
 	// what makes the request survive the loss of a replica: the flags and
 	// the timer are rows, and whichever replica's pump delivers it next
 	// does the rest.

@@ -2333,6 +2333,7 @@ type Sandbox struct {
 	BootEvidenceGen               *int32               `json:"boot_evidence_gen"`
 	BootingSince                  pgtype.Timestamptz   `json:"booting_since"`
 	BootingSinceGen               *int32               `json:"booting_since_gen"`
+	StopRetireGen                 *int32               `json:"stop_retire_gen"`
 }
 
 type SandboxHistory struct {

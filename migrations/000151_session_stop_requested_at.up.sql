@@ -12,14 +12,23 @@
 -- request, within MCPStatusDeliveryWindow). A turn created after the
 -- request carries no flag and runs normally.
 --
+-- sandboxes.stop_retire_gen is the retirement such a wait leaves owed: the
+-- gen a stopped turn was cancelled on, with no word from the agent, while
+-- that gen was still delivering. Nothing is dispatched to it meanwhile
+-- (sessionactor's planDispatch), since the agent may still be running the
+-- stopped work there and its late execution_complete names a gen, never a
+-- turn. It is cleared when the stop timer retires the gen, finds nothing
+-- left to retire, or the row moves to a new gen (UpsertSandboxForSpawn).
+-- NULL means no retirement is owed.
+--
 -- sessions.stop_requested_at also refuses a new child session of a stopped
 -- parent (httpapi.CreateSessionOnTx reads it FOR SHARE), until a person's
 -- next act that sets the session going again clears it: a turn they
 -- create, their approval of its plan, or their approval or revision of a
 -- workflow step awaiting their decision. Stop is not an archive.
 --
--- Both columns are nullable, with no default: NULL means no stop was
--- requested. A repeated request keeps each turn's first instant (COALESCE),
+-- The two stop_requested_at columns are nullable, with no default: NULL
+-- means no stop was requested. A repeated request keeps each turn's first instant (COALESCE),
 -- so the grace a turn in flight gets runs from the first request that
 -- reached it, and moves the session's to its own (GREATEST), which the
 -- disarming of scheduled work is measured against.
@@ -30,10 +39,10 @@
 -- one implicit transaction (000149 says the same of its own file). ADD
 -- COLUMN with no default is a catalog change that rewrites nothing, but
 -- each ALTER TABLE takes ACCESS EXCLUSIVE on its table and the transaction
--- holds both until the file ends, so every query on sessions or turns
--- waits for it. sessions is locked first, then turns: the order the
--- session actor and the REST handlers take them in, since each locks the
--- session row before it touches a turn.
+-- holds all three until the file ends, so every query on sessions, turns
+-- or sandboxes waits for it. sessions is locked first, then turns, then
+-- sandboxes: the session actor and the REST handlers lock the session row
+-- before they touch a turn or a sandbox.
 --
 -- # Rolling deploy
 --
@@ -60,8 +69,10 @@
 -- (controlplane/migrate.go), and golang-migrate refuses a database whose
 -- version it has no file for. So once this migration is applied:
 --   - An older pod that is already running keeps working: every query it
---     makes on sessions and turns names its columns, and none names these
---     two. It cannot carry a stop out, though (see Rolling deploy).
+--     makes on sessions, turns and sandboxes names its columns, and none
+--     names these three. It cannot carry a stop out, though (see Rolling
+--     deploy), and it does not read stop_retire_gen: it dispatches to a
+--     gen whose retirement is owed.
 --   - An older pod that restarts does not boot ("no migration found for
 --     version 151"). That covers a rollback and an old pod restarting in
 --     the middle of a rolling deploy. A binary without 000151 cannot boot
@@ -75,7 +86,10 @@
 --     not against live pods.
 --   - The down drops every pending stop request with its columns: a turn
 --     flagged but not yet cancelled then dispatches as if no stop had been
---     asked for, and a stopped parent accepts new children again.
+--     asked for, a stopped parent accepts new children again, and a gen
+--     whose retirement is owed takes the next turn.
 ALTER TABLE sessions ADD COLUMN stop_requested_at timestamptz;
 
 ALTER TABLE turns ADD COLUMN stop_requested_at timestamptz;
+
+ALTER TABLE sandboxes ADD COLUMN stop_retire_gen integer;
