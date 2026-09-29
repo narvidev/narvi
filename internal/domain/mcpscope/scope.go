@@ -25,10 +25,10 @@ type Scope string
 const (
 	// Read covers every read-only tool.
 	Read Scope = "mcp:read"
-	// Write covers every state-changing tool, and implies Read. Declared
-	// so the hierarchy is settled before any tool needs it; not
-	// advertised, and refused at authorization, until a tool requires it
-	// (Advertised).
+	// Write covers every state-changing tool, and implies Read. One scope
+	// for every write, deliberately: finer per-action scopes can be added
+	// later without taking anything away. Advertised because a tool
+	// requires it (Advertised) -- narvi_create_session first.
 	Write Scope = "mcp:write"
 )
 

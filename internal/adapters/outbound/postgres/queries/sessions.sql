@@ -44,9 +44,25 @@
 -- treatment exactly: every EXISTING call site that never sets it keeps
 -- compiling and behaving identically (NULL, "use platform.Config's own
 -- global default" -- off, unless an operator has turned the default on).
-INSERT INTO sessions (title, spawn_source, created_by, repos, environment_id, provenance_tag, build_model_id, build_effort, parent_session_id, spawn_depth, epistemic_check_enabled)
-VALUES ($1, $2, $3, COALESCE(sqlc.narg('repos'), '[]'::jsonb), sqlc.narg('environment_id'), sqlc.narg('provenance_tag'), sqlc.narg('build_model_id'), sqlc.narg('build_effort'), sqlc.narg('parent_session_id'), COALESCE(sqlc.narg('spawn_depth'), 0), sqlc.narg('epistemic_check_enabled'))
+--
+-- create_idempotency_key/create_request_sha256 (§43.8, migrations/000150)
+-- are sqlc.narg too: NULL for every caller that sends no key, which is every
+-- caller but POST /api/sessions with an idempotencyKey. They are written
+-- together or not at all (the table's own CHECK), and a second insert by
+-- the same creator with the same key fails with 23505 on
+-- sessions_create_idempotency_key_uniq.
+INSERT INTO sessions (title, spawn_source, created_by, repos, environment_id, provenance_tag, build_model_id, build_effort, parent_session_id, spawn_depth, epistemic_check_enabled, create_idempotency_key, create_request_sha256)
+VALUES ($1, $2, $3, COALESCE(sqlc.narg('repos'), '[]'::jsonb), sqlc.narg('environment_id'), sqlc.narg('provenance_tag'), sqlc.narg('build_model_id'), sqlc.narg('build_effort'), sqlc.narg('parent_session_id'), COALESCE(sqlc.narg('spawn_depth'), 0), sqlc.narg('epistemic_check_enabled'), sqlc.narg('create_idempotency_key'), sqlc.narg('create_request_sha256'))
 RETURNING *;
+
+-- name: GetSessionByCreateIdempotencyKey :one
+-- The session one user created with one idempotency key (§43.8,
+-- migrations/000150), for POST /api/sessions' replay check: at most one
+-- row, since (created_by, create_idempotency_key) is unique where the key is
+-- set. Read with no lock: a concurrent create with the same key is settled
+-- by the unique index, not by this read.
+SELECT * FROM sessions
+WHERE created_by = $1 AND create_idempotency_key = $2;
 
 -- name: GetSession :one
 SELECT * FROM sessions

@@ -101,7 +101,7 @@ export interface AutomationReposElem {
  */
 export interface CreateSessionRequest {
   /**
-   * A closed subset of Postgres session_spawn_source: the sources an ingress surface passes in this shape. POST /api/sessions accepts only 'web' and refuses any other value with 400. 'mcp' is never accepted here: the server sets it for a session created over MCP, never from a request. Session.spawnSource, an open enum, lists every value a session can carry.
+   * A closed subset of Postgres session_spawn_source: the sources an ingress surface passes in this shape. POST /api/sessions accepts only 'web' and refuses any other value with 400. 'mcp' is never accepted here: the server sets it for a session created over MCP, never from a request. The narvi_create_session MCP tool sends 'web' here because it is the one value this route accepts, not as a statement of where the request came from: the server records 'mcp' from the MCP grant the call carries. Session.spawnSource, an open enum, lists every value a session can carry.
    */
   spawnSource: 'web' | 'slack' | 'linear' | 'github';
   title: string | null;
@@ -149,6 +149,10 @@ export interface CreateSessionRequest {
    * Optional (§29.8), mirroring buildModelId's own optional-key convention exactly, one field over: the reasoning effort the eventual approval-dispatched IMPLEMENTATION turn should use, distinct from effort (which names the PLAN turn's own effort). Absent/null means 'use the default'. Stored as sessions.build_effort (migrations/000063_turn_session_effort.up.sql).
    */
   buildEffort?: string | null;
+  /**
+   * Optional (§43.8). A UUID the caller chooses for this one create request, so a retry cannot start a second session: 8-4-4-4-12 hexadecimal digits, in either case, both cases being one key; any other spelling is refused with 400. It is scoped to the authenticated user, one namespace across this route and the narvi_create_session MCP tool, and kept with the session it created (sessions.create_idempotency_key, migrations/000150). The same key sent again with the same request answers 200 with that session as it is now, and creates, audits and dispatches nothing. Requests are compared by what they ask for, not how their JSON is written: key order, whitespace, unknown fields, this key, and an optional field absent or given the value the route reads the same way (null, false, an empty list) make no difference. The same key with a different request is refused with 409, and so is a key whose session was started the other way (by this route when the call comes over MCP, or over MCP when it does not). Absent means no replay protection, exactly as before. The narvi_create_session MCP tool always sends one.
+   */
+  idempotencyKey?: string;
   /**
    * Optional ('builder epistemic pre-action check', §20.4), mirroring buildModelId's own optional-key convention exactly: this session's own override of the platform-wide default for the devil's-advocate pre-action check on its own (non-plan-mode) build turns. Absent/null means 'use platform.Config's own global default' (off, unless an operator has turned the default on) -- a non-null value always wins regardless of that default. Stored as sessions.epistemic_check_enabled (migrations/000066_builder_epistemic_check.up.sql). Session-scoped, not turn-scoped, exactly like buildModelId/buildEffort -- CreateTurnRequest does NOT carry this field.
    */
@@ -3258,6 +3262,81 @@ export interface GetSessionResultToolRequest {
    * The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).
    */
   sessionId: string;
+}
+/**
+ * The narvi_create_session MCP tool's own input (technical plan §43.8) -- the tool bridge's twin of POST /api/sessions. Self-contained: it references no other $def. The bridge copies these fields into a CreateSessionRequest and sends that DTO, never these arguments themselves. There is no spawnSource: the server records mcp for a session created over MCP, from the MCP grant the call carries, so a spawnSource argument is refused like any other unknown field. CreateSessionRequest's environment settings (pathScope, mockConfig, docker, egressPolicy, epistemicCheckEnabled) are not offered here. The answer is Session: 201 for a session this call started, 200 for a retry with the same idempotencyKey.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "CreateSessionToolRequest".
+ */
+export interface CreateSessionToolRequest {
+  /**
+   * The session's title. Omitted means none.
+   */
+  title?: string;
+  /**
+   * The first prompt. The session's first turn is queued with it at once.
+   */
+  prompt: string;
+  /**
+   * The repositories the session works on. Each must be one this deployment already knows, or the call is refused exactly as POST /api/sessions refuses it.
+   *
+   * @minItems 1
+   */
+  repos: [
+    {
+      /**
+       * The directory the repository is checked out under.
+       */
+      name: string;
+      /**
+       * The repository's clone URL, for example https://github.com/owner/repo.
+       */
+      url: string;
+      /**
+       * The branch to start from. Omitted means the repository's default branch.
+       */
+      branch?: string;
+    },
+    ...{
+      /**
+       * The directory the repository is checked out under.
+       */
+      name: string;
+      /**
+       * The repository's clone URL, for example https://github.com/owner/repo.
+       */
+      url: string;
+      /**
+       * The branch to start from. Omitted means the repository's default branch.
+       */
+      branch?: string;
+    }[]
+  ];
+  /**
+   * The model of the first turn, an id narvi_list_models lists. Omitted means the deployment's default.
+   */
+  modelId?: string;
+  /**
+   * The reasoning effort of the first turn, one of that model's variants in narvi_list_models. Omitted means the default.
+   */
+  effort?: string;
+  /**
+   * true: the first turn writes a plan and nothing is implemented until a person approves it. Omitted means false.
+   */
+  planMode?: boolean;
+  /**
+   * With planMode, the model the implementation uses once the plan is approved. Omitted means the default.
+   */
+  buildModelId?: string;
+  /**
+   * With planMode, the reasoning effort the implementation uses. Omitted means the default.
+   */
+  buildEffort?: string;
+  /**
+   * A new UUID for each session you mean to start, reused only to retry that same call. A retry with the same key and the same arguments returns the session the first call started and starts nothing; the same key with different arguments is refused, and so is a key the user already used to start a session another way.
+   */
+  idempotencyKey: string;
 }
 /**
  * GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's work is doing now, and how long to wait before reading it again. Derived at read time from the session's turn queue, a completed turn's push and pull request still under way, work the server holds that can create a turn on the session with no new input, and its human gates, all read in ONE database snapshot -- never from Session.status, which is re-derived only when a turn reaches a terminal state and so can hold any of its five values while a turn is queued or running. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read. With ?waitSeconds=N (a whole number of seconds; absent or 0 is the plain read, a negative or malformed value is a 400) the route waits, at most N seconds clamped to the deployment's maximum (25 as shipped), for the session to be settled, and answers the same shape with wait set: the snapshot it answers is its latest read.

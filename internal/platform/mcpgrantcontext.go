@@ -6,9 +6,13 @@
 // which tools the request may see. The REST twins a tool invokes authorize
 // from the AuthenticatedUser alone, exactly as for a cookie request, so a
 // grant can only ever SUBTRACT (hide tools), never add a permission the
-// user does not already hold. The one twin that reads it is the status
-// route's bounded wait (technical plan §43.20), and only its GrantID, as
-// the key its per-caller cap counts against -- never a permission.
+// user does not already hold. Where else it is read, never as a permission:
+// the status route's bounded wait (technical plan §43.20), whose per-caller
+// cap counts against its GrantID; the /mcp call brake and
+// narvi_create_session's brake, keyed by its GrantID (§43.6/§43.8); REST
+// session creation, which records spawn_source mcp exactly when a grant is
+// present (§43.1); and auditlog.Record, which stamps the GrantID and
+// ClientID on the audit row of a change made through it (§43.18).
 
 package platform
 

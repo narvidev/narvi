@@ -9,12 +9,14 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// TestOutcomeMapping is the table-driven test over technical plan
+// TestMapOutcome_Table is the table-driven test over technical plan
 // §43.8's mapping table (doc.go's own reproduction of it), driven by a
 // stub handler writing each status this test names -- TestParity_*
 // (integration_test.go) additionally proves the SAME mapping holds for
-// the REAL httpapi handlers, not just this synthetic table.
-func TestOutcomeMapping(t *testing.T) {
+// the REAL httpapi handlers, not just this synthetic table. 201 and 202
+// are successes like 200: POST /api/sessions answers 201, and a create
+// over MCP must not answer -32603.
+func TestMapOutcome_Table(t *testing.T) {
 	tests := []struct {
 		name           string
 		status         int
@@ -30,6 +32,20 @@ func TestOutcomeMapping(t *testing.T) {
 			status:         http.StatusOK,
 			body:           `{"id":"abc","title":"hello"}`,
 			wantText:       `{"id":"abc","title":"hello"}`,
+			wantStructured: true,
+		},
+		{
+			name:           "201 (created) is a success carrying the body verbatim",
+			status:         http.StatusCreated,
+			body:           `{"id":"abc","spawnSource":"mcp"}`,
+			wantText:       `{"id":"abc","spawnSource":"mcp"}`,
+			wantStructured: true,
+		},
+		{
+			name:           "202 (accepted) is a success carrying the body verbatim",
+			status:         http.StatusAccepted,
+			body:           `{"sessionId":"abc"}`,
+			wantText:       `{"sessionId":"abc"}`,
 			wantStructured: true,
 		},
 		{
@@ -138,15 +154,15 @@ func TestOutcomeMapping(t *testing.T) {
 				t.Errorf("Content[0].Text = %q, want %q", text.Text, tt.wantText)
 			}
 
-			wantIsError := tt.status != http.StatusOK
-			if result.IsError != wantIsError {
-				t.Errorf("IsError = %v, want %v", result.IsError, wantIsError)
+			success := tt.status == http.StatusOK || tt.status == http.StatusCreated || tt.status == http.StatusAccepted
+			if result.IsError == success {
+				t.Errorf("IsError = %v, want %v", result.IsError, !success)
 			}
-			if wantIsError && result.StructuredContent != nil {
+			if !success && result.StructuredContent != nil {
 				t.Errorf("StructuredContent = %v, want nil on an isError result", result.StructuredContent)
 			}
-			if tt.status == http.StatusOK && result.StructuredContent == nil {
-				t.Error("StructuredContent = nil, want the decoded body on a 200")
+			if success && result.StructuredContent == nil {
+				t.Errorf("StructuredContent = nil, want the body on a %d", tt.status)
 			}
 		})
 	}

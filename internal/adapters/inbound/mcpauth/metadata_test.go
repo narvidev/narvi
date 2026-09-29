@@ -46,27 +46,29 @@ func TestMetadata_CacheLifetimeComesFromTimeouts(t *testing.T) {
 }
 
 // TestMetadata_Documents pins both discovery documents field by field
-// (technical plan §43.14): what they advertise -- the refresh-token grant
-// and the RFC 7009 revocation endpoint included -- and, as importantly,
-// what they must not (a jwks_uri, mcp:write, and -- with both
-// client-registration mechanisms off, as here -- no registration endpoint
-// and no client ID metadata document support;
-// TestMetadata_ClientRegistrationAdvertisedOnlyWhenOn covers them on).
+// (technical plan §43.14): what they advertise -- the refresh-token grant,
+// the RFC 7009 revocation endpoint, and this build's scopes, mcp:read and
+// mcp:write in canonical order -- and, as importantly, what they must not
+// (a jwks_uri, and -- with both client-registration mechanisms off, as
+// here -- no registration endpoint and no client ID metadata document
+// support; TestMetadata_ClientRegistrationAdvertisedOnlyWhenOn covers them
+// on). A scope is listed only because the server was configured to offer
+// it: TestMetadata_ScopeLessBuildAdvertisesEmptyArray covers none.
 func TestMetadata_Documents(t *testing.T) {
 	t.Parallel()
 
-	s := newUnitServer(t, "https://narvi.example", []mcpscope.Scope{mcpscope.Read})
+	s := newUnitServer(t, "https://narvi.example", []mcpscope.Scope{mcpscope.Read, mcpscope.Write})
 
 	prm := httptest.NewRecorder()
 	s.ProtectedResourceMetadata(prm, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-protected-resource/mcp", nil))
-	const wantPRM = `{"resource":"https://narvi.example/mcp","authorization_servers":["https://narvi.example/oauth"],"scopes_supported":["mcp:read"],"bearer_methods_supported":["header"],"resource_name":"Narvi MCP"}`
+	const wantPRM = `{"resource":"https://narvi.example/mcp","authorization_servers":["https://narvi.example/oauth"],"scopes_supported":["mcp:read","mcp:write"],"bearer_methods_supported":["header"],"resource_name":"Narvi MCP"}`
 	if got := prm.Body.String(); got != wantPRM {
 		t.Errorf("protected resource metadata =\n %s\nwant\n %s", got, wantPRM)
 	}
 
 	asm := httptest.NewRecorder()
 	s.AuthorizationServerMetadata(asm, httptest.NewRequest(http.MethodGet, "/.well-known/oauth-authorization-server/oauth", nil))
-	const wantASM = `{"issuer":"https://narvi.example/oauth","authorization_endpoint":"https://narvi.example/oauth/authorize","token_endpoint":"https://narvi.example/oauth/token","revocation_endpoint":"https://narvi.example/oauth/revoke","scopes_supported":["mcp:read"],"response_types_supported":["code"],"response_modes_supported":["query"],"grant_types_supported":["authorization_code","refresh_token"],"token_endpoint_auth_methods_supported":["none"],"revocation_endpoint_auth_methods_supported":["none"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true}`
+	const wantASM = `{"issuer":"https://narvi.example/oauth","authorization_endpoint":"https://narvi.example/oauth/authorize","token_endpoint":"https://narvi.example/oauth/token","revocation_endpoint":"https://narvi.example/oauth/revoke","scopes_supported":["mcp:read","mcp:write"],"response_types_supported":["code"],"response_modes_supported":["query"],"grant_types_supported":["authorization_code","refresh_token"],"token_endpoint_auth_methods_supported":["none"],"revocation_endpoint_auth_methods_supported":["none"],"code_challenge_methods_supported":["S256"],"authorization_response_iss_parameter_supported":true}`
 	if got := asm.Body.String(); got != wantASM {
 		t.Errorf("authorization server metadata =\n %s\nwant\n %s", got, wantASM)
 	}

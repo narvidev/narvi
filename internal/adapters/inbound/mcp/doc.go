@@ -1,6 +1,7 @@
 // Package mcp implements the MCP (Model Context Protocol) surface: the
-// entry point, transport, protocol-version gate, and its read-only tools
-// (technical plan §43, "the MCP surface").
+// entry point, transport, protocol-version gate, and its tools -- the
+// reads, and one write, narvi_create_session (technical plan §43, "the MCP
+// surface").
 //
 // # What this is, plainly
 //
@@ -20,9 +21,13 @@
 // or absence -- and its paginated transcript are here (§43.20, bridges
 // like the rest: the wait is the status twin with ?waitSeconds=, whose
 // blocking lives in the twin -- this package only builds the query -- and
-// the result's live freshness read lives in its twin too); the
-// plan/prompt/stop/delegate tools belong to later rows of the plan, and
-// none of that is here.
+// the result's live freshness read lives in its twin too). One tool writes:
+// narvi_create_session (§43.8), under mcp:write, bridged to POST
+// /api/sessions like the reads are bridged to their GETs -- that route
+// records spawn_source mcp from the grant on the context, stamps the grant
+// on its audit row, and replays a create under the same idempotencyKey;
+// this package only builds the request DTO and consults the per-grant
+// create brake (Config.CreateBrake) before the twin runs.
 //
 // # Registration (controlplane/serve.go)
 //
@@ -40,6 +45,7 @@
 //	    r.Use(mcp.RequireTrustedOrigin(...)) // 403 on a bad Origin, FIRST
 //	    r.Use(mcp.RequireEnabled(cfg.MCPEnabled)) // 503 when off, SECOND
 //	    r.Use(auth.RequireMCPBearer(grantStore, bearerCfg)) // bearer only, THIRD
+//	    r.Use(callBrake.LimitBy(mcpauth.GrantKey, mcpauth.MCPCallRateLimited)) // 429 per grant, FOURTH
 //	    r.Post("/", mcpHandler.ServeHTTP)
 //	})
 //
@@ -62,7 +68,9 @@
 // D9); only once the surface is known to be on does auth.RequireMCPBearer
 // run, producing the SAME generic 401 body every other route produces,
 // plus the WWW-Authenticate: Bearer challenge that tells a client where
-// to find the authorization server.
+// to find the authorization server. The per-grant brake (§43.6) runs
+// fourth, because its key is the grant that gate attaches: a grant past
+// its burst is answered 429 with Retry-After before its body is read.
 //
 // # The bridge: one authorization path, never a second (§43.7)
 //
@@ -103,10 +111,11 @@
 //
 // # HTTP outcome -> MCP outcome (outcome.go)
 //
-//   - 200                        -> a successful CallToolResult:
+//   - 200 / 201 / 202            -> a successful CallToolResult:
 //     Content[0].Text and StructuredContent are the REST body's own
 //     bytes, verbatim -- never re-encoded, so a caller sees byte-for-byte
-//     what the REST route would have written.
+//     what the REST route would have written. A write twin answers 201
+//     for what it created; a replayed create answers 200.
 //   - 400 / 403 / 404 / 409       -> a successful CallToolResult with
 //     IsError:true, Content[0].Text = the REST body's own "error" string,
 //     no StructuredContent. Per the MCP tools specification, an
@@ -135,8 +144,17 @@
 // # What is emphatically NOT here
 //
 // No repository discovery (needs a REST route this codebase does not
-// have yet, §43 D5). No plan/
-// delegate/prompt/stop tools (183). No OAuth endpoint of its own (the
+// have yet, §43 D5). No plan, prompt or stop tools yet: the plan
+// decisions, revisions, prompts and stop are later pieces of row 183, each
+// over its own REST twin, and stop has no twin to bridge to yet. No second
+// path for the one write there is: narvi_create_session's body is the
+// restdtos.CreateSessionRequest its BuildRequest builds, marshalled by
+// callTwin, never the raw arguments, and never with a header -- a GET twin
+// handed a body is refused as a defect. No brake of its own on /mcp as a
+// whole: that one is mcpauth's, mounted after the bearer gate in
+// controlplane, which this package may not import (mcpimportban) -- it
+// names the one method of it narvi_create_session needs (CreateBrake). No
+// OAuth endpoint of its own (the
 // authorization server is internal/adapters/inbound/mcpauth; this package
 // only reads the grant auth.RequireMCPBearer attached). No resources, no
 // prompts, no logging capability -- capabilities advertise {"tools":{}}

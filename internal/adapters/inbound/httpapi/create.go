@@ -125,6 +125,24 @@ type ChildSessionOptions struct {
 	// CreateTurnOptions.ReviewVerdictContext's own doc comment (turn.go)
 	// for the full "why".
 	ReviewVerdictContext []byte
+
+	// SpawnSource (§43.1) is the source the session records when it is not
+	// the request's own: the zero value records req.SpawnSource, as every
+	// caller did before. POST /api/sessions alone sets it, to
+	// recordedSpawnSource(ctx) -- mcp for a call bridged from an MCP tool,
+	// whose body says web because that is the one value the route accepts.
+	// The rollout and entitlement gates label their refusals with the same
+	// value.
+	SpawnSource sqlcgen.SessionSpawnSource
+}
+
+// spawnSourceFor is the source a create records and labels its refusals
+// with: opts.SpawnSource when set, req.SpawnSource otherwise.
+func (opts ChildSessionOptions) spawnSourceFor(req restdtos.CreateSessionRequest) sqlcgen.SessionSpawnSource {
+	if opts.SpawnSource != "" {
+		return opts.SpawnSource
+	}
+	return sqlcgen.SessionSpawnSource(req.SpawnSource)
 }
 
 // childSessionOptionsFrom returns opts[0] if the caller supplied one, or
@@ -352,6 +370,35 @@ func CreateSession(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *p
 			return
 		}
 
+		// §43.1: the source this session records is decided here, from the
+		// request's context, never from its body -- mcp exactly when an MCP
+		// tool call bridged here, web otherwise (recordedSpawnSource).
+		source := recordedSpawnSource(ctx)
+
+		// §43.8: a create carrying an idempotencyKey this user has already
+		// used is a replay, answered from the session that key created when
+		// that session records source too (replayCreate) -- looked up only
+		// now, after authorization above, so a key is never a way to read a
+		// session its holder could not create.
+		key, kerr := parseIdempotencyKey(req)
+		if kerr != nil {
+			writeError(w, http.StatusBadRequest, kerr.Error())
+			return
+		}
+		var requestSHA256 []byte
+		if key.Valid {
+			sum, herr := createRequestSHA256(req)
+			if herr != nil {
+				platform.Logger(ctx).Error("httpapi: hash create-session request failed", "error", herr)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
+			requestSHA256 = sum
+			if replayCreate(w, r, sessions, createdBy, key, source, requestSHA256) {
+				return
+			}
+		}
+
 		// rolloutMode/repoSettings (§32): a 403 with an explicit
 		// "repository not enrolled" message (checkRolloutGate's own
 		// Message) is exactly what the generic writeError(w, cerr.Status,
@@ -362,8 +409,16 @@ func CreateSession(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *p
 		// outbox), which route an ordinary error down a retry path that
 		// must be bypassed for a permanent policy refusal (see each of
 		// those call sites' own doc comments).
-		created, cerr := CreateSessionCore(ctx, pool, sessions, turns, environments, auditLog, registry, req, createdBy, epistemicCheckDefault, rolloutMode, repoSettings, prSessions)
+		created, cerr := CreateSessionCore(ctx, pool, sessions, turns, environments, auditLog, registry, req, createdBy, epistemicCheckDefault, rolloutMode, repoSettings, prSessions, ChildSessionOptions{SpawnSource: source})
 		if cerr != nil {
+			// A concurrent create with the same key committed first: this
+			// one's insert waited on the unique index, failed, and rolled
+			// back. The winner is committed now, so it is read and answered
+			// like any replay, its source compared too -- one session
+			// either way.
+			if cerr.IdempotencyConflict && replayCreate(w, r, sessions, createdBy, key, source, requestSHA256) {
+				return
+			}
 			writeError(w, cerr.Status, cerr.Message)
 			return
 		}
@@ -393,8 +448,11 @@ func CreateSession(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *p
 		// CreateSessionCore was ever called) -- so the "session's own
 		// sessions.spawn_source column below" concern this comment used to
 		// flag as separate and untouched is now closed too, by that same
-		// fix.
-		recordExplicitIntentDecision(ctx, intentSvc, created.ID, "web", req.PlanMode)
+		// fix. §43.1 update: the surface is now the source the session
+		// recorded, which this handler decided from the request's context
+		// (recordedSpawnSource) -- still never the body's own claim, and
+		// never anything but web or mcp here.
+		recordExplicitIntentDecision(ctx, intentSvc, created.ID, string(created.SpawnSource), req.PlanMode)
 
 		writeJSON(w, http.StatusCreated, sessionToDTO(created))
 	}
@@ -445,6 +503,13 @@ type CreateSessionError struct {
 	// own doc comment for the full fail-closed-vs-terminal split this
 	// field depends on.
 	RepoEntitlementDenied bool
+
+	// IdempotencyConflict (§43.8) is true iff the session insert failed on
+	// migrations/000150's unique (created_by, create_idempotency_key) index:
+	// a concurrent create by the same user with the same key committed
+	// first. POST /api/sessions answers it by reading that session back
+	// (replayCreate); no other caller sends a key.
+	IdempotencyConflict bool
 }
 
 func (e *CreateSessionError) Error() string { return e.Message }
@@ -481,6 +546,13 @@ type validatedCreateSessionInput struct {
 	// hasEgressPolicy == false case.
 	egressPolicy    environment.EgressPolicy
 	hasEgressPolicy bool
+
+	// idempotencyKey/requestSHA256 (§43.8, migrations/000150): the request's
+	// own key, parsed, and the hash a replay of it is compared by --
+	// idempotencyKey.Valid false and requestSHA256 nil when the request
+	// carries no key.
+	idempotencyKey pgtype.UUID
+	requestSHA256  []byte
 }
 
 // validateCreateSessionRequest performs every check CreateSession's own
@@ -602,6 +674,22 @@ func validateCreateSessionRequest(req restdtos.CreateSessionRequest) (validatedC
 		}
 	}
 
+	// idempotencyKey (§43.8) is optional; when present it must be a UUID
+	// (the REST decode does not check format:uuid) and its request hash is
+	// stored with it.
+	idempotencyKey, kerr := parseIdempotencyKey(req)
+	if kerr != nil {
+		return validatedCreateSessionInput{}, &CreateSessionError{Status: http.StatusBadRequest, Message: kerr.Error()}
+	}
+	var requestSHA256 []byte
+	if idempotencyKey.Valid {
+		sum, herr := createRequestSHA256(req)
+		if herr != nil {
+			return validatedCreateSessionInput{}, &CreateSessionError{Status: http.StatusInternalServerError, Message: "internal error"}
+		}
+		requestSHA256 = sum
+	}
+
 	return validatedCreateSessionInput{
 		reposJSON:       reposJSON,
 		pathScope:       pathScope,
@@ -612,6 +700,8 @@ func validateCreateSessionRequest(req restdtos.CreateSessionRequest) (validatedC
 		hasDocker:       hasDocker,
 		egressPolicy:    egressPolicy,
 		hasEgressPolicy: hasEgressPolicy,
+		idempotencyKey:  idempotencyKey,
+		requestSHA256:   requestSHA256,
 	}, nil
 }
 
@@ -831,7 +921,8 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 	// for the full "why here" reasoning, including the no-op short-circuit
 	// that keeps this a zero-cost no-op for every deployment that has
 	// never set NARVI_ROLLOUT_MODE=cohort.
-	if gerr := checkRolloutGate(ctx, tx, repoSettings, rolloutMode, req); gerr != nil {
+	source := opts.spawnSourceFor(req)
+	if gerr := checkRolloutGate(ctx, tx, repoSettings, rolloutMode, req, string(source)); gerr != nil {
 		return sqlcgen.Session{}, false, gerr
 	}
 
@@ -925,8 +1016,11 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 	}
 
 	created, err := sessions.WithTx(tx).Create(ctx, sqlcgen.CreateSessionParams{
-		Title:         (*string)(req.Title),
-		SpawnSource:   sqlcgen.SessionSpawnSource(req.SpawnSource),
+		Title: (*string)(req.Title),
+		// §43.1: the source this create records -- opts.SpawnSource when
+		// the caller decided it (POST /api/sessions, mcp for a bridged MCP
+		// call), the request's own otherwise.
+		SpawnSource:   source,
 		CreatedBy:     createdBy,
 		Repos:         reposJSON,
 		EnvironmentID: environmentID,
@@ -951,8 +1045,18 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 		// -- consulted later by turn.ResolveEpistemicCheckEnabled
 		// (createTurnLocked, turn.go), never re-derived here.
 		EpistemicCheckEnabled: (*bool)(req.EpistemicCheckEnabled),
+		// §43.8 (migrations/000150): the request's idempotency key and its
+		// hash, both NULL when it carries none.
+		CreateIdempotencyKey: validated.idempotencyKey,
+		CreateRequestSha256:  validated.requestSHA256,
 	})
 	if err != nil {
+		if isCreateIdempotencyConflict(err) {
+			// Expected under concurrency, not a defect: the caller reads
+			// the winner back (CreateSessionError.IdempotencyConflict).
+			logger.Info("httpapi: create session lost an idempotency-key race", "created_by", createdBy)
+			return sqlcgen.Session{}, false, &CreateSessionError{Status: http.StatusConflict, Message: "idempotencyKey is being used by a concurrent request", IdempotencyConflict: true}
+		}
 		logger.Error("httpapi: create session failed", "error", err)
 		return sqlcgen.Session{}, false, &CreateSessionError{Status: http.StatusInternalServerError, Message: "internal error"}
 	}
@@ -1086,8 +1190,13 @@ func TriggerDispatch(ctx context.Context, registry *sessionactor.Registry, sessi
 // function's own doc comment (repoentitlementgate.go) for why all three
 // remain required, not optional, and why entitlement resolution
 // specifically must happen here, this early.
-func CreateSessionCore(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, environments *postgres.EnvironmentStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, req restdtos.CreateSessionRequest, createdBy pgtype.UUID, epistemicCheckDefault bool, rolloutMode platform.RolloutMode, repoSettings *postgres.RepoSettingsStore, prSessions *postgres.GitHubPRSessionStore) (sqlcgen.Session, *CreateSessionError) {
+//
+// opts (§43.1) is CreateSessionOnTx's own options, passed straight through:
+// POST /api/sessions sets SpawnSource there, which also labels the
+// entitlement gate's refusals below. Every other caller passes none.
+func CreateSessionCore(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, environments *postgres.EnvironmentStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, req restdtos.CreateSessionRequest, createdBy pgtype.UUID, epistemicCheckDefault bool, rolloutMode platform.RolloutMode, repoSettings *postgres.RepoSettingsStore, prSessions *postgres.GitHubPRSessionStore, opts ...ChildSessionOptions) (sqlcgen.Session, *CreateSessionError) {
 	logger := platform.Logger(ctx)
+	options := childSessionOptionsFrom(opts)
 
 	// Validate BEFORE ever acquiring a pooled connection -- see
 	// validateCreateSessionRequest's own doc comment. A request that
@@ -1119,7 +1228,7 @@ func CreateSessionCore(ctx context.Context, pool *pgxpool.Pool, sessions *postgr
 	// for why this must run strictly BEFORE pool.Begin below, never inside
 	// the transaction it opens. A denial returns here directly, often
 	// without this function ever acquiring a pooled connection at all.
-	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, createdBy, req)
+	entitlement, everr := resolveRepoEntitlement(ctx, prSessions, auditLog, createdBy, req, string(options.spawnSourceFor(req)))
 	if everr != nil {
 		return sqlcgen.Session{}, everr
 	}
@@ -1135,7 +1244,7 @@ func CreateSessionCore(ctx context.Context, pool *pgxpool.Pool, sessions *postgr
 	// own transact.
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, createdBy, epistemicCheckDefault, rolloutMode, repoSettings, entitlement)
+	created, hasPrompt, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, createdBy, epistemicCheckDefault, rolloutMode, repoSettings, entitlement, options)
 	if cerr != nil {
 		return sqlcgen.Session{}, cerr
 	}

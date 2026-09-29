@@ -51,12 +51,14 @@ func listToolNames(t *testing.T, handler http.Handler) []string {
 // omits what it cannot call" exit criterion at the unit level, driven
 // through the real NewHandler: each grant sees exactly the tools its
 // scopes satisfy -- none for a scope-less, unknown-scope or missing grant,
-// every one for mcp:read, and every one for mcp:write (which implies
-// mcp:read). Row 182's status, wait, result and transcript tools are
+// the read tools only for mcp:read, and every tool for mcp:write (which
+// implies mcp:read). Row 182's status, wait, result and transcript tools are
 // mcp:read like the rest: a grant without it is told none of them exists
-// (technical plan §43.20).
+// (technical plan §43.20); narvi_create_session is mcp:write, so a
+// read-only grant is told it does not exist (§43.17).
 func TestToolsList_ScopeFilter_Table(t *testing.T) {
-	all := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
+	reads := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
+	all := append([]string{"narvi_create_session"}, reads...)
 	tests := []struct {
 		name   string
 		scopes *[]string
@@ -66,9 +68,10 @@ func TestToolsList_ScopeFilter_Table(t *testing.T) {
 		{"unknown scope only", scopes("mcp:admin"), []string{}},
 		{"empty scope string", scopes(""), []string{}},
 		{"no grant at all (defect)", nil, []string{}},
-		{"mcp:read", scopes("mcp:read"), all},
+		{"mcp:read sees the reads only", scopes("mcp:read"), reads},
 		{"mcp:write implies mcp:read", scopes("mcp:write"), all},
 		{"both", scopes("mcp:read", "mcp:write"), all},
+		{"an unknown scope beside mcp:read adds nothing", scopes("mcp:read", "mcp:admin"), reads},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -103,18 +106,33 @@ func discoverInstructions(t *testing.T, grant *[]string) string {
 
 // TestInstructions_NameOnlyVisibleTools: the instructions paragraph is a
 // description of the deployment too, so it names exactly the visible
-// tools -- none for a scope-less or missing grant.
+// tools -- none for a scope-less or missing grant, the reads alone for a
+// read-only grant -- and it calls the tools read-only exactly when no write
+// tool is visible: never beside narvi_create_session.
 func TestInstructions_NameOnlyVisibleTools(t *testing.T) {
 	for name, grant := range map[string]*[]string{"scope-less": scopes(), "no grant": nil, "unknown scope": scopes("mcp:admin")} {
 		if got := discoverInstructions(t, grant); strings.Contains(got, "narvi_") {
 			t.Errorf("%s grant: instructions %q name a tool", name, got)
 		}
 	}
-	full := discoverInstructions(t, scopes("mcp:read"))
+	readOnly := discoverInstructions(t, scopes("mcp:read"))
+	full := discoverInstructions(t, scopes("mcp:read", "mcp:write"))
 	for _, spec := range toolSpecs(Twins{}) {
 		if !strings.Contains(full, spec.Name) {
 			t.Errorf("full grant: instructions %q do not name %s", full, spec.Name)
 		}
+		if got := strings.Contains(readOnly, spec.Name); got != (spec.Scope == mcpscope.Read) {
+			t.Errorf("read-only grant: instructions name %s = %v, want %v: %q", spec.Name, got, spec.Scope == mcpscope.Read, readOnly)
+		}
+	}
+	if !strings.Contains(readOnly, "READ-ONLY") || !strings.Contains(readOnly, "None of these tools writes anything.") {
+		t.Errorf("read-only grant: instructions %q do not say the tools only read", readOnly)
+	}
+	if strings.Contains(full, "READ-ONLY") || strings.Contains(full, "None of these tools writes anything") {
+		t.Errorf("full grant: instructions %q call the tools read-only beside narvi_create_session", full)
+	}
+	if !strings.Contains(full, "can run code in their repositories and spend on models: narvi_create_session") {
+		t.Errorf("full grant: instructions %q do not say what the write tool can do", full)
 	}
 }
 
@@ -141,11 +159,33 @@ func TestInstructionsFor_Composition(t *testing.T) {
 	if three != want {
 		t.Errorf("instructionsFor(three) =\n %q\nwant\n %q", three, want)
 	}
-	all := instructionsFor(specs)
+	reads := specs[:7]
+	for _, spec := range reads {
+		if spec.Scope != mcpscope.Read {
+			t.Fatalf("specs[:7] holds %s, which is not a read -- this test assumes the reads come first", spec.Name)
+		}
+	}
+	allReads := instructionsFor(reads)
 	want = "This server exposes seven READ-ONLY tools over this deployment's session data: " +
 		specs[0].Instruction + ", " + specs[1].Instruction + ", " + specs[2].Instruction + ", " + specs[3].Instruction + ", " + specs[4].Instruction + ", " + specs[5].Instruction + ", and " + specs[6].Instruction + ". None of these tools writes anything."
+	if allReads != want {
+		t.Errorf("instructionsFor(the reads) =\n %q\nwant\n %q", allReads, want)
+	}
+
+	// With the write tool visible, the paragraph names the reads and the
+	// write apart and never says read-only.
+	all := instructionsFor(specs)
+	want = "This server exposes eight tools over this deployment's session data. Seven only read and change nothing: " +
+		specs[0].Instruction + ", " + specs[1].Instruction + ", " + specs[2].Instruction + ", " + specs[3].Instruction + ", " + specs[4].Instruction + ", " + specs[5].Instruction + ", and " + specs[6].Instruction +
+		". One acts as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " + specs[7].Instruction + "."
 	if all != want {
 		t.Errorf("instructionsFor(all) =\n %q\nwant\n %q", all, want)
+	}
+	oneEach := instructionsFor([]toolSpec{specs[0], specs[7]})
+	want = "This server exposes two tools over this deployment's session data. One only reads and changes nothing: " + specs[0].Instruction +
+		". One acts as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " + specs[7].Instruction + "."
+	if oneEach != want {
+		t.Errorf("instructionsFor(one read, one write) =\n %q\nwant\n %q", oneEach, want)
 	}
 }
 
@@ -163,6 +203,29 @@ func TestHiddenToolCall_IsIndistinguishableFromUnknownTool(t *testing.T) {
 	}
 	const unknown = "narvi_does_not_exist"
 	unknownStatus, unknownBody := call(scopes("mcp:read"), unknown)
+
+	// The write tool under a read-only grant (technical plan §43.17): a
+	// grant that may read but not write is told narvi_create_session does
+	// not exist, in exactly an unknown tool's bytes -- never a 403 or an
+	// insufficient_scope that would confirm it is there. A write is picked
+	// by what its twin does (any method but GET), never by the scope it
+	// declares, so a write declared under mcp:read is caught here too.
+	writes := 0
+	for _, spec := range toolSpecs(Twins{}) {
+		if spec.Twin.method == http.MethodGet {
+			continue
+		}
+		writes++
+		t.Run(spec.Name+" under mcp:read", func(t *testing.T) {
+			hiddenStatus, hiddenBody := call(scopes("mcp:read"), spec.Name)
+			if want := strings.ReplaceAll(unknownBody, unknown, spec.Name); hiddenStatus != unknownStatus || hiddenBody != want {
+				t.Fatalf("write tool under a read grant differs from an unknown tool:\n hidden:  %d %s\n unknown: %d %s", hiddenStatus, hiddenBody, unknownStatus, want)
+			}
+		})
+	}
+	if writes == 0 {
+		t.Fatal("no tool in the table writes -- the read-grant rows above prove nothing without one")
+	}
 
 	// Every tool in the table, row 182's status, wait, result and transcript
 	// tools included: each is hidden from a scope-less grant exactly as a
@@ -228,13 +291,14 @@ func TestBridge_NoAuthorizationHeaderReachesTwin(t *testing.T) {
 }
 
 // TestAdvertisedScopes: exactly the scopes the tool table requires --
-// mcp:read only, mcp:write declared but never offered while no tool
-// requires it.
+// mcp:read for the reads and, since narvi_create_session requires it,
+// mcp:write, in canonical order. The authorization server offers this one
+// list and the 401 challenge names it (controlplane).
 func TestAdvertisedScopes(t *testing.T) {
 	t.Parallel()
 
-	if got := AdvertisedScopes(); !reflect.DeepEqual(got, []mcpscope.Scope{mcpscope.Read}) {
-		t.Fatalf("AdvertisedScopes() = %v, want [mcp:read]", got)
+	if got := AdvertisedScopes(); !reflect.DeepEqual(got, []mcpscope.Scope{mcpscope.Read, mcpscope.Write}) {
+		t.Fatalf("AdvertisedScopes() = %v, want [mcp:read mcp:write]", got)
 	}
 }
 

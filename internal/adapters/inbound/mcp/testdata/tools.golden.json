@@ -1561,5 +1561,249 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object"
     }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Start a new session as the user who approved this client -- the same as POST /api/sessions, with the same checks: that user's own role (a viewer may not start one), and every repository must be one this deployment knows. The session clones the repositories and runs a first turn with prompt at once: this runs code in those repositories and spends on models. With planMode true, the first turn writes a plan and nothing is implemented until a person approves it. idempotencyKey is required: a new UUID for each session you mean to start, and the same one only to retry this call -- a retry with the same key and the same arguments returns the session the first call started and starts nothing; the same key with different arguments is refused, and so is a key the user already used to start a session another way. Returns the Session, whose spawnSource is mcp; follow it with narvi_wait_for_session or narvi_get_session_status. One authorization may call this tool 5 times at once, then once a minute (as shipped), and a retry counts as a call: past that the call is refused, starts nothing and says how many seconds to wait. After that wait, a retry with the same key and the same arguments returns the session an earlier call with that key started, if one did.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_create_session MCP tool's own input (technical plan §43.8) -- the tool bridge's twin of POST /api/sessions. Self-contained: it references no other $def. The bridge copies these fields into a CreateSessionRequest and sends that DTO, never these arguments themselves. There is no spawnSource: the server records mcp for a session created over MCP, from the MCP grant the call carries, so a spawnSource argument is refused like any other unknown field. CreateSessionRequest's environment settings (pathScope, mockConfig, docker, egressPolicy, epistemicCheckEnabled) are not offered here. The answer is Session: 201 for a session this call started, 200 for a retry with the same idempotencyKey.",
+      "properties": {
+        "buildEffort": {
+          "description": "With planMode, the reasoning effort the implementation uses. Omitted means the default.",
+          "type": "string"
+        },
+        "buildModelId": {
+          "description": "With planMode, the model the implementation uses once the plan is approved. Omitted means the default.",
+          "type": "string"
+        },
+        "effort": {
+          "description": "The reasoning effort of the first turn, one of that model's variants in narvi_list_models. Omitted means the default.",
+          "type": "string"
+        },
+        "idempotencyKey": {
+          "description": "A new UUID for each session you mean to start, reused only to retry that same call. A retry with the same key and the same arguments returns the session the first call started and starts nothing; the same key with different arguments is refused, and so is a key the user already used to start a session another way.",
+          "format": "uuid",
+          "type": "string"
+        },
+        "modelId": {
+          "description": "The model of the first turn, an id narvi_list_models lists. Omitted means the deployment's default.",
+          "type": "string"
+        },
+        "planMode": {
+          "default": false,
+          "description": "true: the first turn writes a plan and nothing is implemented until a person approves it. Omitted means false.",
+          "type": "boolean"
+        },
+        "prompt": {
+          "description": "The first prompt. The session's first turn is queued with it at once.",
+          "minLength": 1,
+          "type": "string"
+        },
+        "repos": {
+          "description": "The repositories the session works on. Each must be one this deployment already knows, or the call is refused exactly as POST /api/sessions refuses it.",
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "branch": {
+                "description": "The branch to start from. Omitted means the repository's default branch.",
+                "type": "string"
+              },
+              "name": {
+                "description": "The directory the repository is checked out under.",
+                "type": "string"
+              },
+              "url": {
+                "description": "The repository's clone URL, for example https://github.com/owner/repo.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "name",
+              "url"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "title": {
+          "description": "The session's title. Omitted means none.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "prompt",
+        "repos",
+        "idempotencyKey"
+      ],
+      "type": "object"
+    },
+    "name": "narvi_create_session",
+    "outputSchema": {
+      "$defs": {
+        "AutomationReposElem": {
+          "additionalProperties": false,
+          "description": "Same shape as CreateSessionRequest's own inline repos item (name/url/branch) -- a REAL top-level $def here (unlike CreateSessionRequest.repos' own inline item schema, which go-jsonschema cannot be $ref'd across sibling $defs) so Automation/CreateAutomationRequest can both reference it directly.",
+          "properties": {
+            "branch": {
+              "description": "Null means create runs from the repo's default base branch.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "type": "string"
+            },
+            "url": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "url",
+            "branch"
+          ],
+          "type": "object"
+        },
+        "Session": {
+          "additionalProperties": false,
+          "description": "Mirrors the sessions table (migrations/000004_sessions.up.sql). status/failureReason/spawnSource enums match session_status/session_failure_reason/session_spawn_source exactly. repos/sandboxStatus (§12.2 item 1's own GET /api/sessions list endpoint) are two additions to a DTO that otherwise predates them. buildModelId/buildEffort (§12.2 item 3, the plan-mode UI) are a THIRD, read-only addition: sessions.build_model_id/build_effort (migrations/000034_plan_mode.up.sql, 000063_turn_session_effort.up.sql) were write-only via CreateSessionRequest before this -- set once at session-creation time (meaningful only when planMode was true) and never surfaced back on any GET response, which left the plan-mode view (§12.2 item 3's own \"plan-model vs build-model split visible in header\") with no way to ever read back what CreateSessionRequest.buildModelId/buildEffort had written. This is the exact same shape as createdBy/repos above: an addition to a DTO that predates it, sourced from a column that already existed.",
+          "properties": {
+            "archived": {
+              "type": "boolean"
+            },
+            "buildEffort": {
+              "description": "The reasoning effort the approval-dispatched IMPLEMENTATION turn uses (or used), mirroring buildModelId immediately above and CreateSessionRequest.buildEffort's own doc comment.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "buildModelId": {
+              "description": "The model the approval-dispatched IMPLEMENTATION turn uses (or used), mirroring CreateSessionRequest.buildModelId's own doc comment exactly -- set once at session-creation time, meaningful only when this session was created with planMode true. Null means either 'use the default model catalog entry' or 'this session was never created under plan mode' -- the two are indistinguishable from this column alone, exactly like modelId's own existing null-means-default convention offers no way to distinguish 'explicit default' from 'never set' either.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "createdAt": {
+              "format": "date-time",
+              "type": "string"
+            },
+            "createdBy": {
+              "description": "Null for bot/automation-created sessions with no direct human user.",
+              "format": "uuid",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "failureReason": {
+              "description": "Matches Postgres session_failure_reason exactly. Null except on a terminal non-completed path.",
+              "enum": [
+                "cancelled",
+                "failed",
+                "timeout",
+                "never_started",
+                null
+              ],
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "id": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "repos": {
+              "description": "This session's own repo list (sessions.repos, migrations/000018_session_repos.up.sql -- \"position 0 = primary; repos are always a list\"), set once at session-creation time and never mutated afterward. Same shape as AutomationReposElem/CreateSessionRequest.repos' own inline item -- reused here rather than a third near-identical inline copy.",
+              "items": {
+                "$ref": "#/$defs/AutomationReposElem"
+              },
+              "type": "array"
+            },
+            "sandboxStatus": {
+              "description": "Matches Postgres sandbox_status exactly (migrations/000006_sandboxes.up.sql). Null when this session has no sandbox row yet (e.g. status='created', never dispatched). Populated by GET /api/sessions (list) only, sourced from a LEFT JOIN against sandboxes -- GET /api/sessions/{id} always returns null here: the single-session view derives its own live boot/ready state from its own event stream instead (§6.1's typed events already carry 'ready'/'boot_progress' verbatim), never from a second, potentially-stale read of this column.",
+              "enum": [
+                "pending",
+                "spawning",
+                "connecting",
+                "booting",
+                "ready",
+                "snapshotting",
+                "suspect",
+                "stopped",
+                "failed",
+                null
+              ],
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "spawnSource": {
+              "description": "Matches Postgres session_spawn_source exactly. An OPEN enum (manifest.json's openEnums): a consumer MUST tolerate a value it does not recognise.",
+              "examples": [
+                "web",
+                "slack",
+                "linear",
+                "github",
+                "mcp"
+              ],
+              "type": "string"
+            },
+            "status": {
+              "description": "Matches Postgres session_status exactly: derived each time a turn reaches a terminal state -- 'created' until one has, 'active' when another turn was still queued or running at that moment, otherwise that turn's outcome: 'completed', 'failed' or 'cancelled'. It is not re-derived when a turn is queued or dispatched, so it does not show queued or running work, and a queued or running turn can sit under any of the five values: a first turn runs its whole life under 'created', and a follow-up under whatever the last derivation left. What the session is doing now is SessionActivity.activity, GET /api/sessions/{sessionID}/status.",
+              "examples": [
+                "created",
+                "active",
+                "completed",
+                "failed",
+                "cancelled"
+              ],
+              "type": "string"
+            },
+            "title": {
+              "description": "Null until the session_title WS event (§6.1) sets it.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "updatedAt": {
+              "format": "date-time",
+              "type": "string"
+            }
+          },
+          "required": [
+            "id",
+            "title",
+            "status",
+            "failureReason",
+            "archived",
+            "spawnSource",
+            "createdBy",
+            "createdAt",
+            "updatedAt",
+            "repos",
+            "sandboxStatus",
+            "buildModelId",
+            "buildEffort"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/Session",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
   }
 ]

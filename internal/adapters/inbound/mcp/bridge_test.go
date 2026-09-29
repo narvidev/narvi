@@ -26,7 +26,7 @@ func TestCallTwin_URLParamsAndQueryPropagate(t *testing.T) {
 
 	tw := twin{method: http.MethodGet, pathTemplate: "/api/sessions/{sessionID}", handler: stub}
 	query := url.Values{"filter": []string{"all"}}
-	status, body := callTwin(context.Background(), tw, map[string]string{"sessionID": "abc-123"}, query)
+	status, body := callTwin(context.Background(), tw, twinCall{URLParams: map[string]string{"sessionID": "abc-123"}, Query: query})
 
 	if gotSessionID != "abc-123" {
 		t.Errorf("chi.URLParam(sessionID) = %q, want %q", gotSessionID, "abc-123")
@@ -61,7 +61,7 @@ func TestCallTwin_ContextCarriesAuthenticatedUser(t *testing.T) {
 	})
 
 	tw := twin{method: http.MethodGet, pathTemplate: "/api/models", handler: stub}
-	callTwin(ctx, tw, nil, nil)
+	callTwin(ctx, tw, twinCall{})
 
 	if gotValue != "the-authenticated-user" {
 		t.Errorf("handler's own context carried %v, want %q", gotValue, "the-authenticated-user")
@@ -78,7 +78,7 @@ func TestCallTwin_NoQueryOmitsQuestionMark(t *testing.T) {
 		w.WriteHeader(http.StatusOK)
 	})
 	tw := twin{method: http.MethodGet, pathTemplate: "/api/models", handler: stub}
-	callTwin(context.Background(), tw, nil, nil)
+	callTwin(context.Background(), tw, twinCall{})
 
 	if gotURL != "/api/models" {
 		t.Errorf("constructed URL = %q, want %q", gotURL, "/api/models")
@@ -127,7 +127,7 @@ func TestCallTwin_MaliciousURLParamsNeverPanic(t *testing.T) {
 			// subtest (and the whole test binary, since the SDK's own
 			// goroutine has no recover either) would never reach the
 			// assertions below at all.
-			status, body := callTwin(context.Background(), tw, map[string]string{"sessionID": tt.value}, nil)
+			status, body := callTwin(context.Background(), tw, twinCall{URLParams: map[string]string{"sessionID": tt.value}})
 
 			if status != http.StatusOK {
 				t.Fatalf("status = %d, body = %s, want 200 (the stub handler must have run)", status, body)

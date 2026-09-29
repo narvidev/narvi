@@ -2729,12 +2729,12 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// -- a network being the connecting address, so behind a proxy that
 		// hides client addresses every user shares the proxy's one.
 		r.With(
-			mcpauth.NewRateLimiter(cfg.Timeouts.MCPAuthorizeRateInterval, cfg.Timeouts.MCPAuthorizeRateBurst).Limit(mcpAuthServer.AuthorizeRateLimited),
+			mcpauth.NewRateLimiter(cfg.Timeouts.MCPAuthorizeRateInterval, cfg.Timeouts.MCPAuthorizeRateBurst).LimitBy(mcpauth.ByClientAddress, mcpAuthServer.AuthorizeRateLimited),
 		).Get("/authorize", mcpAuthServer.Authorize)
 		r.Get("/consent", mcpAuthServer.ConsentPage)
 		r.Post("/consent", mcpAuthServer.ConsentDecision)
 		r.With(
-			mcpauth.NewRateLimiter(cfg.Timeouts.MCPTokenEndpointRateInterval, cfg.Timeouts.MCPTokenEndpointRateBurst).Limit(mcpauth.TokenRateLimited),
+			mcpauth.NewRateLimiter(cfg.Timeouts.MCPTokenEndpointRateInterval, cfg.Timeouts.MCPTokenEndpointRateBurst).LimitBy(mcpauth.ByClientAddress, mcpauth.TokenRateLimited),
 		).Post("/token", mcpAuthServer.Token)
 		r.Post("/revoke", mcpAuthServer.Revoke)
 		// RFC 7591 dynamic client registration (§43.15): mounted
@@ -2744,17 +2744,18 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// header) before a single row is written.
 		r.With(
 			mcpadapter.RequireEnabled(cfg.MCPDCREnabled),
-			mcpauth.NewRateLimiter(cfg.Timeouts.MCPRegisterRateInterval, cfg.Timeouts.MCPRegisterRateBurst).Limit(mcpauth.RegisterRateLimited),
+			mcpauth.NewRateLimiter(cfg.Timeouts.MCPRegisterRateInterval, cfg.Timeouts.MCPRegisterRateBurst).LimitBy(mcpauth.ByClientAddress, mcpauth.RegisterRateLimited),
 		).Post("/register", mcpAuthServer.Register)
 	})
 
 	// /mcp (technical plan §43, "the MCP surface"): the Streamable HTTP
-	// entry point for the read-only MCP tools -- narvi_list_models,
+	// entry point for the MCP tools -- the reads narvi_list_models,
 	// narvi_list_sessions, narvi_get_session, and row 182's
 	// narvi_get_session_status, narvi_wait_for_session (the status twin
 	// with ?waitSeconds=, on the same sessionWaiter as the REST route),
 	// narvi_get_session_result (on the same sessionResultDeps as the REST
-	// route) and narvi_get_session_transcript (§43.20).
+	// route) and narvi_get_session_transcript (§43.20); and the write
+	// narvi_create_session (§43.8), under mcp:write.
 	// Deliberately NOT under /api/
 	// (a protocol endpoint, the same category as /sessions/{sessionID}/ws
 	// or /webhooks/*) and mounted UNCONDITIONALLY regardless of
@@ -2787,13 +2788,27 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	if err != nil {
 		return nil, fmt.Errorf("build mcp origin gate: %w", err)
 	}
-	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{PublicBaseURL: cfg.PublicBaseURL}, mcpadapter.Twins{
+	//
+	// narvi_create_session (§43.8) is the one write tool: its twin is the
+	// very POST /api/sessions constructor call above, with the same stores,
+	// registry, intent classifier, rollout mode and entitlement store, so an
+	// MCP create passes exactly the gates a browser's does -- the handler
+	// itself records spawn_source mcp from the grant on the context (§43.1).
+	// Every session it starts spawns a sandbox and spends on models, so it
+	// is braked per grant too (CreateBrake: MCPCreateSessionRateBurst, then
+	// one per MCPCreateSessionRateInterval), inside the adapter, after the
+	// arguments validate and before the twin runs.
+	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{
+		PublicBaseURL: cfg.PublicBaseURL,
+		CreateBrake:   mcpauth.NewRateLimiter(cfg.Timeouts.MCPCreateSessionRateInterval, cfg.Timeouts.MCPCreateSessionRateBurst),
+	}, mcpadapter.Twins{
 		ListModels:       httpapi.GetModelCatalog(),
 		ListSessions:     httpapi.ListSessions(sessionStore),
 		GetSession:       httpapi.GetSession(sessionStore),
 		GetSessionStatus: httpapi.GetSessionStatus(sessionStore, sessionWaiter, cfg.Timeouts),
 		ListEvents:       httpapi.ListEvents(sessionStore, eventStore),
 		GetSessionResult: httpapi.GetSessionResult(sessionResultDeps),
+		CreateSession:    httpapi.CreateSession(pool, sessionStore, turnStore, environmentStore, auditLogStore, registry, intentClassifierSvc, cfg.EpistemicCheckDefault, cfg.RolloutMode, repoSettingsStore, githubPRSessionStore),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build mcp handler: %w", err)
@@ -2805,10 +2820,19 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		LastUsedWriteInterval: cfg.Timeouts.MCPGrantLastUsedWriteInterval,
 		ClientMechanisms:      mcpClientMechanisms,
 	})
+	// The fourth gate (§43.6) brakes each grant: a burst of MCPCallRateBurst
+	// calls, then one per MCPCallRateInterval, keyed by the grant the bearer
+	// gate just attached (mcpauth.GrantKey) -- so it can only run after that
+	// gate, and one runaway client spends only its own bucket. A refused call
+	// is answered 429 with Retry-After before its body is read: no tool runs.
+	// It is logged at WARN with grant_id and client_id, never the token, and
+	// never audited.
+	mcpCallBrake := mcpauth.NewRateLimiter(cfg.Timeouts.MCPCallRateInterval, cfg.Timeouts.MCPCallRateBurst)
 	router.Route("/mcp", func(r chi.Router) {
 		r.Use(mcpOriginGate)
 		r.Use(mcpadapter.RequireEnabled(cfg.MCPEnabled))
 		r.Use(mcpBearerGate)
+		r.Use(mcpCallBrake.LimitBy(mcpauth.GrantKey, mcpauth.MCPCallRateLimited))
 		r.Post("/", mcpHandler.ServeHTTP)
 	})
 
