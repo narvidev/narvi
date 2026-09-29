@@ -53,9 +53,9 @@ import (
 //
 // The pool this now returns is sized MaxConns=20 (was previously
 // "pool_max_conns=20" appended to a dedicated per-test connection
-// string) -- see IntegrationTestPool's own doc comment (sharedpool_
-// integration_test.go) for why this package specifically needs a
-// ceiling well above pgxpool's own low-core-count-runner default.
+// string) -- chosen when each live Actor pinned a pool connection, which
+// none does any more; see TestMain's own comment (sharedpool_
+// integration_test.go) for why the size stays.
 func newTestPool(t *testing.T) *pgxpool.Pool {
 	t.Helper()
 	return IntegrationTestPool(t)

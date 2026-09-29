@@ -1044,7 +1044,8 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 	// response on how long the resulting spawn/dispatch decision takes.
 	actor, spawnErr := registry.GetOrSpawn(ctx, sessionID)
 	if spawnErr != nil {
-		logger.Warn("httpapi: GetOrSpawn after turn create failed", "error", spawnErr)
+		logger.Warn("httpapi: GetOrSpawn after turn create failed",
+			"reason", sessionactor.SpawnFailureReason(spawnErr), "error", spawnErr)
 	} else if sendErr := actor.Send(ctx, sessionactor.EnsureDispatched{}); sendErr != nil {
 		logger.Warn("httpapi: send EnsureDispatched after turn create failed", "error", sendErr)
 	}

@@ -185,3 +185,88 @@ startup outright — so, as with item 1's own `NARVI_ROLLOUT_MODE` check,
 is about the two values `strconv.ParseBool` DOES accept, `true` and
 `false`, neither of which boot itself can distinguish from a deliberate
 production choice.
+
+## 10. The fleet's Postgres connections fit under `max_connections`
+
+**Why this is here.** A control-plane replica opens its query pool
+(`NARVI_DB_POOL_MAX_CONNS`, default 20) plus one lock connection that
+holds every one of its session actors' advisory locks, whatever it hosts
+(`docs/TECHNICAL_PLAN.md` §2, §5.1). No connection is held per session,
+so the total is fixed by the fleet's shape, not by its load:
+`replicas × (NARVI_DB_POOL_MAX_CONNS + 1)`, plus whatever else connects
+to the same server (migrations run on boot through a short-lived
+connection of their own, and any operator tooling). If it does not fit,
+replicas fail to connect as they scale out — a failure no single replica
+can see coming, since one process cannot know how many replicas there
+are.
+
+**Check.** On the production server: `SHOW max_connections;`,
+`SHOW superuser_reserved_connections;` and, on Postgres 16 or later,
+`SHOW reserved_connections;`. Confirm
+`max_connections − superuser_reserved_connections − reserved_connections`
+exceeds `replicas × (NARVI_DB_POOL_MAX_CONNS + 1)` with headroom, at the
+fleet's maximum replica count (a rolling deploy briefly runs one extra
+replica per surge slot). Each replica logs its own share at boot
+(`narvi control-plane: postgres connection budget`, with
+`replica_need`), and warns — never refuses — when even that one replica
+does not fit.
+
+To tell the lock connections apart from the pools: each reports an
+`application_name` of `narvi-actor-locks-` followed by a nonce drawn
+afresh on every dial, so a replica that redials shows a new name. Count
+them with `application_name LIKE 'narvi-actor-locks-%'` in
+`pg_stat_activity`, find the locks one holds in `pg_locks` by its pid, and
+match it to its replica through that replica's
+`sessionactor: lock connection established` log line, which carries the
+same `application_name` and `backend_pid`.
+
+**Also confirm** nothing between the control plane and Postgres is a
+transaction-mode connection pooler: the actor locks are session-level
+advisory locks, and a pooler that hands a backend to another client
+between transactions would move them with it. Session-mode pooling, or
+none, is required. Behind a session-mode pooler, three of its settings
+matter too:
+
+- **Its client-side TCP keepalives and user timeout** (PgBouncer:
+  `tcp_keepalive`, `tcp_keepidle`, `tcp_keepintvl`, `tcp_keepcnt`, and
+  `tcp_user_timeout`, in milliseconds). The lock connection asks the
+  server for short keepalives on its end, and for a TCP user timeout of
+  the same reap time (`ActorLockServerKeepalive*` in
+  `internal/platform/timeouts.go`), but through a pooler that end faces
+  the pooler: if a replica vanishes, only the pooler's own settings
+  notice, and until they do the pooler keeps the backend holding that
+  replica's session locks. Set the keepalives so their reap time,
+  `tcp_keepidle + tcp_keepintvl × tcp_keepcnt`, lies above
+  `ActorLockProbeInterval + ActorLockStatementTimeout` (11 s at the
+  shipped values) and below `TimerClaimDuration` (30 s): the bounds
+  `Validate` keeps the server side's own reap time within, for the same
+  reasons. Below the floor, the pooler drops a cut-off replica's lock
+  connection and resets its backend, releasing its locks to the other
+  replicas, before that replica has found the loss and stopped its
+  actors. Above the ceiling, a vanished replica's session locks outlive a
+  timer's claim, so the first retry of those sessions' timers still finds
+  them held. The server side's 10 s, 5 s and 3 (25 s) fit. Set
+  `tcp_user_timeout` between the same bounds, for the same reasons
+  (25000 fits): the keepalives only reap a connection with nothing in
+  flight. Linux sends no keepalive probe while data it sent is
+  unacknowledged, so a replica lost while the pooler's reply to one of its
+  lock statements was in flight is otherwise dropped only when TCP's
+  retransmissions give up — about 15 minutes at Linux's default
+  `tcp_retries2` — its session locks held all the while. PgBouncer's
+  default, 0, leaves it at that, and no other replica ends that backend:
+  only the lost replica's own next lock connection would.
+- **Its client idle timeout** (PgBouncer: `client_idle_timeout`). Leave it
+  at 0, its default, or above the same floor: a lock connection sits idle
+  between probes, and a pooler that closes an idle client resets its
+  backend all the same.
+- **How it passes `application_name` on.** It must set each client's own
+  `application_name` on the backend it links, as PgBouncer does (the
+  parameter is one it tracks). The first lock connection a replica dials
+  after a loss terminates the lost connection's backend if it still runs
+  that connection's session, found by the lost connection's own name;
+  behind a pooler that left a reused backend under an earlier client's
+  name, it could end another replica's live lock connection instead. To
+  check: through the pooler, connect twice in turn with different
+  `application_name` values, and confirm
+  `SELECT current_setting('application_name')` returns each connection's
+  own.

@@ -504,19 +504,22 @@ func IntegrationTestPoolAndConnStr(t *testing.T) (*pgxpool.Pool, string) {
 // sharedPoolMaxConns is the shared pool's size, pinned. pgx's own default
 // is max(4, runtime.NumCPU()): 4 on CI's runners, usually more on a
 // developer's machine, so a test holding more connections at once than CI
-// has passes locally and hangs CI. Every live session actor holds one
-// connection, its advisory lock's, until its Registry shuts down
-// (sessionactor's hydrateAndAcquire). The subtests of
-// TestGetSessionStatus_EscalatedTurnNeverGatesForGood once spawned one
-// actor each on a rig they shared: the fourth hung CI, and all eight
-// passed on twelve cores.
+// has passes locally and hangs CI. Pinning it at CI's own size makes every
+// machine run the tests against the pool CI has. It once mattered for a
+// second reason: a live session actor used to hold one pool connection,
+// its advisory lock's, for its whole life -- the subtests of
+// TestGetSessionStatus_EscalatedTurnNeverGatesForGood spawned one actor
+// each on a rig they shared, and the fourth hung CI while all eight
+// passed on twelve cores. Actors hold none now: every lock lives on the
+// Registry's own lock connection, outside any pool (sessionactor's
+// lockholder.go), and a hydration waits at most ActorHydrateTimeout for a
+// query connection.
 const sharedPoolMaxConns = 4
 
 // poolAcquireBound bounds every acquire on the shared pool. No test here
 // holds connections for seconds, so an acquire that waits this long has
-// found the pool exhausted -- connections leaked, or held by session
-// actors nobody shut down -- and would otherwise wait until the package
-// times out. It fails instead, and so does the test it happened in, with
+// found the pool exhausted -- connections leaked -- and would otherwise
+// wait until the package times out. It fails instead, and so does the test it happened in, with
 // where every connection then out was acquired.
 const poolAcquireBound = 10 * time.Second
 

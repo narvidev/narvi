@@ -7,8 +7,8 @@ import (
 )
 
 // TestScanRegisteredInstruments_FindsLiteralNames proves the scanner's own
-// core extraction: every one of the eight instrumentMethods, called with a
-// string-literal first argument, is found.
+// core extraction: instrumentMethods' synchronous and observable
+// constructors, called with a string-literal first argument, are found.
 func TestScanRegisteredInstruments_FindsLiteralNames(t *testing.T) {
 	dir := t.TempDir()
 	src := `package fake
@@ -20,6 +20,8 @@ func build(m metric.Meter) {
 	_, _ = m.Float64Histogram("fake_histogram_seconds")
 	_, _ = m.Int64Gauge("fake_gauge")
 	_, _ = m.Float64UpDownCounter("fake_updown")
+	_, _ = m.Int64ObservableGauge("fake_observable_gauge")
+	_, _ = m.Int64ObservableCounter("fake_observable_counter")
 }
 `
 	if err := os.WriteFile(filepath.Join(dir, "fake.go"), []byte(src), 0o644); err != nil {
@@ -30,13 +32,14 @@ func build(m metric.Meter) {
 	if err != nil {
 		t.Fatalf("ScanRegisteredInstruments: %v", err)
 	}
-	for _, want := range []string{"fake_counter_total", "fake_histogram_seconds", "fake_gauge", "fake_updown"} {
-		if _, ok := got[want]; !ok {
-			t.Errorf("missing instrument %q in %v", want, got)
+	want := []string{"fake_counter_total", "fake_histogram_seconds", "fake_gauge", "fake_updown", "fake_observable_gauge", "fake_observable_counter"}
+	for _, name := range want {
+		if _, ok := got[name]; !ok {
+			t.Errorf("missing instrument %q in %v", name, got)
 		}
 	}
-	if len(got) != 4 {
-		t.Errorf("found %d instruments, want exactly 4: %v", len(got), got)
+	if len(got) != len(want) {
+		t.Errorf("found %d instruments, want exactly %d: %v", len(got), len(want), got)
 	}
 }
 

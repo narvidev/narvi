@@ -47,15 +47,16 @@ import (
 // instances connected to it -- mirroring exactly how two real pods would
 // each hold their own connection pool to one shared database. This
 // matters for THIS test specifically: "kill pod A" must abruptly drop
-// only pod A's own connections (including whichever one held the
-// session's advisory lock), never pod B's -- a single shared pool would
-// make that distinction impossible to express at all. Neither pool is
-// registered for auto-cleanup via t.Cleanup here: poolA is deliberately
-// NEVER closed by this test at all (see killAdvisoryLockHolder's own call
-// site for why -- a real killed process leaves nothing to gracefully
-// close either, and pgxpool.Pool.Close() would otherwise hang the test
-// itself); poolB's own cleanup is registered explicitly by the test body,
-// ordered relative to registryB.Shutdown().
+// only pod A's own connections (including the lock connection pod A's
+// Registry dialled from poolA's settings, which holds the session's
+// advisory lock -- lockholder.go), never pod B's -- a single shared pool
+// would make that distinction impossible to express at all. Neither pool
+// is registered for auto-cleanup via t.Cleanup here: poolA is
+// deliberately NEVER closed by this test at all (see
+// killAdvisoryLockHolder's own call site for why -- a real killed process
+// leaves nothing to gracefully close either); poolB's own cleanup is
+// registered explicitly by the test body, ordered relative to
+// registryB.Shutdown().
 func newTestPoolPair(t *testing.T) (poolA, poolB *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
@@ -269,8 +270,8 @@ func killAdvisoryLockHolder(ctx context.Context, t *testing.T, adminPool *pgxpoo
 //     timerfired_integration_test.go respectively).
 //  2. Hydrate an actor for this session via registryA.GetOrSpawn -- this
 //     is what makes "pod A" a genuine, real owner of the session (holding
-//     the real Postgres advisory lock on a real connection from poolA),
-//     not a hypothetical one.
+//     the real Postgres advisory lock on pod A's own lock connection,
+//     dialled from poolA's settings), not a hypothetical one.
 //  3. "Kill pod A": terminate the exact Postgres BACKEND holding the
 //     advisory lock directly, via a separate administrative connection
 //     (killAdvisoryLockHolder, using pg_terminate_backend), WITHOUT
@@ -282,15 +283,11 @@ func killAdvisoryLockHolder(ctx context.Context, t *testing.T, adminPool *pgxpoo
 //     dead process's TCP sockets; Postgres notices the connection is gone
 //     and reaps that backend, releasing every lock it held) -- reproduced
 //     faithfully at exactly the layer that matters for this test's own
-//     assertions, without fighting puddle's (pgxpool's own underlying
-//     connection pool) cooperative-release bookkeeping: actor A's own
-//     lock connection is held for its entire lifetime by design
-//     (hydrate.go) and is never released except by its own graceful
-//     shutdown() path, so pgxpool.Pool.Close() itself would hang the TEST
-//     ITSELF forever waiting on that same connection -- an artifact of
-//     simulating the kill from WITHIN the same test process, not a real
-//     second pod -- see this test's own inline comment at the call site
-//     for the full reasoning. Postgres auto-releases an advisory lock the
+//     assertions. pgxpool.Pool.Close() would not do it: the lock lives on
+//     pod A's lock connection, which is not one of poolA's connections
+//     (lockholder.go), so closing poolA would leave the lock held -- see
+//     this test's own inline comment at the call site for the full
+//     reasoning. Postgres auto-releases an advisory lock the
 //     instant the backend connection holding it terminates (this is what
 //     makes the simulation FAITHFUL, not merely "stop referencing a Go
 //     object": if this test instead just dropped its own reference to
@@ -350,7 +347,7 @@ func TestResilience_KillPodMidTurn_TurnFailsWithReason_NoStuckProcessing(t *test
 	}
 
 	// --- Step 2: pod A hydrates and genuinely owns this session (a real
-	// advisory lock on a real poolA connection). ---
+	// advisory lock on pod A's own lock connection). ---
 	registryA, err := NewRegistry(ctx, poolA, timeouts, nil, nil, nil, "", nil, nil, "", nil, false)
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
@@ -363,16 +360,13 @@ func TestResilience_KillPodMidTurn_TurnFailsWithReason_NoStuckProcessing(t *test
 	// -- see this test's own doc comment for why. ---
 	//
 	// pgxpool.Pool.Close() itself is NOT the right tool here, and
-	// deliberately not used: puddle (pgxpool's own underlying connection
-	// pool) blocks Close() until every ACQUIRED connection is returned --
-	// but actor A's own lock connection is HELD for its entire lifetime
-	// by design (hydrate.go) and is never released except by its own
-	// graceful shutdown() path, which this test deliberately never
-	// triggers (a real `kill -9` has no graceful-release phase either).
-	// Calling poolA.Close() here would therefore hang the TEST ITSELF
-	// forever waiting on that same connection -- an artifact of
-	// simulating the kill from WITHIN the same test process, not a
-	// real second pod.
+	// deliberately not used: actor A's advisory lock lives on pod A's own
+	// lock connection, which is not one of poolA's connections
+	// (lockholder.go) -- closing poolA would leave it, and the lock, in
+	// place, and pod B could never take over. (Before the lock connection
+	// existed, the lock lived on a poolA connection actor A held for its
+	// whole life, and Close() would instead have hung the test waiting
+	// for it.)
 	//
 	// Instead, terminate the exact Postgres BACKEND holding the advisory
 	// lock directly (via a separate administrative connection, poolB) --
@@ -391,11 +385,10 @@ func TestResilience_KillPodMidTurn_TurnFailsWithReason_NoStuckProcessing(t *test
 	// Cleanup order matters here: t.Cleanup runs LIFO, so registering
 	// poolB.Close() FIRST and registryB.Shutdown() SECOND means Shutdown
 	// actually runs FIRST at test end -- gracefully stopping actor B (and
-	// releasing its own lock connection back to poolB) BEFORE poolB
-	// itself is closed. Closing poolB first would deadlock: Pool.Close
-	// blocks until every checked-out connection is returned, but actor
-	// B's lock connection is never returned until its own run() loop
-	// exits via Shutdown.
+	// closing its lock connection) BEFORE poolB itself is closed.
+	// Pool.Close blocks until every checked-out connection is returned,
+	// so it must not run while actor B could still be inside a command
+	// holding one.
 	registryB, err := NewRegistry(ctx, poolB, timeouts, nil, nil, nil, "", nil, nil, "", nil, false)
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)

@@ -28,7 +28,8 @@
 // context.Canceled and the deferred shutdown() only (1) evicts the actor
 // from the Registry's map, (2) drains whatever slipped into the mailbox,
 // and (3) releases the advisory lock -- it never writes to turns or
-// sessions at all. This test proves that by reading Postgres directly,
+// sessions at all. (Registry.Shutdown then closes the lock connection
+// itself, which would release any lock left on it.) This test proves that by reading Postgres directly,
 // not by re-deriving it from the source a second time.
 package resilience_test
 
@@ -115,9 +116,8 @@ func TestResilienceScenario12_GracefulRollingRestart_ZeroSessionsMarkedFailed(t 
 	}
 
 	// --- "Pod A" hydrates and genuinely owns this session (a real
-	// advisory lock on a real harness-pool connection) -- exactly what
-	// makes the shutdown below a genuine handover, not a hypothetical
-	// one. ---
+	// advisory lock on pod A's own lock connection) -- exactly what makes
+	// the shutdown below a genuine handover, not a hypothetical one. ---
 	registryA := h.NewRegistry(ctx, t)
 	if _, err := registryA.GetOrSpawn(ctx, sessionID); err != nil {
 		t.Fatalf("registryA.GetOrSpawn: %v", err)

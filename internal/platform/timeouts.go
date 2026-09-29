@@ -267,6 +267,172 @@ type Timeouts struct {
 	// reasonably quickly.
 	TimerClaimDuration time.Duration
 
+	// The session actor's lock connection and hydration bound (§2, §5.1).
+	// A replica holds every one of its actors' advisory locks on ONE
+	// dedicated connection outside its query pool
+	// (internal/app/sessionactor/lockholder.go), so hosting sessions never
+	// takes a query connection. Unlike the fields above, the first three
+	// are linked -- to each other and to TimerClaimDuration -- by
+	// Validate, with no margin: they are a second apart at most, and each
+	// link is an ordering, not a race; so are the server keepalives that
+	// follow (their own comment). The values are not in the plan; they are
+	// chosen, except the fourth's, which is pgxpool's.
+
+	// ActorHydrateTimeout bounds one whole hydration (Registry.GetOrSpawn
+	// for a session this replica does not yet host): the advisory lock,
+	// the epoch bump and the three reads that load the actor's state,
+	// including the wait of a caller that joined a hydration already in
+	// flight for the same session. Past it, GetOrSpawn fails with the
+	// retryable sessionactor.ErrActorUnavailable instead of waiting on a
+	// saturated query pool. 2 s: a healthy hydration is five round trips,
+	// milliseconds, and 2 s stays inside the shortest synchronous webhook
+	// deadline on the paths that hydrate.
+	//
+	// It bounds waiting, not every statement a hydration has started: a
+	// lock statement already in flight when the bound expires runs to its
+	// own bound (ActorLockStatementTimeout) rather than being cut short --
+	// cancelling a statement mid-flight breaks the connection, and with it
+	// every other actor's lock -- and a hydration that fails then releases
+	// its lock with one more statement, after waiting its turn on the lock
+	// connection. So GetOrSpawn can return up to about this bound plus two
+	// ActorLockStatementTimeouts, plus that turn, after it was called.
+	//
+	// It may be shorter than one host's connect_timeout. The lock
+	// connection is never dialled under a hydration's bound: it is dialled
+	// in the background, as the query pool dials, and a hydration only
+	// waits for the dial within its bound. While a dial is still in flight
+	// -- a first host that accepts and never answers, in a multi-host
+	// URL -- hydrations fail fast with ErrActorUnavailable and the dial
+	// goes on to the next host; the first hydration after it lands
+	// succeeds.
+	ActorHydrateTimeout time.Duration
+
+	// ActorLockStatementTimeout bounds each statement on the lock
+	// connection: lock, unlock, probe, and the two that ready a new
+	// connection. A statement that finds the connection gone -- closed, a
+	// network error, a FATAL or PANIC from the server, or this bound
+	// overrun -- presumes it lost: it is closed, every actor locked under
+	// it is stopped, and a new one is dialled. A server-side ERROR on a
+	// live connection fails that statement only, except on an unlock,
+	// where any error presumes the connection lost: the unlock's outcome is
+	// unknown, and closing is the one release that is certain. It does not
+	// bound the connect itself (ActorLockConnectAttemptTimeout). The
+	// terminate a new connection runs after a loss waits for a backend to
+	// end, so it runs under ActorLockOrphanTerminateWait plus this bound.
+	// 1 s.
+	ActorLockStatementTimeout time.Duration
+
+	// ActorLockProbeInterval is how often the lock connection is probed
+	// (Registry.RunLockProbe), and how often a dial that failed is
+	// retried when no hydration asks for one sooner. It is roughly how
+	// long a replica's actors can keep running after that replica has lost
+	// their locks -- another replica may already hold them by then, and
+	// only the epoch fence stops a stale actor's writes (§2). 10 s.
+	ActorLockProbeInterval time.Duration
+
+	// ActorLockConnectAttemptTimeout bounds each connect attempt of the lock
+	// connection's dial -- pgx makes one per address of each host in the
+	// database URL, covering the TCP connect, TLS and authentication -- when
+	// the URL sets no connect_timeout. A URL that sets one keeps it, as the
+	// query pool does. The query pool falls back to pgxpool's own 2 minutes
+	// (pgx v5.10.0, pgxpool/pool.go), but it dials one connection per
+	// acquire, while the lock connection has one dial in flight that every
+	// hydration on the replica waits for: a dial started while the network
+	// drops packets silently -- after a loss found during a partition -- sits
+	// in the kernel's SYN retransmission backoff, and after the heal it would
+	// connect only at the next retransmission, up to about a minute later,
+	// every hydration failing with ErrActorUnavailable meanwhile. Bounded,
+	// the attempt ends within this timeout of its start, and the next
+	// hydration or probe tick dials afresh; a host that accepts and never
+	// answers is passed after it too. Validate keeps it below
+	// ActorLockProbeInterval, with no margin, so an attempt never spans two
+	// probe ticks: once a partition heals, a hydration finds the lock
+	// connection within this timeout, and the probe alone brings it back
+	// within this timeout plus one interval (one address; each further
+	// address adds one attempt). A healthy connect takes milliseconds; a
+	// server slow to accept connections, such as a serverless database waking
+	// up, calls for a connect_timeout in the URL. 5 s: chosen.
+	ActorLockConnectAttemptTimeout time.Duration
+
+	// ActorLockOrphanTerminateWait is how long the first lock connection
+	// dialled after a loss waits for the lost connection's backend to end,
+	// once it has signalled it to (terminateOrphan in
+	// internal/app/sessionactor/lockholder.go), before it installs itself.
+	// A backend releases its advisory locks only as it exits, and a
+	// terminate that does not wait returns as soon as the signal is sent:
+	// installed then, the new connection could answer the first hydration
+	// after it that a session the orphan held is still locked elsewhere --
+	// ErrSessionActorElsewhere, which the timer pump skips until the timer's
+	// claim expires. Postgres waits through pg_terminate_backend's timeout,
+	// from Postgres 14; an older server only signals the backend, and the
+	// dial does not wait. A backend still there when the wait runs out is
+	// logged, and the connection installed anyway: that backend's sessions
+	// then wait for it to end, or for the server's keepalives
+	// (ActorLockServerReapTime). The terminate's statement runs under this
+	// wait plus ActorLockStatementTimeout, so the wait never overruns it.
+	// Postgres looks for the backend's end every 100 ms, from the moment it
+	// signals it, and not after the last step: a wait of 100 ms or less sees
+	// only a backend that had already ended.
+	//
+	// Validate keeps it positive -- 0 asks the server not to wait -- in
+	// whole milliseconds, the unit the server reads (below one, the value
+	// would reach it as 0), and below ActorHydrateTimeout, with no margin:
+	// hydrations wait for a dial within their own bound, so a wait that
+	// reached it would fail the very hydration it exists for, while every
+	// other session waited too. 1 s: chosen.
+	ActorLockOrphanTerminateWait time.Duration
+
+	// ActorLockServerKeepaliveIdle, ActorLockServerKeepaliveInterval and
+	// ActorLockServerKeepaliveCount are the TCP keepalives every lock
+	// connection asks Postgres to apply to the SERVER's end of it
+	// (tcp_keepalives_idle, tcp_keepalives_interval and
+	// tcp_keepalives_count), and ActorLockServerReapTime -- idle plus
+	// interval times count -- is the tcp_user_timeout it asks for beside
+	// them. A backend keeps its advisory locks until its session ends, and
+	// the server ends the session of a client that vanished without a word
+	// -- a network partition that outlasts TCP's retransmission of the
+	// close, or the replica's host lost -- only when its own keepalives
+	// give up: after more than two hours at Postgres's defaults, during
+	// which no replica can host any session the lost lock connection held.
+	// With these the server reaps such a backend within
+	// ActorLockServerReapTime of the last byte it received: the keepalives
+	// on an idle connection, the user timeout on one that was waiting for
+	// an acknowledgement when the network failed. A replica that comes back
+	// does not wait for that: its next lock connection terminates the
+	// backend (internal/app/sessionactor/lockholder.go). These override any
+	// value the database URL sets, for the lock connection only. Behind a
+	// session-mode pooler they guard the pooler's connection to the server,
+	// not the replica's to the pooler; the pooler's own client keepalives
+	// and TCP user timeout guard that one, and both the keepalives' reap
+	// time and the user timeout must lie between the same two bounds as
+	// this one, for the same reasons: a pooler that drops a client resets
+	// its backend, releasing its locks. The pooler needs the user timeout
+	// for the same reason as the server: Linux sends no keepalive probe
+	// while data it sent is unacknowledged, so a replica lost while a reply
+	// to it was in flight is otherwise dropped only when TCP's
+	// retransmissions give up -- about 15 minutes at Linux's defaults.
+	// Validate cannot see the pooler's settings, so
+	// docs/PRODUCTION_CHECKLIST.md, item 10, states them.
+	//
+	// Validate places the reap time between two bounds, with no margin.
+	// Above ActorLockProbeInterval + ActorLockStatementTimeout: a replica
+	// cut off from the server finds the loss and stops its actors before
+	// the server can release their locks to another replica. Below
+	// TimerClaimDuration: while the orphaned backend holds a session, every
+	// replica's timer pump skips that session's timers as owned elsewhere
+	// and leaves them claimed; each comes back when its claim expires, by
+	// which time the backend is gone, so the first retry delivers it.
+	// ActorIdleTTL is not the bound: it is how long an idle actor stays
+	// hosted, not how long a session may go unhostable, and what waits on
+	// the latter is the timer pump's retry. Postgres reads the first two in
+	// whole seconds, so Validate refuses a fraction of one: below a second
+	// the value would reach the server as 0, the system default. Every value
+	// must be positive, for the same reason. 10 s, 5 s and 3, a reap time
+	// of 25 s: chosen.
+	ActorLockServerKeepaliveIdle     time.Duration
+	ActorLockServerKeepaliveInterval time.Duration
+	ActorLockServerKeepaliveCount    int
+
 	// --- §6.4 standalone additions: no ordering relationship with
 	// either invariant chain above (or with any prior Step's standalone
 	// additions), so — per those additions' own precedent — plain fields
@@ -3554,6 +3720,16 @@ func (t Timeouts) PreEvidenceAgentBootCeiling() time.Duration {
 	return max(syncPrepare, clonePrepare) + shaProbes + hooks + buildCleanup
 }
 
+// ActorLockServerReapTime is about how long the server keeps a session
+// actor lock backend whose client vanished without a word, counted from
+// the last byte it received: ActorLockServerKeepaliveIdle plus
+// ActorLockServerKeepaliveInterval times ActorLockServerKeepaliveCount
+// (the three fields' own doc comment). The lock connection asks for it as
+// its tcp_user_timeout too.
+func (t Timeouts) ActorLockServerReapTime() time.Duration {
+	return t.ActorLockServerKeepaliveIdle + t.ActorLockServerKeepaliveInterval*time.Duration(t.ActorLockServerKeepaliveCount)
+}
+
 // DefaultTimeouts returns the shipped defaults for every field, each
 // justified above on the struct field and (briefly) inline here.
 func DefaultTimeouts() Timeouts {
@@ -3595,6 +3771,17 @@ func DefaultTimeouts() Timeouts {
 		ActorIdleTTL:       30 * time.Minute, // §2, explicit
 		TimerPumpInterval:  5 * time.Second,  // not specified; chosen
 		TimerClaimDuration: 30 * time.Second, // not specified; chosen
+
+		ActorHydrateTimeout:       2 * time.Second,  // not specified; chosen
+		ActorLockStatementTimeout: 1 * time.Second,  // not specified; chosen
+		ActorLockProbeInterval:    10 * time.Second, // not specified; chosen
+
+		ActorLockConnectAttemptTimeout: 5 * time.Second, // not specified; chosen -- half the probe interval
+		ActorLockOrphanTerminateWait:   1 * time.Second, // not specified; chosen -- half the hydration bound
+
+		ActorLockServerKeepaliveIdle:     10 * time.Second, // not specified; chosen
+		ActorLockServerKeepaliveInterval: 5 * time.Second,  // not specified; chosen
+		ActorLockServerKeepaliveCount:    3,                // not specified; chosen -- a reap time of 25 s, under TimerClaimDuration
 
 		HookTimeout:               10 * time.Minute, // not specified; chosen generously (setup.sh may install deps)
 		ProcessStopGracePeriod:    10 * time.Second, // not specified; chosen
@@ -4257,6 +4444,69 @@ func (t Timeouts) Validate() error {
 	withinResultDelayBounds("SessionResultDelayLiveRead", t.SessionResultDelayLiveRead)
 	withinResultDelayBounds("SessionResultDelaySettled", t.SessionResultDelaySettled)
 
+	// §2, §5.1: the session actor's lock connection and hydration bound
+	// (the Actor* fields' own block comment on the struct). Orderings with
+	// no margin, like the §43.20 links above. A zero bound fails every
+	// hydration and a zero interval probes in a hot loop, so each is
+	// refused. A lock statement is one step of a hydration, so it lies
+	// below the hydration bound, or the per-statement bound never applies.
+	// A pump delivery that fails on the hydration bound should end inside
+	// its timer's claim, so the retry comes from the claim expiring, not
+	// from a second, concurrent delivery: the link orders the bound itself,
+	// and its overshoot (ActorHydrateTimeout's own comment) is a few
+	// seconds at most against a 30 s claim by default. And one probe
+	// finishes before the next is due. A connect attempt ends within one
+	// probe interval too, so no attempt spans two probe ticks; a zero one
+	// would make pgx wait on a silent host forever, so it is refused.
+	mustBePositive("ActorHydrateTimeout", t.ActorHydrateTimeout)
+	mustBePositive("ActorLockStatementTimeout", t.ActorLockStatementTimeout)
+	mustBePositive("ActorLockProbeInterval", t.ActorLockProbeInterval)
+	mustBePositive("ActorLockConnectAttemptTimeout", t.ActorLockConnectAttemptTimeout)
+	strictlyBelow("ActorHydrateTimeout > ActorLockStatementTimeout",
+		"ActorLockStatementTimeout", t.ActorLockStatementTimeout, "ActorHydrateTimeout", t.ActorHydrateTimeout)
+	strictlyBelow("TimerClaimDuration > ActorHydrateTimeout",
+		"ActorHydrateTimeout", t.ActorHydrateTimeout, "TimerClaimDuration", t.TimerClaimDuration)
+	strictlyBelow("ActorLockProbeInterval > ActorLockStatementTimeout",
+		"ActorLockStatementTimeout", t.ActorLockStatementTimeout, "ActorLockProbeInterval", t.ActorLockProbeInterval)
+	strictlyBelow("ActorLockProbeInterval > ActorLockConnectAttemptTimeout",
+		"ActorLockConnectAttemptTimeout", t.ActorLockConnectAttemptTimeout, "ActorLockProbeInterval", t.ActorLockProbeInterval)
+
+	// §2, §5.1: how long a new lock connection waits for the backend of the
+	// one lost before it to end (ActorLockOrphanTerminateWait's own doc
+	// comment). The server reads it as a bare number of milliseconds, where
+	// 0 means not to wait at all, so a zero or negative value is refused,
+	// and so is a fraction of a millisecond. It lies below the hydration
+	// bound, with no margin.
+	mustBePositive("ActorLockOrphanTerminateWait", t.ActorLockOrphanTerminateWait)
+	if t.ActorLockOrphanTerminateWait > 0 && t.ActorLockOrphanTerminateWait%time.Millisecond != 0 {
+		errs = append(errs, &TimeoutMustBeWholeMillisecondsError{Field: "ActorLockOrphanTerminateWait", Value: t.ActorLockOrphanTerminateWait})
+	}
+	strictlyBelow("ActorHydrateTimeout > ActorLockOrphanTerminateWait",
+		"ActorLockOrphanTerminateWait", t.ActorLockOrphanTerminateWait, "ActorHydrateTimeout", t.ActorHydrateTimeout)
+
+	// §2, §5.1: the lock connection's server keepalives (the
+	// ActorLockServerKeepalive* fields' own doc comment). Each reaches the
+	// server as a bare number, where 0 means the system default -- hours --
+	// so a zero or negative value is refused, and so is a fraction of a
+	// second in the two the server reads in whole seconds. The reap time
+	// lies above one probe and its statement, and below TimerClaimDuration,
+	// with no margin.
+	mustBePositive("ActorLockServerKeepaliveIdle", t.ActorLockServerKeepaliveIdle)
+	mustBePositive("ActorLockServerKeepaliveInterval", t.ActorLockServerKeepaliveInterval)
+	countMustBePositive("ActorLockServerKeepaliveCount", t.ActorLockServerKeepaliveCount)
+	mustBeWholeSeconds := func(field string, value time.Duration) {
+		if value > 0 && value%time.Second != 0 {
+			errs = append(errs, &TimeoutMustBeWholeSecondsError{Field: field, Value: value})
+		}
+	}
+	mustBeWholeSeconds("ActorLockServerKeepaliveIdle", t.ActorLockServerKeepaliveIdle)
+	mustBeWholeSeconds("ActorLockServerKeepaliveInterval", t.ActorLockServerKeepaliveInterval)
+	strictlyBelow("ActorLockServerReapTime > ActorLockProbeInterval + ActorLockStatementTimeout",
+		"ActorLockProbeInterval+ActorLockStatementTimeout", t.ActorLockProbeInterval+t.ActorLockStatementTimeout,
+		"ActorLockServerReapTime", t.ActorLockServerReapTime())
+	strictlyBelow("TimerClaimDuration > ActorLockServerReapTime",
+		"ActorLockServerReapTime", t.ActorLockServerReapTime(), "TimerClaimDuration", t.TimerClaimDuration)
+
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three
 	// fields the retry chain it must contain is built from
@@ -4306,6 +4556,36 @@ type TimeoutMustBePositiveError struct {
 func (e *TimeoutMustBePositiveError) Error() string {
 	return fmt.Sprintf(
 		"timeout invariant violated: %s=%s, want > 0 -- the zero value silently disables or unbounds the control this field governs, see that field's own doc comment",
+		e.Field, e.Value,
+	)
+}
+
+// TimeoutMustBeWholeSecondsError reports a positive Timeouts field that
+// reaches a setting counted in whole seconds and carries a fraction of one:
+// the fraction would be dropped on the way, and below one second the whole
+// value with it (see that field's own doc comment).
+type TimeoutMustBeWholeSecondsError struct {
+	Field string
+	Value time.Duration
+}
+
+func (e *TimeoutMustBeWholeSecondsError) Error() string {
+	return fmt.Sprintf(
+		"timeout invariant violated: %s=%s, want a whole number of seconds -- see that field's own doc comment",
+		e.Field, e.Value,
+	)
+}
+
+// TimeoutMustBeWholeMillisecondsError is TimeoutMustBeWholeSecondsError for
+// a setting counted in whole milliseconds.
+type TimeoutMustBeWholeMillisecondsError struct {
+	Field string
+	Value time.Duration
+}
+
+func (e *TimeoutMustBeWholeMillisecondsError) Error() string {
+	return fmt.Sprintf(
+		"timeout invariant violated: %s=%s, want a whole number of milliseconds -- see that field's own doc comment",
 		e.Field, e.Value,
 	)
 }
