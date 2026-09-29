@@ -2558,3 +2558,54 @@ func TestDefaultTimeouts_GitHubAppMintFinishesBeforeCredentialFetch(t *testing.T
 		t.Fatalf("GitHubAppMintTimeout = %v, want a positive bound", to.GitHubAppMintTimeout)
 	}
 }
+
+// TestValidate_StopGrace pins StopGrace (technical plan §3.3's stop): the
+// shipped 30s, refused at zero or below, and refused unless TurnDeadline
+// exceeds it by MinTimeoutMargin -- a stopped turn in flight must be
+// cancelled by the stop, never timed out by its own deadline first.
+func TestValidate_StopGrace(t *testing.T) {
+	t.Parallel()
+
+	if got := platform.DefaultTimeouts().StopGrace; got != 30*time.Second {
+		t.Fatalf("DefaultTimeouts().StopGrace = %v, want 30s", got)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		grace     func(platform.Timeouts) time.Duration
+		wantField string
+		wantChain string
+	}{
+		{name: "zero", grace: func(platform.Timeouts) time.Duration { return 0 }, wantField: "StopGrace"},
+		{name: "negative", grace: func(platform.Timeouts) time.Duration { return -time.Second }, wantField: "StopGrace"},
+		{name: "at TurnDeadline", grace: func(to platform.Timeouts) time.Duration { return to.TurnDeadline }, wantChain: "TurnDeadline > StopGrace"},
+		{name: "within the margin below TurnDeadline", grace: func(to platform.Timeouts) time.Duration {
+			return to.TurnDeadline - platform.MinTimeoutMargin + time.Second
+		}, wantChain: "TurnDeadline > StopGrace"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			to.StopGrace = tc.grace(to)
+			err := to.Validate()
+			if tc.wantField != "" {
+				var pos *platform.TimeoutMustBePositiveError
+				if !errors.As(err, &pos) || pos.Field != tc.wantField {
+					t.Fatalf("Validate() = %v, want %s refused as non-positive", err, tc.wantField)
+				}
+				return
+			}
+			var inv *platform.TimeoutInvariantError
+			if !errors.As(err, &inv) || inv.Chain != tc.wantChain {
+				t.Fatalf("Validate() = %v, want the broken link %q", err, tc.wantChain)
+			}
+		})
+	}
+
+	to := platform.DefaultTimeouts()
+	to.StopGrace = to.TurnDeadline - platform.MinTimeoutMargin
+	if err := to.Validate(); err != nil {
+		t.Fatalf("StopGrace exactly MinTimeoutMargin below TurnDeadline: Validate() = %v, want nil", err)
+	}
+}
