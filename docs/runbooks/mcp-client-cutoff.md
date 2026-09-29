@@ -148,9 +148,11 @@ is `202` once the request is written: a queued turn is cancelled at once and
 never runs, a running one once its sandbox confirms the stop -- or
 `StopGrace` (30 s) later if it does not -- and nothing is pushed for either;
 `GET /api/sessions/{sessionID}/status` shows each session settle. A `500`
-means one of the sessions it started could not be reached: what was written
-stands, and the same call again reaches the rest. Once the session named is
-stopped, a call cut off by a timeout or a dropped connection still stops
+whose body says to repeat the request means the session was stopped but one
+of the sessions it started could not be reached: what was written stands.
+Any other `500` (`internal error`) wrote nothing. The same call again is
+safe in both cases, since a repeat only stops more. Once the session named
+is stopped, a call cut off by a timeout or a dropped connection still stops
 every session it started. Each stop is audited
 `session.stop`, one row per session it reached; one made through an app
 carries its `detail.mcp`.

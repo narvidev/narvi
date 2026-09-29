@@ -9319,13 +9319,13 @@ route changed. It closes the row's exit.
   the check on the session named. Every `session.stop` row the call writes, each descendant's included,
   carries `detail.mcp` (§43.18): the walk runs under the tool call's own request context.
 - **Outcomes** follow §43.8's table. `202` is a success carrying `StopSessionResponse` verbatim; `403`
-  and `404` are `isError` with REST's text; the route's `500` when a session it started could not be
-  reached is `-32603`, like any server error, its text not passed on. So the tool's description says
-  that an internal error can mean the session was stopped but not every session it started was reached,
-  and that calling it again reaches the rest. Once the named session's request has committed, the call
-  ending early -- a client timeout, a dropped connection -- does not cut the walk short (§3.3), and the
-  description says that too. The per-grant `/mcp` brake (§43.6) applies to it like every call; the
-  create brake does not.
+  and `404` are `isError` with REST's text; every `500` is `-32603`, like any server error, its text not
+  passed on -- the route's partial-walk `500` (the session stopped, a session it started not reached)
+  and its other `500`s, which wrote nothing, alike. So the tool's description says that an internal
+  error means one or the other, and that calling it again is safe either way, since a repeat only stops
+  more. Once the named session's request has committed, the call ending early -- a client timeout, a
+  dropped connection -- does not cut the walk short (§3.3), and the description says that too. The
+  per-grant `/mcp` brake (§43.6) applies to it like every call; the create brake does not.
 - **The instructions.** With the tool visible, the paragraph (§43.5) ends by saying it cancels the
   queued and running turns of a session and of every session it started, answers before that work has
   ended, and is not a no-op when repeated. The mark (`toolSpec.StopsSessions`) changes nothing the tool

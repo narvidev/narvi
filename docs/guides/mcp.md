@@ -240,8 +240,9 @@ work has ended, and waits (`narvi_wait_for_session`) to see each session
 settle. Calling it again is not a no-op: it also stops whatever was started
 since. Once the stop is written, a call that ends early — a timeout, a
 dropped connection — does not cut short the stop of the sessions it
-started. An internal error can mean the session was stopped but not every
-session it started was reached: calling it again reaches the rest. The next
+started. An internal error means either that nothing was written or that
+the session was stopped but not every session it started was reached:
+calling it again is safe either way, and reaches the rest. The next
 prompt, plan approval or workflow-step decision you or the app make on a
 stopped session sets it going again.
 
