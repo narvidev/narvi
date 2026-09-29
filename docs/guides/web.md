@@ -306,9 +306,10 @@ next turn starts on a new one, restored from the last snapshot where there
 is one, so what the stopped turn changed in the workspace since that
 snapshot is not carried over. A sandbox still pushing an earlier turn's
 work and opening its pull request is not stopped before that is done, for
-at most `platform.Timeouts.MCPStatusDeliveryWindow` (10 minutes): until
-then the stopped turn stays running, and a prompt is refused `409` as
-while any turn runs. Every session it started is stopped
+at most `platform.Timeouts.MCPStatusDeliveryWindow` (10 minutes). The
+stopped turn is cancelled all the same, once the grace has passed, and
+nothing is pushed for it; a prompt you send meanwhile is accepted, waits,
+and runs on the new sandbox. Every session it started is stopped
 the same way (`reachedSessionIds`), and a new child of it is refused until
 you resume it. Poll `GET /api/sessions/{sessionID}/status` to watch it
 settle.
