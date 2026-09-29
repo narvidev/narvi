@@ -20,6 +20,7 @@ package auditlog
 import (
 	"context"
 	"encoding/json"
+	"maps"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -53,8 +54,16 @@ import (
 // to the change it describes -- a failure here means the caller's own
 // tx.Commit must never be reached, so the state change and its audit
 // record either both land or neither does.
+//
+// A change made over MCP says so (technical plan §43.18): when ctx carries
+// the platform.MCPGrant auth.RequireMCPBearer attaches -- every tool call's
+// twin runs under that context -- the row's detail gains "mcp":
+// {"grant_id", "client_id"}, naming the authorization and the client the
+// change was made through, never a token. It is stamped on a copy
+// (stampMCPGrant): the caller's map is never modified. A cookie-authenticated
+// change carries no grant, so no stamp.
 func Record(ctx context.Context, store *postgres.AuditLogStore, actorUserID pgtype.UUID, action, resourceType, resourceID string, detail map[string]any) error {
-	detailJSON, err := json.Marshal(detail)
+	detailJSON, err := json.Marshal(stampMCPGrant(ctx, detail))
 	if err != nil {
 		detailJSON = []byte("{}")
 	}
@@ -73,4 +82,23 @@ func Record(ctx context.Context, store *postgres.AuditLogStore, actorUserID pgty
 		CorrelationID: correlationID,
 	})
 	return err
+}
+
+// stampMCPGrant returns detail with "mcp": {"grant_id", "client_id"} added
+// when ctx carries a platform.MCPGrant, and detail itself otherwise. The
+// stamped map is a fresh copy, so the caller's own map is left as it was
+// (Record's own doc comment). The grant is authoritative: a caller's own
+// "mcp" key, if it ever had one, is overwritten in the copy.
+func stampMCPGrant(ctx context.Context, detail map[string]any) map[string]any {
+	grant, ok := platform.MCPGrantFromContext(ctx)
+	if !ok {
+		return detail
+	}
+	stamped := make(map[string]any, len(detail)+1)
+	maps.Copy(stamped, detail)
+	stamped["mcp"] = map[string]any{
+		"grant_id":  grant.GrantID,
+		"client_id": grant.ClientID,
+	}
+	return stamped
 }
