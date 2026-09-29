@@ -2425,17 +2425,23 @@ func TestStopSession_RepeatKeepsEachTurnsFirstFlag(t *testing.T) {
 // but not dispatched to it. The stop timer looks again every StopGrace,
 // never past MCPStatusDeliveryWindow from the delivery's start, and its
 // first fire after the delivery ends -- its push failed -- or after the
-// window has run retires the gen, and the prompt goes to a new one.
+// window has run retires the gen, and the prompt goes to a new one. A gen
+// that dies meanwhile is replaced for the prompt, and the new gen owes
+// nothing.
 func TestStopSession_RetirementWaitsForADelivery(t *testing.T) {
 	ctx := context.Background()
 	const grace = 2 * time.Second
 
 	for _, tc := range []struct {
 		name string
-		// deliveryEnds ends the delivery, or lets its window run out.
+		// retires is whether the stop timer retires gen 1 itself, and so
+		// stops its provider object.
+		retires bool
+		// deliveryEnds ends the delivery, lets its window run out, or ends
+		// the sandbox.
 		deliveryEnds func(t *testing.T, rig *stopRig, sessionID pgtype.UUID)
 	}{
-		{"its push fails", func(t *testing.T, rig *stopRig, sessionID pgtype.UUID) {
+		{"its push fails", true, func(t *testing.T, rig *stopRig, sessionID pgtype.UUID) {
 			agentEvent(ctx, t, rig.registry, sessionID, "push_error", 1, func(messageID string) any {
 				return sandboxws.PushError{Type: "push_error", MessageId: messageID, SessionId: sessionID.String(), Gen: 1, AckId: "push_error:" + messageID, Error: "remote rejected"}
 			})
@@ -2443,7 +2449,7 @@ func TestStopSession_RetirementWaitsForADelivery(t *testing.T) {
 				t.Fatal("push_error left the delivery stamped")
 			}
 		}},
-		{"its window runs out", func(t *testing.T, rig *stopRig, sessionID pgtype.UUID) {
+		{"its window runs out", true, func(t *testing.T, rig *stopRig, sessionID pgtype.UUID) {
 			// The window now ends a second after the stop timer's next
 			// look, so that look still finds the delivery under way, and
 			// must look again at the window's end -- not a grace later,
@@ -2466,6 +2472,26 @@ func TestStopSession_RetirementWaitsForADelivery(t *testing.T) {
 			actorBarrier(ctx, t, rig.registry, sessionID)
 			if rearmed, armed := rig.stopTimer(ctx, t, sessionID); !armed || !rearmed.Equal(end) {
 				t.Fatalf("stop timer armed %v for %v, want it re-armed for the delivery window's end %v", armed, rearmed, end)
+			}
+		}},
+		{"its sandbox dies, and the next turn respawns it", false, func(t *testing.T, rig *stopRig, sessionID pgtype.UUID) {
+			// The liveness watchdog found the sandbox silent, and its
+			// terminal grace fails it. The prompt waiting on the gen then
+			// has it restored under a new gen, before the stop timer's next
+			// look.
+			if _, err := rig.pool.Exec(ctx, `UPDATE sandboxes SET status = 'suspect', pre_suspect_status = 'ready' WHERE session_id = $1`, sessionID); err != nil {
+				t.Fatal(err)
+			}
+			actor, err := rig.registry.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := actor.Send(ctx, sessionactor.TimerFired{Name: sessionactor.TimerTerminalGrace}); err != nil {
+				t.Fatal(err)
+			}
+			actorBarrier(ctx, t, rig.registry, sessionID)
+			if sb := rig.sandboxRow(ctx, t, sessionID); sb.Gen != 2 || sb.StopRetireGen != nil {
+				t.Fatalf("sandbox at gen %d, retirement owed on %v once the dead gen was replaced; want gen 2, owing nothing", sb.Gen, sb.StopRetireGen)
 			}
 		}},
 	} {
@@ -2552,11 +2578,18 @@ func TestStopSession_RetirementWaitsForADelivery(t *testing.T) {
 				sb := rig.sandboxRow(ctx, t, session.ID)
 				return sb.Gen != 1 || sb.Status != sqlcgen.SandboxStatusReady
 			})
+			// The retirement's own dispatch -- the restore of a new gen --
+			// has run.
+			actorBarrier(ctx, t, rig.registry, session.ID)
 			if sb := rig.sandboxRow(ctx, t, session.ID); sb.Gen != 2 || sb.Status != sqlcgen.SandboxStatusConnecting || sb.StopRetireGen != nil {
 				t.Fatalf("sandbox = %s at gen %d, retirement owed on %v; want gen 1 retired, the next turn's gen 2 connecting, nothing owed", sb.Status, sb.Gen, sb.StopRetireGen)
 			}
-			if _, restored, stoppedObjects := provider.calls(); !slices.Equal(stoppedObjects, []string{providerIDForGen(1)}) || !slices.Equal(restored, []int{2}) {
-				t.Fatalf("provider stops = %v, restores %v; want the retired gen's object %s stopped, and gen 2 restored", stoppedObjects, restored, providerIDForGen(1))
+			var wantStops []string
+			if tc.retires {
+				wantStops = []string{providerIDForGen(1)}
+			}
+			if _, restored, stoppedObjects := provider.calls(); !slices.Equal(stoppedObjects, wantStops) || !slices.Equal(restored, []int{2}) {
+				t.Fatalf("provider stops = %v, restores %v; want stops %v, and gen 2 restored", stoppedObjects, restored, wantStops)
 			}
 			pumpUntil(ctx, t, rig.registry, 10*time.Second, "the stop timer ends", func() bool {
 				_, armed := rig.stopTimer(ctx, t, session.ID)
@@ -2650,6 +2683,8 @@ func TestStopSession_DockerSessionsStoppedTurnNeverPushed(t *testing.T) {
 	pumpUntil(ctx, t, rig.registry, 15*time.Second, "the gen retired once the delivery is over", func() bool {
 		return rig.sandboxRow(ctx, t, session.ID).Status == sqlcgen.SandboxStatusStopped
 	})
+	// The provider stop comes after the retirement's commit.
+	actorBarrier(ctx, t, rig.registry, session.ID)
 	if sb := rig.sandboxRow(ctx, t, session.ID); sb.Gen != 1 || sb.StopRetireGen != nil {
 		t.Fatalf("sandbox at gen %d, retirement owed on %v; want gen 1 retired, nothing owed", sb.Gen, sb.StopRetireGen)
 	}
