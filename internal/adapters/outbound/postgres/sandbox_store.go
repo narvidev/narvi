@@ -210,6 +210,14 @@ func (s *SandboxStore) EndPRDelivery(ctx context.Context, sessionID pgtype.UUID)
 	return s.q.EndSandboxPRDelivery(ctx, sessionID)
 }
 
+// PRDelivery returns the sandbox's status, gen and push/PR delivery stamp,
+// with the database's now() -- see GetSandboxPRDelivery's own generated
+// doc comment. Returns pgx.ErrNoRows (unwrapped) when the session has no
+// sandbox.
+func (s *SandboxStore) PRDelivery(ctx context.Context, sessionID pgtype.UUID) (sqlcgen.GetSandboxPRDeliveryRow, error) {
+	return s.q.GetSandboxPRDelivery(ctx, sessionID)
+}
+
 // ListLiveWithSessionRepos returns every live sandbox alongside its
 // owning session's own raw repos JSONB -- the repo-demotion sweep's
 // (internal/app/seed) own input; see ListLiveSandboxesWithSessionRepos's

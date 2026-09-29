@@ -119,10 +119,9 @@ func newTestPool(t *testing.T) *pgxpool.Pool {
 // TestRun_CompositionTurnLeavesAPersonsStopStanding: the release composition
 // review turn is one releasereview.Worker inserts with no person behind it,
 // through the production turn store, so it leaves a person's stop request
-// on the release PR's review session standing (technical plan §3.3: only
-// the next turn a person creates, or the approval of the session's plan,
-// clears it). The turn is inserted, and sessions.stop_requested_at keeps its
-// instant.
+// on the release PR's review session standing (technical plan §3.3: only a
+// person's own act clears it, SessionStore.ClearStopRequest's callers). The
+// turn is inserted, and sessions.stop_requested_at keeps its instant.
 func TestRun_CompositionTurnLeavesAPersonsStopStanding(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)

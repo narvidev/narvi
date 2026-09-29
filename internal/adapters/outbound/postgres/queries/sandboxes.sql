@@ -371,6 +371,19 @@ UPDATE sandboxes
 SET pr_delivery_started_at = NULL, updated_at = now()
 WHERE session_id = $1 AND pr_delivery_started_at IS NOT NULL;
 
+-- name: GetSandboxPRDelivery :one
+-- Read by the stop timer's handler (technical plan §3.3,
+-- sessionactor.deliveryHold) before it retires the sandbox gen a stopped
+-- turn ran on: whether a completed turn's push and pull request, stamped
+-- by StartSandboxPRDelivery, are still being delivered by this sandbox.
+-- observed_at is now() on the database's clock, the clock that wrote the
+-- stamp and the one the timer pump compares fires_at with, so neither the
+-- window's end nor the instant the stop timer is re-armed for depends on
+-- the skew between the database and the replica.
+SELECT status, gen, pr_delivery_started_at, now()::timestamptz AS observed_at
+FROM sandboxes
+WHERE session_id = $1;
+
 -- name: ListLiveSandboxesWithSessionRepos :many
 -- §30.4's own repo-demotion sweep (internal/app/seed): every LIVE sandbox
 -- (the SAME "live status" set ListLiveSandboxProviderIDs already defines

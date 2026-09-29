@@ -515,9 +515,10 @@ type CreateSessionError struct {
 	// would be a child (ChildSessionOptions.ParentSessionID) of a session a
 	// person stopped and nobody has resumed since -- another permanent
 	// refusal, like RolloutRefusal: the parent's stop request is cleared
-	// only by a person's next turn on it, never by a retry, so a caller that
-	// routes an ordinary create error down a retry path (the sentinel
-	// auto-fix outbox) checks this field and gives up instead.
+	// only by a person's own act on it (SessionStore.ClearStopRequest's
+	// callers), never by a retry, so a caller that routes an ordinary
+	// create error down a retry path (the sentinel auto-fix outbox) checks
+	// this field and gives up instead.
 	ParentStopped bool
 }
 

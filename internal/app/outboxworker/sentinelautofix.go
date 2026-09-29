@@ -101,12 +101,13 @@ var errRepoEntitlementDenied = errors.New("outboxworker: sentinelAutoFixNotifier
 // person stopped the review session this fix would be a child of"
 // (httpapi.CreateSessionError.ParentStopped, technical plan §3.3's stop),
 // mirroring errRolloutRefused's shape and its reason: the parent's stop is
-// cleared only by a person's next turn on it, never by a redelivery, so
-// Deliver takes the same terminal skip instead of the outbox's
-// backoff/retry path. The claim transaction rolls back with the refusal,
-// so no fix is recorded and every addressed finding stays 'open'. The fix
-// branch createFixBranch already created before the claim stays on the
-// remote, unused -- the same as on the rollout refusal path.
+// cleared only by a person's own act on it (SessionStore.ClearStopRequest's
+// callers), never by a redelivery, so Deliver takes the same terminal skip
+// instead of the outbox's backoff/retry path. The claim transaction rolls
+// back with the refusal, so no fix is recorded and every addressed finding
+// stays 'open'. The fix branch createFixBranch already created before the
+// claim stays on the remote, unused -- the same as on the rollout refusal
+// path.
 var errParentStopped = errors.New("outboxworker: sentinelAutoFixNotifier: parent session was stopped")
 
 // sentinelFixBranchName derives the distinct upstream branch name Deliver

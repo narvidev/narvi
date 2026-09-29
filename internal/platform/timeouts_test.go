@@ -2609,3 +2609,51 @@ func TestValidate_StopGrace(t *testing.T) {
 		t.Fatalf("StopGrace exactly MinTimeoutMargin below TurnDeadline: Validate() = %v, want nil", err)
 	}
 }
+
+// TestValidate_TurnDeadlineOutlastsDeliveryWindow: a stopped turn whose
+// grace ends while its sandbox gen still delivers a completed turn's push
+// and pull request waits for that delivery, at most MCPStatusDeliveryWindow
+// from its start (technical plan §3.3). The turn was dispatched after that
+// start, so Validate refuses a TurnDeadline that would end it first, as a
+// timeout, unless it exceeds the window by MinTimeoutMargin.
+func TestValidate_TurnDeadlineOutlastsDeliveryWindow(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		deadline func(platform.Timeouts) time.Duration
+		wantErr  bool
+	}{
+		{name: "at the window", deadline: func(to platform.Timeouts) time.Duration { return to.MCPStatusDeliveryWindow }, wantErr: true},
+		{name: "within the margin above the window", deadline: func(to platform.Timeouts) time.Duration {
+			return to.MCPStatusDeliveryWindow + platform.MinTimeoutMargin - time.Second
+		}, wantErr: true},
+		{name: "exactly the margin above the window", deadline: func(to platform.Timeouts) time.Duration {
+			return to.MCPStatusDeliveryWindow + platform.MinTimeoutMargin
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			to.TurnDeadline = tc.deadline(to)
+			err := to.Validate()
+			var errs []error
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				errs = joined.Unwrap()
+			} else if err != nil {
+				errs = []error{err}
+			}
+			found := false
+			for _, e := range errs {
+				var inv *platform.TimeoutInvariantError
+				if errors.As(e, &inv) && inv.Chain == "TurnDeadline > MCPStatusDeliveryWindow" {
+					found = true
+				}
+			}
+			if found != tc.wantErr {
+				t.Fatalf("TurnDeadline %v, MCPStatusDeliveryWindow %v: Validate() = %v; want the link refused: %v", to.TurnDeadline, to.MCPStatusDeliveryWindow, err, tc.wantErr)
+			}
+		})
+	}
+}

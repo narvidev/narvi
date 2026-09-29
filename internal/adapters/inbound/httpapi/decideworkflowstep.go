@@ -48,6 +48,19 @@
 //     re-reviews already fired" exemption): this code path simply never
 //     reaches the function that consults loopguard, not a flag some other
 //     path could accidentally bypass.
+//
+// Technical plan §3.3's stop: approve and revise are a person's act that
+// sets the run going again, like approving a plan, so each resumes a
+// stopped session -- the session's stop request is cleared in this same
+// transaction, as DecidePlanOnTx clears it. Left standing, it would let the
+// decided attempt run and then end the run cancelled when that attempt ends
+// (workflowengine.OnTurnCompleted). Reject sets nothing going, as a plan's
+// reject does not: it ends the run failed, as before, and leaves the
+// request standing. The transaction takes the session's actor-epoch lock
+// before anything else, the lock the stop route writes the request under,
+// so a stop and a decision are ordered: a stop committed first is the
+// request this decision clears, and one committed after it flags the turn
+// this decision inserted.
 
 package httpapi
 
@@ -180,6 +193,20 @@ func DecideWorkflowStep(
 			return
 		}
 
+		// The session's actor-epoch lock, before any write: see this file's
+		// top comment (§3.3's stop). The actor takes it first in every
+		// transaction too, so the order of locks is the same.
+		if _, err := sessions.WithTx(tx).GetActorEpochForUpdate(ctx, runRow.SessionID); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// Defensive: see the session read below.
+				writeError(w, http.StatusNotFound, "workflow run not found")
+				return
+			}
+			logger.Error("httpapi: lock session row for workflow step decision failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+
 		stepRun, err := txWorkflows.GetStepRun(ctx, stepRunID)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -252,6 +279,16 @@ func DecideWorkflowStep(
 			GitHubPRSessions:      githubPRSessions.WithTx(tx),
 			Outbox:                outbox.WithTx(tx),
 			EpistemicCheckDefault: epistemicCheckDefault,
+		}
+
+		// §3.3: approve and revise resume a stopped session (this file's
+		// top comment); reject leaves its stop request standing.
+		if req.Verdict == restdtos.WorkflowStepDecideRequestVerdictApprove || req.Verdict == restdtos.WorkflowStepDecideRequestVerdictRevise {
+			if _, err := sessions.WithTx(tx).ClearStopRequest(ctx, sessionRow.ID); err != nil {
+				logger.Error("httpapi: clear session stop request for workflow step decision failed", "error", err)
+				writeError(w, http.StatusInternalServerError, "internal error")
+				return
+			}
 		}
 
 		var runStatus, stepRunStatus string

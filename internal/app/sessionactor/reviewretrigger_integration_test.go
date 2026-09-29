@@ -418,9 +418,9 @@ func TestReviewRetriggerDebounceTimer_Enqueue_CreatesReviewTurn(t *testing.T) {
 
 // TestReviewRetriggerDebounceTimer_Enqueue_LeavesAPersonsStopStanding: the
 // automatic re-review is a turn the bot inserts with no person behind it,
-// so it leaves a person's stop request standing (technical plan §3.3: only
-// the next turn a person creates, or the approval of the session's plan,
-// clears it). A push after the stop armed the debounce, as new input: the
+// so it leaves a person's stop request standing (technical plan §3.3: only a
+// person's own act clears it, SessionStore.ClearStopRequest's callers). A
+// push after the stop armed the debounce, as new input: the
 // re-review turn is inserted, and sessions.stop_requested_at keeps its
 // instant -- a review session is the parent the sentinel auto-fix spawns
 // under, so a cleared request would let new children through.

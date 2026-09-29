@@ -35,10 +35,12 @@ SET stop_requested_at = NULL
 WHERE id = $1 AND stop_requested_at IS NOT NULL
 `
 
-// The next turn a person creates on the session, or the approval of its
-// plan, clears the request: stop is not an archive. Turns keep their own
-// flags; only the session's -- what refuses a new child session -- is
-// cleared.
+// A person's next act that sets the session going again clears the
+// request -- stop is not an archive: the next turn a person creates on the
+// session, the approval of its plan, or a person's decision to approve or
+// revise a workflow step awaiting it. Turns keep their own flags; only the
+// session's -- what refuses a new child session, and ends a workflow run
+// whose attempt ends -- is cleared.
 func (q *Queries) ClearSessionStopRequest(ctx context.Context, id pgtype.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, clearSessionStopRequest, id)
 	if err != nil {
@@ -848,16 +850,22 @@ func (q *Queries) ListSessions(ctx context.Context, arg ListSessionsParams) ([]L
 
 const requestSessionStop = `-- name: RequestSessionStop :one
 UPDATE sessions
-SET stop_requested_at = COALESCE(stop_requested_at, now())
+SET stop_requested_at = GREATEST(stop_requested_at, now())
 WHERE id = $1
 RETURNING stop_requested_at
 `
 
 // A person's stop request on this session (technical plan §3.3, POST
-// /api/sessions/{sessionID}/stop, migrations/000151): the first request's
-// instant is kept, so a repeated request answers the same requestedAt.
-// Runs under GetSessionActorEpochForUpdate's own lock, in the transaction
-// that flags the session's open turns and arms its stop timer.
+// /api/sessions/{sessionID}/stop, migrations/000151). The session keeps
+// the latest request's instant: a repeated request moves it forward, so
+// the stop timer's handler disarms the work-creating timers armed before
+// the latest request, not only those armed before the first
+// (sessionactor.disarmWorkCreatingTimers). GREATEST, not a plain now(): two
+// requests serialized by the lock below in the other order than their
+// transactions began never move it back. Each turn keeps its own first
+// flag (RequestStopOpenTurns), which its grace runs from. Runs under
+// GetSessionActorEpochForUpdate's own lock, in the transaction that flags
+// the session's open turns and arms its stop timer.
 func (q *Queries) RequestSessionStop(ctx context.Context, id pgtype.UUID) (pgtype.Timestamptz, error) {
 	row := q.db.QueryRow(ctx, requestSessionStop, id)
 	var stop_requested_at pgtype.Timestamptz

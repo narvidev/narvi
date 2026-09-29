@@ -451,11 +451,14 @@ RETURNING id;
 -- fires_at with -- so neither the decision between sending the sandbox
 -- `stop` and cancelling, nor the instant the timer is re-armed for
 -- (stop_requested_at plus the grace), depends on the skew between the
--- database and this replica.
+-- database and this replica. dispatched_sandbox_gen tells the handler
+-- whether cancelling a turn in flight would retire the sandbox's current
+-- gen (sessionactor's deliveryHold and retireStoppedGen).
 SELECT
     id,
     status,
     stop_requested_at,
+    dispatched_sandbox_gen,
     COALESCE(stop_requested_at <= now() - make_interval(secs => sqlc.arg('grace_seconds')::float8), false)::boolean AS grace_elapsed
 FROM turns
 WHERE session_id = sqlc.arg('session_id')

@@ -7,17 +7,22 @@
 -- the timer fires, through §3.3's existing cancel transition: a flagged
 -- pending turn is cancelled and never dispatched, a flagged turn in flight
 -- is sent the sandbox `stop` command and cancelled once StopGrace passes if
--- it has not ended, its sandbox generation then retired. A turn created
--- after the request carries no flag and runs normally.
+-- it has not ended, its sandbox generation then retired (not before that
+-- generation has finished delivering an earlier turn's push and pull
+-- request, within MCPStatusDeliveryWindow). A turn created after the
+-- request carries no flag and runs normally.
 --
 -- sessions.stop_requested_at also refuses a new child session of a stopped
--- parent (httpapi.CreateSessionOnTx reads it FOR SHARE), until the next
--- turn a person creates on the session, or the approval of its plan,
--- clears it. Stop is not an archive.
+-- parent (httpapi.CreateSessionOnTx reads it FOR SHARE), until a person's
+-- next act that sets the session going again clears it: a turn they
+-- create, their approval of its plan, or their approval or revision of a
+-- workflow step awaiting their decision. Stop is not an archive.
 --
 -- Both columns are nullable, with no default: NULL means no stop was
--- requested. A repeated request keeps the first instant (COALESCE), so the
--- grace a turn in flight gets runs from the first request.
+-- requested. A repeated request keeps each turn's first instant (COALESCE),
+-- so the grace a turn in flight gets runs from the first request that
+-- reached it, and moves the session's to its own (GREATEST), which the
+-- disarming of scheduled work is measured against.
 --
 -- # Locks
 --

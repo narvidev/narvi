@@ -574,6 +574,7 @@ SELECT
     id,
     status,
     stop_requested_at,
+    dispatched_sandbox_gen,
     COALESCE(stop_requested_at <= now() - make_interval(secs => $1::float8), false)::boolean AS grace_elapsed
 FROM turns
 WHERE session_id = $2
@@ -588,10 +589,11 @@ type ListStopRequestedOpenTurnsParams struct {
 }
 
 type ListStopRequestedOpenTurnsRow struct {
-	ID              pgtype.UUID        `json:"id"`
-	Status          TurnStatus         `json:"status"`
-	StopRequestedAt pgtype.Timestamptz `json:"stop_requested_at"`
-	GraceElapsed    bool               `json:"grace_elapsed"`
+	ID                   pgtype.UUID        `json:"id"`
+	Status               TurnStatus         `json:"status"`
+	StopRequestedAt      pgtype.Timestamptz `json:"stop_requested_at"`
+	DispatchedSandboxGen *int32             `json:"dispatched_sandbox_gen"`
+	GraceElapsed         bool               `json:"grace_elapsed"`
 }
 
 // The session's flagged turns still open, oldest first, for the actor's
@@ -600,7 +602,9 @@ type ListStopRequestedOpenTurnsRow struct {
 // fires_at with -- so neither the decision between sending the sandbox
 // `stop` and cancelling, nor the instant the timer is re-armed for
 // (stop_requested_at plus the grace), depends on the skew between the
-// database and this replica.
+// database and this replica. dispatched_sandbox_gen tells the handler
+// whether cancelling a turn in flight would retire the sandbox's current
+// gen (sessionactor's deliveryHold and retireStoppedGen).
 func (q *Queries) ListStopRequestedOpenTurns(ctx context.Context, arg ListStopRequestedOpenTurnsParams) ([]ListStopRequestedOpenTurnsRow, error) {
 	rows, err := q.db.Query(ctx, listStopRequestedOpenTurns, arg.GraceSeconds, arg.SessionID)
 	if err != nil {
@@ -614,6 +618,7 @@ func (q *Queries) ListStopRequestedOpenTurns(ctx context.Context, arg ListStopRe
 			&i.ID,
 			&i.Status,
 			&i.StopRequestedAt,
+			&i.DispatchedSandboxGen,
 			&i.GraceElapsed,
 		); err != nil {
 			return nil, err

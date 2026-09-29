@@ -354,13 +354,14 @@ func TestDispatchSameStepRevision_NeverEscalates_RegardlessOfLoopLength(t *testi
 
 // TestApplyStepOutcome_NextAttemptLeavesAPersonsStopStanding: a workflow's
 // next attempt is a turn the engine inserts, never one a person creates, so
-// it leaves a person's stop request standing (technical plan §3.3: only the
-// next turn a person creates, or the approval of the session's plan, clears
-// it). Reached here through ApplyStepOutcome -- the authority a person's
-// HITL step decision also calls, and the one way a run still advances while
-// a stop stands (OnTurnCompleted never consults NextStep then) -- on a
-// session whose request stands: the next attempt's turn is inserted, and
-// sessions.stop_requested_at keeps its instant.
+// inserting it leaves a person's stop request standing (technical plan
+// §3.3: only a person's own act clears it -- a turn they create, a plan
+// they approve, or a workflow step they approve or revise). Reached here
+// through ApplyStepOutcome -- the authority a person's HITL approve also
+// calls, whose route clears the request itself, before this runs
+// (httpapi's DecideWorkflowStep; TestStopSession_HITLDecisionResumes) --
+// on a session whose request stands: the next attempt's turn is inserted,
+// and sessions.stop_requested_at keeps its instant.
 func TestApplyStepOutcome_NextAttemptLeavesAPersonsStopStanding(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)

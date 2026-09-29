@@ -278,6 +278,39 @@ func (q *Queries) GetSandboxBootingElapsed(ctx context.Context, arg GetSandboxBo
 	return elapsed_nanos, err
 }
 
+const getSandboxPRDelivery = `-- name: GetSandboxPRDelivery :one
+SELECT status, gen, pr_delivery_started_at, now()::timestamptz AS observed_at
+FROM sandboxes
+WHERE session_id = $1
+`
+
+type GetSandboxPRDeliveryRow struct {
+	Status              SandboxStatus      `json:"status"`
+	Gen                 int32              `json:"gen"`
+	PrDeliveryStartedAt pgtype.Timestamptz `json:"pr_delivery_started_at"`
+	ObservedAt          pgtype.Timestamptz `json:"observed_at"`
+}
+
+// Read by the stop timer's handler (technical plan §3.3,
+// sessionactor.deliveryHold) before it retires the sandbox gen a stopped
+// turn ran on: whether a completed turn's push and pull request, stamped
+// by StartSandboxPRDelivery, are still being delivered by this sandbox.
+// observed_at is now() on the database's clock, the clock that wrote the
+// stamp and the one the timer pump compares fires_at with, so neither the
+// window's end nor the instant the stop timer is re-armed for depends on
+// the skew between the database and the replica.
+func (q *Queries) GetSandboxPRDelivery(ctx context.Context, sessionID pgtype.UUID) (GetSandboxPRDeliveryRow, error) {
+	row := q.db.QueryRow(ctx, getSandboxPRDelivery, sessionID)
+	var i GetSandboxPRDeliveryRow
+	err := row.Scan(
+		&i.Status,
+		&i.Gen,
+		&i.PrDeliveryStartedAt,
+		&i.ObservedAt,
+	)
+	return i, err
+}
+
 const listLiveSandboxProviderIDs = `-- name: ListLiveSandboxProviderIDs :many
 SELECT provider_id FROM sandboxes
 WHERE status IN ('spawning', 'connecting', 'booting', 'ready', 'snapshotting', 'suspect')

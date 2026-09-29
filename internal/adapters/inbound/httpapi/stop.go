@@ -85,9 +85,11 @@ type StopSessionDeps struct {
 // then stops too -- writes its own session.stop audit row, and re-arms the
 // stop timer. A turn keeps the instant it was first flagged, so its grace
 // runs from the first request that reached it (RequestStopOpenTurns'
-// COALESCE). requestedAt is the first request's instant unless a person
-// resumed the session in between, which makes the repeat a new request
-// (RequestSessionStop's COALESCE over a cleared flag).
+// COALESCE). The session keeps its latest request's instant, which
+// requestedAt answers (RequestSessionStop's GREATEST): a repeat moves it
+// forward, so the stop timer's handler also disarms the work-creating
+// timers armed since an earlier request -- a re-review debounce a push
+// armed between the two.
 func StopSession(deps StopSessionDeps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
@@ -231,8 +233,8 @@ func stopDescendants(ctx context.Context, deps StopSessionDeps, rootID, actorUse
 
 // requestSessionStop writes the stop request to one session in its own
 // transaction -- see this file's top comment -- then wakes its actor. detail
-// is the audit row's detail, gaining open_turns. Returns the instant the
-// request now in force was first made and how many turns it flagged.
+// is the audit row's detail, gaining open_turns. Returns the session's
+// request instant, now this request's, and how many turns it flagged.
 func requestSessionStop(ctx context.Context, deps StopSessionDeps, sessionID, actorUserID pgtype.UUID, detail map[string]any) (pgtype.Timestamptz, int, error) {
 	tx, err := deps.Pool.Begin(ctx)
 	if err != nil {
@@ -255,9 +257,9 @@ func requestSessionStop(ctx context.Context, deps StopSessionDeps, sessionID, ac
 		return pgtype.Timestamptz{}, 0, err
 	}
 	// Due at once. requestedAt is on the database's clock -- the clock the
-	// pump compares fires_at with -- and never later than its now(): this
-	// transaction's own instant for a first request, the first request's
-	// for a repeat.
+	// pump compares fires_at with -- and never later than its current
+	// time: this transaction's own instant, or an earlier request's when
+	// that one began later (RequestSessionStop's GREATEST).
 	if _, err := deps.Timers.WithTx(tx).Upsert(ctx, sqlcgen.UpsertSessionTimerParams{
 		SessionID: sessionID,
 		Name:      sessionactor.TimerStop,

@@ -128,16 +128,20 @@ func OnTurnCompleted(ctx context.Context, deps Deps, sessionRow sqlcgen.Session,
 	}
 
 	// Technical plan §3.3's stop. While the session's stop request stands
-	// -- sessions.stop_requested_at, which only a person's next turn or
-	// plan approval clears -- an attempt that ends, however it ends, ends
-	// its run cancelled, before a HITL gate or workflow.NextStep is ever
-	// reached. An advance is a turn created with no new input: an attempt
-	// that completed before the stop reached it, failed, timed out, or was
-	// created after the request would otherwise queue the next step, and
-	// the stop would not stop. A cancel the stop asked for (the turn's own
-	// flag) ends the run the same way even once a person has resumed the
-	// session: read as 'blocked', it would let a custom definition's edge
-	// queue the next step. Any other cancel keeps the path below.
+	// -- sessions.stop_requested_at, which only a person's next act that
+	// sets the session going again clears: a turn they create, a plan they
+	// approve, or a workflow step awaiting their decision that they approve
+	// or revise (httpapi's DecideWorkflowStep, so the attempt that decision
+	// dispatches runs with the request cleared) -- an attempt that ends,
+	// however it ends, ends its run cancelled, before a HITL gate or
+	// workflow.NextStep is ever reached. An advance is a turn created with
+	// no new input: an attempt that completed before the stop reached it,
+	// failed, timed out, or was created after the request would otherwise
+	// queue the next step, and the stop would not stop. A cancel the stop
+	// asked for (the turn's own flag) ends the run the same way even once a
+	// person has resumed the session: read as 'blocked', it would let a
+	// custom definition's edge queue the next step. Any other cancel keeps
+	// the path below.
 	stopped := sessionRow.StopRequestedAt.Valid
 	if !stopped && trig == turn.TriggerCancel {
 		flagged, err := turnStopRequested(ctx, deps, turnID)

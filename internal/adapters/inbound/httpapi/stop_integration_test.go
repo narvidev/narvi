@@ -142,8 +142,9 @@ func (c *stopCommander) ofType(t *testing.T, typ string) []map[string]any {
 }
 
 // stopRig is one replica: its registry (actor host and timer pump) with
-// the fake sandbox, and a server mounting the stop route beside the turn
-// and plan-approval routes a person resumes a session through.
+// the fake sandbox, and a server mounting the stop route beside the turn,
+// plan-approval and workflow-step decision routes a person resumes a
+// session through.
 type stopRig struct {
 	pool         *pgxpool.Pool
 	sessions     *narvipg.SessionStore
@@ -225,6 +226,11 @@ func newStopRig(t *testing.T, cfg stopRigConfig) *stopRig {
 		}))
 		api.Post("/{sessionID}/turns", httpapi.CreateTurn(pool, r.sessions, r.turns, r.plans, r.participants, r.auditLog, r.registry, nil, nil, false))
 		api.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(pool, r.sessions, r.turns, r.plans, narvipg.NewEventStore(pool), narvipg.NewPlanDocumentStore(pool), r.participants, narvipg.NewOutboxStore(pool, false), narvipg.NewLinearAgentSessionStore(pool), r.auditLog, r.registry, false))
+	})
+	// Mounted as controlplane/serve.go mounts it.
+	router.Route("/api/workflow-runs", func(api chi.Router) {
+		api.Use(auth.Middleware(r.userSessions, r.users))
+		api.Post("/{runId}/steps/{stepRunId}/decide", httpapi.DecideWorkflowStep(pool, r.sessions, r.turns, r.participants, r.workflows, narvipg.NewSlackThreadSessionStore(pool), narvipg.NewLinearAgentSessionStore(pool), r.prSessions, narvipg.NewOutboxStore(pool, false), r.registry, false))
 	})
 	r.server = httptest.NewServer(router)
 	t.Cleanup(r.server.Close)
@@ -529,6 +535,58 @@ func agentReports(ctx context.Context, t *testing.T, registry *sessionactor.Regi
 		t.Fatal("execution_complete not handled")
 	}
 	actorBarrier(ctx, t, registry, sessionID)
+}
+
+// agentEvent delivers one agent event of type typ at gen, built by build
+// from a fresh messageId, to the session's actor on registry, and waits
+// for it to be handled, the post-commit work it starts included.
+func agentEvent(ctx context.Context, t *testing.T, registry *sessionactor.Registry, sessionID pgtype.UUID, typ string, gen int, build func(messageID string) any) {
+	t.Helper()
+	messageID := uuid.NewString()
+	raw, err := json.Marshal(build(messageID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	actor, err := registry.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	reply := make(chan sessionactor.SandboxEventOutcome, 1)
+	if err := actor.Send(ctx, sessionactor.SandboxEvent{Type: typ, Gen: gen, MessageID: messageID, Raw: raw, Reply: reply}); err != nil {
+		t.Fatalf("send %s: %v", typ, err)
+	}
+	select {
+	case <-reply:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s not handled", typ)
+	}
+	actorBarrier(ctx, t, registry, sessionID)
+}
+
+// agentSnapshotReady answers the snapshot a turn's end started, as the
+// agent does once it has minted it: waits for the sandbox to be
+// snapshotting, then sends snapshot_ready at gen echoing the last snapshot
+// command's messageId, which moves the sandbox back to ready and
+// dispatches whatever is queued.
+func (r *stopRig) agentSnapshotReady(ctx context.Context, t *testing.T, sessionID pgtype.UUID, gen int) {
+	t.Helper()
+	stopEventually(t, 10*time.Second, "the snapshot a turn's end starts", func() bool {
+		return r.sandboxRow(ctx, t, sessionID).Status == sqlcgen.SandboxStatusSnapshotting
+	})
+	commands := r.commander.ofType(t, "snapshot")
+	if len(commands) == 0 {
+		t.Fatal("the sandbox is snapshotting but no snapshot command was sent")
+	}
+	command, _ := commands[len(commands)-1]["messageId"].(string)
+	agentEvent(ctx, t, r.registry, sessionID, "snapshot_ready", gen, func(messageID string) any {
+		return sandboxws.SnapshotReady{
+			Type: "snapshot_ready", MessageId: messageID, SessionId: sessionID.String(), Gen: gen,
+			AckId: "snapshot_ready:" + messageID, CommandMessageId: &command, SnapshotId: "snapshot-" + messageID,
+		}
+	})
+	if sb := r.sandboxRow(ctx, t, sessionID); sb.Status != sqlcgen.SandboxStatusReady {
+		t.Fatalf("sandbox = %s after snapshot_ready, want ready", sb.Status)
+	}
 }
 
 // actorBarrier returns once the session's actor on registry has finished
@@ -1573,6 +1631,10 @@ func TestStopSession_SilentGraceMovesTheNextTurnToANewGen(t *testing.T) {
 			if _, err := rig.pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready' WHERE session_id = $1 AND gen = 2`, session.ID); err != nil {
 				t.Fatal(err)
 			}
+			// With the new gen ready and the next turn still queued, a
+			// dropped event that ran its post-commit dispatch would send
+			// the next turn now: it must not.
+			lateEnds("once the new gen is ready with the next turn still queued")
 			agentHeartbeat(ctx, t, rig.registry, session.ID, 2)
 			if gens := rig.commander.promptGens(t); !slices.Equal(gens, []int{2}) {
 				t.Fatalf("prompt frames at gens %v, want one at gen 2", gens)
@@ -1823,4 +1885,560 @@ func TestStopSession_RacingGrandchildSpawnReached(t *testing.T) {
 		t.Fatalf("stop = %d reaching %v, want 202 reaching %v: the grandchild is an orphan", got.status, got.resp.ReachedSessionIds, want)
 	}
 	assertChildStopped(ctx, t, rig, grandchild.ID)
+}
+
+// hitlRun is a run of a custom three-step definition: step 1 gated by a
+// person's decision (hitl_after), then 'ok' edges from step 1 to step 2
+// and from step 2 to step 3.
+type hitlRun struct {
+	id pgtype.UUID
+}
+
+// startHITLRun creates that definition and its run on sessionID, with step
+// 1's attempt processing on the sandbox at gen 1.
+func (r *stopRig) startHITLRun(ctx context.Context, t *testing.T, sessionID pgtype.UUID) hitlRun {
+	t.Helper()
+	var defID pgtype.UUID
+	if err := r.pool.QueryRow(ctx, `INSERT INTO workflow_definitions (lane, name, is_built_in, version) VALUES ('request', 'stop-hitl-test', false, 1) RETURNING id`).Scan(&defID); err != nil {
+		t.Fatal(err)
+	}
+	var steps [3]pgtype.UUID
+	for i := range steps {
+		if err := r.pool.QueryRow(ctx, `INSERT INTO workflow_step_definitions (workflow_definition_id, step_order, kind, prompt_template, hitl_after) VALUES ($1, $2, 'agent', '{{prompt}}', $3) RETURNING id`, defID, i+1, i == 0).Scan(&steps[i]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i+1 < len(steps); i++ {
+		if _, err := r.pool.Exec(ctx, `INSERT INTO workflow_edges (workflow_definition_id, from_step_id, to_step_id, on_status) VALUES ($1, $2, $3, 'ok')`, defID, steps[i], steps[i+1]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	run, err := r.workflows.CreateRun(ctx, sessionID, "request", defID, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stepRun, err := r.workflows.CreateStepRun(ctx, run.ID, steps[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	attempt := r.processingTurn(ctx, t, sessionID, 1)
+	if err := r.workflows.AttachTurn(ctx, stepRun.ID, attempt.ID); err != nil {
+		t.Fatal(err)
+	}
+	return hitlRun{id: run.ID}
+}
+
+// runState returns a workflow run's status and each of its step runs as
+// "<step order>:<status>", oldest first.
+func (r *stopRig) runState(ctx context.Context, t *testing.T, runID pgtype.UUID) (string, []string) {
+	t.Helper()
+	var status string
+	if err := r.pool.QueryRow(ctx, `SELECT status::text FROM workflow_runs WHERE id = $1`, runID).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := r.pool.Query(ctx, `SELECT sd.step_order, sr.status::text FROM workflow_step_runs sr
+		JOIN workflow_step_definitions sd ON sd.id = sr.step_definition_id
+		WHERE sr.workflow_run_id = $1 ORDER BY sr.created_at, sr.id`, runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var steps []string
+	for rows.Next() {
+		var order int32
+		var stepStatus string
+		if err := rows.Scan(&order, &stepStatus); err != nil {
+			t.Fatal(err)
+		}
+		steps = append(steps, fmt.Sprintf("%d:%s", order, stepStatus))
+	}
+	return status, steps
+}
+
+// stepRunIn returns the id and turn of runID's one step run in status,
+// failing with the run's whole state when there is none.
+func (r *stopRig) stepRunIn(ctx context.Context, t *testing.T, runID pgtype.UUID, status string) (id, turnID pgtype.UUID) {
+	t.Helper()
+	if err := r.pool.QueryRow(ctx, `SELECT id, turn_id FROM workflow_step_runs WHERE workflow_run_id = $1 AND status::text = $2`, runID, status).Scan(&id, &turnID); err != nil {
+		runStatus, steps := r.runState(ctx, t, runID)
+		t.Fatalf("no step run %s (%v): run %s, step runs %v", status, err, runStatus, steps)
+	}
+	return id, turnID
+}
+
+// decide POSTs a person's decision on stepRunID of runID.
+func (r *stopRig) decide(t *testing.T, token string, runID, stepRunID pgtype.UUID, body string) restdtos.WorkflowStepDecideResponse {
+	t.Helper()
+	status, raw := r.post(t, "/api/workflow-runs/"+runID.String()+"/steps/"+stepRunID.String()+"/decide", token, []byte(body))
+	if status != http.StatusOK {
+		t.Fatalf("decide %s: status %d %s", body, status, raw)
+	}
+	var resp restdtos.WorkflowStepDecideResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+// runAttempt waits for the actor to dispatch turnID, lets the agent
+// complete it at gen 1, and answers the snapshot its end starts, which
+// dispatches whatever it queued.
+func (r *stopRig) runAttempt(ctx context.Context, t *testing.T, sessionID, turnID pgtype.UUID) {
+	t.Helper()
+	stopEventually(t, 10*time.Second, "the attempt dispatches", func() bool {
+		return r.turnRow(ctx, t, turnID).Status == sqlcgen.TurnStatusProcessing
+	})
+	agentReports(ctx, t, r.registry, sessionID, 1, sandboxws.ExecutionCompleteOutcomeCompleted)
+	if got := r.turnRow(ctx, t, turnID).Status; got != sqlcgen.TurnStatusCompleted {
+		t.Fatalf("attempt = %s after its execution_complete, want completed", got)
+	}
+	r.agentSnapshotReady(ctx, t, sessionID, 1)
+}
+
+// TestStopSession_HITLDecisionResumes: a workflow step awaiting a person's
+// decision when the session is stopped keeps waiting, and the decision is a
+// new human act, as approving the session's plan is (technical plan §3.3).
+// Approving or revising the step resumes the session: the decide route
+// clears the stop request in its own transaction, the attempt it
+// dispatches runs, and the run goes on through its remaining steps to
+// completion -- left standing, the request would let that attempt run and
+// then end the run cancelled. Rejecting it ends the run failed, as it did
+// before the stop existed, dispatches nothing, and leaves the stop
+// standing, as rejecting a plan does. The real decide route behind the
+// real auth middleware, with the real actor.
+func TestStopSession_HITLDecisionResumes(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		verdict string
+		body    string
+	}{
+		{"approve", `{"verdict":"approve","text":null}`},
+		{"revise", `{"verdict":"revise","text":"narrow it to the parser"}`},
+		{"reject", `{"verdict":"reject","text":null}`},
+	} {
+		t.Run(tc.verdict, func(t *testing.T) {
+			rig := newStopRig(t, stopRigConfig{})
+			owner, token := rig.user(ctx, t, sqlcgen.UserRoleMember)
+			session := rig.session(ctx, t, owner.ID, pgtype.UUID{})
+			rig.readySandbox(ctx, t, session.ID, 1)
+			run := rig.startHITLRun(ctx, t, session.ID)
+
+			// The first step's attempt completes; the step waits for a person.
+			agentReports(ctx, t, rig.registry, session.ID, 1, sandboxws.ExecutionCompleteOutcomeCompleted)
+			rig.agentSnapshotReady(ctx, t, session.ID, 1)
+			awaiting, _ := rig.stepRunIn(ctx, t, run.id, "awaiting_decision")
+
+			status, resp := rig.stop(t, session.ID.String(), token)
+			if status != http.StatusAccepted || resp.OpenTurns != 0 {
+				t.Fatalf("stop: status %d, %d open turns; want 202 with none open", status, resp.OpenTurns)
+			}
+			pumpUntil(ctx, t, rig.registry, 10*time.Second, "the stop, with nothing open, handled", func() bool {
+				return !slices.Contains(rig.timerNames(ctx, t, session.ID), sessionactor.TimerStop)
+			})
+			if runStatus, steps := rig.runState(ctx, t, run.id); runStatus != "running" || !slices.Equal(steps, []string{"1:awaiting_decision"}) {
+				t.Fatalf("after the stop: run %s, step runs %v; want the step still awaiting its decision", runStatus, steps)
+			}
+
+			decided := rig.decide(t, token, run.id, awaiting, tc.body)
+			stopStands := rig.sessionRow(ctx, t, session.ID).StopRequestedAt.Valid
+
+			if tc.verdict == "reject" {
+				if decided.RunStatus != "failed" || decided.TurnId != nil || !stopStands {
+					t.Fatalf("reject: run %s, turn %v, stop standing %v; want the run failed, no turn, and the stop left standing", decided.RunStatus, decided.TurnId, stopStands)
+				}
+				actorBarrier(ctx, t, rig.registry, session.ID)
+				runStatus, steps := rig.runState(ctx, t, run.id)
+				turns, err := rig.turns.ListForSession(ctx, session.ID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if runStatus != "failed" || !slices.Equal(steps, []string{"1:failed"}) || len(turns) != 1 || len(rig.commander.ofType(t, "prompt")) != 0 {
+					t.Fatalf("reject: run %s, step runs %v, %d turns, prompts %v; want the run failed and nothing dispatched", runStatus, steps, len(turns), rig.commander.promptGens(t))
+				}
+				return
+			}
+
+			if decided.RunStatus != "running" || decided.TurnId == nil || stopStands {
+				t.Fatalf("%s: run %s, turn %v, stop standing %v; want the run running with a turn, and the session resumed", tc.verdict, decided.RunStatus, decided.TurnId, stopStands)
+			}
+			var next pgtype.UUID
+			if err := next.Scan(string(*decided.TurnId)); err != nil {
+				t.Fatal(err)
+			}
+			want := []string{"1:completed"}
+
+			if tc.verdict == "revise" {
+				// The revised attempt runs, and stops at step 1's gate again:
+				// the run goes on, awaiting the next decision.
+				rig.runAttempt(ctx, t, session.ID, next)
+				runStatus, steps := rig.runState(ctx, t, run.id)
+				if runStatus != "running" || !slices.Equal(steps, []string{"1:completed", "1:awaiting_decision"}) {
+					t.Fatalf("after the revised attempt: run %s, step runs %v; want the run running, step 1 awaiting its decision again", runStatus, steps)
+				}
+				awaiting, _ = rig.stepRunIn(ctx, t, run.id, "awaiting_decision")
+				decided = rig.decide(t, token, run.id, awaiting, `{"verdict":"approve","text":null}`)
+				if decided.RunStatus != "running" || decided.TurnId == nil {
+					t.Fatalf("approve after the revision: run %s, turn %v", decided.RunStatus, decided.TurnId)
+				}
+				if err := next.Scan(string(*decided.TurnId)); err != nil {
+					t.Fatal(err)
+				}
+				want = append(want, "1:completed")
+			}
+
+			// The second step's attempt runs and queues the third's, which
+			// runs and ends the run.
+			rig.runAttempt(ctx, t, session.ID, next)
+			_, step3 := rig.stepRunIn(ctx, t, run.id, "running")
+			rig.runAttempt(ctx, t, session.ID, step3)
+
+			runStatus, steps := rig.runState(ctx, t, run.id)
+			want = append(want, "2:completed", "3:completed")
+			if runStatus != "completed" || !slices.Equal(steps, want) {
+				t.Fatalf("run %s, step runs %v; want completed, %v", runStatus, steps, want)
+			}
+			for _, gen := range rig.commander.promptGens(t) {
+				if gen != 1 {
+					t.Fatalf("prompt frames at gens %v, want every one at gen 1", rig.commander.promptGens(t))
+				}
+			}
+		})
+	}
+}
+
+// TestStopSession_RetirementWaitsForADelivery: a stopped turn whose grace
+// ends while its sandbox gen still delivers the push and pull request of
+// the turn that completed before it is left in flight, and the gen kept:
+// stopping the sandbox would kill that delivery, which technical plan
+// §3.3 keeps as the completed turn's result. The agent handles a push
+// before any frame sent after it, the stop included, so here it is silent
+// through the push. The stopped turn is then cancelled and its gen retired
+// at the stop timer's first fire after the delivery ends -- its push
+// failed -- or, with no word from it, after MCPStatusDeliveryWindow from
+// its start has run.
+func TestStopSession_RetirementWaitsForADelivery(t *testing.T) {
+	ctx := context.Background()
+	const grace = 2 * time.Second
+
+	for _, tc := range []struct {
+		name string
+		// deliveryEnds ends the delivery, or lets its window run out.
+		deliveryEnds func(t *testing.T, rig *stopRig, sessionID pgtype.UUID)
+	}{
+		{"its push fails", func(t *testing.T, rig *stopRig, sessionID pgtype.UUID) {
+			agentEvent(ctx, t, rig.registry, sessionID, "push_error", 1, func(messageID string) any {
+				return sandboxws.PushError{Type: "push_error", MessageId: messageID, SessionId: sessionID.String(), Gen: 1, AckId: "push_error:" + messageID, Error: "remote rejected"}
+			})
+			if rig.sandboxRow(ctx, t, sessionID).PrDeliveryStartedAt.Valid {
+				t.Fatal("push_error left the delivery stamped")
+			}
+		}},
+		{"its window runs out", func(t *testing.T, rig *stopRig, sessionID pgtype.UUID) {
+			// The delivery started a window ago, less a second.
+			if _, err := rig.pool.Exec(ctx, `UPDATE sandboxes SET pr_delivery_started_at = now() - make_interval(secs => $2) WHERE session_id = $1`,
+				sessionID, (rig.timeouts.MCPStatusDeliveryWindow - time.Second).Seconds()); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &stopProvider{}
+			rig := newStopRig(t, stopRigConfig{grace: grace, provider: provider})
+			owner, token := rig.user(ctx, t, sqlcgen.UserRoleMember)
+			repos, err := json.Marshal([]map[string]any{{"name": "widgets", "url": "https://github.com/example-org/widgets.git", "branch": "narvi/feature"}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			session, err := rig.sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb, CreatedBy: owner.ID, Repos: repos})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := narvipg.NewRepoSettingsStore(rig.pool).UpsertLiveEgressEnabled(ctx, "example-org/widgets", true); err != nil {
+				t.Fatal(err)
+			}
+			rig.readySandbox(ctx, t, session.ID, 1)
+			rig.processingTurn(ctx, t, session.ID, 1)
+
+			// The turn before completes: its push is sent, and its delivery
+			// stamped until the push reports back.
+			agentReports(ctx, t, rig.registry, session.ID, 1, sandboxws.ExecutionCompleteOutcomeCompleted)
+			if pushes := rig.commander.ofType(t, "push"); len(pushes) != 1 || !rig.sandboxRow(ctx, t, session.ID).PrDeliveryStartedAt.Valid {
+				t.Fatalf("setup: %d push frames, delivery stamped %v; want the completed turn's push sent and its delivery under way", len(pushes), rig.sandboxRow(ctx, t, session.ID).PrDeliveryStartedAt.Valid)
+			}
+			rig.agentSnapshotReady(ctx, t, session.ID, 1)
+
+			status, raw := rig.post(t, "/api/sessions/"+session.ID.String()+"/turns", token, []byte(`{"prompt":"next","modelId":null,"effort":null,"planMode":false}`))
+			if status != http.StatusCreated {
+				t.Fatalf("prompt: status %d %s", status, raw)
+			}
+			var created restdtos.CreateTurnResponse
+			if err := json.Unmarshal(raw, &created); err != nil {
+				t.Fatal(err)
+			}
+			var stopped pgtype.UUID
+			if err := stopped.Scan(created.Id); err != nil {
+				t.Fatal(err)
+			}
+			stopEventually(t, 10*time.Second, "the next turn dispatches", func() bool {
+				return rig.turnRow(ctx, t, stopped).Status == sqlcgen.TurnStatusProcessing
+			})
+			if status, _ := rig.stop(t, session.ID.String(), token); status != http.StatusAccepted {
+				t.Fatalf("stop: status %d", status)
+			}
+
+			// The stop's first fire tells the agent and arms the timer for
+			// exactly the grace's end, when it is next due.
+			flag := rig.turnRow(ctx, t, stopped).StopRequestedAt.Time
+			stopTimer := func() (pgtype.Timestamptz, bool) {
+				timer, err := rig.timers.Get(ctx, sqlcgen.GetSessionTimerParams{SessionID: session.ID, Name: sessionactor.TimerStop})
+				return timer.FiresAt, err == nil
+			}
+			stopEventually(t, 10*time.Second, "the stop is sent and the timer armed for the grace's end", func() bool {
+				firesAt, armed := stopTimer()
+				return len(rig.commander.ofType(t, "stop")) >= 1 && armed && firesAt.Time.Equal(flag.Add(grace))
+			})
+			// The grace runs out while the agent is still on the push. Each
+			// fire from then on finds it run, and either cancels the turn or,
+			// holding it, tells the agent again. Two looks: the one at the
+			// grace's end, and the next, a grace later, with the delivery
+			// still under way.
+			time.Sleep(time.Until(flag.Add(grace)))
+			for _, look := range []string{"at the grace's end", "a grace later"} {
+				told := len(rig.commander.ofType(t, "stop"))
+				pumpUntil(ctx, t, rig.registry, 15*time.Second, "the stop timer's fire "+look, func() bool {
+					return len(rig.commander.ofType(t, "stop")) > told || rig.turnRow(ctx, t, stopped).Status != sqlcgen.TurnStatusProcessing
+				})
+				if got := rig.turnRow(ctx, t, stopped).Status; got != sqlcgen.TurnStatusProcessing {
+					t.Fatalf("stopped turn = %s %s, want still processing: its gen still delivers the completed turn's push", got, look)
+				}
+			}
+			sb := rig.sandboxRow(ctx, t, session.ID)
+			if sb.Status != sqlcgen.SandboxStatusReady || sb.Gen != 1 || !sb.PrDeliveryStartedAt.Valid {
+				t.Fatalf("sandbox = %s at gen %d, delivery stamped %v; want ready at gen 1, still delivering", sb.Status, sb.Gen, sb.PrDeliveryStartedAt.Valid)
+			}
+			if _, _, stoppedObjects := provider.calls(); len(stoppedObjects) != 0 {
+				t.Fatalf("provider stops = %v while the delivery is under way, want none", stoppedObjects)
+			}
+			// Looked at again within a grace, never past the window's end.
+			if firesAt, armed := stopTimer(); !armed || firesAt.Time.After(sb.PrDeliveryStartedAt.Time.Add(rig.timeouts.MCPStatusDeliveryWindow)) || firesAt.Time.After(time.Now().Add(grace+time.Second)) {
+				t.Fatalf("stop timer armed %v for %v; want it re-armed within a grace, and never past the delivery window's end %v", armed, firesAt.Time, sb.PrDeliveryStartedAt.Time.Add(rig.timeouts.MCPStatusDeliveryWindow))
+			}
+
+			tc.deliveryEnds(t, rig, session.ID)
+			pumpUntil(ctx, t, rig.registry, 20*time.Second, "the stopped turn cancelled once the delivery is over", func() bool {
+				return rig.turnRow(ctx, t, stopped).Status == sqlcgen.TurnStatusCancelled
+			})
+			if sb := rig.sandboxRow(ctx, t, session.ID); sb.Status != sqlcgen.SandboxStatusStopped || sb.Gen != 1 {
+				t.Fatalf("sandbox = %s at gen %d, want gen 1 retired (stopped) now", sb.Status, sb.Gen)
+			}
+			if _, _, stoppedObjects := provider.calls(); !slices.Equal(stoppedObjects, []string{providerIDForGen(1)}) {
+				t.Fatalf("provider stops = %v, want the retired gen's object %s", stoppedObjects, providerIDForGen(1))
+			}
+			if n := rig.syntheticCompletes(ctx, t, session.ID)[stopped.String()]; n != 1 {
+				t.Fatalf("%d synthetic execution_complete events for the stopped turn, want exactly 1", n)
+			}
+			pumpUntil(ctx, t, rig.registry, 10*time.Second, "the stop timer ends", func() bool {
+				return !slices.Contains(rig.timerNames(ctx, t, session.ID), sessionactor.TimerStop)
+			})
+		})
+	}
+}
+
+// TestStopSession_RepeatDisarmsTimersArmedSinceTheFirst: a repeated stop
+// moves the session's request to its own instant, so the stop timer's
+// handler also disarms a work-creating timer armed between the two
+// requests -- the re-review debounce a push armed after the first -- which
+// the person stopped over too. requestedAt answers the latest request.
+func TestStopSession_RepeatDisarmsTimersArmedSinceTheFirst(t *testing.T) {
+	ctx := context.Background()
+	rig := newStopRig(t, stopRigConfig{})
+	owner, token := rig.user(ctx, t, sqlcgen.UserRoleMember)
+	session := rig.session(ctx, t, owner.ID, pgtype.UUID{})
+
+	status, first := rig.stop(t, session.ID.String(), token)
+	if status != http.StatusAccepted {
+		t.Fatalf("first stop: status %d", status)
+	}
+	pumpUntil(ctx, t, rig.registry, 10*time.Second, "the first stop handled", func() bool {
+		return !slices.Contains(rig.timerNames(ctx, t, session.ID), sessionactor.TimerStop)
+	})
+	// A push after the first stop arms the debounce.
+	if _, err := rig.timers.Upsert(ctx, sqlcgen.UpsertSessionTimerParams{
+		SessionID: session.ID, Name: sessionactor.TimerReviewRetriggerDebounce,
+		FiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+	}); err != nil {
+		t.Fatalf("arm debounce: %v", err)
+	}
+
+	status, second := rig.stop(t, session.ID.String(), token)
+	if status != http.StatusAccepted {
+		t.Fatalf("second stop: status %d", status)
+	}
+	pumpUntil(ctx, t, rig.registry, 10*time.Second, "the second stop handled", func() bool {
+		return !slices.Contains(rig.timerNames(ctx, t, session.ID), sessionactor.TimerStop)
+	})
+	if names := rig.timerNames(ctx, t, session.ID); slices.Contains(names, sessionactor.TimerReviewRetriggerDebounce) {
+		t.Fatalf("timers = %v: the debounce armed between the two stops survived the second", names)
+	}
+	if !second.RequestedAt.After(first.RequestedAt) {
+		t.Fatalf("requestedAt = %v, then %v: want the second request's own, later instant", first.RequestedAt, second.RequestedAt)
+	}
+	if got := rig.sessionRow(ctx, t, session.ID).StopRequestedAt.Time; !got.Equal(second.RequestedAt) {
+		t.Fatalf("sessions.stop_requested_at = %v, want the latest request's %v", got, second.RequestedAt)
+	}
+}
+
+// TestStopSession_WorkflowCancelAfterAResumeEndsTheRun: a cancel the stop
+// asked for ends its workflow run cancelled even once a person has resumed
+// the session (technical plan §3.3): with the session's request cleared,
+// the attempt's own flag is what keeps its implicit 'blocked' outcome from
+// taking a custom definition's edge to the next step. Resumed here the one
+// way a person can while the attempt is still in flight -- a code-host
+// mention, which queues behind it (CreateTurnForBot, AlwaysQueue) -- and
+// cancelled both ways a stop cancels a running attempt: the agent's own
+// execution_complete{cancelled}, and the grace's synthetic one.
+func TestStopSession_WorkflowCancelAfterAResumeEndsTheRun(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name         string
+		agentCancels bool
+	}{
+		{"the agent's cancel", true},
+		{"the grace's cancel", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newStopRig(t, stopRigConfig{grace: 2 * time.Second})
+			owner, token := rig.user(ctx, t, sqlcgen.UserRoleMember)
+			session := rig.session(ctx, t, owner.ID, pgtype.UUID{})
+			rig.readySandbox(ctx, t, session.ID, 1)
+
+			var defID, firstStep, nextStep pgtype.UUID
+			if err := rig.pool.QueryRow(ctx, `INSERT INTO workflow_definitions (lane, name, is_built_in, version) VALUES ('request', 'stop-resume-test', false, 1) RETURNING id`).Scan(&defID); err != nil {
+				t.Fatal(err)
+			}
+			for order, id := range map[int]*pgtype.UUID{1: &firstStep, 2: &nextStep} {
+				if err := rig.pool.QueryRow(ctx, `INSERT INTO workflow_step_definitions (workflow_definition_id, step_order, kind, prompt_template) VALUES ($1, $2, 'agent', '{{prompt}}') RETURNING id`, defID, order).Scan(id); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := rig.pool.Exec(ctx, `INSERT INTO workflow_edges (workflow_definition_id, from_step_id, to_step_id, on_status) VALUES ($1, $2, $3, 'blocked')`, defID, firstStep, nextStep); err != nil {
+				t.Fatal(err)
+			}
+			run, err := rig.workflows.CreateRun(ctx, session.ID, "request", defID, 1)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stepRun, err := rig.workflows.CreateStepRun(ctx, run.ID, firstStep)
+			if err != nil {
+				t.Fatal(err)
+			}
+			attempt := rig.processingTurn(ctx, t, session.ID, 1)
+			if err := rig.workflows.AttachTurn(ctx, stepRun.ID, attempt.ID); err != nil {
+				t.Fatal(err)
+			}
+
+			if status, _ := rig.stop(t, session.ID.String(), token); status != http.StatusAccepted {
+				t.Fatalf("stop: status %d", status)
+			}
+			stopEventually(t, 10*time.Second, "the stop is sent", func() bool { return len(rig.commander.ofType(t, "stop")) == 1 })
+
+			if _, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, session.ID,
+				"@narvi carry on", nil, false, false, owner.ID, nil, nil, nil, nil, nil, nil, nil, nil, false); err != nil {
+				t.Fatalf("mention: %v", err)
+			}
+			if rig.sessionRow(ctx, t, session.ID).StopRequestedAt.Valid || !rig.turnRow(ctx, t, attempt.ID).StopRequestedAt.Valid || rig.turnRow(ctx, t, attempt.ID).Status != sqlcgen.TurnStatusProcessing {
+				t.Fatal("setup: want the session resumed, with the flagged attempt still in flight")
+			}
+
+			if tc.agentCancels {
+				agentReports(ctx, t, rig.registry, session.ID, 1, sandboxws.ExecutionCompleteOutcomeCancelled)
+			}
+			pumpUntil(ctx, t, rig.registry, 15*time.Second, "the attempt cancelled", func() bool {
+				return rig.turnRow(ctx, t, attempt.ID).Status == sqlcgen.TurnStatusCancelled
+			})
+
+			runStatus, steps := rig.runState(ctx, t, run.ID)
+			if runStatus != "cancelled" || !slices.Equal(steps, []string{"1:cancelled"}) {
+				t.Fatalf("run %s, step runs %v; want the run cancelled with no next step, after a resume", runStatus, steps)
+			}
+		})
+	}
+}
+
+// TestStopSession_DeadSandboxAtTheTurnsGenEndsTheStop: a stopped turn whose
+// sandbox dies at the turn's own gen within its grace is still cancelled
+// once the grace has run, and the stop ends. There is no gen to retire --
+// a dead sandbox has no edge to suspect, and planDispatch never respawns
+// for a flagged turn in flight, so the gen does not move -- and the
+// provider is not asked to stop or spawn anything. Were a dead sandbox
+// retired like a live one, the illegal transition would roll the cancel
+// back at every fire, and the turn would stay processing until its
+// turn_deadline. The reachable way: the liveness watchdog found the
+// sandbox silent, and its terminal grace failed it.
+func TestStopSession_DeadSandboxAtTheTurnsGenEndsTheStop(t *testing.T) {
+	ctx := context.Background()
+	const grace = 3 * time.Second
+
+	for _, tc := range []struct {
+		name string
+		want sqlcgen.SandboxStatus
+		// dies kills the sandbox at gen 1, within the grace.
+		dies func(t *testing.T, rig *stopRig, sessionID pgtype.UUID)
+	}{
+		{"failed by the watchdog's terminal grace", sqlcgen.SandboxStatusFailed, func(t *testing.T, rig *stopRig, sessionID pgtype.UUID) {
+			if _, err := rig.pool.Exec(ctx, `UPDATE sandboxes SET status = 'suspect', pre_suspect_status = 'ready' WHERE session_id = $1`, sessionID); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := rig.timers.Upsert(ctx, sqlcgen.UpsertSessionTimerParams{
+				SessionID: sessionID, Name: sessionactor.TimerTerminalGrace,
+				FiresAt: pgtype.Timestamptz{Time: time.Now().Add(300 * time.Millisecond), Valid: true},
+			}); err != nil {
+				t.Fatal(err)
+			}
+			pumpUntil(ctx, t, rig.registry, 10*time.Second, "the terminal grace fails the sandbox", func() bool {
+				return rig.sandboxRow(ctx, t, sessionID).Status == sqlcgen.SandboxStatusFailed
+			})
+		}},
+		{"stopped", sqlcgen.SandboxStatusStopped, func(t *testing.T, rig *stopRig, sessionID pgtype.UUID) {
+			if _, err := rig.pool.Exec(ctx, `UPDATE sandboxes SET status = 'stopped' WHERE session_id = $1`, sessionID); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			provider := &stopProvider{}
+			rig := newStopRig(t, stopRigConfig{grace: grace, provider: provider})
+			owner, token := rig.user(ctx, t, sqlcgen.UserRoleMember)
+			session := rig.session(ctx, t, owner.ID, pgtype.UUID{})
+			rig.readySandbox(ctx, t, session.ID, 1)
+			running := rig.processingTurn(ctx, t, session.ID, 1)
+
+			if status, _ := rig.stop(t, session.ID.String(), token); status != http.StatusAccepted {
+				t.Fatalf("stop: status %d", status)
+			}
+			stopEventually(t, 10*time.Second, "the stop is sent", func() bool { return len(rig.commander.ofType(t, "stop")) == 1 })
+			tc.dies(t, rig, session.ID)
+			if got := rig.turnRow(ctx, t, running.ID).Status; got != sqlcgen.TurnStatusProcessing {
+				t.Fatalf("setup: turn = %s once the sandbox died, want still processing within its grace", got)
+			}
+
+			pumpUntil(ctx, t, rig.registry, 15*time.Second, "the grace cancels the turn and the stop ends", func() bool {
+				return rig.turnRow(ctx, t, running.ID).Status == sqlcgen.TurnStatusCancelled &&
+					!slices.Contains(rig.timerNames(ctx, t, session.ID), sessionactor.TimerStop)
+			})
+			if sb := rig.sandboxRow(ctx, t, session.ID); sb.Status != tc.want || sb.Gen != 1 {
+				t.Fatalf("sandbox = %s at gen %d, want %s at gen 1: a dead sandbox is left as it is", sb.Status, sb.Gen, tc.want)
+			}
+			if created, restored, stoppedObjects := provider.calls(); len(created)+len(restored)+len(stoppedObjects) != 0 {
+				t.Fatalf("provider spawns %v, restores %v, stops %v; want none", created, restored, stoppedObjects)
+			}
+			for _, name := range rig.timerNames(ctx, t, session.ID) {
+				if name == sessionactor.TimerTurnDeadline || name == sessionactor.TimerTerminalGrace {
+					t.Fatalf("timers = %v after the stop ended, want neither the turn's deadline nor a terminal grace", rig.timerNames(ctx, t, session.ID))
+				}
+			}
+		})
+	}
 }

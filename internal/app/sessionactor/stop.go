@@ -24,15 +24,29 @@
 //     still reports. An execution_complete names a gen, never a turn:
 //     without the retirement, the stopped work's late one would be booked
 //     against the next turn dispatched to the same gen.
+//   - One wait comes before that retirement (deliveryHold): while the gen
+//     it would retire is still delivering a completed turn's push and pull
+//     request (sandboxes.pr_delivery_started_at, within
+//     MCPStatusDeliveryWindow of its start), the stopped turn is left in
+//     flight and the timer re-armed -- every StopGrace, never past the
+//     window's end -- since stopping the sandbox would kill that delivery.
+//     The agent handles a push before the frames sent after it, the stop
+//     included, so it usually confirms the turn's end once the push is
+//     over; otherwise the first fire after the delivery ends, or after its
+//     window has run, cancels the turn and retires the gen.
 //   - While the session's own request stands, the session's work-creating
 //     timers (ClassifyTimer: TimerWorkCreatesTurn) armed at or before the
-//     request are deleted; one armed after it is new input, and stays.
+//     request -- its latest instant, which a repeated request moves forward
+//     -- are deleted; one armed after it is new input, and stays.
 //
-// A turn created after the request carries no flag and runs normally; the
-// next turn a person creates also clears the session's flag (httpapi's
-// createTurnLocked, DecidePlanOnTx). Children are the REST handler's to
-// reach: it applies the same request to each descendant, whose own actor
-// runs this same file.
+// A turn created after the request carries no flag and runs normally. A
+// person's next act that sets the session going again also clears the
+// session's flag: the next turn a person creates (httpapi's
+// createTurnLocked), the approval of its plan (DecidePlanOnTx), or a
+// decision to approve or revise a workflow step awaiting it
+// (DecideWorkflowStep). Children are the REST handler's to reach: it
+// applies the same request to each descendant, whose own actor runs this
+// same file.
 
 package sessionactor
 
@@ -52,6 +66,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/sandbox"
+	"github.com/narvidev/narvi/internal/domain/session"
 	"github.com/narvidev/narvi/internal/domain/turn"
 )
 
@@ -74,8 +89,8 @@ type retiredGen struct {
 
 // handleStopTimer implements the `stop` named timer -- see this file's own
 // top comment. Ends, like every handler, by re-arming or deleting the timer
-// that fired: re-armed only while a flagged turn is still in flight within
-// its grace.
+// that fired: re-armed only while a flagged turn is still in flight, within
+// its grace or held by deliveryHold.
 func (a *Actor) handleStopTimer(ctx context.Context) error {
 	var signal *stopSignal
 	var retired *retiredGen
@@ -95,18 +110,38 @@ func (a *Actor) handleStopTimer(ctx context.Context) error {
 			return fmt.Errorf("sessionactor: list stop-requested turns: %w", err)
 		}
 
-		var toCancel []pgtype.UUID
-		var graceEnds time.Time
+		// A turn in flight whose grace has run is cancelled below and its
+		// gen retired -- unless that gen is still delivering a completed
+		// turn's push and pull request, which the retirement would kill.
+		var elapsed []sqlcgen.ListStopRequestedOpenTurnsRow
 		for _, f := range flagged {
-			if turn.State(f.Status) == turn.StatePending || f.GraceElapsed {
+			if turn.State(f.Status) != turn.StatePending && f.GraceElapsed {
+				elapsed = append(elapsed, f)
+			}
+		}
+		var heldUntil time.Time
+		if len(elapsed) > 0 {
+			if heldUntil, err = a.deliveryHold(ctx, tx, elapsed); err != nil {
+				return err
+			}
+		}
+
+		var toCancel []pgtype.UUID
+		rearmAt := heldUntil
+		for _, f := range flagged {
+			if turn.State(f.Status) == turn.StatePending || f.GraceElapsed && heldUntil.IsZero() {
 				toCancel = append(toCancel, f.ID)
+				continue
+			}
+			if f.GraceElapsed {
+				// Held: looked at again at heldUntil.
 				continue
 			}
 			// Dispatched or processing, inside its grace: told to stop, and
 			// looked at again once the grace -- measured from its own flag,
 			// on the database's clock -- has run.
-			if ends := f.StopRequestedAt.Time.Add(a.timeouts.StopGrace); graceEnds.IsZero() || ends.Before(graceEnds) {
-				graceEnds = ends
+			if ends := f.StopRequestedAt.Time.Add(a.timeouts.StopGrace); rearmAt.IsZero() || ends.Before(rearmAt) {
+				rearmAt = ends
 			}
 		}
 
@@ -131,7 +166,7 @@ func (a *Actor) handleStopTimer(ctx context.Context) error {
 			return err
 		}
 
-		if graceEnds.IsZero() {
+		if rearmAt.IsZero() {
 			return a.deleteTimer(ctx, tx, TimerStop)
 		}
 		sandboxRow, err := a.stores.sandbox.WithTx(tx).Get(ctx, a.sessionID)
@@ -143,7 +178,7 @@ func (a *Actor) handleStopTimer(ctx context.Context) error {
 		default:
 			return fmt.Errorf("sessionactor: get sandbox: %w", err)
 		}
-		return a.armTimer(ctx, tx, TimerStop, graceEnds)
+		return a.armTimer(ctx, tx, TimerStop, rearmAt)
 	})
 	if err != nil {
 		return err
@@ -287,7 +322,11 @@ func (a *Actor) retireStoppedGen(ctx context.Context, tx pgx.Tx, unconfirmed []s
 		return nil, fmt.Errorf("sessionactor: get sandbox: %w", err)
 	}
 	from := sandbox.State(row.Status)
-	if sandbox.IsDeadSandboxStatus(from) || !ranOnGen(unconfirmed, int(row.Gen)) {
+	gens := make([]*int32, len(unconfirmed))
+	for i, t := range unconfirmed {
+		gens[i] = t.DispatchedSandboxGen
+	}
+	if sandbox.IsDeadSandboxStatus(from) || !ranOnGen(gens, int(row.Gen)) {
 		return nil, nil
 	}
 
@@ -326,15 +365,63 @@ func (a *Actor) retireStoppedGen(ctx context.Context, tx pgx.Tx, unconfirmed []s
 	return &retiredGen{gen: int(row.Gen), providerID: providerID}, nil
 }
 
-// ranOnGen reports whether any of turns was dispatched to gen, or has no
-// dispatched gen recorded.
-func ranOnGen(turns []sqlcgen.Turn, gen int) bool {
-	for _, t := range turns {
-		if t.DispatchedSandboxGen == nil || int(*t.DispatchedSandboxGen) == gen {
+// ranOnGen reports whether any of dispatched -- the dispatched_sandbox_gen
+// of each of a set of turns -- is gen, or is not recorded (nil).
+func ranOnGen(dispatched []*int32, gen int) bool {
+	for _, g := range dispatched {
+		if g == nil || int(*g) == gen {
 			return true
 		}
 	}
 	return false
+}
+
+// deliveryHold decides whether cancelling elapsed -- flagged turns in
+// flight whose grace has run -- waits, and until when. Cancelling them
+// retires the sandbox gen they ran on (retireStoppedGen), and stopping
+// that gen's provider object would kill a completed turn's push and pull
+// request it is still delivering: §3.3 keeps those, as that turn's result.
+// The agent handles a push inline, before any frame sent after it, so the
+// stop it was sent is read only once the push is over; the gen is then
+// retired only if it still has not confirmed the turn's end.
+//
+// Returns the zero time -- cancel now -- when nothing would be retired (no
+// sandbox, one already dead, or one whose gen has moved past every one of
+// elapsed's own dispatches: retireStoppedGen's own conditions), or when
+// no delivery is under way: none stamped (sandboxes.pr_delivery_started_at,
+// cleared once the pull request is created, the push fails or the push
+// cannot be sent), or one stamped MCPStatusDeliveryWindow ago or more,
+// session.PRDeliveryOpen's bound, which the session's status also reads.
+// Otherwise returns when to look again: StopGrace from now, so a delivery
+// that ends is noticed within one grace, and never later than the window's
+// end, so a push that never reports back holds the stop no longer than it
+// holds the session's status. Every instant is on the database's clock.
+func (a *Actor) deliveryHold(ctx context.Context, tx pgx.Tx, elapsed []sqlcgen.ListStopRequestedOpenTurnsRow) (time.Time, error) {
+	row, err := a.stores.sandbox.WithTx(tx).PRDelivery(ctx, a.sessionID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return time.Time{}, nil
+		}
+		return time.Time{}, fmt.Errorf("sessionactor: read sandbox push/PR delivery: %w", err)
+	}
+	gens := make([]*int32, len(elapsed))
+	for i, f := range elapsed {
+		gens[i] = f.DispatchedSandboxGen
+	}
+	if sandbox.IsDeadSandboxStatus(sandbox.State(row.Status)) || !ranOnGen(gens, int(row.Gen)) || !row.PrDeliveryStartedAt.Valid {
+		return time.Time{}, nil
+	}
+	started, observed := row.PrDeliveryStartedAt.Time, row.ObservedAt.Time
+	if !session.PRDeliveryOpen(started, observed, a.timeouts.MCPStatusDeliveryWindow) {
+		return time.Time{}, nil
+	}
+	until := started.Add(a.timeouts.MCPStatusDeliveryWindow)
+	if next := observed.Add(a.timeouts.StopGrace); next.Before(until) {
+		until = next
+	}
+	a.logger.Info("sessionactor: a stopped turn's grace ended while its sandbox gen still delivers a completed turn's push and pull request; its cancel and the gen's retirement wait for that delivery",
+		"gen", row.Gen, "delivery_started_at", started, "next_look", until)
+	return until, nil
 }
 
 // stopSandboxOfRetiredGen asks the provider, after the commit, to stop the
@@ -379,13 +466,15 @@ func stopFlaggedPendingTurnIDs(turns []sqlcgen.Turn) []pgtype.UUID {
 // disarmWorkCreatingTimers deletes every timer of the session whose firing
 // creates a turn with no new input (ClassifyTimer's TimerWorkCreatesTurn --
 // today the re-review debounce) and that was armed at or before
-// requestedAt, the session's standing stop request. session_timers.
-// created_at and sessions.stop_requested_at are both the database's now(),
-// so the comparison involves no replica's clock. A timer armed after the
-// request -- a push after the stop -- is new input, and stays (technical
-// plan §3.3's effects table), however late this timer fires. A NULL
-// requestedAt -- a person resumed the session -- deletes nothing: a timer
-// armed since is new work of theirs.
+// requestedAt, the session's standing stop request: its latest request's
+// instant, which a repeated request moves forward (RequestSessionStop), so
+// a debounce a push armed between two requests goes with the second.
+// session_timers.created_at and sessions.stop_requested_at are both the
+// database's now(), so the comparison involves no replica's clock. A timer
+// armed after the request -- a push after the stop -- is new input, and
+// stays (technical plan §3.3's effects table), however late this timer
+// fires. A NULL requestedAt -- a person resumed the session -- deletes
+// nothing: a timer armed since is new work of theirs.
 //
 // A re-arm updates a timer's row in place and keeps its created_at
 // (UpsertSessionTimer), so a push that lands after the request but before

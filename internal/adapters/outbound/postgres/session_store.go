@@ -147,9 +147,11 @@ func (s *SessionStore) RequestStop(ctx context.Context, id pgtype.UUID) (pgtype.
 	return s.q.RequestSessionStop(ctx, id)
 }
 
-// ClearStopRequest clears the session's stop request -- the next turn a
-// person creates, or the approval of its plan (technical plan §3.3). Reports
-// whether a request was set.
+// ClearStopRequest clears the session's stop request (technical plan §3.3):
+// called, in its own transaction, by each person's act that sets the
+// session going again -- httpapi's createTurnLocked, DecidePlanOnTx
+// (approve) and DecideWorkflowStep (approve, revise). Reports whether a
+// request was set.
 func (s *SessionStore) ClearStopRequest(ctx context.Context, id pgtype.UUID) (bool, error) {
 	n, err := s.q.ClearSessionStopRequest(ctx, id)
 	return n > 0, err

@@ -163,10 +163,12 @@ const (
 	// one check on the session named, since they are its work.
 	ActionStopSession Action = "stop_session"
 	// ActionResumeSession resumes a stopped session. No caller exists yet:
-	// a stop is cleared by the next turn a person creates, through
-	// ActionPromptSession, so nothing resumes a session through this
-	// action today. Reserved so a future call site needs no shape change
-	// here.
+	// a stop is cleared by a person's next act that sets the session going
+	// again, each under its own action -- a turn (ActionPromptSession), a
+	// plan approval (ActionApprovePlan) or a workflow step approval or
+	// revision (ActionDecideWorkflowStep) -- so nothing resumes a session
+	// through this action today. Reserved so a future call site needs no
+	// shape change here.
 	ActionResumeSession Action = "resume_session"
 	// ActionViewShadowComparison covers §8.8's own "shadow-comparison
 	// tooling for review" deliverable (GET /api/admin/shadow-compare,
