@@ -124,6 +124,38 @@ deleted, and switching the mechanism back on lets its clients carry on
 the Settings routes above keep working, so every authorization can still be
 listed and revoked.
 
+## Sessions an app already started
+
+An app whose user granted it "Act as you" (`mcp:write`) can start sessions,
+and each one runs code in the user's repositories and spends on models
+(§43.8). Every step above stops the app's **next** call, the next session
+start included -- it does not stop a session the app already started, which
+runs to its end like any other: no stop action exists yet, over MCP or REST.
+What bounds a runaway app meanwhile is its brakes, both per authorization
+and per control-plane replica: a burst of 30 calls to `POST /mcp`, then one
+a second, answered `429` past that; and a burst of 5 session starts, then
+one a minute, refused past that without starting anything. Both refusals
+are logged at WARN (`mcpauth: rate limited`, `mcp: session start refused by
+the create brake`) with the `grant_id` and `client_id`, and neither is
+audited.
+
+To find what an app started, read the audit log: every session it started
+has a `session.create` row whose `detail.mcp` names the authorization and
+the client, and the session itself records `spawn_source = mcp`:
+
+```sql
+SELECT a.resource_id AS session_id, a.created_at, a.detail_json->'mcp' AS via
+FROM audit_log a
+WHERE a.action = 'session.create'
+  AND a.detail_json->'mcp'->>'client_id' = '<clientId>'
+ORDER BY a.created_at DESC;
+```
+
+(`detail_json->'mcp'->>'grant_id'` narrows it to one user's authorization,
+the `id` the Connected apps lists answer.) The same stamp is on every other
+audit row a change made through an app writes, including a
+`session.repo_entitlement_denied` refusal.
+
 ## Revoke every authorization
 
 - **Of one client:** delete the client (above). For a metadata-document
