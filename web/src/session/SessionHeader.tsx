@@ -10,14 +10,8 @@ import type { Participant } from './participants'
 import { initials } from './participants'
 import { deriveStatusChip } from './sessionStatus'
 import { SourceIcon } from './SourceIcon'
+import { sourceTagLabel } from './sourceLabel'
 import type { TimelineModel } from './timelineModel'
-
-const SOURCE_LABELS: Record<Session['spawnSource'], string> = {
-  web: 'web',
-  slack: 'Slack',
-  linear: 'Linear',
-  github: 'GitHub',
-}
 
 /**
  * PresenceIndicator renders §8.11's own "multiplayer presence" (§12.2
@@ -77,7 +71,7 @@ export function SessionHeader({ session, model, cost, participants }: { session:
       )}
       <span className="srctag">
         <SourceIcon source={session.spawnSource} />
-        {SOURCE_LABELS[session.spawnSource]}
+        {sourceTagLabel(session.spawnSource)}
       </span>
       <span className={`chip ${chip.tone}`}>
         <span className="dot" />

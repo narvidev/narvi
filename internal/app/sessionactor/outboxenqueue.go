@@ -275,8 +275,11 @@ func (a *Actor) enqueueOutboxNotification(ctx context.Context, tx pgx.Tx, sessio
 		}
 
 	default:
-		// Defensive: sessions.spawn_source is a fixed 4-value enum
-		// (web/slack/linear/github) -- this branch should be unreachable.
+		// A source this binary has no channel for. Session.spawnSource is
+		// an open enum (contracts/manifest.json's openEnums), so a newer
+		// migration can add a value that an older binary, still serving
+		// during a rolling deploy, reads here. With no channel to notify,
+		// nothing is enqueued; the source is logged so the gap shows.
 		a.logger.Warn("sessionactor: enqueue outbox notification: unrecognized spawn_source; skipping",
 			"spawn_source", string(sessionRow.SpawnSource))
 		return nil

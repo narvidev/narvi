@@ -158,8 +158,11 @@ func enqueueWorkflowNotice(ctx context.Context, deps Deps, sessionRow sqlcgen.Se
 		payload = githubapi.Payload{Owner: owner, Repo: repo, PRNumber: int(row.PrNumber), Text: text}
 
 	default:
-		// Defensive: sessions.spawn_source is a fixed 4-value enum
-		// (web/slack/linear/github) -- this branch should be unreachable.
+		// A source this binary has no channel for. Session.spawnSource is
+		// an open enum (contracts/manifest.json's openEnums), so a newer
+		// migration can add a value that an older binary, still serving
+		// during a rolling deploy, reads here. With no channel to notify,
+		// nothing is enqueued; the source is logged so the gap shows.
 		logger.Warn("workflowengine: enqueue workflow notice: unrecognized spawn_source; skipping", "spawn_source", string(sessionRow.SpawnSource))
 		return nil
 	}

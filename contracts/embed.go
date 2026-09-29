@@ -36,3 +36,15 @@ var versionRaw string
 // /api/capabilities can see which contracts version the running control
 // plane was built against.
 var Version = strings.TrimSpace(versionRaw)
+
+// ManifestJSON embeds contracts/manifest.json verbatim: the surface list
+// and the openEnums list tools/contractscompat grades every contracts
+// change against. It is embedded for the same reason VERSION is: a
+// runtime consumer that must act on openEnums (the MCP tool bridge,
+// technical plan §43.10) reads the one list CI checks, never a hand-kept
+// copy of it. It is a string, so no importer can modify it, and it is not
+// part of FS, whose files are exactly the manifest's surfaces
+// (contractstest's TestManifestMatchesEmbeddedSchemaSet).
+//
+//go:embed manifest.json
+var ManifestJSON string

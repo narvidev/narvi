@@ -10,6 +10,26 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.9.2]
+
+### rest/v1/dtos.schema.json
+
+- Changed: `Session.spawnSource` is now an open enum.
+  `rest/v1/dtos.schema.json#/$defs/Session/properties/spawnSource` is
+  added to `manifest.json`'s `openEnums`, and the field's description says
+  so. Consumers MUST tolerate a `spawnSource` value they do not recognise.
+  No value is added in this release: a following release adds `mcp`, the
+  source a session created over MCP records (technical plan §43.1, row
+  183). `openEnums` is read from the merge base, so that addition grades
+  MINOR only once this entry is already on `main`. The description change
+  is annotation-only (row 35, PATCH); the `openEnums` entry is not itself
+  a graded finding.
+- Unchanged, deliberately: `CreateSessionRequest.spawnSource` stays out of
+  `openEnums`. It is client-to-platform, where an added enum value already
+  grades MINOR (row 11), and the REST create path refuses any
+  caller-supplied source other than `web`, so listing it would promise a
+  tolerance the platform does not offer there.
+
 ## [1.9.1]
 
 ### rest/v1/dtos.schema.json
