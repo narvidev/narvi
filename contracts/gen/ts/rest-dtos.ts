@@ -45,7 +45,7 @@ export interface Session {
   /**
    * Matches Postgres session_spawn_source exactly. An OPEN enum (manifest.json's openEnums): a consumer MUST tolerate a value it does not recognise.
    */
-  spawnSource: 'web' | 'slack' | 'linear' | 'github';
+  spawnSource: 'web' | 'slack' | 'linear' | 'github' | 'mcp';
   /**
    * Null for bot/automation-created sessions with no direct human user.
    */
@@ -101,7 +101,7 @@ export interface AutomationReposElem {
  */
 export interface CreateSessionRequest {
   /**
-   * Matches Postgres session_spawn_source exactly.
+   * A closed subset of Postgres session_spawn_source: the sources an ingress surface passes in this shape. POST /api/sessions accepts only 'web' and refuses any other value with 400. 'mcp' is never accepted here: the server sets it for a session created over MCP, never from a request. Session.spawnSource, an open enum, lists every value a session can carry.
    */
   spawnSource: 'web' | 'slack' | 'linear' | 'github';
   title: string | null;

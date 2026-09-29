@@ -2330,6 +2330,31 @@ func TestGetSession_NotFound(t *testing.T) {
 	}
 }
 
+// TestGetSession_McpSource pins that a session recorded with spawn_source
+// 'mcp' (technical plan §43.1) reads back over REST as "mcp". The row is
+// seeded directly, since no path writes the value yet; that it is accepted
+// at all needs migration 000149. The body is decoded into the generated
+// restdtos.Session, whose enum check refuses a value the contract does not
+// name, so this also fails on a stale contracts regeneration.
+func TestGetSession_McpSource(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	session, err := rig.sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceMcp})
+	if err != nil {
+		t.Fatalf("create an mcp session: %v", err)
+	}
+	_, token := rig.createAuthenticatedUser(ctx, t)
+
+	var got restdtos.Session
+	status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String(), nil, &got, token)
+	if status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+	if got.SpawnSource != restdtos.SessionSpawnSourceMcp {
+		t.Errorf("SpawnSource = %q, want %q", got.SpawnSource, restdtos.SessionSpawnSourceMcp)
+	}
+}
+
 // --- ListEvents ---
 
 func TestListEvents_HappyPath(t *testing.T) {

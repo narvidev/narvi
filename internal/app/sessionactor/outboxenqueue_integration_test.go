@@ -514,6 +514,11 @@ func TestTurnDeadlineTimeout_EnqueuesOutboxNotificationPerOrigin(t *testing.T) {
 			spawnSource: sqlcgen.SessionSpawnSourceWeb,
 			wantRows:    0,
 		},
+		{
+			name:        "mcp origin stays silent (no external channel)",
+			spawnSource: sqlcgen.SessionSpawnSourceMcp,
+			wantRows:    0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -630,6 +635,65 @@ func TestCompleteProcessingTurn_WebOrigin_EnqueuesNoOutboxRow(t *testing.T) {
 
 	if n := countOutboxRowsForSession(ctx, t, pool, sessionID); n != 0 {
 		t.Errorf("outbox row count for web-origin session = %d, want 0", n)
+	}
+}
+
+// TestCompleteProcessingTurn_McpOrigin_CompletesWithNoWarnAndNoOutboxRow
+// seeds a session recorded with spawn_source 'mcp' (technical plan §43.1;
+// no path writes the value yet) and drives a turn on it to completion
+// through the actor's own mailbox, on real Postgres. The turn completes,
+// no outbox row is written -- an MCP client has no channel to notify; it
+// polls the session's status or waits on it -- and the actor logs no
+// unrecognised-source WARN, which is what a binary predating the value
+// logs for the same session. The capture is installed before the actor is
+// hydrated, since the actor keeps the logger it was hydrated with; that it
+// sees the actor's own hydrate line proves it is wired to that logger.
+func TestCompleteProcessingTurn_McpOrigin_CompletesWithNoWarnAndNoOutboxRow(t *testing.T) {
+	logs := captureDefaultLoggerJSONSync(t)
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	sessionID := createTestSessionWithSpawnSource(ctx, t, pool, sqlcgen.SessionSpawnSourceMcp)
+	if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	turnStore := narvipg.NewTurnStore(pool)
+	processing := createProcessingTurn(ctx, t, turnStore, sessionID)
+
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  executionCompleteRaw(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeCompleted),
+	})
+
+	got, err := turnStore.Get(ctx, processing.ID)
+	if err != nil {
+		t.Fatalf("get turn: %v", err)
+	}
+	if got.Status != sqlcgen.TurnStatusCompleted {
+		t.Errorf("turn status = %q, want %q", got.Status, sqlcgen.TurnStatusCompleted)
+	}
+	if n := countOutboxRowsForSession(ctx, t, pool, sessionID); n != 0 {
+		t.Errorf("outbox row count for mcp-origin session = %d, want 0", n)
+	}
+
+	captured := logs.String()
+	if !strings.Contains(captured, `"msg":"sessionactor: hydrated"`) {
+		t.Fatalf("the capture never saw the actor's hydrate line, so it is not the actor's logger:\n%s", captured)
+	}
+	if strings.Contains(captured, "unrecognized spawn_source") {
+		t.Errorf("an mcp-origin turn logged the unrecognised-source WARN:\n%s", captured)
 	}
 }
 

@@ -1127,6 +1127,7 @@ const (
 	SessionSpawnSourceSlack  SessionSpawnSource = "slack"
 	SessionSpawnSourceLinear SessionSpawnSource = "linear"
 	SessionSpawnSourceGithub SessionSpawnSource = "github"
+	SessionSpawnSourceMcp    SessionSpawnSource = "mcp"
 )
 
 func (e *SessionSpawnSource) Scan(src interface{}) error {

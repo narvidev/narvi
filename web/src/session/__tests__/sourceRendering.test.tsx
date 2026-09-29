@@ -15,7 +15,7 @@ import { SourceIcon } from '../SourceIcon'
 import { buildTimelineModel } from '../timelineModel'
 
 // A value the generated union does not name, as a newer server could send it.
-const UNKNOWN_SOURCE = 'mcp' as Session['spawnSource']
+const UNKNOWN_SOURCE = 'some_future_source' as Session['spawnSource']
 
 function session(spawnSource: Session['spawnSource']): Session {
   return {
@@ -48,7 +48,7 @@ describe('SourceIcon -- an unknown source', () => {
 
   it('never borrows a known source\'s glyph', () => {
     const unknown = renderToStaticMarkup(<SourceIcon source={UNKNOWN_SOURCE} />)
-    for (const known of ['web', 'slack', 'linear', 'github'] as const) {
+    for (const known of ['web', 'slack', 'linear', 'github', 'mcp'] as const) {
       const html = renderToStaticMarkup(<SourceIcon source={known} />)
       expect(html.replace(/title="[^"]*"/, '')).not.toBe(unknown.replace(/title="[^"]*"/, ''))
     }
@@ -67,5 +67,27 @@ describe('SessionHeader -- an unknown source', () => {
 
   it('keeps a known source\'s tag unchanged', () => {
     expect(header('github')).toMatch(/<span class="srctag">.*<\/svg><\/span>GitHub<\/span>/)
+  })
+})
+
+// glyph is a source icon's markup without its tooltip, so two sources
+// compare by the glyph they draw alone.
+function glyph(source: Session['spawnSource']): string {
+  return renderToStaticMarkup(<SourceIcon source={source} />).replace(/title="[^"]*"/, '')
+}
+
+describe('the mcp source', () => {
+  it('draws its own glyph with its own tooltip, never another source\'s or the neutral one', () => {
+    const html = renderToStaticMarkup(<SourceIcon source="mcp" />)
+    expect(html).toContain('title="Started from an MCP client"')
+    expect(html).toContain('<svg')
+    const others: Session['spawnSource'][] = ['web', 'slack', 'linear', 'github', UNKNOWN_SOURCE]
+    for (const other of others) {
+      expect(glyph('mcp'), `mcp draws the ${other} glyph`).not.toBe(glyph(other))
+    }
+  })
+
+  it('shows MCP as the session header tag, never other', () => {
+    expect(header('mcp')).toMatch(/<span class="srctag">.*<\/svg><\/span>MCP<\/span>/)
   })
 })

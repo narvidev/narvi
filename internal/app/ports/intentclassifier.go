@@ -82,7 +82,8 @@ type IntentClassifierInput struct {
 	Text string
 	// Surface matches sessions.spawn_source's existing enum exactly
 	// (migrations/000004_sessions.up.sql: "web" | "slack" | "linear" |
-	// "github") -- which ingress surface is asking.
+	// "github", and "mcp" since migrations/000149) -- which ingress
+	// surface is asking.
 	Surface string
 	// DeterministicTarget is an independently-computed, non-LLM signal
 	// the calling surface already has on hand for Target corroboration

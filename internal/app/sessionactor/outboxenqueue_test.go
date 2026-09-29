@@ -21,7 +21,7 @@ import (
 // channel lookup or an outbox insert would dereference a nil store.
 func TestEnqueueOutboxNotification_UnknownSpawnSource(t *testing.T) {
 	t.Parallel()
-	for _, source := range []sqlcgen.SessionSpawnSource{"mcp", "a_future_source"} {
+	for _, source := range []sqlcgen.SessionSpawnSource{"a_future_source", "Mcp"} {
 		t.Run(string(source), func(t *testing.T) {
 			t.Parallel()
 			var logs bytes.Buffer
@@ -44,5 +44,56 @@ func TestEnqueueOutboxNotification_UnknownSpawnSource(t *testing.T) {
 				t.Errorf("log line = %+v, want a WARN naming spawn_source %q", line, source)
 			}
 		})
+	}
+}
+
+// TestEnqueueOutboxNotification_McpEnqueuesNothingNoWarn pins how a turn
+// completing on an 'mcp'-origin session is routed: exactly like a 'web'
+// one. An MCP client has no channel to notify -- it polls the session's
+// status or waits on it (technical plan §43.20) -- so nothing is enqueued,
+// and nothing is logged either: 'mcp' is a source this binary knows, never
+// the unrecognised-source WARN. That holds for a plan-mode completion too,
+// which on a bot surface enqueues the richer plan-approval notice. The
+// Actor has no stores, so a channel lookup or an outbox insert would
+// dereference a nil store. The last row is the control: the same capture
+// does see the WARN an unrecognised source logs.
+func TestEnqueueOutboxNotification_McpEnqueuesNothingNoWarn(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		source   sqlcgen.SessionSpawnSource
+		wantWarn bool
+	}{
+		{source: sqlcgen.SessionSpawnSourceMcp},
+		{source: sqlcgen.SessionSpawnSourceWeb},
+		{source: "a_future_source", wantWarn: true},
+	} {
+		for _, completion := range []struct {
+			name string
+			trig turn.Trigger
+			plan *sqlcgen.Plan
+		}{
+			{name: "completed", trig: turn.TriggerComplete},
+			{name: "failed", trig: turn.TriggerFail},
+			{name: "plan completed", trig: turn.TriggerComplete, plan: &sqlcgen.Plan{Version: 1}},
+		} {
+			t.Run(string(tc.source)+"/"+completion.name, func(t *testing.T) {
+				t.Parallel()
+				var logs bytes.Buffer
+				a := &Actor{logger: slog.New(slog.NewJSONHandler(&logs, nil))}
+
+				var noReason turn.FailureReason
+				if err := a.enqueueOutboxNotification(context.Background(), nil, sqlcgen.Session{SpawnSource: tc.source}, completion.trig, noReason, sqlcgen.Turn{}, completion.plan); err != nil {
+					t.Fatalf("enqueueOutboxNotification = %v, want nil", err)
+				}
+
+				warned := strings.Contains(logs.String(), "unrecognized spawn_source")
+				switch {
+				case tc.wantWarn && !warned:
+					t.Errorf("logs = %q, want the unrecognised-source WARN (the capture is broken)", logs.String())
+				case !tc.wantWarn && logs.Len() != 0:
+					t.Errorf("logs = %q, want nothing logged for a source with no channel", logs.String())
+				}
+			})
+		}
 	}
 }
