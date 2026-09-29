@@ -27,6 +27,12 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   four values. The REST create path refuses any caller-supplied source
   other than `web`; an MCP session's source is never the caller's to
   choose.
+- Changed (description only, annotation-only PATCH):
+  `CreateSessionRequest.spawnSource` no longer says it matches Postgres
+  `session_spawn_source` exactly, which stopped being true once `mcp` was
+  added. It now says the field is a closed subset of the sources: `POST
+  /api/sessions` accepts only `web`, and `mcp` is set by the server, never
+  read from a request.
 - The MCP tool output schemas that carry a `Session` list the value among
   the open enum's `examples` (`internal/adapters/inbound/mcp/testdata/
   tools.golden.json`).

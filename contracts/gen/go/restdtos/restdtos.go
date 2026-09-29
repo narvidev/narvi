@@ -2209,7 +2209,11 @@ type CreateSessionRequest struct {
 	// contracts.
 	Repos []CreateSessionRequestReposElem `json:"repos" yaml:"repos" mapstructure:"repos"`
 
-	// Matches Postgres session_spawn_source exactly.
+	// A closed subset of Postgres session_spawn_source: the sources an ingress
+	// surface passes in this shape. POST /api/sessions accepts only 'web' and refuses
+	// any other value with 400. 'mcp' is never accepted here: the server sets it for
+	// a session created over MCP, never from a request. Session.spawnSource, an open
+	// enum, lists every value a session can carry.
 	SpawnSource CreateSessionRequestSpawnSource `json:"spawnSource" yaml:"spawnSource" mapstructure:"spawnSource"`
 
 	// Title corresponds to the JSON schema field "title".
