@@ -52,6 +52,7 @@ var wantTwinRoutes = map[string]string{
 	"narvi_reject_plan":            "POST /api/sessions/{sessionID}/plans/{planId}/reject",
 	"narvi_request_plan_revision":  "POST /api/sessions/{sessionID}/turns",
 	"narvi_send_prompt":            "POST /api/sessions/{sessionID}/turns",
+	"narvi_stop_session":           "POST /api/sessions/{sessionID}/stop",
 }
 
 // TestEveryToolHasARegisteredTwin pins technical plan §43.9 item 2: a
@@ -125,6 +126,7 @@ func realToolsListTools(t testing.TB) []*sdkmcp.Tool {
 		ApprovePlan:      stubHandler(200, `{}`),
 		RejectPlan:       stubHandler(200, `{}`),
 		CreateTurn:       stubHandler(201, `{}`),
+		StopSession:      stubHandler(202, `{}`),
 	}
 	tools := make([]*sdkmcp.Tool, 0, len(toolSpecs(twins)))
 	for _, spec := range toolSpecs(twins) {
@@ -156,15 +158,15 @@ func TestToolsList_MatchesGolden(t *testing.T) {
 	}
 }
 
-// TestToolsList_ExactlyThirteenToolsDeterministicOrder pins the full
+// TestToolsList_ExactlyFourteenToolsDeterministicOrder pins the full
 // table: a grant holding every advertised scope sees exactly these
-// thirteen tools, in this order -- the eight reads, then the five writes.
+// fourteen tools, in this order -- the eight reads, then the six writes.
 // Which subset a narrower grant sees is TestToolsList_ScopeFilter_Table's
 // (technical plan §43.17).
-func TestToolsList_ExactlyThirteenToolsDeterministicOrder(t *testing.T) {
+func TestToolsList_ExactlyFourteenToolsDeterministicOrder(t *testing.T) {
 	want := []string{
 		"narvi_list_models", "narvi_list_sessions", "narvi_get_session", "narvi_get_session_status", "narvi_wait_for_session", "narvi_get_session_result", "narvi_get_session_transcript", "narvi_list_plans",
-		"narvi_create_session", "narvi_approve_plan", "narvi_reject_plan", "narvi_request_plan_revision", "narvi_send_prompt",
+		"narvi_create_session", "narvi_approve_plan", "narvi_reject_plan", "narvi_request_plan_revision", "narvi_send_prompt", "narvi_stop_session",
 	}
 	tools := realToolsListTools(t)
 	if len(tools) != len(want) {
@@ -182,7 +184,7 @@ func TestToolsList_ExactlyThirteenToolsDeterministicOrder(t *testing.T) {
 // closed-world; a tool whose twin writes is never marked read-only, and
 // every one carries the destructive and open-world hints explicitly (a nil
 // one means "assume the worst" to a client). Every write's own four are
-// pinned too, as technical plan §43.8 and §43.21 list them.
+// pinned too, as technical plan §43.8, §43.21 and §43.22 list them.
 func TestToolAnnotations_MatchTwinMethod(t *testing.T) {
 	twinMethod := map[string]string{}
 	for _, spec := range toolSpecs(Twins{}) {
@@ -204,12 +206,15 @@ func TestToolAnnotations_MatchTwinMethod(t *testing.T) {
 			}
 		}
 	}
-	// Each write's own four hints (technical plan §43.8, §43.21): destructive
-	// only for the rejection, which ends a plan version; idempotent where a
-	// repeat changes nothing more (a same-key create, a decided plan);
-	// open-world where an effect reaches outside this deployment -- a turn
-	// that reaches the code host, or a plan verdict posted to Slack or
-	// Linear, which a rejection posts as an approval does.
+	// Each write's own four hints (technical plan §43.8, §43.21, §43.22):
+	// destructive for the rejection, which ends a plan version, and the
+	// stop, which cancels running work; idempotent where a repeat changes
+	// nothing more (a same-key create, a decided plan) -- never the stop,
+	// whose repeat also stops what was started since; open-world where an
+	// effect reaches outside this deployment -- a turn that reaches the
+	// code host, a plan verdict posted to Slack or Linear, which a rejection
+	// posts as an approval does, or a cancelled turn's notice, which a stop
+	// posts where the session came from.
 	type hints struct{ destructive, idempotent, openWorld bool }
 	wantWrites := map[string]hints{
 		"narvi_create_session":        {destructive: false, idempotent: true, openWorld: true},
@@ -217,6 +222,7 @@ func TestToolAnnotations_MatchTwinMethod(t *testing.T) {
 		"narvi_reject_plan":           {destructive: true, idempotent: true, openWorld: true},
 		"narvi_request_plan_revision": {destructive: false, idempotent: false, openWorld: true},
 		"narvi_send_prompt":           {destructive: false, idempotent: false, openWorld: true},
+		"narvi_stop_session":          {destructive: true, idempotent: false, openWorld: true},
 	}
 	seen := 0
 	for _, tool := range realToolsListTools(t) {
@@ -252,6 +258,26 @@ func TestRefusedWhileTurnOpen_MarksExactlyTheGatedTools(t *testing.T) {
 		if spec.RefusedWhileTurnOpen != want[spec.Name] {
 			t.Errorf("%s: RefusedWhileTurnOpen = %v, want %v", spec.Name, spec.RefusedWhileTurnOpen, want[spec.Name])
 		}
+	}
+}
+
+// TestStopsSessions_MarksExactlyTheStopTool pins which tool the
+// instructions say stops sessions (technical plan §43.22): the one whose
+// twin is POST .../stop, and no other. The flag changes nothing a tool
+// does; this keeps the paragraph true.
+func TestStopsSessions_MarksExactlyTheStopTool(t *testing.T) {
+	marked := 0
+	for _, spec := range toolSpecs(Twins{}) {
+		want := spec.Twin.method == http.MethodPost && spec.Twin.pathTemplate == "/api/sessions/{sessionID}/stop"
+		if spec.StopsSessions != want {
+			t.Errorf("%s: StopsSessions = %v, want %v", spec.Name, spec.StopsSessions, want)
+		}
+		if spec.StopsSessions {
+			marked++
+		}
+	}
+	if marked != 1 {
+		t.Fatalf("%d tools marked StopsSessions, want exactly narvi_stop_session", marked)
 	}
 }
 

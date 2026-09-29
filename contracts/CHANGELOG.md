@@ -10,6 +10,20 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.14.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `StopSessionToolRequest` (`sessionId`), the input of the new
+  `narvi_stop_session` MCP tool (technical plan §43.22, row 183), whose twin
+  is `POST /api/sessions/{sessionID}/stop`. Self-contained: it references no
+  other `$def`. The tool sends the route no body, as a browser sends none. A
+  new `$def` grades MINOR (row 32).
+- Unchanged: the tool's output reuses `StopSessionResponse`, which holds no
+  enum to publish open. The MCP tool list gains the tool
+  (`internal/adapters/inbound/mcp/testdata/tools.golden.json`). No route
+  changes.
+
 ## [1.13.0]
 
 ### rest/v1/dtos.schema.json

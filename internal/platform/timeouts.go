@@ -110,6 +110,25 @@ type Timeouts struct {
 	// TurnDeadline, which would otherwise end the turn first.
 	StopGrace time.Duration
 
+	// StopDescendantWalkTimeout bounds what a stop request does after the
+	// named session's own request has committed (technical plan §3.3,
+	// httpapi's StopSession): walking to every session it started, one
+	// short transaction each, then waking the actor of every session
+	// reached. That work runs detached from the caller -- a client that
+	// times out or disconnects after the commit must not leave the sessions
+	// it started running -- so it needs a bound of its own. A walk still
+	// unfinished when it expires is logged at WARN, and the route answers
+	// 500 to a caller still there, whose repeat reaches the rest. Not given
+	// a value in the plan; 8s. Validate keeps it positive, and below
+	// ShutdownGracePeriod, so a replica draining its requests on shutdown
+	// lets a detached walk end on its own rather than being cut off with
+	// the server. Nothing needs to sit under it: the wakes come after the
+	// walk, so a hydration slower than the bound (ActorHydrateTimeout may
+	// be set that high) delays a stop without costing the walk a session --
+	// every request it wakes is already written with its timer, which the
+	// pump delivers when a wake does not.
+	StopDescendantWalkTimeout time.Duration
+
 	// SSEInactivityTimeout is the OpenCode SSE inactivity timeout (§7:
 	// "SSE inactivity timeout configurable (default 120s)").
 	SSEInactivityTimeout time.Duration
@@ -3770,6 +3789,7 @@ func DefaultTimeouts() Timeouts {
 		SupervisorTurnCap:         90 * time.Minute,  // not specified; chosen with margin below ProviderHardCap
 		TurnDeadline:              60 * time.Minute,  // not specified; chosen with margin below SupervisorTurnCap
 		StopGrace:                 30 * time.Second,  // not specified; chosen (§3.3's stop)
+		StopDescendantWalkTimeout: 8 * time.Second,   // not specified; chosen (§3.3's stop)
 		SSEInactivityTimeout:      120 * time.Second, // §7, explicit
 		ProviderHTTPClientTimeout: 5 * time.Minute,   // not specified; must clear ProviderWorstColdStart (§4.1) with margin
 		ProviderWorstColdStart:    220 * time.Second, // §4.1, "220s+" floor
@@ -4302,6 +4322,22 @@ func (t Timeouts) Validate() error {
 	mustBePositive("StopGrace", t.StopGrace)
 	check("TurnDeadline > StopGrace",
 		"TurnDeadline", t.TurnDeadline, "StopGrace", t.StopGrace)
+
+	// §3.3's stop, after the named session's commit: a zero walk bound
+	// reaches no session it started, and one at or past
+	// ShutdownGracePeriod outlasts a draining server. See
+	// StopDescendantWalkTimeout's own doc comment. An ordering, not a race,
+	// so no margin.
+	mustBePositive("StopDescendantWalkTimeout", t.StopDescendantWalkTimeout)
+	if t.StopDescendantWalkTimeout >= t.ShutdownGracePeriod {
+		errs = append(errs, &TimeoutInvariantError{
+			Chain:        "ShutdownGracePeriod > StopDescendantWalkTimeout",
+			LesserField:  "StopDescendantWalkTimeout",
+			LesserValue:  t.StopDescendantWalkTimeout,
+			GreaterField: "ShutdownGracePeriod",
+			GreaterValue: t.ShutdownGracePeriod,
+		})
+	}
 
 	// §43.15: the registration rate limit. A zero refill interval is no
 	// limit at all (rate.Every(0) is rate.Inf) -- the same fail-OPEN-at-zero

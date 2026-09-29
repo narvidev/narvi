@@ -2559,6 +2559,61 @@ func TestDefaultTimeouts_GitHubAppMintFinishesBeforeCredentialFetch(t *testing.T
 	}
 }
 
+// TestValidate_StopDescendantWalkTimeout pins the bound on a stop's work
+// after the named session's commit (technical plan §3.3): the shipped 8s,
+// refused at zero or below and at or past ShutdownGracePeriod (a detached
+// walk would outlast a draining server), and not tied to
+// ActorHydrateTimeout, which may be set above it (the wakes follow the
+// walk).
+func TestValidate_StopDescendantWalkTimeout(t *testing.T) {
+	t.Parallel()
+
+	if got := platform.DefaultTimeouts().StopDescendantWalkTimeout; got != 8*time.Second {
+		t.Fatalf("DefaultTimeouts().StopDescendantWalkTimeout = %v, want 8s", got)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		walk      func(platform.Timeouts) time.Duration
+		wantField string
+		wantChain string
+	}{
+		{name: "zero", walk: func(platform.Timeouts) time.Duration { return 0 }, wantField: "StopDescendantWalkTimeout"},
+		{name: "negative", walk: func(platform.Timeouts) time.Duration { return -time.Second }, wantField: "StopDescendantWalkTimeout"},
+		{name: "at ShutdownGracePeriod", walk: func(to platform.Timeouts) time.Duration { return to.ShutdownGracePeriod }, wantChain: "ShutdownGracePeriod > StopDescendantWalkTimeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			to.StopDescendantWalkTimeout = tc.walk(to)
+			err := to.Validate()
+			if tc.wantField != "" {
+				var pos *platform.TimeoutMustBePositiveError
+				if !errors.As(err, &pos) || pos.Field != tc.wantField {
+					t.Fatalf("Validate() = %v, want %s refused as non-positive", err, tc.wantField)
+				}
+				return
+			}
+			var inv *platform.TimeoutInvariantError
+			if !errors.As(err, &inv) || inv.Chain != tc.wantChain {
+				t.Fatalf("Validate() = %v, want the broken link %q", err, tc.wantChain)
+			}
+		})
+	}
+
+	to := platform.DefaultTimeouts()
+	to.StopDescendantWalkTimeout = to.ShutdownGracePeriod - time.Millisecond
+	if err := to.Validate(); err != nil {
+		t.Fatalf("StopDescendantWalkTimeout just below ShutdownGracePeriod: Validate() = %v, want nil", err)
+	}
+	to = platform.DefaultTimeouts()
+	to.ActorHydrateTimeout = to.StopDescendantWalkTimeout + time.Second
+	if err := to.Validate(); err != nil {
+		t.Fatalf("ActorHydrateTimeout above StopDescendantWalkTimeout: Validate() = %v, want nil -- the wakes follow the walk", err)
+	}
+}
+
 // TestValidate_StopGrace pins StopGrace (technical plan §3.3's stop): the
 // shipped 30s, refused at zero or below, and refused unless TurnDeadline
 // exceeds it by MinTimeoutMargin -- a stopped turn in flight must be

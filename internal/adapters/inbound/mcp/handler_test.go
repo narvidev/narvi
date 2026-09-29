@@ -29,6 +29,8 @@ func testTwins() Twins {
 		ApprovePlan: stubHandler(http.StatusOK, `{"status":"approved"}`),
 		RejectPlan:  stubHandler(http.StatusOK, `{"status":"rejected"}`),
 		CreateTurn:  stubHandler(http.StatusCreated, `{"status":"pending"}`),
+		// The stop twin answers 202, as POST .../stop does.
+		StopSession: stubHandler(http.StatusAccepted, `{"openTurns":0}`),
 	}
 }
 

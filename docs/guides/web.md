@@ -341,9 +341,12 @@ as `GET /api/sessions/{sessionID}` does. A member may stop only a session
 they created or joined, and never a pull request's review session, which
 every review of that pull request shares (`403`); a viewer may stop none.
 An admin or maintainer may stop any session. If a session the stop
-reached could not be written, the answer is `500`: what was written
-stands, and repeating the request reaches the rest, flagging, as above,
-whatever is open by then.
+reached could not be written, the answer is `500` with a body saying to
+repeat the request: what was written stands, and repeating the request
+reaches the rest, flagging, as above, whatever is open by then. Any other
+`500` (`internal error`) wrote nothing, and repeating it is safe too. Once
+the session named is stopped, your connection dropping does not cut short
+the stop of the sessions it started.
 
 ## Plan mode
 

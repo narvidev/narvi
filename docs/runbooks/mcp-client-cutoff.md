@@ -127,36 +127,64 @@ listed and revoked.
 ## Sessions an app already started
 
 An app whose user granted it "Act as you" (`mcp:write`) can start sessions,
-and each one runs code in the user's repositories and spends on models
-(§43.8). Every step above stops the app's **next** call, the next session
-start included -- it does not stop a session the app already started, which
-runs to its end like any other: no stop action exists yet, over MCP or REST.
-What bounds a runaway app meanwhile is its brakes, both per authorization
-and per control-plane replica: a burst of 30 calls to `POST /mcp`, then one
-a second, answered `429` past that; and a burst of 5 calls to
-`narvi_create_session`, then one a minute -- a retry counting as a call, so
-the app starts at most that many sessions -- refused past that without
-starting anything. Both refusals
-are logged at WARN (`mcpauth: rate limited`, `mcp: session start refused by
-the create brake`) with the `grant_id` and `client_id`, and neither is
-audited.
+send them prompts and approve their plans, and each turn it sets going runs
+code in the user's repositories and spends on models (§43.8, §43.21). Every
+step above stops the app's **next** call, the next session start included --
+it does not stop work the app already set going: a session it started, or an
+implementation it approved, runs on. So a runaway app takes two moves: cut
+off its access (above), **and** stop the sessions it put to work. Cut the
+access off first: a stopped session is set going again by the next prompt,
+plan approval or workflow-step decision made on it, and one the app makes
+counts as its user's.
 
-To find what an app started, read the audit log: every session it started
-has a `session.create` row whose `detail.mcp` names the authorization and
-the client, and the session itself records `spawn_source = mcp`:
+**Stop them** with `POST /api/sessions/{sessionID}/stop`, one call per
+session, which also stops every session that session started (technical plan
+§3.3; documented in `docs/guides/web.md`, "Stopping a session"). An
+administrator or maintainer may stop any session; a member, only a session
+they started or joined, and never a pull request's review session; a viewer,
+none. While the app still has access, its own `narvi_stop_session` tool is
+the same route (§43.22), and the user can ask the app to use it. The answer
+is `202` once the request is written: a queued turn is cancelled at once and
+never runs, a running one once its sandbox confirms the stop -- or
+`StopGrace` (30 s) later if it does not -- and nothing is pushed for either;
+`GET /api/sessions/{sessionID}/status` shows each session settle. A `500`
+whose body says to repeat the request means the session was stopped but one
+of the sessions it started could not be reached: what was written stands.
+Any other `500` (`internal error`) wrote nothing. The same call again is
+safe in both cases, since a repeat only stops more. Once the session named
+is stopped, a call cut off by a timeout or a dropped connection still stops
+every session it started. Each stop is audited
+`session.stop`, one row per session it reached; one made through an app
+carries its `detail.mcp`.
+
+Until both moves are done, what bounds a runaway app is its brakes, both per
+authorization and per control-plane replica: a burst of 30 calls to
+`POST /mcp`, then one a second, answered `429` past that; and a burst of 5
+calls to `narvi_create_session`, then one a minute -- a retry counting as a
+call, so the app starts at most that many sessions -- refused past that
+without starting anything. Both refusals are logged at WARN (`mcpauth: rate
+limited`, `mcp: session start refused by the create brake`) with the
+`grant_id` and `client_id`, and neither is audited.
+
+To find the sessions an app put to work, read the audit log: every session
+it started has a `session.create` row, and every prompt, revision or plan
+approval it made a `turn.create` or `plan.approve` row naming the session,
+each with a `detail.mcp` that names the authorization and the client; a
+session the app started also records `spawn_source = mcp`. Stop each session
+this answers:
 
 ```sql
-SELECT a.resource_id AS session_id, a.created_at, a.detail_json->'mcp' AS via
+SELECT DISTINCT CASE WHEN a.action = 'session.create' THEN a.resource_id
+                     ELSE a.detail_json->>'session_id' END AS session_id
 FROM audit_log a
-WHERE a.action = 'session.create'
-  AND a.detail_json->'mcp'->>'client_id' = '<clientId>'
-ORDER BY a.created_at DESC;
+WHERE a.action IN ('session.create', 'turn.create', 'plan.approve')
+  AND a.detail_json->'mcp'->>'client_id' = '<clientId>';
 ```
 
 (`detail_json->'mcp'->>'grant_id'` narrows it to one user's authorization,
 the `id` the Connected apps lists answer.) The same stamp is on every other
 audit row a change made through an app writes, including a
-`session.repo_entitlement_denied` refusal.
+`session.repo_entitlement_denied` refusal and a `session.stop`.
 
 ## Revoke every authorization
 

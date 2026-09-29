@@ -1,7 +1,8 @@
 // Package mcp implements the MCP (Model Context Protocol) surface: the
 // entry point, transport, protocol-version gate, and its tools -- the
-// reads, and the writes: narvi_create_session and the plan decisions,
-// revision and prompt (technical plan §43, "the MCP surface").
+// reads, and the writes: narvi_create_session, the plan decisions,
+// revision and prompt, and narvi_stop_session (technical plan §43, "the
+// MCP surface").
 //
 // # What this is, plainly
 //
@@ -22,7 +23,7 @@
 // like the rest: the wait is the status twin with ?waitSeconds=, whose
 // blocking lives in the twin -- this package only builds the query -- and
 // the result's live freshness read lives in its twin too), and so are a
-// session's plan versions (narvi_list_plans, §43.21). Five tools write, all
+// session's plan versions (narvi_list_plans, §43.21). Six tools write, all
 // under mcp:write, each bridged to its REST route like the reads are
 // bridged to their GETs. narvi_create_session (§43.8) is POST
 // /api/sessions -- that route records spawn_source mcp from the grant on
@@ -36,6 +37,11 @@
 // the audit row and the notices; narvi_request_plan_revision and
 // narvi_send_prompt are POST .../turns with planMode true and false, whose
 // RejectIfOpen policy refuses them 409 while any turn is open.
+// narvi_stop_session (§43.22) is POST .../stop, so a stop keeps every check
+// and every effect the route has -- the role, own/joined and review-session
+// rule, the request written as data under the session's lock, the audit row
+// (stamped with the grant, like every write's) and the walk to every
+// session the one named started.
 //
 // # Registration (controlplane/serve.go)
 //
@@ -152,12 +158,13 @@
 // # What is emphatically NOT here
 //
 // No repository discovery (needs a REST route this codebase does not
-// have yet, §43 D5). No stop tool yet: stop is a later piece of row 183,
-// and has no twin to bridge to yet. No second path for any write: a
-// write's body is the restdtos request DTO its BuildRequest builds
-// (CreateSessionRequest, CreateTurnRequest), marshalled by callTwin, never
-// the raw arguments, and never with a header -- a GET twin handed a body is
-// refused as a defect; the plan decisions send no body at all. No queue of
+// have yet, §43 D5). No second path for any write: a write's body is the
+// restdtos request DTO its BuildRequest builds (CreateSessionRequest,
+// CreateTurnRequest), marshalled by callTwin, never the raw arguments, and
+// never with a header -- a GET twin handed a body is refused as a defect;
+// the plan decisions and the stop send no body at all. No stop of its own:
+// narvi_stop_session neither cancels, walks descendants nor retries -- the
+// twin does all of it, once per call. No queue of
 // its own, and no policy: a turn tool cannot choose AlwaysQueue or
 // DropIfOpen, its twin's RejectIfOpen refuses it while a turn is open, and
 // this package neither retries that refusal nor turns it into a queue

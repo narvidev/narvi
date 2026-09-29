@@ -100,13 +100,13 @@ Two-phase terminalization's reconciliation above is scoped to a late signal that
 
 `pending → dispatched → processing → completed | failed | cancelled`. Exactly one `processing` per session. Enqueue → if no live sandbox, trigger spawn and return (dispatch happens when sandbox connects). Dispatch arms `turn_deadline`. On terminal event: complete turn, trigger snapshot, re-derive session status, dispatch next pending. Stop/failure paths emit a **synthetic** `execution_complete` event so clients always see one terminal event per turn. The turn records the OpenCode conversation id **at turn start** (also reported on every heartbeat) so follow-up prompts on a fresh sandbox resume the same conversation — never lazily.
 
-**Stop.** `POST /api/sessions/{sessionID}/stop` stops a session and every session it started, through this machine's own `cancel` edge (legal from `pending`, `dispatched` and `processing`) — there is no second stop, and no new turn state, trigger or session status. The request is data (§2): the turns open at that instant are flagged (`turns.stop_requested_at`), the session is flagged (`sessions.stop_requested_at`), and its `stop` timer is armed for now. A repeated request flags whatever is open by then; each turn keeps its first flag, and the session takes the latest request's instant. The actor then:
+**Stop.** `POST /api/sessions/{sessionID}/stop` stops a session and every session it started, through this machine's own `cancel` edge (legal from `pending`, `dispatched` and `processing`) — there is no second stop, and no new turn state, trigger or session status. An MCP client's stop is this same route, called through `narvi_stop_session` (§43.22). The request is data (§2): the turns open at that instant are flagged (`turns.stop_requested_at`), the session is flagged (`sessions.stop_requested_at`), and its `stop` timer is armed for now. A repeated request flags whatever is open by then; each turn keeps its first flag, and the session takes the latest request's instant. The actor then:
 
 - cancels every flagged `pending` turn with a synthetic `execution_complete` — from the `stop` timer, or from the dispatch gate, whichever runs first: planning a dispatch cancels a flagged pending turn instead of dispatching it, and never re-sends a flagged turn in flight to a respawned sandbox;
 - sends a flagged turn in flight the sandbox `stop{gen}` command after its commit, and re-arms `stop` for the end of that turn's `StopGrace` (30s, measured from its flag on the database's clock). The agent's `execution_complete{cancelled}` takes the ordinary path: cancelled, nothing pushed, and the sandbox is kept. If the timer fires again with the turn still in flight — the agent stayed silent, or there was no sandbox to tell — the actor cancels it with a synthetic `execution_complete`, as `turn_deadline` ends a turn, and **retires the sandbox generation the turn ran on**. An `execution_complete` names a gen, never a turn, and the agent may still be running the stopped work: left live, the sandbox would take the next turn at that gen, and the stopped work's late end would be booked against it. So, in the same transaction, the sandbox takes the machine's own two edges to `stopped` (its live state → `suspect` → `stopped`, the `grace_expired` outcome §3.2 reserves for an explicit stop); after the commit its provider object is stopped, and when that call cannot be made or fails the reconciler reaps it, since a `stopped` row no longer claims it; and the next turn is dispatched to a new gen, restored from the last snapshot or freshly spawned, whose gen fence (§3.2) drops everything the old gen still sends — with no effect at all: an event the fence drops is not stored, moves no liveness, is not acked, and starts nothing after its commit (no snapshot, no dispatch). The cost is that respawn, and whatever the stopped turn changed in the workspace since the last snapshot. Nothing is retired when the agent confirms the turn's end within the grace, or when the sandbox's gen has already moved past the turn's own dispatch. The retirement waits for a delivery, and the cancel does not: while the gen it would retire is still delivering a completed turn's push and pull request (`sandboxes.pr_delivery_started_at`, §43.20), stopping its sandbox would kill that delivery. So the turn is cancelled at its grace's end all the same, with its synthetic `execution_complete`, and only the retirement is left owed (`sandboxes.stop_retire_gen`): nothing is dispatched to that gen and no snapshot of it is started meanwhile, since the agent may still be running the stopped work there — it runs a prompt while it handles a push, and a gen that takes no snapshot (a Docker-required session's, §27.8) is sent the next turn's prompt before the previous turn's push. The stopped work's own late `execution_complete` then finds nothing processing, so nothing is completed or pushed for it, and what it changed goes with the gen. The timer looks again every `StopGrace`, never past `MCPStatusDeliveryWindow` from the delivery's start, and its first fire after the delivery ends, or after its window has run, retires the gen and dispatches what is queued to a new one;
 - while the session's request stands, deletes the session's timers whose firing creates a turn (the §43.20 classification: today the re-review debounce) that were armed at or before the request — `session_timers.created_at` against `sessions.stop_requested_at`, the latest request's instant, both the database's clock, so a repeated request also disarms what a push armed since the one before. One armed after the request is new input and stays.
 
-While the session's request stands, a workflow attempt that ends — however it ends: cancelled by the stop, completed or failed before the stop reached it, or created after the request — ends its run `cancelled`, its step run keeping the status its turn ended with, and `NextStep` is not consulted: advancing inserts a turn with no new input, and read as `blocked` a cancel would let a custom definition's edge queue the next step, so the stop would not stop. A cancel the stop asked for ends the run the same way even after a person resumed the session. A step awaiting a person's decision (§25.9) keeps waiting, and the decision is a new human act: approving or revising the step resumes the session, so the attempt it dispatches runs and the run goes on, while rejecting it ends the run `failed`, as before, and leaves the request standing, as rejecting a plan does. After its own commit the route walks `parent_session_id` and applies the same request to each descendant in its own transaction, each audited `session.stop` with `detail.via_parent_session_id` and authorized by the check on the session named (§13.3). A child is created only after its parent's row is read `FOR SHARE` — the foreign key's `KEY SHARE` would not conflict with the stop's `UPDATE` — and a child of a stopped parent is refused with a permanent marker, so an outbox never retries it: a spawn racing a stop either commits first and is found by the walk, or waits and is refused. A stop is not an archive: a person's next act that sets the session going again — the next turn they create, their approval of the session's plan, or their approval or revision of a workflow step awaiting their decision — clears the session's request in its own transaction, and turns created after the request carry no flag and run normally.
+While the session's request stands, a workflow attempt that ends — however it ends: cancelled by the stop, completed or failed before the stop reached it, or created after the request — ends its run `cancelled`, its step run keeping the status its turn ended with, and `NextStep` is not consulted: advancing inserts a turn with no new input, and read as `blocked` a cancel would let a custom definition's edge queue the next step, so the stop would not stop. A cancel the stop asked for ends the run the same way even after a person resumed the session. A step awaiting a person's decision (§25.9) keeps waiting, and the decision is a new human act: approving or revising the step resumes the session, so the attempt it dispatches runs and the run goes on, while rejecting it ends the run `failed`, as before, and leaves the request standing, as rejecting a plan does. After its own commit the route walks `parent_session_id` and applies the same request to each descendant in its own transaction, each audited `session.stop` with `detail.via_parent_session_id` and authorized by the check on the session named (§13.3). From that commit on, the walk and the actors' wakes, which follow it, no longer depend on the caller: they run on the request's context with its cancellation removed and its values kept (the MCP grant the audit stamp reads included), bounded by `StopDescendantWalkTimeout` (8s, below `ShutdownGracePeriod`), so a client that times out or disconnects after the commit still stops every session the one named started; a walk the bound cuts short is logged at WARN, and a caller still there gets the partial-walk `500`. A child is created only after its parent's row is read `FOR SHARE` — the foreign key's `KEY SHARE` would not conflict with the stop's `UPDATE` — and a child of a stopped parent is refused with a permanent marker, so an outbox never retries it: a spawn racing a stop either commits first and is found by the walk, or waits and is refused. A stop is not an archive: a person's next act that sets the session going again — the next turn they create, their approval of the session's plan, or their approval or revision of a workflow step awaiting their decision — clears the session's request in its own transaction, and turns created after the request carry no flag and run normally.
 
 | Part of the session | Effect of a stop |
 |---|---|
@@ -7157,7 +7157,7 @@ a session's live status and its transcript paging (piece (a), §43.20), the boun
 §43.20), and a session's result -- its last run, the pull requests it produced, and each one's verdict
 with its freshness or its absence (piece (c), §43.20); 183 adds delegate (create session, §43.8), plan
 read -- `narvi_list_plans`, without which a client has no plan id to decide -- plan approve and reject,
-revision and prompt-while-running (§43.21), and stop. Repository discovery (`narvi_list_repositories`)
+revision and prompt-while-running (§43.21), and stop (§43.22). Repository discovery (`narvi_list_repositories`)
 is deliberately absent from 180 too: this codebase has no `GET /api/repos` route for it to sit over,
 and the one-adapter rule (§43.7) means a tool ships only once its HTTP twin exists. A session a client
 creates over MCP (row 183) records `spawn_source = mcp` (decided 2026-09-28), set by the server from the
@@ -7290,7 +7290,8 @@ lists every session on the deployment, not only the caller's own — composed pe
 the request's token can see (its own scopes, §43.16), so it never names a hidden one (§43.17). It calls
 the tools read-only only when no write tool is visible; beside a write tool it names the reads and the
 writes apart, and says that a write acts as the user who approved the client, within that user's role,
-and can run code in their repositories and spend on models. The legacy
+and can run code in their repositories and spend on models; beside the stop tool it ends by saying what a
+stop reaches and that a repeat is not a no-op (§43.22). The legacy
 `initialize` handshake answers with the same `serverInfo`/`capabilities`.
 
 ### 43.6 Registration: where the endpoint mounts, and in what order
@@ -7365,7 +7366,8 @@ the twin's own URL params, query string and body (§43.7). Every read tool adver
 true`, `destructiveHint: false`, `idempotentHint: true`, `openWorldHint: false`. `narvi_create_session`
 advertises `readOnlyHint: false` (it writes), `destructiveHint: false` (it only adds a session),
 `idempotentHint: true` (a retry under the same key starts nothing more) and `openWorldHint: true` (the
-run it starts reads from and pushes to the code host). The plan and turn tools' own hints are §43.21's.
+run it starts reads from and pushes to the code host). The plan and turn tools' own hints are §43.21's,
+and the stop tool's §43.22's.
 Two structural tests tie the table together: a
 tool whose twin is a GET requires `mcp:read` and is annotated read-only, and a tool whose twin is not a
 GET requires `mcp:write` and is never annotated read-only (`TestWriteTwinsRequireWriteScope`,
@@ -7509,7 +7511,9 @@ from it where the tool's contract differs: no `spawnSource` (refused as an unkno
 `CreateSessionRequest.spawnSource`'s description that the tool sends `web` and the server records `mcp`;
 all of it grades MINOR, and adding one of the create's environment settings to the tool later is MINOR
 too. Contracts 1.12.0 adds the inputs of the plan and turn tools the same way, five self-contained
-`$def`s whose outputs reuse `ListPlansResponse`, `PlanActionResponse` and `CreateTurnResponse` (§43.21).
+`$def`s whose outputs reuse `ListPlansResponse`, `PlanActionResponse` and `CreateTurnResponse` (§43.21),
+and contracts 1.14.0 the stop tool's, `StopSessionToolRequest`, whose output reuses
+`StopSessionResponse` (§43.22).
 
 ### 43.11 Feature flag
 
@@ -8162,7 +8166,8 @@ and 182's status, wait, result and transcript, §43.20), `mcp:write` covers ever
 implies `mcp:read`. A scope is advertised — in `scopes_supported`, in the 401 challenge, and as
 acceptable at the authorization endpoint — only when at least one registered tool requires it, so no
 contract promises a scope nothing consumes. Row 183's `narvi_create_session` requires `mcp:write`, and so
-do its plan decisions, revision and prompt (§43.21), so both are offered now, `mcp:read mcp:write`, and
+do its plan decisions, revision and prompt (§43.21) and its stop (§43.22), so both are offered now,
+`mcp:read mcp:write`, and
 a scope outside them is refused as `invalid_scope`. One
 write scope covers every write, deliberately: finer per-action scopes can be added later without taking
 anything away. The consent page shows each requested scope as a checkbox, pre-checked, which the user
@@ -8247,7 +8252,9 @@ overrides a caller's own `mcp` key. The stamp comes from the context, not from a
 covers every audit row a tool call writes, whatever it writes on: `session.create`, in the create's
 transaction, and `session.repo_entitlement_denied`, which the entitlement gate writes through the pool
 before that transaction opens when it refuses a create over MCP — that row, the gate's WARN line and its
-counter all say `spawn_source` `mcp`, as the rollout gate's WARN line and counter do. A change made with
+counter all say `spawn_source` `mcp`, as the rollout gate's WARN line and counter do — and every
+`session.stop` a stop over MCP writes, one per session it reaches, each descendant's in its own
+transaction (§43.22). A change made with
 the cookie carries no stamp. The row's actor stays the user: the
 grant says through which client they acted, not who acted. The grant is read there as a label, never as
 a permission (`platform.MCPGrant`'s own doc comment lists every reader).
@@ -9227,7 +9234,7 @@ approved implementation is running:
   implementation's push rather than with the push that follows the revision's own completion; the
   branch ends the same either way.
 - **(c) Only a stop ends a running implementation early**, and it is authorized on its own (§3.3's
-  stop, Step 217, REST only; row 183's stop tool over it is not yet shipped). Revoking the grant, or
+  stop, Step 217; over MCP, `narvi_stop_session`, §43.22). Revoking the grant, or
   narrowing the user's role, governs the next call; it
   does not abort running work, whose delivery re-checks the creator when the pull request is opened
   (§43.20). A stop's dispatch gate must key on "flagged by a stop", never on "a newer plan exists".
@@ -9283,6 +9290,70 @@ back only after the revision wrote its version; `TestMentionBehindImplementation
 pins the case production reaches: a mention, without plan mode, queued behind the approved
 implementation on a review session is an ordinary turn, and the classifier is not asked -- while the
 same mention, with the same classifier, on a session whose plan awaits approval becomes a revision.
+
+### 43.22 Stop over MCP
+
+Row 183's last piece: one tool, bridged (§43.7) to §3.3's stop route (Step 217), with nothing in that
+route changed. It closes the row's exit.
+
+| Tool | HTTP twin | Scope | Input `$def` | Output `$def` | read-only / destructive / idempotent / open-world |
+|---|---|---|---|---|---|
+| `narvi_stop_session` | `POST /api/sessions/{sessionID}/stop` | `mcp:write` | `StopSessionToolRequest {sessionId}` | `StopSessionResponse` | no / yes / no / yes |
+
+- **The hints, read from the route as it shipped.** The row's design called the tool idempotent and
+  closed-world. The route that shipped makes both untrue, so the tool claims neither. A stop cancels
+  running work, which then pushes nothing: destructive. A repeat is not a no-op (§3.3): it flags
+  whatever is open by then -- a turn a person created since the first call included, which then stops
+  too -- writes its own `session.stop` row and answers its own `requestedAt`, so a client must not retry
+  it as it would an idempotent call. And a cancel reaches outside this deployment as any end of a turn
+  does: the cancelled turn's notice goes to the Slack thread or the Linear session its session came from,
+  and a cancelled review attempt's check is updated on the code host -- §43.21's rule for open-world.
+- **What the twin receives.** The id becomes the twin's chi param `sessionID`; no query and no body. The
+  twin is the same constructor call its `/api` route uses (`controlplane/serve.go`), field for field.
+- **A stop keeps every check and every effect.** The bearer gate (§43.16), then the route: `400` and
+  `404` as on `GET`; `authz.ActionStopSession` with the own/joined rule and its review-session exception
+  (§13.3, owner decision O1) -- an admin or a maintainer stops any session, a member a session they
+  started or joined but never a pull request's review session, a viewer none, so a member's token is
+  refused a review session exactly as the member's cookie is; the request written as data under each
+  session's actor-epoch lock; the actor woken; and the walk to every session it started, authorized by
+  the check on the session named. Every `session.stop` row the call writes, each descendant's included,
+  carries `detail.mcp` (§43.18): the walk runs under the tool call's own request context.
+- **Outcomes** follow §43.8's table. `202` is a success carrying `StopSessionResponse` verbatim; `403`
+  and `404` are `isError` with REST's text; every `500` is `-32603`, like any server error, its text not
+  passed on -- the route's partial-walk `500` (the session stopped, a session it started not reached)
+  and its other `500`s, which wrote nothing, alike. So the tool's description says that an internal
+  error means one or the other, and that calling it again is safe either way, since a repeat only stops
+  more. Once the named session's request has committed, the call ending early -- a client timeout, a
+  dropped connection -- does not cut the walk short (§3.3), and the description says that too. The
+  per-grant `/mcp` brake (§43.6) applies to it like every call; the create brake does not.
+- **The instructions.** With the tool visible, the paragraph (§43.5) ends by saying it cancels the
+  queued and running turns of a session and of every session it started, answers before that work has
+  ended, and is not a no-op when repeated. The mark (`toolSpec.StopsSessions`) changes nothing the tool
+  does.
+- **What cutting a client off does not end.** Revoking the grant, or cutting off its client, governs the
+  next call only (§43.21 (c)): a runaway client needs both, its access cut off and the sessions it put
+  to work stopped, through this tool or the route (`docs/runbooks/mcp-client-cutoff.md`).
+
+**Contracts.** 1.14.0, MINOR (row 32): one self-contained input `$def`; the output reuses
+`StopSessionResponse`, which holds no enum. No route changes.
+
+**Tests.** Unit: the tool-list golden, the scope filter, `TestToolAnnotations_MatchTwinMethod`,
+`TestStopsSessions_MarksExactlyTheStopTool`, `TestHiddenToolCall_IsIndistinguishableFromUnknownTool`,
+`TestPlanAndTurnTools_TwinGetsItsOwnRequest` (its method, path and chi param, no query, no body, no
+header) and `TestStopTool_OutcomesFollowTheTable`. On the production router, through the official SDK
+client: `StopSession_SDKClient` (the answer's bytes and the database state it leaves equal REST's, ids
+and the instant aside, the grant on every audit row the call wrote, the child's included);
+`StopSession_ParityEveryRole_SDKClient` (every role, on a session the user started, one they joined,
+another member's, and a review session the user started: the outcome and the state equal REST's);
+`StopSession_ReadGrantDoesNotSeeIt`; and the row's exit, `PlanRevisionThenStop_NoOrphan_SDKClient`. There
+a plan is approved and its implementation processing on a sandbox whose agent is connected to the
+router's own sandbox WebSocket; a revision is refused, the implementation still processing and the plan
+still approved; a child is started by the sentinel auto-fix notifier -- the codebase's one child-spawn
+path, given a fake code host -- with its first turn queued and its sandbox requested from a local fake
+provider; a stop over MCP on the parent reaches both; the agent is sent `stop` for its gen and confirms;
+`narvi_wait_for_session` settles for every reached session; and, read from Postgres over the parent's
+whole descendant tree, no turn is pending, dispatched or processing, the implementation ended cancelled
+with nothing pushed, and the plan is still approved.
 
 ## 44. The GitHub App pool (new capability)
 

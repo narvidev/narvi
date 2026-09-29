@@ -323,8 +323,9 @@ func sdkCreateSessionKeyAcrossSources(t *testing.T, rig *oauthRouterRig) {
 // assertCreateHiddenLikeUnknown checks, for a flow whose grant cannot see
 // the write tools, that tools/list and the instructions name none of them,
 // that calling narvi_create_session through the SDK fails, that a raw call
-// to it -- and to narvi_approve_plan -- answers exactly an unknown tool's
-// bytes (the name the caller sent aside), and that nothing was written.
+// to it -- and to narvi_approve_plan and narvi_stop_session -- answers
+// exactly an unknown tool's bytes (the name the caller sent aside), and that
+// nothing was written.
 func assertCreateHiddenLikeUnknown(ctx context.Context, t *testing.T, rig *oauthRouterRig, flow *sdkFlow) {
 	t.Helper()
 	writes := map[string]bool{}
@@ -358,7 +359,7 @@ func assertCreateHiddenLikeUnknown(ctx context.Context, t *testing.T, rig *oauth
 		return status, string(raw)
 	}
 	unknownStatus, unknown := call(full, "narvi_does_not_exist")
-	for _, tool := range []string{"narvi_create_session", "narvi_approve_plan"} {
+	for _, tool := range []string{"narvi_create_session", "narvi_approve_plan", "narvi_stop_session"} {
 		hiddenStatus, hidden := call(hiddenToken, tool)
 		if hiddenStatus != unknownStatus || hidden != strings.ReplaceAll(unknown, "narvi_does_not_exist", tool) {
 			t.Fatalf("the hidden write tool %s answers differently from an unknown tool:\n hidden:  %d %s\n unknown: %d %s", tool, hiddenStatus, hidden, unknownStatus, unknown)

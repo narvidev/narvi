@@ -79,6 +79,12 @@ type Twins struct {
 	// handler, so the same RejectIfOpen policy -- 409 while any turn is
 	// open, nothing queued -- as a browser's prompt (technical plan §43.21).
 	CreateTurn http.HandlerFunc
+	// StopSession is httpapi.StopSession(...) -- narvi_stop_session's own
+	// twin, POST /api/sessions/{sessionID}/stop (technical plan §43.22): the
+	// same handler, so the same role, own/joined and review-session rule,
+	// the same request written as data, the same audit row and the same walk
+	// to every session the one named started, as a browser's stop.
+	StopSession http.HandlerFunc
 }
 
 // toolSpec is the ONLY place a tool is declared: its wire name, the
@@ -112,7 +118,14 @@ type toolSpec struct {
 	// decides. instructionsFor says it once, naming these tools
 	// (technical plan §43.21).
 	RefusedWhileTurnOpen bool
-	BuildRequest         func(arguments json.RawMessage) (twinCall, error)
+	// StopsSessions is true for a tool whose twin cancels the queued and
+	// running turns of a session and of every session it started, and does
+	// so again, for whatever was started since, on a repeat --
+	// narvi_stop_session. Like RefusedWhileTurnOpen it changes nothing the
+	// tool does; instructionsFor says it once, naming these tools
+	// (technical plan §43.22).
+	StopsSessions bool
+	BuildRequest  func(arguments json.RawMessage) (twinCall, error)
 }
 
 // countWords spells small tool counts the way the instructions paragraph
@@ -127,14 +140,17 @@ var countWords = []string{"no", "one", "two", "three", "four", "five", "six", "s
 // the tools are read-only only when no write tool is visible; otherwise it
 // names the reads and the writes apart, and says what a write can do. When
 // a visible tool is refused while a turn is open (RefusedWhileTurnOpen), a
-// last sentence names those tools and says that nothing is queued, so a
-// client waits for the session to settle rather than retrying in a loop
-// (technical plan §43.21).
+// sentence names those tools and says that nothing is queued, so a client
+// waits for the session to settle rather than retrying in a loop
+// (technical plan §43.21). When a visible tool stops sessions
+// (StopsSessions), a last sentence names it, says it reaches every session
+// the one named started and returns before their work has ended, and that a
+// second call is not a no-op (technical plan §43.22).
 func instructionsFor(visible []toolSpec) string {
 	if len(visible) == 0 {
 		return "This authorization gives access to no tools on this server. The user can connect this client again and approve more access."
 	}
-	var reads, writes, gated []string
+	var reads, writes, gated, stoppers []string
 	for _, spec := range visible {
 		if spec.Annotations != nil && spec.Annotations.ReadOnlyHint {
 			reads = append(reads, spec.Instruction)
@@ -143,6 +159,9 @@ func instructionsFor(visible []toolSpec) string {
 		}
 		if spec.RefusedWhileTurnOpen {
 			gated = append(gated, spec.Name)
+		}
+		if spec.StopsSessions {
+			stoppers = append(stoppers, spec.Name)
 		}
 	}
 	if len(writes) == 0 {
@@ -155,6 +174,9 @@ func instructionsFor(visible []toolSpec) string {
 	text += " " + capitalize(countWord(len(writes))) + " " + plural(len(writes), "acts", "act") + " as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " + joinList(writes) + "."
 	if len(gated) > 0 {
 		text += " " + joinList(gated) + " " + plural(len(gated), "is", "are") + " refused while a turn of the session is queued or running, and nothing is queued: wait until the session settles, then call again."
+	}
+	if len(stoppers) > 0 {
+		text += " " + joinList(stoppers) + " " + plural(len(stoppers), "cancels", "cancel") + " the queued and running turns of a session and of every session it started, and " + plural(len(stoppers), "answers", "answer") + " before that work has ended: wait until the session settles. Calling it again is not a no-op: it also stops whatever was started since."
 	}
 	return text
 }
@@ -559,6 +581,21 @@ func buildSendPromptRequest(arguments json.RawMessage) (twinCall, error) {
 	return createTurnCall(in.SessionId, in.Prompt, in.ModelId, in.Effort, false), nil
 }
 
+// buildStopSessionRequest maps narvi_stop_session's arguments, decoded
+// through restdtos.StopSessionToolRequest (whose generated UnmarshalJSON
+// enforces "sessionId" is present), onto the stop route's one chi URL
+// param, "sessionID". No query and no body: POST
+// /api/sessions/{sessionID}/stop reads neither. Nothing else: who may stop
+// the session, the request written as data and the walk to every session
+// it started are all the twin's (technical plan §43.22).
+func buildStopSessionRequest(arguments json.RawMessage) (twinCall, error) {
+	var in restdtos.StopSessionToolRequest
+	if err := json.Unmarshal(arguments, &in); err != nil {
+		return twinCall{}, err
+	}
+	return twinCall{URLParams: map[string]string{"sessionID": in.SessionId}}, nil
+}
+
 // toolSpecs is the tool table itself -- registerTools below and
 // TestEveryToolHasARegisteredTwin both read this SAME function (the
 // latter with a zero-value Twins{}, since it only ever inspects Twin.
@@ -712,6 +749,18 @@ func toolSpecs(twins Twins) []toolSpec {
 			RefusedWhileTurnOpen: true,
 			BuildRequest:         buildSendPromptRequest,
 		},
+		{
+			Name:          "narvi_stop_session",
+			Description:   "Stop a session and every session it started, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/stop, with the same checks: that user's own role (an admin or maintainer may stop any session, a member only a session they started or joined and never a pull request's review session, a viewer none). Every turn of those sessions that is queued or running when the call is made is cancelled: a queued one at once, never started, and a running one once its sandbox confirms the stop, or 30 seconds later (as shipped) if it does not; nothing is pushed for it. A turn that already completed keeps its push and pull request, and a plan keeps its status. While the stop stands, none of those sessions starts a new session of its own; the next prompt, plan approval or workflow-step decision a person makes on one sets it going again, and a turn created after the call runs normally. The call answers once the request is written, before that work has ended: follow it with narvi_wait_for_session. Calling it again is not a no-op: it also stops whatever was started since. Once the stop is written, a call that ends early -- a timeout, a dropped connection -- does not cut short the stop of the sessions it started. An internal error means either that nothing was written or that the session was stopped but not every session it started could be reached: calling it again is safe either way, and reaches the rest. Returns sessionId, requestedAt, reachedSessionIds (the session, then every session it started) and openTurns (how many turns it asked to cancel).",
+			Scope:         mcpscope.Write,
+			Instruction:   "narvi_stop_session (stop a session's queued and running work, and that of every session it started)",
+			Twin:          twin{method: http.MethodPost, pathTemplate: "/api/sessions/{sessionID}/stop", handler: twins.StopSession},
+			InputDef:      "StopSessionToolRequest",
+			OutputDef:     "StopSessionResponse",
+			Annotations:   stopSessionAnnotations,
+			StopsSessions: true,
+			BuildRequest:  buildStopSessionRequest,
+		},
 	}
 }
 
@@ -751,7 +800,7 @@ var approvePlanAnnotations = &sdkmcp.ToolAnnotations{
 }
 
 // rejectPlanAnnotations are narvi_reject_plan's (technical plan §43.21): a
-// rejection is final for that plan version -- the one tool here that ends
+// rejection is final for that plan version -- the one plan tool that ends
 // something, so it is marked destructive -- a second call changes nothing
 // more, and, though it queues no turn, it reaches outside this deployment:
 // the verdict is posted to the Slack message or the Linear session the plan
@@ -771,6 +820,22 @@ var rejectPlanAnnotations = &sdkmcp.ToolAnnotations{
 var queueTurnAnnotations = &sdkmcp.ToolAnnotations{
 	ReadOnlyHint:    false,
 	DestructiveHint: boolPtr(false),
+	IdempotentHint:  false,
+	OpenWorldHint:   boolPtr(true),
+}
+
+// stopSessionAnnotations are narvi_stop_session's (technical plan §43.22).
+// Destructive: it cancels running work, which pushes nothing. Not
+// idempotent: its twin documents that a repeat is not a no-op -- it flags
+// whatever is open at that moment, a turn created since the first call
+// included, and writes an audit row of its own -- so a client must not
+// retry it blindly. Open-world: a cancelled turn's notice is posted to the
+// Slack thread or the Linear session a session came from, and a cancelled
+// review attempt's check on the code host is updated, exactly as when a
+// turn ends any other way.
+var stopSessionAnnotations = &sdkmcp.ToolAnnotations{
+	ReadOnlyHint:    false,
+	DestructiveHint: boolPtr(true),
 	IdempotentHint:  false,
 	OpenWorldHint:   boolPtr(true),
 }

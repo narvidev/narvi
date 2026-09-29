@@ -13870,6 +13870,37 @@ func (j *StopSessionResponse) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// The narvi_stop_session MCP tool's own input (technical plan §43.22) -- the tool
+// bridge's twin of POST /api/sessions/{sessionID}/stop, which takes no body: the
+// path parameter is a plain required field. Self-contained: it references no other
+// $def. The answer is StopSessionResponse: 202 once the request is written to the
+// session and to every session it started. Repeating it is not a no-op: it also
+// stops whatever was started since.
+type StopSessionToolRequest struct {
+	// The session to stop, with every session it started: its id, matching
+	// Session.id's own format exactly. A malformed value fails argument validation
+	// before the twin is invoked, reported as a tool execution error (isError:true).
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *StopSessionToolRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in StopSessionToolRequest: required")
+	}
+	type Plain StopSessionToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = StopSessionToolRequest(plain)
+	return nil
+}
+
 // Request body for PUT /api/repos/{owner}/{repo}/auto-approval-settings (§21.2
 // stage 1) -- the auto-approval eligibility engine's own two per-repo-tunable
 // criteria. A SEPARATE endpoint from UpdateRepoSettingsRequest's own PUT
@@ -15782,6 +15813,10 @@ type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
 // exists before any turn does.
 type WorkflowStepRunTurnId *string
 
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
+
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	var raw map[string]interface{}
@@ -15838,7 +15873,3 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRun(plain)
 	return nil
 }
-
-type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
