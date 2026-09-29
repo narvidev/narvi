@@ -147,7 +147,7 @@ func (s *Server) clientUsable(client sqlcgen.McpOauthClient) bool {
 // Vocabulary): the page never shows a user a scope it cannot explain.
 var scopeDescriptions = map[mcpscope.Scope]string{
 	mcpscope.Read:  "Read the model catalog and this deployment's sessions, with exactly the visibility your own account has.",
-	mcpscope.Write: "Act on sessions on your behalf, within what your own role allows.",
+	mcpscope.Write: "Start sessions, send prompts, approve or reject plans, request revisions and stop sessions as you. This can run code in your repositories and spend on models, within what your own role allows.",
 }
 
 // errNoDescription is returned by describeScope for a scope with no

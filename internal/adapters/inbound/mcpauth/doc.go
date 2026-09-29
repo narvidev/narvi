@@ -42,7 +42,10 @@
 // per client network (an IPv4 address, whether it arrives as IPv4 or
 // inside an IPv6 address that carries it, or an IPv6 /48;
 // ClientAddressKey, RateLimiter), before their handler, so a refused
-// request reads and spends nothing.
+// request reads and spends nothing. The same RateLimiter brakes POST /mcp
+// itself, keyed by the MCP grant instead (LimitBy with GrantKey, answered
+// by MCPCallRateLimited; technical plan §43.6), and its Allow is the brake
+// narvi_create_session consults per grant inside the MCP adapter (§43.8).
 //
 // # Invariants this package is responsible for
 //

@@ -3210,6 +3210,41 @@ type Timeouts struct {
 	// bounds how long each request waits. 100.
 	MCPMaxPendingAuthorizationRequestsPerClient int
 
+	// -- technical plan §43.6/§43.8 (the per-grant brakes on /mcp itself) --
+	//
+	// Keyed by the MCP grant a call is authorized by, never by address: a
+	// grant is one user's approval of one client, so one runaway client
+	// spends only its own bucket. The same shape and checks as the brakes
+	// above: a zero interval would be no limit at all (rate.Every(0) is
+	// rate.Inf, failing OPEN), and a burst below one would refuse
+	// everything. In-memory, per replica -- a brake, not a correctness
+	// property -- so N replicas admit up to N times these values, and a user
+	// with several grants has a bucket per grant.
+
+	// MCPCallRateInterval is the refill interval of the per-grant bucket in
+	// front of POST /mcp, mounted after the bearer gate: after a burst of
+	// MCPCallRateBurst calls, one grant may make one more call per interval.
+	// A refused call is answered 429 before its body is read, so no tool
+	// runs. 1 second.
+	MCPCallRateInterval time.Duration
+
+	// MCPCallRateBurst is the per-grant burst POST /mcp admits before
+	// MCPCallRateInterval paces it. A count, kept beside its interval. 30.
+	MCPCallRateBurst int
+
+	// MCPCreateSessionRateInterval is the refill interval of the per-grant
+	// bucket narvi_create_session consults after its arguments validate and
+	// before its twin runs: after a burst of MCPCreateSessionRateBurst
+	// sessions, one grant may start one more per interval. Every session
+	// started spawns a sandbox and spends on models, which a call brake
+	// paced in seconds does not bound. 1 minute.
+	MCPCreateSessionRateInterval time.Duration
+
+	// MCPCreateSessionRateBurst is the per-grant burst of sessions
+	// narvi_create_session starts before MCPCreateSessionRateInterval paces
+	// it. A count, kept beside its interval. 5.
+	MCPCreateSessionRateBurst int
+
 	// -- technical plan §43.20 (a session's status and the suggested delay
 	// before reading it again) --
 	//
@@ -3799,6 +3834,11 @@ func DefaultTimeouts() Timeouts {
 		MCPAuthorizeRateBurst:                       10,              // §43.14; per-network authorization-endpoint burst
 		MCPMaxPendingAuthorizationRequestsPerClient: 100,             // §43.14; pending authorization requests one client may have
 
+		MCPCallRateInterval:          time.Second, // §43.6; per-grant refill of the /mcp call bucket
+		MCPCallRateBurst:             30,          // §43.6; per-grant /mcp call burst
+		MCPCreateSessionRateInterval: time.Minute, // §43.8; per-grant refill of narvi_create_session's bucket
+		MCPCreateSessionRateBurst:    5,           // §43.8; per-grant session-start burst
+
 		MCPStatusDelayStarting:      15 * time.Second,  // §43.20; queued behind a cold start
 		MCPStatusDelayQueued:        5 * time.Second,   // §43.20; queued on a warm sandbox
 		MCPStatusDelayRunning:       10 * time.Second,  // §43.20; a turn in flight
@@ -4065,6 +4105,13 @@ func (t Timeouts) Validate() error {
 	mustBePositive("MCPAuthorizeRateInterval", t.MCPAuthorizeRateInterval)
 	countMustBePositive("MCPAuthorizeRateBurst", t.MCPAuthorizeRateBurst)
 	countMustBePositive("MCPMaxPendingAuthorizationRequestsPerClient", t.MCPMaxPendingAuthorizationRequestsPerClient)
+
+	// §43.6/§43.8: the per-grant brakes on /mcp and on narvi_create_session,
+	// the same shape again.
+	mustBePositive("MCPCallRateInterval", t.MCPCallRateInterval)
+	countMustBePositive("MCPCallRateBurst", t.MCPCallRateBurst)
+	mustBePositive("MCPCreateSessionRateInterval", t.MCPCreateSessionRateInterval)
+	countMustBePositive("MCPCreateSessionRateBurst", t.MCPCreateSessionRateBurst)
 
 	// §43.20: the status delay table (the MCPStatusDelay* fields' own block
 	// comment on the struct). The floor is positive -- a zero floor tells a

@@ -76,7 +76,16 @@ type rigOptions struct {
 	mechanisms mcpclient.Mechanisms
 	// timeouts, when set, replaces platform.DefaultTimeouts().
 	timeouts *platform.Timeouts
+	// scopes, when set, replaces buildScopes as the scopes the
+	// authorization server offers and the /mcp stand-in challenges with.
+	scopes []mcpscope.Scope
 }
+
+// buildScopes is what this build's tool table advertises
+// (internal/adapters/inbound/mcp's AdvertisedScopes, pinned by its own
+// TestAdvertisedScopes): read, and write since narvi_create_session
+// requires it. The rig offers exactly these unless a test chooses others.
+var buildScopes = []mcpscope.Scope{mcpscope.Read, mcpscope.Write}
 
 // newASRig is the rig with both client-registration mechanisms on.
 func newASRig(t *testing.T) *asRig {
@@ -119,11 +128,15 @@ func (r *asRig) build(t *testing.T, opts rigOptions) {
 	if opts.timeouts != nil {
 		timeouts = *opts.timeouts
 	}
+	scopes := buildScopes
+	if opts.scopes != nil {
+		scopes = opts.scopes
+	}
 	var err error
 	r.server, err = mcpauth.New(mcpauth.Config{
 		PublicBaseURL: rigBase,
 		Enabled:       true,
-		Scopes:        []mcpscope.Scope{mcpscope.Read},
+		Scopes:        scopes,
 		Timeouts:      timeouts,
 		Mechanisms:    opts.mechanisms,
 	}, mcpauth.Deps{
@@ -163,7 +176,7 @@ func (r *asRig) build(t *testing.T, opts rigOptions) {
 		rt.Use(auth.RequireMCPBearer(r.grants, auth.MCPBearerConfig{
 			Resource:              ids.Resource,
 			ResourceMetadataURL:   ids.ProtectedResourceMetadataURL,
-			Scopes:                []string{"mcp:read"},
+			Scopes:                mcpscope.Strings(scopes),
 			LastUsedWriteInterval: platform.DefaultTimeouts().MCPGrantLastUsedWriteInterval,
 			ClientMechanisms:      opts.mechanisms,
 		}))

@@ -2729,12 +2729,12 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// -- a network being the connecting address, so behind a proxy that
 		// hides client addresses every user shares the proxy's one.
 		r.With(
-			mcpauth.NewRateLimiter(cfg.Timeouts.MCPAuthorizeRateInterval, cfg.Timeouts.MCPAuthorizeRateBurst).Limit(mcpAuthServer.AuthorizeRateLimited),
+			mcpauth.NewRateLimiter(cfg.Timeouts.MCPAuthorizeRateInterval, cfg.Timeouts.MCPAuthorizeRateBurst).LimitBy(mcpauth.ByClientAddress, mcpAuthServer.AuthorizeRateLimited),
 		).Get("/authorize", mcpAuthServer.Authorize)
 		r.Get("/consent", mcpAuthServer.ConsentPage)
 		r.Post("/consent", mcpAuthServer.ConsentDecision)
 		r.With(
-			mcpauth.NewRateLimiter(cfg.Timeouts.MCPTokenEndpointRateInterval, cfg.Timeouts.MCPTokenEndpointRateBurst).Limit(mcpauth.TokenRateLimited),
+			mcpauth.NewRateLimiter(cfg.Timeouts.MCPTokenEndpointRateInterval, cfg.Timeouts.MCPTokenEndpointRateBurst).LimitBy(mcpauth.ByClientAddress, mcpauth.TokenRateLimited),
 		).Post("/token", mcpAuthServer.Token)
 		r.Post("/revoke", mcpAuthServer.Revoke)
 		// RFC 7591 dynamic client registration (§43.15): mounted
@@ -2744,7 +2744,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// header) before a single row is written.
 		r.With(
 			mcpadapter.RequireEnabled(cfg.MCPDCREnabled),
-			mcpauth.NewRateLimiter(cfg.Timeouts.MCPRegisterRateInterval, cfg.Timeouts.MCPRegisterRateBurst).Limit(mcpauth.RegisterRateLimited),
+			mcpauth.NewRateLimiter(cfg.Timeouts.MCPRegisterRateInterval, cfg.Timeouts.MCPRegisterRateBurst).LimitBy(mcpauth.ByClientAddress, mcpauth.RegisterRateLimited),
 		).Post("/register", mcpAuthServer.Register)
 	})
 

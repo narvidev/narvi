@@ -111,14 +111,14 @@ func TestClientAddressKey(t *testing.T) {
 }
 
 // TestRateLimiter_BoundedMemoryEvictsLeastRecentlyUsed: past
-// maxTrackedAddresses, the network seen least recently is forgotten to
+// maxTrackedKeys, the network seen least recently is forgotten to
 // make room -- a newcomer is admitted, never refused for the table being
 // full -- while a network seen recently keeps its bucket, and the table
 // never grows past the bound.
 func TestRateLimiter_BoundedMemoryEvictsLeastRecentlyUsed(t *testing.T) {
 	t.Parallel()
 	l, _ := newTestLimiter(time.Minute, 1)
-	for i := range maxTrackedAddresses {
+	for i := range maxTrackedKeys {
 		if ok, _ := l.Allow(fmt.Sprintf("key-%d", i)); !ok {
 			t.Fatalf("key %d refused while filling", i)
 		}
@@ -131,8 +131,8 @@ func TestRateLimiter_BoundedMemoryEvictsLeastRecentlyUsed(t *testing.T) {
 	if ok, _ := l.Allow("newcomer"); !ok {
 		t.Fatal("a newcomer was refused because the table was full")
 	}
-	if n := len(l.buckets); n != maxTrackedAddresses || l.recency.Len() != n {
-		t.Fatalf("tracking %d addresses (%d in recency order), want exactly %d", n, l.recency.Len(), maxTrackedAddresses)
+	if n := len(l.buckets); n != maxTrackedKeys || l.recency.Len() != n {
+		t.Fatalf("tracking %d addresses (%d in recency order), want exactly %d", n, l.recency.Len(), maxTrackedKeys)
 	}
 	if ok, _ := l.Allow("key-0"); ok {
 		t.Fatal("key-0, seen recently, lost its bucket to the newcomer")
@@ -162,7 +162,7 @@ func TestRateLimiter_OneNetworkCannotLockOutOthers(t *testing.T) {
 	}
 	newLimited := func() (http.Handler, *fakeClock) {
 		l, clock := newTestLimiter(timeouts.MCPRegisterRateInterval, timeouts.MCPRegisterRateBurst)
-		return l.Limit(RegisterRateLimited)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		return l.LimitBy(ByClientAddress, RegisterRateLimited)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 			w.WriteHeader(http.StatusCreated)
 		})), clock
 	}
@@ -171,7 +171,7 @@ func TestRateLimiter_OneNetworkCannotLockOutOthers(t *testing.T) {
 	t.Run("a flood from one /48", func(t *testing.T) {
 		h, _ := newLimited()
 		admitted := 0
-		for i := range 2 * maxTrackedAddresses {
+		for i := range 2 * maxTrackedKeys {
 			// 2001:db8:4000:<i>::<i>, a different /64 every time.
 			if send(h, fmt.Sprintf("[2001:db8:4000:%x::%x]:443", i, i+1)) == http.StatusCreated {
 				admitted++
@@ -191,7 +191,7 @@ func TestRateLimiter_OneNetworkCannotLockOutOthers(t *testing.T) {
 		h, clock := newLimited()
 		step := timeouts.MCPRegisterRateInterval / 4
 		for round := range 3 {
-			for i := range maxTrackedAddresses + maxTrackedAddresses/2 {
+			for i := range maxTrackedKeys + maxTrackedKeys/2 {
 				// One request per /48 -- 2001:db8:<i>::/48 -- each network
 				// back within a quarter of the refill interval. (The
 				// registrants below are in 2001:db8:5000::/48, which this
@@ -225,7 +225,7 @@ func TestRateLimiter_TranslatedIPv4ClientsKeepTheirOwnBuckets(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			l, _ := newTestLimiter(timeouts.MCPTokenEndpointRateInterval, timeouts.MCPTokenEndpointRateBurst)
-			h := l.Limit(TokenRateLimited)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			h := l.LimitBy(ByClientAddress, TokenRateLimited)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(http.StatusOK)
 			}))
 			send := func(remote string) int {
@@ -333,7 +333,7 @@ func TestRateLimiter_RefusalLogCarriesNoCredential(t *testing.T) {
 	const refresh, state, challenge = "narvi_mcp_rt_secretsecretsecret", "state-secret-value", "challenge-secret-value"
 	l, _ := newTestLimiter(time.Minute, 1)
 	var reached int
-	h := l.Limit(TokenRateLimited)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	h := l.LimitBy(ByClientAddress, TokenRateLimited)(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		reached++
 		w.WriteHeader(http.StatusBadRequest)
 	}))
@@ -363,6 +363,104 @@ func TestRateLimiter_RefusalLogCarriesNoCredential(t *testing.T) {
 	for _, secret := range []string{refresh, state, challenge, "refresh_token", "state="} {
 		if strings.Contains(line, secret) {
 			t.Fatalf("the refusal log carries %q: %s", secret, line)
+		}
+	}
+}
+
+// TestRateLimiter_LimitByKey is the per-grant /mcp brake (technical plan
+// §43.6): keyed by GrantKey, every call from one address spends only its
+// own grant's bucket -- a second grant on the same address is untouched,
+// and so is the same grant's user under another grant -- a refused call
+// never reaches the handler, and is answered by MCPCallRateLimited and
+// logged at WARN with the grant and client ids and the path, never the
+// bearer token or the body. A request with no grant passes through
+// unbraked, whatever the address. Not parallel: it swaps the default
+// logger (TestRateLimiter_RefusalLogCarriesNoCredential says why).
+func TestRateLimiter_LimitByKey(t *testing.T) {
+	var buf bytes.Buffer
+	prev, prevOutput, prevFlags := slog.Default(), log.Writer(), log.Flags()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() {
+		slog.SetDefault(prev)
+		log.SetOutput(prevOutput)
+		log.SetFlags(prevFlags)
+	})
+
+	const token = "narvi_mcp_at_secretsecretsecret"
+	l, clock := newTestLimiter(time.Second, 2)
+	reached := map[string]int{}
+	h := l.LimitBy(GrantKey, MCPCallRateLimited)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g, _ := platform.MCPGrantFromContext(r.Context())
+		reached[g.GrantID]++
+		w.WriteHeader(http.StatusOK)
+	}))
+	send := func(grantID string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"narvi_create_session","arguments":{"prompt":"secret prompt"}}}`))
+		r.Header.Set("Authorization", "Bearer "+token)
+		// One address for every request: only the grant may tell them apart.
+		r.RemoteAddr = "198.51.100.7:4000"
+		if grantID != "" {
+			r = r.WithContext(platform.WithMCPGrant(r.Context(), platform.MCPGrant{GrantID: grantID, ClientID: "narvi_mcp_c_" + grantID, Scopes: []string{"mcp:read", "mcp:write"}}))
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, r)
+		return rec
+	}
+
+	for i := range 2 {
+		if rec := send("grant-a"); rec.Code != http.StatusOK {
+			t.Fatalf("grant-a call %d of the burst: status %d", i+1, rec.Code)
+		}
+	}
+	refused := send("grant-a")
+	if refused.Code != http.StatusTooManyRequests || refused.Header().Get("Retry-After") != "1" || refused.Body.String() != `{"error":"rate limited"}` || reached["grant-a"] != 2 {
+		t.Fatalf("grant-a past its burst: status %d Retry-After %q body %s (handler reached %d times), want 429, 1, the rate-limited body, and no third call", refused.Code, refused.Header().Get("Retry-After"), refused.Body.String(), reached["grant-a"])
+	}
+	for i := range 2 {
+		if rec := send("grant-b"); rec.Code != http.StatusOK {
+			t.Fatalf("grant-b, same address, call %d: status %d, want its own bucket", i+1, rec.Code)
+		}
+	}
+	for i := range 5 {
+		if rec := send(""); rec.Code != http.StatusOK {
+			t.Fatalf("a request with no grant, call %d: status %d, want it passed through unbraked", i+1, rec.Code)
+		}
+	}
+	clock.t = clock.t.Add(time.Second)
+	if rec := send("grant-a"); rec.Code != http.StatusOK {
+		t.Fatalf("grant-a after one interval: status %d, want one more call", rec.Code)
+	}
+
+	line := strings.TrimSpace(buf.String())
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(line), &entry); err != nil || strings.Count(line, "\n") != 0 {
+		t.Fatalf("log = %q, want exactly one JSON line", line)
+	}
+	if entry["level"] != "WARN" || entry["msg"] != "mcpauth: rate limited" || entry["path"] != "/mcp" || entry["grant_id"] != "grant-a" || entry["client_id"] != "narvi_mcp_c_grant-a" {
+		t.Fatalf("log entry = %v, want a WARN naming the path, the grant and the client", entry)
+	}
+	if _, ok := entry["client_address"]; ok {
+		t.Fatalf("log entry = %v: a grant-keyed refusal is not about an address", entry)
+	}
+	for _, secret := range []string{token, "secret prompt", "Bearer"} {
+		if strings.Contains(line, secret) {
+			t.Fatalf("the refusal log carries %q: %s", secret, line)
+		}
+	}
+}
+
+// TestMCPCallRateLimited_Answer: 429, Retry-After rounded up to a whole
+// second and never below one, JSON, and the plain error body.
+func TestMCPCallRateLimited_Answer(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		retryAfter time.Duration
+		want       string
+	}{{time.Millisecond, "1"}, {time.Second, "1"}, {1500 * time.Millisecond, "2"}} {
+		rec := httptest.NewRecorder()
+		MCPCallRateLimited(rec, httptest.NewRequest(http.MethodPost, "/mcp", nil), tc.retryAfter)
+		if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") != tc.want || rec.Header().Get("Content-Type") != "application/json" || rec.Body.String() != `{"error":"rate limited"}` {
+			t.Fatalf("MCPCallRateLimited(%v): status %d Retry-After %q Content-Type %q body %s", tc.retryAfter, rec.Code, rec.Header().Get("Retry-After"), rec.Header().Get("Content-Type"), rec.Body.String())
 		}
 	}
 }

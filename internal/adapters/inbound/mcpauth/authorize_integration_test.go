@@ -15,6 +15,8 @@ import (
 	"testing"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/mcpclient"
+	"github.com/narvidev/narvi/internal/domain/mcpscope"
 )
 
 // TestAuthorize_RedirectURI_Table is the redirect-substitution threat
@@ -219,24 +221,49 @@ func TestAuthorize_ResourceMismatchIsInvalidTarget(t *testing.T) {
 	}
 }
 
-// TestAuthorize_UnadvertisedScopeRefused: mcp:write is declared but no
-// tool requires it yet, so it is not offered -- invalid_scope, and a
-// scope-less request is accepted.
+// TestAuthorize_UnadvertisedScopeRefused: the authorization endpoint
+// accepts exactly the scopes this build advertises -- mcp:read and, since
+// narvi_create_session requires it, mcp:write -- and refuses anything else
+// as invalid_scope, even beside an advertised one; a scope-less request is
+// accepted. TestAuthorize_WriteRefusedWhereNoToolRequiresIt covers a build
+// that does not offer mcp:write.
 func TestAuthorize_UnadvertisedScopeRefused(t *testing.T) {
 	r := newASRig(t)
 	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
 	verifier := newVerifier(t)
 
-	for _, bad := range []string{"mcp:write", "mcp:read mcp:write", "openid", "offline_access"} {
+	for _, bad := range []string{"mcp:admin", "mcp:read mcp:admin", "openid", "offline_access"} {
 		params := r.authorizeParams(verifier)
 		params.Set("scope", bad)
 		rec := r.authorize(params, cookie)
 		t.Run("refused "+bad, func(t *testing.T) { redirectErr(t, rec, rec.Code, "invalid_scope", "state-123") })
 	}
-	params := r.authorizeParams(verifier)
-	params.Del("scope")
-	if rec := r.authorize(params, cookie); rec.Code != http.StatusFound || !consentRequestPattern.MatchString(rec.Header().Get("Location")) {
-		t.Fatalf("scope-less request: status %d Location %q, want accepted", rec.Code, rec.Header().Get("Location"))
+	for _, good := range []string{"mcp:write", "mcp:read mcp:write", ""} {
+		params := r.authorizeParams(verifier)
+		if good == "" {
+			params.Del("scope")
+		} else {
+			params.Set("scope", good)
+		}
+		if rec := r.authorize(params, cookie); rec.Code != http.StatusFound || !consentRequestPattern.MatchString(rec.Header().Get("Location")) {
+			t.Fatalf("scope %q: status %d Location %q, want accepted", good, rec.Code, rec.Header().Get("Location"))
+		}
+	}
+}
+
+// TestAuthorize_WriteRefusedWhereNoToolRequiresIt: on a server offering
+// mcp:read alone -- a build whose tools required no more -- mcp:write is
+// refused as invalid_scope like any unknown scope: a scope is offered
+// because a tool needs it, never because the vocabulary declares it.
+func TestAuthorize_WriteRefusedWhereNoToolRequiresIt(t *testing.T) {
+	r := newASRigWith(t, rigOptions{mechanisms: mcpclient.Mechanisms{MetadataDocuments: true, DynamicRegistration: true}, scopes: []mcpscope.Scope{mcpscope.Read}})
+	_, cookie := r.newUser(t, sqlcgen.UserRoleMember)
+	verifier := newVerifier(t)
+	for _, bad := range []string{"mcp:write", "mcp:read mcp:write"} {
+		params := r.authorizeParams(verifier)
+		params.Set("scope", bad)
+		rec := r.authorize(params, cookie)
+		t.Run("refused "+bad, func(t *testing.T) { redirectErr(t, rec, rec.Code, "invalid_scope", "state-123") })
 	}
 }
 
