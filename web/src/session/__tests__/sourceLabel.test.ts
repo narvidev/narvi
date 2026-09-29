@@ -12,13 +12,14 @@ describe('sourceLabel', () => {
     ['slack', 'Started from Slack', 'Slack'],
     ['linear', 'Started from Linear', 'Linear'],
     ['github', 'Started from GitHub', 'GitHub'],
+    ['mcp', 'Started from an MCP client', 'MCP'],
   ])('names the known source %s', (source, title, tag) => {
     expect(isKnownSpawnSource(source)).toBe(true)
     expect(sourceTitle(source)).toBe(title)
     expect(sourceTagLabel(source)).toBe(tag)
   })
 
-  it.each(['mcp', 'some_future_source', '', 'Slack', 'constructor', 'toString', '__proto__'])(
+  it.each(['some_future_source', '', 'Slack', 'MCP', 'constructor', 'toString', '__proto__'])(
     'gives the unknown source %j neutral words, never a known source\'s',
     (source) => {
       expect(isKnownSpawnSource(source)).toBe(false)

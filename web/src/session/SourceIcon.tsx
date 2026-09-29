@@ -1,14 +1,17 @@
 // SourceIcon.tsx -- decision 31 ("The source stays attached to the
-// session"): the four spawn-source glyphs, copied verbatim (path data
+// session"): the spawn-source glyphs. Four are copied verbatim (path data
 // unchanged) from docs/design/mockups.html's own .srcicon examples in the
 // Session view (web/slack/linear/github, lines ~664-690 at the time this
 // was extracted) -- never redrawn independently of the visual spec.
 //
+// The mockups predate the 'mcp' source (technical plan §43.1), so its
+// glyph, a plug, is drawn here in the mockups' own vocabulary: an 11px
+// outline on a 14-unit viewBox, currentColor, 1.1 strokes, no fill.
+//
 // Session.spawnSource is an OPEN enum (contracts/manifest.json's
 // openEnums), so a source this bundle does not know gets a neutral glyph
 // and a neutral tooltip (sourceLabel.ts) rather than an empty, untitled
-// slot. The neutral glyph is the one shape here that is not in the
-// mockups: they only draw the four known sources.
+// slot. That neutral glyph is not in the mockups either.
 import type { ComponentType } from 'react'
 
 import type { Session } from '@narvi/contracts/rest-dtos'
@@ -58,6 +61,16 @@ function GithubOctocatIcon() {
   )
 }
 
+/** McpPlugIcon is the 'mcp' source's glyph: a plug (two prongs, a rounded body, a cord), for a session an MCP client started. */
+function McpPlugIcon() {
+  return (
+    <svg width="11" height="11" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+      <path d="M5.2 1.6v2.6M8.8 1.6v2.6M7 9.6v2.8" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+      <path d="M3.4 4.2h7.2v1.8a3.6 3.6 0 0 1-7.2 0V4.2Z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
 /** OtherSourceIcon is the neutral glyph for a source this bundle does not know: a dashed ring, claiming no product. */
 function OtherSourceIcon() {
   return (
@@ -72,6 +85,7 @@ const SOURCE_GLYPHS: Record<Session['spawnSource'], ComponentType> = {
   slack: SlackBubbleIcon,
   linear: LinearRectIcon,
   github: GithubOctocatIcon,
+  mcp: McpPlugIcon,
 }
 
 /** SourceIcon renders the right glyph + an honest title tooltip for a session's spawnSource (decision 31) -- the ONE place this mapping is made, so the sidebar and the session header can never disagree on what icon a given source gets. */

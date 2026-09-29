@@ -20,6 +20,7 @@ const SOURCE_WORDING: Record<Session['spawnSource'], SourceWording> = {
   slack: { title: 'Started from Slack', tag: 'Slack' },
   linear: { title: 'Started from Linear', tag: 'Linear' },
   github: { title: 'Started from GitHub', tag: 'GitHub' },
+  mcp: { title: 'Started from an MCP client', tag: 'MCP' },
 }
 
 const UNKNOWN_SOURCE_WORDING: SourceWording = { title: 'Started from another source', tag: 'other' }
