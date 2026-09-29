@@ -508,7 +508,7 @@ export interface PlanActionResponse {
   turnId: string | null;
 }
 /**
- * 202 response body for POST /api/sessions/{sessionID}/stop (technical plan §3.3): a person's request to stop a session and every session it started, accepted and written as data. No request body. Accepted is not done: every turn open at the request is flagged, and the session's actor cancels each through §3.3's own cancel transition -- a pending one at once, a running one once the sandbox's own stop, or the grace after it (StopGrace, 30s), ends it. Turns created after the request run normally. Read GET /api/sessions/{sessionID}/status to see the session settle. Repeating the request is not a no-op: it flags whatever is open at that moment -- a turn created since the first request too, which then stops -- and writes its own audit row; it answers the same requestedAt until a person resumes the session.
+ * 202 response body for POST /api/sessions/{sessionID}/stop (technical plan §3.3): a person's request to stop a session and every session it started, accepted and written as data. No request body. Accepted is not done: every turn open at the request is flagged, and the session's actor cancels each through §3.3's own cancel transition -- a pending one at once, a running one once the sandbox's own stop, or the grace after it (StopGrace, 30s), ends it. Turns created after the request run normally. Read GET /api/sessions/{sessionID}/status to see the session settle. Repeating the request is not a no-op: it flags whatever is open at that moment -- a turn created since the first request too, which then stops -- writes its own audit row, and answers its own requestedAt.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "StopSessionResponse".
@@ -519,7 +519,7 @@ export interface StopSessionResponse {
    */
   sessionId: string;
   /**
-   * When the stop now in force on this session was first requested. A repeated request, before a person resumes the session, answers the same instant; the next turn a person creates on the session clears it.
+   * When this request was made. A repeated request answers its own instant, later than the one before, and the session's scheduled work that would create a turn with no new input (a re-review) is then disarmed up to it, including what was scheduled since the earlier request. A person's next act that sets the session going again clears the stop: a turn they create, their approval of its plan, or their approval or revision of a workflow step awaiting their decision.
    */
   requestedAt: string;
   /**

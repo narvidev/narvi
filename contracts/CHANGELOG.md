@@ -15,12 +15,12 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 ### rest/v1/dtos.schema.json
 
 - Added: `StopSessionResponse`, the `202` body of the new stop route below
-  (technical plan §3.3): `sessionId`, `requestedAt` (when the stop now in
-  force was first requested -- a repeated request answers the same
-  instant until a person resumes the session), `reachedSessionIds` (the session named first, then every
-  session it started, recursively) and `openTurns` (the turns the request
-  flagged to be cancelled, across every reached session). A new `$def`
-  grades MINOR (row 32).
+  (technical plan §3.3): `sessionId`, `requestedAt` (when this request
+  was made -- a repeated request answers its own, later instant),
+  `reachedSessionIds` (the session named first, then every session it
+  started, recursively) and `openTurns` (the turns the request flagged to
+  be cancelled, across every reached session). A new `$def` grades MINOR
+  (row 32).
 
 ### controlplane/testdata/routes.golden
 

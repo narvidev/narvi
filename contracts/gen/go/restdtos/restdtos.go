@@ -13810,8 +13810,7 @@ func (j *ShadowLedgerSummary) UnmarshalJSON(value []byte) error {
 // request run normally. Read GET /api/sessions/{sessionID}/status to see the
 // session settle. Repeating the request is not a no-op: it flags whatever is open
 // at that moment -- a turn created since the first request too, which then stops
-// -- and writes its own audit row; it answers the same requestedAt until a person
-// resumes the session.
+// -- writes its own audit row, and answers its own requestedAt.
 type StopSessionResponse struct {
 	// How many turns were pending, dispatched or processing across every reached
 	// session when the request was written -- the turns it flagged to be cancelled. 0
@@ -13825,9 +13824,12 @@ type StopSessionResponse struct {
 	// request is either listed here or was refused.
 	ReachedSessionIds []string `json:"reachedSessionIds" yaml:"reachedSessionIds" mapstructure:"reachedSessionIds"`
 
-	// When the stop now in force on this session was first requested. A repeated
-	// request, before a person resumes the session, answers the same instant; the
-	// next turn a person creates on the session clears it.
+	// When this request was made. A repeated request answers its own instant, later
+	// than the one before, and the session's scheduled work that would create a turn
+	// with no new input (a re-review) is then disarmed up to it, including what was
+	// scheduled since the earlier request. A person's next act that sets the session
+	// going again clears the stop: a turn they create, their approval of its plan, or
+	// their approval or revision of a workflow step awaiting their decision.
 	RequestedAt time.Time `json:"requestedAt" yaml:"requestedAt" mapstructure:"requestedAt"`
 
 	// The session named in the path.
