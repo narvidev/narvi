@@ -456,7 +456,7 @@ The two-mode knowledge capability: approved-plan durability; the per-repository 
 The path from an emitted metric to a backend that can evaluate an alert on it: a config-gated OTLP exporter in `platform.SetupOTel`, and the relay that carries the four sandbox-emitted histograms out of the sandbox.
 *Exit: an alert defined on a control-plane instrument fires from a real backend rather than from a process's own stdout, which is what closes P6's own exit criterion above. Step 112 gates no phase.*
 
-**Phase 11 — Named gaps (Steps 113-131, and the rows appended since: 152-156, 160-161, 171-179, 189, 198-205, 216)**
+**Phase 11 — Named gaps (Steps 113-131, and the rows appended since: 152-156, 160-161, 171-179, 189, 198-205, 216, 218-226)**
 Real, non-speculative work that each shipping Step declared it was leaving out. A holding list until the owner chose to work it through in full, at which point it gained an execution order and a milestone like any other; the filing rule still governs what may enter it.
 *Exit: every row either shipped, or closed by a recorded decision saying why it will not be — never a silent omission.*
 
@@ -1105,7 +1105,7 @@ as the auto-merge worker does, and runs the merge path's own probe on it. The de
 (`decisioninbox`'s `computeRealEligibility`) still assembles the same facts itself, through its TTL cache,
 and handles a failed call differently -- it blanks the value, marks the read degraded and carries on to the
 comparison, where `ReadLive` stops and names the step -- so a change to `ReadLive` does not reach it.
-Routing the inbox through `ReadLive` is a follow-up recorded on row 182.
+Routing the inbox through `ReadLive` is a follow-up recorded on row 182, filed as row 220.
 
 **Publication is concurrent, and the losing writer must know it lost.** Two attempts can be in
 flight for one pull request, and a base can move under an unchanged head, so the record a publisher
@@ -9213,7 +9213,7 @@ approved implementation is running:
   - `RejectIfOpen`, refused `409` and nothing queued: `POST /api/sessions/{sessionID}/turns` -- the
     browser, and the two MCP turn tools through it -- and Slack's Request-changes modal, which on that
     `409` only logs it and acknowledges the submission, so the modal closes and the feedback is lost with
-    no reply (as before this row);
+    no reply (as before this row; filed as row 218);
   - `DropIfOpen`, nothing queued and a busy reply: a Slack thread reply and a Linear reply, a `revise:`
     one included;
   - `AlwaysQueue`, queued behind the open turn: the code host's mention (`CreateTurnForBot`, from the
