@@ -7,8 +7,8 @@
 -- the timer fires, through §3.3's existing cancel transition: a flagged
 -- pending turn is cancelled and never dispatched, a flagged turn in flight
 -- is sent the sandbox `stop` command and cancelled once StopGrace passes if
--- it has not ended. A turn created after the request carries no flag and
--- runs normally.
+-- it has not ended, its sandbox generation then retired. A turn created
+-- after the request carries no flag and runs normally.
 --
 -- sessions.stop_requested_at also refuses a new child session of a stopped
 -- parent (httpapi.CreateSessionOnTx reads it FOR SHARE), until the next
@@ -30,6 +30,25 @@
 -- session actor and the REST handlers take them in, since each locks the
 -- session row before it touches a turn.
 --
+-- # Rolling deploy
+--
+-- Only a binary that carries this migration knows the `stop` timer. During
+-- a rolling deploy, a stop that a newer pod accepts is written and answered
+-- 202, but a session whose actor is still hosted on an older pod is not
+-- stopped yet. That actor logs "ignoring TimerFired with unknown name" and
+-- leaves the timer armed, so the pump redelivers it every claim window and
+-- an older pod reads the session as having scheduled work. It dispatches
+-- the flagged queued turns, and lets a flagged running turn run on and push
+-- as usual. Nothing is lost: the flags and the timer are rows, and the
+-- first actor on a newer pod to host the session cancels whatever is still
+-- flagged and open. Work that ends before then keeps its result.
+--
+-- DEPLOY: finish the rollout before relying on a stop. When a stop must
+-- take effect during the deploy, terminate the pods still on the previous
+-- binary (they cannot restart anyway, see below): the session's actor then
+-- moves to an updated pod, which carries the stop out. The stop does not
+-- need repeating.
+--
 -- # Rolling back
 --
 -- Every control-plane boot runs the embedded migrations up
@@ -37,7 +56,7 @@
 -- version it has no file for. So once this migration is applied:
 --   - An older pod that is already running keeps working: every query it
 --     makes on sessions and turns names its columns, and none names these
---     two.
+--     two. It cannot carry a stop out, though (see Rolling deploy).
 --   - An older pod that restarts does not boot ("no migration found for
 --     version 151"). That covers a rollback and an old pod restarting in
 --     the middle of a rolling deploy. A binary without 000151 cannot boot

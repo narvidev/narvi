@@ -300,23 +300,38 @@ No body. Answers **`202 Accepted`** with `StopSessionResponse`
 is written, not yet done. Every turn open at that instant is cancelled — a
 queued one at once and never dispatched, a running one through the
 sandbox's own `stop`, or once `platform.Timeouts.StopGrace` (30s) has
-passed if the agent does not answer. The session ends `cancelled`; its
-sandbox is kept and idles out. Every session it started is stopped the
-same way (`reachedSessionIds`), and a new child of it is refused until you
+passed if the agent does not answer. When the agent answers, the sandbox
+is kept and idles out. When it does not, that sandbox is stopped and your
+next turn starts on a new one, restored from the last snapshot where there
+is one, so what the stopped turn changed in the workspace since that
+snapshot is not carried over. Every session it started is stopped the same
+way (`reachedSessionIds`), and a new child of it is refused until you
 resume it. Poll `GET /api/sessions/{sessionID}/status` to watch it settle.
 
-A stop does not undo what already happened: a turn that completed before
-it keeps its push and pull request, and a plan awaiting approval stays
-awaiting approval. It is not an archive either — the next prompt you send
+The session's status follows its last turn, as always: it reads
+`cancelled` when that turn is one the stop cancelled. A session with
+nothing open when you stop it keeps its status, and a turn that completed
+before the stop reached it stays completed. A stop does not undo what
+already happened: that turn keeps its push and pull request, and a plan
+awaiting approval stays awaiting approval. While the stop stands, a
+workflow run the session is in ends `cancelled` instead of moving on to its
+next step. A stop is not an archive either — the next prompt you send
 (`POST /api/sessions/{sessionID}/turns`), or approving the session's plan,
-runs normally and resumes the session. Repeating the request is harmless.
+runs normally and resumes the session.
+
+Repeating the request is not a no-op: it flags whatever is open at that
+moment, a turn you created since the first request included, which then
+stops too, and it writes its own audit entry. `requestedAt` stays the
+first request's instant until you resume the session.
 
 **Negatives.** A malformed id answers `400` and an unknown session `404`,
 as `GET /api/sessions/{sessionID}` does. A member may stop only a session
-they created or joined, and a viewer none (`403`); an admin or maintainer
-may stop any session. If a session the stop reached could not be written,
-the answer is `500`: what was written stands, and repeating the request
-reaches the rest.
+they created or joined, and never a pull request's review session, which
+every review of that pull request shares (`403`); a viewer may stop none.
+An admin or maintainer may stop any session. If a session the stop
+reached could not be written, the answer is `500`: what was written
+stands, and repeating the request reaches the rest, flagging, as above,
+whatever is open by then.
 
 ## Plan mode
 
