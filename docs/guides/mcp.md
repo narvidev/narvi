@@ -165,10 +165,8 @@ the app — never add one it did not ask for:
   its plan versions.
 - **Act as you** (`mcp:write`, which includes read): start sessions, send
   prompts, approve or reject plans, request revisions and stop sessions as
-  you. Everything but stopping a session is what an app can do today;
-  stopping comes to the same access, so an app you allow now gains it when
-  it ships, without asking you again. This can run code in your
-  repositories and spend on models, within what your own role allows.
+  you. This can run code in your repositories and spend on models, within
+  what your own role allows.
 
 An app sees only the tools its access covers: with read alone, no write
 tool is listed and a call to one is answered exactly as a call to a tool
@@ -177,7 +175,7 @@ give an app that has only read the right to act, connect it again and
 approve both. An app never does more than your own role allows — every tool
 runs the same route these guides document, checked against your role on
 every call — so a viewer's app can connect and read but is refused, as the
-viewer is, when it starts a session or decides a plan.
+viewer is, when it starts a session, decides a plan or stops a session.
 
 **Starting a session** (`narvi_create_session`) is `POST /api/sessions`
 ([web.md](web.md)) called for you: the same checks — member role or above,
@@ -228,6 +226,26 @@ of the revision: the pull request may appear only after the revision has
 started, or even after it has written the next version, and a push that
 fails opens none, while the revision still runs.
 
+**Stopping a session** (`narvi_stop_session`) is
+`POST /api/sessions/{sessionID}/stop` ([web.md](web.md), "Stopping a
+session") called for you, with the same checks and the same effect: an
+admin or maintainer may stop any session, a member only a session they
+started or joined and never a pull request's review session, and a viewer
+none; every turn queued or running in the session, and in every session it
+started, is cancelled — a queued one at once, a running one once its sandbox
+confirms, or 30 seconds later (as shipped) — and nothing is pushed for it.
+Each session it reaches gets its own audit record, naming the app and its
+authorization. The app gets its answer once the stop is written, before the
+work has ended, and waits (`narvi_wait_for_session`) to see each session
+settle. Calling it again is not a no-op: it also stops whatever was started
+since. Once the stop is written, a call that ends early — a timeout, a
+dropped connection — does not cut short the stop of the sessions it
+started. An internal error means either that nothing was written or that
+the session was stopped but not every session it started was reached:
+calling it again is safe either way, and reaches the rest. The next
+prompt, plan approval or workflow-step decision you or the app make on a
+stopped session sets it going again.
+
 **Brakes, and what disconnecting does not do.** `/mcp` is braked per
 authorization — one person's approval of one app — on each server replica:
 a burst of 30 calls, then one a
@@ -242,8 +260,12 @@ with how many seconds to wait, and starts nothing; retried after that wait
 with the same key and the same arguments, it gets back the session an
 earlier call with that key started, if one did. Disconnecting an app, or
 cutting off its client, stops its next call — it does not stop a session it
-already started, nor an implementation it approved: each runs to its end
-like any other.
+already started, nor an implementation it approved: each runs on. To end
+that work too, stop each session (above, or from the web); disconnect the
+app first, since a stopped session is set going again by the next prompt or
+approval, the app's included. The on-call runbook
+[`mcp-client-cutoff.md`](../runbooks/mcp-client-cutoff.md) says how to find
+every session an app put to work.
 
 **Negatives.** The MCP surface is off unless the deployment sets
 `NARVI_MCP_ENABLED=true`; while it is off, `/oauth/...` answers `503` — but

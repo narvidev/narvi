@@ -3455,6 +3455,18 @@ export interface SendPromptToolRequest {
   effort?: string;
 }
 /**
+ * The narvi_stop_session MCP tool's own input (technical plan §43.22) -- the tool bridge's twin of POST /api/sessions/{sessionID}/stop, which takes no body: the path parameter is a plain required field. Self-contained: it references no other $def. The answer is StopSessionResponse: 202 once the request is written to the session and to every session it started. Repeating it is not a no-op: it also stops whatever was started since.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "StopSessionToolRequest".
+ */
+export interface StopSessionToolRequest {
+  /**
+   * The session to stop, with every session it started: its id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).
+   */
+  sessionId: string;
+}
+/**
  * GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's work is doing now, and how long to wait before reading it again. Derived at read time from the session's turn queue, a completed turn's push and pull request still under way, work the server holds that can create a turn on the session with no new input, and its human gates, all read in ONE database snapshot -- never from Session.status, which is re-derived only when a turn reaches a terminal state and so can hold any of its five values while a turn is queued or running. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read. With ?waitSeconds=N (a whole number of seconds; absent or 0 is the plain read, a negative or malformed value is a 400) the route waits, at most N seconds clamped to the deployment's maximum (25 as shipped), for the session to be settled, and answers the same shape with wait set: the snapshot it answers is its latest read.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema

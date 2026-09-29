@@ -21,6 +21,17 @@
 // creation races the walk either committed before its parent's request,
 // and is found, or reads the parent's request FOR SHARE and is refused
 // (CreateSessionOnTx, ParentStopped).
+//
+// Once the named session's request has committed, the rest -- waking its
+// actor and the walk -- no longer depends on the caller staying: it runs on
+// the request's context with its cancellation removed (so every value on it,
+// the MCP grant the audit stamp reads included, still reaches each row),
+// bounded by platform.Timeouts.StopDescendantWalkTimeout; the wakes follow
+// the walk, so a slow one delays a stop but costs the walk nothing. A client that
+// times out or disconnects after the commit therefore still stops the whole
+// tree; cut short, the walk would leave the parent stopped and the sessions
+// it started running, and a client that never got an answer has nothing
+// telling it to repeat the request.
 
 package httpapi
 
@@ -67,6 +78,12 @@ type StopSessionDeps struct {
 	// replica cannot host the actor, or is lost -- the pump of whichever
 	// replica claims the timer does the same.
 	Registry *sessionactor.Registry
+	// Timeouts supplies StopDescendantWalkTimeout, the bound on what runs
+	// after the named session's commit, detached from the caller (this
+	// file's top comment). A zero bound -- Timeouts never validated -- ends
+	// that work at once: no descendant is reached and the route answers
+	// 500, so the gap shows.
+	Timeouts platform.Timeouts
 }
 
 // StopSession backs POST /api/sessions/{sessionID}/stop (technical plan
@@ -78,7 +95,10 @@ type StopSessionDeps struct {
 // §13.3), a viewer never. 202 with restdtos.StopSessionResponse once the
 // request is written to the session and to every session it started. 500
 // when a descendant could not be reached: what was written stands, and
-// repeating the request reaches the rest.
+// repeating the request reaches the rest. Once the named session's request
+// has committed, a caller that goes away does not cut the rest short: the
+// wake and the walk run to their end, or to StopDescendantWalkTimeout, and a
+// walk that fails then is logged at WARN, the log being its only trace.
 //
 // A repeat is not a no-op. It flags every turn open at the moment it is
 // made -- including one a person created since the first request, which
@@ -159,9 +179,27 @@ func StopSession(deps StopSessionDeps) http.HandlerFunc {
 			return
 		}
 
-		reached, descendantTurns, walkErr := stopDescendants(ctx, deps, sessionID, actorUserID)
+		// The request is written. What is left is owed to the session and
+		// every session it started, whether or not the caller is still
+		// there: detached from its cancellation, never from its values.
+		walkCtx, cancelWalk := context.WithTimeout(context.WithoutCancel(ctx), deps.Timeouts.StopDescendantWalkTimeout)
+		defer cancelWalk()
+		reached, descendantTurns, walkErr := stopDescendants(walkCtx, deps, sessionID, actorUserID)
+		// The wakes come after the walk, so a slow hydration can only
+		// delay a stop, never cost the walk a session: every request woken
+		// here is already written, with its timer, which the pump delivers
+		// if the wake fails or the bound has run out.
+		wakeStop(walkCtx, deps.Registry, sessionID)
+		reachedIDs := make([]string, 0, len(reached)+1)
+		reachedIDs = append(reachedIDs, sessionID.String())
+		for _, id := range reached {
+			wakeStop(walkCtx, deps.Registry, id)
+			reachedIDs = append(reachedIDs, id.String())
+		}
 		if walkErr != nil {
-			logger.Error("httpapi: stop did not reach every session it started", "error", walkErr, "reached", len(reached))
+			logger.Warn("httpapi: stop did not reach every session it started",
+				"session_id", sessionID.String(), "reached", len(reached), "error", walkErr,
+				"bound_expired", walkCtx.Err() != nil, "caller_gone", ctx.Err() != nil)
 			writeError(w, http.StatusInternalServerError, "the session was stopped, but not every session it started could be reached: repeat the request")
 			return
 		}
@@ -169,7 +207,7 @@ func StopSession(deps StopSessionDeps) http.HandlerFunc {
 		writeJSON(w, http.StatusAccepted, restdtos.StopSessionResponse{
 			SessionId:         sessionID.String(),
 			RequestedAt:       requestedAt.Time,
-			ReachedSessionIds: append([]string{sessionID.String()}, reached...),
+			ReachedSessionIds: reachedIDs,
 			OpenTurns:         openTurns + descendantTurns,
 		})
 	}
@@ -193,8 +231,9 @@ func isPRReviewSession(ctx context.Context, prSessions *postgres.GitHubPRSession
 // creation raced it is either listed or refused (CreateSessionOnTx). A
 // descendant that vanished meanwhile is skipped; any other failure is
 // joined into err, and the walk goes on with the others -- below a session
-// it could not stop, it cannot see what that session started.
-func stopDescendants(ctx context.Context, deps StopSessionDeps, rootID, actorUserID pgtype.UUID) (reached []string, openTurns int, err error) {
+// it could not stop, it cannot see what that session started. It wakes no
+// actor: the caller wakes each session reached once the walk is over.
+func stopDescendants(ctx context.Context, deps StopSessionDeps, rootID, actorUserID pgtype.UUID) (reached []pgtype.UUID, openTurns int, err error) {
 	var errs []error
 	seen := map[pgtype.UUID]bool{rootID: true}
 	queue := []pgtype.UUID{rootID}
@@ -223,7 +262,7 @@ func stopDescendants(ctx context.Context, deps StopSessionDeps, rootID, actorUse
 				}
 				continue
 			}
-			reached = append(reached, childID.String())
+			reached = append(reached, childID)
 			openTurns += n
 			queue = append(queue, childID)
 		}
@@ -232,9 +271,11 @@ func stopDescendants(ctx context.Context, deps StopSessionDeps, rootID, actorUse
 }
 
 // requestSessionStop writes the stop request to one session in its own
-// transaction -- see this file's top comment -- then wakes its actor. detail
-// is the audit row's detail, gaining open_turns. Returns the session's
-// request instant, now this request's, and how many turns it flagged.
+// transaction -- see this file's top comment. detail is the audit row's
+// detail, gaining open_turns. Returns the session's request instant, now
+// this request's, and how many turns it flagged. The caller wakes the
+// session's actor once it has committed (wakeStop), on the detached
+// context the rest of the request runs on.
 func requestSessionStop(ctx context.Context, deps StopSessionDeps, sessionID, actorUserID pgtype.UUID, detail map[string]any) (pgtype.Timestamptz, int, error) {
 	tx, err := deps.Pool.Begin(ctx)
 	if err != nil {
@@ -280,8 +321,6 @@ func requestSessionStop(ctx context.Context, deps StopSessionDeps, sessionID, ac
 	if err := tx.Commit(ctx); err != nil {
 		return pgtype.Timestamptz{}, 0, err
 	}
-
-	wakeStop(ctx, deps.Registry, sessionID)
 	return requestedAt, len(flagged), nil
 }
 

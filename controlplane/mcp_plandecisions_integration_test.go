@@ -975,7 +975,7 @@ func sdkWriteTwinsLikeREST(t *testing.T, rig *oauthRouterRig, classifier *classi
 
 // writeToolNames is every write tool, sorted.
 func writeToolNames() []string {
-	names := []string{"narvi_create_session", "narvi_approve_plan", "narvi_reject_plan", "narvi_request_plan_revision", "narvi_send_prompt"}
+	names := []string{"narvi_create_session", "narvi_approve_plan", "narvi_reject_plan", "narvi_request_plan_revision", "narvi_send_prompt", "narvi_stop_session"}
 	sort.Strings(names)
 	return names
 }

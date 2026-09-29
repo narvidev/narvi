@@ -2114,6 +2114,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			AuditLog:         auditLogStore,
 			GitHubPRSessions: githubPRSessionStore,
 			Registry:         registry,
+			Timeouts:         cfg.Timeouts,
 		}))
 		// plans ("plan mode, web", §8.1/§12.2 item 3): the
 		// approve/reject HITL actions -- see httpapi/planapprove.go's own
@@ -2807,7 +2808,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// on every call, with no cache, and attaches the grant whose scopes
 	// decide which tools the request can see (§43.16/§43.17). Twins are the
 	// SAME httpapi handlers /api/models, /api/sessions[/{sessionID}],
-	// /api/sessions/{sessionID}/{status,result,events,plans,turns} and
+	// /api/sessions/{sessionID}/{status,result,events,plans,turns,stop} and
 	// /api/sessions/{sessionID}/plans/{planId}/{approve,reject} above already
 	// register --
 	// the bridge invokes them in-process, never a second implementation
@@ -2833,6 +2834,12 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// same role and own/joined rule, open-turn gate, guarded update,
 	// snapshot, audit row and notices, and a prompt or revision the same
 	// RejectIfOpen policy, as the browser's.
+	//
+	// The stop tool (§43.22) is the same constructor call as POST .../stop
+	// above, field for field: a stop over MCP runs the same role,
+	// own/joined and review-session rule, writes the same request under the
+	// session's lock, wakes the same registry's actor and walks to every
+	// session the one named started, as the browser's.
 	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{
 		PublicBaseURL: cfg.PublicBaseURL,
 		CreateBrake:   mcpauth.NewRateLimiter(cfg.Timeouts.MCPCreateSessionRateInterval, cfg.Timeouts.MCPCreateSessionRateBurst),
@@ -2848,6 +2855,17 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		ApprovePlan:      httpapi.ApprovePlan(pool, sessionStore, turnStore, planStore, eventStore, planDocumentStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, registry, cfg.EpistemicCheckDefault),
 		RejectPlan:       httpapi.RejectPlan(pool, sessionStore, turnStore, planStore, eventStore, planDocumentStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, cfg.EpistemicCheckDefault),
 		CreateTurn:       httpapi.CreateTurn(pool, sessionStore, turnStore, planStore, participantStore, auditLogStore, registry, intentClassifierSvc, cfg.ObjectStorage, cfg.EpistemicCheckDefault),
+		StopSession: httpapi.StopSession(httpapi.StopSessionDeps{
+			Pool:             pool,
+			Sessions:         sessionStore,
+			Turns:            turnStore,
+			Timers:           timerStore,
+			Participants:     participantStore,
+			AuditLog:         auditLogStore,
+			GitHubPRSessions: githubPRSessionStore,
+			Registry:         registry,
+			Timeouts:         cfg.Timeouts,
+		}),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build mcp handler: %w", err)

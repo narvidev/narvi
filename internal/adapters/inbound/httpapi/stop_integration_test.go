@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
@@ -200,11 +202,12 @@ type stopRig struct {
 // 30s); noWake mounts the route with no registry, so nothing but the timer
 // pump -- or a dispatch -- reaches the actor; provider, when set, is every
 // replica's sandbox provider (none otherwise, so no sandbox is ever
-// spawned).
+// spawned); walk, when set, overrides StopDescendantWalkTimeout.
 type stopRigConfig struct {
 	grace    time.Duration
 	noWake   bool
 	provider ports.SandboxProvider
+	walk     time.Duration
 }
 
 func newStopRig(t *testing.T, cfg stopRigConfig) *stopRig {
@@ -214,6 +217,9 @@ func newStopRig(t *testing.T, cfg stopRigConfig) *stopRig {
 	timeouts := platform.DefaultTimeouts()
 	if cfg.grace > 0 {
 		timeouts.StopGrace = cfg.grace
+	}
+	if cfg.walk > 0 {
+		timeouts.StopDescendantWalkTimeout = cfg.walk
 	}
 	if err := timeouts.Validate(); err != nil {
 		t.Fatalf("timeouts: %v", err)
@@ -253,6 +259,7 @@ func newStopRig(t *testing.T, cfg stopRigConfig) *stopRig {
 			AuditLog:         r.auditLog,
 			GitHubPRSessions: r.prSessions,
 			Registry:         routeRegistry,
+			Timeouts:         timeouts,
 		}))
 		api.Post("/{sessionID}/turns", httpapi.CreateTurn(pool, r.sessions, r.turns, r.plans, r.participants, r.auditLog, r.registry, nil, nil, false))
 		api.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(pool, r.sessions, r.turns, r.plans, narvipg.NewEventStore(pool), narvipg.NewPlanDocumentStore(pool), r.participants, narvipg.NewOutboxStore(pool, false), narvipg.NewLinearAgentSessionStore(pool), r.auditLog, r.registry, false))
@@ -1141,6 +1148,142 @@ func TestStopSession_ReachesEveryDescendant(t *testing.T) {
 	}
 	if got := rig.turnRow(ctx, t, untouched.ID); got.Status != sqlcgen.TurnStatusPending || got.StopRequestedAt.Valid || rig.sessionRow(ctx, t, unrelated.ID).StopRequestedAt.Valid {
 		t.Fatalf("unrelated session touched: turn %s, flagged %v", got.Status, got.StopRequestedAt.Valid)
+	}
+}
+
+// holdSessionRow locks sessionID's row FOR UPDATE on a transaction of its
+// own -- as a writer under the session's actor-epoch lock holds it -- until
+// the returned release is called (at the latest when the test ends).
+func (r *stopRig) holdSessionRow(ctx context.Context, t *testing.T, sessionID pgtype.UUID) (release func()) {
+	t.Helper()
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin the row holder: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM sessions WHERE id = $1 FOR UPDATE`, sessionID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("lock the session row: %v", err)
+	}
+	var once sync.Once
+	release = func() { once.Do(func() { _ = tx.Rollback(ctx) }) }
+	t.Cleanup(release)
+	return release
+}
+
+// TestStopSession_CallerGoneMidWalkStillStopsTheTree: once the named
+// session's request has committed, a caller that goes away -- a client
+// timeout, a disconnect -- does not cut the rest short (technical plan
+// §3.3). The parent commits while its child's row is held, so the walk
+// waits on the child; the client then gives up and its connection closes,
+// which cancels the request's context; the row is released only after
+// that. The walk still reaches the child and the grandchild below it: both
+// flagged and audited as reached through their parents, and every queued
+// turn of the tree cancelled by its actor.
+func TestStopSession_CallerGoneMidWalkStillStopsTheTree(t *testing.T) {
+	ctx := context.Background()
+	rig := newStopRig(t, stopRigConfig{})
+	owner, token := rig.user(ctx, t, sqlcgen.UserRoleMember)
+	parent := rig.session(ctx, t, owner.ID, pgtype.UUID{})
+	child := rig.session(ctx, t, pgtype.UUID{}, parent.ID)
+	grandchild := rig.session(ctx, t, pgtype.UUID{}, child.ID)
+	turns := map[string]sqlcgen.Turn{
+		"parent":     rig.pendingTurn(ctx, t, parent.ID),
+		"child":      rig.pendingTurn(ctx, t, child.ID),
+		"grandchild": rig.pendingTurn(ctx, t, grandchild.ID),
+	}
+
+	release := rig.holdSessionRow(ctx, t, child.ID)
+	waiters := rig.lockWaiters(ctx, t)
+
+	callCtx, hangUp := context.WithCancel(ctx)
+	defer hangUp()
+	req, err := http.NewRequestWithContext(callCtx, http.MethodPost, rig.server.URL+"/api/sessions/"+parent.ID.String()+"/stop", http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: token})
+	var call errgroup.Group
+	call.Go(func() error {
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			_ = resp.Body.Close()
+			return fmt.Errorf("the stop answered %d before the caller hung up", resp.StatusCode)
+		}
+		return nil
+	})
+
+	stopEventually(t, 10*time.Second, "the parent's request committed and the walk waiting on the child's row", func() bool {
+		return rig.sessionRow(ctx, t, parent.ID).StopRequestedAt.Valid && rig.lockWaiters(ctx, t) > waiters
+	})
+	hangUp()
+	if err := call.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	// Long enough for the server to see the connection close and cancel the
+	// request's context; a walk still on that context fails here.
+	time.Sleep(500 * time.Millisecond)
+	release()
+
+	stopEventually(t, 10*time.Second, "every turn of the tree cancelled", func() bool {
+		for _, tr := range turns {
+			if rig.turnRow(ctx, t, tr.ID).Status != sqlcgen.TurnStatusCancelled {
+				return false
+			}
+		}
+		return true
+	})
+	for s, via := range map[pgtype.UUID]pgtype.UUID{child.ID: parent.ID, grandchild.ID: child.ID} {
+		if !rig.sessionRow(ctx, t, s).StopRequestedAt.Valid {
+			t.Errorf("session %s not flagged", s.String())
+		}
+		audits := rig.stopAudits(ctx, t, s)
+		if len(audits) != 1 || audits[0]["via_parent_session_id"] != via.String() || audits[0]["requested_session_id"] != parent.ID.String() {
+			t.Errorf("session %s audits = %v, want one reached via %s", s.String(), audits, via.String())
+		}
+	}
+}
+
+// TestStopSession_WalkBoundedAfterCommit: what runs after the named
+// session's commit is detached from the caller but bounded
+// (StopDescendantWalkTimeout). With the child's row held past the bound,
+// the walk gives up at the bound, not when the row is released: the caller,
+// still there, gets the partial-walk 500 within the bound, and the child
+// stays unflagged and unaudited once the row is released -- its request was
+// never written, and a repeat reaches it.
+func TestStopSession_WalkBoundedAfterCommit(t *testing.T) {
+	ctx := context.Background()
+	const bound = 500 * time.Millisecond
+	rig := newStopRig(t, stopRigConfig{walk: bound})
+	owner, token := rig.user(ctx, t, sqlcgen.UserRoleMember)
+	parent := rig.session(ctx, t, owner.ID, pgtype.UUID{})
+	child := rig.session(ctx, t, pgtype.UUID{}, parent.ID)
+	rig.pendingTurn(ctx, t, parent.ID)
+	childTurn := rig.pendingTurn(ctx, t, child.ID)
+
+	release := rig.holdSessionRow(ctx, t, child.ID)
+	// The row is released on its own after a while, whatever the request
+	// does: a walk that waits for the row -- an unbounded one -- then answers
+	// late and fails this test, instead of never answering at all.
+	releaser := time.AfterFunc(8*bound, release)
+	defer releaser.Stop()
+	started := time.Now()
+	status, raw := rig.post(t, "/api/sessions/"+parent.ID.String()+"/stop", token, nil)
+	elapsed := time.Since(started)
+	const partial = `{"error":"the session was stopped, but not every session it started could be reached: repeat the request"}`
+	if status != http.StatusInternalServerError || strings.TrimSpace(string(raw)) != partial {
+		t.Fatalf("stop with the child's row held past the bound: %d %s, want 500 %s", status, raw, partial)
+	}
+	if elapsed > 4*bound {
+		t.Fatalf("the stop answered after %v, want about the %v bound: the walk waited for the row instead", elapsed, bound)
+	}
+	release()
+
+	time.Sleep(500 * time.Millisecond)
+	if rig.sessionRow(ctx, t, child.ID).StopRequestedAt.Valid || len(rig.stopAudits(ctx, t, child.ID)) != 0 || rig.turnRow(ctx, t, childTurn.ID).StopRequestedAt.Valid {
+		t.Fatal("the child was stopped after the bound had run out")
+	}
+	if !rig.sessionRow(ctx, t, parent.ID).StopRequestedAt.Valid {
+		t.Fatal("the parent's request did not stand")
 	}
 }
 
