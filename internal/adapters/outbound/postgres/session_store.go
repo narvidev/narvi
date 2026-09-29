@@ -42,6 +42,13 @@ func (s *SessionStore) Get(ctx context.Context, id pgtype.UUID) (sqlcgen.Session
 	return s.q.GetSession(ctx, id)
 }
 
+// GetByCreateIdempotencyKey fetches the session createdBy created with key
+// (technical plan §43.8, migrations/000150) -- pgx.ErrNoRows when that user
+// has created none with it.
+func (s *SessionStore) GetByCreateIdempotencyKey(ctx context.Context, createdBy, key pgtype.UUID) (sqlcgen.Session, error) {
+	return s.q.GetSessionByCreateIdempotencyKey(ctx, sqlcgen.GetSessionByCreateIdempotencyKeyParams{CreatedBy: createdBy, CreateIdempotencyKey: key})
+}
+
 // BumpActorEpoch increments a session's actor_epoch and returns the new
 // value. Called once, at acquisition time, when an actor takes ownership
 // of the session (§2: "bumped on each acquisition").

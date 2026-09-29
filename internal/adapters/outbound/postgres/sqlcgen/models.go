@@ -2391,6 +2391,8 @@ type Session struct {
 	SpawnDepth             int32                 `json:"spawn_depth"`
 	BuildEffort            *string               `json:"build_effort"`
 	EpistemicCheckEnabled  *bool                 `json:"epistemic_check_enabled"`
+	CreateIdempotencyKey   pgtype.UUID           `json:"create_idempotency_key"`
+	CreateRequestSha256    []byte                `json:"create_request_sha256"`
 }
 
 type SessionTimer struct {
