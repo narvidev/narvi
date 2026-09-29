@@ -340,6 +340,18 @@ var toolCallArgs = map[string]struct {
 			{keywords: []string{"/properties/effort/type"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","prompt":"run the tests again","effort":null}`, realRefusal: "invalid arguments: - at '/effort': got null, want string"},
 		},
 	},
+	"narvi_stop_session": {
+		realValid: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"}`,
+		realInvalid: []keywordProbe{
+			// buildStopSessionRequest decodes through the generated
+			// StopSessionToolRequest, exactly as narvi_list_plans does through
+			// its own: the same rows hold.
+			{keywords: []string{"/type"}, arguments: `null`, realRefusal: "invalid arguments: - at '': got null, want object"},
+			{keywords: []string{"/additionalProperties"}, arguments: `{"sessionId":"5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a","bogus":1}`, realRefusal: "invalid arguments: - at '': additional properties 'bogus' not allowed"},
+			{keywords: []string{"/properties/sessionId/type"}, arguments: `{"sessionId":null}`, realRefusal: "invalid arguments: - at '/sessionId': got null, want string"},
+			{keywords: []string{"/properties/sessionId/format"}, arguments: `{"sessionId":"not-a-uuid"}`, realRefusal: "invalid arguments: - at '/sessionId': 'not-a-uuid' is not valid uuid: must have 5 elements"},
+		},
+	},
 }
 
 // buildRequestEnforces lists, per tool, the keywords of its real input
@@ -398,6 +410,10 @@ var buildRequestEnforces = map[string]map[string]string{
 		"/properties/prompt/type":      "a non-string prompt fails to decode, and a null one leaves prompt empty, which the generated minLength check refuses",
 		"/properties/prompt/minLength": "restdtos.SendPromptToolRequest.UnmarshalJSON refuses an empty prompt itself",
 	},
+	"narvi_stop_session": {
+		"/required": "restdtos.StopSessionToolRequest.UnmarshalJSON refuses every object without a sessionId key; " +
+			"the one value it carries through without one, null, is not an object, and required constrains objects only",
+	},
 }
 
 // twinBodies is the 200 body each tool's counting twin answers with --
@@ -420,6 +436,7 @@ var twinBodies = map[string]string{
 	"narvi_reject_plan":            `{"status":"rejected"}`,
 	"narvi_request_plan_revision":  `{"status":"pending"}`,
 	"narvi_send_prompt":            `{"status":"pending"}`,
+	"narvi_stop_session":           `{"openTurns":0}`,
 }
 
 // countingTwins returns Twins whose handlers each add one to
@@ -452,6 +469,8 @@ func countingTwins(calls *atomic.Int32) Twins {
 		ApprovePlan: twin("narvi_approve_plan"),
 		RejectPlan:  twin("narvi_reject_plan"),
 		CreateTurn:  twin("narvi_send_prompt"),
+		// The stop twin (technical plan §43.22).
+		StopSession: twin("narvi_stop_session"),
 	}
 }
 

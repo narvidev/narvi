@@ -21,8 +21,8 @@ import (
 // second implementation (doc.go's own "one authorization path" section).
 type twin struct {
 	// method is the twin's own HTTP method: GET for every read tool, POST
-	// for narvi_create_session. TestWriteTwinsRequireWriteScope ties it to
-	// the tool's scope.
+	// for every write. TestWriteTwinsRequireWriteScope ties it to the
+	// tool's scope.
 	method string
 	// pathTemplate is the twin's own chi route pattern, e.g.
 	// "/api/sessions/{sessionID}" -- also what

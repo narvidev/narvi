@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
@@ -12,14 +13,15 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 )
 
-// This file pins what the plan and turn tools (technical plan §43.21) hand
-// their twins: the twin's own method and path, the chi URL params the REST
-// handler reads (sessionID, planId), no query, a body only for the turn
-// tools -- the restdtos.CreateTurnRequest the tool built, planMode its own
-// constant -- and never a header. Everything else (roles, the open-turn
-// gate, the guarded update, the audit row) is the twin's, and is proven
-// against the real handlers on the production router
-// (controlplane/mcp_plandecisions_integration_test.go).
+// This file pins what the plan and turn tools (technical plan §43.21), and
+// the stop tool (§43.22), hand their twins: the twin's own method and path,
+// the chi URL params the REST handler reads (sessionID, planId), no query, a
+// body only for the turn tools -- the restdtos.CreateTurnRequest the tool
+// built, planMode its own constant -- and never a header. Everything else
+// (roles, the open-turn gate, the guarded update, the stop's walk, the audit
+// row) is the twin's, and is proven against the real handlers on the
+// production router (controlplane/mcp_plandecisions_integration_test.go,
+// controlplane/mcp_stopsession_integration_test.go).
 
 const (
 	planTestSessionID = "5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"
@@ -131,6 +133,13 @@ func TestPlanAndTurnTools_TwinGetsItsOwnRequest(t *testing.T) {
 			wantMethod: http.MethodPost, wantPath: "/api/sessions/" + planTestSessionID + "/turns",
 			wantBody: turnBody(t, "run the tests again", nil, nil, false),
 		},
+		{
+			// 202, as POST .../stop answers: accepted, its body verbatim.
+			name: "stop", tool: "narvi_stop_session",
+			arguments:  `{"sessionId":"` + planTestSessionID + `"}`,
+			twinStatus: http.StatusAccepted, twinBody: `{"sessionId":"` + planTestSessionID + `","requestedAt":"2026-01-01T00:00:00Z","reachedSessionIds":["` + planTestSessionID + `"],"openTurns":1}`,
+			wantMethod: http.MethodPost, wantPath: "/api/sessions/" + planTestSessionID + "/stop",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -138,7 +147,7 @@ func TestPlanAndTurnTools_TwinGetsItsOwnRequest(t *testing.T) {
 			var seen []seenTwinCall
 			record := recordingTwin(&mu, &seen, tc.twinStatus, tc.twinBody)
 			twins := testTwins()
-			twins.ListPlans, twins.ApprovePlan, twins.RejectPlan, twins.CreateTurn = record, record, record, record
+			twins.ListPlans, twins.ApprovePlan, twins.RejectPlan, twins.CreateTurn, twins.StopSession = record, record, record, record, record
 			headers := callToolHeaders(tc.tool)
 			headers["Authorization"] = "Bearer narvi_mcp_at_must-never-reach-a-twin"
 			headers["Cookie"] = "narvi_auth_session=also-never"
@@ -199,6 +208,56 @@ func TestTurnTools_OpenTurnRefusalIsAnIsErrorAndIsNotRetried(t *testing.T) {
 			defer mu.Unlock()
 			if len(seen) != 1 {
 				t.Fatalf("twin called %d times, want exactly 1 -- a refusal is answered, never retried", len(seen))
+			}
+		})
+	}
+}
+
+// TestStopTool_OutcomesFollowTheTable: the stop twin's outcomes reach the
+// client through mapOutcome's one table, after exactly one twin call each
+// -- a refusal is never retried and a partial walk never repeated by the
+// adapter (technical plan §43.22). 403 (a role or review-session refusal)
+// and 404 are isError with REST's own text; the 500 that says not every
+// session the stop started could be reached is -32603, its body not
+// leaked, like any other server error.
+func TestStopTool_OutcomesFollowTheTable(t *testing.T) {
+	const partial = "the session was stopped, but not every session it started could be reached: repeat the request"
+	for _, tc := range []struct {
+		name      string
+		status    int
+		body      string
+		wantError string // "" for the -32603 row
+	}{
+		{"forbidden", http.StatusForbidden, `{"error":"forbidden"}`, "forbidden"},
+		{"not found", http.StatusNotFound, `{"error":"session not found"}`, "session not found"},
+		{"a descendant not reached", http.StatusInternalServerError, `{"error":"` + partial + `"}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var seen []seenTwinCall
+			twins := testTwins()
+			twins.StopSession = recordingTwin(&mu, &seen, tc.status, tc.body)
+			handler := newTestHandlerWithGrant(t, twins, scopes("mcp:read", "mcp:write"))
+			arguments := `{"sessionId":"` + planTestSessionID + `"}`
+			if tc.wantError != "" {
+				text, isError := postToolCall(t, handler, "narvi_stop_session", arguments)
+				if !isError || text != tc.wantError {
+					t.Fatalf("result = (IsError %v, %q), want isError with REST's own text %q", isError, text, tc.wantError)
+				}
+			} else {
+				status, raw := rawPost(t, handler, "/mcp", callToolBody(1, "narvi_stop_session", arguments), callToolHeaders("narvi_stop_session"))
+				var env jsonrpcEnvelope
+				if err := json.Unmarshal(raw, &env); err != nil || status != http.StatusOK || env.Error == nil || env.Error.Code != -32603 || env.Error.Message != "internal error" {
+					t.Fatalf("status %d body %s, want a -32603 internal error", status, raw)
+				}
+				if strings.Contains(string(raw), partial) {
+					t.Fatalf("body %s leaks the twin's 500 text", raw)
+				}
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(seen) != 1 {
+				t.Fatalf("twin called %d times, want exactly 1", len(seen))
 			}
 		})
 	}

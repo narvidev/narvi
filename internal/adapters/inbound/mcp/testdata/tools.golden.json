@@ -2275,5 +2275,73 @@
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "type": "object"
     }
+  },
+  {
+    "annotations": {
+      "destructiveHint": true,
+      "idempotentHint": false,
+      "openWorldHint": true,
+      "readOnlyHint": false
+    },
+    "description": "Stop a session and every session it started, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/stop, with the same checks: that user's own role (an admin or maintainer may stop any session, a member only a session they started or joined and never a pull request's review session, a viewer none). Every turn of those sessions that is queued or running when the call is made is cancelled: a queued one at once, never started, and a running one once its sandbox confirms the stop, or 30 seconds later (as shipped) if it does not; nothing is pushed for it. A turn that already completed keeps its push and pull request, and a plan keeps its status. While the stop stands, none of those sessions starts a new session of its own; the next prompt, plan approval or workflow-step decision a person makes on one sets it going again, and a turn created after the call runs normally. The call answers once the request is written, before that work has ended: follow it with narvi_wait_for_session. Calling it again is not a no-op: it also stops whatever was started since. An internal error can mean the session was stopped but not every session it started could be reached: calling it again reaches the rest. Returns sessionId, requestedAt, reachedSessionIds (the session, then every session it started) and openTurns (how many turns it asked to cancel).",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_stop_session MCP tool's own input (technical plan §43.22) -- the tool bridge's twin of POST /api/sessions/{sessionID}/stop, which takes no body: the path parameter is a plain required field. Self-contained: it references no other $def. The answer is StopSessionResponse: 202 once the request is written to the session and to every session it started. Repeating it is not a no-op: it also stops whatever was started since.",
+      "properties": {
+        "sessionId": {
+          "description": "The session to stop, with every session it started: its id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).",
+          "format": "uuid",
+          "type": "string"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "type": "object"
+    },
+    "name": "narvi_stop_session",
+    "outputSchema": {
+      "$defs": {
+        "StopSessionResponse": {
+          "additionalProperties": false,
+          "description": "202 response body for POST /api/sessions/{sessionID}/stop (technical plan §3.3): a person's request to stop a session and every session it started, accepted and written as data. No request body. Accepted is not done: every turn open at the request is flagged, and the session's actor cancels each through §3.3's own cancel transition -- a pending one at once, a running one once the sandbox's own stop, or the grace after it (StopGrace, 30s), ends it -- also while its sandbox is still delivering an earlier turn's push and pull request, and nothing is pushed for it. What waits for such a delivery is the replacement of that sandbox, for at most MCPStatusDeliveryWindow (10 minutes), and a turn created meanwhile waits with it. Turns created after the request run normally. Read GET /api/sessions/{sessionID}/status to see the session settle. Repeating the request is not a no-op: it flags whatever is open at that moment -- a turn created since the first request too, which then stops -- writes its own audit row, and answers its own requestedAt.",
+          "properties": {
+            "openTurns": {
+              "description": "How many turns were pending, dispatched or processing across every reached session when the request was written -- the turns it flagged to be cancelled. 0 when nothing was running; the request still stands, refusing new child sessions until a person resumes the session.",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "reachedSessionIds": {
+              "description": "Every session this request reached and stopped: the session named in the path first, then every session it started, recursively (children, then their children), in the order the walk reached them. A child whose creation raced the request is either listed here or was refused.",
+              "items": {
+                "format": "uuid",
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "requestedAt": {
+              "description": "When this request was made. A repeated request answers its own instant, later than the one before, and the session's scheduled work that would create a turn with no new input (a re-review) is then disarmed up to it, including what was scheduled since the earlier request. A person's next act that sets the session going again clears the stop: a turn they create, their approval of its plan, or their approval or revision of a workflow step awaiting their decision.",
+              "format": "date-time",
+              "type": "string"
+            },
+            "sessionId": {
+              "description": "The session named in the path.",
+              "format": "uuid",
+              "type": "string"
+            }
+          },
+          "required": [
+            "sessionId",
+            "requestedAt",
+            "reachedSessionIds",
+            "openTurns"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/StopSessionResponse",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
   }
 ]

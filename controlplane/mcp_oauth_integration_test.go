@@ -733,8 +733,8 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 
 	// The exit criterion end to end (§43.19): the official SDK client
 	// discovers everything from one live 401, the member approves on the
-	// consent page, and the resulting token lists exactly the thirteen tools
-	// -- the member kept mcp:write, so the five writes among them -- and
+	// consent page, and the resulting token lists exactly the fourteen tools
+	// -- the member kept mcp:write, so the six writes among them -- and
 	// calls one with the same bytes the REST twin gives the member's own
 	// cookie. The SDK's own RFC 9207 issuer check passes along the way.
 	t.Run("EndToEnd_SDKClient", func(t *testing.T) {
@@ -770,7 +770,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 
 		// The member kept every offered scope, mcp:write included, so the
 		// write tools are listed beside the reads (§43.17).
-		want := []string{"narvi_approve_plan", "narvi_create_session", "narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_plans", "narvi_list_sessions", "narvi_reject_plan", "narvi_request_plan_revision", "narvi_send_prompt", "narvi_wait_for_session"}
+		want := []string{"narvi_approve_plan", "narvi_create_session", "narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_plans", "narvi_list_sessions", "narvi_reject_plan", "narvi_request_plan_revision", "narvi_send_prompt", "narvi_stop_session", "narvi_wait_for_session"}
 		if got := toolNames(ctx, t, flow.session); strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Fatalf("ListTools = %v, want %v", got, want)
 		}
@@ -1259,6 +1259,25 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	t.Run("WriteTwins_EveryArgumentLikeREST_SDKClient", func(t *testing.T) {
 		sdkWriteTwinsLikeREST(t, twinsRig, classifier)
 	})
+	// Row 183's stop over MCP (technical plan §43.22), on routers of their
+	// own: every stop that is accepted wakes the actor of each session it
+	// reaches. mcp_stopsession_integration_test.go has each one's doc.
+	stopRig := createRouterRig(t, connStr, liftEndpointBrakes)
+	t.Run("StopSession_SDKClient", func(t *testing.T) {
+		sdkStopSession(t, stopRig)
+	})
+	t.Run("StopSession_ParityEveryRole_SDKClient", func(t *testing.T) {
+		sdkStopSessionParityEveryRole(t, stopRig)
+	})
+	t.Run("StopSession_ReadGrantDoesNotSeeIt", func(t *testing.T) {
+		sdkStopSessionReadGrant(t, stopRig)
+	})
+	// The row's exit, on a router of its own alone, whose sandbox provider
+	// is a local fake (newExitRouterRig).
+	exitRig, exitProvider := newExitRouterRig(t, connStr)
+	t.Run("PlanRevisionThenStop_NoOrphan_SDKClient", func(t *testing.T) {
+		sdkPlanRevisionThenStopNoOrphan(t, exitRig, exitProvider)
+	})
 	createBraked := createRouterRig(t, connStr, brakeTestTimeouts)
 	t.Run("RateLimit_MCPPerGrant429", func(t *testing.T) {
 		rateLimitMCPPerGrant(t, createBraked)
@@ -1397,7 +1416,7 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SDK Connect with a metadata document: %v", err)
 		}
-		want := []string{"narvi_approve_plan", "narvi_create_session", "narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_plans", "narvi_list_sessions", "narvi_reject_plan", "narvi_request_plan_revision", "narvi_send_prompt", "narvi_wait_for_session"}
+		want := []string{"narvi_approve_plan", "narvi_create_session", "narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_plans", "narvi_list_sessions", "narvi_reject_plan", "narvi_request_plan_revision", "narvi_send_prompt", "narvi_stop_session", "narvi_wait_for_session"}
 		if got := toolNames(ctx, t, flow.session); strings.Join(got, ",") != strings.Join(want, ",") {
 			t.Fatalf("ListTools = %v, want %v", got, want)
 		}
@@ -1449,9 +1468,9 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("SDK Connect with dynamic registration: %v", err)
 		}
-		// Every offered scope kept, mcp:write included: the thirteen tools.
-		if got := toolNames(ctx, t, flow.session); len(got) != 13 {
-			t.Fatalf("ListTools = %v, want the thirteen tools", got)
+		// Every offered scope kept, mcp:write included: the fourteen tools.
+		if got := toolNames(ctx, t, flow.session); len(got) != 14 {
+			t.Fatalf("ListTools = %v, want the fourteen tools", got)
 		}
 		if res, err := callListModels(ctx, flow.session); err != nil || res.IsError {
 			t.Fatalf("CallTool narvi_list_models: res %+v err %v", res, err)

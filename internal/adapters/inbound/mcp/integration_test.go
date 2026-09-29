@@ -172,6 +172,18 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 	approvePlan := httpapi.ApprovePlan(pool, rig.sessions, rig.turns, plans, rig.events, planDocuments, participants, outbox, linearAgentSessions, auditLog, registry, false)
 	rejectPlan := httpapi.RejectPlan(pool, rig.sessions, rig.turns, plans, rig.events, planDocuments, participants, outbox, linearAgentSessions, auditLog, false)
 	createTurn := httpapi.CreateTurn(pool, rig.sessions, rig.turns, plans, participants, auditLog, registry, nil, nil, false)
+	// One stop handler for the REST route and the MCP twin alike, as
+	// controlplane wires it (technical plan §43.22).
+	stopSession := httpapi.StopSession(httpapi.StopSessionDeps{
+		Pool:             pool,
+		Sessions:         rig.sessions,
+		Turns:            rig.turns,
+		Timers:           narvipg.NewTimerStore(pool),
+		Participants:     participants,
+		AuditLog:         auditLog,
+		GitHubPRSessions: rig.prSessions,
+		Registry:         registry,
+	})
 
 	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{PublicBaseURL: baseURL, CreateBrake: unlimitedBrake{}}, mcpadapter.Twins{
 		ListModels:       httpapi.GetModelCatalog(),
@@ -185,6 +197,7 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		ApprovePlan:      approvePlan,
 		RejectPlan:       rejectPlan,
 		CreateTurn:       createTurn,
+		StopSession:      stopSession,
 	})
 	if err != nil {
 		t.Fatalf("mcpadapter.NewHandler: %v", err)
@@ -215,6 +228,7 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		r.Post("/{sessionID}/plans/{planId}/approve", approvePlan)
 		r.Post("/{sessionID}/plans/{planId}/reject", rejectPlan)
 		r.Post("/{sessionID}/turns", createTurn)
+		r.Post("/{sessionID}/stop", stopSession)
 	})
 	router.Route("/mcp", func(r chi.Router) {
 		r.Use(mcpOriginGate)

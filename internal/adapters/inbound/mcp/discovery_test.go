@@ -55,13 +55,14 @@ func listToolNames(t *testing.T, handler http.Handler) []string {
 // the read tools only for mcp:read, and every tool for mcp:write (which
 // implies mcp:read). Row 182's status, wait, result and transcript tools are
 // mcp:read like the rest: a grant without it is told none of them exists
-// (technical plan §43.20), and so is row 183's narvi_list_plans; the five
-// writes -- narvi_create_session and the plan and turn tools -- are
-// mcp:write, so a read-only grant is told none of them exists (§43.17).
+// (technical plan §43.20), and so is row 183's narvi_list_plans; the six
+// writes -- narvi_create_session, the plan and turn tools and
+// narvi_stop_session -- are mcp:write, so a read-only grant is told none of
+// them exists (§43.17).
 // tools/list names tools in alphabetical order.
 func TestToolsList_ScopeFilter_Table(t *testing.T) {
 	reads := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_plans", "narvi_list_sessions", "narvi_wait_for_session"}
-	writes := []string{"narvi_approve_plan", "narvi_create_session", "narvi_reject_plan", "narvi_request_plan_revision", "narvi_send_prompt"}
+	writes := []string{"narvi_approve_plan", "narvi_create_session", "narvi_reject_plan", "narvi_request_plan_revision", "narvi_send_prompt", "narvi_stop_session"}
 	all := slices.Sorted(slices.Values(append(slices.Clone(writes), reads...)))
 	tests := []struct {
 		name   string
@@ -114,7 +115,9 @@ func discoverInstructions(t *testing.T, grant *[]string) string {
 // read-only grant -- and it calls the tools read-only exactly when no write
 // tool is visible: never beside a write. With the writes visible it says,
 // once, which of them are refused while a turn is queued or running, and
-// that nothing is queued (technical plan §43.21).
+// that nothing is queued (technical plan §43.21), then that the stop tool
+// reaches every session the one named started, answers before the work has
+// ended, and is not a no-op when repeated (§43.22).
 func TestInstructions_NameOnlyVisibleTools(t *testing.T) {
 	for name, grant := range map[string]*[]string{"scope-less": scopes(), "no grant": nil, "unknown scope": scopes("mcp:admin")} {
 		if got := discoverInstructions(t, grant); strings.Contains(got, "narvi_") {
@@ -141,11 +144,12 @@ func TestInstructions_NameOnlyVisibleTools(t *testing.T) {
 		t.Errorf("full grant: instructions %q do not say what the write tools can do", full)
 	}
 	const gated = "narvi_approve_plan, narvi_request_plan_revision, and narvi_send_prompt are refused while a turn of the session is queued or running, and nothing is queued: wait until the session settles, then call again."
-	if !strings.HasSuffix(full, " "+gated) {
-		t.Errorf("full grant: instructions %q do not end by naming the tools refused while a turn is open", full)
+	const stops = "narvi_stop_session cancels the queued and running turns of a session and of every session it started, and answers before that work has ended: wait until the session settles. Calling it again is not a no-op: it also stops whatever was started since."
+	if !strings.HasSuffix(full, " "+gated+" "+stops) {
+		t.Errorf("full grant: instructions %q do not end by naming the tools refused while a turn is open, then what the stop tool does", full)
 	}
-	if strings.Contains(readOnly, "refused while a turn") {
-		t.Errorf("read-only grant: instructions %q mention a refusal no visible tool has", readOnly)
+	if strings.Contains(readOnly, "refused while a turn") || strings.Contains(readOnly, "not a no-op") {
+		t.Errorf("read-only grant: instructions %q mention a refusal or a stop no visible tool has", readOnly)
 	}
 }
 
@@ -193,18 +197,19 @@ func TestInstructionsFor_Composition(t *testing.T) {
 	}
 
 	// With the writes visible, the paragraph names the reads and the writes
-	// apart, never says read-only, and ends by naming the writes refused
-	// while a turn is open.
+	// apart, never says read-only, names the writes refused while a turn is
+	// open, and ends by saying what the stop tool does.
 	writes := specs[8:]
-	if len(writes) != 5 {
-		t.Fatalf("specs[8:] holds %d tools, want the five writes", len(writes))
+	if len(writes) != 6 {
+		t.Fatalf("specs[8:] holds %d tools, want the six writes", len(writes))
 	}
+	const stops = "narvi_stop_session cancels the queued and running turns of a session and of every session it started, and answers before that work has ended: wait until the session settles. Calling it again is not a no-op: it also stops whatever was started since."
 	all := instructionsFor(specs)
-	want = "This server exposes thirteen tools over this deployment's session data. Eight only read and change nothing: " +
+	want = "This server exposes fourteen tools over this deployment's session data. Eight only read and change nothing: " +
 		strings.Join(instructions(reads[:7]), ", ") + ", and " + reads[7].Instruction +
-		". Five act as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " +
-		strings.Join(instructions(writes[:4]), ", ") + ", and " + writes[4].Instruction +
-		". narvi_approve_plan, narvi_request_plan_revision, and narvi_send_prompt are refused while a turn of the session is queued or running, and nothing is queued: wait until the session settles, then call again."
+		". Six act as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " +
+		strings.Join(instructions(writes[:5]), ", ") + ", and " + writes[5].Instruction +
+		". narvi_approve_plan, narvi_request_plan_revision, and narvi_send_prompt are refused while a turn of the session is queued or running, and nothing is queued: wait until the session settles, then call again. " + stops
 	if all != want {
 		t.Errorf("instructionsFor(all) =\n %q\nwant\n %q", all, want)
 	}
@@ -229,6 +234,16 @@ func TestInstructionsFor_Composition(t *testing.T) {
 		create.Instruction + " and " + approve.Instruction + ". narvi_approve_plan is refused while a turn of the session is queued or running, and nothing is queued: wait until the session settles, then call again."
 	if oneGated != want {
 		t.Errorf("instructionsFor(the create and approve) =\n %q\nwant\n %q", oneGated, want)
+	}
+	stop := writes[5]
+	if stop.Name != "narvi_stop_session" {
+		t.Fatalf("specs[13] is %s, want narvi_stop_session", stop.Name)
+	}
+	createAndStop := instructionsFor([]toolSpec{create, stop})
+	want = "This server exposes two tools over this deployment's session data. Two act as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " +
+		create.Instruction + " and " + stop.Instruction + ". " + stops
+	if createAndStop != want {
+		t.Errorf("instructionsFor(the create and the stop) =\n %q\nwant\n %q", createAndStop, want)
 	}
 }
 
