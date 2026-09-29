@@ -1866,6 +1866,9 @@ func TestPostReviewVerdict_CounterReviewCorroborated_NotFloored(t *testing.T) {
 	if resp.Shippable != restdtos.PostReviewVerdictResponseShippableAuto {
 		t.Errorf("Shippable = %q, want %q (a corroborated counter-review claim must not be floored)", resp.Shippable, restdtos.PostReviewVerdictResponseShippableAuto)
 	}
+	if body := verdictOutboxBody(ctx, t, rig, session.ID); !strings.Contains(body, "- **Shippable**: auto (server-computed)\n\n") || strings.Contains(body, "Kept above auto by") {
+		t.Errorf("an auto verdict's Body must render the bare Shippable bullet and no blockers, Body:\n%s", body)
+	}
 }
 
 // TestPostReviewVerdict_CounterReviewUncorroborated_NoFinishEvent_
@@ -1890,6 +1893,44 @@ func TestPostReviewVerdict_CounterReviewUncorroborated_NoFinishEvent_FloorsToNee
 	if resp.Shippable != restdtos.PostReviewVerdictResponseShippableNeedsHuman {
 		t.Errorf("Shippable = %q, want %q (a claimed-but-uncorroborated done must floor to needs_human)", resp.Shippable, restdtos.PostReviewVerdictResponseShippableNeedsHuman)
 	}
+
+	// §26.1: the posted readout names why, as the server's decision, and
+	// names the counter-review as uncorroborated rather than skipped.
+	body := verdictOutboxBody(ctx, t, rig, session.ID)
+	for _, want := range []string{
+		"- **Shippable**: needs_human (server-computed)\n  - Kept above auto by (decided by the server, not asserted by the reviewer):\n",
+		"    - counter-review `uncorroborated` -- reported done, but this turn's own trace shows no counter-reviewer sub-task that started and completed (needs_human)\n",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("outbox verdict Body missing %q, Body:\n%s", want, body)
+		}
+	}
+
+	// Storage is what it was before the state had a name: the row keeps the
+	// reviewer's own self-report and the same class.
+	var counterReview *string
+	var shippable string
+	if err := rig.pool.QueryRow(ctx, `SELECT counter_review, shippable FROM review_verdicts WHERE repo_full_name = $1`, "acme/verdict-uncorroborated-no-finish").Scan(&counterReview, &shippable); err != nil {
+		t.Fatalf("query review_verdicts row: %v", err)
+	}
+	if counterReview == nil || *counterReview != "done" || shippable != "needs_human" {
+		t.Errorf("review_verdicts counter_review = %v, shippable = %q; want the self-reported \"done\" and \"needs_human\"", counterReview, shippable)
+	}
+}
+
+// verdictOutboxBody returns the rendered comment body of the one
+// github_verdict outbox row sessionID enqueued.
+func verdictOutboxBody(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID) string {
+	t.Helper()
+	var raw []byte
+	if err := rig.pool.QueryRow(ctx, `SELECT payload FROM outbox WHERE session_id = $1 AND kind = $2`, sessionID, string(ports.NotificationKindGitHubVerdict)).Scan(&raw); err != nil {
+		t.Fatalf("query verdict outbox row: %v", err)
+	}
+	var payload githubapi.VerdictPayload
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("unmarshal verdict outbox payload: %v", err)
+	}
+	return payload.Body
 }
 
 // TestPostReviewVerdict_CounterReviewUncorroborated_OnlyDifferentSubAgent

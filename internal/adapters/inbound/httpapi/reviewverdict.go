@@ -634,7 +634,7 @@ func PostReviewVerdict(
 			return
 		}
 
-		verdict := reviewpost.BuildVerdict(input)
+		verdict, shippable := reviewpost.BuildVerdict(input)
 		findings := reviewpost.BuildFindings(input)
 
 		// §21.1's own filesChanged drift canary, now wired: compares
@@ -711,7 +711,7 @@ func PostReviewVerdict(
 
 		event := reviewpost.ComputeFormalReviewEvent(verdict.Shippable, verdict.RiskLevel, blockOnHighRisk)
 		syncedLabel := reviewpost.RiskLabel(verdict.RiskLevel)
-		body := reviewpost.RenderVerdictComment(verdict, findings, input.Digest, req.Summary, botHandle, syncedLabel)
+		body := reviewpost.RenderVerdictComment(verdict, shippable, findings, input.Digest, req.Summary, botHandle, syncedLabel)
 
 		payload, err := json.Marshal(githubapi.VerdictPayload{
 			Owner:     owner,

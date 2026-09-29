@@ -87,7 +87,7 @@ func TestRenderVerdictComment_UntrustedDigestFieldsAreEscaped(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
 
-			got := reviewpost.RenderVerdictComment(baseVerdict(), nil, tt.digest, "Summary.", "narvi-bot", reviewpost.LabelLowRisk)
+			got := reviewpost.RenderVerdictComment(baseVerdict(), assessmentOf(baseVerdict()), nil, tt.digest, "Summary.", "narvi-bot", reviewpost.LabelLowRisk)
 
 			if strings.Contains(got, "<details><summary>evil</summary>") || strings.Contains(got, "List<int>") {
 				t.Errorf("RenderVerdictComment() rendered an UNESCAPED injection from %s -- want '<'/'>' escaped, got:\n%s", tt.name, got)
@@ -115,7 +115,7 @@ func TestRenderVerdictComment_FindingFilePathEscapesBacktickAndNewline(t *testin
 	}
 	digest := reviewpost.Digest{Summary: "No changes of note."}
 
-	got := reviewpost.RenderVerdictComment(baseVerdict(), findings, digest, "Summary.", "narvi-bot", reviewpost.LabelLowRisk)
+	got := reviewpost.RenderVerdictComment(baseVerdict(), assessmentOf(baseVerdict()), findings, digest, "Summary.", "narvi-bot", reviewpost.LabelLowRisk)
 
 	if strings.Contains(got, "a`b") || strings.Contains(got, "b\nc") || strings.Contains(got, "c\rd") {
 		t.Errorf("RenderVerdictComment() rendered an unescaped backtick/newline/carriage-return from Finding.FilePath, breaking out of its code span:\n%s", got)
@@ -140,7 +140,7 @@ func TestRenderVerdictComment_FindingFilePathEscapedInEveryLineShape(t *testing.
 	}
 	digest := reviewpost.Digest{Summary: "No changes of note."}
 
-	got := reviewpost.RenderVerdictComment(baseVerdict(), findings, digest, "Summary.", "narvi-bot", reviewpost.LabelLowRisk)
+	got := reviewpost.RenderVerdictComment(baseVerdict(), assessmentOf(baseVerdict()), findings, digest, "Summary.", "narvi-bot", reviewpost.LabelLowRisk)
 
 	if strings.Contains(got, "range`path") || strings.Contains(got, "unanchored`path") {
 		t.Errorf("RenderVerdictComment() rendered an unescaped backtick from FilePath in the range-anchored or unanchored shape:\n%s", got)
@@ -198,7 +198,7 @@ func TestRenderVerdictComment_NarrativeSummaryIsEscaped(t *testing.T) {
 
 			digest := reviewpost.Digest{Summary: "No changes of note."}
 
-			got := reviewpost.RenderVerdictComment(baseVerdict(), nil, digest, tt.summary, "narvi-bot", reviewpost.LabelLowRisk)
+			got := reviewpost.RenderVerdictComment(baseVerdict(), assessmentOf(baseVerdict()), nil, digest, tt.summary, "narvi-bot", reviewpost.LabelLowRisk)
 
 			if strings.Contains(got, "<details><summary>evil</summary>") || strings.Contains(got, "List<int>") {
 				t.Errorf("RenderVerdictComment() rendered an UNESCAPED injection from the narrative summary (%s) -- want '<'/'>' escaped, got:\n%s", tt.name, got)

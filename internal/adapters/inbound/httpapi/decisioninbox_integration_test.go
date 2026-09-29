@@ -80,7 +80,7 @@ func (rig *decisionInboxTestRig) seedAutoApprovedVerdict(ctx context.Context, t 
 		ProposedShippable: review.ProposedShippableAuto,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	// verdictContext (§21.1's amendment) mirrors internal/app/
 	// decisioninbox's own identical seedAutoApprovedVerdict fixture
 	// (aggregate_integration_test.go): testEligibleBaseRef/
@@ -142,7 +142,7 @@ func (rig *decisionInboxTestRig) seedNotShippableAutoVerdict(ctx context.Context
 		ProposedShippable: review.ProposedShippableNeedsHuman,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if verdict.Shippable == review.ShippableAuto {
 		t.Fatalf("seedNotShippableAutoVerdict: fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}

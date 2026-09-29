@@ -97,7 +97,7 @@ func (rs *digestTestRig) seedRepoWithSlackChannel(ctx context.Context, t *testin
 		ProposedShippable: review.ProposedShippableAuto,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 
 	// §30.8: ListNonShadowReviewVerdictsInWindow (the digest's own
 	// customer-consequential read, rollup.go) excludes any verdict whose

@@ -3,7 +3,7 @@ package review
 // Shippable is the automated-approval engine's own gating field (§21.2, a
 // later Step): auto/needs_human/block. This is the AUTHORITATIVE,
 // server-computed classification — the ONLY sanctioned way to produce a
-// legitimate value is ComputeShippable's return value. See doc.go's
+// legitimate value is the Class of ComputeShippable's result. See doc.go's
 // "server-computed Shippable" section and ProposedShippable's own doc
 // comment below for why this is a distinct type from the model's own
 // self-report, never interchangeable with it without an explicit
@@ -97,9 +97,9 @@ func rank(s Shippable) int {
 
 // maxShippable returns whichever of a, b ranks least permissive (highest
 // rank), preferring b on a tie (a bare `>` on a's rank, not `>=`) — the
-// specific tie-break is immaterial here since ComputeShippable only ever
-// calls this with two values it expects MAY be equal, never relying on
-// which one "wins" a tie to distinguish behavior.
+// specific tie-break is immaterial here since ShippableAssessment.Class
+// only ever calls this with two values it expects MAY be equal, never
+// relying on which one "wins" a tie to distinguish behavior.
 func maxShippable(a, b Shippable) Shippable {
 	if rank(a) > rank(b) {
 		return a
@@ -141,6 +141,96 @@ func baselineFromRisk(r RiskLevel) Shippable {
 	}
 }
 
+// ShippableInput names one of the five inputs ComputeShippable composes:
+// the risk baseline or one of the four raise-only floors. It is how a
+// Blocker says which input it is.
+type ShippableInput string
+
+// The five ShippableInput values, one per ComputeShippable parameter, in
+// the order ComputeShippable composes them, which is also the order a
+// ShippableAssessment lists its blockers in.
+const (
+	ShippableInputRiskLevel           ShippableInput = "risk_level"
+	ShippableInputTestsCoverage       ShippableInput = "tests_coverage"
+	ShippableInputPremise             ShippableInput = "premise"
+	ShippableInputDescriptionAdequacy ShippableInput = "description_adequacy"
+	ShippableInputCounterReview       ShippableInput = "counter_review"
+)
+
+// Blocker is one input that, on its own, keeps Shippable above auto
+// (§26.1): the risk baseline when it is above auto, or a floor that is.
+// Only ComputeShippable puts a Blocker into a ShippableAssessment.
+type Blocker struct {
+	// Input is which of ComputeShippable's inputs this is.
+	Input ShippableInput
+	// Value is that input's value exactly as ComputeShippable received it:
+	// "medium" for a medium risk level, "uncorroborated" for a
+	// counter-review reported done that the server could not corroborate.
+	// An empty or unrecognized value keeps the class above auto under the
+	// fail-conservative policy (doc.go), so it is a blocker too, carried
+	// verbatim.
+	Value string
+	// Level is the class this input alone forces: needs_human or block,
+	// never auto.
+	Level Shippable
+}
+
+// ShippableAssessment is ComputeShippable's result: the blockers, and the
+// class computed from them. It holds the blockers and nothing else, so
+// the two cannot disagree: the class is auto when there are no blockers
+// and otherwise the least permissive Level among them. Only
+// ComputeShippable builds one; the zero value is not an assessment, and
+// its Class is the empty Shippable, never auto (the same property
+// Verdict's own zero value has, TestVerdict_ZeroValueIsNotAuto).
+type ShippableAssessment struct {
+	assessed bool
+	blockers []Blocker
+}
+
+// Class is the authoritative Shippable. It is computed here, from the
+// blockers, and nowhere else.
+func (a ShippableAssessment) Class() Shippable {
+	if !a.assessed {
+		return ""
+	}
+	class := ShippableAuto
+	for _, b := range a.blockers {
+		class = maxShippable(class, b.Level)
+	}
+	return class
+}
+
+// Blockers returns every input that on its own keeps Class above auto, in
+// ComputeShippable's parameter order. It is nil exactly when Class is
+// auto, and two inputs at the same level are both listed. The slice is a
+// copy.
+func (a ShippableAssessment) Blockers() []Blocker {
+	return append([]Blocker(nil), a.blockers...)
+}
+
+// floor is one of ComputeShippable's inputs as a single value: which input
+// it is, its value, and the class it alone forces. assess turns every
+// floor above auto into a Blocker and keeps nothing else, and Class is
+// computed from those blockers alone, so no input can raise the class
+// without being named among them.
+type floor struct {
+	input ShippableInput
+	value string
+	level Shippable
+}
+
+// assess builds the ShippableAssessment for floors: one Blocker per floor
+// whose level ranks above auto, in the order given.
+func assess(floors ...floor) ShippableAssessment {
+	a := ShippableAssessment{assessed: true}
+	for _, f := range floors {
+		if rank(f.level) > rank(ShippableAuto) {
+			a.blockers = append(a.blockers, Blocker{Input: f.input, Value: f.value, Level: f.level})
+		}
+	}
+	return a
+}
+
 // ComputeShippable is domain/review's single exported pure function for
 // deriving Shippable (§8.2, extended by §26.2 and again by
 // §26.4) — the ONLY sanctioned way any caller computes an
@@ -148,11 +238,20 @@ func baselineFromRisk(r RiskLevel) Shippable {
 // own RiskLevel plus the FOUR independent raise-only floors (coverage,
 // premise, description adequacy, counter-review), composed via max(rank):
 //
-//	result = max(rank(baselineFromRisk(risk)),
-//	             rank(CoverageFloor(coverage)),
-//	             rank(PremiseFloor(premise)),
-//	             rank(AdequacyFloor(adequacy)),
-//	             rank(CounterReviewFloor(counterReview)))
+//	class = max(rank(baselineFromRisk(risk)),
+//	            rank(CoverageFloor(coverage)),
+//	            rank(PremiseFloor(premise)),
+//	            rank(AdequacyFloor(adequacy)),
+//	            rank(CounterReviewFloor(counterReview)))
+//
+// The class comes back with its blockers (§26.1): every input that on
+// its own would keep the class above auto. Each input enters as one floor
+// value carrying both its level and what names it, and the class is
+// computed from the blockers those values produce (ShippableAssessment),
+// so there is no second computation for the two to drift apart in: no
+// blockers exactly when the class is auto, and two inputs at the same
+// level are both named. TestComputeShippable_EveryRaisingInputIsABlocker
+// (shippable_test.go) checks this over the baseline and every floor.
 //
 // adequacy (§26.2) is this function's own THIRD floor input,
 // added alongside the original two (coverage, premise) §8.2 already
@@ -172,12 +271,12 @@ func baselineFromRisk(r RiskLevel) Shippable {
 // guess is structurally incapable of influencing this function's result,
 // because it is not a parameter this signature even accepts. A caller
 // wiring up a Verdict (a later Step) is expected to populate
-// Verdict.Shippable with EXACTLY this function's return value and never
+// Verdict.Shippable with EXACTLY this function's result's Class and never
 // with Verdict's own ProposedShippable field, converted or otherwise — see
 // Verdict's own doc comment (verdict.go).
 //
 // RAISE-ONLY property: for any (risk, coverage, premise, adequacy,
-// counterReview) input, this function never returns a Shippable ranked
+// counterReview) input, this function never returns a class ranked
 // BELOW baselineFromRisk(risk) alone, nor below CoverageFloor(coverage)
 // alone, nor below PremiseFloor(premise) alone, nor below
 // AdequacyFloor(adequacy) alone, nor below CounterReviewFloor(counterReview)
@@ -197,11 +296,12 @@ func baselineFromRisk(r RiskLevel) Shippable {
 // TestBuildVerdict_AdequacyNeverAffectsRiskLevel
 // (internal/domain/reviewpost/validate_test.go) for the pin, at
 // BuildVerdict's own real construction site.
-func ComputeShippable(risk RiskLevel, coverage TestsCoverageState, premise PremiseState, adequacy DescriptionAdequacy, counterReview CounterReviewStatus) Shippable {
-	result := baselineFromRisk(risk)
-	result = maxShippable(result, CoverageFloor(coverage))
-	result = maxShippable(result, PremiseFloor(premise))
-	result = maxShippable(result, AdequacyFloor(adequacy))
-	result = maxShippable(result, CounterReviewFloor(counterReview))
-	return result
+func ComputeShippable(risk RiskLevel, coverage TestsCoverageState, premise PremiseState, adequacy DescriptionAdequacy, counterReview CounterReviewStatus) ShippableAssessment {
+	return assess(
+		floor{input: ShippableInputRiskLevel, value: string(risk), level: baselineFromRisk(risk)},
+		floor{input: ShippableInputTestsCoverage, value: string(coverage), level: CoverageFloor(coverage)},
+		floor{input: ShippableInputPremise, value: string(premise), level: PremiseFloor(premise)},
+		floor{input: ShippableInputDescriptionAdequacy, value: string(adequacy), level: AdequacyFloor(adequacy)},
+		floor{input: ShippableInputCounterReview, value: string(counterReview), level: CounterReviewFloor(counterReview)},
+	)
 }

@@ -2043,16 +2043,23 @@ reject-don't-repair posture the endpoint already applies to invalid payloads —
 verdict whose digest is semantically empty raises the `Shippable` floor (§26.2's composition). The
 light path requests the full digest but does not hard-require it.
 
-**The readout names what raised it (amendment).** `Shippable` is the maximum of a
-risk baseline and the raise-only floors `ComputeShippable` composes, and the rendered verdict prints
-the class alone. The
-function that computes the class returns its blockers beside it (every input that on its own would
-keep the class above `auto`: the risk baseline when it is, and each floor that is), the two computed
-together so they cannot disagree (no
-blockers exactly when the class is `auto`), and the readout names them, marked as decided by the
-server and not asserted by the reviewer. A counter-review reported done but not corroborated reaches
-the function as a value of its own rather than as skipped, with the same floor, so its blocker says
-what happened.
+**The readout names what raised it (amendment, Step 200).** `Shippable` is the maximum of a
+risk baseline and the raise-only floors `ComputeShippable` composes, and the rendered verdict used to
+print the class alone. The function that computes the class now returns its blockers with it, as one
+`ShippableAssessment`: every input that on its own keeps the class above `auto` (the risk baseline
+when it is, and each floor that is), each with its value and the level it alone forces. Each input
+enters as a single floor value carrying both its level and what names it, and the class is computed
+from the blockers those values produce, so the two cannot disagree: no blockers exactly when the
+class is `auto`, and two inputs at the same level are both named. The rendered verdict lists them as
+nested bullets under the Shippable bullet, after a lead-in marking them as decided by the server and
+not asserted by the reviewer; an `auto` verdict's header, and every other line of the comment, is
+what it was. A counter-review reported done but not corroborated (§26.4) reaches the function as
+`uncorroborated`, a value of its own rather than `skipped`, with the same `needs_human` floor, so its
+blocker says what happened; a payload cannot claim that value, only the server resolves it. The
+blockers are not persisted: `review_verdicts` keeps the class, and the reviewer's own
+`counter_review` self-report, exactly as before, so every reader of a stored verdict (auto-approval,
+auto-merge, the decision inbox, the Code review view and its REST DTOs) reads what it read before,
+and the posted verdict is where the blockers are read.
 
 ### 26.2 Description adequacy: does the PR tell the truth? (Step 67)
 
@@ -2267,9 +2274,11 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
     existing light-path substitution, and gated explicitly on `ReviewDepth == DepthDeep` — never
     merely on the raw `CounterReview` value, which carries no validated meaning on the light path
     and would otherwise let this substitution silently floor light-path verdicts too): a deep-path
-    `done` claim the server could NOT corroborate is downgraded to `CounterReviewSkipped` before
+    `done` claim the server could NOT corroborate becomes `CounterReviewUncorroborated` before
     `CounterReviewFloor` runs, landing on the identical `needs_human` floor an honest `skipped`
-    self-report already produces. This can only ever make `Shippable` MORE conservative than the
+    self-report already produces while keeping its own name, so the verdict's blocker says the claim
+    went unconfirmed rather than that the reviewer skipped (§26.1; it was read as `skipped` until
+    then, with the same floor). This can only ever make `Shippable` MORE conservative than the
     self-report alone, never less.
   - **A known, accepted race, not a bug:** the verdict POST and the WS event carrying
     `sub_task_finish` are two independent network round-trips from the sandbox with no server-side

@@ -81,6 +81,9 @@ type VerdictInput struct {
 	// ReviewDepth == reviewtriage.DepthDeep -- unvalidated, and never fed
 	// to the counter-review floor as-is, on every other path (see
 	// BuildVerdict's own doc comment for the light-path substitution).
+	// Never review.CounterReviewUncorroborated: that is the server's own
+	// finding, which BuildVerdict alone produces, so the deep-path check
+	// rejects it from a payload like any other unrecognized value.
 	CounterReview review.CounterReviewStatus
 
 	// FactCheck (§26.6) is the diff-only fact-check sub-task's
@@ -557,13 +560,21 @@ func hasNonBlankArchDecision(decisions []ArchDecision) bool {
 // BuildVerdict is the ONE sanctioned way this package turns an
 // ALREADY-VALIDATED VerdictInput (ValidateVerdictInput must be called
 // first -- BuildVerdict does not re-validate) into an authoritative
-// review.Verdict: Shippable is populated with EXACTLY
-// review.ComputeShippable's own return value, never in.ProposedShippable
+// review.Verdict: Shippable is populated with EXACTLY the Class of
+// review.ComputeShippable's own result, never in.ProposedShippable
 // converted, matching review.Verdict's own CONTRACT to the letter (the
 // caller's ProposedShippable is still carried onto the result, verbatim,
 // as pure audit/transparency data -- it simply never influences
 // Shippable's own computation, since ComputeShippable's signature does not
 // accept it at all).
+//
+// That result is returned beside the Verdict (§26.1): the
+// review.ShippableAssessment whose Class the Verdict's Shippable is, and
+// whose Blockers name every input that keeps it above auto.
+// RenderVerdictComment renders the class and its blockers from this one
+// value, so the posted readout's class and the reasons it gives cannot
+// come from two computations. The Verdict itself carries no blockers
+// (review/doc.go's design call #10).
 //
 // in.Digest.DescriptionAdequacy (§26.2) is threaded through as
 // ComputeShippable's own fourth argument, the THIRD raise-only floor --
@@ -633,11 +644,13 @@ func hasNonBlankArchDecision(decisions []ArchDecision) bool {
 // (httpapi) has independently confirmed against this turn's own
 // persisted sandbox event trace (reviewverdict.CounterReviewCorroborated,
 // gen-scoped to the turn's own dispatched_sandbox_gen) that the claim
-// does NOT hold up, this substitution downgrades counterReviewForFloor to
-// review.CounterReviewSkipped -- the SAME value an honest "skipped"
-// self-report already produces, floored by CounterReviewFloor to
-// ShippableNeedsHuman exactly as before. This can only ever make Shippable
-// MORE conservative than the self-report alone would, mirroring the first
+// does NOT hold up, this substitution sets counterReviewForFloor to
+// review.CounterReviewUncorroborated -- a value of its own, floored by
+// CounterReviewFloor to ShippableNeedsHuman exactly as an honest
+// "skipped" self-report is, and kept apart from skipped so the blocker it
+// produces names what happened: the reviewer said done and the server
+// could not confirm it (§26.1). This can only ever make Shippable MORE
+// conservative than the self-report alone would, mirroring the first
 // substitution's own "never less permissive" direction and the B11
 // carve-out's identical posture.
 //
@@ -690,7 +703,7 @@ func hasNonBlankArchDecision(decisions []ArchDecision) bool {
 // already commits to ("every cause floors identically... whatever the
 // reason"). This is accepted, not a defect: no retries, no polling, no
 // new timeout constant belongs here to chase it away.
-func BuildVerdict(in VerdictInput) review.Verdict {
+func BuildVerdict(in VerdictInput) (review.Verdict, review.ShippableAssessment) {
 	counterReviewForFloor := in.CounterReview
 	if in.ReviewDepth != reviewtriage.DepthDeep && in.CounterReview != review.CounterReviewSkipped {
 		counterReviewForFloor = review.CounterReviewDone
@@ -701,8 +714,9 @@ func BuildVerdict(in VerdictInput) review.Verdict {
 	// reviewtriage.DepthDeep EXPLICITLY and not merely in.CounterReview ==
 	// review.CounterReviewDone.
 	if in.ReviewDepth == reviewtriage.DepthDeep && in.CounterReview == review.CounterReviewDone && !in.CounterReviewCorroborated {
-		counterReviewForFloor = review.CounterReviewSkipped
+		counterReviewForFloor = review.CounterReviewUncorroborated
 	}
+	shippable := review.ComputeShippable(in.RiskLevel, in.TestsCoverage, in.Premise, in.Digest.DescriptionAdequacy, counterReviewForFloor)
 	return review.Verdict{
 		RiskLevel:         in.RiskLevel,
 		Premise:           in.Premise,
@@ -711,8 +725,8 @@ func BuildVerdict(in VerdictInput) review.Verdict {
 		TestsCoverage:     in.TestsCoverage,
 		DocsDrift:         in.DocsDrift,
 		ProposedShippable: in.ProposedShippable,
-		Shippable:         review.ComputeShippable(in.RiskLevel, in.TestsCoverage, in.Premise, in.Digest.DescriptionAdequacy, counterReviewForFloor),
-	}
+		Shippable:         shippable.Class(),
+	}, shippable
 }
 
 // BuildFindings is BuildVerdict's own per-finding sibling (§8.2,

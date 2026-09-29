@@ -98,7 +98,20 @@ import (
 // to that closed, seven-field type, digest.go's own doc
 // comment) -- this function only ever changes WHERE they render, never
 // what they are or how internal/app/reviewverdict.Insert persists them.
-func RenderVerdictComment(v review.Verdict, findings []Finding, digest Digest, summary, botHandle, syncedLabel string) string {
+//
+// # (§26.1): what keeps the class above auto
+//
+// shippable is BuildVerdict's second result, the assessment v.Shippable
+// was set from. The header's Shippable bullet renders its Class, and
+// under it, as nested bullets, its Blockers: a lead-in saying the server
+// decided them rather than the reviewer asserting them, then one line per
+// input that on its own keeps the class above auto (see
+// renderShippableBlockers). The class and its reasons are rendered from
+// one value, so the readout cannot state a class its reasons do not
+// account for. An auto verdict has no blockers and renders exactly the
+// header it did before blockers existed; every other line of the comment
+// is unchanged by them.
+func RenderVerdictComment(v review.Verdict, shippable review.ShippableAssessment, findings []Finding, digest Digest, summary, botHandle, syncedLabel string) string {
 	var b strings.Builder
 
 	// --- 1. Header (§26.1 item 1, §26.2 item 1) -- risk badge, why-line,
@@ -109,7 +122,9 @@ func RenderVerdictComment(v review.Verdict, findings []Finding, digest Digest, s
 	fmt.Fprintf(&b, "- **Risk**: %s\n", v.RiskLevel)
 	fmt.Fprintf(&b, "- **Premise**: %s\n", v.Premise)
 	fmt.Fprintf(&b, "- **Description adequacy**: %s -- %s\n", digest.DescriptionAdequacy, escapeFindingDescription(strings.TrimSpace(digest.AdequacyExplanation)))
-	fmt.Fprintf(&b, "- **Shippable**: %s (server-computed)\n\n", v.Shippable)
+	fmt.Fprintf(&b, "- **Shippable**: %s (server-computed)\n", shippable.Class())
+	b.WriteString(renderShippableBlockers(shippable.Blockers()))
+	b.WriteString("\n")
 
 	b.WriteString(escapeFindingDescription(strings.TrimSpace(summary)))
 	b.WriteString("\n\n")
@@ -213,6 +228,68 @@ func RenderVerdictComment(v review.Verdict, findings []Finding, digest Digest, s
 	b.WriteString(RerunGuidance(botHandle))
 
 	return b.String()
+}
+
+// shippableBlockersLeadIn opens the blocker lines under the Shippable
+// bullet (§26.1). It is what marks them as the server's decision, computed
+// from the verdict's inputs, rather than something the reviewer asserted.
+const shippableBlockersLeadIn = "  - Kept above auto by (decided by the server, not asserted by the reviewer):\n"
+
+// uncorroboratedCounterReviewNote says, on the blocker line, what the
+// server-resolved review.CounterReviewUncorroborated means, since the
+// reviewer's own payload said "done".
+const uncorroboratedCounterReviewNote = " -- reported done, but this turn's own trace shows no counter-reviewer sub-task that started and completed"
+
+// renderShippableBlockers renders blockers as nested bullets under the
+// Shippable header bullet: shippableBlockersLeadIn, then one line per
+// blocker naming the input, its value, and the class that input alone
+// forces, in review.ComputeShippable's parameter order. No blockers (an
+// auto verdict) renders nothing at all.
+//
+// A blocker's Value is one of its input's closed-enum values on every
+// verdict ValidateVerdictInput admits, but it is rendered through the
+// code-span escaper anyway: an input that reaches the fail-conservative
+// default carries its value verbatim (review.Blocker), and a backtick or
+// newline in it must not be able to leave the code span it is rendered in.
+func renderShippableBlockers(blockers []review.Blocker) string {
+	if len(blockers) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(shippableBlockersLeadIn)
+	for _, bl := range blockers {
+		value := bl.Value
+		if value == "" {
+			value = "unset"
+		}
+		note := ""
+		if bl.Input == review.ShippableInputCounterReview && bl.Value == string(review.CounterReviewUncorroborated) {
+			note = uncorroboratedCounterReviewNote
+		}
+		fmt.Fprintf(&b, "    - %s `%s`%s (%s)\n", shippableInputLabel(bl.Input), escapeFilePathForCodeSpan(value), note, bl.Level)
+	}
+	return b.String()
+}
+
+// shippableInputLabel is the readout's name for one of
+// review.ComputeShippable's inputs, matching the wording the rest of the
+// comment already uses for the same field (the header's "Risk" and
+// "Premise", the appendix's "Test coverage").
+func shippableInputLabel(input review.ShippableInput) string {
+	switch input {
+	case review.ShippableInputRiskLevel:
+		return "risk level"
+	case review.ShippableInputTestsCoverage:
+		return "test coverage"
+	case review.ShippableInputPremise:
+		return "premise"
+	case review.ShippableInputDescriptionAdequacy:
+		return "description adequacy"
+	case review.ShippableInputCounterReview:
+		return "counter-review"
+	default:
+		return escapeFindingDescription(string(input))
+	}
 }
 
 // renderProposedBody renders proposedBody (digest.ProposedBody, the

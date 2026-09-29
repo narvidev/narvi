@@ -30,13 +30,13 @@
 //     future changes would notice if anyone ever tried to launder a
 //     model's opinion into the authoritative field.
 //   - Shippable — the authoritative field. The ONLY way to obtain a
-//     legitimate value for it is ComputeShippable's return value.
+//     legitimate value for it is the Class of ComputeShippable's result.
 //     ComputeShippable's signature does not accept a ProposedShippable
 //     parameter at all — the model's guess is not merely "not trusted", it
 //     is structurally incapable of influencing the computation, because
 //     there is no parameter for it to influence. A caller (a later Step's
 //     verdict-posting tool, §8.2) is expected to populate
-//     Verdict.Shippable with exactly ComputeShippable's result and never
+//     Verdict.Shippable with exactly that Class and never
 //     with a converted ProposedShippable — see verdict.go's own doc
 //     comment.
 //
@@ -106,6 +106,7 @@
 //   - DescriptionAdequacy: unrecognized ranks with
 //     DescriptionAdequacyMisleading (AdequacyFloor, adequacy.go, §26.2).
 //   - CounterReviewStatus: unrecognized ranks with CounterReviewSkipped
+//     and CounterReviewUncorroborated, which floor alike
 //     (CounterReviewFloor, counterreview.go, §26.4) — see that
 //     type's own doc comment for the one deliberate exception to this
 //     package's usual "every enum feeds a floor on every verdict"
@@ -294,4 +295,17 @@
 //     classification) — it is a human's own decision, recorded
 //     verbatim; this function only validates which decision may
 //     legally follow which.
+//
+//  10. (§26.1) ComputeShippable returns a ShippableAssessment rather than
+//     a bare Shippable: the class and its blockers, every input that on
+//     its own keeps the class above auto. This reopens neither the count
+//     above nor its "no second path" rule. Class and Blockers are that
+//     one result's two accessors, and Class is computed from the
+//     blockers, so the readout's class and the reasons it gives for it
+//     are the same value (see ShippableAssessment's own doc comment).
+//     The blockers are not a Verdict field: Verdict keeps its closed
+//     shape (design call #4), and review_verdicts stores the class
+//     alone. reviewpost.BuildVerdict returns the assessment beside the
+//     Verdict, and the posted verdict comment is where the blockers are
+//     read.
 package review
