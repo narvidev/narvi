@@ -129,10 +129,10 @@ func newFakeOIDCProvider(t *testing.T, clientID string) *fakeOIDCProvider {
 		f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"issuer":                 issuer,
-			"authorization_endpoint": f.server.URL + "/authorize",
-			"token_endpoint":         f.server.URL + "/token",
-			"jwks_uri":               f.server.URL + "/jwks",
+			"issuer":                                issuer,
+			"authorization_endpoint":                f.server.URL + "/authorize",
+			"token_endpoint":                        f.server.URL + "/token",
+			"jwks_uri":                              f.server.URL + "/jwks",
 			"id_token_signing_alg_values_supported": []string{"RS256"},
 		})
 	})
