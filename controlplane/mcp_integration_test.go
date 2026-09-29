@@ -424,6 +424,13 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 	// (seedResultSession): this router's source control is the real code
 	// host adapter, which no test may reach.
 	resultID := seedResultSession(ctx, t, pool, user.ID).String()
+	// A session with two plan versions, so the plan list compares real rows
+	// (§43.21). The write twins' wiring is pinned apart, by
+	// TestOAuth_ProductionRouter's WriteTwins_EveryArgumentLikeREST_SDKClient
+	// (mcp_plandecisions_integration_test.go): on a router configured so that
+	// every argument they read shows in what they write, it compares each
+	// write with its REST twin's rows, the notices included.
+	plannedID := seedTwoPlanVersions(ctx, t, pool, user.ID).String()
 
 	tests := []struct {
 		name        string
@@ -441,6 +448,7 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 		{"narvi_wait_for_session", "/api/sessions/" + sessionID + "/status?waitSeconds=5", "narvi_wait_for_session", fmt.Sprintf(`{"sessionId":%q,"waitSeconds":5}`, sessionID)},
 		{"narvi_get_session_result", "/api/sessions/" + resultID + "/result", "narvi_get_session_result", fmt.Sprintf(`{"sessionId":%q}`, resultID)},
 		{"narvi_get_session_transcript", "/api/sessions/" + busyID + "/events?limit=2", "narvi_get_session_transcript", fmt.Sprintf(`{"sessionId":%q,"limit":2}`, busyID)},
+		{"narvi_list_plans", "/api/sessions/" + plannedID + "/plans", "narvi_list_plans", fmt.Sprintf(`{"sessionId":%q}`, plannedID)},
 	}
 
 	for _, tt := range tests {
@@ -511,4 +519,28 @@ func TestBuild_MCPSurface_TwinParity(t *testing.T) {
 			}
 		})
 	}
+}
+
+// seedTwoPlanVersions creates a session owned by userID whose plan v1 was
+// superseded by v2, awaiting approval, each produced by a completed
+// plan-mode turn.
+func seedTwoPlanVersions(ctx context.Context, t *testing.T, pool *pgxpool.Pool, userID pgtype.UUID) pgtype.UUID {
+	t.Helper()
+	session, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb, CreatedBy: userID})
+	if err != nil {
+		t.Fatalf("create planned session: %v", err)
+	}
+	for _, v := range []struct {
+		version int32
+		status  sqlcgen.PlanStatus
+	}{{1, sqlcgen.PlanStatusSuperseded}, {2, sqlcgen.PlanStatusAwaitingApproval}} {
+		producing, err := narvipg.NewTurnStore(pool).Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+		if err != nil {
+			t.Fatalf("create plan-mode turn: %v", err)
+		}
+		if _, err := narvipg.NewPlanStore(pool).Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: producing.ID, Version: v.version, Status: v.status}); err != nil {
+			t.Fatalf("create plan v%d: %v", v.version, err)
+		}
+	}
+	return session.ID
 }

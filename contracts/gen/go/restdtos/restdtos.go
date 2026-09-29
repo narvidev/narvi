@@ -117,6 +117,45 @@ func (j *ApplySuggestionResponse) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// The narvi_approve_plan MCP tool's own input (technical plan §43.21) -- the tool
+// bridge's twin of POST /api/sessions/{sessionID}/plans/{planId}/approve, which
+// takes no body: both path parameters are plain required fields. Self-contained:
+// it references no other $def. The answer is PlanActionResponse, with the id of
+// the implementation turn the approval queued.
+type ApprovePlanToolRequest struct {
+	// The plan version to approve: a Plan.id narvi_list_plans returns for this
+	// session, whose status is awaiting_approval. A malformed value fails argument
+	// validation before the twin is invoked, reported as a tool execution error
+	// (isError:true).
+	PlanId string `json:"planId" yaml:"planId" mapstructure:"planId"`
+
+	// The session id, matching Session.id's own format exactly. A malformed value
+	// fails argument validation before the twin is invoked, reported as a tool
+	// execution error (isError:true).
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ApprovePlanToolRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["planId"]; raw != nil && !ok {
+		return fmt.Errorf("field planId in ApprovePlanToolRequest: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in ApprovePlanToolRequest: required")
+	}
+	type Plain ApprovePlanToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = ApprovePlanToolRequest(plain)
+	return nil
+}
+
 // One structural decision the diff makes (Digest.archDecisions, §26.1's own
 // 'Architecture choices' section): what was decided, the alternative implicitly
 // rejected, and conformance to the repo's own conventions (its agent instructions
@@ -4853,6 +4892,36 @@ func (j *ListPlansResponse) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// The narvi_list_plans MCP tool's own input (technical plan §43.21) -- the tool
+// bridge's twin of GET /api/sessions/{sessionID}/plans, carrying the path
+// parameter as a plain required field exactly like GetSessionToolRequest. The
+// answer is ListPlansResponse: every plan version of the session, by version, each
+// with the id narvi_approve_plan and narvi_reject_plan take.
+type ListPlansToolRequest struct {
+	// The session id, matching Session.id's own format exactly. A malformed value
+	// fails argument validation before the twin is invoked, reported as a tool
+	// execution error (isError:true).
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ListPlansToolRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in ListPlansToolRequest: required")
+	}
+	type Plain ListPlansToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = ListPlansToolRequest(plain)
+	return nil
+}
+
 // GET /api/intent-templates's own response body (§12.2 item 5) -- every
 // prompt_templates row, ordered by name. Unbounded (no pagination) -- bounded in
 // practice to however many distinct template names this deployment has ever
@@ -8385,6 +8454,44 @@ func (j *RebutFindingRequest) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// The narvi_reject_plan MCP tool's own input (technical plan §43.21) -- the tool
+// bridge's twin of POST /api/sessions/{sessionID}/plans/{planId}/reject, which
+// takes no body: both path parameters are plain required fields. Self-contained:
+// it references no other $def. The answer is PlanActionResponse, with no turn.
+type RejectPlanToolRequest struct {
+	// The plan version to reject: a Plan.id narvi_list_plans returns for this
+	// session, whose status is awaiting_approval. A malformed value fails argument
+	// validation before the twin is invoked, reported as a tool execution error
+	// (isError:true).
+	PlanId string `json:"planId" yaml:"planId" mapstructure:"planId"`
+
+	// The session id, matching Session.id's own format exactly. A malformed value
+	// fails argument validation before the twin is invoked, reported as a tool
+	// execution error (isError:true).
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *RejectPlanToolRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["planId"]; raw != nil && !ok {
+		return fmt.Errorf("field planId in RejectPlanToolRequest: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in RejectPlanToolRequest: required")
+	}
+	type Plain RejectPlanToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = RejectPlanToolRequest(plain)
+	return nil
+}
+
 // One composition finding from §15.3's own aggregate-diff review pass -- reported
 // by the reviewing agent via the composition-findings-posting tool (POST
 // /sessions/:id/release-manifest/composition-findings), never re-parsed from
@@ -9313,6 +9420,59 @@ func (j *RepoSettings) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = RepoSettings(plain)
+	return nil
+}
+
+// The narvi_request_plan_revision MCP tool's own input (technical plan §43.21) --
+// the tool bridge's twin of POST /api/sessions/{sessionID}/turns with planMode
+// true, the web's own request for changes to a plan. Self-contained: it references
+// no other $def. The bridge sends a CreateTurnRequest whose prompt is feedback and
+// whose planMode is true, never these arguments themselves; it offers no planMode
+// (always true here) and no attachments. The answer is CreateTurnResponse: 201 for
+// the plan-mode turn it queued, which writes the next plan version for approval
+// when it completes. While any turn of the session is pending, dispatched or
+// processing -- an approved implementation included -- the twin refuses it with
+// 409 and queues nothing.
+type RequestPlanRevisionToolRequest struct {
+	// The reasoning effort of the revision turn, one of that model's variants in
+	// narvi_list_models. Omitted means the default.
+	Effort *string `json:"effort,omitempty,omitzero" yaml:"effort,omitempty" mapstructure:"effort,omitempty"`
+
+	// What the next plan version should change. It becomes the prompt of a plan-mode
+	// turn in the session's own conversation.
+	Feedback string `json:"feedback" yaml:"feedback" mapstructure:"feedback"`
+
+	// The model of the revision turn, an id narvi_list_models lists. Omitted means
+	// the deployment's default.
+	ModelId *string `json:"modelId,omitempty,omitzero" yaml:"modelId,omitempty" mapstructure:"modelId,omitempty"`
+
+	// The session id, matching Session.id's own format exactly. A malformed value
+	// fails argument validation before the twin is invoked, reported as a tool
+	// execution error (isError:true).
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *RequestPlanRevisionToolRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["feedback"]; raw != nil && !ok {
+		return fmt.Errorf("field feedback in RequestPlanRevisionToolRequest: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in RequestPlanRevisionToolRequest: required")
+	}
+	type Plain RequestPlanRevisionToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if utf8.RuneCountInString(string(plain.Feedback)) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "feedback", 1)
+	}
+	*j = RequestPlanRevisionToolRequest(plain)
 	return nil
 }
 
@@ -11187,6 +11347,58 @@ func (j *SandboxSecret) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = SandboxSecret(plain)
+	return nil
+}
+
+// The narvi_send_prompt MCP tool's own input (technical plan §43.21) -- the tool
+// bridge's twin of POST /api/sessions/{sessionID}/turns with planMode false.
+// Self-contained: it references no other $def. The bridge sends a
+// CreateTurnRequest whose prompt is prompt and whose planMode is false, never
+// these arguments themselves; it offers no planMode (narvi_request_plan_revision
+// is the plan-mode turn) and no attachments. The answer is CreateTurnResponse: 201
+// for the turn it queued. While any turn of the session is pending, dispatched or
+// processing, the twin refuses it with 409 and queues nothing. While a plan awaits
+// approval, the twin refuses it with 409 too, unless it reads the prompt as a
+// change to that plan, which it then queues as a revision.
+type SendPromptToolRequest struct {
+	// The reasoning effort of the turn, one of that model's variants in
+	// narvi_list_models. Omitted means the default.
+	Effort *string `json:"effort,omitempty,omitzero" yaml:"effort,omitempty" mapstructure:"effort,omitempty"`
+
+	// The model of the turn, an id narvi_list_models lists. Omitted means the
+	// deployment's default.
+	ModelId *string `json:"modelId,omitempty,omitzero" yaml:"modelId,omitempty" mapstructure:"modelId,omitempty"`
+
+	// The prompt. The turn continues the session's own conversation.
+	Prompt string `json:"prompt" yaml:"prompt" mapstructure:"prompt"`
+
+	// The session id, matching Session.id's own format exactly. A malformed value
+	// fails argument validation before the twin is invoked, reported as a tool
+	// execution error (isError:true).
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SendPromptToolRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["prompt"]; raw != nil && !ok {
+		return fmt.Errorf("field prompt in SendPromptToolRequest: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in SendPromptToolRequest: required")
+	}
+	type Plain SendPromptToolRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if utf8.RuneCountInString(string(plain.Prompt)) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "prompt", 1)
+	}
+	*j = SendPromptToolRequest(plain)
 	return nil
 }
 

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -54,11 +55,14 @@ func listToolNames(t *testing.T, handler http.Handler) []string {
 // the read tools only for mcp:read, and every tool for mcp:write (which
 // implies mcp:read). Row 182's status, wait, result and transcript tools are
 // mcp:read like the rest: a grant without it is told none of them exists
-// (technical plan §43.20); narvi_create_session is mcp:write, so a
-// read-only grant is told it does not exist (§43.17).
+// (technical plan §43.20), and so is row 183's narvi_list_plans; the five
+// writes -- narvi_create_session and the plan and turn tools -- are
+// mcp:write, so a read-only grant is told none of them exists (§43.17).
+// tools/list names tools in alphabetical order.
 func TestToolsList_ScopeFilter_Table(t *testing.T) {
-	reads := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_sessions", "narvi_wait_for_session"}
-	all := append([]string{"narvi_create_session"}, reads...)
+	reads := []string{"narvi_get_session", "narvi_get_session_result", "narvi_get_session_status", "narvi_get_session_transcript", "narvi_list_models", "narvi_list_plans", "narvi_list_sessions", "narvi_wait_for_session"}
+	writes := []string{"narvi_approve_plan", "narvi_create_session", "narvi_reject_plan", "narvi_request_plan_revision", "narvi_send_prompt"}
+	all := slices.Sorted(slices.Values(append(slices.Clone(writes), reads...)))
 	tests := []struct {
 		name   string
 		scopes *[]string
@@ -108,7 +112,9 @@ func discoverInstructions(t *testing.T, grant *[]string) string {
 // description of the deployment too, so it names exactly the visible
 // tools -- none for a scope-less or missing grant, the reads alone for a
 // read-only grant -- and it calls the tools read-only exactly when no write
-// tool is visible: never beside narvi_create_session.
+// tool is visible: never beside a write. With the writes visible it says,
+// once, which of them are refused while a turn is queued or running, and
+// that nothing is queued (technical plan §43.21).
 func TestInstructions_NameOnlyVisibleTools(t *testing.T) {
 	for name, grant := range map[string]*[]string{"scope-less": scopes(), "no grant": nil, "unknown scope": scopes("mcp:admin")} {
 		if got := discoverInstructions(t, grant); strings.Contains(got, "narvi_") {
@@ -132,7 +138,14 @@ func TestInstructions_NameOnlyVisibleTools(t *testing.T) {
 		t.Errorf("full grant: instructions %q call the tools read-only beside narvi_create_session", full)
 	}
 	if !strings.Contains(full, "can run code in their repositories and spend on models: narvi_create_session") {
-		t.Errorf("full grant: instructions %q do not say what the write tool can do", full)
+		t.Errorf("full grant: instructions %q do not say what the write tools can do", full)
+	}
+	const gated = "narvi_approve_plan, narvi_request_plan_revision, and narvi_send_prompt are refused while a turn of the session is queued or running, and nothing is queued: wait until the session settles, then call again."
+	if !strings.HasSuffix(full, " "+gated) {
+		t.Errorf("full grant: instructions %q do not end by naming the tools refused while a turn is open", full)
+	}
+	if strings.Contains(readOnly, "refused while a turn") {
+		t.Errorf("read-only grant: instructions %q mention a refusal no visible tool has", readOnly)
 	}
 }
 
@@ -159,33 +172,63 @@ func TestInstructionsFor_Composition(t *testing.T) {
 	if three != want {
 		t.Errorf("instructionsFor(three) =\n %q\nwant\n %q", three, want)
 	}
-	reads := specs[:7]
+	reads := specs[:8]
 	for _, spec := range reads {
 		if spec.Scope != mcpscope.Read {
-			t.Fatalf("specs[:7] holds %s, which is not a read -- this test assumes the reads come first", spec.Name)
+			t.Fatalf("specs[:8] holds %s, which is not a read -- this test assumes the reads come first", spec.Name)
 		}
 	}
+	instructions := func(specs []toolSpec) []string {
+		out := make([]string, len(specs))
+		for i, spec := range specs {
+			out[i] = spec.Instruction
+		}
+		return out
+	}
 	allReads := instructionsFor(reads)
-	want = "This server exposes seven READ-ONLY tools over this deployment's session data: " +
-		specs[0].Instruction + ", " + specs[1].Instruction + ", " + specs[2].Instruction + ", " + specs[3].Instruction + ", " + specs[4].Instruction + ", " + specs[5].Instruction + ", and " + specs[6].Instruction + ". None of these tools writes anything."
+	want = "This server exposes eight READ-ONLY tools over this deployment's session data: " +
+		strings.Join(instructions(reads[:7]), ", ") + ", and " + reads[7].Instruction + ". None of these tools writes anything."
 	if allReads != want {
 		t.Errorf("instructionsFor(the reads) =\n %q\nwant\n %q", allReads, want)
 	}
 
-	// With the write tool visible, the paragraph names the reads and the
-	// write apart and never says read-only.
+	// With the writes visible, the paragraph names the reads and the writes
+	// apart, never says read-only, and ends by naming the writes refused
+	// while a turn is open.
+	writes := specs[8:]
+	if len(writes) != 5 {
+		t.Fatalf("specs[8:] holds %d tools, want the five writes", len(writes))
+	}
 	all := instructionsFor(specs)
-	want = "This server exposes eight tools over this deployment's session data. Seven only read and change nothing: " +
-		specs[0].Instruction + ", " + specs[1].Instruction + ", " + specs[2].Instruction + ", " + specs[3].Instruction + ", " + specs[4].Instruction + ", " + specs[5].Instruction + ", and " + specs[6].Instruction +
-		". One acts as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " + specs[7].Instruction + "."
+	want = "This server exposes thirteen tools over this deployment's session data. Eight only read and change nothing: " +
+		strings.Join(instructions(reads[:7]), ", ") + ", and " + reads[7].Instruction +
+		". Five act as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " +
+		strings.Join(instructions(writes[:4]), ", ") + ", and " + writes[4].Instruction +
+		". narvi_approve_plan, narvi_request_plan_revision, and narvi_send_prompt are refused while a turn of the session is queued or running, and nothing is queued: wait until the session settles, then call again."
 	if all != want {
 		t.Errorf("instructionsFor(all) =\n %q\nwant\n %q", all, want)
 	}
-	oneEach := instructionsFor([]toolSpec{specs[0], specs[7]})
+	create := specs[8]
+	if create.Name != "narvi_create_session" {
+		t.Fatalf("specs[8] is %s, want narvi_create_session", create.Name)
+	}
+	oneEach := instructionsFor([]toolSpec{specs[0], create})
 	want = "This server exposes two tools over this deployment's session data. One only reads and changes nothing: " + specs[0].Instruction +
-		". One acts as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " + specs[7].Instruction + "."
+		". One acts as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " + create.Instruction + "."
 	if oneEach != want {
 		t.Errorf("instructionsFor(one read, one write) =\n %q\nwant\n %q", oneEach, want)
+	}
+	var approve toolSpec
+	for _, spec := range writes {
+		if spec.Name == "narvi_approve_plan" {
+			approve = spec
+		}
+	}
+	oneGated := instructionsFor([]toolSpec{create, approve})
+	want = "This server exposes two tools over this deployment's session data. Two act as the user who approved this client, within what that user's own role allows, and can run code in their repositories and spend on models: " +
+		create.Instruction + " and " + approve.Instruction + ". narvi_approve_plan is refused while a turn of the session is queued or running, and nothing is queued: wait until the session settles, then call again."
+	if oneGated != want {
+		t.Errorf("instructionsFor(the create and approve) =\n %q\nwant\n %q", oneGated, want)
 	}
 }
 

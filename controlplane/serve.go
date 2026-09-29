@@ -2792,8 +2792,9 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// uses (§43.2) -- it reads token, grant, client and user in one lookup
 	// on every call, with no cache, and attaches the grant whose scopes
 	// decide which tools the request can see (§43.16/§43.17). Twins are the
-	// SAME httpapi handlers /api/models, /api/sessions[/{sessionID}] and
-	// /api/sessions/{sessionID}/{status,result,events} above already
+	// SAME httpapi handlers /api/models, /api/sessions[/{sessionID}],
+	// /api/sessions/{sessionID}/{status,result,events,plans,turns} and
+	// /api/sessions/{sessionID}/plans/{planId}/{approve,reject} above already
 	// register --
 	// the bridge invokes them in-process, never a second implementation
 	// (§43.7; mcp/bridge.go's own doc comment).
@@ -2802,7 +2803,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		return nil, fmt.Errorf("build mcp origin gate: %w", err)
 	}
 	//
-	// narvi_create_session (§43.8) is the one write tool: its twin is the
+	// narvi_create_session (§43.8) is the first write tool: its twin is the
 	// very POST /api/sessions constructor call above, with the same stores,
 	// registry, intent classifier, rollout mode and entitlement store, so an
 	// MCP create passes exactly the gates a browser's does -- the handler
@@ -2811,6 +2812,13 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// is braked per grant too (CreateBrake: MCPCreateSessionRateBurst, then
 	// one per MCPCreateSessionRateInterval), inside the adapter, after the
 	// arguments validate and before the twin runs.
+	//
+	// The plan and turn tools (§43.21) are the same constructor calls as
+	// GET .../plans, POST .../plans/{planId}/approve|reject and POST
+	// .../turns above, argument for argument: an approval over MCP runs the
+	// same role and own/joined rule, open-turn gate, guarded update,
+	// snapshot, audit row and notices, and a prompt or revision the same
+	// RejectIfOpen policy, as the browser's.
 	mcpHandler, err := mcpadapter.NewHandler(mcpadapter.Config{
 		PublicBaseURL: cfg.PublicBaseURL,
 		CreateBrake:   mcpauth.NewRateLimiter(cfg.Timeouts.MCPCreateSessionRateInterval, cfg.Timeouts.MCPCreateSessionRateBurst),
@@ -2822,6 +2830,10 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		ListEvents:       httpapi.ListEvents(sessionStore, eventStore),
 		GetSessionResult: httpapi.GetSessionResult(sessionResultDeps),
 		CreateSession:    httpapi.CreateSession(pool, sessionStore, turnStore, environmentStore, auditLogStore, registry, intentClassifierSvc, cfg.EpistemicCheckDefault, cfg.RolloutMode, repoSettingsStore, githubPRSessionStore),
+		ListPlans:        httpapi.ListPlans(sessionStore, planStore, turnStore, eventStore, planDocumentStore),
+		ApprovePlan:      httpapi.ApprovePlan(pool, sessionStore, turnStore, planStore, eventStore, planDocumentStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, registry, cfg.EpistemicCheckDefault),
+		RejectPlan:       httpapi.RejectPlan(pool, sessionStore, turnStore, planStore, eventStore, planDocumentStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, cfg.EpistemicCheckDefault),
+		CreateTurn:       httpapi.CreateTurn(pool, sessionStore, turnStore, planStore, participantStore, auditLogStore, registry, intentClassifierSvc, cfg.ObjectStorage, cfg.EpistemicCheckDefault),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("build mcp handler: %w", err)
