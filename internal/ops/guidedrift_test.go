@@ -457,12 +457,13 @@ func TestNoGuideDrift(t *testing.T) {
 	}
 }
 
-// TestGuidesCoverAllFourSurfaces is a cheap companion check, same
+// TestGuidesCoverAllFiveSurfaces is a cheap companion check, same
 // rationale as TestAlertRunbooksExist (drift_test.go): §10-P6 names the
-// guide as covering "web/Slack/Linear/GitHub" explicitly — a missing
+// guide as covering "web/Slack/Linear/GitHub" explicitly, and mcp became a
+// session source with an app surface of its own (§43.1) — a missing
 // surface is a smaller version of the same "looks complete but isn't"
 // hazard.
-func TestGuidesCoverAllFourSurfaces(t *testing.T) {
+func TestGuidesCoverAllFiveSurfaces(t *testing.T) {
 	root := repoRoot(t)
 	guides, err := LoadGuides(filepath.Join(root, "docs", "guides"))
 	if err != nil {
@@ -472,7 +473,7 @@ func TestGuidesCoverAllFourSurfaces(t *testing.T) {
 	for _, g := range guides {
 		got[g.Surface] = true
 	}
-	for _, want := range []string{"web", "slack", "linear", "github"} {
+	for _, want := range []string{"web", "slack", "linear", "github", "mcp"} {
 		if !got[want] {
 			t.Errorf("no guide found for surface %q", want)
 		}

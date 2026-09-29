@@ -1,7 +1,7 @@
 # Per-surface user guides
 
 One file per ingress surface — [web](web.md), [Slack](slack.md),
-[Linear](linear.md), [GitHub](github.md) — each documenting what that
+[Linear](linear.md), [GitHub](github.md), [MCP](mcp.md) — each documenting what that
 surface **accepts**, and, just as importantly, its **honest negatives**:
 what it silently ignores, what it refuses, and what it does not support at
 all. Shipped behavior only. §10-P6's own framing is the reason this
@@ -409,6 +409,7 @@ work, not afterwards:
 | The review's own result surface and human acceptance of a verdict | `github.md` for the check and the review, `web.md` for acceptance |
 | Snapshot restore and what a restored sandbox carries | `web.md` |
 | Upload and capture limits, and anything reclaiming quota | `web.md` |
+| An MCP app's tools, and connecting one | `mcp.md` — the surface `spawnSource: "mcp"` names, with the connection procedure moved there from `web.md` |
 | An external client connection, if one is ever adopted | a new guide file — this one is a connection procedure, not a surface's command set |
 
 The last row is deliberately conditional: `docs/DECISIONS.md` holds that
