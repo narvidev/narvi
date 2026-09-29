@@ -7129,8 +7129,16 @@ prompt-while-running, stop, and delegate (create session). Repository discovery 
 is deliberately absent from 180 too: this codebase has no `GET /api/repos` route for it to sit over,
 and the one-adapter rule (§43.7) means a tool ships only once its HTTP twin exists. A session a client
 creates over MCP (row 183) records `spawn_source = mcp` (decided 2026-09-28), set by the server from the
-authenticated principal and never read from the request, since the REST create path refuses a
-caller-supplied source other than `web`.
+MCP grant the /mcp authentication attaches to the request context (`platform.MCPGrantFromContext`, set
+only by `auth.RequireMCPBearer`), never read from the request and never derived from the principal's
+credential type: a future native-client bearer (Step 158) attaches a user but no grant, so its sessions
+record `web`. The REST create path keeps refusing a caller-supplied source other than `web`. The value
+exists before anything writes it: migration `000149_session_spawn_source_mcp` adds it to
+`session_spawn_source`, contracts 1.10.0 list it in `Session.spawnSource`, and the notification routers
+treat it like `web` (no external channel, nothing enqueued, nothing logged). The migration is
+irreversible once used — Postgres has no `DROP VALUE`, so its down migration recreates the type and
+refuses while any session records `mcp` — and it is deployed everywhere before the change that writes
+the value, or an older replica logs an unrecognised-source WARN and skips that session's notification.
 
 ### 43.2 Authentication: a bearer token from this deployment's own authorization server
 
@@ -7345,11 +7353,19 @@ covers the validation layer this Step provides instead, once, in one place). Bec
 are new in this same Step, stating the real constraints from the start costs nothing in wire-contract
 compatibility terms (a later PR adding `enum`/`minimum` to an ALREADY-published client-to-platform
 `*Request` shape would be a MAJOR change; declaring it here, before anything has shipped, is not).
-Tool OUTPUT shapes are NOT new `$def`s: they reuse the existing REST response shapes unchanged, bundled
-with their own transitively-referenced `$def`s into one self-contained document at boot, with a root
-`"type":"object"` added alongside `$ref` — no hand-written output shape anywhere, matching the
-wire-contracts document's own long-standing rule, and satisfying the legacy MCP protocol revisions this
-server also speaks, which restrict `Tool.outputSchema` to `type:"object"` at the root.
+Tool OUTPUT shapes are NOT new `$def`s: they reuse the existing REST response shapes unchanged, except
+that open enums are published open, bundled with their own transitively-referenced `$def`s into one
+self-contained document at boot, with a root `"type":"object"` added alongside `$ref` — no hand-written
+output shape anywhere, matching the wire-contracts document's own long-standing rule, and satisfying the
+legacy MCP protocol revisions this server also speaks, which restrict `Tool.outputSchema` to
+`type:"object"` at the root. An open enum is a node the contracts manifest lists under `openEnums`, read
+from the embedded manifest itself, never a copy; in an output schema it keeps its `type` and
+`description`, loses `enum`, and carries the values it listed as `examples`. The MCP specification asks
+clients to validate structured results against the output schema, so a closed list would make a validating
+client fail a whole call on a value added after the list was written: during a rolling deploy, after a
+rollback (a value added to a Postgres enum cannot be removed), or against a stale `tools/list`. An
+`openEnums` entry that does not lead to an enum node is refused, never skipped: the output schemas fail to
+build. Input schemas keep every enum closed: the server validates what it accepts.
 
 ### 43.11 Feature flag
 

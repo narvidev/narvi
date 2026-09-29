@@ -2209,7 +2209,11 @@ type CreateSessionRequest struct {
 	// contracts.
 	Repos []CreateSessionRequestReposElem `json:"repos" yaml:"repos" mapstructure:"repos"`
 
-	// Matches Postgres session_spawn_source exactly.
+	// A closed subset of Postgres session_spawn_source: the sources an ingress
+	// surface passes in this shape. POST /api/sessions accepts only 'web' and refuses
+	// any other value with 400. 'mcp' is never accepted here: the server sets it for
+	// a session created over MCP, never from a request. Session.spawnSource, an open
+	// enum, lists every value a session can carry.
 	SpawnSource CreateSessionRequestSpawnSource `json:"spawnSource" yaml:"spawnSource" mapstructure:"spawnSource"`
 
 	// Title corresponds to the JSON schema field "title".
@@ -11115,7 +11119,8 @@ type Session struct {
 	// verbatim), never from a second, potentially-stale read of this column.
 	SandboxStatus *SessionSandboxStatus `json:"sandboxStatus" yaml:"sandboxStatus" mapstructure:"sandboxStatus"`
 
-	// Matches Postgres session_spawn_source exactly.
+	// Matches Postgres session_spawn_source exactly. An OPEN enum (manifest.json's
+	// openEnums): a consumer MUST tolerate a value it does not recognise.
 	SpawnSource SessionSpawnSource `json:"spawnSource" yaml:"spawnSource" mapstructure:"spawnSource"`
 
 	// Matches Postgres session_status exactly: derived each time a turn reaches a
@@ -12895,6 +12900,7 @@ type SessionSpawnSource string
 
 const SessionSpawnSourceGithub SessionSpawnSource = "github"
 const SessionSpawnSourceLinear SessionSpawnSource = "linear"
+const SessionSpawnSourceMcp SessionSpawnSource = "mcp"
 const SessionSpawnSourceSlack SessionSpawnSource = "slack"
 const SessionSpawnSourceWeb SessionSpawnSource = "web"
 
@@ -12903,6 +12909,7 @@ var enumValues_SessionSpawnSource = []interface{}{
 	"slack",
 	"linear",
 	"github",
+	"mcp",
 }
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -15354,16 +15361,10 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
-
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
 // exists before any turn does.
 type WorkflowStepRunTurnId *string
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
-type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
@@ -15421,3 +15422,9 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRun(plain)
 	return nil
 }
+
+type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
+
+type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict

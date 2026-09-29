@@ -1,5 +1,5 @@
 {
-  "version": "1.9.1",
+  "version": "1.10.0",
   "surfaces": [
     {
       "path": "rest/v1/dtos.schema.json",
@@ -44,6 +44,7 @@
     "rest/v1/dtos.schema.json#/$defs/PendingLinkPrompt/properties/provider",
     "rest/v1/dtos.schema.json#/$defs/MCPAuthorization/properties/clientKind",
     "rest/v1/dtos.schema.json#/$defs/MCPClient/properties/kind",
-    "rest/v1/dtos.schema.json#/$defs/SessionOutcomeExcludedPullRequest/properties/kind"
+    "rest/v1/dtos.schema.json#/$defs/SessionOutcomeExcludedPullRequest/properties/kind",
+    "rest/v1/dtos.schema.json#/$defs/Session/properties/spawnSource"
   ]
 }

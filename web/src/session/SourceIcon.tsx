@@ -1,9 +1,22 @@
 // SourceIcon.tsx -- decision 31 ("The source stays attached to the
-// session"): the four spawn-source glyphs, copied verbatim (path data
+// session"): the spawn-source glyphs. Four are copied verbatim (path data
 // unchanged) from docs/design/mockups.html's own .srcicon examples in the
 // Session view (web/slack/linear/github, lines ~664-690 at the time this
 // was extracted) -- never redrawn independently of the visual spec.
+//
+// The mockups predate the 'mcp' source (technical plan §43.1), so its
+// glyph, a plug, is drawn here in the mockups' own vocabulary: an 11px
+// outline on a 14-unit viewBox, currentColor, 1.1 strokes, no fill.
+//
+// Session.spawnSource is an OPEN enum (contracts/manifest.json's
+// openEnums), so a source this bundle does not know gets a neutral glyph
+// and a neutral tooltip (sourceLabel.ts) rather than an empty, untitled
+// slot. That neutral glyph is not in the mockups either.
+import type { ComponentType } from 'react'
+
 import type { Session } from '@narvi/contracts/rest-dtos'
+
+import { isKnownSpawnSource, sourceTitle } from './sourceLabel'
 
 function WebGlobeIcon() {
   return (
@@ -48,21 +61,39 @@ function GithubOctocatIcon() {
   )
 }
 
-const SOURCE_LABELS: Record<Session['spawnSource'], string> = {
-  web: 'Started from the web app',
-  slack: 'Started from Slack',
-  linear: 'Started from Linear',
-  github: 'Started from GitHub',
+/** McpPlugIcon is the 'mcp' source's glyph: a plug (two prongs, a rounded body, a cord), for a session an MCP client started. */
+function McpPlugIcon() {
+  return (
+    <svg width="11" height="11" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+      <path d="M5.2 1.6v2.6M8.8 1.6v2.6M7 9.6v2.8" stroke="currentColor" strokeWidth="1.1" strokeLinecap="round" />
+      <path d="M3.4 4.2h7.2v1.8a3.6 3.6 0 0 1-7.2 0V4.2Z" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" />
+    </svg>
+  )
+}
+
+/** OtherSourceIcon is the neutral glyph for a source this bundle does not know: a dashed ring, claiming no product. */
+function OtherSourceIcon() {
+  return (
+    <svg width="11" height="11" viewBox="0 0 14 14" fill="none" aria-hidden="true">
+      <circle cx="7" cy="7" r="5" stroke="currentColor" strokeWidth="1.1" strokeDasharray="2 1.6" />
+    </svg>
+  )
+}
+
+const SOURCE_GLYPHS: Record<Session['spawnSource'], ComponentType> = {
+  web: WebGlobeIcon,
+  slack: SlackBubbleIcon,
+  linear: LinearRectIcon,
+  github: GithubOctocatIcon,
+  mcp: McpPlugIcon,
 }
 
 /** SourceIcon renders the right glyph + an honest title tooltip for a session's spawnSource (decision 31) -- the ONE place this mapping is made, so the sidebar and the session header can never disagree on what icon a given source gets. */
-export function SourceIcon({ source }: { source: Session['spawnSource'] }) {
+export function SourceIcon({ source }: { source: Session['spawnSource'] | string }) {
+  const Glyph = isKnownSpawnSource(source) ? SOURCE_GLYPHS[source] : OtherSourceIcon
   return (
-    <span className="srcicon" title={SOURCE_LABELS[source]}>
-      {source === 'web' && <WebGlobeIcon />}
-      {source === 'slack' && <SlackBubbleIcon />}
-      {source === 'linear' && <LinearRectIcon />}
-      {source === 'github' && <GithubOctocatIcon />}
+    <span className="srcicon" title={sourceTitle(source)}>
+      <Glyph />
     </span>
   )
 }
