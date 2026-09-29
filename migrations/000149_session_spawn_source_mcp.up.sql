@@ -14,10 +14,28 @@
 --
 -- IRREVERSIBLE once used: Postgres has no ALTER TYPE ... DROP VALUE. The
 -- down migration recreates the type without 'mcp', and refuses while any
--- sessions row holds it. Rolling the binary back is always safe (every
--- binary since contracts 1.9.2 tolerates a spawn_source it does not
--- recognise); rolling the schema back is possible only before the first
--- 'mcp' session exists.
+-- sessions row holds it.
+--
+-- ROLLING BACK. Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for. So once this migration is applied:
+--   - An older pod that is already running keeps working: every binary
+--     since contracts 1.9.2 tolerates a spawn_source it does not
+--     recognise.
+--   - An older pod that restarts after this migration is applied does not
+--     boot ("no migration found for version 149"). That covers a rollback
+--     and an old pod restarting in the middle of a rolling deploy.
+--   - Rolling the binary back is safe only to a binary that carries
+--     000149.
+--   - Rolling back further first needs the down migration, which works
+--     only before the first 'mcp' session exists. The control plane only
+--     ever migrates up, so run it with the golang-migrate CLI and this
+--     release's migrations (goto 148), with the control plane scaled to
+--     zero, then deploy the older binary. The down file says why not
+--     against live pods.
+--   - Forcing the version to 148 instead is not a rollback: the value
+--     stays, and the next boot of a binary that carries 000149 fails on
+--     this ADD VALUE and leaves version 149 dirty.
 --
 -- DEPLOY ORDER: this migration and the binary that understands 'mcp' ship
 -- everywhere BEFORE any code that writes the value. An older replica
