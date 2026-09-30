@@ -16,10 +16,11 @@ const (
 	// refused turn's own reason, providercredential.RefusalPersonalLinkOnly.
 	NotAssessedPersonalLinkOnly = NotAssessedReason(providercredential.RefusalPersonalLinkOnly)
 
-	// NotAssessedRolloutNotEnrolled means the review's sandbox could not be
-	// started because the pull request's repository is not enrolled in
-	// this deployment's cohort rollout (technical plan §32.4): the spawn
-	// was refused and the attempt ended before it ran.
+	// NotAssessedRolloutNotEnrolled means the review was not run because
+	// the pull request's repository is not enrolled in this deployment's
+	// cohort rollout (technical plan §32.4): its sandbox was not started,
+	// or its prompt not sent to a live one, and the attempt ended before
+	// it ran.
 	NotAssessedRolloutNotEnrolled NotAssessedReason = "rollout_not_enrolled"
 
 	// NotAssessedSubstrateUnsupported means the review's sandbox could not
@@ -28,6 +29,11 @@ const (
 	// egress (technical plan §27.5): the spawn was refused and the attempt
 	// ended before it ran.
 	NotAssessedSubstrateUnsupported NotAssessedReason = "substrate_unsupported"
+
+	// NotAssessedPromptNotDelivered means the review's prompt could not be
+	// delivered to its sandbox -- the send failed, or no live connection
+	// was there to take it -- so the attempt ended before the review ran.
+	NotAssessedPromptNotDelivered NotAssessedReason = "prompt_not_delivered"
 )
 
 // notAssessedExplanations is the sentence each named reason adds to a
@@ -37,11 +43,13 @@ var notAssessedExplanations = map[NotAssessedReason]string{
 	NotAssessedPersonalLinkOnly: "Its model is available here only through a person's own provider link, " +
 		"and a pull request's review never runs on one. An admin can add a deployment credential " +
 		"for the model's provider, or the review can use another model.",
-	NotAssessedRolloutNotEnrolled: "Its repository is not enrolled in this deployment's rollout, so no sandbox " +
-		"could be started for it. An admin can enroll the repository, then request the review again.",
+	NotAssessedRolloutNotEnrolled: "Its repository is not enrolled in this deployment's rollout, so the review " +
+		"was not run. An admin can enroll the repository, then request the review again.",
 	NotAssessedSubstrateUnsupported: "The deployment's sandbox provider cannot give this session's environment " +
 		"what it requires (Docker, or enforced egress), so no sandbox could be started for it. An admin can " +
 		"change the provider or the environment, then request the review again.",
+	NotAssessedPromptNotDelivered: "Its prompt could not be delivered to the review's sandbox, so the review " +
+		"did not run. Requesting the review again sends it anew.",
 }
 
 // ComputeOutputWithReason is ComputeOutput, with a not-assessed check's

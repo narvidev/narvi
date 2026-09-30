@@ -1332,12 +1332,13 @@ func (r *spawnRefusal) Error() string { return "sessionactor: spawn refused: " +
 // the edge failDispatchedTurn uses when the turn-dispatch-time refusal
 // ends a turn already processing (executeDispatch). Each gets the
 // synthetic execution_complete that refusal writes, with the same reason
-// text, and the notice every other path that ends a turn enqueues
-// (enqueueOutboxNotification, as refusePersonalLinkOnly calls it): the
-// Slack or Linear "Turn failed" message, and for a review attempt the
-// check closed as not assessed with the refusal named -- the notice
-// turn_deadline used to send for a turn in flight before this deleted
-// that timer. One session warning (the banner) names the refusal and what
+// text, and the channel notice (enqueueOutboxNotification, as
+// refusePersonalLinkOnly calls it) that each path ending a turn enqueues
+// -- completeProcessingTurn, handleTurnDeadlineTimer, cancelStoppedTurns,
+// refusePersonalLinkOnly, failDispatchedTurn: the Slack or Linear "Turn
+// failed" message, and for a review attempt the check closed as not
+// assessed with the refusal named -- the notice turn_deadline used to
+// send for a turn in flight before this deleted that timer. One session warning (the banner) names the refusal and what
 // an admin can do, and the session's status is re-derived. The workflow
 // hook is OnTurnRefused, never OnTurnCompleted: a refusal read as a
 // blocked outcome could follow a blocked edge and queue the same refused
@@ -2194,7 +2195,13 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan) error {
 		if !transient {
 			a.recordRolloutRefusal(ctx, string(plan.sessionRow.SpawnSource))
 		}
-		return a.failDispatchedTurn(ctx, plan.turnID, fmt.Sprintf("repo %q not enrolled in cohort rollout", repo))
+		return a.failDispatchedTurn(ctx, plan.turnID, dispatchFailure{
+			reason: fmt.Sprintf("repo %q not enrolled in cohort rollout", repo),
+			warning: fmt.Sprintf("This session's turn was ended: its repository %q is not enrolled in this deployment's rollout, so the turn was not sent to its sandbox. "+
+				"An admin can enroll the repository; then send the turn again.", repo),
+			notAssessed: reviewcheck.NotAssessedRolloutNotEnrolled,
+			refused:     true,
+		})
 	}
 
 	if err := a.commander.SendCommand(a.sessionID.String(), plan.payload); err != nil {
@@ -2203,7 +2210,10 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan) error {
 		// identically.
 		a.logger.Error("sessionactor: dispatch turn: send prompt command failed; failing turn",
 			"turn_id", plan.turnID.String(), "error", err)
-		return a.failDispatchedTurn(ctx, plan.turnID, fmt.Sprintf("failed to deliver prompt to sandbox: %v", err))
+		return a.failDispatchedTurn(ctx, plan.turnID, dispatchFailure{
+			reason:      fmt.Sprintf("failed to deliver prompt to sandbox: %v", err),
+			notAssessed: reviewcheck.NotAssessedPromptNotDelivered,
+		})
 	}
 	return nil
 }
@@ -2271,10 +2281,12 @@ func (a *Actor) rolloutRefusalForDispatch(ctx context.Context, sessionRow sqlcge
 // terminal path for both, not two parallel ones: from the turn's own
 // perspective, "the actor decided this prompt will never reach a
 // sandbox" is one event, regardless of whether the proximate cause was a
-// transport failure or a policy refusal. reason is the caller's own
-// honest, human-readable account of WHICH -- carried verbatim into the
+// transport failure or a policy refusal. failure is the caller's own
+// honest account of WHICH: its reason text is carried verbatim into the
 // synthetic execution_complete event's own "reason" field (never
-// re-derived or classified further here).
+// re-derived or classified further here), its notAssessed onto a review
+// attempt's check, and a refusal alone adds a warning and reaches the
+// workflow engine as a refusal (below).
 //
 // This reuses the EXACT SAME domain/turn call and "append a synthetic
 // execution_complete event" logic handleTurnDeadlineTimer (timerfired.go)
@@ -2302,7 +2314,20 @@ func (a *Actor) rolloutRefusalForDispatch(ctx context.Context, sessionRow sqlcge
 // classification (§3.3), never meant to distinguish every possible cause
 // within "the control plane gave up on this turn before a real terminal
 // event could ever arrive".
-func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, reason string) error {
+//
+// Like every other path that ends a turn, it tells the turn's channel in
+// the same transaction (enqueueOutboxNotification): the Slack or Linear
+// "Turn failed (timeout)." notice, and for a review attempt -- whose
+// check tryPlanDispatch has already published as running -- the check
+// closed as not assessed, naming failure.notAssessed. It deletes
+// turn_deadline, the only other thing that would have sent that notice.
+// A rollout refusal also records a session warning naming the repository
+// and the remedy, as the spawn-time refusal does, and reaches the workflow
+// engine through OnTurnRefused rather than OnTurnCompleted: read as a
+// blocked outcome, the refusal could follow a blocked self edge and queue
+// the same step again, whose dispatch timer would bring it straight back
+// to this refusal.
+func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, failure dispatchFailure) error {
 	return a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		turns, err := a.stores.turn.WithTx(tx).ListForSession(ctx, a.sessionID)
 		if err != nil {
@@ -2348,7 +2373,7 @@ func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, reas
 		if err != nil {
 			return fmt.Errorf("sessionactor: get session: %w", err)
 		}
-		workflowengine.OnTurnCompleted(ctx, workflowengine.Deps{
+		deps := workflowengine.Deps{
 			Workflows:             a.stores.workflow.WithTx(tx),
 			Turns:                 a.stores.turn.WithTx(tx),
 			SlackThreadSessions:   a.stores.slackThreadSession.WithTx(tx),
@@ -2356,24 +2381,56 @@ func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, reas
 			GitHubPRSessions:      a.stores.githubPRSession.WithTx(tx),
 			Outbox:                a.stores.outbox.WithTx(tx),
 			EpistemicCheckDefault: a.epistemicCheckDefault,
-		}, sessionRow, turnID, turn.TriggerTimeout)
+		}
+		if failure.refused {
+			workflowengine.OnTurnRefused(ctx, deps, sessionRow, turnID, failure.reason)
+		} else {
+			workflowengine.OnTurnCompleted(ctx, deps, sessionRow, turnID, turn.TriggerTimeout)
+		}
 
 		if turn.RequiresSyntheticExecutionComplete(turn.TriggerTimeout) {
 			if err := a.appendEvent(ctx, tx, "execution_complete", map[string]any{
 				"turn_id":   turnID.String(),
 				"synthetic": true,
-				"reason":    reason,
+				"reason":    failure.reason,
 			}); err != nil {
 				return err
 			}
 		}
 
 		failureReason, _ := turn.DeriveFailureReason(turn.StateProcessing, turn.TriggerTimeout)
+		if err := a.enqueueOutboxNotification(ctx, tx, sessionRow, turn.TriggerTimeout, failureReason, target, nil, failure.notAssessed); err != nil {
+			return err
+		}
+		if failure.warning != "" {
+			gen := 0
+			if target.DispatchedSandboxGen != nil {
+				gen = int(*target.DispatchedSandboxGen)
+			}
+			if err := a.recordSessionWarning(ctx, tx, gen, failure.warning); err != nil {
+				return err
+			}
+		}
 		if err := a.persistDerivedSessionStatus(ctx, tx, summariesWithOverride(turns, turnID, to, failureReason)); err != nil {
 			return err
 		}
 		return a.deleteTimer(ctx, tx, TimerTurnDeadline)
 	})
+}
+
+// dispatchFailure is why executeDispatch ends a turn it committed
+// processing (failDispatchedTurn).
+type dispatchFailure struct {
+	// reason is the synthetic execution_complete's reason text.
+	reason string
+	// notAssessed names the cause on a review attempt's check.
+	notAssessed reviewcheck.NotAssessedReason
+	// warning, when set, is recorded as a session warning (the banner).
+	warning string
+	// refused marks a policy refusal of a prompt that was never sent: the
+	// workflow engine hears it through OnTurnRefused, which escalates the
+	// run and queues nothing.
+	refused bool
 }
 
 // BuildPromptPayload marshals a real, schema-valid sandboxws.Prompt for

@@ -5789,7 +5789,14 @@ genuine `SendCommand` failure already uses (`failDispatchedTurn`, `turn.TriggerT
 reason string naming the rollout refusal rather than a transport error. A refused turn therefore
 reaches a real terminal state (`Failed`, a `never_started`-shaped completion, one synthetic
 `execution_complete` event) rather than sitting `Pending` to be silently re-attempted on every
-future `EnsureDispatched` round.
+future `EnsureDispatched` round. Like every path that ends a turn, `failDispatchedTurn` tells the
+turn's channel in the same transaction (`enqueueOutboxNotification`): the Slack or Linear failure
+notice, and a review attempt's check — published running at dispatch — closed as not assessed,
+naming `rollout_not_enrolled` (a prompt the commander could not deliver names
+`prompt_not_delivered`). The refusal also records a session warning naming the repository and the
+remedy, and reaches the workflow engine as a refusal (`OnTurnRefused`, which escalates the run and
+queues nothing): read as a blocked outcome, a step's blocked self edge would queue the same step
+again, and the session's dispatch timer (§2) would bring it straight back to the refusal.
 
 Both parts share the identical pure decision (`internal/domain/rollout.Decide`) and the same
 `repo_settings` resolution logic (`rolloutDecisionForSession`) — only the connection scope (the
