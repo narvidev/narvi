@@ -4,7 +4,7 @@
 // package's own unexported symbols to its external (slack_test)
 // integration test suite -- the standard Go "export_test.go" pattern.
 //
-// Needed for ONE test: textverdict_integration_test.go's own
+// Needed for two tests. The first is textverdict_integration_test.go's own
 // TestHandlePlanVerdict_UnauthorizedActor_DeniedByOwnAuthorizationCheck.
 // That test proves handlePlanVerdict's own authorizeSessionAction(...,
 // authz.ActionApprovePlan) call (this batch's own addition, "honour a
@@ -22,6 +22,16 @@
 // removal undetectable) from black-box tests alone. This bridges JUST
 // enough (handlePlanVerdict itself) to call it directly, bypassing the
 // outer gate entirely -- never a general-purpose test-only API surface.
+//
+// The second is requestchangesrefusal_integration_test.go's
+// TestRequestChangesRefusalText_KeysOnTheSentinel: which text the
+// Request-changes modal shows for a failed create must follow the
+// httpapi.ErrTurnAlreadyOpen sentinel, never the refusal's Message or
+// Status. A real CreateTurnCore only ever pairs that sentinel with one
+// message and one status, so no HTTP-level request can tell a check on the
+// type from a check on the text; the test feeds the real refusal, and
+// copies of it with the text or the type changed, to
+// requestChangesRefusalText directly.
 package slack
 
 import (
@@ -29,6 +39,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -43,4 +54,11 @@ import (
 func (deps Deps) HandlePlanVerdictForTest(ctx context.Context, channel, key string, sessionID, planID pgtype.UUID, verdict string, actorUserID pgtype.UUID) (ok, releaseMessageClaim bool) {
 	result := deps.handlePlanVerdict(ctx, platform.Logger(ctx), channel, key, sessionID, planID, verdict, actorUserID)
 	return result.OK, result.ReleaseMessageClaim
+}
+
+// RequestChangesRefusalTextForTest bridges requestChangesRefusalText
+// (interactive.go) -- see this file's own top doc comment. A pure
+// pass-through.
+func RequestChangesRefusalTextForTest(cerr *httpapi.CreateTurnError) string {
+	return requestChangesRefusalText(cerr)
 }

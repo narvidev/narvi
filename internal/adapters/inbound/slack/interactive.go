@@ -45,7 +45,10 @@
 //     turn (plan_mode=true) via httpapi.CreateTurnCore -- the EXACT SAME
 //     function POST .../turns itself calls, never a third, duplicated
 //     turn-creation call site. Responds with Slack's own required
-//     empty-body 200 (closes the modal).
+//     empty-body 200 (closes the modal) once the turn is created; a
+//     submission that creates nothing is answered with an inline modal
+//     error instead (writeViewSubmissionError), so the modal stays open
+//     with the feedback still in it.
 //   - anything else: logged and 200'd as a no-op -- a future Slack
 //     interaction type this handler doesn't yet understand must degrade
 //     gracefully, never crash or 500.
@@ -282,12 +285,13 @@ func NewInteractivityHandler(deps InteractiveDeps) http.HandlerFunc {
 			// §13.2/§13.3 update) now writes its OWN response: an ordinary
 			// empty-body 200 on success/no-op (Slack's own documented
 			// contract, closes the modal), or a real Slack
-			// "response_action": "errors" body when the resolved actor's
-			// own role fails domain/authz.Authorize -- this view_submission
-			// payload has no channel/thread to post an ordinary denial
-			// message into at all (see that function's own doc comment),
-			// so Slack's own inline-modal-error mechanism is this path's
-			// equivalent of the REST API's 403.
+			// "response_action": "errors" body when the submission is
+			// refused -- blank feedback, an authorization denial, a turn
+			// already open, or a failure of the check or of the create.
+			// This view_submission payload has no channel/thread to post
+			// an ordinary reply into at all (see that function's own doc
+			// comment), so Slack's own inline-modal-error mechanism is this
+			// path's equivalent of the REST API's 4xx/5xx.
 			deps.handleViewSubmission(ctx, w, logger, []byte(rawPayload))
 		default:
 			// A future Slack interaction type this handler doesn't yet
@@ -362,16 +366,26 @@ func (deps InteractiveDeps) handleBlockActions(ctx context.Context, logger *slog
 // already shows for a genuine backend error, so the actor sees the
 // identical honest message regardless of which call underneath actually
 // failed. slackRequestChangesErrorText is its handleViewSubmission
-// counterpart -- no equivalent generic-error text existed on that path
-// before this fix (a CreateTurnCore failure there was only ever logged,
-// silently closing the modal), so this is a new, honest addition rather
-// than a reuse.
+// counterpart, and is also what that function shows when CreateTurnCore
+// itself fails for any reason other than a turn already being open
+// (requestChangesRefusalText) -- that failure used to be only logged,
+// closing the modal as accepted with the feedback lost.
 const (
 	slackPlanForbiddenText        = "You don't have permission to approve or reject this plan."
 	slackPromptForbiddenErrorText = "You don't have permission to request changes on this plan."
 
 	slackDecisionErrorText       = "Something went wrong recording this decision. Please try again."
 	slackRequestChangesErrorText = "Something went wrong submitting this. Please try again."
+
+	// slackRequestChangesBusyErrorText is what the modal shows when
+	// CreateTurnCore refuses the revision because a turn of the session
+	// (typically the approved implementation) is still pending, dispatched
+	// or processing (httpapi.ErrTurnAlreadyOpen). Nothing is queued
+	// (technical plan §43.21(a)): the modal stays open with the feedback in
+	// it, so the person can submit it again once that turn ends -- the
+	// modal's counterpart of the busy reply a Slack thread reply or a
+	// Linear reply gets for the same condition (ackBusyText, handler.go).
+	slackRequestChangesBusyErrorText = "A turn is still running on this session, so this change wasn't submitted or queued. Submit it again once that turn ends."
 
 	// slackEmptyFeedbackErrorText is this batch's own audit-remediation fix
 	// (CONFIRMED MEDIUM finding, "the pre-existing 'Request changes' modal
@@ -720,6 +734,34 @@ type viewSubmissionErrorResponse struct {
 	Errors         map[string]string `json:"errors"`
 }
 
+// writeViewSubmissionError is the ONE builder of handleViewSubmission's
+// inline modal error: a 200 carrying viewSubmissionErrorResponse with text
+// keyed on the modal's single input block (slackapi.RequestChangesBlockID,
+// the block_id OpenView renders), so Slack keeps the modal open, the
+// feedback still in the field, and shows text under that field. Every
+// refusal of the submission -- blank feedback, an authorization denial or
+// its failure, a turn already open, a failed create -- answers through it.
+func writeViewSubmissionError(w http.ResponseWriter, text string) {
+	writeJSON(w, http.StatusOK, viewSubmissionErrorResponse{
+		ResponseAction: "errors",
+		Errors: map[string]string{
+			slackapi.RequestChangesBlockID: text,
+		},
+	})
+}
+
+// requestChangesRefusalText picks the modal text for a CreateTurnCore
+// failure: the busy text when the refusal is RejectIfOpen's open-turn 409,
+// recognized by its sentinel (httpapi.ErrTurnAlreadyOpen) and never by its
+// Message or its Status alone, and the generic error text for anything
+// else.
+func requestChangesRefusalText(cerr *httpapi.CreateTurnError) string {
+	if errors.Is(cerr, httpapi.ErrTurnAlreadyOpen) {
+		return slackRequestChangesBusyErrorText
+	}
+	return slackRequestChangesErrorText
+}
+
 // handleViewSubmission processes the "Request changes" modal's own
 // submission: the feedback text (read back from view.state.values, keyed
 // by slackapi.RequestChangesBlockID/RequestChangesActionID) becomes a new
@@ -734,12 +776,16 @@ type viewSubmissionErrorResponse struct {
 // behaves for every other "request changes" submission, §8.1's own
 // design).
 //
-// w is §13.2's own addition: every early-return path below still writes
-// a bare 200 itself now (this function owns its own response entirely,
-// NewInteractivityHandler's own switch no longer writes one on this
-// branch) so the ONLY path that writes something other than a plain 200
-// is the new authz-denial one, which responds with
-// viewSubmissionErrorResponse instead.
+// w is §13.2's own addition: this function owns its own response entirely
+// (NewInteractivityHandler's own switch writes none on this branch). A
+// payload it cannot read is answered with a bare 200; a created turn with
+// a bare 200 too, which closes the modal. Every refusal -- blank feedback,
+// an authorization denial or a failure checking it, and a CreateTurnCore
+// failure -- answers through writeViewSubmissionError instead, so the
+// modal stays open with the feedback in it. A CreateTurnCore refusal
+// because a turn is already open (RejectIfOpen's 409, technical plan
+// §43.21(a)) says so and asks for the change once that turn ends; nothing
+// is queued.
 func (deps InteractiveDeps) handleViewSubmission(ctx context.Context, w http.ResponseWriter, logger *slog.Logger, raw []byte) {
 	var payload viewSubmissionPayload
 	if err := json.Unmarshal(raw, &payload); err != nil {
@@ -790,12 +836,7 @@ func (deps InteractiveDeps) handleViewSubmission(ctx context.Context, w http.Res
 		// slackEmptyFeedbackErrorText shown against the feedback field, so
 		// the submitter can see why nothing happened and correct it.
 		logger.Warn("slack: interactivity: empty feedback text in view_submission, rejecting")
-		writeJSON(w, http.StatusOK, viewSubmissionErrorResponse{
-			ResponseAction: "errors",
-			Errors: map[string]string{
-				slackapi.RequestChangesBlockID: slackEmptyFeedbackErrorText,
-			},
-		})
+		writeViewSubmissionError(w, slackEmptyFeedbackErrorText)
 		return
 	}
 
@@ -851,22 +892,12 @@ func (deps InteractiveDeps) handleViewSubmission(ctx context.Context, w http.Res
 			// doc comment and this function's own top doc comment on notice
 			// above. Best-effort: never blocks the modal response below.
 			deps.postViewSubmissionLinkNotice(ctx, logger, planIDStr, payload.User.ID, notice)
-			writeJSON(w, http.StatusOK, viewSubmissionErrorResponse{
-				ResponseAction: "errors",
-				Errors: map[string]string{
-					slackapi.RequestChangesBlockID: slackPromptForbiddenErrorText,
-				},
-			})
+			writeViewSubmissionError(w, slackPromptForbiddenErrorText)
 			return
 		}
 		if errors.Is(err, ErrActorNotAuthorized) {
 			logger.Warn("slack: interactivity: request-changes turn denied by authz", "session_id", sessionIDStr, "user_id", actorUserID.String())
-			writeJSON(w, http.StatusOK, viewSubmissionErrorResponse{
-				ResponseAction: "errors",
-				Errors: map[string]string{
-					slackapi.RequestChangesBlockID: slackPromptForbiddenErrorText,
-				},
-			})
+			writeViewSubmissionError(w, slackPromptForbiddenErrorText)
 			return
 		}
 		// MEDIUM audit fix ("Slack's interactive.go has its OWN separate,
@@ -877,12 +908,7 @@ func (deps InteractiveDeps) handleViewSubmission(ctx context.Context, w http.Res
 		// instead of misreporting an internal error as "you don't have
 		// permission" and silently discarding the submitter's feedback text.
 		// Resubmitting the modal is this endpoint's own retry path.
-		writeJSON(w, http.StatusOK, viewSubmissionErrorResponse{
-			ResponseAction: "errors",
-			Errors: map[string]string{
-				slackapi.RequestChangesBlockID: slackRequestChangesErrorText,
-			},
-		})
+		writeViewSubmissionError(w, slackRequestChangesErrorText)
 		return
 	}
 
@@ -894,8 +920,17 @@ func (deps InteractiveDeps) handleViewSubmission(ctx context.Context, w http.Res
 	// carries no IntentClassifier field at all (unlike Deps, handler.go) --
 	// adding one purely to thread an argument that would never be consulted
 	// here would be dead plumbing.
+	//
+	// A failure never closes the modal (technical plan §43.21(b)): the
+	// open-turn refusal and every other failure both answer through
+	// writeViewSubmissionError, with the text requestChangesRefusalText
+	// picks, so the feedback stays in the field. Nothing is queued. Warn,
+	// not Error: CreateTurnCore already logs its own internal failures at
+	// Error, and an open turn is an expected state, not a fault.
 	if _, _, cerr := httpapi.CreateTurnCore(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, nil, deps.AuditLog, deps.Registry, sessionID, feedback, nil, true, deps.EpistemicCheckDefault, actorUserID, httpapi.RejectIfOpen); cerr != nil {
-		logger.Error("slack: interactivity: create request-changes turn failed", "status", cerr.Status, "message", cerr.Message, "session_id", sessionIDStr)
+		logger.Warn("slack: interactivity: create request-changes turn failed", "status", cerr.Status, "message", cerr.Message, "session_id", sessionIDStr)
+		writeViewSubmissionError(w, requestChangesRefusalText(cerr))
+		return
 	}
 	w.WriteHeader(http.StatusOK)
 }

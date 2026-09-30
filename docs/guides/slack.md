@@ -132,7 +132,14 @@ REST endpoints use, so a plan decided here is decided everywhere.
   `CreateTurnPolicy.RejectIfOpen` — the same REST policy, not the
   `DropIfOpen` ordinary-reply policy above — because a modal submission
   has a real, visible failure surface (an inline modal error) to report
-  a conflict through, unlike a plain thread message.
+  a conflict through, unlike a plain thread message. While any turn of
+  the session is pending, dispatched or processing (an approved
+  implementation running, typically), submitting the modal leaves it
+  open with your feedback still in it and a message under the field
+  saying a turn is still running: nothing is queued, so submit it again
+  once that turn ends. Any other failure to create the revision shows
+  "Something went wrong submitting this. Please try again." in the same
+  place; the modal only closes once the revision turn exists.
 - **While a plan is `awaiting_approval`, almost nothing else gets
   through — with one exception.** An ordinary reply that matches neither
   a verdict keyword nor `revise:` is held by the same gate
