@@ -237,7 +237,7 @@ func (f *fakeCheckRunGitHub) server() *httptest.Server {
 				checkRuns = append(checkRuns, map[string]any{
 					"id": e.ID, "name": e.Run.Name, "head_sha": e.Run.HeadSHA,
 					"status": e.Run.Status, "conclusion": e.Run.Conclusion,
-					"app": map[string]any{"id": e.Run.AppID},
+					"app":         map[string]any{"id": e.Run.AppID},
 					"external_id": e.Run.ExternalID,
 				})
 			}
