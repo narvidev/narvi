@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -28,8 +29,9 @@ import (
 // kinds on a deployment with GitHub outbound off dead-letters with "no
 // notifier registered for kind" (docs/runbooks/outbox-delivery.md).
 //
-// Listed for the composition-root tests, which prove the registered set
-// with outbound on minus the set with it off is exactly this list.
+// buildGitHubOutbound refuses to register a kind missing from this list,
+// and the composition-root tests prove the registered set with outbound on
+// minus the set with it off is exactly this list.
 var githubOutboundKinds = []ports.NotificationKind{
 	// Publication (§44.4: what a publish credential posts).
 	ports.NotificationKindGitHub,
@@ -213,6 +215,16 @@ func buildGitHubOutbound(cfg *platform.Config, deps githubOutboundDeps) (*github
 	}, outbound, cfg.Timeouts)
 	if err != nil {
 		return nil, fmt.Errorf("construct release manifest check worker: %w", err)
+	}
+
+	// githubOutboundKinds is the list the rest of this package, and its
+	// tests, take for the axis's whole reach: a kind registered here but
+	// missing from it would be a notifier nothing else knows is GitHub
+	// outbound.
+	for kind := range o.notifiers {
+		if !slices.Contains(githubOutboundKinds, kind) {
+			return nil, fmt.Errorf("GitHub outbound registered a notifier for %s, which githubOutboundKinds does not list", kind)
+		}
 	}
 
 	return o, nil
