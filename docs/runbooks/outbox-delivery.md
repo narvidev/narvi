@@ -40,6 +40,23 @@ correct — this is specifically an *outbound-channel* symptom.
   redact.go`, in case a future notifier's own delivery target ever embeds
   a credential in a URL; the DB column itself is left unredacted, for the
   rare case an operator genuinely needs the raw value).
+- A deploy or restart is not an outage. A delivery the pod's own shutdown
+  cut short logs a *warning*, never an error, naming the shutdown and a
+  `rule`: `shutdown_interrupted` (handed back, its attempt not spent, due
+  again after `OutboxInterruptedSettleDelay`, 45 s, so a request the
+  shutdown cut after the remote end accepted it lands before the repeat),
+  `shutdown_before_start` (claimed but never started, handed back and due
+  at once), or one of the three that count the attempt all the same and
+  wait the later of their backoff and that settle delay —
+  `shutdown_interrupted_not_repeatable` (a kind a second
+  delivery would add to: a Slack post, a Linear activity, a GitHub comment
+  or review, an RWX dispatch), `shutdown_interrupted_outlived_delivery_timeout`,
+  or `shutdown_interrupted_past_bound` (interrupted more than
+  `OutboxMaxConsecutiveInterruptions` times in a row, 3; the row's
+  `outbox.consecutive_interruptions` holds the run). Many
+  `shutdown_interrupted_past_bound` lines for one row mean its delivery is
+  what keeps meeting a shutdown — investigate the pod restarts, not the
+  notifier.
 
 ## Remediation
 

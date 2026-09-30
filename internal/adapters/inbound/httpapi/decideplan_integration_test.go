@@ -107,7 +107,7 @@ func TestDecidePlan_CrossChannelNotify_SlackMessageUpdated(t *testing.T) {
 
 	builder, err := outboxworker.NewBuilder(rig.outbox, rig.pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlackPlanDecided: planNotifier,
-	}, platform.DefaultTimeouts())
+	}, platform.DefaultTimeouts(), &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("outboxworker.NewBuilder: %v", err)
 	}

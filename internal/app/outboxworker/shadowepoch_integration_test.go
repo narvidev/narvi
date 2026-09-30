@@ -200,7 +200,7 @@ func TestPumpOnce_BornShadow_StaysShadowAfterPromotion(t *testing.T) {
 	notifier := &fakeNotifier{}
 	builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlack: notifier,
-	}, platform.DefaultTimeouts())
+	}, platform.DefaultTimeouts(), &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
 	}
@@ -269,7 +269,7 @@ func TestPumpOnce_BornLive_SuppressedAfterDemotion(t *testing.T) {
 	notifier := &fakeNotifier{}
 	builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlack: notifier,
-	}, platform.DefaultTimeouts())
+	}, platform.DefaultTimeouts(), &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
 	}
@@ -326,7 +326,7 @@ func TestPumpOnce_PassThroughKind_DeliversEvenWhenBornShadow(t *testing.T) {
 	notifier := &fakeNotifier{}
 	builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindBlobDelete: notifier,
-	}, platform.DefaultTimeouts())
+	}, platform.DefaultTimeouts(), &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
 	}

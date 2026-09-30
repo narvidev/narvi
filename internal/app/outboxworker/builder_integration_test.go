@@ -217,7 +217,7 @@ func TestPumpOnce_SuccessfulDelivery_MarksDelivered(t *testing.T) {
 	notifier := &fakeNotifier{}
 	builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlack: notifier,
-	}, platform.DefaultTimeouts())
+	}, platform.DefaultTimeouts(), &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
 	}
@@ -264,7 +264,7 @@ func TestPumpOnce_FailedDelivery_BacksOffAndNotRetriedBeforeNextAttemptAt(t *tes
 
 	builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlack: notifier,
-	}, timeouts)
+	}, timeouts, &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
 	}
@@ -332,7 +332,7 @@ func TestPumpOnce_DeadLettersAfterMaxAttempts(t *testing.T) {
 
 	builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlack: notifier,
-	}, timeouts)
+	}, timeouts, &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
 	}
@@ -394,7 +394,7 @@ func TestPumpOnce_PerRowIsolation(t *testing.T) {
 	builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlack:  slackNotifier,
 		ports.NotificationKindGitHub: githubNotifier,
-	}, platform.DefaultTimeouts())
+	}, platform.DefaultTimeouts(), &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
 	}
@@ -438,13 +438,13 @@ func TestPumpOnce_ConcurrentTicksNeverDoubleClaim(t *testing.T) {
 	timeouts := platform.DefaultTimeouts()
 	builderA, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlack: notifierA,
-	}, timeouts)
+	}, timeouts, &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder A: %v", err)
 	}
 	builderB, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlack: notifierB,
-	}, timeouts)
+	}, timeouts, &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder B: %v", err)
 	}
@@ -479,7 +479,7 @@ func TestPumpOnce_NoNotifierRegistered_TreatedAsFailure(t *testing.T) {
 
 	builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		// Deliberately no NotificationKindLinear entry.
-	}, timeouts)
+	}, timeouts, &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
 	}
@@ -609,13 +609,13 @@ func TestPumpOnce_SlowSequentialDelivery_ConcurrentTickNeverStealsRowMidDelivery
 
 	builderA, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlack: notifierA,
-	}, timeouts)
+	}, timeouts, &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder A: %v", err)
 	}
 	builderB, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlack: notifierB,
-	}, timeouts)
+	}, timeouts, &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder B: %v", err)
 	}
@@ -708,7 +708,7 @@ func TestPumpOnce_OutboxDueBacklogCount_ReflectsBacklogIndependentOfCurrentTickC
 	notifier := &fakeNotifier{}
 	builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlack: notifier,
-	}, platform.DefaultTimeouts())
+	}, platform.DefaultTimeouts(), &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
 	}
@@ -782,7 +782,7 @@ func TestPumpOnce_AttemptLogsCorrelationIDAndSessionID(t *testing.T) {
 	builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
 		// Deliberately no NotificationKindLinear entry -- forces the "no
 		// notifier registered" error log line.
-	}, timeouts)
+	}, timeouts, &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
 	}

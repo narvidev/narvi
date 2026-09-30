@@ -1,0 +1,25 @@
+-- Reverses 000152_outbox_consecutive_interruptions.up.sql. Every row's run of
+-- shutdown interruptions goes with the column: nothing a binary without
+-- 000152 reads, and a binary with it that runs 000152 again starts every
+-- row at zero, which spares each pending row at most
+-- platform.Timeouts.OutboxMaxConsecutiveInterruptions more interruptions
+-- before one counts.
+--
+-- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
+-- 000152. Do not run it against live pods of a binary that carries 000152,
+-- for two reasons:
+--   - Every query of that binary that returns a whole outbox row names this
+--     column (sqlc writes each SELECT * and RETURNING * out as a column
+--     list): enqueue, claim and every outcome the delivery worker records
+--     among them. After this down each of them fails with SQLSTATE 42703
+--     (column does not exist), so nothing is enqueued or delivered until the
+--     older binary replaces the pod.
+--   - A pod that carries 000152 and restarts before the older binary
+--     replaces it applies 000152 again at boot, which locks the older binary
+--     out again ("no migration found for version 152").
+-- Guarded: IF EXISTS, so it also runs on a database a rollback already
+-- brought back to 151 with the column kept (`migrate force 151`, the up
+-- file's "Rolling back") and then forced to 152 again. The drop is a
+-- catalog change: it rewrites nothing, but takes ACCESS EXCLUSIVE on outbox
+-- for the file's one implicit transaction.
+ALTER TABLE outbox DROP COLUMN IF EXISTS consecutive_interruptions;

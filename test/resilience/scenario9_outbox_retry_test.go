@@ -43,6 +43,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/outboxworker"
 	"github.com/narvidev/narvi/internal/app/ports"
 	domainoutbox "github.com/narvidev/narvi/internal/domain/outbox"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // flakySlackServer is a fake Slack-shaped chat.postMessage endpoint that
@@ -149,7 +150,7 @@ func TestResilienceScenario9_Outbox_SlackAPI500sThenRecovers_EventuallyDelivered
 
 	builder, err := outboxworker.NewBuilder(outboxStore, h.Pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlack: slackNotifier,
-	}, h.Timeouts)
+	}, h.Timeouts, &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("outboxworker.NewBuilder: %v", err)
 	}
