@@ -495,8 +495,8 @@ type Timeouts struct {
 	// after it that a session the orphan held is still locked elsewhere --
 	// ErrSessionActorElsewhere, which the timer pump skips until the timer's
 	// claim expires. Postgres waits through pg_terminate_backend's timeout,
-	// which every server boot accepts has (from 14 on; the floor is
-	// MinPostgresServerVersionNum, 16). A backend still there when the wait runs out is
+	// which exists from Postgres 14 on, older than the floor boot refuses
+	// below (MinPostgresServerVersionNum). A backend still there when the wait runs out is
 	// logged, and the connection installed anyway: that backend's sessions
 	// then wait for it to end, or for the server's keepalives
 	// (ActorLockServerReapTime). The terminate's statement runs under this

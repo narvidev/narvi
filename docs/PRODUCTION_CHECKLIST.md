@@ -204,7 +204,7 @@ are.
 
 **Check.** On the production server: `SHOW max_connections;`,
 `SHOW superuser_reserved_connections;` and `SHOW reserved_connections;`
-(the server is 16 or later, item 13). Confirm
+(the server runs Postgres 16 or later, item 13). Confirm
 `max_connections − superuser_reserved_connections − reserved_connections`
 exceeds `replicas × (NARVI_DB_POOL_MAX_CONNS + 1)` with headroom, at the
 fleet's maximum replica count (a rolling deploy briefly runs one extra
@@ -357,35 +357,41 @@ roll back -- for example `kubectl rollout status
 deployment/narvi-control-plane --timeout=30m`, whose non-zero exit fails
 the pipeline. No rollout is left paused with pods of two releases running.
 
-## 13. The Postgres server is version 16 or later
+## 13. The server runs Postgres 16 or later
 
 **Why this is here.** The control plane runs on Postgres 16 or later, and
-is tested on 17. Boot reads the server's `server_version_num` before it
-runs any migration and refuses an older server, naming both versions
+is tested on 17. Every subcommand reads the server's `server_version_num`
+first and refuses an older server, naming both versions
 (`platform.MinPostgresServerVersionNum`, `internal/platform/postgres.go`;
-`docs/TECHNICAL_PLAN.md` §1 and §5.1). `serve` and `seed` refuse one;
-`routes`, which needs no database, does not read the server at all. The
-code depends on the floor: item 10's connection budget reads
-`reserved_connections`, which exists from 16 on, and the lock connection
-waits for a lost connection's backend to end when it terminates it
-(`pg_terminate_backend` with a timeout, from 14 on). An operator choosing
-a managed Postgres chooses against this floor, before provisioning.
+`docs/TECHNICAL_PLAN.md` §1 and §5.1): `serve` and `seed` before they
+apply the migrations, and `routes` before it builds the router, which
+reads the database and, in a binary composed with extension modules,
+applies each module's own migrations. The code depends on the floor:
+item 10's connection budget reads `reserved_connections`, which exists
+from 16 on, and the lock connection waits for a lost connection's backend
+to end when it terminates it (`pg_terminate_backend` with a timeout, from
+14 on). An operator choosing a managed Postgres chooses against this
+floor, before provisioning.
 
-**What is tested.** Every Postgres-backed suite runs on Postgres 17. CI
-runs three of them on Postgres 16 as well, in the
+**What is tested.** Every Postgres-backed suite is tested on 17. CI runs
+three of them on the floor as well, in the
 `test-integration-postgres-floor` job (`make
-test-integration-postgres-floor`): the postgres adapter's whole suite
-(every store's queries, every migration up and down), the lock
-connection's tests, and boot's own reads of the server. Every other suite
-runs on 17 only.
+test-integration-postgres-floor`, whose image `internal/ops` holds to the
+floor): the postgres adapter's whole suite (every store's queries, every
+migration up and down), the lock connection's tests, and boot's own reads
+of the server. Every other suite runs on 17 only.
 
-**Why 16.** A default, not a measurement: item 10's budget needs
-`reserved_connections`, this checklist already asked for 16 or later, and
-14 reaches the end of its support in November 2026. The fallbacks the code
-kept for 14 and 15 were removed once boot refused those servers, so
-lowering the floor means restoring them and running the three suites
-above on the lower version first.
+**Why this floor.** A default, not a measurement: item 10's budget needs
+`reserved_connections`, and 14 reaches the end of its support in November
+2026. No document named a floor before this item; item 10 read only
+"and, on Postgres 16 or later, `SHOW reserved_connections;`" --
+a condition that allowed an older server. Boot's refusal let two fallbacks
+go: the budget's read of `reserved_connections` as 0 on a server before
+16, and a terminate that only signalled a lost connection's backend on a
+server before 14. Lowering the floor means restoring the fallbacks the
+lower version needs, and running the three suites above on it first.
 
 **Check.** A clean boot (item 3) proves it: an older server never gets
 past the refusal. Before provisioning, read the offering's major version
 on a server of the same plan (`SHOW server_version;`).
+

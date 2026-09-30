@@ -74,9 +74,9 @@ const orphanBackendMatch = `FROM pg_stat_activity
 // exits -- or false once the wait has run out, the backend still there.
 // False also answers, in a race of microseconds, a backend that ended
 // between the match and the signal. No row: no such backend. The waiting
-// form exists from Postgres 14 on, and boot refuses any server older than
-// platform.MinPostgresServerVersionNum (16), so no form that only signals
-// is kept.
+// form exists from Postgres 14 on, older than the floor boot refuses below
+// (platform.MinPostgresServerVersionNum), so no form that only signals is
+// kept.
 const terminateOrphanQuery = `SELECT pg_terminate_backend(pid, $4) ` + orphanBackendMatch
 
 // errLockHolderClosed is TryLock's error once Registry.Shutdown has closed

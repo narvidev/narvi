@@ -16,9 +16,9 @@ const meterName = "narvi/controlplane"
 
 // connectionBudgetQuery reads the three settings that bound how many
 // connections a non-superuser role can open. reserved_connections exists
-// from Postgres 16 on, the oldest server boot accepts
-// (platform.MinPostgresServerVersionNum), and serve refuses an older one
-// before this runs, so it is read like the other two.
+// from Postgres 16 on, and serve refuses a server older than
+// platform.MinPostgresServerVersionNum, which is no older than that, before
+// this runs, so it is read like the other two.
 const connectionBudgetQuery = `SELECT current_setting('max_connections')::int,
        current_setting('superuser_reserved_connections')::int,
        current_setting('reserved_connections')::int`

@@ -22,10 +22,12 @@ type rowQuerier interface {
 
 // requireSupportedPostgres refuses a Postgres server older than
 // platform.MinPostgresServerVersionNum, naming the server's version and the
-// floor (technical plan §5.1). The subcommands that migrate, serve and seed,
-// call it first on their pool: before anything else reads the server, and
-// before any migration runs against it. routes does not: it lists the routes
-// without needing a reachable database (runRoutesCommand).
+// floor (technical plan §5.1). Every subcommand calls it first on its pool,
+// before anything else reads the server and before any migration runs
+// against it: serve and seed, which apply the embedded migrations, and
+// routes, whose Build reads the database and applies composed modules'
+// migrations. Build itself does not: its callers pass it an open pool, and
+// its contract is that they have called this first.
 //
 // The read is bounded by timeout. A read that fails refuses too: a server
 // that cannot answer one query at boot cannot be shown to be supported, and

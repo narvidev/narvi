@@ -150,7 +150,8 @@ test-integration-group-4:
 # every migration, up and down), the lock connection's tests
 # (pg_terminate_backend's waiting form, the keepalive settings it asks the
 # server for), and boot's own reads of the server (the version check, the
-# migrations, the connection budget's reserved_connections). Every other
+# migrations, the connection budget's reserved_connections, and the routes
+# subcommand, which checks the version before building the router). Every other
 # Postgres-backed suite runs on postgres:17-alpine alone, the tested version
 # (docs/PRODUCTION_CHECKLIST.md item 13). Those three packages' tests read
 # the image from NARVI_TEST_POSTGRES_IMAGE, the boot test fails if the
@@ -164,7 +165,7 @@ test-integration-postgres-floor:
 		$(INTEGRATION_MODULE)/internal/adapters/outbound/postgres
 	NARVI_TEST_POSTGRES_IMAGE=$(POSTGRES_FLOOR_IMAGE) go test -tags=integration -race -run '^TestLockHolder_' \
 		$(INTEGRATION_MODULE)/internal/app/sessionactor
-	NARVI_TEST_POSTGRES_IMAGE=$(POSTGRES_FLOOR_IMAGE) go test -tags=integration -race -v -run '^TestPostgresPreflight_' \
+	NARVI_TEST_POSTGRES_IMAGE=$(POSTGRES_FLOOR_IMAGE) go test -tags=integration -race -v -run '^(TestPostgresPreflight_|TestRunRoutesCommand_)' \
 		$(INTEGRATION_MODULE)/controlplane
 
 # dev is a LOCAL DEV convenience only (docker-compose.dev.yml), distinct
@@ -489,7 +490,9 @@ dist: web-build lint-web-assets
 #      read-only listing forward-migrate whatever database it was pointed
 #      at; it no longer does, since Build's router construction does not
 #      need a migrated schema at all). It loads config, opens the pool,
-#      and calls the EXACT SAME Build serve() calls -- it just never
+#      refuses a Postgres server below the supported floor (the compose
+#      file's postgres:17-alpine passes), and calls the EXACT SAME Build
+#      serve() calls -- it just never
 #      calls GitHub and never starts a listener (no
 #      verifyGitHubAppScopeAtBoot, no app.Run) -- so this is a clean,
 #      byte-for-byte route-table-identity proof, independent of GitHub

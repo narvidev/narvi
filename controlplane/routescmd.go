@@ -12,29 +12,35 @@ import (
 
 // runRoutesCommand is the "routes" subcommand's own implementation (§41.1
 // review round 1, findings P1/P3; round 2, findings Q1/Q3/Q6/Q12): load
-// config, open the pool, and build the router with the SAME Build -- and
+// config, open the pool, refuse a server below the supported floor, and
+// build the router with the SAME Build -- and
 // the SAME modules -- serve() uses, then print its route table to w --
 // one "METHOD /path" per line, sorted -- exactly
 // controlplane/testdata/routes.golden's own format (App.Routes() already
 // returns it pre-sorted; see that method's own doc comment).
 //
-// This command is READ-ONLY: unlike round 1's version, it does NOT apply
-// migrations (§41.1 review round 2, finding Q1/Q3). Build does not need a
-// migrated schema to construct the router -- its only DB read at
-// construction time, CountSuppressedRepos, merely logs a WARN on failure
-// -- and the pool returned by NewPoolWithMaxConns is lazy (it never
-// pings), so no reachable database is required either. Forward-migrating
-// a database that a "list the routes" command was only asked to inspect
-// is exactly the hazard round 2 found: it can advance a production
-// schema ahead of a rollout, race serve()'s own migration lock, or fail
-// outright under a read-only DB role where a listing should still
-// succeed. If the target schema is missing tables Build wants to read
-// (e.g. a fresh, unmigrated database), the affected reads log a WARN to
-// stderr and are otherwise silently skipped -- that is acceptable for a
-// read-only introspection command. For the same reason it does not read the
-// server's version either (requireSupportedPostgres, which serve and seed
-// call before they migrate): a listing that needs no reachable database
-// must not fail on the version of one it never uses.
+// This command applies none of this repository's own migrations (§41.1
+// review round 2, finding Q1/Q3). Build does not need a migrated schema to
+// construct the router -- its one DB read at construction time,
+// CountSuppressedRepos, merely logs a WARN on failure. Forward-migrating a
+// database that a "list the routes" command was only asked to inspect is
+// exactly the hazard round 2 found: it can advance a production schema
+// ahead of a rollout, race serve()'s own migration lock, or fail outright
+// under a read-only DB role where a listing should still succeed. If the
+// target schema is missing tables Build wants to read (e.g. a fresh,
+// unmigrated database), the affected reads log a WARN to stderr and are
+// otherwise silently skipped -- that is acceptable for an introspection
+// command. Build does apply each composed module's own migrations
+// (applyModuleMigrations), so in a binary composed with a module that ships
+// migrations this command runs that module's DDL; the public binary
+// composes none.
+//
+// Because Build reads the database, and in a composed binary migrates it,
+// this command refuses a server older than
+// platform.MinPostgresServerVersionNum before calling it, as serve and seed
+// do (requireSupportedPostgres, §5.1). It therefore needs a reachable
+// database of a supported version, like every other subcommand; the pool
+// is lazy, so that version read is the first time it connects.
 //
 // modules is the same extension.Module list Main receives and threads to
 // serve() (§41.1 review round 2, finding Q6/Q12): passing none here, as
@@ -53,6 +59,12 @@ func runRoutesCommand(ctx context.Context, w io.Writer, modules ...extension.Mod
 		return fmt.Errorf("open postgres pool: %w", err)
 	}
 	defer pool.Close()
+
+	// Build reads the database and applies composed modules' migrations,
+	// so a server below the floor is refused first (§5.1).
+	if err := requireSupportedPostgres(ctx, pool, cfg.Timeouts.PostgresVersionCheckTimeout); err != nil {
+		return err
+	}
 
 	app, err := Build(ctx, cfg, pool, modules...)
 	if err != nil {
