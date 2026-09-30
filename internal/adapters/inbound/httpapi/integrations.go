@@ -148,7 +148,7 @@ func configuredForProvider(cfg *platform.Config, p integrations.Provider) bool {
 	case integrations.ProviderLinear:
 		return integrations.ConfiguredLinear(cfg.LinearWebhookSecret, cfg.LinearOAuthClientID, cfg.LinearOAuthClientSecret)
 	case integrations.ProviderGitHub:
-		return integrations.ConfiguredGitHub(cfg.GitHubWebhookSecret, cfg.GitHubBotHandle, cfg.GitHubBotToken)
+		return integrations.ConfiguredGitHub(cfg.GitHubWebhookSecret, cfg.GitHubBotHandle, cfg.GitHubOutbound != nil)
 	default:
 		return false
 	}

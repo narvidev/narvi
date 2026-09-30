@@ -127,7 +127,7 @@ func TestGetIntegrations_PartiallyConfigured_AllThreeReportFalse(t *testing.T) {
 
 			GitHubWebhookSecret: "", // missing -- GitHub incomplete.
 			GitHubBotHandle:     "present",
-			GitHubBotToken:      "present",
+			GitHubOutbound:      platform.MustNewGitHubOutboundConfig("present"),
 		}
 	})
 	ctx := context.Background()
@@ -174,7 +174,7 @@ func TestGetIntegrations_DisabledSurfaceReportsFalse(t *testing.T) {
 
 			GitHubWebhookSecret: "present",
 			GitHubBotHandle:     "present",
-			GitHubBotToken:      "present",
+			GitHubOutbound:      platform.MustNewGitHubOutboundConfig("present"),
 		}
 	})
 	ctx := context.Background()
@@ -242,7 +242,7 @@ func TestGetIntegrations_NoSecretsInRawResponse(t *testing.T) {
 			LinearOAuthClientSecret: distinctiveSecrets[4],
 			GitHubWebhookSecret:     distinctiveSecrets[5],
 			GitHubBotHandle:         "narvi-test-bot",
-			GitHubBotToken:          distinctiveSecrets[6],
+			GitHubOutbound:          platform.MustNewGitHubOutboundConfig(distinctiveSecrets[6]),
 		}
 	})
 	ctx := context.Background()

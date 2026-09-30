@@ -778,7 +778,7 @@ func spawnFixChild(ctx context.Context, t *testing.T, rig *oauthRouterRig, paren
 		t.Fatalf("record the finding: %v", err)
 	}
 	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, narvipg.NewSessionStore(pool), narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), rig.app.registry,
-		fixes, findings, &fixCodeHost{}, rig.cfg.GitHubBotToken, rig.cfg.Timeouts, rig.cfg.EpistemicCheckDefault, rig.cfg.RolloutMode, narvipg.NewRepoSettingsStore(pool), narvipg.NewGitHubPRSessionStore(pool),
+		fixes, findings, &fixCodeHost{}, rig.cfg.GitHubOutbound.BotToken(), rig.cfg.Timeouts, rig.cfg.EpistemicCheckDefault, rig.cfg.RolloutMode, narvipg.NewRepoSettingsStore(pool), narvipg.NewGitHubPRSessionStore(pool),
 		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
 		SentinelFixID: fix.ID.String(), RepoFullName: repoFullName, OriginPRNumber: prNumber,

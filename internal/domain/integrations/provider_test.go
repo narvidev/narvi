@@ -163,10 +163,12 @@ func TestConfiguredLinear(t *testing.T) {
 	}
 }
 
-// TestConfiguredGitHub mirrors TestConfiguredSlack/TestConfiguredLinear,
-// one case per missing secret among GitHub's own three, plus proves
-// GitHubClientID/GitHubClientSecret (OAuth login, deliberately excluded)
-// have no bearing here by never passing them at all.
+// TestConfiguredGitHub mirrors TestConfiguredSlack/TestConfiguredLinear:
+// one case per missing ingress secret, and one for GitHub outbound being
+// off -- the axis the bot credential now belongs to, passed as a bool so
+// this package never sees the secret itself. GitHubClientID/
+// GitHubClientSecret (OAuth login, deliberately excluded) have no bearing
+// here, proven by never passing them at all.
 func TestConfiguredGitHub(t *testing.T) {
 	t.Parallel()
 
@@ -174,22 +176,22 @@ func TestConfiguredGitHub(t *testing.T) {
 		name          string
 		webhookSecret string
 		botHandle     string
-		botToken      string
+		outbound      bool
 		want          bool
 	}{
-		{"all three present", "wh", "@narvi-bot", "tok", true},
-		{"missing webhook secret", "", "@narvi-bot", "tok", false},
-		{"missing bot handle", "wh", "", "tok", false},
-		{"missing bot token", "wh", "@narvi-bot", "", false},
-		{"all missing", "", "", "", false},
+		{"both secrets present, outbound on", "wh", "@narvi-bot", true, true},
+		{"missing webhook secret", "", "@narvi-bot", true, false},
+		{"missing bot handle", "wh", "", true, false},
+		{"outbound off", "wh", "@narvi-bot", false, false},
+		{"all missing", "", "", false, false},
 	}
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := integrations.ConfiguredGitHub(tc.webhookSecret, tc.botHandle, tc.botToken)
+			got := integrations.ConfiguredGitHub(tc.webhookSecret, tc.botHandle, tc.outbound)
 			if got != tc.want {
-				t.Errorf("ConfiguredGitHub(%q, %q, %q) = %v, want %v", tc.webhookSecret, tc.botHandle, tc.botToken, got, tc.want)
+				t.Errorf("ConfiguredGitHub(%q, %q, %v) = %v, want %v", tc.webhookSecret, tc.botHandle, tc.outbound, got, tc.want)
 			}
 		})
 	}

@@ -522,7 +522,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 			LinearOAuthClientSecret: "test-linear-client-secret",
 			GitHubWebhookSecret:     "test-github-webhook-secret",
 			GitHubBotHandle:         "narvi-test-bot",
-			GitHubBotToken:          "test-github-bot-token",
+			GitHubOutbound:          platform.MustNewGitHubOutboundConfig("test-github-bot-token"),
 		},
 	}
 	t.Cleanup(func() { _ = rig.registry.Shutdown() })

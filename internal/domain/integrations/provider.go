@@ -1,7 +1,7 @@
 // Package integrations holds the pure, I/O-free read-model logic behind
 // GET /api/integrations (§12.5's own "integrations read model & routes"
-// amendment): which ingress/egress surfaces this deployment knows about,
-// whether each one is fully configured, and how an outbox.kind string
+// amendment): which ingress surfaces and outbound axes this deployment
+// knows about, whether each one is fully configured, and how an outbox.kind string
 // attributes to one of them. No I/O, no time.Now(), no randomness (§11)
 // -- every input this package's own functions need (a config secret's
 // already-loaded string value, an outbox row's already-fetched kind) is
@@ -40,6 +40,14 @@ const (
 // other, but kept explicit rather than ranging over a map, whose
 // iteration order Go deliberately randomizes).
 var Providers = []Provider{ProviderSlack, ProviderLinear, ProviderGitHub}
+
+// OutboundProviders is every Provider with an outbound axis of its own
+// (NARVI_OUTBOUND_ENABLED, §12.5): the providers a deployment may declare
+// it calls as its bot independently of whether it mounts that provider's
+// ingress. Only GitHub today -- Slack's and Linear's outbound credentials
+// are still part of their ingress sets. A subset of Providers, in the
+// same order, so both lists share one spelling of each name.
+var OutboundProviders = []Provider{ProviderGitHub}
 
 // OutboxKindPrefix is the literal prefix an outbox.kind must start with to
 // count as posted to p -- the ONE definition of the convention, so the SQL
@@ -106,9 +114,22 @@ func ProviderForOutboxKind(kind string) (Provider, bool) {
 // a deliberate disabling" failure mode this whole optionality design
 // refuses, one layer up from a secret.
 func ParseProvider(raw string) (Provider, bool) {
+	return parseAmong(raw, Providers)
+}
+
+// ParseOutboundProvider is ParseProvider over OutboundProviders: ok=false
+// for a typo and for a known provider with no outbound axis (slack,
+// linear) alike -- platform.Load turns either into a loud boot failure
+// (*platform.InvalidOutboundEnabledError).
+func ParseOutboundProvider(raw string) (Provider, bool) {
+	return parseAmong(raw, OutboundProviders)
+}
+
+// parseAmong reports whether raw is exactly one of known's spellings.
+func parseAmong(raw string, known []Provider) (Provider, bool) {
 	p := Provider(raw)
-	for _, known := range Providers {
-		if p == known {
+	for _, k := range known {
+		if p == k {
 			return p, true
 		}
 	}
@@ -175,10 +196,19 @@ func ConfiguredLinear(webhookSecret, oauthClientID, oauthClientSecret string) bo
 // (platform.Config.GitHubBotHandle, the "@handle" substring §8.2's own
 // mention-detection matches comment bodies against -- without it this
 // ingress never detects a single mention, even though the value itself is
-// a public username, not a secret), and botToken
-// (platform.Config.GitHubBotToken, the credential §5.1's GitHub Notifier
-// posts outbound verdicts/comments/preview-status with -- the OTHER
-// direction §12.5's own lastOutboundAt/lastOutboundStatus reports on).
+// a public username, not a secret), and outbound (whether GitHub outbound
+// is on -- platform.Config.GitHubOutbound != nil, the axis whose bot
+// credential posts verdicts/comments/preview-status, the OTHER direction
+// §12.5's own lastOutboundAt/lastOutboundStatus reports on). A bool, not
+// the credential: this package never sees a secret, only whether one is
+// configured, and the outbound axis is already validated by platform.Load
+// (a nil config is its only "off" representation).
+//
+// "configured" stays ingress-scoped (its caller checks IngressEnabled
+// first): GitHub ingress requires GitHub outbound, so an enabled surface
+// always passes outbound=true, while a deployment with outbound on and
+// ingress off still reads configured=false -- there is no contract field
+// for the outbound axis alone.
 //
 // Deliberately EXCLUDES GitHubClientID/GitHubClientSecret -- those
 // authenticate a HUMAN signing into Narvi's own web UI via GitHub OAuth
@@ -194,10 +224,11 @@ func ConfiguredLinear(webhookSecret, oauthClientID, oauthClientSecret string) bo
 //
 // All three are boot-required WHEN THIS SURFACE IS ENABLED
 // (platform.Config.IngressEnabled, §12.5's own ingress-optionality
-// decision) -- a deployment that never enables GitHub ingress leaves all
-// three empty by design; see ConfiguredSlack's own doc comment for why
-// this predicate alone cannot distinguish that from a half-configured
-// enabled surface, and why its caller checks IngressEnabled separately.
-func ConfiguredGitHub(webhookSecret, botHandle, botToken string) bool {
-	return webhookSecret != "" && botHandle != "" && botToken != ""
+// decision; GitHub ingress requires GitHub outbound) -- a deployment that
+// never enables GitHub ingress leaves the first two empty by design; see
+// ConfiguredSlack's own doc comment for why this predicate alone cannot
+// distinguish that from a half-configured enabled surface, and why its
+// caller checks IngressEnabled separately.
+func ConfiguredGitHub(webhookSecret, botHandle string, outbound bool) bool {
+	return webhookSecret != "" && botHandle != "" && outbound
 }

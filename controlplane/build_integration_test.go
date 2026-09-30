@@ -353,7 +353,7 @@ func TestBuild_GitHubIngressDisabled_NoGitHubPreviewLinkNotifier(t *testing.T) {
 		integrations.ProviderGitHub: false,
 	}
 	cfg.RWXAccessToken = "test-rwx-access-token"
-	cfg.GitHubBotToken = "" // what an operator running this combination would actually have.
+	cfg.GitHubOutbound = nil // what an operator running this combination would actually have.
 
 	app, err := Build(context.Background(), cfg, pool)
 	if err != nil {
