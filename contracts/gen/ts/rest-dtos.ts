@@ -2476,6 +2476,10 @@ export interface DecisionInboxItem {
    */
   acceptanceMergeBlockedReason?: string | null;
   /**
+   * Technical plan §21.2: true on an ordinary pull-request row (never a handoff or a release cut) when the only thing keeping it from a Merge click is what the inbox does not read -- with this deployment's GitHub outbound off (ListDecisionInboxResponse.requiredChecksNotRead), the checks its base branch requires. Every other criterion holds, the row's acceptance applied when it carries one (acceptanceMergeable itself stays false, acceptanceMergeBlockedReason naming the unread requirements). The row stays needs_review, since the inbox cannot call it ready to merge; a client offers Merge on it, and the Merge endpoint reads the base's requirements itself, with the acting person's own GitHub credential, and refuses with 409, naming the check, when one is not met. False on every other pull-request row, and always false while GitHub outbound is on; null on a row that is not a pull request.
+   */
+  mergeableIfRequiredChecksPass?: boolean | null;
+  /**
    * True iff this PR is a release cut (§15) whose manifest check has already been computed and persisted. Set (to true or false) for any PR-shaped row, exactly like isHandoff above -- the field a client checks to render this row's own distinct release shape (a link to the release-review screen, never a Merge button: a release cut always renders under kind=needs_review) instead of the ordinary PR shape. A PR that a release-branch-pattern/label WOULD classify as a release cut but that Narvi has not yet reviewed (or reviewed too recently for the background check to have finished) renders false here -- an honest, temporary gap, never a fabricated one.
    */
   isRelease: boolean | null;
@@ -2545,6 +2549,10 @@ export interface ListDecisionInboxResponse {
    * True iff the caller's PR-derived rows (ready_to_merge/needs_review) are a known-incomplete or degraded picture -- ONE channel fed by several independent producers: the live PR fetch failing outright (a revoked token, a GitHub incident, a timeout, or a linked-identity lookup/decrypt failure -- scmAsOf stays null in these cases, no fetch was attempted or it never returned); one of GitHub's own underlying discovery queries failing while the other still returned a real, if partial, result (scmAsOf IS set here -- a genuine, if partial, fetch happened); or an individual PR's own §17 sentinel-fix exclusion check erroring (that one row is dropped, fail-closed, but the overall read is no longer complete). UNLIKE this field's own previous doc comment claimed, scmAsOf non-null and scmFetchFailed true are NOT mutually exclusive -- a partial-but-real fetch legitimately carries both a real as-of instant and a flag telling the caller not to trust the rows present as complete. Always false alongside scmAsOf==null when no linked identity exists at all (a legitimate, non-degraded empty state). A client should render a distinct 'temporarily unable to load your pull requests, try again shortly' state whenever this is true -- never the same 'no GitHub linked' empty state scmAsOf==null with scmFetchFailed==false means, and never silently trust the rows present as a complete queue.
    */
   scmFetchFailed: boolean;
+  /**
+   * True when this deployment's GitHub outbound is off (NARVI_OUTBOUND_ENABLED declares no github): the inbox then reads no base branch's required checks (technical plan §21.2), so no pull request is shown as ready_to_merge, and a row carrying an acceptance names this as what blocks it. A configuration, stable across loads -- never a failure to retry, and never reported through scmFetchFailed. A client should say so in its own words, distinct from the 'temporarily unable to load' state. Merge stays available where every other criterion holds (DecisionInboxItem.mergeableIfRequiredChecksPass): the Merge endpoint reads the requirements with the acting person's own GitHub credential.
+   */
+  requiredChecksNotRead: boolean;
   /**
    * §16.2's own decision-latency metric -- null iff decisionLatencyComputed is false (§21.1's own 'not yet computed' sentinel, distinct from a real zero: a repo with a real 0-second median and one with no decisions yet in the window must never render identically).
    */

@@ -65,6 +65,9 @@ func cleanInput() autoapproval.EligibilityInput {
 		ChangedFileCount:        5,
 		TouchedBlastRadius:      []review.Tag{review.TagPublicAPI}, // present, but NOT in the default sensitive list
 		TouchedBlastRadiusKnown: true,
+		// Read, and the base requires nothing: RequiredChecks' zero value
+		// is "could not be read", so a clean baseline states it explicitly.
+		RequiredChecks: autoapproval.ReadRequiredChecks(nil, nil, true),
 	}
 }
 
@@ -627,6 +630,7 @@ func TestComputeEligible_IgnoresModelSelfReportedFilesChangedAndBlastRadius(t *t
 			ChangedFileCount:        300, // TRUTH: GitHub itself reports 300 changed files.
 			TouchedBlastRadius:      nil,
 			TouchedBlastRadiusKnown: true,
+			RequiredChecks:          autoapproval.ReadRequiredChecks(nil, nil, true),
 		}
 		eligible, reason := autoapproval.ComputeEligible(in, cfg)
 		if eligible {
@@ -661,6 +665,7 @@ func TestComputeEligible_IgnoresModelSelfReportedFilesChangedAndBlastRadius(t *t
 			// pre-computed TouchedBlastRadius literal.
 			TouchedBlastRadius:      []review.Tag{review.TagMigrations, review.TagAuth},
 			TouchedBlastRadiusKnown: true, // confirmed, complete listing -- this subtest is about the SENSITIVE-PATH criterion, not the unknown-facts one
+			RequiredChecks:          autoapproval.ReadRequiredChecks(nil, nil, true),
 		}
 		eligible, reason := autoapproval.ComputeEligible(in, cfg)
 		if eligible {
@@ -698,6 +703,7 @@ func TestComputeEligible_IgnoresModelSelfReportedFilesChangedAndBlastRadius(t *t
 			ChangedFileCount:        1,
 			TouchedBlastRadius:      nil,
 			TouchedBlastRadiusKnown: true,
+			RequiredChecks:          autoapproval.ReadRequiredChecks(nil, nil, true),
 		}
 		eligible, reason := autoapproval.ComputeEligible(in, cfg)
 		if !eligible {

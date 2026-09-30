@@ -51,6 +51,7 @@ func newRevalidateStores(pool *pgxpool.Pool) *revalidateStores {
 	return &revalidateStores{
 		sourceControl: sc,
 		deps: decisioninbox.Deps{
+			GitHubOutbound: testBotOutbound,
 			Plans:          narvipg.NewPlanStore(pool),
 			Sessions:       narvipg.NewSessionStore(pool),
 			Participants:   narvipg.NewParticipantStore(pool),

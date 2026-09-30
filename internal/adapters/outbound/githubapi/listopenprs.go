@@ -62,8 +62,9 @@
 // # Cost
 //
 // Two Search API calls (30 req/min budget -- see mergedbetween.go's own
-// identical caution) plus up to five further ordinary REST calls (detail,
-// reviews, CI's own two surfaces, changed files) PER discovered candidate
+// identical caution) plus up to six further ordinary REST calls (detail,
+// reviews, CI's own two surfaces, who posted the head's commit statuses
+// when it carries any, changed files) PER discovered candidate
 // PR, bounded by maxOpenPRsForUser -- the SAME "genuinely expensive, no
 // cheaper way through GitHub's REST API as it exists today" cost class
 // mergedbetween.go's own top doc comment already accepts for
@@ -399,17 +400,18 @@ func (a *Adapter) buildOpenPRFromDetail(ctx context.Context, owner, repo string,
 
 	hasApproving, hasChangesRequested, reviewDecisionDegraded := a.fetchReviewDecision(ctx, owner, repo, number, token)
 
-	ci := ports.CIConclusionUnknown
-	var ciConclusionDegraded bool
+	// With no head SHA nothing is read: CI stays unknown, and the head's
+	// check listing is marked incomplete rather than read as "no checks".
+	live := liveCIRead{conclusion: ports.CIConclusionUnknown, headChecksDegraded: true}
 	if detail.Head.SHA != "" {
 		// fetchCIConclusionLive, deliberately NOT fetchCIConclusion -- see that function's own doc comment for
 		// why a LIVE, pre-merge gate needs a STRICT conclusion, distinct
 		// from mergedbetween.go's retrospective-audit-only lenient one.
-		// ciConclusionDegraded is true iff either of that function's two
+		// live.degraded is true iff either of that function's two
 		// GETs itself failed -- see ports.OpenPR.CIConclusionDegraded's
 		// own doc comment for the fail-closed contract this signals to
 		// every caller gating on ci == CIConclusionSuccess.
-		ci, ciConclusionDegraded = a.fetchCIConclusionLive(ctx, owner, repo, detail.Head.SHA, token)
+		live = a.fetchCIConclusionLive(ctx, owner, repo, detail.Head.SHA, token)
 	}
 
 	// Phase 5 audit findings 1+2 (both fixed). Two INDEPENDENT ways this
@@ -502,13 +504,17 @@ func (a *Adapter) buildOpenPRFromDetail(ctx context.Context, owner, repo string,
 		// "why" and which callers must fail closed on it.
 		ReviewDecisionDegraded: reviewDecisionDegraded,
 
-		CIConclusion: ci,
-		// fetchCIConclusionLive's own second return -- see that field's
+		CIConclusion: live.conclusion,
+		// fetchCIConclusionLive's own degraded answer -- see that field's
 		// own doc comment (ports.OpenPR) for the fail-closed contract
 		// every caller gating on CIConclusion == CIConclusionSuccess must
 		// also honor.
-		CIConclusionDegraded: ciConclusionDegraded,
-		Labels:               labels,
+		CIConclusionDegraded: live.degraded,
+		// The same read's checks, listed one by one for a base branch's
+		// required checks (§21.2) -- see both fields' doc comments.
+		HeadChecks:             live.headChecks,
+		HeadChecksListDegraded: live.headChecksDegraded,
+		Labels:                 labels,
 
 		ChangedFiles: files,
 		// Phase 5 audit findings 1+2: ChangedFilesCount is GitHub's own
@@ -681,13 +687,32 @@ func ancestorChainFromDetailStack(stack *stackResponse) []ports.PRAncestorLink {
 // before this fix) for the full "why NAME, not App id or external_id"
 // reasoning -- both functions apply the identical exclusion, for the
 // identical reason.
-func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSHA, token string) (ports.CIConclusion, bool) {
+//
+// The same two responses also list the head's checks one by one
+// (liveCIRead.headChecks, ports.OpenPR.HeadChecks) for a base branch's
+// required checks (§21.2's "CI green means the required checks"
+// amendment): every check run with its App id, and every commit status
+// context GitHub rolls up, each mapped to passed, pending or failed. When
+// the head carries commit statuses, the per-ref statuses listing says who
+// posted each (fetchStatusPosters, a bounded number of pages), so a status
+// an App posted can count for a check tied to that App. The
+// listing never changes the conclusion above -- a base that requires
+// nothing reads exactly what it read before it existed. The status GET
+// asks for per_page=100 so the per-context list is as complete as one page
+// allows; total_count beyond what was served makes the listing degraded
+// (liveCIRead.headChecksDegraded) without degrading the conclusion, which
+// GitHub's combined state already computes over every status.
+func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSHA, token string) liveCIRead {
 	sawFailure := false
 	sawSuccess := false
 	sawIncomplete := false
 	degraded := false
+	var statusEntries []statusEntry
+	var runChecks []ports.HeadCheck
+	appBySlug := map[string]int64{}
+	statusesTruncated := false
 
-	statusPath := fmt.Sprintf("%s/repos/%s/%s/commits/%s/status", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(headSHA))
+	statusPath := fmt.Sprintf("%s/repos/%s/%s/commits/%s/status?per_page=100", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(headSHA))
 	if body, err := a.doGet(ctx, statusPath, token); err != nil {
 		degraded = true
 	} else {
@@ -695,6 +720,10 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 		if json.Unmarshal(body, &status) != nil {
 			degraded = true
 		} else {
+			for _, st := range status.Statuses {
+				statusEntries = append(statusEntries, statusEntry{id: st.ID, context: st.Context, state: st.State})
+			}
+			statusesTruncated = status.TotalCount > len(status.Statuses)
 			switch status.State {
 			case "failure", "error":
 				sawFailure = true
@@ -768,6 +797,14 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 				degraded = true
 			}
 			for _, r := range runs.CheckRuns {
+				// Listed before the narvi/review exclusion below: the
+				// required-check rule takes narvi/review out of the
+				// required set itself, and the listing stays a plain
+				// record of what the head carries.
+				runChecks = append(runChecks, ports.HeadCheck{Name: r.Name, Source: ports.HeadCheckSourceCheckRun, AppID: r.App.ID, Poster: ports.HeadCheckPosterApp, State: checkRunHeadCheckState(r.Conclusion)})
+				if r.App.Slug != "" && r.App.ID > 0 {
+					appBySlug[r.App.Slug] = r.App.ID
+				}
 				if r.Name == reviewcheck.CheckName {
 					// Narvi's own check run -- see this function's own
 					// doc comment for the full "why". Skipped BEFORE the
@@ -804,25 +841,231 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 		}
 	}
 
+	// Who posted each commit status, for a required check tied to an App
+	// (§21.2): read only when the head carries statuses, so a head whose
+	// checks are all check runs pays nothing for it.
+	var headChecks []ports.HeadCheck
+	if len(statusEntries) > 0 {
+		attributions := a.fetchStatusPosters(ctx, owner, repo, headSHA, token, statusEntries)
+		for _, st := range statusEntries {
+			attribution := attributions[st.id]
+			check := ports.HeadCheck{Name: st.context, Source: ports.HeadCheckSourceStatus, State: statusHeadCheckState(st.state), EarlierFromOthers: attribution.earlierFromOthers}
+			check.Poster, check.AppID, check.AppSlug = attributeStatus(attribution.poster, appBySlug)
+			headChecks = append(headChecks, check)
+		}
+	}
+	headChecks = append(headChecks, runChecks...)
+
+	read := liveCIRead{degraded: degraded, headChecks: headChecks, headChecksDegraded: degraded || statusesTruncated}
 	switch {
 	case sawFailure:
 		// A genuine, confirmed failure from whichever GET succeeded is
 		// real signal regardless of the other GET's own health -- never
 		// suppressed by degraded, exactly like the pre-existing "failure
 		// wins over incomplete" precedent immediately below.
-		return ports.CIConclusionFailure, degraded
+		read.conclusion = ports.CIConclusionFailure
 	case sawIncomplete:
-		return ports.CIConclusionUnknown, degraded
+		read.conclusion = ports.CIConclusionUnknown
 	case degraded:
 		// The fix this function exists for: sawSuccess may well be true
 		// here (the surviving GET reported green), but with the OTHER GET
 		// unread, that green is unconfirmed -- report Unknown, never
-		// Success, and say so via the second return value.
-		return ports.CIConclusionUnknown, true
+		// Success, and say so via read.degraded.
+		read.conclusion = ports.CIConclusionUnknown
 	case sawSuccess:
-		return ports.CIConclusionSuccess, false
+		read.conclusion = ports.CIConclusionSuccess
 	default:
-		return ports.CIConclusionUnknown, false
+		read.conclusion = ports.CIConclusionUnknown
+	}
+	return read
+}
+
+// statusEntry is one context of the combined status: the id and state of
+// its latest status.
+type statusEntry struct {
+	id      int64
+	context string
+	state   string
+}
+
+// statusPoster is the account that posted a commit status, from GitHub's
+// per-ref statuses listing: a login and an account type ("Bot" for an
+// App's bot account, "User" for a person).
+type statusPoster struct {
+	Login string `json:"login"`
+	Type  string `json:"type"`
+}
+
+// commitStatusListItem is the subset of one entry of GitHub's GET
+// /repos/{owner}/{repo}/commits/{ref}/statuses response read here: the
+// status id, its context, and who created it. The combined status names no
+// creator; this listing does, newest first.
+type commitStatusListItem struct {
+	ID      int64         `json:"id"`
+	Context string        `json:"context"`
+	Creator *statusPoster `json:"creator"`
+}
+
+// statusListPerPage is the page size asked of the per-ref statuses
+// listing -- the largest GitHub serves.
+const statusListPerPage = 100
+
+// maxStatusListPages bounds how many pages of the per-ref statuses listing
+// one read follows. The listing holds every status ever posted at the ref,
+// each transition of a context included, so the status the combined status
+// rolled a context up to can sit well past the first page; one past this
+// many pages is not looked for, and its poster reads unknown.
+const maxStatusListPages = 5
+
+// statusAttribution is what the per-ref statuses listing says about one
+// status of the combined status.
+type statusAttribution struct {
+	// poster is the status's creator: zero -- unknown -- when the status
+	// was not found in the pages read, or was found with no creator.
+	poster statusPoster
+	// earlierFromOthers is ports.HeadCheck.EarlierFromOthers.
+	earlierFromOthers bool
+}
+
+// fetchStatusPosters reads, from GitHub's per-ref statuses listing (newest
+// first), who posted each status the combined status rolled a context up
+// to, by status id: the listing entry with the SAME id, never merely one
+// of the same context -- a context's newest listing entry can be a status
+// posted after the combined status was read, or one with no creator, and
+// neither says who posted the status whose state is being judged.
+//
+// It pages until every status in entries is found, the listing ends, or
+// maxStatusListPages were read. A status not found -- past the bound, or
+// on a page that failed or did not decode -- is absent from the answer,
+// and its poster reads unknown. Once a status is found, the older entries
+// of its context read after it say whether an earlier status there came
+// from another account (earlierFromOthers); when the listing was not read
+// to its end, every found status is marked so, since the unread tail may
+// hold such a status.
+func (a *Adapter) fetchStatusPosters(ctx context.Context, owner, repo, ref, token string, entries []statusEntry) map[int64]statusAttribution {
+	out := make(map[int64]statusAttribution, len(entries))
+	wanted := make(map[int64]string, len(entries))
+	for _, st := range entries {
+		if st.id > 0 {
+			wanted[st.id] = st.context
+		}
+	}
+	type foundStatus struct {
+		id      int64
+		creator *statusPoster
+	}
+	found := make(map[string]foundStatus, len(wanted))
+	complete := false
+	for page := 1; page <= maxStatusListPages && len(found) < len(wanted); page++ {
+		path := fmt.Sprintf("%s/repos/%s/%s/commits/%s/statuses?per_page=%d&page=%d", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(ref), statusListPerPage, page)
+		body, err := a.doGet(ctx, path, token)
+		if err != nil {
+			break
+		}
+		var items []commitStatusListItem
+		if json.Unmarshal(body, &items) != nil {
+			break
+		}
+		for _, it := range items {
+			if f, ok := found[it.Context]; ok {
+				if !samePoster(f.creator, it.Creator) {
+					attribution := out[f.id]
+					attribution.earlierFromOthers = true
+					out[f.id] = attribution
+				}
+				continue
+			}
+			if wantedContext, ok := wanted[it.ID]; ok && wantedContext == it.Context {
+				found[it.Context] = foundStatus{id: it.ID, creator: it.Creator}
+				attribution := statusAttribution{}
+				if it.Creator != nil {
+					attribution.poster = *it.Creator
+				}
+				out[it.ID] = attribution
+			}
+		}
+		if len(items) < statusListPerPage {
+			complete = true
+			break
+		}
+	}
+	if !complete {
+		for id, attribution := range out {
+			attribution.earlierFromOthers = true
+			out[id] = attribution
+		}
+	}
+	return out
+}
+
+// samePoster reports whether two listing entries were posted by the same
+// account. An entry with no creator is nobody's: it matches nothing.
+func samePoster(a, b *statusPoster) bool {
+	return a != nil && b != nil && a.Login == b.Login && a.Type == b.Type
+}
+
+// attributeStatus says who posted a status and, for an App, which App. An
+// App posts through its bot account, "<slug>[bot]", of type "Bot": its
+// slug is returned, and its id when a check run of the same App slug at
+// the head carries one -- zero otherwise, for the caller to resolve
+// (ports.SourceControl.ResolveAppID); a bot login without that suffix
+// names no slug, and its App can then not be identified. Any other
+// account type is a person. A poster with no type is unknown.
+func attributeStatus(p statusPoster, appBySlug map[string]int64) (ports.HeadCheckPoster, int64, string) {
+	switch p.Type {
+	case "":
+		return ports.HeadCheckPosterUnknown, 0, ""
+	case "Bot":
+		slug, ok := strings.CutSuffix(p.Login, "[bot]")
+		if !ok || slug == "" {
+			return ports.HeadCheckPosterApp, 0, ""
+		}
+		return ports.HeadCheckPosterApp, appBySlug[slug], slug
+	default:
+		return ports.HeadCheckPosterPerson, 0, ""
+	}
+}
+
+// liveCIRead is fetchCIConclusionLive's answer: the conclusion and whether
+// it was fully read (ports.OpenPR.CIConclusion/CIConclusionDegraded), and
+// the head's checks one by one from the same two responses
+// (ports.OpenPR.HeadChecks/HeadChecksListDegraded).
+type liveCIRead struct {
+	conclusion         ports.CIConclusion
+	degraded           bool
+	headChecks         []ports.HeadCheck
+	headChecksDegraded bool
+}
+
+// checkRunHeadCheckState maps a check run's conclusion to where it stands
+// for a required check. GitHub accepts a required check that concluded
+// success, neutral or skipped; a run that has not concluded (nil) is
+// pending; every other conclusion -- failure, cancelled, timed_out,
+// action_required, stale, or one this adapter does not know -- has not
+// passed.
+func checkRunHeadCheckState(conclusion *string) ports.HeadCheckState {
+	if conclusion == nil {
+		return ports.HeadCheckStatePending
+	}
+	switch *conclusion {
+	case "success", "neutral", "skipped":
+		return ports.HeadCheckStatePassed
+	default:
+		return ports.HeadCheckStateFailed
+	}
+}
+
+// statusHeadCheckState maps a commit status's state (success, pending,
+// failure, error) to where it stands for a required check; a state this
+// adapter does not know has not passed.
+func statusHeadCheckState(state string) ports.HeadCheckState {
+	switch state {
+	case "success":
+		return ports.HeadCheckStatePassed
+	case "pending":
+		return ports.HeadCheckStatePending
+	default:
+		return ports.HeadCheckStateFailed
 	}
 }
 

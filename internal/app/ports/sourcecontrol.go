@@ -2,6 +2,7 @@ package ports
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -645,6 +646,22 @@ type OpenPR struct {
 	// stays reachable as Success from check-runs alone, on such a
 	// repository exactly as it always has been.
 	CIConclusionDegraded bool
+	// HeadChecks is every check the SAME read as CIConclusion saw at
+	// HeadSHA, one entry per check run and per commit status context --
+	// what a base branch's required checks (SourceControl.
+	// ListRequiredChecks) are evaluated against, so the required checks
+	// and CIConclusion always describe one snapshot. narvi/review is
+	// listed like any other check run; the required-check rule takes it
+	// out of the required set, and CIConclusion leaves it out by name.
+	HeadChecks []HeadCheck
+	// HeadChecksListDegraded is true when HeadChecks is not a complete
+	// listing: either of the read's two GETs failed or did not decode,
+	// the check runs were truncated (all three already make
+	// CIConclusionDegraded true), or the commit statuses were truncated,
+	// which CIConclusion itself does not need -- the combined state covers
+	// every status -- but a required check's presence does. The zero value
+	// is a complete listing, like ChangedFilesListDegraded's.
+	HeadChecksListDegraded bool
 
 	// Labels is this PR's own current GitHub labels -- a caller checks
 	// this against reviewpost.LabelLowRisk/.../LabelNeedsHuman to derive
@@ -1220,4 +1237,131 @@ type SourceControl interface {
 	// mirrors CreatePRError's own identical "typed only for a real HTTP
 	// response, plain for a failure below that" precedent.
 	MergePR(ctx context.Context, spec MergePRSpec) (mergeCommitSHA string, err error)
+
+	// ListRequiredChecks reports every check spec.Branch requires before a
+	// pull request into it may merge (§21.2: "CI green means the required
+	// checks, not the checks that reported") -- the checks the code host
+	// itself would hold a merge for, whatever has or has not reported at a
+	// head yet. An empty result is a confirmed "requires nothing". A
+	// requirement source the repository's plan does not offer declares
+	// nothing and is not an error; every other failure to read any source
+	// is an error, and a caller must never read it as "requires nothing" --
+	// that is the very read that cannot see a required check which has not
+	// reported. Duplicates across sources may be returned; the caller's
+	// rule (autoapproval.EvaluateRequiredChecks) removes them. Errors are
+	// plain, like every other method on this port except MergePR.
+	ListRequiredChecks(ctx context.Context, spec ListRequiredChecksSpec) ([]RequiredCheck, error)
+
+	// ResolveAppID reports the id of the App whose slug is spec.Slug -- the
+	// App behind a commit status its bot account ("<slug>[bot]") posted,
+	// when no check run of that App at the head carries the id
+	// (HeadCheck.AppSlug). An App keeps its id, but a slug can pass to
+	// another App once freed (a rename or a deletion), so an
+	// implementation may keep a successful answer only for a bounded time,
+	// and never keeps a failure. The answer is never a zero id: a slug
+	// that names no App is ErrAppNotFound (wrapped; match with errors.Is),
+	// a considered answer the caller reads as an App it cannot identify,
+	// whose status never counts for a check that names an App; every other
+	// failure is a failed read, which the caller must not read that way.
+	// Errors are plain, like every other method on this port except
+	// MergePR.
+	ResolveAppID(ctx context.Context, spec ResolveAppIDSpec) (int64, error)
+}
+
+// ErrAppNotFound is ResolveAppID's answer for a slug that names no App on
+// the code host: an answer, not a failed read.
+var ErrAppNotFound = errors.New("sourcecontrol: no App has this slug")
+
+// ResolveAppIDSpec is ResolveAppID's input: the App's slug, and the
+// credential the read that needs it uses (ListRequiredChecksSpec.Token).
+type ResolveAppIDSpec struct {
+	Slug  string
+	Token string
+}
+
+// ListRequiredChecksSpec is ListRequiredChecks' input: the base branch
+// whose requirements are read, and the credential they are read with --
+// the one whoever acts on them uses: the deployment's bot token
+// (platform.GitHubOutboundConfig) for the decision inbox and the
+// auto-merge worker, a person's own token for their Merge click.
+type ListRequiredChecksSpec struct {
+	Owner  string
+	Repo   string
+	Branch string
+	Token  string
+}
+
+// RequiredCheck is one check a base branch requires.
+type RequiredCheck struct {
+	// Name is a check run's name or a commit status's context.
+	Name string
+	// AppID is the id of the App that must report the check; zero when
+	// the requirement names none, and any source counts.
+	AppID int64
+}
+
+// HeadCheckSource is which of the code host's two check surfaces reported
+// a HeadCheck.
+type HeadCheckSource string
+
+const (
+	// HeadCheckSourceCheckRun is a check run, which carries the id of the
+	// App that reported it.
+	HeadCheckSourceCheckRun HeadCheckSource = "check_run"
+	// HeadCheckSourceStatus is a commit status, which carries the account
+	// that posted it rather than an App id.
+	HeadCheckSourceStatus HeadCheckSource = "status"
+)
+
+// HeadCheckPoster is the kind of account that posted a commit status.
+type HeadCheckPoster string
+
+const (
+	// HeadCheckPosterUnknown is a status whose poster could not be read --
+	// the zero value.
+	HeadCheckPosterUnknown HeadCheckPoster = ""
+	// HeadCheckPosterApp is a status an App posted through its bot
+	// account; every check run is posted by an App.
+	HeadCheckPosterApp HeadCheckPoster = "app"
+	// HeadCheckPosterPerson is a status a person's own account posted.
+	HeadCheckPosterPerson HeadCheckPoster = "person"
+)
+
+// HeadCheckState is where a HeadCheck stands for a requirement.
+type HeadCheckState string
+
+const (
+	// HeadCheckStatePassed satisfies a requirement.
+	HeadCheckStatePassed HeadCheckState = "passed"
+	// HeadCheckStatePending has reported and not concluded.
+	HeadCheckStatePending HeadCheckState = "pending"
+	// HeadCheckStateFailed is every other outcome.
+	HeadCheckStateFailed HeadCheckState = "failed"
+)
+
+// HeadCheck is one check reported at a pull request's head, as
+// OpenPR.HeadChecks lists them.
+type HeadCheck struct {
+	Name   string
+	Source HeadCheckSource
+	// AppID is the App a report is attributed to: the App that reported a
+	// check run, or, for a commit status an App posted, that App when a
+	// check run of the same App at the head carries its id -- zero when it
+	// does not (AppSlug then names the App, for ResolveAppID), and for
+	// every status a person posted.
+	AppID int64
+	// AppSlug is, for a commit status an App posted, the App's slug, from
+	// its bot account's login ("<slug>[bot]"); empty for every other
+	// report.
+	AppSlug string
+	// Poster is who posted a commit status (HeadCheckPosterApp for every
+	// check run).
+	Poster HeadCheckPoster
+	// EarlierFromOthers is set on a commit status when an earlier status
+	// of the same context at the head was posted by another account, or by
+	// one that could not be read, or when the earlier statuses were not
+	// all read: GitHub rolls a context up to its newest status only, so a
+	// check that names an App may have reported under this one.
+	EarlierFromOthers bool
+	State             HeadCheckState
 }

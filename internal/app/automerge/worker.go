@@ -171,8 +171,12 @@ func (w *Worker) pumpRepo(ctx context.Context, repoFullName string, now time.Tim
 		return
 	}
 
+	// One memo per repo per tick (§21.2): candidates into the same base
+	// read its required checks once, not once each. The next tick reads
+	// them again.
+	requiredChecks := decisioninbox.NewRequiredChecksMemo()
 	for _, candidate := range candidates {
-		w.mergeCandidate(ctx, repoFullName, int(candidate.PrNumber), now)
+		w.mergeCandidate(ctx, requiredChecks, repoFullName, int(candidate.PrNumber), now)
 	}
 }
 
@@ -189,7 +193,7 @@ func (w *Worker) pumpRepo(ctx context.Context, repoFullName string, now time.Tim
 // an injected clock) -- w.authGuard's own backoff/dead-letter decisions
 // (docs/TECHNICAL_PLAN.md §17) must be deterministic under it for tests
 // to drive multiple ticks without any real wall-clock sleep.
-func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumber int, now time.Time) {
+func (w *Worker) mergeCandidate(ctx context.Context, requiredChecks *decisioninbox.RequiredChecksMemo, repoFullName string, prNumber int, now time.Time) {
 	logger := platform.Logger(ctx)
 
 	allowed, reservation := w.authGuard.allow(repoFullName, now)
@@ -221,7 +225,7 @@ func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumb
 	// MergePR-failure streak back to zero on every tick, so
 	// domainautomerge.MaxAuthFailures could never actually be reached.
 	// Only a genuinely successful MergePR (below) resets either streak.
-	ok, headSHA, reason, viaAcceptance, acceptanceID, err := decisioninbox.RevalidateForAutoMerge(ctx, w.deps.DecisionInbox, w.deps.SourceControl, repoFullName, prNumber, w.deps.Outbound.BotToken())
+	ok, headSHA, reason, viaAcceptance, acceptanceID, err := decisioninbox.RevalidateForAutoMerge(ctx, w.deps.DecisionInbox, w.deps.SourceControl, requiredChecks, repoFullName, prNumber, w.deps.Outbound.BotToken())
 	if err != nil {
 		w.recordAuthOutcome(ctx, repoFullName, err, now, reservation)
 		logger.Error("automerge: revalidate for auto-merge failed", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)

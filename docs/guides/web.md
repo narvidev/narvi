@@ -455,6 +455,20 @@ section describes from the GitHub-ingress side; accepting binds to one
 exact verdict, attempt, and review context, and a new attempt or a moved
 base makes the acceptance inapplicable again, never silently still-valid.
 
+**Negative.** Merge answers `409` for a pull request whose base branch
+requires a check that has not reported at the head, is still running, or
+did not pass, and the message names the check (and the App the base
+names, if any); it answers `409` too while the base's requirements cannot
+be read. It reads them with the clicking person's own GitHub token. A
+check the base does not require still blocks when it fails (technical
+plan §21.2). With the deployment's GitHub outbound off, the inbox reads no
+base branch's requirements: its response carries `requiredChecksNotRead`,
+no row is ready to merge, and the web inbox shows a notice saying so --
+not the "temporarily unable" warning. A row that meets everything else
+carries `mergeableIfRequiredChecksPass` and still shows Merge, with a line
+saying the required checks are read when you merge: the click reads them
+with your own token, and answers `409` naming the check when one is unmet.
+
 ## Uploads
 
 ```json narvi-command

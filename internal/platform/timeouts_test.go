@@ -162,6 +162,27 @@ func TestValidate_CatchesEachBrokenLink(t *testing.T) {
 			},
 			wantChain: "ProviderHardCap > FirstConnectBudget + BootEvidenceFallback",
 		},
+		{
+			name: "GitHubListOpenPRsForUserTimeout not > DecisionInboxRequiredChecksTimeout",
+			mutate: func(to *platform.Timeouts) {
+				to.DecisionInboxRequiredChecksTimeout = to.GitHubListOpenPRsForUserTimeout
+			},
+			wantChain: "GitHubListOpenPRsForUserTimeout > DecisionInboxRequiredChecksTimeout",
+		},
+		{
+			name: "GitHubListOpenPRsForUserTimeout not > DecisionInboxResolveAppIDTimeout",
+			mutate: func(to *platform.Timeouts) {
+				to.DecisionInboxResolveAppIDTimeout = to.GitHubListOpenPRsForUserTimeout
+			},
+			wantChain: "GitHubListOpenPRsForUserTimeout > DecisionInboxResolveAppIDTimeout",
+		},
+		{
+			name: "GitHubAppIDCacheTTL not > AutoMergePumpInterval",
+			mutate: func(to *platform.Timeouts) {
+				to.GitHubAppIDCacheTTL = to.AutoMergePumpInterval
+			},
+			wantChain: "GitHubAppIDCacheTTL > AutoMergePumpInterval",
+		},
 	}
 
 	for _, tc := range tests {
@@ -1503,6 +1524,60 @@ func TestDefaultTimeouts_Step173StandaloneField(t *testing.T) {
 	}
 }
 
+// TestDefaultTimeouts_DecisionInboxResolveAppIDTimeout pins the shipped
+// bound on one read of the App behind a commit status (§21.2): one
+// lightweight GET, inside the Merge click's revalidation bound.
+func TestDefaultTimeouts_DecisionInboxResolveAppIDTimeout(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	if to.DecisionInboxResolveAppIDTimeout != 10*time.Second {
+		t.Errorf("DecisionInboxResolveAppIDTimeout = %v, want %v", to.DecisionInboxResolveAppIDTimeout, 10*time.Second)
+	}
+	if to.DecisionInboxResolveAppIDTimeout >= to.GitHubListOpenPRsForUserTimeout {
+		t.Errorf("DecisionInboxResolveAppIDTimeout = %v, want below GitHubListOpenPRsForUserTimeout (%v), which bounds the revalidation it runs inside", to.DecisionInboxResolveAppIDTimeout, to.GitHubListOpenPRsForUserTimeout)
+	}
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
+// TestDefaultTimeouts_GitHubAppIDCacheTTL pins how long an App slug's id is
+// kept (§21.2): ten minutes, the bound on how long a slug that moved to
+// another App keeps its old id, and longer than the auto-merge tick.
+func TestDefaultTimeouts_GitHubAppIDCacheTTL(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	if to.GitHubAppIDCacheTTL != 10*time.Minute {
+		t.Errorf("GitHubAppIDCacheTTL = %v, want %v", to.GitHubAppIDCacheTTL, 10*time.Minute)
+	}
+	if to.GitHubAppIDCacheTTL <= to.AutoMergePumpInterval {
+		t.Errorf("GitHubAppIDCacheTTL = %v, want above AutoMergePumpInterval (%v)", to.GitHubAppIDCacheTTL, to.AutoMergePumpInterval)
+	}
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
+// TestDefaultTimeouts_DecisionInboxRequiredChecksTimeout pins the shipped
+// bound on one read of a base branch's required checks (§21.2): two
+// lightweight GETs, and inside the Merge click's revalidation bound.
+func TestDefaultTimeouts_DecisionInboxRequiredChecksTimeout(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	if to.DecisionInboxRequiredChecksTimeout != 20*time.Second {
+		t.Errorf("DecisionInboxRequiredChecksTimeout = %v, want %v", to.DecisionInboxRequiredChecksTimeout, 20*time.Second)
+	}
+	if to.DecisionInboxRequiredChecksTimeout >= to.GitHubListOpenPRsForUserTimeout {
+		t.Errorf("DecisionInboxRequiredChecksTimeout = %v, want below GitHubListOpenPRsForUserTimeout (%v), which bounds the revalidation it runs inside", to.DecisionInboxRequiredChecksTimeout, to.GitHubListOpenPRsForUserTimeout)
+	}
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
 // TestValidate_RequiresPositiveFields is U2's own audit fix (confirmed
 // HIGH, SECURITY finding: "the anti-abuse throttle fails open on the zero
 // value of its window... Validate() accepts a zero
@@ -1538,6 +1613,21 @@ func TestValidate_RequiresPositiveFields(t *testing.T) {
 			name:      "RepoAccessCheckBreakerWindow == 0",
 			mutate:    func(to *platform.Timeouts) { to.RepoAccessCheckBreakerWindow = 0 },
 			wantField: "RepoAccessCheckBreakerWindow",
+		},
+		{
+			name:      "DecisionInboxRequiredChecksTimeout == 0",
+			mutate:    func(to *platform.Timeouts) { to.DecisionInboxRequiredChecksTimeout = 0 },
+			wantField: "DecisionInboxRequiredChecksTimeout",
+		},
+		{
+			name:      "DecisionInboxResolveAppIDTimeout == 0",
+			mutate:    func(to *platform.Timeouts) { to.DecisionInboxResolveAppIDTimeout = 0 },
+			wantField: "DecisionInboxResolveAppIDTimeout",
+		},
+		{
+			name:      "GitHubAppIDCacheTTL == 0",
+			mutate:    func(to *platform.Timeouts) { to.GitHubAppIDCacheTTL = 0 },
+			wantField: "GitHubAppIDCacheTTL",
 		},
 		{
 			// A negative value is exactly as permissive as zero for every

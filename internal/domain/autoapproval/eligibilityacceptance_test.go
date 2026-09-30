@@ -241,6 +241,10 @@ func TestComputeEligibleWithAcceptance_EveryCriterionEnumerated(t *testing.T) {
 		autoapproval.ReasonPolicyVersionMismatch,
 		autoapproval.ReasonBaseSHAUnknown,
 		autoapproval.ReasonCIConclusionDegraded,
+		autoapproval.ReasonRequiredChecksUnknown,
+		// A required check the head does not satisfy has no fixed Reason:
+		// it names the check. One such reason stands for the criterion.
+		reasonBuildHasNotReported,
 		autoapproval.ReasonCINotGreen,
 		autoapproval.ReasonNotShippableAuto,
 		autoapproval.ReasonDiffTooLarge,
@@ -344,6 +348,16 @@ func everyCriterionCases() []everyCriterionCase {
 		{
 			reason:        autoapproval.ReasonCIConclusionDegraded,
 			in:            withCIConclusionDegraded(cleanInput(), true),
+			wantWaiveable: false,
+		},
+		{
+			reason:        autoapproval.ReasonRequiredChecksUnknown,
+			in:            withRequiredChecks(cleanInput(), autoapproval.RequiredChecks{}),
+			wantWaiveable: false,
+		},
+		{
+			reason:        reasonBuildHasNotReported,
+			in:            withRequiredChecks(cleanInput(), autoapproval.ReadRequiredChecks([]autoapproval.RequiredCheck{{Name: "build"}}, nil, true)),
 			wantWaiveable: false,
 		},
 		{

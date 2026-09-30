@@ -138,7 +138,11 @@ func assertGitHubAxesLine(t *testing.T, b *lockedBuffer, wantIngress, wantOutbou
 // readout, the session result, the verdict tool and the re-review button
 // are driven through the real router; the actor's two uses are read off the
 // registry (sessionactor.Registry.HasGitHubOutbound), since they are
-// otherwise reachable only through a timer or a spawned fix session.
+// otherwise reachable only through a timer or a spawned fix session. The
+// decision inbox reads base branches' required checks as the bot (§21.2,
+// decisioninbox.Deps.GitHubOutbound): its response says it does
+// (requiredChecksNotRead false), where a nil credential would say it does
+// not.
 func TestBuild_GitHubOutboundReachesEveryOptionalReader(t *testing.T) {
 	setRequiredEnv(t)
 	pool, connStr := newTestPool(t)
@@ -229,6 +233,43 @@ func TestBuild_GitHubOutboundReachesEveryOptionalReader(t *testing.T) {
 		t.Fatalf("POST review/retrigger = %d, want 201", status)
 	}
 	expectBotCall(t, "the re-review button's prefetch (POST .../review/retrigger)")
+
+	if decisionInboxRequiredChecksNotRead(ctx, t, server.URL, cookieHeader) {
+		t.Error("GET /api/decision-inbox says base branches' required checks are not read -- the composition root did not hand the inbox cfg.GitHubOutbound")
+	}
+}
+
+// decisionInboxRequiredChecksNotRead loads the decision inbox through the
+// real router and returns its requiredChecksNotRead (technical plan §21.2).
+func decisionInboxRequiredChecksNotRead(ctx context.Context, t *testing.T, serverURL string, header http.Header) bool {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverURL+"/api/decision-inbox", nil)
+	if err != nil {
+		t.Fatalf("build request: %v", err)
+	}
+	for k, v := range header {
+		req.Header[k] = v
+	}
+	// The test's own request goes through a plain transport, never the
+	// fake that stands in for GitHub.
+	resp, err := (&http.Client{Transport: &http.Transport{}}).Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/decision-inbox: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /api/decision-inbox = %d, want 200", resp.StatusCode)
+	}
+	var body struct {
+		RequiredChecksNotRead *bool `json:"requiredChecksNotRead"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
+		t.Fatalf("decode decision inbox: %v", err)
+	}
+	if body.RequiredChecksNotRead == nil {
+		t.Fatal("the decision inbox response carries no requiredChecksNotRead")
+	}
+	return *body.RequiredChecksNotRead
 }
 
 // createMaintainerSession creates a maintainer and a signed-in session for

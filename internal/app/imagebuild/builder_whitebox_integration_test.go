@@ -131,6 +131,15 @@ func (f *whiteboxFakeSourceControl) ListOpenPRsForUser(context.Context, ports.Li
 	return nil, false, errors.New("whiteboxFakeSourceControl: ListOpenPRsForUser not implemented")
 }
 
+// ListRequiredChecks is unused by this test's scenarios; the base requires nothing.
+func (f *whiteboxFakeSourceControl) ListRequiredChecks(context.Context, ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
+	return nil, nil
+}
+
+func (f *whiteboxFakeSourceControl) ResolveAppID(context.Context, ports.ResolveAppIDSpec) (int64, error) {
+	return 0, errors.New("whiteboxFakeSourceControl: ResolveAppID not implemented")
+}
+
 func (f *whiteboxFakeSourceControl) ResolveCodeOwners(context.Context, ports.ResolveCodeOwnersSpec) ([]ports.Owner, error) {
 	return nil, errors.New("whiteboxFakeSourceControl: ResolveCodeOwners not implemented")
 }
