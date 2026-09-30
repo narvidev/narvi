@@ -105,6 +105,45 @@ func TestParseProvider(t *testing.T) {
 	}
 }
 
+// TestParseOutboundProvider proves the outbound vocabulary is GitHub alone:
+// slack and linear are real providers but have no outbound axis of their
+// own (their outbound credentials are still part of their ingress sets),
+// so they are refused exactly like a typo -- the property platform.Load
+// leans on to make NARVI_OUTBOUND_ENABLED=slack a loud boot failure.
+func TestParseOutboundProvider(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		raw    string
+		want   integrations.Provider
+		wantOK bool
+	}{
+		{"github", integrations.ProviderGitHub, true},
+		{"slack", "", false},
+		{"linear", "", false},
+		{"gihtub", "", false}, // a real near-miss typo of "github".
+		{"GitHub", "", false},
+		{"", "", false},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.raw, func(t *testing.T) {
+			t.Parallel()
+			got, ok := integrations.ParseOutboundProvider(tc.raw)
+			if ok != tc.wantOK || got != tc.want {
+				t.Errorf("ParseOutboundProvider(%q) = (%q, %v), want (%q, %v)", tc.raw, got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+
+	for _, p := range integrations.OutboundProviders {
+		if _, ok := integrations.ParseProvider(string(p)); !ok {
+			t.Errorf("OutboundProviders entry %q is not a known Provider -- the two lists must share one vocabulary", p)
+		}
+	}
+}
+
 // TestConfiguredSlack proves a partially-configured surface (missing
 // EITHER required secret) reads as NOT connected -- one case per missing
 // secret, per this Step's own "Tests that must exist" requirement.
