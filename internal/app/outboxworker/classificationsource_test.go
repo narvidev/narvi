@@ -6,9 +6,11 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // TestClassification_CoversEveryKindDeclaredInSource reads the notification
@@ -52,6 +54,84 @@ func TestClassification_CoversEveryKindDeclaredInSource(t *testing.T) {
 		if !declaredValues[string(kind)] {
 			t.Errorf("the classification table carries %q, which no NotificationKind constant declares any more", kind)
 		}
+	}
+}
+
+// TestRepeatability_CoversEveryKindDeclaredInSource is the same check for
+// the repeatability table (repeatability.go): every kind the port declares
+// says whether a second delivery adds to the first, and the table names no
+// kind the port does not declare. A kind missing here would be read as not
+// repeatable -- the safe direction -- but silently, so it is refused
+// instead, here and by NewBuilder.
+func TestRepeatability_CoversEveryKindDeclaredInSource(t *testing.T) {
+	declared := notificationKindsDeclaredInSource(t)
+	if len(declared) < 19 {
+		t.Fatalf("found only %d NotificationKind constants in the source; the parse is broken, not the table", len(declared))
+	}
+
+	declaredValues := make(map[string]bool, len(declared))
+	for _, name := range declared {
+		declaredValues[name.value] = true
+		if _, ok := notificationKindRepeatability[ports.NotificationKind(name.value)]; !ok {
+			t.Errorf("%s (%q) is declared in internal/app/ports/notifier.go but has no repeatability classification.\n"+
+				"    Say whether delivering it again after the remote end accepted it adds to its effect,\n"+
+				"    in notificationKindRepeatability, and why, in its comment.",
+				name.constName, name.value)
+		}
+	}
+	for kind := range notificationKindRepeatability {
+		if !declaredValues[string(kind)] {
+			t.Errorf("the repeatability table carries %q, which no NotificationKind constant declares any more", kind)
+		}
+	}
+}
+
+// TestCheckRepeatability pins NewBuilder's refusal: a registered kind the
+// repeatability table does not carry is named, and a map of classified
+// kinds passes.
+func TestCheckRepeatability(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		kinds    []ports.NotificationKind
+		wantMiss string
+	}{
+		{name: "every kind classified", kinds: []ports.NotificationKind{ports.NotificationKindSlack, ports.NotificationKindBlobDelete}},
+		{name: "one kind unclassified", kinds: []ports.NotificationKind{ports.NotificationKindSlack, "never_classified_kind"}, wantMiss: "never_classified_kind"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			notifiers := make(map[ports.NotificationKind]ports.Notifier, len(tc.kinds))
+			for _, kind := range tc.kinds {
+				notifiers[kind] = nil
+			}
+			err := checkRepeatability(notifiers)
+			if tc.wantMiss == "" {
+				if err != nil {
+					t.Fatalf("checkRepeatability = %v, want nil", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantMiss) {
+				t.Fatalf("checkRepeatability = %v, want a refusal naming %q", err, tc.wantMiss)
+			}
+		})
+	}
+}
+
+// TestNewBuilder_RefusesAKindWithoutRepeatability pins that NewBuilder
+// applies checkRepeatability to its finished map: a registered kind that
+// has an egress classification but no repeatability one is refused.
+func TestNewBuilder_RefusesAKindWithoutRepeatability(t *testing.T) {
+	const kind = ports.NotificationKindBlobDelete
+	saved, ok := notificationKindRepeatability[kind]
+	if !ok {
+		t.Fatalf("%q has no repeatability classification to remove", kind)
+	}
+	delete(notificationKindRepeatability, kind)
+	t.Cleanup(func() { notificationKindRepeatability[kind] = saved })
+
+	_, err := NewBuilder(nil, nil, map[ports.NotificationKind]ports.Notifier{kind: nil}, platform.DefaultTimeouts(), &platform.ShutdownState{})
+	if err == nil || !strings.Contains(err.Error(), string(kind)) {
+		t.Fatalf("NewBuilder = %v, want a refusal naming %q", err, kind)
 	}
 }
 

@@ -182,6 +182,12 @@ type App struct {
 	// when the server's shutdown begins.
 	sessionWaiter *sessionactivity.Waiter
 
+	// shutdown is this process's own shutdown state (§5.1), the one
+	// outboxBuilder reads. Run sets it as its drain begins, through the
+	// context it runs the outbox delivery worker on
+	// (platform.ShutdownState.Bind).
+	shutdown *platform.ShutdownState
+
 	// capabilities is docs/design/boundaries-design.md, section 1's own
 	// capability registry -- built once, here, from cfg.LicenseKey and the union of
 	// every composed module's own declared Capabilities. Named
@@ -3183,7 +3189,11 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		outboxNotifiers[ports.NotificationKindBlobDelete] = objstore.NewBlobDeleteNotifier(objStore)
 	}
 
-	outboxBuilder, err := outboxworker.NewBuilder(outboxStore, pool, outboxNotifiers, cfg.Timeouts)
+	// shutdown is this process's own shutdown state (§5.1): set by Run
+	// when its drain begins, and read by the outbox delivery worker to
+	// tell a delivery the drain cut short from one that failed.
+	shutdown := &platform.ShutdownState{}
+	outboxBuilder, err := outboxworker.NewBuilder(outboxStore, pool, outboxNotifiers, cfg.Timeouts, shutdown)
 	if err != nil {
 		return nil, fmt.Errorf("construct outbox delivery worker: %w", err)
 	}
@@ -3251,6 +3261,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		providerCredentialStore: providerCredentialStore,
 		chatGPTDeviceFlow:       chatGPTDeviceFlow,
 		sessionWaiter:           sessionWaiter,
+		shutdown:                shutdown,
 
 		capabilities:    capabilities,
 		knowledgeRanker: knowledgeRanker,
@@ -3356,11 +3367,11 @@ func (a *App) Run(ctx context.Context, addr string) error {
 	// goroutine (§11) -- with the identical context.Canceled carve-out
 	// RunTimerPump/RunExpiredTokenCleanup/recon.Run/builder.Run each
 	// already establish for normal shutdown.
+	//
+	// It runs on a context bound to this process's shutdown state, not on
+	// groupCtx itself -- see runOutbox.
 	group.Go(func() error {
-		if err := outboxBuilder.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
-			return fmt.Errorf("outbox delivery worker: %w", err)
-		}
-		return nil
+		return runOutbox(groupCtx, a.shutdown, outboxBuilder.Run)
 	})
 
 	// Blocking-finding fix #1 ("release PR review", §15.2): started/shut
@@ -3467,6 +3478,9 @@ func (a *App) Run(ctx context.Context, addr string) error {
 
 	group.Go(func() error {
 		<-groupCtx.Done()
+		// The drain begins here. This process's shutdown state was set as
+		// groupCtx ended (runOutbox), before the outbox worker's context
+		// ended.
 		slog.Info("narvi control-plane: shutting down", "grace_period", cfg.Timeouts.ShutdownGracePeriod.String())
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeouts.ShutdownGracePeriod)
@@ -3490,6 +3504,24 @@ func (a *App) Run(ctx context.Context, addr string) error {
 	})
 
 	return group.Wait()
+}
+
+// runOutbox runs the outbox delivery worker (run, outboxworker.Builder.Run
+// in production) on a context bound to this process's shutdown state
+// (technical plan §5.1): when groupCtx ends -- a signal, or another loop
+// failing, the moment Run's drain begins -- the state is set first and the
+// worker's context ends after it (platform.ShutdownState.Bind), so a
+// delivery the drain cuts short is always read as an interruption, never
+// counted as a failed attempt. This is where the process's shutdown state
+// is set. The worker's normal context.Canceled on shutdown is not an
+// error, as for every other loop Run starts.
+func runOutbox(groupCtx context.Context, shutdown *platform.ShutdownState, run func(context.Context) error) error {
+	ctx, stop := shutdown.Bind(groupCtx)
+	defer stop()
+	if err := run(ctx); err != nil && !errors.Is(err, context.Canceled) {
+		return fmt.Errorf("outbox delivery worker: %w", err)
+	}
+	return nil
 }
 
 // newHTTPServer is Run's HTTP server: addr and handler, and the replica's

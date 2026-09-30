@@ -299,7 +299,7 @@ func TestGetIntegrations_InboundOutboundIndependent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create outbox entry: %v", err)
 	}
-	if _, err := rig.outbox.RecordFailure(ctx, entry.ID, pgtype.Timestamptz{Time: time.Now().Add(time.Minute), Valid: true}, "posting to github failed: 503"); err != nil {
+	if _, err := rig.outbox.RecordFailure(ctx, entry.ID, pgtype.Timestamptz{Time: time.Now().Add(time.Minute), Valid: true}, "posting to github failed: 503", 0); err != nil {
 		t.Fatalf("record outbox failure: %v", err)
 	}
 

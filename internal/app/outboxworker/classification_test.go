@@ -42,7 +42,7 @@ func TestNewBuilder_RefusesToStart_OnUnclassifiedKind(t *testing.T) {
 		unclassifiedKind:            noopNotifier{},
 	}
 
-	_, err := outboxworker.NewBuilder(nil, nil, notifiers, platform.DefaultTimeouts())
+	_, err := outboxworker.NewBuilder(nil, nil, notifiers, platform.DefaultTimeouts(), &platform.ShutdownState{})
 	if err == nil {
 		t.Fatal("NewBuilder returned a nil error for a notifiers map containing an unclassified kind, want a refusal")
 	}
@@ -68,7 +68,7 @@ func TestNewBuilder_StartsCleanly_WhenEveryRegisteredKindIsClassified(t *testing
 	// this package's own sharedpool_integration_test.go -- installs a
 	// real one; either way Int64Gauge/Int64Counter construction cannot
 	// fail on a valid name/description).
-	if _, err := outboxworker.NewBuilder(nil, nil, notifiers, platform.DefaultTimeouts()); err != nil {
+	if _, err := outboxworker.NewBuilder(nil, nil, notifiers, platform.DefaultTimeouts(), &platform.ShutdownState{}); err != nil {
 		t.Fatalf("NewBuilder: %v, want success (every registered kind is classified)", err)
 	}
 }
@@ -129,7 +129,19 @@ func TestNotificationKindClassification_CoversEveryKnownKind(t *testing.T) {
 		notifiers[kind] = noopNotifier{}
 	}
 
-	if _, err := outboxworker.NewBuilder(nil, nil, notifiers, platform.DefaultTimeouts()); err != nil {
+	if _, err := outboxworker.NewBuilder(nil, nil, notifiers, platform.DefaultTimeouts(), &platform.ShutdownState{}); err != nil {
 		t.Fatalf("NewBuilder: %v, want success (every one of allKnownNotificationKinds must have a classification.go entry)", err)
+	}
+}
+
+// TestNewBuilder_RefusesToStart_WithoutShutdownState pins that a Builder
+// cannot be built blind to this process's shutdown (technical plan §5.1):
+// with no state to read, every delivery a deploy cuts short would be
+// counted as a failed attempt, silently.
+func TestNewBuilder_RefusesToStart_WithoutShutdownState(t *testing.T) {
+	notifiers := map[ports.NotificationKind]ports.Notifier{ports.NotificationKindSlack: noopNotifier{}}
+	_, err := outboxworker.NewBuilder(nil, nil, notifiers, platform.DefaultTimeouts(), nil)
+	if err == nil || !strings.Contains(err.Error(), "shutdown state") {
+		t.Fatalf("NewBuilder with no shutdown state = %v, want a refusal naming it", err)
 	}
 }

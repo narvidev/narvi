@@ -1,0 +1,63 @@
+-- §5.1's amendment: a delivery this process's own shutdown cuts short is not
+-- a failed attempt. The outbox delivery worker claims a row, and counts the
+-- attempt, before delivering; when the process's shutdown then cuts that
+-- delivery short, the worker gives the attempt back
+-- (domain/outbox.EvaluateFailure's deferral class, recorded by
+-- DeferOutboxEntry) -- but only so many times in a row
+-- (platform.Timeouts.OutboxMaxConsecutiveInterruptions), after which the
+-- interruption counts like any failed attempt, so a delivery interrupted
+-- every time still reaches dead-letter.
+--
+-- consecutive_interruptions is that run: how many deliveries of this row, in
+-- a row, this process's own shutdown has cut short. Every outcome the worker
+-- records writes it -- one more for an interruption, whether or not it kept
+-- its attempt, and zero for an attempt that completed, delivered or failed
+-- on its own merits. A claimed row the shutdown reached before its delivery
+-- started keeps the count it had: nothing was sent.
+--
+-- NOT NULL DEFAULT 0: every existing row, and every row a binary without
+-- this migration inserts, starts with no interruption behind it, which is
+-- exactly what such a row has had. No CHECK: the only writer is the worker,
+-- whose value comes from the pure decision, and a validating CHECK would
+-- scan the whole table under the lock the ALTER takes.
+--
+-- IF NOT EXISTS: see "Rolling back" -- a rollback that keeps the column
+-- leaves it in place when this file runs again.
+--
+-- # Locks
+--
+-- ADD COLUMN with a constant default is a catalog change in Postgres 11 and
+-- later: it rewrites nothing, but takes ACCESS EXCLUSIVE on outbox for the
+-- file's one implicit transaction, so every enqueue waits for it -- an
+-- instant.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with the column present. Every statement it
+-- sends to outbox names its columns (sqlc writes each SELECT * and
+-- RETURNING * out as a column list), and its one INSERT leaves this column
+-- to its default. So a pod still running it keeps enqueueing, claiming,
+-- delivering and recording failures, and ignores the column; an interruption
+-- it suffers is counted as before, and its failure writes leave the count
+-- as it was, so a row can carry a count from an older interruption into a
+-- later one -- the direction that makes an interruption count sooner, never
+-- later. migration000152_integration_test.go runs the previous binary's own
+-- statements against the column.
+--
+-- # Rolling back
+--
+-- Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for. So once this migration is applied, the
+-- previous binary cannot boot ("no migration found for version 152"): not
+-- a rolled-back pod, and not an older pod restarting in the middle of a
+-- rolling deploy. A rollback therefore takes one of two steps first, with
+-- the control plane scaled to zero:
+--   - Keep the column: with the golang-migrate CLI, `migrate force 151`.
+--     The previous binary then boots, since 151 is a version it has, and
+--     works with the column present as above. When this release is
+--     deployed again, this file runs again, and IF NOT EXISTS leaves the
+--     column and its counts as they are.
+--   - Drop it: run this migration's down (goto 151) with this release's
+--     migrations. The down file says what it removes.
+ALTER TABLE outbox ADD COLUMN IF NOT EXISTS consecutive_interruptions INTEGER NOT NULL DEFAULT 0;

@@ -1378,6 +1378,49 @@ type Timeouts struct {
 	// sequential processing time.
 	OutboxClaimDuration time.Duration
 
+	// --- §5.1's amendment: a delivery this process's own shutdown cuts
+	// short is not a failed attempt. The worker's context ends when the
+	// drain begins, so everything the outbox delivery worker records after
+	// that -- an interrupted delivery handed back, a claimed row it never
+	// started, a success that landed as the context ended -- is written on
+	// a context that outlives the shutdown instead, bounded here, and an
+	// interruption is spared its attempt only so many times in a row.
+
+	// OutboxShutdownRecordTimeout bounds the context the outbox delivery
+	// worker writes on once this process's shutdown has begun
+	// (internal/app/outboxworker's shutdownWrites): one per pump tick,
+	// created by the first write that needs it and shared by every later
+	// one in that tick, so everything one tick records after shutdown
+	// began finishes within this bound, however many claimed rows it
+	// covers. Each write is one single-row UPDATE. Validate keeps it below
+	// ShutdownGracePeriod, with no margin -- an ordering, not a race: the
+	// worker is one of the loops the process waits for before it exits, so
+	// a bound at or past the grace would let this write hold the process
+	// past it. Not specified in the plan; chosen as 3s -- ample for twenty
+	// single-row writes on a reachable database, and leaving most of the
+	// 10s grace to the HTTP drain it runs beside.
+	OutboxShutdownRecordTimeout time.Duration
+
+	// OutboxMaxConsecutiveInterruptions is how many times in a row a
+	// delivery may be cut short by this process's own shutdown and still
+	// keep its attempt (technical plan §5.1; domain/outbox.EvaluateFailure,
+	// which applies it): the outbox row carries the count
+	// (outbox.consecutive_interruptions, migrations/000152), reset when an
+	// attempt completes, and the interruption past this bound counts as an
+	// ordinary failed attempt. It is the outbox's own retry bound, kept
+	// beside the outbox's other retry settings rather than with the
+	// synchronous *MaxAttempts counts, which bound a single call's retries
+	// within one request. The bound is what keeps a delivery that is
+	// interrupted every time -- a pod restarted each time it reaches that
+	// row, gracefully enough to set the shutdown state -- on its way to
+	// dead-letter rather than retrying forever. Validate refuses a value
+	// below 1: zero would make every interruption count, silently switching
+	// the rule off. Not specified in the plan; chosen as 3 -- a rolling
+	// deploy interrupts a delivery once per replica it lands on, and three
+	// deploys in a row landing on the same row's delivery is already not a
+	// deploy but a pattern.
+	OutboxMaxConsecutiveInterruptions int
+
 	// --- §8.3 standalone addition ("intent classifier", §8.3/§18): no
 	// ordering relationship with either invariant chain above (or with any
 	// prior Step's standalone additions), so -- per those additions' own
@@ -3909,6 +3952,9 @@ func DefaultTimeouts() Timeouts {
 		OutboxDeliveryTimeout: 15 * time.Second, // not specified; chosen, generous for a single outbound notifier POST
 		OutboxClaimDuration:   45 * time.Second, // not specified; chosen -- exactly MinTimeoutMargin above OutboxDeliveryTimeout (audit fix H6, see field doc comment)
 
+		OutboxShutdownRecordTimeout:       3 * time.Second, // §5.1; not specified, chosen -- below ShutdownGracePeriod, see field doc comment
+		OutboxMaxConsecutiveInterruptions: 3,               // §5.1; not specified, chosen -- see field doc comment
+
 		IntentClassifierLLMTimeout: 10 * time.Second, // not specified; chosen, matches RepoSHAResolutionTimeout's own "lightweight call" reasoning
 
 		IdentityEmailFetchTimeout:              800 * time.Millisecond, // audit fix HIGH -- was 300ms (itself audit fix L5's shrink from 10s); see field doc comment for why 300ms was unrealistically tight and why 800ms (reusing SlackInteractivityIdentityFetchTimeout's own precedent) is the realistic figure
@@ -4351,6 +4397,28 @@ func (t Timeouts) Validate() error {
 		}
 	}
 	countMustBePositive("MCPRegisterRateBurst", t.MCPRegisterRateBurst)
+
+	// §5.1: what the outbox delivery worker records once this process's
+	// shutdown has begun is written on a context that outlives the
+	// shutdown, and that context must end before the grace does -- the
+	// worker is one of the loops the process waits for before exiting. A
+	// zero bound would fail every such write at once. An ordering, not a
+	// race, so no margin, like StopDescendantWalkTimeout's above. See
+	// OutboxShutdownRecordTimeout's own doc comment.
+	mustBePositive("OutboxShutdownRecordTimeout", t.OutboxShutdownRecordTimeout)
+	if t.OutboxShutdownRecordTimeout >= t.ShutdownGracePeriod {
+		errs = append(errs, &TimeoutInvariantError{
+			Chain:        "ShutdownGracePeriod > OutboxShutdownRecordTimeout",
+			LesserField:  "OutboxShutdownRecordTimeout",
+			LesserValue:  t.OutboxShutdownRecordTimeout,
+			GreaterField: "ShutdownGracePeriod",
+			GreaterValue: t.ShutdownGracePeriod,
+		})
+	}
+	// §5.1: the bound on interruptions in a row that keep their attempt.
+	// Below one, every interruption would count, silently switching the
+	// rule off. See OutboxMaxConsecutiveInterruptions' own doc comment.
+	countMustBePositive("OutboxMaxConsecutiveInterruptions", t.OutboxMaxConsecutiveInterruptions)
 
 	// §43.14: the token and authorization endpoints' brakes, the same shape
 	// as the registration limit's (fail OPEN at a zero interval, refuse

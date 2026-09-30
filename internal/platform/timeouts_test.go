@@ -2614,6 +2614,71 @@ func TestValidate_StopDescendantWalkTimeout(t *testing.T) {
 	}
 }
 
+// TestValidate_OutboxShutdownRecording pins the two settings of §5.1's
+// shutdown rule for the outbox: the shipped values (3s, 3), the record
+// bound refused at zero or below and at or past ShutdownGracePeriod (the
+// write would hold the process past its grace), and the interruption bound
+// refused below one (every interruption would count). Each broken setting
+// yields its own error, and each boundary that still holds is accepted.
+func TestValidate_OutboxShutdownRecording(t *testing.T) {
+	t.Parallel()
+
+	defaults := platform.DefaultTimeouts()
+	if got := defaults.OutboxShutdownRecordTimeout; got != 3*time.Second {
+		t.Fatalf("DefaultTimeouts().OutboxShutdownRecordTimeout = %v, want 3s", got)
+	}
+	if got := defaults.OutboxMaxConsecutiveInterruptions; got != 3 {
+		t.Fatalf("DefaultTimeouts().OutboxMaxConsecutiveInterruptions = %d, want 3", got)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*platform.Timeouts)
+		wantField string // a *TimeoutMustBePositiveError naming this field
+		wantChain string // or a *TimeoutInvariantError with this chain
+		wantCount string // or a *CountMustBePositiveError naming this field
+	}{
+		{name: "record bound zero", mutate: func(to *platform.Timeouts) { to.OutboxShutdownRecordTimeout = 0 }, wantField: "OutboxShutdownRecordTimeout"},
+		{name: "record bound negative", mutate: func(to *platform.Timeouts) { to.OutboxShutdownRecordTimeout = -time.Second }, wantField: "OutboxShutdownRecordTimeout"},
+		{name: "record bound at ShutdownGracePeriod", mutate: func(to *platform.Timeouts) { to.OutboxShutdownRecordTimeout = to.ShutdownGracePeriod }, wantChain: "ShutdownGracePeriod > OutboxShutdownRecordTimeout"},
+		{name: "interruption bound zero", mutate: func(to *platform.Timeouts) { to.OutboxMaxConsecutiveInterruptions = 0 }, wantCount: "OutboxMaxConsecutiveInterruptions"},
+		{name: "interruption bound negative", mutate: func(to *platform.Timeouts) { to.OutboxMaxConsecutiveInterruptions = -1 }, wantCount: "OutboxMaxConsecutiveInterruptions"},
+		{name: "record bound just below the grace", mutate: func(to *platform.Timeouts) {
+			to.OutboxShutdownRecordTimeout = to.ShutdownGracePeriod - time.Millisecond
+		}},
+		{name: "interruption bound one", mutate: func(to *platform.Timeouts) { to.OutboxMaxConsecutiveInterruptions = 1 }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			switch {
+			case tc.wantField != "":
+				var pos *platform.TimeoutMustBePositiveError
+				if !errors.As(err, &pos) || pos.Field != tc.wantField {
+					t.Fatalf("Validate() = %v, want %s refused as non-positive", err, tc.wantField)
+				}
+			case tc.wantChain != "":
+				var inv *platform.TimeoutInvariantError
+				if !errors.As(err, &inv) || inv.Chain != tc.wantChain {
+					t.Fatalf("Validate() = %v, want the broken link %q", err, tc.wantChain)
+				}
+			case tc.wantCount != "":
+				var cnt *platform.CountMustBePositiveError
+				if !errors.As(err, &cnt) || cnt.Field != tc.wantCount {
+					t.Fatalf("Validate() = %v, want %s refused as below one", err, tc.wantCount)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+			}
+		})
+	}
+}
+
 // TestValidate_StopGrace pins StopGrace (technical plan §3.3's stop): the
 // shipped 30s, refused at zero or below, and refused unless TurnDeadline
 // exceeds it by MinTimeoutMargin -- a stopped turn in flight must be

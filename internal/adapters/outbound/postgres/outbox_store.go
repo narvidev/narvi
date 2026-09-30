@@ -144,24 +144,52 @@ func (s *OutboxStore) MarkDelivered(ctx context.Context, id pgtype.UUID) (sqlcge
 // RecordFailure records a failed delivery attempt still eligible for
 // another retry: nextAttemptAt is the caller's own domain/outbox.
 // EvaluateBackoff-computed value, lastError captures the notifier's own
-// error for observability. Returns pgx.ErrNoRows if id's row is no longer
-// 'pending', mirroring MarkDelivered's own identical guard.
-func (s *OutboxStore) RecordFailure(ctx context.Context, id pgtype.UUID, nextAttemptAt pgtype.Timestamptz, lastError string) (sqlcgen.Outbox, error) {
+// error for observability, and consecutiveInterruptions is the row's run of
+// shutdown interruptions as domain/outbox.EvaluateFailure decided it (zero
+// for an attempt that completed). Returns pgx.ErrNoRows if id's row is no
+// longer 'pending', mirroring MarkDelivered's own identical guard.
+func (s *OutboxStore) RecordFailure(ctx context.Context, id pgtype.UUID, nextAttemptAt pgtype.Timestamptz, lastError string, consecutiveInterruptions int32) (sqlcgen.Outbox, error) {
 	return s.q.RecordOutboxEntryFailure(ctx, sqlcgen.RecordOutboxEntryFailureParams{
-		ID:            id,
-		NextAttemptAt: nextAttemptAt,
-		LastError:     &lastError,
+		ID:                       id,
+		NextAttemptAt:            nextAttemptAt,
+		LastError:                &lastError,
+		ConsecutiveInterruptions: consecutiveInterruptions,
 	})
 }
 
 // MarkDeadLetter records a failed delivery attempt that has exhausted
-// domain/outbox.MaxAttempts. Returns pgx.ErrNoRows if id's row is no
+// domain/outbox.MaxAttempts, with the run of shutdown interruptions
+// decided as for RecordFailure. Returns pgx.ErrNoRows if id's row is no
 // longer 'pending', mirroring MarkDelivered/RecordFailure's own identical
 // guard.
-func (s *OutboxStore) MarkDeadLetter(ctx context.Context, id pgtype.UUID, lastError string) (sqlcgen.Outbox, error) {
+func (s *OutboxStore) MarkDeadLetter(ctx context.Context, id pgtype.UUID, lastError string, consecutiveInterruptions int32) (sqlcgen.Outbox, error) {
 	return s.q.MarkOutboxEntryDeadLetter(ctx, sqlcgen.MarkOutboxEntryDeadLetterParams{
-		ID:        id,
-		LastError: &lastError,
+		ID:                       id,
+		LastError:                &lastError,
+		ConsecutiveInterruptions: consecutiveInterruptions,
+	})
+}
+
+// Defer records a failure of the class that does not consume an attempt
+// (domain/outbox.ClassDeferred, technical plan §5.1 and §44.2): gives back
+// the attempt the claim counted and makes the row due again at
+// nextAttemptAt. lastError nil leaves the row's last error as it was (a
+// delivery that never started); consecutiveInterruptions is the decided
+// run.
+//
+// expectedNextAttemptAt is a compare-and-swap value, exactly as for
+// RenewClaim: the next_attempt_at this caller last observed for the row.
+// Returns pgx.ErrNoRows if the row is no longer 'pending' OR another
+// builder has re-claimed it since -- the attempt then stays counted,
+// since taking it back would take back that builder's (see
+// DeferOutboxEntry's own generated doc comment).
+func (s *OutboxStore) Defer(ctx context.Context, id pgtype.UUID, nextAttemptAt, expectedNextAttemptAt pgtype.Timestamptz, lastError *string, consecutiveInterruptions int32) (sqlcgen.Outbox, error) {
+	return s.q.DeferOutboxEntry(ctx, sqlcgen.DeferOutboxEntryParams{
+		ID:                       id,
+		NextAttemptAt:            nextAttemptAt,
+		LastError:                lastError,
+		ConsecutiveInterruptions: consecutiveInterruptions,
+		ExpectedNextAttemptAt:    expectedNextAttemptAt,
 	})
 }
 

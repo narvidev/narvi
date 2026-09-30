@@ -2049,19 +2049,20 @@ type OpencodeConfig struct {
 }
 
 type Outbox struct {
-	ID                 pgtype.UUID        `json:"id"`
-	SessionID          pgtype.UUID        `json:"session_id"`
-	Kind               string             `json:"kind"`
-	Payload            []byte             `json:"payload"`
-	Status             OutboxStatus       `json:"status"`
-	Attempts           int32              `json:"attempts"`
-	NextAttemptAt      pgtype.Timestamptz `json:"next_attempt_at"`
-	DeliveredAt        pgtype.Timestamptz `json:"delivered_at"`
-	LastError          *string            `json:"last_error"`
-	CreatedAt          pgtype.Timestamptz `json:"created_at"`
-	CorrelationID      *string            `json:"correlation_id"`
-	SuppressedInShadow bool               `json:"suppressed_in_shadow"`
-	DeliveredToLedger  bool               `json:"delivered_to_ledger"`
+	ID                       pgtype.UUID        `json:"id"`
+	SessionID                pgtype.UUID        `json:"session_id"`
+	Kind                     string             `json:"kind"`
+	Payload                  []byte             `json:"payload"`
+	Status                   OutboxStatus       `json:"status"`
+	Attempts                 int32              `json:"attempts"`
+	NextAttemptAt            pgtype.Timestamptz `json:"next_attempt_at"`
+	DeliveredAt              pgtype.Timestamptz `json:"delivered_at"`
+	LastError                *string            `json:"last_error"`
+	CreatedAt                pgtype.Timestamptz `json:"created_at"`
+	CorrelationID            *string            `json:"correlation_id"`
+	SuppressedInShadow       bool               `json:"suppressed_in_shadow"`
+	DeliveredToLedger        bool               `json:"delivered_to_ledger"`
+	ConsecutiveInterruptions int32              `json:"consecutive_interruptions"`
 }
 
 type Participant struct {

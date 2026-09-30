@@ -79,8 +79,10 @@ RETURNING *;
 -- Records a successful delivery: status='delivered', delivered_at=now().
 -- Guarded by "AND status = 'pending'", mirroring RecordImageBuildSuccess's
 -- own identical guard against a stale/already-superseded row.
+-- consecutive_interruptions goes back to zero: this attempt completed
+-- (§5.1, migrations/000152).
 UPDATE outbox
-SET status = 'delivered', delivered_at = now()
+SET status = 'delivered', delivered_at = now(), consecutive_interruptions = 0
 WHERE id = $1 AND status = 'pending'
 RETURNING *;
 
@@ -107,8 +109,11 @@ RETURNING *;
 -- surface built to show it. The column records the row's EFFECTIVE mode,
 -- and by the time this statement runs that mode is shadow whichever half
 -- of the rule decided it.
+--
+-- consecutive_interruptions goes back to zero, as in
+-- MarkOutboxEntryDelivered: this attempt completed.
 UPDATE outbox
-SET status = 'delivered', delivered_at = now(), delivered_to_ledger = true, suppressed_in_shadow = true
+SET status = 'delivered', delivered_at = now(), delivered_to_ledger = true, suppressed_in_shadow = true, consecutive_interruptions = 0
 WHERE id = $1 AND status = 'pending'
 RETURNING *;
 
@@ -120,8 +125,15 @@ RETURNING *;
 -- error for observability. attempts is NOT incremented again here --
 -- ClaimOutboxEntry already counted this attempt. Same "AND status =
 -- 'pending'" guard as MarkOutboxEntryDelivered, for the identical reason.
+--
+-- consecutive_interruptions is the value domain/outbox.EvaluateFailure
+-- decided (§5.1, migrations/000152): zero for an attempt that completed
+-- and failed on its own merits, one more for a delivery this process's
+-- shutdown cut short that counts all the same -- past
+-- platform.Timeouts.OutboxMaxConsecutiveInterruptions, past its own
+-- delivery timeout, or of a kind not safe to repeat.
 UPDATE outbox
-SET next_attempt_at = $2, last_error = $3
+SET next_attempt_at = $2, last_error = $3, consecutive_interruptions = sqlc.arg('consecutive_interruptions')
 WHERE id = $1 AND status = 'pending'
 RETURNING *;
 
@@ -130,9 +142,41 @@ RETURNING *;
 -- MaxAttempts: status='dead_letter', last_error captures the notifier's
 -- own final error. Same "AND status = 'pending'" guard as
 -- MarkOutboxEntryDelivered/RecordOutboxEntryFailure above.
+-- consecutive_interruptions is the decided value, as in
+-- RecordOutboxEntryFailure.
 UPDATE outbox
-SET status = 'dead_letter', last_error = $2
+SET status = 'dead_letter', last_error = $2, consecutive_interruptions = sqlc.arg('consecutive_interruptions')
 WHERE id = $1 AND status = 'pending'
+RETURNING *;
+
+-- name: DeferOutboxEntry :one
+-- Records a failure of the class that does not consume an attempt
+-- (domain/outbox.ClassDeferred, §5.1 and §44.2): gives back the attempt
+-- ClaimOutboxEntry counted and makes the row due again at the caller's
+-- own next_attempt_at, without moving it toward dead-letter. Today its one
+-- cause is this process's own shutdown cutting a delivery short, or
+-- reaching a claimed row before its delivery started; a rate limit whose
+-- deadline GitHub stated (§44.2) is the next.
+--
+-- A genuine compare-and-swap on next_attempt_at, like RenewOutboxClaim's,
+-- not only a status guard: this statement takes an attempt BACK, so it must
+-- not land on a row another builder has re-claimed since this caller last
+-- observed it -- that builder's own claim counted ITS attempt, and taking
+-- it back would let the row retry past MaxAttempts. Once another builder
+-- has moved next_attempt_at on, this matches no row (pgx.ErrNoRows), and
+-- the attempt stays counted. GREATEST keeps attempts from going below zero
+-- whatever a caller passes.
+--
+-- last_error is left as it was when the caller passes NULL (a row whose
+-- delivery never started has nothing to say), and
+-- consecutive_interruptions is the decided value: one more for an
+-- interrupted delivery, unchanged for a row never started.
+UPDATE outbox
+SET attempts = GREATEST(attempts - 1, 0),
+    next_attempt_at = $2,
+    last_error = COALESCE(sqlc.narg('last_error'), last_error),
+    consecutive_interruptions = sqlc.arg('consecutive_interruptions')
+WHERE id = $1 AND status = 'pending' AND next_attempt_at = sqlc.arg('expected_next_attempt_at')
 RETURNING *;
 
 -- name: RenewOutboxClaim :one
