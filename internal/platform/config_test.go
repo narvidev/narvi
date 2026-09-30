@@ -798,11 +798,16 @@ func TestLoadRWXPreviewsRequireGitHubOutbound(t *testing.T) {
 		rwx      string
 		wantRWX  bool // want *RWXPreviewsRequireGitHubOutboundError
 		wantOK   bool
+		// wantUndeclaredAlone: the outbound axis is undeclared (rule R1),
+		// so R6 -- keyed on that axis -- is not evaluated, and
+		// UndeclaredOutboundError is the one error reported.
+		wantUndeclaredAlone bool
 	}{
 		{name: "RWX set, outbound off, ingress off: refused", ingress: ptr("slack,linear"), outbound: ptr(""), rwx: "test-rwx-access-token", wantRWX: true},
 		{name: "RWX set, outbound on, ingress off: boots", ingress: ptr("slack,linear"), outbound: ptr("github"), rwx: "test-rwx-access-token", wantOK: true},
 		{name: "RWX set, outbound defaulted on by GitHub ingress: boots", rwx: "test-rwx-access-token", wantOK: true},
 		{name: "RWX unset, outbound off, ingress off: boots", ingress: ptr("slack,linear"), outbound: ptr(""), wantOK: true},
+		{name: "RWX set, outbound undeclared, ingress off: the undeclared axis alone", ingress: ptr("slack,linear"), rwx: "test-rwx-access-token", wantUndeclaredAlone: true},
 	}
 
 	for _, tc := range tests {
@@ -823,6 +828,13 @@ func TestLoadRWXPreviewsRequireGitHubOutbound(t *testing.T) {
 			var rwxErr *platform.RWXPreviewsRequireGitHubOutboundError
 			if got := errors.As(err, &rwxErr); got != tc.wantRWX {
 				t.Fatalf("Load() error = %v; errors.As(*RWXPreviewsRequireGitHubOutboundError) = %v, want %v", err, got, tc.wantRWX)
+			}
+			if tc.wantUndeclaredAlone {
+				leaves := flattenJoinedErrors(err)
+				var undErr *platform.UndeclaredOutboundError
+				if len(leaves) != 1 || !errors.As(leaves[0], &undErr) {
+					t.Fatalf("Load() error = %v, want *UndeclaredOutboundError alone", err)
+				}
 			}
 			if tc.wantOK {
 				if err != nil {
@@ -987,7 +999,7 @@ func TestLoadOutboundAxis(t *testing.T) {
 					if !errors.As(leaves[0], &undErr) {
 						t.Fatalf("Load() error = %v, want *UndeclaredOutboundError", err)
 					}
-					for _, fragment := range []string{"NARVI_OUTBOUND_ENABLED=github", "NARVI_GITHUB_BOT_TOKEN", "NARVI_OUTBOUND_ENABLED= (empty)"} {
+					for _, fragment := range []string{"NARVI_OUTBOUND_ENABLED=github", "NARVI_GITHUB_BOT_TOKEN", "NARVI_OUTBOUND_ENABLED= (empty)", "auto-merge and release-manifest workers", "never posted before"} {
 						if !strings.Contains(undErr.Error(), fragment) {
 							t.Errorf("UndeclaredOutboundError.Error() = %q, want it to contain %q", undErr.Error(), fragment)
 						}
@@ -995,6 +1007,74 @@ func TestLoadOutboundAxis(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestLoadInvalidIngressEntry_ReportedAlone proves rule R1 applies only to
+// a fully valid NARVI_INGRESS_ENABLED: when an entry is invalid (a wrong
+// case "GitHub" is not an exclusion of github, it is a typo), whether the
+// list "excludes github" is not known, so InvalidIngressEnabledError is the
+// one error reported -- not beside UndeclaredOutboundError, whose advice
+// would send the operator round a second restart once the typo is fixed --
+// and neither is R6, keyed on the still-undeclared outbound axis.
+func TestLoadInvalidIngressEntry_ReportedAlone(t *testing.T) {
+	tests := []struct {
+		name    string
+		ingress string
+		rwx     string
+	}{
+		{name: "wrong case github, outbound unset", ingress: "GitHub,slack"},
+		{name: "a typo alone, outbound unset", ingress: "slcak"},
+		{name: "wrong case github, outbound unset, RWX set", ingress: "GitHub,slack", rwx: "test-rwx-access-token"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			setOrUnsetEnv(t, "NARVI_INGRESS_ENABLED", ptr(tc.ingress))
+			setOrUnsetEnv(t, "NARVI_OUTBOUND_ENABLED", nil)
+			t.Setenv("NARVI_RWX_ACCESS_TOKEN", tc.rwx)
+
+			_, err := platform.Load()
+			leaves := flattenJoinedErrors(err)
+			var invErr *platform.InvalidIngressEnabledError
+			if len(leaves) != 1 || !errors.As(leaves[0], &invErr) {
+				t.Fatalf("Load() error = %v, want *InvalidIngressEnabledError alone", err)
+			}
+		})
+	}
+}
+
+// TestLoadBotHandleStoredOnlyWithGitHubIngress proves the bot handle is
+// kept exactly while GitHub ingress is on: it names a mention only the
+// webhook listens for, so with ingress off a set NARVI_GITHUB_BOT_HANDLE is
+// ignored, never stored, and a verdict posted through GitHub outbound
+// renders reviewpost.RerunGuidance's button-only sentence rather than a
+// mention nothing would act on.
+func TestLoadBotHandleStoredOnlyWithGitHubIngress(t *testing.T) {
+	tests := []struct {
+		name       string
+		ingress    *string
+		outbound   *string
+		wantHandle string
+	}{
+		{name: "GitHub ingress on: stored", wantHandle: "test-bot"},
+		{name: "GitHub ingress off, outbound on, handle set: not stored", ingress: ptr("slack,linear"), outbound: ptr("github")},
+		{name: "GitHub ingress off, outbound off, handle set: not stored", ingress: ptr("slack,linear"), outbound: ptr("")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t) // sets NARVI_GITHUB_BOT_HANDLE=test-bot
+			setOrUnsetEnv(t, "NARVI_INGRESS_ENABLED", tc.ingress)
+			setOrUnsetEnv(t, "NARVI_OUTBOUND_ENABLED", tc.outbound)
+
+			cfg, err := platform.Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v, want nil", err)
+			}
+			if cfg.GitHubBotHandle != tc.wantHandle {
+				t.Errorf("Load().GitHubBotHandle = %q, want %q", cfg.GitHubBotHandle, tc.wantHandle)
+			}
+		})
 	}
 }
 

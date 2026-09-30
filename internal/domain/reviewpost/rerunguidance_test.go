@@ -36,16 +36,20 @@ func TestRerunGuidance_DifferentHandles(t *testing.T) {
 }
 
 // TestRerunGuidance_EmptyHandle_ButtonOnly proves a deployment with no bot
-// handle -- GitHub outbound on, GitHub ingress off (§12.5) -- gets the
-// label/button guidance alone: never a bare "@" mention nobody could type
-// and nothing would detect.
+// handle -- GitHub outbound on, GitHub ingress off (§12.5), where
+// platform.Load stores no handle -- gets the web button alone: never a
+// bare "@" mention, and never the re-review label, since only the GitHub
+// webhook listens for either.
 func TestRerunGuidance_EmptyHandle_ButtonOnly(t *testing.T) {
 	got := reviewpost.RerunGuidance("")
 
 	if strings.Contains(got, "@") {
 		t.Errorf("RerunGuidance(\"\") = %q, want no mention at all", got)
 	}
-	if !strings.Contains(got, "re-review label or button") {
-		t.Errorf("RerunGuidance(\"\") = %q, want it to point at the configured re-review label or button", got)
+	if strings.Contains(strings.ToLower(got), "label") {
+		t.Errorf("RerunGuidance(\"\") = %q, want no re-review label: only the GitHub webhook detects one", got)
+	}
+	if !strings.Contains(got, "Re-run review button") {
+		t.Errorf("RerunGuidance(\"\") = %q, want it to point at the web review screen's Re-run review button", got)
 	}
 }

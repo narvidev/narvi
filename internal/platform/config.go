@@ -492,15 +492,25 @@ func (e *InvalidOutboundEnabledError) Error() string {
 }
 
 // UndeclaredOutboundError is returned by Load when NARVI_INGRESS_ENABLED is
-// set and excludes github while NARVI_OUTBOUND_ENABLED is unset (rule R1,
-// §12.5). Returned alone: whether NARVI_GITHUB_BOT_TOKEN is required
-// depends on the answer, so no token error is reported beside it.
+// set, valid, and excludes github while NARVI_OUTBOUND_ENABLED is unset
+// (rule R1, §12.5). Returned alone: whether NARVI_GITHUB_BOT_TOKEN is
+// required depends on the answer, so no token error is reported beside it.
+//
+// Neither answer reproduces this deployment shape as it ran before the
+// axis existed, and the message says what each one changes. Before, such a
+// deployment posted nothing to GitHub -- every GitHub notifier was gated
+// on ingress -- yet still ran the auto-merge and release-manifest workers
+// and, when a bot token was set, read pull requests with it.
 type UndeclaredOutboundError struct{}
 
 func (e *UndeclaredOutboundError) Error() string {
 	return fmt.Sprintf(
-		"%s excludes github, so whether this deployment still calls GitHub as its bot cannot be inferred: set %s=github (with %s) to keep reviews, comments, statuses and auto-merge, or %s= (empty) for none",
-		ingressEnabledEnvVarName, outboundEnabledEnvVarName, gitHubBotTokenEnvVarName, outboundEnabledEnvVarName,
+		"%s excludes github, so whether this deployment calls GitHub as its bot cannot be inferred -- declare it: "+
+			"%s= (empty) calls GitHub not at all, which posts nothing, as before, but also stops the auto-merge and release-manifest workers and the live pull request reads a set %s used to serve; "+
+			"%s=github (with %s) calls GitHub as the bot for everything, which also posts reviews, comments, labels, check runs and statuses this deployment never posted before",
+		ingressEnabledEnvVarName,
+		outboundEnabledEnvVarName, gitHubBotTokenEnvVarName,
+		outboundEnabledEnvVarName, gitHubBotTokenEnvVarName,
 	)
 }
 
@@ -572,8 +582,9 @@ func (e *RWXPreviewsRequireGitHubOutboundError) Error() string {
 // there is no safe placeholder webhook secret, and a misconfigured/empty
 // bot handle would silently make this entire ingress route never detect a
 // single mention. A deployment that never enables GitHub ingress at all
-// never has either checked, and both simply read as "" (Config.
-// IngressEnabled gates the check, not this pair's own zero value).
+// never has either checked (Config.IngressEnabled gates the check, not this
+// pair's own zero value), and its bot handle is never stored: Config.
+// GitHubBotHandle reads "" whenever GitHub ingress is off.
 const (
 	gitHubWebhookSecretEnvVarName = "NARVI_GITHUB_WEBHOOK_SECRET"
 	gitHubBotHandleEnvVarName     = "NARVI_GITHUB_BOT_HANDLE"
@@ -1799,9 +1810,12 @@ type Config struct {
 	// GitHubWebhookSecret and GitHubBotHandle configure §8.2's
 	// ("GitHub ingress", §8.2) webhook adapter, read from
 	// NARVI_GITHUB_WEBHOOK_SECRET / NARVI_GITHUB_BOT_HANDLE. Both required
-	// in every stage -- never defaulted. See gitHubWebhookSecretEnvVarName's
-	// own doc comment above for why GitHubWebhookSecret is a DISTINCT
-	// secret from HMACWebhookSecret.
+	// in every stage while GitHub ingress is on -- never defaulted. See
+	// gitHubWebhookSecretEnvVarName's own doc comment above for why
+	// GitHubWebhookSecret is a DISTINCT secret from HMACWebhookSecret.
+	// GitHubBotHandle is "" whenever GitHub ingress is off, whatever the
+	// variable says (§12.5): it names a mention only the webhook listens
+	// for, and reviewpost.RerunGuidance keys its button-only sentence on it.
 	GitHubWebhookSecret string
 	GitHubBotHandle     string
 
@@ -2406,12 +2420,14 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		integrations.ProviderLinear: true,
 		integrations.ProviderGitHub: true,
 	}
+	ingressValid := true
 	if rawIngressEnabled, isSet := lookupEnv(ingressEnabledEnvVarName); isSet {
 		ingressEnabled = make(map[integrations.Provider]bool, len(integrations.Providers))
 		for _, entry := range parseCommaSeparatedList(rawIngressEnabled) {
 			p, ok := integrations.ParseProvider(entry)
 			if !ok {
 				errs = append(errs, &InvalidIngressEnabledError{Value: entry})
+				ingressValid = false
 				continue
 			}
 			ingressEnabled[p] = true
@@ -2421,9 +2437,13 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 	// githubOutbound (§12.5's outbound axis, outboundEnabledEnvVarName's own
 	// doc comment): resolved right after ingress, since unset follows it
 	// when -- and only when -- GitHub ingress is on. outboundDeclared is
-	// false only under rule R1 (unset while ingress excludes github), where
-	// the axis is unknown: nothing keyed on it (R3, R4, R6) is evaluated,
-	// so UndeclaredOutboundError is reported alone.
+	// false only when the variable is unset and GitHub ingress is off, where
+	// the axis is unknown: nothing keyed on it (R3, R4, R6) is evaluated.
+	// That is rule R1, and UndeclaredOutboundError is then reported alone --
+	// unless NARVI_INGRESS_ENABLED itself carried an invalid entry, in which
+	// case whether it "excludes github" is not known either (a mistyped
+	// "GitHub" is not an exclusion), and InvalidIngressEnabledError is the
+	// one error to act on.
 	githubIngress := ingressEnabled[integrations.ProviderGitHub]
 	outboundEnabled := map[integrations.Provider]bool{}
 	outboundDeclared := true
@@ -2442,7 +2462,9 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		outboundRequiredBy = "GitHub outbound is enabled (" + outboundEnabledEnvVarName + " is unset, which means github while GitHub ingress is on)"
 	} else {
 		outboundDeclared = false
-		errs = append(errs, &UndeclaredOutboundError{})
+		if ingressValid {
+			errs = append(errs, &UndeclaredOutboundError{})
+		}
 	}
 	githubOutbound := outboundEnabled[integrations.ProviderGitHub]
 	if githubIngress && outboundDeclared && !githubOutbound {
@@ -2541,9 +2563,18 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubWebhookSecretEnvVarName})
 	}
 
+	// The bot handle is stored only while GitHub ingress is on. It names the
+	// mention only the webhook listens for, so with ingress off a set value
+	// is ignored, never stored -- the way R5 treats the bot token -- and the
+	// re-run guidance a posted verdict carries (reviewpost.RerunGuidance)
+	// then points at the web button alone rather than at a mention nothing
+	// would act on.
 	gitHubBotHandle := getenv(gitHubBotHandleEnvVarName)
 	if ingressEnabled[integrations.ProviderGitHub] && gitHubBotHandle == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubBotHandleEnvVarName})
+	}
+	if !ingressEnabled[integrations.ProviderGitHub] {
+		gitHubBotHandle = ""
 	}
 
 	// gitHubReReviewLabel is DELIBERATELY OPTIONAL -- see its own env-var
