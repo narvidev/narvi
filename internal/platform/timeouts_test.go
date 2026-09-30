@@ -2649,6 +2649,46 @@ func TestDefaultTimeouts_GitHubAppMintFinishesBeforeCredentialFetch(t *testing.T
 	}
 }
 
+// TestValidate_PostgresVersionCheckTimeout pins the bound on boot's read of
+// the Postgres server's version (technical plan §5.1): the shipped 15 s,
+// refused at zero or below, and accepted at any positive value.
+func TestValidate_PostgresVersionCheckTimeout(t *testing.T) {
+	t.Parallel()
+
+	if got := platform.DefaultTimeouts().PostgresVersionCheckTimeout; got != 15*time.Second {
+		t.Fatalf("DefaultTimeouts().PostgresVersionCheckTimeout = %v, want 15s", got)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		value   time.Duration
+		refused bool
+	}{
+		{name: "zero", value: 0, refused: true},
+		{name: "negative", value: -time.Second, refused: true},
+		{name: "one millisecond", value: time.Millisecond},
+		{name: "a minute", value: time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			to.PostgresVersionCheckTimeout = tc.value
+			err := to.Validate()
+			if !tc.refused {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			var pos *platform.TimeoutMustBePositiveError
+			if !errors.As(err, &pos) || pos.Field != "PostgresVersionCheckTimeout" {
+				t.Fatalf("Validate() = %v, want PostgresVersionCheckTimeout refused as non-positive", err)
+			}
+		})
+	}
+}
+
 // TestValidate_StopDescendantWalkTimeout pins the bound on a stop's work
 // after the named session's commit (technical plan §3.3): the shipped 8s,
 // refused at zero or below and at or past ShutdownGracePeriod (a detached

@@ -44,8 +44,9 @@ tool wrote for each.
 Not "CI passed at some point on `main`" — the specific commit SHA this
 deployment is built from. Confirm on GitHub: the `checks` job (`go vet`,
 `golangci-lint`, `narvichecks`, `go test -race ./...`, `make
-contracts-check`) and the `test-integration` job (all four matrix groups)
-both green for that SHA. `go test -race ./...` is where
+contracts-check`), the `test-integration` job (all four matrix groups)
+and the `test-integration-postgres-floor` job (item 13) all green for that
+SHA. `go test -race ./...` is where
 `internal/ops`'s own `TestNoMetricDrift` and `TestNoGuideDrift` run — a
 green `checks` job is simultaneously proof that every
 `deploy/observability/{dashboards,alerts}` entry names a metric the code
@@ -69,7 +70,8 @@ verify independently of the others" decoration this checklist avoids.
 A clean boot also proves the embedded migrations applied successfully
 (`applyMigrations` runs, advisory-locked, on every boot,
 `cmd/control-plane/main.go`) — there is no separate manual migration
-step to check.
+step to check — and that the server runs Postgres 16 or later, which boot
+reads before the migrations (item 13).
 
 **Specifically confirm `NARVI_STAGE=production`** (not `staging` left
 over from a template) — `Load` accepts all three valid values equally, so
@@ -201,8 +203,8 @@ can see coming, since one process cannot know how many replicas there
 are.
 
 **Check.** On the production server: `SHOW max_connections;`,
-`SHOW superuser_reserved_connections;` and, on Postgres 16 or later,
-`SHOW reserved_connections;`. Confirm
+`SHOW superuser_reserved_connections;` and `SHOW reserved_connections;`
+(the server is 16 or later, item 13). Confirm
 `max_connections − superuser_reserved_connections − reserved_connections`
 exceeds `replicas × (NARVI_DB_POOL_MAX_CONNS + 1)` with headroom, at the
 fleet's maximum replica count (a rolling deploy briefly runs one extra
@@ -354,3 +356,36 @@ than the ceiling, and treats reaching it as a failed deploy to finish or
 roll back -- for example `kubectl rollout status
 deployment/narvi-control-plane --timeout=30m`, whose non-zero exit fails
 the pipeline. No rollout is left paused with pods of two releases running.
+
+## 13. The Postgres server is version 16 or later
+
+**Why this is here.** The control plane runs on Postgres 16 or later, and
+is tested on 17. Boot reads the server's `server_version_num` before it
+runs any migration and refuses an older server, naming both versions
+(`platform.MinPostgresServerVersionNum`, `internal/platform/postgres.go`;
+`docs/TECHNICAL_PLAN.md` §1 and §5.1). `serve` and `seed` refuse one;
+`routes`, which needs no database, does not read the server at all. The
+code depends on the floor: item 10's connection budget reads
+`reserved_connections`, which exists from 16 on, and the lock connection
+waits for a lost connection's backend to end when it terminates it
+(`pg_terminate_backend` with a timeout, from 14 on). An operator choosing
+a managed Postgres chooses against this floor, before provisioning.
+
+**What is tested.** Every Postgres-backed suite runs on Postgres 17. CI
+runs three of them on Postgres 16 as well, in the
+`test-integration-postgres-floor` job (`make
+test-integration-postgres-floor`): the postgres adapter's whole suite
+(every store's queries, every migration up and down), the lock
+connection's tests, and boot's own reads of the server. Every other suite
+runs on 17 only.
+
+**Why 16.** A default, not a measurement: item 10's budget needs
+`reserved_connections`, this checklist already asked for 16 or later, and
+14 reaches the end of its support in November 2026. The fallbacks the code
+kept for 14 and 15 were removed once boot refused those servers, so
+lowering the floor means restoring them and running the three suites
+above on the lower version first.
+
+**Check.** A clean boot (item 3) proves it: an older server never gets
+past the refusal. Before provisioning, read the offering's major version
+on a server of the same plan (`SHOW server_version;`).

@@ -185,6 +185,19 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+// testPostgresImage is the Postgres image this package's Postgres-backed
+// tests start: NARVI_TEST_POSTGRES_IMAGE when set, else postgres:17-alpine,
+// the version every suite is tested on. `make
+// test-integration-postgres-floor` sets it to the oldest server boot accepts
+// (platform.MinPostgresServerVersionNum); the control plane's boot
+// test and the postgres adapter's tests read the same variable.
+func testPostgresImage() string {
+	if image := os.Getenv("NARVI_TEST_POSTGRES_IMAGE"); image != "" {
+		return image
+	}
+	return "postgres:17-alpine"
+}
+
 // startSharedTestContainer is this package's own former newTestPool's
 // (and newTestPoolPair's -- resilience_killpod_integration_test.go, kept
 // separately for its own dedicated container) identical container-start
@@ -207,7 +220,7 @@ func startSharedTestContainer(ctx context.Context) (*tcpostgres.PostgresContaine
 	startCh := make(chan containerStartResult, 1)
 	var startGroup errgroup.Group
 	startGroup.Go(func() error {
-		container, err := tcpostgres.Run(startCtx, "postgres:17-alpine",
+		container, err := tcpostgres.Run(startCtx, testPostgresImage(),
 			tcpostgres.WithDatabase("narvi_test"),
 			tcpostgres.WithUsername("narvi"),
 			tcpostgres.WithPassword("narvi"),

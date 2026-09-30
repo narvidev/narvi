@@ -31,7 +31,10 @@ import (
 // succeed. If the target schema is missing tables Build wants to read
 // (e.g. a fresh, unmigrated database), the affected reads log a WARN to
 // stderr and are otherwise silently skipped -- that is acceptable for a
-// read-only introspection command.
+// read-only introspection command. For the same reason it does not read the
+// server's version either (requireSupportedPostgres, which serve and seed
+// call before they migrate): a listing that needs no reachable database
+// must not fail on the version of one it never uses.
 //
 // modules is the same extension.Module list Main receives and threads to
 // serve() (§41.1 review round 2, finding Q6/Q12): passing none here, as

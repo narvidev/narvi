@@ -16,11 +16,12 @@ const meterName = "narvi/controlplane"
 
 // connectionBudgetQuery reads the three settings that bound how many
 // connections a non-superuser role can open. reserved_connections exists
-// from Postgres 16 on; current_setting's missing_ok form reads it as 0 on
-// an older server rather than failing.
+// from Postgres 16 on, the oldest server boot accepts
+// (platform.MinPostgresServerVersionNum), and serve refuses an older one
+// before this runs, so it is read like the other two.
 const connectionBudgetQuery = `SELECT current_setting('max_connections')::int,
        current_setting('superuser_reserved_connections')::int,
-       COALESCE(current_setting('reserved_connections', true), '0')::int`
+       current_setting('reserved_connections')::int`
 
 // connectionBudget is this replica's Postgres connection need against the
 // server's limits (§5.1): its query pool plus the one lock connection that
@@ -52,8 +53,9 @@ func (b connectionBudget) fits() bool { return b.need() <= b.available() }
 // fit. It never refuses to boot: the fleet-wide sum it cannot see is the
 // number that matters, and an operator sizing it needs the replica's own
 // share in the log either way. The read is bounded by timeout; a failed
-// read is logged and skipped -- the migrations that follow surface an
-// unreachable database on their own.
+// read is logged and skipped -- boot has already read the server's version
+// by then, and the migrations that follow surface a database lost since on
+// their own.
 func checkConnectionBudget(ctx context.Context, logger *slog.Logger, pool *pgxpool.Pool, timeout time.Duration) {
 	qctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()

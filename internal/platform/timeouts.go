@@ -214,6 +214,20 @@ type Timeouts struct {
 	// (invented).
 	HealthCheckTimeout time.Duration
 
+	// PostgresVersionCheckTimeout bounds boot's read of the Postgres
+	// server's version (controlplane's requireSupportedPostgres, technical
+	// plan §5.1), and a read that runs out refuses boot. It is the first
+	// statement on the query pool, which dials lazily, so the bound covers
+	// that first connection too: looser than HealthCheckTimeout's, since a
+	// server slow to accept connections, such as a serverless database
+	// waking up, can take seconds to answer the first time. Short enough
+	// that a server that never answers refuses boot, with the reason
+	// logged, well before the shipped manifest's liveness probe would kill
+	// the pod with none (about 55 s from start,
+	// deploy/control-plane/deployment.yaml). Validate keeps it positive.
+	// 15 s: chosen.
+	PostgresVersionCheckTimeout time.Duration
+
 	// --- §3.2 standalone additions: no ordering relationship with the
 	// two chains above (or with the PR-06 additions), so — per that PR's
 	// own precedent — just plain fields with sensible defaults, not wired
@@ -481,8 +495,8 @@ type Timeouts struct {
 	// after it that a session the orphan held is still locked elsewhere --
 	// ErrSessionActorElsewhere, which the timer pump skips until the timer's
 	// claim expires. Postgres waits through pg_terminate_backend's timeout,
-	// from Postgres 14; an older server only signals the backend, and the
-	// dial does not wait. A backend still there when the wait runs out is
+	// which every server boot accepts has (from 14 on; the floor is
+	// MinPostgresServerVersionNum, 16). A backend still there when the wait runs out is
 	// logged, and the connection installed anyway: that backend's sessions
 	// then wait for it to end, or for the server's keepalives
 	// (ActorLockServerReapTime). The terminate's statement runs under this
@@ -3991,6 +4005,8 @@ func DefaultTimeouts() Timeouts {
 		ShutdownGracePeriod: 10 * time.Second, // not specified; invented
 		HealthCheckTimeout:  2 * time.Second,  // not specified; invented
 
+		PostgresVersionCheckTimeout: 15 * time.Second, // not specified; chosen -- a slow first dial, well inside the liveness probe
+
 		SteadyHeartbeatBudget:      90 * time.Second,  // §3.2, explicit
 		TerminalGracePeriod:        60 * time.Second,  // §3.2, explicit
 		CircuitBreakerWindow:       5 * time.Minute,   // §3.2, explicit
@@ -4786,6 +4802,10 @@ func (t Timeouts) Validate() error {
 	withinResultDelayBounds("SessionResultDelayUnsettled", t.SessionResultDelayUnsettled)
 	withinResultDelayBounds("SessionResultDelayLiveRead", t.SessionResultDelayLiveRead)
 	withinResultDelayBounds("SessionResultDelaySettled", t.SessionResultDelaySettled)
+
+	// §5.1: boot's read of the Postgres server's version. A zero bound
+	// would refuse every boot before the read could be sent.
+	mustBePositive("PostgresVersionCheckTimeout", t.PostgresVersionCheckTimeout)
 
 	// §2, §5.1: the session actor's lock connection and hydration bound
 	// (the Actor* fields' own block comment on the struct). Orderings with

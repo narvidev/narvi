@@ -318,6 +318,30 @@ jobs:
       - name: Test (integration, group ${{ matrix.group }})
         run: make test-integration-group-${{ matrix.group }}
 
+  # test-integration-postgres-floor runs the suites that exercise what
+  # differs between Postgres versions on the oldest server the control
+  # plane boots against (platform.MinPostgresServerVersionNum), where
+  # test-integration runs everything on postgres:17-alpine: the postgres
+  # adapter's whole suite, the lock connection's tests and boot's own reads
+  # of the server. The Makefile target of the same name holds the image and
+  # the package list, and says why those three. No OpenCode install: none
+  # of these tests spawns it.
+  test-integration-postgres-floor:
+    needs: checks
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Test (integration, on the Postgres floor)
+        run: make test-integration-postgres-floor
+
   # sandbox-image (Step 74's own adversarial review, Finding 2, MEDIUM):
   # before this job, no workflow in this repo built deploy/sandbox-image/
   # Dockerfile at all -- the ONE artifact in this repo with zero

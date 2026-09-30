@@ -63,7 +63,7 @@ func TestRunRoutesCommand_MatchesGolden(t *testing.T) {
 
 // newUnmigratedTestPool is newTestPool's own deliberate opposite (see that
 // function's own doc comment in build_integration_test.go): it starts a
-// bare postgres:17-alpine container and returns a ready pool plus its
+// bare Postgres container (testPostgresImage) and returns a ready pool plus its
 // connection string, WITHOUT ever running a single migration against it.
 // Used only by TestRunRoutesCommand_DoesNotMigrate, which needs a database
 // runRoutesCommand cannot have secretly migrated out from under it.
@@ -71,7 +71,7 @@ func newUnmigratedTestPool(t *testing.T) (*pgxpool.Pool, string) {
 	t.Helper()
 	ctx := context.Background()
 
-	container, err := tcpostgres.Run(ctx, "postgres:17-alpine",
+	container, err := tcpostgres.Run(ctx, testPostgresImage(),
 		tcpostgres.WithDatabase("narvi_test"),
 		tcpostgres.WithUsername("narvi"),
 		tcpostgres.WithPassword("narvi"),
