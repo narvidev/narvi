@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // Payload is the JSON shape internal/app/outboxworker expects to find in
@@ -24,12 +25,13 @@ type Payload struct {
 
 // BotNotifier implements ports.Notifier by calling Adapter.PostIssueComment
 // with a single, statically-configured bot credential baked in at
-// construction time (platform.Config.GitHubBotToken) -- see this
+// construction time (platform.Config.GitHubOutbound, §12.5's GitHub
+// outbound axis) -- see this
 // package's own doc.go for why this is a separate, sibling type from
 // Adapter itself rather than Adapter implementing ports.Notifier directly.
 type BotNotifier struct {
 	adapter  *Adapter
-	botToken string
+	outbound *platform.GitHubOutboundConfig
 }
 
 // var _ ports.Notifier = (*BotNotifier)(nil) makes a Notifier signature
@@ -37,9 +39,14 @@ type BotNotifier struct {
 var _ ports.Notifier = (*BotNotifier)(nil)
 
 // NewBotNotifier builds a BotNotifier wrapping adapter, authenticating
-// every PostIssueComment call it makes with botToken.
-func NewBotNotifier(adapter *Adapter, botToken string) *BotNotifier {
-	return &BotNotifier{adapter: adapter, botToken: botToken}
+// every PostIssueComment call it makes with outbound's bot credential.
+// outbound must be non-nil: posting as the bot is the whole of this
+// notifier, so it refuses to exist with GitHub outbound off (§12.5).
+func NewBotNotifier(adapter *Adapter, outbound *platform.GitHubOutboundConfig) (*BotNotifier, error) {
+	if err := platform.RequireGitHubOutbound(outbound, "githubapi: new BotNotifier"); err != nil {
+		return nil, err
+	}
+	return &BotNotifier{adapter: adapter, outbound: outbound}, nil
 }
 
 // Deliver implements ports.Notifier: decodes n.Payload as Payload and
@@ -55,5 +62,5 @@ func (n *BotNotifier) Deliver(ctx context.Context, notification ports.Notificati
 		return fmt.Errorf("githubapi: decode payload: %w", err)
 	}
 
-	return n.adapter.PostIssueComment(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.botToken, payload.Text)
+	return n.adapter.PostIssueComment(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.outbound.BotToken(), payload.Text)
 }

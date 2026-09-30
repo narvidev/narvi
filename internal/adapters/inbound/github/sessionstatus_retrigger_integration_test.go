@@ -87,7 +87,7 @@ func newRetriggerStatusFixture(ctx context.Context, t *testing.T, optedIn bool) 
 
 	fetcher := &fakeReviewContextFetcher{pr: githubapi.PullRequest{HeadSHA: "sha-live-after-push", BaseRef: "main"}, diff: "+ a line the push changed"}
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false,
-		sessionactor.RegistryOptions{ReviewDiffFetcher: fetcher, GitHubBotHandle: "narvi-bot", GitHubBotToken: "test-token"})
+		sessionactor.RegistryOptions{ReviewDiffFetcher: fetcher, GitHubBotHandle: "narvi-bot", GitHubOutbound: platform.MustNewGitHubOutboundConfig("test-token")})
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}

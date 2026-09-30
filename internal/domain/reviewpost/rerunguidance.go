@@ -40,7 +40,18 @@ import "fmt"
 // (alnum/"_"/"."/"-"/"/"); an ordinary space on both sides is always a
 // safe, unambiguous boundary, avoiding any dependency on exactly which
 // punctuation happens to be adjacent.
+//
+// # An empty handle renders the button-only sentence
+//
+// The bot handle is required only with GitHub ingress on (§12.5), while a
+// verdict is posted whenever GitHub OUTBOUND is on -- so a deployment that
+// posts reviews without mounting the webhook has no mention anyone could
+// type, and nothing that would detect one. It gets the label/button
+// guidance alone, never "comment @ review".
 func RerunGuidance(botHandle string) string {
+	if botHandle == "" {
+		return "To ask for another review after pushing changes, use this deployment's configured re-review label or button on this pull request."
+	}
 	return fmt.Sprintf(
 		"To ask for another review after pushing changes, comment @%s review on this pull request (or use this deployment's configured re-review label/button).",
 		botHandle,

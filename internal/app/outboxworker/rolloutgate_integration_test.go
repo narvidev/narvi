@@ -83,9 +83,9 @@ func TestSentinelAutoFixNotifier_RolloutRefusal_SkipsTerminallyNeverRetried(t *t
 	}
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
-	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeCohort, repoSettings, prSessions,
-		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
+	notifier := mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
+		sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts(), false, platform.RolloutModeCohort, repoSettings, prSessions,
+		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool)))
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
 		SentinelFixID:         fix.ID.String(),
@@ -191,9 +191,9 @@ func TestSentinelAutoFixNotifier_RolloutGate_EnrolledRepoStillSpawns(t *testing.
 	}
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
-	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeCohort, repoSettings, prSessions,
-		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
+	notifier := mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
+		sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts(), false, platform.RolloutModeCohort, repoSettings, prSessions,
+		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool)))
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
 		SentinelFixID:         fix.ID.String(),

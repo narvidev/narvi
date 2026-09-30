@@ -1398,7 +1398,7 @@ func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
 // decryptCreatorGitHubToken: this session has no human creator to check
 // or decrypt a token for (sessionRow.CreatedBy is invalid/NULL,
 // SpawnChildSession's own doc comment) -- the fix PR is a SYSTEM-INITIATED
-// action, bot-attributed via a.githubBotToken (the SAME static credential
+// action, bot-attributed via a.githubOutbound (the SAME static credential
 // internal/adapters/outbound/githubapi's own BotNotifier/VerdictNotifier
 // already authenticate with), mirroring §17.4's own "system-initiated,
 // not a delegated human one" framing for the eventual merge -- a
@@ -1419,14 +1419,20 @@ func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
 // promoted between push send and this event must not turn a shadow-era
 // branch into a real pull request.
 func (a *Actor) createSentinelFixPRBestEffort(ctx context.Context, evt sandboxws.PushComplete, stampSaysShadow bool) {
-	fix, err := a.stores.sentinelFix.GetByFixSession(ctx, a.sessionID)
-	if err != nil {
-		a.logger.Error("sessionactor: get sentinel_fixes row by fix session failed; skipping fix PR creation", "error", err)
+	// Checked first, before any read: with GitHub outbound off (§12.5)
+	// there is no credential to open the fix PR with, so nothing below can
+	// matter. Unreachable in production -- the sentinel auto-fix notifier
+	// that spawns this session is itself registered only with outbound on
+	// -- but a fix session restored across a configuration change must
+	// still skip rather than call GitHub with no credential.
+	if a.githubOutbound == nil {
+		a.logger.Warn("sessionactor: push_complete arrived for a sentinel-auto-fix session but GitHub outbound is off (NARVI_OUTBOUND_ENABLED); skipping PR creation")
 		return
 	}
 
-	if a.githubBotToken == "" {
-		a.logger.Warn("sessionactor: push_complete arrived for a sentinel-auto-fix session but no bot token is configured; skipping PR creation")
+	fix, err := a.stores.sentinelFix.GetByFixSession(ctx, a.sessionID)
+	if err != nil {
+		a.logger.Error("sessionactor: get sentinel_fixes row by fix session failed; skipping fix PR creation", "error", err)
 		return
 	}
 
@@ -1475,7 +1481,7 @@ func (a *Actor) createSentinelFixPRBestEffort(ctx context.Context, evt sandboxws
 			Base:  fix.OriginHeadBranch,
 			Title: "Sentinel auto-fix: " + prTitle(sessionRow),
 			Body:  fmt.Sprintf("Automated sentinel-auto-fix remediation (Narvi, §17) for pull request #%d, branch %s.", fix.OriginPrNumber, pushed.Branch),
-			Token: a.githubBotToken,
+			Token: a.githubOutbound.BotToken(),
 		}
 		prCtx, cancel := context.WithTimeout(ctx, a.timeouts.PRCreateTimeout)
 		var (
@@ -1521,7 +1527,7 @@ func (a *Actor) createSentinelFixPRBestEffort(ctx context.Context, evt sandboxws
 			Owner:     owner,
 			Repo:      repoName,
 			PRNumbers: []int{int(fix.OriginPrNumber), ref.Number},
-			Token:     a.githubBotToken,
+			Token:     a.githubOutbound.BotToken(),
 		})
 		stackCancel()
 		if registerErr != nil {

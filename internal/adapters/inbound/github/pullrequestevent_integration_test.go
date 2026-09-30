@@ -19,6 +19,7 @@ import (
 	githubingress "github.com/narvidev/narvi/internal/adapters/inbound/github"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // pullRequestClosedBody builds a real-shaped `pull_request` webhook
@@ -68,12 +69,16 @@ func newSentinelFixTestServer(t *testing.T, pool *pgxpool.Pool, sentinelFixes *n
 	cfg := githubingress.Config{
 		WebhookSecret: testWebhookSecret,
 		BotHandle:     testBotHandleIntegration,
+		Outbound:      platform.MustNewGitHubOutboundConfig("test-bot-token"),
 		SentinelFixes: sentinelFixes,
 		RepoSettings:  repoSettings,
 		AuditLog:      auditLog,
 	}
 
-	handler := githubingress.NewHandler(coalescer, deliveries, cfg)
+	handler, handlerErr := githubingress.NewHandler(coalescer, deliveries, cfg)
+	if handlerErr != nil {
+		t.Fatalf("githubingress.NewHandler: %v", handlerErr)
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/webhooks/github", handler)
 	server := httptest.NewServer(mux)

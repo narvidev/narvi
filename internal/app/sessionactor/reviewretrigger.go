@@ -517,10 +517,17 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 // trigger path already uses), OUTSIDE any Postgres transaction (this
 // file's own top comment). A nil a.reviewDiffFetcher (not configured for
 // this deployment/test) degrades identically to a live fetch failure --
-// review.PreFetchedContext's own honest zero value, HeadSHA == "".
+// review.PreFetchedContext's own honest zero value, HeadSHA == "" -- and so
+// does a nil a.githubOutbound (GitHub outbound off, §12.5), without making
+// the call.
 func (a *Actor) fetchAutoRetriggerReviewContext(ctx context.Context, repoFullName string, prNumber int32) review.PreFetchedContext {
 	if a.reviewDiffFetcher == nil {
 		a.logger.Warn("sessionactor: review_retrigger_debounce: no review diff fetcher configured, cannot resolve a live head sha",
+			"repo_full_name", repoFullName, "pr_number", prNumber)
+		return review.PreFetchedContext{}
+	}
+	if a.githubOutbound == nil {
+		a.logger.Warn("sessionactor: review_retrigger_debounce: GitHub outbound is off (NARVI_OUTBOUND_ENABLED), cannot read the pull request as the bot",
 			"repo_full_name", repoFullName, "pr_number", prNumber)
 		return review.PreFetchedContext{}
 	}
@@ -530,7 +537,7 @@ func (a *Actor) fetchAutoRetriggerReviewContext(ctx context.Context, repoFullNam
 			"repo_full_name", repoFullName)
 		return review.PreFetchedContext{}
 	}
-	return reviewcontext.Fetch(ctx, a.logger, a.reviewDiffFetcher, a.timeouts, owner, repo, prNumber, a.githubBotToken, nil)
+	return reviewcontext.Fetch(ctx, a.logger, a.reviewDiffFetcher, a.timeouts, owner, repo, prNumber, a.githubOutbound.BotToken(), nil)
 }
 
 // finishReviewRetrigger is handleReviewRetriggerDebounceTimer's own act

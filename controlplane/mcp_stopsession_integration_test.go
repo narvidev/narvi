@@ -777,9 +777,9 @@ func spawnFixChild(ctx context.Context, t *testing.T, rig *oauthRouterRig, paren
 	}); err != nil {
 		t.Fatalf("record the finding: %v", err)
 	}
-	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, narvipg.NewSessionStore(pool), narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), rig.app.registry,
-		fixes, findings, &fixCodeHost{}, rig.cfg.GitHubOutbound.BotToken(), rig.cfg.Timeouts, rig.cfg.EpistemicCheckDefault, rig.cfg.RolloutMode, narvipg.NewRepoSettingsStore(pool), narvipg.NewGitHubPRSessionStore(pool),
-		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
+	notifier := mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, narvipg.NewSessionStore(pool), narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), rig.app.registry,
+		fixes, findings, &fixCodeHost{}, rig.cfg.GitHubOutbound, rig.cfg.Timeouts, rig.cfg.EpistemicCheckDefault, rig.cfg.RolloutMode, narvipg.NewRepoSettingsStore(pool), narvipg.NewGitHubPRSessionStore(pool),
+		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool)))
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
 		SentinelFixID: fix.ID.String(), RepoFullName: repoFullName, OriginPRNumber: prNumber,
 		OriginReviewSessionID: parentID.String(), OriginHeadBranch: headBranch,
@@ -986,4 +986,13 @@ func sdkPlanRevisionThenStopNoOrphan(t *testing.T, rig *oauthRouterRig, provider
 	if strings.Join(stamped, ",") != strings.Join(want, ",") {
 		t.Fatalf("session.stop audit rows for %v, want one each for the parent and the child", stamped)
 	}
+}
+
+// mustNotifier unwraps a notifier constructor's (notifier, error) pair for
+// a test that always hands it a real GitHub outbound config.
+func mustNotifier(n ports.Notifier, err error) ports.Notifier {
+	if err != nil {
+		panic(err)
+	}
+	return n
 }

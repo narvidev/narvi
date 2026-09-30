@@ -35,7 +35,7 @@ func newDenyUnlinkedTestRig(t *testing.T) (testRig, *fakeCommentPoster) {
 	poster := &fakeCommentPoster{}
 	rig := newTestRig(t, func(cfg *githubingress.Config) {
 		cfg.Comments = poster
-		cfg.BotToken = "test-bot-token"
+		cfg.Outbound = platform.MustNewGitHubOutboundConfig("test-bot-token")
 		cfg.PublicBaseURL = testPublicBaseURL
 		cfg.Timeouts = platform.DefaultTimeouts()
 	})

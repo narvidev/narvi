@@ -1437,7 +1437,7 @@ func TestHandleSandboxEvent_PushComplete_CreatorNoGitHubIdentity_NeverFallsBackT
 	sourceControl := &fakeSourceControl{
 		nextRef: ports.PRRef{Number: 77, URL: "https://github.com/acme/repo1/pull/77"},
 	}
-	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false, RegistryOptions{GitHubBotToken: wantBotToken})
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false, RegistryOptions{GitHubOutbound: platform.MustNewGitHubOutboundConfig(wantBotToken)})
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
@@ -1588,7 +1588,7 @@ func TestHandleSandboxEvent_PushComplete_CreatorHasGitHubIdentityButNoUsableToke
 	sourceControl := &fakeSourceControl{
 		nextRef: ports.PRRef{Number: 78, URL: "https://github.com/acme/repo1/pull/78"},
 	}
-	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false, RegistryOptions{GitHubBotToken: wantBotToken})
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false, RegistryOptions{GitHubOutbound: platform.MustNewGitHubOutboundConfig(wantBotToken)})
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}

@@ -80,10 +80,14 @@ func newIdentityTestRig(t *testing.T) identityTestRig {
 	}
 	deliveries := narvipg.NewWebhookDeliveryStore(pool)
 
-	handler := githubingress.NewHandler(coalescer, deliveries, githubingress.Config{
+	handler, handlerErr := githubingress.NewHandler(coalescer, deliveries, githubingress.Config{
 		WebhookSecret: testWebhookSecret,
 		BotHandle:     testBotHandleIntegration,
+		Outbound:      platform.MustNewGitHubOutboundConfig("test-bot-token"),
 	})
+	if handlerErr != nil {
+		t.Fatalf("githubingress.NewHandler: %v", handlerErr)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhooks/github", handler)

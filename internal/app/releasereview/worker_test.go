@@ -91,11 +91,14 @@ func TestWorker_PumpOnce_ClaimsAndRunsEachClaimedRow(t *testing.T) {
 	lister := &fakeMergedPRLister{}
 	outbox := &fakeOutboxEnqueuer{}
 
-	worker := releasereview.NewWorker(store, releasereview.Deps{
+	worker, workerErr := releasereview.NewWorker(store, releasereview.Deps{
 		SourceControl: lister,
 		Outbox:        outbox,
 		Timeouts:      platform.DefaultTimeouts(),
-	}, "gho_bottoken", platform.DefaultTimeouts())
+	}, platform.MustNewGitHubOutboundConfig("gho_bottoken"), platform.DefaultTimeouts())
+	if workerErr != nil {
+		t.Fatalf("releasereview.NewWorker: %v", workerErr)
+	}
 
 	if err := worker.PumpOnce(context.Background()); err != nil {
 		t.Fatalf("PumpOnce() error = %v", err)
@@ -128,11 +131,14 @@ func TestWorker_PumpOnce_NoRowsDue_NoOp(t *testing.T) {
 	lister := &fakeMergedPRLister{}
 	outbox := &fakeOutboxEnqueuer{}
 
-	worker := releasereview.NewWorker(store, releasereview.Deps{
+	worker, workerErr := releasereview.NewWorker(store, releasereview.Deps{
 		SourceControl: lister,
 		Outbox:        outbox,
 		Timeouts:      platform.DefaultTimeouts(),
-	}, "gho_bottoken", platform.DefaultTimeouts())
+	}, platform.MustNewGitHubOutboundConfig("gho_bottoken"), platform.DefaultTimeouts())
+	if workerErr != nil {
+		t.Fatalf("releasereview.NewWorker: %v", workerErr)
+	}
 
 	if err := worker.PumpOnce(context.Background()); err != nil {
 		t.Fatalf("PumpOnce() error = %v", err)
@@ -153,11 +159,14 @@ func TestWorker_PumpOnce_ClaimBatchFails_PropagatesErrorNeverRunsAnything(t *tes
 	lister := &fakeMergedPRLister{}
 	outbox := &fakeOutboxEnqueuer{}
 
-	worker := releasereview.NewWorker(store, releasereview.Deps{
+	worker, workerErr := releasereview.NewWorker(store, releasereview.Deps{
 		SourceControl: lister,
 		Outbox:        outbox,
 		Timeouts:      platform.DefaultTimeouts(),
-	}, "gho_bottoken", platform.DefaultTimeouts())
+	}, platform.MustNewGitHubOutboundConfig("gho_bottoken"), platform.DefaultTimeouts())
+	if workerErr != nil {
+		t.Fatalf("releasereview.NewWorker: %v", workerErr)
+	}
 
 	if err := worker.PumpOnce(context.Background()); err == nil {
 		t.Fatal("PumpOnce() error = nil, want a propagated claim-batch error")
@@ -188,11 +197,14 @@ func TestWorker_PumpOnce_ClaimsOneRowAtATimeAndFinishesItAfterItsCheck(t *testin
 	lister := &fakeMergedPRLister{}
 	store := &fakePendingLister{rows: rows, lister: lister}
 	timeouts := platform.DefaultTimeouts()
-	worker := releasereview.NewWorker(store, releasereview.Deps{
+	worker, workerErr := releasereview.NewWorker(store, releasereview.Deps{
 		SourceControl: lister,
 		Outbox:        &fakeOutboxEnqueuer{},
 		Timeouts:      timeouts,
-	}, "gho_bottoken", timeouts)
+	}, platform.MustNewGitHubOutboundConfig("gho_bottoken"), timeouts)
+	if workerErr != nil {
+		t.Fatalf("releasereview.NewWorker: %v", workerErr)
+	}
 
 	if err := worker.PumpOnce(context.Background()); err != nil {
 		t.Fatalf("PumpOnce() error = %v", err)
@@ -227,11 +239,14 @@ func TestWorker_PumpOnce_FinishFailureNeverAbortsTheTick(t *testing.T) {
 		{ID: testWorkerSessionID(t, "00000000-0000-0000-0000-000000000011"), Owner: "acme", Repo: "widgets", PrNumber: 1, BaseRef: "main", HeadRef: "release/1"},
 		{ID: testWorkerSessionID(t, "00000000-0000-0000-0000-000000000012"), Owner: "acme", Repo: "widgets", PrNumber: 2, BaseRef: "main", HeadRef: "release/2"},
 	}}
-	worker := releasereview.NewWorker(store, releasereview.Deps{
+	worker, workerErr := releasereview.NewWorker(store, releasereview.Deps{
 		SourceControl: lister,
 		Outbox:        &fakeOutboxEnqueuer{},
 		Timeouts:      platform.DefaultTimeouts(),
-	}, "gho_bottoken", platform.DefaultTimeouts())
+	}, platform.MustNewGitHubOutboundConfig("gho_bottoken"), platform.DefaultTimeouts())
+	if workerErr != nil {
+		t.Fatalf("releasereview.NewWorker: %v", workerErr)
+	}
 	if err := worker.PumpOnce(context.Background()); err != nil {
 		t.Fatalf("PumpOnce() error = %v, want a finish failure logged, never returned", err)
 	}
@@ -249,11 +264,14 @@ func TestWorker_PumpOnce_RequestsPendingBatchSizeNotOutboxBatchSize(t *testing.T
 	t.Parallel()
 
 	store := &fakePendingLister{}
-	worker := releasereview.NewWorker(store, releasereview.Deps{
+	worker, workerErr := releasereview.NewWorker(store, releasereview.Deps{
 		SourceControl: &fakeMergedPRLister{},
 		Outbox:        &fakeOutboxEnqueuer{},
 		Timeouts:      platform.DefaultTimeouts(),
-	}, "gho_bottoken", platform.DefaultTimeouts())
+	}, platform.MustNewGitHubOutboundConfig("gho_bottoken"), platform.DefaultTimeouts())
+	if workerErr != nil {
+		t.Fatalf("releasereview.NewWorker: %v", workerErr)
+	}
 
 	if err := worker.PumpOnce(context.Background()); err != nil {
 		t.Fatalf("PumpOnce() error = %v", err)
@@ -301,11 +319,14 @@ func TestWorker_Process_BoundsRunByReleaseManifestCheckTimeout(t *testing.T) {
 	}}
 	timeouts := platform.DefaultTimeouts()
 
-	worker := releasereview.NewWorker(store, releasereview.Deps{
+	worker, workerErr := releasereview.NewWorker(store, releasereview.Deps{
 		SourceControl: &fakeMergedPRLister{},
 		Outbox:        outbox,
 		Timeouts:      timeouts,
-	}, "gho_bottoken", timeouts)
+	}, platform.MustNewGitHubOutboundConfig("gho_bottoken"), timeouts)
+	if workerErr != nil {
+		t.Fatalf("releasereview.NewWorker: %v", workerErr)
+	}
 
 	before := time.Now()
 	if err := worker.PumpOnce(context.Background()); err != nil {
@@ -321,5 +342,26 @@ func TestWorker_Process_BoundsRunByReleaseManifestCheckTimeout(t *testing.T) {
 	if outbox.sawDeadline.Before(wantMin) || outbox.sawDeadline.After(wantMax) {
 		t.Errorf("Outbox.Create's own ctx deadline = %v, want it within [%v, %v] (bounded by ReleaseManifestCheckTimeout = %v)",
 			outbox.sawDeadline, wantMin, wantMax, timeouts.ReleaseManifestCheckTimeout)
+	}
+}
+
+// TestNewWorker_RefusesNilOutbound proves the release-manifest worker
+// cannot be built without GitHub outbound (§12.5): every check it runs
+// reads GitHub as the bot, so a nil *platform.GitHubOutboundConfig is a
+// construction error wrapping platform.ErrGitHubOutboundRequired, never a
+// worker that would call GitHub with an empty token.
+func TestNewWorker_RefusesNilOutbound(t *testing.T) {
+	t.Parallel()
+
+	worker, err := releasereview.NewWorker(&fakePendingLister{}, releasereview.Deps{
+		SourceControl: &fakeMergedPRLister{},
+		Outbox:        &fakeOutboxEnqueuer{},
+		Timeouts:      platform.DefaultTimeouts(),
+	}, nil, platform.DefaultTimeouts())
+	if !errors.Is(err, platform.ErrGitHubOutboundRequired) {
+		t.Errorf("NewWorker(nil outbound) error = %v, want one wrapping platform.ErrGitHubOutboundRequired", err)
+	}
+	if worker != nil {
+		t.Errorf("NewWorker(nil outbound) worker = %v, want nil", worker)
 	}
 }

@@ -162,8 +162,8 @@ type testRig struct {
 
 	// prSessions is §8.2's ("review sessions", §8.2) own addition --
 	// backing this rig's own manual re-review REST button route
-	// (reviewretrigger_integration_test.go). diffFetcher/botToken default
-	// nil/"" (RetriggerReview's own nil-safe "skip the fetch" contract,
+	// (reviewretrigger_integration_test.go). diffFetcher defaults nil
+	// (RetriggerReview's own nil-safe "skip the fetch" contract,
 	// mirrored from internal/adapters/inbound/github's own identical
 	// Config.DiffFetcher precedent): the pre-fetched-diff/stack-context
 	// ASSEMBLY itself is already covered exhaustively, with no DB
@@ -174,11 +174,20 @@ type testRig struct {
 	// composition. A test that specifically wants to prove THIS call
 	// site's own owner/repo/token args reach reviewcontext.Fetch
 	// correctly (audit fix, test-coverage finding) overrides diffFetcher/
-	// botToken via newTestRig's own mutate func, below.
+	// outbound via newTestRig's own mutate func, below.
 	prSessions *narvipg.GitHubPRSessionStore
 
 	diffFetcher reviewcontext.Fetcher
-	botToken    string
+	// outbound is §12.5's GitHub outbound axis, handed to the review
+	// readout, re-review and verdict routes. Defaults to a real config
+	// (GitHub outbound on), so a test that sets diffFetcher gets the live
+	// read it asks for; a test proving the outbound-off degradation sets
+	// it nil (githuboutbound_integration_test.go).
+	outbound *platform.GitHubOutboundConfig
+	// resultOutbound is the result route's own GitHub outbound axis --
+	// separate from outbound above so the result tests' own token stays
+	// distinguishable; nil in a test proving the outbound-off degradation.
+	resultOutbound *platform.GitHubOutboundConfig
 
 	// resultSourceControl is the code host GET /api/sessions/{sessionID}/
 	// result reads a verdict's freshness from (technical plan §43.20) -- nil
@@ -206,9 +215,9 @@ type testRig struct {
 	// back this rig's own verdict-posting-tool route (review/verdict,
 	// reviewverdict_integration_test.go) and the admin repo-settings routes
 	// (reposettings_integration_test.go). botHandle defaults to a fixed,
-	// non-empty test value -- unlike diffFetcher/botToken above (which
-	// default nil/"" because their OWN absence is meaningful/tested
-	// elsewhere), review-verdict's rendered comment always needs a real
+	// non-empty test value -- unlike diffFetcher above (which defaults
+	// nil because its OWN absence is meaningful/tested elsewhere),
+	// review-verdict's rendered comment always needs a real
 	// handle to build RerunGuidance from.
 	repoSettings *narvipg.RepoSettingsStore
 	botHandle    string
@@ -414,7 +423,7 @@ type testRig struct {
 
 // newTestRig builds the default rig. mutate (variadic so every EXISTING
 // newTestRig(t) call site keeps compiling unchanged) lets a caller
-// override this rig's own fields -- e.g. diffFetcher/botToken -- BEFORE
+// override this rig's own fields -- e.g. diffFetcher/outbound -- BEFORE
 // the router below is built, mirroring internal/adapters/inbound/github's
 // own newTestRig(t, mutate...) precedent (handler_integration_test.go)
 // exactly.
@@ -463,6 +472,8 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		resultTimeouts:        platform.DefaultTimeouts(),
 		repoSettings:          narvipg.NewRepoSettingsStore(pool),
 		botHandle:             "narvi-test-bot",
+		outbound:              platform.MustNewGitHubOutboundConfig("test-github-bot-token"),
+		resultOutbound:        platform.MustNewGitHubOutboundConfig("result-bot-token"),
 		shadowLedger:          narvipg.NewShadowSCMWriteStore(pool),
 		readOnlyMinter:        newFakeReadOnlyMinter(),
 		rolloutMode:           platform.RolloutModeOpen,
@@ -609,7 +620,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 			PRSessions:     rig.prSessions,
 			ReviewVerdicts: rig.reviewVerdicts,
 			SourceControl:  rig.resultSourceControl,
-			BotToken:       "result-bot-token",
+			Outbound:       rig.resultOutbound,
 			Timeouts:       rig.resultTimeouts,
 		}))
 		r.Get("/{sessionID}/events", httpapi.ListEvents(rig.sessions, rig.events))
@@ -630,7 +641,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Get("/{sessionID}/plans", httpapi.ListPlans(rig.sessions, rig.plans, rig.turns, rig.events, rig.planDocuments))
 		// review/retrigger ("review sessions", §8.2's own manual
 		// re-trigger-via-BUTTON surface) -- see reviewretrigger.go's own doc
-		// comment. rig.diffFetcher/rig.botToken default nil/"" -- see this
+		// comment. rig.diffFetcher defaults nil, rig.outbound on -- see this
 		// rig's own diffFetcher field doc comment for why, and for how a
 		// test overrides them.
 		// reviewTriageDeps (§26.3; wired to REAL stores as of D6's
@@ -647,7 +658,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		// -- no new store, no new pool connection. reviewModelDeep stays ""
 		// (unconfigured) -- no test in this package needs a specific
 		// deep-tier model id, only the depth decision itself.
-		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(rig.pool, rig.sessions, rig.turns, rig.plans, rig.auditLog, rig.registry, rig.prSessions, rig.diffFetcher, rig.reviewFindings, rig.falsePositivePatterns, rig.reviewVerdicts, nil, rig.botToken, platform.DefaultTimeouts(), appreviewtriage.Deps{RepoSettings: rig.repoSettings, ReviewVerdicts: rig.reviewVerdicts}, ""))
+		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(rig.pool, rig.sessions, rig.turns, rig.plans, rig.auditLog, rig.registry, rig.prSessions, rig.diffFetcher, rig.reviewFindings, rig.falsePositivePatterns, rig.reviewVerdicts, nil, rig.outbound, platform.DefaultTimeouts(), appreviewtriage.Deps{RepoSettings: rig.repoSettings, ReviewVerdicts: rig.reviewVerdicts}, ""))
 		// review readout (§26.1's merge readout, §12.2 item 2) -- see
 		// reviewreadout.go's own doc comment. rig.diffFetcher/rig.
 		// positionResolver default nil, mirroring review/retrigger's own
@@ -655,7 +666,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		// construction); a test exercising the live-fetch title/visualQa
 		// path or the relocation fallback overrides them via newTestRig's
 		// own mutate func.
-		r.Get("/{sessionID}/review", httpapi.GetReviewReadout(rig.sessions, rig.prSessions, reviewVerdictDeps, rig.reviewFindings, rig.turns, rig.diffFetcher, rig.positionResolver, rig.sentinelFixes, rig.handoffSentinelRuns, rig.botToken, platform.DefaultTimeouts()))
+		r.Get("/{sessionID}/review", httpapi.GetReviewReadout(rig.sessions, rig.prSessions, reviewVerdictDeps, rig.reviewFindings, rig.turns, rig.diffFetcher, rig.positionResolver, rig.sentinelFixes, rig.handoffSentinelRuns, rig.outbound, platform.DefaultTimeouts()))
 		// review/findings/{identityHash}/rebut + apply-suggestion (§8.2)
 		// -- see reviewfindings.go's own doc comment.
 		r.Post("/{sessionID}/review/findings/{identityHash}/rebut", httpapi.RebutReviewFinding(rig.sessions, rig.prSessions, rig.reviewFindings, rig.auditLog))
@@ -778,7 +789,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	// review/verdict ("server-side verdict", §8.2/§5.2) is mounted
 	// the SAME way -- see reviewverdict.go's own doc comment.
 	router.Post("/sessions/{sessionID}/review/verdict",
-		httpapi.PostReviewVerdict(rig.pool, rig.sandboxes, rig.sessions, rig.prSessions, rig.repoSettings, rig.reviewFindings, rig.sentinelFixes, rig.outbox, rig.reviewVerdicts, rig.turns, rig.events, rig.botHandle, rig.botToken, rig.diffFetcher, rig.positionResolver, platform.DefaultTimeouts(), false))
+		httpapi.PostReviewVerdict(rig.pool, rig.sandboxes, rig.sessions, rig.prSessions, rig.repoSettings, rig.reviewFindings, rig.sentinelFixes, rig.outbox, rig.reviewVerdicts, rig.turns, rig.events, rig.botHandle, rig.outbound, rig.diffFetcher, rig.positionResolver, platform.DefaultTimeouts(), false))
 	// workflow/step-outcome ("workflow execution engine", §25.6)
 	// is mounted the SAME way -- see workflowstepoutcome.go's own doc
 	// comment.

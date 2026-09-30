@@ -18,6 +18,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // positionAnchoringDiff carries a hunk whose "for i := 0; i < len(items);
@@ -91,7 +92,7 @@ func TestPostReviewVerdict_PositionAnchoring_MatchableFindingRendersAnchoredLine
 	}
 	rig := newTestRig(t, func(r *testRig) {
 		r.diffFetcher = fetcher
-		r.botToken = "test-bot-token"
+		r.outbound = platform.MustNewGitHubOutboundConfig("test-bot-token")
 	})
 
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-anchor-match", 60)
@@ -151,7 +152,7 @@ func TestPostReviewVerdict_PositionAnchoring_UnmatchableFindingRendersNoLine(t *
 	}
 	rig := newTestRig(t, func(r *testRig) {
 		r.diffFetcher = fetcher
-		r.botToken = "test-bot-token"
+		r.outbound = platform.MustNewGitHubOutboundConfig("test-bot-token")
 	})
 
 	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-anchor-nomatch", 61)

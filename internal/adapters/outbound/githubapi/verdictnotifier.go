@@ -8,6 +8,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // VerdictPayload is the JSON shape internal/app/outboxworker expects to
@@ -55,18 +56,22 @@ type VerdictPayload struct {
 // independently-retried halves.
 type VerdictNotifier struct {
 	adapter  *Adapter
-	botToken string
+	outbound *platform.GitHubOutboundConfig
 }
 
 var _ ports.Notifier = (*VerdictNotifier)(nil)
 
 // NewVerdictNotifier builds a VerdictNotifier wrapping adapter,
-// authenticating every call it makes with botToken -- mirrors
+// authenticating every call it makes with outbound's bot credential
+// (non-nil: refused otherwise, §12.5) -- mirrors
 // NewBotNotifier's own identical "single, statically-configured bot
 // credential" precedent (notifier.go): a review session, like every
 // other bot-ingress session, has no per-commenter OAuth token to reuse.
-func NewVerdictNotifier(adapter *Adapter, botToken string) *VerdictNotifier {
-	return &VerdictNotifier{adapter: adapter, botToken: botToken}
+func NewVerdictNotifier(adapter *Adapter, outbound *platform.GitHubOutboundConfig) (*VerdictNotifier, error) {
+	if err := platform.RequireGitHubOutbound(outbound, "githubapi: new VerdictNotifier"); err != nil {
+		return nil, err
+	}
+	return &VerdictNotifier{adapter: adapter, outbound: outbound}, nil
 }
 
 // Deliver implements ports.Notifier: decodes n.Payload as VerdictPayload,
@@ -95,7 +100,7 @@ func (n *VerdictNotifier) Deliver(ctx context.Context, notification ports.Notifi
 		return fmt.Errorf("githubapi: decode verdict payload: %w", err)
 	}
 
-	if err := n.adapter.CreateReview(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.botToken,
+	if err := n.adapter.CreateReview(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.outbound.BotToken(),
 		reviewpost.FormalReviewEvent(payload.Event), payload.Body); err != nil {
 		return fmt.Errorf("githubapi: deliver verdict (create review): %w", err)
 	}
@@ -117,19 +122,19 @@ func (n *VerdictNotifier) Deliver(ctx context.Context, notification ports.Notifi
 		return nil
 	}
 
-	currentLabels, err := n.adapter.ListLabels(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.botToken)
+	currentLabels, err := n.adapter.ListLabels(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.outbound.BotToken())
 	if err != nil {
 		return fmt.Errorf("githubapi: deliver verdict (list labels): %w", err)
 	}
 	plan := reviewpost.ComputeLabelSync(currentLabels, review.RiskLevel(payload.RiskLevel))
 
 	if len(plan.Add) > 0 {
-		if err := n.adapter.AddLabels(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.botToken, plan.Add); err != nil {
+		if err := n.adapter.AddLabels(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.outbound.BotToken(), plan.Add); err != nil {
 			return fmt.Errorf("githubapi: deliver verdict (add labels): %w", err)
 		}
 	}
 	for _, label := range plan.Remove {
-		if err := n.adapter.RemoveLabel(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.botToken, label); err != nil {
+		if err := n.adapter.RemoveLabel(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.outbound.BotToken(), label); err != nil {
 			return fmt.Errorf("githubapi: deliver verdict (remove label %q): %w", label, err)
 		}
 	}

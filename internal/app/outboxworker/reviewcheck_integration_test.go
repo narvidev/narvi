@@ -38,6 +38,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/outboxworker"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/reviewcheck"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // newTestAttempt creates a real session + turn -- review_check_runs.
@@ -314,7 +315,7 @@ func TestReviewCheckNotifier_OlderAttemptRefusedAfterNewerAlreadyPublished(t *te
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+	notifier := mustNotifier(outboxworker.NewReviewCheckNotifier(pool, store, adapter, platform.MustNewGitHubOutboundConfig("tok")))
 
 	const prNumber = 42
 	const headSHA = "deadbeef"
@@ -396,7 +397,7 @@ func TestReviewCheckNotifier_ConcurrentAttempts_ResolveToOneIdentity(t *testing.
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+	notifier := mustNotifier(outboxworker.NewReviewCheckNotifier(pool, store, adapter, platform.MustNewGitHubOutboundConfig("tok")))
 
 	owner, repoName := "acme", fmt.Sprintf("race-repo-%d", time.Now().UnixNano())
 	const prNumber = 7
@@ -516,7 +517,7 @@ func TestReviewCheckNotifier_TerminalRestart_NeverReopensConcludedRun(t *testing
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+	notifier := mustNotifier(outboxworker.NewReviewCheckNotifier(pool, store, adapter, platform.MustNewGitHubOutboundConfig("tok")))
 
 	owner, repoName := "acme", fmt.Sprintf("restart-repo-%d", time.Now().UnixNano())
 	const prNumber = 101
@@ -626,7 +627,7 @@ func TestReviewCheckNotifier_Recovery_AdoptsOwnInFlightRun(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	warmNotifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+	warmNotifier := mustNotifier(outboxworker.NewReviewCheckNotifier(pool, store, adapter, platform.MustNewGitHubOutboundConfig("tok")))
 
 	owner, repoName := "acme", fmt.Sprintf("recovery-repo-%d", time.Now().UnixNano())
 	const prNumber = 55
@@ -686,7 +687,7 @@ func TestReviewCheckNotifier_Recovery_AdoptsOwnInFlightRun(t *testing.T) {
 	// still ADOPT the existing, still-in-progress run rather than create
 	// a second one, recovering the durably-persisted app id finding B2
 	// gives it, never guessing and never falling back to "create".
-	coldNotifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+	coldNotifier := mustNotifier(outboxworker.NewReviewCheckNotifier(pool, store, adapter, platform.MustNewGitHubOutboundConfig("tok")))
 	if err := coldNotifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubReviewCheck, Payload: runningPayload}); err != nil {
 		t.Fatalf("Deliver(running, redelivery on a COLD notifier) error = %v", err)
 	}
@@ -741,7 +742,7 @@ func TestReviewCheckNotifier_Recovery_NeverAdoptsAnotherAppsRun(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+	notifier := mustNotifier(outboxworker.NewReviewCheckNotifier(pool, store, adapter, platform.MustNewGitHubOutboundConfig("tok")))
 
 	owner, repoName := "acme", fmt.Sprintf("otherapp-repo-%d", time.Now().UnixNano())
 	const prNumber = 88
@@ -824,7 +825,7 @@ func TestReviewCheckNotifier_SelfHealsWhenSupersededDuringGitHubCall(t *testing.
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+	notifier := mustNotifier(outboxworker.NewReviewCheckNotifier(pool, store, adapter, platform.MustNewGitHubOutboundConfig("tok")))
 
 	owner, repoName := "acme", fmt.Sprintf("race3-repo-%d", time.Now().UnixNano())
 	const prNumber = 13
@@ -969,7 +970,7 @@ func TestReviewCheckNotifier_SelfHealNeverReopensARunANewerIdentityAbandoned(t *
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+	notifier := mustNotifier(outboxworker.NewReviewCheckNotifier(pool, store, adapter, platform.MustNewGitHubOutboundConfig("tok")))
 
 	owner, repoName := "acme", fmt.Sprintf("b1-repo-%d", time.Now().UnixNano())
 	const prNumber = 21
@@ -1101,7 +1102,7 @@ func TestReviewCheckNotifier_AdoptFailure_ClassifiedAsAdoptNotCreate(t *testing.
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+	notifier := mustNotifier(outboxworker.NewReviewCheckNotifier(pool, store, adapter, platform.MustNewGitHubOutboundConfig("tok")))
 
 	owner, repoName := "acme", fmt.Sprintf("adoptfail-repo-%d", time.Now().UnixNano())
 	const prNumber = 303

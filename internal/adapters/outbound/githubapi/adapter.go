@@ -893,7 +893,7 @@ type StackInfo struct {
 // call, authenticated with token as a Bearer token -- like PostIssueComment,
 // this method is agnostic to whose token it's handed (production wiring,
 // cmd/control-plane/main.go, passes the bot's own statically-configured
-// credential, platform.Config.GitHubBotToken, since a GitHub webhook
+// credential, platform.Config.GitHubOutbound, since a GitHub webhook
 // mention carries no per-commenter OAuth token the way CreatePR's caller
 // already has one in hand).
 func (a *Adapter) GetPullRequest(ctx context.Context, owner, repo string, number int32, token string) (PullRequest, error) {
@@ -1144,7 +1144,7 @@ func (a *Adapter) GetCompareDiff(ctx context.Context, owner, repo, base, head, t
 // issue/PR prNumber, authenticated with token as a Bearer token (
 // "outbox delivery", §5.1). Unlike CreatePR/ResolveBranchSHA above, token
 // here is typically a single, statically-configured bot credential
-// (platform.Config.GitHubBotToken via BotNotifier, notifier.go) rather
+// (platform.Config.GitHubOutbound via BotNotifier, notifier.go) rather
 // than a per-session decrypted OAuth token -- this method itself is
 // agnostic to which kind of token it's handed, exactly like doGet/doPost
 // are agnostic to whose token they carry.
@@ -1180,7 +1180,7 @@ type createCommitStatusRequest struct {
 // authenticated with token as a Bearer token -- like PostIssueComment
 // above, this method is agnostic to whose token it's handed; production
 // wiring (PreviewLinkNotifier, previewlinknotifier.go) authenticates with
-// the SAME static bot credential (platform.Config.GitHubBotToken) every
+// the SAME static bot credential (platform.Config.GitHubOutbound) every
 // other system-initiated write in this package already uses, since a
 // preview link is a system-generated fact about a commit, never
 // attributed to any individual PR author or reviewer.

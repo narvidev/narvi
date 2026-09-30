@@ -84,12 +84,15 @@ func newRolloutTestRig(t *testing.T, mode platform.RolloutMode) (testRig, *narvi
 		BotHandle:     testBotHandleIntegration,
 		LinkNotices:   rig.linkNotices,
 		Comments:      poster,
-		BotToken:      "test-bot-token",
+		Outbound:      platform.MustNewGitHubOutboundConfig("test-bot-token"),
 		PublicBaseURL: testPublicBaseURL,
 		Timeouts:      platform.DefaultTimeouts(),
 	}
 
-	handler := githubingress.NewHandler(coalescer, deliveries, cfg)
+	handler, handlerErr := githubingress.NewHandler(coalescer, deliveries, cfg)
+	if handlerErr != nil {
+		t.Fatalf("githubingress.NewHandler: %v", handlerErr)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhooks/github", handler)

@@ -157,7 +157,7 @@ func newReviewNoPushFixture(ctx context.Context, t *testing.T) reviewNoPushFixtu
 	commander := &reviewNoPushCommander{}
 	fetcher := &fakeReviewContextFetcher{pr: githubapi.PullRequest{HeadSHA: reviewNoPushHeadAfter, BaseRef: "main"}, diff: "+ the line someone else's push changed"}
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, commander, nil, "", nil, reviewNoPushTokenKey, "", nil, false,
-		sessionactor.RegistryOptions{ReviewDiffFetcher: fetcher, GitHubBotHandle: "narvi-bot", GitHubBotToken: "test-token"})
+		sessionactor.RegistryOptions{ReviewDiffFetcher: fetcher, GitHubBotHandle: "narvi-bot", GitHubOutbound: platform.MustNewGitHubOutboundConfig("test-token")})
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}

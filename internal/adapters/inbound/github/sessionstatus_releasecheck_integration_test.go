@@ -120,7 +120,7 @@ func TestSessionStatus_ReleaseManifestCheckIsScheduledUntilItsCompositionTurnExi
 			}
 
 			lister := &holdingMergedPRLister{truncated: tc.triggers, entered: make(chan struct{}), release: make(chan struct{})}
-			worker := releasereview.NewWorker(pendingStore, releasereview.Deps{
+			worker, workerErr := releasereview.NewWorker(pendingStore, releasereview.Deps{
 				SourceControl:          lister,
 				Outbox:                 narvipg.NewOutboxStore(pool, false),
 				CompositionTemplates:   narvipg.NewPromptTemplateStore(pool),
@@ -128,7 +128,10 @@ func TestSessionStatus_ReleaseManifestCheckIsScheduledUntilItsCompositionTurnExi
 				CompositionTurns:       turns,
 				CompositionDispatch:    noopCompositionDispatch{},
 				Timeouts:               platform.DefaultTimeouts(),
-			}, "gho_bottoken", platform.DefaultTimeouts())
+			}, platform.MustNewGitHubOutboundConfig("gho_bottoken"), platform.DefaultTimeouts())
+			if workerErr != nil {
+				t.Fatalf("releasereview.NewWorker: %v", workerErr)
+			}
 
 			var (
 				mu   sync.Mutex

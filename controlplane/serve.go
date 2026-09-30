@@ -444,13 +444,6 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	slackIngressEnabled := cfg.IngressEnabled[integrations.ProviderSlack]
 	linearIngressEnabled := cfg.IngressEnabled[integrations.ProviderLinear]
 	githubIngressEnabled := cfg.IngressEnabled[integrations.ProviderGitHub]
-	// githubBotToken bridges the typed GitHub outbound axis
-	// (cfg.GitHubOutbound) to the string-typed consumers below until each
-	// takes the typed config itself.
-	githubBotToken := ""
-	if cfg.GitHubOutbound != nil {
-		githubBotToken = cfg.GitHubOutbound.BotToken()
-	}
 
 	// hub is the single shared piece of state connecting the app-layer
 	// actor to the adapter-layer client sockets (§6.2's "→ broadcast
@@ -652,7 +645,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	registry, err := sessionactor.NewRegistry(ctx, pool, cfg.Timeouts, hub, commander, sandboxProvider, cfg.PublicBaseURL,
 		sourceControl, cfg.TokenEncryptionKey, cfg.OpenCodeRuntimeVersion, sourceControl, cfg.EpistemicCheckDefault,
 		sessionactor.RegistryOptions{
-			GitHubBotToken:    githubBotToken,
+			GitHubOutbound:    cfg.GitHubOutbound,
 			GitHubBotHandle:   cfg.GitHubBotHandle,
 			ReviewDiffFetcher: sourceControl,
 			ReviewModelDeep:   cfg.ReviewModelDeep,
@@ -1359,7 +1352,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// reviewpost.RerunGuidance) is built to be recognized by that SAME
 	// regex (§5.2).
 	router.Post("/sessions/{sessionID}/review/verdict",
-		httpapi.PostReviewVerdict(pool, sandboxStore, sessionStore, githubPRSessionStore, repoSettingsStore, reviewFindingStore, sentinelFixStore, outboxStore, reviewVerdictStore, turnStore, eventStore, cfg.GitHubBotHandle, githubBotToken, sourceControl, findingRelocationResolver, cfg.Timeouts, cfg.ShadowMode))
+		httpapi.PostReviewVerdict(pool, sandboxStore, sessionStore, githubPRSessionStore, repoSettingsStore, reviewFindingStore, sentinelFixStore, outboxStore, reviewVerdictStore, turnStore, eventStore, cfg.GitHubBotHandle, cfg.GitHubOutbound, sourceControl, findingRelocationResolver, cfg.Timeouts, cfg.ShadowMode))
 
 	// workflow/step-outcome ("workflow execution engine", §25.6):
 	// the GENERIC step-outcome-posting tool -- deliberately mounted
@@ -1539,7 +1532,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// mount this route at all, so a webhook POST from GitHub 404s rather
 	// than reaching a handler built against an empty WebhookSecret.
 	if githubIngressEnabled {
-		router.Post("/webhooks/github", githubingress.NewHandler(
+		githubWebhookHandler, err := githubingress.NewHandler(
 			&githubingress.SessionCoalescer{
 				Pool:             pool,
 				PRSessions:       githubPRSessionStore,
@@ -1654,7 +1647,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 				// cfg.GitHubBotToken is the SAME bot credential githubNotifier
 				// (below) already authenticates its own PostIssueComment calls
 				// with, never a per-commenter credential.
-				BotToken:     githubBotToken,
+				Outbound:     cfg.GitHubOutbound,
 				PullRequests: sourceControl,
 				// Comments (a follow-up fix, Finding 1; also posts
 				// batch fix/deny-unlinked-github-actors' own "please sign in"
@@ -1706,7 +1699,11 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 				Automations:           automationStore,
 				AutomationInvocations: automationInvocationStore,
 			},
-		))
+		)
+		if err != nil {
+			return nil, fmt.Errorf("construct github webhook handler: %w", err)
+		}
+		router.Post("/webhooks/github", githubWebhookHandler)
 	}
 
 	// Auth routes (§13.1/§13.4): how a session is obtained/
@@ -1971,15 +1968,18 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// cfg.GitHubBotToken -- the bot credential, since a background
 	// worker has no clicking human's own token to reuse (see
 	// automerge.Deps' own doc comment).
-	automergeWorker, err := automerge.New(automerge.Deps{
-		DecisionInbox: decisionInboxDeps,
-		SourceControl: sourceControl,
-		AuditLog:      auditLogStore,
-		BotToken:      githubBotToken,
-		Timeouts:      cfg.Timeouts,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("construct automerge worker: %w", err)
+	var automergeWorker *automerge.Worker
+	if cfg.GitHubOutbound != nil {
+		automergeWorker, err = automerge.New(automerge.Deps{
+			DecisionInbox: decisionInboxDeps,
+			SourceControl: sourceControl,
+			AuditLog:      auditLogStore,
+			Outbound:      cfg.GitHubOutbound,
+			Timeouts:      cfg.Timeouts,
+		})
+		if err != nil {
+			return nil, fmt.Errorf("construct automerge worker: %w", err)
+		}
 	}
 	digestPump := digest.New(digest.Deps{
 		Channels:      digestChannelStore,
@@ -2063,7 +2063,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		PRSessions:     githubPRSessionStore,
 		ReviewVerdicts: reviewVerdictStore,
 		SourceControl:  sourceControl,
-		BotToken:       githubBotToken,
+		Outbound:       cfg.GitHubOutbound,
 		Timeouts:       cfg.Timeouts,
 	}
 	router.Route("/api/sessions", func(r chi.Router) {
@@ -2141,7 +2141,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// sourceControl/cfg.GitHubBotToken are the SAME instances the
 		// GitHub webhook ingress wiring above already constructs, never a
 		// second, independently-constructed copy.
-		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(pool, sessionStore, turnStore, planStore, auditLogStore, registry, githubPRSessionStore, sourceControl, reviewFindingStore, falsePositivePatternStore, reviewVerdictStore, knowledgeRanker, githubBotToken, cfg.Timeouts, appreviewtriage.Deps{RepoSettings: repoSettingsStore, ReviewVerdicts: reviewVerdictStore, Artifacts: artifactStore, Sessions: sessionStore}, cfg.ReviewModelDeep))
+		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(pool, sessionStore, turnStore, planStore, auditLogStore, registry, githubPRSessionStore, sourceControl, reviewFindingStore, falsePositivePatternStore, reviewVerdictStore, knowledgeRanker, cfg.GitHubOutbound, cfg.Timeouts, appreviewtriage.Deps{RepoSettings: repoSettingsStore, ReviewVerdicts: reviewVerdictStore, Artifacts: artifactStore, Sessions: sessionStore}, cfg.ReviewModelDeep))
 		// review/findings/{identityHash}/rebut + apply-suggestion (
 		// "sentinels + suggestions", §12.2 item 2/§22.1) -- maintainer+
 		// only (authz.ActionEditReviewVerdict, checked inside each
@@ -2156,7 +2156,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// comment. sourceControl/findingRelocationResolver/cfg.GitHubBotToken
 		// are the SAME instances every other GitHub-facing route above
 		// already uses.
-		r.Get("/{sessionID}/review", httpapi.GetReviewReadout(sessionStore, githubPRSessionStore, reviewVerdictDeps, reviewFindingStore, turnStore, sourceControl, findingRelocationResolver, sentinelFixStore, handoffSentinelStore, githubBotToken, cfg.Timeouts))
+		r.Get("/{sessionID}/review", httpapi.GetReviewReadout(sessionStore, githubPRSessionStore, reviewVerdictDeps, reviewFindingStore, turnStore, sourceControl, findingRelocationResolver, sentinelFixStore, handoffSentinelStore, cfg.GitHubOutbound, cfg.Timeouts))
 		// release-manifest (§15.2/§15.3, §12.2 item 9) -- the dedicated
 		// release-review screen's own read model, see httpapi/
 		// releasemanifestreadout.go's own doc comment.
@@ -2980,7 +2980,6 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// linearnotifier.go). slackNotifier/planSlackNotifier are constructed
 	// earlier, alongside outboxStore -- see that construction site's own
 	// doc comment for why.
-	githubNotifier := githubapi.NewBotNotifier(liveSourceControl, githubBotToken)
 	linearNotifier := outboxworker.NewLinearNotifier(linearClient, linearInstallationStore, cfg.TokenEncryptionKey)
 	// githubVerdictNotifier ("server-side verdict", §8.2) wraps
 	// the SAME sourceControl *githubapi.Adapter instance every other
@@ -2989,28 +2988,23 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// posting a verdict is a bot-attributed action exactly like posting
 	// the (now-blocked-for-review-sessions) generic outcome comment used
 	// to be, never a per-commenter credential.
-	githubVerdictNotifier := githubapi.NewVerdictNotifier(liveSourceControl, githubBotToken)
 	// sentinelAutoFixNotifier ("sentinels + suggestions", §17.2)
 	// spawns the child session -- reviewFindingStore/sentinelFixStore are
 	// the SAME instances every other caller above already uses.
-	sentinelAutoFixNotifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessionStore, turnStore, environmentStore, auditLogStore, registry, sentinelFixStore, reviewFindingStore, sourceControl, githubBotToken, cfg.Timeouts, cfg.EpistemicCheckDefault, cfg.RolloutMode, repoSettingsStore, githubPRSessionStore, isLiveEgress, shadowLedger)
 	// handoffNotifier ("handoff-readiness sentinel", §14.4) posts
 	// the handoff-readiness comment and applies the "handoff" label on a
 	// scoped session's PR -- the SAME sourceControl/cfg.GitHubBotToken
 	// every other GitHub-flavored notifier above already uses.
-	handoffNotifier := githubapi.NewHandoffNotifier(liveSourceControl, githubBotToken)
 	// releaseManifestNotifier ("release PR review", §15.2) posts
 	// the release manifest check's own summary comment -- the SAME
 	// sourceControl/cfg.GitHubBotToken every other GitHub-flavored
 	// notifier above already uses.
-	releaseManifestNotifier := githubapi.NewReleaseManifestNotifier(liveSourceControl, githubBotToken)
 	// descriptionAutofixNotifier ("review digest: description
 	// adequacy + graduated remediation", §26.2) re-verifies Narvi-
 	// authorship and this repo's own descriptionAutofix flag, fresh, at
 	// delivery time, then rewrites a Narvi-authored PR's own body -- the
 	// SAME repoSettingsStore/artifactStore/sourceControl/cfg.GitHubBotToken
 	// every other caller above already uses.
-	descriptionAutofixNotifier := outboxworker.NewDescriptionAutofixNotifier(repoSettingsStore, artifactStore, sourceControl, githubBotToken, cfg.Timeouts)
 	// reviewCheckNotifier (the review's own GitHub-native result
 	// surface, §8.2/§21.1/§21.1b) publishes/updates the
 	// narvi/review check run -- the SAME liveSourceControl/
@@ -3027,7 +3021,6 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// comment, reviewcheck.go) -- no config value for it exists, or is
 	// needed, here.
 	reviewCheckRunStore := postgres.NewReviewCheckRunStore(pool)
-	reviewCheckNotifier := outboxworker.NewReviewCheckNotifier(pool, reviewCheckRunStore, liveSourceControl, githubBotToken)
 
 	// outboxStore is constructed earlier, alongside linearAgentSessionStore
 	// -- see that construction site's own doc comment for why.
@@ -3088,6 +3081,36 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		outboxNotifiers[ports.NotificationKindLinearDigest] = outboxworker.NewDigestLinearNotifier()
 	}
 	if githubIngressEnabled {
+		// GitHub ingress requires GitHub outbound, so cfg.GitHubOutbound is
+		// non-nil here; every constructor below still refuses nil.
+		githubNotifier, err := githubapi.NewBotNotifier(liveSourceControl, cfg.GitHubOutbound)
+		if err != nil {
+			return nil, err
+		}
+		githubVerdictNotifier, err := githubapi.NewVerdictNotifier(liveSourceControl, cfg.GitHubOutbound)
+		if err != nil {
+			return nil, err
+		}
+		sentinelAutoFixNotifier, err := outboxworker.NewSentinelAutoFixNotifier(pool, sessionStore, turnStore, environmentStore, auditLogStore, registry, sentinelFixStore, reviewFindingStore, sourceControl, cfg.GitHubOutbound, cfg.Timeouts, cfg.EpistemicCheckDefault, cfg.RolloutMode, repoSettingsStore, githubPRSessionStore, isLiveEgress, shadowLedger)
+		if err != nil {
+			return nil, err
+		}
+		handoffNotifier, err := githubapi.NewHandoffNotifier(liveSourceControl, cfg.GitHubOutbound)
+		if err != nil {
+			return nil, err
+		}
+		releaseManifestNotifier, err := githubapi.NewReleaseManifestNotifier(liveSourceControl, cfg.GitHubOutbound)
+		if err != nil {
+			return nil, err
+		}
+		descriptionAutofixNotifier, err := outboxworker.NewDescriptionAutofixNotifier(repoSettingsStore, artifactStore, sourceControl, cfg.GitHubOutbound, cfg.Timeouts)
+		if err != nil {
+			return nil, err
+		}
+		reviewCheckNotifier, err := outboxworker.NewReviewCheckNotifier(pool, reviewCheckRunStore, liveSourceControl, cfg.GitHubOutbound)
+		if err != nil {
+			return nil, err
+		}
 		// githubNotifier wraps the SAME sourceControl Adapter already
 		// constructed above (design decision: BotNotifier is a sibling
 		// type over the same Adapter/doPost machinery, not a second,
@@ -3173,7 +3196,11 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		rwxDispatchClient := rwx.NewDispatchClient(http.DefaultClient, "", cfg.RWXAccessToken)
 		outboxNotifiers[ports.NotificationKindRWXPreviewDispatch] = rwx.NewPreviewNotifier(rwxDispatchClient)
 		if githubIngressEnabled {
-			outboxNotifiers[ports.NotificationKindGitHubPreviewLink] = githubapi.NewPreviewLinkNotifier(liveSourceControl, githubBotToken)
+			previewLinkNotifier, err := githubapi.NewPreviewLinkNotifier(liveSourceControl, cfg.GitHubOutbound)
+			if err != nil {
+				return nil, err
+			}
+			outboxNotifiers[ports.NotificationKindGitHubPreviewLink] = previewLinkNotifier
 		}
 	}
 
@@ -3224,21 +3251,27 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// (*sessionactor.Actor).Send(sessionactor.EnsureDispatched{}), the SAME
 	// fire-and-forget sequencing httpapi.createTurnLocked already uses
 	// after every OTHER turn-creation path (turn.go).
-	releaseManifestWorker := releasereview.NewWorker(releaseManifestPendingStore, releasereview.Deps{
-		SourceControl:          sourceControl,
-		Outbox:                 outboxStore,
-		ReleaseManifestChecks:  releaseManifestCheckStore,
-		CompositionTemplates:   promptTemplateStore,
-		CompositionDiffFetcher: sourceControl,
-		CompositionTurns:       turnStore,
-		CompositionDispatch:    releaseCompositionDispatcher{registry: registry},
-		// CompositionAnchor (confirmed-major auditability fix): the SAME
-		// releaseManifestCheckStore instance ReleaseManifestChecks above
-		// already uses -- it satisfies releasereview.CompositionAnchorUpdater
-		// directly (UpdateCompositionAnchor), no new store instance needed.
-		CompositionAnchor: releaseManifestCheckStore,
-		Timeouts:          cfg.Timeouts,
-	}, githubBotToken, cfg.Timeouts)
+	var releaseManifestWorker *releasereview.Worker
+	if cfg.GitHubOutbound != nil {
+		releaseManifestWorker, err = releasereview.NewWorker(releaseManifestPendingStore, releasereview.Deps{
+			SourceControl:          sourceControl,
+			Outbox:                 outboxStore,
+			ReleaseManifestChecks:  releaseManifestCheckStore,
+			CompositionTemplates:   promptTemplateStore,
+			CompositionDiffFetcher: sourceControl,
+			CompositionTurns:       turnStore,
+			CompositionDispatch:    releaseCompositionDispatcher{registry: registry},
+			// CompositionAnchor (confirmed-major auditability fix): the SAME
+			// releaseManifestCheckStore instance ReleaseManifestChecks above
+			// already uses -- it satisfies releasereview.CompositionAnchorUpdater
+			// directly (UpdateCompositionAnchor), no new store instance needed.
+			CompositionAnchor: releaseManifestCheckStore,
+			Timeouts:          cfg.Timeouts,
+		}, cfg.GitHubOutbound, cfg.Timeouts)
+		if err != nil {
+			return nil, err
+		}
+	}
 
 	return &App{
 		Router: router,
@@ -3380,12 +3413,14 @@ func (a *App) Run(ctx context.Context, addr string) error {
 	// point of this fix (see releaseManifestWorker's own construction
 	// site doc comment, and migrations/000050_release_manifest_pending.
 	// up.sql's own doc comment, for the full "why").
-	group.Go(func() error {
-		if err := releaseManifestWorker.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
-			return fmt.Errorf("release manifest check worker: %w", err)
-		}
-		return nil
-	})
+	if releaseManifestWorker != nil {
+		group.Go(func() error {
+			if err := releaseManifestWorker.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
+				return fmt.Errorf("release manifest check worker: %w", err)
+			}
+			return nil
+		})
+	}
 
 	// §3.5 ("automations: engine", §3.5): started/shut down through
 	// this SAME errgroup as every other background loop above -- no naked
@@ -3406,12 +3441,14 @@ func (a *App) Run(ctx context.Context, addr string) error {
 	// naked goroutine (§11) -- with the identical context.Canceled
 	// carve-out every other background loop already establishes for
 	// normal shutdown.
-	group.Go(func() error {
-		if err := automergeWorker.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
-			return fmt.Errorf("auto-merge worker: %w", err)
-		}
-		return nil
-	})
+	if automergeWorker != nil {
+		group.Go(func() error {
+			if err := automergeWorker.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
+				return fmt.Errorf("auto-merge worker: %w", err)
+			}
+			return nil
+		})
+	}
 
 	// (§21.3, "deterministic daily digest"): started/shut down
 	// through this SAME errgroup as every other background loop above --

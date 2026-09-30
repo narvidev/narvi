@@ -116,7 +116,7 @@ const manualRetriggerPromptText = "Manual re-review requested via the web review
 // internal/adapters/inbound/github's own identical Config.ArchDecisions/
 // KnowledgeRanker fields (handler.go) in shape -- see this function's own
 // FetchPriorArchDecisions call site for the full "why".
-func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, prSessions *postgres.GitHubPRSessionStore, diffFetcher reviewcontext.Fetcher, reviewFindings reviewcontext.FindingsFetcher, falsePositivePatterns reviewcontext.FalsePositivePatternsFetcher, archDecisions reviewcontext.ArchDecisionsFetcher, knowledgeRanker ports.KnowledgeRanker, botToken string, timeouts platform.Timeouts, reviewTriageDeps appreviewtriage.Deps, reviewModelDeep string) http.HandlerFunc {
+func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, prSessions *postgres.GitHubPRSessionStore, diffFetcher reviewcontext.Fetcher, reviewFindings reviewcontext.FindingsFetcher, falsePositivePatterns reviewcontext.FalsePositivePatternsFetcher, archDecisions reviewcontext.ArchDecisionsFetcher, knowledgeRanker ports.KnowledgeRanker, outbound *platform.GitHubOutboundConfig, timeouts platform.Timeouts, reviewTriageDeps appreviewtriage.Deps, reviewModelDeep string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
 		if !ok {
@@ -231,9 +231,19 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		var reviewHeadSHA *string
 		var prCtx review.PreFetchedContext
 		havePrCtx := false
-		if diffFetcher != nil {
+		switch {
+		case diffFetcher == nil:
+			// No fetcher configured: the prompt stays the plain fixed text.
+		case outbound == nil:
+			// GitHub outbound off (§12.5): no credential to read the pull
+			// request as the bot, so the review turn runs without the
+			// pre-fetched diff context -- the SAME degradation as a nil
+			// diffFetcher, with no call made.
+			logger.Warn("httpapi: GitHub outbound is off (NARVI_OUTBOUND_ENABLED), re-review runs without pre-fetched review context",
+				"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+		default:
 			if owner, repo, ok := reposource.SplitFullName(prSession.RepoFullName); ok {
-				prCtx = reviewcontext.Fetch(ctx, logger, diffFetcher, timeouts, owner, repo, prSession.PrNumber, botToken, nil)
+				prCtx = reviewcontext.Fetch(ctx, logger, diffFetcher, timeouts, owner, repo, prSession.PrNumber, outbound.BotToken(), nil)
 				havePrCtx = true
 				if prCtx.HeadSHA != "" {
 					reviewHeadSHA = &prCtx.HeadSHA

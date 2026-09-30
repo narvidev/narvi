@@ -9,6 +9,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // TestReleaseManifestNotifier_Deliver_PostsPlainComment proves Deliver
@@ -37,7 +38,7 @@ func TestReleaseManifestNotifier_Deliver_PostsPlainComment(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := githubapi.NewReleaseManifestNotifier(adapter, "baked-in-bot-token")
+	notifier := mustBuild(githubapi.NewReleaseManifestNotifier(adapter, platform.MustNewGitHubOutboundConfig("baked-in-bot-token")))
 
 	payload, err := json.Marshal(githubapi.ReleaseManifestPayload{
 		Owner:    "acme",
@@ -75,7 +76,7 @@ func TestReleaseManifestNotifier_Deliver_MalformedPayload(t *testing.T) {
 	t.Parallel()
 
 	adapter := githubapi.New(nil, "https://example.invalid")
-	notifier := githubapi.NewReleaseManifestNotifier(adapter, "tok")
+	notifier := mustBuild(githubapi.NewReleaseManifestNotifier(adapter, platform.MustNewGitHubOutboundConfig("tok")))
 
 	err := notifier.Deliver(context.Background(), ports.Notification{
 		Kind:    ports.NotificationKindReleaseManifest,

@@ -60,6 +60,11 @@ import (
 // every other reviewcontext.Fetcher caller's own explicit nil guard.
 var errNilReviewContextFetcher = errors.New("httpapi: review readout fetcher is nil")
 
+// errGitHubOutboundOff is the review readout's "live read not available"
+// reason when GitHub outbound is off (§12.5): there is no bot credential to
+// read the pull request with, so none is attempted.
+var errGitHubOutboundOff = errors.New("httpapi: GitHub outbound is off (NARVI_OUTBOUND_ENABLED), no live pull request read")
+
 // GetReviewReadout backs GET /api/sessions/{sessionID}/review. 404 if
 // sessionID doesn't exist; 400 if it exists but was never created via a
 // GitHub PR mention (no PR to read a review for); 403 if the caller fails
@@ -78,7 +83,7 @@ func GetReviewReadout(
 	relocationResolver *findingposition.Resolver,
 	sentinelFixes *postgres.SentinelFixStore,
 	handoffSentinelRuns *postgres.HandoffSentinelStore,
-	botToken string,
+	outbound *platform.GitHubOutboundConfig,
 	timeouts platform.Timeouts,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -156,11 +161,17 @@ func GetReviewReadout(
 		// legitimately unconfigured/test caller must degrade, never panic.
 		var pr githubapi.PullRequest
 		var prErr error
-		if fetcher == nil {
+		switch {
+		case fetcher == nil:
 			prErr = errNilReviewContextFetcher
-		} else {
+		case outbound == nil:
+			// GitHub outbound off (§12.5): no credential to read the pull
+			// request as the bot -- the live part reads "not available",
+			// the same degradation as a failed fetch, with no call made.
+			prErr = errGitHubOutboundOff
+		default:
 			prCtx, cancel := context.WithTimeout(ctx, timeouts.GitHubGetPRTimeout)
-			pr, prErr = fetcher.GetPullRequest(prCtx, owner, repo, prNumber, botToken)
+			pr, prErr = fetcher.GetPullRequest(prCtx, owner, repo, prNumber, outbound.BotToken())
 			cancel()
 		}
 		if prErr != nil {
@@ -253,8 +264,8 @@ func GetReviewReadout(
 		// itself failing) leaves every finding unanchored (0, 0), exactly
 		// findingposition.ResolveAll's own documented degradation.
 		var diff string
-		if hasLatest && latest.HeadSHA != "" {
-			if d, ok := reviewcontext.FetchDiffAt(ctx, logger, fetcher, timeouts, owner, repo, prNumber, botToken, latest.HeadSHA); ok {
+		if hasLatest && latest.HeadSHA != "" && outbound != nil {
+			if d, ok := reviewcontext.FetchDiffAt(ctx, logger, fetcher, timeouts, owner, repo, prNumber, outbound.BotToken(), latest.HeadSHA); ok {
 				diff = d
 			}
 		}

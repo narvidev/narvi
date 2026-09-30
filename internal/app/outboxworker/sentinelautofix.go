@@ -134,16 +134,16 @@ type sentinelAutoFixNotifier struct {
 	registry       *sessionactor.Registry
 	sentinelFixes  *postgres.SentinelFixStore
 	reviewFindings *postgres.ReviewFindingStore
-	// sourceControl/githubBotToken (confirmed-finding fix) let Deliver
+	// sourceControl/outbound (confirmed-finding fix) let Deliver
 	// create the fix session's own distinct upstream branch (see this
 	// file's own Deliver doc comment) BEFORE ever spawning the child
 	// session -- the SAME bot-attributed, static credential
 	// createSentinelFixPRBestEffort (pushpr.go) already authenticates its
 	// own fix-PR-creation calls with, never a per-user OAuth token (this
 	// session has no human creator to decrypt one for).
-	sourceControl  ports.SourceControl
-	githubBotToken string
-	timeouts       platform.Timeouts
+	sourceControl ports.SourceControl
+	outbound      *platform.GitHubOutboundConfig
+	timeouts      platform.Timeouts
 	// epistemicCheckDefault (F6, adversarial review) is the SAME
 	// platform.Config.EpistemicCheckDefault value every other
 	// CreateSessionOnTx-reaching caller in this codebase now threads
@@ -205,10 +205,12 @@ var _ ports.Notifier = (*sentinelAutoFixNotifier)(nil)
 // ports.NotificationKindSentinelAutoFix -- called once by cmd/control-
 // plane/main.go's own kind->Notifier map assembly, mirroring every other
 // notifier constructor's own identical "called exactly once" precedent.
-// sourceControl/githubBotToken/timeouts are the SAME instances/values
+// sourceControl/outbound/timeouts are the SAME instances/values
 // production wiring already constructs for every other GitHub-flavored
 // notifier (e.g. githubapi.NewVerdictNotifier's own sourceControl/
-// cfg.GitHubBotToken, cmd/control-plane/main.go). isLive/ledger (§30.7/
+// cfg.GitHubOutbound, controlplane/githuboutbound.go). outbound must be
+// non-nil: the fix branch is created as the bot, so the notifier refuses
+// to exist with GitHub outbound off (§12.5). isLive/ledger (§30.7/
 // §30.9, resolved: no git mirror -- short-circuit the lane before the
 // claim) are the SAME isLiveEgress closure and shadowLedger instance
 // production wiring already constructs for shadowscm.Decorator -- see
@@ -224,7 +226,7 @@ func NewSentinelAutoFixNotifier(
 	sentinelFixes *postgres.SentinelFixStore,
 	reviewFindings *postgres.ReviewFindingStore,
 	sourceControl ports.SourceControl,
-	githubBotToken string,
+	outbound *platform.GitHubOutboundConfig,
 	timeouts platform.Timeouts,
 	epistemicCheckDefault bool,
 	rolloutMode platform.RolloutMode,
@@ -232,18 +234,21 @@ func NewSentinelAutoFixNotifier(
 	prSessions *postgres.GitHubPRSessionStore,
 	isLive func(ctx context.Context, repoFullName string) bool,
 	ledger shadowledger.Store,
-) ports.Notifier {
+) (ports.Notifier, error) {
+	if err := platform.RequireGitHubOutbound(outbound, "outboxworker: new sentinel auto-fix notifier"); err != nil {
+		return nil, err
+	}
 	return &sentinelAutoFixNotifier{
 		pool: pool, sessions: sessions, turns: turns, environments: environments,
 		auditLog: auditLog, registry: registry, sentinelFixes: sentinelFixes, reviewFindings: reviewFindings,
-		sourceControl: sourceControl, githubBotToken: githubBotToken, timeouts: timeouts,
+		sourceControl: sourceControl, outbound: outbound, timeouts: timeouts,
 		epistemicCheckDefault: epistemicCheckDefault,
 		rolloutMode:           rolloutMode,
 		repoSettings:          repoSettings,
 		prSessions:            prSessions,
 		isLive:                isLive,
 		ledger:                ledger,
-	}
+	}, nil
 }
 
 // sentinelAutoFixPromptText builds the fix session's own deterministic,
@@ -793,7 +798,7 @@ func (n *sentinelAutoFixNotifier) createFixBranch(ctx context.Context, payload p
 		Owner:  owner,
 		Repo:   repoName,
 		Branch: payload.OriginHeadBranch,
-		Token:  n.githubBotToken,
+		Token:  n.outbound.BotToken(),
 	})
 	cancel()
 	if err != nil {
@@ -808,7 +813,7 @@ func (n *sentinelAutoFixNotifier) createFixBranch(ctx context.Context, payload p
 		Repo:   repoName,
 		Branch: newBranch,
 		SHA:    sha,
-		Token:  n.githubBotToken,
+		Token:  n.outbound.BotToken(),
 	})
 	cancel()
 	if err != nil {

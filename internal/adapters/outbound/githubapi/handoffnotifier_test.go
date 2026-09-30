@@ -11,6 +11,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/handoff"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // TestHandoffNotifier_Deliver_AddsLabelAndPostsComment proves ONE Deliver
@@ -49,7 +50,7 @@ func TestHandoffNotifier_Deliver_AddsLabelAndPostsComment(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := githubapi.NewHandoffNotifier(adapter, "baked-in-bot-token")
+	notifier := mustBuild(githubapi.NewHandoffNotifier(adapter, platform.MustNewGitHubOutboundConfig("baked-in-bot-token")))
 
 	payload, err := json.Marshal(githubapi.HandoffPayload{
 		Owner:    "acme",
@@ -108,7 +109,7 @@ func TestHandoffNotifier_Deliver_LabelFailure_NeverPostsComment(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := githubapi.NewHandoffNotifier(adapter, "baked-in-bot-token")
+	notifier := mustBuild(githubapi.NewHandoffNotifier(adapter, platform.MustNewGitHubOutboundConfig("baked-in-bot-token")))
 
 	payload, err := json.Marshal(githubapi.HandoffPayload{
 		Owner: "acme", Repo: "widgets", PRNumber: 42, Body: "text", Label: handoff.Label,
@@ -165,7 +166,7 @@ func TestHandoffNotifier_Deliver_RetryAfterCommentFailure_NeverDuplicatesComment
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := githubapi.NewHandoffNotifier(adapter, "baked-in-bot-token")
+	notifier := mustBuild(githubapi.NewHandoffNotifier(adapter, platform.MustNewGitHubOutboundConfig("baked-in-bot-token")))
 
 	payload, err := json.Marshal(githubapi.HandoffPayload{
 		Owner: "acme", Repo: "widgets", PRNumber: 42, Body: "text", Label: handoff.Label,
@@ -198,7 +199,7 @@ func TestHandoffNotifier_Deliver_InvalidPayload(t *testing.T) {
 	t.Parallel()
 
 	adapter := githubapi.New(http.DefaultClient, "http://unused.invalid")
-	notifier := githubapi.NewHandoffNotifier(adapter, "bot-token")
+	notifier := mustBuild(githubapi.NewHandoffNotifier(adapter, platform.MustNewGitHubOutboundConfig("bot-token")))
 
 	err := notifier.Deliver(context.Background(), ports.Notification{
 		Kind:    ports.NotificationKindHandoffSentinel,

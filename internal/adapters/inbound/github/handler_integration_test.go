@@ -133,6 +133,7 @@ func newTestRig(t *testing.T, mutate ...func(*githubingress.Config)) testRig {
 	cfg := githubingress.Config{
 		WebhookSecret: testWebhookSecret,
 		BotHandle:     testBotHandleIntegration,
+		Outbound:      platform.MustNewGitHubOutboundConfig("test-bot-token"),
 		// LinkNotices (batch fix/deny-unlinked-github-actors): wired by
 		// DEFAULT for every test in this file, mirroring cmd/control-
 		// plane/main.go's own unconditional production wiring -- harmless
@@ -147,7 +148,10 @@ func newTestRig(t *testing.T, mutate ...func(*githubingress.Config)) testRig {
 		m(&cfg)
 	}
 
-	handler := githubingress.NewHandler(coalescer, deliveries, cfg)
+	handler, handlerErr := githubingress.NewHandler(coalescer, deliveries, cfg)
+	if handlerErr != nil {
+		t.Fatalf("githubingress.NewHandler: %v", handlerErr)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhooks/github", handler)
@@ -750,7 +754,7 @@ func TestGitHubIntegration_InlineDiffAndStackPreFetched_FoldedIntoTurnPrompt(t *
 	rig := newTestRig(t, func(cfg *githubingress.Config) {
 		cfg.PullRequests = fetcher
 		cfg.DiffFetcher = fetcher
-		cfg.BotToken = "test-bot-token"
+		cfg.Outbound = platform.MustNewGitHubOutboundConfig("test-bot-token")
 	})
 
 	const commenterID = 80000909
@@ -1144,7 +1148,7 @@ func TestGitHubIntegration_IssueCommentResolvesRealHeadBranch(t *testing.T) {
 	}
 	rig := newTestRig(t, func(cfg *githubingress.Config) {
 		cfg.PullRequests = resolver
-		cfg.BotToken = "test-bot-token"
+		cfg.Outbound = platform.MustNewGitHubOutboundConfig("test-bot-token")
 		cfg.Timeouts = platform.DefaultTimeouts()
 	})
 
@@ -1186,7 +1190,7 @@ func TestGitHubIntegration_IssueCommentGetPullRequestFailureFallsBack(t *testing
 	resolver := &fakePullRequestResolver{err: errors.New("simulated GitHub API outage")}
 	rig := newTestRig(t, func(cfg *githubingress.Config) {
 		cfg.PullRequests = resolver
-		cfg.BotToken = "test-bot-token"
+		cfg.Outbound = platform.MustNewGitHubOutboundConfig("test-bot-token")
 		cfg.Timeouts = platform.DefaultTimeouts()
 	})
 
@@ -1255,7 +1259,7 @@ func TestGitHubIntegration_AwaitingPlanBlocksReuseTurn_HonestReplyNoRelease(t *t
 	poster := &fakeCommentPoster{}
 	rig := newTestRig(t, func(cfg *githubingress.Config) {
 		cfg.Comments = poster
-		cfg.BotToken = "test-bot-token"
+		cfg.Outbound = platform.MustNewGitHubOutboundConfig("test-bot-token")
 	})
 
 	const repoFullName = "acme/awaiting-plan-repo"
