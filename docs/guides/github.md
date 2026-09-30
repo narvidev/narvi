@@ -150,8 +150,13 @@ webhook above, in one direction only:
   that it never calls GitHub (`NARVI_OUTBOUND_ENABLED=` empty). It must
   say which: with `NARVI_INGRESS_ENABLED` excluding `github`, an unset
   `NARVI_OUTBOUND_ENABLED` refuses to boot. With it off, nothing above is
-  posted, auto-merge does not run, and the review screens show their
-  live GitHub facts as unavailable.
+  posted, neither auto-merge nor the release-manifest check runs, and
+  the review screens show their live GitHub facts as unavailable; the
+  web "Re-run review" button still queues a review whose findings show
+  there. With it on and ingress off, the bot posts everything above, and
+  a posted review's re-run guidance points at that web button alone --
+  no mention or label would reach Narvi without the webhook, and the bot
+  handle is not kept.
 
 It is not the GitHub App below: that App's read-only installation token
 is what review sandboxes clone with, and it never posts anything. It is

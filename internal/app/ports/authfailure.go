@@ -18,7 +18,7 @@ import "errors"
 // sentinel's first real consumer: internal/app/automerge.Worker signs
 // EVERY outbound call it makes, against EVERY repo it ever touches, with
 // the SAME single, statically-configured deployment-wide bot credential
-// (platform.Config.GitHubBotToken) -- so a 401 against any one repo is,
+// (platform.Config.GitHubOutbound's bot token) -- so a 401 against any one repo is,
 // by construction, a worker-wide condition, never scoped to just that
 // repo. See internal/app/automerge's own authguard.go for where that
 // scope decision is actually made and acted on.

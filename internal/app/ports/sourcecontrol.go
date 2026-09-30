@@ -261,7 +261,7 @@ type UpdatePRBodySpec struct {
 	// to (the target PR may have been opened by a different session
 	// entirely than the one whose verdict triggered this rewrite), so this
 	// is always the deployment's own static bot credential
-	// (platform.Config.GitHubBotToken) -- never a per-user OAuth token,
+	// (platform.Config.GitHubOutbound's bot token) -- never a per-user OAuth token,
 	// mirroring pushpr.go's own createSentinelFixPRBestEffort precedent
 	// for the identical "no human creator to attribute to" situation.
 	Token string

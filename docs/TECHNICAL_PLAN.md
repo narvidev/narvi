@@ -634,20 +634,53 @@ switch, `NARVI_OUTBOUND_ENABLED`: a comma-separated list over the same `Provider
 still part of their ingress sets). The rules:
 
 - Unset follows GitHub ingress when ingress includes it, so a deployment that never narrowed ingress is
-  unchanged. Unset while `NARVI_INGRESS_ENABLED` excludes `github` is refused at boot: the old bundling
-  hid a real choice there, and inferring it either way would silently change what the deployment sends.
-  `""` declares no outbound provider.
+  unchanged. Unset while a valid `NARVI_INGRESS_ENABLED` excludes `github` is refused at boot: the old
+  bundling hid a real choice there, and inferring it either way would silently change what the
+  deployment sends. (An ingress list with an invalid entry is refused for that entry alone: whether it
+  excludes `github` is not known.) `""` declares no outbound provider.
 - GitHub ingress requires GitHub outbound (the webhook handler reads pull requests and replies as the
   bot); outbound never requires ingress.
 - The bot token is required exactly when GitHub outbound is on, and ignored -- never stored -- when it
   is off. RWX previews require GitHub outbound, since the preview link is a commit status posted as the
-  bot.
+  bot. The bot handle, which names a mention only the webhook listens for, is stored only while GitHub
+  ingress is on, so a verdict posted with ingress off points at the web review's "Re-run review" button
+  alone.
 - The token reaches its consumers only as `*platform.GitHubOutboundConfig` (`platform.Config.
   GitHubOutbound`, nil when the axis is off). A consumer that only makes sense with outbound refuses nil
   in its constructor; a reader that can degrade treats nil as its existing degraded path and makes no
-  call. `controlplane/githuboutbound.go` is the one place the axis is wired, separating publication from
-  bot-only writes (§44.4), and `internal/ops`'s outbound guard keeps the variable, the type and the
-  unwrapped token from appearing anywhere else.
+  call. `controlplane/githuboutbound.go` is the one place the notifiers and workers are wired, separating
+  publication from bot-only writes (§44.4); the composition root hands the optional readers the same
+  config.
+- `internal/ops`'s `TestGitHubOutboundGuard` scans every Go file outside `internal/platform` for three
+  things, and no more: (a) the token's variable named in a string literal, in non-test code; (b)
+  `GitHubOutboundConfig` named other than behind a pointer (tests included), or its constructors
+  referenced from non-test code; (c) `.BotToken` in non-test files directly under `controlplane/`.
+  Consumers elsewhere do unwrap the token inside themselves, by design, and the scan does not follow the
+  string once they have. `TestLoadStoresTheBotTokenOnlyInGitHubOutbound` covers what the scan cannot
+  see: no field of `platform.Config` other than `GitHubOutbound` holds the token.
+
+**Migrating a deployment that narrowed ingress.** Only a deployment whose `NARVI_INGRESS_ENABLED` is set
+and excludes `github` is affected; it must now declare `NARVI_OUTBOUND_ENABLED` to boot. Before the axis
+existed it posted nothing to GitHub -- every GitHub notifier was gated on GitHub ingress, so those rows
+dead-lettered -- yet it still ran the auto-merge and release-manifest workers and, when
+`NARVI_GITHUB_BOT_TOKEN` was set, read pull requests with that token. Neither value reproduces that
+exactly:
+
+- `NARVI_OUTBOUND_ENABLED=` (empty) calls GitHub not at all. Nothing is posted, as before. What changes:
+  the auto-merge worker stops (it used to merge as the bot with a token set, or loop on 401s until its
+  auth guard dead-lettered it without one); the release-manifest worker stops (idle already, since only
+  the webhook fills its queue; rows left from when GitHub ingress was on are no longer processed); and a
+  set token no longer serves live reads, so on review sessions created while GitHub ingress was on the
+  review readout shows its live pull request facts as unavailable and re-anchors no finding, verdict
+  freshness in `GET .../result` and `narvi_get_session_result` reads unconfirmed (with the settled poll
+  delay), the verdict tool leaves findings unanchored, and the re-review button and the actor's automatic
+  re-review run without pre-fetched context -- the button's turn still carries the verdict tool's
+  instructions, and its findings still show in the review readout.
+- `NARVI_OUTBOUND_ENABLED=github` with a real token keeps all of the above working and also posts as the
+  bot -- verdicts and risk labels, the review check run, turn-outcome, handoff and release-manifest
+  comments, the preview commit status with RWX, sentinel fix branches and pull requests, description
+  rewrites -- for any session linked to a pull request (the handoff comment on a pull request a web
+  session opens, for instance), none of which this deployment posted before.
 
 "Outbound", not "egress": egress already names §30's per-repository live/shadow mode, §27.6's sandbox
 egress and §42.4's NetworkPolicy. This switch decides whether the deployment calls GitHub as its bot at
