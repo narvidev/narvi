@@ -45,6 +45,12 @@ import (
 // synchronous GET .../commits/{branch}, so its result is the base
 // branch's LIVE tip at the moment this review turn's context is
 // assembled -- the one value BaseSHA below is pinned to.
+//
+// GetCompareDiff's contract on truncation: a diff cut at a size cap is
+// returned as a prefix of WHOLE lines, ending at a line boundary
+// (*githubapi.Adapter cuts it back to its last "\n"), so every line Fetch
+// parses -- and every changed path it reports -- is one the real diff has.
+// A partial last line would otherwise read as an invented path.
 type Fetcher interface {
 	GetPullRequest(ctx context.Context, owner, repo string, number int32, token string) (githubapi.PullRequest, error)
 	GetCompareDiff(ctx context.Context, owner, repo, base, head, token string) (diff string, truncated bool, err error)

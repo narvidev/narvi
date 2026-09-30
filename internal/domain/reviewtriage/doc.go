@@ -83,9 +83,10 @@
 // review context's producer): anything but a complete or genuinely empty
 // read routes deep under ReasonInputUnreadable. That rule is the LAST deep
 // rule: a path, a line or a root seen in a partial read is still there in
-// the whole one, and the verdict history and the labels do not come from
-// the diff, so each earlier rule fires only on a real signal and records
-// its own reason. The unreadable reason is recorded only when nothing else
+// the whole one (a truncated diff holds whole lines only -- the code host
+// adapter cuts it back to its last line boundary), and the verdict history
+// and the labels do not come from the diff, so each earlier rule fires only
+// on a real signal and records its own reason. The unreadable reason is recorded only when nothing else
 // routes deep, which is why a depth chosen for it is never a later
 // review's floor (NonFloorReasons, depth.go) while the others still are.
 // An always_light override still wins, being an admin's decision, and the

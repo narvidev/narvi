@@ -157,7 +157,11 @@ func resolveMode(m Mode) Mode {
 // it fires only on something that was actually read -- a path, a line or
 // a root seen in a partial diff is still there in the whole one (a partial
 // read can only undercount), and the verdict history and the labels do not
-// come from the diff at all. So when one of them fires on an unreadable
+// come from the diff at all. "Only undercounts" holds because a truncated
+// diff is a prefix of WHOLE lines: the code host adapter cuts it back to
+// its last line boundary (githubapi's truncatedDiffPrefix, behind the
+// reviewcontext.Fetcher contract), so no header line cut short ever reads
+// as a path the change never touched. So when one of them fires on an unreadable
 // input, the review is deep for that real reason, which is recorded and
 // floors the next review (§26.3's "once deep, stays deep"). The unreadable
 // reason is recorded only when nothing else routes deep -- the one case

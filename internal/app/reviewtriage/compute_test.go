@@ -3,12 +3,20 @@ package reviewtriage_test
 import (
 	"context"
 	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
+	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	"github.com/narvidev/narvi/internal/app/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/review"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // addedFileDiff renders one diff section adding n lines to path.
@@ -117,5 +125,100 @@ func TestComputeDecision_SizeIgnoresPullRequestMarkers(t *testing.T) {
 	decision, _, _ := reviewtriage.ComputeDecision(context.Background(), reviewtriage.Deps{SizeExclusions: domainreviewtriage.DefaultSizeExclusions()}, "acme/widgets", 1, prCtx)
 	if decision.Depth != domainreviewtriage.DepthDeep || decision.Reason != domainreviewtriage.ReasonChangedLinesOver || decision.SourceLines != 702 {
 		t.Fatalf("ComputeDecision() = (%q, %q, source %d), want (deep, %q, 702): a pull request's own markers must never shrink its size", decision.Depth, decision.Reason, decision.SourceLines, domainreviewtriage.ReasonChangedLinesOver)
+	}
+}
+
+// cappedDiffBody returns a diff body longer than the code host adapter's
+// 4 MiB cap, holding two real roots (cmd and internal), whose byte cap
+// falls right after partial -- the start of a header line, lead being the
+// whole lines of that section before it. Before the adapter cut a
+// truncated diff back to a line boundary, each such cut read as a path
+// the change never touched, in a third root.
+func cappedDiffBody(lead, partial, rest string) string {
+	const capBytes = 4 << 20
+	const lines = 400
+	head := "diff --git a/cmd/b/main.go b/cmd/b/main.go\n--- a/cmd/b/main.go\n+++ b/cmd/b/main.go\n@@ -0,0 +1,2 @@\n+a\n+b\n" +
+		"diff --git a/internal/app/big.go b/internal/app/big.go\n--- /dev/null\n+++ b/internal/app/big.go\n" + fmt.Sprintf("@@ -0,0 +1,%d @@\n", lines)
+	fill := capBytes - len(head) - len(lead) - len(partial)
+	var b strings.Builder
+	b.WriteString(head)
+	per := fill / lines
+	for i := 0; i < lines; i++ {
+		n := per
+		if i == lines-1 {
+			n = fill - per*(lines-1)
+		}
+		b.WriteString("+" + strings.Repeat("y", n-2) + "\n")
+	}
+	b.WriteString(lead + partial + rest + "\n@@ -0,0 +1,1 @@\n+z\n")
+	b.WriteString(strings.Repeat("+tail\n", 1000))
+	return b.String()
+}
+
+// cappedDiffShapes are the header lines a byte cap can land inside.
+var cappedDiffShapes = []struct {
+	name                string
+	lead, partial, rest string
+}{
+	{"inside a +++ path", "diff --git a/internal/z.go b/internal/z.go\n--- a/internal/z.go\n", "+++ b/int", "ernal/z.go"},
+	{"inside a diff --git header", "", "diff --git a/internal/x.go b/in", "ternal/x.go"},
+	{"inside +++ /dev/null", "diff --git a/internal/gone.go b/internal/gone.go\ndeleted file mode 100644\n--- a/internal/gone.go\n", "+++ /dev/nu", "ll"},
+	{"right after +++ b", "diff --git a/internal/w.go b/internal/w.go\n--- a/internal/w.go\n", "+++ b", "/internal/w.go"},
+}
+
+// hostDiffFetcher is a reviewcontext.Fetcher whose diff read is the real
+// code host adapter, against a test server serving body.
+type hostDiffFetcher struct {
+	adapter *githubapi.Adapter
+}
+
+func (hostDiffFetcher) GetPullRequest(context.Context, string, string, int32, string) (githubapi.PullRequest, error) {
+	return githubapi.PullRequest{HeadSHA: "sha-capped", BaseRef: "main", ChangedFiles: 5, Additions: 403}, nil
+}
+
+func (hostDiffFetcher) ResolveBranchSHA(_ context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	return "", spec.Branch, nil
+}
+
+func (f hostDiffFetcher) GetCompareDiff(ctx context.Context, owner, repo, base, head, token string) (string, bool, error) {
+	return f.adapter.GetCompareDiff(ctx, owner, repo, base, head, token)
+}
+
+// fetchCappedContext reads a capped diff of shape through the real adapter
+// and reviewcontext.Fetch, as a review lane does.
+func fetchCappedContext(t *testing.T, lead, partial, rest string) review.PreFetchedContext {
+	t.Helper()
+	body := cappedDiffBody(lead, partial, rest)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(server.Close)
+	fetcher := hostDiffFetcher{adapter: githubapi.New(server.Client(), server.URL)}
+	return reviewcontext.Fetch(context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)), fetcher, platform.DefaultTimeouts(), "acme", "widgets", 1, "gho_bottoken", nil)
+}
+
+// TestComputeDecision_ACapCutInsideAHeaderInventsNoRoot pins, from the
+// code host adapter through the review context to the decision, that a
+// diff cut at the size cap inside a header line invents no path: the
+// review sees the two real roots only, and records the unreadable-input
+// reason -- which never floors a later review -- not root dispersion.
+func TestComputeDecision_ACapCutInsideAHeaderInventsNoRoot(t *testing.T) {
+	for _, shape := range cappedDiffShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			prCtx := fetchCappedContext(t, shape.lead, shape.partial, shape.rest)
+			if prCtx.InputRead != review.InputReadDiffTruncated {
+				t.Fatalf("InputRead = %q, want %q", prCtx.InputRead, review.InputReadDiffTruncated)
+			}
+			for _, p := range prCtx.ChangedPaths {
+				if !strings.HasPrefix(p, "cmd/") && !strings.HasPrefix(p, "internal/") {
+					t.Errorf("ChangedPaths holds %q, a path the change never touched", p)
+				}
+			}
+			decision, _, _ := reviewtriage.ComputeDecision(context.Background(), reviewtriage.Deps{SizeExclusions: domainreviewtriage.DefaultSizeExclusions()}, "acme/widgets", 1, prCtx)
+			if decision.Reason != domainreviewtriage.ReasonInputUnreadable || decision.DistinctRoots != 2 {
+				t.Errorf("decision = (%q, %q, roots %d), want (deep, %q, roots 2)", decision.Depth, decision.Reason, decision.DistinctRoots, domainreviewtriage.ReasonInputUnreadable)
+			}
+		})
 	}
 }

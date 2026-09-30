@@ -2272,7 +2272,9 @@ missing scope costs a finding. As built:
   in full` — the LAST deep rule, checked only when nothing else routes deep. Every rule before it
   fires only on something that was actually read: a sensitive or configured deep path, a source line
   or a top-level root seen in a partial diff is still there in the whole one (a partial read only
-  undercounts), and the verdict history and the `review:needs-human` label do not come from the diff
+  undercounts — guaranteed because the code host adapter cuts a truncated diff back to its last
+  line boundary, so no header line cut short at the size cap reads as a path the change never
+  touched), and the verdict history and the `review:needs-human` label do not come from the diff
   at all. So a review with an unreadable input that is also deep for one of those real reasons
   records that reason, and floors the next review. An explicit `always_light` override still wins,
   being an admin's decision. The routing record (`turns.review_depth_decision`) carries `inputRead`

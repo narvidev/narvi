@@ -978,6 +978,24 @@ const diffAcceptHeader = "application/vnd.github.diff"
 // consumer).
 const maxPRDiffResponseBytes = 4 << 20 // 4 MiB
 
+// truncatedDiffPrefix is what GetPullRequestDiff and GetCompareDiff return
+// for a diff longer than maxPRDiffResponseBytes: the capped bytes, cut back
+// to the last line boundary -- everything up to and including the last
+// "\n" -- so the prefix holds only WHOLE lines of the real diff. A raw byte
+// cut can land inside a line; a header line cut short ("+++ b/int",
+// "diff --git a/x b/in", "+++ /dev/nu") reads as a path the change never
+// touched, and every consumer that parses the diff would see it. Dropping
+// the partial line keeps a truncated diff a strict undercount of the real
+// one: every line a consumer reads is a line the whole diff also has
+// (§26.3's "a partial read only undercounts" rests on this). A capped
+// prefix with no line break at all yields "", still reported truncated.
+// No consumer depends on the prefix's exact length.
+func truncatedDiffPrefix(body []byte) string {
+	capped := body[:maxPRDiffResponseBytes]
+	end := bytes.LastIndexByte(capped, '\n')
+	return string(capped[:end+1])
+}
+
 // GetPullRequestDiff fetches pull request number's own current unified diff
 // ("review sessions", §8.2: "inline diff pre-fetched into
 // context") via the SAME GET https://api.github.com/repos/{owner}/{repo}/
@@ -988,7 +1006,8 @@ const maxPRDiffResponseBytes = 4 << 20 // 4 MiB
 //
 // truncated reports whether the real diff was cut short at
 // maxPRDiffResponseBytes -- true means diff is a PREFIX of the PR's real,
-// full diff, not the whole thing; callers must surface this honestly
+// full diff, not the whole thing, ending at a line boundary
+// (truncatedDiffPrefix); callers must surface this honestly
 // (RenderTurnPrompt's own explicit notice) rather than silently treating a
 // partial diff as complete.
 //
@@ -1049,7 +1068,7 @@ func (a *Adapter) GetPullRequestDiff(ctx context.Context, owner, repo string, nu
 	}
 
 	if len(body) > maxPRDiffResponseBytes {
-		return string(body[:maxPRDiffResponseBytes]), true, nil
+		return truncatedDiffPrefix(body), true, nil
 	}
 	return string(body), false, nil
 }
@@ -1135,7 +1154,7 @@ func (a *Adapter) GetCompareDiff(ctx context.Context, owner, repo, base, head, t
 	}
 
 	if len(body) > maxPRDiffResponseBytes {
-		return string(body[:maxPRDiffResponseBytes]), true, nil
+		return truncatedDiffPrefix(body), true, nil
 	}
 	return string(body), false, nil
 }

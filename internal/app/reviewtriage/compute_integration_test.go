@@ -774,3 +774,34 @@ func TestComputeDecision_RealReasonOnAnUnreadableReviewStillFloors(t *testing.T)
 		})
 	}
 }
+
+// TestComputeDecision_ACapCutInsideAHeaderDoesNotFloor pins on real
+// Postgres what a header line cut at the diff size cap would otherwise
+// cause: an invented third root routing the review deep under root
+// dispersion, a reason that floors every later review. Read through the
+// real code host adapter and reviewcontext.Fetch, each cut records the
+// unreadable-input reason instead, and the next small readable push is
+// not floored.
+func TestComputeDecision_ACapCutInsideAHeaderDoesNotFloor(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	deps := reviewtriage.Deps{RepoSettings: narvipg.NewRepoSettingsStore(pool), ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), SizeExclusions: domainreviewtriage.DefaultSizeExclusions()}
+	smallReadable := review.PreFetchedContext{InputRead: review.InputReadComplete, Additions: 4, Deletions: 2, ChangedFilesCount: 1, ChangedPaths: []string{"internal/app/foo/a.go"}}
+
+	for i, shape := range cappedDiffShapes {
+		t.Run(shape.name, func(t *testing.T) {
+			repoFullName := repoFullNameForTest(t)
+			prNumber := int32(500 + i)
+
+			v1, _, v1Final := reviewOnce(ctx, t, pool, deps, repoFullName, prNumber, fetchCappedContext(t, shape.lead, shape.partial, shape.rest))
+			if v1.Reason != domainreviewtriage.ReasonInputUnreadable || v1Final != domainreviewtriage.DepthDeep {
+				t.Fatalf("capped review = (%q, %q), want (deep, %q)", v1Final, v1.Reason, domainreviewtriage.ReasonInputUnreadable)
+			}
+
+			_, prior, v2Final := reviewOnce(ctx, t, pool, deps, repoFullName, prNumber, smallReadable)
+			if v2Final != domainreviewtriage.DepthLight {
+				t.Errorf("next review = %q (prior %q), want light: a capped read must never floor it", v2Final, prior)
+			}
+		})
+	}
+}
