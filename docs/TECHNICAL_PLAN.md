@@ -677,8 +677,9 @@ exactly:
   re-review run without pre-fetched context -- the button's turn still carries the verdict tool's
   instructions, and its findings still show in the review readout. The decision inbox reads no base
   branch's required checks without the bot (§21.2), so it shows no pull request as ready to merge and
-  says so (`requiredChecksNotRead`) without reporting a failure; a person's Merge click is unaffected,
-  since it reads the requirements, and merges, with that person's own GitHub token.
+  says so (`requiredChecksNotRead`) without reporting a failure; it still offers Merge on a row that
+  meets every other criterion (`mergeableIfRequiredChecksPass`), and the click reads the requirements,
+  and merges, with that person's own GitHub token.
 - `NARVI_OUTBOUND_ENABLED=github` with a real token keeps all of the above working and also posts as the
   bot -- verdicts and risk labels, the review check run, turn-outcome, handoff and release-manifest
   comments, the preview commit status with RWX, sentinel fix branches and pull requests, description
@@ -1301,15 +1302,20 @@ rulesets that apply to the branch (rules of type `required_status_checks`, each 
 `integration_id`), never from the admin-only protection endpoint. Each required check must be
 satisfied at the head: a report counts when it carries the check's name and, when an App is named,
 comes from that App -- a check run the App reported, or a commit status the App posted through its bot
-account (`<slug>[bot]`, read from the per-ref statuses listing, which names each status's creator). A
-check run from another App never counts, nor does a status a person posted, nor one whose poster
-cannot be read. A status's App is verified when a check run of the same App (same slug) at the head
-carries its id; with no such run, the status counts as from an App whose id could not be verified --
-GitHub still enforces the exact source when the merge is made. The check is satisfied when at least one
-report counts and every report that counts passed (success, neutral or skipped), so a check run and a
-commit status carrying the same required name must both pass. A missing, pending or failed required
-check makes the pull request ineligible and is named in the refusal, the App's id with it, for every
-kind of refusal, when one is named; a refusal that counted an unverified App's status says so.
+account (`<slug>[bot]`), that App identified by id. A status's poster is read from the per-ref
+statuses listing, which names each status's creator: the listing entry with the same status id as the
+one the combined status rolled the name up to, paged to a bound, past which the poster is unknown. The
+App behind a bot account is identified by a check run of the same App (same slug) at the head, which
+carries its id, or else by its slug (`GET /apps/{app_slug}`, a public read whose answer never changes
+and is kept once read, a failure never). A check run from another App never counts, nor does a status
+another App or a person posted, nor one whose poster cannot be read, nor one whose App cannot be
+identified; a check naming an App that no report counts for, beside a status whose poster or App
+cannot be established, or beside another source's status posted over an earlier status of the same
+name from another account (which the combined status hides, and which may be the App's), could not be
+confirmed. The check is satisfied when at least one report counts and every report that counts passed
+(success, neutral or skipped), so a check run and a commit status carrying the same required name must
+both pass. A missing, unconfirmed, pending or failed required check makes the pull request ineligible
+and is named in the refusal, the App's id with it, for every kind of refusal, when one is named.
 `narvi/review` is taken out of the required set: it is the review this eligibility already reads. An
 answer that the feature is unavailable on the repository's plan means that source declares nothing;
 any other failed read of the requirements makes the pull request ineligible, never falling back to the
@@ -1330,8 +1336,10 @@ for the inbox's SCM cache TTL (a failed read is never cached); a failed read mar
 degraded only when it is what refuses the row, never when freshness (a confirmed base move, say)
 already decided it. With GitHub outbound off the read model reads nothing: its rows are not ready to
 merge, the inbox is not degraded, and its response says so (`requiredChecksNotRead`), a configuration
-rather than a failure to retry. The inbox's "CI green" chip stays the CI read at the head; the row's
-kind is where eligibility shows.
+rather than a failure to retry. A row that meets every other criterion (its acceptance applied, when it
+carries one) still offers Merge (`mergeableIfRequiredChecksPass`), since the click reads the
+requirements itself and refuses, naming the check, when one is unmet. The inbox's "CI green" chip stays
+the CI read at the head; the row's kind is where eligibility shows.
 
 **An unresolved conversation blocks too (amendment, decided 2026-09-28).** Through a per-repository
 setting on by default, eligibility also requires that no review conversation is unresolved, read live

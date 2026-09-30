@@ -281,8 +281,9 @@ or description rewrite, auto-merge and release-manifest check goes out
 through it, and so do the live pull request reads behind the review
 screens and the decision inbox's reads of base branches' required checks;
 with it off, none of them happens, and the inbox shows no pull request as
-ready to merge (a person's Merge click still reads the requirements with
-their own token and merges). Left unset it follows GitHub
+ready to merge (it still offers Merge on a pull request that meets
+everything else, and that click reads the requirements with the person's
+own token, and merges or names the unmet check). Left unset it follows GitHub
 ingress, so a deployment that never narrowed ingress has it on without
 saying so, and one that did narrow ingress had to declare it to boot at
 all -- and neither value is exactly how such a deployment ran before

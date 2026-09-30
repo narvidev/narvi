@@ -464,7 +464,10 @@ check the base does not require still blocks when it fails (technical
 plan §21.2). With the deployment's GitHub outbound off, the inbox reads no
 base branch's requirements: its response carries `requiredChecksNotRead`,
 no row is ready to merge, and the web inbox shows a notice saying so --
-not the "temporarily unable" warning.
+not the "temporarily unable" warning. A row that meets everything else
+carries `mergeableIfRequiredChecksPass` and still shows Merge, with a line
+saying the required checks are read when you merge: the click reads them
+with your own token, and answers `409` naming the check when one is unmet.
 
 ## Uploads
 

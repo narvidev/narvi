@@ -170,12 +170,15 @@ pass, or while the requirements cannot be read; a plan that does not offer
 rulesets or branch protection is read as requiring nothing there. A check
 the base ties to one App is satisfied by that App's check run or by a
 commit status that App's bot account posted -- never by another App's
-check run or a person's status. When no check run of that App is at the
-head to confirm its id, its status still counts, as from an App whose id
-could not be verified, and GitHub enforces the exact source at merge. With
-GitHub outbound off, the decision inbox reads no requirements: it shows no
-pull request as ready to merge and says so, while a person's Merge click
-still reads them itself and merges.
+check run or status, or a person's status. The App behind a status is
+identified by a check run of the same App at the head or, failing that,
+by its slug (`GET /apps/{app_slug}`, read with the same token); a status
+whose App cannot be identified, or another source's status posted over an
+earlier one of the same name from another account, leaves the check "could
+not be confirmed", never satisfied. With GitHub outbound off, the decision inbox reads no
+requirements: it shows no pull request as ready to merge and says so, but
+still offers Merge on a pull request that meets everything else; the
+click reads the requirements itself, and merges or names the unmet check.
 
 It is not the GitHub App below: that App's read-only installation token
 is what review sandboxes clone with, and it never posts anything. It is
