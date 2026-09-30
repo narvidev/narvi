@@ -139,30 +139,36 @@ func (a *Actor) timerHandler(name string) (func(context.Context) error, bool) {
 // replica armed it during a rolling deploy, and its own pump will claim it
 // -- or one nothing will handle again, left behind by a rollback or a
 // retired kind. This binary cannot tell which, so DecideUnknownTimer goes
-// by the row's age, read with the database's now() in the same statement
-// (TimerStore.Age), and this applies it in one transaction:
+// by the time since the row was last armed (armed_at), read with the
+// database's now() in the same statement (TimerStore.Age), and this
+// applies it in one transaction:
 //
-//   - kept (younger than UnknownTimerGrace): nothing is written, so the
-//     row comes back when the pump's claim lapses, within one
-//     TimerClaimDuration -- a newer replica's timer loses no more than
+//   - kept (last armed less than UnknownTimerGrace ago): nothing is
+//     written, so the row comes back when the pump's claim lapses, within
+//     one TimerClaimDuration -- a newer replica's timer loses no more than
 //     that, as it always has;
-//   - backed off: its fires_at moves to the database's now plus
-//     UnknownTimerBackoff, through the claim's own UPDATE, which never
-//     inserts, so a row another writer deleted stays deleted;
-//   - deleted (older than UnknownTimerDeleteAfter).
+//   - backed off: its fires_at, and nothing else, moves to the database's
+//     now plus UnknownTimerBackoff;
+//   - deleted (last armed UnknownTimerDeleteAfter ago or more).
 //
-// Each outcome past the grace logs one WARN naming the kind and counts
-// session_timer_unknown_kind_total, after the commit. A row already gone
-// -- a TimerFired sent with no row behind it -- changes nothing. Until the
-// row is deleted, the session's status counts it as scheduled work
-// (TimerCanCreateWork), the safe direction.
+// Both writes hold only while the row still carries the armed_at the
+// decision read (TimerStore.PostponeIfArmedAt, DeleteIfArmedAt): the read
+// locks nothing, so a newer replica can re-arm the row between the two,
+// and its re-arm wins -- the write then touches no row, and nothing is
+// logged at WARN or counted. Each outcome that did write logs one WARN
+// naming the kind and counts session_timer_unknown_kind_total, after the
+// commit. A row already gone -- a TimerFired sent with no row behind it --
+// changes nothing. Until the row is deleted, the session's status counts
+// it as scheduled work (TimerCanCreateWork), the safe direction.
 func (a *Actor) handleUnknownTimer(ctx context.Context, name string) error {
 	var (
 		action  UnknownTimerAction
 		age     time.Duration
 		firesAt time.Time
+		written bool
 	)
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		action, written = 0, false
 		timers := a.stores.timer.WithTx(tx)
 		row, err := timers.Age(ctx, sqlcgen.GetSessionTimerAgeParams{SessionID: a.sessionID, Name: name})
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -172,40 +178,54 @@ func (a *Actor) handleUnknownTimer(ctx context.Context, name string) error {
 			return fmt.Errorf("sessionactor: read the age of timer %q: %w", name, err)
 		}
 		now := row.DbNow.Time
-		age = now.Sub(row.CreatedAt.Time)
-		action = DecideUnknownTimer(row.CreatedAt.Time, now, a.timeouts.UnknownTimerGrace, a.timeouts.UnknownTimerDeleteAfter)
+		age = now.Sub(row.ArmedAt.Time)
+		action = DecideUnknownTimer(row.ArmedAt.Time, now, a.timeouts.UnknownTimerGrace, a.timeouts.UnknownTimerDeleteAfter)
+		var n int64
 		switch action {
 		case UnknownTimerBackOff:
 			firesAt = now.Add(a.timeouts.UnknownTimerBackoff)
-			if _, err := timers.Claim(ctx, sqlcgen.ClaimDueTimerParams{
+			n, err = timers.PostponeIfArmedAt(ctx, sqlcgen.PostponeSessionTimerIfArmedAtParams{
 				FiresAt:   pgtype.Timestamptz{Time: firesAt, Valid: true},
 				SessionID: a.sessionID,
 				Name:      name,
-			}); err != nil {
+				ArmedAt:   row.ArmedAt,
+			})
+			if err != nil {
 				return fmt.Errorf("sessionactor: back off timer %q: %w", name, err)
 			}
 		case UnknownTimerDelete:
-			return a.deleteTimer(ctx, tx, name)
+			n, err = timers.DeleteIfArmedAt(ctx, sqlcgen.DeleteSessionTimerIfArmedAtParams{
+				SessionID: a.sessionID,
+				Name:      name,
+				ArmedAt:   row.ArmedAt,
+			})
+			if err != nil {
+				return fmt.Errorf("sessionactor: delete timer %q: %w", name, err)
+			}
 		}
+		written = n > 0
 		return nil
 	})
 	if err != nil {
 		return err
 	}
 
-	switch action {
-	case UnknownTimerKeep:
+	switch {
+	case action == 0:
+		a.logger.Info("sessionactor: TimerFired with unknown name has no timer row", "name", name)
+	case action == UnknownTimerKeep:
 		a.logger.Warn("sessionactor: ignoring TimerFired with unknown name", "name", name, "age", age)
-	case UnknownTimerBackOff:
+	case !written:
+		a.logger.Info("sessionactor: timer kind this binary does not know was re-armed meanwhile; left as it is",
+			"name", name, "decided", action.String())
+	case action == UnknownTimerBackOff:
 		a.logger.Warn("sessionactor: timer kind this binary does not know backed off",
 			"name", name, "age", age, "fires_at", firesAt)
 		a.recordUnknownTimer(ctx, action)
-	case UnknownTimerDelete:
+	case action == UnknownTimerDelete:
 		a.logger.Warn("sessionactor: timer kind this binary does not know deleted",
 			"name", name, "age", age)
 		a.recordUnknownTimer(ctx, action)
-	default:
-		a.logger.Info("sessionactor: TimerFired with unknown name has no timer row", "name", name)
 	}
 	return nil
 }

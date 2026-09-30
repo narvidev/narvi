@@ -15,33 +15,21 @@ import (
 // when the manifest sets none: 600 seconds.
 const kubernetesDefaultProgressDeadline = 600 * time.Second
 
-// defaultRolloutMaxWaves is the most waves a RollingUpdate at Kubernetes'
-// default maxSurge (25%, rounded up) and maxUnavailable (25%, rounded down)
-// replaces a Deployment in, at any replica count: see
-// defaultRolloutWaves.
-const defaultRolloutMaxWaves = 3
-
-// defaultRolloutWaves is how many waves a RollingUpdate at Kubernetes'
-// default percentages replaces replicas pods in: each wave replaces at most
-// maxSurge + maxUnavailable of them.
-func defaultRolloutWaves(replicas int) int {
-	surge := (replicas + 3) / 4 // 25%, rounded up
-	unavailable := replicas / 4 // 25%, rounded down
-	perWave := surge + unavailable
-	return (replicas + perWave - 1) / perWave
-}
-
-// TestDeployment_KeepsTheRolloutDefaultsRollingDeployCeilingRestsOn pins
-// what platform.Timeouts.RollingDeployCeiling is derived from -- the bound
-// a timer kind this binary does not know is kept at the claim cadence
-// beyond (UnknownTimerGrace, technical plan §2). The control plane's
-// Deployment (deploy/control-plane/deployment.yaml) sets neither a strategy
-// nor progressDeadlineSeconds, so Kubernetes' defaults apply: a
-// RollingUpdate at 25% surge and 25% unavailable, which replaces a
-// Deployment of any size in at most three waves, each within a 600-second
-// progress deadline. A manifest that sets either of them fails here, so the
-// ceiling is revisited with it rather than silently outgrown.
-func TestDeployment_KeepsTheRolloutDefaultsRollingDeployCeilingRestsOn(t *testing.T) {
+// TestDeployment_ShippedRolloutFitsRollingDeployCeiling checks the one part
+// of platform.Timeouts.RollingDeployCeiling the repository can check. The
+// ceiling itself is an operational assumption (docs/PRODUCTION_CHECKLIST.md,
+// item 12): Kubernetes bounds no rollout's length. progressDeadlineSeconds
+// bounds only the gap between two progress events -- each new pod turning
+// ready is one -- a rollout past it is flagged, not stopped, and a paused
+// one is not timed. What the shipped manifest does bound is a rollout
+// Kubernetes never flags: with no strategy and no progressDeadlineSeconds
+// set, Kubernetes' defaults apply, each new pod turns ready within 600 s of
+// the previous progress event, and the whole fleet is replaced within
+// replicas x 600 s. That must fit under the ceiling. A manifest that sets a
+// strategy or a progress deadline, or raises replicas past what the ceiling
+// covers, fails here, so the ceiling and the checklist item are revisited
+// with it.
+func TestDeployment_ShippedRolloutFitsRollingDeployCeiling(t *testing.T) {
 	t.Parallel()
 
 	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "deploy", "control-plane", "deployment.yaml"))
@@ -60,18 +48,15 @@ func TestDeployment_KeepsTheRolloutDefaultsRollingDeployCeilingRestsOn(t *testin
 	}
 	for _, key := range []string{"strategy", "progressDeadlineSeconds"} {
 		if _, set := manifest.Spec[key]; set {
-			t.Errorf("deployment.yaml sets spec.%s: platform.Timeouts.RollingDeployCeiling is derived from Kubernetes' default for it -- recompute the ceiling from the new value, then update this test", key)
+			t.Errorf("deployment.yaml sets spec.%s: the bound checked here assumes Kubernetes' default for it -- recompute the longest unflagged rollout, then revisit platform.Timeouts.RollingDeployCeiling and this test", key)
 		}
 	}
-
-	maxWaves := 0
-	for replicas := 1; replicas <= 1000; replicas++ {
-		maxWaves = max(maxWaves, defaultRolloutWaves(replicas))
+	replicas, ok := manifest.Spec["replicas"].(int)
+	if !ok || replicas < 1 {
+		t.Fatalf("deployment.yaml spec.replicas = %v, want a positive integer", manifest.Spec["replicas"])
 	}
-	if maxWaves != defaultRolloutMaxWaves {
-		t.Fatalf("the default rollout takes up to %d waves over 1..1000 replicas, want %d", maxWaves, defaultRolloutMaxWaves)
-	}
-	if got, floor := platform.DefaultTimeouts().RollingDeployCeiling, defaultRolloutMaxWaves*kubernetesDefaultProgressDeadline; got < floor {
-		t.Errorf("RollingDeployCeiling = %v, want at least %d waves x %v = %v", got, defaultRolloutMaxWaves, kubernetesDefaultProgressDeadline, floor)
+	ceiling := platform.DefaultTimeouts().RollingDeployCeiling
+	if longest := time.Duration(replicas) * kubernetesDefaultProgressDeadline; longest > ceiling {
+		t.Errorf("deployment.yaml's %d replicas can take %v to replace without Kubernetes flagging the rollout, past RollingDeployCeiling (%v): raise the ceiling (and UnknownTimerGrace above it), or state how this fleet keeps its rollouts under it", replicas, longest, ceiling)
 	}
 }

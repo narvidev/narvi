@@ -140,9 +140,9 @@ func runPreviousBinaryOutbox(ctx context.Context, t *testing.T, db *sql.DB) (del
 	return row.id, other.id
 }
 
-// previousBinaryMigrate is golang-migrate as the previous binary runs it at
-// boot: the same embedded migrations, without 000152.
-func previousBinaryMigrate(t *testing.T, connStr string) (*migrate.Migrate, *sql.DB) {
+// previousBinaryMigrate is golang-migrate as a previous binary runs it at
+// boot: the same embedded migrations, up to and including last.
+func previousBinaryMigrate(t *testing.T, connStr string, last int) (*migrate.Migrate, *sql.DB) {
 	t.Helper()
 	previous := fstest.MapFS{}
 	err := fs.WalkDir(migrations.FS, ".", func(path string, d fs.DirEntry, err error) error {
@@ -153,7 +153,7 @@ func previousBinaryMigrate(t *testing.T, connStr string) (*migrate.Migrate, *sql
 		if err != nil {
 			return err
 		}
-		if version > 151 {
+		if version > last {
 			return nil
 		}
 		data, err := fs.ReadFile(migrations.FS, path)
@@ -251,7 +251,7 @@ func TestMigrationOutboxConsecutiveInterruptions_UpAndDown(t *testing.T) {
 
 	// It cannot boot on 152: golang-migrate refuses a version it has no
 	// file for.
-	previous, pdb := previousBinaryMigrate(t, connStr)
+	previous, pdb := previousBinaryMigrate(t, connStr, 151)
 	if err := previous.Up(); err == nil || !strings.Contains(err.Error(), "152") {
 		t.Fatalf("the previous binary's boot on 152 = %v, want a refusal naming 152", err)
 	}
@@ -263,7 +263,7 @@ func TestMigrationOutboxConsecutiveInterruptions_UpAndDown(t *testing.T) {
 	if err := m.Force(151); err != nil {
 		t.Fatalf("force 151: %v", err)
 	}
-	previous, pdb = previousBinaryMigrate(t, connStr)
+	previous, pdb = previousBinaryMigrate(t, connStr, 151)
 	if err := previous.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		t.Fatalf("the previous binary's boot after force 151 = %v, want no change", err)
 	}

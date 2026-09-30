@@ -42,11 +42,27 @@ func (s *TimerStore) Get(ctx context.Context, arg sqlcgen.GetSessionTimerParams)
 	return s.q.GetSessionTimer(ctx, arg)
 }
 
-// Age fetches a named timer's created_at together with the database's
-// now(): the session actor measures the age of a timer kind it does not
-// know on the database's clock (sessionactor.DecideUnknownTimer).
+// Age fetches a named timer's armed_at -- its last arm -- together with the
+// database's now(): the session actor measures the age of a timer kind it
+// does not know on the database's clock (sessionactor.DecideUnknownTimer).
 func (s *TimerStore) Age(ctx context.Context, arg sqlcgen.GetSessionTimerAgeParams) (sqlcgen.GetSessionTimerAgeRow, error) {
 	return s.q.GetSessionTimerAge(ctx, arg)
+}
+
+// PostponeIfArmedAt moves a named timer's fires_at, and nothing else, only
+// while the row still carries arg.ArmedAt, and reports how many rows it
+// moved: zero when the row is gone or was re-armed since that armed_at was
+// read. The session actor's backoff of a timer kind it does not know.
+func (s *TimerStore) PostponeIfArmedAt(ctx context.Context, arg sqlcgen.PostponeSessionTimerIfArmedAtParams) (int64, error) {
+	return s.q.PostponeSessionTimerIfArmedAt(ctx, arg)
+}
+
+// DeleteIfArmedAt deletes a named timer only while it still carries
+// arg.ArmedAt, and reports how many rows it deleted: zero when the row is
+// gone or was re-armed since. The session actor's deletion of a timer kind
+// it does not know.
+func (s *TimerStore) DeleteIfArmedAt(ctx context.Context, arg sqlcgen.DeleteSessionTimerIfArmedAtParams) (int64, error) {
+	return s.q.DeleteSessionTimerIfArmedAt(ctx, arg)
 }
 
 // ListDue fetches up to limit due timers, locking each row (FOR UPDATE
@@ -58,10 +74,8 @@ func (s *TimerStore) ListDue(ctx context.Context, limit int32) ([]sqlcgen.Sessio
 
 // Claim pushes an already-locked (via ListDue, same transaction) timer's
 // fires_at forward, so it won't be re-selected as due until the claim
-// window elapses (redelivery-safety, §2). The session actor also uses it to
-// re-arm a timer kind it does not know at its backoff: an UPDATE of a row
-// that exists, never an insert, so it cannot bring back a row another
-// writer has deleted (pgx.ErrNoRows then).
+// window elapses (redelivery-safety, §2). It never moves armed_at: a claim
+// is not an arm.
 func (s *TimerStore) Claim(ctx context.Context, arg sqlcgen.ClaimDueTimerParams) (sqlcgen.SessionTimer, error) {
 	return s.q.ClaimDueTimer(ctx, arg)
 }

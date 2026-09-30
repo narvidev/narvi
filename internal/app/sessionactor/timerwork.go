@@ -162,23 +162,28 @@ func (a UnknownTimerAction) String() string {
 }
 
 // DecideUnknownTimer decides what happens to a timer of a kind this binary
-// does not know, from its age: now minus createdAt, the row's
-// session_timers.created_at, which a re-arm (UpsertSessionTimer) and a
-// claim (ClaimDueTimer) never move -- never its fires_at, which the pump
-// moves at every claim. The caller passes both instants from the database's
-// clock (TimerStore.Age), so no replica's clock is involved.
+// does not know, from its age: now minus armedAt, the row's
+// session_timers.armed_at -- the instant of its last arm. Every arm and
+// re-arm (UpsertSessionTimer) sets it; the pump's claim (ClaimDueTimer) and
+// this path's own backoff never move it. So the age is how long nothing
+// that knows the kind has maintained the row: a kind a newer binary keeps
+// re-arming stays young however long ago it was first armed. Never
+// created_at, which only the first insert sets, and never fires_at, which
+// the pump moves at every claim. The caller passes both instants from the
+// database's clock (TimerStore.Age), so no replica's clock is involved.
 //
-//   - Younger than grace (platform.Timeouts.UnknownTimerGrace, longer than
-//     any rolling deploy): UnknownTimerKeep. A newer replica may have
-//     armed it moments ago, and it must lose no more than one claim window.
+//   - Younger than grace (platform.Timeouts.UnknownTimerGrace, longer than a
+//     rolling deploy is assumed to run): UnknownTimerKeep. A newer replica
+//     may have armed it moments ago, and it must lose no more than one
+//     claim window.
 //   - At grace or older, but younger than deleteAfter
 //     (UnknownTimerDeleteAfter): UnknownTimerBackOff.
 //   - At deleteAfter or older: UnknownTimerDelete.
 //
-// A createdAt after now -- impossible on one clock -- reads as age zero:
+// An armedAt after now -- impossible on one clock -- reads as age zero:
 // kept, the safe direction.
-func DecideUnknownTimer(createdAt, now time.Time, grace, deleteAfter time.Duration) UnknownTimerAction {
-	age := now.Sub(createdAt)
+func DecideUnknownTimer(armedAt, now time.Time, grace, deleteAfter time.Duration) UnknownTimerAction {
+	age := now.Sub(armedAt)
 	switch {
 	case age >= deleteAfter:
 		return UnknownTimerDelete

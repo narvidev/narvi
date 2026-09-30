@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"sort"
 	"testing"
 	"time"
@@ -25,9 +26,9 @@ import (
 // Postgres, through the real timer pump and the real session actor. No
 // test waits for real time to pass: a row's age is set directly
 // (armTimerAged), and advanceTimer moves one timer's clock forward by
-// dating both its fires_at and its created_at back -- exactly what the
+// dating its fires_at, armed_at and created_at back -- exactly what the
 // passing of that much time does to the row, relative to the database's
-// now().
+// now(). A re-arm is the real UpsertSessionTimer (rearmTimer).
 
 // newerBinaryKind is a timer kind this binary does not know: one a newer
 // binary would arm.
@@ -38,6 +39,8 @@ const (
 	unknownTimerKeptMsg      = "sessionactor: ignoring TimerFired with unknown name"
 	unknownTimerBackedOffMsg = "sessionactor: timer kind this binary does not know backed off"
 	unknownTimerDeletedMsg   = "sessionactor: timer kind this binary does not know deleted"
+	// A backoff or a deletion that found the row re-armed since its read.
+	unknownTimerRearmedMsg = "sessionactor: timer kind this binary does not know was re-armed meanwhile; left as it is"
 )
 
 // unknownTimerMetric is the counter handleUnknownTimer records.
@@ -52,7 +55,7 @@ const unknownTimerMetric = "session_timer_unknown_kind_total"
 const clockSlack = 2 * time.Second
 
 // armTimerAged arms name on sessionID due a second ago, its row created
-// age ago on the database's clock.
+// and last armed age ago on the database's clock.
 func armTimerAged(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, name string, age time.Duration) {
 	t.Helper()
 	if _, err := narvipg.NewTimerStore(pool).Upsert(ctx, sqlcgen.UpsertSessionTimerParams{
@@ -63,7 +66,9 @@ func armTimerAged(ctx context.Context, t *testing.T, pool *pgxpool.Pool, session
 		t.Fatalf("arm timer %q: %v", name, err)
 	}
 	if _, err := pool.Exec(ctx,
-		`UPDATE session_timers SET created_at = now() - make_interval(secs => $3::double precision)
+		`UPDATE session_timers
+		 SET created_at = now() - make_interval(secs => $3::double precision),
+		     armed_at = now() - make_interval(secs => $3::double precision)
 		 WHERE session_id = $1 AND name = $2`,
 		sessionID, name, age.Seconds(),
 	); err != nil {
@@ -71,14 +76,15 @@ func armTimerAged(ctx context.Context, t *testing.T, pool *pgxpool.Pool, session
 	}
 }
 
-// advanceTimer moves the clock of one timer forward by d: its fires_at and
-// its created_at both d earlier, as d passing would leave them relative to
-// the database's now().
+// advanceTimer moves the clock of one timer forward by d: its fires_at,
+// armed_at and created_at all d earlier, as d passing would leave them
+// relative to the database's now().
 func advanceTimer(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, name string, d time.Duration) {
 	t.Helper()
 	tag, err := pool.Exec(ctx,
 		`UPDATE session_timers
 		 SET fires_at = fires_at - make_interval(secs => $3::double precision),
+		     armed_at = armed_at - make_interval(secs => $3::double precision),
 		     created_at = created_at - make_interval(secs => $3::double precision)
 		 WHERE session_id = $1 AND name = $2`,
 		sessionID, name, d.Seconds(),
@@ -134,12 +140,32 @@ func logLines(t *testing.T, buf *syncLogBuffer, msg, name string) int {
 	return n
 }
 
+// logField returns field of the first log line in buf whose msg is msg
+// and whose name is name, or nil when there is none.
+func logField(t *testing.T, buf *syncLogBuffer, msg, name, field string) any {
+	t.Helper()
+	for _, line := range bytes.Split([]byte(buf.String()), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var entry map[string]any
+		if err := json.Unmarshal(line, &entry); err != nil {
+			t.Fatalf("unmarshal log line %q: %v", line, err)
+		}
+		if entry["msg"] == msg && entry["name"] == name {
+			return entry[field]
+		}
+	}
+	return nil
+}
+
 // unknownTimerLines counts every line handleUnknownTimer wrote for name.
 func unknownTimerLines(t *testing.T, buf *syncLogBuffer, name string) int {
 	t.Helper()
 	return logLines(t, buf, unknownTimerKeptMsg, name) +
 		logLines(t, buf, unknownTimerBackedOffMsg, name) +
-		logLines(t, buf, unknownTimerDeletedMsg, name)
+		logLines(t, buf, unknownTimerDeletedMsg, name) +
+		logLines(t, buf, unknownTimerRearmedMsg, name)
 }
 
 // waitForLogLines waits until buf holds want lines of msg naming name.
@@ -518,5 +544,189 @@ func TestUnknownTimer_KnownKindsUnaffectedByAge(t *testing.T) {
 	}
 	if backedOff, deleted := unknownTimerCounts(ctx, t); backedOff != backedOffBefore || deleted != deletedBefore {
 		t.Errorf("%s moved (backed_off %+d, deleted %+d) for declared kinds, want no count", unknownTimerMetric, backedOff-backedOffBefore, deleted-deletedBefore)
+	}
+}
+
+// rearmTimer re-arms name on sessionID in place, due at firesAt, through
+// the real UpsertSessionTimer -- as the handler of a binary that knows the
+// kind does -- and returns the row it leaves.
+func rearmTimer(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, name string, firesAt time.Time) sqlcgen.SessionTimer {
+	t.Helper()
+	row, err := narvipg.NewTimerStore(pool).Upsert(ctx, sqlcgen.UpsertSessionTimerParams{
+		SessionID: sessionID,
+		Name:      name,
+		FiresAt:   pgtype.Timestamptz{Time: firesAt, Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("re-arm timer %q: %v", name, err)
+	}
+	return row
+}
+
+// TestUnknownTimer_AgedFromItsLastArmNotItsFirst proves a kind this binary
+// does not know is aged from its row's last arm (armed_at), never from its
+// first insert (created_at): a kind a newer binary keeps re-arming in place
+// -- as inactivity, liveness_check and stop re-arm themselves -- is kept at
+// the claim cadence however long ago it was first armed, while one nothing
+// has re-armed is backed off an hour after its last arm and deleted a day
+// after it. One real pump tick delivers every case.
+func TestUnknownTimer_AgedFromItsLastArmNotItsFirst(t *testing.T) {
+	logs := captureDefaultLoggerJSONSync(t)
+	ctx := context.Background()
+	pool := newTestPool(t)
+	timeouts := platform.DefaultTimeouts()
+	r := newUnknownTimerRegistry(ctx, t, pool, timeouts)
+
+	type stage struct {
+		name      string
+		firstArm  time.Duration // how long ago the row was inserted
+		rearmed   bool          // re-armed in place just now, by a binary that knows the kind
+		sinceLast time.Duration // then left alone this long
+		wantMsg   string
+		wantRow   bool
+	}
+	cases := []stage{
+		{name: "first armed a day ago, re-armed a second ago", firstArm: timeouts.UnknownTimerDeleteAfter + time.Hour, rearmed: true, wantMsg: unknownTimerKeptMsg, wantRow: true},
+		{name: "first armed two hours ago, re-armed a second ago", firstArm: 2 * time.Hour, rearmed: true, wantMsg: unknownTimerKeptMsg, wantRow: true},
+		{name: "first armed a day ago, last re-armed just past the grace", firstArm: timeouts.UnknownTimerDeleteAfter + time.Hour, rearmed: true, sinceLast: timeouts.UnknownTimerGrace + time.Minute, wantMsg: unknownTimerBackedOffMsg, wantRow: true},
+		{name: "stranded an hour", firstArm: timeouts.UnknownTimerGrace + time.Minute, wantMsg: unknownTimerBackedOffMsg, wantRow: true},
+		{name: "stranded a day", firstArm: timeouts.UnknownTimerDeleteAfter + time.Minute, wantMsg: unknownTimerDeletedMsg, wantRow: false},
+	}
+	type armed struct {
+		stage
+		kind      string
+		sessionID pgtype.UUID
+		createdAt time.Time
+	}
+	var all []armed
+	for i, c := range cases {
+		a := armed{stage: c, kind: fmt.Sprintf("%s_%d", newerBinaryKind, i), sessionID: createTestSession(ctx, t, pool)}
+		armTimerAged(ctx, t, pool, a.sessionID, a.kind, c.firstArm)
+		row, _ := timerRow(ctx, t, pool, a.sessionID, a.kind)
+		a.createdAt = row.CreatedAt.Time
+		if c.rearmed {
+			rearmed := rearmTimer(ctx, t, pool, a.sessionID, a.kind, time.Now().Add(-time.Second))
+			if !rearmed.CreatedAt.Time.Equal(a.createdAt) {
+				t.Fatalf("%s: created_at moved on a re-arm (%v -> %v)", c.name, a.createdAt, rearmed.CreatedAt.Time)
+			}
+			if age := dbNow(ctx, t, pool).Sub(rearmed.ArmedAt.Time); age > time.Minute {
+				t.Fatalf("%s: armed_at after the re-arm is %v old, want just now", c.name, age)
+			}
+		}
+		if c.sinceLast > 0 {
+			advanceTimer(ctx, t, pool, a.sessionID, a.kind, c.sinceLast)
+		}
+		all = append(all, a)
+	}
+	backedOffBefore, deletedBefore := unknownTimerCounts(ctx, t)
+
+	if err := r.PumpOnce(ctx); err != nil {
+		t.Fatalf("PumpOnce: %v", err)
+	}
+	var wantBackedOff, wantDeleted int64
+	for _, a := range all {
+		waitForLogLines(t, logs, a.wantMsg, a.kind, 1)
+		if got := unknownTimerLines(t, logs, a.kind); got != 1 {
+			t.Errorf("%s: %d lines about %q, want only the one %q", a.name, got, a.kind, a.wantMsg)
+		}
+		if _, exists := timerRow(ctx, t, pool, a.sessionID, a.kind); exists != a.wantRow {
+			t.Errorf("%s: timer exists = %v after its delivery, want %v", a.name, exists, a.wantRow)
+		}
+		switch a.wantMsg {
+		case unknownTimerBackedOffMsg:
+			wantBackedOff++
+		case unknownTimerDeletedMsg:
+			wantDeleted++
+		}
+	}
+	if backedOff, deleted := unknownTimerCounts(ctx, t); backedOff-backedOffBefore != wantBackedOff || deleted-deletedBefore != wantDeleted {
+		t.Errorf("%s moved by backed_off %+d, deleted %+d; want %d and %d", unknownTimerMetric, backedOff-backedOffBefore, deleted-deletedBefore, wantBackedOff, wantDeleted)
+	}
+}
+
+// TestUnknownTimer_ReArmBetweenReadAndWriteWins proves a newer replica's
+// re-arm that lands between the actor reading a row's age and writing its
+// decision wins: the backoff or the deletion the actor decided touches
+// nothing, the row keeps the re-arm's fires_at and armed_at, and nothing is
+// logged at WARN or counted. The re-arm is interleaved deterministically:
+// the test holds the timer row's lock, the actor reads the row (a read
+// takes no lock) and blocks on its write, the test re-arms and commits,
+// and the write then finds a different armed_at.
+func TestUnknownTimer_ReArmBetweenReadAndWriteWins(t *testing.T) {
+	logs := captureDefaultLoggerJSONSync(t)
+	ctx := context.Background()
+	pool := newTestPool(t)
+	timeouts := platform.DefaultTimeouts()
+	r := newUnknownTimerRegistry(ctx, t, pool, timeouts)
+
+	for i, c := range []struct {
+		name     string
+		lastArm  time.Duration
+		decision string
+	}{
+		{"a backoff", timeouts.UnknownTimerGrace + time.Minute, UnknownTimerBackOff.String()},
+		{"a deletion", timeouts.UnknownTimerDeleteAfter + time.Minute, UnknownTimerDelete.String()},
+	} {
+		kind := fmt.Sprintf("%s_%d", newerBinaryKind, i)
+		sessionID := createTestSession(ctx, t, pool)
+		armTimerAged(ctx, t, pool, sessionID, kind, c.lastArm)
+		backedOffBefore, deletedBefore := unknownTimerCounts(ctx, t)
+
+		actor, err := r.GetOrSpawn(ctx, sessionID)
+		if err != nil {
+			t.Fatalf("%s: GetOrSpawn: %v", c.name, err)
+		}
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM session_timers WHERE session_id = $1 AND name = $2 FOR UPDATE`, sessionID, kind); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("%s: lock the timer row: %v", c.name, err)
+		}
+		if err := actor.Send(ctx, TimerFired{Name: kind}); err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("%s: Send: %v", c.name, err)
+		}
+		// The actor has read the row and waits on its write.
+		waitUntil(t, 10*time.Second, func() bool {
+			var waiting int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+				WHERE datname = current_database() AND wait_event_type = 'Lock'
+				  AND query LIKE '%session_timers%' AND pid <> pg_backend_pid()`).Scan(&waiting); err != nil {
+				t.Fatalf("%s: read pg_stat_activity: %v", c.name, err)
+			}
+			return waiting > 0
+		})
+		rearmed, err := narvipg.NewTimerStore(pool).WithTx(tx).Upsert(ctx, sqlcgen.UpsertSessionTimerParams{
+			SessionID: sessionID,
+			Name:      kind,
+			FiresAt:   pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
+		})
+		if err != nil {
+			_ = tx.Rollback(ctx)
+			t.Fatalf("%s: re-arm: %v", c.name, err)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("%s: commit the re-arm: %v", c.name, err)
+		}
+
+		waitForLogLines(t, logs, unknownTimerRearmedMsg, kind, 1)
+		if got := logField(t, logs, unknownTimerRearmedMsg, kind, "decided"); got != c.decision {
+			t.Errorf("%s: the re-armed line says the actor decided %v, want %q", c.name, got, c.decision)
+		}
+		row, exists := timerRow(ctx, t, pool, sessionID, kind)
+		if !exists {
+			t.Fatalf("%s: the re-armed timer was deleted", c.name)
+		}
+		if !row.FiresAt.Time.Equal(rearmed.FiresAt.Time) || !row.ArmedAt.Time.Equal(rearmed.ArmedAt.Time) {
+			t.Errorf("%s: fires_at = %v, armed_at = %v; want the re-arm's %v and %v", c.name, row.FiresAt.Time, row.ArmedAt.Time, rearmed.FiresAt.Time, rearmed.ArmedAt.Time)
+		}
+		if got := logLines(t, logs, unknownTimerBackedOffMsg, kind) + logLines(t, logs, unknownTimerDeletedMsg, kind); got != 0 {
+			t.Errorf("%s: %d WARN lines for a write that touched nothing, want 0", c.name, got)
+		}
+		if backedOff, deleted := unknownTimerCounts(ctx, t); backedOff != backedOffBefore || deleted != deletedBefore {
+			t.Errorf("%s: %s moved (backed_off %+d, deleted %+d), want no count", c.name, unknownTimerMetric, backedOff-backedOffBefore, deleted-deletedBefore)
+		}
 	}
 }

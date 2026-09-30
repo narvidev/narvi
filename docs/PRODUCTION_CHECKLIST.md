@@ -329,3 +329,28 @@ every live repository will retry and dead-letter the same way
 and each repository's own live/shadow setting still decides, per write,
 whether it is sent or recorded -- which is exactly why the check needs a
 live repository.
+
+## 12. A control-plane rolling deploy finishes within 30 minutes
+
+**Why this is here.** During a rolling deploy an older pod can claim a
+session timer a newer pod armed, of a kind the older binary does not know.
+It keeps such a timer at the claim cadence for `UnknownTimerGrace` (1 hour)
+after its last arm, then backs it off to every `UnknownTimerBackoff`
+(10 minutes), and deletes it `UnknownTimerDeleteAfter` (24 hours) after its
+last arm (`docs/TECHNICAL_PLAN.md` §2). The grace is sized against
+`RollingDeployCeiling` (30 minutes, `internal/platform/timeouts.go`), and
+nothing enforces that ceiling: a Deployment's `progressDeadlineSeconds`
+only bounds the gap between two progress events, flags a rollout that
+exceeds it without stopping it, and does not time a paused rollout. The
+shipped `deploy/control-plane/deployment.yaml` (2 replicas, Kubernetes'
+default rollout) is replaced within 20 minutes unless Kubernetes flags it,
+which `internal/ops` checks; a larger fleet can take about 10 minutes per
+replica without ever being flagged. A deploy that outlasts the ceiling
+costs a newer kind's timers up to a backoff of latency, and one that leaves
+mixed versions for a day loses them.
+
+**Check.** The deploy pipeline waits on the rollout with a bound no longer
+than the ceiling, and treats reaching it as a failed deploy to finish or
+roll back -- for example `kubectl rollout status
+deployment/narvi-control-plane --timeout=30m`, whose non-zero exit fails
+the pipeline. No rollout is left paused with pods of two releases running.
