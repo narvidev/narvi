@@ -105,6 +105,45 @@ func TestParseProvider(t *testing.T) {
 	}
 }
 
+// TestParseOutboundProvider proves the outbound vocabulary is GitHub alone:
+// slack and linear are real providers but have no outbound axis of their
+// own (their outbound credentials are still part of their ingress sets),
+// so they are refused exactly like a typo -- the property platform.Load
+// leans on to make NARVI_OUTBOUND_ENABLED=slack a loud boot failure.
+func TestParseOutboundProvider(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		raw    string
+		want   integrations.Provider
+		wantOK bool
+	}{
+		{"github", integrations.ProviderGitHub, true},
+		{"slack", "", false},
+		{"linear", "", false},
+		{"gihtub", "", false}, // a real near-miss typo of "github".
+		{"GitHub", "", false},
+		{"", "", false},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.raw, func(t *testing.T) {
+			t.Parallel()
+			got, ok := integrations.ParseOutboundProvider(tc.raw)
+			if ok != tc.wantOK || got != tc.want {
+				t.Errorf("ParseOutboundProvider(%q) = (%q, %v), want (%q, %v)", tc.raw, got, ok, tc.want, tc.wantOK)
+			}
+		})
+	}
+
+	for _, p := range integrations.OutboundProviders {
+		if _, ok := integrations.ParseProvider(string(p)); !ok {
+			t.Errorf("OutboundProviders entry %q is not a known Provider -- the two lists must share one vocabulary", p)
+		}
+	}
+}
+
 // TestConfiguredSlack proves a partially-configured surface (missing
 // EITHER required secret) reads as NOT connected -- one case per missing
 // secret, per this Step's own "Tests that must exist" requirement.
@@ -163,10 +202,12 @@ func TestConfiguredLinear(t *testing.T) {
 	}
 }
 
-// TestConfiguredGitHub mirrors TestConfiguredSlack/TestConfiguredLinear,
-// one case per missing secret among GitHub's own three, plus proves
-// GitHubClientID/GitHubClientSecret (OAuth login, deliberately excluded)
-// have no bearing here by never passing them at all.
+// TestConfiguredGitHub mirrors TestConfiguredSlack/TestConfiguredLinear:
+// one case per missing ingress secret, and one for GitHub outbound being
+// off -- the axis the bot credential now belongs to, passed as a bool so
+// this package never sees the secret itself. GitHubClientID/
+// GitHubClientSecret (OAuth login, deliberately excluded) have no bearing
+// here, proven by never passing them at all.
 func TestConfiguredGitHub(t *testing.T) {
 	t.Parallel()
 
@@ -174,22 +215,22 @@ func TestConfiguredGitHub(t *testing.T) {
 		name          string
 		webhookSecret string
 		botHandle     string
-		botToken      string
+		outbound      bool
 		want          bool
 	}{
-		{"all three present", "wh", "@narvi-bot", "tok", true},
-		{"missing webhook secret", "", "@narvi-bot", "tok", false},
-		{"missing bot handle", "wh", "", "tok", false},
-		{"missing bot token", "wh", "@narvi-bot", "", false},
-		{"all missing", "", "", "", false},
+		{"both secrets present, outbound on", "wh", "@narvi-bot", true, true},
+		{"missing webhook secret", "", "@narvi-bot", true, false},
+		{"missing bot handle", "wh", "", true, false},
+		{"outbound off", "wh", "@narvi-bot", false, false},
+		{"all missing", "", "", false, false},
 	}
 	for _, tc := range tests {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := integrations.ConfiguredGitHub(tc.webhookSecret, tc.botHandle, tc.botToken)
+			got := integrations.ConfiguredGitHub(tc.webhookSecret, tc.botHandle, tc.outbound)
 			if got != tc.want {
-				t.Errorf("ConfiguredGitHub(%q, %q, %q) = %v, want %v", tc.webhookSecret, tc.botHandle, tc.botToken, got, tc.want)
+				t.Errorf("ConfiguredGitHub(%q, %q, %v) = %v, want %v", tc.webhookSecret, tc.botHandle, tc.outbound, got, tc.want)
 			}
 		})
 	}

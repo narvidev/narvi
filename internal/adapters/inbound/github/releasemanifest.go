@@ -82,7 +82,7 @@ func triggerReleaseManifestCheckBestEffort(
 	}
 
 	prCtx, cancel := context.WithTimeout(ctx, cfg.Timeouts.GitHubGetPRTimeout)
-	pr, err := cfg.PullRequests.GetPullRequest(prCtx, owner, repo, prNumber, cfg.BotToken)
+	pr, err := cfg.PullRequests.GetPullRequest(prCtx, owner, repo, prNumber, cfg.Outbound.BotToken())
 	cancel()
 	if err != nil {
 		logger.Warn("github: release manifest: fetch pull request (for release detection) failed, skipping",
@@ -109,7 +109,7 @@ func triggerReleaseManifestCheckBestEffort(
 		PRNumber:      prNumber,
 		BaseRef:       pr.BaseRef,
 		HeadRef:       pr.HeadRef,
-		Token:         cfg.BotToken,
+		Token:         cfg.Outbound.BotToken(),
 		CorrelationID: correlationID,
 	})
 }

@@ -59,11 +59,11 @@ import (
 // that is uncertain about eligibility fails toward "don't rewrite the
 // description" -- see each branch below for the specific reasoning.
 type descriptionAutofixNotifier struct {
-	repoSettings   *postgres.RepoSettingsStore
-	artifacts      *postgres.ArtifactStore
-	sourceControl  ports.SourceControl
-	githubBotToken string
-	timeouts       platform.Timeouts
+	repoSettings  *postgres.RepoSettingsStore
+	artifacts     *postgres.ArtifactStore
+	sourceControl ports.SourceControl
+	outbound      *platform.GitHubOutboundConfig
+	timeouts      platform.Timeouts
 }
 
 var _ ports.Notifier = (*descriptionAutofixNotifier)(nil)
@@ -72,24 +72,29 @@ var _ ports.Notifier = (*descriptionAutofixNotifier)(nil)
 // ports.NotificationKindGitHubDescriptionAutofix -- called once by cmd/
 // control-plane/main.go's own kind->Notifier map assembly, mirroring
 // every other notifier constructor's own identical "called exactly once"
-// precedent. sourceControl/githubBotToken/timeouts are the SAME
+// precedent. sourceControl/outbound/timeouts are the SAME
 // instances/values production wiring already constructs for every other
 // GitHub-flavored notifier (e.g. githubapi.NewVerdictNotifier's own
-// sourceControl/cfg.GitHubBotToken).
+// sourceControl/cfg.GitHubOutbound). outbound must be non-nil: the
+// rewrite is made as the bot, so the notifier refuses to exist with
+// GitHub outbound off (§12.5).
 func NewDescriptionAutofixNotifier(
 	repoSettings *postgres.RepoSettingsStore,
 	artifacts *postgres.ArtifactStore,
 	sourceControl ports.SourceControl,
-	githubBotToken string,
+	outbound *platform.GitHubOutboundConfig,
 	timeouts platform.Timeouts,
-) ports.Notifier {
-	return &descriptionAutofixNotifier{
-		repoSettings:   repoSettings,
-		artifacts:      artifacts,
-		sourceControl:  sourceControl,
-		githubBotToken: githubBotToken,
-		timeouts:       timeouts,
+) (ports.Notifier, error) {
+	if err := platform.RequireGitHubOutbound(outbound, "outboxworker: new description autofix notifier"); err != nil {
+		return nil, err
 	}
+	return &descriptionAutofixNotifier{
+		repoSettings:  repoSettings,
+		artifacts:     artifacts,
+		sourceControl: sourceControl,
+		outbound:      outbound,
+		timeouts:      timeouts,
+	}, nil
 }
 
 // pullRequestHTMLURL builds the SAME deterministic "https://github.com/
@@ -213,7 +218,7 @@ func (n *descriptionAutofixNotifier) Deliver(ctx context.Context, notification p
 	}
 
 	getCtx, cancel := context.WithTimeout(ctx, n.timeouts.GitHubGetPRTimeout)
-	originalBody, found, err := n.sourceControl.GetPRBody(getCtx, payload.Owner, payload.Repo, payload.PRNumber, n.githubBotToken)
+	originalBody, found, err := n.sourceControl.GetPRBody(getCtx, payload.Owner, payload.Repo, payload.PRNumber, n.outbound.BotToken())
 	cancel()
 	if err != nil {
 		return fmt.Errorf("outboxworker: descriptionAutofixNotifier: get pr body: %w", err)
@@ -233,7 +238,7 @@ func (n *descriptionAutofixNotifier) Deliver(ctx context.Context, notification p
 		Repo:   payload.Repo,
 		Number: payload.PRNumber,
 		Body:   newBody,
-		Token:  n.githubBotToken,
+		Token:  n.outbound.BotToken(),
 	})
 	cancel()
 	if err != nil {

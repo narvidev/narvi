@@ -22,6 +22,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // fakeReviewContextFetcher is a test-only reviewcontext.Fetcher -- no real
@@ -244,7 +245,7 @@ func TestRetriggerReview_PreFetchesReviewContext_CorrectOwnerRepoArgs(t *testing
 	}
 	rig := newTestRig(t, func(r *testRig) {
 		r.diffFetcher = fetcher
-		r.botToken = "test-bot-token"
+		r.outbound = platform.MustNewGitHubOutboundConfig("test-bot-token")
 	})
 	ctx := context.Background()
 	owner, _ := rig.createAuthenticatedUser(ctx, t)
@@ -324,7 +325,7 @@ func TestRetriggerReview_PersistsFullReviewVerdictContext_ReadBackByPostReviewVe
 	}
 	rig := newTestRig(t, func(r *testRig) {
 		r.diffFetcher = fetcher
-		r.botToken = "test-bot-token"
+		r.outbound = platform.MustNewGitHubOutboundConfig("test-bot-token")
 	})
 	ctx := context.Background()
 	owner, _ := rig.createAuthenticatedUser(ctx, t)
@@ -574,7 +575,7 @@ func TestRetriggerReview_AlreadyAnsweredFacts_RetiresFindingWhoseFileLeftTheDiff
 	}
 	rig := newTestRig(t, func(r *testRig) {
 		r.diffFetcher = fetcher
-		r.botToken = "test-bot-token"
+		r.outbound = platform.MustNewGitHubOutboundConfig("test-bot-token")
 	})
 	ctx := context.Background()
 	owner, _ := rig.createAuthenticatedUser(ctx, t)
@@ -665,7 +666,7 @@ func TestRetriggerReview_AwaitingPlanAlwaysDeclines_NeverClassifies(t *testing.T
 	}
 	rig := newTestRig(t, func(r *testRig) {
 		r.diffFetcher = fetcher
-		r.botToken = "test-bot-token"
+		r.outbound = platform.MustNewGitHubOutboundConfig("test-bot-token")
 	})
 	ctx := context.Background()
 	owner, _ := rig.createAuthenticatedUser(ctx, t)

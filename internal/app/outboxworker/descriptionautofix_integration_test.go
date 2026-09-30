@@ -216,7 +216,7 @@ func TestDescriptionAutofixNotifier_FlagOff_NeverWrites(t *testing.T) {
 	// Deliberately NO repo_settings row for this repo at all.
 
 	sourceControl := &fakeDescriptionAutofixSourceControl{nextFound: true, nextBody: "Original body."}
-	notifier := outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts())
+	notifier := mustNotifier(outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts()))
 
 	payload := descriptionAutofixPayload(t, owner, repo, number, "Proposed new body.")
 	if err := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubDescriptionAutofix, Payload: payload}); err != nil {
@@ -250,7 +250,7 @@ func TestDescriptionAutofixNotifier_FlagExplicitlyOff_NeverWrites(t *testing.T) 
 	}
 
 	sourceControl := &fakeDescriptionAutofixSourceControl{nextFound: true, nextBody: "Original body."}
-	notifier := outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts())
+	notifier := mustNotifier(outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts()))
 
 	payload := descriptionAutofixPayload(t, owner, repo, number, "Proposed new body.")
 	if err := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubDescriptionAutofix, Payload: payload}); err != nil {
@@ -282,7 +282,7 @@ func TestDescriptionAutofixNotifier_NotPlatformAuthored_NeverWrites(t *testing.T
 	// a Narvi session.
 
 	sourceControl := &fakeDescriptionAutofixSourceControl{nextFound: true, nextBody: "Original body."}
-	notifier := outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts())
+	notifier := mustNotifier(outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts()))
 
 	payload := descriptionAutofixPayload(t, owner, repo, number, "Proposed new body.")
 	if err := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubDescriptionAutofix, Payload: payload}); err != nil {
@@ -319,7 +319,7 @@ func TestDescriptionAutofixNotifier_AdequacyOK_NeverWrites(t *testing.T) {
 	}
 
 	sourceControl := &fakeDescriptionAutofixSourceControl{nextFound: true, nextBody: "Original body."}
-	notifier := outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts())
+	notifier := mustNotifier(outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts()))
 
 	payload := descriptionAutofixPayloadWithAdequacy(t, owner, repo, number, "An unsolicited proposed rewrite.", review.DescriptionAdequacyOK)
 	if err := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubDescriptionAutofix, Payload: payload}); err != nil {
@@ -354,7 +354,7 @@ func TestDescriptionAutofixNotifier_AdequacyZeroValue_NeverWrites(t *testing.T) 
 	}
 
 	sourceControl := &fakeDescriptionAutofixSourceControl{nextFound: true, nextBody: "Original body."}
-	notifier := outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts())
+	notifier := mustNotifier(outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts()))
 
 	// Marshal a payload with NO descriptionAdequacy key at all -- exactly
 	// what an outbox row enqueued before this field existed would decode
@@ -387,7 +387,7 @@ func TestDescriptionAutofixNotifier_FlagOnAndPlatformAuthored_WritesComposedBody
 	}
 
 	sourceControl := &fakeDescriptionAutofixSourceControl{nextFound: true, nextBody: "The CURRENT live body, freshly fetched."}
-	notifier := outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts())
+	notifier := mustNotifier(outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts()))
 
 	proposedBody := "This PR rewrites the auth token refresh path to retry on transient failures."
 	payload := descriptionAutofixPayload(t, owner, repo, number, proposedBody)
@@ -435,7 +435,7 @@ func TestDescriptionAutofixNotifier_PRNoLongerFound_NeverWrites(t *testing.T) {
 	}
 
 	sourceControl := &fakeDescriptionAutofixSourceControl{nextFound: false}
-	notifier := outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts())
+	notifier := mustNotifier(outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts()))
 
 	payload := descriptionAutofixPayload(t, owner, repo, number, "Proposed new body.")
 	if err := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubDescriptionAutofix, Payload: payload}); err != nil {
@@ -466,7 +466,7 @@ func TestDescriptionAutofixNotifier_GetPRBodyFails_ReturnsErrorForRetry(t *testi
 	}
 
 	sourceControl := &fakeDescriptionAutofixSourceControl{nextGetErr: errors.New("simulated transient GitHub API failure")}
-	notifier := outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts())
+	notifier := mustNotifier(outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts()))
 
 	payload := descriptionAutofixPayload(t, owner, repo, number, "Proposed new body.")
 	if err := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubDescriptionAutofix, Payload: payload}); err == nil {
@@ -503,7 +503,7 @@ func TestDescriptionAutofixNotifier_RepoSettingsReadError_ReturnsErrorForRetry(t
 	brokenRepoSettings := narvipg.NewRepoSettingsStore(pool).WithTx(tx)
 
 	sourceControl := &fakeDescriptionAutofixSourceControl{nextFound: true, nextBody: "Original body."}
-	notifier := outboxworker.NewDescriptionAutofixNotifier(brokenRepoSettings, artifacts, sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts())
+	notifier := mustNotifier(outboxworker.NewDescriptionAutofixNotifier(brokenRepoSettings, artifacts, sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts()))
 
 	payload := descriptionAutofixPayload(t, owner, repo, number, "Proposed new body.")
 	if err := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindGitHubDescriptionAutofix, Payload: payload}); err == nil {
@@ -543,7 +543,7 @@ func TestDescriptionAutofixNotifier_RepeatedDelivery_IsIdempotent(t *testing.T) 
 
 	realOriginal := "The real, human-authored original description."
 	sourceControl := &fakeDescriptionAutofixSourceControl{nextFound: true, nextBody: realOriginal}
-	notifier := outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts())
+	notifier := mustNotifier(outboxworker.NewDescriptionAutofixNotifier(repoSettings, artifacts, sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts()))
 
 	proposedBody := "This PR rewrites the auth token refresh path to retry on transient failures."
 	payload := descriptionAutofixPayload(t, owner, repo, number, proposedBody)

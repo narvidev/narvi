@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // HandoffPayload is the JSON shape internal/app/outboxworker expects to
@@ -37,19 +38,23 @@ type HandoffPayload struct {
 // GitHub calls" shape).
 type HandoffNotifier struct {
 	adapter  *Adapter
-	botToken string
+	outbound *platform.GitHubOutboundConfig
 }
 
 var _ ports.Notifier = (*HandoffNotifier)(nil)
 
 // NewHandoffNotifier builds a HandoffNotifier wrapping adapter,
-// authenticating every call with botToken -- this sentinel's own comment
+// authenticating every call with outbound's bot credential (non-nil:
+// refused otherwise, §12.5) -- this sentinel's own comment
 // and label are a system-generated notice, never attributed to any
 // individual reviewer or the session's own creator, mirroring
 // NewVerdictNotifier's own identical "single, statically-configured bot
 // credential" choice.
-func NewHandoffNotifier(adapter *Adapter, botToken string) *HandoffNotifier {
-	return &HandoffNotifier{adapter: adapter, botToken: botToken}
+func NewHandoffNotifier(adapter *Adapter, outbound *platform.GitHubOutboundConfig) (*HandoffNotifier, error) {
+	if err := platform.RequireGitHubOutbound(outbound, "githubapi: new HandoffNotifier"); err != nil {
+		return nil, err
+	}
+	return &HandoffNotifier{adapter: adapter, outbound: outbound}, nil
 }
 
 // Deliver implements ports.Notifier: decodes n.Payload as HandoffPayload,
@@ -81,12 +86,12 @@ func (n *HandoffNotifier) Deliver(ctx context.Context, notification ports.Notifi
 	}
 
 	if payload.Label != "" {
-		if err := n.adapter.AddLabels(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.botToken, []string{payload.Label}); err != nil {
+		if err := n.adapter.AddLabels(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.outbound.BotToken(), []string{payload.Label}); err != nil {
 			return fmt.Errorf("githubapi: deliver handoff (add label): %w", err)
 		}
 	}
 
-	if err := n.adapter.PostIssueComment(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.botToken, payload.Body); err != nil {
+	if err := n.adapter.PostIssueComment(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.outbound.BotToken(), payload.Body); err != nil {
 		return fmt.Errorf("githubapi: deliver handoff (post comment): %w", err)
 	}
 

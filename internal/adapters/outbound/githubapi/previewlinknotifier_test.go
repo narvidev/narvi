@@ -9,6 +9,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // TestPreviewLinkNotifier_Deliver proves Deliver decodes a
@@ -37,7 +38,7 @@ func TestPreviewLinkNotifier_Deliver(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := githubapi.NewPreviewLinkNotifier(adapter, "baked-in-bot-token")
+	notifier := mustBuild(githubapi.NewPreviewLinkNotifier(adapter, platform.MustNewGitHubOutboundConfig("baked-in-bot-token")))
 
 	payload, err := json.Marshal(githubapi.PreviewLinkPayload{
 		Owner:       "acme",
@@ -81,7 +82,7 @@ func TestPreviewLinkNotifier_Deliver_MalformedPayload(t *testing.T) {
 	t.Parallel()
 
 	adapter := githubapi.New(nil, "https://example.invalid")
-	notifier := githubapi.NewPreviewLinkNotifier(adapter, "tok")
+	notifier := mustBuild(githubapi.NewPreviewLinkNotifier(adapter, platform.MustNewGitHubOutboundConfig("tok")))
 
 	err := notifier.Deliver(context.Background(), ports.Notification{
 		Kind:    ports.NotificationKindGitHubPreviewLink,
@@ -103,7 +104,7 @@ func TestPreviewLinkNotifier_Deliver_HTTPFailurePropagates(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := githubapi.NewPreviewLinkNotifier(adapter, "tok")
+	notifier := mustBuild(githubapi.NewPreviewLinkNotifier(adapter, platform.MustNewGitHubOutboundConfig("tok")))
 
 	payload, _ := json.Marshal(githubapi.PreviewLinkPayload{Owner: "acme", Repo: "widgets", SHA: "sha1"})
 	err := notifier.Deliver(context.Background(), ports.Notification{

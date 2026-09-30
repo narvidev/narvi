@@ -270,3 +270,58 @@ matter too:
   `application_name` values, and confirm
   `SELECT current_setting('application_name')` returns each connection's
   own.
+
+## 11. GitHub outbound is declared as intended
+
+**Why this is here.** Whether this deployment calls GitHub as its bot
+(`NARVI_OUTBOUND_ENABLED`, `docs/TECHNICAL_PLAN.md` §12.5) is a separate
+axis from whether it mounts the GitHub webhook (`NARVI_INGRESS_ENABLED`).
+Every review verdict, comment, label, check run, commit status, sentinel
+or description rewrite, auto-merge and release-manifest check goes out
+through it, and so do the live pull request reads behind the review
+screens; with it off, none of them happens. Left unset it follows GitHub
+ingress, so a deployment that never narrowed ingress has it on without
+saying so, and one that did narrow ingress had to declare it to boot at
+all -- and neither value is exactly how such a deployment ran before
+(§12.5's "Migrating a deployment that narrowed ingress" lists what each
+changes). What boot cannot tell is whether the value declared is the one
+this deployment is meant to have, or whether the bot token behind it
+actually works.
+
+**Check.** The boot log carries one line, `narvi control-plane: GitHub
+axes`, with `ingress`, `outbound` and `outbound_credential`: confirm
+`outbound` is what this deployment intends (`true` with `bot token` for
+a deployment that posts reviews).
+
+Then, with it on, confirm the credential works end to end -- **on a
+repository promoted to live**, and nowhere else. Every repository is in
+§30 shadow mode until it is promoted (`repo_settings.live_egress_enabled`,
+false by default; promoted by `POST
+/api/repos/{owner}/{repo}/shadow-ledger/activate` or the seed manifest's
+`liveEgressEnabled`), and a write made in shadow is recorded to the
+ledger without GitHub ever being called -- with a wrong or revoked token
+too. `GET /api/integrations` cannot tell the two apart: a shadow-ledger
+row also reads `lastOutboundStatus` `delivered`, so that field does not
+count for this check. After a real review on the promoted repository,
+read the outbox itself:
+
+```sql
+SELECT kind, status, delivered_to_ledger, attempts, last_error, delivered_at
+FROM outbox
+WHERE kind LIKE 'github%'
+  AND payload->>'owner' = '<owner>' AND payload->>'repo' = '<repo>'
+ORDER BY created_at DESC
+LIMIT 10;
+```
+
+The check passes only on a row with `status = 'delivered'` AND
+`delivered_to_ledger = false` -- a call GitHub actually accepted. A row
+with `delivered_to_ledger = true` is a shadow write and proves nothing
+about the token; a `pending` row with a `last_error` naming a 401 means
+the bot token is wrong or revoked, and every GitHub outbound kind on
+every live repository will retry and dead-letter the same way
+([outbox-delivery.md](runbooks/outbox-delivery.md)). This axis is not
+§30's shadow mode (item 9): it decides whether GitHub is called at all,
+and each repository's own live/shadow setting still decides, per write,
+whether it is sent or recorded -- which is exactly why the check needs a
+live repository.

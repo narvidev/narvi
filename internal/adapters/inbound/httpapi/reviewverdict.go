@@ -181,14 +181,16 @@ func PostReviewVerdict(
 	// required together.
 	events *postgres.EventStore,
 	botHandle string,
-	// botToken (§22.1.1) is the SAME GitHub bot credential
-	// platform.Config.GitHubBotToken already supplies to every other
-	// diff-fetching call site (internal/app/reviewcontext.Fetch's own
+	// outbound (§22.1.1, §12.5) is the GitHub outbound axis whose bot
+	// credential platform.Config.GitHubOutbound already supplies to every
+	// other diff-fetching call site (internal/app/reviewcontext.Fetch's own
 	// callers, handler.go/reviewretrigger.go) -- distinct from botHandle
 	// above (a plain username string, never a credential): this handler
 	// needs a REAL token to authenticate FetchDiffAt's own GitHub API
-	// calls, which botHandle alone cannot provide.
-	botToken string,
+	// calls, which botHandle alone cannot provide. Nil when GitHub
+	// outbound is off: the route stays mounted and every finding stays
+	// unanchored, with no diff fetch attempted.
+	outbound *platform.GitHubOutboundConfig,
 	// diffFetcher/positionResolver/timeouts (§22.1.1) back this
 	// handler's OWN content-anchored positioning: diffFetcher re-fetches
 	// (internal/app/reviewcontext.FetchDiffAt) the SAME diff a review
@@ -682,7 +684,10 @@ func PostReviewVerdict(
 		// non-fatal degradation" posture exactly, applied here to position
 		// resolution instead of the review_verdicts insert.
 		if len(findings) > 0 && verdictHeadSHA != "" && diffFetcher != nil {
-			if diff, ok := reviewcontext.FetchDiffAt(ctx, logger, diffFetcher, timeouts, owner, repo, prSession.PrNumber, botToken, verdictHeadSHA); ok {
+			if outbound == nil {
+				logger.Warn("httpapi: review-verdict: GitHub outbound is off (NARVI_OUTBOUND_ENABLED), no diff to anchor against -- every finding stays unanchored",
+					"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+			} else if diff, ok := reviewcontext.FetchDiffAt(ctx, logger, diffFetcher, timeouts, owner, repo, prSession.PrNumber, outbound.BotToken(), verdictHeadSHA); ok {
 				findings = findingposition.ResolveAll(ctx, positionResolver, findings, diff, timeouts)
 			} else {
 				logger.Warn("httpapi: review-verdict: fetch diff for position anchoring failed, every finding stays unanchored",

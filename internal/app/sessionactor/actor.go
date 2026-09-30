@@ -88,12 +88,13 @@ type Actor struct {
 	// e.g. the resilience test).
 	sourceControl ports.SourceControl
 
-	// githubBotToken is §8.2's ("sentinels + suggestions", §17.2) own
+	// githubOutbound is §8.2's ("sentinels + suggestions", §17.2) own
 	// addition -- see Registry's own identical field doc comment
 	// (registry.go) for the full rationale; createSentinelFixPRBestEffort
-	// (pushpr.go) is this Actor's own one use of it. May be empty (tests
-	// that never exercise the sentinel-fix PR path).
-	githubBotToken string
+	// (pushpr.go) and fetchAutoRetriggerReviewContext (reviewretrigger.go)
+	// are this Actor's own uses of it. Nil when GitHub outbound is off
+	// (§12.5): both then skip their GitHub call.
+	githubOutbound *platform.GitHubOutboundConfig
 
 	// reviewModelDeep is §26.3's own addition (§26.3) -- see
 	// RegistryOptions.ReviewModelDeep's own doc comment.

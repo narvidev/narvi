@@ -451,7 +451,7 @@ func (rs *automergeTestRig) deps(sourceControl ports.SourceControl) automerge.De
 		},
 		SourceControl: sourceControl,
 		AuditLog:      rs.auditLog,
-		BotToken:      "bot-token",
+		Outbound:      platform.MustNewGitHubOutboundConfig("bot-token"),
 		Timeouts:      platform.DefaultTimeouts(),
 	}
 }

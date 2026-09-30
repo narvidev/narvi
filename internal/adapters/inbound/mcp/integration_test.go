@@ -134,7 +134,7 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 		PRSessions:     rig.prSessions,
 		ReviewVerdicts: rig.reviewVerdicts,
 		SourceControl:  parityCodeHost{},
-		BotToken:       "parity-bot-token",
+		Outbound:       platform.MustNewGitHubOutboundConfig("parity-bot-token"),
 		Timeouts:       platform.DefaultTimeouts(),
 	})
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // previewCommitStatusContext is the fixed GitHub commit-status "context"
@@ -42,7 +43,7 @@ type PreviewLinkPayload struct {
 // reasoning).
 type PreviewLinkNotifier struct {
 	adapter  *Adapter
-	botToken string
+	outbound *platform.GitHubOutboundConfig
 }
 
 // var _ ports.Notifier = (*PreviewLinkNotifier)(nil) makes a Notifier
@@ -50,12 +51,16 @@ type PreviewLinkNotifier struct {
 var _ ports.Notifier = (*PreviewLinkNotifier)(nil)
 
 // NewPreviewLinkNotifier builds a PreviewLinkNotifier wrapping adapter,
-// authenticating every call with botToken — a preview link is a
+// authenticating every call with outbound's bot credential (non-nil:
+// refused otherwise, §12.5) — a preview link is a
 // system-generated fact about a commit, never attributed to any
 // individual PR author or reviewer, mirroring NewReleaseManifestNotifier's
 // own identical "single, statically-configured bot credential" choice.
-func NewPreviewLinkNotifier(adapter *Adapter, botToken string) *PreviewLinkNotifier {
-	return &PreviewLinkNotifier{adapter: adapter, botToken: botToken}
+func NewPreviewLinkNotifier(adapter *Adapter, outbound *platform.GitHubOutboundConfig) (*PreviewLinkNotifier, error) {
+	if err := platform.RequireGitHubOutbound(outbound, "githubapi: new PreviewLinkNotifier"); err != nil {
+		return nil, err
+	}
+	return &PreviewLinkNotifier{adapter: adapter, outbound: outbound}, nil
 }
 
 // Deliver implements ports.Notifier: decodes n.Payload as
@@ -73,7 +78,7 @@ func (n *PreviewLinkNotifier) Deliver(ctx context.Context, notification ports.No
 	}
 
 	if err := n.adapter.CreateCommitStatus(ctx, payload.Owner, payload.Repo, payload.SHA,
-		"success", payload.TargetURL, payload.Description, previewCommitStatusContext, n.botToken); err != nil {
+		"success", payload.TargetURL, payload.Description, previewCommitStatusContext, n.outbound.BotToken()); err != nil {
 		return fmt.Errorf("githubapi: deliver preview link (create commit status): %w", err)
 	}
 	return nil

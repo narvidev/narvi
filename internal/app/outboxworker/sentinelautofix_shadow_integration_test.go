@@ -83,9 +83,9 @@ func TestSentinelAutoFixNotifier_ShadowRepo_ShortCircuitsBeforeClaim_NeverFixPen
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
 	shadowRepo := func(context.Context, string) bool { return false }
-	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
-		shadowRepo, shadowLedgerStore)
+	notifier := mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
+		sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
+		shadowRepo, shadowLedgerStore))
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
 		SentinelFixID:         fix.ID.String(),
@@ -251,9 +251,9 @@ func TestSentinelAutoFixNotifier_BornShadowRow_DeliveredAfterPromotion_StillShor
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
 	shadowRepo := func(context.Context, string) bool { return true } // promoted since enqueue
-	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
-		sourceControl, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
-		shadowRepo, shadowLedgerStore)
+	notifier := mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, environments, auditLog, registry, sentinelFixes, reviewFindings,
+		sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
+		shadowRepo, shadowLedgerStore))
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
 		SentinelFixID:         fix.ID.String(),

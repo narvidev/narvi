@@ -127,9 +127,9 @@ func TestSentinelAutoFixChild_IsNotAReviewSessionSoItsPushIsSent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewRegistry (spawn): %v", err)
 	}
-	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), spawnRegistry, sentinelFixes, reviewFindings,
-		&fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
-		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
+	notifier := mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, sessions, turns, narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), spawnRegistry, sentinelFixes, reviewFindings,
+		&fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions,
+		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool)))
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
 		SentinelFixID:         fix.ID.String(),
 		RepoFullName:          repoFullName,

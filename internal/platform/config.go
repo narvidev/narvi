@@ -180,11 +180,22 @@ const (
 // MissingRequiredEnvError is returned by Load when a required environment
 // variable that has no safe default (NARVI_DATABASE_URL today) is unset or
 // empty.
+//
+// RequiredBy is optional: set only when the variable is required because
+// of another setting rather than unconditionally, it names that setting
+// (e.g. NARVI_GITHUB_BOT_TOKEN, required because GitHub outbound is
+// enabled), and Error appends it. EnvVar stays the one structured field
+// internal/ops reads by reflection, so adding a reason changes nothing a
+// caller matching on the type or on EnvVar relies on.
 type MissingRequiredEnvError struct {
-	EnvVar string
+	EnvVar     string
+	RequiredBy string
 }
 
 func (e *MissingRequiredEnvError) Error() string {
+	if e.RequiredBy != "" {
+		return fmt.Sprintf("missing required %s (no default): required because %s", e.EnvVar, e.RequiredBy)
+	}
 	return fmt.Sprintf("missing required %s (no default)", e.EnvVar)
 }
 
@@ -352,7 +363,9 @@ func canonicalOIDCIssuerURL(raw string, stage Stage) (string, error) {
 // is required, and Load fails fast (MissingRequiredEnvError) if any of it
 // is missing. A surface NOT named here is not mounted anywhere in
 // controlplane/serve.go's own wiring -- no webhook route, no outbox
-// notifier registered for any of its kinds -- and its own credential env
+// notifier registered for any of its kinds (for GitHub, whose notifiers
+// post as the bot, that is decided by the outbound axis instead --
+// outboundEnabledEnvVarName) -- and its own credential env
 // vars are read but never enforced, mirroring objectStoreEndpointEnvVarName's
 // own "endpoint absent, nothing else even inspected" gating rule one level
 // up (a whole surface instead of one sub-config).
@@ -417,18 +430,115 @@ func (e *InvalidIngressEnabledError) Error() string {
 	)
 }
 
-// RWXPreviewsRequireGitHubIngressError is returned by Load when
+// outboundEnabledEnvVarName is the process environment variable Load reads
+// for §12.5's outbound axis: an explicit, comma-separated list of which
+// providers this deployment calls AS ITS BOT, independently of which
+// ingress surfaces it mounts (ingressEnabledEnvVarName). It reads exactly
+// like NARVI_INGRESS_ENABLED and draws on the same
+// internal/domain/integrations.Provider vocabulary, but accepts only
+// integrations.OutboundProviders -- today just "github". Slack's and
+// Linear's outbound credentials are still part of their ingress sets.
+//
+// GitHub outbound is everything Narvi does on GitHub as the bot, through
+// NARVI_GITHUB_BOT_TOKEN: review verdicts, comments and labels, the
+// review check run, commit statuses, the sentinel and description
+// rewrites, auto-merge and the release-manifest check. Its consumers take
+// the typed *GitHubOutboundConfig (Config.GitHubOutbound), nil when this
+// axis is off, never the token as a string.
+//
+// This is NOT §30's live/shadow switch, and deliberately not called
+// "egress": that word already names §30's per-repository mode
+// (repo_settings.live_egress_enabled), §27.6's sandbox egress and §42.4's
+// NetworkPolicy egress. This switch decides whether the deployment talks
+// to GitHub as its bot at all; §30 still decides, per repository, whether
+// each of those writes is sent or recorded.
+//
+// Unset and set-to-empty mean different things, as for
+// NARVI_INGRESS_ENABLED (os.LookupEnv, not the "" idiom):
+//
+//   - Unset resolves to github when GitHub ingress is on, so every
+//     deployment that never narrowed NARVI_INGRESS_ENABLED boots exactly
+//     as before. When NARVI_INGRESS_ENABLED is set and excludes github,
+//     unset is refused (UndeclaredOutboundError): the old bundling hid a
+//     real choice there, and inferring it either way would silently change
+//     what the deployment sends.
+//   - "" is an explicit "no outbound provider".
+//   - "github" turns GitHub outbound on, and makes NARVI_GITHUB_BOT_TOKEN
+//     required.
+//
+// GitHub ingress requires GitHub outbound (GitHubIngressRequiresOutboundError:
+// the webhook handler reads pull requests and replies as the bot);
+// outbound never requires ingress.
+const outboundEnabledEnvVarName = "NARVI_OUTBOUND_ENABLED"
+
+// InvalidOutboundEnabledError is returned by Load when NARVI_OUTBOUND_ENABLED
+// carries an entry that is not one of integrations.OutboundProviders --
+// a typo, or a provider (slack, linear) that has no outbound axis of its
+// own. Rejected loudly rather than dropped, for the same reason as
+// InvalidIngressEnabledError.
+type InvalidOutboundEnabledError struct {
+	Value string
+}
+
+func (e *InvalidOutboundEnabledError) Error() string {
+	allowed := make([]string, len(integrations.OutboundProviders))
+	for i, p := range integrations.OutboundProviders {
+		allowed[i] = strconv.Quote(string(p))
+	}
+	return fmt.Sprintf(
+		"invalid entry %q in %s: must be one of %s -- Slack's and Linear's outbound credentials are still part of their ingress sets (%s), so they have no outbound switch of their own",
+		e.Value, outboundEnabledEnvVarName, strings.Join(allowed, ", "), ingressEnabledEnvVarName,
+	)
+}
+
+// UndeclaredOutboundError is returned by Load when NARVI_INGRESS_ENABLED is
+// set, valid, and excludes github while NARVI_OUTBOUND_ENABLED is unset
+// (rule R1, §12.5). Returned alone: whether NARVI_GITHUB_BOT_TOKEN is
+// required depends on the answer, so no token error is reported beside it.
+//
+// Neither answer reproduces this deployment shape as it ran before the
+// axis existed, and the message says what each one changes. Before, such a
+// deployment posted nothing to GitHub -- every GitHub notifier was gated
+// on ingress -- yet still ran the auto-merge and release-manifest workers
+// and, when a bot token was set, read pull requests with it.
+type UndeclaredOutboundError struct{}
+
+func (e *UndeclaredOutboundError) Error() string {
+	return fmt.Sprintf(
+		"%s excludes github, so whether this deployment calls GitHub as its bot cannot be inferred -- declare it: "+
+			"%s= (empty) calls GitHub not at all, which posts nothing, as before, but also stops the auto-merge and release-manifest workers and the live pull request reads a set %s used to serve; "+
+			"%s=github (with %s) calls GitHub as the bot for everything, which also posts reviews, comments, labels, check runs and statuses this deployment never posted before",
+		ingressEnabledEnvVarName,
+		outboundEnabledEnvVarName, gitHubBotTokenEnvVarName,
+		outboundEnabledEnvVarName, gitHubBotTokenEnvVarName,
+	)
+}
+
+// GitHubIngressRequiresOutboundError is returned by Load when GitHub
+// ingress is on while GitHub outbound is off (rule R3, §12.5): the GitHub
+// webhook handler resolves pull requests, fetches review context and
+// posts its sign-in and plan-awaiting replies as the bot, so it cannot run
+// without the bot credential. The reverse never holds: outbound without
+// ingress is a valid deployment.
+type GitHubIngressRequiresOutboundError struct{}
+
+func (e *GitHubIngressRequiresOutboundError) Error() string {
+	return fmt.Sprintf(
+		"%s includes github but %s does not: the GitHub webhook handler reads pull requests and replies as the bot, so GitHub ingress needs GitHub outbound -- add github to %s (with %s), or remove github from %s",
+		ingressEnabledEnvVarName, outboundEnabledEnvVarName, outboundEnabledEnvVarName, gitHubBotTokenEnvVarName, ingressEnabledEnvVarName,
+	)
+}
+
+// RWXPreviewsRequireGitHubOutboundError is returned by Load when
 // NARVI_RWX_ACCESS_TOKEN is set (rwxAccessTokenEnvVarName's own doc
 // comment: an explicit, per-deployment opt-in into RWX previews) while
-// GitHub ingress is disabled (ingressEnabled[integrations.ProviderGitHub]
-// == false, §12.5). The combination can never work: the preview link half
-// of the feature (githubPreviewLinkNotifier, controlplane/serve.go) posts
-// through cfg.GitHubBotToken, and gitHubBotTokenEnvVarName's own doc
-// comment already establishes that this credential is bundled into the
-// GitHub ingress surface and left empty whenever that surface is disabled
-// -- so an operator who set the RWX token while leaving GitHub ingress off
+// GitHub outbound is off (rule R6, §12.5). The combination can never work:
+// the preview link half of the feature posts a commit status as the bot,
+// through Config.GitHubOutbound, which is nil exactly when GitHub outbound
+// is off -- so an operator who set the RWX token without GitHub outbound
 // asked for something structurally impossible, not a degraded-but-valid
-// posture.
+// posture. Keyed on the outbound axis, not on ingress: a deployment with
+// GitHub ingress off but outbound on posts preview links fine.
 //
 // A hard boot refusal, not a startup warning, deliberately -- following
 // InvalidObjectStoreCredentialsError's own precedent immediately below
@@ -444,12 +554,12 @@ func (e *InvalidIngressEnabledError) Error() string {
 // report is a deliberate, sometimes-correct operational posture that
 // needs a live DB read (CountSuppressedRepos) to even evaluate --
 // genuinely different in kind from this one.
-type RWXPreviewsRequireGitHubIngressError struct{}
+type RWXPreviewsRequireGitHubOutboundError struct{}
 
-func (e *RWXPreviewsRequireGitHubIngressError) Error() string {
+func (e *RWXPreviewsRequireGitHubOutboundError) Error() string {
 	return fmt.Sprintf(
-		"%s is set but GitHub ingress is disabled (%s): RWX preview links can never be posted without %s, which is only ever configured when GitHub ingress is enabled -- either enable GitHub ingress or unset %s",
-		rwxAccessTokenEnvVarName, ingressEnabledEnvVarName, gitHubBotTokenEnvVarName, rwxAccessTokenEnvVarName,
+		"%s is set but GitHub outbound is off (%s): RWX preview links are posted to GitHub as the bot and can never be posted without it -- either set %s=github (with %s) or unset %s",
+		rwxAccessTokenEnvVarName, outboundEnabledEnvVarName, outboundEnabledEnvVarName, gitHubBotTokenEnvVarName, rwxAccessTokenEnvVarName,
 	)
 }
 
@@ -472,30 +582,36 @@ func (e *RWXPreviewsRequireGitHubIngressError) Error() string {
 // there is no safe placeholder webhook secret, and a misconfigured/empty
 // bot handle would silently make this entire ingress route never detect a
 // single mention. A deployment that never enables GitHub ingress at all
-// never has either checked, and both simply read as "" (Config.
-// IngressEnabled gates the check, not this pair's own zero value).
+// never has either checked (Config.IngressEnabled gates the check, not this
+// pair's own zero value), and its bot handle is never stored: Config.
+// GitHubBotHandle reads "" whenever GitHub ingress is off.
 const (
 	gitHubWebhookSecretEnvVarName = "NARVI_GITHUB_WEBHOOK_SECRET"
 	gitHubBotHandleEnvVarName     = "NARVI_GITHUB_BOT_HANDLE"
 )
 
-// gitHubBotTokenEnvVarName configures §5.1's ("outbox delivery", §5.1)
-// own GitHub Notifier adapter (internal/adapters/outbound/githubapi's new
-// issue-comment-posting method) -- read from NARVI_GITHUB_BOT_TOKEN.
+// gitHubBotTokenEnvVarName is the credential of §12.5's GitHub outbound
+// axis (outboundEnabledEnvVarName) -- read from NARVI_GITHUB_BOT_TOKEN, and
+// read NOWHERE else in this codebase: Load wraps it into
+// *GitHubOutboundConfig (Config.GitHubOutbound), the only form any
+// consumer receives it in, and internal/ops's outbound guard fails the
+// suite if the variable's name appears in Go source outside this package.
 // Required -- never defaulted, matching every other secret this file
-// already reads -- WHEN GitHub ingress is enabled (ingressEnabledEnvVarName's
-// own doc comment, §12.5): internal/domain/integrations.ConfiguredGitHub
-// bundles this credential together with GitHubWebhookSecret/GitHubBotHandle
-// as one surface (its own doc comment explains why -- posting a review
-// verdict/comment back to GitHub is the OUTBOUND half of the same "GitHub
-// ingress" surface the webhook adapter forms the INBOUND half of), so a
-// deployment that never enables GitHub ingress leaves this empty too, and
-// every GitHub-flavored outbox notifier this credential backs
-// (controlplane/serve.go's own outboxNotifiers map) is simply never
+// already reads -- WHEN GitHub outbound is enabled: explicitly
+// (NARVI_OUTBOUND_ENABLED=github), or by default, since an unset
+// NARVI_OUTBOUND_ENABLED resolves to github while GitHub ingress is on.
+// When GitHub outbound is off the value is ignored and never stored (the
+// same treatment a disabled ingress surface's secrets get), so no
+// consumer can reach it, and every GitHub-flavored outbox notifier this
+// credential backs (controlplane/githuboutbound.go) is simply never
 // registered -- any stray row enqueued for one of those kinds anyway
 // dead-letters through outboxworker's existing "no notifier registered for
-// kind" path rather than posting with an empty credential. Deliberately a
-// SEPARATE credential from every
+// kind" path rather than posting with an empty credential.
+//
+// This is the ONE place that says "GitHub outbound means a bot token":
+// a later publication credential (the GitHub App pool, §44.5) may satisfy
+// the axis instead, and relaxing rule R4 here is all that would take.
+// Deliberately a SEPARATE credential from every
 // existing GitHub-flavored value in this struct: GitHubClientID/
 // GitHubClientSecret authenticate the OAuth APP a human signs into Narvi
 // through (§13.1); ports.SourceControl.CreatePR (githubapi.Adapter,
@@ -504,11 +620,11 @@ const (
 // IdentityStore) -- but a webhook-originated (GitHub/Slack/Linear) session
 // has sessions.created_by left NULL (migrations/000004_sessions.up.sql),
 // so there is no logged-in Narvi user's own token to reuse for posting an
-// async turn-outcome comment back to a PR. GitHubBotToken is instead a
+// async turn-outcome comment back to a PR. The bot token is instead a
 // single, statically-configured bot/app credential (a real GitHub personal
 // access token or a GitHub App installation token, whichever the deploying
-// operator provisions), baked into the GitHub Notifier adapter once at
-// construction time (cmd/control-plane/main.go), never looked up per
+// operator provisions), baked into each outbound consumer once at
+// construction time (controlplane/githuboutbound.go), never looked up per
 // session the way CreatePR's own spec.Token is.
 //
 // Batch fix/audit-github-pr-payload-correctness (H5 audit fix) adds a
@@ -529,9 +645,10 @@ const gitHubBotTokenEnvVarName = "NARVI_GITHUB_BOT_TOKEN"
 // by the freshness pump and the build service."
 //
 // DELIBERATELY OPTIONAL -- unlike every other GitHub-flavored secret this
-// file reads (GitHubClientID/Secret, GitHubWebhookSecret, GitHubBotToken,
-// all required, never defaulted): this credential's own consumers (the
-// freshness pump's per-repo tip-SHA resolution, app/imagebuild.Builder's
+// file reads (GitHubClientID/Secret, GitHubWebhookSecret, the bot token,
+// each required once its surface or axis is on, never defaulted): this
+// credential's own consumers (the freshness pump's per-repo tip-SHA
+// resolution, app/imagebuild.Builder's
 // claim-time SHA resolution for a repo-bearing row) are explicitly
 // designed to degrade cleanly on its absence rather than treat a missing
 // value as a boot-time configuration error: a missing/invalid credential
@@ -545,8 +662,8 @@ const gitHubBotTokenEnvVarName = "NARVI_GITHUB_BOT_TOKEN"
 // own "always fall back to base image on any miss" invariant,
 // unaffected).
 //
-// How this differs from GitHubBotToken (see that field's own doc comment
-// for its full reasoning): GitHubBotToken is a REQUIRED, already-used,
+// How this differs from the bot token (gitHubBotTokenEnvVarName's own doc
+// comment has its full reasoning): the bot token is a REQUIRED, already-used,
 // operator-provisioned-once credential backing a real GitHub identity
 // (posting PR comments as a bot, resolving a webhook mention's true PR)
 // -- its own doc comment describes it as "a real GitHub personal access
@@ -556,11 +673,11 @@ const gitHubBotTokenEnvVarName = "NARVI_GITHUB_BOT_TOKEN"
 // GitHubImageBuildToken is a DIFFERENT, NEW, distinct credential for a
 // completely different purpose (read-only tip-SHA resolution for a
 // session-creator-independent background pump, not comment-posting or
-// PR-lookup identity) -- reusing GitHubBotToken here would conflate two
+// PR-lookup identity) -- reusing the bot token here would conflate two
 // unrelated rotation/scoping boundaries the whole point of "separate
 // secrets per direction" (§5.2) argues against, and would make this
 // pump's own failure mode (a missing/invalid credential) impossible to
-// diagnose independently of GitHubBotToken's own, unrelated consumers.
+// diagnose independently of the bot token's own, unrelated consumers.
 // Plain string, same shape as every other token this file reads (a real
 // GitHub personal access token or a GitHub App installation token,
 // whichever the deploying operator provisions) -- never logged anywhere.
@@ -1420,7 +1537,7 @@ func canonicalOTLPEndpointURL(raw string) (string, error) {
 // + private key in platform.Config, fail-fast validation) -- read from
 // NARVI_GITHUB_APP_ID / NARVI_GITHUB_APP_PRIVATE_KEY. Both required in every
 // stage -- never defaulted, matching every other "never a baked-in default"
-// secret this file already reads (GitHubBotToken, TokenEncryptionKey, the 3
+// secret this file already reads (the bot token, TokenEncryptionKey, the 3
 // HMAC secrets).
 //
 // Required rather than optional (unlike GitHubImageBuildToken, this file's
@@ -1638,8 +1755,8 @@ type Config struct {
 	// A surface absent from this map (Go's own zero value for a missing
 	// key: false) is not mounted anywhere in controlplane/serve.go's own
 	// wiring -- no webhook route, no outbox notifier registered for any of
-	// its kinds -- and Load never enforces that surface's own credential
-	// env vars. A surface present with value true has its own full
+	// its kinds (GitHub's notifiers follow GitHubOutbound instead) -- and
+	// Load never enforces that surface's own credential env vars. A surface present with value true has its own full
 	// credential set enforced exactly as every ingress surface always has
 	// been (a *MissingRequiredEnvError on anything missing). Load never
 	// stores an explicit false entry -- checking IngressEnabled[p] on a
@@ -1693,9 +1810,12 @@ type Config struct {
 	// GitHubWebhookSecret and GitHubBotHandle configure §8.2's
 	// ("GitHub ingress", §8.2) webhook adapter, read from
 	// NARVI_GITHUB_WEBHOOK_SECRET / NARVI_GITHUB_BOT_HANDLE. Both required
-	// in every stage -- never defaulted. See gitHubWebhookSecretEnvVarName's
-	// own doc comment above for why GitHubWebhookSecret is a DISTINCT
-	// secret from HMACWebhookSecret.
+	// in every stage while GitHub ingress is on -- never defaulted. See
+	// gitHubWebhookSecretEnvVarName's own doc comment above for why
+	// GitHubWebhookSecret is a DISTINCT secret from HMACWebhookSecret.
+	// GitHubBotHandle is "" whenever GitHub ingress is off, whatever the
+	// variable says (§12.5): it names a mention only the webhook listens
+	// for, and reviewpost.RerunGuidance keys its button-only sentence on it.
 	GitHubWebhookSecret string
 	GitHubBotHandle     string
 
@@ -1716,22 +1836,23 @@ type Config struct {
 	GitHubReleaseLabel         string
 	GitHubReleaseBranchPattern string
 
-	// GitHubBotToken configures §5.1's ("outbox delivery", §5.1) own
-	// GitHub Notifier adapter, read from NARVI_GITHUB_BOT_TOKEN. Required
-	// in every stage -- never defaulted. See gitHubBotTokenEnvVarName's own
-	// doc comment above for why this is a distinct credential from every
-	// other GitHub-flavored value in this struct -- and, since batch
-	// fix/audit-github-pr-payload-correctness (H5 audit fix), also for
-	// GitHub ingress's own GetPullRequest call (cmd/control-plane/main.go's
-	// githubingress.Config.BotToken). Never logged.
-	GitHubBotToken string
+	// GitHubOutbound is §12.5's GitHub outbound axis (NARVI_OUTBOUND_ENABLED,
+	// outboundEnabledEnvVarName's own doc comment): nil exactly when this
+	// deployment does not call GitHub as its bot, otherwise the typed
+	// holder of NARVI_GITHUB_BOT_TOKEN. There is deliberately no string
+	// field for the bot token on this struct: every consumer takes this
+	// pointer, a consumer that only makes sense with outbound refuses nil
+	// in its constructor, and one that can degrade treats nil as its
+	// degraded path without making the call. Mirrors ObjectStorage's
+	// "nil means the feature is off" shape.
+	GitHubOutbound *GitHubOutboundConfig
 
 	// GitHubImageBuildToken is §19.2's ("warm boot: refresh pump + hook
 	// policy", §19.2) own platform-level GitHub credential, read from
 	// NARVI_GITHUB_IMAGE_BUILD_TOKEN. Empty string means "not configured" --
 	// see gitHubImageBuildTokenEnvVarName's own doc comment for why this,
 	// uniquely among this struct's GitHub-flavored fields, is deliberately
-	// OPTIONAL and how it differs from GitHubBotToken. Never logged.
+	// OPTIONAL and how it differs from the bot token. Never logged.
 	GitHubImageBuildToken string
 
 	// ReviewModelDeep is §26.3's own optional deep-path model override,
@@ -2118,6 +2239,85 @@ type ObjectStorageConfig struct {
 	MaxSessionUploadBytes int64
 }
 
+// GitHubOutboundConfig is §12.5's GitHub outbound axis: the one form in
+// which the bot credential (NARVI_GITHUB_BOT_TOKEN) reaches any consumer.
+// Config.GitHubOutbound is nil exactly when the axis is off.
+//
+// The token is an unexported field, so a value outside this package can
+// only come from NewGitHubOutboundConfig (which refuses an empty token) or
+// be copied from one that did; internal/ops's outbound guard additionally
+// fails the suite if the type is ever named outside this package other
+// than behind a pointer (no composite literal, no new(), no value
+// variable), and if the constructors are called from non-test code
+// outside it -- Load is the only production caller.
+//
+// Consumers depend on this type rather than on the token, so a later
+// purpose-scoped publication credential (§44.5's publish App) can be added
+// here without touching them.
+type GitHubOutboundConfig struct {
+	botToken string
+}
+
+// ErrGitHubOutboundRequired is what RequireGitHubOutbound wraps: a consumer
+// that only makes sense with GitHub outbound was handed none.
+var ErrGitHubOutboundRequired = errors.New("GitHub outbound is off (" + outboundEnabledEnvVarName + "), and this consumer calls GitHub as the bot")
+
+// errEmptyGitHubBotToken is NewGitHubOutboundConfig's refusal.
+var errEmptyGitHubBotToken = errors.New("platform: GitHub outbound needs a non-empty bot token")
+
+// NewGitHubOutboundConfig builds the GitHub outbound axis around botToken,
+// refusing an empty one -- rule R4 is this refusal. Load is its only
+// production caller.
+func NewGitHubOutboundConfig(botToken string) (*GitHubOutboundConfig, error) {
+	if botToken == "" {
+		return nil, errEmptyGitHubBotToken
+	}
+	return &GitHubOutboundConfig{botToken: botToken}, nil
+}
+
+// MustNewGitHubOutboundConfig is NewGitHubOutboundConfig for tests: it
+// panics on an empty token. internal/ops's outbound guard refuses it in
+// non-test code.
+func MustNewGitHubOutboundConfig(botToken string) *GitHubOutboundConfig {
+	c, err := NewGitHubOutboundConfig(botToken)
+	if err != nil {
+		panic(err)
+	}
+	return c
+}
+
+// BotToken returns the bot credential. Deliberately not nil-safe: a
+// consumer that calls it on a nil config forgot its nil check, and a panic
+// is the loud failure an "Authorization: Bearer " with nothing after it
+// never was.
+func (c *GitHubOutboundConfig) BotToken() string {
+	return c.botToken
+}
+
+// String keeps the token out of any %v/%+v rendering of the config.
+func (c *GitHubOutboundConfig) String() string {
+	if c == nil {
+		return "GitHubOutboundConfig(off)"
+	}
+	return "GitHubOutboundConfig(bot token: [redacted])"
+}
+
+// GoString keeps the token out of %#v too.
+func (c *GitHubOutboundConfig) GoString() string {
+	return c.String()
+}
+
+// RequireGitHubOutbound is the one refusal every required-class outbound
+// consumer's constructor makes: nil (or a zero value, which nothing
+// outside this package can build) is an error wrapping
+// ErrGitHubOutboundRequired, named for consumer.
+func RequireGitHubOutbound(c *GitHubOutboundConfig, consumer string) error {
+	if c == nil || c.botToken == "" {
+		return fmt.Errorf("%s: %w", consumer, ErrGitHubOutboundRequired)
+	}
+	return nil
+}
+
 // Load reads process configuration and validates it fail-fast, returning
 // named, structured errors (joined via errors.Join when more than one
 // check fails) instead of letting an invalid config boot silently. Callers
@@ -2220,15 +2420,71 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		integrations.ProviderLinear: true,
 		integrations.ProviderGitHub: true,
 	}
+	ingressValid := true
 	if rawIngressEnabled, isSet := lookupEnv(ingressEnabledEnvVarName); isSet {
 		ingressEnabled = make(map[integrations.Provider]bool, len(integrations.Providers))
 		for _, entry := range parseCommaSeparatedList(rawIngressEnabled) {
 			p, ok := integrations.ParseProvider(entry)
 			if !ok {
 				errs = append(errs, &InvalidIngressEnabledError{Value: entry})
+				ingressValid = false
 				continue
 			}
 			ingressEnabled[p] = true
+		}
+	}
+
+	// githubOutbound (§12.5's outbound axis, outboundEnabledEnvVarName's own
+	// doc comment): resolved right after ingress, since unset follows it
+	// when -- and only when -- GitHub ingress is on. outboundDeclared is
+	// false only when the variable is unset and GitHub ingress is off, where
+	// the axis is unknown: nothing keyed on it (R3, R4, R6) is evaluated.
+	// That is rule R1, and UndeclaredOutboundError is then reported alone --
+	// unless NARVI_INGRESS_ENABLED itself carried an invalid entry, in which
+	// case whether it "excludes github" is not known either (a mistyped
+	// "GitHub" is not an exclusion), and InvalidIngressEnabledError is the
+	// one error to act on.
+	githubIngress := ingressEnabled[integrations.ProviderGitHub]
+	outboundEnabled := map[integrations.Provider]bool{}
+	outboundDeclared := true
+	outboundRequiredBy := "GitHub outbound is enabled (" + outboundEnabledEnvVarName + ")"
+	if rawOutboundEnabled, isSet := lookupEnv(outboundEnabledEnvVarName); isSet {
+		for _, entry := range parseCommaSeparatedList(rawOutboundEnabled) {
+			p, ok := integrations.ParseOutboundProvider(entry)
+			if !ok {
+				errs = append(errs, &InvalidOutboundEnabledError{Value: entry})
+				continue
+			}
+			outboundEnabled[p] = true
+		}
+	} else if githubIngress {
+		outboundEnabled[integrations.ProviderGitHub] = true
+		outboundRequiredBy = "GitHub outbound is enabled (" + outboundEnabledEnvVarName + " is unset, which means github while GitHub ingress is on)"
+	} else {
+		outboundDeclared = false
+		if ingressValid {
+			errs = append(errs, &UndeclaredOutboundError{})
+		}
+	}
+	githubOutbound := outboundEnabled[integrations.ProviderGitHub]
+	if githubIngress && outboundDeclared && !githubOutbound {
+		errs = append(errs, &GitHubIngressRequiresOutboundError{})
+	}
+
+	// The bot token is required exactly when GitHub outbound is on (R4),
+	// and ignored -- never stored -- when it is off (R5), the way a
+	// disabled ingress surface's secrets are. NewGitHubOutboundConfig's
+	// refusal of an empty token IS the requirement.
+	var gitHubOutbound *GitHubOutboundConfig
+	if githubOutbound {
+		outboundConfig, outboundErr := NewGitHubOutboundConfig(getenv(gitHubBotTokenEnvVarName))
+		if outboundErr != nil {
+			errs = append(errs, &MissingRequiredEnvError{
+				EnvVar:     gitHubBotTokenEnvVarName,
+				RequiredBy: outboundRequiredBy,
+			})
+		} else {
+			gitHubOutbound = outboundConfig
 		}
 	}
 
@@ -2293,22 +2549,32 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		errs = append(errs, &InvalidOIDCConfigError{})
 	}
 
-	// WebhookSecret/BotHandle/BotToken (below) are required ONLY when
-	// GitHub ingress is enabled (ingressEnabled[integrations.ProviderGitHub]
-	// -- ingressEnabledEnvVarName's own doc comment, §12.5). A deployment
-	// that never enables GitHub ingress still reads whatever value happens
-	// to be set (never validated), but Config.IngressEnabled -- not this
-	// pair's own non-empty-ness -- is what every consumer downstream
+	// WebhookSecret/BotHandle (below) are required ONLY when GitHub ingress
+	// is enabled (ingressEnabled[integrations.ProviderGitHub] --
+	// ingressEnabledEnvVarName's own doc comment, §12.5). A deployment that
+	// never enables GitHub ingress still reads whatever value happens to be
+	// set (never validated), but Config.IngressEnabled -- not this pair's
+	// own non-empty-ness -- is what every consumer downstream
 	// (controlplane/serve.go's route mounting, httpapi.
-	// configuredForProvider) actually gates on.
+	// configuredForProvider) actually gates on. The bot token is not part
+	// of this set: it belongs to the outbound axis, resolved above.
 	gitHubWebhookSecret := getenv(gitHubWebhookSecretEnvVarName)
 	if ingressEnabled[integrations.ProviderGitHub] && gitHubWebhookSecret == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubWebhookSecretEnvVarName})
 	}
 
+	// The bot handle is stored only while GitHub ingress is on. It names the
+	// mention only the webhook listens for, so with ingress off a set value
+	// is ignored, never stored -- the way R5 treats the bot token -- and the
+	// re-run guidance a posted verdict carries (reviewpost.RerunGuidance)
+	// then points at the web button alone rather than at a mention nothing
+	// would act on.
 	gitHubBotHandle := getenv(gitHubBotHandleEnvVarName)
 	if ingressEnabled[integrations.ProviderGitHub] && gitHubBotHandle == "" {
 		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubBotHandleEnvVarName})
+	}
+	if !ingressEnabled[integrations.ProviderGitHub] {
+		gitHubBotHandle = ""
 	}
 
 	// gitHubReReviewLabel is DELIBERATELY OPTIONAL -- see its own env-var
@@ -2330,11 +2596,6 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 	gitHubReleaseBranchPattern := getenv(gitHubReleaseBranchPatternEnvVarName)
 	if gitHubReleaseBranchPattern == "" {
 		gitHubReleaseBranchPattern = defaultGitHubReleaseBranchPattern
-	}
-
-	gitHubBotToken := getenv(gitHubBotTokenEnvVarName)
-	if ingressEnabled[integrations.ProviderGitHub] && gitHubBotToken == "" {
-		errs = append(errs, &MissingRequiredEnvError{EnvVar: gitHubBotTokenEnvVarName})
 	}
 
 	// gitHubImageBuildToken is DELIBERATELY OPTIONAL -- see its own env-var
@@ -2521,15 +2782,15 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 
 	// rwxAccessToken is optional -- see its own env-var-name doc comment
 	// above. No MissingRequiredEnvError is ever appended for it. But
-	// RWXPreviewsRequireGitHubIngressError's own doc comment: setting it
-	// while GitHub ingress is disabled is rejected outright, not silently
-	// accepted -- the combination can never work (githubPreviewLinkNotifier
-	// needs cfg.GitHubBotToken, which is only ever populated when GitHub
-	// ingress is enabled), and both halves of the check are plain env vars
-	// with no I/O, so Load is where it belongs.
+	// RWXPreviewsRequireGitHubOutboundError's own doc comment (rule R6):
+	// setting it while GitHub outbound is off is rejected outright, not
+	// silently accepted -- the combination can never work (the preview link
+	// is a commit status posted as the bot), and both halves of the check
+	// are plain env vars with no I/O, so Load is where it belongs. Not
+	// evaluated while the axis is undeclared (R1 is reported alone).
 	rwxAccessToken := getenv(rwxAccessTokenEnvVarName)
-	if rwxAccessToken != "" && !ingressEnabled[integrations.ProviderGitHub] {
-		errs = append(errs, &RWXPreviewsRequireGitHubIngressError{})
+	if rwxAccessToken != "" && outboundDeclared && !githubOutbound {
+		errs = append(errs, &RWXPreviewsRequireGitHubOutboundError{})
 	}
 
 	openCodeRuntimeVersion := getenv(openCodeRuntimeVersionEnvVarName)
@@ -2750,7 +3011,7 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		GitHubReReviewLabel:        gitHubReReviewLabel,
 		GitHubReleaseLabel:         gitHubReleaseLabel,
 		GitHubReleaseBranchPattern: gitHubReleaseBranchPattern,
-		GitHubBotToken:             gitHubBotToken,
+		GitHubOutbound:             gitHubOutbound,
 		GitHubImageBuildToken:      gitHubImageBuildToken,
 		ReviewModelDeep:            reviewModelDeep,
 		PublicBaseURL:              publicBaseURL,

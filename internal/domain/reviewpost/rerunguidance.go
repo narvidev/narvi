@@ -40,7 +40,20 @@ import "fmt"
 // (alnum/"_"/"."/"-"/"/"); an ordinary space on both sides is always a
 // safe, unambiguous boundary, avoiding any dependency on exactly which
 // punctuation happens to be adjacent.
+//
+// # An empty handle renders the button-only sentence
+//
+// platform.Load stores the bot handle only while GitHub ingress is on
+// (§12.5), and GitHub ingress is the only thing that listens for either the
+// mention or the re-review label. A verdict is posted whenever GitHub
+// OUTBOUND is on, so a deployment that posts reviews without mounting the
+// webhook has an empty handle here, and nothing on GitHub it could point
+// at: it gets the web review screen's "Re-run review" button alone -- never
+// "comment @ review", and never the label either.
 func RerunGuidance(botHandle string) string {
+	if botHandle == "" {
+		return "To ask for another review after pushing changes, use the Re-run review button on this pull request's review in Narvi."
+	}
 	return fmt.Sprintf(
 		"To ask for another review after pushing changes, comment @%s review on this pull request (or use this deployment's configured re-review label/button).",
 		botHandle,

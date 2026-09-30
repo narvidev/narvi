@@ -196,11 +196,14 @@ func TestGitHubIntegration_WorkerPumpOnce_ClaimsPendingCheckAndEnqueuesOutboxRow
 		{Number: 201, Title: "fix: something", HasApprovingReview: true, CIConclusionAtMergeSHA: ports.CIConclusionSuccess},
 		{Number: 202, Title: "feat: another thing", HasApprovingReview: false},
 	}}
-	worker := releasereview.NewWorker(pendingStore, releasereview.Deps{
+	worker, workerErr := releasereview.NewWorker(pendingStore, releasereview.Deps{
 		SourceControl: sourceControl,
 		Outbox:        outboxStore,
 		Timeouts:      platform.DefaultTimeouts(),
-	}, "gho_bottoken", platform.DefaultTimeouts())
+	}, platform.MustNewGitHubOutboundConfig("gho_bottoken"), platform.DefaultTimeouts())
+	if workerErr != nil {
+		t.Fatalf("releasereview.NewWorker: %v", workerErr)
+	}
 
 	if err := worker.PumpOnce(ctx); err != nil {
 		t.Fatalf("Worker.PumpOnce() error = %v", err)
@@ -326,11 +329,14 @@ func TestGitHubIntegration_WorkerPumpOnce_ConcurrentPodsNeverDoubleProcess(t *te
 	}
 
 	sourceControl := &fakeReleaseManifestSourceControl{}
-	worker := releasereview.NewWorker(pendingStore, releasereview.Deps{
+	worker, workerErr := releasereview.NewWorker(pendingStore, releasereview.Deps{
 		SourceControl: sourceControl,
 		Outbox:        outboxStore,
 		Timeouts:      platform.DefaultTimeouts(),
-	}, "gho_bottoken", platform.DefaultTimeouts())
+	}, platform.MustNewGitHubOutboundConfig("gho_bottoken"), platform.DefaultTimeouts())
+	if workerErr != nil {
+		t.Fatalf("releasereview.NewWorker: %v", workerErr)
+	}
 
 	const numConcurrentPods = 4
 	var wg sync.WaitGroup

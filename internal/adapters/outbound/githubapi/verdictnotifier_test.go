@@ -12,6 +12,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 type capturedRequest struct {
@@ -67,7 +68,7 @@ func TestVerdictNotifier_Deliver_SubmitsReviewAndSyncsLabels(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := githubapi.NewVerdictNotifier(adapter, "baked-in-bot-token")
+	notifier := mustBuild(githubapi.NewVerdictNotifier(adapter, platform.MustNewGitHubOutboundConfig("baked-in-bot-token")))
 
 	payload, err := json.Marshal(githubapi.VerdictPayload{
 		Owner:     "acme",
@@ -148,7 +149,7 @@ func TestVerdictNotifier_Deliver_ReviewFailure_NeverSyncsLabels(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := githubapi.NewVerdictNotifier(adapter, "baked-in-bot-token")
+	notifier := mustBuild(githubapi.NewVerdictNotifier(adapter, platform.MustNewGitHubOutboundConfig("baked-in-bot-token")))
 
 	payload, err := json.Marshal(githubapi.VerdictPayload{
 		Owner:     "acme",
@@ -201,7 +202,7 @@ func TestVerdictNotifier_Deliver_EmptyRiskLevel_SkipsLabelSync(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := githubapi.NewVerdictNotifier(adapter, "baked-in-bot-token")
+	notifier := mustBuild(githubapi.NewVerdictNotifier(adapter, platform.MustNewGitHubOutboundConfig("baked-in-bot-token")))
 
 	payload, err := json.Marshal(githubapi.VerdictPayload{
 		Owner:    "acme",
@@ -237,7 +238,7 @@ func TestVerdictNotifier_Deliver_InvalidPayload(t *testing.T) {
 	t.Parallel()
 
 	adapter := githubapi.New(http.DefaultClient, "http://unused.invalid")
-	notifier := githubapi.NewVerdictNotifier(adapter, "bot-token")
+	notifier := mustBuild(githubapi.NewVerdictNotifier(adapter, platform.MustNewGitHubOutboundConfig("bot-token")))
 
 	err := notifier.Deliver(context.Background(), ports.Notification{
 		Kind:    ports.NotificationKindGitHubVerdict,

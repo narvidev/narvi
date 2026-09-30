@@ -52,7 +52,17 @@ correct — this is specifically an *outbound-channel* symptom.
    token or webhook credential; a sustained 5xx means the third-party API
    itself is degraded (exactly §9.3 scenario #9's own scripted case,
    below); a 4xx on every attempt for one channel and not others narrows
-   it to that channel's own credential or payload.
+   it to that channel's own credential or payload. **A `last_error` of
+   `no notifier registered for kind "..."` is not a delivery failure at
+   all** but a kind this deployment does not deliver: for a `github_*`,
+   `sentinel_auto_fix`, `handoff_sentinel` or `release_manifest` row it
+   means GitHub outbound is off (`NARVI_OUTBOUND_ENABLED` without
+   `github` -- the boot log's `narvi control-plane: GitHub axes` line says
+   `outbound=false`; `docs/TECHNICAL_PLAN.md` §12.5), so nothing will
+   ever post it. Either the deployment is meant to post as the bot --
+   declare `NARVI_OUTBOUND_ENABLED=github` with a real
+   `NARVI_GITHUB_BOT_TOKEN` and restart -- or the rows are expected
+   leftovers of a surface it deliberately does not call.
 2. **A transient third-party outage self-heals.** `domain/outbox.
    EvaluateBackoff`'s own schedule keeps retrying (`OutboxBackoffBase` 30s
    up to `OutboxBackoffMax` 5m, `internal/platform/timeouts.go`) until

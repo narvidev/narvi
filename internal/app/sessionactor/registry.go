@@ -299,20 +299,22 @@ type Registry struct {
 	// session's own fingerprint shares that one (test-only) value.
 	openCodeRuntimeVersion string
 
-	// githubBotToken is §8.2's ("sentinels + suggestions", §17.2) own
+	// githubOutbound is §8.2's ("sentinels + suggestions", §17.2) own
 	// addition, threaded through to every Actor this Registry hydrates
 	// exactly like the fields above: pushpr.go's own
 	// createSentinelFixPRBestEffort uses this SAME static bot credential
-	// (platform.Config.GitHubBotToken -- the identical one internal/
-	// adapters/outbound/githubapi.BotNotifier/VerdictNotifier already
-	// authenticate with) to open the fix PR, since a sentinel-auto-fix
+	// (platform.Config.GitHubOutbound, §12.5's GitHub outbound axis -- the
+	// identical one internal/adapters/outbound/githubapi.BotNotifier/
+	// VerdictNotifier already authenticate with) to open the fix PR, since a sentinel-auto-fix
 	// child session has NO human creator of its own to decrypt an OAuth
 	// token FOR (sessionRow.CreatedBy is invalid/NULL, SpawnChildSession's
 	// own doc comment) -- the fix PR is a system-initiated action,
 	// bot-attributed by design, mirroring §17.4's own "system-initiated,
-	// not a delegated human one" framing for the eventual merge. May be
-	// empty (tests that never exercise the sentinel-fix PR path).
-	githubBotToken string
+	// not a delegated human one" framing for the eventual merge. Nil when
+	// GitHub outbound is off (and in tests that never exercise the
+	// sentinel-fix PR path): every reader treats nil as its degraded path
+	// and makes no call.
+	githubOutbound *platform.GitHubOutboundConfig
 
 	// reviewModelDeep is §26.3's own addition (§26.3) -- see
 	// RegistryOptions.ReviewModelDeep's own doc comment.
@@ -374,9 +376,10 @@ type Registry struct {
 	// (§24.6) embeds reviewpost.RerunGuidance(botHandle), the SAME
 	// server-side, deterministic re-run phrasing every OTHER posted
 	// verdict already carries (§5.2), which needs this handle to render
-	// an "@botHandle review" mention. May be empty (tests that never
-	// exercise the budget-exhausted notice path) -- RerunGuidance("")
-	// still renders a (degenerate but harmless) string.
+	// an "@botHandle review" mention. May be empty (GitHub ingress off,
+	// §12.5, or a test that never exercises the budget-exhausted notice
+	// path) -- RerunGuidance("") then points at the web Re-run review
+	// button alone, with no mention and no label.
 	githubBotHandle string
 
 	// contractDriftDetected is §14.3's ("mocking + contract drift", §14.3)
@@ -495,7 +498,7 @@ type Registry struct {
 // construction errors today (cmd/control-plane/main.go).
 //
 // opts is a trailing variadic of RegistryOptions (§8.2's own
-// githubBotToken started this "one small options struct, not more
+// bot token started this "one small options struct, not more
 // positional parameters" pattern as a bare `...string`; §24 widens it
 // into a real struct since it needs to add two further optional fields
 // of DIFFERENT types) -- every real caller passes at most one; only the
@@ -560,7 +563,7 @@ func NewRegistry(
 		reviewDiffFetcher:      opt.ReviewDiffFetcher,
 		knowledgeRanker:        opt.KnowledgeRanker,
 		githubBotHandle:        opt.GitHubBotHandle,
-		githubBotToken:         opt.GitHubBotToken,
+		githubOutbound:         opt.GitHubOutbound,
 		reviewModelDeep:        opt.ReviewModelDeep,
 		rolloutMode:            opt.RolloutMode,
 		contractDriftDetected:  contractDriftDetected,
@@ -579,12 +582,15 @@ func NewRegistry(
 // this is a trailing variadic struct rather than more required
 // positional parameters.
 type RegistryOptions struct {
-	// GitHubBotToken is §8.2's ("sentinels + suggestions", §17.2) own
-	// addition: the SAME static bot credential (platform.Config.
-	// GitHubBotToken) pushpr.go's own createSentinelFixPRBestEffort uses
-	// to open a sentinel-auto-fix child session's own fix PR. May be
-	// empty (tests that never exercise the sentinel-fix PR path).
-	GitHubBotToken string
+	// GitHubOutbound is §8.2's ("sentinels + suggestions", §17.2) own
+	// addition: §12.5's GitHub outbound axis (platform.Config.
+	// GitHubOutbound), whose bot credential pushpr.go's own
+	// createSentinelFixPRBestEffort uses to open a sentinel-auto-fix child
+	// session's own fix PR, and reviewretrigger.go's automatic re-review
+	// uses to read the pull request. May be nil -- GitHub outbound off, or
+	// a test that never exercises either path -- and nil makes both skip
+	// their GitHub call entirely.
+	GitHubOutbound *platform.GitHubOutboundConfig
 	// GitHubBotHandle is §24's own addition -- see Registry.
 	// githubBotHandle's own doc comment.
 	GitHubBotHandle string
@@ -624,7 +630,7 @@ type RegistryOptions struct {
 	// value in this registry's own ~50 existing test call sites is
 	// therefore indistinguishable from those tests running against an
 	// ordinary open-mode deployment, not a silently-disabled gate --
-	// mirroring GitHubBotToken/ReviewModelDeep's own identical "safe to
+	// mirroring GitHubOutbound/ReviewModelDeep's own identical "safe to
 	// default, so it belongs here, not on every call site" reasoning
 	// immediately above. Production wiring (cmd/control-plane/main.go)
 	// is this field's one real, non-test caller, and passes the actual
@@ -892,6 +898,16 @@ func (r *Registry) evict(sessionID pgtype.UUID, a *Actor) {
 		r.opsMetrics.addActorsLive(context.Background(), -1)
 	}
 	r.mu.Unlock()
+}
+
+// HasGitHubOutbound reports whether this Registry's actors were handed
+// §12.5's GitHub outbound axis (RegistryOptions.GitHubOutbound). It exists
+// for composition-root tests (controlplane's Build), mirroring
+// outboxworker.Builder.HasNotifier: the actor's two uses of the axis -- the
+// automatic re-review's context and the sentinel fix PR -- are otherwise
+// reachable only through a timer or a spawned fix session.
+func (r *Registry) HasGitHubOutbound() bool {
+	return r.githubOutbound != nil
 }
 
 // Shutdown cancels every live actor's run loop (each releases its

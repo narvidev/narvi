@@ -92,7 +92,7 @@ func TestHandleSandboxEvent_PushComplete_SentinelFixPR_BaseIsOriginHeadBranch_Ne
 		defaultBranchName: wantRepoDefaultBranch,
 	}
 
-	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false, RegistryOptions{GitHubBotToken: wantBotToken})
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false, RegistryOptions{GitHubOutbound: platform.MustNewGitHubOutboundConfig(wantBotToken)})
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
@@ -213,7 +213,7 @@ func TestHandleSandboxEvent_PushComplete_SentinelFixPR_HonorsFrozenShadowStamp(t
 		nextRef:           ports.PRRef{Number: 99, URL: "https://github.com/acme/sentinel-frozen/pull/99"},
 		defaultBranchName: "main",
 	}
-	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false, RegistryOptions{GitHubBotToken: "bot-static-token"})
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", sourceControl, testTokenEncryptionKey, "", nil, false, RegistryOptions{GitHubOutbound: platform.MustNewGitHubOutboundConfig("bot-static-token")})
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}

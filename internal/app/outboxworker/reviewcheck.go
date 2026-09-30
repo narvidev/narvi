@@ -46,7 +46,7 @@ type reviewCheckNotifier struct {
 	pool     *pgxpool.Pool
 	store    *postgres.ReviewCheckRunStore
 	adapter  *githubapi.Adapter
-	botToken string
+	outbound *platform.GitHubOutboundConfig
 	// writerAppID (finding A2) is this deployment's own SELF-OBSERVED
 	// writer App id -- the second half of "select by SHA and GitHub
 	// App": a recovery list-check-runs read (below) adopts only a check
@@ -58,8 +58,8 @@ type reviewCheckNotifier struct {
 	// OWN, entirely separate GitHub App: the read-only installation-
 	// token-minting credential internal/adapters/outbound/githubapp.
 	// Client uses for shadow-mode substitution, never the credential
-	// n.botToken actually carries. A deployment's bot token is
-	// documented (platform.Config's own GitHubBotToken doc comment) as
+	// n.outbound actually carries. A deployment's bot token is
+	// documented (platform's own gitHubBotTokenEnvVarName doc comment) as
 	// "a real GitHub personal access token OR a GitHub App installation
 	// token, whichever the deploying operator provisions" -- there is no
 	// config field anywhere in this codebase naming THAT credential's
@@ -139,9 +139,14 @@ type reviewCheckNotifier struct {
 }
 
 // NewReviewCheckNotifier builds a ports.Notifier for
-// ports.NotificationKindGitHubReviewCheck.
-func NewReviewCheckNotifier(pool *pgxpool.Pool, store *postgres.ReviewCheckRunStore, adapter *githubapi.Adapter, botToken string) ports.Notifier {
-	return &reviewCheckNotifier{pool: pool, store: store, adapter: adapter, botToken: botToken}
+// ports.NotificationKindGitHubReviewCheck. outbound must be non-nil: the
+// check run is written as the bot, so the notifier refuses to exist with
+// GitHub outbound off (§12.5).
+func NewReviewCheckNotifier(pool *pgxpool.Pool, store *postgres.ReviewCheckRunStore, adapter *githubapi.Adapter, outbound *platform.GitHubOutboundConfig) (ports.Notifier, error) {
+	if err := platform.RequireGitHubOutbound(outbound, "outboxworker: new review check notifier"); err != nil {
+		return nil, err
+	}
+	return &reviewCheckNotifier{pool: pool, store: store, adapter: adapter, outbound: outbound}, nil
 }
 
 var _ ports.Notifier = (*reviewCheckNotifier)(nil)
@@ -372,7 +377,7 @@ func (n *reviewCheckNotifier) Deliver(ctx context.Context, notification ports.No
 	output := reviewcheck.ComputeOutputWithReason(candidate.Phase, reviewcheck.NotAssessedReason(payload.NotAssessedReason))
 
 	if existingExternalID != nil {
-		if err := n.adapter.UpdateCheckRun(ctx, payload.Owner, payload.Repo, n.botToken, *existingExternalID, string(output.Status), string(output.Conclusion), output.Title, output.Summary); err != nil {
+		if err := n.adapter.UpdateCheckRun(ctx, payload.Owner, payload.Repo, n.outbound.BotToken(), *existingExternalID, string(output.Status), string(output.Conclusion), output.Title, output.Summary); err != nil {
 			return n.classifyAndWrap(logger, "update", err)
 		}
 		// finding A3: this call had no Postgres transaction open across
@@ -552,7 +557,7 @@ func (n *reviewCheckNotifier) Deliver(ctx context.Context, notification ports.No
 // state (classifyAndWrap's own doc comment).
 func (n *reviewCheckNotifier) resolveOrCreateCheckRun(ctx context.Context, logger *slog.Logger, owner, repo, headSHA string, prNumber int32, output reviewcheck.Output) (int64, error) {
 	prExternalID := reviewcheck.PRExternalID(prNumber)
-	existing, err := n.adapter.ListCheckRunsForRef(ctx, owner, repo, headSHA, n.botToken)
+	existing, err := n.adapter.ListCheckRunsForRef(ctx, owner, repo, headSHA, n.outbound.BotToken())
 	if err != nil {
 		return 0, n.classifyAndWrap(logger, "list", err)
 	}
@@ -566,14 +571,14 @@ func (n *reviewCheckNotifier) resolveOrCreateCheckRun(ctx context.Context, logge
 	if observedAppID != 0 {
 		for _, run := range existing {
 			if run.Name == reviewcheck.CheckName && run.AppID == observedAppID && run.HeadSHA == headSHA && run.Status != string(reviewcheck.StatusCompleted) && run.ExternalID == prExternalID {
-				if err := n.adapter.UpdateCheckRun(ctx, owner, repo, n.botToken, run.ID, string(output.Status), string(output.Conclusion), output.Title, output.Summary); err != nil {
+				if err := n.adapter.UpdateCheckRun(ctx, owner, repo, n.outbound.BotToken(), run.ID, string(output.Status), string(output.Conclusion), output.Title, output.Summary); err != nil {
 					return 0, n.classifyAndWrap(logger, "adopt", err)
 				}
 				return run.ID, nil
 			}
 		}
 	}
-	id, appID, err := n.adapter.CreateCheckRun(ctx, owner, repo, n.botToken, headSHA, reviewcheck.CheckName, string(output.Status), string(output.Conclusion), output.Title, output.Summary, prExternalID)
+	id, appID, err := n.adapter.CreateCheckRun(ctx, owner, repo, n.outbound.BotToken(), headSHA, reviewcheck.CheckName, string(output.Status), string(output.Conclusion), output.Title, output.Summary, prExternalID)
 	if err != nil {
 		return 0, n.classifyAndWrap(logger, "create", err)
 	}
@@ -702,7 +707,7 @@ func (n *reviewCheckNotifier) guardAgainstSupersessionDuringCall(ctx context.Con
 	// superseded this one carries its own reason, if any, on its own
 	// delivery.
 	correctedOutput := reviewcheck.ComputeOutput(current.Phase)
-	if err := n.adapter.UpdateCheckRun(ctx, owner, repo, n.botToken, externalID, string(correctedOutput.Status), string(correctedOutput.Conclusion), correctedOutput.Title, correctedOutput.Summary); err != nil {
+	if err := n.adapter.UpdateCheckRun(ctx, owner, repo, n.outbound.BotToken(), externalID, string(correctedOutput.Status), string(correctedOutput.Conclusion), correctedOutput.Title, correctedOutput.Summary); err != nil {
 		logger.Warn("outboxworker: reviewCheckNotifier: self-correction PATCH failed; the check run may still show stale output until a future emission republishes it", "repo", repoFullName, "pr_number", prNumber, "error", err)
 	}
 }

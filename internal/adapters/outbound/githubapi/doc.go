@@ -38,7 +38,7 @@
 // call -- GitHub's Issues API, which a pull request is itself always
 // addressable through) plus BotNotifier, a small sibling type (notifier.go)
 // implementing ports.Notifier by calling PostIssueComment with a single,
-// statically-configured bot credential (platform.Config.GitHubBotToken)
+// statically-configured bot credential (platform.Config.GitHubOutbound)
 // baked in at construction time -- deliberately NOT Adapter itself: every
 // existing Adapter method (CreatePR/ResolveBranchSHA/
 // ResolveContractsFingerprint) is authenticated PER-CALL with a
@@ -58,7 +58,7 @@
 // payload never carries head.ref/head.repo directly, unlike
 // "pull_request_review_comment" -- see that package's own headresolve.go),
 // authenticated with the SAME bot credential BotNotifier already uses
-// (platform.Config.GitHubBotToken) -- a GitHub webhook mention carries no
+// (platform.Config.GitHubOutbound) -- a GitHub webhook mention carries no
 // per-commenter OAuth token the way CreatePR's caller already has one in
 // hand, and reading a PR's own already-public head branch/repo needs no
 // per-user identity at all.

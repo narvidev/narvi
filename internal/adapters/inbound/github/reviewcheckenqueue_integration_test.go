@@ -85,13 +85,16 @@ func newTestRigWithOutbox(t *testing.T) (testRig, *fakeReviewContextFetcher) {
 		WebhookSecret: testWebhookSecret,
 		BotHandle:     testBotHandleIntegration,
 		LinkNotices:   rig.linkNotices,
-		BotToken:      "test-bot-token",
+		Outbound:      platform.MustNewGitHubOutboundConfig("test-bot-token"),
 		Timeouts:      platform.DefaultTimeouts(),
 		PullRequests:  fetcher,
 		DiffFetcher:   fetcher,
 	}
 
-	handler := githubingress.NewHandler(coalescer, deliveries, cfg)
+	handler, handlerErr := githubingress.NewHandler(coalescer, deliveries, cfg)
+	if handlerErr != nil {
+		t.Fatalf("githubingress.NewHandler: %v", handlerErr)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhooks/github", handler)
