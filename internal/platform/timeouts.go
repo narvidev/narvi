@@ -366,16 +366,22 @@ type Timeouts struct {
 	// such a timer is deleted, with a warning naming it: for that long
 	// nothing that knows the kind has re-armed it. Until then the session's
 	// status counts it as scheduled work (sessionactor.TimerCanCreateWork),
-	// the safe direction. A day, so a kind a rollback strands survives a
-	// fixed redeploy the next day, counted from the last time a binary that
-	// knows it re-armed it -- for a kind that re-arms itself, the rollback.
-	// A kind armed long before it is due is aged from that arm too: one
-	// armed more than this far ahead of its due instant, and first
-	// delivered by a binary that does not know it, is deleted at that
-	// delivery (backed off, if armed more than UnknownTimerGrace ahead). A
-	// Step adding such a kind re-arms it within the day or ships a down
-	// migration that deletes its rows. Validate keeps it above
-	// UnknownTimerGrace. Not specified in the plan; 24 hours.
+	// the safe direction. A day, counted from the last time a binary that
+	// knows the kind re-armed it. A kind's lead -- how far ahead of its due
+	// instant it is armed -- is the age it already has at its first
+	// delivery, and the pump delivers only after the due instant, a pump
+	// interval or a claim window later. So a kind armed with a lead of
+	// about a day or more (UnknownTimerDeleteAfter less that delivery
+	// delay) and first delivered by a binary that does not know it is
+	// deleted at that delivery; with a lead of UnknownTimerGrace or more it
+	// is backed off there. And a kind a newer binary keeps re-arming with a
+	// lead L was last re-armed up to about L before a rollback strands it,
+	// so it survives only about UnknownTimerDeleteAfter minus L after the
+	// rollback -- a fixed redeploy the next day finds it only while L is
+	// small. A Step adding a kind keeps its re-arm lead well under this
+	// bound, ideally at most UnknownTimerGrace, or ships a down migration
+	// that deletes its rows. Validate keeps it above UnknownTimerGrace. Not
+	// specified in the plan; 24 hours.
 	UnknownTimerDeleteAfter time.Duration
 
 	// The session actor's lock connection and hydration bound (§2, §5.1).
