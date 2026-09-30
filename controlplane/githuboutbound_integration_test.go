@@ -138,7 +138,11 @@ func assertGitHubAxesLine(t *testing.T, b *lockedBuffer, wantIngress, wantOutbou
 // readout, the session result, the verdict tool and the re-review button
 // are driven through the real router; the actor's two uses are read off the
 // registry (sessionactor.Registry.HasGitHubOutbound), since they are
-// otherwise reachable only through a timer or a spawned fix session.
+// otherwise reachable only through a timer or a spawned fix session. The
+// decision inbox's reads of a base branch's required checks (§21.2,
+// decisioninbox.Deps.GitHubOutbound) are proven by the Build call itself:
+// the inbox routes and the auto-merge worker share one decisionInboxDeps,
+// and automerge.New refuses deps without the bot credential.
 func TestBuild_GitHubOutboundReachesEveryOptionalReader(t *testing.T) {
 	setRequiredEnv(t)
 	pool, connStr := newTestPool(t)

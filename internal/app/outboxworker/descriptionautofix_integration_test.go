@@ -138,6 +138,12 @@ func (f *fakeDescriptionAutofixSourceControl) GetOpenPR(context.Context, string,
 func (f *fakeDescriptionAutofixSourceControl) ListOpenPRsForUser(context.Context, ports.ListOpenPRsForUserSpec) ([]ports.OpenPR, bool, error) {
 	return nil, false, errors.New("fakeDescriptionAutofixSourceControl: ListOpenPRsForUser not implemented")
 }
+
+// ListRequiredChecks is unused by this test's scenarios; the base requires nothing.
+func (f *fakeDescriptionAutofixSourceControl) ListRequiredChecks(context.Context, ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
+	return nil, nil
+}
+
 func (f *fakeDescriptionAutofixSourceControl) ResolveCodeOwners(context.Context, ports.ResolveCodeOwnersSpec) ([]ports.Owner, error) {
 	return nil, errors.New("fakeDescriptionAutofixSourceControl: ResolveCodeOwners not implemented")
 }

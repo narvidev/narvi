@@ -69,6 +69,12 @@ type fakeSCMCacheSourceControl struct {
 	isAncestorErr       error
 	isAncestorDelay     time.Duration
 	isAncestorCallCount int
+
+	// requiredChecksByBranch/requiredChecksErr/requiredChecksCallCount back
+	// SCMCache.ListRequiredChecks' own tests below (§21.2).
+	requiredChecksByBranch  map[string][]ports.RequiredCheck
+	requiredChecksErr       error
+	requiredChecksCallCount int
 }
 
 var _ ports.SourceControl = (*fakeSCMCacheSourceControl)(nil)
@@ -184,6 +190,30 @@ func (f *fakeSCMCacheSourceControl) isAncestorCalls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.isAncestorCallCount
+}
+
+// ListRequiredChecks backs SCMCache.ListRequiredChecks' own tests below.
+// It honors ctx first, so a call made with no time left is observable.
+func (f *fakeSCMCacheSourceControl) ListRequiredChecks(ctx context.Context, spec ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
+	f.mu.Lock()
+	f.requiredChecksCallCount++
+	required := f.requiredChecksByBranch[spec.Branch]
+	err := f.requiredChecksErr
+	f.mu.Unlock()
+
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	return required, nil
+}
+
+func (f *fakeSCMCacheSourceControl) requiredChecksCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.requiredChecksCallCount
 }
 func (f *fakeSCMCacheSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("fakeSCMCacheSourceControl: ResolveContractsFingerprint not implemented")
@@ -717,5 +747,102 @@ func TestSCMCache_IsAncestor_PropagatesUnderlyingError(t *testing.T) {
 	}
 	if !errors.Is(err, wantErr) {
 		t.Errorf("IsAncestor() error = %v, want it to wrap %v", err, wantErr)
+	}
+}
+
+// TestSCMCache_ListRequiredChecks covers the read model's cached copy of a
+// base branch's required checks (§21.2): one read per base branch per TTL,
+// shared by every caller whatever credential it passes; a failed read
+// returned as an error and never cached -- a cached failure, or a cached
+// empty "requires nothing", would stand for a whole TTL -- and the read
+// bounded by DecisionInboxRequiredChecksTimeout.
+func TestSCMCache_ListRequiredChecks(t *testing.T) {
+	t.Parallel()
+
+	build := []ports.RequiredCheck{{Name: "build", AppID: 7}}
+	spec := func(branch, token string) ports.ListRequiredChecksSpec {
+		return ports.ListRequiredChecksSpec{Owner: "acme", Repo: "widgets", Branch: branch, Token: token}
+	}
+
+	tests := []struct {
+		name      string
+		fake      *fakeSCMCacheSourceControl
+		timeouts  func(*platform.Timeouts)
+		calls     []ports.ListRequiredChecksSpec
+		offsets   []time.Duration
+		wantErrs  []bool
+		wantLast  []ports.RequiredCheck
+		wantReads int
+	}{
+		{
+			name:      "a second read of the same base within the TTL is a cache hit, whatever the token",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBranch: map[string][]ports.RequiredCheck{"main": build}},
+			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot"), spec("main", "someone-else")},
+			offsets:   []time.Duration{0, time.Second},
+			wantErrs:  []bool{false, false},
+			wantLast:  build,
+			wantReads: 1,
+		},
+		{
+			name:      "another base branch is its own entry",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBranch: map[string][]ports.RequiredCheck{"main": build}},
+			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot"), spec("release", "bot")},
+			offsets:   []time.Duration{0, time.Second},
+			wantErrs:  []bool{false, false},
+			wantLast:  nil,
+			wantReads: 2,
+		},
+		{
+			name:      "an expired entry is read again",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBranch: map[string][]ports.RequiredCheck{"main": build}},
+			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot"), spec("main", "bot")},
+			offsets:   []time.Duration{0, time.Hour},
+			wantErrs:  []bool{false, false},
+			wantLast:  build,
+			wantReads: 2,
+		},
+		{
+			name:      "a failed read is returned and never cached",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksErr: errors.New("boom: github is down")},
+			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot"), spec("main", "bot")},
+			offsets:   []time.Duration{0, time.Second},
+			wantErrs:  []bool{true, true},
+			wantReads: 2,
+		},
+		{
+			name:      "the read runs under DecisionInboxRequiredChecksTimeout",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBranch: map[string][]ports.RequiredCheck{"main": build}},
+			timeouts:  func(to *platform.Timeouts) { to.DecisionInboxRequiredChecksTimeout = 0 },
+			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot")},
+			offsets:   []time.Duration{0},
+			wantErrs:  []bool{true},
+			wantReads: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			timeouts := platform.DefaultTimeouts()
+			if tc.timeouts != nil {
+				tc.timeouts(&timeouts)
+			}
+			cache := decisioninbox.NewSCMCache(tc.fake, timeouts)
+			now := time.Now()
+			var last []ports.RequiredCheck
+			for i, call := range tc.calls {
+				got, err := cache.ListRequiredChecks(context.Background(), call, now.Add(tc.offsets[i]))
+				if (err != nil) != tc.wantErrs[i] {
+					t.Fatalf("call %d: ListRequiredChecks() error = %v, want error %v", i, err, tc.wantErrs[i])
+				}
+				last = got
+			}
+			if !tc.wantErrs[len(tc.wantErrs)-1] && len(last) != len(tc.wantLast) {
+				t.Errorf("last ListRequiredChecks() = %+v, want %+v", last, tc.wantLast)
+			}
+			if got := tc.fake.requiredChecksCalls(); got != tc.wantReads {
+				t.Errorf("underlying reads = %d, want %d", got, tc.wantReads)
+			}
+		})
 	}
 }

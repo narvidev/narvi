@@ -137,6 +137,11 @@ func (f *fakeSentinelAutoFixSourceControl) ListOpenPRsForUser(context.Context, p
 	return nil, false, errors.New("fakeSentinelAutoFixSourceControl: ListOpenPRsForUser not implemented")
 }
 
+// ListRequiredChecks is unused by this test's scenarios; the base requires nothing.
+func (f *fakeSentinelAutoFixSourceControl) ListRequiredChecks(context.Context, ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
+	return nil, nil
+}
+
 func (f *fakeSentinelAutoFixSourceControl) ResolveCodeOwners(context.Context, ports.ResolveCodeOwnersSpec) ([]ports.Owner, error) {
 	return nil, errors.New("fakeSentinelAutoFixSourceControl: ResolveCodeOwners not implemented")
 }

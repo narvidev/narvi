@@ -129,6 +129,7 @@ type SCMCache struct {
 	codeOwners        *ttlCache[codeOwnersCacheKey, []ports.Owner]
 	branchSHAs        *ttlCache[branchSHACacheKey, string]
 	isAncestorResults *ttlCache[isAncestorCacheKey, bool]
+	requiredChecks    *ttlCache[requiredChecksCacheKey, []ports.RequiredCheck]
 }
 
 // NewSCMCache builds an SCMCache wrapping sourceControl.
@@ -140,7 +141,42 @@ func NewSCMCache(sourceControl ports.SourceControl, timeouts platform.Timeouts) 
 		codeOwners:        newTTLCache[codeOwnersCacheKey, []ports.Owner](),
 		branchSHAs:        newTTLCache[branchSHACacheKey, string](),
 		isAncestorResults: newTTLCache[isAncestorCacheKey, bool](),
+		requiredChecks:    newTTLCache[requiredChecksCacheKey, []ports.RequiredCheck](),
 	}
+}
+
+// requiredChecksCacheKey identifies one base branch's requirements.
+type requiredChecksCacheKey struct {
+	owner, repo, branch string
+}
+
+// ListRequiredChecks returns the checks spec.Branch requires (§21.2),
+// live-fetching on a cache miss or expiry and caching the answer for
+// platform.Timeouts.DecisionInboxSCMCacheTTL -- the read model's copy of
+// the read revalidateCore makes uncached, like ResolveBranchSHA below.
+// Keyed on (owner, repo, branch) and never on the credential: every caller
+// reads as the bot (Deps.GitHubOutbound, requiredchecks.go), so one answer
+// per base branch serves every actor and every pull request into that
+// branch. A failed read is returned as err and never cached, so the next
+// load asks again rather than serving a failure -- or, worse, an empty
+// "requires nothing" -- for a whole TTL.
+func (c *SCMCache) ListRequiredChecks(ctx context.Context, spec ports.ListRequiredChecksSpec, now time.Time) ([]ports.RequiredCheck, error) {
+	key := requiredChecksCacheKey{owner: spec.Owner, repo: spec.Repo, branch: spec.Branch}
+	if cached, _, ok := c.requiredChecks.get(key, now); ok {
+		return cached, nil
+	}
+
+	callCtx, cancel := context.WithTimeout(ctx, c.timeouts.DecisionInboxRequiredChecksTimeout)
+	defer cancel()
+	required, err := c.sourceControl.ListRequiredChecks(callCtx, spec)
+	if err != nil {
+		return nil, fmt.Errorf("decisioninbox: list required checks: %w", err)
+	}
+
+	// Stored against a fresh time.Now() taken after the call, like every
+	// other method here ("born-expired entries").
+	c.requiredChecks.set(key, required, time.Now(), c.timeouts.DecisionInboxSCMCacheTTL)
+	return required, nil
 }
 
 // ResolveBranchSHA returns spec's own branch's CURRENT commit SHA,

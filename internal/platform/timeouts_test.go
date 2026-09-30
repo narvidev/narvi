@@ -162,6 +162,13 @@ func TestValidate_CatchesEachBrokenLink(t *testing.T) {
 			},
 			wantChain: "ProviderHardCap > FirstConnectBudget + BootEvidenceFallback",
 		},
+		{
+			name: "GitHubListOpenPRsForUserTimeout not > DecisionInboxRequiredChecksTimeout",
+			mutate: func(to *platform.Timeouts) {
+				to.DecisionInboxRequiredChecksTimeout = to.GitHubListOpenPRsForUserTimeout
+			},
+			wantChain: "GitHubListOpenPRsForUserTimeout > DecisionInboxRequiredChecksTimeout",
+		},
 	}
 
 	for _, tc := range tests {
@@ -1503,6 +1510,24 @@ func TestDefaultTimeouts_Step173StandaloneField(t *testing.T) {
 	}
 }
 
+// TestDefaultTimeouts_DecisionInboxRequiredChecksTimeout pins the shipped
+// bound on one read of a base branch's required checks (§21.2): two
+// lightweight GETs, and inside the Merge click's revalidation bound.
+func TestDefaultTimeouts_DecisionInboxRequiredChecksTimeout(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	if to.DecisionInboxRequiredChecksTimeout != 20*time.Second {
+		t.Errorf("DecisionInboxRequiredChecksTimeout = %v, want %v", to.DecisionInboxRequiredChecksTimeout, 20*time.Second)
+	}
+	if to.DecisionInboxRequiredChecksTimeout >= to.GitHubListOpenPRsForUserTimeout {
+		t.Errorf("DecisionInboxRequiredChecksTimeout = %v, want below GitHubListOpenPRsForUserTimeout (%v), which bounds the revalidation it runs inside", to.DecisionInboxRequiredChecksTimeout, to.GitHubListOpenPRsForUserTimeout)
+	}
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
 // TestValidate_RequiresPositiveFields is U2's own audit fix (confirmed
 // HIGH, SECURITY finding: "the anti-abuse throttle fails open on the zero
 // value of its window... Validate() accepts a zero
@@ -1538,6 +1563,11 @@ func TestValidate_RequiresPositiveFields(t *testing.T) {
 			name:      "RepoAccessCheckBreakerWindow == 0",
 			mutate:    func(to *platform.Timeouts) { to.RepoAccessCheckBreakerWindow = 0 },
 			wantField: "RepoAccessCheckBreakerWindow",
+		},
+		{
+			name:      "DecisionInboxRequiredChecksTimeout == 0",
+			mutate:    func(to *platform.Timeouts) { to.DecisionInboxRequiredChecksTimeout = 0 },
+			wantField: "DecisionInboxRequiredChecksTimeout",
 		},
 		{
 			// A negative value is exactly as permissive as zero for every

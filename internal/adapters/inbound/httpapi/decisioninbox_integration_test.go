@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -45,6 +46,11 @@ import (
 // httpapi_integration_test.go's own tokenEncryptionKey literal exactly
 // ("01234567890123456789012345678901", 32 bytes).
 var decisionInboxTokenKey = []byte("01234567890123456789012345678901")
+
+// decisionInboxBotToken is the deployment's bot token in this file's
+// rigs: the credential a base branch's required checks are read with
+// (§21.2), never the acting person's own.
+const decisionInboxBotToken = "decision-inbox-bot-token"
 
 // decisionInboxTestRig is this file's own small, self-contained fixture --
 // see this file's own top doc comment for why it does not reuse testRig.
@@ -206,9 +212,21 @@ type fakeMergeSourceControl struct {
 	// literal changes needed.
 	resolveBranchSHA    string
 	resolveBranchSHAErr error
+
+	// requiredChecksByBranch/requiredChecksCalls back ListRequiredChecks
+	// below (§21.2's "CI green means the required checks"): a branch absent
+	// from the map -- the nil map included, as in every test that never
+	// sets it -- requires nothing.
+	requiredChecksByBranch map[string][]ports.RequiredCheck
+	requiredChecksCalls    []ports.ListRequiredChecksSpec
 }
 
 var _ ports.SourceControl = (*fakeMergeSourceControl)(nil)
+
+func (f *fakeMergeSourceControl) ListRequiredChecks(_ context.Context, spec ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
+	f.requiredChecksCalls = append(f.requiredChecksCalls, spec)
+	return f.requiredChecksByBranch[spec.Branch], nil
+}
 
 func (f *fakeMergeSourceControl) ListOpenPRsForUser(context.Context, ports.ListOpenPRsForUserSpec) ([]ports.OpenPR, bool, error) {
 	f.listOpenPRsCalls++
@@ -312,8 +330,11 @@ func newDecisionInboxTestRig(t *testing.T, sourceControl ports.SourceControl) *d
 		GitHubPRSessions:      githubPRSessions,
 		ReleaseManifestChecks: releaseManifestChecks,
 		SCMCache:              decisioninbox.NewSCMCache(sourceControl, platform.DefaultTimeouts()),
-		TokenEncryptionKey:    decisionInboxTokenKey,
-		Timeouts:              platform.DefaultTimeouts(),
+		// The bot credential a base branch's required checks are read with
+		// (§21.2), as controlplane/serve.go wires it.
+		GitHubOutbound:     platform.MustNewGitHubOutboundConfig(decisionInboxBotToken),
+		TokenEncryptionKey: decisionInboxTokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
 		// (§21.1/§21.2): the REAL auto-approval eligibility
 		// engine's own store dependencies.
 		ReviewVerdict: appreviewverdict.Deps{
@@ -932,6 +953,74 @@ func TestMergePullRequest_NotPlatformAuthored(t *testing.T) {
 	}
 }
 
+// TestMergePullRequest_RequiredCheckNotReported_409NamesIt drives §21.2's
+// "CI green means the required checks" through the Merge endpoint: a pull
+// request whose own checks are all green, but whose base branch requires
+// a check that has not reported, is refused with a 409 whose message names
+// that check, nothing is merged, and the base's requirements are read with
+// the deployment's bot token -- never the clicking person's own. Once the
+// check has reported and passed, the same click merges.
+func TestMergePullRequest_RequiredCheckNotReported_409NamesIt(t *testing.T) {
+	const htmlURL = "https://github.com/acme/widgets/pull/1230"
+	pr := ports.OpenPR{
+		Owner: "acme", Repo: "widgets", Number: 1230, Title: "green but not done", HTMLURL: htmlURL,
+		HeadSHA: "headsha1230", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+		Assignees:    []ports.PRPerson{{ExternalID: "9030", Login: "octocat"}},
+		CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"},
+		HeadChecks: []ports.HeadCheck{{Name: "build", Source: ports.HeadCheckSourceCheckRun, AppID: 1, State: ports.HeadCheckStatePassed}},
+	}
+	fakeSCM := &fakeMergeSourceControl{
+		openPRs:                []ports.OpenPR{pr},
+		mergeSHA:               "merged-sha-1230",
+		requiredChecksByBranch: map[string][]ports.RequiredCheck{testEligibleBaseRef: {{Name: "ci/slow-external"}}},
+	}
+	rig := newDecisionInboxTestRig(t, fakeSCM)
+	ctx := context.Background()
+
+	user, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMember)
+	rig.linkGitHub(ctx, t, user.ID, "9030")
+	rig.markPlatformAuthored(ctx, t, user.ID, htmlURL)
+	rig.seedAutoApprovedVerdict(ctx, t, "acme/widgets", 1230, "headsha1230")
+	if _, err := narvipg.NewRepoSettingsStore(rig.pool).UpsertLiveEgressEnabled(ctx, "acme/widgets", true); err != nil {
+		t.Fatalf("arm live egress: %v", err)
+	}
+
+	body, err := json.Marshal(restdtos.MergePullRequestRequest{RepoFullName: "acme/widgets", PrNumber: 1230})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	var errBody map[string]string
+	if status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/merge", body, &errBody, token); status != http.StatusConflict {
+		t.Fatalf("status = %d, want %d (body: %+v)", status, http.StatusConflict, errBody)
+	}
+	if want := `required check "ci/slow-external" has not reported at the current head`; !strings.Contains(errBody["error"], want) {
+		t.Errorf("409 error = %q, want it to name the check: %q", errBody["error"], want)
+	}
+	if len(fakeSCM.mergeCalls) != 0 {
+		t.Errorf("MergePR called %d times, want 0", len(fakeSCM.mergeCalls))
+	}
+	if len(fakeSCM.requiredChecksCalls) == 0 {
+		t.Fatal("the base's required checks were never read")
+	}
+	for _, c := range fakeSCM.requiredChecksCalls {
+		if c.Token != decisionInboxBotToken {
+			t.Errorf("required checks read with token %q, want the bot's", c.Token)
+		}
+	}
+
+	// The check reports and passes: the same click now merges.
+	pr.HeadChecks = append(pr.HeadChecks, ports.HeadCheck{Name: "ci/slow-external", Source: ports.HeadCheckSourceStatus, State: ports.HeadCheckStatePassed})
+	fakeSCM.openPRs = []ports.OpenPR{pr}
+	var got restdtos.MergePullRequestResponse
+	if status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/merge", body, &got, token); status != http.StatusOK {
+		t.Fatalf("status once the check passed = %d, want %d", status, http.StatusOK)
+	}
+	if !got.Merged || len(fakeSCM.mergeCalls) != 1 {
+		t.Errorf("response = %+v, MergePR calls = %d, want one merge", got, len(fakeSCM.mergeCalls))
+	}
+}
+
 // TestMergePullRequest_Viewer_Returns403 proves authz.Authorize
 // (ActionMergePR) actually gates this endpoint end to end -- every OTHER merge test in this file
 // authenticates as Member, so a deleted/bypassed RBAC gate would pass the
@@ -1395,6 +1484,7 @@ func TestListDecisionInbox_FindingsUnknownRendersNullNotTheFailClosedSentinel(t 
 		Artifacts:          artifacts,
 		Identities:         identities,
 		SCMCache:           decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts()),
+		GitHubOutbound:     platform.MustNewGitHubOutboundConfig(decisionInboxBotToken),
 		TokenEncryptionKey: decisionInboxTokenKey,
 		Timeouts:           platform.DefaultTimeouts(),
 		// (§21.1/§21.2): computeRealEligibility runs regardless of

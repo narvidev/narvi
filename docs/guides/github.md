@@ -158,6 +158,17 @@ webhook above, in one direction only:
   no mention or label would reach Narvi without the webhook, and the bot
   handle is not kept.
 
+The bot also reads, for every pull request whose eligibility for merge is
+assessed -- in the decision inbox, on a Merge click, and by auto-merge --
+the checks its base branch requires: the branch's protection, from the
+branch itself, and the rulesets that apply to the branch (technical plan
+§21.2). The token therefore needs read access to each repository's
+branches and rules. A pull request is not ready to merge while a required
+check has not reported, is still running or did not pass, or while the
+requirements cannot be read; a plan that does not offer rulesets or branch
+protection is read as requiring nothing there. With GitHub outbound off,
+nothing can be read and no pull request is ready to merge.
+
 It is not the GitHub App below: that App's read-only installation token
 is what review sandboxes clone with, and it never posts anything. It is
 not shadow mode either: each repository's own live/shadow setting (§30)

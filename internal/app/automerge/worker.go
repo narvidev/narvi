@@ -95,6 +95,13 @@ func New(deps Deps) (*Worker, error) {
 	if err := platform.RequireGitHubOutbound(deps.Outbound, "automerge: new worker"); err != nil {
 		return nil, err
 	}
+	// Revalidation reads each candidate's base branch's required checks as
+	// the bot (§21.2, decisioninbox.Deps.GitHubOutbound); without it every
+	// candidate would read ineligible ("could not be read"), a worker that
+	// runs and never merges.
+	if err := platform.RequireGitHubOutbound(deps.DecisionInbox.GitHubOutbound, "automerge: new worker: decision inbox"); err != nil {
+		return nil, err
+	}
 	meter := otel.Meter(meterName)
 	authDeadLetterCount, err := meter.Int64Counter(
 		"automerge_auth_dead_lettered_total",

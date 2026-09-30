@@ -359,7 +359,7 @@ verifying nothing about the half that carries the risk.
 ## 8. Feature set (exit criteria, not options)
 
 1. **Plan mode**: persistent plans, HITL approve/reject on web/Slack/Linear/GitHub, server-side implementation dispatch on approval, plan/build model split, cross-channel verdict + archive notifications. **A revision never withdraws an approval** (normative, §43.21): while any turn of the session is pending, dispatched or processing -- an approved implementation included -- a revision, like any prompt, asked for over REST or MCP is refused `409` and nothing is queued, and no ingress queues one behind an approved implementation today (§43.21(b) names which ingresses queue, drop or refuse a turn); were one queued, it would wait, the plan staying `approved`, and be dispatched only once the implementation has reached its terminal state, to write version N+1 awaiting approval beside the approved N -- the implementation's push and pull request proceeding independently of it, even after it has run. Only a stop, authorized on its own, may end a running implementation early.
-2. **Code review**: review sessions per PR with session reuse; atomic claim coalescing of concurrent @mentions; risk-map verdict with `review:*` labels — **a structured verdict from day one** (premise state, risk drivers, shippable class — server-computed, never self-reported, never re-parsed from posted text; full design and the automation policy built on it in §21); test-coverage & doc-drift sentinels; **server-side** verdict floor + formal-review gate + verdict-posting tool (raw issue comments blocked, scoped to review sessions); re-trigger via label/button, or automatically on new commits (debounced, off by default per repo, §24); inline diff pre-fetched into context (agent must not need to run `gh pr diff` repeatedly); suggestion safety (apply via validated endpoint); **criteria-driven auto-approval** (`visual-qa: pass/skip` unchanged; `review: low risk` **inverts** into a `review: needs-human` escape hatch — approval itself is deterministic and criteria-driven rather than label-triggered, §21); dedicated review model selection; optional sentinel auto-fix for coverage/doc-drift findings, merge-gated on the origin PR (§17, disabled by default); **review as a merge readout** (§26) — the verdict front-loads a diff-derived summary, the diff's architecture choices, and its risks to the stack, demoting findings to a collapsed appendix; a description-adequacy check with a third raise-only floor and graduated remediation; deterministic light/deep review triage, measurable per path; adversarial counter-review with contested-points surfacing on the deep path; a diff-only fact-check pass on both paths that kills only provably-wrong findings (§26.6); a per-path cost budget with dispatch-time look-ahead (§26.7); findings anchored to the diff by content, never a guessed line number (§22.1.1).
+2. **Code review**: review sessions per PR with session reuse; atomic claim coalescing of concurrent @mentions; risk-map verdict with `review:*` labels — **a structured verdict from day one** (premise state, risk drivers, shippable class — server-computed, never self-reported, never re-parsed from posted text; full design and the automation policy built on it in §21); test-coverage & doc-drift sentinels; **server-side** verdict floor + formal-review gate + verdict-posting tool (raw issue comments blocked, scoped to review sessions); re-trigger via label/button, or automatically on new commits (debounced, off by default per repo, §24); inline diff pre-fetched into context (agent must not need to run `gh pr diff` repeatedly); suggestion safety (apply via validated endpoint); **criteria-driven auto-approval** (`visual-qa: pass/skip` unchanged; `review: low risk` **inverts** into a `review: needs-human` escape hatch — approval itself is deterministic and criteria-driven rather than label-triggered, §21; CI green there means every check the base branch requires, read as the bot, as well as every check that reported, §21.2); dedicated review model selection; optional sentinel auto-fix for coverage/doc-drift findings, merge-gated on the origin PR (§17, disabled by default); **review as a merge readout** (§26) — the verdict front-loads a diff-derived summary, the diff's architecture choices, and its risks to the stack, demoting findings to a collapsed appendix; a description-adequacy check with a third raise-only floor and graduated remediation; deterministic light/deep review triage, measurable per path; adversarial counter-review with contested-points surfacing on the deep path; a diff-only fact-check pass on both paths that kills only provably-wrong findings (§26.6); a per-path cost budget with dispatch-time look-ahead (§26.7); findings anchored to the diff by content, never a guessed line number (§22.1.1).
 3. **Unified intent classifier** (detailed design — see §18): review-vs-request and plan-vs-build across all ingress surfaces; shadow mode (log-only) → active, permanently available, never a one-time launch gate; never-throw contract with an enumerated fallback-reason taxonomy; confidence rubric anchored on textual directness, not model self-reported certainty; DB-backed editable prompt templates with assembled-prompt preview; per-session routing decision records (§18.4).
 4. **Automations**: GitHub/Linear/webhook/cron triggers with condition builder; sandbox settings honored on automation sessions; creator/status filters; `last_run` + `artifact_summary` populated; per-automation env vars/secrets.
 5. **Enterprise sandbox glue** (full design in §27): cloud credentials via OIDC (provider-agnostic), kubeconfig injection for the target cluster, Docker-in-sandbox, egress proxy, repo/environment/global secrets, OpenCode config storage + injection, toolchain in images (Playwright+Chromium, ripgrep, typescript-language-server).
@@ -1290,18 +1290,35 @@ No per-PR human label is required or consulted for this decision — the LLM's v
 Once armed, auto-merge reuses the decision inbox's **existing** server-side re-validation-at-click contract unchanged (§16.2, Step 60: re-check CI, approval state, `Authorize` before calling the SCM) — merging is simply machine-initiated instead of human-clicked, the same checks either way. This is a deliberate reuse, not a parallel merge path: the inbox's Merge endpoint was already built to never trust its own rendered queue as authority, exactly the property an unattended merge needs.
 
 **CI green means the required checks, not the checks that reported (amendment).**
-Eligibility reads CI over the check runs and statuses present at the head. A check the base branch
-requires but that has not reported yet is absent from that read, so the read can be green before the
-requirement is met. The required set is read from the base branch object's protection and from its
-rulesets, never from the admin-only protection endpoint, and each required check must be satisfied at
-the head, by the App named when one is named; a missing, pending or failed one makes the pull request
-ineligible and is named. A check run and a commit status carrying the same required name must both
-pass. `narvi/review` is taken out of the required set: it is the review this eligibility already
-reads. An answer that the feature is unavailable on the repository's plan means that source declares
-nothing; any other failed read of the requirements makes the pull request ineligible. The required
-set is added to today's read, never substituted for it: every check present at the head must still
-pass, so a failing check the base does not require keeps blocking. A base that requires nothing keeps
-today's read alone, which reads unknown when there is no check at all.
+The CI read covers the check runs and statuses present at the head. A check the base branch requires
+but that has not reported yet is absent from that read, so the read can be green before the
+requirement is met. The required set is read from the base branch object's protection
+(`protection.required_status_checks`: `contexts`, and `checks` with an optional `app_id`) and from the
+rulesets that apply to the branch (rules of type `required_status_checks`, each check with an optional
+`integration_id`), never from the admin-only protection endpoint, and always as the deployment's bot
+(§12.5's outbound axis), so the inbox, a person's Merge click and the auto-merge worker read the same
+requirements whoever is looking; with GitHub outbound off nothing can be read, and nothing is eligible.
+Each required check must be satisfied at the head: a report counts when it carries the check's name
+and, when an App is named, is a check run from that App (a commit status names no App, so it never
+counts for such a check); the check is satisfied when at least one report counts and every report
+that counts passed (success, neutral or skipped). So a check run and a commit status carrying the same
+required name must both pass. A missing, pending or failed required check makes the pull request
+ineligible and is named in the refusal, the App's id with it when one is named. `narvi/review` is taken
+out of the required set: it is the review this eligibility already reads. An answer that the feature
+is unavailable on the repository's plan means that source declares nothing; any other failed read of
+the requirements makes the pull request ineligible, never falling back to the CI read alone. The
+required set is added to the CI read, never substituted for it: every check present at the head must
+still pass, so a failing check the base does not require keeps blocking. A base that requires nothing
+keeps the CI read alone, which reads unknown when there is no check at all.
+
+The criterion sits after "was the CI read complete" and before "is CI green", so a required check that
+is still running or failed is named rather than reported as CI not green; the eligibility policy version
+does not change, since the requirement is read live at every assessment and never from a verdict. The
+merge path reads the requirements live before its probe, so its refusal can name the check; a failed
+read stands in its probe as "requires nothing", so it refuses only once every other criterion passed.
+The inbox's read model reads them after its probe, cached per base branch for the inbox's SCM cache TTL
+(a failed read is never cached), and a failed read there marks the inbox's SCM data degraded. The
+inbox's "CI green" chip stays the CI read at the head; the row's kind is where eligibility shows.
 
 **An unresolved conversation blocks too (amendment, decided 2026-09-28).** Through a per-repository
 setting on by default, eligibility also requires that no review conversation is unresolved, read live

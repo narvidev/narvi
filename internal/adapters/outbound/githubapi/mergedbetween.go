@@ -314,9 +314,18 @@ func (a *Adapter) branchRequiresApprovingReview(ctx context.Context, owner, repo
 // comment (listopenprs.go) for where this distinction is load-bearing;
 // fetchCIConclusion (this file, below) never inspects state=="pending" at
 // all, so it has no analogous need for this field.
+//
+// Statuses is the one status per context GitHub rolls up (the latest for
+// each), read only by fetchCIConclusionLive to list the head's checks for
+// a base branch's required checks (ports.OpenPR.HeadChecks); State alone
+// already covers every status for the CI conclusion itself.
 type combinedStatusResponse struct {
 	State      string `json:"state"`
 	TotalCount int    `json:"total_count"`
+	Statuses   []struct {
+		Context string `json:"context"`
+		State   string `json:"state"`
+	} `json:"statuses"`
 }
 
 // checkRunsResponse is the subset of GitHub's real GET
@@ -358,11 +367,19 @@ type combinedStatusResponse struct {
 // computation. Filtered by NAME alone, not by writer App id or
 // external_id (both considered and rejected, this package's own two
 // callers' doc comments have the full "why" for each).
+//
+// App.ID is the App that reported the run, read only by
+// fetchCIConclusionLive: a base branch can require a check from one named
+// App (ports.RequiredCheck.AppID), and a run of that name from any other
+// App does not satisfy it.
 type checkRunsResponse struct {
 	TotalCount int `json:"total_count"`
 	CheckRuns  []struct {
 		Name       string  `json:"name"`
 		Conclusion *string `json:"conclusion"`
+		App        struct {
+			ID int64 `json:"id"`
+		} `json:"app"`
 	} `json:"check_runs"`
 }
 

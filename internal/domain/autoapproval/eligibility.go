@@ -401,6 +401,22 @@ type EligibilityInput struct {
 	// a caller populating this field wrong can misreport WHICH reason a
 	// refusal carries, never turn a genuine refusal into an approval.
 	CIConclusionDegraded bool
+	// RequiredChecks is the base branch's required checks, evaluated at
+	// CurrentHeadSHA (§21.2's "CI green means the required checks"
+	// amendment) -- built with ReadRequiredChecks from the requirements
+	// the caller read and the checks the SAME read as CIGreen saw at the
+	// head, or left at its zero value when the requirements could not be
+	// read. The zero value is "could not be read" and refuses
+	// (ReasonRequiredChecksUnknown), the package's fail-conservative
+	// convention: a caller that forgets this field cannot make a pull
+	// request eligible on the CI read alone. It is checked after
+	// CIConclusionDegraded -- a half-read head can make a required check
+	// look missing -- and BEFORE CIGreen, so a required check that is
+	// missing, still running or failed refuses by name rather than as
+	// "CI is not green". It never replaces CIGreen: a head satisfying
+	// every required check is still refused while its CI read is not
+	// green.
+	RequiredChecks RequiredChecks
 	// HasNeedsHumanLabel is reviewpost.LabelNeedsHuman's own current
 	// presence on the PR -- §21.2's escape hatch, unconditional and
 	// checked first, regardless of every other field's value.
@@ -518,11 +534,19 @@ const (
 	// "is the fact even knowable" distinction ReasonBlastRadiusUnknown
 	// already draws for the sensitive-path check.
 	ReasonCIConclusionDegraded Reason = "this pull request's CI status could not be fully read from GitHub"
-	ReasonCINotGreen           Reason = "CI is not green at the current head"
-	ReasonNotShippableAuto     Reason = "the verdict's shippable classification is not auto"
-	ReasonDiffTooLarge         Reason = "the diff exceeds this repo's auto-approval file-count threshold"
-	ReasonBlastRadiusUnknown   Reason = "the diff's sensitive-path facts could not be established from GitHub"
-	ReasonSensitivePathTouched Reason = "the diff touches a sensitive path"
+	// ReasonRequiredChecksUnknown accompanies a pull request whose base
+	// branch's required checks could not be read (EligibilityInput.
+	// RequiredChecks' zero value). A failed read never falls back to the
+	// CI read alone: that is exactly the read that cannot see a required
+	// check which has not reported yet. A required check the head does
+	// not satisfy has no fixed Reason of its own -- the Reason names the
+	// check, and starts with RequiredCheckReasonPrefix (requiredchecks.go).
+	ReasonRequiredChecksUnknown Reason = "the checks this pull request's base branch requires could not be read from GitHub"
+	ReasonCINotGreen            Reason = "CI is not green at the current head"
+	ReasonNotShippableAuto      Reason = "the verdict's shippable classification is not auto"
+	ReasonDiffTooLarge          Reason = "the diff exceeds this repo's auto-approval file-count threshold"
+	ReasonBlastRadiusUnknown    Reason = "the diff's sensitive-path facts could not be established from GitHub"
+	ReasonSensitivePathTouched  Reason = "the diff touches a sensitive path"
 )
 
 // ComputeEligible is this package's single exported pure function
@@ -608,6 +632,20 @@ func computeEligibleCore(in EligibilityInput, cfg EligibilityConfig, waiveHumanJ
 	if in.CIConclusionDegraded {
 		return false, ReasonCIConclusionDegraded, false
 	}
+	// The base branch's required checks (EligibilityInput.RequiredChecks):
+	// "could the requirements be read" before "does the head satisfy
+	// them", the same precedence as the CI read's own pair around it.
+	// Mandatory, never waived by an acceptance -- CI green at the current
+	// head is one of §21.1b's conditions that are not about judgment.
+	if !in.RequiredChecks.Known {
+		return false, ReasonRequiredChecksUnknown, false
+	}
+	if len(in.RequiredChecks.Shortfalls) > 0 {
+		return false, requiredChecksReason(in.RequiredChecks.Shortfalls), false
+	}
+	// Still checked when every required check is satisfied: the required
+	// set is added to the CI read, never substituted for it, so a failing
+	// check the base does not require keeps blocking here.
 	if !in.CIGreen {
 		return false, ReasonCINotGreen, false
 	}

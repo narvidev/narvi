@@ -221,9 +221,40 @@ type fakeDecisionInboxSourceControl struct {
 	isAncestorResult bool
 	isAncestorErr    error
 	isAncestorCalls  []ports.IsAncestorSpec
+
+	// requiredChecksByBranch/requiredChecksErr/requiredChecksCalls back
+	// ListRequiredChecks below (§21.2's "CI green means the required
+	// checks"): what each base branch requires -- a branch absent from the
+	// map, the nil map included, requires nothing, so every test that never
+	// sets this field reads exactly as it did before required checks
+	// existed -- or a failed read, and every call received.
+	requiredChecksByBranch map[string][]ports.RequiredCheck
+	requiredChecksErr      error
+	requiredChecksCalls    []ports.ListRequiredChecksSpec
 }
 
 var _ ports.SourceControl = (*fakeDecisionInboxSourceControl)(nil)
+
+// testBotOutbound is the deployment's bot credential in every rig in this
+// package: what a base branch's required checks are read with (§21.2,
+// Deps.GitHubOutbound), never the acting person's own token.
+var testBotOutbound = platform.MustNewGitHubOutboundConfig(testBotToken)
+
+const testBotToken = "decisioninbox-test-bot-token"
+
+// ListRequiredChecks reports requiredChecksByBranch[spec.Branch], or
+// requiredChecksErr, recording the call. Honors ctx first, like
+// IsAncestor/ResolveBranchSHA, so a missing timeout is detectable.
+func (f *fakeDecisionInboxSourceControl) ListRequiredChecks(ctx context.Context, spec ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
+	f.requiredChecksCalls = append(f.requiredChecksCalls, spec)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.requiredChecksErr != nil {
+		return nil, f.requiredChecksErr
+	}
+	return f.requiredChecksByBranch[spec.Branch], nil
+}
 
 // IsAncestor (D3, second adversarial-review round) reports
 // isAncestorResult/isAncestorErr, recording every call it receives so a
@@ -577,7 +608,8 @@ func TestBuild_FullScenario(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: plans, Sessions: sessions, Participants: participants, Automations: automations,
+		GitHubOutbound: testBotOutbound,
+		Plans:          plans, Sessions: sessions, Participants: participants, Automations: automations,
 		Outbox: outbox, ReviewFindings: reviewFindings, SentinelFixes: sentinelFixes, Artifacts: artifacts,
 		Identities: identities, SCMCache: scmCache, TokenEncryptionKey: tokenKey, Timeouts: platform.DefaultTimeouts(),
 		ReviewVerdict: appreviewverdict.Deps{ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool), ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Timeouts: platform.DefaultTimeouts()},
@@ -902,7 +934,8 @@ func TestBuild_ReviewSessionIDAndReleaseCut(t *testing.T) {
 	scmCache := decisioninbox.NewSCMCache(fakeSCM, platform.DefaultTimeouts())
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: sessions, Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: sessions, Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: identities, GitHubPRSessions: githubPRSessions, ReleaseManifestChecks: releaseManifestChecks,
@@ -1034,6 +1067,7 @@ func TestBuild_NoLinkedGitHubIdentity(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
+		GitHubOutbound:     testBotOutbound,
 		Plans:              narvipg.NewPlanStore(pool),
 		Sessions:           narvipg.NewSessionStore(pool),
 		Participants:       narvipg.NewParticipantStore(pool),
@@ -1139,7 +1173,8 @@ func TestBuild_PlanOwnershipScoping(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: plans, Sessions: sessions, Participants: participants,
+		GitHubOutbound: testBotOutbound,
+		Plans:          plans, Sessions: sessions, Participants: participants,
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -1257,7 +1292,8 @@ func TestBuild_PRLabelVariations(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: identities,
@@ -1408,7 +1444,8 @@ func TestBuild_HasChangesRequestedDemotesFromReadyToMerge(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -1512,7 +1549,8 @@ func TestBuild_AncestorChainMatches_LiveResolved_StaysReadyToMerge(t *testing.T)
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -1623,7 +1661,8 @@ func TestBuild_AncestorChainUnknown_LiveResolveFails_DemotesAndMarksDegraded(t *
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -1689,7 +1728,8 @@ func TestBuild_AncestorChainDegradedRef_DemotesAndMarksDegraded(t *testing.T) {
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -1758,7 +1798,8 @@ func TestBuild_AncestorChainAdvanced_ConfirmedFastForward_StaysReadyToMerge(t *t
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -1877,7 +1918,8 @@ func TestBuild_AncestorChainChanged_DemotesFromReadyToMerge(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -1999,7 +2041,8 @@ func TestBuild_AcceptedVerdict_BaseMoved_HidesStaleAcceptance(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -2147,7 +2190,8 @@ func TestBuild_AcceptedVerdict_HeadMoved_HidesStaleAcceptance(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -2290,7 +2334,8 @@ func TestBuild_AcceptedVerdict_AncestorChainChanged_HidesStaleAcceptance(t *test
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -2496,7 +2541,8 @@ func TestBuild_AcceptanceMergeable(t *testing.T) {
 			}
 
 			deps := decisioninbox.Deps{
-				Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+				GitHubOutbound: testBotOutbound,
+				Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 				Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 				ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
 				Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -2655,7 +2701,8 @@ func TestBuild_AcceptanceMergeable_NeedsHumanLabel_DoesNotRecordOverridden(t *te
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -2792,7 +2839,8 @@ func TestBuild_AcceptanceMergeable_DegradedLiveCheck_DistinctReason(t *testing.T
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -2930,7 +2978,8 @@ func TestBuild_AcceptanceMergeable_ReadyToMergeRow(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -3054,7 +3103,8 @@ func TestBuild_AcceptanceMergeable_HandoffRow(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -3204,7 +3254,8 @@ func TestBuild_AcceptanceMergeable_ReleaseCutRow(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: sessions, Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: sessions, Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -3296,7 +3347,8 @@ func TestBuild_ChangedFilesListDegraded_NeverReadyToMerge(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
@@ -3359,7 +3411,8 @@ func TestBuild_CodeOwnersResolvedAgainstBaseRefNeverHead(t *testing.T) {
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -3407,7 +3460,8 @@ func TestBuild_SCMFetchFailedSignal(t *testing.T) {
 			openPRsTruncated: true,
 		}
 		deps := decisioninbox.Deps{
-			Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+			GitHubOutbound: testBotOutbound,
+			Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 			Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 			ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 			Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -3435,7 +3489,8 @@ func TestBuild_SCMFetchFailedSignal(t *testing.T) {
 
 		fakeSCM := &fakeDecisionInboxSourceControl{openPRsErr: errors.New("boom: github is down")}
 		deps := decisioninbox.Deps{
-			Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+			GitHubOutbound: testBotOutbound,
+			Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 			Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 			ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 			Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -3505,7 +3560,8 @@ func TestBuild_SentinelFixStoreErrorDegradesTheReadButNeverPanics(t *testing.T) 
 	}
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: brokenSentinelFixes,
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -3555,7 +3611,8 @@ func TestBuild_CredentialResolutionErrorDegradesRatherThanRenderingNoGitHub(t *t
 	brokenIdentities := narvipg.NewIdentityStore(pool).WithTx(tx)
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: brokenIdentities,
@@ -3669,7 +3726,8 @@ func TestBuild_EligibilityConfigStoreError_DemotesFromReadyToMerge(t *testing.T)
 	brokenRepoSettings := narvipg.NewRepoSettingsStore(pool).WithTx(tx)
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -3722,7 +3780,8 @@ func TestBuild_LiveSCMLookupFails_MarksSCMFetchFailed(t *testing.T) {
 	fakeSCM.resolveBranchSHAErr = errors.New("boom: github is down")
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -3778,7 +3837,8 @@ func TestBuild_IsAncestorLookupFails_MarksSCMFetchFailed(t *testing.T) {
 	fakeSCM.isAncestorErr = errors.New("boom: github is down")
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -3840,7 +3900,8 @@ func TestBuild_BaseBranchAdvanced_ButAlreadyIneligibleForAnotherReason(t *testin
 	fakeSCM.isAncestorErr = errors.New("boom: github is down")
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -3918,7 +3979,8 @@ func TestBuild_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall(t *testing.T
 	fakeSCM.resolveBranchSHAErr = errors.New("boom: github is down")
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -4020,7 +4082,8 @@ func TestBuild_CIConclusionDegraded_FinalLiteralWiredFromRealValue(t *testing.T)
 	// ready_to_merge.
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -4078,7 +4141,8 @@ func TestBuild_BaseBranchAdvanced_LiveTipMoved_DemotesFromReadyToMerge(t *testin
 	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "d2-actor@example.com", actorGitHubExternalID, repoFullName, 62)
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -4152,7 +4216,8 @@ func TestBuild_BaseBranchAdvanced_ConfirmedFastForward_StaysReadyToMerge(t *test
 	actor, fakeSCM := buildEligibleReadyToMergeFixture(ctx, t, pool, tokenKey, "d3-actor@example.com", actorGitHubExternalID, repoFullName, 63)
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -4222,7 +4287,8 @@ func TestBuild_ReviewDecisionDegraded_DemotesFromReadyToMerge(t *testing.T) {
 	fakeSCM.openPRsByExternalID[actorGitHubExternalID] = prs
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -4310,7 +4376,8 @@ func TestBuild_Contested_HasChangesRequestedHalf_RecordsOverridden(t *testing.T)
 	fakeSCM.openPRsByExternalID[actorGitHubExternalID] = prs
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -4374,7 +4441,8 @@ func TestBuild_Contested_NeedsHumanLabelHalf_RecordsOverridden(t *testing.T) {
 	fakeSCM.openPRsByExternalID[actorGitHubExternalID] = prs
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
@@ -4440,7 +4508,8 @@ func TestBuild_NotContested_WhenEngineWouldNotHaveApprovedAnyway(t *testing.T) {
 	fakeSCM.openPRsByExternalID[actorGitHubExternalID] = prs
 
 	deps := decisioninbox.Deps{
-		Plans: narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
 		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
 		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
 		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),

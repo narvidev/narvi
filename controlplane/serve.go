@@ -1970,9 +1970,15 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		GitHubPRSessions:      githubPRSessionStore,
 		ReleaseManifestChecks: releaseManifestCheckStore,
 		SCMCache:              decisionInboxSCMCache,
-		TokenEncryptionKey:    cfg.TokenEncryptionKey,
-		Timeouts:              cfg.Timeouts,
-		ReviewVerdict:         reviewVerdictDeps,
+		// GitHubOutbound: the bot credential every eligibility read of a
+		// base branch's required checks uses (§21.2) -- the read model,
+		// the Merge click, and the auto-merge worker, which reuses these
+		// deps. nil with GitHub outbound off: no requirement can be read,
+		// so no pull request is eligible.
+		GitHubOutbound:     cfg.GitHubOutbound,
+		TokenEncryptionKey: cfg.TokenEncryptionKey,
+		Timeouts:           cfg.Timeouts,
+		ReviewVerdict:      reviewVerdictDeps,
 	}
 
 	// githubOutboundAxis is §12.5's GitHub outbound axis, wired in ONE

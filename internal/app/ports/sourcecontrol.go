@@ -645,6 +645,22 @@ type OpenPR struct {
 	// stays reachable as Success from check-runs alone, on such a
 	// repository exactly as it always has been.
 	CIConclusionDegraded bool
+	// HeadChecks is every check the SAME read as CIConclusion saw at
+	// HeadSHA, one entry per check run and per commit status context --
+	// what a base branch's required checks (SourceControl.
+	// ListRequiredChecks) are evaluated against, so the required checks
+	// and CIConclusion always describe one snapshot. narvi/review is
+	// listed like any other check run; the required-check rule takes it
+	// out of the required set, and CIConclusion leaves it out by name.
+	HeadChecks []HeadCheck
+	// HeadChecksListDegraded is true when HeadChecks is not a complete
+	// listing: either of the read's two GETs failed or did not decode,
+	// the check runs were truncated (all three already make
+	// CIConclusionDegraded true), or the commit statuses were truncated,
+	// which CIConclusion itself does not need -- the combined state covers
+	// every status -- but a required check's presence does. The zero value
+	// is a complete listing, like ChangedFilesListDegraded's.
+	HeadChecksListDegraded bool
 
 	// Labels is this PR's own current GitHub labels -- a caller checks
 	// this against reviewpost.LabelLowRisk/.../LabelNeedsHuman to derive
@@ -1220,4 +1236,74 @@ type SourceControl interface {
 	// mirrors CreatePRError's own identical "typed only for a real HTTP
 	// response, plain for a failure below that" precedent.
 	MergePR(ctx context.Context, spec MergePRSpec) (mergeCommitSHA string, err error)
+
+	// ListRequiredChecks reports every check spec.Branch requires before a
+	// pull request into it may merge (§21.2: "CI green means the required
+	// checks, not the checks that reported") -- the checks the code host
+	// itself would hold a merge for, whatever has or has not reported at a
+	// head yet. An empty result is a confirmed "requires nothing". A
+	// requirement source the repository's plan does not offer declares
+	// nothing and is not an error; every other failure to read any source
+	// is an error, and a caller must never read it as "requires nothing" --
+	// that is the very read that cannot see a required check which has not
+	// reported. Duplicates across sources may be returned; the caller's
+	// rule (autoapproval.EvaluateRequiredChecks) removes them. Errors are
+	// plain, like every other method on this port except MergePR.
+	ListRequiredChecks(ctx context.Context, spec ListRequiredChecksSpec) ([]RequiredCheck, error)
+}
+
+// ListRequiredChecksSpec is ListRequiredChecks' input: the base branch
+// whose requirements are read, and the credential they are read with --
+// the deployment's bot token (platform.GitHubOutboundConfig) at every
+// eligibility call site, so the inbox, a person's Merge click and the
+// auto-merge worker read the same requirements.
+type ListRequiredChecksSpec struct {
+	Owner  string
+	Repo   string
+	Branch string
+	Token  string
+}
+
+// RequiredCheck is one check a base branch requires.
+type RequiredCheck struct {
+	// Name is a check run's name or a commit status's context.
+	Name string
+	// AppID is the id of the App that must report the check; zero when
+	// the requirement names none, and any source counts.
+	AppID int64
+}
+
+// HeadCheckSource is which of the code host's two check surfaces reported
+// a HeadCheck.
+type HeadCheckSource string
+
+const (
+	// HeadCheckSourceCheckRun is a check run, which carries the id of the
+	// App that reported it.
+	HeadCheckSourceCheckRun HeadCheckSource = "check_run"
+	// HeadCheckSourceStatus is a commit status, which carries no App id.
+	HeadCheckSourceStatus HeadCheckSource = "status"
+)
+
+// HeadCheckState is where a HeadCheck stands for a requirement.
+type HeadCheckState string
+
+const (
+	// HeadCheckStatePassed satisfies a requirement.
+	HeadCheckStatePassed HeadCheckState = "passed"
+	// HeadCheckStatePending has reported and not concluded.
+	HeadCheckStatePending HeadCheckState = "pending"
+	// HeadCheckStateFailed is every other outcome.
+	HeadCheckStateFailed HeadCheckState = "failed"
+)
+
+// HeadCheck is one check reported at a pull request's head, as
+// OpenPR.HeadChecks lists them.
+type HeadCheck struct {
+	Name   string
+	Source HeadCheckSource
+	// AppID is the id of the App that reported a check run; zero for a
+	// commit status.
+	AppID int64
+	State HeadCheckState
 }

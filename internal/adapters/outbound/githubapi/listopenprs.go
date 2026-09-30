@@ -399,17 +399,18 @@ func (a *Adapter) buildOpenPRFromDetail(ctx context.Context, owner, repo string,
 
 	hasApproving, hasChangesRequested, reviewDecisionDegraded := a.fetchReviewDecision(ctx, owner, repo, number, token)
 
-	ci := ports.CIConclusionUnknown
-	var ciConclusionDegraded bool
+	// With no head SHA nothing is read: CI stays unknown, and the head's
+	// check listing is marked incomplete rather than read as "no checks".
+	live := liveCIRead{conclusion: ports.CIConclusionUnknown, headChecksDegraded: true}
 	if detail.Head.SHA != "" {
 		// fetchCIConclusionLive, deliberately NOT fetchCIConclusion -- see that function's own doc comment for
 		// why a LIVE, pre-merge gate needs a STRICT conclusion, distinct
 		// from mergedbetween.go's retrospective-audit-only lenient one.
-		// ciConclusionDegraded is true iff either of that function's two
+		// live.degraded is true iff either of that function's two
 		// GETs itself failed -- see ports.OpenPR.CIConclusionDegraded's
 		// own doc comment for the fail-closed contract this signals to
 		// every caller gating on ci == CIConclusionSuccess.
-		ci, ciConclusionDegraded = a.fetchCIConclusionLive(ctx, owner, repo, detail.Head.SHA, token)
+		live = a.fetchCIConclusionLive(ctx, owner, repo, detail.Head.SHA, token)
 	}
 
 	// Phase 5 audit findings 1+2 (both fixed). Two INDEPENDENT ways this
@@ -502,13 +503,17 @@ func (a *Adapter) buildOpenPRFromDetail(ctx context.Context, owner, repo string,
 		// "why" and which callers must fail closed on it.
 		ReviewDecisionDegraded: reviewDecisionDegraded,
 
-		CIConclusion: ci,
-		// fetchCIConclusionLive's own second return -- see that field's
+		CIConclusion: live.conclusion,
+		// fetchCIConclusionLive's own degraded answer -- see that field's
 		// own doc comment (ports.OpenPR) for the fail-closed contract
 		// every caller gating on CIConclusion == CIConclusionSuccess must
 		// also honor.
-		CIConclusionDegraded: ciConclusionDegraded,
-		Labels:               labels,
+		CIConclusionDegraded: live.degraded,
+		// The same read's checks, listed one by one for a base branch's
+		// required checks (§21.2) -- see both fields' doc comments.
+		HeadChecks:             live.headChecks,
+		HeadChecksListDegraded: live.headChecksDegraded,
+		Labels:                 labels,
 
 		ChangedFiles: files,
 		// Phase 5 audit findings 1+2: ChangedFilesCount is GitHub's own
@@ -681,13 +686,27 @@ func ancestorChainFromDetailStack(stack *stackResponse) []ports.PRAncestorLink {
 // before this fix) for the full "why NAME, not App id or external_id"
 // reasoning -- both functions apply the identical exclusion, for the
 // identical reason.
-func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSHA, token string) (ports.CIConclusion, bool) {
+//
+// The same two responses also list the head's checks one by one
+// (liveCIRead.headChecks, ports.OpenPR.HeadChecks) for a base branch's
+// required checks (§21.2's "CI green means the required checks"
+// amendment): every check run with its App id, and every commit status
+// context GitHub rolls up, each mapped to passed, pending or failed. The
+// listing never changes the conclusion above -- a base that requires
+// nothing reads exactly what it read before it existed. The status GET
+// asks for per_page=100 so the per-context list is as complete as one page
+// allows; total_count beyond what was served makes the listing degraded
+// (liveCIRead.headChecksDegraded) without degrading the conclusion, which
+// GitHub's combined state already computes over every status.
+func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSHA, token string) liveCIRead {
 	sawFailure := false
 	sawSuccess := false
 	sawIncomplete := false
 	degraded := false
+	var headChecks []ports.HeadCheck
+	statusesTruncated := false
 
-	statusPath := fmt.Sprintf("%s/repos/%s/%s/commits/%s/status", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(headSHA))
+	statusPath := fmt.Sprintf("%s/repos/%s/%s/commits/%s/status?per_page=100", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(headSHA))
 	if body, err := a.doGet(ctx, statusPath, token); err != nil {
 		degraded = true
 	} else {
@@ -695,6 +714,10 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 		if json.Unmarshal(body, &status) != nil {
 			degraded = true
 		} else {
+			for _, st := range status.Statuses {
+				headChecks = append(headChecks, ports.HeadCheck{Name: st.Context, Source: ports.HeadCheckSourceStatus, State: statusHeadCheckState(st.State)})
+			}
+			statusesTruncated = status.TotalCount > len(status.Statuses)
 			switch status.State {
 			case "failure", "error":
 				sawFailure = true
@@ -768,6 +791,11 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 				degraded = true
 			}
 			for _, r := range runs.CheckRuns {
+				// Listed before the narvi/review exclusion below: the
+				// required-check rule takes narvi/review out of the
+				// required set itself, and the listing stays a plain
+				// record of what the head carries.
+				headChecks = append(headChecks, ports.HeadCheck{Name: r.Name, Source: ports.HeadCheckSourceCheckRun, AppID: r.App.ID, State: checkRunHeadCheckState(r.Conclusion)})
 				if r.Name == reviewcheck.CheckName {
 					// Narvi's own check run -- see this function's own
 					// doc comment for the full "why". Skipped BEFORE the
@@ -804,25 +832,70 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 		}
 	}
 
+	read := liveCIRead{degraded: degraded, headChecks: headChecks, headChecksDegraded: degraded || statusesTruncated}
 	switch {
 	case sawFailure:
 		// A genuine, confirmed failure from whichever GET succeeded is
 		// real signal regardless of the other GET's own health -- never
 		// suppressed by degraded, exactly like the pre-existing "failure
 		// wins over incomplete" precedent immediately below.
-		return ports.CIConclusionFailure, degraded
+		read.conclusion = ports.CIConclusionFailure
 	case sawIncomplete:
-		return ports.CIConclusionUnknown, degraded
+		read.conclusion = ports.CIConclusionUnknown
 	case degraded:
 		// The fix this function exists for: sawSuccess may well be true
 		// here (the surviving GET reported green), but with the OTHER GET
 		// unread, that green is unconfirmed -- report Unknown, never
-		// Success, and say so via the second return value.
-		return ports.CIConclusionUnknown, true
+		// Success, and say so via read.degraded.
+		read.conclusion = ports.CIConclusionUnknown
 	case sawSuccess:
-		return ports.CIConclusionSuccess, false
+		read.conclusion = ports.CIConclusionSuccess
 	default:
-		return ports.CIConclusionUnknown, false
+		read.conclusion = ports.CIConclusionUnknown
+	}
+	return read
+}
+
+// liveCIRead is fetchCIConclusionLive's answer: the conclusion and whether
+// it was fully read (ports.OpenPR.CIConclusion/CIConclusionDegraded), and
+// the head's checks one by one from the same two responses
+// (ports.OpenPR.HeadChecks/HeadChecksListDegraded).
+type liveCIRead struct {
+	conclusion         ports.CIConclusion
+	degraded           bool
+	headChecks         []ports.HeadCheck
+	headChecksDegraded bool
+}
+
+// checkRunHeadCheckState maps a check run's conclusion to where it stands
+// for a required check. GitHub accepts a required check that concluded
+// success, neutral or skipped; a run that has not concluded (nil) is
+// pending; every other conclusion -- failure, cancelled, timed_out,
+// action_required, stale, or one this adapter does not know -- has not
+// passed.
+func checkRunHeadCheckState(conclusion *string) ports.HeadCheckState {
+	if conclusion == nil {
+		return ports.HeadCheckStatePending
+	}
+	switch *conclusion {
+	case "success", "neutral", "skipped":
+		return ports.HeadCheckStatePassed
+	default:
+		return ports.HeadCheckStateFailed
+	}
+}
+
+// statusHeadCheckState maps a commit status's state (success, pending,
+// failure, error) to where it stands for a required check; a state this
+// adapter does not know has not passed.
+func statusHeadCheckState(state string) ports.HeadCheckState {
+	switch state {
+	case "success":
+		return ports.HeadCheckStatePassed
+	case "pending":
+		return ports.HeadCheckStatePending
+	default:
+		return ports.HeadCheckStateFailed
 	}
 }
 

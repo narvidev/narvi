@@ -130,6 +130,17 @@ type Deps struct {
 
 	SCMCache *SCMCache
 
+	// GitHubOutbound is §12.5's GitHub outbound axis: the bot credential a
+	// base branch's required checks are read with (§21.2's "CI green
+	// means the required checks" amendment, requiredchecks.go) -- the
+	// same credential in the read model, a person's Merge click and the
+	// auto-merge worker, so all three read the same requirements whoever
+	// is looking, and one cached answer per base branch serves every
+	// actor. nil when the axis is off: the requirements then cannot be
+	// read, and no pull request is eligible (ReasonRequiredChecksUnknown)
+	// -- never read as "requires nothing".
+	GitHubOutbound *platform.GitHubOutboundConfig
+
 	TokenEncryptionKey []byte
 	Timeouts           platform.Timeouts
 
@@ -188,7 +199,9 @@ type Result struct {
 	//  6. computeRealEligibility's own live SCM lookups for that ONE PR --
 	//     the base-branch tip resolution (SCMCache.ResolveBranchSHA) or the
 	//     fast-forward-ancestry confirmation (SCMCache.IsAncestor), either
-	//     one failing (E5, third adversarial-review round). Before this
+	//     one failing (E5, third adversarial-review round), or the read of
+	//     the base branch's required checks (SCMCache.ListRequiredChecks,
+	//     §21.2's "CI green means the required checks"). Before this
 	//     producer existed, a row demoted out of ready_to_merge by either
 	//     failure's own fail-closed reason (ReasonBaseSHAUnknown/
 	//     ReasonBaseMoved) rendered identically to a row the engine
@@ -896,7 +909,11 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 				switch {
 				case acceptanceEligibility.Degraded:
 					degraded = true
-					item.AcceptanceMergeBlockedReason = reasonBaseCommitUnconfirmed
+					// reasonBaseCommitUnconfirmed for a freshness read, the
+					// engine's own ReasonRequiredChecksUnknown text for the
+					// base's required checks (eligibilityResult.
+					// UnconfirmedReason).
+					item.AcceptanceMergeBlockedReason = acceptanceEligibility.UnconfirmedReason
 				case !acceptanceEligibility.Eligible:
 					// Deliberately NOT one of the shared reason constants:
 					// this fact ("still refused even WITH the acceptance
@@ -955,8 +972,9 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 // closed for revalidateCore one file over).
 // degraded (E5, third adversarial-review round) is a SECOND, distinct
 // return value from eligible/eligible-ness itself: true iff a live SCM
-// lookup this function makes (base-branch tip resolution, or the
-// fast-forward-ancestry confirmation, both below) failed. Unset (false)
+// lookup this function makes (base-branch tip resolution, the
+// fast-forward-ancestry confirmation, or the base branch's required
+// checks, all below) failed. Unset (false)
 // for the GetLatest/!hasVerdict/LoadEligibilityConfig early returns
 // immediately below -- those are pre-existing, differently-shaped
 // degradations (a Postgres store read, never a live GitHub SCM call) and
@@ -1111,10 +1129,16 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		AncestorChainAdvancedWithoutRewrite: true,
 		CIGreen:                             ciGreen,
 		CIConclusionDegraded:                pr.CIConclusionDegraded,
-		HasNeedsHumanLabel:                  false,
-		ChangedFileCount:                    changedFileCount,
-		TouchedBlastRadius:                  touchedBlastRadius,
-		TouchedBlastRadiusKnown:             touchedBlastRadiusKnown,
+		// RequiredChecks is deferred past this probe like the base SHA: the
+		// base's requirements are read below, once the probe has passed,
+		// and probeRequiredChecks' stand-in ("read, requiring nothing") is
+		// the most lenient value, so a refusal here is a refusal with the
+		// real fact too (requiredchecks.go).
+		RequiredChecks:          probeRequiredChecks(autoapproval.RequiredChecks{}),
+		HasNeedsHumanLabel:      false,
+		ChangedFileCount:        changedFileCount,
+		TouchedBlastRadius:      touchedBlastRadius,
+		TouchedBlastRadiusKnown: touchedBlastRadiusKnown,
 	}
 	// ComputeEligibleWithAcceptance, never a bare ComputeEligible (round 3,
 	// finding R1, adversarial review) -- accepted is false from this
@@ -1124,6 +1148,28 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// which is the whole point of threading it through.
 	if probeEligible, _, _ := autoapproval.ComputeEligibleWithAcceptance(probe, cfg, accepted); !probeEligible {
 		return eligibilityResult{}
+	}
+
+	// requiredChecks is the base branch's required checks at pr's head
+	// (§21.2's "CI green means the required checks" amendment), read as
+	// the bot through deps.SCMCache -- once per base branch per TTL, shared
+	// by every row and actor (SCMCache.ListRequiredChecks). Read only now
+	// that the probe has passed, like the base SHA below: this read model
+	// shows no refusal reason, so a pull request the probe already refused
+	// gains nothing from it. A failed read is the fact's zero value, which
+	// the final call below refuses on (ReasonRequiredChecksUnknown) --
+	// never "requires nothing" -- and, the probe having passed, it really
+	// is what stands between this row and ready_to_merge, so it also marks
+	// the read degraded (Result.SCMFetchFailed, producer 6).
+	requiredSpec, requiredErr := requiredChecksSpec(deps, pr)
+	var required []ports.RequiredCheck
+	if requiredErr == nil {
+		required, requiredErr = deps.SCMCache.ListRequiredChecks(ctx, requiredSpec, now)
+	}
+	requiredChecks := requiredChecksFact(required, requiredErr, pr)
+	requiredChecksUnread := requiredErr != nil
+	if requiredChecksUnread {
+		platform.Logger(ctx).Warn("decisioninbox: read base branch's required checks failed, eligibility will fail closed via ReasonRequiredChecksUnknown", "error", requiredErr, "repo", repoFullName, "pr_number", pr.Number, "base_ref", pr.BaseRef)
 	}
 
 	// A genuine correctness bug: computed ONCE, ignoring BOTH human-disagreement signals --
@@ -1408,6 +1454,7 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		AncestorChainAdvancedWithoutRewrite: ancestorChainAdvancedWithoutRewrite,
 		CIGreen:                             ciGreen,
 		CIConclusionDegraded:                pr.CIConclusionDegraded,
+		RequiredChecks:                      requiredChecks,
 		HasNeedsHumanLabel:                  false,
 		ChangedFileCount:                    changedFileCount,
 		TouchedBlastRadius:                  touchedBlastRadius,
@@ -1423,9 +1470,21 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// this function) to decide from -- called from EXACTLY ONE call site
 	// (buildPROpenItem's Kind-classification call, accepted=false), never
 	// from the AcceptanceMergeable display call (accepted=true).
+	// unconfirmedReason names the live read that failed first in the
+	// engine's own order -- a freshness read (base, ancestor chain) before
+	// the required checks -- for the one caller that shows it
+	// (buildPROpenItem's AcceptanceMergeBlockedReason).
+	var unconfirmedReason string
+	switch {
+	case degraded:
+		unconfirmedReason = reasonBaseCommitUnconfirmed
+	case requiredChecksUnread:
+		unconfirmedReason = string(autoapproval.ReasonRequiredChecksUnknown)
+	}
 	return eligibilityResult{
 		Eligible:                     eligible,
-		Degraded:                     degraded,
+		Degraded:                     degraded || requiredChecksUnread,
+		UnconfirmedReason:            unconfirmedReason,
 		EligibleIgnoringHumanSignals: eligibleIgnoringHumanSignals,
 		HeadSHA:                      record.HeadSHA,
 	}
@@ -1448,8 +1507,14 @@ type eligibilityResult struct {
 	// Degraded is true iff a live SCM lookup this function makes failed --
 	// see computeRealEligibility's own doc comment for the full producer
 	// list and its "unset for the GetLatest/!hasVerdict/
-	// LoadEligibilityConfig early returns" scoping.
+	// LoadEligibilityConfig early returns" scoping. The base branch's
+	// required checks (§21.2) are one of those lookups.
 	Degraded bool
+	// UnconfirmedReason, set whenever Degraded is, says which live read
+	// failed, in the engine's order: reasonBaseCommitUnconfirmed for a
+	// freshness read, ReasonRequiredChecksUnknown's text for the required
+	// checks.
+	UnconfirmedReason string
 	// EligibleIgnoringHumanSignals/HeadSHA back
 	// recordContestedIfApplicable's own §21.2 stage 2 "contested" write,
 	// below -- no OTHER caller/field may ever consult them. Both are the

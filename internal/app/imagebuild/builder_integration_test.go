@@ -158,6 +158,11 @@ func (f *fakeSourceControl) ListOpenPRsForUser(context.Context, ports.ListOpenPR
 	return nil, false, errors.New("fakeSourceControl: ListOpenPRsForUser not implemented")
 }
 
+// ListRequiredChecks is unused by this test's scenarios; the base requires nothing.
+func (f *fakeSourceControl) ListRequiredChecks(context.Context, ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
+	return nil, nil
+}
+
 func (f *fakeSourceControl) ResolveCodeOwners(context.Context, ports.ResolveCodeOwnersSpec) ([]ports.Owner, error) {
 	return nil, errors.New("fakeSourceControl: ResolveCodeOwners not implemented")
 }

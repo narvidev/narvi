@@ -447,6 +447,32 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	touchedBlastRadius := autoapproval.ClassifyChangedPaths(target.ChangedFiles)
 	touchedBlastRadiusKnown := !target.ChangedFilesListDegraded
 
+	// requiredChecks is the base branch's required checks at target's head
+	// (§21.2's "CI green means the required checks, not the checks that
+	// reported"), read as the bot -- live and uncached, like every other
+	// read in this function -- and evaluated against the checks target's
+	// own CI read listed (requiredchecks.go). Read BEFORE the probe, unlike
+	// the read model (computeRealEligibility): this function's refusal is
+	// shown, as a 409 body or the auto-merge worker's log line, and a
+	// required check that is still running or failed must be named in it
+	// -- behind the probe it would refuse first as "CI is not green". A
+	// failed read stands in the probe as "read, requiring nothing"
+	// (probeRequiredChecks), so it refuses only in the final call, on
+	// ReasonRequiredChecksUnknown, once every other criterion has passed:
+	// a transient failure never masks a pull request's lasting reason (G3,
+	// fourth round), and never falls back to the CI read alone.
+	requiredSpec, requiredErr := requiredChecksSpec(deps, target)
+	var required []ports.RequiredCheck
+	if requiredErr == nil {
+		requiredCtx, cancelRequired := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxRequiredChecksTimeout)
+		required, requiredErr = sourceControl.ListRequiredChecks(requiredCtx, requiredSpec)
+		cancelRequired()
+	}
+	if requiredErr != nil {
+		platform.Logger(ctx).Warn("decisioninbox: read base branch's required checks failed -- eligibility will fail closed via ReasonRequiredChecksUnknown unless another criterion refuses first", "error", requiredErr, "repo_full_name", repoFullName, "pr_number", prNumber, "base_ref", target.BaseRef)
+	}
+	requiredChecks := requiredChecksFact(required, requiredErr, target)
+
 	// probe (G3/G4, fourth adversarial-review round) asks "setting the
 	// base-freshness question aside entirely, is this PR already
 	// ineligible" -- every criterion below is fully known WITHOUT any
@@ -454,7 +480,11 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// both already in hand), the verdict's own base-REF/policy-version
 	// equality (record.Context vs. target, no new I/O, mirroring
 	// CurrentHeadSHA's own identical sourcing), CI, Shippable, diff size,
-	// and blast radius. The ANCESTOR CHAIN is NOT among these (round-11
+	// and blast radius -- plus the base branch's required checks, read
+	// just above as this function's one live call ahead of the probe
+	// (requiredChecks' own comment says why), entering as read or, when
+	// that read failed, as probeRequiredChecks' lenient stand-in. The
+	// ANCESTOR CHAIN is NOT among these (round-11
 	// finding E, corrected: a previous version of this paragraph listed
 	// it alongside base-ref/policy-version as though the probe genuinely
 	// compares it against target's own live value) -- CurrentAncestorChain
@@ -550,6 +580,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		AncestorChainAdvancedWithoutRewrite: true,
 		CIGreen:                             ciGreen,
 		CIConclusionDegraded:                ciConclusionDegraded,
+		RequiredChecks:                      probeRequiredChecks(requiredChecks), // the real fact once read; see requiredChecks above
 		HasNeedsHumanLabel:                  hasNeedsHuman,
 		ChangedFileCount:                    changedFileCount,
 		TouchedBlastRadius:                  touchedBlastRadius,
@@ -656,6 +687,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		AncestorChainAdvancedWithoutRewrite: live.AncestorChainAdvancedWithoutRewrite,
 		CIGreen:                             ciGreen,
 		CIConclusionDegraded:                ciConclusionDegraded,
+		RequiredChecks:                      requiredChecks,
 		HasNeedsHumanLabel:                  hasNeedsHuman,
 		ChangedFileCount:                    changedFileCount,
 		TouchedBlastRadius:                  touchedBlastRadius,

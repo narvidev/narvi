@@ -87,6 +87,15 @@ type fakeAutoMergeSourceControl struct {
 	resolveBranchSHA    string
 	resolveBranchSHAErr error
 
+	// requiredChecksByBranch/requiredChecksErr/requiredChecksCalls back
+	// ListRequiredChecks below (§21.2's "CI green means the required
+	// checks"): a branch absent from the map -- the nil map included, as in
+	// every test that never sets it -- requires nothing, so those tests
+	// read exactly as before required checks existed.
+	requiredChecksByBranch map[string][]ports.RequiredCheck
+	requiredChecksErr      error
+	requiredChecksCalls    []ports.ListRequiredChecksSpec
+
 	mergeCalls     []ports.MergePRSpec
 	mergeSHA       string
 	mergeErr       error
@@ -402,6 +411,21 @@ func (f *fakeAutoMergeSourceControl) ResolveCodeOwners(context.Context, ports.Re
 	return nil, errors.New("not implemented")
 }
 
+// ListRequiredChecks reports requiredChecksByBranch[spec.Branch], or
+// requiredChecksErr, recording the call. Honors ctx first, like GetOpenPR.
+func (f *fakeAutoMergeSourceControl) ListRequiredChecks(ctx context.Context, spec ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requiredChecksCalls = append(f.requiredChecksCalls, spec)
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if f.requiredChecksErr != nil {
+		return nil, f.requiredChecksErr
+	}
+	return f.requiredChecksByBranch[spec.Branch], nil
+}
+
 // automergeTestRig bundles every store internal/app/automerge.Worker
 // needs, backed by ONE shared Postgres pool (sharedpool_integration_test.go).
 type automergeTestRig struct {
@@ -435,8 +459,13 @@ func newAutomergeTestRig(t *testing.T) *automergeTestRig {
 }
 
 func (rs *automergeTestRig) deps(sourceControl ports.SourceControl) automerge.Deps {
+	outbound := platform.MustNewGitHubOutboundConfig("bot-token")
 	return automerge.Deps{
 		DecisionInbox: decisioninbox.Deps{
+			// The same bot credential as Outbound below, as
+			// controlplane/githuboutbound.go wires it: revalidation reads a
+			// base branch's required checks with it.
+			GitHubOutbound: outbound,
 			Plans:          narvipg.NewPlanStore(rs.pool),
 			Sessions:       narvipg.NewSessionStore(rs.pool),
 			Participants:   narvipg.NewParticipantStore(rs.pool),
@@ -451,7 +480,7 @@ func (rs *automergeTestRig) deps(sourceControl ports.SourceControl) automerge.De
 		},
 		SourceControl: sourceControl,
 		AuditLog:      rs.auditLog,
-		Outbound:      platform.MustNewGitHubOutboundConfig("bot-token"),
+		Outbound:      outbound,
 		Timeouts:      platform.DefaultTimeouts(),
 	}
 }
