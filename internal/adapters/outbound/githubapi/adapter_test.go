@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -723,11 +724,13 @@ func TestGetPullRequestDiff_Success(t *testing.T) {
 
 // TestGetPullRequestDiff_Truncated proves a diff exceeding
 // maxPRDiffResponseBytes is cut at the cap and reported as truncated,
-// rather than silently handed back partial with no signal.
+// rather than silently handed back partial with no signal. A capped prefix
+// holding no line break at all has no whole line to return.
 func TestGetPullRequestDiff_Truncated(t *testing.T) {
 	t.Parallel()
 
-	// 5 MiB of 'x' -- comfortably past the package's own 4 MiB cap.
+	// 5 MiB of 'x' with no line break -- comfortably past the package's
+	// own 4 MiB cap.
 	oversized := strings.Repeat("x", 5<<20)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
@@ -745,9 +748,8 @@ func TestGetPullRequestDiff_Truncated(t *testing.T) {
 	if !truncated {
 		t.Error("truncated = false, want true (the diff exceeded the cap)")
 	}
-	const wantLen = 4 << 20
-	if len(diff) != wantLen {
-		t.Errorf("len(diff) = %d, want exactly %d (cut at the cap)", len(diff), wantLen)
+	if diff != "" {
+		t.Errorf("len(diff) = %d, want 0 (the capped prefix holds no whole line)", len(diff))
 	}
 }
 
@@ -928,9 +930,8 @@ func TestGetCompareDiff_Truncated(t *testing.T) {
 	if !truncated {
 		t.Error("truncated = false, want true (the diff exceeded the cap)")
 	}
-	const wantLen = 4 << 20
-	if len(diff) != wantLen {
-		t.Errorf("len(diff) = %d, want exactly %d (cut at the cap)", len(diff), wantLen)
+	if diff != "" {
+		t.Errorf("len(diff) = %d, want 0 (the capped prefix holds no whole line)", len(diff))
 	}
 }
 
@@ -1888,4 +1889,95 @@ func TestCreateBranch_403RateLimited_APIErrorCarriesRateLimited(t *testing.T) {
 	if !apiErr.RateLimited {
 		t.Error("APIError.RateLimited = false, want true -- doPost must compute it exactly like doGet/doPut do")
 	}
+}
+
+// diffCutAt returns a unified diff body longer than the 4 MiB cap whose
+// cap falls right after partial, the start of a header line -- lead is the
+// whole lines of that section before it -- and the whole-line prefix a
+// truncated read must return: everything before partial.
+func diffCutAt(lead, partial, rest string) (body, wantPrefix string) {
+	const capBytes = 4 << 20
+	const lines = 400
+	head := "diff --git a/internal/app/big.go b/internal/app/big.go\n--- /dev/null\n+++ b/internal/app/big.go\n" + fmt.Sprintf("@@ -0,0 +1,%d @@\n", lines)
+	fill := capBytes - len(head) - len(lead) - len(partial)
+	var b strings.Builder
+	b.WriteString(head)
+	per := fill / lines
+	for i := 0; i < lines; i++ {
+		n := per
+		if i == lines-1 {
+			n = fill - per*(lines-1)
+		}
+		b.WriteString("+" + strings.Repeat("y", n-2) + "\n")
+	}
+	b.WriteString(lead)
+	wantPrefix = b.String()
+	b.WriteString(partial + rest + "\n@@ -0,0 +1,1 @@\n+z\n")
+	b.WriteString(strings.Repeat("+tail\n", 1000))
+	return b.String(), wantPrefix
+}
+
+// TestDiffTruncation_CutsAtALineBoundary proves both diff reads return a
+// truncated diff cut back to its last whole line, whatever header line the
+// byte cap lands inside, so no consumer ever parses a header cut short as
+// a path the change never touched.
+func TestDiffTruncation_CutsAtALineBoundary(t *testing.T) {
+	t.Parallel()
+
+	shapes := []struct {
+		name          string
+		lead, partial string
+		rest          string
+	}{
+		{"inside a +++ path", "diff --git a/internal/z.go b/internal/z.go\n--- a/internal/z.go\n", "+++ b/int", "ernal/z.go"},
+		{"inside a diff --git header", "", "diff --git a/internal/x.go b/in", "ternal/x.go"},
+		{"inside +++ /dev/null", "diff --git a/internal/gone.go b/internal/gone.go\ndeleted file mode 100644\n--- a/internal/gone.go\n", "+++ /dev/nu", "ll"},
+		{"right after +++ b", "diff --git a/internal/w.go b/internal/w.go\n--- a/internal/w.go\n", "+++ b", "/internal/w.go"},
+	}
+	reads := []struct {
+		name string
+		read func(a *githubapi.Adapter) (string, bool, error)
+	}{
+		{"GetCompareDiff", func(a *githubapi.Adapter) (string, bool, error) {
+			return a.GetCompareDiff(context.Background(), "acme", "widgets", "main", "sha", "gho_bottoken")
+		}},
+		{"GetPullRequestDiff", func(a *githubapi.Adapter) (string, bool, error) {
+			return a.GetPullRequestDiff(context.Background(), "acme", "widgets", 42, "gho_bottoken")
+		}},
+	}
+	for _, shape := range shapes {
+		body, wantPrefix := diffCutAt(shape.lead, shape.partial, shape.rest)
+		for _, read := range reads {
+			t.Run(shape.name+"/"+read.name, func(t *testing.T) {
+				t.Parallel()
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.WriteHeader(http.StatusOK)
+					_, _ = w.Write([]byte(body))
+				}))
+				defer server.Close()
+
+				diff, truncated, err := read.read(githubapi.New(server.Client(), server.URL))
+				if err != nil {
+					t.Fatalf("error = %v, want nil", err)
+				}
+				if !truncated {
+					t.Error("truncated = false, want true (the diff exceeded the cap)")
+				}
+				if diff != wantPrefix {
+					t.Errorf("diff is %d bytes ending %q, want the %d-byte whole-line prefix ending %q", len(diff), lastBytes(diff), len(wantPrefix), lastBytes(wantPrefix))
+				}
+				if !strings.HasSuffix(diff, "\n") {
+					t.Error("truncated diff does not end at a line boundary")
+				}
+			})
+		}
+	}
+}
+
+// lastBytes is s's last 40 bytes, for a readable failure message.
+func lastBytes(s string) string {
+	if len(s) > 40 {
+		return s[len(s)-40:]
+	}
+	return s
 }

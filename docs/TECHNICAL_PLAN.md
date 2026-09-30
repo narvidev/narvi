@@ -2207,9 +2207,11 @@ trust agent judgment for routing; deterministic fallbacks throughout, §18):
   `review:low/medium/high-risk`, which `ComputeLabelSync` overwrites on every posted verdict and is
   therefore not a stable routing input, so those three are deliberately not among these signals; a
   hand-applied risk label would just be clobbered by the next verdict regardless.
-- **v1 rules** (initial thresholds): any sensitive-glob hit → always deep; >600 changed lines or
-  ≥3 distinct top-level path roots → deep; a prior `high` verdict on this PR (Step 62) → deep; a
-  `review:needs-human` label → deep; otherwise light. **No LLM tie-break in v1** — a `review_depth`
+- **v1 rules** (initial thresholds): any sensitive-glob hit → always deep; >600 changed source lines
+  (test, documentation and generated files left out of the count, the amendment below) or ≥3
+  distinct top-level path roots → deep; a prior `high` verdict on this PR (Step 62) → deep; a
+  `review:needs-human` label → deep; an input that could not be read in full, when none of those
+  fired → deep (same amendment); otherwise light. **No LLM tie-break in v1** — a `review_depth`
   surface on the unified classifier (§18) remains a v2 option only if per-path analytics show a
   real grey zone (the classifier consumes free text today, so this would be new surface area, not
   a config flip).
@@ -2224,7 +2226,8 @@ trust agent judgment for routing; deterministic fallbacks throughout, §18):
   cross-family counter-review (§26.4): the family comes from provenance, the tier from depth.
 - **Per-repo config**: `reviewDepth: {mode: auto|always_light|always_deep, deepPaths: [...]}`
   alongside the other per-repo review settings. **Any triage error fails open to light** — a
-  review must never be blocked by its own router.
+  review must never be blocked by its own router. An input the router could not read is not one of
+  its errors: it routes deep under a reason of its own (the amendment below).
 - **Re-review on push** (§24): depth re-evaluated on the delta, but floored at the PR's previous
   depth — once deep, a PR stays deep, with one explicit exception (and a second, below: a depth
   chosen because an input could not be read is never a floor): a repo configured
@@ -2279,22 +2282,64 @@ the axis is binary-on, not size-gated); further gating *within* the deep path (s
 `architecture-scribe` or `counter-reviewer` themselves below some size) is named, not designed —
 §26.9 resolves why it stays out of v1.
 
-**An unreadable input is not a small change (amendment).** The router sizes a
+**An unreadable input is not a small change (amendment, shipped in Step 199).** The router sizes a
 review from the additions, deletions and changed paths its context carries. A pull request that could
 not be read leaves all three empty, and a diff that could not be read leaves the paths empty, so the
-review can route light under the reason a one-line fix gets, and a sensitive path it touches is invisible.
-The fail-open rule above covers the router's own errors; an input that could not be read is a
-different case. The decision record already notes an empty or truncated diff but not why it is empty,
-a change that is genuinely empty or a read that failed; it records the cause in every case, and an
-unreadable input routes deep (decided 2026-09-28): a missing size costs a thorough review, a missing
-scope costs a finding. An explicit
-`always_light` override still wins, being an admin's decision, and the cause is recorded under it too;
-a truncated file list counts as unreadable;
-and a depth chosen for an unreadable input is never the next review's floor. The size that routes
-counts source changes only: test, documentation and generated files, matched by patterns the
-deployment configures (never by markers the pull request carries), are left out of the count, while
-the path signals keep reading every changed path. The paths are the pull request's own, so production code placed under a test
-directory shrinks the count; the path signals still see it. The cost budget (§26.7) is unaffected.
+review used to route light under the reason a one-line fix gets, and a sensitive path it touched was
+invisible. The fail-open rule above covers the router's own errors; an input that could not be read is
+a different case, and routes deep (decided 2026-09-28): a missing size costs a thorough review, a
+missing scope costs a finding. As built:
+
+- **The cause travels as a typed value.** The review context's producer (`reviewcontext.Fetch`, and
+  each lane that makes no read at all) sets `review.InputRead`: `complete`; `empty` (the diff is
+  empty and the pull request reports no changed file — a genuinely empty change); `not_fetched` (no
+  fetcher, GitHub outbound off, or a repository name that is not `owner/repo`); `pr_unreadable`;
+  `diff_unreadable` (the diff read failed, came back empty for a pull request that reports changed
+  files, or named no file); `diff_truncated` (cut at the response-size cap, or naming fewer paths than
+  the pull request reports changed files). The decision never infers the cause from empty fields, and
+  an unset value is itself unreadable, so a lane that forgets to say routes deep, not light.
+- **The rule.** Anything but `complete` or `empty` routes deep under `review input could not be read
+  in full` — the LAST deep rule, checked only when nothing else routes deep. Every rule before it
+  fires only on something that was actually read: a sensitive or configured deep path, a source line
+  or a top-level root seen in a partial diff is still there in the whole one (a partial read only
+  undercounts — guaranteed because the code host adapter cuts a truncated diff back to its last
+  line boundary, so no header line cut short at the size cap reads as a path the change never
+  touched), and the verdict history and the `review:needs-human` label do not come from the diff
+  at all. So a review with an unreadable input that is also deep for one of those real reasons
+  records that reason, and floors the next review. An explicit `always_light` override still wins,
+  being an admin's decision. The routing record (`turns.review_depth_decision`) carries `inputRead`
+  in every case, the override included, beside `diffEmpty`/`diffTruncated`, which alone could not say
+  whether an empty diff was an empty change or a failed read.
+- **Never a floor.** The re-review floor reads the `review_path` of the pull request's latest verdict
+  whose producing turn (`attempt_id`) was not routed for the unreadable-input reason, stepping over
+  the ones that were. Because that reason is recorded only when the missing input alone decided, one
+  transient failure never keeps a pull request deep, while a review that was deep for a real reason
+  — whether before an unreadable review or on it — keeps flooring. Every lane (mention, label, the
+  re-review button, the automatic re-review) reads this one floor; the automatic re-review no longer
+  keeps a second read of its own.
+- **The size counts source changes only.** The line threshold compares the diff's own lines less
+  those of files matched by the deployment's size patterns. The size comes from the single diff read
+  pinned to the head under review, never from GitHub's reported line counts less something: those
+  are a separate read that could describe another head, so they are recorded (`changedLines`, beside
+  the diff's own total, `diffLines`) and never mixed in. For a complete diff the source size is exact;
+  for a partial one it is a lower bound, which can still route deep on its own. Exclusion is by the
+  deployment's patterns alone, never by markers the pull request carries (`.gitattributes`, a file
+  header), which its author controls. The patterns are `NARVI_REVIEW_SIZE_EXCLUDED_PATHS`
+  (comma-separated, the gitignore dialect `codeowners` already implements): unset means the built-in
+  default (`reviewtriage.DefaultSizeExclusions`, listed with the reason for each entry in §26.5), set
+  replaces it, and set to empty counts every line. An entry using a construct that dialect does not
+  implement — a leading `!`, `[...]`, `{a,b}`, a backslash, a leading `#` — refuses to boot, naming
+  the construct, since the entry would be read as literal text and never match. A rename is left out
+  only when both of its paths match. A path containing a space is matched without the TAB git (and
+  GitHub's compare diff) appends to its `---`/`+++` lines.
+
+The path signals (sensitive globs, root dispersion) keep reading every changed path. Stated
+residuals: paths are the pull request's own, so a hand-written production file named like a test or
+a generated file (`*_test.go`, `*.test.ts`, `*_generated.go`, …) shrinks the count; a Markdown file a
+product embeds and ships is left out as documentation; the sensitive-path rules still apply to both.
+The cost budget (§26.7) is unaffected. A record written before this amendment has no `inputRead`,
+`sourceLines` or `diffLines` and decodes as before; a record written after it decodes in the earlier
+shape, which ignores those fields and reads the new reason as the string it is.
 
 ### 26.4 The deep path: adversarial counter-review (Step 69)
 
@@ -2428,6 +2473,34 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
   already-dispatched turn — never claim more than that; and the paradigm's proxy
   metric: **% of PRs approved with zero human inline comments** — the number that says whether the
   shift is actually operating.
+- **Reading cost and precision per path after Step 199** (§26.3's amendment): a review routed deep
+  because its input could not be read is still a deep review (`review_path = deep`, and it costs
+  what a deep review costs), but it was not routed deep by anything in the change. Its routing record
+  names the reason (`review input could not be read in full`) and the cause (`inputRead`), so the
+  per-path figures can be read with and without those reviews, and a rise in them is itself a
+  signal: a read path that is failing, not a codebase that got riskier. The same record carries the
+  pull request's total changed lines beside the source lines the threshold compared, so the effect
+  of the deployment's size patterns on routing volume is measurable rather than assumed.
+- **What the default size patterns leave out, and why none can match hand-written production code**
+  (§26.3's amendment; `reviewtriage.DefaultSizeExclusions`). Each entry is judged by the file's NAME
+  alone — never by a directory name, since a package named `doc`, `docs` or `test` is ordinary
+  production code in many repositories:
+  - `*_test.go` — the Go toolchain compiles a `_test.go` file only into a test binary, never into a
+    production build.
+  - `*.test.ts`, `*.test.tsx` — the test runner's discovery suffix for TypeScript, the convention this
+    repository's own web code uses; a module named so is collected as a test file.
+  - `*.md`, `*.rst`, `*.adoc` — documentation formats, not program source.
+  - `*.pb.go`, `*_pb2.py`, `*_pb2_grpc.py` — the names the protocol buffer compiler gives its output;
+    the `.proto` source stays counted.
+  - `zz_generated.*`, `*_generated.go`, `*.gen.go` — file names that say the file is generated.
+
+  Counted on purpose: test directories and other languages' test names (sized with their code until
+  an operator adds them), JVM names ending in `Test` (a main-source class can carry one), `*.spec.*`
+  (API contracts use it), lockfiles (the only record of a dependency's resolved source and hash, and
+  no sensitive-path rule covers dependencies, so a large lockfile rewrite must still route deep by
+  size), minified bundles and snapshots (shipped or asserted content), and MDX (compiled into
+  pages). An operator whose repositories follow other conventions widens the list with
+  `NARVI_REVIEW_SIZE_EXCLUDED_PATHS`.
 - The §21.3 deterministic digest and the §16 decision inbox surface the readout's `Summary` line
   per PR — reusing their existing aggregation, no new mechanism.
 - **Evals**: known-PR digest-quality cases (expected architecture decisions on reference diffs,

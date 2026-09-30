@@ -100,6 +100,10 @@ type Actor struct {
 	// RegistryOptions.ReviewModelDeep's own doc comment.
 	reviewModelDeep string
 
+	// reviewSizeExclusions -- see RegistryOptions.ReviewSizeExclusions'
+	// own doc comment.
+	reviewSizeExclusions []string
+
 	// diffFetcher is §14.4's ("handoff-readiness sentinel", §14.4) own
 	// addition -- see Registry's own identical field doc comment
 	// (registry.go) for the full rationale; handoffsentinel.go's own

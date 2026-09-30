@@ -125,6 +125,7 @@ func (r *Registry) hydrateAndAcquire(ctx context.Context, sessionID pgtype.UUID)
 		githubOutbound:         r.githubOutbound,
 		githubBotHandle:        r.githubBotHandle,
 		reviewModelDeep:        r.reviewModelDeep,
+		reviewSizeExclusions:   r.reviewSizeExclusions,
 		contractDriftDetected:  r.contractDriftDetected,
 		opsMetrics:             r.opsMetrics,
 		repoAccessCache:        r.repoAccessCache,

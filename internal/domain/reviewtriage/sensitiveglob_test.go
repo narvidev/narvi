@@ -10,7 +10,7 @@ func TestDecide_SensitiveGlobDoesNotIncludeContracts(t *testing.T) {
 	// Regression pin for the deliberate divergence from
 	// internal/domain/autoapproval.DefaultSensitiveTags -- see
 	// sensitiveglob.go's own doc comment.
-	sig := reviewtriage.Signals{ChangedPaths: []string{"contracts/rest/v1/dtos.schema.json"}}
+	sig := readable(reviewtriage.Signals{ChangedPaths: []string{"contracts/rest/v1/dtos.schema.json"}})
 	got := reviewtriage.Decide(sig, reviewtriage.DefaultConfig())
 	if got.Depth != reviewtriage.DepthLight {
 		t.Fatalf("a contracts-only change must not trip triage's own sensitive-glob rule, got %q (reason=%q)", got.Depth, got.Reason)
@@ -34,7 +34,7 @@ func TestMatchDeepPath_Semantics(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			sig := reviewtriage.Signals{ChangedPaths: []string{tt.path}}
+			sig := readable(reviewtriage.Signals{ChangedPaths: []string{tt.path}})
 			cfg := reviewtriage.Config{Mode: reviewtriage.ModeAuto, DeepPaths: []string{tt.pattern}}
 			got := reviewtriage.Decide(sig, cfg)
 			gotMatch := got.Depth == reviewtriage.DepthDeep && got.Reason == reviewtriage.ReasonDeepPathConfig

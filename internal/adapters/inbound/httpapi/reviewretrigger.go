@@ -216,11 +216,11 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		// WHOLE struct is needed further down to compute this manual
 		// re-trigger's own light/deep triage decision, mirroring
 		// internal/adapters/inbound/github's own identical hoist
-		// (handler.go). review.PreFetchedContext{} (every field its own
-		// honest zero value) is exactly what a nil diffFetcher, or a
-		// repo_full_name that fails to split, degrades to --
-		// internal/app/reviewtriage.ComputeDecision's own fail-open
-		// posture already treats an all-zero Signals as "route light".
+		// (handler.go). A nil diffFetcher, GitHub outbound off, or a
+		// repo_full_name that fails to split leaves prCtx empty but for
+		// InputRead, which says no read was made (review.
+		// InputReadNotFetched): the depth decision routes that as an
+		// unreadable input, never as a small change (§26.3).
 		// havePrCtx (D2's own fix) tracks whether prCtx below went through
 		// the review-context path -- a real Fetch call, or GitHub outbound
 		// being off, which takes that path's own degraded outcome -- exactly
@@ -231,7 +231,7 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		// prompt stays the plain fixed text with no diff/verdict-tool-
 		// instructions block appended.
 		var reviewHeadSHA *string
-		var prCtx review.PreFetchedContext
+		prCtx := review.PreFetchedContext{InputRead: review.InputReadNotFetched}
 		havePrCtx := false
 		switch {
 		case diffFetcher == nil:
@@ -239,10 +239,12 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		case outbound == nil:
 			// GitHub outbound off (§12.5): no credential to read the pull
 			// request as the bot, so no call is made, and the turn takes the
-			// SAME degraded path a failed live read takes -- reviewcontext.
-			// Fetch's honest zero context, havePrCtx set -- not the plain
-			// text of a nil diffFetcher. RenderTurnPrompt then still adds
-			// the verdict tool's instructions, so the review can post what
+			// SAME degraded path a failed live read takes -- an empty
+			// context whose InputRead says no read was made, so the depth
+			// decision routes it as an unreadable input (§26.3), havePrCtx
+			// set -- not the plain text of a nil diffFetcher.
+			// RenderTurnPrompt then still adds the verdict tool's
+			// instructions, so the review can post what
 			// it finds: the sandbox reads the code through the GitHub App's
 			// read-only token, which this axis does not touch, and the
 			// verdict tool records its findings (review_findings), which the

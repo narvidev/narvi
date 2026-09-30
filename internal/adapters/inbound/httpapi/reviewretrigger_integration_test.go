@@ -9,6 +9,7 @@ package httpapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"testing"
@@ -59,10 +60,16 @@ type fakeReviewContextFetcher struct {
 	// review.PreFetchedContext.BaseSHA -- and therefore the persisted
 	// review_verdict_context.baseSha -- is genuinely non-empty.
 	resolveBranchSHA string
+
+	// prErr/diffErr fail the pull-request and diff reads -- the unreadable
+	// inputs §26.3 routes deep (TestRetriggerReview_UnreadableInput_
+	// RoutesDeepAndRecordsTheCause). nil in every other test.
+	prErr   error
+	diffErr error
 }
 
 func (f *fakeReviewContextFetcher) GetPullRequest(_ context.Context, _, _ string, _ int32, _ string) (githubapi.PullRequest, error) {
-	return f.pr, nil
+	return f.pr, f.prErr
 }
 
 // ResolveBranchSHA (finding F1 (§21.1's amendment)) reports resolveBranchSHA --
@@ -77,7 +84,7 @@ func (f *fakeReviewContextFetcher) ResolveBranchSHA(_ context.Context, spec port
 
 func (f *fakeReviewContextFetcher) GetCompareDiff(_ context.Context, owner, repo, base, head, token string) (string, bool, error) {
 	f.diffOwner, f.diffRepo, f.diffBase, f.diffHead, f.diffToken = owner, repo, base, head, token
-	return f.diff, f.diffTruncated, nil
+	return f.diff, f.diffTruncated, f.diffErr
 }
 
 // createOwnedGitHubReviewSession creates a session (CreatedBy = owner) plus
@@ -711,9 +718,9 @@ func TestRetriggerReview_AwaitingPlanAlwaysDeclines_NeverClassifies(t *testing.T
 // test for this lane (adversarial-review fix, "re-review depth floor
 // applied at only 1 of 3 lanes"): before this fix, this endpoint fed the
 // FRESH, unfloored triage decision straight through with no awareness of
-// this PR's own prior depth at all -- a light-looking re-review (no
-// diffFetcher wired here, so the fresh signal is the honest, maximally
-// light "nothing to see" input) through this button would have produced
+// this PR's own prior depth at all -- a light-looking re-review (a
+// one-line readable diff; an input never fetched now routes deep on its
+// own, §26.3, which would hide the floor) through this button would have produced
 // review_depth = "light" even though this PR had already gone deep once,
 // silently defeating §24's own "once deep, a PR stays deep" floor for
 // every OTHER lane reading review_verdicts.review_path back afterward
@@ -723,7 +730,12 @@ func TestRetriggerReview_AwaitingPlanAlwaysDeclines_NeverClassifies(t *testing.T
 // verdict" signal) feeds domainreviewtriage.Floor, and the floored --
 // never the fresh -- depth is what actually gets persisted.
 func TestRetriggerReview_DeepToLight_StaysFloorAtDeep(t *testing.T) {
-	rig := newTestRig(t)
+	rig := newTestRig(t, func(r *testRig) {
+		r.diffFetcher = &fakeReviewContextFetcher{
+			pr:   githubapi.PullRequest{HeadSHA: "sha-light-head", BaseRef: "main", ChangedFiles: 1, Additions: 1, Deletions: 1},
+			diff: "diff --git a/internal/app/foo/a.go b/internal/app/foo/a.go\n--- a/internal/app/foo/a.go\n+++ b/internal/app/foo/a.go\n@@ -1 +1 @@\n-x\n+y\n",
+		}
+	})
 	ctx := context.Background()
 	owner, _ := rig.createAuthenticatedUser(ctx, t)
 	_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMaintainer)
@@ -756,10 +768,9 @@ func TestRetriggerReview_DeepToLight_StaysFloorAtDeep(t *testing.T) {
 		t.Fatalf("seed prior deep review verdict: %v", err)
 	}
 
-	// No diffFetcher wired -- prCtx stays the honest all-zero value, so
-	// the FRESH decision this firing computes is deterministically light
-	// (ReasonLightDefault, internal/domain/reviewtriage.Decide's own rule
-	// 6) -- the floor, not the fresh signal, is what this test isolates.
+	// A one-line readable diff -- the FRESH decision this firing computes
+	// is deterministically light (ReasonLightDefault) -- the floor, not
+	// the fresh signal, is what this test isolates.
 	var resp restdtos.CreateTurnResponse
 	status := rig.doJSON(t, http.MethodPost, "/api/sessions/"+session.ID.String()+"/review/retrigger", nil, &resp, token)
 	if status != http.StatusCreated {
@@ -794,5 +805,111 @@ func TestRetriggerReview_DeepToLight_StaysFloorAtDeep(t *testing.T) {
 	}
 	if !record.Floored {
 		t.Error("review_depth_decision.floored = false, want true (the fresh decision was light; the floor is what actually decided)")
+	}
+}
+
+// TestRetriggerReview_UnreadableInput_RoutesDeepAndRecordsTheCause pins
+// §26.3's unreadable-input rule through this lane (the re-review button):
+// whatever the review context could not read -- or never tried to -- the
+// turn routes deep under its own reason and its routing record names the
+// cause. One rig per case: each re-review spawns a session actor, which
+// pins a connection of the rig's small pool.
+func TestRetriggerReview_UnreadableInput_RoutesDeepAndRecordsTheCause(t *testing.T) {
+	readablePR := githubapi.PullRequest{HeadSHA: "sha-unreadable-head", BaseRef: "main", ChangedFiles: 2, Additions: 5, Deletions: 1}
+	tests := []struct {
+		name          string
+		fetcher       *fakeReviewContextFetcher
+		wantDepth     string
+		wantReason    string
+		wantInputRead string
+	}{
+		{name: "no read made", fetcher: nil, wantDepth: "deep", wantReason: "review input could not be read in full", wantInputRead: "not_fetched"},
+		{name: "pull request unreadable", fetcher: &fakeReviewContextFetcher{prErr: errors.New("github 502")}, wantDepth: "deep", wantReason: "review input could not be read in full", wantInputRead: "pr_unreadable"},
+		{name: "diff unreadable", fetcher: &fakeReviewContextFetcher{pr: readablePR, diffErr: errors.New("github 502")}, wantDepth: "deep", wantReason: "review input could not be read in full", wantInputRead: "diff_unreadable"},
+		{name: "diff names fewer files than the pull request", fetcher: &fakeReviewContextFetcher{pr: readablePR, diff: "diff --git a/internal/a.go b/internal/a.go\n--- a/internal/a.go\n+++ b/internal/a.go\n@@ -1 +1 @@\n-x\n+y\n"}, wantDepth: "deep", wantReason: "review input could not be read in full", wantInputRead: "diff_truncated"},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rig := newTestRig(t, func(r *testRig) {
+				if tt.fetcher != nil {
+					r.diffFetcher = tt.fetcher
+				}
+			})
+			ctx := context.Background()
+			owner, _ := rig.createAuthenticatedUser(ctx, t)
+			_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMaintainer)
+			session := rig.createOwnedGitHubReviewSession(ctx, t, owner.ID, "acme/unreadable-retrigger-repo", int32(300+i))
+
+			var resp restdtos.CreateTurnResponse
+			if status := rig.doJSON(t, http.MethodPost, "/api/sessions/"+session.ID.String()+"/review/retrigger", nil, &resp, token); status != http.StatusCreated {
+				t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+			}
+
+			var reviewDepth *string
+			var recordJSON []byte
+			if err := rig.pool.QueryRow(ctx, `SELECT review_depth, review_depth_decision FROM turns WHERE id = $1`, resp.Id).Scan(&reviewDepth, &recordJSON); err != nil {
+				t.Fatalf("query turn: %v", err)
+			}
+			if reviewDepth == nil || *reviewDepth != tt.wantDepth {
+				t.Errorf("turns.review_depth = %v, want %q", reviewDepth, tt.wantDepth)
+			}
+			var record struct {
+				Reason    string `json:"reason"`
+				InputRead string `json:"inputRead"`
+			}
+			if err := json.Unmarshal(recordJSON, &record); err != nil {
+				t.Fatalf("unmarshal review_depth_decision %s: %v", recordJSON, err)
+			}
+			if record.Reason != tt.wantReason || record.InputRead != tt.wantInputRead {
+				t.Errorf("record reason/inputRead = %q/%q, want %q/%q", record.Reason, record.InputRead, tt.wantReason, tt.wantInputRead)
+			}
+		})
+	}
+}
+
+// TestRetriggerReview_SizePatternsReachTheDecision pins that the
+// deployment's size patterns, carried on the Deps this route is built
+// with, reach the re-review button's decision: 40 source lines beside 600
+// test lines route light, on 40.
+func TestRetriggerReview_SizePatternsReachTheDecision(t *testing.T) {
+	var diff strings.Builder
+	diff.WriteString("diff --git a/internal/app/billing/charge.go b/internal/app/billing/charge.go\n--- a/internal/app/billing/charge.go\n+++ b/internal/app/billing/charge.go\n@@ -0,0 +1,40 @@\n")
+	for i := 0; i < 40; i++ {
+		diff.WriteString("+source line\n")
+	}
+	diff.WriteString("diff --git a/internal/app/billing/charge_test.go b/internal/app/billing/charge_test.go\n--- a/internal/app/billing/charge_test.go\n+++ b/internal/app/billing/charge_test.go\n@@ -0,0 +1,600 @@\n")
+	for i := 0; i < 600; i++ {
+		diff.WriteString("+test line\n")
+	}
+	rig := newTestRig(t, func(r *testRig) {
+		r.diffFetcher = &fakeReviewContextFetcher{
+			pr:   githubapi.PullRequest{HeadSHA: "sha-size-head", BaseRef: "main", ChangedFiles: 2, Additions: 640},
+			diff: diff.String(),
+		}
+	})
+	ctx := context.Background()
+	owner, _ := rig.createAuthenticatedUser(ctx, t)
+	_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMaintainer)
+	session := rig.createOwnedGitHubReviewSession(ctx, t, owner.ID, "acme/size-retrigger-repo", 373)
+
+	var resp restdtos.CreateTurnResponse
+	if status := rig.doJSON(t, http.MethodPost, "/api/sessions/"+session.ID.String()+"/review/retrigger", nil, &resp, token); status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+	}
+
+	var reviewDepth *string
+	var recordJSON []byte
+	if err := rig.pool.QueryRow(ctx, `SELECT review_depth, review_depth_decision FROM turns WHERE id = $1`, resp.Id).Scan(&reviewDepth, &recordJSON); err != nil {
+		t.Fatalf("query turn: %v", err)
+	}
+	var record struct {
+		ChangedLines int  `json:"changedLines"`
+		SourceLines  *int `json:"sourceLines"`
+	}
+	if err := json.Unmarshal(recordJSON, &record); err != nil {
+		t.Fatalf("unmarshal review_depth_decision %s: %v", recordJSON, err)
+	}
+	if reviewDepth == nil || *reviewDepth != "light" || record.SourceLines == nil || *record.SourceLines != 40 || record.ChangedLines != 640 {
+		t.Errorf("review_depth = %v, record = %s, want light with changedLines 640 and sourceLines 40", reviewDepth, recordJSON)
 	}
 }

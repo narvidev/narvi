@@ -58,6 +58,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowledger"
 	"github.com/narvidev/narvi/internal/domain/integrations"
+	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -658,7 +659,10 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		// -- no new store, no new pool connection. reviewModelDeep stays ""
 		// (unconfigured) -- no test in this package needs a specific
 		// deep-tier model id, only the depth decision itself.
-		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(rig.pool, rig.sessions, rig.turns, rig.plans, rig.auditLog, rig.registry, rig.prSessions, rig.diffFetcher, rig.reviewFindings, rig.falsePositivePatterns, rig.reviewVerdicts, nil, rig.outbound, platform.DefaultTimeouts(), appreviewtriage.Deps{RepoSettings: rig.repoSettings, ReviewVerdicts: rig.reviewVerdicts}, ""))
+		// SizeExclusions is the deployment's default size patterns, the
+		// value serve.go wires from platform.Config when
+		// NARVI_REVIEW_SIZE_EXCLUDED_PATHS is unset.
+		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(rig.pool, rig.sessions, rig.turns, rig.plans, rig.auditLog, rig.registry, rig.prSessions, rig.diffFetcher, rig.reviewFindings, rig.falsePositivePatterns, rig.reviewVerdicts, nil, rig.outbound, platform.DefaultTimeouts(), appreviewtriage.Deps{RepoSettings: rig.repoSettings, ReviewVerdicts: rig.reviewVerdicts, SizeExclusions: domainreviewtriage.DefaultSizeExclusions()}, ""))
 		// review readout (§26.1's merge readout, §12.2 item 2) -- see
 		// reviewreadout.go's own doc comment. rig.diffFetcher/rig.
 		// positionResolver default nil, mirroring review/retrigger's own

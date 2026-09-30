@@ -47,6 +47,14 @@ type Config struct {
 	// full shape and DefaultCostBudget for this Step's own proposed
 	// starting figures.
 	CostBudget CostBudget
+	// SizeExclusions are this DEPLOYMENT's test, documentation and
+	// generated-file patterns (platform.Config.ReviewSizeExcludedPaths,
+	// DefaultSizeExclusions when unset) -- the same for every repo, set by
+	// internal/app/reviewtriage.ComputeDecision from its Deps rather than
+	// read from repo_settings. Files they match are left out of the size
+	// Decide routes on, never out of the path signals. Nil excludes
+	// nothing.
+	SizeExclusions []string
 }
 
 // DefaultConfig is the engine's own built-in default -- applied whenever

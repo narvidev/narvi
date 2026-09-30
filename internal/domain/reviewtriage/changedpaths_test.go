@@ -43,6 +43,15 @@ func TestExtractChangedPaths(t *testing.T) {
 			[]string{"gone.go"},
 		},
 		{
+			// git (and GitHub's compare diff) ends a "---"/"+++" line with a
+			// TAB when the path holds a space; the TAB is not part of the
+			// name.
+			"a path with a space loses git's trailing tab",
+			"diff --git a/my dir/foo_test.go b/my dir/foo_test.go\n--- a/my dir/foo_test.go\t\n+++ b/my dir/foo_test.go\t\n@@ -1 +1 @@\n-x\n+y\n" +
+				"diff --git a/my dir/gone.md b/my dir/gone.md\n--- a/my dir/gone.md\t\n+++ /dev/null\n@@ -1 +0,0 @@\n-x\n",
+			[]string{"my dir/foo_test.go", "my dir/gone.md"},
+		},
+		{
 			"duplicate header lines dedupe",
 			"diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1 @@\n-x\n+y\n" +
 				"diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -5 +5 @@\n-x\n+y\n",

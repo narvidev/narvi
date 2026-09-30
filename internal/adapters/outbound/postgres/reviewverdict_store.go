@@ -68,6 +68,24 @@ func (s *ReviewVerdictStore) GetLatest(ctx context.Context, repoFullName string,
 	})
 }
 
+// GetLatestFloorReviewPath fetches the review_path §24's re-review floor
+// composes with: that of (repoFullName, prNumber)'s latest verdict whose
+// producing turn was not routed for one of nonFloorReasons -- see
+// GetLatestFloorReviewPath's own generated doc comment. A nil
+// nonFloorReasons is sent as an empty array (skip nothing), never as SQL
+// NULL, which "<> ALL" would read as unknown and so match no row at all.
+// pgx.ErrNoRows (unwrapped) means no verdict can floor this PR.
+func (s *ReviewVerdictStore) GetLatestFloorReviewPath(ctx context.Context, repoFullName string, prNumber int32, nonFloorReasons []string) (*string, error) {
+	if nonFloorReasons == nil {
+		nonFloorReasons = []string{}
+	}
+	return s.q.GetLatestFloorReviewPath(ctx, sqlcgen.GetLatestFloorReviewPathParams{
+		RepoFullName:    repoFullName,
+		PrNumber:        prNumber,
+		NonFloorReasons: nonFloorReasons,
+	})
+}
+
 // GetLatestNonShadow fetches (repoFullName, prNumber)'s own LATEST
 // verdict (GetLatest's own doc comment immediately above -- the identical
 // "never post time alone" correction applies here too), excluding any
