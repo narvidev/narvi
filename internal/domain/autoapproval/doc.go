@@ -83,7 +83,7 @@
 //     path's answer, never a second comparison's.
 //
 //  5. EligibilityInput.CIConclusionDegraded must be false -- the live CI
-//     read (check 6 below) must have actually been FULLY performed
+//     read (check 7 below) must have actually been FULLY performed
 //     before its own answer is trusted for anything: ports.OpenPR.
 //     CIConclusionDegraded's own doc comment (githubapi.
 //     fetchCIConclusionLive makes two independent GETs, and either can
@@ -91,34 +91,50 @@
 //     this is true -- this check changes no OUTCOME by itself -- but it
 //     is checked FIRST, on its own dedicated reason
 //     (ReasonCIConclusionDegraded), the same "is the fact even knowable"
-//     precedence check 9 below already establishes for check 10, so a
+//     precedence check 10 below already establishes for check 11, so a
 //     half-read CI composite refuses distinguishably from a confirmed-red
 //     one (CIGreen == false, this field == false) or a still-running one.
 //
-//  6. CIGreen -- must be true.
+//  6. EligibilityInput.RequiredChecks -- the base branch's required
+//     checks (§21.2's "CI green means the required checks" amendment)
+//     must have been read (ReasonRequiredChecksUnknown otherwise, never a
+//     fall-back to the CI read alone), and the head must satisfy each one:
+//     reported, from the App the base names when it names one (its check
+//     run, or a commit status its bot account posted, that App identified
+//     by id), and passed -- a check run and a commit status of the same
+//     name both passed. A required check that is missing, could not be
+//     confirmed, still running or failed refuses with a Reason naming it,
+//     and its App (requiredchecks.go). narvi/review is taken
+//     out of the required set: it is the review this eligibility already
+//     reads. Checked before check 7, so a required check that has not
+//     reported is named rather than read as "CI is not green".
 //
-//  7. Verdict.Shippable == review.ShippableAuto.
+//  7. CIGreen -- must be true, whatever check 6 said: the required set is
+//     added to the CI read, never substituted for it, so a failing check
+//     the base does not require still blocks here.
 //
-//  8. EligibilityInput.ChangedFileCount <= cfg.MaxFilesChanged (diff
+//  8. Verdict.Shippable == review.ShippableAuto.
+//
+//  9. EligibilityInput.ChangedFileCount <= cfg.MaxFilesChanged (diff
 //     size) -- GitHub's own authoritative changed-file scalar, never
 //     Verdict.FilesChanged, and (Phase 5 audit finding 2, fixed) never
 //     a possibly page-truncated len() of the fetched path listing
 //     either.
 //
-//  9. EligibilityInput.TouchedBlastRadiusKnown is true (Phase 5 audit
-//     findings 1+2, fixed) -- the sensitive-path facts check 10 below
+//  10. EligibilityInput.TouchedBlastRadiusKnown is true (Phase 5 audit
+//     findings 1+2, fixed) -- the sensitive-path facts check 11 below
 //     relies on must have actually been established from GitHub; a
 //     failed or page-truncated changed-files fetch refuses here rather
 //     than silently reading as "nothing sensitive touched".
 //
-//  10. No cfg.SensitiveTags member appears in EligibilityInput.
+//  11. No cfg.SensitiveTags member appears in EligibilityInput.
 //     TouchedBlastRadius (no sensitive path touched) -- never
 //     Verdict.BlastRadius.
 //
 // "No floor raised: neither the coverage floor nor the premise floor
 // ... is above its baseline" is DELIBERATELY not a separate check of its
 // own anywhere in the numbered list above (never conflate this with
-// check 9, Phase 5 audit findings 1+2's own "is the fact even knowable"
+// check 10, Phase 5 audit findings 1+2's own "is the fact even knowable"
 // gate above, which exists for an entirely different reason: whether
 // GitHub's changed-files data could be fetched at all, nothing to do
 // with floors). internal/domain/review's own ComputeShippable composes
@@ -134,16 +150,16 @@
 // contribute a HIGHER rank into a max() and still have the max() come
 // out at the LOWEST rank. Re-deriving "no floor raised" as a second,
 // independent check over the verdict's own raw RiskLevel/TestsCoverage/
-// Premise fields would therefore either (a) always agree with check 7
+// Premise fields would therefore either (a) always agree with check 8
 // above, making it dead weight, or (b) disagree with it, which would
 // mean domain/review's own raise-only property had a bug -- a bug this
-// package has no business re-litigating a second time. Check 7 alone
+// package has no business re-litigating a second time. Check 8 alone
 // already IS "no floor raised", exactly as rigorously as a bespoke
 // second check would be. This package's own test suite (eligibility_test.go)
 // still exercises "a floor raised" as its own, independently named
 // scenario -- via three DISTINCT Verdict fixtures (coverage floor
 // raised, premise floor raised, risk baseline alone raised), each
-// proving check 7 catches that specific case -- rather than by adding a
+// proving check 8 catches that specific case -- rather than by adding a
 // redundant branch that could never independently fail.
 //
 // # IsDraft / HasChangesRequested are deliberately NOT inputs here

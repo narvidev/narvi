@@ -391,6 +391,16 @@ func (f *applySuggestionFakeSourceControl) ListMergedBetween(context.Context, po
 func (f *applySuggestionFakeSourceControl) ListOpenPRsForUser(context.Context, ports.ListOpenPRsForUserSpec) ([]ports.OpenPR, bool, error) {
 	return nil, false, errors.New("not implemented")
 }
+
+// ListRequiredChecks is unused by this test's scenarios; the base requires nothing.
+func (f *applySuggestionFakeSourceControl) ListRequiredChecks(context.Context, ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
+	return nil, nil
+}
+
+func (f *applySuggestionFakeSourceControl) ResolveAppID(context.Context, ports.ResolveAppIDSpec) (int64, error) {
+	return 0, errors.New("not implemented")
+}
+
 func (f *applySuggestionFakeSourceControl) ResolveCodeOwners(context.Context, ports.ResolveCodeOwnersSpec) ([]ports.Owner, error) {
 	return nil, errors.New("not implemented")
 }

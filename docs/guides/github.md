@@ -158,6 +158,30 @@ webhook above, in one direction only:
   no mention or label would reach Narvi without the webhook, and the bot
   handle is not kept.
 
+The checks a pull request's base branch requires are read before it can
+be merged from Narvi (technical plan §21.2): the branch's protection, from
+the branch itself, and the rulesets that apply to the branch. The decision
+inbox reads them as the bot, and auto-merge reads them as the bot too; a
+person's Merge click reads them with that person's own GitHub token, the
+one the merge is made with. Both tokens therefore need read access to each
+repository's branches and rules. A pull request is not ready to merge
+while a required check has not reported, is still running or did not
+pass, or while the requirements cannot be read; a plan that does not offer
+rulesets or branch protection is read as requiring nothing there. A check
+the base ties to one App is satisfied by that App's check run or by a
+commit status that App's bot account posted -- never by another App's
+check run or status, or a person's status. The App behind a status is
+identified by a check run of the same App at the head or, failing that,
+by its slug (`GET /apps/{app_slug}`, read with the same token, and kept for
+ten minutes, since a slug can pass to another App); a slug that names no
+App, or another source's status posted over an earlier one of the same
+name from another account, leaves the check "could not be confirmed",
+never satisfied, and any other failure to read the App is a failed read of
+the requirements. With GitHub outbound off, the decision inbox reads no
+requirements: it shows no pull request as ready to merge and says so, but
+still offers Merge on a pull request that meets everything else; the
+click reads the requirements itself, and merges or names the unmet check.
+
 It is not the GitHub App below: that App's read-only installation token
 is what review sandboxes clone with, and it never posts anything. It is
 not shadow mode either: each repository's own live/shadow setting (§30)

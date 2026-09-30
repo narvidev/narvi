@@ -185,6 +185,19 @@ type Item struct {
 	AcceptanceMergeable          bool
 	AcceptanceMergeBlockedReason string
 
+	// MergeableIfRequiredChecksPass is set on an ordinary PR row (never a
+	// handoff or a release cut) when the only thing keeping it from a Merge
+	// click is what the read model does not read: with GitHub outbound off
+	// (Result.RequiredChecksNotRead), the checks its base branch requires
+	// (§21.2). Every other criterion -- the mandatory ones and the engine's,
+	// with the row's acceptance applied when it carries one -- holds. The
+	// row stays needs_review, since the inbox cannot call it ready to
+	// merge; a client offers Merge on it, and the click reads the base's
+	// requirements itself, with the person's own token, and refuses,
+	// naming the check, when one is not met (RevalidateForMerge). False on
+	// every other row, and whenever GitHub outbound is on.
+	MergeableIfRequiredChecksPass bool
+
 	// IsRelease is true iff this PR-shaped row is a release cut (§15)
 	// whose §15.2 manifest check has already been computed and persisted
 	// -- see resolveReleaseCut's own doc comment (aggregate.go) for the

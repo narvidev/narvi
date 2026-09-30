@@ -92,6 +92,7 @@ import { meQueryOptions } from '../auth/session'
 import { AUTO_PAUSE_THRESHOLD } from './automationFormat'
 import {
   canMergeDecisionInboxItem,
+  canMergeIfRequiredChecksPass,
   canMergeViaAcceptance,
   formatAgeSeconds,
   formatDecisionLatencySeconds,
@@ -418,8 +419,22 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
         lines down for what a maintainer sees INSTEAD of the button on a
         row this still refuses.
       */}
-      {(item.kind === 'ready_to_merge' || (kind === 'pr' && item.kind === 'needs_review' && canMergeViaAcceptance(item))) && (
+      {/*
+        canMergeIfRequiredChecksPass (technical plan §21.2): with GitHub
+        outbound off the inbox reads no base's required checks, so a row
+        that meets everything else stays needs_review -- and still offers
+        Merge, with a line saying the click reads those checks itself. The
+        server's own answer, like acceptanceMergeable; the Merge endpoint
+        refuses, naming the check, when one is unmet.
+      */}
+      {(item.kind === 'ready_to_merge' ||
+        (kind === 'pr' && item.kind === 'needs_review' && (canMergeViaAcceptance(item) || canMergeIfRequiredChecksPass(item)))) && (
         <MergeButton item={item} canMerge={canMerge} />
+      )}
+      {kind === 'pr' && item.kind === 'needs_review' && !canMergeViaAcceptance(item) && canMergeIfRequiredChecksPass(item) && (
+        <span className="qwhy" title="GitHub outbound is off, so this inbox does not read the checks the base branch requires">
+          required checks are read when you merge
+        </span>
       )}
       {/*
         The "if not, why" half of finding R1: a row WITH an acceptance
@@ -470,6 +485,7 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
       {((kind === 'pr' && item.kind === 'needs_review') || kind === 'handoff' || kind === 'release') &&
         hasAcceptedOverride(item) &&
         !canMergeViaAcceptance(item) &&
+        !(kind === 'pr' && canMergeIfRequiredChecksPass(item)) &&
         item.acceptanceMergeBlockedReason != null && (
           <span className="qwhy" title="This acceptance does not currently unblock a merge">
             <T text={`Still blocked: ${item.acceptanceMergeBlockedReason}`} />
@@ -655,6 +671,28 @@ export function ScmStatusBanner({ scmAsOf, scmFetchFailed }: { scmAsOf: string |
   )
 }
 
+/**
+ * RequiredChecksNotReadNotice -- ListDecisionInboxResponse.requiredChecksNotRead
+ * (technical plan §21.2): with this deployment's GitHub outbound off, the
+ * inbox reads no base branch's required checks, so no pull request is shown
+ * ready to merge; a row that meets everything else still offers Merge
+ * (canMergeIfRequiredChecksPass), and the click reads them. A
+ * configuration, stable across loads, not a failure: a plain notice, never
+ * ScmStatusBanner's "temporarily unable" warning.
+ */
+export function RequiredChecksNotReadNotice({ requiredChecksNotRead }: { requiredChecksNotRead: boolean }) {
+  if (!requiredChecksNotRead) {
+    return null
+  }
+  return (
+    <div className="sync-banner" role="status">
+      No pull request is shown ready to merge here: this deployment&apos;s GitHub outbound is off, so the inbox does not read the checks base branches
+      require. Merge is still offered on a pull request that meets everything else: your merge reads its base branch&apos;s required checks with your own
+      GitHub account, and is refused, naming the check, if one is not met.
+    </div>
+  )
+}
+
 export function DecisionInboxView() {
   const meQuery = useQuery(meQueryOptions)
   const [repoFilter, setRepoFilter] = useState('all')
@@ -726,6 +764,7 @@ export function DecisionInboxView() {
         </div>
 
         {inboxQuery.isSuccess && <ScmStatusBanner scmAsOf={inboxQuery.data.scmAsOf} scmFetchFailed={inboxQuery.data.scmFetchFailed} />}
+        {inboxQuery.isSuccess && <RequiredChecksNotReadNotice requiredChecksNotRead={inboxQuery.data.requiredChecksNotRead} />}
 
         {inboxQuery.isPending && (
           <div className="session-state" aria-live="polite">

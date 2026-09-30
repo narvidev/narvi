@@ -11,6 +11,8 @@ package decisioninbox_test
 import (
 	"context"
 	"errors"
+	"fmt"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -69,6 +71,21 @@ type fakeSCMCacheSourceControl struct {
 	isAncestorErr       error
 	isAncestorDelay     time.Duration
 	isAncestorCallCount int
+
+	// requiredChecksByBase/requiredChecksErr/requiredChecksCallCount back
+	// SCMCache.ListRequiredChecks' own tests below (§21.2), keyed
+	// "owner/repo@branch" so two repositories sharing a branch name answer
+	// differently.
+	requiredChecksByBase    map[string][]ports.RequiredCheck
+	requiredChecksErr       error
+	requiredChecksCallCount int
+
+	// appIDsBySlug/appIDErr/appIDCallCount back SCMCache.ResolveAppID's
+	// own test below: a slug absent from the map names no App
+	// (ErrAppNotFound), and appIDErr, when set, fails every read.
+	appIDsBySlug   map[string]int64
+	appIDErr       error
+	appIDCallCount int
 }
 
 var _ ports.SourceControl = (*fakeSCMCacheSourceControl)(nil)
@@ -184,6 +201,51 @@ func (f *fakeSCMCacheSourceControl) isAncestorCalls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.isAncestorCallCount
+}
+
+// ListRequiredChecks backs SCMCache.ListRequiredChecks' own tests below.
+// It honors ctx first, so a call made with no time left is observable.
+func (f *fakeSCMCacheSourceControl) ListRequiredChecks(ctx context.Context, spec ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
+	f.mu.Lock()
+	f.requiredChecksCallCount++
+	required := f.requiredChecksByBase[spec.Owner+"/"+spec.Repo+"@"+spec.Branch]
+	err := f.requiredChecksErr
+	f.mu.Unlock()
+
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, ctxErr
+	}
+	if err != nil {
+		return nil, err
+	}
+	return required, nil
+}
+
+// ResolveAppID backs SCMCache.ResolveAppID's own test below. It honors
+// ctx first, so a call made with no time left is observable.
+func (f *fakeSCMCacheSourceControl) ResolveAppID(ctx context.Context, spec ports.ResolveAppIDSpec) (int64, error) {
+	f.mu.Lock()
+	f.appIDCallCount++
+	id, ok := f.appIDsBySlug[spec.Slug]
+	readErr := f.appIDErr
+	f.mu.Unlock()
+
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return 0, ctxErr
+	}
+	if readErr != nil {
+		return 0, readErr
+	}
+	if !ok {
+		return 0, fmt.Errorf("fakeSCMCacheSourceControl: slug %s: %w", spec.Slug, ports.ErrAppNotFound)
+	}
+	return id, nil
+}
+
+func (f *fakeSCMCacheSourceControl) requiredChecksCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.requiredChecksCallCount
 }
 func (f *fakeSCMCacheSourceControl) ResolveContractsFingerprint(context.Context, ports.ResolveContractsFingerprintSpec) (string, bool, error) {
 	return "", false, errors.New("fakeSCMCacheSourceControl: ResolveContractsFingerprint not implemented")
@@ -717,5 +779,182 @@ func TestSCMCache_IsAncestor_PropagatesUnderlyingError(t *testing.T) {
 	}
 	if !errors.Is(err, wantErr) {
 		t.Errorf("IsAncestor() error = %v, want it to wrap %v", err, wantErr)
+	}
+}
+
+// TestSCMCache_ListRequiredChecks covers the read model's cached copy of a
+// base branch's required checks (§21.2): one read per base branch per TTL,
+// shared by every caller whatever credential it passes; a failed read
+// returned as an error and never cached -- a cached failure, or a cached
+// empty "requires nothing", would stand for a whole TTL -- and the read
+// bounded by DecisionInboxRequiredChecksTimeout.
+func TestSCMCache_ListRequiredChecks(t *testing.T) {
+	t.Parallel()
+
+	build := []ports.RequiredCheck{{Name: "build", AppID: 7}}
+	lint := []ports.RequiredCheck{{Name: "lint"}}
+	spec := func(branch, token string) ports.ListRequiredChecksSpec {
+		return ports.ListRequiredChecksSpec{Owner: "acme", Repo: "widgets", Branch: branch, Token: token}
+	}
+	specIn := func(owner, repo string) ports.ListRequiredChecksSpec {
+		return ports.ListRequiredChecksSpec{Owner: owner, Repo: repo, Branch: "main", Token: "bot"}
+	}
+	widgetsMain := map[string][]ports.RequiredCheck{"acme/widgets@main": build}
+
+	tests := []struct {
+		name      string
+		fake      *fakeSCMCacheSourceControl
+		timeouts  func(*platform.Timeouts)
+		calls     []ports.ListRequiredChecksSpec
+		offsets   []time.Duration
+		wantErrs  []bool
+		wantLast  []ports.RequiredCheck
+		wantReads int
+	}{
+		{
+			name:      "a second read of the same base within the TTL is a cache hit, whatever the token",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBase: widgetsMain},
+			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot"), spec("main", "someone-else")},
+			offsets:   []time.Duration{0, time.Second},
+			wantErrs:  []bool{false, false},
+			wantLast:  build,
+			wantReads: 1,
+		},
+		{
+			name:      "another base branch is its own entry",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBase: widgetsMain},
+			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot"), spec("release", "bot")},
+			offsets:   []time.Duration{0, time.Second},
+			wantErrs:  []bool{false, false},
+			wantLast:  nil,
+			wantReads: 2,
+		},
+		{
+			name:      "another repository with the same base branch name is its own entry",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBase: map[string][]ports.RequiredCheck{"acme/widgets@main": build, "acme/gadgets@main": lint}},
+			calls:     []ports.ListRequiredChecksSpec{specIn("acme", "widgets"), specIn("acme", "gadgets")},
+			offsets:   []time.Duration{0, time.Second},
+			wantErrs:  []bool{false, false},
+			wantLast:  lint,
+			wantReads: 2,
+		},
+		{
+			name:      "another owner's repository of the same name is its own entry",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBase: map[string][]ports.RequiredCheck{"acme/widgets@main": build, "other/widgets@main": lint}},
+			calls:     []ports.ListRequiredChecksSpec{specIn("acme", "widgets"), specIn("other", "widgets")},
+			offsets:   []time.Duration{0, time.Second},
+			wantErrs:  []bool{false, false},
+			wantLast:  lint,
+			wantReads: 2,
+		},
+		{
+			name:      "an expired entry is read again",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBase: widgetsMain},
+			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot"), spec("main", "bot")},
+			offsets:   []time.Duration{0, time.Hour},
+			wantErrs:  []bool{false, false},
+			wantLast:  build,
+			wantReads: 2,
+		},
+		{
+			name:      "a failed read is returned and never cached",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksErr: errors.New("boom: github is down")},
+			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot"), spec("main", "bot")},
+			offsets:   []time.Duration{0, time.Second},
+			wantErrs:  []bool{true, true},
+			wantReads: 2,
+		},
+		{
+			name:      "the read runs under DecisionInboxRequiredChecksTimeout",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBase: widgetsMain},
+			timeouts:  func(to *platform.Timeouts) { to.DecisionInboxRequiredChecksTimeout = 0 },
+			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot")},
+			offsets:   []time.Duration{0},
+			wantErrs:  []bool{true},
+			wantReads: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			timeouts := platform.DefaultTimeouts()
+			if tc.timeouts != nil {
+				tc.timeouts(&timeouts)
+			}
+			cache := decisioninbox.NewSCMCache(tc.fake, timeouts)
+			now := time.Now()
+			var last []ports.RequiredCheck
+			for i, call := range tc.calls {
+				got, err := cache.ListRequiredChecks(context.Background(), call, now.Add(tc.offsets[i]))
+				if (err != nil) != tc.wantErrs[i] {
+					t.Fatalf("call %d: ListRequiredChecks() error = %v, want error %v", i, err, tc.wantErrs[i])
+				}
+				last = got
+			}
+			if !tc.wantErrs[len(tc.wantErrs)-1] && !reflect.DeepEqual(last, tc.wantLast) {
+				t.Errorf("last ListRequiredChecks() = %+v, want %+v", last, tc.wantLast)
+			}
+			if got := tc.fake.requiredChecksCalls(); got != tc.wantReads {
+				t.Errorf("underlying reads = %d, want %d", got, tc.wantReads)
+			}
+		})
+	}
+}
+
+// TestSCMCache_ResolveAppID pins SCMCache.ResolveAppID (§21.2, the App
+// behind a commit status): the id the port answers; a slug naming no App
+// still ErrAppNotFound through the wrapping, a failed read an error that
+// is not; and each call bounded by DecisionInboxResolveAppIDTimeout. The
+// adapter keeps each answer for its TTL, so nothing is cached here.
+func TestSCMCache_ResolveAppID(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		apps         map[string]int64
+		readErr      error
+		timeouts     func(*platform.Timeouts)
+		slug         string
+		wantID       int64
+		wantErr      bool
+		wantNotFound bool
+		wantReads    int
+	}{
+		{name: "an App the port identifies is answered", apps: map[string]int64{"coverage": 254}, slug: "coverage", wantID: 254, wantReads: 1},
+		{name: "a slug naming no App stays ErrAppNotFound through the wrapping", apps: map[string]int64{"coverage": 254}, slug: "other-ci", wantErr: true, wantNotFound: true, wantReads: 1},
+		{name: "a failed read is an error, not ErrAppNotFound", apps: map[string]int64{"coverage": 254}, readErr: errors.New("apps: http 502"), slug: "coverage", wantErr: true, wantReads: 1},
+		{
+			name:      "the read runs under DecisionInboxResolveAppIDTimeout",
+			apps:      map[string]int64{"coverage": 254},
+			timeouts:  func(to *platform.Timeouts) { to.DecisionInboxResolveAppIDTimeout = 0 },
+			slug:      "coverage",
+			wantErr:   true,
+			wantReads: 1,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			timeouts := platform.DefaultTimeouts()
+			if tc.timeouts != nil {
+				tc.timeouts(&timeouts)
+			}
+			fake := &fakeSCMCacheSourceControl{appIDsBySlug: tc.apps, appIDErr: tc.readErr}
+			id, err := decisioninbox.NewSCMCache(fake, timeouts).ResolveAppID(context.Background(), ports.ResolveAppIDSpec{Slug: tc.slug, Token: "bot"})
+			if (err != nil) != tc.wantErr || id != tc.wantID {
+				t.Errorf("ResolveAppID() = (%d, %v), want (%d, error %v)", id, err, tc.wantID, tc.wantErr)
+			}
+			if got := errors.Is(err, ports.ErrAppNotFound); got != tc.wantNotFound {
+				t.Errorf("errors.Is(err, ErrAppNotFound) = %v, want %v (err %v)", got, tc.wantNotFound, err)
+			}
+			fake.mu.Lock()
+			reads := fake.appIDCallCount
+			fake.mu.Unlock()
+			if reads != tc.wantReads {
+				t.Errorf("underlying reads = %d, want %d", reads, tc.wantReads)
+			}
+		})
 	}
 }

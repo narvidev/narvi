@@ -4540,6 +4540,13 @@
           ],
           "description": "A short, human-readable explanation of why acceptanceMergeable is false -- null whenever acceptanceMergeable is null or true. Never itself an instruction; display only, mirroring failureReason/lastError's own identical 'echo a short reason string, never markup' discipline."
         },
+        "mergeableIfRequiredChecksPass": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "Technical plan \u00a721.2: true on an ordinary pull-request row (never a handoff or a release cut) when the only thing keeping it from a Merge click is what the inbox does not read -- with this deployment's GitHub outbound off (ListDecisionInboxResponse.requiredChecksNotRead), the checks its base branch requires. Every other criterion holds, the row's acceptance applied when it carries one (acceptanceMergeable itself stays false, acceptanceMergeBlockedReason naming the unread requirements). The row stays needs_review, since the inbox cannot call it ready to merge; a client offers Merge on it, and the Merge endpoint reads the base's requirements itself, with the acting person's own GitHub credential, and refuses with 409, naming the check, when one is not met. False on every other pull-request row, and always false while GitHub outbound is on; null on a row that is not a pull request."
+        },
         "isRelease": {
           "type": [
             "boolean",
@@ -4656,6 +4663,7 @@
         "items",
         "scmAsOf",
         "scmFetchFailed",
+        "requiredChecksNotRead",
         "decisionLatencyMedianSeconds",
         "decisionLatencySampleSize",
         "decisionLatencyComputed"
@@ -4685,6 +4693,10 @@
         "scmFetchFailed": {
           "type": "boolean",
           "description": "True iff the caller's PR-derived rows (ready_to_merge/needs_review) are a known-incomplete or degraded picture -- ONE channel fed by several independent producers: the live PR fetch failing outright (a revoked token, a GitHub incident, a timeout, or a linked-identity lookup/decrypt failure -- scmAsOf stays null in these cases, no fetch was attempted or it never returned); one of GitHub's own underlying discovery queries failing while the other still returned a real, if partial, result (scmAsOf IS set here -- a genuine, if partial, fetch happened); or an individual PR's own \u00a717 sentinel-fix exclusion check erroring (that one row is dropped, fail-closed, but the overall read is no longer complete). UNLIKE this field's own previous doc comment claimed, scmAsOf non-null and scmFetchFailed true are NOT mutually exclusive -- a partial-but-real fetch legitimately carries both a real as-of instant and a flag telling the caller not to trust the rows present as complete. Always false alongside scmAsOf==null when no linked identity exists at all (a legitimate, non-degraded empty state). A client should render a distinct 'temporarily unable to load your pull requests, try again shortly' state whenever this is true -- never the same 'no GitHub linked' empty state scmAsOf==null with scmFetchFailed==false means, and never silently trust the rows present as a complete queue."
+        },
+        "requiredChecksNotRead": {
+          "type": "boolean",
+          "description": "True when this deployment's GitHub outbound is off (NARVI_OUTBOUND_ENABLED declares no github): the inbox then reads no base branch's required checks (technical plan \u00a721.2), so no pull request is shown as ready_to_merge, and a row carrying an acceptance names this as what blocks it. A configuration, stable across loads -- never a failure to retry, and never reported through scmFetchFailed. A client should say so in its own words, distinct from the 'temporarily unable to load' state. Merge stays available where every other criterion holds (DecisionInboxItem.mergeableIfRequiredChecksPass): the Merge endpoint reads the requirements with the acting person's own GitHub credential."
         },
         "decisionLatencyMedianSeconds": {
           "type": [

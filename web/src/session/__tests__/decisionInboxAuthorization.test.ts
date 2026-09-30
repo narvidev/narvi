@@ -84,7 +84,7 @@ describe('mergePullRequest -- the client always sends the real request', () => {
 describe('listDecisionInbox -- the client always sends the real, unconditional read', () => {
   it('calls GET /api/decision-inbox with no query params -- needs_attention filtering is server-side only, never a client-side param', async () => {
     const spy = respondWith(
-      { items: [], scmAsOf: null, scmFetchFailed: false, decisionLatencyMedianSeconds: null, decisionLatencySampleSize: 0, decisionLatencyComputed: false },
+      { items: [], scmAsOf: null, scmFetchFailed: false, requiredChecksNotRead: false, decisionLatencyMedianSeconds: null, decisionLatencySampleSize: 0, decisionLatencyComputed: false },
       200,
     )
 

@@ -2640,8 +2640,11 @@ type Timeouts struct {
 	// GitHubListOpenPRsForUserTimeout/GitHubResolveCodeOwnersTimeout
 	// already establish just above, not a new pattern. GetOpenPR (getopenpr.go)
 	// is FIVE sequential GETs against the SAME single target PR, never
-	// one: fetchOpenPRDetail, fetchReviewDecision, fetchCIConclusionLive's
-	// own two calls (combined-status, check-runs), and
+	// one -- more when the head carries commit statuses: fetchOpenPRDetail,
+	// fetchReviewDecision, fetchCIConclusionLive's own two calls
+	// (combined-status, check-runs) plus the statuses listing that says who
+	// posted each status (§21.2's required checks; one page, up to five
+	// when a context's latest status sits past the first), and
 	// fetchChangedFilePaths (all buildOpenPRFromDetail's own construction,
 	// listopenprs.go) -- a previous revision of the call site reused
 	// GitHubGetPRTimeout here, whose OWN doc comment names a genuinely
@@ -2705,6 +2708,47 @@ type Timeouts struct {
 	// class of call (one GET to the compare-two-commits endpoint), just a
 	// different comparison.
 	DecisionInboxIsAncestorTimeout time.Duration
+
+	// DecisionInboxRequiredChecksTimeout bounds ONE SourceControl.
+	// ListRequiredChecks call made from internal/app/decisioninbox (§21.2,
+	// "CI green means the required checks") -- SCMCache.ListRequiredChecks
+	// (cached, the read model) and revalidateCore (uncached, the Merge
+	// click and the auto-merge worker) share it, like the two fields
+	// above. Its own field, per this file's one-timeout-per-call
+	// convention: the call is a base branch's two requirement sources, the
+	// branch object and its rulesets, read one after the other (a further
+	// rules page only past a hundred rules). Chosen as 20s, two of this
+	// file's "single lightweight GitHub REST GET" baselines of 10s. Linked
+	// below GitHubListOpenPRsForUserTimeout, which bounds the whole Merge
+	// click's revalidation this read runs inside.
+	DecisionInboxRequiredChecksTimeout time.Duration
+
+	// DecisionInboxResolveAppIDTimeout bounds ONE SourceControl.
+	// ResolveAppID call made from internal/app/decisioninbox (§21.2): the
+	// id of the App behind a commit status its bot account posted, read
+	// when a required check names an App and no check run at the head
+	// carries that App's id. SCMCache.ResolveAppID (the read model) and
+	// the merge path (the Merge click and the auto-merge worker) share it.
+	// A single lightweight GET, and one the adapter keeps once read, so
+	// this file's 10s "lightweight GitHub REST GET" baseline. Linked below
+	// GitHubListOpenPRsForUserTimeout, like DecisionInboxRequiredChecksTimeout
+	// above, for the same reason.
+	DecisionInboxResolveAppIDTimeout time.Duration
+
+	// GitHubAppIDCacheTTL is how long the GitHub adapter keeps the id it
+	// read for an App's slug (ResolveAppID, §21.2's required checks). An
+	// App keeps its id, but a slug can pass to another App once freed (a
+	// rename or a deletion frees it), so an answer is kept for a bounded
+	// time: a slug that moved is read again within this TTL, and until then
+	// a running process still attributes that slug's commit statuses to
+	// the App that held it -- the residual window, bounded by this value
+	// and by GitHub's own enforcement of a check's source at merge for
+	// every merger the rule binds. Chosen as 10 minutes: an App is read at
+	// most once per slug per ten minutes by the inbox, the Merge click and
+	// the auto-merge worker together, and a moved slug is caught well
+	// inside an hour. Linked above AutoMergePumpInterval, so the worker's
+	// ticks do not each read again.
+	GitHubAppIDCacheTTL time.Duration
 
 	// GitHubMergePRTimeout bounds ONE MergePR call -- a single PUT, but to
 	// an endpoint GitHub's own docs note can itself take a moment to
@@ -4115,6 +4159,9 @@ func DefaultTimeouts() Timeouts {
 		GitHubGetOpenPRTimeout:               30 * time.Second,    // §21.2 stage 2, H3 (fifth adversarial-review round); not specified, matches GitHubResolveCodeOwnersTimeout's own figure for a comparable few-sequential-GET composite against one PR
 		DecisionInboxResolveBranchSHATimeout: 10 * time.Second,    // D2, second adversarial-review round; not specified, matches GitHubResolveBaseBranchSHATimeout/GitHubGetPRTimeout's own "lightweight GET" reasoning
 		DecisionInboxIsAncestorTimeout:       10 * time.Second,    // D3, second adversarial-review round; not specified, matches this file's own "lightweight GitHub REST GET" precedent
+		DecisionInboxRequiredChecksTimeout:   20 * time.Second,    // §21.2's required-checks amendment; not specified, two sequential lightweight GETs (the branch object, then the base's rulesets)
+		DecisionInboxResolveAppIDTimeout:     10 * time.Second,    // §21.2's required-checks amendment; not specified, one lightweight GET (GET /apps/{app_slug})
+		GitHubAppIDCacheTTL:                  10 * time.Minute,    // §21.2's required-checks amendment; not specified, bounds how long a moved App slug keeps its old id
 		GitHubMergePRTimeout:                 15 * time.Second,    // §16; not specified, half again GitHubGetPRTimeout's baseline (interactive, human-facing write)
 		DecisionInboxSCMCacheTTL:             2 * time.Minute,     // §16.2's own worked example ("as of 2 min ago")
 		DecisionInboxStaleAfter:              48 * time.Hour,      // §16.1, explicit ("stale items (>48h, configurable)")
@@ -4442,6 +4489,30 @@ func (t Timeouts) Validate() error {
 		}
 	}
 	mustBePositive("AutomationDispatchThrottleWindow", t.AutomationDispatchThrottleWindow)
+
+	// §21.2's required checks: a zero bound would fail every read of a
+	// base's requirements, and every pull request would read ineligible
+	// ("could not be read") with nothing else wrong. The Merge click's
+	// revalidation runs under GitHubListOpenPRsForUserTimeout, so that
+	// bound must leave room for this read inside it. See
+	// DecisionInboxRequiredChecksTimeout's own doc comment.
+	mustBePositive("DecisionInboxRequiredChecksTimeout", t.DecisionInboxRequiredChecksTimeout)
+	check("GitHubListOpenPRsForUserTimeout > DecisionInboxRequiredChecksTimeout",
+		"GitHubListOpenPRsForUserTimeout", t.GitHubListOpenPRsForUserTimeout, "DecisionInboxRequiredChecksTimeout", t.DecisionInboxRequiredChecksTimeout)
+	// The same for identifying the App behind a commit status: a zero bound
+	// would leave every App-posted status unidentified, never counting for
+	// a check that names an App. See DecisionInboxResolveAppIDTimeout's own
+	// doc comment.
+	mustBePositive("DecisionInboxResolveAppIDTimeout", t.DecisionInboxResolveAppIDTimeout)
+	check("GitHubListOpenPRsForUserTimeout > DecisionInboxResolveAppIDTimeout",
+		"GitHubListOpenPRsForUserTimeout", t.GitHubListOpenPRsForUserTimeout, "DecisionInboxResolveAppIDTimeout", t.DecisionInboxResolveAppIDTimeout)
+	// The id kept for an App's slug: a zero TTL would read every App on
+	// every load and tick, and one no longer than the auto-merge tick would
+	// read it again on every tick. See GitHubAppIDCacheTTL's own doc
+	// comment for the upper side, the residual window.
+	mustBePositive("GitHubAppIDCacheTTL", t.GitHubAppIDCacheTTL)
+	check("GitHubAppIDCacheTTL > AutoMergePumpInterval",
+		"GitHubAppIDCacheTTL", t.GitHubAppIDCacheTTL, "AutoMergePumpInterval", t.AutoMergePumpInterval)
 	mustBePositive("CircuitBreakerWindow", t.CircuitBreakerWindow)
 	mustBePositive("RepoAccessCheckBreakerWindow", t.RepoAccessCheckBreakerWindow)
 

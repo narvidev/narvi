@@ -507,7 +507,7 @@ type UndeclaredOutboundError struct{}
 func (e *UndeclaredOutboundError) Error() string {
 	return fmt.Sprintf(
 		"%s excludes github, so whether this deployment calls GitHub as its bot cannot be inferred -- declare it: "+
-			"%s= (empty) calls GitHub not at all, which posts nothing, as before, but also stops the auto-merge and release-manifest workers and the live pull request reads a set %s used to serve; "+
+			"%s= (empty) calls GitHub not at all, which posts nothing, as before, but also stops the auto-merge and release-manifest workers, the decision inbox's ready-to-merge rows, and the live pull request reads a set %s used to serve; "+
 			"%s=github (with %s) calls GitHub as the bot for everything, which also posts reviews, comments, labels, check runs and statuses this deployment never posted before",
 		ingressEnabledEnvVarName,
 		outboundEnabledEnvVarName, gitHubBotTokenEnvVarName,

@@ -253,6 +253,16 @@ func (d *Decorator) ResolveCodeOwners(ctx context.Context, spec ports.ResolveCod
 	return d.live.ResolveCodeOwners(ctx, spec)
 }
 
+// ListRequiredChecks is a read and is forwarded unchanged.
+func (d *Decorator) ListRequiredChecks(ctx context.Context, spec ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
+	return d.live.ListRequiredChecks(ctx, spec)
+}
+
+// ResolveAppID is a read and is forwarded unchanged.
+func (d *Decorator) ResolveAppID(ctx context.Context, spec ports.ResolveAppIDSpec) (int64, error) {
+	return d.live.ResolveAppID(ctx, spec)
+}
+
 // ---- Reads that live on the concrete adapter rather than on the port.
 //
 // §30.2 observes that methods exist outside ports.SourceControl; these two

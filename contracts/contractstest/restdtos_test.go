@@ -778,6 +778,44 @@ func TestDecisionInboxItemRoundTrip(t *testing.T) {
 		})
 	})
 
+	// NeedsReviewMergeableIfRequiredChecksPass (technical plan §21.2): with
+	// GitHub outbound off the inbox reads no base's required checks, so a
+	// row that meets everything else stays needs_review and says Merge is
+	// still offered.
+	t.Run("NeedsReviewMergeableIfRequiredChecksPass", func(t *testing.T) {
+		repo := "acme/widgets"
+		prNumber := 1205
+		htmlURL := "https://github.com/acme/widgets/pull/1205"
+		headSHA := "abc124"
+		ciGreen := true
+		findings := 0
+		isHandoff := false
+		hasApprovingReview := false
+		hasChangesRequested := false
+		isRelease := false
+		mergeableIfRequiredChecksPass := true
+		roundTrip(t, sch, restdtos.DecisionInboxItem{
+			Kind:                          restdtos.DecisionInboxItemKindNeedsReview,
+			Title:                         "scheduler: jitter the recovery sweep",
+			EnteredQueueAt:                enteredQueueAt,
+			AgeSeconds:                    600,
+			Stale:                         false,
+			RepoFullName:                  &repo,
+			PrNumber:                      &prNumber,
+			HtmlUrl:                       &htmlURL,
+			HeadSha:                       &headSHA,
+			ProvenanceKind:                &restdtos.DecisionInboxItemProvenanceKind{Value: "codeowners"},
+			ProvenancePattern:             strPtr("internal/app/scheduler/**"),
+			CiGreen:                       &ciGreen,
+			Findings:                      &findings,
+			IsHandoff:                     &isHandoff,
+			HasApprovingReview:            &hasApprovingReview,
+			HasChangesRequested:           &hasChangesRequested,
+			IsRelease:                     &isRelease,
+			MergeableIfRequiredChecksPass: &mergeableIfRequiredChecksPass,
+		})
+	})
+
 	// AwaitingApprovalHandoffPR covers the OTHER
 	// PR-shaped kind=awaiting_approval sub-case a plain plan row (below)
 	// does not: a handoff-labeled PR rides awaiting_approval instead of
@@ -948,6 +986,22 @@ func TestListDecisionInboxResponseRoundTrip(t *testing.T) {
 			DecisionLatencyMedianSeconds: &median,
 			DecisionLatencySampleSize:    12,
 			DecisionLatencyComputed:      true,
+		})
+	})
+
+	// GitHubOutboundOff: the inbox reads no base branch's required checks
+	// (technical plan §21.2) -- a configuration, carried beside a complete,
+	// undegraded fetch.
+	t.Run("GitHubOutboundOff", func(t *testing.T) {
+		scmAsOf := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+		roundTrip(t, sch, restdtos.ListDecisionInboxResponse{
+			Items:                        []restdtos.DecisionInboxItem{},
+			ScmAsOf:                      &scmAsOf,
+			ScmFetchFailed:               false,
+			RequiredChecksNotRead:        true,
+			DecisionLatencyMedianSeconds: nil,
+			DecisionLatencySampleSize:    0,
+			DecisionLatencyComputed:      false,
 		})
 	})
 
