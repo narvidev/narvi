@@ -2874,6 +2874,75 @@ func TestValidate_StopGrace(t *testing.T) {
 	}
 }
 
+// TestValidate_DispatchRetryBackoff pins the durable dispatch trigger's
+// retry after a failed evaluation (technical plan §2): the shipped bounds
+// (one minute, one hour), and each link -- the shortest delay above the
+// claim window, the longest above ActorIdleTTL and above the shortest --
+// refused when either side moves past the other, and accepted at exactly
+// MinTimeoutMargin.
+func TestValidate_DispatchRetryBackoff(t *testing.T) {
+	t.Parallel()
+
+	defaults := platform.DefaultTimeouts()
+	if defaults.DispatchRetryBackoff != time.Minute || defaults.DispatchRetryBackoffMax != time.Hour {
+		t.Fatalf("DefaultTimeouts() dispatch retry backoff = %v..%v, want 1m0s..1h0m0s", defaults.DispatchRetryBackoff, defaults.DispatchRetryBackoffMax)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*platform.Timeouts)
+		wantChain string // the broken link, or "" for valid
+	}{
+		{name: "shortest at the claim window", mutate: func(to *platform.Timeouts) {
+			to.DispatchRetryBackoff = to.TimerClaimDuration
+		}, wantChain: "DispatchRetryBackoff > TimerClaimDuration"},
+		{name: "claim window raised past the shortest", mutate: func(to *platform.Timeouts) {
+			to.TimerClaimDuration = to.DispatchRetryBackoff + time.Minute
+		}, wantChain: "DispatchRetryBackoff > TimerClaimDuration"},
+		{name: "shortest exactly the margin above the claim window", mutate: func(to *platform.Timeouts) {
+			to.DispatchRetryBackoff = to.TimerClaimDuration + platform.MinTimeoutMargin
+		}},
+		{name: "longest at the idle TTL", mutate: func(to *platform.Timeouts) {
+			to.DispatchRetryBackoffMax = to.ActorIdleTTL
+		}, wantChain: "DispatchRetryBackoffMax > ActorIdleTTL"},
+		{name: "idle TTL raised past the longest", mutate: func(to *platform.Timeouts) {
+			to.ActorIdleTTL = to.DispatchRetryBackoffMax + time.Minute
+		}, wantChain: "DispatchRetryBackoffMax > ActorIdleTTL"},
+		{name: "longest exactly the margin above the idle TTL", mutate: func(to *platform.Timeouts) {
+			to.DispatchRetryBackoffMax = to.ActorIdleTTL + platform.MinTimeoutMargin
+		}},
+		{name: "shortest raised to the longest", mutate: func(to *platform.Timeouts) {
+			to.DispatchRetryBackoff = to.DispatchRetryBackoffMax
+		}, wantChain: "DispatchRetryBackoffMax > DispatchRetryBackoff"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			if tc.wantChain == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			found := false
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				for _, e := range joined.Unwrap() {
+					var inv *platform.TimeoutInvariantError
+					if errors.As(e, &inv) && inv.Chain == tc.wantChain {
+						found = true
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("Validate() = %v, want the broken link %q among its errors", err, tc.wantChain)
+			}
+		})
+	}
+}
+
 // TestValidate_UnknownTimerBounds pins the bounds on a timer kind this
 // binary does not know (technical plan §2): the shipped values (a 30-minute
 // rolling-deploy ceiling, a one-hour grace, a 10-minute backoff, deletion at

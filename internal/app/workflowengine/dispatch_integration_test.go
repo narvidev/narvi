@@ -375,7 +375,9 @@ func TestResolveStepForNewTurn_LiveAwaitingDecisionStep_ResolvesButDoesNotTrack(
 	session := seedCustomHITLAfterStep(t, ctx, pool, sessions, customDefID, customStepID, "acme/hitl-resolve")
 
 	row, _ := startRunAndAttachRealTurn(t, ctx, sessions, turns, workflows, session, "draft something", nil, false)
-	workflowengine.OnTurnCompleted(ctx, testDeps(pool, turns, workflows), session, row.turnID, turn.TriggerComplete)
+	inTx(t, ctx, pool, testDeps(pool, turns, workflows), func(deps workflowengine.Deps) {
+		workflowengine.OnTurnCompleted(ctx, deps, session, row.turnID, turn.TriggerComplete)
+	})
 
 	stepRun, err := workflows.GetLiveStepRunForRun(ctx, row.runID)
 	if err != nil {

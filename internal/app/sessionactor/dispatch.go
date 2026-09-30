@@ -330,6 +330,7 @@ type dispatchPlan struct {
 func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 	spawn, dispatch, err := a.planDispatch(ctx)
 	if err != nil {
+		a.backOffDispatchTimer(ctx, err)
 		return err
 	}
 	switch {
@@ -350,6 +351,43 @@ func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 		// or a defensive skip (nil provider/commander) inside one of the
 		// try* helpers below.
 		return nil
+	}
+}
+
+// backOffDispatchTimer runs after a dispatch evaluation that failed
+// (technical plan §2): planDispatch's transaction rolled back, the
+// dispatch timer's delete with it, and the pump's claim alone would bring
+// the timer back every TimerClaimDuration for as long as the failure
+// lasts, each delivery waking the actor so it never idles out. So, in a
+// transaction of its own, the timer's fires_at moves to the database's
+// now plus its age since its first arm, held between DispatchRetryBackoff
+// and DispatchRetryBackoffMax: the delay doubles with each failed
+// delivery, the claim cadence is never the retry cadence, and once the
+// delay passes ActorIdleTTL the actor can idle out between two tries.
+// armed_at is not moved -- a backoff is not an arm -- and a session with
+// no dispatch timer gets none. A stale actor (ErrStaleEpoch), or one whose
+// context is done, writes nothing: its successor has the timer. A failure
+// here is logged; the claim window still bounds the next try.
+func (a *Actor) backOffDispatchTimer(ctx context.Context, cause error) {
+	if errors.Is(cause, ErrStaleEpoch) || ctx.Err() != nil {
+		return
+	}
+	var moved int64
+	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		moved, err = a.stores.timer.WithTx(tx).BackOffDispatch(ctx, sqlcgen.BackOffSessionDispatchTimerParams{
+			SessionID:   a.sessionID,
+			BaseSeconds: a.timeouts.DispatchRetryBackoff.Seconds(),
+			MaxSeconds:  a.timeouts.DispatchRetryBackoffMax.Seconds(),
+		})
+		return err
+	})
+	if err != nil {
+		a.logger.Warn("sessionactor: back off the dispatch timer after a failed evaluation failed", "error", err, "cause", cause)
+		return
+	}
+	if moved > 0 {
+		a.logger.Warn("sessionactor: dispatch evaluation failed; dispatch timer backed off", "cause", cause)
 	}
 }
 
@@ -380,7 +418,9 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, er
 		// below, and one committed after it re-arms the timer after this
 		// delete, so it survives for the next round. Deleted first, so a
 		// turn this same transaction inserted later would re-arm it too
-		// (none does today). A rolled-back evaluation keeps it.
+		// (none does today). A rolled-back evaluation keeps it, and
+		// handleEnsureDispatched backs it off; a spawn refused on policy
+		// ends the turns it was for and commits (endTurnsOnSpawnRefusal).
 		if err := a.deleteTimer(ctx, tx, TimerDispatch); err != nil {
 			return err
 		}
@@ -837,7 +877,7 @@ func (a *Actor) tryPlanSpawn(
 	if action.Kind == sandbox.SpawnActionSpawn || action.Kind == sandbox.SpawnActionRestore || action.Kind == sandbox.SpawnActionResume {
 		dockerRequired, err := a.refuseIfSubstrateUnsupported(ctx, tx, sessionRow, caps)
 		if err != nil {
-			return nil, err
+			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, err, now)
 		}
 
 		// §10's own dispatch-time half of the "fail-closed, twice"
@@ -848,7 +888,7 @@ func (a *Actor) tryPlanSpawn(
 		// refuseIfRolloutUnenrolled's own doc comment for the full "why
 		// this is what makes rollback real".
 		if err := a.refuseIfRolloutUnenrolled(ctx, tx, sessionRow); err != nil {
-			return nil, err
+			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, err, now)
 		}
 
 		// §27.8's own genuinely-unresolved snapshot-parity point (§27.5
@@ -974,16 +1014,19 @@ func (a *Actor) tryPlanSpawn(
 // check can never observe a DIFFERENT provider snapshot than the one
 // EvaluateSpawnDecision itself just reasoned over.
 //
-// On failure, this refuses the ENTIRE spawn attempt for this round with
-// a real, propagated error -- deliberately NOT sandbox.SpawnActionSkip's
-// own silent (nil, nil) shape: a Skip looks identical to an ordinary,
-// expected cooldown/in-progress no-op, but a docker/enforced-egress
-// session whose requirement the provider cannot honor is a genuine,
-// persistent misconfiguration that must be loud (logged at Error, and
-// surfaced to run's own "command handling failed" logger) until either
-// the provider or the Environment's own requirement changes -- silently
-// retrying forever would look, from the outside, exactly like a session
-// that is merely waiting its turn.
+// On failure, this refuses the ENTIRE spawn attempt with a spawnRefusal
+// -- deliberately NOT sandbox.SpawnActionSkip's own silent (nil, nil)
+// shape: a Skip looks identical to an ordinary, expected
+// cooldown/in-progress no-op, but a docker/enforced-egress session whose
+// requirement the provider cannot honor is a genuine, persistent
+// misconfiguration that must be loud (logged at Error). tryPlanSpawn hands
+// the refusal to endTurnsOnSpawnRefusal, which ends the session's open
+// turns with its reason in the same transaction: retrying the same
+// evaluation would only repeat it (technical plan §2's dispatch timer
+// would bring it back every claim window), and a turn left pending
+// forever would look, from the outside, exactly like a session that is
+// merely waiting its turn. A read of the Environment that fails is not a
+// refusal: it is returned as it is, and the evaluation backs off.
 //
 // Returns the resolved dockerRequired alongside the error (even on a nil
 // error) so its one caller (tryPlanSpawn) can also apply §27.8's own
@@ -997,7 +1040,7 @@ func (a *Actor) refuseIfSubstrateUnsupported(ctx context.Context, tx pgx.Tx, ses
 	if err := environment.CheckSubstrateCapabilities(dockerRequired, egressPolicy.RequiresEnforcement(), caps.DockerInSandbox, caps.EgressPolicy); err != nil {
 		a.logger.Error("sessionactor: refusing to spawn: configured provider cannot honor this Environment's substrate requirements (§27.5/§27.6 dispatch-time fail-closed re-check)",
 			"session_id", a.sessionID.String(), "error", err)
-		return dockerRequired, fmt.Errorf("sessionactor: dispatch-time substrate capability re-check failed: %w", err)
+		return dockerRequired, &spawnRefusal{reason: fmt.Sprintf("the configured sandbox provider cannot honor this session's environment: %v", err)}
 	}
 	return dockerRequired, nil
 }
@@ -1153,15 +1196,19 @@ func (a *Actor) rolloutDecisionForSession(ctx context.Context, repoSettings *pos
 // repo de-enrolled between two consecutive dispatch attempts for the SAME
 // session is caught on the very next one.
 //
-// On refusal, this returns a real, propagated error -- deliberately NOT
+// On refusal, this returns a spawnRefusal -- deliberately NOT
 // sandbox.SpawnActionSkip's own silent (nil, nil) shape, mirroring
 // refuseIfSubstrateUnsupported's own identical reasoning: a Skip looks
 // identical to an ordinary, expected cooldown/in-progress no-op, but a
-// session whose own repo has been de-enrolled is a genuine, persistent
-// policy state that must be loud (logged at Error, surfaced to run's own
-// "command handling failed" logger) until re-enrolled, never a silent,
-// indefinitely-retried no-op that looks identical to the sandbox merely
-// waiting its turn.
+// session whose own repo has been de-enrolled is a genuine policy state
+// that must be loud (logged at Error, counted). tryPlanSpawn hands it to
+// endTurnsOnSpawnRefusal, which ends the session's open turns forward
+// with the same reason text the turn-dispatch-time refusal writes
+// (executeDispatch), so the refusal is made, and counted, once per turn
+// set rather than once per retry: re-enrolling the repo lets the next
+// turn a person creates run. A repo_settings read that failed is not a
+// fact about the repo: it is returned as a plain error, and the
+// evaluation backs off (handleEnsureDispatched's backOffDispatchTimer).
 //
 // Phase 6 audit fix (Finding 4): this refusal now ALSO increments
 // session_rollout_refused_total (recordRolloutRefusal, opsmetrics.go) --
@@ -1181,7 +1228,13 @@ func (a *Actor) refuseIfRolloutUnenrolled(ctx context.Context, tx pgx.Tx, sessio
 
 	decision, transient, err := a.rolloutDecisionForSession(ctx, a.stores.repoSettings.WithTx(tx), sessionRow)
 	if err != nil {
-		return fmt.Errorf("sessionactor: dispatch-time rollout re-check: %w", err)
+		// A structurally malformed repos column: no retry reads it any
+		// differently, so it is refused as a fact, exactly as
+		// rolloutRefusalForDispatch refuses it at turn-dispatch time.
+		a.logger.Error("sessionactor: spawn-time rollout re-check: resolve admission decision failed; failing closed (refusing spawn)",
+			"session_id", a.sessionID.String(), "error", err)
+		a.recordRolloutRefusal(ctx, string(sessionRow.SpawnSource))
+		return &spawnRefusal{reason: fmt.Sprintf("repo %q not enrolled in cohort rollout", "<unresolvable repos>")}
 	}
 	if decision.Admitted {
 		return nil
@@ -1189,10 +1242,119 @@ func (a *Actor) refuseIfRolloutUnenrolled(ctx context.Context, tx pgx.Tx, sessio
 
 	a.logger.Error("sessionactor: refusing to spawn: configured repo is not enrolled in the cohort rollout (§10 Phase 6, §32 dispatch-time fail-closed re-check)",
 		"session_id", a.sessionID.String(), "repo", decision.RepoFullName, "transient", transient)
-	if !transient {
-		a.recordRolloutRefusal(ctx, string(sessionRow.SpawnSource))
+	if transient {
+		// A repo_settings read that failed: not a fact about the repo. The
+		// evaluation fails, its transaction rolls back, and
+		// handleEnsureDispatched backs the dispatch timer off.
+		return fmt.Errorf("sessionactor: dispatch-time rollout re-check failed: repo %q could not be read (transient)", decision.RepoFullName)
 	}
-	return fmt.Errorf("sessionactor: dispatch-time rollout re-check failed: repo %q not enrolled in cohort rollout", decision.RepoFullName)
+	a.recordRolloutRefusal(ctx, string(sessionRow.SpawnSource))
+	return &spawnRefusal{reason: fmt.Sprintf("repo %q not enrolled in cohort rollout", decision.RepoFullName)}
+}
+
+// spawnRefusal is a spawn-time policy refusal: a fact about the session
+// that no retry of the same evaluation changes -- a repo the cohort
+// rollout does not admit, an environment the configured provider cannot
+// honor (technical plan §27.5, §32). refuseIfSubstrateUnsupported and
+// refuseIfRolloutUnenrolled return it; tryPlanSpawn hands it to
+// endTurnsOnSpawnRefusal. Anything else those gates return is transient.
+type spawnRefusal struct {
+	// reason is the human-readable cause, carried into each ended turn's
+	// synthetic execution_complete -- the same text the turn-dispatch-time
+	// refusal writes (executeDispatch).
+	reason string
+}
+
+func (r *spawnRefusal) Error() string { return "sessionactor: spawn refused: " + r.reason }
+
+// endTurnsOnSpawnRefusal settles a refused spawn inside the evaluation's
+// own transaction (technical plan §2, §3.3). For a spawnRefusal it ends
+// every open turn of the session forward and returns nil, so the
+// transaction commits -- with the dispatch timer planDispatch deleted
+// first -- and nothing re-evaluates the same refusal: no pump delivery
+// comes back for it, and the actor can idle out. Every open turn needed
+// the sandbox the refusal is about: a pending turn could not be sent
+// anywhere else, and a spawn is only attempted for a turn in flight when
+// its sandbox is dead or stuck. Each turn goes through the turn machine's
+// own edge to Failed: turn.TriggerAbandon from pending or dispatched (the
+// session's failure reason reads never_started, as for any turn given up
+// on before it reached a sandbox), turn.TriggerTimeout from processing,
+// the edge failDispatchedTurn uses when the turn-dispatch-time refusal
+// ends a turn already processing (executeDispatch). Each gets the
+// synthetic execution_complete that refusal writes, with the same reason
+// text, and the session's status is re-derived. The workflow hook is
+// OnTurnRefused, never OnTurnCompleted: a refusal read as a blocked
+// outcome could follow a blocked edge and queue the same refused step
+// again, re-arming the dispatch timer in this very transaction.
+//
+// Any other error -- a read that failed, including a transient rollout
+// read -- is returned as it is: the evaluation fails, its transaction
+// rolls back with the timer's delete, and handleEnsureDispatched backs the
+// timer off instead (backOffDispatchTimer).
+func (a *Actor) endTurnsOnSpawnRefusal(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, err error, now time.Time) error {
+	var refusal *spawnRefusal
+	if !errors.As(err, &refusal) {
+		return err
+	}
+	turns, err := a.stores.turn.WithTx(tx).ListForSession(ctx, a.sessionID)
+	if err != nil {
+		return fmt.Errorf("sessionactor: list turns: %w", err)
+	}
+	overrides := map[pgtype.UUID]turn.Summary{}
+	endedProcessing := false
+	for _, t := range turns {
+		from := turn.State(t.Status)
+		if turn.IsTerminal(from) {
+			continue
+		}
+		trig := turn.TriggerAbandon
+		if from == turn.StateProcessing {
+			trig = turn.TriggerTimeout
+			endedProcessing = true
+		}
+		to, err := turn.Transition(from, trig)
+		if err != nil {
+			return fmt.Errorf("sessionactor: end turn %s on a refused spawn: %w", t.ID.String(), err)
+		}
+		if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+			ID:          t.ID,
+			Status:      sqlcgen.TurnStatus(to),
+			CompletedAt: pgtype.Timestamptz{Time: now, Valid: true},
+		}); err != nil {
+			return fmt.Errorf("sessionactor: update turn status: %w", err)
+		}
+		workflowengine.OnTurnRefused(ctx, workflowengine.Deps{
+			Workflows:             a.stores.workflow.WithTx(tx),
+			Turns:                 a.stores.turn.WithTx(tx),
+			SlackThreadSessions:   a.stores.slackThreadSession.WithTx(tx),
+			LinearAgentSessions:   a.stores.linearAgentSession.WithTx(tx),
+			GitHubPRSessions:      a.stores.githubPRSession.WithTx(tx),
+			Outbox:                a.stores.outbox.WithTx(tx),
+			EpistemicCheckDefault: a.epistemicCheckDefault,
+		}, sessionRow, t.ID, refusal.reason)
+		if turn.RequiresSyntheticExecutionComplete(trig) {
+			if err := a.appendEvent(ctx, tx, "execution_complete", map[string]any{
+				"turn_id":   t.ID.String(),
+				"synthetic": true,
+				"reason":    refusal.reason,
+			}); err != nil {
+				return err
+			}
+		}
+		failureReason, _ := turn.DeriveFailureReason(from, trig)
+		overrides[t.ID] = turn.Summary{Status: to, FailureReason: failureReason}
+		a.logger.Warn("sessionactor: turn ended: the spawn it needed was refused",
+			"turn_id", t.ID.String(), "from", string(from), "reason", refusal.reason)
+	}
+	if len(overrides) > 0 {
+		if err := a.persistDerivedSessionStatus(ctx, tx, summariesWithOverrides(turns, overrides)); err != nil {
+			return err
+		}
+	}
+	if endedProcessing {
+		return a.deleteTimer(ctx, tx, TimerTurnDeadline)
+	}
+	return nil
 }
 
 // planFreshSpawn implements design decision 3a's own write (token mint,

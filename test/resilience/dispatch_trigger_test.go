@@ -190,15 +190,19 @@ func createSessionThroughCore(ctx context.Context, t *testing.T, h *Harness, via
 	return created.ID
 }
 
-// TestDurableDispatchTrigger_AFailedTriggerIsDeliveredWithinOneClaimWindow:
+// TestDurableDispatchTrigger_AFailedTriggerIsDeliveredWhenAHostClaimsItsTimer:
 // a turn created while its trigger fails, on a session with no sandbox and
-// no other timer, is dispatched by the replica that can host the actor
-// within one claim window. The replica whose trigger failed is also the
-// first to claim the timer -- the worst case -- and fails again, keeping the
-// row; the hosting replica's next tick after that claim lapses delivers it.
-// "Dispatched" here is the dispatch evaluation of a turn with no sandbox: a
-// spawn, on the hosting replica, exactly once.
-func TestDurableDispatchTrigger_AFailedTriggerIsDeliveredWithinOneClaimWindow(t *testing.T) {
+// no other timer, is dispatched by the first replica able to host the
+// actor that claims its dispatch timer. Here the replica whose trigger
+// failed claims it first and fails again, keeping the row, and the hosting
+// replica wins the single lapsed claim that follows, so the turn is
+// dispatched within one claim window of the failed claim. That is all this
+// case shows, and all the pump promises: each lapsed claim is raced by
+// every replica's pump, and a replica that cannot host the actor may win it
+// again, each such win costing one more claim window. "Dispatched" here is
+// the dispatch evaluation of a turn with no sandbox: a spawn, on the
+// hosting replica, exactly once.
+func TestDurableDispatchTrigger_AFailedTriggerIsDeliveredWhenAHostClaimsItsTimer(t *testing.T) {
 	ctx := context.Background()
 	h := newHarness(t)
 	timeouts := h.Timeouts
@@ -264,7 +268,7 @@ func TestDurableDispatchTrigger_AFailedTriggerIsDeliveredWithinOneClaimWindow(t 
 				return host.provider.createCount() == 1
 			})
 			if elapsed := time.Since(claimedAt); elapsed > timeouts.TimerClaimDuration+time.Second {
-				t.Fatalf("dispatched %v after the failed claim, want within one claim window (%v)", elapsed, timeouts.TimerClaimDuration)
+				t.Fatalf("dispatched %v after the failed claim, want within the one claim window (%v) the hosting replica's winning claim follows", elapsed, timeouts.TimerClaimDuration)
 			}
 			waitUntil(t, 5*time.Second, func() bool { return !hasDispatchTimer(ctx, t, h, sessionID) })
 			if n := failing.provider.createCount(); n != 0 {

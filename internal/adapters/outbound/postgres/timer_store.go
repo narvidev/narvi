@@ -37,6 +37,15 @@ func (s *TimerStore) Upsert(ctx context.Context, arg sqlcgen.UpsertSessionTimerP
 	return s.q.UpsertSessionTimer(ctx, arg)
 }
 
+// BackOffDispatch moves the session's dispatch timer, and nothing else,
+// to the database's now plus its age since its first arm, held between
+// arg.BaseSeconds and arg.MaxSeconds, and reports how many rows it moved:
+// zero when the session has no dispatch timer. The session actor's backoff
+// after a dispatch evaluation that failed (technical plan §2).
+func (s *TimerStore) BackOffDispatch(ctx context.Context, arg sqlcgen.BackOffSessionDispatchTimerParams) (int64, error) {
+	return s.q.BackOffSessionDispatchTimer(ctx, arg)
+}
+
 // Get fetches a named timer for a session.
 func (s *TimerStore) Get(ctx context.Context, arg sqlcgen.GetSessionTimerParams) (sqlcgen.SessionTimer, error) {
 	return s.q.GetSessionTimer(ctx, arg)

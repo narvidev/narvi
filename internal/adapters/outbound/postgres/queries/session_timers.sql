@@ -27,6 +27,20 @@ VALUES ($1, 'dispatch', now())
 ON CONFLICT (session_id, name) DO UPDATE
     SET fires_at = now(), armed_at = now();
 
+-- name: BackOffSessionDispatchTimer :execrows
+-- The session actor's backoff of its dispatch timer after a dispatch
+-- evaluation that failed (sessionactor's backOffDispatchTimer, technical
+-- plan §2): fires_at moves to now plus the row's age since its first arm
+-- (created_at, which neither a re-arm nor this moves), held between the
+-- two bounds, so each failed delivery doubles the delay until the bound.
+-- armed_at is not moved: a backoff is not an arm. A session with no
+-- dispatch timer is left without one (zero rows).
+UPDATE session_timers
+SET fires_at = now() + LEAST(
+        GREATEST(now() - created_at, make_interval(secs => sqlc.arg('base_seconds')::float8)),
+        make_interval(secs => sqlc.arg('max_seconds')::float8))
+WHERE session_id = sqlc.arg('session_id') AND name = 'dispatch';
+
 -- name: GetSessionTimer :one
 SELECT * FROM session_timers
 WHERE session_id = $1 AND name = $2;

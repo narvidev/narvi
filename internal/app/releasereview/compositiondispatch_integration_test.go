@@ -75,8 +75,11 @@ func (d registryDispatcher) EnsureDispatched(ctx context.Context, sessionID pgty
 // (postgres.LockedTurnCreator), so when its post-commit trigger fails --
 // here the worker's replica cannot host actors (actor_unavailable) -- and
 // that replica's pump claims the timer first and fails again, keeping the
-// row, the replica that can host the actor delivers the dispatch within
-// one claim window: on a session with no sandbox, a spawn, exactly once.
+// row, the replica that can host the actor delivers the dispatch when it
+// wins the lapsed claim -- here the single lapse that follows, so within
+// one claim window of the failed claim (a replica that cannot host may win
+// a lapse again, one more window each time): on a session with no
+// sandbox, a spawn, exactly once.
 func TestRun_CompositionTurnWithAFailedTriggerIsDispatchedByThePump(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)

@@ -7,6 +7,8 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -17,6 +19,20 @@ import (
 // The sqlc CreateTurn query takes a CreateTurnParams, so no other file can
 // call it without naming the type.
 const turnStoreFile = "internal/adapters/outbound/postgres/turn_store.go"
+
+// insertIntoTurns matches SQL that inserts into the turns table, quoted or
+// schema-qualified or not; sqlComment strips a SQL line comment first, so
+// prose that merely names such a statement does not match.
+var (
+	insertIntoTurns = regexp.MustCompile(`(?i)\binsert\s+into\s+("?public"?\s*\.\s*)?"?turns"?(\s|\(|$)`)
+	sqlComment      = regexp.MustCompile(`--[^\n]*`)
+)
+
+// insertsIntoTurns reports whether sql, its line comments stripped,
+// inserts into turns.
+func insertsIntoTurns(sql string) bool {
+	return insertIntoTurns.MatchString(sqlComment.ReplaceAllString(sql, ""))
+}
 
 // armingCallees are the calls a production CreateTurnParams literal may be
 // handed to: CreateAndArmDispatch, and CreateLockedTurn, which runs it in a
@@ -36,7 +52,10 @@ var armingCallees = map[string]bool{"CreateAndArmDispatch": true, "CreateLockedT
 // through the plain Create -- one autocommit insert, no timer -- or calls
 // the sqlc CreateTurn query itself fails here, however the params value was
 // built: a literal handed to anything else, or the type named in a
-// variable, a conversion or a helper's signature.
+// variable, a conversion or a helper's signature. A Go string literal that
+// inserts into turns fails too (raw SQL through Exec or QueryRow), and
+// TestNoOtherSQLInsertsTurns covers the sqlc queries and the migrations.
+// Neither sees SQL assembled at run time from pieces.
 func TestEveryTurnInsertArmsTheDispatchTimer(t *testing.T) {
 	t.Parallel()
 
@@ -138,12 +157,81 @@ func checkTurnInserts(t *testing.T, fset *token.FileSet, rel string, file *ast.F
 	})
 
 	ast.Inspect(file, func(n ast.Node) bool {
-		if id, ok := n.(*ast.Ident); ok && id.Name == "CreateTurnParams" && !approved[id.Pos()] {
-			t.Errorf("%s: a CreateTurnParams value outside CreateAndArmDispatch/CreateLockedTurn: every turn production code creates must arm its session's dispatch timer in the same transaction (technical plan §2) -- hand the literal straight to TurnStore.CreateAndArmDispatch", fset.Position(id.Pos()))
+		switch n := n.(type) {
+		case *ast.Ident:
+			if n.Name == "CreateTurnParams" && !approved[n.Pos()] {
+				t.Errorf("%s: a CreateTurnParams value outside CreateAndArmDispatch/CreateLockedTurn: every turn production code creates must arm its session's dispatch timer in the same transaction (technical plan §2) -- hand the literal straight to TurnStore.CreateAndArmDispatch", fset.Position(n.Pos()))
+			}
+		case *ast.BasicLit:
+			if n.Kind != token.STRING {
+				return true
+			}
+			if sql, err := strconv.Unquote(n.Value); err == nil && insertsIntoTurns(sql) {
+				t.Errorf("%s: raw SQL inserting into turns: a turn it creates arms no dispatch timer (technical plan §2) -- create it through TurnStore.CreateAndArmDispatch", fset.Position(n.Pos()))
+			}
 		}
 		return true
 	})
 	return arming
+}
+
+// TestNoOtherSQLInsertsTurns is the SQL half of
+// TestEveryTurnInsertArmsTheDispatchTimer: in the sqlc queries, the one
+// statement that inserts into turns is CreateTurn -- the query
+// TurnStore.Create and CreateAndArmDispatch run, and nothing else calls
+// with a CreateTurnParams value -- and no migration inserts into turns. A
+// second sqlc query inserting turns would get params of its own, which the
+// Go scan cannot see, and a turn a migration inserts would have no
+// dispatch timer.
+func TestNoOtherSQLInsertsTurns(t *testing.T) {
+	t.Parallel()
+
+	root := moduleRootForTest(t)
+	queries, err := filepath.Glob(filepath.Join(root, "internal", "adapters", "outbound", "postgres", "queries", "*.sql"))
+	if err != nil || len(queries) == 0 {
+		t.Fatalf("list the sqlc queries: %v (%d files)", err, len(queries))
+	}
+	createTurn := 0
+	for _, path := range queries {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// One block per "-- name:" header; the text before the first
+		// header is the file's own prose.
+		blocks := strings.Split(string(body), "-- name:")
+		for i, block := range blocks {
+			if !insertsIntoTurns(block) {
+				continue
+			}
+			name := ""
+			if i > 0 {
+				name = strings.Fields(block)[0]
+			}
+			if name == "CreateTurn" {
+				createTurn++
+				continue
+			}
+			t.Errorf("%s: query %q inserts into turns: only CreateTurn may, reached through TurnStore.CreateAndArmDispatch, which arms the session's dispatch timer (technical plan §2)", path, name)
+		}
+	}
+	if createTurn != 1 {
+		t.Fatalf("found %d CreateTurn queries inserting into turns, want 1: the scan is broken", createTurn)
+	}
+
+	migrations, err := filepath.Glob(filepath.Join(root, "migrations", "*.sql"))
+	if err != nil || len(migrations) == 0 {
+		t.Fatalf("list the migrations: %v (%d files)", err, len(migrations))
+	}
+	for _, path := range migrations {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if insertsIntoTurns(string(body)) {
+			t.Errorf("%s: a migration inserts into turns: those turns have no dispatch timer (technical plan §2)", path)
+		}
+	}
 }
 
 // namesCreateTurnParams reports whether a composite literal's type is

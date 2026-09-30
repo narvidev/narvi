@@ -30,6 +30,35 @@ func (q *Queries) ArmSessionDispatchTimer(ctx context.Context, sessionID pgtype.
 	return err
 }
 
+const backOffSessionDispatchTimer = `-- name: BackOffSessionDispatchTimer :execrows
+UPDATE session_timers
+SET fires_at = now() + LEAST(
+        GREATEST(now() - created_at, make_interval(secs => $1::float8)),
+        make_interval(secs => $2::float8))
+WHERE session_id = $3 AND name = 'dispatch'
+`
+
+type BackOffSessionDispatchTimerParams struct {
+	BaseSeconds float64     `json:"base_seconds"`
+	MaxSeconds  float64     `json:"max_seconds"`
+	SessionID   pgtype.UUID `json:"session_id"`
+}
+
+// The session actor's backoff of its dispatch timer after a dispatch
+// evaluation that failed (sessionactor's backOffDispatchTimer, technical
+// plan §2): fires_at moves to now plus the row's age since its first arm
+// (created_at, which neither a re-arm nor this moves), held between the
+// two bounds, so each failed delivery doubles the delay until the bound.
+// armed_at is not moved: a backoff is not an arm. A session with no
+// dispatch timer is left without one (zero rows).
+func (q *Queries) BackOffSessionDispatchTimer(ctx context.Context, arg BackOffSessionDispatchTimerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, backOffSessionDispatchTimer, arg.BaseSeconds, arg.MaxSeconds, arg.SessionID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const claimDueTimer = `-- name: ClaimDueTimer :one
 UPDATE session_timers
 SET fires_at = $1

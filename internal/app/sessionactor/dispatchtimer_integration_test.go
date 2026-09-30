@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
@@ -252,8 +253,11 @@ func TestDispatchTimer_NoTriggerIsDeliveredByThePump(t *testing.T) {
 // database. The replica that cannot deliver a claimed dispatch timer --
 // another replica hosts the session (actor_elsewhere), or it cannot host
 // actors right now (actor_unavailable) -- leaves the row claimed, never
-// dropped, and the replica that can host the actor delivers it when that
-// claim lapses: within one claim window of the failed claim.
+// dropped, and the replica that can host the actor delivers it when it
+// wins the lapsed claim: here, the single lapse that follows, so within
+// one claim window of the failed claim. The pump does not favour the
+// hosting replica: a replica that cannot host may win a lapsed claim
+// again, which costs one more window each time.
 func TestDispatchTimer_AReplicaThatCannotHostKeepsTheRow(t *testing.T) {
 	ctx := context.Background()
 
@@ -382,4 +386,92 @@ func TestDispatchTimer_NoTimerLingersAfterANormalTurn(t *testing.T) {
 	if _, ok := dispatchTimer(ctx, t, pool, sessionID); ok {
 		t.Fatal("a dispatch timer lingers after a normal turn ended")
 	}
+}
+
+// TestDispatchTimer_AWriterQueuedBehindAnEvaluationKeepsItsTimer pins the
+// ordering technical plan §2 rests on: every dispatch evaluation deletes
+// the dispatch timer first, inside its own transaction, under the
+// actor-epoch lock -- so a turn committed after that lock re-arms the
+// timer after the delete, never before it. The evaluation is held inside
+// planDispatch, lock taken and timer deleted, by a transaction that holds
+// the turns table; a writer then queues behind the epoch lock to create a
+// turn and arm the timer, as createTurnLocked does, and sends no trigger
+// (its trigger failed). Once released, the evaluation finds nothing to do
+// and commits, the writer commits after it, and the timer the writer armed
+// must survive, for the pump to dispatch the new turn: a delete run after
+// the evaluation's commit instead would remove it, and strand the turn.
+func TestDispatchTimer_AWriterQueuedBehindAnEvaluationKeepsItsTimer(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+	seedReadySandbox(ctx, t, pool, sessionID)
+
+	commander := &fakeSendCommander{}
+	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	lockWaiters := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&n); err != nil {
+			t.Fatalf("count lock waiters: %v", err)
+		}
+		return n
+	}
+
+	holder, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback(ctx) }()
+	if _, err := holder.Exec(ctx, `LOCK TABLE turns IN ACCESS EXCLUSIVE MODE`); err != nil {
+		t.Fatalf("hold the turns table: %v", err)
+	}
+
+	// The evaluation: epoch lock taken, timer deleted, then held at its
+	// read of the turns.
+	sendEnsureDispatched(ctx, t, a)
+	waitUntil(t, 5*time.Second, func() bool { return lockWaiters() >= 1 })
+
+	// The writer, queued behind the evaluation's epoch lock.
+	var g errgroup.Group
+	g.Go(func() error {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		if _, err := narvipg.NewSessionStore(pool).WithTx(tx).GetActorEpochForUpdate(ctx, sessionID); err != nil {
+			return err
+		}
+		prompt := "the turn behind the evaluation"
+		if _, err := narvipg.NewTurnStore(pool).WithTx(tx).CreateAndArmDispatch(ctx, sqlcgen.CreateTurnParams{
+			SessionID: sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &prompt,
+		}); err != nil {
+			return err
+		}
+		return tx.Commit(ctx)
+	})
+	waitUntil(t, 5*time.Second, func() bool { return lockWaiters() >= 2 })
+
+	if err := holder.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := g.Wait(); err != nil {
+		t.Fatalf("the writer: %v", err)
+	}
+	// Let the evaluation finish whatever it does after its commit.
+	time.Sleep(300 * time.Millisecond)
+
+	if _, ok := dispatchTimer(ctx, t, pool, sessionID); !ok {
+		t.Fatal("the dispatch timer the writer armed after the evaluation's lock is gone: the evaluation deleted it after its own commit, and the new turn is stranded")
+	}
+	if err := r.PumpOnce(ctx); err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, 5*time.Second, func() bool { return promptCount(commander) == 1 })
 }
