@@ -15,7 +15,7 @@ const claimOutboxEntry = `-- name: ClaimOutboxEntry :one
 UPDATE outbox
 SET attempts = attempts + 1, next_attempt_at = $2
 WHERE id = $1 AND status = 'pending'
-RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger
+RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions
 `
 
 type ClaimOutboxEntryParams struct {
@@ -51,6 +51,7 @@ func (q *Queries) ClaimOutboxEntry(ctx context.Context, arg ClaimOutboxEntryPara
 		&i.CorrelationID,
 		&i.SuppressedInShadow,
 		&i.DeliveredToLedger,
+		&i.ConsecutiveInterruptions,
 	)
 	return i, err
 }
@@ -87,7 +88,7 @@ const createOutboxEntry = `-- name: CreateOutboxEntry :one
 
 INSERT INTO outbox (session_id, kind, payload, correlation_id, suppressed_in_shadow)
 VALUES ($1, $2, $3, $4, $5)
-RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger
+RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions
 `
 
 type CreateOutboxEntryParams struct {
@@ -157,12 +158,80 @@ func (q *Queries) CreateOutboxEntry(ctx context.Context, arg CreateOutboxEntryPa
 		&i.CorrelationID,
 		&i.SuppressedInShadow,
 		&i.DeliveredToLedger,
+		&i.ConsecutiveInterruptions,
+	)
+	return i, err
+}
+
+const deferOutboxEntry = `-- name: DeferOutboxEntry :one
+UPDATE outbox
+SET attempts = GREATEST(attempts - 1, 0),
+    next_attempt_at = $2,
+    last_error = COALESCE($3, last_error),
+    consecutive_interruptions = $4
+WHERE id = $1 AND status = 'pending' AND next_attempt_at = $5
+RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions
+`
+
+type DeferOutboxEntryParams struct {
+	ID                       pgtype.UUID        `json:"id"`
+	NextAttemptAt            pgtype.Timestamptz `json:"next_attempt_at"`
+	LastError                *string            `json:"last_error"`
+	ConsecutiveInterruptions int32              `json:"consecutive_interruptions"`
+	ExpectedNextAttemptAt    pgtype.Timestamptz `json:"expected_next_attempt_at"`
+}
+
+// Records a failure of the class that does not consume an attempt
+// (domain/outbox.ClassDeferred, §5.1 and §44.2): gives back the attempt
+// ClaimOutboxEntry counted and makes the row due again at the caller's
+// own next_attempt_at, without moving it toward dead-letter. Today its one
+// cause is this process's own shutdown cutting a delivery short, or
+// reaching a claimed row before its delivery started; a rate limit whose
+// deadline GitHub stated (§44.2) is the next.
+//
+// A genuine compare-and-swap on next_attempt_at, like RenewOutboxClaim's,
+// not only a status guard: this statement takes an attempt BACK, so it must
+// not land on a row another builder has re-claimed since this caller last
+// observed it -- that builder's own claim counted ITS attempt, and taking
+// it back would let the row retry past MaxAttempts. Once another builder
+// has moved next_attempt_at on, this matches no row (pgx.ErrNoRows), and
+// the attempt stays counted. GREATEST keeps attempts from going below zero
+// whatever a caller passes.
+//
+// last_error is left as it was when the caller passes NULL (a row whose
+// delivery never started has nothing to say), and
+// consecutive_interruptions is the decided value: one more for an
+// interrupted delivery, unchanged for a row never started.
+func (q *Queries) DeferOutboxEntry(ctx context.Context, arg DeferOutboxEntryParams) (Outbox, error) {
+	row := q.db.QueryRow(ctx, deferOutboxEntry,
+		arg.ID,
+		arg.NextAttemptAt,
+		arg.LastError,
+		arg.ConsecutiveInterruptions,
+		arg.ExpectedNextAttemptAt,
+	)
+	var i Outbox
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.Kind,
+		&i.Payload,
+		&i.Status,
+		&i.Attempts,
+		&i.NextAttemptAt,
+		&i.DeliveredAt,
+		&i.LastError,
+		&i.CreatedAt,
+		&i.CorrelationID,
+		&i.SuppressedInShadow,
+		&i.DeliveredToLedger,
+		&i.ConsecutiveInterruptions,
 	)
 	return i, err
 }
 
 const getLatestOutboxEntryByKindPrefix = `-- name: GetLatestOutboxEntryByKindPrefix :one
-SELECT id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger FROM outbox
+SELECT id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions FROM outbox
 WHERE kind LIKE $1::text || '%'
 ORDER BY created_at DESC
 LIMIT 1
@@ -204,12 +273,13 @@ func (q *Queries) GetLatestOutboxEntryByKindPrefix(ctx context.Context, kindPref
 		&i.CorrelationID,
 		&i.SuppressedInShadow,
 		&i.DeliveredToLedger,
+		&i.ConsecutiveInterruptions,
 	)
 	return i, err
 }
 
 const getOutboxEntry = `-- name: GetOutboxEntry :one
-SELECT id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger FROM outbox
+SELECT id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions FROM outbox
 WHERE id = $1
 `
 
@@ -230,12 +300,13 @@ func (q *Queries) GetOutboxEntry(ctx context.Context, id pgtype.UUID) (Outbox, e
 		&i.CorrelationID,
 		&i.SuppressedInShadow,
 		&i.DeliveredToLedger,
+		&i.ConsecutiveInterruptions,
 	)
 	return i, err
 }
 
 const listDeadLetterOutboxEntries = `-- name: ListDeadLetterOutboxEntries :many
-SELECT id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger FROM outbox
+SELECT id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions FROM outbox
 WHERE status = 'dead_letter'
 ORDER BY created_at DESC
 LIMIT $1
@@ -289,6 +360,7 @@ func (q *Queries) ListDeadLetterOutboxEntries(ctx context.Context, limit int32) 
 			&i.CorrelationID,
 			&i.SuppressedInShadow,
 			&i.DeliveredToLedger,
+			&i.ConsecutiveInterruptions,
 		); err != nil {
 			return nil, err
 		}
@@ -301,7 +373,7 @@ func (q *Queries) ListDeadLetterOutboxEntries(ctx context.Context, limit int32) 
 }
 
 const listDuePendingOutboxEntries = `-- name: ListDuePendingOutboxEntries :many
-SELECT id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger FROM outbox
+SELECT id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions FROM outbox
 WHERE status = 'pending' AND next_attempt_at <= now()
 ORDER BY next_attempt_at
 LIMIT $1
@@ -338,6 +410,7 @@ func (q *Queries) ListDuePendingOutboxEntries(ctx context.Context, limit int32) 
 			&i.CorrelationID,
 			&i.SuppressedInShadow,
 			&i.DeliveredToLedger,
+			&i.ConsecutiveInterruptions,
 		); err != nil {
 			return nil, err
 		}
@@ -510,22 +583,25 @@ func (q *Queries) ListShadowSuppressedOutboxWithSessionRepos(ctx context.Context
 
 const markOutboxEntryDeadLetter = `-- name: MarkOutboxEntryDeadLetter :one
 UPDATE outbox
-SET status = 'dead_letter', last_error = $2
+SET status = 'dead_letter', last_error = $2, consecutive_interruptions = $3
 WHERE id = $1 AND status = 'pending'
-RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger
+RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions
 `
 
 type MarkOutboxEntryDeadLetterParams struct {
-	ID        pgtype.UUID `json:"id"`
-	LastError *string     `json:"last_error"`
+	ID                       pgtype.UUID `json:"id"`
+	LastError                *string     `json:"last_error"`
+	ConsecutiveInterruptions int32       `json:"consecutive_interruptions"`
 }
 
 // Records a failed delivery attempt that has exhausted domain/outbox.
 // MaxAttempts: status='dead_letter', last_error captures the notifier's
 // own final error. Same "AND status = 'pending'" guard as
 // MarkOutboxEntryDelivered/RecordOutboxEntryFailure above.
+// consecutive_interruptions is the decided value, as in
+// RecordOutboxEntryFailure.
 func (q *Queries) MarkOutboxEntryDeadLetter(ctx context.Context, arg MarkOutboxEntryDeadLetterParams) (Outbox, error) {
-	row := q.db.QueryRow(ctx, markOutboxEntryDeadLetter, arg.ID, arg.LastError)
+	row := q.db.QueryRow(ctx, markOutboxEntryDeadLetter, arg.ID, arg.LastError, arg.ConsecutiveInterruptions)
 	var i Outbox
 	err := row.Scan(
 		&i.ID,
@@ -541,20 +617,23 @@ func (q *Queries) MarkOutboxEntryDeadLetter(ctx context.Context, arg MarkOutboxE
 		&i.CorrelationID,
 		&i.SuppressedInShadow,
 		&i.DeliveredToLedger,
+		&i.ConsecutiveInterruptions,
 	)
 	return i, err
 }
 
 const markOutboxEntryDelivered = `-- name: MarkOutboxEntryDelivered :one
 UPDATE outbox
-SET status = 'delivered', delivered_at = now()
+SET status = 'delivered', delivered_at = now(), consecutive_interruptions = 0
 WHERE id = $1 AND status = 'pending'
-RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger
+RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions
 `
 
 // Records a successful delivery: status='delivered', delivered_at=now().
 // Guarded by "AND status = 'pending'", mirroring RecordImageBuildSuccess's
 // own identical guard against a stale/already-superseded row.
+// consecutive_interruptions goes back to zero: this attempt completed
+// (§5.1, migrations/000152).
 func (q *Queries) MarkOutboxEntryDelivered(ctx context.Context, id pgtype.UUID) (Outbox, error) {
 	row := q.db.QueryRow(ctx, markOutboxEntryDelivered, id)
 	var i Outbox
@@ -572,15 +651,16 @@ func (q *Queries) MarkOutboxEntryDelivered(ctx context.Context, id pgtype.UUID) 
 		&i.CorrelationID,
 		&i.SuppressedInShadow,
 		&i.DeliveredToLedger,
+		&i.ConsecutiveInterruptions,
 	)
 	return i, err
 }
 
 const markOutboxEntryDeliveredToLedger = `-- name: MarkOutboxEntryDeliveredToLedger :one
 UPDATE outbox
-SET status = 'delivered', delivered_at = now(), delivered_to_ledger = true, suppressed_in_shadow = true
+SET status = 'delivered', delivered_at = now(), delivered_to_ledger = true, suppressed_in_shadow = true, consecutive_interruptions = 0
 WHERE id = $1 AND status = 'pending'
-RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger
+RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions
 `
 
 // §30.6/§30.8's own terminal mark: records that this row's own effective
@@ -605,6 +685,9 @@ RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, deli
 // surface built to show it. The column records the row's EFFECTIVE mode,
 // and by the time this statement runs that mode is shadow whichever half
 // of the rule decided it.
+//
+// consecutive_interruptions goes back to zero, as in
+// MarkOutboxEntryDelivered: this attempt completed.
 func (q *Queries) MarkOutboxEntryDeliveredToLedger(ctx context.Context, id pgtype.UUID) (Outbox, error) {
 	row := q.db.QueryRow(ctx, markOutboxEntryDeliveredToLedger, id)
 	var i Outbox
@@ -622,21 +705,23 @@ func (q *Queries) MarkOutboxEntryDeliveredToLedger(ctx context.Context, id pgtyp
 		&i.CorrelationID,
 		&i.SuppressedInShadow,
 		&i.DeliveredToLedger,
+		&i.ConsecutiveInterruptions,
 	)
 	return i, err
 }
 
 const recordOutboxEntryFailure = `-- name: RecordOutboxEntryFailure :one
 UPDATE outbox
-SET next_attempt_at = $2, last_error = $3
+SET next_attempt_at = $2, last_error = $3, consecutive_interruptions = $4
 WHERE id = $1 AND status = 'pending'
-RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger
+RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions
 `
 
 type RecordOutboxEntryFailureParams struct {
-	ID            pgtype.UUID        `json:"id"`
-	NextAttemptAt pgtype.Timestamptz `json:"next_attempt_at"`
-	LastError     *string            `json:"last_error"`
+	ID                       pgtype.UUID        `json:"id"`
+	NextAttemptAt            pgtype.Timestamptz `json:"next_attempt_at"`
+	LastError                *string            `json:"last_error"`
+	ConsecutiveInterruptions int32              `json:"consecutive_interruptions"`
 }
 
 // Records a failed delivery attempt that is still eligible for another
@@ -646,8 +731,20 @@ type RecordOutboxEntryFailureParams struct {
 // error for observability. attempts is NOT incremented again here --
 // ClaimOutboxEntry already counted this attempt. Same "AND status =
 // 'pending'" guard as MarkOutboxEntryDelivered, for the identical reason.
+//
+// consecutive_interruptions is the value domain/outbox.EvaluateFailure
+// decided (§5.1, migrations/000152): zero for an attempt that completed
+// and failed on its own merits, one more for a delivery this process's
+// shutdown cut short that counts all the same -- past
+// platform.Timeouts.OutboxMaxConsecutiveInterruptions, past its own
+// delivery timeout, or of a kind not safe to repeat.
 func (q *Queries) RecordOutboxEntryFailure(ctx context.Context, arg RecordOutboxEntryFailureParams) (Outbox, error) {
-	row := q.db.QueryRow(ctx, recordOutboxEntryFailure, arg.ID, arg.NextAttemptAt, arg.LastError)
+	row := q.db.QueryRow(ctx, recordOutboxEntryFailure,
+		arg.ID,
+		arg.NextAttemptAt,
+		arg.LastError,
+		arg.ConsecutiveInterruptions,
+	)
 	var i Outbox
 	err := row.Scan(
 		&i.ID,
@@ -663,6 +760,7 @@ func (q *Queries) RecordOutboxEntryFailure(ctx context.Context, arg RecordOutbox
 		&i.CorrelationID,
 		&i.SuppressedInShadow,
 		&i.DeliveredToLedger,
+		&i.ConsecutiveInterruptions,
 	)
 	return i, err
 }
@@ -671,7 +769,7 @@ const renewOutboxClaim = `-- name: RenewOutboxClaim :one
 UPDATE outbox
 SET next_attempt_at = $2
 WHERE id = $1 AND status = 'pending' AND next_attempt_at = $3
-RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger
+RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions
 `
 
 type RenewOutboxClaimParams struct {
@@ -743,6 +841,7 @@ func (q *Queries) RenewOutboxClaim(ctx context.Context, arg RenewOutboxClaimPara
 		&i.CorrelationID,
 		&i.SuppressedInShadow,
 		&i.DeliveredToLedger,
+		&i.ConsecutiveInterruptions,
 	)
 	return i, err
 }

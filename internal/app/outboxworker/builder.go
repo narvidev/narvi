@@ -43,6 +43,13 @@ type Builder struct {
 	notifiers map[ports.NotificationKind]ports.Notifier
 	timeouts  platform.Timeouts
 
+	// shutdown is this process's own shutdown state (platform.
+	// ShutdownState), set by the run path when its drain begins and read
+	// here to tell a delivery that shutdown cut short from one that failed
+	// (§5.1) -- never inferred from a cancellation error. The process's
+	// one instance, shared with every other reader.
+	shutdown *platform.ShutdownState
+
 	outboxLag        metric.Int64Gauge
 	outboxDueBacklog metric.Int64Gauge
 	deadLetterCount  metric.Int64Counter
@@ -61,7 +68,15 @@ type Builder struct {
 // construction time -- not per-tick, not per-row -- mirroring
 // app/imagebuild.NewBuilder's own image_build_failure_streak precedent
 // exactly.
-func NewBuilder(store *postgres.OutboxStore, pool *pgxpool.Pool, notifiers map[ports.NotificationKind]ports.Notifier, timeouts platform.Timeouts) (*Builder, error) {
+//
+// shutdown is this process's shutdown state (§5.1), required: a Builder
+// with none could never tell an interruption from a failure, and would
+// quietly count every delivery a deploy cuts short.
+func NewBuilder(store *postgres.OutboxStore, pool *pgxpool.Pool, notifiers map[ports.NotificationKind]ports.Notifier, timeouts platform.Timeouts, shutdown *platform.ShutdownState) (*Builder, error) {
+	if shutdown == nil {
+		return nil, errors.New("outboxworker: refusing to start: no shutdown state (§5.1)")
+	}
+
 	// §30.2's own outbox seam: refuse to start rather than let a
 	// registered-but-unclassified kind reach attempt() with no way to
 	// decide whether §30.8's suppress-wins check applies to it -- see
@@ -69,6 +84,11 @@ func NewBuilder(store *postgres.OutboxStore, pool *pgxpool.Pool, notifiers map[p
 	// HERE, on the finished map NewBuilder receives, rather than at
 	// main.go's own wiring line.
 	if err := classifyNotifiers(notifiers); err != nil {
+		return nil, err
+	}
+	// §5.1's shutdown rule needs the same of every registered kind: whether
+	// a second delivery adds to the first (repeatability.go).
+	if err := checkRepeatability(notifiers); err != nil {
 		return nil, err
 	}
 
@@ -115,6 +135,7 @@ func NewBuilder(store *postgres.OutboxStore, pool *pgxpool.Pool, notifiers map[p
 		pool:             pool,
 		notifiers:        notifiers,
 		timeouts:         timeouts,
+		shutdown:         shutdown,
 		outboxLag:        outboxLag,
 		outboxDueBacklog: outboxDueBacklog,
 		deadLetterCount:  deadLetterCount,
@@ -151,12 +172,25 @@ func (b *Builder) RegisteredKinds() []ports.NotificationKind {
 	return kinds
 }
 
+// ShutdownBegun reports whether the shutdown state this Builder reads has
+// begun -- for the same composition-root tests as HasNotifier: the control
+// plane's run path sets one state and this Builder must read that same
+// one, or every delivery a deploy cuts short would be counted again
+// (§5.1).
+func (b *Builder) ShutdownBegun() bool {
+	return b.shutdown.Begun()
+}
+
 // Run runs the process-wide outbox-delivery loop until ctx is done --
 // mirrors app/imagebuild.Builder.Run/app/reconciler.Reconciler.Run
 // exactly: a ticker on platform.Timeouts.OutboxPumpInterval, calling
 // PumpOnce each tick, logging (never propagating) any per-tick error so
 // one bad tick never kills the whole loop. The caller starts this via its
 // own errgroup.Go exactly once per process.
+//
+// ctx should end only once this process's shutdown has begun -- the
+// control plane runs this on platform.ShutdownState.Bind's context -- so a
+// delivery it cuts short is always read as an interruption (§5.1).
 func (b *Builder) Run(ctx context.Context) error {
 	ticker := time.NewTicker(b.timeouts.OutboxPumpInterval)
 	defer ticker.Stop()
@@ -191,6 +225,12 @@ func (b *Builder) Run(ctx context.Context) error {
 // query below is likewise isolated: a failure there is logged, not
 // propagated -- it is a cheap, standalone observability read, never
 // allowed to abort a tick's own real claim/deliver work.
+//
+// Every outcome the tick records is written on one context that outlives
+// the worker's (newOutcomeContext), so a shutdown that begins while a write
+// is in flight does not cancel it (§5.1). Once the shutdown has begun,
+// every row of the batch not yet attempted is handed back without spending
+// its attempt (attempt's own first check).
 func (b *Builder) PumpOnce(ctx context.Context) error {
 	claimed, oldestCreatedAt, err := b.claimBatch(ctx)
 	if err != nil {
@@ -212,10 +252,51 @@ func (b *Builder) PumpOnce(ctx context.Context) error {
 		b.outboxDueBacklog.Record(ctx, backlog)
 	}
 
+	outcomeCtx, release := newOutcomeContext(ctx, b.timeouts.OutboxShutdownRecordTimeout)
+	defer release()
 	for _, row := range claimed {
-		b.attempt(ctx, row)
+		b.attempt(ctx, outcomeCtx, row)
 	}
 	return nil
+}
+
+// newOutcomeContext returns the context a pump tick records outcomes on
+// (§5.1), and the function that releases it once the tick is done.
+//
+// An outcome is known before its write starts -- a delivery succeeded, it
+// failed, a claimed row goes back -- and is correct to record whatever the
+// shutdown state reads by then. On the worker's own context, a shutdown
+// that begins while the write is in flight cancels it, and the row, its
+// attempt spent, waits for its claim to lapse: a delivery that succeeded
+// is then delivered again. So this context carries the worker context's
+// values and is not cancelled with it.
+//
+// It is bounded from the moment the worker context ends, not from its own
+// creation: while the worker runs it has no deadline, as the worker
+// context has none, so a write late in a long tick is never cut by a
+// bound meant for the shutdown; once the worker context ends it is
+// cancelled OutboxShutdownRecordTimeout later, so everything the tick
+// still records after its shutdown began finishes within that one bound,
+// however many rows it covers, and Validate keeps that bound below
+// ShutdownGracePeriod.
+//
+// The bound is kept by context.AfterFunc's own goroutine, which ends at
+// the bound or at release, whichever comes first.
+func newOutcomeContext(worker context.Context, bound time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.WithoutCancel(worker))
+	stop := context.AfterFunc(worker, func() {
+		timer := time.NewTimer(bound)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cancel()
+		case <-ctx.Done():
+		}
+	})
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
 // claimBatch runs the ENTIRE claim step inside one transaction:
@@ -318,7 +399,18 @@ func (b *Builder) claimBatch(ctx context.Context) ([]sqlcgen.Outbox, time.Time, 
 // renewal a real single-writer lease: at most one builder proceeds to
 // notifier.Deliver for this row at a time. The renewal never increments
 // attempts -- claimBatch already counted this attempt.
-func (b *Builder) attempt(ctx context.Context, row sqlcgen.Outbox) {
+//
+// This process's own shutdown (§5.1) is read from its shutdown state,
+// never inferred from an error, at two points. First, before anything
+// else: once shutdown has begun, no delivery starts, and the row -- the
+// rest of a batch the shutdown reached -- is handed back with its
+// attempt, whatever its kind, since nothing was sent. Then once Deliver
+// has returned: domain/outbox.EvaluateFailure decides from that one
+// reading whether the shutdown cut the delivery short in a way that keeps
+// the attempt. Every outcome -- a failure, a success, a row handed back --
+// is written on outcomeCtx (newOutcomeContext), never on ctx, so a
+// shutdown that begins after either reading does not cancel the write.
+func (b *Builder) attempt(ctx, outcomeCtx context.Context, row sqlcgen.Outbox) {
 	var correlationID string
 	if row.CorrelationID != nil {
 		correlationID = *row.CorrelationID
@@ -331,10 +423,25 @@ func (b *Builder) attempt(ctx context.Context, row sqlcgen.Outbox) {
 		"correlation_id", correlationID,
 	)
 
+	// The first reading: once shutdown has begun, the row is handed back
+	// untouched but for its attempt -- nothing was sent, whatever the kind.
+	if b.shutdown.Begun() {
+		b.recordFailure(outcomeCtx, logger, row, domainoutbox.Failure{
+			AttemptCount:             int(row.Attempts),
+			ConsecutiveInterruptions: int(row.ConsecutiveInterruptions),
+			ShutdownBegun:            true,
+			NotStarted:               true,
+		}, "")
+		return
+	}
+
 	notifier, ok := b.notifiers[ports.NotificationKind(row.Kind)]
 	if !ok {
 		logger.Error("outboxworker: no notifier registered for kind; recording as a failed attempt")
-		b.recordFailure(ctx, logger, row, fmt.Sprintf("no notifier registered for kind %q", row.Kind))
+		b.recordFailure(outcomeCtx, logger, row, domainoutbox.Failure{
+			AttemptCount:             int(row.Attempts),
+			ConsecutiveInterruptions: int(row.ConsecutiveInterruptions),
+		}, fmt.Sprintf("no notifier registered for kind %q", row.Kind))
 		return
 	}
 
@@ -391,19 +498,35 @@ func (b *Builder) attempt(ctx context.Context, row sqlcgen.Outbox) {
 	deliverCtx, cancel := context.WithTimeout(ctx, b.timeouts.OutboxDeliveryTimeout)
 	defer cancel()
 
-	if err := notifier.Deliver(deliverCtx, ports.Notification{
+	started := time.Now()
+	err = notifier.Deliver(deliverCtx, ports.Notification{
 		Kind:    ports.NotificationKind(row.Kind),
 		Payload: row.Payload,
 		// Carried for the PASS-THROUGH kinds, which reach here without
 		// the stamp check above ever having run for them.
 		SuppressedInShadow: row.SuppressedInShadow,
-	}); err != nil {
-		logger.Warn("outboxworker: Deliver failed", "error", err)
-		b.recordFailure(ctx, logger, row, err.Error())
+	})
+	elapsed := time.Since(started)
+	if err != nil {
+		// The second reading, the one this failure is decided by.
+		begun := b.shutdown.Begun()
+		if !begun {
+			logger.Warn("outboxworker: Deliver failed", "error", err)
+		}
+		b.recordFailure(outcomeCtx, logger, row, domainoutbox.Failure{
+			AttemptCount:             int(row.Attempts),
+			ConsecutiveInterruptions: int(row.ConsecutiveInterruptions),
+			ShutdownBegun:            begun,
+			OutlivedDeliveryTimeout:  elapsed >= b.timeouts.OutboxDeliveryTimeout,
+			Repeatable:               repeatabilityOf(ports.NotificationKind(row.Kind)) == Repeatable,
+		}, err.Error())
 		return
 	}
 
-	if _, err := b.store.MarkDelivered(ctx, row.ID); err != nil {
+	// A delivery that succeeded is recorded as delivered whenever the
+	// shutdown begins, before this write or during it: left pending, it
+	// would be delivered again once its claim lapsed.
+	if _, err := b.store.MarkDelivered(outcomeCtx, row.ID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// The row is no longer 'pending' -- a should-be-rare, benign
 			// race (e.g. a bug elsewhere ever double-claims a row); logged,
@@ -424,6 +547,10 @@ func (b *Builder) attempt(ctx context.Context, row sqlcgen.Outbox) {
 // Record, shadow_scm_writes), nothing further needs writing beyond this
 // one terminal mark -- see MarkOutboxEntryDeliveredToLedger's own
 // generated doc comment for the exact column-level effect.
+//
+// Written on the worker's own context, never the outcome one: a mode read
+// the shutdown cut short resolves shadow, fail-closed, and a mark written
+// past the shutdown would record that as a real suppression.
 func (b *Builder) deliverToLedger(ctx context.Context, logger *slog.Logger, row sqlcgen.Outbox) {
 	if _, err := b.store.MarkDeliveredToLedger(ctx, row.ID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -436,16 +563,69 @@ func (b *Builder) deliverToLedger(ctx context.Context, logger *slog.Logger, row 
 	logger.Info("outboxworker: row suppressed in shadow -- delivered to the ledger instead of the world")
 }
 
-// recordFailure computes the next retry time (or dead-letter decision) via
-// domain/outbox.EvaluateBackoff and records the failure -- shared by
-// every attempt failure path above (no notifier registered, Deliver
-// error).
-func (b *Builder) recordFailure(ctx context.Context, logger *slog.Logger, row sqlcgen.Outbox, lastError string) {
-	now := time.Now()
-	decision := domainoutbox.EvaluateBackoff(int(row.Attempts), domainoutbox.BackoffConfig{
-		BaseDelay: b.timeouts.OutboxBackoffBase,
-		MaxDelay:  b.timeouts.OutboxBackoffMax,
-	}, now)
+// failurePolicy is domain/outbox.EvaluateFailure's configuration, from
+// this Builder's timeouts.
+func (b *Builder) failurePolicy() domainoutbox.Policy {
+	return domainoutbox.Policy{
+		Backoff: domainoutbox.BackoffConfig{
+			BaseDelay: b.timeouts.OutboxBackoffBase,
+			MaxDelay:  b.timeouts.OutboxBackoffMax,
+		},
+		MaxConsecutiveInterruptions: b.timeouts.OutboxMaxConsecutiveInterruptions,
+		InterruptedSettleDelay:      b.timeouts.OutboxInterruptedSettleDelay,
+	}
+}
+
+// recordFailure records one failed attempt as domain/outbox.EvaluateFailure
+// decides it -- the one path every failure takes (no notifier registered, a
+// Deliver error, a row the shutdown reached before its delivery started):
+// ClassDeferred gives the attempt back (Defer), ClassCounted keeps it and
+// reschedules (RecordFailure) or dead-letters (MarkDeadLetter). Every write
+// carries the run of shutdown interruptions the decision names. ctx is the
+// context to write on: the tick's outcome context, which outlives the
+// worker's.
+//
+// A failure the shutdown caused is logged at warning level, naming the
+// shutdown and the rule applied, never at error level: a deploy is not an
+// outage. The caller logs an ordinary failure's own line itself.
+func (b *Builder) recordFailure(ctx context.Context, logger *slog.Logger, row sqlcgen.Outbox, f domainoutbox.Failure, lastError string) {
+	decision := domainoutbox.EvaluateFailure(f, b.failurePolicy(), time.Now())
+	logger = logger.With("rule", string(decision.Rule), "consecutive_interruptions", decision.ConsecutiveInterruptions)
+
+	if decision.Class == domainoutbox.ClassDeferred {
+		var recorded *string
+		switch decision.Rule {
+		case domainoutbox.RuleShutdownBeforeStart:
+			logger.Warn("outboxworker: this process's shutdown began before this row's delivery started; returned to the queue without spending an attempt")
+		default:
+			logger.Warn("outboxworker: delivery interrupted by this process's shutdown; returned to the queue without spending an attempt",
+				"max_consecutive_interruptions", b.timeouts.OutboxMaxConsecutiveInterruptions,
+				"error", redactURLCredentials(lastError),
+			)
+			interrupted := "interrupted by this process's shutdown, attempt not counted: " + lastError
+			recorded = &interrupted
+		}
+		if _, err := b.store.Defer(ctx, row.ID,
+			pgtype.Timestamptz{Time: decision.NextRetryAt, Valid: true},
+			row.NextAttemptAt, // CAS: never take back an attempt another builder's claim counted.
+			recorded, int32(decision.ConsecutiveInterruptions),
+		); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				logger.Warn("outboxworker: return to queue no-op: row no longer pending or claimed by another builder since")
+				return
+			}
+			logger.Error("outboxworker: return to queue failed", "error", err)
+		}
+		return
+	}
+
+	if decision.Rule != domainoutbox.RuleFailed {
+		logger.Warn("outboxworker: delivery interrupted by this process's shutdown; counted as a failed attempt",
+			"max_consecutive_interruptions", b.timeouts.OutboxMaxConsecutiveInterruptions,
+			"error", redactURLCredentials(lastError),
+		)
+		lastError = "interrupted by this process's shutdown, counted (" + string(decision.Rule) + "): " + lastError
+	}
 
 	if decision.DeadLetter {
 		// Confirmed audit finding (LOW): docs/runbooks/outbox-delivery.md's
@@ -460,7 +640,7 @@ func (b *Builder) recordFailure(ctx context.Context, logger *slog.Logger, row sq
 			"max_attempts", domainoutbox.MaxAttempts,
 			"last_error", redactURLCredentials(lastError),
 		)
-		if _, err := b.store.MarkDeadLetter(ctx, row.ID, lastError); err != nil {
+		if _, err := b.store.MarkDeadLetter(ctx, row.ID, lastError, int32(decision.ConsecutiveInterruptions)); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				logger.Warn("outboxworker: mark dead letter no-op: row no longer pending")
 				return
@@ -472,7 +652,7 @@ func (b *Builder) recordFailure(ctx context.Context, logger *slog.Logger, row sq
 		return
 	}
 
-	if _, err := b.store.RecordFailure(ctx, row.ID, pgtype.Timestamptz{Time: decision.NextRetryAt, Valid: true}, lastError); err != nil {
+	if _, err := b.store.RecordFailure(ctx, row.ID, pgtype.Timestamptz{Time: decision.NextRetryAt, Valid: true}, lastError, int32(decision.ConsecutiveInterruptions)); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			logger.Warn("outboxworker: record failure no-op: row no longer pending")
 			return

@@ -14,6 +14,12 @@
 // outbox-specific language ("dead-letter after N attempts") requires an
 // outbox entry to eventually stop retrying and be given up on, which
 // EvaluateBackoff (below) reports via BackoffDecision.DeadLetter.
+//
+// EvaluateFailure (failure.go) is the worker's one entry point for a failed
+// attempt: it decides the failure's class -- counted, on EvaluateBackoff's
+// schedule, or deferred, the class that gives the attempt back (§5.1's
+// shutdown interruptions, and §44.2's rate limits next) -- and calls
+// EvaluateBackoff for every counted one.
 package outbox
 
 import "time"
