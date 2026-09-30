@@ -15,6 +15,7 @@ func TestEvaluateFailure(t *testing.T) {
 			MaxDelay:  5 * time.Minute,
 		},
 		MaxConsecutiveInterruptions: 2,
+		InterruptedSettleDelay:      45 * time.Second,
 	}
 
 	// interrupted is a repeatable delivery the shutdown cut short, within
@@ -48,14 +49,14 @@ func TestEvaluateFailure(t *testing.T) {
 			wantClass: outbox.ClassCounted, wantRule: outbox.RuleFailed, wantDeadLetter: true, wantRun: 0,
 		},
 		{
-			name:      "an interrupted delivery keeps its attempt and is due at once",
+			name:      "an interrupted delivery keeps its attempt and is due after the settle delay",
 			failure:   interrupted(1, 0),
-			wantClass: outbox.ClassDeferred, wantRule: outbox.RuleShutdownInterrupted, wantDelay: 0, wantRun: 1,
+			wantClass: outbox.ClassDeferred, wantRule: outbox.RuleShutdownInterrupted, wantDelay: 45 * time.Second, wantRun: 1,
 		},
 		{
 			name:      "an interruption at the bound still keeps its attempt",
 			failure:   interrupted(1, 1),
-			wantClass: outbox.ClassDeferred, wantRule: outbox.RuleShutdownInterrupted, wantDelay: 0, wantRun: 2,
+			wantClass: outbox.ClassDeferred, wantRule: outbox.RuleShutdownInterrupted, wantDelay: 45 * time.Second, wantRun: 2,
 		},
 		{
 			name:      "an interruption past the bound counts",
@@ -70,7 +71,7 @@ func TestEvaluateFailure(t *testing.T) {
 		{
 			name:      "an interrupted delivery on its tenth attempt is not dead-lettered: the attempt is given back",
 			failure:   interrupted(outbox.MaxAttempts, 0),
-			wantClass: outbox.ClassDeferred, wantRule: outbox.RuleShutdownInterrupted, wantDelay: 0, wantRun: 1,
+			wantClass: outbox.ClassDeferred, wantRule: outbox.RuleShutdownInterrupted, wantDelay: 45 * time.Second, wantRun: 1,
 		},
 		{
 			name:      "an interruption of a kind not safe to repeat counts",
@@ -110,7 +111,7 @@ func TestEvaluateFailure(t *testing.T) {
 		{
 			name:      "a negative run reads as zero",
 			failure:   interrupted(1, -4),
-			wantClass: outbox.ClassDeferred, wantRule: outbox.RuleShutdownInterrupted, wantDelay: 0, wantRun: 1,
+			wantClass: outbox.ClassDeferred, wantRule: outbox.RuleShutdownInterrupted, wantDelay: 45 * time.Second, wantRun: 1,
 		},
 	}
 

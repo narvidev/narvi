@@ -86,10 +86,13 @@ var notificationKindRepeatability = map[ports.NotificationKind]Repeatability{
 	// reviewCheckNotifier finds the run it created -- by head sha, check
 	// name, this deployment's own recorded writer App and the pull
 	// request's external id -- and updates it before it would create one,
-	// so a repeat updates the same run. The one gap is a deployment's very
-	// first create, before any writer App has been recorded: a repeat of
-	// that one delivery can leave a second run, and it can today as well,
-	// since the cut attempt is retried either way; later repeats adopt.
+	// so a repeat updates the same run, provided the cut create has landed
+	// by then: which is why an interrupted delivery is due again only after
+	// platform.Timeouts.OutboxInterruptedSettleDelay, never at once. The
+	// one gap is a deployment's very first create, before any writer App
+	// has been recorded: a repeat of that one delivery can leave a second
+	// run, and it can today as well, since the cut attempt is retried
+	// either way; later repeats adopt.
 	ports.NotificationKindGitHubReviewCheck: Repeatable,
 
 	// sentinelAutoFixNotifier claims its sentinel_fixes row, creates the

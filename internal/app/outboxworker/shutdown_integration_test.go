@@ -173,14 +173,23 @@ func newShutdownTestBuilder(t *testing.T, pool *pgxpool.Pool, store *narvipg.Out
 	return builder
 }
 
-// makeDue makes a handed-back row due on the database's own clock. The
-// worker stamps "due at once" from the host's clock, which may lead the
-// database's by a few milliseconds -- in production the next tick absorbs
-// that; a test pumping again at once would find the row not yet due.
+// makeDue makes a handed-back row due now on the database's own clock,
+// standing in for its settle delay, or its backoff, having passed.
 func makeDue(t *testing.T, pool *pgxpool.Pool, id pgtype.UUID) {
 	t.Helper()
 	if _, err := pool.Exec(context.Background(), `UPDATE outbox SET next_attempt_at = LEAST(next_attempt_at, now()) WHERE id = $1`, id); err != nil {
 		t.Fatalf("make due: %v", err)
+	}
+}
+
+// absorbClockSkew makes a row due on the database's own clock only if the
+// worker already made it due on the host's: the host's clock may lead the
+// database's by a few milliseconds, which production's next tick absorbs.
+// A row due later -- settling, backing off -- stays as it is.
+func absorbClockSkew(t *testing.T, pool *pgxpool.Pool, id pgtype.UUID) {
+	t.Helper()
+	if _, err := pool.Exec(context.Background(), `UPDATE outbox SET next_attempt_at = now() WHERE id = $1 AND next_attempt_at <= now() + interval '1 second'`, id); err != nil {
+		t.Fatalf("absorb clock skew: %v", err)
 	}
 }
 
@@ -197,7 +206,8 @@ func getRow(t *testing.T, store *narvipg.OutboxStore, id pgtype.UUID) sqlcgen.Ou
 type want struct {
 	attempts     int32
 	interrupted  int32
-	dueNow       bool // next_attempt_at already passed: handed back
+	dueNow       bool // next_attempt_at already passed: handed back, never started
+	settling     bool // next_attempt_at OutboxInterruptedSettleDelay away: handed back after an interruption
 	backedOff    bool // next_attempt_at at least most of OutboxBackoffBase away: counted
 	lastErrorHas string
 }
@@ -215,6 +225,10 @@ func requireRow(t *testing.T, got sqlcgen.Outbox, w want) {
 	}
 	if w.dueNow && got.NextAttemptAt.Time.After(time.Now()) {
 		t.Fatalf("next_attempt_at = %v, want it already due", got.NextAttemptAt.Time)
+	}
+	if settle := platform.DefaultTimeouts().OutboxInterruptedSettleDelay; w.settling &&
+		(got.NextAttemptAt.Time.Before(time.Now().Add(settle-5*time.Second)) || got.NextAttemptAt.Time.After(time.Now().Add(settle+time.Second))) {
+		t.Fatalf("next_attempt_at = %v, want it OutboxInterruptedSettleDelay (%v) away", got.NextAttemptAt.Time, settle)
 	}
 	if w.backedOff && got.NextAttemptAt.Time.Before(time.Now().Add(20*time.Second)) {
 		t.Fatalf("next_attempt_at = %v, want it backed off by OutboxBackoffBase", got.NextAttemptAt.Time)
@@ -246,7 +260,7 @@ func TestShutdown_InterruptedDeliveryKeepsItsAttempt(t *testing.T) {
 	if interrupted.callCount() != 1 {
 		t.Fatalf("deliveries = %d, want 1", interrupted.callCount())
 	}
-	requireRow(t, getRow(t, store, row.ID), want{attempts: 0, interrupted: 1, dueNow: true, lastErrorHas: "interrupted by this process's shutdown"})
+	requireRow(t, getRow(t, store, row.ID), want{attempts: 0, interrupted: 1, settling: true, lastErrorHas: "interrupted by this process's shutdown"})
 	logs.requireNoErrorLogs(t)
 	logs.requireShutdownWarning(t, row.ID, "shutdown_interrupted")
 
@@ -282,11 +296,10 @@ func TestShutdown_WhatCounts(t *testing.T) {
 		// deliver runs as the notifier, given the process it runs in.
 		deliver func(p process, ctx context.Context) error
 		// runCtx is the context PumpOnce runs on; the process's own when nil.
-		runCtx       func(p process) (context.Context, context.CancelFunc)
-		timeouts     func(*platform.Timeouts)
-		want         want
-		wantRule     string // a warning naming the shutdown with this rule; "" for none
-		errorsLogged bool   // today's behavior for a write on a cancelled context
+		runCtx   func(p process) (context.Context, context.CancelFunc)
+		timeouts func(*platform.Timeouts)
+		want     want
+		wantRule string // a warning naming the shutdown with this rule; "" for none
 	}{
 		{
 			name:    "a failure on its own merits",
@@ -301,11 +314,10 @@ func TestShutdown_WhatCounts(t *testing.T) {
 				return context.WithCancel(context.Background())
 			},
 			// Filled in below: cancels the run context, not the process.
-			want: want{attempts: 1, interrupted: 0},
-			// The failure write runs on the cancelled context, as before
-			// the rule, and fails: the row waits for its claim, attempt
-			// spent.
-			errorsLogged: true,
+			// Counted like any failure, and recorded all the same: the
+			// write goes on the tick's outcome context, not the one that
+			// ended.
+			want: want{attempts: 1, interrupted: 0, backedOff: true, lastErrorHas: "context canceled"},
 		},
 		{
 			name: "shutdown read from the state, whatever the error says",
@@ -316,7 +328,7 @@ func TestShutdown_WhatCounts(t *testing.T) {
 				p.state.Begin()
 				return ownFailure
 			},
-			want:     want{attempts: 0, interrupted: 1, dueNow: true, lastErrorHas: "interrupted by this process's shutdown"},
+			want:     want{attempts: 0, interrupted: 1, settling: true, lastErrorHas: "interrupted by this process's shutdown"},
 			wantRule: "shutdown_interrupted",
 		},
 		{
@@ -402,9 +414,7 @@ func TestShutdown_WhatCounts(t *testing.T) {
 			if tc.wantRule != "" {
 				logs.requireShutdownWarning(t, row.ID, tc.wantRule)
 			}
-			if !tc.errorsLogged {
-				logs.requireNoErrorLogs(t)
-			}
+			logs.requireNoErrorLogs(t)
 		})
 	}
 }
@@ -426,8 +436,8 @@ func TestShutdown_BoundMakesARepeatedInterruptionCount(t *testing.T) {
 		want want
 		rule string
 	}{
-		{want{attempts: 0, interrupted: 1, dueNow: true}, "shutdown_interrupted"},
-		{want{attempts: 0, interrupted: 2, dueNow: true}, "shutdown_interrupted"},
+		{want{attempts: 0, interrupted: 1, settling: true}, "shutdown_interrupted"},
+		{want{attempts: 0, interrupted: 2, settling: true}, "shutdown_interrupted"},
 		{want{attempts: 1, interrupted: 3, backedOff: true, lastErrorHas: "shutdown_interrupted_past_bound"}, "shutdown_interrupted_past_bound"},
 	} {
 		makeDue(t, pool, row.ID)
@@ -478,13 +488,13 @@ func TestShutdown_CompletedAttemptResetsTheRun(t *testing.T) {
 	interrupt := func(p process, ctx context.Context) error { return p.cutShort(ctx) }
 
 	pump("first interruption", interrupt)
-	requireRow(t, getRow(t, store, row.ID), want{attempts: 0, interrupted: 1, dueNow: true})
+	requireRow(t, getRow(t, store, row.ID), want{attempts: 0, interrupted: 1, settling: true})
 
 	pump("a completed, failed attempt", func(process, context.Context) error { return errors.New("remote answered 500") })
 	requireRow(t, getRow(t, store, row.ID), want{attempts: 1, interrupted: 0, backedOff: true})
 
 	pump("second interruption", interrupt)
-	requireRow(t, getRow(t, store, row.ID), want{attempts: 1, interrupted: 1, dueNow: true})
+	requireRow(t, getRow(t, store, row.ID), want{attempts: 1, interrupted: 1, settling: true})
 	logs.requireShutdownWarning(t, row.ID, "shutdown_interrupted")
 
 	pump("delivered", func(process, context.Context) error { return nil })

@@ -1380,19 +1380,23 @@ type Timeouts struct {
 
 	// --- §5.1's amendment: a delivery this process's own shutdown cuts
 	// short is not a failed attempt. The worker's context ends when the
-	// drain begins, so everything the outbox delivery worker records after
-	// that -- an interrupted delivery handed back, a claimed row it never
-	// started, a success that landed as the context ended -- is written on
-	// a context that outlives the shutdown instead, bounded here, and an
+	// drain begins, so everything the outbox delivery worker records --
+	// an interrupted delivery handed back, a claimed row it never started,
+	// a success or failure whose write the shutdown overtook -- is written
+	// on a context that outlives the shutdown instead, bounded here; an
+	// interrupted delivery is due again only after a settle delay; and an
 	// interruption is spared its attempt only so many times in a row.
 
 	// OutboxShutdownRecordTimeout bounds the context the outbox delivery
-	// worker writes on once this process's shutdown has begun
-	// (internal/app/outboxworker's shutdownWrites): one per pump tick,
-	// created by the first write that needs it and shared by every later
-	// one in that tick, so everything one tick records after shutdown
-	// began finishes within this bound, however many claimed rows it
-	// covers. Each write is one single-row UPDATE. Validate keeps it below
+	// worker records outcomes on (internal/app/outboxworker's
+	// newOutcomeContext): one per pump tick, carrying the worker context's
+	// values and not cancelled with it, so an outcome already known is
+	// recorded whatever the shutdown state reads when its write starts.
+	// It has no deadline while the worker runs, as the worker context has
+	// none; once the worker context ends it is cancelled this long after,
+	// so everything one tick still records after its shutdown began
+	// finishes within this bound, however many claimed rows it covers.
+	// Each write is one single-row UPDATE. Validate keeps it below
 	// ShutdownGracePeriod, with no margin -- an ordering, not a race: the
 	// worker is one of the loops the process waits for before it exits, so
 	// a bound at or past the grace would let this write hold the process
@@ -1400,6 +1404,25 @@ type Timeouts struct {
 	// single-row writes on a reachable database, and leaving most of the
 	// 10s grace to the HTTP drain it runs beside.
 	OutboxShutdownRecordTimeout time.Duration
+
+	// OutboxInterruptedSettleDelay is how long a delivery this process's
+	// shutdown cut short, and that keeps its attempt, waits before it is
+	// due again (domain/outbox.EvaluateFailure's RuleShutdownInterrupted;
+	// a claimed row whose delivery never started is due at once, since
+	// nothing was sent). The cut request may already have reached the
+	// remote end, which goes on processing it after the caller stopped
+	// listening: a repeat that runs before that request lands cannot see
+	// what it did. A review check's repeat, for one, would find no run to
+	// adopt and create a second one, left in progress forever. Before this
+	// rule the failure write ran on the cancelled context and failed, so
+	// the row waited for its claim to lapse -- OutboxClaimDuration after
+	// the renewal just before its delivery -- and the repeat always came
+	// after the cut request had landed. Validate keeps this delay at least
+	// OutboxClaimDuration, with no margin: counted from the interruption,
+	// which comes after the renewal, it never makes a row due sooner than
+	// that lapse did. Not specified in the plan; chosen as 45s, exactly
+	// OutboxClaimDuration.
+	OutboxInterruptedSettleDelay time.Duration
 
 	// OutboxMaxConsecutiveInterruptions is how many times in a row a
 	// delivery may be cut short by this process's own shutdown and still
@@ -3952,8 +3975,9 @@ func DefaultTimeouts() Timeouts {
 		OutboxDeliveryTimeout: 15 * time.Second, // not specified; chosen, generous for a single outbound notifier POST
 		OutboxClaimDuration:   45 * time.Second, // not specified; chosen -- exactly MinTimeoutMargin above OutboxDeliveryTimeout (audit fix H6, see field doc comment)
 
-		OutboxShutdownRecordTimeout:       3 * time.Second, // §5.1; not specified, chosen -- below ShutdownGracePeriod, see field doc comment
-		OutboxMaxConsecutiveInterruptions: 3,               // §5.1; not specified, chosen -- see field doc comment
+		OutboxShutdownRecordTimeout:       3 * time.Second,  // §5.1; not specified, chosen -- below ShutdownGracePeriod, see field doc comment
+		OutboxInterruptedSettleDelay:      45 * time.Second, // §5.1; not specified, chosen -- exactly OutboxClaimDuration, see field doc comment
+		OutboxMaxConsecutiveInterruptions: 3,                // §5.1; not specified, chosen -- see field doc comment
 
 		IntentClassifierLLMTimeout: 10 * time.Second, // not specified; chosen, matches RepoSHAResolutionTimeout's own "lightweight call" reasoning
 
@@ -4413,6 +4437,20 @@ func (t Timeouts) Validate() error {
 			LesserValue:  t.OutboxShutdownRecordTimeout,
 			GreaterField: "ShutdownGracePeriod",
 			GreaterValue: t.ShutdownGracePeriod,
+		})
+	}
+	// §5.1: an interrupted delivery that keeps its attempt is due again no
+	// sooner than its claim would have lapsed before the rule existed, so
+	// a request the shutdown cut after the remote end accepted it lands
+	// before the repeat. An ordering, not a race, so no margin. See
+	// OutboxInterruptedSettleDelay's own doc comment.
+	if t.OutboxInterruptedSettleDelay < t.OutboxClaimDuration {
+		errs = append(errs, &TimeoutInvariantError{
+			Chain:        "OutboxInterruptedSettleDelay >= OutboxClaimDuration",
+			LesserField:  "OutboxInterruptedSettleDelay",
+			LesserValue:  t.OutboxInterruptedSettleDelay,
+			GreaterField: "OutboxClaimDuration",
+			GreaterValue: t.OutboxClaimDuration,
 		})
 	}
 	// §5.1: the bound on interruptions in a row that keep their attempt.

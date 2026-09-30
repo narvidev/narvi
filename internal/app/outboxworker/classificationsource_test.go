@@ -86,6 +86,54 @@ func TestRepeatability_CoversEveryKindDeclaredInSource(t *testing.T) {
 	}
 }
 
+// TestRepeatability_EveryKindsValue pins every kind's repeatability, not
+// only its presence: each value decides, when a shutdown cuts that kind's
+// delivery short, whether the attempt is given back -- and a kind whose
+// second delivery adds to the first must never get it back. Flipping any
+// one value fails here, naming the kind and the reason it has that value.
+func TestRepeatability_EveryKindsValue(t *testing.T) {
+	type pinned struct {
+		value  Repeatability
+		reason string
+	}
+	want := map[ports.NotificationKind]pinned{
+		ports.NotificationKindSlack:                    {NotRepeatable, "chat.postMessage: a repeat posts a second message"},
+		ports.NotificationKindSlackPlanApproval:        {NotRepeatable, "chat.postMessage of the approval request: a second message"},
+		ports.NotificationKindSlackWorkflowDecision:    {NotRepeatable, "chat.postMessage: a second message"},
+		ports.NotificationKindSlackDigest:              {NotRepeatable, "chat.postMessage of the digest: a second message"},
+		ports.NotificationKindSlackPlanDecided:         {Repeatable, "chat.update of a known message: the same text again"},
+		ports.NotificationKindLinear:                   {NotRepeatable, "agentActivityCreate without an id: a second activity"},
+		ports.NotificationKindLinearProgress:           {NotRepeatable, "agentActivityCreate without an id: a second thought"},
+		ports.NotificationKindLinearWorkflowDecision:   {NotRepeatable, "agentActivityCreate without an id: a second activity"},
+		ports.NotificationKindLinearDigest:             {Repeatable, "always returns its typed error, writes nothing"},
+		ports.NotificationKindGitHub:                   {NotRepeatable, "BotNotifier's PostIssueComment: a second comment"},
+		ports.NotificationKindGitHubWorkflowDecision:   {NotRepeatable, "BotNotifier's PostIssueComment: a second comment"},
+		ports.NotificationKindGitHubVerdict:            {NotRepeatable, "CreateReview: a second formal review"},
+		ports.NotificationKindHandoffSentinel:          {NotRepeatable, "ends in PostIssueComment: a second comment"},
+		ports.NotificationKindReleaseManifest:          {NotRepeatable, "PostIssueComment: a second comment"},
+		ports.NotificationKindGitHubPreviewLink:        {Repeatable, "a commit status per (context, sha) converges"},
+		ports.NotificationKindGitHubDescriptionAutofix: {Repeatable, "RenderAutofixBody re-extracts the preserved original: the same body"},
+		ports.NotificationKindGitHubReviewCheck:        {Repeatable, "finds and adopts its own run before creating one"},
+		ports.NotificationKindSentinelAutoFix:          {Repeatable, "claim, branch and spawn in one transaction; a repeat finds the claim"},
+		ports.NotificationKindRWXPreviewDispatch:       {NotRepeatable, "each dispatch starts a build"},
+		ports.NotificationKindBlobDelete:               {Repeatable, "deleting an absent key succeeds"},
+	}
+
+	if len(notificationKindRepeatability) != len(want) {
+		t.Errorf("the table classifies %d kinds, this test pins %d: pin the new kind's value here too", len(notificationKindRepeatability), len(want))
+	}
+	for kind, w := range want {
+		got, ok := notificationKindRepeatability[kind]
+		if !ok {
+			t.Errorf("%q is missing from the repeatability table", kind)
+			continue
+		}
+		if got != w.value {
+			t.Errorf("%q repeatability = %d, want %d: %s", kind, got, w.value, w.reason)
+		}
+	}
+}
+
 // TestCheckRepeatability pins NewBuilder's refusal: a registered kind the
 // repeatability table does not carry is named, and a map of classified
 // kinds passes.

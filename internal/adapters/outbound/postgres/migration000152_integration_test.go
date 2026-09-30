@@ -269,9 +269,11 @@ func TestMigrationOutboxConsecutiveInterruptions_UpAndDown(t *testing.T) {
 	}
 	_ = pdb.Close()
 	runPreviousBinaryOutbox(ctx, t, db)
+	// Pinned to 152, like every migration test here: Up would also apply
+	// whatever later migrations exist by the time this runs.
 	again, adb := newMigrate(t, connStr)
-	if err := again.Up(); err != nil {
-		t.Fatalf("this release's boot after the rollback = %v, want 000152 applied again", err)
+	if err := again.Migrate(152); err != nil {
+		t.Fatalf("this release's migration after the rollback = %v, want 000152 applied again", err)
 	}
 	_ = adb.Close()
 	assertCleanVersion(t, connStr, 152)

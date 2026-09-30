@@ -43,8 +43,10 @@ correct — this is specifically an *outbound-channel* symptom.
 - A deploy or restart is not an outage. A delivery the pod's own shutdown
   cut short logs a *warning*, never an error, naming the shutdown and a
   `rule`: `shutdown_interrupted` (handed back, its attempt not spent, due
-  again at once), `shutdown_before_start` (claimed but never started,
-  handed back likewise), or one of the three that count the attempt all
+  again after `OutboxInterruptedSettleDelay`, 45 s, so a request the
+  shutdown cut after the remote end accepted it lands before the repeat),
+  `shutdown_before_start` (claimed but never started, handed back and due
+  at once), or one of the three that count the attempt all
   the same — `shutdown_interrupted_not_repeatable` (a kind a second
   delivery would add to: a Slack post, a Linear activity, a GitHub comment
   or review, an RWX dispatch), `shutdown_interrupted_outlived_delivery_timeout`,

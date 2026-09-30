@@ -48,16 +48,20 @@
 // (platform.ShutdownState, which the control plane sets as its drain
 // begins, before the worker's context ends) -- never a cancellation error
 // -- and domain/outbox.EvaluateFailure decides: the claim's attempt is given
-// back (the deferred class, DeferOutboxEntry) and the row is due again at
-// once, unless the kind is one a second delivery would add to
-// (repeatability.go), the delivery outlived its own OutboxDeliveryTimeout,
-// or the row has been interrupted more times in a row than
-// OutboxMaxConsecutiveInterruptions allows (outbox.consecutive_interruptions,
-// reset when an attempt completes). The rest of the batch, never started,
-// is handed back with its attempts, and every outcome recorded after the
-// shutdown began is written on one context per tick that outlives it,
-// bounded by OutboxShutdownRecordTimeout. None of it is logged at error
-// level: each is a warning naming the shutdown and the rule applied.
+// back (the deferred class, DeferOutboxEntry) and the row is due again
+// OutboxInterruptedSettleDelay later, once a request the shutdown cut after
+// the remote end accepted it has landed, unless the kind is one a second
+// delivery would add to (repeatability.go), the delivery outlived its own
+// OutboxDeliveryTimeout, or the row has been interrupted more times in a
+// row than OutboxMaxConsecutiveInterruptions allows
+// (outbox.consecutive_interruptions, reset when an attempt completes). The
+// rest of the batch, never started, is handed back with its attempts and
+// due at once. Every outcome a tick records is written on one context that
+// is not cancelled with the worker's, and is bounded by
+// OutboxShutdownRecordTimeout from the moment the worker's ends, so a
+// shutdown that begins mid-write does not lose a known outcome. None of it
+// is logged at error level: each is a warning naming the shutdown and the
+// rule applied.
 //
 // Three OTel instruments are constructed once, at NewBuilder time
 // (mirroring app/imagebuild's own image_build_failure_streak precedent):

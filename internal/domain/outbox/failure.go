@@ -48,13 +48,13 @@ const (
 
 	// RuleShutdownBeforeStart applies when this process's shutdown had
 	// begun before the row's delivery started, so nothing was sent.
-	// ClassDeferred for every kind, repeatable or not, and the run of
-	// interruptions stays as it was: this was no delivery cut short.
+	// ClassDeferred for every kind, repeatable or not, due at once, and the
+	// run of interruptions stays as it was: this was no delivery cut short.
 	RuleShutdownBeforeStart Rule = "shutdown_before_start"
 
 	// RuleShutdownInterrupted applies when this process's shutdown cut the
 	// delivery short, and none of the three rules below applies.
-	// ClassDeferred.
+	// ClassDeferred, due again after Policy.InterruptedSettleDelay.
 	RuleShutdownInterrupted Rule = "shutdown_interrupted"
 
 	// RuleShutdownNotRepeatable applies when the shutdown cut the delivery
@@ -122,6 +122,13 @@ type Policy struct {
 	// row keep their attempt; the next one counts.
 	// platform.Timeouts.OutboxMaxConsecutiveInterruptions.
 	MaxConsecutiveInterruptions int
+
+	// InterruptedSettleDelay is how long a delivery the shutdown cut short
+	// waits before it is due again, when it keeps its attempt: the cut
+	// request may already have reached the remote end, and a repeat must
+	// not run before it lands. platform.Timeouts.
+	// OutboxInterruptedSettleDelay.
+	InterruptedSettleDelay time.Duration
 }
 
 // FailureDecision is EvaluateFailure's verdict for one failed attempt.
@@ -155,13 +162,15 @@ type FailureDecision struct {
 //   - No shutdown: RuleFailed, counted. An attempt that completes resets the
 //     run of interruptions.
 //   - Shutdown before the delivery started: RuleShutdownBeforeStart,
-//     deferred, due at once, run unchanged.
+//     deferred, due at once -- nothing was sent -- run unchanged.
 //   - Shutdown cut the delivery short: the run grows by one, and the
 //     attempt is counted if the kind is not repeatable, if the delivery
 //     outlived its own delivery timeout, or if the run now exceeds
 //     MaxConsecutiveInterruptions, in that order of precedence; otherwise
-//     RuleShutdownInterrupted, deferred and due at once, so another
-//     replica, or this one after its restart, delivers it next.
+//     RuleShutdownInterrupted, deferred and due InterruptedSettleDelay
+//     later, so the cut request, if the remote end accepted it, has
+//     landed before another replica, or this one after its restart,
+//     repeats it.
 func EvaluateFailure(f Failure, p Policy, now time.Time) FailureDecision {
 	run := f.ConsecutiveInterruptions
 	if run < 0 {
@@ -176,11 +185,11 @@ func EvaluateFailure(f Failure, p Policy, now time.Time) FailureDecision {
 			ConsecutiveInterruptions: run,
 		}
 	}
-	deferred := func(rule Rule, run int) FailureDecision {
+	deferred := func(rule Rule, run int, dueAfter time.Duration) FailureDecision {
 		return FailureDecision{
 			Class:                    ClassDeferred,
 			Rule:                     rule,
-			BackoffDecision:          BackoffDecision{NextRetryAt: now},
+			BackoffDecision:          BackoffDecision{NextRetryAt: now.Add(dueAfter)},
 			ConsecutiveInterruptions: run,
 		}
 	}
@@ -189,7 +198,7 @@ func EvaluateFailure(f Failure, p Policy, now time.Time) FailureDecision {
 		return counted(RuleFailed, 0)
 	}
 	if f.NotStarted {
-		return deferred(RuleShutdownBeforeStart, run)
+		return deferred(RuleShutdownBeforeStart, run, 0)
 	}
 
 	run++
@@ -201,6 +210,6 @@ func EvaluateFailure(f Failure, p Policy, now time.Time) FailureDecision {
 	case run > p.MaxConsecutiveInterruptions:
 		return counted(RuleShutdownPastBound, run)
 	default:
-		return deferred(RuleShutdownInterrupted, run)
+		return deferred(RuleShutdownInterrupted, run, p.InterruptedSettleDelay)
 	}
 }

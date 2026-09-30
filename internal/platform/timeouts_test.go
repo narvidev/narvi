@@ -2614,12 +2614,14 @@ func TestValidate_StopDescendantWalkTimeout(t *testing.T) {
 	}
 }
 
-// TestValidate_OutboxShutdownRecording pins the two settings of §5.1's
-// shutdown rule for the outbox: the shipped values (3s, 3), the record
+// TestValidate_OutboxShutdownRecording pins the three settings of §5.1's
+// shutdown rule for the outbox: the shipped values (3s, 45s, 3), the record
 // bound refused at zero or below and at or past ShutdownGracePeriod (the
-// write would hold the process past its grace), and the interruption bound
-// refused below one (every interruption would count). Each broken setting
-// yields its own error, and each boundary that still holds is accepted.
+// write would hold the process past its grace), the settle delay refused
+// below OutboxClaimDuration (a repeat could run before a cut request
+// lands), and the interruption bound refused below one (every interruption
+// would count). Each broken setting yields its own error, and each
+// boundary that still holds is accepted.
 func TestValidate_OutboxShutdownRecording(t *testing.T) {
 	t.Parallel()
 
@@ -2629,6 +2631,9 @@ func TestValidate_OutboxShutdownRecording(t *testing.T) {
 	}
 	if got := defaults.OutboxMaxConsecutiveInterruptions; got != 3 {
 		t.Fatalf("DefaultTimeouts().OutboxMaxConsecutiveInterruptions = %d, want 3", got)
+	}
+	if got := defaults.OutboxInterruptedSettleDelay; got != 45*time.Second {
+		t.Fatalf("DefaultTimeouts().OutboxInterruptedSettleDelay = %v, want 45s", got)
 	}
 
 	for _, tc := range []struct {
@@ -2647,6 +2652,15 @@ func TestValidate_OutboxShutdownRecording(t *testing.T) {
 			to.OutboxShutdownRecordTimeout = to.ShutdownGracePeriod - time.Millisecond
 		}},
 		{name: "interruption bound one", mutate: func(to *platform.Timeouts) { to.OutboxMaxConsecutiveInterruptions = 1 }},
+		{name: "settle delay below the claim lapse", mutate: func(to *platform.Timeouts) {
+			to.OutboxInterruptedSettleDelay = to.OutboxClaimDuration - time.Millisecond
+		}, wantChain: "OutboxInterruptedSettleDelay >= OutboxClaimDuration"},
+		{name: "claim lapse raised past the settle delay", mutate: func(to *platform.Timeouts) {
+			to.OutboxClaimDuration = to.OutboxInterruptedSettleDelay + time.Second
+		}, wantChain: "OutboxInterruptedSettleDelay >= OutboxClaimDuration"},
+		{name: "settle delay equal to the claim lapse", mutate: func(to *platform.Timeouts) {
+			to.OutboxInterruptedSettleDelay = to.OutboxClaimDuration
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
