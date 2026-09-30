@@ -2052,11 +2052,19 @@ enters as a single floor value carrying both its level and what names it, and th
 from the blockers those values produce, so the two cannot disagree: no blockers exactly when the
 class is `auto`, and two inputs at the same level are both named. The rendered verdict lists them as
 nested bullets under the Shippable bullet, after a lead-in marking them as decided by the server and
-not asserted by the reviewer; an `auto` verdict's header, and every other line of the comment, is
-what it was. A counter-review reported done but not corroborated (§26.4) reaches the function as
-`uncorroborated`, a value of its own rather than `skipped`, with the same `needs_human` floor, so its
-blocker says what happened; a payload cannot claim that value, only the server resolves it. The
-blockers are not persisted: `review_verdicts` keeps the class, and the reviewer's own
+not asserted by the reviewer. That header list is the server's alone: the two reviewer fields rendered
+in it or right after it cannot open a list item there, the one-line adequacy explanation having its
+line breaks folded to spaces and every line of the why-line that would open a list item having its
+marker escaped, so reviewer text cannot pass for a Shippable bullet or a blocker block. Otherwise an
+`auto` verdict's header, and every other line of the comment, is what it was. A counter-review
+reported done but not corroborated (§26.4) reaches the function as `uncorroborated`, a value of its
+own rather than `skipped`, with the same `needs_human` floor, so its blocker says the reviewer
+reported done and the server could not confirm it from the turn's trace when the verdict was posted.
+That is all it claims, since the same value covers a trace with no completed counter-reviewer, a
+trace the server could not read, and a finish event that had not landed yet. A payload cannot claim
+that value on any path: `ValidateVerdictInput` rejects it whatever the depth, and the one writer of
+`review_verdicts.counter_review` refuses it too; only the server resolves it. The blockers are not
+persisted: `review_verdicts` keeps the class, and the reviewer's own
 `counter_review` self-report, exactly as before, so every reader of a stored verdict (auto-approval,
 auto-merge, the decision inbox, the Code review view and its REST DTOs) reads what it read before,
 and the posted verdict is where the blockers are read.

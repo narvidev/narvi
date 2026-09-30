@@ -1088,8 +1088,10 @@ func digestInputFromWire(d restdtos.Digest) reviewpost.Digest {
 // completely unvalidated outside the deep path (validate.go's own doc
 // comment). A present value is forwarded verbatim -- ValidateVerdictInput
 // is what actually rejects anything other than review.CounterReviewDone/
-// CounterReviewSkipped, and only when this session's own resolved
-// ReviewDepth is deep.
+// CounterReviewSkipped when this session's own resolved ReviewDepth is
+// deep, and rejects the server-only review.CounterReviewUncorroborated
+// whatever the depth (§26.1), so that value never reaches
+// appreviewverdict.Insert as the reviewer's report.
 func counterReviewFromWire(v restdtos.PostReviewVerdictRequestCounterReview) review.CounterReviewStatus {
 	if v == nil {
 		return ""

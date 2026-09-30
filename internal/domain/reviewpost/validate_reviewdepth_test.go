@@ -105,7 +105,7 @@ func TestValidateVerdictInput_DeepPath(t *testing.T) {
 		{
 			name:    "deep path with counterReview=uncorroborated is rejected -- only the server resolves that state, a payload cannot claim it",
 			mutate:  func(in *reviewpost.VerdictInput) { in.CounterReview = review.CounterReviewUncorroborated },
-			wantErr: reviewpost.ErrInvalidCounterReview,
+			wantErr: reviewpost.ErrServerOnlyCounterReview,
 		},
 	}
 	for _, tc := range tests {

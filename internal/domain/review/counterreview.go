@@ -54,10 +54,14 @@ const (
 	// CounterReviewUncorroborated is a deep-path counter-review the
 	// reviewer reported done that the server could not corroborate
 	// against this turn's own persisted sub-task trace
-	// (reviewverdict.CounterReviewCorroborated). It is the server's
-	// finding, never a report: reviewpost.ValidateVerdictInput admits only
-	// done and skipped from a payload, and reviewpost.BuildVerdict is the
-	// one place this value is produced. It floors exactly like
+	// (reviewverdict.CounterReviewCorroborated): the trace showed no
+	// counter-reviewer sub-task that started and completed, or it could
+	// not be read, or the finish event had not landed when the verdict
+	// was posted -- the server cannot tell these apart, so the value
+	// claims only that the done was not confirmed. It is the server's
+	// finding, never a report: reviewpost.ValidateVerdictInput rejects it
+	// from a payload on every path, and reviewpost.BuildVerdict is the one
+	// place this value is produced. It floors exactly like
 	// CounterReviewSkipped and keeps a name of its own, so the blocker it
 	// produces (§26.1) says what happened rather than reading as a skip
 	// the reviewer admitted to.

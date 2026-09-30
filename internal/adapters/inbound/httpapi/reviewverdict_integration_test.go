@@ -1899,7 +1899,7 @@ func TestPostReviewVerdict_CounterReviewUncorroborated_NoFinishEvent_FloorsToNee
 	body := verdictOutboxBody(ctx, t, rig, session.ID)
 	for _, want := range []string{
 		"- **Shippable**: needs_human (server-computed)\n  - Kept above auto by (decided by the server, not asserted by the reviewer):\n",
-		"    - counter-review `uncorroborated` -- reported done, but this turn's own trace shows no counter-reviewer sub-task that started and completed (needs_human)\n",
+		"    - counter-review `uncorroborated` -- reported done, but the server could not confirm it from this turn's trace when the verdict was posted (needs_human)\n",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("outbox verdict Body missing %q, Body:\n%s", want, body)
@@ -1915,6 +1915,96 @@ func TestPostReviewVerdict_CounterReviewUncorroborated_NoFinishEvent_FloorsToNee
 	}
 	if counterReview == nil || *counterReview != "done" || shippable != "needs_human" {
 		t.Errorf("review_verdicts counter_review = %v, shippable = %q; want the self-reported \"done\" and \"needs_human\"", counterReview, shippable)
+	}
+}
+
+// TestPostReviewVerdict_CounterReviewUnreadTrace_SaysOnlyItWasNotConfirmed
+// (§26.1/§26.4) covers a path where the server never reads the trace:
+// the turn carries no dispatched_event_id, so the handler cannot scope
+// the corroboration queries and leaves the claim uncorroborated -- even
+// though the trace holds a counter-reviewer sub-task that started and
+// completed. The posted blocker must say only what the server knows, that
+// it could not confirm the reported done, never that the trace shows no
+// such sub-task.
+func TestPostReviewVerdict_CounterReviewUnreadTrace_SaysOnlyItWasNotConfirmed(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-unread-trace", 84)
+	turn := seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-unread-trace", 1)
+	seedSubTaskStart(ctx, t, rig, session.ID, "msg-start-unread", "subtask-unread", review.CounterReviewerAgentName, 1)
+	seedSubTaskFinish(ctx, t, rig, session.ID, "msg-finish-unread", "subtask-unread", "completed", 1)
+	if _, err := rig.pool.Exec(ctx, `UPDATE turns SET dispatched_event_id = NULL WHERE id = $1`, turn.ID); err != nil {
+		t.Fatalf("clear dispatched_event_id: %v", err)
+	}
+
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepPathVerdictRequestJSON("done"))
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+	}
+	if resp.Shippable != restdtos.PostReviewVerdictResponseShippableNeedsHuman {
+		t.Errorf("Shippable = %q, want %q", resp.Shippable, restdtos.PostReviewVerdictResponseShippableNeedsHuman)
+	}
+	body := verdictOutboxBody(ctx, t, rig, session.ID)
+	if want := "    - counter-review `uncorroborated` -- reported done, but the server could not confirm it from this turn's trace when the verdict was posted (needs_human)\n"; !strings.Contains(body, want) {
+		t.Errorf("outbox verdict Body missing %q, Body:\n%s", want, body)
+	}
+	if strings.Contains(body, "trace shows no") {
+		t.Errorf("outbox verdict Body claims what the trace shows, though the server never read it, Body:\n%s", body)
+	}
+}
+
+// TestPostReviewVerdict_ServerOnlyCounterReview_RejectedOnEveryPath
+// (§26.1) posts the server-only counter-review value on a light, an
+// unresolved and a deep turn. Each is refused with 400 before anything is
+// written: no review_verdicts row stores it as the reviewer's report, and
+// no verdict is enqueued. Each case gets its own rig.
+func TestPostReviewVerdict_ServerOnlyCounterReview_RejectedOnEveryPath(t *testing.T) {
+	withCounterReview := func(body string) string {
+		return strings.Replace(body, `"factCheckKilled": 0`, `"factCheckKilled": 0, "counterReview": "uncorroborated"`, 1)
+	}
+	tests := []struct {
+		name  string
+		depth *string
+		body  string
+	}{
+		{"light", func() *string { d := string(reviewtriage.DepthLight); return &d }(), withCounterReview(validVerdictRequestJSON())},
+		{"unresolved depth", nil, withCounterReview(validVerdictRequestJSON())},
+		{"deep", func() *string { d := string(reviewtriage.DepthDeep); return &d }(), deepPathVerdictRequestJSON("uncorroborated")},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newTestRig(t)
+			ctx := context.Background()
+			repo := fmt.Sprintf("acme/verdict-server-only-%d", i)
+			session := setupReviewSessionWithSandbox(ctx, t, rig, repo, int32(90+i))
+			headSHA := "sha-server-only"
+			created, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHA, ReviewDepth: tc.depth})
+			if err != nil {
+				t.Fatalf("seed processing turn: %v", err)
+			}
+			messageID := testDispatchMessageID
+			if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: created.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &messageID}); err != nil {
+				t.Fatalf("stamp dispatched_message_id: %v", err)
+			}
+			if !strings.Contains(tc.body, `"counterReview": "uncorroborated"`) {
+				t.Fatalf("test setup: the request body does not carry the server-only value: %s", tc.body)
+			}
+
+			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, tc.body)
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
+			}
+			var verdicts, outboxRows int
+			if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM review_verdicts WHERE repo_full_name = $1`, repo).Scan(&verdicts); err != nil {
+				t.Fatalf("count review_verdicts: %v", err)
+			}
+			if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE session_id = $1 AND kind = $2`, session.ID, string(ports.NotificationKindGitHubVerdict)).Scan(&outboxRows); err != nil {
+				t.Fatalf("count verdict outbox rows: %v", err)
+			}
+			if verdicts != 0 || outboxRows != 0 {
+				t.Errorf("review_verdicts rows = %d, verdict outbox rows = %d; want none for a refused payload", verdicts, outboxRows)
+			}
+		})
 	}
 }
 

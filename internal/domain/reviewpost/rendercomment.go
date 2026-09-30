@@ -111,6 +111,21 @@ import (
 // account for. An auto verdict has no blockers and renders exactly the
 // header it did before blockers existed; every other line of the comment
 // is unchanged by them.
+//
+// # The header's reviewer text cannot open a list item there
+//
+// The header list is the server's: its four bullets and the blocker lines
+// under Shippable. Two reviewer-authored fields are rendered in that
+// region -- the adequacy explanation on the Description adequacy bullet,
+// and the why-line summary right after the list -- and neither may put a
+// line of its own into that list, or the reviewer could write a Shippable
+// bullet or a "decided by the server" block indistinguishable from the
+// real one. So the adequacy explanation, a one-line field (§26.2), has its
+// line breaks folded to spaces (foldLineBreaks), and every line of the
+// why-line that would open a list item has its marker escaped
+// (escapeListItemOpeners). Text with neither renders byte for byte as
+// before. Every later reviewer field sits under a heading of its own, so
+// none can place a line in the header list.
 func RenderVerdictComment(v review.Verdict, shippable review.ShippableAssessment, findings []Finding, digest Digest, summary, botHandle, syncedLabel string) string {
 	var b strings.Builder
 
@@ -121,12 +136,12 @@ func RenderVerdictComment(v review.Verdict, shippable review.ShippableAssessment
 	b.WriteString("### Code review verdict\n\n")
 	fmt.Fprintf(&b, "- **Risk**: %s\n", v.RiskLevel)
 	fmt.Fprintf(&b, "- **Premise**: %s\n", v.Premise)
-	fmt.Fprintf(&b, "- **Description adequacy**: %s -- %s\n", digest.DescriptionAdequacy, escapeFindingDescription(strings.TrimSpace(digest.AdequacyExplanation)))
+	fmt.Fprintf(&b, "- **Description adequacy**: %s -- %s\n", digest.DescriptionAdequacy, escapeFindingDescription(foldLineBreaks(strings.TrimSpace(digest.AdequacyExplanation))))
 	fmt.Fprintf(&b, "- **Shippable**: %s (server-computed)\n", shippable.Class())
 	b.WriteString(renderShippableBlockers(shippable.Blockers()))
 	b.WriteString("\n")
 
-	b.WriteString(escapeFindingDescription(strings.TrimSpace(summary)))
+	b.WriteString(escapeFindingDescription(escapeListItemOpeners(strings.TrimSpace(summary))))
 	b.WriteString("\n\n")
 
 	// --- 2. "What this PR does" (§26.1 item 2).
@@ -237,8 +252,15 @@ const shippableBlockersLeadIn = "  - Kept above auto by (decided by the server, 
 
 // uncorroboratedCounterReviewNote says, on the blocker line, what the
 // server-resolved review.CounterReviewUncorroborated means, since the
-// reviewer's own payload said "done".
-const uncorroboratedCounterReviewNote = " -- reported done, but this turn's own trace shows no counter-reviewer sub-task that started and completed"
+// reviewer's own payload said "done". It says only what the server knows:
+// that it could not confirm the claim when the verdict was posted. It
+// does not say what the trace holds, because the same value also comes
+// from paths where the trace was never read or only partly read (no
+// dispatched gen or event id on the turn, a failed corroboration query, a
+// malformed row that was skipped) and from the accepted race where the
+// counter-reviewer's finish event lands after the verdict (httpapi's
+// corroborateCounterReview, reviewpost.BuildVerdict).
+const uncorroboratedCounterReviewNote = " -- reported done, but the server could not confirm it from this turn's trace when the verdict was posted"
 
 // renderShippableBlockers renders blockers as nested bullets under the
 // Shippable header bullet: shippableBlockersLeadIn, then one line per
@@ -269,6 +291,83 @@ func renderShippableBlockers(blockers []review.Blocker) string {
 		fmt.Fprintf(&b, "    - %s `%s`%s (%s)\n", shippableInputLabel(bl.Input), escapeFilePathForCodeSpan(value), note, bl.Level)
 	}
 	return b.String()
+}
+
+// lineBreakFolder folds every CommonMark line ending (LF, CR, CRLF) into
+// one space.
+var lineBreakFolder = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ")
+
+// foldLineBreaks keeps a one-line reviewer field on the one line the
+// header renders it on (RenderVerdictComment's "The header's reviewer
+// text cannot open a list item there"): with no line break left, nothing
+// in it can begin a line, so nothing in it can open a list item.
+func foldLineBreaks(s string) string {
+	return lineBreakFolder.Replace(s)
+}
+
+// escapeListItemOpeners backslash-escapes the marker of every line of s
+// that could open a list item: after any indentation of spaces and tabs,
+// a bullet (-, + or *) or an ordered marker (one to nine digits, then . or
+// )), followed by a space, a tab or the end of the line. Both LF and CR
+// end a line, as they do for CommonMark. Whether a deeply indented marker
+// would open an item depends on the blocks around it, so this does not
+// try to tell: it escapes every one, and the only cost is a visible
+// backslash should such a line sit in an indented code block. An escaped
+// marker renders as the literal character and opens nothing; every other
+// byte of s is kept as it was, so text with no such line comes back
+// unchanged.
+func escapeListItemOpeners(s string) string {
+	var b strings.Builder
+	lineStart := true
+	for i := 0; i < len(s); {
+		if lineStart {
+			lineStart = false
+			j := i
+			for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+				j++
+			}
+			if k, ok := listMarkerAt(s, j); ok {
+				b.WriteString(s[i:k])
+				b.WriteByte('\\')
+				i = k
+				continue
+			}
+		}
+		c := s[i]
+		b.WriteByte(c)
+		if c == '\n' || c == '\r' {
+			lineStart = true
+		}
+		i++
+	}
+	return b.String()
+}
+
+// listMarkerAt reports whether a list-item marker starts at s[j], and if
+// so the index of the marker's punctuation byte -- the bullet itself, or
+// the . or ) after an ordered marker's digits -- which is the byte a
+// backslash escapes.
+func listMarkerAt(s string, j int) (int, bool) {
+	if j >= len(s) {
+		return 0, false
+	}
+	if c := s[j]; c == '-' || c == '+' || c == '*' {
+		return j, endsListMarker(s, j+1)
+	}
+	d := j
+	for d < len(s) && d-j < 9 && s[d] >= '0' && s[d] <= '9' {
+		d++
+	}
+	if d == j || d >= len(s) || (s[d] != '.' && s[d] != ')') {
+		return 0, false
+	}
+	return d, endsListMarker(s, d+1)
+}
+
+// endsListMarker reports whether what follows a list-item marker at s[p]
+// lets it open an item: a space, a tab, a line ending or the end of s.
+func endsListMarker(s string, p int) bool {
+	return p >= len(s) || s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r'
 }
 
 // shippableInputLabel is the readout's name for one of

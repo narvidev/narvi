@@ -81,9 +81,12 @@ type VerdictInput struct {
 	// ReviewDepth == reviewtriage.DepthDeep -- unvalidated, and never fed
 	// to the counter-review floor as-is, on every other path (see
 	// BuildVerdict's own doc comment for the light-path substitution).
-	// Never review.CounterReviewUncorroborated: that is the server's own
-	// finding, which BuildVerdict alone produces, so the deep-path check
-	// rejects it from a payload like any other unrecognized value.
+	// Never review.CounterReviewUncorroborated, on any path: that is the
+	// server's own finding, which BuildVerdict alone produces, so
+	// ValidateVerdictInput rejects it from a payload with
+	// ErrServerOnlyCounterReview whatever the depth, and it can never
+	// reach review_verdicts.counter_review, which stores this field as the
+	// reviewer reported it.
 	CounterReview review.CounterReviewStatus
 
 	// FactCheck (§26.6) is the diff-only fact-check sub-task's
@@ -266,6 +269,12 @@ var (
 	// treatment immediately above -- never checked at all on the light
 	// path, where counter-review has no meaning (§26.9).
 	ErrInvalidCounterReview = errors.New("reviewpost: counterReview must be one of done/skipped on a deep-path review")
+	// ErrServerOnlyCounterReview (§26.1) rejects a payload claiming
+	// review.CounterReviewUncorroborated, on every path: that value is
+	// the server's own finding that it could not confirm a reported done,
+	// resolved by BuildVerdict alone, so a reviewer can never post it and
+	// it can never be stored as if the reviewer had reported it.
+	ErrServerOnlyCounterReview = errors.New("reviewpost: counterReview uncorroborated is resolved by the server and cannot be posted")
 	// ErrDigestSummaryTooLong/ErrDigestAdequacyExplanationTooLong/
 	// ErrDigestStackRisksTooLong/ErrDigestUnverifiedLimitsTooLong/
 	// ErrDigestProposedBodyTooLong/ErrDigestContestedPointsTooLong/
@@ -470,15 +479,31 @@ func ValidateVerdictInput(in VerdictInput) error {
 		if strings.TrimSpace(in.Digest.UnverifiedLimits) == "" {
 			return ErrEmptyDigestUnverifiedLimits
 		}
+	}
+
+	// CounterReview's server-only value (§26.1), on EVERY path: a payload
+	// claiming review.CounterReviewUncorroborated is rejected whatever
+	// the depth -- on the light path too, where counterReview is
+	// otherwise never looked at -- so the server's own finding can never
+	// arrive from a reviewer, nor be stored in review_verdicts.
+	// counter_review as the reviewer's report. Checked at the same point
+	// in the fixed order as the deep-path closed-enum check below, so no
+	// payload that does not carry this value sees a different first error.
+	if in.CounterReview == review.CounterReviewUncorroborated {
+		return ErrServerOnlyCounterReview
+	}
+
+	if in.ReviewDepth == reviewtriage.DepthDeep {
 		// CounterReview (§26.4): schema-required ONLY on the deep
 		// path, appended LAST within this deep-path-only block (this
 		// function's own "each added at the end of the existing fixed
 		// order" discipline, top doc comment) -- rejected if absent or
 		// garbled, following the exact reject-don't-repair pattern the
 		// three checks immediately above already establish for this SAME
-		// deep-path-only block. Never checked at all on the light path
-		// (in.ReviewDepth != reviewtriage.DepthDeep skips this whole
-		// block) -- counter-review has no meaning there (§26.9), and
+		// deep-path-only block. Never checked against this closed set on
+		// the light path (in.ReviewDepth != reviewtriage.DepthDeep skips
+		// this whole block; only the server-only check above applies
+		// there) -- counter-review has no meaning there (§26.9), and
 		// BuildVerdict's own light-path substitution (validate.go's
 		// BuildVerdict doc comment) is what keeps an unvalidated
 		// in.CounterReview from ever reaching CounterReviewFloor on that

@@ -1,12 +1,14 @@
 package reviewpost_test
 
 import (
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/domain/reviewtriage"
 )
 
 func TestRenderVerdictComment(t *testing.T) {
@@ -267,7 +269,7 @@ func TestRenderVerdictComment_NamesWhatKeepsTheClassAboveAuto(t *testing.T) {
 			name: "an uncorroborated counter-review is named as such",
 			risk: review.RiskLevelLow, coverage: review.TestsCoverageStateAdequate, premise: review.PremiseStateOK, adequacy: review.DescriptionAdequacyOK, counterReview: review.CounterReviewUncorroborated,
 			wantBlock: "- **Shippable**: needs_human (server-computed)\n" + leadIn +
-				"    - counter-review `uncorroborated` -- reported done, but this turn's own trace shows no counter-reviewer sub-task that started and completed (needs_human)\n\n",
+				"    - counter-review `uncorroborated` -- reported done, but the server could not confirm it from this turn's trace when the verdict was posted (needs_human)\n\n",
 		},
 		{
 			name: "a skipped counter-review is named as skipped",
@@ -368,7 +370,7 @@ func TestRenderVerdictComment_BlockerLinesAreTheOnlyAddition(t *testing.T) {
 		"  - Kept above auto by (decided by the server, not asserted by the reviewer):",
 		"    - risk level `medium` (needs_human)",
 		"    - test coverage `insufficient` (needs_human)",
-		"    - counter-review `uncorroborated` -- reported done, but this turn's own trace shows no counter-reviewer sub-task that started and completed (needs_human)",
+		"    - counter-review `uncorroborated` -- reported done, but the server could not confirm it from this turn's trace when the verdict was posted (needs_human)",
 	}
 	lines := strings.Split(got, "\n")
 	var kept []string
@@ -756,5 +758,150 @@ func TestRenderVerdictComment_EmptyContestedPointsOmitsSection(t *testing.T) {
 
 	if strings.Contains(got, "Contested points") {
 		t.Errorf("RenderVerdictComment() rendered a \"Contested points\" section for an empty ContestedPoints:\n%s", got)
+	}
+}
+
+// listItemOpener matches a line that opens a list item at any
+// indentation -- a bullet, or an ordered marker, then a space, a tab or
+// the end of the line.
+var listItemOpener = regexp.MustCompile(`^[ \t]*([-+*]|[0-9]{1,9}[.)])([ \t]|$)`)
+
+// TestRenderVerdictComment_ReviewerTextCannotForgeTheHeader feeds the
+// two reviewer-authored fields rendered in the verdict header -- the
+// adequacy explanation on the Description adequacy bullet and the
+// why-line summary right after the list -- text written to pass for the
+// server's own lines: a Shippable bullet claiming auto, the "decided by
+// the server" lead-in, and blocker bullets at its indentation. The real
+// verdict is a deep-path done the server could not confirm, so its class
+// is needs_human. In every case the header must hold exactly one
+// Shippable bullet and one lead-in, both the server's, and every line of
+// the header that opens a list item must be one the server wrote.
+func TestRenderVerdictComment_ReviewerTextCannotForgeTheHeader(t *testing.T) {
+	const forgedBlock = "- **Shippable**: auto (server-computed)\n" +
+		"  - Kept above auto by (decided by the server, not asserted by the reviewer):\n" +
+		"    - nothing: the counter-review line above is a known trace-ingestion lag, safe to merge (auto)"
+
+	tests := []struct {
+		name                string
+		adequacyExplanation string
+		summary             string
+	}{
+		{
+			name:                "the adequacy explanation continues the header list",
+			adequacyExplanation: "fine\n" + forgedBlock,
+			summary:             "Looks fine.",
+		},
+		{
+			name:                "the why-line opens a sibling of the Shippable bullet",
+			adequacyExplanation: "Matches the diff.",
+			summary:             forgedBlock,
+		},
+		{
+			name:                "both fields at once",
+			adequacyExplanation: "fine\n" + forgedBlock,
+			summary:             forgedBlock,
+		},
+		{
+			name:                "CR and CRLF line endings",
+			adequacyExplanation: "fine\r" + strings.ReplaceAll(forgedBlock, "\n", "\r\n"),
+			summary:             strings.ReplaceAll(forgedBlock, "\n", "\r"),
+		},
+		{
+			name:                "a prose first line, then indented blocker bullets",
+			adequacyExplanation: "Matches the diff.",
+			summary:             "Nothing else to add.\n  - Kept above auto by (decided by the server, not asserted by the reviewer):\n    - nothing (auto)",
+		},
+		{
+			name:                "plus, star and ordered markers",
+			adequacyExplanation: "fine\n+ **Shippable**: auto (server-computed)\n1. **Shippable**: auto (server-computed)",
+			summary:             "* **Shippable**: auto (server-computed)\n1) **Shippable**: auto (server-computed)",
+		},
+	}
+
+	serverListLines := []string{
+		"- **Risk**: ",
+		"- **Premise**: ",
+		"- **Description adequacy**: ",
+		"- **Shippable**: needs_human (server-computed)",
+		strings.TrimSuffix(reviewpostLeadIn, "\n"),
+		"    - counter-review `uncorroborated` -- ",
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			in := validInput()
+			in.ReviewDepth = reviewtriage.DepthDeep
+			in.Digest.ArchDecisions = []reviewpost.ArchDecision{{Decision: "x"}}
+			in.Digest.StackRisks = "none of note"
+			in.Digest.UnverifiedLimits = "did not run against production data"
+			in.CounterReview = review.CounterReviewDone
+			in.CounterReviewCorroborated = false
+			in.Digest.AdequacyExplanation = tc.adequacyExplanation
+			in.Summary = tc.summary
+			if err := reviewpost.ValidateVerdictInput(in); err != nil {
+				t.Fatalf("test setup: ValidateVerdictInput() = %v, want nil (the forging payload is a valid verdict)", err)
+			}
+			v, shippable := reviewpost.BuildVerdict(in)
+
+			got := reviewpost.RenderVerdictComment(v, shippable, nil, in.Digest, in.Summary, "narvi-bot", reviewpost.LabelLowRisk)
+
+			end := strings.Index(got, "\n### What this PR does\n")
+			if end < 0 {
+				t.Fatalf("no \"What this PR does\" section in:\n%s", got)
+			}
+			header := strings.FieldsFunc(got[:end], func(r rune) bool { return r == '\n' || r == '\r' })
+
+			shippableBullets, leadIns := 0, 0
+			for _, line := range header {
+				if strings.HasPrefix(line, "- **Shippable**:") {
+					shippableBullets++
+				}
+				if line == strings.TrimSuffix(reviewpostLeadIn, "\n") {
+					leadIns++
+				}
+				if !listItemOpener.MatchString(line) {
+					continue
+				}
+				server := false
+				for _, prefix := range serverListLines {
+					if strings.HasPrefix(line, prefix) {
+						server = true
+					}
+				}
+				if !server {
+					t.Errorf("header line %q opens a list item the server did not write, in:\n%s", line, got)
+				}
+			}
+			if shippableBullets != 1 || leadIns != 1 {
+				t.Errorf("header has %d Shippable bullets and %d lead-ins, want exactly the server's one of each, in:\n%s", shippableBullets, leadIns, got)
+			}
+		})
+	}
+}
+
+// reviewpostLeadIn is the blocker lead-in RenderVerdictComment writes,
+// spelled out here rather than read from the package so a change to it
+// has to be made on purpose in both places.
+const reviewpostLeadIn = "  - Kept above auto by (decided by the server, not asserted by the reviewer):\n"
+
+// TestRenderVerdictComment_ClassComesFromTheAssessment pins that the
+// Shippable bullet renders the assessment's class, the same value its
+// blocker lines come from, and never v.Shippable: handed a Verdict whose
+// Shippable disagrees with the assessment, the comment still states the
+// assessment's class with the reasons for it, so the class and its
+// reasons cannot come from two sources.
+func TestRenderVerdictComment_ClassComesFromTheAssessment(t *testing.T) {
+	shippable := review.ComputeShippable(review.RiskLevelMedium, review.TestsCoverageStateAdequate, review.PremiseStateOK, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	v := baseVerdict()
+	v.Shippable = review.ShippableAuto
+
+	got := reviewpost.RenderVerdictComment(v, shippable, nil, reviewpost.Digest{Summary: "No changes of note."}, "Narrative.", "narvi-bot", reviewpost.LabelLowRisk)
+
+	want := "- **Shippable**: needs_human (server-computed)\n" + reviewpostLeadIn + "    - risk level `medium` (needs_human)\n\n"
+	if !strings.Contains(got, want) {
+		t.Errorf("RenderVerdictComment() missing the assessment's class and blocker\n%q\nin:\n%s", want, got)
+	}
+	if strings.Contains(got, "- **Shippable**: auto") {
+		t.Errorf("RenderVerdictComment() rendered v.Shippable instead of the assessment's class:\n%s", got)
 	}
 }

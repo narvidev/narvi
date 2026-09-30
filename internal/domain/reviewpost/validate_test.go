@@ -211,6 +211,27 @@ func TestValidateVerdictInput(t *testing.T) {
 			mutate:  func(in *reviewpost.VerdictInput) { in.CounterReview = "bogus" },
 			wantErr: nil,
 		},
+		{
+			name:    "counterReview=uncorroborated is rejected on an unresolved-depth path -- only the server resolves that state",
+			mutate:  func(in *reviewpost.VerdictInput) { in.CounterReview = review.CounterReviewUncorroborated },
+			wantErr: reviewpost.ErrServerOnlyCounterReview,
+		},
+		{
+			name: "counterReview=uncorroborated is rejected on the light path -- only the server resolves that state",
+			mutate: func(in *reviewpost.VerdictInput) {
+				in.ReviewDepth = reviewtriage.DepthLight
+				in.CounterReview = review.CounterReviewUncorroborated
+			},
+			wantErr: reviewpost.ErrServerOnlyCounterReview,
+		},
+		{
+			name: "counterReview=skipped stays legal on the light path",
+			mutate: func(in *reviewpost.VerdictInput) {
+				in.ReviewDepth = reviewtriage.DepthLight
+				in.CounterReview = review.CounterReviewSkipped
+			},
+			wantErr: nil,
+		},
 	}
 
 	for _, tc := range tests {
@@ -642,7 +663,9 @@ func TestBuildVerdict_CorroborationSubstitutionInertOnLightPath(t *testing.T) {
 // named uncorroborated rather than skipped -- and every other input as
 // the reviewer reported it. Mutation coverage: collapsing the
 // uncorroborated state back into skipped makes the uncorroborated case
-// fail here, since its blocker would then read "skipped".
+// fail here, since its blocker would then read "skipped"; and a
+// substitution that fires only when nothing else already holds
+// needs_human fails the medium-risk case, which must name both.
 func TestBuildVerdict_NamesItsBlockers(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -685,6 +708,20 @@ func TestBuildVerdict_NamesItsBlockers(t *testing.T) {
 			},
 			wantClass:    review.ShippableNeedsHuman,
 			wantBlockers: []review.Blocker{{Input: review.ShippableInputCounterReview, Value: "uncorroborated", Level: review.ShippableNeedsHuman}},
+		},
+		{
+			name: "an uncorroborated done is named beside a medium risk that already holds needs_human",
+			mutate: func(in *reviewpost.VerdictInput) {
+				*in = deepValidInput()
+				in.RiskLevel = review.RiskLevelMedium
+				in.CounterReview = review.CounterReviewDone
+				in.CounterReviewCorroborated = false
+			},
+			wantClass: review.ShippableNeedsHuman,
+			wantBlockers: []review.Blocker{
+				{Input: review.ShippableInputRiskLevel, Value: "medium", Level: review.ShippableNeedsHuman},
+				{Input: review.ShippableInputCounterReview, Value: "uncorroborated", Level: review.ShippableNeedsHuman},
+			},
 		},
 		{
 			name: "a deep-path done claim the server corroborated names none",
@@ -746,14 +783,19 @@ func TestBuildVerdict_NamesItsBlockers(t *testing.T) {
 // adding CounterReviewUncorroborated: every verdict BuildVerdict can be
 // handed across depth (deep, light, unresolved), the counter-review value
 // in the payload (done, skipped, unset, garbled, and even the server-only
-// uncorroborated), corroboration, and a clean or medium risk, computes
-// the SAME Shippable it did when an uncorroborated claim was folded into
-// skipped -- the expected class below is that earlier rule, written out
-// -- and returns an assessment whose class is the Verdict's Shippable and
-// whose blockers are empty exactly when it is auto. So the new state moves
-// no decision anywhere Shippable is read (the formal review event, the
-// persisted review_verdicts row, auto-approval, auto-merge, the readout);
-// it only changes what the blocker says.
+// uncorroborated, which ValidateVerdictInput rejects on every path but
+// BuildVerdict does not re-check), corroboration, and a clean or medium
+// risk, computes the SAME Shippable it did when an uncorroborated claim
+// was folded into skipped -- the expected class below is that earlier
+// rule, written out -- and returns an assessment whose class is the
+// Verdict's Shippable and whose blockers are empty exactly when it is
+// auto. So the new state moves no decision anywhere Shippable is read
+// (the formal review event, the persisted review_verdicts row,
+// auto-approval, auto-merge, the readout); it only changes what the
+// blocker says. And it always says it: the uncorroborated counter-review
+// blocker is present exactly when the deep path's done went unconfirmed
+// (or an unvalidated deep payload carried the value itself), whatever
+// else already holds the class at needs_human.
 func TestBuildVerdict_UncorroboratedKeepsEveryDecision(t *testing.T) {
 	depths := []reviewtriage.ReviewDepth{reviewtriage.DepthDeep, reviewtriage.DepthLight, ""}
 	counterReviews := []review.CounterReviewStatus{review.CounterReviewDone, review.CounterReviewSkipped, "", "maybe", review.CounterReviewUncorroborated}
@@ -792,6 +834,18 @@ func TestBuildVerdict_UncorroboratedKeepsEveryDecision(t *testing.T) {
 					}
 					if (len(shippable.Blockers()) == 0) != (v.Shippable == review.ShippableAuto) {
 						t.Errorf("%s: Shippable %q with blockers %+v; want none exactly when auto", name, v.Shippable, shippable.Blockers())
+					}
+
+					wantUncorroborated := depth == reviewtriage.DepthDeep &&
+						((cr == review.CounterReviewDone && !corroborated) || cr == review.CounterReviewUncorroborated)
+					gotUncorroborated := false
+					for _, b := range shippable.Blockers() {
+						if b.Input == review.ShippableInputCounterReview && b.Value == string(review.CounterReviewUncorroborated) {
+							gotUncorroborated = true
+						}
+					}
+					if gotUncorroborated != wantUncorroborated {
+						t.Errorf("%s: uncorroborated counter-review blocker present = %v, want %v (blockers %+v)", name, gotUncorroborated, wantUncorroborated, shippable.Blockers())
 					}
 				}
 			}
