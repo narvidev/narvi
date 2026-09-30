@@ -532,8 +532,12 @@ refusal" section for the sharpest example of this).
 multiplayer session you opened included. It never runs a pull request's
 review session, even one your own mention opened, nor a session the
 platform starts from another one: those run on the deployment's
-credentials, and a turn in one whose model only your link could run fails
-before it starts, naming `personal_link_only` (technical plan §29.4).
+credentials (technical plan §29.4). In such a session that you created, a
+turn whose model only your link could run fails before it starts, naming
+`personal_link_only` in the session's warning and its terminal event. In
+one someone else created, the same turn is dispatched and fails inside the
+coding agent without that name: only a session's creator's link is
+checked.
 
 ## Connected apps (MCP clients)
 

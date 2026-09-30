@@ -7,14 +7,30 @@
 // credentialscope.Scope), so such a turn could only fail somewhere inside
 // the agent runtime with a provider error that names nothing. It is refused
 // before it is sent instead, with that reason named: the turn fails,
-// never_started, its terminal event opens with
-// providercredential.RefusalPersonalLinkOnly, and a review attempt's check
-// closes as not completed with the same reason. It never runs on the link,
-// and never on another model in its place.
+// never_started; its terminal event and a session warning open with
+// providercredential.RefusalPersonalLinkOnly; a review attempt's check
+// closes as not completed with the same reason; and a workflow run the
+// turn belongs to escalates for a person instead of following an edge
+// (workflowengine.OnTurnRefused). It never runs on the link, and never on
+// another model in its place.
+//
+// Only the session creator's own link is known here, so only a model that
+// link carries is refused by name. A model no credential this session
+// resolves serves -- whoever else holds a link for it -- is dispatched as
+// before and fails inside the agent runtime; it runs on nobody's link
+// either way.
+//
+// Bounded twice. Within one round, only the turns pending when the round
+// began are ever refused: a turn the refusal itself queued is neither
+// refused nor dispatched in that round. Across rounds, a refusal queues
+// nothing, because the workflow run escalates rather than re-firing the
+// step.
 //
 // A turn that names no model is not this gate's business: the agent
-// runtime picks its default among the credentials the sandbox was
-// delivered, which never include a withheld link.
+// runtime picks its default among the credentials the sandbox holds, and
+// the sandbox agent removes OpenCode's persisted auth store before every
+// boot, so it holds only what was delivered on that boot, never a withheld
+// link.
 
 package sessionactor
 
@@ -69,17 +85,38 @@ func (a *Actor) loadPersonalLinkGate(ctx context.Context, tx pgx.Tx, sessionRow 
 	return personalLinkGate{resolvable: resolvable, personal: personal}, nil
 }
 
+// refuseTurnFunc ends one pending turn as refused. refusePersonalLinkOnly
+// in production; a parameter only so a test can have the refusal queue a
+// turn of its own and prove the round never refuses that turn.
+type refuseTurnFunc func(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, turns []sqlcgen.Turn, target sqlcgen.Turn, provider providercredential.Provider, gen int, now time.Time) error
+
 // refusePersonalLinkOnlyPending runs the gate over the turn planDispatch is
 // about to dispatch (pendingID, turn.NextToDispatch's pick), refusing it
 // when its model only a withheld link could run, then over the next one,
-// until a turn passes or none is left. It returns the turns as they stand
-// afterwards and the pending turn, if any, that passed.
+// until a turn passes or none is left. Only turns already pending when the
+// round began are candidates: if the next pick is one this round's own
+// refusal queued, the round ends with nothing to dispatch, and that turn
+// waits for the next round, which gates it like any other. It returns the
+// turns as they stand afterwards and the pending turn, if any, that passed.
 func (a *Actor) refusePersonalLinkOnlyPending(
 	ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session,
-	turns []sqlcgen.Turn, pendingID pgtype.UUID, hasPending bool, now time.Time,
+	turns []sqlcgen.Turn, pendingID pgtype.UUID, hasPending bool, gen int, now time.Time,
+	refuse refuseTurnFunc,
 ) ([]sqlcgen.Turn, pgtype.UUID, bool, error) {
+	roundPending := make(map[pgtype.UUID]bool, len(turns))
+	for _, t := range turns {
+		if turn.State(t.Status) == turn.StatePending {
+			roundPending[t.ID] = true
+		}
+	}
+
 	var gate *personalLinkGate
 	for hasPending {
+		if !roundPending[pendingID] {
+			a.logger.Warn("sessionactor: a turn queued by this round's own refusal is held for the next round",
+				"turn_id", pendingID.String())
+			return turns, pgtype.UUID{}, false, nil
+		}
 		target, ok := findTurnByID(turns, pendingID)
 		if !ok || target.ModelID == nil || *target.ModelID == "" {
 			break
@@ -91,13 +128,14 @@ func (a *Actor) refusePersonalLinkOnlyPending(
 			}
 			gate = &loaded
 		}
-		provider, refuse := providercredential.PersonalLinkOnly(*target.ModelID, gate.resolvable, gate.personal)
-		if !refuse {
+		provider, refused := providercredential.PersonalLinkOnly(*target.ModelID, gate.resolvable, gate.personal)
+		if !refused {
 			break
 		}
-		if err := a.refusePersonalLinkOnly(ctx, tx, sessionRow, turns, target, provider, now); err != nil {
+		if err := refuse(ctx, tx, sessionRow, turns, target, provider, gen, now); err != nil {
 			return nil, pgtype.UUID{}, false, err
 		}
+		delete(roundPending, target.ID)
 		var err error
 		if turns, err = a.stores.turn.WithTx(tx).ListForSession(ctx, a.sessionID); err != nil {
 			return nil, pgtype.UUID{}, false, fmt.Errorf("sessionactor: list turns: %w", err)
@@ -111,9 +149,12 @@ func (a *Actor) refusePersonalLinkOnlyPending(
 // started: the machine's own Pending -> Failed edge (turn.TriggerAbandon),
 // so the session's failure reason is never_started, the existing value for
 // a turn given up on before it reached a sandbox. The named cause travels
-// beside it: at the head of the synthetic terminal event's reason, where a
-// session shows why its turn ended, and on a review attempt's check.
-func (a *Actor) refusePersonalLinkOnly(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, turns []sqlcgen.Turn, target sqlcgen.Turn, provider providercredential.Provider, now time.Time) error {
+// beside it: at the head of the synthetic terminal event's reason, in a
+// session warning (the banner a session shows every warning in, the way
+// this package names every other reason it originates), and on a review
+// attempt's check. gen is the session's sandbox gen, 0 with no sandbox
+// yet; the warning carries it like every other.
+func (a *Actor) refusePersonalLinkOnly(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, turns []sqlcgen.Turn, target sqlcgen.Turn, provider providercredential.Provider, gen int, now time.Time) error {
 	from := turn.State(target.Status)
 	to, err := turn.Transition(from, turn.TriggerAbandon)
 	if err != nil {
@@ -127,7 +168,12 @@ func (a *Actor) refusePersonalLinkOnly(ctx context.Context, tx pgx.Tx, sessionRo
 		return fmt.Errorf("sessionactor: update turn status: %w", err)
 	}
 
-	workflowengine.OnTurnCompleted(ctx, workflowengine.Deps{
+	reason := providercredential.PersonalLinkOnlyMessage(*target.ModelID, provider)
+
+	// Never OnTurnCompleted: it would read the refusal as an implicit
+	// "blocked" and follow any blocked edge the step wires, queueing the
+	// same refused attempt again (refusal.go's doc comment).
+	workflowengine.OnTurnRefused(ctx, workflowengine.Deps{
 		Workflows:             a.stores.workflow.WithTx(tx),
 		Turns:                 a.stores.turn.WithTx(tx),
 		SlackThreadSessions:   a.stores.slackThreadSession.WithTx(tx),
@@ -135,9 +181,8 @@ func (a *Actor) refusePersonalLinkOnly(ctx context.Context, tx pgx.Tx, sessionRo
 		GitHubPRSessions:      a.stores.githubPRSession.WithTx(tx),
 		Outbox:                a.stores.outbox.WithTx(tx),
 		EpistemicCheckDefault: a.epistemicCheckDefault,
-	}, sessionRow, target.ID, turn.TriggerAbandon)
+	}, sessionRow, target.ID, reason)
 
-	reason := providercredential.PersonalLinkOnlyMessage(*target.ModelID, provider)
 	if turn.RequiresSyntheticExecutionComplete(turn.TriggerAbandon) {
 		if err := a.appendEvent(ctx, tx, "execution_complete", map[string]any{
 			"turn_id":   target.ID.String(),
@@ -146,6 +191,9 @@ func (a *Actor) refusePersonalLinkOnly(ctx context.Context, tx pgx.Tx, sessionRo
 		}); err != nil {
 			return err
 		}
+	}
+	if err := a.recordSessionWarning(ctx, tx, gen, reason); err != nil {
+		return err
 	}
 
 	failureReason, _ := turn.DeriveFailureReason(from, turn.TriggerAbandon)

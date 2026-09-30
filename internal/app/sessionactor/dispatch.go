@@ -419,8 +419,13 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, er
 		// link (a pull request's review session, a child session), is
 		// refused here, named, before anything is spawned or sent for it
 		// (credentialgate.go). The turns and the pending pick are re-read
-		// when one is.
-		if turns, pendingID, hasPending, err = a.refusePersonalLinkOnlyPending(ctx, tx, sessionRow, turns, pendingID, hasPending, now); err != nil {
+		// when one is; a turn the refusal itself queued waits for the next
+		// round.
+		gen := 0
+		if hasSandbox {
+			gen = int(sandboxRow.Gen)
+		}
+		if turns, pendingID, hasPending, err = a.refusePersonalLinkOnlyPending(ctx, tx, sessionRow, turns, pendingID, hasPending, gen, now, a.refusePersonalLinkOnly); err != nil {
 			return err
 		}
 		entries = toQueueEntries(turns)

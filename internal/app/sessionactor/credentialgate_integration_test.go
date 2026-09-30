@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/providercredential"
 	"github.com/narvidev/narvi/internal/domain/reviewcheck"
+	"github.com/narvidev/narvi/internal/domain/turn"
 )
 
 // This file proves, on real Postgres, the two actor-side readers of a
@@ -205,6 +207,16 @@ func TestDispatchGate_PersonalLinkOnly(t *testing.T) {
 			if !strings.HasPrefix(reason, string(providercredential.RefusalPersonalLinkOnly)+": ") || !strings.Contains(reason, *tc.model) {
 				t.Errorf("terminal reason = %q, want it to name %q and the model %q", reason, providercredential.RefusalPersonalLinkOnly, *tc.model)
 			}
+			var warning string
+			if err := pool.QueryRow(ctx,
+				`SELECT payload->>'message' FROM events WHERE session_id = $1 AND type = 'warning'`,
+				session.ID,
+			).Scan(&warning); err != nil {
+				t.Fatalf("read the refusal's session warning: %v", err)
+			}
+			if warning != reason {
+				t.Errorf("session warning = %q, want the refusal's own reason %q", warning, reason)
+			}
 
 			var kind string
 			var payload []byte
@@ -274,5 +286,281 @@ func TestReviewCounterReviewerModel_NeverCountsTheRequestersLink(t *testing.T) {
 				t.Errorf("ReviewCounterReviewerModel = %v, want a %s model", got, tc.wantPrefix)
 			}
 		})
+	}
+}
+
+// gatedReviewSession is a pull request's review session whose first
+// requester holds a personal openai link, on a deployment holding only a
+// global anthropic key, with a Ready sandbox: every turn naming an openai
+// model is one the gate refuses.
+func gatedReviewSession(ctx context.Context, t *testing.T, pool *pgxpool.Pool, prNumber int32) sqlcgen.Session {
+	t.Helper()
+	creator := createLinkedMember(ctx, t, pool, fmt.Sprintf("gated-%d", prNumber))
+	if _, err := pool.Exec(ctx, `DELETE FROM provider_credentials WHERE scope = 'global'`); err != nil {
+		t.Fatalf("clear global credentials: %v", err)
+	}
+	createGlobalCredential(ctx, t, pool, sqlcgen.ProviderCredentialProviderAnthropic)
+	session, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{
+		SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: creator, Repos: []byte(credentialGateRepos),
+	})
+	if err != nil {
+		t.Fatalf("create session: %v", err)
+	}
+	claimPullRequest(ctx, t, pool, "acme/widgets", prNumber, session.ID)
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	if _, err := sandboxStore.Create(ctx, session.ID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	if _, err := sandboxStore.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{SessionID: session.ID, Status: sqlcgen.SandboxStatusReady}); err != nil {
+		t.Fatalf("move sandbox to ready: %v", err)
+	}
+	return session
+}
+
+func pendingTurnWithModel(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, model string, reviewAttempt bool) sqlcgen.Turn {
+	t.Helper()
+	headSHA := "c0ffee"
+	created, err := narvipg.NewTurnStore(pool).Create(ctx, sqlcgen.CreateTurnParams{
+		SessionID: sessionID, Status: sqlcgen.TurnStatusPending, Prompt: strPtr("review this pull request"),
+		ModelID: &model, ReviewHeadSha: &headSHA, IsReviewAttempt: reviewAttempt,
+	})
+	if err != nil {
+		t.Fatalf("create pending turn: %v", err)
+	}
+	return created
+}
+
+func countRows(ctx context.Context, t *testing.T, pool *pgxpool.Pool, query string, args ...any) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(ctx, query, args...).Scan(&n); err != nil {
+		t.Fatalf("count (%s): %v", query, err)
+	}
+	return n
+}
+
+// TestDispatchGate_RefusedWorkflowStep_WithBlockedSelfEdge_EscalatesOnce
+// drives a workflow-tracked review turn -- a custom review definition
+// whose one step pins a model only the requester's link carries, with a
+// self edge on `blocked`, the documented shape of an explicit retry loop --
+// through the real actor. The refusal must not follow that edge: exactly
+// one refusal, the round commits, the run waits for a person with a notice
+// naming the refusal, the session row's lock is free for the stop route's
+// own write, and a second dispatch round refuses nothing more.
+func TestDispatchGate_RefusedWorkflowStep_WithBlockedSelfEdge_EscalatesOnce(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	session := gatedReviewSession(ctx, t, pool, 400)
+
+	var defID, stepID pgtype.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO workflow_definitions (lane, name, is_built_in, version) VALUES ('review', 'test-refused-step-blocked-self-edge', false, 1) RETURNING id`).Scan(&defID); err != nil {
+		t.Fatalf("insert definition: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO workflow_step_definitions (workflow_definition_id, step_order, kind, prompt_template, model_id) VALUES ($1, 1, 'agent', '{{prompt}}', 'openai/gpt-5.4') RETURNING id`, defID).Scan(&stepID); err != nil {
+		t.Fatalf("insert step definition: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO workflow_edges (workflow_definition_id, from_step_id, to_step_id, on_status) VALUES ($1, $2, $2, 'blocked')`, defID, stepID); err != nil {
+		t.Fatalf("insert blocked self edge: %v", err)
+	}
+	workflows := narvipg.NewWorkflowStore(pool)
+	run, err := workflows.CreateRun(ctx, session.ID, "review", defID, 1)
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stepRun, err := workflows.CreateStepRun(ctx, run.ID, stepID)
+	if err != nil {
+		t.Fatalf("create step run: %v", err)
+	}
+	refused := pendingTurnWithModel(ctx, t, pool, session.ID, "openai/gpt-5.4", true)
+	if err := workflows.AttachTurn(ctx, stepRun.ID, refused.ID); err != nil {
+		t.Fatalf("attach turn: %v", err)
+	}
+
+	commander := &fakeSendCommander{}
+	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	turns := narvipg.NewTurnStore(pool)
+	sendEnsureDispatched(ctx, t, a)
+	waitUntil(t, 5*time.Second, func() bool {
+		got, err := turns.Get(ctx, refused.ID)
+		return err == nil && got.Status == sqlcgen.TurnStatusFailed
+	})
+
+	assertOneRefusal := func(round string) {
+		t.Helper()
+		if n := countRows(ctx, t, pool, `SELECT count(*) FROM turns WHERE session_id = $1`, session.ID); n != 1 {
+			t.Errorf("%s: turns = %d, want the one refused turn and no re-queued attempt", round, n)
+		}
+		if n := countRows(ctx, t, pool, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'execution_complete'`, session.ID); n != 1 {
+			t.Errorf("%s: terminal events = %d, want exactly one refusal", round, n)
+		}
+		if n := countRows(ctx, t, pool, `SELECT count(*) FROM workflow_step_runs WHERE workflow_run_id = $1`, run.ID); n != 1 {
+			t.Errorf("%s: step runs = %d, want the refused attempt alone", round, n)
+		}
+		if n := commander.callCount(); n != 0 {
+			t.Errorf("%s: prompts sent = %d, want 0", round, n)
+		}
+	}
+	assertOneRefusal("first round")
+
+	gotRun, err := workflows.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatalf("get run: %v", err)
+	}
+	if gotRun.Status != sqlcgen.WorkflowRunStatusNeedsReview {
+		t.Errorf("run status = %s, want needs_review", gotRun.Status)
+	}
+	gotStepRun, err := workflows.GetStepRun(ctx, stepRun.ID)
+	if err != nil {
+		t.Fatalf("get step run: %v", err)
+	}
+	if gotStepRun.Status != sqlcgen.WorkflowStepRunStatusFailed {
+		t.Errorf("step run status = %s, want failed", gotStepRun.Status)
+	}
+	var notice string
+	if err := pool.QueryRow(ctx, `SELECT payload->>'text' FROM outbox WHERE session_id = $1 AND kind = $2`, session.ID, string(ports.NotificationKindGitHubWorkflowDecision)).Scan(&notice); err != nil {
+		t.Fatalf("read the run's escalation notice: %v", err)
+	}
+	if !strings.Contains(notice, "refused before it ran") || !strings.Contains(notice, string(providercredential.RefusalPersonalLinkOnly)) {
+		t.Errorf("escalation notice = %q, want it to name the refusal", notice)
+	}
+
+	sendEnsureDispatched(ctx, t, a)
+	// A second round has nothing to refuse: give it time to act, then
+	// require that it did not.
+	time.Sleep(500 * time.Millisecond)
+	assertOneRefusal("second round")
+
+	// The stop route's own write: the session row, locked FOR UPDATE, then
+	// the request recorded -- within a lock timeout, as nothing still holds
+	// the lock.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SET LOCAL lock_timeout = '1s'`); err != nil {
+		t.Fatalf("set lock_timeout: %v", err)
+	}
+	if _, err := tx.Exec(ctx, `SELECT id FROM sessions WHERE id = $1 FOR UPDATE`, session.ID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("lock the session row: %v (the refusal round must have released it)", err)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE sessions SET stop_requested_at = now() WHERE id = $1`, session.ID); err != nil {
+		_ = tx.Rollback(ctx)
+		t.Fatalf("record a stop: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit the stop: %v", err)
+	}
+}
+
+// TestDispatchGate_RefusedTurnThenRunnableTurn_BothInOneRound queues a
+// refused review turn ahead of one the deployment can run: the gate
+// re-picks after the refusal, so the second turn is dispatched in the same
+// round rather than left pending.
+func TestDispatchGate_RefusedTurnThenRunnableTurn_BothInOneRound(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	session := gatedReviewSession(ctx, t, pool, 401)
+	first := pendingTurnWithModel(ctx, t, pool, session.ID, "openai/gpt-5.4", true)
+	second := pendingTurnWithModel(ctx, t, pool, session.ID, "anthropic/claude-opus-4-5", false)
+
+	commander := &fakeSendCommander{}
+	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	sendEnsureDispatched(ctx, t, a)
+
+	turns := narvipg.NewTurnStore(pool)
+	waitUntil(t, 5*time.Second, func() bool { return commander.callCount() == 1 })
+	gotFirst, err := turns.Get(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("get first turn: %v", err)
+	}
+	gotSecond, err := turns.Get(ctx, second.ID)
+	if err != nil {
+		t.Fatalf("get second turn: %v", err)
+	}
+	if gotFirst.Status != sqlcgen.TurnStatusFailed || gotSecond.Status != sqlcgen.TurnStatusProcessing {
+		t.Errorf("turns = %s, %s; want the first refused (failed) and the second dispatched (processing) in one round", gotFirst.Status, gotSecond.Status)
+	}
+}
+
+// TestRefusePersonalLinkOnlyPending_NeverRefusesATurnItsOwnRefusalQueued
+// pins the within-round bound on its own, whatever the workflow engine
+// does: a refusal that queues a new pending turn with the same refused
+// model -- what following a retry edge would do -- ends the round after
+// exactly one refusal, with the queued turn neither refused nor offered
+// for dispatch, and left pending for the next round once this one commits.
+func TestRefusePersonalLinkOnlyPending_NeverRefusesATurnItsOwnRefusalQueued(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	session := gatedReviewSession(ctx, t, pool, 402)
+	pendingTurnWithModel(ctx, t, pool, session.ID, "openai/gpt-5.4", false)
+
+	r := newDispatchTestRegistry(t, ctx, pool, nil, &fakeSendCommander{})
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	refusals := 0
+	var queued pgtype.UUID
+	requeue := func(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, turns []sqlcgen.Turn, target sqlcgen.Turn, provider providercredential.Provider, gen int, now time.Time) error {
+		refusals++
+		if refusals > 3 {
+			return fmt.Errorf("refused %d turns in one round: the round refuses what its own refusals queue", refusals)
+		}
+		if err := a.refusePersonalLinkOnly(ctx, tx, sessionRow, turns, target, provider, gen, now); err != nil {
+			return err
+		}
+		model := *target.ModelID
+		created, err := a.stores.turn.WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{
+			SessionID: sessionRow.ID, Status: sqlcgen.TurnStatusPending, Prompt: strPtr("retry"), ModelID: &model,
+		})
+		if err != nil {
+			return err
+		}
+		queued = created.ID
+		return nil
+	}
+
+	var pickOK bool
+	err = a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		sessionRow, err := a.stores.session.WithTx(tx).Get(ctx, a.sessionID)
+		if err != nil {
+			return err
+		}
+		turns, err := a.stores.turn.WithTx(tx).ListForSession(ctx, a.sessionID)
+		if err != nil {
+			return err
+		}
+		pendingID, hasPending := turn.NextToDispatch(toQueueEntries(turns))
+		_, _, pickOK, err = a.refusePersonalLinkOnlyPending(ctx, tx, sessionRow, turns, pendingID, hasPending, 1, time.Now(), requeue)
+		return err
+	})
+	if err != nil {
+		t.Fatalf("round: %v", err)
+	}
+	if refusals != 1 {
+		t.Errorf("refusals = %d, want exactly one", refusals)
+	}
+	if pickOK {
+		t.Error("the round offered a turn for dispatch, want none: the only pending turn is the one its refusal queued")
+	}
+	got, err := narvipg.NewTurnStore(pool).Get(ctx, queued)
+	if err != nil {
+		t.Fatalf("get queued turn: %v", err)
+	}
+	if got.Status != sqlcgen.TurnStatusPending {
+		t.Errorf("queued turn = %s, want still pending, for the next round", got.Status)
 	}
 }

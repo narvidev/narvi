@@ -57,7 +57,8 @@ func UserScopeTarget(o SessionOrigin) (userID string, ok bool) {
 
 // Refusal names why a turn is refused before it runs because of where its
 // provider credential would have come from. It is carried verbatim at the
-// head of the refused turn's terminal reason, and on a review's check.
+// head of the refused turn's terminal reason and session warning, and on a
+// review's check.
 type Refusal string
 
 // RefusalPersonalLinkOnly means the turn names a model whose provider this

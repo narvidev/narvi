@@ -157,14 +157,23 @@ the session shows a warning saying so.
 A review session runs on the deployment's provider credentials (the
 global, repository and environment keys an admin configures), never on a
 person's own linked account, such as a ChatGPT link — not even the account
-of the member whose mention opened the review (technical plan §29.4). The
-counter-reviewer's opposing model is chosen among the deployment's
-credentials too. A review whose model only a person's own link could run
-is not run: it fails before it starts, its `narvi/review` check closes as
-not completed and says the review's model is available only through a
-person's own provider link, and the session names the model, its provider
-and `personal_link_only`. An admin adding a deployment credential for that
-provider, or the review using another model, lets the next review run.
+of the member whose mention opened the review, whom Narvi records as the
+session's creator (technical plan §29.4). The counter-reviewer's opposing
+model is chosen among the deployment's credentials too.
+
+When the review's model has no deployment credential for its provider and
+that creator's own link carries it, the review is not run. It fails before
+it starts; its `narvi/review` check closes as not completed and says the
+review's model is available only through a person's own provider link; a
+workflow run it belongs to waits for review, with a notice saying so; and
+the session shows a warning naming the model, its provider and
+`personal_link_only`. Only the creator's link is checked. When the model's
+provider has no deployment credential and no link of the creator's carries
+it — another member's link does not count — the review is dispatched like
+any other and fails inside the coding agent, with a provider error that
+names no link. Either way it never runs on anyone's link. An admin adding a
+deployment credential for that provider, or the review using another
+model, lets the next review run.
 
 ## Review verdicts and decision inbox
 
