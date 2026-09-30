@@ -19,9 +19,18 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   then reads no base branch's required checks (technical plan §21.2), so
   no pull request is shown as `ready_to_merge`. A configuration, stable
   across loads, never reported through `scmFetchFailed`; the Merge
-  endpoint is unaffected, since it reads the requirements with the acting
-  person's own credential. A required property added to a
-  platform-produced shape grades MINOR (row 3).
+  endpoint reads the requirements itself, with the acting person's own
+  credential. A required property added to a platform-produced shape
+  grades MINOR (row 3).
+- Added: `DecisionInboxItem.mergeableIfRequiredChecksPass` (optional,
+  boolean or null), true on an ordinary pull-request row when the only
+  thing keeping it from a Merge click is that the inbox, with GitHub
+  outbound off, does not read its base's required checks: every other
+  criterion holds, the row stays `needs_review`, and a client offers
+  Merge, whose endpoint reads the requirements and refuses with 409,
+  naming the check, when one is unmet. False on every other pull-request
+  row, null on a row that is not a pull request. A property added, not
+  required, grades MINOR (row 2).
 - Unchanged: no route, no enum, no other `$def`.
 
 ## [1.14.0]

@@ -171,6 +171,13 @@ func decisionInboxItemToDTO(it decisioninbox.Item) restdtos.DecisionInboxItem {
 		dto.HasApprovingReview = &hasApprovingReview
 		hasChangesRequested := it.HasChangesRequested
 		dto.HasChangesRequested = &hasChangesRequested
+		// mergeableIfRequiredChecksPass (§21.2) is set for every PR-shaped
+		// row, like hasChangesRequested: with GitHub outbound off, it is the
+		// field a client offers Merge on when the row's base requirements
+		// are the one thing the inbox did not read
+		// (Item.MergeableIfRequiredChecksPass).
+		mergeableIfRequiredChecksPass := it.MergeableIfRequiredChecksPass
+		dto.MergeableIfRequiredChecksPass = &mergeableIfRequiredChecksPass
 
 		// verdictId (finding F3, adversarial review) renders whenever this
 		// PR has a posted review verdict of record -- the id a client

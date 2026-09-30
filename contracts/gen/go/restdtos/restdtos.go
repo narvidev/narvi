@@ -3125,6 +3125,20 @@ type DecisionInboxItem struct {
 	// that would render '0' identically to 'unknown'.
 	ManifestFindingsCount DecisionInboxItemManifestFindingsCount `json:"manifestFindingsCount" yaml:"manifestFindingsCount" mapstructure:"manifestFindingsCount"`
 
+	// Technical plan §21.2: true on an ordinary pull-request row (never a handoff or
+	// a release cut) when the only thing keeping it from a Merge click is what the
+	// inbox does not read -- with this deployment's GitHub outbound off
+	// (ListDecisionInboxResponse.requiredChecksNotRead), the checks its base branch
+	// requires. Every other criterion holds, the row's acceptance applied when it
+	// carries one (acceptanceMergeable itself stays false,
+	// acceptanceMergeBlockedReason naming the unread requirements). The row stays
+	// needs_review, since the inbox cannot call it ready to merge; a client offers
+	// Merge on it, and the Merge endpoint reads the base's requirements itself, with
+	// the acting person's own GitHub credential, and refuses with 409, naming the
+	// check, when one is not met. False on every other pull-request row, and always
+	// false while GitHub outbound is on; null on a row that is not a pull request.
+	MergeableIfRequiredChecksPass DecisionInboxItemMergeableIfRequiredChecksPass `json:"mergeableIfRequiredChecksPass,omitempty,omitzero" yaml:"mergeableIfRequiredChecksPass,omitempty" mapstructure:"mergeableIfRequiredChecksPass,omitempty"`
+
 	// kind=needs_attention, a dead-lettered outbox delivery, only.
 	OutboxId DecisionInboxItemOutboxId `json:"outboxId" yaml:"outboxId" mapstructure:"outboxId"`
 
@@ -3414,6 +3428,20 @@ type DecisionInboxItemManifestCoveragePartial *bool
 // is why it is a separate nullable field rather than folded into a chip that would
 // render '0' identically to 'unknown'.
 type DecisionInboxItemManifestFindingsCount *int
+
+// Technical plan §21.2: true on an ordinary pull-request row (never a handoff or a
+// release cut) when the only thing keeping it from a Merge click is what the inbox
+// does not read -- with this deployment's GitHub outbound off
+// (ListDecisionInboxResponse.requiredChecksNotRead), the checks its base branch
+// requires. Every other criterion holds, the row's acceptance applied when it
+// carries one (acceptanceMergeable itself stays false,
+// acceptanceMergeBlockedReason naming the unread requirements). The row stays
+// needs_review, since the inbox cannot call it ready to merge; a client offers
+// Merge on it, and the Merge endpoint reads the base's requirements itself, with
+// the acting person's own GitHub credential, and refuses with 409, naming the
+// check, when one is not met. False on every other pull-request row, and always
+// false while GitHub outbound is on; null on a row that is not a pull request.
+type DecisionInboxItemMergeableIfRequiredChecksPass *bool
 
 // kind=needs_attention, a dead-lettered outbox delivery, only.
 type DecisionInboxItemOutboxId *string
@@ -4616,8 +4644,9 @@ type ListDecisionInboxResponse struct {
 	// row carrying an acceptance names this as what blocks it. A configuration,
 	// stable across loads -- never a failure to retry, and never reported through
 	// scmFetchFailed. A client should say so in its own words, distinct from the
-	// 'temporarily unable to load' state. The Merge endpoint is not affected: it
-	// reads the requirements with the acting person's own GitHub credential.
+	// 'temporarily unable to load' state. Merge stays available where every other
+	// criterion holds (DecisionInboxItem.mergeableIfRequiredChecksPass): the Merge
+	// endpoint reads the requirements with the acting person's own GitHub credential.
 	RequiredChecksNotRead bool `json:"requiredChecksNotRead" yaml:"requiredChecksNotRead" mapstructure:"requiredChecksNotRead"`
 
 	// When the PR-derived rows (ready_to_merge/needs_review) were actually fetched

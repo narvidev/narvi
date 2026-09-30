@@ -676,6 +676,53 @@ describe('ScmStatusBanner -- the three-way SCM state, never collapsed', () => {
   })
 })
 
+// mergeableIfRequiredChecksPass (technical plan §21.2): with GitHub outbound
+// off, a row that meets everything but its base's unread requirements
+// stays needs_review and still offers Merge, saying the click reads them.
+describe('DecisionInboxRow -- with GitHub outbound off, Merge stays offered where only the required checks are unread', () => {
+  it('a needs_review row the server marks mergeable if its required checks pass renders Merge, and says the checks are read on merge', () => {
+    const item = prItem({ kind: 'needs_review', mergeableIfRequiredChecksPass: true })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('>Merge<')
+    expect(html).toContain('required checks are read when you merge')
+  })
+
+  it('an accepted row blocked only by the unread required checks renders Merge, never "Still blocked"', () => {
+    const item = prItem({
+      kind: 'needs_review',
+      acceptanceId: 'acceptance-1',
+      acceptanceJustification: 'Reviewed offline; risk accepted.',
+      acceptanceMergeable: false,
+      acceptanceMergeBlockedReason: "the checks this pull request's base branch requires are not read in the inbox while this deployment's GitHub outbound is off",
+      mergeableIfRequiredChecksPass: true,
+    })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('>Merge<')
+    expect(html).not.toContain('Still blocked')
+    expect(html).toContain('accepted override')
+  })
+
+  it('a needs_review row the server does not mark renders no Merge', () => {
+    const item = prItem({ kind: 'needs_review', mergeableIfRequiredChecksPass: false })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).not.toContain('>Merge<')
+    expect(html).not.toContain('required checks are read when you merge')
+  })
+
+  it('a viewer sees the row read-only, as on any other mergeable row', () => {
+    const item = prItem({ kind: 'needs_review', mergeableIfRequiredChecksPass: true })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={false} />)
+    expect(html).not.toContain('>Merge<')
+    expect(html).toContain('read-only')
+  })
+
+  it('a handoff row never offers Merge from it', () => {
+    const item = prItem({ kind: 'awaiting_approval', isHandoff: true, mergeableIfRequiredChecksPass: true })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).not.toContain('>Merge<')
+  })
+})
+
 // RequiredChecksNotReadNotice (technical plan §21.2): GitHub outbound off is
 // a configuration the inbox states plainly -- never the "temporarily
 // unable" warning ScmStatusBanner keeps for a failed read.
@@ -688,6 +735,7 @@ describe('RequiredChecksNotReadNotice -- outbound off is a stable notice, not a 
     const html = renderToStaticMarkup(<RequiredChecksNotReadNotice requiredChecksNotRead={true} />)
     expect(html).toContain('GitHub outbound is off')
     expect(html).toContain('No pull request is shown ready to merge here')
+    expect(html).toContain('Merge is still offered on a pull request that meets everything else')
     expect(html).not.toContain('sync-banner-warn')
     expect(html).not.toContain('Temporarily unable')
   })

@@ -2476,6 +2476,10 @@ export interface DecisionInboxItem {
    */
   acceptanceMergeBlockedReason?: string | null;
   /**
+   * Technical plan §21.2: true on an ordinary pull-request row (never a handoff or a release cut) when the only thing keeping it from a Merge click is what the inbox does not read -- with this deployment's GitHub outbound off (ListDecisionInboxResponse.requiredChecksNotRead), the checks its base branch requires. Every other criterion holds, the row's acceptance applied when it carries one (acceptanceMergeable itself stays false, acceptanceMergeBlockedReason naming the unread requirements). The row stays needs_review, since the inbox cannot call it ready to merge; a client offers Merge on it, and the Merge endpoint reads the base's requirements itself, with the acting person's own GitHub credential, and refuses with 409, naming the check, when one is not met. False on every other pull-request row, and always false while GitHub outbound is on; null on a row that is not a pull request.
+   */
+  mergeableIfRequiredChecksPass?: boolean | null;
+  /**
    * True iff this PR is a release cut (§15) whose manifest check has already been computed and persisted. Set (to true or false) for any PR-shaped row, exactly like isHandoff above -- the field a client checks to render this row's own distinct release shape (a link to the release-review screen, never a Merge button: a release cut always renders under kind=needs_review) instead of the ordinary PR shape. A PR that a release-branch-pattern/label WOULD classify as a release cut but that Narvi has not yet reviewed (or reviewed too recently for the background check to have finished) renders false here -- an honest, temporary gap, never a fabricated one.
    */
   isRelease: boolean | null;
@@ -2546,7 +2550,7 @@ export interface ListDecisionInboxResponse {
    */
   scmFetchFailed: boolean;
   /**
-   * True when this deployment's GitHub outbound is off (NARVI_OUTBOUND_ENABLED declares no github): the inbox then reads no base branch's required checks (technical plan §21.2), so no pull request is shown as ready_to_merge, and a row carrying an acceptance names this as what blocks it. A configuration, stable across loads -- never a failure to retry, and never reported through scmFetchFailed. A client should say so in its own words, distinct from the 'temporarily unable to load' state. The Merge endpoint is not affected: it reads the requirements with the acting person's own GitHub credential.
+   * True when this deployment's GitHub outbound is off (NARVI_OUTBOUND_ENABLED declares no github): the inbox then reads no base branch's required checks (technical plan §21.2), so no pull request is shown as ready_to_merge, and a row carrying an acceptance names this as what blocks it. A configuration, stable across loads -- never a failure to retry, and never reported through scmFetchFailed. A client should say so in its own words, distinct from the 'temporarily unable to load' state. Merge stays available where every other criterion holds (DecisionInboxItem.mergeableIfRequiredChecksPass): the Merge endpoint reads the requirements with the acting person's own GitHub credential.
    */
   requiredChecksNotRead: boolean;
   /**

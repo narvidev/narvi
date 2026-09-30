@@ -4,6 +4,7 @@ import type { DecisionInboxItem } from '@narvi/contracts/rest-dtos'
 
 import {
   canMergeDecisionInboxItem,
+  canMergeIfRequiredChecksPass,
   canMergeViaAcceptance,
   formatAgeSeconds,
   formatDecisionLatencySeconds,
@@ -183,6 +184,27 @@ describe('canMergeViaAcceptance -- the server\'s own mergeability answer, never 
 
   it('acceptanceId null -- NOT mergeable regardless of acceptanceMergeable (the question does not apply)', () => {
     expect(canMergeViaAcceptance({ acceptanceId: null, acceptanceMergeable: true })).toBe(false)
+  })
+})
+
+// canMergeIfRequiredChecksPass (technical plan §21.2): with GitHub outbound
+// off, the server's own answer that a row meets everything but the
+// requirements the inbox does not read. Only a true counts.
+describe('canMergeIfRequiredChecksPass -- the server\'s own answer, never inferred', () => {
+  it('true -- Merge is offered', () => {
+    expect(canMergeIfRequiredChecksPass({ mergeableIfRequiredChecksPass: true })).toBe(true)
+  })
+
+  it('false -- not offered', () => {
+    expect(canMergeIfRequiredChecksPass({ mergeableIfRequiredChecksPass: false })).toBe(false)
+  })
+
+  it('null (a row that is not a pull request) -- not offered', () => {
+    expect(canMergeIfRequiredChecksPass({ mergeableIfRequiredChecksPass: null })).toBe(false)
+  })
+
+  it('absent (a server that predates the field) -- not offered', () => {
+    expect(canMergeIfRequiredChecksPass({})).toBe(false)
   })
 })
 

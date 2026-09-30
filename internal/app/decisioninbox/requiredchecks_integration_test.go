@@ -21,6 +21,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	decisioninboxdomain "github.com/narvidev/narvi/internal/domain/decisioninbox"
 	"github.com/narvidev/narvi/internal/domain/reviewcheck"
+	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -74,9 +75,13 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 		// each path makes (the inbox's only when it reads the requirements).
 		apps         map[string]int64
 		wantAppReads int
-		ci           ports.CIConclusion
-		headMoved    bool
-		changedFiles []string
+		// needsHuman labels the PR review:needs-human; changesRequested has
+		// a reviewer request changes.
+		needsHuman       bool
+		changesRequested bool
+		ci               ports.CIConclusion
+		headMoved        bool
+		changedFiles     []string
 		// headShort marks the head's check listing incomplete (its
 		// statuses beyond one page).
 		headShort bool
@@ -92,6 +97,10 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 		// wantMergeOnly: the merge path merges while the inbox, which reads
 		// no requirements with GitHub outbound off, shows needs_review.
 		wantMergeOnly bool
+		// wantMergeOffered: the inbox row, not ready to merge because GitHub
+		// outbound is off, still offers Merge
+		// (Item.MergeableIfRequiredChecksPass).
+		wantMergeOffered bool
 		// wantReason is a substring of RevalidateForMerge's refusal.
 		wantReason   string
 		wantDegraded bool
@@ -242,12 +251,58 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 		{
 			// The inbox reads nothing without the bot and says so, not
 			// degraded; the click reads with the person's token and merges.
-			name:          "with GitHub outbound off the inbox reads nothing and the Merge click still merges",
-			noBot:         true,
-			required:      []ports.RequiredCheck{build("build", 0)},
-			head:          []ports.HeadCheck{run("build", 1, passed)},
-			ci:            ports.CIConclusionSuccess,
-			wantMergeOnly: true,
+			name:             "with GitHub outbound off the inbox reads nothing, offers Merge, and the Merge click merges",
+			noBot:            true,
+			required:         []ports.RequiredCheck{build("build", 0)},
+			head:             []ports.HeadCheck{run("build", 1, passed)},
+			ci:               ports.CIConclusionSuccess,
+			wantMergeOnly:    true,
+			wantMergeOffered: true,
+		},
+		{
+			// The inbox cannot know the requirement is unmet: it offers
+			// Merge, and the click's own read refuses, naming the check.
+			name:             "with GitHub outbound off a row that meets everything else offers Merge, and the click names the unmet check",
+			noBot:            true,
+			required:         []ports.RequiredCheck{build("ci/slow-external", 0)},
+			head:             []ports.HeadCheck{run("build", 1, passed)},
+			ci:               ports.CIConclusionSuccess,
+			wantMergeOffered: true,
+			wantReason:       `required check "ci/slow-external" has not reported at the current head`,
+		},
+		{
+			name:       "with GitHub outbound off a row another criterion refuses offers no Merge",
+			noBot:      true,
+			required:   []ports.RequiredCheck{build("build", 0)},
+			head:       []ports.HeadCheck{run("build", 1, passed)},
+			ci:         ports.CIConclusionSuccess,
+			headMoved:  true,
+			wantReason: string(autoapproval.ReasonStaleVerdict),
+		},
+		{
+			name:       "with GitHub outbound off a row labelled needs-human offers no Merge",
+			noBot:      true,
+			head:       []ports.HeadCheck{run("build", 1, passed)},
+			ci:         ports.CIConclusionSuccess,
+			needsHuman: true,
+			wantReason: string(autoapproval.ReasonNeedsHumanLabel),
+		},
+		{
+			name:             "with GitHub outbound off a row with changes requested offers no Merge",
+			noBot:            true,
+			head:             []ports.HeadCheck{run("build", 1, passed)},
+			ci:               ports.CIConclusionSuccess,
+			changesRequested: true,
+			wantReason:       "changes requested",
+		},
+		{
+			// A criterion the engine checks after the required checks.
+			name:         "with GitHub outbound off a row touching a sensitive path offers no Merge",
+			noBot:        true,
+			head:         []ports.HeadCheck{run("build", 1, passed)},
+			ci:           ports.CIConclusionSuccess,
+			changedFiles: []string{"migrations/000999_drop_everything.up.sql"},
+			wantReason:   string(autoapproval.ReasonSensitivePathTouched),
 		},
 		{
 			// Freshness is checked before the requirements: the confirmed
@@ -328,6 +383,10 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 				pr.ChangedFilesCount = len(tc.changedFiles)
 			}
 			pr.HeadChecksListDegraded = tc.headShort
+			if tc.needsHuman {
+				pr.Labels = append(pr.Labels, reviewpost.LabelNeedsHuman)
+			}
+			pr.HasChangesRequested = tc.changesRequested
 			if tc.baseRewritten {
 				rs.sourceControl.resolveBranchSHA = "sha-rewritten-base"
 				rs.sourceControl.isAncestorResult = false
@@ -373,6 +432,9 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 			if result.RequiredChecksNotRead != tc.noBot {
 				t.Errorf("RequiredChecksNotRead = %v, want %v", result.RequiredChecksNotRead, tc.noBot)
 			}
+			if item.MergeableIfRequiredChecksPass != tc.wantMergeOffered {
+				t.Errorf("MergeableIfRequiredChecksPass = %v, want %v", item.MergeableIfRequiredChecksPass, tc.wantMergeOffered)
+			}
 			inboxCalls := rs.sourceControl.requiredChecksCalls
 			rs.sourceControl.requiredChecksCalls = nil
 			if tc.noBot && len(inboxCalls) != 0 {
@@ -407,9 +469,15 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 				t.Errorf("RevalidateForMerge() reason = %q, want it to contain %q", reason, tc.wantReason)
 			}
 
+			// Once -- unless changes requested, a hard block checked before
+			// anything is read, refused the click first.
+			wantMergeReads := 1
+			if tc.changesRequested {
+				wantMergeReads = 0
+			}
 			mergeCalls := rs.sourceControl.requiredChecksCalls
-			if len(mergeCalls) != 1 {
-				t.Errorf("the Merge click read the requirements %d times, want once", len(mergeCalls))
+			if len(mergeCalls) != wantMergeReads {
+				t.Errorf("the Merge click read the requirements %d times, want %d", len(mergeCalls), wantMergeReads)
 			}
 			for _, c := range append(inboxCalls, mergeCalls...) {
 				if c.Owner != "acme" || c.Repo != repo || c.Branch != pr.BaseRef {
@@ -453,8 +521,12 @@ func TestRequiredChecks_AcceptanceReadout(t *testing.T) {
 		readErr       error
 		noBot         bool
 		baseRewritten bool
-		wantReason    string
-		wantDegraded  bool
+		// oversizedDiff gives the pull request more changed files than the
+		// engine allows: only the acceptance waives that.
+		oversizedDiff    bool
+		wantReason       string
+		wantDegraded     bool
+		wantMergeOffered bool
 	}{
 		{
 			name:         "a failed read that decides the row names it, and degrades the inbox",
@@ -463,9 +535,19 @@ func TestRequiredChecks_AcceptanceReadout(t *testing.T) {
 			wantDegraded: true,
 		},
 		{
-			name:       "GitHub outbound off names the configuration, and does not degrade the inbox",
-			noBot:      true,
-			wantReason: "the checks this pull request's base branch requires are not read in the inbox while this deployment's GitHub outbound is off",
+			name:             "GitHub outbound off names the configuration, does not degrade the inbox, and still offers Merge",
+			noBot:            true,
+			wantReason:       "the checks this pull request's base branch requires are not read in the inbox while this deployment's GitHub outbound is off",
+			wantMergeOffered: true,
+		},
+		{
+			// Without the acceptance the row fails on its size; with it,
+			// only the unread requirements remain.
+			name:             "GitHub outbound off offers Merge on a row only its acceptance clears",
+			noBot:            true,
+			oversizedDiff:    true,
+			wantReason:       "the checks this pull request's base branch requires are not read in the inbox while this deployment's GitHub outbound is off",
+			wantMergeOffered: true,
 		},
 		{
 			name:          "a failed read beside a confirmed base move is not the blocker, and does not degrade the inbox",
@@ -518,6 +600,9 @@ func TestRequiredChecks_AcceptanceReadout(t *testing.T) {
 			}); err != nil {
 				t.Fatalf("Accept() error = %v", err)
 			}
+			if tc.oversizedDiff {
+				pr.ChangedFilesCount = 100000
+			}
 			rs.replaceTargetPR(actorGitHubID, pr)
 			rs.sourceControl.requiredChecksErr = tc.readErr
 			if tc.baseRewritten {
@@ -551,6 +636,9 @@ func TestRequiredChecks_AcceptanceReadout(t *testing.T) {
 			}
 			if result.SCMFetchFailed != tc.wantDegraded {
 				t.Errorf("SCMFetchFailed = %v, want %v", result.SCMFetchFailed, tc.wantDegraded)
+			}
+			if item.MergeableIfRequiredChecksPass != tc.wantMergeOffered {
+				t.Errorf("MergeableIfRequiredChecksPass = %v, want %v", item.MergeableIfRequiredChecksPass, tc.wantMergeOffered)
 			}
 		})
 	}

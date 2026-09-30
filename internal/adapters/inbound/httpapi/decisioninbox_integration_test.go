@@ -1075,10 +1075,23 @@ func TestDecisionInbox_GitHubOutboundOff_StableStateAndMergeStillWorks(t *testin
 		if !got.RequiredChecksNotRead || got.ScmFetchFailed {
 			t.Errorf("load %d: requiredChecksNotRead=%v scmFetchFailed=%v, want true and false -- a configuration, not a failure", load, got.RequiredChecksNotRead, got.ScmFetchFailed)
 		}
+		found := false
 		for _, it := range got.Items {
-			if it.PrNumber != nil && *it.PrNumber == 1231 && it.Kind == restdtos.DecisionInboxItemKindReadyToMerge {
+			if it.PrNumber == nil || *it.PrNumber != 1231 {
+				continue
+			}
+			found = true
+			if it.Kind == restdtos.DecisionInboxItemKindReadyToMerge {
 				t.Errorf("load %d: the row is ready_to_merge, want needs_review while its base's requirements are not read", load)
 			}
+			// The row meets everything else, so the inbox still offers
+			// Merge: the click reads the requirements itself.
+			if it.MergeableIfRequiredChecksPass == nil || !*it.MergeableIfRequiredChecksPass {
+				t.Errorf("load %d: mergeableIfRequiredChecksPass = %v, want true", load, it.MergeableIfRequiredChecksPass)
+			}
+		}
+		if !found {
+			t.Errorf("load %d: PR #1231 missing from the inbox", load)
 		}
 	}
 	if len(fakeSCM.requiredChecksCalls) != 0 {

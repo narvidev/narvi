@@ -259,6 +259,23 @@ export function canMergeViaAcceptance(item: Pick<DecisionInboxItem, 'acceptanceI
 }
 
 /**
+ * canMergeIfRequiredChecksPass reads DecisionInboxItem.
+ * mergeableIfRequiredChecksPass (technical plan §21.2): with this
+ * deployment's GitHub outbound off, the inbox reads no base branch's
+ * required checks, so no row is ready_to_merge -- but a row the server
+ * says meets every other criterion (its acceptance applied, when it
+ * carries one) still offers Merge. The click stays the real gate: the
+ * Merge endpoint reads the base's requirements with the person's own
+ * GitHub credential and refuses, naming the check, when one is unmet.
+ * Like canMergeViaAcceptance, this client never infers it: only the
+ * server's own true counts, and an absent or null field (a server that
+ * predates it, a row that is not a pull request) reads false.
+ */
+export function canMergeIfRequiredChecksPass(item: Pick<DecisionInboxItem, 'mergeableIfRequiredChecksPass'>): boolean {
+  return item.mergeableIfRequiredChecksPass === true
+}
+
+/**
  * releaseChipData builds the mockup's own `.chip` sequence for a release-
  * cut row ("manifest: 3 flags") -- deliberately NOT prChipData's own
  * riskLabel/findings chips, which describe an ordinary code-review

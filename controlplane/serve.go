@@ -1984,8 +1984,9 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// GitHubOutbound: the bot credential the inbox's read model reads a
 		// base branch's required checks with (§21.2). nil with GitHub
 		// outbound off: the inbox then reads none and says so
-		// (requiredChecksNotRead); a Merge click reads them with the
-		// person's own token either way.
+		// (requiredChecksNotRead), still offering Merge on a row that meets
+		// everything else (mergeableIfRequiredChecksPass); a Merge click
+		// reads them with the person's own token either way.
 		GitHubOutbound:     cfg.GitHubOutbound,
 		TokenEncryptionKey: cfg.TokenEncryptionKey,
 		Timeouts:           cfg.Timeouts,

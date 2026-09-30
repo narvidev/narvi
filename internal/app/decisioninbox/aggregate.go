@@ -826,6 +826,11 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		} else {
 			item.Kind = decisioninbox.KindNeedsReview
 		}
+		// With GitHub outbound off the base's required checks are not read
+		// here, so no row is ready to merge; a row that meets everything
+		// else still offers Merge, whose click reads them itself
+		// (Item.MergeableIfRequiredChecksPass).
+		item.MergeableIfRequiredChecksPass = mandatoryCriteriaClear && eligibilityRes.MergeableIfRequiredChecksPass
 
 		// AcceptanceMergeable/AcceptanceMergeBlockedReason (round 3,
 		// finding R1, adversarial review; generalized to BOTH outcomes of
@@ -920,7 +925,12 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 					// GitHub outbound is off, and the inbox reads no base's
 					// requirements (computeRealEligibility): the row is not
 					// degraded, and the readout says why it is blocked here.
+					// When the acceptance clears everything else, Merge is
+					// still offered: the click reads the requirements itself.
 					item.AcceptanceMergeBlockedReason = reasonRequiredChecksNotRead
+					if acceptanceEligibility.MergeableIfRequiredChecksPass {
+						item.MergeableIfRequiredChecksPass = true
+					}
 				case acceptanceEligibility.Degraded:
 					degraded = true
 					// reasonBaseCommitUnconfirmed for a freshness read, the
@@ -1508,6 +1518,15 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	requirementsDecided := finalReason == autoapproval.ReasonRequiredChecksUnknown
 	requiredDegraded := requiredChecksUnread && requirementsDecided
 	notRead := outboundOff && requirementsDecided
+	// mergeableIfPass is whether, with the requirements unread only
+	// because GitHub outbound is off, they are the one thing between this
+	// row and a Merge click. The probe above already passed every
+	// criterion the engine checks after them, on the same inputs with the
+	// requirements standing in as read and requiring nothing
+	// (probeRequiredChecks); the final call refusing on them means every
+	// criterion before them passed too, the live base included. So only
+	// the needs-human label, which nothing waives, is left to check.
+	mergeableIfPass := notRead && !hasNeedsHuman
 	// unconfirmedReason names the live read that failed first in the
 	// engine's own order -- a freshness read (base, ancestor chain) before
 	// the required checks -- for the one caller that shows it
@@ -1520,12 +1539,13 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		unconfirmedReason = string(autoapproval.ReasonRequiredChecksUnknown)
 	}
 	return eligibilityResult{
-		Eligible:                     eligible,
-		Degraded:                     degraded || requiredDegraded,
-		UnconfirmedReason:            unconfirmedReason,
-		RequiredChecksNotRead:        notRead,
-		EligibleIgnoringHumanSignals: eligibleIgnoringHumanSignals,
-		HeadSHA:                      record.HeadSHA,
+		Eligible:                      eligible,
+		Degraded:                      degraded || requiredDegraded,
+		UnconfirmedReason:             unconfirmedReason,
+		RequiredChecksNotRead:         notRead,
+		MergeableIfRequiredChecksPass: mergeableIfPass,
+		EligibleIgnoringHumanSignals:  eligibleIgnoringHumanSignals,
+		HeadSHA:                       record.HeadSHA,
 	}
 }
 
@@ -1558,6 +1578,12 @@ type eligibilityResult struct {
 	// read because GitHub outbound is off, and that is what refused the row
 	// -- a configuration, never Degraded.
 	RequiredChecksNotRead bool
+	// MergeableIfRequiredChecksPass is set with RequiredChecksNotRead when
+	// every criterion the engine checks after the required checks holds
+	// too, and no needs-human label is on the pull request: the row would
+	// merge if its base's requirements are met
+	// (Item.MergeableIfRequiredChecksPass).
+	MergeableIfRequiredChecksPass bool
 	// EligibleIgnoringHumanSignals/HeadSHA back
 	// recordContestedIfApplicable's own §21.2 stage 2 "contested" write,
 	// below -- no OTHER caller/field may ever consult them. Both are the
