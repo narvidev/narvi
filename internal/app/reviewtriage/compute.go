@@ -19,44 +19,36 @@ import (
 // a safe, always-valid result" contract (§18.1). NO error return at all,
 // by construction: every internal failure this function's own body can
 // hit (a repo_settings read failure in LoadConfig, a review_verdicts read
-// failure below) is caught, logged, and neutralized to the value that
-// makes reviewtriage.Decide route light on its own -- there is no path
-// through this function's own body that can reach its return statement
-// with anything OTHER than a valid Decision/Config pair.
+// failure below) is caught, logged, and neutralized to its safe value
+// (the built-in config, no prior high verdict, no floor).
+//
+// That fail-open rule is about this function's OWN reads. An input the
+// review context could not read (prCtx.InputRead, set by the context's
+// producer) is not a router error: it reaches reviewtriage.Decide as a
+// typed fact and routes deep under ReasonInputUnreadable (§26.3).
 //
 // prCtx is the SAME review.PreFetchedContext every review-trigger path
 // already builds via internal/app/reviewcontext.Fetch (§26.3: "already
 // fetched with the inline diff at review-session creation") -- this
-// function performs exactly ONE further read of its own (the latest
-// posted verdict for repoFullName/prNumber, for the "prior high verdict"
-// signal) plus LoadConfig's own repo_settings read; no new network call,
-// no diff re-fetch.
+// function performs two further reads of its own (the latest posted
+// verdict, for the "prior high verdict" signal, and the floor's own
+// review_path read below) plus LoadConfig's own repo_settings read; no
+// new network call, no diff re-fetch.
 //
-// Returns the FRESH decision, cfg, and priorReviewDepth -- priorReviewDepth
-// (adversarial-review fix, D1: "re-review depth floor applied at only 1 of
-// 3 lanes") is the SAME latest-review_verdicts row's own review_path this
-// function already reads (below) for the "prior high verdict" signal
-// (rule 4), now ALSO surfaced to the caller instead of discarded, so
-// every caller -- not just internal/app/sessionactor/reviewretrigger.go's
-// own auto-retrigger lane, which already performed a SEPARATE GetLatest
-// read of its own for exactly this purpose -- can apply §24's re-review
-// floor (reviewtriage.Floor(decision.Depth, priorReviewDepth)) without a
-// second, redundant Postgres query. Empty ("") when no verdict has ever
-// been posted for this PR, or when the latest one has no recorded depth at
-// all (its own turn never resolved one) -- both degrade identically to
-// "nothing to floor against" (reviewtriage.Floor's own doc comment: an
-// empty/unrecognized prior ranks with DepthLight, the least conservative
-// reading), exactly like a brand-new review session with no prior turn at
-// all.
+// Returns the FRESH decision, cfg, and priorReviewDepth -- the depth §24's
+// re-review floor composes with (reviewtriage.Floor(decision.Depth,
+// priorReviewDepth)), which every lane applies unless the fresh decision
+// is an always_light override (Floor's own doc comment). priorReviewDepth
+// is the review_path of the latest verdict whose producing turn was NOT
+// routed for a reviewtriage.NonFloorReasons reason (depth.go): a depth
+// chosen only because an input could not be read is never a floor, and
+// the verdict before it is read instead. Empty ("") when no such verdict
+// exists, or its own turn never resolved a depth -- both degrade to
+// "nothing to floor against", exactly like a brand-new review session.
 //
-// A caller with no prior depth to floor against (a brand-new review
-// session, priorReviewDepth == "") simply uses decision.Depth as-is --
-// reviewtriage.Floor(fresh, "") is a no-op by construction (Floor's own
-// rank table), so a caller MAY also apply Floor unconditionally without
-// special-casing this case itself. A caller re-reviewing an existing PR
-// calls reviewtriage.Floor(decision.Depth, priorReviewDepth) and rebuilds
-// its own DecisionRecord via reviewtriage.NewDecisionRecord(decision, cfg,
-// flooredDepth) to capture that the floor is what actually decided.
+// deps.SizeExclusions (the deployment's size patterns) are set on the
+// returned cfg, so the caller's decision record reflects the config the
+// decision was actually made under.
 func ComputeDecision(ctx context.Context, deps Deps, repoFullName string, prNumber int32, prCtx review.PreFetchedContext) (decision reviewtriage.Decision, cfg reviewtriage.Config, priorReviewDepth reviewtriage.ReviewDepth) {
 	logger := platform.Logger(ctx)
 
@@ -66,6 +58,7 @@ func ComputeDecision(ctx context.Context, deps Deps, repoFullName string, prNumb
 		// no second log line here, just the safe fallback.
 		cfg = reviewtriage.DefaultConfig()
 	}
+	cfg.SizeExclusions = deps.SizeExclusions
 
 	// A nil deps.ReviewVerdicts (this package's own tests, or any other
 	// minimal wiring that doesn't care about this Step) degrades
@@ -81,28 +74,53 @@ func ComputeDecision(ctx context.Context, deps Deps, repoFullName string, prNumb
 			logger.Warn("reviewtriage: compute decision: read latest review verdict failed, treating prior-high-verdict signal as absent", "error", verdictErr, "repo_full_name", repoFullName, "pr_number", prNumber)
 		}
 		// pgx.ErrNoRows: no verdict has ever been posted for this PR --
-		// priorVerdictRiskHigh correctly stays false, priorReviewDepth
-		// correctly stays "", neither is an error at all.
+		// priorVerdictRiskHigh correctly stays false, not an error at all.
 	} else {
 		priorVerdictRiskHigh = latest.RiskLevel == string(review.RiskLevelHigh)
-		if latest.ReviewPath != nil {
-			priorReviewDepth = reviewtriage.ReviewDepth(*latest.ReviewPath)
-		}
 	}
+
+	priorReviewDepth = readFloorDepth(ctx, deps, repoFullName, prNumber)
 
 	decision, cfg = decideWithSignals(prCtx, cfg, priorVerdictRiskHigh)
 	return decision, cfg, priorReviewDepth
+}
+
+// readFloorDepth reads the depth §24's re-review floor composes with --
+// ComputeDecision's own doc comment. A read failure is logged and reads
+// as no floor (fail open to the fresh decision, §26.3).
+func readFloorDepth(ctx context.Context, deps Deps, repoFullName string, prNumber int32) reviewtriage.ReviewDepth {
+	nonFloor := reviewtriage.NonFloorReasons()
+	excluded := make([]string, len(nonFloor))
+	for i, r := range nonFloor {
+		excluded[i] = string(r)
+	}
+	path, err := deps.ReviewVerdicts.GetLatestFloorReviewPath(ctx, repoFullName, prNumber, excluded)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			platform.Logger(ctx).Warn("reviewtriage: compute decision: read the re-review floor's prior depth failed, applying no floor", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)
+		}
+		return ""
+	}
+	if path == nil {
+		return ""
+	}
+	return reviewtriage.ReviewDepth(*path)
 }
 
 // decideWithSignals assembles the final reviewtriage.Signals from prCtx
 // and the already-resolved priorVerdictRiskHigh, and calls the pure
 // domain Decide -- the one tail both of ComputeDecision's own paths
 // (real deps.ReviewVerdicts read, or a nil-store short-circuit) share.
+// prCtx.InputRead is passed through as is: whether the input was readable
+// is the context producer's fact, never re-derived here from empty
+// fields.
 func decideWithSignals(prCtx review.PreFetchedContext, cfg reviewtriage.Config, priorVerdictRiskHigh bool) (reviewtriage.Decision, reviewtriage.Config) {
 	sig := reviewtriage.Signals{
 		Additions:              prCtx.Additions,
 		Deletions:              prCtx.Deletions,
 		ChangedPaths:           prCtx.ChangedPaths,
+		FileLines:              reviewtriage.ExtractFileLines(prCtx.Diff),
+		InputRead:              prCtx.InputRead,
 		NeedsHumanLabelPresent: hasNeedsHumanLabel(prCtx.Labels),
 		PriorVerdictRiskHigh:   priorVerdictRiskHigh,
 	}

@@ -32,6 +32,8 @@ package github_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -164,14 +166,17 @@ func insertPriorReviewVerdict(ctx context.Context, t *testing.T, rig testRig, re
 // own regression test for coalesce.go's REUSE branch (a second @mention
 // on an already-tracked PR): before this fix, this branch fed the FRESH,
 // unfloored triage decision straight through -- a light-looking second
-// mention (no diffFetcher wired here, so the fresh signal is the honest
-// all-zero "nothing fetched" input, isolating the floor specifically)
+// mention (a one-line, readable diff, isolating the floor specifically)
 // on a PR that had already gone deep once would have produced
 // turns.review_depth = "light", silently defeating §24's own "once deep,
-// a PR stays deep" floor.
+// a PR stays deep" floor. The diff must be READ: an input that was never
+// fetched now routes deep on its own (§26.3), which would hide the floor.
 func TestGitHubIntegration_ReuseMention_DeepToLight_StaysFloorAtDeep(t *testing.T) {
 	ctx := context.Background()
-	rig := newTestRigWithReviewTriage(t, nil)
+	rig := newTestRigWithReviewTriage(t, &fakeReviewContextFetcher{
+		pr:   githubapi.PullRequest{HeadSHA: "sha-reuse-light-head", BaseRef: "main", ChangedFiles: 1, Additions: 1, Deletions: 1},
+		diff: "diff --git a/internal/app/foo/a.go b/internal/app/foo/a.go\n--- a/internal/app/foo/a.go\n+++ b/internal/app/foo/a.go\n@@ -1 +1 @@\n-x\n+y\n",
+	})
 
 	const repoFullName = "acme/reuse-deep-to-light-repo"
 	const cloneURL = "https://github.com/acme/reuse-deep-to-light-repo.git"
@@ -182,8 +187,7 @@ func TestGitHubIntegration_ReuseMention_DeepToLight_StaysFloorAtDeep(t *testing.
 
 	// First mention -- WINNER branch, creates the session/claim row (and,
 	// since no prior verdict exists yet, its own turn routes light: a
-	// brand-new PR with no diffFetcher wired has nothing deep-routing
-	// about it).
+	// one-line readable diff has nothing deep-routing about it).
 	first := postWebhook(t, rig, issueCommentBodyWithCommenter(repoFullName, "reuse-deep-to-light-repo", cloneURL, prNumber, "first-mention", commenterID, "reuse-user"), "delivery-reuse-deep-1")
 	if first != http.StatusOK {
 		t.Fatalf("first (mention) delivery status = %d, want %d", first, http.StatusOK)
@@ -197,8 +201,8 @@ func TestGitHubIntegration_ReuseMention_DeepToLight_StaysFloorAtDeep(t *testing.
 	// own reviewverdict_integration_test.go).
 	insertPriorReviewVerdict(ctx, t, rig, repoFullName, prNumber, "sha-first-deep-verdict", "deep")
 
-	// Second mention -- REUSE branch. Still no diffFetcher wired, so the
-	// FRESH decision this firing computes is deterministically light.
+	// Second mention -- REUSE branch. The same one-line readable diff, so
+	// the FRESH decision this firing computes is deterministically light.
 	second := postWebhook(t, rig, issueCommentBodyWithCommenter(repoFullName, "reuse-deep-to-light-repo", cloneURL, prNumber, "second-mention", commenterID, "reuse-user"), "delivery-reuse-deep-2")
 	if second != http.StatusOK {
 		t.Fatalf("second (mention) delivery status = %d, want %d", second, http.StatusOK)
@@ -445,5 +449,120 @@ func TestGitHubIntegration_SensitiveGlobDiff_RoutesDeep_PersistsThroughVerdict(t
 			got = *verdictReviewPath
 		}
 		t.Errorf("review_verdicts.review_path = %s, want %q (the turn's own persisted review_depth must be forwarded, verbatim, onto the posted verdict)", got, "deep")
+	}
+}
+
+// TestGitHubIntegration_UnreadableInput_RoutesDeepAndRecordsTheCause pins
+// §26.3's unreadable-input rule through this lane (a mention; the label
+// re-trigger shares the same handler path): whatever the review context
+// could not read, the turn routes deep under its own reason and its
+// routing record names the cause -- and a genuinely empty change is told
+// apart from a failed read.
+func TestGitHubIntegration_UnreadableInput_RoutesDeepAndRecordsTheCause(t *testing.T) {
+	fetcher := &fakeReviewContextFetcher{}
+	rig := newTestRigWithReviewTriage(t, fetcher)
+	ctx := context.Background()
+
+	const commenterID = 80007171
+	createLinkedGitHubUser(ctx, t, rig.users, rig.identities, commenterID, sqlcgen.UserRoleMaintainer)
+
+	readablePR := githubapi.PullRequest{HeadSHA: "sha-unreadable-head", BaseRef: "main", ChangedFiles: 2, Additions: 5, Deletions: 1}
+	tests := []struct {
+		name          string
+		pr            githubapi.PullRequest
+		prErr         error
+		diff          string
+		diffTruncated bool
+		diffErr       error
+		wantDepth     string
+		wantReason    string
+		wantInputRead string
+	}{
+		{name: "pull request unreadable", prErr: errors.New("github 502"), wantDepth: "deep", wantReason: "review input could not be read in full", wantInputRead: "pr_unreadable"},
+		{name: "diff unreadable", pr: readablePR, diffErr: errors.New("github 502"), wantDepth: "deep", wantReason: "review input could not be read in full", wantInputRead: "diff_unreadable"},
+		{name: "diff truncated", pr: readablePR, diff: "diff --git a/internal/a.go b/internal/a.go\n--- a/internal/a.go\n+++ b/internal/a.go\n@@ -1 +1 @@\n-x\n+y\n", diffTruncated: true, wantDepth: "deep", wantReason: "review input could not be read in full", wantInputRead: "diff_truncated"},
+		{name: "genuinely empty change", pr: githubapi.PullRequest{HeadSHA: "sha-empty-head", BaseRef: "main"}, wantDepth: "light", wantReason: "no deep-routing signal", wantInputRead: "empty"},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fetcher.pr, fetcher.prErr = tt.pr, tt.prErr
+			fetcher.diff, fetcher.diffTruncated, fetcher.diffErr = tt.diff, tt.diffTruncated, tt.diffErr
+
+			repoName := fmt.Sprintf("unreadable-input-repo-%d", i)
+			repoFullName := "acme/" + repoName
+			prNumber := int32(7171 + i)
+			status := postWebhook(t, rig, issueCommentBodyWithCommenter(repoFullName, repoName, "https://github.com/"+repoFullName+".git", int(prNumber), "unreadable-review", commenterID, "unreadable-user"), fmt.Sprintf("delivery-unreadable-%d", i))
+			if status != http.StatusOK {
+				t.Fatalf("webhook delivery status = %d, want %d", status, http.StatusOK)
+			}
+
+			var reviewDepth *string
+			var recordJSON []byte
+			if err := rig.pool.QueryRow(ctx,
+				`SELECT t.review_depth, t.review_depth_decision FROM turns t
+				 JOIN github_pr_sessions g ON g.session_id = t.session_id
+				 WHERE g.repo_full_name = $1 AND g.pr_number = $2
+				 ORDER BY t.created_at DESC LIMIT 1`,
+				repoFullName, prNumber,
+			).Scan(&reviewDepth, &recordJSON); err != nil {
+				t.Fatalf("query review turn: %v", err)
+			}
+			if reviewDepth == nil || *reviewDepth != tt.wantDepth {
+				t.Errorf("turns.review_depth = %v, want %q", reviewDepth, tt.wantDepth)
+			}
+			var record struct {
+				Reason    string `json:"reason"`
+				InputRead string `json:"inputRead"`
+			}
+			if err := json.Unmarshal(recordJSON, &record); err != nil {
+				t.Fatalf("unmarshal review_depth_decision %s: %v", recordJSON, err)
+			}
+			if record.Reason != tt.wantReason || record.InputRead != tt.wantInputRead {
+				t.Errorf("record reason/inputRead = %q/%q, want %q/%q", record.Reason, record.InputRead, tt.wantReason, tt.wantInputRead)
+			}
+		})
+	}
+}
+
+// TestGitHubIntegration_NoReadMade_RoutesDeepAndRecordsNotFetched pins the
+// lane's own half of the cause: with no diff fetcher wired, the handler
+// makes no read, and says so (not_fetched) rather than leaving the cause
+// unset.
+func TestGitHubIntegration_NoReadMade_RoutesDeepAndRecordsNotFetched(t *testing.T) {
+	rig := newTestRigWithReviewTriage(t, nil)
+	ctx := context.Background()
+
+	const repoFullName = "acme/no-read-repo"
+	const prNumber = 7272
+	const commenterID = 80007272
+	createLinkedGitHubUser(ctx, t, rig.users, rig.identities, commenterID, sqlcgen.UserRoleMaintainer)
+
+	if status := postWebhook(t, rig, issueCommentBodyWithCommenter(repoFullName, "no-read-repo", "https://github.com/acme/no-read-repo.git", prNumber, "no-read-review", commenterID, "no-read-user"), "delivery-no-read-1"); status != http.StatusOK {
+		t.Fatalf("webhook delivery status = %d, want %d", status, http.StatusOK)
+	}
+
+	var reviewDepth *string
+	var recordJSON []byte
+	if err := rig.pool.QueryRow(ctx,
+		`SELECT t.review_depth, t.review_depth_decision FROM turns t
+		 JOIN github_pr_sessions g ON g.session_id = t.session_id
+		 WHERE g.repo_full_name = $1 AND g.pr_number = $2
+		 ORDER BY t.created_at DESC LIMIT 1`,
+		repoFullName, prNumber,
+	).Scan(&reviewDepth, &recordJSON); err != nil {
+		t.Fatalf("query review turn: %v", err)
+	}
+	if reviewDepth == nil || *reviewDepth != "deep" {
+		t.Errorf("turns.review_depth = %v, want deep", reviewDepth)
+	}
+	var record struct {
+		Reason    string `json:"reason"`
+		InputRead string `json:"inputRead"`
+	}
+	if err := json.Unmarshal(recordJSON, &record); err != nil {
+		t.Fatalf("unmarshal review_depth_decision %s: %v", recordJSON, err)
+	}
+	if record.Reason != "review input could not be read in full" || record.InputRead != "not_fetched" {
+		t.Errorf("record reason/inputRead = %q/%q, want %q/%q", record.Reason, record.InputRead, "review input could not be read in full", "not_fetched")
 	}
 }

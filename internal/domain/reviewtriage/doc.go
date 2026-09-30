@@ -5,9 +5,11 @@
 // trust agent judgment for routing; deterministic fallbacks throughout,
 // §18)." Every function here is pure per CLAUDE.md/§11: no I/O, no
 // time.Now(), no randomness. Unlike internal/domain/review, this package
-// does import the standard library (path/strings) and one sibling domain
-// package (internal/domain/autoapproval, for its already-shipped
-// path->BlastRadius-tag classifier) -- both real, existing precedents:
+// does import the standard library (path/strings/strconv) and sibling
+// domain packages (internal/domain/autoapproval, for its already-shipped
+// path->BlastRadius-tag classifier; internal/domain/codeowners, for the
+// one gitignore-style glob matcher the size patterns reuse) -- both real,
+// existing precedents:
 // internal/domain/autoapproval itself already imports "path"/"strings"
 // (blastradius.go), and cross-domain-package imports are already
 // established (internal/domain/autoapproval imports internal/domain/
@@ -71,6 +73,30 @@
 // exactly one of those three labels), so treating them as a second,
 // separate signal would be redundant with, and could lag behind, the
 // database read the fourth rule already performs.
+//
+// # An unreadable input is not a small change
+//
+// The rules above read a size and a set of changed paths. When the pull
+// request or its diff could not be read, those are missing or partial,
+// and an empty list looks exactly like a one-line fix. So the reads' own
+// outcome reaches Decide as a typed fact (Signals.InputRead, set by the
+// review context's producer): anything but a complete or genuinely empty
+// read routes deep under ReasonInputUnreadable, after the path rules (a
+// sensitive path that WAS read is still a real signal) and before every
+// count. An always_light override still wins, being an admin's decision,
+// and the record names the cause either way. A depth chosen for that
+// reason is never a later review's floor (NonFloorReasons, depth.go).
+//
+// # The size counts source changes only
+//
+// The line threshold is compared against the pull request's reported
+// changed lines less the lines of files this deployment's size patterns
+// match -- tests, documentation, generated files (DefaultSizeExclusions,
+// sizeexclusion.go). The patterns are the deployment's, matched on paths
+// alone, never on markers the pull request carries about its own files.
+// The path rules still read every changed path, so production code placed
+// under a test directory shrinks the count but not the sensitive-path
+// check.
 //
 // # Per-repo config: mode + deepPaths only, thresholds stay fixed
 //

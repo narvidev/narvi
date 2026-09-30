@@ -21,6 +21,19 @@ type DecisionRecord struct {
 	ChangedLines         int      `json:"changedLines"`
 	DistinctRoots        int      `json:"distinctRoots"`
 	Mode                 string   `json:"mode"`
+	// InputRead (§26.3) is how the reads behind this turn's context ended
+	// (review.InputRead: complete, empty, not_fetched, pr_unreadable,
+	// diff_unreadable, diff_truncated), recorded whatever rule decided --
+	// under an always_light override too. It is what DiffEmpty below
+	// cannot say on its own: whether an empty diff is an empty change or
+	// a read that failed. Absent on a record written before it existed;
+	// a reader must take that as unknown, never as complete.
+	InputRead string `json:"inputRead,omitempty"`
+	// SourceLines (§26.3) is the size the line threshold was compared
+	// against: ChangedLines less the lines of files the deployment's size
+	// exclusions match. Absent on a record written before it existed,
+	// when ChangedLines was the size compared.
+	SourceLines *int `json:"sourceLines,omitempty"`
 	// Floored reports whether §24's re-review floor (Floor, depth.go) is
 	// what actually determined the final Depth above -- true means the
 	// fresh Decide result was itself overridden by a higher-ranked PRIOR
@@ -215,6 +228,7 @@ func NewDecisionRecord(decision Decision, cfg Config, finalDepth ReviewDepth, pr
 	for i, t := range decision.MatchedSensitiveTags {
 		tags[i] = string(t)
 	}
+	sourceLines := decision.SourceLines
 	var modelID, effort string
 	if resolvedModelID != nil {
 		modelID = *resolvedModelID
@@ -228,6 +242,8 @@ func NewDecisionRecord(decision Decision, cfg Config, finalDepth ReviewDepth, pr
 		MatchedSensitiveTags: tags,
 		ChangedLines:         decision.ChangedLines,
 		DistinctRoots:        decision.DistinctRoots,
+		InputRead:            string(decision.InputRead),
+		SourceLines:          &sourceLines,
 		ResolvedModelID:      modelID,
 		ResolvedEffort:       effort,
 		Mode:                 string(resolveMode(cfg.Mode)),

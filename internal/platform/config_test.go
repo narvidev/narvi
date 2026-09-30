@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/narvidev/narvi/internal/domain/integrations"
+	"github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/rollout"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -2667,5 +2668,46 @@ func collectStringsHolding(v reflect.Value, path, needle string, depth int, hold
 			collectStringsHolding(iter.Key(), path+"{key}", needle, depth+1, holders)
 			collectStringsHolding(iter.Value(), path+"{value}", needle, depth+1, holders)
 		}
+	}
+}
+
+// TestLoadReviewSizeExcludedPaths covers §26.3's size-rule patterns:
+// unset is the built-in default, set replaces it, set to empty excludes
+// nothing, and an entry that cannot mean what it says refuses to boot.
+func TestLoadReviewSizeExcludedPaths(t *testing.T) {
+	empty := ""
+	custom := " *_test.go , **/fixtures/** ,, vendor/**"
+	negated := "*_test.go,!docs/keep.md"
+	tests := []struct {
+		name      string
+		value     *string
+		want      []string
+		wantError string
+	}{
+		{name: "unset is the built-in default", value: nil, want: reviewtriage.DefaultSizeExclusions()},
+		{name: "set replaces the default", value: &custom, want: []string{"*_test.go", "**/fixtures/**", "vendor/**"}},
+		{name: "set to empty excludes nothing", value: &empty, want: []string{}},
+		{name: "a negated entry refuses to boot", value: &negated, wantError: `invalid entry "!docs/keep.md" in NARVI_REVIEW_SIZE_EXCLUDED_PATHS`},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			setOrUnsetEnv(t, "NARVI_REVIEW_SIZE_EXCLUDED_PATHS", tt.value)
+
+			cfg, err := platform.Load()
+			if tt.wantError != "" {
+				var target *platform.InvalidReviewSizeExcludedPathError
+				if !errors.As(err, &target) || !strings.Contains(err.Error(), tt.wantError) {
+					t.Fatalf("Load() error = %v, want an InvalidReviewSizeExcludedPathError containing %q", err, tt.wantError)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v, want nil", err)
+			}
+			if !reflect.DeepEqual(cfg.ReviewSizeExcludedPaths, tt.want) {
+				t.Errorf("ReviewSizeExcludedPaths = %q, want %q", cfg.ReviewSizeExcludedPaths, tt.want)
+			}
+		})
 	}
 }

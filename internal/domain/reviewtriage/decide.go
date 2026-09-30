@@ -35,6 +35,13 @@ const (
 	ReasonPriorHighVerdict  Reason = "prior verdict for this PR was high risk"
 	ReasonNeedsHumanLabel   Reason = "review:needs-human label present"
 	ReasonLightDefault      Reason = "no deep-routing signal"
+	// ReasonInputUnreadable: the pull request or its diff could not be
+	// read in full (Signals.InputRead), so the size and the changed paths
+	// the other rules read are missing or partial. §26.3: a missing size
+	// costs a thorough review, a missing scope costs a finding. A depth
+	// chosen for this reason is never the next review's floor
+	// (NonFloorReasons, depth.go).
+	ReasonInputUnreadable Reason = "review input could not be read in full"
 )
 
 // Decision is Decide's own output -- recorded verbatim on the §18.4-
@@ -54,13 +61,23 @@ type Decision struct {
 	// glob check matched, carried through for the routing-decision
 	// record's own audit trail.
 	MatchedSensitiveTags []review.Tag
-	// ChangedLines is Signals.Additions+Signals.Deletions, carried
-	// through verbatim for the routing-decision record.
+	// ChangedLines is Signals.Additions+Signals.Deletions, the pull
+	// request's own reported total, carried through verbatim for the
+	// routing-decision record.
 	ChangedLines int
+	// SourceLines is the size the line threshold is compared against:
+	// ChangedLines less the lines the diff attributes to files the
+	// deployment's size exclusions match (sourceChangedLines,
+	// sizeexclusion.go).
+	SourceLines int
 	// DistinctRoots is the number of distinct top-level path roots
 	// Signals.ChangedPaths touches, carried through verbatim for the
 	// routing-decision record.
 	DistinctRoots int
+	// InputRead is Signals.InputRead, carried through so the record names
+	// how the input was read whatever rule decided -- an always_light
+	// override included.
+	InputRead review.InputRead
 }
 
 // topLevelRoot returns p's own first path segment -- "internal/domain/
@@ -110,57 +127,76 @@ func resolveMode(m Mode) Mode {
 // "fixed order... deterministic first error" discipline):
 //
 //  1. cfg.Mode == always_light / always_deep: an explicit admin override,
-//     checked before any signal at all.
+//     checked before any signal at all -- an unreadable input included.
 //  2. Any changed path matches the fixed sensitive-glob set (migrations/
 //     auth/infra-as-code+CI-workflows) OR any repo-configured
-//     cfg.DeepPaths entry -> deep.
-//  3. Signals.Additions+Deletions > 600, OR distinct top-level path roots
-//     >= 3 -> deep.
-//  4. Signals.PriorVerdictRiskHigh -> deep (§26.3's own explicit fourth
+//     cfg.DeepPaths entry -> deep. Every changed path is read, test and
+//     documentation files included, and a partial list is still read:
+//     a sensitive path that WAS seen is a real signal.
+//  3. Signals.InputRead is not readable (the pull request or its diff
+//     could not be read in full) -> deep, ReasonInputUnreadable. Checked
+//     before every count, since the counts are what is missing.
+//  4. The source line count (ChangedLines less the lines of files the
+//     deployment's cfg.SizeExclusions match) > 600, OR distinct top-level
+//     path roots >= 3 -> deep.
+//  5. Signals.PriorVerdictRiskHigh -> deep (§26.3's own explicit fourth
 //     rule; see doc.go's own "v1 rules -- five, not three" section).
-//  5. Signals.NeedsHumanLabelPresent -> deep (this package's own fifth
+//  6. Signals.NeedsHumanLabelPresent -> deep (this package's own fifth
 //     rule, same section).
-//  6. Otherwise: light.
+//  7. Otherwise: light.
 //
-// A caller with NO usable signals at all (every Signals field at its own
-// zero value -- e.g. a diff fetch that failed entirely) reaches rule 6
-// and returns DepthLight, never an error: this function has no error
-// return at all, by construction, so "fail open to light" is structurally
-// true for THIS function -- see internal/app/reviewtriage.ComputeDepth's
-// own doc comment for how the CALLER'S surrounding I/O (config/verdict-
-// history reads, which CAN fail) is made to degrade to the same safe
-// input before ever reaching here.
+// This function has no error return at all. An input that could not be
+// read is not a router error (§26.3): it reaches rule 3 and routes deep
+// under a reason of its own. The fail-open-to-light rule covers only the
+// caller's own reads (config, verdict history) -- see internal/app/
+// reviewtriage.ComputeDecision's own doc comment for how those degrade.
 func Decide(sig Signals, cfg Config) Decision {
-	changedLines := sig.Additions + sig.Deletions
-	roots := distinctRoots(sig.ChangedPaths)
+	base := Decision{
+		ChangedLines:  sig.Additions + sig.Deletions,
+		DistinctRoots: distinctRoots(sig.ChangedPaths),
+		InputRead:     sig.InputRead,
+	}
+	base.SourceLines = sourceChangedLines(base.ChangedLines, sig.FileLines, cfg.SizeExclusions)
+	decide := func(depth ReviewDepth, reason Reason) Decision {
+		d := base
+		d.Depth = depth
+		d.Reason = reason
+		return d
+	}
 
 	switch resolveMode(cfg.Mode) {
 	case ModeAlwaysLight:
-		return Decision{Depth: DepthLight, Reason: ReasonAlwaysLightConfig, ChangedLines: changedLines, DistinctRoots: roots}
+		return decide(DepthLight, ReasonAlwaysLightConfig)
 	case ModeAlwaysDeep:
-		return Decision{Depth: DepthDeep, Reason: ReasonAlwaysDeepConfig, ChangedLines: changedLines, DistinctRoots: roots}
+		return decide(DepthDeep, ReasonAlwaysDeepConfig)
 	}
 
 	if tags := classifySensitivePaths(sig.ChangedPaths); len(tags) > 0 {
-		return Decision{Depth: DepthDeep, Reason: ReasonSensitiveGlob, MatchedSensitiveTags: tags, ChangedLines: changedLines, DistinctRoots: roots}
+		d := decide(DepthDeep, ReasonSensitiveGlob)
+		d.MatchedSensitiveTags = tags
+		return d
 	}
 	if anyDeepPathMatch(sig.ChangedPaths, cfg.DeepPaths) {
-		return Decision{Depth: DepthDeep, Reason: ReasonDeepPathConfig, ChangedLines: changedLines, DistinctRoots: roots}
+		return decide(DepthDeep, ReasonDeepPathConfig)
 	}
 
-	if changedLines > maxChangedLinesLight {
-		return Decision{Depth: DepthDeep, Reason: ReasonChangedLinesOver, ChangedLines: changedLines, DistinctRoots: roots}
+	if !sig.InputRead.Readable() {
+		return decide(DepthDeep, ReasonInputUnreadable)
 	}
-	if roots >= minDistinctRootsForDeep {
-		return Decision{Depth: DepthDeep, Reason: ReasonRootDispersion, ChangedLines: changedLines, DistinctRoots: roots}
+
+	if base.SourceLines > maxChangedLinesLight {
+		return decide(DepthDeep, ReasonChangedLinesOver)
+	}
+	if base.DistinctRoots >= minDistinctRootsForDeep {
+		return decide(DepthDeep, ReasonRootDispersion)
 	}
 
 	if sig.PriorVerdictRiskHigh {
-		return Decision{Depth: DepthDeep, Reason: ReasonPriorHighVerdict, ChangedLines: changedLines, DistinctRoots: roots}
+		return decide(DepthDeep, ReasonPriorHighVerdict)
 	}
 	if sig.NeedsHumanLabelPresent {
-		return Decision{Depth: DepthDeep, Reason: ReasonNeedsHumanLabel, ChangedLines: changedLines, DistinctRoots: roots}
+		return decide(DepthDeep, ReasonNeedsHumanLabel)
 	}
 
-	return Decision{Depth: DepthLight, Reason: ReasonLightDefault, ChangedLines: changedLines, DistinctRoots: roots}
+	return decide(DepthLight, ReasonLightDefault)
 }

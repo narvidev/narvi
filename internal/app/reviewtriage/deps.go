@@ -44,4 +44,10 @@ type Deps struct {
 	// to Provenance{} -- never a panic.
 	Artifacts *postgres.ArtifactStore
 	Sessions  *postgres.SessionStore
+	// SizeExclusions (§26.3) are this deployment's size patterns,
+	// platform.Config.ReviewSizeExcludedPaths -- files they match are left
+	// out of the size a review is routed on (reviewtriage.Config.
+	// SizeExclusions). Nil excludes nothing, the count every changed line
+	// had before these patterns existed.
+	SizeExclusions []string
 }

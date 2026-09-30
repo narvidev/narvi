@@ -8,12 +8,13 @@ import (
 )
 
 func TestNewDecisionRecord(t *testing.T) {
-	sig := reviewtriage.Signals{ChangedPaths: []string{"migrations/x.sql"}}
+	sig := readable(reviewtriage.Signals{ChangedPaths: []string{"migrations/x.sql"}})
 	cfg := reviewtriage.DefaultConfig()
 	decision := reviewtriage.Decide(sig, cfg)
 
 	t.Run("not floored", func(t *testing.T) {
 		got := reviewtriage.NewDecisionRecord(decision, cfg, decision.Depth, reviewtriage.Provenance{}, nil, nil, 0, false, false, nil, nil)
+		zero := 0
 		want := reviewtriage.DecisionRecord{
 			Depth:                "deep",
 			Reason:               string(reviewtriage.ReasonSensitiveGlob),
@@ -21,6 +22,8 @@ func TestNewDecisionRecord(t *testing.T) {
 			ChangedLines:         0,
 			DistinctRoots:        1,
 			Mode:                 "auto",
+			InputRead:            "complete",
+			SourceLines:          &zero,
 			Floored:              false,
 		}
 		if !reflect.DeepEqual(got, want) {
@@ -29,7 +32,7 @@ func TestNewDecisionRecord(t *testing.T) {
 	})
 
 	t.Run("floored by a higher-ranked prior depth", func(t *testing.T) {
-		lightSig := reviewtriage.Signals{ChangedPaths: []string{"internal/app/foo/a.go"}}
+		lightSig := readable(reviewtriage.Signals{ChangedPaths: []string{"internal/app/foo/a.go"}})
 		lightDecision := reviewtriage.Decide(lightSig, cfg)
 		floored := reviewtriage.Floor(lightDecision.Depth, reviewtriage.DepthDeep)
 

@@ -50,8 +50,9 @@ func (h *tripwireCodeHost) CreatePR(context.Context, ports.CreatePRSpec) (ports.
 }
 
 // TestFetchAutoRetriggerReviewContext_NilOutbound_NoCall proves the
-// actor's automatic re-review takes its existing degraded path -- the
-// honest zero review.PreFetchedContext -- when GitHub outbound is off,
+// actor's automatic re-review takes its existing degraded path -- an
+// empty review.PreFetchedContext that says no read was made
+// (review.InputReadNotFetched, §26.3) -- when GitHub outbound is off,
 // WITHOUT calling the code host: a configured diff fetcher is not enough
 // to read a pull request as the bot.
 func TestFetchAutoRetriggerReviewContext_NilOutbound_NoCall(t *testing.T) {
@@ -64,8 +65,8 @@ func TestFetchAutoRetriggerReviewContext_NilOutbound_NoCall(t *testing.T) {
 
 	got := a.fetchAutoRetriggerReviewContext(context.Background(), "acme/widgets", 7)
 
-	if !reflect.DeepEqual(got, review.PreFetchedContext{}) {
-		t.Errorf("fetchAutoRetriggerReviewContext() = %+v, want the zero PreFetchedContext", got)
+	if want := (review.PreFetchedContext{InputRead: review.InputReadNotFetched}); !reflect.DeepEqual(got, want) {
+		t.Errorf("fetchAutoRetriggerReviewContext() = %+v, want %+v", got, want)
 	}
 	if host.calls != 0 {
 		t.Errorf("code host called %d times, want 0", host.calls)
