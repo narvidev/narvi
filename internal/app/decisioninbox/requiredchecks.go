@@ -2,6 +2,8 @@ package decisioninbox
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/narvidev/narvi/internal/app/ports"
@@ -42,8 +44,13 @@ import (
 // when a check run of the same App at the head carries its id; when none
 // does, the fact identifies it by slug (resolveStatusApps,
 // ports.SourceControl.ResolveAppID) with the same credential as the
-// requirements, and an App that cannot be identified is one whose status
-// never counts.
+// requirements. A slug that names no App is an answer: that App cannot be
+// identified, and its status never counts. Any other failure to read an
+// App is a failed read of the requirements, handled exactly like one: the
+// fact is "could not be read", a probe stands it in as "requires
+// nothing", and it degrades the inbox only when it decides the row. Each
+// slug is read at most once per inbox load or auto-merge tick
+// (appIDReads), and a failure is logged once there.
 
 // requiredChecksSpec is the read of pr's base branch's requirements with
 // token.
@@ -61,6 +68,8 @@ func requiredChecksSpec(pr ports.OpenPR, token string) ports.ListRequiredChecksS
 type RequiredChecksMemo struct {
 	mu      sync.Mutex
 	entries map[requiredChecksCacheKey]requiredChecksMemoEntry
+	// apps is the tick's App reads (appIDReads).
+	apps *appIDReads
 }
 
 type requiredChecksMemoEntry struct {
@@ -70,7 +79,16 @@ type requiredChecksMemoEntry struct {
 
 // NewRequiredChecksMemo returns an empty memo, for one tick.
 func NewRequiredChecksMemo() *RequiredChecksMemo {
-	return &RequiredChecksMemo{entries: map[requiredChecksCacheKey]requiredChecksMemoEntry{}}
+	return &RequiredChecksMemo{entries: map[requiredChecksCacheKey]requiredChecksMemoEntry{}, apps: newAppIDReads()}
+}
+
+// appReads is the App reads to share: the tick's when m is a tick's memo,
+// and a fresh set, for one call, when m is nil (a Merge click).
+func (m *RequiredChecksMemo) appReads() *appIDReads {
+	if m == nil || m.apps == nil {
+		return newAppIDReads()
+	}
+	return m.apps
 }
 
 // readRequiredChecksLive reads spec's requirements through sourceControl,
@@ -97,15 +115,20 @@ func readRequiredChecksLive(ctx context.Context, deps Deps, sourceControl ports.
 // requiredChecksFact is the fact for one read of pr's base requirements:
 // evaluated against the checks pr's own CI read listed at its head, their
 // Apps identified by resolve where the requirements need it
-// (resolveStatusApps), when the read succeeded, and the zero value --
-// "could not be read", which the engine refuses on -- when it failed. A
-// failed read is never turned into "requires nothing".
-func requiredChecksFact(ctx context.Context, required []ports.RequiredCheck, readErr error, pr ports.OpenPR, resolve appIDResolver) autoapproval.RequiredChecks {
+// (resolveStatusApps), when every read succeeded. When the requirements
+// read failed, or an App read did (a slug that names no App is not a
+// failure), it is the zero value -- "could not be read", which the engine
+// refuses on -- returned with the failure. A failed read is never turned
+// into "requires nothing", nor into a considered shortfall.
+func requiredChecksFact(ctx context.Context, required []ports.RequiredCheck, readErr error, pr ports.OpenPR, resolve appIDResolver) (autoapproval.RequiredChecks, error) {
 	if readErr != nil {
-		return autoapproval.RequiredChecks{}
+		return autoapproval.RequiredChecks{}, readErr
 	}
-	head := resolveStatusApps(ctx, required, pr, resolve)
-	return autoapproval.ReadRequiredChecks(toDomainRequiredChecks(required), toDomainHeadChecks(head), !pr.HeadChecksListDegraded)
+	head, err := resolveStatusApps(ctx, required, pr, resolve)
+	if err != nil {
+		return autoapproval.RequiredChecks{}, err
+	}
+	return autoapproval.ReadRequiredChecks(toDomainRequiredChecks(required), toDomainHeadChecks(head), !pr.HeadChecksListDegraded), nil
 }
 
 // appIDResolver identifies the App behind slug by id
@@ -115,8 +138,9 @@ type appIDResolver func(ctx context.Context, slug string) (int64, error)
 
 // liveAppIDResolver resolves through sourceControl with token, each call
 // bounded by deps.Timeouts.DecisionInboxResolveAppIDTimeout -- the merge
-// path's resolver. The adapter keeps each App's id once read, so a slug
-// is read once per process, not once per merge.
+// path's resolver. The adapter keeps each App's id for
+// platform.Timeouts.GitHubAppIDCacheTTL once read, so a slug is not read
+// again on every merge.
 func liveAppIDResolver(deps Deps, sourceControl ports.SourceControl, token string) appIDResolver {
 	return func(ctx context.Context, slug string) (int64, error) {
 		callCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxResolveAppIDTimeout)
@@ -125,15 +149,59 @@ func liveAppIDResolver(deps Deps, sourceControl ports.SourceControl, token strin
 	}
 }
 
+// appIDReads holds one inbox load's, or one auto-merge tick's, App reads
+// by slug -- the id, or the error -- so each slug is read at most once
+// there, whatever the number of rows and eligibility calls, and a failure
+// is logged once. The next load or tick reads again: nothing here outlives
+// it. Safe for concurrent use.
+type appIDReads struct {
+	mu      sync.Mutex
+	entries map[string]appIDRead
+}
+
+type appIDRead struct {
+	id  int64
+	err error
+}
+
+func newAppIDReads() *appIDReads {
+	return &appIDReads{entries: map[string]appIDRead{}}
+}
+
+// through returns a resolver answering from r, and reading with read the
+// first time a slug is asked for.
+func (r *appIDReads) through(read appIDResolver) appIDResolver {
+	if r == nil {
+		r = newAppIDReads()
+	}
+	return func(ctx context.Context, slug string) (int64, error) {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		if e, ok := r.entries[slug]; ok {
+			return e.id, e.err
+		}
+		id, err := read(ctx, slug)
+		switch {
+		case errors.Is(err, ports.ErrAppNotFound):
+			platform.Logger(ctx).Info("decisioninbox: no App has the slug of the bot account that posted a commit status; its status will not count for a required check naming an App", "app_slug", slug)
+		case err != nil:
+			platform.Logger(ctx).Warn("decisioninbox: read the App behind a commit status failed -- the base branch's required checks read as not read, and eligibility fails closed via ReasonRequiredChecksUnknown unless another criterion refuses first", "error", err, "app_slug", slug)
+		}
+		r.entries[slug] = appIDRead{id: id, err: err}
+		return id, err
+	}
+}
+
 // resolveStatusApps returns pr's head checks with the App behind a commit
 // status identified by id where the requirements need it: a status an App
 // posted (its slug known, HeadCheck.AppSlug) that no check run at the head
 // identified, carrying the name of a required check that names an App.
 // Nothing else is resolved, so a base that names no App costs no read.
-// Each slug is resolved at most once per call. A slug that cannot be
-// resolved leaves the id zero: an App the rule reads as unidentified,
-// whose status never counts for a check that names an App.
-func resolveStatusApps(ctx context.Context, required []ports.RequiredCheck, pr ports.OpenPR, resolve appIDResolver) []ports.HeadCheck {
+// Each slug is resolved at most once per call. A slug that names no App
+// (ports.ErrAppNotFound) leaves the id zero: an App the rule reads as
+// unidentified, whose status never counts for a check that names an App.
+// Any other failure is returned: the head's Apps could not be read.
+func resolveStatusApps(ctx context.Context, required []ports.RequiredCheck, pr ports.OpenPR, resolve appIDResolver) ([]ports.HeadCheck, error) {
 	appNamed := make(map[string]bool, len(required))
 	for _, c := range required {
 		if c.AppID != 0 {
@@ -141,33 +209,35 @@ func resolveStatusApps(ctx context.Context, required []ports.RequiredCheck, pr p
 		}
 	}
 	if len(appNamed) == 0 {
-		return pr.HeadChecks
+		return pr.HeadChecks, nil
 	}
 	out := make([]ports.HeadCheck, len(pr.HeadChecks))
 	copy(out, pr.HeadChecks)
 	resolved := map[string]int64{}
-	unresolved := map[string]bool{}
+	notFound := map[string]bool{}
 	for i, c := range out {
 		if c.Source != ports.HeadCheckSourceStatus || c.Poster != ports.HeadCheckPosterApp || c.AppID != 0 || c.AppSlug == "" || !appNamed[c.Name] {
 			continue
 		}
-		if unresolved[c.AppSlug] {
+		if notFound[c.AppSlug] {
 			continue
 		}
 		id, ok := resolved[c.AppSlug]
 		if !ok {
 			got, err := resolve(ctx, c.AppSlug)
-			if err != nil {
-				unresolved[c.AppSlug] = true
-				platform.Logger(ctx).Warn("decisioninbox: identify the App behind a commit status failed, its status will not count for a required check naming an App", "error", err, "app_slug", c.AppSlug, "repo", pr.Owner+"/"+pr.Repo, "pr_number", pr.Number, "check", c.Name)
+			switch {
+			case errors.Is(err, ports.ErrAppNotFound):
+				notFound[c.AppSlug] = true
 				continue
+			case err != nil:
+				return nil, fmt.Errorf("decisioninbox: read the App behind the commit status %q (app %q): %w", c.Name, c.AppSlug, err)
 			}
 			resolved[c.AppSlug] = got
 			id = got
 		}
 		out[i].AppID = id
 	}
-	return out
+	return out, nil
 }
 
 // probeRequiredChecks is the stand-in a probe uses for fact: fact itself

@@ -11,6 +11,7 @@ package decisioninbox_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"sync"
 	"testing"
@@ -79,9 +80,11 @@ type fakeSCMCacheSourceControl struct {
 	requiredChecksErr       error
 	requiredChecksCallCount int
 
-	// appIDsBySlug/appIDCallCount back SCMCache.ResolveAppID's own test
-	// below: a slug absent from the map names no App.
+	// appIDsBySlug/appIDErr/appIDCallCount back SCMCache.ResolveAppID's
+	// own test below: a slug absent from the map names no App
+	// (ErrAppNotFound), and appIDErr, when set, fails every read.
 	appIDsBySlug   map[string]int64
+	appIDErr       error
 	appIDCallCount int
 }
 
@@ -224,13 +227,17 @@ func (f *fakeSCMCacheSourceControl) ResolveAppID(ctx context.Context, spec ports
 	f.mu.Lock()
 	f.appIDCallCount++
 	id, ok := f.appIDsBySlug[spec.Slug]
+	readErr := f.appIDErr
 	f.mu.Unlock()
 
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		return 0, ctxErr
 	}
+	if readErr != nil {
+		return 0, readErr
+	}
 	if !ok {
-		return 0, errors.New("fakeSCMCacheSourceControl: no App has slug " + spec.Slug)
+		return 0, fmt.Errorf("fakeSCMCacheSourceControl: slug %s: %w", spec.Slug, ports.ErrAppNotFound)
 	}
 	return id, nil
 }
@@ -896,24 +903,27 @@ func TestSCMCache_ListRequiredChecks(t *testing.T) {
 }
 
 // TestSCMCache_ResolveAppID pins SCMCache.ResolveAppID (§21.2, the App
-// behind a commit status): the id the port answers, a failure returned as
-// an error and never a zero id, and each call bounded by
-// DecisionInboxResolveAppIDTimeout -- the adapter keeps each answer, so
-// nothing is cached here.
+// behind a commit status): the id the port answers; a slug naming no App
+// still ErrAppNotFound through the wrapping, a failed read an error that
+// is not; and each call bounded by DecisionInboxResolveAppIDTimeout. The
+// adapter keeps each answer for its TTL, so nothing is cached here.
 func TestSCMCache_ResolveAppID(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name      string
-		apps      map[string]int64
-		timeouts  func(*platform.Timeouts)
-		slug      string
-		wantID    int64
-		wantErr   bool
-		wantReads int
+		name         string
+		apps         map[string]int64
+		readErr      error
+		timeouts     func(*platform.Timeouts)
+		slug         string
+		wantID       int64
+		wantErr      bool
+		wantNotFound bool
+		wantReads    int
 	}{
 		{name: "an App the port identifies is answered", apps: map[string]int64{"coverage": 254}, slug: "coverage", wantID: 254, wantReads: 1},
-		{name: "a slug naming no App is an error", apps: map[string]int64{"coverage": 254}, slug: "other-ci", wantErr: true, wantReads: 1},
+		{name: "a slug naming no App stays ErrAppNotFound through the wrapping", apps: map[string]int64{"coverage": 254}, slug: "other-ci", wantErr: true, wantNotFound: true, wantReads: 1},
+		{name: "a failed read is an error, not ErrAppNotFound", apps: map[string]int64{"coverage": 254}, readErr: errors.New("apps: http 502"), slug: "coverage", wantErr: true, wantReads: 1},
 		{
 			name:      "the read runs under DecisionInboxResolveAppIDTimeout",
 			apps:      map[string]int64{"coverage": 254},
@@ -931,10 +941,13 @@ func TestSCMCache_ResolveAppID(t *testing.T) {
 			if tc.timeouts != nil {
 				tc.timeouts(&timeouts)
 			}
-			fake := &fakeSCMCacheSourceControl{appIDsBySlug: tc.apps}
+			fake := &fakeSCMCacheSourceControl{appIDsBySlug: tc.apps, appIDErr: tc.readErr}
 			id, err := decisioninbox.NewSCMCache(fake, timeouts).ResolveAppID(context.Background(), ports.ResolveAppIDSpec{Slug: tc.slug, Token: "bot"})
 			if (err != nil) != tc.wantErr || id != tc.wantID {
 				t.Errorf("ResolveAppID() = (%d, %v), want (%d, error %v)", id, err, tc.wantID, tc.wantErr)
+			}
+			if got := errors.Is(err, ports.ErrAppNotFound); got != tc.wantNotFound {
+				t.Errorf("errors.Is(err, ErrAppNotFound) = %v, want %v (err %v)", got, tc.wantNotFound, err)
 			}
 			fake.mu.Lock()
 			reads := fake.appIDCallCount

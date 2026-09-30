@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -42,8 +43,10 @@ type requiredChecksGitHub struct {
 	creators map[string]map[string]any
 	earlier  []map[string]any
 	// apps answers GET /apps/{app_slug}: the id of each App; a slug absent
-	// from it names no App.
-	apps map[string]int64
+	// from it names no App (404). appsStatus, when set, answers every App
+	// read with that status instead: a failed read.
+	apps       map[string]int64
+	appsStatus int
 	// branch answers GET /branches/main; rules answers GET
 	// /rules/branches/main (status and body).
 	branch      map[string]any
@@ -100,6 +103,11 @@ func (g *requiredChecksGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		}
 		encode(append(listing, g.earlier...))
 	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/apps/"):
+		if g.appsStatus != 0 {
+			w.WriteHeader(g.appsStatus)
+			_, _ = w.Write([]byte(`{"message":"Server Error"}`))
+			return
+		}
 		id, ok := g.apps[strings.TrimPrefix(r.URL.Path, "/apps/")]
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
@@ -190,6 +198,7 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 		creators    map[string]map[string]any
 		earlier     []map[string]any
 		apps        map[string]int64
+		appsStatus  int
 		checkRuns   []map[string]any
 		branch      map[string]any
 		rulesStatus int
@@ -286,6 +295,19 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 			wantAppReads: []string{"GET /apps/other-ci"},
 		},
 		{
+			// A failed App read is a failed read of the requirements, never
+			// a considered "could not be confirmed".
+			name:        "a check tied to an App never merges while its App cannot be read, and says the requirements could not be read",
+			statuses:    []map[string]any{{"context": "coverage/patch", "state": "success"}},
+			creators:    map[string]map[string]any{"coverage/patch": {"login": "coverage[bot]", "type": "Bot"}},
+			appsStatus:  http.StatusBadGateway,
+			checkRuns:   []map[string]any{actionsRunJSON("build", "success")},
+			branch:      protection(map[string]any{"context": "coverage/patch", "app_id": 254}),
+			rulesStatus: http.StatusOK, rulesBody: rulesJSON(),
+			wantReason:   string(autoapproval.ReasonRequiredChecksUnknown),
+			wantAppReads: []string{"GET /apps/coverage"},
+		},
+		{
 			name:        "a check tied to an App never merges on a status from an App that cannot be identified",
 			statuses:    []map[string]any{{"context": "coverage/patch", "state": "success"}},
 			creators:    map[string]map[string]any{"coverage/patch": {"login": "coverage[bot]", "type": "Bot"}},
@@ -344,7 +366,7 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 
 			github := &requiredChecksGitHub{
 				repo: repo, number: int(n), head: head,
-				statuses: tc.statuses, creators: tc.creators, earlier: tc.earlier, apps: tc.apps, checkRuns: tc.checkRuns,
+				statuses: tc.statuses, creators: tc.creators, earlier: tc.earlier, apps: tc.apps, appsStatus: tc.appsStatus, checkRuns: tc.checkRuns,
 				branch: tc.branch, rulesStatus: tc.rulesStatus, rulesBody: tc.rulesBody,
 			}
 			server := httptest.NewServer(github)
@@ -405,7 +427,9 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 // TestPumpOnce_RequiredChecks_ReadOncePerBasePerTick pins the auto-merge
 // worker's cost (§21.2): every candidate into the same base shares one
 // read of that base's requirements per tick -- the refused ones included
-// -- and the next tick reads again, never a stale answer for longer.
+// -- and the next tick reads again, never a stale answer for longer. The
+// same holds for the App behind a commit status the requirements need:
+// one read per slug per tick, a failed one included.
 func TestPumpOnce_RequiredChecks_ReadOncePerBasePerTick(t *testing.T) {
 	rig := newAutomergeTestRig(t)
 	ctx := context.Background()
@@ -420,6 +444,7 @@ func TestPumpOnce_RequiredChecks_ReadOncePerBasePerTick(t *testing.T) {
 			Owner: "acme", Repo: "required-checks-per-tick", Number: int(n), HTMLURL: htmlURL,
 			HeadSHA: "sha-moved-" + strconv.Itoa(int(n)), BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
 			CIConclusion: ports.CIConclusionSuccess,
+			HeadChecks:   []ports.HeadCheck{{Name: "coverage/patch", Source: ports.HeadCheckSourceStatus, AppSlug: "coverage", Poster: ports.HeadCheckPosterApp, State: ports.HeadCheckStatePassed}},
 		}
 	}
 	if _, err := rig.repoSettings.UpsertAutoMergeToggle(ctx, repoFullName, true); err != nil {
@@ -427,7 +452,8 @@ func TestPumpOnce_RequiredChecks_ReadOncePerBasePerTick(t *testing.T) {
 	}
 	sc := &fakeAutoMergeSourceControl{
 		prsByKey:               prs,
-		requiredChecksByBranch: map[string][]ports.RequiredCheck{testEligibleBaseRef: {{Name: "build"}}},
+		requiredChecksByBranch: map[string][]ports.RequiredCheck{testEligibleBaseRef: {{Name: "build"}, {Name: "coverage/patch", AppID: 254}}},
+		resolveAppIDErr:        errors.New("apps: http 502"),
 	}
 	worker := rig.newWorker(t, sc)
 
@@ -438,9 +464,13 @@ func TestPumpOnce_RequiredChecks_ReadOncePerBasePerTick(t *testing.T) {
 		sc.mu.Lock()
 		reads := len(sc.requiredChecksCalls)
 		calls := append([]ports.ListRequiredChecksSpec(nil), sc.requiredChecksCalls...)
+		appReads := len(sc.resolveAppIDCalls)
 		sc.mu.Unlock()
 		if reads != tick {
 			t.Errorf("after tick %d: %d reads of the base's requirements, want %d (one per base per tick, for three candidates)", tick, reads, tick)
+		}
+		if appReads != tick {
+			t.Errorf("after tick %d: %d reads of the App, want %d (one per slug per tick, a failed one included)", tick, appReads, tick)
 		}
 		for _, c := range calls {
 			if c.Token != "bot-token" || c.Branch != testEligibleBaseRef {

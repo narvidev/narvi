@@ -176,6 +176,13 @@ func TestValidate_CatchesEachBrokenLink(t *testing.T) {
 			},
 			wantChain: "GitHubListOpenPRsForUserTimeout > DecisionInboxResolveAppIDTimeout",
 		},
+		{
+			name: "GitHubAppIDCacheTTL not > AutoMergePumpInterval",
+			mutate: func(to *platform.Timeouts) {
+				to.GitHubAppIDCacheTTL = to.AutoMergePumpInterval
+			},
+			wantChain: "GitHubAppIDCacheTTL > AutoMergePumpInterval",
+		},
 	}
 
 	for _, tc := range tests {
@@ -1535,6 +1542,24 @@ func TestDefaultTimeouts_DecisionInboxResolveAppIDTimeout(t *testing.T) {
 	}
 }
 
+// TestDefaultTimeouts_GitHubAppIDCacheTTL pins how long an App slug's id is
+// kept (§21.2): ten minutes, the bound on how long a slug that moved to
+// another App keeps its old id, and longer than the auto-merge tick.
+func TestDefaultTimeouts_GitHubAppIDCacheTTL(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	if to.GitHubAppIDCacheTTL != 10*time.Minute {
+		t.Errorf("GitHubAppIDCacheTTL = %v, want %v", to.GitHubAppIDCacheTTL, 10*time.Minute)
+	}
+	if to.GitHubAppIDCacheTTL <= to.AutoMergePumpInterval {
+		t.Errorf("GitHubAppIDCacheTTL = %v, want above AutoMergePumpInterval (%v)", to.GitHubAppIDCacheTTL, to.AutoMergePumpInterval)
+	}
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
 // TestDefaultTimeouts_DecisionInboxRequiredChecksTimeout pins the shipped
 // bound on one read of a base branch's required checks (§21.2): two
 // lightweight GETs, and inside the Merge click's revalidation bound.
@@ -1598,6 +1623,11 @@ func TestValidate_RequiresPositiveFields(t *testing.T) {
 			name:      "DecisionInboxResolveAppIDTimeout == 0",
 			mutate:    func(to *platform.Timeouts) { to.DecisionInboxResolveAppIDTimeout = 0 },
 			wantField: "DecisionInboxResolveAppIDTimeout",
+		},
+		{
+			name:      "GitHubAppIDCacheTTL == 0",
+			mutate:    func(to *platform.Timeouts) { to.GitHubAppIDCacheTTL = 0 },
+			wantField: "GitHubAppIDCacheTTL",
 		},
 		{
 			// A negative value is exactly as permissive as zero for every

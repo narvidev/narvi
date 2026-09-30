@@ -176,6 +176,10 @@ type App struct {
 	providerCredentialStore *postgres.ProviderCredentialStore
 	chatGPTDeviceFlow       *chatgptoauth.Client
 
+	// liveSourceControl is the one GitHub adapter every consumer shares,
+	// kept so a test can see how it was configured (its App-id TTL).
+	liveSourceControl *githubapi.Adapter
+
 	// sessionWaiter is the replica's one bounded-wait service (technical
 	// plan §43.20, row 182's piece (b)), shared by the status route and
 	// its MCP twin; Run hands it to newHTTPServer, which interrupts it
@@ -607,7 +611,9 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// ports.GitHubSourceControlHost/SupportedSourceControlHosts' own
 	// existing "production wiring always talks to github.com" invariant.
 	gatedHTTPClient := githubapi.NewGatedClient(shadowLedger, isLiveEgress)
-	liveSourceControl := githubapi.New(gatedHTTPClient, githubUserTokenAPIBaseURL)
+	// WithAppIDCacheTTL bounds how long an App slug's id is kept (§21.2):
+	// a slug can pass to another App, so it is read again within the TTL.
+	liveSourceControl := githubapi.New(gatedHTTPClient, githubUserTokenAPIBaseURL).WithAppIDCacheTTL(cfg.Timeouts.GitHubAppIDCacheTTL)
 
 	// Layer 1 on top of layer 0 (§30.2), redundant in one direction only:
 	// the decorator records the six port writes with their real types and
@@ -3130,6 +3136,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 
 		registry:                registry,
 		recon:                   recon,
+		liveSourceControl:       liveSourceControl,
 		builder:                 builder,
 		outboxBuilder:           outboxBuilder,
 		releaseManifestWorker:   releaseManifestWorker,

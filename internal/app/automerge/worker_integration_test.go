@@ -97,8 +97,10 @@ type fakeAutoMergeSourceControl struct {
 	requiredChecksCalls    []ports.ListRequiredChecksSpec
 
 	// appIDsBySlug/resolveAppIDCalls back ResolveAppID below: a slug absent
-	// from the map names no App, and resolving it fails.
+	// from the map names no App (ErrAppNotFound); resolveAppIDErr, when
+	// set, fails every read.
 	appIDsBySlug      map[string]int64
+	resolveAppIDErr   error
 	resolveAppIDCalls []ports.ResolveAppIDSpec
 
 	mergeCalls     []ports.MergePRSpec
@@ -431,8 +433,9 @@ func (f *fakeAutoMergeSourceControl) ListRequiredChecks(ctx context.Context, spe
 	return f.requiredChecksByBranch[spec.Branch], nil
 }
 
-// ResolveAppID reports appIDsBySlug[spec.Slug], failing for a slug absent
-// from it, recording the call. Honors ctx first, like ListRequiredChecks.
+// ResolveAppID reports appIDsBySlug[spec.Slug], ErrAppNotFound for a slug
+// absent from it, recording the call. Honors ctx first, like
+// ListRequiredChecks.
 func (f *fakeAutoMergeSourceControl) ResolveAppID(ctx context.Context, spec ports.ResolveAppIDSpec) (int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -440,9 +443,12 @@ func (f *fakeAutoMergeSourceControl) ResolveAppID(ctx context.Context, spec port
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	if f.resolveAppIDErr != nil {
+		return 0, f.resolveAppIDErr
+	}
 	id, ok := f.appIDsBySlug[spec.Slug]
 	if !ok {
-		return 0, errors.New("fakeAutoMergeSourceControl: no App has slug " + spec.Slug)
+		return 0, fmt.Errorf("fakeAutoMergeSourceControl: slug %s: %w", spec.Slug, ports.ErrAppNotFound)
 	}
 	return id, nil
 }

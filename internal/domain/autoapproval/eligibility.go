@@ -406,7 +406,9 @@ type EligibilityInput struct {
 	// amendment) -- built with ReadRequiredChecks from the requirements
 	// the caller read and the checks the SAME read as CIGreen saw at the
 	// head, or left at its zero value when the requirements could not be
-	// read. The zero value is "could not be read" and refuses
+	// read -- they, or an App they need identified (a slug that names no
+	// App is an answer, not a failed read). The zero value is "could not
+	// be read" and refuses
 	// (ReasonRequiredChecksUnknown), the package's fail-conservative
 	// convention: a caller that forgets this field cannot make a pull
 	// request eligible on the CI read alone. It is checked after
@@ -535,8 +537,8 @@ const (
 	// already draws for the sensitive-path check.
 	ReasonCIConclusionDegraded Reason = "this pull request's CI status could not be fully read from GitHub"
 	// ReasonRequiredChecksUnknown accompanies a pull request whose base
-	// branch's required checks could not be read (EligibilityInput.
-	// RequiredChecks' zero value). A failed read never falls back to the
+	// branch's required checks could not be read, or an App they need
+	// identified (EligibilityInput.RequiredChecks' zero value). A failed read never falls back to the
 	// CI read alone: that is exactly the read that cannot see a required
 	// check which has not reported yet. A required check the head does
 	// not satisfy has no fixed Reason of its own -- the Reason names the

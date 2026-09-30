@@ -71,9 +71,11 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 		// head is the PR's CI read at its head.
 		head []ports.HeadCheck
 		// apps is every App the code host can identify by slug; a slug
-		// absent from it names no App. wantAppReads is how many App reads
-		// each path makes (the inbox's only when it reads the requirements).
+		// absent from it names no App. appReadErr fails every App read (a
+		// 5xx, say). wantAppReads is how many App reads each path makes (the
+		// inbox's only when it reads the requirements).
 		apps         map[string]int64
+		appReadErr   error
 		wantAppReads int
 		// needsHuman labels the PR review:needs-human; changesRequested has
 		// a reviewer request changes.
@@ -181,6 +183,8 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 			wantEligible: true,
 		},
 		{
+			// A read that ran out of time is a failed read, not a slug that
+			// names no App.
 			name:           "the App read runs under DecisionInboxResolveAppIDTimeout",
 			required:       []ports.RequiredCheck{build("coverage/patch", 254)},
 			head:           []ports.HeadCheck{appStatus("coverage/patch", "coverage", passed), run("build", 15368, passed)},
@@ -188,7 +192,57 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 			zeroAppTimeout: true,
 			ci:             ports.CIConclusionSuccess,
 			wantAppReads:   1,
-			wantReason:     `required check "coverage/patch" from the App the base branch names (App id 254) could not be confirmed at the current head (the App that posted its commit status could not be identified)`,
+			wantReason:     string(autoapproval.ReasonRequiredChecksUnknown),
+			wantDegraded:   true,
+		},
+		{
+			// A failed App read is a failed read of the requirements: never
+			// a considered "could not be confirmed", and the inbox is
+			// degraded because it decides the row.
+			name:         "a failed App read is a failed read of the requirements, and degrades the inbox",
+			required:     []ports.RequiredCheck{build("coverage/patch", 254)},
+			head:         []ports.HeadCheck{appStatus("coverage/patch", "coverage", passed), run("build", 15368, passed)},
+			appReadErr:   errors.New("apps: http 502"),
+			ci:           ports.CIConclusionSuccess,
+			wantAppReads: 1,
+			wantReason:   string(autoapproval.ReasonRequiredChecksUnknown),
+			wantDegraded: true,
+		},
+		{
+			// It stands in the merge path's probe as "requires nothing", so
+			// the live base read still runs and the lasting reason is the
+			// one given; in the inbox it does not decide the row.
+			name:          "a failed App read beside a confirmed base move refuses on the base move, undegraded",
+			required:      []ports.RequiredCheck{build("coverage/patch", 254)},
+			head:          []ports.HeadCheck{appStatus("coverage/patch", "coverage", passed), run("build", 15368, passed)},
+			appReadErr:    errors.New("apps: http 502"),
+			ci:            ports.CIConclusionSuccess,
+			baseRewritten: true,
+			wantAppReads:  1,
+			wantReason:    string(autoapproval.ReasonBaseMoved),
+		},
+		{
+			name:           "an App read that ran out of time beside a confirmed base move refuses on the base move",
+			required:       []ports.RequiredCheck{build("coverage/patch", 254)},
+			head:           []ports.HeadCheck{appStatus("coverage/patch", "coverage", passed), run("build", 15368, passed)},
+			apps:           map[string]int64{"coverage": 254},
+			zeroAppTimeout: true,
+			ci:             ports.CIConclusionSuccess,
+			baseRewritten:  true,
+			wantAppReads:   1,
+			wantReason:     string(autoapproval.ReasonBaseMoved),
+		},
+		{
+			// The control: a slug that names no App is an answer -- a
+			// lasting fact about the head, like any shortfall -- so the
+			// merge path's probe may name it ahead of the base move.
+			name:          "a slug that names no App beside a confirmed base move is a considered shortfall",
+			required:      []ports.RequiredCheck{build("coverage/patch", 254)},
+			head:          []ports.HeadCheck{appStatus("coverage/patch", "coverage", passed), run("build", 15368, passed)},
+			ci:            ports.CIConclusionSuccess,
+			baseRewritten: true,
+			wantAppReads:  1,
+			wantReason:    `(the App that posted its commit status could not be identified)`,
 		},
 		{
 			name:       "a person's commit status never satisfies a check tied to an App",
@@ -397,6 +451,7 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 			}
 			rs.sourceControl.requiredChecksErr = tc.readErr
 			rs.sourceControl.appIDsBySlug = tc.apps
+			rs.sourceControl.resolveAppIDErr = tc.appReadErr
 
 			deps := rs.deps
 			timeouts := platform.DefaultTimeouts()
@@ -523,7 +578,13 @@ func TestRequiredChecks_AcceptanceReadout(t *testing.T) {
 		baseRewritten bool
 		// oversizedDiff gives the pull request more changed files than the
 		// engine allows: only the acceptance waives that.
-		oversizedDiff    bool
+		oversizedDiff bool
+		// appStatusOnly gives the head a passing commit status from the
+		// "coverage" App's bot account, and the base a required check
+		// naming that App (254); appReadErr fails the App read.
+		appStatusOnly    bool
+		appReadErr       error
+		wantAppReads     int
 		wantReason       string
 		wantDegraded     bool
 		wantMergeOffered bool
@@ -554,6 +615,16 @@ func TestRequiredChecks_AcceptanceReadout(t *testing.T) {
 			readErr:       errors.New("rulesets: http 502"),
 			baseRewritten: true,
 			wantReason:    "this pull request no longer meets the auto-approval eligibility criteria, even with its accepted override applied",
+		},
+		{
+			// Read once for the load, although the row runs the engine
+			// twice (without and with its acceptance).
+			name:          "a failed App read that decides the row names the requirements as not read, and degrades the inbox",
+			appStatusOnly: true,
+			appReadErr:    errors.New("apps: http 502"),
+			wantAppReads:  1,
+			wantReason:    string(autoapproval.ReasonRequiredChecksUnknown),
+			wantDegraded:  true,
 		},
 	}
 
@@ -603,6 +674,14 @@ func TestRequiredChecks_AcceptanceReadout(t *testing.T) {
 			if tc.oversizedDiff {
 				pr.ChangedFilesCount = 100000
 			}
+			if tc.appStatusOnly {
+				pr.HeadChecks = []ports.HeadCheck{
+					{Name: "coverage/patch", Source: ports.HeadCheckSourceStatus, AppSlug: "coverage", Poster: ports.HeadCheckPosterApp, State: ports.HeadCheckStatePassed},
+					{Name: "build", Source: ports.HeadCheckSourceCheckRun, AppID: 15368, Poster: ports.HeadCheckPosterApp, State: ports.HeadCheckStatePassed},
+				}
+				rs.sourceControl.requiredChecksByBranch = map[string][]ports.RequiredCheck{pr.BaseRef: {{Name: "coverage/patch", AppID: 254}}}
+				rs.sourceControl.resolveAppIDErr = tc.appReadErr
+			}
 			rs.replaceTargetPR(actorGitHubID, pr)
 			rs.sourceControl.requiredChecksErr = tc.readErr
 			if tc.baseRewritten {
@@ -639,6 +718,9 @@ func TestRequiredChecks_AcceptanceReadout(t *testing.T) {
 			}
 			if item.MergeableIfRequiredChecksPass != tc.wantMergeOffered {
 				t.Errorf("MergeableIfRequiredChecksPass = %v, want %v", item.MergeableIfRequiredChecksPass, tc.wantMergeOffered)
+			}
+			if got := len(rs.sourceControl.resolveAppIDCalls); got != tc.wantAppReads {
+				t.Errorf("App reads in one load = %d, want %d", got, tc.wantAppReads)
 			}
 		})
 	}

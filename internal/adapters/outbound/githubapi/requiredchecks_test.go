@@ -3,12 +3,14 @@ package githubapi_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"reflect"
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/app/ports"
@@ -723,26 +725,29 @@ func TestGetOpenPR_ListsHeadChecks(t *testing.T) {
 }
 
 // TestResolveAppID proves ResolveAppID reads an App's id from GET
-// /apps/{app_slug} with the caller's token, keeps a successful answer (an
-// App's id never changes), and keeps no failure: a slug naming no App, a
-// failed read, an undecodable body and an answer with no id are errors,
-// and the next call reads again.
+// /apps/{app_slug} with the caller's token, keeps a successful answer
+// within its TTL (TestResolveAppID_KeepsAnAnswerForItsTTL covers expiry),
+// and keeps no failure. A slug naming no App is ports.ErrAppNotFound, an
+// answer; a failed read, an undecodable body and an answer with no id are
+// failed reads, never ErrAppNotFound. Each failure is read again.
 func TestResolveAppID(t *testing.T) {
 	t.Parallel()
 
 	tests := []struct {
-		name    string
-		answer  requiredChecksHandler
-		wantID  int64
-		wantErr bool
+		name         string
+		answer       requiredChecksHandler
+		wantID       int64
+		wantErr      bool
+		wantNotFound bool
 		// wantRequests is how many requests two calls make.
 		wantRequests int
 	}{
 		{name: "an App's id is read once and kept", answer: writeJSON(map[string]any{"id": 4242, "slug": "real-ci", "name": "Real CI"}), wantID: 4242, wantRequests: 1},
-		{name: "a slug naming no App is an error, and is read again", answer: writeStatus(http.StatusNotFound, `{"message":"Not Found"}`, nil), wantErr: true, wantRequests: 2},
-		{name: "a failed read is an error, and is read again", answer: writeStatus(http.StatusBadGateway, `{"message":"bad gateway"}`, nil), wantErr: true, wantRequests: 2},
-		{name: "an undecodable answer is an error", answer: writeStatus(http.StatusOK, `{"id":`, nil), wantErr: true, wantRequests: 2},
-		{name: "an answer with no id is an error", answer: writeJSON(map[string]any{"slug": "real-ci"}), wantErr: true, wantRequests: 2},
+		{name: "a slug naming no App is ErrAppNotFound, and is read again", answer: writeStatus(http.StatusNotFound, `{"message":"Not Found"}`, nil), wantErr: true, wantNotFound: true, wantRequests: 2},
+		{name: "a server error is a failed read, and is read again", answer: writeStatus(http.StatusBadGateway, `{"message":"bad gateway"}`, nil), wantErr: true, wantRequests: 2},
+		{name: "a rate-limited answer is a failed read", answer: writeStatus(http.StatusForbidden, `{"message":"API rate limit exceeded"}`, map[string]string{"X-RateLimit-Remaining": "0"}), wantErr: true, wantRequests: 2},
+		{name: "an undecodable answer is a failed read", answer: writeStatus(http.StatusOK, `{"id":`, nil), wantErr: true, wantRequests: 2},
+		{name: "an answer with no id is a failed read", answer: writeJSON(map[string]any{"slug": "real-ci"}), wantErr: true, wantRequests: 2},
 	}
 
 	for _, tc := range tests {
@@ -767,11 +772,14 @@ func TestResolveAppID(t *testing.T) {
 			}))
 			defer server.Close()
 
-			adapter := githubapi.New(server.Client(), server.URL)
+			adapter := githubapi.New(server.Client(), server.URL).WithAppIDCacheTTL(time.Hour)
 			for call := 1; call <= 2; call++ {
 				id, err := adapter.ResolveAppID(context.Background(), ports.ResolveAppIDSpec{Slug: "real-ci", Token: "tok"})
 				if (err != nil) != tc.wantErr || id != tc.wantID {
 					t.Errorf("call %d: ResolveAppID() = (%d, %v), want (%d, error %v)", call, id, err, tc.wantID, tc.wantErr)
+				}
+				if got := errors.Is(err, ports.ErrAppNotFound); got != tc.wantNotFound {
+					t.Errorf("call %d: errors.Is(err, ErrAppNotFound) = %v, want %v (err %v)", call, got, tc.wantNotFound, err)
 				}
 			}
 			mu.Lock()

@@ -409,6 +409,11 @@ func TestBuild_GitHubOutboundOnIngressOff(t *testing.T) {
 	if app.releaseManifestWorker == nil {
 		t.Error("App.releaseManifestWorker is nil with GitHub outbound on")
 	}
+	// The GitHub adapter keeps an App slug's id for the configured TTL, a
+	// bounded time (§21.2): never none, never for the process's lifetime.
+	if got := app.liveSourceControl.AppIDCacheTTL(); got != cfg.Timeouts.GitHubAppIDCacheTTL || got <= 0 {
+		t.Errorf("GitHub adapter App-id TTL = %v, want GitHubAppIDCacheTTL (%v)", got, cfg.Timeouts.GitHubAppIDCacheTTL)
+	}
 
 	rec := httptest.NewRecorder()
 	app.Router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhooks/github", nil))

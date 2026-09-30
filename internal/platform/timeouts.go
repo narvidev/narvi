@@ -2683,6 +2683,21 @@ type Timeouts struct {
 	// above, for the same reason.
 	DecisionInboxResolveAppIDTimeout time.Duration
 
+	// GitHubAppIDCacheTTL is how long the GitHub adapter keeps the id it
+	// read for an App's slug (ResolveAppID, §21.2's required checks). An
+	// App keeps its id, but a slug can pass to another App once freed (a
+	// rename or a deletion frees it), so an answer is kept for a bounded
+	// time: a slug that moved is read again within this TTL, and until then
+	// a running process still attributes that slug's commit statuses to
+	// the App that held it -- the residual window, bounded by this value
+	// and by GitHub's own enforcement of a check's source at merge for
+	// every merger the rule binds. Chosen as 10 minutes: an App is read at
+	// most once per slug per ten minutes by the inbox, the Merge click and
+	// the auto-merge worker together, and a moved slug is caught well
+	// inside an hour. Linked above AutoMergePumpInterval, so the worker's
+	// ticks do not each read again.
+	GitHubAppIDCacheTTL time.Duration
+
 	// GitHubMergePRTimeout bounds ONE MergePR call -- a single PUT, but to
 	// an endpoint GitHub's own docs note can itself take a moment to
 	// perform the merge server-side (unlike a plain metadata GET/POST);
@@ -4089,6 +4104,7 @@ func DefaultTimeouts() Timeouts {
 		DecisionInboxIsAncestorTimeout:       10 * time.Second,    // D3, second adversarial-review round; not specified, matches this file's own "lightweight GitHub REST GET" precedent
 		DecisionInboxRequiredChecksTimeout:   20 * time.Second,    // §21.2's required-checks amendment; not specified, two sequential lightweight GETs (the branch object, then the base's rulesets)
 		DecisionInboxResolveAppIDTimeout:     10 * time.Second,    // §21.2's required-checks amendment; not specified, one lightweight GET (GET /apps/{app_slug})
+		GitHubAppIDCacheTTL:                  10 * time.Minute,    // §21.2's required-checks amendment; not specified, bounds how long a moved App slug keeps its old id
 		GitHubMergePRTimeout:                 15 * time.Second,    // §16; not specified, half again GitHubGetPRTimeout's baseline (interactive, human-facing write)
 		DecisionInboxSCMCacheTTL:             2 * time.Minute,     // §16.2's own worked example ("as of 2 min ago")
 		DecisionInboxStaleAfter:              48 * time.Hour,      // §16.1, explicit ("stale items (>48h, configurable)")
@@ -4433,6 +4449,13 @@ func (t Timeouts) Validate() error {
 	mustBePositive("DecisionInboxResolveAppIDTimeout", t.DecisionInboxResolveAppIDTimeout)
 	check("GitHubListOpenPRsForUserTimeout > DecisionInboxResolveAppIDTimeout",
 		"GitHubListOpenPRsForUserTimeout", t.GitHubListOpenPRsForUserTimeout, "DecisionInboxResolveAppIDTimeout", t.DecisionInboxResolveAppIDTimeout)
+	// The id kept for an App's slug: a zero TTL would read every App on
+	// every load and tick, and one no longer than the auto-merge tick would
+	// read it again on every tick. See GitHubAppIDCacheTTL's own doc
+	// comment for the upper side, the residual window.
+	mustBePositive("GitHubAppIDCacheTTL", t.GitHubAppIDCacheTTL)
+	check("GitHubAppIDCacheTTL > AutoMergePumpInterval",
+		"GitHubAppIDCacheTTL", t.GitHubAppIDCacheTTL, "AutoMergePumpInterval", t.AutoMergePumpInterval)
 	mustBePositive("CircuitBreakerWindow", t.CircuitBreakerWindow)
 	mustBePositive("RepoAccessCheckBreakerWindow", t.RepoAccessCheckBreakerWindow)
 

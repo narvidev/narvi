@@ -406,6 +406,10 @@ func buildPRItems(ctx context.Context, deps Deps, actorGitHubID, token string, n
 	// comment for why this must never be shared
 	// across actors/requests the way deps.SCMCache itself is.
 	budget := newCodeOwnersBudget(maxCodeOwnerResolutionsPerBuild)
+	// appReads is this load's reads of the Apps behind commit statuses
+	// (requiredchecks.go): each slug read at most once, whatever the rows,
+	// and a failure logged once. Per load, like budget, never shared.
+	appReads := newAppIDReads()
 
 	items = make([]Item, 0, len(prs))
 	for _, pr := range prs {
@@ -466,7 +470,7 @@ func buildPRItems(ctx context.Context, deps Deps, actorGitHubID, token string, n
 			// above -- a per-row degrade still marks the whole batch.
 			degraded = true
 		}
-		item, itemDegraded := buildPROpenItem(ctx, deps, pr, repoFullName, actorGitHubID, token, now, budget)
+		item, itemDegraded := buildPROpenItem(ctx, deps, pr, repoFullName, actorGitHubID, token, now, budget, appReads)
 		if itemDegraded {
 			// E5, third adversarial-review round: buildPROpenItem's own
 			// computeRealEligibility call hit a live SCM lookup failure for
@@ -580,7 +584,7 @@ func acceptanceContextStillFresh(recordContext reviewverdict.Context, pr ports.O
 	return true
 }
 
-func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullName, actorGitHubID, token string, now time.Time, budget *codeOwnersBudget) (Item, bool) {
+func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullName, actorGitHubID, token string, now time.Time, budget *codeOwnersBudget, appReads *appIDReads) (Item, bool) {
 	var degraded bool
 	provenance := resolvePRProvenance(ctx, deps, pr, repoFullName, actorGitHubID, token, now, budget)
 
@@ -776,7 +780,7 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		item.Kind = decisioninbox.KindNeedsReview
 	default:
 		platformAuthored := isPlatformAuthored(ctx, deps, pr.HTMLURL)
-		eligibilityRes := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now, false)
+		eligibilityRes := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now, false, appReads)
 		// T1 (round 4, adversarial review): the ONLY call to
 		// recordContestedIfApplicable in this file -- see that function's
 		// own doc comment for why the SECOND, display-only
@@ -919,7 +923,7 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 				// constant) -- the SAME shared definition, never a third,
 				// independently-typed phrasing for the same fact
 				// (round-5 finding V3).
-				acceptanceEligibility := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now, true)
+				acceptanceEligibility := computeRealEligibility(ctx, deps, repoFullName, pr, ciGreen, hasNeedsHuman, token, now, true, appReads)
 				switch {
 				case acceptanceEligibility.RequiredChecksNotRead:
 					// GitHub outbound is off, and the inbox reads no base's
@@ -1024,7 +1028,7 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 // question a maintainer+'s own Merge click actually depends on, computed
 // by the SAME engine RevalidateForMerge itself re-checks at click time,
 // never a second, independently-derived approximation.
-func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string, pr ports.OpenPR, ciGreen, hasNeedsHuman bool, token string, now time.Time, accepted bool) eligibilityResult {
+func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string, pr ports.OpenPR, ciGreen, hasNeedsHuman bool, token string, now time.Time, accepted bool, appReads *appIDReads) eligibilityResult {
 	var degraded bool
 	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, repoFullName, int32(pr.Number))
 	if err != nil {
@@ -1182,10 +1186,13 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// names an App (SCMCache.ResolveAppID). Read only now
 	// that the probe has passed, like the base SHA below: this read model
 	// shows no refusal reason, so a pull request the probe already refused
-	// gains nothing from it. A failed read is the fact's zero value, which
-	// the final call below refuses on (ReasonRequiredChecksUnknown) --
-	// never "requires nothing" -- and marks the read degraded only when
-	// that refusal is what decides the row (requiredDegraded, below).
+	// gains nothing from it. A failed read -- of the requirements, or of
+	// an App they need (a slug that names no App is an answer, not a
+	// failure) -- is the fact's zero value, which the final call below
+	// refuses on (ReasonRequiredChecksUnknown) -- never "requires nothing"
+	// nor a considered shortfall -- and marks the read degraded only when
+	// that refusal is what decides the row (requiredDegraded, below). Each
+	// App is read once per load (appReads).
 	//
 	// With GitHub outbound off (deps.GitHubOutbound nil) there is no bot
 	// to read with, and nothing is read: the fact stays at its zero value,
@@ -1199,13 +1206,15 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	if !outboundOff {
 		botToken := deps.GitHubOutbound.BotToken()
 		required, requiredErr := deps.SCMCache.ListRequiredChecks(ctx, requiredChecksSpec(pr, botToken), now)
-		requiredChecks = requiredChecksFact(ctx, required, requiredErr, pr, func(ctx context.Context, slug string) (int64, error) {
-			return deps.SCMCache.ResolveAppID(ctx, ports.ResolveAppIDSpec{Slug: slug, Token: botToken})
-		})
-		requiredChecksUnread = requiredErr != nil
-		if requiredChecksUnread {
+		if requiredErr != nil {
 			platform.Logger(ctx).Warn("decisioninbox: read base branch's required checks failed, eligibility will fail closed via ReasonRequiredChecksUnknown", "error", requiredErr, "repo", repoFullName, "pr_number", pr.Number, "base_ref", pr.BaseRef)
 		}
+		// An App read that fails is logged once per load, by appReads.
+		var factErr error
+		requiredChecks, factErr = requiredChecksFact(ctx, required, requiredErr, pr, appReads.through(func(ctx context.Context, slug string) (int64, error) {
+			return deps.SCMCache.ResolveAppID(ctx, ports.ResolveAppIDSpec{Slug: slug, Token: botToken})
+		}))
+		requiredChecksUnread = factErr != nil
 	}
 
 	// A genuine correctness bug: computed ONCE, ignoring BOTH human-disagreement signals --

@@ -2,6 +2,7 @@ package ports
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"time"
@@ -1254,15 +1255,22 @@ type SourceControl interface {
 	// ResolveAppID reports the id of the App whose slug is spec.Slug -- the
 	// App behind a commit status its bot account ("<slug>[bot]") posted,
 	// when no check run of that App at the head carries the id
-	// (HeadCheck.AppSlug). An App's id never changes, so an implementation
-	// may keep a successful answer for as long as it lives; it never keeps
-	// a failure. A slug that names no App, and every other failure, is an
-	// error -- never a zero id -- and the caller then reads that App as
-	// unidentified, which never lets its status count for a check that
-	// names an App. Errors are plain, like every other method on this port
-	// except MergePR.
+	// (HeadCheck.AppSlug). An App keeps its id, but a slug can pass to
+	// another App once freed (a rename or a deletion), so an
+	// implementation may keep a successful answer only for a bounded time,
+	// and never keeps a failure. The answer is never a zero id: a slug
+	// that names no App is ErrAppNotFound (wrapped; match with errors.Is),
+	// a considered answer the caller reads as an App it cannot identify,
+	// whose status never counts for a check that names an App; every other
+	// failure is a failed read, which the caller must not read that way.
+	// Errors are plain, like every other method on this port except
+	// MergePR.
 	ResolveAppID(ctx context.Context, spec ResolveAppIDSpec) (int64, error)
 }
+
+// ErrAppNotFound is ResolveAppID's answer for a slug that names no App on
+// the code host: an answer, not a failed read.
+var ErrAppNotFound = errors.New("sourcecontrol: no App has this slug")
 
 // ResolveAppIDSpec is ResolveAppID's input: the App's slug, and the
 // credential the read that needs it uses (ListRequiredChecksSpec.Token).

@@ -476,12 +476,18 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// (probeRequiredChecks), so it refuses only in the final call, on
 	// ReasonRequiredChecksUnknown, once every other criterion has passed:
 	// a transient failure never masks a pull request's lasting reason (G3,
-	// fourth round), and never falls back to the CI read alone.
+	// fourth round), and never falls back to the CI read alone. The same
+	// holds for a failed read of an App the requirements need (the App
+	// behind a commit status; a slug that names no App is an answer, not a
+	// failure): it makes the fact "could not be read", never a considered
+	// shortfall that would refuse in the probe ahead of the live base read.
+	// Each App is read once per call, or per tick for the worker (memo),
+	// and a failure is logged there.
 	required, requiredErr := readRequiredChecksLive(ctx, deps, sourceControl, memo, requiredChecksSpec(target, token))
 	if requiredErr != nil {
 		platform.Logger(ctx).Warn("decisioninbox: read base branch's required checks failed -- eligibility will fail closed via ReasonRequiredChecksUnknown unless another criterion refuses first", "error", requiredErr, "repo_full_name", repoFullName, "pr_number", prNumber, "base_ref", target.BaseRef)
 	}
-	requiredChecks := requiredChecksFact(ctx, required, requiredErr, target, liveAppIDResolver(deps, sourceControl, token))
+	requiredChecks, _ := requiredChecksFact(ctx, required, requiredErr, target, memo.appReads().through(liveAppIDResolver(deps, sourceControl, token)))
 
 	// probe (G3/G4, fourth adversarial-review round) asks "setting the
 	// base-freshness question aside entirely, is this PR already

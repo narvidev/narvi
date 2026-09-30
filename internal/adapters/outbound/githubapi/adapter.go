@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/contractdrift"
@@ -62,10 +63,13 @@ type Adapter struct {
 	httpClient *http.Client
 	apiBaseURL string
 
-	// appIDs is ResolveAppID's answers, by slug, for as long as the
-	// adapter lives (appid.go). Guarded by appIDsMu.
+	// appIDs is ResolveAppID's kept answers, by slug, each until it
+	// expires, appIDTTL after it was read (appid.go, WithAppIDCacheTTL).
+	// Guarded by appIDsMu. now is the cache's clock; nil is time.Now.
 	appIDsMu sync.Mutex
-	appIDs   map[string]int64
+	appIDs   map[string]appIDEntry
+	appIDTTL time.Duration
+	now      func() time.Time
 }
 
 // var _ ports.SourceControl = (*Adapter)(nil) makes a SourceControl

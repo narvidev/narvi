@@ -232,9 +232,11 @@ type fakeDecisionInboxSourceControl struct {
 	requiredChecksErr      error
 	requiredChecksCalls    []ports.ListRequiredChecksSpec
 
-	// appIDsBySlug/resolveAppIDCalls back ResolveAppID below: a slug absent
-	// from the map names no App, and resolving it fails.
+	// appIDsBySlug/resolveAppIDErr/resolveAppIDCalls back ResolveAppID
+	// below: a slug absent from the map names no App (ErrAppNotFound), and
+	// resolveAppIDErr, when set, fails every read.
 	appIDsBySlug      map[string]int64
+	resolveAppIDErr   error
 	resolveAppIDCalls []ports.ResolveAppIDSpec
 }
 
@@ -261,16 +263,20 @@ func (f *fakeDecisionInboxSourceControl) ListRequiredChecks(ctx context.Context,
 	return f.requiredChecksByBranch[spec.Branch], nil
 }
 
-// ResolveAppID reports appIDsBySlug[spec.Slug], failing for a slug absent
-// from it, recording the call. Honors ctx first, like ListRequiredChecks.
+// ResolveAppID reports appIDsBySlug[spec.Slug] -- ErrAppNotFound for a
+// slug absent from it -- or resolveAppIDErr, recording the call. Honors ctx
+// first, like ListRequiredChecks.
 func (f *fakeDecisionInboxSourceControl) ResolveAppID(ctx context.Context, spec ports.ResolveAppIDSpec) (int64, error) {
 	f.resolveAppIDCalls = append(f.resolveAppIDCalls, spec)
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	if f.resolveAppIDErr != nil {
+		return 0, f.resolveAppIDErr
+	}
 	id, ok := f.appIDsBySlug[spec.Slug]
 	if !ok {
-		return 0, errors.New("fakeDecisionInboxSourceControl: no App has slug " + spec.Slug)
+		return 0, fmt.Errorf("fakeDecisionInboxSourceControl: slug %s: %w", spec.Slug, ports.ErrAppNotFound)
 	}
 	return id, nil
 }

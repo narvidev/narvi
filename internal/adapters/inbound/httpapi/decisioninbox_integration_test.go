@@ -231,7 +231,7 @@ func (f *fakeMergeSourceControl) ListRequiredChecks(_ context.Context, spec port
 // ResolveAppID names no App: no test here gives a commit status an App
 // posted without its id.
 func (f *fakeMergeSourceControl) ResolveAppID(_ context.Context, spec ports.ResolveAppIDSpec) (int64, error) {
-	return 0, errors.New("fakeMergeSourceControl: no App has slug " + spec.Slug)
+	return 0, fmt.Errorf("fakeMergeSourceControl: slug %s: %w", spec.Slug, ports.ErrAppNotFound)
 }
 
 func (f *fakeMergeSourceControl) ListOpenPRsForUser(context.Context, ports.ListOpenPRsForUserSpec) ([]ports.OpenPR, bool, error) {
