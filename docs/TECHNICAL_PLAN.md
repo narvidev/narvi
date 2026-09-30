@@ -1619,6 +1619,10 @@ Pure, no I/O, same discipline as every other `/internal/domain` package (CLAUDE.
 - `NextStep(...)` — one pure decision function, the same shape as `turn.Transition`/
   `plan.Transition`/`sandbox.Transition` (`internal/domain/turn/state.go:167`,
   `internal/domain/plan/plan.go:118`, `internal/domain/sandbox/state.go:375`).
+- `NextStepAfterRefusal(...)` — the same machine's row for an attempt the platform refused before
+  it ran (§29.4's personal-link refusal): not a `StepOutcomeStatus` the step reported, so no edge
+  conditions on it, and it always escalates. Following a retry edge there would only queue the
+  same refused step again.
 
 Why the three built-in workflows are rows, not Go constants: the "duplicate and customize"
 requirement and the canvas editor both need the default to exist in exactly the same shape as a
@@ -3526,6 +3530,39 @@ representable but deliberately has no creating endpoint — one less path to rea
 §45.1: accounts a user connects get an endpoint, and are stored where this resolution never reads
 them; and a review session never resolves the `user` scope, row 205.)
 
+**Which sessions read the `user` scope at all is one rule** (`providercredential.UserScopeTarget`),
+and every reader of this resolution goes through it (`internal/app/credentialscope`): the sandbox's
+credential delivery, the counter-reviewer's choice of an opposing model (§26.4), and the dispatch
+gate below. A session reads its creator's `user`-scope rows only when a person created it and runs
+it themselves. A session with no creator, a pull request's review session (a `github_pr_sessions`
+row, read from that table on every resolution, never from a flag on the session) and a child session
+never do, whatever their `created_by`, and keep the deployment's credentials: a review session's
+creator is merely the first linked person who triggered it, so its link would carry every later
+review of that pull request, the automatic lane's and other maintainers' included, and send the
+diff to that one person's seat (§45.1); a child is started by the platform, not run by a person,
+and §45.1 already keeps every selection from passing to a child. The counter-reviewer therefore
+picks its opposing model among the deployment's credentials only, and with none opposing pins
+nothing, as it always has. A turn whose model only a withheld link could run — its provider has no
+credential this session resolves, and its creator's link carries it — is refused before anything
+is spawned or sent for it: it fails `never_started` (the existing reason for a turn given up on
+before it started); its terminal reason and a session warning open with `personal_link_only` and
+name the model and the provider; a review attempt's `narvi/review` check closes as not completed
+and says the same; and a workflow run the turn belongs to escalates to `needs_review` with a notice
+naming the refusal, through the machine's own refusal row (`workflow.NextStepAfterRefusal`), never
+following an edge — a retry edge would queue the same refused step again. Each dispatch round
+refuses only turns already pending when it began. It never runs on the link, and never on another
+model in its place. Only the creator's link is consulted: a model whose provider no credential this
+session resolves serves, and no link of the creator's carries — another member's link does not
+count — is dispatched as before and fails inside the agent runtime, unnamed and on nobody's link. A
+turn that names no model is left to the agent runtime's default, chosen among the credentials the
+sandbox holds: before OpenCode starts, on every boot, fresh or restored, the sandbox agent removes
+OpenCode's persisted auth store (`auth.json`), so only credentials delivered on that boot exist.
+It is not also removed when a snapshot is minted: the running OpenCode keeps reading it, and the
+next boot removes it anyway. A sandbox whose sandbox agent predates this rule — one still running,
+or restored from a snapshot that brings its older agent back with its filesystem — keeps the store
+it was served, a review requester's link included, until that access token expires (no refresh
+token ever reaches a sandbox, §29.6).
+
 ### 29.5 Refresh: the control plane is the single refresher, pump-only
 
 OpenAI's rotation + reuse-detection (§29.2) plus its own single-holder guidance dictate the shape:
@@ -3689,9 +3726,10 @@ Data-model threading, mirroring `model_id`'s own established pair (the same prec
    design. An org that wants pooled OpenAI usage configures a static `OPENAI_API_KEY` at
    org scopes (Step 53, unchanged).
 4. **Multiplayer quota attribution**: participant prompts in a creator's session consume the
-   creator's seat (§29.4). Accepted v1; the designed-but-unbuilt extension is per-turn
-   re-injection (`PUT /auth` is callable between turns) keyed on the prompting user, if telemetry
-   shows it biting.
+   creator's seat (§29.4), a sharing its creator chose by opening the session. A pull request's
+   review session has no such creator and never resolves a link at all (§29.4). Accepted v1; the
+   designed-but-unbuilt extension is per-turn re-injection (`PUT /auth` is callable between
+   turns) keyed on the prompting user, if telemetry shows it biting.
 5. **Subscription turns are mis-costed, but not by the mechanism first assumed.** The original
    claim here — that the Codex models' catalog cost object is all zeros — was **disproved during
    Step 59** by querying `GET /provider` directly against the pinned OpenCode 1.17.15 binary: every
@@ -9608,8 +9646,9 @@ the user scope heads the resolution order (`scopePriority`, `internal/domain/pro
 and is resolved from the session's creator, so a linked personal credential already takes precedence
 over every deployment key for all of its owner's sessions; for a pull request's review session,
 whose creator is merely the first linked person who triggered it, that is a defect of its own, fixed
-by row 205. New accounts, subscription or API key, do not join that resolution: connecting one
-changes nothing until its owner selects it for a session they create and run themselves; a review
+by row 205: such a session never resolves the user scope, and a review whose model only a personal
+link provides is refused with that reason named (§29.4). New accounts, subscription or API key, do
+not join that resolution: connecting one changes nothing until its owner selects it for a session they create and run themselves; a review
 session, an automation's session, a session someone else created and any child session never use
 it, since a selection never passes to a child, and their turns keep the deployment's credentials. Automations run on triggers other people cause
 and can be edited by any maintainer, so they use deployment accounts, which an admin manages. §29's

@@ -515,7 +515,7 @@ func (a *Actor) handleTurnDeadlineTimer(ctx context.Context) error {
 		// as the state change" rule, identical to how completeProcessingTurn
 		// enqueues inside handleSandboxEvent's own transact. sessionRow is
 		// the SAME row already fetched above.
-		if err := a.enqueueOutboxNotification(ctx, tx, sessionRow, turn.TriggerTimeout, failureReason, processing, nil); err != nil {
+		if err := a.enqueueOutboxNotification(ctx, tx, sessionRow, turn.TriggerTimeout, failureReason, processing, nil, ""); err != nil {
 			return err
 		}
 

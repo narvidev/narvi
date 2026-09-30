@@ -38,7 +38,7 @@ import (
 // claim path -- but defended rather than assumed, mirroring
 // outboxenqueue.go's own identical defensive convention for the
 // Slack/Linear reverse lookups).
-func (a *Actor) enqueueReviewCheck(ctx context.Context, tx pgx.Tx, turn sqlcgen.Turn, phase reviewcheck.Phase, logPrefix string) error {
+func (a *Actor) enqueueReviewCheck(ctx context.Context, tx pgx.Tx, turn sqlcgen.Turn, phase reviewcheck.Phase, reason reviewcheck.NotAssessedReason, logPrefix string) error {
 	if turn.ReviewHeadSha == nil || *turn.ReviewHeadSha == "" {
 		a.logger.Warn("sessionactor: "+logPrefix+": turn has no review head sha on record, skipping", "turn_id", turn.ID.String())
 		return nil
@@ -69,12 +69,13 @@ func (a *Actor) enqueueReviewCheck(ctx context.Context, tx pgx.Tx, turn sqlcgen.
 
 	payload, err := json.Marshal(ports.ReviewCheckPayload{
 		Owner: owner, Repo: repo, PRNumber: int(prSession.PrNumber), HeadSHA: *turn.ReviewHeadSha,
-		AttemptID:        turn.ID.String(),
-		AttemptCreatedAt: turn.CreatedAt.Time,
-		Phase:            string(phase),
-		BaseRef:          verdictContext.BaseRef,
-		BaseSHA:          verdictContext.BaseSHA,
-		PolicyVersion:    verdictContext.PolicyVersion,
+		AttemptID:         turn.ID.String(),
+		AttemptCreatedAt:  turn.CreatedAt.Time,
+		Phase:             string(phase),
+		BaseRef:           verdictContext.BaseRef,
+		BaseSHA:           verdictContext.BaseSHA,
+		PolicyVersion:     verdictContext.PolicyVersion,
+		NotAssessedReason: string(reason),
 	})
 	if err != nil {
 		return fmt.Errorf("sessionactor: %s: marshal payload: %w", logPrefix, err)
@@ -96,7 +97,7 @@ func (a *Actor) enqueueReviewCheck(ctx context.Context, tx pgx.Tx, turn sqlcgen.
 // gate), right after turn transitions Pending -> Dispatched -> Processing
 // in that SAME transaction.
 func (a *Actor) enqueueReviewCheckRunning(ctx context.Context, tx pgx.Tx, turn sqlcgen.Turn) error {
-	return a.enqueueReviewCheck(ctx, tx, turn, reviewcheck.PhaseRunning, "enqueue review-check running")
+	return a.enqueueReviewCheck(ctx, tx, turn, reviewcheck.PhaseRunning, "", "enqueue review-check running")
 }
 
 // enqueueReviewCheckNotAssessed is outboxenqueue.go's own github-branch
@@ -112,8 +113,10 @@ func (a *Actor) enqueueReviewCheckRunning(ctx context.Context, tx pgx.Tx, turn s
 // (httpapi.PostReviewVerdict, same transaction as that verdict's own
 // review_verdicts insert), and publishing NotAssessed on top of it here
 // would be racing an accurate result with an inaccurate one for the
-// exact same attempt.
-func (a *Actor) enqueueReviewCheckNotAssessed(ctx context.Context, tx pgx.Tx, processing sqlcgen.Turn) error {
+// exact same attempt. reason is why the attempt ended, when this actor
+// refused it itself (refusePersonalLinkOnly, credentialgate.go); empty
+// for every attempt that ran.
+func (a *Actor) enqueueReviewCheckNotAssessed(ctx context.Context, tx pgx.Tx, processing sqlcgen.Turn, reason reviewcheck.NotAssessedReason) error {
 	assessed, err := a.stores.reviewVerdict.WithTx(tx).ExistsForAttempt(ctx, processing.ID)
 	if err != nil {
 		return fmt.Errorf("sessionactor: enqueue review-check not-assessed: check existing verdict: %w", err)
@@ -121,5 +124,5 @@ func (a *Actor) enqueueReviewCheckNotAssessed(ctx context.Context, tx pgx.Tx, pr
 	if assessed {
 		return nil
 	}
-	return a.enqueueReviewCheck(ctx, tx, processing, reviewcheck.PhaseTerminalNotAssessed, "enqueue review-check not-assessed")
+	return a.enqueueReviewCheck(ctx, tx, processing, reviewcheck.PhaseTerminalNotAssessed, reason, "enqueue review-check not-assessed")
 }

@@ -1275,7 +1275,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// comment) -- another sandbox-bearer-token-authenticated route, not a
 	// browser-facing one.
 	router.Post("/sessions/{sessionID}/provider-credentials",
-		httpapi.ProviderCredentialsDelivery(sessionStore, sandboxStore, providerCredentialStore, cfg.TokenEncryptionKey))
+		httpapi.ProviderCredentialsDelivery(sessionStore, sandboxStore, githubPRSessionStore, providerCredentialStore, cfg.TokenEncryptionKey))
 
 	// sandbox-secrets / opencode-config ("sandbox secrets &
 	// opencode config", §27.1/§27.2): deliberately mounted OUTSIDE
