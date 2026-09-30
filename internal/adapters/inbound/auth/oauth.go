@@ -23,7 +23,7 @@ const oauthCallbackPath = "/auth/github/callback"
 //     incrementally add scopes to an already-issued token without the
 //     user re-authorizing, and §8.11/§13.1's own stated purpose for
 //     storing this token at all is §9.3's future PR-creation need
-//     ("PR created with the prompting user's OAuth token") -- requesting
+//     (the PR created with the session creator's OAuth token) -- requesting
 //     it now avoids forcing every already-signed-up user through a
 //     second re-authorization later just to grant a scope that was
 //     always the point of storing their token in the first place.
