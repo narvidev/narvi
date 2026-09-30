@@ -19,6 +19,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 )
 
@@ -34,6 +35,9 @@ type requiredChecksGitHub struct {
 
 	statuses  []map[string]any
 	checkRuns []map[string]any
+	// creators answers the per-ref statuses listing: who posted the
+	// status of each context (a map of "login" and "type").
+	creators map[string]map[string]any
 	// branch answers GET /branches/main; rules answers GET
 	// /rules/branches/main (status and body).
 	branch      map[string]any
@@ -82,6 +86,13 @@ func (g *requiredChecksGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request)
 			state = "pending"
 		}
 		encode(map[string]any{"state": state, "total_count": len(g.statuses), "statuses": g.statuses})
+	case r.Method == http.MethodGet && r.URL.Path == prefix+"/commits/"+g.head+"/statuses":
+		listing := []map[string]any{}
+		for _, st := range g.statuses {
+			context := st["context"].(string)
+			listing = append(listing, map[string]any{"context": context, "state": st["state"], "creator": g.creators[context]})
+		}
+		encode(listing)
 	case r.Method == http.MethodGet && r.URL.Path == prefix+"/commits/"+g.head+"/check-runs":
 		encode(map[string]any{"total_count": len(g.checkRuns), "check_runs": g.checkRuns})
 	case r.Method == http.MethodGet && r.URL.Path == prefix+"/commits/"+testEligibleBaseRef:
@@ -127,6 +138,12 @@ func checkRunJSON(name string, appID int64, conclusion any) map[string]any {
 	return map[string]any{"name": name, "conclusion": conclusion, "app": map[string]any{"id": appID}}
 }
 
+// actionsRunJSON is a check run from GitHub Actions, whose App slug names
+// the github-actions[bot] account that posts a workflow's statuses.
+func actionsRunJSON(name string, conclusion any) map[string]any {
+	return map[string]any{"name": name, "conclusion": conclusion, "app": map[string]any{"id": 15368, "slug": "github-actions"}}
+}
+
 // TestPumpOnce_RequiredChecks_EndToEnd runs §21.2's "CI green means the
 // required checks, not the checks that reported" through the unattended
 // merge path end to end: the auto-merge worker on real Postgres, the real
@@ -142,6 +159,7 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 	tests := []struct {
 		name        string
 		statuses    []map[string]any
+		creators    map[string]map[string]any
 		checkRuns   []map[string]any
 		branch      map[string]any
 		rulesStatus int
@@ -200,6 +218,42 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 			wantMerged: true,
 		},
 		{
+			name:        "a check tied to an App merges on that App's own commit status, its id not verifiable",
+			statuses:    []map[string]any{{"context": "codecov/patch", "state": "success"}},
+			creators:    map[string]map[string]any{"codecov/patch": {"login": "codecov[bot]", "type": "Bot"}},
+			checkRuns:   []map[string]any{actionsRunJSON("build", "success")},
+			branch:      protection(map[string]any{"context": "codecov/patch", "app_id": 254}),
+			rulesStatus: http.StatusOK, rulesBody: rulesJSON(),
+			wantMerged: true,
+		},
+		{
+			name:        "a check tied to GitHub Actions merges on its workflow's status, the App verified by its check run",
+			statuses:    []map[string]any{{"context": "deploy/preview", "state": "success"}},
+			creators:    map[string]map[string]any{"deploy/preview": {"login": "github-actions[bot]", "type": "Bot"}},
+			checkRuns:   []map[string]any{actionsRunJSON("build", "success")},
+			branch:      protection(map[string]any{"context": "deploy/preview", "app_id": 15368}),
+			rulesStatus: http.StatusOK, rulesBody: rulesJSON(),
+			wantMerged: true,
+		},
+		{
+			name:        "a check tied to an App never merges on a status a person posted",
+			statuses:    []map[string]any{{"context": "codecov/patch", "state": "success"}},
+			creators:    map[string]map[string]any{"codecov/patch": {"login": "octocat", "type": "User"}},
+			checkRuns:   []map[string]any{actionsRunJSON("build", "success")},
+			branch:      protection(map[string]any{"context": "codecov/patch", "app_id": 254}),
+			rulesStatus: http.StatusOK, rulesBody: rulesJSON(),
+			wantReason: `required check \"codecov/patch\" from the App the base branch names (App id 254) has not reported at the current head; a report of that name came from another source`,
+		},
+		{
+			name:        "a check tied to an App never merges on a status another verified App posted",
+			statuses:    []map[string]any{{"context": "codecov/patch", "state": "success"}},
+			creators:    map[string]map[string]any{"codecov/patch": {"login": "github-actions[bot]", "type": "Bot"}},
+			checkRuns:   []map[string]any{actionsRunJSON("build", "success")},
+			branch:      protection(map[string]any{"context": "codecov/patch", "app_id": 254}),
+			rulesStatus: http.StatusOK, rulesBody: rulesJSON(),
+			wantReason: `required check \"codecov/patch\" from the App the base branch names (App id 254) has not reported at the current head`,
+		},
+		{
 			name:        "any other failed read of the requirements never merges",
 			checkRuns:   []map[string]any{checkRunJSON("build", 1, "success")},
 			branch:      protection(),
@@ -221,7 +275,7 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 
 			github := &requiredChecksGitHub{
 				repo: repo, number: int(n), head: head,
-				statuses: tc.statuses, checkRuns: tc.checkRuns,
+				statuses: tc.statuses, creators: tc.creators, checkRuns: tc.checkRuns,
 				branch: tc.branch, rulesStatus: tc.rulesStatus, rulesBody: tc.rulesBody,
 			}
 			server := httptest.NewServer(github)
@@ -267,5 +321,56 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 				t.Errorf("auto-approval outcomes recorded = %d, want %d", total, wantTotal)
 			}
 		})
+	}
+}
+
+// TestPumpOnce_RequiredChecks_ReadOncePerBasePerTick pins the auto-merge
+// worker's cost (§21.2): every candidate into the same base shares one
+// read of that base's requirements per tick -- the refused ones included
+// -- and the next tick reads again, never a stale answer for longer.
+func TestPumpOnce_RequiredChecks_ReadOncePerBasePerTick(t *testing.T) {
+	rig := newAutomergeTestRig(t)
+	ctx := context.Background()
+	const repoFullName = "acme/required-checks-per-tick"
+
+	prs := map[string]ports.OpenPR{}
+	for n := int32(1); n <= 3; n++ {
+		htmlURL := rig.seedEligiblePR(ctx, t, repoFullName, n, "sha-verdict-"+strconv.Itoa(int(n)))
+		// A head that moved since the verdict: each candidate is refused
+		// (stale verdict), after the requirements were read.
+		prs[repoFullName+"#"+strconv.Itoa(int(n))] = ports.OpenPR{
+			Owner: "acme", Repo: "required-checks-per-tick", Number: int(n), HTMLURL: htmlURL,
+			HeadSHA: "sha-moved-" + strconv.Itoa(int(n)), BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+			CIConclusion: ports.CIConclusionSuccess,
+		}
+	}
+	if _, err := rig.repoSettings.UpsertAutoMergeToggle(ctx, repoFullName, true); err != nil {
+		t.Fatalf("arm auto-merge: %v", err)
+	}
+	sc := &fakeAutoMergeSourceControl{
+		prsByKey:               prs,
+		requiredChecksByBranch: map[string][]ports.RequiredCheck{testEligibleBaseRef: {{Name: "build"}}},
+	}
+	worker := rig.newWorker(t, sc)
+
+	for tick := 1; tick <= 2; tick++ {
+		if err := worker.PumpOnce(ctx, time.Now()); err != nil {
+			t.Fatalf("tick %d: PumpOnce() error = %v", tick, err)
+		}
+		sc.mu.Lock()
+		reads := len(sc.requiredChecksCalls)
+		calls := append([]ports.ListRequiredChecksSpec(nil), sc.requiredChecksCalls...)
+		sc.mu.Unlock()
+		if reads != tick {
+			t.Errorf("after tick %d: %d reads of the base's requirements, want %d (one per base per tick, for three candidates)", tick, reads, tick)
+		}
+		for _, c := range calls {
+			if c.Token != "bot-token" || c.Branch != testEligibleBaseRef {
+				t.Errorf("read %+v, want the bot token on %s", c, testEligibleBaseRef)
+			}
+		}
+	}
+	if got := sc.mergeCallCount(); got != 0 {
+		t.Errorf("MergePR calls = %d, want 0 (every candidate's verdict is stale)", got)
 	}
 }

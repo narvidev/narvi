@@ -4610,6 +4610,16 @@ type ListDecisionInboxResponse struct {
 	// this order as-is, never re-sorts.
 	Items []DecisionInboxItem `json:"items" yaml:"items" mapstructure:"items"`
 
+	// True when this deployment's GitHub outbound is off (NARVI_OUTBOUND_ENABLED
+	// declares no github): the inbox then reads no base branch's required checks
+	// (technical plan §21.2), so no pull request is shown as ready_to_merge, and a
+	// row carrying an acceptance names this as what blocks it. A configuration,
+	// stable across loads -- never a failure to retry, and never reported through
+	// scmFetchFailed. A client should say so in its own words, distinct from the
+	// 'temporarily unable to load' state. The Merge endpoint is not affected: it
+	// reads the requirements with the acting person's own GitHub credential.
+	RequiredChecksNotRead bool `json:"requiredChecksNotRead" yaml:"requiredChecksNotRead" mapstructure:"requiredChecksNotRead"`
+
 	// When the PR-derived rows (ready_to_merge/needs_review) were actually fetched
 	// from GitHub (§16.2: 'the response carries its as-of timestamp... never
 	// presented as live truth') -- null iff the caller has no linked GitHub identity,
@@ -4668,6 +4678,9 @@ func (j *ListDecisionInboxResponse) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["items"]; raw != nil && !ok {
 		return fmt.Errorf("field items in ListDecisionInboxResponse: required")
+	}
+	if _, ok := raw["requiredChecksNotRead"]; raw != nil && !ok {
+		return fmt.Errorf("field requiredChecksNotRead in ListDecisionInboxResponse: required")
 	}
 	if _, ok := raw["scmAsOf"]; raw != nil && !ok {
 		return fmt.Errorf("field scmAsOf in ListDecisionInboxResponse: required")

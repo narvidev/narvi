@@ -1,7 +1,8 @@
 package decisioninbox
 
 import (
-	"errors"
+	"context"
+	"sync"
 
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
@@ -13,28 +14,75 @@ import (
 // RequiredChecks. Both of this package's eligibility call sites -- the
 // read model (computeRealEligibility, aggregate.go) and the merge path
 // (revalidateCore, revalidate.go, which the auto-merge worker shares) --
-// read the requirements as the bot and build the fact here, from the same
-// ports.OpenPR the CI read came from, so the inbox, a person's Merge click
-// and the worker decide on the same requirements through the same engine.
+// build the fact here, from the same ports.OpenPR the CI read came from,
+// and decide through the same engine.
 //
-// They differ only in WHEN they read, for a reason each states at its call
+// Which credential reads the requirements follows who acts:
+//   - the merge path reads them with the credential that makes the merge:
+//     the person's own token on a Merge click, the bot's on the auto-merge
+//     worker. A person's Merge click therefore does not depend on GitHub
+//     outbound, exactly as the merge it makes does not.
+//   - the read model, which merges nothing, reads them as the bot
+//     (Deps.GitHubOutbound), one cached answer per base branch for every
+//     actor. With GitHub outbound off it reads nothing, and says so: its
+//     rows are not ready to merge, the inbox is not degraded, and
+//     Result.RequiredChecksNotRead is set -- a configuration, not a
+//     failure to retry.
+//
+// They also differ in WHEN they read, for a reason each states at its call
 // site: the merge path reads before its probe, so a required check that is
 // still running or failed is named in the refusal it returns; the read
 // model shows no reason, and reads only once its probe has passed, like
-// its other live reads.
+// its other live reads. The auto-merge worker reads each base once per
+// tick (RequiredChecksMemo).
 
-// errNoBotCredential is the failed read of a deployment with GitHub
-// outbound off (Deps.GitHubOutbound nil): there is no credential to read
-// the requirements with.
-var errNoBotCredential = errors.New("no bot credential to read the base branch's required checks with: GitHub outbound is off")
+// requiredChecksSpec is the read of pr's base branch's requirements with
+// token.
+func requiredChecksSpec(pr ports.OpenPR, token string) ports.ListRequiredChecksSpec {
+	return ports.ListRequiredChecksSpec{Owner: pr.Owner, Repo: pr.Repo, Branch: pr.BaseRef, Token: token}
+}
 
-// requiredChecksSpec is the read of pr's base branch's requirements as the
-// bot, or errNoBotCredential.
-func requiredChecksSpec(deps Deps, pr ports.OpenPR) (ports.ListRequiredChecksSpec, error) {
-	if deps.GitHubOutbound == nil {
-		return ports.ListRequiredChecksSpec{}, errNoBotCredential
+// RequiredChecksMemo holds one auto-merge tick's reads of base branches'
+// requirements, so candidates into the same base share one read instead
+// of repeating it per candidate: the auto-merge worker creates one per
+// tick and hands it to RevalidateForAutoMerge. A failed read is kept too,
+// for the rest of the tick, and the next tick reads again. A person's
+// Merge click never uses one: it reads live, every time. Safe for
+// concurrent use.
+type RequiredChecksMemo struct {
+	mu      sync.Mutex
+	entries map[requiredChecksCacheKey]requiredChecksMemoEntry
+}
+
+type requiredChecksMemoEntry struct {
+	required []ports.RequiredCheck
+	err      error
+}
+
+// NewRequiredChecksMemo returns an empty memo, for one tick.
+func NewRequiredChecksMemo() *RequiredChecksMemo {
+	return &RequiredChecksMemo{entries: map[requiredChecksCacheKey]requiredChecksMemoEntry{}}
+}
+
+// readRequiredChecksLive reads spec's requirements through sourceControl,
+// bounded by deps.Timeouts.DecisionInboxRequiredChecksTimeout -- once per
+// base per tick when memo is non-nil, every call when it is nil.
+func readRequiredChecksLive(ctx context.Context, deps Deps, sourceControl ports.SourceControl, memo *RequiredChecksMemo, spec ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
+	key := requiredChecksCacheKey{owner: spec.Owner, repo: spec.Repo, branch: spec.Branch}
+	if memo != nil {
+		memo.mu.Lock()
+		defer memo.mu.Unlock()
+		if e, ok := memo.entries[key]; ok {
+			return e.required, e.err
+		}
 	}
-	return ports.ListRequiredChecksSpec{Owner: pr.Owner, Repo: pr.Repo, Branch: pr.BaseRef, Token: deps.GitHubOutbound.BotToken()}, nil
+	readCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxRequiredChecksTimeout)
+	required, err := sourceControl.ListRequiredChecks(readCtx, spec)
+	cancel()
+	if memo != nil {
+		memo.entries[key] = requiredChecksMemoEntry{required: required, err: err}
+	}
+	return required, err
 }
 
 // requiredChecksFact is the fact for one read of pr's base requirements:
@@ -80,10 +128,24 @@ func toDomainHeadChecks(in []ports.HeadCheck) []autoapproval.HeadCheck {
 			Name:   c.Name,
 			Source: toDomainCheckSource(c.Source),
 			AppID:  c.AppID,
+			Poster: toDomainPoster(c.Poster),
 			State:  toDomainCheckState(c.State),
 		})
 	}
 	return out
+}
+
+// toDomainPoster maps a port poster to the domain's. An unknown value maps
+// to unknown, which never lets a status count for a check tied to an App.
+func toDomainPoster(p ports.HeadCheckPoster) autoapproval.Poster {
+	switch p {
+	case ports.HeadCheckPosterApp:
+		return autoapproval.PosterApp
+	case ports.HeadCheckPosterPerson:
+		return autoapproval.PosterPerson
+	default:
+		return autoapproval.PosterUnknown
+	}
 }
 
 // toDomainCheckSource maps a port source to the domain's. An unknown

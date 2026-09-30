@@ -463,8 +463,9 @@ func (rs *automergeTestRig) deps(sourceControl ports.SourceControl) automerge.De
 	return automerge.Deps{
 		DecisionInbox: decisioninbox.Deps{
 			// The same bot credential as Outbound below, as
-			// controlplane/githuboutbound.go wires it: revalidation reads a
-			// base branch's required checks with it.
+			// controlplane/serve.go wires it (the inbox's read model reads
+			// base branches' required checks with it; the worker reads them
+			// with the bot token it merges with).
 			GitHubOutbound: outbound,
 			Plans:          narvipg.NewPlanStore(rs.pool),
 			Sessions:       narvipg.NewSessionStore(rs.pool),

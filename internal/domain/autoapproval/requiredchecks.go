@@ -41,8 +41,24 @@ const (
 	// CheckSourceCheckRun is a check run, which carries the id of the App
 	// that reported it.
 	CheckSourceCheckRun CheckSource = "check_run"
-	// CheckSourceStatus is a commit status, which carries no App id.
+	// CheckSourceStatus is a commit status, which carries the account that
+	// posted it rather than an App id.
 	CheckSourceStatus CheckSource = "status"
+)
+
+// Poster is the kind of account that posted a commit status.
+type Poster string
+
+const (
+	// PosterUnknown is a status whose poster could not be read. The zero
+	// value, so a caller that forgets to say never makes a status count
+	// for a check that names an App.
+	PosterUnknown Poster = ""
+	// PosterApp is a status an App posted, through its bot account. A check
+	// run is always posted by an App.
+	PosterApp Poster = "app"
+	// PosterPerson is a status a person's own account posted.
+	PosterPerson Poster = "person"
 )
 
 // CheckState is where a HeadCheck stands, as far as a requirement is
@@ -64,10 +80,15 @@ const (
 type HeadCheck struct {
 	Name   string
 	Source CheckSource
-	// AppID is the id of the App that reported a check run; zero for a
-	// commit status, which reports none.
+	// AppID is the App a report is attributed to: for a check run, the App
+	// that reported it; for a commit status an App posted, that App when
+	// its id could be established from the head's own check runs, and zero
+	// when it could not. Zero for every other status.
 	AppID int64
-	State CheckState
+	// Poster is who posted a commit status: an App, a person, or unknown.
+	// A check run is always PosterApp.
+	Poster Poster
+	State  CheckState
 }
 
 // ShortfallKind is why a required check is not satisfied at the head.
@@ -75,13 +96,18 @@ type ShortfallKind string
 
 const (
 	// ShortfallMissing is a required check with no report at the head from
-	// a source that counts for it -- none at all, or only reports from an
-	// App other than the one the base names.
+	// a source that counts for it -- none at all, or only reports from
+	// another source (another App, or a person's commit status, for a
+	// check that names an App).
 	ShortfallMissing ShortfallKind = "missing"
 	// ShortfallUnconfirmed is a required check not seen at the head while
 	// the head's list of checks was not read in full: it may have reported
 	// in the part that was not read.
 	ShortfallUnconfirmed ShortfallKind = "unconfirmed"
+	// ShortfallPosterUnknown is a required check naming an App, not
+	// satisfied by any report that counts, beside a commit status of its
+	// name whose poster could not be read: that status may be the App's.
+	ShortfallPosterUnknown ShortfallKind = "poster_unknown"
 	// ShortfallPending is a required check that has reported and not yet
 	// concluded.
 	ShortfallPending ShortfallKind = "pending"
@@ -94,6 +120,13 @@ const (
 type RequiredCheckShortfall struct {
 	Check RequiredCheck
 	Kind  ShortfallKind
+	// OtherSource is set on a missing check when a report of its name did
+	// come in, from a source that does not count for it.
+	OtherSource bool
+	// UnverifiedApp is set on a pending or failed check when a report that
+	// counted is a commit status from an App whose id could not be
+	// established.
+	UnverifiedApp bool
 }
 
 // RequiredChecks is the required-check fact eligibility reads, alongside
@@ -124,22 +157,30 @@ func ReadRequiredChecks(required []RequiredCheck, head []HeadCheck, headComplete
 // all.
 //
 // For each required check, the reports that count are those at the head
-// carrying its name and, when it names an App, reported by that App. A
-// commit status carries no App id, so it never counts for a check that
-// names one, and neither does a check run from another App: GitHub counts
-// only the named App's report. The check is satisfied only when at least
-// one report counts and EVERY report that counts passed -- a check run and
-// a commit status carrying the same required name must both pass, as
-// GitHub requires; taking either one as enough would approve a failing
-// check beside a passing status. A failed report outranks a pending one.
+// carrying its name and, when it names an App, attributed to that App (see
+// countsFor): that App's check run, or a commit status that App posted.
+// The check is satisfied only when at least one report counts and EVERY
+// report that counts passed -- a check run and a commit status carrying the
+// same required name must both pass, as GitHub requires; taking either one
+// as enough would approve a failing check beside a passing status. A
+// failed report outranks a pending one.
+//
+// A check run from another App never counts, nor does a commit status a
+// person posted. A commit status an App posted counts when its App is the
+// one named, and also when its App's id could not be established from the
+// head (no check run of that App is there to carry the id): GitHub
+// attributes such a status to the App that posted it and accepts it, and
+// refusing it here would keep the pull request ineligible for a check that
+// did report. That status's App is then not verified by this rule; GitHub
+// still enforces the exact source when the merge is made. A reason naming
+// such a check says so.
 //
 // headComplete is false when the head's list of checks was not read in
-// full. A required check naming no App that is then not seen is reported
-// unconfirmed, never missing, since it may sit in the part that was not
-// read. A check naming an App is still missing: what can go unread without
-// the CI read itself reading degraded is the commit statuses (a truncated
-// check-run list, or a failed GET, degrades the CI read, which refuses
-// first), and a status never counts for a check that names an App.
+// full (its commit statuses beyond one page). A required check that is
+// then not seen is reported unconfirmed, never missing, since it may sit
+// in the part that was not read. A check naming an App beside a status of
+// its name whose poster could not be read is reported the same way, as
+// poster unknown.
 //
 // reviewcheck.CheckName (narvi/review) is taken out of the required set
 // before anything else: it is the review this eligibility already reads
@@ -150,11 +191,23 @@ func EvaluateRequiredChecks(required []RequiredCheck, head []HeadCheck, headComp
 	var shortfalls []RequiredCheckShortfall
 	for _, check := range normalizeRequired(required) {
 		counted, failed, pending := 0, false, false
+		otherSource, posterUnknown, unverified := false, false, false
 		for _, report := range head {
+			if report.Name != check.Name {
+				continue
+			}
 			if !countsFor(check, report) {
+				if report.Source == CheckSourceStatus && report.Poster == PosterUnknown {
+					posterUnknown = true
+				} else {
+					otherSource = true
+				}
 				continue
 			}
 			counted++
+			if check.AppID != 0 && report.Source == CheckSourceStatus && report.AppID == 0 {
+				unverified = true
+			}
 			switch report.State {
 			case CheckStatePassed:
 			case CheckStatePending:
@@ -164,30 +217,36 @@ func EvaluateRequiredChecks(required []RequiredCheck, head []HeadCheck, headComp
 			}
 		}
 		switch {
-		case counted == 0 && !headComplete && check.AppID == 0:
+		case counted == 0 && posterUnknown:
+			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallPosterUnknown})
+		case counted == 0 && !headComplete:
 			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallUnconfirmed})
 		case counted == 0:
-			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallMissing})
+			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallMissing, OtherSource: otherSource})
 		case failed:
-			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallFailed})
+			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallFailed, UnverifiedApp: unverified})
 		case pending:
-			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallPending})
+			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallPending, UnverifiedApp: unverified})
 		}
 	}
 	return shortfalls
 }
 
-// countsFor reports whether report is one of the reports that decide
-// check: the same name, and, when check names an App, a check run from that
-// App.
+// countsFor reports whether report, which carries check's name, is one of
+// the reports that decide check. A check naming no App counts every report
+// of its name. A check naming an App counts that App's check runs, and the
+// commit statuses an App posted -- the named App's, or an App's whose id
+// could not be established (AppID zero; see EvaluateRequiredChecks). A
+// check run from another App, a status attributed to another App, a status
+// a person posted and a status whose poster is unknown never count.
 func countsFor(check RequiredCheck, report HeadCheck) bool {
-	if report.Name != check.Name {
-		return false
-	}
 	if check.AppID == 0 {
 		return true
 	}
-	return report.Source == CheckSourceCheckRun && report.AppID == check.AppID
+	if report.Source == CheckSourceCheckRun {
+		return report.AppID == check.AppID
+	}
+	return report.Poster == PosterApp && (report.AppID == check.AppID || report.AppID == 0)
 }
 
 // normalizeRequired drops reviewcheck.CheckName and empty names, removes
@@ -233,19 +292,30 @@ func requiredChecksReason(shortfalls []RequiredCheckShortfall) Reason {
 // criterion apart without parsing the rest.
 const RequiredCheckReasonPrefix = "required check "
 
+// describeShortfall names the check -- with the App the base names, for
+// every kind of shortfall, when one is named -- and what is wrong with it.
 func describeShortfall(s RequiredCheckShortfall) string {
 	name := fmt.Sprintf("%s%q", RequiredCheckReasonPrefix, s.Check.Name)
+	if s.Check.AppID != 0 {
+		name += fmt.Sprintf(" from the App the base branch names (App id %d)", s.Check.AppID)
+	}
+	unverified := ""
+	if s.UnverifiedApp {
+		unverified = ", counting a commit status from an App whose id could not be verified"
+	}
 	switch s.Kind {
 	case ShortfallMissing:
-		if s.Check.AppID != 0 {
-			return fmt.Sprintf("%s has not reported at the current head from the App the base branch names (App id %d)", name, s.Check.AppID)
+		if s.OtherSource {
+			return name + " has not reported at the current head; a report of that name came from another source, which does not count"
 		}
 		return name + " has not reported at the current head"
 	case ShortfallUnconfirmed:
 		return name + " could not be confirmed at the current head (its commit statuses were not all read)"
+	case ShortfallPosterUnknown:
+		return name + " could not be confirmed at the current head (who posted its commit status could not be read)"
 	case ShortfallPending:
-		return name + " is still running at the current head"
+		return name + " is still running at the current head" + unverified
 	default:
-		return name + " did not pass at the current head"
+		return name + " did not pass at the current head" + unverified
 	}
 }

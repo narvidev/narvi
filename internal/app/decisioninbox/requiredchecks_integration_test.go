@@ -27,13 +27,14 @@ import (
 // TestRequiredChecks_InboxAndMergePathAgree drives §21.2's "CI green means
 // the required checks, not the checks that reported" through both of this
 // package's eligibility call sites on real Postgres, one fully eligible
-// pull request per scenario with exactly one required-check fact changed:
-// the decision inbox's read model (Build: is the row ready_to_merge) and
-// the merge path (RevalidateForMerge, which the auto-merge worker shares:
-// does the click merge, and what does its refusal say). The two must
-// agree on every scenario, the refusal must name the check, and both must
-// read the base's requirements as the bot -- never with the person's own
-// token.
+// pull request per scenario with exactly one fact changed: the decision
+// inbox's read model (Build: is the row ready_to_merge) and the merge path
+// (RevalidateForMerge, which the auto-merge worker shares: does the click
+// merge, and what does its refusal say). The two must agree on every
+// scenario but one -- GitHub outbound off, where the inbox reads no
+// requirements and the click reads them itself -- the refusal must name
+// the check, the read model must read the base's requirements as the bot,
+// and the click with the person's own token, the one it merges with.
 func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
@@ -43,10 +44,13 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 		return ports.RequiredCheck{Name: name, AppID: appID}
 	}
 	run := func(name string, appID int64, state ports.HeadCheckState) ports.HeadCheck {
-		return ports.HeadCheck{Name: name, Source: ports.HeadCheckSourceCheckRun, AppID: appID, State: state}
+		return ports.HeadCheck{Name: name, Source: ports.HeadCheckSourceCheckRun, AppID: appID, Poster: ports.HeadCheckPosterApp, State: state}
 	}
 	status := func(name string, state ports.HeadCheckState) ports.HeadCheck {
-		return ports.HeadCheck{Name: name, Source: ports.HeadCheckSourceStatus, State: state}
+		return ports.HeadCheck{Name: name, Source: ports.HeadCheckSourceStatus, Poster: ports.HeadCheckPosterPerson, State: state}
+	}
+	appStatus := func(name string, appID int64, state ports.HeadCheckState) ports.HeadCheck {
+		return ports.HeadCheck{Name: name, Source: ports.HeadCheckSourceStatus, AppID: appID, Poster: ports.HeadCheckPosterApp, State: state}
 	}
 	const passed, pending, failed = ports.HeadCheckStatePassed, ports.HeadCheckStatePending, ports.HeadCheckStateFailed
 
@@ -62,10 +66,19 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 		ci           ports.CIConclusion
 		headMoved    bool
 		changedFiles []string
+		// headShort marks the head's check listing incomplete (its
+		// statuses beyond one page).
+		headShort bool
+		// baseRewritten moves the base branch's live tip to a commit that
+		// does not descend from the verdict's base: a confirmed base move.
+		baseRewritten bool
 		// zeroTimeout sets DecisionInboxRequiredChecksTimeout to zero: a
 		// read made under it has no time at all.
 		zeroTimeout  bool
 		wantEligible bool
+		// wantMergeOnly: the merge path merges while the inbox, which reads
+		// no requirements with GitHub outbound off, shows needs_review.
+		wantMergeOnly bool
 		// wantReason is a substring of RevalidateForMerge's refusal.
 		wantReason   string
 		wantDegraded bool
@@ -95,7 +108,36 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 			required:   []ports.RequiredCheck{build("ci/build", 15368)},
 			head:       []ports.HeadCheck{run("ci/build", 99, passed)},
 			ci:         ports.CIConclusionSuccess,
-			wantReason: `required check "ci/build" has not reported at the current head from the App the base branch names (App id 15368)`,
+			wantReason: `required check "ci/build" from the App the base branch names (App id 15368) has not reported at the current head; a report of that name came from another source`,
+		},
+		{
+			name:         "a required check an App reports as a commit status is satisfied by that App's status",
+			required:     []ports.RequiredCheck{build("codecov/patch", 254)},
+			head:         []ports.HeadCheck{appStatus("codecov/patch", 0, passed), run("build", 15368, passed)},
+			ci:           ports.CIConclusionSuccess,
+			wantEligible: true,
+		},
+		{
+			name:       "a person's commit status never satisfies a check tied to an App",
+			required:   []ports.RequiredCheck{build("codecov/patch", 254)},
+			head:       []ports.HeadCheck{status("codecov/patch", passed), run("build", 15368, passed)},
+			ci:         ports.CIConclusionSuccess,
+			wantReason: `required check "codecov/patch" from the App the base branch names (App id 254) has not reported at the current head`,
+		},
+		{
+			name:       "an App-named check that failed names its App",
+			required:   []ports.RequiredCheck{build("ci/build", 15368)},
+			head:       []ports.HeadCheck{run("ci/build", 15368, failed), run("ci/build", 99, passed)},
+			ci:         ports.CIConclusionFailure,
+			wantReason: `required check "ci/build" from the App the base branch names (App id 15368) did not pass at the current head`,
+		},
+		{
+			name:       "a required check not seen in a head listing short of its statuses is unconfirmed",
+			required:   []ports.RequiredCheck{build("ci/slow-external", 0)},
+			head:       []ports.HeadCheck{run("build", 1, passed)},
+			ci:         ports.CIConclusionSuccess,
+			headShort:  true,
+			wantReason: `required check "ci/slow-external" could not be confirmed at the current head (its commit statuses were not all read)`,
 		},
 		{
 			name:       "a required check still running is named, not read as CI not green",
@@ -134,12 +176,25 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 			wantDegraded: true,
 		},
 		{
-			name:         "with GitHub outbound off the requirements cannot be read",
-			noBot:        true,
-			head:         []ports.HeadCheck{run("build", 1, passed)},
-			ci:           ports.CIConclusionSuccess,
-			wantReason:   string(autoapproval.ReasonRequiredChecksUnknown),
-			wantDegraded: true,
+			// The inbox reads nothing without the bot and says so, not
+			// degraded; the click reads with the person's token and merges.
+			name:          "with GitHub outbound off the inbox reads nothing and the Merge click still merges",
+			noBot:         true,
+			required:      []ports.RequiredCheck{build("build", 0)},
+			head:          []ports.HeadCheck{run("build", 1, passed)},
+			ci:            ports.CIConclusionSuccess,
+			wantMergeOnly: true,
+		},
+		{
+			// Freshness is checked before the requirements: the confirmed
+			// base move decides the row, so the failed read neither
+			// degrades the inbox nor is the reason given.
+			name:          "a failed read beside a confirmed base move refuses on the base move, undegraded",
+			readErr:       errors.New("rulesets: http 502"),
+			head:          []ports.HeadCheck{run("build", 1, passed)},
+			ci:            ports.CIConclusionSuccess,
+			baseRewritten: true,
+			wantReason:    string(autoapproval.ReasonBaseMoved),
 		},
 		{
 			// A transient read failure never stands in for a lasting
@@ -208,6 +263,11 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 				pr.ChangedFiles = tc.changedFiles
 				pr.ChangedFilesCount = len(tc.changedFiles)
 			}
+			pr.HeadChecksListDegraded = tc.headShort
+			if tc.baseRewritten {
+				rs.sourceControl.resolveBranchSHA = "sha-rewritten-base"
+				rs.sourceControl.isAncestorResult = false
+			}
 			rs.replaceTargetPR(actorGitHubID, pr)
 			if tc.required != nil {
 				rs.sourceControl.requiredChecksByBranch = map[string][]ports.RequiredCheck{pr.BaseRef: tc.required}
@@ -235,11 +295,25 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 			if item == nil {
 				t.Fatalf("PR #%d missing from the inbox", n)
 			}
-			if got := item.Kind == decisioninboxdomain.KindReadyToMerge; got != tc.wantEligible {
+			inboxReady := item.Kind == decisioninboxdomain.KindReadyToMerge
+			if inboxReady != tc.wantEligible {
 				t.Errorf("inbox Kind = %s, want ready_to_merge %v", item.Kind, tc.wantEligible)
 			}
 			if result.SCMFetchFailed != tc.wantDegraded {
 				t.Errorf("SCMFetchFailed = %v, want %v", result.SCMFetchFailed, tc.wantDegraded)
+			}
+			if result.RequiredChecksNotRead != tc.noBot {
+				t.Errorf("RequiredChecksNotRead = %v, want %v", result.RequiredChecksNotRead, tc.noBot)
+			}
+			inboxCalls := rs.sourceControl.requiredChecksCalls
+			rs.sourceControl.requiredChecksCalls = nil
+			if tc.noBot && len(inboxCalls) != 0 {
+				t.Errorf("the inbox read the requirements %d times with no bot credential, want 0", len(inboxCalls))
+			}
+			for _, c := range inboxCalls {
+				if c.Token != testBotToken {
+					t.Errorf("inbox ListRequiredChecks token = %q, want the bot's", c.Token)
+				}
 			}
 
 			// The merge path.
@@ -247,107 +321,151 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 			if err != nil {
 				t.Fatalf("RevalidateForMerge() error = %v", err)
 			}
-			if ok != tc.wantEligible {
-				t.Errorf("RevalidateForMerge() ok = %v (reason %q), want %v", ok, reason, tc.wantEligible)
+			wantMerge := tc.wantEligible || tc.wantMergeOnly
+			if ok != wantMerge {
+				t.Errorf("RevalidateForMerge() ok = %v (reason %q), want %v", ok, reason, wantMerge)
 			}
-			if ok != (item.Kind == decisioninboxdomain.KindReadyToMerge) {
+			if !tc.wantMergeOnly && ok != inboxReady {
 				t.Errorf("the inbox (Kind %s) and the merge path (ok %v) disagree", item.Kind, ok)
 			}
 			if tc.wantReason != "" && !strings.Contains(reason, tc.wantReason) {
 				t.Errorf("RevalidateForMerge() reason = %q, want it to contain %q", reason, tc.wantReason)
 			}
 
-			calls := rs.sourceControl.requiredChecksCalls
-			if tc.noBot && len(calls) != 0 {
-				t.Errorf("ListRequiredChecks called %d times with no bot credential, want 0", len(calls))
+			mergeCalls := rs.sourceControl.requiredChecksCalls
+			if len(mergeCalls) != 1 {
+				t.Errorf("the Merge click read the requirements %d times, want once", len(mergeCalls))
 			}
-			if !tc.noBot && len(calls) == 0 {
-				t.Error("ListRequiredChecks never called, want the base's requirements read")
-			}
-			for _, c := range calls {
-				if c.Token != testBotToken {
-					t.Errorf("ListRequiredChecks token = %q, want the bot's (never the person's own)", c.Token)
-				}
+			for _, c := range append(inboxCalls, mergeCalls...) {
 				if c.Owner != "acme" || c.Repo != repo || c.Branch != pr.BaseRef {
 					t.Errorf("ListRequiredChecks spec = %+v, want acme/%s@%s", c, repo, pr.BaseRef)
+				}
+			}
+			for _, c := range mergeCalls {
+				if c.Token != humanToken {
+					t.Errorf("Merge click ListRequiredChecks token = %q, want the person's own (the credential the merge is made with)", c.Token)
 				}
 			}
 		})
 	}
 }
 
-// TestRequiredChecks_AcceptanceReadoutNamesTheUnreadRequirements pins the
-// decision inbox's acceptance readout on a failed read of the base's
-// required checks: an accepted row whose only blocker is that failed read
-// says the requirements could not be read -- the engine's own reason --
-// never that the base commit could not be confirmed.
-func TestRequiredChecks_AcceptanceReadoutNamesTheUnreadRequirements(t *testing.T) {
+// TestRequiredChecks_AcceptanceReadout pins the decision inbox's acceptance
+// readout around the base's required checks (§21.2). An accepted row whose
+// only blocker is a failed read of the requirements says they could not be
+// read -- the engine's own reason, the inbox degraded. With GitHub outbound
+// off it says the inbox does not read them, and the inbox is not degraded:
+// a configuration. And when a confirmed base move already decides the row,
+// a failed read neither degrades the inbox nor names the blocker.
+func TestRequiredChecks_AcceptanceReadout(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
-
-	const actorGitHubID, repoFullName, n = "rc-acceptance-actor", "acme/required-checks-acceptance", 801
-	users := narvipg.NewUserStore(pool)
-	actor, err := users.Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: "rc-acceptance@example.com", DisplayName: "Maintainer", Role: sqlcgen.UserRoleMaintainer})
-	if err != nil {
-		t.Fatalf("create actor: %v", err)
-	}
 	tokenKey := []byte("01234567890123456789012345678901")
-	encrypted, err := platform.EncryptToken(tokenKey, []byte("person-token"))
-	if err != nil {
-		t.Fatalf("encrypt token: %v", err)
-	}
-	if _, err := narvipg.NewIdentityStore(pool).Create(ctx, sqlcgen.CreateIdentityParams{
-		UserID: actor.ID, Provider: sqlcgen.IdentityProviderGithub, ExternalID: actorGitHubID,
-		EmailVerified: true, LinkedVia: sqlcgen.IdentityLinkedViaAutoEmail, AccessTokenEncrypted: encrypted,
-	}); err != nil {
-		t.Fatalf("create identity: %v", err)
+
+	tests := []struct {
+		name          string
+		readErr       error
+		noBot         bool
+		baseRewritten bool
+		wantReason    string
+		wantDegraded  bool
+	}{
+		{
+			name:         "a failed read that decides the row names it, and degrades the inbox",
+			readErr:      errors.New("rulesets: http 502"),
+			wantReason:   string(autoapproval.ReasonRequiredChecksUnknown),
+			wantDegraded: true,
+		},
+		{
+			name:       "GitHub outbound off names the configuration, and does not degrade the inbox",
+			noBot:      true,
+			wantReason: "the checks this pull request's base branch requires are not read in the inbox while this deployment's GitHub outbound is off",
+		},
+		{
+			name:          "a failed read beside a confirmed base move is not the blocker, and does not degrade the inbox",
+			readErr:       errors.New("rulesets: http 502"),
+			baseRewritten: true,
+			wantReason:    "this pull request no longer meets the auto-approval eligibility criteria, even with its accepted override applied",
+		},
 	}
 
-	rs := newRevalidateStores(pool)
-	pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, n)
-	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, rs.deps.ReviewVerdict, repoFullName, int32(n))
-	if err != nil || !hasVerdict {
-		t.Fatalf("GetLatest() = (%v, %v), want the seeded verdict", hasVerdict, err)
-	}
-	var verdictID pgtype.UUID
-	if err := verdictID.Scan(record.ID); err != nil {
-		t.Fatalf("scan verdict id: %v", err)
-	}
-	if _, _, err := appreviewverdict.Accept(ctx, rs.deps.ReviewVerdict.Acceptances, appreviewverdict.AcceptInput{
-		RepoFullName:  repoFullName,
-		PRNumber:      int32(n),
-		VerdictID:     verdictID,
-		AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
-		HeadSHA:       record.HeadSHA,
-		Context:       record.Context,
-		Reason:        string(autoapproval.ReasonNotShippableAuto),
-		Justification: "Accepted so the readout below has an acceptance to describe.",
-		AcceptedBy:    actor.ID,
-	}); err != nil {
-		t.Fatalf("Accept() error = %v", err)
-	}
-	rs.replaceTargetPR(actorGitHubID, pr)
-	rs.sourceControl.requiredChecksErr = errors.New("rulesets: http 502")
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			n := 801 + i
+			repoFullName := "acme/required-checks-acceptance-" + strconv.Itoa(n)
+			actorGitHubID := "rc-acceptance-actor-" + strconv.Itoa(n)
+			actor, err := narvipg.NewUserStore(pool).Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: actorGitHubID + "@example.com", DisplayName: "Maintainer", Role: sqlcgen.UserRoleMaintainer})
+			if err != nil {
+				t.Fatalf("create actor: %v", err)
+			}
+			encrypted, err := platform.EncryptToken(tokenKey, []byte("person-token"))
+			if err != nil {
+				t.Fatalf("encrypt token: %v", err)
+			}
+			if _, err := narvipg.NewIdentityStore(pool).Create(ctx, sqlcgen.CreateIdentityParams{
+				UserID: actor.ID, Provider: sqlcgen.IdentityProviderGithub, ExternalID: actorGitHubID,
+				EmailVerified: true, LinkedVia: sqlcgen.IdentityLinkedViaAutoEmail, AccessTokenEncrypted: encrypted,
+			}); err != nil {
+				t.Fatalf("create identity: %v", err)
+			}
 
-	deps := rs.deps
-	deps.SCMCache = decisioninbox.NewSCMCache(rs.sourceControl, platform.DefaultTimeouts())
-	deps.TokenEncryptionKey = tokenKey
+			rs := newRevalidateStores(pool)
+			pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, n)
+			record, hasVerdict, err := appreviewverdict.GetLatest(ctx, rs.deps.ReviewVerdict, repoFullName, int32(n))
+			if err != nil || !hasVerdict {
+				t.Fatalf("GetLatest() = (%v, %v), want the seeded verdict", hasVerdict, err)
+			}
+			var verdictID pgtype.UUID
+			if err := verdictID.Scan(record.ID); err != nil {
+				t.Fatalf("scan verdict id: %v", err)
+			}
+			if _, _, err := appreviewverdict.Accept(ctx, rs.deps.ReviewVerdict.Acceptances, appreviewverdict.AcceptInput{
+				RepoFullName:  repoFullName,
+				PRNumber:      int32(n),
+				VerdictID:     verdictID,
+				AttemptID:     seedReviewAttemptTurn(ctx, t, pool),
+				HeadSHA:       record.HeadSHA,
+				Context:       record.Context,
+				Reason:        string(autoapproval.ReasonNotShippableAuto),
+				Justification: "Accepted so the readout below has an acceptance to describe.",
+				AcceptedBy:    actor.ID,
+			}); err != nil {
+				t.Fatalf("Accept() error = %v", err)
+			}
+			rs.replaceTargetPR(actorGitHubID, pr)
+			rs.sourceControl.requiredChecksErr = tc.readErr
+			if tc.baseRewritten {
+				rs.sourceControl.resolveBranchSHA = "sha-rewritten-base"
+				rs.sourceControl.isAncestorResult = false
+			}
 
-	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMaintainer, time.Now())
-	if err != nil {
-		t.Fatalf("Build() error = %v", err)
-	}
-	item := findItemByPR(result.Items, n)
-	if item == nil {
-		t.Fatalf("PR #%d missing from the inbox", n)
-	}
-	if item.AcceptanceID == "" {
-		t.Fatal("the row carries no acceptance -- the fixture does not exercise the readout")
-	}
-	if item.AcceptanceMergeable {
-		t.Error("AcceptanceMergeable = true with the base's requirements unread, want false")
-	}
-	if item.AcceptanceMergeBlockedReason != string(autoapproval.ReasonRequiredChecksUnknown) {
-		t.Errorf("AcceptanceMergeBlockedReason = %q, want %q", item.AcceptanceMergeBlockedReason, autoapproval.ReasonRequiredChecksUnknown)
+			deps := rs.deps
+			deps.SCMCache = decisioninbox.NewSCMCache(rs.sourceControl, platform.DefaultTimeouts())
+			deps.TokenEncryptionKey = tokenKey
+			if tc.noBot {
+				deps.GitHubOutbound = nil
+			}
+
+			result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMaintainer, time.Now())
+			if err != nil {
+				t.Fatalf("Build() error = %v", err)
+			}
+			item := findItemByPR(result.Items, n)
+			if item == nil {
+				t.Fatalf("PR #%d missing from the inbox", n)
+			}
+			if item.AcceptanceID == "" {
+				t.Fatal("the row carries no acceptance -- the fixture does not exercise the readout")
+			}
+			if item.AcceptanceMergeable {
+				t.Error("AcceptanceMergeable = true, want false")
+			}
+			if item.AcceptanceMergeBlockedReason != tc.wantReason {
+				t.Errorf("AcceptanceMergeBlockedReason = %q, want %q", item.AcceptanceMergeBlockedReason, tc.wantReason)
+			}
+			if result.SCMFetchFailed != tc.wantDegraded {
+				t.Errorf("SCMFetchFailed = %v, want %v", result.SCMFetchFailed, tc.wantDegraded)
+			}
+		})
 	}
 }

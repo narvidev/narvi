@@ -11,6 +11,7 @@ package decisioninbox_test
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -70,9 +71,11 @@ type fakeSCMCacheSourceControl struct {
 	isAncestorDelay     time.Duration
 	isAncestorCallCount int
 
-	// requiredChecksByBranch/requiredChecksErr/requiredChecksCallCount back
-	// SCMCache.ListRequiredChecks' own tests below (§21.2).
-	requiredChecksByBranch  map[string][]ports.RequiredCheck
+	// requiredChecksByBase/requiredChecksErr/requiredChecksCallCount back
+	// SCMCache.ListRequiredChecks' own tests below (§21.2), keyed
+	// "owner/repo@branch" so two repositories sharing a branch name answer
+	// differently.
+	requiredChecksByBase    map[string][]ports.RequiredCheck
 	requiredChecksErr       error
 	requiredChecksCallCount int
 }
@@ -197,7 +200,7 @@ func (f *fakeSCMCacheSourceControl) isAncestorCalls() int {
 func (f *fakeSCMCacheSourceControl) ListRequiredChecks(ctx context.Context, spec ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
 	f.mu.Lock()
 	f.requiredChecksCallCount++
-	required := f.requiredChecksByBranch[spec.Branch]
+	required := f.requiredChecksByBase[spec.Owner+"/"+spec.Repo+"@"+spec.Branch]
 	err := f.requiredChecksErr
 	f.mu.Unlock()
 
@@ -760,9 +763,14 @@ func TestSCMCache_ListRequiredChecks(t *testing.T) {
 	t.Parallel()
 
 	build := []ports.RequiredCheck{{Name: "build", AppID: 7}}
+	lint := []ports.RequiredCheck{{Name: "lint"}}
 	spec := func(branch, token string) ports.ListRequiredChecksSpec {
 		return ports.ListRequiredChecksSpec{Owner: "acme", Repo: "widgets", Branch: branch, Token: token}
 	}
+	specIn := func(owner, repo string) ports.ListRequiredChecksSpec {
+		return ports.ListRequiredChecksSpec{Owner: owner, Repo: repo, Branch: "main", Token: "bot"}
+	}
+	widgetsMain := map[string][]ports.RequiredCheck{"acme/widgets@main": build}
 
 	tests := []struct {
 		name      string
@@ -776,7 +784,7 @@ func TestSCMCache_ListRequiredChecks(t *testing.T) {
 	}{
 		{
 			name:      "a second read of the same base within the TTL is a cache hit, whatever the token",
-			fake:      &fakeSCMCacheSourceControl{requiredChecksByBranch: map[string][]ports.RequiredCheck{"main": build}},
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBase: widgetsMain},
 			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot"), spec("main", "someone-else")},
 			offsets:   []time.Duration{0, time.Second},
 			wantErrs:  []bool{false, false},
@@ -785,7 +793,7 @@ func TestSCMCache_ListRequiredChecks(t *testing.T) {
 		},
 		{
 			name:      "another base branch is its own entry",
-			fake:      &fakeSCMCacheSourceControl{requiredChecksByBranch: map[string][]ports.RequiredCheck{"main": build}},
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBase: widgetsMain},
 			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot"), spec("release", "bot")},
 			offsets:   []time.Duration{0, time.Second},
 			wantErrs:  []bool{false, false},
@@ -793,8 +801,26 @@ func TestSCMCache_ListRequiredChecks(t *testing.T) {
 			wantReads: 2,
 		},
 		{
+			name:      "another repository with the same base branch name is its own entry",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBase: map[string][]ports.RequiredCheck{"acme/widgets@main": build, "acme/gadgets@main": lint}},
+			calls:     []ports.ListRequiredChecksSpec{specIn("acme", "widgets"), specIn("acme", "gadgets")},
+			offsets:   []time.Duration{0, time.Second},
+			wantErrs:  []bool{false, false},
+			wantLast:  lint,
+			wantReads: 2,
+		},
+		{
+			name:      "another owner's repository of the same name is its own entry",
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBase: map[string][]ports.RequiredCheck{"acme/widgets@main": build, "other/widgets@main": lint}},
+			calls:     []ports.ListRequiredChecksSpec{specIn("acme", "widgets"), specIn("other", "widgets")},
+			offsets:   []time.Duration{0, time.Second},
+			wantErrs:  []bool{false, false},
+			wantLast:  lint,
+			wantReads: 2,
+		},
+		{
 			name:      "an expired entry is read again",
-			fake:      &fakeSCMCacheSourceControl{requiredChecksByBranch: map[string][]ports.RequiredCheck{"main": build}},
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBase: widgetsMain},
 			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot"), spec("main", "bot")},
 			offsets:   []time.Duration{0, time.Hour},
 			wantErrs:  []bool{false, false},
@@ -811,7 +837,7 @@ func TestSCMCache_ListRequiredChecks(t *testing.T) {
 		},
 		{
 			name:      "the read runs under DecisionInboxRequiredChecksTimeout",
-			fake:      &fakeSCMCacheSourceControl{requiredChecksByBranch: map[string][]ports.RequiredCheck{"main": build}},
+			fake:      &fakeSCMCacheSourceControl{requiredChecksByBase: widgetsMain},
 			timeouts:  func(to *platform.Timeouts) { to.DecisionInboxRequiredChecksTimeout = 0 },
 			calls:     []ports.ListRequiredChecksSpec{spec("main", "bot")},
 			offsets:   []time.Duration{0},
@@ -837,7 +863,7 @@ func TestSCMCache_ListRequiredChecks(t *testing.T) {
 				}
 				last = got
 			}
-			if !tc.wantErrs[len(tc.wantErrs)-1] && len(last) != len(tc.wantLast) {
+			if !tc.wantErrs[len(tc.wantErrs)-1] && !reflect.DeepEqual(last, tc.wantLast) {
 				t.Errorf("last ListRequiredChecks() = %+v, want %+v", last, tc.wantLast)
 			}
 			if got := tc.fake.requiredChecksCalls(); got != tc.wantReads {

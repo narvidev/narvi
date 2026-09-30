@@ -2546,6 +2546,10 @@ export interface ListDecisionInboxResponse {
    */
   scmFetchFailed: boolean;
   /**
+   * True when this deployment's GitHub outbound is off (NARVI_OUTBOUND_ENABLED declares no github): the inbox then reads no base branch's required checks (technical plan §21.2), so no pull request is shown as ready_to_merge, and a row carrying an acceptance names this as what blocks it. A configuration, stable across loads -- never a failure to retry, and never reported through scmFetchFailed. A client should say so in its own words, distinct from the 'temporarily unable to load' state. The Merge endpoint is not affected: it reads the requirements with the acting person's own GitHub credential.
+   */
+  requiredChecksNotRead: boolean;
+  /**
    * §16.2's own decision-latency metric -- null iff decisionLatencyComputed is false (§21.1's own 'not yet computed' sentinel, distinct from a real zero: a repo with a real 0-second median and one with no decisions yet in the window must never render identically).
    */
   decisionLatencyMedianSeconds: number | null;

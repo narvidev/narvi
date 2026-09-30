@@ -14,7 +14,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 
 import type { DecisionInboxItem } from '@narvi/contracts/rest-dtos'
 
-import { DecisionInboxRow, ScmStatusBanner } from '../DecisionInboxView'
+import { DecisionInboxRow, RequiredChecksNotReadNotice, ScmStatusBanner } from '../DecisionInboxView'
 import { isSafeHref } from '../urlSafety'
 
 const XSS_IMG = '<img src=x onerror=alert(1)>'
@@ -673,5 +673,22 @@ describe('ScmStatusBanner -- the three-way SCM state, never collapsed', () => {
     // combination adds the staleness clause the outright-failure case
     // must never show (no fetch to be stale from, in that case).
     expect(html).not.toBe(renderToStaticMarkup(<ScmStatusBanner scmAsOf={null} scmFetchFailed={true} />))
+  })
+})
+
+// RequiredChecksNotReadNotice (technical plan §21.2): GitHub outbound off is
+// a configuration the inbox states plainly -- never the "temporarily
+// unable" warning ScmStatusBanner keeps for a failed read.
+describe('RequiredChecksNotReadNotice -- outbound off is a stable notice, not a failure', () => {
+  it('renders nothing while the requirements are read', () => {
+    expect(renderToStaticMarkup(<RequiredChecksNotReadNotice requiredChecksNotRead={false} />)).toBe('')
+  })
+
+  it('says why nothing is ready to merge when outbound is off, without the warning style', () => {
+    const html = renderToStaticMarkup(<RequiredChecksNotReadNotice requiredChecksNotRead={true} />)
+    expect(html).toContain('GitHub outbound is off')
+    expect(html).toContain('No pull request is shown ready to merge here')
+    expect(html).not.toContain('sync-banner-warn')
+    expect(html).not.toContain('Temporarily unable')
   })
 })

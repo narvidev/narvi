@@ -305,6 +305,14 @@ func (f *fakeMergeSourceControl) GetOpenPR(context.Context, string, string, int,
 
 func newDecisionInboxTestRig(t *testing.T, sourceControl ports.SourceControl) *decisionInboxTestRig {
 	t.Helper()
+	return newDecisionInboxTestRigWithOutbound(t, sourceControl, platform.MustNewGitHubOutboundConfig(decisionInboxBotToken))
+}
+
+// newDecisionInboxTestRigWithOutbound is newDecisionInboxTestRig with the
+// deployment's GitHub outbound axis given explicitly -- nil for a
+// deployment with GitHub outbound off.
+func newDecisionInboxTestRigWithOutbound(t *testing.T, sourceControl ports.SourceControl, outbound *platform.GitHubOutboundConfig) *decisionInboxTestRig {
+	t.Helper()
 	pool := newTestPool(t)
 
 	users := narvipg.NewUserStore(pool)
@@ -330,9 +338,9 @@ func newDecisionInboxTestRig(t *testing.T, sourceControl ports.SourceControl) *d
 		GitHubPRSessions:      githubPRSessions,
 		ReleaseManifestChecks: releaseManifestChecks,
 		SCMCache:              decisioninbox.NewSCMCache(sourceControl, platform.DefaultTimeouts()),
-		// The bot credential a base branch's required checks are read with
-		// (§21.2), as controlplane/serve.go wires it.
-		GitHubOutbound:     platform.MustNewGitHubOutboundConfig(decisionInboxBotToken),
+		// The bot credential the read model reads a base branch's required
+		// checks with (§21.2), as controlplane/serve.go wires it.
+		GitHubOutbound:     outbound,
 		TokenEncryptionKey: decisionInboxTokenKey,
 		Timeouts:           platform.DefaultTimeouts(),
 		// (§21.1/§21.2): the REAL auto-approval eligibility
@@ -958,8 +966,8 @@ func TestMergePullRequest_NotPlatformAuthored(t *testing.T) {
 // request whose own checks are all green, but whose base branch requires
 // a check that has not reported, is refused with a 409 whose message names
 // that check, nothing is merged, and the base's requirements are read with
-// the deployment's bot token -- never the clicking person's own. Once the
-// check has reported and passed, the same click merges.
+// the clicking person's own token -- the credential the merge is made
+// with. Once the check has reported and passed, the same click merges.
 func TestMergePullRequest_RequiredCheckNotReported_409NamesIt(t *testing.T) {
 	const htmlURL = "https://github.com/acme/widgets/pull/1230"
 	pr := ports.OpenPR{
@@ -1004,8 +1012,8 @@ func TestMergePullRequest_RequiredCheckNotReported_409NamesIt(t *testing.T) {
 		t.Fatal("the base's required checks were never read")
 	}
 	for _, c := range fakeSCM.requiredChecksCalls {
-		if c.Token != decisionInboxBotToken {
-			t.Errorf("required checks read with token %q, want the bot's", c.Token)
+		if c.Token != "fake-gh-token" {
+			t.Errorf("required checks read with token %q, want the clicking person's own (the credential the merge is made with)", c.Token)
 		}
 	}
 
@@ -1018,6 +1026,72 @@ func TestMergePullRequest_RequiredCheckNotReported_409NamesIt(t *testing.T) {
 	}
 	if !got.Merged || len(fakeSCM.mergeCalls) != 1 {
 		t.Errorf("response = %+v, MergePR calls = %d, want one merge", got, len(fakeSCM.mergeCalls))
+	}
+}
+
+// TestDecisionInbox_GitHubOutboundOff_StableStateAndMergeStillWorks pins
+// §21.2 with GitHub outbound off (a deployment declaring
+// NARVI_OUTBOUND_ENABLED empty). The inbox reads no base branch's required
+// checks without the bot: it says so (requiredChecksNotRead), is not
+// degraded (scmFetchFailed stays false, load after load), and shows the
+// otherwise eligible row as needs_review, not ready_to_merge. The Merge
+// click is not affected: it reads the requirements with the person's own
+// token, the one it merges with, and merges.
+func TestDecisionInbox_GitHubOutboundOff_StableStateAndMergeStillWorks(t *testing.T) {
+	const htmlURL = "https://github.com/acme/widgets/pull/1231"
+	fakeSCM := &fakeMergeSourceControl{
+		openPRs: []ports.OpenPR{{
+			Owner: "acme", Repo: "widgets", Number: 1231, Title: "eligible", HTMLURL: htmlURL,
+			HeadSHA: "headsha1231", BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+			Assignees:    []ports.PRPerson{{ExternalID: "9031", Login: "octocat"}},
+			CIConclusion: ports.CIConclusionSuccess, Labels: []string{"review:low-risk"},
+			HeadChecks: []ports.HeadCheck{{Name: "ci/build", Source: ports.HeadCheckSourceCheckRun, AppID: 1, Poster: ports.HeadCheckPosterApp, State: ports.HeadCheckStatePassed}},
+		}},
+		mergeSHA:               "merged-sha-1231",
+		requiredChecksByBranch: map[string][]ports.RequiredCheck{testEligibleBaseRef: {{Name: "ci/build"}}},
+	}
+	rig := newDecisionInboxTestRigWithOutbound(t, fakeSCM, nil)
+	ctx := context.Background()
+
+	user, token := rig.createAuthenticatedUser(ctx, t, sqlcgen.UserRoleMember)
+	rig.linkGitHub(ctx, t, user.ID, "9031")
+	rig.markPlatformAuthored(ctx, t, user.ID, htmlURL)
+	rig.seedAutoApprovedVerdict(ctx, t, "acme/widgets", 1231, "headsha1231")
+	if _, err := narvipg.NewRepoSettingsStore(rig.pool).UpsertLiveEgressEnabled(ctx, "acme/widgets", true); err != nil {
+		t.Fatalf("arm live egress: %v", err)
+	}
+
+	for load := 0; load < 2; load++ {
+		var got restdtos.ListDecisionInboxResponse
+		if status := rig.doJSON(t, http.MethodGet, "/api/decision-inbox", nil, &got, token); status != http.StatusOK {
+			t.Fatalf("load %d: status = %d, want 200", load, status)
+		}
+		if !got.RequiredChecksNotRead || got.ScmFetchFailed {
+			t.Errorf("load %d: requiredChecksNotRead=%v scmFetchFailed=%v, want true and false -- a configuration, not a failure", load, got.RequiredChecksNotRead, got.ScmFetchFailed)
+		}
+		for _, it := range got.Items {
+			if it.PrNumber != nil && *it.PrNumber == 1231 && it.Kind == restdtos.DecisionInboxItemKindReadyToMerge {
+				t.Errorf("load %d: the row is ready_to_merge, want needs_review while its base's requirements are not read", load)
+			}
+		}
+	}
+	if len(fakeSCM.requiredChecksCalls) != 0 {
+		t.Errorf("the inbox read the requirements %d times with outbound off, want 0", len(fakeSCM.requiredChecksCalls))
+	}
+
+	body, err := json.Marshal(restdtos.MergePullRequestRequest{RepoFullName: "acme/widgets", PrNumber: 1231})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	var merged restdtos.MergePullRequestResponse
+	if status := rig.doJSON(t, http.MethodPost, "/api/decision-inbox/merge", body, &merged, token); status != http.StatusOK {
+		t.Fatalf("merge status = %d, want 200: the Merge click does not depend on GitHub outbound", status)
+	}
+	if !merged.Merged || len(fakeSCM.mergeCalls) != 1 {
+		t.Errorf("response = %+v, MergePR calls = %d, want one merge", merged, len(fakeSCM.mergeCalls))
+	}
+	if len(fakeSCM.requiredChecksCalls) != 1 || fakeSCM.requiredChecksCalls[0].Token != "fake-gh-token" {
+		t.Errorf("required-checks reads on the Merge click = %+v, want one, with the person's own token", fakeSCM.requiredChecksCalls)
 	}
 }
 

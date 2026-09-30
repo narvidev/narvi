@@ -951,6 +951,22 @@ func TestListDecisionInboxResponseRoundTrip(t *testing.T) {
 		})
 	})
 
+	// GitHubOutboundOff: the inbox reads no base branch's required checks
+	// (technical plan §21.2) -- a configuration, carried beside a complete,
+	// undegraded fetch.
+	t.Run("GitHubOutboundOff", func(t *testing.T) {
+		scmAsOf := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+		roundTrip(t, sch, restdtos.ListDecisionInboxResponse{
+			Items:                        []restdtos.DecisionInboxItem{},
+			ScmAsOf:                      &scmAsOf,
+			ScmFetchFailed:               false,
+			RequiredChecksNotRead:        true,
+			DecisionLatencyMedianSeconds: nil,
+			DecisionLatencySampleSize:    0,
+			DecisionLatencyComputed:      false,
+		})
+	})
+
 	t.Run("NoGitHubIdentityNoDecisionsYet", func(t *testing.T) {
 		roundTrip(t, sch, restdtos.ListDecisionInboxResponse{
 			Items:                        []restdtos.DecisionInboxItem{},

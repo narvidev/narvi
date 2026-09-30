@@ -1970,11 +1970,11 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		GitHubPRSessions:      githubPRSessionStore,
 		ReleaseManifestChecks: releaseManifestCheckStore,
 		SCMCache:              decisionInboxSCMCache,
-		// GitHubOutbound: the bot credential every eligibility read of a
-		// base branch's required checks uses (§21.2) -- the read model,
-		// the Merge click, and the auto-merge worker, which reuses these
-		// deps. nil with GitHub outbound off: no requirement can be read,
-		// so no pull request is eligible.
+		// GitHubOutbound: the bot credential the inbox's read model reads a
+		// base branch's required checks with (§21.2). nil with GitHub
+		// outbound off: the inbox then reads none and says so
+		// (requiredChecksNotRead); a Merge click reads them with the
+		// person's own token either way.
 		GitHubOutbound:     cfg.GitHubOutbound,
 		TokenEncryptionKey: cfg.TokenEncryptionKey,
 		Timeouts:           cfg.Timeouts,

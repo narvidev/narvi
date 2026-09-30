@@ -10,6 +10,20 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.15.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `ListDecisionInboxResponse.requiredChecksNotRead` (required
+  boolean), true when the deployment's GitHub outbound is off: the inbox
+  then reads no base branch's required checks (technical plan §21.2), so
+  no pull request is shown as `ready_to_merge`. A configuration, stable
+  across loads, never reported through `scmFetchFailed`; the Merge
+  endpoint is unaffected, since it reads the requirements with the acting
+  person's own credential. A required property added to a
+  platform-produced shape grades MINOR (row 3).
+- Unchanged: no route, no enum, no other `$def`.
+
 ## [1.14.0]
 
 ### rest/v1/dtos.schema.json

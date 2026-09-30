@@ -102,6 +102,7 @@ func decisionInboxResultToDTO(result decisioninbox.Result) restdtos.ListDecision
 		Items:                     items,
 		ScmAsOf:                   result.SCMAsOf,
 		ScmFetchFailed:            result.SCMFetchFailed,
+		RequiredChecksNotRead:     result.RequiredChecksNotRead,
 		DecisionLatencySampleSize: result.DecisionLatencySampleSize,
 		DecisionLatencyComputed:   result.DecisionLatencyComputed,
 	}

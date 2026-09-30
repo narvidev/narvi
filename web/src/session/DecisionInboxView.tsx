@@ -655,6 +655,24 @@ export function ScmStatusBanner({ scmAsOf, scmFetchFailed }: { scmAsOf: string |
   )
 }
 
+/**
+ * RequiredChecksNotReadNotice -- ListDecisionInboxResponse.requiredChecksNotRead
+ * (technical plan §21.2): with this deployment's GitHub outbound off, the
+ * inbox reads no base branch's required checks, so no pull request is shown
+ * ready to merge. A configuration, stable across loads, not a failure: a
+ * plain notice, never ScmStatusBanner's "temporarily unable" warning.
+ */
+export function RequiredChecksNotReadNotice({ requiredChecksNotRead }: { requiredChecksNotRead: boolean }) {
+  if (!requiredChecksNotRead) {
+    return null
+  }
+  return (
+    <div className="sync-banner" role="status">
+      No pull request is shown ready to merge here: this deployment&apos;s GitHub outbound is off, so the inbox does not read the checks base branches require.
+    </div>
+  )
+}
+
 export function DecisionInboxView() {
   const meQuery = useQuery(meQueryOptions)
   const [repoFilter, setRepoFilter] = useState('all')
@@ -726,6 +744,7 @@ export function DecisionInboxView() {
         </div>
 
         {inboxQuery.isSuccess && <ScmStatusBanner scmAsOf={inboxQuery.data.scmAsOf} scmFetchFailed={inboxQuery.data.scmFetchFailed} />}
+        {inboxQuery.isSuccess && <RequiredChecksNotReadNotice requiredChecksNotRead={inboxQuery.data.requiredChecksNotRead} />}
 
         {inboxQuery.isPending && (
           <div className="session-state" aria-live="polite">

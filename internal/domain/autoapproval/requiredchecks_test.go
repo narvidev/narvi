@@ -19,11 +19,23 @@ func withRequiredChecks(in autoapproval.EligibilityInput, r autoapproval.Require
 }
 
 func checkRun(name string, appID int64, state autoapproval.CheckState) autoapproval.HeadCheck {
-	return autoapproval.HeadCheck{Name: name, Source: autoapproval.CheckSourceCheckRun, AppID: appID, State: state}
+	return autoapproval.HeadCheck{Name: name, Source: autoapproval.CheckSourceCheckRun, AppID: appID, Poster: autoapproval.PosterApp, State: state}
 }
 
+// status is a commit status a person posted.
 func status(name string, state autoapproval.CheckState) autoapproval.HeadCheck {
-	return autoapproval.HeadCheck{Name: name, Source: autoapproval.CheckSourceStatus, State: state}
+	return autoapproval.HeadCheck{Name: name, Source: autoapproval.CheckSourceStatus, Poster: autoapproval.PosterPerson, State: state}
+}
+
+// appStatus is a commit status an App posted; appID zero is an App whose
+// id could not be established from the head.
+func appStatus(name string, appID int64, state autoapproval.CheckState) autoapproval.HeadCheck {
+	return autoapproval.HeadCheck{Name: name, Source: autoapproval.CheckSourceStatus, AppID: appID, Poster: autoapproval.PosterApp, State: state}
+}
+
+// unknownStatus is a commit status whose poster could not be read.
+func unknownStatus(name string, state autoapproval.CheckState) autoapproval.HeadCheck {
+	return autoapproval.HeadCheck{Name: name, Source: autoapproval.CheckSourceStatus, Poster: autoapproval.PosterUnknown, State: state}
 }
 
 func required(name string, appID int64) autoapproval.RequiredCheck {
@@ -32,6 +44,16 @@ func required(name string, appID int64) autoapproval.RequiredCheck {
 
 func shortfall(name string, appID int64, kind autoapproval.ShortfallKind) autoapproval.RequiredCheckShortfall {
 	return autoapproval.RequiredCheckShortfall{Check: required(name, appID), Kind: kind}
+}
+
+func withOtherSource(s autoapproval.RequiredCheckShortfall) autoapproval.RequiredCheckShortfall {
+	s.OtherSource = true
+	return s
+}
+
+func withUnverifiedApp(s autoapproval.RequiredCheckShortfall) autoapproval.RequiredCheckShortfall {
+	s.UnverifiedApp = true
+	return s
 }
 
 const (
@@ -112,18 +134,71 @@ func TestEvaluateRequiredChecks(t *testing.T) {
 			want:         []autoapproval.RequiredCheckShortfall{shortfall("build", 0, autoapproval.ShortfallFailed)},
 		},
 		{
-			name:         "a check the base ties to one App, reported only by another App, is missing",
+			name:         "a check the base ties to one App, reported only by another App's check run, is missing",
 			required:     []autoapproval.RequiredCheck{required("build", ciApp)},
 			head:         []autoapproval.HeadCheck{checkRun("build", otherApp, passed)},
 			headComplete: true,
-			want:         []autoapproval.RequiredCheckShortfall{shortfall("build", ciApp, autoapproval.ShortfallMissing)},
+			want:         []autoapproval.RequiredCheckShortfall{withOtherSource(shortfall("build", ciApp, autoapproval.ShortfallMissing))},
 		},
 		{
-			name:         "a check the base ties to one App is not satisfied by a commit status of its name",
+			name:         "a check the base ties to one App is not satisfied by a commit status a person posted",
 			required:     []autoapproval.RequiredCheck{required("build", ciApp)},
 			head:         []autoapproval.HeadCheck{status("build", passed)},
 			headComplete: true,
-			want:         []autoapproval.RequiredCheckShortfall{shortfall("build", ciApp, autoapproval.ShortfallMissing)},
+			want:         []autoapproval.RequiredCheckShortfall{withOtherSource(shortfall("build", ciApp, autoapproval.ShortfallMissing))},
+		},
+		{
+			name:         "a check the base ties to one App is satisfied by that App's own commit status",
+			required:     []autoapproval.RequiredCheck{required("codecov/patch", 254)},
+			head:         []autoapproval.HeadCheck{appStatus("codecov/patch", 254, passed), checkRun("build", ciApp, passed)},
+			headComplete: true,
+		},
+		{
+			name:         "a commit status from an App whose id could not be established counts for an App-named check",
+			required:     []autoapproval.RequiredCheck{required("codecov/patch", 254)},
+			head:         []autoapproval.HeadCheck{appStatus("codecov/patch", 0, passed)},
+			headComplete: true,
+		},
+		{
+			name:         "a commit status attributed to another App does not count",
+			required:     []autoapproval.RequiredCheck{required("codecov/patch", 254)},
+			head:         []autoapproval.HeadCheck{appStatus("codecov/patch", otherApp, passed)},
+			headComplete: true,
+			want:         []autoapproval.RequiredCheckShortfall{withOtherSource(shortfall("codecov/patch", 254, autoapproval.ShortfallMissing))},
+		},
+		{
+			name:         "a failing commit status from an unverified App fails the check, and says so",
+			required:     []autoapproval.RequiredCheck{required("codecov/patch", 254)},
+			head:         []autoapproval.HeadCheck{appStatus("codecov/patch", 0, failed)},
+			headComplete: true,
+			want:         []autoapproval.RequiredCheckShortfall{withUnverifiedApp(shortfall("codecov/patch", 254, autoapproval.ShortfallFailed))},
+		},
+		{
+			name:         "a pending commit status from an unverified App is still running, and says so",
+			required:     []autoapproval.RequiredCheck{required("codecov/patch", 254)},
+			head:         []autoapproval.HeadCheck{appStatus("codecov/patch", 0, pending)},
+			headComplete: true,
+			want:         []autoapproval.RequiredCheckShortfall{withUnverifiedApp(shortfall("codecov/patch", 254, autoapproval.ShortfallPending))},
+		},
+		{
+			name:         "a person's passing status beside the App's failing status of the same name fails",
+			required:     []autoapproval.RequiredCheck{required("codecov/patch", 254)},
+			head:         []autoapproval.HeadCheck{status("codecov/patch", passed), appStatus("codecov/patch", 254, failed)},
+			headComplete: true,
+			want:         []autoapproval.RequiredCheckShortfall{shortfall("codecov/patch", 254, autoapproval.ShortfallFailed)},
+		},
+		{
+			name:         "a status whose poster could not be read leaves an App-named check unconfirmed",
+			required:     []autoapproval.RequiredCheck{required("codecov/patch", 254)},
+			head:         []autoapproval.HeadCheck{unknownStatus("codecov/patch", passed)},
+			headComplete: true,
+			want:         []autoapproval.RequiredCheckShortfall{shortfall("codecov/patch", 254, autoapproval.ShortfallPosterUnknown)},
+		},
+		{
+			name:         "a status whose poster could not be read still counts for a check naming no App",
+			required:     []autoapproval.RequiredCheck{required("codecov/patch", 0)},
+			head:         []autoapproval.HeadCheck{unknownStatus("codecov/patch", passed)},
+			headComplete: true,
 		},
 		{
 			name:         "a check the base ties to one App is satisfied by that App's passing check run",
@@ -159,10 +234,12 @@ func TestEvaluateRequiredChecks(t *testing.T) {
 			want:         []autoapproval.RequiredCheckShortfall{shortfall("build", 0, autoapproval.ShortfallUnconfirmed)},
 		},
 		{
-			name:         "a check naming an App, not seen while the head was not read in full, is missing",
+			// An App can post a status, so a short status listing leaves
+			// an App-named check unconfirmed too.
+			name:         "a check naming an App, not seen while the head was not read in full, is unconfirmed",
 			required:     []autoapproval.RequiredCheck{required("build", ciApp)},
 			headComplete: false,
-			want:         []autoapproval.RequiredCheckShortfall{shortfall("build", ciApp, autoapproval.ShortfallMissing)},
+			want:         []autoapproval.RequiredCheckShortfall{shortfall("build", ciApp, autoapproval.ShortfallUnconfirmed)},
 		},
 		{
 			name:         "a check seen passing is satisfied even when the head was not read in full",
@@ -181,7 +258,7 @@ func TestEvaluateRequiredChecks(t *testing.T) {
 			required:     []autoapproval.RequiredCheck{required("build", ciApp), required("build", 0)},
 			head:         []autoapproval.HeadCheck{status("build", passed)},
 			headComplete: true,
-			want:         []autoapproval.RequiredCheckShortfall{shortfall("build", ciApp, autoapproval.ShortfallMissing)},
+			want:         []autoapproval.RequiredCheckShortfall{withOtherSource(shortfall("build", ciApp, autoapproval.ShortfallMissing))},
 		},
 		{
 			name:         "an empty required name is ignored",
@@ -251,7 +328,50 @@ func TestComputeEligible_RequiredChecks(t *testing.T) {
 			in: withRequiredChecks(cleanInput(), read(
 				[]autoapproval.RequiredCheck{{Name: "build", AppID: 15368}},
 				[]autoapproval.HeadCheck{checkRun("build", 99, passed)}, true)),
-			wantReason: `required check "build" has not reported at the current head from the App the base branch names (App id 15368)`,
+			wantReason: `required check "build" from the App the base branch names (App id 15368) has not reported at the current head; a report of that name came from another source, which does not count`,
+		},
+		{
+			name: "an App-named check that failed is named with its App",
+			in: withCIGreen(withRequiredChecks(cleanInput(), read(
+				[]autoapproval.RequiredCheck{{Name: "build", AppID: 15368}},
+				[]autoapproval.HeadCheck{checkRun("build", 15368, failed), checkRun("build", 99, passed)}, true)), false),
+			wantReason: `required check "build" from the App the base branch names (App id 15368) did not pass at the current head`,
+		},
+		{
+			name: "an App-named check still running is named with its App",
+			in: withCIGreen(withRequiredChecks(cleanInput(), read(
+				[]autoapproval.RequiredCheck{{Name: "build", AppID: 15368}},
+				[]autoapproval.HeadCheck{checkRun("build", 15368, pending)}, true)), false),
+			wantReason: `required check "build" from the App the base branch names (App id 15368) is still running at the current head`,
+		},
+		{
+			name: "an App's own commit status satisfies an App-named check",
+			in: withRequiredChecks(cleanInput(), read(
+				[]autoapproval.RequiredCheck{{Name: "codecov/patch", AppID: 254}},
+				[]autoapproval.HeadCheck{appStatus("codecov/patch", 254, passed)}, true)),
+			wantEligible: true,
+			wantReason:   autoapproval.ReasonNone,
+		},
+		{
+			name: "a failing status from an App whose id is not verifiable is named as such",
+			in: withCIGreen(withRequiredChecks(cleanInput(), read(
+				[]autoapproval.RequiredCheck{{Name: "codecov/patch", AppID: 254}},
+				[]autoapproval.HeadCheck{appStatus("codecov/patch", 0, failed)}, true)), false),
+			wantReason: `required check "codecov/patch" from the App the base branch names (App id 254) did not pass at the current head, counting a commit status from an App whose id could not be verified`,
+		},
+		{
+			name: "a person's status never satisfies an App-named check",
+			in: withRequiredChecks(cleanInput(), read(
+				[]autoapproval.RequiredCheck{{Name: "codecov/patch", AppID: 254}},
+				[]autoapproval.HeadCheck{status("codecov/patch", passed)}, true)),
+			wantReason: `required check "codecov/patch" from the App the base branch names (App id 254) has not reported at the current head; a report of that name came from another source, which does not count`,
+		},
+		{
+			name: "a status whose poster could not be read leaves an App-named check unconfirmed",
+			in: withRequiredChecks(cleanInput(), read(
+				[]autoapproval.RequiredCheck{{Name: "codecov/patch", AppID: 254}},
+				[]autoapproval.HeadCheck{unknownStatus("codecov/patch", passed)}, true)),
+			wantReason: `required check "codecov/patch" from the App the base branch names (App id 254) could not be confirmed at the current head (who posted its commit status could not be read)`,
 		},
 		{
 			name: "a required check still running refuses as running, not as CI not green",

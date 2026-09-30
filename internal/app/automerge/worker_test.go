@@ -5,45 +5,29 @@ import (
 	"testing"
 
 	"github.com/narvidev/narvi/internal/app/automerge"
-	"github.com/narvidev/narvi/internal/app/decisioninbox"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
 // TestNew_RefusesNilOutbound proves the auto-merge worker cannot be built
-// without GitHub outbound (§12.5): it reads pull requests and merges as
-// the bot, so a nil *platform.GitHubOutboundConfig is a construction error
-// wrapping platform.ErrGitHubOutboundRequired -- never a worker polling
-// GitHub with an empty token until its auth guard dead-letters it. The
-// decision inbox deps it revalidates through need the same credential:
-// they read each candidate's base branch's required checks with it
-// (§21.2), and without it every candidate would read ineligible -- a
-// worker that runs and never merges.
+// without GitHub outbound (§12.5): it reads pull requests -- and their base
+// branches' required checks (§21.2) -- and merges as the bot, so a nil
+// *platform.GitHubOutboundConfig is a construction error wrapping
+// platform.ErrGitHubOutboundRequired -- never a worker polling GitHub with
+// an empty token until its auth guard dead-letters it.
 func TestNew_RefusesNilOutbound(t *testing.T) {
-	outbound := platform.MustNewGitHubOutboundConfig("tok")
-
 	tests := []struct {
 		name    string
 		deps    automerge.Deps
 		wantErr bool
 	}{
 		{
-			name:    "no outbound at all",
+			name:    "no outbound",
 			deps:    automerge.Deps{Timeouts: platform.DefaultTimeouts()},
 			wantErr: true,
 		},
 		{
-			name:    "the worker's outbound, but none in the decision inbox deps",
-			deps:    automerge.Deps{Outbound: outbound, Timeouts: platform.DefaultTimeouts()},
-			wantErr: true,
-		},
-		{
-			name:    "the decision inbox deps' outbound, but none for the worker",
-			deps:    automerge.Deps{DecisionInbox: decisioninbox.Deps{GitHubOutbound: outbound}, Timeouts: platform.DefaultTimeouts()},
-			wantErr: true,
-		},
-		{
-			name: "both",
-			deps: automerge.Deps{Outbound: outbound, DecisionInbox: decisioninbox.Deps{GitHubOutbound: outbound}, Timeouts: platform.DefaultTimeouts()},
+			name: "outbound",
+			deps: automerge.Deps{Outbound: platform.MustNewGitHubOutboundConfig("tok"), Timeouts: platform.DefaultTimeouts()},
 		},
 	}
 

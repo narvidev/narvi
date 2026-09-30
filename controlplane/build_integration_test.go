@@ -367,6 +367,17 @@ func TestBuild_GitHubOutboundDisabled_NoOutboundConsumers(t *testing.T) {
 	if !app.outboxBuilder.HasNotifier(ports.NotificationKindRWXPreviewDispatch) {
 		t.Error("outboxBuilder has no notifier for rwx_preview_dispatch, want one (RWXAccessToken alone is sufficient for that kind)")
 	}
+
+	// The decision inbox reads no base branch's required checks without the
+	// bot, and says so -- a configuration, not a failure (§21.2).
+	server := httptest.NewServer(app.Router)
+	t.Cleanup(server.Close)
+	ctx := context.Background()
+	cookie := createMaintainerSession(ctx, t, pool)
+	cookieHeader := http.Header{"Cookie": []string{platform.AuthSessionCookieName + "=" + cookie}}
+	if !decisionInboxRequiredChecksNotRead(ctx, t, server.URL, cookieHeader) {
+		t.Error("GET /api/decision-inbox says base branches' required checks are read, with GitHub outbound off")
+	}
 }
 
 // TestBuild_GitHubOutboundOnIngressOff proves the two axes are independent

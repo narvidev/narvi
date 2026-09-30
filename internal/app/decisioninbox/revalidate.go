@@ -99,7 +99,7 @@ func RevalidateForMerge(ctx context.Context, deps Deps, sourceControl ports.Sour
 		return false, "", "this pull request is no longer open, or no longer assigned to you", false, "", nil
 	}
 
-	return revalidateCore(ctx, deps, sourceControl, token, repoFullName, prNumber, *target, true)
+	return revalidateCore(ctx, deps, sourceControl, nil, token, repoFullName, prNumber, *target, true)
 }
 
 // RevalidateForAutoMerge is RevalidateForMerge's own machine-initiated
@@ -127,11 +127,15 @@ func RevalidateForMerge(ctx context.Context, deps Deps, sourceControl ports.Sour
 // was already unreachable here before this fix; ReasonDiffTooLarge was
 // not, and is what this fix actually closes.
 //
+// memo (§21.2) is the worker's per-tick memo of base branches' required
+// checks (RequiredChecksMemo): candidates into the same base read its
+// requirements once per tick. nil reads them on every call.
+//
 // found=false (GetOpenPR's own confirmed-404 signal) is reported as a
 // plain ok=false/reason, mirroring RevalidateForMerge's own "no longer
 // open" case above -- a PR closed/merged through some other path between
 // discovery and this call is an ordinary, expected race, never an error.
-func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.SourceControl, repoFullName string, prNumber int, botToken string) (ok bool, headSHA string, reason string, viaAcceptance bool, acceptanceID string, err error) {
+func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.SourceControl, memo *RequiredChecksMemo, repoFullName string, prNumber int, botToken string) (ok bool, headSHA string, reason string, viaAcceptance bool, acceptanceID string, err error) {
 	owner, repo, splitOK := reposource.SplitFullName(repoFullName)
 	if !splitOK {
 		return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for auto-merge: repoFullName %q is not shaped owner/repo", repoFullName)
@@ -199,7 +203,7 @@ func RevalidateForAutoMerge(ctx context.Context, deps Deps, sourceControl ports.
 		return false, "", "this pull request is no longer open", false, "", nil
 	}
 
-	return revalidateCore(ctx, deps, sourceControl, botToken, repoFullName, prNumber, target, false)
+	return revalidateCore(ctx, deps, sourceControl, memo, botToken, repoFullName, prNumber, target, false)
 }
 
 // revalidateCore is the SHARED body of RevalidateForMerge/
@@ -272,6 +276,12 @@ const (
 	reasonOpenFinding            = "this pull request has an open, unresolved review finding"
 	reasonBaseCommitUnconfirmed  = "this pull request's base commit could not be confirmed (a live check failed) -- try again shortly"
 
+	// reasonRequiredChecksNotRead is the read model's acceptance readout
+	// when GitHub outbound is off (aggregate.go): the inbox reads no base
+	// branch's required checks without the bot, so it cannot show the row
+	// as mergeable. A configuration, not a failure to retry -- worded so.
+	reasonRequiredChecksNotRead = "the checks this pull request's base branch requires are not read in the inbox while this deployment's GitHub outbound is off"
+
 	// reasonNoLongerMeetsCriteriaFmt is this function's own probe-refusal
 	// AND final-refusal wording -- used at BOTH points below (the probe,
 	// before any live SCM call, and the final post-freshness-check
@@ -285,7 +295,7 @@ const (
 	reasonNoLongerMeetsCriteriaFmt = "this pull request no longer meets the auto-approval eligibility criteria: %s"
 )
 
-func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceControl, token string, repoFullName string, prNumber int, target ports.OpenPR, honorAcceptance bool) (ok bool, headSHA string, reason string, viaAcceptance bool, acceptanceID string, err error) {
+func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceControl, memo *RequiredChecksMemo, token string, repoFullName string, prNumber int, target ports.OpenPR, honorAcceptance bool) (ok bool, headSHA string, reason string, viaAcceptance bool, acceptanceID string, err error) {
 	if target.Draft {
 		return false, "", "this pull request is a draft", false, "", nil
 	}
@@ -449,9 +459,13 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 
 	// requiredChecks is the base branch's required checks at target's head
 	// (§21.2's "CI green means the required checks, not the checks that
-	// reported"), read as the bot -- live and uncached, like every other
-	// read in this function -- and evaluated against the checks target's
-	// own CI read listed (requiredchecks.go). Read BEFORE the probe, unlike
+	// reported"), read live with token -- the credential this path merges
+	// with: the person's own token on a Merge click (so a Merge click never
+	// depends on GitHub outbound, like the merge it makes), the bot's on
+	// the auto-merge worker -- and evaluated against the checks target's
+	// own CI read listed (requiredchecks.go). The worker hands in one memo
+	// per tick, so candidates into the same base share a read; a Merge
+	// click hands in none and reads fresh. Read BEFORE the probe, unlike
 	// the read model (computeRealEligibility): this function's refusal is
 	// shown, as a 409 body or the auto-merge worker's log line, and a
 	// required check that is still running or failed must be named in it
@@ -461,13 +475,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// ReasonRequiredChecksUnknown, once every other criterion has passed:
 	// a transient failure never masks a pull request's lasting reason (G3,
 	// fourth round), and never falls back to the CI read alone.
-	requiredSpec, requiredErr := requiredChecksSpec(deps, target)
-	var required []ports.RequiredCheck
-	if requiredErr == nil {
-		requiredCtx, cancelRequired := context.WithTimeout(ctx, deps.Timeouts.DecisionInboxRequiredChecksTimeout)
-		required, requiredErr = sourceControl.ListRequiredChecks(requiredCtx, requiredSpec)
-		cancelRequired()
-	}
+	required, requiredErr := readRequiredChecksLive(ctx, deps, sourceControl, memo, requiredChecksSpec(target, token))
 	if requiredErr != nil {
 		platform.Logger(ctx).Warn("decisioninbox: read base branch's required checks failed -- eligibility will fail closed via ReasonRequiredChecksUnknown unless another criterion refuses first", "error", requiredErr, "repo_full_name", repoFullName, "pr_number", prNumber, "base_ref", target.BaseRef)
 	}
