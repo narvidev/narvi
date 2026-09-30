@@ -378,8 +378,8 @@ type Registry struct {
 	// verdict already carries (§5.2), which needs this handle to render
 	// an "@botHandle review" mention. May be empty (GitHub ingress off,
 	// §12.5, or a test that never exercises the budget-exhausted notice
-	// path) -- RerunGuidance("") then renders the label/button guidance
-	// alone, with no mention.
+	// path) -- RerunGuidance("") then points at the web Re-run review
+	// button alone, with no mention and no label.
 	githubBotHandle string
 
 	// contractDriftDetected is §14.3's ("mocking + contract drift", §14.3)
@@ -898,6 +898,16 @@ func (r *Registry) evict(sessionID pgtype.UUID, a *Actor) {
 		r.opsMetrics.addActorsLive(context.Background(), -1)
 	}
 	r.mu.Unlock()
+}
+
+// HasGitHubOutbound reports whether this Registry's actors were handed
+// §12.5's GitHub outbound axis (RegistryOptions.GitHubOutbound). It exists
+// for composition-root tests (controlplane's Build), mirroring
+// outboxworker.Builder.HasNotifier: the actor's two uses of the axis -- the
+// automatic re-review's context and the sentinel fix PR -- are otherwise
+// reachable only through a timer or a spawned fix session.
+func (r *Registry) HasGitHubOutbound() bool {
+	return r.githubOutbound != nil
 }
 
 // Shutdown cancels every live actor's run loop (each releases its

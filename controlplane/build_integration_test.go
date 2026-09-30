@@ -331,10 +331,11 @@ func loadGitHubIngressOff(t *testing.T, outbound string) (*platform.Config, *pgx
 }
 
 // TestBuild_GitHubOutboundDisabled_NoOutboundConsumers proves the one
-// outbound switch reaches every consumer: with GitHub outbound off, no
-// GitHub outbound kind has a notifier registered and neither the
-// auto-merge nor the release-manifest worker exists -- so nothing can post,
-// merge or read as the bot, and a stray row dead-letters rather than going
+// outbound switch reaches every notifier and worker (the optional readers
+// are TestBuild_GitHubOutboundReachesEveryOptionalReader's): with GitHub
+// outbound off, no GitHub outbound kind has a notifier registered and
+// neither the auto-merge nor the release-manifest worker exists -- so
+// nothing can post or merge as the bot, and a stray row dead-letters rather than going
 // out with an empty token. RWX previews are forced on AFTER Load (Load
 // refuses them without outbound, RWXPreviewsRequireGitHubOutboundError) to
 // prove the registration does not lean on that refusal: the preview's
@@ -344,11 +345,13 @@ func loadGitHubIngressOff(t *testing.T, outbound string) (*platform.Config, *pgx
 func TestBuild_GitHubOutboundDisabled_NoOutboundConsumers(t *testing.T) {
 	cfg, pool := loadGitHubIngressOff(t, "")
 	cfg.RWXAccessToken = "test-rwx-access-token"
+	bootLog := captureInfoLog(t)
 
 	app, err := Build(context.Background(), cfg, pool)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
+	assertGitHubAxesLine(t, bootLog, false, false, "none")
 
 	for _, kind := range githubOutboundKinds {
 		if app.outboxBuilder.HasNotifier(kind) {
@@ -374,11 +377,15 @@ func TestBuild_GitHubOutboundDisabled_NoOutboundConsumers(t *testing.T) {
 func TestBuild_GitHubOutboundOnIngressOff(t *testing.T) {
 	t.Setenv("NARVI_RWX_ACCESS_TOKEN", "test-rwx-access-token")
 	cfg, pool := loadGitHubIngressOff(t, "github")
+	bootLog := captureInfoLog(t)
 
 	app, err := Build(context.Background(), cfg, pool)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
+	// The one shape where the two axes differ: a line that read either
+	// axis for the other would say outbound=false here.
+	assertGitHubAxesLine(t, bootLog, false, true, "bot token")
 
 	for _, kind := range githubOutboundKinds {
 		if !app.outboxBuilder.HasNotifier(kind) {

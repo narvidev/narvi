@@ -253,13 +253,14 @@ func (o *githubOutbound) workers() (*automerge.Worker, *releasereview.Worker) {
 // logGitHubAxes says out loud, once at boot, which GitHub directions this
 // deployment runs: whether it mounts the webhook (ingress) and whether it
 // calls GitHub as its bot (outbound), and with what credential -- the line
-// docs/PRODUCTION_CHECKLIST.md asks an operator to check.
-func logGitHubAxes(cfg *platform.Config) {
+// docs/PRODUCTION_CHECKLIST.md and the outbox-delivery runbook ask an
+// operator to read.
+func logGitHubAxes(logger *slog.Logger, cfg *platform.Config) {
 	credential := "none"
 	if cfg.GitHubOutbound != nil {
 		credential = "bot token"
 	}
-	slog.Info("narvi control-plane: GitHub axes",
+	logger.Info("narvi control-plane: GitHub axes",
 		"ingress", cfg.IngressEnabled[integrations.ProviderGitHub],
 		"outbound", cfg.GitHubOutbound != nil,
 		"outbound_credential", credential)

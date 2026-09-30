@@ -451,7 +451,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	slackIngressEnabled := cfg.IngressEnabled[integrations.ProviderSlack]
 	linearIngressEnabled := cfg.IngressEnabled[integrations.ProviderLinear]
 	githubIngressEnabled := cfg.IngressEnabled[integrations.ProviderGitHub]
-	logGitHubAxes(cfg)
+	logGitHubAxes(slog.Default(), cfg)
 
 	// hub is the single shared piece of state connecting the app-layer
 	// actor to the adapter-layer client sockets (§6.2's "→ broadcast
@@ -1358,8 +1358,10 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// mention detector already matches against (githubingress.Config.
 	// BotHandle above) -- the rendered re-run guidance (internal/domain/
 	// reviewpost.RerunGuidance) is built to be recognized by that SAME
-	// regex (§5.2), and names only the label/button when there is no
-	// handle (GitHub ingress off). cfg.GitHubOutbound anchors findings
+	// regex (§5.2), and names only the web Re-run review button when there
+	// is no handle -- platform.Load stores none while GitHub ingress is off,
+	// since nothing but the webhook would hear a mention or a label.
+	// cfg.GitHubOutbound anchors findings
 	// against the pull request's diff; nil (GitHub outbound off) leaves
 	// every finding unanchored with no GitHub call, and the route stays
 	// mounted.
