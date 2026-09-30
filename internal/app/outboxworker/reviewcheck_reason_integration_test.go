@@ -15,6 +15,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/outboxworker"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/reviewcheck"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // TestReviewCheckNotifier_NotAssessedReason_NamedOnTheCheck delivers a
@@ -43,7 +44,7 @@ func TestReviewCheckNotifier_NotAssessedReason_NamedOnTheCheck(t *testing.T) {
 			fake := newFakeCheckRunGitHub()
 			server := fake.server()
 			defer server.Close()
-			notifier := outboxworker.NewReviewCheckNotifier(pool, narvipg.NewReviewCheckRunStore(pool), githubapi.New(server.Client(), server.URL), "tok")
+			notifier := mustNotifier(outboxworker.NewReviewCheckNotifier(pool, narvipg.NewReviewCheckRunStore(pool), githubapi.New(server.Client(), server.URL), platform.MustNewGitHubOutboundConfig("tok")))
 
 			payload, err := json.Marshal(ports.ReviewCheckPayload{
 				Owner: "acme", Repo: fmt.Sprintf("reason-repo-%d-%d", i, time.Now().UnixNano()), PRNumber: 7, HeadSHA: "feedface",
