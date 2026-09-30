@@ -207,7 +207,7 @@ type want struct {
 	attempts     int32
 	interrupted  int32
 	dueNow       bool // next_attempt_at already passed: handed back, never started
-	settling     bool // next_attempt_at OutboxInterruptedSettleDelay away: handed back after an interruption
+	settling     bool // next_attempt_at OutboxInterruptedSettleDelay away: an interruption, kept or counted
 	backedOff    bool // next_attempt_at at least most of OutboxBackoffBase away: counted
 	lastErrorHas string
 }
@@ -340,37 +340,37 @@ func TestShutdown_WhatCounts(t *testing.T) {
 				return ctx.Err()
 			},
 			timeouts: func(to *platform.Timeouts) { to.OutboxDeliveryTimeout = 300 * time.Millisecond },
-			want:     want{attempts: 1, interrupted: 1, backedOff: true, lastErrorHas: "shutdown_interrupted_outlived_delivery_timeout"},
+			want:     want{attempts: 1, interrupted: 1, settling: true, lastErrorHas: "shutdown_interrupted_outlived_delivery_timeout"},
 			wantRule: "shutdown_interrupted_outlived_delivery_timeout",
 		},
 		{
 			name:     "an interrupted comment (BotNotifier)",
 			kind:     ports.NotificationKindGitHub,
-			want:     want{attempts: 1, interrupted: 1, backedOff: true, lastErrorHas: "shutdown_interrupted_not_repeatable"},
+			want:     want{attempts: 1, interrupted: 1, settling: true, lastErrorHas: "shutdown_interrupted_not_repeatable"},
 			wantRule: "shutdown_interrupted_not_repeatable",
 		},
 		{
 			name:     "an interrupted formal review",
 			kind:     ports.NotificationKindGitHubVerdict,
-			want:     want{attempts: 1, interrupted: 1, backedOff: true},
+			want:     want{attempts: 1, interrupted: 1, settling: true},
 			wantRule: "shutdown_interrupted_not_repeatable",
 		},
 		{
 			name:     "an interrupted Slack post",
 			kind:     ports.NotificationKindSlack,
-			want:     want{attempts: 1, interrupted: 1, backedOff: true},
+			want:     want{attempts: 1, interrupted: 1, settling: true},
 			wantRule: "shutdown_interrupted_not_repeatable",
 		},
 		{
 			name:     "an interrupted Linear activity",
 			kind:     ports.NotificationKindLinearProgress,
-			want:     want{attempts: 1, interrupted: 1, backedOff: true},
+			want:     want{attempts: 1, interrupted: 1, settling: true},
 			wantRule: "shutdown_interrupted_not_repeatable",
 		},
 		{
 			name:     "an interrupted preview dispatch",
 			kind:     ports.NotificationKindRWXPreviewDispatch,
-			want:     want{attempts: 1, interrupted: 1, backedOff: true},
+			want:     want{attempts: 1, interrupted: 1, settling: true},
 			wantRule: "shutdown_interrupted_not_repeatable",
 		},
 	} {
@@ -438,7 +438,7 @@ func TestShutdown_BoundMakesARepeatedInterruptionCount(t *testing.T) {
 	}{
 		{want{attempts: 0, interrupted: 1, settling: true}, "shutdown_interrupted"},
 		{want{attempts: 0, interrupted: 2, settling: true}, "shutdown_interrupted"},
-		{want{attempts: 1, interrupted: 3, backedOff: true, lastErrorHas: "shutdown_interrupted_past_bound"}, "shutdown_interrupted_past_bound"},
+		{want{attempts: 1, interrupted: 3, settling: true, lastErrorHas: "shutdown_interrupted_past_bound"}, "shutdown_interrupted_past_bound"},
 	} {
 		makeDue(t, pool, row.ID)
 		p := newProcess(t)

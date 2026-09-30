@@ -54,9 +54,10 @@
 // delivery would add to (repeatability.go), the delivery outlived its own
 // OutboxDeliveryTimeout, or the row has been interrupted more times in a
 // row than OutboxMaxConsecutiveInterruptions allows
-// (outbox.consecutive_interruptions, reset when an attempt completes). The
-// rest of the batch, never started, is handed back with its attempts and
-// due at once. Every outcome a tick records is written on one context that
+// (outbox.consecutive_interruptions, reset when an attempt completes):
+// then the attempt counts, and the row is due the later of its backoff and
+// OutboxInterruptedSettleDelay, for the same reason. The rest of the
+// batch, never started, is handed back with its attempts and due at once. Every outcome a tick records is written on one context that
 // is not cancelled with the worker's, and is bounded by
 // OutboxShutdownRecordTimeout from the moment the worker's ends, so a
 // shutdown that begins mid-write does not lose a known outcome. None of it

@@ -59,9 +59,14 @@ func TestEvaluateFailure(t *testing.T) {
 			wantClass: outbox.ClassDeferred, wantRule: outbox.RuleShutdownInterrupted, wantDelay: 45 * time.Second, wantRun: 2,
 		},
 		{
-			name:      "an interruption past the bound counts",
+			name:      "an interruption past the bound counts, due no sooner than the settle delay",
 			failure:   interrupted(1, 2),
-			wantClass: outbox.ClassCounted, wantRule: outbox.RuleShutdownPastBound, wantDelay: 30 * time.Second, wantRun: 3,
+			wantClass: outbox.ClassCounted, wantRule: outbox.RuleShutdownPastBound, wantDelay: 45 * time.Second, wantRun: 3,
+		},
+		{
+			name:      "an interruption past the bound backing off longer than the settle delay keeps its backoff",
+			failure:   interrupted(4, 2),
+			wantClass: outbox.ClassCounted, wantRule: outbox.RuleShutdownPastBound, wantDelay: 4 * time.Minute, wantRun: 3,
 		},
 		{
 			name:      "an interruption past the bound at MaxAttempts dead-letters",
@@ -74,9 +79,19 @@ func TestEvaluateFailure(t *testing.T) {
 			wantClass: outbox.ClassDeferred, wantRule: outbox.RuleShutdownInterrupted, wantDelay: 45 * time.Second, wantRun: 1,
 		},
 		{
-			name:      "an interruption of a kind not safe to repeat counts",
+			name:      "an interruption of a kind not safe to repeat counts, due no sooner than the settle delay",
 			failure:   outbox.Failure{AttemptCount: 1, ShutdownBegun: true},
-			wantClass: outbox.ClassCounted, wantRule: outbox.RuleShutdownNotRepeatable, wantDelay: 30 * time.Second, wantRun: 1,
+			wantClass: outbox.ClassCounted, wantRule: outbox.RuleShutdownNotRepeatable, wantDelay: 45 * time.Second, wantRun: 1,
+		},
+		{
+			name:      "an interruption of a kind not safe to repeat backing off longer than the settle delay keeps its backoff",
+			failure:   outbox.Failure{AttemptCount: 3, ShutdownBegun: true},
+			wantClass: outbox.ClassCounted, wantRule: outbox.RuleShutdownNotRepeatable, wantDelay: 2 * time.Minute, wantRun: 1,
+		},
+		{
+			name:      "an interruption of a kind not safe to repeat at MaxAttempts dead-letters",
+			failure:   outbox.Failure{AttemptCount: outbox.MaxAttempts, ShutdownBegun: true},
+			wantClass: outbox.ClassCounted, wantRule: outbox.RuleShutdownNotRepeatable, wantDeadLetter: true, wantRun: 1,
 		},
 		{
 			name:      "a delivery that outlived its own timeout counts, even when shutdown stopped it",
@@ -86,12 +101,12 @@ func TestEvaluateFailure(t *testing.T) {
 		{
 			name:      "not repeatable takes precedence over the delivery timeout and the bound",
 			failure:   outbox.Failure{AttemptCount: 1, ConsecutiveInterruptions: 9, ShutdownBegun: true, OutlivedDeliveryTimeout: true},
-			wantClass: outbox.ClassCounted, wantRule: outbox.RuleShutdownNotRepeatable, wantDelay: 30 * time.Second, wantRun: 10,
+			wantClass: outbox.ClassCounted, wantRule: outbox.RuleShutdownNotRepeatable, wantDelay: 45 * time.Second, wantRun: 10,
 		},
 		{
 			name:      "the delivery timeout takes precedence over the bound",
 			failure:   outbox.Failure{AttemptCount: 1, ConsecutiveInterruptions: 9, ShutdownBegun: true, OutlivedDeliveryTimeout: true, Repeatable: true},
-			wantClass: outbox.ClassCounted, wantRule: outbox.RuleShutdownOutlivedDeliveryTimeout, wantDelay: 30 * time.Second, wantRun: 10,
+			wantClass: outbox.ClassCounted, wantRule: outbox.RuleShutdownOutlivedDeliveryTimeout, wantDelay: 45 * time.Second, wantRun: 10,
 		},
 		{
 			name:      "a row the shutdown reached before its delivery started keeps its attempt and its run",

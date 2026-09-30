@@ -70,7 +70,38 @@ func runningReviewCheckPayload(ctx context.Context, t *testing.T, pool *pgxpool.
 // no run to adopt and creates a second one, which nothing ever updates
 // again. Once the settle delay has passed, B repeats the delivery, finds
 // A's run and adopts it: exactly one run, recorded as the row's.
+//
+// Both ways the interruption can be recorded wait the settle delay: kept,
+// when it gives the attempt back, and counted, when the row was already
+// interrupted as many times in a row as OutboxMaxConsecutiveInterruptions
+// allows. A counted interruption's own backoff would make it due sooner:
+// every deferral before it gave its attempt back, so it backs off from a
+// first attempt, OutboxBackoffBase (30s) -- under the settle delay, and
+// under the claim lapse this rule replaced.
 func TestShutdown_InterruptedReviewCheckIsRepeatedOnlyAfterItLands(t *testing.T) {
+	bound := platform.DefaultTimeouts().OutboxMaxConsecutiveInterruptions
+	for _, tc := range []struct {
+		name     string
+		priorRun int
+		want     want
+		rule     string
+	}{
+		{name: "kept: the interruption gives its attempt back", priorRun: 0,
+			want: want{attempts: 0, interrupted: 1, settling: true}, rule: "shutdown_interrupted"},
+		{name: "counted: the row was interrupted as often as the bound allows", priorRun: bound,
+			want: want{attempts: 1, interrupted: int32(bound) + 1, settling: true}, rule: "shutdown_interrupted_past_bound"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repeatedOnlyAfterItLands(t, tc.priorRun, tc.want, tc.rule)
+		})
+	}
+}
+
+// repeatedOnlyAfterItLands runs TestShutdown_InterruptedReviewCheck...'s
+// scenario on a row that has already been interrupted priorRun times in a
+// row, expecting replica A's interruption to leave the row as want, under
+// rule.
+func repeatedOnlyAfterItLands(t *testing.T, priorRun int, wantAfterA want, rule string) {
 	ctx := context.Background()
 	pool := IntegrationTestPool(t)
 	outbox := narvipg.NewOutboxStore(pool, false)
@@ -114,6 +145,9 @@ func TestShutdown_InterruptedReviewCheckIsRepeatedOnlyAfterItLands(t *testing.T)
 	if err != nil {
 		t.Fatalf("enqueue review check: %v", err)
 	}
+	if _, err := pool.Exec(ctx, `UPDATE outbox SET consecutive_interruptions = $2 WHERE id = $1`, row.ID, priorRun); err != nil {
+		t.Fatalf("give the row its run of interruptions: %v", err)
+	}
 
 	// Replica A: the delivery is cut short with the create in flight.
 	armed.Store(true)
@@ -121,8 +155,8 @@ func TestShutdown_InterruptedReviewCheckIsRepeatedOnlyAfterItLands(t *testing.T)
 	if err := builderA.PumpOnce(a.ctx); err != nil {
 		t.Fatalf("replica A: PumpOnce: %v", err)
 	}
-	requireRow(t, getRow(t, outbox, row.ID), want{attempts: 0, interrupted: 1, settling: true})
-	logs.requireShutdownWarning(t, row.ID, "shutdown_interrupted")
+	requireRow(t, getRow(t, outbox, row.ID), wantAfterA)
+	logs.requireShutdownWarning(t, row.ID, rule)
 
 	// Replica B, a process of its own with a notifier that has never
 	// created anything, pumps at once: A's create has not landed.

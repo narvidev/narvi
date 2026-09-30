@@ -1405,11 +1405,15 @@ type Timeouts struct {
 	// 10s grace to the HTTP drain it runs beside.
 	OutboxShutdownRecordTimeout time.Duration
 
-	// OutboxInterruptedSettleDelay is how long a delivery this process's
-	// shutdown cut short, and that keeps its attempt, waits before it is
-	// due again (domain/outbox.EvaluateFailure's RuleShutdownInterrupted;
-	// a claimed row whose delivery never started is due at once, since
-	// nothing was sent). The cut request may already have reached the
+	// OutboxInterruptedSettleDelay is the least a delivery this process's
+	// shutdown cut short waits before it is due again
+	// (domain/outbox.EvaluateFailure): exactly this long when it keeps its
+	// attempt (RuleShutdownInterrupted), and the later of this and its
+	// backoff when it counts it -- the other shutdown rules; a counted
+	// interruption backs off from the attempt count every earlier deferral
+	// gave back, often a first attempt's OutboxBackoffBase, shorter than
+	// this. A claimed row whose delivery never started is due at once,
+	// since nothing was sent. The cut request may already have reached the
 	// remote end, which goes on processing it after the caller stopped
 	// listening: a repeat that runs before that request lands cannot see
 	// what it did. A review check's repeat, for one, would find no run to

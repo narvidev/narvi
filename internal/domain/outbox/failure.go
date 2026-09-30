@@ -61,7 +61,8 @@ const (
 	// short, but the row's kind is not safe to deliver twice: a delivery
 	// cut after the remote end accepted it would be repeated, and deferring
 	// it would repeat it more often, not less. ClassCounted, as before this
-	// rule.
+	// rule, and due no sooner than Policy.InterruptedSettleDelay, like
+	// every counted interruption.
 	RuleShutdownNotRepeatable Rule = "shutdown_interrupted_not_repeatable"
 
 	// RuleShutdownOutlivedDeliveryTimeout applies when the delivery ran for
@@ -123,10 +124,11 @@ type Policy struct {
 	// platform.Timeouts.OutboxMaxConsecutiveInterruptions.
 	MaxConsecutiveInterruptions int
 
-	// InterruptedSettleDelay is how long a delivery the shutdown cut short
-	// waits before it is due again, when it keeps its attempt: the cut
-	// request may already have reached the remote end, and a repeat must
-	// not run before it lands. platform.Timeouts.
+	// InterruptedSettleDelay is the least a delivery the shutdown cut short
+	// waits before it is due again, whether it keeps its attempt or counts
+	// it: the cut request may already have reached the remote end, and a
+	// repeat must not run before it lands. A counted interruption waits
+	// the later of this and its backoff. platform.Timeouts.
 	// OutboxInterruptedSettleDelay.
 	InterruptedSettleDelay time.Duration
 }
@@ -170,7 +172,11 @@ type FailureDecision struct {
 //     RuleShutdownInterrupted, deferred and due InterruptedSettleDelay
 //     later, so the cut request, if the remote end accepted it, has
 //     landed before another replica, or this one after its restart,
-//     repeats it.
+//     repeats it. A counted interruption is due no sooner either: the
+//     later of its backoff and InterruptedSettleDelay. Its backoff alone
+//     can be shorter -- every deferral before it gave its attempt back, so
+//     it is often backing off from a first attempt -- and the cut request
+//     is just as likely to be in flight.
 func EvaluateFailure(f Failure, p Policy, now time.Time) FailureDecision {
 	run := f.ConsecutiveInterruptions
 	if run < 0 {
@@ -184,6 +190,15 @@ func EvaluateFailure(f Failure, p Policy, now time.Time) FailureDecision {
 			BackoffDecision:          EvaluateBackoff(f.AttemptCount, p.Backoff, now),
 			ConsecutiveInterruptions: run,
 		}
+	}
+	// countedCut is a counted interruption of a delivery that had started:
+	// its backoff, but never sooner than the settle delay.
+	countedCut := func(rule Rule, run int) FailureDecision {
+		d := counted(rule, run)
+		if settled := now.Add(p.InterruptedSettleDelay); !d.DeadLetter && d.NextRetryAt.Before(settled) {
+			d.NextRetryAt = settled
+		}
+		return d
 	}
 	deferred := func(rule Rule, run int, dueAfter time.Duration) FailureDecision {
 		return FailureDecision{
@@ -204,11 +219,11 @@ func EvaluateFailure(f Failure, p Policy, now time.Time) FailureDecision {
 	run++
 	switch {
 	case !f.Repeatable:
-		return counted(RuleShutdownNotRepeatable, run)
+		return countedCut(RuleShutdownNotRepeatable, run)
 	case f.OutlivedDeliveryTimeout:
-		return counted(RuleShutdownOutlivedDeliveryTimeout, run)
+		return countedCut(RuleShutdownOutlivedDeliveryTimeout, run)
 	case run > p.MaxConsecutiveInterruptions:
-		return counted(RuleShutdownPastBound, run)
+		return countedCut(RuleShutdownPastBound, run)
 	default:
 		return deferred(RuleShutdownInterrupted, run, p.InterruptedSettleDelay)
 	}
