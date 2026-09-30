@@ -2588,10 +2588,11 @@ type Timeouts struct {
 	// GitHubListOpenPRsForUserTimeout/GitHubResolveCodeOwnersTimeout
 	// already establish just above, not a new pattern. GetOpenPR (getopenpr.go)
 	// is FIVE sequential GETs against the SAME single target PR, never
-	// one -- six when the head carries commit statuses: fetchOpenPRDetail,
+	// one -- more when the head carries commit statuses: fetchOpenPRDetail,
 	// fetchReviewDecision, fetchCIConclusionLive's own two calls
 	// (combined-status, check-runs) plus the statuses listing that says who
-	// posted each status (§21.2's required checks), and
+	// posted each status (§21.2's required checks; one page, up to five
+	// when a context's latest status sits past the first), and
 	// fetchChangedFilePaths (all buildOpenPRFromDetail's own construction,
 	// listopenprs.go) -- a previous revision of the call site reused
 	// GitHubGetPRTimeout here, whose OWN doc comment names a genuinely
@@ -2669,6 +2670,18 @@ type Timeouts struct {
 	// below GitHubListOpenPRsForUserTimeout, which bounds the whole Merge
 	// click's revalidation this read runs inside.
 	DecisionInboxRequiredChecksTimeout time.Duration
+
+	// DecisionInboxResolveAppIDTimeout bounds ONE SourceControl.
+	// ResolveAppID call made from internal/app/decisioninbox (§21.2): the
+	// id of the App behind a commit status its bot account posted, read
+	// when a required check names an App and no check run at the head
+	// carries that App's id. SCMCache.ResolveAppID (the read model) and
+	// the merge path (the Merge click and the auto-merge worker) share it.
+	// A single lightweight GET, and one the adapter keeps once read, so
+	// this file's 10s "lightweight GitHub REST GET" baseline. Linked below
+	// GitHubListOpenPRsForUserTimeout, like DecisionInboxRequiredChecksTimeout
+	// above, for the same reason.
+	DecisionInboxResolveAppIDTimeout time.Duration
 
 	// GitHubMergePRTimeout bounds ONE MergePR call -- a single PUT, but to
 	// an endpoint GitHub's own docs note can itself take a moment to
@@ -4075,6 +4088,7 @@ func DefaultTimeouts() Timeouts {
 		DecisionInboxResolveBranchSHATimeout: 10 * time.Second,    // D2, second adversarial-review round; not specified, matches GitHubResolveBaseBranchSHATimeout/GitHubGetPRTimeout's own "lightweight GET" reasoning
 		DecisionInboxIsAncestorTimeout:       10 * time.Second,    // D3, second adversarial-review round; not specified, matches this file's own "lightweight GitHub REST GET" precedent
 		DecisionInboxRequiredChecksTimeout:   20 * time.Second,    // §21.2's required-checks amendment; not specified, two sequential lightweight GETs (the branch object, then the base's rulesets)
+		DecisionInboxResolveAppIDTimeout:     10 * time.Second,    // §21.2's required-checks amendment; not specified, one lightweight GET (GET /apps/{app_slug})
 		GitHubMergePRTimeout:                 15 * time.Second,    // §16; not specified, half again GitHubGetPRTimeout's baseline (interactive, human-facing write)
 		DecisionInboxSCMCacheTTL:             2 * time.Minute,     // §16.2's own worked example ("as of 2 min ago")
 		DecisionInboxStaleAfter:              48 * time.Hour,      // §16.1, explicit ("stale items (>48h, configurable)")
@@ -4412,6 +4426,13 @@ func (t Timeouts) Validate() error {
 	mustBePositive("DecisionInboxRequiredChecksTimeout", t.DecisionInboxRequiredChecksTimeout)
 	check("GitHubListOpenPRsForUserTimeout > DecisionInboxRequiredChecksTimeout",
 		"GitHubListOpenPRsForUserTimeout", t.GitHubListOpenPRsForUserTimeout, "DecisionInboxRequiredChecksTimeout", t.DecisionInboxRequiredChecksTimeout)
+	// The same for identifying the App behind a commit status: a zero bound
+	// would leave every App-posted status unidentified, never counting for
+	// a check that names an App. See DecisionInboxResolveAppIDTimeout's own
+	// doc comment.
+	mustBePositive("DecisionInboxResolveAppIDTimeout", t.DecisionInboxResolveAppIDTimeout)
+	check("GitHubListOpenPRsForUserTimeout > DecisionInboxResolveAppIDTimeout",
+		"GitHubListOpenPRsForUserTimeout", t.GitHubListOpenPRsForUserTimeout, "DecisionInboxResolveAppIDTimeout", t.DecisionInboxResolveAppIDTimeout)
 	mustBePositive("CircuitBreakerWindow", t.CircuitBreakerWindow)
 	mustBePositive("RepoAccessCheckBreakerWindow", t.RepoAccessCheckBreakerWindow)
 

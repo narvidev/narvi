@@ -1250,6 +1250,25 @@ type SourceControl interface {
 	// rule (autoapproval.EvaluateRequiredChecks) removes them. Errors are
 	// plain, like every other method on this port except MergePR.
 	ListRequiredChecks(ctx context.Context, spec ListRequiredChecksSpec) ([]RequiredCheck, error)
+
+	// ResolveAppID reports the id of the App whose slug is spec.Slug -- the
+	// App behind a commit status its bot account ("<slug>[bot]") posted,
+	// when no check run of that App at the head carries the id
+	// (HeadCheck.AppSlug). An App's id never changes, so an implementation
+	// may keep a successful answer for as long as it lives; it never keeps
+	// a failure. A slug that names no App, and every other failure, is an
+	// error -- never a zero id -- and the caller then reads that App as
+	// unidentified, which never lets its status count for a check that
+	// names an App. Errors are plain, like every other method on this port
+	// except MergePR.
+	ResolveAppID(ctx context.Context, spec ResolveAppIDSpec) (int64, error)
+}
+
+// ResolveAppIDSpec is ResolveAppID's input: the App's slug, and the
+// credential the read that needs it uses (ListRequiredChecksSpec.Token).
+type ResolveAppIDSpec struct {
+	Slug  string
+	Token string
 }
 
 // ListRequiredChecksSpec is ListRequiredChecks' input: the base branch
@@ -1320,10 +1339,21 @@ type HeadCheck struct {
 	// AppID is the App a report is attributed to: the App that reported a
 	// check run, or, for a commit status an App posted, that App when a
 	// check run of the same App at the head carries its id -- zero when it
-	// does not, and for every status a person posted.
+	// does not (AppSlug then names the App, for ResolveAppID), and for
+	// every status a person posted.
 	AppID int64
+	// AppSlug is, for a commit status an App posted, the App's slug, from
+	// its bot account's login ("<slug>[bot]"); empty for every other
+	// report.
+	AppSlug string
 	// Poster is who posted a commit status (HeadCheckPosterApp for every
 	// check run).
 	Poster HeadCheckPoster
-	State  HeadCheckState
+	// EarlierFromOthers is set on a commit status when an earlier status
+	// of the same context at the head was posted by another account, or by
+	// one that could not be read, or when the earlier statuses were not
+	// all read: GitHub rolls a context up to its newest status only, so a
+	// check that names an App may have reported under this one.
+	EarlierFromOthers bool
+	State             HeadCheckState
 }

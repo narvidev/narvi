@@ -81,14 +81,20 @@ type HeadCheck struct {
 	Name   string
 	Source CheckSource
 	// AppID is the App a report is attributed to: for a check run, the App
-	// that reported it; for a commit status an App posted, that App when
-	// its id could be established from the head's own check runs, and zero
-	// when it could not. Zero for every other status.
+	// that reported it; for a commit status an App posted, that App when it
+	// could be identified, and zero when it could not. Zero for every other
+	// status.
 	AppID int64
 	// Poster is who posted a commit status: an App, a person, or unknown.
 	// A check run is always PosterApp.
 	Poster Poster
-	State  CheckState
+	// EarlierFromOthers is set on a commit status when an earlier status of
+	// its name at the head came from another account, or from one that
+	// could not be read, or when the earlier ones were not all read. The
+	// code host rolls a name up to its latest status only, so an earlier
+	// status hidden under this one may be the App's.
+	EarlierFromOthers bool
+	State             CheckState
 }
 
 // ShortfallKind is why a required check is not satisfied at the head.
@@ -108,6 +114,16 @@ const (
 	// satisfied by any report that counts, beside a commit status of its
 	// name whose poster could not be read: that status may be the App's.
 	ShortfallPosterUnknown ShortfallKind = "poster_unknown"
+	// ShortfallAppUnknown is a required check naming an App, not satisfied
+	// by any report that counts, beside a commit status of its name that
+	// an App posted but whose App could not be identified: it may be the
+	// App named.
+	ShortfallAppUnknown ShortfallKind = "app_unknown"
+	// ShortfallReplaced is a required check naming an App, not satisfied by
+	// any report that counts, whose name's latest commit status came from
+	// another source over an earlier status that may be the App's
+	// (HeadCheck.EarlierFromOthers): what the App reported cannot be read.
+	ShortfallReplaced ShortfallKind = "replaced"
 	// ShortfallPending is a required check that has reported and not yet
 	// concluded.
 	ShortfallPending ShortfallKind = "pending"
@@ -123,10 +139,6 @@ type RequiredCheckShortfall struct {
 	// OtherSource is set on a missing check when a report of its name did
 	// come in, from a source that does not count for it.
 	OtherSource bool
-	// UnverifiedApp is set on a pending or failed check when a report that
-	// counted is a commit status from an App whose id could not be
-	// established.
-	UnverifiedApp bool
 }
 
 // RequiredChecks is the required-check fact eligibility reads, alongside
@@ -166,21 +178,19 @@ func ReadRequiredChecks(required []RequiredCheck, head []HeadCheck, headComplete
 // failed report outranks a pending one.
 //
 // A check run from another App never counts, nor does a commit status a
-// person posted. A commit status an App posted counts when its App is the
-// one named, and also when its App's id could not be established from the
-// head (no check run of that App is there to carry the id): GitHub
-// attributes such a status to the App that posted it and accepts it, and
-// refusing it here would keep the pull request ineligible for a check that
-// did report. That status's App is then not verified by this rule; GitHub
-// still enforces the exact source when the merge is made. A reason naming
-// such a check says so.
+// person posted, nor one another App posted: a commit status counts for a
+// check naming an App only when that App, identified by id, posted it.
+// A status whose App could not be identified never counts either -- it may
+// be any App -- and neither does one whose poster could not be read.
 //
 // headComplete is false when the head's list of checks was not read in
 // full (its commit statuses beyond one page). A required check that is
 // then not seen is reported unconfirmed, never missing, since it may sit
-// in the part that was not read. A check naming an App beside a status of
-// its name whose poster could not be read is reported the same way, as
-// poster unknown.
+// in the part that was not read. A check naming an App that no report
+// counts for is reported as could-not-be-confirmed, never missing, beside
+// a status of its name whose poster could not be read (poster unknown),
+// whose App could not be identified (App unknown), or that another source
+// posted over an earlier status that may be the App's (replaced).
 //
 // reviewcheck.CheckName (narvi/review) is taken out of the required set
 // before anything else: it is the review this eligibility already reads
@@ -191,23 +201,26 @@ func EvaluateRequiredChecks(required []RequiredCheck, head []HeadCheck, headComp
 	var shortfalls []RequiredCheckShortfall
 	for _, check := range normalizeRequired(required) {
 		counted, failed, pending := 0, false, false
-		otherSource, posterUnknown, unverified := false, false, false
+		otherSource, posterUnknown, appUnknown, replaced := false, false, false, false
 		for _, report := range head {
 			if report.Name != check.Name {
 				continue
 			}
 			if !countsFor(check, report) {
-				if report.Source == CheckSourceStatus && report.Poster == PosterUnknown {
+				switch {
+				case report.Source == CheckSourceStatus && report.Poster == PosterUnknown:
 					posterUnknown = true
-				} else {
+				case report.Source == CheckSourceStatus && report.Poster == PosterApp && report.AppID == 0:
+					appUnknown = true
+				default:
 					otherSource = true
+					if report.Source == CheckSourceStatus && report.EarlierFromOthers {
+						replaced = true
+					}
 				}
 				continue
 			}
 			counted++
-			if check.AppID != 0 && report.Source == CheckSourceStatus && report.AppID == 0 {
-				unverified = true
-			}
 			switch report.State {
 			case CheckStatePassed:
 			case CheckStatePending:
@@ -219,14 +232,18 @@ func EvaluateRequiredChecks(required []RequiredCheck, head []HeadCheck, headComp
 		switch {
 		case counted == 0 && posterUnknown:
 			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallPosterUnknown})
+		case counted == 0 && appUnknown:
+			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallAppUnknown})
+		case counted == 0 && replaced:
+			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallReplaced})
 		case counted == 0 && !headComplete:
 			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallUnconfirmed})
 		case counted == 0:
 			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallMissing, OtherSource: otherSource})
 		case failed:
-			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallFailed, UnverifiedApp: unverified})
+			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallFailed})
 		case pending:
-			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallPending, UnverifiedApp: unverified})
+			shortfalls = append(shortfalls, RequiredCheckShortfall{Check: check, Kind: ShortfallPending})
 		}
 	}
 	return shortfalls
@@ -234,11 +251,11 @@ func EvaluateRequiredChecks(required []RequiredCheck, head []HeadCheck, headComp
 
 // countsFor reports whether report, which carries check's name, is one of
 // the reports that decide check. A check naming no App counts every report
-// of its name. A check naming an App counts that App's check runs, and the
-// commit statuses an App posted -- the named App's, or an App's whose id
-// could not be established (AppID zero; see EvaluateRequiredChecks). A
-// check run from another App, a status attributed to another App, a status
-// a person posted and a status whose poster is unknown never count.
+// of its name. A check naming an App counts that App's check runs and the
+// commit statuses that App posted, the App identified by id. A check run
+// from another App, a status another App posted, a status whose App could
+// not be identified, a status a person posted and a status whose poster is
+// unknown never count.
 func countsFor(check RequiredCheck, report HeadCheck) bool {
 	if check.AppID == 0 {
 		return true
@@ -246,7 +263,7 @@ func countsFor(check RequiredCheck, report HeadCheck) bool {
 	if report.Source == CheckSourceCheckRun {
 		return report.AppID == check.AppID
 	}
-	return report.Poster == PosterApp && (report.AppID == check.AppID || report.AppID == 0)
+	return report.Poster == PosterApp && report.AppID == check.AppID
 }
 
 // normalizeRequired drops reviewcheck.CheckName and empty names, removes
@@ -299,10 +316,6 @@ func describeShortfall(s RequiredCheckShortfall) string {
 	if s.Check.AppID != 0 {
 		name += fmt.Sprintf(" from the App the base branch names (App id %d)", s.Check.AppID)
 	}
-	unverified := ""
-	if s.UnverifiedApp {
-		unverified = ", counting a commit status from an App whose id could not be verified"
-	}
 	switch s.Kind {
 	case ShortfallMissing:
 		if s.OtherSource {
@@ -313,9 +326,13 @@ func describeShortfall(s RequiredCheckShortfall) string {
 		return name + " could not be confirmed at the current head (its commit statuses were not all read)"
 	case ShortfallPosterUnknown:
 		return name + " could not be confirmed at the current head (who posted its commit status could not be read)"
+	case ShortfallAppUnknown:
+		return name + " could not be confirmed at the current head (the App that posted its commit status could not be identified)"
+	case ShortfallReplaced:
+		return name + " could not be confirmed at the current head (its latest commit status came from another source, which does not count, over an earlier one that may be the App's)"
 	case ShortfallPending:
-		return name + " is still running at the current head" + unverified
+		return name + " is still running at the current head"
 	default:
-		return name + " did not pass at the current head" + unverified
+		return name + " did not pass at the current head"
 	}
 }

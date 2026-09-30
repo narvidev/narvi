@@ -142,6 +142,10 @@ func (f *fakeSentinelAutoFixSourceControl) ListRequiredChecks(context.Context, p
 	return nil, nil
 }
 
+func (f *fakeSentinelAutoFixSourceControl) ResolveAppID(context.Context, ports.ResolveAppIDSpec) (int64, error) {
+	return 0, errors.New("fakeSentinelAutoFixSourceControl: ResolveAppID not implemented")
+}
+
 func (f *fakeSentinelAutoFixSourceControl) ResolveCodeOwners(context.Context, ports.ResolveCodeOwnersSpec) ([]ports.Owner, error) {
 	return nil, errors.New("fakeSentinelAutoFixSourceControl: ResolveCodeOwners not implemented")
 }

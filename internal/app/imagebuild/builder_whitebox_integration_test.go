@@ -136,6 +136,10 @@ func (f *whiteboxFakeSourceControl) ListRequiredChecks(context.Context, ports.Li
 	return nil, nil
 }
 
+func (f *whiteboxFakeSourceControl) ResolveAppID(context.Context, ports.ResolveAppIDSpec) (int64, error) {
+	return 0, errors.New("whiteboxFakeSourceControl: ResolveAppID not implemented")
+}
+
 func (f *whiteboxFakeSourceControl) ResolveCodeOwners(context.Context, ports.ResolveCodeOwnersSpec) ([]ports.Owner, error) {
 	return nil, errors.New("whiteboxFakeSourceControl: ResolveCodeOwners not implemented")
 }

@@ -179,6 +179,23 @@ func (c *SCMCache) ListRequiredChecks(ctx context.Context, spec ports.ListRequir
 	return required, nil
 }
 
+// ResolveAppID identifies the App behind spec.Slug
+// (ports.SourceControl.ResolveAppID) for the read model's required-checks
+// fact, bounded by platform.Timeouts.DecisionInboxResolveAppIDTimeout.
+// Not cached here: an App's id never changes, and the adapter keeps each
+// one it reads for its own lifetime, which is the process's -- a cache
+// with an expiry here would only expire an answer that cannot go stale. A
+// failure is kept nowhere, so the next load asks again.
+func (c *SCMCache) ResolveAppID(ctx context.Context, spec ports.ResolveAppIDSpec) (int64, error) {
+	callCtx, cancel := context.WithTimeout(ctx, c.timeouts.DecisionInboxResolveAppIDTimeout)
+	defer cancel()
+	id, err := c.sourceControl.ResolveAppID(callCtx, spec)
+	if err != nil {
+		return 0, fmt.Errorf("decisioninbox: resolve app id: %w", err)
+	}
+	return id, nil
+}
+
 // ResolveBranchSHA returns spec's own branch's CURRENT commit SHA,
 // live-fetching on a cache miss/expiry and caching the result for
 // platform.Timeouts.DecisionInboxSCMCacheTTL -- mirrors

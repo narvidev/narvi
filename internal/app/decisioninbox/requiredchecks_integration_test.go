@@ -49,8 +49,14 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 	status := func(name string, state ports.HeadCheckState) ports.HeadCheck {
 		return ports.HeadCheck{Name: name, Source: ports.HeadCheckSourceStatus, Poster: ports.HeadCheckPosterPerson, State: state}
 	}
-	appStatus := func(name string, appID int64, state ports.HeadCheckState) ports.HeadCheck {
-		return ports.HeadCheck{Name: name, Source: ports.HeadCheckSourceStatus, AppID: appID, Poster: ports.HeadCheckPosterApp, State: state}
+	// appStatus is a commit status the App slug's bot account posted, with
+	// no check run of that App at the head to carry its id.
+	appStatus := func(name, slug string, state ports.HeadCheckState) ports.HeadCheck {
+		return ports.HeadCheck{Name: name, Source: ports.HeadCheckSourceStatus, AppSlug: slug, Poster: ports.HeadCheckPosterApp, State: state}
+	}
+	overEarlierFromOthers := func(h ports.HeadCheck) ports.HeadCheck {
+		h.EarlierFromOthers = true
+		return h
 	}
 	const passed, pending, failed = ports.HeadCheckStatePassed, ports.HeadCheckStatePending, ports.HeadCheckStateFailed
 
@@ -62,7 +68,12 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 		// noBot runs with GitHub outbound off (Deps.GitHubOutbound nil).
 		noBot bool
 		// head is the PR's CI read at its head.
-		head         []ports.HeadCheck
+		head []ports.HeadCheck
+		// apps is every App the code host can identify by slug; a slug
+		// absent from it names no App. wantAppReads is how many App reads
+		// each path makes (the inbox's only when it reads the requirements).
+		apps         map[string]int64
+		wantAppReads int
 		ci           ports.CIConclusion
 		headMoved    bool
 		changedFiles []string
@@ -73,9 +84,11 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 		// does not descend from the verdict's base: a confirmed base move.
 		baseRewritten bool
 		// zeroTimeout sets DecisionInboxRequiredChecksTimeout to zero: a
-		// read made under it has no time at all.
-		zeroTimeout  bool
-		wantEligible bool
+		// read made under it has no time at all. zeroAppTimeout does the
+		// same to DecisionInboxResolveAppIDTimeout.
+		zeroTimeout    bool
+		zeroAppTimeout bool
+		wantEligible   bool
 		// wantMergeOnly: the merge path merges while the inbox, which reads
 		// no requirements with GitHub outbound off, shows needs_review.
 		wantMergeOnly bool
@@ -111,18 +124,69 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 			wantReason: `required check "ci/build" from the App the base branch names (App id 15368) has not reported at the current head; a report of that name came from another source`,
 		},
 		{
-			name:         "a required check an App reports as a commit status is satisfied by that App's status",
-			required:     []ports.RequiredCheck{build("codecov/patch", 254)},
-			head:         []ports.HeadCheck{appStatus("codecov/patch", 0, passed), run("build", 15368, passed)},
+			name:         "a required check an App reports as a commit status is satisfied by that App's status, the App identified by slug",
+			wantAppReads: 1,
+			required:     []ports.RequiredCheck{build("coverage/patch", 254)},
+			head:         []ports.HeadCheck{appStatus("coverage/patch", "coverage", passed), run("build", 15368, passed)},
+			apps:         map[string]int64{"coverage": 254},
 			ci:           ports.CIConclusionSuccess,
 			wantEligible: true,
 		},
 		{
+			name:         "another App's commit status never satisfies a check tied to an App",
+			wantAppReads: 1,
+			required:     []ports.RequiredCheck{build("coverage/patch", 254)},
+			head:         []ports.HeadCheck{appStatus("coverage/patch", "other-ci", passed), run("build", 15368, passed)},
+			apps:         map[string]int64{"coverage": 254, "other-ci": 99},
+			ci:           ports.CIConclusionSuccess,
+			wantReason:   `required check "coverage/patch" from the App the base branch names (App id 254) has not reported at the current head; a report of that name came from another source`,
+		},
+		{
+			// The masking case: the named App's own earlier status is
+			// hidden under another App's later one.
+			name:         "another App's commit status over an earlier one that may be the App's leaves the check not confirmed",
+			wantAppReads: 1,
+			required:     []ports.RequiredCheck{build("coverage/patch", 254)},
+			head:         []ports.HeadCheck{overEarlierFromOthers(appStatus("coverage/patch", "other-ci", passed)), run("build", 15368, passed)},
+			apps:         map[string]int64{"coverage": 254, "other-ci": 99},
+			ci:           ports.CIConclusionSuccess,
+			wantReason:   `required check "coverage/patch" from the App the base branch names (App id 254) could not be confirmed at the current head (its latest commit status came from another source`,
+		},
+		{
+			name:         "a commit status from an App that cannot be identified leaves the check not confirmed",
+			wantAppReads: 1,
+			required:     []ports.RequiredCheck{build("coverage/patch", 254)},
+			head:         []ports.HeadCheck{appStatus("coverage/patch", "coverage", passed), run("build", 15368, passed)},
+			ci:           ports.CIConclusionSuccess,
+			wantReason:   `required check "coverage/patch" from the App the base branch names (App id 254) could not be confirmed at the current head (the App that posted its commit status could not be identified)`,
+		},
+		{
+			// Beside a check that does name one: only that check's status
+			// is read for.
+			name:         "a commit status an App posted for a check naming no App needs no App read",
+			required:     []ports.RequiredCheck{build("deploy/preview", 0), build("coverage/patch", 254)},
+			head:         []ports.HeadCheck{appStatus("deploy/preview", "previews", passed), appStatus("coverage/patch", "coverage", passed), run("build", 15368, passed)},
+			apps:         map[string]int64{"coverage": 254},
+			ci:           ports.CIConclusionSuccess,
+			wantAppReads: 1,
+			wantEligible: true,
+		},
+		{
+			name:           "the App read runs under DecisionInboxResolveAppIDTimeout",
+			required:       []ports.RequiredCheck{build("coverage/patch", 254)},
+			head:           []ports.HeadCheck{appStatus("coverage/patch", "coverage", passed), run("build", 15368, passed)},
+			apps:           map[string]int64{"coverage": 254},
+			zeroAppTimeout: true,
+			ci:             ports.CIConclusionSuccess,
+			wantAppReads:   1,
+			wantReason:     `required check "coverage/patch" from the App the base branch names (App id 254) could not be confirmed at the current head (the App that posted its commit status could not be identified)`,
+		},
+		{
 			name:       "a person's commit status never satisfies a check tied to an App",
-			required:   []ports.RequiredCheck{build("codecov/patch", 254)},
-			head:       []ports.HeadCheck{status("codecov/patch", passed), run("build", 15368, passed)},
+			required:   []ports.RequiredCheck{build("coverage/patch", 254)},
+			head:       []ports.HeadCheck{status("coverage/patch", passed), run("build", 15368, passed)},
 			ci:         ports.CIConclusionSuccess,
-			wantReason: `required check "codecov/patch" from the App the base branch names (App id 254) has not reported at the current head`,
+			wantReason: `required check "coverage/patch" from the App the base branch names (App id 254) has not reported at the current head`,
 		},
 		{
 			name:       "an App-named check that failed names its App",
@@ -273,11 +337,15 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 				rs.sourceControl.requiredChecksByBranch = map[string][]ports.RequiredCheck{pr.BaseRef: tc.required}
 			}
 			rs.sourceControl.requiredChecksErr = tc.readErr
+			rs.sourceControl.appIDsBySlug = tc.apps
 
 			deps := rs.deps
 			timeouts := platform.DefaultTimeouts()
 			if tc.zeroTimeout {
 				timeouts.DecisionInboxRequiredChecksTimeout = 0
+			}
+			if tc.zeroAppTimeout {
+				timeouts.DecisionInboxResolveAppIDTimeout = 0
 			}
 			deps.Timeouts = timeouts
 			deps.SCMCache = decisioninbox.NewSCMCache(rs.sourceControl, timeouts)
@@ -315,6 +383,13 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 					t.Errorf("inbox ListRequiredChecks token = %q, want the bot's", c.Token)
 				}
 			}
+			inboxResolves := rs.sourceControl.resolveAppIDCalls
+			rs.sourceControl.resolveAppIDCalls = nil
+			for _, c := range inboxResolves {
+				if c.Token != testBotToken {
+					t.Errorf("inbox ResolveAppID token = %q, want the bot's, like the requirements read", c.Token)
+				}
+			}
 
 			// The merge path.
 			ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, deps, rs.sourceControl, actorGitHubID, repoFullName, n, humanToken)
@@ -345,6 +420,17 @@ func TestRequiredChecks_InboxAndMergePathAgree(t *testing.T) {
 				if c.Token != humanToken {
 					t.Errorf("Merge click ListRequiredChecks token = %q, want the person's own (the credential the merge is made with)", c.Token)
 				}
+			}
+			mergeResolves := rs.sourceControl.resolveAppIDCalls
+			for _, c := range mergeResolves {
+				if c.Token != humanToken {
+					t.Errorf("Merge click ResolveAppID token = %q, want the person's own, like the requirements read", c.Token)
+				}
+			}
+			// An App is identified only where a requirement names one and
+			// no check run carried its id.
+			if len(mergeResolves) != tc.wantAppReads || (!tc.noBot && len(inboxResolves) != tc.wantAppReads) {
+				t.Errorf("ResolveAppID calls = (inbox %d, merge %d), want %d each", len(inboxResolves), len(mergeResolves), tc.wantAppReads)
 			}
 		})
 	}

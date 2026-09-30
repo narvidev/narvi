@@ -100,10 +100,11 @@
 //     must have been read (ReasonRequiredChecksUnknown otherwise, never a
 //     fall-back to the CI read alone), and the head must satisfy each one:
 //     reported, from the App the base names when it names one (its check
-//     run, or a commit status its bot account posted), and passed -- a
-//     check run and a commit status of the same name both passed. A
-//     required check that is missing, still running or failed refuses
-//     with a Reason naming it, and its App (requiredchecks.go). narvi/review is taken
+//     run, or a commit status its bot account posted, that App identified
+//     by id), and passed -- a check run and a commit status of the same
+//     name both passed. A required check that is missing, could not be
+//     confirmed, still running or failed refuses with a Reason naming it,
+//     and its App (requiredchecks.go). narvi/review is taken
 //     out of the required set: it is the review this eligibility already
 //     reads. Checked before check 7, so a required check that has not
 //     reported is named rather than read as "CI is not green".

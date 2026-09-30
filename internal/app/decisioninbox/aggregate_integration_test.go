@@ -231,6 +231,11 @@ type fakeDecisionInboxSourceControl struct {
 	requiredChecksByBranch map[string][]ports.RequiredCheck
 	requiredChecksErr      error
 	requiredChecksCalls    []ports.ListRequiredChecksSpec
+
+	// appIDsBySlug/resolveAppIDCalls back ResolveAppID below: a slug absent
+	// from the map names no App, and resolving it fails.
+	appIDsBySlug      map[string]int64
+	resolveAppIDCalls []ports.ResolveAppIDSpec
 }
 
 var _ ports.SourceControl = (*fakeDecisionInboxSourceControl)(nil)
@@ -254,6 +259,20 @@ func (f *fakeDecisionInboxSourceControl) ListRequiredChecks(ctx context.Context,
 		return nil, f.requiredChecksErr
 	}
 	return f.requiredChecksByBranch[spec.Branch], nil
+}
+
+// ResolveAppID reports appIDsBySlug[spec.Slug], failing for a slug absent
+// from it, recording the call. Honors ctx first, like ListRequiredChecks.
+func (f *fakeDecisionInboxSourceControl) ResolveAppID(ctx context.Context, spec ports.ResolveAppIDSpec) (int64, error) {
+	f.resolveAppIDCalls = append(f.resolveAppIDCalls, spec)
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	id, ok := f.appIDsBySlug[spec.Slug]
+	if !ok {
+		return 0, errors.New("fakeDecisionInboxSourceControl: no App has slug " + spec.Slug)
+	}
+	return id, nil
 }
 
 // IsAncestor (D3, second adversarial-review round) reports

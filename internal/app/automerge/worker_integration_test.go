@@ -96,6 +96,11 @@ type fakeAutoMergeSourceControl struct {
 	requiredChecksErr      error
 	requiredChecksCalls    []ports.ListRequiredChecksSpec
 
+	// appIDsBySlug/resolveAppIDCalls back ResolveAppID below: a slug absent
+	// from the map names no App, and resolving it fails.
+	appIDsBySlug      map[string]int64
+	resolveAppIDCalls []ports.ResolveAppIDSpec
+
 	mergeCalls     []ports.MergePRSpec
 	mergeSHA       string
 	mergeErr       error
@@ -424,6 +429,22 @@ func (f *fakeAutoMergeSourceControl) ListRequiredChecks(ctx context.Context, spe
 		return nil, f.requiredChecksErr
 	}
 	return f.requiredChecksByBranch[spec.Branch], nil
+}
+
+// ResolveAppID reports appIDsBySlug[spec.Slug], failing for a slug absent
+// from it, recording the call. Honors ctx first, like ListRequiredChecks.
+func (f *fakeAutoMergeSourceControl) ResolveAppID(ctx context.Context, spec ports.ResolveAppIDSpec) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.resolveAppIDCalls = append(f.resolveAppIDCalls, spec)
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	id, ok := f.appIDsBySlug[spec.Slug]
+	if !ok {
+		return 0, errors.New("fakeAutoMergeSourceControl: no App has slug " + spec.Slug)
+	}
+	return id, nil
 }
 
 // automergeTestRig bundles every store internal/app/automerge.Worker

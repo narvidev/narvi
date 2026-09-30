@@ -144,6 +144,10 @@ func (f *fakeDescriptionAutofixSourceControl) ListRequiredChecks(context.Context
 	return nil, nil
 }
 
+func (f *fakeDescriptionAutofixSourceControl) ResolveAppID(context.Context, ports.ResolveAppIDSpec) (int64, error) {
+	return 0, errors.New("fakeDescriptionAutofixSourceControl: ResolveAppID not implemented")
+}
+
 func (f *fakeDescriptionAutofixSourceControl) ResolveCodeOwners(context.Context, ports.ResolveCodeOwnersSpec) ([]ports.Owner, error) {
 	return nil, errors.New("fakeDescriptionAutofixSourceControl: ResolveCodeOwners not implemented")
 }

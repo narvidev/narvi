@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/contractdrift"
@@ -60,6 +61,11 @@ const maxResponseBodySize = 1 << 20 // 1 MiB
 type Adapter struct {
 	httpClient *http.Client
 	apiBaseURL string
+
+	// appIDs is ResolveAppID's answers, by slug, for as long as the
+	// adapter lives (appid.go). Guarded by appIDsMu.
+	appIDsMu sync.Mutex
+	appIDs   map[string]int64
 }
 
 // var _ ports.SourceControl = (*Adapter)(nil) makes a SourceControl

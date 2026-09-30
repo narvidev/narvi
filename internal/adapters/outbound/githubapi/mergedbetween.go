@@ -318,11 +318,14 @@ func (a *Adapter) branchRequiresApprovingReview(ctx context.Context, owner, repo
 // Statuses is the one status per context GitHub rolls up (the latest for
 // each), read only by fetchCIConclusionLive to list the head's checks for
 // a base branch's required checks (ports.OpenPR.HeadChecks); State alone
-// already covers every status for the CI conclusion itself.
+// already covers every status for the CI conclusion itself. Each carries
+// its status id, which is how its poster is found in the per-ref statuses
+// listing (fetchStatusPosters).
 type combinedStatusResponse struct {
 	State      string `json:"state"`
 	TotalCount int    `json:"total_count"`
 	Statuses   []struct {
+		ID      int64  `json:"id"`
 		Context string `json:"context"`
 		State   string `json:"state"`
 	} `json:"statuses"`

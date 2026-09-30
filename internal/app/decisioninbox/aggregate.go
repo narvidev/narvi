@@ -1167,7 +1167,9 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// requiredChecks is the base branch's required checks at pr's head
 	// (§21.2's "CI green means the required checks" amendment), read as
 	// the bot through deps.SCMCache -- once per base branch per TTL, shared
-	// by every row and actor (SCMCache.ListRequiredChecks). Read only now
+	// by every row and actor (SCMCache.ListRequiredChecks), the App behind
+	// an App's commit status identified as the bot too where a requirement
+	// names an App (SCMCache.ResolveAppID). Read only now
 	// that the probe has passed, like the base SHA below: this read model
 	// shows no refusal reason, so a pull request the probe already refused
 	// gains nothing from it. A failed read is the fact's zero value, which
@@ -1185,8 +1187,11 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	requiredChecksUnread := false
 	outboundOff := deps.GitHubOutbound == nil
 	if !outboundOff {
-		required, requiredErr := deps.SCMCache.ListRequiredChecks(ctx, requiredChecksSpec(pr, deps.GitHubOutbound.BotToken()), now)
-		requiredChecks = requiredChecksFact(required, requiredErr, pr)
+		botToken := deps.GitHubOutbound.BotToken()
+		required, requiredErr := deps.SCMCache.ListRequiredChecks(ctx, requiredChecksSpec(pr, botToken), now)
+		requiredChecks = requiredChecksFact(ctx, required, requiredErr, pr, func(ctx context.Context, slug string) (int64, error) {
+			return deps.SCMCache.ResolveAppID(ctx, ports.ResolveAppIDSpec{Slug: slug, Token: botToken})
+		})
 		requiredChecksUnread = requiredErr != nil
 		if requiredChecksUnread {
 			platform.Logger(ctx).Warn("decisioninbox: read base branch's required checks failed, eligibility will fail closed via ReasonRequiredChecksUnknown", "error", requiredErr, "repo", repoFullName, "pr_number", pr.Number, "base_ref", pr.BaseRef)

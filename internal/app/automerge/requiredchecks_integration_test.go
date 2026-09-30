@@ -36,8 +36,14 @@ type requiredChecksGitHub struct {
 	statuses  []map[string]any
 	checkRuns []map[string]any
 	// creators answers the per-ref statuses listing: who posted the
-	// status of each context (a map of "login" and "type").
+	// status of each context (a map of "login" and "type"), matched to the
+	// combined status by id. earlier is older listing entries, after
+	// those: statuses the combined status rolled up past.
 	creators map[string]map[string]any
+	earlier  []map[string]any
+	// apps answers GET /apps/{app_slug}: the id of each App; a slug absent
+	// from it names no App.
+	apps map[string]int64
 	// branch answers GET /branches/main; rules answers GET
 	// /rules/branches/main (status and body).
 	branch      map[string]any
@@ -85,14 +91,22 @@ func (g *requiredChecksGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		if len(g.statuses) == 0 {
 			state = "pending"
 		}
-		encode(map[string]any{"state": state, "total_count": len(g.statuses), "statuses": g.statuses})
+		encode(map[string]any{"state": state, "total_count": len(g.statuses), "statuses": g.withStatusIDs()})
 	case r.Method == http.MethodGet && r.URL.Path == prefix+"/commits/"+g.head+"/statuses":
 		listing := []map[string]any{}
-		for _, st := range g.statuses {
+		for _, st := range g.withStatusIDs() {
 			context := st["context"].(string)
-			listing = append(listing, map[string]any{"context": context, "state": st["state"], "creator": g.creators[context]})
+			listing = append(listing, map[string]any{"id": st["id"], "context": context, "state": st["state"], "creator": g.creators[context]})
 		}
-		encode(listing)
+		encode(append(listing, g.earlier...))
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, "/apps/"):
+		id, ok := g.apps[strings.TrimPrefix(r.URL.Path, "/apps/")]
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"message":"Not Found"}`))
+			return
+		}
+		encode(map[string]any{"id": id})
 	case r.Method == http.MethodGet && r.URL.Path == prefix+"/commits/"+g.head+"/check-runs":
 		encode(map[string]any{"total_count": len(g.checkRuns), "check_runs": g.checkRuns})
 	case r.Method == http.MethodGet && r.URL.Path == prefix+"/commits/"+testEligibleBaseRef:
@@ -111,6 +125,20 @@ func (g *requiredChecksGitHub) ServeHTTP(w http.ResponseWriter, r *http.Request)
 		w.WriteHeader(http.StatusNotFound)
 		_, _ = w.Write([]byte(`{"message":"Not Found"}`))
 	}
+}
+
+// withStatusIDs is statuses as the combined status serves them: each with
+// its status id, the one the listing carries for it too.
+func (g *requiredChecksGitHub) withStatusIDs() []map[string]any {
+	out := make([]map[string]any, 0, len(g.statuses))
+	for i, st := range g.statuses {
+		withID := map[string]any{"id": 1000 + i}
+		for k, v := range st {
+			withID[k] = v
+		}
+		out = append(out, withID)
+	}
+	return out
 }
 
 // protection is a branch object whose protection requires checks.
@@ -160,12 +188,16 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 		name        string
 		statuses    []map[string]any
 		creators    map[string]map[string]any
+		earlier     []map[string]any
+		apps        map[string]int64
 		checkRuns   []map[string]any
 		branch      map[string]any
 		rulesStatus int
 		rulesBody   string
 		wantMerged  bool
 		wantReason  string
+		// wantAppReads is every GET /apps/{app_slug} path requested.
+		wantAppReads []string
 	}{
 		{
 			name:        "a base requiring nothing merges, as today",
@@ -218,13 +250,50 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 			wantMerged: true,
 		},
 		{
-			name:        "a check tied to an App merges on that App's own commit status, its id not verifiable",
-			statuses:    []map[string]any{{"context": "codecov/patch", "state": "success"}},
-			creators:    map[string]map[string]any{"codecov/patch": {"login": "codecov[bot]", "type": "Bot"}},
+			name:        "a check tied to an App merges on that App's own commit status, the App identified by slug",
+			statuses:    []map[string]any{{"context": "coverage/patch", "state": "success"}},
+			creators:    map[string]map[string]any{"coverage/patch": {"login": "coverage[bot]", "type": "Bot"}},
+			apps:        map[string]int64{"coverage": 254},
 			checkRuns:   []map[string]any{actionsRunJSON("build", "success")},
-			branch:      protection(map[string]any{"context": "codecov/patch", "app_id": 254}),
+			branch:      protection(map[string]any{"context": "coverage/patch", "app_id": 254}),
 			rulesStatus: http.StatusOK, rulesBody: rulesJSON(),
-			wantMerged: true,
+			wantMerged:   true,
+			wantAppReads: []string{"GET /apps/coverage"},
+		},
+		{
+			name:        "a check tied to an App never merges on another App's commit status",
+			statuses:    []map[string]any{{"context": "coverage/patch", "state": "success"}},
+			creators:    map[string]map[string]any{"coverage/patch": {"login": "other-ci[bot]", "type": "Bot"}},
+			apps:        map[string]int64{"coverage": 254, "other-ci": 99},
+			checkRuns:   []map[string]any{actionsRunJSON("build", "success")},
+			branch:      protection(map[string]any{"context": "coverage/patch", "app_id": 254}),
+			rulesStatus: http.StatusOK, rulesBody: rulesJSON(),
+			wantReason:   `required check \"coverage/patch\" from the App the base branch names (App id 254) has not reported at the current head; a report of that name came from another source`,
+			wantAppReads: []string{"GET /apps/other-ci"},
+		},
+		{
+			// The masking case: the named App's status failed, then another
+			// App's passed, and the combined status keeps the latest only.
+			name:        "a check tied to an App never merges on another App's status posted over the App's own failure",
+			statuses:    []map[string]any{{"context": "coverage/patch", "state": "success"}},
+			creators:    map[string]map[string]any{"coverage/patch": {"login": "other-ci[bot]", "type": "Bot"}},
+			earlier:     []map[string]any{{"id": 900, "context": "coverage/patch", "state": "failure", "creator": map[string]any{"login": "coverage[bot]", "type": "Bot"}}},
+			apps:        map[string]int64{"coverage": 254, "other-ci": 99},
+			checkRuns:   []map[string]any{actionsRunJSON("build", "success")},
+			branch:      protection(map[string]any{"context": "coverage/patch", "app_id": 254}),
+			rulesStatus: http.StatusOK, rulesBody: rulesJSON(),
+			wantReason:   `required check \"coverage/patch\" from the App the base branch names (App id 254) could not be confirmed at the current head (its latest commit status came from another source`,
+			wantAppReads: []string{"GET /apps/other-ci"},
+		},
+		{
+			name:        "a check tied to an App never merges on a status from an App that cannot be identified",
+			statuses:    []map[string]any{{"context": "coverage/patch", "state": "success"}},
+			creators:    map[string]map[string]any{"coverage/patch": {"login": "coverage[bot]", "type": "Bot"}},
+			checkRuns:   []map[string]any{actionsRunJSON("build", "success")},
+			branch:      protection(map[string]any{"context": "coverage/patch", "app_id": 254}),
+			rulesStatus: http.StatusOK, rulesBody: rulesJSON(),
+			wantReason:   `required check \"coverage/patch\" from the App the base branch names (App id 254) could not be confirmed at the current head (the App that posted its commit status could not be identified)`,
+			wantAppReads: []string{"GET /apps/coverage"},
 		},
 		{
 			name:        "a check tied to GitHub Actions merges on its workflow's status, the App verified by its check run",
@@ -237,21 +306,21 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 		},
 		{
 			name:        "a check tied to an App never merges on a status a person posted",
-			statuses:    []map[string]any{{"context": "codecov/patch", "state": "success"}},
-			creators:    map[string]map[string]any{"codecov/patch": {"login": "octocat", "type": "User"}},
+			statuses:    []map[string]any{{"context": "coverage/patch", "state": "success"}},
+			creators:    map[string]map[string]any{"coverage/patch": {"login": "octocat", "type": "User"}},
 			checkRuns:   []map[string]any{actionsRunJSON("build", "success")},
-			branch:      protection(map[string]any{"context": "codecov/patch", "app_id": 254}),
+			branch:      protection(map[string]any{"context": "coverage/patch", "app_id": 254}),
 			rulesStatus: http.StatusOK, rulesBody: rulesJSON(),
-			wantReason: `required check \"codecov/patch\" from the App the base branch names (App id 254) has not reported at the current head; a report of that name came from another source`,
+			wantReason: `required check \"coverage/patch\" from the App the base branch names (App id 254) has not reported at the current head; a report of that name came from another source`,
 		},
 		{
 			name:        "a check tied to an App never merges on a status another verified App posted",
-			statuses:    []map[string]any{{"context": "codecov/patch", "state": "success"}},
-			creators:    map[string]map[string]any{"codecov/patch": {"login": "github-actions[bot]", "type": "Bot"}},
+			statuses:    []map[string]any{{"context": "coverage/patch", "state": "success"}},
+			creators:    map[string]map[string]any{"coverage/patch": {"login": "github-actions[bot]", "type": "Bot"}},
 			checkRuns:   []map[string]any{actionsRunJSON("build", "success")},
-			branch:      protection(map[string]any{"context": "codecov/patch", "app_id": 254}),
+			branch:      protection(map[string]any{"context": "coverage/patch", "app_id": 254}),
 			rulesStatus: http.StatusOK, rulesBody: rulesJSON(),
-			wantReason: `required check \"codecov/patch\" from the App the base branch names (App id 254) has not reported at the current head`,
+			wantReason: `required check \"coverage/patch\" from the App the base branch names (App id 254) has not reported at the current head`,
 		},
 		{
 			name:        "any other failed read of the requirements never merges",
@@ -275,7 +344,7 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 
 			github := &requiredChecksGitHub{
 				repo: repo, number: int(n), head: head,
-				statuses: tc.statuses, creators: tc.creators, checkRuns: tc.checkRuns,
+				statuses: tc.statuses, creators: tc.creators, earlier: tc.earlier, apps: tc.apps, checkRuns: tc.checkRuns,
 				branch: tc.branch, rulesStatus: tc.rulesStatus, rulesBody: tc.rulesBody,
 			}
 			server := httptest.NewServer(github)
@@ -311,6 +380,15 @@ func TestPumpOnce_RequiredChecks_EndToEnd(t *testing.T) {
 			}
 			if tc.wantReason != "" && !strings.Contains(logs.String(), tc.wantReason) {
 				t.Errorf("the worker's log does not carry the reason %q:\n%s", tc.wantReason, logs.String())
+			}
+			var appReads []string
+			for _, req := range requests {
+				if strings.HasPrefix(req, "GET /apps/") {
+					appReads = append(appReads, req)
+				}
+			}
+			if strings.Join(appReads, ",") != strings.Join(tc.wantAppReads, ",") {
+				t.Errorf("App reads = %v, want %v", appReads, tc.wantAppReads)
 			}
 
 			total, _, err := narvipg.NewAutoApprovalOutcomeStore(rig.pool).CountInWindow(ctx, repoFullName, pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true})

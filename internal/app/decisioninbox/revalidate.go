@@ -463,7 +463,9 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	// with: the person's own token on a Merge click (so a Merge click never
 	// depends on GitHub outbound, like the merge it makes), the bot's on
 	// the auto-merge worker -- and evaluated against the checks target's
-	// own CI read listed (requiredchecks.go). The worker hands in one memo
+	// own CI read listed, the App behind an App's commit status identified
+	// with the same token where a requirement names an App
+	// (requiredchecks.go). The worker hands in one memo
 	// per tick, so candidates into the same base share a read; a Merge
 	// click hands in none and reads fresh. Read BEFORE the probe, unlike
 	// the read model (computeRealEligibility): this function's refusal is
@@ -479,7 +481,7 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	if requiredErr != nil {
 		platform.Logger(ctx).Warn("decisioninbox: read base branch's required checks failed -- eligibility will fail closed via ReasonRequiredChecksUnknown unless another criterion refuses first", "error", requiredErr, "repo_full_name", repoFullName, "pr_number", prNumber, "base_ref", target.BaseRef)
 	}
-	requiredChecks := requiredChecksFact(required, requiredErr, target)
+	requiredChecks := requiredChecksFact(ctx, required, requiredErr, target, liveAppIDResolver(deps, sourceControl, token))
 
 	// probe (G3/G4, fourth adversarial-review round) asks "setting the
 	// base-freshness question aside entirely, is this PR already

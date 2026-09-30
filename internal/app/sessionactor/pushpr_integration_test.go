@@ -336,6 +336,10 @@ func (f *fakeSourceControl) ListRequiredChecks(context.Context, ports.ListRequir
 	return nil, nil
 }
 
+func (f *fakeSourceControl) ResolveAppID(context.Context, ports.ResolveAppIDSpec) (int64, error) {
+	return 0, errors.New("fakeSourceControl: ResolveAppID not implemented")
+}
+
 func (f *fakeSourceControl) ResolveCodeOwners(context.Context, ports.ResolveCodeOwnersSpec) ([]ports.Owner, error) {
 	return nil, errors.New("fakeSourceControl: ResolveCodeOwners not implemented")
 }

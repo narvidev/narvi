@@ -169,6 +169,13 @@ func TestValidate_CatchesEachBrokenLink(t *testing.T) {
 			},
 			wantChain: "GitHubListOpenPRsForUserTimeout > DecisionInboxRequiredChecksTimeout",
 		},
+		{
+			name: "GitHubListOpenPRsForUserTimeout not > DecisionInboxResolveAppIDTimeout",
+			mutate: func(to *platform.Timeouts) {
+				to.DecisionInboxResolveAppIDTimeout = to.GitHubListOpenPRsForUserTimeout
+			},
+			wantChain: "GitHubListOpenPRsForUserTimeout > DecisionInboxResolveAppIDTimeout",
+		},
 	}
 
 	for _, tc := range tests {
@@ -1510,6 +1517,24 @@ func TestDefaultTimeouts_Step173StandaloneField(t *testing.T) {
 	}
 }
 
+// TestDefaultTimeouts_DecisionInboxResolveAppIDTimeout pins the shipped
+// bound on one read of the App behind a commit status (§21.2): one
+// lightweight GET, inside the Merge click's revalidation bound.
+func TestDefaultTimeouts_DecisionInboxResolveAppIDTimeout(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	if to.DecisionInboxResolveAppIDTimeout != 10*time.Second {
+		t.Errorf("DecisionInboxResolveAppIDTimeout = %v, want %v", to.DecisionInboxResolveAppIDTimeout, 10*time.Second)
+	}
+	if to.DecisionInboxResolveAppIDTimeout >= to.GitHubListOpenPRsForUserTimeout {
+		t.Errorf("DecisionInboxResolveAppIDTimeout = %v, want below GitHubListOpenPRsForUserTimeout (%v), which bounds the revalidation it runs inside", to.DecisionInboxResolveAppIDTimeout, to.GitHubListOpenPRsForUserTimeout)
+	}
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
+	}
+}
+
 // TestDefaultTimeouts_DecisionInboxRequiredChecksTimeout pins the shipped
 // bound on one read of a base branch's required checks (§21.2): two
 // lightweight GETs, and inside the Merge click's revalidation bound.
@@ -1568,6 +1593,11 @@ func TestValidate_RequiresPositiveFields(t *testing.T) {
 			name:      "DecisionInboxRequiredChecksTimeout == 0",
 			mutate:    func(to *platform.Timeouts) { to.DecisionInboxRequiredChecksTimeout = 0 },
 			wantField: "DecisionInboxRequiredChecksTimeout",
+		},
+		{
+			name:      "DecisionInboxResolveAppIDTimeout == 0",
+			mutate:    func(to *platform.Timeouts) { to.DecisionInboxResolveAppIDTimeout = 0 },
+			wantField: "DecisionInboxResolveAppIDTimeout",
 		},
 		{
 			// A negative value is exactly as permissive as zero for every

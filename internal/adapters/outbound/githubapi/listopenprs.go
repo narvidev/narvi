@@ -693,9 +693,9 @@ func ancestorChainFromDetailStack(stack *stackResponse) []ports.PRAncestorLink {
 // required checks (§21.2's "CI green means the required checks"
 // amendment): every check run with its App id, and every commit status
 // context GitHub rolls up, each mapped to passed, pending or failed. When
-// the head carries commit statuses, one more GET, the per-ref statuses
-// listing, says who posted each (fetchStatusPosters), so a status an App
-// posted can count for a check tied to that App. The
+// the head carries commit statuses, the per-ref statuses listing says who
+// posted each (fetchStatusPosters, a bounded number of pages), so a status
+// an App posted can count for a check tied to that App. The
 // listing never changes the conclusion above -- a base that requires
 // nothing reads exactly what it read before it existed. The status GET
 // asks for per_page=100 so the per-context list is as complete as one page
@@ -721,7 +721,7 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 			degraded = true
 		} else {
 			for _, st := range status.Statuses {
-				statusEntries = append(statusEntries, statusEntry{context: st.Context, state: st.State})
+				statusEntries = append(statusEntries, statusEntry{id: st.ID, context: st.Context, state: st.State})
 			}
 			statusesTruncated = status.TotalCount > len(status.Statuses)
 			switch status.State {
@@ -846,10 +846,11 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 	// checks are all check runs pays nothing for it.
 	var headChecks []ports.HeadCheck
 	if len(statusEntries) > 0 {
-		posters := a.fetchStatusPosters(ctx, owner, repo, headSHA, token)
+		attributions := a.fetchStatusPosters(ctx, owner, repo, headSHA, token, statusEntries)
 		for _, st := range statusEntries {
-			check := ports.HeadCheck{Name: st.context, Source: ports.HeadCheckSourceStatus, State: statusHeadCheckState(st.state)}
-			check.Poster, check.AppID = attributeStatus(posters[st.context], appBySlug)
+			attribution := attributions[st.id]
+			check := ports.HeadCheck{Name: st.context, Source: ports.HeadCheckSourceStatus, State: statusHeadCheckState(st.state), EarlierFromOthers: attribution.earlierFromOthers}
+			check.Poster, check.AppID, check.AppSlug = attributeStatus(attribution.poster, appBySlug)
 			headChecks = append(headChecks, check)
 		}
 	}
@@ -879,8 +880,10 @@ func (a *Adapter) fetchCIConclusionLive(ctx context.Context, owner, repo, headSH
 	return read
 }
 
-// statusEntry is one context of the combined status: its latest state.
+// statusEntry is one context of the combined status: the id and state of
+// its latest status.
 type statusEntry struct {
+	id      int64
 	context string
 	state   string
 }
@@ -895,55 +898,131 @@ type statusPoster struct {
 
 // commitStatusListItem is the subset of one entry of GitHub's GET
 // /repos/{owner}/{repo}/commits/{ref}/statuses response read here: the
-// context and who created it. The combined status names no creator; this
-// listing does, newest first.
+// status id, its context, and who created it. The combined status names no
+// creator; this listing does, newest first.
 type commitStatusListItem struct {
+	ID      int64         `json:"id"`
 	Context string        `json:"context"`
 	Creator *statusPoster `json:"creator"`
 }
 
-// fetchStatusPosters reads who posted each commit status context at ref:
-// the creator of the newest status of each context in GitHub's per-ref
-// statuses listing (newest first, one page of a hundred). A context not
-// found there -- a failed or undecodable read, or one pushed past the page
-// by a hundred newer statuses -- has no entry, and its poster reads
-// unknown, which never lets its status count for a check tied to an App.
-func (a *Adapter) fetchStatusPosters(ctx context.Context, owner, repo, ref, token string) map[string]statusPoster {
-	posters := map[string]statusPoster{}
-	path := fmt.Sprintf("%s/repos/%s/%s/commits/%s/statuses?per_page=100", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(ref))
-	body, err := a.doGet(ctx, path, token)
-	if err != nil {
-		return posters
-	}
-	var items []commitStatusListItem
-	if json.Unmarshal(body, &items) != nil {
-		return posters
-	}
-	for _, it := range items {
-		if it.Creator == nil {
-			continue
+// statusListPerPage is the page size asked of the per-ref statuses
+// listing -- the largest GitHub serves.
+const statusListPerPage = 100
+
+// maxStatusListPages bounds how many pages of the per-ref statuses listing
+// one read follows. The listing holds every status ever posted at the ref,
+// each transition of a context included, so the status the combined status
+// rolled a context up to can sit well past the first page; one past this
+// many pages is not looked for, and its poster reads unknown.
+const maxStatusListPages = 5
+
+// statusAttribution is what the per-ref statuses listing says about one
+// status of the combined status.
+type statusAttribution struct {
+	// poster is the status's creator: zero -- unknown -- when the status
+	// was not found in the pages read, or was found with no creator.
+	poster statusPoster
+	// earlierFromOthers is ports.HeadCheck.EarlierFromOthers.
+	earlierFromOthers bool
+}
+
+// fetchStatusPosters reads, from GitHub's per-ref statuses listing (newest
+// first), who posted each status the combined status rolled a context up
+// to, by status id: the listing entry with the SAME id, never merely one
+// of the same context -- a context's newest listing entry can be a status
+// posted after the combined status was read, or one with no creator, and
+// neither says who posted the status whose state is being judged.
+//
+// It pages until every status in entries is found, the listing ends, or
+// maxStatusListPages were read. A status not found -- past the bound, or
+// on a page that failed or did not decode -- is absent from the answer,
+// and its poster reads unknown. Once a status is found, the older entries
+// of its context read after it say whether an earlier status there came
+// from another account (earlierFromOthers); when the listing was not read
+// to its end, every found status is marked so, since the unread tail may
+// hold such a status.
+func (a *Adapter) fetchStatusPosters(ctx context.Context, owner, repo, ref, token string, entries []statusEntry) map[int64]statusAttribution {
+	out := make(map[int64]statusAttribution, len(entries))
+	wanted := make(map[int64]string, len(entries))
+	for _, st := range entries {
+		if st.id > 0 {
+			wanted[st.id] = st.context
 		}
-		if _, seen := posters[it.Context]; !seen {
-			posters[it.Context] = *it.Creator
+	}
+	type foundStatus struct {
+		id      int64
+		creator *statusPoster
+	}
+	found := make(map[string]foundStatus, len(wanted))
+	complete := false
+	for page := 1; page <= maxStatusListPages && len(found) < len(wanted); page++ {
+		path := fmt.Sprintf("%s/repos/%s/%s/commits/%s/statuses?per_page=%d&page=%d", a.apiBaseURL, url.PathEscape(owner), url.PathEscape(repo), url.PathEscape(ref), statusListPerPage, page)
+		body, err := a.doGet(ctx, path, token)
+		if err != nil {
+			break
+		}
+		var items []commitStatusListItem
+		if json.Unmarshal(body, &items) != nil {
+			break
+		}
+		for _, it := range items {
+			if f, ok := found[it.Context]; ok {
+				if !samePoster(f.creator, it.Creator) {
+					attribution := out[f.id]
+					attribution.earlierFromOthers = true
+					out[f.id] = attribution
+				}
+				continue
+			}
+			if wantedContext, ok := wanted[it.ID]; ok && wantedContext == it.Context {
+				found[it.Context] = foundStatus{id: it.ID, creator: it.Creator}
+				attribution := statusAttribution{}
+				if it.Creator != nil {
+					attribution.poster = *it.Creator
+				}
+				out[it.ID] = attribution
+			}
+		}
+		if len(items) < statusListPerPage {
+			complete = true
+			break
 		}
 	}
-	return posters
+	if !complete {
+		for id, attribution := range out {
+			attribution.earlierFromOthers = true
+			out[id] = attribution
+		}
+	}
+	return out
+}
+
+// samePoster reports whether two listing entries were posted by the same
+// account. An entry with no creator is nobody's: it matches nothing.
+func samePoster(a, b *statusPoster) bool {
+	return a != nil && b != nil && a.Login == b.Login && a.Type == b.Type
 }
 
 // attributeStatus says who posted a status and, for an App, which App. An
-// App posts through its bot account, "<slug>[bot]", of type "Bot"; its App
-// id is the one a check run of the same App slug at the head carries, and
-// zero when no such check run is there -- an App the rule then counts as
-// not verifiable (autoapproval.EvaluateRequiredChecks). Any other account
-// type is a person. A poster with no type is unknown.
-func attributeStatus(p statusPoster, appBySlug map[string]int64) (ports.HeadCheckPoster, int64) {
+// App posts through its bot account, "<slug>[bot]", of type "Bot": its
+// slug is returned, and its id when a check run of the same App slug at
+// the head carries one -- zero otherwise, for the caller to resolve
+// (ports.SourceControl.ResolveAppID); a bot login without that suffix
+// names no slug, and its App can then not be identified. Any other
+// account type is a person. A poster with no type is unknown.
+func attributeStatus(p statusPoster, appBySlug map[string]int64) (ports.HeadCheckPoster, int64, string) {
 	switch p.Type {
 	case "":
-		return ports.HeadCheckPosterUnknown, 0
+		return ports.HeadCheckPosterUnknown, 0, ""
 	case "Bot":
-		return ports.HeadCheckPosterApp, appBySlug[strings.TrimSuffix(p.Login, "[bot]")]
+		slug, ok := strings.CutSuffix(p.Login, "[bot]")
+		if !ok || slug == "" {
+			return ports.HeadCheckPosterApp, 0, ""
+		}
+		return ports.HeadCheckPosterApp, appBySlug[slug], slug
 	default:
-		return ports.HeadCheckPosterPerson, 0
+		return ports.HeadCheckPosterPerson, 0, ""
 	}
 }
 
