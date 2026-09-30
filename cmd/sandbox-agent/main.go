@@ -1132,6 +1132,38 @@ func providerCredentialOAuthSets(resolved map[string]credentials.AuthValue) map[
 	return oauth
 }
 
+// spawnOpenCode starts `opencode serve` (opencodeproc.Spawn) over an empty
+// persisted auth store: the store the process will read, resolved from the
+// exact environment it is started with, is removed first, on every boot --
+// a fresh spawn and a restore alike. Only this boot's deliveries then
+// exist: api-kind credentials in that environment, and the oauth-kind ones
+// run() PUTs once the process is healthy. Without this, a restored
+// snapshot's store would keep whatever an earlier boot was delivered --
+// before §29.4 withheld it, a review session's requester's own ChatGPT
+// link -- and OpenCode would still run on it.
+//
+// Not also removed when a snapshot is minted (HandleSnapshot): the live
+// OpenCode keeps reading its store after the snapshot, and nothing
+// re-delivers a link until the next boot, which removes the store anyway.
+//
+// A store that cannot be removed fails the boot, like a credential cache
+// that cannot be purged (runBootSequence): OpenCode never starts over a
+// credential this boot did not deliver.
+func spawnOpenCode(ctx context.Context, sup *supervisor.Supervisor, workDir string, providerCredentialEnv, runtimeEnv []string,
+	runtimeCredential *syscall.Credential, readinessTimeout, pollInterval time.Duration,
+) (opencodeproc.Result, error) {
+	if store, ok := opencodeproc.AuthStoreFor(opencodeproc.Env(providerCredentialEnv, runtimeEnv)); ok {
+		removed, err := store.Remove()
+		if err != nil {
+			return opencodeproc.Result{}, fmt.Errorf("remove opencode's persisted auth store before it starts: %w", err)
+		}
+		if removed {
+			slog.Info("sandbox-agent: removed opencode's persisted auth store left by an earlier boot; only this boot's credentials will exist", "path", store.Path())
+		}
+	}
+	return opencodeproc.Spawn(ctx, sup, workDir, providerCredentialEnv, runtimeEnv, runtimeCredential, readinessTimeout, pollInterval)
+}
+
 func run() error {
 	// boot.Load() is the earliest possible failure -- before any logging
 	// setup even -- exactly like control-plane's own platform.Load()
@@ -1644,7 +1676,7 @@ func run() error {
 		runtimeEnv = append(runtimeEnv, sandboxSecretEnv...)
 		runtimeEnv = append(runtimeEnv, "HOME="+boot.RuntimeHomePath(cfg.WorkspaceDir))
 
-		result, spawnErr := opencodeproc.Spawn(ctx, sup, cfg.WorkspaceDir, providerCredentialEnv, runtimeEnv,
+		result, spawnErr := spawnOpenCode(ctx, sup, cfg.WorkspaceDir, providerCredentialEnv, runtimeEnv,
 			runtimeCredential, timeouts.OpenCodeReadinessTimeout, timeouts.OpenCodeReadinessPollInterval)
 		if spawnErr != nil {
 			// Best-effort cleanup of whatever sup may already be tracking
