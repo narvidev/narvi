@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -24,6 +25,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewfreshness"
+	"github.com/narvidev/narvi/internal/domain/review"
 )
 
 // tripwireReviewFetcher is a reviewcontext.Fetcher that fails the test on
@@ -117,6 +119,11 @@ func TestGetSessionResult_GitHubOutboundOff_FreshnessUnconfirmed(t *testing.T) {
 	if n := host.readsOf(owner, repo, 1); n != 0 || len(host.tokens) != 0 {
 		t.Errorf("code host read %d times with tokens %v, want no read at all", n, host.tokens)
 	}
+	// The SAME answer as no code host at all, the suggested delay included:
+	// nothing was read live, so there is nothing to poll for sooner.
+	if want := int(rig.resultTimeouts.SessionResultDelaySettled / time.Second); got.SuggestedDelaySeconds != want {
+		t.Errorf("suggestedDelaySeconds = %d, want %d (SessionResultDelaySettled: nothing is read live with GitHub outbound off)", got.SuggestedDelaySeconds, want)
+	}
 }
 
 // TestPostReviewVerdict_GitHubOutboundOff_FindingsUnanchored: the verdict
@@ -171,8 +178,11 @@ func TestPostReviewVerdict_GitHubOutboundOff_FindingsUnanchored(t *testing.T) {
 }
 
 // TestRetriggerReview_GitHubOutboundOff_NoPrefetch: the re-review button
-// still queues the review turn, with the plain fixed prompt and no
-// pre-fetched diff context, and never calls the code host.
+// still queues the review turn, never calls the code host, and takes the
+// SAME degraded path a failed live read takes: no head sha, but a prompt
+// that still carries the verdict tool's instructions, so the turn can post
+// what it finds (TestPostReviewVerdict_GitHubOutboundOff_NoHeadSHA_
+// FindingsShowInReadout is the other half).
 func TestRetriggerReview_GitHubOutboundOff_NoPrefetch(t *testing.T) {
 	fetcher := &tripwireReviewFetcher{t: t}
 	rig := newTestRig(t, func(r *testRig) {
@@ -194,11 +204,61 @@ func TestRetriggerReview_GitHubOutboundOff_NoPrefetch(t *testing.T) {
 	if err := rig.pool.QueryRow(ctx, `SELECT prompt, review_head_sha FROM turns WHERE session_id = $1`, session.ID).Scan(&prompt, &reviewHeadSHA); err != nil {
 		t.Fatalf("query turn: %v", err)
 	}
-	if prompt != "Manual re-review requested via the web review button." {
-		t.Errorf("turn prompt = %q, want the plain fixed prompt (no pre-fetched context)", prompt)
+	if !strings.HasPrefix(prompt, "Manual re-review requested via the web review button.") {
+		t.Errorf("turn prompt = %q, want the fixed re-review prompt first", prompt)
+	}
+	for _, placeholder := range []string{review.VerdictToolURLPlaceholder, review.VerdictToolBearerPlaceholder, review.VerdictToolDispatchMessageIDPlaceholder} {
+		if !strings.Contains(prompt, placeholder) {
+			t.Errorf("turn prompt lacks %s -- without the verdict tool's instructions the turn cannot post a verdict", placeholder)
+		}
 	}
 	if reviewHeadSHA != nil {
 		t.Errorf("turns.review_head_sha = %q, want NULL (no live head read)", *reviewHeadSHA)
+	}
+	if n := fetcher.calls.Load(); n != 0 {
+		t.Errorf("code host called %d times, want 0", n)
+	}
+}
+
+// TestPostReviewVerdict_GitHubOutboundOff_NoHeadSHA_FindingsShowInReadout
+// proves the outbound-off re-review turn is worth running: a verdict posted
+// against a turn with no head sha -- what the button queues with GitHub
+// outbound off -- records its findings, and the review readout shows them.
+// Nothing is stored as a verdict (no head sha) and nothing reaches GitHub.
+func TestPostReviewVerdict_GitHubOutboundOff_NoHeadSHA_FindingsShowInReadout(t *testing.T) {
+	ctx := context.Background()
+	fetcher := &tripwireReviewFetcher{t: t}
+	rig := newTestRig(t, func(r *testRig) {
+		r.diffFetcher = fetcher
+		r.outbound = nil
+	})
+
+	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/outbound-off-findings", 63)
+	seedDispatchedTurn(ctx, t, rig, session.ID)
+
+	const description = "the loop reads past the end of items when the list is empty"
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, verdictRequestWithFinding("main.go", description))
+	if status != http.StatusCreated {
+		t.Fatalf("POST verdict status = %d, want %d", status, http.StatusCreated)
+	}
+
+	_, token := rig.createAuthenticatedUser(ctx, t)
+	var got map[string]any
+	if status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/review", nil, &got, token); status != http.StatusOK {
+		t.Fatalf("GET review status = %d, want %d", status, http.StatusOK)
+	}
+	findings, _ := got["findings"].([]any)
+	found := false
+	for _, f := range findings {
+		if m, ok := f.(map[string]any); ok && m["description"] == description {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("readout findings = %v, want the finding the verdict posted", findings)
+	}
+	if got["latestVerdict"] != nil {
+		t.Errorf("latestVerdict = %v, want null (no head sha, so no verdict row)", got["latestVerdict"])
 	}
 	if n := fetcher.calls.Load(); n != 0 {
 		t.Errorf("code host called %d times, want 0", n)

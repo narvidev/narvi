@@ -168,7 +168,11 @@ func GetSessionResult(deps SessionResultDeps) http.HandlerFunc {
 		_ = g.Wait() // no goroutine returns an error: Assess never fails
 		cancelLive()
 
-		readLive := len(snap.live) > 0 && deps.SourceControl != nil
+		// Keyed on the code host the freshness reads above actually used,
+		// not on deps.SourceControl: with GitHub outbound off
+		// (freshnessDeps) nothing was read live, so the answer is the
+		// no-code-host one, SessionResultDelaySettled included.
+		readLive := len(snap.live) > 0 && freshnessDeps.SourceControl != nil
 		snap.outcome.SuggestedDelaySeconds = wholeSecondsRoundedUp(resultReadDelay(snap.activity, snap.reviewsSettled, readLive, deps.Timeouts))
 		writeJSON(w, http.StatusOK, snap.outcome)
 	}
