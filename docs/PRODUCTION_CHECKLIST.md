@@ -270,3 +270,32 @@ matter too:
   `application_name` values, and confirm
   `SELECT current_setting('application_name')` returns each connection's
   own.
+
+## 11. GitHub outbound is declared as intended
+
+**Why this is here.** Whether this deployment calls GitHub as its bot
+(`NARVI_OUTBOUND_ENABLED`, `docs/TECHNICAL_PLAN.md` §12.5) is a separate
+axis from whether it mounts the GitHub webhook (`NARVI_INGRESS_ENABLED`).
+Every review verdict, comment, label, check run, commit status, sentinel
+or description rewrite and auto-merge goes out through it; with it off,
+none of them is sent and the auto-merge worker does not run. Left unset
+it follows GitHub ingress, so a deployment that never narrowed ingress
+has it on without saying so, and one that did narrow ingress had to
+declare it to boot at all. What boot cannot tell is whether the value
+declared is the one this deployment is meant to have, or whether the bot
+token behind it actually works.
+
+**Check.** The boot log carries one line, `narvi control-plane: GitHub
+axes`, with `ingress`, `outbound` and `outbound_credential`: confirm
+`outbound` is what this deployment intends (`true` with `bot token` for
+a deployment that posts reviews). Then, with it on, confirm the
+credential works end to end: after a real review, the GitHub row of
+`GET /api/integrations` shows `lastOutboundStatus` `delivered` for a
+real `github_*` delivery (its `lastOutboundAt` after that review), not a
+`pending` row retrying with a `lastOutboundError` or a `dead_letter`. A
+401 in that error means the bot token is wrong or revoked, and every
+GitHub outbound kind will retry and dead-letter the same way
+([outbox-delivery.md](runbooks/outbox-delivery.md)). This axis is not
+§30's shadow mode (item 9): it decides whether GitHub is called at all,
+and each repository's own live/shadow setting still decides, per write,
+whether it is sent or recorded.

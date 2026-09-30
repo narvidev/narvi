@@ -130,6 +130,34 @@ pipeline below, completely unaffected — see "No slash commands, no
 free-text prompting" under "Honest negatives" for what that means for
 everything else.
 
+## Posting as the bot: GitHub outbound
+
+Everything Narvi does on GitHub as its bot -- the review it posts and its
+`review:*-risk` labels, the `narvi/review` check run, the turn-outcome,
+handoff and release-manifest comments, the `narvi/preview` commit status,
+the sentinel and description rewrites, and auto-merge -- goes out through
+one bot credential, `NARVI_GITHUB_BOT_TOKEN`, on an axis of its own:
+`NARVI_OUTBOUND_ENABLED` (technical plan §12.5). It is independent of the
+webhook above, in one direction only:
+
+- **GitHub ingress requires it.** The webhook handler reads pull requests
+  and posts its sign-in and plan-awaiting replies as the bot, so a
+  deployment that mounts the webhook must have GitHub outbound on; boot
+  refuses otherwise. Left unset, `NARVI_OUTBOUND_ENABLED` follows GitHub
+  ingress, so a default deployment needs nothing new.
+- **It does not require ingress.** A deployment with GitHub ingress off
+  may still post as the bot (`NARVI_OUTBOUND_ENABLED=github`), or declare
+  that it never calls GitHub (`NARVI_OUTBOUND_ENABLED=` empty). It must
+  say which: with `NARVI_INGRESS_ENABLED` excluding `github`, an unset
+  `NARVI_OUTBOUND_ENABLED` refuses to boot. With it off, nothing above is
+  posted, auto-merge does not run, and the review screens show their
+  live GitHub facts as unavailable.
+
+It is not the GitHub App below: that App's read-only installation token
+is what review sandboxes clone with, and it never posts anything. It is
+not shadow mode either: each repository's own live/shadow setting (§30)
+still decides whether each of these writes is sent or recorded.
+
 ## The GitHub App: install it on every repository Narvi reviews
 
 A review session is read-only. Its sandbox clones the pull request's
