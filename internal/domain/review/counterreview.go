@@ -26,8 +26,9 @@ package review
 // AdequacyFloor/PremiseFloor/CoverageFloor's own signatures.
 type CounterReviewStatus string
 
-// The two legal CounterReviewStatus values (§26.4's own "typed
-// CounterReview: done|skipped field", verbatim) — see this type's own doc
+// The CounterReviewStatus values: the two a reviewer reports (§26.4's own
+// "typed CounterReview: done|skipped field", verbatim) and the one the
+// server resolves (CounterReviewUncorroborated) — see this type's own doc
 // comment for why the zero value ("") is never legitimately observed by
 // CounterReviewFloor in production (reviewpost.ValidateVerdictInput
 // rejects it outright on the deep path, the only path this field is ever
@@ -50,6 +51,21 @@ const (
 	// package's own fail-conservative reference point for an unrecognized
 	// CounterReviewStatus value (see CounterReviewFloor).
 	CounterReviewSkipped CounterReviewStatus = "skipped"
+	// CounterReviewUncorroborated is a deep-path counter-review the
+	// reviewer reported done that the server could not corroborate
+	// against this turn's own persisted sub-task trace
+	// (reviewverdict.CounterReviewCorroborated): the trace showed no
+	// counter-reviewer sub-task that started and completed, or it could
+	// not be read, or the finish event had not landed when the verdict
+	// was posted -- the server cannot tell these apart, so the value
+	// claims only that the done was not confirmed. It is the server's
+	// finding, never a report: reviewpost.ValidateVerdictInput rejects it
+	// from a payload on every path, and reviewpost.BuildVerdict is the one
+	// place this value is produced. It floors exactly like
+	// CounterReviewSkipped and keeps a name of its own, so the blocker it
+	// produces (§26.1) says what happened rather than reading as a skip
+	// the reviewer admitted to.
+	CounterReviewUncorroborated CounterReviewStatus = "uncorroborated"
 )
 
 // CounterReviewFloor is the FOURTH raise-only floor's single exported pure
@@ -71,6 +87,9 @@ const (
 //     sizable PR (§26.3's own deep-routing triggers) that did not
 //     actually get an adversarial counter-review must never auto-approve
 //     on the strength of a review pass that never happened.
+//   - CounterReviewUncorroborated: ShippableNeedsHuman — the same floor as
+//     CounterReviewSkipped: a counter-review the server cannot confirm
+//     ran counts for no more than one the reviewer says did not.
 //   - the zero value or any other unrecognized CounterReviewStatus:
 //     ShippableNeedsHuman, FAILING CONSERVATIVE — ranked identically to
 //     CounterReviewSkipped, this enum's own worst known legitimate value
@@ -78,7 +97,8 @@ const (
 //     CounterReviewDone's own ShippableAuto. In practice this branch is
 //     unreachable from a real deep-path verdict (reviewpost.
 //     ValidateVerdictInput rejects anything but Done/Skipped on the deep
-//     path before BuildVerdict ever runs) — kept anyway, exactly like
+//     path before BuildVerdict ever runs, and BuildVerdict itself only
+//     ever adds Uncorroborated) — kept anyway, exactly like
 //     every sibling floor's own identical defensive default, so a future
 //     caller that skips validation fails toward the SAME safe direction
 //     every other floor already does, rather than an unguarded map/switch
@@ -87,7 +107,7 @@ func CounterReviewFloor(s CounterReviewStatus) Shippable {
 	switch s {
 	case CounterReviewDone:
 		return ShippableAuto
-	case CounterReviewSkipped:
+	case CounterReviewSkipped, CounterReviewUncorroborated:
 		return ShippableNeedsHuman
 	default:
 		return ShippableNeedsHuman

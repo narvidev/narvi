@@ -46,7 +46,7 @@ func seedNotShippableAutoVerdict(ctx context.Context, t *testing.T, pool *pgxpoo
 		ProposedShippable: review.ProposedShippableNeedsHuman,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if verdict.Shippable == review.ShippableAuto {
 		t.Fatalf("seedNotShippableAutoVerdict: fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}
@@ -423,7 +423,7 @@ func seedNotShippableAutoVerdictForAttempt(ctx context.Context, t *testing.T, po
 		ProposedShippable: review.ProposedShippableNeedsHuman,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if verdict.Shippable == review.ShippableAuto {
 		t.Fatalf("seedNotShippableAutoVerdictForAttempt: fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}

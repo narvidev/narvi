@@ -381,7 +381,7 @@ func seedAutoApprovedVerdict(ctx context.Context, t *testing.T, pool *pgxpool.Po
 		ProposedShippable: review.ProposedShippableAuto,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	// §30.8: decisioninbox's own classification deliberately reads the
 	// SAME unfiltered GetLatest every other internal, operator-facing
 	// caller uses (migrations/000105's own doc comment) -- this fixture
@@ -1481,7 +1481,7 @@ func TestBuild_AncestorChainMatches_LiveResolved_StaysReadyToMerge(t *testing.T)
 		ProposedShippable: review.ProposedShippableAuto,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	verdictContext := reviewverdict.Context{
 		BaseRef:       testEligibleBaseRef,
 		BaseSHA:       testEligibleBaseSHA,
@@ -1744,7 +1744,7 @@ func TestBuild_AncestorChainAdvanced_ConfirmedFastForward_StaysReadyToMerge(t *t
 		ProposedShippable: review.ProposedShippableAuto,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	verdictContext := reviewverdict.Context{
 		BaseRef:       testEligibleBaseRef,
 		BaseSHA:       testEligibleBaseSHA,
@@ -1952,7 +1952,7 @@ func TestBuild_AcceptedVerdict_BaseMoved_HidesStaleAcceptance(t *testing.T) {
 		ProposedShippable: review.ProposedShippableNeedsHuman,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if verdict.Shippable == review.ShippableAuto {
 		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}
@@ -2099,7 +2099,7 @@ func TestBuild_AcceptedVerdict_HeadMoved_HidesStaleAcceptance(t *testing.T) {
 		ProposedShippable: review.ProposedShippableNeedsHuman,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if verdict.Shippable == review.ShippableAuto {
 		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}
@@ -2234,7 +2234,7 @@ func TestBuild_AcceptedVerdict_AncestorChainChanged_HidesStaleAcceptance(t *test
 		ProposedShippable: review.ProposedShippableNeedsHuman,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if verdict.Shippable == review.ShippableAuto {
 		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}
@@ -2449,7 +2449,7 @@ func TestBuild_AcceptanceMergeable(t *testing.T) {
 				ProposedShippable: review.ProposedShippableNeedsHuman,
 				FilesChanged:      3,
 			}
-			verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+			verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 			if verdict.Shippable == review.ShippableAuto {
 				t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 			}
@@ -2610,7 +2610,7 @@ func TestBuild_AcceptanceMergeable_NeedsHumanLabel_DoesNotRecordOverridden(t *te
 		ProposedShippable: review.ProposedShippableNeedsHuman,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if verdict.Shippable == review.ShippableAuto {
 		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}
@@ -2742,7 +2742,7 @@ func TestBuild_AcceptanceMergeable_DegradedLiveCheck_DistinctReason(t *testing.T
 		ProposedShippable: review.ProposedShippableNeedsHuman,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if verdict.Shippable == review.ShippableAuto {
 		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}
@@ -2885,7 +2885,7 @@ func TestBuild_AcceptanceMergeable_ReadyToMergeRow(t *testing.T) {
 		ProposedShippable: review.ProposedShippableAuto,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if verdict.Shippable != review.ShippableAuto {
 		t.Fatalf("fixture bug -- RiskLevelLow computed Shippable=%v, want auto", verdict.Shippable)
 	}
@@ -3009,7 +3009,7 @@ func TestBuild_AcceptanceMergeable_HandoffRow(t *testing.T) {
 		ProposedShippable: review.ProposedShippableNeedsHuman,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if verdict.Shippable == review.ShippableAuto {
 		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}
@@ -3157,7 +3157,7 @@ func TestBuild_AcceptanceMergeable_ReleaseCutRow(t *testing.T) {
 		ProposedShippable: review.ProposedShippableNeedsHuman,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if verdict.Shippable == review.ShippableAuto {
 		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}

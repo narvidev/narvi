@@ -28,8 +28,8 @@ func TestVerdict_ZeroValueIsNotAuto(t *testing.T) {
 
 // TestVerdict_ShippableComputedFromFields builds a Verdict the way a
 // caller (a later Step's verdict-posting tool) is contractually expected
-// to: populating Shippable with exactly ComputeShippable's own return
-// value derived from the same RiskLevel/TestsCoverage/Premise fields
+// to: populating Shippable with exactly the Class of ComputeShippable's
+// own result, derived from the same RiskLevel/TestsCoverage/Premise fields
 // carried on the same Verdict, never a hand-set or ProposedShippable-
 // derived value. This exercises Verdict's own documented CONTRACT
 // end-to-end.
@@ -45,7 +45,7 @@ func TestVerdict_ShippableComputedFromFields(t *testing.T) {
 		DocsDrift:         review.DocsDriftStateNone,
 		ProposedShippable: review.ProposedShippableAuto,
 	}
-	v.Shippable = review.ComputeShippable(v.RiskLevel, v.TestsCoverage, v.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	v.Shippable = review.ComputeShippable(v.RiskLevel, v.TestsCoverage, v.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 
 	want := review.ShippableNeedsHuman // high baseline + insufficient floor, both needs_human; premise floor (questionable) also needs_human
 	if v.Shippable != want {

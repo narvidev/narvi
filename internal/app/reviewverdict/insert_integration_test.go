@@ -169,7 +169,7 @@ func TestInsert_AllTenPlaceholderTokensStrippedFromStoredDigest(t *testing.T) {
 		DocsDrift:         review.DocsDriftStateNone,
 		ProposedShippable: review.ProposedShippableAuto,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 
 	digest := reviewpost.Digest{
 		Summary:             poison,
@@ -265,7 +265,7 @@ func TestInsert_ContextAndAttemptIDRoundTrip(t *testing.T) {
 			DocsDrift:         review.DocsDriftStateNone,
 			ProposedShippable: review.ProposedShippableAuto,
 		}
-		v.Shippable = review.ComputeShippable(v.RiskLevel, v.TestsCoverage, v.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		v.Shippable = review.ComputeShippable(v.RiskLevel, v.TestsCoverage, v.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 		return v
 	}
 	digest := reviewpost.Digest{Summary: "Context round-trip test-seeded verdict.", DescriptionAdequacy: review.DescriptionAdequacyOK, AdequacyExplanation: "n/a"}
@@ -406,7 +406,7 @@ func TestGetLatest_OrdersByProducingAttemptRecency_NeverPostTime(t *testing.T) {
 			DocsDrift:         review.DocsDriftStateNone,
 			ProposedShippable: review.ProposedShippableAuto,
 		}
-		v.Shippable = review.ComputeShippable(v.RiskLevel, v.TestsCoverage, v.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		v.Shippable = review.ComputeShippable(v.RiskLevel, v.TestsCoverage, v.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 		return v
 	}
 	digest := reviewpost.Digest{Summary: "Attempt-recency test-seeded verdict.", DescriptionAdequacy: review.DescriptionAdequacyOK, AdequacyExplanation: "n/a"}
@@ -521,7 +521,7 @@ func TestGetLatestAndListLatestAutoApproved_AgreeOnAttemptRecency(t *testing.T) 
 			DocsDrift:         review.DocsDriftStateNone,
 			ProposedShippable: review.ProposedShippableAuto,
 		}
-		v.Shippable = review.ComputeShippable(v.RiskLevel, v.TestsCoverage, v.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		v.Shippable = review.ComputeShippable(v.RiskLevel, v.TestsCoverage, v.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 		return v
 	}
 	digest := reviewpost.Digest{Summary: "Attempt-recency auto-merge-agreement test-seeded verdict.", DescriptionAdequacy: review.DescriptionAdequacyOK, AdequacyExplanation: "n/a"}

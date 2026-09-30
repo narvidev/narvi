@@ -141,6 +141,15 @@ func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSetting
 	if headSHA == "" {
 		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: insert: refusing to persist a verdict with no known head sha for %s#%d", repoFullName, prNumber)
 	}
+	// counter_review stores the reviewer's own report (§26.1).
+	// review.CounterReviewUncorroborated is the server's finding about
+	// that report, resolved by reviewpost.BuildVerdict and rejected from
+	// every payload by reviewpost.ValidateVerdictInput; this is the one
+	// writer of the column, so it refuses the value too, and no caller
+	// can store the server's finding as though the reviewer had said it.
+	if counterReview == review.CounterReviewUncorroborated {
+		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: insert: refusing to persist the server-only counter-review state %q as the reviewer's report for %s#%d", counterReview, repoFullName, prNumber)
+	}
 
 	suppressedInShadow := egressmode.Resolve(ctx, egressmode.Deps{
 		RepoSettings:   repoSettings,

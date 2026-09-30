@@ -98,7 +98,35 @@ import (
 // to that closed, seven-field type, digest.go's own doc
 // comment) -- this function only ever changes WHERE they render, never
 // what they are or how internal/app/reviewverdict.Insert persists them.
-func RenderVerdictComment(v review.Verdict, findings []Finding, digest Digest, summary, botHandle, syncedLabel string) string {
+//
+// # (§26.1): what keeps the class above auto
+//
+// shippable is BuildVerdict's second result, the assessment v.Shippable
+// was set from. The header's Shippable bullet renders its Class, and
+// under it, as nested bullets, its Blockers: a lead-in saying the server
+// decided them rather than the reviewer asserting them, then one line per
+// input that on its own keeps the class above auto (see
+// renderShippableBlockers). The class and its reasons are rendered from
+// one value, so the readout cannot state a class its reasons do not
+// account for. An auto verdict has no blockers and renders exactly the
+// header it did before blockers existed; every other line of the comment
+// is unchanged by them.
+//
+// # The header's reviewer text cannot open a list item there
+//
+// The header list is the server's: its four bullets and the blocker lines
+// under Shippable. Two reviewer-authored fields are rendered in that
+// region -- the adequacy explanation on the Description adequacy bullet,
+// and the why-line summary right after the list -- and neither may put a
+// line of its own into that list, or the reviewer could write a Shippable
+// bullet or a "decided by the server" block indistinguishable from the
+// real one. So the adequacy explanation, a one-line field (§26.2), has its
+// line breaks folded to spaces (foldLineBreaks), and every line of the
+// why-line that would open a list item has its marker escaped
+// (escapeListItemOpeners). Text with neither renders byte for byte as
+// before. Every later reviewer field sits under a heading of its own, so
+// none can place a line in the header list.
+func RenderVerdictComment(v review.Verdict, shippable review.ShippableAssessment, findings []Finding, digest Digest, summary, botHandle, syncedLabel string) string {
 	var b strings.Builder
 
 	// --- 1. Header (§26.1 item 1, §26.2 item 1) -- risk badge, why-line,
@@ -108,10 +136,12 @@ func RenderVerdictComment(v review.Verdict, findings []Finding, digest Digest, s
 	b.WriteString("### Code review verdict\n\n")
 	fmt.Fprintf(&b, "- **Risk**: %s\n", v.RiskLevel)
 	fmt.Fprintf(&b, "- **Premise**: %s\n", v.Premise)
-	fmt.Fprintf(&b, "- **Description adequacy**: %s -- %s\n", digest.DescriptionAdequacy, escapeFindingDescription(strings.TrimSpace(digest.AdequacyExplanation)))
-	fmt.Fprintf(&b, "- **Shippable**: %s (server-computed)\n\n", v.Shippable)
+	fmt.Fprintf(&b, "- **Description adequacy**: %s -- %s\n", digest.DescriptionAdequacy, escapeFindingDescription(foldLineBreaks(strings.TrimSpace(digest.AdequacyExplanation))))
+	fmt.Fprintf(&b, "- **Shippable**: %s (server-computed)\n", shippable.Class())
+	b.WriteString(renderShippableBlockers(shippable.Blockers()))
+	b.WriteString("\n")
 
-	b.WriteString(escapeFindingDescription(strings.TrimSpace(summary)))
+	b.WriteString(escapeFindingDescription(escapeListItemOpeners(strings.TrimSpace(summary))))
 	b.WriteString("\n\n")
 
 	// --- 2. "What this PR does" (§26.1 item 2).
@@ -213,6 +243,152 @@ func RenderVerdictComment(v review.Verdict, findings []Finding, digest Digest, s
 	b.WriteString(RerunGuidance(botHandle))
 
 	return b.String()
+}
+
+// shippableBlockersLeadIn opens the blocker lines under the Shippable
+// bullet (§26.1). It is what marks them as the server's decision, computed
+// from the verdict's inputs, rather than something the reviewer asserted.
+const shippableBlockersLeadIn = "  - Kept above auto by (decided by the server, not asserted by the reviewer):\n"
+
+// uncorroboratedCounterReviewNote says, on the blocker line, what the
+// server-resolved review.CounterReviewUncorroborated means, since the
+// reviewer's own payload said "done". It says only what the server knows:
+// that it could not confirm the claim when the verdict was posted. It
+// does not say what the trace holds, because the same value also comes
+// from paths where the trace was never read or only partly read (no
+// dispatched gen or event id on the turn, a failed corroboration query, a
+// malformed row that was skipped) and from the accepted race where the
+// counter-reviewer's finish event lands after the verdict (httpapi's
+// corroborateCounterReview, reviewpost.BuildVerdict).
+const uncorroboratedCounterReviewNote = " -- reported done, but the server could not confirm it from this turn's trace when the verdict was posted"
+
+// renderShippableBlockers renders blockers as nested bullets under the
+// Shippable header bullet: shippableBlockersLeadIn, then one line per
+// blocker naming the input, its value, and the class that input alone
+// forces, in review.ComputeShippable's parameter order. No blockers (an
+// auto verdict) renders nothing at all.
+//
+// A blocker's Value is one of its input's closed-enum values on every
+// verdict ValidateVerdictInput admits, but it is rendered through the
+// code-span escaper anyway: an input that reaches the fail-conservative
+// default carries its value verbatim (review.Blocker), and a backtick or
+// newline in it must not be able to leave the code span it is rendered in.
+func renderShippableBlockers(blockers []review.Blocker) string {
+	if len(blockers) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString(shippableBlockersLeadIn)
+	for _, bl := range blockers {
+		value := bl.Value
+		if value == "" {
+			value = "unset"
+		}
+		note := ""
+		if bl.Input == review.ShippableInputCounterReview && bl.Value == string(review.CounterReviewUncorroborated) {
+			note = uncorroboratedCounterReviewNote
+		}
+		fmt.Fprintf(&b, "    - %s `%s`%s (%s)\n", shippableInputLabel(bl.Input), escapeFilePathForCodeSpan(value), note, bl.Level)
+	}
+	return b.String()
+}
+
+// lineBreakFolder folds every CommonMark line ending (LF, CR, CRLF) into
+// one space.
+var lineBreakFolder = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ")
+
+// foldLineBreaks keeps a one-line reviewer field on the one line the
+// header renders it on (RenderVerdictComment's "The header's reviewer
+// text cannot open a list item there"): with no line break left, nothing
+// in it can begin a line, so nothing in it can open a list item.
+func foldLineBreaks(s string) string {
+	return lineBreakFolder.Replace(s)
+}
+
+// escapeListItemOpeners backslash-escapes the marker of every line of s
+// that could open a list item: after any indentation of spaces and tabs,
+// a bullet (-, + or *) or an ordered marker (one to nine digits, then . or
+// )), followed by a space, a tab or the end of the line. Both LF and CR
+// end a line, as they do for CommonMark. Whether a deeply indented marker
+// would open an item depends on the blocks around it, so this does not
+// try to tell: it escapes every one, and the only cost is a visible
+// backslash should such a line sit in an indented code block. An escaped
+// marker renders as the literal character and opens nothing; every other
+// byte of s is kept as it was, so text with no such line comes back
+// unchanged.
+func escapeListItemOpeners(s string) string {
+	var b strings.Builder
+	lineStart := true
+	for i := 0; i < len(s); {
+		if lineStart {
+			lineStart = false
+			j := i
+			for j < len(s) && (s[j] == ' ' || s[j] == '\t') {
+				j++
+			}
+			if k, ok := listMarkerAt(s, j); ok {
+				b.WriteString(s[i:k])
+				b.WriteByte('\\')
+				i = k
+				continue
+			}
+		}
+		c := s[i]
+		b.WriteByte(c)
+		if c == '\n' || c == '\r' {
+			lineStart = true
+		}
+		i++
+	}
+	return b.String()
+}
+
+// listMarkerAt reports whether a list-item marker starts at s[j], and if
+// so the index of the marker's punctuation byte -- the bullet itself, or
+// the . or ) after an ordered marker's digits -- which is the byte a
+// backslash escapes.
+func listMarkerAt(s string, j int) (int, bool) {
+	if j >= len(s) {
+		return 0, false
+	}
+	if c := s[j]; c == '-' || c == '+' || c == '*' {
+		return j, endsListMarker(s, j+1)
+	}
+	d := j
+	for d < len(s) && d-j < 9 && s[d] >= '0' && s[d] <= '9' {
+		d++
+	}
+	if d == j || d >= len(s) || (s[d] != '.' && s[d] != ')') {
+		return 0, false
+	}
+	return d, endsListMarker(s, d+1)
+}
+
+// endsListMarker reports whether what follows a list-item marker at s[p]
+// lets it open an item: a space, a tab, a line ending or the end of s.
+func endsListMarker(s string, p int) bool {
+	return p >= len(s) || s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r'
+}
+
+// shippableInputLabel is the readout's name for one of
+// review.ComputeShippable's inputs, matching the wording the rest of the
+// comment already uses for the same field (the header's "Risk" and
+// "Premise", the appendix's "Test coverage").
+func shippableInputLabel(input review.ShippableInput) string {
+	switch input {
+	case review.ShippableInputRiskLevel:
+		return "risk level"
+	case review.ShippableInputTestsCoverage:
+		return "test coverage"
+	case review.ShippableInputPremise:
+		return "premise"
+	case review.ShippableInputDescriptionAdequacy:
+		return "description adequacy"
+	case review.ShippableInputCounterReview:
+		return "counter-review"
+	default:
+		return escapeFindingDescription(string(input))
+	}
 }
 
 // renderProposedBody renders proposedBody (digest.ProposedBody, the

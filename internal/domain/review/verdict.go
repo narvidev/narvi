@@ -10,9 +10,9 @@ package review
 // shape is included here.
 //
 // CONTRACT for the caller that constructs a Verdict (a later Step, never
-// this package): Shippable must be populated with EXACTLY
+// this package): Shippable must be populated with EXACTLY the Class of
 // ComputeShippable(RiskLevel, TestsCoverage, Premise, DescriptionAdequacy,
-// CounterReviewStatus)'s return value — never a hand-set value, and never
+// CounterReviewStatus)'s result — never a hand-set value, and never
 // ProposedShippable converted to Shippable. This package cannot enforce
 // that at the type-system level
 // (Go has no way to make a struct field "write-once, only via this
@@ -53,7 +53,7 @@ type Verdict struct {
 	// struct's own top-level CONTRACT.
 	ProposedShippable ProposedShippable
 	// Shippable is the AUTHORITATIVE, server-computed classification.
-	// CONTRACT: populate only via ComputeShippable's return value — see
+	// CONTRACT: populate only via the Class of ComputeShippable's result — see
 	// this struct's own top-level doc comment.
 	Shippable Shippable
 }
