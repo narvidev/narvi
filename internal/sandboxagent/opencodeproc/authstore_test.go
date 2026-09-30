@@ -52,7 +52,7 @@ func TestAuthStore_Remove(t *testing.T) {
 			writeFile(t, filepath.Join(home, ".local", "share", "opencode", "auth.json"))
 			return ""
 		}, true, false},
-		{"no data directory is nothing to remove", func(t *testing.T, home string) string { return "" }, false, false},
+		{"no data directory is nothing to remove", func(_ *testing.T, _ string) string { return "" }, false, false},
 		{"a store that is a symlink is removed as a link", func(t *testing.T, home string) string {
 			target := filepath.Join(t.TempDir(), "elsewhere.json")
 			writeFile(t, target)
