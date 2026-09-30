@@ -279,7 +279,10 @@ axis from whether it mounts the GitHub webhook (`NARVI_INGRESS_ENABLED`).
 Every review verdict, comment, label, check run, commit status, sentinel
 or description rewrite, auto-merge and release-manifest check goes out
 through it, and so do the live pull request reads behind the review
-screens; with it off, none of them happens. Left unset it follows GitHub
+screens and the decision inbox's reads of base branches' required checks;
+with it off, none of them happens, and the inbox shows no pull request as
+ready to merge (a person's Merge click still reads the requirements with
+their own token and merges). Left unset it follows GitHub
 ingress, so a deployment that never narrowed ingress has it on without
 saying so, and one that did narrow ingress had to declare it to boot at
 all -- and neither value is exactly how such a deployment ran before

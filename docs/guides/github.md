@@ -158,16 +158,24 @@ webhook above, in one direction only:
   no mention or label would reach Narvi without the webhook, and the bot
   handle is not kept.
 
-The bot also reads, for every pull request whose eligibility for merge is
-assessed -- in the decision inbox, on a Merge click, and by auto-merge --
-the checks its base branch requires: the branch's protection, from the
-branch itself, and the rulesets that apply to the branch (technical plan
-§21.2). The token therefore needs read access to each repository's
-branches and rules. A pull request is not ready to merge while a required
-check has not reported, is still running or did not pass, or while the
-requirements cannot be read; a plan that does not offer rulesets or branch
-protection is read as requiring nothing there. With GitHub outbound off,
-nothing can be read and no pull request is ready to merge.
+The checks a pull request's base branch requires are read before it can
+be merged from Narvi (technical plan §21.2): the branch's protection, from
+the branch itself, and the rulesets that apply to the branch. The decision
+inbox reads them as the bot, and auto-merge reads them as the bot too; a
+person's Merge click reads them with that person's own GitHub token, the
+one the merge is made with. Both tokens therefore need read access to each
+repository's branches and rules. A pull request is not ready to merge
+while a required check has not reported, is still running or did not
+pass, or while the requirements cannot be read; a plan that does not offer
+rulesets or branch protection is read as requiring nothing there. A check
+the base ties to one App is satisfied by that App's check run or by a
+commit status that App's bot account posted -- never by another App's
+check run or a person's status. When no check run of that App is at the
+head to confirm its id, its status still counts, as from an App whose id
+could not be verified, and GitHub enforces the exact source at merge. With
+GitHub outbound off, the decision inbox reads no requirements: it shows no
+pull request as ready to merge and says so, while a person's Merge click
+still reads them itself and merges.
 
 It is not the GitHub App below: that App's read-only installation token
 is what review sandboxes clone with, and it never posts anything. It is

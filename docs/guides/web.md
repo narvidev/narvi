@@ -459,8 +459,12 @@ base makes the acceptance inapplicable again, never silently still-valid.
 requires a check that has not reported at the head, is still running, or
 did not pass, and the message names the check (and the App the base
 names, if any); it answers `409` too while the base's requirements cannot
-be read. A check the base does not require still blocks when it fails
-(technical plan §21.2).
+be read. It reads them with the clicking person's own GitHub token. A
+check the base does not require still blocks when it fails (technical
+plan §21.2). With the deployment's GitHub outbound off, the inbox reads no
+base branch's requirements: its response carries `requiredChecksNotRead`,
+no row is ready to merge, and the web inbox shows a notice saying so --
+not the "temporarily unable" warning.
 
 ## Uploads
 
