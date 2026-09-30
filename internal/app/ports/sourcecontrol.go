@@ -77,7 +77,8 @@ type CreatePRSpec struct {
 
 	// Token is the SAME plaintext, decrypted OAuth access token the
 	// scm-credentials endpoint already obtained for this session's own
-	// user (§8.11: "PR created with the prompting user's OAuth token") --
+	// user, its creator (§8.11: the push and the PR use the session
+	// creator's OAuth token) --
 	// the caller that already succeeded at the push already has this
 	// value in hand, so CreatePR never re-fetches/re-decrypts it itself.
 	// Never logged by any caller or implementation of this port.

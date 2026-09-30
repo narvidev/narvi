@@ -9,8 +9,8 @@
 // added for this.
 //
 // Nothing in §13.1 ever calls DecryptToken outside this file's own
-// round-trip test — §9.3's SourceControl adapter (§8.11: "PR created
-// with the prompting user's OAuth token") is the actual future consumer.
+// round-trip test — §9.3's SourceControl adapter (§8.11: the PR is created
+// with the session creator's OAuth token) is the actual future consumer.
 
 package platform
 

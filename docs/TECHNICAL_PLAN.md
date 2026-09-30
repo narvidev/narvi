@@ -368,7 +368,7 @@ verifying nothing about the half that carries the risk.
 8. **Models**: Anthropic + OpenAI/Codex (ChatGPT-account OAuth — native in the pinned OpenCode binary, no plugin and no new `AgentRuntime` adapter, but NOT env-var-shaped either; full design in §29) + Gemini (via OpenCode's own already-present `google`/`google-vertex` providers, no new `AgentRuntime` adapter — §25.2) + reasoning-effort plumbing (per-session and per-message overrides — §29.8).
 9. **RWX previews**: PR preview links dispatched at latest PR commit (detailed design — adapter §4.1.1, preview-link mechanism §4.1.2).
 10. **Slack/Linear fidelity**: mrkdwn contract both directions; Linear progressive AgentActivity updates; thread↔session mapping.
-11. **Multiplayer**: participants, presence, per-user PR attribution (viewer ≠ reviewer), PR created with the *prompting user's* OAuth token (no bot fallback: without a usable GitHub token nothing is pushed and no PR is opened, §41.3; whether a bounded App credential may push instead is an open decision, §44.4).
+11. **Multiplayer**: participants, presence, per-user PR attribution (viewer ≠ reviewer): the push credential and the PR token are the *session creator's* GitHub OAuth token (no bot fallback: without the creator's usable GitHub token nothing is pushed and no PR is opened, §41.3; whether a bounded App credential may push instead is an open decision, §44.4). **Multiplayer push attribution**: a follow-up prompted by anyone other than the creator (a member who joined it, or an admin or maintainer, whom `authz.ActionPromptSession` lets prompt any session) pushes and opens its PR as the creator. Accepted v1; pushing and opening as whoever prompted the turn is deferred in `docs/DECISIONS.md`, with what reopens it.
 12. **Identity & access** (new — see §13): GitHub sign-in + pluggable OIDC SSO; automatic cross-channel identity linking (Slack/Linear ↔ GitHub by verified email, in-channel link prompt on ambiguity); RBAC with four roles (admin/maintainer/member/viewer) enforced server-side and channel-agnostic; audit log.
 13. **Product prototyping workflow** (new — see §14): path-scoped Environments enforced via sparse-checkout (not prompt discipline); a generalized multi-service boot manifest (`services.yml`) supervised natively by `sandbox-agent`; contract-driven mocking with drift detection; a handoff-readiness sentinel that flags backend-touching or uncontracted work for engineering pickup.
 14. **Decision inbox** (new — see §16): a home view listing everything waiting on the signed-in user — auto-approved PRs ready to merge (assigned directly or via CODEOWNERS through the identity graph), reviews requested, plans awaiting approval, recoverable failures — with actions inline, server-side re-validation at click time, and decision latency as an analytics KPI.
@@ -639,7 +639,7 @@ a surface nobody has exercised is exactly the claim this codebase's own conventi
 ## 13. Identity, authentication & RBAC
 
 ### 13.1 Authentication
-- **GitHub OAuth is the primary login** and serves double duty: the stored user OAuth token is what attributes PRs to the real author (§8.11). Generic **OIDC** is the secondary provider for SSO (Google/enterprise IdP). An earlier version of this line said "configuration, not code"; it is code — two handlers, discovery, and an issuer-qualified identity row — and it was not built with the GitHub flow. §41.3 specifies it (Step 164); until it ships, the sign-in view's SSO button is configuration-gated and disabled, and says so.
+- **GitHub OAuth is the primary login** and serves double duty: the stored user OAuth token is what attributes PRs to a real person, the session's creator (§8.11). Generic **OIDC** is the secondary provider for SSO (Google/enterprise IdP). An earlier version of this line said "configuration, not code"; it is code — two handlers, discovery, and an issuer-qualified identity row — and it was not built with the GitHub flow. §41.3 specifies it (Step 164); until it ships, the sign-in view's SSO button is configuration-gated and disabled, and says so.
 - Sessions: **backend-issued, host-scoped cookies** (HttpOnly, SameSite=Lax; never a default cookie name on a shared parent domain — a colliding cookie from a sibling app on the parent domain is a classic random-logout cause). Token/refresh handling lives in the Go control plane; the SPA holds no provider tokens.
 - Signup gate: allowlist of email domains / GitHub orgs / explicit users, evaluated at first sign-in; default role assigned from config (e.g. domain match → member).
 - Provider tokens encrypted at rest (AES-GCM), per-user.
@@ -6832,10 +6832,11 @@ boot; unset leaves the SSO button exactly as disabled as today. The verified `em
 allowlist gate, the same default-role assignment, and the same `users` row model as GitHub sign-in;
 `identities` gains provider `oidc` with `external_id = {issuer}|{sub}` — issuer-qualified, since two
 IdPs can issue the same `sub` — by migration. A user with only an OIDC identity has no GitHub OAuth
-token, so they cannot push until they link one: the push is not attempted and the session records a
-warning saying so. A bot-credential fallback was built and removed in review, because it gave a
+token, and the push and the PR use the session creator's (§8.11), so a session whose creator has no
+linked GitHub identity cannot push until the creator links one: the push is not attempted and the
+session records a warning saying so. A bot-credential fallback was built and removed in review, because it gave a
 GitHub-less member the bot's write access on a branch of their choosing; whether a bounded App
-credential may push for such a user is open (§44.4). The sign-in view's identity panel offers linking a GitHub identity later through the
+credential may push for such a session is open (§44.4). The sign-in view's identity panel offers linking a GitHub identity later through the
 ordinary GitHub flow — the graph merges on verified email exactly as §13.2 step 3 does for Slack and
 Linear.
 
