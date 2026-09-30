@@ -881,6 +881,16 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 				item.AcceptanceMergeBlockedReason = reasonNotPlatformAuthored
 			case pr.HasChangesRequested:
 				item.AcceptanceMergeBlockedReason = reasonChangesRequested
+			case hasNeedsHuman:
+				// Never waived by an acceptance, and lasting: named before
+				// anything a read that failed or was not made could change
+				// -- a failed review-decision read, and the base's
+				// required checks the engine re-run below would otherwise
+				// be blamed for (unread with GitHub outbound off, or
+				// unreadable), since the engine itself is never given the
+				// label (computeRealEligibility). The engine's own reason,
+				// the one a Merge click refuses with.
+				item.AcceptanceMergeBlockedReason = string(autoapproval.ReasonNeedsHumanLabel)
 			case pr.ReviewDecisionDegraded:
 				item.AcceptanceMergeBlockedReason = reasonReviewDecisionDegraded
 			case openFindings > 0:

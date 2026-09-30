@@ -579,6 +579,8 @@ func TestRequiredChecks_AcceptanceReadout(t *testing.T) {
 		// oversizedDiff gives the pull request more changed files than the
 		// engine allows: only the acceptance waives that.
 		oversizedDiff bool
+		// needsHuman labels the PR review:needs-human.
+		needsHuman bool
 		// appStatusOnly gives the head a passing commit status from the
 		// "coverage" App's bot account, and the base a required check
 		// naming that App (254); appReadErr fails the App read.
@@ -625,6 +627,14 @@ func TestRequiredChecks_AcceptanceReadout(t *testing.T) {
 			wantAppReads:  1,
 			wantReason:    string(autoapproval.ReasonRequiredChecksUnknown),
 			wantDegraded:  true,
+		},
+		{
+			// The label, which nothing waives, is the lasting blocker: not
+			// the requirements the inbox does not read.
+			name:       "GitHub outbound off names the needs-human label, not the unread requirements",
+			noBot:      true,
+			needsHuman: true,
+			wantReason: string(autoapproval.ReasonNeedsHumanLabel),
 		},
 	}
 
@@ -673,6 +683,9 @@ func TestRequiredChecks_AcceptanceReadout(t *testing.T) {
 			}
 			if tc.oversizedDiff {
 				pr.ChangedFilesCount = 100000
+			}
+			if tc.needsHuman {
+				pr.Labels = append(pr.Labels, reviewpost.LabelNeedsHuman)
 			}
 			if tc.appStatusOnly {
 				pr.HeadChecks = []ports.HeadCheck{
