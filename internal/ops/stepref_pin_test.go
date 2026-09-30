@@ -69,7 +69,7 @@ var stepRefPins = []stepRefPin{
 	{"docs/DECISIONS.md", "190", "a verdict's formal review is posted twice, on the wrong commit, or blocking after it was replaced"},
 	{"docs/DECISIONS.md", "195", "a turn's work App, bound durably"},
 	{"docs/DECISIONS.md", "197", "the operator surface and runbook"},
-	{"docs/DECISIONS.md", "199", "an unreadable diff routes light, under the reason of a small one"},
+	{"docs/DECISIONS.md", "199", "an unreadable diff routes light, under the reason of a small one (shipped)"},
 	{"docs/DECISIONS.md", "206", "a human's ruling on one finding"},
 	{"docs/DECISIONS.md", "208", "review quality, readable"},
 	{"docs/DECISIONS.md", "209", "provider accounts under this deployment's roles"},

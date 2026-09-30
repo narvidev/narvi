@@ -320,6 +320,10 @@ type Registry struct {
 	// RegistryOptions.ReviewModelDeep's own doc comment.
 	reviewModelDeep string
 
+	// reviewSizeExclusions -- see RegistryOptions.ReviewSizeExclusions'
+	// own doc comment.
+	reviewSizeExclusions []string
+
 	// diffFetcher is §14.4's ("handoff-readiness sentinel", §14.4) own
 	// addition, threaded through to every Actor this Registry hydrates
 	// exactly like the fields above: handoffsentinel.go's own
@@ -565,6 +569,7 @@ func NewRegistry(
 		githubBotHandle:        opt.GitHubBotHandle,
 		githubOutbound:         opt.GitHubOutbound,
 		reviewModelDeep:        opt.ReviewModelDeep,
+		reviewSizeExclusions:   opt.ReviewSizeExclusions,
 		rolloutMode:            opt.RolloutMode,
 		contractDriftDetected:  contractDriftDetected,
 		opsMetrics:             opsMetrics,
@@ -609,6 +614,11 @@ type RegistryOptions struct {
 	// means "not configured" -- see internal/domain/reviewtriage.
 	// ModelAndEffort's own doc comment.
 	ReviewModelDeep string
+	// ReviewSizeExclusions (§26.3) is platform.Config.
+	// ReviewSizeExcludedPaths, threaded to the automatic re-review's own
+	// depth decision exactly as the other two review lanes receive it
+	// (appreviewtriage.Deps.SizeExclusions). Nil excludes nothing.
+	ReviewSizeExclusions []string
 
 	// RolloutMode is §10's own master switch (§10 Phase 6, §32):
 	// platform.Config.RolloutMode, threaded through to dispatch.go's own

@@ -154,7 +154,9 @@ type PreFetchedContext struct {
 	// diff's own full length (the fetch's own response-size cap) -- when
 	// true, RenderTurnPrompt renders an explicit notice alongside Diff
 	// rather than silently handing the agent a partial diff it has no way
-	// to know is partial.
+	// to know is partial. A truncated Diff still ends at a line boundary:
+	// every line in it is a whole line of the real diff (the Fetcher
+	// contract, internal/app/reviewcontext).
 	DiffTruncated bool
 	// Stack is non-nil exactly when the PR under review belongs to a
 	// GitHub-native stack (StackContext's own doc comment) -- nil is the
@@ -252,11 +254,8 @@ type PreFetchedContext struct {
 	// agent has no legitimate use for these as instructions, they exist
 	// purely to feed internal/domain/reviewtriage.Decide (§26.3's own
 	// light/deep routing decision). All three are 0 for a failed
-	// GetPullRequest fetch, indistinguishable from a genuinely empty
-	// diff -- reviewtriage's own "any triage error fails open to light"
-	// posture (internal/app/reviewtriage) makes this ambiguity safe: a
-	// diff that looks empty because the fetch failed can only ever route
-	// LIGHT, never miss a deep-routing signal that was actually there.
+	// GetPullRequest fetch; InputRead below is what tells that apart from
+	// a genuinely empty change.
 	Additions         int
 	Deletions         int
 	ChangedFilesCount int
@@ -268,6 +267,11 @@ type PreFetchedContext struct {
 	// re-parsing Diff at its own call site. nil when Diff itself is
 	// empty (a failed or never-attempted fetch).
 	ChangedPaths []string
+	// InputRead (§26.3) is how the reads above ended -- complete, empty,
+	// or which read failed -- set by the producer, never inferred from
+	// empty fields downstream (InputRead's own doc comment). Server-side
+	// bookkeeping only, never rendered into the prompt.
+	InputRead InputRead
 	// Labels (§26.3) is this PR's own current GitHub label set
 	// -- bookkeeping only, mirrors HeadSHA -- sourced from the SAME
 	// GetPullRequest call (githubapi.PullRequest.Labels, already

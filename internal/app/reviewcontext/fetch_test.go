@@ -807,3 +807,41 @@ func TestFetch_DiffFetchFails_TruncatedIgnored(t *testing.T) {
 		t.Error("DiffTruncated = true, want false (the diffTruncated=true fake field must be ignored once diffErr fired)")
 	}
 }
+
+// TestFetch_InputRead pins that Fetch names how its reads ended
+// (review.InputRead) in every case, so the depth decision never reads a
+// failed read's empty diff as a small change (§26.3) -- and that a
+// genuinely empty change is told apart from a read that failed.
+func TestFetch_InputRead(t *testing.T) {
+	t.Parallel()
+
+	twoFiles := "diff --git a/internal/a.go b/internal/a.go\n--- a/internal/a.go\n+++ b/internal/a.go\n@@ -1 +1 @@\n-x\n+y\n" +
+		"diff --git a/internal/b.go b/internal/b.go\n--- a/internal/b.go\n+++ b/internal/b.go\n@@ -1 +1 @@\n-x\n+y\n"
+	pr := func(changedFiles int) githubapi.PullRequest {
+		return githubapi.PullRequest{HeadSHA: "sha", BaseRef: "main", ChangedFiles: changedFiles, Additions: 2, Deletions: 2}
+	}
+	tests := []struct {
+		name    string
+		fetcher *fakeFetcher
+		want    review.InputRead
+	}{
+		{"pull request read fails", &fakeFetcher{prErr: errors.New("network exploded")}, review.InputReadPRUnreadable},
+		{"diff read fails", &fakeFetcher{pr: pr(2), diffErr: errors.New("502")}, review.InputReadDiffUnreadable},
+		{"diff cut at the size cap", &fakeFetcher{pr: pr(2), diff: twoFiles, diffTruncated: true}, review.InputReadDiffTruncated},
+		{"diff names fewer files than the pull request reports", &fakeFetcher{pr: pr(3), diff: twoFiles}, review.InputReadDiffTruncated},
+		{"diff empty while the pull request reports changed files", &fakeFetcher{pr: pr(2), diff: ""}, review.InputReadDiffUnreadable},
+		{"diff names no file at all", &fakeFetcher{pr: pr(1), diff: "<html>not a diff</html>"}, review.InputReadDiffUnreadable},
+		{"genuinely empty change", &fakeFetcher{pr: pr(0), diff: ""}, review.InputReadEmpty},
+		{"complete", &fakeFetcher{pr: pr(2), diff: twoFiles}, review.InputReadComplete},
+		{"a rename names two paths for one changed file", &fakeFetcher{pr: pr(1), diff: "diff --git a/a.go b/b.go\nsimilarity index 100%\nrename from a.go\nrename to b.go\n"}, review.InputReadComplete},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := reviewcontext.Fetch(context.Background(), discardLogger(), tt.fetcher, platform.DefaultTimeouts(), "acme", "widgets", 42, "gho_bottoken", nil)
+			if got.InputRead != tt.want {
+				t.Errorf("InputRead = %q, want %q", got.InputRead, tt.want)
+			}
+		})
+	}
+}

@@ -246,6 +246,12 @@ func ExtractChangedPaths(diff string) []string {
 // quoting for the WHOLE line's own path, e.g.
 // `+++ "b/uni_caf\303\251.go"`, D2 above) or left bare, and this function
 // handles both without the caller needing to know which it is looking at.
+//
+// An unquoted path loses one trailing TAB: git (and so GitHub's compare
+// diff) ends a "---"/"+++" line with a TAB when the path contains a space,
+// so the line cannot be misread as a path followed by a traditional diff's
+// timestamp. A real path never ends in a TAB here -- git quotes any path
+// containing one -- so the TAB is never part of the name.
 func extractPath(line, prefix string) string {
 	rest := strings.TrimPrefix(line, prefix)
 	if strings.HasPrefix(rest, `"`) {
@@ -253,7 +259,7 @@ func extractPath(line, prefix string) string {
 			return unquotePathLiteral(quoted)
 		}
 	}
-	return rest
+	return strings.TrimSuffix(rest, "\t")
 }
 
 // parseDiffGitHeaderLine parses a "diff --git <old> <new>" line's own two

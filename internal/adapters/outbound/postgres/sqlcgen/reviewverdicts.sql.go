@@ -37,6 +37,44 @@ func (q *Queries) ExistsReviewVerdictForAttempt(ctx context.Context, attemptID p
 	return verdict_exists, err
 }
 
+const getLatestFloorReviewPath = `-- name: GetLatestFloorReviewPath :one
+SELECT rv.review_path FROM review_verdicts rv
+LEFT JOIN turns t ON t.id = rv.attempt_id
+WHERE rv.repo_full_name = $1 AND rv.pr_number = $2
+    AND COALESCE(t.review_depth_decision->>'reason', '') <> ALL($3::text[])
+ORDER BY COALESCE(t.created_at, rv.created_at) DESC, rv.created_at DESC, rv.id DESC
+LIMIT 1
+`
+
+type GetLatestFloorReviewPathParams struct {
+	RepoFullName    string   `json:"repo_full_name"`
+	PrNumber        int32    `json:"pr_number"`
+	NonFloorReasons []string `json:"non_floor_reasons"`
+}
+
+// The depth §24's re-review floor composes with (§26.3: "once deep, a PR
+// stays deep"): the review_path of this PR's latest verdict whose
+// producing turn (attempt_id) was NOT routed for one of
+// non_floor_reasons -- internal/domain/reviewtriage.NonFloorReasons, the
+// reasons whose depth is never a floor (a review routed deep only because
+// its input could not be read). A skipped verdict is stepped over, not
+// read as "no floor": the verdict before it still floors, so a PR that
+// went deep for a real reason stays deep through an unreadable review.
+//
+// The reason is read from the producing turn's own
+// turns.review_depth_decision (the routing record, migrations/000083).
+// A verdict with no attempt_id (posted before migrations/000130), or a
+// turn with no record, has no reason to match and floors as before.
+// Same ordering, tie-breakers and unfiltered-by-shadow scope as
+// GetLatestReviewVerdict above, whose review_path this read replaced as
+// the floor's input. pgx.ErrNoRows means no verdict can floor this PR.
+func (q *Queries) GetLatestFloorReviewPath(ctx context.Context, arg GetLatestFloorReviewPathParams) (*string, error) {
+	row := q.db.QueryRow(ctx, getLatestFloorReviewPath, arg.RepoFullName, arg.PrNumber, arg.NonFloorReasons)
+	var review_path *string
+	err := row.Scan(&review_path)
+	return review_path, err
+}
+
 const getLatestNonShadowReviewVerdict = `-- name: GetLatestNonShadowReviewVerdict :one
 SELECT rv.id, rv.repo_full_name, rv.pr_number, rv.head_sha, rv.risk_level, rv.premise, rv.blast_radius, rv.files_changed, rv.tests_coverage, rv.docs_drift, rv.proposed_shippable, rv.shippable, rv.session_id, rv.created_at, rv.digest_summary, rv.digest_arch_decisions, rv.digest_stack_risks, rv.digest_unverified_limits, rv.digest_description_adequacy, rv.digest_adequacy_explanation, rv.digest_proposed_body, rv.review_path, rv.counter_review, rv.fact_check, rv.fact_check_killed, rv.digest_contested_points, rv.suppressed_in_shadow, rv.arch_decision_tags, rv.arch_decision_roots, rv.knowledge_mode, rv.knowledge_influenced, rv.base_ref, rv.base_sha, rv.ancestor_chain, rv.policy_version, rv.attempt_id FROM review_verdicts rv
 LEFT JOIN turns t ON t.id = rv.attempt_id

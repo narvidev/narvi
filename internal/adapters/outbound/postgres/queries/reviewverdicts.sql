@@ -157,6 +157,30 @@ WHERE rv.repo_full_name = $1 AND rv.pr_number = $2
 ORDER BY COALESCE(t.created_at, rv.created_at) DESC, rv.created_at DESC, rv.id DESC
 LIMIT 1;
 
+-- name: GetLatestFloorReviewPath :one
+-- The depth §24's re-review floor composes with (§26.3: "once deep, a PR
+-- stays deep"): the review_path of this PR's latest verdict whose
+-- producing turn (attempt_id) was NOT routed for one of
+-- non_floor_reasons -- internal/domain/reviewtriage.NonFloorReasons, the
+-- reasons whose depth is never a floor (a review routed deep only because
+-- its input could not be read). A skipped verdict is stepped over, not
+-- read as "no floor": the verdict before it still floors, so a PR that
+-- went deep for a real reason stays deep through an unreadable review.
+--
+-- The reason is read from the producing turn's own
+-- turns.review_depth_decision (the routing record, migrations/000083).
+-- A verdict with no attempt_id (posted before migrations/000130), or a
+-- turn with no record, has no reason to match and floors as before.
+-- Same ordering, tie-breakers and unfiltered-by-shadow scope as
+-- GetLatestReviewVerdict above, whose review_path this read replaced as
+-- the floor's input. pgx.ErrNoRows means no verdict can floor this PR.
+SELECT rv.review_path FROM review_verdicts rv
+LEFT JOIN turns t ON t.id = rv.attempt_id
+WHERE rv.repo_full_name = sqlc.arg(repo_full_name) AND rv.pr_number = sqlc.arg(pr_number)
+    AND COALESCE(t.review_depth_decision->>'reason', '') <> ALL(sqlc.arg(non_floor_reasons)::text[])
+ORDER BY COALESCE(t.created_at, rv.created_at) DESC, rv.created_at DESC, rv.id DESC
+LIMIT 1;
+
 -- name: GetLatestNonShadowReviewVerdict :one
 -- §30.8's own customer-consequential sibling of GetLatestReviewVerdict
 -- above: the SAME per-PR latest-verdict reduction -- including the

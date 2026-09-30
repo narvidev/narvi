@@ -45,6 +45,12 @@ import (
 // synchronous GET .../commits/{branch}, so its result is the base
 // branch's LIVE tip at the moment this review turn's context is
 // assembled -- the one value BaseSHA below is pinned to.
+//
+// GetCompareDiff's contract on truncation: a diff cut at a size cap is
+// returned as a prefix of WHOLE lines, ending at a line boundary
+// (*githubapi.Adapter cuts it back to its last "\n"), so every line Fetch
+// parses -- and every changed path it reports -- is one the real diff has.
+// A partial last line would otherwise read as an invented path.
 type Fetcher interface {
 	GetPullRequest(ctx context.Context, owner, repo string, number int32, token string) (githubapi.PullRequest, error)
 	GetCompareDiff(ctx context.Context, owner, repo, base, head, token string) (diff string, truncated bool, err error)
@@ -129,7 +135,9 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 		// creation" precedent. knownStack, if the caller already had it
 		// from its own webhook payload, is still worth keeping -- it cost
 		// this call nothing and remains genuine, valid context.
-		return review.PreFetchedContext{Stack: knownStack}
+		// InputRead names the failure, so the depth decision never reads
+		// the empty size and paths as a small change (§26.3).
+		return review.PreFetchedContext{Stack: knownStack, InputRead: review.InputReadPRUnreadable}
 	}
 
 	stack := knownStack
@@ -271,10 +279,18 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 	diffCtx, cancel := context.WithTimeout(ctx, timeouts.GitHubPRDiffTimeout)
 	diff, truncated, err := fetcher.GetCompareDiff(diffCtx, owner, repo, diffBase, pr.HeadSHA, token)
 	cancel()
-	if err != nil {
+	diffFailed := err != nil
+	if diffFailed {
 		logger.Warn("reviewcontext: fetch compare diff failed, review turn will carry no pre-fetched diff",
 			"error", err, "owner", owner, "repo", repo, "pr_number", number, "head_sha", pr.HeadSHA)
 		diff, truncated = "", false
+	}
+	changedPaths := reviewtriage.ExtractChangedPaths(diff)
+	inputRead := classifyInputRead(diffFailed, diff, truncated, changedPaths, pr.ChangedFiles)
+	if !inputRead.Readable() && !diffFailed {
+		logger.Warn("reviewcontext: the diff's file list is incomplete, the review will be routed as an unreadable input",
+			"owner", owner, "repo", repo, "pr_number", number, "head_sha", pr.HeadSHA,
+			"input_read", string(inputRead), "diff_truncated", truncated, "diff_paths", len(changedPaths), "pr_changed_files", pr.ChangedFiles)
 	}
 
 	// HeadSHA is reported here regardless of whether the diff fetch above
@@ -298,9 +314,9 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 	// reported even when the diff fetch below failed, exactly like Title/
 	// Body. ChangedPaths is parsed from diff itself (reviewtriage.
 	// ExtractChangedPaths), so it is empty exactly when diff is (a failed
-	// or never-attempted diff fetch) -- reviewtriage's own fail-open-to-
-	// light posture makes that degradation safe (this file's own doc
-	// comment on review.PreFetchedContext.Additions).
+	// or never-attempted diff fetch). InputRead (classifyInputRead) is
+	// what tells that apart from a genuinely empty change: the depth
+	// decision routes an unreadable input deep, never light (§26.3).
 	return review.PreFetchedContext{
 		Diff:          diff,
 		DiffTruncated: truncated,
@@ -335,7 +351,41 @@ func Fetch(ctx context.Context, logger *slog.Logger, fetcher Fetcher, timeouts p
 		Additions:         pr.Additions,
 		Deletions:         pr.Deletions,
 		ChangedFilesCount: pr.ChangedFiles,
-		ChangedPaths:      reviewtriage.ExtractChangedPaths(diff),
+		ChangedPaths:      changedPaths,
 		Labels:            pr.Labels,
+		InputRead:         inputRead,
+	}
+}
+
+// classifyInputRead names how Fetch's reads of a pull request it DID read
+// ended (review.InputRead; a failed pull-request read never reaches here,
+// Fetch returns InputReadPRUnreadable itself). Checked in order:
+//
+//   - the diff fetch failed -> diff_unreadable;
+//   - the diff was cut at the response-size cap -> diff_truncated;
+//   - the diff is empty: an empty change when the pull request reports no
+//     changed file, otherwise diff_unreadable (the read returned nothing
+//     for a change GitHub says touches files);
+//   - the diff names no file at all -> diff_unreadable (not a diff);
+//   - the diff names fewer paths than the pull request reports changed
+//     files -> diff_truncated. A rename contributes two paths and counts
+//     as one changed file, so a complete list never names fewer;
+//   - otherwise complete.
+func classifyInputRead(diffFailed bool, diff string, truncated bool, changedPaths []string, prChangedFiles int) review.InputRead {
+	switch {
+	case diffFailed:
+		return review.InputReadDiffUnreadable
+	case truncated:
+		return review.InputReadDiffTruncated
+	case diff == "" && prChangedFiles == 0:
+		return review.InputReadEmpty
+	case diff == "":
+		return review.InputReadDiffUnreadable
+	case len(changedPaths) == 0:
+		return review.InputReadDiffUnreadable
+	case len(changedPaths) < prChangedFiles:
+		return review.InputReadDiffTruncated
+	default:
+		return review.InputReadComplete
 	}
 }

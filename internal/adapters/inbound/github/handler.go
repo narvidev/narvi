@@ -758,14 +758,12 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		// below), the WHOLE struct is needed further down, to compute this
 		// mention's own light/deep triage decision BEFORE rendering the
 		// prompt (see this block's own doc comment immediately below).
-		// review.PreFetchedContext{} (every field its own honest zero
-		// value) is exactly what a nil cfg.DiffFetcher, or a repo_full_name
-		// that fails to split, degrades to -- internal/app/reviewtriage.
-		// ComputeDecision's own fail-open posture already treats an
-		// all-zero Signals as "route light", so no special-casing is
-		// needed here for either branch below.
+		// A nil cfg.DiffFetcher, or a repo_full_name that fails to split,
+		// leaves prCtx empty but for InputRead, which says no read was
+		// made (review.InputReadNotFetched): the depth decision routes that
+		// as an unreadable input, never as a small change (§26.3).
 		var fetchedHeadSHA string
-		var prCtx review.PreFetchedContext
+		prCtx := review.PreFetchedContext{InputRead: review.InputReadNotFetched}
 		havePrCtx := false
 		if cfg.DiffFetcher != nil {
 			if owner, repo, ok := reposource.SplitFullName(m.RepoFullName); ok {

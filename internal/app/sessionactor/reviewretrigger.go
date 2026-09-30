@@ -140,24 +140,14 @@ type reviewRetriggerDecision struct {
 	budgetNoticeAlreadySent bool
 	latestVerdictRiskLevel  string
 
-	// latestVerdictReviewPath (§26.3) is the latest posted
-	// verdict's own review_path column -- §24's own re-review floor
-	// input ("once deep, a PR stays deep, even if the delta itself
-	// would independently route light"). Empty when no verdict has ever
-	// been posted for this PR, or when the latest one predates §26.3 /
-	// never resolved a depth -- both degrade identically to "nothing to
-	// floor against", mirroring latestVerdictRiskLevel's own identical
-	// "no prior verdict" zero-value convention immediately above.
-	latestVerdictReviewPath string
-
 	// The four fields below are §26.3's own computed OUTPUT (§26.3),
 	// set by handleReviewRetriggerDebounceTimer between phase 2 (fetch)
 	// and phase 3 (finish/insert) -- never set by readReviewRetriggerState
-	// itself, which only ever reads latestVerdictReviewPath above as an
-	// INPUT. finalReviewDepth is decision.Depth AFTER §24's Floor has
-	// been applied against latestVerdictReviewPath -- see
-	// insertAutoRetriggerTurn's own doc comment for how these four ride
-	// onto the inserted turn's own row.
+	// itself. finalReviewDepth is decision.Depth AFTER §24's Floor has
+	// been applied against ComputeDecision's own prior depth (the floor
+	// every lane reads, which skips a depth chosen for an unreadable
+	// input) -- see insertAutoRetriggerTurn's own doc comment for how
+	// these four ride onto the inserted turn's own row.
 	finalReviewDepth        string
 	reviewDepthDecisionJSON []byte
 	triageModelID           *string
@@ -245,25 +235,15 @@ func (a *Actor) handleReviewRetriggerDebounceTimer(ctx context.Context) error {
 			// the PR's own previous depth ("once deep, a PR stays deep,
 			// even if the delta itself would independently route
 			// light") -- UNLESS this fresh decision is itself an explicit
-			// always_light admin override (D9, below) -- decision.
-			// latestVerdictReviewPath is the SAME
-			// GetLatest read readReviewRetriggerState already performed
-			// (phase 1), never a second, redundant review_verdicts
-			// query. ComputeDecision itself performs its OWN further
-			// GetLatest read (for the "prior high verdict" signal,
-			// distinct from the floor) -- a second, small, harmless
-			// query outside any transaction, accepted for reusing the
-			// SAME shared entry point every other trigger path calls
-			// rather than a bespoke variant just for this one caller.
-			// D1 (adversarial-review fix): ComputeDecision's own third
-			// return value (priorReviewDepth, compute.go) is deliberately
-			// IGNORED here -- this lane already has its OWN, independently
-			// obtained prior depth (decision.latestVerdictReviewPath,
-			// read by readReviewRetriggerState's own phase-1 GetLatest,
-			// above) to floor against, so using ComputeDecision's copy of
-			// the identical fact here would be redundant, never a
-			// correctness difference (both reads name the SAME latest
-			// review_verdicts row for this repoFullName/prNumber).
+			// always_light admin override (D9, below). The prior depth is
+			// ComputeDecision's own third return value, the SAME floor
+			// read every other lane uses: unfiltered by shadow (a
+			// shadow-era depth is a fact about how this platform reviews,
+			// not an effect on anyone's repository, so a shadow
+			// evaluation escalates exactly like the live system it
+			// predicts), and stepping over any verdict whose depth was
+			// chosen only because its input could not be read, which is
+			// never a floor (reviewtriage.NonFloorReasons).
 			//
 			// Adversarial-review fix (§26.4/§26.7): computed
 			// BEFORE composeAutoRetriggerPrompt now, not after -- this
@@ -284,8 +264,8 @@ func (a *Actor) handleReviewRetriggerDebounceTimer(ctx context.Context) error {
 			// own ErrInvalidCounterReview/ErrEmptyDigestArchDecisions) on
 			// every such verdict, since the agent was never told
 			// counterReview/the three digest fields were required at all.
-			triageDeps := appreviewtriage.Deps{RepoSettings: a.stores.repoSettings, ReviewVerdicts: a.stores.reviewVerdict, Artifacts: a.stores.artifact, Sessions: a.stores.session}
-			triageDecision, triageConfig, _ := appreviewtriage.ComputeDecision(ctx, triageDeps, decision.repoFullName, decision.prNumber, reviewCtx)
+			triageDeps := appreviewtriage.Deps{RepoSettings: a.stores.repoSettings, ReviewVerdicts: a.stores.reviewVerdict, Artifacts: a.stores.artifact, Sessions: a.stores.session, SizeExclusions: a.reviewSizeExclusions}
+			triageDecision, triageConfig, priorReviewDepth := appreviewtriage.ComputeDecision(ctx, triageDeps, decision.repoFullName, decision.prNumber, reviewCtx)
 			triageProvenance := appreviewtriage.ResolveProvenance(ctx, triageDeps, decision.repoFullName, decision.prNumber)
 			// D9 (adversarial-review fix): skip the floor entirely when
 			// the FRESH decision's own Reason is ReasonAlwaysLightConfig
@@ -301,7 +281,7 @@ func (a *Actor) handleReviewRetriggerDebounceTimer(ctx context.Context) error {
 			// (mode "always_light" alongside depth "deep").
 			flooredDepth := triageDecision.Depth
 			if triageDecision.Reason != domainreviewtriage.ReasonAlwaysLightConfig {
-				flooredDepth = domainreviewtriage.Floor(triageDecision.Depth, domainreviewtriage.ReviewDepth(decision.latestVerdictReviewPath))
+				flooredDepth = domainreviewtriage.Floor(triageDecision.Depth, priorReviewDepth)
 			}
 			decision.finalReviewDepth = string(flooredDepth)
 			decision.triageModelID, decision.triageEffort = domainreviewtriage.ModelAndEffort(flooredDepth, a.reviewModelDeep)
@@ -429,29 +409,21 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 			return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
 		}
 
-		// §24.3 step 2: the latest posted verdict for this PR. TWO reads,
-		// because this one row feeds three decisions and they do not all
-		// have the same audience.
-		//
-		// GetLatestNonShadow for the customer-consequential pair (§30.8):
-		// a shadow-era "already reviewed" fact must never suppress a REAL
+		// §24.3 step 2: the latest posted verdict for this PR, for the
+		// customer-consequential pair (§30.8) -- GetLatestNonShadow: a
+		// shadow-era "already reviewed" fact must never suppress a REAL
 		// re-review once this repo goes live, and a shadow-era risk level
 		// must never be quoted in the real, customer-visible
 		// budget-exhausted notice below.
 		//
-		// But the THIRD consumer is §24's "once deep, a PR stays deep"
-		// floor, and that one is internal: it picks a model tier and an
-		// effort for a review this platform is about to run on its own
-		// machines. Filtering it would quietly make a shadow evaluation
-		// behave DIFFERENTLY from the live system it exists to predict --
-		// a PR that went deep in shadow would drop back to light on its
-		// next shadow push, and the evaluation would under-report exactly
-		// the escalation an operator is trying to observe. So the floor
-		// reads the unfiltered latest.
-		//
-		// The split is the point: suppression is about what reaches a
-		// customer, and evaluation fidelity is about everything else.
-		var verdictHeadSHA, verdictRiskLevel, verdictReviewPath string
+		// §24's "once deep, a PR stays deep" floor is NOT read here: it
+		// is internal (it picks a model tier and an effort for a review
+		// this platform runs on its own machines), so it reads the
+		// unfiltered history, through the one floor read every lane
+		// shares (internal/app/reviewtriage.ComputeDecision, phase 2).
+		// Suppression is about what reaches a customer, and evaluation
+		// fidelity is about everything else.
+		var verdictHeadSHA, verdictRiskLevel string
 		if latest, verdictErr := a.stores.reviewVerdict.WithTx(tx).GetLatestNonShadow(ctx, prSession.RepoFullName, prSession.PrNumber); verdictErr != nil {
 			if !errors.Is(verdictErr, pgx.ErrNoRows) {
 				return fmt.Errorf("sessionactor: get latest review verdict: %w", verdictErr)
@@ -462,23 +434,6 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 		} else {
 			verdictHeadSHA = latest.HeadSha
 			verdictRiskLevel = latest.RiskLevel
-			// (§26.3): review_path is nullable (a pre-existing
-			// row, or a verdict whose own turn never resolved a depth)
-			// -- degrades to "", the SAME "nothing to floor against"
-			// reading as no prior verdict at all.
-			if latest.ReviewPath != nil {
-				verdictReviewPath = *latest.ReviewPath
-			}
-		}
-		// The floor's own read, unfiltered -- see the two-reads note
-		// above. A shadow-era depth is a fact about how this platform
-		// reviews, not an effect on anyone's repository.
-		if anyLatest, anyErr := a.stores.reviewVerdict.WithTx(tx).GetLatest(ctx, prSession.RepoFullName, prSession.PrNumber); anyErr != nil {
-			if !errors.Is(anyErr, pgx.ErrNoRows) {
-				return fmt.Errorf("sessionactor: get latest review verdict for the depth floor: %w", anyErr)
-			}
-		} else if anyLatest.ReviewPath != nil && verdictReviewPath == "" {
-			verdictReviewPath = *anyLatest.ReviewPath
 		}
 
 		base := reviewRetriggerDecision{
@@ -488,7 +443,6 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 			autoRetriggerCount:      prSession.AutoRetriggerCount,
 			budgetNoticeAlreadySent: prSession.AutoRetriggerBudgetNoticeSentAt.Valid,
 			latestVerdictRiskLevel:  verdictRiskLevel,
-			latestVerdictReviewPath: verdictReviewPath,
 		}
 
 		switch {
@@ -517,25 +471,26 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 // trigger path already uses), OUTSIDE any Postgres transaction (this
 // file's own top comment). A nil a.reviewDiffFetcher (not configured for
 // this deployment/test) degrades identically to a live fetch failure --
-// review.PreFetchedContext's own honest zero value, HeadSHA == "" -- and so
-// does a nil a.githubOutbound (GitHub outbound off, §12.5), without making
-// the call.
+// an empty review.PreFetchedContext, HeadSHA == "" -- and so does a nil
+// a.githubOutbound (GitHub outbound off, §12.5), without making the call.
+// Each carries review.InputReadNotFetched, so the context says truthfully
+// that no read was made (the lane then declines, having no head).
 func (a *Actor) fetchAutoRetriggerReviewContext(ctx context.Context, repoFullName string, prNumber int32) review.PreFetchedContext {
 	if a.reviewDiffFetcher == nil {
 		a.logger.Warn("sessionactor: review_retrigger_debounce: no review diff fetcher configured, cannot resolve a live head sha",
 			"repo_full_name", repoFullName, "pr_number", prNumber)
-		return review.PreFetchedContext{}
+		return review.PreFetchedContext{InputRead: review.InputReadNotFetched}
 	}
 	if a.githubOutbound == nil {
 		a.logger.Warn("sessionactor: review_retrigger_debounce: GitHub outbound is off (NARVI_OUTBOUND_ENABLED), cannot read the pull request as the bot",
 			"repo_full_name", repoFullName, "pr_number", prNumber)
-		return review.PreFetchedContext{}
+		return review.PreFetchedContext{InputRead: review.InputReadNotFetched}
 	}
 	owner, repo, ok := reposource.SplitFullName(repoFullName)
 	if !ok {
 		a.logger.Warn("sessionactor: review_retrigger_debounce: repo_full_name not in owner/repo shape",
 			"repo_full_name", repoFullName)
-		return review.PreFetchedContext{}
+		return review.PreFetchedContext{InputRead: review.InputReadNotFetched}
 	}
 	return reviewcontext.Fetch(ctx, a.logger, a.reviewDiffFetcher, a.timeouts, owner, repo, prNumber, a.githubOutbound.BotToken(), nil)
 }

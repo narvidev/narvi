@@ -663,6 +663,10 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			GitHubBotHandle:   cfg.GitHubBotHandle,
 			ReviewDiffFetcher: sourceControl,
 			ReviewModelDeep:   cfg.ReviewModelDeep,
+			// ReviewSizeExclusions (§26.3): the deployment's size
+			// patterns, the same list the other two review lanes' own
+			// appreviewtriage.Deps carry.
+			ReviewSizeExclusions: cfg.ReviewSizeExcludedPaths,
 			// RolloutMode (§10 Phase 6, §32): dispatch.go's own
 			// refuseIfRolloutUnenrolled -- the dispatch-time half of the
 			// "fail-closed, twice" pair -- consults this on every
@@ -1583,6 +1587,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 					ReviewVerdicts: reviewVerdictStore,
 					Artifacts:      artifactStore,
 					Sessions:       sessionStore,
+					SizeExclusions: cfg.ReviewSizeExcludedPaths,
 				},
 				ReviewModelDeep: cfg.ReviewModelDeep,
 				// RolloutMode/RepoSettings (§10 Phase 6, §32): the
@@ -2180,7 +2185,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// second, independently-constructed copy. With GitHub outbound off
 		// (cfg.GitHubOutbound nil) the route stays mounted and re-reviews
 		// without pre-fetched context, making no GitHub call.
-		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(pool, sessionStore, turnStore, planStore, auditLogStore, registry, githubPRSessionStore, sourceControl, reviewFindingStore, falsePositivePatternStore, reviewVerdictStore, knowledgeRanker, cfg.GitHubOutbound, cfg.Timeouts, appreviewtriage.Deps{RepoSettings: repoSettingsStore, ReviewVerdicts: reviewVerdictStore, Artifacts: artifactStore, Sessions: sessionStore}, cfg.ReviewModelDeep))
+		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(pool, sessionStore, turnStore, planStore, auditLogStore, registry, githubPRSessionStore, sourceControl, reviewFindingStore, falsePositivePatternStore, reviewVerdictStore, knowledgeRanker, cfg.GitHubOutbound, cfg.Timeouts, appreviewtriage.Deps{RepoSettings: repoSettingsStore, ReviewVerdicts: reviewVerdictStore, Artifacts: artifactStore, Sessions: sessionStore, SizeExclusions: cfg.ReviewSizeExcludedPaths}, cfg.ReviewModelDeep))
 		// review/findings/{identityHash}/rebut + apply-suggestion (
 		// "sentinels + suggestions", §12.2 item 2/§22.1) -- maintainer+
 		// only (authz.ActionEditReviewVerdict, checked inside each

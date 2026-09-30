@@ -18,6 +18,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/domain/integrations"
 	"github.com/narvidev/narvi/internal/domain/reposource"
+	"github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/rollout"
 )
 
@@ -715,6 +716,46 @@ const gitHubImageBuildTokenEnvVarName = "NARVI_GITHUB_IMAGE_BUILD_TOKEN"
 // opts in by setting this; one who does not keeps booting with zero new
 // required configuration.
 const reviewModelDeepEnvVarName = "NARVI_REVIEW_MODEL_DEEP"
+
+// reviewSizeExcludedPathsEnvVarName configures §26.3's size rule: the
+// comma-separated file patterns whose files are left out of the line
+// count a review is routed on (the path
+// signals -- sensitive globs, root dispersion -- still read every changed
+// path). A deployment-level list, like NARVI_REVIEW_MODEL_DEEP above, not a
+// repo_settings column: the row that asked for it names patterns "this
+// deployment configures", and no per-repo need is described.
+//
+// Unset means reviewtriage.DefaultSizeExclusions (internal/domain/
+// reviewtriage/sizeexclusion.go). Set, it REPLACES that list -- an
+// operator widens or narrows it by writing the list they want -- and set
+// to empty it excludes nothing, counting every changed line as before the
+// rule existed. os.LookupEnv, not the "" idiom, for exactly that
+// difference, the same shape NARVI_INGRESS_ENABLED has.
+//
+// Patterns are the gitignore dialect internal/domain/codeowners
+// implements ("*_test.go", "**/fixtures/**"). An entry using a construct
+// that dialect does not implement -- a leading "!" (negation), "[...]" (a
+// character class), "{a,b}" (a brace list, which the comma split would cut
+// in two anyway), a backslash (an escape) or a leading "#" (a comment) --
+// is refused at boot (InvalidReviewSizeExcludedPathError, naming the
+// construct): the dialect would read it as literal text, and the entry
+// would silently never match what its author meant. A path that really
+// contains one of those characters is matched with "*" in its place.
+const reviewSizeExcludedPathsEnvVarName = "NARVI_REVIEW_SIZE_EXCLUDED_PATHS"
+
+// InvalidReviewSizeExcludedPathError is returned by Load when an entry of
+// NARVI_REVIEW_SIZE_EXCLUDED_PATHS cannot mean what it says
+// (reviewSizeExcludedPathsEnvVarName's own doc comment).
+type InvalidReviewSizeExcludedPathError struct {
+	Value string
+	// Construct names the unsupported construct the entry uses
+	// (reviewtriage.UnsupportedSizeExclusionConstruct).
+	Construct string
+}
+
+func (e *InvalidReviewSizeExcludedPathError) Error() string {
+	return fmt.Sprintf("invalid entry %q in %s: the pattern dialect has no %s, so the entry would never match what it says; write the pattern with \"*\" and \"**\" only", e.Value, reviewSizeExcludedPathsEnvVarName, e.Construct)
+}
 
 // gitHubReReviewLabelEnvVarName configures §8.2's ("review sessions",
 // §8.2) own manual re-trigger-via-label lane (internal/adapters/inbound/
@@ -1862,6 +1903,12 @@ type Config struct {
 	// it is unset").
 	ReviewModelDeep string
 
+	// ReviewSizeExcludedPaths are §26.3's size-rule patterns, read from
+	// NARVI_REVIEW_SIZE_EXCLUDED_PATHS -- reviewtriage.
+	// DefaultSizeExclusions when unset, empty when set to empty (see
+	// reviewSizeExcludedPathsEnvVarName's own doc comment).
+	ReviewSizeExcludedPaths []string
+
 	// PublicBaseURL is this control plane's own externally-reachable base
 	// URL (e.g. "http://localhost:8080" in development, a real https://
 	// URL in production), read from NARVI_PUBLIC_BASE_URL. Required — used
@@ -2610,6 +2657,21 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 	// failure.
 	reviewModelDeep := getenv(reviewModelDeepEnvVarName)
 
+	// reviewSizeExcludedPaths (§26.3): unset is the built-in default,
+	// set replaces it -- see reviewSizeExcludedPathsEnvVarName's own doc
+	// comment.
+	reviewSizeExcludedPaths := reviewtriage.DefaultSizeExclusions()
+	if raw, isSet := lookupEnv(reviewSizeExcludedPathsEnvVarName); isSet {
+		reviewSizeExcludedPaths = []string{}
+		for _, entry := range parseCommaSeparatedList(raw) {
+			if construct, bad := reviewtriage.UnsupportedSizeExclusionConstruct(entry); bad {
+				errs = append(errs, &InvalidReviewSizeExcludedPathError{Value: entry, Construct: construct})
+				continue
+			}
+			reviewSizeExcludedPaths = append(reviewSizeExcludedPaths, entry)
+		}
+	}
+
 	var tokenEncryptionKey []byte
 	rawTokenEncryptionKey := getenv(tokenEncryptionKeyEnvVarName)
 	if rawTokenEncryptionKey == "" {
@@ -3014,6 +3076,7 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 		GitHubOutbound:             gitHubOutbound,
 		GitHubImageBuildToken:      gitHubImageBuildToken,
 		ReviewModelDeep:            reviewModelDeep,
+		ReviewSizeExcludedPaths:    reviewSizeExcludedPaths,
 		PublicBaseURL:              publicBaseURL,
 		TokenEncryptionKey:         tokenEncryptionKey,
 		AllowedEmailDomains:        allowedEmailDomains,
