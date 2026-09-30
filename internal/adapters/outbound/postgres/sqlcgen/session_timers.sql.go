@@ -82,6 +82,34 @@ func (q *Queries) GetSessionTimer(ctx context.Context, arg GetSessionTimerParams
 	return i, err
 }
 
+const getSessionTimerAge = `-- name: GetSessionTimerAge :one
+SELECT created_at, now()::timestamptz AS db_now
+FROM session_timers
+WHERE session_id = $1 AND name = $2
+`
+
+type GetSessionTimerAgeParams struct {
+	SessionID pgtype.UUID `json:"session_id"`
+	Name      string      `json:"name"`
+}
+
+type GetSessionTimerAgeRow struct {
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	DbNow     pgtype.Timestamptz `json:"db_now"`
+}
+
+// A timer's created_at beside the database's now(), in one statement, so
+// the age of a kind the session actor does not know
+// (sessionactor.DecideUnknownTimer) is measured on the database's clock
+// alone: created_at is the database's now() at insert, and neither a
+// re-arm (UpsertSessionTimer) nor a claim (ClaimDueTimer) moves it.
+func (q *Queries) GetSessionTimerAge(ctx context.Context, arg GetSessionTimerAgeParams) (GetSessionTimerAgeRow, error) {
+	row := q.db.QueryRow(ctx, getSessionTimerAge, arg.SessionID, arg.Name)
+	var i GetSessionTimerAgeRow
+	err := row.Scan(&i.CreatedAt, &i.DbNow)
+	return i, err
+}
+
 const listDueTimers = `-- name: ListDueTimers :many
 SELECT id, session_id, name, fires_at, created_at FROM session_timers
 WHERE fires_at <= now()

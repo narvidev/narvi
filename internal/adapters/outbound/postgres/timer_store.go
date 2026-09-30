@@ -42,6 +42,13 @@ func (s *TimerStore) Get(ctx context.Context, arg sqlcgen.GetSessionTimerParams)
 	return s.q.GetSessionTimer(ctx, arg)
 }
 
+// Age fetches a named timer's created_at together with the database's
+// now(): the session actor measures the age of a timer kind it does not
+// know on the database's clock (sessionactor.DecideUnknownTimer).
+func (s *TimerStore) Age(ctx context.Context, arg sqlcgen.GetSessionTimerAgeParams) (sqlcgen.GetSessionTimerAgeRow, error) {
+	return s.q.GetSessionTimerAge(ctx, arg)
+}
+
 // ListDue fetches up to limit due timers, locking each row (FOR UPDATE
 // SKIP LOCKED) so concurrent pump ticks never select the same row — the
 // timer pump's poll query (§2).
@@ -51,7 +58,10 @@ func (s *TimerStore) ListDue(ctx context.Context, limit int32) ([]sqlcgen.Sessio
 
 // Claim pushes an already-locked (via ListDue, same transaction) timer's
 // fires_at forward, so it won't be re-selected as due until the claim
-// window elapses (redelivery-safety, §2).
+// window elapses (redelivery-safety, §2). The session actor also uses it to
+// re-arm a timer kind it does not know at its backoff: an UPDATE of a row
+// that exists, never an insert, so it cannot bring back a row another
+// writer has deleted (pgx.ErrNoRows then).
 func (s *TimerStore) Claim(ctx context.Context, arg sqlcgen.ClaimDueTimerParams) (sqlcgen.SessionTimer, error) {
 	return s.q.ClaimDueTimer(ctx, arg)
 }

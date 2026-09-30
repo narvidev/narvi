@@ -10,57 +10,17 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
-// declaredTimerKinds parses this package's own non-test Go files and
-// returns every package-level string constant named Timer* -- the named
-// timer kinds (command.go) -- as name -> value. Parsed from source, not
-// listed by hand, so a kind added later is found without anyone updating a
-// list.
+// declaredTimerKinds returns every Timer* kind this package declares, as
+// name -> value (export_test.go's DeclaredTimerKindsForTest).
 func declaredTimerKinds(t *testing.T) map[string]string {
 	t.Helper()
-	fset := token.NewFileSet()
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatalf("read package dir: %v", err)
-	}
-	kinds := map[string]string{}
-	for _, e := range entries {
-		name := e.Name()
-		if e.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		file, err := parser.ParseFile(fset, name, nil, parser.SkipObjectResolution)
-		if err != nil {
-			t.Fatalf("parse %s: %v", name, err)
-		}
-		for _, decl := range file.Decls {
-			gen, ok := decl.(*ast.GenDecl)
-			if !ok || gen.Tok != token.CONST {
-				continue
-			}
-			for _, spec := range gen.Specs {
-				vs := spec.(*ast.ValueSpec)
-				for i, ident := range vs.Names {
-					if !strings.HasPrefix(ident.Name, "Timer") || i >= len(vs.Values) {
-						continue
-					}
-					lit, ok := vs.Values[i].(*ast.BasicLit)
-					if !ok || lit.Kind != token.STRING {
-						continue
-					}
-					value, err := strconv.Unquote(lit.Value)
-					if err != nil {
-						t.Fatalf("unquote %s: %v", ident.Name, err)
-					}
-					kinds[ident.Name] = value
-				}
-			}
-		}
-	}
-	return kinds
+	return sessionactor.DeclaredTimerKindsForTest(t)
 }
 
 // TestClassifyTimer_EveryDeclaredKindIsClassified is the exhaustiveness
@@ -278,5 +238,116 @@ func TestClassifyTimer_EveryArmedNameIsClassified(t *testing.T) {
 	}
 	if sites < 10 {
 		t.Fatalf("found only %d timer-arming call sites: the scan is broken", sites)
+	}
+}
+
+// TestTimerDispatch_EveryDeclaredKindHasItsOwnHandler pins that a kind this
+// binary declares never reaches the unknown-kind path (technical plan §2),
+// whatever its row's age: every Timer* constant of this package has a
+// handler of its own in handleTimerFired's dispatch, as it has a
+// classification in ClassifyTimer, and a name ClassifyTimer does not know
+// has neither.
+func TestTimerDispatch_EveryDeclaredKindHasItsOwnHandler(t *testing.T) {
+	t.Parallel()
+
+	kinds := declaredTimerKinds(t)
+	if len(kinds) < 7 {
+		t.Fatalf("found %d Timer* constants (%v), want at least the seven named timers: the scan is broken", len(kinds), kinds)
+	}
+	for name, value := range kinds {
+		if !sessionactor.HasOwnTimerHandlerForTest(value) {
+			t.Errorf("timer kind %s = %q has no handler of its own in handleTimerFired (timerfired.go's timerHandler): it would be aged and deleted as a kind this binary does not know", name, value)
+		}
+		if _, ok := sessionactor.ClassifyTimer(value); !ok {
+			t.Errorf("timer kind %s = %q has a handler but no classification", name, value)
+		}
+	}
+	for _, unknown := range []string{"", "a_kind_from_a_newer_binary", "Review_Retrigger_Debounce", "stop "} {
+		if sessionactor.HasOwnTimerHandlerForTest(unknown) {
+			t.Errorf("HasOwnTimerHandlerForTest(%q) = true, want false: a name ClassifyTimer does not know takes the unknown-kind path", unknown)
+		}
+		if _, ok := sessionactor.ClassifyTimer(unknown); ok {
+			t.Errorf("ClassifyTimer(%q) ok, want unknown", unknown)
+		}
+	}
+}
+
+// TestDecideUnknownTimer_Table pins what happens to a timer of a kind this
+// binary does not know, by the age of its row (technical plan §2): kept
+// strictly inside the grace, backed off from the grace to the deletion
+// bound, deleted from the deletion bound on; a row dated after now (one
+// clock, so impossible, but never a reason to delete) is kept. Run against
+// the shipped bounds and against a second, arbitrary pair, so the decision
+// reads its arguments rather than a copy of the defaults.
+func TestDecideUnknownTimer_Table(t *testing.T) {
+	t.Parallel()
+
+	defaults := platform.DefaultTimeouts()
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	for _, bounds := range []struct {
+		name               string
+		grace, deleteAfter time.Duration
+	}{
+		{"shipped", defaults.UnknownTimerGrace, defaults.UnknownTimerDeleteAfter},
+		{"arbitrary", 7 * time.Minute, 50 * time.Minute},
+	} {
+		for _, tc := range []struct {
+			name string
+			age  time.Duration
+			want sessionactor.UnknownTimerAction
+		}{
+			{"armed after now", -time.Minute, sessionactor.UnknownTimerKeep},
+			{"just armed", 0, sessionactor.UnknownTimerKeep},
+			{"just inside the grace", bounds.grace - time.Nanosecond, sessionactor.UnknownTimerKeep},
+			{"at the grace", bounds.grace, sessionactor.UnknownTimerBackOff},
+			{"between the bounds", (bounds.grace + bounds.deleteAfter) / 2, sessionactor.UnknownTimerBackOff},
+			{"just inside the deletion bound", bounds.deleteAfter - time.Nanosecond, sessionactor.UnknownTimerBackOff},
+			{"at the deletion bound", bounds.deleteAfter, sessionactor.UnknownTimerDelete},
+			{"long past the deletion bound", 10 * bounds.deleteAfter, sessionactor.UnknownTimerDelete},
+		} {
+			t.Run(bounds.name+"/"+tc.name, func(t *testing.T) {
+				t.Parallel()
+				got := sessionactor.DecideUnknownTimer(now.Add(-tc.age), now, bounds.grace, bounds.deleteAfter)
+				if got != tc.want {
+					t.Errorf("DecideUnknownTimer(age %v, grace %v, deleteAfter %v) = %v, want %v", tc.age, bounds.grace, bounds.deleteAfter, got, tc.want)
+				}
+			})
+		}
+	}
+}
+
+// TestDecideUnknownTimer_KeepsEveryAgeOfARollingDeploy is the rolling-deploy
+// guarantee at the decision's level: under the shipped bounds, a timer a
+// newer replica armed at any instant of a rolling deploy as long as
+// RollingDeployCeiling is kept at the claim cadence, never backed off.
+func TestDecideUnknownTimer_KeepsEveryAgeOfARollingDeploy(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	now := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
+	for age := time.Duration(0); age <= to.RollingDeployCeiling; age += to.TimerClaimDuration {
+		if got := sessionactor.DecideUnknownTimer(now.Add(-age), now, to.UnknownTimerGrace, to.UnknownTimerDeleteAfter); got != sessionactor.UnknownTimerKeep {
+			t.Fatalf("DecideUnknownTimer(age %v) = %v, want %v: a newer replica's timer would wait out a backoff during a deploy", age, got, sessionactor.UnknownTimerKeep)
+		}
+	}
+}
+
+// TestUnknownTimerAction_String pins the names the WARN lines and the
+// session_timer_unknown_kind_total counter's action attribute carry.
+func TestUnknownTimerAction_String(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		action sessionactor.UnknownTimerAction
+		want   string
+	}{
+		{sessionactor.UnknownTimerKeep, "kept"},
+		{sessionactor.UnknownTimerBackOff, "backed_off"},
+		{sessionactor.UnknownTimerDelete, "deleted"},
+		{0, "unknown"},
+	} {
+		if got := tc.action.String(); got != tc.want {
+			t.Errorf("UnknownTimerAction(%d).String() = %q, want %q", int(tc.action), got, tc.want)
+		}
 	}
 }

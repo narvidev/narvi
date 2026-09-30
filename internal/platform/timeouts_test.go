@@ -2743,3 +2743,94 @@ func TestValidate_StopGrace(t *testing.T) {
 		t.Fatalf("StopGrace exactly MinTimeoutMargin below TurnDeadline: Validate() = %v, want nil", err)
 	}
 }
+
+// TestValidate_UnknownTimerBounds pins the bounds on a timer kind this
+// binary does not know (technical plan §2): the shipped values (a 30-minute
+// rolling-deploy ceiling, a one-hour grace, a 10-minute backoff, deletion at
+// 24 hours of age), the ceiling refused at zero or below, and each of the
+// three links -- the grace above the ceiling, the backoff above the claim
+// window, the deletion bound above the grace -- refused when either side
+// moves past the other, and accepted at exactly MinTimeoutMargin.
+func TestValidate_UnknownTimerBounds(t *testing.T) {
+	t.Parallel()
+
+	defaults := platform.DefaultTimeouts()
+	for _, tc := range []struct {
+		field string
+		got   time.Duration
+		want  time.Duration
+	}{
+		{"RollingDeployCeiling", defaults.RollingDeployCeiling, 30 * time.Minute},
+		{"UnknownTimerGrace", defaults.UnknownTimerGrace, time.Hour},
+		{"UnknownTimerBackoff", defaults.UnknownTimerBackoff, 10 * time.Minute},
+		{"UnknownTimerDeleteAfter", defaults.UnknownTimerDeleteAfter, 24 * time.Hour},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("DefaultTimeouts().%s = %v, want %v", tc.field, tc.got, tc.want)
+		}
+	}
+
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*platform.Timeouts)
+		wantField string // a *TimeoutMustBePositiveError naming this field
+		wantChain string // or a *TimeoutInvariantError with this chain; neither: valid
+	}{
+		{name: "ceiling zero", mutate: func(to *platform.Timeouts) { to.RollingDeployCeiling = 0 }, wantField: "RollingDeployCeiling"},
+		{name: "ceiling negative", mutate: func(to *platform.Timeouts) { to.RollingDeployCeiling = -time.Minute }, wantField: "RollingDeployCeiling"},
+		{name: "grace at the ceiling", mutate: func(to *platform.Timeouts) {
+			to.UnknownTimerGrace = to.RollingDeployCeiling
+		}, wantChain: "UnknownTimerGrace > RollingDeployCeiling"},
+		{name: "ceiling raised past the grace", mutate: func(to *platform.Timeouts) {
+			to.RollingDeployCeiling = to.UnknownTimerGrace + time.Minute
+		}, wantChain: "UnknownTimerGrace > RollingDeployCeiling"},
+		{name: "grace within the margin above the ceiling", mutate: func(to *platform.Timeouts) {
+			to.UnknownTimerGrace = to.RollingDeployCeiling + platform.MinTimeoutMargin - time.Second
+		}, wantChain: "UnknownTimerGrace > RollingDeployCeiling"},
+		{name: "grace exactly the margin above the ceiling", mutate: func(to *platform.Timeouts) {
+			to.UnknownTimerGrace = to.RollingDeployCeiling + platform.MinTimeoutMargin
+		}},
+		{name: "backoff at the claim window", mutate: func(to *platform.Timeouts) {
+			to.UnknownTimerBackoff = to.TimerClaimDuration
+		}, wantChain: "UnknownTimerBackoff > TimerClaimDuration"},
+		{name: "claim window raised past the backoff", mutate: func(to *platform.Timeouts) {
+			to.TimerClaimDuration = to.UnknownTimerBackoff + time.Minute
+		}, wantChain: "UnknownTimerBackoff > TimerClaimDuration"},
+		{name: "backoff exactly the margin above the claim window", mutate: func(to *platform.Timeouts) {
+			to.UnknownTimerBackoff = to.TimerClaimDuration + platform.MinTimeoutMargin
+		}},
+		{name: "deletion at the grace", mutate: func(to *platform.Timeouts) {
+			to.UnknownTimerDeleteAfter = to.UnknownTimerGrace
+		}, wantChain: "UnknownTimerDeleteAfter > UnknownTimerGrace"},
+		{name: "grace raised past the deletion bound", mutate: func(to *platform.Timeouts) {
+			to.UnknownTimerGrace = to.UnknownTimerDeleteAfter + time.Hour
+		}, wantChain: "UnknownTimerDeleteAfter > UnknownTimerGrace"},
+		{name: "deletion exactly the margin above the grace", mutate: func(to *platform.Timeouts) {
+			to.UnknownTimerDeleteAfter = to.UnknownTimerGrace + platform.MinTimeoutMargin
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			switch {
+			case tc.wantField != "":
+				var pos *platform.TimeoutMustBePositiveError
+				if !errors.As(err, &pos) || pos.Field != tc.wantField {
+					t.Fatalf("Validate() = %v, want %s refused as non-positive", err, tc.wantField)
+				}
+			case tc.wantChain != "":
+				var inv *platform.TimeoutInvariantError
+				if !errors.As(err, &inv) || inv.Chain != tc.wantChain {
+					t.Fatalf("Validate() = %v, want the broken link %q", err, tc.wantChain)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+			}
+		})
+	}
+}

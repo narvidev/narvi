@@ -62,8 +62,9 @@ type Command interface {
 // once rather than at the pump's next tick (every handler already tolerates
 // a redelivered firing, since the pump's claim window can redeliver one). Name is one of the 5 constants above
 // in practice, but this type does not itself restrict it -- an unknown
-// name is handled defensively (logged, ignored) by the dispatch switch in
-// timerfired.go, the same deny-list-not-allow-list convention
+// name is handled defensively (kept, backed off or deleted by its row's
+// age, handleUnknownTimer) by the dispatch in timerfired.go, the same
+// deny-list-not-allow-list convention
 // internal/domain/sandbox.IsDeadSandboxStatus and internal/domain/turn.
 // IsTerminal already use.
 type TimerFired struct {

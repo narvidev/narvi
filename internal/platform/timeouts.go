@@ -307,6 +307,58 @@ type Timeouts struct {
 	// reasonably quickly.
 	TimerClaimDuration time.Duration
 
+	// A timer kind this binary does not know (§2; sessionactor's
+	// DecideUnknownTimer). session_timers.name is TEXT, so a row can name a
+	// kind that only a newer binary handles -- armed by a newer replica
+	// during a rolling deploy -- or one nothing will ever handle again: a
+	// kind left behind by a rollback past the change that introduced it, or
+	// a retired one. The actor cannot tell the two apart, so it goes by the
+	// row's age, created_at, which a re-arm and a claim never move, measured
+	// on the database's clock. The three fields below and the ceiling they
+	// rest on are linked by Validate, each with MinTimeoutMargin.
+
+	// RollingDeployCeiling is the longest a rolling deploy of the control
+	// plane runs, from its first new pod to its last old one: the window in
+	// which an older replica can claim a timer a newer one armed. Not a
+	// timeout anything enforces -- the bound UnknownTimerGrace must outlast.
+	// Derived from deploy/control-plane/deployment.yaml, which sets neither
+	// a strategy nor progressDeadlineSeconds, so Kubernetes' defaults apply:
+	// a RollingUpdate with maxSurge and maxUnavailable at 25%, and a
+	// 600-second progress deadline, past which a rollout that has made no
+	// progress is reported failed and is an incident rather than a deploy.
+	// At those percentages a Deployment of any size is replaced in at most
+	// three waves (three at 3, 7 or 11 replicas; two at the shipped 2), and
+	// each wave makes progress within the deadline: 3 x 10 min. An old pod
+	// still terminating adds its terminationGracePeriodSeconds (30 s by
+	// default), inside MinTimeoutMargin. internal/ops pins the manifest to
+	// those defaults. Not specified in the plan; 30 minutes.
+	RollingDeployCeiling time.Duration
+
+	// UnknownTimerGrace is how long a timer of a kind this binary does not
+	// know is handled as it always was: left armed, so the pump claims it
+	// again within one TimerClaimDuration. Past RollingDeployCeiling, so a
+	// newer replica's timer claimed by an older one during a deploy costs
+	// no more latency than one claim window. Not specified in the plan; one
+	// hour, twice the ceiling.
+	UnknownTimerGrace time.Duration
+
+	// UnknownTimerBackoff is how far ahead such a timer is re-armed once
+	// its row is older than UnknownTimerGrace, instead of every claim
+	// window: each delivery wakes the session's actor, and past the grace
+	// no deploy explains the kind. Each re-arm is logged at WARN with its
+	// name and counted (session_timer_unknown_kind_total). Validate keeps
+	// it above TimerClaimDuration. Not specified in the plan; 10 minutes.
+	UnknownTimerBackoff time.Duration
+
+	// UnknownTimerDeleteAfter is the age past which such a timer is
+	// deleted, with a warning naming it: nothing that knows the kind has
+	// run for the whole time. Until then the session's status counts it as
+	// scheduled work (sessionactor.TimerCanCreateWork), the safe direction.
+	// Longer than a rollback and a fixed redeploy the next day, so a kind a
+	// rollback strands survives for the binary that handles it. Validate
+	// keeps it above UnknownTimerGrace. Not specified in the plan; 24 hours.
+	UnknownTimerDeleteAfter time.Duration
+
 	// The session actor's lock connection and hydration bound (§2, §5.1).
 	// A replica holds every one of its actors' advisory locks on ONE
 	// dedicated connection outside its query pool
@@ -3884,6 +3936,11 @@ func DefaultTimeouts() Timeouts {
 		TimerPumpInterval:  5 * time.Second,  // not specified; chosen
 		TimerClaimDuration: 30 * time.Second, // not specified; chosen
 
+		RollingDeployCeiling:    30 * time.Minute, // not specified; Kubernetes' defaults for deploy/control-plane/deployment.yaml -- see field doc comment
+		UnknownTimerGrace:       1 * time.Hour,    // not specified; chosen, twice RollingDeployCeiling
+		UnknownTimerBackoff:     10 * time.Minute, // not specified; chosen, well above TimerClaimDuration
+		UnknownTimerDeleteAfter: 24 * time.Hour,   // not specified; chosen
+
 		ActorHydrateTimeout:       2 * time.Second,  // not specified; chosen
 		ActorLockStatementTimeout: 1 * time.Second,  // not specified; chosen
 		ActorLockProbeInterval:    10 * time.Second, // not specified; chosen
@@ -4396,6 +4453,19 @@ func (t Timeouts) Validate() error {
 	mustBePositive("StopGrace", t.StopGrace)
 	check("TurnDeadline > StopGrace",
 		"TurnDeadline", t.TurnDeadline, "StopGrace", t.StopGrace)
+
+	// §2, a timer kind this binary does not know: kept at the claim cadence
+	// for longer than any rolling deploy, so a newer replica's timer never
+	// waits out a backoff; backed off to above the claim window past that;
+	// deleted only past the grace, never within it. See UnknownTimerGrace's
+	// and its neighbours' doc comments.
+	mustBePositive("RollingDeployCeiling", t.RollingDeployCeiling)
+	check("UnknownTimerGrace > RollingDeployCeiling",
+		"UnknownTimerGrace", t.UnknownTimerGrace, "RollingDeployCeiling", t.RollingDeployCeiling)
+	check("UnknownTimerBackoff > TimerClaimDuration",
+		"UnknownTimerBackoff", t.UnknownTimerBackoff, "TimerClaimDuration", t.TimerClaimDuration)
+	check("UnknownTimerDeleteAfter > UnknownTimerGrace",
+		"UnknownTimerDeleteAfter", t.UnknownTimerDeleteAfter, "UnknownTimerGrace", t.UnknownTimerGrace)
 
 	// §3.3's stop, after the named session's commit: a zero walk bound
 	// reaches no session it started, and one at or past
