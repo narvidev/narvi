@@ -35,11 +35,27 @@ ON CONFLICT (session_id, name) DO UPDATE
 -- two bounds, so each failed delivery doubles the delay until the bound.
 -- armed_at is not moved: a backoff is not an arm. A session with no
 -- dispatch timer is left without one (zero rows).
+--
+-- It holds only while the row still carries the armed_at the failed
+-- evaluation read when it deleted the timer (DeleteSessionDispatchTimer):
+-- a turn created since re-armed it due at once and moved armed_at, and
+-- that re-arm wins (zero rows).
 UPDATE session_timers
 SET fires_at = now() + LEAST(
         GREATEST(now() - created_at, make_interval(secs => sqlc.arg('base_seconds')::float8)),
         make_interval(secs => sqlc.arg('max_seconds')::float8))
-WHERE session_id = sqlc.arg('session_id') AND name = 'dispatch';
+WHERE session_id = sqlc.arg('session_id') AND name = 'dispatch'
+  AND armed_at = sqlc.arg('armed_at');
+
+-- name: DeleteSessionDispatchTimer :one
+-- A dispatch evaluation's first write (sessionactor's planDispatch,
+-- technical plan §2): the session's dispatch timer is deleted, and its
+-- armed_at returned, so an evaluation that fails -- its transaction rolls
+-- the delete back -- backs off only the row it read
+-- (BackOffSessionDispatchTimer). pgx.ErrNoRows when the session has none.
+DELETE FROM session_timers
+WHERE session_id = $1 AND name = 'dispatch'
+RETURNING armed_at;
 
 -- name: GetSessionTimer :one
 SELECT * FROM session_timers

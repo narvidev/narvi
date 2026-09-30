@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -39,11 +40,23 @@ func (s *TimerStore) Upsert(ctx context.Context, arg sqlcgen.UpsertSessionTimerP
 
 // BackOffDispatch moves the session's dispatch timer, and nothing else,
 // to the database's now plus its age since its first arm, held between
-// arg.BaseSeconds and arg.MaxSeconds, and reports how many rows it moved:
-// zero when the session has no dispatch timer. The session actor's backoff
-// after a dispatch evaluation that failed (technical plan §2).
+// arg.BaseSeconds and arg.MaxSeconds, only while the row still carries
+// arg.ArmedAt, and reports how many rows it moved: zero when the session
+// has no dispatch timer, or a turn re-armed it since. The session actor's
+// backoff after a dispatch evaluation that failed (technical plan §2).
 func (s *TimerStore) BackOffDispatch(ctx context.Context, arg sqlcgen.BackOffSessionDispatchTimerParams) (int64, error) {
 	return s.q.BackOffSessionDispatchTimer(ctx, arg)
+}
+
+// DeleteDispatch deletes the session's dispatch timer and returns the
+// armed_at it carried, or an invalid timestamp when the session had none.
+// The first write of every dispatch evaluation (technical plan §2).
+func (s *TimerStore) DeleteDispatch(ctx context.Context, sessionID pgtype.UUID) (pgtype.Timestamptz, error) {
+	armedAt, err := s.q.DeleteSessionDispatchTimer(ctx, sessionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return pgtype.Timestamptz{}, nil
+	}
+	return armedAt, err
 }
 
 // Get fetches a named timer for a session.

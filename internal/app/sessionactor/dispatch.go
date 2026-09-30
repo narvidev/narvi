@@ -129,6 +129,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/environment"
 	"github.com/narvidev/narvi/internal/domain/reposource"
+	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 	"github.com/narvidev/narvi/internal/domain/rollout"
 	"github.com/narvidev/narvi/internal/domain/sandbox"
 	"github.com/narvidev/narvi/internal/domain/turn"
@@ -328,9 +329,9 @@ type dispatchPlan struct {
 // but they are kept adjacent here since they share this exact hook point
 // for the exact same structural reason.
 func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
-	spawn, dispatch, err := a.planDispatch(ctx)
+	spawn, dispatch, dispatchArmedAt, err := a.planDispatch(ctx)
 	if err != nil {
-		a.backOffDispatchTimer(ctx, err)
+		a.backOffDispatchTimer(ctx, err, dispatchArmedAt)
 		return err
 	}
 	switch {
@@ -368,8 +369,16 @@ func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 // no dispatch timer gets none. A stale actor (ErrStaleEpoch), or one whose
 // context is done, writes nothing: its successor has the timer. A failure
 // here is logged; the claim window still bounds the next try.
-func (a *Actor) backOffDispatchTimer(ctx context.Context, cause error) {
-	if errors.Is(cause, ErrStaleEpoch) || ctx.Err() != nil {
+//
+// armedAt is the armed_at of the dispatch timer the failed evaluation
+// deleted (planDispatch), which its rollback restored; invalid when the
+// session had none, and then nothing is backed off. The write holds only
+// while the row still carries that armed_at: a turn created between the
+// rollback and this transaction -- a writer queued on the session-row lock
+// behind the evaluation gets it first -- re-arms the timer due at once and
+// moves armed_at, and its re-arm wins.
+func (a *Actor) backOffDispatchTimer(ctx context.Context, cause error, armedAt pgtype.Timestamptz) {
+	if !armedAt.Valid || errors.Is(cause, ErrStaleEpoch) || ctx.Err() != nil {
 		return
 	}
 	var moved int64
@@ -377,6 +386,7 @@ func (a *Actor) backOffDispatchTimer(ctx context.Context, cause error) {
 		var err error
 		moved, err = a.stores.timer.WithTx(tx).BackOffDispatch(ctx, sqlcgen.BackOffSessionDispatchTimerParams{
 			SessionID:   a.sessionID,
+			ArmedAt:     armedAt,
 			BaseSeconds: a.timeouts.DispatchRetryBackoff.Seconds(),
 			MaxSeconds:  a.timeouts.DispatchRetryBackoffMax.Seconds(),
 		})
@@ -401,9 +411,15 @@ func (a *Actor) backOffDispatchTimer(ctx context.Context, cause error) {
 // (handleEnsureDispatched) then performs the actual network call
 // (CreateSandbox / RestoreFromSnapshot / ResumeSandbox / SendCommand
 // respectively) outside any transaction.
-func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, error) {
+//
+// dispatchArmedAt is the armed_at of the session's dispatch timer this
+// evaluation deleted, invalid when it had none -- returned even with an
+// error, when the rollback has restored that timer, so
+// handleEnsureDispatched backs off only the row this evaluation read.
+func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, pgtype.Timestamptz, error) {
 	var spawn *spawnPlan
 	var dispatch *dispatchPlan
+	var dispatchArmedAt pgtype.Timestamptz
 
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		now := time.Now()
@@ -421,9 +437,12 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, er
 		// (none does today). A rolled-back evaluation keeps it, and
 		// handleEnsureDispatched backs it off; a spawn refused on policy
 		// ends the turns it was for and commits (endTurnsOnSpawnRefusal).
-		if err := a.deleteTimer(ctx, tx, TimerDispatch); err != nil {
-			return err
+		dispatchArmedAt = pgtype.Timestamptz{}
+		armedAt, err := a.stores.timer.WithTx(tx).DeleteDispatch(ctx, a.sessionID)
+		if err != nil {
+			return fmt.Errorf("sessionactor: delete the dispatch timer: %w", err)
 		}
+		dispatchArmedAt = armedAt
 
 		sessionRow, err := a.stores.session.WithTx(tx).Get(ctx, a.sessionID)
 		if err != nil {
@@ -587,7 +606,7 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, er
 		return nil
 	})
 
-	return spawn, dispatch, err
+	return spawn, dispatch, dispatchArmedAt, err
 }
 
 // planReenqueueOrRespawn implements §3.3's ("turn recovery", §9.3
@@ -877,7 +896,7 @@ func (a *Actor) tryPlanSpawn(
 	if action.Kind == sandbox.SpawnActionSpawn || action.Kind == sandbox.SpawnActionRestore || action.Kind == sandbox.SpawnActionResume {
 		dockerRequired, err := a.refuseIfSubstrateUnsupported(ctx, tx, sessionRow, caps)
 		if err != nil {
-			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, err, now)
+			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, sandboxGen(sandboxRow, hasSandbox), err, now)
 		}
 
 		// §10's own dispatch-time half of the "fail-closed, twice"
@@ -888,7 +907,7 @@ func (a *Actor) tryPlanSpawn(
 		// refuseIfRolloutUnenrolled's own doc comment for the full "why
 		// this is what makes rollback real".
 		if err := a.refuseIfRolloutUnenrolled(ctx, tx, sessionRow); err != nil {
-			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, err, now)
+			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, sandboxGen(sandboxRow, hasSandbox), err, now)
 		}
 
 		// §27.8's own genuinely-unresolved snapshot-parity point (§27.5
@@ -1040,7 +1059,12 @@ func (a *Actor) refuseIfSubstrateUnsupported(ctx context.Context, tx pgx.Tx, ses
 	if err := environment.CheckSubstrateCapabilities(dockerRequired, egressPolicy.RequiresEnforcement(), caps.DockerInSandbox, caps.EgressPolicy); err != nil {
 		a.logger.Error("sessionactor: refusing to spawn: configured provider cannot honor this Environment's substrate requirements (§27.5/§27.6 dispatch-time fail-closed re-check)",
 			"session_id", a.sessionID.String(), "error", err)
-		return dockerRequired, &spawnRefusal{reason: fmt.Sprintf("the configured sandbox provider cannot honor this session's environment: %v", err)}
+		return dockerRequired, &spawnRefusal{
+			reason: fmt.Sprintf("the configured sandbox provider cannot honor this session's environment: %v", err),
+			warning: fmt.Sprintf("This session's open turns were ended: the configured sandbox provider cannot honor its environment (%v). "+
+				"An admin can change the provider or the environment; then send the turn again.", err),
+			notAssessed: reviewcheck.NotAssessedSubstrateUnsupported,
+		}
 	}
 	return dockerRequired, nil
 }
@@ -1234,7 +1258,7 @@ func (a *Actor) refuseIfRolloutUnenrolled(ctx context.Context, tx pgx.Tx, sessio
 		a.logger.Error("sessionactor: spawn-time rollout re-check: resolve admission decision failed; failing closed (refusing spawn)",
 			"session_id", a.sessionID.String(), "error", err)
 		a.recordRolloutRefusal(ctx, string(sessionRow.SpawnSource))
-		return &spawnRefusal{reason: fmt.Sprintf("repo %q not enrolled in cohort rollout", "<unresolvable repos>")}
+		return rolloutSpawnRefusal("<unresolvable repos>")
 	}
 	if decision.Admitted {
 		return nil
@@ -1249,7 +1273,27 @@ func (a *Actor) refuseIfRolloutUnenrolled(ctx context.Context, tx pgx.Tx, sessio
 		return fmt.Errorf("sessionactor: dispatch-time rollout re-check failed: repo %q could not be read (transient)", decision.RepoFullName)
 	}
 	a.recordRolloutRefusal(ctx, string(sessionRow.SpawnSource))
-	return &spawnRefusal{reason: fmt.Sprintf("repo %q not enrolled in cohort rollout", decision.RepoFullName)}
+	return rolloutSpawnRefusal(decision.RepoFullName)
+}
+
+// rolloutSpawnRefusal is the spawnRefusal for repo, one the cohort
+// rollout does not admit.
+func rolloutSpawnRefusal(repo string) *spawnRefusal {
+	return &spawnRefusal{
+		reason: fmt.Sprintf("repo %q not enrolled in cohort rollout", repo),
+		warning: fmt.Sprintf("This session's open turns were ended: its repository %q is not enrolled in this deployment's rollout, so no sandbox could be started. "+
+			"An admin can enroll the repository; then send the turn again.", repo),
+		notAssessed: reviewcheck.NotAssessedRolloutNotEnrolled,
+	}
+}
+
+// sandboxGen is the session's sandbox gen as a warning carries it: 0 with
+// no sandbox row yet.
+func sandboxGen(sandboxRow sqlcgen.Sandbox, hasSandbox bool) int {
+	if !hasSandbox {
+		return 0
+	}
+	return int(sandboxRow.Gen)
 }
 
 // spawnRefusal is a spawn-time policy refusal: a fact about the session
@@ -1263,6 +1307,12 @@ type spawnRefusal struct {
 	// synthetic execution_complete -- the same text the turn-dispatch-time
 	// refusal writes (executeDispatch).
 	reason string
+	// warning is the session warning (the banner) recorded once for the
+	// refusal: what ended the turns, and what an admin can do about it.
+	warning string
+	// notAssessed names the refusal on an ended review attempt's check,
+	// so it closes as not assessed with that reason.
+	notAssessed reviewcheck.NotAssessedReason
 }
 
 func (r *spawnRefusal) Error() string { return "sessionactor: spawn refused: " + r.reason }
@@ -1282,16 +1332,22 @@ func (r *spawnRefusal) Error() string { return "sessionactor: spawn refused: " +
 // the edge failDispatchedTurn uses when the turn-dispatch-time refusal
 // ends a turn already processing (executeDispatch). Each gets the
 // synthetic execution_complete that refusal writes, with the same reason
-// text, and the session's status is re-derived. The workflow hook is
-// OnTurnRefused, never OnTurnCompleted: a refusal read as a blocked
-// outcome could follow a blocked edge and queue the same refused step
-// again, re-arming the dispatch timer in this very transaction.
+// text, and the notice every other path that ends a turn enqueues
+// (enqueueOutboxNotification, as refusePersonalLinkOnly calls it): the
+// Slack or Linear "Turn failed" message, and for a review attempt the
+// check closed as not assessed with the refusal named -- the notice
+// turn_deadline used to send for a turn in flight before this deleted
+// that timer. One session warning (the banner) names the refusal and what
+// an admin can do, and the session's status is re-derived. The workflow
+// hook is OnTurnRefused, never OnTurnCompleted: a refusal read as a
+// blocked outcome could follow a blocked edge and queue the same refused
+// step again, re-arming the dispatch timer in this very transaction.
 //
 // Any other error -- a read that failed, including a transient rollout
 // read -- is returned as it is: the evaluation fails, its transaction
 // rolls back with the timer's delete, and handleEnsureDispatched backs the
 // timer off instead (backOffDispatchTimer).
-func (a *Actor) endTurnsOnSpawnRefusal(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, err error, now time.Time) error {
+func (a *Actor) endTurnsOnSpawnRefusal(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, gen int, err error, now time.Time) error {
 	var refusal *spawnRefusal
 	if !errors.As(err, &refusal) {
 		return err
@@ -1342,11 +1398,17 @@ func (a *Actor) endTurnsOnSpawnRefusal(ctx context.Context, tx pgx.Tx, sessionRo
 			}
 		}
 		failureReason, _ := turn.DeriveFailureReason(from, trig)
+		if err := a.enqueueOutboxNotification(ctx, tx, sessionRow, trig, failureReason, t, nil, refusal.notAssessed); err != nil {
+			return err
+		}
 		overrides[t.ID] = turn.Summary{Status: to, FailureReason: failureReason}
 		a.logger.Warn("sessionactor: turn ended: the spawn it needed was refused",
 			"turn_id", t.ID.String(), "from", string(from), "reason", refusal.reason)
 	}
 	if len(overrides) > 0 {
+		if err := a.recordSessionWarning(ctx, tx, gen, refusal.warning); err != nil {
+			return err
+		}
 		if err := a.persistDerivedSessionStatus(ctx, tx, summariesWithOverrides(turns, overrides)); err != nil {
 			return err
 		}
