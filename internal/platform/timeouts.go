@@ -307,6 +307,83 @@ type Timeouts struct {
 	// reasonably quickly.
 	TimerClaimDuration time.Duration
 
+	// A timer kind this binary does not know (§2; sessionactor's
+	// DecideUnknownTimer). session_timers.name is TEXT, so a row can name a
+	// kind that only a newer binary handles -- armed by a newer replica
+	// during a rolling deploy -- or one nothing will ever handle again: a
+	// kind left behind by a rollback past the change that introduced it, or
+	// a retired one. The actor cannot tell the two apart, so it goes by the
+	// time since the row was last armed: armed_at (migration 000153), which
+	// every arm and re-arm sets and neither the pump's claim nor the backoff
+	// moves, measured on the database's clock. A kind a newer binary keeps
+	// re-arming therefore stays young however long ago it was first armed.
+	// The three fields below and the ceiling they rest on are linked by
+	// Validate, each with MinTimeoutMargin.
+
+	// RollingDeployCeiling is how long a rolling deploy of the control plane
+	// is assumed to run at most, from its first new pod to its last old
+	// one: the window in which an older replica can claim a timer a newer
+	// one armed. Nothing enforces it, and nothing in Kubernetes bounds it: a
+	// Deployment's progressDeadlineSeconds (600 s by default;
+	// deploy/control-plane/deployment.yaml sets none) bounds only the gap
+	// between two progress events -- each new pod turning ready is one --
+	// and a rollout past it is flagged, not stopped, while a paused one is
+	// not timed at all. So it is an operational assumption the operator
+	// keeps (docs/PRODUCTION_CHECKLIST.md, item 12): a rollout still running
+	// past it is a failed deploy, to be finished or rolled back. What the
+	// shipped manifest does bound is a rollout Kubernetes never flags: at
+	// the default RollingUpdate (maxSurge 25% rounded up, maxUnavailable 25%
+	// rounded down) its 2 replicas are replaced one pod at a time, each
+	// turning ready within 600 s of the previous progress event, so within
+	// 2 x 10 min plus an old pod's terminationGracePeriodSeconds (30 s by
+	// default); internal/ops checks replicas x 600 s against this ceiling.
+	// A larger fleet can take about replicas x 10 min without ever being
+	// flagged, and keeps to the ceiling by its own means. Past it the cost
+	// is bounded: a newer replica's timer claimed by an older pod waits up
+	// to UnknownTimerBackoff instead of one claim window, and is deleted
+	// only after UnknownTimerDeleteAfter of mixed versions. Not specified in
+	// the plan; 30 minutes.
+	RollingDeployCeiling time.Duration
+
+	// UnknownTimerGrace is how long after its last arm a timer of a kind
+	// this binary does not know is handled as it always was: left armed, so
+	// the pump claims it again within one TimerClaimDuration. Past
+	// RollingDeployCeiling, so a newer replica's timer claimed by an older
+	// one during a deploy costs no more latency than one claim window. Not
+	// specified in the plan; one hour, twice the ceiling.
+	UnknownTimerGrace time.Duration
+
+	// UnknownTimerBackoff is how far ahead such a timer is moved once its
+	// last arm is older than UnknownTimerGrace, instead of every claim
+	// window: each delivery wakes the session's actor, and past the grace
+	// no deploy explains the kind. The move changes fires_at alone, so the
+	// row keeps ageing. Each is logged at WARN with the kind's name and
+	// counted (session_timer_unknown_kind_total). Validate keeps it above
+	// TimerClaimDuration. Not specified in the plan; 10 minutes.
+	UnknownTimerBackoff time.Duration
+
+	// UnknownTimerDeleteAfter is the time since its last arm past which
+	// such a timer is deleted, with a warning naming it: for that long
+	// nothing that knows the kind has re-armed it. Until then the session's
+	// status counts it as scheduled work (sessionactor.TimerCanCreateWork),
+	// the safe direction. A day, counted from the last time a binary that
+	// knows the kind re-armed it. A kind's lead -- how far ahead of its due
+	// instant it is armed -- is the age it already has at its first
+	// delivery, and the pump delivers only after the due instant, a pump
+	// interval or a claim window later. So a kind armed with a lead of
+	// about a day or more (UnknownTimerDeleteAfter less that delivery
+	// delay) and first delivered by a binary that does not know it is
+	// deleted at that delivery; with a lead of UnknownTimerGrace or more it
+	// is backed off there. And a kind a newer binary keeps re-arming with a
+	// lead L was last re-armed up to about L before a rollback strands it,
+	// so it survives only about UnknownTimerDeleteAfter minus L after the
+	// rollback -- a fixed redeploy the next day finds it only while L is
+	// small. A Step adding a kind keeps its re-arm lead well under this
+	// bound, ideally at most UnknownTimerGrace, or ships a down migration
+	// that deletes its rows. Validate keeps it above UnknownTimerGrace. Not
+	// specified in the plan; 24 hours.
+	UnknownTimerDeleteAfter time.Duration
+
 	// The session actor's lock connection and hydration bound (§2, §5.1).
 	// A replica holds every one of its actors' advisory locks on ONE
 	// dedicated connection outside its query pool
@@ -3928,6 +4005,11 @@ func DefaultTimeouts() Timeouts {
 		TimerPumpInterval:  5 * time.Second,  // not specified; chosen
 		TimerClaimDuration: 30 * time.Second, // not specified; chosen
 
+		RollingDeployCeiling:    30 * time.Minute, // not specified; an operational assumption, see field doc comment
+		UnknownTimerGrace:       1 * time.Hour,    // not specified; chosen, twice RollingDeployCeiling
+		UnknownTimerBackoff:     10 * time.Minute, // not specified; chosen, well above TimerClaimDuration
+		UnknownTimerDeleteAfter: 24 * time.Hour,   // not specified; chosen
+
 		ActorHydrateTimeout:       2 * time.Second,  // not specified; chosen
 		ActorLockStatementTimeout: 1 * time.Second,  // not specified; chosen
 		ActorLockProbeInterval:    10 * time.Second, // not specified; chosen
@@ -4467,6 +4549,19 @@ func (t Timeouts) Validate() error {
 	mustBePositive("StopGrace", t.StopGrace)
 	check("TurnDeadline > StopGrace",
 		"TurnDeadline", t.TurnDeadline, "StopGrace", t.StopGrace)
+
+	// §2, a timer kind this binary does not know: kept at the claim cadence
+	// for longer than a rolling deploy is assumed to run, so a newer
+	// replica's timer never waits out a backoff; backed off to above the claim window past that;
+	// deleted only past the grace, never within it. See UnknownTimerGrace's
+	// and its neighbours' doc comments.
+	mustBePositive("RollingDeployCeiling", t.RollingDeployCeiling)
+	check("UnknownTimerGrace > RollingDeployCeiling",
+		"UnknownTimerGrace", t.UnknownTimerGrace, "RollingDeployCeiling", t.RollingDeployCeiling)
+	check("UnknownTimerBackoff > TimerClaimDuration",
+		"UnknownTimerBackoff", t.UnknownTimerBackoff, "TimerClaimDuration", t.TimerClaimDuration)
+	check("UnknownTimerDeleteAfter > UnknownTimerGrace",
+		"UnknownTimerDeleteAfter", t.UnknownTimerDeleteAfter, "UnknownTimerGrace", t.UnknownTimerGrace)
 
 	// §3.3's stop, after the named session's commit: a zero walk bound
 	// reaches no session it started, and one at or past

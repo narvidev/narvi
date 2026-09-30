@@ -15,7 +15,7 @@ const claimDueTimer = `-- name: ClaimDueTimer :one
 UPDATE session_timers
 SET fires_at = $1
 WHERE session_id = $2 AND name = $3
-RETURNING id, session_id, name, fires_at, created_at
+RETURNING id, session_id, name, fires_at, created_at, armed_at
 `
 
 type ClaimDueTimerParams struct {
@@ -25,7 +25,9 @@ type ClaimDueTimerParams struct {
 }
 
 // Pushes an already-locked (via ListDueTimers, same transaction) timer's
-// fires_at forward by the pump's claim duration, so a second
+// fires_at forward by the pump's claim duration -- never armed_at: a claim
+// is not an arm, and a kind no binary maintains must keep ageing through
+// every claim of it (GetSessionTimerAge) -- so a second
 // concurrent/later pump tick won't re-select the same row as due again
 // until the claim window elapses -- the redelivery-safety mechanism (§2):
 // claiming before delivering means a crash after claiming but before the
@@ -40,6 +42,7 @@ func (q *Queries) ClaimDueTimer(ctx context.Context, arg ClaimDueTimerParams) (S
 		&i.Name,
 		&i.FiresAt,
 		&i.CreatedAt,
+		&i.ArmedAt,
 	)
 	return i, err
 }
@@ -59,8 +62,30 @@ func (q *Queries) DeleteSessionTimer(ctx context.Context, arg DeleteSessionTimer
 	return err
 }
 
+const deleteSessionTimerIfArmedAt = `-- name: DeleteSessionTimerIfArmedAt :execrows
+DELETE FROM session_timers
+WHERE session_id = $1 AND name = $2 AND armed_at = $3
+`
+
+type DeleteSessionTimerIfArmedAtParams struct {
+	SessionID pgtype.UUID        `json:"session_id"`
+	Name      string             `json:"name"`
+	ArmedAt   pgtype.Timestamptz `json:"armed_at"`
+}
+
+// The session actor's deletion of a timer kind it does not know, only
+// while the row still carries the armed_at the decision read: a row
+// re-armed since is left alone (zero rows).
+func (q *Queries) DeleteSessionTimerIfArmedAt(ctx context.Context, arg DeleteSessionTimerIfArmedAtParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteSessionTimerIfArmedAt, arg.SessionID, arg.Name, arg.ArmedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getSessionTimer = `-- name: GetSessionTimer :one
-SELECT id, session_id, name, fires_at, created_at FROM session_timers
+SELECT id, session_id, name, fires_at, created_at, armed_at FROM session_timers
 WHERE session_id = $1 AND name = $2
 `
 
@@ -78,12 +103,43 @@ func (q *Queries) GetSessionTimer(ctx context.Context, arg GetSessionTimerParams
 		&i.Name,
 		&i.FiresAt,
 		&i.CreatedAt,
+		&i.ArmedAt,
 	)
 	return i, err
 }
 
+const getSessionTimerAge = `-- name: GetSessionTimerAge :one
+SELECT armed_at, now()::timestamptz AS db_now
+FROM session_timers
+WHERE session_id = $1 AND name = $2
+`
+
+type GetSessionTimerAgeParams struct {
+	SessionID pgtype.UUID `json:"session_id"`
+	Name      string      `json:"name"`
+}
+
+type GetSessionTimerAgeRow struct {
+	ArmedAt pgtype.Timestamptz `json:"armed_at"`
+	DbNow   pgtype.Timestamptz `json:"db_now"`
+}
+
+// A timer's armed_at beside the database's now(), in one statement, so the
+// age of a kind the session actor does not know
+// (sessionactor.DecideUnknownTimer) is the time since its last arm,
+// measured on the database's clock alone: every arm and re-arm
+// (UpsertSessionTimer) sets armed_at to the database's now(), and neither
+// the claim (ClaimDueTimer) nor the backoff (PostponeSessionTimerIfArmedAt)
+// moves it.
+func (q *Queries) GetSessionTimerAge(ctx context.Context, arg GetSessionTimerAgeParams) (GetSessionTimerAgeRow, error) {
+	row := q.db.QueryRow(ctx, getSessionTimerAge, arg.SessionID, arg.Name)
+	var i GetSessionTimerAgeRow
+	err := row.Scan(&i.ArmedAt, &i.DbNow)
+	return i, err
+}
+
 const listDueTimers = `-- name: ListDueTimers :many
-SELECT id, session_id, name, fires_at, created_at FROM session_timers
+SELECT id, session_id, name, fires_at, created_at, armed_at FROM session_timers
 WHERE fires_at <= now()
 ORDER BY fires_at
 LIMIT $1
@@ -108,6 +164,7 @@ func (q *Queries) ListDueTimers(ctx context.Context, limit int32) ([]SessionTime
 			&i.Name,
 			&i.FiresAt,
 			&i.CreatedAt,
+			&i.ArmedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -120,7 +177,7 @@ func (q *Queries) ListDueTimers(ctx context.Context, limit int32) ([]SessionTime
 }
 
 const listSessionTimers = `-- name: ListSessionTimers :many
-SELECT id, session_id, name, fires_at, created_at FROM session_timers
+SELECT id, session_id, name, fires_at, created_at, armed_at FROM session_timers
 WHERE session_id = $1
 ORDER BY name
 `
@@ -142,6 +199,7 @@ func (q *Queries) ListSessionTimers(ctx context.Context, sessionID pgtype.UUID) 
 			&i.Name,
 			&i.FiresAt,
 			&i.CreatedAt,
+			&i.ArmedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -153,13 +211,43 @@ func (q *Queries) ListSessionTimers(ctx context.Context, sessionID pgtype.UUID) 
 	return items, nil
 }
 
+const postponeSessionTimerIfArmedAt = `-- name: PostponeSessionTimerIfArmedAt :execrows
+UPDATE session_timers
+SET fires_at = $1
+WHERE session_id = $2 AND name = $3 AND armed_at = $4
+`
+
+type PostponeSessionTimerIfArmedAtParams struct {
+	FiresAt   pgtype.Timestamptz `json:"fires_at"`
+	SessionID pgtype.UUID        `json:"session_id"`
+	Name      string             `json:"name"`
+	ArmedAt   pgtype.Timestamptz `json:"armed_at"`
+}
+
+// The session actor's backoff of a timer kind it does not know: moves
+// fires_at, never armed_at, and only while the row still carries the
+// armed_at the decision read (GetSessionTimerAge). A row re-armed since --
+// by a newer replica that knows the kind -- is left alone: zero rows.
+func (q *Queries) PostponeSessionTimerIfArmedAt(ctx context.Context, arg PostponeSessionTimerIfArmedAtParams) (int64, error) {
+	result, err := q.db.Exec(ctx, postponeSessionTimerIfArmedAt,
+		arg.FiresAt,
+		arg.SessionID,
+		arg.Name,
+		arg.ArmedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const upsertSessionTimer = `-- name: UpsertSessionTimer :one
 
 INSERT INTO session_timers (session_id, name, fires_at)
 VALUES ($1, $2, $3)
 ON CONFLICT (session_id, name) DO UPDATE
-    SET fires_at = EXCLUDED.fires_at
-RETURNING id, session_id, name, fires_at, created_at
+    SET fires_at = EXCLUDED.fires_at, armed_at = now()
+RETURNING id, session_id, name, fires_at, created_at, armed_at
 `
 
 type UpsertSessionTimerParams struct {
@@ -172,6 +260,10 @@ type UpsertSessionTimerParams struct {
 // ON CONFLICT (session_id, name) DO UPDATE per the "each is armed/re-armed
 // independently" semantics (§2) — re-arming updates the existing row, never
 // inserts a duplicate.
+// Every arm and re-arm stamps armed_at with now() (migration 000153): the
+// instant a binary that knows the kind last maintained the row, from which
+// a kind the session actor does not know is aged (GetSessionTimerAge). The
+// insert takes it from the column's default.
 func (q *Queries) UpsertSessionTimer(ctx context.Context, arg UpsertSessionTimerParams) (SessionTimer, error) {
 	row := q.db.QueryRow(ctx, upsertSessionTimer, arg.SessionID, arg.Name, arg.FiresAt)
 	var i SessionTimer
@@ -181,6 +273,7 @@ func (q *Queries) UpsertSessionTimer(ctx context.Context, arg UpsertSessionTimer
 		&i.Name,
 		&i.FiresAt,
 		&i.CreatedAt,
+		&i.ArmedAt,
 	)
 	return i, err
 }

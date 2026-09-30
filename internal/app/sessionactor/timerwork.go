@@ -1,5 +1,7 @@
 package sessionactor
 
+import "time"
+
 // TimerWork is what an armed named timer means for a session's status
 // (technical plan §43.20): whether its firing can create work on the
 // session -- a turn -- with no new input from anyone, and so whether a
@@ -38,9 +40,9 @@ const (
 // (a raw Exec, a new sqlc query, a migration). The runtime backstop covers
 // those: ok is false for a name it does not know, and TimerCanCreateWork
 // counts such a name as work, so the status errs toward scheduled, never
-// settled (and handleTimerFired leaves an unknown name armed, so the pump
-// redelivers it and the session keeps reading scheduled). Each case says
-// why:
+// settled (and handleTimerFired leaves an unknown name armed until
+// DecideUnknownTimer deletes it, so the session keeps reading scheduled
+// until then). Each case says why:
 //
 //   - connecting_deadline (armed at spawn, dispatch.go), liveness_check and
 //     inactivity (armed at Booting->Ready, sandboxevent.go; each re-arms
@@ -123,4 +125,71 @@ func TimerCountsAsScheduledWork(name string, reviewRetriggerCanFire bool) bool {
 		return reviewRetriggerCanFire
 	}
 	return TimerCanCreateWork(name)
+}
+
+// UnknownTimerAction is what handleTimerFired does with a timer whose kind
+// ClassifyTimer does not know (technical plan §2), decided by
+// DecideUnknownTimer from the row's age.
+type UnknownTimerAction int
+
+const (
+	// UnknownTimerKeep leaves the row as the pump's claim left it, so the
+	// pump delivers it again within one TimerClaimDuration -- the handling
+	// every unknown kind had before these bounds existed, kept while a
+	// rolling deploy can still explain the kind: a newer replica armed it,
+	// and its own pump must find it at the claim cadence.
+	UnknownTimerKeep UnknownTimerAction = iota + 1
+	// UnknownTimerBackOff re-arms the row UnknownTimerBackoff ahead instead
+	// of every claim window, logged at WARN with its name and counted.
+	UnknownTimerBackOff
+	// UnknownTimerDelete deletes the row, logged at WARN with its name.
+	UnknownTimerDelete
+)
+
+// String names the action for logs and the
+// session_timer_unknown_kind_total counter's action attribute.
+func (a UnknownTimerAction) String() string {
+	switch a {
+	case UnknownTimerKeep:
+		return "kept"
+	case UnknownTimerBackOff:
+		return "backed_off"
+	case UnknownTimerDelete:
+		return "deleted"
+	default:
+		return "unknown"
+	}
+}
+
+// DecideUnknownTimer decides what happens to a timer of a kind this binary
+// does not know, from its age: now minus armedAt, the row's
+// session_timers.armed_at -- the instant of its last arm. Every arm and
+// re-arm (UpsertSessionTimer) sets it; the pump's claim (ClaimDueTimer) and
+// this path's own backoff never move it. So the age is how long nothing
+// that knows the kind has maintained the row: a kind a newer binary keeps
+// re-arming stays young however long ago it was first armed. Never
+// created_at, which only the first insert sets, and never fires_at, which
+// the pump moves at every claim. The caller passes both instants from the
+// database's clock (TimerStore.Age), so no replica's clock is involved.
+//
+//   - Younger than grace (platform.Timeouts.UnknownTimerGrace, longer than a
+//     rolling deploy is assumed to run): UnknownTimerKeep. A newer replica
+//     may have armed it moments ago, and it must lose no more than one
+//     claim window.
+//   - At grace or older, but younger than deleteAfter
+//     (UnknownTimerDeleteAfter): UnknownTimerBackOff.
+//   - At deleteAfter or older: UnknownTimerDelete.
+//
+// An armedAt after now -- impossible on one clock -- reads as age zero:
+// kept, the safe direction.
+func DecideUnknownTimer(armedAt, now time.Time, grace, deleteAfter time.Duration) UnknownTimerAction {
+	age := now.Sub(armedAt)
+	switch {
+	case age >= deleteAfter:
+		return UnknownTimerDelete
+	case age >= grace:
+		return UnknownTimerBackOff
+	default:
+		return UnknownTimerKeep
+	}
 }

@@ -201,6 +201,15 @@ type opsMetrics struct {
 	// lockConnLost is session_actor_lock_conn_lost, one per lost lock
 	// connection; each loss stopped every actor this replica hosted.
 	lockConnLost metric.Int64Counter
+
+	// unknownTimerKind is session_timer_unknown_kind_total: one per timer
+	// of a kind this binary does not know that handleUnknownTimer
+	// (timerfired.go) backed off or deleted once its row outlived
+	// platform.Timeouts.UnknownTimerGrace, tagged action=backed_off|deleted.
+	// A kind still inside the grace is not counted: a rolling deploy
+	// explains it. Which kind is in the WARN line logged with it -- the
+	// name is not an attribute, since a row can carry any text.
+	unknownTimerKind metric.Int64Counter
 }
 
 // newOpsMetrics constructs all five instruments against meter -- the SAME
@@ -344,6 +353,15 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		return opsMetrics{}, fmt.Errorf("sessionactor: construct session_actor_lock_conn_lost counter: %w", err)
 	}
 
+	unknownTimerKind, err := meter.Int64Counter(
+		"session_timer_unknown_kind_total",
+		metric.WithDescription("Timers of a kind this binary does not know (§2) whose row outlived UnknownTimerGrace -- longer than any rolling deploy, so no newer replica explains the kind -- by action: backed_off (re-armed UnknownTimerBackoff ahead instead of every claim window) or deleted (older than UnknownTimerDeleteAfter). A kind still inside the grace is not counted. The WARN line logged with each names the kind."),
+		metric.WithUnit("{timer}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct session_timer_unknown_kind_total counter: %w", err)
+	}
+
 	return opsMetrics{
 		actorsLive:           actorsLive,
 		hydrations:           hydrations,
@@ -359,7 +377,18 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		gitCheckoutDuration:  gitCheckoutDuration,
 		rolloutRefused:       rolloutRefused,
 		bootEvidenceFallback: bootEvidenceFallback,
+		unknownTimerKind:     unknownTimerKind,
 	}, nil
+}
+
+// recordUnknownTimer counts one timer of a kind this binary does not know
+// that handleUnknownTimer (timerfired.go) backed off or deleted, after the
+// transaction that did it has committed.
+func (a *Actor) recordUnknownTimer(ctx context.Context, action UnknownTimerAction) {
+	if a.opsMetrics.unknownTimerKind == nil {
+		return
+	}
+	a.opsMetrics.unknownTimerKind.Add(ctx, 1, metric.WithAttributes(attribute.String("action", action.String())))
 }
 
 // addActorsLive moves session_actors_live by delta.

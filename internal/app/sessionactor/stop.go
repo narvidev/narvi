@@ -519,7 +519,8 @@ func stopFlaggedPendingTurnIDs(turns []sqlcgen.Turn) []pgtype.UUID {
 // answers, so that window is normally the actor's own queue.
 //
 // A kind ClassifyTimer does not know is left armed: this binary cannot tell
-// what it does, and handleTimerFired leaves one armed too.
+// what it does, and handleTimerFired leaves one armed too, until the time
+// since its last arm reaches UnknownTimerDeleteAfter (technical plan §2).
 func (a *Actor) disarmWorkCreatingTimers(ctx context.Context, tx pgx.Tx, requestedAt pgtype.Timestamptz) error {
 	if !requestedAt.Valid {
 		return nil

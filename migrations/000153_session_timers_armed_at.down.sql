@@ -1,0 +1,25 @@
+-- Reverses 000153_session_timers_armed_at.up.sql. Every row's last-arm
+-- instant goes with the column: nothing a binary without 000153 reads, and
+-- a binary with it that runs 000153 again backfills every row from
+-- created_at, so a kind it does not know is aged from its first arm until
+-- something re-arms it -- older than it is, so backed off or deleted
+-- sooner, never later.
+--
+-- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
+-- 000153. Do not run it against live pods of a binary that carries 000153,
+-- for two reasons:
+--   - Every query of that binary that returns a whole timer row names this
+--     column (sqlc writes each SELECT * and RETURNING * out as a column
+--     list): arming, reading, claiming and listing a session's timers among
+--     them, and its re-arm sets it. After this down each of them fails with
+--     SQLSTATE 42703 (column does not exist), so no timer is armed or fired
+--     until the older binary replaces the pod.
+--   - A pod that carries 000153 and restarts before the older binary
+--     replaces it applies 000153 again at boot, which locks the older binary
+--     out again ("no migration found for version 153").
+-- Guarded: IF EXISTS, so it also runs on a database a rollback already
+-- brought back to 152 with the column kept (`migrate force 152`, the up
+-- file's "Rolling back") and then forced to 153 again. The drop is a
+-- catalog change: it rewrites nothing, but takes ACCESS EXCLUSIVE on
+-- session_timers for the file's one implicit transaction.
+ALTER TABLE session_timers DROP COLUMN IF EXISTS armed_at;

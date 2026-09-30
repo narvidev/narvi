@@ -55,6 +55,10 @@
 // left the claimed row untouched -- would have that same claim window
 // silently expire and redeliver the identical TimerFired command forever,
 // even long after the condition it was watching stopped being relevant.
+// The one deliberate exception is a kind this binary does not know, left
+// untouched while its row is young enough that a newer replica's pump may
+// still want it at the claim cadence -- and bounded by the row's age past
+// that (handleUnknownTimer).
 
 package sessionactor
 
@@ -94,28 +98,136 @@ func (a *Actor) handle(ctx context.Context, cmd Command) error {
 }
 
 func (a *Actor) handleTimerFired(ctx context.Context, cmd TimerFired) error {
-	switch cmd.Name {
-	case TimerInactivity:
-		return a.handleInactivityTimer(ctx)
-	case TimerConnectingDeadline:
-		return a.handleConnectingDeadlineTimer(ctx)
-	case TimerLivenessCheck:
-		return a.handleLivenessCheckTimer(ctx)
-	case TimerTerminalGrace:
-		return a.handleTerminalGraceTimer(ctx)
-	case TimerTurnDeadline:
-		return a.handleTurnDeadlineTimer(ctx)
-	case TimerReviewRetriggerDebounce:
-		return a.handleReviewRetriggerDebounceTimer(ctx)
-	case TimerStop:
-		return a.handleStopTimer(ctx)
-	default:
-		// TEXT column, not an enum (§2) -- an unrecognized name is
-		// handled defensively (deny-list-not-allow-list, same convention
-		// as domain/sandbox.IsDeadSandboxStatus), never a fatal error.
-		a.logger.Warn("sessionactor: ignoring TimerFired with unknown name", "name", cmd.Name)
-		return nil
+	if handler, ok := a.timerHandler(cmd.Name); ok {
+		return handler(ctx)
 	}
+	// TEXT column, not an enum (§2) -- an unrecognized name is handled
+	// defensively (deny-list-not-allow-list, same convention as
+	// domain/sandbox.IsDeadSandboxStatus), never a fatal error.
+	return a.handleUnknownTimer(ctx, cmd.Name)
+}
+
+// timerHandler returns the handler of a timer kind this binary knows, and
+// false for any other name, which handleTimerFired sends to
+// handleUnknownTimer instead. It lists the kinds ClassifyTimer classifies:
+// timerwork_test.go fails when a declared Timer* kind has no handler here,
+// so a kind this binary declares never reaches the unknown-kind path,
+// whatever its row's age.
+func (a *Actor) timerHandler(name string) (func(context.Context) error, bool) {
+	switch name {
+	case TimerInactivity:
+		return a.handleInactivityTimer, true
+	case TimerConnectingDeadline:
+		return a.handleConnectingDeadlineTimer, true
+	case TimerLivenessCheck:
+		return a.handleLivenessCheckTimer, true
+	case TimerTerminalGrace:
+		return a.handleTerminalGraceTimer, true
+	case TimerTurnDeadline:
+		return a.handleTurnDeadlineTimer, true
+	case TimerReviewRetriggerDebounce:
+		return a.handleReviewRetriggerDebounceTimer, true
+	case TimerStop:
+		return a.handleStopTimer, true
+	default:
+		return nil, false
+	}
+}
+
+// handleUnknownTimer handles a timer whose kind this binary does not know
+// (technical plan §2). The kind is either a newer binary's -- a newer
+// replica armed it during a rolling deploy, and its own pump will claim it
+// -- or one nothing will handle again, left behind by a rollback or a
+// retired kind. This binary cannot tell which, so DecideUnknownTimer goes
+// by the time since the row was last armed (armed_at), read with the
+// database's now() in the same statement (TimerStore.Age), and this
+// applies it in one transaction:
+//
+//   - kept (last armed less than UnknownTimerGrace ago): nothing is
+//     written, so the row comes back when the pump's claim lapses, within
+//     one TimerClaimDuration -- a newer replica's timer loses no more than
+//     that, as it always has;
+//   - backed off: its fires_at, and nothing else, moves to the database's
+//     now plus UnknownTimerBackoff;
+//   - deleted (last armed UnknownTimerDeleteAfter ago or more).
+//
+// Both writes hold only while the row still carries the armed_at the
+// decision read (TimerStore.PostponeIfArmedAt, DeleteIfArmedAt): the read
+// locks nothing, so a newer replica can re-arm the row between the two,
+// and its re-arm wins -- the write then touches no row, and nothing is
+// logged at WARN or counted. Each outcome that did write logs one WARN
+// naming the kind and counts session_timer_unknown_kind_total, after the
+// commit. A row already gone -- a TimerFired sent with no row behind it --
+// changes nothing. Until the row is deleted, the session's status counts
+// it as scheduled work (TimerCanCreateWork), the safe direction.
+func (a *Actor) handleUnknownTimer(ctx context.Context, name string) error {
+	var (
+		action  UnknownTimerAction
+		age     time.Duration
+		firesAt time.Time
+		written bool
+	)
+	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		action, written = 0, false
+		timers := a.stores.timer.WithTx(tx)
+		row, err := timers.Age(ctx, sqlcgen.GetSessionTimerAgeParams{SessionID: a.sessionID, Name: name})
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return fmt.Errorf("sessionactor: read the age of timer %q: %w", name, err)
+		}
+		now := row.DbNow.Time
+		age = now.Sub(row.ArmedAt.Time)
+		action = DecideUnknownTimer(row.ArmedAt.Time, now, a.timeouts.UnknownTimerGrace, a.timeouts.UnknownTimerDeleteAfter)
+		var n int64
+		switch action {
+		case UnknownTimerBackOff:
+			firesAt = now.Add(a.timeouts.UnknownTimerBackoff)
+			n, err = timers.PostponeIfArmedAt(ctx, sqlcgen.PostponeSessionTimerIfArmedAtParams{
+				FiresAt:   pgtype.Timestamptz{Time: firesAt, Valid: true},
+				SessionID: a.sessionID,
+				Name:      name,
+				ArmedAt:   row.ArmedAt,
+			})
+			if err != nil {
+				return fmt.Errorf("sessionactor: back off timer %q: %w", name, err)
+			}
+		case UnknownTimerDelete:
+			n, err = timers.DeleteIfArmedAt(ctx, sqlcgen.DeleteSessionTimerIfArmedAtParams{
+				SessionID: a.sessionID,
+				Name:      name,
+				ArmedAt:   row.ArmedAt,
+			})
+			if err != nil {
+				return fmt.Errorf("sessionactor: delete timer %q: %w", name, err)
+			}
+		}
+		written = n > 0
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	switch {
+	case action == 0:
+		a.logger.Info("sessionactor: TimerFired with unknown name has no timer row", "name", name)
+	case action == UnknownTimerKeep:
+		a.logger.Warn("sessionactor: ignoring TimerFired with unknown name", "name", name, "age", age)
+	case !written:
+		a.logger.Info("sessionactor: timer kind this binary does not know was re-armed meanwhile; left as it is",
+			"name", name, "decided", action.String())
+	case action == UnknownTimerBackOff:
+		a.logger.Warn("sessionactor: timer kind this binary does not know backed off",
+			"name", name, "age", age, "fires_at", firesAt)
+		a.recordUnknownTimer(ctx, action)
+	case action == UnknownTimerDelete:
+		a.logger.Warn("sessionactor: timer kind this binary does not know deleted",
+			"name", name, "age", age)
+		a.recordUnknownTimer(ctx, action)
+	}
+	return nil
 }
 
 // handleInactivityTimer implements the `inactivity` named timer (§2).

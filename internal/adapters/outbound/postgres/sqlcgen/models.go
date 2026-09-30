@@ -2404,6 +2404,7 @@ type SessionTimer struct {
 	Name      string             `json:"name"`
 	FiresAt   pgtype.Timestamptz `json:"fires_at"`
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	ArmedAt   pgtype.Timestamptz `json:"armed_at"`
 }
 
 type ShadowScmWrite struct {
