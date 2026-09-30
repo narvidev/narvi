@@ -9,6 +9,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // TestPostIssueComment_Success proves PostIssueComment posts the right
@@ -87,7 +88,7 @@ func TestBotNotifier_Deliver(t *testing.T) {
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := githubapi.NewBotNotifier(adapter, "baked-in-bot-token")
+	notifier := mustBuild(githubapi.NewBotNotifier(adapter, platform.MustNewGitHubOutboundConfig("baked-in-bot-token")))
 
 	payload, err := json.Marshal(githubapi.Payload{
 		Owner:    "acme",
@@ -120,7 +121,7 @@ func TestBotNotifier_Deliver_InvalidPayload(t *testing.T) {
 	t.Parallel()
 
 	adapter := githubapi.New(http.DefaultClient, "http://unused.invalid")
-	notifier := githubapi.NewBotNotifier(adapter, "bot-token")
+	notifier := mustBuild(githubapi.NewBotNotifier(adapter, platform.MustNewGitHubOutboundConfig("bot-token")))
 
 	err := notifier.Deliver(context.Background(), ports.Notification{
 		Kind:    ports.NotificationKindGitHub,

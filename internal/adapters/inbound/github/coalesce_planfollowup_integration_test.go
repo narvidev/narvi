@@ -140,14 +140,17 @@ func TestCoalesce_ReusePathClassifiesRawMentionText_NeverTheEnrichedPrompt(t *te
 	}
 	deliveries := narvipg.NewWebhookDeliveryStore(pool)
 
-	handler := githubingress.NewHandler(coalescer, deliveries, githubingress.Config{
+	handler, handlerErr := githubingress.NewHandler(coalescer, deliveries, githubingress.Config{
 		WebhookSecret: testWebhookSecret,
 		BotHandle:     testBotHandleIntegration,
 		PullRequests:  fetcher,
 		DiffFetcher:   fetcher,
-		BotToken:      "test-bot-token",
+		Outbound:      platform.MustNewGitHubOutboundConfig("test-bot-token"),
 		Timeouts:      platform.DefaultTimeouts(),
 	})
+	if handlerErr != nil {
+		t.Fatalf("githubingress.NewHandler: %v", handlerErr)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhooks/github", handler)

@@ -47,7 +47,7 @@ func testSessionID(t *testing.T) pgtype.UUID {
 
 func baseReleaseCfg(pr githubapi.PullRequest, pending *fakePendingEnqueuer) Config {
 	return Config{
-		BotToken:             "gho_bottoken",
+		Outbound:             platform.MustNewGitHubOutboundConfig("gho_bottoken"),
 		PullRequests:         &fakePullRequestResolver{pr: pr},
 		PendingChecks:        pending,
 		ReleaseLabel:         "release",
@@ -108,7 +108,7 @@ func TestTriggerReleaseManifestCheck_OrdinaryPRNeverTriggers(t *testing.T) {
 func TestTriggerReleaseManifestCheck_NilDepsSkipsEntirely(t *testing.T) {
 	resolver := &fakePullRequestResolver{pr: githubapi.PullRequest{HeadRef: "release/2.4"}}
 	cfg := Config{
-		BotToken:     "gho_bottoken",
+		Outbound:     platform.MustNewGitHubOutboundConfig("gho_bottoken"),
 		PullRequests: resolver,
 		Timeouts:     platform.DefaultTimeouts(),
 		// PendingChecks deliberately left nil.
@@ -127,7 +127,7 @@ func TestTriggerReleaseManifestCheck_NilDepsSkipsEntirely(t *testing.T) {
 func TestTriggerReleaseManifestCheck_GetPullRequestFailsNeverPanics(t *testing.T) {
 	pending := &fakePendingEnqueuer{}
 	cfg := Config{
-		BotToken:             "gho_bottoken",
+		Outbound:             platform.MustNewGitHubOutboundConfig("gho_bottoken"),
 		PullRequests:         &fakePullRequestResolver{err: errors.New("network exploded")},
 		PendingChecks:        pending,
 		ReleaseLabel:         "release",
@@ -149,7 +149,7 @@ func TestTriggerReleaseManifestCheck_UnsplittableRepoFullNameSkips(t *testing.T)
 	resolver := &fakePullRequestResolver{pr: githubapi.PullRequest{HeadRef: "release/2.4"}}
 	pending := &fakePendingEnqueuer{}
 	cfg := Config{
-		BotToken:             "gho_bottoken",
+		Outbound:             platform.MustNewGitHubOutboundConfig("gho_bottoken"),
 		PullRequests:         resolver,
 		PendingChecks:        pending,
 		ReleaseLabel:         "release",

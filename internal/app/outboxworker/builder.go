@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -155,6 +156,20 @@ func NewBuilder(store *postgres.OutboxStore, pool *pgxpool.Pool, notifiers map[p
 func (b *Builder) HasNotifier(kind ports.NotificationKind) bool {
 	_, ok := b.notifiers[kind]
 	return ok
+}
+
+// RegisteredKinds returns every kind with a notifier registered, sorted --
+// HasNotifier's whole-map sibling, for the same composition-root tests: a
+// relational assertion (the kinds one configuration registers minus
+// another's) needs the full set, where HasNotifier can only confirm a list
+// the test already wrote down.
+func (b *Builder) RegisteredKinds() []ports.NotificationKind {
+	kinds := make([]ports.NotificationKind, 0, len(b.notifiers))
+	for kind := range b.notifiers {
+		kinds = append(kinds, kind)
+	}
+	slices.Sort(kinds)
+	return kinds
 }
 
 // Run runs the process-wide outbox-delivery loop until ctx is done --

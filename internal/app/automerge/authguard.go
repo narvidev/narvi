@@ -20,7 +20,7 @@ import (
 // is that SAME shape, reused rather than reinvented, for a completely
 // different outbound path this worker owns: a GitHub call authenticated
 // with the deployment's single, statically-configured bot credential
-// (Worker.deps.BotToken).
+// (Worker.deps.Outbound's bot token).
 //
 // The one structural difference from outbox's own backoff, and why this
 // is an in-memory authGuard rather than a Postgres-backed retry queue
@@ -78,7 +78,7 @@ const (
 	authScopeNone authScope = iota
 	// authScopeWorker is ports.ErrAuthenticationFailed's own scope -- see
 	// that sentinel's doc comment (internal/app/ports/authfailure.go) for
-	// why a 401 against Worker.deps.BotToken is always worker-wide.
+	// why a 401 against Worker.deps.Outbound's bot token is always worker-wide.
 	authScopeWorker
 	// authScopeRepo is ports.ErrPermissionDenied's own scope -- a 403
 	// GitHub's own rate-limit/abuse-detection classification
@@ -187,7 +187,7 @@ func stateReady(s *authFailureState, now time.Time) bool {
 
 // recordSuccess resets BOTH the worker-wide streak and repoFullName's own
 // per-repository streak: a real, successful authenticated GitHub call
-// against repoFullName is direct evidence that Worker.deps.BotToken
+// against repoFullName is direct evidence that Worker.deps.Outbound's bot token
 // itself currently works (worker-wide, per authScopeWorker's own doc
 // comment) AND that repoFullName specifically still grants it access.
 // It never touches a DIFFERENT repository's own state -- a per-repository
@@ -197,7 +197,7 @@ func stateReady(s *authFailureState, now time.Time) bool {
 // Called ONLY after a genuinely successful MergePR (worker.go's own
 // mergeCandidate) -- deliberately NOT after RevalidateForAutoMerge's own
 // success. A read-only GetOpenPR call succeeding is real evidence
-// Worker.deps.BotToken can still read, but it says nothing about whether
+// Worker.deps.Outbound's bot token can still read, but it says nothing about whether
 // it can still WRITE (merge) to repoFullName specifically -- the exact
 // distinction ports.ErrPermissionDenied's own repo-scope exists to draw.
 // Resetting on a mere read success would let every OTHER eligible

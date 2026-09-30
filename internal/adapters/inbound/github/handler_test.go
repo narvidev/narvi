@@ -4,12 +4,14 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // githubSign mirrors GitHub's own "X-Hub-Signature-256: sha256=<hex>"
@@ -32,7 +34,27 @@ func githubSign(secret, body []byte) string {
 func newTestHandler(secret, botHandle string) http.HandlerFunc {
 	deliveries := postgres.NewWebhookDeliveryStore(nil)
 	coalescer := &SessionCoalescer{}
-	return NewHandler(coalescer, deliveries, Config{WebhookSecret: secret, BotHandle: botHandle})
+	handler, err := NewHandler(coalescer, deliveries, Config{WebhookSecret: secret, BotHandle: botHandle, Outbound: platform.MustNewGitHubOutboundConfig("test-bot-token")})
+	if err != nil {
+		panic(err) // unreachable: Outbound is set
+	}
+	return handler
+}
+
+// TestNewHandler_RefusesNilOutbound proves GitHub ingress cannot be built
+// without GitHub outbound (§12.5): the handler resolves pull requests,
+// fetches review context and replies as the bot, so a nil
+// Config.Outbound is a construction error wrapping
+// platform.ErrGitHubOutboundRequired -- never a handler that would call
+// GitHub with an empty token.
+func TestNewHandler_RefusesNilOutbound(t *testing.T) {
+	handler, err := NewHandler(&SessionCoalescer{}, postgres.NewWebhookDeliveryStore(nil), Config{WebhookSecret: "s", BotHandle: "narvi-bot"})
+	if !errors.Is(err, platform.ErrGitHubOutboundRequired) {
+		t.Errorf("NewHandler(nil Outbound) error = %v, want one wrapping platform.ErrGitHubOutboundRequired", err)
+	}
+	if handler != nil {
+		t.Error("NewHandler(nil Outbound) returned a handler, want nil")
+	}
 }
 
 // TestHandler_SignatureVerification_Rejects is table-driven over

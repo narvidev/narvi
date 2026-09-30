@@ -258,7 +258,7 @@ func (f *autoRetriggerFixture) countAuditLogRows(ctx context.Context, t *testing
 func newAutoRetriggerRegistry(ctx context.Context, t *testing.T, pool *pgxpool.Pool, diffFetcher *fakeReviewDiffFetcher) *Registry {
 	t.Helper()
 	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false,
-		RegistryOptions{ReviewDiffFetcher: diffFetcher, GitHubBotHandle: "narvi-bot", GitHubBotToken: "test-token"})
+		RegistryOptions{ReviewDiffFetcher: diffFetcher, GitHubBotHandle: "narvi-bot", GitHubOutbound: platform.MustNewGitHubOutboundConfig("test-token")})
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}

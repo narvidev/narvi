@@ -57,9 +57,9 @@ func TestSentinelAutoFixNotifier_ParentStopped_SkipsTerminallyNeverRetried(t *te
 		t.Fatalf("upsert review finding: %v", err)
 	}
 
-	notifier := outboxworker.NewSentinelAutoFixNotifier(pool, sessions, narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), registry, sentinelFixes, reviewFindings,
-		&fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}, "gh-fake-bot-token", platform.DefaultTimeouts(), false, platform.RolloutModeOpen, narvipg.NewRepoSettingsStore(pool), narvipg.NewGitHubPRSessionStore(pool),
-		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool))
+	notifier := mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, sessions, narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), registry, sentinelFixes, reviewFindings,
+		&fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts(), false, platform.RolloutModeOpen, narvipg.NewRepoSettingsStore(pool), narvipg.NewGitHubPRSessionStore(pool),
+		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool)))
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
 		SentinelFixID:         fix.ID.String(),

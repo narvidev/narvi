@@ -69,16 +69,21 @@ type Config struct {
 	// bodies against (compileMentionPattern, payload.go).
 	BotHandle string
 
-	// BotToken/PullRequests/Timeouts (batch fix/audit-github-pr-payload-
+	// Outbound/PullRequests/Timeouts (batch fix/audit-github-pr-payload-
 	// correctness, H5 audit fix) together resolve an issue_comment
 	// mention's TRUE head branch/repo via one authenticated GitHub REST
 	// API call -- see headresolve.go's own doc comments for the full
 	// fallback behavior.
 	//
-	// BotToken is the SAME bot credential githubapi.BotNotifier already
-	// authenticates its own PostIssueComment calls with
-	// (platform.Config.GitHubBotToken) -- never a per-commenter
-	// credential: a GitHub webhook mention carries no OAuth token for the
+	// Outbound is §12.5's GitHub outbound axis (platform.Config.
+	// GitHubOutbound), whose bot credential is the SAME one
+	// githubapi.BotNotifier already authenticates its own PostIssueComment
+	// calls with -- never a per-commenter credential. REQUIRED: NewHandler
+	// refuses a nil one, because this handler resolves pull requests,
+	// fetches review context and posts its sign-in and plan-awaiting
+	// replies as the bot, which is why GitHub ingress requires GitHub
+	// outbound (platform.GitHubIngressRequiresOutboundError). Never a
+	// per-commenter credential either: a GitHub webhook mention carries no OAuth token for the
 	// commenter (unlike CreatePR's own per-session, per-creator token),
 	// and resolving a PR's own already-public head branch/repo needs none
 	// of that per-user identity.
@@ -97,7 +102,7 @@ type Config struct {
 	// exactly (that field's own doc comment): a genuine outbound network
 	// call made inline in a webhook handler must never run against the
 	// bare, deadline-free r.Context() unbounded.
-	BotToken     string
+	Outbound     *platform.GitHubOutboundConfig
 	PullRequests PullRequestResolver
 	Timeouts     platform.Timeouts
 
@@ -345,11 +350,16 @@ type Config struct {
 	Timers *postgres.TimerStore
 }
 
-// NewHandler builds the POST /webhooks/github handler (cmd/control-plane/
-// main.go). See doc.go's own "Request handling" section for the full
+// NewHandler builds the POST /webhooks/github handler (controlplane/
+// serve.go). See doc.go's own "Request handling" section for the full
 // verify -> dedupe-claim -> parse -> detect -> coalesce sequencing this
-// implements.
-func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliveryStore, cfg Config) http.HandlerFunc {
+// implements. It refuses a nil cfg.Outbound (see that field's doc
+// comment): GitHub ingress cannot run without GitHub outbound.
+func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliveryStore, cfg Config) (http.HandlerFunc, error) {
+	if err := platform.RequireGitHubOutbound(cfg.Outbound, "github: new webhook handler"); err != nil {
+		return nil, err
+	}
+	botToken := cfg.Outbound.BotToken()
 	mentionRE := compileMentionPattern(cfg.BotHandle)
 	secret := []byte(cfg.WebhookSecret)
 
@@ -480,7 +490,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		// care about this Step) falls through to the ordinary pipeline
 		// unchanged, which acknowledges it as a no-op exactly like today.
 		if eventType == eventTypePullRequest && cfg.SentinelFixes != nil && readPullRequestEventAction(body) == "closed" {
-			dataSource := &githubMergeGateDataSource{diffFetcher: cfg.DiffFetcher, pullRequests: cfg.PullRequests, botToken: cfg.BotToken, timeouts: cfg.Timeouts}
+			dataSource := &githubMergeGateDataSource{diffFetcher: cfg.DiffFetcher, pullRequests: cfg.PullRequests, botToken: botToken, timeouts: cfg.Timeouts}
 			handlePullRequestClosed(ctx, w, body, cfg.SentinelFixes, cfg.RepoSettings, cfg.AuditLog, dataSource, notImplementedFixMerger{})
 			return
 		}
@@ -593,7 +603,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		// authored by the bot's OWN GitHub identity must never be treated as
 		// a fresh mention-worthy event. Without this, the bot's own posted
 		// comment (githubapi.Adapter's async turn-outcome notification back
-		// to this SAME PR, wired via GitHubBotToken) could itself satisfy
+		// to this SAME PR, posted with the GitHub outbound bot token) could itself satisfy
 		// compileMentionPattern -- e.g. quoting or echoing the handle back --
 		// and re-trigger mention detection, a bot-replies-to-its-own-comment
 		// loop this filter closes. Checked as early as possible (before the
@@ -605,7 +615,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		// best available signal for "is this the bot" today -- the SAME
 		// configured handle mention-detection itself already matches comment
 		// bodies against (Config.BotHandle's own doc comment). internal/
-		// platform/config.go's own GitHubBotToken doc comment describes that
+		// platform/config.go's own gitHubBotTokenEnvVarName doc comment describes that
 		// credential as "a real GitHub personal access token or a GitHub App
 		// installation token, whichever the deploying operator provisions"
 		// -- so this filter must recognize BOTH realistic shapes a
@@ -628,7 +638,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		//    silently stop recognizing that identity's own comments as
 		//    self-comments. Closing that fully would need this codebase to
 		//    independently discover/verify the bot's own real login (e.g. a
-		//    GET /user call against GitHubBotToken at startup).
+		//    GET /user call against the bot token at startup).
 		//  - Over-inclusion (the "[bot]" branch specifically): GitHub App
 		//    slugs are globally unique, but nothing stops an unrelated,
 		//    independently-installed third-party App from happening to share
@@ -660,7 +670,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		// request, only logs and falls back.
 		if eventType == eventTypeIssueComment {
 			resolveCtx, cancel := context.WithTimeout(ctx, cfg.Timeouts.GitHubGetPRTimeout)
-			m = resolveIssueCommentHead(resolveCtx, logger, cfg.PullRequests, cfg.BotToken, m)
+			m = resolveIssueCommentHead(resolveCtx, logger, cfg.PullRequests, botToken, m)
 			cancel()
 		}
 
@@ -759,7 +769,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		havePrCtx := false
 		if cfg.DiffFetcher != nil {
 			if owner, repo, ok := reposource.SplitFullName(m.RepoFullName); ok {
-				prCtx = reviewcontext.Fetch(ctx, logger, cfg.DiffFetcher, cfg.Timeouts, owner, repo, m.PRNumber, cfg.BotToken, m.Stack)
+				prCtx = reviewcontext.Fetch(ctx, logger, cfg.DiffFetcher, cfg.Timeouts, owner, repo, m.PRNumber, botToken, m.Stack)
 				havePrCtx = true
 				fetchedHeadSHA = prCtx.HeadSHA
 			} else {
@@ -1034,7 +1044,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 				// could fix here.
 				if !actor.Valid {
 					if claimActorNotAuthorizedNotice(ctx, logger, cfg.LinkNotices, cfg.Timeouts.GitHubActorNoticeTTL, m.RepoFullName, m.PRNumber, m.CommenterID) {
-						postActorNotAuthorizedReply(ctx, logger, cfg.Comments, cfg.PublicBaseURL, cfg.BotToken, m.RepoFullName, m.PRNumber, m.CommenterID)
+						postActorNotAuthorizedReply(ctx, logger, cfg.Comments, cfg.PublicBaseURL, botToken, m.RepoFullName, m.PRNumber, m.CommenterID)
 					}
 				}
 				w.WriteHeader(http.StatusOK)
@@ -1094,7 +1104,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 				// all, unlike Slack/Linear's own equivalent honest replies
 				// for this exact sentinel.
 				logger.Info("github: mention blocked by awaiting-approval plan", "repo", m.RepoFullName, "pr_number", m.PRNumber)
-				postPlanAwaitingReply(ctx, logger, cfg.Comments, cfg.BotToken, m.RepoFullName, m.PRNumber)
+				postPlanAwaitingReply(ctx, logger, cfg.Comments, botToken, m.RepoFullName, m.PRNumber)
 				w.WriteHeader(http.StatusOK)
 				return
 			}
@@ -1134,5 +1144,5 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 			"session_id", session.ID, "turn_id", turn.ID, "new_session", isNew,
 			"repo", m.RepoFullName, "pr_number", m.PRNumber, "event_type", eventType)
 		w.WriteHeader(http.StatusOK)
-	}
+	}, nil
 }

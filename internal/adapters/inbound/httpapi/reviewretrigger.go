@@ -116,7 +116,7 @@ const manualRetriggerPromptText = "Manual re-review requested via the web review
 // internal/adapters/inbound/github's own identical Config.ArchDecisions/
 // KnowledgeRanker fields (handler.go) in shape -- see this function's own
 // FetchPriorArchDecisions call site for the full "why".
-func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, prSessions *postgres.GitHubPRSessionStore, diffFetcher reviewcontext.Fetcher, reviewFindings reviewcontext.FindingsFetcher, falsePositivePatterns reviewcontext.FalsePositivePatternsFetcher, archDecisions reviewcontext.ArchDecisionsFetcher, knowledgeRanker ports.KnowledgeRanker, botToken string, timeouts platform.Timeouts, reviewTriageDeps appreviewtriage.Deps, reviewModelDeep string) http.HandlerFunc {
+func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, prSessions *postgres.GitHubPRSessionStore, diffFetcher reviewcontext.Fetcher, reviewFindings reviewcontext.FindingsFetcher, falsePositivePatterns reviewcontext.FalsePositivePatternsFetcher, archDecisions reviewcontext.ArchDecisionsFetcher, knowledgeRanker ports.KnowledgeRanker, outbound *platform.GitHubOutboundConfig, timeouts platform.Timeouts, reviewTriageDeps appreviewtriage.Deps, reviewModelDeep string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
 		if !ok {
@@ -221,19 +221,40 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		// repo_full_name that fails to split, degrades to --
 		// internal/app/reviewtriage.ComputeDecision's own fail-open
 		// posture already treats an all-zero Signals as "route light".
-		// havePrCtx (D2's own fix) tracks whether prCtx below was actually
-		// populated by a real Fetch call -- exactly the SAME condition
-		// that used to gate the (now-moved) RenderTurnPrompt call inline,
-		// preserved here so a nil diffFetcher or a repo_full_name that
-		// fails to split keeps degrading identically to before this fix:
-		// no RenderTurnPrompt call at all, prompt stays the plain fixed
-		// text with no diff/verdict-tool-instructions block appended.
+		// havePrCtx (D2's own fix) tracks whether prCtx below went through
+		// the review-context path -- a real Fetch call, or GitHub outbound
+		// being off, which takes that path's own degraded outcome -- exactly
+		// the SAME condition that used to gate the (now-moved)
+		// RenderTurnPrompt call inline, preserved here so a nil diffFetcher
+		// or a repo_full_name that fails to split keeps degrading
+		// identically to before this fix: no RenderTurnPrompt call at all,
+		// prompt stays the plain fixed text with no diff/verdict-tool-
+		// instructions block appended.
 		var reviewHeadSHA *string
 		var prCtx review.PreFetchedContext
 		havePrCtx := false
-		if diffFetcher != nil {
+		switch {
+		case diffFetcher == nil:
+			// No fetcher configured: the prompt stays the plain fixed text.
+		case outbound == nil:
+			// GitHub outbound off (§12.5): no credential to read the pull
+			// request as the bot, so no call is made, and the turn takes the
+			// SAME degraded path a failed live read takes -- reviewcontext.
+			// Fetch's honest zero context, havePrCtx set -- not the plain
+			// text of a nil diffFetcher. RenderTurnPrompt then still adds
+			// the verdict tool's instructions, so the review can post what
+			// it finds: the sandbox reads the code through the GitHub App's
+			// read-only token, which this axis does not touch, and the
+			// verdict tool records its findings (review_findings), which the
+			// review readout shows. With no head sha the verdict itself is
+			// not stored and nothing reaches GitHub. It is also what the
+			// actor's automatic re-review does with outbound off.
+			logger.Warn("httpapi: GitHub outbound is off (NARVI_OUTBOUND_ENABLED), re-review runs without pre-fetched review context",
+				"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+			havePrCtx = true
+		default:
 			if owner, repo, ok := reposource.SplitFullName(prSession.RepoFullName); ok {
-				prCtx = reviewcontext.Fetch(ctx, logger, diffFetcher, timeouts, owner, repo, prSession.PrNumber, botToken, nil)
+				prCtx = reviewcontext.Fetch(ctx, logger, diffFetcher, timeouts, owner, repo, prSession.PrNumber, outbound.BotToken(), nil)
 				havePrCtx = true
 				if prCtx.HeadSHA != "" {
 					reviewHeadSHA = &prCtx.HeadSHA

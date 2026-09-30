@@ -123,6 +123,7 @@ var probeValuesByVar = map[string]string{
 	"NARVI_LOG_LEVEL":                             "info",
 	"NARVI_ROLLOUT_MODE":                          "open",
 	"NARVI_INGRESS_ENABLED":                       "github,linear,slack",
+	"NARVI_OUTBOUND_ENABLED":                      "github",
 	"NARVI_GITHUB_APP_ID":                         "123456",
 }
 

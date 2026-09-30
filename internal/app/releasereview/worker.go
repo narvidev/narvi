@@ -63,20 +63,25 @@ type PendingLister interface {
 type Worker struct {
 	store    PendingLister
 	deps     Deps
-	botToken string
+	outbound *platform.GitHubOutboundConfig
 	timeouts platform.Timeouts
 }
 
 // NewWorker builds a Worker backed by store (the durable
 // release_manifest_pending queue), deps (SourceControl/Outbox/Timeouts --
-// the SAME shape Run itself takes), botToken (this deployment's own
-// statically-configured GitHub bot credential -- the SAME one the
-// pre-fix inline call already authenticated every ListMergedBetween call
-// with; never persisted onto a release_manifest_pending row itself, see
-// Enqueue's own doc comment), and timeouts (for
-// ReleaseManifestCheckPumpInterval/ReleaseManifestCheckTimeout).
-func NewWorker(store PendingLister, deps Deps, botToken string, timeouts platform.Timeouts) *Worker {
-	return &Worker{store: store, deps: deps, botToken: botToken, timeouts: timeouts}
+// the SAME shape Run itself takes), outbound (§12.5's GitHub outbound
+// axis, whose bot credential is the SAME one the pre-fix inline call
+// already authenticated every ListMergedBetween call with; never persisted
+// onto a release_manifest_pending row itself, see Enqueue's own doc
+// comment), and timeouts (for
+// ReleaseManifestCheckPumpInterval/ReleaseManifestCheckTimeout). outbound
+// must be non-nil: every check reads GitHub as the bot, so the worker
+// refuses to exist with GitHub outbound off.
+func NewWorker(store PendingLister, deps Deps, outbound *platform.GitHubOutboundConfig, timeouts platform.Timeouts) (*Worker, error) {
+	if err := platform.RequireGitHubOutbound(outbound, "releasereview: new worker"); err != nil {
+		return nil, err
+	}
+	return &Worker{store: store, deps: deps, outbound: outbound, timeouts: timeouts}, nil
 }
 
 // Run runs the process-wide release-manifest-check loop until ctx is
@@ -185,7 +190,7 @@ func (w *Worker) process(ctx context.Context, row sqlcgen.ReleaseManifestPending
 		PRNumber:      row.PrNumber,
 		BaseRef:       row.BaseRef,
 		HeadRef:       row.HeadRef,
-		Token:         w.botToken,
+		Token:         w.outbound.BotToken(),
 		CorrelationID: row.CorrelationID,
 	})
 }

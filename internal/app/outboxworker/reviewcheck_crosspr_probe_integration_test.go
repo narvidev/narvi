@@ -25,6 +25,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/outboxworker"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // TestReviewCheckNotifier_TwoPRsOneCommit_NeverCollapseOntoOneCheckRun is
@@ -49,7 +50,7 @@ func TestReviewCheckNotifier_TwoPRsOneCommit_NeverCollapseOntoOneCheckRun(t *tes
 	defer server.Close()
 
 	adapter := githubapi.New(server.Client(), server.URL)
-	notifier := outboxworker.NewReviewCheckNotifier(pool, store, adapter, "tok")
+	notifier := mustNotifier(outboxworker.NewReviewCheckNotifier(pool, store, adapter, platform.MustNewGitHubOutboundConfig("tok")))
 
 	owner, repoName := "acme", fmt.Sprintf("crosspr-repo-%d", time.Now().UnixNano())
 	const prA = 101

@@ -38,6 +38,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/golang-migrate/migrate/v4"
@@ -47,11 +48,11 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver, used only for the migrate handle below
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/extension"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/ports"
-	"github.com/narvidev/narvi/internal/domain/integrations"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/migrations"
 )
@@ -303,38 +304,18 @@ func TestBuild_IngressDisabled_RoutesUnmounted(t *testing.T) {
 	}
 }
 
-// TestBuild_GitHubIngressDisabled_NoGitHubPreviewLinkNotifier proves the
-// fix for the leak TestBuild_IngressDisabled_RoutesUnmounted's own route
-// table could never see: with GitHub ingress disabled, cfg.GitHubBotToken
-// reads empty (gitHubBotTokenEnvVarName's own doc comment, platform/
-// config.go), yet the pre-fix outboxNotifiers wiring in Build still
-// registered github_preview_link -- githubapi.NewPreviewLinkNotifier
-// authenticated with that empty token -- whenever cfg.RWXAccessToken was
-// set, because that registration was gated on RWXAccessToken alone, never
-// on githubIngressEnabled. Any row enqueued for that kind (ordinary
-// steady-state traffic on a preview-enabled repo, not a stale/edge case --
-// see sessionactor.enqueuePreviewBestEffort's own call site) would then
-// post "Authorization: Bearer" with nothing after it, retry the full
-// backoff ladder, dead-letter, and (because the kind's "github" prefix
-// feeds the /api/integrations read model) misattribute the failure to
-// GitHub as configured=false/lastOutboundStatus=failed.
-//
-// platform.Load's own RWXPreviewsRequireGitHubIngressError now refuses to
-// boot a real deployment in this state at all, so this test builds its
-// *platform.Config the same way TestBuild_IngressDisabled_RoutesUnmounted
-// does and then mutates it directly, AFTER Load already succeeded on a
-// valid combination -- proving Build's own registration gate is a real,
-// independent backstop (as its own doc comment in serve.go claims), not
-// dead code that merely happens to never execute because Load rejects the
-// input first.
-//
-// Asserts on the registered notifier set itself
-// (outboxworker.Builder.HasNotifier), not on the route table --
-// TestBuild_IngressDisabled_RoutesUnmounted's own proof is blind to this
-// class of defect entirely, since routes and outbox notifiers are two
-// separate registrations in Build.
-func TestBuild_GitHubIngressDisabled_NoGitHubPreviewLinkNotifier(t *testing.T) {
+// loadGitHubIngressOff loads a Config whose GitHub ingress is off
+// (NARVI_INGRESS_ENABLED=slack,linear, with the webhook secret and bot
+// handle blanked to prove neither is needed) and whose GitHub outbound axis
+// is declared as outbound -- "" for off, "github" for on (§12.5) -- against
+// a fresh, migrated Postgres.
+func loadGitHubIngressOff(t *testing.T, outbound string) (*platform.Config, *pgxpool.Pool) {
+	t.Helper()
 	setRequiredEnv(t)
+	t.Setenv("NARVI_INGRESS_ENABLED", "slack,linear")
+	t.Setenv("NARVI_OUTBOUND_ENABLED", outbound)
+	t.Setenv("NARVI_GITHUB_WEBHOOK_SECRET", "")
+	t.Setenv("NARVI_GITHUB_BOT_HANDLE", "")
 
 	pool, connStr := newTestPool(t)
 	t.Setenv("NARVI_DATABASE_URL", connStr)
@@ -343,31 +324,189 @@ func TestBuild_GitHubIngressDisabled_NoGitHubPreviewLinkNotifier(t *testing.T) {
 	if err != nil {
 		t.Fatalf("platform.Load: %v", err)
 	}
-
-	// Mutate cfg AFTER a successful Load, to the exact state
-	// RWXPreviewsRequireGitHubIngressError refuses to let a real
-	// deployment boot into -- see this test's own top doc comment for why.
-	cfg.IngressEnabled = map[integrations.Provider]bool{
-		integrations.ProviderSlack:  true,
-		integrations.ProviderLinear: true,
-		integrations.ProviderGitHub: false,
+	if got := cfg.GitHubOutbound != nil; got != (outbound == "github") {
+		t.Fatalf("Load().GitHubOutbound != nil = %v with NARVI_OUTBOUND_ENABLED=%q", got, outbound)
 	}
+	return cfg, pool
+}
+
+// TestBuild_GitHubOutboundDisabled_NoOutboundConsumers proves the one
+// outbound switch reaches every notifier and worker (the optional readers
+// are TestBuild_GitHubOutboundReachesEveryOptionalReader's): with GitHub
+// outbound off, no GitHub outbound kind has a notifier registered and
+// neither the auto-merge nor the release-manifest worker exists -- so
+// nothing can post or merge as the bot, and a stray row dead-letters rather than going
+// out with an empty token. RWX previews are forced on AFTER Load (Load
+// refuses them without outbound, RWXPreviewsRequireGitHubOutboundError) to
+// prove the registration does not lean on that refusal: the preview's
+// GitHub half stays unregistered while its RWX half, which needs no GitHub
+// credential, is registered. Replaces the earlier test that proved the
+// same for the preview link alone, on the ingress gate.
+func TestBuild_GitHubOutboundDisabled_NoOutboundConsumers(t *testing.T) {
+	cfg, pool := loadGitHubIngressOff(t, "")
 	cfg.RWXAccessToken = "test-rwx-access-token"
-	cfg.GitHubBotToken = "" // what an operator running this combination would actually have.
+	bootLog := captureInfoLog(t)
 
 	app, err := Build(context.Background(), cfg, pool)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
+	assertGitHubAxesLine(t, bootLog, false, false, "none")
 
-	if app.outboxBuilder.HasNotifier(ports.NotificationKindGitHubPreviewLink) {
-		t.Error("outboxBuilder has a notifier registered for github_preview_link with GitHub ingress disabled -- it would post with an empty GitHubBotToken")
+	for _, kind := range githubOutboundKinds {
+		if app.outboxBuilder.HasNotifier(kind) {
+			t.Errorf("outboxBuilder has a notifier registered for %s with GitHub outbound off", kind)
+		}
 	}
-	// rwx_preview_dispatch needs no GitHub credential at all -- it must
-	// stay registered on RWXAccessToken alone, proving the fix narrowed
-	// the gate rather than disabling the whole RWX-configured block.
+	if app.automergeWorker != nil {
+		t.Error("App.automergeWorker is non-nil with GitHub outbound off")
+	}
+	if app.releaseManifestWorker != nil {
+		t.Error("App.releaseManifestWorker is non-nil with GitHub outbound off")
+	}
 	if !app.outboxBuilder.HasNotifier(ports.NotificationKindRWXPreviewDispatch) {
-		t.Error("outboxBuilder has no notifier registered for rwx_preview_dispatch, want registered (RWXAccessToken alone is sufficient for this kind)")
+		t.Error("outboxBuilder has no notifier for rwx_preview_dispatch, want one (RWXAccessToken alone is sufficient for that kind)")
+	}
+}
+
+// TestBuild_GitHubOutboundOnIngressOff proves the two axes are independent
+// in the direction the old bundling forbade: GitHub ingress off, GitHub
+// outbound on. Every GitHub outbound kind is registered -- the preview
+// link included, RWX previews being configured -- both workers exist, and
+// the GitHub webhook is still not mounted.
+func TestBuild_GitHubOutboundOnIngressOff(t *testing.T) {
+	t.Setenv("NARVI_RWX_ACCESS_TOKEN", "test-rwx-access-token")
+	cfg, pool := loadGitHubIngressOff(t, "github")
+	bootLog := captureInfoLog(t)
+
+	app, err := Build(context.Background(), cfg, pool)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	// The one shape where the two axes differ: a line that read either
+	// axis for the other would say outbound=false here.
+	assertGitHubAxesLine(t, bootLog, false, true, "bot token")
+
+	for _, kind := range githubOutboundKinds {
+		if !app.outboxBuilder.HasNotifier(kind) {
+			t.Errorf("outboxBuilder has no notifier registered for %s with GitHub outbound on", kind)
+		}
+	}
+	if app.automergeWorker == nil {
+		t.Error("App.automergeWorker is nil with GitHub outbound on")
+	}
+	if app.releaseManifestWorker == nil {
+		t.Error("App.releaseManifestWorker is nil with GitHub outbound on")
+	}
+
+	rec := httptest.NewRecorder()
+	app.Router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/webhooks/github", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("POST /webhooks/github = %d, want %d (GitHub ingress off: the route must not exist)", rec.Code, http.StatusNotFound)
+	}
+}
+
+// TestBuild_GitHubOutboundKinds_AreExactlyTheAxisDifference is the
+// relational half: with everything else equal (GitHub ingress off, RWX
+// previews configured), the kinds registered with GitHub outbound on minus
+// those registered with it off are exactly githubOutboundKinds -- no GitHub
+// kind is registered by anything but the outbound axis, and no kind the
+// axis registers is missing from the list the other tests check.
+func TestBuild_GitHubOutboundKinds_AreExactlyTheAxisDifference(t *testing.T) {
+	t.Setenv("NARVI_RWX_ACCESS_TOKEN", "test-rwx-access-token")
+	cfgOn, pool := loadGitHubIngressOff(t, "github")
+	appOn, err := Build(context.Background(), cfgOn, pool)
+	if err != nil {
+		t.Fatalf("Build (outbound on): %v", err)
+	}
+
+	cfgOff := *cfgOn
+	cfgOff.GitHubOutbound = nil
+	appOff, err := Build(context.Background(), &cfgOff, pool)
+	if err != nil {
+		t.Fatalf("Build (outbound off): %v", err)
+	}
+
+	off := make(map[ports.NotificationKind]bool)
+	for _, kind := range appOff.outboxBuilder.RegisteredKinds() {
+		off[kind] = true
+	}
+	var difference []string
+	for _, kind := range appOn.outboxBuilder.RegisteredKinds() {
+		if !off[kind] {
+			difference = append(difference, string(kind))
+		}
+	}
+	var want []string
+	for _, kind := range githubOutboundKinds {
+		want = append(want, string(kind))
+	}
+	sort.Strings(difference)
+	sort.Strings(want)
+	if !slices.Equal(difference, want) {
+		t.Errorf("registered(outbound on) - registered(outbound off) = %v, want githubOutboundKinds %v", difference, want)
+	}
+	for kind := range off {
+		if slices.Contains(want, string(kind)) {
+			t.Errorf("kind %s is registered with GitHub outbound off", kind)
+		}
+	}
+}
+
+// TestBuild_GitHubIngressWithoutOutbound proves Build's own backstop for
+// "GitHub ingress requires GitHub outbound" (§12.5): Load refuses that
+// combination (GitHubIngressRequiresOutboundError), so this test builds a
+// default Config -- ingress on -- and then removes the outbound axis, and
+// Build must refuse rather than mount a webhook handler that would reply
+// and read as a bot it has no credential for.
+func TestBuild_GitHubIngressWithoutOutbound(t *testing.T) {
+	setRequiredEnv(t)
+	pool, connStr := newTestPool(t)
+	t.Setenv("NARVI_DATABASE_URL", connStr)
+	cfg, err := platform.Load()
+	if err != nil {
+		t.Fatalf("platform.Load: %v", err)
+	}
+	cfg.GitHubOutbound = nil
+
+	app, err := Build(context.Background(), cfg, pool)
+	if !errors.Is(err, platform.ErrGitHubOutboundRequired) {
+		t.Errorf("Build(GitHub ingress on, outbound nil) error = %v, want one wrapping platform.ErrGitHubOutboundRequired", err)
+	}
+	if app != nil {
+		t.Error("Build returned an App despite GitHub ingress without GitHub outbound")
+	}
+}
+
+// TestRun_GitHubOutboundOff_StartsWithoutOutboundWorkers proves App.Run
+// starts the two GitHub outbound workers only when they exist: with GitHub
+// outbound off, Run starts and shuts down cleanly rather than dereferencing
+// a nil worker in one of its goroutines.
+func TestRun_GitHubOutboundOff_StartsWithoutOutboundWorkers(t *testing.T) {
+	cfg, pool := loadGitHubIngressOff(t, "")
+	app, err := Build(context.Background(), cfg, pool)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+
+	runCtx, stopRun := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	var running errgroup.Group
+	running.Go(func() error {
+		err := app.Run(runCtx, "127.0.0.1:0")
+		done <- err
+		return err
+	})
+	// Give every background loop a moment to start before stopping them.
+	select {
+	case err := <-done:
+		stopRun()
+		t.Fatalf("Run returned before being stopped: %v", err)
+	case <-time.After(500 * time.Millisecond):
+	}
+	stopRun()
+	if err := running.Wait(); err != nil {
+		t.Fatalf("Run: %v", err)
 	}
 }
 

@@ -2,8 +2,13 @@ package platform_test
 
 import (
 	"errors"
+	"fmt"
 	"log/slog"
+	"os"
+	"reflect"
 	"slices"
+	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/narvidev/narvi/internal/domain/integrations"
@@ -668,6 +673,10 @@ func TestLoadIngressEnabled(t *testing.T) {
 	t.Run("explicitly empty disables all three, and their secrets become optional", func(t *testing.T) {
 		setRequiredEnv(t)
 		t.Setenv("NARVI_INGRESS_ENABLED", "")
+		// With GitHub ingress excluded, the outbound axis must be declared
+		// (§12.5's rule R1) -- declared off here, the shape of every
+		// deployment that narrowed ingress before the axes were split.
+		t.Setenv("NARVI_OUTBOUND_ENABLED", "")
 		// Blank out every ingress-surface secret setRequiredEnv set --
 		// proves Load no longer enforces any of them once all three
 		// surfaces are explicitly disabled.
@@ -774,70 +783,373 @@ func TestLoadIngressEnabled(t *testing.T) {
 	})
 }
 
-// TestLoadRWXPreviewsRequireGitHubIngress covers
-// RWXPreviewsRequireGitHubIngressError: NARVI_RWX_ACCESS_TOKEN configures
-// an explicit opt-in into RWX previews (§4.1.1/§4.1.2), whose GitHub half
-// (posting the preview link, controlplane/serve.go's own
-// githubPreviewLinkNotifier) can only ever work with cfg.GitHubBotToken --
-// itself only ever populated when GitHub ingress is enabled
-// (gitHubBotTokenEnvVarName's own doc comment). Setting the RWX token
-// while disabling GitHub ingress is therefore a config that can never
-// work, and Load refuses to boot with it rather than silently letting
-// controlplane/serve.go's own Build wire a GitHub-flavored notifier with
-// an empty credential.
-func TestLoadRWXPreviewsRequireGitHubIngress(t *testing.T) {
-	t.Run("RWX token set with GitHub ingress disabled is a loud boot failure", func(t *testing.T) {
-		setRequiredEnv(t)
-		t.Setenv("NARVI_INGRESS_ENABLED", "slack,linear") // GitHub left out.
-		t.Setenv("NARVI_RWX_ACCESS_TOKEN", "test-rwx-access-token")
-		// GitHub ingress secrets are irrelevant once GitHub ingress is
-		// disabled -- blank them out to prove this failure is about the
-		// RWX/GitHub combination, not a leftover missing GitHub secret.
-		t.Setenv("NARVI_GITHUB_WEBHOOK_SECRET", "")
-		t.Setenv("NARVI_GITHUB_BOT_HANDLE", "")
-		t.Setenv("NARVI_GITHUB_BOT_TOKEN", "")
+// TestLoadRWXPreviewsRequireGitHubOutbound covers
+// RWXPreviewsRequireGitHubOutboundError (§12.5's rule R6):
+// NARVI_RWX_ACCESS_TOKEN configures an explicit opt-in into RWX previews
+// (§4.1.1/§4.1.2), whose GitHub half (the preview link, a commit status
+// posted as the bot) can only ever work with GitHub outbound on. The
+// refusal is keyed on the outbound axis, never on ingress: with GitHub
+// ingress off but outbound on, previews boot fine.
+func TestLoadRWXPreviewsRequireGitHubOutbound(t *testing.T) {
+	tests := []struct {
+		name     string
+		ingress  *string // nil leaves NARVI_INGRESS_ENABLED unset
+		outbound *string // nil leaves NARVI_OUTBOUND_ENABLED unset
+		rwx      string
+		wantRWX  bool // want *RWXPreviewsRequireGitHubOutboundError
+		wantOK   bool
+		// wantUndeclaredAlone: the outbound axis is undeclared (rule R1),
+		// so R6 -- keyed on that axis -- is not evaluated, and
+		// UndeclaredOutboundError is the one error reported.
+		wantUndeclaredAlone bool
+	}{
+		{name: "RWX set, outbound off, ingress off: refused", ingress: ptr("slack,linear"), outbound: ptr(""), rwx: "test-rwx-access-token", wantRWX: true},
+		{name: "RWX set, outbound on, ingress off: boots", ingress: ptr("slack,linear"), outbound: ptr("github"), rwx: "test-rwx-access-token", wantOK: true},
+		{name: "RWX set, outbound defaulted on by GitHub ingress: boots", rwx: "test-rwx-access-token", wantOK: true},
+		{name: "RWX unset, outbound off, ingress off: boots", ingress: ptr("slack,linear"), outbound: ptr(""), wantOK: true},
+		{name: "RWX set, outbound undeclared, ingress off: the undeclared axis alone", ingress: ptr("slack,linear"), rwx: "test-rwx-access-token", wantUndeclaredAlone: true},
+	}
 
-		_, err := platform.Load()
-		if err == nil {
-			t.Fatal("Load() error = nil, want error (RWX previews configured with GitHub ingress disabled can never post the GitHub half of a preview)")
-		}
-		var rwxErr *platform.RWXPreviewsRequireGitHubIngressError
-		if !errors.As(err, &rwxErr) {
-			t.Fatalf("Load() error = %v, want *platform.RWXPreviewsRequireGitHubIngressError", err)
-		}
-	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			setOrUnsetEnv(t, "NARVI_INGRESS_ENABLED", tc.ingress)
+			setOrUnsetEnv(t, "NARVI_OUTBOUND_ENABLED", tc.outbound)
+			t.Setenv("NARVI_RWX_ACCESS_TOKEN", tc.rwx)
+			if tc.ingress != nil {
+				// GitHub ingress is off in every row that sets ingress --
+				// blank its secrets to prove the outcome is about the
+				// RWX/outbound combination, not a leftover ingress secret.
+				t.Setenv("NARVI_GITHUB_WEBHOOK_SECRET", "")
+				t.Setenv("NARVI_GITHUB_BOT_HANDLE", "")
+			}
 
-	t.Run("RWX token set with GitHub ingress enabled boots fine", func(t *testing.T) {
-		setRequiredEnv(t)
-		t.Setenv("NARVI_RWX_ACCESS_TOKEN", "test-rwx-access-token")
-		// NARVI_INGRESS_ENABLED deliberately left unset -- default enables
-		// all three surfaces, GitHub included.
+			cfg, err := platform.Load()
+			var rwxErr *platform.RWXPreviewsRequireGitHubOutboundError
+			if got := errors.As(err, &rwxErr); got != tc.wantRWX {
+				t.Fatalf("Load() error = %v; errors.As(*RWXPreviewsRequireGitHubOutboundError) = %v, want %v", err, got, tc.wantRWX)
+			}
+			if tc.wantUndeclaredAlone {
+				leaves := flattenJoinedErrors(err)
+				var undErr *platform.UndeclaredOutboundError
+				if len(leaves) != 1 || !errors.As(leaves[0], &undErr) {
+					t.Fatalf("Load() error = %v, want *UndeclaredOutboundError alone", err)
+				}
+			}
+			if tc.wantOK {
+				if err != nil {
+					t.Fatalf("Load() error = %v, want nil", err)
+				}
+				if cfg.RWXAccessToken != tc.rwx {
+					t.Errorf("Load().RWXAccessToken = %q, want %q", cfg.RWXAccessToken, tc.rwx)
+				}
+			}
+		})
+	}
+}
 
-		cfg, err := platform.Load()
-		if err != nil {
-			t.Fatalf("Load() error = %v, want nil (GitHub ingress enabled makes the RWX/GitHub combination valid)", err)
-		}
-		if cfg.RWXAccessToken != "test-rwx-access-token" {
-			t.Errorf("Load().RWXAccessToken = %q, want %q", cfg.RWXAccessToken, "test-rwx-access-token")
-		}
-	})
+// ptr returns a pointer to s, for the table rows above and below that
+// distinguish an unset variable (nil) from one set to a value, "" included.
+func ptr(s string) *string { return &s }
 
-	t.Run("RWX token unset with GitHub ingress disabled boots fine", func(t *testing.T) {
-		setRequiredEnv(t)
-		t.Setenv("NARVI_INGRESS_ENABLED", "slack,linear") // GitHub left out.
-		t.Setenv("NARVI_GITHUB_WEBHOOK_SECRET", "")
-		t.Setenv("NARVI_GITHUB_BOT_HANDLE", "")
-		t.Setenv("NARVI_GITHUB_BOT_TOKEN", "")
-		// NARVI_RWX_ACCESS_TOKEN deliberately left unset.
+// setOrUnsetEnv sets key to *value for the calling test, or makes sure it
+// is UNSET when value is nil -- the distinction NARVI_INGRESS_ENABLED and
+// NARVI_OUTBOUND_ENABLED both depend on. t.Setenv first, so the test's
+// cleanup restores whatever the process had, then os.Unsetenv.
+func setOrUnsetEnv(t *testing.T, key string, value *string) {
+	t.Helper()
+	if value != nil {
+		t.Setenv(key, *value)
+		return
+	}
+	t.Setenv(key, "")
+	if err := os.Unsetenv(key); err != nil {
+		t.Fatalf("unset %s: %v", key, err)
+	}
+}
 
-		cfg, err := platform.Load()
-		if err != nil {
-			t.Fatalf("Load() error = %v, want nil (no RWX token means the impossible combination never arises)", err)
+// TestLoadOutboundAxis is §12.5's outbound-axis decision table: every
+// combination of GitHub ingress (on: unset or "github"; off: "slack,linear"
+// or ""), NARVI_OUTBOUND_ENABLED (unset, "github", "") and the bot token
+// (set, empty), with the exact errors rules R1-R5 promise -- and, as
+// importantly, the errors they promise NOT to add beside them ("only"
+// rows). Every ingress-on case runs under both of its spellings, and
+// every ingress-off case under both of its, so a rule accidentally keyed
+// on how ingress was spelled rather than on whether it includes github
+// shows up as a failing row.
+func TestLoadOutboundAxis(t *testing.T) {
+	type want int
+	const (
+		wantOn         want = iota // boots, GitHubOutbound non-nil with the token
+		wantOff                    // boots, GitHubOutbound nil
+		wantMissing                // only *MissingRequiredEnvError{NARVI_GITHUB_BOT_TOKEN, RequiredBy set}
+		wantRequiresO              // only *GitHubIngressRequiresOutboundError
+		wantUndeclared             // only *UndeclaredOutboundError
+	)
+	ingressOn := []*string{nil, ptr("github")}
+	ingressOff := []*string{ptr("slack,linear"), ptr("")}
+
+	rows := []struct {
+		ingressOn bool
+		outbound  *string
+		token     string
+		want      want
+	}{
+		{true, ptr("github"), "tok", wantOn},
+		{true, ptr("github"), "", wantMissing},
+		{true, ptr(""), "tok", wantRequiresO},
+		{true, ptr(""), "", wantRequiresO},
+		{true, nil, "tok", wantOn},
+		{true, nil, "", wantMissing},
+		{false, ptr("github"), "tok", wantOn},
+		{false, ptr("github"), "", wantMissing},
+		{false, ptr(""), "tok", wantOff},
+		{false, ptr(""), "", wantOff},
+		{false, nil, "tok", wantUndeclared},
+		{false, nil, "", wantUndeclared},
+	}
+
+	label := func(v *string) string {
+		if v == nil {
+			return "unset"
 		}
-		if cfg.RWXAccessToken != "" {
-			t.Errorf("Load().RWXAccessToken = %q, want empty", cfg.RWXAccessToken)
+		return strconv.Quote(*v)
+	}
+
+	for _, row := range rows {
+		spellings := ingressOff
+		if row.ingressOn {
+			spellings = ingressOn
 		}
-	})
+		for _, ingress := range spellings {
+			name := "ingress=" + label(ingress) + "/outbound=" + label(row.outbound) + "/token=" + strconv.Quote(row.token)
+			t.Run(name, func(t *testing.T) {
+				setRequiredEnv(t)
+				setOrUnsetEnv(t, "NARVI_INGRESS_ENABLED", ingress)
+				setOrUnsetEnv(t, "NARVI_OUTBOUND_ENABLED", row.outbound)
+				t.Setenv("NARVI_GITHUB_BOT_TOKEN", row.token)
+				if !row.ingressOn {
+					// Ingress off: the webhook secret and bot handle are
+					// ingress-only and must not be required, whatever the
+					// outbound axis says.
+					t.Setenv("NARVI_GITHUB_WEBHOOK_SECRET", "")
+					t.Setenv("NARVI_GITHUB_BOT_HANDLE", "")
+				}
+				if ingress != nil && *ingress == "" {
+					// Every surface off: blank Slack's and Linear's
+					// secrets too, as TestLoadIngressEnabled does.
+					for _, v := range []string{"NARVI_LINEAR_WEBHOOK_SECRET", "NARVI_LINEAR_CLIENT_ID", "NARVI_LINEAR_CLIENT_SECRET", "NARVI_LINEAR_DEFAULT_REPO_NAME", "NARVI_LINEAR_DEFAULT_REPO_URL", "NARVI_SLACK_SIGNING_SECRET", "NARVI_SLACK_BOT_TOKEN"} {
+						t.Setenv(v, "")
+					}
+				}
+
+				cfg, err := platform.Load()
+
+				switch row.want {
+				case wantOn, wantOff:
+					if err != nil {
+						t.Fatalf("Load() error = %v, want nil", err)
+					}
+					if row.want == wantOff {
+						if cfg.GitHubOutbound != nil {
+							t.Errorf("Load().GitHubOutbound = %v, want nil (GitHub outbound off; a set token is ignored, never stored)", cfg.GitHubOutbound)
+						}
+						return
+					}
+					if cfg.GitHubOutbound == nil {
+						t.Fatal("Load().GitHubOutbound = nil, want non-nil (GitHub outbound on)")
+					}
+					if got := cfg.GitHubOutbound.BotToken(); got != row.token {
+						t.Errorf("Load().GitHubOutbound.BotToken() = %q, want %q", got, row.token)
+					}
+					return
+				}
+
+				if err != nil && cfg != nil {
+					t.Errorf("Load() cfg = %+v, want nil on error", cfg)
+				}
+				leaves := flattenJoinedErrors(err)
+				if len(leaves) != 1 {
+					t.Fatalf("Load() returned %d errors, want exactly 1: %v", len(leaves), err)
+				}
+				switch row.want {
+				case wantMissing:
+					var missErr *platform.MissingRequiredEnvError
+					if !errors.As(leaves[0], &missErr) || missErr.EnvVar != "NARVI_GITHUB_BOT_TOKEN" {
+						t.Fatalf("Load() error = %v, want *MissingRequiredEnvError{EnvVar: NARVI_GITHUB_BOT_TOKEN}", err)
+					}
+					if !strings.Contains(missErr.RequiredBy, "NARVI_OUTBOUND_ENABLED") {
+						t.Errorf("MissingRequiredEnvError.RequiredBy = %q, want it to name NARVI_OUTBOUND_ENABLED", missErr.RequiredBy)
+					}
+					if !strings.Contains(missErr.Error(), missErr.RequiredBy) {
+						t.Errorf("MissingRequiredEnvError.Error() = %q, want it to carry RequiredBy %q", missErr.Error(), missErr.RequiredBy)
+					}
+				case wantRequiresO:
+					var reqErr *platform.GitHubIngressRequiresOutboundError
+					if !errors.As(leaves[0], &reqErr) {
+						t.Fatalf("Load() error = %v, want *GitHubIngressRequiresOutboundError", err)
+					}
+					for _, name := range []string{"NARVI_INGRESS_ENABLED", "NARVI_OUTBOUND_ENABLED"} {
+						if !strings.Contains(reqErr.Error(), name) {
+							t.Errorf("GitHubIngressRequiresOutboundError.Error() = %q, want it to name %s", reqErr.Error(), name)
+						}
+					}
+				case wantUndeclared:
+					var undErr *platform.UndeclaredOutboundError
+					if !errors.As(leaves[0], &undErr) {
+						t.Fatalf("Load() error = %v, want *UndeclaredOutboundError", err)
+					}
+					for _, fragment := range []string{"NARVI_OUTBOUND_ENABLED=github", "NARVI_GITHUB_BOT_TOKEN", "NARVI_OUTBOUND_ENABLED= (empty)", "auto-merge and release-manifest workers", "never posted before"} {
+						if !strings.Contains(undErr.Error(), fragment) {
+							t.Errorf("UndeclaredOutboundError.Error() = %q, want it to contain %q", undErr.Error(), fragment)
+						}
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestLoadInvalidIngressEntry_ReportedAlone proves rule R1 applies only to
+// a fully valid NARVI_INGRESS_ENABLED: when an entry is invalid (a wrong
+// case "GitHub" is not an exclusion of github, it is a typo), whether the
+// list "excludes github" is not known, so InvalidIngressEnabledError is the
+// one error reported -- not beside UndeclaredOutboundError, whose advice
+// would send the operator round a second restart once the typo is fixed --
+// and neither is R6, keyed on the still-undeclared outbound axis.
+func TestLoadInvalidIngressEntry_ReportedAlone(t *testing.T) {
+	tests := []struct {
+		name    string
+		ingress string
+		rwx     string
+	}{
+		{name: "wrong case github, outbound unset", ingress: "GitHub,slack"},
+		{name: "a typo alone, outbound unset", ingress: "slcak"},
+		{name: "wrong case github, outbound unset, RWX set", ingress: "GitHub,slack", rwx: "test-rwx-access-token"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			setOrUnsetEnv(t, "NARVI_INGRESS_ENABLED", ptr(tc.ingress))
+			setOrUnsetEnv(t, "NARVI_OUTBOUND_ENABLED", nil)
+			t.Setenv("NARVI_RWX_ACCESS_TOKEN", tc.rwx)
+
+			_, err := platform.Load()
+			leaves := flattenJoinedErrors(err)
+			var invErr *platform.InvalidIngressEnabledError
+			if len(leaves) != 1 || !errors.As(leaves[0], &invErr) {
+				t.Fatalf("Load() error = %v, want *InvalidIngressEnabledError alone", err)
+			}
+		})
+	}
+}
+
+// TestLoadBotHandleStoredOnlyWithGitHubIngress proves the bot handle is
+// kept exactly while GitHub ingress is on: it names a mention only the
+// webhook listens for, so with ingress off a set NARVI_GITHUB_BOT_HANDLE is
+// ignored, never stored, and a verdict posted through GitHub outbound
+// renders reviewpost.RerunGuidance's button-only sentence rather than a
+// mention nothing would act on.
+func TestLoadBotHandleStoredOnlyWithGitHubIngress(t *testing.T) {
+	tests := []struct {
+		name       string
+		ingress    *string
+		outbound   *string
+		wantHandle string
+	}{
+		{name: "GitHub ingress on: stored", wantHandle: "test-bot"},
+		{name: "GitHub ingress off, outbound on, handle set: not stored", ingress: ptr("slack,linear"), outbound: ptr("github")},
+		{name: "GitHub ingress off, outbound off, handle set: not stored", ingress: ptr("slack,linear"), outbound: ptr("")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t) // sets NARVI_GITHUB_BOT_HANDLE=test-bot
+			setOrUnsetEnv(t, "NARVI_INGRESS_ENABLED", tc.ingress)
+			setOrUnsetEnv(t, "NARVI_OUTBOUND_ENABLED", tc.outbound)
+
+			cfg, err := platform.Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v, want nil", err)
+			}
+			if cfg.GitHubBotHandle != tc.wantHandle {
+				t.Errorf("Load().GitHubBotHandle = %q, want %q", cfg.GitHubBotHandle, tc.wantHandle)
+			}
+		})
+	}
+}
+
+// TestLoadOutboundEnabledInvalid proves NARVI_OUTBOUND_ENABLED accepts only
+// integrations.OutboundProviders: a typo and a real provider with no
+// outbound axis of its own (slack, linear) are both loud boot failures,
+// and the message says why the latter is refused.
+func TestLoadOutboundEnabledInvalid(t *testing.T) {
+	tests := []struct {
+		raw       string
+		wantValue string
+	}{
+		{raw: "slack", wantValue: "slack"},
+		{raw: "linear", wantValue: "linear"},
+		{raw: "gihtub", wantValue: "gihtub"},
+		{raw: "github,slack", wantValue: "slack"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.raw, func(t *testing.T) {
+			setRequiredEnv(t)
+			t.Setenv("NARVI_OUTBOUND_ENABLED", tc.raw)
+
+			_, err := platform.Load()
+			var invErr *platform.InvalidOutboundEnabledError
+			if !errors.As(err, &invErr) {
+				t.Fatalf("Load() error = %v, want *platform.InvalidOutboundEnabledError", err)
+			}
+			if invErr.Value != tc.wantValue {
+				t.Errorf("InvalidOutboundEnabledError.Value = %q, want %q", invErr.Value, tc.wantValue)
+			}
+			if !strings.Contains(invErr.Error(), "ingress sets") {
+				t.Errorf("InvalidOutboundEnabledError.Error() = %q, want it to say Slack's and Linear's outbound credentials are part of their ingress sets", invErr.Error())
+			}
+		})
+	}
+}
+
+// TestNewGitHubOutboundConfig proves the typed axis refuses an empty token
+// (rule R4 is this refusal), that RequireGitHubOutbound refuses nil for a
+// required consumer, and that no rendering of the config leaks the token.
+func TestNewGitHubOutboundConfig(t *testing.T) {
+	if c, err := platform.NewGitHubOutboundConfig(""); err == nil || c != nil {
+		t.Errorf("NewGitHubOutboundConfig(\"\") = (%v, %v), want (nil, error)", c, err)
+	}
+
+	c, err := platform.NewGitHubOutboundConfig("gho_secret-token-value")
+	if err != nil {
+		t.Fatalf("NewGitHubOutboundConfig(non-empty) error = %v, want nil", err)
+	}
+	if got := c.BotToken(); got != "gho_secret-token-value" {
+		t.Errorf("BotToken() = %q, want the token given", got)
+	}
+	for _, rendered := range []string{fmt.Sprintf("%v", c), fmt.Sprintf("%+v", c), fmt.Sprintf("%#v", c), fmt.Sprintf("%+v", platform.Config{GitHubOutbound: c})} {
+		if strings.Contains(rendered, "secret-token") {
+			t.Errorf("a rendering of the config leaks the token: %s", rendered)
+		}
+	}
+
+	if err := platform.RequireGitHubOutbound(c, "test consumer"); err != nil {
+		t.Errorf("RequireGitHubOutbound(non-nil) = %v, want nil", err)
+	}
+	err = platform.RequireGitHubOutbound(nil, "test consumer")
+	if !errors.Is(err, platform.ErrGitHubOutboundRequired) {
+		t.Errorf("RequireGitHubOutbound(nil) = %v, want an error wrapping ErrGitHubOutboundRequired", err)
+	}
+	if err != nil && !strings.Contains(err.Error(), "test consumer") {
+		t.Errorf("RequireGitHubOutbound(nil) = %q, want it to name the consumer", err)
+	}
+
+	defer func() {
+		if recover() == nil {
+			t.Error("MustNewGitHubOutboundConfig(\"\") did not panic")
+		}
+	}()
+	_ = platform.MustNewGitHubOutboundConfig("")
 }
 
 // TestLoadOpenCodeRuntimeVersion covers §8.5's ("image builds") own
@@ -2274,4 +2586,86 @@ func TestLoadGitHubAPIBaseURL(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestLoadStoresTheBotTokenOnlyInGitHubOutbound is the structural half of
+// §12.5's outbound axis that a guard over other packages cannot see: Load
+// keeps the bot token in *GitHubOutboundConfig and NOWHERE else in Config
+// -- no string field a consumer could read around the typed config (the
+// shape Config.GitHubBotToken had) -- and, with GitHub outbound off, does
+// not keep it at all (rule R5), even when the variable is set. Walks every
+// field of the loaded Config by reflection, unexported ones included,
+// skipping only the one place the token belongs.
+func TestLoadStoresTheBotTokenOnlyInGitHubOutbound(t *testing.T) {
+	const token = "gho_only-in-the-outbound-config"
+	tests := []struct {
+		name         string
+		ingress      *string
+		outbound     *string
+		wantOutbound bool
+	}{
+		{name: "outbound on by default", wantOutbound: true},
+		{name: "outbound off with the token set", ingress: ptr("slack,linear"), outbound: ptr("")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			setOrUnsetEnv(t, "NARVI_INGRESS_ENABLED", tc.ingress)
+			setOrUnsetEnv(t, "NARVI_OUTBOUND_ENABLED", tc.outbound)
+			t.Setenv("NARVI_GITHUB_BOT_TOKEN", token)
+			if tc.ingress != nil {
+				t.Setenv("NARVI_GITHUB_WEBHOOK_SECRET", "")
+				t.Setenv("NARVI_GITHUB_BOT_HANDLE", "")
+			}
+
+			cfg, err := platform.Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v, want nil", err)
+			}
+			if got := cfg.GitHubOutbound != nil; got != tc.wantOutbound {
+				t.Fatalf("Load().GitHubOutbound != nil = %v, want %v", got, tc.wantOutbound)
+			}
+
+			var holders []string
+			collectStringsHolding(reflect.ValueOf(*cfg), "Config", token, 0, &holders)
+			if len(holders) > 0 {
+				t.Errorf("the bot token is stored outside Config.GitHubOutbound, at %v -- consumers must receive it only as *platform.GitHubOutboundConfig", holders)
+			}
+		})
+	}
+}
+
+// collectStringsHolding appends to holders the path of every string within v
+// that contains needle, descending through structs, pointers, slices, arrays,
+// maps and interfaces -- but never into a *platform.GitHubOutboundConfig, the
+// one place the bot token is allowed to live.
+func collectStringsHolding(v reflect.Value, path, needle string, depth int, holders *[]string) {
+	if depth > 12 || !v.IsValid() {
+		return
+	}
+	switch v.Kind() {
+	case reflect.String:
+		if strings.Contains(v.String(), needle) {
+			*holders = append(*holders, path)
+		}
+	case reflect.Pointer, reflect.Interface:
+		if v.IsNil() || v.Type() == reflect.TypeOf((*platform.GitHubOutboundConfig)(nil)) {
+			return
+		}
+		collectStringsHolding(v.Elem(), path, needle, depth+1, holders)
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			collectStringsHolding(v.Field(i), path+"."+v.Type().Field(i).Name, needle, depth+1, holders)
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			collectStringsHolding(v.Index(i), fmt.Sprintf("%s[%d]", path, i), needle, depth+1, holders)
+		}
+	case reflect.Map:
+		iter := v.MapRange()
+		for iter.Next() {
+			collectStringsHolding(iter.Key(), path+"{key}", needle, depth+1, holders)
+			collectStringsHolding(iter.Value(), path+"{value}", needle, depth+1, holders)
+		}
+	}
 }

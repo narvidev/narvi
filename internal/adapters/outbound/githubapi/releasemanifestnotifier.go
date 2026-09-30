@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // ReleaseManifestPayload is the JSON shape internal/app/outboxworker
@@ -33,19 +34,23 @@ type ReleaseManifestPayload struct {
 // formal-review event on).
 type ReleaseManifestNotifier struct {
 	adapter  *Adapter
-	botToken string
+	outbound *platform.GitHubOutboundConfig
 }
 
 var _ ports.Notifier = (*ReleaseManifestNotifier)(nil)
 
 // NewReleaseManifestNotifier builds a ReleaseManifestNotifier wrapping
-// adapter, authenticating every call with botToken -- this check's own
+// adapter, authenticating every call with outbound's bot credential
+// (non-nil: refused otherwise, §12.5) -- this check's own
 // comment is a system-generated audit, never attributed to any
 // individual reviewer or the release PR's own author, mirroring
 // NewHandoffNotifier's own identical "single, statically-configured bot
 // credential" choice.
-func NewReleaseManifestNotifier(adapter *Adapter, botToken string) *ReleaseManifestNotifier {
-	return &ReleaseManifestNotifier{adapter: adapter, botToken: botToken}
+func NewReleaseManifestNotifier(adapter *Adapter, outbound *platform.GitHubOutboundConfig) (*ReleaseManifestNotifier, error) {
+	if err := platform.RequireGitHubOutbound(outbound, "githubapi: new ReleaseManifestNotifier"); err != nil {
+		return nil, err
+	}
+	return &ReleaseManifestNotifier{adapter: adapter, outbound: outbound}, nil
 }
 
 // Deliver implements ports.Notifier: decodes n.Payload as
@@ -67,7 +72,7 @@ func (n *ReleaseManifestNotifier) Deliver(ctx context.Context, notification port
 		return fmt.Errorf("githubapi: decode release manifest payload: %w", err)
 	}
 
-	if err := n.adapter.PostIssueComment(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.botToken, payload.Body); err != nil {
+	if err := n.adapter.PostIssueComment(ctx, payload.Owner, payload.Repo, payload.PRNumber, n.outbound.BotToken(), payload.Body); err != nil {
 		return fmt.Errorf("githubapi: deliver release manifest (post comment): %w", err)
 	}
 	return nil

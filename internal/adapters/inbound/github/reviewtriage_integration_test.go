@@ -117,7 +117,7 @@ func newTestRigWithReviewTriage(t *testing.T, fetcher *fakeReviewContextFetcher)
 		WebhookSecret: testWebhookSecret,
 		BotHandle:     testBotHandleIntegration,
 		LinkNotices:   rig.linkNotices,
-		BotToken:      "test-bot-token",
+		Outbound:      platform.MustNewGitHubOutboundConfig("test-bot-token"),
 		Timeouts:      platform.DefaultTimeouts(),
 	}
 	// fetcher assigned only when non-nil -- cfg.DiffFetcher is an
@@ -130,7 +130,10 @@ func newTestRigWithReviewTriage(t *testing.T, fetcher *fakeReviewContextFetcher)
 		cfg.DiffFetcher = fetcher
 	}
 
-	handler := githubingress.NewHandler(coalescer, deliveries, cfg)
+	handler, handlerErr := githubingress.NewHandler(coalescer, deliveries, cfg)
+	if handlerErr != nil {
+		t.Fatalf("githubingress.NewHandler: %v", handlerErr)
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/webhooks/github", handler)
@@ -402,7 +405,7 @@ func TestGitHubIntegration_SensitiveGlobDiff_RoutesDeep_PersistsThroughVerdict(t
 		rig.turns,
 		narvipg.NewEventStore(rig.pool),
 		testBotHandleIntegration,
-		"test-bot-token",
+		platform.MustNewGitHubOutboundConfig("test-bot-token"),
 		nil,
 		nil,
 		platform.DefaultTimeouts(),

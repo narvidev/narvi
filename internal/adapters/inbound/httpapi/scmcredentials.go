@@ -92,7 +92,7 @@
 // completeProcessingTurn sends no push command for one) and never opens a
 // PR, and its own output reaches GitHub exclusively through the
 // verdict-posting tool (reviewverdict.go, §8.2), which authenticates
-// server-side with cfg.GitHubBotToken. So its sandbox is served only the
+// server-side with cfg.GitHubOutbound. So its sandbox is served only the
 // §30.4 read-only GitHub App installation token (step 7 below), through
 // the same scope-checked mint as the shadow substitution, whatever the
 // repository's egress mode.

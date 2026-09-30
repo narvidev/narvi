@@ -53,7 +53,12 @@ type Deps struct {
 	SourceControl ports.SourceControl
 	AuditLog      *postgres.AuditLogStore
 
-	BotToken string
+	// Outbound is §12.5's GitHub outbound axis: the worker reads pull
+	// requests and merges as the bot, so New refuses a nil one -- a
+	// deployment with GitHub outbound off has no auto-merge worker at all
+	// (controlplane/githuboutbound.go), rather than one that loops on 401s
+	// until its auth guard dead-letters it.
+	Outbound *platform.GitHubOutboundConfig
 	Timeouts platform.Timeouts
 }
 
@@ -87,6 +92,9 @@ type Worker struct {
 // "a metric instrument that failed to construct is a construction-time
 // error, not a per-call one" precedent.
 func New(deps Deps) (*Worker, error) {
+	if err := platform.RequireGitHubOutbound(deps.Outbound, "automerge: new worker"); err != nil {
+		return nil, err
+	}
 	meter := otel.Meter(meterName)
 	authDeadLetterCount, err := meter.Int64Counter(
 		"automerge_auth_dead_lettered_total",
@@ -202,7 +210,7 @@ func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumb
 
 	// NOTE: no w.authGuard.recordSuccess call on RevalidateForAutoMerge's
 	// own success below -- deliberately. A read-only GetOpenPR call
-	// succeeding is real evidence w.deps.BotToken can still READ, but it
+	// succeeding is real evidence the bot token (w.deps.Outbound) can still READ, but it
 	// says nothing about whether it can still WRITE (merge) to this
 	// repository, which is the SEPARATE, narrower permission
 	// ports.ErrPermissionDenied's own repo-scope tracks -- and a real bot
@@ -213,7 +221,7 @@ func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumb
 	// MergePR-failure streak back to zero on every tick, so
 	// domainautomerge.MaxAuthFailures could never actually be reached.
 	// Only a genuinely successful MergePR (below) resets either streak.
-	ok, headSHA, reason, viaAcceptance, acceptanceID, err := decisioninbox.RevalidateForAutoMerge(ctx, w.deps.DecisionInbox, w.deps.SourceControl, repoFullName, prNumber, w.deps.BotToken)
+	ok, headSHA, reason, viaAcceptance, acceptanceID, err := decisioninbox.RevalidateForAutoMerge(ctx, w.deps.DecisionInbox, w.deps.SourceControl, repoFullName, prNumber, w.deps.Outbound.BotToken())
 	if err != nil {
 		w.recordAuthOutcome(ctx, repoFullName, err, now, reservation)
 		logger.Error("automerge: revalidate for auto-merge failed", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)
@@ -232,7 +240,7 @@ func (w *Worker) mergeCandidate(ctx context.Context, repoFullName string, prNumb
 
 	mergeCtx, cancel := context.WithTimeout(ctx, w.deps.Timeouts.GitHubMergePRTimeout)
 	mergeSHA, err := w.deps.SourceControl.MergePR(mergeCtx, ports.MergePRSpec{
-		Owner: owner, Repo: repo, Number: prNumber, HeadSHA: headSHA, Token: w.deps.BotToken,
+		Owner: owner, Repo: repo, Number: prNumber, HeadSHA: headSHA, Token: w.deps.Outbound.BotToken(),
 	})
 	cancel()
 	if errors.Is(err, ports.ErrShadowSuppressed) {
@@ -342,7 +350,7 @@ func (w *Worker) recordAuthOutcome(ctx context.Context, repoFullName string, err
 	// resourceType/resourceID vary by scope: authScopeRepo names the one
 	// repository this token was denied for (a real "repository" resource,
 	// target non-empty); authScopeWorker has no single resource to name
-	// -- w.deps.BotToken itself is not a Postgres row -- so it is recorded
+	// -- the bot token (w.deps.Outbound) is not a Postgres row -- so it is recorded
 	// against a fixed "automerge_worker" resource type instead, never the
 	// empty string mislabeled as a repository.
 	resourceType, resourceID := "repository", target

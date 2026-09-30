@@ -44,10 +44,13 @@ const resultSummaryMaxChars = 4000
 // Postgres (Pool, for the one read-only snapshot, and the stores read in
 // it), and the code host for the one live read, a verdict's freshness --
 // SourceControl (nil when none is configured: freshness then reads
-// unconfirmed) with BotToken, the credential the code-review view and the
-// auto-merge worker read pull requests with. Timeouts bounds each live call
-// and all of them together (SessionResultLiveReadBudget), and holds the
-// suggested-delay table (the SessionResultDelay* fields).
+// unconfirmed) with Outbound, §12.5's GitHub outbound axis, whose bot
+// credential the code-review view and the auto-merge worker read pull
+// requests with (nil when GitHub outbound is off: freshness then reads
+// unconfirmed exactly as with no SourceControl, and no read is attempted).
+// Timeouts bounds each live call and all of them together
+// (SessionResultLiveReadBudget), and holds the suggested-delay table (the
+// SessionResultDelay* fields).
 type SessionResultDeps struct {
 	Pool           *pgxpool.Pool
 	Sessions       *postgres.SessionStore
@@ -57,8 +60,20 @@ type SessionResultDeps struct {
 	PRSessions     *postgres.GitHubPRSessionStore
 	ReviewVerdicts *postgres.ReviewVerdictStore
 	SourceControl  ports.SourceControl
-	BotToken       string
+	Outbound       *platform.GitHubOutboundConfig
 	Timeouts       platform.Timeouts
+}
+
+// freshnessDeps is the one place GetSessionResult's live freshness read is
+// configured: with GitHub outbound off there is no bot credential to read
+// a pull request with, so it gets no code host at all -- the SAME
+// "unconfirmed, no live read" path a nil SourceControl already takes --
+// rather than a code host called with an empty token.
+func (deps SessionResultDeps) freshnessDeps() reviewfreshness.Deps {
+	if deps.Outbound == nil {
+		return reviewfreshness.Deps{Timeouts: deps.Timeouts}
+	}
+	return reviewfreshness.Deps{SourceControl: deps.SourceControl, Token: deps.Outbound.BotToken(), Timeouts: deps.Timeouts}
 }
 
 // GetSessionResult backs GET /api/sessions/{sessionID}/result (technical
@@ -105,7 +120,7 @@ type SessionResultDeps struct {
 // (owner decision D7).
 func GetSessionResult(deps SessionResultDeps) http.HandlerFunc {
 	bounds := statusBoundsFrom(deps.Timeouts)
-	freshnessDeps := reviewfreshness.Deps{SourceControl: deps.SourceControl, Token: deps.BotToken, Timeouts: deps.Timeouts}
+	freshnessDeps := deps.freshnessDeps()
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
 		if !ok {
@@ -153,7 +168,11 @@ func GetSessionResult(deps SessionResultDeps) http.HandlerFunc {
 		_ = g.Wait() // no goroutine returns an error: Assess never fails
 		cancelLive()
 
-		readLive := len(snap.live) > 0 && deps.SourceControl != nil
+		// Keyed on the code host the freshness reads above actually used,
+		// not on deps.SourceControl: with GitHub outbound off
+		// (freshnessDeps) nothing was read live, so the answer is the
+		// no-code-host one, SessionResultDelaySettled included.
+		readLive := len(snap.live) > 0 && freshnessDeps.SourceControl != nil
 		snap.outcome.SuggestedDelaySeconds = wholeSecondsRoundedUp(resultReadDelay(snap.activity, snap.reviewsSettled, readLive, deps.Timeouts))
 		writeJSON(w, http.StatusOK, snap.outcome)
 	}
