@@ -9386,9 +9386,13 @@ approved implementation is running:
 - **(b) Where an ingress does queue one.** Each ingress that creates a turn through `CreateTurnCore`
   fixes one admission policy (`CreateTurnPolicy`, `httpapi/turn.go`):
   - `RejectIfOpen`, refused `409` and nothing queued: `POST /api/sessions/{sessionID}/turns` -- the
-    browser, and the two MCP turn tools through it -- and Slack's Request-changes modal, which on that
-    `409` only logs it and acknowledges the submission, so the modal closes and the feedback is lost with
-    no reply (as before this row; filed as row 218);
+    browser, and the two MCP turn tools through it -- and Slack's Request-changes modal, which answers
+    that `409` with a `response_action: errors` response under its feedback field, as it answers an
+    authorization denial: the modal stays open with the feedback still in it and says a turn is running
+    and the change can be submitted once it ends. It tells the refusal apart by its sentinel
+    (`httpapi.ErrTurnAlreadyOpen`), never by its text, and any other failure of the create shows the
+    generic error the modal shows when the authorization check itself fails, so a failure never closes
+    the modal (Step 218);
   - `DropIfOpen`, nothing queued and a busy reply: a Slack thread reply and a Linear reply, a `revise:`
     one included;
   - `AlwaysQueue`, queued behind the open turn: the code host's mention (`CreateTurnForBot`, from the
@@ -9488,6 +9492,13 @@ back only after the revision wrote its version; `TestMentionBehindImplementation
 pins the case production reaches: a mention, without plan mode, queued behind the approved
 implementation on a review session is an ordinary turn, and the classifier is not asked -- while the
 same mention, with the same classifier, on a session whose plan awaits approval becomes a revision.
+The Slack modal's answer in (b) is pinned on the real handler and Postgres:
+`TestInteractivityHandler_ViewSubmission_RefusedCreateKeepsTheModalOpen` (with the approved
+implementation pending, dispatched or processing, the busy text under the block the opened modal
+renders, no turn inserted or audited, the implementation and the plan untouched, then the revision
+created once the implementation has completed; a create failing on the server shows the generic
+error) and `TestRequestChangesRefusalText_KeysOnTheSentinel` (the real refusal reworded still reads as
+busy; its text or its status without the sentinel, and the plan-awaiting-approval `409`, do not).
 
 ### 43.22 Stop over MCP
 

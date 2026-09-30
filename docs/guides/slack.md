@@ -132,7 +132,23 @@ REST endpoints use, so a plan decided here is decided everywhere.
   `CreateTurnPolicy.RejectIfOpen` — the same REST policy, not the
   `DropIfOpen` ordinary-reply policy above — because a modal submission
   has a real, visible failure surface (an inline modal error) to report
-  a conflict through, unlike a plain thread message.
+  a conflict through, unlike a plain thread message. A submission that
+  creates no revision leaves the modal open with your feedback still in
+  it and one message under the field, which depends on why:
+  - blank feedback (empty, or only whitespace/zero-width characters):
+    "Feedback can't be empty. Please describe the changes you'd like.";
+  - a Slack account not linked to a Narvi account yet, or a role that
+    may not prompt this session: "You don't have permission to request
+    changes on this plan.";
+  - any turn of the session pending, dispatched or processing (an
+    approved implementation running, typically): "A turn is still
+    running on this session, so this change wasn't submitted or queued.
+    Submit it again once that turn ends." Nothing is queued, so submit
+    it again once that turn ends;
+  - a server error while checking your permission or creating the
+    revision: "Something went wrong submitting this. Please try again."
+
+  The modal only closes once the revision turn exists.
 - **While a plan is `awaiting_approval`, almost nothing else gets
   through — with one exception.** An ordinary reply that matches neither
   a verdict keyword nor `revise:` is held by the same gate
