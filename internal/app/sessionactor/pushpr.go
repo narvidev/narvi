@@ -1222,8 +1222,8 @@ func (a *Actor) createPRBestEffort(ctx context.Context, raw json.RawMessage) {
 		return // already logged by creatorMayGetPRAttribution
 	}
 
-	// §8.11 ("multiplayer... PR created with the prompting user's OAuth
-	// token"): no bot/service-account fallback exists here, for either
+	// §8.11 (the push and the PR use the session creator's OAuth token):
+	// no bot/service-account fallback exists here, for either
 	// shape of "no usable creator token" -- a creator with NO github
 	// identity at all (the ordinary case for someone who has only ever
 	// signed in through OIDC, §41.3) or one whose linked identity's stored

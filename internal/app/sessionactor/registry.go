@@ -282,8 +282,8 @@ type Registry struct {
 	// createPRBestEffort (pushpr.go) calls CreatePR on once a push_complete
 	// event arrives; tokenEncryptionKey decrypts the session creator's own
 	// stored identities.access_token_encrypted (§13.1) to obtain the
-	// plaintext OAuth token CreatePR needs (§8.11: "PR created with the
-	// prompting user's OAuth token"). Both may be nil/empty (tests that
+	// plaintext OAuth token CreatePR needs (§8.11: the PR is created with
+	// the session creator's OAuth token). Both may be nil/empty (tests that
 	// never exercise the push/PR path).
 	sourceControl      ports.SourceControl
 	tokenEncryptionKey []byte

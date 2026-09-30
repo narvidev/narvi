@@ -92,7 +92,7 @@ func TestGetReviewAnalytics_RendersComputedRollups(t *testing.T) {
 		ProposedShippable: review.ProposedShippableAuto,
 		FilesChanged:      2,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	seededDigest := reviewpost.Digest{
 		Summary: "Test-seeded verdict.",
 		ArchDecisions: []reviewpost.ArchDecision{
@@ -190,7 +190,7 @@ func TestGetReviewAnalytics_DigestContestationRate_ComputedFromDeepPathAndContes
 		ProposedShippable: review.ProposedShippableAuto,
 		FilesChanged:      1,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	digest := reviewpost.Digest{Summary: "Deep-path test-seeded verdict."}
 	if _, err := appreviewverdict.Insert(ctx, rig.reviewVerdicts, narvipg.NewRepoSettingsStore(rig.pool), false, repoFullName, 9, "deadbeef2", pgtype.UUID{}, verdict, digest, reviewtriage.DepthDeep, review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, reviewverdict.Context{}, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed deep-path review_verdicts row: %v", err)

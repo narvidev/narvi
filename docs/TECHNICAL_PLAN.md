@@ -368,7 +368,7 @@ verifying nothing about the half that carries the risk.
 8. **Models**: Anthropic + OpenAI/Codex (ChatGPT-account OAuth — native in the pinned OpenCode binary, no plugin and no new `AgentRuntime` adapter, but NOT env-var-shaped either; full design in §29) + Gemini (via OpenCode's own already-present `google`/`google-vertex` providers, no new `AgentRuntime` adapter — §25.2) + reasoning-effort plumbing (per-session and per-message overrides — §29.8).
 9. **RWX previews**: PR preview links dispatched at latest PR commit (detailed design — adapter §4.1.1, preview-link mechanism §4.1.2).
 10. **Slack/Linear fidelity**: mrkdwn contract both directions; Linear progressive AgentActivity updates; thread↔session mapping.
-11. **Multiplayer**: participants, presence, per-user PR attribution (viewer ≠ reviewer), PR created with the *prompting user's* OAuth token (fallback: bot + manual PR URL).
+11. **Multiplayer**: participants, presence, per-user PR attribution (viewer ≠ reviewer): the push credential and the PR token are the *session creator's* GitHub OAuth token (no bot fallback: without the creator's usable GitHub token nothing is pushed and no PR is opened, §41.3; whether a bounded App credential may push instead is an open decision, §44.4). **Multiplayer push attribution**: a follow-up prompted by anyone other than the creator (a member who joined it, or an admin or maintainer, whom `authz.ActionPromptSession` lets prompt any session) pushes and opens its PR as the creator. Accepted v1; pushing and opening as whoever prompted the turn is deferred in `docs/DECISIONS.md`, with what reopens it.
 12. **Identity & access** (new — see §13): GitHub sign-in + pluggable OIDC SSO; automatic cross-channel identity linking (Slack/Linear ↔ GitHub by verified email, in-channel link prompt on ambiguity); RBAC with four roles (admin/maintainer/member/viewer) enforced server-side and channel-agnostic; audit log.
 13. **Product prototyping workflow** (new — see §14): path-scoped Environments enforced via sparse-checkout (not prompt discipline); a generalized multi-service boot manifest (`services.yml`) supervised natively by `sandbox-agent`; contract-driven mocking with drift detection; a handoff-readiness sentinel that flags backend-touching or uncontracted work for engineering pickup.
 14. **Decision inbox** (new — see §16): a home view listing everything waiting on the signed-in user — auto-approved PRs ready to merge (assigned directly or via CODEOWNERS through the identity graph), reviews requested, plans awaiting approval, recoverable failures — with actions inline, server-side re-validation at click time, and decision latency as an analytics KPI.
@@ -396,12 +396,15 @@ These run as automated scenarios against a real (or provider-faked) stack. Minim
 10. Concurrent @mentions on one PR → exactly one review session (atomic claim).
 11. Dirty working tree at relaunch → stash → checkout session branch → pop; zero lost user edits.
 12. Deploy rollout (rolling restart) → zero sessions marked failed.
-13. Turn dispatched onto a sandbox past its runway floor → rotation first, turn runs on the replacement, never a failure; and a deadline reached mid-turn → the turn stays `Processing`, a neutral warning is persisted, the same turn resumes after the rotation (§35.3, §35.4).
-14. Fresh-lineage respawn after a sandbox is lost → the recap reaches the agent framed as a third-party report, the continuity warning is persisted and survives a reload, and no claim in the recap is presented as the agent's own memory (§35.5).
-15. Session spend reaches its cap mid-run → the in-flight turn completes, the next dispatch is refused with a typed reason and one notice, the session is not marked failed, and an audited raise re-admits the next turn; and the freeze flipped with auto-merge candidates pending → no merge, no auto-fix spawn, no re-review enqueue and no automation invocation occurs while frozen, every candidate is still a candidate after unfreeze, a human command still works, and no running turn is severed (§40.1, §40.2).
-16. On the Kubernetes provider: the sandbox pod is deleted mid-turn → suspect → grace → respawn under a new gen as a new pod, the old gen's `Secret` gone with its pod, the same turn resumed (scenario 2 on a third provider); a boot against a cluster whose configured RuntimeClass is absent → refused at boot with the class named, never a `runc` pod; and a session in an `allowlist` Environment on a provider declaring `EgressPolicy: false` → refused at dispatch with the typed reason, never run open (§42.2, §42.3, §42.4).
 
-Scenarios 13-16 were added after Phase 2 closed, and each gates the appended phase that adds it — not Phase 2's own "12 scenarios" criterion, which is not reopened. This is the Phase 4 precedent: a later phase may extend this catalogue and gate itself on what it added, and a closed gate stays closed on the set it was signed off against.
+Scenarios 13-17 are numbered in `test/resilience/README.md`, which indexes them with their tests: 13-16 are Step 42's warm-boot scenarios (fetch-fail boot, stale-image boot, refresh-in-flight spawn and non-idempotent-setup boot, §19), and 17 is Step 74's restore-with-docker (§27.8). The scenarios below take the next free numbers.
+
+18. Turn dispatched onto a sandbox past its runway floor → rotation first, turn runs on the replacement, never a failure; and a deadline reached mid-turn → the turn stays `Processing`, a neutral warning is persisted, the same turn resumes after the rotation (§35.3, §35.4).
+19. Fresh-lineage respawn after a sandbox is lost → the recap reaches the agent framed as a third-party report, the continuity warning is persisted and survives a reload, and no claim in the recap is presented as the agent's own memory (§35.5).
+20. Session spend reaches its cap mid-run → the in-flight turn completes, the next dispatch is refused with a typed reason and one notice, the session is not marked failed, and an audited raise re-admits the next turn; and the freeze flipped with auto-merge candidates pending → no merge, no auto-fix spawn, no re-review enqueue and no automation invocation occurs while frozen, every candidate is still a candidate after unfreeze, a human command still works, and no running turn is severed (§40.1, §40.2).
+21. On the Kubernetes provider: the sandbox pod is deleted mid-turn → suspect → grace → respawn under a new gen as a new pod, the old gen's `Secret` gone with its pod, the same turn resumed (scenario 2 on a third provider); a boot against a cluster whose configured RuntimeClass is absent → refused at boot with the class named, never a `runc` pod; and a session in an `allowlist` Environment on a provider declaring `EgressPolicy: false` → refused at dispatch with the typed reason, never run open (§42.2, §42.3, §42.4).
+
+Scenarios 18-21 were added after Phase 2 closed, and each gates the appended phase that adds it — not Phase 2's own "12 scenarios" criterion, which is not reopened. This is the Phase 4 precedent: a later phase may extend this catalogue and gate itself on what it added, and a closed gate stays closed on the set it was signed off against.
 
 ### 9.4 Shadow mode (phases 3-4, and §30 for the platform-wide capability)
 Intent classifier and code review run in shadow mode (log-only) on real traffic before activation; divergence report per decision. **Shadow mode is a permanent capability, not a one-time launch gate** (§18.5): activating a classifier or reviewer on a surface must never delete the shadow code path, its config, or its telemetry — the same mechanism is used again for every future model swap, prompt change, or new surface, not just the first activation. Skipping the shadow window on the reasoning that tests alone prove equivalence is not a default; it requires an explicit, documented exception.
@@ -466,7 +469,7 @@ The seams that let an optional module compose a second binary on top of this rep
 
 **Phase 13 — Silent failures (Steps 136-142; additive; see §35, §36, §24.8, §37)**
 Six ways this system can fail while looking like it succeeded, and the write-time refusals that stop a seventh: sandbox lifetime rotation and the interrupted turn, fresh-lineage continuity and the stored text parts it rests on, the broken-contract backstop across all three surfaces that mandate an artifact, and the base-branch gate with its re-target lane.
-*Exit: each class produces a signal that can be told apart from the success it used to imitate; §9.3 scenarios 13 and 14 green, gating this phase and not Phase 2's own closed criterion.*
+*Exit: each class produces a signal that can be told apart from the success it used to imitate; §9.3 scenarios 18 and 19 green, gating this phase and not Phase 2's own closed criterion.*
 
 **Phase 14 — Decomposition and chaining (Steps 143-147; additive; see §38, §39)**
 Two capabilities that compose work this system already performs into more than one unit: one automation's own reported conclusion starting another, and a tracker ticket a team already decomposed landing as one pull request per sub-issue, each dependent link gated on its predecessor's recomputed verdict. Nothing here is a defect; both are capabilities this design did not have.
@@ -474,11 +477,11 @@ Two capabilities that compose work this system already performs into more than o
 
 **Phase 15 — Autonomy guardrails (Steps 148-151; additive; see §40)**
 The four controls that make the autonomy this system already grants bounded and legible: a spend cap that refuses the next turn, one persisted freeze every automatic action consults, session-level bounds in the timeout ladder, and one per-repository level that constrains the automation-enabling toggles rather than replacing them. Nothing here is a defect in a shipped Step; each is a control the design assumed and never named.
-*Exit: a session at its cap or bound stops taking turns without being marked failed and resumes on an audited raise; the freeze stops every automatic action without severing a running turn or losing a candidate; a repository's level answers what it may do in one field and one audit row. §9.3 scenario 15 green, gating this phase.*
+*Exit: a session at its cap or bound stops taking turns without being marked failed and resumes on an audited raise; the freeze stops every automatic action without severing a running turn or losing a candidate; a repository's level answers what it may do in one field and one audit row. §9.3 scenario 20 green, gating this phase.*
 
-**Phase 16 — External-client prerequisites (Steps 157-159, 180-183; additive; gated on a product decision)**
-What this repository owes an external client before one can be built honestly: a stable, versioned `/contracts` policy with CI that fails a breaking change (Step 157, worth doing regardless), native-client authentication (158) and a cursor-resumable event stream (159) — the latter two not to be started on speculation. The MCP surface existing clients use (180-183) is specified in §43; the rest in `docs/IMPLEMENTATION_PLAN.md`'s own Phase 16 block.
-*Exit: a script client in this repository's own tests authenticates as a native client, follows a session to completion, survives a drop and catches up from its own offset without re-pulling; under no client decision, Step 157 alone.*
+**Phase 16 — External-client prerequisites (Steps 157-159, 180-183 and 217; additive; 158 and 159 gated on the native-client decision)**
+What this repository owes an external client before one can be built honestly: a stable, versioned `/contracts` policy with CI that fails a breaking change (Step 157, worth doing regardless), native-client authentication (158) and a cursor-resumable event stream (159) — the latter two not to be started on speculation. The MCP surface existing clients use (180-183, over the stop Step 217 builds) is specified in §43; the rest in `docs/IMPLEMENTATION_PLAN.md`'s own Phase 16 block.
+*Exit: Step 157's policy fails a breaking change in CI, and an existing MCP client, through the official SDK on the production router, is authorized with consent, discovers, starts and follows a session, reads its result, decides a plan and stops a session with every session it started, each through the checks the equivalent HTTP call makes; if a native client is decided, a script client in this repository's own tests also authenticates as a native client, follows a session to completion, survives a drop and catches up from its own offset without re-pulling; under no native-client decision, 158 and 159 stay unstarted.*
 
 **Phase 17 — Claims parity (Steps 162-165; additive; see §41)**
 The three sentences in `docs/FOUNDATIONS.md` that are true of the plan and false of the binary — control-plane packaging, sandbox provider selection, OIDC sign-in — built, and the document brought into the repository under a drift test so a present-tense claim can never again outrun the code. Nothing here is a defect in a shipped Step; each is a sentence written about the plan as if about the binary.
@@ -486,7 +489,7 @@ The three sentences in `docs/FOUNDATIONS.md` that are true of the plan and false
 
 **Phase 18 — Kubernetes-native sandbox provider (Steps 166-170; additive; see §42)**
 The third `SandboxProvider`: pods in the operator's own cluster, with the three decisions a pod needs before it is a sandbox — a RuntimeClass that is a boundary (Kata by default, fail-closed on absence, `runc` never), an egress policy that can name a host, and a lifetime Narvi sets itself. Gated on Phase 17's Step 163, the selection switch it plugs into.
-*Exit: §9.3 scenario 16 green on `kind`; an acceptance run on the target cluster recorded with the RuntimeClass handler, node type and date — the boundary is proven there and nowhere else.*
+*Exit: §9.3 scenario 21 green on `kind`; an acceptance run on the target cluster recorded with the RuntimeClass handler, node type and date — the boundary is proven there and nowhere else.*
 
 **Phase 19: Adopted product capabilities (Steps 184-188; additive)**
 Five capabilities adopted by owner decision on 2026-09-17 and 2026-09-18, grouped by that provenance
@@ -666,7 +669,7 @@ a surface nobody has exercised is exactly the claim this codebase's own conventi
 ## 13. Identity, authentication & RBAC
 
 ### 13.1 Authentication
-- **GitHub OAuth is the primary login** and serves double duty: the stored user OAuth token is what attributes PRs to the real author (§8.11). Generic **OIDC** is the secondary provider for SSO (Google/enterprise IdP). An earlier version of this line said "configuration, not code"; it is code — two handlers, discovery, and an issuer-qualified identity row — and it was not built with the GitHub flow. §41.3 specifies it (Step 164); until it ships, the sign-in view's SSO button is configuration-gated and disabled, and says so.
+- **GitHub OAuth is the primary login** and serves double duty: the stored user OAuth token is what attributes PRs to a real person, the session's creator (§8.11). Generic **OIDC** is the secondary provider for SSO (Google/enterprise IdP). An earlier version of this line said "configuration, not code"; it is code — two handlers, discovery, and an issuer-qualified identity row — and it was not built with the GitHub flow. §41.3 specifies it (Step 164); until it ships, the sign-in view's SSO button is configuration-gated and disabled, and says so.
 - Sessions: **backend-issued, host-scoped cookies** (HttpOnly, SameSite=Lax; never a default cookie name on a shared parent domain — a colliding cookie from a sibling app on the parent domain is a classic random-logout cause). Token/refresh handling lives in the Go control plane; the SPA holds no provider tokens.
 - Signup gate: allowlist of email domains / GitHub orgs / explicit users, evaluated at first sign-in; default role assigned from config (e.g. domain match → member).
 - Provider tokens encrypted at rest (AES-GCM), per-user.
@@ -2073,16 +2076,31 @@ reject-don't-repair posture the endpoint already applies to invalid payloads —
 verdict whose digest is semantically empty raises the `Shippable` floor (§26.2's composition). The
 light path requests the full digest but does not hard-require it.
 
-**The readout names what raised it (amendment).** `Shippable` is the maximum of a
-risk baseline and the raise-only floors `ComputeShippable` composes, and the rendered verdict prints
-the class alone. The
-function that computes the class returns its blockers beside it (every input that on its own would
-keep the class above `auto`: the risk baseline when it is, and each floor that is), the two computed
-together so they cannot disagree (no
-blockers exactly when the class is `auto`), and the readout names them, marked as decided by the
-server and not asserted by the reviewer. A counter-review reported done but not corroborated reaches
-the function as a value of its own rather than as skipped, with the same floor, so its blocker says
-what happened.
+**The readout names what raised it (amendment, Step 200).** `Shippable` is the maximum of a
+risk baseline and the raise-only floors `ComputeShippable` composes, and the rendered verdict used to
+print the class alone. The function that computes the class now returns its blockers with it, as one
+`ShippableAssessment`: every input that on its own keeps the class above `auto` (the risk baseline
+when it is, and each floor that is), each with its value and the level it alone forces. Each input
+enters as a single floor value carrying both its level and what names it, and the class is computed
+from the blockers those values produce, so the two cannot disagree: no blockers exactly when the
+class is `auto`, and two inputs at the same level are both named. The rendered verdict lists them as
+nested bullets under the Shippable bullet, after a lead-in marking them as decided by the server and
+not asserted by the reviewer. That header list is the server's alone: the two reviewer fields rendered
+in it or right after it cannot open a list item there, the one-line adequacy explanation having its
+line breaks folded to spaces and every line of the why-line that would open a list item having its
+marker escaped, so reviewer text cannot pass for a Shippable bullet or a blocker block. Otherwise an
+`auto` verdict's header, and every other line of the comment, is what it was. A counter-review
+reported done but not corroborated (§26.4) reaches the function as `uncorroborated`, a value of its
+own rather than `skipped`, with the same `needs_human` floor, so its blocker says the reviewer
+reported done and the server could not confirm it from the turn's trace when the verdict was posted.
+That is all it claims, since the same value covers a trace with no completed counter-reviewer, a
+trace the server could not read, and a finish event that had not landed yet. A payload cannot claim
+that value on any path: `ValidateVerdictInput` rejects it whatever the depth, and the one writer of
+`review_verdicts.counter_review` refuses it too; only the server resolves it. The blockers are not
+persisted: `review_verdicts` keeps the class, and the reviewer's own
+`counter_review` self-report, exactly as before, so every reader of a stored verdict (auto-approval,
+auto-merge, the decision inbox, the Code review view and its REST DTOs) reads what it read before,
+and the posted verdict is where the blockers are read.
 
 ### 26.2 Description adequacy: does the PR tell the truth? (Step 67)
 
@@ -2297,9 +2315,11 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
     existing light-path substitution, and gated explicitly on `ReviewDepth == DepthDeep` — never
     merely on the raw `CounterReview` value, which carries no validated meaning on the light path
     and would otherwise let this substitution silently floor light-path verdicts too): a deep-path
-    `done` claim the server could NOT corroborate is downgraded to `CounterReviewSkipped` before
+    `done` claim the server could NOT corroborate becomes `CounterReviewUncorroborated` before
     `CounterReviewFloor` runs, landing on the identical `needs_human` floor an honest `skipped`
-    self-report already produces. This can only ever make `Shippable` MORE conservative than the
+    self-report already produces while keeping its own name, so the verdict's blocker says the claim
+    went unconfirmed rather than that the reviewer skipped (§26.1; it was read as `skipped` until
+    then, with the same floor). This can only ever make `Shippable` MORE conservative than the
     self-report alone, never less.
   - **A known, accepted race, not a bug:** the verdict POST and the WS event carrying
     `sub_task_finish` are two independent network round-trips from the sandbox with no server-side
@@ -6192,7 +6212,8 @@ By content this is §3.2/§3.3 resilience work, and Phase 2 is its substrate. It
 rather than folded in, for the reason Phases 8 through 12 each give for themselves. Within it:
 §35.2 before §35.3 (a gate cannot read a deadline nobody stamps), §35.3 before §35.4 (the
 interruption path rotates), and §35.6 before §35.5 (a recap built on lossy storage is a recap worth
-less than the warning beside it). §9.3 gains two scenarios on the Phase 4 precedent — the new
+less than the warning beside it), met by the §6.1 fix §35.6 opens with; what is left of §35.6
+serves another runtime adapter and does not gate §35.5. §9.3 gains two scenarios on the Phase 4 precedent — the new
 phase's own milestone gates on them, and Phase 2's "12 scenarios" gate is not reopened.
 
 ## 36. The broken-contract backstop (new capability)
@@ -6759,7 +6780,7 @@ a Step.
   adapter-local accumulator still exists and is still not the control-plane figure, exactly as
   §25.15 says.
 - **§2** gains `session_deadline` as the sixth named timer. **§5.4** gains the session-level tier.
-- **§9.3** gains scenario 15, gating Phase 15 on the Phase 4 precedent.
+- **§9.3** gains scenario 20, gating Phase 15 on the Phase 4 precedent.
 - **§13.3**'s admin-only row names the level, the freeze, the cap and the bounds; the level is gated
   at least as strictly as any toggle it constrains.
 - **§16** shows the freeze and lists capped and bounded sessions as waiting on a human.
@@ -6858,8 +6879,11 @@ boot; unset leaves the SSO button exactly as disabled as today. The verified `em
 allowlist gate, the same default-role assignment, and the same `users` row model as GitHub sign-in;
 `identities` gains provider `oidc` with `external_id = {issuer}|{sub}` — issuer-qualified, since two
 IdPs can issue the same `sub` — by migration. A user with only an OIDC identity has no GitHub OAuth
-token: PR creation takes §8.11's existing fallback (bot identity plus the PR URL surfaced for a manual
-step), and the sign-in view's identity panel offers linking a GitHub identity later through the
+token, and the push and the PR use the session creator's (§8.11), so a session whose creator has no
+linked GitHub identity cannot push until the creator links one: the push is not attempted and the
+session records a warning saying so. A bot-credential fallback was built and removed in review, because it gave a
+GitHub-less member the bot's write access on a branch of their choosing; whether a bounded App
+credential may push for such a session is open (§44.4). The sign-in view's identity panel offers linking a GitHub identity later through the
 ordinary GitHub flow — the graph merges on verified email exactly as §13.2 step 3 does for Slack and
 Linear.
 
@@ -7057,7 +7081,7 @@ CI runs `kind`, and `kind` cannot run Kata. Every lifecycle property in this sec
 list, gen-fenced identity, secret garbage collection, `activeDeadlineSeconds`, the security context a
 PSS `restricted` namespace refuses, the boot-time RuntimeClass check refusing an absent class, the
 shared-kernel escape hatch logging its own use — is proven on `kind` with
-`NARVI_K8S_ALLOW_SHARED_KERNEL=1`, and §9.3 scenario 16 runs there. The isolation boundary itself is
+`NARVI_K8S_ALLOW_SHARED_KERNEL=1`, and §9.3 scenario 21 runs there. The isolation boundary itself is
 **not** what a green CI proves, and this section says so where the exit criterion is written: Step
 167's exit is an acceptance run on the target cluster, recorded with the RuntimeClass handler, the
 node type and the date — the RWX precedent (§4.1.1) of settling a capability empirically before
@@ -7077,7 +7101,7 @@ declaring it. A reader who infers Kata from a green badge has been told not to.
   privilege) and not for what it does not (a stronger boundary than the host kernel).
 - **§27.6**'s "NetworkPolicy for the anticipated Kubernetes provider" is narrowed to FQDN-capable
   policy, with the reason (§42.4).
-- **§9.3** gains scenario 16, gating Phase 18 on the Phase 4 precedent.
+- **§9.3** gains scenario 21, gating Phase 18 on the Phase 4 precedent.
 - **§41.2**'s `NARVI_SANDBOX_PROVIDER` gains the value `kubernetes` — in Step 166, not before.
 - **`docs/PRODUCTION_CHECKLIST.md`** gains three lines: the RuntimeClass and its handler, the
   egress-policy assertion, and `NARVI_K8S_ALLOW_SHARED_KERNEL` unset.
@@ -7090,7 +7114,7 @@ is gated on Phase 17's Step 163, the selection switch it plugs into. 167 (the Ru
 and the acceptance run) and 168 (egress) are the two decisions, and neither can be skipped by
 declaring a capability false — 167 because a provider without it is a shared kernel, 168 because
 §27.6's fail-closed rule leaves an `allowlist` Environment unspawnable until it lands. 169 and 170 are
-independent of each other and gate nothing. Scenario 16 gates the phase.
+independent of each other and gate nothing. Scenario 21 gates the phase.
 
 ### 42.9 Alternative studied: Agent Substrate, and AX above it
 

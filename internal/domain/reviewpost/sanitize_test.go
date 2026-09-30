@@ -290,7 +290,7 @@ func TestRenderVerdictComment_UnaffectedBySanitizeDigest(t *testing.T) {
 	// produces.
 	_ = reviewpost.SanitizeDigest(original)
 
-	got := reviewpost.RenderVerdictComment(baseVerdict(), nil, original, "Summary.", "narvi-bot", reviewpost.LabelLowRisk)
+	got := reviewpost.RenderVerdictComment(baseVerdict(), assessmentOf(baseVerdict()), nil, original, "Summary.", "narvi-bot", reviewpost.LabelLowRisk)
 
 	if !strings.Contains(got, digestInjectionEscaped) {
 		t.Errorf("RenderVerdictComment() missing the SINGLY-escaped StackRisks content, want to contain %q, got:\n%s", digestInjectionEscaped, got)

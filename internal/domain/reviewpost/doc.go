@@ -41,7 +41,9 @@
 //     Shippable is computed), ValidateVerdictInput (rejects a malformed or
 //     partial payload), BuildVerdict (the one sanctioned way to turn a
 //     validated VerdictInput into a review.Verdict, populating Shippable
-//     via review.ComputeShippable exactly per that package's CONTRACT).
+//     via review.ComputeShippable exactly per that package's CONTRACT,
+//     and returning that call's review.ShippableAssessment beside it so
+//     the readout can name what keeps the class above auto, §26.1).
 //   - formalreview.go: FormalReviewEvent, ComputeFormalReviewEvent -- the
 //     formal-review gate's own event decision (§8.2's "submitting
 //     an actual GitHub PR review rather than a comment"), and the
@@ -66,8 +68,10 @@
 //     body, folding in the verdict's own typed fields, the agent-supplied
 //     narrative Summary (never re-parsed back out of it afterward -- it is
 //     accepted, rendered, and never read again as structured data), the
-//     synced label, RerunGuidance, and (§26.1) the digest sections that
-//     now front the appendix findings/coverage/docs-drift content.
+//     synced label, RerunGuidance, (§26.1) the digest sections that
+//     now front the appendix findings/coverage/docs-drift content, and
+//     (§26.1) the blockers that keep the Shippable class above auto,
+//     rendered under the class from the same assessment.
 //   - digest.go: Digest, ArchDecision -- §26.1's own merge-readout
 //     content (§26.1): "what this PR does", architecture choices, and
 //     risks to the stack, carried on VerdictInput alongside its
