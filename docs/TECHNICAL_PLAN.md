@@ -1306,8 +1306,13 @@ account (`<slug>[bot]`), that App identified by id. A status's poster is read fr
 statuses listing, which names each status's creator: the listing entry with the same status id as the
 one the combined status rolled the name up to, paged to a bound, past which the poster is unknown. The
 App behind a bot account is identified by a check run of the same App (same slug) at the head, which
-carries its id, or else by its slug (`GET /apps/{app_slug}`, a public read whose answer never changes
-and is kept once read, a failure never). A check run from another App never counts, nor does a status
+carries its id, or else by its slug (`GET /apps/{app_slug}`, a public read). An App keeps its id, but a
+slug can pass to another App once freed (a rename or a deletion), so an answer is kept for a bounded
+time (`GitHubAppIDCacheTTL`, ten minutes), a failure never: a running process may attribute a moved
+slug's statuses to the App that held it for at most that long, and GitHub's own enforcement at merge
+covers every merger the rule binds. A slug that names no App is an answer, the App unidentified; any
+other failure to read an App is a failed read of the requirements, handled like one (below). Each
+slug is read once per inbox load or auto-merge tick. A check run from another App never counts, nor does a status
 another App or a person posted, nor one whose poster cannot be read, nor one whose App cannot be
 identified; a check naming an App that no report counts for, beside a status whose poster or App
 cannot be established, or beside another source's status posted over an earlier status of the same
@@ -1330,7 +1335,8 @@ Who reads the requirements follows who acts. The merge path reads them live, bef
 refusal can name the check), with the credential that makes the merge: a person's Merge click with
 their own token, so it does not depend on GitHub outbound any more than the merge does; the auto-merge
 worker with the bot, once per base branch per tick for all its candidates. A failed read stands in the
-probe as "requires nothing", so it refuses only once every other criterion passed. The inbox's read
+probe as "requires nothing", so it refuses only once every other criterion passed; so does a failed read
+of an App the requirements need. The inbox's read
 model, which merges nothing, reads them as the deployment's bot after its probe, cached per base branch
 for the inbox's SCM cache TTL (a failed read is never cached); a failed read marks the inbox's SCM data
 degraded only when it is what refuses the row, never when freshness (a confirmed base move, say)

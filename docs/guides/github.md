@@ -172,10 +172,12 @@ the base ties to one App is satisfied by that App's check run or by a
 commit status that App's bot account posted -- never by another App's
 check run or status, or a person's status. The App behind a status is
 identified by a check run of the same App at the head or, failing that,
-by its slug (`GET /apps/{app_slug}`, read with the same token); a status
-whose App cannot be identified, or another source's status posted over an
-earlier one of the same name from another account, leaves the check "could
-not be confirmed", never satisfied. With GitHub outbound off, the decision inbox reads no
+by its slug (`GET /apps/{app_slug}`, read with the same token, and kept for
+ten minutes, since a slug can pass to another App); a slug that names no
+App, or another source's status posted over an earlier one of the same
+name from another account, leaves the check "could not be confirmed",
+never satisfied, and any other failure to read the App is a failed read of
+the requirements. With GitHub outbound off, the decision inbox reads no
 requirements: it shows no pull request as ready to merge and says so, but
 still offers Merge on a pull request that meets everything else; the
 click reads the requirements itself, and merges or names the unmet check.
