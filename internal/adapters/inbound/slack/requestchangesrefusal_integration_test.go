@@ -130,11 +130,16 @@ func submitRequestChanges(t *testing.T, rig *interactiveTestRig, modal requestCh
 
 // modalErrors decodes a response_action "errors" answer and returns its
 // errors map, failing the test on any other answer -- a bare 200 closes
-// the modal as accepted.
+// the modal as accepted. The answer must be declared JSON: Slack reads a
+// view_submission's response_action from an application/json body, and a
+// body written without the header would reach it as text/plain.
 func modalErrors(t *testing.T, rec *httptest.ResponseRecorder) map[string]string {
 	t.Helper()
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (body=%s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Type"); got != "application/json" {
+		t.Fatalf("Content-Type = %q, want %q (body=%s)", got, "application/json", rec.Body.String())
 	}
 	var resp struct {
 		ResponseAction string            `json:"response_action"`

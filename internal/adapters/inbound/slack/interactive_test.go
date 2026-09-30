@@ -258,6 +258,11 @@ func TestNewInteractivityHandler_ViewSubmission_EmptyFeedback_RespondsWithInline
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want %d (body=%s)", rec.Code, http.StatusOK, rec.Body.String())
 			}
+			// writeViewSubmissionError must declare the answer JSON: Slack
+			// reads response_action from an application/json body.
+			if got := rec.Header().Get("Content-Type"); got != "application/json" {
+				t.Errorf("Content-Type = %q, want %q", got, "application/json")
+			}
 
 			var resp viewSubmissionErrorResponse
 			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
