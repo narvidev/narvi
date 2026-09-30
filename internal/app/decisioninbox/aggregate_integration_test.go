@@ -603,7 +603,7 @@ func TestBuild_FullScenario(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create outbox entry: %v", err)
 	}
-	if _, err := outbox.MarkDeadLetter(ctx, deadOutboxEntry.ID, "notifier: permanent failure"); err != nil {
+	if _, err := outbox.MarkDeadLetter(ctx, deadOutboxEntry.ID, "notifier: permanent failure", 0); err != nil {
 		t.Fatalf("mark outbox dead letter: %v", err)
 	}
 

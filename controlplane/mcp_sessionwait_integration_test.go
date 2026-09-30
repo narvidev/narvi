@@ -233,14 +233,24 @@ func answeredWithinAPoll(t *testing.T, rig *oauthRouterRig, changedAt, answeredA
 // (one transaction, turn.Transition), and the wait answers within about a
 // poll: finished, settled, reason "settled", having waited. Mutations: a
 // wait that returns on its first read regardless fails the first check.
+//
+// The three polls are counted from the moment the server holds the wait
+// (the replica's Waiter reports it active), never from the client's call:
+// the request can reach the server a poll or more after it was sent, and
+// the waited time the answer reports is the server's own.
 func sdkWaitReturnsOnRealTerminalState(t *testing.T, rig *oauthRouterRig) {
 	ctx := oauthTestCtx(t)
 	flow := rig.connectSDKClient(ctx, t, nil)
 	seed := newWaitSeed(rig.pool)
 	sid := seed.session(ctx, t, flow.member.ID)
 	turnID := seed.processingTurn(ctx, t, sid, false)
+	base := rig.app.sessionWaiter.Active()
 
 	call := startWait(ctx, flow.session, map[string]any{"sessionId": sid.String(), "waitSeconds": 5})
+	held := time.Now().Add(3 * time.Second)
+	for rig.app.sessionWaiter.Active() <= base && !call.answered() && time.Now().Before(held) {
+		time.Sleep(5 * time.Millisecond)
+	}
 	stillWaiting(t, rig, call, 3, "a processing turn")
 	completedAt := time.Now()
 	seed.completeTurn(ctx, t, sid, turnID, nil)

@@ -230,7 +230,7 @@ func TestPlanSlackNotifier_DeliverApproval_RejectedBetweenEnqueueAndDelivery_Ski
 
 	builder, err := outboxworker.NewBuilder(outbox, pool, map[ports.NotificationKind]ports.Notifier{
 		ports.NotificationKindSlackPlanApproval: notifier,
-	}, platform.DefaultTimeouts())
+	}, platform.DefaultTimeouts(), &platform.ShutdownState{})
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
 	}
