@@ -1254,9 +1254,9 @@ type SourceControl interface {
 
 // ListRequiredChecksSpec is ListRequiredChecks' input: the base branch
 // whose requirements are read, and the credential they are read with --
-// the deployment's bot token (platform.GitHubOutboundConfig) at every
-// eligibility call site, so the inbox, a person's Merge click and the
-// auto-merge worker read the same requirements.
+// the one whoever acts on them uses: the deployment's bot token
+// (platform.GitHubOutboundConfig) for the decision inbox and the
+// auto-merge worker, a person's own token for their Merge click.
 type ListRequiredChecksSpec struct {
 	Owner  string
 	Repo   string
@@ -1281,8 +1281,23 @@ const (
 	// HeadCheckSourceCheckRun is a check run, which carries the id of the
 	// App that reported it.
 	HeadCheckSourceCheckRun HeadCheckSource = "check_run"
-	// HeadCheckSourceStatus is a commit status, which carries no App id.
+	// HeadCheckSourceStatus is a commit status, which carries the account
+	// that posted it rather than an App id.
 	HeadCheckSourceStatus HeadCheckSource = "status"
+)
+
+// HeadCheckPoster is the kind of account that posted a commit status.
+type HeadCheckPoster string
+
+const (
+	// HeadCheckPosterUnknown is a status whose poster could not be read --
+	// the zero value.
+	HeadCheckPosterUnknown HeadCheckPoster = ""
+	// HeadCheckPosterApp is a status an App posted through its bot
+	// account; every check run is posted by an App.
+	HeadCheckPosterApp HeadCheckPoster = "app"
+	// HeadCheckPosterPerson is a status a person's own account posted.
+	HeadCheckPosterPerson HeadCheckPoster = "person"
 )
 
 // HeadCheckState is where a HeadCheck stands for a requirement.
@@ -1302,8 +1317,13 @@ const (
 type HeadCheck struct {
 	Name   string
 	Source HeadCheckSource
-	// AppID is the id of the App that reported a check run; zero for a
-	// commit status.
+	// AppID is the App a report is attributed to: the App that reported a
+	// check run, or, for a commit status an App posted, that App when a
+	// check run of the same App at the head carries its id -- zero when it
+	// does not, and for every status a person posted.
 	AppID int64
-	State HeadCheckState
+	// Poster is who posted a commit status (HeadCheckPosterApp for every
+	// check run).
+	Poster HeadCheckPoster
+	State  HeadCheckState
 }

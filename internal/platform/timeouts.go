@@ -2518,8 +2518,10 @@ type Timeouts struct {
 	// GitHubListOpenPRsForUserTimeout/GitHubResolveCodeOwnersTimeout
 	// already establish just above, not a new pattern. GetOpenPR (getopenpr.go)
 	// is FIVE sequential GETs against the SAME single target PR, never
-	// one: fetchOpenPRDetail, fetchReviewDecision, fetchCIConclusionLive's
-	// own two calls (combined-status, check-runs), and
+	// one -- six when the head carries commit statuses: fetchOpenPRDetail,
+	// fetchReviewDecision, fetchCIConclusionLive's own two calls
+	// (combined-status, check-runs) plus the statuses listing that says who
+	// posted each status (§21.2's required checks), and
 	// fetchChangedFilePaths (all buildOpenPRFromDetail's own construction,
 	// listopenprs.go) -- a previous revision of the call site reused
 	// GitHubGetPRTimeout here, whose OWN doc comment names a genuinely

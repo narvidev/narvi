@@ -371,14 +371,17 @@ type combinedStatusResponse struct {
 // App.ID is the App that reported the run, read only by
 // fetchCIConclusionLive: a base branch can require a check from one named
 // App (ports.RequiredCheck.AppID), and a run of that name from any other
-// App does not satisfy it.
+// App does not satisfy it. App.Slug is that App's slug, which names its
+// bot account ("<slug>[bot]"): a commit status that bot posted is
+// attributed to the same App id.
 type checkRunsResponse struct {
 	TotalCount int `json:"total_count"`
 	CheckRuns  []struct {
 		Name       string  `json:"name"`
 		Conclusion *string `json:"conclusion"`
 		App        struct {
-			ID int64 `json:"id"`
+			ID   int64  `json:"id"`
+			Slug string `json:"slug"`
 		} `json:"app"`
 	} `json:"check_runs"`
 }

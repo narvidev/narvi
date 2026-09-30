@@ -236,6 +236,35 @@ func TestListRequiredChecks(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name:   "four full pages and a partial fifth are read in full",
+			branch: writeJSON(unprotectedBranch()),
+			rules:  pagesOfRules(t, 4, []map[string]any{statusChecksRule(map[string]any{"context": "on-page-5"})}),
+			want:   []ports.RequiredCheck{{Name: "on-page-1"}, {Name: "on-page-2"}, {Name: "on-page-3"}, {Name: "on-page-4"}, {Name: "on-page-5"}},
+		},
+		{
+			name:   "exactly five full pages, then an empty sixth, are read in full",
+			branch: writeJSON(unprotectedBranch()),
+			rules:  pagesOfRules(t, 5, nil),
+			want:   []ports.RequiredCheck{{Name: "on-page-1"}, {Name: "on-page-2"}, {Name: "on-page-3"}, {Name: "on-page-4"}, {Name: "on-page-5"}},
+		},
+		{
+			name:    "five full pages and rules on a sixth is an error",
+			branch:  writeJSON(unprotectedBranch()),
+			rules:   pagesOfRules(t, 5, []map[string]any{statusChecksRule(map[string]any{"context": "on-page-6"})}),
+			wantErr: true,
+		},
+		{
+			name:   "the plan's answer on a later page is an error, never a branch requiring nothing",
+			branch: writeJSON(unprotectedBranch()),
+			rules: func(page int) requiredChecksHandler {
+				if page == 1 {
+					return writeJSON(fullPageOfRules(map[string]any{"context": "e2e"}))
+				}
+				return writeStatus(http.StatusForbidden, planUnavailableBody, nil)
+			},
+			wantErr: true,
+		},
 	}
 
 	for _, tc := range tests {
@@ -286,71 +315,156 @@ func TestListRequiredChecks(t *testing.T) {
 	}
 }
 
-// fullPageOfRules is a page of 100 rules, none of them a status-check rule.
-func fullPageOfRules() []map[string]any {
+// fullPageOfRules is a page of 100 rules, none of them a status-check rule
+// unless checks are given, in which case the last rule requires them.
+func fullPageOfRules(checks ...map[string]any) []map[string]any {
 	rules := make([]map[string]any, 100)
 	for i := range rules {
 		rules[i] = map[string]any{"type": "non_fast_forward"}
 	}
+	if len(checks) > 0 {
+		rules[99] = statusChecksRule(checks...)
+	}
 	return rules
+}
+
+// pagesOfRules answers pages 1..full with a full page, the page after with
+// last (nil for an empty page), and any later page with a failure: a read
+// that goes further than it needs to must not pass.
+func pagesOfRules(t *testing.T, full int, last []map[string]any) func(page int) requiredChecksHandler {
+	return func(page int) requiredChecksHandler {
+		switch {
+		case page <= full:
+			return writeJSON(fullPageOfRules(map[string]any{"context": "on-page-" + strconv.Itoa(page)}))
+		case page == full+1:
+			if last == nil {
+				last = []map[string]any{}
+			}
+			return writeJSON(last)
+		default:
+			t.Errorf("rules page %d was requested, past the last page %d", page, full+1)
+			return writeStatus(http.StatusInternalServerError, `{"message":"too far"}`, nil)
+		}
+	}
 }
 
 // TestGetOpenPR_ListsHeadChecks proves the live CI read lists the head's
 // checks one by one for a base branch's required checks (ports.OpenPR.
 // HeadChecks): every check run with its App id and every commit status
-// context, each mapped to passed, pending or failed, from the SAME two
+// context, each mapped to passed, pending or failed, from the SAME
 // responses the CI conclusion comes from -- and that listing them never
-// changes that conclusion.
+// changes that conclusion. When the head carries statuses, the per-ref
+// statuses listing says who posted each: an App's bot account ("<slug>[bot]",
+// type Bot), attributed to that App's id when a check run of the same slug
+// is at the head and to no id otherwise; a person (type User); or nobody
+// known.
 func TestGetOpenPR_ListsHeadChecks(t *testing.T) {
 	t.Parallel()
 
 	conclusion := func(c string) any { return c }
+	bot := func(login string) map[string]any { return map[string]any{"login": login, "type": "Bot"} }
+	user := func(login string) map[string]any { return map[string]any{"login": login, "type": "User"} }
+	status := func(name string, poster ports.HeadCheckPoster, appID int64, state ports.HeadCheckState) ports.HeadCheck {
+		return ports.HeadCheck{Name: name, Source: ports.HeadCheckSourceStatus, AppID: appID, Poster: poster, State: state}
+	}
+	run := func(name string, appID int64, state ports.HeadCheckState) ports.HeadCheck {
+		return ports.HeadCheck{Name: name, Source: ports.HeadCheckSourceCheckRun, AppID: appID, Poster: ports.HeadCheckPosterApp, State: state}
+	}
+	const passed, pending, failed = ports.HeadCheckStatePassed, ports.HeadCheckStatePending, ports.HeadCheckStateFailed
+	const app, person, unknown = ports.HeadCheckPosterApp, ports.HeadCheckPosterPerson, ports.HeadCheckPosterUnknown
+
 	tests := []struct {
-		name             string
-		status           requiredChecksHandler
-		checkRuns        requiredChecksHandler
+		name      string
+		status    requiredChecksHandler
+		checkRuns requiredChecksHandler
+		// statusList answers the per-ref statuses listing; nil means the
+		// listing must not be requested at all.
+		statusList       requiredChecksHandler
 		wantChecks       []ports.HeadCheck
 		wantListDegraded bool
 		wantCI           ports.CIConclusion
 		wantCIDegraded   bool
 	}{
 		{
-			name: "check runs and statuses are listed with their App and state",
-			status: writeJSON(map[string]any{"state": "failure", "total_count": 4, "statuses": []map[string]any{
+			name: "check runs and statuses are listed with their App, poster and state",
+			status: writeJSON(map[string]any{"state": "failure", "total_count": 5, "statuses": []map[string]any{
 				{"context": "deploy/preview", "state": "success"},
 				{"context": "legacy/ci", "state": "pending"},
 				{"context": "legacy/lint", "state": "failure"},
 				{"context": "legacy/odd", "state": "error"},
+				{"context": "codecov/patch", "state": "success"},
 			}}),
 			checkRuns: writeJSON(map[string]any{"total_count": 10, "check_runs": []map[string]any{
-				{"name": "build", "conclusion": conclusion("success"), "app": map[string]any{"id": 15368}},
-				{"name": "docs", "conclusion": conclusion("neutral"), "app": map[string]any{"id": 15368}},
-				{"name": "optional", "conclusion": conclusion("skipped"), "app": map[string]any{"id": 15368}},
-				{"name": "test", "conclusion": nil, "app": map[string]any{"id": 15368}},
-				{"name": "flaky", "conclusion": conclusion("cancelled"), "app": map[string]any{"id": 15368}},
-				{"name": "slow", "conclusion": conclusion("timed_out"), "app": map[string]any{"id": 15368}},
+				{"name": "build", "conclusion": conclusion("success"), "app": map[string]any{"id": 15368, "slug": "github-actions"}},
+				{"name": "docs", "conclusion": conclusion("neutral"), "app": map[string]any{"id": 15368, "slug": "github-actions"}},
+				{"name": "optional", "conclusion": conclusion("skipped"), "app": map[string]any{"id": 15368, "slug": "github-actions"}},
+				{"name": "test", "conclusion": nil, "app": map[string]any{"id": 15368, "slug": "github-actions"}},
+				{"name": "flaky", "conclusion": conclusion("cancelled"), "app": map[string]any{"id": 15368, "slug": "github-actions"}},
+				{"name": "slow", "conclusion": conclusion("timed_out"), "app": map[string]any{"id": 15368, "slug": "github-actions"}},
 				{"name": "gate", "conclusion": conclusion("action_required"), "app": map[string]any{"id": 99}},
 				{"name": "old", "conclusion": conclusion("stale"), "app": map[string]any{"id": 99}},
 				{"name": "mystery", "conclusion": conclusion("something-new"), "app": map[string]any{"id": 99}},
 				{"name": "narvi/review", "conclusion": conclusion("success"), "app": map[string]any{"id": 7}},
 			}}),
+			// Newest first: legacy/ci's newest status is a person's, an
+			// older one a bot's; the newest decides.
+			statusList: writeJSON([]map[string]any{
+				{"context": "deploy/preview", "creator": bot("previews[bot]")},
+				{"context": "legacy/ci", "creator": user("octocat")},
+				{"context": "legacy/lint", "creator": bot("github-actions[bot]")},
+				{"context": "legacy/ci", "creator": bot("github-actions[bot]")},
+				{"context": "codecov/patch", "creator": bot("codecov[bot]")},
+			}),
 			wantChecks: []ports.HeadCheck{
-				{Name: "deploy/preview", Source: ports.HeadCheckSourceStatus, State: ports.HeadCheckStatePassed},
-				{Name: "legacy/ci", Source: ports.HeadCheckSourceStatus, State: ports.HeadCheckStatePending},
-				{Name: "legacy/lint", Source: ports.HeadCheckSourceStatus, State: ports.HeadCheckStateFailed},
-				{Name: "legacy/odd", Source: ports.HeadCheckSourceStatus, State: ports.HeadCheckStateFailed},
-				{Name: "build", Source: ports.HeadCheckSourceCheckRun, AppID: 15368, State: ports.HeadCheckStatePassed},
-				{Name: "docs", Source: ports.HeadCheckSourceCheckRun, AppID: 15368, State: ports.HeadCheckStatePassed},
-				{Name: "optional", Source: ports.HeadCheckSourceCheckRun, AppID: 15368, State: ports.HeadCheckStatePassed},
-				{Name: "test", Source: ports.HeadCheckSourceCheckRun, AppID: 15368, State: ports.HeadCheckStatePending},
-				{Name: "flaky", Source: ports.HeadCheckSourceCheckRun, AppID: 15368, State: ports.HeadCheckStateFailed},
-				{Name: "slow", Source: ports.HeadCheckSourceCheckRun, AppID: 15368, State: ports.HeadCheckStateFailed},
-				{Name: "gate", Source: ports.HeadCheckSourceCheckRun, AppID: 99, State: ports.HeadCheckStateFailed},
-				{Name: "old", Source: ports.HeadCheckSourceCheckRun, AppID: 99, State: ports.HeadCheckStateFailed},
-				{Name: "mystery", Source: ports.HeadCheckSourceCheckRun, AppID: 99, State: ports.HeadCheckStateFailed},
-				{Name: "narvi/review", Source: ports.HeadCheckSourceCheckRun, AppID: 7, State: ports.HeadCheckStatePassed},
+				status("deploy/preview", app, 0, passed),
+				status("legacy/ci", person, 0, pending),
+				status("legacy/lint", app, 15368, failed),
+				status("legacy/odd", unknown, 0, failed),
+				status("codecov/patch", app, 0, passed),
+				run("build", 15368, passed),
+				run("docs", 15368, passed),
+				run("optional", 15368, passed),
+				run("test", 15368, pending),
+				run("flaky", 15368, failed),
+				run("slow", 15368, failed),
+				run("gate", 99, failed),
+				run("old", 99, failed),
+				run("mystery", 99, failed),
+				run("narvi/review", 7, passed),
 			},
 			wantCI: ports.CIConclusionFailure,
+		},
+		{
+			name: "a status listing that fails leaves every poster unknown, and the conclusion untouched",
+			status: writeJSON(map[string]any{"state": "success", "total_count": 1, "statuses": []map[string]any{
+				{"context": "codecov/patch", "state": "success"},
+			}}),
+			checkRuns: writeJSON(map[string]any{"total_count": 1, "check_runs": []map[string]any{
+				{"name": "build", "conclusion": conclusion("success"), "app": map[string]any{"id": 15368, "slug": "github-actions"}},
+			}}),
+			statusList: writeStatus(http.StatusInternalServerError, `{"message":"boom"}`, nil),
+			wantChecks: []ports.HeadCheck{status("codecov/patch", unknown, 0, passed), run("build", 15368, passed)},
+			wantCI:     ports.CIConclusionSuccess,
+		},
+		{
+			name: "a status with no creator, or no account type, has an unknown poster",
+			status: writeJSON(map[string]any{"state": "success", "total_count": 2, "statuses": []map[string]any{
+				{"context": "a", "state": "success"},
+				{"context": "b", "state": "success"},
+			}}),
+			checkRuns:  writeJSON(map[string]any{"total_count": 0, "check_runs": []map[string]any{}}),
+			statusList: writeJSON([]map[string]any{{"context": "a"}, {"context": "b", "creator": map[string]any{"login": "someone"}}}),
+			wantChecks: []ports.HeadCheck{status("a", unknown, 0, passed), status("b", unknown, 0, passed)},
+			wantCI:     ports.CIConclusionSuccess,
+		},
+		{
+			name:   "a head with no commit statuses never requests the listing",
+			status: writeJSON(map[string]any{"state": "pending", "total_count": 0, "statuses": []map[string]any{}}),
+			checkRuns: writeJSON(map[string]any{"total_count": 1, "check_runs": []map[string]any{
+				{"name": "build", "conclusion": conclusion("success"), "app": map[string]any{"id": 15368, "slug": "github-actions"}},
+			}}),
+			wantChecks: []ports.HeadCheck{run("build", 15368, passed)},
+			wantCI:     ports.CIConclusionSuccess,
 		},
 		{
 			// The combined state covers every status, so the conclusion
@@ -361,12 +475,10 @@ func TestGetOpenPR_ListsHeadChecks(t *testing.T) {
 				{"context": "deploy/preview", "state": "success"},
 			}}),
 			checkRuns: writeJSON(map[string]any{"total_count": 1, "check_runs": []map[string]any{
-				{"name": "build", "conclusion": conclusion("success"), "app": map[string]any{"id": 15368}},
+				{"name": "build", "conclusion": conclusion("success"), "app": map[string]any{"id": 15368, "slug": "github-actions"}},
 			}}),
-			wantChecks: []ports.HeadCheck{
-				{Name: "deploy/preview", Source: ports.HeadCheckSourceStatus, State: ports.HeadCheckStatePassed},
-				{Name: "build", Source: ports.HeadCheckSourceCheckRun, AppID: 15368, State: ports.HeadCheckStatePassed},
-			},
+			statusList:       writeJSON([]map[string]any{{"context": "deploy/preview", "creator": user("octocat")}}),
+			wantChecks:       []ports.HeadCheck{status("deploy/preview", person, 0, passed), run("build", 15368, passed)},
 			wantListDegraded: true,
 			wantCI:           ports.CIConclusionSuccess,
 		},
@@ -376,9 +488,7 @@ func TestGetOpenPR_ListsHeadChecks(t *testing.T) {
 			checkRuns: writeJSON(map[string]any{"total_count": 1, "check_runs": []map[string]any{
 				{"name": "build", "conclusion": conclusion("success"), "app": map[string]any{"id": 15368}},
 			}}),
-			wantChecks: []ports.HeadCheck{
-				{Name: "build", Source: ports.HeadCheckSourceCheckRun, AppID: 15368, State: ports.HeadCheckStatePassed},
-			},
+			wantChecks:       []ports.HeadCheck{run("build", 15368, passed)},
 			wantListDegraded: true,
 			wantCI:           ports.CIConclusionUnknown,
 			wantCIDegraded:   true,
@@ -389,9 +499,7 @@ func TestGetOpenPR_ListsHeadChecks(t *testing.T) {
 			checkRuns: writeJSON(map[string]any{"total_count": 140, "check_runs": []map[string]any{
 				{"name": "build", "conclusion": conclusion("success"), "app": map[string]any{"id": 15368}},
 			}}),
-			wantChecks: []ports.HeadCheck{
-				{Name: "build", Source: ports.HeadCheckSourceCheckRun, AppID: 15368, State: ports.HeadCheckStatePassed},
-			},
+			wantChecks:       []ports.HeadCheck{run("build", 15368, passed)},
 			wantListDegraded: true,
 			wantCI:           ports.CIConclusionUnknown,
 			wantCIDegraded:   true,
@@ -415,6 +523,16 @@ func TestGetOpenPR_ListsHeadChecks(t *testing.T) {
 						t.Errorf("status per_page = %q, want 100", got)
 					}
 					tc.status(w, r)
+				case "/repos/acme/widgets/commits/h9/statuses":
+					if tc.statusList == nil {
+						t.Errorf("the statuses listing was requested for a head with no commit status")
+						w.WriteHeader(http.StatusNotFound)
+						return
+					}
+					if got := r.URL.Query().Get("per_page"); got != "100" {
+						t.Errorf("statuses listing per_page = %q, want 100", got)
+					}
+					tc.statusList(w, r)
 				case "/repos/acme/widgets/commits/h9/check-runs":
 					tc.checkRuns(w, r)
 				default:
@@ -438,5 +556,33 @@ func TestGetOpenPR_ListsHeadChecks(t *testing.T) {
 				t.Errorf("CI = (%v, degraded %v), want (%v, degraded %v)", pr.CIConclusion, pr.CIConclusionDegraded, tc.wantCI, tc.wantCIDegraded)
 			}
 		})
+	}
+}
+
+// TestGetOpenPR_NoHeadSHA_ListingIncomplete pins that a pull request whose
+// head could not be read has its check listing marked incomplete, never
+// read as "no checks at the head": nothing was read.
+func TestGetOpenPR_NoHeadSHA_ListingIncomplete(t *testing.T) {
+	t.Parallel()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/repos/acme/widgets/pulls/9":
+			writeJSON(map[string]any{"number": 9, "state": "open", "head": map[string]any{"sha": ""}, "base": map[string]any{"ref": "main"}})(w, r)
+		case "/repos/acme/widgets/pulls/9/reviews", "/repos/acme/widgets/pulls/9/files":
+			writeJSON([]map[string]any{})(w, r)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	pr, found, err := githubapi.New(server.Client(), server.URL).GetOpenPR(context.Background(), "acme", "widgets", 9, "tok")
+	if err != nil || !found {
+		t.Fatalf("GetOpenPR() = (found %v, err %v), want found and no error", found, err)
+	}
+	if !pr.HeadChecksListDegraded || len(pr.HeadChecks) != 0 || pr.CIConclusion != ports.CIConclusionUnknown {
+		t.Errorf("GetOpenPR() = (HeadChecks %+v, listing degraded %v, CI %v), want no checks, a degraded listing and CI unknown", pr.HeadChecks, pr.HeadChecksListDegraded, pr.CIConclusion)
 	}
 }

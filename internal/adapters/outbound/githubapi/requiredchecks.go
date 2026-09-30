@@ -53,8 +53,9 @@ import (
 const requiredCheckRulesPerPage = 100
 
 // maxRequiredCheckRulePages bounds how many pages of rules one read
-// follows. A branch with more active rules than this reads as failed,
-// never as the prefix that was read.
+// follows. A branch with more pages of active rules than this reads as
+// failed, never as the prefix that was read. Exactly this many full pages
+// is not more: the next page is read to tell, and must be empty.
 const maxRequiredCheckRulePages = 5
 
 // branchWithProtectionResponse is the subset of GitHub's GET
@@ -147,10 +148,13 @@ func (a *Adapter) requiredChecksFromBranchProtection(ctx context.Context, spec p
 
 func (a *Adapter) requiredChecksFromRulesets(ctx context.Context, spec ports.ListRequiredChecksSpec) ([]ports.RequiredCheck, error) {
 	var out []ports.RequiredCheck
-	for page := 1; page <= maxRequiredCheckRulePages; page++ {
+	for page := 1; ; page++ {
 		path := fmt.Sprintf("%s/repos/%s/%s/rules/branches/%s?per_page=%d&page=%d", a.apiBaseURL, url.PathEscape(spec.Owner), url.PathEscape(spec.Repo), url.PathEscape(spec.Branch), requiredCheckRulesPerPage, page)
 		body, err := a.doGet(ctx, path, spec.Token)
 		if err != nil {
+			// The plan's answer comes on the first page or not at all: a
+			// later page answering it is a failed read, never a branch that
+			// suddenly requires nothing.
 			if page == 1 && isPlanUnavailable(err) {
 				return nil, nil
 			}
@@ -159,6 +163,12 @@ func (a *Adapter) requiredChecksFromRulesets(ctx context.Context, spec ports.Lis
 		var rules []branchRuleResponse
 		if err := json.Unmarshal(body, &rules); err != nil {
 			return nil, fmt.Errorf("decode rules page %d: %w", page, err)
+		}
+		if page > maxRequiredCheckRulePages {
+			if len(rules) == 0 {
+				return out, nil
+			}
+			return nil, fmt.Errorf("more than %d pages of rules apply to the branch", maxRequiredCheckRulePages)
 		}
 		for _, rule := range rules {
 			if rule.Type != requiredStatusChecksRuleType {
@@ -176,7 +186,6 @@ func (a *Adapter) requiredChecksFromRulesets(ctx context.Context, spec ports.Lis
 			return out, nil
 		}
 	}
-	return nil, fmt.Errorf("more than %d pages of rules apply to the branch", maxRequiredCheckRulePages)
 }
 
 // namedAppID is the App a requirement names: a positive id, or zero for
