@@ -285,6 +285,14 @@ func dispatchNextAttempt(ctx context.Context, deps Deps, runID pgtype.UUID, toSt
 // a notice -- every later call finds claimed == 0 and sends nothing
 // further, so hitting needs_review is observable exactly once.
 func escalateRun(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, sessionRow sqlcgen.Session) (Outcome, error) {
+	return escalateRunWithNotice(ctx, deps, runRow, sessionRow, escalationNoticeText(runRow.ID))
+}
+
+// escalateRunWithNotice is escalateRun with the notice text chosen by the
+// caller: OnTurnRefused (refusal.go) names the refusal instead of
+// escalationNoticeText's two causes. The one-time claim is the same, so a
+// run is still notified at most once, whichever cause escalates it first.
+func escalateRunWithNotice(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, sessionRow sqlcgen.Session, notice string) (Outcome, error) {
 	logger := platform.Logger(ctx)
 
 	run, err := deps.Workflows.EscalateRun(ctx, runRow.ID)
@@ -307,7 +315,7 @@ func escalateRun(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, ses
 		return Outcome{RunStatus: string(run.Status)}, nil
 	}
 
-	if err := enqueueWorkflowNotice(ctx, deps, sessionRow, escalationNoticeText(runRow.ID)); err != nil {
+	if err := enqueueWorkflowNotice(ctx, deps, sessionRow, notice); err != nil {
 		logger.Error("workflowengine: enqueue workflow run escalation notice failed", "run_id", runRow.ID.String(), "error", err)
 	}
 	return Outcome{RunStatus: string(run.Status)}, nil

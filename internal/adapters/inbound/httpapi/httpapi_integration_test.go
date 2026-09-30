@@ -999,7 +999,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	// scm-credentials -- see providercredentialsdelivery.go's own doc
 	// comment.
 	router.Post("/sessions/{sessionID}/provider-credentials",
-		httpapi.ProviderCredentialsDelivery(rig.sessions, rig.sandboxes, rig.providerCredentials, rig.tokenEncryptionKey))
+		httpapi.ProviderCredentialsDelivery(rig.sessions, rig.sandboxes, rig.prSessions, rig.providerCredentials, rig.tokenEncryptionKey))
 	// /api/repos/{owner}/{repo}/sandbox-secrets,
 	// /api/environments/{environmentID}/sandbox-secrets,
 	// /api/sandbox-secrets, and their sandbox-facing delivery route

@@ -526,7 +526,7 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 	// session, or a non-'web'-origin session whose own reverse-lookup row
 	// is missing -- see enqueueOutboxNotification's own doc comment
 	// (outboxenqueue.go).
-	if err := a.enqueueOutboxNotification(ctx, tx, sessionRow, trig, failureReason, processing, plan); err != nil {
+	if err := a.enqueueOutboxNotification(ctx, tx, sessionRow, trig, failureReason, processing, plan, ""); err != nil {
 		return nil, err
 	}
 

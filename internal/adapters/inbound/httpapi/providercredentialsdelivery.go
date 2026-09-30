@@ -39,7 +39,11 @@
 //     providercredential.Resolve over every candidate row (across all 4
 //     scopes, including §8.8's own ScopeUser) that could apply to this
 //     session's own repo(s)/environment/creator, decrypted server-side
-//     (the ONLY layer that ever holds cfg.TokenEncryptionKey). A provider
+//     -- the creator's ScopeUser rows only when providercredential.
+//     UserScopeTarget says this session reads them: never for a pull
+//     request's review session, a child session or a session with no
+//     creator (§29.4, §45.1) -- (the ONLY layer that ever holds
+//     cfg.TokenEncryptionKey). A provider
 //     with nothing configured at any scope is simply ABSENT from the map
 //     -- never a null/empty-string entry, and never itself an error: the
 //     overwhelming common case is zero rows configured for any given
@@ -81,6 +85,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/credentialscope"
 	"github.com/narvidev/narvi/internal/domain/providercredential"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/sandbox"
@@ -182,6 +187,7 @@ func sessionRepoFullNames(rawRepos []byte) ([]string, error) {
 func ProviderCredentialsDelivery(
 	sessions *postgres.SessionStore,
 	sandboxes *postgres.SandboxStore,
+	prSessions *postgres.GitHubPRSessionStore,
 	providerCredentials *postgres.ProviderCredentialStore,
 	tokenEncryptionKey []byte,
 ) http.HandlerFunc {
@@ -240,31 +246,24 @@ func ProviderCredentialsDelivery(
 			return
 		}
 
-		repoFullNames, err := sessionRepoFullNames(sessionRow.Repos)
+		// §29.4: resolution keys on sessions.created_by, through the one
+		// rule (providercredential.UserScopeTarget) the counter-reviewer's
+		// own read shares: a session with no creator (an automation's), a
+		// pull request's review session and a child session contribute no
+		// user-scope candidate and resolve the deployment's credentials
+		// alone. The review-session membership is read here, from
+		// github_pr_sessions, beside the session row just loaded; a failed
+		// read is a 500, never "not a review session", which would serve
+		// a requester's personal link.
+		scope, err := credentialscope.Load(ctx, prSessions, sessionRow)
 		if err != nil {
-			logger.Error("httpapi: provider-credentials: parse session repos failed", "error", err)
+			logger.Error("httpapi: provider-credentials: load credential scope failed", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
+		repoFullNames := scope.RepoFullNames
 
-		var environmentID *string
-		if sessionRow.EnvironmentID.Valid {
-			id := sessionRow.EnvironmentID.String()
-			environmentID = &id
-		}
-
-		// (§29.4): "resolution keys on sessions.created_by" --
-		// nil for a bot/automation session (CreatedBy invalid, migration
-		// 000004's own comment), which simply contributes no user-scope
-		// candidate below, falling through to the static-key scopes
-		// exactly as before this Step existed.
-		var userID *string
-		if sessionRow.CreatedBy.Valid {
-			id := sessionRow.CreatedBy.String()
-			userID = &id
-		}
-
-		rows, err := providerCredentials.ListForResolution(ctx, repoFullNames, environmentID, userID)
+		rows, err := scope.Candidates(ctx, providerCredentials)
 		if err != nil {
 			logger.Error("httpapi: provider-credentials: list candidates failed", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
@@ -273,8 +272,8 @@ func ProviderCredentialsDelivery(
 
 		// repoRank maps each of this session's own repo full names to its
 		// position in repoFullNames (already primary-first -- see
-		// sessionRepoFullNames' own doc comment, §3.4 "position 0 =
-		// primary") -- used ONLY below to make the ScopeRepo tie-break
+		// credentialscope.Scope.RepoFullNames' own doc comment, §3.4
+		// "position 0 = primary") -- used ONLY below to make the ScopeRepo tie-break
 		// deterministic. ListProviderCredentialsForResolution's own SQL
 		// query (queries/providercredentials.sql) has no secondary ORDER BY
 		// key beyond `provider`, so two same-provider, different-repo rows

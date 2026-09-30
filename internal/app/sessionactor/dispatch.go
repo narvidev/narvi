@@ -413,6 +413,22 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, er
 		// condition.
 		entries := toQueueEntries(turns)
 		pendingID, hasPending := turn.NextToDispatch(entries)
+
+		// Technical plan §29.4: a pending turn whose model only a personal
+		// provider link could run, in a session that never resolves that
+		// link (a pull request's review session, a child session), is
+		// refused here, named, before anything is spawned or sent for it
+		// (credentialgate.go). The turns and the pending pick are re-read
+		// when one is; a turn the refusal itself queued waits for the next
+		// round.
+		gen := 0
+		if hasSandbox {
+			gen = int(sandboxRow.Gen)
+		}
+		if turns, pendingID, hasPending, err = a.refusePersonalLinkOnlyPending(ctx, tx, sessionRow, turns, pendingID, hasPending, gen, now, a.refusePersonalLinkOnly); err != nil {
+			return err
+		}
+		entries = toQueueEntries(turns)
 		if !hasPending {
 			// §3.3 ("turn recovery", §9.3 scenario #2): no dispatchable
 			// Pending turn -- but there may still be an in-flight

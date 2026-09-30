@@ -159,6 +159,24 @@ func NextStep(def Definition, currentStepID ID, outcome StepOutcomeStatus) (Next
 	return Next{Kind: NextEscalate}, nil
 }
 
+// NextStepAfterRefusal is the machine's row for an attempt the platform
+// refused before it ever ran -- its model could run only on a credential
+// the session never resolves, say (technical plan §29.4). A refusal is not
+// a StepOutcomeStatus the step reported: the step never ran, so no Edge
+// conditions on it (Edges condition only on StepOutcomeStatus, §25.4), and
+// retrying cannot succeed until a person changes the configuration. So the
+// run always escalates to a human (NextEscalate, §25.4's fail-conservative
+// consequence), whatever edges the definition wires -- a blocked or
+// needs_fix edge, a self edge included, is never followed: following one
+// would queue the same refused attempt again, a retry loop with nothing to
+// end it. Unknown steps are refused exactly as NextStep refuses them.
+func NextStepAfterRefusal(def Definition, currentStepID ID) (Next, error) {
+	if _, ok := stepByID(def, currentStepID); !ok {
+		return Next{}, &UnknownStepError{DefinitionID: def.ID, StepID: currentStepID}
+	}
+	return Next{Kind: NextEscalate}, nil
+}
+
 // stepByID finds the step with the given id. A linear scan: a
 // definition's step count is small by construction (the largest shape
 // §25 names is 4 steps), so no index map is worth building per call.

@@ -218,3 +218,52 @@ func TestNextKind_String(t *testing.T) {
 		}
 	}
 }
+
+// TestNextStepAfterRefusal pins the machine's row for an attempt the
+// platform refused before it ran: it escalates on every shape, whatever
+// edge the step carries for any outcome -- a blocked self edge, a
+// needs_fix self-loop, a forward or backward edge -- where NextStep
+// itself would follow the edge.
+func TestNextStepAfterRefusal(t *testing.T) {
+	t.Parallel()
+
+	blockedSelfEdge := func() workflow.Definition {
+		d := validSingleStep()
+		d.IsBuiltIn = false
+		d.Steps[0].Edges = []workflow.Edge{{FromStepID: "s1", OnStatus: workflow.StepOutcomeBlocked, ToStepID: "s1"}}
+		return d
+	}
+	tests := []struct {
+		name    string
+		def     func() workflow.Definition
+		current workflow.ID
+	}{
+		{"single step, no edges", validSingleStep, "s1"},
+		{"a blocked self edge is never followed", blockedSelfEdge, "s1"},
+		{"a needs_fix self-loop is never followed", validPlanShape, "plan"},
+		{"a needs_fix forward edge is never followed", validAuditLoopShape, "audit"},
+		{"an ok backward edge is never followed", validAuditLoopShape, "fix"},
+		{"a middle step never advances by Order", validAuditLoopShape, "build"},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			got, err := workflow.NextStepAfterRefusal(tc.def(), tc.current)
+			if err != nil {
+				t.Fatalf("NextStepAfterRefusal() error = %v, want nil", err)
+			}
+			if got != (workflow.Next{Kind: workflow.NextEscalate}) {
+				t.Errorf("NextStepAfterRefusal() = %+v, want an escalation", got)
+			}
+		})
+	}
+
+	if _, err := workflow.NextStepAfterRefusal(validSingleStep(), "ghost"); !errors.Is(err, workflow.ErrUnknownStep) {
+		t.Errorf("NextStepAfterRefusal(unknown step) error = %v, want ErrUnknownStep", err)
+	}
+	if next, _ := workflow.NextStep(blockedSelfEdge(), "s1", workflow.StepOutcomeBlocked); next.Kind != workflow.NextAdvance {
+		t.Errorf("control: NextStep on the blocked self edge = %+v, want it followed", next)
+	}
+}

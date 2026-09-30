@@ -175,9 +175,7 @@ func Spawn(
 		return Result{}, fmt.Errorf("opencodeproc: allocate ephemeral port: %w", err)
 	}
 
-	env := supervisor.EnvWithout(boot.SessionConfigEnvVar)
-	env = append(env, sandboxSecretEnv...)
-	env = append(env, providerCredentialEnv...)
+	env := Env(providerCredentialEnv, sandboxSecretEnv)
 
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path: "opencode",
@@ -214,6 +212,18 @@ func Spawn(
 		Version: discoverVersion(ctx, baseURL, readinessTimeout),
 		Process: proc,
 	}, nil
+}
+
+// Env is the environment Spawn starts `opencode serve` with: this
+// process's own, minus NARVI_SESSION_CONFIG, then sandboxSecretEnv, then
+// providerCredentialEnv -- the recorded order Spawn's own doc comment
+// states, a later assignment of a name winning. Exported so a caller can
+// resolve what that process will read (AuthStoreFor) from exactly the
+// environment it will get.
+func Env(providerCredentialEnv, sandboxSecretEnv []string) []string {
+	env := supervisor.EnvWithout(boot.SessionConfigEnvVar)
+	env = append(env, sandboxSecretEnv...)
+	return append(env, providerCredentialEnv...)
 }
 
 // freePort binds to 127.0.0.1:0, reads back the ephemeral port the kernel

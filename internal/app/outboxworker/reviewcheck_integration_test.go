@@ -77,6 +77,9 @@ type fakeCheckRun struct {
 	// mutated by UpdateCheckRun (GitHub's own PATCH endpoint does not
 	// accept it either), exactly like Name/HeadSHA beside it.
 	ExternalID string
+	// Summary is the check run's output.summary as last written, by the
+	// create or by an update that carried an output.
+	Summary string
 }
 
 // fakeCheckRunGitHub is an in-memory stand-in for GitHub's real Checks
@@ -180,7 +183,7 @@ func (f *fakeCheckRunGitHub) server() *httptest.Server {
 			status, _ := body["status"].(string)
 			conclusion, _ := body["conclusion"].(string)
 			externalID, _ := body["external_id"].(string)
-			f.runs[id] = &fakeCheckRun{Name: name, HeadSHA: headSHA, AppID: f.appID, Status: status, Conclusion: conclusion, ExternalID: externalID}
+			f.runs[id] = &fakeCheckRun{Name: name, HeadSHA: headSHA, AppID: f.appID, Status: status, Conclusion: conclusion, ExternalID: externalID, Summary: outputSummary(body)}
 			f.creates++
 			appID := f.appID
 			f.mu.Unlock()
@@ -212,6 +215,9 @@ func (f *fakeCheckRunGitHub) server() *httptest.Server {
 					run.Conclusion = conclusion
 				} else {
 					run.Conclusion = ""
+				}
+				if _, present := body["output"]; present {
+					run.Summary = outputSummary(body)
 				}
 			}
 			f.updates++
@@ -288,7 +294,15 @@ func (f *fakeCheckRunGitHub) stateFor(id int64) map[string]any {
 	if !ok {
 		return nil
 	}
-	return map[string]any{"status": run.Status, "conclusion": run.Conclusion, "name": run.Name, "head_sha": run.HeadSHA, "app_id": run.AppID, "external_id": run.ExternalID}
+	return map[string]any{"status": run.Status, "conclusion": run.Conclusion, "name": run.Name, "head_sha": run.HeadSHA, "app_id": run.AppID, "external_id": run.ExternalID, "summary": run.Summary}
+}
+
+// outputSummary reads a create/update request body's output.summary, ""
+// when it carries none.
+func outputSummary(body map[string]any) string {
+	output, _ := body["output"].(map[string]any)
+	summary, _ := output["summary"].(string)
+	return summary
 }
 
 func (f *fakeCheckRunGitHub) counts() (creates, updates int32) {
