@@ -821,8 +821,6 @@ func TestLockHolder_InstallsOnlyOnceTheOrphanTerminateHasReturned(t *testing.T) 
 // Log lines the tests of the wait for an orphan to end look for.
 const (
 	logOrphanOutlastedWait = "sessionactor: the backend a lost lock connection left behind was not seen to end within the wait for it; until it does, or the server's keepalives end it, its advisory locks keep its sessions from every replica"
-	logOrphanNoWaitServer  = "sessionactor: this server cannot wait for a terminated backend to end (Postgres before 14); the lost lock connection's backend is only signalled"
-	logOrphanSignalled     = "sessionactor: signalled the backend a lost lock connection left behind, still holding its advisory locks, to end"
 	logLockDialFailed      = "sessionactor: could not dial the lock connection"
 )
 
@@ -1013,56 +1011,6 @@ func TestLockHolder_AnOrphanThatOutlastsTheWaitDoesNotHoldUpTheDial(t *testing.T
 		t.Fatalf("GetOrSpawn for the session the orphan still holds = %v, want ErrSessionActorElsewhere", err)
 	}
 	release()
-	waitUntil(t, 5*time.Second, func() bool {
-		_, err := r.GetOrSpawn(ctx, sessionID)
-		return err == nil
-	})
-}
-
-// TestLockHolder_ServerBefore14OnlySignalsTheOrphan (T28) proves the
-// terminate after a loss still ends the orphan on a server older than
-// Postgres 14, which has no pg_terminate_backend that waits and refuses the
-// statement that calls one (SQLSTATE 42883, undefined function): the
-// refusal is logged, the orphan is signalled without the wait, and the new
-// connection installed. Only Postgres 17 runs here, so the older server is
-// stood in for by a statement that calls, in the waiting form's place, a
-// function no server has, which any server refuses the same way. A dial
-// that took the refusal for any other failed terminate would leave the
-// orphan, and every session it held, to the server's keepalives.
-func TestLockHolder_ServerBefore14OnlySignalsTheOrphan(t *testing.T) {
-	ctx := context.Background()
-	admin, connStr := IntegrationTestPoolAndConnStr(t)
-	sessionID := createTestSession(ctx, t, admin)
-	orphan, _ := lockingStandIn(ctx, t, connStr, sessionID)
-
-	const waiting = "pg_terminate_backend(pid, $4)"
-	if n := strings.Count(terminateOrphanQuery, waiting); n != 1 {
-		t.Fatalf("terminateOrphanQuery calls %s %d times, want once to stand in for", waiting, n)
-	}
-	before14 := strings.Replace(terminateOrphanQuery, waiting, "narvi_no_such_terminate(pid, $4)", 1)
-
-	logs := captureDefaultLoggerJSONSync(t)
-	r := newLockTestRegistry(ctx, t, newLockTestPool(ctx, t, connStr, 2), lockTestShippedTimeouts(t))
-	r.locks.setTerminateSQLForTest(t, before14)
-	r.locks.setOrphanForTest(orphan)
-	r.locks.startDial()
-
-	waitUntil(t, 5*time.Second, func() bool { return r.locks.backendPIDForTest() != 0 })
-	refusal := waitForLogEntry(t, logs, 5*time.Second, logOrphanNoWaitServer)
-	if got, _ := refusal["error"].(string); !strings.Contains(got, "42883") {
-		t.Errorf("the waiting terminate's refusal logged error %q, want SQLSTATE 42883 (undefined function)", got)
-	}
-	signalledAt, establishedAt := logIndex(t, logs, logOrphanSignalled), logIndex(t, logs, logLockConnEstablished)
-	if signalledAt < 0 || establishedAt < signalledAt {
-		t.Fatalf("log order: %q at line %d, %q at line %d; want the signal first", logOrphanSignalled, signalledAt, logLockConnEstablished, establishedAt)
-	}
-	if i := logIndex(t, logs, logLockDialFailed); i >= 0 {
-		t.Fatalf("a lock dial failed: log line %d", i)
-	}
-	if got := r.locks.orphanForTest(); got != nil {
-		t.Fatalf("the orphan %+v is still recorded after a dial dealt with it", *got)
-	}
-	waitUntil(t, 5*time.Second, func() bool { return !lockBackendAlive(ctx, t, admin, uint32(orphan.pid)) })
 	waitUntil(t, 5*time.Second, func() bool {
 		_, err := r.GetOrSpawn(ctx, sessionID)
 		return err == nil

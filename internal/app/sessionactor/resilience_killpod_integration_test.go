@@ -100,7 +100,7 @@ func newTestPoolPair(t *testing.T) (poolA, poolB *pgxpool.Pool) {
 	startCh := make(chan containerStartResult, 1)
 	var startGroup errgroup.Group
 	startGroup.Go(func() error {
-		container, err := tcpostgres.Run(startCtx, "postgres:17-alpine",
+		container, err := tcpostgres.Run(startCtx, testPostgresImage(),
 			tcpostgres.WithDatabase("narvi_test"),
 			tcpostgres.WithUsername("narvi"),
 			tcpostgres.WithPassword("narvi"),

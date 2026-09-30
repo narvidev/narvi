@@ -1,7 +1,8 @@
 // This file (seed.go) implements the "seed" subcommand (
 // "config/data seeding", §10-P6, §13.4): `control-plane seed -manifest
 // <path> [-dry-run]`. Thin by design -- flag parsing, config load, DB
-// pool + migrations (the SAME applyMigrations helper serve() itself
+// pool, the Postgres version check + migrations (the SAME
+// requireSupportedPostgres and applyMigrations helpers serve() itself
 // calls, reused unchanged), then a single call into internal/app/seed.Run,
 // which owns every actual decision. See internal/app/seed/doc.go for the
 // full "why this lives here, not its own cmd/ binary" writeup (deps.go's
@@ -66,6 +67,13 @@ func runSeedCommand(args []string) error {
 		return fmt.Errorf("open postgres pool: %w", err)
 	}
 	defer pool.Close()
+
+	// The same refusal serve() makes of a server older than
+	// platform.MinPostgresServerVersionNum, before any migration runs
+	// against it (§5.1).
+	if err := requireSupportedPostgres(ctx, pool, cfg.Timeouts.PostgresVersionCheckTimeout); err != nil {
+		return err
+	}
 
 	// Mirrors serve()'s own boot-time migration call exactly (same
 	// helper, same "safe to call on every boot regardless of replica
