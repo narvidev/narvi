@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"reflect"
 	"slices"
 	"strconv"
 	"strings"
@@ -2505,4 +2506,86 @@ func TestLoadGitHubAPIBaseURL(t *testing.T) {
 			})
 		}
 	})
+}
+
+// TestLoadStoresTheBotTokenOnlyInGitHubOutbound is the structural half of
+// §12.5's outbound axis that a guard over other packages cannot see: Load
+// keeps the bot token in *GitHubOutboundConfig and NOWHERE else in Config
+// -- no string field a consumer could read around the typed config (the
+// shape Config.GitHubBotToken had) -- and, with GitHub outbound off, does
+// not keep it at all (rule R5), even when the variable is set. Walks every
+// field of the loaded Config by reflection, unexported ones included,
+// skipping only the one place the token belongs.
+func TestLoadStoresTheBotTokenOnlyInGitHubOutbound(t *testing.T) {
+	const token = "gho_only-in-the-outbound-config"
+	tests := []struct {
+		name         string
+		ingress      *string
+		outbound     *string
+		wantOutbound bool
+	}{
+		{name: "outbound on by default", wantOutbound: true},
+		{name: "outbound off with the token set", ingress: ptr("slack,linear"), outbound: ptr("")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			setRequiredEnv(t)
+			setOrUnsetEnv(t, "NARVI_INGRESS_ENABLED", tc.ingress)
+			setOrUnsetEnv(t, "NARVI_OUTBOUND_ENABLED", tc.outbound)
+			t.Setenv("NARVI_GITHUB_BOT_TOKEN", token)
+			if tc.ingress != nil {
+				t.Setenv("NARVI_GITHUB_WEBHOOK_SECRET", "")
+				t.Setenv("NARVI_GITHUB_BOT_HANDLE", "")
+			}
+
+			cfg, err := platform.Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v, want nil", err)
+			}
+			if got := cfg.GitHubOutbound != nil; got != tc.wantOutbound {
+				t.Fatalf("Load().GitHubOutbound != nil = %v, want %v", got, tc.wantOutbound)
+			}
+
+			var holders []string
+			collectStringsHolding(reflect.ValueOf(*cfg), "Config", token, 0, &holders)
+			if len(holders) > 0 {
+				t.Errorf("the bot token is stored outside Config.GitHubOutbound, at %v -- consumers must receive it only as *platform.GitHubOutboundConfig", holders)
+			}
+		})
+	}
+}
+
+// collectStringsHolding appends to holders the path of every string within v
+// that contains needle, descending through structs, pointers, slices, arrays,
+// maps and interfaces -- but never into a *platform.GitHubOutboundConfig, the
+// one place the bot token is allowed to live.
+func collectStringsHolding(v reflect.Value, path, needle string, depth int, holders *[]string) {
+	if depth > 12 || !v.IsValid() {
+		return
+	}
+	switch v.Kind() {
+	case reflect.String:
+		if strings.Contains(v.String(), needle) {
+			*holders = append(*holders, path)
+		}
+	case reflect.Pointer, reflect.Interface:
+		if v.IsNil() || v.Type() == reflect.TypeOf((*platform.GitHubOutboundConfig)(nil)) {
+			return
+		}
+		collectStringsHolding(v.Elem(), path, needle, depth+1, holders)
+	case reflect.Struct:
+		for i := 0; i < v.NumField(); i++ {
+			collectStringsHolding(v.Field(i), path+"."+v.Type().Field(i).Name, needle, depth+1, holders)
+		}
+	case reflect.Slice, reflect.Array:
+		for i := 0; i < v.Len(); i++ {
+			collectStringsHolding(v.Index(i), fmt.Sprintf("%s[%d]", path, i), needle, depth+1, holders)
+		}
+	case reflect.Map:
+		iter := v.MapRange()
+		for iter.Next() {
+			collectStringsHolding(iter.Key(), path+"{key}", needle, depth+1, holders)
+			collectStringsHolding(iter.Value(), path+"{value}", needle, depth+1, holders)
+		}
+	}
 }

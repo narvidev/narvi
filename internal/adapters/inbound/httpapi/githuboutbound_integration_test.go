@@ -68,16 +68,18 @@ func TestGetReviewReadout_GitHubOutboundOff_NoLiveRead(t *testing.T) {
 	session := rig.createOwnedGitHubReviewSession(ctx, t, owner.ID, repoFullName, 11)
 	verdictAt(ctx, t, rig, session.ID, repoFullName, 11, pgtype.UUID{}, "outbound-off-head", currentContext())
 
-	var got restdtos.ReviewReadout
+	// Decoded loosely: the seeded verdict carries no digest, which the
+	// generated DTO's own validation would refuse -- irrelevant here.
+	var got map[string]any
 	status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/review", nil, &got, token)
 	if status != http.StatusOK {
 		t.Fatalf("status = %d, want %d", status, http.StatusOK)
 	}
-	if got.LatestVerdict == nil {
-		t.Fatal("LatestVerdict = nil, want the recorded verdict -- without it the diff re-fetch path this test guards is never reached")
+	if got["latestVerdict"] == nil {
+		t.Fatal("latestVerdict = null, want the recorded verdict -- without it the diff re-fetch path this test guards is never reached")
 	}
-	if got.PrTitle != nil || got.VisualQa != nil {
-		t.Errorf("PrTitle = %v, VisualQa = %v, want both nil (the live read is not available with GitHub outbound off)", got.PrTitle, got.VisualQa)
+	if got["prTitle"] != nil || got["visualQa"] != nil {
+		t.Errorf("prTitle = %v, visualQa = %v, want both null (the live read is not available with GitHub outbound off)", got["prTitle"], got["visualQa"])
 	}
 	if n := fetcher.calls.Load(); n != 0 {
 		t.Errorf("code host called %d times, want 0", n)
