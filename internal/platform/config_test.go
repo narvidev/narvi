@@ -2675,9 +2675,7 @@ func collectStringsHolding(v reflect.Value, path, needle string, depth int, hold
 // unset is the built-in default, set replaces it, set to empty excludes
 // nothing, and an entry that cannot mean what it says refuses to boot.
 func TestLoadReviewSizeExcludedPaths(t *testing.T) {
-	empty := ""
-	custom := " *_test.go , **/fixtures/** ,, vendor/**"
-	negated := "*_test.go,!docs/keep.md"
+	str := func(s string) *string { return &s }
 	tests := []struct {
 		name      string
 		value     *string
@@ -2685,9 +2683,13 @@ func TestLoadReviewSizeExcludedPaths(t *testing.T) {
 		wantError string
 	}{
 		{name: "unset is the built-in default", value: nil, want: reviewtriage.DefaultSizeExclusions()},
-		{name: "set replaces the default", value: &custom, want: []string{"*_test.go", "**/fixtures/**", "vendor/**"}},
-		{name: "set to empty excludes nothing", value: &empty, want: []string{}},
-		{name: "a negated entry refuses to boot", value: &negated, wantError: `invalid entry "!docs/keep.md" in NARVI_REVIEW_SIZE_EXCLUDED_PATHS`},
+		{name: "set replaces the default", value: str(" *_test.go , **/fixtures/** ,, vendor/**, my dir/*.md"), want: []string{"*_test.go", "**/fixtures/**", "vendor/**", "my dir/*.md"}},
+		{name: "set to empty excludes nothing", value: str(""), want: []string{}},
+		{name: "a negated entry refuses to boot", value: str("*_test.go,!docs/keep.md"), wantError: `invalid entry "!docs/keep.md" in NARVI_REVIEW_SIZE_EXCLUDED_PATHS: the pattern dialect has no negation`},
+		{name: "a character class refuses to boot", value: str("[Tt]est/**"), wantError: `invalid entry "[Tt]est/**" in NARVI_REVIEW_SIZE_EXCLUDED_PATHS: the pattern dialect has no character class`},
+		{name: "a brace list refuses to boot", value: str("*.{md,rst}"), wantError: `invalid entry "*.{md" in NARVI_REVIEW_SIZE_EXCLUDED_PATHS: the pattern dialect has no brace list`},
+		{name: "an escape refuses to boot", value: str(`docs\*.md`), wantError: `the pattern dialect has no escape`},
+		{name: "a comment refuses to boot", value: str("#generated"), wantError: `the pattern dialect has no comment`},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

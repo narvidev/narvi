@@ -718,8 +718,8 @@ const gitHubImageBuildTokenEnvVarName = "NARVI_GITHUB_IMAGE_BUILD_TOKEN"
 const reviewModelDeepEnvVarName = "NARVI_REVIEW_MODEL_DEEP"
 
 // reviewSizeExcludedPathsEnvVarName configures §26.3's size rule: the
-// comma-separated test, documentation and generated-file patterns whose
-// files are left out of the line count a review is routed on (the path
+// comma-separated file patterns whose files are left out of the line
+// count a review is routed on (the path
 // signals -- sensitive globs, root dispersion -- still read every changed
 // path). A deployment-level list, like NARVI_REVIEW_MODEL_DEEP above, not a
 // repo_settings column: the row that asked for it names patterns "this
@@ -733,10 +733,14 @@ const reviewModelDeepEnvVarName = "NARVI_REVIEW_MODEL_DEEP"
 // difference, the same shape NARVI_INGRESS_ENABLED has.
 //
 // Patterns are the gitignore dialect internal/domain/codeowners
-// implements ("*_test.go", "**/docs/**"). A pattern starting with "!" is
-// refused at boot (InvalidReviewSizeExcludedPathError): that dialect has
-// no negation, so the entry would be read as a literal file name and
-// silently never match what its author meant.
+// implements ("*_test.go", "**/fixtures/**"). An entry using a construct
+// that dialect does not implement -- a leading "!" (negation), "[...]" (a
+// character class), "{a,b}" (a brace list, which the comma split would cut
+// in two anyway), a backslash (an escape) or a leading "#" (a comment) --
+// is refused at boot (InvalidReviewSizeExcludedPathError, naming the
+// construct): the dialect would read it as literal text, and the entry
+// would silently never match what its author meant. A path that really
+// contains one of those characters is matched with "*" in its place.
 const reviewSizeExcludedPathsEnvVarName = "NARVI_REVIEW_SIZE_EXCLUDED_PATHS"
 
 // InvalidReviewSizeExcludedPathError is returned by Load when an entry of
@@ -744,10 +748,13 @@ const reviewSizeExcludedPathsEnvVarName = "NARVI_REVIEW_SIZE_EXCLUDED_PATHS"
 // (reviewSizeExcludedPathsEnvVarName's own doc comment).
 type InvalidReviewSizeExcludedPathError struct {
 	Value string
+	// Construct names the unsupported construct the entry uses
+	// (reviewtriage.UnsupportedSizeExclusionConstruct).
+	Construct string
 }
 
 func (e *InvalidReviewSizeExcludedPathError) Error() string {
-	return fmt.Sprintf("invalid entry %q in %s: negation (\"!\") is not supported, list only the paths to leave out of the review size", e.Value, reviewSizeExcludedPathsEnvVarName)
+	return fmt.Sprintf("invalid entry %q in %s: the pattern dialect has no %s, so the entry would never match what it says; write the pattern with \"*\" and \"**\" only", e.Value, reviewSizeExcludedPathsEnvVarName, e.Construct)
 }
 
 // gitHubReReviewLabelEnvVarName configures §8.2's ("review sessions",
@@ -2657,8 +2664,8 @@ func load(lookupEnv func(string) (string, bool)) (*Config, error) {
 	if raw, isSet := lookupEnv(reviewSizeExcludedPathsEnvVarName); isSet {
 		reviewSizeExcludedPaths = []string{}
 		for _, entry := range parseCommaSeparatedList(raw) {
-			if strings.HasPrefix(entry, "!") {
-				errs = append(errs, &InvalidReviewSizeExcludedPathError{Value: entry})
+			if construct, bad := reviewtriage.UnsupportedSizeExclusionConstruct(entry); bad {
+				errs = append(errs, &InvalidReviewSizeExcludedPathError{Value: entry, Construct: construct})
 				continue
 			}
 			reviewSizeExcludedPaths = append(reviewSizeExcludedPaths, entry)

@@ -30,10 +30,13 @@ type DecisionRecord struct {
 	// a reader must take that as unknown, never as complete.
 	InputRead string `json:"inputRead,omitempty"`
 	// SourceLines (§26.3) is the size the line threshold was compared
-	// against: ChangedLines less the lines of files the deployment's size
-	// exclusions match. Absent on a record written before it existed,
-	// when ChangedLines was the size compared.
+	// against: the diff's lines less those of files the deployment's size
+	// exclusions match. DiffLines is every line the diff shows, beside
+	// ChangedLines (GitHub's own count), so a disagreement between the two
+	// reads is visible. Both absent on a record written before they
+	// existed, when ChangedLines was the size compared.
 	SourceLines *int `json:"sourceLines,omitempty"`
+	DiffLines   *int `json:"diffLines,omitempty"`
 	// Floored reports whether §24's re-review floor (Floor, depth.go) is
 	// what actually determined the final Depth above -- true means the
 	// fresh Decide result was itself overridden by a higher-ranked PRIOR
@@ -228,7 +231,7 @@ func NewDecisionRecord(decision Decision, cfg Config, finalDepth ReviewDepth, pr
 	for i, t := range decision.MatchedSensitiveTags {
 		tags[i] = string(t)
 	}
-	sourceLines := decision.SourceLines
+	sourceLines, diffLines := decision.SourceLines, decision.DiffLines
 	var modelID, effort string
 	if resolvedModelID != nil {
 		modelID = *resolvedModelID
@@ -244,6 +247,7 @@ func NewDecisionRecord(decision Decision, cfg Config, finalDepth ReviewDepth, pr
 		DistinctRoots:        decision.DistinctRoots,
 		InputRead:            string(decision.InputRead),
 		SourceLines:          &sourceLines,
+		DiffLines:            &diffLines,
 		ResolvedModelID:      modelID,
 		ResolvedEffort:       effort,
 		Mode:                 string(resolveMode(cfg.Mode)),

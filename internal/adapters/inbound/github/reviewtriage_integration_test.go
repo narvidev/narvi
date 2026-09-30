@@ -50,6 +50,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -108,9 +109,15 @@ func newTestRigWithReviewTriage(t *testing.T, fetcher *fakeReviewContextFetcher)
 		// newTestRig: real stores, so ComputeDecision's own repo_settings/
 		// review_verdicts reads (and, via them, domainreviewtriage.Floor)
 		// are genuinely exercised through this package's webhook ingress.
+		//
+		// SizeExclusions carries the deployment's default size patterns,
+		// the value serve.go wires from platform.Config when
+		// NARVI_REVIEW_SIZE_EXCLUDED_PATHS is unset -- so a test here can
+		// see them reach the decision through this lane's own Deps.
 		ReviewTriage: appreviewtriage.Deps{
 			RepoSettings:   narvipg.NewRepoSettingsStore(pool),
 			ReviewVerdicts: narvipg.NewReviewVerdictStore(pool),
+			SizeExclusions: domainreviewtriage.DefaultSizeExclusions(),
 		},
 	}
 	deliveries := narvipg.NewWebhookDeliveryStore(pool)
@@ -564,5 +571,65 @@ func TestGitHubIntegration_NoReadMade_RoutesDeepAndRecordsNotFetched(t *testing.
 	}
 	if record.Reason != "review input could not be read in full" || record.InputRead != "not_fetched" {
 		t.Errorf("record reason/inputRead = %q/%q, want %q/%q", record.Reason, record.InputRead, "review input could not be read in full", "not_fetched")
+	}
+}
+
+// sourceAndTestsDiff is a readable change of 40 source lines and 600 test
+// lines, the §26.3 exit case: it routes on 40 only when the deployment's
+// size patterns reach the decision.
+func sourceAndTestsDiff() string {
+	var b strings.Builder
+	b.WriteString("diff --git a/internal/app/billing/charge.go b/internal/app/billing/charge.go\n--- a/internal/app/billing/charge.go\n+++ b/internal/app/billing/charge.go\n@@ -0,0 +1,40 @@\n")
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&b, "+source %d\n", i)
+	}
+	b.WriteString("diff --git a/internal/app/billing/charge_test.go b/internal/app/billing/charge_test.go\n--- a/internal/app/billing/charge_test.go\n+++ b/internal/app/billing/charge_test.go\n@@ -0,0 +1,600 @@\n")
+	for i := 0; i < 600; i++ {
+		fmt.Fprintf(&b, "+test %d\n", i)
+	}
+	return b.String()
+}
+
+// TestGitHubIntegration_SizePatternsReachTheDecision pins that the
+// deployment's size patterns, carried on this lane's own
+// SessionCoalescer.ReviewTriage Deps, reach the decision a mention makes:
+// 40 source lines beside 600 test lines route light, on 40.
+func TestGitHubIntegration_SizePatternsReachTheDecision(t *testing.T) {
+	rig := newTestRigWithReviewTriage(t, &fakeReviewContextFetcher{
+		pr:   githubapi.PullRequest{HeadSHA: "sha-size-head", BaseRef: "main", ChangedFiles: 2, Additions: 640},
+		diff: sourceAndTestsDiff(),
+	})
+	ctx := context.Background()
+
+	const repoFullName = "acme/size-patterns-repo"
+	const prNumber = 7373
+	const commenterID = 80007373
+	createLinkedGitHubUser(ctx, t, rig.users, rig.identities, commenterID, sqlcgen.UserRoleMaintainer)
+
+	if status := postWebhook(t, rig, issueCommentBodyWithCommenter(repoFullName, "size-patterns-repo", "https://github.com/acme/size-patterns-repo.git", prNumber, "size-review", commenterID, "size-user"), "delivery-size-1"); status != http.StatusOK {
+		t.Fatalf("webhook delivery status = %d, want %d", status, http.StatusOK)
+	}
+
+	var reviewDepth *string
+	var recordJSON []byte
+	if err := rig.pool.QueryRow(ctx,
+		`SELECT t.review_depth, t.review_depth_decision FROM turns t
+		 JOIN github_pr_sessions g ON g.session_id = t.session_id
+		 WHERE g.repo_full_name = $1 AND g.pr_number = $2
+		 ORDER BY t.created_at DESC LIMIT 1`,
+		repoFullName, prNumber,
+	).Scan(&reviewDepth, &recordJSON); err != nil {
+		t.Fatalf("query review turn: %v", err)
+	}
+	var record struct {
+		Reason       string `json:"reason"`
+		ChangedLines int    `json:"changedLines"`
+		SourceLines  *int   `json:"sourceLines"`
+	}
+	if err := json.Unmarshal(recordJSON, &record); err != nil {
+		t.Fatalf("unmarshal review_depth_decision %s: %v", recordJSON, err)
+	}
+	if reviewDepth == nil || *reviewDepth != "light" || record.SourceLines == nil || *record.SourceLines != 40 || record.ChangedLines != 640 {
+		t.Errorf("review_depth = %v, record = %s, want light with changedLines 640 and sourceLines 40", reviewDepth, recordJSON)
 	}
 }

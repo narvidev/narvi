@@ -116,11 +116,50 @@ func TestDecide_UnreadableInput(t *testing.T) {
 			wantReason: reviewtriage.ReasonAlwaysDeepConfig,
 		},
 		{
-			name:       "an unreadable input is routed before the size, which it cannot trust",
+			name:       "lines only GitHub's count claims are not a size: the diff never showed them",
 			sig:        reviewtriage.Signals{Additions: 700, ChangedPaths: []string{"internal/app/a.go"}, InputRead: review.InputReadDiffTruncated},
 			cfg:        deploymentConfig(),
 			wantDepth:  reviewtriage.DepthDeep,
 			wantReason: reviewtriage.ReasonInputUnreadable,
+		},
+		{
+			name:       "a prior high verdict read from the history keeps its own reason",
+			sig:        reviewtriage.Signals{Additions: 3, InputRead: review.InputReadDiffUnreadable, PriorVerdictRiskHigh: true},
+			cfg:        deploymentConfig(),
+			wantDepth:  reviewtriage.DepthDeep,
+			wantReason: reviewtriage.ReasonPriorHighVerdict,
+		},
+		{
+			name:       "a needs-human label read with the pull request keeps its own reason",
+			sig:        reviewtriage.Signals{Additions: 3, InputRead: review.InputReadDiffUnreadable, NeedsHumanLabelPresent: true},
+			cfg:        deploymentConfig(),
+			wantDepth:  reviewtriage.DepthDeep,
+			wantReason: reviewtriage.ReasonNeedsHumanLabel,
+		},
+		{
+			name:       "three roots seen in a truncated list keep their own reason",
+			sig:        reviewtriage.Signals{ChangedPaths: []string{"internal/a.go", "cmd/b/main.go", "web/c.ts"}, InputRead: review.InputReadDiffTruncated},
+			cfg:        deploymentConfig(),
+			wantDepth:  reviewtriage.DepthDeep,
+			wantReason: reviewtriage.ReasonRootDispersion,
+		},
+		{
+			name:       "a configured deep path seen in a truncated list keeps its own reason",
+			sig:        reviewtriage.Signals{ChangedPaths: []string{"internal/billing/charge.go"}, InputRead: review.InputReadDiffTruncated},
+			cfg:        reviewtriage.Config{Mode: reviewtriage.ModeAuto, DeepPaths: []string{"internal/billing"}, SizeExclusions: reviewtriage.DefaultSizeExclusions()},
+			wantDepth:  reviewtriage.DepthDeep,
+			wantReason: reviewtriage.ReasonDeepPathConfig,
+		},
+		{
+			name: "source lines seen in a truncated diff already over the threshold keep their own reason",
+			sig: func() reviewtriage.Signals {
+				s := sizedSignals(addedFileDiff("internal/app/billing/charge.go", 650, plainLine))
+				s.InputRead = review.InputReadDiffTruncated
+				return s
+			}(),
+			cfg:        deploymentConfig(),
+			wantDepth:  reviewtriage.DepthDeep,
+			wantReason: reviewtriage.ReasonChangedLinesOver,
 		},
 		{
 			name:       "a sensitive path seen in a truncated list is a real signal",
@@ -152,6 +191,8 @@ func TestDecide_SourceSize(t *testing.T) {
 	tests600 := addedFileDiff("internal/app/billing/charge_test.go", 600, plainLine)
 	docs700 := addedFileDiff("docs/guide/billing.md", 700, plainLine)
 	lock900 := addedFileDiff("web/package-lock.json", 900, plainLine)
+	tests700 := addedFileDiff("internal/app/billing/charge_test.go", 700, plainLine)
+	readme300 := addedFileDiff("README.md", 300, plainLine)
 	source601 := addedFileDiff("internal/app/billing/charge.go", 601, plainLine)
 
 	tests := []struct {
@@ -173,13 +214,71 @@ func TestDecide_SourceSize(t *testing.T) {
 			wantSource:  40,
 		},
 		{
-			name:        "documentation and generated lockfile lines are left out too",
-			sig:         sizedSignals(source40 + lock900),
+			name:        "documentation lines are left out too",
+			sig:         sizedSignals(source40 + docs700),
 			cfg:         deploymentConfig(),
 			wantDepth:   reviewtriage.DepthLight,
 			wantReason:  reviewtriage.ReasonLightDefault,
-			wantChanged: 940,
+			wantChanged: 740,
 			wantSource:  40,
+		},
+		{
+			name:        "a large change of excluded files only routes on its source size, 0",
+			sig:         sizedSignals(tests700 + readme300),
+			cfg:         deploymentConfig(),
+			wantDepth:   reviewtriage.DepthLight,
+			wantReason:  reviewtriage.ReasonLightDefault,
+			wantChanged: 1000,
+			wantSource:  0,
+		},
+		{
+			name:        "a lockfile rewrite counts: no sensitive rule covers dependencies",
+			sig:         sizedSignals(lock900),
+			cfg:         deploymentConfig(),
+			wantDepth:   reviewtriage.DepthDeep,
+			wantReason:  reviewtriage.ReasonChangedLinesOver,
+			wantChanged: 900,
+			wantSource:  900,
+		},
+		{
+			name:        "production code in a doc package counts",
+			sig:         sizedSignals(addedFileDiff("pkg/doc/render.go", 900, plainLine)),
+			cfg:         deploymentConfig(),
+			wantDepth:   reviewtriage.DepthDeep,
+			wantReason:  reviewtriage.ReasonChangedLinesOver,
+			wantChanged: 900,
+			wantSource:  900,
+		},
+		{
+			name:        "a main-source class named like a test counts",
+			sig:         sizedSignals(addedFileDiff("src/main/java/com/acme/experiments/ABTest.java", 900, plainLine)),
+			cfg:         deploymentConfig(),
+			wantDepth:   reviewtriage.DepthDeep,
+			wantReason:  reviewtriage.ReasonChangedLinesOver,
+			wantChanged: 900,
+			wantSource:  900,
+		},
+		{
+			name:        "an API contract named spec counts",
+			sig:         sizedSignals(addedFileDiff("api/openapi.spec.yaml", 900, plainLine)),
+			cfg:         deploymentConfig(),
+			wantDepth:   reviewtriage.DepthDeep,
+			wantReason:  reviewtriage.ReasonChangedLinesOver,
+			wantChanged: 900,
+			wantSource:  900,
+		},
+		{
+			name: "GitHub's count lagging the diff is never mixed in: the diff alone sizes",
+			sig: func() reviewtriage.Signals {
+				s := sizedSignals(addedFileDiff("internal/app/billing/charge.go", 700, plainLine) + tests700)
+				s.Additions = 700 // the previous head's count, still served beside the new head
+				return s
+			}(),
+			cfg:         deploymentConfig(),
+			wantDepth:   reviewtriage.DepthDeep,
+			wantReason:  reviewtriage.ReasonChangedLinesOver,
+			wantChanged: 700,
+			wantSource:  700,
 		},
 		{
 			name:        "601 source lines still route deep beside test lines",
@@ -200,8 +299,21 @@ func TestDecide_SourceSize(t *testing.T) {
 			wantSource:  640,
 		},
 		{
-			name:        "a sensitive path inside a test directory still routes deep",
-			sig:         sizedSignals(addedFileDiff("internal/auth/testdata/expired_token.json", 5, plainLine)),
+			name: "GitHub's count running ahead of a complete diff never inflates the size",
+			sig: func() reviewtriage.Signals {
+				s := sizedSignals(source40)
+				s.Additions = 900 // a count for another head than the one the diff is pinned to
+				return s
+			}(),
+			cfg:         deploymentConfig(),
+			wantDepth:   reviewtriage.DepthLight,
+			wantReason:  reviewtriage.ReasonLightDefault,
+			wantChanged: 900,
+			wantSource:  40,
+		},
+		{
+			name:        "a sensitive path in an excluded test file still routes deep",
+			sig:         sizedSignals(addedFileDiff("internal/auth/session_test.go", 5, plainLine)),
 			cfg:         deploymentConfig(),
 			wantDepth:   reviewtriage.DepthDeep,
 			wantReason:  reviewtriage.ReasonSensitiveGlob,
@@ -342,8 +454,8 @@ func TestNewDecisionRecord_RecordsTheCause(t *testing.T) {
 		sig := sizedSignals(addedFileDiff("internal/a.go", 40, plainLine) + addedFileDiff("internal/a_test.go", 600, plainLine))
 		decision := reviewtriage.Decide(sig, deploymentConfig())
 		record := reviewtriage.NewDecisionRecord(decision, deploymentConfig(), decision.Depth, reviewtriage.Provenance{}, nil, nil, 2, false, false, nil, nil)
-		if record.ChangedLines != 640 || record.SourceLines == nil || *record.SourceLines != 40 {
-			t.Errorf("record ChangedLines/SourceLines = %d/%v, want 640/40", record.ChangedLines, record.SourceLines)
+		if record.ChangedLines != 640 || record.SourceLines == nil || *record.SourceLines != 40 || record.DiffLines == nil || *record.DiffLines != 640 {
+			t.Errorf("record ChangedLines/SourceLines/DiffLines = %d/%v/%v, want 640/40/640", record.ChangedLines, record.SourceLines, record.DiffLines)
 		}
 	})
 }
@@ -425,5 +537,21 @@ func TestNonFloorReasons(t *testing.T) {
 	got[0] = "mutated"
 	if reviewtriage.NonFloorReasons()[0] != reviewtriage.ReasonInputUnreadable {
 		t.Error("NonFloorReasons() returned a shared slice a caller can mutate")
+	}
+}
+
+// TestDecide_SizeExcludesAPathWithASpace pins, end to end, that a test
+// file whose path holds a space is excluded like any other: git's trailing
+// TAB on its "---"/"+++" lines is not part of the name the patterns match.
+func TestDecide_SizeExcludesAPathWithASpace(t *testing.T) {
+	var b strings.Builder
+	b.WriteString(addedFileDiff("src/app.go", 50, plainLine))
+	b.WriteString("diff --git a/my pkg/big_test.go b/my pkg/big_test.go\n--- /dev/null\n+++ b/my pkg/big_test.go\t\n@@ -0,0 +1,700 @@\n")
+	for i := 0; i < 700; i++ {
+		b.WriteString("+x\n")
+	}
+	got := reviewtriage.Decide(sizedSignals(b.String()), deploymentConfig())
+	if got.Depth != reviewtriage.DepthLight || got.SourceLines != 50 {
+		t.Fatalf("Decide() = (%q, %q, source %d), want (light, source 50): the 700 test lines under a spaced path must be left out", got.Depth, got.Reason, got.SourceLines)
 	}
 }

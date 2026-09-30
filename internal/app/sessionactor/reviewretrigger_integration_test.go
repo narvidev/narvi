@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -22,6 +23,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	"github.com/narvidev/narvi/internal/domain/knowledge"
 	"github.com/narvidev/narvi/internal/domain/review"
+	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -40,6 +42,10 @@ type fakeReviewDiffFetcher struct {
 	nextPRErr      error
 	nextDiff       string
 	nextCompareErr error
+	// nextAdditions/nextChangedFiles are the pull request's own reported
+	// size, zero in every test that does not need it.
+	nextAdditions    int
+	nextChangedFiles int
 }
 
 func (f *fakeReviewDiffFetcher) GetPullRequest(_ context.Context, _, _ string, _ int32, _ string) (githubapi.PullRequest, error) {
@@ -49,7 +55,7 @@ func (f *fakeReviewDiffFetcher) GetPullRequest(_ context.Context, _, _ string, _
 	if f.nextPRErr != nil {
 		return githubapi.PullRequest{}, f.nextPRErr
 	}
-	return githubapi.PullRequest{HeadSHA: f.nextHeadSHA, BaseRef: f.nextBaseRef}, nil
+	return githubapi.PullRequest{HeadSHA: f.nextHeadSHA, BaseRef: f.nextBaseRef, Additions: f.nextAdditions, ChangedFiles: f.nextChangedFiles}, nil
 }
 
 // ResolveBranchSHA (finding F1 (§21.1's amendment)) reports no live resolution --
@@ -258,11 +264,14 @@ func (f *autoRetriggerFixture) countAuditLogRows(ctx context.Context, t *testing
 // newAutoRetriggerRegistry builds a Registry wired with diffFetcher as
 // its ReviewDiffFetcher -- botHandle/botToken are fixed test values
 // (never asserted on directly, only that they were threaded through to
-// RerunGuidance's own rendered text where relevant).
+// RerunGuidance's own rendered text where relevant). ReviewSizeExclusions
+// carries the deployment's default size patterns, the value serve.go
+// wires from platform.Config when NARVI_REVIEW_SIZE_EXCLUDED_PATHS is
+// unset.
 func newAutoRetriggerRegistry(ctx context.Context, t *testing.T, pool *pgxpool.Pool, diffFetcher *fakeReviewDiffFetcher) *Registry {
 	t.Helper()
 	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false,
-		RegistryOptions{ReviewDiffFetcher: diffFetcher, GitHubBotHandle: "narvi-bot", GitHubOutbound: platform.MustNewGitHubOutboundConfig("test-token")})
+		RegistryOptions{ReviewDiffFetcher: diffFetcher, GitHubBotHandle: "narvi-bot", GitHubOutbound: platform.MustNewGitHubOutboundConfig("test-token"), ReviewSizeExclusions: domainreviewtriage.DefaultSizeExclusions()})
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
@@ -1155,5 +1164,46 @@ func TestReviewRetriggerDebounceTimer_UnreadableInput(t *testing.T) {
 				t.Errorf("record reason/inputRead/floored = %q/%q/%v, want %q/%q/%v", record.Reason, record.InputRead, record.Floored, tt.wantReason, tt.wantInputRead, tt.wantFloored)
 			}
 		})
+	}
+}
+
+// TestReviewRetriggerDebounceTimer_SizePatternsReachTheDecision pins that
+// the deployment's size patterns, passed as RegistryOptions.
+// ReviewSizeExclusions, reach the automatic re-review's decision through
+// the registry and every actor it hydrates: 40 source lines beside 600
+// test lines route light, on 40.
+func TestReviewRetriggerDebounceTimer_SizePatternsReachTheDecision(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newAutoRetriggerFixture(ctx, t, pool)
+	if _, err := f.repoSettings.UpsertAutoRetriggerReviewToggle(ctx, f.repoFullName, true); err != nil {
+		t.Fatalf("enable auto-retrigger-review: %v", err)
+	}
+	f.setPendingHeadSHA(ctx, t, "sha-pending-size")
+	f.armDebounceTimer(ctx, t)
+
+	var diff strings.Builder
+	diff.WriteString("diff --git a/internal/app/billing/charge.go b/internal/app/billing/charge.go\n--- a/internal/app/billing/charge.go\n+++ b/internal/app/billing/charge.go\n@@ -0,0 +1,40 @@\n")
+	for i := 0; i < 40; i++ {
+		fmt.Fprintf(&diff, "+source %d\n", i)
+	}
+	diff.WriteString("diff --git a/internal/app/billing/charge_test.go b/internal/app/billing/charge_test.go\n--- a/internal/app/billing/charge_test.go\n+++ b/internal/app/billing/charge_test.go\n@@ -0,0 +1,600 @@\n")
+	for i := 0; i < 600; i++ {
+		fmt.Fprintf(&diff, "+test %d\n", i)
+	}
+	r := newAutoRetriggerRegistry(ctx, t, pool, &fakeReviewDiffFetcher{nextHeadSHA: "sha-live-size", nextBaseRef: "main", nextDiff: diff.String(), nextAdditions: 640, nextChangedFiles: 2})
+	fireDebounceTimer(ctx, t, r, f)
+
+	got := f.latestTurn(ctx, t)
+	var record struct {
+		Reason       string `json:"reason"`
+		ChangedLines int    `json:"changedLines"`
+		SourceLines  *int   `json:"sourceLines"`
+	}
+	if err := json.Unmarshal(got.ReviewDepthDecision, &record); err != nil {
+		t.Fatalf("unmarshal review_depth_decision %s: %v", got.ReviewDepthDecision, err)
+	}
+	if got.ReviewDepth == nil || *got.ReviewDepth != "light" || record.SourceLines == nil || *record.SourceLines != 40 || record.ChangedLines != 640 {
+		t.Errorf("review_depth = %v, record = %s, want light with changedLines 640 and sourceLines 40", got.ReviewDepth, got.ReviewDepthDecision)
 	}
 }

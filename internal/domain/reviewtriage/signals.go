@@ -12,8 +12,9 @@ import "github.com/narvidev/narvi/internal/domain/review"
 // GetLatest read.
 type Signals struct {
 	// Additions/Deletions are this PR's own server-reported diff-size
-	// facts (review.PreFetchedContext.Additions/Deletions) -- summed by
-	// changedLines (decide.go) against maxChangedLinesLight.
+	// facts (review.PreFetchedContext.Additions/Deletions) -- recorded as
+	// Decision.ChangedLines, never compared against maxChangedLinesLight:
+	// the size that routes comes from the diff alone (FileLines).
 	Additions int
 	Deletions int
 
@@ -28,9 +29,9 @@ type Signals struct {
 	ChangedPaths []string
 
 	// FileLines is the diff's own per-file added/deleted lines
-	// (ExtractFileLines over review.PreFetchedContext.Diff) -- read only
-	// to find the lines the size rule leaves out (sourceChangedLines,
-	// sizeexclusion.go).
+	// (ExtractFileLines over review.PreFetchedContext.Diff) -- the size
+	// rule's only input (diffSize, sizeexclusion.go): Additions/Deletions
+	// above are GitHub's separate count, recorded, never routed on.
 	FileLines []FileLines
 
 	// InputRead is how the reads behind this review's context ended

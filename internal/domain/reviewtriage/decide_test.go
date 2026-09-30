@@ -92,6 +92,7 @@ func TestDecide_Default(t *testing.T) {
 				Additions:    500,
 				Deletions:    101,
 				ChangedPaths: []string{"internal/app/foo/a.go"},
+				FileLines:    []reviewtriage.FileLines{{Path: "internal/app/foo/a.go", Added: 500, Deleted: 101}},
 			},
 			cfg:        reviewtriage.DefaultConfig(),
 			wantDepth:  reviewtriage.DepthDeep,
@@ -103,6 +104,7 @@ func TestDecide_Default(t *testing.T) {
 				Additions:    500,
 				Deletions:    100,
 				ChangedPaths: []string{"internal/app/foo/a.go"},
+				FileLines:    []reviewtriage.FileLines{{Path: "internal/app/foo/a.go", Added: 500, Deleted: 100}},
 			},
 			cfg:        reviewtriage.DefaultConfig(),
 			wantDepth:  reviewtriage.DepthLight,
@@ -247,17 +249,22 @@ func TestDecide_ModeCheckedBeforeAnySignal(t *testing.T) {
 	}
 }
 
-// TestDecide_ChangedLinesIsSum pins that changedLines is additions PLUS
-// deletions, not either alone -- mutating the `+` in Decide's own
-// `changedLines := sig.Additions + sig.Deletions` into either operand
-// alone must fail this test (300+301 exceeds 600 only when summed).
+// TestDecide_ChangedLinesIsSum pins that both counts are additions PLUS
+// deletions, not either alone -- the recorded ChangedLines (GitHub's own
+// count) and the routed SourceLines (the diff's): mutating either sum into
+// one operand must fail this test (300+301 exceeds 600 only when summed).
 func TestDecide_ChangedLinesIsSum(t *testing.T) {
-	sig := readable(reviewtriage.Signals{Additions: 300, Deletions: 301, ChangedPaths: []string{"internal/app/foo/a.go"}})
+	sig := readable(reviewtriage.Signals{
+		Additions:    300,
+		Deletions:    301,
+		ChangedPaths: []string{"internal/app/foo/a.go"},
+		FileLines:    []reviewtriage.FileLines{{Path: "internal/app/foo/a.go", Added: 300, Deleted: 301}},
+	})
 	got := reviewtriage.Decide(sig, reviewtriage.DefaultConfig())
 	if got.Depth != reviewtriage.DepthDeep {
-		t.Fatalf("300 additions + 301 deletions = 601 > 600 must route deep, got %q (lines=%d)", got.Depth, got.ChangedLines)
+		t.Fatalf("300 added + 301 deleted = 601 > 600 must route deep, got %q (source=%d)", got.Depth, got.SourceLines)
 	}
-	if got.ChangedLines != 601 {
-		t.Fatalf("ChangedLines = %d, want 601", got.ChangedLines)
+	if got.ChangedLines != 601 || got.SourceLines != 601 || got.DiffLines != 601 {
+		t.Fatalf("ChangedLines/SourceLines/DiffLines = %d/%d/%d, want 601 each", got.ChangedLines, got.SourceLines, got.DiffLines)
 	}
 }

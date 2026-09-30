@@ -453,6 +453,13 @@ func TestResolveProvenance_FailsOpenOnBrokenArtifactsStore(t *testing.T) {
 // ComputeDecision read, and the final depth.
 func reviewOnce(ctx context.Context, t *testing.T, pool *pgxpool.Pool, deps reviewtriage.Deps, repoFullName string, prNumber int32, prCtx review.PreFetchedContext) (domainreviewtriage.Decision, domainreviewtriage.ReviewDepth, domainreviewtriage.ReviewDepth) {
 	t.Helper()
+	return reviewOnceWithRisk(ctx, t, pool, deps, repoFullName, prNumber, prCtx, "low")
+}
+
+// reviewOnceWithRisk is reviewOnce, with the posted verdict carrying
+// riskLevel -- what the next review's prior-high-verdict rule reads.
+func reviewOnceWithRisk(ctx context.Context, t *testing.T, pool *pgxpool.Pool, deps reviewtriage.Deps, repoFullName string, prNumber int32, prCtx review.PreFetchedContext, riskLevel string) (domainreviewtriage.Decision, domainreviewtriage.ReviewDepth, domainreviewtriage.ReviewDepth) {
+	t.Helper()
 	decision, cfg, prior := reviewtriage.ComputeDecision(ctx, deps, repoFullName, prNumber, prCtx)
 	final := decision.Depth
 	if decision.Reason != domainreviewtriage.ReasonAlwaysLightConfig {
@@ -478,7 +485,7 @@ func reviewOnce(ctx context.Context, t *testing.T, pool *pgxpool.Pool, deps revi
 	if err != nil {
 		t.Fatalf("create review turn: %v", err)
 	}
-	insertVerdict(ctx, t, pool, repoFullName, prNumber, &finalStr, turn.ID)
+	insertVerdictWithRisk(ctx, t, pool, repoFullName, prNumber, &finalStr, turn.ID, riskLevel)
 	return decision, prior, final
 }
 
@@ -487,11 +494,16 @@ func reviewOnce(ctx context.Context, t *testing.T, pool *pgxpool.Pool, deps revi
 // posted before verdicts recorded their attempt).
 func insertVerdict(ctx context.Context, t *testing.T, pool *pgxpool.Pool, repoFullName string, prNumber int32, reviewPath *string, attempt pgtype.UUID) {
 	t.Helper()
+	insertVerdictWithRisk(ctx, t, pool, repoFullName, prNumber, reviewPath, attempt, "low")
+}
+
+func insertVerdictWithRisk(ctx context.Context, t *testing.T, pool *pgxpool.Pool, repoFullName string, prNumber int32, reviewPath *string, attempt pgtype.UUID, riskLevel string) {
+	t.Helper()
 	if _, err := narvipg.NewReviewVerdictStore(pool).Insert(ctx, sqlcgen.InsertReviewVerdictParams{
 		RepoFullName:      repoFullName,
 		PrNumber:          prNumber,
 		HeadSha:           "sha-" + t.Name(),
-		RiskLevel:         "low",
+		RiskLevel:         riskLevel,
 		Premise:           "ok",
 		BlastRadius:       []byte(`[]`),
 		FilesChanged:      1,
@@ -653,6 +665,111 @@ func TestComputeDecision_RecordsTheCause(t *testing.T) {
 			}
 			if record.Depth != tt.wantDepth || record.Reason != string(tt.wantReason) || record.InputRead != tt.wantInputRead {
 				t.Errorf("persisted record depth/reason/inputRead = %q/%q/%q, want %q/%q/%q", record.Depth, record.Reason, record.InputRead, tt.wantDepth, tt.wantReason, tt.wantInputRead)
+			}
+		})
+	}
+}
+
+// TestComputeDecision_RealReasonOnAnUnreadableReviewStillFloors pins, on
+// real Postgres, that an unreadable input never hides a real deep reason
+// the same review had: a prior high verdict (read from the history), a
+// needs-human label (read with the pull request), a configured deep path
+// or three roots seen in a truncated list. That reason is recorded, so the
+// review floors the next one (§26.3, "once deep, stays deep"); only a
+// review deep for the unreadable input alone is stepped over. Sequences:
+// V0 (optional) posts a verdict; V1 is the unreadable review; V2 is a
+// small readable push.
+func TestComputeDecision_RealReasonOnAnUnreadableReviewStillFloors(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	repoSettings := narvipg.NewRepoSettingsStore(pool)
+	deps := reviewtriage.Deps{RepoSettings: repoSettings, ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), SizeExclusions: domainreviewtriage.DefaultSizeExclusions()}
+
+	smallReadable := review.PreFetchedContext{InputRead: review.InputReadComplete, Additions: 4, Deletions: 2, ChangedFilesCount: 1, ChangedPaths: []string{"internal/app/foo/a.go"}}
+	diffUnreadable := review.PreFetchedContext{InputRead: review.InputReadDiffUnreadable, Additions: 3, Deletions: 1, ChangedFilesCount: 1}
+
+	tests := []struct {
+		name       string
+		deepPaths  []string
+		v0         *review.PreFetchedContext
+		v0Risk     string
+		v1         review.PreFetchedContext
+		v1Risk     string
+		wantReason domainreviewtriage.Reason
+		wantV2     domainreviewtriage.ReviewDepth
+	}{
+		{
+			name:       "a prior high verdict on the unreadable review floors the next one",
+			v0:         &smallReadable,
+			v0Risk:     "high",
+			v1:         diffUnreadable,
+			v1Risk:     "medium",
+			wantReason: domainreviewtriage.ReasonPriorHighVerdict,
+			wantV2:     domainreviewtriage.DepthDeep,
+		},
+		{
+			name: "a needs-human label on the unreadable review floors the next one",
+			v1: func() review.PreFetchedContext {
+				c := diffUnreadable
+				c.Labels = []string{"review:needs-human"}
+				return c
+			}(),
+			v1Risk:     "low",
+			wantReason: domainreviewtriage.ReasonNeedsHumanLabel,
+			wantV2:     domainreviewtriage.DepthDeep,
+		},
+		{
+			name:       "a configured deep path in a truncated list floors the next one",
+			deepPaths:  []string{"internal/billing"},
+			v1:         review.PreFetchedContext{InputRead: review.InputReadDiffTruncated, Additions: 9, ChangedFilesCount: 4, ChangedPaths: []string{"internal/billing/charge.go"}},
+			v1Risk:     "low",
+			wantReason: domainreviewtriage.ReasonDeepPathConfig,
+			wantV2:     domainreviewtriage.DepthDeep,
+		},
+		{
+			name:       "three roots seen in a truncated list floor the next one",
+			v1:         review.PreFetchedContext{InputRead: review.InputReadDiffTruncated, Additions: 9, ChangedFilesCount: 5, ChangedPaths: []string{"internal/a.go", "cmd/b/main.go", "web/c.ts"}},
+			v1Risk:     "low",
+			wantReason: domainreviewtriage.ReasonRootDispersion,
+			wantV2:     domainreviewtriage.DepthDeep,
+		},
+		{
+			name:       "control: deep for the unreadable input alone does not floor the next one",
+			v1:         diffUnreadable,
+			v1Risk:     "low",
+			wantReason: domainreviewtriage.ReasonInputUnreadable,
+			wantV2:     domainreviewtriage.DepthLight,
+		},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repoFullName := repoFullNameForTest(t)
+			prNumber := int32(400 + i)
+			if tt.deepPaths != nil {
+				mode := "auto"
+				paths, err := json.Marshal(tt.deepPaths)
+				if err != nil {
+					t.Fatalf("marshal deep paths: %v", err)
+				}
+				if _, err := repoSettings.UpsertReviewDepthConfig(ctx, repoFullName, &mode, paths); err != nil {
+					t.Fatalf("UpsertReviewDepthConfig: %v", err)
+				}
+			}
+			if tt.v0 != nil {
+				reviewOnceWithRisk(ctx, t, pool, deps, repoFullName, prNumber, *tt.v0, tt.v0Risk)
+			}
+
+			v1, _, v1Final := reviewOnceWithRisk(ctx, t, pool, deps, repoFullName, prNumber, tt.v1, tt.v1Risk)
+			if v1.Reason != tt.wantReason || v1Final != domainreviewtriage.DepthDeep {
+				t.Fatalf("V1 = (%q, %q), want (deep, %q)", v1Final, v1.Reason, tt.wantReason)
+			}
+
+			v2, prior, v2Final := reviewOnce(ctx, t, pool, deps, repoFullName, prNumber, smallReadable)
+			if v2.Depth != domainreviewtriage.DepthLight {
+				t.Fatalf("V2's fresh decision = %q (%q), want light: the floor must be what decides", v2.Depth, v2.Reason)
+			}
+			if v2Final != tt.wantV2 {
+				t.Errorf("V2 final depth = %q (prior %q), want %q", v2Final, prior, tt.wantV2)
 			}
 		})
 	}

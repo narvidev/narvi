@@ -95,7 +95,9 @@ func Floor(fresh, prior ReviewDepth) ReviewDepth {
 // read is never a floor"). A review routed deep only because its input
 // could not be read says nothing about the change itself; flooring on it
 // would make one transient read failure keep a pull request deep for
-// good. The floor's own read (internal/app/reviewtriage.ComputeDecision)
+// good. The recorded reason means exactly that because Decide checks the
+// unreadable-input rule after every other deep rule: a review that was
+// also deep for a real reason records that reason instead, and floors. The floor's own read (internal/app/reviewtriage.ComputeDecision)
 // passes this list to Postgres and skips every verdict whose producing
 // turn's recorded reason is in it, flooring on the latest verdict before
 // them instead -- so a pull request that went deep for a real reason

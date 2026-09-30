@@ -37,9 +37,12 @@ const (
 	ReasonLightDefault      Reason = "no deep-routing signal"
 	// ReasonInputUnreadable: the pull request or its diff could not be
 	// read in full (Signals.InputRead), so the size and the changed paths
-	// the other rules read are missing or partial. §26.3: a missing size
-	// costs a thorough review, a missing scope costs a finding. A depth
-	// chosen for this reason is never the next review's floor
+	// the other rules read are missing or partial, and none of the rules
+	// that read what WAS read, nor the ones that read nothing from the
+	// diff, routed deep. §26.3: a missing size costs a thorough review, a
+	// missing scope costs a finding. Being the last deep rule, it is the
+	// recorded reason only when the input alone decided, which is why a
+	// depth chosen for it is never the next review's floor
 	// (NonFloorReasons, depth.go).
 	ReasonInputUnreadable Reason = "review input could not be read in full"
 )
@@ -65,10 +68,17 @@ type Decision struct {
 	// request's own reported total, carried through verbatim for the
 	// routing-decision record.
 	ChangedLines int
+	// DiffLines is every line the diff adds or deletes, as the one diff
+	// read pinned to the head under review shows it (diffSize,
+	// sizeexclusion.go). Recorded beside ChangedLines so a disagreement
+	// between GitHub's reported counts and the diff is visible; neither is
+	// derived from the other.
+	DiffLines int
 	// SourceLines is the size the line threshold is compared against:
-	// ChangedLines less the lines the diff attributes to files the
-	// deployment's size exclusions match (sourceChangedLines,
-	// sizeexclusion.go).
+	// DiffLines less the lines of files the deployment's size exclusions
+	// match -- the diff alone, never ChangedLines less anything, so two
+	// reads that could describe different heads are never mixed. Exact for
+	// a complete diff, a lower bound for a partial one.
 	SourceLines int
 	// DistinctRoots is the number of distinct top-level path roots
 	// Signals.ChangedPaths touches, carried through verbatim for the
@@ -131,32 +141,41 @@ func resolveMode(m Mode) Mode {
 //  2. Any changed path matches the fixed sensitive-glob set (migrations/
 //     auth/infra-as-code+CI-workflows) OR any repo-configured
 //     cfg.DeepPaths entry -> deep. Every changed path is read, test and
-//     documentation files included, and a partial list is still read:
-//     a sensitive path that WAS seen is a real signal.
-//  3. Signals.InputRead is not readable (the pull request or its diff
-//     could not be read in full) -> deep, ReasonInputUnreadable. Checked
-//     before every count, since the counts are what is missing.
-//  4. The source line count (ChangedLines less the lines of files the
+//     documentation files included.
+//  3. The source line count (the diff's lines less those of files the
 //     deployment's cfg.SizeExclusions match) > 600, OR distinct top-level
 //     path roots >= 3 -> deep.
-//  5. Signals.PriorVerdictRiskHigh -> deep (§26.3's own explicit fourth
+//  4. Signals.PriorVerdictRiskHigh -> deep (§26.3's own explicit fourth
 //     rule; see doc.go's own "v1 rules -- five, not three" section).
-//  6. Signals.NeedsHumanLabelPresent -> deep (this package's own fifth
+//  5. Signals.NeedsHumanLabelPresent -> deep (this package's own fifth
 //     rule, same section).
+//  6. Signals.InputRead is not readable (the pull request or its diff
+//     could not be read in full) -> deep, ReasonInputUnreadable.
 //  7. Otherwise: light.
 //
+// Why the unreadable rule is LAST among the deep rules: every rule before
+// it fires only on something that was actually read -- a path, a line or
+// a root seen in a partial diff is still there in the whole one (a partial
+// read can only undercount), and the verdict history and the labels do not
+// come from the diff at all. So when one of them fires on an unreadable
+// input, the review is deep for that real reason, which is recorded and
+// floors the next review (§26.3's "once deep, stays deep"). The unreadable
+// reason is recorded only when nothing else routes deep -- the one case
+// where the depth is owed to the missing input alone, and the one case
+// NonFloorReasons (depth.go) keeps out of the floor.
+//
 // This function has no error return at all. An input that could not be
-// read is not a router error (§26.3): it reaches rule 3 and routes deep
-// under a reason of its own. The fail-open-to-light rule covers only the
-// caller's own reads (config, verdict history) -- see internal/app/
-// reviewtriage.ComputeDecision's own doc comment for how those degrade.
+// read is not a router error (§26.3): it routes deep under a reason of its
+// own. The fail-open-to-light rule covers only the caller's own reads
+// (config, verdict history) -- see internal/app/reviewtriage.
+// ComputeDecision's own doc comment for how those degrade.
 func Decide(sig Signals, cfg Config) Decision {
 	base := Decision{
 		ChangedLines:  sig.Additions + sig.Deletions,
 		DistinctRoots: distinctRoots(sig.ChangedPaths),
 		InputRead:     sig.InputRead,
 	}
-	base.SourceLines = sourceChangedLines(base.ChangedLines, sig.FileLines, cfg.SizeExclusions)
+	base.DiffLines, base.SourceLines = diffSize(sig.FileLines, cfg.SizeExclusions)
 	decide := func(depth ReviewDepth, reason Reason) Decision {
 		d := base
 		d.Depth = depth
@@ -180,10 +199,6 @@ func Decide(sig Signals, cfg Config) Decision {
 		return decide(DepthDeep, ReasonDeepPathConfig)
 	}
 
-	if !sig.InputRead.Readable() {
-		return decide(DepthDeep, ReasonInputUnreadable)
-	}
-
 	if base.SourceLines > maxChangedLinesLight {
 		return decide(DepthDeep, ReasonChangedLinesOver)
 	}
@@ -196,6 +211,10 @@ func Decide(sig Signals, cfg Config) Decision {
 	}
 	if sig.NeedsHumanLabelPresent {
 		return decide(DepthDeep, ReasonNeedsHumanLabel)
+	}
+
+	if !sig.InputRead.Readable() {
+		return decide(DepthDeep, ReasonInputUnreadable)
 	}
 
 	return decide(DepthLight, ReasonLightDefault)

@@ -119,6 +119,28 @@ func TestExtractFileLines(t *testing.T) {
 			want: []reviewtriage.FileLines{{Path: "café.go", Added: 1, Deleted: 1}},
 		},
 		{
+			name: "a path with a space loses git's trailing tab",
+			diff: "diff --git a/my dir/foo_test.go b/my dir/foo_test.go\n" +
+				"--- a/my dir/foo_test.go\t\n" +
+				"+++ b/my dir/foo_test.go\t\n" +
+				"@@ -1 +1,2 @@\n" +
+				" keep\n" +
+				"+add\n" +
+				"diff --git a/my dir/old name.go b/my dir/new_test.go\n" +
+				"similarity index 80%\n" +
+				"rename from my dir/old name.go\n" +
+				"rename to my dir/new_test.go\n" +
+				"--- a/my dir/old name.go\t\n" +
+				"+++ b/my dir/new_test.go\n" +
+				"@@ -1 +1 @@\n" +
+				"-a\n" +
+				"+b\n",
+			want: []reviewtriage.FileLines{
+				{Path: "my dir/foo_test.go", Added: 1},
+				{Path: "my dir/new_test.go", OldPath: "my dir/old name.go", Added: 1, Deleted: 1},
+			},
+		},
+		{
 			name: "plain unified diff with no git header",
 			diff: "--- a/one.txt\n" +
 				"+++ b/one.txt\n" +

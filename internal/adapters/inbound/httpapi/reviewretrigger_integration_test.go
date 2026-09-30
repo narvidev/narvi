@@ -866,3 +866,50 @@ func TestRetriggerReview_UnreadableInput_RoutesDeepAndRecordsTheCause(t *testing
 		})
 	}
 }
+
+// TestRetriggerReview_SizePatternsReachTheDecision pins that the
+// deployment's size patterns, carried on the Deps this route is built
+// with, reach the re-review button's decision: 40 source lines beside 600
+// test lines route light, on 40.
+func TestRetriggerReview_SizePatternsReachTheDecision(t *testing.T) {
+	var diff strings.Builder
+	diff.WriteString("diff --git a/internal/app/billing/charge.go b/internal/app/billing/charge.go\n--- a/internal/app/billing/charge.go\n+++ b/internal/app/billing/charge.go\n@@ -0,0 +1,40 @@\n")
+	for i := 0; i < 40; i++ {
+		diff.WriteString("+source line\n")
+	}
+	diff.WriteString("diff --git a/internal/app/billing/charge_test.go b/internal/app/billing/charge_test.go\n--- a/internal/app/billing/charge_test.go\n+++ b/internal/app/billing/charge_test.go\n@@ -0,0 +1,600 @@\n")
+	for i := 0; i < 600; i++ {
+		diff.WriteString("+test line\n")
+	}
+	rig := newTestRig(t, func(r *testRig) {
+		r.diffFetcher = &fakeReviewContextFetcher{
+			pr:   githubapi.PullRequest{HeadSHA: "sha-size-head", BaseRef: "main", ChangedFiles: 2, Additions: 640},
+			diff: diff.String(),
+		}
+	})
+	ctx := context.Background()
+	owner, _ := rig.createAuthenticatedUser(ctx, t)
+	_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMaintainer)
+	session := rig.createOwnedGitHubReviewSession(ctx, t, owner.ID, "acme/size-retrigger-repo", 373)
+
+	var resp restdtos.CreateTurnResponse
+	if status := rig.doJSON(t, http.MethodPost, "/api/sessions/"+session.ID.String()+"/review/retrigger", nil, &resp, token); status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+	}
+
+	var reviewDepth *string
+	var recordJSON []byte
+	if err := rig.pool.QueryRow(ctx, `SELECT review_depth, review_depth_decision FROM turns WHERE id = $1`, resp.Id).Scan(&reviewDepth, &recordJSON); err != nil {
+		t.Fatalf("query turn: %v", err)
+	}
+	var record struct {
+		ChangedLines int  `json:"changedLines"`
+		SourceLines  *int `json:"sourceLines"`
+	}
+	if err := json.Unmarshal(recordJSON, &record); err != nil {
+		t.Fatalf("unmarshal review_depth_decision %s: %v", recordJSON, err)
+	}
+	if reviewDepth == nil || *reviewDepth != "light" || record.SourceLines == nil || *record.SourceLines != 40 || record.ChangedLines != 640 {
+		t.Errorf("review_depth = %v, record = %s, want light with changedLines 640 and sourceLines 40", reviewDepth, recordJSON)
+	}
+}

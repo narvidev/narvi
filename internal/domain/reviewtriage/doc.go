@@ -81,22 +81,28 @@
 // and an empty list looks exactly like a one-line fix. So the reads' own
 // outcome reaches Decide as a typed fact (Signals.InputRead, set by the
 // review context's producer): anything but a complete or genuinely empty
-// read routes deep under ReasonInputUnreadable, after the path rules (a
-// sensitive path that WAS read is still a real signal) and before every
-// count. An always_light override still wins, being an admin's decision,
-// and the record names the cause either way. A depth chosen for that
-// reason is never a later review's floor (NonFloorReasons, depth.go).
+// read routes deep under ReasonInputUnreadable. That rule is the LAST deep
+// rule: a path, a line or a root seen in a partial read is still there in
+// the whole one, and the verdict history and the labels do not come from
+// the diff, so each earlier rule fires only on a real signal and records
+// its own reason. The unreadable reason is recorded only when nothing else
+// routes deep, which is why a depth chosen for it is never a later
+// review's floor (NonFloorReasons, depth.go) while the others still are.
+// An always_light override still wins, being an admin's decision, and the
+// record names the cause either way.
 //
 // # The size counts source changes only
 //
-// The line threshold is compared against the pull request's reported
-// changed lines less the lines of files this deployment's size patterns
-// match -- tests, documentation, generated files (DefaultSizeExclusions,
-// sizeexclusion.go). The patterns are the deployment's, matched on paths
-// alone, never on markers the pull request carries about its own files.
-// The path rules still read every changed path, so production code placed
-// under a test directory shrinks the count but not the sensitive-path
-// check.
+// The line threshold is compared against the diff's own lines less those
+// of files this deployment's size patterns match (DefaultSizeExclusions,
+// sizeexclusion.go, which lists each default and why it cannot match
+// hand-written production code). The size comes from the one diff read
+// pinned to the head under review, never from GitHub's reported counts
+// less something, which could describe another head. The patterns are the
+// deployment's, matched on file names alone, never on a directory name or
+// on markers the pull request carries about its own files. The path rules
+// still read every changed path, so a file excluded from the count still
+// counts toward the sensitive-path and root rules.
 //
 // # Per-repo config: mode + deepPaths only, thresholds stay fixed
 //

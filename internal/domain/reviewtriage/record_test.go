@@ -24,6 +24,7 @@ func TestNewDecisionRecord(t *testing.T) {
 			Mode:                 "auto",
 			InputRead:            "complete",
 			SourceLines:          &zero,
+			DiffLines:            &zero,
 			Floored:              false,
 		}
 		if !reflect.DeepEqual(got, want) {
