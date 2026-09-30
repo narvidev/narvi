@@ -1,5 +1,6 @@
 .PHONY: build vet fmt tidy lint lint-web-assets test test-integration \
 	test-integration-group-1 test-integration-group-2 test-integration-group-3 test-integration-group-4 \
+	test-integration-postgres-floor \
 	contracts-generate contracts-check contracts-compat dev \
 	web-typecheck web-lint web-check-dto-types web-test web-build web-check dist \
 	verify-control-plane-image
@@ -141,6 +142,31 @@ test-integration-group-4:
 	pkgs="$$(go list -tags=integration ./... | grep -vxF -f "$$tmp")"; \
 	rm -f "$$tmp"; \
 	go test -tags=integration -race -p 2 $$pkgs
+
+# test-integration-postgres-floor runs, on the oldest Postgres server the
+# control plane boots against (platform.MinPostgresServerVersionNum,
+# technical plan §5.1), the suites that exercise what differs between server
+# versions: the postgres adapter's whole suite (every store's queries and
+# every migration, up and down), the lock connection's tests
+# (pg_terminate_backend's waiting form, the keepalive settings it asks the
+# server for), and boot's own reads of the server (the version check, the
+# migrations, the connection budget's reserved_connections, and the routes
+# subcommand, which checks the version before building the router). Every other
+# Postgres-backed suite runs on postgres:17-alpine alone, the tested version
+# (docs/PRODUCTION_CHECKLIST.md item 13). Those three packages' tests read
+# the image from NARVI_TEST_POSTGRES_IMAGE, the boot test fails if the
+# server it reached is not the major the image names, and internal/ops
+# checks that this image names the floor's major. CI runs this target as a
+# job of its own (.github/workflows/ci.yml).
+POSTGRES_FLOOR_IMAGE := postgres:16-alpine
+
+test-integration-postgres-floor:
+	NARVI_TEST_POSTGRES_IMAGE=$(POSTGRES_FLOOR_IMAGE) go test -tags=integration -race -p 1 \
+		$(INTEGRATION_MODULE)/internal/adapters/outbound/postgres
+	NARVI_TEST_POSTGRES_IMAGE=$(POSTGRES_FLOOR_IMAGE) go test -tags=integration -race -run '^TestLockHolder_' \
+		$(INTEGRATION_MODULE)/internal/app/sessionactor
+	NARVI_TEST_POSTGRES_IMAGE=$(POSTGRES_FLOOR_IMAGE) go test -tags=integration -race -v -run '^(TestPostgresPreflight_|TestRunRoutesCommand_)' \
+		$(INTEGRATION_MODULE)/controlplane
 
 # dev is a LOCAL DEV convenience only (docker-compose.dev.yml), distinct
 # from the self-host production story (§12.1: "one binary + Postgres") —
@@ -464,7 +490,9 @@ dist: web-build lint-web-assets
 #      read-only listing forward-migrate whatever database it was pointed
 #      at; it no longer does, since Build's router construction does not
 #      need a migrated schema at all). It loads config, opens the pool,
-#      and calls the EXACT SAME Build serve() calls -- it just never
+#      refuses a Postgres server below the supported floor (the compose
+#      file's postgres:17-alpine passes), and calls the EXACT SAME Build
+#      serve() calls -- it just never
 #      calls GitHub and never starts a listener (no
 #      verifyGitHubAppScopeAtBoot, no app.Run) -- so this is a clean,
 #      byte-for-byte route-table-identity proof, independent of GitHub

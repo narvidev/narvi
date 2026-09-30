@@ -18,8 +18,9 @@
 // constructor, assembled against the already-open pool) and Run (the
 // listener and every background loop, through one errgroup). "routes"
 // (routescmd.go) is §41.1's own exit-criterion proof: it loads config,
-// opens the pool, applies migrations, and calls the SAME Build serve()
-// uses, then prints App.Routes() one "METHOD /path" per line -- never
+// opens the pool, refuses a Postgres server below the supported floor, and
+// calls the SAME Build serve() uses (applying none of this repository's own
+// migrations), then prints App.Routes() one "METHOD /path" per line -- never
 // calling GitHub and never starting a listener -- so
 // `docker run <image> routes` can be diffed byte-for-byte against
 // controlplane/testdata/routes.golden without needing serve()'s own
@@ -297,7 +298,8 @@ func Main(args []string, modules ...extension.Module) int {
 }
 
 // serve loads config, wires logging/OTel (unchanged from PR-02/PR-03),
-// opens the Postgres pool and applies embedded migrations, then runs the
+// opens the Postgres pool, refuses a server older than
+// platform.MinPostgresServerVersionNum and applies embedded migrations, then runs the
 // chi-routed HTTP server until SIGINT/SIGTERM, shutting down gracefully
 // within Timeouts.ShutdownGracePeriod. The listen goroutine and the
 // shutdown-watcher goroutine are both launched via errgroup.Group.Go —
@@ -355,6 +357,13 @@ func serve(modules ...extension.Module) error {
 	// doc comment for why this number matters independently of host core
 	// count.
 	slog.Info("narvi control-plane: postgres pool configured", "max_conns", pool.Config().MaxConns)
+	// §5.1: a server older than platform.MinPostgresServerVersionNum is
+	// refused before anything else reads it -- the connection budget below
+	// reads a setting the floor guarantees -- and before any migration runs
+	// against it.
+	if err := requireSupportedPostgres(ctx, pool, cfg.Timeouts.PostgresVersionCheckTimeout); err != nil {
+		return err
+	}
 	// §5.1: this replica's connections are its pool plus the one lock
 	// connection holding every session actor's advisory lock
 	// (internal/app/sessionactor/lockholder.go). Logged beside the
@@ -428,6 +437,14 @@ func serve(modules ...extension.Module) error {
 // set is empty (internal/app/capability.Registry.Enabled is then false
 // for everything, whatever cfg.LicenseKey holds -- technical plan
 // §34.5).
+//
+// Build reads the database (CountSuppressedRepos) and applies each composed
+// module's own migrations, so its caller must have refused a Postgres server
+// below platform.MinPostgresServerVersionNum first (requireSupportedPostgres,
+// §5.1): serve and runRoutesCommand do, and a private binary calling Build
+// directly takes on the same duty. It is the one function in this package
+// that reaches a migration without that check in its own body, which
+// TestMigrationsRunOnlyAfterTheVersionCheck holds to.
 func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, modules ...extension.Module) (*App, error) {
 	if err := validateModules(modules); err != nil {
 		return nil, err
