@@ -112,7 +112,7 @@ type fakeCompositionTurnInserter struct {
 	lastParams sqlcgen.CreateTurnParams
 }
 
-func (f *fakeCompositionTurnInserter) Create(_ context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error) {
+func (f *fakeCompositionTurnInserter) CreateLockedTurn(_ context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error) {
 	f.calls++
 	f.lastParams = arg
 	if f.err != nil {
@@ -227,7 +227,7 @@ func TestRun_AggregateReviewTriggered_DispatchesCompositionReviewTurn(t *testing
 		t.Errorf("GetCompareDiff token = %q, want %q", diffFetcher.lastGetCompareDiffToken, "gho_bottoken")
 	}
 	if turns.calls != 1 {
-		t.Fatalf("CompositionTurns.Create calls = %d, want 1", turns.calls)
+		t.Fatalf("CompositionTurns.CreateLockedTurn calls = %d, want 1", turns.calls)
 	}
 	if turns.lastParams.SessionID != sessionID {
 		t.Errorf("inserted turn SessionID = %v, want %v", turns.lastParams.SessionID, sessionID)
@@ -324,7 +324,7 @@ func TestRun_TruncatedCoverageAloneTriggersCompositionDispatch(t *testing.T) {
 	})
 
 	if turns.calls != 1 {
-		t.Fatalf("CompositionTurns.Create calls = %d, want 1 -- a truncated constituent-PR listing must itself trigger the composition pass, never silently skip it", turns.calls)
+		t.Fatalf("CompositionTurns.CreateLockedTurn calls = %d, want 1 -- a truncated constituent-PR listing must itself trigger the composition pass, never silently skip it", turns.calls)
 	}
 	if dispatch.calls != 1 {
 		t.Errorf("CompositionDispatch.EnsureDispatched calls = %d, want 1", dispatch.calls)
@@ -391,7 +391,7 @@ func TestRun_AggregateReviewNotTriggered_NeverDispatchesCompositionReview(t *tes
 		t.Errorf("CompositionTemplates.GetTemplate calls = %d, want 0 (aggregate review never triggered)", templates.calls)
 	}
 	if turns.calls != 0 {
-		t.Errorf("CompositionTurns.Create calls = %d, want 0 (aggregate review never triggered)", turns.calls)
+		t.Errorf("CompositionTurns.CreateLockedTurn calls = %d, want 0 (aggregate review never triggered)", turns.calls)
 	}
 	if dispatch.calls != 0 {
 		t.Errorf("CompositionDispatch.EnsureDispatched calls = %d, want 0 (aggregate review never triggered)", dispatch.calls)
@@ -535,7 +535,7 @@ func TestRun_CompositionDepsNotConfigured_DegradesGracefully(t *testing.T) {
 				t.Errorf("Outbox.Create calls = %d, want 1 (the manifest check's own outbox comment must still be enqueued)", outbox.calls)
 			}
 			if turns.calls != 0 {
-				t.Errorf("CompositionTurns.Create calls = %d, want 0 (nilField=%s must decline the whole dispatch)", turns.calls, tt.nilField)
+				t.Errorf("CompositionTurns.CreateLockedTurn calls = %d, want 0 (nilField=%s must decline the whole dispatch)", turns.calls, tt.nilField)
 			}
 			if dispatch.calls != 0 {
 				t.Errorf("CompositionDispatch.EnsureDispatched calls = %d, want 0 (nilField=%s must decline the whole dispatch)", dispatch.calls, tt.nilField)
@@ -565,7 +565,7 @@ func TestRun_CompositionTemplateFetchFails_NeverInsertsTurn(t *testing.T) {
 	})
 
 	if turns.calls != 0 {
-		t.Errorf("CompositionTurns.Create calls = %d, want 0 (template fetch failed)", turns.calls)
+		t.Errorf("CompositionTurns.CreateLockedTurn calls = %d, want 0 (template fetch failed)", turns.calls)
 	}
 	if dispatch.calls != 0 {
 		t.Errorf("CompositionDispatch.EnsureDispatched calls = %d, want 0 (template fetch failed)", dispatch.calls)
@@ -594,7 +594,7 @@ func TestRun_CompositionDiffFetchFails_NeverInsertsTurn(t *testing.T) {
 	})
 
 	if turns.calls != 0 {
-		t.Errorf("CompositionTurns.Create calls = %d, want 0 (diff/head-sha fetch failed)", turns.calls)
+		t.Errorf("CompositionTurns.CreateLockedTurn calls = %d, want 0 (diff/head-sha fetch failed)", turns.calls)
 	}
 	if dispatch.calls != 0 {
 		t.Errorf("CompositionDispatch.EnsureDispatched calls = %d, want 0 (diff/head-sha fetch failed)", dispatch.calls)
@@ -641,7 +641,7 @@ func TestRun_CompareDiffFetchFails_HeadSHAStillResolved_NeverInsertsTurn(t *test
 		t.Fatalf("GetPullRequest calls = %d, want 1 (head sha resolution must still be attempted)", diffFetcher.prCalls)
 	}
 	if turns.calls != 0 {
-		t.Errorf("CompositionTurns.Create calls = %d, want 0 -- a pass that never reviewed a diff must never dispatch a turn that could get recorded as a clean result", turns.calls)
+		t.Errorf("CompositionTurns.CreateLockedTurn calls = %d, want 0 -- a pass that never reviewed a diff must never dispatch a turn that could get recorded as a clean result", turns.calls)
 	}
 	if dispatch.calls != 0 {
 		t.Errorf("CompositionDispatch.EnsureDispatched calls = %d, want 0", dispatch.calls)
@@ -803,7 +803,7 @@ func TestRun_CompositionAnchorNotConfigured_DegradesGracefully(t *testing.T) {
 	})
 
 	if turns.calls != 1 {
-		t.Fatalf("CompositionTurns.Create calls = %d, want 1 (a nil CompositionAnchor must never block the turn dispatch itself)", turns.calls)
+		t.Fatalf("CompositionTurns.CreateLockedTurn calls = %d, want 1 (a nil CompositionAnchor must never block the turn dispatch itself)", turns.calls)
 	}
 	if checks.anchorCalls != 0 {
 		t.Errorf("CompositionAnchor.UpdateCompositionAnchor calls = %d, want 0 (nil dep)", checks.anchorCalls)

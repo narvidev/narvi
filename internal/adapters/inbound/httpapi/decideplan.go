@@ -351,7 +351,7 @@ func DecidePlanOnTx(
 		if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
 			correlationID = &id
 		}
-		createdTurn, err := turns.WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{
+		createdTurn, err := turns.WithTx(tx).CreateAndArmDispatch(ctx, sqlcgen.CreateTurnParams{
 			SessionID: sessionRow.ID,
 			Status:    sqlcgen.TurnStatusPending,
 			Prompt:    &prompt,

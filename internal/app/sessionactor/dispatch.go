@@ -370,6 +370,21 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, er
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		now := time.Now()
 
+		// The durable dispatch trigger (technical plan §2, §3.3): the
+		// transaction that created a turn armed the dispatch timer, and
+		// this evaluation is what it stands for, whatever asked for it --
+		// the post-commit trigger, the timer itself, a sandbox frame, a
+		// turn's end. Deleted under the actor-epoch lock transact took,
+		// which every transaction that creates a turn on an existing
+		// session takes too: a turn committed before that lock is read
+		// below, and one committed after it re-arms the timer after this
+		// delete, so it survives for the next round. Deleted first, so a
+		// turn this same transaction inserted later would re-arm it too
+		// (none does today). A rolled-back evaluation keeps it.
+		if err := a.deleteTimer(ctx, tx, TimerDispatch); err != nil {
+			return err
+		}
+
 		sessionRow, err := a.stores.session.WithTx(tx).Get(ctx, a.sessionID)
 		if err != nil {
 			return fmt.Errorf("sessionactor: get session: %w", err)

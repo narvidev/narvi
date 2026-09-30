@@ -40,15 +40,16 @@
 // createTurnLocked/CreateTurnCore, which would re-run checks -- the
 // open-turn/busy gate, the awaiting-plan gate -- that make no sense for a
 // system/decision-triggered turn), mirroring decideplan.go's own identical
-// choice to insert the post-approval implementation turn directly via
-// turns.Create. The new turn needs no explicit dispatch trigger of its own:
-// it lands Pending, and internal/app/sessionactor's own pre-existing
-// "re-evaluate dispatch state right after commit" step (§3.3,
-// handleEnsureDispatched, run unconditionally after every one of
-// OnTurnCompleted's three call sites' own transactions commits already, and
-// after the decide endpoint's own commit via httpapi.TriggerDispatch) picks
-// it up exactly like any other queued turn -- no new dispatch-triggering
-// code is needed here at all.
+// choice to insert the post-approval implementation turn directly, through
+// turns.CreateAndArmDispatch -- which, like every turn insert, arms the
+// session's dispatch timer in the same transaction (technical plan §2,
+// §3.3). The new turn needs no explicit dispatch trigger of its own: it
+// lands Pending, and internal/app/sessionactor's own "re-evaluate dispatch
+// state right after commit" step (§3.3, handleEnsureDispatched, run after
+// OnTurnCompleted's call sites' own transactions commit, and after the
+// decide endpoint's own commit via httpapi.TriggerDispatch) picks it up
+// exactly like any other queued turn; wherever that step does not run, or
+// fails, the dispatch timer delivers the same evaluation.
 
 package workflowengine
 
@@ -255,7 +256,7 @@ func dispatchNextAttempt(ctx context.Context, deps Deps, runID pgtype.UUID, toSt
 	if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
 		correlationID = &id
 	}
-	created, err := deps.Turns.Create(ctx, sqlcgen.CreateTurnParams{
+	created, err := deps.Turns.CreateAndArmDispatch(ctx, sqlcgen.CreateTurnParams{
 		SessionID:     sessionRow.ID,
 		Status:        sqlcgen.TurnStatusPending,
 		Prompt:        &dispatchedPrompt,

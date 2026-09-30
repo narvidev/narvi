@@ -125,7 +125,7 @@ func TestSessionStatus_ReleaseManifestCheckIsScheduledUntilItsCompositionTurnExi
 				Outbox:                 narvipg.NewOutboxStore(pool, false),
 				CompositionTemplates:   narvipg.NewPromptTemplateStore(pool),
 				CompositionDiffFetcher: &fakeReviewContextFetcher{pr: githubapi.PullRequest{HeadSHA: "sha-release-head", BaseRef: "main"}, diff: "+ the release's aggregate diff"},
-				CompositionTurns:       turns,
+				CompositionTurns:       narvipg.NewLockedTurnCreator(pool),
 				CompositionDispatch:    noopCompositionDispatch{},
 				Timeouts:               platform.DefaultTimeouts(),
 			}, platform.MustNewGitHubOutboundConfig("gho_bottoken"), platform.DefaultTimeouts())

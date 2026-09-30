@@ -147,7 +147,7 @@ func TestRun_CompositionTurnLeavesAPersonsStopStanding(t *testing.T) {
 		diff:             "diff --git a/x b/x\n+hello\n",
 	}
 	deps := fullCompositionDeps(lister, &fakeOutboxEnqueuer{}, templates, diffFetcher, &fakeCompositionTurnInserter{}, &fakeCompositionDispatcher{})
-	deps.CompositionTurns = turns
+	deps.CompositionTurns = narvipg.NewLockedTurnCreator(pool)
 
 	releasereview.Run(ctx, discardLogger(), deps, releasereview.Input{
 		SessionID: session.ID,

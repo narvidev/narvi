@@ -11,6 +11,25 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const armSessionDispatchTimer = `-- name: ArmSessionDispatchTimer :exec
+INSERT INTO session_timers (session_id, name, fires_at)
+VALUES ($1, 'dispatch', now())
+ON CONFLICT (session_id, name) DO UPDATE
+    SET fires_at = now(), armed_at = now()
+`
+
+// The session's dispatch timer (technical plan §2, §3.3), armed due at once
+// on the database's clock, in the transaction that creates a turn: the only
+// caller is TurnStore.CreateAndArmDispatch, which inserts the turn in the
+// same transaction. 'dispatch' is sessionactor.TimerDispatch; the kind is
+// named here rather than passed in, so no caller can arm another kind this
+// way. A re-arm moves fires_at back to now even while the pump holds the
+// row claimed, and stamps armed_at like every arm (UpsertSessionTimer).
+func (q *Queries) ArmSessionDispatchTimer(ctx context.Context, sessionID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, armSessionDispatchTimer, sessionID)
+	return err
+}
+
 const claimDueTimer = `-- name: ClaimDueTimer :one
 UPDATE session_timers
 SET fires_at = $1

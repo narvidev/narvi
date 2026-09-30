@@ -14,6 +14,19 @@ ON CONFLICT (session_id, name) DO UPDATE
     SET fires_at = EXCLUDED.fires_at, armed_at = now()
 RETURNING *;
 
+-- name: ArmSessionDispatchTimer :exec
+-- The session's dispatch timer (technical plan §2, §3.3), armed due at once
+-- on the database's clock, in the transaction that creates a turn: the only
+-- caller is TurnStore.CreateAndArmDispatch, which inserts the turn in the
+-- same transaction. 'dispatch' is sessionactor.TimerDispatch; the kind is
+-- named here rather than passed in, so no caller can arm another kind this
+-- way. A re-arm moves fires_at back to now even while the pump holds the
+-- row claimed, and stamps armed_at like every arm (UpsertSessionTimer).
+INSERT INTO session_timers (session_id, name, fires_at)
+VALUES ($1, 'dispatch', now())
+ON CONFLICT (session_id, name) DO UPDATE
+    SET fires_at = now(), armed_at = now();
+
 -- name: GetSessionTimer :one
 SELECT * FROM session_timers
 WHERE session_id = $1 AND name = $2;

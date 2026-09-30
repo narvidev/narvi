@@ -59,6 +59,7 @@ func TestClassifyTimer_Table(t *testing.T) {
 		{sessionactor.TimerTerminalGrace, sessionactor.TimerWorkSandboxOnly, false},
 		{sessionactor.TimerTurnDeadline, sessionactor.TimerWorkTurnInFlight, false},
 		{sessionactor.TimerStop, sessionactor.TimerWorkTurnInFlight, false},
+		{sessionactor.TimerDispatch, sessionactor.TimerWorkTurnInFlight, false},
 		{sessionactor.TimerReviewRetriggerDebounce, sessionactor.TimerWorkCreatesTurn, true},
 	} {
 		got, ok := sessionactor.ClassifyTimer(tc.name)
@@ -134,7 +135,7 @@ func TestTimerCountsAsScheduledWork_Table(t *testing.T) {
 		if got := sessionactor.TimerCountsAsScheduledWork(sessionactor.TimerReviewRetriggerDebounce, canFire); got != canFire {
 			t.Errorf("TimerCountsAsScheduledWork(debounce, canFire %v) = %v, want %v", canFire, got, canFire)
 		}
-		for _, name := range []string{sessionactor.TimerConnectingDeadline, sessionactor.TimerLivenessCheck, sessionactor.TimerInactivity, sessionactor.TimerTerminalGrace, sessionactor.TimerTurnDeadline, sessionactor.TimerStop, "a_kind_from_a_newer_binary"} {
+		for _, name := range []string{sessionactor.TimerConnectingDeadline, sessionactor.TimerLivenessCheck, sessionactor.TimerInactivity, sessionactor.TimerTerminalGrace, sessionactor.TimerTurnDeadline, sessionactor.TimerStop, sessionactor.TimerDispatch, "a_kind_from_a_newer_binary"} {
 			if got, want := sessionactor.TimerCountsAsScheduledWork(name, canFire), sessionactor.TimerCanCreateWork(name); got != want {
 				t.Errorf("TimerCountsAsScheduledWork(%q, canFire %v) = %v, want TimerCanCreateWork's %v", name, canFire, got, want)
 			}
