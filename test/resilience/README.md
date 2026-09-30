@@ -547,3 +547,7 @@ generally — nothing to replay here.
 | 15 | Refresh-in-flight spawn | Covered — Step 42 |
 | 16 | Non-idempotent-setup boot | Covered — Step 42 |
 | 17 | Restore-with-docker | Covered — Step 74 |
+
+Numbers 18-21 are taken by the scenarios `docs/TECHNICAL_PLAN.md` §9.3 appends for Phases 13, 15
+and 18 (rotation and the interrupted turn, fresh-lineage continuity, the spend cap and freeze, the
+Kubernetes provider), none built yet. A new scenario takes 22.

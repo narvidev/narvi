@@ -182,7 +182,7 @@ func seedPRWithVerdictContext(ctx context.Context, t *testing.T, pool *pgxpool.P
 		ProposedShippable: review.ProposedShippableAuto,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if _, err := appreviewverdict.Insert(ctx, narvipg.NewReviewVerdictStore(pool), narvipg.NewRepoSettingsStore(pool), false, repoFullName, int32(prNumber), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed the verdict for %s#%d: %v", repoFullName, prNumber, err)
 	}

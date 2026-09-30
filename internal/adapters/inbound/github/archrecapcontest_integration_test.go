@@ -83,7 +83,7 @@ func seedDeepVerdictWithArchDecisions(ctx context.Context, t *testing.T, reviewV
 		DocsDrift:         review.DocsDriftStateNone,
 		ProposedShippable: review.ProposedShippableAuto,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	digest := reviewpost.Digest{
 		Summary:             "Test-seeded deep-path verdict.",
 		DescriptionAdequacy: review.DescriptionAdequacyOK,

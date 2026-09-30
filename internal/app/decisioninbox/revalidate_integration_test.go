@@ -406,7 +406,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			ProposedShippable: review.ProposedShippableAuto,
 			FilesChanged:      3,
 		}
-		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict whose recorded ancestor chain matches the live resolution"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 			t.Fatalf("insert second verdict with a matching ancestor chain: %v", err)
 		}
@@ -443,7 +443,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			ProposedShippable: review.ProposedShippableAuto,
 			FilesChanged:      3,
 		}
-		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict with a real ancestor chain"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 			t.Fatalf("insert second verdict with a real ancestor chain: %v", err)
 		}
@@ -566,7 +566,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			ProposedShippable: review.ProposedShippableAuto,
 			FilesChanged:      3,
 		}
-		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict whose ancestor chain has since advanced"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 			t.Fatalf("insert second verdict with an advanced ancestor chain: %v", err)
 		}
@@ -626,7 +626,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			ProposedShippable: review.ProposedShippableAuto,
 			FilesChanged:      3,
 		}
-		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict whose ancestor chain advanced, unconfirmed"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 			t.Fatalf("insert second verdict with an advanced-but-unconfirmed ancestor chain: %v", err)
 		}
@@ -1482,7 +1482,7 @@ func TestRevalidateForMerge_LyingVerdictAgainstReal300FileSensitivePR(t *testing
 		FilesChanged:      1,   // LIE: claims a trivial, one-file diff
 		BlastRadius:       nil, // LIE: claims nothing sensitive touched
 	}
-	lyingVerdict.Shippable = review.ComputeShippable(lyingVerdict.RiskLevel, lyingVerdict.TestsCoverage, lyingVerdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	lyingVerdict.Shippable = review.ComputeShippable(lyingVerdict.RiskLevel, lyingVerdict.TestsCoverage, lyingVerdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 	if lyingVerdict.Shippable != review.ShippableAuto {
 		t.Fatalf("test setup: lyingVerdict.Shippable = %v, want auto", lyingVerdict.Shippable)
 	}

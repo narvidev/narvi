@@ -2,6 +2,8 @@ package reviewpost_test
 
 import (
 	"errors"
+	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -209,6 +211,27 @@ func TestValidateVerdictInput(t *testing.T) {
 			mutate:  func(in *reviewpost.VerdictInput) { in.CounterReview = "bogus" },
 			wantErr: nil,
 		},
+		{
+			name:    "counterReview=uncorroborated is rejected on an unresolved-depth path -- only the server resolves that state",
+			mutate:  func(in *reviewpost.VerdictInput) { in.CounterReview = review.CounterReviewUncorroborated },
+			wantErr: reviewpost.ErrServerOnlyCounterReview,
+		},
+		{
+			name: "counterReview=uncorroborated is rejected on the light path -- only the server resolves that state",
+			mutate: func(in *reviewpost.VerdictInput) {
+				in.ReviewDepth = reviewtriage.DepthLight
+				in.CounterReview = review.CounterReviewUncorroborated
+			},
+			wantErr: reviewpost.ErrServerOnlyCounterReview,
+		},
+		{
+			name: "counterReview=skipped stays legal on the light path",
+			mutate: func(in *reviewpost.VerdictInput) {
+				in.ReviewDepth = reviewtriage.DepthLight
+				in.CounterReview = review.CounterReviewSkipped
+			},
+			wantErr: nil,
+		},
 	}
 
 	for _, tc := range tests {
@@ -310,7 +333,7 @@ func TestBuildVerdict_ShippableAlwaysComputedNeverCopiedFromProposed(t *testing.
 	in.TestsCoverage = review.TestsCoverageStateAdequate
 	in.ProposedShippable = review.ProposedShippableAuto // the model insists "auto" -- must be ignored.
 
-	got := reviewpost.BuildVerdict(in)
+	got, _ := reviewpost.BuildVerdict(in)
 	if got.Shippable != review.ShippableBlock {
 		t.Errorf("Shippable = %q, want %q (ProposedShippableAuto must never override the computed floor)", got.Shippable, review.ShippableBlock)
 	}
@@ -335,7 +358,7 @@ func TestBuildVerdict_MisleadingAdequacyRaisesShippable(t *testing.T) {
 	in.TestsCoverage = review.TestsCoverageStateAdequate
 	in.Digest.DescriptionAdequacy = review.DescriptionAdequacyMisleading
 
-	got := reviewpost.BuildVerdict(in)
+	got, _ := reviewpost.BuildVerdict(in)
 	if got.Shippable != review.ShippableNeedsHuman {
 		t.Errorf("Shippable = %q, want %q (a misleading description must raise Shippable off an otherwise-clean auto baseline)", got.Shippable, review.ShippableNeedsHuman)
 	}
@@ -357,11 +380,11 @@ func TestBuildVerdict_AdequacyNeverAffectsRiskLevel(t *testing.T) {
 
 	okInput := base
 	okInput.Digest.DescriptionAdequacy = review.DescriptionAdequacyOK
-	okVerdict := reviewpost.BuildVerdict(okInput)
+	okVerdict, _ := reviewpost.BuildVerdict(okInput)
 
 	misleadingInput := base
 	misleadingInput.Digest.DescriptionAdequacy = review.DescriptionAdequacyMisleading
-	misleadingVerdict := reviewpost.BuildVerdict(misleadingInput)
+	misleadingVerdict, _ := reviewpost.BuildVerdict(misleadingInput)
 
 	if okVerdict.RiskLevel != review.RiskLevelMedium {
 		t.Fatalf("test setup: okVerdict.RiskLevel = %q, want %q", okVerdict.RiskLevel, review.RiskLevelMedium)
@@ -411,7 +434,7 @@ func TestBuildVerdict_CounterReviewSkippedRaisesShippable(t *testing.T) {
 		t.Fatalf("test setup: ValidateVerdictInput() = %v, want nil", err)
 	}
 
-	got := reviewpost.BuildVerdict(in)
+	got, _ := reviewpost.BuildVerdict(in)
 	if got.Shippable != review.ShippableNeedsHuman {
 		t.Errorf("Shippable = %q, want %q (a skipped counter-review must raise Shippable off an otherwise-clean auto baseline on the deep path)", got.Shippable, review.ShippableNeedsHuman)
 	}
@@ -446,7 +469,7 @@ func TestBuildVerdict_CounterReviewFloorInertOnLightPath(t *testing.T) {
 		t.Fatalf("test setup: ValidateVerdictInput() = %v, want nil (counterReview is never validated on the light path)", err)
 	}
 
-	got := reviewpost.BuildVerdict(in)
+	got, _ := reviewpost.BuildVerdict(in)
 	if got.Shippable != review.ShippableAuto {
 		t.Errorf("Shippable = %q, want %q (an unset CounterReview must be inert on the light path, never floored as though it were 'skipped')", got.Shippable, review.ShippableAuto)
 	}
@@ -483,7 +506,7 @@ func TestBuildVerdict_ExplicitCounterReviewSkippedNeverOverwrittenOnLightPath(t 
 		t.Fatalf("test setup: ValidateVerdictInput() = %v, want nil (CounterReview is never validated on the light path, so an explicit \"skipped\" is legal input there)", err)
 	}
 
-	got := reviewpost.BuildVerdict(in)
+	got, _ := reviewpost.BuildVerdict(in)
 	if got.Shippable != review.ShippableNeedsHuman {
 		t.Errorf("Shippable = %q, want %q (an EXPLICIT CounterReview: skipped must still raise Shippable, even on a verdict this function cannot confirm is genuinely deep-path)", got.Shippable, review.ShippableNeedsHuman)
 	}
@@ -514,7 +537,7 @@ func TestBuildVerdict_CorroboratedDeepPathKeepsCounterReviewDoneFloor(t *testing
 		t.Fatalf("test setup: ValidateVerdictInput() = %v, want nil", err)
 	}
 
-	got := reviewpost.BuildVerdict(in)
+	got, _ := reviewpost.BuildVerdict(in)
 	if got.Shippable != review.ShippableAuto {
 		t.Errorf("Shippable = %q, want %q (a corroborated done claim on the deep path must keep the ordinary CounterReviewDone floor)", got.Shippable, review.ShippableAuto)
 	}
@@ -548,7 +571,7 @@ func TestBuildVerdict_UncorroboratedDeepPathDoneFloorsToNeedsHuman(t *testing.T)
 		t.Fatalf("test setup: ValidateVerdictInput() = %v, want nil", err)
 	}
 
-	got := reviewpost.BuildVerdict(in)
+	got, _ := reviewpost.BuildVerdict(in)
 	if got.Shippable != review.ShippableNeedsHuman {
 		t.Errorf("Shippable = %q, want %q (a deep-path done claim the server could NOT corroborate must be floored to needs_human)", got.Shippable, review.ShippableNeedsHuman)
 	}
@@ -582,7 +605,7 @@ func TestBuildVerdict_ExplicitSkippedUnaffectedByCorroboration(t *testing.T) {
 			t.Fatalf("test setup (corroborated=%v): ValidateVerdictInput() = %v, want nil", corroborated, err)
 		}
 
-		got := reviewpost.BuildVerdict(in)
+		got, _ := reviewpost.BuildVerdict(in)
 		if got.Shippable != review.ShippableNeedsHuman {
 			t.Errorf("corroborated=%v: Shippable = %q, want %q (an explicit skipped self-report floors regardless of CounterReviewCorroborated)", corroborated, got.Shippable, review.ShippableNeedsHuman)
 		}
@@ -627,9 +650,206 @@ func TestBuildVerdict_CorroborationSubstitutionInertOnLightPath(t *testing.T) {
 		t.Fatalf("test setup: ValidateVerdictInput() = %v, want nil (counterReview is never validated on the light path)", err)
 	}
 
-	got := reviewpost.BuildVerdict(in)
+	got, _ := reviewpost.BuildVerdict(in)
 	if got.Shippable != review.ShippableAuto {
 		t.Errorf("Shippable = %q, want %q (the corroboration substitution must be inert on the light path, never floored via a CounterReview:\"done\" echo paired with an always-false CounterReviewCorroborated)", got.Shippable, review.ShippableAuto)
+	}
+}
+
+// TestBuildVerdict_NamesItsBlockers pins, at the posting endpoint's own
+// construction site, the blockers BuildVerdict returns beside the Verdict
+// (§26.1): the counter-review input as BuildVerdict resolves it --
+// including a deep-path done claim the server could not corroborate,
+// named uncorroborated rather than skipped -- and every other input as
+// the reviewer reported it. Mutation coverage: collapsing the
+// uncorroborated state back into skipped makes the uncorroborated case
+// fail here, since its blocker would then read "skipped"; and a
+// substitution that fires only when nothing else already holds
+// needs_human fails the medium-risk case, which must name both.
+func TestBuildVerdict_NamesItsBlockers(t *testing.T) {
+	tests := []struct {
+		name         string
+		mutate       func(in *reviewpost.VerdictInput)
+		wantClass    review.Shippable
+		wantBlockers []review.Blocker
+	}{
+		{
+			name:         "a clean light-path verdict names none",
+			mutate:       func(_ *reviewpost.VerdictInput) {},
+			wantClass:    review.ShippableAuto,
+			wantBlockers: nil,
+		},
+		{
+			name:         "a medium-risk verdict with every floor clean names its risk level",
+			mutate:       func(in *reviewpost.VerdictInput) { in.RiskLevel = review.RiskLevelMedium },
+			wantClass:    review.ShippableNeedsHuman,
+			wantBlockers: []review.Blocker{{Input: review.ShippableInputRiskLevel, Value: "medium", Level: review.ShippableNeedsHuman}},
+		},
+		{
+			name:         "a verdict floored by a coverage gap names the coverage gap",
+			mutate:       func(in *reviewpost.VerdictInput) { in.TestsCoverage = review.TestsCoverageStateInsufficient },
+			wantClass:    review.ShippableNeedsHuman,
+			wantBlockers: []review.Blocker{{Input: review.ShippableInputTestsCoverage, Value: "insufficient", Level: review.ShippableNeedsHuman}},
+		},
+		{
+			name: "a misleading description is named from the digest",
+			mutate: func(in *reviewpost.VerdictInput) {
+				in.Digest.DescriptionAdequacy = review.DescriptionAdequacyMisleading
+			},
+			wantClass:    review.ShippableNeedsHuman,
+			wantBlockers: []review.Blocker{{Input: review.ShippableInputDescriptionAdequacy, Value: "misleading", Level: review.ShippableNeedsHuman}},
+		},
+		{
+			name: "a deep-path done claim the server could not corroborate is named uncorroborated",
+			mutate: func(in *reviewpost.VerdictInput) {
+				*in = deepValidInput()
+				in.CounterReview = review.CounterReviewDone
+				in.CounterReviewCorroborated = false
+			},
+			wantClass:    review.ShippableNeedsHuman,
+			wantBlockers: []review.Blocker{{Input: review.ShippableInputCounterReview, Value: "uncorroborated", Level: review.ShippableNeedsHuman}},
+		},
+		{
+			name: "an uncorroborated done is named beside a medium risk that already holds needs_human",
+			mutate: func(in *reviewpost.VerdictInput) {
+				*in = deepValidInput()
+				in.RiskLevel = review.RiskLevelMedium
+				in.CounterReview = review.CounterReviewDone
+				in.CounterReviewCorroborated = false
+			},
+			wantClass: review.ShippableNeedsHuman,
+			wantBlockers: []review.Blocker{
+				{Input: review.ShippableInputRiskLevel, Value: "medium", Level: review.ShippableNeedsHuman},
+				{Input: review.ShippableInputCounterReview, Value: "uncorroborated", Level: review.ShippableNeedsHuman},
+			},
+		},
+		{
+			name: "a deep-path done claim the server corroborated names none",
+			mutate: func(in *reviewpost.VerdictInput) {
+				*in = deepValidInput()
+				in.CounterReview = review.CounterReviewDone
+				in.CounterReviewCorroborated = true
+			},
+			wantClass:    review.ShippableAuto,
+			wantBlockers: nil,
+		},
+		{
+			name: "a deep-path skip the reviewer reported is named skipped, corroborated or not",
+			mutate: func(in *reviewpost.VerdictInput) {
+				*in = deepValidInput()
+				in.CounterReview = review.CounterReviewSkipped
+				in.CounterReviewCorroborated = true
+			},
+			wantClass:    review.ShippableNeedsHuman,
+			wantBlockers: []review.Blocker{{Input: review.ShippableInputCounterReview, Value: "skipped", Level: review.ShippableNeedsHuman}},
+		},
+		{
+			name:         "an explicit skip on the light path is named skipped",
+			mutate:       func(in *reviewpost.VerdictInput) { in.CounterReview = review.CounterReviewSkipped },
+			wantClass:    review.ShippableNeedsHuman,
+			wantBlockers: []review.Blocker{{Input: review.ShippableInputCounterReview, Value: "skipped", Level: review.ShippableNeedsHuman}},
+		},
+		{
+			name:         "a light-path done echo is inert, never named uncorroborated",
+			mutate:       func(in *reviewpost.VerdictInput) { in.CounterReview = review.CounterReviewDone },
+			wantClass:    review.ShippableAuto,
+			wantBlockers: nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			in := validInput()
+			tc.mutate(&in)
+			if err := reviewpost.ValidateVerdictInput(in); err != nil {
+				t.Fatalf("test setup: ValidateVerdictInput() = %v, want nil", err)
+			}
+
+			v, shippable := reviewpost.BuildVerdict(in)
+			if v.Shippable != tc.wantClass {
+				t.Errorf("Verdict.Shippable = %q, want %q", v.Shippable, tc.wantClass)
+			}
+			if shippable.Class() != v.Shippable {
+				t.Errorf("assessment class %q differs from Verdict.Shippable %q", shippable.Class(), v.Shippable)
+			}
+			if got := shippable.Blockers(); !reflect.DeepEqual(got, tc.wantBlockers) {
+				t.Errorf("Blockers() = %+v, want %+v", got, tc.wantBlockers)
+			}
+		})
+	}
+}
+
+// TestBuildVerdict_UncorroboratedKeepsEveryDecision is the audit behind
+// adding CounterReviewUncorroborated: every verdict BuildVerdict can be
+// handed across depth (deep, light, unresolved), the counter-review value
+// in the payload (done, skipped, unset, garbled, and even the server-only
+// uncorroborated, which ValidateVerdictInput rejects on every path but
+// BuildVerdict does not re-check), corroboration, and a clean or medium
+// risk, computes the SAME Shippable it did when an uncorroborated claim
+// was folded into skipped -- the expected class below is that earlier
+// rule, written out -- and returns an assessment whose class is the
+// Verdict's Shippable and whose blockers are empty exactly when it is
+// auto. So the new state moves no decision anywhere Shippable is read
+// (the formal review event, the persisted review_verdicts row,
+// auto-approval, auto-merge, the readout); it only changes what the
+// blocker says. And it always says it: the uncorroborated counter-review
+// blocker is present exactly when the deep path's done went unconfirmed
+// (or an unvalidated deep payload carried the value itself), whatever
+// else already holds the class at needs_human.
+func TestBuildVerdict_UncorroboratedKeepsEveryDecision(t *testing.T) {
+	depths := []reviewtriage.ReviewDepth{reviewtriage.DepthDeep, reviewtriage.DepthLight, ""}
+	counterReviews := []review.CounterReviewStatus{review.CounterReviewDone, review.CounterReviewSkipped, "", "maybe", review.CounterReviewUncorroborated}
+	risks := []review.RiskLevel{review.RiskLevelLow, review.RiskLevelMedium}
+
+	for _, depth := range depths {
+		for _, cr := range counterReviews {
+			for _, corroborated := range []bool{true, false} {
+				for _, risk := range risks {
+					name := fmt.Sprintf("depth=%q counterReview=%q corroborated=%v risk=%s", depth, cr, corroborated, risk)
+					in := validInput()
+					in.ReviewDepth = depth
+					in.CounterReview = cr
+					in.CounterReviewCorroborated = corroborated
+					in.RiskLevel = risk
+
+					// The counter-review floor as it stood with an
+					// uncorroborated claim read as skipped: on the deep
+					// path, anything but a corroborated done floors; off
+					// it, only an explicit skip does.
+					counterReviewFloors := cr == review.CounterReviewSkipped
+					if depth == reviewtriage.DepthDeep {
+						counterReviewFloors = cr != review.CounterReviewDone || !corroborated
+					}
+					want := review.ShippableAuto
+					if counterReviewFloors || risk == review.RiskLevelMedium {
+						want = review.ShippableNeedsHuman
+					}
+
+					v, shippable := reviewpost.BuildVerdict(in)
+					if v.Shippable != want {
+						t.Errorf("%s: Verdict.Shippable = %q, want %q", name, v.Shippable, want)
+					}
+					if shippable.Class() != v.Shippable {
+						t.Errorf("%s: assessment class %q differs from Verdict.Shippable %q", name, shippable.Class(), v.Shippable)
+					}
+					if (len(shippable.Blockers()) == 0) != (v.Shippable == review.ShippableAuto) {
+						t.Errorf("%s: Shippable %q with blockers %+v; want none exactly when auto", name, v.Shippable, shippable.Blockers())
+					}
+
+					wantUncorroborated := depth == reviewtriage.DepthDeep &&
+						((cr == review.CounterReviewDone && !corroborated) || cr == review.CounterReviewUncorroborated)
+					gotUncorroborated := false
+					for _, b := range shippable.Blockers() {
+						if b.Input == review.ShippableInputCounterReview && b.Value == string(review.CounterReviewUncorroborated) {
+							gotUncorroborated = true
+						}
+					}
+					if gotUncorroborated != wantUncorroborated {
+						t.Errorf("%s: uncorroborated counter-review blocker present = %v, want %v (blockers %+v)", name, gotUncorroborated, wantUncorroborated, shippable.Blockers())
+					}
+				}
+			}
+		}
 	}
 }
 
@@ -657,7 +877,7 @@ func TestComputeShippable_FactCheckSkippedNeverRaisesShippable(t *testing.T) {
 	if err := reviewpost.ValidateVerdictInput(doneInput); err != nil {
 		t.Fatalf("test setup: ValidateVerdictInput(done) = %v, want nil", err)
 	}
-	doneVerdict := reviewpost.BuildVerdict(doneInput)
+	doneVerdict, _ := reviewpost.BuildVerdict(doneInput)
 
 	skippedInput := base
 	skippedInput.FactCheck = reviewpost.FactCheckSkipped
@@ -665,7 +885,7 @@ func TestComputeShippable_FactCheckSkippedNeverRaisesShippable(t *testing.T) {
 	if err := reviewpost.ValidateVerdictInput(skippedInput); err != nil {
 		t.Fatalf("test setup: ValidateVerdictInput(skipped) = %v, want nil", err)
 	}
-	skippedVerdict := reviewpost.BuildVerdict(skippedInput)
+	skippedVerdict, _ := reviewpost.BuildVerdict(skippedInput)
 
 	if doneVerdict.Shippable != review.ShippableAuto {
 		t.Fatalf("test setup: doneVerdict.Shippable = %q, want %q", doneVerdict.Shippable, review.ShippableAuto)

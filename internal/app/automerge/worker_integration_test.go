@@ -499,7 +499,7 @@ func (rs *automergeTestRig) seedEligiblePR(ctx context.Context, t *testing.T, re
 		ProposedShippable: review.ProposedShippableAuto,
 		FilesChanged:      3,
 	}
-	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone)
+	verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
 
 	// §30.8: ListLatestAutoApprovedInRepo now excludes any verdict whose
 	// own repo has not been promoted past the live_egress_promoted_at
