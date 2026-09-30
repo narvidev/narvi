@@ -65,6 +65,8 @@ type interactiveTestRig struct {
 	sessions *narvipg.SessionStore
 	turns    *narvipg.TurnStore
 	plans    *narvipg.PlanStore
+	auditLog *narvipg.AuditLogStore
+	registry *sessionactor.Registry
 
 	requests chan recordedSlackRequest
 
@@ -101,6 +103,16 @@ const interactivityDefaultUserID = "U0INTERACTIVE-DEFAULT"
 // doesn't have to wait out the real production default.
 func newInteractiveTestRigWithTimeouts(t *testing.T, pool *pgxpool.Pool, timeouts platform.Timeouts) *interactiveTestRig {
 	t.Helper()
+	return newInteractiveTestRigWithDeps(t, pool, timeouts, nil)
+}
+
+// newInteractiveTestRigWithDeps is newInteractiveTestRigWithTimeouts with
+// one more hook: mutate, when non-nil, edits the fully-wired
+// InteractiveDeps just before the handler is built, so a test can swap
+// one dependency (e.g. a closed pool behind CreateTurnCore's transaction)
+// while every other one, and the rig's own stores, stay the real ones.
+func newInteractiveTestRigWithDeps(t *testing.T, pool *pgxpool.Pool, timeouts platform.Timeouts, mutate func(*slack.InteractiveDeps)) *interactiveTestRig {
+	t.Helper()
 	ctx := context.Background()
 
 	defaultActor := linkSlackIdentityForTest(ctx, t, pool, interactivityDefaultUserID, sqlcgen.UserRoleMaintainer)
@@ -132,7 +144,7 @@ func newInteractiveTestRigWithTimeouts(t *testing.T, pool *pgxpool.Pool, timeout
 
 	slackClient := slackapi.New(fakeSlack.Client(), fakeSlack.URL, "test-bot-token")
 
-	handler := slack.NewInteractivityHandler(slack.InteractiveDeps{
+	deps := slack.InteractiveDeps{
 		Pool:                pool,
 		Sessions:            sessions,
 		Turns:               turns,
@@ -162,9 +174,13 @@ func newInteractiveTestRigWithTimeouts(t *testing.T, pool *pgxpool.Pool, timeout
 		},
 		SigningSecret: testSigningSecret,
 		Timeouts:      timeouts,
-	})
+	}
+	if mutate != nil {
+		mutate(&deps)
+	}
+	handler := slack.NewInteractivityHandler(deps)
 
-	return &interactiveTestRig{handler: handler, pool: pool, sessions: sessions, turns: turns, plans: plans, requests: requests, defaultActorUserID: defaultActor.ID}
+	return &interactiveTestRig{handler: handler, pool: pool, sessions: sessions, turns: turns, plans: plans, auditLog: auditLog, registry: registry, requests: requests, defaultActorUserID: defaultActor.ID}
 }
 
 // signedInteractivityRequest builds a real, correctly-signed POST

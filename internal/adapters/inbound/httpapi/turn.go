@@ -207,8 +207,8 @@ type CreateTurnError struct {
 	Message string
 
 	// sentinel is set ONLY for a small, well-known set of reasons a caller
-	// might need to recognize distinctly via errors.Is -- currently just
-	// ErrPlanAwaitingApproval below. Every OTHER CreateTurnError
+	// might need to recognize distinctly via errors.Is -- currently
+	// ErrPlanAwaitingApproval and ErrTurnAlreadyOpen below. Every OTHER CreateTurnError
 	// construction leaves this nil, so errors.Is against anything is
 	// simply false for those, exactly as before this field existed.
 	// Mirrors internal/domain/plan.IllegalTransitionError's own identical
@@ -254,6 +254,17 @@ func (e *CreateTurnError) Unwrap() error { return e.sentinel }
 // producing a silent, self-inflicted redelivery retry storm.
 var ErrPlanAwaitingApproval = errors.New("httpapi: plan awaiting approval")
 
+// ErrTurnAlreadyOpen is the sentinel RejectIfOpen's refusal carries: the
+// 409 createTurnLocked returns while any turn of the session is pending,
+// dispatched or processing. REST forwards that refusal's Status/Message
+// as it always has. Slack's Request-changes modal (interactive.go's
+// handleViewSubmission) recognizes it through errors.Is, never by its
+// Message, to keep the modal open with the person's feedback and say a
+// turn is running, while any other failure of the create shows its
+// generic error. DecidePlan's approval gate refuses the same condition
+// with its own sentinel, ErrPlanOpenTurnInFlight (decideplan.go).
+var ErrTurnAlreadyOpen = errors.New("httpapi: a turn is already open for this session")
+
 // planAwaitingApprovalMessage is ErrPlanAwaitingApproval's own REST-facing
 // text -- REST's 409 body verbatim (CreateTurn's own doc comment above),
 // mirroring the existing open-turn 409's shape exactly (same CreateTurnError
@@ -272,11 +283,12 @@ type CreateTurnPolicy int
 
 const (
 	// RejectIfOpen refuses to enqueue a second turn while one is already
-	// open, returning a 409 CreateTurnError -- the REST relaunch
-	// endpoint's own long-standing policy (CreateTurn's own doc comment
-	// above). Also used, unchanged, by Slack's "Request changes" modal
-	// submission (interactive.go's own handleViewSubmission), which has
-	// always gone through this exact function.
+	// open, returning a 409 CreateTurnError carrying ErrTurnAlreadyOpen --
+	// the REST relaunch endpoint's own long-standing policy (CreateTurn's
+	// own doc comment above). Also used, unchanged, by Slack's "Request
+	// changes" modal submission (interactive.go's own
+	// handleViewSubmission), which has always gone through this exact
+	// function and answers that refusal with an inline modal error.
 	RejectIfOpen CreateTurnPolicy = iota
 	// DropIfOpen silently declines to enqueue while a turn is already
 	// open: the returned turn is the zero value, wasCreated is false, and
@@ -736,7 +748,7 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 			if policy == DropIfOpen {
 				return sqlcgen.Turn{}, false, nil
 			}
-			return sqlcgen.Turn{}, false, &CreateTurnError{Status: http.StatusConflict, Message: "a turn is already pending, dispatched, or processing for this session"}
+			return sqlcgen.Turn{}, false, &CreateTurnError{Status: http.StatusConflict, Message: "a turn is already pending, dispatched, or processing for this session", sentinel: ErrTurnAlreadyOpen}
 		}
 	}
 
