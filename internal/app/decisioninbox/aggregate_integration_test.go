@@ -207,6 +207,11 @@ type fakeDecisionInboxSourceControl struct {
 	// since it answers every branch identically. Every EXISTING test that
 	// never populates this map is unaffected.
 	resolveBranchSHAByBranch map[string]string
+	// resolveBranchSHAErrByBranch fails the resolution of one branch alone
+	// -- checked before resolveBranchSHAByBranch -- so a test can fail the
+	// base branch's read while its ancestor link's still answers, or the
+	// other way round.
+	resolveBranchSHAErrByBranch map[string]error
 
 	// isAncestorResult/isAncestorErr/isAncestorCalls (D3, second
 	// adversarial-review round) back IsAncestor below -- the fast-forward
@@ -352,6 +357,9 @@ func (f *fakeDecisionInboxSourceControl) ResolveBranchSHA(ctx context.Context, s
 	}
 	if f.resolveBranchSHAErr != nil {
 		return "", "", f.resolveBranchSHAErr
+	}
+	if err, ok := f.resolveBranchSHAErrByBranch[spec.Branch]; ok {
+		return "", "", err
 	}
 	if sha, ok := f.resolveBranchSHAByBranch[spec.Branch]; ok {
 		return sha, spec.Branch, nil
@@ -1508,7 +1516,7 @@ func TestBuild_HasChangesRequestedDemotesFromReadyToMerge(t *testing.T) {
 // own ResolveBranchSHA fallback already resolves "main" to elsewhere in
 // this file) -- proving the comparison uses the LIVE resolution, never
 // the cached SHA, and stays ready_to_merge when they genuinely agree.
-// Mutation-test target: deleting `CurrentAncestorChain: currentAncestorChain,`
+// Mutation-test target: deleting `CurrentAncestorChain: live.AncestorChain,`
 // from either EligibilityInput literal in aggregate.go (defaulting it to
 // nil) would wrongly mismatch this otherwise-agreeing fixture, turning
 // this test's own KindReadyToMerge assertion into KindNeedsReview.
@@ -1647,8 +1655,12 @@ func TestBuild_AncestorChainMatches_LiveResolved_StaysReadyToMerge(t *testing.T)
 // "recorded before it was ever stacked" precondition this scenario
 // needs.
 //
-// Mutation-test targets, each pinned by its OWN assertion below (not
-// both by either, per the execution above):
+// Since row 220 the read model resolves the link through
+// reviewfreshness.ReadLive, whose StepResolveAncestor failure presets no
+// marker at all: computeRealEligibility fails the row closed and marks it
+// degraded on the failure itself, so both assertions below pin that one
+// branch. The targets this test was written against, in the read model's
+// own former block:
 //   - Deleting the currentAncestorChain block's own preset
 //     `currentAncestorChain = unknownMarker` default (leaving it at nil
 //     unless the success case fires) flips Kind from needs_review to
@@ -1737,7 +1749,9 @@ func TestBuild_AncestorChainUnknown_LiveResolveFails_DemotesAndMarksDegraded(t *
 // Mutation-test target: reinstating `&& pr.AncestorChain[0].Ref != ""`
 // on this block's own guard (this fix's own inverse) turns this test's
 // own KindNeedsReview/SCMFetchFailed assertions back into
-// KindReadyToMerge/false.
+// KindReadyToMerge/false. Since row 220 that guard is
+// reviewfreshness.ReadLive's StepAncestorRefUnreadable check, which the
+// read model reads through.
 func TestBuild_AncestorChainDegradedRef_DemotesAndMarksDegraded(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
@@ -1893,7 +1907,7 @@ func TestBuild_AncestorChainAdvanced_ConfirmedFastForward_StaysReadyToMerge(t *t
 // autoapproval.ancestorChainEqual(nil, nil) trivially passes regardless
 // of whether CurrentAncestorChain's own wiring line even exists --
 // exactly what made it independently deletable before this test existed.
-// Mutation-test target: deleting `CurrentAncestorChain: currentAncestorChain,`
+// Mutation-test target: deleting `CurrentAncestorChain: live.AncestorChain,`
 // from the FINAL EligibilityInput literal in aggregate.go must turn this
 // test's own KindNeedsReview assertion back into KindReadyToMerge (its own
 // zero value, nil, would then trivially match VerdictAncestorChain's
@@ -4049,10 +4063,10 @@ func TestBuild_CIConclusionDegraded_ProbeCatchesItBeforeAnyLiveCall(t *testing.T
 	// can no longer distinguish it (it is true either way after the fix
 	// above). resolveBranchSHAErr is still armed: if the probe did NOT
 	// carry CIConclusionDegraded, this call would still run and its
-	// failure would set currentBaseSHA = "" but would NOT be observable
-	// via SCMFetchFailed anymore either (masked by producer (7)) -- this
-	// call count is now the ONLY way to prove the probe's own
-	// short-circuit still holds.
+	// failure would fail the row closed (ReadLive's StepResolveBase) but
+	// would NOT be observable via SCMFetchFailed anymore either (masked by
+	// producer (7)) -- this call count is now the ONLY way to prove the
+	// probe's own short-circuit still holds.
 	if len(fakeSCM.resolveBranchSHACalls) != 0 {
 		t.Errorf("ResolveBranchSHA called %d times, want 0 -- the probe's own CIConclusionDegraded refusal already refuses this PR, independent of the base-SHA question, so the live ResolveBranchSHA call could never have changed this row's own fate", len(fakeSCM.resolveBranchSHACalls))
 	}

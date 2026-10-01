@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/reviewfreshness"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -198,40 +199,66 @@ func (c *SCMCache) ResolveAppID(ctx context.Context, spec ports.ResolveAppIDSpec
 	return id, nil
 }
 
+// FreshnessReads is this cache's view, as of now, of the two calls
+// reviewfreshness.ReadLive makes -- ResolveBranchSHA and IsAncestor below
+// -- which computeRealEligibility (aggregate.go) hands ReadLive, so the read
+// model reads the live freshness facts through the one function the merge
+// path and a session's result read them through (§21.1b), and a list read
+// is still served from this cache (§16.2). An action endpoint never takes
+// it: revalidateCore (revalidate.go) hands ReadLive the live port.
+func (c *SCMCache) FreshnessReads(now time.Time) reviewfreshness.LiveReader {
+	return freshnessReads{cache: c, now: now}
+}
+
+// freshnessReads is FreshnessReads' view: each read goes through the
+// cache, looked up as of now.
+type freshnessReads struct {
+	cache *SCMCache
+	now   time.Time
+}
+
+// ResolveBranchSHA answers spec.Branch's commit through the cache.
+// resolvedBranch is spec.Branch itself: the cache keeps no default-branch
+// resolution, and ReadLive names the branch it reads and never reads this
+// value.
+func (r freshnessReads) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranchSHASpec) (string, string, error) {
+	sha, _, err := r.cache.ResolveBranchSHA(ctx, spec, r.now)
+	if err != nil {
+		return "", "", err
+	}
+	return sha, spec.Branch, nil
+}
+
+// IsAncestor answers spec through the cache.
+func (r freshnessReads) IsAncestor(ctx context.Context, spec ports.IsAncestorSpec) (bool, error) {
+	return r.cache.IsAncestor(ctx, spec, r.now)
+}
+
 // ResolveBranchSHA returns spec's own branch's CURRENT commit SHA,
 // live-fetching on a cache miss/expiry and caching the result for
 // platform.Timeouts.DecisionInboxSCMCacheTTL -- mirrors
 // ListOpenPRsForUser/ResolveCodeOwners above exactly.
 //
-// D2 (second adversarial-review round): this method is what
-// computeRealEligibility (aggregate.go) now calls to supply
-// autoapproval.EligibilityInput.CurrentBaseSHA, replacing a direct read
-// of ports.OpenPR.BaseSHA -- GitHub's own per-PR CACHED "base.sha"
-// snapshot, verified to lag the base branch's real tip by an unknown,
-// sometimes month-scale margin (see that field's own doc comment,
-// ports/sourcecontrol.go). revalidateCore (revalidate.go) already
-// resolves this SAME kind of value -- a LIVE branch-tip read -- but
-// deliberately bypasses every cache (that function's own doc comment:
-// "the whole point of this function is a fresh read"), since it backs an
-// ACTION endpoint (merge). computeRealEligibility backs a READ MODEL
-// instead (§16.2: "SCM data is cached with a short TTL... never presented
-// as live truth" -- explicitly the posture this whole cache exists for),
-// so caching this call here, exactly like every other SCM read this
-// aggregator makes, is correct: both callers now supply the SAME KIND of
-// value (a live-resolved tip, never the stale per-PR snapshot) to
-// autoapproval.ComputeEligible, differing only in how fresh "live" is
-// allowed to be for their own, differently-scoped purposes.
+// D2 (second adversarial-review round): the read model's live freshness
+// read resolves the base branch's tip through this method (FreshnessReads,
+// above), never reading ports.OpenPR.BaseSHA -- GitHub's own per-PR CACHED
+// "base.sha" snapshot, verified to lag the base branch's real tip by an
+// unknown, sometimes month-scale margin (see that field's own doc comment,
+// ports/sourcecontrol.go). The merge path (revalidateCore, revalidate.go)
+// reads the SAME kind of value through the same reviewfreshness.ReadLive
+// but bypasses every cache, since it backs an ACTION endpoint (merge). The
+// inbox's list backs a READ MODEL instead (§16.2: "SCM data is cached with a
+// short TTL... never presented as live truth" -- explicitly the posture
+// this whole cache exists for), so caching this call here, exactly like
+// every other SCM read this aggregator makes, is correct: both callers
+// supply the SAME KIND of value (a live-resolved tip, never the stale
+// per-PR snapshot) to autoapproval.ComputeEligible, differing only in how
+// fresh "live" is allowed to be for their own, differently-scoped purposes.
 //
 // A resolution failure is propagated as err, exactly like
-// ListOpenPRsForUser/ResolveCodeOwners above -- computeRealEligibility's
-// own caller degrades that to an empty CurrentBaseSHA, which
-// autoapproval.ComputeEligible's own ReasonBaseSHAUnknown guard then
-// fails closed on. This is NOT what revalidateCore (revalidate.go) does
-// for the identical live-lookup failure: since H2 (fifth adversarial-
-// review round), that function returns early with its own distinct,
-// honest reason instead of falling through to this same guard -- see
-// revalidateCore's own doc comment for why the two call sites diverge
-// (a cached read model here, an action endpoint there).
+// ListOpenPRsForUser/ResolveCodeOwners above, and never cached:
+// ReadLive reports it as the step that failed, and the read model fails
+// the row closed and marks the read degraded (computeRealEligibility).
 func (c *SCMCache) ResolveBranchSHA(ctx context.Context, spec ports.ResolveBranchSHASpec, now time.Time) (sha string, asOf time.Time, err error) {
 	key := branchSHACacheKey{owner: spec.Owner, repo: spec.Repo, branch: spec.Branch}
 	if cached, fetchedAt, ok := c.branchSHAs.get(key, now); ok {
@@ -275,17 +302,17 @@ type isAncestorCacheKey struct {
 // live-fetching on a cache miss/expiry and caching the result for
 // platform.Timeouts.DecisionInboxSCMCacheTTL -- mirrors ResolveBranchSHA
 // immediately above exactly, and for the identical reason: this backs
-// computeRealEligibility's own READ MODEL (aggregate.go), which §16.2
+// the READ MODEL's live freshness read (FreshnessReads, above), which §16.2
 // already licenses to serve a short-TTL-cached view rather than an
 // instantaneous-fresh one.
 //
 // See ports.SourceControl.IsAncestor's own doc comment for what this
-// answers and why: computeRealEligibility (and revalidateCore, which
-// bypasses this cache exactly like it bypasses ResolveBranchSHA's own
-// cache, for the identical "action endpoint needs a fresh read" reason)
-// consult this only when a verdict's own recorded base sha differs from
-// the base branch's current live tip but the base REF is unchanged --
-// tolerating an ORDINARY, unrelated merge to the base branch between
+// answers and why: reviewfreshness.ReadLive (through FreshnessReads here;
+// the merge path's revalidateCore hands it the live port instead,
+// bypassing this cache for the identical "action endpoint needs a fresh
+// read" reason) consults this only when a verdict's own recorded base sha,
+// or its ancestor link's, differs from the live tip under an unchanged ref
+// -- tolerating an ORDINARY, unrelated merge to the base branch between
 // review and merge/revalidation, while still refusing a genuine rewrite.
 func (c *SCMCache) IsAncestor(ctx context.Context, spec ports.IsAncestorSpec, now time.Time) (isAncestor bool, err error) {
 	key := isAncestorCacheKey{owner: spec.Owner, repo: spec.Repo, ancestor: spec.Ancestor, descendant: spec.Descendant}

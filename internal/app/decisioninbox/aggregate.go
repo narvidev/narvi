@@ -76,13 +76,13 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/reviewfreshness"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/automation"
 	"github.com/narvidev/narvi/internal/domain/decisioninbox"
 	"github.com/narvidev/narvi/internal/domain/handoff"
-	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
@@ -196,10 +196,11 @@ type Result struct {
 	//     renders it, demoted out of ready_to_merge (that field's own doc
 	//     comment) -- but the overall read is, again, no longer a complete
 	//     picture. SCMAsOf is set here too, same as (3)/(4).
-	//  6. computeRealEligibility's own live SCM lookups for that ONE PR --
-	//     the base-branch tip resolution (SCMCache.ResolveBranchSHA) or the
-	//     fast-forward-ancestry confirmation (SCMCache.IsAncestor), either
-	//     one failing (E5, third adversarial-review round), or the read of
+	//  6. computeRealEligibility's own live SCM reads for that ONE PR --
+	//     the live freshness read (reviewfreshness.ReadLive, through
+	//     SCMCache.FreshnessReads: the base branch's tip, the ancestor
+	//     link's, or either fast-forward-ancestry confirmation) failing at
+	//     any step (E5, third adversarial-review round), or the read of
 	//     the base branch's required checks (SCMCache.ListRequiredChecks,
 	//     §21.2's "CI green means the required checks"). Before this
 	//     producer existed, a row demoted out of ready_to_merge by either
@@ -497,10 +498,11 @@ const openFindingsUnknownFailClosed = 1
 
 // buildPROpenItem assembles one Item for an already-filtered, non-draft,
 // non-§17-excluded OpenPR. degraded (E5, third adversarial-review round)
-// is true iff computeRealEligibility's own live SCM lookups (base-branch
-// tip resolution, fast-forward-ancestry confirmation) failed for this
-// ONE row -- see that function's own doc comment and Result.
-// SCMFetchFailed's own producer list (6) for the full "why": without
+// is true iff computeRealEligibility's own live SCM reads (the live
+// freshness read through reviewfreshness.ReadLive, or the base branch's
+// required checks where they decide the row) failed for this ONE row --
+// see that function's own doc comment and Result.SCMFetchFailed's own
+// producer list (6) for the full "why": without
 // this, a row demoted out of ready_to_merge purely because a live GitHub
 // call failed rendered identically to one demoted on a genuine,
 // considered ineligibility judgement, exactly the "failure rendering as
@@ -1002,23 +1004,23 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 // this function returns.
 //
 // token/now (D2, second adversarial-review round) back this function's
-// OWN live base-branch-tip resolution, below -- see that call site's own
-// doc comment for the full "why" (this used to compare pr.BaseSHA,
-// GitHub's own per-PR CACHED snapshot, against a verdict's own
-// live-resolved context: two values of a DIFFERENT kind that compared
-// unequal by construction, the exact same class of hazard finding F1
-// closed for revalidateCore one file over).
+// live freshness read, below (reviewfreshness.ReadLive, through
+// deps.SCMCache's view as of now) -- see that call site's own doc comment
+// for the full "why" (this used to compare pr.BaseSHA, GitHub's own per-PR
+// CACHED snapshot, against a verdict's own live-resolved context: two
+// values of a DIFFERENT kind that compared unequal by construction, the
+// exact same class of hazard finding F1 closed for revalidateCore one file
+// over).
 // degraded (E5, third adversarial-review round) is a SECOND, distinct
 // return value from eligible/eligible-ness itself: true iff a live SCM
-// lookup this function makes (base-branch tip resolution, the
-// fast-forward-ancestry confirmation, or the base branch's required
-// checks, all below) failed. Unset (false)
+// read this function makes failed -- the live freshness read (at any of
+// ReadLive's steps), or the base branch's required checks when they are
+// what refused the row, both below. Unset (false)
 // for the GetLatest/!hasVerdict/LoadEligibilityConfig early returns
 // immediately below -- those are pre-existing, differently-shaped
 // degradations (a Postgres store read, never a live GitHub SCM call) and
-// were never part of what this finding names; only the two live SCM
-// lookups this function's own D2/D3 (second round) fixes added are in
-// scope. Before this fix, a live SCM failure here demoted a row out of
+// were never part of what this finding names. Before this fix, a live SCM
+// failure here demoted a row out of
 // ready_to_merge (via ReasonBaseSHAUnknown/ReasonBaseMoved, both
 // fail-closed) with NO way for the caller to tell that apart from a
 // considered "this PR really is not eligible" judgement -- see
@@ -1039,7 +1041,6 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 // by the SAME engine RevalidateForMerge itself re-checks at click time,
 // never a second, independently-derived approximation.
 func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string, pr ports.OpenPR, ciGreen, hasNeedsHuman bool, token string, now time.Time, accepted bool, appReads *appIDReads) eligibilityResult {
-	var degraded bool
 	record, hasVerdict, err := appreviewverdict.GetLatest(ctx, deps.ReviewVerdict, repoFullName, int32(pr.Number))
 	if err != nil {
 		platform.Logger(ctx).Error("decisioninbox: get latest review verdict failed -- failing closed (not eligible)", "error", err, "repo", repoFullName, "pr_number", pr.Number)
@@ -1150,10 +1151,10 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		// CurrentAncestorChain (round-10 finding B) mirrors CurrentBaseSHA's
 		// own identical "assumed equal to the verdict's own recorded
 		// value" leniency immediately above -- the REAL, live-resolved
-		// chain (currentAncestorChain, computed further down this
-		// function, right before the final ComputeEligible call) is
-		// deferred past this probe exactly like the real currentBaseSHA
-		// is. Never pr.AncestorChain's own raw ref+sha pairs here -- that
+		// chain (live.AncestorChain, read further down this function by
+		// reviewfreshness.ReadLive, right before the final ComputeEligible
+		// call) is deferred past this probe exactly like the real base
+		// commit is. Never pr.AncestorChain's own raw ref+sha pairs here -- that
 		// reads GitHub's own CACHED per-PR stack field (the same shape
 		// finding F1 already proved stale-by-design), which is exactly
 		// what made this comparison verify nothing before this fix.
@@ -1227,6 +1228,56 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		requiredChecksUnread = factErr != nil
 	}
 
+	// The live freshness facts -- the base branch's live tip, the ancestor
+	// link's, and, where either moved under an unchanged ref, whether it
+	// moved only forward -- are read by reviewfreshness.ReadLive, the one live
+	// read the merge path (revalidateCore) and a session's result read them
+	// through too (§21.1b, row 220): a change to that read reaches this read
+	// model as well, so the inbox and the merge path cannot come to disagree
+	// about one pull request with nothing reporting it. Each fact is resolved
+	// live, never GitHub's per-PR cached snapshot (pr.BaseSHA, the SHA on
+	// pr.AncestorChain: finding F1, D2 second round, round-10 finding B);
+	// ReadLive's own doc comment gives its skip conditions. Read only now that
+	// the probe has passed (G10, fourth round): a row the probe refused gains
+	// nothing from it, and a failure that could not have changed the row's
+	// fate must not mark the read degraded.
+	//
+	// ReadLive is handed this cache's view of its two calls
+	// (SCMCache.FreshnessReads), as of now: a list read serves each from the
+	// TTL cache (§16.2: "SCM data is cached with a short TTL... never
+	// presented as live truth"), so one load reads each base, each ancestor
+	// link and each forward move once however many rows share them. Only an
+	// answer is cached, never a failure, and ReadLive caches nothing past the
+	// step that failed: the display-only call with accepted=true
+	// (buildPROpenItem) reads live what the first call failed to read, and
+	// also every step the first call never reached -- all of them when the
+	// first call's probe refused, the usual case for an accepted verdict.
+	// An action endpoint never takes this view: revalidateCore hands ReadLive
+	// the live port.
+	//
+	// A fact ReadLive could not establish, at any step, fails this row closed
+	// and marks it degraded (Result.SCMFetchFailed, producer 6; E5, third
+	// round), and the acceptance readout names it with
+	// reasonBaseCommitUnconfirmed, the merge path's own words for a failed
+	// live check (T3, fourth round) -- what a person saw for every step,
+	// within any one load, before this read went through ReadLive. Across
+	// loads within the TTL it can differ, toward the live answer: the read
+	// model used to resolve and cache the ancestor link even after a failed
+	// base read, so a later load served that link from the cache; it now
+	// reads it live then, as the merge path does
+	// (TestBuild_FreshnessRead_LinkAfterAFailedBaseReadIsReadLiveNextLoad).
+	// The final engine call is not made: on
+	// the blank or unconfirmed fact it would refuse on freshness
+	// (autoapproval.CheckFreshness), which the engine checks before the
+	// required checks, so the requirements read above could not have decided
+	// the row, and nothing that call answers beyond "not eligible" reached the
+	// page.
+	live, failure := reviewfreshness.ReadLive(ctx, deps.Timeouts, deps.SCMCache.FreshnessReads(now), token, pr, record.Context)
+	if failure != nil {
+		platform.Logger(ctx).Warn("decisioninbox: live freshness read failed, the row fails closed and the read is degraded", "step", failure.Step, "error", failure.Err, "repo", repoFullName, "pr_number", pr.Number)
+		return eligibilityResult{Degraded: true, UnconfirmedReason: reasonBaseCommitUnconfirmed}
+	}
+
 	// A genuine correctness bug: computed ONCE, ignoring BOTH human-disagreement signals --
 	// HasNeedsHumanLabel here, and pr.HasChangesRequested, which is not
 	// even a ComputeEligible INPUT at all (it is enforced entirely
@@ -1264,230 +1315,14 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// eligibleIgnoringHumanSignals, which is exactly "would the engine
 	// have approved this on its own criteria", independent of which
 	// human-disagreement signal (if any) is ALSO present.
-	// currentBaseSHA (D2, second adversarial-review round) is the base
-	// branch's LIVE tip, resolved fresh through deps.SCMCache -- NEVER
-	// pr.BaseSHA (ports.OpenPR.BaseSHA's own doc comment: GitHub's own
-	// per-PR CACHED "base.sha" snapshot, refreshed on GitHub's own
-	// schedule rather than on every push to the base branch, verified to
-	// lag the branch's real tip by an unknown, sometimes month-scale
-	// margin). Before this fix, this call site was the LAST remaining
-	// consumer of pr.BaseSHA for an eligibility comparison: revalidateCore
-	// (revalidate.go, finding F1) already resolves this SAME kind of
-	// value for the identical reason, one file over -- comparing this
-	// function's own cached snapshot against a verdict's own live-resolved
-	// context compared two values of a DIFFERENT KIND, unequal by
-	// construction, exactly the hazard F1 closed for the OTHER
-	// ComputeEligible call site. SCMCache.ResolveBranchSHA (unlike
-	// revalidateCore's own direct, uncached sourceControl.ResolveBranchSHA
-	// call) caches this read for DecisionInboxSCMCacheTTL -- correct here,
-	// never there, because this function backs a READ MODEL (§16.2: "SCM
-	// data is cached with a short TTL... never presented as live truth"),
-	// while revalidateCore backs an ACTION endpoint (merge) that needs an
-	// instantaneous-fresh read regardless of any cache's own TTL.
 	//
-	// A resolution failure degrades to an empty currentBaseSHA, which
-	// autoapproval.ComputeEligible's own empty-base-sha guard (finding F2)
-	// then fails closed on -- this function's OWN fail-closed path, never
-	// a second, independently-invented one. This is NOT what revalidateCore
-	// (revalidate.go) does for the identical live-lookup failure: since H2
-	// (fifth adversarial-review round), that function returns early with
-	// its own distinct, honest reason instead of falling through to this
-	// same guard -- see revalidateCore's own doc comment for why the two
-	// call sites diverge (a cached read model here, an action endpoint
-	// there). ALSO marks this function's
-	// own degraded return true (E5, third round; correctly SCOPED by the
-	// probe above, G10, fourth round): the probe already confirmed this
-	// row would otherwise be eligible, so a live GitHub call failing here
-	// really is about to fail this row closed on ReasonBaseSHAUnknown for
-	// a reason that has nothing to do with the PR's own merits -- and the
-	// caller must be able to tell the two apart. Before the probe existed,
-	// this same degraded=true fired even when the row was ALREADY, and
-	// independently, going to be ineligible (a needs-human label aside,
-	// which the probe deliberately still ignores -- see the probe's own
-	// doc comment above), which is producer (6)'s own doc comment's "row
-	// is NOT dropped, only demoted" scoped more widely than it should
-	// have been.
-	currentBaseSHA, _, baseSHAErr := deps.SCMCache.ResolveBranchSHA(ctx, ports.ResolveBranchSHASpec{
-		Owner:  pr.Owner,
-		Repo:   pr.Repo,
-		Branch: pr.BaseRef,
-		Token:  token,
-	}, now)
-	if baseSHAErr != nil {
-		platform.Logger(ctx).Warn("decisioninbox: resolve live base branch sha failed, base-freshness check will fail closed via ReasonBaseSHAUnknown", "error", baseSHAErr, "repo", repoFullName, "pr_number", pr.Number)
-		currentBaseSHA = ""
-		degraded = true
-	}
-
-	// baseAdvancedWithoutRewrite (D3, second adversarial-review round)
-	// mirrors revalidateCore's own identical wiring (revalidate.go) -- see
-	// that call site's own doc comment for the full "why" and the
-	// preconditions gating this call, and autoapproval.
-	// BaseAdvancedWithoutRewrite's own doc comment (eligibility.go) for
-	// what a confirmed "yes" here actually establishes and what it does
-	// not. Cached via deps.SCMCache.IsAncestor, exactly like
-	// currentBaseSHA immediately above, for the identical
-	// read-model-vs-action-endpoint reason. A failure here ALSO marks
-	// degraded true (E5, third round), pinned by its own regression test
-	// (G9, fourth round -- previously untested: only the ResolveBranchSHA
-	// half of this same signal had one).
-	var baseAdvancedWithoutRewrite bool
-	if record.Context.BaseRef == pr.BaseRef && record.Context.BaseSHA != "" && currentBaseSHA != "" && record.Context.BaseSHA != currentBaseSHA {
-		confirmed, ancestorErr := deps.SCMCache.IsAncestor(ctx, ports.IsAncestorSpec{
-			Owner:      pr.Owner,
-			Repo:       pr.Repo,
-			Ancestor:   record.Context.BaseSHA,
-			Descendant: currentBaseSHA,
-			Token:      token,
-		}, now)
-		if ancestorErr != nil {
-			platform.Logger(ctx).Warn("decisioninbox: resolve base-advanced-without-rewrite ancestry failed, base-freshness check will fail closed via ReasonBaseMoved", "error", ancestorErr, "repo", repoFullName, "pr_number", pr.Number)
-			// E5, third round: same reasoning as baseSHAErr above -- this
-			// row is about to fail closed on ReasonBaseMoved for a reason
-			// that is not a judgement about the PR at all.
-			degraded = true
-		} else {
-			baseAdvancedWithoutRewrite = confirmed
-		}
-	}
-
-	// currentAncestorChain (round-10 finding B) mirrors currentBaseSHA's
-	// own identical "never the cached field, always a live resolution"
-	// discipline immediately above, one link further: pr.AncestorChain
-	// (ports.OpenPR's own field) is GitHub's per-PR CACHED stack object,
-	// the exact shape finding F1 already proved stale-by-design for the
-	// immediate base -- comparing it against record.Context.AncestorChain
-	// (itself now ALSO live-resolved at review-context-fetch time,
-	// internal/app/reviewcontext.Fetch) would otherwise compare a live
-	// fact against a cached one, unequal by construction. §17.6 bounds
-	// this to AT MOST ONE link today, so this is at most one further live
-	// call, cached via deps.SCMCache.ResolveBranchSHA exactly like
-	// currentBaseSHA immediately above, for the identical read-model-vs-
-	// action-endpoint reason. The ref itself (a branch name) is trusted
-	// from the cached read, exactly like BaseRef is; only the SHA is
-	// re-resolved live.
-	//
-	// currentAncestorChain's own zero value (nil) is the correct answer
-	// ONLY when pr.AncestorChain reports no link at all -- a CONFIRMED
-	// fact (this PR is not currently stacked, or sits at its own bottom).
-	// A live resolution that fails, OR one that succeeds with an empty
-	// sha (this production adapter's own ResolveBranchSHA never returns
-	// that combination, but a defensive symmetric check costs nothing),
-	// is NEITHER of those things -- round-11 finding A1's own fix applies
-	// here exactly as it does in revalidateCore (revalidate.go) and at
-	// review-context-fetch time (internal/app/reviewcontext.Fetch):
-	// currentAncestorChain is set to an EXPLICIT unknown-marker link (an
-	// empty sha, this package's own dedicated "could not be established"
-	// value) rather than falling through to nil, which the PREVIOUS
-	// version of this comment (and this function's own two-case switch,
-	// which had NO default arm at all) claimed was safe -- it is not: a
-	// nil currentAncestorChain here is INDISTINGUISHABLE, once compared,
-	// from "this PR was never in a stack at all", so a genuinely-stacked
-	// PR whose live ancestor resolve merely failed just now could
-	// otherwise read as a clean, confirmed-empty match against a verdict
-	// recorded before it was ever stacked -- silently passing this row as
-	// ready_to_merge on exactly the criterion this check exists to catch.
-	// Marking degraded true on both new branches (the switch's own
-	// missing default, now added) keeps this row visibly DEMOTED rather
-	// than silently approved, mirroring baseSHAErr/ancestorErr's own
-	// identical "fail closed AND flag it visibly" discipline immediately
-	// above.
-	//
-	// D1 (round-12 sweep): pr.AncestorChain[0].Ref can ITSELF be empty --
-	// the adapter's own degraded-stack-read case, where GitHub reported
-	// position > 1 (proving a link exists) but the stack's own base ref
-	// could not be decoded (ancestorChainFromDetailStack's own doc
-	// comment, listopenprs.go). That is not "no link" (nil) and it is not
-	// a link this code can live-resolve (there is no ref to resolve
-	// against) -- it is the SAME unknown-marker state a failed live
-	// resolution reports below for a KNOWN ref, and is handled as its own
-	// first branch, before any live call is attempted.
-	var currentAncestorChain []review.AncestorLink
-	if len(pr.AncestorChain) > 0 && pr.AncestorChain[0].Ref == "" {
-		// D1 (round-12 sweep): the adapter's own degraded-stack-read case
-		// -- position > 1 PROVES a link exists (ancestorChainFromDetailStack's
-		// own doc comment, listopenprs.go, now mirrors review.
-		// AncestorChainFromStack exactly) but the ref itself could not be
-		// read off GitHub's stack object. There is no ref here to even
-		// ATTEMPT a live resolution against, so this reports the SAME
-		// explicit unknown marker directly, fail-closed -- exactly like a
-		// live resolution failure below does for a KNOWN ref. The
-		// PREVIOUS version of this guard required Ref != "" to enter this
-		// block at all, so this exact case fell through to
-		// currentAncestorChain's own nil zero value -- INDISTINGUISHABLE,
-		// once compared, from "this PR was never in a stack at all",
-		// silently passing this row as ready_to_merge on exactly the
-		// criterion this check exists to catch (the same collapse finding
-		// A1 closed one layer down for a live-resolution failure).
-		currentAncestorChain = []review.AncestorLink{{Ref: "", SHA: ""}}
-		platform.Logger(ctx).Warn("decisioninbox: ancestor chain link reported with no ref at all (a degraded stack read), base-freshness check will fail closed via ReasonAncestorChainUnknown", "repo", repoFullName, "pr_number", pr.Number)
-		degraded = true
-	} else if len(pr.AncestorChain) > 0 {
-		// unknownMarker is the fail-closed default for this iteration --
-		// overwritten below only on a genuine, non-empty live resolution.
-		unknownMarker := []review.AncestorLink{{Ref: pr.AncestorChain[0].Ref, SHA: ""}}
-		currentAncestorChain = unknownMarker
-		liveAncestorSHA, _, liveAncestorErr := deps.SCMCache.ResolveBranchSHA(ctx, ports.ResolveBranchSHASpec{
-			Owner:  pr.Owner,
-			Repo:   pr.Repo,
-			Branch: pr.AncestorChain[0].Ref,
-			Token:  token,
-		}, now)
-		switch {
-		case liveAncestorErr != nil:
-			platform.Logger(ctx).Warn("decisioninbox: resolve live ancestor chain sha failed, base-freshness check will fail closed via ReasonAncestorChainUnknown", "error", liveAncestorErr, "repo", repoFullName, "pr_number", pr.Number)
-			degraded = true
-		case liveAncestorSHA != "":
-			currentAncestorChain = []review.AncestorLink{{Ref: pr.AncestorChain[0].Ref, SHA: liveAncestorSHA}}
-		default:
-			platform.Logger(ctx).Warn("decisioninbox: resolve live ancestor chain sha returned an empty sha with no error, base-freshness check will fail closed via ReasonAncestorChainUnknown", "repo", repoFullName, "pr_number", pr.Number)
-			degraded = true
-		}
-	}
-
-	// ancestorChainAdvancedWithoutRewrite (round-11 finding A3) mirrors
-	// baseAdvancedWithoutRewrite's own identical fast-forward tolerance,
-	// one link further out -- see autoapproval.
-	// EligibilityInput.AncestorChainAdvancedWithoutRewrite's own doc
-	// comment (eligibility.go) for what a confirmed "yes" here actually
-	// establishes and what residual it carries. Only even attempted when
-	// both sides report a real (non-unknown) link, that link's REF is
-	// unchanged (a real restructure still refuses unconditionally), and
-	// the sha genuinely differs. Cached via deps.SCMCache.IsAncestor,
-	// exactly like baseAdvancedWithoutRewrite immediately above, for the
-	// identical read-model-vs-action-endpoint reason. A failure here ALSO
-	// marks degraded true, mirroring baseAdvancedWithoutRewrite's own
-	// identical E5 discipline.
-	var ancestorChainAdvancedWithoutRewrite bool
-	if len(record.Context.AncestorChain) > 0 && len(currentAncestorChain) > 0 &&
-		record.Context.AncestorChain[0].Ref == currentAncestorChain[0].Ref &&
-		record.Context.AncestorChain[0].SHA != "" && currentAncestorChain[0].SHA != "" &&
-		record.Context.AncestorChain[0].SHA != currentAncestorChain[0].SHA {
-		confirmed, ancestorChainErr := deps.SCMCache.IsAncestor(ctx, ports.IsAncestorSpec{
-			Owner:      pr.Owner,
-			Repo:       pr.Repo,
-			Ancestor:   record.Context.AncestorChain[0].SHA,
-			Descendant: currentAncestorChain[0].SHA,
-			Token:      token,
-		}, now)
-		if ancestorChainErr != nil {
-			platform.Logger(ctx).Warn("decisioninbox: resolve ancestor-chain-advanced-without-rewrite ancestry failed, base-freshness check will fail closed via ReasonAncestorChainChanged", "error", ancestorChainErr, "repo", repoFullName, "pr_number", pr.Number)
-			degraded = true
-		} else {
-			ancestorChainAdvancedWithoutRewrite = confirmed
-		}
-	}
-
 	// VerdictAssessed/VerdictBaseRef/VerdictBaseSHA/VerdictAncestorChain/
-	// VerdictPolicyVersion and CurrentBaseRef/CurrentAncestorChain
-	// (§21.1's amendment) mirror revalidateCore's own identical wiring
-	// (revalidate.go) -- record.Context is the SAME review_verdicts row
-	// record.HeadSHA already came from, and pr is this function's own
-	// already-fetched, live ports.OpenPR (no new I/O), exactly like
-	// pr.HeadSHA itself. CurrentBaseSHA/CurrentAncestorChain are the
-	// exceptions -- see currentBaseSHA/currentAncestorChain's own doc
-	// comments immediately above for why they are NOT pr.BaseSHA/
-	// pr.AncestorChain.
+	// VerdictPolicyVersion (§21.1's amendment) mirror revalidateCore's own
+	// identical wiring (revalidate.go) -- record.Context is the SAME
+	// review_verdicts row record.HeadSHA already came from. The Current*
+	// fields and the two forward-move confirmations are ReadLive's live facts,
+	// wired exactly as revalidateCore wires them: the head and base ref as pr
+	// reports them, the base and ancestor link's commits resolved live.
 	// ComputeEligibleWithAcceptance, mirroring the probe call's own
 	// identical switch above (round 3, finding R1, adversarial review) --
 	// same accepted, same "false is byte-for-byte identical to the
@@ -1501,12 +1336,12 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 		VerdictBaseSHA:                      record.Context.BaseSHA,
 		VerdictAncestorChain:                record.Context.AncestorChain,
 		VerdictPolicyVersion:                record.Context.PolicyVersion,
-		CurrentHeadSHA:                      pr.HeadSHA,
-		CurrentBaseRef:                      pr.BaseRef,
-		CurrentBaseSHA:                      currentBaseSHA,
-		CurrentAncestorChain:                currentAncestorChain,
-		BaseAdvancedWithoutRewrite:          baseAdvancedWithoutRewrite,
-		AncestorChainAdvancedWithoutRewrite: ancestorChainAdvancedWithoutRewrite,
+		CurrentHeadSHA:                      live.HeadSHA,
+		CurrentBaseRef:                      live.BaseRef,
+		CurrentBaseSHA:                      live.BaseSHA,
+		CurrentAncestorChain:                live.AncestorChain,
+		BaseAdvancedWithoutRewrite:          live.BaseAdvancedWithoutRewrite,
+		AncestorChainAdvancedWithoutRewrite: live.AncestorChainAdvancedWithoutRewrite,
 		CIGreen:                             ciGreen,
 		CIConclusionDegraded:                pr.CIConclusionDegraded,
 		RequiredChecks:                      requiredChecks,
@@ -1546,20 +1381,17 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// criterion before them passed too, the live base included. So only
 	// the needs-human label, which nothing waives, is left to check.
 	mergeableIfPass := notRead && !hasNeedsHuman
-	// unconfirmedReason names the live read that failed first in the
-	// engine's own order -- a freshness read (base, ancestor chain) before
-	// the required checks -- for the one caller that shows it
-	// (buildPROpenItem's AcceptanceMergeBlockedReason).
+	// unconfirmedReason names the failed read for the one caller that shows
+	// it (buildPROpenItem's AcceptanceMergeBlockedReason). Only the required
+	// checks can have failed here: a failed freshness read, the first in the
+	// engine's order, returned above with reasonBaseCommitUnconfirmed.
 	var unconfirmedReason string
-	switch {
-	case degraded:
-		unconfirmedReason = reasonBaseCommitUnconfirmed
-	case requiredDegraded:
+	if requiredDegraded {
 		unconfirmedReason = string(autoapproval.ReasonRequiredChecksUnknown)
 	}
 	return eligibilityResult{
 		Eligible:                      eligible,
-		Degraded:                      degraded || requiredDegraded,
+		Degraded:                      requiredDegraded,
 		UnconfirmedReason:             unconfirmedReason,
 		RequiredChecksNotRead:         notRead,
 		MergeableIfRequiredChecksPass: mergeableIfPass,
@@ -1582,16 +1414,16 @@ type eligibilityResult struct {
 	// merge-time gate, revalidate.go, which feeds hasNeedsHuman into the
 	// SAME EligibilityInput.HasNeedsHumanLabel field unconditionally).
 	Eligible bool
-	// Degraded is true iff a live SCM lookup this function makes failed --
+	// Degraded is true iff a live SCM read this function makes failed --
 	// see computeRealEligibility's own doc comment for the full producer
 	// list and its "unset for the GetLatest/!hasVerdict/
-	// LoadEligibilityConfig early returns" scoping. The base branch's
-	// required checks (§21.2) are one of those lookups.
+	// LoadEligibilityConfig early returns" scoping. The live freshness read
+	// and the base branch's required checks (§21.2) are those reads.
 	Degraded bool
 	// UnconfirmedReason, set whenever Degraded is, says which live read
-	// failed, in the engine's order: reasonBaseCommitUnconfirmed for a
-	// freshness read, ReasonRequiredChecksUnknown's text for the required
-	// checks.
+	// failed, in the engine's order: reasonBaseCommitUnconfirmed for the
+	// freshness read (whichever of its steps failed),
+	// ReasonRequiredChecksUnknown's text for the required checks.
 	UnconfirmedReason string
 	// RequiredChecksNotRead is set when the base's required checks were not
 	// read because GitHub outbound is off, and that is what refused the row
@@ -1607,7 +1439,8 @@ type eligibilityResult struct {
 	// recordContestedIfApplicable's own §21.2 stage 2 "contested" write,
 	// below -- no OTHER caller/field may ever consult them. Both are the
 	// Go zero value on every early-return path inside computeRealEligibility
-	// (no verdict, a store error, or the probe already refusing), which
+	// (no verdict, a store error, the probe already refusing, or a failed
+	// live freshness read), which
 	// recordContestedIfApplicable's own condition and recordOutcome's own
 	// headSHA=="" guard both already treat as "never write" -- mirroring
 	// Eligible/Degraded's own identical zero-value "nothing to report"

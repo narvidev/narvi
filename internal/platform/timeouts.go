@@ -2751,7 +2751,10 @@ type Timeouts struct {
 	// uncached call at review-turn-creation time. Chosen as 10s, matching
 	// GitHubResolveBaseBranchSHATimeout/GitHubGetPRTimeout's own identical
 	// "a single lightweight GitHub REST GET" reasoning -- this is the SAME
-	// underlying endpoint, just two different call sites.
+	// underlying endpoint, just two different call sites. Both paths make
+	// the call through reviewfreshness.ReadLive (row 220), which bounds it
+	// by this field; on the cached path SCMCache bounds its own fetch by it
+	// too, so the one value applies either way.
 	DecisionInboxResolveBranchSHATimeout time.Duration
 
 	// DecisionInboxIsAncestorTimeout (D3, second adversarial-review round;
@@ -2770,7 +2773,9 @@ type Timeouts struct {
 	// (GitHubGetPRTimeout/GitHubResolveBaseBranchSHATimeout/
 	// DecisionInboxResolveBranchSHATimeout) -- IsAncestor is the SAME
 	// class of call (one GET to the compare-two-commits endpoint), just a
-	// different comparison.
+	// different comparison. As with DecisionInboxResolveBranchSHATimeout,
+	// both paths make the call through reviewfreshness.ReadLive (row 220),
+	// the cached one also bounded by SCMCache, by this same value.
 	DecisionInboxIsAncestorTimeout time.Duration
 
 	// DecisionInboxRequiredChecksTimeout bounds ONE SourceControl.

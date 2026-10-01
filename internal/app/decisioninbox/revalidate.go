@@ -624,9 +624,9 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 	//
 	// reviewfreshness.ReadLive reads those facts (row 182, §21.1b: a
 	// session's result reads them through the same function and compares
-	// them through the same autoapproval.CheckFreshness; the decision
-	// inbox's cached read model still assembles its own copy -- see the
-	// reviewfreshness package doc), and it
+	// them through the same autoapproval.CheckFreshness, and so does the
+	// decision inbox's read model, through its cache's view of the calls,
+	// row 220 -- this function hands it the live port, uncached), and it
 	// makes exactly the calls this function used to make inline, in the
 	// same order, bounded by the same platform.Timeouts constants
 	// (DecisionInboxResolveBranchSHATimeout, DecisionInboxIsAncestorTimeout
