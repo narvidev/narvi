@@ -35,61 +35,6 @@ jobs:
           fi
           echo "Branch name '$BRANCH' OK"
 
-  # TEMPORARY -- removed again before this branch merges. It soaks the
-  # packages the intermittent-test fixes touch, -race, twenty runs each, on
-  # this runner's own load: services, boot and supervisor in one `go test`
-  # the way `make test` runs them, with cmd/sandbox-agent alongside as load
-  # (the mix whose earlier soak saw TestRun_PrimaryCrashIsFatal fail), and,
-  # at the same time, internal/app/automation's integration suite against
-  # Postgres. It prints each package's result, the pass/fail count of every
-  # test the fixes target, and the output of any test that failed.
-  soak-touched-packages:
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Soak (-race, -count=20)
-        run: |
-          set -uo pipefail
-          go test -race -count=20 -timeout 60m -json -skip '^TestRealTurn_' \
-            ./internal/sandboxagent/services/ ./internal/sandboxagent/boot/ \
-            ./internal/sandboxagent/supervisor/ ./cmd/sandbox-agent/ > soak-unit.json &
-          unit=$!
-          go test -tags=integration -race -p 1 -count=20 -timeout 60m -json -skip '^TestRealTurn_' \
-            ./internal/app/automation/ > soak-automation.json &
-          integration=$!
-          status=0
-          wait "$unit" || status=$?
-          echo "unit go test exit status: $status"
-          wait "$integration" || status=$?
-          echo "combined exit status: $status"
-          cat soak-unit.json soak-automation.json > soak.json
-          echo "== package results"
-          jq -r 'select(.Test == null and (.Action == "pass" or .Action == "fail")) | "\(.Action) \(.Package) \(.Elapsed)s"' soak.json
-          echo "== targeted tests"
-          for t in TestRun_PrimaryCrashIsFatal TestRun_PrimaryCleanExitIsAlsoFatal TestRun_MixedOutcomes_OneCrashesOneSucceeds \
-                   TestRunBoot_FatalFailureInRepoAStopsBeforeRepoB TestUnconditionalReaping \
-                   TestEvaluateCronTriggersOnce_NeverFiresTwiceInTheSameMinute \
-                   'TestEvaluateCronTriggersOnce_NeverFiresTwiceInTheSameMinute/second_tick_later_in_the_same_minute' \
-                   'TestEvaluateCronTriggersOnce_NeverFiresTwiceInTheSameMinute/second_tick_in_the_next_minute'; do
-            echo "$t: $(jq -r --arg t "$t" 'select(.Test == $t and (.Action == "pass" or .Action == "fail" or .Action == "skip")) | .Action' soak.json | sort | uniq -c | tr -s ' \n' ' ')"
-          done
-          echo "all test runs: $(jq -r 'select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip")) | .Action' soak.json | sort | uniq -c | tr -s ' \n' ' ')"
-          echo "== failed tests and their output"
-          jq -r -s '[.[] | select(.Test != null and .Action == "fail") | .Test] as $failed
-            | .[] | select(.Action == "output" and .Test != null and ((.Test as $x | $failed | index($x)) != null)) | "\(.Test): \(.Output)"' soak.json
-          echo "== data races"
-          jq -r 'select(.Action == "output") | select(.Output | test("DATA RACE")) | "\(.Test): \(.Output)"' soak.json
-          exit "$status"
-
   commit-scope:
     # ADVISORY ONLY — never fails the build. CLAUDE.md defines a commit's scope
     # as "the primary package or directory touched", but that is a judgement
