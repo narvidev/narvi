@@ -31,6 +31,50 @@ func TestSandboxEventsRoundTrip(t *testing.T) {
 		})
 	})
 
+	t.Run("Ready_Capabilities", func(t *testing.T) {
+		// Technical plan §3.3, prompt receipts: capabilities is optional, and
+		// so is each capability inside it; an agent that predates it sends
+		// neither (Ready above).
+		promptReceipt := true
+		roundTrip(t, sch, sandboxws.Ready{
+			Type:         "ready",
+			MessageId:    "e1c",
+			SessionId:    testSessionID,
+			Gen:          1,
+			Timestamp:    testTimestamp,
+			AgentVersion: "v1.4.2",
+			ImageDigest:  "sha256:9f31c00abcdef",
+			Capabilities: &sandboxws.ReadyCapabilities{PromptReceipt: &promptReceipt},
+		})
+	})
+
+	t.Run("PromptReceived", func(t *testing.T) {
+		roundTrip(t, sch, sandboxws.PromptReceived{
+			Type:            "prompt_received",
+			MessageId:       "prompt_received:m1",
+			SessionId:       testSessionID,
+			Gen:             1,
+			PromptMessageId: "m1",
+			Duplicate:       true,
+		})
+	})
+
+	// prompt_received's messageId is deterministic (technical plan §3.3,
+	// prompt receipts): the control plane finds a prompt's receipt by
+	// 'prompt_received:{promptMessageId}', so a receipt under any other key
+	// is refused by the schema and by the generated decoder alike.
+	t.Run("PromptReceived_MessageIdWithoutPrefixRejected", func(t *testing.T) {
+		payload := []byte(`{"type":"prompt_received","messageId":"m1","sessionId":"` + testSessionID +
+			`","gen":1,"promptMessageId":"m1","duplicate":false}`)
+		if err := validateJSON(t, sch, payload); err == nil {
+			t.Fatal("expected a prompt_received messageId without its prefix to fail validation, got nil error")
+		}
+		var event sandboxws.PromptReceived
+		if err := json.Unmarshal(payload, &event); err == nil {
+			t.Fatal("expected a prompt_received messageId without its prefix to fail Go unmarshal, got nil error")
+		}
+	})
+
 	t.Run("Heartbeat", func(t *testing.T) {
 		conversationID := "conv-123"
 		bootPhase := "installing_deps"
