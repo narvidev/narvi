@@ -1177,12 +1177,15 @@ session's result (§43.20, row 182), which also reads the pull request itself li
 does, and runs the merge path's own probe on it, and for the decision inbox's read model (`decisioninbox`'s
 `computeRealEligibility`, row 220), so a change to `ReadLive` reaches all three. The inbox hands it its TTL
 cache's view of the two calls (`SCMCache.FreshnessReads`), so a list read stays cached (§16.2) while the
-merge path reads live; no other code in `decisioninbox` makes either call, which two structural tests pin
+merge path reads live. Outside the cache's own read methods no code in `decisioninbox` names either call,
+as a call or a method value, which two structural tests pin by name within the package
 (`TestComputeRealEligibility_ReadsLiveFactsOnlyThroughReviewFreshness`,
 `TestDecisionInbox_FreshnessCallsOnlyInItsCache`). What a failed read means stays each consumer's own: the
 merge path refuses, naming the check; a session's result reports its freshness unconfirmed; the inbox shows
 the row degraded and never eligible, its acceptance readout saying the base commit could not be confirmed,
-whichever step failed -- what it showed before it read through `ReadLive`.
+whichever step failed -- what any one load showed before it read through `ReadLive`. Since `ReadLive` stops
+at the failed step, the inbox no longer caches an ancestor link read after a failed base read, so a later
+load within the cache's TTL reads that link live and agrees with the merge path.
 
 **Publication is concurrent, and the losing writer must know it lost.** Two attempts can be in
 flight for one pull request, and a base can move under an unchanged head, so the record a publisher

@@ -476,10 +476,12 @@ type PRPerson struct {
 // decodes it straight off GitHub's per-PR stack object, with no live
 // resolution capability of its own, the SAME "cached, display/audit only"
 // shape ports.OpenPR.BaseSHA's own doc comment already documents one
-// layer up (finding F1). Every real ComputeEligible call site
-// (internal/app/decisioninbox's revalidateCore/computeRealEligibility)
-// reads ONLY Ref off this struct and re-resolves the SHA LIVE itself via
-// SourceControl.ResolveBranchSHA -- never this field.
+// layer up (finding F1). Every consumer of the freshness comparison --
+// internal/app/decisioninbox's revalidateCore and computeRealEligibility,
+// and a session's result -- reads ONLY Ref off this struct and has
+// internal/app/reviewfreshness.ReadLive resolve the SHA live (the merge
+// path and a session's result through this port, the decision inbox
+// through decisioninbox.SCMCache.FreshnessReads) -- never this field.
 //
 // Ref == "" on a link INSIDE A NON-NIL chain (as opposed to a nil chain
 // entirely) is this port's own dedicated "could not be established"

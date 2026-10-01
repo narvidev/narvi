@@ -588,13 +588,14 @@ func (a *Adapter) buildOpenPRFromDetail(ctx context.Context, owner, repo string,
 // CACHED value here, never a live one -- this function's own two real
 // callers (buildOpenPRFromDetail, above, feeding ports.OpenPR.AncestorChain;
 // and GetOpenPR, getopenpr.go) both document that their own SHA is
-// display/audit data only, and BOTH of ComputeEligible's real call sites
-// (internal/app/decisioninbox's revalidateCore/computeRealEligibility)
-// deliberately read ONLY this result's Ref field, re-resolving the SHA
-// live themselves via SourceControl.ResolveBranchSHA -- exactly the
+// display/audit data only, and every consumer of the freshness
+// comparison (internal/app/decisioninbox's revalidateCore and
+// computeRealEligibility, and a session's result) deliberately reads ONLY
+// this result's Ref field, having internal/app/reviewfreshness.ReadLive
+// resolve the SHA live (through the port, or the decision inbox's cached
+// view of it, decisioninbox.SCMCache.FreshnessReads) -- exactly the
 // "never the cached field" discipline BaseSHA already established one
-// layer up, applied here by the CALLER rather than by this function
-// itself.
+// layer up, applied by the CALLER rather than by this function itself.
 func ancestorChainFromDetailStack(stack *stackResponse) []ports.PRAncestorLink {
 	if stack == nil || stack.Position <= 1 {
 		return nil

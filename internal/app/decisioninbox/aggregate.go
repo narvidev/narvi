@@ -1246,18 +1246,27 @@ func computeRealEligibility(ctx context.Context, deps Deps, repoFullName string,
 	// (SCMCache.FreshnessReads), as of now: a list read serves each from the
 	// TTL cache (§16.2: "SCM data is cached with a short TTL... never
 	// presented as live truth"), so one load reads each base, each ancestor
-	// link and each forward move once however many rows share them, and the
-	// display-only call with accepted=true (buildPROpenItem) reads again only
-	// what the first call failed to read, a failure never being cached. An
-	// action endpoint never takes this view: revalidateCore hands ReadLive
+	// link and each forward move once however many rows share them. Only an
+	// answer is cached, never a failure, and ReadLive caches nothing past the
+	// step that failed: the display-only call with accepted=true
+	// (buildPROpenItem) reads live what the first call failed to read, and
+	// also every step the first call never reached -- all of them when the
+	// first call's probe refused, the usual case for an accepted verdict.
+	// An action endpoint never takes this view: revalidateCore hands ReadLive
 	// the live port.
 	//
 	// A fact ReadLive could not establish, at any step, fails this row closed
 	// and marks it degraded (Result.SCMFetchFailed, producer 6; E5, third
 	// round), and the acceptance readout names it with
 	// reasonBaseCommitUnconfirmed, the merge path's own words for a failed
-	// live check (T3, fourth round) -- what a person saw for every step before
-	// this read went through ReadLive. The final engine call is not made: on
+	// live check (T3, fourth round) -- what a person saw for every step,
+	// within any one load, before this read went through ReadLive. Across
+	// loads within the TTL it can differ, toward the live answer: the read
+	// model used to resolve and cache the ancestor link even after a failed
+	// base read, so a later load served that link from the cache; it now
+	// reads it live then, as the merge path does
+	// (TestBuild_FreshnessRead_LinkAfterAFailedBaseReadIsReadLiveNextLoad).
+	// The final engine call is not made: on
 	// the blank or unconfirmed fact it would refuse on freshness
 	// (autoapproval.CheckFreshness), which the engine checks before the
 	// required checks, so the requirements read above could not have decided

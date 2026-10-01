@@ -10,6 +10,7 @@ import (
 	"errors"
 	"maps"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -458,5 +459,113 @@ func TestBuild_FreshnessReadCost(t *testing.T) {
 		if ready != n {
 			t.Errorf("%s: %d rows ready to merge, want all %d -- every row must reach the live read for the count to mean anything", load.name, ready, n)
 		}
+	}
+}
+
+// TestBuild_FreshnessRead_LinkAfterAFailedBaseReadIsReadLiveNextLoad pins
+// what a later load within the cache's TTL shows after a failed base read.
+// ReadLive stops at the failed base read and caches nothing past it, so the
+// ancestor link, never read on that load, is read live on the next one. A
+// stacked pull request's base tip fails on the first load; the fault then
+// clears and the link is rewritten before the second load, inside the TTL.
+// The second load shows the row refused and undegraded, as the merge path
+// refuses it -- never ready to merge from a link read and cached after the
+// failed base read, which is what the read model showed before it read
+// through ReadLive.
+func TestBuild_FreshnessRead_LinkAfterAFailedBaseReadIsReadLiveNextLoad(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubID = "freshness-next-load-actor"
+	const repoFullName = "acme/freshness-read-next-load"
+	const n = 990
+
+	actor := decisionInboxActorFixture(ctx, t, pool, "freshness-next-load@example.com", actorGitHubID, tokenKey)
+	rs := newRevalidateStores(pool)
+	pr := seedPRWithVerdictContext(ctx, t, pool, rs, actorGitHubID, repoFullName, n, reviewverdict.Context{
+		BaseRef:       testEligibleBaseRef,
+		BaseSHA:       testEligibleBaseSHA,
+		AncestorChain: []review.AncestorLink{{Ref: "parent", SHA: "sha-parent"}},
+		PolicyVersion: autoapproval.CurrentPolicyVersion,
+	})
+	pr.CreatedAt = time.Now()
+	pr.AncestorChain = []ports.PRAncestorLink{{Ref: "parent", SHA: "a-cached-sha-never-read"}}
+	rs.replaceTargetPR(actorGitHubID, pr)
+
+	fake := rs.sourceControl
+	fake.resolveBranchSHAByBranch = map[string]string{testEligibleBaseRef: testEligibleBaseSHA, "parent": "sha-parent"}
+	fake.resolveBranchSHAErrByBranch = map[string]error{testEligibleBaseRef: errors.New("code host: http 502")}
+	host := newCountingCodeHost(fake)
+	deps := rs.deps
+	deps.SCMCache = decisioninbox.NewSCMCache(host, platform.DefaultTimeouts())
+	deps.TokenEncryptionKey = tokenKey
+
+	t0 := time.Now()
+	loads := []struct {
+		name string
+		at   time.Time
+		// prepare changes the code host before the load.
+		prepare      func()
+		wantReady    bool
+		wantDegraded bool
+		// wantFreshnessReads is the load's ResolveBranchSHA and IsAncestor
+		// calls.
+		wantFreshnessReads map[string]int
+	}{
+		{
+			name:               "the base tip fails",
+			at:                 t0,
+			prepare:            func() {},
+			wantDegraded:       true,
+			wantFreshnessReads: map[string]int{"ResolveBranchSHA": 1},
+		},
+		{
+			name: "within the TTL, the fault cleared and the link rewritten",
+			at:   t0.Add(platform.DefaultTimeouts().DecisionInboxSCMCacheTTL / 2),
+			prepare: func() {
+				delete(fake.resolveBranchSHAErrByBranch, testEligibleBaseRef)
+				fake.resolveBranchSHAByBranch["parent"] = "sha-parent-rewritten"
+				fake.isAncestorResult = false
+			},
+			// The base tip, never cached, and the link, never read on the
+			// first load, both read live; the link's move is checked.
+			wantFreshnessReads: map[string]int{"ResolveBranchSHA": 2, "IsAncestor": 1},
+		},
+	}
+	for _, load := range loads {
+		load.prepare()
+		result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, load.at)
+		if err != nil {
+			t.Fatalf("%s: Build() error = %v", load.name, err)
+		}
+		reads := host.take()
+		item := findItemByPR(result.Items, n)
+		if item == nil {
+			t.Fatalf("%s: PR #%d missing from the inbox", load.name, n)
+		}
+		if ready := item.Kind == decisioninboxdomain.KindReadyToMerge; ready != load.wantReady {
+			t.Errorf("%s: Kind = %s, want ready_to_merge %v", load.name, item.Kind, load.wantReady)
+		}
+		if result.SCMFetchFailed != load.wantDegraded {
+			t.Errorf("%s: SCMFetchFailed = %v, want %v", load.name, result.SCMFetchFailed, load.wantDegraded)
+		}
+		freshness := map[string]int{}
+		for _, method := range []string{"ResolveBranchSHA", "IsAncestor"} {
+			if reads[method] > 0 {
+				freshness[method] = reads[method]
+			}
+		}
+		if !maps.Equal(freshness, load.wantFreshnessReads) {
+			t.Errorf("%s: freshness reads = %v, want %v", load.name, freshness, load.wantFreshnessReads)
+		}
+	}
+
+	// The merge path reads live and refuses on the rewritten link too.
+	ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, deps, fake, actorGitHubID, repoFullName, n, "person-token")
+	if err != nil {
+		t.Fatalf("RevalidateForMerge() error = %v", err)
+	}
+	if ok || !strings.Contains(reason, string(autoapproval.ReasonAncestorChainChanged)) {
+		t.Errorf("RevalidateForMerge() = (%v, %q), want a refusal naming the changed ancestor chain", ok, reason)
 	}
 }

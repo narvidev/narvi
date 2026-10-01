@@ -230,8 +230,9 @@ type EligibilityInput struct {
 	// (ports.OpenPR.BaseSHA's own doc comment), exactly the value both of
 	// this engine's real callers (internal/app/decisioninbox's
 	// revalidateCore and computeRealEligibility) deliberately bypass in
-	// favor of a live SourceControl.ResolveBranchSHA call -- see either
-	// call site's own doc comment for the full "why".
+	// favor of the base branch's live tip, which both read through
+	// internal/app/reviewfreshness.ReadLive -- see either call site's own
+	// doc comment for the full "why".
 	CurrentBaseRef       string
 	CurrentBaseSHA       string
 	CurrentAncestorChain []review.AncestorLink
