@@ -1129,7 +1129,7 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 		if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
 			correlationID = &id
 		}
-		if _, err := turns.WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{
+		if _, err := turns.WithTx(tx).CreateAndArmDispatch(ctx, sqlcgen.CreateTurnParams{
 			SessionID:               created.ID,
 			Status:                  sqlcgen.TurnStatusPending,
 			Prompt:                  &firstTurnPrompt,
@@ -1182,10 +1182,15 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 // actor within ActorHydrateTimeout): answering 503 would make a client
 // retry and create a duplicate, and asking a webhook sender to redeliver
 // would re-run work that is not idempotent -- so the response is
-// unchanged and the warning carries reason=actor_unavailable. The pending
-// turn is then dispatched by the next command that reaches its session
-// (a sandbox frame, a timer); a session with neither waits for one --
-// durable redelivery of a failed trigger is not built yet.
+// unchanged and the warning carries reason=actor_unavailable. This trigger
+// is the fast path, not the only one (technical plan §2, §3.3): the
+// transaction that created the turn armed the session's dispatch timer due
+// at once (postgres.TurnStore.CreateAndArmDispatch), so when this fails --
+// actor_unavailable, actor_elsewhere (with more than one replica, the
+// answer on every replica but the one hosting the session), a Send to an
+// actor that has stopped, or a replica that dies before it runs -- the
+// timer pump delivers the same dispatch evaluation on whichever replica
+// claims the timer, and again after each claim window.
 func TriggerDispatch(ctx context.Context, registry *sessionactor.Registry, sessionID pgtype.UUID) {
 	logger := platform.Logger(ctx)
 

@@ -1003,7 +1003,7 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 	if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
 		correlationID = &id
 	}
-	created, err := turns.WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{
+	created, err := turns.WithTx(tx).CreateAndArmDispatch(ctx, sqlcgen.CreateTurnParams{
 		SessionID:               sessionID,
 		Status:                  sqlcgen.TurnStatusPending,
 		Prompt:                  &effectivePrompt,
@@ -1066,6 +1066,9 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 	// CreateSession's own identical post-commit sequencing (create.go) --
 	// see that handler's own doc comment for why this never blocks the
 	// response on how long the resulting spawn/dispatch decision takes.
+	// The fast path only: the insert above armed the session's dispatch
+	// timer in the same transaction, so a failure here is delivered by the
+	// timer pump (TriggerDispatch's doc comment).
 	actor, spawnErr := registry.GetOrSpawn(ctx, sessionID)
 	if spawnErr != nil {
 		logger.Warn("httpapi: GetOrSpawn after turn create failed",

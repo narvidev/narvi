@@ -12,7 +12,11 @@
 // file's own top comment) rather than by any of this file's own handlers,
 // unlike the 5 timers this file's rest describes. Technical plan §3.3's
 // stop adds a 7th, stop, armed from outside the actor the same way (by
-// POST /api/sessions/{sessionID}/stop) and implemented in stop.go.
+// POST /api/sessions/{sessionID}/stop) and implemented in stop.go. The
+// durable dispatch trigger (§2, §3.3) adds an 8th, dispatch, armed in the
+// transaction that creates a turn (postgres.TurnStore.CreateAndArmDispatch)
+// and handled by handleEnsureDispatched (dispatch.go), whose planDispatch
+// deletes it.
 //
 // All 5 named timers' RE-ARM/handling logic is fully wired here -- none
 // needed a SandboxProvider or AgentRuntime (neither port exists yet). The
@@ -129,6 +133,10 @@ func (a *Actor) timerHandler(name string) (func(context.Context) error, bool) {
 		return a.handleReviewRetriggerDebounceTimer, true
 	case TimerStop:
 		return a.handleStopTimer, true
+	case TimerDispatch:
+		// The evaluation deletes the row itself, first, in planDispatch's
+		// own transaction, as it does for every other caller.
+		return a.handleEnsureDispatched, true
 	default:
 		return nil, false
 	}

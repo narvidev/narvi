@@ -843,7 +843,7 @@ func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision
 	if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
 		correlationID = &id
 	}
-	created, err := a.stores.turn.WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{
+	created, err := a.stores.turn.WithTx(tx).CreateAndArmDispatch(ctx, sqlcgen.CreateTurnParams{
 		SessionID:               a.sessionID,
 		Status:                  sqlcgen.TurnStatusPending,
 		Prompt:                  &prompt,

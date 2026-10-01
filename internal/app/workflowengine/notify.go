@@ -66,7 +66,10 @@ type Deps struct {
 	// own implementation-turn insert does: this caller already holds the
 	// session row's lock and does not want createTurnLocked's own
 	// unrelated checks (the open-turn/busy gate, the awaiting-plan gate)
-	// re-run for a system/decision-triggered turn that is neither.
+	// re-run for a system/decision-triggered turn that is neither. It must
+	// be bound to that caller's transaction (TurnStore.WithTx):
+	// CreateAndArmDispatch refuses a pool-bound store, since the turn and
+	// its dispatch timer commit together (technical plan §2, §3.3).
 	Turns *postgres.TurnStore
 	// SlackThreadSessions/LinearAgentSessions/GitHubPRSessions back this
 	// file's own destination resolution -- the SAME three reverse-lookup

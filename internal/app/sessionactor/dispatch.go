@@ -129,6 +129,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/environment"
 	"github.com/narvidev/narvi/internal/domain/reposource"
+	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 	"github.com/narvidev/narvi/internal/domain/rollout"
 	"github.com/narvidev/narvi/internal/domain/sandbox"
 	"github.com/narvidev/narvi/internal/domain/turn"
@@ -328,8 +329,9 @@ type dispatchPlan struct {
 // but they are kept adjacent here since they share this exact hook point
 // for the exact same structural reason.
 func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
-	spawn, dispatch, err := a.planDispatch(ctx)
+	spawn, dispatch, deleted, err := a.planDispatch(ctx)
 	if err != nil {
+		a.backOffDispatchTimer(ctx, err, deleted)
 		return err
 	}
 	switch {
@@ -344,12 +346,59 @@ func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 		a.checkContractDrift(ctx, spawn)
 		return a.executeSpawn(ctx, spawn)
 	case dispatch != nil:
-		return a.executeDispatch(ctx, dispatch)
+		return a.executeDispatch(ctx, dispatch, deleted.CreatedAt)
 	default:
 		// Nothing to do this round: no pending turn, branch (c)'s no-op,
 		// or a defensive skip (nil provider/commander) inside one of the
 		// try* helpers below.
 		return nil
+	}
+}
+
+// backOffDispatchTimer runs after a dispatch evaluation that failed
+// (technical plan §2): planDispatch's transaction rolled back, the
+// dispatch timer's delete with it, and the pump's claim alone would bring
+// the timer back every TimerClaimDuration for as long as the failure
+// lasts, each delivery waking the actor so it never idles out. So, in a
+// transaction of its own, the timer's fires_at moves to the database's
+// now plus its age since its first arm, held between DispatchRetryBackoff
+// and DispatchRetryBackoffMax: the delay doubles with each failed
+// delivery, the claim cadence is never the retry cadence, and once the
+// delay passes ActorIdleTTL the actor can idle out between two tries.
+// armed_at is not moved -- a backoff is not an arm -- and a session with
+// no dispatch timer gets none. A stale actor (ErrStaleEpoch), or one whose
+// context is done, writes nothing: its successor has the timer. A failure
+// here is logged; the claim window still bounds the next try.
+//
+// deleted is the dispatch timer the failed evaluation deleted
+// (planDispatch), which its rollback restored; its armed_at is invalid
+// when the session had none, and then nothing is backed off. The write
+// holds only while the row still carries that armed_at: a turn created
+// between the rollback and this transaction -- a writer queued on the
+// session-row lock behind the evaluation gets it first -- re-arms the
+// timer due at once and moves armed_at, and its re-arm wins.
+func (a *Actor) backOffDispatchTimer(ctx context.Context, cause error, deleted sqlcgen.DeleteSessionDispatchTimerRow) {
+	if !deleted.ArmedAt.Valid || errors.Is(cause, ErrStaleEpoch) || ctx.Err() != nil {
+		return
+	}
+	var moved int64
+	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		moved, err = a.stores.timer.WithTx(tx).BackOffDispatch(ctx, sqlcgen.BackOffSessionDispatchTimerParams{
+			SessionID:   a.sessionID,
+			ArmedAt:     deleted.ArmedAt,
+			Since:       deleted.CreatedAt,
+			BaseSeconds: a.timeouts.DispatchRetryBackoff.Seconds(),
+			MaxSeconds:  a.timeouts.DispatchRetryBackoffMax.Seconds(),
+		})
+		return err
+	})
+	if err != nil {
+		a.logger.Warn("sessionactor: back off the dispatch timer after a failed evaluation failed", "error", err, "cause", cause)
+		return
+	}
+	if moved > 0 {
+		a.logger.Warn("sessionactor: dispatch evaluation failed; dispatch timer backed off", "cause", cause)
 	}
 }
 
@@ -363,12 +412,40 @@ func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 // (handleEnsureDispatched) then performs the actual network call
 // (CreateSandbox / RestoreFromSnapshot / ResumeSandbox / SendCommand
 // respectively) outside any transaction.
-func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, error) {
+//
+// deleted is the session's dispatch timer this evaluation deleted -- its
+// armed_at and created_at, both invalid when it had none -- returned even
+// with an error, when the rollback has restored that timer, so
+// handleEnsureDispatched backs off only the row this evaluation read, and
+// a prompt that is then never delivered carries that row's first arm on
+// (executeDispatch).
+func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, sqlcgen.DeleteSessionDispatchTimerRow, error) {
 	var spawn *spawnPlan
 	var dispatch *dispatchPlan
+	var deleted sqlcgen.DeleteSessionDispatchTimerRow
 
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		now := time.Now()
+
+		// The durable dispatch trigger (technical plan §2, §3.3): the
+		// transaction that created a turn armed the dispatch timer, and
+		// this evaluation is what it stands for, whatever asked for it --
+		// the post-commit trigger, the timer itself, a sandbox frame, a
+		// turn's end. Deleted under the actor-epoch lock transact took,
+		// which every transaction that creates a turn on an existing
+		// session takes too: a turn committed before that lock is read
+		// below, and one committed after it re-arms the timer after this
+		// delete, so it survives for the next round. Deleted first, so a
+		// turn this same transaction inserted later would re-arm it too
+		// (none does today). A rolled-back evaluation keeps it, and
+		// handleEnsureDispatched backs it off; a spawn refused on policy
+		// ends the turns it was for and commits (endTurnsOnSpawnRefusal).
+		deleted = sqlcgen.DeleteSessionDispatchTimerRow{}
+		row, err := a.stores.timer.WithTx(tx).DeleteDispatch(ctx, a.sessionID)
+		if err != nil {
+			return fmt.Errorf("sessionactor: delete the dispatch timer: %w", err)
+		}
+		deleted = row
 
 		sessionRow, err := a.stores.session.WithTx(tx).Get(ctx, a.sessionID)
 		if err != nil {
@@ -532,7 +609,7 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, er
 		return nil
 	})
 
-	return spawn, dispatch, err
+	return spawn, dispatch, deleted, err
 }
 
 // planReenqueueOrRespawn implements §3.3's ("turn recovery", §9.3
@@ -822,7 +899,7 @@ func (a *Actor) tryPlanSpawn(
 	if action.Kind == sandbox.SpawnActionSpawn || action.Kind == sandbox.SpawnActionRestore || action.Kind == sandbox.SpawnActionResume {
 		dockerRequired, err := a.refuseIfSubstrateUnsupported(ctx, tx, sessionRow, caps)
 		if err != nil {
-			return nil, err
+			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, sandboxGen(sandboxRow, hasSandbox), err, now)
 		}
 
 		// §10's own dispatch-time half of the "fail-closed, twice"
@@ -833,7 +910,7 @@ func (a *Actor) tryPlanSpawn(
 		// refuseIfRolloutUnenrolled's own doc comment for the full "why
 		// this is what makes rollback real".
 		if err := a.refuseIfRolloutUnenrolled(ctx, tx, sessionRow); err != nil {
-			return nil, err
+			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, sandboxGen(sandboxRow, hasSandbox), err, now)
 		}
 
 		// §27.8's own genuinely-unresolved snapshot-parity point (§27.5
@@ -959,16 +1036,19 @@ func (a *Actor) tryPlanSpawn(
 // check can never observe a DIFFERENT provider snapshot than the one
 // EvaluateSpawnDecision itself just reasoned over.
 //
-// On failure, this refuses the ENTIRE spawn attempt for this round with
-// a real, propagated error -- deliberately NOT sandbox.SpawnActionSkip's
-// own silent (nil, nil) shape: a Skip looks identical to an ordinary,
-// expected cooldown/in-progress no-op, but a docker/enforced-egress
-// session whose requirement the provider cannot honor is a genuine,
-// persistent misconfiguration that must be loud (logged at Error, and
-// surfaced to run's own "command handling failed" logger) until either
-// the provider or the Environment's own requirement changes -- silently
-// retrying forever would look, from the outside, exactly like a session
-// that is merely waiting its turn.
+// On failure, this refuses the ENTIRE spawn attempt with a spawnRefusal
+// -- deliberately NOT sandbox.SpawnActionSkip's own silent (nil, nil)
+// shape: a Skip looks identical to an ordinary, expected
+// cooldown/in-progress no-op, but a docker/enforced-egress session whose
+// requirement the provider cannot honor is a genuine, persistent
+// misconfiguration that must be loud (logged at Error). tryPlanSpawn hands
+// the refusal to endTurnsOnSpawnRefusal, which ends the session's open
+// turns with its reason in the same transaction: retrying the same
+// evaluation would only repeat it (technical plan §2's dispatch timer
+// would bring it back every claim window), and a turn left pending
+// forever would look, from the outside, exactly like a session that is
+// merely waiting its turn. A read of the Environment that fails is not a
+// refusal: it is returned as it is, and the evaluation backs off.
 //
 // Returns the resolved dockerRequired alongside the error (even on a nil
 // error) so its one caller (tryPlanSpawn) can also apply §27.8's own
@@ -982,7 +1062,12 @@ func (a *Actor) refuseIfSubstrateUnsupported(ctx context.Context, tx pgx.Tx, ses
 	if err := environment.CheckSubstrateCapabilities(dockerRequired, egressPolicy.RequiresEnforcement(), caps.DockerInSandbox, caps.EgressPolicy); err != nil {
 		a.logger.Error("sessionactor: refusing to spawn: configured provider cannot honor this Environment's substrate requirements (§27.5/§27.6 dispatch-time fail-closed re-check)",
 			"session_id", a.sessionID.String(), "error", err)
-		return dockerRequired, fmt.Errorf("sessionactor: dispatch-time substrate capability re-check failed: %w", err)
+		return dockerRequired, &spawnRefusal{
+			reason: fmt.Sprintf("the configured sandbox provider cannot honor this session's environment: %v", err),
+			warning: fmt.Sprintf("This session's open turns were ended: the configured sandbox provider cannot honor its environment (%v). "+
+				"An admin can change the provider or the environment; then send the turn again.", err),
+			notAssessed: reviewcheck.NotAssessedSubstrateUnsupported,
+		}
 	}
 	return dockerRequired, nil
 }
@@ -1138,15 +1223,19 @@ func (a *Actor) rolloutDecisionForSession(ctx context.Context, repoSettings *pos
 // repo de-enrolled between two consecutive dispatch attempts for the SAME
 // session is caught on the very next one.
 //
-// On refusal, this returns a real, propagated error -- deliberately NOT
+// On refusal, this returns a spawnRefusal -- deliberately NOT
 // sandbox.SpawnActionSkip's own silent (nil, nil) shape, mirroring
 // refuseIfSubstrateUnsupported's own identical reasoning: a Skip looks
 // identical to an ordinary, expected cooldown/in-progress no-op, but a
-// session whose own repo has been de-enrolled is a genuine, persistent
-// policy state that must be loud (logged at Error, surfaced to run's own
-// "command handling failed" logger) until re-enrolled, never a silent,
-// indefinitely-retried no-op that looks identical to the sandbox merely
-// waiting its turn.
+// session whose own repo has been de-enrolled is a genuine policy state
+// that must be loud (logged at Error, counted). tryPlanSpawn hands it to
+// endTurnsOnSpawnRefusal, which ends the session's open turns forward
+// with the same reason text the turn-dispatch-time refusal writes
+// (executeDispatch), so the refusal is made, and counted, once per turn
+// set rather than once per retry: re-enrolling the repo lets the next
+// turn a person creates run. A repo_settings read that failed is not a
+// fact about the repo: it is returned as a plain error, and the
+// evaluation backs off (handleEnsureDispatched's backOffDispatchTimer).
 //
 // Phase 6 audit fix (Finding 4): this refusal now ALSO increments
 // session_rollout_refused_total (recordRolloutRefusal, opsmetrics.go) --
@@ -1166,7 +1255,13 @@ func (a *Actor) refuseIfRolloutUnenrolled(ctx context.Context, tx pgx.Tx, sessio
 
 	decision, transient, err := a.rolloutDecisionForSession(ctx, a.stores.repoSettings.WithTx(tx), sessionRow)
 	if err != nil {
-		return fmt.Errorf("sessionactor: dispatch-time rollout re-check: %w", err)
+		// A structurally malformed repos column: no retry reads it any
+		// differently, so it is refused as a fact, exactly as
+		// rolloutRefusalForDispatch refuses it at turn-dispatch time.
+		a.logger.Error("sessionactor: spawn-time rollout re-check: resolve admission decision failed; failing closed (refusing spawn)",
+			"session_id", a.sessionID.String(), "error", err)
+		a.recordRolloutRefusal(ctx, string(sessionRow.SpawnSource))
+		return rolloutSpawnRefusal("<unresolvable repos>")
 	}
 	if decision.Admitted {
 		return nil
@@ -1174,10 +1269,158 @@ func (a *Actor) refuseIfRolloutUnenrolled(ctx context.Context, tx pgx.Tx, sessio
 
 	a.logger.Error("sessionactor: refusing to spawn: configured repo is not enrolled in the cohort rollout (§10 Phase 6, §32 dispatch-time fail-closed re-check)",
 		"session_id", a.sessionID.String(), "repo", decision.RepoFullName, "transient", transient)
-	if !transient {
-		a.recordRolloutRefusal(ctx, string(sessionRow.SpawnSource))
+	if transient {
+		// A repo_settings read that failed: not a fact about the repo. The
+		// evaluation fails, its transaction rolls back, and
+		// handleEnsureDispatched backs the dispatch timer off.
+		return fmt.Errorf("sessionactor: dispatch-time rollout re-check failed: repo %q could not be read (transient)", decision.RepoFullName)
 	}
-	return fmt.Errorf("sessionactor: dispatch-time rollout re-check failed: repo %q not enrolled in cohort rollout", decision.RepoFullName)
+	a.recordRolloutRefusal(ctx, string(sessionRow.SpawnSource))
+	return rolloutSpawnRefusal(decision.RepoFullName)
+}
+
+// rolloutSpawnRefusal is the spawnRefusal for repo, one the cohort
+// rollout does not admit.
+func rolloutSpawnRefusal(repo string) *spawnRefusal {
+	return &spawnRefusal{
+		reason: fmt.Sprintf("repo %q not enrolled in cohort rollout", repo),
+		warning: fmt.Sprintf("This session's open turns were ended: its repository %q is not enrolled in this deployment's rollout, so no sandbox could be started. "+
+			"An admin can enroll the repository; then send the turn again.", repo),
+		notAssessed: reviewcheck.NotAssessedRolloutNotEnrolled,
+	}
+}
+
+// sandboxGen is the session's sandbox gen as a warning carries it: 0 with
+// no sandbox row yet.
+func sandboxGen(sandboxRow sqlcgen.Sandbox, hasSandbox bool) int {
+	if !hasSandbox {
+		return 0
+	}
+	return int(sandboxRow.Gen)
+}
+
+// spawnRefusal is a spawn-time policy refusal: a fact about the session
+// that no retry of the same evaluation changes -- a repo the cohort
+// rollout does not admit, an environment the configured provider cannot
+// honor (technical plan §27.5, §32). refuseIfSubstrateUnsupported and
+// refuseIfRolloutUnenrolled return it; tryPlanSpawn hands it to
+// endTurnsOnSpawnRefusal. Anything else those gates return is transient.
+type spawnRefusal struct {
+	// reason is the human-readable cause, carried into each ended turn's
+	// synthetic execution_complete -- the same text the turn-dispatch-time
+	// refusal writes (executeDispatch).
+	reason string
+	// warning is the session warning (the banner) recorded once for the
+	// refusal: what ended the turns, and what an admin can do about it.
+	warning string
+	// notAssessed names the refusal on an ended review attempt's check,
+	// so it closes as not assessed with that reason.
+	notAssessed reviewcheck.NotAssessedReason
+}
+
+func (r *spawnRefusal) Error() string { return "sessionactor: spawn refused: " + r.reason }
+
+// endTurnsOnSpawnRefusal settles a refused spawn inside the evaluation's
+// own transaction (technical plan §2, §3.3). For a spawnRefusal it ends
+// every open turn of the session forward and returns nil, so the
+// transaction commits -- with the dispatch timer planDispatch deleted
+// first -- and nothing re-evaluates the same refusal: no pump delivery
+// comes back for it, and the actor can idle out. Every open turn needed
+// the sandbox the refusal is about: a pending turn could not be sent
+// anywhere else, and a spawn is only attempted for a turn in flight when
+// its sandbox is dead or stuck. Each turn goes through the turn machine's
+// own edge to Failed: turn.TriggerAbandon from pending or dispatched (the
+// session's failure reason reads never_started, as for any turn given up
+// on before it reached a sandbox), turn.TriggerTimeout from processing,
+// the edge failDispatchedTurn uses when the turn-dispatch-time refusal
+// ends a turn already processing (executeDispatch). Each gets the
+// synthetic execution_complete that refusal writes, with the same reason
+// text, and the channel notice (enqueueOutboxNotification, as
+// refusePersonalLinkOnly calls it) that each path ending a turn enqueues
+// -- completeProcessingTurn, handleTurnDeadlineTimer, cancelStoppedTurns,
+// refusePersonalLinkOnly, failDispatchedTurn: the Slack or Linear "Turn
+// failed" message, and for a review attempt the check closed as not
+// assessed with the refusal named -- the notice turn_deadline used to
+// send for a turn in flight before this deleted that timer. One session warning (the banner) names the refusal and what
+// an admin can do, and the session's status is re-derived. The workflow
+// hook is OnTurnRefused, never OnTurnCompleted: a refusal read as a
+// blocked outcome could follow a blocked edge and queue the same refused
+// step again, re-arming the dispatch timer in this very transaction.
+//
+// Any other error -- a read that failed, including a transient rollout
+// read -- is returned as it is: the evaluation fails, its transaction
+// rolls back with the timer's delete, and handleEnsureDispatched backs the
+// timer off instead (backOffDispatchTimer).
+func (a *Actor) endTurnsOnSpawnRefusal(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, gen int, err error, now time.Time) error {
+	var refusal *spawnRefusal
+	if !errors.As(err, &refusal) {
+		return err
+	}
+	turns, err := a.stores.turn.WithTx(tx).ListForSession(ctx, a.sessionID)
+	if err != nil {
+		return fmt.Errorf("sessionactor: list turns: %w", err)
+	}
+	overrides := map[pgtype.UUID]turn.Summary{}
+	endedProcessing := false
+	for _, t := range turns {
+		from := turn.State(t.Status)
+		if turn.IsTerminal(from) {
+			continue
+		}
+		trig := turn.TriggerAbandon
+		if from == turn.StateProcessing {
+			trig = turn.TriggerTimeout
+			endedProcessing = true
+		}
+		to, err := turn.Transition(from, trig)
+		if err != nil {
+			return fmt.Errorf("sessionactor: end turn %s on a refused spawn: %w", t.ID.String(), err)
+		}
+		if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+			ID:          t.ID,
+			Status:      sqlcgen.TurnStatus(to),
+			CompletedAt: pgtype.Timestamptz{Time: now, Valid: true},
+		}); err != nil {
+			return fmt.Errorf("sessionactor: update turn status: %w", err)
+		}
+		workflowengine.OnTurnRefused(ctx, workflowengine.Deps{
+			Workflows:             a.stores.workflow.WithTx(tx),
+			Turns:                 a.stores.turn.WithTx(tx),
+			SlackThreadSessions:   a.stores.slackThreadSession.WithTx(tx),
+			LinearAgentSessions:   a.stores.linearAgentSession.WithTx(tx),
+			GitHubPRSessions:      a.stores.githubPRSession.WithTx(tx),
+			Outbox:                a.stores.outbox.WithTx(tx),
+			EpistemicCheckDefault: a.epistemicCheckDefault,
+		}, sessionRow, t.ID, refusal.reason)
+		if turn.RequiresSyntheticExecutionComplete(trig) {
+			if err := a.appendEvent(ctx, tx, "execution_complete", map[string]any{
+				"turn_id":   t.ID.String(),
+				"synthetic": true,
+				"reason":    refusal.reason,
+			}); err != nil {
+				return err
+			}
+		}
+		failureReason, _ := turn.DeriveFailureReason(from, trig)
+		if err := a.enqueueOutboxNotification(ctx, tx, sessionRow, trig, failureReason, t, nil, refusal.notAssessed); err != nil {
+			return err
+		}
+		overrides[t.ID] = turn.Summary{Status: to, FailureReason: failureReason}
+		a.logger.Warn("sessionactor: turn ended: the spawn it needed was refused",
+			"turn_id", t.ID.String(), "from", string(from), "reason", refusal.reason)
+	}
+	if len(overrides) > 0 {
+		if err := a.recordSessionWarning(ctx, tx, gen, refusal.warning); err != nil {
+			return err
+		}
+		if err := a.persistDerivedSessionStatus(ctx, tx, summariesWithOverrides(turns, overrides)); err != nil {
+			return err
+		}
+	}
+	if endedProcessing {
+		return a.deleteTimer(ctx, tx, TimerTurnDeadline)
+	}
+	return nil
 }
 
 // planFreshSpawn implements design decision 3a's own write (token mint,
@@ -1948,14 +2191,24 @@ func (a *Actor) tryPlanDispatch(
 // actor has decided it will never actually deliver to a sandbox, for
 // WHATEVER reason (a transport failure or a policy refusal), reaches the
 // SAME terminal state the SAME way, with only the reason text differing.
-func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan) error {
+//
+// chainStart is the created_at of the dispatch timer the evaluation that
+// planned this dispatch deleted (invalid when it deleted none): the first
+// arm of the chain a failed delivery backs off from (failDispatchedTurn).
+func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainStart pgtype.Timestamptz) error {
 	if repo, refused, transient := a.rolloutRefusalForDispatch(ctx, plan.sessionRow); refused {
 		a.logger.Error("sessionactor: refusing to dispatch turn: configured repo is not enrolled in the cohort rollout (§10 Phase 6, §32 turn-dispatch-time fail-closed re-check)",
 			"session_id", a.sessionID.String(), "turn_id", plan.turnID.String(), "repo", repo, "transient", transient)
 		if !transient {
 			a.recordRolloutRefusal(ctx, string(plan.sessionRow.SpawnSource))
 		}
-		return a.failDispatchedTurn(ctx, plan.turnID, fmt.Sprintf("repo %q not enrolled in cohort rollout", repo))
+		return a.failDispatchedTurn(ctx, plan.turnID, dispatchFailure{
+			reason: fmt.Sprintf("repo %q not enrolled in cohort rollout", repo),
+			warning: fmt.Sprintf("This session's turn was ended: its repository %q is not enrolled in this deployment's rollout, so the turn was not sent to its sandbox. "+
+				"An admin can enroll the repository; then send the turn again.", repo),
+			notAssessed: reviewcheck.NotAssessedRolloutNotEnrolled,
+			refused:     true,
+		})
 	}
 
 	if err := a.commander.SendCommand(a.sessionID.String(), plan.payload); err != nil {
@@ -1964,7 +2217,11 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan) error {
 		// identically.
 		a.logger.Error("sessionactor: dispatch turn: send prompt command failed; failing turn",
 			"turn_id", plan.turnID.String(), "error", err)
-		return a.failDispatchedTurn(ctx, plan.turnID, fmt.Sprintf("failed to deliver prompt to sandbox: %v", err))
+		return a.failDispatchedTurn(ctx, plan.turnID, dispatchFailure{
+			reason:       fmt.Sprintf("failed to deliver prompt to sandbox: %v", err),
+			notAssessed:  reviewcheck.NotAssessedPromptNotDelivered,
+			backOffSince: chainStart,
+		})
 	}
 	return nil
 }
@@ -2032,10 +2289,12 @@ func (a *Actor) rolloutRefusalForDispatch(ctx context.Context, sessionRow sqlcge
 // terminal path for both, not two parallel ones: from the turn's own
 // perspective, "the actor decided this prompt will never reach a
 // sandbox" is one event, regardless of whether the proximate cause was a
-// transport failure or a policy refusal. reason is the caller's own
-// honest, human-readable account of WHICH -- carried verbatim into the
+// transport failure or a policy refusal. failure is the caller's own
+// honest account of WHICH: its reason text is carried verbatim into the
 // synthetic execution_complete event's own "reason" field (never
-// re-derived or classified further here).
+// re-derived or classified further here), its notAssessed onto a review
+// attempt's check, and a refusal alone adds a warning and reaches the
+// workflow engine as a refusal (below).
 //
 // This reuses the EXACT SAME domain/turn call and "append a synthetic
 // execution_complete event" logic handleTurnDeadlineTimer (timerfired.go)
@@ -2063,7 +2322,20 @@ func (a *Actor) rolloutRefusalForDispatch(ctx context.Context, sessionRow sqlcge
 // classification (§3.3), never meant to distinguish every possible cause
 // within "the control plane gave up on this turn before a real terminal
 // event could ever arrive".
-func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, reason string) error {
+//
+// Like every other path that ends a turn, it tells the turn's channel in
+// the same transaction (enqueueOutboxNotification): the Slack or Linear
+// "Turn failed (timeout)." notice, and for a review attempt -- whose
+// check tryPlanDispatch has already published as running -- the check
+// closed as not assessed, naming failure.notAssessed. It deletes
+// turn_deadline, the only other thing that would have sent that notice.
+// A rollout refusal also records a session warning naming the repository
+// and the remedy, as the spawn-time refusal does, and reaches the workflow
+// engine through OnTurnRefused rather than OnTurnCompleted: read as a
+// blocked outcome, the refusal could follow a blocked self edge and queue
+// the same step again, whose dispatch timer would bring it straight back
+// to this refusal.
+func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, failure dispatchFailure) error {
 	return a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		turns, err := a.stores.turn.WithTx(tx).ListForSession(ctx, a.sessionID)
 		if err != nil {
@@ -2109,7 +2381,7 @@ func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, reas
 		if err != nil {
 			return fmt.Errorf("sessionactor: get session: %w", err)
 		}
-		workflowengine.OnTurnCompleted(ctx, workflowengine.Deps{
+		deps := workflowengine.Deps{
 			Workflows:             a.stores.workflow.WithTx(tx),
 			Turns:                 a.stores.turn.WithTx(tx),
 			SlackThreadSessions:   a.stores.slackThreadSession.WithTx(tx),
@@ -2117,24 +2389,105 @@ func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, reas
 			GitHubPRSessions:      a.stores.githubPRSession.WithTx(tx),
 			Outbox:                a.stores.outbox.WithTx(tx),
 			EpistemicCheckDefault: a.epistemicCheckDefault,
-		}, sessionRow, turnID, turn.TriggerTimeout)
+		}
+		if failure.refused {
+			workflowengine.OnTurnRefused(ctx, deps, sessionRow, turnID, failure.reason)
+		} else {
+			workflowengine.OnTurnCompleted(ctx, deps, sessionRow, turnID, turn.TriggerTimeout)
+		}
 
 		if turn.RequiresSyntheticExecutionComplete(turn.TriggerTimeout) {
 			if err := a.appendEvent(ctx, tx, "execution_complete", map[string]any{
 				"turn_id":   turnID.String(),
 				"synthetic": true,
-				"reason":    reason,
+				"reason":    failure.reason,
 			}); err != nil {
 				return err
 			}
 		}
 
 		failureReason, _ := turn.DeriveFailureReason(turn.StateProcessing, turn.TriggerTimeout)
+		if err := a.enqueueOutboxNotification(ctx, tx, sessionRow, turn.TriggerTimeout, failureReason, target, nil, failure.notAssessed); err != nil {
+			return err
+		}
+		if failure.warning != "" {
+			gen := 0
+			if target.DispatchedSandboxGen != nil {
+				gen = int(*target.DispatchedSandboxGen)
+			}
+			if err := a.recordSessionWarning(ctx, tx, gen, failure.warning); err != nil {
+				return err
+			}
+		}
 		if err := a.persistDerivedSessionStatus(ctx, tx, summariesWithOverride(turns, turnID, to, failureReason)); err != nil {
 			return err
 		}
+		if !failure.refused {
+			if err := a.backOffAfterUndeliveredPrompt(ctx, tx, failure.backOffSince); err != nil {
+				return err
+			}
+		}
 		return a.deleteTimer(ctx, tx, TimerTurnDeadline)
 	})
+}
+
+// backOffAfterUndeliveredPrompt backs off the session's dispatch timer, if
+// it has one, inside the transaction that ended a turn whose prompt never
+// reached the sandbox (technical plan §2). OnTurnCompleted reads that end
+// as a blocked outcome, and a workflow step with a blocked self edge
+// queues the same step again, arming the dispatch timer due at once in
+// this very transaction; the next pump tick would send that turn to the
+// same dead connection, whose failure would queue the next -- a new turn,
+// step run and channel notice every tick, the backoff after a failed
+// evaluation never applying since each evaluation itself succeeds. So an
+// undelivered prompt counts as a failed evaluation for the timer: it waits
+// DispatchRetryBackoff, doubling to DispatchRetryBackoffMax with the age
+// of the chain's first arm, since -- the created_at of the timer the
+// evaluation deleted, which the re-queued turn's new row would otherwise
+// restart. The sandbox's own watchdogs meanwhile move a sandbox with no
+// live connection to suspect and failed, and the dispatch that follows
+// respawns it, as before. A turn's own post-commit trigger still
+// dispatches at once; only the pump's delivery waits. The row is read and
+// written under the actor-epoch lock this transaction holds, so no writer
+// re-arms it between the two.
+func (a *Actor) backOffAfterUndeliveredPrompt(ctx context.Context, tx pgx.Tx, since pgtype.Timestamptz) error {
+	timers := a.stores.timer.WithTx(tx)
+	row, err := timers.Get(ctx, sqlcgen.GetSessionTimerParams{SessionID: a.sessionID, Name: TimerDispatch})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("sessionactor: read the dispatch timer: %w", err)
+	}
+	if _, err := timers.BackOffDispatch(ctx, sqlcgen.BackOffSessionDispatchTimerParams{
+		SessionID:   a.sessionID,
+		ArmedAt:     row.ArmedAt,
+		Since:       since,
+		BaseSeconds: a.timeouts.DispatchRetryBackoff.Seconds(),
+		MaxSeconds:  a.timeouts.DispatchRetryBackoffMax.Seconds(),
+	}); err != nil {
+		return fmt.Errorf("sessionactor: back off the dispatch timer after an undelivered prompt: %w", err)
+	}
+	return nil
+}
+
+// dispatchFailure is why executeDispatch ends a turn it committed
+// processing (failDispatchedTurn).
+type dispatchFailure struct {
+	// reason is the synthetic execution_complete's reason text.
+	reason string
+	// notAssessed names the cause on a review attempt's check.
+	notAssessed reviewcheck.NotAssessedReason
+	// warning, when set, is recorded as a session warning (the banner).
+	warning string
+	// refused marks a policy refusal of a prompt that was never sent: the
+	// workflow engine hears it through OnTurnRefused, which escalates the
+	// run and queues nothing. Anything else is an undelivered prompt, and
+	// backs the session's dispatch timer off (backOffAfterUndeliveredPrompt).
+	refused bool
+	// backOffSince is the first arm of the dispatch timer's chain of
+	// failures, carried from the evaluation that planned the dispatch.
+	backOffSince pgtype.Timestamptz
 }
 
 // BuildPromptPayload marshals a real, schema-valid sandboxws.Prompt for

@@ -11,6 +11,75 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const armSessionDispatchTimer = `-- name: ArmSessionDispatchTimer :exec
+INSERT INTO session_timers (session_id, name, fires_at)
+VALUES ($1, 'dispatch', now())
+ON CONFLICT (session_id, name) DO UPDATE
+    SET fires_at = now(), armed_at = now()
+`
+
+// The session's dispatch timer (technical plan §2, §3.3), armed due at once
+// on the database's clock, in the transaction that creates a turn: the only
+// caller is TurnStore.CreateAndArmDispatch, which inserts the turn in the
+// same transaction. 'dispatch' is sessionactor.TimerDispatch; the kind is
+// named here rather than passed in, so no caller can arm another kind this
+// way. A re-arm moves fires_at back to now even while the pump holds the
+// row claimed, and stamps armed_at like every arm (UpsertSessionTimer).
+func (q *Queries) ArmSessionDispatchTimer(ctx context.Context, sessionID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, armSessionDispatchTimer, sessionID)
+	return err
+}
+
+const backOffSessionDispatchTimer = `-- name: BackOffSessionDispatchTimer :execrows
+UPDATE session_timers
+SET created_at = LEAST(created_at, COALESCE($1::timestamptz, created_at)),
+    fires_at = now() + LEAST(
+        GREATEST(now() - LEAST(created_at, COALESCE($1::timestamptz, created_at)),
+                 make_interval(secs => $2::float8)),
+        make_interval(secs => $3::float8))
+WHERE session_id = $4 AND name = 'dispatch'
+  AND armed_at = $5
+`
+
+type BackOffSessionDispatchTimerParams struct {
+	Since       pgtype.Timestamptz `json:"since"`
+	BaseSeconds float64            `json:"base_seconds"`
+	MaxSeconds  float64            `json:"max_seconds"`
+	SessionID   pgtype.UUID        `json:"session_id"`
+	ArmedAt     pgtype.Timestamptz `json:"armed_at"`
+}
+
+// The session actor's backoff of its dispatch timer (sessionactor's
+// backOffDispatchTimer and failDispatchedTurn, technical plan §2): after a
+// dispatch evaluation that failed, or one that sent a prompt the sandbox
+// never received. fires_at moves to now plus the row's age since the first
+// arm of its chain of failures, held between the two bounds, so each
+// failure doubles the delay until the bound. That first arm is created_at,
+// which a re-arm never moves, or since when it is earlier: a failed
+// delivery ends its turn, and a workflow step it re-queues arms a new row
+// whose created_at would restart the chain, so since carries the first arm
+// of the row the evaluation deleted, and created_at takes it. armed_at is
+// not moved: a backoff is not an arm. A session with no dispatch timer is
+// left without one (zero rows).
+//
+// It holds only while the row still carries armed_at: after a failed
+// evaluation, the armed_at that evaluation read when it deleted the timer
+// (DeleteSessionDispatchTimer) -- a turn created since re-armed it due at
+// once and moved armed_at, and that re-arm wins (zero rows).
+func (q *Queries) BackOffSessionDispatchTimer(ctx context.Context, arg BackOffSessionDispatchTimerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, backOffSessionDispatchTimer,
+		arg.Since,
+		arg.BaseSeconds,
+		arg.MaxSeconds,
+		arg.SessionID,
+		arg.ArmedAt,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const claimDueTimer = `-- name: ClaimDueTimer :one
 UPDATE session_timers
 SET fires_at = $1
@@ -44,6 +113,31 @@ func (q *Queries) ClaimDueTimer(ctx context.Context, arg ClaimDueTimerParams) (S
 		&i.CreatedAt,
 		&i.ArmedAt,
 	)
+	return i, err
+}
+
+const deleteSessionDispatchTimer = `-- name: DeleteSessionDispatchTimer :one
+DELETE FROM session_timers
+WHERE session_id = $1 AND name = 'dispatch'
+RETURNING armed_at, created_at
+`
+
+type DeleteSessionDispatchTimerRow struct {
+	ArmedAt   pgtype.Timestamptz `json:"armed_at"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+}
+
+// A dispatch evaluation's first write (sessionactor's planDispatch,
+// technical plan §2): the session's dispatch timer is deleted, and its
+// armed_at and created_at returned, so an evaluation that fails -- its
+// transaction rolls the delete back -- backs off only the row it read, and
+// one whose prompt is never delivered carries the row's first arm on to
+// the next (BackOffSessionDispatchTimer). pgx.ErrNoRows when the session
+// has none.
+func (q *Queries) DeleteSessionDispatchTimer(ctx context.Context, sessionID pgtype.UUID) (DeleteSessionDispatchTimerRow, error) {
+	row := q.db.QueryRow(ctx, deleteSessionDispatchTimer, sessionID)
+	var i DeleteSessionDispatchTimerRow
+	err := row.Scan(&i.ArmedAt, &i.CreatedAt)
 	return i, err
 }
 

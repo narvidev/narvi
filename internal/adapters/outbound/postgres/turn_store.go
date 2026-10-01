@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -16,6 +18,9 @@ import (
 // that lives in domain/turn (§3.1) and app/sessionactor (§2).
 type TurnStore struct {
 	q *sqlcgen.Queries
+	// bound reports whether q runs on a transaction (WithTx) rather than
+	// the pool: CreateAndArmDispatch refuses to run on the pool.
+	bound bool
 }
 
 // NewTurnStore builds a TurnStore backed by pool.
@@ -27,14 +32,98 @@ func NewTurnStore(pool *pgxpool.Pool) *TurnStore {
 // this store was built with — used by app/sessionactor's transactional-
 // write helper (§2).
 func (s *TurnStore) WithTx(tx pgx.Tx) *TurnStore {
-	return &TurnStore{q: s.q.WithTx(tx)}
+	return &TurnStore{q: s.q.WithTx(tx), bound: true}
 }
 
-// Create inserts a new turn row and returns it. The database rejects a
-// second concurrent 'processing' turn for the same session via the
-// turns_one_processing_per_session partial unique index (§3.3).
+// Create inserts a new turn row and returns it, and nothing else. The
+// database rejects a second concurrent 'processing' turn for the same
+// session via the turns_one_processing_per_session partial unique index
+// (§3.3). It arms no dispatch timer, so production code never calls it:
+// every turn a path creates goes through CreateAndArmDispatch, and
+// TestEveryTurnInsertArmsTheDispatchTimer fails for a CreateTurnParams
+// value built anywhere else. Tests keep it to seed turns in any state.
 func (s *TurnStore) Create(ctx context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error) {
 	return s.q.CreateTurn(ctx, arg)
+}
+
+// ErrTurnOutsideTransaction is CreateAndArmDispatch's answer on a store
+// that is not bound to a transaction: a turn and its dispatch timer commit
+// together or not at all, which two autocommit statements cannot promise.
+var ErrTurnOutsideTransaction = errors.New("postgres: a turn is created only inside a transaction, with its dispatch timer")
+
+// CreateAndArmDispatch is the one way production code creates a turn
+// (technical plan §2, §3.3): it inserts the turn and, in the same
+// transaction, arms the session's dispatch timer due at once on the
+// database's clock (ArmSessionDispatchTimer). The caller commits both, and
+// after its commit asks the session's actor to plan a dispatch; when that
+// trigger fails -- this replica cannot host the actor (actor_unavailable),
+// another replica hosts it (actor_elsewhere), the actor has stopped, or
+// the replica dies first -- the timer pump delivers the same evaluation on
+// whichever replica claims the timer, and again after each claim window.
+// The actor deletes the timer at the start of every dispatch evaluation
+// (sessionactor's planDispatch), so after a trigger that succeeded it is
+// gone within that evaluation. Refuses with ErrTurnOutsideTransaction on a
+// store not built by WithTx, writing nothing.
+//
+// A caller writing to a session that already exists holds the session's
+// actor-epoch row lock (SessionStore.GetActorEpochForUpdate) in the same
+// transaction, as every writer outside the actor does: the actor's own
+// transactions take that lock first, so an evaluation either sees this
+// turn or runs after its timer was armed. A caller creating the session in
+// the same transaction needs no lock: nothing else can see the session
+// before it commits.
+func (s *TurnStore) CreateAndArmDispatch(ctx context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error) {
+	if !s.bound {
+		return sqlcgen.Turn{}, ErrTurnOutsideTransaction
+	}
+	created, err := s.q.CreateTurn(ctx, arg)
+	if err != nil {
+		return sqlcgen.Turn{}, err
+	}
+	if err := s.q.ArmSessionDispatchTimer(ctx, arg.SessionID); err != nil {
+		return sqlcgen.Turn{}, fmt.Errorf("postgres: arm the dispatch timer: %w", err)
+	}
+	return created, nil
+}
+
+// LockedTurnCreator creates a turn in a transaction of its own, under the
+// session's actor-epoch row lock (SessionStore.GetActorEpochForUpdate) --
+// the lock REST takes to insert a turn -- through CreateAndArmDispatch, so
+// the turn and its dispatch timer commit together. It serves a caller with
+// no transaction of its own to join: the release composition review
+// (internal/app/releasereview), which runs on the release manifest worker.
+type LockedTurnCreator struct {
+	pool *pgxpool.Pool
+}
+
+// NewLockedTurnCreator builds a LockedTurnCreator on pool.
+func NewLockedTurnCreator(pool *pgxpool.Pool) *LockedTurnCreator {
+	return &LockedTurnCreator{pool: pool}
+}
+
+// CreateLockedTurn begins a transaction, locks arg.SessionID's
+// actor-epoch row, creates the turn and arms its dispatch timer
+// (CreateAndArmDispatch), and commits. pgx.ErrNoRows when the session does
+// not exist; nothing is written on any error.
+func (c *LockedTurnCreator) CreateLockedTurn(ctx context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error) {
+	tx, err := c.pool.Begin(ctx)
+	if err != nil {
+		return sqlcgen.Turn{}, fmt.Errorf("postgres: begin the turn transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	q := sqlcgen.New(c.pool).WithTx(tx)
+	if _, err := q.GetSessionActorEpochForUpdate(ctx, arg.SessionID); err != nil {
+		return sqlcgen.Turn{}, fmt.Errorf("postgres: lock the session's actor epoch: %w", err)
+	}
+	created, err := (&TurnStore{q: q, bound: true}).CreateAndArmDispatch(ctx, arg)
+	if err != nil {
+		return sqlcgen.Turn{}, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return sqlcgen.Turn{}, fmt.Errorf("postgres: commit the turn transaction: %w", err)
+	}
+	return created, nil
 }
 
 // Get fetches a turn by id.

@@ -199,16 +199,20 @@ func buildGitHubOutbound(cfg *platform.Config, deps githubOutboundDeps) (*github
 	// release_manifest_pending rows -- written by the GitHub webhook
 	// handler, so idle without ingress -- and reads merged pull requests
 	// as the bot, entirely decoupled from any webhook request's lifetime.
-	// The composition review dispatches through releaseCompositionDispatcher
+	// The composition review inserts its turn through
+	// postgres.LockedTurnCreator -- the turn and the session's dispatch
+	// timer in one transaction, under the session's actor-epoch lock --
+	// and dispatches through releaseCompositionDispatcher
 	// (registry.GetOrSpawn + EnsureDispatched, the same fire-and-forget
-	// sequencing every other turn-creation path uses).
+	// sequencing every other turn-creation path uses), whose failure the
+	// timer pump makes good.
 	o.releaseManifestWorker, err = releasereview.NewWorker(deps.releaseManifestQueue, releasereview.Deps{
 		SourceControl:          deps.sourceControl,
 		Outbox:                 deps.outbox,
 		ReleaseManifestChecks:  deps.releaseChecks,
 		CompositionTemplates:   deps.promptTemplates,
 		CompositionDiffFetcher: deps.sourceControl,
-		CompositionTurns:       deps.turns,
+		CompositionTurns:       postgres.NewLockedTurnCreator(deps.pool),
 		CompositionDispatch:    releaseCompositionDispatcher{registry: deps.registry},
 		CompositionAnchor:      deps.releaseChecks,
 		Timeouts:               cfg.Timeouts,

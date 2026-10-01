@@ -29,7 +29,9 @@ func TestOnTurnCompleted_SingleStepLane_OkOutcome_CompletesRun(t *testing.T) {
 	session := newSession(t, ctx, sessions)
 	row, _ := startRunAndAttachRealTurn(t, ctx, sessions, turns, workflows, session, "do the thing", nil, false)
 
-	workflowengine.OnTurnCompleted(ctx, deps, session, row.turnID, turn.TriggerComplete)
+	inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+		workflowengine.OnTurnCompleted(ctx, deps, session, row.turnID, turn.TriggerComplete)
+	})
 
 	var status string
 	var outcome *string
@@ -79,7 +81,9 @@ func TestOnTurnCompleted_SingleStepLane_FailTrigger_EscalatesRun(t *testing.T) {
 	session := newSession(t, ctx, sessions)
 	row, _ := startRunAndAttachRealTurn(t, ctx, sessions, turns, workflows, session, "do the thing", nil, false)
 
-	workflowengine.OnTurnCompleted(ctx, deps, session, row.turnID, turn.TriggerFail)
+	inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+		workflowengine.OnTurnCompleted(ctx, deps, session, row.turnID, turn.TriggerFail)
+	})
 
 	var status string
 	var outcome *string
@@ -146,7 +150,9 @@ func TestOnTurnCompleted_HITLAfterStep_MarksAwaitingDecision_RunStaysRunning(t *
 		t.Fatalf("res.Prompt = %q, want unchanged (test setup assumption)", res.Prompt)
 	}
 
-	workflowengine.OnTurnCompleted(ctx, deps, session, row.turnID, turn.TriggerComplete)
+	inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+		workflowengine.OnTurnCompleted(ctx, deps, session, row.turnID, turn.TriggerComplete)
+	})
 
 	var status string
 	var outcome *string
@@ -208,7 +214,9 @@ func TestOnTurnCompleted_PostedOutcomeTakesPrecedenceOverImplicitDerivation(t *t
 	// The turn itself now completes normally -- a naive implementation
 	// would derive StepOutcomeOK and overwrite the already-posted
 	// needs_fix; the COALESCE in FinishStepRun must prevent that.
-	workflowengine.OnTurnCompleted(ctx, deps, session, row.turnID, turn.TriggerComplete)
+	inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+		workflowengine.OnTurnCompleted(ctx, deps, session, row.turnID, turn.TriggerComplete)
+	})
 
 	var status string
 	var outcome *string

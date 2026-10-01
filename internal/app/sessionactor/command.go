@@ -44,6 +44,24 @@ const (
 	// the timer are rows, and whichever replica's pump delivers it next
 	// does the rest.
 	TimerStop = "stop"
+
+	// TimerDispatch makes a turn's dispatch trigger durable (technical plan
+	// §2, §3.3). It is armed from OUTSIDE the actor, due at once, in the
+	// transaction that creates a turn -- postgres.TurnStore.
+	// CreateAndArmDispatch is the one way production code creates one, and
+	// its query (ArmSessionDispatchTimer) names this kind -- so a turn
+	// committed on a session always has either a dispatch evaluation still
+	// to come or this timer. The post-commit EnsureDispatched every
+	// turn-creating path sends is the fast path; when it fails
+	// (actor_unavailable, actor_elsewhere, a stopped actor, or a replica
+	// that dies between its commit and the trigger) the timer pump delivers
+	// the evaluation on whichever replica claims the timer, and again after
+	// each claim window. Its handler is EnsureDispatched's
+	// (handleEnsureDispatched), and every dispatch evaluation deletes it
+	// first, in its own transaction (planDispatch), whatever asked for the
+	// evaluation -- so after a trigger that succeeded the row is gone within
+	// that evaluation, and a firing that arrives later finds nothing to do.
+	TimerDispatch = "dispatch"
 )
 
 // Command is the sum type an Actor's mailbox carries (§2: "one goroutine

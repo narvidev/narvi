@@ -398,6 +398,31 @@ type Timeouts struct {
 	// specified in the plan; 24 hours.
 	UnknownTimerDeleteAfter time.Duration
 
+	// The durable dispatch trigger's retry after a failed evaluation (§2;
+	// sessionactor's backOffDispatchTimer). A dispatch evaluation that
+	// fails -- a read that errored, a rollout read that could not be made
+	// -- rolls back the delete of the session's dispatch timer, and the
+	// pump's claim alone would bring it back every TimerClaimDuration for
+	// as long as the failure lasts, each delivery waking the session's
+	// actor. So the actor moves the timer to now plus its age since its
+	// first arm, held between these two bounds: the delay doubles with
+	// each failed delivery. A prompt the sandbox never received counts as
+	// such a failure, so a workflow step that re-queues itself is retried
+	// on this schedule, not at every pump tick. A policy refusal (a repo
+	// the cohort rollout does not admit, a substrate the provider cannot
+	// give) is not retried at all: it ends the session's open turns.
+
+	// DispatchRetryBackoff is the shortest such delay. Validate keeps it
+	// above TimerClaimDuration, so a failing evaluation is never retried
+	// at the claim cadence. Not specified in the plan; one minute.
+	DispatchRetryBackoff time.Duration
+
+	// DispatchRetryBackoffMax is the longest. Validate keeps it above
+	// ActorIdleTTL, so that once the delay reaches it the session's actor
+	// idles out between two tries, and above DispatchRetryBackoff. Not
+	// specified in the plan; one hour.
+	DispatchRetryBackoffMax time.Duration
+
 	// The session actor's lock connection and hydration bound (§2, §5.1).
 	// A replica holds every one of its actors' advisory locks on ONE
 	// dedicated connection outside its query pool
@@ -4026,6 +4051,9 @@ func DefaultTimeouts() Timeouts {
 		UnknownTimerBackoff:     10 * time.Minute, // not specified; chosen, well above TimerClaimDuration
 		UnknownTimerDeleteAfter: 24 * time.Hour,   // not specified; chosen
 
+		DispatchRetryBackoff:    1 * time.Minute, // not specified; chosen, above TimerClaimDuration
+		DispatchRetryBackoffMax: 1 * time.Hour,   // not specified; chosen, above ActorIdleTTL
+
 		ActorHydrateTimeout:       2 * time.Second,  // not specified; chosen
 		ActorLockStatementTimeout: 1 * time.Second,  // not specified; chosen
 		ActorLockProbeInterval:    10 * time.Second, // not specified; chosen
@@ -4578,6 +4606,17 @@ func (t Timeouts) Validate() error {
 		"UnknownTimerBackoff", t.UnknownTimerBackoff, "TimerClaimDuration", t.TimerClaimDuration)
 	check("UnknownTimerDeleteAfter > UnknownTimerGrace",
 		"UnknownTimerDeleteAfter", t.UnknownTimerDeleteAfter, "UnknownTimerGrace", t.UnknownTimerGrace)
+
+	// §2, the durable dispatch trigger's retry after a failed evaluation:
+	// never at the claim cadence, and slow enough at its longest for the
+	// session's actor to idle out between two tries. See
+	// DispatchRetryBackoff's and DispatchRetryBackoffMax's doc comments.
+	check("DispatchRetryBackoff > TimerClaimDuration",
+		"DispatchRetryBackoff", t.DispatchRetryBackoff, "TimerClaimDuration", t.TimerClaimDuration)
+	check("DispatchRetryBackoffMax > ActorIdleTTL",
+		"DispatchRetryBackoffMax", t.DispatchRetryBackoffMax, "ActorIdleTTL", t.ActorIdleTTL)
+	check("DispatchRetryBackoffMax > DispatchRetryBackoff",
+		"DispatchRetryBackoffMax", t.DispatchRetryBackoffMax, "DispatchRetryBackoff", t.DispatchRetryBackoff)
 
 	// §3.3's stop, after the named session's commit: a zero walk bound
 	// reaches no session it started, and one at or past

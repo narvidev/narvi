@@ -89,16 +89,39 @@ func TestOnTurnRefused(t *testing.T) {
 
 	t.Run("control: a completion read as blocked follows the self edge", func(t *testing.T) {
 		session, runID, turnID := startRun(t, "1.0001")
-		workflowengine.OnTurnCompleted(ctx, deps, session, turnID, turn.TriggerAbandon)
+		// In a transaction, as every production caller runs the engine: the
+		// re-queued attempt's turn is created with its dispatch timer, which
+		// needs one (TurnStore.CreateAndArmDispatch).
+		inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+			workflowengine.OnTurnCompleted(ctx, deps, session, turnID, turn.TriggerAbandon)
+		})
 		if n := stepRuns(t, runID); n != 2 {
 			t.Fatalf("step runs = %d, want 2: the edge re-queued the step", n)
+		}
+		live, err := workflows.GetLiveStepRunForRun(ctx, runID)
+		if err != nil {
+			t.Fatalf("get the re-queued attempt: %v", err)
+		}
+		if !live.TurnID.Valid || live.TurnID == turnID {
+			t.Fatalf("re-queued attempt's turn_id = %v, want a new turn: the edge queued no turn", live.TurnID)
+		}
+		var timers int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM session_timers WHERE session_id = $1 AND name = 'dispatch'`, session.ID).Scan(&timers); err != nil {
+			t.Fatalf("count dispatch timers: %v", err)
+		}
+		if timers != 1 {
+			t.Fatalf("dispatch timers = %d, want 1: the re-queued turn was created without its dispatch timer", timers)
 		}
 	})
 
 	t.Run("a refusal escalates once and follows no edge", func(t *testing.T) {
 		session, runID, turnID := startRun(t, "1.0002")
-		workflowengine.OnTurnRefused(ctx, deps, session, turnID, reason)
-		workflowengine.OnTurnRefused(ctx, deps, session, turnID, reason)
+		inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+			workflowengine.OnTurnRefused(ctx, deps, session, turnID, reason)
+		})
+		inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+			workflowengine.OnTurnRefused(ctx, deps, session, turnID, reason)
+		})
 
 		run, err := workflows.GetRun(ctx, runID)
 		if err != nil {
@@ -123,7 +146,9 @@ func TestOnTurnRefused(t *testing.T) {
 	t.Run("a person's standing stop cancels the run", func(t *testing.T) {
 		session, runID, turnID := startRun(t, "1.0003")
 		session.StopRequestedAt = pgtype.Timestamptz{Valid: true, Time: session.CreatedAt.Time}
-		workflowengine.OnTurnRefused(ctx, deps, session, turnID, reason)
+		inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+			workflowengine.OnTurnRefused(ctx, deps, session, turnID, reason)
+		})
 		run, err := workflows.GetRun(ctx, runID)
 		if err != nil {
 			t.Fatalf("get run: %v", err)
@@ -139,7 +164,9 @@ func TestOnTurnRefused(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create turn: %v", err)
 		}
-		workflowengine.OnTurnRefused(ctx, deps, session, created.ID, reason)
+		inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+			workflowengine.OnTurnRefused(ctx, deps, session, created.ID, reason)
+		})
 		var n int
 		if err := pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE session_id = $1`, session.ID).Scan(&n); err != nil {
 			t.Fatalf("count outbox: %v", err)

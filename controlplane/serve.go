@@ -224,7 +224,10 @@ type App struct {
 // (*sessionactor.Actor).Send(sessionactor.EnsureDispatched{}), the SAME
 // fire-and-forget sequencing httpapi.createTurnLocked already uses after
 // every OTHER turn-creation path (internal/adapters/inbound/httpapi/
-// turn.go). Kept here, in the wiring layer, rather than inside
+// turn.go). It is the fast path: the composition turn's own transaction
+// armed the session's dispatch timer (postgres.LockedTurnCreator), so an
+// error here -- this replica cannot host the actor, or another one does --
+// costs latency, not the turn. Kept here, in the wiring layer, rather than inside
 // internal/app/releasereview itself, so that package never needs to
 // import internal/app/sessionactor's own Command type system directly --
 // its own CompositionDispatcher interface stays a single narrow method,

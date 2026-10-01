@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -35,6 +36,29 @@ func (s *TimerStore) WithTx(tx pgx.Tx) *TimerStore {
 // independently") — never a duplicate row.
 func (s *TimerStore) Upsert(ctx context.Context, arg sqlcgen.UpsertSessionTimerParams) (sqlcgen.SessionTimer, error) {
 	return s.q.UpsertSessionTimer(ctx, arg)
+}
+
+// BackOffDispatch moves the session's dispatch timer to the database's
+// now plus its age since the first arm of its chain of failures -- its
+// created_at, or arg.Since when earlier, which created_at then takes --
+// held between arg.BaseSeconds and arg.MaxSeconds, only while the row
+// still carries arg.ArmedAt, and reports how many rows it moved: zero when
+// the session has no dispatch timer, or a turn re-armed it since. armed_at
+// is not moved. The session actor's backoff after a dispatch evaluation
+// that failed, or a prompt its sandbox never received (technical plan §2).
+func (s *TimerStore) BackOffDispatch(ctx context.Context, arg sqlcgen.BackOffSessionDispatchTimerParams) (int64, error) {
+	return s.q.BackOffSessionDispatchTimer(ctx, arg)
+}
+
+// DeleteDispatch deletes the session's dispatch timer and returns the
+// armed_at and created_at it carried, both invalid when the session had
+// none. The first write of every dispatch evaluation (technical plan §2).
+func (s *TimerStore) DeleteDispatch(ctx context.Context, sessionID pgtype.UUID) (sqlcgen.DeleteSessionDispatchTimerRow, error) {
+	row, err := s.q.DeleteSessionDispatchTimer(ctx, sessionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return sqlcgen.DeleteSessionDispatchTimerRow{}, nil
+	}
+	return row, err
 }
 
 // Get fetches a named timer for a session.

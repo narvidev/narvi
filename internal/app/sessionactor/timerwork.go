@@ -17,13 +17,14 @@ const (
 	// creates, starts or ends a turn, a plan, a workflow step or run, or a
 	// delivery. A session holding one can be settled.
 	TimerWorkSandboxOnly TimerWork = iota + 1
-	// TimerWorkTurnInFlight means firing it can end a turn, and so start the
-	// workflow's next step in the same transaction, but only a turn that is
-	// open when it fires -- processing for turn_deadline, pending,
-	// dispatched or processing for stop -- which the same snapshot already
-	// reads as queued or running. From a settled snapshot (no turn pending,
-	// dispatched or processing) it finds none and deletes itself. A session
-	// holding one can be settled.
+	// TimerWorkTurnInFlight means firing it can start or end a turn -- and
+	// an end can start the workflow's next step in the same transaction --
+	// but only a turn that is open when it fires -- processing for
+	// turn_deadline, pending, dispatched or processing for stop and for
+	// dispatch -- which the same snapshot already reads as queued or
+	// running. From a settled snapshot (no turn pending, dispatched or
+	// processing) it finds none and deletes itself. A session holding one
+	// can be settled.
 	TimerWorkTurnInFlight
 	// TimerWorkCreatesTurn means firing it can insert a turn with no new input.
 	// While one is armed the session is never settled; it reads scheduled
@@ -82,11 +83,22 @@ const (
 //     by the actor with no further input (reviewretrigger.go). Otherwise it
 //     declines and deletes itself. TimerCountsAsScheduledWork narrows it by
 //     the opt-in and the budget, which the status reads in its snapshot.
+//   - dispatch (armed due at once in the transaction that creates a turn,
+//     postgres.TurnStore.CreateAndArmDispatch; technical plan §2, §3.3):
+//     its firing is a dispatch evaluation (handleEnsureDispatched), which
+//     deletes it first and then dispatches, spawns or restores for, or --
+//     a person's stop, a personal-link refusal, which escalates a
+//     workflow run and queues nothing -- ends, only a turn already
+//     pending, or re-sends one already in flight: turns the same snapshot
+//     already reads as queued or running. It inserts no turn, and from a
+//     settled snapshot it finds nothing to do. Every evaluation deletes
+//     it, so after a trigger that succeeded it is gone within that
+//     evaluation.
 func ClassifyTimer(name string) (work TimerWork, ok bool) {
 	switch name {
 	case TimerConnectingDeadline, TimerLivenessCheck, TimerInactivity, TimerTerminalGrace:
 		return TimerWorkSandboxOnly, true
-	case TimerTurnDeadline, TimerStop:
+	case TimerTurnDeadline, TimerStop, TimerDispatch:
 		return TimerWorkTurnInFlight, true
 	case TimerReviewRetriggerDebounce:
 		return TimerWorkCreatesTurn, true

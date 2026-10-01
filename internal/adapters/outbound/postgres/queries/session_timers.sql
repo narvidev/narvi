@@ -14,6 +14,58 @@ ON CONFLICT (session_id, name) DO UPDATE
     SET fires_at = EXCLUDED.fires_at, armed_at = now()
 RETURNING *;
 
+-- name: ArmSessionDispatchTimer :exec
+-- The session's dispatch timer (technical plan §2, §3.3), armed due at once
+-- on the database's clock, in the transaction that creates a turn: the only
+-- caller is TurnStore.CreateAndArmDispatch, which inserts the turn in the
+-- same transaction. 'dispatch' is sessionactor.TimerDispatch; the kind is
+-- named here rather than passed in, so no caller can arm another kind this
+-- way. A re-arm moves fires_at back to now even while the pump holds the
+-- row claimed, and stamps armed_at like every arm (UpsertSessionTimer).
+INSERT INTO session_timers (session_id, name, fires_at)
+VALUES ($1, 'dispatch', now())
+ON CONFLICT (session_id, name) DO UPDATE
+    SET fires_at = now(), armed_at = now();
+
+-- name: BackOffSessionDispatchTimer :execrows
+-- The session actor's backoff of its dispatch timer (sessionactor's
+-- backOffDispatchTimer and failDispatchedTurn, technical plan §2): after a
+-- dispatch evaluation that failed, or one that sent a prompt the sandbox
+-- never received. fires_at moves to now plus the row's age since the first
+-- arm of its chain of failures, held between the two bounds, so each
+-- failure doubles the delay until the bound. That first arm is created_at,
+-- which a re-arm never moves, or since when it is earlier: a failed
+-- delivery ends its turn, and a workflow step it re-queues arms a new row
+-- whose created_at would restart the chain, so since carries the first arm
+-- of the row the evaluation deleted, and created_at takes it. armed_at is
+-- not moved: a backoff is not an arm. A session with no dispatch timer is
+-- left without one (zero rows).
+--
+-- It holds only while the row still carries armed_at: after a failed
+-- evaluation, the armed_at that evaluation read when it deleted the timer
+-- (DeleteSessionDispatchTimer) -- a turn created since re-armed it due at
+-- once and moved armed_at, and that re-arm wins (zero rows).
+UPDATE session_timers
+SET created_at = LEAST(created_at, COALESCE(sqlc.narg('since')::timestamptz, created_at)),
+    fires_at = now() + LEAST(
+        GREATEST(now() - LEAST(created_at, COALESCE(sqlc.narg('since')::timestamptz, created_at)),
+                 make_interval(secs => sqlc.arg('base_seconds')::float8)),
+        make_interval(secs => sqlc.arg('max_seconds')::float8))
+WHERE session_id = sqlc.arg('session_id') AND name = 'dispatch'
+  AND armed_at = sqlc.arg('armed_at');
+
+-- name: DeleteSessionDispatchTimer :one
+-- A dispatch evaluation's first write (sessionactor's planDispatch,
+-- technical plan §2): the session's dispatch timer is deleted, and its
+-- armed_at and created_at returned, so an evaluation that fails -- its
+-- transaction rolls the delete back -- backs off only the row it read, and
+-- one whose prompt is never delivered carries the row's first arm on to
+-- the next (BackOffSessionDispatchTimer). pgx.ErrNoRows when the session
+-- has none.
+DELETE FROM session_timers
+WHERE session_id = $1 AND name = 'dispatch'
+RETURNING armed_at, created_at;
+
 -- name: GetSessionTimer :one
 SELECT * FROM session_timers
 WHERE session_id = $1 AND name = $2;

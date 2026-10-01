@@ -31,15 +31,20 @@ import (
 //
 // Mirrors internal/app/sessionactor/reviewretrigger.go's own
 // insertAutoRetriggerTurn precedent for WHY this inserts a turn directly
-// via a store's own Create method rather than going through httpapi's
+// at the storage layer rather than going through httpapi's
 // createTurnLocked: that function is unexported, so no package outside
 // internal/adapters/inbound/httpapi can call it at all, regardless of any
-// import-cycle question. This inserts the turn directly via
-// CompositionTurnInserter.Create -- the SAME store-level primitive
-// createTurnLocked itself calls -- mirroring §8.2's manual path at the
-// storage layer rather than calling through it, exactly like
-// insertAutoRetriggerTurn already does for the automatic-re-review lane.
-// The SAME "workflowengine wiring is deliberately not duplicated"
+// import-cycle question. This inserts the turn through
+// CompositionTurnInserter.CreateLockedTurn, which gives it the transaction
+// createTurnLocked's own insert runs in (technical plan §2, §3.3): the
+// session's actor-epoch row lock, then the turn and the session's dispatch
+// timer, committed together (postgres.LockedTurnCreator). This path has no
+// transaction of its own to join -- it runs on the release manifest
+// worker -- so it gains one rather than writing in autocommit. The
+// post-commit EnsureDispatched below is the fast path; when it fails --
+// with more than one replica the worker is often not on the replica that
+// hosts the review session -- the timer pump delivers the same dispatch
+// evaluation. The SAME "workflowengine wiring is deliberately not duplicated"
 // omission reviewretrigger.go's own doc comment names applies identically
 // here: a composition-review turn is untracked by workflowengine,
 // degrading safely exactly like every other turn workflow engine was
@@ -127,7 +132,7 @@ func dispatchCompositionReview(ctx context.Context, logger *slog.Logger, deps De
 	// finding (D5's own framing) -- the fix is to stop writing it, not to
 	// invent a read path for a value no eligibility check will ever
 	// consult.
-	created, err := deps.CompositionTurns.Create(ctx, sqlcgen.CreateTurnParams{
+	created, err := deps.CompositionTurns.CreateLockedTurn(ctx, sqlcgen.CreateTurnParams{
 		SessionID:     in.SessionID,
 		Status:        sqlcgen.TurnStatusPending,
 		Prompt:        &prompt,
@@ -164,7 +169,7 @@ func dispatchCompositionReview(ctx context.Context, logger *slog.Logger, deps De
 	}
 
 	if err := deps.CompositionDispatch.EnsureDispatched(ctx, in.SessionID); err != nil {
-		logger.Warn("releasereview: ensure-dispatched after composition review turn insert failed",
+		logger.Warn("releasereview: ensure-dispatched after composition review turn insert failed; the session's dispatch timer delivers it",
 			"error", err, "owner", in.Owner, "repo", in.Repo, "pr_number", in.PRNumber)
 	}
 }
@@ -190,12 +195,16 @@ type CompositionTemplateFetcher interface {
 	GetTemplate(ctx context.Context, name string) (string, error)
 }
 
-// CompositionTurnInserter is the narrow slice of *postgres.TurnStore this
-// package needs -- mirrors this package's own OutboxEnqueuer/
+// CompositionTurnInserter is the narrow slice of *postgres.LockedTurnCreator
+// this package needs -- mirrors this package's own OutboxEnqueuer/
 // ReleaseManifestCheckInserter precedent: a small, locally-defined
 // interface so a unit test can inject a fake with no real DB round trip.
+// CreateLockedTurn inserts the turn and arms the session's dispatch timer
+// in one transaction, under the session's actor-epoch row lock (technical
+// plan §2, §3.3). *postgres.TurnStore does not satisfy it: its plain
+// Create is one autocommit insert, with no lock and no timer.
 type CompositionTurnInserter interface {
-	Create(ctx context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error)
+	CreateLockedTurn(ctx context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error)
 }
 
 // CompositionAnchorUpdater is the narrow slice of
@@ -212,8 +221,10 @@ type CompositionAnchorUpdater interface {
 }
 
 // CompositionDispatcher is this package's own narrow "please dispatch
-// this session's newly-inserted pending turn now" dependency -- mirrors
-// httpapi.createTurnLocked's own established "GetOrSpawn, then
+// this session's newly-inserted pending turn now" dependency -- the fast
+// path only: the session's dispatch timer, armed with the turn
+// (CompositionTurnInserter), delivers the same evaluation when it fails --
+// mirrors httpapi.createTurnLocked's own established "GetOrSpawn, then
 // Send(EnsureDispatched{})" fire-and-forget sequencing (internal/adapters/
 // inbound/httpapi/turn.go), abstracted behind one method so this package
 // never needs to import internal/app/sessionactor's own Command type

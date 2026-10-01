@@ -123,6 +123,31 @@ func completeWithOutcome(t *testing.T, ctx context.Context, deps workflowengine.
 	workflowengine.OnTurnCompleted(ctx, deps, sessionRow, turnID, turn.TriggerComplete)
 }
 
+// inTx runs fn with deps bound to one transaction on pool, and commits it,
+// as every production caller of the engine does (the session actor's
+// transact, the decide endpoint's own transaction): the engine creates its
+// turns through TurnStore.CreateAndArmDispatch, which arms their dispatch
+// timer in the same transaction and refuses a store bound to the pool.
+func inTx(t *testing.T, ctx context.Context, pool *pgxpool.Pool, deps workflowengine.Deps, fn func(workflowengine.Deps)) {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	bound := deps
+	bound.Workflows = deps.Workflows.WithTx(tx)
+	bound.Turns = deps.Turns.WithTx(tx)
+	bound.SlackThreadSessions = deps.SlackThreadSessions.WithTx(tx)
+	bound.LinearAgentSessions = deps.LinearAgentSessions.WithTx(tx)
+	bound.GitHubPRSessions = deps.GitHubPRSessions.WithTx(tx)
+	bound.Outbox = deps.Outbox.WithTx(tx)
+	fn(bound)
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+}
+
 // countOutboxRowsOfKind returns how many outbox rows for sessionID carry
 // kind -- used to assert "exactly one notice, never repeated" directly
 // against durable state, not just the immediate call's own return value.
@@ -190,7 +215,9 @@ func TestCircuitBreaker_NeedsFixLoop_EscalatesAfterMaxAttempts_ExactlyOneNotice(
 	for attempt := 0; attempt < loopguard.DefaultMaxAttempts+2; attempt++ {
 		// audit reports needs_fix -> either proceeds to a fresh "fix"
 		// attempt, or (once the bound is exhausted) escalates instead.
-		completeWithOutcome(t, ctx, deps, session, auditStepRunID, auditTurnID, "needs_fix")
+		inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+			completeWithOutcome(t, ctx, deps, session, auditStepRunID, auditTurnID, "needs_fix")
+		})
 
 		runRow, err := workflows.GetRun(ctx, runID)
 		if err != nil {
@@ -215,7 +242,9 @@ func TestCircuitBreaker_NeedsFixLoop_EscalatesAfterMaxAttempts_ExactlyOneNotice(
 		}
 
 		// fix reports ok -> loops back to a fresh "audit" attempt.
-		completeWithOutcome(t, ctx, deps, session, fixRun.ID, fixRun.TurnID, "ok")
+		inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+			completeWithOutcome(t, ctx, deps, session, fixRun.ID, fixRun.TurnID, "ok")
+		})
 
 		nextAudit, err := workflows.GetLiveStepRunForRun(ctx, runID)
 		if err != nil {
@@ -309,10 +338,12 @@ func TestDispatchSameStepRevision_NeverEscalates_RegardlessOfLoopLength(t *testi
 	}
 
 	for i := 0; i < revisionRounds; i++ {
-		newTurnID, err := workflowengine.DispatchSameStepRevision(ctx, deps, run.ID, auditStep, "please revise again", session)
-		if err != nil {
-			t.Fatalf("DispatchSameStepRevision (round %d): %v", i, err)
-		}
+		var newTurnID pgtype.UUID
+		inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+			if newTurnID, err = workflowengine.DispatchSameStepRevision(ctx, deps, run.ID, auditStep, "please revise again", session); err != nil {
+				t.Fatalf("DispatchSameStepRevision (round %d): %v", i, err)
+			}
+		})
 
 		runRow, err := workflows.GetRun(ctx, run.ID)
 		if err != nil {
@@ -404,9 +435,11 @@ func TestApplyStepOutcome_NextAttemptLeavesAPersonsStopStanding(t *testing.T) {
 		t.Fatalf("load definition: %v", err)
 	}
 
-	if _, err := workflowengine.ApplyStepOutcome(ctx, deps, runRow, loaded, sessionRow, workflow.ID(def.auditStepID.String()), workflow.StepOutcomeNeedsFix, nil); err != nil {
-		t.Fatalf("ApplyStepOutcome: %v", err)
-	}
+	inTx(t, ctx, pool, deps, func(deps workflowengine.Deps) {
+		if _, err := workflowengine.ApplyStepOutcome(ctx, deps, runRow, loaded, sessionRow, workflow.ID(def.auditStepID.String()), workflow.StepOutcomeNeedsFix, nil); err != nil {
+			t.Fatalf("ApplyStepOutcome: %v", err)
+		}
+	})
 
 	all, err := turns.ListForSession(ctx, session.ID)
 	if err != nil {
