@@ -78,10 +78,12 @@ func (b *Bridge) dispatch(ctx context.Context, msgType string, data []byte) erro
 			slog.Warn("wsbridge: dropping malformed prompt command", "error", err)
 			return nil
 		}
+		// Gen-checked before anything else: a receipt for a stale gen's
+		// prompt would tell the control plane this gen holds it.
 		if !b.checkGen("prompt", cmd.Gen) {
 			return nil
 		}
-		b.handler.HandlePrompt(ctx, cmd)
+		b.dispatchPrompt(ctx, cmd)
 		return nil
 
 	case "stop":

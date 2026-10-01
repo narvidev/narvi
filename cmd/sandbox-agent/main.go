@@ -1760,6 +1760,14 @@ func run() error {
 			timeouts.SandboxWSDialTimeout, timeouts.SandboxWSHeartbeatInterval,
 			timeouts.SandboxWSReconnectMinBackoff, timeouts.SandboxWSReconnectMaxBackoff)
 		handler.bridge = bridge
+		// Technical plan §3.3's prompt receipts: open this gen's prompt
+		// journal, before bridge.Run, so every ready advertises the
+		// capability and no prompt messageId runs twice, across a restart of
+		// this process within the gen too. A journal that cannot be opened
+		// leaves the bridge as it was -- no capability, so the control plane
+		// never re-sends to this gen -- and is logged by the bridge; it never
+		// fails the boot.
+		_ = bridge.EnablePromptReceipts(cfg.AgentStateDir)
 
 		// (§29.6): inject every resolved oauth-kind credential
 		// into OpenCode's own auth store, ONE PUT /auth/{providerID} call

@@ -29,3 +29,21 @@ func SetReplayCaughtUpHookForTest(b *Bridge, hook func()) {
 // OutboundBufferCapForTest is outboundBufferCap, for a test that needs a
 // connection to come up with the buffer exactly at its cap.
 const OutboundBufferCapForTest = outboundBufferCap
+
+// BreakPromptJournalForTest closes the file of b's prompt journal under it,
+// so every later append fails -- how a test makes a journal append fail
+// deterministically. Call it after EnablePromptReceipts.
+func BreakPromptJournalForTest(b *Bridge) {
+	b.journal.close()
+}
+
+// AssertStateDirIsOursForTest is assertStateDirIsOurs, so a test can check
+// a directory against an owner other than itself.
+func AssertStateDirIsOursForTest(dir string, uid int) error {
+	return assertStateDirIsOurs(dir, uid)
+}
+
+// PromptJournalFileNameForTest is promptJournalFileName.
+func PromptJournalFileNameForTest(sessionID string, gen int) string {
+	return promptJournalFileName(sessionID, gen)
+}

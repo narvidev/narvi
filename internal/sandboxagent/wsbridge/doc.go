@@ -120,6 +120,49 @@
 // connection's delayed shutdown must never tear down a bridge that has
 // already moved on to a newer generation.
 //
+// # Prompt receipts and the dedup journal
+//
+// The control plane commits a turn Processing before it writes the turn's
+// prompt to this connection, in one frame nothing acknowledges, so a prompt
+// can be lost -- the control plane dies after its commit, or the frame goes
+// with its socket -- leaving the turn to wait out its deadline on a sandbox
+// that never had it. Technical plan §3.3's prompt receipts close that: once
+// EnablePromptReceipts has opened this gen's prompt journal (promptjournal.go,
+// in boot.Config.AgentStateDir), every ready advertises
+// capabilities.promptReceipt, and the control plane, which records that per
+// gen, asks such a gen for a receipt on each prompt (receiptRequested). On
+// the gen's next reconnect it looks the receipt up, and when none is stored
+// sends the same prompt again, with the same messageId. So this package, for
+// every prompt, after checking its gen:
+//
+//   - journals its messageId, appended and fsynced, the first time it
+//     arrives -- before anything else;
+//   - answers it, when it asked, with a best-effort prompt_received event
+//     whose messageId is 'prompt_received:{messageId}' -- a duplicate too,
+//     with duplicate set, so a lost receipt is answered again by the next
+//     copy;
+//   - hands it to CommandHandler.HandlePrompt only the first time.
+//
+// A receipt is never sent for a prompt whose journal append failed: it
+// would promise what a restarted process could not keep, so such a prompt
+// neither runs nor is receipted, and the control plane may send it again.
+// A prompt that asked for no receipt still runs then, deduped in memory.
+// The receipt is not one of the critical types: each re-sent copy draws a
+// fresh one, and a buffered one replays on reconnect like any best-effort
+// event.
+//
+// The journal is keyed by session and gen (prompts-<sessionId>-<gen>.log)
+// and outlives this process, not the gen: a container restart within the
+// gen (a Kubernetes pod's default restartPolicy) keeps it, and a respawn,
+// restore or resume is a new gen, which never reads an older gen's file --
+// one that arrives with a snapshot or repo image is removed at open. Its
+// directory must be this process's own and writable by no one else, as the
+// credential cache's is (internal/sandboxagent/credentials): the agent
+// runtime is a different, untrusted uid (§30.5). A journal that cannot be
+// opened leaves the Bridge exactly as it was before receipts -- no
+// capability, no receipt, no dedup -- and the control plane then never
+// re-sends to this gen.
+//
 // # Honest gaps this package documents rather than papers over
 //
 // New's own sandboxID parameter is the value internal/sandboxagent/boot.
