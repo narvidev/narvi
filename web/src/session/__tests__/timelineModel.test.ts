@@ -194,6 +194,31 @@ describe('buildTimelineModel', () => {
     expect(buildTimelineModel(events).turns).toEqual([])
   })
 
+  it('keeps prompt_received (technical plan §3.3, prompt receipts) out of the model: it opens no turn after an execution_complete and leaves the boot signal alone', () => {
+    const events = [
+      env('boot_progress', { messageId: 'm0', phase: 'installing deps', timestamp: '2026-08-20T10:00:00Z' }),
+      env('tool_call', { messageId: 'm1', callId: 'c1', toolName: 'Read', input: {} }),
+      env('execution_complete', { messageId: 'm2', outcome: 'completed', reason: null }),
+      env('prompt_received', { type: 'prompt_received', messageId: 'prompt_received:p2', sessionId: 's', gen: 1, promptMessageId: 'p2', duplicate: false }),
+    ]
+    const model = buildTimelineModel(events)
+    expect(model.turns).toHaveLength(1)
+    expect(model.turns[0]!.live).toBe(false)
+    expect(model.latestBootPhase).toBe('installing deps')
+    expect(model.sawReady).toBe(false)
+  })
+
+  it('reads a ready that advertises capabilities as any ready', () => {
+    const events = [
+      env('boot_progress', { messageId: 'm1', phase: 'installing deps', timestamp: '2026-08-20T10:00:00Z' }),
+      env('ready', { messageId: 'm2', timestamp: '2026-08-20T10:01:00Z', capabilities: { promptReceipt: true } }),
+    ]
+    const model = buildTimelineModel(events)
+    expect(model.sawReady).toBe(true)
+    expect(model.latestBootPhase).toBeNull()
+    expect(model.turns).toEqual([])
+  })
+
   it('handles a step_finish with no matching step_start by surfacing a step anyway (never dropped)', () => {
     const events = [env('step_finish', { messageId: 'm1', stepId: 'ghost-step', cost: { tokens: { input: 1, output: 1 } } })]
     const model = buildTimelineModel(events)

@@ -295,6 +295,13 @@ type dispatchPlan struct {
 	// transaction, after this plan's own transact has already committed
 	// and returned.
 	sessionRow sqlcgen.Session
+
+	// receiptResend is non-nil only on the plan of technical plan §3.3's
+	// prompt-receipt check of a same-gen reconnect (tryPlanReceiptResend,
+	// promptreceipt.go): executeDispatch hands it to executeReceiptResend,
+	// which sends payload only for turn.PromptResendSend and never fails the
+	// turn. payload is nil for the other two outcomes.
+	receiptResend *receiptResendPlan
 }
 
 // handleEnsureDispatched implements the EnsureDispatched command
@@ -626,13 +633,18 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, sq
 //     a Pending or an in-flight turn is what ultimately needs it).
 //   - (b') a live sandbox, Ready or Suspect: if the in-flight turn's own
 //     dispatched_sandbox_gen already matches this sandbox's CURRENT gen
-//     (turn.NeedsReenqueue reports false), this is a turn being
-//     correctly, actively processed by its own current-gen sandbox RIGHT
-//     NOW -- a strict, hard no-op (see TestHandleEnsureDispatched_
+//     (turn.NeedsReenqueue reports false), the prompt went to this very
+//     sandbox incarnation, which may be running it right now, so it is
+//     never re-dispatched (see TestHandleEnsureDispatched_
 //     ProcessingOnCurrentGenSandbox_NeverReDispatched, dispatch_
 //     integration_test.go, for the regression proof this can never
-//     regress). Otherwise, tryPlanReenqueue re-sends it to the current
-//     sandbox.
+//     regress) -- with one exception, technical plan §3.3's prompt
+//     receipts (tryPlanReceiptResend, promptreceipt.go): when the gen
+//     advertised the capability, the turn's own dispatch asked for a
+//     receipt, the gen has reconnected since and no receipt is stored, the
+//     SAME prompt, with the SAME messageId, is sent once more, which the
+//     agent runs at most once. Otherwise, tryPlanReenqueue re-sends it to
+//     the current sandbox.
 //   - (c') sandbox exists, neither dead nor Ready/Suspect (still
 //     Spawning/Connecting/Booting/Snapshotting) -- defers to
 //     EvaluateSpawnDecision's own judgment exactly like branch (c) does:
@@ -685,12 +697,20 @@ func (a *Actor) planReenqueueOrRespawn(
 			dispatchedGen = &g
 		}
 		if !turn.NeedsReenqueue(dispatchedGen, int(sandboxRow.Gen)) {
-			// CRITICAL no-op: this turn is already correctly, actively
-			// being processed by its own current-gen, live sandbox --
-			// re-dispatching it here would send its prompt a SECOND time
-			// to a sandbox already working on it. See this function's own
-			// doc comment above for the regression test proving this.
-			return nil, nil, nil
+			// CRITICAL: this turn's prompt went to this current-gen, live
+			// sandbox, which may be working on it right now -- it is never
+			// re-dispatched with a new messageId here: an agent that holds
+			// the prompt would run it a second time. The one thing that
+			// may follow is technical plan §3.3's prompt-receipt check,
+			// which sends nothing unless the gen advertised the capability,
+			// the turn's own dispatch asked for a receipt, the gen has
+			// reconnected since the last check and no receipt is stored --
+			// and then sends the SAME prompt, with the SAME messageId, which
+			// such an agent runs at most once. See this function's own doc
+			// comment above for the regression test proving an incapable
+			// gen's turn is never re-sent.
+			d, err := a.tryPlanReceiptResend(ctx, tx, sessionRow, sandboxRow, target)
+			return nil, d, err
 		}
 		d, err := a.tryPlanReenqueue(ctx, tx, sessionRow, sandboxRow, target, now)
 		return nil, d, err
@@ -788,8 +808,18 @@ func (a *Actor) tryPlanReenqueue(
 	}); err != nil {
 		return nil, fmt.Errorf("sessionactor: stamp dispatched_sandbox_gen for reenqueue: %w", err)
 	}
+	// Technical plan §3.3's prompt receipts: this new dispatch, to a new
+	// gen, asks for a receipt only when that gen advertised the capability,
+	// and records which messageId asked in this same commit -- or records
+	// that none did, clearing the request the turn's dispatch to the
+	// previous gen made. receiptRequested and the recorded request come
+	// from this one value (promptreceipt.go).
+	receiptRequested, err := a.recordPromptReceiptRequest(ctx, tx, target.ID, sandboxRow, messageID)
+	if err != nil {
+		return nil, err
+	}
 
-	payload, err := BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, target, messageID)
+	payload, err := BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, target, messageID, receiptRequested)
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: build prompt payload (reenqueue): %w", err)
 	}
@@ -2090,15 +2120,29 @@ func (a *Actor) tryPlanDispatch(
 	}); err != nil {
 		return nil, fmt.Errorf("sessionactor: update turn status to dispatched: %w", err)
 	}
+	// Technical plan §3.3's prompt receipts: this dispatch asks the sandbox
+	// for a receipt only when the gen advertised the capability, and
+	// records which messageId asked, and when, in this same commit -- the
+	// one place a later re-send can learn that this dispatch, and not an
+	// older binary's, asked. receiptRequested and the recorded request come
+	// from this one value (promptreceipt.go).
+	receiptRequested, err := a.recordPromptReceiptRequest(ctx, tx, turnID, sandboxRow, messageID)
+	if err != nil {
+		return nil, err
+	}
 
-	// §3.3: dispatched -> processing happens immediately here too -- this
-	// Step's own scope has no separate "the sandbox acknowledged receipt"
-	// signal to gate the second transition on (see design decision 3b's
-	// own reasoning); "we successfully sent it" is treated as sufficient
-	// for both. Note this now commits BEFORE SendCommand is ever attempted
-	// (see this file's own top comment) -- if the send subsequently fails,
-	// the turn is failed forward from here (executeDispatch/
-	// failDispatchedTurn), never rolled back to Pending.
+	// §3.3: dispatched -> processing happens immediately here too, in this
+	// same commit, receipt or not. The prompt receipt is recorded as data,
+	// never as this edge: a turn held in Dispatched until its sandbox's
+	// receipt came back would never complete on a control plane that
+	// completes only a Processing turn (completeProcessingTurn) -- an older
+	// replica during a rolling deploy, or this one for an agent that sends
+	// no receipt. A prompt lost after this commit is instead sent again,
+	// on the same gen, once that gen has reconnected (promptreceipt.go).
+	// Note this commits BEFORE SendCommand is ever attempted (see this
+	// file's own top comment) -- if the send subsequently fails, the turn is
+	// failed forward from here (executeDispatch/failDispatchedTurn), never
+	// rolled back to Pending.
 	toProcessing, err := turn.Transition(turn.StateDispatched, turn.TriggerStartProcessing)
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: turn transition dispatched->processing: %w", err)
@@ -2114,7 +2158,7 @@ func (a *Actor) tryPlanDispatch(
 		return nil, err
 	}
 
-	payload, err := BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, target, messageID)
+	payload, err := BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, target, messageID, receiptRequested)
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: build prompt payload: %w", err)
 	}
@@ -2195,7 +2239,15 @@ func (a *Actor) tryPlanDispatch(
 // chainStart is the created_at of the dispatch timer the evaluation that
 // planned this dispatch deleted (invalid when it deleted none): the first
 // arm of the chain a failed delivery backs off from (failDispatchedTurn).
+//
+// A plan carrying receiptResend -- technical plan §3.3's prompt-receipt
+// check of a same-gen reconnect -- goes to executeReceiptResend instead,
+// which runs the same rollout re-check but never fails the turn: its
+// prompt was already sent once, and may be running.
 func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainStart pgtype.Timestamptz) error {
+	if plan.receiptResend != nil {
+		return a.executeReceiptResend(ctx, plan)
+	}
 	if repo, refused, transient := a.rolloutRefusalForDispatch(ctx, plan.sessionRow); refused {
 		a.logger.Error("sessionactor: refusing to dispatch turn: configured repo is not enrolled in the cohort rollout (§10 Phase 6, §32 turn-dispatch-time fail-closed re-check)",
 			"session_id", a.sessionID.String(), "turn_id", plan.turnID.String(), "repo", repo, "transient", transient)
@@ -2524,7 +2576,14 @@ type dispatchFailure struct {
 // package boundary reach the real, single implementation (see turn.go's
 // own doc comments) -- a pure rename, no behavior change: both call sites
 // below are unaffected other than the name.
-func BuildPromptPayload(sessionID string, sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, target sqlcgen.Turn, messageID string) (json.RawMessage, error) {
+//
+// receiptRequested (technical plan §3.3, prompt receipts) sets the wire
+// Prompt's receiptRequested to true, and only when it is true: a prompt that
+// asks for no receipt omits the key, byte-identical to one a control plane
+// without receipts sends. Every caller passes the value it recorded in the
+// same transaction (promptreceipt.go's recordPromptReceiptRequest), or true
+// for a receipt re-send.
+func BuildPromptPayload(sessionID string, sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, target sqlcgen.Turn, messageID string, receiptRequested bool) (json.RawMessage, error) {
 	prompt := sandboxws.Prompt{
 		Type:      "prompt",
 		MessageId: messageID,
@@ -2545,6 +2604,9 @@ func BuildPromptPayload(sessionID string, sessionRow sqlcgen.Session, sandboxRow
 		ScmName:  scmCommitName,
 		ScmEmail: scmCommitEmail,
 		PlanMode: target.PlanMode,
+	}
+	if receiptRequested {
+		prompt.ReceiptRequested = &receiptRequested
 	}
 	return json.Marshal(prompt)
 }

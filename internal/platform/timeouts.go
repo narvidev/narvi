@@ -110,6 +110,25 @@ type Timeouts struct {
 	// TurnDeadline, which would otherwise end the turn first.
 	StopGrace time.Duration
 
+	// PromptResendWindow: how long after a turn's dispatch asked its sandbox for a
+	// prompt receipt (turns.receipt_requested_at, database clock) the session actor
+	// still re-sends that prompt, on the same gen, when the gen's next reconnect finds
+	// no receipt stored (technical plan §3.3). Not given a value in the plan; 10m.
+	//
+	// At the bound nothing is sent: the reconnect is logged at WARN and counted
+	// (turn_prompt_resend_total{outcome="window_expired"}), and the turn ends as
+	// it did before receipts existed, at turn_deadline or by a person's stop --
+	// no new failure path. Validate keeps it positive; below TurnDeadline by
+	// MinTimeoutMargin, so a prompt re-sent at the last moment starts before its
+	// deadline with at least TurnDeadline minus this left to run (the deadline is
+	// never re-armed by a re-send); and above ActorLockServerReapTime plus
+	// SandboxWSReconnectMaxBackoff plus ActorHydrateTimeout by MinTimeoutMargin,
+	// the slowest path from a dispatching replica that died after its commit to a
+	// same-gen ready on another replica -- the server reaping the dead lock
+	// backend, the agent's next dial, the hydration -- so that path still lands
+	// inside the window.
+	PromptResendWindow time.Duration
+
 	// StopDescendantWalkTimeout bounds what a stop request does after the
 	// named session's own request has committed (technical plan §3.3,
 	// httpapi's StopSession): walking to every session it started, one
@@ -4024,6 +4043,7 @@ func DefaultTimeouts() Timeouts {
 		SupervisorTurnCap:         90 * time.Minute,  // not specified; chosen with margin below ProviderHardCap
 		TurnDeadline:              60 * time.Minute,  // not specified; chosen with margin below SupervisorTurnCap
 		StopGrace:                 30 * time.Second,  // not specified; chosen (§3.3's stop)
+		PromptResendWindow:        10 * time.Minute,  // not specified; chosen (§3.3's prompt receipts)
 		StopDescendantWalkTimeout: 8 * time.Second,   // not specified; chosen (§3.3's stop)
 		SSEInactivityTimeout:      120 * time.Second, // §7, explicit
 		ProviderHTTPClientTimeout: 5 * time.Minute,   // not specified; must clear ProviderWorstColdStart (§4.1) with margin
@@ -4598,6 +4618,21 @@ func (t Timeouts) Validate() error {
 	mustBePositive("StopGrace", t.StopGrace)
 	check("TurnDeadline > StopGrace",
 		"TurnDeadline", t.TurnDeadline, "StopGrace", t.StopGrace)
+
+	// §3.3's prompt receipts: a zero window re-sends nothing, ever; one at or
+	// past TurnDeadline would re-send a prompt with no budget left before its
+	// deadline, which a re-send never re-arms; and one no longer than the
+	// slowest path from a replica that died after its dispatch commit to a
+	// same-gen ready on another replica -- the server reaping the dead lock
+	// backend, the agent's next dial, the hydration -- would refuse the very
+	// reconnect the window exists for. See PromptResendWindow's own doc comment.
+	mustBePositive("PromptResendWindow", t.PromptResendWindow)
+	check("TurnDeadline > PromptResendWindow",
+		"TurnDeadline", t.TurnDeadline, "PromptResendWindow", t.PromptResendWindow)
+	check("PromptResendWindow > ActorLockServerReapTime + SandboxWSReconnectMaxBackoff + ActorHydrateTimeout",
+		"PromptResendWindow", t.PromptResendWindow,
+		"ActorLockServerReapTime + SandboxWSReconnectMaxBackoff + ActorHydrateTimeout",
+		t.ActorLockServerReapTime()+t.SandboxWSReconnectMaxBackoff+t.ActorHydrateTimeout)
 
 	// §2, a timer kind this binary does not know: kept at the claim cadence
 	// for longer than a rolling deploy is assumed to run, so a newer

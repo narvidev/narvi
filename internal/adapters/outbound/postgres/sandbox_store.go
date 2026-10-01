@@ -75,6 +75,14 @@ func (s *SandboxStore) MarkBootEvidence(ctx context.Context, sessionID pgtype.UU
 	return s.q.MarkSandboxBootEvidence(ctx, sqlcgen.MarkSandboxBootEvidenceParams{SessionID: sessionID, Gen: gen})
 }
 
+// RecordReady counts a ready of gen and records whether it advertised the
+// prompt-receipt capability (technical plan §3.3, prompt receipts), when
+// gen is still the sandbox's live gen, and does nothing otherwise -- see
+// RecordSandboxReady's own generated doc comment.
+func (s *SandboxStore) RecordReady(ctx context.Context, sessionID pgtype.UUID, gen int32, promptReceipt bool) error {
+	return s.q.RecordSandboxReady(ctx, sqlcgen.RecordSandboxReadyParams{PromptReceipt: promptReceipt, SessionID: sessionID, Gen: gen})
+}
+
 // MarkBootingSince records, on the database's clock, when gen entered
 // Booting -- once per gen, and only while gen is the sandbox's live gen.
 // §3.2's boot-evidence fallback; see MarkSandboxBootingSince's own

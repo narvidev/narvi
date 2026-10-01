@@ -282,3 +282,49 @@ func (s *TurnStore) ListStopRequestedOpen(ctx context.Context, sessionID pgtype.
 		SessionID:    sessionID,
 	})
 }
+
+// SetPromptReceiptRequest records, in the transaction of the dispatch that
+// just stamped id's dispatched_message_id, whether that dispatch asked its
+// sandbox for a prompt receipt (technical plan §3.3, prompt receipts):
+// messageID is that dispatched_message_id when it asked and nil when it
+// did not, which clears an earlier request; readySeq is the sandbox's
+// ready_seq at the dispatch. See SetTurnPromptReceiptRequest's own
+// generated doc comment.
+func (s *TurnStore) SetPromptReceiptRequest(ctx context.Context, id pgtype.UUID, messageID *string, readySeq int32) error {
+	return s.q.SetTurnPromptReceiptRequest(ctx, sqlcgen.SetTurnPromptReceiptRequestParams{
+		MessageID: messageID,
+		ReadySeq:  readySeq,
+		ID:        id,
+	})
+}
+
+// PromptReceiptState reports whether the receipt of id's current dispatch
+// is stored, by its deterministic key, and how long ago that dispatch
+// asked for it, on the database's clock. ok is false when the dispatch
+// asked for no receipt.
+func (s *TurnStore) PromptReceiptState(ctx context.Context, id pgtype.UUID) (receiptStored bool, sinceRequest time.Duration, ok bool, err error) {
+	row, err := s.q.GetTurnPromptReceiptState(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, 0, false, nil
+	}
+	if err != nil {
+		return false, 0, false, err
+	}
+	return row.ReceiptStored, time.Duration(row.SinceRequestNanos), true, nil
+}
+
+// MarkPromptReconnectAnswered claims the sandbox ready numbered readySeq
+// for id's prompt-receipt check: it moves receipt_checked_ready_seq from
+// checkedReadySeq to readySeq while id is still Processing, unflagged by a
+// stop, on the dispatch messageID names, which asked for the receipt.
+// Returns the rows moved, 0 or 1; 0 means the claim failed and nothing is
+// to be sent. See MarkTurnPromptReconnectAnswered's own generated doc
+// comment.
+func (s *TurnStore) MarkPromptReconnectAnswered(ctx context.Context, id pgtype.UUID, messageID string, checkedReadySeq, readySeq int32) (int64, error) {
+	return s.q.MarkTurnPromptReconnectAnswered(ctx, sqlcgen.MarkTurnPromptReconnectAnsweredParams{
+		ReadySeq:        readySeq,
+		ID:              id,
+		MessageID:       messageID,
+		CheckedReadySeq: checkedReadySeq,
+	})
+}

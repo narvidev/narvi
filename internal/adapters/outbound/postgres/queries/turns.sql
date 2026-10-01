@@ -198,6 +198,62 @@ UPDATE turns
 SET progress_notified_at = $2
 WHERE id = $1 AND progress_notified_at IS NULL;
 
+-- name: SetTurnPromptReceiptRequest :exec
+-- Technical plan §3.3, prompt receipts (migrations/000154_prompt_receipts.up.sql):
+-- records whether the dispatch that just stamped dispatched_message_id
+-- asked its sandbox for a receipt, in that dispatch's own transaction
+-- (tryPlanDispatch, tryPlanReenqueue). message_id is that dispatch's
+-- dispatched_message_id when it asked, and NULL when it did not -- a later
+-- dispatch that does not ask clears an earlier request. receipt_requested_at
+-- is the database's now(), the start of PromptResendWindow, and
+-- receipt_checked_ready_seq the sandbox's ready_seq at the dispatch, so only
+-- a ready recorded after it counts as a reconnect to answer.
+UPDATE turns
+SET receipt_requested_message_id = sqlc.narg('message_id'),
+    receipt_requested_at = CASE WHEN sqlc.narg('message_id')::text IS NULL THEN NULL ELSE now() END,
+    receipt_checked_ready_seq = CASE WHEN sqlc.narg('message_id')::text IS NULL THEN NULL ELSE sqlc.arg('ready_seq')::integer END
+WHERE id = sqlc.arg('id');
+
+-- name: GetTurnPromptReceiptState :one
+-- Technical plan §3.3, prompt receipts: whether the receipt of the turn's
+-- current dispatch is stored, and how long ago that dispatch asked for it,
+-- in nanoseconds (a time.Duration) on the database's clock -- one
+-- statement, one clock. The receipt is read by its key, never by scanning
+-- types: the agent gives it the deterministic messageId
+-- 'prompt_received:{promptMessageId}', so a receipt stored by any binary --
+-- one that does not know the type stores it through the same generic path,
+-- under the same wire messageId -- is the same row, found through
+-- events_session_id_message_id_idx. The type check is an extra guard. No
+-- row when the turn's dispatch asked for no receipt.
+SELECT EXISTS (
+           SELECT 1 FROM events e
+           WHERE e.session_id = t.session_id
+             AND e.message_id = 'prompt_received:' || t.dispatched_message_id
+             AND e.type = 'prompt_received'
+       ) AS receipt_stored,
+       (EXTRACT(EPOCH FROM (now() - t.receipt_requested_at)) * 1000000000)::bigint AS since_request_nanos
+FROM turns t
+WHERE t.id = $1 AND t.receipt_requested_at IS NOT NULL;
+
+-- name: MarkTurnPromptReconnectAnswered :execrows
+-- Technical plan §3.3, prompt receipts: claims one same-gen reconnect of
+-- the turn's sandbox for this evaluation -- moves receipt_checked_ready_seq
+-- from the value the evaluation read to the sandbox's current ready_seq,
+-- and only while the turn is still Processing, unflagged by a stop, on the
+-- dispatch that asked for the receipt, with no other evaluation having
+-- claimed this ready first. 0 rows affected means one of those no longer
+-- holds, and nothing is sent. The stop guard is defense in depth behind
+-- planReenqueueOrRespawn's own early return on stop_requested_at.
+UPDATE turns
+SET receipt_checked_ready_seq = sqlc.arg('ready_seq')::integer
+WHERE id = sqlc.arg('id')
+  AND status = 'processing'
+  AND stop_requested_at IS NULL
+  AND dispatched_message_id = sqlc.arg('message_id')::text
+  AND receipt_requested_message_id = sqlc.arg('message_id')::text
+  AND receipt_checked_ready_seq = sqlc.arg('checked_ready_seq')::integer
+  AND receipt_checked_ready_seq < sqlc.arg('ready_seq')::integer;
+
 -- name: GetProcessingTurnForSession :one
 -- §20 ("builder epistemic pre-action check", §20.2) own epistemic-
 -- outcome-posting endpoint's first read -- mirrors WorkflowStore's own

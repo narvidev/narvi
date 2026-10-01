@@ -1,0 +1,100 @@
+-- Technical plan §3.3, prompt receipts. A turn is committed Processing
+-- before its prompt is written to the sandbox's socket, so a control plane
+-- that dies between that commit and the write, or a frame lost with its
+-- socket after a write that returned, leaves a turn Processing on a
+-- sandbox that never received it. The sandbox reconnects on the same gen,
+-- and until this release nothing on that gen noticed: the turn waited out
+-- turn_deadline. A capable agent now answers a prompt that asks for it
+-- with a prompt_received event, and the session actor re-sends, once per
+-- same-gen reconnect, a prompt whose receipt is not stored -- with the same
+-- messageId, which the agent runs at most once. These five columns are what
+-- that decision reads and writes; the receipt itself is the stored events
+-- row, found by its deterministic key (session_id,
+-- message_id = 'prompt_received:' || dispatched_message_id) through the
+-- existing unique index events_session_id_message_id_idx
+-- (migrations/000019_events_message_id.up.sql).
+--
+-- turns.receipt_requested_message_id: the dispatched_message_id of the
+-- dispatch that asked for a receipt, written in that dispatch's own commit
+-- (tryPlanDispatch, tryPlanReenqueue). A later dispatch that does not ask
+-- clears it. A dispatch by a binary without this column changes
+-- dispatched_message_id and leaves this column alone, so the two then
+-- differ, which reads as "not asked": a prompt is re-sent only for a turn
+-- whose own dispatch asked.
+--
+-- turns.receipt_requested_at: the database's now() in that commit.
+-- PromptResendWindow (internal/platform/timeouts.go) is measured from it,
+-- on the database's clock alone.
+--
+-- turns.receipt_checked_ready_seq: sandboxes.ready_seq at that dispatch.
+-- It moves to the current ready_seq each time a later ready is answered --
+-- the prompt re-sent, found receipted, or refused past the window -- and is
+-- the compare-and-set token that lets exactly one evaluation answer a
+-- given ready.
+--
+-- sandboxes.prompt_receipt_gen: the gen whose latest ready advertised
+-- capabilities.promptReceipt. Written only for the live gen and, like
+-- boot_evidence_gen (migrations/000147_sandbox_boot_evidence_gen.up.sql),
+-- never reset: UpsertSandboxForSpawn bumps gen, and the value stops
+-- matching, so no respawn, restore or resume inherits it. A ready of the
+-- live gen that does not advertise the capability clears it: the latest
+-- ready decides.
+--
+-- sandboxes.ready_seq: how many ready events this release has recorded for
+-- the session's sandbox, across all gens -- one per WebSocket connection.
+-- A turn compares it with its own receipt_checked_ready_seq only while the
+-- turn's dispatched gen is the live gen, so a reconnect since the last
+-- answered one is ready_seq > receipt_checked_ready_seq.
+--
+-- No backfill, no index. Every turn and sandbox that exists when this runs
+-- reads "not asked" and "not capable", which is today's behavior.
+--
+-- # Locks
+--
+-- Each ADD COLUMN is nullable or carries a constant default, so it is a
+-- catalog change that rewrites nothing. They take ACCESS EXCLUSIVE on
+-- turns, then on sandboxes, for the file's one implicit transaction, in
+-- that order, for an instant.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with these columns present:
+--   - Every statement it sends names its columns (sqlc writes each
+--     SELECT * and RETURNING * out as a column list), so it neither reads
+--     nor writes them.
+--   - Its CreateTurn leaves the three turn columns NULL, and its
+--     UpdateTurnStatus leaves them untouched. Its cross-gen re-enqueue
+--     therefore leaves a stale receipt_requested_message_id that no longer
+--     equals the new dispatched_message_id, which reads as not asked.
+--   - Its UpsertSandboxForSpawn leaves ready_seq at its value and
+--     prompt_receipt_gen stale; the gen bump makes it not match.
+--   - Its ready handling counts nothing and records no capability, and it
+--     never sets receiptRequested on a prompt. It stores a prompt_received
+--     an agent sends through its generic path, under the event's wire
+--     messageId and with no ack -- the same row this release stores and
+--     reads.
+-- migration000154_integration_test.go runs the previous binary's own
+-- statements against the columns.
+--
+-- # Rolling back
+--
+-- Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for. So once this migration is applied, the
+-- previous binary cannot boot ("no migration found for version 154"). A
+-- rollback therefore takes one of two steps first, with the control plane
+-- scaled to zero:
+--   - Keep the columns: with the golang-migrate CLI, `migrate force 153`.
+--     The previous binary then boots, since 153 is a version it has, and
+--     works with the columns present as above. When this release is
+--     deployed again, this file runs again and leaves the columns and
+--     their values as they are.
+--   - Drop them: run this migration's down (goto 153) with this release's
+--     migrations. The down file says what it removes.
+-- Nothing else needs undoing: no timer kind is added, and a stored
+-- prompt_received row is inert to every binary.
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS receipt_requested_message_id TEXT;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS receipt_requested_at TIMESTAMPTZ;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS receipt_checked_ready_seq INTEGER;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS prompt_receipt_gen INTEGER;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS ready_seq INTEGER NOT NULL DEFAULT 0;

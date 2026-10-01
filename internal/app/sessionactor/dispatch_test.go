@@ -56,7 +56,7 @@ func TestBuildPromptPayload(t *testing.T) {
 		sessionRow := sqlcgen.Session{OpencodeConversationID: nil}
 		turn := sqlcgen.Turn{ID: turnID, Prompt: &prompt, ModelID: &model, Effort: &effort, PlanMode: true}
 
-		raw, err := BuildPromptPayload("session-1", sessionRow, sandboxRow, turn, "msg-1")
+		raw, err := BuildPromptPayload("session-1", sessionRow, sandboxRow, turn, "msg-1", false)
 		if err != nil {
 			t.Fatalf("BuildPromptPayload() error = %v, want nil", err)
 		}
@@ -112,7 +112,7 @@ func TestBuildPromptPayload(t *testing.T) {
 		sessionRow := sqlcgen.Session{OpencodeConversationID: &conversationID}
 		turn := sqlcgen.Turn{ID: turnID, Prompt: &prompt}
 
-		raw, err := BuildPromptPayload("session-2", sessionRow, sandboxRow, turn, "msg-2")
+		raw, err := BuildPromptPayload("session-2", sessionRow, sandboxRow, turn, "msg-2", false)
 		if err != nil {
 			t.Fatalf("BuildPromptPayload() error = %v, want nil", err)
 		}
@@ -132,7 +132,7 @@ func TestBuildPromptPayload(t *testing.T) {
 		sessionRow := sqlcgen.Session{}
 		turn := sqlcgen.Turn{ID: turnID}
 
-		raw, err := BuildPromptPayload("session-3", sessionRow, sandboxRow, turn, "msg-3")
+		raw, err := BuildPromptPayload("session-3", sessionRow, sandboxRow, turn, "msg-3", false)
 		if err != nil {
 			t.Fatalf("BuildPromptPayload() error = %v, want nil", err)
 		}
@@ -147,6 +147,46 @@ func TestBuildPromptPayload(t *testing.T) {
 			t.Errorf("Model = %v, Effort = %v, want both nil for a turn with neither set", got.Model, got.Effort)
 		}
 	})
+}
+
+// TestBuildPromptPayload_ReceiptRequested pins technical plan §3.3's
+// prompt-receipt field on the wire: a prompt that asks for a receipt
+// carries receiptRequested: true, and one that does not omits the key, so
+// it stays byte-identical to the prompt a control plane without receipts
+// sends.
+func TestBuildPromptPayload_ReceiptRequested(t *testing.T) {
+	t.Parallel()
+
+	prompt := "please do the thing"
+	sandboxRow := sqlcgen.Sandbox{Gen: 2}
+	turnRow := sqlcgen.Turn{Prompt: &prompt}
+	for _, tc := range []struct {
+		name      string
+		requested bool
+		wantKey   bool
+	}{
+		{name: "asked", requested: true, wantKey: true},
+		{name: "not asked", requested: false, wantKey: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			raw, err := BuildPromptPayload("session-r", sqlcgen.Session{}, sandboxRow, turnRow, "msg-r", tc.requested)
+			if err != nil {
+				t.Fatalf("BuildPromptPayload() error = %v, want nil", err)
+			}
+			var keys map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &keys); err != nil {
+				t.Fatalf("unmarshal: %v", err)
+			}
+			value, has := keys["receiptRequested"]
+			if has != tc.wantKey {
+				t.Fatalf("receiptRequested present = %v, want %v (payload: %s)", has, tc.wantKey, raw)
+			}
+			if has && string(value) != "true" {
+				t.Fatalf("receiptRequested = %s, want true", value)
+			}
+		})
+	}
 }
 
 // TestStringOrEmpty covers stringOrEmpty's own nil/non-nil cases.
