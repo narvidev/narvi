@@ -292,6 +292,16 @@ LIMIT 1;
 -- The rule is conservative: it holds until the sandbox's gen moves on, so
 -- a session whose turn timed out reads every later turn's claims on that
 -- gen as unconfirmed.
+--
+-- A turn whose prompt certainly never reached the sandbox is not one of
+-- them: its agent never existed. sessionactor's failDispatchedTurn marks
+-- that synthetic event `"delivered": false` -- a dispatch refused before
+-- the prompt was sent, or a send refused with no live connection, which
+-- writes nothing -- and such an event is not counted. Any other synthetic
+-- event still is: a timeout, a stop, or a send failure that may have
+-- followed a partial write. Only a synthetic event without the mark can
+-- make a turn count, so a stray marked event for a turn that did time out
+-- cannot hide that turn's own unmarked one.
 SELECT EXISTS (
     SELECT 1 FROM turns earlier
     WHERE earlier.session_id = $1
@@ -304,6 +314,7 @@ SELECT EXISTS (
             AND e.type = 'execution_complete'
             AND e.payload->>'synthetic' = 'true'
             AND e.payload->>'turn_id' = earlier.id::text
+            AND COALESCE(e.payload->>'delivered', '') <> 'false'
       )
 ) AS left_running;
 

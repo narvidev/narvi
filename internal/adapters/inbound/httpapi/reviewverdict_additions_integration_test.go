@@ -798,18 +798,34 @@ func TestPostReviewVerdict_CounterReviewAddition_LaterTurnsRunsAreNotTheEarlierT
 	}
 }
 
-// markTurnEnded ends turn the way the session actor would. timedOut: its
-// deadline passed, so it is marked failed and a synthetic
-// execution_complete naming it is appended, as handleTurnDeadlineTimer
-// does -- its agent was not stopped. Otherwise it completed: the sandbox's
-// own execution_complete arrived and it is marked completed.
-func markTurnEnded(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID, turn sqlcgen.Turn, timedOut bool) {
+// turnEnd is how markTurnEnded ends a turn.
+type turnEnd int
+
+const (
+	// turnCompleted: the sandbox's own execution_complete arrived.
+	turnCompleted turnEnd = iota
+	// turnTimedOut: its deadline passed, so it is marked failed and a
+	// synthetic execution_complete naming it is appended, as
+	// handleTurnDeadlineTimer does -- its agent was not stopped.
+	turnTimedOut
+	// turnUndelivered: its prompt certainly never reached the sandbox, so
+	// failDispatchedTurn marked its synthetic execution_complete
+	// "delivered": false -- no agent of it ever ran.
+	turnUndelivered
+)
+
+// markTurnEnded ends turn the way the session actor would (turnEnd).
+func markTurnEnded(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID, turn sqlcgen.Turn, end turnEnd) {
 	t.Helper()
 	status := sqlcgen.TurnStatusCompleted
 	payload := map[string]any{"type": "execution_complete", "messageId": "msg-complete-" + turn.ID.String(), "sessionId": sessionID.String(), "gen": 1, "ackId": "execution_complete:" + turn.ID.String(), "outcome": "completed", "reason": "done"}
-	if timedOut {
+	switch end {
+	case turnTimedOut:
 		status = sqlcgen.TurnStatusFailed
 		payload = map[string]any{"turn_id": turn.ID.String(), "synthetic": true, "reason": "timeout"}
+	case turnUndelivered:
+		status = sqlcgen.TurnStatusFailed
+		payload = map[string]any{"turn_id": turn.ID.String(), "synthetic": true, "reason": "failed to deliver prompt to sandbox: ports: no live sandbox connection", "delivered": false}
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
@@ -856,23 +872,25 @@ func dispatchDeepTurn(ctx context.Context, t *testing.T, rig testRig, sessionID 
 // A's, so B's trace is not read at all: the addition could not be
 // confirmed and the counter-review claim is not corroborated -- never
 // "checked" on another turn's run. An earlier turn that completed with
-// its own execution_complete, or one that timed out on a gen since
-// replaced, changes nothing. One rig per case.
+// its own execution_complete, one that timed out on a gen since replaced,
+// or one whose prompt never reached the sandbox, changes nothing. One rig
+// per case.
 func TestPostReviewVerdict_CounterReviewAddition_EarlierTurnLeftRunning(t *testing.T) {
 	tests := []struct {
 		name          string
-		earlierTimed  bool  // A ended without its own execution_complete
-		laterGen      int32 // the gen B is dispatched at
-		laterSecond   bool  // B's own second run
-		earlierLate   bool  // A's late second run, after B's counter-review
+		earlierEnd    turnEnd // how A ended
+		laterGen      int32   // the gen B is dispatched at
+		laterSecond   bool    // B's own second run
+		earlierLate   bool    // A's late second run, after B's counter-review
 		wantCheck     string
 		wantShippable restdtos.PostReviewVerdictResponseShippable
 	}{
-		{"an earlier turn timed out on this gen: its late run is not this turn's", true, 1, false, true, "unconfirmed", restdtos.PostReviewVerdictResponseShippableNeedsHuman},
-		{"an earlier turn timed out on this gen: even this turn's own run cannot be told apart", true, 1, true, false, "unconfirmed", restdtos.PostReviewVerdictResponseShippableNeedsHuman},
-		{"an earlier turn that completed normally changes nothing", false, 1, true, false, "checked", restdtos.PostReviewVerdictResponseShippableAuto},
-		{"an earlier turn that completed normally, and no second run: not found", false, 1, false, false, "not_found", restdtos.PostReviewVerdictResponseShippableAuto},
-		{"an earlier turn that timed out on a gen since replaced changes nothing", true, 2, true, false, "checked", restdtos.PostReviewVerdictResponseShippableAuto},
+		{"an earlier turn timed out on this gen: its late run is not this turn's", turnTimedOut, 1, false, true, "unconfirmed", restdtos.PostReviewVerdictResponseShippableNeedsHuman},
+		{"an earlier turn timed out on this gen: even this turn's own run cannot be told apart", turnTimedOut, 1, true, false, "unconfirmed", restdtos.PostReviewVerdictResponseShippableNeedsHuman},
+		{"an earlier turn that completed normally changes nothing", turnCompleted, 1, true, false, "checked", restdtos.PostReviewVerdictResponseShippableAuto},
+		{"an earlier turn that completed normally, and no second run: not found", turnCompleted, 1, false, false, "not_found", restdtos.PostReviewVerdictResponseShippableAuto},
+		{"an earlier turn that timed out on a gen since replaced changes nothing", turnTimedOut, 2, true, false, "checked", restdtos.PostReviewVerdictResponseShippableAuto},
+		{"an earlier turn whose prompt never reached the sandbox changes nothing", turnUndelivered, 1, true, false, "checked", restdtos.PostReviewVerdictResponseShippableAuto},
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -883,7 +901,7 @@ func TestPostReviewVerdict_CounterReviewAddition_EarlierTurnLeftRunning(t *testi
 			turnA := seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-turn-a", 1)
 			seedFactCheck(ctx, t, rig, session.ID, "fc-a-first")
 			seedCounterReview(ctx, t, rig, session.ID, "cr-a")
-			markTurnEnded(ctx, t, rig, session.ID, turnA, tc.earlierTimed)
+			markTurnEnded(ctx, t, rig, session.ID, turnA, tc.earlierEnd)
 
 			if tc.laterGen != 1 {
 				// The sandbox respawned: a new incarnation, a new gen.

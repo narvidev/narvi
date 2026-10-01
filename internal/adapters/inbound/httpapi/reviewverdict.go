@@ -1194,7 +1194,9 @@ type subTaskFinishPayload struct {
 // still running -- turns.EarlierTurnLeftRunning), this turn's trace is not
 // read at all (ReadInFull false), and both its claims resolve unconfirmed.
 // An earlier turn that ended with a real execution_complete changes
-// nothing.
+// nothing, and neither does one whose prompt certainly never reached the
+// sandbox (its synthetic event says "delivered": false): no agent of it
+// ever ran.
 //
 // Every record carries its row's events.id (EventID): within one session
 // ids are allocated in commit order, which is what lets
