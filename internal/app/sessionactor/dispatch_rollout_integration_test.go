@@ -550,7 +550,7 @@ func TestRolloutRefusalForDispatch_RecordsRolloutRefusedTotal_OnGenuineRefusal(t
 
 	before := readCounterSumByAttr(ctx, t, otelReader, "session_rollout_refused_total", "spawn_source", string(sessionRow.SpawnSource))
 
-	if err := a.executeDispatch(ctx, &dispatchPlan{turnID: created.ID, payload: json.RawMessage(`{}`), sessionRow: sessionRow}); err != nil {
+	if err := a.executeDispatch(ctx, &dispatchPlan{turnID: created.ID, payload: json.RawMessage(`{}`), sessionRow: sessionRow}, pgtype.Timestamptz{}); err != nil {
 		t.Fatalf("executeDispatch: %v", err)
 	}
 

@@ -329,9 +329,9 @@ type dispatchPlan struct {
 // but they are kept adjacent here since they share this exact hook point
 // for the exact same structural reason.
 func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
-	spawn, dispatch, dispatchArmedAt, err := a.planDispatch(ctx)
+	spawn, dispatch, deleted, err := a.planDispatch(ctx)
 	if err != nil {
-		a.backOffDispatchTimer(ctx, err, dispatchArmedAt)
+		a.backOffDispatchTimer(ctx, err, deleted)
 		return err
 	}
 	switch {
@@ -346,7 +346,7 @@ func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 		a.checkContractDrift(ctx, spawn)
 		return a.executeSpawn(ctx, spawn)
 	case dispatch != nil:
-		return a.executeDispatch(ctx, dispatch)
+		return a.executeDispatch(ctx, dispatch, deleted.CreatedAt)
 	default:
 		// Nothing to do this round: no pending turn, branch (c)'s no-op,
 		// or a defensive skip (nil provider/commander) inside one of the
@@ -370,15 +370,15 @@ func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 // context is done, writes nothing: its successor has the timer. A failure
 // here is logged; the claim window still bounds the next try.
 //
-// armedAt is the armed_at of the dispatch timer the failed evaluation
-// deleted (planDispatch), which its rollback restored; invalid when the
-// session had none, and then nothing is backed off. The write holds only
-// while the row still carries that armed_at: a turn created between the
-// rollback and this transaction -- a writer queued on the session-row lock
-// behind the evaluation gets it first -- re-arms the timer due at once and
-// moves armed_at, and its re-arm wins.
-func (a *Actor) backOffDispatchTimer(ctx context.Context, cause error, armedAt pgtype.Timestamptz) {
-	if !armedAt.Valid || errors.Is(cause, ErrStaleEpoch) || ctx.Err() != nil {
+// deleted is the dispatch timer the failed evaluation deleted
+// (planDispatch), which its rollback restored; its armed_at is invalid
+// when the session had none, and then nothing is backed off. The write
+// holds only while the row still carries that armed_at: a turn created
+// between the rollback and this transaction -- a writer queued on the
+// session-row lock behind the evaluation gets it first -- re-arms the
+// timer due at once and moves armed_at, and its re-arm wins.
+func (a *Actor) backOffDispatchTimer(ctx context.Context, cause error, deleted sqlcgen.DeleteSessionDispatchTimerRow) {
+	if !deleted.ArmedAt.Valid || errors.Is(cause, ErrStaleEpoch) || ctx.Err() != nil {
 		return
 	}
 	var moved int64
@@ -386,7 +386,8 @@ func (a *Actor) backOffDispatchTimer(ctx context.Context, cause error, armedAt p
 		var err error
 		moved, err = a.stores.timer.WithTx(tx).BackOffDispatch(ctx, sqlcgen.BackOffSessionDispatchTimerParams{
 			SessionID:   a.sessionID,
-			ArmedAt:     armedAt,
+			ArmedAt:     deleted.ArmedAt,
+			Since:       deleted.CreatedAt,
 			BaseSeconds: a.timeouts.DispatchRetryBackoff.Seconds(),
 			MaxSeconds:  a.timeouts.DispatchRetryBackoffMax.Seconds(),
 		})
@@ -412,14 +413,16 @@ func (a *Actor) backOffDispatchTimer(ctx context.Context, cause error, armedAt p
 // (CreateSandbox / RestoreFromSnapshot / ResumeSandbox / SendCommand
 // respectively) outside any transaction.
 //
-// dispatchArmedAt is the armed_at of the session's dispatch timer this
-// evaluation deleted, invalid when it had none -- returned even with an
-// error, when the rollback has restored that timer, so
-// handleEnsureDispatched backs off only the row this evaluation read.
-func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, pgtype.Timestamptz, error) {
+// deleted is the session's dispatch timer this evaluation deleted -- its
+// armed_at and created_at, both invalid when it had none -- returned even
+// with an error, when the rollback has restored that timer, so
+// handleEnsureDispatched backs off only the row this evaluation read, and
+// a prompt that is then never delivered carries that row's first arm on
+// (executeDispatch).
+func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, sqlcgen.DeleteSessionDispatchTimerRow, error) {
 	var spawn *spawnPlan
 	var dispatch *dispatchPlan
-	var dispatchArmedAt pgtype.Timestamptz
+	var deleted sqlcgen.DeleteSessionDispatchTimerRow
 
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		now := time.Now()
@@ -437,12 +440,12 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, pg
 		// (none does today). A rolled-back evaluation keeps it, and
 		// handleEnsureDispatched backs it off; a spawn refused on policy
 		// ends the turns it was for and commits (endTurnsOnSpawnRefusal).
-		dispatchArmedAt = pgtype.Timestamptz{}
-		armedAt, err := a.stores.timer.WithTx(tx).DeleteDispatch(ctx, a.sessionID)
+		deleted = sqlcgen.DeleteSessionDispatchTimerRow{}
+		row, err := a.stores.timer.WithTx(tx).DeleteDispatch(ctx, a.sessionID)
 		if err != nil {
 			return fmt.Errorf("sessionactor: delete the dispatch timer: %w", err)
 		}
-		dispatchArmedAt = armedAt
+		deleted = row
 
 		sessionRow, err := a.stores.session.WithTx(tx).Get(ctx, a.sessionID)
 		if err != nil {
@@ -606,7 +609,7 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, pg
 		return nil
 	})
 
-	return spawn, dispatch, dispatchArmedAt, err
+	return spawn, dispatch, deleted, err
 }
 
 // planReenqueueOrRespawn implements §3.3's ("turn recovery", §9.3
@@ -2188,7 +2191,11 @@ func (a *Actor) tryPlanDispatch(
 // actor has decided it will never actually deliver to a sandbox, for
 // WHATEVER reason (a transport failure or a policy refusal), reaches the
 // SAME terminal state the SAME way, with only the reason text differing.
-func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan) error {
+//
+// chainStart is the created_at of the dispatch timer the evaluation that
+// planned this dispatch deleted (invalid when it deleted none): the first
+// arm of the chain a failed delivery backs off from (failDispatchedTurn).
+func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainStart pgtype.Timestamptz) error {
 	if repo, refused, transient := a.rolloutRefusalForDispatch(ctx, plan.sessionRow); refused {
 		a.logger.Error("sessionactor: refusing to dispatch turn: configured repo is not enrolled in the cohort rollout (§10 Phase 6, §32 turn-dispatch-time fail-closed re-check)",
 			"session_id", a.sessionID.String(), "turn_id", plan.turnID.String(), "repo", repo, "transient", transient)
@@ -2211,8 +2218,9 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan) error {
 		a.logger.Error("sessionactor: dispatch turn: send prompt command failed; failing turn",
 			"turn_id", plan.turnID.String(), "error", err)
 		return a.failDispatchedTurn(ctx, plan.turnID, dispatchFailure{
-			reason:      fmt.Sprintf("failed to deliver prompt to sandbox: %v", err),
-			notAssessed: reviewcheck.NotAssessedPromptNotDelivered,
+			reason:       fmt.Sprintf("failed to deliver prompt to sandbox: %v", err),
+			notAssessed:  reviewcheck.NotAssessedPromptNotDelivered,
+			backOffSince: chainStart,
 		})
 	}
 	return nil
@@ -2414,8 +2422,53 @@ func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, fail
 		if err := a.persistDerivedSessionStatus(ctx, tx, summariesWithOverride(turns, turnID, to, failureReason)); err != nil {
 			return err
 		}
+		if !failure.refused {
+			if err := a.backOffAfterUndeliveredPrompt(ctx, tx, failure.backOffSince); err != nil {
+				return err
+			}
+		}
 		return a.deleteTimer(ctx, tx, TimerTurnDeadline)
 	})
+}
+
+// backOffAfterUndeliveredPrompt backs off the session's dispatch timer, if
+// it has one, inside the transaction that ended a turn whose prompt never
+// reached the sandbox (technical plan §2). OnTurnCompleted reads that end
+// as a blocked outcome, and a workflow step with a blocked self edge
+// queues the same step again, arming the dispatch timer due at once in
+// this very transaction; the next pump tick would send that turn to the
+// same dead connection, whose failure would queue the next -- a new turn,
+// step run and channel notice every tick, the backoff after a failed
+// evaluation never applying since each evaluation itself succeeds. So an
+// undelivered prompt counts as a failed evaluation for the timer: it waits
+// DispatchRetryBackoff, doubling to DispatchRetryBackoffMax with the age
+// of the chain's first arm, since -- the created_at of the timer the
+// evaluation deleted, which the re-queued turn's new row would otherwise
+// restart. The sandbox's own watchdogs meanwhile move a sandbox with no
+// live connection to suspect and failed, and the dispatch that follows
+// respawns it, as before. A turn's own post-commit trigger still
+// dispatches at once; only the pump's delivery waits. The row is read and
+// written under the actor-epoch lock this transaction holds, so no writer
+// re-arms it between the two.
+func (a *Actor) backOffAfterUndeliveredPrompt(ctx context.Context, tx pgx.Tx, since pgtype.Timestamptz) error {
+	timers := a.stores.timer.WithTx(tx)
+	row, err := timers.Get(ctx, sqlcgen.GetSessionTimerParams{SessionID: a.sessionID, Name: TimerDispatch})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("sessionactor: read the dispatch timer: %w", err)
+	}
+	if _, err := timers.BackOffDispatch(ctx, sqlcgen.BackOffSessionDispatchTimerParams{
+		SessionID:   a.sessionID,
+		ArmedAt:     row.ArmedAt,
+		Since:       since,
+		BaseSeconds: a.timeouts.DispatchRetryBackoff.Seconds(),
+		MaxSeconds:  a.timeouts.DispatchRetryBackoffMax.Seconds(),
+	}); err != nil {
+		return fmt.Errorf("sessionactor: back off the dispatch timer after an undelivered prompt: %w", err)
+	}
+	return nil
 }
 
 // dispatchFailure is why executeDispatch ends a turn it committed
@@ -2429,8 +2482,12 @@ type dispatchFailure struct {
 	warning string
 	// refused marks a policy refusal of a prompt that was never sent: the
 	// workflow engine hears it through OnTurnRefused, which escalates the
-	// run and queues nothing.
+	// run and queues nothing. Anything else is an undelivered prompt, and
+	// backs the session's dispatch timer off (backOffAfterUndeliveredPrompt).
 	refused bool
+	// backOffSince is the first arm of the dispatch timer's chain of
+	// failures, carried from the evaluation that planned the dispatch.
+	backOffSince pgtype.Timestamptz
 }
 
 // BuildPromptPayload marshals a real, schema-valid sandboxws.Prompt for

@@ -38,25 +38,27 @@ func (s *TimerStore) Upsert(ctx context.Context, arg sqlcgen.UpsertSessionTimerP
 	return s.q.UpsertSessionTimer(ctx, arg)
 }
 
-// BackOffDispatch moves the session's dispatch timer, and nothing else,
-// to the database's now plus its age since its first arm, held between
-// arg.BaseSeconds and arg.MaxSeconds, only while the row still carries
-// arg.ArmedAt, and reports how many rows it moved: zero when the session
-// has no dispatch timer, or a turn re-armed it since. The session actor's
-// backoff after a dispatch evaluation that failed (technical plan §2).
+// BackOffDispatch moves the session's dispatch timer to the database's
+// now plus its age since the first arm of its chain of failures -- its
+// created_at, or arg.Since when earlier, which created_at then takes --
+// held between arg.BaseSeconds and arg.MaxSeconds, only while the row
+// still carries arg.ArmedAt, and reports how many rows it moved: zero when
+// the session has no dispatch timer, or a turn re-armed it since. armed_at
+// is not moved. The session actor's backoff after a dispatch evaluation
+// that failed, or a prompt its sandbox never received (technical plan §2).
 func (s *TimerStore) BackOffDispatch(ctx context.Context, arg sqlcgen.BackOffSessionDispatchTimerParams) (int64, error) {
 	return s.q.BackOffSessionDispatchTimer(ctx, arg)
 }
 
 // DeleteDispatch deletes the session's dispatch timer and returns the
-// armed_at it carried, or an invalid timestamp when the session had none.
-// The first write of every dispatch evaluation (technical plan §2).
-func (s *TimerStore) DeleteDispatch(ctx context.Context, sessionID pgtype.UUID) (pgtype.Timestamptz, error) {
-	armedAt, err := s.q.DeleteSessionDispatchTimer(ctx, sessionID)
+// armed_at and created_at it carried, both invalid when the session had
+// none. The first write of every dispatch evaluation (technical plan §2).
+func (s *TimerStore) DeleteDispatch(ctx context.Context, sessionID pgtype.UUID) (sqlcgen.DeleteSessionDispatchTimerRow, error) {
+	row, err := s.q.DeleteSessionDispatchTimer(ctx, sessionID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return pgtype.Timestamptz{}, nil
+		return sqlcgen.DeleteSessionDispatchTimerRow{}, nil
 	}
-	return armedAt, err
+	return row, err
 }
 
 // Get fetches a named timer for a session.

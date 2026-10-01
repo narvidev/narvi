@@ -224,3 +224,104 @@ func TestDispatchRefusal_WorkflowStepWithABlockedSelfEdgeEscalatesOnce(t *testin
 		t.Error("a dispatch timer is left: something was queued behind the refusal")
 	}
 }
+
+// TestUndeliveredPrompt_AWorkflowRetryIsBackedOffNotLooped: a prompt the
+// commander cannot deliver (no live connection) fails its turn, and a
+// workflow step with a blocked self edge queues the same step again -- a
+// turn whose dispatch timer is due at once. Were that timer left as it
+// is, every pump tick would send the new turn to the same dead
+// connection, fail it, notify the thread and queue the next. The failure
+// backs the timer off instead (backOffAfterUndeliveredPrompt), doubling
+// from DispatchRetryBackoff: here 1 s, so over 3 s of pump ticks every
+// 100 ms the attempts come at about 0 s, 1 s and 2 s -- at least 2 and at
+// most 4, one failed turn and one Slack notice each -- and the timer is
+// left backed off. Once the connection is back, the next delivery sends
+// the prompt.
+func TestUndeliveredPrompt_AWorkflowRetryIsBackedOffNotLooped(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID, attempt := readySlackSession(ctx, t, pool)
+
+	var defID, stepID pgtype.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO workflow_definitions (lane, name, is_built_in, version) VALUES ('request', 'test-undelivered-blocked-self-edge', false, 1) RETURNING id`).Scan(&defID); err != nil {
+		t.Fatalf("insert definition: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO workflow_step_definitions (workflow_definition_id, step_order, kind, prompt_template) VALUES ($1, 1, 'agent', '{{prompt}}') RETURNING id`, defID).Scan(&stepID); err != nil {
+		t.Fatalf("insert step definition: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO workflow_edges (workflow_definition_id, from_step_id, to_step_id, on_status) VALUES ($1, $2, $2, 'blocked')`, defID, stepID); err != nil {
+		t.Fatalf("insert blocked self edge: %v", err)
+	}
+	workflows := narvipg.NewWorkflowStore(pool)
+	run, err := workflows.CreateRun(ctx, sessionID, "request", defID, 1)
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stepRun, err := workflows.CreateStepRun(ctx, run.ID, stepID)
+	if err != nil {
+		t.Fatalf("create step run: %v", err)
+	}
+	if err := workflows.AttachTurn(ctx, stepRun.ID, attempt.ID); err != nil {
+		t.Fatalf("attach turn: %v", err)
+	}
+
+	timeouts := platform.DefaultTimeouts()
+	timeouts.TimerClaimDuration = 300 * time.Millisecond
+	timeouts.DispatchRetryBackoff = time.Second
+	timeouts.DispatchRetryBackoffMax = 10 * time.Second
+	commander := &fakeSendCommander{nextErr: ports.ErrNoLiveSandboxConnection}
+	r, err := NewRegistry(ctx, pool, timeouts, nil, commander, nil, "http://localhost:8080", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendEnsureDispatched(ctx, t, a)
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		if err := r.PumpOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	attempts := promptCount(commander)
+	failed := countRows(ctx, t, pool, `SELECT count(*) FROM turns WHERE session_id = $1 AND status = 'failed'`, sessionID)
+	notices := len(outboxRows(ctx, t, pool, sessionID, ports.NotificationKindSlack))
+	t.Logf("delivery attempts over 3 s of pump ticks: %d (failed turns %d, Slack notices %d)", attempts, failed, notices)
+	if attempts < 2 || attempts > 4 {
+		t.Fatalf("delivery attempts = %d over 3 s, want 2 to 4: a failed delivery must back the retry off, not repeat it every pump tick", attempts)
+	}
+	if failed != attempts || notices != attempts {
+		t.Errorf("failed turns = %d, Slack notices = %d, want one each per attempt (%d)", failed, notices, attempts)
+	}
+	var dueIn, chainAge float64
+	if err := pool.QueryRow(ctx, `SELECT EXTRACT(EPOCH FROM fires_at - now())::float8, EXTRACT(EPOCH FROM now() - created_at)::float8 FROM session_timers WHERE session_id = $1 AND name = $2`, sessionID, TimerDispatch).Scan(&dueIn, &chainAge); err != nil {
+		t.Fatalf("read the dispatch timer: %v", err)
+	}
+	if dueIn <= 0 {
+		t.Errorf("dispatch timer due in %.1fs, want it backed off", dueIn)
+	}
+	// The chain's first arm is carried from row to row, so the delay keeps
+	// doubling: the timer the last re-queued turn armed is as old as the
+	// first attempt, not as its own insert.
+	if chainAge < 2.5 {
+		t.Errorf("dispatch timer's created_at is %.1fs old, want the chain's first arm (about 3 s): each re-queued turn restarted the backoff", chainAge)
+	}
+
+	// The connection is back: the next delivery sends the prompt.
+	commander.mu.Lock()
+	commander.nextErr = nil
+	commander.mu.Unlock()
+	waitUntil(t, 15*time.Second, func() bool {
+		if err := r.PumpOnce(ctx); err != nil {
+			t.Fatal(err)
+		}
+		return countRows(ctx, t, pool, `SELECT count(*) FROM turns WHERE session_id = $1 AND status = 'processing'`, sessionID) == 1
+	})
+	if got := countRows(ctx, t, pool, `SELECT count(*) FROM turns WHERE session_id = $1 AND status = 'failed'`, sessionID); got != failed {
+		t.Errorf("failed turns = %d after the connection came back, want still %d", got, failed)
+	}
+}

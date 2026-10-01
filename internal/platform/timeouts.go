@@ -406,9 +406,11 @@ type Timeouts struct {
 	// as long as the failure lasts, each delivery waking the session's
 	// actor. So the actor moves the timer to now plus its age since its
 	// first arm, held between these two bounds: the delay doubles with
-	// each failed delivery. A policy refusal (a repo the cohort rollout
-	// does not admit, a substrate the provider cannot give) is not retried
-	// at all: it ends the session's open turns.
+	// each failed delivery. A prompt the sandbox never received counts as
+	// such a failure, so a workflow step that re-queues itself is retried
+	// on this schedule, not at every pump tick. A policy refusal (a repo
+	// the cohort rollout does not admit, a substrate the provider cannot
+	// give) is not retried at all: it ends the session's open turns.
 
 	// DispatchRetryBackoff is the shortest such delay. Validate keeps it
 	// above TimerClaimDuration, so a failing evaluation is never retried
