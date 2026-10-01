@@ -36,7 +36,10 @@ const SandboxStatusEventType = "sandbox_status"
 // these as the server's own record -- a sandbox_status's gen and status
 // move the rail -- so a frame of one of these types from the sandbox
 // socket is dropped there, never stored (any process holding the sandbox
-// token can open that socket).
+// token can open that socket). refusedSandboxFrame drops it, with the
+// other frames a sandbox may not send: one without a type, and one shaped
+// like the fetch_history reply whose sandbox row a page shows as the
+// server's.
 //
 // This is a deny list of the control plane's own types, not an allow list
 // of the sandbox-ws contract's: a newer sandbox-agent may send a type this

@@ -145,6 +145,58 @@ func peekAckID(raw json.RawMessage) string {
 	return peek.AckID
 }
 
+// replyShapedKeys records which of the keys a client WS reply carries at
+// its top level appear in a sandbox frame, null values included: a frame
+// is stored and broadcast to every open page as its raw bytes, and a page
+// takes a frame with `events` and `nextCursor` while a fetch_history is
+// pending for that reply, `sandbox` included (clientws.FetchHistoryResponse).
+// No sandbox-ws event defines any of the three
+// (contracts/sandbox-ws/v1/events.schema.json).
+type replyShapedKeys struct {
+	Events     keyPresent `json:"events"`
+	NextCursor keyPresent `json:"nextCursor"`
+	Sandbox    keyPresent `json:"sandbox"`
+}
+
+// keyPresent is set by its key's presence, whatever the value, null too.
+type keyPresent bool
+
+func (k *keyPresent) UnmarshalJSON([]byte) error {
+	*k = true
+	return nil
+}
+
+// refusedSandboxFrame reports whether handleSandboxEvent drops cmd, and
+// why. Three kinds of frame, none of which a sandbox-ws event can be:
+//
+//   - one typed as an event the control plane writes itself
+//     (serverEventTypes, sandboxstatus.go): stored, a sandbox_status from
+//     the sandbox would put a gen and a status the server never recorded
+//     on the page as the server's;
+//   - one with no type: every sandbox-ws event names one;
+//   - one carrying a top-level events, nextCursor or sandbox key
+//     (replyShapedKeys): broadcast raw, it reads on a page like the
+//     fetch_history reply the page is waiting for, and that reply's
+//     sandbox row is the status the page shows as the server's.
+//
+// Any other type is stored, a type this binary does not know yet
+// included: a newer sandbox-agent may send one during a rollout.
+func refusedSandboxFrame(cmd SandboxEvent) (string, bool) {
+	if serverEventTypes[cmd.Type] {
+		return "typed as an event the control plane writes itself", true
+	}
+	if cmd.Type == "" {
+		return "no type", true
+	}
+	// wshub hands over only frames that decoded as a JSON object; anything
+	// else carries no key a page could read.
+	var keys replyShapedKeys
+	if json.Unmarshal(cmd.Raw, &keys) == nil && (keys.Events || keys.NextCursor || keys.Sandbox) {
+		return "shaped like a client reply (a top-level events, nextCursor or sandbox key)", true
+	}
+	return "", false
+}
+
 // sandboxTransitionTrigger reports which Trigger (if any) applies for the
 // given (event type, LastBootPhase, current status, whether a null phase
 // counts as completion) combination -- the two (and only two) mappings
@@ -232,17 +284,15 @@ func (a *Actor) armReadyWatchdogs(ctx context.Context, tx pgx.Tx, now time.Time)
 // other-errors-are-logged-not-fatal behavior (actor.go) keeps working
 // exactly as it does today.
 func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error {
-	// A frame typed as one of the control plane's own events
-	// (serverEventTypes, sandboxstatus.go) is never the sandbox's to
-	// write: stored, a sandbox_status from the sandbox would put a gen and
-	// a status the server never recorded on the page as the server's.
-	// Dropped the way the gen fence below drops a stale gen's frame: not
-	// stored, not broadcast, no liveness bump, nothing after it, no ack,
-	// and the connection stays open. A well-behaved agent never sends one,
-	// so there is nothing for it to redeliver.
-	if serverEventTypes[cmd.Type] {
-		a.logger.Warn("sessionactor: dropping a sandbox event typed as one the control plane writes itself",
-			"event_type", cmd.Type, "event_gen", cmd.Gen, "message_id", cmd.MessageID)
+	// A frame the sandbox has no business sending is dropped the way the
+	// gen fence below drops a stale gen's frame: not stored, not
+	// broadcast, no liveness bump, nothing after it, no ack, and the
+	// connection stays open (refusedSandboxFrame says which and why). A
+	// well-behaved agent never sends one, so there is nothing for it to
+	// redeliver.
+	if reason, refused := refusedSandboxFrame(cmd); refused {
+		a.logger.Warn("sessionactor: dropping a sandbox event the sandbox may not send",
+			"reason", reason, "event_type", cmd.Type, "event_gen", cmd.Gen, "message_id", cmd.MessageID)
 		select {
 		case cmd.Reply <- SandboxEventOutcome{}:
 		default:

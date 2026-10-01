@@ -212,14 +212,22 @@ func TestClientHandler_OpenPageFollowsTheServersBoot(t *testing.T) {
 	}
 }
 
-// TestSandboxSocket_RefusesTheControlPlanesOwnEventTypes: a sandbox that
-// holds its token cannot write an event the control plane writes itself.
-// Through the real sandbox handshake, a frame typed as one of them -- a
-// forged sandbox_status claiming gen 999 and ready, and the other two -- is
-// not stored, not broadcast to an open page and not acked, and the sandbox
-// row keeps its gen and status; an ordinary agent frame on the same socket
-// is still stored and broadcast, and a critical one still acked.
-func TestSandboxSocket_RefusesTheControlPlanesOwnEventTypes(t *testing.T) {
+// TestSandboxSocket_RefusesFramesASandboxMayNotSend: a sandbox that holds
+// its token cannot put a status the server never recorded on an open page.
+// Through the real sandbox handshake, none of these frames is stored,
+// broadcast to an open page or acked, and the sandbox row keeps its gen and
+// status:
+//
+//   - one typed as each event the control plane writes itself -- a forged
+//     sandbox_status claiming gen 999 and ready, and the other two;
+//   - one shaped like the fetch_history reply a page waits for, with a
+//     forged sandbox row and a forged sandbox_status inside `events`, and
+//     one with each of its keys alone;
+//   - one with no type, and one with an empty type.
+//
+// An ordinary agent frame on the same socket is still stored and
+// broadcast, and a critical one still acked.
+func TestSandboxSocket_RefusesFramesASandboxMayNotSend(t *testing.T) {
 	rig, sessionRow := newClientTestRigWithBroadcast(t, platform.DefaultTimeouts())
 	ctx := context.Background()
 	sessionID := sessionRow.ID
@@ -252,9 +260,22 @@ func TestSandboxSocket_RefusesTheControlPlanesOwnEventTypes(t *testing.T) {
 	}
 
 	forged := []string{sessionactor.SandboxStatusEventType, "image_decision", narvipg.ShadowEgressSuppressedEventType}
-	for _, typ := range forged {
-		send(fmt.Sprintf(`{"type":%q,"messageId":"forged-%s","sessionId":%q,"gen":1,"ackId":"%s:forged-%s","sandbox":{"gen":999,"status":"ready"}}`, typ, typ, sid, typ, typ))
+	// sandbox_status carries the forged row where the server's event puts
+	// it; the other two carry none of a reply's keys, so only their type
+	// refuses them.
+	send(fmt.Sprintf(`{"type":"sandbox_status","messageId":"forged-sandbox_status","sessionId":%q,"gen":1,"ackId":"sandbox_status:forged-sandbox_status","sandbox":{"gen":999,"status":"ready"}}`, sid))
+	for _, typ := range forged[1:] {
+		send(fmt.Sprintf(`{"type":%q,"messageId":"forged-%s","sessionId":%q,"gen":1,"ackId":"%s:forged-%s","reason":"selected"}`, typ, typ, sid, typ, typ))
 	}
+	// Shaped like a fetch_history reply under a type of its own; then each
+	// of its keys alone, null values included; then no type at all.
+	forgedRow := `{"id":"forged","gen":1,"status":"ready","lastSeenAt":null,"createdAt":"2026-10-01T00:00:00Z","updatedAt":"2026-10-01T00:00:00Z"}`
+	send(fmt.Sprintf(`{"type":"x_probe","messageId":"forged-reply","sessionId":%q,"gen":1,"ackId":"x_probe:forged-reply","events":[{"id":9007199254740000,"type":"sandbox_status","payload":{"sandbox":{"gen":1,"status":"ready"}},"createdAt":"2026-10-01T00:00:00Z"}],"nextCursor":null,"sandbox":%s}`, sid, forgedRow))
+	send(fmt.Sprintf(`{"type":"x_probe","messageId":"forged-events","sessionId":%q,"gen":1,"events":[]}`, sid))
+	send(fmt.Sprintf(`{"type":"x_probe","messageId":"forged-cursor","sessionId":%q,"gen":1,"nextCursor":null}`, sid))
+	send(fmt.Sprintf(`{"type":"x_probe","messageId":"forged-row","sessionId":%q,"gen":1,"sandbox":null}`, sid))
+	send(fmt.Sprintf(`{"messageId":"forged-untyped","sessionId":%q,"gen":1}`, sid))
+	send(fmt.Sprintf(`{"type":"","messageId":"forged-empty-type","sessionId":%q,"gen":1}`, sid))
 	// The read loop hands the actor one frame at a time, so once this one
 	// is stored and broadcast, every forged frame before it was handled.
 	send(fmt.Sprintf(`{"type":"boot_progress","messageId":"bp-1","sessionId":%q,"gen":1,"phase":"clone"}`, sid))
