@@ -81,9 +81,10 @@ export function deriveBootProgress(sandboxStatus: string | null): { index: numbe
  * Rollout compatibility: a control plane older than
  * FetchHistoryResponse.sandbox never sends the page a status after the
  * subscribe reply, so the server's status would stay the subscribe-time
- * one for good. `rollout` says whether this page's stream has read a reply
- * carrying the row (SessionStreamSnapshot.serverReportsSandbox); while it
- * has not, the boot ends at the agent's `ready` (sawAgentReady,
+ * one for good. `rollout` says whether the stream's sandbox status is the
+ * server's (SessionStreamSnapshot.serverReportsSandbox: from the subscribe
+ * reply on, until a fetch_history reply comes back without the row); once
+ * it is not, the boot ends at the agent's `ready` (sawAgentReady,
  * timelineModel.ts), as it did before the control plane reported it.
  */
 export function isStillBooting(

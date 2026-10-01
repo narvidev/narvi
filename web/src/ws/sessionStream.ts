@@ -74,16 +74,16 @@ export interface SessionStreamSnapshot {
    */
   sandboxState: unknown
   /**
-   * Rollout compatibility: whether the latest fetch_history reply carried
-   * the sandbox row (FetchHistoryResponse.sandbox, null included). False
-   * until a reply does, and after a reply from a control plane older than
-   * the field, which never sends this page a status after the subscribe
-   * reply: the session view then reads the boot from the agent's own
-   * `ready`, as it did before the server reported it (sessionStatus.ts's
-   * isStillBooting, sandboxRail.ts). Every reply on one connection comes
-   * from one control plane; a reconnect keeps the previous connection's
-   * answer until its own first reply, so a page on a current control plane
-   * does not fall back for that moment.
+   * Rollout compatibility: whether sandboxState is the server's status as of
+   * this connection's latest reply. True from the subscribe reply on --
+   * its state.sandbox is the server's status at that moment, on a control
+   * plane of any age -- and after every fetch_history reply carrying the
+   * sandbox row (FetchHistoryResponse.sandbox, null included). False only
+   * after a reply without that key, from a control plane older than the
+   * field, which sends this page no status after the subscribe reply: the
+   * session view then reads the boot from the agent's own `ready`, as it
+   * did before the server reported it (sessionStatus.ts's isStillBooting,
+   * sandboxRail.ts), until the next subscribe.
    */
   serverReportsSandbox: boolean
   /**
@@ -158,7 +158,7 @@ export class SessionStream {
   private activity: SessionActivityState = initialSessionActivityState
   private lastError: string | null = null
   private sandboxState: unknown = null
-  private serverReportsSandbox = false
+  private serverReportsSandbox = true
   private correlationIdState: unknown = null
   private participantsState: readonly { [k: string]: unknown }[] = []
   private readonly listeners = new Set<() => void>()
@@ -258,6 +258,7 @@ export class SessionStream {
     // including a reconnect -- and then follows every fetch_history reply
     // (runBackfill below).
     this.sandboxState = isPlainObject(payload.state) ? (payload.state.sandbox ?? null) : null
+    this.serverReportsSandbox = true
     this.correlationIdState = isPlainObject(payload.state) ? (payload.state.correlationId ?? null) : null
     this.participantsState = payload.participants
     const inserted = this.log.appendMany(parseEnvelopes(payload.events))

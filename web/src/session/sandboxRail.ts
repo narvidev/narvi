@@ -54,13 +54,13 @@
 // - rollout compatibility: a control plane older than
 //   FetchHistoryResponse.sandbox stores no sandbox_status events and sends
 //   no sandbox row after the subscribe reply, so the snapshot would hold
-//   the subscribe-time status for good. While the stream has read no reply
-//   carrying the row (SessionStreamSnapshot.serverReportsSandbox false),
+//   the subscribe-time status for good. Once a fetch_history reply comes
+//   back without the row (SessionStreamSnapshot.serverReportsSandbox false),
 //   the status is read as it was before the control plane reported it: the
 //   snapshot, overlaid by the agent's events -- a boot_progress reads
 //   booting, a `ready` reads ready and ends the open phase, a fatal error
-//   reads failed and ends it. Once a reply carries the row, the server's
-//   status is the only source.
+//   reads failed and ends it. From a subscribe reply, and while replies
+//   carry the row, the server's status is the only source.
 // - correlation id: a SEPARATE, per-request concept -- see
 //   sessionCorrelationId.ts, not this module. A fingerprint is a property
 //   of the sandbox (this gen, stable for its whole life); a correlation id

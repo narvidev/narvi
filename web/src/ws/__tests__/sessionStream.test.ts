@@ -2,6 +2,9 @@ import { QueryClient } from '@tanstack/react-query'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { sessionQueryKeys } from '../../api/queryKeys'
+import { buildSandboxRailModel } from '../../session/sandboxRail'
+import { parseSandboxSnapshot } from '../../session/sandboxSnapshot'
+import { isStillBooting } from '../../session/sessionStatus'
 import { buildTimelineModel } from '../../session/timelineModel'
 import { SessionStream } from '../sessionStream'
 import { FakeClientWsServer, type FakeConnection, fakeEvent, subscribedPayload } from './fakeServer'
@@ -342,6 +345,63 @@ describe('SessionStream', () => {
   // fetch_history reply that broadcast prompts carries the row as the
   // server holds it (FetchHistoryResponse.sandbox). Taking the status from
   // the subscribe reply alone again makes this test fail.
+  // The subscribe reply's row is the server's status at that moment, on a
+  // control plane of any age: from it on, the page shows the server's
+  // boot, and the agent's `ready` in the replayed log ends nothing while
+  // the first fetch_history is still pending. Only a reply without the row
+  // (a control plane older than it) moves the page to the rollout fallback,
+  // where the agent's `ready` ends the boot as before. Starting the stream
+  // in the fallback makes the "before the first reply" checks fail.
+  describe('the boot a page shows around its first fetch_history reply', () => {
+    const booting = { id: 'sb-1', gen: 1, status: 'booting', lastSeenAt: null, createdAt: 'x', updatedAt: 'y' }
+    const cases: { name: string; reply: Record<string, unknown>; after: { serverReportsSandbox: boolean; railStatus: string | null; stillBooting: boolean } }[] = [
+      { name: 'a current control plane: booting, before and after', reply: { events: [], nextCursor: null, sandbox: booting }, after: { serverReportsSandbox: true, railStatus: 'booting', stillBooting: true } },
+      { name: 'a control plane older than the row: booting, then the agent\'s ready ends it', reply: { events: [], nextCursor: null }, after: { serverReportsSandbox: false, railStatus: 'ready', stillBooting: false } },
+    ]
+    for (const c of cases) {
+      it(c.name, async () => {
+        server = await FakeClientWsServer.start()
+        stream = newStream('sess-11', new QueryClient())
+        const connPromise = server.waitForConnection()
+        stream.start()
+        const conn = await connPromise
+        await conn.nextMessage()
+        const replayed = [fakeEvent(1, 'boot_progress', { type: 'boot_progress', gen: 1, phase: 'clone' }), fakeEvent(2, 'ready', { type: 'ready', gen: 1 })]
+        conn.send(subscribedPayload('sess-11', replayed, { sandbox: booting }))
+        await conn.nextMessage() // the first fetch_history, left pending for now
+        await waitFor(() => stream!.getSnapshot().events.length === 2)
+
+        const view = () => {
+          const snap = stream!.getSnapshot()
+          const sandbox = parseSandboxSnapshot(snap.sandboxState)
+          const rail = buildSandboxRailModel(snap.events, sandbox, snap.serverReportsSandbox)
+          const model = buildTimelineModel(snap.events)
+          return {
+            serverReportsSandbox: snap.serverReportsSandbox,
+            railStatus: rail.status,
+            stillBooting: isStillBooting('active', sandbox?.status ?? null, { serverReportsSandbox: snap.serverReportsSandbox, sawAgentReady: model.sawAgentReady }),
+          }
+        }
+        expect(view(), 'before the first reply').toEqual({ serverReportsSandbox: true, railStatus: 'booting', stillBooting: true })
+
+        conn.send(c.reply)
+        await waitFor(() => stream!.getSnapshot().syncState === 'complete')
+        expect(view(), 'after it').toEqual(c.after)
+
+        // A reconnect: the new subscribe reply's row is the server's
+        // status again, whatever the previous connection's replies were.
+        const nextConnPromise = server!.waitForConnection()
+        conn.close(1011, 'simulated drop')
+        const nextConn = await nextConnPromise
+        await nextConn.nextMessage()
+        nextConn.send(subscribedPayload('sess-11', replayed, { sandbox: booting }))
+        await nextConn.nextMessage() // its first fetch_history, left pending
+        await waitFor(() => stream!.getSnapshot().connectionStatus === 'open')
+        expect(view(), 'after a reconnect, before its first reply').toEqual({ serverReportsSandbox: true, railStatus: 'booting', stillBooting: true })
+      })
+    }
+  })
+
   it('follows the sandbox every fetch_history reply carries, keeping it when a reply carries none', async () => {
     server = await FakeClientWsServer.start()
     const queryClient = new QueryClient()
@@ -354,9 +414,9 @@ describe('SessionStream', () => {
     const booting = { id: 'sb-1', gen: 1, status: 'booting', lastSeenAt: null, createdAt: 'x', updatedAt: 'y' }
     conn.send(subscribedPayload('sess-10', [fakeEvent(1, 'ready', { type: 'ready', gen: 1 })], { sandbox: booting }))
     await conn.nextMessage()
-    // Before any reply, the stream cannot know the control plane reports
-    // the row (rollout compatibility, serverReportsSandbox).
-    expect(stream.getSnapshot().serverReportsSandbox).toBe(false)
+    // The subscribe reply's row is the server's status at that moment, on a
+    // control plane of any age (rollout compatibility, serverReportsSandbox).
+    expect(stream.getSnapshot().serverReportsSandbox).toBe(true)
     conn.send({ events: [], nextCursor: null, sandbox: booting })
     await waitFor(() => stream!.getSnapshot().syncState === 'complete')
     expect(stream.getSnapshot().sandboxState).toEqual(booting)
