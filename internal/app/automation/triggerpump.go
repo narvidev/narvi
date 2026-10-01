@@ -92,7 +92,15 @@ func unmarshalCronTriggerConfig(raw []byte) (domainautomation.CronTriggerConfig,
 // and does NOT abort the rest of the batch, exactly like every other pump
 // in this package.
 func (e *Engine) EvaluateCronTriggersOnce(ctx context.Context) error {
-	now := time.Now()
+	return e.evaluateCronTriggersAt(ctx, time.Now())
+}
+
+// evaluateCronTriggersAt is EvaluateCronTriggersOnce's tick, evaluated as
+// of now. It reads no clock itself: every minute bucket, catch-up window
+// and claim below is computed from now, so a test can place two ticks in
+// the same minute, or in two different ones, by construction instead of
+// by the wall clock (export_test.go).
+func (e *Engine) evaluateCronTriggersAt(ctx context.Context, now time.Time) error {
 	toBucket := now.Truncate(e.timeouts.AutomationCronGranularity)
 
 	rows, err := e.automations.ListActiveCronAutomations(ctx)

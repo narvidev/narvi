@@ -442,32 +442,59 @@ func TestSupervisor_StopAll(t *testing.T) {
 
 // TestUnconditionalReaping proves a process that exits naturally is
 // reaped by the background goroutine launched at Spawn time, WITHOUT
-// anyone ever calling Wait or Stop on it in the meantime: sleeping well
-// past its natural exit before the first Wait call means Wait can only
-// return near-instantly if the reap goroutine already collected the exit
-// on its own.
+// anyone ever calling Wait or Stop on it in the meantime.
+//
+// It polls Exited until it reports the exit. Exited never reaps and never
+// blocks: it only reads whether the reap goroutine has already collected
+// the exit. Nothing else touches the process before the poll ends, so only
+// that goroutine can make it true. Wait must then hand back the result the
+// reap already recorded.
+//
+// Both deadlines only detect a hang. The poll ends as soon as the reap
+// lands, however long a loaded runner takes to start the shell or to
+// schedule the reap goroutine under -race, and Wait has nothing left to
+// wait for. A reap that only a Wait call sets off never makes the poll
+// true, and fails here.
+//
+// An earlier form of this test slept 200 ms, then required Wait to return
+// in under 50 ms inside a 100 ms context. That bounded the shell's start-up
+// and the reap goroutine's scheduling by wall-clock, and a loaded machine
+// broke it with the code correct ("Wait() error = context deadline
+// exceeded, want the already-reaped result"). It did not even catch a reap
+// deferred to the first Wait call: that Wait reaps a process that has
+// already exited within its 50 ms.
 func TestUnconditionalReaping(t *testing.T) {
 	t.Parallel()
+
+	const hangDeadline = 30 * time.Second
 
 	sup := New()
 	proc := spawnShell(t, sup, "exit 3")
 
-	time.Sleep(200 * time.Millisecond)
+	deadline := time.Now().Add(hangDeadline)
+	var reaped ExitResult
+	for {
+		result, exited := proc.Exited()
+		if exited {
+			reaped = result
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("Exited() still reports (_, false) %v after spawning `exit 3`, want the background goroutine to have reaped it with no Wait or Stop call", hangDeadline)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if reaped != (ExitResult{ExitCode: 3}) {
+		t.Errorf("Exited() result = %+v, want the reaped exit {ExitCode:3 Err:<nil>}", reaped)
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), hangDeadline)
 	defer cancel()
-
-	start := time.Now()
 	result, err := proc.Wait(ctx)
-	elapsed := time.Since(start)
-
 	if err != nil {
 		t.Fatalf("Wait() error = %v, want the already-reaped result", err)
 	}
-	if result.ExitCode != 3 {
-		t.Errorf("ExitCode = %d, want 3", result.ExitCode)
-	}
-	if elapsed >= 50*time.Millisecond {
-		t.Errorf("Wait() took %v, want near-instant (doneCh should already be closed by the background reap goroutine)", elapsed)
+	if result != reaped {
+		t.Errorf("Wait() result = %+v, want the result the reap recorded, %+v", result, reaped)
 	}
 }
