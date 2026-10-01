@@ -66,7 +66,10 @@ function SessionWorkspace() {
   const stream = useSessionStream(sessionId)
   const model = useMemo(() => buildTimelineModel(stream.events), [stream.events])
   const sandboxSnapshot = useMemo(() => parseSandboxSnapshot(stream.sandboxState), [stream.sandboxState])
-  const sandboxModel = useMemo(() => buildSandboxRailModel(stream.events, sandboxSnapshot), [stream.events, sandboxSnapshot])
+  const sandboxModel = useMemo(
+    () => buildSandboxRailModel(stream.events, sandboxSnapshot, stream.serverReportsSandbox),
+    [stream.events, sandboxSnapshot, stream.serverReportsSandbox],
+  )
   const costModel = useMemo(() => buildCostRollup(stream.events), [stream.events])
   const participants = useMemo(() => parseParticipants(stream.participantsState), [stream.participantsState])
   const correlationId = useMemo(() => parseSessionCorrelationId(stream.correlationIdState), [stream.correlationIdState])
@@ -118,6 +121,7 @@ function SessionWorkspace() {
               model={model}
               bootPhase={model.latestBootPhase}
               sandboxStatus={sandboxSnapshot?.status ?? null}
+              rollout={{ serverReportsSandbox: stream.serverReportsSandbox, sawAgentReady: model.sawAgentReady }}
               sessionStatus={sessionQuery.data.status}
             />
             <Composer sessionId={sessionId} sandboxStatus={sandboxModel.status} hasOpenTurn={hasOpenTurn} />
@@ -134,6 +138,7 @@ function SessionTimelineBody({
   model,
   bootPhase,
   sandboxStatus,
+  rollout,
   sessionStatus,
 }: {
   sessionId: string
@@ -141,12 +146,14 @@ function SessionTimelineBody({
   bootPhase: string | null
   /** The server's sandbox status (the stream's snapshot), never inferred from the event log -- see isStillBooting. */
   sandboxStatus: string | null
+  /** Rollout compatibility: whether the control plane reports the sandbox row, and whether the agent's `ready` was seen -- see isStillBooting. */
+  rollout: { serverReportsSandbox: boolean; sawAgentReady: boolean }
   sessionStatus: Session['status']
 }) {
   const hasContent = model.turns.length > 0 || model.warnings.length > 0 || model.errors.length > 0
 
   if (!hasContent) {
-    if (isStillBooting(sessionStatus, sandboxStatus)) {
+    if (isStillBooting(sessionStatus, sandboxStatus, rollout)) {
       return (
         <div className="session-state" aria-live="polite">
           <p>{bootPhase ? `Sandbox is booting — ${bootPhase}…` : 'Sandbox is booting…'}</p>

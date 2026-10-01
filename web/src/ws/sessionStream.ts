@@ -74,6 +74,19 @@ export interface SessionStreamSnapshot {
    */
   sandboxState: unknown
   /**
+   * Rollout compatibility: whether the latest fetch_history reply carried
+   * the sandbox row (FetchHistoryResponse.sandbox, null included). False
+   * until a reply does, and after a reply from a control plane older than
+   * the field, which never sends this page a status after the subscribe
+   * reply: the session view then reads the boot from the agent's own
+   * `ready`, as it did before the server reported it (sessionStatus.ts's
+   * isStillBooting, sandboxRail.ts). Every reply on one connection comes
+   * from one control plane; a reconnect keeps the previous connection's
+   * answer until its own first reply, so a page on a current control plane
+   * does not fall back for that moment.
+   */
+  serverReportsSandbox: boolean
+  /**
    * The subscribe reply's own `state.correlationId` (§12.2 item 1's own
    * session-rail gap): the SESSION's own most-recently-created turn's
    * correlation id (client.go's own latestTurnCorrelationID), or null
@@ -145,6 +158,7 @@ export class SessionStream {
   private activity: SessionActivityState = initialSessionActivityState
   private lastError: string | null = null
   private sandboxState: unknown = null
+  private serverReportsSandbox = false
   private correlationIdState: unknown = null
   private participantsState: readonly { [k: string]: unknown }[] = []
   private readonly listeners = new Set<() => void>()
@@ -219,6 +233,7 @@ export class SessionStream {
         activity: this.activity,
         lastError: this.lastError,
         sandboxState: this.sandboxState,
+        serverReportsSandbox: this.serverReportsSandbox,
         correlationIdState: this.correlationIdState,
         participantsState: this.participantsState,
       }
@@ -302,7 +317,8 @@ export class SessionStream {
         // since replies come back one at a time on this one connection.
         // Checked by key, not value: null is a real answer (no sandbox
         // yet), while a control plane older than the field omits it.
-        if ('sandbox' in response) this.sandboxState = response.sandbox ?? null
+        this.serverReportsSandbox = 'sandbox' in response
+        if (this.serverReportsSandbox) this.sandboxState = response.sandbox ?? null
         const inserted = this.log.appendMany(parseEnvelopes(response.events))
         this.applyNewEvents(inserted)
         if (response.nextCursor === null) break

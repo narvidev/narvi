@@ -181,6 +181,54 @@ describe('buildSandboxRailModel', () => {
       ])
     })
 
+    // A generation only ever grows, so the rail shows the highest one
+    // reported -- the snapshot's, an agent event's or a sandbox_status's --
+    // never the last one read. A log can hold an older gen after a newer
+    // one (an old gen's frames replayed late), and a snapshot can be ahead
+    // of every event loaded (a respawn whose sandbox_status is not in the
+    // page yet, or one from before the control plane reported changes).
+    // Showing the last gen seen makes every row below but the first fail.
+    describe('gen: the highest reported, never the last one read', () => {
+      const toolCall = (id: number, gen: number, s: number) => ev(id, 'tool_call', { type: 'tool_call', messageId: `m${id}`, sessionId: 's', gen, callId: `c${id}`, toolName: 'Read', input: {} }, at(s))
+      const genCases: { name: string; events: EventEnvelope[]; snapshot: SandboxSnapshot | null; want: number | null }[] = [
+        { name: 'a newer event after an older one', events: [toolCall(1, 1, 0), toolCall(2, 2, 1)], snapshot: null, want: 2 },
+        { name: 'the snapshot above the last gen-bearing event', events: [toolCall(1, 2, 0)], snapshot: snap('booting', 3), want: 3 },
+        { name: 'an older gen after a newer one', events: [toolCall(1, 3, 0), toolCall(2, 2, 1)], snapshot: null, want: 3 },
+        { name: 'an older agent event after the server\'s newer generation', events: [status(1, 'spawning', 0, 3), toolCall(2, 2, 1)], snapshot: null, want: 3 },
+        { name: 'an older sandbox_status after a newer agent event', events: [toolCall(1, 3, 0), status(2, 'stopped', 1, 2)], snapshot: snap('booting', 1), want: 3 },
+      ]
+      for (const c of genCases) {
+        it(c.name, () => {
+          expect(buildSandboxRailModel(c.events, c.snapshot).gen).toBe(c.want)
+        })
+      }
+    })
+
+    // Rollout compatibility: a control plane older than
+    // FetchHistoryResponse.sandbox stores no sandbox_status and sends no
+    // row after the subscribe reply. Until a reply carries the row
+    // (serverReportsSandbox false), the agent's events move the status as
+    // they did before -- else the rail would keep the subscribe-time status
+    // until the next subscribe. Dropping the fallback makes these rows
+    // fail; applying it while the server reports the row makes the table
+    // above fail.
+    describe('a control plane that reports no sandbox row: the agent\'s events move the status, as before', () => {
+      const rolloutCases: { name: string; events: EventEnvelope[]; want: string | null; wantPhases: Partial<BootPhase>[] }[] = [
+        { name: 'the agent\'s ready ends the boot and its phase', events: [phase(1, 'clone', 0), ready(2, 4)], want: 'ready', wantPhases: [{ phase: 'clone', endedAt: at(4), seconds: 4, open: false }] },
+        { name: 'a phase after the ready reads booting', events: [ready(1, 0), phase(2, 'web:ready', 1)], want: 'booting', wantPhases: [{ phase: 'web:ready', open: true }] },
+        { name: 'a fatal agent error reads failed and ends the phase', events: [phase(1, 'clone', 0), fatal(2, 3)], want: 'failed', wantPhases: [{ phase: 'clone', endedAt: at(3), open: false }] },
+        { name: 'no agent event: the subscribe-time status', events: [], want: 'booting', wantPhases: [] },
+      ]
+      for (const c of rolloutCases) {
+        it(c.name, () => {
+          const model = buildSandboxRailModel(c.events, snap('booting'), false)
+          expect(model.status).toBe(c.want)
+          expect(model.bootPhases).toHaveLength(c.wantPhases.length)
+          c.wantPhases.forEach((want, i) => expect(model.bootPhases[i]).toMatchObject(want))
+        })
+      }
+    })
+
     it('a sandbox_status event reports the server\'s generation but is no sign of life: gen follows it, lastSeenAt does not', () => {
       const model = buildSandboxRailModel([phase(1, 'clone', 0), status(2, 'spawning', 30, 2)], snap('ready'))
       expect(model.gen).toBe(2)

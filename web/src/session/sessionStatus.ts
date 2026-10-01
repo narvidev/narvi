@@ -77,9 +77,22 @@ export function deriveBootProgress(sandboxStatus: string | null): { index: numbe
  * must never claim otherwise -- caught live during the original browser
  * verification pass: a seeded 'completed' session with no events
  * rendered "Sandbox is booting…" before this check existed.
+ *
+ * Rollout compatibility: a control plane older than
+ * FetchHistoryResponse.sandbox never sends the page a status after the
+ * subscribe reply, so the server's status would stay the subscribe-time
+ * one for good. `rollout` says whether this page's stream has read a reply
+ * carrying the row (SessionStreamSnapshot.serverReportsSandbox); while it
+ * has not, the boot ends at the agent's `ready` (sawAgentReady,
+ * timelineModel.ts), as it did before the control plane reported it.
  */
-export function isStillBooting(sessionStatus: Session['status'], sandboxStatus: string | null): boolean {
+export function isStillBooting(
+  sessionStatus: Session['status'],
+  sandboxStatus: string | null,
+  rollout: { serverReportsSandbox: boolean; sawAgentReady: boolean } = { serverReportsSandbox: true, sawAgentReady: false },
+): boolean {
   if (sessionStatus !== 'created' && sessionStatus !== 'active') return false
+  if (!rollout.serverReportsSandbox) return !rollout.sawAgentReady
   return sandboxStatus === null || deriveBootProgress(sandboxStatus) !== null
 }
 

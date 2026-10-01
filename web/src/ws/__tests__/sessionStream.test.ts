@@ -354,18 +354,23 @@ describe('SessionStream', () => {
     const booting = { id: 'sb-1', gen: 1, status: 'booting', lastSeenAt: null, createdAt: 'x', updatedAt: 'y' }
     conn.send(subscribedPayload('sess-10', [fakeEvent(1, 'ready', { type: 'ready', gen: 1 })], { sandbox: booting }))
     await conn.nextMessage()
+    // Before any reply, the stream cannot know the control plane reports
+    // the row (rollout compatibility, serverReportsSandbox).
+    expect(stream.getSnapshot().serverReportsSandbox).toBe(false)
     conn.send({ events: [], nextCursor: null, sandbox: booting })
     await waitFor(() => stream!.getSnapshot().syncState === 'complete')
     expect(stream.getSnapshot().sandboxState).toEqual(booting)
+    expect(stream.getSnapshot().serverReportsSandbox).toBe(true)
 
-    const steps: { name: string; reply: Record<string, unknown>; want: unknown }[] = [
+    const steps: { name: string; reply: Record<string, unknown>; want: unknown; wantReports: boolean }[] = [
       {
         name: 'the server marks the sandbox ready',
         reply: { events: [fakeEvent(2, 'sandbox_status', { sandbox: { gen: 1, status: 'ready' } })], nextCursor: null, sandbox: { ...booting, status: 'ready' } },
         want: { ...booting, status: 'ready' },
+        wantReports: true,
       },
-      { name: 'a control plane older than the field', reply: { events: [fakeEvent(3)], nextCursor: null }, want: { ...booting, status: 'ready' } },
-      { name: 'no sandbox any more', reply: { events: [fakeEvent(4)], nextCursor: null, sandbox: null }, want: null },
+      { name: 'a control plane older than the field', reply: { events: [fakeEvent(3)], nextCursor: null }, want: { ...booting, status: 'ready' }, wantReports: false },
+      { name: 'no sandbox any more', reply: { events: [fakeEvent(4)], nextCursor: null, sandbox: null }, want: null, wantReports: true },
     ]
     for (const step of steps) {
       const before = stream.getSnapshot().events.length
@@ -377,6 +382,7 @@ describe('SessionStream', () => {
       await replied
       await waitFor(() => stream!.getSnapshot().events.length === before + 1 && stream!.getSnapshot().syncState === 'complete')
       expect(stream.getSnapshot().sandboxState, step.name).toEqual(step.want)
+      expect(stream.getSnapshot().serverReportsSandbox, step.name).toBe(step.wantReports)
     }
   })
 

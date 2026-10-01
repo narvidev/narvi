@@ -154,6 +154,13 @@ export interface TimelineModel {
    * ends nothing here.
    */
   latestBootPhase: string | null
+  /**
+   * True once the agent's `ready` is in the log. Read only for rollout
+   * compatibility, while the control plane reports no sandbox row
+   * (sessionStatus.ts's isStillBooting): the boot then ends there, as it
+   * did before the server reported its status.
+   */
+  sawAgentReady: boolean
 }
 
 function subTaskStatusFromOutcome(outcome: 'completed' | 'failed' | 'cancelled'): SubTaskNode['status'] {
@@ -167,6 +174,7 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
   const orphanedSubTasks: SubTaskNode[] = []
   let latestTitle: string | null = null
   let latestBootPhase: string | null = null
+  let sawAgentReady = false
 
   let currentTurn: TurnNode | null = null
   // Per-turn correlation state -- reset every time a new turn opens
@@ -262,7 +270,10 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
     // The agent's `ready` opens its connection, ahead of its boot: it
     // ends no phase. The server's own status report does, once the boot
     // is over -- or a new generation starts one afresh.
-    if (asReady(event) !== null) continue
+    if (asReady(event) !== null) {
+      sawAgentReady = true
+      continue
+    }
     const statusChange = asSandboxStatusChange(event)
     if (statusChange !== null) {
       if (endsBootPhase(statusChange.status)) latestBootPhase = null
@@ -429,5 +440,5 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
     // a thrown error.
   }
 
-  return { turns, warnings, errors, latestTitle, orphanedSubTasks, latestBootPhase }
+  return { turns, warnings, errors, latestTitle, orphanedSubTasks, latestBootPhase, sawAgentReady }
 }

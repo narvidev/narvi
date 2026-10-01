@@ -229,6 +229,14 @@ describe('buildTimelineModel', () => {
         expect(model.turns).toEqual([]) // session-lifecycle events never open a turn
       })
     }
+
+    // Rollout compatibility (sessionStatus.ts's isStillBooting): read only
+    // while the control plane reports no sandbox row.
+    it('sawAgentReady: whether the agent\'s ready is in the log, and nothing else sets it', () => {
+      expect(buildTimelineModel([phase('clone'), status('ready')]).sawAgentReady).toBe(false)
+      expect(buildTimelineModel([phase('clone'), ready()]).sawAgentReady).toBe(true)
+      expect(buildTimelineModel([ready(), phase('clone')]).sawAgentReady).toBe(true)
+    })
   })
 
   it('does not treat an artifact event as a turn-opening event and does not throw on a very large tool_call input', () => {

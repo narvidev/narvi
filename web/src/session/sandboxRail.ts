@@ -51,6 +51,16 @@
 //   own first "ready" event has landed server-side, or after a respawn
 //   resets it (client.go's own UpsertSandboxForSpawn doc comment) --
 //   SessionRail.tsx renders an honest "not reported yet" for that window.
+// - rollout compatibility: a control plane older than
+//   FetchHistoryResponse.sandbox stores no sandbox_status events and sends
+//   no sandbox row after the subscribe reply, so the snapshot would hold
+//   the subscribe-time status for good. While the stream has read no reply
+//   carrying the row (SessionStreamSnapshot.serverReportsSandbox false),
+//   the status is read as it was before the control plane reported it: the
+//   snapshot, overlaid by the agent's events -- a boot_progress reads
+//   booting, a `ready` reads ready and ends the open phase, a fatal error
+//   reads failed and ends it. Once a reply carries the row, the server's
+//   status is the only source.
 // - correlation id: a SEPARATE, per-request concept -- see
 //   sessionCorrelationId.ts, not this module. A fingerprint is a property
 //   of the sandbox (this gen, stable for its whole life); a correlation id
@@ -119,10 +129,20 @@ function transitionTone(status: string): SandboxTransition['tone'] {
   return 'neutral'
 }
 
-export function buildSandboxRailModel(events: readonly EventEnvelope[], snapshot: SandboxSnapshot | null): SandboxRailModel {
+/**
+ * buildSandboxRailModel builds the rail from the event log and the sandbox
+ * row as the server holds it. serverReportsSandbox is false only while the
+ * control plane is older than FetchHistoryResponse.sandbox (rollout
+ * compatibility, this file's top comment): the agent's events then move
+ * the status, as before the server reported it.
+ */
+export function buildSandboxRailModel(events: readonly EventEnvelope[], snapshot: SandboxSnapshot | null, serverReportsSandbox = true): SandboxRailModel {
   let gen: number | null = snapshot?.gen ?? null
   let lastSeenAt: string | null = snapshot?.lastSeenAt ?? null
   let hasSandbox = snapshot !== null
+  // Rollout compatibility only (see the top comment): the status before
+  // the control plane reported it.
+  let agentReadStatus: string | null = snapshot?.status ?? null
 
   const bootPhases: BootPhase[] = []
   const transitions: SandboxTransition[] = []
@@ -165,20 +185,28 @@ export function buildSandboxRailModel(events: readonly EventEnvelope[], snapshot
       closeOpenPhase(event.createdAt)
       openPhase = { phase: bootProgress.phase, startedAt: event.createdAt, endedAt: null, seconds: null, open: true }
       bootPhases.push(openPhase)
+      agentReadStatus = 'booting'
       transitions.push({ id: `boot:${event.id}`, label: bootProgress.phase, at: event.createdAt, tone: 'neutral' })
       continue
     }
 
     // The agent's `ready` is its connection coming up, ahead of its boot
     // (the sandbox-ws contract): it neither ends a phase nor makes the
-    // sandbox ready -- the server says when that is.
+    // sandbox ready -- the server says when that is. Only a control plane
+    // that reports no sandbox row leaves it to end the boot, as before.
     if (asReady(event) !== null) {
+      if (!serverReportsSandbox) closeOpenPhase(event.createdAt)
+      agentReadStatus = 'ready'
       transitions.push({ id: `ready:${event.id}`, label: 'agent connected', at: event.createdAt, tone: 'neutral' })
       continue
     }
 
     const sandboxError = asSandboxError(event)
     if (sandboxError !== null) {
+      if (sandboxError.fatal) {
+        if (!serverReportsSandbox) closeOpenPhase(event.createdAt)
+        agentReadStatus = 'failed'
+      }
       transitions.push({
         id: `error:${event.id}`,
         label: sandboxError.fatal ? `error: ${sandboxError.message}` : `warning: ${sandboxError.message}`,
@@ -198,7 +226,7 @@ export function buildSandboxRailModel(events: readonly EventEnvelope[], snapshot
   }
 
   return {
-    status: snapshot?.status ?? null,
+    status: serverReportsSandbox ? (snapshot?.status ?? null) : agentReadStatus,
     gen,
     lastSeenAt,
     bootPhases,

@@ -83,6 +83,26 @@ describe('isStillBooting', () => {
   for (const c of cases) {
     it(c.name, () => {
       expect(isStillBooting(c.session, c.sandbox)).toBe(c.want)
+      expect(isStillBooting(c.session, c.sandbox, { serverReportsSandbox: true, sawAgentReady: true }), 'the server reports the row: the agent\'s ready changes nothing').toBe(c.want)
+    })
+  }
+
+  // Rollout compatibility: a control plane older than
+  // FetchHistoryResponse.sandbox never sends the page a status after the
+  // subscribe reply. Until a reply carries the row, the agent's `ready`
+  // ends the boot, as before -- else a page subscribed while booting would
+  // read booting until its next subscribe. Dropping the fallback makes the
+  // "ready seen" rows fail; applying it once the server reports the row
+  // makes the rows above fail.
+  const rolloutCases: { name: string; session: Parameters<typeof isStillBooting>[0]; sandbox: string | null; sawAgentReady: boolean; want: boolean }[] = [
+    { name: 'no row reported, the agent\'s ready seen: the boot is over, whatever the subscribe-time status', session: 'active', sandbox: 'booting', sawAgentReady: true, want: false },
+    { name: 'no row reported, no ready yet: still booting', session: 'active', sandbox: 'booting', sawAgentReady: false, want: true },
+    { name: 'no row reported, no ready yet, a status past the boot: still booting, as before', session: 'created', sandbox: 'ready', sawAgentReady: false, want: true },
+    { name: 'no row reported: a finished session still has no boot in progress', session: 'completed', sandbox: 'booting', sawAgentReady: false, want: false },
+  ]
+  for (const c of rolloutCases) {
+    it(c.name, () => {
+      expect(isStillBooting(c.session, c.sandbox, { serverReportsSandbox: false, sawAgentReady: c.sawAgentReady })).toBe(c.want)
     })
   }
 })
