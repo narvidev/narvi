@@ -32,13 +32,21 @@ import { isPlainObject } from './util'
 //      most one fetch_history in flight at a time" itself (fetchHistory
 //      rejects a second call while one is pending) and then
 //      shape-matches: a frame that parses with an `events` array AND a
-//      `nextCursor` key, WHILE a fetch_history call is pending, is treated
-//      as that call's reply; everything else is a live broadcast. A real
-//      domain event payload coincidentally carrying both an `events` array
-//      and a `nextCursor` key is not ruled out by the schema, only
-//      pragmatically implausible -- documented here as a known, narrow
-//      limitation of a protocol with no correlation id, not silently
-//      assumed away.
+//      `nextCursor` key AND no `type` key, WHILE a fetch_history call is
+//      pending, is treated as that call's reply; everything else is a
+//      live broadcast. The reply never has a `type` (FetchHistoryResponse
+//      is additionalProperties:false, on a control plane older than its
+//      `sandbox` too), while every broadcast of a sandbox's frame does:
+//      the sandbox-ws contract requires one, and the control plane drops a
+//      sandbox frame without one, or with a top-level `events`,
+//      `nextCursor` or `sandbox` key (sessionactor's
+//      refusedSandboxFrame). So a sandbox cannot answer this page's
+//      fetch_history, and the reply's `sandbox` row, which the page shows
+//      as the server's status, is the server's. An event the control plane
+//      writes itself carries no `type` at its top level, but none of them
+//      has an `events` array and a `nextCursor`: the remaining overlap is
+//      a protocol with no correlation id, documented here, not assumed
+//      away.
 //
 // # Redelivery this file does NOT attempt to solve
 //
@@ -121,8 +129,9 @@ function looksLikeSubscribedPayload(value: unknown): value is SubscribedPayload 
   )
 }
 
+/** looksLikeFetchHistoryResponse: an `events` array, a `nextCursor`, and no `type` -- the reply never has one, and every broadcast of a sandbox's frame does (see this file's top comment). */
 function looksLikeFetchHistoryResponse(value: unknown): value is FetchHistoryResponse {
-  return isPlainObject(value) && Array.isArray(value.events) && (typeof value.nextCursor === 'string' || value.nextCursor === null)
+  return isPlainObject(value) && !('type' in value) && Array.isArray(value.events) && (typeof value.nextCursor === 'string' || value.nextCursor === null)
 }
 
 export class ClientWsTransport {
