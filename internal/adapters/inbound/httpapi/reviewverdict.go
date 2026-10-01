@@ -1172,10 +1172,13 @@ type subTaskFinishPayload struct {
 // would read as the earlier turn's second run over its additions. The
 // bound applies to both checks, since they read the same rows. Work the
 // earlier turn did after the later one was dispatched is left out too, so
-// the cut trace is marked CutAtNextTurn: a second run found inside the
-// window still counts, and one not found there resolves to unconfirmed
-// ("could not be confirmed"), never not_found, since it may lie past the
-// cut; a counter-review not found there leaves that claim uncorroborated.
+// the cut trace is marked CutAtNextTurn, and the additions resolve to
+// unconfirmed ("could not be confirmed") whatever the window holds: a
+// second run missing from it may lie past the cut, and one found in it
+// may have been followed, past the cut, by another counter-reviewer pass.
+// The counter-review claim is positive, so a completed counter-reviewer
+// inside the window still corroborates it, and one not found there leaves
+// it uncorroborated.
 // Another turn sharing this turn's watermark means the two turns' events
 // cannot be told apart, and the trace is not read at all (ReadInFull
 // false).

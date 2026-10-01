@@ -731,19 +731,25 @@ func seedLaterTurnAfterTimeout(ctx context.Context, t *testing.T, rig testRig, s
 // one, or A's own late second run, which the event log cannot tell apart
 // -- never counts as A's: the addition could not be confirmed, never
 // "checked", and never "not found" either, since the run may lie past the
-// cut. A's own second run before B was dispatched still counts, and so
-// does A's counter-review. One rig per case.
+// cut. Nor does A's own second run before B was dispatched settle it: A's
+// agent may run another counter-reviewer pass past the cut (the retry the
+// ordering rule exists to catch), which the cut read cannot see, so that
+// is unconfirmed too. A's counter-review, a positive claim proved by a
+// completed counter-reviewer inside the window, still corroborates. One
+// rig per case.
 func TestPostReviewVerdict_CounterReviewAddition_LaterTurnsRunsAreNotTheEarlierTurns(t *testing.T) {
 	tests := []struct {
 		name               string
 		earlierSecondFirst bool // A's second run, before B's dispatch
 		earlierSecondLate  bool // A's second run, after B's dispatch
 		laterFirst         bool // B's routine first fact-check
+		earlierRetryLate   bool // A's counter-reviewer retry, after B's dispatch
 		wantCheck          string
 	}{
-		{"the later turn's first fact-check is not the earlier turn's second run", false, false, true, "unconfirmed"},
-		{"the earlier turn's own second run, after the later turn's dispatch, could not be confirmed", false, true, false, "unconfirmed"},
-		{"the earlier turn's own second run, before the later turn's dispatch, still counts", true, false, true, "checked"},
+		{"the later turn's first fact-check is not the earlier turn's second run", false, false, true, false, "unconfirmed"},
+		{"the earlier turn's own second run, after the later turn's dispatch, could not be confirmed", false, true, false, false, "unconfirmed"},
+		{"the earlier turn's own second run, before the later turn's dispatch, could not be confirmed past the cut", true, false, true, false, "unconfirmed"},
+		{"a counter-reviewer retry past the cut, after the earlier turn's second run: never checked", true, false, false, true, "unconfirmed"},
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -763,6 +769,9 @@ func TestPostReviewVerdict_CounterReviewAddition_LaterTurnsRunsAreNotTheEarlierT
 			}
 			if tc.earlierSecondLate {
 				seedFactCheck(ctx, t, rig, session.ID, "fc-a-second-late")
+			}
+			if tc.earlierRetryLate {
+				seedCounterReview(ctx, t, rig, session.ID, "cr-a-retry")
 			}
 
 			status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepVerdictWithAdditionsJSON(t, "done", 0))

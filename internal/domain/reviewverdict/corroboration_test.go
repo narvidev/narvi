@@ -305,11 +305,12 @@ func TestAdditionsFactCheckInTrace(t *testing.T) {
 			trace: reviewverdict.SubTaskTrace{},
 			want:  reviewpost.AdditionsTraceUnread,
 		},
-		// A read cut at the next turn's dispatch: the window itself was
-		// read in full, so a run inside it counts; a run not found in it
-		// may lie past the cut.
+		// A read cut at the next turn's dispatch: this turn's own events
+		// past the cut were left unread, so neither a run missing from the
+		// window nor a run found in it settles the additions -- a
+		// counter-reviewer pass past the cut would defeat the run.
 		{
-			name: "a read cut at the next turn's dispatch, with the run inside the window: run found",
+			name: "a read cut at the next turn's dispatch, with the run inside the window: could not be confirmed",
 			trace: func() reviewverdict.SubTaskTrace {
 				tr := traceOf(
 					start(1, "cr1", cr), finish(2, "cr1", "completed"),
@@ -318,7 +319,7 @@ func TestAdditionsFactCheckInTrace(t *testing.T) {
 				tr.CutAtNextTurn = true
 				return tr
 			}(),
-			want: reviewpost.AdditionsTraceRunFound,
+			want: reviewpost.AdditionsTraceUnread,
 		},
 		{
 			name: "a read cut at the next turn's dispatch, with no run inside the window: could not be confirmed",
@@ -348,5 +349,23 @@ func TestAdditionsFactCheckInTrace(t *testing.T) {
 				t.Errorf("AdditionsFactCheckInTrace() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// TestCounterReviewCorroborated_CutReadStillProvesARunInsideTheWindow:
+// the counter-review claim is positive, so a completed counter-reviewer
+// inside a cut window still corroborates it -- the cut only stops the
+// additions rule from claiming nothing follows the second run.
+func TestCounterReviewCorroborated_CutReadStillProvesARunInsideTheWindow(t *testing.T) {
+	tr := traceOf(
+		start(1, "cr1", review.CounterReviewerAgentName), finish(2, "cr1", "completed"),
+		start(3, "fc2", review.FactCheckAgentName), finish(4, "fc2", "completed"),
+	)
+	tr.CutAtNextTurn = true
+	if !reviewverdict.CounterReviewCorroborated(tr.Starts, tr.Finishes) {
+		t.Error("CounterReviewCorroborated() = false for a completed counter-reviewer inside a cut window, want true")
+	}
+	if got := reviewverdict.AdditionsFactCheckInTrace(tr); got != reviewpost.AdditionsTraceUnread {
+		t.Errorf("AdditionsFactCheckInTrace() = %q for the same cut window, want %q", got, reviewpost.AdditionsTraceUnread)
 	}
 }

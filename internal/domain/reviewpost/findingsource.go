@@ -99,9 +99,8 @@ const (
 	// trace could not be read in full (a failed read, a row that did not
 	// decode, a finish with no start, a turn with no dispatch scope to
 	// read it in or whose events cannot be told from another turn's, or a
-	// read cut at the next turn's dispatch that found no run inside its
-	// window), so whether a run covered the additions could not be
-	// confirmed.
+	// read cut at the next turn's dispatch), so whether a run covered the
+	// additions could not be confirmed.
 	AdditionUnconfirmed AdditionCheck = "unconfirmed"
 )
 

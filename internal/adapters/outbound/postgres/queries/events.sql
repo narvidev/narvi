@@ -266,9 +266,10 @@ LIMIT 1;
 -- watermark, so `id <= next_dispatched_event_id` excludes all of them.
 -- Work the earlier turn did after the later one was dispatched is
 -- excluded too, deliberately unread, so the caller marks such a read cut
--- (SubTaskTrace.CutAtNextTurn): a second run found inside the window
--- counts, and one not found there resolves to "could not be confirmed"
--- (unconfirmed), never "not found", since it may lie past the cut. The
+-- (SubTaskTrace.CutAtNextTurn), and its additions resolve to "could not
+-- be confirmed" (unconfirmed) whatever the window holds: a second run
+-- missing from it may lie past the cut, and one found in it may have been
+-- followed, past the cut, by another counter-reviewer pass. The
 -- LATER turn's read keeps the lower bound alone, and an earlier turn that
 -- may still be running at its gen makes it unreadable instead
 -- (ExistsEarlierTurnLeftRunning, queries/turns.sql).
