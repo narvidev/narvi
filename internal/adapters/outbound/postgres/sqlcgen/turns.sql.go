@@ -235,6 +235,49 @@ func (q *Queries) GetNewestReviewAttempt(ctx context.Context, sessionID pgtype.U
 	return i, err
 }
 
+const getNextTurnDispatchedEventID = `-- name: GetNextTurnDispatchedEventID :one
+SELECT dispatched_event_id FROM turns
+WHERE session_id = $1
+  AND id <> $2
+  AND dispatched_event_id >= $3::bigint
+ORDER BY dispatched_event_id ASC
+LIMIT 1
+`
+
+type GetNextTurnDispatchedEventIDParams struct {
+	SessionID         pgtype.UUID `json:"session_id"`
+	ID                pgtype.UUID `json:"id"`
+	DispatchedEventID int64       `json:"dispatched_event_id"`
+}
+
+// The upper bound of one turn's sub-task trace (§26.4's corroboration,
+// §26.6's amendment): the lowest dispatched_event_id among the session's
+// OTHER turns that is at or above this turn's own. Every event a later
+// turn produces lands above that turn's watermark (MaxEventIDForSession,
+// queries/events.sql), so a read of this turn's trace bounded by
+// `id <= next` holds none of them. The bound is needed because a turn
+// that timed out is marked failed without stopping its agent, the next
+// turn is dispatched to the same sandbox at the same gen, and the timed-
+// out turn's late verdict is still resolved by its own message id
+// (GetTurnByDispatchedMessageID): without it, the later turn's sub-tasks
+// -- its routine first fact-check included -- would read as the earlier
+// turn's own.
+//
+// ">=" rather than ">": another turn whose watermark EQUALS this one's
+// was dispatched with no event between the two dispatches, so the event
+// log cannot tell the two turns' events apart. The caller sees next ==
+// its own watermark and treats the trace as not read in full, never as
+// an empty one. A turn re-sent to a respawned sandbox carries the
+// watermark of its latest dispatch, so a bound taken from it is that
+// dispatch's. pgx.ErrNoRows: no other turn was dispatched at or after
+// this one, and the trace has no upper bound.
+func (q *Queries) GetNextTurnDispatchedEventID(ctx context.Context, arg GetNextTurnDispatchedEventIDParams) (*int64, error) {
+	row := q.db.QueryRow(ctx, getNextTurnDispatchedEventID, arg.SessionID, arg.ID, arg.DispatchedEventID)
+	var dispatched_event_id *int64
+	err := row.Scan(&dispatched_event_id)
+	return dispatched_event_id, err
+}
+
 const getPlatformCostSummaryInWindow = `-- name: GetPlatformCostSummaryInWindow :one
 WITH per_session AS (
     SELECT session_id, SUM(cost_usd) AS total

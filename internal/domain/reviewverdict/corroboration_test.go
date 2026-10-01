@@ -246,7 +246,45 @@ func TestAdditionsFactCheckInTrace(t *testing.T) {
 			name: "a completed finish for another sub-task is not the second run's",
 			trace: traceOf(
 				start(1, "cr1", cr), finish(2, "cr1", "completed"),
-				start(3, "fc2", fc), finish(4, "other", "completed"),
+				start(3, "fc2", fc),
+				start(4, "other", review.ArchitectureScribeAgentName), finish(5, "other", "completed"),
+			),
+			want: reviewpost.AdditionsTraceNoRunFound,
+		},
+		{
+			// A retry of the counter-review still running when the verdict
+			// is posted: its start alone, with no finish yet, already puts
+			// the second fact-check before a counter-reviewer event.
+			name: "a later counter-review run started after the second fact-check and has not finished: none found",
+			trace: traceOf(
+				start(1, "fc1", fc), finish(2, "fc1", "completed"),
+				start(3, "cr1", cr), finish(4, "cr1", "completed"),
+				start(5, "fc2", fc), finish(6, "fc2", "completed"),
+				start(7, "cr2", cr),
+			),
+			want: reviewpost.AdditionsTraceNoRunFound,
+		},
+		{
+			// sub_task_start is best-effort and can be evicted during a long
+			// disconnect while its critical finish is delivered: cr2's
+			// finish, with no start, could be a counter-reviewer's run after
+			// the second fact-check, so the trace is not complete.
+			name: "a finish whose start is not in the trace: could not be confirmed",
+			trace: traceOf(
+				start(10, "fc1", fc), finish(11, "fc1", "completed"),
+				start(20, "cr1", cr), finish(21, "cr1", "completed"),
+				start(30, "fc2", fc), finish(31, "fc2", "completed"),
+				finish(41, "cr2", "completed"),
+			),
+			want: reviewpost.AdditionsTraceUnread,
+		},
+		{
+			name: "the same trace with that start present: none found",
+			trace: traceOf(
+				start(10, "fc1", fc), finish(11, "fc1", "completed"),
+				start(20, "cr1", cr), finish(21, "cr1", "completed"),
+				start(30, "fc2", fc), finish(31, "fc2", "completed"),
+				start(40, "cr2", cr), finish(41, "cr2", "completed"),
 			),
 			want: reviewpost.AdditionsTraceNoRunFound,
 		},

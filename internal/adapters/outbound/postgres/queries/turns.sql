@@ -245,6 +245,35 @@ WHERE session_id = $1 AND status = 'processing';
 SELECT * FROM turns
 WHERE session_id = $1 AND dispatched_message_id = $2;
 
+-- name: GetNextTurnDispatchedEventID :one
+-- The upper bound of one turn's sub-task trace (§26.4's corroboration,
+-- §26.6's amendment): the lowest dispatched_event_id among the session's
+-- OTHER turns that is at or above this turn's own. Every event a later
+-- turn produces lands above that turn's watermark (MaxEventIDForSession,
+-- queries/events.sql), so a read of this turn's trace bounded by
+-- `id <= next` holds none of them. The bound is needed because a turn
+-- that timed out is marked failed without stopping its agent, the next
+-- turn is dispatched to the same sandbox at the same gen, and the timed-
+-- out turn's late verdict is still resolved by its own message id
+-- (GetTurnByDispatchedMessageID): without it, the later turn's sub-tasks
+-- -- its routine first fact-check included -- would read as the earlier
+-- turn's own.
+--
+-- ">=" rather than ">": another turn whose watermark EQUALS this one's
+-- was dispatched with no event between the two dispatches, so the event
+-- log cannot tell the two turns' events apart. The caller sees next ==
+-- its own watermark and treats the trace as not read in full, never as
+-- an empty one. A turn re-sent to a respawned sandbox carries the
+-- watermark of its latest dispatch, so a bound taken from it is that
+-- dispatch's. pgx.ErrNoRows: no other turn was dispatched at or after
+-- this one, and the trace has no upper bound.
+SELECT dispatched_event_id FROM turns
+WHERE session_id = $1
+  AND id <> $2
+  AND dispatched_event_id >= sqlc.arg('dispatched_event_id')::bigint
+ORDER BY dispatched_event_id ASC
+LIMIT 1;
+
 -- name: SetTurnEpistemicOutcome :execrows
 -- The guarded UPDATE backing that same endpoint (§20.2) -- mirrors
 -- SetWorkflowStepRunOutcome's own "WHERE ... AND status = 'running'" guard

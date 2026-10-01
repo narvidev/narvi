@@ -609,7 +609,7 @@ func PostReviewVerdict(
 		checkCounterReview := reviewDepth == reviewtriage.DepthDeep && input.CounterReview == review.CounterReviewDone
 		checkAdditions := reviewDepth == reviewtriage.DepthDeep && input.AdditionsFactCheck == reviewpost.FactCheckDone
 		if checkCounterReview || checkAdditions {
-			trace := readSubTaskTrace(ctx, logger, events, sessionID, dispatchedSandboxGen, dispatchedEventID)
+			trace := readSubTaskTrace(ctx, logger, events, turns, sessionID, dispatchedTurn.ID, dispatchedSandboxGen, dispatchedEventID)
 			if checkCounterReview {
 				input.CounterReviewCorroborated = reviewverdict.CounterReviewCorroborated(trace.Starts, trace.Finishes)
 			}
@@ -1026,8 +1026,11 @@ func findingInputFromWire(f restdtos.PostedFinding) reviewpost.FindingInput {
 	if f.SuggestedFix != nil {
 		in.SuggestedFix = f.SuggestedFix
 	}
-	// §26.6's amendment: absent decodes to "", which
-	// reviewpost.ValidateVerdictInput refuses (ErrInvalidFindingSource).
+	// §26.6's amendment: absent decodes to "", reviewpost.
+	// FindingSourceNotRecorded -- a turn whose prompt was rendered before
+	// sources existed sends none, and its finding is stored with no source
+	// recorded (findingsource.go). A garbled value is refused by
+	// reviewpost.ValidateVerdictInput (ErrInvalidFindingSource).
 	if f.Source != nil {
 		in.Source = reviewpost.FindingSource(*f.Source)
 	}
@@ -1149,10 +1152,22 @@ type subTaskFinishPayload struct {
 // an adversarial review, to let an EARLIER turn's own real counter-review
 // trace spuriously corroborate a LATER turn's self-report in exactly that
 // case; the dispatchedEventID lower bound is what actually closes that gap
-// (turns_one_processing_per_session's own unique partial index guarantees
-// turns execute strictly sequentially per session, so an earlier turn's
-// own sub-task events all carry ids at or below a later turn's own
-// dispatch watermark).
+// for the later turn.
+//
+// The read is bounded above as well (§26.6's amendment): by the watermark
+// of the next turn dispatched on the session, when there is one
+// (turns.NextDispatchedEventID). Turns are not always over when the next
+// one is dispatched -- a turn past TurnDeadline is marked failed while its
+// agent can still run in the same sandbox, at the same gen, and its late
+// verdict is still resolved by its own message id (finding F3's fix, above)
+// -- so without the upper bound that late verdict's trace would hold the
+// later turn's sub-tasks, and the later turn's routine first fact-check
+// would read as the earlier turn's second run over its additions. The
+// bound applies to both checks, since they read the same rows; work the
+// earlier turn did after the later one was dispatched is left out too,
+// which can only leave a claim unconfirmed. Another turn sharing this
+// turn's watermark means the two turns' events cannot be told apart, and
+// the trace is not read at all (ReadInFull false).
 //
 // Every record carries its row's events.id (EventID): within one session
 // ids are allocated in commit order, which is what lets
@@ -1162,7 +1177,8 @@ type subTaskFinishPayload struct {
 // The result's ReadInFull is false -- the trace "could not be confirmed",
 // never "shows none" -- whenever any part of it could not be read: the
 // turn has no dispatched_sandbox_gen or dispatched_event_id to scope a
-// read to, either query fails, or a row's payload does not decode (that
+// read to, its upper bound cannot be read or is shared with another turn,
+// a query fails, or a row's payload does not decode (that
 // row is skipped, not fatal to the rest: one corrupt event must not blind
 // the counter-review check to every OTHER, perfectly good row). None of
 // these fails the verdict-posting request: each only ever leaves a claim
@@ -1192,7 +1208,7 @@ type subTaskFinishPayload struct {
 // belongs here to work around it -- see reviewpost.BuildVerdict's own doc
 // comment ("The accepted race") for the fuller version of this same
 // reasoning.
-func readSubTaskTrace(ctx context.Context, logger *slog.Logger, events *postgres.EventStore, sessionID pgtype.UUID, gen *int32, dispatchedEventID *int64) reviewverdict.SubTaskTrace {
+func readSubTaskTrace(ctx context.Context, logger *slog.Logger, events *postgres.EventStore, turns *postgres.TurnStore, sessionID, turnID pgtype.UUID, gen *int32, dispatchedEventID *int64) reviewverdict.SubTaskTrace {
 	switch {
 	case gen == nil:
 		// dispatched_sandbox_gen NULL (migrations/
@@ -1220,13 +1236,31 @@ func readSubTaskTrace(ctx context.Context, logger *slog.Logger, events *postgres
 		return reviewverdict.SubTaskTrace{}
 	}
 
+	// The upper bound: the next turn dispatched on this session, if any.
+	var upper *int64
+	next, found, err := turns.NextDispatchedEventID(ctx, sessionID, turnID, *dispatchedEventID)
+	switch {
+	case err != nil:
+		logger.Warn("httpapi: review-verdict: read the next turn's dispatch watermark failed, the trace could not be bounded and was not read", "error", err)
+		return reviewverdict.SubTaskTrace{}
+	case found && next == *dispatchedEventID:
+		// Another turn was dispatched at this same watermark, with no event
+		// between the two dispatches: the event log cannot tell the two
+		// turns' events apart, so neither trace can be read as this turn's
+		// alone.
+		logger.Warn("httpapi: review-verdict: another turn shares this turn's dispatch watermark, the trace cannot be told apart and was not read")
+		return reviewverdict.SubTaskTrace{}
+	case found:
+		upper = &next
+	}
+
 	trace := reviewverdict.SubTaskTrace{ReadInFull: true}
-	startRows, err := events.ListSubTaskStartsForTurn(ctx, sessionID, *gen, *dispatchedEventID)
+	startRows, err := events.ListSubTaskStartsForTurn(ctx, sessionID, *gen, *dispatchedEventID, upper)
 	if err != nil {
 		logger.Warn("httpapi: review-verdict: list sub_task_start events for corroboration failed, the trace could not be read", "error", err)
 		return reviewverdict.SubTaskTrace{}
 	}
-	finishRows, err := events.ListSubTaskFinishesForTurn(ctx, sessionID, *gen, *dispatchedEventID)
+	finishRows, err := events.ListSubTaskFinishesForTurn(ctx, sessionID, *gen, *dispatchedEventID, upper)
 	if err != nil {
 		logger.Warn("httpapi: review-verdict: list sub_task_finish events for corroboration failed, the trace could not be read", "error", err)
 		return reviewverdict.SubTaskTrace{}

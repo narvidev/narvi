@@ -27,6 +27,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/review"
+	"github.com/narvidev/narvi/internal/domain/reviewtriage"
 )
 
 const (
@@ -416,9 +417,11 @@ func TestPostReviewVerdict_CounterReviewAddition_CouldNotBeConfirmedWhenTraceUnr
 }
 
 // TestPostReviewVerdict_EveryPublishedFindingRecordsItsSource: a finding
-// with no source is refused before anything is written, a counter-review
-// source is refused off the deep path, and a light-path primary finding
-// is stored with its source. One rig per case.
+// with a garbled source is refused before anything is written, a
+// counter-review source is refused off the deep path, and a light-path
+// primary finding is stored with its source. A finding with no source at
+// all is admitted (TestPostReviewVerdict_FindingWithNoSource_ReadAsNotRecorded).
+// One rig per case.
 func TestPostReviewVerdict_EveryPublishedFindingRecordsItsSource(t *testing.T) {
 	lightBody := func(source string) string {
 		finding := `{"severity":"low","filePath":"a.go","description":"Stale comment."`
@@ -435,7 +438,8 @@ func TestPostReviewVerdict_EveryPublishedFindingRecordsItsSource(t *testing.T) {
 		wantStatus int
 		wantSource string
 	}{
-		{"no source: refused", lightBody(""), http.StatusBadRequest, ""},
+		{"garbled source: refused", lightBody("scribe"), http.StatusBadRequest, ""},
+		{"source in the wrong case: refused", lightBody("Primary"), http.StatusBadRequest, ""},
 		{"counter_review off the deep path: refused", lightBody("counter_review"), http.StatusBadRequest, ""},
 		{"primary: recorded", lightBody("primary"), http.StatusCreated, "primary"},
 	}
@@ -485,5 +489,411 @@ func TestPostReviewVerdict_EveryPublishedFindingRecordsItsSource(t *testing.T) {
 				t.Errorf("a light-path verdict recorded a second fact-check run: %s/%s resolved %s", strOrNil(runs.additionsFactCheck), int32OrNil(runs.additionsFactCheckKilled), strOrNil(runs.additionsCheck))
 			}
 		})
+	}
+}
+
+// basePromptFinding is a finding shaped exactly as the review prompt
+// before finding sources asked for one: sentinelKind, severity, filePath,
+// line, description and suggestedFix, and no source. A turn's prompt is
+// rendered when the turn is created and re-sent as stored, so a turn
+// rendered before the deploy posts this shape after it.
+func basePromptFinding(description string) map[string]any {
+	return map[string]any{
+		"sentinelKind": nil,
+		"severity":     "medium",
+		"filePath":     "internal/retry/retry.go",
+		"line":         12,
+		"description":  description,
+		"suggestedFix": "--- a/internal/retry/retry.go\n+++ b/internal/retry/retry.go\n@@ -12 +12 @@\n-\tfor {\n+\tfor attempt := 0; attempt < 3; attempt++ {\n",
+	}
+}
+
+// basePromptVerdictJSON is a verdict body as the base prompt shaped it,
+// carrying findings with no source: on the deep path, counterReview done
+// and the three deep digest fields, and no second-run fields, which that
+// prompt never named.
+func basePromptVerdictJSON(t *testing.T, deep bool, findings ...map[string]any) string {
+	t.Helper()
+	digest := map[string]any{
+		"summary":             "Adds a retry helper around the flaky call and swaps every call site onto it.",
+		"descriptionAdequacy": "ok",
+		"adequacyExplanation": "The PR body accurately describes the retry helper.",
+	}
+	body := map[string]any{
+		"riskLevel":         "low",
+		"premise":           "ok",
+		"blastRadius":       []string{},
+		"filesChanged":      3,
+		"testsCoverage":     "adequate",
+		"docsDrift":         "none",
+		"proposedShippable": "auto",
+		"summary":           "Findings posted the way the earlier prompt asked.",
+		"findings":          findings,
+		"digest":            digest,
+		"factCheck":         "done",
+		"factCheckKilled":   0,
+	}
+	if deep {
+		digest["archDecisions"] = []map[string]any{{"decision": "Reused the existing retry helper."}}
+		digest["stackRisks"] = "None of note -- purely additive."
+		digest["unverifiedLimits"] = "Did not run against production traffic."
+		body["counterReview"] = "done"
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal verdict body: %v", err)
+	}
+	return string(raw)
+}
+
+// TestPostReviewVerdict_FindingWithNoSource_ReadAsNotRecorded is the
+// rolling-deploy case for finding sources: a review turn rendered before
+// them -- queued, running, or re-sent across the deploy -- posts its
+// findings exactly as its stored prompt shaped them, with no source. On
+// the light and the deep path the verdict is accepted (201), and every
+// finding is stored with no source recorded and read back as such, the
+// way a finding last published before sources existed is read: neither
+// primary nor an addition, listed among the findings with no marker,
+// counted under not_recorded and in the main finding-outcomes
+// distribution. One rig per case.
+func TestPostReviewVerdict_FindingWithNoSource_ReadAsNotRecorded(t *testing.T) {
+	const (
+		first  = "The retry loop never backs off between attempts."
+		second = "The timeout is read once, at package init, and never refreshed."
+	)
+	tests := []struct {
+		name string
+		deep bool
+	}{
+		{"light path", false},
+		{"deep path", true},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newTestRig(t)
+			ctx := context.Background()
+			repo := fmt.Sprintf("acme/no-source-%d", i)
+			session := setupReviewSessionWithSandbox(ctx, t, rig, repo, int32(340+i))
+			if tc.deep {
+				seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-no-source", 1)
+				seedFactCheck(ctx, t, rig, session.ID, "fc-first")
+				seedCounterReview(ctx, t, rig, session.ID, "cr")
+			} else {
+				headSHA, light := "sha-no-source", string(reviewtriage.DepthLight)
+				created, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHA, ReviewDepth: &light})
+				if err != nil {
+					t.Fatalf("seed processing light-path turn: %v", err)
+				}
+				messageID := testDispatchMessageID
+				if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: created.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &messageID}); err != nil {
+					t.Fatalf("stamp dispatched_message_id: %v", err)
+				}
+			}
+
+			status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, basePromptVerdictJSON(t, tc.deep, basePromptFinding(first), basePromptFinding(second)))
+			if status != http.StatusCreated {
+				t.Fatalf("status = %d, want %d (a verdict its own stored prompt shaped must be accepted)", status, http.StatusCreated)
+			}
+			if resp.Shippable != restdtos.PostReviewVerdictResponseShippableAuto {
+				t.Errorf("Shippable = %q, want auto", resp.Shippable)
+			}
+
+			for _, description := range []string{first, second} {
+				if source, check := findingSourceColumns(ctx, t, rig, repo, description); source != nil || check != nil {
+					t.Errorf("finding %q: reported_source = %s, addition_check = %s; want <nil>, <nil> (source not recorded)", description, strOrNil(source), strOrNil(check))
+				}
+			}
+			if runs := readVerdictFactCheckRuns(ctx, t, rig, repo); runs.additionsFactCheck != nil || runs.additionsFactCheckKilled != nil || runs.additionsCheck != nil {
+				t.Errorf("a verdict with no addition and no second run recorded one: %s/%s resolved %s", strOrNil(runs.additionsFactCheck), int32OrNil(runs.additionsFactCheckKilled), strOrNil(runs.additionsCheck))
+			}
+
+			body := verdictOutboxBody(ctx, t, rig, session.ID)
+			for _, want := range []string{
+				"**Findings:**\n\n",
+				"`internal/retry/retry.go`: " + first + "\n",
+				"`internal/retry/retry.go`: " + second + "\n",
+			} {
+				if !strings.Contains(body, want) {
+					t.Errorf("posted body missing %q (a no-source finding renders as before), Body:\n%s", want, body)
+				}
+			}
+			for _, marker := range []string{"**Unverified", "added by the counter-review"} {
+				if strings.Contains(body, marker) {
+					t.Errorf("posted body marks a no-source finding with %q, Body:\n%s", marker, body)
+				}
+			}
+
+			_, token := rig.createAuthenticatedUser(ctx, t)
+			var readout restdtos.ReviewReadout
+			if status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/review", nil, &readout, token); status != http.StatusOK {
+				t.Fatalf("readout status = %d, want %d", status, http.StatusOK)
+			}
+			if len(readout.Findings) != 2 {
+				t.Fatalf("readout findings = %d, want 2", len(readout.Findings))
+			}
+			for _, f := range readout.Findings {
+				if f.Source != nil || f.AdditionCheck != nil {
+					t.Errorf("readout finding %q: source %s, additionCheck %s; want null, null (source not recorded)", f.Description, strOrNil(f.Source), strOrNil(f.AdditionCheck))
+				}
+			}
+
+			var analytics restdtos.ReviewAnalytics
+			if status := rig.doJSON(t, http.MethodGet, "/api/repos/"+repo+"/review-analytics", nil, &analytics, token); status != http.StatusOK {
+				t.Fatalf("analytics status = %d, want %d", status, http.StatusOK)
+			}
+			if !analytics.FindingOutcomesComputed || analytics.FindingOutcomes == nil || analytics.FindingOutcomesBySource == nil {
+				t.Fatalf("analytics finding outcomes not computed: %+v", analytics)
+			}
+			total := 0
+			for _, o := range *analytics.FindingOutcomes {
+				total += o.Count
+			}
+			if total != 2 {
+				t.Errorf("findingOutcomes counts %d findings, want 2 (no-source findings stay in the main distribution)", total)
+			}
+			bySource := map[string]int{}
+			for _, o := range *analytics.FindingOutcomesBySource {
+				bySource[o.Source] += o.Count
+			}
+			if bySource["not_recorded"] != 2 || len(bySource) != 1 {
+				t.Errorf("findingOutcomesBySource = %v, want not_recorded 2 and nothing else", bySource)
+			}
+		})
+	}
+}
+
+// seedLaterTurnAfterTimeout marks earlier (a turn past its deadline) failed
+// -- its agent still running, as handleTurnDeadlineTimer leaves it -- and
+// dispatches a later deep-path turn on the same session, to the same
+// sandbox at the same gen, with its own watermark and message id: the
+// state in which the earlier turn's late verdict is still resolved by its
+// own message id while the later turn runs.
+func seedLaterTurnAfterTimeout(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID, earlier sqlcgen.Turn) sqlcgen.Turn {
+	t.Helper()
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: earlier.ID, Status: sqlcgen.TurnStatusFailed}); err != nil {
+		t.Fatalf("mark the earlier turn failed: %v", err)
+	}
+	headSHA, deep := "sha-later-turn", string(reviewtriage.DepthDeep)
+	later, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHA, ReviewDepth: &deep})
+	if err != nil {
+		t.Fatalf("create the later turn: %v", err)
+	}
+	watermark, err := rig.events.MaxEventIDForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("read the later turn's watermark: %v", err)
+	}
+	gen, messageID := int32(1), "msg-later-turn"
+	updated, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		ID: later.ID, Status: sqlcgen.TurnStatusProcessing,
+		DispatchedSandboxGen: &gen, DispatchedEventID: &watermark, DispatchedMessageID: &messageID,
+	})
+	if err != nil {
+		t.Fatalf("stamp the later turn's dispatch: %v", err)
+	}
+	return updated
+}
+
+// TestPostReviewVerdict_CounterReviewAddition_LaterTurnsRunsAreNotTheEarlierTurns
+// is the timed-out-turn race: turn A (deep) runs its first fact-check and
+// a counter-review, is marked failed at its deadline while its agent keeps
+// running, and turn B is dispatched to the same sandbox at the same gen
+// and runs its own routine first fact-check. A's agent then posts A's
+// verdict, reporting the second run done. B's fact-check started after
+// A's counter-review, but it is B's: A's trace is read up to B's dispatch
+// watermark and no further, so the addition is not found -- never
+// checked. A's own second run, when it ran before B was dispatched, still
+// counts, and so does A's counter-review. One rig per case.
+func TestPostReviewVerdict_CounterReviewAddition_LaterTurnsRunsAreNotTheEarlierTurns(t *testing.T) {
+	tests := []struct {
+		name          string
+		earlierSecond bool
+		wantCheck     string
+	}{
+		{"the later turn's first fact-check is not the earlier turn's second run", false, "not_found"},
+		{"the earlier turn's own second run, before the later turn's dispatch, still counts", true, "checked"},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newTestRig(t)
+			ctx := context.Background()
+			repo := fmt.Sprintf("acme/additions-later-turn-%d", i)
+			session := setupReviewSessionWithSandbox(ctx, t, rig, repo, int32(350+i))
+			turnA := seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-turn-a", 1)
+			seedFactCheck(ctx, t, rig, session.ID, "fc-a-first")
+			seedCounterReview(ctx, t, rig, session.ID, "cr-a")
+			if tc.earlierSecond {
+				seedFactCheck(ctx, t, rig, session.ID, "fc-a-second")
+			}
+			seedLaterTurnAfterTimeout(ctx, t, rig, session.ID, turnA)
+			seedFactCheck(ctx, t, rig, session.ID, "fc-b-first")
+
+			status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepVerdictWithAdditionsJSON(t, "done", 0))
+			if status != http.StatusCreated {
+				t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+			}
+			if resp.Shippable != restdtos.PostReviewVerdictResponseShippableAuto {
+				t.Errorf("Shippable = %q, want auto (A's own counter-review, before B's dispatch, still corroborates)", resp.Shippable)
+			}
+			if _, check := findingSourceColumns(ctx, t, rig, repo, additionsAddedDescription); strOrNil(check) != tc.wantCheck {
+				t.Errorf("addition_check = %s, want %s", strOrNil(check), tc.wantCheck)
+			}
+			if runs := readVerdictFactCheckRuns(ctx, t, rig, repo); strOrNil(runs.additionsCheck) != tc.wantCheck {
+				t.Errorf("review_verdicts.additions_check = %s, want %s", strOrNil(runs.additionsCheck), tc.wantCheck)
+			}
+			body := verdictOutboxBody(ctx, t, rig, session.ID)
+			if checked := strings.Contains(body, additionsCheckedMarker); checked != (tc.wantCheck == "checked") {
+				t.Errorf("posted body marks the addition fact-checked: %v, want %v, Body:\n%s", checked, tc.wantCheck == "checked", body)
+			}
+		})
+	}
+}
+
+// TestPostReviewVerdict_CounterReviewAddition_TurnSharingTheWatermarkCannotBeToldApart:
+// turn A is dispatched, ends with no event persisted, and turn B is
+// dispatched at the very same watermark. Every sub-task event after it
+// could be either turn's, so A's trace is not read as A's alone: the
+// addition could not be confirmed, and the counter-review claim is not
+// corroborated -- never "checked" on events that might be B's.
+func TestPostReviewVerdict_CounterReviewAddition_TurnSharingTheWatermarkCannotBeToldApart(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	const repo = "acme/additions-shared-watermark"
+	session := setupReviewSessionWithSandbox(ctx, t, rig, repo, 360)
+	turnA := seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-turn-a", 1)
+	turnB := seedLaterTurnAfterTimeout(ctx, t, rig, session.ID, turnA)
+	if *turnB.DispatchedEventID != *turnA.DispatchedEventID {
+		t.Fatalf("watermarks differ (%d, %d): this test needs two turns dispatched with no event between them", *turnA.DispatchedEventID, *turnB.DispatchedEventID)
+	}
+	seedFactCheck(ctx, t, rig, session.ID, "fc-first")
+	seedCounterReview(ctx, t, rig, session.ID, "cr")
+	seedFactCheck(ctx, t, rig, session.ID, "fc-second")
+
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepVerdictWithAdditionsJSON(t, "done", 0))
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+	}
+	if resp.Shippable != restdtos.PostReviewVerdictResponseShippableNeedsHuman {
+		t.Errorf("Shippable = %q, want needs_human (a counter-review the server cannot attribute to this turn is not corroborated)", resp.Shippable)
+	}
+	if _, check := findingSourceColumns(ctx, t, rig, repo, additionsAddedDescription); strOrNil(check) != "unconfirmed" {
+		t.Errorf("addition_check = %s, want unconfirmed", strOrNil(check))
+	}
+}
+
+// TestPostReviewVerdict_CounterReviewAddition_IncompleteTraceIsUnconfirmed
+// covers two traces that look complete row by row but are not, each
+// through the handler on real Postgres: the second run's sub_task_finish
+// whose payload does not decode (skipped, so the run's outcome is unknown,
+// never "not found"), and a counter-reviewer's sub_task_finish whose
+// best-effort sub_task_start never landed (a counter-review that may have
+// run after the second fact-check). Either way the addition could not be
+// confirmed. One rig per case.
+func TestPostReviewVerdict_CounterReviewAddition_IncompleteTraceIsUnconfirmed(t *testing.T) {
+	tests := []struct {
+		name string
+		seed func(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID)
+	}{
+		{
+			name: "the second run's sub_task_finish does not decode",
+			seed: func(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID) {
+				seedSubTaskStart(ctx, t, rig, sessionID, "msg-start-fc-second", "fc-second", review.FactCheckAgentName, 1)
+				payload := []byte(`{"type":"sub_task_finish","gen":1,"subTaskId":"fc-second","outcome":{"x":1}}`)
+				if _, err := rig.events.Create(ctx, sqlcgen.CreateEventParams{SessionID: sessionID, Type: "sub_task_finish", MessageID: "msg-finish-fc-second-malformed", Payload: payload}); err != nil {
+					t.Fatalf("persist malformed sub_task_finish: %v", err)
+				}
+			},
+		},
+		{
+			name: "a counter-reviewer's finish after the second run, its start lost",
+			seed: func(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID) {
+				seedFactCheck(ctx, t, rig, sessionID, "fc-second")
+				seedSubTaskFinish(ctx, t, rig, sessionID, "msg-finish-cr2", "cr2", "completed", 1)
+			},
+		},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newTestRig(t)
+			ctx := context.Background()
+			repo := fmt.Sprintf("acme/additions-incomplete-%d", i)
+			session := setupReviewSessionWithSandbox(ctx, t, rig, repo, int32(370+i))
+			seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-additions-incomplete", 1)
+			seedFactCheck(ctx, t, rig, session.ID, "fc-first")
+			seedCounterReview(ctx, t, rig, session.ID, "cr")
+			tc.seed(ctx, t, rig, session.ID)
+
+			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepVerdictWithAdditionsJSON(t, "done", 0))
+			if status != http.StatusCreated {
+				t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+			}
+			if _, check := findingSourceColumns(ctx, t, rig, repo, additionsAddedDescription); strOrNil(check) != "unconfirmed" {
+				t.Errorf("addition_check = %s, want unconfirmed", strOrNil(check))
+			}
+			body := verdictOutboxBody(ctx, t, rig, session.ID)
+			if !strings.Contains(body, additionsUnconfirmedFragment) || strings.Contains(body, "was found in this turn's trace") {
+				t.Errorf("posted body does not say the check could not be confirmed, or claims what the trace shows, Body:\n%s", body)
+			}
+		})
+	}
+}
+
+// additionsPublishedUnverifiedLogMsg is reviewverdict.go's own log line for
+// a verdict that published counter-review additions marked unverified.
+const additionsPublishedUnverifiedLogMsg = "httpapi: review-verdict: counter-review additions published unverified"
+
+// TestPostReviewVerdict_SecondRunRemovedEveryAddition_NothingCalledUnverified:
+// the counter-review added findings and the second fact-check removed all
+// of them, so the verdict publishes none, and reports the run done with
+// its kill count. The run's finish has not landed when the verdict is
+// posted (§26.4's accepted race). The report and the count are recorded,
+// but with no addition published nothing is resolved, logged or shown as
+// unverified.
+func TestPostReviewVerdict_SecondRunRemovedEveryAddition_NothingCalledUnverified(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	const repo = "acme/additions-all-removed"
+	session := setupReviewSessionWithSandbox(ctx, t, rig, repo, 380)
+	seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-additions-all-removed", 1)
+	seedFactCheck(ctx, t, rig, session.ID, "fc-first")
+	seedCounterReview(ctx, t, rig, session.ID, "cr")
+	seedSubTaskStart(ctx, t, rig, session.ID, "msg-start-fc-second", "fc-second", review.FactCheckAgentName, 1)
+
+	var body map[string]any
+	if err := json.Unmarshal([]byte(deepVerdictWithAdditionsJSON(t, "done", 2)), &body); err != nil {
+		t.Fatalf("unmarshal verdict body: %v", err)
+	}
+	body["findings"] = []map[string]any{{"severity": "medium", "filePath": "internal/retry/retry.go", "description": additionsPrimaryDescription, "source": "primary"}}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal verdict body: %v", err)
+	}
+
+	buf := captureDefaultLoggerJSON(t)
+	status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, string(raw))
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+	}
+	if hasLogEntry(t, buf, additionsPublishedUnverifiedLogMsg) {
+		t.Errorf("logged %q for a verdict that published no addition; full log:\n%s", additionsPublishedUnverifiedLogMsg, buf.String())
+	}
+
+	runs := readVerdictFactCheckRuns(ctx, t, rig, repo)
+	if strOrNil(runs.additionsFactCheck) != "done" || int32OrNil(runs.additionsFactCheckKilled) != "2" || runs.additionsCheck != nil {
+		t.Errorf("second run = %s/%s resolved %s, want done/2 resolved <nil> (no addition published)", strOrNil(runs.additionsFactCheck), int32OrNil(runs.additionsFactCheckKilled), strOrNil(runs.additionsCheck))
+	}
+	if posted := verdictOutboxBody(ctx, t, rig, session.ID); strings.Contains(posted, "**Unverified") {
+		t.Errorf("posted body lists unverified additions, but none was published, Body:\n%s", posted)
+	}
+
+	_, token := rig.createAuthenticatedUser(ctx, t)
+	var readout restdtos.ReviewReadout
+	if status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/review", nil, &readout, token); status != http.StatusOK {
+		t.Fatalf("readout status = %d, want %d", status, http.StatusOK)
+	}
+	if readout.LatestVerdict == nil {
+		t.Fatal("readout has no latest verdict")
+	}
+	if lv := readout.LatestVerdict; strOrNil(lv.AdditionsFactCheck) != "done" || lv.AdditionsFactCheckKilled == nil || *lv.AdditionsFactCheckKilled != 2 || lv.AdditionsCheck != nil {
+		t.Errorf("readout second run = %s/%v resolved %s, want done/2 resolved null", strOrNil(lv.AdditionsFactCheck), lv.AdditionsFactCheckKilled, strOrNil(lv.AdditionsCheck))
 	}
 }

@@ -249,6 +249,23 @@ LIMIT 1;
 -- identical fail-conservative treatment when dispatched_event_id itself is
 -- NULL (should be unreachable -- a turn being verdicted is by definition
 -- already dispatched -- but never assumed).
+--
+-- # The upper bound (§26.6's amendment)
+--
+-- The lower bound alone assumes an earlier turn is over once a later one
+-- is dispatched. It is not always: a turn that exceeds TurnDeadline is
+-- marked failed without its agent being stopped, the next turn goes to
+-- the same sandbox at the same gen, and the first turn's late verdict is
+-- still resolved by its own message id. Its trace, bounded below only,
+-- then holds the later turn's sub-tasks too -- and every review runs a
+-- first fact-check, which would read as the earlier turn's second run
+-- over its counter-review's additions. So the read is also bounded above,
+-- by next_dispatched_event_id: the watermark of the next turn dispatched
+-- on the session (GetNextTurnDispatchedEventID, queries/turns.sql), NULL
+-- when there is none. Every event of that later turn has an id above its
+-- watermark, so `id <= next_dispatched_event_id` excludes all of them.
+-- The cost is the safe one: work the earlier turn did after the later one
+-- was dispatched is excluded too, so its additions read "not found".
 
 -- name: ListSubTaskStartEventsForTurn :many
 SELECT * FROM events
@@ -256,6 +273,7 @@ WHERE session_id = $1
   AND type = 'sub_task_start'
   AND (payload->>'gen')::int = sqlc.arg('gen')::int
   AND id > sqlc.arg('dispatched_event_id')::bigint
+  AND (sqlc.narg('next_dispatched_event_id')::bigint IS NULL OR id <= sqlc.narg('next_dispatched_event_id')::bigint)
 ORDER BY id ASC;
 
 -- name: ListSubTaskFinishEventsForTurn :many
@@ -264,6 +282,7 @@ WHERE session_id = $1
   AND type = 'sub_task_finish'
   AND (payload->>'gen')::int = sqlc.arg('gen')::int
   AND id > sqlc.arg('dispatched_event_id')::bigint
+  AND (sqlc.narg('next_dispatched_event_id')::bigint IS NULL OR id <= sqlc.narg('next_dispatched_event_id')::bigint)
 ORDER BY id ASC;
 
 -- name: MaxEventIDForSession :one

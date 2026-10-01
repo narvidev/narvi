@@ -2128,7 +2128,7 @@ func TestSeedProcessingDeepPathTurn_StampsWatermarkBelowItsOwnEvents(t *testing.
 	}
 
 	// The REAL production query, at the seeded gen and watermark, finds it.
-	starts, err := rig.events.ListSubTaskStartsForTurn(ctx, session.ID, *turnRow.DispatchedSandboxGen, *turnRow.DispatchedEventID)
+	starts, err := rig.events.ListSubTaskStartsForTurn(ctx, session.ID, *turnRow.DispatchedSandboxGen, *turnRow.DispatchedEventID, nil)
 	if err != nil {
 		t.Fatalf("ListSubTaskStartsForTurn: %v", err)
 	}
@@ -2141,12 +2141,31 @@ func TestSeedProcessingDeepPathTurn_StampsWatermarkBelowItsOwnEvents(t *testing.
 	// them. Without this, the assertion above would still pass against a
 	// query that had quietly stopped filtering at all.
 	raised := minSeededID
-	excluded, err := rig.events.ListSubTaskStartsForTurn(ctx, session.ID, *turnRow.DispatchedSandboxGen, raised)
+	excluded, err := rig.events.ListSubTaskStartsForTurn(ctx, session.ID, *turnRow.DispatchedSandboxGen, raised, nil)
 	if err != nil {
 		t.Fatalf("ListSubTaskStartsForTurn (raised watermark): %v", err)
 	}
 	if len(excluded) != 0 {
 		t.Errorf("raising the watermark to %d still returned %d sub_task_start row(s): the id > dispatched_event_id bound is not actually filtering", raised, len(excluded))
+	}
+
+	// The upper bound (a later turn's watermark) filters too: one below
+	// those same events excludes them, one at or above them keeps them.
+	below := minSeededID - 1
+	capped, err := rig.events.ListSubTaskStartsForTurn(ctx, session.ID, *turnRow.DispatchedSandboxGen, *turnRow.DispatchedEventID, &below)
+	if err != nil {
+		t.Fatalf("ListSubTaskStartsForTurn (upper bound below): %v", err)
+	}
+	if len(capped) != 0 {
+		t.Errorf("an upper bound of %d still returned %d sub_task_start row(s) above it: the id <= next_dispatched_event_id bound is not actually filtering", below, len(capped))
+	}
+	atOrAbove := minSeededID
+	kept, err := rig.events.ListSubTaskStartsForTurn(ctx, session.ID, *turnRow.DispatchedSandboxGen, *turnRow.DispatchedEventID, &atOrAbove)
+	if err != nil {
+		t.Fatalf("ListSubTaskStartsForTurn (upper bound at): %v", err)
+	}
+	if len(kept) != len(starts) {
+		t.Errorf("an upper bound at the seeded start's own id returned %d row(s), want %d: the bound must include the row it names", len(kept), len(starts))
 	}
 }
 
