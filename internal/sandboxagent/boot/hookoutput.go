@@ -78,11 +78,17 @@ type outputTail struct {
 	// half of a genuine CRLF split across two Write calls and must be
 	// swallowed rather than read as a further, empty line boundary.
 	afterCR bool
+
+	// indexByte is the byte search Write scans p with: bytes.IndexByte,
+	// always, in production. It is a field so a test can count the bytes
+	// one Write examines, which proves Write linear by an operation count
+	// rather than by timing it (hookoutput_internal_test.go).
+	indexByte func(b []byte, c byte) int
 }
 
 // newOutputTail returns a ready, empty outputTail.
 func newOutputTail() *outputTail {
-	return &outputTail{}
+	return &outputTail{indexByte: bytes.IndexByte}
 }
 
 // indexLineBoundary reports the index and byte width of the first line
@@ -104,13 +110,15 @@ func newOutputTail() *outputTail {
 // Write's k line boundaries (an O(k·n) blowup that only a newline-only
 // buffer -- one with no '\r' anywhere to short-circuit the full scan -- was
 // large enough to expose).
-func indexLineBoundary(p []byte) (idx, width int) {
-	nl := bytes.IndexByte(p, '\n')
+//
+// indexByte is the byte search to scan with (outputTail.indexByte).
+func indexLineBoundary(p []byte, indexByte func(b []byte, c byte) int) (idx, width int) {
+	nl := indexByte(p, '\n')
 	var cr int
 	if nl >= 0 {
-		cr = bytes.IndexByte(p[:nl], '\r')
+		cr = indexByte(p[:nl], '\r')
 	} else {
-		cr = bytes.IndexByte(p, '\r')
+		cr = indexByte(p, '\r')
 	}
 	if nl < 0 && cr < 0 {
 		return -1, 0
@@ -152,7 +160,7 @@ func (t *outputTail) Write(p []byte) (int, error) {
 	}
 
 	for len(p) > 0 {
-		idx, width := indexLineBoundary(p)
+		idx, width := indexLineBoundary(p, t.indexByte)
 		if idx < 0 {
 			break
 		}

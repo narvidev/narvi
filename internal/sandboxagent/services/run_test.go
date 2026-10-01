@@ -78,6 +78,28 @@ func tcpListenerCmd(port int, delaySeconds float64) string {
 	)
 }
 
+// gatedListenerCmd is a real, separate process (python3) that binds port
+// at once but calls listen() only once gateFile exists, or at once when
+// gateFile is empty. A bound socket that is not listening refuses
+// connections, so the readiness check sees the service as not ready
+// until the gate opens -- the test decides when that is, not a sleep.
+// Binding first also keeps the port, which freePort only proved free for
+// an instant, from going to another process while the gate is shut.
+func gatedListenerCmd(port int, gateFile string) string {
+	program := strings.Join([]string{
+		"import os, socket, time",
+		"s = socket.socket()",
+		"s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
+		fmt.Sprintf(`s.bind(("127.0.0.1", %d))`, port),
+		fmt.Sprintf("gate = %q", gateFile),
+		"while gate and not os.path.exists(gate):",
+		"    time.sleep(0.01)",
+		"s.listen(1)",
+		"time.sleep(30)",
+	}, "\n")
+	return "exec python3 -c '" + program + "'"
+}
+
 // probeEnvAndListenCmd is a real, separate process (python3) that writes
 // NARVI_SESSION_CONFIG's own value as seen by ITS OWN os.environ (or the
 // literal "ABSENT" if unset/empty) to probeFile, then opens a real TCP
@@ -146,6 +168,12 @@ func (c *eventCollector) report(e services.BootProgressEvent) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.events = append(c.events, e)
+}
+
+func (c *eventCollector) all() []services.BootProgressEvent {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]services.BootProgressEvent(nil), c.events...)
 }
 
 func (c *eventCollector) forService(name string) []services.BootProgressEvent {
@@ -463,83 +491,92 @@ func TestRun_PrimaryTimeoutIsFatal(t *testing.T) {
 	assertSequence(t, collector, "slow-primary", services.PhaseTimeout)
 }
 
-// TestRun_ServicesRunConcurrently proves the three services' readiness
-// waits overlap rather than run one at a time: total elapsed must stay
-// close to the SLOWEST individual delay, nowhere near the SUM of all
-// three.
+// TestRun_ServicesRunConcurrently proves, by order and not by elapsed
+// time, that Run starts every service before any of them is ready and
+// waits on their readiness concurrently, not one service at a time.
+//
+// Each service binds its port at once but listens only when the test
+// opens its gate, and the test opens the gates from its own reporter in
+// reverse manifest order. "third" listens at once. "second" listens once
+// Run has reported "third" ready. "first" listens once Run has reported
+// "second" ready. The chain completes only if the wait on "first" is
+// still running while the waits on the other two resolve.
+//
+// Two sequential forms of Run would both fail here. One spawns a service
+// and waits for it before spawning the next. The other spawns them all
+// and then waits on each in turn. Either way the wait on "first" never
+// ends, because its gate opens only after a later wait has ended. It
+// times out, and Run returns an error.
+//
+// So the readiness timeout below only detects a hang. The passing path
+// does not have to beat it: nothing in the chain waits on a clock, and a
+// loaded runner only makes the chain slower.
+//
+// An earlier form of this test bounded Run's elapsed time by the sum of
+// three staggered sleeps. That is a wall-clock bound over interpreter
+// start-up, and a busy runner broke it with the code correct ("Run()
+// took 2.206698958s, want well under the sequential sum 2s").
 func TestRun_ServicesRunConcurrently(t *testing.T) {
 	t.Parallel()
 
-	// fastDelay/mediumDelay are deliberately larger than the minimum
-	// needed to prove ordering -- this widens the gap between sumOfDelays
-	// (the sequential-would-take bound below) and slowestDelay (the actual
-	// concurrent wall-clock bound, since real elapsed time is governed by
-	// the slowest service, not by fast/medium) without changing the test's
-	// own real-world runtime at all. A previously tighter margin (0.6s
-	// medium against a 2.0s sum) produced a real, observed CI flake
-	// ("Run() took 2.206698958s, want well under the sequential sum 2s")
-	// on a resource-contended runner, confirmed non-reproducing in 5 clean
-	// local reruns immediately after -- process-spawn/scheduling jitter
-	// under contention, not a genuine concurrency regression. Widening
-	// this margin (2.7s sum vs. the same 1.4s slowest/actual-runtime
-	// bound) is the fix.
-	const (
-		fastDelay   = 0.4
-		mediumDelay = 0.9
-		slowDelay   = 1.4
-	)
+	gateDir := t.TempDir()
+	gate := func(name string) string { return filepath.Join(gateDir, "open-"+name) }
 
-	portFast := freePort(t)
-	portMedium := freePort(t)
-	portSlow := freePort(t)
+	// Run reporting the key ready opens the value's gate.
+	opensOnReady := map[string]string{"third": "second", "second": "first"}
+
+	manifest := servicemanifest.Manifest{}
+	for _, name := range []string{"first", "second", "third"} {
+		port := freePort(t)
+		gateFile := gate(name)
+		if name == "third" {
+			gateFile = "" // the head of the chain: listens at once
+		}
+		manifest.Services = append(manifest.Services, servicemanifest.Service{
+			Name:        name,
+			Cmd:         gatedListenerCmd(port, gateFile),
+			Readiness:   servicemanifest.Readiness{Port: intPtr(port)},
+			Criticality: servicemanifest.CriticalityPrimary,
+		})
+	}
 
 	sup := supervisor.New()
 	stopAllOnCleanup(t, sup)
 
-	manifest := servicemanifest.Manifest{Services: []servicemanifest.Service{
-		{
-			Name:        "fast",
-			Cmd:         tcpListenerCmd(portFast, fastDelay),
-			Readiness:   servicemanifest.Readiness{Port: intPtr(portFast)},
-			Criticality: servicemanifest.CriticalityPrimary,
-		},
-		{
-			Name:        "medium",
-			Cmd:         tcpListenerCmd(portMedium, mediumDelay),
-			Readiness:   servicemanifest.Readiness{Port: intPtr(portMedium)},
-			Criticality: servicemanifest.CriticalityPrimary,
-		},
-		{
-			Name:        "slow",
-			Cmd:         tcpListenerCmd(portSlow, slowDelay),
-			Readiness:   servicemanifest.Readiness{Port: intPtr(portSlow)},
-			Criticality: servicemanifest.CriticalityPrimary,
-		},
-	}}
-
 	collector := &eventCollector{}
+	reporter := func(e services.BootProgressEvent) {
+		collector.report(e)
+		if e.Phase != services.PhaseReady {
+			return
+		}
+		if next, ok := opensOnReady[e.ServiceName]; ok {
+			if err := os.WriteFile(gate(next), nil, 0o600); err != nil {
+				t.Errorf("open %s's gate: %v", next, err)
+			}
+		}
+	}
 
-	start := time.Now()
-	err := services.Run(context.Background(), sup, t.TempDir(), manifest, nil, collector.report,
-		5*time.Second, 50*time.Millisecond, nil)
-	elapsed := time.Since(start)
-
+	err := services.Run(context.Background(), sup, t.TempDir(), manifest, nil, reporter,
+		30*time.Second, 50*time.Millisecond, nil)
 	if err != nil {
-		t.Fatalf("Run() error = %v, want nil", err)
+		t.Fatalf("Run() error = %v, want nil -- a readiness wait that never ended means Run waited on its services one at a time", err)
 	}
 
-	assertSequence(t, collector, "fast", services.PhaseReady)
-	assertSequence(t, collector, "medium", services.PhaseReady)
-	assertSequence(t, collector, "slow", services.PhaseReady)
-
-	sumOfDelays := time.Duration((fastDelay + mediumDelay + slowDelay) * float64(time.Second))
-	if elapsed >= sumOfDelays {
-		t.Errorf("Run() took %v, want well under the sequential sum %v -- services did not run concurrently",
-			elapsed, sumOfDelays)
+	want := []services.BootProgressEvent{
+		{ServiceName: "first", Phase: services.PhaseStarting},
+		{ServiceName: "second", Phase: services.PhaseStarting},
+		{ServiceName: "third", Phase: services.PhaseStarting},
+		{ServiceName: "third", Phase: services.PhaseReady},
+		{ServiceName: "second", Phase: services.PhaseReady},
+		{ServiceName: "first", Phase: services.PhaseReady},
 	}
-
-	slowestDelay := time.Duration(slowDelay * float64(time.Second))
-	if elapsed < slowestDelay {
-		t.Errorf("Run() took %v, want at least the slowest individual delay %v", elapsed, slowestDelay)
+	got := collector.all()
+	if len(got) != len(want) {
+		t.Fatalf("events = %+v, want every service started before any is ready, then ready in reverse order: %+v", got, want)
+	}
+	for i := range want {
+		if got[i].ServiceName != want[i].ServiceName || got[i].Phase != want[i].Phase || got[i].Err != nil {
+			t.Errorf("event[%d] = %+v, want %+v (all events: %+v)", i, got[i], want[i], got)
+		}
 	}
 }

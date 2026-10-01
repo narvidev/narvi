@@ -15,16 +15,12 @@ import (
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
+// writeScript writes a /bin/sh script with body at path, through
+// boot.WriteExecutableForTest -- the writer that keeps a concurrent
+// test's fork from making the script ETXTBSY (see its doc comment).
 func writeScript(t *testing.T, path, body string) {
 	t.Helper()
-
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	content := "#!/bin/sh\n" + body + "\n"
-	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	boot.WriteExecutableForTest(t, path, []byte("#!/bin/sh\n"+body+"\n"))
 }
 
 func assertFileExists(t *testing.T, path string) {

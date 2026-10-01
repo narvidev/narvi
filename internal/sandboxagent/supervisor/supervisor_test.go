@@ -63,6 +63,54 @@ func TestSpawn_NonexistentPath(t *testing.T) {
 	}
 }
 
+// TestSupervisor_SpawnCount proves SpawnCount counts every Spawn call, one
+// whose process never started included, and nothing else -- stopping the
+// processes leaves it as it was. A test asserting that a code path spawned
+// nothing (cmd/sandbox-agent's push rejection test) relies on both halves:
+// a count that missed a call would let a spawn through unseen.
+func TestSupervisor_SpawnCount(t *testing.T) {
+	t.Parallel()
+
+	const (
+		starts = "/bin/sh"
+		fails  = "/nonexistent/narvi-test-binary-xyz"
+	)
+
+	tests := []struct {
+		name  string
+		paths []string
+		want  int
+	}{
+		{name: "nothing spawned", paths: nil, want: 0},
+		{name: "one process that starts", paths: []string{starts}, want: 1},
+		{name: "one spawn that fails to start", paths: []string{fails}, want: 1},
+		{name: "starts and failures together", paths: []string{starts, fails, starts}, want: 3},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			sup := New()
+			for _, path := range tc.paths {
+				_, _ = sup.Spawn(Spec{Path: path, Args: []string{"-c", "exit 0"}})
+			}
+			if got := sup.SpawnCount(); got != tc.want {
+				t.Errorf("SpawnCount() after spawning %v = %d, want %d", tc.paths, got, tc.want)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := sup.StopAll(ctx, time.Second); err != nil {
+				t.Fatalf("StopAll() error = %v", err)
+			}
+			if got := sup.SpawnCount(); got != tc.want {
+				t.Errorf("SpawnCount() after StopAll = %d, want %d unchanged", got, tc.want)
+			}
+		})
+	}
+}
+
 func TestWait_ContextDeadlineExceeded(t *testing.T) {
 	t.Parallel()
 

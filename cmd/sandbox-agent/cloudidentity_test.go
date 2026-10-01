@@ -622,42 +622,9 @@ func TestRunCloudIdentityRefreshLoop_EmptyStatesBlocksThenReturnsOnCtxDone(t *te
 // exactly what applyCloudIdentityBinding minted, via a fake CP client
 // (no real network dependency).
 //
-// On the 5-second hookTimeout below: this test (with its
-// TestOIDCClusterBindingTokenReachesRealSpawnedHook sibling,
-// kubeconfig_test.go) failed once under a fully-loaded local `make test`
-// with concurrent compile load and passed in isolation immediately after.
-// Measured, twice, before touching the ceiling: two independent full `go
-// test -race ./...` runs (the same concurrent-load shape that produced
-// the original failure, on a machine already at a 2x-oversubscribed load
-// average from unrelated concurrent work) both timed this test's actual
-// setup.sh round trip at 0.32s -- under 7% of the 5s budget, identical
-// across both runs.
-//
-// That measurement is real, but it is not the whole picture: a third
-// attempt, this one made WHILE gate-checking the fix these comments
-// belong to, reproduced the original failure outright (5.01s, this exact
-// test, under an ordinary `go test -race ./...`) -- so this is a live,
-// intermittent risk, not a closed one, and the two clean timings above
-// should not be read as if they were. What changed the conclusion from
-// "raise it" to "leave it, and say why" is where the 5s is actually
-// spent: runHook's hookCtx starts only AFTER supervisor.Spawn returns
-// (hooks.go) -- fork/exec latency is not inside this budget at all --
-// and Process.Wait (process.go) blocks on a channel a background reaper
-// goroutine closes once it observes the child has exited, not on the
-// child directly. Under -race, with GOMAXPROCS-many other
-// race-instrumented goroutines contending for real OS threads on an
-// oversubscribed machine, that reaper goroutine can itself go
-// unscheduled for seconds even after the (sub-millisecond) `cat` it is
-// waiting on has already exited. That is Go-runtime/OS scheduling
-// contention on a shared box, not a floor on how long a real setup.sh
-// spawn legitimately needs -- so it has no principled worst-case bound a
-// bigger constant would reliably clear, and picking one anyway (5s
-// clearly wasn't enough; is 10s? 30s?) would be exactly the ungrounded
-// guess this Step's own row warns against, bought at the cost of a
-// slower failure signal for a setup.sh that is genuinely hung. Left at
-// 5s: rare, environment-dependent, and a real fix (if one is wanted)
-// is a scheduling-isolation or retry-on-timeout design change, not a
-// bigger number here.
+// The hook runs through runSpawnedSetupHook, which treats a hook timeout
+// as inconclusive and runs the hook again -- see its doc comment for why
+// a timeout here says nothing about the token.
 func TestCloudIdentityTokenReachesRealSpawnedHook(t *testing.T) {
 	dir := t.TempDir()
 	m := &fakeMinter{tokens: map[string]credentials.MintedCloudIdentityToken{"sts.amazonaws.com": {Token: "real-spawned-process-jwt"}}}
@@ -672,12 +639,7 @@ func TestCloudIdentityTokenReachesRealSpawnedHook(t *testing.T) {
 	writeCloudIdentityTestScript(t, filepath.Join(workspaceDir, "repo-a", "setup.sh"),
 		`cat "$AWS_WEB_IDENTITY_TOKEN_FILE" > `+probeFile)
 
-	sup := supervisor.New()
-	repos := []boot.RepoInfo{{Name: "repo-a", Primary: true}}
-
-	err := boot.RunHooks(context.Background(), sup, workspaceDir, repos, sandboxboot.BootModeBuild, nil, nil, env,
-		func(_, _, _ string, _, _ bool, _ float64) {}, 5*time.Second, time.Second, time.Millisecond)
-	if err != nil {
+	if err := runSpawnedSetupHook(t, workspaceDir, env, probeFile); err != nil {
 		t.Fatalf("RunHooks() error = %v, want nil", err)
 	}
 
@@ -691,6 +653,59 @@ func TestCloudIdentityTokenReachesRealSpawnedHook(t *testing.T) {
 }
 
 // --- test helpers ---
+
+// spawnedHookTimeout is the hook budget each runSpawnedSetupHook attempt
+// gets. It is a hang detector, not a bound these tests exist to check:
+// production's own is HookTimeout, ten minutes.
+const spawnedHookTimeout = 5 * time.Second
+
+// spawnedHookAttempts is how many hook timeouts in a row runSpawnedSetupHook
+// sits through before it reports the last one as the result.
+const spawnedHookAttempts = 3
+
+// runSpawnedSetupHook runs workspaceDir's repo-a setup.sh for real, through
+// boot.RunHooks in build mode with env threaded in, and returns RunHooks'
+// result. It treats a hook timeout as inconclusive and runs the hook again,
+// up to spawnedHookAttempts times. Any other outcome is decisive on the
+// spot: success, a spawn failure, or a non-zero exit. A token path that is
+// broken therefore still fails on the first attempt, and a setup.sh that
+// really hangs still fails, after spawnedHookAttempts timeouts, each one
+// logged.
+//
+// A timeout says nothing about the token. runHook's budget starts only
+// after Spawn returns, so it does not cover fork/exec. It is spent in
+// Process.Wait, which blocks on a channel that the supervisor's reaper
+// goroutine closes once it has observed the exit. Under -race, on a
+// machine loaded by other test binaries, the scheduler can leave that
+// goroutine unrun for seconds after the script itself has finished. Both
+// tests below have timed out that way at 5.01s, on a script measured at
+// 0.32s in the same kind of run. No ceiling bounds a scheduling delay, so
+// a bigger number would only make the wait longer. A second attempt takes
+// a new sample of the scheduler instead.
+//
+// The probe file is removed before every attempt, so the content a test
+// asserts afterwards was written by the attempt that succeeded.
+func runSpawnedSetupHook(t *testing.T, workspaceDir string, env []string, probeFile string) error {
+	t.Helper()
+
+	repos := []boot.RepoInfo{{Name: "repo-a", Primary: true}}
+	var err error
+	for attempt := 1; attempt <= spawnedHookAttempts; attempt++ {
+		if rmErr := os.Remove(probeFile); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			t.Fatalf("remove probe file before attempt %d: %v", attempt, rmErr)
+		}
+
+		start := time.Now()
+		err = boot.RunHooks(context.Background(), supervisor.New(), workspaceDir, repos, sandboxboot.BootModeBuild, nil, nil, env,
+			func(_, _, _ string, _, _ bool, _ float64) {}, spawnedHookTimeout, time.Second, time.Millisecond)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			return err
+		}
+		t.Logf("attempt %d of %d: setup.sh did not finish inside %s (%s elapsed), inconclusive: %v",
+			attempt, spawnedHookAttempts, spawnedHookTimeout, time.Since(start).Round(time.Millisecond), err)
+	}
+	return err
+}
 
 func writeCloudIdentityTestScript(t *testing.T, path, body string) {
 	t.Helper()

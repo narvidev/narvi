@@ -1,11 +1,11 @@
 package boot
 
 import (
+	"bytes"
 	"fmt"
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -25,105 +25,81 @@ import (
 // (no '\r' anywhere, so nothing ever short-circuits a full remaining-buffer
 // scan for it) must cost ~O(n), not ~O(k·n).
 //
-// This is exactly the failure scenario the review measured directly before
-// the fix: L=20,000 -> 38.6ms; L=40,000 -> 135.5ms (~3.5x, not ~2x);
-// L=80,000 -> 528.5ms (~3.9x again) -- quadratic, not linear.
+// The review measured the quadratic form before the fix: L=20,000 took
+// 38.6ms, L=40,000 took 135.5ms and L=80,000 took 528.5ms.
 //
-// # Why this measures TWO independent step ratios, not one
+// # Why an operation count, not a timing
 //
-// The first version of this test asserted an absolute bound (the 4x case
-// must finish under 400ms) -- flaky the moment the machine was busy: it
-// failed at 491ms on a host running other work, with the implementation
-// perfectly correct. A second version replaced that with a single ratio
-// over one 4x step (20k -> 80k, minimum of several repeats each) -- still
-// occasionally flaky under REAL CI contention, not just a busy dev laptop:
-// CI run 30831633470 measured this same, unchanged, genuinely-linear
-// implementation at 9.84x against that version's 8.0x threshold, while a
-// wholly unrelated package's own test was independently hanging the whole
-// runner for ten minutes on a stuck Docker call in the same job -- entirely
-// plausible contention for this test's own measurement window to land in.
+// Write's cost is its byte searches, so this counts the bytes they examine
+// -- through outputTail.indexByte, the one seam production fills with
+// bytes.IndexByte -- and bounds that count by the input's size. A search
+// for c examines every byte up to and including the first c it finds, or
+// all of b when there is none. The count is a property of the algorithm
+// alone: no load, GC pause or race-detector overhead can move it, so it
+// can be asserted exactly instead of with headroom.
 //
-// A single ratio over one step cannot tell "the algorithm regressed" apart
-// from "one of the two measurements got unlucky". Per this test's own
-// existing reasoning below (the MINIMUM of several repeats, since
-// scheduling noise/GC/page faults can only ever make a run slower, never
-// faster), an unlucky measurement always moves the SAME direction: slower.
-// Three sizes across two independent 2x steps (small->mid, mid->large)
-// closes this: mid is the only measurement shared by both steps -- the
-// numerator of one and the denominator of the other -- so inflating mid
-// alone pushes step1 (mid/small) UP but step2 (large/mid) DOWN, and
-// inflating small or large alone affects only ONE step, leaving the other
-// unchanged. A single noisy sample can therefore only ever push ONE of the
-// two step ratios toward false failure, never both at once. A genuine
-// O(k·n) regression does the opposite: every size scales quadratically
-// relative to its predecessor, so BOTH steps land near the same elevated
-// ratio, consistently. Requiring BOTH independent steps to breach threshold
-// before failing catches a real regression exactly as reliably as the old
-// single-ratio check, while making the actual CI-observed failure mode --
-// one sample, one step, unlucky -- structurally unable to fail the test on
-// its own.
+// The bound is two examined bytes per input byte, at every size. The '\n'
+// search examines a line up to its terminator, and the '\r' search,
+// bounded to p[:nl], examines the same line again short of the terminator:
+// 21 bytes for each 11-byte line here. The quadratic form re-scans the
+// whole remainder for '\r' at every line, about n²/22 bytes for n input
+// bytes. At L=20,000 that is over 2·10⁹ against a bound of 440,000, so the
+// regression cannot hide inside the bound at any size in the table.
+//
+// The two earlier forms of this test timed Write. One asserted an absolute
+// bound and one a ratio across input sizes. Both failed on busy machines
+// with the implementation correct: 491ms against a 400ms bound, then
+// 9.84x against an 8.0x ratio on CI.
 func TestIndexLineBoundary_WriteNewlineOnlyLinesScalesLinearly(t *testing.T) {
-	measureOnce := func(lines int) time.Duration {
-		var buf strings.Builder
-		buf.Grow(lines * 11)
-		for i := 0; i < lines; i++ {
-			buf.WriteString("0123456789\n")
-		}
-		p := []byte(buf.String())
+	t.Parallel()
 
-		tail := newOutputTail()
-		start := time.Now()
-		if _, err := tail.Write(p); err != nil {
-			t.Fatalf("Write() error = %v, want nil", err)
-		}
-		return time.Since(start)
+	// maxExaminedPerByte is the linear bound: each input byte is examined
+	// at most once by the '\n' search and once by the '\r' search.
+	const maxExaminedPerByte = 2
+
+	tests := []struct {
+		name  string
+		lines int
+	}{
+		{name: "one line", lines: 1},
+		{name: "1,000 lines", lines: 1_000},
+		{name: "20,000 lines", lines: 20_000},
+		{name: "40,000 lines", lines: 40_000},
+		{name: "80,000 lines", lines: 80_000},
 	}
 
-	// Repeats are cheap here (the largest case is well under a second even
-	// quadratically) and buy a much steadier estimate than a single sample.
-	const repeats = 5
-	measureMin := func(lines int) time.Duration {
-		best := measureOnce(lines)
-		for i := 1; i < repeats; i++ {
-			if d := measureOnce(lines); d < best {
-				best = d
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			p := []byte(strings.Repeat("0123456789\n", tc.lines))
+
+			examined := 0
+			tail := newOutputTail()
+			tail.indexByte = func(b []byte, c byte) int {
+				i := bytes.IndexByte(b, c)
+				if i < 0 {
+					examined += len(b)
+				} else {
+					examined += i + 1
+				}
+				return i
 			}
-		}
-		return best
-	}
 
-	const small = 20_000
-	const mid = 2 * small // 40,000 -- first 2x step
-	const large = 2 * mid // 80,000 -- second 2x step; same 4x-from-small the review originally measured overall
+			if _, err := tail.Write(p); err != nil {
+				t.Fatalf("Write() error = %v, want nil", err)
+			}
 
-	// Warm up (page faults, allocator warm-up, GC) so the first measured
-	// call isn't penalized relative to the rest.
-	_ = measureOnce(1_000)
-
-	smallElapsed := measureMin(small)
-	midElapsed := measureMin(mid)
-	largeElapsed := measureMin(large)
-
-	if smallElapsed <= 0 || midElapsed <= 0 {
-		t.Fatalf("Write(%d lines) = %v, Write(%d lines) = %v -- clock resolution too coarse to compare against",
-			small, smallElapsed, mid, midElapsed)
-	}
-	step1 := float64(midElapsed) / float64(smallElapsed)
-	step2 := float64(largeElapsed) / float64(midElapsed)
-
-	t.Logf("min of %d: Write(%d)=%v Write(%d)=%v Write(%d)=%v (step1 %.2fx, step2 %.2fx)",
-		repeats, small, smallElapsed, mid, midElapsed, large, largeElapsed, step1, step2)
-
-	// Quadratic scaling over a 2x step lands near 4x; linear scaling lands
-	// near 2x. 3.0 sits clear of both while leaving real headroom for
-	// per-measurement noise -- and, per this test's own doc comment above,
-	// BOTH independent steps must breach it before this fails, not just
-	// one.
-	const maxStepRatio = 3.0
-	if step1 > maxStepRatio && step2 > maxStepRatio {
-		t.Errorf("Write() time ratio exceeded %.1fx on BOTH independent 2x input-size steps "+
-			"(%d->%d = %.2fx, %d->%d = %.2fx) -- O(k·n) regression?",
-			maxStepRatio, small, mid, step1, mid, large, step2)
+			if limit := maxExaminedPerByte * len(p); examined > limit {
+				t.Errorf("Write(%d newline-only lines, %d bytes) examined %d bytes, want at most %d "+
+					"(%d per input byte) -- O(k·n) regression?",
+					tc.lines, len(p), examined, limit, maxExaminedPerByte)
+			}
+			if got, want := len(tail.Lines()), min(tc.lines, hookOutputTailMaxLines); got != want {
+				t.Errorf("Lines() kept %d lines, want %d -- the count above must be over a Write that did its work",
+					got, want)
+			}
+		})
 	}
 }
 

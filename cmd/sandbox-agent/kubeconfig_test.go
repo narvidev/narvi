@@ -13,10 +13,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/narvidev/narvi/internal/domain/sandboxboot"
-	"github.com/narvidev/narvi/internal/sandboxagent/boot"
 	"github.com/narvidev/narvi/internal/sandboxagent/credentials"
-	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
 )
 
 func strPtrKC(s string) *string { return &s }
@@ -341,17 +338,10 @@ func TestApplyClusterBinding_KubeconfigPermissions(t *testing.T) {
 // with no subcommand, no exec plugin, and no re-exposure of the
 // sandbox's own bearer token anywhere in that process tree.
 //
-// On the 5-second hookTimeout below: see
-// TestCloudIdentityTokenReachesRealSpawnedHook's own doc comment
-// (cloudidentity_test.go) for the full measurement and the reasoning for
-// leaving it unchanged -- both tests failed together on the original
-// (2026-09-03) loaded run this Step's own row records, both were
-// re-measured together at 0.32-0.33s under two independent full-suite
-// runs, and this test's own timing stayed clean (0.41s) on the third
-// attempt where its sibling reproduced the original failure outright --
-// consistent with the sibling comment's own point that this is
-// goroutine-scheduling contention on a shared machine, not a deterministic
-// property of either script.
+// The hook runs through runSpawnedSetupHook (cloudidentity_test.go), which
+// treats a hook timeout as inconclusive and runs the hook again -- the two
+// tests timed out together under load, and a timeout says nothing about
+// the token either reaches.
 func TestOIDCClusterBindingTokenReachesRealSpawnedHook(t *testing.T) {
 	dir := t.TempDir()
 	params, _ := json.Marshal(map[string]string{"clientId": "real-spawn-client"})
@@ -381,12 +371,7 @@ func TestOIDCClusterBindingTokenReachesRealSpawnedHook(t *testing.T) {
 	writeCloudIdentityTestScript(t, filepath.Join(workspaceDir, "repo-a", "setup.sh"),
 		`token_file=$(grep 'tokenFile:' "$KUBECONFIG" | awk '{print $2}'); cat "$token_file" > `+probeFile)
 
-	sup := supervisor.New()
-	repos := []boot.RepoInfo{{Name: "repo-a", Primary: true}}
-
-	err := boot.RunHooks(context.Background(), sup, workspaceDir, repos, sandboxboot.BootModeBuild, nil, nil, env,
-		func(_, _, _ string, _, _ bool, _ float64) {}, 5*time.Second, time.Second, time.Millisecond)
-	if err != nil {
+	if err := runSpawnedSetupHook(t, workspaceDir, env, probeFile); err != nil {
 		t.Fatalf("RunHooks() error = %v, want nil", err)
 	}
 

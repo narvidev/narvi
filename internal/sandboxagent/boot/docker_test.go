@@ -2,14 +2,10 @@ package boot_test
 
 import (
 	"context"
-	"errors"
 	"fmt"
-	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
 	"time"
 
@@ -51,7 +47,8 @@ func (c *eventCollector) all() []services.BootProgressEvent {
 // socket file appearing") -- then sleeps long enough for the test to
 // observe it, unless exitCode is non-zero, in which case it exits
 // immediately instead (never creating the socket, simulating a crash
-// before readiness).
+// before readiness). It is written through boot.WriteExecutableForTest,
+// so a concurrent test's fork cannot leave it ETXTBSY for RunDocker.
 func fakeDockerdScript(t *testing.T, delaySeconds float64, socketPath string, createSocket bool, exitCode int) string {
 	t.Helper()
 	dir := t.TempDir()
@@ -67,10 +64,7 @@ func fakeDockerdScript(t *testing.T, delaySeconds float64, socketPath string, cr
 		body = fmt.Sprintf("#!/bin/sh\nsleep %v\nsleep 30\n", delaySeconds)
 	}
 
-	if err := os.WriteFile(scriptPath, []byte(body), 0o755); err != nil {
-		t.Fatalf("write fake dockerd script: %v", err)
-	}
-	waitExecutable(t, scriptPath)
+	boot.WriteExecutableForTest(t, scriptPath, []byte(body))
 	return scriptPath
 }
 
@@ -211,44 +205,5 @@ func TestRunDocker_SpawnFailureReportsFailedAndReturnsError(t *testing.T) {
 	events := collector.all()
 	if len(events) != 2 || events[1].Phase != services.PhaseFailed {
 		t.Fatalf("events = %+v, want [Starting, Failed]", events)
-	}
-}
-
-// waitExecutable drains the ETXTBSY window before a freshly-written
-// script is handed to code that will exec it.
-//
-// os.WriteFile closes its own descriptor, so this is not about THIS
-// goroutine. It is Go's long-standing fork/exec race (golang/go#22315):
-// a concurrent test in this package writes its own script, and any
-// fork+exec happening in that instant inherits the still-open write
-// descriptor. The inode then has a writer as far as the kernel is
-// concerned, and exec'ing it returns ETXTBSY -- from an unrelated test,
-// for a file that test wrote correctly.
-//
-// That surfaced as a CI-only failure on one shard while every local run
-// passed, which is exactly how this class hides: the race needs enough
-// parallel forks to land inside a window measured in microseconds.
-//
-// RunDocker itself must NOT retry this -- a real dockerd binary is never
-// being written, so ETXTBSY there is a genuine anomaly worth surfacing,
-// and teaching production to paper over it would be the wrong fix for a
-// problem only tests create. So the wait lives here, in the helper that
-// creates the condition.
-func waitExecutable(t *testing.T, path string) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for {
-		cmd := exec.Command(path, "--narvi-exec-probe")
-		err := cmd.Run()
-		if !errors.Is(err, syscall.ETXTBSY) {
-			// Any other outcome -- success, a non-zero exit, a shell
-			// error -- means exec itself worked, which is all this waits
-			// for. The script's own behavior is the test's business.
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("fake dockerd script %s still ETXTBSY after 2s; a writer descriptor was never released", path)
-		}
-		time.Sleep(5 * time.Millisecond)
 	}
 }
