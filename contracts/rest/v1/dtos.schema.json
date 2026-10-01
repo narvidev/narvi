@@ -1259,7 +1259,7 @@
             "string",
             "null"
           ],
-          "description": "\u00a726.6's amendment: the pass of the review that produced this finding -- 'primary' (the primary reviewer, put through the first fact-check run) or 'counter_review' (an addition the counter-reviewer surfaced on its own, deep path only, which the first fact-check run never saw). Schema-optional, like counterReview, and application-level REQUIRED on every posted finding (internal/domain/reviewpost.ValidateVerdictInput's ErrInvalidFindingSource); 'counter_review' is refused off the deep path (ErrCounterReviewAdditionOffDeepPath). Self-reported: the server records it as the payload states it (review_findings.reported_source). A 'counter_review' finding is published as checked only when the server finds, in the turn's own sub-task trace, a fact-check sub-task that started after the counter-review and completed; otherwise it is published marked unverified and counted apart."
+          "description": "\u00a726.6's amendment: the pass of the review that produced this finding -- 'primary' (the primary reviewer, put through the first fact-check run) or 'counter_review' (an addition the counter-reviewer surfaced on its own, deep path only, which the first fact-check run never saw). Optional on the wire, and a value that is present must be 'primary' or 'counter_review' (internal/domain/reviewpost.ValidateVerdictInput's ErrInvalidFindingSource); 'counter_review' is refused off the deep path (ErrCounterReviewAdditionOffDeepPath). Absent is admitted because the verdict body follows the review prompt, which is rendered once, when the turn is created, and re-sent as stored: a turn rendered before this field existed posts its findings without it. Such a finding is stored with no source recorded -- read as neither primary nor an addition, exactly like a finding last published before sources were recorded. Self-reported: the server records it as the payload states it (review_findings.reported_source). A 'counter_review' finding is published as checked only when the server finds, in the turn's own sub-task trace, a fact-check sub-task that started after the counter-review and completed; otherwise it is published marked unverified and counted apart."
         }
       }
     },
@@ -1709,7 +1709,7 @@
         },
         "additionsCheck": {
           "type": ["string", "null"],
-          "description": "\u00a726.6's amendment: the server's resolution of this verdict's counter-review additions -- 'checked' (a fact-check sub-task that started after the counter-review and completed is in the turn's own trace, and the reviewer reported the run done), 'not_run' (the reviewer reported no such run), 'not_found' (reported, and the trace read when the verdict was posted held none), or 'unconfirmed' (the trace could not be read in full); null when there was nothing to resolve. Unconstrained here for the same reason counterReview is. Every value but 'checked' means the additions were published marked unverified."
+          "description": "\u00a726.6's amendment: the server's resolution of this verdict's counter-review additions -- 'checked' (a fact-check sub-task that started after the counter-review and completed is in the turn's own trace, and the reviewer reported the run done), 'not_run' (the reviewer reported no such run), 'not_found' (reported, and the trace read when the verdict was posted held none), or 'unconfirmed' (the trace could not be read in full). Null when the verdict published no counter-review addition -- a light-path verdict, a deep one whose counter-review added nothing, one whose second run removed every addition (additionsFactCheck and additionsFactCheckKilled still say so), or one posted before this field existed -- since there was then nothing to resolve. Unconstrained here for the same reason counterReview is. So a value is present only when additions were published, and every value but 'checked' means they were published marked unverified."
         },
         "headSha": {
           "type": "string",
@@ -1770,7 +1770,7 @@
         },
         "source": {
           "type": ["string", "null"],
-          "description": "\u00a726.6's amendment: the pass the finding's latest publication reported producing it -- 'primary' or 'counter_review' (self-reported, review_findings.reported_source). Null when no source was recorded: the finding was last published before sources were recorded, and reads as neither."
+          "description": "\u00a726.6's amendment: the pass the finding's latest publication reported producing it -- 'primary' or 'counter_review' (self-reported, review_findings.reported_source). Null when no source was recorded: the finding was last published before sources were recorded, or by a turn whose prompt was rendered before they were (a posted finding with no source), and reads as neither."
         },
         "additionCheck": {
           "type": ["string", "null"],
@@ -2435,7 +2435,7 @@
       "properties": {
         "source": {
           "type": "string",
-          "description": "'primary', 'counter_review' (an addition the server counted as checked), 'counter_review_unverified' (an addition it could not: counted apart), or 'not_recorded' (a finding last published before sources were recorded). The source is self-reported by the reviewer. Unconstrained here, like ReviewReadoutVerdict.counterReview, so a later bucket is not a breaking change."
+          "description": "'primary', 'counter_review' (an addition the server counted as checked), 'counter_review_unverified' (an addition it could not: counted apart), or 'not_recorded' (a finding last published with no source recorded: before sources were recorded, or by a turn whose prompt was rendered before they were). The source is self-reported by the reviewer. Unconstrained here, like ReviewReadoutVerdict.counterReview, so a later bucket is not a breaking change."
         },
         "status": {
           "type": "string",
@@ -4550,7 +4550,14 @@
             "integer",
             "null"
           ],
-          "description": "Count of still-open (never rebutted/fixed) review findings on this PR. Set for any PR-shaped row -- see ciGreen's own description -- UNLESS the count itself could not be determined (a store error) -- a transient failure fails the *eligibility computation* closed (treated internally as though a blocking finding were present) but that fail-closed sentinel must never be presented on the wire as an honest, real count, so this is null in that case instead, never the synthetic value used internally."
+          "description": "Count of still-open (never rebutted/fixed) review findings on this PR, as a client shows it: every one EXCEPT the counter-review additions the server could not count as checked, which unverifiedAdditions counts apart (\u00a726.6's amendment), so the row agrees with the Code review view. A display count only: the merge gate's own open-findings count (\u00a726.5) is unchanged and includes those additions, so a row can be blocked by an open finding while this reads 0 and unverifiedAdditions does not. Set for any PR-shaped row -- see ciGreen's own description -- UNLESS the count itself could not be determined (a store error) -- a transient failure fails the *eligibility computation* closed (treated internally as though a blocking finding were present) but that fail-closed sentinel must never be presented on the wire as an honest, real count, so this is null in that case instead, never the synthetic value used internally."
+        },
+        "unverifiedAdditions": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "\u00a726.6's amendment: count of still-open counter-review additions on this PR that the server could not count as checked -- shown apart from findings, never in it, as the posted comment, the readout and the Code review view count them. A display count: they block merge exactly like any other open finding (\u00a726.5). Set whenever findings is, on any PR-shaped row; null or absent when findings is null, and on a row that is not a pull request."
         },
         "isHandoff": {
           "type": [

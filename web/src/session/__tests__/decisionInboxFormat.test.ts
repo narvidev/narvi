@@ -10,6 +10,7 @@ import {
   formatDecisionLatencySeconds,
   hasAcceptedOverride,
   prChipData,
+  findingCountsText,
   provenanceText,
   releaseChipData,
   rowKeyFor,
@@ -123,6 +124,21 @@ describe('riskLabel chips via prChipData -- the wire value is "review:high-risk"
     const chips = prChipData({ riskLabel: 'review:high-risk', findings: 2, ciGreen: true, hasChangesRequested: false, acceptanceId: null })
     expect(chips[0]).toEqual({ tone: 'crit', text: 'review: high risk · 2 findings' })
     expect(chips).toContainEqual({ tone: 'ok', text: 'CI green' })
+  })
+
+  // §26.6's amendment: unverified counter-review additions are shown apart
+  // from the findings count, as the Code review view counts them.
+  it('unverified additions are shown apart from the findings count, never in it', () => {
+    const chips = prChipData({ riskLabel: 'review:low-risk', findings: 1, unverifiedAdditions: 2, ciGreen: true, hasChangesRequested: false, acceptanceId: null })
+    expect(chips[0]).toEqual({ tone: 'ok', text: 'review: low risk · 1 finding · 2 unverified' })
+  })
+
+  it('only unverified additions: no findings count, the unverified count alone', () => {
+    expect(prChipData({ riskLabel: 'review:low-risk', findings: 0, unverifiedAdditions: 1, ciGreen: true, hasChangesRequested: false, acceptanceId: null })[0]).toEqual({
+      tone: 'ok',
+      text: 'review: low risk · 1 unverified',
+    })
+    expect(prChipData({ riskLabel: null, findings: 0, unverifiedAdditions: 3, ciGreen: null, hasChangesRequested: false, acceptanceId: null })).toContainEqual({ tone: 'warn', text: '3 unverified' })
   })
 
   it('a low-risk label with zero findings omits the findings suffix', () => {
@@ -398,5 +414,19 @@ describe('rowKeyFor -- a stable, collision-free React key per row shape', () => 
   })
   it('keys a session row by sessionId', () => {
     expect(rowKeyFor(baseItem({ sessionId: 's1' }))).toBe('session:s1')
+  })
+})
+
+describe('findingCountsText (§26.6)', () => {
+  it('names the findings, then the unverified additions apart', () => {
+    expect(findingCountsText({ findings: 2, unverifiedAdditions: 1 })).toBe('2 findings · 1 unverified')
+    expect(findingCountsText({ findings: 1, unverifiedAdditions: 0 })).toBe('1 finding')
+    expect(findingCountsText({ findings: 0, unverifiedAdditions: 2 })).toBe('2 unverified')
+  })
+
+  it('says nothing when there is neither, or the count is unknown', () => {
+    expect(findingCountsText({ findings: 0, unverifiedAdditions: 0 })).toBe('')
+    expect(findingCountsText({ findings: 0 })).toBe('')
+    expect(findingCountsText({ findings: null, unverifiedAdditions: 2 })).toBe('')
   })
 })

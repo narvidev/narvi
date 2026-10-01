@@ -1636,4 +1636,7 @@ func TestListDecisionInbox_FindingsUnknownRendersNullNotTheFailClosedSentinel(t 
 	if row.Findings != nil {
 		t.Errorf("Findings = %d, want nil -- the internal fail-closed sentinel (openFindingsUnknownFailClosed) must never be rendered on the wire as an honest, real count", *row.Findings)
 	}
+	if row.UnverifiedAdditions != nil {
+		t.Errorf("UnverifiedAdditions = %d, want nil -- an unknown findings count leaves its unverified split unknown too", *row.UnverifiedAdditions)
+	}
 }

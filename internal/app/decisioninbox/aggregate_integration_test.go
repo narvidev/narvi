@@ -1370,6 +1370,115 @@ func TestBuild_PRLabelVariations(t *testing.T) {
 	}
 }
 
+// TestBuild_UnverifiedAdditionsCountedApartFromFindings (§26.6's
+// amendment): the inbox row shows the counter-review additions the server
+// could not count as checked apart from its findings count -- as the Code
+// review view does -- while the merge gate still counts them. Three PRs,
+// each shaped like TestBuild_FullScenario's ready_to_merge PR #10
+// (platform-authored, low-risk, CI green, assigned, an auto verdict at its
+// head): #30 has a primary finding, a finding with no source recorded, a
+// checked addition and two unverified ones, plus a rebutted unverified one
+// that counts nowhere; #31 has only an unverified addition, so it shows no
+// finding yet is still kept out of ready_to_merge; #32 has none, and is
+// ready to merge, so the fixture is otherwise eligible.
+func TestBuild_UnverifiedAdditionsCountedApartFromFindings(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	tokenKey := []byte("01234567890123456789012345678901")
+	const actorGitHubExternalID = "3001"
+	actor := decisionInboxActorFixture(ctx, t, pool, "unverified-additions-actor@example.com", actorGitHubExternalID, tokenKey)
+
+	const repo = "acme/widgets"
+	artifacts := narvipg.NewArtifactStore(pool)
+	platformSession, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub, CreatedBy: actor.ID})
+	if err != nil {
+		t.Fatalf("create platform session: %v", err)
+	}
+	var openPRs []ports.OpenPR
+	for _, number := range []int{30, 31, 32} {
+		htmlURL := fmt.Sprintf("https://github.com/acme/widgets/pull/%d", number)
+		headSHA := fmt.Sprintf("sha%d", number)
+		if _, err := artifacts.Create(ctx, sqlcgen.CreateArtifactParams{SessionID: platformSession.ID, Type: sqlcgen.ArtifactTypePr, Url: htmlURL, Metadata: []byte("{}")}); err != nil {
+			t.Fatalf("mark PR #%d platform-authored: %v", number, err)
+		}
+		seedAutoApprovedVerdict(ctx, t, pool, repo, int32(number), headSHA)
+		openPRs = append(openPRs, ports.OpenPR{
+			Owner: "acme", Repo: "widgets", Number: number, Title: fmt.Sprintf("PR %d", number),
+			HTMLURL: htmlURL, HeadSHA: headSHA,
+			BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA,
+			Assignees:    []ports.PRPerson{{ExternalID: actorGitHubExternalID, Login: "actor"}},
+			CIConclusion: ports.CIConclusionSuccess,
+			Labels:       []string{"review:low-risk"},
+			CreatedAt:    time.Now().Add(-time.Hour),
+		})
+	}
+
+	reviewFindings := narvipg.NewReviewFindingStore(pool)
+	str := func(s string) *string { return &s }
+	seed := func(pr int32, hash string, source, check *string) {
+		t.Helper()
+		if _, err := reviewFindings.Upsert(ctx, sqlcgen.UpsertReviewFindingParams{
+			RepoFullName: repo, PrNumber: pr, IdentityHash: hash, Severity: "medium", FilePath: "internal/foo.go",
+			Description: "finding " + hash, ReportedSource: source, AdditionCheck: check,
+		}); err != nil {
+			t.Fatalf("seed finding %s: %v", hash, err)
+		}
+	}
+	seed(30, "primary", str("primary"), nil)
+	seed(30, "no-source", nil, nil)
+	seed(30, "checked-addition", str("counter_review"), str("checked"))
+	seed(30, "unverified-1", str("counter_review"), str("not_found"))
+	seed(30, "unverified-2", str("counter_review"), str("unconfirmed"))
+	seed(30, "unverified-rebutted", str("counter_review"), str("not_run"))
+	if _, err := reviewFindings.MarkRebutted(ctx, repo, 30, "unverified-rebutted", "Not a real defect.", actor.ID); err != nil {
+		t.Fatalf("rebut finding: %v", err)
+	}
+	seed(31, "unverified-only", str("counter_review"), str("not_run"))
+
+	deps := decisioninbox.Deps{
+		GitHubOutbound: testBotOutbound,
+		Plans:          narvipg.NewPlanStore(pool), Sessions: narvipg.NewSessionStore(pool), Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: reviewFindings, SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: artifacts, Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(&fakeDecisionInboxSourceControl{openPRsByExternalID: map[string][]ports.OpenPR{actorGitHubExternalID: openPRs}}, platform.DefaultTimeouts()),
+		TokenEncryptionKey: tokenKey,
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool), ReviewFindings: reviewFindings, AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+	result, err := decisioninbox.Build(ctx, deps, actor.ID, authz.RoleMember, time.Now())
+	if err != nil {
+		t.Fatalf("Build() error = %v, want nil", err)
+	}
+
+	tests := []struct {
+		pr             int
+		wantFindings   int
+		wantUnverified int
+		wantKind       decisioninboxdomain.Kind
+	}{
+		{30, 3, 2, decisioninboxdomain.KindNeedsReview},
+		{31, 0, 1, decisioninboxdomain.KindNeedsReview},
+		{32, 0, 0, decisioninboxdomain.KindReadyToMerge},
+	}
+	for _, tt := range tests {
+		item := findItemByPR(result.Items, tt.pr)
+		if item == nil {
+			t.Errorf("PR #%d missing from the inbox entirely", tt.pr)
+			continue
+		}
+		if item.FindingsUnknown {
+			t.Errorf("PR #%d FindingsUnknown = true, want a real count", tt.pr)
+		}
+		if item.Findings != tt.wantFindings || item.UnverifiedAdditions != tt.wantUnverified {
+			t.Errorf("PR #%d Findings = %d, UnverifiedAdditions = %d; want %d, %d", tt.pr, item.Findings, item.UnverifiedAdditions, tt.wantFindings, tt.wantUnverified)
+		}
+		if item.Kind != tt.wantKind {
+			t.Errorf("PR #%d Kind = %s, want %s (the merge gate counts unverified additions like any open finding)", tt.pr, item.Kind, tt.wantKind)
+		}
+	}
+}
+
 // decisionInboxActorFixture creates a fresh member actor with a linked
 // GitHub identity -- the setup every test below this point repeats
 // verbatim, factored out once these three new tests made the duplication

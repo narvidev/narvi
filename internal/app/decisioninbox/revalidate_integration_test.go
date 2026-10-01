@@ -787,6 +787,35 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 	})
 
+	// §26.6's amendment: the inbox shows an unverified counter-review
+	// addition apart from its findings count, but the merge gate counts it
+	// like any other open finding (§26.5) -- a PR whose only open finding
+	// is one such addition is refused.
+	t.Run("OnlyAnUnverifiedAdditionOpen_Refused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-unverified-addition"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 110)
+		rs.replaceTargetPR(actorGitHubID, pr)
+		source, check := "counter_review", "not_found"
+		if _, err := narvipg.NewReviewFindingStore(pool).Upsert(ctx, sqlcgen.UpsertReviewFindingParams{
+			RepoFullName: repoFullName, PrNumber: int32(pr.Number), IdentityHash: "unverified-addition",
+			Severity: "high", FilePath: "internal/foo.go", Description: "an addition no second fact-check covered",
+			ReportedSource: &source, AdditionCheck: &check,
+		}); err != nil {
+			t.Fatalf("seed unverified addition: %v", err)
+		}
+
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false (an unverified addition blocks merge like any other open finding)")
+		}
+		if reason == "" {
+			t.Error("reason is empty, want a human-readable explanation")
+		}
+	})
+
 	// (§21.2) note: classifyPRLabels' own "most restrictive risk
 	// label wins" property is no longer
 	// observable through RevalidateForMerge's own ok/refused OUTCOME --
