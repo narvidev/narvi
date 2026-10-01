@@ -74,6 +74,7 @@ import {
   asToolResult,
   asWarning,
 } from './eventPayloads'
+import { asSandboxStatusChange, endsBootPhase } from './sandboxSnapshot'
 
 export interface SubTaskNode {
   subTaskId: string
@@ -142,10 +143,24 @@ export interface TimelineModel {
   errors: (TimelineNotice & { fatal: boolean })[]
   latestTitle: string | null
   orphanedSubTasks: SubTaskNode[]
-  /** The most recent named boot_progress phase seen, or null once a 'ready' event has been seen (or none was ever reported) -- Timeline.tsx's own "session still booting" empty-state signal. */
+  /**
+   * The most recent named boot_progress phase, or null when none has been
+   * reported since the server last reported a status that ends a boot (a
+   * sandbox_status event, sandboxSnapshot.ts's endsBootPhase) -- the phase
+   * the "session still booting" empty state names. Whether the session IS
+   * still booting is the server's status, never this log's
+   * (sessionStatus.ts's isStillBooting): the agent's `ready` is the first
+   * event of a connection, ahead of the boot (technical plan §3.2), so it
+   * ends nothing here.
+   */
   latestBootPhase: string | null
-  /** True once a 'ready' event (sandbox finished booting) has been seen anywhere in the log. */
-  sawReady: boolean
+  /**
+   * True once the agent's `ready` is in the log. Read only for rollout
+   * compatibility, while the control plane reports no sandbox row
+   * (sessionStatus.ts's isStillBooting): the boot then ends there, as it
+   * did before the server reported its status.
+   */
+  sawAgentReady: boolean
 }
 
 function subTaskStatusFromOutcome(outcome: 'completed' | 'failed' | 'cancelled'): SubTaskNode['status'] {
@@ -159,7 +174,7 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
   const orphanedSubTasks: SubTaskNode[] = []
   let latestTitle: string | null = null
   let latestBootPhase: string | null = null
-  let sawReady = false
+  let sawAgentReady = false
 
   let currentTurn: TurnNode | null = null
   // Per-turn correlation state -- reset every time a new turn opens
@@ -252,9 +267,16 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
       latestBootPhase = bootProgress.phase
       continue
     }
+    // The agent's `ready` opens its connection, ahead of its boot: it
+    // ends no phase. The server's own status report does, once the boot
+    // is over -- or a new generation starts one afresh.
     if (asReady(event) !== null) {
-      sawReady = true
-      latestBootPhase = null // "Null once boot has completed" -- Heartbeat.lastBootPhase's own doc comment, mirrored here
+      sawAgentReady = true
+      continue
+    }
+    const statusChange = asSandboxStatusChange(event)
+    if (statusChange !== null) {
+      if (endsBootPhase(statusChange.status)) latestBootPhase = null
       continue
     }
     // Artifact events (pr/preview/upload) are the rail's own content
@@ -409,14 +431,14 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
       currentTurn = null // the NEXT turn-scoped event (if any) starts fresh
       continue
     }
-    // Every other recognized/unrecognized type (ready, heartbeat,
-    // boot_progress, git_sync, boot_timing, push_complete, push_error,
-    // snapshot_ready, or a genuinely unknown future type) is not part of
+    // Every other recognized/unrecognized type (heartbeat, git_sync,
+    // boot_timing, push_complete, push_error, snapshot_ready, or a
+    // genuinely unknown future type) is not part of
     // this timeline model -- session-workspace-wide status (the rail) or
     // simply out of this file's own rendering scope. Never a
     // crash either way: an unrecognized type is a documented no-op, not
     // a thrown error.
   }
 
-  return { turns, warnings, errors, latestTitle, orphanedSubTasks, latestBootPhase, sawReady }
+  return { turns, warnings, errors, latestTitle, orphanedSubTasks, latestBootPhase, sawAgentReady }
 }

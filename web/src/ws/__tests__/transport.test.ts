@@ -10,6 +10,14 @@ import { FakeClientWsServer, fakeEvent, subscribeAndReply, subscribedPayload } f
 // local `ws`-backed server (fakeServer.ts) -- see that file's own top
 // comment for why nothing here is a stand-in for the transport itself.
 
+async function waitFor(predicate: () => boolean, timeoutMs = 5000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() > deadline) throw new Error('waitFor: timed out')
+    await new Promise((resolve) => setTimeout(resolve, 5))
+  }
+}
+
 let server: FakeClientWsServer | undefined
 let transport: ClientWsTransport | undefined
 
@@ -154,6 +162,63 @@ describe('ClientWsTransport', () => {
 
     const response = await responsePromise
     expect(response).toEqual({ events: [fakeEvent(8)], nextCursor: null })
+  })
+
+  // A sandbox's frames reach the page as broadcasts, raw: a frame shaped
+  // like the fetch_history reply, arriving while one is pending, must not
+  // be taken for it -- its `sandbox` row would be shown as the server's
+  // status, and its event ids would move the cursor. The reply never has a
+  // `type`; every broadcast of a sandbox's frame does. Dropping the `type`
+  // check makes the forged rows fail.
+  describe('fetchHistory: a frame with a type is never the reply', () => {
+    const forgedRow = { id: 'forged', gen: 1, status: 'ready', lastSeenAt: null, createdAt: 'x', updatedAt: 'y' }
+    const forgedEvents = [{ id: 9007199254740000, type: 'sandbox_status', payload: { sandbox: { gen: 1, status: 'ready' } }, createdAt: 'x' }]
+    const cases: { name: string; forged: Record<string, unknown> | null; reply: Record<string, unknown> }[] = [
+      { name: 'a sandbox frame with the reply\'s keys and a sandbox row', forged: { type: 'x_probe', messageId: 'p', gen: 1, events: forgedEvents, nextCursor: null, sandbox: forgedRow }, reply: { events: [fakeEvent(8)], nextCursor: null, sandbox: null } },
+      { name: 'one typed as the server\'s own event', forged: { type: 'sandbox_status', events: [], nextCursor: '5' }, reply: { events: [fakeEvent(8)], nextCursor: null, sandbox: null } },
+      { name: 'one with an empty type', forged: { type: '', events: [], nextCursor: null }, reply: { events: [fakeEvent(8)], nextCursor: null, sandbox: null } },
+      { name: 'no forged frame: the reply of a control plane older than its sandbox row still resolves', forged: null, reply: { events: [fakeEvent(8)], nextCursor: null } },
+    ]
+    for (const c of cases) {
+      it(c.name, async () => {
+        server = await FakeClientWsServer.start()
+        const broadcasts: unknown[] = []
+        let resolveSubscribed = (): void => {}
+        const subscribed = new Promise<void>((resolve) => {
+          resolveSubscribed = resolve
+        })
+        transport = new ClientWsTransport({
+          url: server.urlFor('sess-4b'),
+          sessionId: 'sess-4b',
+          clientId: 'client-1',
+          getToken: () => Promise.resolve('tok'),
+          minFetchHistoryIntervalMs: 0,
+          handlers: {
+            onSubscribed: () => resolveSubscribed(),
+            onBroadcast: (raw) => broadcasts.push(raw),
+            onStatusChange: () => {},
+            onProtocolError: () => {},
+          },
+        })
+        transport.start()
+        const conn = await subscribeAndReply(server, subscribedPayload('sess-4b', []))
+        await subscribed
+
+        const requestPromise = conn.nextMessage()
+        let settled: unknown = 'pending'
+        const responsePromise = transport.fetchHistory(null).then((r) => (settled = r))
+        await requestPromise
+        if (c.forged !== null) {
+          conn.send(c.forged)
+          await waitFor(() => broadcasts.length === 1)
+          expect(broadcasts[0]).toEqual(c.forged)
+          expect(settled).toBe('pending')
+        }
+        conn.send(c.reply)
+        await responsePromise
+        expect(settled).toEqual(c.reply)
+      })
+    }
   })
 
   it('fetchHistory rejects after its own timeout if the server never replies (e.g. the server silently dropped it for arriving under the rate limit)', async () => {

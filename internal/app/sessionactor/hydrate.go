@@ -85,13 +85,19 @@ func (r *Registry) hydrateAndAcquire(ctx context.Context, sessionID pgtype.UUID)
 		return nil, fail("get session", err)
 	}
 
-	hasSandbox := true
-	if _, err := r.stores.sandbox.Get(hctx, sessionID); err != nil {
+	// The sandbox row also seeds what the actor last committed of it, so its
+	// first write reports a sandbox_status event only when it changes the
+	// generation or status (sandboxstatus.go).
+	var sandboxCommitted *sandboxStatusKey
+	if row, err := r.stores.sandbox.Get(hctx, sessionID); err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return nil, fail("get sandbox", err)
 		}
-		hasSandbox = false
+	} else {
+		key := sandboxStatusKeyOf(row)
+		sandboxCommitted = &key
 	}
+	hasSandbox := sandboxCommitted != nil
 
 	turns, err := r.stores.turn.ListForSession(hctx, sessionID)
 	if err != nil {
@@ -131,6 +137,7 @@ func (r *Registry) hydrateAndAcquire(ctx context.Context, sessionID pgtype.UUID)
 		repoAccessCache:        r.repoAccessCache,
 		epistemicCheckDefault:  r.epistemicCheckDefault,
 		rolloutMode:            r.rolloutMode,
+		sandboxCommitted:       sandboxCommitted,
 		registry:               r,
 		lockGen:                lockGen,
 		mailbox:                make(chan Command, mailboxBufferSize),

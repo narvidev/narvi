@@ -60,12 +60,32 @@ export interface SessionStreamSnapshot {
    * SandboxEvent: the deeper, type-checked narrowing belongs to the
    * session view layer (session/sandboxSnapshot.ts's own
    * parseSandboxSnapshot, mirroring session/eventPayloads.ts's precedent),
-   * never to this generic pipeline. Only refreshed on (re)subscribe --
-   * `state` is not re-sent on every live broadcast/backfill page, so a
-   * consumer wanting a LIVE status must layer this session's own event
-   * log on top (session/sandboxRail.ts does exactly that).
+   * never to this generic pipeline. Set on every (re)subscribe, then
+   * replaced by every fetch_history reply's own `sandbox`
+   * (FetchHistoryResponse.sandbox, the same shape, read by the server as
+   * it assembles that reply): the control plane stores and broadcasts a
+   * sandbox_status event whenever it changes the sandbox's status, and the
+   * backfill that broadcast starts brings the new row back here. So this
+   * is the status the SERVER derives, as of the latest reply -- a consumer
+   * never has to infer it from the agent's own events (technical plan
+   * §3.2: a sandbox stays booting after the agent's `ready`). A reply from
+   * a control plane older than the field carries none and leaves this as
+   * it was.
    */
   sandboxState: unknown
+  /**
+   * Rollout compatibility: whether sandboxState is the server's status as of
+   * this connection's latest reply. True from the subscribe reply on --
+   * its state.sandbox is the server's status at that moment, on a control
+   * plane of any age -- and after every fetch_history reply carrying the
+   * sandbox row (FetchHistoryResponse.sandbox, null included). False only
+   * after a reply without that key, from a control plane older than the
+   * field, which sends this page no status after the subscribe reply: the
+   * session view then reads the boot from the agent's own `ready`, as it
+   * did before the server reported it (sessionStatus.ts's isStillBooting,
+   * sandboxRail.ts), until the next subscribe.
+   */
+  serverReportsSandbox: boolean
   /**
    * The subscribe reply's own `state.correlationId` (§12.2 item 1's own
    * session-rail gap): the SESSION's own most-recently-created turn's
@@ -138,6 +158,7 @@ export class SessionStream {
   private activity: SessionActivityState = initialSessionActivityState
   private lastError: string | null = null
   private sandboxState: unknown = null
+  private serverReportsSandbox = true
   private correlationIdState: unknown = null
   private participantsState: readonly { [k: string]: unknown }[] = []
   private readonly listeners = new Set<() => void>()
@@ -212,6 +233,7 @@ export class SessionStream {
         activity: this.activity,
         lastError: this.lastError,
         sandboxState: this.sandboxState,
+        serverReportsSandbox: this.serverReportsSandbox,
         correlationIdState: this.correlationIdState,
         participantsState: this.participantsState,
       }
@@ -233,11 +255,10 @@ export class SessionStream {
 
   private handleSubscribed(payload: SubscribedPayload): void {
     // this.sandboxState is set unconditionally on every (re)subscribe --
-    // including a reconnect, which is the ONLY way this client ever
-    // learns about a sandbox transition that produced no client-visible
-    // event of its own (see sandboxRail.ts's own top comment for the full
-    // "what this can and cannot show" accounting).
+    // including a reconnect -- and then follows every fetch_history reply
+    // (runBackfill below).
     this.sandboxState = isPlainObject(payload.state) ? (payload.state.sandbox ?? null) : null
+    this.serverReportsSandbox = true
     this.correlationIdState = isPlainObject(payload.state) ? (payload.state.correlationId ?? null) : null
     this.participantsState = payload.participants
     const inserted = this.log.appendMany(parseEnvelopes(payload.events))
@@ -292,6 +313,13 @@ export class SessionStream {
           this.notify()
           return
         }
+        // The sandbox as the server holds it as it assembled this reply --
+        // newer than the subscribe reply's, and than any earlier reply's,
+        // since replies come back one at a time on this one connection.
+        // Checked by key, not value: null is a real answer (no sandbox
+        // yet), while a control plane older than the field omits it.
+        this.serverReportsSandbox = 'sandbox' in response
+        if (this.serverReportsSandbox) this.sandboxState = response.sandbox ?? null
         const inserted = this.log.appendMany(parseEnvelopes(response.events))
         this.applyNewEvents(inserted)
         if (response.nextCursor === null) break

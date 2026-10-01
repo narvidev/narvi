@@ -46,10 +46,10 @@
 //     before reading it again. No events.
 //   - GET /api/sessions/{sessionID}/events?cursor=&limit= -- events.go's
 //     ListEvents: 404 if the session doesn't exist, else 200 with
-//     restdtos.EventsResponse (shaped exactly like client-ws/v1's own
-//     FetchHistoryResponse -- the same underlying EventStore.
-//     ListForSession read the client WS hub's own fetch_history uses, one
-//     implementation, two callers).
+//     restdtos.EventsResponse (client-ws/v1's FetchHistoryResponse without
+//     its sandbox row, which is a WS concern -- the same underlying
+//     EventStore.ListForSession read the client WS hub's own fetch_history
+//     uses, one implementation, two callers).
 //   - GET /api/sessions/{sessionID}/artifacts -- artifacts.go's
 //     ListArtifacts: 404 if the session doesn't exist, else 200 with
 //     restdtos.ArtifactsResponse.

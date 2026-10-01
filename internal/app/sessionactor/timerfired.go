@@ -489,7 +489,7 @@ func (a *Actor) handleTerminalGraceTimer(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("sessionactor: sandbox transition suspect->failed: %w", err)
 		}
-		if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+		if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 			SessionID: a.sessionID,
 			Status:    sqlcgen.SandboxStatus(to),
 		}); err != nil {
@@ -673,7 +673,7 @@ func (a *Actor) transitionSandboxToSuspect(ctx context.Context, tx pgx.Tx, row s
 		return fmt.Errorf("sessionactor: sandbox transition to suspect: %w", err)
 	}
 	preSuspect := sqlcgen.SandboxStatus(row.Status)
-	if _, err := a.stores.sandbox.WithTx(tx).UpdateStatusToSuspect(ctx, sqlcgen.UpdateSandboxStatusToSuspectParams{
+	if _, err := a.sandboxWrites(tx).UpdateStatusToSuspect(ctx, sqlcgen.UpdateSandboxStatusToSuspectParams{
 		SessionID:        a.sessionID,
 		PreSuspectStatus: &preSuspect,
 	}); err != nil {

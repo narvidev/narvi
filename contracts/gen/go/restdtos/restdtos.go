@@ -3974,10 +3974,13 @@ func (j *Environment) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-// GET /api/sessions/:id/events (§6.3). Mirrors client-ws/v1's own
-// FetchHistoryResponse shape exactly, for the same reason that schema gives: the
-// full event-payload shape is assembled by later PRs, and REST/WS should not
-// diverge on this envelope.
+// GET /api/sessions/:id/events (§6.3). The envelope of client-ws/v1's
+// FetchHistoryResponse (events, nextCursor), read through the same event-store
+// query fetch_history uses, except that it deliberately omits
+// FetchHistoryResponse's required sandbox: the sandbox row a fetch_history reply
+// carries is a WS concern, what keeps an open page's sandbox status current after
+// a sandbox_status broadcast. A REST caller reads a session's sandbox status from
+// GET /api/sessions/:id/status (SessionActivity.sandboxStatus).
 type EventsResponse struct {
 	// Events corresponds to the JSON schema field "events".
 	Events []EventsResponseEventsElem `json:"events" yaml:"events" mapstructure:"events"`
@@ -11914,6 +11917,16 @@ type SessionActivity struct {
 	// first, then a workflow step, then an escalated workflow run.
 	Awaiting *SessionActivityAwaiting `json:"awaiting" yaml:"awaiting" mapstructure:"awaiting"`
 
+	// The session's open workflow escalation, whatever awaiting reports: a custom
+	// workflow's run escalated for review, open under exactly the rule awaiting.kind
+	// 'workflow_escalation' states -- while it is the session's newest workflow run,
+	// ran an attempt of its own, and no turn other than its own attempts has been
+	// created since it escalated. awaiting names one gate, a plan or a workflow step
+	// before an escalation, so an escalation open beside either is reported here and
+	// not there; a client showing which workflow run a person should look at reads it
+	// here. Null when no escalation is open, a built-in workflow's included.
+	Escalation *SessionActivityEscalation `json:"escalation" yaml:"escalation" mapstructure:"escalation"`
+
 	// The turn dispatched to a sandbox or being processed; null when none is.
 	InFlightTurn *SessionActivityInFlightTurn `json:"inFlightTurn" yaml:"inFlightTurn" mapstructure:"inFlightTurn"`
 
@@ -12082,6 +12095,43 @@ func (j *SessionActivityAwaiting) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = SessionActivityAwaiting(plain)
+	return nil
+}
+
+// The session's open workflow escalation, whatever awaiting reports: a custom
+// workflow's run escalated for review, open under exactly the rule awaiting.kind
+// 'workflow_escalation' states -- while it is the session's newest workflow run,
+// ran an attempt of its own, and no turn other than its own attempts has been
+// created since it escalated. awaiting names one gate, a plan or a workflow step
+// before an escalation, so an escalation open beside either is reported here and
+// not there; a client showing which workflow run a person should look at reads it
+// here. Null when no escalation is open, a built-in workflow's included.
+type SessionActivityEscalation struct {
+	// The escalated run's id.
+	Id string `json:"id" yaml:"id" mapstructure:"id"`
+
+	// When the run escalated.
+	Since time.Time `json:"since" yaml:"since" mapstructure:"since"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityEscalation) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["id"]; raw != nil && !ok {
+		return fmt.Errorf("field id in SessionActivityEscalation: required")
+	}
+	if _, ok := raw["since"]; raw != nil && !ok {
+		return fmt.Errorf("field since in SessionActivityEscalation: required")
+	}
+	type Plain SessionActivityEscalation
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionActivityEscalation(plain)
 	return nil
 }
 
@@ -12418,6 +12468,9 @@ func (j *SessionActivity) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["awaiting"]; raw != nil && !ok {
 		return fmt.Errorf("field awaiting in SessionActivity: required")
+	}
+	if _, ok := raw["escalation"]; raw != nil && !ok {
+		return fmt.Errorf("field escalation in SessionActivity: required")
 	}
 	if _, ok := raw["inFlightTurn"]; raw != nil && !ok {
 		return fmt.Errorf("field inFlightTurn in SessionActivity: required")
@@ -16142,6 +16195,30 @@ type WorkflowStepRunOutcomeSummary *string
 
 type WorkflowStepRunStatus string
 
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_WorkflowStepRunStatus {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_WorkflowStepRunStatus, v)
+	}
+	*j = WorkflowStepRunStatus(v)
+	return nil
+}
+
+type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
+
 const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
 const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
 const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
@@ -16217,29 +16294,5 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRun(plain)
 	return nil
 }
-
-type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
-
-// UnmarshalJSON implements json.Unmarshaler.
-func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
-	var v string
-	if err := json.Unmarshal(value, &v); err != nil {
-		return err
-	}
-	var ok bool
-	for _, expected := range enumValues_WorkflowStepRunStatus {
-		if reflect.DeepEqual(v, expected) {
-			ok = true
-			break
-		}
-	}
-	if !ok {
-		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_WorkflowStepRunStatus, v)
-	}
-	*j = WorkflowStepRunStatus(v)
-	return nil
-}
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
 
 type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict

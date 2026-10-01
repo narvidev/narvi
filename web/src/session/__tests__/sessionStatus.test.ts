@@ -57,21 +57,52 @@ describe('deriveBootProgress', () => {
 })
 
 describe('isStillBooting', () => {
-  // Named regression: caught live during this Step's own browser
-  // verification pass -- a seeded 'completed' session with zero events
-  // rendered "Sandbox is booting…" before this function existed.
-  it('is false for a completed/cancelled/failed session with no events -- there is no boot in progress to report', () => {
-    expect(isStillBooting('completed', false)).toBe(false)
-    expect(isStillBooting('cancelled', false)).toBe(false)
-    expect(isStillBooting('failed', false)).toBe(false)
-  })
+  // Technical plan §3.2: the boot is the server's status, never the event
+  // log's -- a sandbox stays booting after the agent's `ready` until its
+  // boot has run. Reading it from `ready` again (or ignoring the status)
+  // makes the "still booting after its ready" row fail.
+  const cases: { name: string; session: Parameters<typeof isStillBooting>[0]; sandbox: string | null; want: boolean }[] = [
+    { name: 'still booting after the agent\'s ready: the server says booting', session: 'active', sandbox: 'booting', want: true },
+    { name: 'a created session whose sandbox is booting', session: 'created', sandbox: 'booting', want: true },
+    { name: 'every pre-ready stage reads booting', session: 'active', sandbox: 'connecting', want: true },
+    { name: 'spawning reads booting', session: 'active', sandbox: 'spawning', want: true },
+    { name: 'pending reads booting', session: 'created', sandbox: 'pending', want: true },
+    { name: 'no sandbox yet: the first turn spawns one', session: 'created', sandbox: null, want: true },
+    { name: 'the server marked it ready', session: 'active', sandbox: 'ready', want: false },
+    { name: 'snapshotting is past the boot', session: 'active', sandbox: 'snapshotting', want: false },
+    { name: 'a suspect sandbox is not booting', session: 'active', sandbox: 'suspect', want: false },
+    { name: 'a stopped sandbox is not booting', session: 'active', sandbox: 'stopped', want: false },
+    { name: 'a failed sandbox is not booting', session: 'active', sandbox: 'failed', want: false },
+    // Named regression: caught live during the original browser
+    // verification pass -- a seeded 'completed' session with zero events
+    // rendered "Sandbox is booting…" before this function existed.
+    { name: 'a completed session has no boot in progress', session: 'completed', sandbox: 'booting', want: false },
+    { name: 'a cancelled session has no boot in progress', session: 'cancelled', sandbox: null, want: false },
+    { name: 'a failed session has no boot in progress', session: 'failed', sandbox: 'booting', want: false },
+  ]
+  for (const c of cases) {
+    it(c.name, () => {
+      expect(isStillBooting(c.session, c.sandbox)).toBe(c.want)
+      expect(isStillBooting(c.session, c.sandbox, { serverReportsSandbox: true, sawAgentReady: true }), 'the server reports the row: the agent\'s ready changes nothing').toBe(c.want)
+    })
+  }
 
-  it('is true for a created/active session that has not seen a ready event yet', () => {
-    expect(isStillBooting('created', false)).toBe(true)
-    expect(isStillBooting('active', false)).toBe(true)
-  })
-
-  it('is false once a ready event has been seen, even for an active session', () => {
-    expect(isStillBooting('active', true)).toBe(false)
-  })
+  // Rollout compatibility: a control plane older than
+  // FetchHistoryResponse.sandbox never sends the page a status after the
+  // subscribe reply. Until a reply carries the row, the agent's `ready`
+  // ends the boot, as before -- else a page subscribed while booting would
+  // read booting until its next subscribe. Dropping the fallback makes the
+  // "ready seen" rows fail; applying it once the server reports the row
+  // makes the rows above fail.
+  const rolloutCases: { name: string; session: Parameters<typeof isStillBooting>[0]; sandbox: string | null; sawAgentReady: boolean; want: boolean }[] = [
+    { name: 'no row reported, the agent\'s ready seen: the boot is over, whatever the subscribe-time status', session: 'active', sandbox: 'booting', sawAgentReady: true, want: false },
+    { name: 'no row reported, no ready yet: still booting', session: 'active', sandbox: 'booting', sawAgentReady: false, want: true },
+    { name: 'no row reported, no ready yet, a status past the boot: still booting, as before', session: 'created', sandbox: 'ready', sawAgentReady: false, want: true },
+    { name: 'no row reported: a finished session still has no boot in progress', session: 'completed', sandbox: 'booting', sawAgentReady: false, want: false },
+  ]
+  for (const c of rolloutCases) {
+    it(c.name, () => {
+      expect(isStillBooting(c.session, c.sandbox, { serverReportsSandbox: false, sawAgentReady: c.sawAgentReady })).toBe(c.want)
+    })
+  }
 })
