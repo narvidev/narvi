@@ -389,7 +389,8 @@ func findingFromRow(row sqlcgen.ReviewFinding) reviewpost.Finding {
 		f.Line = &line
 	}
 	// §26.6's amendment: both NULL on a row last published before
-	// migrations/000154, which reads as "no source recorded" -- never as
+	// migrations/000154, or posted with no source by a turn whose prompt
+	// predates sources, which reads as "no source recorded" -- never as
 	// primary, and never as an unverified addition.
 	if row.ReportedSource != nil {
 		f.Source = reviewpost.FindingSource(*row.ReportedSource)

@@ -25,11 +25,30 @@ import "github.com/narvidev/narvi/internal/domain/reviewtriage"
 // that basis (§26.5).
 type FindingSource string
 
-// The two FindingSource values a payload may carry. Required on every
-// posted finding (ValidateVerdictInput's ErrInvalidFindingSource): a
-// missing source and a garbled one are the same failure, like every other
-// closed vocabulary this package validates.
+// The FindingSource values. A payload may carry primary or
+// counter_review, or no source at all; any other value is refused
+// (ValidateVerdictInput's ErrInvalidFindingSource).
+//
+// # Why an absent source is admitted
+//
+// The verdict body's shape comes from the review prompt, and the prompt is
+// rendered once, when the turn is created (review.RenderTurnPrompt), then
+// stored with the turn and re-sent as stored on every dispatch, a
+// re-dispatch to a respawned sandbox included. A turn created by a binary
+// that predates sources -- queued, running, or re-sent while the control
+// plane is deployed -- was never told about the field, and posts its
+// findings without one. Refusing them would refuse the verdict its own
+// instructions shaped. So an absent source is recorded as not recorded,
+// the state migrations/000154 already gives a finding last published
+// before sources existed, and every reader treats the two alike: neither
+// primary nor an addition, never marked unverified, counted under
+// "not_recorded". This gives up nothing the field could protect: the
+// source is self-reported, and a reviewer could always write "primary".
 const (
+	// FindingSourceNotRecorded is a finding whose source is not recorded:
+	// posted with none, or last published before sources existed. It is
+	// never a counter-review addition.
+	FindingSourceNotRecorded FindingSource = ""
 	// FindingSourcePrimary is a finding the primary reviewer produced and
 	// put through the first fact-check run.
 	FindingSourcePrimary FindingSource = "primary"
@@ -133,31 +152,42 @@ type SecondFactCheck struct {
 	// ReportedKilled is the count the reviewer says the run removed --
 	// self-reported, like FactCheckKilled.
 	ReportedKilled int
-	// Resolved is the server's resolution, "" when there was nothing to
-	// resolve.
+	// Resolved is the server's resolution of the additions the verdict
+	// published, "" when it published none: there is then no addition to
+	// mark checked or unverified, even when a second run was reported
+	// (one that removed every addition). So a non-empty Resolved always
+	// describes published additions, and every value but AdditionChecked
+	// means they were published marked unverified.
 	Resolved AdditionCheck
 }
 
 // BuildSecondFactCheck resolves in's second fact-check run. Applicable
 // only on the deep path (ValidateVerdictInput refuses additions and a
 // second-run report anywhere else), and only when there is something to
-// resolve: the payload published a counter-review addition, or reported
-// a second run (one that killed every addition still has an outcome worth
-// recording). Every counter-review finding BuildFindings returns carries
-// this same Resolved value, so the verdict's record and its findings'
-// marks come from one resolution and cannot disagree.
+// record: the payload published a counter-review addition, or reported a
+// second run. A run that removed every addition still has an outcome
+// worth recording -- its report and kill count -- but with no addition
+// published there is nothing for the server to resolve, so Resolved stays
+// "" ("no addition published") rather than claiming unverified additions
+// that do not exist. Every counter-review finding BuildFindings returns
+// carries this same Resolved value, so the verdict's record and its
+// findings' marks come from one resolution and cannot disagree.
 func BuildSecondFactCheck(in VerdictInput) SecondFactCheck {
 	if in.ReviewDepth != reviewtriage.DepthDeep {
 		return SecondFactCheck{}
 	}
-	if !hasCounterReviewAddition(in.Findings) && in.AdditionsFactCheck == "" {
+	published := hasCounterReviewAddition(in.Findings)
+	if !published && in.AdditionsFactCheck == "" {
 		return SecondFactCheck{}
 	}
-	return SecondFactCheck{
+	out := SecondFactCheck{
 		Reported:       in.AdditionsFactCheck,
 		ReportedKilled: in.AdditionsFactCheckKilled,
-		Resolved:       ResolveAdditionCheck(in.AdditionsFactCheck, in.AdditionsTrace),
 	}
+	if published {
+		out.Resolved = ResolveAdditionCheck(in.AdditionsFactCheck, in.AdditionsTrace)
+	}
+	return out
 }
 
 // hasCounterReviewAddition reports whether any of findings says the

@@ -323,11 +323,15 @@ var (
 	ErrDigestProposedBodyTooLong        = errors.New("reviewpost: digest.proposedBody exceeds the maximum length")
 	ErrDigestContestedPointsTooLong     = errors.New("reviewpost: digest.contestedPoints exceeds the maximum length")
 	ErrDigestArchDecisionFieldTooLong   = errors.New("reviewpost: digest.archDecisions contains a field exceeding the maximum length")
-	// ErrInvalidFindingSource (§26.6's amendment): every posted finding
-	// names the pass that produced it, primary or counter_review --
-	// required, so every published finding records its source; a missing
-	// value and a garbled one are the same failure.
-	ErrInvalidFindingSource = errors.New("reviewpost: finding source must be one of primary/counter_review")
+	// ErrInvalidFindingSource (§26.6's amendment): a posted finding's
+	// source, when present, names the pass that produced it, primary or
+	// counter_review. An absent source is admitted and recorded as "source
+	// not recorded" (FindingSourceNotRecorded): a turn's prompt is rendered
+	// once, when the turn is created, so a turn rendered before sources
+	// existed posts its findings without one, and refusing them would
+	// refuse a verdict the turn's own instructions shaped. A garbled value
+	// says the payload is wrong, and is refused.
+	ErrInvalidFindingSource = errors.New("reviewpost: finding source must be one of primary/counter_review, or absent")
 	// ErrCounterReviewAdditionOffDeepPath (§26.6's amendment, §26.9): a
 	// finding sourced counter_review, or a report of the second
 	// fact-check run, on a verdict that is not deep. No counter-reviewer
@@ -603,9 +607,12 @@ func ValidateVerdictInput(in VerdictInput) error {
 
 	// Finding sources and the second fact-check run (§26.6's amendment)
 	// -- appended after the length caps, so a payload that already fails
-	// an earlier check keeps reporting the same first error. Each finding
-	// names its source; a counter-review source, or a second-run report,
-	// exists only on the deep path. On the deep path every combination is
+	// an earlier check keeps reporting the same first error. A finding's
+	// source, when present, is primary or counter_review; an absent one is
+	// recorded as not recorded (ErrInvalidFindingSource's doc comment says
+	// why it is admitted), and is never a counter-review addition. A
+	// counter-review source, or a second-run report, exists only on the
+	// deep path. On the deep path every combination is
 	// admitted, including additions beside a counter-review reported
 	// skipped: whatever the payload claims, an addition is published
 	// checked only when the server finds the second run in the trace
@@ -614,7 +621,7 @@ func ValidateVerdictInput(in VerdictInput) error {
 	// would only push a reviewer to relabel an addition primary.
 	for _, f := range in.Findings {
 		switch f.Source {
-		case FindingSourcePrimary, FindingSourceCounterReview:
+		case FindingSourceNotRecorded, FindingSourcePrimary, FindingSourceCounterReview:
 		default:
 			return ErrInvalidFindingSource
 		}

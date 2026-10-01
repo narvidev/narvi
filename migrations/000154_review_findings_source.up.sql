@@ -25,7 +25,10 @@
 -- a row is never marked unverified and keeps counting in the finding
 -- outcomes KPI as before; the per-source breakdown counts it under its own
 -- "not recorded" bucket. Its next publication by a binary with this
--- migration records both columns.
+-- migration records both columns -- unless that publication itself names
+-- no source (a turn whose prompt was rendered before sources existed,
+-- which the verdict endpoint accepts), which leaves both NULL, read the
+-- same way.
 --
 -- review_verdicts gains the second fact-check run's outcome, kept apart
 -- from the first run's (fact_check/fact_check_killed, migration 000084):
@@ -34,9 +37,10 @@
 --   - additions_fact_check_killed: the count the reviewer reported that
 --     run removed (self-reported), NULL when it reported no run.
 --   - additions_check: the server's resolution, the same vocabulary as
---     review_findings.addition_check, NULL when there was nothing to
---     resolve (not a deep review, or one whose counter-review added
---     nothing and reported no second run).
+--     review_findings.addition_check, NULL when the verdict published no
+--     counter-review addition (not a deep review, one whose counter-review
+--     added nothing, or one whose second run removed every addition), so
+--     there was nothing to resolve.
 --
 -- All nullable TEXT/INTEGER with no default and no CHECK, like every
 -- review_verdicts column since 000077: the vocabulary is validated in Go

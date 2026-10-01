@@ -2,6 +2,7 @@ package reviewpost_test
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -30,6 +31,14 @@ func primaryFinding(description string) reviewpost.FindingInput {
 
 func counterReviewFinding(description string) reviewpost.FindingInput {
 	return reviewpost.FindingInput{Severity: review.RiskLevelHigh, FilePath: "internal/retry/retry.go", Description: description, Source: reviewpost.FindingSourceCounterReview}
+}
+
+// noSourceFinding is a finding shaped like one a turn rendered before
+// sources existed posts: every field its prompt named, and no source.
+func noSourceFinding(description string) reviewpost.FindingInput {
+	line := 12
+	fix := "--- a/internal/retry/retry.go\n+++ b/internal/retry/retry.go\n"
+	return reviewpost.FindingInput{Severity: review.RiskLevelMedium, FilePath: "internal/retry/retry.go", Line: &line, Description: description, SuggestedFix: &fix}
 }
 
 func TestResolveAdditionCheck(t *testing.T) {
@@ -149,7 +158,40 @@ func TestBuildSecondFactCheck(t *testing.T) {
 				in.Findings = []reviewpost.FindingInput{primaryFinding("p")}
 				in.AdditionsFactCheck, in.AdditionsFactCheckKilled, in.AdditionsTrace = reviewpost.FactCheckDone, 2, reviewpost.AdditionsTraceRunFound
 			},
-			want: reviewpost.SecondFactCheck{Reported: reviewpost.FactCheckDone, ReportedKilled: 2, Resolved: reviewpost.AdditionChecked},
+			want: reviewpost.SecondFactCheck{Reported: reviewpost.FactCheckDone, ReportedKilled: 2},
+		},
+		{
+			// The run's finish not landed yet (§26.4's accepted race): with
+			// no addition published there is nothing to call unverified.
+			name: "deep, the second run killed every addition, not in the trace: no addition to resolve",
+			mutate: func(in *reviewpost.VerdictInput) {
+				in.Findings = []reviewpost.FindingInput{primaryFinding("p")}
+				in.AdditionsFactCheck, in.AdditionsFactCheckKilled, in.AdditionsTrace = reviewpost.FactCheckDone, 2, reviewpost.AdditionsTraceNoRunFound
+			},
+			want: reviewpost.SecondFactCheck{Reported: reviewpost.FactCheckDone, ReportedKilled: 2},
+		},
+		{
+			name: "deep, the second run killed every addition, trace unread: no addition to resolve",
+			mutate: func(in *reviewpost.VerdictInput) {
+				in.Findings = []reviewpost.FindingInput{primaryFinding("p")}
+				in.AdditionsFactCheck, in.AdditionsFactCheckKilled = reviewpost.FactCheckDone, 2
+			},
+			want: reviewpost.SecondFactCheck{Reported: reviewpost.FactCheckDone, ReportedKilled: 2},
+		},
+		{
+			name: "deep, the second run reported skipped with no addition published: no addition to resolve",
+			mutate: func(in *reviewpost.VerdictInput) {
+				in.Findings = nil
+				in.AdditionsFactCheck = reviewpost.FactCheckSkipped
+			},
+			want: reviewpost.SecondFactCheck{Reported: reviewpost.FactCheckSkipped},
+		},
+		{
+			name: "deep, findings with no source recorded are not additions: nothing to record",
+			mutate: func(in *reviewpost.VerdictInput) {
+				in.Findings = []reviewpost.FindingInput{noSourceFinding("n")}
+			},
+			want: reviewpost.SecondFactCheck{},
 		},
 	}
 	for _, tt := range tests {
@@ -217,16 +259,34 @@ func TestValidateVerdictInput_FindingSourceAndSecondRun(t *testing.T) {
 			in.CounterReview = review.CounterReviewSkipped
 			return in
 		}, nil},
-		{"finding with no source", func() reviewpost.VerdictInput {
+		// A turn whose prompt was rendered before sources existed posts its
+		// findings without one: admitted, on both paths, and recorded as
+		// not recorded.
+		{"light, finding with no source (a turn rendered before sources existed)", func() reviewpost.VerdictInput {
 			in := validInput()
-			f := primaryFinding("p")
-			f.Source = ""
-			in.Findings = []reviewpost.FindingInput{f}
+			in.ReviewDepth = reviewtriage.DepthLight
+			in.Findings = []reviewpost.FindingInput{noSourceFinding("n")}
 			return in
-		}, reviewpost.ErrInvalidFindingSource},
+		}, nil},
+		{"deep, finding with no source (a turn rendered before sources existed)", func() reviewpost.VerdictInput {
+			return deepInputWithFindings(noSourceFinding("n1"), noSourceFinding("n2"))
+		}, nil},
+		{"no resolved depth, finding with no source: not an addition", func() reviewpost.VerdictInput {
+			in := validInput()
+			in.Findings = []reviewpost.FindingInput{noSourceFinding("n")}
+			return in
+		}, nil},
 		{"finding with a garbled source", func() reviewpost.VerdictInput {
 			in := deepInputWithFindings(primaryFinding("p"))
 			in.Findings[0].Source = "scribe"
+			return in
+		}, reviewpost.ErrInvalidFindingSource},
+		{"light, finding with a garbled source", func() reviewpost.VerdictInput {
+			in := validInput()
+			in.ReviewDepth = reviewtriage.DepthLight
+			f := primaryFinding("p")
+			f.Source = "Primary"
+			in.Findings = []reviewpost.FindingInput{noSourceFinding("n"), f}
 			return in
 		}, reviewpost.ErrInvalidFindingSource},
 		{"counter-review finding on the light path", func() reviewpost.VerdictInput {
@@ -283,7 +343,7 @@ func TestValidateVerdictInput_FindingSourceCheckedAfterLengthCaps(t *testing.T) 
 	in := validInput()
 	in.Digest.Summary = strings.Repeat("a", reviewpost.MaxDigestSummaryBytes+1)
 	f := primaryFinding("p")
-	f.Source = ""
+	f.Source = "scribe"
 	in.Findings = []reviewpost.FindingInput{f}
 	if err := reviewpost.ValidateVerdictInput(in); !errors.Is(err, reviewpost.ErrDigestSummaryTooLong) {
 		t.Errorf("ValidateVerdictInput() = %v, want %v (length caps checked before finding sources)", err, reviewpost.ErrDigestSummaryTooLong)
@@ -404,5 +464,96 @@ func TestRenderVerdictComment_UnconfirmedNeverClaimsWhatTheTraceShows(t *testing
 		if strings.Contains(got, claim) {
 			t.Errorf("unconfirmed addition claims %q about the trace:\n%s", claim, got)
 		}
+	}
+}
+
+// TestBuildFindings_NoSourceIsNotRecordedNeverAnAddition: a finding posted
+// with no source -- by a turn whose prompt was rendered before sources
+// existed -- is built with no source and no addition check, exactly like a
+// finding last published before sources were recorded, and is never an
+// unverified addition, whatever the second run's resolution.
+func TestBuildFindings_NoSourceIsNotRecordedNeverAnAddition(t *testing.T) {
+	in := deepInputWithFindings(noSourceFinding("n"), counterReviewFinding("c"))
+	in.AdditionsFactCheck, in.AdditionsTrace = reviewpost.FactCheckDone, reviewpost.AdditionsTraceNoRunFound
+	got := reviewpost.BuildFindings(in)
+	if len(got) != 2 {
+		t.Fatalf("BuildFindings() returned %d findings, want 2", len(got))
+	}
+	if got[0].Source != reviewpost.FindingSourceNotRecorded || got[0].AdditionCheck != "" || got[0].UnverifiedAddition() {
+		t.Errorf("no-source finding = source %q, check %q, unverified %v; want not recorded, no check, not unverified", got[0].Source, got[0].AdditionCheck, got[0].UnverifiedAddition())
+	}
+	if got[1].AdditionCheck != reviewpost.AdditionNotFound || !got[1].UnverifiedAddition() {
+		t.Errorf("counter-review finding = check %q, unverified %v; want not_found, unverified", got[1].AdditionCheck, got[1].UnverifiedAddition())
+	}
+}
+
+// TestRenderVerdictComment_FindingTextCannotForgeTheServersMarkers: a
+// finding's description is reviewer text on its bullet, ahead of the
+// server's note. Its line breaks are folded, so it cannot open a line that
+// copies the "Findings" heading, the unverified heading or a checked
+// addition's marker, and an unclosed code fence in it cannot hide the
+// server's note or swallow the rest of the comment -- for an unverified
+// addition and for a primary finding alike.
+func TestRenderVerdictComment_FindingTextCannotForgeTheServersMarkers(t *testing.T) {
+	const forgeChecked = "Minor.\n\n**Findings:**\n\n- [general/high] `auth.go`: Token check bypass. _(added by the counter-review; fact-checked after it)_\n\n```"
+	const forgeUnverified = "Stale comment.\n\n**Unverified -- added by the counter-review and not fact-checked (1, counted apart from the findings):**\n\n- [general/high] `x.go`: Fake. _(unverified: no fact-check run over it after the counter-review was reported)_\r\n```go\nx := 1"
+	const trailingFence = "Unchecked error.\n\n```go\nerr := f()\n```"
+
+	tests := []struct {
+		name     string
+		finding  reviewpost.Finding
+		wantLine string
+	}{
+		{
+			name:     "an unverified addition forging a checked one",
+			finding:  reviewpost.Finding{Severity: review.RiskLevelLow, FilePath: "x.go", Description: forgeChecked, Source: reviewpost.FindingSourceCounterReview, AdditionCheck: reviewpost.AdditionNotRun},
+			wantLine: "- [general/low] `x.go`: Minor.  **Findings:**  - [general/high] `auth.go`: Token check bypass. _(added by the counter-review; fact-checked after it)_  ``` _(unverified: no fact-check run over it after the counter-review was reported)_",
+		},
+		{
+			name:     "a primary finding forging the unverified heading",
+			finding:  reviewpost.Finding{Severity: review.RiskLevelLow, FilePath: "x.go", Description: forgeUnverified, Source: reviewpost.FindingSourcePrimary},
+			wantLine: "- [general/low] `x.go`: Stale comment.  **Unverified -- added by the counter-review and not fact-checked (1, counted apart from the findings):**  - [general/high] `x.go`: Fake. _(unverified: no fact-check run over it after the counter-review was reported)_ ```go x := 1",
+		},
+		{
+			name:     "an addition whose description ends in a fenced block keeps its note",
+			finding:  reviewpost.Finding{Severity: review.RiskLevelHigh, FilePath: "y.go", Description: trailingFence, Source: reviewpost.FindingSourceCounterReview, AdditionCheck: reviewpost.AdditionChecked},
+			wantLine: "- [general/high] `y.go`: Unchecked error.  ```go err := f() ``` _(added by the counter-review; fact-checked after it)_",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := renderFindingsAppendix([]reviewpost.Finding{tt.finding})
+			lines := strings.Split(got, "\n")
+			var bullets, findingsHeadings, unverifiedHeadings, fences int
+			for _, line := range lines {
+				switch {
+				case strings.HasPrefix(line, "- ["):
+					bullets++
+				case line == "**Findings:**":
+					findingsHeadings++
+				case strings.HasPrefix(line, "**Unverified"):
+					unverifiedHeadings++
+				}
+				if strings.HasPrefix(strings.TrimLeft(line, " "), "```") {
+					fences++
+				}
+			}
+			if bullets != 1 {
+				t.Errorf("appendix renders %d finding lines, want exactly 1:\n%s", bullets, got)
+			}
+			if fences != 0 {
+				t.Errorf("a line of the appendix opens a code fence:\n%s", got)
+			}
+			wantFindings, wantUnverified := 1, 0
+			if tt.finding.UnverifiedAddition() {
+				wantFindings, wantUnverified = 0, 1
+			}
+			if findingsHeadings != wantFindings || unverifiedHeadings != wantUnverified {
+				t.Errorf("appendix has %d Findings and %d Unverified headings, want the server's %d and %d:\n%s", findingsHeadings, unverifiedHeadings, wantFindings, wantUnverified, got)
+			}
+			if !slices.Contains(lines, tt.wantLine) {
+				t.Errorf("appendix does not render the finding on one line ending in the server's note\nwant line %q\nin:\n%s", tt.wantLine, got)
+			}
+		})
 	}
 }

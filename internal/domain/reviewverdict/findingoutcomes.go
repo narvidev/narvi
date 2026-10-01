@@ -59,7 +59,8 @@ func FindingOutcomes(statuses []reviewpost.FindingStatus) ([]FindingStatusCount,
 // FindingOutcomeRow is one review_findings row as the finding outcomes KPI
 // reads it (§26.5/§26.6's amendment): its status, the source its latest
 // publication reported ("" when none was recorded -- a row last published
-// before migrations/000154), and the server's addition check.
+// before migrations/000154, or posted with no source by a turn whose
+// prompt predates sources), and the server's addition check.
 type FindingOutcomeRow struct {
 	Status        reviewpost.FindingStatus
 	Source        reviewpost.FindingSource

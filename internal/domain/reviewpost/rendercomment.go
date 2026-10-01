@@ -120,7 +120,8 @@ import (
 // count, and each line says why the server could not count it as checked
 // (unverifiedAdditionReason). A checked addition stays among the findings,
 // marked as the counter-review's. Every other finding -- primary, or with
-// no source recorded -- renders byte for byte as before. Nothing here
+// no source recorded -- renders as before, its description on one line
+// (below). Nothing here
 // touches the header: an unverified addition raises the Shippable class
 // exactly as much as any other finding does, which is not at all
 // (review.ComputeShippable reads no finding).
@@ -139,6 +140,23 @@ import (
 // (escapeListItemOpeners). Text with neither renders byte for byte as
 // before. Every later reviewer field sits under a heading of its own, so
 // none can place a line in the header list.
+//
+// # A finding is one line, and the server's note on it stays visible
+//
+// The findings appendix carries server-decided text: the "Findings"
+// heading, the unverified additions' heading with their count, and the
+// note on each addition (checkedAdditionNote, or the unverified reason).
+// Each finding's description is reviewer text rendered on its bullet,
+// before that note, so its line breaks are folded to spaces
+// (renderFindingLine), primary and counter-review alike, the way the
+// header's adequacy explanation already is. With no line break left, nothing
+// in a description can begin a line: it can open no list item, heading or
+// paragraph that copies the server's, and no code fence -- a fence opens
+// only at the start of a line -- so an unclosed one cannot swallow the
+// note after it, or the rest of the comment. A backtick run left open on
+// the line stays literal text, since nothing the server appends after it
+// contains a backtick to close it. A description with no line break
+// renders byte for byte as before.
 func RenderVerdictComment(v review.Verdict, shippable review.ShippableAssessment, findings []Finding, digest Digest, summary, botHandle, syncedLabel string) string {
 	var b strings.Builder
 
@@ -224,8 +242,9 @@ func RenderVerdictComment(v review.Verdict, shippable review.ShippableAssessment
 	// §26.6's amendment: a counter-review addition the server could not
 	// count as checked is listed apart, under its own heading carrying the
 	// count, and never among the findings; a checked addition stays in the
-	// list, marked as the counter-review's. A finding with any other source
-	// renders exactly as it always did.
+	// list, marked as the counter-review's. A finding with any other source,
+	// or none recorded, renders as it always did, its description folded
+	// onto its one line (renderFindingLine).
 	var listed, unverified []Finding
 	for _, f := range findings {
 		if f.UnverifiedAddition() {
@@ -259,7 +278,10 @@ func RenderVerdictComment(v review.Verdict, shippable review.ShippableAssessment
 }
 
 // renderFindingLine renders one finding as its appendix bullet, then
-// note (server text, "" for none) after its description.
+// note (server text, "" for none) after its description. The description's
+// line breaks are folded to spaces, so the finding is exactly one line and
+// nothing in it can begin a line of its own (RenderVerdictComment's "A
+// finding is one line").
 //
 // §22.1.1: StartLine/EndLine (server-computed, content-anchored --
 // position.go) are the ONLY position ever rendered here once they exist.
@@ -274,7 +296,7 @@ func renderFindingLine(f Finding, note string) string {
 	if f.SentinelKind != nil {
 		kind = string(*f.SentinelKind)
 	}
-	description := escapeFindingDescription(f.Description)
+	description := escapeFindingDescription(foldLineBreaks(f.Description))
 	filePath := escapeFilePathForCodeSpan(f.FilePath)
 	switch {
 	case f.StartLine != 0 && f.StartLine == f.EndLine:
@@ -367,10 +389,12 @@ func renderShippableBlockers(blockers []review.Blocker) string {
 // one space.
 var lineBreakFolder = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ")
 
-// foldLineBreaks keeps a one-line reviewer field on the one line the
-// header renders it on (RenderVerdictComment's "The header's reviewer
-// text cannot open a list item there"): with no line break left, nothing
-// in it can begin a line, so nothing in it can open a list item.
+// foldLineBreaks keeps a one-line reviewer field on the one line it is
+// rendered on -- the header's adequacy explanation (RenderVerdictComment's
+// "The header's reviewer text cannot open a list item there") and each
+// finding's description in the appendix ("A finding is one line"): with
+// no line break left, nothing in it can begin a line, so nothing in it can
+// open a list item, a heading or a code fence.
 func foldLineBreaks(s string) string {
 	return lineBreakFolder.Replace(s)
 }

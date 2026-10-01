@@ -193,12 +193,14 @@ type FindingInput struct {
 	// finding has no machine-suggested fix at all.
 	SuggestedFix *string
 	// Source is the pass that produced this finding, as the reviewer's
-	// payload says (§26.6's amendment, findingsource.go) -- required on
-	// every finding a verdict posts (ValidateVerdictInput, not
+	// payload says (§26.6's amendment, findingsource.go): primary or
+	// counter_review when present (ValidateVerdictInput, not
 	// ValidateFindingInput: a finding another producer builds, such as
 	// the handoff sentinel's, comes from neither pass and carries none).
-	// Never part of identity: the same issue re-reported by the other
-	// pass is the same finding.
+	// "" when the payload names none -- a turn whose prompt was rendered
+	// before sources existed (FindingSourceNotRecorded) -- and stored as
+	// "source not recorded". Never part of identity: the same issue
+	// re-reported by the other pass is the same finding.
 	Source FindingSource
 }
 
@@ -218,8 +220,9 @@ type Finding struct {
 	SuggestedFix *string
 
 	// Source is FindingInput.Source, carried verbatim -- self-reported;
-	// "" for a finding no reviewer pass produced, or a stored one first
-	// published before sources were recorded (migrations/000154).
+	// "" (FindingSourceNotRecorded) for a finding no reviewer pass
+	// produced, one posted with no source, or a stored one last published
+	// before sources were recorded (migrations/000154).
 	Source FindingSource
 	// AdditionCheck is the server's resolution for a counter-review
 	// addition (findingsource.go): set by BuildFindings, from the one
