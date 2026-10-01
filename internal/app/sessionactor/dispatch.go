@@ -2214,18 +2214,24 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainSt
 	}
 
 	if err := a.commander.SendCommand(a.sessionID.String(), plan.payload); err != nil {
-		// Covers ports.ErrNoLiveSandboxConnection (the prompt genuinely
-		// never reached a live connection) and every other send failure
-		// identically.
+		// Every send failure fails the turn the same way, with one
+		// difference. ports.ErrNoLiveSandboxConnection means SendCommand
+		// found no connection and wrote nothing, so the prompt certainly
+		// never reached the sandbox and no agent of this turn can be
+		// running: undelivered marks its synthetic execution_complete
+		// "delivered": false, and the review-verdict endpoint does not
+		// count it as an earlier turn left running
+		// (ExistsEarlierTurnLeftRunning, queries/turns.sql). Any other
+		// error may have followed a partial write, so the prompt may have
+		// arrived and the turn is left unmarked, counted as possibly still
+		// running.
 		a.logger.Error("sessionactor: dispatch turn: send prompt command failed; failing turn",
 			"turn_id", plan.turnID.String(), "error", err)
 		return a.failDispatchedTurn(ctx, plan.turnID, dispatchFailure{
 			reason:       fmt.Sprintf("failed to deliver prompt to sandbox: %v", err),
 			notAssessed:  reviewcheck.NotAssessedPromptNotDelivered,
 			backOffSince: chainStart,
-			// No live connection: SendCommand wrote nothing. Any other
-			// error may have followed a partial write.
-			undelivered: errors.Is(err, ports.ErrNoLiveSandboxConnection),
+			undelivered:  errors.Is(err, ports.ErrNoLiveSandboxConnection),
 		})
 	}
 	return nil
