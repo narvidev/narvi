@@ -1211,7 +1211,9 @@ func TestRenderTurnPrompt_CounterReviewAdditionsAreFactChecked(t *testing.T) {
 		"ONLY the additions",
 		"ONLY when the diff text alone PROVES it wrong",
 		"rests on repository context outside the diff",
-		`"additionsFactCheck": "done"`,
+		// The one instruction behind "an addition the diff disproves is not
+		// published": the server cannot see what the run disproved.
+		`Remove exactly the additions it disproved, and report "additionsFactCheck": "done"`,
 		`"additionsFactCheck": "skipped", "additionsFactCheckKilled": 0`,
 		"the cost-budget check below applies to it too",
 		"a fact-check that started after the counter-review and completed",
@@ -1224,6 +1226,8 @@ func TestRenderTurnPrompt_CounterReviewAdditionsAreFactChecked(t *testing.T) {
 
 	for _, want := range []string{
 		`"source": "primary" | "counter_review" (required`,
+		// The guard against the cheapest way around the whole rule.
+		`never relabel an addition "primary" -- an addition is published as checked only when the second fact-check run is found in this turn's trace, and as unverified otherwise`,
 		`"additionsFactCheck": "done" | "skipped" (the second fact-check run over the counter-review's additions`,
 		`"additionsFactCheckKilled": <integer, count of additions the second fact-check run removed`,
 	} {
