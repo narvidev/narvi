@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -669,8 +670,9 @@ const spawnedHookAttempts = 3
 // up to spawnedHookAttempts times. Any other outcome is decisive on the
 // spot: success, a spawn failure, or a non-zero exit. A token path that is
 // broken therefore still fails on the first attempt, and a setup.sh that
-// really hangs still fails, after spawnedHookAttempts timeouts, each one
-// logged.
+// really hangs still fails, after spawnedHookAttempts timeouts. Every
+// timeout is recorded through noteSpawnedHookTimeout, where a passing CI
+// run keeps it, so a rising rate of absorbed timeouts can be seen.
 //
 // A timeout says nothing about the token. runHook's budget starts only
 // after Spawn returns, so it does not cover fork/exec. It is spent in
@@ -701,10 +703,56 @@ func runSpawnedSetupHook(t *testing.T, workspaceDir string, env []string, probeF
 		if !errors.Is(err, context.DeadlineExceeded) {
 			return err
 		}
-		t.Logf("attempt %d of %d: setup.sh did not finish inside %s (%s elapsed), inconclusive: %v",
-			attempt, spawnedHookAttempts, spawnedHookTimeout, time.Since(start).Round(time.Millisecond), err)
+		next := "retrying"
+		if attempt == spawnedHookAttempts {
+			next = "no attempts left, failing"
+		}
+		noteSpawnedHookTimeout(t, fmt.Sprintf("attempt %d of %d: setup.sh did not finish inside %s (%s elapsed), inconclusive, %s: %v",
+			attempt, spawnedHookAttempts, spawnedHookTimeout, time.Since(start).Round(time.Millisecond), next, err))
 	}
 	return err
+}
+
+// spawnedHookTimeoutLabel starts every line noteSpawnedHookTimeout writes,
+// so the lines can be found and counted.
+const spawnedHookTimeoutLabel = "SPAWNED-HOOK TIMEOUT"
+
+// noteSpawnedHookTimeout records one timed-out runSpawnedSetupHook attempt
+// in three places. A retry that absorbs the timeout keeps the test
+// passing, and `go test` run over a package list -- `make test`, and every
+// CI job -- prints only the ok line for a package that passes, dropping its
+// t.Log output and its stderr alike. Without the step summary, an absorbed
+// timeout would leave no trace in CI, and a rising rate of them would go
+// unseen.
+//
+//   - t.Log, as every test logs, shown with -v or when the test fails.
+//   - stderr, labelled, shown with -v, in single-directory mode and when
+//     the package fails.
+//   - The file GITHUB_STEP_SUMMARY names, when it is set, as it is in every
+//     GitHub Actions step. GitHub shows that file on the run's summary page
+//     whether the step passed or failed. Failing to append to it is logged,
+//     never fatal: the note must not change the test's outcome.
+func noteSpawnedHookTimeout(t *testing.T, line string) {
+	t.Helper()
+
+	t.Log(line)
+	fmt.Fprintf(os.Stderr, "%s: %s: %s\n", spawnedHookTimeoutLabel, t.Name(), line)
+
+	summary := os.Getenv("GITHUB_STEP_SUMMARY")
+	if summary == "" {
+		return
+	}
+	f, err := os.OpenFile(summary, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Logf("append to GITHUB_STEP_SUMMARY: %v", err)
+		return
+	}
+	if _, err := fmt.Fprintf(f, "- **%s** `%s`: %s\n", spawnedHookTimeoutLabel, t.Name(), line); err != nil {
+		t.Logf("append to GITHUB_STEP_SUMMARY: %v", err)
+	}
+	if err := f.Close(); err != nil {
+		t.Logf("close GITHUB_STEP_SUMMARY: %v", err)
+	}
 }
 
 func writeCloudIdentityTestScript(t *testing.T, path, body string) {

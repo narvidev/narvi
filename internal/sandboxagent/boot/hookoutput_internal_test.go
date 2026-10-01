@@ -3,6 +3,7 @@ package boot
 import (
 	"bytes"
 	"fmt"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -28,34 +29,59 @@ import (
 // The review measured the quadratic form before the fix: L=20,000 took
 // 38.6ms, L=40,000 took 135.5ms and L=80,000 took 528.5ms.
 //
-// # Why an operation count, not a timing
+// # What it proves, without a clock
 //
-// Write's cost is its byte searches, so this counts the bytes they examine
-// -- through outputTail.indexByte, the one seam production fills with
-// bytes.IndexByte -- and bounds that count by the input's size. A search
-// for c examines every byte up to and including the first c it finds, or
-// all of b when there is none. The count is a property of the algorithm
-// alone: no load, GC pause or race-detector overhead can move it, so it
-// can be asserted exactly instead of with headroom.
+// It counts what Write does instead of timing it, on two axes.
 //
-// The bound is two examined bytes per input byte, at every size. The '\n'
-// search examines a line up to its terminator, and the '\r' search,
-// bounded to p[:nl], examines the same line again short of the terminator:
-// 21 bytes for each 11-byte line here. The quadratic form re-scans the
-// whole remainder for '\r' at every line, about n²/22 bytes for n input
-// bytes. At L=20,000 that is over 2·10⁹ against a bound of 440,000, so the
-// regression cannot hide inside the bound at any size in the table.
+// Searching. The test fills outputTail.indexByte with a search that counts
+// the bytes it examines: every byte up to and including the first match,
+// or all of b when there is none. At every size, one Write of newline-only
+// lines must examine between one and two bytes per input byte. The '\n'
+// search alone has to see every input byte, so the lower bound proves the
+// searches go through the counted seam at all. The upper bound is two
+// passes over each line: the '\n' search to its terminator, and the '\r'
+// search, bounded to p[:nl], over the same line short of it. That makes 21
+// bytes for each 11-byte line here. Re-scanning the whole remainder for
+// '\r' at every line examines about n²/22 bytes, over 2·10⁹ at L=20,000
+// against a bound of 440,000.
+//
+// Copying. Write must read each line out of p, never copy the remainder
+// on each boundary -- the shape of the original bug, which neither search
+// count sees. The bytes one Write allocates (runtime.MemStats.TotalAlloc)
+// must therefore grow with its input: quadrupling the input from 20,000
+// to 80,000 lines may at most multiply them by eight. That is linear (4x)
+// with 2x headroom. A per-boundary copy of the remainder multiplies them
+// by about fifteen. The bound compares two sizes rather than fixing bytes
+// per input byte, because the race detector raises the absolute figure
+// about a hundredfold: sync.Pool, which the ANSI strip's regexp uses,
+// drops items at random under -race. TotalAlloc is process-wide, so this
+// test is not parallel.
+//
+// It does not prove anything about CPU spent outside both axes -- a loop
+// over the remainder that neither searches through the seam nor allocates
+// would not show here.
 //
 // The two earlier forms of this test timed Write. One asserted an absolute
 // bound and one a ratio across input sizes. Both failed on busy machines
 // with the implementation correct: 491ms against a 400ms bound, then
 // 9.84x against an 8.0x ratio on CI.
 func TestIndexLineBoundary_WriteNewlineOnlyLinesScalesLinearly(t *testing.T) {
-	t.Parallel()
+	// Not parallel: the allocation bound reads runtime.MemStats.TotalAlloc,
+	// which counts every goroutine's allocations, so it needs the process
+	// to itself. A sequential top-level test runs while every parallel one
+	// is still paused.
 
-	// maxExaminedPerByte is the linear bound: each input byte is examined
-	// at most once by the '\n' search and once by the '\r' search.
-	const maxExaminedPerByte = 2
+	const (
+		// Each input byte is examined at least once, by the '\n' search,
+		// and at most twice, once by each search.
+		minExaminedPerByte = 1
+		maxExaminedPerByte = 2
+
+		// The allocation step: 4x the input may cost at most 8x the bytes.
+		allocBaseLines   = 20_000
+		allocLargeLines  = 80_000
+		maxAllocStepGrow = 8
+	)
 
 	tests := []struct {
 		name  string
@@ -63,15 +89,14 @@ func TestIndexLineBoundary_WriteNewlineOnlyLinesScalesLinearly(t *testing.T) {
 	}{
 		{name: "one line", lines: 1},
 		{name: "1,000 lines", lines: 1_000},
-		{name: "20,000 lines", lines: 20_000},
+		{name: "20,000 lines", lines: allocBaseLines},
 		{name: "40,000 lines", lines: 40_000},
-		{name: "80,000 lines", lines: 80_000},
+		{name: "80,000 lines", lines: allocLargeLines},
 	}
 
+	allocated := make(map[int]uint64, len(tests))
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
 			p := []byte(strings.Repeat("0123456789\n", tc.lines))
 
 			examined := 0
@@ -86,18 +111,78 @@ func TestIndexLineBoundary_WriteNewlineOnlyLinesScalesLinearly(t *testing.T) {
 				return i
 			}
 
-			if _, err := tail.Write(p); err != nil {
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			_, err := tail.Write(p)
+			runtime.ReadMemStats(&after)
+			if err != nil {
 				t.Fatalf("Write() error = %v, want nil", err)
 			}
+			allocated[tc.lines] = after.TotalAlloc - before.TotalAlloc
 
-			if limit := maxExaminedPerByte * len(p); examined > limit {
+			if low := minExaminedPerByte * len(p); examined < low {
+				t.Errorf("Write(%d newline-only lines, %d bytes) examined %d bytes through outputTail.indexByte, want at least %d "+
+					"-- the '\\n' search must see every byte, so Write is searching some other way the count cannot see",
+					tc.lines, len(p), examined, low)
+			}
+			if high := maxExaminedPerByte * len(p); examined > high {
 				t.Errorf("Write(%d newline-only lines, %d bytes) examined %d bytes, want at most %d "+
 					"(%d per input byte) -- O(k·n) regression?",
-					tc.lines, len(p), examined, limit, maxExaminedPerByte)
+					tc.lines, len(p), examined, high, maxExaminedPerByte)
 			}
 			if got, want := len(tail.Lines()), min(tc.lines, hookOutputTailMaxLines); got != want {
-				t.Errorf("Lines() kept %d lines, want %d -- the count above must be over a Write that did its work",
+				t.Errorf("Lines() kept %d lines, want %d -- the counts above must be over a Write that did its work",
 					got, want)
+			}
+		})
+	}
+
+	base, large := allocated[allocBaseLines], allocated[allocLargeLines]
+	if base == 0 {
+		t.Fatalf("Write(%d lines) allocated nothing; the allocation step has no base to compare against", allocBaseLines)
+	}
+	if grew := float64(large) / float64(base); grew > maxAllocStepGrow {
+		t.Errorf("Write allocated %d bytes for %d lines and %d bytes for %d lines (%.1fx for 4x the input), want at most %dx "+
+			"-- is Write copying the remainder on each boundary?",
+			base, allocBaseLines, large, allocLargeLines, grew, maxAllocStepGrow)
+	}
+}
+
+// TestOutputTail_ZeroValueWrites proves the zero outputTail is ready to
+// use, as it was before outputTail.indexByte existed: a nil indexByte
+// means bytes.IndexByte. Write runs in os/exec's copy goroutine, so a nil
+// search there would panic and take sandbox-agent down with it.
+func TestOutputTail_ZeroValueWrites(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		input string
+		want  []string
+	}{
+		{name: "a newline-terminated line", input: "hello\n", want: []string{"hello"}},
+		{name: "a carriage-return redraw", input: "10%\r20%\n", want: []string{"10%", "20%"}},
+		{name: "a CRLF line", input: "windows\r\n", want: []string{"windows"}},
+		{name: "a partial line", input: "no boundary yet", want: []string{"no boundary yet"}},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var tail outputTail
+			n, err := tail.Write([]byte(tc.input))
+			if err != nil || n != len(tc.input) {
+				t.Fatalf("Write(%q) = (%d, %v), want (%d, nil)", tc.input, n, err, len(tc.input))
+			}
+			got := tail.Lines()
+			if len(got) != len(tc.want) {
+				t.Fatalf("Lines() = %q, want %q", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("Lines()[%d] = %q, want %q", i, got[i], tc.want[i])
+				}
 			}
 		})
 	}

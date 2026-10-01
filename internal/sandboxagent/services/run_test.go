@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -76,28 +78,6 @@ func tcpListenerCmd(port int, delaySeconds float64) string {
 		`python3 -c "import socket,time;time.sleep(%v);s=socket.socket();s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1);s.bind(('127.0.0.1', %d));s.listen(1);time.sleep(30)"`,
 		delaySeconds, port,
 	)
-}
-
-// gatedListenerCmd is a real, separate process (python3) that binds port
-// at once but calls listen() only once gateFile exists, or at once when
-// gateFile is empty. A bound socket that is not listening refuses
-// connections, so the readiness check sees the service as not ready
-// until the gate opens -- the test decides when that is, not a sleep.
-// Binding first also keeps the port, which freePort only proved free for
-// an instant, from going to another process while the gate is shut.
-func gatedListenerCmd(port int, gateFile string) string {
-	program := strings.Join([]string{
-		"import os, socket, time",
-		"s = socket.socket()",
-		"s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)",
-		fmt.Sprintf(`s.bind(("127.0.0.1", %d))`, port),
-		fmt.Sprintf("gate = %q", gateFile),
-		"while gate and not os.path.exists(gate):",
-		"    time.sleep(0.01)",
-		"s.listen(1)",
-		"time.sleep(30)",
-	}, "\n")
-	return "exec python3 -c '" + program + "'"
 }
 
 // probeEnvAndListenCmd is a real, separate process (python3) that writes
@@ -493,24 +473,27 @@ func TestRun_PrimaryTimeoutIsFatal(t *testing.T) {
 
 // TestRun_ServicesRunConcurrently proves, by order and not by elapsed
 // time, that Run starts every service before any of them is ready and
-// waits on their readiness concurrently, not one service at a time.
+// waits on their readiness all at once -- not one service at a time, in
+// any order.
 //
-// Each service binds its port at once but listens only when the test
-// opens its gate, and the test opens the gates from its own reporter in
-// reverse manifest order. "third" listens at once. "second" listens once
-// Run has reported "third" ready. "first" listens once Run has reported
-// "second" ready. The chain completes only if the wait on "first" is
-// still running while the waits on the other two resolve.
+// Each service's readiness is a health URL on a server this test runs.
+// The server answers 503 to every probe until each of the three URLs has
+// been probed at least once, and 200 from then on. A readiness wait ends
+// only on a 200, so none can end before all three waits have probed. At
+// the moment the last of them first probes, all three are in flight
+// together.
 //
-// Two sequential forms of Run would both fail here. One spawns a service
-// and waits for it before spawning the next. The other spawns them all
-// and then waits on each in turn. Either way the wait on "first" never
-// ends, because its gate opens only after a later wait has ended. It
-// times out, and Run returns an error.
+// A Run that waits on one service at a time probes only that service's
+// URL, whichever service it starts with. It gets 503 until the readiness
+// timeout, and Run returns an error. The same happens to a Run that waits
+// on two services at a time, and to a Run that spawns one service and
+// waits for it before spawning the next.
 //
 // So the readiness timeout below only detects a hang. The passing path
-// does not have to beat it: nothing in the chain waits on a clock, and a
-// loaded runner only makes the chain slower.
+// does not have to beat it: nothing waits on a clock, and a loaded runner
+// only makes the probes slower. The services only sleep, and readiness is
+// the test's own server, so the test needs neither python3 nor a port that
+// freePort released.
 //
 // An earlier form of this test bounded Run's elapsed time by the sum of
 // three staggered sleeps. That is a wall-clock bound over interpreter
@@ -519,23 +502,31 @@ func TestRun_PrimaryTimeoutIsFatal(t *testing.T) {
 func TestRun_ServicesRunConcurrently(t *testing.T) {
 	t.Parallel()
 
-	gateDir := t.TempDir()
-	gate := func(name string) string { return filepath.Join(gateDir, "open-"+name) }
+	names := []string{"first", "second", "third"}
 
-	// Run reporting the key ready opens the value's gate.
-	opensOnReady := map[string]string{"third": "second", "second": "first"}
+	var (
+		mu     sync.Mutex
+		probed = map[string]bool{}
+	)
+	barrier := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		probed[strings.TrimPrefix(r.URL.Path, "/")] = true
+		allProbed := len(probed) == len(names)
+		mu.Unlock()
+		if !allProbed {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(barrier.Close)
 
 	manifest := servicemanifest.Manifest{}
-	for _, name := range []string{"first", "second", "third"} {
-		port := freePort(t)
-		gateFile := gate(name)
-		if name == "third" {
-			gateFile = "" // the head of the chain: listens at once
-		}
+	for _, name := range names {
 		manifest.Services = append(manifest.Services, servicemanifest.Service{
 			Name:        name,
-			Cmd:         gatedListenerCmd(port, gateFile),
-			Readiness:   servicemanifest.Readiness{Port: intPtr(port)},
+			Cmd:         "exec sleep 120",
+			Readiness:   servicemanifest.Readiness{Health: strPtr(barrier.URL + "/" + name)},
 			Criticality: servicemanifest.CriticalityPrimary,
 		})
 	}
@@ -544,39 +535,38 @@ func TestRun_ServicesRunConcurrently(t *testing.T) {
 	stopAllOnCleanup(t, sup)
 
 	collector := &eventCollector{}
-	reporter := func(e services.BootProgressEvent) {
-		collector.report(e)
-		if e.Phase != services.PhaseReady {
-			return
-		}
-		if next, ok := opensOnReady[e.ServiceName]; ok {
-			if err := os.WriteFile(gate(next), nil, 0o600); err != nil {
-				t.Errorf("open %s's gate: %v", next, err)
-			}
-		}
-	}
-
-	err := services.Run(context.Background(), sup, t.TempDir(), manifest, nil, reporter,
+	err := services.Run(context.Background(), sup, t.TempDir(), manifest, nil, collector.report,
 		30*time.Second, 50*time.Millisecond, nil)
 	if err != nil {
-		t.Fatalf("Run() error = %v, want nil -- a readiness wait that never ended means Run waited on its services one at a time", err)
+		t.Fatalf("Run() error = %v, want nil -- a readiness wait that never got its 200 means Run did not wait on all three services at once", err)
 	}
 
-	want := []services.BootProgressEvent{
-		{ServiceName: "first", Phase: services.PhaseStarting},
-		{ServiceName: "second", Phase: services.PhaseStarting},
-		{ServiceName: "third", Phase: services.PhaseStarting},
-		{ServiceName: "third", Phase: services.PhaseReady},
-		{ServiceName: "second", Phase: services.PhaseReady},
-		{ServiceName: "first", Phase: services.PhaseReady},
+	mu.Lock()
+	gotProbed := len(probed)
+	mu.Unlock()
+	if gotProbed != len(names) {
+		t.Errorf("the barrier saw %d of %d readiness URLs probed, want all of them -- Run reported ready without checking", gotProbed, len(names))
 	}
+
+	// Run spawns, and so reports PhaseStarting, in manifest order. The
+	// ready reports may come in any order, but only after every start.
 	got := collector.all()
-	if len(got) != len(want) {
-		t.Fatalf("events = %+v, want every service started before any is ready, then ready in reverse order: %+v", got, want)
+	if len(got) != 2*len(names) {
+		t.Fatalf("events = %+v, want each service started, then each ready", got)
 	}
-	for i := range want {
-		if got[i].ServiceName != want[i].ServiceName || got[i].Phase != want[i].Phase || got[i].Err != nil {
-			t.Errorf("event[%d] = %+v, want %+v (all events: %+v)", i, got[i], want[i], got)
+	for i, name := range names {
+		if got[i].ServiceName != name || got[i].Phase != services.PhaseStarting {
+			t.Errorf("event[%d] = %+v, want %s starting -- every service starts before any is ready", i, got[i], name)
 		}
+	}
+	ready := map[string]bool{}
+	for _, e := range got[len(names):] {
+		if e.Phase != services.PhaseReady || e.Err != nil {
+			t.Errorf("event %+v after the starts, want only ready events", e)
+		}
+		ready[e.ServiceName] = true
+	}
+	if len(ready) != len(names) {
+		t.Errorf("ready events %+v name %d services, want each of %v once", got[len(names):], len(ready), names)
 	}
 }
