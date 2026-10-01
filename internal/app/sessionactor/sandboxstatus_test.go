@@ -82,8 +82,8 @@ var sandboxStatusOwners = map[string]bool{
 //   - an identifier naming one of the four queries' params, unless it
 //     types a composite literal handed straight to a sandboxWriter method,
 //     or sits in a signature in the store or the recorder;
-//   - a string literal, or a constant string concatenation, that updates
-//     or inserts or merges into sandboxes: UPDATE [ONLY] or INSERT INTO or
+//   - a string literal, or a constant string concatenation read whole
+//     (constStrings), that updates or inserts or merges into sandboxes: UPDATE [ONLY] or INSERT INTO or
 //     MERGE INTO, the table bare, "quoted" or public-qualified.
 //
 // A file the build constraints leave out of the type-checked load (none
@@ -161,19 +161,27 @@ func checkSandboxStatusWrites(t *testing.T, f productionFile) int {
 	})
 
 	ast.Inspect(f.file, func(n ast.Node) bool {
-		switch n := n.(type) {
-		case *ast.Ident:
-			if sandboxStatusParams[n.Name] && !approved[n.Pos()] {
-				t.Errorf("%s: a %s value outside sandboxWrites: a sandbox status written this way reaches no open page (technical plan §3.2) -- hand the literal straight to a.sandboxWrites(tx)", fset.Position(n.Pos()), n.Name)
-			}
-		case *ast.BasicLit, *ast.BinaryExpr:
-			if sql, ok := f.constString(n.(ast.Expr)); ok && rawSandboxesWrite.MatchString(sql) {
-				t.Errorf("%s: raw SQL writing sandboxes: a status it changes reaches no open page (technical plan §3.2) -- write it through the sandbox store and sandboxWrites", fset.Position(n.Pos()))
-			}
+		if id, ok := n.(*ast.Ident); ok && sandboxStatusParams[id.Name] && !approved[id.Pos()] {
+			t.Errorf("%s: a %s value outside sandboxWrites: a sandbox status written this way reaches no open page (technical plan §3.2) -- hand the literal straight to a.sandboxWrites(tx)", fset.Position(id.Pos()), id.Name)
 		}
 		return true
 	})
+	for _, pos := range rawSandboxesWrites(f) {
+		t.Errorf("%s: raw SQL writing sandboxes: a status it changes reaches no open page (technical plan §3.2) -- write it through the sandbox store and sandboxWrites", fset.Position(pos))
+	}
 	return recorded
+}
+
+// rawSandboxesWrites returns where f's constant strings write sandboxes
+// (rawSandboxesWrite), each read whole (constStrings).
+func rawSandboxesWrites(f productionFile) []token.Pos {
+	var out []token.Pos
+	f.constStrings(func(expr ast.Expr, sql string) {
+		if rawSandboxesWrite.MatchString(sql) {
+			out = append(out, expr.Pos())
+		}
+	})
+	return out
 }
 
 var (
@@ -463,6 +471,69 @@ func (f productionFile) constString(expr ast.Expr) (string, bool) {
 		return lit.Value, true
 	}
 	return "", false
+}
+
+// constStrings calls visit with each maximal constant string in f: a
+// string literal, or, with type information, a constant concatenation,
+// read whole and never again operand by operand -- an operand alone, such
+// as "INSERT INTO events (...) " without its VALUES, is not SQL anyone
+// runs. Without type information (a file the build constraints leave out),
+// every string literal is read on its own.
+func (f productionFile) constStrings(visit func(expr ast.Expr, value string)) {
+	ast.Inspect(f.file, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.BasicLit, *ast.BinaryExpr:
+			if value, ok := f.constString(n.(ast.Expr)); ok {
+				visit(n.(ast.Expr), value)
+				return false
+			}
+		}
+		return true
+	})
+}
+
+// typeCheckedFixture parses and type-checks src, a Go file importing
+// nothing, as a production file of its own: the scans' helpers read it the
+// way they read the real packages.
+func typeCheckedFixture(t *testing.T, src string) productionFile {
+	t.Helper()
+	fset := token.NewFileSet()
+	file, err := parser.ParseFile(fset, "fixture.go", src, parser.SkipObjectResolution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info := &types.Info{Types: map[ast.Expr]types.TypeAndValue{}, Selections: map[*ast.SelectorExpr]*types.Selection{}}
+	if _, err := (&types.Config{}).Check("fixture", fset, []*ast.File{file}, info); err != nil {
+		t.Fatal(err)
+	}
+	return productionFile{rel: "fixture.go", file: file, fset: fset, info: info, module: "example.com/fixture"}
+}
+
+// TestRawSandboxesWritesReadsASplitConstantOnce: a constant split across
+// operands is read whole, so an operand that only looks like a write on its
+// own is not one, and a real write split across operands is still caught,
+// once.
+func TestRawSandboxesWritesReadsASplitConstantOnce(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		src  string
+		want int
+	}{
+		{"a write split in two", `const q = "UPDATE " + "sandboxes SET status = 'stopped' WHERE session_id = $1"`, 1},
+		{"a write split in three", `const q = "UPDATE ONLY " + "sandboxes " + "SET status = 'stopped'"`, 1},
+		{"another table, split where its name starts like sandboxes", `const q = "INSERT INTO sandboxes" + "_archive (session_id) VALUES ($1)"`, 0},
+		{"a write in one literal", `const q = "UPDATE sandboxes SET status = 'stopped'"`, 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := len(rawSandboxesWrites(typeCheckedFixture(t, "package fixture\n\n"+tc.src+"\n"))); got != tc.want {
+				t.Errorf("rawSandboxesWrites found %d writes in %s, want %d", got, tc.src, tc.want)
+			}
+		})
+	}
 }
 
 // productionTrees are the module's directories holding production code.

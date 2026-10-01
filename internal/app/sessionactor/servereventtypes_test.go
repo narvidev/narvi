@@ -32,7 +32,8 @@ var eventTypePassThroughs = map[string]bool{
 //     the Type field of a sqlcgen.CreateEventParams literal, each a
 //     constant or else handed through by one of eventTypePassThroughs;
 //   - every INSERT or MERGE into events in a Go string constant (a literal
-//     or a constant concatenation), and in a sqlc query other than
+//     or a constant concatenation, read whole -- constStrings), and in a
+//     sqlc query other than
 //     CreateEvent -- whose type is its param, read above -- the type taken
 //     from a VALUES list that names it as an SQL string literal. One that
 //     does not (a parameter, an INSERT ... SELECT, a MERGE) fails: its type
@@ -50,11 +51,11 @@ func TestServerWrittenEventTypesAreReserved(t *testing.T) {
 	written := map[string][]string{}
 	passThroughs := map[string]bool{}
 	recordSQL := func(where, sql string) {
-		if !insertsEvents.MatchString(sql) {
+		typesInSQL, readable, inserts := eventInsertTypes(sql)
+		if !inserts {
 			return
 		}
-		typesInSQL, ok := sqlInsertedEventTypes(sql)
-		if !ok {
+		if !readable {
 			t.Errorf("%s: an insert into events whose type is not an SQL string literal in its VALUES: write the event through CreateEvent (appendEvent, appendRawEvent), or name the type there, so TestServerWrittenEventTypesAreReserved can check it is reserved", where)
 			return
 		}
@@ -63,14 +64,8 @@ func TestServerWrittenEventTypesAreReserved(t *testing.T) {
 		}
 	}
 	for _, f := range productionFiles(t) {
-		ast.Inspect(f.file, func(n ast.Node) bool {
-			switch n := n.(type) {
-			case *ast.BasicLit, *ast.BinaryExpr:
-				if sql, ok := f.constString(n.(ast.Expr)); ok {
-					recordSQL(f.fset.Position(n.Pos()).String(), sql)
-				}
-			}
-			return true
+		f.constStrings(func(expr ast.Expr, sql string) {
+			recordSQL(f.fset.Position(expr.Pos()).String(), sql)
 		})
 		if f.info == nil {
 			continue
@@ -149,15 +144,8 @@ func TestServerWrittenEventTypesAreReserved(t *testing.T) {
 	if len(written[SandboxStatusEventType]) == 0 {
 		t.Fatalf("no write of %q found: the scan is broken", SandboxStatusEventType)
 	}
-	typeNames := make([]string, 0, len(written))
-	for typ := range written {
-		typeNames = append(typeNames, typ)
-	}
-	sort.Strings(typeNames)
-	for _, typ := range typeNames {
-		if !contract[typ] && !serverEventTypes[typ] {
-			t.Errorf("event type %q (written at %v) is no sandbox-ws event type, so the control plane alone writes it: add it to serverEventTypes (sandboxstatus.go), or a sandbox can store one the page takes for the server's", typ, written[typ])
-		}
+	for _, typ := range unreservedServerTypes(written, contract) {
+		t.Errorf("event type %q (written at %v) is no sandbox-ws event type, so the control plane alone writes it: add it to serverEventTypes (sandboxstatus.go), or a sandbox can store one the page takes for the server's", typ, written[typ])
 	}
 	for typ := range serverEventTypes {
 		if contract[typ] {
@@ -210,6 +198,103 @@ func sandboxWSEventTypes(t *testing.T) map[string]bool {
 		t.Fatalf("read %d sandbox-ws event types, want at least 20: the schema moved, or the read is broken", len(out))
 	}
 	return out
+}
+
+// unreservedServerTypes returns, sorted, the written event types that are
+// neither sandbox-ws event types nor reserved.
+func unreservedServerTypes(written map[string][]string, contract map[string]bool) []string {
+	var out []string
+	for typ := range written {
+		if !contract[typ] && !serverEventTypes[typ] {
+			out = append(out, typ)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// eventInsertTypes reads sql the way the reserved-type guard does: whether
+// it inserts into events at all, and if so whether every type it inserts
+// is readable (sqlInsertedEventTypes), and which.
+func eventInsertTypes(sql string) (typeNames []string, readable, inserts bool) {
+	if !insertsEvents.MatchString(sql) {
+		return nil, false, false
+	}
+	typeNames, readable = sqlInsertedEventTypes(sql)
+	return typeNames, readable, true
+}
+
+// TestReservedTypeGuardReadsASplitConstantOnce: an insert into events
+// written as a constant split across operands is read whole -- its
+// operands alone, an INSERT without its VALUES, are never read as an
+// unreadable insert -- so a reserved type split this way is accepted, and
+// an unreserved one is still caught.
+func TestReservedTypeGuardReadsASplitConstantOnce(t *testing.T) {
+	t.Parallel()
+
+	contract := sandboxWSEventTypes(t)
+	tests := []struct {
+		name           string
+		src            string
+		wantWritten    []string
+		wantUnreserved []string
+	}{
+		{
+			name:        "two operands, a reserved type",
+			src:         `const zzProbeInsert = "INSERT INTO events (session_id, type, message_id, payload) " + "VALUES ($1, 'image_decision', $2, $3)"`,
+			wantWritten: []string{"image_decision"},
+		},
+		{
+			name:        "three operands, a reserved type",
+			src:         `const zzProbeInsert = "INSERT INTO events (session_id, type, message_id, payload) " + "VALUES ($1, " + "'image_decision', $2, $3)"`,
+			wantWritten: []string{"image_decision"},
+		},
+		{
+			name:        "parenthesised operands, a contract type",
+			src:         `const zzProbeInsert = ("INSERT INTO events (session_id, type) " + "VALUES ($1, ") + "'warning')"`,
+			wantWritten: []string{"warning"},
+		},
+		{
+			name:           "two operands, an unreserved type: still caught",
+			src:            `const zzProbeInsert = "INSERT INTO events (session_id, type, message_id, payload) " + "VALUES ($1, 'server_note', $2, $3)"`,
+			wantWritten:    []string{"server_note"},
+			wantUnreserved: []string{"server_note"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			f := typeCheckedFixture(t, "package fixture\n\n"+tc.src+"\n")
+			written := map[string][]string{}
+			var unreadable []string
+			f.constStrings(func(expr ast.Expr, sql string) {
+				typeNames, readable, inserts := eventInsertTypes(sql)
+				switch {
+				case !inserts:
+				case !readable:
+					unreadable = append(unreadable, sql)
+				default:
+					for _, typ := range typeNames {
+						written[typ] = append(written[typ], f.fset.Position(expr.Pos()).String())
+					}
+				}
+			})
+			if len(unreadable) != 0 {
+				t.Errorf("read as an insert whose type cannot be checked: %q", unreadable)
+			}
+			var gotWritten []string
+			for typ := range written {
+				gotWritten = append(gotWritten, typ)
+			}
+			sort.Strings(gotWritten)
+			if strings.Join(gotWritten, ",") != strings.Join(tc.wantWritten, ",") {
+				t.Errorf("written types = %q, want %q", gotWritten, tc.wantWritten)
+			}
+			if got := unreservedServerTypes(written, contract); strings.Join(got, ",") != strings.Join(tc.wantUnreserved, ",") {
+				t.Errorf("unreserved types = %q, want %q", got, tc.wantUnreserved)
+			}
+		})
+	}
 }
 
 // insertsEvents matches an INSERT or a MERGE into the events table, bare,
