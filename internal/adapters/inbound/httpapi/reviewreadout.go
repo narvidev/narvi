@@ -262,9 +262,11 @@ func GetReviewReadout(
 		// here, never a stored line number. Only meaningful when a verdict
 		// exists at all; diff == "" (hasLatest false, or the refetch
 		// itself failing) leaves every finding unanchored (0, 0), exactly
-		// findingposition.ResolveAll's own documented degradation.
+		// findingposition.ResolveAll's own documented degradation. A nil
+		// fetcher degrades the same way, as the live read above does:
+		// FetchDiffAt calls through it unguarded.
 		var diff string
-		if hasLatest && latest.HeadSHA != "" && outbound != nil {
+		if hasLatest && latest.HeadSHA != "" && outbound != nil && fetcher != nil {
 			if d, ok := reviewcontext.FetchDiffAt(ctx, logger, fetcher, timeouts, owner, repo, prNumber, outbound.BotToken(), latest.HeadSHA); ok {
 				diff = d
 			}
@@ -386,6 +388,16 @@ func findingFromRow(row sqlcgen.ReviewFinding) reviewpost.Finding {
 		line := int(*row.Line)
 		f.Line = &line
 	}
+	// §26.6's amendment: both NULL on a row last published before
+	// migrations/000154, or posted with no source by a turn whose prompt
+	// predates sources, which reads as "no source recorded" -- never as
+	// primary, and never as an unverified addition.
+	if row.ReportedSource != nil {
+		f.Source = reviewpost.FindingSource(*row.ReportedSource)
+	}
+	if row.AdditionCheck != nil {
+		f.AdditionCheck = reviewpost.AdditionCheck(*row.AdditionCheck)
+	}
 	return f
 }
 
@@ -412,6 +424,14 @@ func findingToReadoutWire(f reviewpost.Finding, row sqlcgen.ReviewFinding) restd
 	if f.Line != nil {
 		line := *f.Line
 		out.Line = &line
+	}
+	if f.Source != "" {
+		source := string(f.Source)
+		out.Source = &source
+	}
+	if f.AdditionCheck != "" {
+		check := string(f.AdditionCheck)
+		out.AdditionCheck = &check
 	}
 	return out
 }
@@ -451,6 +471,17 @@ func reviewReadoutVerdictToWire(rec reviewverdict.Record) restdtos.ReviewReadout
 	if rec.FactCheck != "" {
 		fc := string(rec.FactCheck)
 		out.FactCheck = &fc
+	}
+	// §26.6's amendment: the second fact-check run, apart from the first.
+	if rec.SecondFactCheck.Reported != "" {
+		reported := string(rec.SecondFactCheck.Reported)
+		killed := rec.SecondFactCheck.ReportedKilled
+		out.AdditionsFactCheck = &reported
+		out.AdditionsFactCheckKilled = &killed
+	}
+	if rec.SecondFactCheck.Resolved != "" {
+		resolved := string(rec.SecondFactCheck.Resolved)
+		out.AdditionsCheck = &resolved
 	}
 	return out
 }

@@ -2465,6 +2465,59 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
     `needs_human` — strictly more conservative, never less — the same fail-conservative bias
     `CounterReviewSkipped`'s own "every cause floors identically" posture already commits to.
     Deliberately left unaddressed: no retries, no polling, no new timeout constant.
+  - **Extended to the second fact-check run (§26.6's amendment).** The same trace read now feeds
+    two checks, never two reads: `httpapi.readSubTaskTrace` reads the turn's sub-task events once,
+    whenever the deep path reports the counter-review done or the second fact-check run done, and
+    returns a `reviewverdict.SubTaskTrace` whose records carry each row's own `events.id`. Within one
+    session ids are allocated in commit order (`MaxEventIDForSession`), so comparing two records'
+    ids orders them as the trace recorded them, with no clock. `CounterReviewCorroborated` is
+    unchanged; `AdditionsFactCheckInTrace` reports whether a `fact-check` sub-task started after
+    every counter-reviewer event in the trace (each start and each finish belonging to one) and
+    completed, given at least one counter-review that completed. The first fact-check run starts
+    before the counter-review by the funnel's design, so without that ordering every deep review
+    would read as checked. `SubTaskTrace.ReadInFull` is false when any part of the trace could not
+    be read -- no dispatch gen or event id on the turn, a failed query, a row that did not decode --
+    and the additions then resolve to `unconfirmed`, "could not be confirmed", even when a
+    qualifying run is among the rows that were read: a checked addition is a claim that no later
+    counter-reviewer event exists, which a partial read cannot support. The counter-review claim
+    keeps its existing reading (a positive found among the decoded rows still corroborates).
+    A finish whose start is not in the trace also leaves it incomplete for the additions:
+    `sub_task_finish` carries no sub-agent type and is critical, while `sub_task_start` is
+    best-effort and can be evicted during a long disconnect, so a lone finish may be a
+    counter-review that ran after the second fact-check.
+  - **Bounded above as well.** A turn past `TurnDeadline` is marked failed without its agent being
+    stopped, the next turn is dispatched to the same sandbox at the same gen, and the first turn's
+    late verdict is still resolved by its own message id. Bounded below only, that verdict's trace
+    would hold the later turn's sub-tasks, and the later turn's routine first fact-check would read
+    as the earlier turn's second run. So the read stops at the next turn's own dispatch watermark
+    (`events.id <= next`, `turns.GetNextTurnDispatchedEventID`), for both checks, since they read
+    the same rows. Work the earlier turn did after the later one was dispatched is left out too,
+    deliberately unread, so the read is marked cut (`SubTaskTrace.CutAtNextTurn`), and the
+    additions resolve to `unconfirmed` ("could not be confirmed") whatever the window holds: a
+    second run missing from it may lie past the cut, and one found in it may have been followed,
+    past the cut, by another counter-reviewer pass -- `checked` claims that no counter-reviewer
+    event follows the run, which a cut read cannot support. The counter-review claim is positive
+    (a counter-reviewer ran and completed), so one found inside the window, this turn's own
+    events, still corroborates it, and one not found there leaves it uncorroborated. Another turn
+    dispatched at the same
+    watermark, with no event between the two dispatches, makes the two turns' events
+    indistinguishable, and the trace is then not read at all (`ReadInFull` false).
+  - **The later turn's read, when an earlier one may still be running.** The same race reaches the
+    later turn, whose read is bounded below only: the earlier turn's late sub-tasks land above its
+    watermark, at the same gen, and no sub-task event names the turn or prompt it belongs to, so
+    nothing attributes them -- an earlier turn's late fact-check would count as the later turn's own
+    second run, "checked" in the unsafe direction. The rule is conservative: when the session holds
+    an earlier turn, dispatched on the same gen, that ended without its own `execution_complete`
+    (the control plane appended a synthetic one naming it: timed out, stopped, abandoned or
+    refused, its agent possibly still running -- `turns.ExistsEarlierTurnLeftRunning`), the later
+    turn's trace is not read at all, and both its claims resolve unconfirmed. An earlier turn that
+    ended with a real `execution_complete`, or one on a gen since replaced, changes nothing, and
+    neither does one whose prompt certainly never reached the sandbox -- a dispatch refused before
+    the prompt was sent, or a send refused with no live connection, which writes nothing:
+    `failDispatchedTurn` marks its synthetic event `"delivered": false`, and no agent of it ever
+    ran. Any other send failure may have followed a partial write, and still counts. The cost is
+    named: until the sandbox's gen moves on, every later deep turn on that session reads its claims
+    as unconfirmed (the counter-review floored to `needs_human`).
 
 ### 26.5 Measuring the readout (Step 69, on Step 62's instrument)
 
@@ -2526,6 +2579,26 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
   size), minified bundles and snapshots (shipped or asserted content), and MDX (compiled into
   pages). An operator whose repositories follow other conventions widens the list with
   `NARVI_REVIEW_SIZE_EXCLUDED_PATHS`.
+- **Precision per source, and unverified additions counted apart (§26.6's amendment).** Every
+  published finding records the source its payload reported, `primary` or `counter_review`
+  (`review_findings.reported_source`, migration `000154`), and, for a counter-review addition,
+  the server's resolution (`addition_check`: `checked`, `not_run`, `not_found`, `unconfirmed`).
+  Both describe the finding's latest publication and are overwritten on a re-report, like
+  `last_seen_at`; a residual, named: a finding the counter-reviewer introduced and the primary
+  reviewer later re-reports counts under `primary` from then on. The source is self-reported --
+  the server cannot see which pass wrote a finding -- and is recorded as such. The "Review finding
+  outcomes" KPI (`ReviewAnalytics.findingOutcomes`) leaves out every addition the server could not
+  count as checked, and `findingOutcomesBySource` counts every finding per source (`primary`,
+  `counter_review`, `counter_review_unverified`, `not_recorded`) and status, so precision per
+  source is the share of a source's findings a maintainer rebutted, and the §26.6 rule can be
+  revisited on numbers. A finding last published before migration `000154` has no source
+  recorded, and neither has one posted without a source by a turn whose prompt was rendered
+  before sources existed (§26.6's amendment, Validation): either reads as `not_recorded`, never
+  as `primary`, is never marked unverified, and stays in the main distribution as it always was.
+  The merge-gate's open-findings count is unchanged: an unverified addition blocks merge exactly
+  like any other open finding. The §16 decision inbox shows those additions apart from its
+  findings count (`DecisionInboxItem.unverifiedAdditions`), as the Code review view does; its
+  `findings` is a display count, and the gate still reads the full one.
 - The §21.3 deterministic digest and the §16 decision inbox surface the readout's `Summary` line
   per PR — reusing their existing aggregation, no new mechanism.
 - **Evals**: known-PR digest-quality cases (expected architecture decisions on reference diffs,
@@ -2550,8 +2623,9 @@ Counter-review is deep, adversarial, tool-equipped, and runs only on the deep pa
 pass is shallow, mechanical, and runs on **both**. On the deep path they compose as a funnel:
 
 primary reviewer's findings → **fact-check** (kills only provably-wrong-from-diff) →
-**counter-review** (§26.4, adjudicates the survivors, may itself surface new findings) →
-synthesis (unchanged) → publish
+**counter-review** (§26.4, adjudicates the survivors, may itself surface new findings, each
+stating the evidence triplet) → **second fact-check**, over the additions only (amendment below)
+→ synthesis (unchanged) → publish
 
 (`architecture-scribe` is orthogonal to this ordering — §26.4's own "virgin context, uncontaminated
 by the primary's finding hunt" design means it never consumes or feeds the findings list this
@@ -2631,6 +2705,66 @@ second fact-check sub-task, run after the counter-review in the same turn, is co
 turn's own sub-task events; any other is published marked unverified, and what the reviewer reports
 about coverage and source is recorded as self-reported. Every published finding records its source, primary or counter-review, so
 §26.5 reports precision per source and the rule can be revisited on numbers.
+
+As shipped:
+- **The instruction** (`internal/domain/review/context.go`). The counter-review step asks each
+  addition to state the defect, quoting the diff lines it rests on; the path that reaches it; and
+  the consequence -- and to drop one that cannot state all three. A fourth, deep-only step spawns a
+  new `fact-check` sub-task over the additions alone, after the counter-review has finished, under
+  step 1's diff-only rules; it is a fact-check spawn, so §26.7's budget check governs it unchanged.
+  The payload reports it as `additionsFactCheck` (`done`/`skipped`, omitted when the
+  counter-review added nothing) and `additionsFactCheckKilled`, apart from `factCheck`/
+  `factCheckKilled`, and every finding carries `source` (`primary` on light, where the text names
+  no other value; `primary` or `counter_review` on deep). Contracts 1.17.0.
+- **The rule** (`reviewpost.ResolveAdditionCheck`). An addition is `checked` only when the
+  reviewer reported the second run done AND the turn's trace shows a fact-check that started after
+  the counter-review and completed (§26.4's extension); otherwise it is `not_run` (reported
+  skipped, or not reported), `not_found` (reported, and the trace read when the verdict was posted
+  held none -- §26.4's accepted race included) or `unconfirmed` (the trace could not be read in
+  full). One resolution per verdict (`BuildSecondFactCheck`) marks every addition, so the verdict
+  and its findings cannot disagree. It is made only when the verdict publishes an addition: a
+  second run that removed every addition is recorded (its report and kill count) with no
+  resolution, so the readout shows "no addition published", never "additions unverified".
+- **Validation.** `source` is optional in the schema. A value that is present must be `primary` or
+  `counter_review` (a garbled one is `400`). An absent one is admitted in one case only: from a
+  turn whose own stored prompt predates the source instruction, on a payload that reports no
+  `additionsFactCheck`. The verdict body follows the review prompt, which is rendered once, when
+  the turn is created, and re-sent as stored on every dispatch, so a turn rendered before this
+  change -- queued, running, or re-sent to a respawned sandbox while the control plane is
+  deployed -- posts its findings without the field; refusing them would refuse the verdict its
+  own instructions shaped, and would make the contract's MINOR grade untrue. Such a finding is
+  recorded as not recorded. The server tells that turn apart by its stored prompt
+  (`turns.prompt`): both paths' source lines open with one exported marker,
+  `review.FindingSourceFieldMarker`, which the renderer builds them from and
+  `review.PromptInstructsFindingSource` looks for, so a later prompt edit cannot desynchronise
+  the two; and `additionsFactCheck`, which only the current prompt names, marks a current-prompt
+  payload on its own. From any other turn an absent source is refused with `400`, like a garbled
+  one: an addition its reviewer forgot to label is never published as an ordinary finding. A
+  `counter_review` source, or a
+  second-run report, is refused off the deep path; a kill count is refused unless the run is
+  reported `done`. On the deep path every other combination is admitted -- additions beside a
+  counter-review reported skipped included -- because whatever the payload claims, an addition is
+  checked only when the server finds the run, and refusing an inconsistent claim would only push a
+  reviewer to relabel an addition `primary`.
+- **Publication.** The posted comment lists an unverified addition under its own heading, after
+  the findings, with their count and the server's reason for each; a checked one stays among the
+  findings, marked as the counter-review's; every other finding renders as before. Each finding's
+  description has its line breaks folded onto its one line, primary and addition alike, as §26.1's
+  header already folds the adequacy explanation, so reviewer text cannot open a line that copies
+  the server's headings or markers, and an unclosed code fence in it cannot hide the server's note
+  or the rest of the comment. The readout
+  carries `source`/`additionCheck` per finding and `additionsFactCheck`/
+  `additionsFactCheckKilled`/`additionsCheck` on the verdict; the Code review view marks an
+  unverified addition, counts it apart in the appendix header and lists it apart, and the decision
+  inbox shows the count apart from its findings (§26.5). An unverified
+  addition raises the Shippable class no more than a checked one: `review.ComputeShippable` reads
+  no finding (§26.1), and neither the blockers nor the merge gate treat it differently.
+- **Storage.** `review_verdicts.additions_fact_check`/`additions_fact_check_killed`/
+  `additions_check` record the second run apart from the first; `review_findings.reported_source`/
+  `addition_check` record each finding's source and resolution (migration `000154`). The server
+  cannot see whether the diff disproved an addition -- `sub_task_finish` carries no content -- so
+  "an addition the diff disproves is not published" rests on the instruction, with the reviewer's
+  reported kill count recorded beside the run.
 
 ### 26.7 Per-review cost budget with look-ahead (Step 69 design, Step 70 wiring)
 
@@ -2736,8 +2870,10 @@ derived (propose $0.50 light / $5 deep per review, matching this plan's own conv
 a concrete, explicitly-tunable starting figure rather than leaving a blank, §24.6's
 `auto_retrigger_count` budget is the precedent). Light path's own ceiling is a degenerate,
 one-checkpoint case (the one optional pass it can run at all is §26.6's fact-check sub-task); deep
-path's is checked once before each of the two optional sub-tasks this ceiling actually governs —
-fact-check and `counter-reviewer` — in whatever order that orchestration dispatches them.
+path's is checked once before each optional sub-task dispatch this ceiling actually governs —
+fact-check (both runs, the second over the counter-review's additions, §26.6's amendment) and
+`counter-reviewer` — in whatever order that orchestration dispatches them; a skipped second
+fact-check leaves the additions published marked unverified.
 `architecture-scribe` is excluded from this check entirely (§26.9's own resolution: a
 budget-triggered scribe skip would floor nothing and appear nowhere, the silent downgrade the v1
 rigor invariant forbids) — it always runs regardless of cost.

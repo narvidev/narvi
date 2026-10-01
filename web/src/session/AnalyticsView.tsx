@@ -57,11 +57,12 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 
-import type { PlatformAnalytics } from '@narvi/contracts/rest-dtos'
+import type { PlatformAnalytics, ReviewAnalytics } from '@narvi/contracts/rest-dtos'
 
 import { getPlatformAnalytics, getRepoDigestScope, getReviewAnalytics } from '../api/endpoints'
 import { ApiError } from '../api/http'
 import { platformAnalyticsQueryKeys, repoAnalyticsQueryKeys, repoDigestScopeQueryKeys } from '../api/queryKeys'
+import { findingSourceBucketLabel } from './reviewFormat'
 import { lookbackDaysLabel } from './settingsFormat'
 import { truncateForDisplay } from './textSafety'
 
@@ -118,6 +119,76 @@ function NotAvailableTile({ label, detail }: { label: string; detail?: string })
   )
 }
 
+/**
+ * FindingOutcomesChart is the "Review finding outcomes" KPI tile, pure and
+ * presentational so it renders from a ReviewAnalytics value alone. §26.6's
+ * amendment: findingOutcomes leaves out the counter-review additions the
+ * server could not count as checked, so the bar never mixes them in; they
+ * are counted apart, on a line of their own, and findingOutcomesBySource
+ * lists every source with how many of its findings a maintainer rebutted
+ * -- the per-source precision reading §26.5 names.
+ */
+export function FindingOutcomesChart({ data }: { data: ReviewAnalytics }) {
+  const outcomes = data.findingOutcomesComputed && data.findingOutcomes ? data.findingOutcomes : []
+  const totalOutcomes = outcomes.reduce((sum, o) => sum + o.count, 0)
+  const bySource = data.findingOutcomesComputed && data.findingOutcomesBySource ? data.findingOutcomesBySource : []
+  const sources: { source: string; total: number; rebutted: number }[] = []
+  for (const row of bySource) {
+    let entry = sources.find((e) => e.source === row.source)
+    if (!entry) {
+      entry = { source: row.source, total: 0, rebutted: 0 }
+      sources.push(entry)
+    }
+    entry.total += row.count
+    if (row.status === 'rebutted') entry.rebutted += row.count
+  }
+  const unverified = sources.find((e) => e.source === 'counter_review_unverified')?.total ?? 0
+
+  return (
+    <div className="chart">
+      <h4>Review · finding outcomes</h4>
+      <p className="ch">the "Review finding outcomes" KPI</p>
+      {!data.findingOutcomesComputed && <p className="notavailable">Not available yet -- no review findings reported for this repo in the analytics window.</p>}
+      {outcomes.length > 0 && (
+        <>
+          <div className="outcomebar" role="img" aria-label="Finding outcome distribution">
+            {outcomes.map((o) => (
+              <i key={o.status} style={{ width: `${(o.count / Math.max(1, totalOutcomes)) * 100}%`, background: 'var(--accent)' }} title={`${STATUS_LABEL[o.status] ?? o.status} · ${o.count}`} />
+            ))}
+          </div>
+          <div className="olabels">
+            {outcomes.map((o) => (
+              <span key={o.status}>
+                <i style={{ background: 'var(--accent)' }} />
+                {STATUS_LABEL[o.status] ?? o.status} {o.count}
+              </span>
+            ))}
+          </div>
+        </>
+      )}
+      {unverified > 0 && (
+        <p className="ch">
+          {unverified} unverified counter-review addition{unverified === 1 ? '' : 's'}, counted apart
+        </p>
+      )}
+      {sources.length > 0 && (
+        <dl className="kv">
+          {sources.map((e) => (
+            <div key={e.source} style={{ display: 'contents' }}>
+              <dt>
+                <T text={findingSourceBucketLabel(e.source)} />
+              </dt>
+              <dd>
+                {e.total} finding{e.total === 1 ? '' : 's'}, {e.rebutted} rebutted
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
+    </div>
+  )
+}
+
 function ReviewRiskSection({ owner, repo }: { owner: string; repo: string }) {
   const enabled = owner.trim().length > 0 && repo.trim().length > 0
   const repoFullName = `${owner}/${repo}`
@@ -135,7 +206,6 @@ function ReviewRiskSection({ owner, repo }: { owner: string; repo: string }) {
 
   const data = query.data
   const maxDriverCount = data.topRiskDriversComputed && data.topRiskDrivers ? Math.max(1, ...data.topRiskDrivers.map((d) => d.count)) : 1
-  const totalOutcomes = data.findingOutcomesComputed && data.findingOutcomes ? data.findingOutcomes.reduce((sum, o) => sum + o.count, 0) : 0
 
   return (
     <div className="charts2">
@@ -193,28 +263,7 @@ function ReviewRiskSection({ owner, repo }: { owner: string; repo: string }) {
         )}
       </div>
 
-      <div className="chart">
-        <h4>Review · finding outcomes</h4>
-        <p className="ch">the "Review finding outcomes" KPI</p>
-        {!data.findingOutcomesComputed && <p className="notavailable">Not available yet -- no review findings reported for this repo in the analytics window.</p>}
-        {data.findingOutcomesComputed && data.findingOutcomes && data.findingOutcomes.length > 0 && (
-          <>
-            <div className="outcomebar" role="img" aria-label="Finding outcome distribution">
-              {data.findingOutcomes.map((o) => (
-                <i key={o.status} style={{ width: `${(o.count / Math.max(1, totalOutcomes)) * 100}%`, background: 'var(--accent)' }} title={`${STATUS_LABEL[o.status] ?? o.status} · ${o.count}`} />
-              ))}
-            </div>
-            <div className="olabels">
-              {data.findingOutcomes.map((o) => (
-                <span key={o.status}>
-                  <i style={{ background: 'var(--accent)' }} />
-                  {STATUS_LABEL[o.status] ?? o.status} {o.count}
-                </span>
-              ))}
-            </div>
-          </>
-        )}
-      </div>
+      <FindingOutcomesChart data={data} />
 
       <div className="chart">
         <h4>Digest contestation rate</h4>

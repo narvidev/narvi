@@ -96,18 +96,30 @@ func GetReviewAnalytics(reviewVerdictDeps appreviewverdict.Deps, prSessions *pos
 			resp.TopRiskDrivers = &tagCounts
 		}
 
-		if outcomes, computed, err := appreviewverdict.FindingOutcomes(ctx, reviewVerdictDeps, repoFullName, now); err != nil {
+		if readout, computed, err := appreviewverdict.FindingOutcomes(ctx, reviewVerdictDeps, repoFullName, now); err != nil {
 			logger.Error("httpapi: compute review finding outcomes failed", "error", err)
 		} else if computed {
 			resp.FindingOutcomesComputed = true
-			statusCounts := make(restdtos.ReviewAnalyticsFindingOutcomes, len(outcomes))
-			for i, o := range outcomes {
+			// Every finding but the unverified counter-review additions
+			// (§26.6's amendment), which are counted apart below.
+			statusCounts := make(restdtos.ReviewAnalyticsFindingOutcomes, len(readout.Outcomes))
+			for i, o := range readout.Outcomes {
 				statusCounts[i] = restdtos.ReviewAnalyticsFindingStatusCount{
 					Status: restdtos.ReviewAnalyticsFindingStatusCountStatus(o.Status),
 					Count:  o.Count,
 				}
 			}
 			resp.FindingOutcomes = &statusCounts
+			// §26.5: precision per source is read from this breakdown.
+			sourceCounts := make(restdtos.ReviewAnalyticsFindingOutcomesBySource, len(readout.BySource))
+			for i, o := range readout.BySource {
+				sourceCounts[i] = restdtos.ReviewAnalyticsFindingSourceCount{
+					Source: string(o.Source),
+					Status: restdtos.ReviewAnalyticsFindingSourceCountStatus(o.Status),
+					Count:  o.Count,
+				}
+			}
+			resp.FindingOutcomesBySource = &sourceCounts
 		}
 
 		if rate, computed, err := appreviewverdict.DigestContestationRate(ctx, reviewVerdictDeps, repoFullName, now); err != nil {

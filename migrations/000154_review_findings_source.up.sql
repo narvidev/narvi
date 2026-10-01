@@ -1,0 +1,91 @@
+-- §26.6's amendment: what the counter-reviewer adds is fact-checked, or
+-- published marked unverified, and every published finding records its
+-- source so §26.5 can report precision per source.
+--
+-- review_findings gains two columns, both describing the finding's LATEST
+-- publication (the verdict-posting endpoint overwrites them on every
+-- re-report of the same identity, exactly like last_seen_at):
+--   - reported_source: 'primary' or 'counter_review', the pass the
+--     reviewer's payload says produced the finding. Self-reported: the
+--     server cannot see which pass wrote a finding, so the column is
+--     named for what it is.
+--   - addition_check: the server's resolution for a counter-review
+--     addition -- 'checked' (a second fact-check sub-task that started
+--     after the counter-review and completed is in the turn's own trace),
+--     'not_run' (the reviewer reported no such run), 'not_found' (it
+--     reported one, and the trace read in full shows none), or
+--     'unconfirmed' (the trace could not be read in full). NULL for a
+--     primary finding. Every value but 'checked' is published marked
+--     unverified.
+--
+-- A row last published before this migration keeps NULL in both: it reads
+-- as "source not recorded", never as primary -- before this migration the
+-- counter-reviewer's additions were published unmarked beside the
+-- primary reviewer's findings, and nothing recorded which was which. Such
+-- a row is never marked unverified and keeps counting in the finding
+-- outcomes KPI as before; the per-source breakdown counts it under its own
+-- "not recorded" bucket. Its next publication by a binary with this
+-- migration records both columns -- unless that publication itself names
+-- no source (a turn whose prompt was rendered before sources existed,
+-- which the verdict endpoint accepts), which leaves both NULL, read the
+-- same way.
+--
+-- review_verdicts gains the second fact-check run's outcome, kept apart
+-- from the first run's (fact_check/fact_check_killed, migration 000084):
+--   - additions_fact_check: 'done' or 'skipped' as the reviewer reported
+--     it, NULL when it reported nothing (self-reported, like fact_check).
+--   - additions_fact_check_killed: the count the reviewer reported that
+--     run removed (self-reported), NULL when it reported no run.
+--   - additions_check: the server's resolution, the same vocabulary as
+--     review_findings.addition_check, NULL when the verdict published no
+--     counter-review addition (not a deep review, one whose counter-review
+--     added nothing, or one whose second run removed every addition), so
+--     there was nothing to resolve.
+--
+-- All nullable TEXT/INTEGER with no default and no CHECK, like every
+-- review_verdicts column since 000077: the vocabulary is validated in Go
+-- (internal/domain/reviewpost), the one writer.
+--
+-- IF NOT EXISTS: see "Rolling back" -- a rollback that keeps the columns
+-- leaves them in place when this file runs again.
+--
+-- # Locks
+--
+-- Each ADD COLUMN without a default is a catalog change: it rewrites
+-- nothing, but takes ACCESS EXCLUSIVE on its table for the file's one
+-- implicit transaction, so a verdict post waits for it -- an instant.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with the columns present. Every statement it
+-- sends to review_findings and review_verdicts names its columns (sqlc
+-- writes each SELECT * and RETURNING * out as a column list), and its
+-- INSERTs leave these columns NULL. So a pod still running it keeps
+-- posting verdicts: a finding it inserts has no source recorded, and a
+-- finding it re-reports keeps the source and check the newer binary last
+-- recorded (its ON CONFLICT moves only last_seen_at). Its verdict rows
+-- record no second fact-check run. migration000154_integration_test.go
+-- runs the previous binary's own statements against the columns.
+--
+-- # Rolling back
+--
+-- Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for. So once this migration is applied, the
+-- previous binary cannot boot ("no migration found for version 154"): not
+-- a rolled-back pod, and not an older pod restarting in the middle of a
+-- rolling deploy. A rollback therefore takes one of two steps first, with
+-- the control plane scaled to zero:
+--   - Keep the columns: with the golang-migrate CLI, `migrate force 153`.
+--     The previous binary then boots, since 153 is a version it has, and
+--     works with the columns present as above. When this release is
+--     deployed again, this file runs again, and IF NOT EXISTS leaves the
+--     columns and their values as they are.
+--   - Drop them: run this migration's down (goto 153) with this release's
+--     migrations. The down file says what it removes.
+ALTER TABLE review_findings ADD COLUMN IF NOT EXISTS reported_source TEXT;
+ALTER TABLE review_findings ADD COLUMN IF NOT EXISTS addition_check TEXT;
+
+ALTER TABLE review_verdicts ADD COLUMN IF NOT EXISTS additions_fact_check TEXT;
+ALTER TABLE review_verdicts ADD COLUMN IF NOT EXISTS additions_fact_check_killed INTEGER;
+ALTER TABLE review_verdicts ADD COLUMN IF NOT EXISTS additions_check TEXT;

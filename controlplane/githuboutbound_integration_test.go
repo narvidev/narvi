@@ -381,7 +381,7 @@ func verdictWithOneFinding(t *testing.T) string {
 		"proposedShippable": "auto",
 		"summary":           "Outbound wiring verdict.",
 		"findings": []map[string]any{
-			{"severity": "medium", "filePath": "main.go", "description": "the loop reads past the end of items"},
+			{"severity": "medium", "filePath": "main.go", "description": "the loop reads past the end of items", "source": "primary"},
 		},
 		"digest": map[string]any{
 			"summary":             "Reworks the loop.",

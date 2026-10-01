@@ -102,3 +102,66 @@ export function sentinelFixLabel(status: string): string {
       return status
   }
 }
+
+// §26.6's amendment: what the counter-reviewer adds is fact-checked, or
+// published marked unverified and counted apart. The server resolves it
+// (ReviewReadoutFinding.additionCheck); these helpers only read that
+// resolution, and never upgrade an unknown value to "checked".
+
+/** isUnverifiedAddition reports whether a readout finding is a counter-review addition the server could not count as checked. Only 'checked' counts -- null or any value this client does not know is unverified, the server's own fail-conservative rule. A finding with any other source, or none recorded (last published before sources were recorded, or posted without one by a turn rendered before they were), is never one. */
+export function isUnverifiedAddition(finding: { source?: string | null; additionCheck?: string | null }): boolean {
+  return finding.source === 'counter_review' && finding.additionCheck !== 'checked'
+}
+
+/** additionCheckReason says why an addition is unverified, in the posted comment's own words (internal/domain/reviewpost's unverifiedAdditionReason). "Could not be confirmed" never claims what the trace holds. */
+export function additionCheckReason(check: string | null | undefined): string {
+  switch (check) {
+    case 'not_run':
+      return 'no fact-check run over it after the counter-review was reported'
+    case 'not_found':
+      return "a fact-check run over it was reported, but none that started after the counter-review and completed was found in this turn's trace when the verdict was posted"
+    case 'unconfirmed':
+      return "whether a fact-check ran over it could not be confirmed: this turn's trace could not be read in full when the verdict was posted"
+    default:
+      return 'no fact-check run over it was confirmed'
+  }
+}
+
+/** additionsCheckLabel renders ReviewReadoutVerdict.additionsCheck -- the server's resolution of the counter-review additions the verdict published -- for the Sentinels panel; '—' when there was nothing to resolve. */
+export function additionsCheckLabel(check: string | null | undefined): string {
+  if (check === null || check === undefined || check === '') return '—'
+  if (check === 'checked') return 'additions checked'
+  if (check === 'unconfirmed') return 'additions unverified (could not be confirmed)'
+  return 'additions unverified'
+}
+
+/** additionsRunSummary renders the Sentinels panel's second fact-check row: the reviewer's report and kill count, then the server's resolution of the additions the verdict published. A verdict that published none -- its second run removed every addition -- reads 'no addition published', never 'additions unverified': additionsCheck is null exactly then. hasUnsourcedFinding says some published finding has no recorded source, which could have been an addition the server never saw as one; the row then says only that nothing was resolved, never that no addition was published. '—' when there was neither a second run nor an addition. */
+export function additionsRunSummary(
+  verdict: { additionsFactCheck?: string | null; additionsFactCheckKilled?: number | null; additionsCheck?: string | null } | null | undefined,
+  hasUnsourcedFinding = false,
+): string {
+  const reported = verdict?.additionsFactCheck ?? null
+  const check = verdict?.additionsCheck ?? null
+  if (!reported && !check) return '—'
+  const killed = typeof verdict?.additionsFactCheckKilled === 'number' ? ` (${verdict.additionsFactCheckKilled} killed)` : ''
+  let resolution = 'no addition published'
+  if (check) resolution = additionsCheckLabel(check)
+  else if (hasUnsourcedFinding) resolution = 'not resolved -- a finding has no recorded source'
+  return `${reported ?? 'not reported'}${killed} · ${resolution}`
+}
+
+/** findingSourceBucketLabel renders ReviewAnalyticsFindingSourceCount.source, the bucket the per-source finding breakdown counts under. */
+export function findingSourceBucketLabel(source: string): string {
+  switch (source) {
+    case 'primary':
+      return 'primary reviewer'
+    case 'counter_review':
+      return 'counter-review, checked'
+    case 'counter_review_unverified':
+      return 'counter-review, unverified'
+    case 'not_recorded':
+      return 'source not recorded'
+    default:
+      return source
+  }
+}

@@ -3046,13 +3046,19 @@ type DecisionInboxItem struct {
 	// session, only.
 	FailureReason DecisionInboxItemFailureReason `json:"failureReason" yaml:"failureReason" mapstructure:"failureReason"`
 
-	// Count of still-open (never rebutted/fixed) review findings on this PR. Set for
-	// any PR-shaped row -- see ciGreen's own description -- UNLESS the count itself
-	// could not be determined (a store error) -- a transient failure fails the
-	// *eligibility computation* closed (treated internally as though a blocking
-	// finding were present) but that fail-closed sentinel must never be presented on
-	// the wire as an honest, real count, so this is null in that case instead, never
-	// the synthetic value used internally.
+	// Count of still-open (never rebutted/fixed) review findings on this PR, as a
+	// client shows it: every one EXCEPT the counter-review additions the server could
+	// not count as checked, which unverifiedAdditions counts apart (§26.6's
+	// amendment), so the row agrees with the Code review view. A display count only:
+	// the merge gate's own open-findings count (§26.5) is unchanged and includes
+	// those additions, so a row can be blocked by an open finding while this reads 0
+	// and unverifiedAdditions does not. Set for any PR-shaped row -- see ciGreen's
+	// own description -- UNLESS the count itself could not be determined (a store
+	// error) -- a transient failure fails the *eligibility computation* closed
+	// (treated internally as though a blocking finding were present) but that
+	// fail-closed sentinel must never be presented on the wire as an honest, real
+	// count, so this is null in that case instead, never the synthetic value used
+	// internally.
 	Findings DecisionInboxItemFindings `json:"findings" yaml:"findings" mapstructure:"findings"`
 
 	// The PR's own current GitHub review-decision fact -- display only, NEVER what
@@ -3190,6 +3196,14 @@ type DecisionInboxItem struct {
 	// Title corresponds to the JSON schema field "title".
 	Title string `json:"title" yaml:"title" mapstructure:"title"`
 
+	// §26.6's amendment: count of still-open counter-review additions on this PR that
+	// the server could not count as checked -- shown apart from findings, never in
+	// it, as the posted comment, the readout and the Code review view count them. A
+	// display count: they block merge exactly like any other open finding (§26.5).
+	// Set whenever findings is, on any PR-shaped row; null or absent when findings is
+	// null, and on a row that is not a pull request.
+	UnverifiedAdditions DecisionInboxItemUnverifiedAdditions `json:"unverifiedAdditions,omitempty,omitzero" yaml:"unverifiedAdditions,omitempty" mapstructure:"unverifiedAdditions,omitempty"`
+
 	// review_verdicts.id for this PR's own CURRENT latest verdict, whenever one has
 	// been posted -- null for a PR with no review verdict of record. This is the id a
 	// client names back on AcceptReviewVerdictRequest.verdictId (finding F3,
@@ -3323,13 +3337,18 @@ type DecisionInboxItemCompositionReviewed *bool
 // session, only.
 type DecisionInboxItemFailureReason *string
 
-// Count of still-open (never rebutted/fixed) review findings on this PR. Set for
-// any PR-shaped row -- see ciGreen's own description -- UNLESS the count itself
-// could not be determined (a store error) -- a transient failure fails the
-// *eligibility computation* closed (treated internally as though a blocking
-// finding were present) but that fail-closed sentinel must never be presented on
-// the wire as an honest, real count, so this is null in that case instead, never
-// the synthetic value used internally.
+// Count of still-open (never rebutted/fixed) review findings on this PR, as a
+// client shows it: every one EXCEPT the counter-review additions the server could
+// not count as checked, which unverifiedAdditions counts apart (§26.6's
+// amendment), so the row agrees with the Code review view. A display count only:
+// the merge gate's own open-findings count (§26.5) is unchanged and includes those
+// additions, so a row can be blocked by an open finding while this reads 0 and
+// unverifiedAdditions does not. Set for any PR-shaped row -- see ciGreen's own
+// description -- UNLESS the count itself could not be determined (a store error)
+// -- a transient failure fails the *eligibility computation* closed (treated
+// internally as though a blocking finding were present) but that fail-closed
+// sentinel must never be presented on the wire as an honest, real count, so this
+// is null in that case instead, never the synthetic value used internally.
 type DecisionInboxItemFindings *int
 
 // The PR's own current GitHub review-decision fact -- display only, NEVER what
@@ -3515,6 +3534,14 @@ type DecisionInboxItemRiskLabel *string
 // PR-shaped row Narvi has never been mentioned on, which is common and not an
 // error.
 type DecisionInboxItemSessionId *string
+
+// §26.6's amendment: count of still-open counter-review additions on this PR that
+// the server could not count as checked -- shown apart from findings, never in it,
+// as the posted comment, the readout and the Code review view count them. A
+// display count: they block merge exactly like any other open finding (§26.5). Set
+// whenever findings is, on any PR-shaped row; null or absent when findings is
+// null, and on a row that is not a pull request.
+type DecisionInboxItemUnverifiedAdditions *int
 
 // review_verdicts.id for this PR's own CURRENT latest verdict, whenever one has
 // been posted -- null for a PR with no review verdict of record. This is the id a
@@ -7172,6 +7199,23 @@ func (j *PostReleaseCompositionFindingsResponse) UnmarshalJSON(value []byte) err
 // counter-review + readout measurement') -- see those two properties' own doc
 // comments below.
 type PostReviewVerdictRequest struct {
+	// §26.6's amendment: the reviewer's report of the deep path's SECOND fact-check
+	// run, the diff-only pass over what the counter-review added, run after it and
+	// before publication -- 'done' or 'skipped' when present
+	// (internal/domain/reviewpost.ValidateVerdictInput's
+	// ErrInvalidAdditionsFactCheck), absent when the counter-review added nothing.
+	// Refused off the deep path (ErrCounterReviewAdditionOffDeepPath). Self-reported
+	// and recorded apart from factCheck, the first run. 'done' is necessary but never
+	// sufficient: an addition counts as checked only when the server also finds that
+	// run in the turn's own sub-task trace.
+	AdditionsFactCheck PostReviewVerdictRequestAdditionsFactCheck `json:"additionsFactCheck,omitempty,omitzero" yaml:"additionsFactCheck,omitempty" mapstructure:"additionsFactCheck,omitempty"`
+
+	// §26.6's amendment: the count of counter-review additions the second fact-check
+	// run removed as provably wrong from the diff alone -- self-reported, and 0 or
+	// absent unless additionsFactCheck is 'done'
+	// (ErrAdditionsFactCheckKilledWithoutRun). Recorded apart from factCheckKilled.
+	AdditionsFactCheckKilled PostReviewVerdictRequestAdditionsFactCheckKilled `json:"additionsFactCheckKilled,omitempty,omitzero" yaml:"additionsFactCheckKilled,omitempty" mapstructure:"additionsFactCheckKilled,omitempty"`
+
 	// Matches internal/domain/review.Tag's own fixed, closed vocabulary exactly -- an
 	// empty array is legal (the reviewer found no tagged area touched).
 	BlastRadius []PostReviewVerdictRequestBlastRadiusElem `json:"blastRadius" yaml:"blastRadius" mapstructure:"blastRadius"`
@@ -7254,6 +7298,23 @@ type PostReviewVerdictRequest struct {
 	// Matches internal/domain/review.TestsCoverageState's own three values exactly.
 	TestsCoverage PostReviewVerdictRequestTestsCoverage `json:"testsCoverage" yaml:"testsCoverage" mapstructure:"testsCoverage"`
 }
+
+// §26.6's amendment: the reviewer's report of the deep path's SECOND fact-check
+// run, the diff-only pass over what the counter-review added, run after it and
+// before publication -- 'done' or 'skipped' when present
+// (internal/domain/reviewpost.ValidateVerdictInput's
+// ErrInvalidAdditionsFactCheck), absent when the counter-review added nothing.
+// Refused off the deep path (ErrCounterReviewAdditionOffDeepPath). Self-reported
+// and recorded apart from factCheck, the first run. 'done' is necessary but never
+// sufficient: an addition counts as checked only when the server also finds that
+// run in the turn's own sub-task trace.
+type PostReviewVerdictRequestAdditionsFactCheck *string
+
+// §26.6's amendment: the count of counter-review additions the second fact-check
+// run removed as provably wrong from the diff alone -- self-reported, and 0 or
+// absent unless additionsFactCheck is 'done'
+// (ErrAdditionsFactCheckKilledWithoutRun). Recorded apart from factCheckKilled.
+type PostReviewVerdictRequestAdditionsFactCheckKilled *int
 
 type PostReviewVerdictRequestBlastRadiusElem string
 
@@ -7827,6 +7888,29 @@ type PostedFinding struct {
 	// severity, independent of the verdict's overall riskLevel.
 	Severity PostedFindingSeverity `json:"severity" yaml:"severity" mapstructure:"severity"`
 
+	// §26.6's amendment: the pass of the review that produced this finding --
+	// 'primary' (the primary reviewer, put through the first fact-check run) or
+	// 'counter_review' (an addition the counter-reviewer surfaced on its own, deep
+	// path only, which the first fact-check run never saw). Optional in the schema; a
+	// value that is present must be 'primary' or 'counter_review'
+	// (internal/domain/reviewpost.ValidateVerdictInput's ErrInvalidFindingSource),
+	// and 'counter_review' is refused off the deep path
+	// (ErrCounterReviewAdditionOffDeepPath). An absent source is admitted in one case
+	// only: from a turn whose own stored prompt predates the source instruction (it
+	// carries no 'source' entry in its finding object), on a payload that reports no
+	// additionsFactCheck, a field only the current prompt names. The verdict body
+	// follows the review prompt, which is rendered once, when the turn is created,
+	// and re-sent as stored, so such a turn posts its findings without the field; its
+	// finding is stored with no source recorded -- read as neither primary nor an
+	// addition, exactly like a finding last published before sources were recorded.
+	// From any other turn an absent source is refused with 400, like a garbled one.
+	// Self-reported: the server records it as the payload states it
+	// (review_findings.reported_source). A 'counter_review' finding is published as
+	// checked only when the server finds, in the turn's own sub-task trace, a
+	// fact-check sub-task that started after the counter-review and completed;
+	// otherwise it is published marked unverified and counted apart.
+	Source PostedFindingSource `json:"source,omitempty,omitzero" yaml:"source,omitempty" mapstructure:"source,omitempty"`
+
 	// An optional unified-diff/patch text the apply-suggestion endpoint (§12.2 item
 	// 2) can attempt to apply.
 	SuggestedFix PostedFindingSuggestedFix `json:"suggestedFix,omitempty,omitzero" yaml:"suggestedFix,omitempty" mapstructure:"suggestedFix,omitempty"`
@@ -7878,6 +7962,29 @@ func (j *PostedFindingSeverity) UnmarshalJSON(value []byte) error {
 	*j = PostedFindingSeverity(v)
 	return nil
 }
+
+// §26.6's amendment: the pass of the review that produced this finding --
+// 'primary' (the primary reviewer, put through the first fact-check run) or
+// 'counter_review' (an addition the counter-reviewer surfaced on its own, deep
+// path only, which the first fact-check run never saw). Optional in the schema; a
+// value that is present must be 'primary' or 'counter_review'
+// (internal/domain/reviewpost.ValidateVerdictInput's ErrInvalidFindingSource), and
+// 'counter_review' is refused off the deep path
+// (ErrCounterReviewAdditionOffDeepPath). An absent source is admitted in one case
+// only: from a turn whose own stored prompt predates the source instruction (it
+// carries no 'source' entry in its finding object), on a payload that reports no
+// additionsFactCheck, a field only the current prompt names. The verdict body
+// follows the review prompt, which is rendered once, when the turn is created, and
+// re-sent as stored, so such a turn posts its findings without the field; its
+// finding is stored with no source recorded -- read as neither primary nor an
+// addition, exactly like a finding last published before sources were recorded.
+// From any other turn an absent source is refused with 400, like a garbled one.
+// Self-reported: the server records it as the payload states it
+// (review_findings.reported_source). A 'counter_review' finding is published as
+// checked only when the server finds, in the turn's own sub-task trace, a
+// fact-check sub-task that started after the counter-review and completed;
+// otherwise it is published marked unverified and counted apart.
+type PostedFindingSource *string
 
 // An optional unified-diff/patch text the apply-suggestion endpoint (§12.2 item 2)
 // can attempt to apply.
@@ -9545,11 +9652,19 @@ type ReviewAnalytics struct {
 	DigestContestationRatePercent ReviewAnalyticsDigestContestationRatePercent `json:"digestContestationRatePercent" yaml:"digestContestationRatePercent" mapstructure:"digestContestationRatePercent"`
 
 	// Every reviewpost.FindingStatus present in the window, sorted by count
-	// descending then status ascending. Null iff findingOutcomesComputed is false --
-	// like timeseries above, a real, computed result can never itself be an empty
-	// array (every counted status is non-empty by construction), so null is
-	// unambiguous here too.
+	// descending then status ascending, over every finding EXCEPT the counter-review
+	// additions the server could not count as checked (§26.6's amendment), which are
+	// counted apart, in findingOutcomesBySource. Null iff findingOutcomesComputed is
+	// false. A computed result is empty only when every finding in the window is such
+	// an addition.
 	FindingOutcomes *ReviewAnalyticsFindingOutcomes `json:"findingOutcomes" yaml:"findingOutcomes" mapstructure:"findingOutcomes"`
+
+	// §26.5/§26.6's amendment: every finding in the window counted per source and
+	// status -- the breakdown precision per source is read from (the share of a
+	// source's findings a maintainer rebutted). Sorted by source ('primary',
+	// 'counter_review', 'counter_review_unverified', 'not_recorded'), then count
+	// descending, then status ascending. Null iff findingOutcomesComputed is false.
+	FindingOutcomesBySource *ReviewAnalyticsFindingOutcomesBySource `json:"findingOutcomesBySource" yaml:"findingOutcomesBySource" mapstructure:"findingOutcomesBySource"`
 
 	// False iff no review_findings row exists for this repo within the window --
 	// reads a DIFFERENT table than the two rollups above (review_findings, §8.2's
@@ -9645,11 +9760,102 @@ func (j *ReviewAnalyticsDayBucket) UnmarshalJSON(value []byte) error {
 type ReviewAnalyticsDigestContestationRatePercent *float64
 
 // Every reviewpost.FindingStatus present in the window, sorted by count descending
-// then status ascending. Null iff findingOutcomesComputed is false -- like
-// timeseries above, a real, computed result can never itself be an empty array
-// (every counted status is non-empty by construction), so null is unambiguous here
-// too.
+// then status ascending, over every finding EXCEPT the counter-review additions
+// the server could not count as checked (§26.6's amendment), which are counted
+// apart, in findingOutcomesBySource. Null iff findingOutcomesComputed is false. A
+// computed result is empty only when every finding in the window is such an
+// addition.
 type ReviewAnalyticsFindingOutcomes []ReviewAnalyticsFindingStatusCount
+
+// §26.5/§26.6's amendment: every finding in the window counted per source and
+// status -- the breakdown precision per source is read from (the share of a
+// source's findings a maintainer rebutted). Sorted by source ('primary',
+// 'counter_review', 'counter_review_unverified', 'not_recorded'), then count
+// descending, then status ascending. Null iff findingOutcomesComputed is false.
+type ReviewAnalyticsFindingOutcomesBySource []ReviewAnalyticsFindingSourceCount
+
+// §26.5/§26.6's amendment: one (source, status) pair's count across the window's
+// review_findings rows -- ReviewAnalytics.findingOutcomesBySource's own row
+// (internal/domain/reviewverdict.FindingSourceStatusCount).
+type ReviewAnalyticsFindingSourceCount struct {
+	// Count corresponds to the JSON schema field "count".
+	Count int `json:"count" yaml:"count" mapstructure:"count"`
+
+	// 'primary', 'counter_review' (an addition the server counted as checked),
+	// 'counter_review_unverified' (an addition it could not: counted apart), or
+	// 'not_recorded' (a finding last published with no source recorded: before
+	// sources were recorded, or by a turn whose prompt was rendered before they
+	// were). The source is self-reported by the reviewer. Unconstrained here, like
+	// ReviewReadoutVerdict.counterReview, so a later bucket is not a breaking change.
+	Source string `json:"source" yaml:"source" mapstructure:"source"`
+
+	// Status corresponds to the JSON schema field "status".
+	Status ReviewAnalyticsFindingSourceCountStatus `json:"status" yaml:"status" mapstructure:"status"`
+}
+
+type ReviewAnalyticsFindingSourceCountStatus string
+
+const ReviewAnalyticsFindingSourceCountStatusFixApplied ReviewAnalyticsFindingSourceCountStatus = "fix_applied"
+const ReviewAnalyticsFindingSourceCountStatusFixMerged ReviewAnalyticsFindingSourceCountStatus = "fix_merged"
+const ReviewAnalyticsFindingSourceCountStatusFixOpen ReviewAnalyticsFindingSourceCountStatus = "fix_open"
+const ReviewAnalyticsFindingSourceCountStatusFixPending ReviewAnalyticsFindingSourceCountStatus = "fix_pending"
+const ReviewAnalyticsFindingSourceCountStatusFixRecorded ReviewAnalyticsFindingSourceCountStatus = "fix_recorded"
+const ReviewAnalyticsFindingSourceCountStatusOpen ReviewAnalyticsFindingSourceCountStatus = "open"
+const ReviewAnalyticsFindingSourceCountStatusRebutted ReviewAnalyticsFindingSourceCountStatus = "rebutted"
+
+var enumValues_ReviewAnalyticsFindingSourceCountStatus = []interface{}{
+	"open",
+	"rebutted",
+	"fix_pending",
+	"fix_open",
+	"fix_merged",
+	"fix_applied",
+	"fix_recorded",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ReviewAnalyticsFindingSourceCountStatus) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_ReviewAnalyticsFindingSourceCountStatus {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_ReviewAnalyticsFindingSourceCountStatus, v)
+	}
+	*j = ReviewAnalyticsFindingSourceCountStatus(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ReviewAnalyticsFindingSourceCount) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["count"]; raw != nil && !ok {
+		return fmt.Errorf("field count in ReviewAnalyticsFindingSourceCount: required")
+	}
+	if _, ok := raw["source"]; raw != nil && !ok {
+		return fmt.Errorf("field source in ReviewAnalyticsFindingSourceCount: required")
+	}
+	if _, ok := raw["status"]; raw != nil && !ok {
+		return fmt.Errorf("field status in ReviewAnalyticsFindingSourceCount: required")
+	}
+	type Plain ReviewAnalyticsFindingSourceCount
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = ReviewAnalyticsFindingSourceCount(plain)
+	return nil
+}
 
 // One reviewpost.FindingStatus's own occurrence count across the window's
 // review_findings rows -- ReviewAnalytics.findingOutcomes' own per-status row
@@ -9828,6 +10034,9 @@ func (j *ReviewAnalytics) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["findingOutcomes"]; raw != nil && !ok {
 		return fmt.Errorf("field findingOutcomes in ReviewAnalytics: required")
+	}
+	if _, ok := raw["findingOutcomesBySource"]; raw != nil && !ok {
+		return fmt.Errorf("field findingOutcomesBySource in ReviewAnalytics: required")
 	}
 	if _, ok := raw["findingOutcomesComputed"]; raw != nil && !ok {
 		return fmt.Errorf("field findingOutcomesComputed in ReviewAnalytics: required")
@@ -10101,6 +10310,14 @@ type ReviewReadoutEpistemicOutcome *string
 // startLine/endLine, re-resolved at READ time (§22.1.1/§22.5) rather than stored,
 // so a separate type from ReviewFinding rather than a breaking change to it.
 type ReviewReadoutFinding struct {
+	// §26.6's amendment: for a 'counter_review' finding, the server's resolution at
+	// its latest publication -- 'checked', 'not_run', 'not_found' or 'unconfirmed'
+	// (see ReviewReadoutVerdict.additionsCheck); null for any other finding. A
+	// 'counter_review' finding whose additionCheck is anything but 'checked' is
+	// unverified, and a client marks it so and counts it apart from the other
+	// findings.
+	AdditionCheck ReviewReadoutFindingAdditionCheck `json:"additionCheck" yaml:"additionCheck" mapstructure:"additionCheck"`
+
 	// Description corresponds to the JSON schema field "description".
 	Description string `json:"description" yaml:"description" mapstructure:"description"`
 
@@ -10125,6 +10342,14 @@ type ReviewReadoutFinding struct {
 	// Severity corresponds to the JSON schema field "severity".
 	Severity ReviewReadoutFindingSeverity `json:"severity" yaml:"severity" mapstructure:"severity"`
 
+	// §26.6's amendment: the pass the finding's latest publication reported producing
+	// it -- 'primary' or 'counter_review' (self-reported,
+	// review_findings.reported_source). Null when no source was recorded: the finding
+	// was last published before sources were recorded, or by a turn whose prompt was
+	// rendered before they were (a posted finding with no source), and reads as
+	// neither.
+	Source ReviewReadoutFindingSource `json:"source" yaml:"source" mapstructure:"source"`
+
 	// §22.1.1's own content-anchored position, re-resolved at read time against the
 	// diff at the latest verdict's own headSha. 0 means explicitly unanchored --
 	// never a guessed line number; a client must render this distinctly from a real
@@ -10137,6 +10362,14 @@ type ReviewReadoutFinding struct {
 	// SuggestedFix corresponds to the JSON schema field "suggestedFix".
 	SuggestedFix ReviewReadoutFindingSuggestedFix `json:"suggestedFix" yaml:"suggestedFix" mapstructure:"suggestedFix"`
 }
+
+// §26.6's amendment: for a 'counter_review' finding, the server's resolution at
+// its latest publication -- 'checked', 'not_run', 'not_found' or 'unconfirmed'
+// (see ReviewReadoutVerdict.additionsCheck); null for any other finding. A
+// 'counter_review' finding whose additionCheck is anything but 'checked' is
+// unverified, and a client marks it so and counts it apart from the other
+// findings.
+type ReviewReadoutFindingAdditionCheck *string
 
 type ReviewReadoutFindingLine *int
 
@@ -10175,6 +10408,14 @@ func (j *ReviewReadoutFindingSeverity) UnmarshalJSON(value []byte) error {
 	*j = ReviewReadoutFindingSeverity(v)
 	return nil
 }
+
+// §26.6's amendment: the pass the finding's latest publication reported producing
+// it -- 'primary' or 'counter_review' (self-reported,
+// review_findings.reported_source). Null when no source was recorded: the finding
+// was last published before sources were recorded, or by a turn whose prompt was
+// rendered before they were (a posted finding with no source), and reads as
+// neither.
+type ReviewReadoutFindingSource *string
 
 type ReviewReadoutFindingStatus string
 
@@ -10224,6 +10465,9 @@ func (j *ReviewReadoutFinding) UnmarshalJSON(value []byte) error {
 	if err := json.Unmarshal(value, &raw); err != nil {
 		return err
 	}
+	if _, ok := raw["additionCheck"]; raw != nil && !ok {
+		return fmt.Errorf("field additionCheck in ReviewReadoutFinding: required")
+	}
 	if _, ok := raw["description"]; raw != nil && !ok {
 		return fmt.Errorf("field description in ReviewReadoutFinding: required")
 	}
@@ -10247,6 +10491,9 @@ func (j *ReviewReadoutFinding) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["severity"]; raw != nil && !ok {
 		return fmt.Errorf("field severity in ReviewReadoutFinding: required")
+	}
+	if _, ok := raw["source"]; raw != nil && !ok {
+		return fmt.Errorf("field source in ReviewReadoutFinding: required")
 	}
 	if _, ok := raw["startLine"]; raw != nil && !ok {
 		return fmt.Errorf("field startLine in ReviewReadoutFinding: required")
@@ -10316,6 +10563,33 @@ func (j *ReviewReadoutHandoffReadiness) UnmarshalJSON(value []byte) error {
 // Null when no verdict has ever been posted for this PR -- an honest 'not reviewed
 // yet' state, never a fabricated placeholder verdict.
 type ReviewReadoutLatestVerdict struct {
+	// §26.6's amendment: the server's resolution of this verdict's counter-review
+	// additions -- 'checked' (a fact-check sub-task that started after the
+	// counter-review and completed is in the turn's own trace, and the reviewer
+	// reported the run done), 'not_run' (the reviewer reported no such run),
+	// 'not_found' (reported, and the trace read when the verdict was posted held
+	// none), or 'unconfirmed' (the trace could not be read in full). Null when the
+	// verdict published no counter-review addition -- a light-path verdict, a deep
+	// one whose counter-review added nothing, one whose second run removed every
+	// addition (additionsFactCheck and additionsFactCheckKilled still say so), or one
+	// posted before this field existed -- since there was then nothing to resolve.
+	// Unconstrained here for the same reason counterReview is. So a value is present
+	// only when additions were published, and every value but 'checked' means they
+	// were published marked unverified.
+	AdditionsCheck ReviewReadoutVerdictAdditionsCheck `json:"additionsCheck,omitempty,omitzero" yaml:"additionsCheck,omitempty" mapstructure:"additionsCheck,omitempty"`
+
+	// §26.6's amendment: the second fact-check run, over what the counter-review
+	// added, as the reviewer reported it -- 'done'/'skipped', or null when it
+	// reported none (a light-path verdict, a deep one whose counter-review added
+	// nothing, or one posted before this field existed). Self-reported; recorded
+	// apart from factCheck.
+	AdditionsFactCheck ReviewReadoutVerdictAdditionsFactCheck `json:"additionsFactCheck,omitempty,omitzero" yaml:"additionsFactCheck,omitempty" mapstructure:"additionsFactCheck,omitempty"`
+
+	// §26.6's amendment: the count the reviewer reported the second run removed; null
+	// when it reported no second run. Self-reported; recorded apart from
+	// factCheckKilled.
+	AdditionsFactCheckKilled ReviewReadoutVerdictAdditionsFactCheckKilled `json:"additionsFactCheckKilled,omitempty,omitzero" yaml:"additionsFactCheckKilled,omitempty" mapstructure:"additionsFactCheckKilled,omitempty"`
+
 	// Display data only -- §21.2: 'both are display data and neither may gate
 	// anything.' Never used client-side to enable/disable an action.
 	BlastRadius []ReviewReadoutVerdictBlastRadiusElem `json:"blastRadius" yaml:"blastRadius" mapstructure:"blastRadius"`
@@ -10504,6 +10778,33 @@ func (j *ReviewReadoutSessionReuse) UnmarshalJSON(value []byte) error {
 // carries: the AUTHORITATIVE server-computed shippable (never proposedShippable),
 // headSha, postedAt, and sessionId.
 type ReviewReadoutVerdict struct {
+	// §26.6's amendment: the server's resolution of this verdict's counter-review
+	// additions -- 'checked' (a fact-check sub-task that started after the
+	// counter-review and completed is in the turn's own trace, and the reviewer
+	// reported the run done), 'not_run' (the reviewer reported no such run),
+	// 'not_found' (reported, and the trace read when the verdict was posted held
+	// none), or 'unconfirmed' (the trace could not be read in full). Null when the
+	// verdict published no counter-review addition -- a light-path verdict, a deep
+	// one whose counter-review added nothing, one whose second run removed every
+	// addition (additionsFactCheck and additionsFactCheckKilled still say so), or one
+	// posted before this field existed -- since there was then nothing to resolve.
+	// Unconstrained here for the same reason counterReview is. So a value is present
+	// only when additions were published, and every value but 'checked' means they
+	// were published marked unverified.
+	AdditionsCheck ReviewReadoutVerdictAdditionsCheck `json:"additionsCheck,omitempty,omitzero" yaml:"additionsCheck,omitempty" mapstructure:"additionsCheck,omitempty"`
+
+	// §26.6's amendment: the second fact-check run, over what the counter-review
+	// added, as the reviewer reported it -- 'done'/'skipped', or null when it
+	// reported none (a light-path verdict, a deep one whose counter-review added
+	// nothing, or one posted before this field existed). Self-reported; recorded
+	// apart from factCheck.
+	AdditionsFactCheck ReviewReadoutVerdictAdditionsFactCheck `json:"additionsFactCheck,omitempty,omitzero" yaml:"additionsFactCheck,omitempty" mapstructure:"additionsFactCheck,omitempty"`
+
+	// §26.6's amendment: the count the reviewer reported the second run removed; null
+	// when it reported no second run. Self-reported; recorded apart from
+	// factCheckKilled.
+	AdditionsFactCheckKilled ReviewReadoutVerdictAdditionsFactCheckKilled `json:"additionsFactCheckKilled,omitempty,omitzero" yaml:"additionsFactCheckKilled,omitempty" mapstructure:"additionsFactCheckKilled,omitempty"`
+
 	// Display data only -- §21.2: 'both are display data and neither may gate
 	// anything.' Never used client-side to enable/disable an action.
 	BlastRadius []ReviewReadoutVerdictBlastRadiusElem `json:"blastRadius" yaml:"blastRadius" mapstructure:"blastRadius"`
@@ -10561,6 +10862,33 @@ type ReviewReadoutVerdict struct {
 	// TestsCoverage corresponds to the JSON schema field "testsCoverage".
 	TestsCoverage ReviewReadoutVerdictTestsCoverage `json:"testsCoverage" yaml:"testsCoverage" mapstructure:"testsCoverage"`
 }
+
+// §26.6's amendment: the server's resolution of this verdict's counter-review
+// additions -- 'checked' (a fact-check sub-task that started after the
+// counter-review and completed is in the turn's own trace, and the reviewer
+// reported the run done), 'not_run' (the reviewer reported no such run),
+// 'not_found' (reported, and the trace read when the verdict was posted held
+// none), or 'unconfirmed' (the trace could not be read in full). Null when the
+// verdict published no counter-review addition -- a light-path verdict, a deep one
+// whose counter-review added nothing, one whose second run removed every addition
+// (additionsFactCheck and additionsFactCheckKilled still say so), or one posted
+// before this field existed -- since there was then nothing to resolve.
+// Unconstrained here for the same reason counterReview is. So a value is present
+// only when additions were published, and every value but 'checked' means they
+// were published marked unverified.
+type ReviewReadoutVerdictAdditionsCheck *string
+
+// §26.6's amendment: the second fact-check run, over what the counter-review
+// added, as the reviewer reported it -- 'done'/'skipped', or null when it reported
+// none (a light-path verdict, a deep one whose counter-review added nothing, or
+// one posted before this field existed). Self-reported; recorded apart from
+// factCheck.
+type ReviewReadoutVerdictAdditionsFactCheck *string
+
+// §26.6's amendment: the count the reviewer reported the second run removed; null
+// when it reported no second run. Self-reported; recorded apart from
+// factCheckKilled.
+type ReviewReadoutVerdictAdditionsFactCheckKilled *int
 
 type ReviewReadoutVerdictBlastRadiusElem string
 
@@ -15867,19 +16195,7 @@ type WorkflowStepRunOutcomeSummary *string
 
 type WorkflowStepRunStatus string
 
-const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
-const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
-const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
-const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
-const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
-
-var enumValues_WorkflowStepRunStatus = []interface{}{
-	"awaiting_decision",
-	"running",
-	"completed",
-	"failed",
-	"cancelled",
-}
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
@@ -15899,6 +16215,22 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	}
 	*j = WorkflowStepRunStatus(v)
 	return nil
+}
+
+type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
+
+const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
+const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
+const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
+const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
+const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
+
+var enumValues_WorkflowStepRunStatus = []interface{}{
+	"awaiting_decision",
+	"running",
+	"completed",
+	"failed",
+	"cancelled",
 }
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
@@ -15964,7 +16296,3 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 }
 
 type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
-
-type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict

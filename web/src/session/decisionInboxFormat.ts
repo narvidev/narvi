@@ -166,15 +166,15 @@ export interface DecisionInboxChip {
  * "not green" when genuinely unknown.
  */
 export function prChipData(
-  item: Pick<DecisionInboxItem, 'riskLabel' | 'findings' | 'ciGreen' | 'hasChangesRequested' | 'acceptanceId'>,
+  item: Pick<DecisionInboxItem, 'riskLabel' | 'findings' | 'unverifiedAdditions' | 'ciGreen' | 'hasChangesRequested' | 'acceptanceId'>,
 ): DecisionInboxChip[] {
   const chips: DecisionInboxChip[] = []
 
+  const counts = findingCountsText(item)
   if (item.riskLabel) {
-    const findingsSuffix = item.findings !== null && item.findings > 0 ? ` · ${item.findings} finding${item.findings === 1 ? '' : 's'}` : ''
-    chips.push({ tone: riskLabelTone(item.riskLabel), text: `${riskLabelText(item.riskLabel)}${findingsSuffix}` })
-  } else if (item.findings !== null && item.findings > 0) {
-    chips.push({ tone: 'warn', text: `${item.findings} finding${item.findings === 1 ? '' : 's'}` })
+    chips.push({ tone: riskLabelTone(item.riskLabel), text: `${riskLabelText(item.riskLabel)}${counts ? ` · ${counts}` : ''}` })
+  } else if (counts) {
+    chips.push({ tone: 'warn', text: counts })
   }
 
   if (item.ciGreen !== null) {
@@ -188,6 +188,23 @@ export function prChipData(
   chips.push(...acceptedOverrideChipData(item))
 
   return chips
+}
+
+/**
+ * findingCountsText renders a PR row's open findings and, apart from them,
+ * its unverified counter-review additions (§26.6's amendment): "2 findings
+ * · 1 unverified", the way the Code review view counts them apart. findings
+ * already leaves those additions out (DecisionInboxItem.findings), so the
+ * two never count the same finding; both still block the merge. '' when
+ * there is neither, or when the count is unknown (findings null).
+ */
+export function findingCountsText(item: Pick<DecisionInboxItem, 'findings' | 'unverifiedAdditions'>): string {
+  if (item.findings === null) return ''
+  const parts: string[] = []
+  if (item.findings > 0) parts.push(`${item.findings} finding${item.findings === 1 ? '' : 's'}`)
+  const unverified = item.unverifiedAdditions ?? 0
+  if (unverified > 0) parts.push(`${unverified} unverified`)
+  return parts.join(' · ')
 }
 
 /**
