@@ -199,6 +199,25 @@ describe('featuredRun', () => {
       want: 'r1',
     },
     { name: 'a live id that names no listed run changes nothing', runs: [baseRun({ id: 'r1', status: 'completed' })], live: 'gone', want: 'r1' },
+    // Two live runs: the newest is featured. The run list and the status
+    // are read apart, so a list that already shows the next turn's fresh
+    // run can sit beside a status read before that turn, still naming the
+    // older escalation as open.
+    {
+      name: 'a newer running run beside the older escalation a stale status still names: the newer one',
+      runs: [baseRun({ id: 'next', status: 'running', createdAt: '2026-08-20T02:00:00Z' }), baseRun({ id: 'escalated', status: 'needs_review', createdAt: '2026-08-20T01:00:00Z' })],
+      live: 'escalated',
+      want: 'next',
+    },
+    // The server keeps one running run per session (a unique index), and a
+    // run waiting at a HITL gate is still running; were a list to hold two,
+    // the newest would still be the one featured.
+    {
+      name: 'an older run running at a HITL gate beside a newer running run: the newer one',
+      runs: [baseRun({ id: 'newer', status: 'running', createdAt: '2026-08-20T02:00:00Z' }), baseRun({ id: 'gated', status: 'running', createdAt: '2026-08-20T01:00:00Z' })],
+      live: null,
+      want: 'newer',
+    },
   ]
   for (const c of cases) {
     it(c.name, () => {

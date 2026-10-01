@@ -55,7 +55,7 @@
 // testing, mirroring PlanCard/DefinitionRow/WorkflowStepNode's own
 // established precedent.
 import { useState } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 
 import type { WorkflowRun, WorkflowStepRun } from '@narvi/contracts/rest-dtos'
@@ -162,7 +162,33 @@ export function EdgeConnector({ edge, toStepIndex }: { edge: EdgeTaken; toStepIn
   return <div className="resumed-note">{edgeLabel(edge, toStepIndex)}</div>
 }
 
-function ReviseBox({ runId, stepRunId, sessionId, onDone }: { runId: string; stepRunId: string; sessionId: string; onDone: () => void }) {
+/**
+ * invalidateAfterDecision re-reads everything a verdict on a workflow step
+ * can change, for all three verdicts alike: the run and the session's run
+ * list, the session and the session lists, and the session's status --
+ * whose `escalation` decides which run this view features and re-reads, and
+ * what its banner says (featuredRun, runRefetchInterval, escalationNotice).
+ * An approve can escalate the run inside the request (an outcome with no
+ * next step, or a retry loop's guard tripping, §25.9), making it the live
+ * escalation (technical plan §43.20); without the status, the view would
+ * read the escalation as it stood before the verdict until the next poll,
+ * and say that nothing waits on a person who is being waited on.
+ */
+function invalidateAfterDecision(queryClient: QueryClient, sessionId: string, runId: string): void {
+  for (const queryKey of [
+    workflowRunQueryKeys.detail(runId),
+    workflowRunQueryKeys.listForSession(sessionId),
+    sessionQueryKeys.detail(sessionId),
+    sessionQueryKeys.activity(sessionId),
+    sessionListQueryKeys.list('mine'),
+    sessionListQueryKeys.list('all'),
+  ]) {
+    void queryClient.invalidateQueries({ queryKey })
+  }
+}
+
+/** ReviseBox is the revise verdict's own text box. Exported for direct wiring testing: what its verdict re-reads once it lands (invalidateAfterDecision). */
+export function ReviseBox({ runId, stepRunId, sessionId, onDone }: { runId: string; stepRunId: string; sessionId: string; onDone: () => void }) {
   const queryClient = useQueryClient()
   const [text, setText] = useState('')
   const reviseMutation = useMutation({
@@ -170,9 +196,7 @@ function ReviseBox({ runId, stepRunId, sessionId, onDone }: { runId: string; ste
     onSuccess: () => {
       setText('')
       onDone()
-      void queryClient.invalidateQueries({ queryKey: workflowRunQueryKeys.detail(runId) })
-      void queryClient.invalidateQueries({ queryKey: workflowRunQueryKeys.listForSession(sessionId) })
-      void queryClient.invalidateQueries({ queryKey: sessionQueryKeys.detail(sessionId) })
+      invalidateAfterDecision(queryClient, sessionId, runId)
     },
   })
 
@@ -211,21 +235,13 @@ function DecisionGate({ sessionId, runId, stepRun, canAct }: { sessionId: string
   const queryClient = useQueryClient()
   const [revising, setRevising] = useState(false)
 
-  function invalidateAfterDecision() {
-    void queryClient.invalidateQueries({ queryKey: workflowRunQueryKeys.detail(runId) })
-    void queryClient.invalidateQueries({ queryKey: workflowRunQueryKeys.listForSession(sessionId) })
-    void queryClient.invalidateQueries({ queryKey: sessionQueryKeys.detail(sessionId) })
-    void queryClient.invalidateQueries({ queryKey: sessionListQueryKeys.list('mine') })
-    void queryClient.invalidateQueries({ queryKey: sessionListQueryKeys.list('all') })
-  }
-
   const approveMutation = useMutation({
     mutationFn: () => decideWorkflowStep(runId, stepRun.id, { verdict: 'approve', text: null }),
-    onSuccess: invalidateAfterDecision,
+    onSuccess: () => invalidateAfterDecision(queryClient, sessionId, runId),
   })
   const rejectMutation = useMutation({
     mutationFn: () => decideWorkflowStep(runId, stepRun.id, { verdict: 'reject', text: null }),
-    onSuccess: invalidateAfterDecision,
+    onSuccess: () => invalidateAfterDecision(queryClient, sessionId, runId),
   })
 
   const pending = approveMutation.isPending || rejectMutation.isPending
@@ -335,9 +351,8 @@ export function WorkflowRunsView({ sessionId }: { sessionId: string }) {
   // A status that could not be read reports no escalation open: no parked
   // run is featured or re-read on a guess.
   const liveEscalationId = liveEscalationRunId(activityQuery.data)
-  const featured = runsQuery.isSuccess
-    ? (selectedRunId === null ? featuredRun(runs, liveEscalationId) : (runs.find((r) => r.id === selectedRunId) ?? featuredRun(runs, liveEscalationId)))
-    : null
+  const selected = selectedRunId === null ? undefined : runs.find((r) => r.id === selectedRunId)
+  const featured = runsQuery.isSuccess ? (selected ?? featuredRun(runs, liveEscalationId)) : null
 
   const runDetailQuery = useQuery({
     queryKey: workflowRunQueryKeys.detail(featured?.id ?? ''),
