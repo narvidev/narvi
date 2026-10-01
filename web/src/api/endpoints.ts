@@ -89,6 +89,7 @@ import type {
   RotateCloudIdentitySigningKeyResponse,
   SandboxSecret,
   Session,
+  SessionActivity,
   ShadowLedgerSummary,
   UpdateAutoApprovalSettingsRequest,
   UpdateAutoMergeToggleRequest,
@@ -142,6 +143,11 @@ export function createSession(body: CreateSessionRequest, signal?: AbortSignal):
 
 export function getSession(sessionId: string, signal?: AbortSignal): Promise<Session> {
   return request<Session>(`/api/sessions/${encodeURIComponent(sessionId)}`, { signal })
+}
+
+/** getSessionActivity calls GET /api/sessions/:id/status (technical plan §43.20) -- what the session's work is doing now, derived by the server in one snapshot, including the workflow escalation still open (`escalation`), which the run view features by. Same gate as getSession. */
+export function getSessionActivity(sessionId: string, signal?: AbortSignal): Promise<SessionActivity> {
+  return request<SessionActivity>(`/api/sessions/${encodeURIComponent(sessionId)}/status`, { signal })
 }
 
 // -- §12.2 item 1: the session workspace sidebar's own list. --

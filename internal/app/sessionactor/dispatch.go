@@ -1530,7 +1530,7 @@ func (a *Actor) planFreshSpawn(
 	}
 	tokenHash := hashSandboxToken(token)
 
-	row, err := a.stores.sandbox.WithTx(tx).UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{
+	row, err := a.sandboxWrites(tx).UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{
 		SessionID: a.sessionID,
 		TokenHash: &tokenHash,
 	})
@@ -1602,7 +1602,7 @@ func (a *Actor) planRestore(
 	}
 	tokenHash := hashSandboxToken(token)
 
-	row, err := a.stores.sandbox.WithTx(tx).UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{
+	row, err := a.sandboxWrites(tx).UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{
 		SessionID: a.sessionID,
 		TokenHash: &tokenHash,
 	})
@@ -1718,7 +1718,7 @@ func (a *Actor) planResume(
 	}
 	tokenHash := hashSandboxToken(token)
 
-	row, err := a.stores.sandbox.WithTx(tx).UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{
+	row, err := a.sandboxWrites(tx).UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{
 		SessionID: a.sessionID,
 		TokenHash: &tokenHash,
 	})
@@ -1864,7 +1864,7 @@ func (a *Actor) recordProviderOutcome(ctx context.Context, gen int, ref ports.Sa
 		if err != nil {
 			return fmt.Errorf("sessionactor: sandbox transition spawning->connecting: %w", err)
 		}
-		if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+		if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 			SessionID: a.sessionID,
 			Status:    sqlcgen.SandboxStatus(to),
 		}); err != nil {
@@ -2039,7 +2039,7 @@ func (a *Actor) recordResumeOutcome(ctx context.Context, gen int, resumeErr erro
 		if err != nil {
 			return fmt.Errorf("sessionactor: sandbox transition spawning->connecting (resume ack): %w", err)
 		}
-		if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+		if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 			SessionID: a.sessionID,
 			Status:    sqlcgen.SandboxStatus(to),
 		}); err != nil {

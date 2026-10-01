@@ -697,13 +697,16 @@ func phaseOrNull(phase *string) string {
 	return *phase
 }
 
-// storedKinds returns every event stored for the fixture's session, in
-// arrival order: "ready", "heartbeat:<phase>" ("null" for a null phase),
-// "boot_timing:<metric>", or the bare type for anything else.
+// storedKinds returns every event of the agent's stored for the fixture's
+// session, in arrival order: "ready", "heartbeat:<phase>" ("null" for a
+// null phase), "boot_timing:<metric>", or the bare type for anything else.
+// The control plane's own sandbox_status reports, stored between them, are
+// left out: these tests pin what the agent put on the wire, and
+// TestClientHandler_OpenPageFollowsTheServersBoot pins the reports.
 func (f bootReadyFixture) storedKinds(ctx context.Context, t *testing.T) []string {
 	t.Helper()
 	rows, err := f.pool.Query(ctx, `SELECT type, COALESCE(payload->>'lastBootPhase', 'null'), COALESCE(payload->>'metric', '')
-		FROM events WHERE session_id = $1 ORDER BY id`, f.sessionID)
+		FROM events WHERE session_id = $1 AND type <> $2 ORDER BY id`, f.sessionID, sessionactor.SandboxStatusEventType)
 	if err != nil {
 		t.Fatalf("query events: %v", err)
 	}

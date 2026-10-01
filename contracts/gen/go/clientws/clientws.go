@@ -54,12 +54,32 @@ type FetchHistoryResponse struct {
 
 	// Null when there are no more pages.
 	NextCursor FetchHistoryResponseNextCursor `json:"nextCursor" yaml:"nextCursor" mapstructure:"nextCursor"`
+
+	// The session's sandbox as the control plane holds it when this reply is
+	// assembled, in the shape SubscribedPayload.state.sandbox has (its status is the
+	// one the control plane derives, never one a client infers from the event log);
+	// null when the session has no sandbox yet. Read on every reply, so a client
+	// keeps the sandbox current between two subscribes: the control plane stores and
+	// broadcasts a sandbox_status event whenever it changes the sandbox's status or
+	// generation, and the fetch_history that broadcast prompts returns the new state
+	// here. A control plane older than this field omits it.
+	Sandbox *FetchHistoryResponseSandbox `json:"sandbox" yaml:"sandbox" mapstructure:"sandbox"`
 }
 
 type FetchHistoryResponseEventsElem map[string]interface{}
 
 // Null when there are no more pages.
 type FetchHistoryResponseNextCursor *string
+
+// The session's sandbox as the control plane holds it when this reply is
+// assembled, in the shape SubscribedPayload.state.sandbox has (its status is the
+// one the control plane derives, never one a client infers from the event log);
+// null when the session has no sandbox yet. Read on every reply, so a client keeps
+// the sandbox current between two subscribes: the control plane stores and
+// broadcasts a sandbox_status event whenever it changes the sandbox's status or
+// generation, and the fetch_history that broadcast prompts returns the new state
+// here. A control plane older than this field omits it.
+type FetchHistoryResponseSandbox map[string]interface{}
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *FetchHistoryResponse) UnmarshalJSON(value []byte) error {
@@ -72,6 +92,9 @@ func (j *FetchHistoryResponse) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["nextCursor"]; raw != nil && !ok {
 		return fmt.Errorf("field nextCursor in FetchHistoryResponse: required")
+	}
+	if _, ok := raw["sandbox"]; raw != nil && !ok {
+		return fmt.Errorf("field sandbox in FetchHistoryResponse: required")
 	}
 	type Plain FetchHistoryResponse
 	var plain Plain

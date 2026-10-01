@@ -6,7 +6,9 @@
 // connection's own handshake-time gen has already been validated (§6.1's
 // "403 on id/gen mismatch") -- this handler enforces the SEPARATE
 // per-message half of §3.2's gen-fencing rule ("stale-gen inputs are
-// rejected and logged"), persists every recognized event (append-only),
+// rejected and logged"), drops a frame typed as one of the control
+// plane's own events (serverEventTypes, sandboxstatus.go), persists every
+// other event (append-only),
 // always bumps liveness (last_seen_at = max of all signals), and fires
 // the state transitions this Step's plan row (and §3.2's, "snapshots &
 // restore") scope: "ready"/Connecting, "heartbeat"-nil-phase/Booting once
@@ -143,6 +145,58 @@ func peekAckID(raw json.RawMessage) string {
 	return peek.AckID
 }
 
+// replyShapedKeys records which of the keys a client WS reply carries at
+// its top level appear in a sandbox frame, null values included: a frame
+// is stored and broadcast to every open page as its raw bytes, and a page
+// takes a frame with `events` and `nextCursor` while a fetch_history is
+// pending for that reply, `sandbox` included (clientws.FetchHistoryResponse).
+// No sandbox-ws event defines any of the three
+// (contracts/sandbox-ws/v1/events.schema.json).
+type replyShapedKeys struct {
+	Events     keyPresent `json:"events"`
+	NextCursor keyPresent `json:"nextCursor"`
+	Sandbox    keyPresent `json:"sandbox"`
+}
+
+// keyPresent is set by its key's presence, whatever the value, null too.
+type keyPresent bool
+
+func (k *keyPresent) UnmarshalJSON([]byte) error {
+	*k = true
+	return nil
+}
+
+// refusedSandboxFrame reports whether handleSandboxEvent drops cmd, and
+// why. Three kinds of frame, none of which a sandbox-ws event can be:
+//
+//   - one typed as an event the control plane writes itself
+//     (serverEventTypes, sandboxstatus.go): stored, a sandbox_status from
+//     the sandbox would put a gen and a status the server never recorded
+//     on the page as the server's;
+//   - one with no type: every sandbox-ws event names one;
+//   - one carrying a top-level events, nextCursor or sandbox key
+//     (replyShapedKeys): broadcast raw, it reads on a page like the
+//     fetch_history reply the page is waiting for, and that reply's
+//     sandbox row is the status the page shows as the server's.
+//
+// Any other type is stored, a type this binary does not know yet
+// included: a newer sandbox-agent may send one during a rollout.
+func refusedSandboxFrame(cmd SandboxEvent) (string, bool) {
+	if serverEventTypes[cmd.Type] {
+		return "typed as an event the control plane writes itself", true
+	}
+	if cmd.Type == "" {
+		return "no type", true
+	}
+	// wshub hands over only frames that decoded as a JSON object; anything
+	// else carries no key a page could read.
+	var keys replyShapedKeys
+	if json.Unmarshal(cmd.Raw, &keys) == nil && (keys.Events || keys.NextCursor || keys.Sandbox) {
+		return "shaped like a client reply (a top-level events, nextCursor or sandbox key)", true
+	}
+	return "", false
+}
+
 // sandboxTransitionTrigger reports which Trigger (if any) applies for the
 // given (event type, LastBootPhase, current status, whether a null phase
 // counts as completion) combination -- the two (and only two) mappings
@@ -230,6 +284,22 @@ func (a *Actor) armReadyWatchdogs(ctx context.Context, tx pgx.Tx, now time.Time)
 // other-errors-are-logged-not-fatal behavior (actor.go) keeps working
 // exactly as it does today.
 func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error {
+	// A frame the sandbox has no business sending is dropped the way the
+	// gen fence below drops a stale gen's frame: not stored, not
+	// broadcast, no liveness bump, nothing after it, no ack, and the
+	// connection stays open (refusedSandboxFrame says which and why). A
+	// well-behaved agent never sends one, so there is nothing for it to
+	// redeliver.
+	if reason, refused := refusedSandboxFrame(cmd); refused {
+		a.logger.Warn("sessionactor: dropping a sandbox event the sandbox may not send",
+			"reason", reason, "event_type", cmd.Type, "event_gen", cmd.Gen, "message_id", cmd.MessageID)
+		select {
+		case cmd.Reply <- SandboxEventOutcome{}:
+		default:
+		}
+		return nil
+	}
+
 	var outcome SandboxEventOutcome
 	// pushAfterCommit is non-nil only when THIS event just completed a
 	// turn successfully (§9.3, "e2e happy path", pushpr.go) -- acted on
@@ -341,7 +411,7 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 				a.logger.Warn("sessionactor: suspect recovery rejected; leaving sandbox suspect",
 					"pre_suspect_status", *row.PreSuspectStatus, "error", recErr)
 			} else {
-				recovered, err := a.stores.sandbox.WithTx(tx).RecoverFromSuspect(ctx, sqlcgen.RecoverSandboxFromSuspectParams{
+				recovered, err := a.sandboxWrites(tx).RecoverFromSuspect(ctx, sqlcgen.RecoverSandboxFromSuspectParams{
 					SessionID:  a.sessionID,
 					Status:     sqlcgen.SandboxStatus(recoveredTo),
 					LastSeenAt: pgtype.Timestamptz{Time: now, Valid: true},
@@ -463,7 +533,7 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// takes when this SAME event names no further transition of its
 		// own: still persisted, liveness bumped.
 
-		if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+		if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 			SessionID:    a.sessionID,
 			Status:       target,
 			LastSeenAt:   pgtype.Timestamptz{Time: now, Valid: true},
@@ -903,7 +973,7 @@ func (a *Actor) handleSnapshotReadyEvent(ctx context.Context, tx pgx.Tx, row sql
 	if err != nil {
 		return fmt.Errorf("sessionactor: sandbox transition snapshotting->ready (snapshot_ready): %w", err)
 	}
-	if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+	if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 		SessionID: a.sessionID,
 		Status:    sqlcgen.SandboxStatus(to),
 	}); err != nil {
@@ -982,7 +1052,7 @@ func (a *Actor) revertSnapshotToReady(ctx context.Context, tx pgx.Tx, row sqlcge
 	if err != nil {
 		return fmt.Errorf("sessionactor: sandbox transition snapshotting->ready (revert): %w", err)
 	}
-	if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+	if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 		SessionID: a.sessionID,
 		Status:    sqlcgen.SandboxStatus(to),
 	}); err != nil {
@@ -1152,7 +1222,7 @@ func (a *Actor) triggerSnapshotBestEffort(ctx context.Context) {
 		if err != nil {
 			return fmt.Errorf("sessionactor: sandbox transition ready->snapshotting: %w", err)
 		}
-		if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+		if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 			SessionID: a.sessionID,
 			Status:    sqlcgen.SandboxStatus(to),
 		}); err != nil {

@@ -348,7 +348,7 @@ func NewClientHandler(
 		})
 
 		// (8) post-subscribe read loop (fetch_history).
-		readClientLoop(ctx, conn, sessionID, events, timeouts, logger)
+		readClientLoop(ctx, conn, sessionID, events, sandboxes, timeouts, logger)
 	}
 }
 
@@ -849,7 +849,7 @@ type clientEnvelope struct {
 // reply is written for it. Deliberately per-connection, not per-session or
 // global: this is a rate limit on one connection's own request cadence,
 // not cross-connection/cross-session coordination.
-func readClientLoop(ctx context.Context, conn *websocket.Conn, sessionID pgtype.UUID, events *postgres.EventStore, timeouts platform.Timeouts, logger *slog.Logger) {
+func readClientLoop(ctx context.Context, conn *websocket.Conn, sessionID pgtype.UUID, events *postgres.EventStore, sandboxes *postgres.SandboxStore, timeouts platform.Timeouts, logger *slog.Logger) {
 	var lastFetchHistoryAt time.Time
 	for {
 		_, data, err := conn.Read(ctx)
@@ -872,7 +872,7 @@ func readClientLoop(ctx context.Context, conn *websocket.Conn, sessionID pgtype.
 				continue
 			}
 			lastFetchHistoryAt = now
-			handleFetchHistory(ctx, conn, sessionID, events, data, logger)
+			handleFetchHistory(ctx, conn, sessionID, events, sandboxes, data, logger)
 		default:
 			logger.Warn("wshub: ignoring unrecognized client frame type", "type", env.Type)
 		}
@@ -885,7 +885,17 @@ func readClientLoop(ctx context.Context, conn *websocket.Conn, sessionID pgtype.
 // request body is rejected defensively (logged, not fatal -- the
 // connection stays open) rather than trusted, since a WS connection is
 // already scoped to exactly one session for its entire lifetime.
-func handleFetchHistory(ctx context.Context, conn *websocket.Conn, sessionID pgtype.UUID, events *postgres.EventStore, data []byte, logger *slog.Logger) {
+//
+// Every reply also carries the sandbox row as it stands when the reply is
+// assembled (FetchHistoryResponse.sandbox, sandboxWireMap's shape, nil
+// when the session has none yet), read after the page: the subscribe
+// reply's state.sandbox is read once, and the status the control plane
+// derives (technical plan §3.2) changes after it. The session actor
+// stores and broadcasts a sandbox_status event with every such change
+// (sessionactor.SandboxStatusEventType); the fetch_history that broadcast
+// prompts returns the new row here, so an open page reads the boot from
+// the server and never has to infer it from the agent's own events.
+func handleFetchHistory(ctx context.Context, conn *websocket.Conn, sessionID pgtype.UUID, events *postgres.EventStore, sandboxes *postgres.SandboxStore, data []byte, logger *slog.Logger) {
 	var req clientws.FetchHistoryRequest
 	if err := json.Unmarshal(data, &req); err != nil {
 		logger.Warn("wshub: malformed fetch_history request", "error", err)
@@ -931,9 +941,22 @@ func handleFetchHistory(ctx context.Context, conn *websocket.Conn, sessionID pgt
 		nextCursor = &s
 	}
 
+	var sandbox *clientws.FetchHistoryResponseSandbox
+	sandboxRow, err := sandboxes.Get(ctx, sessionID)
+	switch {
+	case err == nil:
+		state := clientws.FetchHistoryResponseSandbox(sandboxWireMap(sandboxRow))
+		sandbox = &state
+	case errors.Is(err, pgx.ErrNoRows):
+	default:
+		logger.Error("wshub: fetch_history: get sandbox failed", "error", err)
+		return
+	}
+
 	resp := clientws.FetchHistoryResponse{
 		Events:     wire,
 		NextCursor: nextCursor,
+		Sandbox:    sandbox,
 	}
 	raw, err := json.Marshal(resp)
 	if err != nil {

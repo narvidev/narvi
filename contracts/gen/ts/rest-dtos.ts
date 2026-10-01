@@ -231,7 +231,7 @@ export interface WSTokenResponse {
   expiresAt: string;
 }
 /**
- * GET /api/sessions/:id/events (§6.3). Mirrors client-ws/v1's own FetchHistoryResponse shape exactly, for the same reason that schema gives: the full event-payload shape is assembled by later PRs, and REST/WS should not diverge on this envelope.
+ * GET /api/sessions/:id/events (§6.3). The envelope of client-ws/v1's FetchHistoryResponse (events, nextCursor), read through the same event-store query fetch_history uses, except that it deliberately omits FetchHistoryResponse's required sandbox: the sandbox row a fetch_history reply carries is a WS concern, what keeps an open page's sandbox status current after a sandbox_status broadcast. A REST caller reads a session's sandbox status from GET /api/sessions/:id/status (SessionActivity.sandboxStatus).
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "EventsResponse".
@@ -3519,6 +3519,19 @@ export interface SessionActivity {
     id: string;
     /**
      * When the gate opened.
+     */
+    since: string;
+  } | null;
+  /**
+   * The session's open workflow escalation, whatever awaiting reports: a custom workflow's run escalated for review, open under exactly the rule awaiting.kind 'workflow_escalation' states -- while it is the session's newest workflow run, ran an attempt of its own, and no turn other than its own attempts has been created since it escalated. awaiting names one gate, a plan or a workflow step before an escalation, so an escalation open beside either is reported here and not there; a client showing which workflow run a person should look at reads it here. Null when no escalation is open, a built-in workflow's included.
+   */
+  escalation: {
+    /**
+     * The escalated run's id.
+     */
+    id: string;
+    /**
+     * When the run escalated.
      */
     since: string;
   } | null;

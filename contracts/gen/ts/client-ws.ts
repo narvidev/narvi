@@ -83,4 +83,10 @@ export interface FetchHistoryResponse {
    * Null when there are no more pages.
    */
   nextCursor: string | null;
+  /**
+   * The session's sandbox as the control plane holds it when this reply is assembled, in the shape SubscribedPayload.state.sandbox has (its status is the one the control plane derives, never one a client infers from the event log); null when the session has no sandbox yet. Read on every reply, so a client keeps the sandbox current between two subscribes: the control plane stores and broadcasts a sandbox_status event whenever it changes the sandbox's status or generation, and the fetch_history that broadcast prompts returns the new state here. A control plane older than this field omits it.
+   */
+  sandbox: {
+    [k: string]: unknown;
+  } | null;
 }

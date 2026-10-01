@@ -32,11 +32,14 @@ const (
 // hub's own session-existence-first convention) -- 404 if it doesn't
 // exist. cursor defaults to 0 ("from the beginning"); limit defaults to
 // eventsDefaultLimit and is capped at eventsMaxLimit regardless of what
-// the caller requests. Responds 200 with restdtos.EventsResponse, shaped
-// like clientws.FetchHistoryResponse deliberately (§6.2/§6.3 should not
-// diverge on this envelope, per that DTO's own schema doc comment) --
-// backed by the SAME EventStore.ListForSession the client WS hub's own
-// fetch_history handler uses, one implementation, two callers.
+// the caller requests. Responds 200 with restdtos.EventsResponse: the
+// events and nextCursor of clientws.FetchHistoryResponse, backed by the
+// SAME EventStore.ListForSession the client WS hub's own fetch_history
+// handler uses, one implementation, two callers. It deliberately leaves
+// out FetchHistoryResponse's sandbox: that row is a WS concern, what keeps
+// an open page's sandbox status current after a sandbox_status broadcast
+// (§6.2); a REST caller reads the status from GET
+// /api/sessions/{id}/status (SessionActivity.sandboxStatus).
 func ListEvents(sessions *postgres.SessionStore, events *postgres.EventStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)

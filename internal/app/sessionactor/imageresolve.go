@@ -454,6 +454,11 @@ func (a *Actor) upsertPendingImageBuildBestEffort(ctx context.Context, fingerpri
 	return imagedecision.ReasonImageBuildPending
 }
 
+// imageDecisionEventType is the stored event persistImageDecisionBestEffort
+// appends. The control plane writes it, never a sandbox, so it is one of
+// serverEventTypes (sandboxstatus.go), which a sandbox may not send.
+const imageDecisionEventType = "image_decision"
+
 // persistImageDecisionBestEffort is decideImage's own caller-side
 // persistence step (see this file's own top "# Persisted decision
 // provenance" comment for the full design): writes reason/fingerprint
@@ -550,7 +555,7 @@ func (a *Actor) persistImageDecisionBestEffort(ctx context.Context, gen int, rea
 		}); err != nil {
 			return fmt.Errorf("sessionactor: update sandbox image decision: %w", err)
 		}
-		return a.appendEvent(ctx, tx, "image_decision", payload)
+		return a.appendEvent(ctx, tx, imageDecisionEventType, payload)
 	})
 	if err != nil {
 		a.logger.Warn("sessionactor: resolve image: persist image decision failed (best-effort, spawn unaffected)",
