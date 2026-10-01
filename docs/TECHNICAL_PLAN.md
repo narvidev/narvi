@@ -2480,6 +2480,20 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
     qualifying run is among the rows that were read: a checked addition is a claim that no later
     counter-reviewer event exists, which a partial read cannot support. The counter-review claim
     keeps its existing reading (a positive found among the decoded rows still corroborates).
+    A finish whose start is not in the trace also leaves it incomplete for the additions:
+    `sub_task_finish` carries no sub-agent type and is critical, while `sub_task_start` is
+    best-effort and can be evicted during a long disconnect, so a lone finish may be a
+    counter-review that ran after the second fact-check.
+  - **Bounded above as well.** A turn past `TurnDeadline` is marked failed without its agent being
+    stopped, the next turn is dispatched to the same sandbox at the same gen, and the first turn's
+    late verdict is still resolved by its own message id. Bounded below only, that verdict's trace
+    would hold the later turn's sub-tasks, and the later turn's routine first fact-check would read
+    as the earlier turn's second run. So the read stops at the next turn's own dispatch watermark
+    (`events.id <= next`, `turns.GetNextTurnDispatchedEventID`), for both checks, since they read
+    the same rows. Work the earlier turn did after the later one was dispatched is left out too,
+    which can only leave a claim unconfirmed. Another turn dispatched at the same watermark, with
+    no event between the two dispatches, makes the two turns' events indistinguishable, and the
+    trace is then not read at all (`ReadInFull` false).
 
 ### 26.5 Measuring the readout (Step 69, on Step 62's instrument)
 
@@ -2554,9 +2568,13 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
   `counter_review`, `counter_review_unverified`, `not_recorded`) and status, so precision per
   source is the share of a source's findings a maintainer rebutted, and the §26.6 rule can be
   revisited on numbers. A finding last published before migration `000154` has no source
-  recorded: it reads as `not_recorded`, never as `primary`, is never marked unverified, and stays
-  in the main distribution as it always was. The merge-gate's open-findings count is unchanged: an
-  unverified addition blocks merge exactly like any other open finding.
+  recorded, and neither has one posted without a source by a turn whose prompt was rendered
+  before sources existed (§26.6's amendment, Validation): either reads as `not_recorded`, never
+  as `primary`, is never marked unverified, and stays in the main distribution as it always was.
+  The merge-gate's open-findings count is unchanged: an unverified addition blocks merge exactly
+  like any other open finding. The §16 decision inbox shows those additions apart from its
+  findings count (`DecisionInboxItem.unverifiedAdditions`), as the Code review view does; its
+  `findings` is a display count, and the gate still reads the full one.
 - The §21.3 deterministic digest and the §16 decision inbox surface the readout's `Summary` line
   per PR — reusing their existing aggregation, no new mechanism.
 - **Evals**: known-PR digest-quality cases (expected architecture decisions on reference diffs,
@@ -2680,19 +2698,33 @@ As shipped:
   skipped, or not reported), `not_found` (reported, and the trace read when the verdict was posted
   held none -- §26.4's accepted race included) or `unconfirmed` (the trace could not be read in
   full). One resolution per verdict (`BuildSecondFactCheck`) marks every addition, so the verdict
-  and its findings cannot disagree.
-- **Validation.** `source` is required on every posted finding (a missing or garbled value is
-  `400`); a `counter_review` source, or a second-run report, is refused off the deep path; a kill
-  count is refused unless the run is reported `done`. On the deep path every other combination is
-  admitted -- additions beside a counter-review reported skipped included -- because whatever the
-  payload claims, an addition is checked only when the server finds the run, and refusing an
-  inconsistent claim would only push a reviewer to relabel an addition `primary`.
+  and its findings cannot disagree. It is made only when the verdict publishes an addition: a
+  second run that removed every addition is recorded (its report and kill count) with no
+  resolution, so the readout shows "no addition published", never "additions unverified".
+- **Validation.** `source` is optional on the wire. A value that is present must be `primary` or
+  `counter_review` (a garbled one is `400`); an absent one is recorded as not recorded. The verdict
+  body follows the review prompt, which is rendered once, when the turn is created, and re-sent as
+  stored on every dispatch, so a turn rendered before this change -- queued, running, or re-sent to
+  a respawned sandbox while the control plane is deployed -- posts its findings without the field;
+  refusing them would refuse the verdict its own instructions shaped, and would make the contract's
+  MINOR grade untrue. Admitting it gives up nothing the field protected: the source is
+  self-reported, and a reviewer could always write `primary`. A `counter_review` source, or a
+  second-run report, is refused off the deep path; a kill count is refused unless the run is
+  reported `done`. On the deep path every other combination is admitted -- additions beside a
+  counter-review reported skipped included -- because whatever the payload claims, an addition is
+  checked only when the server finds the run, and refusing an inconsistent claim would only push a
+  reviewer to relabel an addition `primary`.
 - **Publication.** The posted comment lists an unverified addition under its own heading, after
   the findings, with their count and the server's reason for each; a checked one stays among the
-  findings, marked as the counter-review's; every other finding renders as before. The readout
+  findings, marked as the counter-review's; every other finding renders as before. Each finding's
+  description has its line breaks folded onto its one line, primary and addition alike, as §26.1's
+  header already folds the adequacy explanation, so reviewer text cannot open a line that copies
+  the server's headings or markers, and an unclosed code fence in it cannot hide the server's note
+  or the rest of the comment. The readout
   carries `source`/`additionCheck` per finding and `additionsFactCheck`/
   `additionsFactCheckKilled`/`additionsCheck` on the verdict; the Code review view marks an
-  unverified addition, counts it apart in the appendix header and lists it apart. An unverified
+  unverified addition, counts it apart in the appendix header and lists it apart, and the decision
+  inbox shows the count apart from its findings (§26.5). An unverified
   addition raises the Shippable class no more than a checked one: `review.ComputeShippable` reads
   no finding (§26.1), and neither the blockers nor the merge gate treat it differently.
 - **Storage.** `review_verdicts.additions_fact_check`/`additions_fact_check_killed`/
