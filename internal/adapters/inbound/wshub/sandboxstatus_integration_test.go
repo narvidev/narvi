@@ -6,6 +6,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/contracts/gen/go/clientws"
+	"github.com/narvidev/narvi/internal/adapters/inbound/wshub"
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/platform"
@@ -205,5 +209,105 @@ func TestClientHandler_OpenPageFollowsTheServersBoot(t *testing.T) {
 		if got := replySandboxStatus(t, fetchHistoryPage(ctx, t, conn, sessionRow.ID)); got != step.want {
 			t.Errorf("%s: fetch_history reply sandbox status = %q, want %q", step.name, got, step.want)
 		}
+	}
+}
+
+// TestSandboxSocket_RefusesTheControlPlanesOwnEventTypes: a sandbox that
+// holds its token cannot write an event the control plane writes itself.
+// Through the real sandbox handshake, a frame typed as one of them -- a
+// forged sandbox_status claiming gen 999 and ready, and the other two -- is
+// not stored, not broadcast to an open page and not acked, and the sandbox
+// row keeps its gen and status; an ordinary agent frame on the same socket
+// is still stored and broadcast, and a critical one still acked.
+func TestSandboxSocket_RefusesTheControlPlanesOwnEventTypes(t *testing.T) {
+	rig, sessionRow := newClientTestRigWithBroadcast(t, platform.DefaultTimeouts())
+	ctx := context.Background()
+	sessionID := sessionRow.ID
+	sid := sessionID.String()
+	setTestSandboxStatus(ctx, t, rig, sessionID, sqlcgen.SandboxStatusBooting)
+	const secret = "the-sandbox-token"
+	setSandboxTokenHash(ctx, t, rig.pool, sessionID, wshub.HashSandboxToken(secret))
+	before := getSandbox(ctx, t, rig.pool, sessionID)
+
+	token := createTestWSToken(ctx, t, rig.pool, sessionID, time.Now().Add(24*time.Hour))
+	page := subscribeClient(ctx, t, rig.wsURL, sid, token)
+	defer func() { _ = page.CloseNow() }()
+	pageFrames, waitPage := startReader(page)
+
+	header := http.Header{}
+	header.Set("Authorization", "Bearer "+secret)
+	header.Set("X-Sandbox-ID", "sbx-test")
+	header.Set("X-Sandbox-Gen", "1")
+	sandboxConn, _, err := websocket.Dial(ctx, rig.wsURL+"/sessions/"+sid+"/ws?type=sandbox", &websocket.DialOptions{HTTPHeader: header})
+	if err != nil {
+		t.Fatalf("dial the sandbox socket: %v", err)
+	}
+	defer func() { _ = sandboxConn.CloseNow() }()
+	sandboxFrames, waitSandbox := startReader(sandboxConn)
+	send := func(frame string) {
+		t.Helper()
+		if err := sandboxConn.Write(ctx, websocket.MessageText, []byte(frame)); err != nil {
+			t.Fatalf("write %s: %v", frame, err)
+		}
+	}
+
+	forged := []string{sessionactor.SandboxStatusEventType, "image_decision", narvipg.ShadowEgressSuppressedEventType}
+	for _, typ := range forged {
+		send(fmt.Sprintf(`{"type":%q,"messageId":"forged-%s","sessionId":%q,"gen":1,"ackId":"%s:forged-%s","sandbox":{"gen":999,"status":"ready"}}`, typ, typ, sid, typ, typ))
+	}
+	// The read loop hands the actor one frame at a time, so once this one
+	// is stored and broadcast, every forged frame before it was handled.
+	send(fmt.Sprintf(`{"type":"boot_progress","messageId":"bp-1","sessionId":%q,"gen":1,"phase":"clone"}`, sid))
+
+	deadline := time.After(dispatchTestWait)
+	for broadcast := false; !broadcast; {
+		select {
+		case data := <-pageFrames:
+			var frame struct {
+				MessageID string `json:"messageId"`
+			}
+			_ = json.Unmarshal(data, &frame)
+			if strings.HasPrefix(frame.MessageID, "forged-") {
+				t.Fatalf("an open page was sent a forged frame: %s", data)
+			}
+			broadcast = frame.MessageID == "bp-1"
+		case <-deadline:
+			t.Fatal("the ordinary agent frame never reached the open page")
+		}
+	}
+
+	for _, typ := range forged {
+		if got := countEvents(ctx, t, rig.pool, sessionID, typ); got != 0 {
+			t.Errorf("%d %s events stored, want 0: a sandbox wrote an event the control plane owns", got, typ)
+		}
+	}
+	var stored int
+	if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM events WHERE session_id = $1 AND message_id LIKE 'forged-%'`, sessionID).Scan(&stored); err != nil {
+		t.Fatalf("count forged events: %v", err)
+	}
+	if stored != 0 {
+		t.Errorf("%d forged frames stored, want 0", stored)
+	}
+	if got := countEvents(ctx, t, rig.pool, sessionID, "boot_progress"); got != 1 {
+		t.Errorf("boot_progress events = %d, want 1: the ordinary frame on the same socket must still be stored", got)
+	}
+	after := getSandbox(ctx, t, rig.pool, sessionID)
+	if after.Gen != before.Gen || after.Status != before.Status || after.PreSuspectStatus != nil {
+		t.Errorf("sandbox row moved: gen %d status %s pre_suspect %v, want gen %d status %s", after.Gen, after.Status, after.PreSuspectStatus, before.Gen, before.Status)
+	}
+
+	// No ack for any forged frame, though each carried an ackId; the
+	// connection is still open and still acks a critical frame.
+	expectNoMessage(t, sandboxFrames, 300*time.Millisecond)
+	send(fmt.Sprintf(`{"type":"push_error","messageId":"pe-1","sessionId":%q,"gen":1,"ackId":"push_error:pe-1","error":"boom"}`, sid))
+	expectAck(t, sandboxFrames, "push_error:pe-1")
+
+	_ = sandboxConn.Close(websocket.StatusNormalClosure, "")
+	_ = page.Close(websocket.StatusNormalClosure, "")
+	if err := waitSandbox(); err != nil {
+		t.Errorf("sandbox reader: %v", err)
+	}
+	if err := waitPage(); err != nil {
+		t.Errorf("page reader: %v", err)
 	}
 }

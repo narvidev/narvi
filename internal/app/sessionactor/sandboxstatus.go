@@ -27,6 +27,31 @@ import (
 // and a null-phase heartbeat -- never from the agent's own events.
 const SandboxStatusEventType = "sandbox_status"
 
+// serverEventTypes are the event types the control plane writes into a
+// session's event log itself and no sandbox-ws event has: this file's
+// sandbox_status, imageresolve.go's image_decision, and the shadow-mode
+// suppression record the postgres adapter writes (§30.6). They share the
+// events.type namespace with the frames a sandbox sends, which
+// handleSandboxEvent stores under the type each frame names. A page takes
+// these as the server's own record -- a sandbox_status's gen and status
+// move the rail -- so a frame of one of these types from the sandbox
+// socket is dropped there, never stored (any process holding the sandbox
+// token can open that socket).
+//
+// This is a deny list of the control plane's own types, not an allow list
+// of the sandbox-ws contract's: a newer sandbox-agent may send a type this
+// binary does not know yet during a rollout, and that frame is still
+// stored. A type written by the control plane that the contract also
+// defines (execution_complete, warning) cannot be reserved: the agent
+// sends it too. TestServerWrittenEventTypesAreReserved fails on any event
+// type production code writes that is in neither the contract nor this
+// set, and on an entry here that the contract defines or nothing writes.
+var serverEventTypes = map[string]bool{
+	SandboxStatusEventType:                   true,
+	imageDecisionEventType:                   true,
+	postgres.ShadowEgressSuppressedEventType: true,
+}
+
 // sandboxStatusKey is what the event reports, and what decides whether a
 // write changed anything worth reporting.
 type sandboxStatusKey struct {

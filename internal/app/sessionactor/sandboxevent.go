@@ -6,7 +6,9 @@
 // connection's own handshake-time gen has already been validated (§6.1's
 // "403 on id/gen mismatch") -- this handler enforces the SEPARATE
 // per-message half of §3.2's gen-fencing rule ("stale-gen inputs are
-// rejected and logged"), persists every recognized event (append-only),
+// rejected and logged"), drops a frame typed as one of the control
+// plane's own events (serverEventTypes, sandboxstatus.go), persists every
+// other event (append-only),
 // always bumps liveness (last_seen_at = max of all signals), and fires
 // the state transitions this Step's plan row (and §3.2's, "snapshots &
 // restore") scope: "ready"/Connecting, "heartbeat"-nil-phase/Booting once
@@ -230,6 +232,24 @@ func (a *Actor) armReadyWatchdogs(ctx context.Context, tx pgx.Tx, now time.Time)
 // other-errors-are-logged-not-fatal behavior (actor.go) keeps working
 // exactly as it does today.
 func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error {
+	// A frame typed as one of the control plane's own events
+	// (serverEventTypes, sandboxstatus.go) is never the sandbox's to
+	// write: stored, a sandbox_status from the sandbox would put a gen and
+	// a status the server never recorded on the page as the server's.
+	// Dropped the way the gen fence below drops a stale gen's frame: not
+	// stored, not broadcast, no liveness bump, nothing after it, no ack,
+	// and the connection stays open. A well-behaved agent never sends one,
+	// so there is nothing for it to redeliver.
+	if serverEventTypes[cmd.Type] {
+		a.logger.Warn("sessionactor: dropping a sandbox event typed as one the control plane writes itself",
+			"event_type", cmd.Type, "event_gen", cmd.Gen, "message_id", cmd.MessageID)
+		select {
+		case cmd.Reply <- SandboxEventOutcome{}:
+		default:
+		}
+		return nil
+	}
+
 	var outcome SandboxEventOutcome
 	// pushAfterCommit is non-nil only when THIS event just completed a
 	// turn successfully (§9.3, "e2e happy path", pushpr.go) -- acted on
