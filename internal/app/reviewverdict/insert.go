@@ -137,7 +137,14 @@ import (
 // below -- never the empty string -- so internal/domain/autoapproval.
 // ComputeEligible reads it back as UNKNOWN, exactly like a pre-migration
 // row.
-func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSettings *postgres.RepoSettingsStore, platformShadow bool, repoFullName string, prNumber int32, headSHA string, sessionID pgtype.UUID, verdict review.Verdict, digest reviewpost.Digest, reviewPath reviewtriage.ReviewDepth, counterReview review.CounterReviewStatus, factCheck reviewpost.FactCheckStatus, factCheckKilled int, archDecisionTags, archDecisionRoots []string, knowledgeMode string, knowledgeInfluenced bool, verdictContext reviewverdict.Context, attemptID pgtype.UUID) (reviewverdict.Record, error) {
+//
+// secondFactCheck (§26.6's amendment) is reviewpost.BuildSecondFactCheck's
+// result for the posting VerdictInput: the second fact-check run, over
+// what the counter-review added, persisted onto its own three columns
+// (migrations/000154) and never folded into factCheck/factCheckKilled,
+// which stay the first run's. Its zero value persists three NULLs --
+// nothing to record.
+func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSettings *postgres.RepoSettingsStore, platformShadow bool, repoFullName string, prNumber int32, headSHA string, sessionID pgtype.UUID, verdict review.Verdict, digest reviewpost.Digest, reviewPath reviewtriage.ReviewDepth, counterReview review.CounterReviewStatus, factCheck reviewpost.FactCheckStatus, factCheckKilled int, secondFactCheck reviewpost.SecondFactCheck, archDecisionTags, archDecisionRoots []string, knowledgeMode string, knowledgeInfluenced bool, verdictContext reviewverdict.Context, attemptID pgtype.UUID) (reviewverdict.Record, error) {
 	if headSHA == "" {
 		return reviewverdict.Record{}, fmt.Errorf("reviewverdict: insert: refusing to persist a verdict with no known head sha for %s#%d", repoFullName, prNumber)
 	}
@@ -229,6 +236,9 @@ func Insert(ctx context.Context, store *postgres.ReviewVerdictStore, repoSetting
 		AncestorChain:             ancestorChainJSON,
 		PolicyVersion:             int32(verdictContext.PolicyVersion),
 		AttemptID:                 attemptID,
+		AdditionsFactCheck:        nonEmptyStringPtr(string(secondFactCheck.Reported)),
+		AdditionsFactCheckKilled:  additionsFactCheckKilledPtr(secondFactCheck),
+		AdditionsCheck:            nonEmptyStringPtr(string(secondFactCheck.Resolved)),
 	})
 	if err != nil {
 		return reviewverdict.Record{}, err
@@ -263,5 +273,18 @@ func nonEmptyStringPtr(s string) *string {
 // instead.
 func factCheckKilledPtr(n int) *int32 {
 	v := int32(n)
+	return &v
+}
+
+// additionsFactCheckKilledPtr is review_verdicts.additions_fact_check_killed
+// for c: the count the reviewer reported for the second run, or NULL when
+// it reported no second run -- unlike factCheckKilledPtr above, the second
+// run is optional, so "no run reported" and "a run that killed nothing"
+// are kept apart.
+func additionsFactCheckKilledPtr(c reviewpost.SecondFactCheck) *int32 {
+	if c.Reported == "" {
+		return nil
+	}
+	v := int32(c.ReportedKilled)
 	return &v
 }

@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/narvidev/narvi/internal/domain/review"
+	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 )
 
@@ -121,6 +122,156 @@ func TestCounterReviewCorroborated(t *testing.T) {
 			got := reviewverdict.CounterReviewCorroborated(tt.starts, tt.finishes)
 			if got != tt.want {
 				t.Errorf("CounterReviewCorroborated(%+v, %+v) = %v, want %v", tt.starts, tt.finishes, got, tt.want)
+			}
+		})
+	}
+}
+
+// trace builds a SubTaskTrace read in full from (eventID, kind, subTaskID,
+// subAgentType-or-outcome) steps, in the order given.
+type traceStep struct {
+	id      int64
+	finish  bool
+	subTask string
+	value   string // subAgentType for a start, outcome for a finish
+}
+
+func traceOf(steps ...traceStep) reviewverdict.SubTaskTrace {
+	trace := reviewverdict.SubTaskTrace{ReadInFull: true}
+	for _, s := range steps {
+		if s.finish {
+			trace.Finishes = append(trace.Finishes, reviewverdict.SubTaskFinishRecord{EventID: s.id, SubTaskID: s.subTask, Outcome: s.value})
+		} else {
+			trace.Starts = append(trace.Starts, reviewverdict.SubTaskStartRecord{EventID: s.id, SubTaskID: s.subTask, SubAgentType: s.value})
+		}
+	}
+	return trace
+}
+
+func start(id int64, subTask, agent string) traceStep {
+	return traceStep{id: id, subTask: subTask, value: agent}
+}
+
+func finish(id int64, subTask, outcome string) traceStep {
+	return traceStep{id: id, finish: true, subTask: subTask, value: outcome}
+}
+
+func TestAdditionsFactCheckInTrace(t *testing.T) {
+	const (
+		fc = review.FactCheckAgentName
+		cr = review.CounterReviewerAgentName
+	)
+	tests := []struct {
+		name  string
+		trace reviewverdict.SubTaskTrace
+		want  reviewpost.AdditionsTrace
+	}{
+		{
+			name: "first fact-check, counter-review, then a second fact-check that completed: run found",
+			trace: traceOf(
+				start(1, "fc1", fc), finish(2, "fc1", "completed"),
+				start(3, "cr1", cr), finish(4, "cr1", "completed"),
+				start(5, "fc2", fc), finish(6, "fc2", "completed"),
+			),
+			want: reviewpost.AdditionsTraceRunFound,
+		},
+		{
+			name: "every fact-check ran before the counter-review: none found",
+			trace: traceOf(
+				start(1, "fc1", fc), finish(2, "fc1", "completed"),
+				start(3, "fc2", fc), finish(4, "fc2", "completed"),
+				start(5, "cr1", cr), finish(6, "cr1", "completed"),
+			),
+			want: reviewpost.AdditionsTraceNoRunFound,
+		},
+		{
+			name: "a fact-check started while the counter-review was running: not after it",
+			trace: traceOf(
+				start(1, "cr1", cr),
+				start(2, "fc2", fc), finish(3, "fc2", "completed"),
+				finish(4, "cr1", "completed"),
+			),
+			want: reviewpost.AdditionsTraceNoRunFound,
+		},
+		{
+			name: "no second fact-check at all: none found",
+			trace: traceOf(
+				start(1, "fc1", fc), finish(2, "fc1", "completed"),
+				start(3, "cr1", cr), finish(4, "cr1", "completed"),
+			),
+			want: reviewpost.AdditionsTraceNoRunFound,
+		},
+		{
+			name: "the second fact-check failed: none found",
+			trace: traceOf(
+				start(1, "cr1", cr), finish(2, "cr1", "completed"),
+				start(3, "fc2", fc), finish(4, "fc2", "failed"),
+			),
+			want: reviewpost.AdditionsTraceNoRunFound,
+		},
+		{
+			name: "the second fact-check's finish has not landed: none found",
+			trace: traceOf(
+				start(1, "cr1", cr), finish(2, "cr1", "completed"),
+				start(3, "fc2", fc),
+			),
+			want: reviewpost.AdditionsTraceNoRunFound,
+		},
+		{
+			name: "a later counter-review run started after the second fact-check: not after every counter-review",
+			trace: traceOf(
+				start(1, "cr1", cr), finish(2, "cr1", "completed"),
+				start(3, "fc2", fc), finish(4, "fc2", "completed"),
+				start(5, "cr2", cr), finish(6, "cr2", "completed"),
+			),
+			want: reviewpost.AdditionsTraceNoRunFound,
+		},
+		{
+			name: "a fact-check after a counter-review that never completed: no counter-review to come after",
+			trace: traceOf(
+				start(1, "cr1", cr), finish(2, "cr1", "failed"),
+				start(3, "fc2", fc), finish(4, "fc2", "completed"),
+			),
+			want: reviewpost.AdditionsTraceNoRunFound,
+		},
+		{
+			name: "a different sub-agent after the counter-review is not a fact-check",
+			trace: traceOf(
+				start(1, "cr1", cr), finish(2, "cr1", "completed"),
+				start(3, "scribe", review.ArchitectureScribeAgentName), finish(4, "scribe", "completed"),
+			),
+			want: reviewpost.AdditionsTraceNoRunFound,
+		},
+		{
+			name: "a completed finish for another sub-task is not the second run's",
+			trace: traceOf(
+				start(1, "cr1", cr), finish(2, "cr1", "completed"),
+				start(3, "fc2", fc), finish(4, "other", "completed"),
+			),
+			want: reviewpost.AdditionsTraceNoRunFound,
+		},
+		{
+			name: "a qualifying run in a trace not read in full: could not be confirmed",
+			trace: func() reviewverdict.SubTaskTrace {
+				tr := traceOf(
+					start(1, "cr1", cr), finish(2, "cr1", "completed"),
+					start(3, "fc2", fc), finish(4, "fc2", "completed"),
+				)
+				tr.ReadInFull = false
+				return tr
+			}(),
+			want: reviewpost.AdditionsTraceUnread,
+		},
+		{
+			name:  "the zero trace was never read: could not be confirmed",
+			trace: reviewverdict.SubTaskTrace{},
+			want:  reviewpost.AdditionsTraceUnread,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := reviewverdict.AdditionsFactCheckInTrace(tt.trace); got != tt.want {
+				t.Errorf("AdditionsFactCheckInTrace() = %q, want %q", got, tt.want)
 			}
 		})
 	}

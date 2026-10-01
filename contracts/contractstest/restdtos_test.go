@@ -1180,6 +1180,13 @@ func TestReviewAnalyticsRoundTrip(t *testing.T) {
 			{Status: restdtos.ReviewAnalyticsFindingStatusCountStatusOpen, Count: 4},
 			{Status: restdtos.ReviewAnalyticsFindingStatusCountStatusRebutted, Count: 2},
 		}
+		// §26.6's amendment: the per-source breakdown, an unverified
+		// counter-review addition counted in a bucket of its own.
+		bySource := restdtos.ReviewAnalyticsFindingOutcomesBySource{
+			{Source: "primary", Status: restdtos.ReviewAnalyticsFindingSourceCountStatusOpen, Count: 3},
+			{Source: "counter_review", Status: restdtos.ReviewAnalyticsFindingSourceCountStatusRebutted, Count: 2},
+			{Source: "counter_review_unverified", Status: restdtos.ReviewAnalyticsFindingSourceCountStatusOpen, Count: 1},
+		}
 		roundTrip(t, sch, restdtos.ReviewAnalytics{
 			RepoFullName:            "acme/widgets",
 			TimeseriesComputed:      true,
@@ -1188,6 +1195,7 @@ func TestReviewAnalyticsRoundTrip(t *testing.T) {
 			TopRiskDrivers:          &drivers,
 			FindingOutcomesComputed: true,
 			FindingOutcomes:         &outcomes,
+			FindingOutcomesBySource: &bySource,
 		})
 	})
 

@@ -10,6 +10,52 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.16.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `PostedFinding.source` (optional, string or null), the pass of the
+  review that produced a posted finding: `primary` or `counter_review`
+  (technical plan §26.6's amendment). Schema-optional and required by the
+  application on every posted finding (a missing or garbled value is
+  refused with `400`); `counter_review` is refused off the deep path.
+  Self-reported: the server records it as stated. A property added, not
+  required, grades MINOR (row 2).
+- Added: `PostReviewVerdictRequest.additionsFactCheck` (optional, string or
+  null: `done` or `skipped`) and `additionsFactCheckKilled` (optional,
+  integer or null, minimum 0), the reviewer's report of the second, diff-only
+  fact-check run over what the counter-review added, recorded apart from
+  `factCheck`/`factCheckKilled`. Refused off the deep path; a kill count is
+  refused unless the run is reported `done`. Two properties added, not
+  required, grade MINOR (row 2).
+- Added: `ReviewReadoutFinding.source` and `ReviewReadoutFinding.additionCheck`
+  (required, string or null): the source the finding's latest publication
+  reported, null when none was recorded (a finding last published before
+  this change), and, for a `counter_review` finding, the server's
+  resolution -- `checked`, `not_run`, `not_found` or `unconfirmed`. Every
+  value but `checked` marks the finding unverified. Required properties
+  added to a platform-produced shape grade MINOR (row 3).
+- Added: `ReviewReadoutVerdict.additionsFactCheck`,
+  `additionsFactCheckKilled` and `additionsCheck` (optional, nullable): the
+  second run as the reviewer reported it, and the server's resolution of
+  the verdict's counter-review additions. Properties added, not required,
+  grade MINOR (row 2).
+- Added: `ReviewAnalytics.findingOutcomesBySource` (required, array or
+  null) and the `ReviewAnalyticsFindingSourceCount` `$def` (`source`,
+  `status`, `count`): every finding in the window counted per source --
+  `primary`, `counter_review`, `counter_review_unverified`, `not_recorded`
+  -- and status, the breakdown precision per source is read from
+  (technical plan §26.5). A required property added to a platform-produced
+  shape grades MINOR (row 3); a new `$def` grades MINOR (row 32).
+- Changed (description only): `ReviewAnalytics.findingOutcomes` now counts
+  every finding except the counter-review additions the server could not
+  count as checked, which are counted apart in `findingOutcomesBySource`;
+  a computed result is empty only when every finding in the window is
+  such an addition. PATCH (row 35).
+- Unchanged: no route, no enum. Every new string is unconstrained, like
+  `ReviewReadoutVerdict.counterReview`, so a later value is not a breaking
+  change.
+
 ## [1.15.0]
 
 ### rest/v1/dtos.schema.json

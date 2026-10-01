@@ -1,6 +1,9 @@
 package reviewverdict
 
-import "github.com/narvidev/narvi/internal/domain/review"
+import (
+	"github.com/narvidev/narvi/internal/domain/review"
+	"github.com/narvidev/narvi/internal/domain/reviewpost"
+)
 
 // This file implements §26.4's own named residual, closed by §26.4:
 // "Corroborating the claim against the persisted sub_task_finish trace is
@@ -54,7 +57,15 @@ import "github.com/narvidev/narvi/internal/domain/review"
 // taskInputSubAgentType for the extraction, and that field's own doc
 // comment for why THIS field, never the freeform Label, is what
 // corroboration keys off).
+//
+// EventID (§26.6's amendment) is the persisted event's own events.id.
+// Within one session ids are allocated in commit order (queries/
+// events.sql's MaxEventIDForSession), so comparing two records' EventIDs
+// orders them as the trace recorded them -- with no clock in it, the same
+// reason the corroboration queries bound a turn by dispatched_event_id.
+// AdditionsFactCheckInTrace is what reads it.
 type SubTaskStartRecord struct {
+	EventID      int64
 	SubTaskID    string
 	SubAgentType string
 }
@@ -65,9 +76,25 @@ type SubTaskStartRecord struct {
 // with which Outcome -- one of sandboxws's own ExecutionCompleteOutcome
 // wire strings ("completed"/"failed"/"cancelled", §7.1's own "reuses the
 // turn's own outcome taxonomy").
+//
+// EventID: see SubTaskStartRecord.
 type SubTaskFinishRecord struct {
+	EventID   int64
 	SubTaskID string
 	Outcome   string
+}
+
+// SubTaskTrace is one turn's sub-task trace as the caller read it (§26.6's
+// amendment): the decoded starts and finishes, and whether that read
+// covered the whole trace. ReadInFull is false when any part of it could
+// not be read -- a failed query, a row whose payload did not decode (the
+// caller skips it), or a turn with no dispatch scope to read it in -- and
+// its zero value is false, so a trace nobody read is never mistaken for an
+// empty one.
+type SubTaskTrace struct {
+	Starts     []SubTaskStartRecord
+	Finishes   []SubTaskFinishRecord
+	ReadInFull bool
 }
 
 // counterReviewFinishOutcomeCompleted mirrors sandboxws.
@@ -139,4 +166,73 @@ func CounterReviewCorroborated(starts []SubTaskStartRecord, finishes []SubTaskFi
 		}
 	}
 	return false
+}
+
+// AdditionsFactCheckInTrace (§26.6's amendment) extends the corroboration
+// above to the second fact-check run, over what the counter-review added:
+// it reports whether trace holds a fact-check sub-task (review.
+// FactCheckAgentName) that STARTED AFTER the counter-review and
+// completed. That ordering is the whole rule. The first fact-check run
+// starts before the counter-review by the funnel's own design (§26.6), so
+// "some completed fact-check exists" would always be true on a deep
+// review that ran its first pass, and would count every addition as
+// checked by a run that never saw it.
+//
+// "After the counter-review" means after every counter-reviewer event in
+// the trace: the start's EventID must exceed the EventID of every
+// counter-reviewer start and of every finish belonging to one. A second
+// counter-review run (a retry) that started after the fact-check could
+// have added findings that fact-check never saw. There must also be a
+// counter-review that completed (CounterReviewCorroborated): with none,
+// there is no counter-review for a run to come after.
+//
+// Returns:
+//   - reviewpost.AdditionsTraceUnread when !trace.ReadInFull -- even if a
+//     qualifying run is among the rows that were read: "checked" is a claim
+//     that no later counter-reviewer event exists, which a partial read
+//     cannot support. The caller resolves this to unconfirmed, "could not
+//     be confirmed", never to "the trace shows none".
+//   - reviewpost.AdditionsTraceRunFound when a qualifying run is present.
+//   - reviewpost.AdditionsTraceNoRunFound otherwise: the trace, read in
+//     full, holds no qualifying run -- which includes a run whose finish
+//     had not landed when the verdict was posted (§26.4's accepted race),
+//     so the caller's text says "not found when the verdict was posted",
+//     never "did not run".
+//
+// Pure: zero I/O, zero time.Now(), like CounterReviewCorroborated.
+func AdditionsFactCheckInTrace(trace SubTaskTrace) reviewpost.AdditionsTrace {
+	if !trace.ReadInFull {
+		return reviewpost.AdditionsTraceUnread
+	}
+	if !CounterReviewCorroborated(trace.Starts, trace.Finishes) {
+		return reviewpost.AdditionsTraceNoRunFound
+	}
+
+	finishesBySubTask := make(map[string][]SubTaskFinishRecord, len(trace.Finishes))
+	for _, f := range trace.Finishes {
+		finishesBySubTask[f.SubTaskID] = append(finishesBySubTask[f.SubTaskID], f)
+	}
+
+	var lastCounterReviewEvent int64
+	for _, s := range trace.Starts {
+		if s.SubAgentType != review.CounterReviewerAgentName {
+			continue
+		}
+		lastCounterReviewEvent = max(lastCounterReviewEvent, s.EventID)
+		for _, f := range finishesBySubTask[s.SubTaskID] {
+			lastCounterReviewEvent = max(lastCounterReviewEvent, f.EventID)
+		}
+	}
+
+	for _, s := range trace.Starts {
+		if s.SubAgentType != review.FactCheckAgentName || s.EventID <= lastCounterReviewEvent {
+			continue
+		}
+		for _, f := range finishesBySubTask[s.SubTaskID] {
+			if f.Outcome == counterReviewFinishOutcomeCompleted {
+				return reviewpost.AdditionsTraceRunFound
+			}
+		}
+	}
+	return reviewpost.AdditionsTraceNoRunFound
 }

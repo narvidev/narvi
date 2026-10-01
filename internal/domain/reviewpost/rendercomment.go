@@ -112,6 +112,19 @@ import (
 // header it did before blockers existed; every other line of the comment
 // is unchanged by them.
 //
+// # (§26.6's amendment): counter-review additions
+//
+// A finding whose Source is the counter-review and whose AdditionCheck is
+// not checked (Finding.UnverifiedAddition) is never rendered among the
+// findings: it goes under its own heading after them, which carries their
+// count, and each line says why the server could not count it as checked
+// (unverifiedAdditionReason). A checked addition stays among the findings,
+// marked as the counter-review's. Every other finding -- primary, or with
+// no source recorded -- renders byte for byte as before. Nothing here
+// touches the header: an unverified addition raises the Shippable class
+// exactly as much as any other finding does, which is not at all
+// (review.ComputeShippable reads no finding).
+//
 // # The header's reviewer text cannot open a list item there
 //
 // The header list is the server's: its four bullets and the blocker lines
@@ -208,33 +221,33 @@ func RenderVerdictComment(v review.Verdict, shippable review.ShippableAssessment
 	fmt.Fprintf(&b, "- **Docs drift**: %s\n", v.DocsDrift)
 	fmt.Fprintf(&b, "- **Files changed**: %d\n", v.FilesChanged)
 
-	if len(findings) > 0 {
+	// §26.6's amendment: a counter-review addition the server could not
+	// count as checked is listed apart, under its own heading carrying the
+	// count, and never among the findings; a checked addition stays in the
+	// list, marked as the counter-review's. A finding with any other source
+	// renders exactly as it always did.
+	var listed, unverified []Finding
+	for _, f := range findings {
+		if f.UnverifiedAddition() {
+			unverified = append(unverified, f)
+		} else {
+			listed = append(listed, f)
+		}
+	}
+	if len(listed) > 0 {
 		b.WriteString("\n**Findings:**\n\n")
-		for _, f := range findings {
-			kind := findingIdentityGeneralKind
-			if f.SentinelKind != nil {
-				kind = string(*f.SentinelKind)
+		for _, f := range listed {
+			note := ""
+			if f.Source == FindingSourceCounterReview {
+				note = checkedAdditionNote
 			}
-			// §22.1.1: StartLine/EndLine (server-computed, content-anchored
-			// -- position.go) are the ONLY position ever rendered here once
-			// they exist. f.Line (the model's own self-reported, UNVERIFIED
-			// pointer) is deliberately never used as a rendering fallback
-			// when StartLine is 0 (unanchored): rendering it anyway would
-			// hand a maintainer exactly the "plausible-looking wrong
-			// answer" §22.1.1 says is worse than no position at all --
-			// StartLine==0 renders as no line reference whatsoever, an
-			// honest "position not found", never a guess dressed up as a
-			// real one.
-			description := escapeFindingDescription(f.Description)
-			filePath := escapeFilePathForCodeSpan(f.FilePath)
-			switch {
-			case f.StartLine != 0 && f.StartLine == f.EndLine:
-				fmt.Fprintf(&b, "- [%s/%s] `%s:%d`: %s\n", kind, f.Severity, filePath, f.StartLine, description)
-			case f.StartLine != 0:
-				fmt.Fprintf(&b, "- [%s/%s] `%s:%d-%d`: %s\n", kind, f.Severity, filePath, f.StartLine, f.EndLine, description)
-			default:
-				fmt.Fprintf(&b, "- [%s/%s] `%s`: %s\n", kind, f.Severity, filePath, description)
-			}
+			b.WriteString(renderFindingLine(f, note))
+		}
+	}
+	if len(unverified) > 0 {
+		fmt.Fprintf(&b, "\n"+unverifiedAdditionsHeading+"\n\n", len(unverified))
+		for _, f := range unverified {
+			b.WriteString(renderFindingLine(f, " _(unverified: "+unverifiedAdditionReason(f.AdditionCheck)+")_"))
 		}
 	}
 	b.WriteString("\n</details>\n\n")
@@ -243,6 +256,63 @@ func RenderVerdictComment(v review.Verdict, shippable review.ShippableAssessment
 	b.WriteString(RerunGuidance(botHandle))
 
 	return b.String()
+}
+
+// renderFindingLine renders one finding as its appendix bullet, then
+// note (server text, "" for none) after its description.
+//
+// §22.1.1: StartLine/EndLine (server-computed, content-anchored --
+// position.go) are the ONLY position ever rendered here once they exist.
+// f.Line (the model's own self-reported, UNVERIFIED pointer) is
+// deliberately never used as a rendering fallback when StartLine is 0
+// (unanchored): rendering it anyway would hand a maintainer exactly the
+// "plausible-looking wrong answer" §22.1.1 says is worse than no position
+// at all -- StartLine==0 renders as no line reference whatsoever, an
+// honest "position not found", never a guess dressed up as a real one.
+func renderFindingLine(f Finding, note string) string {
+	kind := findingIdentityGeneralKind
+	if f.SentinelKind != nil {
+		kind = string(*f.SentinelKind)
+	}
+	description := escapeFindingDescription(f.Description)
+	filePath := escapeFilePathForCodeSpan(f.FilePath)
+	switch {
+	case f.StartLine != 0 && f.StartLine == f.EndLine:
+		return fmt.Sprintf("- [%s/%s] `%s:%d`: %s%s\n", kind, f.Severity, filePath, f.StartLine, description, note)
+	case f.StartLine != 0:
+		return fmt.Sprintf("- [%s/%s] `%s:%d-%d`: %s%s\n", kind, f.Severity, filePath, f.StartLine, f.EndLine, description, note)
+	default:
+		return fmt.Sprintf("- [%s/%s] `%s`: %s%s\n", kind, f.Severity, filePath, description, note)
+	}
+}
+
+// checkedAdditionNote marks a counter-review addition the server counted
+// as checked (§26.6's amendment): it stays among the findings, and says
+// which pass produced it.
+const checkedAdditionNote = " _(added by the counter-review; fact-checked after it)_"
+
+// unverifiedAdditionsHeading opens the list of counter-review additions
+// the server could not count as checked, with their count (§26.6's
+// amendment): listed apart from the findings and counted apart.
+const unverifiedAdditionsHeading = "**Unverified -- added by the counter-review and not fact-checked (%d, counted apart from the findings):**"
+
+// unverifiedAdditionReason says why an addition is unverified, from the
+// server's resolution. It says only what the server found when the
+// verdict was posted: "not found" is a statement about the trace as read
+// then, and a trace not read in full yields "could not be confirmed",
+// never a claim about what it holds (§26.1's lesson on the uncorroborated
+// counter-review).
+func unverifiedAdditionReason(c AdditionCheck) string {
+	switch c {
+	case AdditionNotRun:
+		return "no fact-check run over it after the counter-review was reported"
+	case AdditionNotFound:
+		return "a fact-check run over it was reported, but none that started after the counter-review and completed was found in this turn's trace when the verdict was posted"
+	case AdditionUnconfirmed:
+		return "whether a fact-check ran over it could not be confirmed: this turn's trace could not be read in full when the verdict was posted"
+	default:
+		return "no fact-check run over it was confirmed"
+	}
 }
 
 // shippableBlockersLeadIn opens the blocker lines under the Shippable
@@ -259,7 +329,7 @@ const shippableBlockersLeadIn = "  - Kept above auto by (decided by the server, 
 // dispatched gen or event id on the turn, a failed corroboration query, a
 // malformed row that was skipped) and from the accepted race where the
 // counter-reviewer's finish event lands after the verdict (httpapi's
-// corroborateCounterReview, reviewpost.BuildVerdict).
+// readSubTaskTrace, reviewpost.BuildVerdict).
 const uncorroboratedCounterReviewNote = " -- reported done, but the server could not confirm it from this turn's trace when the verdict was posted"
 
 // renderShippableBlockers renders blockers as nested bullets under the

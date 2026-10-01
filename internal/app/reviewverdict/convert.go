@@ -197,6 +197,7 @@ func recordFromRow(row sqlcgen.ReviewVerdict) reviewverdict.Record {
 		CounterReview:   counterReviewFromRow(row),
 		FactCheck:       factCheckFromRow(row),
 		FactCheckKilled: factCheckKilledFromRow(row),
+		SecondFactCheck: secondFactCheckFromRow(row),
 		Context:         contextFromRow(row),
 		AttemptID:       attemptIDFromRow(row.AttemptID),
 	}
@@ -236,6 +237,25 @@ func factCheckKilledFromRow(row sqlcgen.ReviewVerdict) int {
 		return 0
 	}
 	return int(*row.FactCheckKilled)
+}
+
+// secondFactCheckFromRow reads row's own additions_fact_check/
+// additions_fact_check_killed/additions_check columns (§26.6's amendment,
+// migrations/000154) -- each NULL degrades to its zero value, so a row
+// with nothing recorded (or posted before the migration) reads back as
+// the zero SecondFactCheck.
+func secondFactCheckFromRow(row sqlcgen.ReviewVerdict) reviewpost.SecondFactCheck {
+	var out reviewpost.SecondFactCheck
+	if row.AdditionsFactCheck != nil {
+		out.Reported = reviewpost.FactCheckStatus(*row.AdditionsFactCheck)
+	}
+	if row.AdditionsFactCheckKilled != nil {
+		out.ReportedKilled = int(*row.AdditionsFactCheckKilled)
+	}
+	if row.AdditionsCheck != nil {
+		out.Resolved = reviewpost.AdditionCheck(*row.AdditionsCheck)
+	}
+	return out
 }
 
 // reviewPathFromRow reads row's own review_path column (§26.3)

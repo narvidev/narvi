@@ -464,7 +464,7 @@ func seedAutoApprovedVerdict(ctx context.Context, t *testing.T, pool *pgxpool.Po
 		BaseSHA:       testEligibleBaseSHA,
 		PolicyVersion: autoapproval.CurrentPolicyVersion,
 	}
-	if _, err := appreviewverdict.Insert(ctx, store, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, store, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed auto-approved review_verdicts row for %s#%d: %v", repoFullName, prNumber, err)
 	}
 }
@@ -1560,7 +1560,7 @@ func TestBuild_AncestorChainMatches_LiveResolved_StaysReadyToMerge(t *testing.T)
 	}
 	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
-	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, "acme/widgets", 42, "sha42", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict whose recorded ancestor chain matches the live resolution."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, "acme/widgets", 42, "sha42", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded verdict whose recorded ancestor chain matches the live resolution."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed verdict with a matching ancestor chain: %v", err)
 	}
 
@@ -1832,7 +1832,7 @@ func TestBuild_AncestorChainAdvanced_ConfirmedFastForward_StaysReadyToMerge(t *t
 	}
 	reviewVerdicts := narvipg.NewReviewVerdictStore(pool)
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
-	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, 81, "sha-81", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "verdict recorded before the ancestor chain's own confirmed fast-forward"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, 81, "sha-81", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "verdict recorded before the ancestor chain's own confirmed fast-forward"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed verdict with an advanced-but-confirmed ancestor chain: %v", err)
 	}
 
@@ -2038,7 +2038,7 @@ func TestBuild_AcceptedVerdict_BaseMoved_HidesStaleAcceptance(t *testing.T) {
 		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}
 	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
-	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, 42, "sha42", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, 42, "sha42", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{})
 	if err != nil {
 		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
 	}
@@ -2186,7 +2186,7 @@ func TestBuild_AcceptedVerdict_HeadMoved_HidesStaleAcceptance(t *testing.T) {
 		t.Fatalf("fixture bug -- RiskLevelHigh computed Shippable=auto, want anything else")
 	}
 	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
-	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, 43, "sha43", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, 43, "sha43", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{})
 	if err != nil {
 		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
 	}
@@ -2329,7 +2329,7 @@ func TestBuild_AcceptedVerdict_AncestorChainChanged_HidesStaleAcceptance(t *test
 		AncestorChain: []review.AncestorLink{{Ref: "feature/stack-parent", SHA: "sha-stack-parent"}},
 		PolicyVersion: autoapproval.CurrentPolicyVersion,
 	}
-	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, 44, "sha44", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, 44, "sha44", pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{})
 	if err != nil {
 		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
 	}
@@ -2539,7 +2539,7 @@ func TestBuild_AcceptanceMergeable(t *testing.T) {
 			}
 			headSHA := fmt.Sprintf("sha-r1-%d", i)
 			verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
-			record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+			record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{})
 			if err != nil {
 				t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
 			}
@@ -2701,7 +2701,7 @@ func TestBuild_AcceptanceMergeable_NeedsHumanLabel_DoesNotRecordOverridden(t *te
 	}
 	const headSHA = "sha-t1-needs-human"
 	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
-	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{})
 	if err != nil {
 		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
 	}
@@ -2834,7 +2834,7 @@ func TestBuild_AcceptanceMergeable_DegradedLiveCheck_DistinctReason(t *testing.T
 	}
 	const headSHA = "sha-t3-degraded"
 	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
-	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{})
 	if err != nil {
 		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
 	}
@@ -2978,7 +2978,7 @@ func TestBuild_AcceptanceMergeable_ReadyToMergeRow(t *testing.T) {
 	}
 	const headSHA = "sha-t6-ready-to-merge"
 	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
-	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded auto-approved verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded auto-approved verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{})
 	if err != nil {
 		t.Fatalf("seed shippable-auto review_verdicts row: %v", err)
 	}
@@ -3103,7 +3103,7 @@ func TestBuild_AcceptanceMergeable_HandoffRow(t *testing.T) {
 	}
 	const headSHA = "sha-t6-handoff"
 	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
-	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{})
 	if err != nil {
 		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
 	}
@@ -3252,7 +3252,7 @@ func TestBuild_AcceptanceMergeable_ReleaseCutRow(t *testing.T) {
 	}
 	const headSHA = "sha-t7-release"
 	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
-	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{})
+	record, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettingsStore, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{})
 	if err != nil {
 		t.Fatalf("seed not-shippable-auto review_verdicts row: %v", err)
 	}

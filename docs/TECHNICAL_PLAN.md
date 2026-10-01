@@ -2464,6 +2464,22 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
     `needs_human` — strictly more conservative, never less — the same fail-conservative bias
     `CounterReviewSkipped`'s own "every cause floors identically" posture already commits to.
     Deliberately left unaddressed: no retries, no polling, no new timeout constant.
+  - **Extended to the second fact-check run (§26.6's amendment).** The same trace read now feeds
+    two checks, never two reads: `httpapi.readSubTaskTrace` reads the turn's sub-task events once,
+    whenever the deep path reports the counter-review done or the second fact-check run done, and
+    returns a `reviewverdict.SubTaskTrace` whose records carry each row's own `events.id`. Within one
+    session ids are allocated in commit order (`MaxEventIDForSession`), so comparing two records'
+    ids orders them as the trace recorded them, with no clock. `CounterReviewCorroborated` is
+    unchanged; `AdditionsFactCheckInTrace` reports whether a `fact-check` sub-task started after
+    every counter-reviewer event in the trace (each start and each finish belonging to one) and
+    completed, given at least one counter-review that completed. The first fact-check run starts
+    before the counter-review by the funnel's design, so without that ordering every deep review
+    would read as checked. `SubTaskTrace.ReadInFull` is false when any part of the trace could not
+    be read -- no dispatch gen or event id on the turn, a failed query, a row that did not decode --
+    and the additions then resolve to `unconfirmed`, "could not be confirmed", even when a
+    qualifying run is among the rows that were read: a checked addition is a claim that no later
+    counter-reviewer event exists, which a partial read cannot support. The counter-review claim
+    keeps its existing reading (a positive found among the decoded rows still corroborates).
 
 ### 26.5 Measuring the readout (Step 69, on Step 62's instrument)
 
@@ -2525,6 +2541,22 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
   size), minified bundles and snapshots (shipped or asserted content), and MDX (compiled into
   pages). An operator whose repositories follow other conventions widens the list with
   `NARVI_REVIEW_SIZE_EXCLUDED_PATHS`.
+- **Precision per source, and unverified additions counted apart (§26.6's amendment).** Every
+  published finding records the source its payload reported, `primary` or `counter_review`
+  (`review_findings.reported_source`, migration `000154`), and, for a counter-review addition,
+  the server's resolution (`addition_check`: `checked`, `not_run`, `not_found`, `unconfirmed`).
+  Both describe the finding's latest publication and are overwritten on a re-report, like
+  `last_seen_at`; a residual, named: a finding the counter-reviewer introduced and the primary
+  reviewer later re-reports counts under `primary` from then on. The source is self-reported --
+  the server cannot see which pass wrote a finding -- and is recorded as such. The "Review finding
+  outcomes" KPI (`ReviewAnalytics.findingOutcomes`) leaves out every addition the server could not
+  count as checked, and `findingOutcomesBySource` counts every finding per source (`primary`,
+  `counter_review`, `counter_review_unverified`, `not_recorded`) and status, so precision per
+  source is the share of a source's findings a maintainer rebutted, and the §26.6 rule can be
+  revisited on numbers. A finding last published before migration `000154` has no source
+  recorded: it reads as `not_recorded`, never as `primary`, is never marked unverified, and stays
+  in the main distribution as it always was. The merge-gate's open-findings count is unchanged: an
+  unverified addition blocks merge exactly like any other open finding.
 - The §21.3 deterministic digest and the §16 decision inbox surface the readout's `Summary` line
   per PR — reusing their existing aggregation, no new mechanism.
 - **Evals**: known-PR digest-quality cases (expected architecture decisions on reference diffs,
@@ -2549,8 +2581,9 @@ Counter-review is deep, adversarial, tool-equipped, and runs only on the deep pa
 pass is shallow, mechanical, and runs on **both**. On the deep path they compose as a funnel:
 
 primary reviewer's findings → **fact-check** (kills only provably-wrong-from-diff) →
-**counter-review** (§26.4, adjudicates the survivors, may itself surface new findings) →
-synthesis (unchanged) → publish
+**counter-review** (§26.4, adjudicates the survivors, may itself surface new findings, each
+stating the evidence triplet) → **second fact-check**, over the additions only (amendment below)
+→ synthesis (unchanged) → publish
 
 (`architecture-scribe` is orthogonal to this ordering — §26.4's own "virgin context, uncontaminated
 by the primary's finding hunt" design means it never consumes or feeds the findings list this
@@ -2630,6 +2663,44 @@ second fact-check sub-task, run after the counter-review in the same turn, is co
 turn's own sub-task events; any other is published marked unverified, and what the reviewer reports
 about coverage and source is recorded as self-reported. Every published finding records its source, primary or counter-review, so
 §26.5 reports precision per source and the rule can be revisited on numbers.
+
+As shipped:
+- **The instruction** (`internal/domain/review/context.go`). The counter-review step asks each
+  addition to state the defect, quoting the diff lines it rests on; the path that reaches it; and
+  the consequence -- and to drop one that cannot state all three. A fourth, deep-only step spawns a
+  new `fact-check` sub-task over the additions alone, after the counter-review has finished, under
+  step 1's diff-only rules; it is a fact-check spawn, so §26.7's budget check governs it unchanged.
+  The payload reports it as `additionsFactCheck` (`done`/`skipped`, omitted when the
+  counter-review added nothing) and `additionsFactCheckKilled`, apart from `factCheck`/
+  `factCheckKilled`, and every finding carries `source` (`primary` on light, where the text names
+  no other value; `primary` or `counter_review` on deep). Contracts 1.16.0.
+- **The rule** (`reviewpost.ResolveAdditionCheck`). An addition is `checked` only when the
+  reviewer reported the second run done AND the turn's trace shows a fact-check that started after
+  the counter-review and completed (§26.4's extension); otherwise it is `not_run` (reported
+  skipped, or not reported), `not_found` (reported, and the trace read when the verdict was posted
+  held none -- §26.4's accepted race included) or `unconfirmed` (the trace could not be read in
+  full). One resolution per verdict (`BuildSecondFactCheck`) marks every addition, so the verdict
+  and its findings cannot disagree.
+- **Validation.** `source` is required on every posted finding (a missing or garbled value is
+  `400`); a `counter_review` source, or a second-run report, is refused off the deep path; a kill
+  count is refused unless the run is reported `done`. On the deep path every other combination is
+  admitted -- additions beside a counter-review reported skipped included -- because whatever the
+  payload claims, an addition is checked only when the server finds the run, and refusing an
+  inconsistent claim would only push a reviewer to relabel an addition `primary`.
+- **Publication.** The posted comment lists an unverified addition under its own heading, after
+  the findings, with their count and the server's reason for each; a checked one stays among the
+  findings, marked as the counter-review's; every other finding renders as before. The readout
+  carries `source`/`additionCheck` per finding and `additionsFactCheck`/
+  `additionsFactCheckKilled`/`additionsCheck` on the verdict; the Code review view marks an
+  unverified addition, counts it apart in the appendix header and lists it apart. An unverified
+  addition raises the Shippable class no more than a checked one: `review.ComputeShippable` reads
+  no finding (§26.1), and neither the blockers nor the merge gate treat it differently.
+- **Storage.** `review_verdicts.additions_fact_check`/`additions_fact_check_killed`/
+  `additions_check` record the second run apart from the first; `review_findings.reported_source`/
+  `addition_check` record each finding's source and resolution (migration `000154`). The server
+  cannot see whether the diff disproved an addition -- `sub_task_finish` carries no content -- so
+  "an addition the diff disproves is not published" rests on the instruction, with the reviewer's
+  reported kill count recorded beside the run.
 
 ### 26.7 Per-review cost budget with look-ahead (Step 69 design, Step 70 wiring)
 
@@ -2735,8 +2806,10 @@ derived (propose $0.50 light / $5 deep per review, matching this plan's own conv
 a concrete, explicitly-tunable starting figure rather than leaving a blank, §24.6's
 `auto_retrigger_count` budget is the precedent). Light path's own ceiling is a degenerate,
 one-checkpoint case (the one optional pass it can run at all is §26.6's fact-check sub-task); deep
-path's is checked once before each of the two optional sub-tasks this ceiling actually governs —
-fact-check and `counter-reviewer` — in whatever order that orchestration dispatches them.
+path's is checked once before each optional sub-task dispatch this ceiling actually governs —
+fact-check (both runs, the second over the counter-review's additions, §26.6's amendment) and
+`counter-reviewer` — in whatever order that orchestration dispatches them; a skipped second
+fact-check leaves the additions published marked unverified.
 `architecture-scribe` is excluded from this check entirely (§26.9's own resolution: a
 budget-triggered scribe skip would floor nothing and appear nowhere, the silent downgrade the v1
 rigor invariant forbids) — it always runs regardless of cost.

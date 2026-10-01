@@ -2246,6 +2246,8 @@ type ReviewFinding struct {
 	FixPrNumber       *int32             `json:"fix_pr_number"`
 	FirstSeenAt       pgtype.Timestamptz `json:"first_seen_at"`
 	LastSeenAt        pgtype.Timestamptz `json:"last_seen_at"`
+	ReportedSource    *string            `json:"reported_source"`
+	AdditionCheck     *string            `json:"addition_check"`
 }
 
 type ReviewVerdict struct {
@@ -2285,6 +2287,9 @@ type ReviewVerdict struct {
 	AncestorChain             []byte             `json:"ancestor_chain"`
 	PolicyVersion             int32              `json:"policy_version"`
 	AttemptID                 pgtype.UUID        `json:"attempt_id"`
+	AdditionsFactCheck        *string            `json:"additions_fact_check"`
+	AdditionsFactCheckKilled  *int32             `json:"additions_fact_check_killed"`
+	AdditionsCheck            *string            `json:"additions_check"`
 }
 
 type ReviewVerdictAcceptance struct {

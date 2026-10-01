@@ -420,10 +420,21 @@ func TestRenderTurnPrompt_VerdictToolJSONShapeMatchesContract(t *testing.T) {
 		// reviewpost.ValidateVerdictInput's own ErrInvalidFactCheck.
 		`"factCheck"`, string(restdtos.PostReviewVerdictRequestFactCheckDone), string(restdtos.PostReviewVerdictRequestFactCheckSkipped),
 		`"factCheckKilled"`, `"counterReview"`, `"contestedPoints"`,
+		// (§26.6's amendment): every finding names its source.
+		`"source"`,
 	}
 	for _, want := range fieldsAndEnums {
 		if !strings.Contains(got, want) {
 			t.Errorf("verdict-tool instructions do not mention %q (contract field/enum value) -- rendered:\n%s", want, got)
+		}
+	}
+
+	// (§26.6's amendment): the deep path's own additional keys -- the
+	// counter-review source value and the second fact-check run.
+	deep := review.RenderTurnPrompt("", review.PreFetchedContext{DeepPath: true})
+	for _, want := range []string{`"source"`, `"counter_review"`, `"additionsFactCheck"`, `"additionsFactCheckKilled"`} {
+		if !strings.Contains(deep, want) {
+			t.Errorf("deep-path verdict-tool instructions do not mention %q -- rendered:\n%s", want, deep)
 		}
 	}
 
@@ -453,13 +464,21 @@ func TestRenderTurnPrompt_VerdictToolJSONShapeMatchesContract(t *testing.T) {
 	*contestedPoints = "example contested points"
 	counterReview := restdtos.PostReviewVerdictRequestCounterReview(new(string))
 	*counterReview = string(restdtos.PostReviewVerdictRequestFactCheckDone)
+	findingSource := restdtos.PostedFindingSource(new(string))
+	*findingSource = "counter_review"
+	additionsFactCheck := restdtos.PostReviewVerdictRequestAdditionsFactCheck(new(string))
+	*additionsFactCheck = "done"
+	additionsFactCheckKilled := restdtos.PostReviewVerdictRequestAdditionsFactCheckKilled(new(int))
+	*additionsFactCheckKilled = 1
 	example := restdtos.PostReviewVerdictRequest{
-		BlastRadius:     []restdtos.PostReviewVerdictRequestBlastRadiusElem{restdtos.PostReviewVerdictRequestBlastRadiusElemAuth},
-		DocsDrift:       restdtos.PostReviewVerdictRequestDocsDriftNone,
-		FilesChanged:    1,
-		FactCheck:       restdtos.PostReviewVerdictRequestFactCheckDone,
-		FactCheckKilled: 2,
-		CounterReview:   counterReview,
+		BlastRadius:              []restdtos.PostReviewVerdictRequestBlastRadiusElem{restdtos.PostReviewVerdictRequestBlastRadiusElemAuth},
+		DocsDrift:                restdtos.PostReviewVerdictRequestDocsDriftNone,
+		FilesChanged:             1,
+		FactCheck:                restdtos.PostReviewVerdictRequestFactCheckDone,
+		FactCheckKilled:          2,
+		CounterReview:            counterReview,
+		AdditionsFactCheck:       additionsFactCheck,
+		AdditionsFactCheckKilled: additionsFactCheckKilled,
 		Findings: []restdtos.PostedFinding{
 			{
 				Description:  "example finding",
@@ -467,6 +486,7 @@ func TestRenderTurnPrompt_VerdictToolJSONShapeMatchesContract(t *testing.T) {
 				Line:         findingLine,
 				Severity:     restdtos.PostedFindingSeverityMedium,
 				SuggestedFix: findingSuggestedFix,
+				Source:       findingSource,
 			},
 		},
 		Premise:           restdtos.PostReviewVerdictRequestPremiseOk,
@@ -496,6 +516,7 @@ func TestRenderTurnPrompt_VerdictToolJSONShapeMatchesContract(t *testing.T) {
 		`"digest"`, `"archDecisions"`, `"decision"`, `"rejectedAlternative"`, `"conventionConformance"`, `"stackRisks"`, `"unverifiedLimits"`,
 		`"descriptionAdequacy"`, `"adequacyExplanation"`, `"proposedBody"`,
 		`"factCheck"`, `"factCheckKilled"`, `"counterReview"`, `"contestedPoints"`,
+		`"source"`, `"additionsFactCheck"`, `"additionsFactCheckKilled"`,
 	} {
 		if !strings.Contains(string(raw), wantKey) {
 			t.Errorf("marshaled restdtos.PostReviewVerdictRequest = %s, want it to contain key %q", raw, wantKey)
@@ -1144,5 +1165,87 @@ func TestAncestorChainFromStack(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestRenderTurnPrompt_CounterReviewAdditionsAreFactChecked pins §26.6's
+// amendment in the deep-path instruction: the counter-review's additions
+// are no longer exempt from the fact-check, each states the evidence
+// triplet, and a second, diff-only fact-check runs over them after the
+// counter-review, reported apart from the first.
+func TestRenderTurnPrompt_CounterReviewAdditionsAreFactChecked(t *testing.T) {
+	t.Parallel()
+
+	deep := review.RenderTurnPrompt("review this", review.PreFetchedContext{DeepPath: true})
+	if strings.Contains(deep, "NOT re-run through fact-check") {
+		t.Errorf("deep-path prompt still exempts the counter-review's additions from the fact-check:\n%s", deep)
+	}
+
+	counterReviewIdx := strings.Index(deep, "3. Counter-review (subagent_type")
+	secondRunIdx := strings.Index(deep, "4. Second fact-check, over the additions (subagent_type \""+review.FactCheckAgentName+"\"")
+	if counterReviewIdx < 0 || secondRunIdx < 0 {
+		t.Fatalf("deep-path prompt is missing the counter-review step (%d) or the second fact-check step (%d):\n%s", counterReviewIdx, secondRunIdx, deep)
+	}
+	if secondRunIdx < counterReviewIdx {
+		t.Errorf("the second fact-check step is instructed before the counter-review step:\n%s", deep)
+	}
+
+	counterReviewStep := deep[counterReviewIdx:secondRunIdx]
+	for _, want := range []string{
+		"the defect, quoting the exact lines of the diff it rests on",
+		"the path that reaches it",
+		"the consequence, what goes wrong",
+		"Drop any addition that does not state all three",
+	} {
+		if !strings.Contains(counterReviewStep, want) {
+			t.Errorf("counter-review step does not ask each addition for %q:\n%s", want, counterReviewStep)
+		}
+	}
+
+	secondRunStep := deep[secondRunIdx:]
+	if end := strings.Index(secondRunStep, "\n"); end >= 0 {
+		secondRunStep = secondRunStep[:end]
+	}
+	for _, want := range []string{
+		"AFTER the counter-review has finished",
+		"ONLY the additions",
+		"ONLY when the diff text alone PROVES it wrong",
+		"rests on repository context outside the diff",
+		`"additionsFactCheck": "done"`,
+		`"additionsFactCheck": "skipped", "additionsFactCheckKilled": 0`,
+		"the cost-budget check below applies to it too",
+		"a fact-check that started after the counter-review and completed",
+		"marked unverified, counted apart",
+	} {
+		if !strings.Contains(secondRunStep, want) {
+			t.Errorf("second fact-check step does not say %q:\n%s", want, secondRunStep)
+		}
+	}
+
+	for _, want := range []string{
+		`"source": "primary" | "counter_review" (required`,
+		`"additionsFactCheck": "done" | "skipped" (the second fact-check run over the counter-review's additions`,
+		`"additionsFactCheckKilled": <integer, count of additions the second fact-check run removed`,
+	} {
+		if !strings.Contains(deep, want) {
+			t.Errorf("deep-path JSON body does not carry %q:\n%s", want, deep)
+		}
+	}
+}
+
+// TestRenderTurnPrompt_LightPathNamesOnlyThePrimarySource: §26.9 -- a
+// light-path prompt names no counter-review source and no second
+// fact-check run; every finding there is the reviewer's own.
+func TestRenderTurnPrompt_LightPathNamesOnlyThePrimarySource(t *testing.T) {
+	t.Parallel()
+
+	light := review.RenderTurnPrompt("review this", review.PreFetchedContext{DeepPath: false, ReviewCostBudgetUSD: 0.5})
+	if !strings.Contains(light, `"source": "primary" (required -- every finding on this review is your own)`) {
+		t.Errorf("light-path prompt does not require the primary source on every finding:\n%s", light)
+	}
+	for _, absent := range []string{"counter_review", "additionsFactCheck", "Second fact-check"} {
+		if strings.Contains(light, absent) {
+			t.Errorf("light-path prompt mentions %q, which exists only on the deep path:\n%s", absent, light)
+		}
 	}
 }

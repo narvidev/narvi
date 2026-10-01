@@ -12,7 +12,7 @@ import (
 )
 
 const getReviewFinding = `-- name: GetReviewFinding :one
-SELECT id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at FROM review_findings
+SELECT id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at, reported_source, addition_check FROM review_findings
 WHERE repo_full_name = $1 AND pr_number = $2 AND identity_hash = $3
 `
 
@@ -46,12 +46,14 @@ func (q *Queries) GetReviewFinding(ctx context.Context, arg GetReviewFindingPara
 		&i.FixPrNumber,
 		&i.FirstSeenAt,
 		&i.LastSeenAt,
+		&i.ReportedSource,
+		&i.AdditionCheck,
 	)
 	return i, err
 }
 
 const listAllReviewFindingsForPR = `-- name: ListAllReviewFindingsForPR :many
-SELECT id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at FROM review_findings
+SELECT id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at, reported_source, addition_check FROM review_findings
 WHERE repo_full_name = $1 AND pr_number = $2
 ORDER BY first_seen_at ASC
 `
@@ -96,6 +98,8 @@ func (q *Queries) ListAllReviewFindingsForPR(ctx context.Context, arg ListAllRev
 			&i.FixPrNumber,
 			&i.FirstSeenAt,
 			&i.LastSeenAt,
+			&i.ReportedSource,
+			&i.AdditionCheck,
 		); err != nil {
 			return nil, err
 		}
@@ -108,7 +112,7 @@ func (q *Queries) ListAllReviewFindingsForPR(ctx context.Context, arg ListAllRev
 }
 
 const listOpenAndRebuttedReviewFindings = `-- name: ListOpenAndRebuttedReviewFindings :many
-SELECT id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at FROM review_findings
+SELECT id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at, reported_source, addition_check FROM review_findings
 WHERE repo_full_name = $1 AND pr_number = $2 AND status IN ('open', 'rebutted', 'fix_recorded')
 ORDER BY first_seen_at ASC
 `
@@ -165,6 +169,8 @@ func (q *Queries) ListOpenAndRebuttedReviewFindings(ctx context.Context, arg Lis
 			&i.FixPrNumber,
 			&i.FirstSeenAt,
 			&i.LastSeenAt,
+			&i.ReportedSource,
+			&i.AdditionCheck,
 		); err != nil {
 			return nil, err
 		}
@@ -177,7 +183,7 @@ func (q *Queries) ListOpenAndRebuttedReviewFindings(ctx context.Context, arg Lis
 }
 
 const listReviewFindingStatusesInWindow = `-- name: ListReviewFindingStatusesInWindow :many
-SELECT status FROM review_findings
+SELECT status, reported_source, addition_check FROM review_findings
 WHERE repo_full_name = $1 AND first_seen_at > $2
 ORDER BY first_seen_at ASC
 LIMIT $3
@@ -189,26 +195,35 @@ type ListReviewFindingStatusesInWindowParams struct {
 	Limit        int32              `json:"limit"`
 }
 
+type ListReviewFindingStatusesInWindowRow struct {
+	Status         string  `json:"status"`
+	ReportedSource *string `json:"reported_source"`
+	AdditionCheck  *string `json:"addition_check"`
+}
+
 // §21's own "Review finding outcomes" analytics KPI (§21.1/§12.2
 // item 6) -- every finding FIRST seen for repoFullName after sinceTime,
 // bounded by limit (§21.1's own "bounded from day one" discipline). Only
-// the status column is selected: internal/domain/reviewverdict.
-// FindingOutcomes reduces a plain []reviewpost.FindingStatus, never a
-// full row, mirroring internal/app/decisioninbox.Metrics' own identical
-// "select only the columns the pure reduction actually needs" precedent.
-func (q *Queries) ListReviewFindingStatusesInWindow(ctx context.Context, arg ListReviewFindingStatusesInWindowParams) ([]string, error) {
+// the columns the pure reduction reads are selected: the status, and
+// (§26.5/§26.6's amendment, migrations/000154) the reported source and
+// the addition check, so an unverified counter-review addition is counted
+// apart and precision can be read per source
+// (internal/domain/reviewverdict.FindingOutcomesBySource), mirroring
+// internal/app/decisioninbox.Metrics' own identical "select only the
+// columns the pure reduction actually needs" precedent.
+func (q *Queries) ListReviewFindingStatusesInWindow(ctx context.Context, arg ListReviewFindingStatusesInWindowParams) ([]ListReviewFindingStatusesInWindowRow, error) {
 	rows, err := q.db.Query(ctx, listReviewFindingStatusesInWindow, arg.RepoFullName, arg.FirstSeenAt, arg.Limit)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var items []string
+	var items []ListReviewFindingStatusesInWindowRow
 	for rows.Next() {
-		var status string
-		if err := rows.Scan(&status); err != nil {
+		var i ListReviewFindingStatusesInWindowRow
+		if err := rows.Scan(&i.Status, &i.ReportedSource, &i.AdditionCheck); err != nil {
 			return nil, err
 		}
-		items = append(items, status)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -220,7 +235,7 @@ const markReviewFindingFixApplied = `-- name: MarkReviewFindingFixApplied :one
 UPDATE review_findings
 SET status = 'fix_applied'
 WHERE repo_full_name = $1 AND pr_number = $2 AND identity_hash = $3
-RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at
+RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at, reported_source, addition_check
 `
 
 type MarkReviewFindingFixAppliedParams struct {
@@ -254,6 +269,8 @@ func (q *Queries) MarkReviewFindingFixApplied(ctx context.Context, arg MarkRevie
 		&i.FixPrNumber,
 		&i.FirstSeenAt,
 		&i.LastSeenAt,
+		&i.ReportedSource,
+		&i.AdditionCheck,
 	)
 	return i, err
 }
@@ -262,7 +279,7 @@ const markReviewFindingFixOpen = `-- name: MarkReviewFindingFixOpen :one
 UPDATE review_findings
 SET status = 'fix_open', fix_pr_number = $2
 WHERE fix_child_session_id = $1 AND status = 'fix_pending'
-RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at
+RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at, reported_source, addition_check
 `
 
 type MarkReviewFindingFixOpenParams struct {
@@ -294,6 +311,8 @@ func (q *Queries) MarkReviewFindingFixOpen(ctx context.Context, arg MarkReviewFi
 		&i.FixPrNumber,
 		&i.FirstSeenAt,
 		&i.LastSeenAt,
+		&i.ReportedSource,
+		&i.AdditionCheck,
 	)
 	return i, err
 }
@@ -303,7 +322,7 @@ UPDATE review_findings
 SET status = 'fix_pending', fix_child_session_id = $4
 WHERE repo_full_name = $1 AND pr_number = $2 AND identity_hash = $3
   AND status IN ('open', 'fix_pending')
-RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at
+RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at, reported_source, addition_check
 `
 
 type MarkReviewFindingFixPendingParams struct {
@@ -359,6 +378,8 @@ func (q *Queries) MarkReviewFindingFixPending(ctx context.Context, arg MarkRevie
 		&i.FixPrNumber,
 		&i.FirstSeenAt,
 		&i.LastSeenAt,
+		&i.ReportedSource,
+		&i.AdditionCheck,
 	)
 	return i, err
 }
@@ -367,7 +388,7 @@ const markReviewFindingFixRecorded = `-- name: MarkReviewFindingFixRecorded :one
 UPDATE review_findings
 SET status = 'fix_recorded'
 WHERE repo_full_name = $1 AND pr_number = $2 AND identity_hash = $3
-RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at
+RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at, reported_source, addition_check
 `
 
 type MarkReviewFindingFixRecordedParams struct {
@@ -410,6 +431,8 @@ func (q *Queries) MarkReviewFindingFixRecorded(ctx context.Context, arg MarkRevi
 		&i.FixPrNumber,
 		&i.FirstSeenAt,
 		&i.LastSeenAt,
+		&i.ReportedSource,
+		&i.AdditionCheck,
 	)
 	return i, err
 }
@@ -418,7 +441,7 @@ const markReviewFindingRebutted = `-- name: MarkReviewFindingRebutted :one
 UPDATE review_findings
 SET status = 'rebutted', rebuttal_text = $4, rebutted_by = $5, rebutted_at = now()
 WHERE repo_full_name = $1 AND pr_number = $2 AND identity_hash = $3
-RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at
+RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at, reported_source, addition_check
 `
 
 type MarkReviewFindingRebuttedParams struct {
@@ -460,6 +483,8 @@ func (q *Queries) MarkReviewFindingRebutted(ctx context.Context, arg MarkReviewF
 		&i.FixPrNumber,
 		&i.FirstSeenAt,
 		&i.LastSeenAt,
+		&i.ReportedSource,
+		&i.AdditionCheck,
 	)
 	return i, err
 }
@@ -468,7 +493,7 @@ const markReviewFindingsFixMergedByFixSession = `-- name: MarkReviewFindingsFixM
 UPDATE review_findings
 SET status = 'fix_merged'
 WHERE fix_child_session_id = $1 AND status IN ('fix_pending', 'fix_open')
-RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at
+RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at, reported_source, addition_check
 `
 
 // Merge-gating's own terminal write (§17.4, once all four checks pass and
@@ -502,6 +527,8 @@ func (q *Queries) MarkReviewFindingsFixMergedByFixSession(ctx context.Context, f
 			&i.FixPrNumber,
 			&i.FirstSeenAt,
 			&i.LastSeenAt,
+			&i.ReportedSource,
+			&i.AdditionCheck,
 		); err != nil {
 			return nil, err
 		}
@@ -517,24 +544,30 @@ const upsertReviewFinding = `-- name: UpsertReviewFinding :one
 
 INSERT INTO review_findings (
     repo_full_name, pr_number, identity_hash, sentinel_kind, severity,
-    file_path, line, description, suggested_fix
+    file_path, line, description, suggested_fix,
+    reported_source, addition_check
 )
-VALUES ($1, $2, $3, $7, $4, $5, $8, $6, $9)
+VALUES ($1, $2, $3, $7, $4, $5, $8, $6, $9,
+    $10, $11)
 ON CONFLICT (repo_full_name, pr_number, identity_hash)
-DO UPDATE SET last_seen_at = now()
-RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at
+DO UPDATE SET last_seen_at = now(),
+    reported_source = EXCLUDED.reported_source,
+    addition_check = EXCLUDED.addition_check
+RETURNING id, repo_full_name, pr_number, identity_hash, sentinel_kind, severity, file_path, line, description, suggested_fix, status, rebuttal_text, rebutted_by, rebutted_at, fix_child_session_id, fix_pr_number, first_seen_at, last_seen_at, reported_source, addition_check
 `
 
 type UpsertReviewFindingParams struct {
-	RepoFullName string  `json:"repo_full_name"`
-	PrNumber     int32   `json:"pr_number"`
-	IdentityHash string  `json:"identity_hash"`
-	Severity     string  `json:"severity"`
-	FilePath     string  `json:"file_path"`
-	Description  string  `json:"description"`
-	SentinelKind *string `json:"sentinel_kind"`
-	Line         *int32  `json:"line"`
-	SuggestedFix *string `json:"suggested_fix"`
+	RepoFullName   string  `json:"repo_full_name"`
+	PrNumber       int32   `json:"pr_number"`
+	IdentityHash   string  `json:"identity_hash"`
+	Severity       string  `json:"severity"`
+	FilePath       string  `json:"file_path"`
+	Description    string  `json:"description"`
+	SentinelKind   *string `json:"sentinel_kind"`
+	Line           *int32  `json:"line"`
+	SuggestedFix   *string `json:"suggested_fix"`
+	ReportedSource *string `json:"reported_source"`
+	AdditionCheck  *string `json:"addition_check"`
 }
 
 // Queries backing ReviewFindingStore ("sentinels + suggestions",
@@ -551,6 +584,14 @@ type UpsertReviewFindingParams struct {
 // which is exactly what makes a finding re-reported on a LATER commit
 // still read as "already rebutted"/"already fix_open" rather than
 // silently reverting to looking brand new.
+//
+// reported_source/addition_check (§26.6's amendment, migrations/
+// 000154_review_findings_source.up.sql) describe the finding's LATEST
+// publication, so a re-report overwrites them just as it moves
+// last_seen_at: a counter-review addition published unverified and later
+// re-published checked, or re-reported by the primary reviewer, reads as
+// that later publication says. A row first published before 000154 gets
+// both on its next publication.
 func (q *Queries) UpsertReviewFinding(ctx context.Context, arg UpsertReviewFindingParams) (ReviewFinding, error) {
 	row := q.db.QueryRow(ctx, upsertReviewFinding,
 		arg.RepoFullName,
@@ -562,6 +603,8 @@ func (q *Queries) UpsertReviewFinding(ctx context.Context, arg UpsertReviewFindi
 		arg.SentinelKind,
 		arg.Line,
 		arg.SuggestedFix,
+		arg.ReportedSource,
+		arg.AdditionCheck,
 	)
 	var i ReviewFinding
 	err := row.Scan(
@@ -583,6 +626,8 @@ func (q *Queries) UpsertReviewFinding(ctx context.Context, arg UpsertReviewFindi
 		&i.FixPrNumber,
 		&i.FirstSeenAt,
 		&i.LastSeenAt,
+		&i.ReportedSource,
+		&i.AdditionCheck,
 	)
 	return i, err
 }

@@ -34,7 +34,7 @@ func TestInsert_RefusesBeforeTouchingTheStore(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			_, err := Insert(context.Background(), nil, nil, false, "acme/widgets", 7, tc.headSHA, pgtype.UUID{},
-				review.Verdict{}, reviewpost.Digest{}, reviewtriage.DepthDeep, tc.counterReview, reviewpost.FactCheckDone, 0,
+				review.Verdict{}, reviewpost.Digest{}, reviewtriage.DepthDeep, tc.counterReview, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{},
 				nil, nil, "", false, reviewverdict.Context{}, pgtype.UUID{})
 			if err == nil || !strings.Contains(err.Error(), tc.wantRefusal) {
 				t.Fatalf("Insert() error = %v, want a refusal mentioning %q", err, tc.wantRefusal)

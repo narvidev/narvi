@@ -1,0 +1,489 @@
+//go:build integration
+
+// Integration tests for §26.6's amendment, end to end through the real
+// verdict handler (reviewverdict.go) against real Postgres: a finding the
+// counter-reviewer adds counts as checked only when this turn's own
+// persisted sub-task trace shows a fact-check sub-task that started after
+// the counter-review and completed; any other addition is published
+// marked unverified and counted apart; every published finding records
+// its source; and the second fact-check run is recorded apart from the
+// first. The trace is seeded through the same EventStore.Create path the
+// session actor persists sandbox events with (seedSubTaskStart/
+// seedSubTaskFinish, reviewverdict_integration_test.go), so the ordering
+// the server checks is the order of real events.id values.
+package httpapi_test
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/review"
+)
+
+const (
+	additionsPrimaryDescription  = "The retry loop never backs off between attempts."
+	additionsAddedDescription    = "Defect: `for attempt := 0; ; attempt++` has no exit. Path: Fetch -> retryLoop on a permanent 404. Consequence: the worker spins forever and starves the queue."
+	additionsUnverifiedHeading   = "**Unverified -- added by the counter-review and not fact-checked (1, counted apart from the findings):**"
+	additionsCheckedMarker       = "_(added by the counter-review; fact-checked after it)_"
+	additionsNotFoundReason      = "a fact-check run over it was reported, but none that started after the counter-review and completed was found in this turn's trace when the verdict was posted"
+	additionsNotRunReason        = "no fact-check run over it after the counter-review was reported"
+	additionsUnconfirmedFragment = "could not be confirmed"
+)
+
+// deepVerdictWithAdditionsJSON is a legal deep-path verdict body
+// (counterReview done) carrying one primary finding and one counter-review
+// addition, with the second fact-check run reported as additionsFactCheck
+// (omitted when "") and additionsFactCheckKilled. The first run reports
+// factCheckKilled 2, so a merge of the two runs' outcomes is visible.
+func deepVerdictWithAdditionsJSON(t *testing.T, additionsFactCheck string, additionsFactCheckKilled int) string {
+	t.Helper()
+	body := map[string]any{
+		"riskLevel":         "low",
+		"premise":           "ok",
+		"blastRadius":       []string{},
+		"filesChanged":      3,
+		"testsCoverage":     "adequate",
+		"docsDrift":         "none",
+		"proposedShippable": "auto",
+		"summary":           "One finding of mine, one the counter-review added.",
+		"findings": []map[string]any{
+			{"severity": "medium", "filePath": "internal/retry/retry.go", "description": additionsPrimaryDescription, "source": "primary"},
+			{"severity": "high", "filePath": "internal/retry/retry.go", "description": additionsAddedDescription, "source": "counter_review"},
+		},
+		"digest": map[string]any{
+			"summary":             "Adds a retry helper around the flaky call and swaps every call site onto it.",
+			"descriptionAdequacy": "ok",
+			"adequacyExplanation": "The PR body accurately describes the retry helper.",
+			"archDecisions":       []map[string]any{{"decision": "Reused the existing retry helper."}},
+			"stackRisks":          "None of note -- purely additive.",
+			"unverifiedLimits":    "Did not run against production traffic.",
+		},
+		"factCheck":       "done",
+		"factCheckKilled": 2,
+		"counterReview":   "done",
+	}
+	if additionsFactCheck != "" {
+		body["additionsFactCheck"] = additionsFactCheck
+		body["additionsFactCheckKilled"] = additionsFactCheckKilled
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal verdict body: %v", err)
+	}
+	return string(raw)
+}
+
+// findingSourceColumns reads one review_findings row's reported_source
+// and addition_check, by description.
+func findingSourceColumns(ctx context.Context, t *testing.T, rig testRig, repoFullName, description string) (source, check *string) {
+	t.Helper()
+	if err := rig.pool.QueryRow(ctx, `SELECT reported_source, addition_check FROM review_findings WHERE repo_full_name = $1 AND description = $2`,
+		repoFullName, description).Scan(&source, &check); err != nil {
+		t.Fatalf("read review_findings row %q: %v", description, err)
+	}
+	return source, check
+}
+
+// verdictFactCheckRuns is the one review_verdicts row's first and second
+// fact-check runs.
+type verdictFactCheckRuns struct {
+	factCheck                *string
+	factCheckKilled          *int32
+	additionsFactCheck       *string
+	additionsFactCheckKilled *int32
+	additionsCheck           *string
+}
+
+func readVerdictFactCheckRuns(ctx context.Context, t *testing.T, rig testRig, repoFullName string) verdictFactCheckRuns {
+	t.Helper()
+	var got verdictFactCheckRuns
+	if err := rig.pool.QueryRow(ctx, `SELECT fact_check, fact_check_killed, additions_fact_check, additions_fact_check_killed, additions_check
+		FROM review_verdicts WHERE repo_full_name = $1`, repoFullName).Scan(
+		&got.factCheck, &got.factCheckKilled, &got.additionsFactCheck, &got.additionsFactCheckKilled, &got.additionsCheck); err != nil {
+		t.Fatalf("read review_verdicts row: %v", err)
+	}
+	return got
+}
+
+func strOrNil(p *string) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return *p
+}
+
+func int32OrNil(p *int32) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return fmt.Sprint(*p)
+}
+
+// seedCounterReview persists a completed counter-reviewer sub-task.
+func seedCounterReview(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID, id string) {
+	t.Helper()
+	seedSubTaskStart(ctx, t, rig, sessionID, "msg-start-"+id, id, review.CounterReviewerAgentName, 1)
+	seedSubTaskFinish(ctx, t, rig, sessionID, "msg-finish-"+id, id, "completed", 1)
+}
+
+// seedFactCheck persists a completed fact-check sub-task.
+func seedFactCheck(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID, id string) {
+	t.Helper()
+	seedSubTaskStart(ctx, t, rig, sessionID, "msg-start-"+id, id, review.FactCheckAgentName, 1)
+	seedSubTaskFinish(ctx, t, rig, sessionID, "msg-finish-"+id, id, "completed", 1)
+}
+
+// TestPostReviewVerdict_CounterReviewAddition_CheckedWhenSecondRunFollowsCounterReview
+// is the positive case: the first fact-check, the counter-review, then a
+// second fact-check that started after it and completed. The addition is
+// published checked -- among the findings, marked as the counter-review's
+// -- both findings record their source, and the second run's outcome is
+// stored apart from the first's.
+func TestPostReviewVerdict_CounterReviewAddition_CheckedWhenSecondRunFollowsCounterReview(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	const repo = "acme/additions-checked"
+	session := setupReviewSessionWithSandbox(ctx, t, rig, repo, 301)
+	seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-additions-checked", 1)
+	seedFactCheck(ctx, t, rig, session.ID, "fc-first")
+	seedCounterReview(ctx, t, rig, session.ID, "cr")
+	seedFactCheck(ctx, t, rig, session.ID, "fc-second")
+
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepVerdictWithAdditionsJSON(t, "done", 1))
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+	}
+	if resp.Shippable != restdtos.PostReviewVerdictResponseShippableAuto {
+		t.Errorf("Shippable = %q, want auto", resp.Shippable)
+	}
+
+	if source, check := findingSourceColumns(ctx, t, rig, repo, additionsPrimaryDescription); strOrNil(source) != "primary" || check != nil {
+		t.Errorf("primary finding: reported_source = %s, addition_check = %s; want primary, <nil>", strOrNil(source), strOrNil(check))
+	}
+	if source, check := findingSourceColumns(ctx, t, rig, repo, additionsAddedDescription); strOrNil(source) != "counter_review" || strOrNil(check) != "checked" {
+		t.Errorf("addition: reported_source = %s, addition_check = %s; want counter_review, checked", strOrNil(source), strOrNil(check))
+	}
+
+	runs := readVerdictFactCheckRuns(ctx, t, rig, repo)
+	if strOrNil(runs.factCheck) != "done" || int32OrNil(runs.factCheckKilled) != "2" {
+		t.Errorf("first run = %s/%s, want done/2 (the first run's own report, never merged with the second)", strOrNil(runs.factCheck), int32OrNil(runs.factCheckKilled))
+	}
+	if strOrNil(runs.additionsFactCheck) != "done" || int32OrNil(runs.additionsFactCheckKilled) != "1" || strOrNil(runs.additionsCheck) != "checked" {
+		t.Errorf("second run = %s/%s resolved %s, want done/1 resolved checked", strOrNil(runs.additionsFactCheck), int32OrNil(runs.additionsFactCheckKilled), strOrNil(runs.additionsCheck))
+	}
+
+	body := verdictOutboxBody(ctx, t, rig, session.ID)
+	if !strings.Contains(body, additionsCheckedMarker) {
+		t.Errorf("posted body does not mark the checked addition as the counter-review's, Body:\n%s", body)
+	}
+	if strings.Contains(body, "**Unverified") {
+		t.Errorf("posted body lists a checked addition as unverified, Body:\n%s", body)
+	}
+}
+
+// TestPostReviewVerdict_CounterReviewAddition_UnverifiedWhenSecondRunPrecedesCounterReview:
+// two completed fact-checks, both BEFORE the counter-review. Any-run-counts
+// would call the addition checked; the ordering check finds no run after
+// the counter-review, so it is published unverified, listed and counted
+// apart in the comment, the readout and the finding-outcomes KPI, and it
+// moves the Shippable class no more than a checked one does.
+func TestPostReviewVerdict_CounterReviewAddition_UnverifiedWhenSecondRunPrecedesCounterReview(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	const repo = "acme/additions-run-before"
+	session := setupReviewSessionWithSandbox(ctx, t, rig, repo, 302)
+	seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-additions-run-before", 1)
+	seedFactCheck(ctx, t, rig, session.ID, "fc-first")
+	seedFactCheck(ctx, t, rig, session.ID, "fc-second-too-early")
+	seedCounterReview(ctx, t, rig, session.ID, "cr")
+
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepVerdictWithAdditionsJSON(t, "done", 0))
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+	}
+	if resp.Shippable != restdtos.PostReviewVerdictResponseShippableAuto {
+		t.Errorf("Shippable = %q, want auto (an unverified addition raises the class no more than a checked one)", resp.Shippable)
+	}
+
+	if source, check := findingSourceColumns(ctx, t, rig, repo, additionsAddedDescription); strOrNil(source) != "counter_review" || strOrNil(check) != "not_found" {
+		t.Errorf("addition: reported_source = %s, addition_check = %s; want counter_review, not_found", strOrNil(source), strOrNil(check))
+	}
+	if runs := readVerdictFactCheckRuns(ctx, t, rig, repo); strOrNil(runs.additionsCheck) != "not_found" || strOrNil(runs.additionsFactCheck) != "done" {
+		t.Errorf("second run = %s resolved %s, want done resolved not_found", strOrNil(runs.additionsFactCheck), strOrNil(runs.additionsCheck))
+	}
+
+	body := verdictOutboxBody(ctx, t, rig, session.ID)
+	for _, want := range []string{
+		"**Findings:**\n\n- [general/medium] `internal/retry/retry.go`: " + additionsPrimaryDescription + "\n",
+		additionsUnverifiedHeading,
+		additionsNotFoundReason,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("posted body missing %q, Body:\n%s", want, body)
+		}
+	}
+	findingsStart := strings.Index(body, "**Findings:**")
+	unverifiedStart := strings.Index(body, additionsUnverifiedHeading)
+	if addition := strings.Index(body, "Path: Fetch"); addition < unverifiedStart || findingsStart > unverifiedStart {
+		t.Errorf("the unverified addition is not listed under its own heading after the findings, Body:\n%s", body)
+	}
+
+	// The readout marks it, and carries the second run apart from the first.
+	_, token := rig.createAuthenticatedUser(ctx, t)
+	var readout restdtos.ReviewReadout
+	if status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/review", nil, &readout, token); status != http.StatusOK {
+		t.Fatalf("readout status = %d, want %d", status, http.StatusOK)
+	}
+	sources := map[string]string{}
+	checks := map[string]string{}
+	for _, f := range readout.Findings {
+		sources[f.Description] = strOrNil(f.Source)
+		checks[f.Description] = strOrNil(f.AdditionCheck)
+	}
+	if sources[additionsPrimaryDescription] != "primary" || checks[additionsPrimaryDescription] != "<nil>" {
+		t.Errorf("readout primary finding source/check = %s/%s, want primary/<nil>", sources[additionsPrimaryDescription], checks[additionsPrimaryDescription])
+	}
+	if sources[additionsAddedDescription] != "counter_review" || checks[additionsAddedDescription] != "not_found" {
+		t.Errorf("readout addition source/check = %s/%s, want counter_review/not_found", sources[additionsAddedDescription], checks[additionsAddedDescription])
+	}
+	if readout.LatestVerdict == nil {
+		t.Fatal("readout has no latest verdict")
+	}
+	if lv := readout.LatestVerdict; strOrNil(lv.FactCheck) != "done" || lv.FactCheckKilled != 2 || strOrNil(lv.AdditionsFactCheck) != "done" || lv.AdditionsFactCheckKilled == nil || *lv.AdditionsFactCheckKilled != 0 || strOrNil(lv.AdditionsCheck) != "not_found" {
+		t.Errorf("readout verdict runs = first %s/%d, second %s/%v resolved %s; want done/2, done/0 resolved not_found",
+			strOrNil(lv.FactCheck), lv.FactCheckKilled, strOrNil(lv.AdditionsFactCheck), lv.AdditionsFactCheckKilled, strOrNil(lv.AdditionsCheck))
+	}
+
+	// The finding-outcomes KPI counts the unverified addition apart.
+	var analytics restdtos.ReviewAnalytics
+	if status := rig.doJSON(t, http.MethodGet, "/api/repos/"+repo+"/review-analytics", nil, &analytics, token); status != http.StatusOK {
+		t.Fatalf("analytics status = %d, want %d", status, http.StatusOK)
+	}
+	if !analytics.FindingOutcomesComputed || analytics.FindingOutcomes == nil || analytics.FindingOutcomesBySource == nil {
+		t.Fatalf("analytics finding outcomes not computed: %+v", analytics)
+	}
+	total := 0
+	for _, o := range *analytics.FindingOutcomes {
+		total += o.Count
+	}
+	if total != 1 {
+		t.Errorf("findingOutcomes counts %d findings, want 1 (the primary; the unverified addition counted apart)", total)
+	}
+	bySource := map[string]int{}
+	for _, o := range *analytics.FindingOutcomesBySource {
+		bySource[o.Source] += o.Count
+	}
+	if bySource["primary"] != 1 || bySource["counter_review_unverified"] != 1 || bySource["counter_review"] != 0 {
+		t.Errorf("findingOutcomesBySource = %v, want primary 1, counter_review_unverified 1", bySource)
+	}
+}
+
+// TestPostReviewVerdict_CounterReviewAddition_UnverifiedWithNoSecondRun
+// covers the turn whose trace holds no fact-check after the counter-review
+// at all: the reviewer reported no second run (not_run), reported it
+// skipped -- out of the cost budget, say -- (not_run), or reported it done
+// with nothing in the trace to show for it (not_found). Each is published
+// unverified. One rig per case.
+func TestPostReviewVerdict_CounterReviewAddition_UnverifiedWithNoSecondRun(t *testing.T) {
+	tests := []struct {
+		name       string
+		reported   string
+		killed     int
+		wantCheck  string
+		wantReason string
+	}{
+		{"no second run reported", "", 0, "not_run", additionsNotRunReason},
+		{"second run reported skipped (cost budget)", "skipped", 0, "not_run", additionsNotRunReason},
+		{"second run reported done, never in the trace", "done", 1, "not_found", additionsNotFoundReason},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newTestRig(t)
+			ctx := context.Background()
+			repo := fmt.Sprintf("acme/additions-no-second-run-%d", i)
+			session := setupReviewSessionWithSandbox(ctx, t, rig, repo, int32(310+i))
+			seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-additions-no-second-run", 1)
+			seedFactCheck(ctx, t, rig, session.ID, "fc-first")
+			seedCounterReview(ctx, t, rig, session.ID, "cr")
+
+			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepVerdictWithAdditionsJSON(t, tc.reported, tc.killed))
+			if status != http.StatusCreated {
+				t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+			}
+			if _, check := findingSourceColumns(ctx, t, rig, repo, additionsAddedDescription); strOrNil(check) != tc.wantCheck {
+				t.Errorf("addition_check = %s, want %s", strOrNil(check), tc.wantCheck)
+			}
+			runs := readVerdictFactCheckRuns(ctx, t, rig, repo)
+			if strOrNil(runs.additionsCheck) != tc.wantCheck {
+				t.Errorf("review_verdicts.additions_check = %s, want %s", strOrNil(runs.additionsCheck), tc.wantCheck)
+			}
+			wantReported, wantKilled := tc.reported, fmt.Sprint(tc.killed)
+			if tc.reported == "" {
+				wantReported, wantKilled = "<nil>", "<nil>"
+			}
+			if strOrNil(runs.additionsFactCheck) != wantReported || int32OrNil(runs.additionsFactCheckKilled) != wantKilled {
+				t.Errorf("second run recorded %s/%s, want %s/%s", strOrNil(runs.additionsFactCheck), int32OrNil(runs.additionsFactCheckKilled), wantReported, wantKilled)
+			}
+			body := verdictOutboxBody(ctx, t, rig, session.ID)
+			if !strings.Contains(body, additionsUnverifiedHeading) || !strings.Contains(body, tc.wantReason) {
+				t.Errorf("posted body does not list the addition as unverified with %q, Body:\n%s", tc.wantReason, body)
+			}
+		})
+	}
+}
+
+// TestPostReviewVerdict_CounterReviewAddition_CouldNotBeConfirmedWhenTraceUnreadable
+// applies §26.1's lesson on the uncorroborated counter-review to the
+// additions: when the trace was not read in full, the server says the
+// check "could not be confirmed", never that the trace shows none --
+// even though a qualifying second run is
+// among the rows it did read. Two ways a trace goes unread: a row that
+// does not decode, and a turn with no dispatched_event_id to scope a read
+// to. One rig per case.
+func TestPostReviewVerdict_CounterReviewAddition_CouldNotBeConfirmedWhenTraceUnreadable(t *testing.T) {
+	tests := []struct {
+		name   string
+		spoil  func(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID, turn sqlcgen.Turn)
+		wantCR restdtos.PostReviewVerdictResponseShippable
+	}{
+		{
+			name: "a sub_task_start row whose payload does not decode",
+			spoil: func(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID, _ sqlcgen.Turn) {
+				payload := []byte(`{"type":"sub_task_start","gen":1,"subTaskId":7,"subAgentType":"counter-reviewer"}`)
+				if _, err := rig.events.Create(ctx, sqlcgen.CreateEventParams{SessionID: sessionID, Type: "sub_task_start", MessageID: "msg-start-malformed", Payload: payload}); err != nil {
+					t.Fatalf("persist malformed sub_task_start: %v", err)
+				}
+			},
+			// The counter-review itself is still corroborated by the rows
+			// that did decode: a positive claim survives a skipped row.
+			wantCR: restdtos.PostReviewVerdictResponseShippableAuto,
+		},
+		{
+			name: "a turn with no dispatched_event_id",
+			spoil: func(ctx context.Context, t *testing.T, rig testRig, _ pgtype.UUID, turn sqlcgen.Turn) {
+				if _, err := rig.pool.Exec(ctx, `UPDATE turns SET dispatched_event_id = NULL WHERE id = $1`, turn.ID); err != nil {
+					t.Fatalf("clear dispatched_event_id: %v", err)
+				}
+			},
+			wantCR: restdtos.PostReviewVerdictResponseShippableNeedsHuman,
+		},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newTestRig(t)
+			ctx := context.Background()
+			repo := fmt.Sprintf("acme/additions-unreadable-%d", i)
+			session := setupReviewSessionWithSandbox(ctx, t, rig, repo, int32(320+i))
+			turn := seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-additions-unreadable", 1)
+			seedFactCheck(ctx, t, rig, session.ID, "fc-first")
+			seedCounterReview(ctx, t, rig, session.ID, "cr")
+			seedFactCheck(ctx, t, rig, session.ID, "fc-second")
+			tc.spoil(ctx, t, rig, session.ID, turn)
+
+			status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepVerdictWithAdditionsJSON(t, "done", 0))
+			if status != http.StatusCreated {
+				t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+			}
+			if resp.Shippable != tc.wantCR {
+				t.Errorf("Shippable = %q, want %q", resp.Shippable, tc.wantCR)
+			}
+			if _, check := findingSourceColumns(ctx, t, rig, repo, additionsAddedDescription); strOrNil(check) != "unconfirmed" {
+				t.Errorf("addition_check = %s, want unconfirmed", strOrNil(check))
+			}
+			if runs := readVerdictFactCheckRuns(ctx, t, rig, repo); strOrNil(runs.additionsCheck) != "unconfirmed" {
+				t.Errorf("review_verdicts.additions_check = %s, want unconfirmed", strOrNil(runs.additionsCheck))
+			}
+			body := verdictOutboxBody(ctx, t, rig, session.ID)
+			if !strings.Contains(body, additionsUnverifiedHeading) || !strings.Contains(body, additionsUnconfirmedFragment) {
+				t.Errorf("posted body does not say the check could not be confirmed, Body:\n%s", body)
+			}
+			for _, claim := range []string{"shows no", "was found in this turn's trace"} {
+				if strings.Contains(body, claim) {
+					t.Errorf("posted body claims %q about a trace the server did not read in full, Body:\n%s", claim, body)
+				}
+			}
+		})
+	}
+}
+
+// TestPostReviewVerdict_EveryPublishedFindingRecordsItsSource: a finding
+// with no source is refused before anything is written, a counter-review
+// source is refused off the deep path, and a light-path primary finding
+// is stored with its source. One rig per case.
+func TestPostReviewVerdict_EveryPublishedFindingRecordsItsSource(t *testing.T) {
+	lightBody := func(source string) string {
+		finding := `{"severity":"low","filePath":"a.go","description":"Stale comment."`
+		if source != "" {
+			finding += `,"source":"` + source + `"`
+		}
+		finding += `}`
+		return `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"adequate","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[` + finding +
+			`],"digest":{"summary":"Fixes a comment.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
+	}
+	tests := []struct {
+		name       string
+		body       string
+		wantStatus int
+		wantSource string
+	}{
+		{"no source: refused", lightBody(""), http.StatusBadRequest, ""},
+		{"counter_review off the deep path: refused", lightBody("counter_review"), http.StatusBadRequest, ""},
+		{"primary: recorded", lightBody("primary"), http.StatusCreated, "primary"},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newTestRig(t)
+			ctx := context.Background()
+			repo := fmt.Sprintf("acme/additions-source-%d", i)
+			session := setupReviewSessionWithSandbox(ctx, t, rig, repo, int32(330+i))
+			headSHA := "sha-additions-source"
+			created, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHA})
+			if err != nil {
+				t.Fatalf("seed processing turn: %v", err)
+			}
+			messageID := testDispatchMessageID
+			if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: created.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &messageID}); err != nil {
+				t.Fatalf("stamp dispatched_message_id: %v", err)
+			}
+
+			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, tc.body)
+			if status != tc.wantStatus {
+				t.Fatalf("status = %d, want %d", status, tc.wantStatus)
+			}
+			var findings, verdicts, outboxRows int
+			if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM review_findings WHERE repo_full_name = $1`, repo).Scan(&findings); err != nil {
+				t.Fatalf("count review_findings: %v", err)
+			}
+			if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM review_verdicts WHERE repo_full_name = $1`, repo).Scan(&verdicts); err != nil {
+				t.Fatalf("count review_verdicts: %v", err)
+			}
+			if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE session_id = $1 AND kind = $2`, session.ID, string(ports.NotificationKindGitHubVerdict)).Scan(&outboxRows); err != nil {
+				t.Fatalf("count verdict outbox rows: %v", err)
+			}
+			if tc.wantStatus != http.StatusCreated {
+				if findings != 0 || verdicts != 0 || outboxRows != 0 {
+					t.Errorf("refused payload wrote %d findings, %d verdicts, %d verdict outbox rows; want none", findings, verdicts, outboxRows)
+				}
+				return
+			}
+			if findings != 1 {
+				t.Fatalf("review_findings rows = %d, want 1", findings)
+			}
+			if source, check := findingSourceColumns(ctx, t, rig, repo, "Stale comment."); strOrNil(source) != tc.wantSource || check != nil {
+				t.Errorf("reported_source = %s, addition_check = %s; want %s, <nil>", strOrNil(source), strOrNil(check), tc.wantSource)
+			}
+			if runs := readVerdictFactCheckRuns(ctx, t, rig, repo); runs.additionsFactCheck != nil || runs.additionsFactCheckKilled != nil || runs.additionsCheck != nil {
+				t.Errorf("a light-path verdict recorded a second fact-check run: %s/%s resolved %s", strOrNil(runs.additionsFactCheck), int32OrNil(runs.additionsFactCheckKilled), strOrNil(runs.additionsCheck))
+			}
+		})
+	}
+}

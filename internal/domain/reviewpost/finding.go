@@ -192,6 +192,14 @@ type FindingInput struct {
 	// endpoint (§12.2 item 2) can attempt to apply -- nil means this
 	// finding has no machine-suggested fix at all.
 	SuggestedFix *string
+	// Source is the pass that produced this finding, as the reviewer's
+	// payload says (§26.6's amendment, findingsource.go) -- required on
+	// every finding a verdict posts (ValidateVerdictInput, not
+	// ValidateFindingInput: a finding another producer builds, such as
+	// the handoff sentinel's, comes from neither pass and carries none).
+	// Never part of identity: the same issue re-reported by the other
+	// pass is the same finding.
+	Source FindingSource
 }
 
 // Finding is FindingInput plus the ONE thing FindingInput can never carry:
@@ -208,6 +216,18 @@ type Finding struct {
 	Line         *int
 	Description  string
 	SuggestedFix *string
+
+	// Source is FindingInput.Source, carried verbatim -- self-reported;
+	// "" for a finding no reviewer pass produced, or a stored one first
+	// published before sources were recorded (migrations/000154).
+	Source FindingSource
+	// AdditionCheck is the server's resolution for a counter-review
+	// addition (findingsource.go): set by BuildFindings, from the one
+	// verdict-level BuildSecondFactCheck, on every finding whose Source
+	// is FindingSourceCounterReview, and "" on every other. A
+	// counter-review finding whose AdditionCheck is not Checked() is
+	// published marked unverified and counted apart.
+	AdditionCheck AdditionCheck
 
 	// StartLine/EndLine are §22.1.1's own content-anchored position --
 	// computed server-side by MatchPosition (position.go), or by the
@@ -301,7 +321,16 @@ func BuildFinding(in FindingInput) Finding {
 		Line:         in.Line,
 		Description:  in.Description,
 		SuggestedFix: in.SuggestedFix,
+		Source:       in.Source,
 	}
+}
+
+// UnverifiedAddition reports whether f is a counter-review addition the
+// server could not count as checked -- the findings published marked
+// unverified and counted apart (§26.6's amendment). A finding with any
+// other source, including none recorded, is never one.
+func (f Finding) UnverifiedAddition() bool {
+	return f.Source == FindingSourceCounterReview && !f.AdditionCheck.Checked()
 }
 
 // findingIdentitySeparator joins ComputeFindingIdentity's three

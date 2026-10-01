@@ -629,6 +629,16 @@ const (
 // guidance this function prepends before these JSON-body instructions --
 // an agent must know HOW to arrive at "factCheck"/"counterReview" values
 // before it is told the shape to report them in.
+//
+// # (§26.6's amendment): finding sources and the second fact-check run
+//
+// Every finding object carries "source" -- on light, always "primary"
+// (the text names no other value, §26.9); on deep, "primary" or
+// "counter_review". The deep path adds "additionsFactCheck"/
+// "additionsFactCheckKilled", the second run over what the counter-review
+// added, optional and omitted when it added nothing. reviewpost.
+// ValidateVerdictInput requires the source on every finding and refuses
+// a counter_review source, or a second-run report, off the deep path.
 func verdictToolInstructions(deep bool, costBudgetUSD float64, costBudgetSafetyMarginPercent int) string {
 	digestRequiredFieldsClause := "\"archDecisions\"/\"stackRisks\"/\"unverifiedLimits\"/\"proposedBody\"/\"contestedPoints\" are requested but optional"
 	archDecisionsRequirement := "REQUESTED, not required"
@@ -651,6 +661,14 @@ func verdictToolInstructions(deep bool, costBudgetUSD float64, costBudgetSafetyM
 	// no "key": <spec> to write -- prose explaining its absence is still
 	// the correct shape there.
 	counterReviewLine := "\"counterReview\" is OMITTED entirely on this light-path review -- that adversarial pass never runs on this path (§26.9), so do not include this field at all"
+	// optionalFieldsClause/findingSourceLine/additionsFactCheckLines
+	// (§26.6's amendment): every finding names its source, and the deep
+	// path reports the second fact-check run over what the counter-review
+	// added. On light the source is always "primary" and nothing names the
+	// counter-review or the second run (§26.9).
+	optionalFieldsClause := "\"findings\" and \"counterReview\", which are optional -- see \"counterReview\"'s own entry below for exactly when to include it"
+	findingSourceLine := "      \"source\": \"primary\" (required -- every finding on this review is your own)\n"
+	additionsFactCheckLines := ""
 	if deep {
 		digestRequiredFieldsClause = "\"archDecisions\"/\"stackRisks\"/\"unverifiedLimits\" are ALSO REQUIRED on this deep-path review (§26.3) -- only \"proposedBody\"/\"contestedPoints\" remain requested but optional"
 		archDecisionsRequirement = "REQUIRED on this deep-path review -- at least one entry, with a real (non-blank) decision/rejectedAlternative/conventionConformance, not an empty array or an all-blank placeholder"
@@ -659,6 +677,10 @@ func verdictToolInstructions(deep bool, costBudgetUSD float64, costBudgetSafetyM
 		archDecisionsGuidance = " This should be informed by (though you may edit/supplement) the " + ArchitectureScribeAgentName + " sub-task's own recap, see the orchestration guidance above."
 		contestedPointsGuidance = "Omit entirely if the " + CounterReviewerAgentName + " sub-task raised nothing"
 		counterReviewLine = "\"counterReview\": \"done\" | \"skipped\" (REQUIRED on this deep-path review (§26.4) -- \"done\" means you actually spawned and adjudicated the " + CounterReviewerAgentName + " sub-task; \"skipped\" means a genuine sub-task error/timeout, or the cost budget already having been reached before it would have been dispatched -- \"skipped\" raises this verdict's own shippable classification to needs_human no matter how low-risk everything else looks, so do not report \"done\" unless the sub-task genuinely ran)"
+		optionalFieldsClause = "\"findings\", \"counterReview\", \"additionsFactCheck\" and \"additionsFactCheckKilled\", which are optional -- see each one's own entry below for exactly when to include it"
+		findingSourceLine = "      \"source\": \"primary\" | \"counter_review\" (required -- \"primary\" for a finding you produced and put through the first fact-check, \"counter_review\" for an addition the " + CounterReviewerAgentName + " surfaced on its own; never relabel an addition \"primary\" -- an addition is published as checked only when the second fact-check run is found in this turn's trace, and as unverified otherwise)\n"
+		additionsFactCheckLines = "  \"additionsFactCheck\": \"done\" | \"skipped\" (the second fact-check run over the counter-review's additions, step 4 of the orchestration guidance above -- omit it when the counter-review added nothing),\n" +
+			"  \"additionsFactCheckKilled\": <integer, count of additions the second fact-check run removed as provably wrong from the diff alone -- MUST be 0 when \"additionsFactCheck\" is \"skipped\", omitted with it>,\n"
 	}
 
 	return subAgentOrchestrationInstructions(deep, costBudgetUSD, costBudgetSafetyMarginPercent) +
@@ -669,7 +691,7 @@ func verdictToolInstructions(deep bool, costBudgetUSD float64, costBudgetSafetyM
 		"X-Sandbox-Gen: " + VerdictToolGenPlaceholder + "\n" +
 		"X-Sandbox-Dispatch-Message-Id: " + VerdictToolDispatchMessageIDPlaceholder + "\n" +
 		"Content-Type: application/json\n\n" +
-		"JSON body (every field below the top level is required except \"findings\" and \"counterReview\", which are optional -- see \"counterReview\"'s own entry below for exactly when to include it; within \"digest\", \"summary\"/\"descriptionAdequacy\"/\"adequacyExplanation\" are required -- " + digestRequiredFieldsClause + "):\n" +
+		"JSON body (every field below the top level is required except " + optionalFieldsClause + "; within \"digest\", \"summary\"/\"descriptionAdequacy\"/\"adequacyExplanation\" are required -- " + digestRequiredFieldsClause + "):\n" +
 		"{\n" +
 		"  \"riskLevel\": \"low\" | \"medium\" | \"high\",\n" +
 		"  \"premise\": \"ok\" | \"questionable\" | \"not_a_pr\",\n" +
@@ -686,7 +708,8 @@ func verdictToolInstructions(deep bool, costBudgetUSD float64, costBudgetSafetyM
 		"      \"filePath\": \"<repo-relative path this finding is about>\" (required),\n" +
 		"      \"line\": <integer, optional -- the specific line, if any; never treat this as identifying the finding, only as a human-readable pointer>,\n" +
 		"      \"description\": \"<your own finding text>\" (required -- this is compared, normalized, against every future review pass on this same PR, so describe the SAME underlying issue with the SAME wording every time you re-report it, rather than paraphrasing),\n" +
-		"      \"suggestedFix\": \"<optional unified-diff/patch text a maintainer's apply-suggestion action can attempt to apply>\"\n" +
+		"      \"suggestedFix\": \"<optional unified-diff/patch text a maintainer's apply-suggestion action can attempt to apply>\",\n" +
+		findingSourceLine +
 		"    }\n" +
 		"  ],\n" +
 		"  \"digest\": {\n" +
@@ -707,6 +730,7 @@ func verdictToolInstructions(deep bool, costBudgetUSD float64, costBudgetSafetyM
 		"  },\n" +
 		"  \"factCheck\": \"done\" | \"skipped\" (REQUIRED, on EVERY review, light or deep -- see the orchestration guidance above for when this is \"skipped\": a genuine sub-task error/timeout, or the cost budget already having been reached),\n" +
 		"  \"factCheckKilled\": <integer, REQUIRED, count of findings the fact-check sub-task actually removed as provably wrong from the diff alone -- MUST be 0 when \"factCheck\" is \"skipped\">,\n" +
+		additionsFactCheckLines +
 		"  " + counterReviewLine + "\n" +
 		"}\n\n" +
 		"A 201 response confirms the verdict was recorded and posted; the server -- never you -- computes the authoritative shippable classification, the formal GitHub review event, the synced review:*-risk label, and (when \"findings\" names a sentinelKind and this repo's own sentinel-auto-fix toggle is on) whether an automated fix session is triggered, from these fields."
@@ -740,6 +764,24 @@ func verdictToolInstructions(deep bool, costBudgetUSD float64, costBudgetSafetyM
 // primary's own finding hunt" design: it never consumes or feeds the
 // findings list this funnel prunes) -- dispatched whenever convenient,
 // before/after/interleaved with the funnel above.
+//
+// # What the counter-reviewer adds is fact-checked too (§26.6's amendment)
+//
+// The counter-reviewer may surface findings of its own, and this text used
+// to exempt them from the fact-check on the ground that a tool-equipped
+// pass is at least as rigorous. Nothing measured that, and it exempted the
+// one pass that adds findings from the one check that removes them. So the
+// counter-review step asks each addition to state the evidence triplet --
+// the defect, quoting the diff lines it rests on; the path that reaches
+// it; the consequence -- which is also what gives the diff-only pass
+// something it can disprove, and a fourth step runs a second fact-check
+// over the additions alone, after the counter-review. The prompt is not
+// what enforces it: the server counts an addition as checked only when the
+// turn's own sub-task trace shows a fact-check that started after the
+// counter-review and completed (reviewverdict.AdditionsFactCheckInTrace),
+// and publishes every other addition marked unverified. The second run is
+// a fact-check spawn, so the cost-budget check below already governs it,
+// with no change to that paragraph's text.
 //
 // # The cost budget (§26.7): a real, checkable fact, not
 // self-estimation -- but still not a server-ENFORCED gate
@@ -800,7 +842,8 @@ func subAgentOrchestrationInstructions(deep bool, costBudgetUSD float64, costBud
 		"1. Diff-only fact-check (subagent_type \"" + FactCheckAgentName + "\", ALWAYS -- light and deep path alike): after you have your own first-draft findings, spawn this sub-task with your findings list and the diff. It has NO tool access -- it reasons over text you give it alone. Its ONLY job is to try to DISPROVE each finding using the diff text alone: it may kill a finding ONLY when it is PROVABLY wrong from the diff alone (a fact, not a judgment call), and must leave anything merely uncertain untouched -- it is not asked to (and must not attempt to) confirm findings, only to disprove the provably-wrong ones. Remove from your own findings list exactly the ones it disproved; report \"factCheck\": \"done\" and \"factCheckKilled\" as the count removed (0 is a completely normal, common outcome -- most findings are not provably wrong from the diff alone). If this sub-task errors, times out, or returns something you cannot parse, do NOT block on it -- publish your findings exactly as if you had never run it, and report \"factCheck\": \"skipped\", \"factCheckKilled\": 0.\n"
 	if deep {
 		out += "2. Architecture recap (subagent_type \"" + ArchitectureScribeAgentName + "\", deep path only): spawn this sub-task with the diff and a pointer to this repo's own CLAUDE.md/AGENTS.md, but NOT your own findings or digest -- it must work from a virgin context, uncontaminated by your own finding hunt, so its recap is an independent second read of the architecture, not an echo of your own. It is read-only (no edit access). Fold its recap into your own \"digest.archDecisions\" above -- you may edit or supplement it, but do not discard it silently.\n" +
-			"3. Counter-review (subagent_type \"" + CounterReviewerAgentName + "\", deep path only, AFTER fact-check has already pruned your findings): spawn this sub-task with your own SURVIVING findings (post-fact-check) and your digest, and ask it to try to REFUTE each one and to surface anything you missed. It has read/tool access to the repo (it may need to verify a claim against real files) but must not edit anything. It may itself surface genuinely NEW findings -- these are NOT re-run through fact-check (a tool-equipped, full-context adversarial pass is by construction at least as rigorous as a diff-only check). Publish only the findings that SURVIVE this adjudication -- drop anything it convincingly refutes. Where it disagreed with you and you did not simply defer to it, name that disagreement in \"digest.contestedPoints\" -- agent disagreement is precisely the signal a human should weigh in on. Report \"counterReview\": \"done\". If this sub-task errors, times out, or returns something you cannot parse, publish your findings exactly as they stood after fact-check, and report \"counterReview\": \"skipped\" -- this alone raises your verdict's own shippable classification to needs_human, so do not treat a skip as routine.\n"
+			"3. Counter-review (subagent_type \"" + CounterReviewerAgentName + "\", deep path only, AFTER fact-check has already pruned your findings): spawn this sub-task with your own SURVIVING findings (post-fact-check) and your digest, and ask it to try to REFUTE each one and to surface anything you missed. It has read/tool access to the repo (it may need to verify a claim against real files) but must not edit anything. It may itself surface genuinely NEW findings -- additions. Ask it to state, for each addition, three things: the defect, quoting the exact lines of the diff it rests on; the path that reaches it, from an entry point to those lines; and the consequence, what goes wrong when that path is taken. Drop any addition that does not state all three, and keep each surviving addition's three parts in its \"description\". Publish only the findings that SURVIVE this adjudication -- drop anything it convincingly refutes. Where it disagreed with you and you did not simply defer to it, name that disagreement in \"digest.contestedPoints\" -- agent disagreement is precisely the signal a human should weigh in on. Report \"counterReview\": \"done\". If this sub-task errors, times out, or returns something you cannot parse, publish your findings exactly as they stood after fact-check, and report \"counterReview\": \"skipped\" -- this alone raises your verdict's own shippable classification to needs_human, so do not treat a skip as routine.\n" +
+			"4. Second fact-check, over the additions (subagent_type \"" + FactCheckAgentName + "\" again, deep path only, AFTER the counter-review has finished, and only when it added findings): the first fact-check ran before the counter-review, so it never saw the additions. Spawn a NEW fact-check sub-task with ONLY the additions, each with its three parts, and the diff -- the same diff-only rules as step 1: it may kill an addition ONLY when the diff text alone PROVES it wrong, and must let through anything merely uncertain, including an addition that rests on repository context outside the diff. Remove exactly the additions it disproved, and report \"additionsFactCheck\": \"done\" and \"additionsFactCheckKilled\" as the count removed. This is a fact-check spawn like step 1, so the cost-budget check below applies to it too. If it errors, times out, returns something you cannot parse, or the budget says skip, publish the additions as they stood and report \"additionsFactCheck\": \"skipped\", \"additionsFactCheckKilled\": 0. If the counter-review added nothing, do not spawn it and omit both fields. The server holds the rule, not you: it counts an addition as checked only when this turn's own sub-task trace shows a fact-check that started after the counter-review and completed, and publishes every other addition marked unverified, counted apart from your findings -- so reporting \"done\" for a run you did not spawn changes nothing but the record of what you claimed.\n"
 	}
 	if costBudgetUSD > 0 {
 		// B5 fix (kept by §26.5): costBudgetSafetyMarginPercent

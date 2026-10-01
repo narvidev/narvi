@@ -14,13 +14,25 @@
 -- which is exactly what makes a finding re-reported on a LATER commit
 -- still read as "already rebutted"/"already fix_open" rather than
 -- silently reverting to looking brand new.
+--
+-- reported_source/addition_check (§26.6's amendment, migrations/
+-- 000154_review_findings_source.up.sql) describe the finding's LATEST
+-- publication, so a re-report overwrites them just as it moves
+-- last_seen_at: a counter-review addition published unverified and later
+-- re-published checked, or re-reported by the primary reviewer, reads as
+-- that later publication says. A row first published before 000154 gets
+-- both on its next publication.
 INSERT INTO review_findings (
     repo_full_name, pr_number, identity_hash, sentinel_kind, severity,
-    file_path, line, description, suggested_fix
+    file_path, line, description, suggested_fix,
+    reported_source, addition_check
 )
-VALUES ($1, $2, $3, sqlc.narg('sentinel_kind'), $4, $5, sqlc.narg('line'), $6, sqlc.narg('suggested_fix'))
+VALUES ($1, $2, $3, sqlc.narg('sentinel_kind'), $4, $5, sqlc.narg('line'), $6, sqlc.narg('suggested_fix'),
+    sqlc.narg('reported_source'), sqlc.narg('addition_check'))
 ON CONFLICT (repo_full_name, pr_number, identity_hash)
-DO UPDATE SET last_seen_at = now()
+DO UPDATE SET last_seen_at = now(),
+    reported_source = EXCLUDED.reported_source,
+    addition_check = EXCLUDED.addition_check
 RETURNING *;
 
 -- name: GetReviewFinding :one
@@ -139,11 +151,14 @@ RETURNING *;
 -- §21's own "Review finding outcomes" analytics KPI (§21.1/§12.2
 -- item 6) -- every finding FIRST seen for repoFullName after sinceTime,
 -- bounded by limit (§21.1's own "bounded from day one" discipline). Only
--- the status column is selected: internal/domain/reviewverdict.
--- FindingOutcomes reduces a plain []reviewpost.FindingStatus, never a
--- full row, mirroring internal/app/decisioninbox.Metrics' own identical
--- "select only the columns the pure reduction actually needs" precedent.
-SELECT status FROM review_findings
+-- the columns the pure reduction reads are selected: the status, and
+-- (§26.5/§26.6's amendment, migrations/000154) the reported source and
+-- the addition check, so an unverified counter-review addition is counted
+-- apart and precision can be read per source
+-- (internal/domain/reviewverdict.FindingOutcomesBySource), mirroring
+-- internal/app/decisioninbox.Metrics' own identical "select only the
+-- columns the pure reduction actually needs" precedent.
+SELECT status, reported_source, addition_check FROM review_findings
 WHERE repo_full_name = $1 AND first_seen_at > $2
 ORDER BY first_seen_at ASC
 LIMIT $3;

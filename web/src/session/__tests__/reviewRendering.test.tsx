@@ -73,6 +73,8 @@ function baseFinding(overrides: Partial<ReviewReadoutFinding> = {}): ReviewReado
     rebuttalText: null,
     startLine: 10,
     endLine: 10,
+    source: null,
+    additionCheck: null,
     ...overrides,
   }
 }
@@ -646,5 +648,76 @@ describe('SentinelsPanel -- visual-QA sentinel status (§12.2 item 2)', () => {
     const html = withQueryClient(<SentinelsPanel verdict={null} visualQa={XSS_SCRIPT} />)
     expect(html).not.toContain('<script>')
     expect(html).toContain('&lt;script&gt;')
+  })
+})
+
+// §26.6's amendment: a finding the counter-reviewer adds is fact-checked,
+// or published marked unverified and counted apart. The readout carries
+// the server's resolution (source/additionCheck); these prove the view
+// marks it and never counts an unverified addition with the findings.
+describe('CodeReviewView -- counter-review additions (§26.6)', () => {
+  it('an unverified addition is marked, with the server reason', () => {
+    const html = withQueryClient(<FindingCard finding={baseFinding({ source: 'counter_review', additionCheck: 'not_found' })} canAct={false} sessionId="s1" />)
+    expect(html).toContain('unverified addition')
+    expect(html).toContain('Added by the counter-review and not fact-checked')
+    expect(html).toContain('none that started after the counter-review and completed was found')
+  })
+
+  it('an addition whose check could not be confirmed says so, never what the trace shows', () => {
+    const html = withQueryClient(<FindingCard finding={baseFinding({ source: 'counter_review', additionCheck: 'unconfirmed' })} canAct={false} sessionId="s1" />)
+    expect(html).toContain('could not be confirmed')
+    expect(html).not.toContain('was found in')
+  })
+
+  it('an addition with no resolution, or one this client does not know, is unverified -- never upgraded to checked', () => {
+    for (const additionCheck of [null, 'CHECKED', 'later-value']) {
+      const html = withQueryClient(<FindingCard finding={baseFinding({ source: 'counter_review', additionCheck })} canAct={false} sessionId="s1" />)
+      expect(html).toContain('unverified addition')
+    }
+  })
+
+  it('a checked addition is labeled as the counter-review\'s and not marked unverified', () => {
+    const html = withQueryClient(<FindingCard finding={baseFinding({ source: 'counter_review', additionCheck: 'checked' })} canAct={false} sessionId="s1" />)
+    expect(html).toContain('counter-review addition, checked')
+    expect(html).not.toContain('unverified')
+  })
+
+  it('a primary finding, or one with no source recorded, carries no addition marker', () => {
+    for (const source of ['primary', null]) {
+      const html = withQueryClient(<FindingCard finding={baseFinding({ source })} canAct={false} sessionId="s1" />)
+      expect(html).not.toContain('addition')
+      expect(html).not.toContain('unverified')
+    }
+  })
+
+  it('the appendix counts unverified additions apart from the total and the open count', () => {
+    const findings = [
+      baseFinding({ identityHash: 'p1', source: 'primary' }),
+      baseFinding({ identityHash: 'p2', source: null, status: 'rebutted' }),
+      baseFinding({ identityHash: 'c1', source: 'counter_review', additionCheck: 'checked' }),
+      baseFinding({ identityHash: 'u1', source: 'counter_review', additionCheck: 'not_run' }),
+      baseFinding({ identityHash: 'u2', source: 'counter_review', additionCheck: 'unconfirmed' }),
+    ]
+    const html = withQueryClient(<FindingsAppendix findings={findings} canAct={false} sessionId="s1" />)
+    expect(html).toContain('Findings (3 total, 2 open) · 2 unverified, counted apart')
+  })
+
+  it('the appendix shows no unverified count when there is none', () => {
+    const html = withQueryClient(<FindingsAppendix findings={[baseFinding({ source: 'primary' })]} canAct={false} sessionId="s1" />)
+    expect(html).toContain('Findings (1 total, 1 open)')
+    expect(html).not.toContain('unverified')
+  })
+
+  it('the Sentinels panel reports the second fact-check run apart from the first', () => {
+    const html = renderToStaticMarkup(
+      <SentinelsPanel verdict={baseVerdict({ factCheck: 'done', factCheckKilled: 2, additionsFactCheck: 'done', additionsFactCheckKilled: 1, additionsCheck: 'not_found' })} visualQa={null} />,
+    )
+    expect(html).toContain('fact check (additions)')
+    expect(html).toContain('done (1 killed) · additions unverified')
+  })
+
+  it('the Sentinels panel shows a dash when there was no second run to resolve', () => {
+    const html = renderToStaticMarkup(<SentinelsPanel verdict={baseVerdict()} visualQa={null} />)
+    expect(html).toContain('<dt>fact check (additions)</dt><dd>—</dd>')
   })
 })

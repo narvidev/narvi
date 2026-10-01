@@ -22,9 +22,9 @@
 import { describe, expect, it } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 
-import type { PlatformAnalytics } from '@narvi/contracts/rest-dtos'
+import type { PlatformAnalytics, ReviewAnalytics } from '@narvi/contracts/rest-dtos'
 
-import { PlatformAnalyticsBody } from '../AnalyticsView'
+import { FindingOutcomesChart, PlatformAnalyticsBody } from '../AnalyticsView'
 
 // healthyAnalytics is a fully-computed baseline -- every rollup succeeded,
 // every field carries a real, non-sentinel value. Each test below starts
@@ -180,5 +180,67 @@ describe('PlatformAnalyticsBody -- the boot-p95 query fails', () => {
   it('Sessions and Cost -- unaffected rollups -- still render their real values', () => {
     expect(html).toContain('<span class="big">42</span>')
     expect(html).toContain('$16.00')
+  })
+})
+
+// §26.5/§26.6's amendment: the finding-outcomes KPI never mixes the
+// counter-review additions the server could not count as checked into its
+// distribution; they are counted apart, and the per-source breakdown
+// gives each source's findings and rebuttals.
+function reviewAnalytics(overrides: Partial<ReviewAnalytics> = {}): ReviewAnalytics {
+  return {
+    repoFullName: 'acme/widgets',
+    timeseriesComputed: false,
+    timeseries: null,
+    topRiskDriversComputed: false,
+    topRiskDrivers: null,
+    findingOutcomesComputed: true,
+    findingOutcomes: [
+      { status: 'open', count: 3 },
+      { status: 'rebutted', count: 1 },
+    ],
+    findingOutcomesBySource: [
+      { source: 'primary', status: 'open', count: 3 },
+      { source: 'primary', status: 'rebutted', count: 1 },
+      { source: 'counter_review_unverified', status: 'rebutted', count: 1 },
+      { source: 'counter_review_unverified', status: 'open', count: 1 },
+    ],
+    digestContestationRateComputed: false,
+    digestContestationRatePercent: null,
+    ...overrides,
+  }
+}
+
+describe('FindingOutcomesChart -- unverified counter-review additions counted apart (§26.6)', () => {
+  it('counts the unverified additions on their own line and lists each source with its rebuttals', () => {
+    const html = renderToStaticMarkup(<FindingOutcomesChart data={reviewAnalytics()} />)
+    expect(html).toContain('open 3')
+    expect(html).toContain('rebutted 1')
+    expect(html).toContain('2 unverified counter-review additions, counted apart')
+    expect(html).toContain('<dt>primary reviewer</dt><dd>4 findings, 1 rebutted</dd>')
+    expect(html).toContain('<dt>counter-review, unverified</dt><dd>2 findings, 1 rebutted</dd>')
+  })
+
+  it('renders no unverified line when there is none', () => {
+    const html = renderToStaticMarkup(
+      <FindingOutcomesChart data={reviewAnalytics({ findingOutcomesBySource: [{ source: 'primary', status: 'open', count: 3 }] })} />,
+    )
+    expect(html).not.toContain('unverified')
+  })
+
+  it('a window holding only unverified additions renders their count, and no distribution bar', () => {
+    const html = renderToStaticMarkup(
+      <FindingOutcomesChart data={reviewAnalytics({ findingOutcomes: [], findingOutcomesBySource: [{ source: 'counter_review_unverified', status: 'open', count: 1 }] })} />,
+    )
+    expect(html).toContain('1 unverified counter-review addition, counted apart')
+    expect(html).not.toContain('outcomebar')
+  })
+
+  it('renders "not available" when nothing was computed', () => {
+    const html = renderToStaticMarkup(
+      <FindingOutcomesChart data={reviewAnalytics({ findingOutcomesComputed: false, findingOutcomes: null, findingOutcomesBySource: null })} />,
+    )
+    expect(html).toContain('Not available yet')
+    expect(html).not.toContain('unverified')
   })
 })

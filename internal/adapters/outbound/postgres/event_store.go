@@ -139,7 +139,7 @@ func (s *EventStore) ListRecentForSession(ctx context.Context, sessionID pgtype.
 //
 // Both callers already validate their own respective NULL case before
 // reaching here (dispatchedEventID is never derived from a NULL column on a
-// real call -- see corroborateCounterReview,
+// real call -- see readSubTaskTrace,
 // internal/adapters/inbound/httpapi/reviewverdict.go, for that NULL
 // handling and the fuller "why" this pair of conditions is required, not
 // merely an optimization).

@@ -244,7 +244,7 @@ LIMIT 1;
 -- toward "matches nothing", never toward "over-matches" -- the same
 -- fail-conservative direction this codebase's own closed-enum defaults
 -- already commit to elsewhere (review/doc.go's "fail-conservative policy
--- for every closed enum" section). The caller (corroborateCounterReview,
+-- for every closed enum" section). The caller (readSubTaskTrace,
 -- internal/adapters/inbound/httpapi/reviewverdict.go) applies the
 -- identical fail-conservative treatment when dispatched_event_id itself is
 -- NULL (should be unreachable -- a turn being verdicted is by definition

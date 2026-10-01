@@ -76,6 +76,14 @@ type Record struct {
 	// tracking existed", never "this path never runs fact-check".
 	FactCheck       reviewpost.FactCheckStatus
 	FactCheckKilled int
+	// SecondFactCheck (§26.6's amendment) is the second fact-check run,
+	// over what the counter-review added, recorded apart from
+	// FactCheck/FactCheckKilled (migrations/000154): the reviewer's report
+	// and the server's resolution. The zero value is what a row with
+	// nothing to record -- a light-path verdict, a deep one whose
+	// counter-review added nothing and reported no second run, or a row
+	// posted before the migration -- reads back as.
+	SecondFactCheck reviewpost.SecondFactCheck
 	// Context (§21.1's amendment) is the rest of what this verdict
 	// examined, beyond HeadSHA above -- base ref/sha, ordered ancestor
 	// chain, and the eligibility-policy version in effect at fetch time.

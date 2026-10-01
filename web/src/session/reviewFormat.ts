@@ -102,3 +102,51 @@ export function sentinelFixLabel(status: string): string {
       return status
   }
 }
+
+// §26.6's amendment: what the counter-reviewer adds is fact-checked, or
+// published marked unverified and counted apart. The server resolves it
+// (ReviewReadoutFinding.additionCheck); these helpers only read that
+// resolution, and never upgrade an unknown value to "checked".
+
+/** isUnverifiedAddition reports whether a readout finding is a counter-review addition the server could not count as checked. Only 'checked' counts -- null or any value this client does not know is unverified, the server's own fail-conservative rule. A finding with any other source, or none recorded (a finding last published before sources were recorded), is never one. */
+export function isUnverifiedAddition(finding: { source?: string | null; additionCheck?: string | null }): boolean {
+  return finding.source === 'counter_review' && finding.additionCheck !== 'checked'
+}
+
+/** additionCheckReason says why an addition is unverified, in the posted comment's own words (internal/domain/reviewpost's unverifiedAdditionReason). "Could not be confirmed" never claims what the trace holds. */
+export function additionCheckReason(check: string | null | undefined): string {
+  switch (check) {
+    case 'not_run':
+      return 'no fact-check run over it after the counter-review was reported'
+    case 'not_found':
+      return "a fact-check run over it was reported, but none that started after the counter-review and completed was found in this turn's trace when the verdict was posted"
+    case 'unconfirmed':
+      return "whether a fact-check ran over it could not be confirmed: this turn's trace could not be read in full when the verdict was posted"
+    default:
+      return 'no fact-check run over it was confirmed'
+  }
+}
+
+/** additionsCheckLabel renders ReviewReadoutVerdict.additionsCheck -- the server's resolution of the verdict's counter-review additions -- for the Sentinels panel; '—' when there was nothing to resolve. */
+export function additionsCheckLabel(check: string | null | undefined): string {
+  if (check === null || check === undefined || check === '') return '—'
+  if (check === 'checked') return 'additions checked'
+  if (check === 'unconfirmed') return 'additions unverified (could not be confirmed)'
+  return 'additions unverified'
+}
+
+/** findingSourceBucketLabel renders ReviewAnalyticsFindingSourceCount.source, the bucket the per-source finding breakdown counts under. */
+export function findingSourceBucketLabel(source: string): string {
+  switch (source) {
+    case 'primary':
+      return 'primary reviewer'
+    case 'counter_review':
+      return 'counter-review, checked'
+    case 'counter_review_unverified':
+      return 'counter-review, unverified'
+    case 'not_recorded':
+      return 'source not recorded'
+    default:
+      return source
+  }
+}
