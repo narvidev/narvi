@@ -32,6 +32,11 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   never stored or broadcast, with the control plane's other own event
   types (`image_decision`, `shadow_egress_suppressed`); the sandbox-ws
   contract defines none of them, and its own types are stored as before.
+  So is a sandbox frame without a type, or with a top-level `events`,
+  `nextCursor` or `sandbox` key, none of which a sandbox-ws event has:
+  broadcast raw, it would read like a `fetch_history` reply. A client takes
+  a frame for that reply only when it has no `type`, which the reply never
+  has (`additionalProperties: false`).
 - Unchanged: `SubscribeRequest`, `SubscribedPayload`, `FetchHistoryRequest`.
 
 ### rest/v1/dtos.schema.json
