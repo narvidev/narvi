@@ -20,7 +20,8 @@ import (
 // immediately closes the listener, exactly like
 // internal/sandboxagent/services's own test helper of the same name (a
 // separate package, so duplicated rather than shared -- these are test
-// files, not production code).
+// files, not production code). It is only for a service that does listen
+// on the port: one that must never be reported ready takes neverBoundPort.
 func freePort(t *testing.T) int {
 	t.Helper()
 
@@ -31,6 +32,16 @@ func freePort(t *testing.T) int {
 	defer func() { _ = l.Close() }()
 	return l.Addr().(*net.TCPAddr).Port
 }
+
+// neverBoundPort is the readiness port of every service here that exits
+// without listening, duplicated from internal/sandboxagent/services' own
+// test constant of the same name, which explains it in full. A port
+// freePort released can be handed to another socket the moment it is
+// closed, another parallel test's own freePort listener included; the
+// readiness dial then reaches that stranger before the exit is reaped, and
+// a crashed primary is reported ready. Port 1 lies below every ephemeral
+// range, so the kernel never hands it out.
+const neverBoundPort = 1
 
 // writeServicesManifest writes a .narvi/services.yml under repoDir with
 // the given raw content.
@@ -225,7 +236,7 @@ func TestRunBoot_FatalFailureInRepoAStopsBeforeRepoB(t *testing.T) {
 	if err := os.MkdirAll(repoADir, 0o755); err != nil {
 		t.Fatalf("MkdirAll: %v", err)
 	}
-	writeServicesManifest(t, repoADir, crashingManifestYAML("crashes", freePort(t), "primary"))
+	writeServicesManifest(t, repoADir, crashingManifestYAML("crashes", neverBoundPort, "primary"))
 
 	laterMarker := filepath.Join(workspaceDir, "repo-b-marker")
 	writeScript(t, filepath.Join(workspaceDir, "repo-b", "start.sh"), "touch "+laterMarker)
@@ -270,7 +281,7 @@ func TestRunBoot_ChownsBeforeStartingServices(t *testing.T) {
 	// A .narvi/services.yml makes RunBoot take the services branch. The
 	// service itself exits immediately; this test observes ORDERING, not
 	// readiness.
-	writeServicesManifest(t, repoDir, crashingManifestYAML("web", 1, "secondary"))
+	writeServicesManifest(t, repoDir, crashingManifestYAML("web", neverBoundPort, "secondary"))
 
 	var order []string
 	chown := func(got string) error {

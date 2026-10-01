@@ -137,21 +137,63 @@ func TestEvaluateCronTriggersOnce_NeverFiresWhenScheduleDoesNotMatch(t *testing.
 	}
 }
 
+// TestEvaluateCronTriggersOnce_NeverFiresTwiceInTheSameMinute proves an
+// every-minute schedule fires once per minute: a second tick inside the
+// minute it already fired in creates no second invocation, and a tick in
+// the next minute does create one.
+//
+// Each tick is evaluated at an instant the test chooses, through
+// EvaluateCronTriggersAtForTest, so whether two ticks share a minute is
+// fixed by construction. An earlier form ran both ticks on the wall clock,
+// back to back. Two ticks that straddle a minute boundary are in two
+// minutes, where the schedule rightly fires twice, so that form failed
+// with the code correct whenever it ran across one (CI on main, around
+// 03:36:00 UTC: "invocations for automation = 2, want exactly 1 across two
+// ticks in the same minute").
 func TestEvaluateCronTriggersOnce_NeverFiresTwiceInTheSameMinute(t *testing.T) {
-	f := newFixture(t)
-	ctx := context.Background()
+	minute := time.Now().UTC().Truncate(time.Minute)
 
-	auto := f.createCronAutomation(t, "every minute", "* * * * *", sqlcgen.AutomationStatusActive)
-
-	if err := f.engine.EvaluateCronTriggersOnce(ctx); err != nil {
-		t.Fatalf("EvaluateCronTriggersOnce (first tick): %v", err)
+	tests := []struct {
+		name          string
+		first, second time.Time
+		want          int
+	}{
+		{
+			name:   "second tick later in the same minute",
+			first:  minute.Add(10 * time.Second),
+			second: minute.Add(50 * time.Second),
+			want:   1,
+		},
+		{
+			name:   "second tick in the next minute",
+			first:  minute.Add(50 * time.Second),
+			second: minute.Add(70 * time.Second),
+			want:   2,
+		},
 	}
-	if err := f.engine.EvaluateCronTriggersOnce(ctx); err != nil {
-		t.Fatalf("EvaluateCronTriggersOnce (second tick): %v", err)
-	}
 
-	if got := f.countInvocationsForAutomation(t, auto.ID); got != 1 {
-		t.Fatalf("invocations for automation = %d, want exactly 1 across two ticks in the same minute", got)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			ctx := context.Background()
+
+			auto := f.createCronAutomation(t, "every minute", "* * * * *", sqlcgen.AutomationStatusActive)
+
+			if err := f.engine.EvaluateCronTriggersAtForTest(ctx, tc.first); err != nil {
+				t.Fatalf("first tick at %s: %v", tc.first.Format(time.TimeOnly), err)
+			}
+			if got := f.countInvocationsForAutomation(t, auto.ID); got != 1 {
+				t.Fatalf("invocations after the first tick = %d, want 1: an every-minute schedule fires on its first tick", got)
+			}
+			if err := f.engine.EvaluateCronTriggersAtForTest(ctx, tc.second); err != nil {
+				t.Fatalf("second tick at %s: %v", tc.second.Format(time.TimeOnly), err)
+			}
+
+			if got := f.countInvocationsForAutomation(t, auto.ID); got != tc.want {
+				t.Fatalf("invocations after ticks at %s and %s = %d, want %d: one per minute the ticks fall in",
+					tc.first.Format(time.TimeOnly), tc.second.Format(time.TimeOnly), got, tc.want)
+			}
+		})
 	}
 }
 

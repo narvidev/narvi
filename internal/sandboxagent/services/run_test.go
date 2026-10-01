@@ -31,7 +31,8 @@ func strPtr(v string) *string { return &v }
 // gets a real, currently-unused port number without ever hardcoding one.
 // There is an inherent, accepted TOCTOU window between this Close and
 // whatever the caller spawns to rebind the same port; standard practice
-// for this kind of test.
+// for this kind of test. It is only for a service that does listen on the
+// port: one that must never be reported ready takes neverBoundPort.
 func freePort(t *testing.T) int {
 	t.Helper()
 
@@ -43,17 +44,25 @@ func freePort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// neverBoundPort is a fixed, low TCP port for the two tests
+// neverBoundPort is a fixed, low TCP port for every test whose service
+// must never be reported ready: the two timeout tests
 // (TestRun_PrimaryTimeoutIsFatal, TestRun_SecondaryTimeoutLeavesProcessRunning)
-// that need a port GUARANTEED to stay closed for the readiness timeout's
-// entire duration, not merely at one instant -- freePort's own "bind,
-// read the port, close" pattern only proves the port was free the moment
-// it was checked. Once closed, the kernel is free to hand that exact
-// ephemeral port to any other process on the machine for the rest of the
-// test; when it does, portReady's TCP dial legitimately succeeds against
-// that unrelated listener, and Run wrongly observes PhaseReady instead of
-// PhaseTimeout -- not a bug in the code under test, but the test's own
-// port choice (observed once on a loaded CI runner).
+// and the three whose primary exits before readiness
+// (TestRun_PrimaryCrashIsFatal, TestRun_PrimaryCleanExitIsAlsoFatal,
+// TestRun_MixedOutcomes_OneCrashesOneSucceeds). Each needs a port
+// GUARANTEED to stay closed for as long as Run waits, not merely at one
+// instant -- freePort's own "bind, read the port, close" pattern only
+// proves the port was free the moment it was checked. Once closed, the
+// kernel is free to hand that exact ephemeral port to any other socket on
+// the machine for the rest of the test, another test's own freePort
+// listener included; when it does, portReady's TCP dial legitimately
+// succeeds against that unrelated listener, and Run wrongly observes
+// PhaseReady -- not a bug in the code under test, but the test's own port
+// choice. A timeout test then sees PhaseReady instead of PhaseTimeout
+// (observed once on a loaded CI runner). A crash test sees it instead of
+// PhaseFailed whenever the dial wins the race with the exit's reap, and
+// Run returns nil (observed on CI and in a Linux container; a listener
+// planted on the released port reproduces it every time).
 //
 // 1 (TCPMUX, RFC 1078) is below every mainstream OS's own ephemeral/
 // dynamic port range floor (Linux and macOS/BSD both start at 32768 or
@@ -312,7 +321,7 @@ func TestRun_PrimaryCrashIsFatal(t *testing.T) {
 		{
 			Name:        "crashes",
 			Cmd:         "exit 1",
-			Readiness:   servicemanifest.Readiness{Port: intPtr(freePort(t))},
+			Readiness:   servicemanifest.Readiness{Port: intPtr(neverBoundPort)}, // never opened by "exit 1"
 			Criticality: servicemanifest.CriticalityPrimary,
 		},
 	}}
@@ -344,7 +353,7 @@ func TestRun_PrimaryCleanExitIsAlsoFatal(t *testing.T) {
 		{
 			Name:        "exits-cleanly",
 			Cmd:         "exit 0",
-			Readiness:   servicemanifest.Readiness{Port: intPtr(freePort(t))}, // never opened by "exit 0"
+			Readiness:   servicemanifest.Readiness{Port: intPtr(neverBoundPort)}, // never opened by "exit 0"
 			Criticality: servicemanifest.CriticalityPrimary,
 		},
 	}}
@@ -381,7 +390,7 @@ func TestRun_MixedOutcomes_OneCrashesOneSucceeds(t *testing.T) {
 		{
 			Name:        "crashes",
 			Cmd:         "exit 1",
-			Readiness:   servicemanifest.Readiness{Port: intPtr(freePort(t))},
+			Readiness:   servicemanifest.Readiness{Port: intPtr(neverBoundPort)}, // never opened by "exit 1"
 			Criticality: servicemanifest.CriticalityPrimary,
 		},
 		{
