@@ -457,7 +457,12 @@ export function HandoffReadinessCard({ handoffReadiness }: { handoffReadiness: H
   )
 }
 
-export function SentinelsPanel({ verdict, visualQa }: { verdict: ReviewReadoutVerdict | null; visualQa: string | null }) {
+/**
+ * SentinelsPanel is the rail's sentinel summary. hasUnsourcedFinding says
+ * some published finding has no recorded source (§26.6's amendment): the
+ * second-run row then never claims that no addition was published.
+ */
+export function SentinelsPanel({ verdict, visualQa, hasUnsourcedFinding = false }: { verdict: ReviewReadoutVerdict | null; visualQa: string | null; hasUnsourcedFinding?: boolean }) {
   return (
     <div>
       <h3>Sentinels</h3>
@@ -504,7 +509,7 @@ export function SentinelsPanel({ verdict, visualQa }: { verdict: ReviewReadoutVe
             counter-review added -- the reviewer's report beside the
             server's resolution, apart from the first run above. */}
         <dt>fact check (additions)</dt>
-        <dd>{additionsRunSummary(verdict)}</dd>
+        <dd>{additionsRunSummary(verdict, hasUnsourcedFinding)}</dd>
       </dl>
     </div>
   )
@@ -665,7 +670,7 @@ export function CodeReviewView({ sessionId }: { sessionId: string }) {
       <aside className="rail" aria-label="Review details">
         <ReviewSessionPanel sessionReuse={readout.sessionReuse} />
         <SentinelAutoFixPanel sentinelFix={sentinelFix} repoFullName={readout.repoFullName} />
-        <SentinelsPanel verdict={verdict} visualQa={visualQa} />
+        <SentinelsPanel verdict={verdict} visualQa={visualQa} hasUnsourcedFinding={readout.findings.some((f) => !f.source)} />
         <div>
           <h3>Actions</h3>
           <div className="btnrow" style={{ flexDirection: 'column', alignItems: 'stretch' }}>

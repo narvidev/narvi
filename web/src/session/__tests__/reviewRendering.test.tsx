@@ -729,6 +729,14 @@ describe('CodeReviewView -- counter-review additions (§26.6)', () => {
     expect(html).not.toContain('additions unverified')
   })
 
+  it('the Sentinels panel never says no addition was published while a finding has no recorded source', () => {
+    const html = renderToStaticMarkup(
+      <SentinelsPanel verdict={baseVerdict({ additionsFactCheck: 'done', additionsFactCheckKilled: 0, additionsCheck: null })} visualQa={null} hasUnsourcedFinding />,
+    )
+    expect(html).toContain('<dt>fact check (additions)</dt><dd>done (0 killed) · not resolved -- a finding has no recorded source</dd>')
+    expect(html).not.toContain('no addition published')
+  })
+
   // The expanded appendix: unverified additions are listed apart, under
   // their own heading after the other findings, and never repeated among
   // them.

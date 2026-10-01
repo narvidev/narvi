@@ -99,6 +99,12 @@ describe('additionsRunSummary (§26.6)', () => {
     expect(additionsRunSummary({ additionsFactCheck: 'done', additionsFactCheckKilled: 2 })).not.toContain('unverified')
   })
 
+  it('never claims no addition was published while a published finding has no recorded source', () => {
+    expect(additionsRunSummary({ additionsFactCheck: 'done', additionsFactCheckKilled: 0, additionsCheck: null }, true)).toBe('done (0 killed) · not resolved -- a finding has no recorded source')
+    expect(additionsRunSummary({ additionsFactCheck: 'done', additionsFactCheckKilled: 0, additionsCheck: null }, true)).not.toContain('no addition published')
+    expect(additionsRunSummary({ additionsFactCheck: 'done', additionsFactCheckKilled: 1, additionsCheck: 'checked' }, true)).toBe('done (1 killed) · additions checked')
+  })
+
   it('a dash when there was neither a second run nor an addition', () => {
     expect(additionsRunSummary({ additionsFactCheck: null, additionsFactCheckKilled: null, additionsCheck: null })).toBe('—')
     expect(additionsRunSummary({})).toBe('—')

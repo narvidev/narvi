@@ -135,15 +135,19 @@ export function additionsCheckLabel(check: string | null | undefined): string {
   return 'additions unverified'
 }
 
-/** additionsRunSummary renders the Sentinels panel's second fact-check row: the reviewer's report and kill count, then the server's resolution of the additions the verdict published. A verdict that published none -- its second run removed every addition -- reads 'no addition published', never 'additions unverified': additionsCheck is null exactly then. '—' when there was neither a second run nor an addition. */
+/** additionsRunSummary renders the Sentinels panel's second fact-check row: the reviewer's report and kill count, then the server's resolution of the additions the verdict published. A verdict that published none -- its second run removed every addition -- reads 'no addition published', never 'additions unverified': additionsCheck is null exactly then. hasUnsourcedFinding says some published finding has no recorded source, which could have been an addition the server never saw as one; the row then says only that nothing was resolved, never that no addition was published. '—' when there was neither a second run nor an addition. */
 export function additionsRunSummary(
   verdict: { additionsFactCheck?: string | null; additionsFactCheckKilled?: number | null; additionsCheck?: string | null } | null | undefined,
+  hasUnsourcedFinding = false,
 ): string {
   const reported = verdict?.additionsFactCheck ?? null
   const check = verdict?.additionsCheck ?? null
   if (!reported && !check) return '—'
   const killed = typeof verdict?.additionsFactCheckKilled === 'number' ? ` (${verdict.additionsFactCheckKilled} killed)` : ''
-  return `${reported ?? 'not reported'}${killed} · ${check ? additionsCheckLabel(check) : 'no addition published'}`
+  let resolution = 'no addition published'
+  if (check) resolution = additionsCheckLabel(check)
+  else if (hasUnsourcedFinding) resolution = 'not resolved -- a finding has no recorded source'
+  return `${reported ?? 'not reported'}${killed} · ${resolution}`
 }
 
 /** findingSourceBucketLabel renders ReviewAnalyticsFindingSourceCount.source, the bucket the per-source finding breakdown counts under. */
