@@ -1171,14 +1171,18 @@ current CI conclusion), it reads them live and compares them against the recorde
 folds them back into the record. The comparison exists once, so no two consumers can compare
 differently: `autoapproval.CheckFreshness` is the freshness prefix of the eligibility engine, which calls
 it, so every consumer of eligibility -- the decision inbox included -- compares through it. The live read
-is shared by two consumers only: `reviewfreshness.ReadLive` reads the facts the comparison needs (the base
-branch's live tip, the ancestor link's, and whether each moved only forward) for the merge path's
-revalidation and for a session's result (§43.20, row 182), which also reads the pull request itself live,
-as the auto-merge worker does, and runs the merge path's own probe on it. The decision inbox's read model
-(`decisioninbox`'s `computeRealEligibility`) still assembles the same facts itself, through its TTL cache,
-and handles a failed call differently -- it blanks the value, marks the read degraded and carries on to the
-comparison, where `ReadLive` stops and names the step -- so a change to `ReadLive` does not reach it.
-Routing the inbox through `ReadLive` is a follow-up recorded on row 182, filed as row 220.
+exists once too: `reviewfreshness.ReadLive` reads the facts the comparison needs (the base branch's live
+tip, the ancestor link's, and whether each moved only forward) for the merge path's revalidation, for a
+session's result (§43.20, row 182), which also reads the pull request itself live, as the auto-merge worker
+does, and runs the merge path's own probe on it, and for the decision inbox's read model (`decisioninbox`'s
+`computeRealEligibility`, row 220), so a change to `ReadLive` reaches all three. The inbox hands it its TTL
+cache's view of the two calls (`SCMCache.FreshnessReads`), so a list read stays cached (§16.2) while the
+merge path reads live; no other code in `decisioninbox` makes either call, which two structural tests pin
+(`TestComputeRealEligibility_ReadsLiveFactsOnlyThroughReviewFreshness`,
+`TestDecisionInbox_FreshnessCallsOnlyInItsCache`). What a failed read means stays each consumer's own: the
+merge path refuses, naming the check; a session's result reports its freshness unconfirmed; the inbox shows
+the row degraded and never eligible, its acceptance readout saying the base commit could not be confirmed,
+whichever step failed -- what it showed before it read through `ReadLive`.
 
 **Publication is concurrent, and the losing writer must know it lost.** Two attempts can be in
 flight for one pull request, and a base can move under an unchanged head, so the record a publisher
@@ -9338,13 +9342,12 @@ freshness prefix of `computeEligibleCore`, moved out verbatim and called by it r
 needs-human escape hatch (a human override, not a freshness fact, so it stays first); `ReadLive` is the
 live-fact assembly moved out of `decisioninbox.revalidateCore` -- the same calls in the same order, with
 the same skip conditions and timeouts -- which reports the step that failed, so the merge path keeps its
-own refusal reason and log line for each, byte for byte. The decision inbox's cached read model is not
-among its callers (§21.1b): it still assembles the same facts itself, which row 182 records as a
-follow-up. That refactor changed no behaviour of the merge path: every eligibility, revalidation,
+own refusal reason and log line for each, byte for byte. The decision inbox's cached read model joined its
+callers in row 220, handing it the cache's view of the calls (§21.1b). That refactor changed no behaviour of the merge path: every eligibility, revalidation,
 decision-inbox, auto-merge and merge-endpoint test passes, by name, before and after it. `TestCheckFreshness_EquivalentToEligibilityPrefix` runs every input of the
 eligibility tables, and an exhaustive product of the freshness fields, through both, and two structural
 tests pin that `computeEligibleCore` compares no freshness field itself and that `revalidateCore` makes no
-base or ancestry call of its own.
+base or ancestry call of its own (row 220 pins `computeRealEligibility` the same way).
 
 A push that moves the pull request's head after the verdict -- never the review session's own, which
 never pushes -- is visible here before its `synchronize` arms anything: the result reads the live head,

@@ -543,10 +543,10 @@ type OpenPR struct {
 	// PR evaluated while based on another PR's branch, then retargeted,
 	// or whose parent moved beneath it, kept an unchanged head, so
 	// comparing this CACHED value against itself detected nothing). Both
-	// call sites now resolve the base branch's LIVE tip instead --
-	// decisioninbox.SCMCache.ResolveBranchSHA (cached, §16.2's own "SCM
-	// data is cached with a short TTL" posture, for the read-model path)
-	// or a direct, uncached ports.SourceControl.ResolveBranchSHA call
+	// call sites now resolve the base branch's LIVE tip instead, through
+	// reviewfreshness.ReadLive -- handed decisioninbox.SCMCache's view of
+	// the call (cached, §16.2's own "SCM data is cached with a short TTL"
+	// posture, for the read-model path) or this port itself, uncached
 	// (for the action-endpoint path) -- never this field. Retained here
 	// as GitHub's own honestly-cached fact, exposed for any future
 	// display/audit purpose that can tolerate its own staleness; not
@@ -1016,9 +1016,11 @@ type SourceControl interface {
 	// convention at all (it documents fields only) -- the fail-closed
 	// convention every caller of THIS method applies to a non-nil error
 	// lives at the call sites, not on this port: internal/app/
-	// decisioninbox's revalidateCore (revalidate.go) and
-	// computeRealEligibility (aggregate.go) each document their own
-	// logged, early-return/degraded fail-closed handling.
+	// reviewfreshness.ReadLive, the one caller, reports a failure as the
+	// step that failed, and each of its callers -- decisioninbox's
+	// revalidateCore (revalidate.go) and computeRealEligibility
+	// (aggregate.go), and a session's result -- documents its own logged,
+	// fail-closed handling of it.
 	IsAncestor(ctx context.Context, spec IsAncestorSpec) (isAncestor bool, err error)
 
 	// ResolveContractsFingerprint fingerprints spec.Path's directory

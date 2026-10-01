@@ -19,6 +19,9 @@ import (
 
 	"github.com/narvidev/narvi/internal/app/decisioninbox"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/reviewfreshness"
+	"github.com/narvidev/narvi/internal/domain/review"
+	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -954,6 +957,72 @@ func TestSCMCache_ResolveAppID(t *testing.T) {
 			fake.mu.Unlock()
 			if reads != tc.wantReads {
 				t.Errorf("underlying reads = %d, want %d", reads, tc.wantReads)
+			}
+		})
+	}
+}
+
+// TestSCMCache_FreshnessReads drives reviewfreshness.ReadLive through the
+// cache's view of its two calls, as the decision inbox's read model does
+// (computeRealEligibility, §21.1b): a pull request whose base moved forward,
+// stacked on a link that moved forward too, so all four of ReadLive's calls
+// run. A second read within the TTL is served whole from the cache, with the
+// same facts; a failed read is never cached, so the next read asks again.
+func TestSCMCache_FreshnessReads(t *testing.T) {
+	t.Parallel()
+
+	recorded := reviewverdict.Context{BaseRef: "main", BaseSHA: "old-main", AncestorChain: []review.AncestorLink{{Ref: "parent", SHA: "old-parent"}}}
+	target := ports.OpenPR{Owner: "acme", Repo: "widgets", Number: 7, HeadSHA: "head", BaseRef: "main", AncestorChain: []ports.PRAncestorLink{{Ref: "parent", SHA: "a-cached-sha-never-read"}}}
+	wantFacts := reviewfreshness.LiveFacts{
+		HeadSHA: "head", BaseRef: "main", BaseSHA: "new",
+		AncestorChain:              []review.AncestorLink{{Ref: "parent", SHA: "new"}},
+		BaseAdvancedWithoutRewrite: true, AncestorChainAdvancedWithoutRewrite: true,
+	}
+
+	tests := []struct {
+		name        string
+		resolveErr  error
+		wantFailure reviewfreshness.Step
+		// wantResolves/wantAncestry are the port's calls over both reads.
+		wantResolves, wantAncestry int
+	}{
+		{name: "a second read within the TTL is served from the cache", wantResolves: 2, wantAncestry: 2},
+		{name: "a failed read is never cached", resolveErr: errors.New("boom: http 502"), wantFailure: reviewfreshness.StepResolveBase, wantResolves: 2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fake := &fakeSCMCacheSourceControl{resolveBranchSHA: "new", resolveBranchSHAErr: tc.resolveErr, isAncestorResult: true}
+			timeouts := platform.DefaultTimeouts()
+			cache := decisioninbox.NewSCMCache(fake, timeouts)
+			now := time.Now()
+			for _, at := range []time.Time{now, now.Add(timeouts.DecisionInboxSCMCacheTTL / 2)} {
+				live, failure := reviewfreshness.ReadLive(context.Background(), timeouts, cache.FreshnessReads(at), "tok", target, recorded)
+				if tc.wantFailure != "" {
+					if failure == nil || failure.Step != tc.wantFailure {
+						t.Fatalf("ReadLive() failure = %+v, want step %s", failure, tc.wantFailure)
+					}
+					continue
+				}
+				if failure != nil {
+					t.Fatalf("ReadLive() failure = %+v, want none", failure)
+				}
+				if !reflect.DeepEqual(live, wantFacts) {
+					t.Errorf("ReadLive() = %+v, want %+v", live, wantFacts)
+				}
+			}
+			if got := fake.resolveBranchSHACalls(); got != tc.wantResolves {
+				t.Errorf("ResolveBranchSHA calls = %d, want %d", got, tc.wantResolves)
+			}
+			if got := fake.isAncestorCalls(); got != tc.wantAncestry {
+				t.Errorf("IsAncestor calls = %d, want %d", got, tc.wantAncestry)
+			}
+			if tc.resolveErr == nil {
+				// The resolved branch is the one named: the view keeps no
+				// default-branch resolution of its own.
+				if _, branch, err := cache.FreshnessReads(now).ResolveBranchSHA(context.Background(), ports.ResolveBranchSHASpec{Owner: "acme", Repo: "widgets", Branch: "main"}); err != nil || branch != "main" {
+					t.Errorf("FreshnessReads().ResolveBranchSHA() = (branch %q, err %v), want (main, nil)", branch, err)
+				}
 			}
 		})
 	}
