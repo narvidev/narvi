@@ -604,257 +604,22 @@
                 "null"
               ]
             },
-            "inFlightTurn": {
+            "escalation": {
               "additionalProperties": false,
-              "description": "The turn dispatched to a sandbox or being processed; null when none is.",
-              "properties": {
-                "dispatchedAt": {
-                  "description": "When the turn was dispatched.",
-                  "format": "date-time",
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "state": {
-                  "description": "'dispatched': handed to the sandbox, not yet confirmed started; 'processing': the agent is working on it.",
-                  "enum": [
-                    "dispatched",
-                    "processing"
-                  ],
-                  "type": "string"
-                },
-                "turnId": {
-                  "format": "uuid",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "turnId",
-                "state",
-                "dispatchedAt"
-              ],
-              "type": [
-                "object",
-                "null"
-              ]
-            },
-            "lastRun": {
-              "additionalProperties": false,
-              "description": "The most recently created turn that reached a terminal state; null when none has.",
-              "properties": {
-                "failureReason": {
-                  "description": "Why the run did not complete, with Session.failureReason's values. A turn carries no reason of its own, so this is the session's recorded reason, given only when it can describe nothing but this run: the run is the session's newest turn, did not complete, and the session's recorded outcome is this run's. Null otherwise, and always null when the run completed.",
-                  "enum": [
-                    "cancelled",
-                    "failed",
-                    "timeout",
-                    "never_started",
-                    null
-                  ],
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "finishedAt": {
-                  "description": "When the run reached its terminal state; null when that was not recorded.",
-                  "format": "date-time",
-                  "type": [
-                    "string",
-                    "null"
-                  ]
-                },
-                "outcome": {
-                  "enum": [
-                    "completed",
-                    "failed",
-                    "cancelled"
-                  ],
-                  "type": "string"
-                },
-                "turnId": {
-                  "format": "uuid",
-                  "type": "string"
-                }
-              },
-              "required": [
-                "turnId",
-                "outcome",
-                "failureReason",
-                "finishedAt"
-              ],
-              "type": [
-                "object",
-                "null"
-              ]
-            },
-            "observedAt": {
-              "description": "The database's clock when the snapshot was taken.",
-              "format": "date-time",
-              "type": "string"
-            },
-            "pendingTurns": {
-              "description": "How many turns are queued (pending), not yet dispatched to a sandbox.",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "sandboxStatus": {
-              "description": "The session's sandbox status in the same snapshot, with Session.sandboxStatus's values; null when the session has no sandbox yet. Informational, and an input to suggestedDelaySeconds while queued: activity never derives from it.",
-              "enum": [
-                "pending",
-                "spawning",
-                "connecting",
-                "booting",
-                "ready",
-                "snapshotting",
-                "suspect",
-                "stopped",
-                "failed",
-                null
-              ],
-              "type": [
-                "string",
-                "null"
-              ]
-            },
-            "sessionId": {
-              "format": "uuid",
-              "type": "string"
-            },
-            "settled": {
-              "description": "true exactly when activity is idle, awaiting_approval or finished: nothing progresses server-side until a person acts or sends new input. Never true while a turn is queued or running, while a completed turn's push and pull request are being delivered, or while work that can create a turn is scheduled.",
-              "type": "boolean"
-            },
-            "suggestedDelaySeconds": {
-              "description": "How long to wait before reading this status again, in whole seconds (rounded up): short while a turn is queued on a warm sandbox, running or being delivered, longer while a sandbox starts or work is scheduled (never past the moment that work comes due, plus a few seconds for it to act), longer still while a person must act, longest once finished or idle -- always within the deployment's configured floor and ceiling (2 and 300 seconds as shipped). A hint that keeps polling quiet, never a limit: an earlier read is answered all the same.",
-              "minimum": 0,
-              "type": "integer"
-            },
-            "wait": {
-              "additionalProperties": false,
-              "description": "How the wait ended, present only when the read waited (?waitSeconds= one or more; narvi_wait_for_session) and absent from a plain read, whose bytes are unchanged by it. The wait reads the status at once and, while it is not settled, again every second (as shipped), so it answers a session that is queued, running, delivering or scheduled only with reason timeout, interrupted or capacity -- never settled. It wakes by reading the database, so any replica serves it.",
-              "properties": {
-                "reason": {
-                  "description": "'settled': a read found the session settled (settled true; activity says which: finished, idle or awaiting_approval). 'timeout': the wait ran to its bound and the session is still not settled -- call the wait again, rather than sleeping. 'interrupted': the server began shutting down, and answered the latest read at once -- call again, another replica will serve it. 'capacity': the replica serving the call already runs as many concurrent waits as one of its three caps allows -- the caller's (2 as shipped, counted per MCP authorization, or per user for a signed-in browser), the user's across all of their MCP authorizations and their browser together (4), or all callers' together (32) -- so the status was read once and this read did not wait: a normal answer, never an error; the snapshot is current, and a later call waits once a slot is free.",
-                  "enum": [
-                    "settled",
-                    "timeout",
-                    "interrupted",
-                    "capacity"
-                  ],
-                  "type": "string"
-                },
-                "waitedMs": {
-                  "description": "How long the wait blocked, in milliseconds, from its first read to its answer: 0 when the first read was answered at once (settled, or over capacity).",
-                  "minimum": 0,
-                  "type": "integer"
-                }
-              },
-              "required": [
-                "reason",
-                "waitedMs"
-              ],
-              "type": "object"
-            }
-          },
-          "required": [
-            "sessionId",
-            "activity",
-            "settled",
-            "pendingTurns",
-            "inFlightTurn",
-            "awaiting",
-            "lastRun",
-            "sandboxStatus",
-            "archived",
-            "suggestedDelaySeconds",
-            "observedAt"
-          ],
-          "type": "object"
-        }
-      },
-      "$ref": "#/$defs/SessionActivity",
-      "$schema": "https://json-schema.org/draft/2020-12/schema",
-      "type": "object"
-    }
-  },
-  {
-    "annotations": {
-      "destructiveHint": false,
-      "idempotentHint": true,
-      "openWorldHint": false,
-      "readOnlyHint": true
-    },
-    "description": "Wait, server-side and bounded, until one session is settled -- finished, idle, or awaiting a person -- then return its state: the same state narvi_get_session_status returns (GET /api/sessions/{sessionID}/status?waitSeconds=N), with wait.reason and wait.waitedMs. The state is read at once, then again one second after each read (as shipped), and the call returns as soon as a read finds the session settled; a session that is queued, running, delivering a completed turn's pull request, or holding scheduled work never ends the wait early. Otherwise the call blocks for waitSeconds seconds -- omitted, or larger than the deployment allows, means the longest: 25 seconds as shipped -- then reads the state once more and returns that read. wait.reason: settled; timeout (still not settled at the end of the wait -- call this tool again rather than sleeping); interrupted (the server is restarting and returned its latest read at once -- call again); capacity (the state was read once and returned at once, without waiting, because the server replica that took the call already runs as many concurrent waits as one of its three caps allows: 2 under this authorization, 4 of this user's across all of their authorizations and their browser, or 32 from all callers together -- the caps as shipped; a later call waits once a slot is free). Does not include the transcript.",
-    "inputSchema": {
-      "additionalProperties": false,
-      "description": "The narvi_wait_for_session MCP tool's own input (technical plan §43.20, row 182's bounded wait) -- the tool bridge's twin of GET /api/sessions/{sessionID}/status?waitSeconds=N, the blocking form of the status read: sessionId becomes the path parameter and waitSeconds the query parameter. The answer is SessionActivity with its wait object set.",
-      "properties": {
-        "sessionId": {
-          "description": "The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).",
-          "format": "uuid",
-          "type": "string"
-        },
-        "waitSeconds": {
-          "description": "The most seconds to wait for the session to settle. Omitted means the longest wait the deployment allows (25 seconds as shipped); a larger value is clamped to it, never refused. minimum: a wait of zero seconds is narvi_get_session_status. Deliberately no \"maximum\": the route clamps rather than rejects, and tools/contractscompat's closed keyword allowlist does not recognize \"maximum\" (ListSessionsToolRequest.limit's own reasoning).",
-          "minimum": 1,
-          "type": "integer"
-        }
-      },
-      "required": [
-        "sessionId"
-      ],
-      "type": "object"
-    },
-    "name": "narvi_wait_for_session",
-    "outputSchema": {
-      "$defs": {
-        "SessionActivity": {
-          "additionalProperties": false,
-          "description": "GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's work is doing now, and how long to wait before reading it again. Derived at read time from the session's turn queue, a completed turn's push and pull request still under way, work the server holds that can create a turn on the session with no new input, and its human gates, all read in ONE database snapshot -- never from Session.status, which is re-derived only when a turn reaches a terminal state and so can hold any of its five values while a turn is queued or running. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read. With ?waitSeconds=N (a whole number of seconds; absent or 0 is the plain read, a negative or malformed value is a 400) the route waits, at most N seconds clamped to the deployment's maximum (25 as shipped), for the session to be settled, and answers the same shape with wait set: the snapshot it answers is its latest read.",
-          "properties": {
-            "activity": {
-              "description": "In precedence order: 'running' when a turn is dispatched or processing (turns may be queued behind it); else 'queued' when a turn is pending -- including the gap between one turn finishing and the next being dispatched, and a whole sandbox cold start; else 'delivering' when a turn that completed is still being delivered -- its branch pushed, then its pull request opened, which happens with no new input -- for at most the deployment's delivery window from when that turn completed (10 minutes as shipped: a push that never reports back stops counting then); else 'scheduled' when the server holds work that can create a turn on this session with no new input and has neither created it nor declined yet -- an automatic re-review armed by a push to the session's pull request (a debounce, 2 minutes as shipped, counted only while the pull request's repository has opted in and its automatic re-review budget is not spent: the two conditions under which it can create a turn), or a release pull request's manifest check still to come or still running (it can add a composition review turn); else 'awaiting_approval' when a person must act (a plan awaiting approval, a workflow step awaiting a decision, or a custom workflow's run escalated for review until a turn is created on the session after it escalated -- see awaiting.kind); else 'idle' when the session has no turn at all; else 'finished' (at least one turn, every one terminal, nothing being delivered, nothing scheduled). A queued or running turn is never reported as idle or finished. 'delivering' ends once the pull request is recorded, or once the delivery ends without one: the push failed or could not be sent, the pull request could not be opened (the creator may no longer open one, or their GitHub token is no longer usable, or GitHub refused it), or the window passed. A pull request that is opened is recorded before activity leaves 'delivering', except when two pushes overlap: a sandbox records one delivery at a time, so if a later turn completes before an earlier turn's push has reported back, the earlier push's pull request ends the later delivery, and the later pull request can appear after 'finished'. 'scheduled' ends when its work comes due and either creates its turn ('queued' follows) or declines (the session reads whatever else it holds). A pull request's review session is read-only and never pushes, so its turns are never followed by 'delivering'.",
-              "enum": [
-                "idle",
-                "queued",
-                "running",
-                "delivering",
-                "scheduled",
-                "awaiting_approval",
-                "finished"
-              ],
-              "type": "string"
-            },
-            "archived": {
-              "type": "boolean"
-            },
-            "awaiting": {
-              "additionalProperties": false,
-              "description": "The human gate open on this session, if any, whatever activity says: activity is 'awaiting_approval' only when nothing is also queued, running, being delivered or scheduled. When more than one gate is open, a plan is reported first, then a workflow step, then an escalated workflow run.",
+              "description": "The session's open workflow escalation, whatever awaiting reports: a custom workflow's run escalated for review, open under exactly the rule awaiting.kind 'workflow_escalation' states -- while it is the session's newest workflow run, ran an attempt of its own, and no turn other than its own attempts has been created since it escalated. awaiting names one gate, a plan or a workflow step before an escalation, so an escalation open beside either is reported here and not there; a client showing which workflow run a person should look at reads it here. Null when no escalation is open, a built-in workflow's included.",
               "properties": {
                 "id": {
+                  "description": "The escalated run's id.",
                   "format": "uuid",
-                  "type": "string"
-                },
-                "kind": {
-                  "description": "'plan': a plan awaiting approval (id is the plan's, decided through POST /api/sessions/{sessionID}/plans/{planId}/approve or reject); 'workflow_step': a workflow step awaiting a decision (id is the step run's); 'workflow_escalation': a custom workflow's run escalated for review (id is the run's), reported until a turn is created on the session after it escalated: while it is the session's newest workflow run and no turn other than the run's own attempts has been created since. New work sent to the session answers it; a turn created before the escalation never does, whether it is still queued, running or has ended (such as one queued behind the turn whose end escalated the run, or one sent while a step awaited the decision that escalated it), so while such a turn runs, activity says running and awaiting still reports the escalation. A built-in workflow's escalation is never reported: no person or route can act on it, and when its turn failed or was stopped, lastRun already says so.",
-                  "enum": [
-                    "plan",
-                    "workflow_step",
-                    "workflow_escalation"
-                  ],
                   "type": "string"
                 },
                 "since": {
-                  "description": "When the gate opened.",
+                  "description": "When the run escalated.",
                   "format": "date-time",
                   "type": "string"
                 }
               },
               "required": [
-                "kind",
                 "id",
                 "since"
               ],
@@ -1024,6 +789,291 @@
             "pendingTurns",
             "inFlightTurn",
             "awaiting",
+            "escalation",
+            "lastRun",
+            "sandboxStatus",
+            "archived",
+            "suggestedDelaySeconds",
+            "observedAt"
+          ],
+          "type": "object"
+        }
+      },
+      "$ref": "#/$defs/SessionActivity",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object"
+    }
+  },
+  {
+    "annotations": {
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "readOnlyHint": true
+    },
+    "description": "Wait, server-side and bounded, until one session is settled -- finished, idle, or awaiting a person -- then return its state: the same state narvi_get_session_status returns (GET /api/sessions/{sessionID}/status?waitSeconds=N), with wait.reason and wait.waitedMs. The state is read at once, then again one second after each read (as shipped), and the call returns as soon as a read finds the session settled; a session that is queued, running, delivering a completed turn's pull request, or holding scheduled work never ends the wait early. Otherwise the call blocks for waitSeconds seconds -- omitted, or larger than the deployment allows, means the longest: 25 seconds as shipped -- then reads the state once more and returns that read. wait.reason: settled; timeout (still not settled at the end of the wait -- call this tool again rather than sleeping); interrupted (the server is restarting and returned its latest read at once -- call again); capacity (the state was read once and returned at once, without waiting, because the server replica that took the call already runs as many concurrent waits as one of its three caps allows: 2 under this authorization, 4 of this user's across all of their authorizations and their browser, or 32 from all callers together -- the caps as shipped; a later call waits once a slot is free). Does not include the transcript.",
+    "inputSchema": {
+      "additionalProperties": false,
+      "description": "The narvi_wait_for_session MCP tool's own input (technical plan §43.20, row 182's bounded wait) -- the tool bridge's twin of GET /api/sessions/{sessionID}/status?waitSeconds=N, the blocking form of the status read: sessionId becomes the path parameter and waitSeconds the query parameter. The answer is SessionActivity with its wait object set.",
+      "properties": {
+        "sessionId": {
+          "description": "The session id, matching Session.id's own format exactly. A malformed value fails argument validation before the twin is invoked, reported as a tool execution error (isError:true).",
+          "format": "uuid",
+          "type": "string"
+        },
+        "waitSeconds": {
+          "description": "The most seconds to wait for the session to settle. Omitted means the longest wait the deployment allows (25 seconds as shipped); a larger value is clamped to it, never refused. minimum: a wait of zero seconds is narvi_get_session_status. Deliberately no \"maximum\": the route clamps rather than rejects, and tools/contractscompat's closed keyword allowlist does not recognize \"maximum\" (ListSessionsToolRequest.limit's own reasoning).",
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "sessionId"
+      ],
+      "type": "object"
+    },
+    "name": "narvi_wait_for_session",
+    "outputSchema": {
+      "$defs": {
+        "SessionActivity": {
+          "additionalProperties": false,
+          "description": "GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's work is doing now, and how long to wait before reading it again. Derived at read time from the session's turn queue, a completed turn's push and pull request still under way, work the server holds that can create a turn on the session with no new input, and its human gates, all read in ONE database snapshot -- never from Session.status, which is re-derived only when a turn reaches a terminal state and so can hold any of its five values while a turn is queued or running. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read. With ?waitSeconds=N (a whole number of seconds; absent or 0 is the plain read, a negative or malformed value is a 400) the route waits, at most N seconds clamped to the deployment's maximum (25 as shipped), for the session to be settled, and answers the same shape with wait set: the snapshot it answers is its latest read.",
+          "properties": {
+            "activity": {
+              "description": "In precedence order: 'running' when a turn is dispatched or processing (turns may be queued behind it); else 'queued' when a turn is pending -- including the gap between one turn finishing and the next being dispatched, and a whole sandbox cold start; else 'delivering' when a turn that completed is still being delivered -- its branch pushed, then its pull request opened, which happens with no new input -- for at most the deployment's delivery window from when that turn completed (10 minutes as shipped: a push that never reports back stops counting then); else 'scheduled' when the server holds work that can create a turn on this session with no new input and has neither created it nor declined yet -- an automatic re-review armed by a push to the session's pull request (a debounce, 2 minutes as shipped, counted only while the pull request's repository has opted in and its automatic re-review budget is not spent: the two conditions under which it can create a turn), or a release pull request's manifest check still to come or still running (it can add a composition review turn); else 'awaiting_approval' when a person must act (a plan awaiting approval, a workflow step awaiting a decision, or a custom workflow's run escalated for review until a turn is created on the session after it escalated -- see awaiting.kind); else 'idle' when the session has no turn at all; else 'finished' (at least one turn, every one terminal, nothing being delivered, nothing scheduled). A queued or running turn is never reported as idle or finished. 'delivering' ends once the pull request is recorded, or once the delivery ends without one: the push failed or could not be sent, the pull request could not be opened (the creator may no longer open one, or their GitHub token is no longer usable, or GitHub refused it), or the window passed. A pull request that is opened is recorded before activity leaves 'delivering', except when two pushes overlap: a sandbox records one delivery at a time, so if a later turn completes before an earlier turn's push has reported back, the earlier push's pull request ends the later delivery, and the later pull request can appear after 'finished'. 'scheduled' ends when its work comes due and either creates its turn ('queued' follows) or declines (the session reads whatever else it holds). A pull request's review session is read-only and never pushes, so its turns are never followed by 'delivering'.",
+              "enum": [
+                "idle",
+                "queued",
+                "running",
+                "delivering",
+                "scheduled",
+                "awaiting_approval",
+                "finished"
+              ],
+              "type": "string"
+            },
+            "archived": {
+              "type": "boolean"
+            },
+            "awaiting": {
+              "additionalProperties": false,
+              "description": "The human gate open on this session, if any, whatever activity says: activity is 'awaiting_approval' only when nothing is also queued, running, being delivered or scheduled. When more than one gate is open, a plan is reported first, then a workflow step, then an escalated workflow run.",
+              "properties": {
+                "id": {
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "kind": {
+                  "description": "'plan': a plan awaiting approval (id is the plan's, decided through POST /api/sessions/{sessionID}/plans/{planId}/approve or reject); 'workflow_step': a workflow step awaiting a decision (id is the step run's); 'workflow_escalation': a custom workflow's run escalated for review (id is the run's), reported until a turn is created on the session after it escalated: while it is the session's newest workflow run and no turn other than the run's own attempts has been created since. New work sent to the session answers it; a turn created before the escalation never does, whether it is still queued, running or has ended (such as one queued behind the turn whose end escalated the run, or one sent while a step awaited the decision that escalated it), so while such a turn runs, activity says running and awaiting still reports the escalation. A built-in workflow's escalation is never reported: no person or route can act on it, and when its turn failed or was stopped, lastRun already says so.",
+                  "enum": [
+                    "plan",
+                    "workflow_step",
+                    "workflow_escalation"
+                  ],
+                  "type": "string"
+                },
+                "since": {
+                  "description": "When the gate opened.",
+                  "format": "date-time",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "kind",
+                "id",
+                "since"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "escalation": {
+              "additionalProperties": false,
+              "description": "The session's open workflow escalation, whatever awaiting reports: a custom workflow's run escalated for review, open under exactly the rule awaiting.kind 'workflow_escalation' states -- while it is the session's newest workflow run, ran an attempt of its own, and no turn other than its own attempts has been created since it escalated. awaiting names one gate, a plan or a workflow step before an escalation, so an escalation open beside either is reported here and not there; a client showing which workflow run a person should look at reads it here. Null when no escalation is open, a built-in workflow's included.",
+              "properties": {
+                "id": {
+                  "description": "The escalated run's id.",
+                  "format": "uuid",
+                  "type": "string"
+                },
+                "since": {
+                  "description": "When the run escalated.",
+                  "format": "date-time",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "id",
+                "since"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "inFlightTurn": {
+              "additionalProperties": false,
+              "description": "The turn dispatched to a sandbox or being processed; null when none is.",
+              "properties": {
+                "dispatchedAt": {
+                  "description": "When the turn was dispatched.",
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "state": {
+                  "description": "'dispatched': handed to the sandbox, not yet confirmed started; 'processing': the agent is working on it.",
+                  "enum": [
+                    "dispatched",
+                    "processing"
+                  ],
+                  "type": "string"
+                },
+                "turnId": {
+                  "format": "uuid",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "turnId",
+                "state",
+                "dispatchedAt"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "lastRun": {
+              "additionalProperties": false,
+              "description": "The most recently created turn that reached a terminal state; null when none has.",
+              "properties": {
+                "failureReason": {
+                  "description": "Why the run did not complete, with Session.failureReason's values. A turn carries no reason of its own, so this is the session's recorded reason, given only when it can describe nothing but this run: the run is the session's newest turn, did not complete, and the session's recorded outcome is this run's. Null otherwise, and always null when the run completed.",
+                  "enum": [
+                    "cancelled",
+                    "failed",
+                    "timeout",
+                    "never_started",
+                    null
+                  ],
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "finishedAt": {
+                  "description": "When the run reached its terminal state; null when that was not recorded.",
+                  "format": "date-time",
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
+                "outcome": {
+                  "enum": [
+                    "completed",
+                    "failed",
+                    "cancelled"
+                  ],
+                  "type": "string"
+                },
+                "turnId": {
+                  "format": "uuid",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "turnId",
+                "outcome",
+                "failureReason",
+                "finishedAt"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
+            "observedAt": {
+              "description": "The database's clock when the snapshot was taken.",
+              "format": "date-time",
+              "type": "string"
+            },
+            "pendingTurns": {
+              "description": "How many turns are queued (pending), not yet dispatched to a sandbox.",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "sandboxStatus": {
+              "description": "The session's sandbox status in the same snapshot, with Session.sandboxStatus's values; null when the session has no sandbox yet. Informational, and an input to suggestedDelaySeconds while queued: activity never derives from it.",
+              "enum": [
+                "pending",
+                "spawning",
+                "connecting",
+                "booting",
+                "ready",
+                "snapshotting",
+                "suspect",
+                "stopped",
+                "failed",
+                null
+              ],
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "sessionId": {
+              "format": "uuid",
+              "type": "string"
+            },
+            "settled": {
+              "description": "true exactly when activity is idle, awaiting_approval or finished: nothing progresses server-side until a person acts or sends new input. Never true while a turn is queued or running, while a completed turn's push and pull request are being delivered, or while work that can create a turn is scheduled.",
+              "type": "boolean"
+            },
+            "suggestedDelaySeconds": {
+              "description": "How long to wait before reading this status again, in whole seconds (rounded up): short while a turn is queued on a warm sandbox, running or being delivered, longer while a sandbox starts or work is scheduled (never past the moment that work comes due, plus a few seconds for it to act), longer still while a person must act, longest once finished or idle -- always within the deployment's configured floor and ceiling (2 and 300 seconds as shipped). A hint that keeps polling quiet, never a limit: an earlier read is answered all the same.",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "wait": {
+              "additionalProperties": false,
+              "description": "How the wait ended, present only when the read waited (?waitSeconds= one or more; narvi_wait_for_session) and absent from a plain read, whose bytes are unchanged by it. The wait reads the status at once and, while it is not settled, again every second (as shipped), so it answers a session that is queued, running, delivering or scheduled only with reason timeout, interrupted or capacity -- never settled. It wakes by reading the database, so any replica serves it.",
+              "properties": {
+                "reason": {
+                  "description": "'settled': a read found the session settled (settled true; activity says which: finished, idle or awaiting_approval). 'timeout': the wait ran to its bound and the session is still not settled -- call the wait again, rather than sleeping. 'interrupted': the server began shutting down, and answered the latest read at once -- call again, another replica will serve it. 'capacity': the replica serving the call already runs as many concurrent waits as one of its three caps allows -- the caller's (2 as shipped, counted per MCP authorization, or per user for a signed-in browser), the user's across all of their MCP authorizations and their browser together (4), or all callers' together (32) -- so the status was read once and this read did not wait: a normal answer, never an error; the snapshot is current, and a later call waits once a slot is free.",
+                  "enum": [
+                    "settled",
+                    "timeout",
+                    "interrupted",
+                    "capacity"
+                  ],
+                  "type": "string"
+                },
+                "waitedMs": {
+                  "description": "How long the wait blocked, in milliseconds, from its first read to its answer: 0 when the first read was answered at once (settled, or over capacity).",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "reason",
+                "waitedMs"
+              ],
+              "type": "object"
+            }
+          },
+          "required": [
+            "sessionId",
+            "activity",
+            "settled",
+            "pendingTurns",
+            "inFlightTurn",
+            "awaiting",
+            "escalation",
             "lastRun",
             "sandboxStatus",
             "archived",

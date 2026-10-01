@@ -29,7 +29,7 @@ import { parseArtifacts } from './artifactPayloads'
 import type { CostRollup } from './costRollup'
 import { formatRelativeTime } from './relativeTime'
 import { runtimeLabel } from './sandboxRail'
-import type { SandboxRailModel } from './sandboxRail'
+import type { BootPhase, SandboxRailModel } from './sandboxRail'
 import { formatUsd } from './money'
 import { isSafeHref } from './urlSafety'
 
@@ -38,10 +38,15 @@ function formatTokenCount(n: number): string {
   return String(n)
 }
 
-function formatSeconds(seconds: number | null): string {
-  if (seconds === null) return 'running…'
+function formatSeconds(seconds: number): string {
   if (seconds < 10) return `${seconds.toFixed(1)} s`
   return `${Math.round(seconds)} s`
+}
+
+/** formatBootPhase renders one phase's cell: running while open, its duration once it ended, and a bare tick for a phase the server's status shows over without saying when (sandboxRail.ts's BootPhase). */
+function formatBootPhase(phase: Pick<BootPhase, 'open' | 'seconds'>): string {
+  if (phase.open) return 'running…'
+  return phase.seconds === null ? '✓' : `${formatSeconds(phase.seconds)} ✓`
 }
 
 function statusTone(status: string | null): 'ok' | 'warn' | 'crit' | 'neutral' {
@@ -102,10 +107,7 @@ function BootProgressPanel({ model }: { model: SandboxRailModel }) {
         {model.bootPhases.map((p, i) => (
           <Fragment key={i}>
             <dt>{p.phase}</dt>
-            <dd>
-              {formatSeconds(p.seconds)}
-              {p.endedAt !== null ? ' ✓' : ''}
-            </dd>
+            <dd>{formatBootPhase(p)}</dd>
           </Fragment>
         ))}
       </dl>

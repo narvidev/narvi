@@ -3523,6 +3523,19 @@ export interface SessionActivity {
     since: string;
   } | null;
   /**
+   * The session's open workflow escalation, whatever awaiting reports: a custom workflow's run escalated for review, open under exactly the rule awaiting.kind 'workflow_escalation' states -- while it is the session's newest workflow run, ran an attempt of its own, and no turn other than its own attempts has been created since it escalated. awaiting names one gate, a plan or a workflow step before an escalation, so an escalation open beside either is reported here and not there; a client showing which workflow run a person should look at reads it here. Null when no escalation is open, a built-in workflow's included.
+   */
+  escalation: {
+    /**
+     * The escalated run's id.
+     */
+    id: string;
+    /**
+     * When the run escalated.
+     */
+    since: string;
+  } | null;
+  /**
    * The most recently created turn that reached a terminal state; null when none has.
    */
   lastRun: {

@@ -65,7 +65,8 @@ function SessionWorkspace() {
   })
   const stream = useSessionStream(sessionId)
   const model = useMemo(() => buildTimelineModel(stream.events), [stream.events])
-  const sandboxModel = useMemo(() => buildSandboxRailModel(stream.events, parseSandboxSnapshot(stream.sandboxState)), [stream.events, stream.sandboxState])
+  const sandboxSnapshot = useMemo(() => parseSandboxSnapshot(stream.sandboxState), [stream.sandboxState])
+  const sandboxModel = useMemo(() => buildSandboxRailModel(stream.events, sandboxSnapshot), [stream.events, sandboxSnapshot])
   const costModel = useMemo(() => buildCostRollup(stream.events), [stream.events])
   const participants = useMemo(() => parseParticipants(stream.participantsState), [stream.participantsState])
   const correlationId = useMemo(() => parseSessionCorrelationId(stream.correlationIdState), [stream.correlationIdState])
@@ -116,7 +117,7 @@ function SessionWorkspace() {
               sessionId={sessionId}
               model={model}
               bootPhase={model.latestBootPhase}
-              sawReady={model.sawReady}
+              sandboxStatus={sandboxSnapshot?.status ?? null}
               sessionStatus={sessionQuery.data.status}
             />
             <Composer sessionId={sessionId} sandboxStatus={sandboxModel.status} hasOpenTurn={hasOpenTurn} />
@@ -132,19 +133,20 @@ function SessionTimelineBody({
   sessionId,
   model,
   bootPhase,
-  sawReady,
+  sandboxStatus,
   sessionStatus,
 }: {
   sessionId: string
   model: ReturnType<typeof buildTimelineModel>
   bootPhase: string | null
-  sawReady: boolean
+  /** The server's sandbox status (the stream's snapshot), never inferred from the event log -- see isStillBooting. */
+  sandboxStatus: string | null
   sessionStatus: Session['status']
 }) {
   const hasContent = model.turns.length > 0 || model.warnings.length > 0 || model.errors.length > 0
 
   if (!hasContent) {
-    if (isStillBooting(sessionStatus, sawReady)) {
+    if (isStillBooting(sessionStatus, sandboxStatus)) {
       return (
         <div className="session-state" aria-live="polite">
           <p>{bootPhase ? `Sandbox is booting — ${bootPhase}…` : 'Sandbox is booting…'}</p>

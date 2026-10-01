@@ -2,65 +2,63 @@
 // §12.2's own "sandbox rail (transitions, gen, fingerprint, boot phases,
 // artifacts, cost incl. sub-task roll-up)": the pure model builder behind
 // SessionRail.tsx's "Sandbox" and "Boot progress" panels. Combines
-// sandboxSnapshot.ts's own one-shot WS snapshot (real, authoritative, but
-// only refreshed on (re)subscribe) with this session's own live event log
-// (boot_progress/ready/error, refreshed continuously) -- the same
-// "REST/snapshot base + WS-derived overlay" shape SessionHeader.tsx
-// already uses for session.title vs. model.latestTitle, applied here to
-// sandbox status instead.
+// sandboxSnapshot.ts's sandbox row as the server holds it (the subscribe
+// reply's, then every fetch_history reply's -- ws/sessionStream.ts) with
+// this session's own event log, read for WHEN things happened.
 //
 // # What this module can and cannot honestly show (documented, not
 // silently gapped -- this codebase's own established convention,
 // sessionStatus.ts's BOOT_TOTAL comment is the precedent)
 //
-// - status/gen/lastSeenAt: REAL. gen and "last seen" are derived
-//   generically -- every sandbox-ws event carries its own `gen` field
-//   (verified directly against contracts/sandbox-ws/v1/events.schema.json:
-//   every one of its 20 event $defs requires `gen`), so the most recent
-//   event of ANY type is a valid, honest proxy for "last seen" (§3.2's own
-//   heartbeat-updated last_seen_at column, approximated the same way
-//   sessionStatus.ts's own BOOT_TOTAL already approximates a different
-//   field this codebase doesn't persist a finer-grained version of).
-// - boot phases with durations: REAL, computed from consecutive
-//   boot_progress event timestamps (each phase's duration = the next
-//   phase's -- or 'ready''s -- own timestamp minus this phase's own). Not
-//   sourced from the separate `boot_timing` event (real pre-measured
-//   seconds, §33.1) -- deliberately deferred: boot_progress phases alone
-//   already satisfy "boot phases with durations" honestly, and boot_timing
-//   only covers 4 fixed metrics, not every named phase boot_progress
-//   itself reports. A precision upgrade, not a gap in what this Step ships.
-// - transitions: REAL but coarser than the mockup's own idealized
-//   4-stage "spawning -> connecting -> booting -> ready" chain. No client-
-//   visible source reports THOSE coarse lifecycle-stage transitions live
-//   (sandbox_history, migrations/000007, is provably unpopulated by any
-//   real code path today -- confirmed by reading every call site of the
-//   pure internal/domain/sandbox.Transition function; every one commits
-//   only sandboxes.status, never a history row). What IS real and shown
-//   here instead: this session's own boot_progress/ready/error events,
-//   each with its genuine server timestamp -- a richer, more specific
-//   signal than the mockup's abstract stage names, just not the same
-//   granularity. Labeled in the UI as observed from this session's own
-//   events, never claimed as the authoritative transition ledger.
-// - runtime fingerprint (agentVersion/imageDigest): REAL, sourced from
+// - status: the SERVER's, from the snapshot alone -- never inferred from
+//   an event. Technical plan §3.2 keeps a sandbox `booting` after the
+//   agent's `ready` (the first event of every connection) until the same
+//   generation has shown boot evidence and a heartbeat reports a null
+//   phase; nor does an agent's `boot_progress` or fatal `error` move it.
+//   An event-derived status read a sandbox still cloning as ready. The
+//   snapshot follows the server: the control plane broadcasts a
+//   sandbox_status event whenever it changes the status, and the
+//   fetch_history reply that broadcast prompts carries the new row.
+// - gen: the highest the server or the agent has reported -- the snapshot,
+//   the agent's events (every sandbox-ws event carries its own `gen`,
+//   contracts/sandbox-ws/v1/events.schema.json), the sandbox_status events.
+//   A generation only ever grows, so the highest is the current one.
+// - lastSeenAt: the most recent AGENT event of any type, or the snapshot's
+//   before any -- §3.2's own last_seen_at, approximated. A sandbox_status
+//   event is the server's, not a sign of life, and its gen sits under
+//   `sandbox` so this never reads it as one.
+// - boot phases with durations: REAL, from consecutive boot_progress event
+//   timestamps. A phase ends at the next phase, or when the server reports
+//   a status that ends the boot (a sandbox_status event,
+//   sandboxSnapshot.ts's endsBootPhase) -- never at the agent's `ready`,
+//   which comes before the boot. A phase still open when the server's
+//   status says the boot is over (a boot that ended before the server
+//   reported its changes) is shown finished, its duration unknown. Not
+//   sourced from `boot_timing` (pre-measured seconds, §33.1): it covers
+//   four fixed metrics, not every named phase.
+// - transitions: this session's own boot_progress / ready / error events
+//   and the server's own sandbox_status events, each at its real server
+//   timestamp -- the agent's connection labelled as such, never as ready,
+//   and the server's coarse lifecycle (spawning, connecting, booting,
+//   ready, ...) as it reported it. A session whose sandbox changed status
+//   before the control plane reported changes shows only the events it
+//   has.
+// - runtime fingerprint (agentVersion/imageDigest): REAL, from the
 //   snapshot ONLY (state.sandbox's own agentVersion/imageDigest,
-//   sandboxWireMap) -- never event-log-derived, because no CLIENT-visible
-//   event carries it (sandbox-ws's own "ready" event does, §12.2 item 1,
-//   but that fact reaches the browser only via the persisted sandboxes
-//   row this snapshot already reads). Null until this gen's own first
-//   "ready" event has landed server-side, or after a respawn resets it
-//   (client.go's own UpsertSandboxForSpawn doc comment) -- SessionRail.tsx
-//   renders an honest "not reported yet" for that window, never a stale
-//   previous-gen value.
+//   sandboxWireMap) -- no client-visible event carries it (sandbox-ws's
+//   own "ready" event does, §12.2 item 1, but that fact reaches the
+//   browser only via the persisted sandboxes row). Null until this gen's
+//   own first "ready" event has landed server-side, or after a respawn
+//   resets it (client.go's own UpsertSandboxForSpawn doc comment) --
+//   SessionRail.tsx renders an honest "not reported yet" for that window.
 // - correlation id: a SEPARATE, per-request concept -- see
-//   sessionCorrelationId.ts, not this module. Deliberately not folded into
-//   SandboxRailModel alongside the fingerprint above even though both
-//   render in the same rail panel: a fingerprint is a property of the
-//   sandbox (this gen, stable for its whole life); a correlation id names
-//   a REQUEST (this session's latest turn), a materially different
-//   lifetime forcing the two into one shape would obscure.
+//   sessionCorrelationId.ts, not this module. A fingerprint is a property
+//   of the sandbox (this gen, stable for its whole life); a correlation id
+//   names a REQUEST (this session's latest turn).
 import type { EventEnvelope } from '../ws/types'
 import { isPlainObject } from '../ws/util'
 import { asBootProgress, asReady, asSandboxError } from './eventPayloads'
+import { asSandboxStatusChange, endsBootPhase } from './sandboxSnapshot'
 import type { SandboxSnapshot } from './sandboxSnapshot'
 
 /** shortDigest truncates an image digest for display -- mirrors SessionRail.tsx's own ArtifactRow's established `sha.slice(0, 7)` short-SHA convention, but strips a leading "algo:" prefix first (e.g. "sha256:") when present, since truncating THAT unchanged would just show the algorithm name, never any of the digest itself. */
@@ -78,10 +76,12 @@ export function runtimeLabel(agentVersion: string | null, imageDigest: string | 
 export interface BootPhase {
   phase: string
   startedAt: string
-  /** Null while this is the most recently reported phase and nothing later (another phase, or 'ready') has arrived yet to bound its end. */
+  /** When the phase ended: the next phase, or the server's sandbox_status ending the boot. Null while the phase is still open, and for a phase the server's status shows over without saying when (see `open`). */
   endedAt: string | null
-  /** Null while still open (endedAt is null) -- see endedAt's own doc comment. */
+  /** The phase's duration, null whenever endedAt is. */
   seconds: number | null
+  /** True while this phase is still running: the latest one, and the server has not reported a status that ends the boot. */
+  open: boolean
 }
 
 export interface SandboxTransition {
@@ -93,7 +93,7 @@ export interface SandboxTransition {
 }
 
 export interface SandboxRailModel {
-  /** Matches sandbox_status verbatim when known; null when this session has no observed sandbox at all yet (sessionSnapshot null AND no gen-bearing event ever seen). */
+  /** The server's sandbox_status, verbatim, from the snapshot alone; null when the server has reported no sandbox (yet). */
   status: string | null
   gen: number | null
   lastSeenAt: string | null
@@ -112,8 +112,14 @@ function extractGen(payload: unknown): number | null {
   return typeof payload.gen === 'number' ? payload.gen : null
 }
 
+function transitionTone(status: string): SandboxTransition['tone'] {
+  if (status === 'ready') return 'ok'
+  if (status === 'failed') return 'crit'
+  if (status === 'suspect') return 'warn'
+  return 'neutral'
+}
+
 export function buildSandboxRailModel(events: readonly EventEnvelope[], snapshot: SandboxSnapshot | null): SandboxRailModel {
-  let status: string | null = snapshot?.status ?? null
   let gen: number | null = snapshot?.gen ?? null
   let lastSeenAt: string | null = snapshot?.lastSeenAt ?? null
   let hasSandbox = snapshot !== null
@@ -127,41 +133,52 @@ export function buildSandboxRailModel(events: readonly EventEnvelope[], snapshot
     openPhase.endedAt = at
     const ms = new Date(at).getTime() - new Date(openPhase.startedAt).getTime()
     openPhase.seconds = Number.isFinite(ms) && ms >= 0 ? ms / 1000 : null
+    openPhase.open = false
     openPhase = null
   }
 
+  function seeGen(next: number): void {
+    gen = gen === null ? next : Math.max(gen, next)
+    hasSandbox = true
+  }
+
   for (const event of events) {
+    // The server's own report of a status change: where a boot phase
+    // ends, and a transition at the server's own timestamp. Never the
+    // rail's status, which is the snapshot's (this file's top comment).
+    const change = asSandboxStatusChange(event)
+    if (change !== null) {
+      seeGen(change.gen)
+      if (endsBootPhase(change.status)) closeOpenPhase(event.createdAt)
+      transitions.push({ id: `status:${event.id}`, label: change.status, at: event.createdAt, tone: transitionTone(change.status) })
+      continue
+    }
+
     const eventGen = extractGen(event.payload)
     if (eventGen !== null) {
-      gen = eventGen
-      hasSandbox = true
+      seeGen(eventGen)
       lastSeenAt = event.createdAt
     }
 
     const bootProgress = asBootProgress(event)
     if (bootProgress !== null) {
       closeOpenPhase(event.createdAt)
-      openPhase = { phase: bootProgress.phase, startedAt: event.createdAt, endedAt: null, seconds: null }
+      openPhase = { phase: bootProgress.phase, startedAt: event.createdAt, endedAt: null, seconds: null, open: true }
       bootPhases.push(openPhase)
-      status = 'booting'
       transitions.push({ id: `boot:${event.id}`, label: bootProgress.phase, at: event.createdAt, tone: 'neutral' })
       continue
     }
 
-    const ready = asReady(event)
-    if (ready !== null) {
-      closeOpenPhase(event.createdAt)
-      status = 'ready'
-      transitions.push({ id: `ready:${event.id}`, label: 'ready', at: event.createdAt, tone: 'ok' })
+    // The agent's `ready` is its connection coming up, ahead of its boot
+    // (the sandbox-ws contract): it neither ends a phase nor makes the
+    // sandbox ready -- the server says when that is.
+    if (asReady(event) !== null) {
+      transitions.push({ id: `ready:${event.id}`, label: 'agent connected', at: event.createdAt, tone: 'neutral' })
       continue
     }
 
     const sandboxError = asSandboxError(event)
     if (sandboxError !== null) {
-      if (sandboxError.fatal) {
-        closeOpenPhase(event.createdAt)
-        status = 'failed'
-      }
       transitions.push({
         id: `error:${event.id}`,
         label: sandboxError.fatal ? `error: ${sandboxError.message}` : `warning: ${sandboxError.message}`,
@@ -172,8 +189,16 @@ export function buildSandboxRailModel(events: readonly EventEnvelope[], snapshot
     }
   }
 
+  // A phase still open while the server's status says the boot is over:
+  // it ended, at a moment no sandbox_status event of this log records (a
+  // boot the server finished before it reported its changes).
+  const lastPhase: BootPhase | null = openPhase
+  if (lastPhase !== null && snapshot !== null && endsBootPhase(snapshot.status)) {
+    lastPhase.open = false
+  }
+
   return {
-    status,
+    status: snapshot?.status ?? null,
     gen,
     lastSeenAt,
     bootPhases,

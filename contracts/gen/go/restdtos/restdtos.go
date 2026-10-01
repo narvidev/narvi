@@ -11586,6 +11586,16 @@ type SessionActivity struct {
 	// first, then a workflow step, then an escalated workflow run.
 	Awaiting *SessionActivityAwaiting `json:"awaiting" yaml:"awaiting" mapstructure:"awaiting"`
 
+	// The session's open workflow escalation, whatever awaiting reports: a custom
+	// workflow's run escalated for review, open under exactly the rule awaiting.kind
+	// 'workflow_escalation' states -- while it is the session's newest workflow run,
+	// ran an attempt of its own, and no turn other than its own attempts has been
+	// created since it escalated. awaiting names one gate, a plan or a workflow step
+	// before an escalation, so an escalation open beside either is reported here and
+	// not there; a client showing which workflow run a person should look at reads it
+	// here. Null when no escalation is open, a built-in workflow's included.
+	Escalation *SessionActivityEscalation `json:"escalation" yaml:"escalation" mapstructure:"escalation"`
+
 	// The turn dispatched to a sandbox or being processed; null when none is.
 	InFlightTurn *SessionActivityInFlightTurn `json:"inFlightTurn" yaml:"inFlightTurn" mapstructure:"inFlightTurn"`
 
@@ -11754,6 +11764,43 @@ func (j *SessionActivityAwaiting) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = SessionActivityAwaiting(plain)
+	return nil
+}
+
+// The session's open workflow escalation, whatever awaiting reports: a custom
+// workflow's run escalated for review, open under exactly the rule awaiting.kind
+// 'workflow_escalation' states -- while it is the session's newest workflow run,
+// ran an attempt of its own, and no turn other than its own attempts has been
+// created since it escalated. awaiting names one gate, a plan or a workflow step
+// before an escalation, so an escalation open beside either is reported here and
+// not there; a client showing which workflow run a person should look at reads it
+// here. Null when no escalation is open, a built-in workflow's included.
+type SessionActivityEscalation struct {
+	// The escalated run's id.
+	Id string `json:"id" yaml:"id" mapstructure:"id"`
+
+	// When the run escalated.
+	Since time.Time `json:"since" yaml:"since" mapstructure:"since"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityEscalation) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["id"]; raw != nil && !ok {
+		return fmt.Errorf("field id in SessionActivityEscalation: required")
+	}
+	if _, ok := raw["since"]; raw != nil && !ok {
+		return fmt.Errorf("field since in SessionActivityEscalation: required")
+	}
+	type Plain SessionActivityEscalation
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionActivityEscalation(plain)
 	return nil
 }
 
@@ -12090,6 +12137,9 @@ func (j *SessionActivity) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["awaiting"]; raw != nil && !ok {
 		return fmt.Errorf("field awaiting in SessionActivity: required")
+	}
+	if _, ok := raw["escalation"]; raw != nil && !ok {
+		return fmt.Errorf("field escalation in SessionActivity: required")
 	}
 	if _, ok := raw["inFlightTurn"]; raw != nil && !ok {
 		return fmt.Errorf("field inFlightTurn in SessionActivity: required")
@@ -15848,16 +15898,10 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
-
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
 // exists before any turn does.
 type WorkflowStepRunTurnId *string
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
-type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
@@ -15915,3 +15959,9 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	*j = WorkflowStepRun(plain)
 	return nil
 }
+
+type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
+
+type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict

@@ -63,17 +63,24 @@ export function deriveBootProgress(sandboxStatus: string | null): { index: numbe
 /**
  * isStillBooting reports whether an EMPTY timeline (no turns/warnings/
  * errors folded yet, timelineModel.ts's own hasContent check) should read
- * as "sandbox is booting" rather than a plain "no events yet" -- true
- * only while the session itself could plausibly still be booting
- * (created/active, and no 'ready' event has been seen yet). A completed/
- * cancelled/failed session with zero events has no boot in progress at
- * all (its sandbox is long gone) and must never claim otherwise -- caught
- * live during this Step's own browser verification pass: a seeded
- * 'completed' session with no events rendered "Sandbox is booting…"
- * before this check existed.
+ * as "sandbox is booting" rather than a plain "no events yet" -- from the
+ * sandbox status the SERVER derives (sandboxSnapshot.ts's snapshot, which
+ * follows every change, ws/sessionStream.ts), never from the event log:
+ * technical plan §3.2 keeps a sandbox `booting` after the agent's `ready`
+ * until its boot has run and a heartbeat reports a null phase, and an
+ * agent dials before it clones. True while the session itself can still
+ * be booting (created/active) and the server's status is a pre-ready
+ * stage (pending, spawning, connecting, booting -- deriveBootProgress's
+ * own set), or the server has reported no sandbox yet: the session's
+ * first turn spawns one. A completed/cancelled/failed session with zero
+ * events has no boot in progress at all (its sandbox is long gone) and
+ * must never claim otherwise -- caught live during the original browser
+ * verification pass: a seeded 'completed' session with no events
+ * rendered "Sandbox is booting…" before this check existed.
  */
-export function isStillBooting(sessionStatus: Session['status'], sawReady: boolean): boolean {
-  return !sawReady && (sessionStatus === 'created' || sessionStatus === 'active')
+export function isStillBooting(sessionStatus: Session['status'], sandboxStatus: string | null): boolean {
+  if (sessionStatus !== 'created' && sessionStatus !== 'active') return false
+  return sandboxStatus === null || deriveBootProgress(sandboxStatus) !== null
 }
 
 /**

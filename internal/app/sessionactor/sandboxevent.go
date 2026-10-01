@@ -341,7 +341,7 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 				a.logger.Warn("sessionactor: suspect recovery rejected; leaving sandbox suspect",
 					"pre_suspect_status", *row.PreSuspectStatus, "error", recErr)
 			} else {
-				recovered, err := a.stores.sandbox.WithTx(tx).RecoverFromSuspect(ctx, sqlcgen.RecoverSandboxFromSuspectParams{
+				recovered, err := a.sandboxWrites(tx).RecoverFromSuspect(ctx, sqlcgen.RecoverSandboxFromSuspectParams{
 					SessionID:  a.sessionID,
 					Status:     sqlcgen.SandboxStatus(recoveredTo),
 					LastSeenAt: pgtype.Timestamptz{Time: now, Valid: true},
@@ -448,7 +448,7 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// takes when this SAME event names no further transition of its
 		// own: still persisted, liveness bumped.
 
-		if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+		if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 			SessionID:    a.sessionID,
 			Status:       target,
 			LastSeenAt:   pgtype.Timestamptz{Time: now, Valid: true},
@@ -874,7 +874,7 @@ func (a *Actor) handleSnapshotReadyEvent(ctx context.Context, tx pgx.Tx, row sql
 	if err != nil {
 		return fmt.Errorf("sessionactor: sandbox transition snapshotting->ready (snapshot_ready): %w", err)
 	}
-	if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+	if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 		SessionID: a.sessionID,
 		Status:    sqlcgen.SandboxStatus(to),
 	}); err != nil {
@@ -953,7 +953,7 @@ func (a *Actor) revertSnapshotToReady(ctx context.Context, tx pgx.Tx, row sqlcge
 	if err != nil {
 		return fmt.Errorf("sessionactor: sandbox transition snapshotting->ready (revert): %w", err)
 	}
-	if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+	if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 		SessionID: a.sessionID,
 		Status:    sqlcgen.SandboxStatus(to),
 	}); err != nil {
@@ -1123,7 +1123,7 @@ func (a *Actor) triggerSnapshotBestEffort(ctx context.Context) {
 		if err != nil {
 			return fmt.Errorf("sessionactor: sandbox transition ready->snapshotting: %w", err)
 		}
-		if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+		if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 			SessionID: a.sessionID,
 			Status:    sqlcgen.SandboxStatus(to),
 		}); err != nil {

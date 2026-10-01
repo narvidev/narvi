@@ -11,7 +11,7 @@
 // that was taken. edgeToNext/buildStepRunSequence below are that
 // derivation, kept pure and unit-testable so the logic has one home instead
 // of being inlined into the view.
-import type { WorkflowRun, WorkflowStepRun } from '@narvi/contracts/rest-dtos'
+import type { SessionActivity, WorkflowRun, WorkflowStepRun } from '@narvi/contracts/rest-dtos'
 import { formatUsd } from './money'
 
 import { canActOnPlan } from './planFormat'
@@ -57,19 +57,76 @@ export function runStatusLabel(status: WorkflowRun['status']): string {
 }
 
 /**
- * featuredRun picks the run WorkflowRunsView.tsx should feature: the
- * currently active one (running, or parked needs_review awaiting a human)
- * if there is one, otherwise the most recently created run. Mirrors
- * planFormat.ts's own latestPlan (prefer the actionable version, else the
- * newest) one level up: a session, not a single document, and `runs` is
- * already server-sorted newest-first (ListWorkflowRunsForSession's own
- * ORDER BY created_at DESC) so the fallback never re-sorts.
+ * liveEscalationRunId reads, from the session's status (GET
+ * /api/sessions/{id}/status, SessionActivity), the run whose escalation
+ * is still open -- the server's rule, technical plan §43.20: a custom
+ * workflow's run escalated to needs_review, while it is the session's
+ * newest run, ran an attempt of its own, and no turn other than its own
+ * attempts has been created since it escalated. needs_review is never
+ * left (the next turn starts a fresh run beside the parked one), so the
+ * run's own status cannot tell a live escalation from a parked one; this
+ * client never re-derives the rule, it reads `escalation`, which the
+ * server reports whatever gate `awaiting` names first. A server older
+ * than that field leaves it out; its `awaiting` then names the escalation
+ * when no plan or workflow step is open before it. Null without a status
+ * read yet, or with no escalation open.
  */
-export function featuredRun(runs: readonly WorkflowRun[]): WorkflowRun | null {
-  if (runs.length === 0) return null
-  const active = runs.find((r) => r.status === 'running' || r.status === 'needs_review')
-  if (active) return active
-  return runs[0]
+export function liveEscalationRunId(activity: SessionActivity | null | undefined): string | null {
+  if (!activity) return null
+  if (activity.escalation !== undefined) return activity.escalation?.id ?? null
+  return activity.awaiting?.kind === 'workflow_escalation' ? activity.awaiting.id : null
+}
+
+/**
+ * isLiveRun reports whether a run can still change, so WorkflowRunsView.tsx
+ * features it and re-reads it: a run still running (its step's turn, or a
+ * step awaiting a person's decision), or the live escalation above. A
+ * needs_review run that is not the live escalation is parked for good:
+ * nothing moves it again, and re-reading it would fetch an immutable
+ * document every few seconds.
+ */
+export function isLiveRun(run: WorkflowRun, liveEscalationId: string | null): boolean {
+  return run.status === 'running' || run.id === liveEscalationId
+}
+
+/**
+ * WORKFLOW_RUN_POLL_MS is how often a live run is re-read. Matches the
+ * cadence the other live surfaces in this app already use, so an operator
+ * watching two screens does not see them disagree about how current they
+ * are. Deliberately a plain client-side interval and not a websocket
+ * subscription: the run read model changes on the order of a turn, not a
+ * token, and a second realtime channel is a mechanism this screen does not
+ * need to justify.
+ */
+export const WORKFLOW_RUN_POLL_MS = 15_000
+
+/**
+ * runRefetchInterval is how often WorkflowRunsView.tsx re-reads the run it
+ * shows: every WORKFLOW_RUN_POLL_MS while the run can still move
+ * (isLiveRun), never otherwise. A completed, failed or cancelled run is
+ * finished changing, and so is a parked escalation -- needs_review is
+ * never left -- so polling either would be a request every few seconds
+ * for a document that is now immutable, the operator's own pick from the
+ * run history included.
+ */
+export function runRefetchInterval(run: WorkflowRun | null, liveEscalationId: string | null): number | false {
+  return run !== null && isLiveRun(run, liveEscalationId) ? WORKFLOW_RUN_POLL_MS : false
+}
+
+/**
+ * featuredRun picks the run WorkflowRunsView.tsx features: the newest live
+ * one (isLiveRun) if there is one, otherwise the newest run that is not a
+ * parked escalation. A parked escalation -- needs_review, and not the live
+ * escalation the status surface reports -- stays listed in the rail and is
+ * never featured: a later run, finished or not, is what the session did
+ * next. Null when every run is a parked escalation, or there is none.
+ * `runs` is already server-sorted newest-first (ListWorkflowRunsForSession's
+ * own ORDER BY created_at DESC), so nothing here re-sorts.
+ */
+export function featuredRun(runs: readonly WorkflowRun[], liveEscalationId: string | null): WorkflowRun | null {
+  const live = runs.find((r) => isLiveRun(r, liveEscalationId))
+  if (live) return live
+  return runs.find((r) => r.status !== 'needs_review') ?? null
 }
 
 /**
@@ -88,6 +145,26 @@ export function featuredRun(runs: readonly WorkflowRun[]): WorkflowRun | null {
  */
 export const NEEDS_REVIEW_EXPLANATION =
   "Automatic progress on this run has stopped: either a bounded retry reached its limit, or a step's outcome had no automatic next step configured. Nothing further happens on this run automatically, and there is no retry action here."
+
+/** ESCALATION_OPEN_NOTE: the live escalation's own gate -- what answers it. */
+export const ESCALATION_OPEN_NOTE = 'It is waiting on a person: new work sent to the session -- a message, a mention, a plan approval -- answers it and starts a fresh run.'
+
+/** ESCALATION_CLOSED_NOTE: a parked escalation nothing waits on any more. */
+export const ESCALATION_CLOSED_NOTE = 'Nothing waits on it any more: the session has moved on since it escalated, or it belongs to a built-in workflow, which no person acts on.'
+
+/**
+ * escalationNotice is the banner a run parked at needs_review with no
+ * attempt awaiting a decision shows: NEEDS_REVIEW_EXPLANATION, then whether
+ * the escalation still waits on a person -- the live escalation the
+ * status surface reports (liveEscalationRunId), which new work sent to the
+ * session answers (technical plan §43.20) -- or no longer does. Null for
+ * any other run.
+ */
+export function escalationNotice(run: WorkflowRun, liveEscalationId: string | null): string | null {
+  if (run.status !== 'needs_review') return null
+  const note = run.id === liveEscalationId ? ESCALATION_OPEN_NOTE : ESCALATION_CLOSED_NOTE
+  return `${NEEDS_REVIEW_EXPLANATION} ${note}`
+}
 
 // -- step-attempt-level status ------------------------------------------
 

@@ -201,16 +201,34 @@ describe('buildTimelineModel', () => {
     expect(model.turns[0]!.steps[0]!.cost).not.toBeNull()
   })
 
-  it('tracks the latest boot_progress phase and clears it once ready is seen (the "session still booting" empty-state signal)', () => {
-    const events = [env('boot_progress', { messageId: 'm1', phase: 'installing deps', timestamp: '2026-08-20T10:00:00Z' })]
-    let model = buildTimelineModel(events)
-    expect(model.latestBootPhase).toBe('installing deps')
-    expect(model.sawReady).toBe(false)
-    expect(model.turns).toEqual([]) // session-lifecycle events never open a turn
-
-    model = buildTimelineModel([...events, env('ready', { messageId: 'm2', timestamp: '2026-08-20T10:01:00Z' })])
-    expect(model.sawReady).toBe(true)
-    expect(model.latestBootPhase).toBeNull()
+  // Technical plan §3.2: the agent's `ready` is the first event of its
+  // connection, ahead of the clone, the git-dir sync and the hooks; the
+  // server keeps the sandbox booting until boot evidence and a null-phase
+  // heartbeat, and says so with a sandbox_status event. Reading the boot as
+  // over at `ready` again makes the "ready ends nothing" row fail.
+  describe('latestBootPhase: the phase the "session still booting" empty state names', () => {
+    const phase = (p: string) => env('boot_progress', { messageId: `bp-${p}`, gen: 1, phase: p })
+    const ready = () => env('ready', { messageId: 'r', gen: 1 })
+    const status = (s: string, gen = 1) => env('sandbox_status', { sandbox: { gen, status: s } })
+    const cases: { name: string; events: () => EventEnvelope[]; want: string | null }[] = [
+      { name: 'none reported', events: () => [], want: null },
+      { name: 'the latest boot_progress phase', events: () => [phase('clone'), phase('installing deps')], want: 'installing deps' },
+      { name: 'the agent\'s ready ends nothing: it comes before the boot', events: () => [ready(), phase('clone')], want: 'clone' },
+      { name: 'a ready after the phase ends nothing either (a reconnect mid-boot)', events: () => [phase('clone'), ready()], want: 'clone' },
+      { name: 'the server reporting booting keeps it', events: () => [phase('clone'), status('booting')], want: 'clone' },
+      { name: 'the server reporting suspect keeps it: a liveness doubt, not the end of the boot', events: () => [phase('clone'), status('suspect')], want: 'clone' },
+      { name: 'the server reporting ready ends it', events: () => [phase('clone'), status('ready')], want: null },
+      { name: 'the server reporting failed ends it', events: () => [phase('clone'), status('failed')], want: null },
+      { name: 'a new generation starts over', events: () => [phase('clone'), status('stopped'), status('spawning', 2), phase('deps')], want: 'deps' },
+      { name: 'a malformed sandbox_status ends nothing', events: () => [phase('clone'), env('sandbox_status', { status: 'ready' })], want: 'clone' },
+    ]
+    for (const c of cases) {
+      it(c.name, () => {
+        const model = buildTimelineModel(c.events())
+        expect(model.latestBootPhase).toBe(c.want)
+        expect(model.turns).toEqual([]) // session-lifecycle events never open a turn
+      })
+    }
   })
 
   it('does not treat an artifact event as a turn-opening event and does not throw on a very large tool_call input', () => {

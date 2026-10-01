@@ -10,6 +10,39 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.16.0]
+
+### client-ws/v1/protocol.schema.json
+
+- Added: `FetchHistoryResponse.sandbox` (required, an object or null): the
+  session's sandbox as the control plane holds it when the reply is
+  assembled, in `SubscribedPayload.state.sandbox`'s shape; null when the
+  session has no sandbox yet. The control plane now stores and broadcasts a
+  `sandbox_status` event (payload `{"sandbox": {"gen", "status"}}`) in the
+  transaction of every change of the sandbox's status or generation, so the
+  `fetch_history` that broadcast prompts brings an open page the status the
+  server derives (technical plan §3.2, §6.2) without a resubscribe. A
+  required property added to a platform-produced shape grades MINOR (row 3).
+  A client that predates it ignores the property, and skips the event as a
+  type it does not know; a stored event's payload is outside this policy
+  (`SubscribedPayload.events` elements), and this one keeps its values under
+  `sandbox`, never at the top level, so a reader of an agent event's
+  top-level `gen` never takes it for one.
+- Unchanged: `SubscribeRequest`, `SubscribedPayload`, `FetchHistoryRequest`.
+
+### rest/v1/dtos.schema.json
+
+- Added: `SessionActivity.escalation` (required, object or null: `id`, the
+  escalated run's, and `since`), the workflow escalation still open under
+  `awaiting.kind` `workflow_escalation`'s rule, reported whatever gate
+  `awaiting` names first (technical plan §43.20): an escalation open beside
+  a plan awaiting approval or a workflow step awaiting a decision is not in
+  `awaiting`, and a client showing which workflow run a person should look
+  at reads it here. A required property added to a platform-produced shape
+  grades MINOR (row 3). The MCP status and wait tools' output schemas carry
+  it (`internal/adapters/inbound/mcp/testdata/tools.golden.json`).
+- Unchanged: no route, no enum, no other `$def`.
+
 ## [1.15.0]
 
 ### rest/v1/dtos.schema.json

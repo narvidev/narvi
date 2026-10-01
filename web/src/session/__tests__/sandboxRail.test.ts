@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { EventEnvelope } from '../../ws/types'
 import { buildSandboxRailModel, runtimeLabel, shortDigest } from '../sandboxRail'
+import type { BootPhase } from '../sandboxRail'
 import type { SandboxSnapshot } from '../sandboxSnapshot'
 
 function ev(id: number, type: string, payload: unknown, createdAt: string): EventEnvelope {
@@ -66,37 +67,126 @@ describe('buildSandboxRailModel', () => {
     expect(model.imageDigest).toBeNull()
   })
 
-  it('boot_progress events accumulate as phases with real, computed durations, and set status booting', () => {
+  it('boot_progress events accumulate as phases with real, computed durations, and never set the status', () => {
     const events: EventEnvelope[] = [
       ev(1, 'boot_progress', { type: 'boot_progress', messageId: 'm1', sessionId: 's', gen: 1, phase: 'clone', timestamp: 'x' }, '2026-08-20T10:00:00.000Z'),
       ev(2, 'boot_progress', { type: 'boot_progress', messageId: 'm2', sessionId: 's', gen: 1, phase: 'deps', timestamp: 'x' }, '2026-08-20T10:00:03.500Z'),
     ]
     const model = buildSandboxRailModel(events, null)
-    expect(model.status).toBe('booting')
+    expect(model.status).toBeNull()
     expect(model.bootPhases).toHaveLength(2)
-    expect(model.bootPhases[0]).toMatchObject({ phase: 'clone', endedAt: '2026-08-20T10:00:03.500Z', seconds: 3.5 })
+    expect(model.bootPhases[0]).toMatchObject({ phase: 'clone', endedAt: '2026-08-20T10:00:03.500Z', seconds: 3.5, open: false })
     // Last phase stays open (no seconds yet) until something closes it.
-    expect(model.bootPhases[1]).toMatchObject({ phase: 'deps', endedAt: null, seconds: null })
+    expect(model.bootPhases[1]).toMatchObject({ phase: 'deps', endedAt: null, seconds: null, open: true })
     expect(model.transitions.map((t) => t.label)).toEqual(['clone', 'deps'])
   })
 
-  it('a ready event closes the last open phase and flips status to ready', () => {
-    const events: EventEnvelope[] = [
-      ev(1, 'boot_progress', { type: 'boot_progress', messageId: 'm1', sessionId: 's', gen: 1, phase: 'agent', timestamp: 'x' }, '2026-08-20T10:00:00.000Z'),
-      ev(2, 'ready', { type: 'ready', messageId: 'm2', sessionId: 's', gen: 1, timestamp: 'x' }, '2026-08-20T10:00:05.000Z'),
-    ]
-    const model = buildSandboxRailModel(events, null)
-    expect(model.status).toBe('ready')
-    expect(model.bootPhases[0]).toMatchObject({ endedAt: '2026-08-20T10:00:05.000Z', seconds: 5 })
-    expect(model.transitions.at(-1)).toMatchObject({ label: 'ready', tone: 'ok' })
-  })
+  // Technical plan §3.2: the agent's `ready` opens its connection, ahead
+  // of the clone, the git-dir sync and the hooks; the server keeps the
+  // sandbox booting until boot evidence and a null-phase heartbeat. The
+  // rail's status is the server's (the snapshot, which follows every
+  // change), and only the server's own sandbox_status event ends a phase.
+  // Reading the boot from `ready` again makes the first two rows fail.
+  describe('status and boot phases follow the server, never the agent\'s own events', () => {
+    const at = (s: number) => `2026-08-20T10:00:${String(s).padStart(2, '0')}.000Z`
+    const snap = (status: string, gen = 1): SandboxSnapshot => ({ id: 'sb-1', gen, status, lastSeenAt: null, createdAt: 'x', updatedAt: 'y', agentVersion: null, imageDigest: null })
+    const phase = (id: number, p: string, s: number) => ev(id, 'boot_progress', { type: 'boot_progress', messageId: `m${id}`, sessionId: 's', gen: 1, phase: p }, at(s))
+    const ready = (id: number, s: number) => ev(id, 'ready', { type: 'ready', messageId: `m${id}`, sessionId: 's', gen: 1 }, at(s))
+    const status = (id: number, st: string, s: number, gen = 1) => ev(id, 'sandbox_status', { sandbox: { gen, status: st } }, at(s))
+    const fatal = (id: number, s: number) => ev(id, 'error', { type: 'error', messageId: `m${id}`, sessionId: 's', gen: 1, ackId: `error:m${id}`, message: 'boom', fatal: true }, at(s))
 
-  it('a FATAL sandbox_error flips status to failed and tags the transition crit', () => {
-    const events: EventEnvelope[] = [ev(1, 'error', { type: 'error', messageId: 'm1', sessionId: 's', gen: 1, ackId: 'error:m1', message: 'boom', fatal: true }, '2026-08-20T10:00:00Z')]
-    const model = buildSandboxRailModel(events, null)
-    expect(model.status).toBe('failed')
-    expect(model.transitions[0]).toMatchObject({ tone: 'crit' })
-    expect(model.transitions[0]?.label).toContain('boom')
+    const cases: {
+      name: string
+      events: EventEnvelope[]
+      snapshot: SandboxSnapshot | null
+      wantStatus: string | null
+      wantPhases: Partial<BootPhase>[]
+      wantLabels: string[]
+    }[] = [
+      {
+        name: 'a ready after the phase neither closes it nor reads ready while the server says booting',
+        events: [phase(1, 'clone', 0), ready(2, 5)],
+        snapshot: snap('booting'),
+        wantStatus: 'booting',
+        wantPhases: [{ phase: 'clone', endedAt: null, seconds: null, open: true }],
+        wantLabels: ['clone', 'agent connected'],
+      },
+      {
+        name: 'the agent connected, then reported its phase: still booting',
+        events: [status(1, 'booting', 0), ready(2, 0), phase(3, 'clone', 1)],
+        snapshot: snap('booting'),
+        wantStatus: 'booting',
+        wantPhases: [{ phase: 'clone', open: true }],
+        wantLabels: ['booting', 'agent connected', 'clone'],
+      },
+      {
+        name: 'the server marking it ready closes the phase at its own time',
+        events: [phase(1, 'clone', 0), ready(2, 1), status(3, 'ready', 9)],
+        snapshot: snap('ready'),
+        wantStatus: 'ready',
+        wantPhases: [{ phase: 'clone', endedAt: at(9), seconds: 9, open: false }],
+        wantLabels: ['clone', 'agent connected', 'ready'],
+      },
+      {
+        name: 'suspect keeps the phase open: a liveness doubt, not the end of the boot',
+        events: [phase(1, 'clone', 0), status(2, 'suspect', 4)],
+        snapshot: snap('suspect'),
+        wantStatus: 'suspect',
+        wantPhases: [{ phase: 'clone', open: true }],
+        wantLabels: ['clone', 'suspect'],
+      },
+      {
+        name: 'a fatal agent error does not make the sandbox failed: the server says what it is',
+        events: [phase(1, 'clone', 0), fatal(2, 3)],
+        snapshot: snap('booting'),
+        wantStatus: 'booting',
+        wantPhases: [{ phase: 'clone', open: true }],
+        wantLabels: ['clone', 'error: boom'],
+      },
+      {
+        name: 'a phase the server shows over without saying when: finished, duration unknown',
+        events: [phase(1, 'clone', 0)],
+        snapshot: snap('ready'),
+        wantStatus: 'ready',
+        wantPhases: [{ phase: 'clone', endedAt: null, seconds: null, open: false }],
+        wantLabels: ['clone'],
+      },
+      {
+        name: 'no snapshot: no status, however many events',
+        events: [phase(1, 'clone', 0), ready(2, 1), status(3, 'ready', 2)],
+        snapshot: null,
+        wantStatus: null,
+        wantPhases: [{ phase: 'clone', endedAt: at(2), open: false }],
+        wantLabels: ['clone', 'agent connected', 'ready'],
+      },
+    ]
+    for (const c of cases) {
+      it(c.name, () => {
+        const model = buildSandboxRailModel(c.events, c.snapshot)
+        expect(model.status).toBe(c.wantStatus)
+        expect(model.bootPhases).toHaveLength(c.wantPhases.length)
+        c.wantPhases.forEach((want, i) => expect(model.bootPhases[i]).toMatchObject(want))
+        expect(model.transitions.map((t) => t.label)).toEqual(c.wantLabels)
+      })
+    }
+
+    it('tones the server\'s transitions: ready ok, failed crit, suspect warn, the rest neutral; the agent\'s connection is neutral, never ok', () => {
+      const model = buildSandboxRailModel([status(1, 'booting', 0), ready(2, 1), status(3, 'ready', 2), status(4, 'suspect', 3), status(5, 'failed', 4)], snap('failed'))
+      expect(model.transitions.map((t) => [t.label, t.tone])).toEqual([
+        ['booting', 'neutral'],
+        ['agent connected', 'neutral'],
+        ['ready', 'ok'],
+        ['suspect', 'warn'],
+        ['failed', 'crit'],
+      ])
+    })
+
+    it('a sandbox_status event reports the server\'s generation but is no sign of life: gen follows it, lastSeenAt does not', () => {
+      const model = buildSandboxRailModel([phase(1, 'clone', 0), status(2, 'spawning', 30, 2)], snap('ready'))
+      expect(model.gen).toBe(2)
+      expect(model.lastSeenAt).toBe(at(0))
+      expect(model.hasSandbox).toBe(true)
+    })
   })
 
   it('a NON-fatal sandbox_error is recorded but does not change status', () => {

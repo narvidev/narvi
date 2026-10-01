@@ -6120,7 +6120,7 @@
       "type": "object",
       "additionalProperties": false,
       "description": "GET /api/sessions/{sessionID}/status (technical plan §43.20): what one session's work is doing now, and how long to wait before reading it again. Derived at read time from the session's turn queue, a completed turn's push and pull request still under way, work the server holds that can create a turn on the session with no new input, and its human gates, all read in ONE database snapshot -- never from Session.status, which is re-derived only when a turn reaches a terminal state and so can hold any of its five values while a turn is queued or running. Carries no events and no transcript: the event history is GET /api/sessions/{sessionID}/events (EventsResponse), a separate, paginated read. With ?waitSeconds=N (a whole number of seconds; absent or 0 is the plain read, a negative or malformed value is a 400) the route waits, at most N seconds clamped to the deployment's maximum (25 as shipped), for the session to be settled, and answers the same shape with wait set: the snapshot it answers is its latest read.",
-      "required": ["sessionId", "activity", "settled", "pendingTurns", "inFlightTurn", "awaiting", "lastRun", "sandboxStatus", "archived", "suggestedDelaySeconds", "observedAt"],
+      "required": ["sessionId", "activity", "settled", "pendingTurns", "inFlightTurn", "awaiting", "escalation", "lastRun", "sandboxStatus", "archived", "suggestedDelaySeconds", "observedAt"],
       "properties": {
         "sessionId": {
           "type": "string",
@@ -6181,6 +6181,24 @@
               "type": "string",
               "format": "date-time",
               "description": "When the gate opened."
+            }
+          }
+        },
+        "escalation": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "The session's open workflow escalation, whatever awaiting reports: a custom workflow's run escalated for review, open under exactly the rule awaiting.kind 'workflow_escalation' states -- while it is the session's newest workflow run, ran an attempt of its own, and no turn other than its own attempts has been created since it escalated. awaiting names one gate, a plan or a workflow step before an escalation, so an escalation open beside either is reported here and not there; a client showing which workflow run a person should look at reads it here. Null when no escalation is open, a built-in workflow's included.",
+          "required": ["id", "since"],
+          "properties": {
+            "id": {
+              "type": "string",
+              "format": "uuid",
+              "description": "The escalated run's id."
+            },
+            "since": {
+              "type": "string",
+              "format": "date-time",
+              "description": "When the run escalated."
             }
           }
         },

@@ -198,6 +198,17 @@ type Actor struct {
 	// across separate commands or separate attempts.
 	pendingBroadcast []json.RawMessage
 
+	// sandboxCommitted is the sandbox's generation and status as of this
+	// actor's last committed sandbox write -- seeded from the row hydration
+	// read, nil when the session had no sandbox then -- and sandboxWritten
+	// the last one the CURRENT transact attempt wrote through
+	// sandboxWrites, nil when it wrote none. transact compares the two to
+	// append the sandbox_status event (sandboxstatus.go) in the same
+	// transaction, and promotes sandboxWritten only once that commits.
+	// Single-goroutine, like pendingBroadcast.
+	sandboxCommitted *sandboxStatusKey
+	sandboxWritten   *sandboxStatusKey
+
 	registry *Registry
 
 	// lockGen is the lock-connection generation this Actor's advisory lock
@@ -507,14 +518,28 @@ func (a *Actor) transact(ctx context.Context, fn func(ctx context.Context, tx pg
 		return ErrStaleEpoch
 	}
 
+	a.sandboxWritten = nil
 	if err := fn(ctx, tx); err != nil {
 		a.pendingBroadcast = nil
+		a.sandboxWritten = nil
+		return err
+	}
+	// The sandbox_status event commits with the write it reports (§2), and
+	// is broadcast with every other event below.
+	if err := a.appendSandboxStatusIfChanged(ctx, tx); err != nil {
+		a.pendingBroadcast = nil
+		a.sandboxWritten = nil
 		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		a.pendingBroadcast = nil
+		a.sandboxWritten = nil
 		return fmt.Errorf("sessionactor: transact: commit: %w", err)
+	}
+	if a.sandboxWritten != nil {
+		a.sandboxCommitted = a.sandboxWritten
+		a.sandboxWritten = nil
 	}
 
 	a.broadcastPending()

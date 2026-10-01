@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import type { WorkflowRun, WorkflowStepRun } from '@narvi/contracts/rest-dtos'
+import type { SessionActivity, WorkflowRun, WorkflowStepRun } from '@narvi/contracts/rest-dtos'
 
 import { canActOnPlan } from '../planFormat'
 import {
@@ -10,16 +10,23 @@ import {
   decisionLabel,
   edgeLabel,
   edgeToNext,
+  ESCALATION_CLOSED_NOTE,
+  ESCALATION_OPEN_NOTE,
+  escalationNotice,
   featuredRun,
   formatStepCost,
+  isLiveRun,
+  liveEscalationRunId,
   NEEDS_REVIEW_EXPLANATION,
   outcomeStatusLabel,
   outcomeStatusTone,
+  runRefetchInterval,
   runStatusLabel,
   runStatusTone,
   stepRunStatusLabel,
   stepRunStatusTone,
   totalKnownCost,
+  WORKFLOW_RUN_POLL_MS,
 } from '../workflowRunFormat'
 
 // Fixtures deliberately shaped exactly like what the server actually sends
@@ -150,21 +157,149 @@ describe('totalKnownCost', () => {
   })
 })
 
+// Technical plan §43.20: needs_review is never left, the next turn starts
+// a fresh run beside the parked one, and an escalation is live only while
+// the status surface reports it (SessionActivity.escalation). The view
+// features and re-reads a run by that rule, never by needs_review alone.
+// Featuring "the newest running or needs_review" again makes the parked
+// rows below fail; re-reading a parked run makes the isLiveRun rows fail.
 describe('featuredRun', () => {
-  it('returns null for an empty list', () => {
-    expect(featuredRun([])).toBeNull()
+  const cases: { name: string; runs: WorkflowRun[]; live: string | null; want: string | null }[] = [
+    { name: 'no runs', runs: [], live: null, want: null },
+    {
+      name: 'a parked needs_review followed by a completed run features the completed one',
+      runs: [baseRun({ id: 'done', status: 'completed', createdAt: '2026-08-20T02:00:00Z' }), baseRun({ id: 'parked', status: 'needs_review', createdAt: '2026-08-20T01:00:00Z' })],
+      live: null,
+      want: 'done',
+    },
+    {
+      name: 'a parked needs_review followed by a failed run features the failed one',
+      runs: [baseRun({ id: 'later', status: 'failed' }), baseRun({ id: 'parked', status: 'needs_review' })],
+      live: null,
+      want: 'later',
+    },
+    {
+      name: 'the live escalation of a custom workflow is featured',
+      runs: [baseRun({ id: 'escalated', status: 'needs_review' }), baseRun({ id: 'older', status: 'completed' })],
+      live: 'escalated',
+      want: 'escalated',
+    },
+    {
+      name: 'a newest needs_review the server no longer reports open (a turn since, or a built-in\'s) is passed over for the run before it',
+      runs: [baseRun({ id: 'answered', status: 'needs_review' }), baseRun({ id: 'older', status: 'completed' })],
+      live: null,
+      want: 'older',
+    },
+    { name: 'every run parked and none live: nothing is featured', runs: [baseRun({ id: 'p1', status: 'needs_review' }), baseRun({ id: 'p2', status: 'needs_review' })], live: null, want: null },
+    { name: 'a running run is featured over a newer finished one', runs: [baseRun({ id: 'r1', status: 'completed' }), baseRun({ id: 'r2', status: 'running' })], live: null, want: 'r2' },
+    {
+      name: 'nothing live: the FIRST run not parked (server-sorted newest-first), without re-sorting',
+      runs: [baseRun({ id: 'r1', status: 'completed', createdAt: '2026-08-20T02:00:00Z' }), baseRun({ id: 'r2', status: 'failed', createdAt: '2026-08-20T03:00:00Z' })],
+      live: null,
+      want: 'r1',
+    },
+    { name: 'a live id that names no listed run changes nothing', runs: [baseRun({ id: 'r1', status: 'completed' })], live: 'gone', want: 'r1' },
+  ]
+  for (const c of cases) {
+    it(c.name, () => {
+      expect(featuredRun(c.runs, c.live)?.id ?? null).toBe(c.want)
+    })
+  }
+})
+
+describe('isLiveRun: whether the view re-reads a run on a timer', () => {
+  const cases: { name: string; run: WorkflowRun; live: string | null; want: boolean }[] = [
+    { name: 'a running run', run: baseRun({ id: 'r', status: 'running' }), live: null, want: true },
+    { name: 'the live escalation', run: baseRun({ id: 'e', status: 'needs_review' }), live: 'e', want: true },
+    { name: 'a parked escalation is never re-read', run: baseRun({ id: 'p', status: 'needs_review' }), live: null, want: false },
+    { name: 'a parked escalation beside another live one', run: baseRun({ id: 'p', status: 'needs_review' }), live: 'e', want: false },
+    { name: 'a completed run', run: baseRun({ id: 'c', status: 'completed' }), live: null, want: false },
+    { name: 'a failed run', run: baseRun({ id: 'f', status: 'failed' }), live: null, want: false },
+    { name: 'a cancelled run', run: baseRun({ id: 'x', status: 'cancelled' }), live: null, want: false },
+  ]
+  for (const c of cases) {
+    it(c.name, () => {
+      expect(isLiveRun(c.run, c.live)).toBe(c.want)
+    })
+  }
+})
+
+describe('runRefetchInterval: the run view re-reads the run it shows only while it can change', () => {
+  const cases: { name: string; run: WorkflowRun | null; live: string | null; want: number | false }[] = [
+    { name: 'no run shown', run: null, live: null, want: false },
+    { name: 'a running run', run: baseRun({ id: 'r', status: 'running' }), live: null, want: WORKFLOW_RUN_POLL_MS },
+    { name: 'the live escalation', run: baseRun({ id: 'e', status: 'needs_review' }), live: 'e', want: WORKFLOW_RUN_POLL_MS },
+    { name: 'a parked escalation, featured or picked from the history, is not polled', run: baseRun({ id: 'p', status: 'needs_review' }), live: null, want: false },
+    { name: 'a completed run', run: baseRun({ id: 'c', status: 'completed' }), live: null, want: false },
+  ]
+  for (const c of cases) {
+    it(c.name, () => {
+      expect(runRefetchInterval(c.run, c.live)).toBe(c.want)
+    })
+  }
+})
+
+describe('liveEscalationRunId', () => {
+  const runID = '3f2a1c9e-8d4b-4e6f-9a1b-2c3d4e5f6a7b'
+  const activity = (overrides: Partial<SessionActivity>): SessionActivity => ({
+    sessionId: 'sess-1',
+    activity: 'awaiting_approval',
+    settled: true,
+    pendingTurns: 0,
+    inFlightTurn: null,
+    awaiting: null,
+    escalation: null,
+    lastRun: null,
+    sandboxStatus: 'ready',
+    archived: false,
+    suggestedDelaySeconds: 60,
+    observedAt: '2026-10-01T09:00:00Z',
+    ...overrides,
   })
-  it('prefers a running run over a completed one', () => {
-    const runs = [baseRun({ id: 'r1', status: 'completed' }), baseRun({ id: 'r2', status: 'running' })]
-    expect(featuredRun(runs)?.id).toBe('r2')
+  const since = '2026-10-01T08:58:00Z'
+  const cases: { name: string; activity: SessionActivity | null | undefined; want: string | null }[] = [
+    { name: 'no status read yet', activity: undefined, want: null },
+    { name: 'none open', activity: activity({}), want: null },
+    { name: 'the escalation the server reports', activity: activity({ escalation: { id: runID, since } }), want: runID },
+    {
+      name: 'an escalation open beside a plan awaiting approval: awaiting names the plan, escalation the run',
+      activity: activity({ awaiting: { kind: 'plan', id: 'plan-1', since }, escalation: { id: runID, since } }),
+      want: runID,
+    },
+    {
+      name: 'a server that reports no escalation field: its awaiting, when it names the escalation',
+      activity: (() => {
+        const a: Partial<SessionActivity> = activity({ awaiting: { kind: 'workflow_escalation', id: runID, since } })
+        delete a.escalation
+        return a as SessionActivity
+      })(),
+      want: runID,
+    },
+    {
+      name: 'escalation null wins over awaiting: the field is the answer',
+      activity: activity({ awaiting: { kind: 'workflow_escalation', id: runID, since }, escalation: null }),
+      want: null,
+    },
+  ]
+  for (const c of cases) {
+    it(c.name, () => {
+      expect(liveEscalationRunId(c.activity)).toBe(c.want)
+    })
+  }
+})
+
+describe('escalationNotice', () => {
+  it('a live escalation says it waits on a person, and what answers it', () => {
+    const notice = escalationNotice(baseRun({ id: 'e', status: 'needs_review' }), 'e')
+    expect(notice).toBe(`${NEEDS_REVIEW_EXPLANATION} ${ESCALATION_OPEN_NOTE}`)
   })
-  it('prefers a needs_review run over a completed one -- it is still waiting on a human', () => {
-    const runs = [baseRun({ id: 'r1', status: 'completed' }), baseRun({ id: 'r2', status: 'needs_review' })]
-    expect(featuredRun(runs)?.id).toBe('r2')
+  it('a parked escalation says nothing waits on it any more', () => {
+    const notice = escalationNotice(baseRun({ id: 'p', status: 'needs_review' }), null)
+    expect(notice).toBe(`${NEEDS_REVIEW_EXPLANATION} ${ESCALATION_CLOSED_NOTE}`)
   })
-  it('falls back to the FIRST entry (server-sorted newest-first) when nothing is active, without re-sorting', () => {
-    const runs = [baseRun({ id: 'r1', status: 'completed', createdAt: '2026-08-20T02:00:00Z' }), baseRun({ id: 'r2', status: 'failed', createdAt: '2026-08-20T01:00:00Z' })]
-    expect(featuredRun(runs)?.id).toBe('r1')
+  it('any other run has none', () => {
+    expect(escalationNotice(baseRun({ id: 'r', status: 'running' }), 'r')).toBeNull()
+    expect(escalationNotice(baseRun({ id: 'c', status: 'completed' }), null)).toBeNull()
   })
 })
 

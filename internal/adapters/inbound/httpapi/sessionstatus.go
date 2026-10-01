@@ -347,6 +347,7 @@ func sessionActivityToDTO(facts sqlcgen.GetSessionActivityFactsRow, delays sessi
 		PendingTurns:          in.TurnCounts[turn.StatePending],
 		InFlightTurn:          inFlightTurnDTO(facts),
 		Awaiting:              awaitingDTO(facts),
+		Escalation:            escalationDTO(facts),
 		LastRun:               lastRunDTO(facts),
 		SandboxStatus:         sandboxStatus,
 		Archived:              facts.Archived,
@@ -405,6 +406,22 @@ func awaitingDTO(facts sqlcgen.GetSessionActivityFactsRow) *restdtos.SessionActi
 		}
 	default:
 		return nil
+	}
+}
+
+// escalationDTO reports the session's open workflow escalation whatever
+// awaitingDTO reports first: the same facts row field, which carries a run
+// only while its escalation is still open (GetSessionActivityFacts'
+// escalated lookup). awaiting names one gate, so an escalation open beside
+// a plan or a workflow step reaches a client only here -- the web's run
+// view features it by this field (technical plan §43.20).
+func escalationDTO(facts sqlcgen.GetSessionActivityFactsRow) *restdtos.SessionActivityEscalation {
+	if !facts.EscalatedRunID.Valid {
+		return nil
+	}
+	return &restdtos.SessionActivityEscalation{
+		Id:    facts.EscalatedRunID.String(),
+		Since: facts.EscalatedRunSince.Time,
 	}
 }
 

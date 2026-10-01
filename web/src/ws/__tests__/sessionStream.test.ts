@@ -336,6 +336,50 @@ describe('SessionStream', () => {
     expect(stream.getSnapshot().sandboxState).toEqual({ id: 'sb-1', gen: 3, status: 'ready', lastSeenAt: 'z', createdAt: 'x', updatedAt: 'w' })
   })
 
+  // Technical plan §3.2: the server keeps a sandbox booting after the
+  // agent's `ready`, and changes its status with no reconnect. The control
+  // plane broadcasts a sandbox_status event on every change, and the
+  // fetch_history reply that broadcast prompts carries the row as the
+  // server holds it (FetchHistoryResponse.sandbox). Taking the status from
+  // the subscribe reply alone again makes this test fail.
+  it('follows the sandbox every fetch_history reply carries, keeping it when a reply carries none', async () => {
+    server = await FakeClientWsServer.start()
+    const queryClient = new QueryClient()
+    stream = newStream('sess-10', queryClient)
+
+    const connPromise = server.waitForConnection()
+    stream.start()
+    const conn = await connPromise
+    await conn.nextMessage()
+    const booting = { id: 'sb-1', gen: 1, status: 'booting', lastSeenAt: null, createdAt: 'x', updatedAt: 'y' }
+    conn.send(subscribedPayload('sess-10', [fakeEvent(1, 'ready', { type: 'ready', gen: 1 })], { sandbox: booting }))
+    await conn.nextMessage()
+    conn.send({ events: [], nextCursor: null, sandbox: booting })
+    await waitFor(() => stream!.getSnapshot().syncState === 'complete')
+    expect(stream.getSnapshot().sandboxState).toEqual(booting)
+
+    const steps: { name: string; reply: Record<string, unknown>; want: unknown }[] = [
+      {
+        name: 'the server marks the sandbox ready',
+        reply: { events: [fakeEvent(2, 'sandbox_status', { sandbox: { gen: 1, status: 'ready' } })], nextCursor: null, sandbox: { ...booting, status: 'ready' } },
+        want: { ...booting, status: 'ready' },
+      },
+      { name: 'a control plane older than the field', reply: { events: [fakeEvent(3)], nextCursor: null }, want: { ...booting, status: 'ready' } },
+      { name: 'no sandbox any more', reply: { events: [fakeEvent(4)], nextCursor: null, sandbox: null }, want: null },
+    ]
+    for (const step of steps) {
+      const before = stream.getSnapshot().events.length
+      const replied = (async () => {
+        await conn.nextMessage()
+        conn.send(step.reply)
+      })()
+      conn.send({ sandbox: { gen: 1, status: 'ready' } }) // the live broadcast that prompts the fetch
+      await replied
+      await waitFor(() => stream!.getSnapshot().events.length === before + 1 && stream!.getSnapshot().syncState === 'complete')
+      expect(stream.getSnapshot().sandboxState, step.name).toEqual(step.want)
+    }
+  })
+
   it('exposes sandboxState as null when this session has no sandbox row yet (state.sandbox absent/empty)', async () => {
     server = await FakeClientWsServer.start()
     const queryClient = new QueryClient()

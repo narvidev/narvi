@@ -9,14 +9,14 @@
 // its ordered step runs (oldest-first, one row per ATTEMPT -- a retry or a
 // human revise re-run is a NEW row, never an update-in-place, §25.5/§25.10).
 // featuredRun (workflowRunFormat.ts) picks the run to show in the main
-// panel -- the currently active one if there is one, else the most recent
-// -- mirroring PlanModeView.tsx's own latestPlan one level up; every other
-// run for this session is listed, read-only, in the rail (mirrors
-// PlanModeView's own PlanHistoryPanel: a compact list, not a second
-// selectable browser -- this screen deliberately does not let an operator
-// pick an older run to inspect in the main panel, since the one thing this
-// Step actually asks for is watching the run that IS live and unblocking
-// it, not a general run archive).
+// panel: the newest live one -- running, or the escalation the session's
+// status still reports open (GET /api/sessions/:id/status, `escalation`:
+// the server's rule, technical plan §43.20, never re-derived here) -- else
+// the newest run that is not a parked escalation. A run parked at
+// needs_review that the server no longer reports open is listed in the
+// rail, never featured, and never re-read on a timer: needs_review is
+// never left, and the session's next turn starts a fresh run beside it.
+// Every run is listed in the rail, and selectable there.
 //
 // # The edge actually taken is rendered, never fetched
 //
@@ -38,9 +38,10 @@
 // this gate must never offer, per this Step's own spec: a run parked at
 // 'needs_review' with NO attempt awaiting a decision (the circuit-breaker/
 // unrouted-outcome escalation path, §25.9) gets an explanatory banner
-// (NEEDS_REVIEW_EXPLANATION) and no button of any kind -- see
-// decidableStepRun's own doc comment for how this screen tells that path
-// apart from the ordinary HITL gate.
+// (escalationNotice: NEEDS_REVIEW_EXPLANATION, then whether the escalation
+// still waits on a person, who answers it by sending the session new work)
+// and no button of any kind -- see decidableStepRun's own doc comment for
+// how this screen tells that path apart from the ordinary HITL gate.
 //
 // # Rendering safety
 //
@@ -59,7 +60,7 @@ import { Link } from '@tanstack/react-router'
 
 import type { WorkflowRun, WorkflowStepRun } from '@narvi/contracts/rest-dtos'
 
-import { decideWorkflowStep, getSession, getWorkflowRun, listSessionWorkflowRuns } from '../api/endpoints'
+import { decideWorkflowStep, getSession, getSessionActivity, getWorkflowRun, listSessionWorkflowRuns } from '../api/endpoints'
 import { ApiError } from '../api/http'
 import { sessionListQueryKeys, sessionQueryKeys, workflowRunQueryKeys } from '../api/queryKeys'
 import { meQueryOptions } from '../auth/session'
@@ -74,16 +75,19 @@ import {
   decisionLabel,
   edgeLabel,
   edgeToNext,
+  escalationNotice,
   featuredRun,
   formatStepCost,
-  NEEDS_REVIEW_EXPLANATION,
+  liveEscalationRunId,
   outcomeStatusLabel,
   outcomeStatusTone,
+  runRefetchInterval,
   runStatusLabel,
   runStatusTone,
   stepRunStatusLabel,
   stepRunStatusTone,
   totalKnownCost,
+  WORKFLOW_RUN_POLL_MS,
 } from './workflowRunFormat'
 
 const MAX_FIELD_CHARS = 2000
@@ -269,16 +273,6 @@ function DecisionGate({ sessionId, runId, stepRun, canAct }: { sessionId: string
   )
 }
 
-/**
- * WORKFLOW_RUN_POLL_MS is how often a live run is re-read. Matches the
- * cadence the other live surfaces in this app already use, so an operator
- * watching two screens does not see them disagree about how current they
- * are. Deliberately a plain client-side interval and not a websocket
- * subscription: the run read model changes on the order of a turn, not a
- * token, and a second realtime channel is a mechanism this screen does not
- * need to justify.
- */
-const WORKFLOW_RUN_POLL_MS = 15_000
 
 function RunHistoryPanel({ runs, featuredId, onSelect }: { runs: WorkflowRun[]; featuredId: string | null; onSelect: (runId: string) => void }) {
   if (runs.length === 0) return null
@@ -287,10 +281,10 @@ function RunHistoryPanel({ runs, featuredId, onSelect }: { runs: WorkflowRun[]; 
       <h3>Run history</h3>
       {/*
         Selectable, not a read-only list. Which run the main panel opens on
-        is a heuristic -- it prefers one that still needs attention -- and a
-        heuristic that cannot be overridden is a trap: a run parked for
-        review outranks newer runs, and without a way to click past it the
-        newer ones are unreachable rather than merely not-default.
+        is a rule -- the newest live run, else the newest one not parked --
+        and an operator may still want any other: a parked escalation, an
+        older finished run. Selecting one shows it; it is re-read on a timer
+        only while it can still change (isLiveRun).
       */}
       <ul className="transitions">
         {runs.map((r) => (
@@ -311,6 +305,15 @@ function RunHistoryPanel({ runs, featuredId, onSelect }: { runs: WorkflowRun[]; 
 export function WorkflowRunsView({ sessionId }: { sessionId: string }) {
   const meQuery = useQuery(meQueryOptions)
   const sessionQuery = useQuery({ queryKey: sessionQueryKeys.detail(sessionId), queryFn: ({ signal }) => getSession(sessionId, signal) })
+  // The session's status says which escalation is still open -- the one
+  // run parked at needs_review that is still live (technical plan
+  // §43.20). Re-read on the same cadence as the run list, since a turn
+  // created on the session closes it.
+  const activityQuery = useQuery({
+    queryKey: sessionQueryKeys.activity(sessionId),
+    queryFn: ({ signal }) => getSessionActivity(sessionId, signal),
+    refetchInterval: WORKFLOW_RUN_POLL_MS,
+  })
   const runsQuery = useQuery({
     queryKey: workflowRunQueryKeys.listForSession(sessionId),
     queryFn: ({ signal }) => listSessionWorkflowRuns(sessionId, signal),
@@ -324,28 +327,27 @@ export function WorkflowRunsView({ sessionId }: { sessionId: string }) {
   })
 
   // A run the operator picked out of the history list, if any. Null means
-  // "follow the heuristic", which is what an operator who has not chosen
-  // wants: land on whatever still needs attention.
+  // "follow featuredRun", which is what an operator who has not chosen
+  // wants: land on whatever is live, else on what the session did last.
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null)
 
   const runs = runsQuery.isSuccess ? runsQuery.data.runs : []
+  // A status that could not be read reports no escalation open: no parked
+  // run is featured or re-read on a guess.
+  const liveEscalationId = liveEscalationRunId(activityQuery.data)
   const featured = runsQuery.isSuccess
-    ? (selectedRunId === null ? featuredRun(runs) : (runs.find((r) => r.id === selectedRunId) ?? featuredRun(runs)))
+    ? (selectedRunId === null ? featuredRun(runs, liveEscalationId) : (runs.find((r) => r.id === selectedRunId) ?? featuredRun(runs, liveEscalationId)))
     : null
 
   const runDetailQuery = useQuery({
     queryKey: workflowRunQueryKeys.detail(featured?.id ?? ''),
     queryFn: ({ signal }) => getWorkflowRun(featured?.id ?? '', signal),
     enabled: featured !== null,
-    // Only while the run can still move. A completed, failed or cancelled
-    // run is finished changing, and polling one forever would be a request
-    // every few seconds for a document that is now immutable. needs_review
-    // KEEPS polling: it is exactly the state a human is expected to resolve,
-    // and its step attempts change when they do.
-    refetchInterval: featured !== null && (featured.status === 'running' || featured.status === 'needs_review') ? WORKFLOW_RUN_POLL_MS : false,
+    // Only while the run can still move (runRefetchInterval).
+    refetchInterval: runRefetchInterval(featured, liveEscalationId),
   })
 
-  if (sessionQuery.isPending || runsQuery.isPending) {
+  if (sessionQuery.isPending || runsQuery.isPending || activityQuery.isPending) {
     return (
       <div className="session-state" aria-live="polite">
         <p>Loading workflow runs…</p>
@@ -367,6 +369,7 @@ export function WorkflowRunsView({ sessionId }: { sessionId: string }) {
   const sequence = detail ? buildStepRunSequence(detail.stepRuns) : []
   const decidable = detail ? decidableStepRun(detail.stepRuns) : null
   const totalCost = detail ? totalKnownCost(detail.stepRuns) : null
+  const notice = featured && detail && !decidable ? escalationNotice(featured, liveEscalationId) : null
 
   return (
     <div className="app two">
@@ -395,7 +398,11 @@ export function WorkflowRunsView({ sessionId }: { sessionId: string }) {
         <div className="timeline">
           {!featured && (
             <div className="card">
-              <p>No workflow runs have started for this session yet.</p>
+              <p>
+                {runs.length === 0
+                  ? 'No workflow runs have started for this session yet.'
+                  : 'No run is in progress or waiting on a person. Every run of this session is in the run history.'}
+              </p>
             </div>
           )}
 
@@ -423,7 +430,7 @@ export function WorkflowRunsView({ sessionId }: { sessionId: string }) {
               )
             })}
 
-          {featured && detail && featured.status === 'needs_review' && !decidable && <div className="banner banner-warn">{NEEDS_REVIEW_EXPLANATION}</div>}
+          {notice && <div className="banner banner-warn">{notice}</div>}
         </div>
 
         {/*
