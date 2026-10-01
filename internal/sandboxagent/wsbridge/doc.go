@@ -145,8 +145,15 @@
 //
 // A receipt is never sent for a prompt whose journal append failed: it
 // would promise what a restarted process could not keep, so such a prompt
-// neither runs nor is receipted, and the control plane may send it again.
-// A prompt that asked for no receipt still runs then, deduped in memory.
+// neither runs nor is receipted. The failure breaks the journal for good:
+// the agent stops advertising the capability, reports the prompt in a
+// non-fatal, critical error event, and ends the connection, so the next
+// ready tells the control plane, which records the gen as incapable and
+// re-sends nothing more -- that turn ends at its deadline. A prompt that
+// asked for no receipt still runs then, deduped in memory. The file holds
+// complete lines only: a failed append is cut back off, and a tail a crash
+// cut short is cut off at open, so no fragment glues onto a later line or,
+// closed by one, reads as a prompt that ran.
 // The receipt is not one of the critical types: each re-sent copy draws a
 // fresh one, and a buffered one replays on reconnect like any best-effort
 // event.
@@ -162,6 +169,15 @@
 // opened leaves the Bridge exactly as it was before receipts -- no
 // capability, no receipt, no dedup -- and the control plane then never
 // re-sends to this gen.
+//
+// # The largest message a connection reads
+//
+// Every connection reads messages of up to platform.MaxPromptFrameBytes,
+// the largest prompt frame the control plane may send. The WebSocket
+// library's default, 32 KiB, closed the connection on any longer prompt --
+// a review's, with its pull request's diff inlined -- and the prompt was
+// lost; with prompt receipts, every reconnect re-sent it, to be lost
+// again.
 //
 // # Honest gaps this package documents rather than papers over
 //

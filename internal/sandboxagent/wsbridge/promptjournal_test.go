@@ -411,16 +411,52 @@ func TestPromptJournal_TornLastLineIsNotRecorded(t *testing.T) {
 	}
 }
 
+// TestPrompt_JournalAppendFails_RequestedPromptNeitherRunNorReceipted: a
+// prompt that asked for a receipt and cannot be journaled is neither run
+// nor receipted (fail closed), and the agent says so and stops promising:
+// a non-fatal error event names the prompt, the connection is ended, and
+// the next connection's ready advertises no capability. A prompt that
+// asked for none still runs, once.
 func TestPrompt_JournalAppendFails_RequestedPromptNeitherRunNorReceipted(t *testing.T) {
 	t.Parallel()
 
-	frames := make(chan []byte, 16)
-	server := scriptedControlPlane(t, frames, []string{
-		promptFrame("asked", testGen, true),
-		promptFrame("unasked", testGen, false),
-		promptFrame("unasked", testGen, false),
-		promptFrame("last", testGen, false),
-	})
+	frames1 := make(chan []byte, 16)
+	frames2 := make(chan []byte, 16)
+	closed1 := make(chan struct{})
+	conn1 := func(conn *websocket.Conn) {
+		defer close(closed1)
+		ready, err := serverRead(conn, testWait)
+		if err != nil {
+			return
+		}
+		frames1 <- ready
+		if err := conn.Write(context.Background(), websocket.MessageText, []byte(promptFrame("asked", testGen, true))); err != nil {
+			return
+		}
+		for {
+			_, data, err := conn.Read(context.Background())
+			if err != nil {
+				return // the agent ended the connection
+			}
+			frames1 <- data
+		}
+	}
+	conn2 := func(conn *websocket.Conn) {
+		ready, err := serverRead(conn, testWait)
+		if err != nil {
+			return
+		}
+		frames2 <- ready
+		for _, cmd := range []string{promptFrame("unasked", testGen, false), promptFrame("unasked", testGen, false), promptFrame("last", testGen, false)} {
+			if err := conn.Write(context.Background(), websocket.MessageText, []byte(cmd)); err != nil {
+				return
+			}
+		}
+		absorbForever(conn)
+	}
+	server := httptest.NewServer(&stepServer{steps: []func(*websocket.Conn){conn1, conn2}, fallback: absorbForever})
+	t.Cleanup(server.Close)
+
 	counter := newPromptCounter()
 	bridge := wsbridge.New(testSessionConfig(server.URL), "sbx-1", "test-agent-version", "test-image-digest", counter,
 		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
@@ -430,28 +466,111 @@ func TestPrompt_JournalAppendFails_RequestedPromptNeitherRunNorReceipted(t *test
 	wsbridge.BreakPromptJournalForTest(bridge)
 	stopBridge(t, bridge)
 
-	// Every append fails now. The read loop handles commands in order, so
-	// once "last" has run, every prompt before it has been handled, and a
-	// receipt for any of them has been written ahead of anything later.
-	waitRuns(t, counter, "last", 1)
-	drain := time.After(200 * time.Millisecond)
+	if ready := waitChan(t, frames1, testWait); !strings.Contains(string(ready), `"promptReceipt":true`) {
+		t.Fatalf("first ready = %s, want the capability: no append has failed yet", ready)
+	}
+	// The agent ends the connection the prompt arrived on.
+	select {
+	case <-closed1:
+	case <-time.After(testWait):
+		t.Fatal("the agent kept the connection after failing to journal a prompt that asked for a receipt")
+	}
+	var signal *sandboxws.SandboxErrorEvent
 	for done := false; !done; {
 		select {
-		case data := <-frames:
-			var got receiptFrame
-			if err := json.Unmarshal(data, &got); err == nil && got.Type == "prompt_received" {
-				t.Fatalf("a receipt was sent with the journal broken: %s", data)
+		case data := <-frames1:
+			var head receiptFrame
+			_ = json.Unmarshal(data, &head)
+			switch head.Type {
+			case "prompt_received":
+				t.Fatalf("a receipt was sent for a prompt that was not journaled: %s", data)
+			case "error":
+				var e sandboxws.SandboxErrorEvent
+				if err := json.Unmarshal(data, &e); err != nil {
+					t.Fatalf("error event fails its contract: %v (%s)", err, data)
+				}
+				signal = &e
 			}
-		case <-drain:
+		default:
 			done = true
 		}
 	}
+	if signal == nil || signal.Fatal || !strings.Contains(signal.Message, "asked") || signal.AckId != "error:prompt-not-journaled:asked" {
+		t.Fatalf("signal = %+v, want a non-fatal, critical error event naming the prompt", signal)
+	}
+
+	// The next connection: no capability, and prompts that ask for none run.
+	if ready := waitChan(t, frames2, testWait); strings.Contains(string(ready), "capabilities") {
+		t.Fatalf("the ready after a failed append advertises capabilities: %s", ready)
+	}
+	waitRuns(t, counter, "last", 1)
 	if got := counter.count("asked"); got != 0 {
 		t.Fatalf("a prompt that asked for a receipt ran %d times with its append failed, want 0 (fail closed)", got)
 	}
 	if got := counter.count("unasked"); got != 1 {
 		t.Fatalf("a prompt that asked for no receipt ran %d times, want exactly 1 (run, deduped in memory)", got)
 	}
+}
+
+// TestPromptJournal_TornCompleteIdIsNotReadAsRecordedLater: a journal whose
+// last line is a whole id without its newline -- an append cut exactly
+// before it -- reads that id as not recorded, and so does every later
+// process of the gen: a prompt no process ran is run when it comes, never
+// answered as a duplicate.
+func TestPromptJournal_TornCompleteIdIsNotReadAsRecordedLater(t *testing.T) {
+	t.Parallel()
+
+	stateDir := t.TempDir()
+	journal := filepath.Join(stateDir, wsbridge.PromptJournalFileNameForTest(testSessionID, testGen))
+	if err := os.WriteFile(journal, []byte("\"p1\"\n\"p2\""), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	counter := newPromptCounter()
+
+	// Process A opens the journal, runs only a sentinel, and stops.
+	framesA := make(chan []byte, 16)
+	serverA := scriptedControlPlane(t, framesA, []string{promptFrame("sentinel", testGen, true)})
+	bridgeA := wsbridge.New(testSessionConfig(serverA.URL), "sbx-1", "test-agent-version", "test-image-digest", counter,
+		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
+	if err := bridgeA.EnablePromptReceipts(stateDir); err != nil {
+		t.Fatalf("EnablePromptReceipts: %v", err)
+	}
+	stopA := stopBridge(t, bridgeA)
+	nextReceipt(t, framesA)
+	waitRuns(t, counter, "sentinel", 1)
+	stopA()
+
+	// Process B is sent p2.
+	framesB := make(chan []byte, 16)
+	serverB := scriptedControlPlane(t, framesB, []string{promptFrame("p2", testGen, true)})
+	startBridge(t, serverB, counter, stateDir)
+	if got := nextReceipt(t, framesB); got.PromptMessageID != "p2" || got.Duplicate {
+		t.Fatalf("p2's receipt = %+v, want not a duplicate: no process ran it", got)
+	}
+	waitRuns(t, counter, "p2", 1)
+}
+
+// TestRun_ReadsAPromptFrameOver32KiB: a prompt frame longer than the
+// WebSocket library's default read limit (32 KiB) -- a review's, with its
+// diff inlined -- is read whole and run once, on the connection it came
+// on: the agent reads up to platform.MaxPromptFrameBytes.
+func TestRun_ReadsAPromptFrameOver32KiB(t *testing.T) {
+	t.Parallel()
+
+	big := fmt.Sprintf(`{"type":"prompt","messageId":"big","sessionId":%q,"gen":%d,"text":%q,"model":null,"effort":null,"scmName":"n","scmEmail":"n@example.com","receiptRequested":true}`,
+		testSessionID, testGen, strings.Repeat("<diff>", 40*1024/6+1))
+	if len(big) <= 40*1024 {
+		t.Fatalf("frame is %d bytes, want over 40 KiB", len(big))
+	}
+	frames := make(chan []byte, 16)
+	server := scriptedControlPlane(t, frames, []string{big})
+	counter := newPromptCounter()
+	startBridge(t, server, counter, t.TempDir())
+
+	if got := nextReceipt(t, frames); got.PromptMessageID != "big" || got.Duplicate {
+		t.Fatalf("receipt = %+v, want big's, not a duplicate", got)
+	}
+	waitRuns(t, counter, "big", 1)
 }
 
 func TestEnablePromptReceipts_RejectsDirNotOursOrWritableByOthers(t *testing.T) {

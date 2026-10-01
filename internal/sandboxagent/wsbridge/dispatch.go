@@ -83,8 +83,8 @@ func (b *Bridge) dispatch(ctx context.Context, msgType string, data []byte) erro
 		if !b.checkGen("prompt", cmd.Gen) {
 			return nil
 		}
-		b.dispatchPrompt(ctx, cmd)
-		return nil
+		// An error here ends the connection (dispatchPrompt's doc comment).
+		return b.dispatchPrompt(ctx, cmd)
 
 	case "stop":
 		var cmd sandboxws.Stop

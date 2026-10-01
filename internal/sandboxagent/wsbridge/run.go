@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // Run connects (retrying with exponential backoff, bounded
@@ -144,6 +145,13 @@ func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn) error 
 	defer b.setConn(nil)
 	defer func() { _ = conn.CloseNow() }()
 
+	// The largest message this connection reads is the largest prompt
+	// frame the control plane may send (technical plan §6.1). The
+	// library's default, 32 KiB, closed the connection on any longer prompt
+	// -- a review's, with its pull request's diff inlined -- which was then
+	// lost.
+	conn.SetReadLimit(platform.MaxPromptFrameBytes)
+
 	if err := b.sendReady(ctx, conn); err != nil {
 		return fmt.Errorf("wsbridge: send ready: %w", err)
 	}
@@ -175,8 +183,8 @@ func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn) error 
 // (technical plan §3.3's prompt receipts).
 //
 // It advertises capabilities.promptReceipt when, and only when, the prompt
-// journal is open (EnablePromptReceipts); otherwise the key is absent, as
-// from an agent that predates it.
+// journal is open (EnablePromptReceipts) and no append to it has failed;
+// otherwise the key is absent, as from an agent that predates it.
 func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
 	msg := sandboxws.Ready{
 		Type:         "ready",
@@ -187,7 +195,7 @@ func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
 		AgentVersion: b.agentVersion,
 		ImageDigest:  b.imageDigest,
 	}
-	if b.journal != nil {
+	if b.promptReceiptsOn() {
 		promptReceipt := true
 		msg.Capabilities = &sandboxws.ReadyCapabilities{PromptReceipt: &promptReceipt}
 	}
