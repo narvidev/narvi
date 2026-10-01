@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { additionCheckReason, additionsCheckLabel, findingSourceBucketLabel, isUnverifiedAddition, sentinelFixLabel, sentinelFixTone, visualQaTone } from '../reviewFormat'
+import { additionCheckReason, additionsCheckLabel, additionsRunSummary, findingSourceBucketLabel, isUnverifiedAddition, sentinelFixLabel, sentinelFixTone, visualQaTone } from '../reviewFormat'
 
 describe('visualQaTone', () => {
   it('maps pass/fail/skip(ped) to the expected tones', () => {
@@ -83,5 +83,25 @@ describe('additionCheckReason / additionsCheckLabel / findingSourceBucketLabel',
     expect(findingSourceBucketLabel('counter_review_unverified')).toBe('counter-review, unverified')
     expect(findingSourceBucketLabel('not_recorded')).toBe('source not recorded')
     expect(findingSourceBucketLabel('later')).toBe('later')
+  })
+})
+
+describe('additionsRunSummary (§26.6)', () => {
+  it('reports the second run beside the resolution of the additions the verdict published', () => {
+    expect(additionsRunSummary({ additionsFactCheck: 'done', additionsFactCheckKilled: 1, additionsCheck: 'checked' })).toBe('done (1 killed) · additions checked')
+    expect(additionsRunSummary({ additionsFactCheck: 'done', additionsFactCheckKilled: 0, additionsCheck: 'not_found' })).toBe('done (0 killed) · additions unverified')
+    expect(additionsRunSummary({ additionsFactCheck: 'skipped', additionsFactCheckKilled: 0, additionsCheck: 'not_run' })).toBe('skipped (0 killed) · additions unverified')
+    expect(additionsRunSummary({ additionsFactCheck: null, additionsFactCheckKilled: null, additionsCheck: 'not_run' })).toBe('not reported · additions unverified')
+  })
+
+  it('a second run that removed every addition published none, and never reads unverified', () => {
+    expect(additionsRunSummary({ additionsFactCheck: 'done', additionsFactCheckKilled: 2, additionsCheck: null })).toBe('done (2 killed) · no addition published')
+    expect(additionsRunSummary({ additionsFactCheck: 'done', additionsFactCheckKilled: 2 })).not.toContain('unverified')
+  })
+
+  it('a dash when there was neither a second run nor an addition', () => {
+    expect(additionsRunSummary({ additionsFactCheck: null, additionsFactCheckKilled: null, additionsCheck: null })).toBe('—')
+    expect(additionsRunSummary({})).toBe('—')
+    expect(additionsRunSummary(null)).toBe('—')
   })
 })

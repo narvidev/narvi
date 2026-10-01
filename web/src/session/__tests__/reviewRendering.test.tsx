@@ -720,4 +720,48 @@ describe('CodeReviewView -- counter-review additions (§26.6)', () => {
     const html = renderToStaticMarkup(<SentinelsPanel verdict={baseVerdict()} visualQa={null} />)
     expect(html).toContain('<dt>fact check (additions)</dt><dd>—</dd>')
   })
+
+  it('the Sentinels panel never calls additions unverified when the second run removed every one', () => {
+    const html = renderToStaticMarkup(
+      <SentinelsPanel verdict={baseVerdict({ factCheck: 'done', factCheckKilled: 0, additionsFactCheck: 'done', additionsFactCheckKilled: 2, additionsCheck: null })} visualQa={null} />,
+    )
+    expect(html).toContain('<dt>fact check (additions)</dt><dd>done (2 killed) · no addition published</dd>')
+    expect(html).not.toContain('additions unverified')
+  })
+
+  // The expanded appendix: unverified additions are listed apart, under
+  // their own heading after the other findings, and never repeated among
+  // them.
+  it('the expanded appendix lists unverified additions apart, after the other findings, once each', () => {
+    const findings = [
+      baseFinding({ identityHash: 'u1', description: 'Unverified one.', source: 'counter_review', additionCheck: 'not_run' }),
+      baseFinding({ identityHash: 'p1', description: 'Primary one.', source: 'primary' }),
+      baseFinding({ identityHash: 'n1', description: 'No source one.', source: null }),
+      baseFinding({ identityHash: 'c1', description: 'Checked addition.', source: 'counter_review', additionCheck: 'checked' }),
+      baseFinding({ identityHash: 'u2', description: 'Unverified two.', source: 'counter_review', additionCheck: 'unconfirmed' }),
+    ]
+    const html = withQueryClient(<FindingsAppendix findings={findings} canAct={false} sessionId="s1" defaultOpen />)
+    const heading = '<h3>Unverified -- added by the counter-review and not fact-checked (2)</h3>'
+    expect(html.split(heading).length - 1).toBe(1)
+    const [listedPart, unverifiedPart] = html.split(heading)
+    for (const listed of ['Primary one.', 'No source one.', 'Checked addition.']) {
+      expect(listedPart).toContain(listed)
+      expect(unverifiedPart).not.toContain(listed)
+    }
+    // A card can render its description more than once (its text and a
+    // title); each unverified addition must appear exactly as often as one
+    // card of its own renders it -- listed once, never repeated.
+    for (const finding of findings.filter((f) => f.source === 'counter_review' && f.additionCheck !== 'checked')) {
+      const perCard = withQueryClient(<FindingCard finding={finding} canAct={false} sessionId="s1" />).split(finding.description).length - 1
+      expect(perCard).toBeGreaterThan(0)
+      expect(listedPart).not.toContain(finding.description)
+      expect(unverifiedPart.split(finding.description).length - 1).toBe(perCard)
+    }
+  })
+
+  it('the expanded appendix has no unverified section when there is no unverified addition', () => {
+    const html = withQueryClient(<FindingsAppendix findings={[baseFinding({ source: 'primary', description: 'Primary one.' })]} canAct={false} sessionId="s1" defaultOpen />)
+    expect(html).toContain('Primary one.')
+    expect(html).not.toContain('<h3>Unverified')
+  })
 })

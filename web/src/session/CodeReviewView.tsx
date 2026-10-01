@@ -57,7 +57,7 @@ import { applySuggestion, getReviewReadout, listFalsePositivePatterns, rebutRevi
 import { falsePositivePatternQueryKeys, reviewQueryKeys } from '../api/queryKeys'
 import { meQueryOptions } from '../auth/session'
 import { formatRelativeTime } from './relativeTime'
-import { additionCheckReason, additionsCheckLabel, descriptionAdequacyTone, findingStatusLabel, findingStatusTone, isUnverifiedAddition, riskTone, sentinelFixLabel, sentinelFixTone, shippableLabel, shippableTone, visualQaTone } from './reviewFormat'
+import { additionCheckReason, additionsRunSummary, descriptionAdequacyTone, findingStatusLabel, findingStatusTone, isUnverifiedAddition, riskTone, sentinelFixLabel, sentinelFixTone, shippableLabel, shippableTone, visualQaTone } from './reviewFormat'
 import { truncateForDisplay } from './textSafety'
 import { isSafeHref } from './urlSafety'
 
@@ -291,9 +291,10 @@ export function FindingCard({
  * counter-review additions the server could not count as checked are
  * counted apart -- never in the total or the open count -- and listed
  * apart, after the other findings, mirroring the posted comment.
+ * defaultOpen renders it expanded (collapsed by default).
  */
-export function FindingsAppendix({ findings, canAct, sessionId }: { findings: ReviewReadoutFinding[]; canAct: boolean; sessionId: string }) {
-  const [open, setOpen] = useState(false)
+export function FindingsAppendix({ findings, canAct, sessionId, defaultOpen = false }: { findings: ReviewReadoutFinding[]; canAct: boolean; sessionId: string; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen)
   if (findings.length === 0) {
     return <p className="rail-empty">No findings have ever been posted for this PR.</p>
   }
@@ -503,11 +504,7 @@ export function SentinelsPanel({ verdict, visualQa }: { verdict: ReviewReadoutVe
             counter-review added -- the reviewer's report beside the
             server's resolution, apart from the first run above. */}
         <dt>fact check (additions)</dt>
-        <dd>
-          {verdict?.additionsCheck
-            ? `${verdict.additionsFactCheck ?? 'not reported'}${typeof verdict.additionsFactCheckKilled === 'number' ? ` (${verdict.additionsFactCheckKilled} killed)` : ''} · ${additionsCheckLabel(verdict.additionsCheck)}`
-            : '—'}
-        </dd>
+        <dd>{additionsRunSummary(verdict)}</dd>
       </dl>
     </div>
   )
