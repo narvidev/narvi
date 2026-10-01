@@ -2942,6 +2942,42 @@ func TestValidate_PromptResendWindow(t *testing.T) {
 	}
 }
 
+// TestValidate_PromptResendMaxPerTurn pins PromptResendMaxPerTurn
+// (technical plan §3.3's prompt receipts): the shipped 3, refused at zero
+// or below -- a cap of zero would never re-send a lost prompt -- and one
+// accepted.
+func TestValidate_PromptResendMaxPerTurn(t *testing.T) {
+	t.Parallel()
+
+	if got := platform.DefaultTimeouts().PromptResendMaxPerTurn; got != 3 {
+		t.Fatalf("DefaultTimeouts().PromptResendMaxPerTurn = %d, want 3", got)
+	}
+	for _, tc := range []struct {
+		name    string
+		max     int
+		refused bool
+	}{
+		{name: "zero", max: 0, refused: true},
+		{name: "negative", max: -1, refused: true},
+		{name: "one", max: 1, refused: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			to.PromptResendMaxPerTurn = tc.max
+			err := to.Validate()
+			var cnt *platform.CountMustBePositiveError
+			refused := errors.As(err, &cnt) && cnt.Field == "PromptResendMaxPerTurn"
+			if refused != tc.refused {
+				t.Fatalf("Validate() = %v, want PromptResendMaxPerTurn refused = %v", err, tc.refused)
+			}
+			if !tc.refused && err != nil {
+				t.Fatalf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
 // TestValidate_DispatchRetryBackoff pins the durable dispatch trigger's
 // retry after a failed evaluation (technical plan §2): the shipped bounds
 // (one minute, one hour), and each link -- the shortest delay above the

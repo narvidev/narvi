@@ -2460,6 +2460,7 @@ type Turn struct {
 	ReceiptRequestedMessageID *string               `json:"receipt_requested_message_id"`
 	ReceiptRequestedAt        pgtype.Timestamptz    `json:"receipt_requested_at"`
 	ReceiptCheckedReadySeq    *int32                `json:"receipt_checked_ready_seq"`
+	ReceiptResendCount        int32                 `json:"receipt_resend_count"`
 }
 
 type TurnStepCost struct {

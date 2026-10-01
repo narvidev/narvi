@@ -112,6 +112,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
 	"github.com/narvidev/narvi/internal/adapters/inbound/wshub"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/wsbridge"
 )
 
@@ -178,6 +179,18 @@ type wsProxy struct {
 	// is up) and the critical event itself (proving it was sent/resent),
 	// mirroring bridge_test.go's own readyCh/critCh two-channel precedent.
 	onRelay func(payload []byte)
+	// alwaysDropBackendType, when set, applies dropBackendType's drop and
+	// sever to every backend->client frame of that type on every connection
+	// (scenario #22's deterministic loss); dropped counts those frames.
+	alwaysDropBackendType string
+	dropped               int
+}
+
+// droppedCount returns how many frames alwaysDropBackendType dropped.
+func (p *wsProxy) droppedCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dropped
 }
 
 func newWSProxy(backendURL string, onRelay func(payload []byte)) *wsProxy {
@@ -221,6 +234,11 @@ func forwardableHandshakeHeaders(r *http.Request) http.Header {
 
 func (p *wsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	step := p.nextStep()
+	p.mu.Lock()
+	if p.alwaysDropBackendType != "" {
+		step.dropBackendType = p.alwaysDropBackendType
+	}
+	p.mu.Unlock()
 
 	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
@@ -234,6 +252,10 @@ func (p *wsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = backendConn.CloseNow() }()
+	// The relay itself must never be what cuts a frame: it reads as much as
+	// a sandbox-agent does (technical plan §6.1).
+	clientConn.SetReadLimit(platform.MaxPromptFrameBytes)
+	backendConn.SetReadLimit(platform.MaxPromptFrameBytes)
 
 	if step.dropAfterClient > 0 {
 		for i := 0; i < step.dropAfterClient; i++ {
@@ -285,6 +307,9 @@ func (p *wsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			}
 			if step.dropBackendType != "" && relayType(data) == step.dropBackendType {
 				// As above, backend->client.
+				p.mu.Lock()
+				p.dropped++
+				p.mu.Unlock()
 				return nil
 			}
 			if err := clientConn.Write(relayCtx, websocket.MessageText, data); err != nil {

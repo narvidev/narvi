@@ -316,15 +316,22 @@ func (s *TurnStore) PromptReceiptState(ctx context.Context, id pgtype.UUID) (rec
 // MarkPromptReconnectAnswered claims the sandbox ready numbered readySeq
 // for id's prompt-receipt check: it moves receipt_checked_ready_seq from
 // checkedReadySeq to readySeq while id is still Processing, unflagged by a
-// stop, on the dispatch messageID names, which asked for the receipt.
-// Returns the rows moved, 0 or 1; 0 means the claim failed and nothing is
-// to be sent. See MarkTurnPromptReconnectAnswered's own generated doc
-// comment.
-func (s *TurnStore) MarkPromptReconnectAnswered(ctx context.Context, id pgtype.UUID, messageID string, checkedReadySeq, readySeq int32) (int64, error) {
+// stop, on the dispatch messageID names, which asked for the receipt, with
+// resendCount re-sends made so far -- and counts one more re-send when
+// resend is true. Returns the rows moved, 0 or 1; 0 means the claim failed
+// and nothing is to be sent. See MarkTurnPromptReconnectAnswered's own
+// generated doc comment.
+func (s *TurnStore) MarkPromptReconnectAnswered(ctx context.Context, id pgtype.UUID, messageID string, checkedReadySeq, readySeq, resendCount int32, resend bool) (int64, error) {
+	var add int32
+	if resend {
+		add = 1
+	}
 	return s.q.MarkTurnPromptReconnectAnswered(ctx, sqlcgen.MarkTurnPromptReconnectAnsweredParams{
 		ReadySeq:        readySeq,
+		Resend:          add,
 		ID:              id,
 		MessageID:       messageID,
 		CheckedReadySeq: checkedReadySeq,
+		ResendCount:     resendCount,
 	})
 }

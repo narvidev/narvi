@@ -124,6 +124,18 @@ func TestTurnStore_SetPromptReceiptRequest(t *testing.T) {
 		t.Fatalf("request = (%v, %v, %v), want (msg-1, set, 4)", got.ReceiptRequestedMessageID, got.ReceiptRequestedAt, got.ReceiptCheckedReadySeq)
 	}
 
+	// A re-send counted, then the next dispatch's request starts it over.
+	if moved, err := turns.MarkPromptReconnectAnswered(ctx, turnID, "msg-1", 4, 5, 0, true); err != nil || moved != 1 {
+		t.Fatalf("claim with a re-send moved %d (%v), want 1", moved, err)
+	}
+	asked := "msg-1"
+	if err := turns.SetPromptReceiptRequest(ctx, turnID, &asked, 5); err != nil {
+		t.Fatal(err)
+	}
+	if got, err = turns.Get(ctx, turnID); err != nil || got.ReceiptResendCount != 0 {
+		t.Fatalf("receipt_resend_count after a new request = %d (%v), want 0", got.ReceiptResendCount, err)
+	}
+
 	if err := turns.SetPromptReceiptRequest(ctx, turnID, nil, 9); err != nil {
 		t.Fatal(err)
 	}
@@ -137,7 +149,8 @@ func TestTurnStore_SetPromptReceiptRequest(t *testing.T) {
 
 // TestTurnStore_MarkPromptReconnectAnswered_CAS: exactly one evaluation
 // claims a given ready, and only for a Processing, unflagged turn on the
-// dispatch that asked.
+// dispatch that asked, with the re-send count the claim read; a claim
+// answered by a re-send counts it.
 func TestTurnStore_MarkPromptReconnectAnswered_CAS(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -150,9 +163,13 @@ func TestTurnStore_MarkPromptReconnectAnswered_CAS(t *testing.T) {
 		messageID string
 		checked   int32
 		readySeq  int32
+		resends   int32
+		resend    bool
 		want      int64
 	}{
 		{name: "the claim", messageID: "msg", checked: 3, readySeq: 5, want: 1},
+		{name: "the claim, answered by a re-send", messageID: "msg", checked: 3, readySeq: 5, resend: true, want: 1},
+		{name: "a stale re-send count", messageID: "msg", checked: 3, readySeq: 5, resends: 1, resend: true, want: 0},
 		{name: "not a newer ready", messageID: "msg", checked: 3, readySeq: 3, want: 0},
 		{name: "a message mismatch", messageID: "msg-other", checked: 3, readySeq: 5, want: 0},
 		{name: "a stale checked seq", messageID: "msg", checked: 2, readySeq: 5, want: 0},
@@ -177,26 +194,39 @@ func TestTurnStore_MarkPromptReconnectAnswered_CAS(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			turnID := processingTurnWithRequest(ctx, t, pool, sessionID, "msg", 3)
+			// Settle the turn whatever happens, so the next case's processing
+			// turn is the session's only one (turns_one_processing_per_session).
+			t.Cleanup(func() {
+				if _, err := turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: turnID, Status: sqlcgen.TurnStatusCompleted}); err != nil {
+					t.Error(err)
+				}
+			})
 			if tc.prepare != nil {
 				tc.prepare(t, turnID)
 			}
-			moved, err := turns.MarkPromptReconnectAnswered(ctx, turnID, tc.messageID, tc.checked, tc.readySeq)
+			moved, err := turns.MarkPromptReconnectAnswered(ctx, turnID, tc.messageID, tc.checked, tc.readySeq, tc.resends, tc.resend)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if moved != tc.want {
 				t.Fatalf("rows moved = %d, want %d", moved, tc.want)
 			}
+			row, err := turns.Get(ctx, turnID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantCount := int32(0)
+			if tc.want == 1 && tc.resend {
+				wantCount = 1
+			}
+			if row.ReceiptResendCount != wantCount {
+				t.Fatalf("receipt_resend_count = %d, want %d", row.ReceiptResendCount, wantCount)
+			}
 			if tc.want == 1 {
-				again, err := turns.MarkPromptReconnectAnswered(ctx, turnID, tc.messageID, tc.checked, tc.readySeq)
+				again, err := turns.MarkPromptReconnectAnswered(ctx, turnID, tc.messageID, tc.checked, tc.readySeq, row.ReceiptResendCount, tc.resend)
 				if err != nil || again != 0 {
 					t.Fatalf("a second claim with the old seq moved %d rows (%v), want 0", again, err)
 				}
-			}
-			// Settle the turn so the next case's processing turn is the
-			// session's only one (turns_one_processing_per_session).
-			if _, err := turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: turnID, Status: sqlcgen.TurnStatusCompleted}); err != nil {
-				t.Fatal(err)
 			}
 		})
 	}

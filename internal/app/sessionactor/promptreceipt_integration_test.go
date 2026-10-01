@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +21,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/rollout"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -196,6 +198,11 @@ type receiptRigOptions struct {
 	noTurn   bool
 	provider ports.SandboxProvider
 	timeouts *platform.Timeouts
+	// prompt is the pending turn's text; "do the thing" when empty.
+	prompt string
+	// repoFullName, when set, gives the session that one repo, enrolled in
+	// the cohort rollout, and the registry runs in cohort mode.
+	repoFullName string
 }
 
 func newReceiptRig(ctx context.Context, t *testing.T, opts receiptRigOptions) *receiptRig {
@@ -203,10 +210,19 @@ func newReceiptRig(ctx context.Context, t *testing.T, opts receiptRigOptions) *r
 	pool := newTestPool(t)
 	rig := &receiptRig{
 		pool:      pool,
-		sessionID: createTestSession(ctx, t, pool),
 		turns:     narvipg.NewTurnStore(pool),
 		sandboxes: narvipg.NewSandboxStore(pool),
 		commander: &receiptCommander{},
+	}
+	var options []RegistryOptions
+	if opts.repoFullName != "" {
+		rig.sessionID = createTestSessionWithRepos(ctx, t, pool, pgtype.UUID{}, "widgets", "https://github.com/"+opts.repoFullName+".git", "")
+		if _, err := narvipg.NewRepoSettingsStore(pool).UpsertSessionsEnabled(ctx, opts.repoFullName, true); err != nil {
+			t.Fatalf("enroll the repo: %v", err)
+		}
+		options = append(options, RegistryOptions{RolloutMode: rollout.ModeCohort})
+	} else {
+		rig.sessionID = createTestSession(ctx, t, pool)
 	}
 	if _, err := rig.sandboxes.Create(ctx, rig.sessionID); err != nil {
 		t.Fatalf("create sandbox: %v", err)
@@ -215,13 +231,17 @@ func newReceiptRig(ctx context.Context, t *testing.T, opts receiptRigOptions) *r
 		t.Fatalf("move sandbox to ready: %v", err)
 	}
 	if !opts.noTurn {
-		rig.turnID = createPendingTurn(ctx, t, rig.turns, rig.sessionID, "do the thing").ID
+		prompt := opts.prompt
+		if prompt == "" {
+			prompt = "do the thing"
+		}
+		rig.turnID = createPendingTurn(ctx, t, rig.turns, rig.sessionID, prompt).ID
 	}
 	timeouts := platform.DefaultTimeouts()
 	if opts.timeouts != nil {
 		timeouts = *opts.timeouts
 	}
-	r, err := NewRegistry(ctx, pool, timeouts, nil, rig.commander, opts.provider, "http://localhost:8080", nil, nil, "", nil, false)
+	r, err := NewRegistry(ctx, pool, timeouts, nil, rig.commander, opts.provider, "http://localhost:8080", nil, nil, "", nil, false, options...)
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
 	}
@@ -856,5 +876,188 @@ func TestPromptReceipt_ResendSendFailure_TurnStaysProcessing(t *testing.T) {
 	}
 	if got := promptResendCount(ctx, t, promptResendOutcomeSent) - sentBefore; got != 1 {
 		t.Fatalf("turn_prompt_resend_total{sent} moved by %d, want 1", got)
+	}
+}
+
+const capReachedMsg = "sessionactor: prompt not receipted by its sandbox, but it has been re-sent the most times a turn allows; not re-sent, the turn ends at its deadline"
+
+// TestPromptReceipt_ResendCapStopsADeterministicLoss: a prompt lost on
+// every delivery -- each send answered by another reconnect, as a frame
+// the sandbox can never take was -- is re-sent PromptResendMaxPerTurn
+// times and then no more: each later reconnect logs one WARN and counts
+// cap_reached, and the turn stays processing for its deadline.
+func TestPromptReceipt_ResendCapStopsADeterministicLoss(t *testing.T) {
+	logs := captureDefaultLoggerJSONSync(t)
+	ctx := context.Background()
+	rig := newReceiptRig(ctx, t, receiptRigOptions{})
+	maxResends := platform.DefaultTimeouts().PromptResendMaxPerTurn
+	capBefore := promptResendCount(ctx, t, promptResendOutcomeCapReached)
+
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	messageID := rig.dispatched(ctx, t).messageID
+	// Every send is lost, and the loss is a reconnect.
+	for i := 1; i <= maxResends; i++ {
+		sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+		if got := len(rig.commander.prompts(t)); got != 1+i {
+			t.Fatalf("reconnect %d: %d prompts sent, want %d", i, got, 1+i)
+		}
+	}
+	for i := 1; i <= 2; i++ {
+		sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+		if got := len(rig.commander.prompts(t)); got != 1+maxResends {
+			t.Fatalf("reconnect past the cap: %d prompts sent, want %d", got, 1+maxResends)
+		}
+		if got := countLogLines(t, logs, capReachedMsg); got != i {
+			t.Fatalf("%d cap WARN lines after %d reconnects past the cap, want %d", got, i, i)
+		}
+		if got := promptResendCount(ctx, t, promptResendOutcomeCapReached) - capBefore; got != int64(i) {
+			t.Fatalf("turn_prompt_resend_total{cap_reached} moved by %d, want %d", got, i)
+		}
+	}
+	for _, p := range rig.commander.prompts(t) {
+		if p.MessageId != messageID {
+			t.Fatalf("a re-send carried messageId %q, want %q", p.MessageId, messageID)
+		}
+	}
+	got := rig.turn(ctx, t)
+	if got.Status != sqlcgen.TurnStatusProcessing || got.ReceiptResendCount != int32(maxResends) {
+		t.Fatalf("turn status %s, receipt_resend_count %d; want processing, %d", got.Status, got.ReceiptResendCount, maxResends)
+	}
+}
+
+// TestPromptReceipt_PromptFrameOverTheLimit_RefusedNeverSent: a prompt
+// whose encoded frame is larger than a sandbox accepts
+// (platform.MaxPromptFrameBytes) is never written: its turn fails at
+// dispatch as a refusal, with a session warning naming both sizes and a
+// synthetic execution_complete saying why. The size measured is the
+// encoded frame's: a text of '<' is a sixth of its frame.
+func TestPromptReceipt_PromptFrameOverTheLimit_RefusedNeverSent(t *testing.T) {
+	ctx := context.Background()
+	text := strings.Repeat("<", platform.MaxPromptFrameBytes/6+1024)
+	if len(text) >= platform.MaxPromptFrameBytes {
+		t.Fatal("the text alone must fit: only its encoding exceeds the limit")
+	}
+	rig := newReceiptRig(ctx, t, receiptRigOptions{prompt: text})
+
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	if got := len(rig.commander.prompts(t)); got != 0 {
+		t.Fatalf("%d prompts sent, want 0: a frame over the limit is never written", got)
+	}
+	if got := rig.turn(ctx, t); got.Status != sqlcgen.TurnStatusFailed {
+		t.Fatalf("turn status = %s, want failed", got.Status)
+	}
+	var reason, warning string
+	if err := rig.pool.QueryRow(ctx,
+		`SELECT (SELECT payload->>'reason' FROM events WHERE session_id = $1 AND type = 'execution_complete'),
+		        (SELECT payload->>'message' FROM events WHERE session_id = $1 AND type = 'warning')`,
+		rig.sessionID).Scan(&reason, &warning); err != nil {
+		t.Fatalf("read the turn's end: %v", err)
+	}
+	if !strings.Contains(reason, "larger than the 33554432 bytes a sandbox accepts") {
+		t.Fatalf("synthetic execution_complete reason = %q, want the sizes named", reason)
+	}
+	if !strings.Contains(warning, "32.0 MiB a sandbox accepts") {
+		t.Fatalf("session warning = %q, want the limit named for a person", warning)
+	}
+}
+
+// TestPromptReceipt_ResendOverTheFrameLimit_RefusedNotSent: a re-send
+// whose frame would exceed the limit -- which its dispatch's did not, so
+// only a row changed since could make it so -- is refused and counted,
+// and the turn stays processing.
+func TestPromptReceipt_ResendOverTheFrameLimit_RefusedNotSent(t *testing.T) {
+	ctx := context.Background()
+	rig := newReceiptRig(ctx, t, receiptRigOptions{})
+	tooLargeBefore := promptResendCount(ctx, t, promptResendOutcomeFrameTooLarge)
+
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	if _, err := rig.pool.Exec(ctx, `UPDATE turns SET prompt = $2 WHERE id = $1`,
+		rig.turnID, strings.Repeat("<", platform.MaxPromptFrameBytes/6+1024)); err != nil {
+		t.Fatal(err)
+	}
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	if got := len(rig.commander.prompts(t)); got != 1 {
+		t.Fatalf("%d prompts sent, want only the dispatch", got)
+	}
+	if got := promptResendCount(ctx, t, promptResendOutcomeFrameTooLarge) - tooLargeBefore; got != 1 {
+		t.Fatalf("turn_prompt_resend_total{frame_too_large} moved by %d, want 1", got)
+	}
+	if got := rig.turn(ctx, t); got.Status != sqlcgen.TurnStatusProcessing {
+		t.Fatalf("turn status = %s, want processing", got.Status)
+	}
+}
+
+// TestPromptReceipt_CrossGenReenqueueToACapableGen_AsksAndIsResent: a turn
+// in flight on gen 1 is re-enqueued to a respawned gen 2 whose ready
+// advertises the capability: that dispatch asks for a receipt, records the
+// request under its new messageId, and gen 2's next reconnect re-sends it
+// under that same messageId.
+func TestPromptReceipt_CrossGenReenqueueToACapableGen_AsksAndIsResent(t *testing.T) {
+	ctx := context.Background()
+	rig := newReceiptRig(ctx, t, receiptRigOptions{})
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	first := rig.dispatched(ctx, t)
+
+	// Gen 1 is lost and respawned as gen 2, Ready.
+	if _, err := rig.sandboxes.UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{SessionID: rig.sessionID}); err != nil {
+		t.Fatalf("respawn: %v", err)
+	}
+	if _, err := rig.sandboxes.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{SessionID: rig.sessionID, Status: sqlcgen.SandboxStatusReady}); err != nil {
+		t.Fatalf("move sandbox to ready: %v", err)
+	}
+
+	// Gen 2's capable ready: the turn is re-enqueued to it, asking.
+	sendAndSettle(ctx, t, rig.actor, receiptReady(2, true), 2)
+	prompts := rig.commander.prompts(t)
+	if len(prompts) != 2 {
+		t.Fatalf("%d prompts sent, want the dispatch and the re-enqueue", len(prompts))
+	}
+	reenqueued := prompts[1]
+	if reenqueued.Gen != 2 || reenqueued.MessageId == first.messageID || !reenqueued.asksReceipt(t) {
+		t.Fatalf("re-enqueued prompt = %+v (%s), want gen 2, a new messageId, asking for a receipt", reenqueued.Prompt, reenqueued.raw)
+	}
+	got := rig.turn(ctx, t)
+	if got.ReceiptRequestedMessageID == nil || *got.ReceiptRequestedMessageID != reenqueued.MessageId {
+		t.Fatalf("receipt_requested_message_id = %v, want the re-enqueue's %q", got.ReceiptRequestedMessageID, reenqueued.MessageId)
+	}
+
+	// Gen 2 reconnects: the re-enqueued prompt is re-sent, same messageId.
+	sendAndSettle(ctx, t, rig.actor, receiptReady(2, true), 2)
+	prompts = rig.commander.prompts(t)
+	if len(prompts) != 3 || prompts[2].MessageId != reenqueued.MessageId || prompts[2].Gen != 2 || !prompts[2].asksReceipt(t) {
+		t.Fatalf("after gen 2 reconnects: %d prompts, last %+v; want a third, %q on gen 2, asking", len(prompts), prompts[len(prompts)-1].Prompt, reenqueued.MessageId)
+	}
+}
+
+// TestPromptReceipt_RolloutRefusesTheResend_NothingSent: a re-send passes
+// the turn-dispatch-time rollout re-check: once the session's repo is
+// un-enrolled, a same-gen reconnect sends nothing, counts refused, and
+// fails nothing.
+func TestPromptReceipt_RolloutRefusesTheResend_NothingSent(t *testing.T) {
+	ctx := context.Background()
+	repo := "acme/zz-resend-refusal-" + uuid.NewString()[:8]
+	rig := newReceiptRig(ctx, t, receiptRigOptions{repoFullName: repo})
+	refusedBefore := promptResendCount(ctx, t, promptResendOutcomeRefused)
+	sentBefore := promptResendCount(ctx, t, promptResendOutcomeSent)
+
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	if got := len(rig.commander.prompts(t)); got != 1 {
+		t.Fatalf("%d prompts sent, want the dispatch to the enrolled repo", got)
+	}
+	if _, err := narvipg.NewRepoSettingsStore(rig.pool).UpsertSessionsEnabled(ctx, repo, false); err != nil {
+		t.Fatalf("un-enroll the repo: %v", err)
+	}
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	if got := len(rig.commander.prompts(t)); got != 1 {
+		t.Fatalf("%d prompts sent, want no re-send to an un-enrolled repo", got)
+	}
+	if got := promptResendCount(ctx, t, promptResendOutcomeRefused) - refusedBefore; got != 1 {
+		t.Fatalf("turn_prompt_resend_total{refused} moved by %d, want 1", got)
+	}
+	if got := promptResendCount(ctx, t, promptResendOutcomeSent) - sentBefore; got != 0 {
+		t.Fatalf("turn_prompt_resend_total{sent} moved by %d, want 0", got)
+	}
+	if got := rig.turn(ctx, t); got.Status != sqlcgen.TurnStatusProcessing {
+		t.Fatalf("turn status = %s, want processing: a refused re-send fails nothing", got.Status)
 	}
 }

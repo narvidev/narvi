@@ -7,7 +7,7 @@
 -- turn_deadline. A capable agent now answers a prompt that asks for it
 -- with a prompt_received event, and the session actor re-sends, once per
 -- same-gen reconnect, a prompt whose receipt is not stored -- with the same
--- messageId, which the agent runs at most once. These five columns are what
+-- messageId, which the agent runs at most once. These six columns are what
 -- that decision reads and writes; the receipt itself is the stored events
 -- row, found by its deterministic key (session_id,
 -- message_id = 'prompt_received:' || dispatched_message_id) through the
@@ -31,6 +31,13 @@
 -- the prompt re-sent, found receipted, or refused past the window -- and is
 -- the compare-and-set token that lets exactly one evaluation answer a
 -- given ready.
+--
+-- turns.receipt_resend_count: how many times that dispatch's prompt has
+-- been re-sent, moved by the same compare-and-set that claims the ready a
+-- re-send answers, and reset to 0 by every dispatch that records a
+-- request. PromptResendMaxPerTurn caps it, a backstop against a loss that
+-- recurs on every reconnect. NOT NULL DEFAULT 0, so the previous binary's
+-- CreateTurn, which names no such column, inserts 0.
 --
 -- sandboxes.prompt_receipt_gen: the gen whose latest ready advertised
 -- capabilities.promptReceipt. Written only for the live gen and, like
@@ -62,10 +69,11 @@
 --   - Every statement it sends names its columns (sqlc writes each
 --     SELECT * and RETURNING * out as a column list), so it neither reads
 --     nor writes them.
---   - Its CreateTurn leaves the three turn columns NULL, and its
---     UpdateTurnStatus leaves them untouched. Its cross-gen re-enqueue
---     therefore leaves a stale receipt_requested_message_id that no longer
---     equals the new dispatched_message_id, which reads as not asked.
+--   - Its CreateTurn leaves the three nullable turn columns NULL and
+--     receipt_resend_count 0, and its UpdateTurnStatus leaves all four
+--     untouched. Its cross-gen re-enqueue therefore leaves a stale
+--     receipt_requested_message_id that no longer equals the new
+--     dispatched_message_id, which reads as not asked.
 --   - Its UpsertSandboxForSpawn leaves ready_seq at its value and
 --     prompt_receipt_gen stale; the gen bump makes it not match.
 --   - Its ready handling counts nothing and records no capability, and it
@@ -96,5 +104,6 @@
 ALTER TABLE turns ADD COLUMN IF NOT EXISTS receipt_requested_message_id TEXT;
 ALTER TABLE turns ADD COLUMN IF NOT EXISTS receipt_requested_at TIMESTAMPTZ;
 ALTER TABLE turns ADD COLUMN IF NOT EXISTS receipt_checked_ready_seq INTEGER;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS receipt_resend_count INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS prompt_receipt_gen INTEGER;
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS ready_seq INTEGER NOT NULL DEFAULT 0;

@@ -20,8 +20,9 @@ import (
 // This file runs migration 000154 (prompt_receipts) through golang-migrate
 // against real Postgres, in a database of its own migrated to 153 first.
 // The up adds what technical plan §3.3's prompt receipts read and write:
-// three turn columns (the request a dispatch recorded, its instant, and
-// the last reconnect its check answered) and two sandbox columns (the gen
+// four turn columns (the request a dispatch recorded, its instant, the
+// last reconnect its check answered and its re-sends) and two sandbox
+// columns (the gen
 // whose latest ready advertised the capability, and the count of readies);
 // the down removes them.
 //
@@ -108,7 +109,7 @@ func TestMigrationPromptReceipts_UpAndDown(t *testing.T) {
 		t.Helper()
 		rows, err := db.QueryContext(ctx, `SELECT table_name || '.' || column_name, is_nullable || ' ' || coalesce(column_default, '')
 			FROM information_schema.columns
-			WHERE (table_name = 'turns' AND column_name IN ('receipt_requested_message_id', 'receipt_requested_at', 'receipt_checked_ready_seq'))
+			WHERE (table_name = 'turns' AND column_name IN ('receipt_requested_message_id', 'receipt_requested_at', 'receipt_checked_ready_seq', 'receipt_resend_count'))
 			   OR (table_name = 'sandboxes' AND column_name IN ('prompt_receipt_gen', 'ready_seq'))`)
 		if err != nil {
 			t.Fatal(err)
@@ -152,6 +153,7 @@ func TestMigrationPromptReceipts_UpAndDown(t *testing.T) {
 		"turns.receipt_requested_message_id": "YES ",
 		"turns.receipt_requested_at":         "YES ",
 		"turns.receipt_checked_ready_seq":    "YES ",
+		"turns.receipt_resend_count":         "NO 0",
 		"sandboxes.prompt_receipt_gen":       "YES ",
 		"sandboxes.ready_seq":                "NO 0",
 	}
@@ -221,13 +223,13 @@ func TestMigrationPromptReceipts_UpAndDown(t *testing.T) {
 	}
 	// Not asked: the check's compare-and-set refuses that dispatch.
 	moved, err := q.MarkTurnPromptReconnectAnswered(ctx, sqlcgen.MarkTurnPromptReconnectAnsweredParams{
-		ReadySeq: 2, ID: turn, MessageID: "msg-previous-binary", CheckedReadySeq: 1,
+		ReadySeq: 2, Resend: 1, ID: turn, MessageID: "msg-previous-binary", CheckedReadySeq: 1, ResendCount: 0,
 	})
 	if err != nil || moved != 0 {
 		t.Fatalf("claim for the previous binary's dispatch moved %d rows (%v), want 0: it asked for nothing", moved, err)
 	}
 	var pendingNull bool
-	if err := db.QueryRowContext(ctx, `SELECT bool_and(receipt_requested_message_id IS NULL AND receipt_requested_at IS NULL AND receipt_checked_ready_seq IS NULL)
+	if err := db.QueryRowContext(ctx, `SELECT bool_and(receipt_requested_message_id IS NULL AND receipt_requested_at IS NULL AND receipt_checked_ready_seq IS NULL AND receipt_resend_count = 0)
 		FROM turns WHERE session_id = $1 AND id <> $2`, sessionID, turnID).Scan(&pendingNull); err != nil || !pendingNull {
 		t.Fatalf("the previous binary's new turn carries a request (%v), want none", err)
 	}

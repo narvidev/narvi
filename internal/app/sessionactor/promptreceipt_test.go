@@ -132,3 +132,26 @@ func TestPromptResendFacts(t *testing.T) {
 		})
 	}
 }
+
+// TestRefusedSandboxFrame_AdmitsPromptReceiptFrames pins that the frames
+// technical plan §3.3's prompt receipts add are a sandbox's own: neither a
+// prompt_received nor a ready advertising the capability is an event type
+// the control plane reserves, typeless, or shaped like a client reply, so
+// handleSandboxEvent stores both.
+func TestRefusedSandboxFrame_AdmitsPromptReceiptFrames(t *testing.T) {
+	t.Parallel()
+
+	for _, cmd := range []SandboxEvent{
+		{Type: "prompt_received", Gen: 1, MessageID: "prompt_received:m1",
+			Raw: json.RawMessage(`{"type":"prompt_received","messageId":"prompt_received:m1","sessionId":"s","gen":1,"promptMessageId":"m1","duplicate":true}`)},
+		{Type: "ready", Gen: 1, MessageID: "r1",
+			Raw: json.RawMessage(`{"type":"ready","messageId":"r1","sessionId":"s","gen":1,"timestamp":"2026-10-01T12:00:00Z","agentVersion":"dev","imageDigest":"unknown","capabilities":{"promptReceipt":true}}`)},
+	} {
+		if reason, refused := refusedSandboxFrame(cmd); refused {
+			t.Errorf("refusedSandboxFrame(%s) refused it (%s), want it stored", cmd.Type, reason)
+		}
+		if serverEventTypes[cmd.Type] {
+			t.Errorf("%s is reserved as a control-plane event type, want it the sandbox's", cmd.Type)
+		}
+	}
+}

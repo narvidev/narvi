@@ -2240,6 +2240,11 @@ func (a *Actor) tryPlanDispatch(
 // planned this dispatch deleted (invalid when it deleted none): the first
 // arm of the chain a failed delivery backs off from (failDispatchedTurn).
 //
+// No frame larger than platform.MaxPromptFrameBytes is ever written: the
+// agent reads no longer message, and its connection would close on it
+// (§6.1). Such a turn fails here, through the same failDispatchedTurn, as
+// a refusal naming both sizes.
+//
 // A plan carrying receiptResend -- technical plan §3.3's prompt-receipt
 // check of a same-gen reconnect -- goes to executeReceiptResend instead,
 // which runs the same rollout re-check but never fails the turn: its
@@ -2259,6 +2264,27 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainSt
 			warning: fmt.Sprintf("This session's turn was ended: its repository %q is not enrolled in this deployment's rollout, so the turn was not sent to its sandbox. "+
 				"An admin can enroll the repository; then send the turn again.", repo),
 			notAssessed: reviewcheck.NotAssessedRolloutNotEnrolled,
+			refused:     true,
+		})
+	}
+
+	// Technical plan §6.1: no prompt frame longer than a sandbox reads is
+	// ever written -- the agent's connection would close on it
+	// (StatusMessageTooBig) and the prompt be lost. The size is the encoded
+	// frame's, escaping included, and a prompt that big will not shrink on
+	// a retry, so the turn ends here as a refusal: named, with its sizes,
+	// in a session warning and on a review attempt's check, and never
+	// queued again by the workflow engine (OnTurnRefused) or backed off
+	// for a retry.
+	if size := len(plan.payload); size > platform.MaxPromptFrameBytes {
+		a.logger.Error("sessionactor: refusing to dispatch turn: its prompt frame is larger than a sandbox accepts",
+			"session_id", a.sessionID.String(), "turn_id", plan.turnID.String(),
+			"frame_bytes", size, "max_frame_bytes", platform.MaxPromptFrameBytes)
+		return a.failDispatchedTurn(ctx, plan.turnID, dispatchFailure{
+			reason: fmt.Sprintf("prompt frame of %d bytes is larger than the %d bytes a sandbox accepts", size, platform.MaxPromptFrameBytes),
+			warning: fmt.Sprintf("This session's turn was ended: its prompt is %s once encoded, more than the %s a sandbox accepts in one message, so it was not sent. "+
+				"Shorten the prompt, or split the work across turns, then send the turn again.", formatMiB(size), formatMiB(platform.MaxPromptFrameBytes)),
+			notAssessed: reviewcheck.NotAssessedPromptNotDelivered,
 			refused:     true,
 		})
 	}
@@ -2334,10 +2360,11 @@ func (a *Actor) rolloutRefusalForDispatch(ctx context.Context, sessionRow sqlcge
 // here (internal/domain/turn/state.go is explicitly off-limits this
 // Step), so the only legal move is forward.
 //
-// Two callers reach this, both from executeDispatch: a genuine
+// Three callers reach this, all from executeDispatch: a genuine
 // SandboxCommander.SendCommand failure (this function's ORIGINAL, §9.3
-// reason for existing), and §10's own turn-dispatch-time rollout
-// refusal (rolloutRefusalForDispatch, above) -- deliberately the SAME
+// reason for existing), a prompt frame larger than a sandbox accepts
+// (platform.MaxPromptFrameBytes, §6.1), and §10's own turn-dispatch-time
+// rollout refusal (rolloutRefusalForDispatch, above) -- deliberately the SAME
 // terminal path for both, not two parallel ones: from the turn's own
 // perspective, "the actor decided this prompt will never reach a
 // sandbox" is one event, regardless of whether the proximate cause was a
@@ -2532,10 +2559,12 @@ type dispatchFailure struct {
 	notAssessed reviewcheck.NotAssessedReason
 	// warning, when set, is recorded as a session warning (the banner).
 	warning string
-	// refused marks a policy refusal of a prompt that was never sent: the
-	// workflow engine hears it through OnTurnRefused, which escalates the
-	// run and queues nothing. Anything else is an undelivered prompt, and
-	// backs the session's dispatch timer off (backOffAfterUndeliveredPrompt).
+	// refused marks a prompt that was never sent and would be refused
+	// again on a retry -- a policy refusal, or a frame larger than a
+	// sandbox accepts (platform.MaxPromptFrameBytes): the workflow engine
+	// hears it through OnTurnRefused, which escalates the run and queues
+	// nothing. Anything else is an undelivered prompt, and backs the
+	// session's dispatch timer off (backOffAfterUndeliveredPrompt).
 	refused bool
 	// backOffSince is the first arm of the dispatch timer's chain of
 	// failures, carried from the evaluation that planned the dispatch.
@@ -2609,6 +2638,11 @@ func BuildPromptPayload(sessionID string, sessionRow sqlcgen.Session, sandboxRow
 		prompt.ReceiptRequested = &receiptRequested
 	}
 	return json.Marshal(prompt)
+}
+
+// formatMiB renders a byte count as MiB with one decimal, for a person.
+func formatMiB(bytes int) string {
+	return fmt.Sprintf("%.1f MiB", float64(bytes)/(1<<20))
 }
 
 // toQueueEntries adapts stored turn rows into the generic

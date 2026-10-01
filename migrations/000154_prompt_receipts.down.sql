@@ -1,6 +1,6 @@
 -- Reverses 000154_prompt_receipts.up.sql. With the columns go every
--- turn's record of the receipt its dispatch asked for, and every sandbox's
--- ready count and capability gen. Nothing a binary without 000154 reads; a
+-- turn's record of the receipt its dispatch asked for and of its
+-- re-sends, and every sandbox's ready count and capability gen. Nothing a binary without 000154 reads; a
 -- binary with it that runs 000154 again reads every turn as not asked and
 -- every sandbox as not capable until its next ready, which is the
 -- behavior before this release -- a lost prompt then waits out
@@ -26,6 +26,7 @@
 -- sandboxes, then on turns, for the file's one implicit transaction.
 ALTER TABLE sandboxes DROP COLUMN IF EXISTS ready_seq;
 ALTER TABLE sandboxes DROP COLUMN IF EXISTS prompt_receipt_gen;
+ALTER TABLE turns DROP COLUMN IF EXISTS receipt_resend_count;
 ALTER TABLE turns DROP COLUMN IF EXISTS receipt_checked_ready_seq;
 ALTER TABLE turns DROP COLUMN IF EXISTS receipt_requested_at;
 ALTER TABLE turns DROP COLUMN IF EXISTS receipt_requested_message_id;

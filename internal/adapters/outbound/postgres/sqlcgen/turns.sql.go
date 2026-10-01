@@ -15,7 +15,7 @@ const createTurn = `-- name: CreateTurn :one
 
 INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, is_review_attempt)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count
 `
 
 type CreateTurnParams struct {
@@ -168,6 +168,7 @@ func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, e
 		&i.ReceiptRequestedMessageID,
 		&i.ReceiptRequestedAt,
 		&i.ReceiptCheckedReadySeq,
+		&i.ReceiptResendCount,
 	)
 	return i, err
 }
@@ -298,7 +299,7 @@ func (q *Queries) GetPlatformCostSummaryInWindow(ctx context.Context, createdAt 
 }
 
 const getProcessingTurnForSession = `-- name: GetProcessingTurnForSession :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count FROM turns
 WHERE session_id = $1 AND status = 'processing'
 `
 
@@ -345,12 +346,13 @@ func (q *Queries) GetProcessingTurnForSession(ctx context.Context, sessionID pgt
 		&i.ReceiptRequestedMessageID,
 		&i.ReceiptRequestedAt,
 		&i.ReceiptCheckedReadySeq,
+		&i.ReceiptResendCount,
 	)
 	return i, err
 }
 
 const getTurn = `-- name: GetTurn :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count FROM turns
 WHERE id = $1
 `
 
@@ -388,12 +390,13 @@ func (q *Queries) GetTurn(ctx context.Context, id pgtype.UUID) (Turn, error) {
 		&i.ReceiptRequestedMessageID,
 		&i.ReceiptRequestedAt,
 		&i.ReceiptCheckedReadySeq,
+		&i.ReceiptResendCount,
 	)
 	return i, err
 }
 
 const getTurnByDispatchedMessageID = `-- name: GetTurnByDispatchedMessageID :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count FROM turns
 WHERE session_id = $1 AND dispatched_message_id = $2
 `
 
@@ -466,6 +469,7 @@ func (q *Queries) GetTurnByDispatchedMessageID(ctx context.Context, arg GetTurnB
 		&i.ReceiptRequestedMessageID,
 		&i.ReceiptRequestedAt,
 		&i.ReceiptCheckedReadySeq,
+		&i.ReceiptResendCount,
 	)
 	return i, err
 }
@@ -678,7 +682,7 @@ func (q *Queries) ListStopRequestedOpenTurns(ctx context.Context, arg ListStopRe
 }
 
 const listTurnsForSession = `-- name: ListTurnsForSession :many
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count FROM turns
 WHERE session_id = $1
 ORDER BY created_at ASC
 `
@@ -726,6 +730,7 @@ func (q *Queries) ListTurnsForSession(ctx context.Context, sessionID pgtype.UUID
 			&i.ReceiptRequestedMessageID,
 			&i.ReceiptRequestedAt,
 			&i.ReceiptCheckedReadySeq,
+			&i.ReceiptResendCount,
 		); err != nil {
 			return nil, err
 		}
@@ -769,21 +774,25 @@ func (q *Queries) MarkTurnProgressNotified(ctx context.Context, arg MarkTurnProg
 
 const markTurnPromptReconnectAnswered = `-- name: MarkTurnPromptReconnectAnswered :execrows
 UPDATE turns
-SET receipt_checked_ready_seq = $1::integer
-WHERE id = $2
+SET receipt_checked_ready_seq = $1::integer,
+    receipt_resend_count = receipt_resend_count + $2::integer
+WHERE id = $3
   AND status = 'processing'
   AND stop_requested_at IS NULL
-  AND dispatched_message_id = $3::text
-  AND receipt_requested_message_id = $3::text
-  AND receipt_checked_ready_seq = $4::integer
+  AND dispatched_message_id = $4::text
+  AND receipt_requested_message_id = $4::text
+  AND receipt_checked_ready_seq = $5::integer
   AND receipt_checked_ready_seq < $1::integer
+  AND receipt_resend_count = $6::integer
 `
 
 type MarkTurnPromptReconnectAnsweredParams struct {
 	ReadySeq        int32       `json:"ready_seq"`
+	Resend          int32       `json:"resend"`
 	ID              pgtype.UUID `json:"id"`
 	MessageID       string      `json:"message_id"`
 	CheckedReadySeq int32       `json:"checked_ready_seq"`
+	ResendCount     int32       `json:"resend_count"`
 }
 
 // Technical plan §3.3, prompt receipts: claims one same-gen reconnect of
@@ -793,13 +802,19 @@ type MarkTurnPromptReconnectAnsweredParams struct {
 // dispatch that asked for the receipt, with no other evaluation having
 // claimed this ready first. 0 rows affected means one of those no longer
 // holds, and nothing is sent. The stop guard is defense in depth behind
-// planReenqueueOrRespawn's own early return on stop_requested_at.
+// planReenqueueOrRespawn's own early return on stop_requested_at. resend
+// (0 or 1) is added to receipt_resend_count in the same statement when
+// the claim is answered by a re-send, and the count read is part of the
+// claim, so PromptResendMaxPerTurn is enforced on the same row state the
+// decision read.
 func (q *Queries) MarkTurnPromptReconnectAnswered(ctx context.Context, arg MarkTurnPromptReconnectAnsweredParams) (int64, error) {
 	result, err := q.db.Exec(ctx, markTurnPromptReconnectAnswered,
 		arg.ReadySeq,
+		arg.Resend,
 		arg.ID,
 		arg.MessageID,
 		arg.CheckedReadySeq,
+		arg.ResendCount,
 	)
 	if err != nil {
 		return 0, err
@@ -956,7 +971,8 @@ const setTurnPromptReceiptRequest = `-- name: SetTurnPromptReceiptRequest :exec
 UPDATE turns
 SET receipt_requested_message_id = $1,
     receipt_requested_at = CASE WHEN $1::text IS NULL THEN NULL ELSE now() END,
-    receipt_checked_ready_seq = CASE WHEN $1::text IS NULL THEN NULL ELSE $2::integer END
+    receipt_checked_ready_seq = CASE WHEN $1::text IS NULL THEN NULL ELSE $2::integer END,
+    receipt_resend_count = 0
 WHERE id = $3
 `
 
@@ -974,7 +990,8 @@ type SetTurnPromptReceiptRequestParams struct {
 // dispatch that does not ask clears an earlier request. receipt_requested_at
 // is the database's now(), the start of PromptResendWindow, and
 // receipt_checked_ready_seq the sandbox's ready_seq at the dispatch, so only
-// a ready recorded after it counts as a reconnect to answer.
+// a ready recorded after it counts as a reconnect to answer. Every dispatch
+// starts its re-sends from 0 (receipt_resend_count).
 func (q *Queries) SetTurnPromptReceiptRequest(ctx context.Context, arg SetTurnPromptReceiptRequestParams) error {
 	_, err := q.db.Exec(ctx, setTurnPromptReceiptRequest, arg.MessageID, arg.ReadySeq, arg.ID)
 	return err
@@ -989,7 +1006,7 @@ SET status = $2,
     dispatched_event_id = COALESCE($6, dispatched_event_id),
     dispatched_message_id = COALESCE($7, dispatched_message_id)
 WHERE id = $1
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count
 `
 
 type UpdateTurnStatusParams struct {
@@ -1078,6 +1095,7 @@ func (q *Queries) UpdateTurnStatus(ctx context.Context, arg UpdateTurnStatusPara
 		&i.ReceiptRequestedMessageID,
 		&i.ReceiptRequestedAt,
 		&i.ReceiptCheckedReadySeq,
+		&i.ReceiptResendCount,
 	)
 	return i, err
 }

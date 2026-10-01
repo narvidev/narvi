@@ -73,10 +73,16 @@ const (
 	// ends as it would have without receipts, at turn_deadline or by a
 	// person's stop.
 	PromptResendWindowExpired
-	// PromptResendSend means no receipt is stored, inside the window. The
-	// prompt is sent again, with the same messageId, which the agent runs
-	// at most once.
+	// PromptResendSend means no receipt is stored, inside the window, under
+	// the cap. The prompt is sent again, with the same messageId, which the
+	// agent runs at most once.
 	PromptResendSend
+	// PromptResendCapReached means no receipt is stored, inside the window,
+	// but the dispatch's prompt has already been re-sent the most times
+	// allowed: a loss that recurs on every reconnect -- a frame the sandbox
+	// can never take -- is not fed by more re-sends. Nothing is sent; the
+	// turn ends as one whose window ran out.
+	PromptResendCapReached
 )
 
 // String names the outcome as the session actor logs and counts it.
@@ -88,6 +94,8 @@ func (o PromptResendOutcome) String() string {
 		return "window_expired"
 	case PromptResendSend:
 		return "send"
+	case PromptResendCapReached:
+		return "cap_reached"
 	default:
 		return "unknown"
 	}
@@ -96,15 +104,19 @@ func (o PromptResendOutcome) String() string {
 // DecidePromptResend decides what to do about a reconnect
 // PromptReconnectToAnswer said to answer: receiptStored is whether the
 // turn's receipt is stored, sinceRequest how long ago its dispatch asked
-// for one, and window PromptResendWindow. A stored receipt wins; without
-// one, an elapsed time at or past the window refuses, and anything short of
-// it -- a negative elapsed time included -- sends.
-func DecidePromptResend(receiptStored bool, sinceRequest, window time.Duration) PromptResendOutcome {
+// for one, window PromptResendWindow, resends how many times the
+// dispatch's prompt has been re-sent already and maxResends
+// PromptResendMaxPerTurn. A stored receipt wins; without one, an elapsed
+// time at or past the window refuses, then resends at or past the cap
+// refuse, and anything else -- a negative elapsed time included -- sends.
+func DecidePromptResend(receiptStored bool, sinceRequest, window time.Duration, resends, maxResends int) PromptResendOutcome {
 	switch {
 	case receiptStored:
 		return PromptResendReceiptStored
 	case sinceRequest >= window:
 		return PromptResendWindowExpired
+	case resends >= maxResends:
+		return PromptResendCapReached
 	default:
 		return PromptResendSend
 	}

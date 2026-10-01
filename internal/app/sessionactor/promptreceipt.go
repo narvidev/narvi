@@ -69,9 +69,15 @@
 // the ready with a compare-and-set on receipt_checked_ready_seq, and
 // turn.DecidePromptResend says what follows: a stored receipt sends
 // nothing; past PromptResendWindow nothing is sent either, and one WARN says
-// so; otherwise executeReceiptResend writes the prompt again. So a prompt is
-// re-sent at most once per reconnect, and never once its receipt is stored
-// or its turn has left Processing.
+// so; past PromptResendMaxPerTurn re-sends of the dispatch nothing is sent
+// either, with one WARN; otherwise executeReceiptResend writes the prompt
+// again. So a prompt is re-sent at most once per reconnect, at most
+// PromptResendMaxPerTurn times in all, and never once its receipt is stored
+// or its turn has left Processing. The cap is the backstop for a loss that
+// is not a one-off: each re-send is answered only after the next
+// reconnect, and a frame the sandbox can never take -- one over its read
+// limit, before platform.MaxPromptFrameBytes existed -- causes the very
+// reconnect that would re-send it.
 //
 // The re-send is the original prompt: the same messageId, which the agent
 // dedups on and httpapi.PostReviewVerdict resolves the turn by. It re-arms
@@ -98,6 +104,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/turn"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // The outcome attribute of turn_prompt_resend_total (opsmetrics.go).
@@ -106,6 +113,8 @@ const (
 	promptResendOutcomeSendFailed    = "send_failed"
 	promptResendOutcomeRefused       = "refused"
 	promptResendOutcomeWindowExpired = "window_expired"
+	promptResendOutcomeCapReached    = "cap_reached"
+	promptResendOutcomeFrameTooLarge = "frame_too_large"
 )
 
 // receiptResendPlan is what tryPlanReceiptResend hands executeDispatch, on
@@ -126,6 +135,9 @@ type receiptResendPlan struct {
 	// sinceRequest is how long before the check the dispatch asked for a
 	// receipt, on the database's clock.
 	sinceRequest time.Duration
+	// resends is how many times the dispatch's prompt had been re-sent
+	// before this check.
+	resends int32
 }
 
 // readyAdvertisesPromptReceipt reports whether a ready event advertises
@@ -219,11 +231,16 @@ func (a *Actor) tryPlanReceiptResend(
 		// instant are written together (SetTurnPromptReceiptRequest).
 		return nil, nil
 	}
-	outcome := turn.DecidePromptResend(stored, since, a.timeouts.PromptResendWindow)
+	outcome := turn.DecidePromptResend(stored, since, a.timeouts.PromptResendWindow,
+		int(target.ReceiptResendCount), a.timeouts.PromptResendMaxPerTurn)
 
+	// The claim counts the re-send it decides on in the same statement,
+	// and holds only while the count is the one decided on: the cap is
+	// enforced on the row state this evaluation read.
 	messageID := *target.DispatchedMessageID
 	checked := *target.ReceiptCheckedReadySeq
-	moved, err := turns.MarkPromptReconnectAnswered(ctx, target.ID, messageID, checked, sandboxRow.ReadySeq)
+	moved, err := turns.MarkPromptReconnectAnswered(ctx, target.ID, messageID, checked, sandboxRow.ReadySeq,
+		target.ReceiptResendCount, outcome == turn.PromptResendSend)
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: claim the reconnect for the prompt receipt check: %w", err)
 	}
@@ -257,17 +274,22 @@ func (a *Actor) tryPlanReceiptResend(
 			checkedReadySeq: checked,
 			readySeq:        sandboxRow.ReadySeq,
 			sinceRequest:    since,
+			resends:         target.ReceiptResendCount,
 		},
 	}, nil
 }
 
 // executeReceiptResend acts, outside any transaction, on what
 // tryPlanReceiptResend decided and committed: nothing for a stored
-// receipt, one WARN and a count past the window, and otherwise the
-// original prompt written again. A re-send passes the same turn-dispatch-
-// time rollout re-check every dispatch does (executeDispatch), but neither
-// a refusal nor a failed write fails the turn, as executeDispatch's would:
-// the prompt may already be running, and the next reconnect asks again.
+// receipt, one WARN and a count past the window or the cap
+// (PromptResendMaxPerTurn), and otherwise the original prompt written
+// again. A re-send passes the same turn-dispatch-time checks every
+// dispatch does (executeDispatch) -- the rollout re-check and the frame's
+// size against platform.MaxPromptFrameBytes -- but neither a refusal nor a
+// failed write fails the turn, as executeDispatch's would: the prompt may
+// already be running, and the next reconnect asks again. The size check
+// cannot refuse a frame the same dispatch already sent; it is there so no
+// frame over the limit is ever written, whatever produced it.
 //
 // The payload tryPlanReceiptResend built carries the turn's own
 // dispatched_message_id -- never a new one -- and receiptRequested: the
@@ -286,6 +308,12 @@ func (a *Actor) executeReceiptResend(ctx context.Context, plan *dispatchPlan) er
 			"since_request", rr.sinceRequest.String(), "window", a.timeouts.PromptResendWindow.String())
 		a.recordPromptResend(ctx, promptResendOutcomeWindowExpired)
 		return nil
+	case turn.PromptResendCapReached:
+		a.logger.Warn("sessionactor: prompt not receipted by its sandbox, but it has been re-sent the most times a turn allows; not re-sent, the turn ends at its deadline",
+			"turn_id", plan.turnID.String(), "gen", rr.gen, "message_id", rr.messageID,
+			"resends", rr.resends, "max", a.timeouts.PromptResendMaxPerTurn)
+		a.recordPromptResend(ctx, promptResendOutcomeCapReached)
+		return nil
 	case turn.PromptResendSend:
 	default:
 		return fmt.Errorf("sessionactor: unknown prompt resend outcome %v", rr.outcome)
@@ -297,11 +325,19 @@ func (a *Actor) executeReceiptResend(ctx context.Context, plan *dispatchPlan) er
 		a.recordPromptResend(ctx, promptResendOutcomeRefused)
 		return nil
 	}
+	if len(plan.payload) > platform.MaxPromptFrameBytes {
+		a.logger.Warn("sessionactor: prompt re-send refused: the frame is larger than a sandbox accepts; the turn stays processing",
+			"turn_id", plan.turnID.String(), "gen", rr.gen, "message_id", rr.messageID,
+			"frame_bytes", len(plan.payload), "max_frame_bytes", platform.MaxPromptFrameBytes)
+		a.recordPromptResend(ctx, promptResendOutcomeFrameTooLarge)
+		return nil
+	}
 
 	a.logger.Info("sessionactor: re-sending a prompt its sandbox has not receipted, after a same-gen reconnect",
 		"turn_id", plan.turnID.String(), "gen", rr.gen, "message_id", rr.messageID,
 		"checked_ready_seq", rr.checkedReadySeq, "ready_seq", rr.readySeq,
-		"since_request", rr.sinceRequest.String(), "window", a.timeouts.PromptResendWindow.String())
+		"since_request", rr.sinceRequest.String(), "window", a.timeouts.PromptResendWindow.String(),
+		"resend", rr.resends+1, "max", a.timeouts.PromptResendMaxPerTurn)
 	if err := a.commander.SendCommand(a.sessionID.String(), plan.payload); err != nil {
 		a.logger.Warn("sessionactor: prompt re-send failed; the turn stays processing and the next reconnect asks again",
 			"turn_id", plan.turnID.String(), "gen", rr.gen, "message_id", rr.messageID, "error", err)

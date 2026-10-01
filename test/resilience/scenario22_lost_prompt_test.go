@@ -67,6 +67,11 @@ type lostPromptRig struct {
 // newLostPromptRig seeds a Ready sandbox at gen 1 and a pending turn, and
 // scripts the proxy's first connection with first.
 func newLostPromptRig(ctx context.Context, t *testing.T, timeouts platform.Timeouts, first wsProxyStep) *lostPromptRig {
+	return newLostPromptRigWithPrompt(ctx, t, timeouts, first, "scenario22 turn")
+}
+
+// newLostPromptRigWithPrompt is newLostPromptRig with the turn's text.
+func newLostPromptRigWithPrompt(ctx context.Context, t *testing.T, timeouts platform.Timeouts, first wsProxyStep, prompt string) *lostPromptRig {
 	t.Helper()
 	h := newHarness(t)
 	h.Timeouts = timeouts
@@ -86,7 +91,6 @@ func newLostPromptRig(ctx context.Context, t *testing.T, timeouts platform.Timeo
 	if _, err := h.Sandboxes.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{SessionID: rig.sessionID, Status: sqlcgen.SandboxStatusReady}); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
 	}
-	prompt := "scenario22 turn"
 	created, err := h.Turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: rig.sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &prompt})
 	if err != nil {
 		t.Fatalf("create turn: %v", err)
@@ -386,5 +390,68 @@ func TestResilience_Scenario22_LostPromptFrame_PreChangeAgent_NeverResent_EndsAt
 	}
 	if got := prompts.total(); got != 0 {
 		t.Fatalf("the agent received %d prompts in all, want 0", got)
+	}
+}
+
+// TestResilience_Scenario22_PromptFrameOver32KiB_CapableAgent_DeliveredOnceAndCompletes:
+// a prompt frame longer than the WebSocket library's default read limit
+// (32 KiB) -- a review's, with its diff inlined -- reaches a capable agent
+// whole, on the connection it was sent on, and runs once. Before the agent
+// read up to platform.MaxPromptFrameBytes, that frame closed its
+// connection and was lost; with receipts, every reconnect re-sent it, to
+// be lost again.
+func TestResilience_Scenario22_PromptFrameOver32KiB_CapableAgent_DeliveredOnceAndCompletes(t *testing.T) {
+	ctx := context.Background()
+	rig := newLostPromptRigWithPrompt(ctx, t, platform.DefaultTimeouts(), wsProxyStep{}, strings.Repeat("diff --git a/x b/x\n+<line>\n", 40*1024/25+1))
+	agent := startCapableAgent(ctx, t, rig)
+
+	waitUntil(t, scenario22Wait, func() bool { return rig.turn(ctx, t).Status == sqlcgen.TurnStatusCompleted })
+	messageID := *rig.turn(ctx, t).DispatchedMessageID
+	if runs := agent.runCounts(); len(runs) != 1 || runs[messageID] != 1 {
+		t.Fatalf("prompt runs = %v, want %q run exactly once", runs, messageID)
+	}
+	if got := rig.readyCount(); got != 1 {
+		t.Fatalf("%d readies relayed, want 1: the frame was read on the connection it came on", got)
+	}
+	var frameBytes int
+	if err := rig.h.Pool.QueryRow(ctx, `SELECT octet_length(prompt) FROM turns WHERE id = $1`, rig.turnID).Scan(&frameBytes); err != nil {
+		t.Fatal(err)
+	}
+	if frameBytes <= 40*1024 {
+		t.Fatalf("prompt is %d bytes, want over 40 KiB", frameBytes)
+	}
+}
+
+// TestResilience_Scenario22_PromptLostOnEveryDelivery_ResendCapStopsTheLoop:
+// a prompt the sandbox can never take -- every copy dropped with its
+// socket, each loss a reconnect -- is sent once and re-sent
+// PromptResendMaxPerTurn times, and then the reconnects stop: the next
+// ready is answered with nothing, so the connection stays up, and the turn
+// waits for its deadline.
+func TestResilience_Scenario22_PromptLostOnEveryDelivery_ResendCapStopsTheLoop(t *testing.T) {
+	ctx := context.Background()
+	timeouts := platform.DefaultTimeouts()
+	rig := newLostPromptRig(ctx, t, timeouts, wsProxyStep{})
+	rig.proxy.mu.Lock()
+	rig.proxy.alwaysDropBackendType = "prompt"
+	rig.proxy.mu.Unlock()
+	agent := startCapableAgent(ctx, t, rig)
+
+	want := 1 + timeouts.PromptResendMaxPerTurn
+	waitUntil(t, scenario22Wait, func() bool { return rig.proxy.droppedCount() >= want && rig.readyCount() >= want+1 })
+	// Settled: no further copy, no further reconnect.
+	time.Sleep(time.Second)
+	if got := rig.proxy.droppedCount(); got != want {
+		t.Fatalf("%d prompt copies sent and lost, want %d: the dispatch and PromptResendMaxPerTurn re-sends", got, want)
+	}
+	if got := rig.readyCount(); got != want+1 {
+		t.Fatalf("%d readies, want %d: the reconnects stop once nothing more is sent", got, want+1)
+	}
+	if runs := agent.runCounts(); len(runs) != 0 {
+		t.Fatalf("prompt runs = %v, want none: every copy was lost", runs)
+	}
+	got := rig.turn(ctx, t)
+	if got.Status != sqlcgen.TurnStatusProcessing || got.ReceiptResendCount != int32(timeouts.PromptResendMaxPerTurn) {
+		t.Fatalf("turn status %s, receipt_resend_count %d; want processing, %d", got.Status, got.ReceiptResendCount, timeouts.PromptResendMaxPerTurn)
 	}
 }

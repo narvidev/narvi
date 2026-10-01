@@ -129,6 +129,23 @@ type Timeouts struct {
 	// inside the window.
 	PromptResendWindow time.Duration
 
+	// PromptResendMaxPerTurn: how many times, at most, the session actor
+	// re-sends one dispatch's prompt on same-gen reconnects (technical plan
+	// §3.3) -- a backstop against a loss that is not a one-off. Each re-send
+	// is answered only after the next reconnect, so a frame the sandbox can
+	// never take would otherwise be re-sent on every reconnect it causes,
+	// for the whole PromptResendWindow. The count lives on the turn
+	// (turns.receipt_resend_count), is moved by the compare-and-set that
+	// claims each reconnect, and starts again at each dispatch that asks
+	// for a receipt. Past it nothing is sent: one WARN per reconnect and
+	// turn_prompt_resend_total{outcome="cap_reached"}, and the turn ends at
+	// turn_deadline or by a person's stop, as one whose window ran out. A
+	// count, not a duration; it sits here beside the window it bounds. Not
+	// given a value in the plan; 3 -- one lost frame is the case the
+	// re-send exists for, and three in a row on one turn is no accident.
+	// Validate keeps it positive: zero would never re-send at all.
+	PromptResendMaxPerTurn int
+
 	// StopDescendantWalkTimeout bounds what a stop request does after the
 	// named session's own request has committed (technical plan §3.3,
 	// httpapi's StopSession): walking to every session it started, one
@@ -4044,6 +4061,7 @@ func DefaultTimeouts() Timeouts {
 		TurnDeadline:              60 * time.Minute,  // not specified; chosen with margin below SupervisorTurnCap
 		StopGrace:                 30 * time.Second,  // not specified; chosen (§3.3's stop)
 		PromptResendWindow:        10 * time.Minute,  // not specified; chosen (§3.3's prompt receipts)
+		PromptResendMaxPerTurn:    3,                 // not specified; chosen (§3.3's prompt receipts)
 		StopDescendantWalkTimeout: 8 * time.Second,   // not specified; chosen (§3.3's stop)
 		SSEInactivityTimeout:      120 * time.Second, // §7, explicit
 		ProviderHTTPClientTimeout: 5 * time.Minute,   // not specified; must clear ProviderWorstColdStart (§4.1) with margin
@@ -4686,6 +4704,10 @@ func (t Timeouts) Validate() error {
 		}
 	}
 	countMustBePositive("MCPRegisterRateBurst", t.MCPRegisterRateBurst)
+
+	// §3.3's prompt receipts: a cap of zero would never re-send a lost
+	// prompt at all. See PromptResendMaxPerTurn's own doc comment.
+	countMustBePositive("PromptResendMaxPerTurn", t.PromptResendMaxPerTurn)
 
 	// §5.1: what the outbox delivery worker records once this process's
 	// shutdown has begun is written on a context that outlives the

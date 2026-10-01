@@ -207,11 +207,13 @@ WHERE id = $1 AND progress_notified_at IS NULL;
 -- dispatch that does not ask clears an earlier request. receipt_requested_at
 -- is the database's now(), the start of PromptResendWindow, and
 -- receipt_checked_ready_seq the sandbox's ready_seq at the dispatch, so only
--- a ready recorded after it counts as a reconnect to answer.
+-- a ready recorded after it counts as a reconnect to answer. Every dispatch
+-- starts its re-sends from 0 (receipt_resend_count).
 UPDATE turns
 SET receipt_requested_message_id = sqlc.narg('message_id'),
     receipt_requested_at = CASE WHEN sqlc.narg('message_id')::text IS NULL THEN NULL ELSE now() END,
-    receipt_checked_ready_seq = CASE WHEN sqlc.narg('message_id')::text IS NULL THEN NULL ELSE sqlc.arg('ready_seq')::integer END
+    receipt_checked_ready_seq = CASE WHEN sqlc.narg('message_id')::text IS NULL THEN NULL ELSE sqlc.arg('ready_seq')::integer END,
+    receipt_resend_count = 0
 WHERE id = sqlc.arg('id');
 
 -- name: GetTurnPromptReceiptState :one
@@ -243,16 +245,22 @@ WHERE t.id = $1 AND t.receipt_requested_at IS NOT NULL;
 -- dispatch that asked for the receipt, with no other evaluation having
 -- claimed this ready first. 0 rows affected means one of those no longer
 -- holds, and nothing is sent. The stop guard is defense in depth behind
--- planReenqueueOrRespawn's own early return on stop_requested_at.
+-- planReenqueueOrRespawn's own early return on stop_requested_at. resend
+-- (0 or 1) is added to receipt_resend_count in the same statement when
+-- the claim is answered by a re-send, and the count read is part of the
+-- claim, so PromptResendMaxPerTurn is enforced on the same row state the
+-- decision read.
 UPDATE turns
-SET receipt_checked_ready_seq = sqlc.arg('ready_seq')::integer
+SET receipt_checked_ready_seq = sqlc.arg('ready_seq')::integer,
+    receipt_resend_count = receipt_resend_count + sqlc.arg('resend')::integer
 WHERE id = sqlc.arg('id')
   AND status = 'processing'
   AND stop_requested_at IS NULL
   AND dispatched_message_id = sqlc.arg('message_id')::text
   AND receipt_requested_message_id = sqlc.arg('message_id')::text
   AND receipt_checked_ready_seq = sqlc.arg('checked_ready_seq')::integer
-  AND receipt_checked_ready_seq < sqlc.arg('ready_seq')::integer;
+  AND receipt_checked_ready_seq < sqlc.arg('ready_seq')::integer
+  AND receipt_resend_count = sqlc.arg('resend_count')::integer;
 
 -- name: GetProcessingTurnForSession :one
 -- §20 ("builder epistemic pre-action check", §20.2) own epistemic-
