@@ -2492,10 +2492,14 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
     as the earlier turn's second run. So the read stops at the next turn's own dispatch watermark
     (`events.id <= next`, `turns.GetNextTurnDispatchedEventID`), for both checks, since they read
     the same rows. Work the earlier turn did after the later one was dispatched is left out too,
-    deliberately unread, so the read is marked cut (`SubTaskTrace.CutAtNextTurn`): a second run
-    found inside the window still counts, and one not found there resolves to `unconfirmed`
-    ("could not be confirmed"), never `not_found`, since it may lie past the cut; a counter-review
-    not found there leaves that claim uncorroborated. Another turn dispatched at the same
+    deliberately unread, so the read is marked cut (`SubTaskTrace.CutAtNextTurn`), and the
+    additions resolve to `unconfirmed` ("could not be confirmed") whatever the window holds: a
+    second run missing from it may lie past the cut, and one found in it may have been followed,
+    past the cut, by another counter-reviewer pass -- `checked` claims that no counter-reviewer
+    event follows the run, which a cut read cannot support. The counter-review claim is positive
+    (a counter-reviewer ran and completed), so one found inside the window, this turn's own
+    events, still corroborates it, and one not found there leaves it uncorroborated. Another turn
+    dispatched at the same
     watermark, with no event between the two dispatches, makes the two turns' events
     indistinguishable, and the trace is then not read at all (`ReadInFull` false).
   - **The later turn's read, when an earlier one may still be running.** The same race reaches the
@@ -2507,9 +2511,13 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
     (the control plane appended a synthetic one naming it: timed out, stopped, abandoned or
     refused, its agent possibly still running -- `turns.ExistsEarlierTurnLeftRunning`), the later
     turn's trace is not read at all, and both its claims resolve unconfirmed. An earlier turn that
-    ended with a real `execution_complete`, or one on a gen since replaced, changes nothing. The
-    cost is named: until the sandbox's gen moves on, every later deep turn on that session reads
-    its claims as unconfirmed (the counter-review floored to `needs_human`).
+    ended with a real `execution_complete`, or one on a gen since replaced, changes nothing, and
+    neither does one whose prompt certainly never reached the sandbox -- a dispatch refused before
+    the prompt was sent, or a send refused with no live connection, which writes nothing:
+    `failDispatchedTurn` marks its synthetic event `"delivered": false`, and no agent of it ever
+    ran. Any other send failure may have followed a partial write, and still counts. The cost is
+    named: until the sandbox's gen moves on, every later deep turn on that session reads its claims
+    as unconfirmed (the counter-review floored to `needs_human`).
 
 ### 26.5 Measuring the readout (Step 69, on Step 62's instrument)
 
