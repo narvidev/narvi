@@ -27,7 +27,11 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   type it does not know; a stored event's payload is outside this policy
   (`SubscribedPayload.events` elements), and this one keeps its values under
   `sandbox`, never at the top level, so a reader of an agent event's
-  top-level `gen` never takes it for one.
+  top-level `gen` never takes it for one. Only the control plane writes
+  one: a frame typed `sandbox_status` from the sandbox socket is dropped,
+  never stored or broadcast, with the control plane's other own event
+  types (`image_decision`, `shadow_egress_suppressed`); the sandbox-ws
+  contract defines none of them, and its own types are stored as before.
 - Unchanged: `SubscribeRequest`, `SubscribedPayload`, `FetchHistoryRequest`.
 
 ### rest/v1/dtos.schema.json
@@ -41,7 +45,16 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   at reads it here. A required property added to a platform-produced shape
   grades MINOR (row 3). The MCP status and wait tools' output schemas carry
   it (`internal/adapters/inbound/mcp/testdata/tools.golden.json`).
-- Unchanged: no route, no enum, no other `$def`.
+- Changed, description only: `EventsResponse` no longer claims to mirror
+  `FetchHistoryResponse` exactly. It is that reply's `events` and
+  `nextCursor`, read through the same query, and deliberately omits the
+  `sandbox` row the WS reply now carries: that row is a WS concern, what
+  keeps an open page's sandbox status current after a `sandbox_status`
+  broadcast, and a REST caller reads the sandbox status from
+  `GET /api/sessions/:id/status` (`SessionActivity.sandboxStatus`). The MCP
+  transcript tool's output schema carries the new description. Its shape
+  is unchanged.
+- Unchanged: no route, no enum; no other `$def` changes.
 
 ## [1.15.0]
 

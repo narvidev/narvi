@@ -1583,7 +1583,7 @@
       "$defs": {
         "EventsResponse": {
           "additionalProperties": false,
-          "description": "GET /api/sessions/:id/events (§6.3). Mirrors client-ws/v1's own FetchHistoryResponse shape exactly, for the same reason that schema gives: the full event-payload shape is assembled by later PRs, and REST/WS should not diverge on this envelope.",
+          "description": "GET /api/sessions/:id/events (§6.3). The envelope of client-ws/v1's FetchHistoryResponse (events, nextCursor), read through the same event-store query fetch_history uses, except that it deliberately omits FetchHistoryResponse's required sandbox: the sandbox row a fetch_history reply carries is a WS concern, what keeps an open page's sandbox status current after a sandbox_status broadcast. A REST caller reads a session's sandbox status from GET /api/sessions/:id/status (SessionActivity.sandboxStatus).",
           "properties": {
             "events": {
               "items": {
