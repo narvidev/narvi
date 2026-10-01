@@ -35,50 +35,6 @@ jobs:
           fi
           echo "Branch name '$BRANCH' OK"
 
-  # TEMPORARY -- removed again before this branch merges. It soaks the
-  # packages the intermittent-test fixes touch: -race, twenty runs each, all
-  # four in one `go test` the way `make test` runs them, on this runner's
-  # own load. It prints each package's result, the pass/fail count of every
-  # test the fixes target, the output of any test that failed, and every
-  # inconclusive hook attempt the spawned-hook pair logged.
-  soak-touched-packages:
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-
-      - name: Set up Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-          cache: true
-
-      - name: Soak (-race, -count=20)
-        run: |
-          set -uo pipefail
-          status=0
-          go test -race -count=20 -timeout 60m -json -skip '^TestRealTurn_' \
-            ./internal/sandboxagent/services/ ./internal/sandboxagent/boot/ \
-            ./internal/sandboxagent/supervisor/ ./cmd/sandbox-agent/ > soak.json || status=$?
-          echo "go test exit status: $status"
-          echo "== package results"
-          jq -r 'select(.Test == null and (.Action == "pass" or .Action == "fail")) | "\(.Action) \(.Package) \(.Elapsed)s"' soak.json
-          echo "== targeted tests"
-          for t in TestRun_ServicesRunConcurrently TestIndexLineBoundary_WriteNewlineOnlyLinesScalesLinearly \
-                   TestRunHooks_SuccessContinuesToLaterHooksAndRepos TestCloudIdentityTokenReachesRealSpawnedHook \
-                   TestOIDCClusterBindingTokenReachesRealSpawnedHook TestPushOneRepo_MaliciousInputsRejectedBeforeSpawn; do
-            echo "$t: $(jq -r --arg t "$t" 'select(.Test == $t and (.Action == "pass" or .Action == "fail" or .Action == "skip")) | .Action' soak.json | sort | uniq -c | tr -s ' \n' ' ')"
-          done
-          echo "TestRunHooks_*/TestRunBoot_* top-level: $(jq -r 'select((.Test // "" | test("^TestRun(Hooks|Boot)_[^/]*$")) and (.Action == "pass" or .Action == "fail")) | .Action' soak.json | sort | uniq -c | tr -s ' \n' ' ')"
-          echo "all test runs: $(jq -r 'select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip")) | .Action' soak.json | sort | uniq -c | tr -s ' \n' ' ')"
-          echo "== failed tests and their output"
-          jq -r -s '[.[] | select(.Test != null and .Action == "fail") | .Test] as $failed
-            | .[] | select(.Action == "output" and .Test != null and ((.Test as $x | $failed | index($x)) != null)) | "\(.Test): \(.Output)"' soak.json
-          echo "== inconclusive hook attempts and ETXTBSY lines"
-          jq -r 'select(.Action == "output") | select(.Output | test("did not finish inside|text file busy|DATA RACE")) | "\(.Test): \(.Output)"' soak.json
-          exit "$status"
-
   commit-scope:
     # ADVISORY ONLY — never fails the build. CLAUDE.md defines a commit's scope
     # as "the primary package or directory touched", but that is a judgement
