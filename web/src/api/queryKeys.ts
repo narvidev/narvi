@@ -15,6 +15,8 @@ export const sessionQueryKeys = {
   detail: (sessionId: string) => ['session', sessionId, 'detail'] as const,
   events: (sessionId: string) => ['session', sessionId, 'events'] as const,
   artifacts: (sessionId: string) => ['session', sessionId, 'artifacts'] as const,
+  /** GET /api/sessions/:id/status (SessionActivity, technical plan §43.20). */
+  activity: (sessionId: string) => ['session', sessionId, 'activity'] as const,
 }
 
 // sessionListQueryKeys (§12.2 item 1) -- the sidebar's own list

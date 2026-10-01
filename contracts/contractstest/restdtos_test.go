@@ -1349,3 +1349,52 @@ func TestShadowLedgerSummaryRoundTrip(t *testing.T) {
 		})
 	})
 }
+
+// TestSessionActivityRoundTrip covers escalation (technical plan §43.20):
+// the session's open workflow escalation, reported whatever awaiting names
+// first, so an escalation open beside a plan awaiting approval still
+// reaches a client; and null when none is open.
+func TestSessionActivityRoundTrip(t *testing.T) {
+	sch := compileSchema(t, restDTOsSchemaPath, "#/$defs/SessionActivity")
+	observedAt := time.Date(2026, 10, 1, 9, 0, 0, 0, time.UTC)
+	planSince := time.Date(2026, 10, 1, 8, 59, 0, 0, time.UTC)
+	escalatedAt := time.Date(2026, 10, 1, 8, 58, 0, 0, time.UTC)
+	const runID = "3f2a1c9e-8d4b-4e6f-9a1b-2c3d4e5f6a7b"
+	const planID = "7a6b5c4d-3e2f-4a1b-8c9d-0e1f2a3b4c5d"
+
+	tests := []struct {
+		name       string
+		awaiting   *restdtos.SessionActivityAwaiting
+		escalation *restdtos.SessionActivityEscalation
+	}{
+		{
+			name:       "an escalation open beside a plan awaiting approval",
+			awaiting:   &restdtos.SessionActivityAwaiting{Kind: restdtos.SessionActivityAwaitingKindPlan, Id: planID, Since: planSince},
+			escalation: &restdtos.SessionActivityEscalation{Id: runID, Since: escalatedAt},
+		},
+		{
+			name:       "an escalation that is the only gate",
+			awaiting:   &restdtos.SessionActivityAwaiting{Kind: restdtos.SessionActivityAwaitingKindWorkflowEscalation, Id: runID, Since: escalatedAt},
+			escalation: &restdtos.SessionActivityEscalation{Id: runID, Since: escalatedAt},
+		},
+		{name: "no escalation open", awaiting: nil, escalation: nil},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			roundTrip(t, sch, restdtos.SessionActivity{
+				SessionId:             testSessionID,
+				Activity:              restdtos.SessionActivityActivityAwaitingApproval,
+				Settled:               true,
+				PendingTurns:          0,
+				InFlightTurn:          nil,
+				Awaiting:              tc.awaiting,
+				Escalation:            tc.escalation,
+				LastRun:               nil,
+				SandboxStatus:         &restdtos.SessionActivitySandboxStatus{Value: "ready"},
+				Archived:              false,
+				SuggestedDelaySeconds: 60,
+				ObservedAt:            observedAt,
+			})
+		})
+	}
+}

@@ -382,7 +382,7 @@ func (a *Actor) retireStoppedGen(ctx context.Context, tx pgx.Tx, dispatched []*i
 			return nil, fmt.Errorf("sessionactor: retire stopped sandbox gen: %w", err)
 		}
 		preSuspect := sqlcgen.SandboxStatus(from)
-		if _, err := a.stores.sandbox.WithTx(tx).UpdateStatusToSuspect(ctx, sqlcgen.UpdateSandboxStatusToSuspectParams{
+		if _, err := a.sandboxWrites(tx).UpdateStatusToSuspect(ctx, sqlcgen.UpdateSandboxStatusToSuspectParams{
 			SessionID:        a.sessionID,
 			PreSuspectStatus: &preSuspect,
 		}); err != nil {
@@ -393,7 +393,7 @@ func (a *Actor) retireStoppedGen(ctx context.Context, tx pgx.Tx, dispatched []*i
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: retire stopped sandbox gen: %w", err)
 	}
-	if _, err := a.stores.sandbox.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
+	if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 		SessionID: a.sessionID,
 		Status:    sqlcgen.SandboxStatus(to),
 	}); err != nil {

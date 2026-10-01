@@ -133,7 +133,12 @@ and `ArtifactsResponse`. Both deliberately reuse the same
 protocol.schema.json`'s own `SubscribedPayload`/`FetchHistoryResponse` (the
 technical plan itself leaves the full event/artifact read-model shape to
 "later PRs" — REST and the client WS protocol intentionally do not diverge
-on this).
+on the event elements). The two envelopes are no longer identical:
+`FetchHistoryResponse` also carries the session's sandbox row (`sandbox`,
+contracts 1.16.0), and `EventsResponse` deliberately omits it. That row is a
+WS concern — it is what keeps an open page's sandbox status current after a
+`sandbox_status` broadcast — and a REST caller reads the sandbox status from
+`GET /api/sessions/:id/status` (`SessionActivity.sandboxStatus`).
 
 **Secrets, environments, automations, and uploads DTOs are still
 deliberately not modeled here** — this remains a scope decision, not an

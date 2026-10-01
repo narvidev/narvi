@@ -182,10 +182,12 @@ func (EnsureDispatched) isCommand() {}
 
 // SandboxEventOutcome is what handleSandboxEvent (sandboxevent.go) sends
 // back on SandboxEvent.Reply once its own transaction has committed (or
-// deliberately skipped persisting a stale-gen event, see sandboxevent.go).
+// deliberately skipped persisting a stale-gen event, or a frame typed as
+// one of the control plane's own events -- serverEventTypes, see
+// sandboxevent.go).
 //
 //   - Persisted reports whether the event was actually appended to the
-//     events table (false only for the stale-gen-rejection path).
+//     events table (false only for those two rejection paths).
 //   - AckID is the original critical event's own deterministic ackId
 //     (contracts/gen/go/sandboxws's own "{type}:{messageId}" convention),
 //     non-empty only when the inbound wire message was one of the 6
@@ -193,7 +195,7 @@ func (EnsureDispatched) isCommand() {}
 //     fresh sandboxws.Ack{AckId: outcome.AckID, ...} on the same
 //     connection when non-empty; an empty AckID means "do not send an
 //     ack for this message" (either it was never a critical type, or it
-//     was a stale-gen event that was never persisted at all).
+//     was rejected by one of those two paths and never persisted at all).
 type SandboxEventOutcome struct {
 	Persisted bool
 	AckID     string

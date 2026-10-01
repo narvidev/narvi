@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
-import { parseSandboxSnapshot } from '../sandboxSnapshot'
+import type { EventEnvelope } from '../../ws/types'
+import { asSandboxStatusChange, endsBootPhase, parseSandboxSnapshot } from '../sandboxSnapshot'
 
 describe('parseSandboxSnapshot', () => {
   it('parses a well-formed snapshot (client.go\'s own sandboxWireMap shape)', () => {
@@ -44,4 +45,41 @@ describe('parseSandboxSnapshot', () => {
   it('returns null when a required field is missing entirely', () => {
     expect(parseSandboxSnapshot({ gen: 3, status: 'ready', lastSeenAt: null, createdAt: 'x', updatedAt: 'x' })).toBeNull()
   })
+})
+
+describe('asSandboxStatusChange', () => {
+  const env = (type: string, payload: unknown): EventEnvelope => ({ id: 1, type, payload, createdAt: '2026-08-20T10:00:00Z' })
+  const cases: { name: string; event: EventEnvelope; want: ReturnType<typeof asSandboxStatusChange> }[] = [
+    { name: 'the server\'s report, as the session actor stores it', event: env('sandbox_status', { sandbox: { gen: 2, status: 'ready' } }), want: { gen: 2, status: 'ready' } },
+    { name: 'an unknown future status is kept verbatim', event: env('sandbox_status', { sandbox: { gen: 1, status: 'hibernating' } }), want: { gen: 1, status: 'hibernating' } },
+    { name: 'another event type', event: env('ready', { sandbox: { gen: 1, status: 'ready' } }), want: null },
+    { name: 'values at the top level, not under sandbox', event: env('sandbox_status', { gen: 1, status: 'ready' }), want: null },
+    { name: 'a gen that is not a number', event: env('sandbox_status', { sandbox: { gen: '1', status: 'ready' } }), want: null },
+    { name: 'no status', event: env('sandbox_status', { sandbox: { gen: 1 } }), want: null },
+    { name: 'a payload that is not an object', event: env('sandbox_status', 'ready'), want: null },
+  ]
+  for (const c of cases) {
+    it(c.name, () => {
+      expect(asSandboxStatusChange(c.event)).toEqual(c.want)
+    })
+  }
+})
+
+describe('endsBootPhase', () => {
+  const cases: { status: string; want: boolean }[] = [
+    { status: 'booting', want: false },
+    { status: 'suspect', want: false },
+    { status: 'ready', want: true },
+    { status: 'snapshotting', want: true },
+    { status: 'stopped', want: true },
+    { status: 'failed', want: true },
+    { status: 'spawning', want: true },
+    { status: 'connecting', want: true },
+    { status: 'pending', want: true },
+  ]
+  for (const c of cases) {
+    it(`${c.status} -> ${c.want}`, () => {
+      expect(endsBootPhase(c.status)).toBe(c.want)
+    })
+  }
 })

@@ -6,19 +6,22 @@
 // lastSeenAt, createdAt, updatedAt, agentVersion, imageDigest}`,
 // deliberately excluding tokenHash/providerId/spawnFailureCount/
 // lastSpawnFailureAt, proven by
-// TestClientHandler_SubscribedPayloadExcludesSandboxTokenHash). No REST
-// endpoint exposes this at all (GET /api/sessions/:id/`sandboxStatus` is
-// always null on the single-session view by design -- Session.
-// sandboxStatus's own schema doc comment) -- this WS field is genuinely
-// the only source, which is why ws/sessionStream.ts (this Step's own
-// change) captures it and sandboxRail.ts (below) is its first real
-// consumer.
+// TestClientHandler_SubscribedPayloadExcludesSandboxTokenHash), and every
+// fetch_history reply's `sandbox` (FetchHistoryResponse.sandbox, the same
+// shape, read again on each reply -- the control plane broadcasts a
+// sandbox_status event whenever it changes the status, below, so the page
+// re-reads it then). No REST endpoint exposes this at all (GET
+// /api/sessions/:id/`sandboxStatus` is always null on the single-session
+// view by design -- Session.sandboxStatus's own schema doc comment) -- the
+// WS is genuinely the only source, which is why ws/sessionStream.ts
+// captures it and sandboxRail.ts (below) is its first real consumer.
 //
 // `state` itself is `additionalProperties: true` on the wire
 // (client-ws/v1/protocol.schema.json's own SubscribedPayload) -- untrusted
 // exactly like every event payload this Step's session/eventPayloads.ts
 // already treats defensively, so every field here is type-checked before
 // being trusted, mirroring that module's own narrowing discipline.
+import type { EventEnvelope } from '../ws/types'
 import { isPlainObject } from '../ws/util'
 
 export interface SandboxSnapshot {
@@ -63,4 +66,52 @@ export function parseSandboxSnapshot(raw: unknown): SandboxSnapshot | null {
     agentVersion: agentVersion ?? null,
     imageDigest: imageDigest ?? null,
   }
+}
+
+/**
+ * SANDBOX_STATUS_EVENT is the stored event the control plane appends
+ * whenever it changes the sandbox's status or generation
+ * (internal/app/sessionactor/sandboxstatus.go): `{sandbox: {gen, status}}`,
+ * the status the server derives (technical plan §3.2) -- never one this
+ * client infers from the agent's own events. It is what wakes an open page
+ * to re-read the sandbox: its broadcast prompts a fetch_history, whose
+ * reply carries the sandbox row (FetchHistoryResponse.sandbox,
+ * ws/sessionStream.ts). The status shown is that row's; the event itself is
+ * read for when each change happened (sandboxRail.ts's transitions, and
+ * where a boot phase ends).
+ */
+export const SANDBOX_STATUS_EVENT = 'sandbox_status'
+
+export interface SandboxStatusChange {
+  gen: number
+  /** sandbox_status verbatim, kept a `string` like SandboxSnapshot.status. */
+  status: string
+}
+
+/**
+ * asSandboxStatusChange narrows a sandbox_status event's payload, or
+ * returns null for any other event or a payload that does not shape up.
+ * The values sit under `sandbox`, never at the payload's top level, so a
+ * reader taking a top-level `gen` as an agent event's (sandboxRail.ts's
+ * last-seen) never mistakes this one for the agent's.
+ */
+export function asSandboxStatusChange(env: EventEnvelope): SandboxStatusChange | null {
+  if (env.type !== SANDBOX_STATUS_EVENT || !isPlainObject(env.payload)) return null
+  const sandbox = env.payload.sandbox
+  if (!isPlainObject(sandbox)) return null
+  const { gen, status } = sandbox
+  if (typeof gen !== 'number' || typeof status !== 'string') return null
+  return { gen, status }
+}
+
+/**
+ * endsBootPhase reports whether the server, by reporting `status`, has
+ * ended the boot phase in progress: a sandbox it marked ready (or past
+ * it), one that stopped or failed, or a new generation starting over.
+ * `booting` keeps the phase going, and so does `suspect` -- a liveness
+ * doubt the server returns from to the status it left (§3.2's terminal
+ * grace), not the end of a boot.
+ */
+export function endsBootPhase(status: string): boolean {
+  return status !== 'booting' && status !== 'suspect'
 }

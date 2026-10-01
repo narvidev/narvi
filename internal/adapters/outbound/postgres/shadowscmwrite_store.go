@@ -55,6 +55,12 @@ func (s *ShadowSCMWriteStore) ListForRepo(ctx context.Context, repoFullName stri
 	})
 }
 
+// ShadowEgressSuppressedEventType is the stored event AppendSuppressionEvent
+// writes into the session's event log. The control plane writes it, never a
+// sandbox, so the session actor refuses it from the sandbox socket
+// (sessionactor's serverEventTypes).
+const ShadowEgressSuppressedEventType = "shadow_egress_suppressed"
+
 // AppendSuppressionEvent writes §30.6's own third recording write: an
 // `events` row so a suppression appears inline in the session workspace
 // the operator is already watching.
@@ -68,7 +74,7 @@ func (s *ShadowSCMWriteStore) ListForRepo(ctx context.Context, repoFullName stri
 func (s *ShadowSCMWriteStore) AppendSuppressionEvent(ctx context.Context, sessionID pgtype.UUID, messageID string, payload []byte) error {
 	_, err := s.q.CreateEvent(ctx, sqlcgen.CreateEventParams{
 		SessionID: sessionID,
-		Type:      "shadow_egress_suppressed",
+		Type:      ShadowEgressSuppressedEventType,
 		MessageID: messageID,
 		Payload:   payload,
 	})

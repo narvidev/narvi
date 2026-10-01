@@ -83,6 +83,8 @@ func TestSessionActivityToDTO_UnknownTurnStateReachesTheDerivation(t *testing.T)
 // with a human gate after its step: the turn's completion records the plan
 // and marks the step awaiting a decision in one transaction), and the
 // route's integration test pins that one; this sweeps every combination.
+// escalation reports the open escalation in every one of them, whatever
+// awaiting names first, and is null without one.
 func TestSessionActivityToDTO_AwaitingPrecedence(t *testing.T) {
 	t.Parallel()
 
@@ -105,6 +107,7 @@ func TestSessionActivityToDTO_AwaitingPrecedence(t *testing.T) {
 		{"plan and escalation -> the plan", true, false, true, restdtos.SessionActivityAwaitingKindPlan, planID, planSince},
 		{"step and escalation -> the step", false, true, true, restdtos.SessionActivityAwaitingKindWorkflowStep, stepID, stepSince},
 		{"the escalation alone", false, false, true, restdtos.SessionActivityAwaitingKindWorkflowEscalation, runID, runSince},
+		{"the step alone", false, true, false, restdtos.SessionActivityAwaitingKindWorkflowStep, stepID, stepSince},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -124,6 +127,12 @@ func TestSessionActivityToDTO_AwaitingPrecedence(t *testing.T) {
 			}
 			if got.Awaiting == nil || got.Awaiting.Kind != tc.wantKind || got.Awaiting.Id != tc.wantID.String() || !got.Awaiting.Since.Equal(tc.wantSince) {
 				t.Fatalf("awaiting = %+v, want %s %v since %v", got.Awaiting, tc.wantKind, tc.wantID, tc.wantSince)
+			}
+			switch {
+			case !tc.run && got.Escalation != nil:
+				t.Errorf("escalation = %+v, want null: no escalation is open", got.Escalation)
+			case tc.run && (got.Escalation == nil || got.Escalation.Id != runID.String() || !got.Escalation.Since.Equal(runSince)):
+				t.Errorf("escalation = %+v, want run %v since %v whatever awaiting names", got.Escalation, runID, runSince)
 			}
 		})
 	}
