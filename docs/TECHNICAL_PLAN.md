@@ -2491,9 +2491,24 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
     as the earlier turn's second run. So the read stops at the next turn's own dispatch watermark
     (`events.id <= next`, `turns.GetNextTurnDispatchedEventID`), for both checks, since they read
     the same rows. Work the earlier turn did after the later one was dispatched is left out too,
-    which can only leave a claim unconfirmed. Another turn dispatched at the same watermark, with
-    no event between the two dispatches, makes the two turns' events indistinguishable, and the
-    trace is then not read at all (`ReadInFull` false).
+    deliberately unread, so the read is marked cut (`SubTaskTrace.CutAtNextTurn`): a second run
+    found inside the window still counts, and one not found there resolves to `unconfirmed`
+    ("could not be confirmed"), never `not_found`, since it may lie past the cut; a counter-review
+    not found there leaves that claim uncorroborated. Another turn dispatched at the same
+    watermark, with no event between the two dispatches, makes the two turns' events
+    indistinguishable, and the trace is then not read at all (`ReadInFull` false).
+  - **The later turn's read, when an earlier one may still be running.** The same race reaches the
+    later turn, whose read is bounded below only: the earlier turn's late sub-tasks land above its
+    watermark, at the same gen, and no sub-task event names the turn or prompt it belongs to, so
+    nothing attributes them -- an earlier turn's late fact-check would count as the later turn's own
+    second run, "checked" in the unsafe direction. The rule is conservative: when the session holds
+    an earlier turn, dispatched on the same gen, that ended without its own `execution_complete`
+    (the control plane appended a synthetic one naming it: timed out, stopped, abandoned or
+    refused, its agent possibly still running -- `turns.ExistsEarlierTurnLeftRunning`), the later
+    turn's trace is not read at all, and both its claims resolve unconfirmed. An earlier turn that
+    ended with a real `execution_complete`, or one on a gen since replaced, changes nothing. The
+    cost is named: until the sandbox's gen moves on, every later deep turn on that session reads
+    its claims as unconfirmed (the counter-review floored to `needs_human`).
 
 ### 26.5 Measuring the readout (Step 69, on Step 62's instrument)
 
@@ -2701,14 +2716,22 @@ As shipped:
   and its findings cannot disagree. It is made only when the verdict publishes an addition: a
   second run that removed every addition is recorded (its report and kill count) with no
   resolution, so the readout shows "no addition published", never "additions unverified".
-- **Validation.** `source` is optional on the wire. A value that is present must be `primary` or
-  `counter_review` (a garbled one is `400`); an absent one is recorded as not recorded. The verdict
-  body follows the review prompt, which is rendered once, when the turn is created, and re-sent as
-  stored on every dispatch, so a turn rendered before this change -- queued, running, or re-sent to
-  a respawned sandbox while the control plane is deployed -- posts its findings without the field;
-  refusing them would refuse the verdict its own instructions shaped, and would make the contract's
-  MINOR grade untrue. Admitting it gives up nothing the field protected: the source is
-  self-reported, and a reviewer could always write `primary`. A `counter_review` source, or a
+- **Validation.** `source` is optional in the schema. A value that is present must be `primary` or
+  `counter_review` (a garbled one is `400`). An absent one is admitted in one case only: from a
+  turn whose own stored prompt predates the source instruction, on a payload that reports no
+  `additionsFactCheck`. The verdict body follows the review prompt, which is rendered once, when
+  the turn is created, and re-sent as stored on every dispatch, so a turn rendered before this
+  change -- queued, running, or re-sent to a respawned sandbox while the control plane is
+  deployed -- posts its findings without the field; refusing them would refuse the verdict its
+  own instructions shaped, and would make the contract's MINOR grade untrue. Such a finding is
+  recorded as not recorded. The server tells that turn apart by its stored prompt
+  (`turns.prompt`): both paths' source lines open with one exported marker,
+  `review.FindingSourceFieldMarker`, which the renderer builds them from and
+  `review.PromptInstructsFindingSource` looks for, so a later prompt edit cannot desynchronise
+  the two; and `additionsFactCheck`, which only the current prompt names, marks a current-prompt
+  payload on its own. From any other turn an absent source is refused with `400`, like a garbled
+  one: an addition its reviewer forgot to label is never published as an ordinary finding. A
+  `counter_review` source, or a
   second-run report, is refused off the deep path; a kill count is refused unless the run is
   reported `done`. On the deep path every other combination is admitted -- additions beside a
   counter-review reported skipped included -- because whatever the payload claims, an addition is
