@@ -388,9 +388,7 @@ func TestSetupUnchangedSinceBuild_Unchanged(t *testing.T) {
 	mkdirAllInternal(t, dir)
 	initGitRepoInternal(t, dir)
 
-	if err := os.WriteFile(filepath.Join(dir, "setup.sh"), []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	WriteExecutableForTest(t, filepath.Join(dir, "setup.sh"), []byte("#!/bin/sh\necho hi\n"))
 	runGitInternal(t, dir, "add", "setup.sh")
 	runGitInternal(t, dir, "commit", "-m", "add setup.sh")
 	builtSHA := gitHeadInternal(t, dir)
@@ -421,16 +419,12 @@ func TestSetupUnchangedSinceBuild_Changed(t *testing.T) {
 	mkdirAllInternal(t, dir)
 	initGitRepoInternal(t, dir)
 
-	if err := os.WriteFile(filepath.Join(dir, "setup.sh"), []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	WriteExecutableForTest(t, filepath.Join(dir, "setup.sh"), []byte("#!/bin/sh\necho hi\n"))
 	runGitInternal(t, dir, "add", "setup.sh")
 	runGitInternal(t, dir, "commit", "-m", "add setup.sh")
 	builtSHA := gitHeadInternal(t, dir)
 
-	if err := os.WriteFile(filepath.Join(dir, "setup.sh"), []byte("#!/bin/sh\necho changed\n"), 0o755); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	WriteExecutableForTest(t, filepath.Join(dir, "setup.sh"), []byte("#!/bin/sh\necho changed\n"))
 	runGitInternal(t, dir, "add", "setup.sh")
 	runGitInternal(t, dir, "commit", "-m", "change setup.sh")
 
@@ -517,9 +511,7 @@ func TestSetupUnchangedSinceBuild_AcceptsValidFullSHA(t *testing.T) {
 	mkdirAllInternal(t, dir)
 	initGitRepoInternal(t, dir)
 
-	if err := os.WriteFile(filepath.Join(dir, "setup.sh"), []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	WriteExecutableForTest(t, filepath.Join(dir, "setup.sh"), []byte("#!/bin/sh\necho hi\n"))
 	runGitInternal(t, dir, "add", "setup.sh")
 	runGitInternal(t, dir, "commit", "-m", "add setup.sh")
 	builtSHA := gitHeadInternal(t, dir)
@@ -548,15 +540,11 @@ func gitHeadInternal(t *testing.T, dir string) string {
 	return strings.TrimSpace(string(out))
 }
 
+// writeScriptInternal is this package's copy of boot_test's writeScript,
+// through the same guarded writer (WriteExecutableForTest).
 func writeScriptInternal(t *testing.T, path, body string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		t.Fatalf("MkdirAll: %v", err)
-	}
-	content := "#!/bin/sh\n" + body + "\n"
-	if err := os.WriteFile(path, []byte(content), 0o755); err != nil {
-		t.Fatalf("WriteFile: %v", err)
-	}
+	WriteExecutableForTest(t, path, []byte("#!/bin/sh\n"+body+"\n"))
 }
 
 // noopHookRerunTimingInternal is this file's own package-boot copy of

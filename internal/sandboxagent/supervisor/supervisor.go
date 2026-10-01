@@ -80,6 +80,9 @@ type Spec struct {
 type Supervisor struct {
 	mu        sync.Mutex
 	processes []*Process
+	// spawnCalls counts every Spawn call, failed ones included -- see
+	// SpawnCount. Guarded by mu.
+	spawnCalls int
 
 	// group exists solely so the per-process background reap goroutine
 	// (launched in Spawn) has an errgroup.Group.Go call site to go
@@ -116,6 +119,10 @@ func New() *Supervisor {
 // that unconditionally waits on it exactly once, so it is reaped promptly
 // even if no caller ever calls Wait or Stop on the returned Process.
 func (s *Supervisor) Spawn(spec Spec) (*Process, error) {
+	s.mu.Lock()
+	s.spawnCalls++
+	s.mu.Unlock()
+
 	cmd := exec.Command(spec.Path, spec.Args...)
 	cmd.Dir = spec.Dir
 	cmd.Env = spec.Env
@@ -151,6 +158,19 @@ func (s *Supervisor) Spawn(spec Spec) (*Process, error) {
 	})
 
 	return proc, nil
+}
+
+// SpawnCount reports how many times Spawn has been called on this
+// Supervisor, whether or not the process started.
+//
+// Production never reads it. It exists so a test can assert that a code
+// path spawned nothing at all -- that a push carrying a malicious ref was
+// rejected before any git process ran, say -- on the spawn itself,
+// rather than on how long the rejection took.
+func (s *Supervisor) SpawnCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.spawnCalls
 }
 
 // StopAll bounds a graceful-then-forceful shutdown of every process this

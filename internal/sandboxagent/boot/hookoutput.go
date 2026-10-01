@@ -78,9 +78,16 @@ type outputTail struct {
 	// half of a genuine CRLF split across two Write calls and must be
 	// swallowed rather than read as a further, empty line boundary.
 	afterCR bool
+
+	// indexByte is the byte search Write scans p with. nil, as production
+	// always leaves it, means bytes.IndexByte, so the zero outputTail is
+	// ready to use. It is a field so a test can count the bytes one Write
+	// examines (hookoutput_internal_test.go).
+	indexByte func(b []byte, c byte) int
 }
 
-// newOutputTail returns a ready, empty outputTail.
+// newOutputTail returns a ready, empty outputTail. The zero outputTail is
+// ready too.
 func newOutputTail() *outputTail {
 	return &outputTail{}
 }
@@ -96,21 +103,33 @@ func newOutputTail() *outputTail {
 // The '\r' search is bounded to p[:nl] (never the full remainder) whenever
 // a '\n' was found: any '\r' that could possibly change the result must sit
 // BEFORE nl (p[nl] is itself '\n', so it can never itself be that '\r'), so
-// scanning past nl buys nothing but cost. This keeps a single call's own
-// work proportional to the ONE line it resolves, not to however much of p
-// is still left to process -- which is what keeps Write's own per-Write
-// cost genuinely O(n) across all of a call's line boundaries, rather than
-// re-scanning the whole shrinking remainder of p for '\r' on every one of a
-// Write's k line boundaries (an O(k·n) blowup that only a newline-only
-// buffer -- one with no '\r' anywhere to short-circuit the full scan -- was
-// large enough to expose).
-func indexLineBoundary(p []byte) (idx, width int) {
-	nl := bytes.IndexByte(p, '\n')
+// scanning past nl buys nothing but cost. A call that resolves a '\n'
+// boundary (CRLF included) therefore examines only the line it resolves, so
+// a Write whose boundaries are all '\n' examines O(n) bytes -- not the
+// O(k·n) it took when every one of a Write's k boundaries re-scanned the
+// whole remainder for '\r'.
+//
+// A lone '\r' boundary is not bounded the same way. The '\n' search runs
+// first and goes on to the next '\n' after the '\r', or to the end of p,
+// so a Write of k '\r'-redrawn lines with no '\n' among them examines
+// O(k·n) bytes: 16,385 per input byte for 32 KiB of bare '\r', against 1.9
+// for newline-terminated lines. It is bounded by the size of one Write, and
+// outputTail does not bound that itself: its one production writer is
+// os/exec copying the hook's pipe through io.Copy's 32 KiB buffer. So over
+// a hook's whole output the cost stays linear, at about seven times the
+// CPU per byte of newline output (8 MiB of bare '\r' through exec in about
+// 2.3s, against 0.33s). That is not a denial of service. The output comes
+// from the repository's own setup.sh/start.sh, bounded by HookTimeout,
+// which could burn a core directly anyway.
+//
+// indexByte is the byte search to scan with (outputTail.indexByte).
+func indexLineBoundary(p []byte, indexByte func(b []byte, c byte) int) (idx, width int) {
+	nl := indexByte(p, '\n')
 	var cr int
 	if nl >= 0 {
-		cr = bytes.IndexByte(p[:nl], '\r')
+		cr = indexByte(p[:nl], '\r')
 	} else {
-		cr = bytes.IndexByte(p, '\r')
+		cr = indexByte(p, '\r')
 	}
 	if nl < 0 && cr < 0 {
 		return -1, 0
@@ -136,8 +155,10 @@ func indexLineBoundary(p []byte) (idx, width int) {
 //
 // Each completed line is read directly out of p (or the p-prefix plus
 // whatever was already pending in t.cur), never by re-reading and
-// rebuilding the whole remainder on every boundary found -- so a single
-// Write containing k lines costs O(n) total, not O(k·n).
+// rebuilding the whole remainder on every boundary found -- so what one
+// Write copies and allocates is O(n) for any input. What it searches is
+// O(n) when its boundaries are '\n'; see indexLineBoundary for the '\r'
+// case, which is O(k·n) within one Write.
 func (t *outputTail) Write(p []byte) (int, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -151,8 +172,13 @@ func (t *outputTail) Write(p []byte) (int, error) {
 		}
 	}
 
+	indexByte := t.indexByte
+	if indexByte == nil {
+		indexByte = bytes.IndexByte
+	}
+
 	for len(p) > 0 {
-		idx, width := indexLineBoundary(p)
+		idx, width := indexLineBoundary(p, indexByte)
 		if idx < 0 {
 			break
 		}

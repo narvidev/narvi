@@ -8,14 +8,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
+	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
@@ -94,7 +95,7 @@ func pushTestStrPtr(s string) *string { return &s }
 // git-dir (gitdir.Seed, exactly like gitclone.SyncAll/CloneAll do before
 // any push is ever attempted in production) restores a real target: a
 // validator regression now really does reach gitdir.Run and spawn git,
-// which the timing baseline in the tests below can actually catch.
+// which the spawn count in the tests below can actually catch.
 func newSeededPushTestHandler(t *testing.T, workspaceDir string, repoNames ...string) *commandHandler {
 	t.Helper()
 
@@ -133,43 +134,51 @@ func newSeededPushTestHandler(t *testing.T, workspaceDir string, repoNames ...st
 // repoSpec.Name/Branch/Remote is rejected by pushOneRepo's own
 // reposource validators BEFORE h.sup.Spawn is ever called for it.
 //
-// supervisor.Supervisor exposes no process count to assert against
-// directly, so "no real git process ran" is proven via wall-clock
-// timing instead, self-calibrated against a REAL measured baseline on
-// this exact machine/CI runner (rather than a fixed constant, which
-// would be flaky across faster/slower hosts): `git --version` -- the
-// cheapest possible real git subprocess invocation, paying only process-
-// creation cost and none of git's own repository/network work -- is
-// used as that baseline. A pure in-process regex/string rejection
-// (reposource's own validators) is faster by orders of magnitude, not
-// merely somewhat faster, so asserting the rejection completes in well
-// under half that baseline is not expected to be flaky.
+// It asserts on the spawn itself. h.sup.SpawnCount must not move across
+// the call, and every git process pushOneRepo can start goes through
+// h.sup, so an unmoved count means no git ran at all, however briefly.
+// The error must also carry the validator's own typed error, which tells
+// a rejection apart from a git failure. It also tells a rejection apart
+// from a structural guard that would have refused the call before any
+// spawn anyway. The spawn count alone would pass in that case, even with
+// the validator gone.
+//
+// This replaces a timing baseline. The test used to time one real `git
+// --version` and fail any rejection that took half of it or more. One
+// fast baseline sample, or one scheduler pause under -race, was enough
+// to fail it with the code correct: 3.59ms against a 1.815ms baseline,
+// on main, with the marker files still absent.
 func TestPushOneRepo_MaliciousInputsRejectedBeforeSpawn(t *testing.T) {
 	workspaceDir := t.TempDir()
 	markerDir := t.TempDir()
-
-	baselineStart := time.Now()
-	if err := exec.Command("git", "--version").Run(); err != nil {
-		t.Fatalf("git --version: %v", err)
-	}
-	baseline := time.Since(baselineStart)
 
 	h := newSeededPushTestHandler(t, workspaceDir, "widgets")
 
 	branchMarker := filepath.Join(markerDir, "branch-marker-should-never-exist")
 	remoteMarker := filepath.Join(markerDir, "remote-marker-should-never-exist")
 
+	var (
+		badName   *reposource.InvalidRepoNameError
+		badBranch *reposource.InvalidRefError
+		badRemote *reposource.InvalidRemoteNameError
+	)
+
 	tests := []struct {
 		name string
 		spec sandboxws.PushReposElem
+		// rejectedAs is the validator's typed error pushOneRepo must
+		// return (errors.As target).
+		rejectedAs any
 	}{
 		{
-			name: "malicious name (path traversal)",
-			spec: sandboxws.PushReposElem{Name: "../escaped-outside-workspace", Branch: "main"},
+			name:       "malicious name (path traversal)",
+			spec:       sandboxws.PushReposElem{Name: "../escaped-outside-workspace", Branch: "main"},
+			rejectedAs: &badName,
 		},
 		{
-			name: "malicious branch (argument injection)",
-			spec: sandboxws.PushReposElem{Name: "widgets", Branch: "--receive-pack=touch " + branchMarker},
+			name:       "malicious branch (argument injection)",
+			spec:       sandboxws.PushReposElem{Name: "widgets", Branch: "--receive-pack=touch " + branchMarker},
+			rejectedAs: &badBranch,
 		},
 		{
 			name: "malicious remote (argument injection)",
@@ -178,6 +187,7 @@ func TestPushOneRepo_MaliciousInputsRejectedBeforeSpawn(t *testing.T) {
 				Branch: "main",
 				Remote: pushTestStrPtr("--receive-pack=touch " + remoteMarker),
 			},
+			rejectedAs: &badRemote,
 		},
 		{
 			// The exact attack shape an adversarial review confirmed
@@ -194,22 +204,26 @@ func TestPushOneRepo_MaliciousInputsRejectedBeforeSpawn(t *testing.T) {
 				Branch: "main",
 				Remote: pushTestStrPtr("/tmp/attacker-controlled-rogue-bare-repo.git"),
 			},
+			rejectedAs: &badRemote,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			start := time.Now()
+			before := h.sup.SpawnCount()
 			_, err := h.pushOneRepo(tc.spec)
-			elapsed := time.Since(start)
+			spawned := h.sup.SpawnCount() - before
 
+			if spawned != 0 {
+				t.Errorf("pushOneRepo(%+v) spawned %d process(es) before returning, want 0 -- "+
+					"a real git process ran before the malicious input was rejected", tc.spec, spawned)
+			}
 			if err == nil {
 				t.Fatalf("pushOneRepo(%+v) error = nil, want a validation error", tc.spec)
 			}
-			if elapsed >= baseline/2 {
-				t.Errorf("pushOneRepo(%+v) took %s (real git-subprocess baseline = %s) -- suspiciously slow "+
-					"for pure validation, suggesting a real git process may have been spawned before rejection",
-					tc.spec, elapsed, baseline)
+			if !errors.As(err, tc.rejectedAs) {
+				t.Errorf("pushOneRepo(%+v) error = %v, want it to wrap the validator's %T -- "+
+					"something other than the validator refused this input", tc.spec, err, tc.rejectedAs)
 			}
 		})
 	}
