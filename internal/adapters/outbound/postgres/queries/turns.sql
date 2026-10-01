@@ -274,6 +274,39 @@ WHERE session_id = $1
 ORDER BY dispatched_event_id ASC
 LIMIT 1;
 
+-- name: ExistsEarlierTurnLeftRunning :one
+-- Whether the session holds an EARLIER turn, dispatched to the same
+-- sandbox gen before this one, that ended without its own
+-- execution_complete (§26.6's amendment): timed out, stopped, abandoned
+-- or refused, so the control plane appended a synthetic one naming it
+-- (`"synthetic": true, "turn_id": <id>`, sessionactor's appendEvent).
+-- Nothing stops that turn's agent, so it may still be running in the same
+-- sandbox, at the same gen, while this turn runs, and its late sub-tasks
+-- land in this turn's window (bounded below only, by this turn's own
+-- watermark) where nothing tells them from this turn's own: no sub-task
+-- event names the turn or prompt it belongs to. The caller then reads
+-- this turn's trace as not read in full, for both checks. A turn that
+-- ended with a real execution_complete leaves no synthetic one, and
+-- changes nothing; an earlier turn on another gen ran in a sandbox
+-- incarnation that is gone, whose events the gen filter already excludes.
+-- The rule is conservative: it holds until the sandbox's gen moves on, so
+-- a session whose turn timed out reads every later turn's claims on that
+-- gen as unconfirmed.
+SELECT EXISTS (
+    SELECT 1 FROM turns earlier
+    WHERE earlier.session_id = $1
+      AND earlier.id <> $2
+      AND earlier.dispatched_sandbox_gen = sqlc.arg('gen')::int
+      AND earlier.dispatched_event_id < sqlc.arg('dispatched_event_id')::bigint
+      AND EXISTS (
+          SELECT 1 FROM events e
+          WHERE e.session_id = earlier.session_id
+            AND e.type = 'execution_complete'
+            AND e.payload->>'synthetic' = 'true'
+            AND e.payload->>'turn_id' = earlier.id::text
+      )
+) AS left_running;
+
 -- name: SetTurnEpistemicOutcome :execrows
 -- The guarded UPDATE backing that same endpoint (§20.2) -- mirrors
 -- SetWorkflowStepRunOutcome's own "WHERE ... AND status = 'running'" guard

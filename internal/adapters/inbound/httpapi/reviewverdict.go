@@ -1157,8 +1157,9 @@ type subTaskFinishPayload struct {
 // routinely do) share the identical gen. gen scoping ALONE was found, by
 // an adversarial review, to let an EARLIER turn's own real counter-review
 // trace spuriously corroborate a LATER turn's self-report in exactly that
-// case; the dispatchedEventID lower bound is what actually closes that gap
-// for the later turn.
+// case; the dispatchedEventID lower bound is what closes that gap for the
+// later turn, as long as the earlier turn had ended -- one that may still
+// be running is covered below.
 //
 // The read is bounded above as well (§26.6's amendment): by the watermark
 // of the next turn dispatched on the session, when there is one
@@ -1169,11 +1170,28 @@ type subTaskFinishPayload struct {
 // -- so without the upper bound that late verdict's trace would hold the
 // later turn's sub-tasks, and the later turn's routine first fact-check
 // would read as the earlier turn's second run over its additions. The
-// bound applies to both checks, since they read the same rows; work the
-// earlier turn did after the later one was dispatched is left out too,
-// which can only leave a claim unconfirmed. Another turn sharing this
-// turn's watermark means the two turns' events cannot be told apart, and
-// the trace is not read at all (ReadInFull false).
+// bound applies to both checks, since they read the same rows. Work the
+// earlier turn did after the later one was dispatched is left out too, so
+// the cut trace is marked CutAtNextTurn: a second run found inside the
+// window still counts, and one not found there resolves to unconfirmed
+// ("could not be confirmed"), never not_found, since it may lie past the
+// cut; a counter-review not found there leaves that claim uncorroborated.
+// Another turn sharing this turn's watermark means the two turns' events
+// cannot be told apart, and the trace is not read at all (ReadInFull
+// false).
+//
+// The same race reaches the LATER turn's read, bounded below only: the
+// earlier turn's late sub-tasks land above the later turn's watermark, at
+// the same gen, and no sub-task event names the turn or prompt it belongs
+// to -- so nothing attributes them, and an earlier turn's late fact-check
+// would count as the later turn's own second run. The rule is
+// conservative: when the session holds an earlier turn, dispatched on the
+// same gen, that ended without its own execution_complete (a synthetic one
+// names it: timed out, stopped, abandoned or refused, its agent possibly
+// still running -- turns.EarlierTurnLeftRunning), this turn's trace is not
+// read at all (ReadInFull false), and both its claims resolve unconfirmed.
+// An earlier turn that ended with a real execution_complete changes
+// nothing.
 //
 // Every record carries its row's events.id (EventID): within one session
 // ids are allocated in commit order, which is what lets
@@ -1184,7 +1202,8 @@ type subTaskFinishPayload struct {
 // never "shows none" -- whenever any part of it could not be read: the
 // turn has no dispatched_sandbox_gen or dispatched_event_id to scope a
 // read to, its upper bound cannot be read or is shared with another turn,
-// a query fails, or a row's payload does not decode (that
+// an earlier turn on its gen may still be running, a query fails, or a
+// row's payload does not decode (that
 // row is skipped, not fatal to the rest: one corrupt event must not blind
 // the counter-review check to every OTHER, perfectly good row). None of
 // these fails the verdict-posting request: each only ever leaves a claim
@@ -1260,7 +1279,20 @@ func readSubTaskTrace(ctx context.Context, logger *slog.Logger, events *postgres
 		upper = &next
 	}
 
-	trace := reviewverdict.SubTaskTrace{ReadInFull: true}
+	// An earlier turn on this gen that may still be running: its late
+	// sub-tasks would sit in this turn's window with nothing to tell them
+	// apart, so the trace is not read as this turn's alone.
+	leftRunning, err := turns.EarlierTurnLeftRunning(ctx, sessionID, turnID, *gen, *dispatchedEventID)
+	switch {
+	case err != nil:
+		logger.Warn("httpapi: review-verdict: check for an earlier turn left running failed, the trace was not read", "error", err)
+		return reviewverdict.SubTaskTrace{}
+	case leftRunning:
+		logger.Warn("httpapi: review-verdict: an earlier turn on this sandbox gen ended without its own execution_complete and may still be running, the trace cannot be told apart and was not read")
+		return reviewverdict.SubTaskTrace{}
+	}
+
+	trace := reviewverdict.SubTaskTrace{ReadInFull: true, CutAtNextTurn: upper != nil}
 	startRows, err := events.ListSubTaskStartsForTurn(ctx, sessionID, *gen, *dispatchedEventID, upper)
 	if err != nil {
 		logger.Warn("httpapi: review-verdict: list sub_task_start events for corroboration failed, the trace could not be read", "error", err)

@@ -537,8 +537,14 @@ type ListSubTaskStartEventsForTurnParams struct {
 // on the session (GetNextTurnDispatchedEventID, queries/turns.sql), NULL
 // when there is none. Every event of that later turn has an id above its
 // watermark, so `id <= next_dispatched_event_id` excludes all of them.
-// The cost is the safe one: work the earlier turn did after the later one
-// was dispatched is excluded too, so its additions read "not found".
+// Work the earlier turn did after the later one was dispatched is
+// excluded too, deliberately unread, so the caller marks such a read cut
+// (SubTaskTrace.CutAtNextTurn): a second run found inside the window
+// counts, and one not found there resolves to "could not be confirmed"
+// (unconfirmed), never "not found", since it may lie past the cut. The
+// LATER turn's read keeps the lower bound alone, and an earlier turn that
+// may still be running at its gen makes it unreadable instead
+// (ExistsEarlierTurnLeftRunning, queries/turns.sql).
 func (q *Queries) ListSubTaskStartEventsForTurn(ctx context.Context, arg ListSubTaskStartEventsForTurnParams) ([]Event, error) {
 	rows, err := q.db.Query(ctx, listSubTaskStartEventsForTurn,
 		arg.SessionID,

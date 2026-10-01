@@ -305,6 +305,42 @@ func TestAdditionsFactCheckInTrace(t *testing.T) {
 			trace: reviewverdict.SubTaskTrace{},
 			want:  reviewpost.AdditionsTraceUnread,
 		},
+		// A read cut at the next turn's dispatch: the window itself was
+		// read in full, so a run inside it counts; a run not found in it
+		// may lie past the cut.
+		{
+			name: "a read cut at the next turn's dispatch, with the run inside the window: run found",
+			trace: func() reviewverdict.SubTaskTrace {
+				tr := traceOf(
+					start(1, "cr1", cr), finish(2, "cr1", "completed"),
+					start(3, "fc2", fc), finish(4, "fc2", "completed"),
+				)
+				tr.CutAtNextTurn = true
+				return tr
+			}(),
+			want: reviewpost.AdditionsTraceRunFound,
+		},
+		{
+			name: "a read cut at the next turn's dispatch, with no run inside the window: could not be confirmed",
+			trace: func() reviewverdict.SubTaskTrace {
+				tr := traceOf(
+					start(1, "fc1", fc), finish(2, "fc1", "completed"),
+					start(3, "cr1", cr), finish(4, "cr1", "completed"),
+				)
+				tr.CutAtNextTurn = true
+				return tr
+			}(),
+			want: reviewpost.AdditionsTraceUnread,
+		},
+		{
+			name: "a read cut at the next turn's dispatch, with no counter-review inside the window: could not be confirmed",
+			trace: func() reviewverdict.SubTaskTrace {
+				tr := traceOf(start(1, "fc1", fc), finish(2, "fc1", "completed"))
+				tr.CutAtNextTurn = true
+				return tr
+			}(),
+			want: reviewpost.AdditionsTraceUnread,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

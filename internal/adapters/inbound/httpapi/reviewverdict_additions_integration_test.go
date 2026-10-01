@@ -722,23 +722,28 @@ func seedLaterTurnAfterTimeout(ctx context.Context, t *testing.T, rig testRig, s
 }
 
 // TestPostReviewVerdict_CounterReviewAddition_LaterTurnsRunsAreNotTheEarlierTurns
-// is the timed-out-turn race: turn A (deep) runs its first fact-check and
-// a counter-review, is marked failed at its deadline while its agent keeps
-// running, and turn B is dispatched to the same sandbox at the same gen
-// and runs its own routine first fact-check. A's agent then posts A's
-// verdict, reporting the second run done. B's fact-check started after
-// A's counter-review, but it is B's: A's trace is read up to B's dispatch
-// watermark and no further, so the addition is not found -- never
-// checked. A's own second run, when it ran before B was dispatched, still
-// counts, and so does A's counter-review. One rig per case.
+// is the timed-out-turn race, read from the earlier turn: turn A (deep)
+// runs its first fact-check and a counter-review, is marked failed at its
+// deadline while its agent keeps running, and turn B is dispatched to the
+// same sandbox at the same gen. A's agent then posts A's verdict,
+// reporting the second run done. A's trace is read up to B's dispatch
+// watermark and no further, so a fact-check after it -- B's routine first
+// one, or A's own late second run, which the event log cannot tell apart
+// -- never counts as A's: the addition could not be confirmed, never
+// "checked", and never "not found" either, since the run may lie past the
+// cut. A's own second run before B was dispatched still counts, and so
+// does A's counter-review. One rig per case.
 func TestPostReviewVerdict_CounterReviewAddition_LaterTurnsRunsAreNotTheEarlierTurns(t *testing.T) {
 	tests := []struct {
-		name          string
-		earlierSecond bool
-		wantCheck     string
+		name               string
+		earlierSecondFirst bool // A's second run, before B's dispatch
+		earlierSecondLate  bool // A's second run, after B's dispatch
+		laterFirst         bool // B's routine first fact-check
+		wantCheck          string
 	}{
-		{"the later turn's first fact-check is not the earlier turn's second run", false, "not_found"},
-		{"the earlier turn's own second run, before the later turn's dispatch, still counts", true, "checked"},
+		{"the later turn's first fact-check is not the earlier turn's second run", false, false, true, "unconfirmed"},
+		{"the earlier turn's own second run, after the later turn's dispatch, could not be confirmed", false, true, false, "unconfirmed"},
+		{"the earlier turn's own second run, before the later turn's dispatch, still counts", true, false, true, "checked"},
 	}
 	for i, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -749,11 +754,16 @@ func TestPostReviewVerdict_CounterReviewAddition_LaterTurnsRunsAreNotTheEarlierT
 			turnA := seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-turn-a", 1)
 			seedFactCheck(ctx, t, rig, session.ID, "fc-a-first")
 			seedCounterReview(ctx, t, rig, session.ID, "cr-a")
-			if tc.earlierSecond {
+			if tc.earlierSecondFirst {
 				seedFactCheck(ctx, t, rig, session.ID, "fc-a-second")
 			}
 			seedLaterTurnAfterTimeout(ctx, t, rig, session.ID, turnA)
-			seedFactCheck(ctx, t, rig, session.ID, "fc-b-first")
+			if tc.laterFirst {
+				seedFactCheck(ctx, t, rig, session.ID, "fc-b-first")
+			}
+			if tc.earlierSecondLate {
+				seedFactCheck(ctx, t, rig, session.ID, "fc-a-second-late")
+			}
 
 			status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepVerdictWithAdditionsJSON(t, "done", 0))
 			if status != http.StatusCreated {
@@ -767,6 +777,133 @@ func TestPostReviewVerdict_CounterReviewAddition_LaterTurnsRunsAreNotTheEarlierT
 			}
 			if runs := readVerdictFactCheckRuns(ctx, t, rig, repo); strOrNil(runs.additionsCheck) != tc.wantCheck {
 				t.Errorf("review_verdicts.additions_check = %s, want %s", strOrNil(runs.additionsCheck), tc.wantCheck)
+			}
+			body := verdictOutboxBody(ctx, t, rig, session.ID)
+			if checked := strings.Contains(body, additionsCheckedMarker); checked != (tc.wantCheck == "checked") {
+				t.Errorf("posted body marks the addition fact-checked: %v, want %v, Body:\n%s", checked, tc.wantCheck == "checked", body)
+			}
+			if tc.wantCheck == "unconfirmed" && (!strings.Contains(body, additionsUnconfirmedFragment) || strings.Contains(body, "was found in this turn's trace")) {
+				t.Errorf("posted body does not say the check could not be confirmed, or claims what the cut trace shows, Body:\n%s", body)
+			}
+		})
+	}
+}
+
+// markTurnEnded ends turn the way the session actor would. timedOut: its
+// deadline passed, so it is marked failed and a synthetic
+// execution_complete naming it is appended, as handleTurnDeadlineTimer
+// does -- its agent was not stopped. Otherwise it completed: the sandbox's
+// own execution_complete arrived and it is marked completed.
+func markTurnEnded(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID, turn sqlcgen.Turn, timedOut bool) {
+	t.Helper()
+	status := sqlcgen.TurnStatusCompleted
+	payload := map[string]any{"type": "execution_complete", "messageId": "msg-complete-" + turn.ID.String(), "sessionId": sessionID.String(), "gen": 1, "ackId": "execution_complete:" + turn.ID.String(), "outcome": "completed", "reason": "done"}
+	if timedOut {
+		status = sqlcgen.TurnStatusFailed
+		payload = map[string]any{"turn_id": turn.ID.String(), "synthetic": true, "reason": "timeout"}
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal execution_complete: %v", err)
+	}
+	if _, err := rig.events.Create(ctx, sqlcgen.CreateEventParams{SessionID: sessionID, Type: "execution_complete", MessageID: "msg-complete-" + turn.ID.String(), Payload: raw}); err != nil {
+		t.Fatalf("persist execution_complete: %v", err)
+	}
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: turn.ID, Status: status}); err != nil {
+		t.Fatalf("end the turn: %v", err)
+	}
+}
+
+// dispatchDeepTurn dispatches a deep-path turn on sessionID at gen, with
+// its own watermark and messageID, the way tryPlanDispatch stamps one.
+func dispatchDeepTurn(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID, gen int32, messageID string) sqlcgen.Turn {
+	t.Helper()
+	headSHA, deep := "sha-"+messageID, string(reviewtriage.DepthDeep)
+	created, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHA, ReviewDepth: &deep})
+	if err != nil {
+		t.Fatalf("create turn %s: %v", messageID, err)
+	}
+	watermark, err := rig.events.MaxEventIDForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("read turn %s's watermark: %v", messageID, err)
+	}
+	updated, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		ID: created.ID, Status: sqlcgen.TurnStatusProcessing,
+		DispatchedSandboxGen: &gen, DispatchedEventID: &watermark, DispatchedMessageID: &messageID,
+	})
+	if err != nil {
+		t.Fatalf("stamp turn %s's dispatch: %v", messageID, err)
+	}
+	return updated
+}
+
+// TestPostReviewVerdict_CounterReviewAddition_EarlierTurnLeftRunning is the
+// same race read from the LATER turn, whose read is bounded below only:
+// turn A (deep) runs its first fact-check and a counter-review and times
+// out, its agent left running; turn B is dispatched to the same sandbox
+// at the same gen and runs its own first fact-check and counter-review;
+// then A's late second fact-check lands. B posts its verdict reporting a
+// second run it never made. Nothing in the event log says that run is
+// A's, so B's trace is not read at all: the addition could not be
+// confirmed and the counter-review claim is not corroborated -- never
+// "checked" on another turn's run. An earlier turn that completed with
+// its own execution_complete, or one that timed out on a gen since
+// replaced, changes nothing. One rig per case.
+func TestPostReviewVerdict_CounterReviewAddition_EarlierTurnLeftRunning(t *testing.T) {
+	tests := []struct {
+		name          string
+		earlierTimed  bool  // A ended without its own execution_complete
+		laterGen      int32 // the gen B is dispatched at
+		laterSecond   bool  // B's own second run
+		earlierLate   bool  // A's late second run, after B's counter-review
+		wantCheck     string
+		wantShippable restdtos.PostReviewVerdictResponseShippable
+	}{
+		{"an earlier turn timed out on this gen: its late run is not this turn's", true, 1, false, true, "unconfirmed", restdtos.PostReviewVerdictResponseShippableNeedsHuman},
+		{"an earlier turn timed out on this gen: even this turn's own run cannot be told apart", true, 1, true, false, "unconfirmed", restdtos.PostReviewVerdictResponseShippableNeedsHuman},
+		{"an earlier turn that completed normally changes nothing", false, 1, true, false, "checked", restdtos.PostReviewVerdictResponseShippableAuto},
+		{"an earlier turn that completed normally, and no second run: not found", false, 1, false, false, "not_found", restdtos.PostReviewVerdictResponseShippableAuto},
+		{"an earlier turn that timed out on a gen since replaced changes nothing", true, 2, true, false, "checked", restdtos.PostReviewVerdictResponseShippableAuto},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newTestRig(t)
+			ctx := context.Background()
+			repo := fmt.Sprintf("acme/additions-earlier-left-running-%d", i)
+			session := setupReviewSessionWithSandbox(ctx, t, rig, repo, int32(400+i))
+			turnA := seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-turn-a", 1)
+			seedFactCheck(ctx, t, rig, session.ID, "fc-a-first")
+			seedCounterReview(ctx, t, rig, session.ID, "cr-a")
+			markTurnEnded(ctx, t, rig, session.ID, turnA, tc.earlierTimed)
+
+			if tc.laterGen != 1 {
+				// The sandbox respawned: a new incarnation, a new gen.
+				if _, err := rig.pool.Exec(ctx, `UPDATE sandboxes SET gen = $2 WHERE session_id = $1`, session.ID, tc.laterGen); err != nil {
+					t.Fatalf("bump the sandbox gen: %v", err)
+				}
+			}
+			dispatchDeepTurn(ctx, t, rig, session.ID, tc.laterGen, "msg-turn-b")
+			seedSubTaskStart(ctx, t, rig, session.ID, "msg-start-fc-b-first", "fc-b-first", review.FactCheckAgentName, tc.laterGen)
+			seedSubTaskFinish(ctx, t, rig, session.ID, "msg-finish-fc-b-first", "fc-b-first", "completed", tc.laterGen)
+			seedSubTaskStart(ctx, t, rig, session.ID, "msg-start-cr-b", "cr-b", review.CounterReviewerAgentName, tc.laterGen)
+			seedSubTaskFinish(ctx, t, rig, session.ID, "msg-finish-cr-b", "cr-b", "completed", tc.laterGen)
+			if tc.laterSecond {
+				seedSubTaskStart(ctx, t, rig, session.ID, "msg-start-fc-b-second", "fc-b-second", review.FactCheckAgentName, tc.laterGen)
+				seedSubTaskFinish(ctx, t, rig, session.ID, "msg-finish-fc-b-second", "fc-b-second", "completed", tc.laterGen)
+			}
+			if tc.earlierLate {
+				seedFactCheck(ctx, t, rig, session.ID, "fc-a-second-late")
+			}
+
+			status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", fmt.Sprint(tc.laterGen), "msg-turn-b", deepVerdictWithAdditionsJSON(t, "done", 0))
+			if status != http.StatusCreated {
+				t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+			}
+			if resp.Shippable != tc.wantShippable {
+				t.Errorf("Shippable = %q, want %q", resp.Shippable, tc.wantShippable)
+			}
+			if _, check := findingSourceColumns(ctx, t, rig, repo, additionsAddedDescription); strOrNil(check) != tc.wantCheck {
+				t.Errorf("addition_check = %s, want %s", strOrNil(check), tc.wantCheck)
 			}
 			body := verdictOutboxBody(ctx, t, rig, session.ID)
 			if checked := strings.Contains(body, additionsCheckedMarker); checked != (tc.wantCheck == "checked") {

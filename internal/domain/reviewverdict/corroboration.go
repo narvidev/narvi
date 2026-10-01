@@ -90,14 +90,23 @@ type SubTaskFinishRecord struct {
 // whether that read covered the whole trace. ReadInFull is false when any
 // part of it could not be read -- a failed query, a row whose payload did
 // not decode (the caller skips it), a turn with no dispatch scope to read
-// it in, or one whose watermark another turn shares -- and its zero value
-// is false, so a trace nobody read is never mistaken for an empty one.
-// AdditionsFactCheckInTrace also reads a finish with no start in the
-// trace as a trace not read in full.
+// it in, one whose watermark another turn shares, or one dispatched after
+// an earlier turn on the same gen that may still be running -- and its
+// zero value is false, so a trace nobody read is never mistaken for an
+// empty one. AdditionsFactCheckInTrace also reads a finish with no start
+// in the trace as a trace not read in full.
 type SubTaskTrace struct {
 	Starts     []SubTaskStartRecord
 	Finishes   []SubTaskFinishRecord
 	ReadInFull bool
+	// CutAtNextTurn is true when the read stopped at the next turn's
+	// dispatch watermark: this turn's own events after it, if it kept
+	// running, were deliberately left unread, because they cannot be told
+	// from the next turn's. What the window holds is still read in full,
+	// so a run found inside it counts; a run not found inside it may lie
+	// past the cut, so AdditionsFactCheckInTrace reports the trace as not
+	// read in full rather than as holding none.
+	CutAtNextTurn bool
 }
 
 // counterReviewFinishOutcomeCompleted mirrors sandboxws.
@@ -208,6 +217,11 @@ func CounterReviewCorroborated(starts []SubTaskStartRecord, finishes []SubTaskFi
 //     The caller resolves this to unconfirmed, "could not be confirmed",
 //     never to "the trace shows none".
 //   - reviewpost.AdditionsTraceRunFound when a qualifying run is present.
+//     A read cut at the next turn's dispatch (CutAtNextTurn) still finds
+//     one inside its window: the window itself was read in full.
+//   - reviewpost.AdditionsTraceUnread, too, when no qualifying run is
+//     present but the read was cut at the next turn's dispatch: the run
+//     may lie past the cut, in events deliberately left unread.
 //   - reviewpost.AdditionsTraceNoRunFound otherwise: the trace, read in
 //     full, holds no qualifying run -- which includes a run whose finish
 //     had not landed when the verdict was posted (§26.4's accepted race),
@@ -219,8 +233,21 @@ func AdditionsFactCheckInTrace(trace SubTaskTrace) reviewpost.AdditionsTrace {
 	if !trace.ReadInFull || hasFinishWithoutStart(trace) {
 		return reviewpost.AdditionsTraceUnread
 	}
+	if additionsRunInTrace(trace) {
+		return reviewpost.AdditionsTraceRunFound
+	}
+	if trace.CutAtNextTurn {
+		return reviewpost.AdditionsTraceUnread
+	}
+	return reviewpost.AdditionsTraceNoRunFound
+}
+
+// additionsRunInTrace is AdditionsFactCheckInTrace's ordering rule over
+// the rows that were read: a completed counter-review, and a fact-check
+// that started after every counter-reviewer event and completed.
+func additionsRunInTrace(trace SubTaskTrace) bool {
 	if !CounterReviewCorroborated(trace.Starts, trace.Finishes) {
-		return reviewpost.AdditionsTraceNoRunFound
+		return false
 	}
 
 	finishesBySubTask := make(map[string][]SubTaskFinishRecord, len(trace.Finishes))
@@ -245,11 +272,11 @@ func AdditionsFactCheckInTrace(trace SubTaskTrace) reviewpost.AdditionsTrace {
 		}
 		for _, f := range finishesBySubTask[s.SubTaskID] {
 			if f.Outcome == counterReviewFinishOutcomeCompleted {
-				return reviewpost.AdditionsTraceRunFound
+				return true
 			}
 		}
 	}
-	return reviewpost.AdditionsTraceNoRunFound
+	return false
 }
 
 // hasFinishWithoutStart reports whether trace holds a sub_task_finish whose

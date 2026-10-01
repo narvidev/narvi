@@ -241,6 +241,20 @@ func (s *TurnStore) NextDispatchedEventID(ctx context.Context, sessionID, turnID
 	return *got, true, nil
 }
 
+// EarlierTurnLeftRunning reports whether sessionID holds a turn other than
+// turnID, dispatched to sandbox gen before dispatchedEventID (turnID's own
+// watermark), that ended without its own execution_complete -- so its
+// agent may still be running at that gen (§26.6's amendment,
+// ExistsEarlierTurnLeftRunning's doc comment in queries/turns.sql).
+func (s *TurnStore) EarlierTurnLeftRunning(ctx context.Context, sessionID, turnID pgtype.UUID, gen int32, dispatchedEventID int64) (bool, error) {
+	return s.q.ExistsEarlierTurnLeftRunning(ctx, sqlcgen.ExistsEarlierTurnLeftRunningParams{
+		SessionID:         sessionID,
+		ID:                turnID,
+		Gen:               gen,
+		DispatchedEventID: dispatchedEventID,
+	})
+}
+
 // SetEpistemicOutcome is the guarded write backing the epistemic-outcome-
 // posting endpoint (§20.2) -- mirrors WorkflowStore.
 // SetStepRunOutcome's own "guarded UPDATE, observed via :execrows" idiom
