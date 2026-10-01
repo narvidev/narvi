@@ -581,6 +581,12 @@ func PostReviewVerdict(
 		if req.AdditionsFactCheckKilled != nil {
 			input.AdditionsFactCheckKilled = *req.AdditionsFactCheckKilled
 		}
+		// §26.6's amendment: whether this turn's own stored prompt asked
+		// every finding for a source. A turn rendered before sources
+		// existed did not, and only its findings may arrive without one
+		// (reviewpost.ErrInvalidFindingSource) -- read from the turn the
+		// request was attributed to, never from the payload.
+		input.SourceInstructed = dispatchedTurn.Prompt != nil && review.PromptInstructsFindingSource(*dispatchedTurn.Prompt)
 		for _, tag := range req.BlastRadius {
 			input.BlastRadius = append(input.BlastRadius, review.Tag(tag))
 		}
@@ -1027,10 +1033,10 @@ func findingInputFromWire(f restdtos.PostedFinding) reviewpost.FindingInput {
 		in.SuggestedFix = f.SuggestedFix
 	}
 	// §26.6's amendment: absent decodes to "", reviewpost.
-	// FindingSourceNotRecorded -- a turn whose prompt was rendered before
-	// sources existed sends none, and its finding is stored with no source
-	// recorded (findingsource.go). A garbled value is refused by
-	// reviewpost.ValidateVerdictInput (ErrInvalidFindingSource).
+	// FindingSourceNotRecorded. reviewpost.ValidateVerdictInput admits it
+	// only from a turn whose stored prompt predates sources, storing the
+	// finding with no source recorded (findingsource.go), and refuses it,
+	// like a garbled value, from any other (ErrInvalidFindingSource).
 	if f.Source != nil {
 		in.Source = reviewpost.FindingSource(*f.Source)
 	}

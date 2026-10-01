@@ -25,11 +25,12 @@ import "github.com/narvidev/narvi/internal/domain/reviewtriage"
 // that basis (§26.5).
 type FindingSource string
 
-// The FindingSource values. A payload may carry primary or
-// counter_review, or no source at all; any other value is refused
-// (ValidateVerdictInput's ErrInvalidFindingSource).
+// The FindingSource values. A payload carries primary or counter_review;
+// any other value is refused (ValidateVerdictInput's
+// ErrInvalidFindingSource), and so is no source at all, except from a
+// turn rendered before sources existed.
 //
-// # Why an absent source is admitted
+// # When an absent source is admitted
 //
 // The verdict body's shape comes from the review prompt, and the prompt is
 // rendered once, when the turn is created (review.RenderTurnPrompt), then
@@ -38,16 +39,22 @@ type FindingSource string
 // that predates sources -- queued, running, or re-sent while the control
 // plane is deployed -- was never told about the field, and posts its
 // findings without one. Refusing them would refuse the verdict its own
-// instructions shaped. So an absent source is recorded as not recorded,
-// the state migrations/000154 already gives a finding last published
-// before sources existed, and every reader treats the two alike: neither
-// primary nor an addition, never marked unverified, counted under
-// "not_recorded". This gives up nothing the field could protect: the
-// source is self-reported, and a reviewer could always write "primary".
+// instructions shaped. The server can tell such a turn apart: its stored
+// prompt carries no source instruction (review.PromptInstructsFindingSource,
+// VerdictInput.SourceInstructed), and its payload reports no second
+// fact-check run, a field only the current prompt names. For that turn
+// alone an absent source is recorded as not recorded, the state
+// migrations/000154 already gives a finding last published before sources
+// existed, and every reader treats the two alike: neither primary nor an
+// addition, never marked unverified, counted under "not_recorded". A turn
+// whose prompt asked for a source and that leaves it off gets the same 400
+// as a garbled value, so an addition it forgot to label is never published
+// unmarked.
 const (
 	// FindingSourceNotRecorded is a finding whose source is not recorded:
-	// posted with none, or last published before sources existed. It is
-	// never a counter-review addition.
+	// posted with none by a turn rendered before sources existed, or last
+	// published before sources existed. It is never a counter-review
+	// addition.
 	FindingSourceNotRecorded FindingSource = ""
 	// FindingSourcePrimary is a finding the primary reviewer produced and
 	// put through the first fact-check run.

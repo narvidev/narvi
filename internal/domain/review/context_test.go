@@ -1253,3 +1253,48 @@ func TestRenderTurnPrompt_LightPathNamesOnlyThePrimarySource(t *testing.T) {
 		}
 	}
 }
+
+// TestPromptInstructsFindingSource: the marker the server reads a turn's
+// stored prompt for is the one both paths' source lines are built from,
+// so every prompt rendered now carries it, and the prompt rendered before
+// sources existed -- whose finding object named no source -- does not.
+func TestPromptInstructsFindingSource(t *testing.T) {
+	t.Parallel()
+
+	// The earlier prompt's finding object, verbatim.
+	const earlierFindingObject = "    {\n" +
+		"      \"sentinelKind\": \"coverage\" | \"docs_drift\" | null (null for an ordinary risk-map finding with no sentinel origin),\n" +
+		"      \"severity\": \"low\" | \"medium\" | \"high\" (required, independent of the verdict's own overall riskLevel above),\n" +
+		"      \"filePath\": \"<repo-relative path this finding is about>\" (required),\n" +
+		"      \"line\": <integer, optional -- the specific line, if any; never treat this as identifying the finding, only as a human-readable pointer>,\n" +
+		"      \"description\": \"<your own finding text>\" (required -- this is compared, normalized, against every future review pass on this same PR, so describe the SAME underlying issue with the SAME wording every time you re-report it, rather than paraphrasing),\n" +
+		"      \"suggestedFix\": \"<optional unified-diff/patch text a maintainer's apply-suggestion action can attempt to apply>\"\n" +
+		"    }\n"
+
+	tests := []struct {
+		name   string
+		prompt string
+		want   bool
+	}{
+		{"light path, rendered now", review.RenderTurnPrompt("review this", review.PreFetchedContext{DeepPath: false}), true},
+		{"deep path, rendered now", review.RenderTurnPrompt("review this", review.PreFetchedContext{DeepPath: true}), true},
+		{"the earlier prompt's finding object", earlierFindingObject, false},
+		{"the field named in prose, not as the body's own entry", `a finding's "source": "primary" or "counter_review"`, false},
+		{"no prompt", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := review.PromptInstructsFindingSource(tt.prompt); got != tt.want {
+				t.Errorf("PromptInstructsFindingSource() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+
+	for _, deep := range []bool{false, true} {
+		prompt := review.RenderTurnPrompt("review this", review.PreFetchedContext{DeepPath: deep})
+		if n := strings.Count(prompt, review.FindingSourceFieldMarker); n != 1 {
+			t.Errorf("deep=%v: the prompt carries the source marker %d times, want once, on the finding object's source line", deep, n)
+		}
+	}
+}

@@ -276,6 +276,38 @@ func TestValidateVerdictInput_FindingSourceAndSecondRun(t *testing.T) {
 			in.Findings = []reviewpost.FindingInput{noSourceFinding("n")}
 			return in
 		}, nil},
+		// A turn whose own prompt asked every finding for a source may not
+		// leave one off: an addition it forgot to label would otherwise be
+		// published unmarked.
+		{"light, no source on a turn whose prompt asked for one", func() reviewpost.VerdictInput {
+			in := validInput()
+			in.ReviewDepth = reviewtriage.DepthLight
+			in.SourceInstructed = true
+			in.Findings = []reviewpost.FindingInput{primaryFinding("p"), noSourceFinding("n")}
+			return in
+		}, reviewpost.ErrInvalidFindingSource},
+		{"deep, no source on a turn whose prompt asked for one", func() reviewpost.VerdictInput {
+			in := deepInputWithFindings(primaryFinding("p"), noSourceFinding("n"))
+			in.SourceInstructed = true
+			return in
+		}, reviewpost.ErrInvalidFindingSource},
+		{"deep, every source given on a turn whose prompt asked for them", func() reviewpost.VerdictInput {
+			in := deepInputWithFindings(primaryFinding("p"), counterReviewFinding("c"))
+			in.SourceInstructed = true
+			return in
+		}, nil},
+		// The second-run report is a field only the current prompt names,
+		// so a payload carrying it was not shaped by an older prompt.
+		{"deep, no source beside a second-run report", func() reviewpost.VerdictInput {
+			in := deepInputWithFindings(noSourceFinding("n"))
+			in.AdditionsFactCheck = reviewpost.FactCheckDone
+			return in
+		}, reviewpost.ErrInvalidFindingSource},
+		{"deep, no source beside a second run reported skipped", func() reviewpost.VerdictInput {
+			in := deepInputWithFindings(noSourceFinding("n"))
+			in.AdditionsFactCheck = reviewpost.FactCheckSkipped
+			return in
+		}, reviewpost.ErrInvalidFindingSource},
 		{"finding with a garbled source", func() reviewpost.VerdictInput {
 			in := deepInputWithFindings(primaryFinding("p"))
 			in.Findings[0].Source = "scribe"

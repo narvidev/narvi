@@ -546,6 +546,44 @@ func basePromptVerdictJSON(t *testing.T, deep bool, findings ...map[string]any) 
 	return string(raw)
 }
 
+// earlierPromptFindingObject is the finding object of the review prompt
+// rendered before finding sources, verbatim: what a turn created by the
+// previous binary carries in turns.prompt.
+const earlierPromptFindingObject = "    {\n" +
+	"      \"sentinelKind\": \"coverage\" | \"docs_drift\" | null (null for an ordinary risk-map finding with no sentinel origin),\n" +
+	"      \"severity\": \"low\" | \"medium\" | \"high\" (required, independent of the verdict's own overall riskLevel above),\n" +
+	"      \"filePath\": \"<repo-relative path this finding is about>\" (required),\n" +
+	"      \"line\": <integer, optional -- the specific line, if any; never treat this as identifying the finding, only as a human-readable pointer>,\n" +
+	"      \"description\": \"<your own finding text>\" (required -- this is compared, normalized, against every future review pass on this same PR, so describe the SAME underlying issue with the SAME wording every time you re-report it, rather than paraphrasing),\n" +
+	"      \"suggestedFix\": \"<optional unified-diff/patch text a maintainer's apply-suggestion action can attempt to apply>\"\n" +
+	"    }\n"
+
+// seedReviewTurnWithPrompt seeds the processing review turn the verdict is
+// posted from, on the deep path (seedProcessingDeepPathTurn) or the light
+// one, and stores prompt as its turns.prompt -- the text the server reads
+// to tell a turn rendered before finding sources from one rendered after.
+func seedReviewTurnWithPrompt(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID, deep bool, prompt string) sqlcgen.Turn {
+	t.Helper()
+	var turn sqlcgen.Turn
+	if deep {
+		turn = seedProcessingDeepPathTurn(ctx, t, rig, sessionID, "sha-with-prompt", 1)
+	} else {
+		headSHA, light := "sha-with-prompt", string(reviewtriage.DepthLight)
+		created, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHA, ReviewDepth: &light})
+		if err != nil {
+			t.Fatalf("seed processing light-path turn: %v", err)
+		}
+		messageID := testDispatchMessageID
+		if turn, err = rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: created.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &messageID}); err != nil {
+			t.Fatalf("stamp dispatched_message_id: %v", err)
+		}
+	}
+	if _, err := rig.pool.Exec(ctx, `UPDATE turns SET prompt = $2 WHERE id = $1`, turn.ID, prompt); err != nil {
+		t.Fatalf("store the turn's prompt: %v", err)
+	}
+	return turn
+}
+
 // TestPostReviewVerdict_FindingWithNoSource_ReadAsNotRecorded is the
 // rolling-deploy case for finding sources: a review turn rendered before
 // them -- queued, running, or re-sent across the deploy -- posts its
@@ -574,20 +612,10 @@ func TestPostReviewVerdict_FindingWithNoSource_ReadAsNotRecorded(t *testing.T) {
 			ctx := context.Background()
 			repo := fmt.Sprintf("acme/no-source-%d", i)
 			session := setupReviewSessionWithSandbox(ctx, t, rig, repo, int32(340+i))
+			seedReviewTurnWithPrompt(ctx, t, rig, session.ID, tc.deep, earlierPromptFindingObject)
 			if tc.deep {
-				seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-no-source", 1)
 				seedFactCheck(ctx, t, rig, session.ID, "fc-first")
 				seedCounterReview(ctx, t, rig, session.ID, "cr")
-			} else {
-				headSHA, light := "sha-no-source", string(reviewtriage.DepthLight)
-				created, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, ReviewHeadSha: &headSHA, ReviewDepth: &light})
-				if err != nil {
-					t.Fatalf("seed processing light-path turn: %v", err)
-				}
-				messageID := testDispatchMessageID
-				if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: created.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedMessageID: &messageID}); err != nil {
-					t.Fatalf("stamp dispatched_message_id: %v", err)
-				}
 			}
 
 			status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, basePromptVerdictJSON(t, tc.deep, basePromptFinding(first), basePromptFinding(second)))
@@ -895,5 +923,99 @@ func TestPostReviewVerdict_SecondRunRemovedEveryAddition_NothingCalledUnverified
 	}
 	if lv := readout.LatestVerdict; strOrNil(lv.AdditionsFactCheck) != "done" || lv.AdditionsFactCheckKilled == nil || *lv.AdditionsFactCheckKilled != 2 || lv.AdditionsCheck != nil {
 		t.Errorf("readout second run = %s/%v resolved %s, want done/2 resolved null", strOrNil(lv.AdditionsFactCheck), lv.AdditionsFactCheckKilled, strOrNil(lv.AdditionsCheck))
+	}
+}
+
+// withoutAdditionSource is body with "source" deleted from its
+// counter_review findings: an addition its reviewer forgot to label.
+func withoutAdditionSource(t *testing.T, body string) string {
+	t.Helper()
+	var parsed map[string]any
+	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
+		t.Fatalf("unmarshal verdict body: %v", err)
+	}
+	findings, _ := parsed["findings"].([]any)
+	removed := 0
+	for _, raw := range findings {
+		if f, ok := raw.(map[string]any); ok && f["source"] == "counter_review" {
+			delete(f, "source")
+			removed++
+		}
+	}
+	if removed == 0 {
+		t.Fatal("fixture bug: the body has no counter_review finding to unlabel")
+	}
+	out, err := json.Marshal(parsed)
+	if err != nil {
+		t.Fatalf("marshal verdict body: %v", err)
+	}
+	return string(out)
+}
+
+// TestPostReviewVerdict_FindingWithNoSource_RefusedFromACurrentPrompt: an
+// absent source is admitted only from a turn rendered before sources
+// existed. A turn whose stored prompt asked every finding for a source,
+// on either path, gets the same 400 a garbled source gets, and so does a
+// payload reporting the second fact-check run, a field only the current
+// prompt names -- even from a turn whose stored prompt predates sources.
+// Nothing is written: an addition its reviewer forgot to label is never
+// published as an ordinary finding. One rig per case.
+func TestPostReviewVerdict_FindingWithNoSource_RefusedFromACurrentPrompt(t *testing.T) {
+	tests := []struct {
+		name   string
+		deep   bool
+		prompt string
+		body   func(t *testing.T) string
+	}{
+		{
+			name:   "light, the turn's prompt asked for a source",
+			prompt: review.RenderTurnPrompt("review this", review.PreFetchedContext{DeepPath: false}),
+			body: func(t *testing.T) string {
+				return basePromptVerdictJSON(t, false, basePromptFinding("The retry loop never backs off between attempts."))
+			},
+		},
+		{
+			name:   "deep, the turn's prompt asked for a source, an addition left unlabelled",
+			deep:   true,
+			prompt: review.RenderTurnPrompt("review this", review.PreFetchedContext{DeepPath: true}),
+			body:   func(t *testing.T) string { return withoutAdditionSource(t, deepVerdictWithAdditionsJSON(t, "", 0)) },
+		},
+		{
+			name:   "deep, an earlier prompt but a second-run report beside an unlabelled addition",
+			deep:   true,
+			prompt: earlierPromptFindingObject,
+			body:   func(t *testing.T) string { return withoutAdditionSource(t, deepVerdictWithAdditionsJSON(t, "done", 0)) },
+		},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rig := newTestRig(t)
+			ctx := context.Background()
+			repo := fmt.Sprintf("acme/no-source-refused-%d", i)
+			session := setupReviewSessionWithSandbox(ctx, t, rig, repo, int32(390+i))
+			seedReviewTurnWithPrompt(ctx, t, rig, session.ID, tc.deep, tc.prompt)
+			if tc.deep {
+				seedFactCheck(ctx, t, rig, session.ID, "fc-first")
+				seedCounterReview(ctx, t, rig, session.ID, "cr")
+			}
+
+			status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, tc.body(t))
+			if status != http.StatusBadRequest {
+				t.Fatalf("status = %d, want %d", status, http.StatusBadRequest)
+			}
+			var findings, verdicts, outboxRows int
+			if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM review_findings WHERE repo_full_name = $1`, repo).Scan(&findings); err != nil {
+				t.Fatalf("count review_findings: %v", err)
+			}
+			if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM review_verdicts WHERE repo_full_name = $1`, repo).Scan(&verdicts); err != nil {
+				t.Fatalf("count review_verdicts: %v", err)
+			}
+			if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE session_id = $1 AND kind = $2`, session.ID, string(ports.NotificationKindGitHubVerdict)).Scan(&outboxRows); err != nil {
+				t.Fatalf("count verdict outbox rows: %v", err)
+			}
+			if findings != 0 || verdicts != 0 || outboxRows != 0 {
+				t.Errorf("refused payload wrote %d findings, %d verdicts, %d verdict outbox rows; want none", findings, verdicts, outboxRows)
+			}
+		})
 	}
 }

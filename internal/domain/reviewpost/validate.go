@@ -144,6 +144,17 @@ type VerdictInput struct {
 	// Its zero value, AdditionsTraceUnread, can only resolve an addition
 	// to unconfirmed, never to checked (ResolveAdditionCheck).
 	AdditionsTrace AdditionsTrace
+	// SourceInstructed (§26.6's amendment) is whether the posting turn's
+	// own stored prompt asked every finding for a source
+	// (review.PromptInstructsFindingSource over turns.prompt) --
+	// server-computed only, never read from the payload. When it did, a
+	// finding with no source is refused like a garbled one; only a turn
+	// rendered before sources existed may post one (ErrInvalidFindingSource).
+	// Its zero value admits the absence, so a caller that cannot read the
+	// prompt behaves as for an older turn; the payload's own
+	// AdditionsFactCheck, which only the current prompt names, still
+	// refuses it.
+	SourceInstructed bool
 }
 
 // MaxDigestSummaryBytes/MaxDigestAdequacyExplanationBytes/
@@ -323,15 +334,19 @@ var (
 	ErrDigestProposedBodyTooLong        = errors.New("reviewpost: digest.proposedBody exceeds the maximum length")
 	ErrDigestContestedPointsTooLong     = errors.New("reviewpost: digest.contestedPoints exceeds the maximum length")
 	ErrDigestArchDecisionFieldTooLong   = errors.New("reviewpost: digest.archDecisions contains a field exceeding the maximum length")
-	// ErrInvalidFindingSource (§26.6's amendment): a posted finding's
-	// source, when present, names the pass that produced it, primary or
-	// counter_review. An absent source is admitted and recorded as "source
-	// not recorded" (FindingSourceNotRecorded): a turn's prompt is rendered
-	// once, when the turn is created, so a turn rendered before sources
-	// existed posts its findings without one, and refusing them would
-	// refuse a verdict the turn's own instructions shaped. A garbled value
-	// says the payload is wrong, and is refused.
-	ErrInvalidFindingSource = errors.New("reviewpost: finding source must be one of primary/counter_review, or absent")
+	// ErrInvalidFindingSource (§26.6's amendment): a posted finding names
+	// the pass that produced it, primary or counter_review. A garbled value
+	// is refused on every turn. An absent one is refused too, except from
+	// a turn rendered before sources existed: a turn's prompt is rendered
+	// once, when the turn is created, and re-sent as stored, so such a
+	// turn posts its findings without one, and refusing them would refuse
+	// a verdict its own instructions shaped. That absence is admitted only
+	// when the turn's stored prompt carries no source instruction
+	// (VerdictInput.SourceInstructed false) AND the payload reports no
+	// second fact-check run (AdditionsFactCheck, a field only the current
+	// prompt names), and is recorded as "source not recorded"
+	// (FindingSourceNotRecorded).
+	ErrInvalidFindingSource = errors.New("reviewpost: finding source must be one of primary/counter_review")
 	// ErrCounterReviewAdditionOffDeepPath (§26.6's amendment, §26.9): a
 	// finding sourced counter_review, or a report of the second
 	// fact-check run, on a verdict that is not deep. No counter-reviewer
@@ -608,9 +623,10 @@ func ValidateVerdictInput(in VerdictInput) error {
 	// Finding sources and the second fact-check run (§26.6's amendment)
 	// -- appended after the length caps, so a payload that already fails
 	// an earlier check keeps reporting the same first error. A finding's
-	// source, when present, is primary or counter_review; an absent one is
-	// recorded as not recorded (ErrInvalidFindingSource's doc comment says
-	// why it is admitted), and is never a counter-review addition. A
+	// source is primary or counter_review; an absent one is admitted only
+	// from a turn rendered before sources existed, recorded as not
+	// recorded and never a counter-review addition
+	// (ErrInvalidFindingSource's doc comment says exactly when). A
 	// counter-review source, or a second-run report, exists only on the
 	// deep path. On the deep path every combination is
 	// admitted, including additions beside a counter-review reported
@@ -619,9 +635,14 @@ func ValidateVerdictInput(in VerdictInput) error {
 	// (BuildSecondFactCheck), so an inconsistent claim can only leave
 	// additions marked unverified -- the safe direction -- and refusing it
 	// would only push a reviewer to relabel an addition primary.
+	sourceRequired := in.SourceInstructed || in.AdditionsFactCheck != ""
 	for _, f := range in.Findings {
 		switch f.Source {
-		case FindingSourceNotRecorded, FindingSourcePrimary, FindingSourceCounterReview:
+		case FindingSourcePrimary, FindingSourceCounterReview:
+		case FindingSourceNotRecorded:
+			if sourceRequired {
+				return ErrInvalidFindingSource
+			}
 		default:
 			return ErrInvalidFindingSource
 		}

@@ -16,19 +16,24 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 
 - Added: `PostedFinding.source` (optional, string or null), the pass of the
   review that produced a posted finding: `primary` or `counter_review`
-  (technical plan §26.6's amendment). Optional on the wire, in the
-  application as in the schema: a value that is present must be one of the
-  two (a garbled one is refused with `400`), `counter_review` is refused
-  off the deep path, and an absent one is accepted and stored as "source
-  not recorded", the state a finding last published before this change
-  already has. Absent is accepted because this body follows the review
-  prompt, which is rendered once, when the turn is created, and re-sent as
-  stored: a turn rendered before this change -- queued, running, or
-  re-dispatched to a respawned sandbox while the control plane is
-  deployed -- posts its findings without the field, and refusing them
-  would refuse a request an older client's instructions shaped.
-  Self-reported: the server records it as stated. A property added, not
-  required, with every older body still accepted, grades MINOR (row 2).
+  (technical plan §26.6's amendment). Optional in the schema. A value
+  that is present must be one of the two (a garbled one is refused with
+  `400`), and `counter_review` is refused off the deep path. An absent one
+  is accepted in one case only: from a turn whose own stored prompt
+  predates the source instruction, on a payload that reports no
+  `additionsFactCheck` (a field only the new prompt names); it is stored
+  as "source not recorded", the state a finding last published before
+  this change already has. That case exists because this body follows the
+  review prompt, which is rendered once, when the turn is created, and
+  re-sent as stored: a turn rendered before this change -- queued,
+  running, or re-dispatched to a respawned sandbox while the control plane
+  is deployed -- posts its findings without the field, and refusing them
+  would refuse a request an older client's instructions shaped. From a
+  turn whose prompt asked for the field, an absent one is refused with
+  `400`, like a garbled one, so an addition its reviewer forgot to label is
+  never published as an ordinary finding. Self-reported: the server
+  records it as stated. A property added, not required, with every older
+  client's body still accepted, grades MINOR (row 2).
 - Added: `PostReviewVerdictRequest.additionsFactCheck` (optional, string or
   null: `done` or `skipped`) and `additionsFactCheckKilled` (optional,
   integer or null, minimum 0), the reviewer's report of the second, diff-only

@@ -1,5 +1,7 @@
 package review
 
+import "strings"
+
 // StackContext is the GitHub-native-stack information a review session's
 // pre-fetched context carries WHEN the PR under review happens to belong to
 // a GitHub stack (§17.6's amendment to §21.1's own stacked-PR
@@ -488,6 +490,28 @@ const (
 	FactCheckAgentName          = "fact-check"
 )
 
+// FindingSourceFieldMarker opens the "source" entry of the verdict body's
+// finding object (§26.6's amendment), on both paths: the light path's
+// line and the deep path's line are each this text followed by their own
+// vocabulary. It is the one string both the renderer
+// (verdictToolInstructions) and the server's check
+// (PromptInstructsFindingSource) use, so a later edit to the instruction
+// cannot leave the check looking for text the prompt no longer carries.
+// Its indentation is the JSON body's own, which is what keeps a turn's
+// untrusted content -- a diff or a PR body rendered into the same prompt
+// -- from carrying it by accident.
+const FindingSourceFieldMarker = `      "source": "primary"`
+
+// PromptInstructsFindingSource reports whether prompt -- a review turn's
+// stored prompt (turns.prompt), rendered once when the turn was created
+// and re-sent as stored -- asked every finding for a "source". A prompt
+// rendered before sources existed did not, and a verdict its instructions
+// shaped posts its findings without one; reviewpost.ValidateVerdictInput
+// admits that absence only for such a turn.
+func PromptInstructsFindingSource(prompt string) bool {
+	return strings.Contains(prompt, FindingSourceFieldMarker)
+}
+
 // verdictToolInstructions is RenderTurnPrompt's own fixed, deterministic
 // block instructing the review agent how to post its verdict (§8.2,
 // reviewverdict.go's own doc comment: "the review turn's own prompt
@@ -636,9 +660,15 @@ const (
 // (the text names no other value, §26.9); on deep, "primary" or
 // "counter_review". The deep path adds "additionsFactCheck"/
 // "additionsFactCheckKilled", the second run over what the counter-review
-// added, optional and omitted when it added nothing. reviewpost.
-// ValidateVerdictInput requires the source on every finding and refuses
-// a counter_review source, or a second-run report, off the deep path.
+// added, optional and omitted when it added nothing. Both paths' source
+// lines open with FindingSourceFieldMarker, which is how the server tells
+// a turn whose stored prompt asked for a source from one rendered before
+// sources existed (PromptInstructsFindingSource). reviewpost.
+// ValidateVerdictInput refuses a finding with no source when the turn's
+// prompt asked for one (or the payload reports the second run, which only
+// this prompt names), admits it from a turn rendered before sources
+// existed, refuses a garbled source on every turn, and refuses a
+// counter_review source, or a second-run report, off the deep path.
 func verdictToolInstructions(deep bool, costBudgetUSD float64, costBudgetSafetyMarginPercent int) string {
 	digestRequiredFieldsClause := "\"archDecisions\"/\"stackRisks\"/\"unverifiedLimits\"/\"proposedBody\"/\"contestedPoints\" are requested but optional"
 	archDecisionsRequirement := "REQUESTED, not required"
@@ -667,7 +697,7 @@ func verdictToolInstructions(deep bool, costBudgetUSD float64, costBudgetSafetyM
 	// added. On light the source is always "primary" and nothing names the
 	// counter-review or the second run (§26.9).
 	optionalFieldsClause := "\"findings\" and \"counterReview\", which are optional -- see \"counterReview\"'s own entry below for exactly when to include it"
-	findingSourceLine := "      \"source\": \"primary\" (required -- every finding on this review is your own)\n"
+	findingSourceLine := FindingSourceFieldMarker + " (required -- every finding on this review is your own)\n"
 	additionsFactCheckLines := ""
 	if deep {
 		digestRequiredFieldsClause = "\"archDecisions\"/\"stackRisks\"/\"unverifiedLimits\" are ALSO REQUIRED on this deep-path review (§26.3) -- only \"proposedBody\"/\"contestedPoints\" remain requested but optional"
@@ -678,7 +708,7 @@ func verdictToolInstructions(deep bool, costBudgetUSD float64, costBudgetSafetyM
 		contestedPointsGuidance = "Omit entirely if the " + CounterReviewerAgentName + " sub-task raised nothing"
 		counterReviewLine = "\"counterReview\": \"done\" | \"skipped\" (REQUIRED on this deep-path review (§26.4) -- \"done\" means you actually spawned and adjudicated the " + CounterReviewerAgentName + " sub-task; \"skipped\" means a genuine sub-task error/timeout, or the cost budget already having been reached before it would have been dispatched -- \"skipped\" raises this verdict's own shippable classification to needs_human no matter how low-risk everything else looks, so do not report \"done\" unless the sub-task genuinely ran)"
 		optionalFieldsClause = "\"findings\", \"counterReview\", \"additionsFactCheck\" and \"additionsFactCheckKilled\", which are optional -- see each one's own entry below for exactly when to include it"
-		findingSourceLine = "      \"source\": \"primary\" | \"counter_review\" (required -- \"primary\" for a finding you produced and put through the first fact-check, \"counter_review\" for an addition the " + CounterReviewerAgentName + " surfaced on its own; never relabel an addition \"primary\" -- an addition is published as checked only when the second fact-check run is found in this turn's trace, and as unverified otherwise)\n"
+		findingSourceLine = FindingSourceFieldMarker + " | \"counter_review\" (required -- \"primary\" for a finding you produced and put through the first fact-check, \"counter_review\" for an addition the " + CounterReviewerAgentName + " surfaced on its own; never relabel an addition \"primary\" -- an addition is published as checked only when the second fact-check run is found in this turn's trace, and as unverified otherwise)\n"
 		additionsFactCheckLines = "  \"additionsFactCheck\": \"done\" | \"skipped\" (the second fact-check run over the counter-review's additions, step 4 of the orchestration guidance above -- omit it when the counter-review added nothing),\n" +
 			"  \"additionsFactCheckKilled\": <integer, count of additions the second fact-check run removed as provably wrong from the diff alone -- MUST be 0 when \"additionsFactCheck\" is \"skipped\", omitted with it>,\n"
 	}

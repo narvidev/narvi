@@ -197,9 +197,9 @@ type FindingInput struct {
 	// counter_review when present (ValidateVerdictInput, not
 	// ValidateFindingInput: a finding another producer builds, such as
 	// the handoff sentinel's, comes from neither pass and carries none).
-	// "" when the payload names none -- a turn whose prompt was rendered
-	// before sources existed (FindingSourceNotRecorded) -- and stored as
-	// "source not recorded". Never part of identity: the same issue
+	// "" when the payload names none, which only a turn whose prompt was
+	// rendered before sources existed may do (FindingSourceNotRecorded),
+	// stored as "source not recorded". Never part of identity: the same issue
 	// re-reported by the other pass is the same finding.
 	Source FindingSource
 }

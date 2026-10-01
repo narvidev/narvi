@@ -7888,20 +7888,24 @@ type PostedFinding struct {
 	// §26.6's amendment: the pass of the review that produced this finding --
 	// 'primary' (the primary reviewer, put through the first fact-check run) or
 	// 'counter_review' (an addition the counter-reviewer surfaced on its own, deep
-	// path only, which the first fact-check run never saw). Optional on the wire, and
-	// a value that is present must be 'primary' or 'counter_review'
-	// (internal/domain/reviewpost.ValidateVerdictInput's ErrInvalidFindingSource);
-	// 'counter_review' is refused off the deep path
-	// (ErrCounterReviewAdditionOffDeepPath). Absent is admitted because the verdict
-	// body follows the review prompt, which is rendered once, when the turn is
-	// created, and re-sent as stored: a turn rendered before this field existed posts
-	// its findings without it. Such a finding is stored with no source recorded --
-	// read as neither primary nor an addition, exactly like a finding last published
-	// before sources were recorded. Self-reported: the server records it as the
-	// payload states it (review_findings.reported_source). A 'counter_review' finding
-	// is published as checked only when the server finds, in the turn's own sub-task
-	// trace, a fact-check sub-task that started after the counter-review and
-	// completed; otherwise it is published marked unverified and counted apart.
+	// path only, which the first fact-check run never saw). Optional in the schema; a
+	// value that is present must be 'primary' or 'counter_review'
+	// (internal/domain/reviewpost.ValidateVerdictInput's ErrInvalidFindingSource),
+	// and 'counter_review' is refused off the deep path
+	// (ErrCounterReviewAdditionOffDeepPath). An absent source is admitted in one case
+	// only: from a turn whose own stored prompt predates the source instruction (it
+	// carries no 'source' entry in its finding object), on a payload that reports no
+	// additionsFactCheck, a field only the current prompt names. The verdict body
+	// follows the review prompt, which is rendered once, when the turn is created,
+	// and re-sent as stored, so such a turn posts its findings without the field; its
+	// finding is stored with no source recorded -- read as neither primary nor an
+	// addition, exactly like a finding last published before sources were recorded.
+	// From any other turn an absent source is refused with 400, like a garbled one.
+	// Self-reported: the server records it as the payload states it
+	// (review_findings.reported_source). A 'counter_review' finding is published as
+	// checked only when the server finds, in the turn's own sub-task trace, a
+	// fact-check sub-task that started after the counter-review and completed;
+	// otherwise it is published marked unverified and counted apart.
 	Source PostedFindingSource `json:"source,omitempty,omitzero" yaml:"source,omitempty" mapstructure:"source,omitempty"`
 
 	// An optional unified-diff/patch text the apply-suggestion endpoint (§12.2 item
@@ -7959,20 +7963,24 @@ func (j *PostedFindingSeverity) UnmarshalJSON(value []byte) error {
 // §26.6's amendment: the pass of the review that produced this finding --
 // 'primary' (the primary reviewer, put through the first fact-check run) or
 // 'counter_review' (an addition the counter-reviewer surfaced on its own, deep
-// path only, which the first fact-check run never saw). Optional on the wire, and
-// a value that is present must be 'primary' or 'counter_review'
-// (internal/domain/reviewpost.ValidateVerdictInput's ErrInvalidFindingSource);
+// path only, which the first fact-check run never saw). Optional in the schema; a
+// value that is present must be 'primary' or 'counter_review'
+// (internal/domain/reviewpost.ValidateVerdictInput's ErrInvalidFindingSource), and
 // 'counter_review' is refused off the deep path
-// (ErrCounterReviewAdditionOffDeepPath). Absent is admitted because the verdict
-// body follows the review prompt, which is rendered once, when the turn is
-// created, and re-sent as stored: a turn rendered before this field existed posts
-// its findings without it. Such a finding is stored with no source recorded --
-// read as neither primary nor an addition, exactly like a finding last published
-// before sources were recorded. Self-reported: the server records it as the
-// payload states it (review_findings.reported_source). A 'counter_review' finding
-// is published as checked only when the server finds, in the turn's own sub-task
-// trace, a fact-check sub-task that started after the counter-review and
-// completed; otherwise it is published marked unverified and counted apart.
+// (ErrCounterReviewAdditionOffDeepPath). An absent source is admitted in one case
+// only: from a turn whose own stored prompt predates the source instruction (it
+// carries no 'source' entry in its finding object), on a payload that reports no
+// additionsFactCheck, a field only the current prompt names. The verdict body
+// follows the review prompt, which is rendered once, when the turn is created, and
+// re-sent as stored, so such a turn posts its findings without the field; its
+// finding is stored with no source recorded -- read as neither primary nor an
+// addition, exactly like a finding last published before sources were recorded.
+// From any other turn an absent source is refused with 400, like a garbled one.
+// Self-reported: the server records it as the payload states it
+// (review_findings.reported_source). A 'counter_review' finding is published as
+// checked only when the server finds, in the turn's own sub-task trace, a
+// fact-check sub-task that started after the counter-review and completed;
+// otherwise it is published marked unverified and counted apart.
 type PostedFindingSource *string
 
 // An optional unified-diff/patch text the apply-suggestion endpoint (§12.2 item 2)
