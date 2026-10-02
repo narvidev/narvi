@@ -2265,6 +2265,8 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainSt
 				"An admin can enroll the repository; then send the turn again.", repo),
 			notAssessed: reviewcheck.NotAssessedRolloutNotEnrolled,
 			refused:     true,
+			// SendCommand is never called on this path.
+			undelivered: true,
 		})
 	}
 
@@ -2290,15 +2292,24 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainSt
 	}
 
 	if err := a.commander.SendCommand(a.sessionID.String(), plan.payload); err != nil {
-		// Covers ports.ErrNoLiveSandboxConnection (the prompt genuinely
-		// never reached a live connection) and every other send failure
-		// identically.
+		// Every send failure fails the turn the same way, with one
+		// difference. ports.ErrNoLiveSandboxConnection means SendCommand
+		// found no connection and wrote nothing, so the prompt certainly
+		// never reached the sandbox and no agent of this turn can be
+		// running: undelivered marks its synthetic execution_complete
+		// "delivered": false, and the review-verdict endpoint does not
+		// count it as an earlier turn left running
+		// (ExistsEarlierTurnLeftRunning, queries/turns.sql). Any other
+		// error may have followed a partial write, so the prompt may have
+		// arrived and the turn is left unmarked, counted as possibly still
+		// running.
 		a.logger.Error("sessionactor: dispatch turn: send prompt command failed; failing turn",
 			"turn_id", plan.turnID.String(), "error", err)
 		return a.failDispatchedTurn(ctx, plan.turnID, dispatchFailure{
 			reason:       fmt.Sprintf("failed to deliver prompt to sandbox: %v", err),
 			notAssessed:  reviewcheck.NotAssessedPromptNotDelivered,
 			backOffSince: chainStart,
+			undelivered:  errors.Is(err, ports.ErrNoLiveSandboxConnection),
 		})
 	}
 	return nil
@@ -2476,11 +2487,15 @@ func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, fail
 		}
 
 		if turn.RequiresSyntheticExecutionComplete(turn.TriggerTimeout) {
-			if err := a.appendEvent(ctx, tx, "execution_complete", map[string]any{
+			payload := map[string]any{
 				"turn_id":   turnID.String(),
 				"synthetic": true,
 				"reason":    failure.reason,
-			}); err != nil {
+			}
+			if failure.undelivered {
+				payload[syntheticUndeliveredKey] = false
+			}
+			if err := a.appendEvent(ctx, tx, "execution_complete", payload); err != nil {
 				return err
 			}
 		}
@@ -2569,7 +2584,22 @@ type dispatchFailure struct {
 	// backOffSince is the first arm of the dispatch timer's chain of
 	// failures, carried from the evaluation that planned the dispatch.
 	backOffSince pgtype.Timestamptz
+	// undelivered marks a prompt that certainly never reached the
+	// sandbox: refused before SendCommand was called, or refused by it
+	// with ports.ErrNoLiveSandboxConnection, which writes nothing. The
+	// synthetic execution_complete then says so ("delivered": false), and
+	// no agent of this turn can be running: the review-verdict endpoint's
+	// trace read does not count it as an earlier turn left running
+	// (queries/turns.sql, ExistsEarlierTurnLeftRunning). Any other send
+	// failure may have written part of the prompt, so it is not marked.
+	undelivered bool
 }
+
+// syntheticUndeliveredKey is the field failDispatchedTurn adds, set to
+// false, to the synthetic execution_complete of a turn whose prompt
+// certainly never reached the sandbox (dispatchFailure.undelivered).
+// queries/turns.sql's ExistsEarlierTurnLeftRunning reads the same key.
+const syntheticUndeliveredKey = "delivered"
 
 // BuildPromptPayload marshals a real, schema-valid sandboxws.Prompt for
 // turnID (§3.3: "the turn records the OpenCode conversation id at turn

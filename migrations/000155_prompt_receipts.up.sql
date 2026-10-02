@@ -81,7 +81,7 @@
 --     an agent sends through its generic path, under the event's wire
 --     messageId and with no ack -- the same row this release stores and
 --     reads.
--- migration000154_integration_test.go runs the previous binary's own
+-- migration000155_integration_test.go runs the previous binary's own
 -- statements against the columns.
 --
 -- # Rolling back
@@ -89,15 +89,15 @@
 -- Every control-plane boot runs the embedded migrations up
 -- (controlplane/migrate.go), and golang-migrate refuses a database whose
 -- version it has no file for. So once this migration is applied, the
--- previous binary cannot boot ("no migration found for version 154"). A
+-- previous binary cannot boot ("no migration found for version 155"). A
 -- rollback therefore takes one of two steps first, with the control plane
 -- scaled to zero:
---   - Keep the columns: with the golang-migrate CLI, `migrate force 153`.
---     The previous binary then boots, since 153 is a version it has, and
+--   - Keep the columns: with the golang-migrate CLI, `migrate force 154`.
+--     The previous binary then boots, since 154 is a version it has, and
 --     works with the columns present as above. When this release is
 --     deployed again, this file runs again and leaves the columns and
 --     their values as they are.
---   - Drop them: run this migration's down (goto 153) with this release's
+--   - Drop them: run this migration's down (goto 154) with this release's
 --     migrations. The down file says what it removes.
 -- Nothing else needs undoing: no timer kind is added, and a stored
 -- prompt_received row is inert to every binary.

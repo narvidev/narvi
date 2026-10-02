@@ -15,7 +15,7 @@ import (
 )
 
 // The queries technical plan §3.3's prompt receipts rest on
-// (migrations/000154_prompt_receipts.up.sql), against real Postgres.
+// (migrations/000155_prompt_receipts.up.sql), against real Postgres.
 
 // TestSandboxStore_RecordReady_GuardedOnGen: a ready counts, and records
 // its capability, only for the sandbox's live gen; the latest ready of the

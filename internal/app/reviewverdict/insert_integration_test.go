@@ -184,7 +184,7 @@ func TestInsert_AllTenPlaceholderTokensStrippedFromStoredDigest(t *testing.T) {
 		},
 	}
 
-	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, digest, reviewtriage.DepthDeep, review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, reviewverdict.Context{}, pgtype.UUID{}); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, digest, reviewtriage.DepthDeep, review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, reviewverdict.Context{}, pgtype.UUID{}); err != nil {
 		t.Fatalf("Insert: %v", err)
 	}
 
@@ -282,7 +282,7 @@ func TestInsert_ContextAndAttemptIDRoundTrip(t *testing.T) {
 			PolicyVersion: autoapproval.CurrentPolicyVersion,
 		}
 
-		if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, baseVerdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, nil, nil, "", false, wantContext, turn.ID); err != nil {
+		if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, baseVerdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, wantContext, turn.ID); err != nil {
 			t.Fatalf("Insert: %v", err)
 		}
 
@@ -316,7 +316,7 @@ func TestInsert_ContextAndAttemptIDRoundTrip(t *testing.T) {
 		const prNumber = int32(2)
 		const headSHA = "sha-context-roundtrip-2"
 
-		if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, baseVerdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, nil, nil, "", false, reviewverdict.Context{}, pgtype.UUID{}); err != nil {
+		if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, baseVerdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, reviewverdict.Context{}, pgtype.UUID{}); err != nil {
 			t.Fatalf("Insert: %v", err)
 		}
 
@@ -413,7 +413,7 @@ func TestGetLatest_OrdersByProducingAttemptRecency_NeverPostTime(t *testing.T) {
 
 	// The NEWER attempt's own verdict is INSERTED FIRST -- an earlier
 	// review_verdicts.created_at than what follows.
-	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-newer-attempt", pgtype.UUID{}, verdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, nil, nil, "", false, reviewverdict.Context{}, newerTurn.ID); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-newer-attempt", pgtype.UUID{}, verdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, reviewverdict.Context{}, newerTurn.ID); err != nil {
 		t.Fatalf("insert newer attempt's verdict: %v", err)
 	}
 	// The OLDER attempt's own verdict is INSERTED SECOND -- reaching the
@@ -421,7 +421,7 @@ func TestGetLatest_OrdersByProducingAttemptRecency_NeverPostTime(t *testing.T) {
 	// names: "an older attempt's own POST landing at the database AFTER a
 	// newer attempt's must not win this read". Its review_verdicts.created_at
 	// is therefore the LATER of the two.
-	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-older-attempt", pgtype.UUID{}, verdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, nil, nil, "", false, reviewverdict.Context{}, olderTurn.ID); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-older-attempt", pgtype.UUID{}, verdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, reviewverdict.Context{}, olderTurn.ID); err != nil {
 		t.Fatalf("insert older attempt's verdict (landing at the DB second): %v", err)
 	}
 
@@ -528,12 +528,12 @@ func TestGetLatestAndListLatestAutoApproved_AgreeOnAttemptRecency(t *testing.T) 
 
 	// The NEWER attempt's own verdict is INSERTED FIRST -- an earlier
 	// review_verdicts.created_at than what follows.
-	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-newer-attempt-auto", pgtype.UUID{}, verdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, nil, nil, "", false, reviewverdict.Context{}, newerTurn.ID); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-newer-attempt-auto", pgtype.UUID{}, verdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, reviewverdict.Context{}, newerTurn.ID); err != nil {
 		t.Fatalf("insert newer attempt's verdict: %v", err)
 	}
 	// The OLDER attempt's own verdict is INSERTED SECOND -- reaching the
 	// database AFTER the newer attempt's own.
-	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-older-attempt-auto", pgtype.UUID{}, verdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, nil, nil, "", false, reviewverdict.Context{}, olderTurn.ID); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, reviewVerdicts, repoSettings, false, repoFullName, prNumber, "sha-older-attempt-auto", pgtype.UUID{}, verdict(), digest, reviewtriage.DepthLight, "", reviewpost.FactCheckSkipped, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, reviewverdict.Context{}, olderTurn.ID); err != nil {
 		t.Fatalf("insert older attempt's verdict (landing at the DB second): %v", err)
 	}
 

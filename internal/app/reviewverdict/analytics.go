@@ -126,20 +126,50 @@ func TopRiskDrivers(ctx context.Context, deps Deps, repoFullName string, now tim
 	return drivers, ok, nil
 }
 
+// FindingOutcomeReadout is the "Review finding outcomes" KPI as
+// FindingOutcomes computes it (§21.1, §26.5/§26.6's amendment).
+type FindingOutcomeReadout struct {
+	// Outcomes is the status distribution of every finding in the window
+	// except the counter-review additions the server could not count as
+	// checked (reviewverdict.VerifiedStatuses) -- empty, never nil, when
+	// every finding in the window is one.
+	Outcomes []reviewverdict.FindingStatusCount
+	// BySource counts every finding in the window per source and status,
+	// unverified additions in a bucket of their own -- the breakdown
+	// precision per source is read from (§26.5).
+	BySource []reviewverdict.FindingSourceStatusCount
+}
+
 // FindingOutcomes computes repoFullName's own §21.1/§12.2 item 6
 // "Review finding outcomes" KPI, read from review_findings (§8.2) --
 // see internal/domain/reviewverdict.FindingOutcomes' own doc comment for
 // why this reads a DIFFERENT table than Timeseries/TopRiskDrivers above.
-func FindingOutcomes(ctx context.Context, deps Deps, repoFullName string, now time.Time) ([]reviewverdict.FindingStatusCount, bool, error) {
+// ok is false when no finding was first seen in the window, the KPI's own
+// "not yet computed" state; an unverified addition is a finding, so a
+// window holding only those is computed, with an empty Outcomes and the
+// additions counted apart in BySource.
+func FindingOutcomes(ctx context.Context, deps Deps, repoFullName string, now time.Time) (FindingOutcomeReadout, bool, error) {
 	since := now.Add(-deps.Timeouts.ReviewVerdictAnalyticsWindow)
 	raw, err := deps.ReviewFindings.ListStatusesInWindow(ctx, repoFullName, pgtype.Timestamptz{Time: since, Valid: true}, maxAnalyticsRows)
 	if err != nil {
-		return nil, false, err
+		return FindingOutcomeReadout{}, false, err
 	}
-	statuses := make([]reviewpost.FindingStatus, len(raw))
-	for i, s := range raw {
-		statuses[i] = reviewpost.FindingStatus(s)
+	if len(raw) == 0 {
+		return FindingOutcomeReadout{}, false, nil
 	}
-	outcomes, ok := reviewverdict.FindingOutcomes(statuses)
-	return outcomes, ok, nil
+	rows := make([]reviewverdict.FindingOutcomeRow, len(raw))
+	for i, r := range raw {
+		rows[i] = reviewverdict.FindingOutcomeRow{Status: reviewpost.FindingStatus(r.Status)}
+		if r.ReportedSource != nil {
+			rows[i].Source = reviewpost.FindingSource(*r.ReportedSource)
+		}
+		if r.AdditionCheck != nil {
+			rows[i].AdditionCheck = reviewpost.AdditionCheck(*r.AdditionCheck)
+		}
+	}
+	outcomes, _ := reviewverdict.FindingOutcomes(reviewverdict.VerifiedStatuses(rows))
+	if outcomes == nil {
+		outcomes = []reviewverdict.FindingStatusCount{}
+	}
+	return FindingOutcomeReadout{Outcomes: outcomes, BySource: reviewverdict.FindingOutcomesBySource(rows)}, true, nil
 }

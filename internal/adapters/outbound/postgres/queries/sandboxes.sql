@@ -240,7 +240,7 @@ WHERE session_id = $1
   AND gen = $2;
 
 -- name: RecordSandboxReady :exec
--- Technical plan §3.3, prompt receipts (migrations/000154_prompt_receipts.up.sql):
+-- Technical plan §3.3, prompt receipts (migrations/000155_prompt_receipts.up.sql):
 -- counts a ready of gen $gen, and records whether it advertised
 -- capabilities.promptReceipt -- the latest ready of the live gen decides,
 -- so one that does not advertise it clears it. handleSandboxEvent

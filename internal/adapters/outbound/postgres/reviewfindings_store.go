@@ -139,10 +139,11 @@ func (s *ReviewFindingStore) MarkFixRecorded(ctx context.Context, repoFullName s
 	})
 }
 
-// ListStatusesInWindow returns the status column of every finding first
-// seen for repoFullName after sinceTime, oldest-first, bounded by limit
-// -- §21's own "Review finding outcomes" analytics KPI (§21.1).
-func (s *ReviewFindingStore) ListStatusesInWindow(ctx context.Context, repoFullName string, sinceTime pgtype.Timestamptz, limit int32) ([]string, error) {
+// ListStatusesInWindow returns the status, reported source and addition
+// check of every finding first seen for repoFullName after sinceTime,
+// oldest-first, bounded by limit -- §21's own "Review finding outcomes"
+// analytics KPI (§21.1), read per source since §26.6's amendment.
+func (s *ReviewFindingStore) ListStatusesInWindow(ctx context.Context, repoFullName string, sinceTime pgtype.Timestamptz, limit int32) ([]sqlcgen.ListReviewFindingStatusesInWindowRow, error) {
 	return s.q.ListReviewFindingStatusesInWindow(ctx, sqlcgen.ListReviewFindingStatusesInWindowParams{
 		RepoFullName: repoFullName,
 		FirstSeenAt:  sinceTime,

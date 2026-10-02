@@ -341,11 +341,13 @@ func revalidateCore(ctx context.Context, deps Deps, sourceControl ports.SourceCo
 		return false, "", reasonNotPlatformAuthored, false, "", nil
 	}
 
-	openFindings, findingsErr := countOpenFindings(ctx, deps, repoFullName, prNumber)
+	findingCounts, findingsErr := countOpenFindings(ctx, deps, repoFullName, prNumber)
 	if findingsErr != nil {
 		return false, "", "", false, "", fmt.Errorf("decisioninbox: revalidate for merge: count open findings: %w", findingsErr)
 	}
-	if openFindings > 0 {
+	// The merge gate's own count (openFindingCounts.Blocking): an
+	// unverified addition blocks merge like any other open finding.
+	if findingCounts.Blocking > 0 {
 		// Mirrors buildPROpenItem's own identical "kept as its own,
 		// separate AND-condition" reasoning (aggregate.go) -- never
 		// folded into the eligibility engine itself.

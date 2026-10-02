@@ -112,6 +112,20 @@ import (
 // header it did before blockers existed; every other line of the comment
 // is unchanged by them.
 //
+// # (§26.6's amendment): counter-review additions
+//
+// A finding whose Source is the counter-review and whose AdditionCheck is
+// not checked (Finding.UnverifiedAddition) is never rendered among the
+// findings: it goes under its own heading after them, which carries their
+// count, and each line says why the server could not count it as checked
+// (unverifiedAdditionReason). A checked addition stays among the findings,
+// marked as the counter-review's. Every other finding -- primary, or with
+// no source recorded -- renders as before, its description on one line
+// (below). Nothing here
+// touches the header: an unverified addition raises the Shippable class
+// exactly as much as any other finding does, which is not at all
+// (review.ComputeShippable reads no finding).
+//
 // # The header's reviewer text cannot open a list item there
 //
 // The header list is the server's: its four bullets and the blocker lines
@@ -126,6 +140,23 @@ import (
 // (escapeListItemOpeners). Text with neither renders byte for byte as
 // before. Every later reviewer field sits under a heading of its own, so
 // none can place a line in the header list.
+//
+// # A finding is one line, and the server's note on it stays visible
+//
+// The findings appendix carries server-decided text: the "Findings"
+// heading, the unverified additions' heading with their count, and the
+// note on each addition (checkedAdditionNote, or the unverified reason).
+// Each finding's description is reviewer text rendered on its bullet,
+// before that note, so its line breaks are folded to spaces
+// (renderFindingLine), primary and counter-review alike, the way the
+// header's adequacy explanation already is. With no line break left, nothing
+// in a description can begin a line: it can open no list item, heading or
+// paragraph that copies the server's, and no code fence -- a fence opens
+// only at the start of a line -- so an unclosed one cannot swallow the
+// note after it, or the rest of the comment. A backtick run left open on
+// the line stays literal text, since nothing the server appends after it
+// contains a backtick to close it. A description with no line break
+// renders byte for byte as before.
 func RenderVerdictComment(v review.Verdict, shippable review.ShippableAssessment, findings []Finding, digest Digest, summary, botHandle, syncedLabel string) string {
 	var b strings.Builder
 
@@ -208,33 +239,34 @@ func RenderVerdictComment(v review.Verdict, shippable review.ShippableAssessment
 	fmt.Fprintf(&b, "- **Docs drift**: %s\n", v.DocsDrift)
 	fmt.Fprintf(&b, "- **Files changed**: %d\n", v.FilesChanged)
 
-	if len(findings) > 0 {
+	// §26.6's amendment: a counter-review addition the server could not
+	// count as checked is listed apart, under its own heading carrying the
+	// count, and never among the findings; a checked addition stays in the
+	// list, marked as the counter-review's. A finding with any other source,
+	// or none recorded, renders as it always did, its description folded
+	// onto its one line (renderFindingLine).
+	var listed, unverified []Finding
+	for _, f := range findings {
+		if f.UnverifiedAddition() {
+			unverified = append(unverified, f)
+		} else {
+			listed = append(listed, f)
+		}
+	}
+	if len(listed) > 0 {
 		b.WriteString("\n**Findings:**\n\n")
-		for _, f := range findings {
-			kind := findingIdentityGeneralKind
-			if f.SentinelKind != nil {
-				kind = string(*f.SentinelKind)
+		for _, f := range listed {
+			note := ""
+			if f.Source == FindingSourceCounterReview {
+				note = checkedAdditionNote
 			}
-			// §22.1.1: StartLine/EndLine (server-computed, content-anchored
-			// -- position.go) are the ONLY position ever rendered here once
-			// they exist. f.Line (the model's own self-reported, UNVERIFIED
-			// pointer) is deliberately never used as a rendering fallback
-			// when StartLine is 0 (unanchored): rendering it anyway would
-			// hand a maintainer exactly the "plausible-looking wrong
-			// answer" §22.1.1 says is worse than no position at all --
-			// StartLine==0 renders as no line reference whatsoever, an
-			// honest "position not found", never a guess dressed up as a
-			// real one.
-			description := escapeFindingDescription(f.Description)
-			filePath := escapeFilePathForCodeSpan(f.FilePath)
-			switch {
-			case f.StartLine != 0 && f.StartLine == f.EndLine:
-				fmt.Fprintf(&b, "- [%s/%s] `%s:%d`: %s\n", kind, f.Severity, filePath, f.StartLine, description)
-			case f.StartLine != 0:
-				fmt.Fprintf(&b, "- [%s/%s] `%s:%d-%d`: %s\n", kind, f.Severity, filePath, f.StartLine, f.EndLine, description)
-			default:
-				fmt.Fprintf(&b, "- [%s/%s] `%s`: %s\n", kind, f.Severity, filePath, description)
-			}
+			b.WriteString(renderFindingLine(f, note))
+		}
+	}
+	if len(unverified) > 0 {
+		fmt.Fprintf(&b, "\n"+unverifiedAdditionsHeading+"\n\n", len(unverified))
+		for _, f := range unverified {
+			b.WriteString(renderFindingLine(f, " _(unverified: "+unverifiedAdditionReason(f.AdditionCheck)+")_"))
 		}
 	}
 	b.WriteString("\n</details>\n\n")
@@ -243,6 +275,66 @@ func RenderVerdictComment(v review.Verdict, shippable review.ShippableAssessment
 	b.WriteString(RerunGuidance(botHandle))
 
 	return b.String()
+}
+
+// renderFindingLine renders one finding as its appendix bullet, then
+// note (server text, "" for none) after its description. The description's
+// line breaks are folded to spaces, so the finding is exactly one line and
+// nothing in it can begin a line of its own (RenderVerdictComment's "A
+// finding is one line").
+//
+// §22.1.1: StartLine/EndLine (server-computed, content-anchored --
+// position.go) are the ONLY position ever rendered here once they exist.
+// f.Line (the model's own self-reported, UNVERIFIED pointer) is
+// deliberately never used as a rendering fallback when StartLine is 0
+// (unanchored): rendering it anyway would hand a maintainer exactly the
+// "plausible-looking wrong answer" §22.1.1 says is worse than no position
+// at all -- StartLine==0 renders as no line reference whatsoever, an
+// honest "position not found", never a guess dressed up as a real one.
+func renderFindingLine(f Finding, note string) string {
+	kind := findingIdentityGeneralKind
+	if f.SentinelKind != nil {
+		kind = string(*f.SentinelKind)
+	}
+	description := escapeFindingDescription(foldLineBreaks(f.Description))
+	filePath := escapeFilePathForCodeSpan(f.FilePath)
+	switch {
+	case f.StartLine != 0 && f.StartLine == f.EndLine:
+		return fmt.Sprintf("- [%s/%s] `%s:%d`: %s%s\n", kind, f.Severity, filePath, f.StartLine, description, note)
+	case f.StartLine != 0:
+		return fmt.Sprintf("- [%s/%s] `%s:%d-%d`: %s%s\n", kind, f.Severity, filePath, f.StartLine, f.EndLine, description, note)
+	default:
+		return fmt.Sprintf("- [%s/%s] `%s`: %s%s\n", kind, f.Severity, filePath, description, note)
+	}
+}
+
+// checkedAdditionNote marks a counter-review addition the server counted
+// as checked (§26.6's amendment): it stays among the findings, and says
+// which pass produced it.
+const checkedAdditionNote = " _(added by the counter-review; fact-checked after it)_"
+
+// unverifiedAdditionsHeading opens the list of counter-review additions
+// the server could not count as checked, with their count (§26.6's
+// amendment): listed apart from the findings and counted apart.
+const unverifiedAdditionsHeading = "**Unverified -- added by the counter-review and not fact-checked (%d, counted apart from the findings):**"
+
+// unverifiedAdditionReason says why an addition is unverified, from the
+// server's resolution. It says only what the server found when the
+// verdict was posted: "not found" is a statement about the trace as read
+// then, and a trace not read in full yields "could not be confirmed",
+// never a claim about what it holds (§26.1's lesson on the uncorroborated
+// counter-review).
+func unverifiedAdditionReason(c AdditionCheck) string {
+	switch c {
+	case AdditionNotRun:
+		return "no fact-check run over it after the counter-review was reported"
+	case AdditionNotFound:
+		return "a fact-check run over it was reported, but none that started after the counter-review and completed was found in this turn's trace when the verdict was posted"
+	case AdditionUnconfirmed:
+		return "whether a fact-check ran over it could not be confirmed: this turn's trace could not be read in full when the verdict was posted"
+	default:
+		return "no fact-check run over it was confirmed"
+	}
 }
 
 // shippableBlockersLeadIn opens the blocker lines under the Shippable
@@ -259,7 +351,7 @@ const shippableBlockersLeadIn = "  - Kept above auto by (decided by the server, 
 // dispatched gen or event id on the turn, a failed corroboration query, a
 // malformed row that was skipped) and from the accepted race where the
 // counter-reviewer's finish event lands after the verdict (httpapi's
-// corroborateCounterReview, reviewpost.BuildVerdict).
+// readSubTaskTrace, reviewpost.BuildVerdict).
 const uncorroboratedCounterReviewNote = " -- reported done, but the server could not confirm it from this turn's trace when the verdict was posted"
 
 // renderShippableBlockers renders blockers as nested bullets under the
@@ -297,10 +389,12 @@ func renderShippableBlockers(blockers []review.Blocker) string {
 // one space.
 var lineBreakFolder = strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ")
 
-// foldLineBreaks keeps a one-line reviewer field on the one line the
-// header renders it on (RenderVerdictComment's "The header's reviewer
-// text cannot open a list item there"): with no line break left, nothing
-// in it can begin a line, so nothing in it can open a list item.
+// foldLineBreaks keeps a one-line reviewer field on the one line it is
+// rendered on -- the header's adequacy explanation (RenderVerdictComment's
+// "The header's reviewer text cannot open a list item there") and each
+// finding's description in the appendix ("A finding is one line"): with
+// no line break left, nothing in it can begin a line, so nothing in it can
+// open a list item, a heading or a code fence.
 func foldLineBreaks(s string) string {
 	return lineBreakFolder.Replace(s)
 }

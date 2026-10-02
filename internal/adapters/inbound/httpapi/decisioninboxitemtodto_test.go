@@ -33,6 +33,7 @@ package httpapi
 // existing test still green.
 
 import (
+	"strconv"
 	"testing"
 	"time"
 
@@ -256,4 +257,61 @@ func TestDecisionInboxItemToDTO_AcceptanceMergeableFalseEmptyReasonOmitsField(t 
 	if dto.AcceptanceMergeBlockedReason != nil {
 		t.Errorf("AcceptanceMergeBlockedReason = %v, want nil (absent from the JSON, arriving client-side as undefined) when the Go string is empty", *dto.AcceptanceMergeBlockedReason)
 	}
+}
+
+// TestDecisionInboxItemToDTO_UnverifiedAdditionsRideWithFindings (§26.6's
+// amendment): unverifiedAdditions is rendered beside findings on a PR row,
+// and nulled with it when the count could not be determined -- never the
+// zero an unknown count would otherwise show.
+func TestDecisionInboxItemToDTO_UnverifiedAdditionsRideWithFindings(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		item           decisioninbox.Item
+		wantFindings   *int
+		wantUnverified *int
+	}{
+		{
+			name:           "a known count renders both",
+			item:           decisioninbox.Item{Kind: domaindecisioninbox.KindNeedsReview, Provenance: &domaindecisioninbox.Provenance{Kind: domaindecisioninbox.ProvenanceDirect}, Findings: 1, UnverifiedAdditions: 2},
+			wantFindings:   intPtrForTest(1),
+			wantUnverified: intPtrForTest(2),
+		},
+		{
+			name:           "no unverified addition renders a real zero",
+			item:           decisioninbox.Item{Kind: domaindecisioninbox.KindNeedsReview, Provenance: &domaindecisioninbox.Provenance{Kind: domaindecisioninbox.ProvenanceDirect}, Findings: 3},
+			wantFindings:   intPtrForTest(3),
+			wantUnverified: intPtrForTest(0),
+		},
+		{
+			name: "an unknown count nulls both",
+			item: decisioninbox.Item{Kind: domaindecisioninbox.KindNeedsReview, Provenance: &domaindecisioninbox.Provenance{Kind: domaindecisioninbox.ProvenanceDirect}, Findings: 0, UnverifiedAdditions: 0, FindingsUnknown: true},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dto := decisionInboxItemToDTO(tt.item)
+			if !sameIntPtr(dto.Findings, tt.wantFindings) || !sameIntPtr(dto.UnverifiedAdditions, tt.wantUnverified) {
+				t.Errorf("findings = %v, unverifiedAdditions = %v; want %v, %v", derefForTest(dto.Findings), derefForTest(dto.UnverifiedAdditions), derefForTest(tt.wantFindings), derefForTest(tt.wantUnverified))
+			}
+		})
+	}
+}
+
+func intPtrForTest(v int) *int { return &v }
+
+func sameIntPtr(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func derefForTest(p *int) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return strconv.Itoa(*p)
 }

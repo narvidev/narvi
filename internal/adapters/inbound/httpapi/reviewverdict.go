@@ -173,12 +173,12 @@ func PostReviewVerdict(
 	outbox *postgres.OutboxStore,
 	reviewVerdicts *postgres.ReviewVerdictStore,
 	turns *postgres.TurnStore,
-	// events (§26.4/§7.1) backs post-hoc sub-task corroboration:
-	// reading back this session's own already-persisted sub_task_start/
-	// sub_task_finish trace, scoped to BOTH turns' own
-	// dispatched_sandbox_gen AND dispatched_at -- see corroborateCounterReview's
-	// own doc comment below for the full call-site wiring and why both are
-	// required together.
+	// events (§26.4/§7.1, §26.6's amendment) backs post-hoc sub-task
+	// corroboration: reading back this session's own already-persisted
+	// sub_task_start/sub_task_finish trace, scoped to BOTH the turn's
+	// own dispatched_sandbox_gen AND dispatched_event_id -- see
+	// readSubTaskTrace's own doc comment below for the full call-site
+	// wiring and why both are required together.
 	events *postgres.EventStore,
 	botHandle string,
 	// outbound (§22.1.1, §12.5) is the GitHub outbound axis whose bot
@@ -572,6 +572,21 @@ func PostReviewVerdict(
 			FactCheck:         reviewpost.FactCheckStatus(req.FactCheck),
 			FactCheckKilled:   req.FactCheckKilled,
 		}
+		// §26.6's amendment: the second fact-check run, over what the
+		// counter-review added, as the reviewer reported it -- recorded
+		// apart from the first run (FactCheck/FactCheckKilled above).
+		if req.AdditionsFactCheck != nil {
+			input.AdditionsFactCheck = reviewpost.FactCheckStatus(*req.AdditionsFactCheck)
+		}
+		if req.AdditionsFactCheckKilled != nil {
+			input.AdditionsFactCheckKilled = *req.AdditionsFactCheckKilled
+		}
+		// §26.6's amendment: whether this turn's own stored prompt asked
+		// every finding for a source. A turn rendered before sources
+		// existed did not, and only its findings may arrive without one
+		// (reviewpost.ErrInvalidFindingSource) -- read from the turn the
+		// request was attributed to, never from the payload.
+		input.SourceInstructed = dispatchedTurn.Prompt != nil && review.PromptInstructsFindingSource(*dispatchedTurn.Prompt)
 		for _, tag := range req.BlastRadius {
 			input.BlastRadius = append(input.BlastRadius, review.Tag(tag))
 		}
@@ -579,55 +594,33 @@ func PostReviewVerdict(
 			input.Findings = append(input.Findings, findingInputFromWire(f))
 		}
 
-		// (§26.4/§7.1): post-hoc sub-task corroboration -- see
-		// reviewpost.VerdictInput.CounterReviewCorroborated's own doc
-		// comment and reviewpost.BuildVerdict's own "Second substitution"
-		// doc comment for what this feeds and why. The two corroboration
-		// queries (events.ListSubTaskStartsForTurn/ListSubTaskFinishesForTurn)
-		// are ONLY run when they could possibly matter -- deep path AND
-		// the self-report claims done -- so every light-path verdict, and
-		// every deep-path verdict that already self-reports "skipped",
-		// pays no extra DB round-trip at all: input.CounterReviewCorroborated
-		// simply stays at its own zero value, false, exactly as
-		// BuildVerdict's own gate (in.ReviewDepth == DepthDeep &&
-		// in.CounterReview == CounterReviewDone) already requires before
-		// this field can affect anything.
-		if reviewDepth == reviewtriage.DepthDeep && input.CounterReview == review.CounterReviewDone {
-			switch {
-			case dispatchedSandboxGen == nil:
-				// dispatched_sandbox_gen NULL (migrations/
-				// 000026_turn_dispatch_gen.up.sql: "NULL before a turn's
-				// first real dispatch") -- treated as NOT corroborated,
-				// fail-conservative, the same direction every other
-				// closed-enum default in this codebase already commits to
-				// (review/doc.go's own "fail-conservative policy for
-				// every closed enum" section), rather than erroring this
-				// request or silently skipping the check. input.
-				// CounterReviewCorroborated is simply left at its own
-				// zero value, false, below.
-				logger.Warn("httpapi: review-verdict: no dispatched_sandbox_gen on record for this turn, treating counter-review claim as uncorroborated",
-					"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
-			case dispatchedEventID == nil:
-				// dispatched_event_id NULL
-				// (migrations/000089_turns_dispatched_event_id.up.sql:
-				// nullable, set only once a turn is actually dispatched)
-				// -- the IDENTICAL fail-conservative treatment as the
-				// dispatchedSandboxGen-nil case immediately above, applied
-				// to this Step's own new second precondition. Should be
-				// genuinely unreachable in practice (a turn being
-				// verdicted right now is, by construction, already
-				// dispatched -- this very request is proof of that), but
-				// the code must never ASSUME that rather than checking it,
-				// exactly like the gen case does not assume gen is always
-				// set. Note this is NOT interchangeable with "watermark 0":
-				// 0 is a legitimate, meaningful value (a turn dispatched
-				// before this session had any events at all) that admits
-				// every subsequent event, whereas NULL means the turn was
-				// never stamped and nothing can be trusted about its trace.
-				logger.Warn("httpapi: review-verdict: no dispatched_event_id on record for this turn, treating counter-review claim as uncorroborated",
-					"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
-			default:
-				input.CounterReviewCorroborated = corroborateCounterReview(ctx, logger, events, sessionID, *dispatchedSandboxGen, *dispatchedEventID)
+		// (§26.4/§7.1, extended by §26.6's amendment): post-hoc sub-task
+		// corroboration -- see reviewpost.VerdictInput.CounterReviewCorroborated/
+		// AdditionsTrace and reviewpost.BuildVerdict's own "Second
+		// substitution" doc comment for what this feeds and why. The turn's
+		// sub-task trace is read once (readSubTaskTrace) and feeds both
+		// checks; it is read ONLY when one of them could possibly matter --
+		// deep path AND the reviewer reports the counter-review done, or the
+		// second fact-check run done -- so every light-path verdict, and
+		// every deep-path verdict reporting neither, pays no extra DB
+		// round-trip at all: CounterReviewCorroborated stays false and
+		// AdditionsTrace stays AdditionsTraceUnread, their zero values, and
+		// neither can then count as confirmed.
+		//
+		// The ordering check for the second run (a fact-check that started
+		// after the counter-review) is reviewverdict.AdditionsFactCheckInTrace,
+		// over the persisted events' own ids -- never anything the payload
+		// claims. A trace not read in full resolves the additions to
+		// unconfirmed, "could not be confirmed", never "none ran".
+		checkCounterReview := reviewDepth == reviewtriage.DepthDeep && input.CounterReview == review.CounterReviewDone
+		checkAdditions := reviewDepth == reviewtriage.DepthDeep && input.AdditionsFactCheck == reviewpost.FactCheckDone
+		if checkCounterReview || checkAdditions {
+			trace := readSubTaskTrace(ctx, logger, events, turns, sessionID, dispatchedTurn.ID, dispatchedSandboxGen, dispatchedEventID)
+			if checkCounterReview {
+				input.CounterReviewCorroborated = reviewverdict.CounterReviewCorroborated(trace.Starts, trace.Finishes)
+			}
+			if checkAdditions {
+				input.AdditionsTrace = reviewverdict.AdditionsFactCheckInTrace(trace)
 			}
 		}
 
@@ -638,6 +631,12 @@ func PostReviewVerdict(
 
 		verdict, shippable := reviewpost.BuildVerdict(input)
 		findings := reviewpost.BuildFindings(input)
+		secondFactCheck := reviewpost.BuildSecondFactCheck(input)
+		if secondFactCheck.Resolved != "" && !secondFactCheck.Resolved.Checked() {
+			logger.Info("httpapi: review-verdict: counter-review additions published unverified",
+				"additions_check", string(secondFactCheck.Resolved), "additions_fact_check_reported", string(secondFactCheck.Reported),
+				"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+		}
 
 		// §21.1's own filesChanged drift canary, now wired: compares
 		// verdict.FilesChanged (the reviewing agent's own self-report,
@@ -799,6 +798,11 @@ func PostReviewVerdict(
 				Line:         lineColumn(f.Line),
 				Description:  f.Description,
 				SuggestedFix: f.SuggestedFix,
+				// §26.6's amendment: the source the payload reported, and
+				// the server's resolution for a counter-review addition --
+				// both describe this, the finding's latest publication.
+				ReportedSource: nonEmptyColumn(string(f.Source)),
+				AdditionCheck:  nonEmptyColumn(string(f.AdditionCheck)),
 			}); upsertErr != nil {
 				logger.Error("httpapi: review-verdict: upsert review finding failed", "error", upsertErr)
 				writeError(w, http.StatusInternalServerError, "internal error")
@@ -833,7 +837,7 @@ func PostReviewVerdict(
 		// an unpersisted verdict.
 		if verdictHeadSHA == "" {
 			logger.Warn("httpapi: review-verdict: no review head sha on record, skipping review_verdicts insert", "repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
-		} else if _, insertErr := appreviewverdict.Insert(ctx, reviewVerdicts.WithTx(tx), repoSettings.WithTx(tx), platformShadow, prSession.RepoFullName, prSession.PrNumber, verdictHeadSHA, sessionID, verdict, input.Digest, reviewDepth, input.CounterReview, input.FactCheck, input.FactCheckKilled, archDecisionTags, archDecisionRoots, knowledgeMode, knowledgeInfluenced, verdictContext, attemptID); insertErr != nil {
+		} else if _, insertErr := appreviewverdict.Insert(ctx, reviewVerdicts.WithTx(tx), repoSettings.WithTx(tx), platformShadow, prSession.RepoFullName, prSession.PrNumber, verdictHeadSHA, sessionID, verdict, input.Digest, reviewDepth, input.CounterReview, input.FactCheck, input.FactCheckKilled, secondFactCheck, archDecisionTags, archDecisionRoots, knowledgeMode, knowledgeInfluenced, verdictContext, attemptID); insertErr != nil {
 			logger.Error("httpapi: review-verdict: insert review_verdicts row failed", "error", insertErr)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -1028,6 +1032,14 @@ func findingInputFromWire(f restdtos.PostedFinding) reviewpost.FindingInput {
 	if f.SuggestedFix != nil {
 		in.SuggestedFix = f.SuggestedFix
 	}
+	// §26.6's amendment: absent decodes to "", reviewpost.
+	// FindingSourceNotRecorded. reviewpost.ValidateVerdictInput admits it
+	// only from a turn whose stored prompt predates sources, storing the
+	// finding with no source recorded (findingsource.go), and refuses it,
+	// like a garbled value, from any other (ErrInvalidFindingSource).
+	if f.Source != nil {
+		in.Source = reviewpost.FindingSource(*f.Source)
+	}
 	return in
 }
 
@@ -1123,16 +1135,18 @@ type subTaskFinishPayload struct {
 	Outcome   string `json:"outcome"`
 }
 
-// corroborateCounterReview (§26.4) is this handler's own I/O +
-// decode half of post-hoc sub-task corroboration -- the pure comparison
-// itself lives in reviewverdict.CounterReviewCorroborated (internal/
-// domain/reviewverdict/corroboration.go), which this function is the
-// ONE caller of in production. Queries this session's own already-
-// persisted sub_task_start/sub_task_finish trace, scoped to BOTH gen (the
-// turn being verdicted's own dispatched_sandbox_gen) AND a created_at
-// lower bound at dispatchedEventID (that SAME turn's own
-// turns.dispatched_event_id)
-// -- see queries/events.sql's own ListSubTaskStartEventsForTurn/
+// readSubTaskTrace (§26.4, extended by §26.6's amendment) is this
+// handler's own I/O + decode half of post-hoc sub-task corroboration --
+// the pure comparisons live in internal/domain/reviewverdict
+// (corroboration.go): CounterReviewCorroborated for the counter-review
+// claim, AdditionsFactCheckInTrace for the second fact-check run over
+// what the counter-review added. This function is the ONE place the
+// trace is read, so the two checks see the same rows. Queries this
+// session's own already-persisted sub_task_start/sub_task_finish trace,
+// scoped to BOTH gen (the turn being verdicted's own
+// dispatched_sandbox_gen) AND an events.id lower bound at
+// dispatchedEventID (that SAME turn's own turns.dispatched_event_id) --
+// see queries/events.sql's own ListSubTaskStartEventsForTurn/
 // ListSubTaskFinishEventsForTurn doc comment for the full "why" both
 // conditions are required together, not gen alone: a session can carry
 // multiple review turns over its lifetime (§24's automatic re-review
@@ -1141,86 +1155,200 @@ type subTaskFinishPayload struct {
 // dispatch to an already-live sandbox -- two turns on the same session can
 // (and, on the common "sandbox survives across re-review turns" path,
 // routinely do) share the identical gen. gen scoping ALONE was found, by
-// an adversarial review of this same PR, to let an EARLIER turn's own
-// real counter-review trace spuriously corroborate a LATER turn's
-// self-report in exactly that case; the dispatchedEventID lower bound is what
-// actually closes that gap (turns_one_processing_per_session's own unique
-// partial index guarantees turns execute strictly sequentially per
-// session, so an earlier turn's own sub-task events all predate a later
-// turn's own dispatched_at).
+// an adversarial review, to let an EARLIER turn's own real counter-review
+// trace spuriously corroborate a LATER turn's self-report in exactly that
+// case; the dispatchedEventID lower bound is what closes that gap for the
+// later turn, as long as the earlier turn had ended -- one that may still
+// be running is covered below.
 //
-// A genuine store error on EITHER query, or a malformed payload on any
-// individual row, is logged and treated as NOT corroborated for that row/
-// call -- fail-conservative, never a reason to fail this whole verdict-
-// posting request: this computation only ever feeds a floor that makes
-// Shippable MORE conservative, mirroring every other degradation this
-// handler already treats this way (e.g. serverComputedChangedFiles' own
-// "a genuine store error... degrades... never a reason to fail this
-// whole tool call" precedent above). A single malformed row is skipped,
-// not fatal to the rest of the batch -- one corrupt event must not blind
-// this function to every OTHER, perfectly good row in the same trace.
+// The read is bounded above as well (§26.6's amendment): by the watermark
+// of the next turn dispatched on the session, when there is one
+// (turns.NextDispatchedEventID). Turns are not always over when the next
+// one is dispatched -- a turn past TurnDeadline is marked failed while its
+// agent can still run in the same sandbox, at the same gen, and its late
+// verdict is still resolved by its own message id (finding F3's fix, above)
+// -- so without the upper bound that late verdict's trace would hold the
+// later turn's sub-tasks, and the later turn's routine first fact-check
+// would read as the earlier turn's second run over its additions. The
+// bound applies to both checks, since they read the same rows. Work the
+// earlier turn did after the later one was dispatched is left out too, so
+// the cut trace is marked CutAtNextTurn, and the additions resolve to
+// unconfirmed ("could not be confirmed") whatever the window holds: a
+// second run missing from it may lie past the cut, and one found in it
+// may have been followed, past the cut, by another counter-reviewer pass.
+// The counter-review claim is positive, so a completed counter-reviewer
+// inside the window still corroborates it, and one not found there leaves
+// it uncorroborated.
+// Another turn sharing this turn's watermark means the two turns' events
+// cannot be told apart, and the trace is not read at all (ReadInFull
+// false).
+//
+// The same race reaches the LATER turn's read, bounded below only: the
+// earlier turn's late sub-tasks land above the later turn's watermark, at
+// the same gen, and no sub-task event names the turn or prompt it belongs
+// to -- so nothing attributes them, and an earlier turn's late fact-check
+// would count as the later turn's own second run. The rule is
+// conservative: when the session holds an earlier turn, dispatched on the
+// same gen, that ended without its own execution_complete (a synthetic one
+// names it: timed out, stopped, abandoned or refused, its agent possibly
+// still running -- turns.EarlierTurnLeftRunning), this turn's trace is not
+// read at all (ReadInFull false), and both its claims resolve unconfirmed.
+// An earlier turn that ended with a real execution_complete changes
+// nothing, and neither does one whose prompt certainly never reached the
+// sandbox (its synthetic event says "delivered": false): no agent of it
+// ever ran.
+//
+// Every record carries its row's events.id (EventID): within one session
+// ids are allocated in commit order, which is what lets
+// AdditionsFactCheckInTrace say a fact-check started after the
+// counter-review without a clock.
+//
+// The result's ReadInFull is false -- the trace "could not be confirmed",
+// never "shows none" -- whenever any part of it could not be read: the
+// turn has no dispatched_sandbox_gen or dispatched_event_id to scope a
+// read to, its upper bound cannot be read or is shared with another turn,
+// an earlier turn on its gen may still be running, a query fails, or a
+// row's payload does not decode (that
+// row is skipped, not fatal to the rest: one corrupt event must not blind
+// the counter-review check to every OTHER, perfectly good row). None of
+// these fails the verdict-posting request: each only ever leaves a claim
+// unconfirmed, which makes the outcome MORE conservative (a counter-review
+// floored to needs_human, an addition published unverified), mirroring
+// every other degradation this handler treats this way.
 //
 // # The accepted race -- do not "fix" this into something more complex
 //
-// This corroboration query runs against whatever sub_task_start/
-// sub_task_finish rows are ALREADY committed to Postgres at the moment
-// THIS HTTP request is processed. The verdict-posting POST (this
-// handler) and the sandbox's own WS event stream (which carries
-// sub_task_finish, one of the six ack-guaranteed critical event types)
-// are two INDEPENDENT network round-trips from the sandbox, with no
-// server-side ordering guarantee between them. The deep-path review
-// prompt (review/context.go's own orchestration instructions) tells the
-// agent to wait for the counter-reviewer sub-task's own result before
-// composing the verdict it then POSTs here, so CAUSALLY the sub-task has
-// already resolved -- but that gives no guarantee its own sub_task_finish
-// event has actually landed in Postgres by the time this query runs. A
-// false negative here (real "done", but the trace is not visible yet)
-// fails toward NOT corroborated, which BuildVerdict's own second
-// substitution then floors to needs_human -- MORE conservative, never
-// less, the identical fail-conservative bias review.CounterReviewSkipped's
-// own doc comment already commits to. This is accepted, not a bug: no
-// retries, no polling, no new timeout constant belongs here to work
-// around it -- see reviewpost.BuildVerdict's own doc comment ("The
-// accepted race") for the fuller version of this same reasoning.
-func corroborateCounterReview(ctx context.Context, logger *slog.Logger, events *postgres.EventStore, sessionID pgtype.UUID, gen int32, dispatchedEventID int64) bool {
-	startRows, err := events.ListSubTaskStartsForTurn(ctx, sessionID, gen, dispatchedEventID)
-	if err != nil {
-		logger.Warn("httpapi: review-verdict: list sub_task_start events for corroboration failed, treating counter-review claim as uncorroborated", "error", err)
-		return false
-	}
-	finishRows, err := events.ListSubTaskFinishesForTurn(ctx, sessionID, gen, dispatchedEventID)
-	if err != nil {
-		logger.Warn("httpapi: review-verdict: list sub_task_finish events for corroboration failed, treating counter-review claim as uncorroborated", "error", err)
-		return false
+// This read runs against whatever sub_task_start/sub_task_finish rows are
+// ALREADY committed to Postgres at the moment THIS HTTP request is
+// processed. The verdict-posting POST (this handler) and the sandbox's own
+// WS event stream (which carries sub_task_finish, one of the six
+// ack-guaranteed critical event types) are two INDEPENDENT network
+// round-trips from the sandbox, with no server-side ordering guarantee
+// between them. The review prompt (review/context.go's own orchestration
+// instructions) tells the agent to wait for each sub-task's own result
+// before composing the verdict it then POSTs here, so CAUSALLY the
+// sub-tasks have already resolved -- but that gives no guarantee their own
+// sub_task_finish events have actually landed in Postgres by the time this
+// read runs. A false negative here (a real run, but its trace not visible
+// yet) fails toward NOT corroborated -- a counter-review floored to
+// needs_human, an addition published unverified -- MORE conservative,
+// never less, the identical fail-conservative bias
+// review.CounterReviewSkipped's own doc comment already commits to. This
+// is accepted, not a bug: no retries, no polling, no new timeout constant
+// belongs here to work around it -- see reviewpost.BuildVerdict's own doc
+// comment ("The accepted race") for the fuller version of this same
+// reasoning.
+func readSubTaskTrace(ctx context.Context, logger *slog.Logger, events *postgres.EventStore, turns *postgres.TurnStore, sessionID, turnID pgtype.UUID, gen *int32, dispatchedEventID *int64) reviewverdict.SubTaskTrace {
+	switch {
+	case gen == nil:
+		// dispatched_sandbox_gen NULL (migrations/
+		// 000026_turn_dispatch_gen.up.sql: "NULL before a turn's first
+		// real dispatch") -- the trace cannot be scoped, so it is not
+		// read: fail-conservative, the same direction every other
+		// closed-enum default in this codebase already commits to
+		// (review/doc.go's own "fail-conservative policy for every closed
+		// enum" section), rather than erroring this request.
+		logger.Warn("httpapi: review-verdict: no dispatched_sandbox_gen on record for this turn, the sub-task trace cannot be read: a counter-review claim is uncorroborated and counter-review additions are unconfirmed")
+		return reviewverdict.SubTaskTrace{}
+	case dispatchedEventID == nil:
+		// dispatched_event_id NULL
+		// (migrations/000089_turns_dispatched_event_id.up.sql: nullable,
+		// set only once a turn is actually dispatched) -- the IDENTICAL
+		// fail-conservative treatment as the gen-nil case above. Should
+		// be genuinely unreachable in practice (a turn being verdicted
+		// right now is, by construction, already dispatched), but the
+		// code must never ASSUME that rather than checking it. NOT
+		// interchangeable with "watermark 0": 0 is a legitimate value (a
+		// turn dispatched before this session had any events at all) that
+		// admits every subsequent event, whereas NULL means the turn was
+		// never stamped and nothing can be trusted about its trace.
+		logger.Warn("httpapi: review-verdict: no dispatched_event_id on record for this turn, the sub-task trace cannot be read: a counter-review claim is uncorroborated and counter-review additions are unconfirmed")
+		return reviewverdict.SubTaskTrace{}
 	}
 
-	starts := make([]reviewverdict.SubTaskStartRecord, 0, len(startRows))
+	// The upper bound: the next turn dispatched on this session, if any.
+	var upper *int64
+	next, found, err := turns.NextDispatchedEventID(ctx, sessionID, turnID, *dispatchedEventID)
+	switch {
+	case err != nil:
+		logger.Warn("httpapi: review-verdict: read the next turn's dispatch watermark failed, the trace could not be bounded and was not read", "error", err)
+		return reviewverdict.SubTaskTrace{}
+	case found && next == *dispatchedEventID:
+		// Another turn was dispatched at this same watermark, with no event
+		// between the two dispatches: the event log cannot tell the two
+		// turns' events apart, so neither trace can be read as this turn's
+		// alone.
+		logger.Warn("httpapi: review-verdict: another turn shares this turn's dispatch watermark, the trace cannot be told apart and was not read")
+		return reviewverdict.SubTaskTrace{}
+	case found:
+		upper = &next
+	}
+
+	// An earlier turn on this gen that may still be running: its late
+	// sub-tasks would sit in this turn's window with nothing to tell them
+	// apart, so the trace is not read as this turn's alone.
+	leftRunning, err := turns.EarlierTurnLeftRunning(ctx, sessionID, turnID, *gen, *dispatchedEventID)
+	switch {
+	case err != nil:
+		logger.Warn("httpapi: review-verdict: check for an earlier turn left running failed, the trace was not read", "error", err)
+		return reviewverdict.SubTaskTrace{}
+	case leftRunning:
+		logger.Warn("httpapi: review-verdict: an earlier turn on this sandbox gen ended without its own execution_complete and may still be running, the trace cannot be told apart and was not read")
+		return reviewverdict.SubTaskTrace{}
+	}
+
+	trace := reviewverdict.SubTaskTrace{ReadInFull: true, CutAtNextTurn: upper != nil}
+	startRows, err := events.ListSubTaskStartsForTurn(ctx, sessionID, *gen, *dispatchedEventID, upper)
+	if err != nil {
+		logger.Warn("httpapi: review-verdict: list sub_task_start events for corroboration failed, the trace could not be read", "error", err)
+		return reviewverdict.SubTaskTrace{}
+	}
+	finishRows, err := events.ListSubTaskFinishesForTurn(ctx, sessionID, *gen, *dispatchedEventID, upper)
+	if err != nil {
+		logger.Warn("httpapi: review-verdict: list sub_task_finish events for corroboration failed, the trace could not be read", "error", err)
+		return reviewverdict.SubTaskTrace{}
+	}
+
+	trace.Starts = make([]reviewverdict.SubTaskStartRecord, 0, len(startRows))
 	for _, row := range startRows {
 		var p subTaskStartPayload
 		if unmarshalErr := json.Unmarshal(row.Payload, &p); unmarshalErr != nil {
-			logger.Warn("httpapi: review-verdict: unmarshal sub_task_start payload for corroboration failed, skipping this row", "error", unmarshalErr)
+			logger.Warn("httpapi: review-verdict: unmarshal sub_task_start payload for corroboration failed, skipping this row; the trace was not read in full", "error", unmarshalErr)
+			trace.ReadInFull = false
 			continue
 		}
-		starts = append(starts, reviewverdict.SubTaskStartRecord{
+		trace.Starts = append(trace.Starts, reviewverdict.SubTaskStartRecord{
+			EventID:      row.ID,
 			SubTaskID:    p.SubTaskID,
 			SubAgentType: p.SubAgentType,
 		})
 	}
 
-	finishes := make([]reviewverdict.SubTaskFinishRecord, 0, len(finishRows))
+	trace.Finishes = make([]reviewverdict.SubTaskFinishRecord, 0, len(finishRows))
 	for _, row := range finishRows {
 		var p subTaskFinishPayload
 		if unmarshalErr := json.Unmarshal(row.Payload, &p); unmarshalErr != nil {
-			logger.Warn("httpapi: review-verdict: unmarshal sub_task_finish payload for corroboration failed, skipping this row", "error", unmarshalErr)
+			logger.Warn("httpapi: review-verdict: unmarshal sub_task_finish payload for corroboration failed, skipping this row; the trace was not read in full", "error", unmarshalErr)
+			trace.ReadInFull = false
 			continue
 		}
-		finishes = append(finishes, reviewverdict.SubTaskFinishRecord{
+		trace.Finishes = append(trace.Finishes, reviewverdict.SubTaskFinishRecord{
+			EventID:   row.ID,
 			SubTaskID: p.SubTaskID,
 			Outcome:   p.Outcome,
 		})
 	}
 
-	return reviewverdict.CounterReviewCorroborated(starts, finishes)
+	return trace
+}
+
+// nonEmptyColumn converts s into a nullable TEXT column value: nil for
+// "", so an absent value is stored as SQL NULL, never an empty string.
+func nonEmptyColumn(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // archDecisionStringField nil-safely dereferences one of restdtos.

@@ -139,25 +139,33 @@ func (s *EventStore) ListRecentForSession(ctx context.Context, sessionID pgtype.
 //
 // Both callers already validate their own respective NULL case before
 // reaching here (dispatchedEventID is never derived from a NULL column on a
-// real call -- see corroborateCounterReview,
+// real call -- see readSubTaskTrace,
 // internal/adapters/inbound/httpapi/reviewverdict.go, for that NULL
 // handling and the fuller "why" this pair of conditions is required, not
 // merely an optimization).
-func (s *EventStore) ListSubTaskStartsForTurn(ctx context.Context, sessionID pgtype.UUID, gen int32, dispatchedEventID int64) ([]sqlcgen.Event, error) {
+//
+// nextDispatchedEventID (§26.6's amendment) bounds the read from above:
+// the watermark of the next turn dispatched on the session
+// (TurnStore.NextDispatchedEventID), so a later turn's events never read
+// as this turn's; nil when no turn was dispatched after this one. See
+// queries/events.sql's "The upper bound".
+func (s *EventStore) ListSubTaskStartsForTurn(ctx context.Context, sessionID pgtype.UUID, gen int32, dispatchedEventID int64, nextDispatchedEventID *int64) ([]sqlcgen.Event, error) {
 	return s.q.ListSubTaskStartEventsForTurn(ctx, sqlcgen.ListSubTaskStartEventsForTurnParams{
-		SessionID:         sessionID,
-		Gen:               gen,
-		DispatchedEventID: dispatchedEventID,
+		SessionID:             sessionID,
+		Gen:                   gen,
+		DispatchedEventID:     dispatchedEventID,
+		NextDispatchedEventID: nextDispatchedEventID,
 	})
 }
 
 // ListSubTaskFinishesForTurn is ListSubTaskStartsForTurn's own sibling --
 // see that method's doc comment immediately above for the full "why".
-func (s *EventStore) ListSubTaskFinishesForTurn(ctx context.Context, sessionID pgtype.UUID, gen int32, dispatchedEventID int64) ([]sqlcgen.Event, error) {
+func (s *EventStore) ListSubTaskFinishesForTurn(ctx context.Context, sessionID pgtype.UUID, gen int32, dispatchedEventID int64, nextDispatchedEventID *int64) ([]sqlcgen.Event, error) {
 	return s.q.ListSubTaskFinishEventsForTurn(ctx, sqlcgen.ListSubTaskFinishEventsForTurnParams{
-		SessionID:         sessionID,
-		Gen:               gen,
-		DispatchedEventID: dispatchedEventID,
+		SessionID:             sessionID,
+		Gen:                   gen,
+		DispatchedEventID:     dispatchedEventID,
+		NextDispatchedEventID: nextDispatchedEventID,
 	})
 }
 

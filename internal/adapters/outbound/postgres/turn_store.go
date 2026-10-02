@@ -212,6 +212,49 @@ func (s *TurnStore) GetByDispatchedMessageID(ctx context.Context, sessionID pgty
 	})
 }
 
+// NextDispatchedEventID returns the upper bound of turnID's sub-task trace
+// (§26.6's amendment, GetNextTurnDispatchedEventID's doc comment in
+// queries/turns.sql): the lowest dispatched_event_id among sessionID's
+// other turns at or above dispatchedEventID, turnID's own. found is false
+// when no other turn was dispatched at or after it -- the trace then has
+// no upper bound. A returned value equal to dispatchedEventID means
+// another turn shares the watermark, and the event log cannot tell the
+// two turns' events apart.
+func (s *TurnStore) NextDispatchedEventID(ctx context.Context, sessionID, turnID pgtype.UUID, dispatchedEventID int64) (next int64, found bool, err error) {
+	got, err := s.q.GetNextTurnDispatchedEventID(ctx, sqlcgen.GetNextTurnDispatchedEventIDParams{
+		SessionID:         sessionID,
+		ID:                turnID,
+		DispatchedEventID: dispatchedEventID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	if got == nil {
+		// Unreachable: the WHERE clause compares the column, so a NULL
+		// never matches. Treated as no bound found would widen the read,
+		// so it is an error instead.
+		return 0, false, errors.New("postgres: next turn dispatched_event_id is NULL")
+	}
+	return *got, true, nil
+}
+
+// EarlierTurnLeftRunning reports whether sessionID holds a turn other than
+// turnID, dispatched to sandbox gen before dispatchedEventID (turnID's own
+// watermark), that ended without its own execution_complete -- so its
+// agent may still be running at that gen (§26.6's amendment,
+// ExistsEarlierTurnLeftRunning's doc comment in queries/turns.sql).
+func (s *TurnStore) EarlierTurnLeftRunning(ctx context.Context, sessionID, turnID pgtype.UUID, gen int32, dispatchedEventID int64) (bool, error) {
+	return s.q.ExistsEarlierTurnLeftRunning(ctx, sqlcgen.ExistsEarlierTurnLeftRunningParams{
+		SessionID:         sessionID,
+		ID:                turnID,
+		Gen:               gen,
+		DispatchedEventID: dispatchedEventID,
+	})
+}
+
 // SetEpistemicOutcome is the guarded write backing the epistemic-outcome-
 // posting endpoint (§20.2) -- mirrors WorkflowStore.
 // SetStepRunOutcome's own "guarded UPDATE, observed via :execrows" idiom

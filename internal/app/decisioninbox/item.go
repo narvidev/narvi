@@ -47,10 +47,22 @@ type Item struct {
 	Provenance   *decisioninbox.Provenance
 	RiskLabel    string
 	CIGreen      bool
-	// Findings is the PR's own still-open review-findings count -- see
+	// Findings is the PR's own still-open review-findings count, as the
+	// inbox shows it: every finding whose status still blocks merge
+	// EXCEPT the counter-review additions the server could not count as
+	// checked, which UnverifiedAdditions counts apart (§26.6's amendment),
+	// so the row agrees with the Code review view. A display count only:
+	// the merge gate reads the full count, those additions included
+	// (countOpenFindings' openFindingCounts.Blocking). See
 	// FindingsUnknown's own doc comment immediately below for when this
 	// value must NOT be trusted/rendered as a real count.
 	Findings int
+	// UnverifiedAdditions counts the PR's still-open counter-review
+	// additions the server could not count as checked (§26.6's
+	// amendment): shown apart from Findings, never in it, and never
+	// rendered when FindingsUnknown is true. They block merge like any
+	// other open finding.
+	UnverifiedAdditions int
 	// FindingsUnknown is true iff Findings above could not actually be
 	// determined (countOpenFindings itself errored) -- buildPROpenItem
 	// still fails the ELIGIBILITY

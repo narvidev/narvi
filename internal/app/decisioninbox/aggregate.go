@@ -592,7 +592,8 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 
 	hasNeedsHuman, riskLabel, isHandoffPR := classifyPRLabels(pr.Labels)
 
-	openFindings, findingsErr := countOpenFindings(ctx, deps, repoFullName, pr.Number)
+	findingCounts, findingsErr := countOpenFindings(ctx, deps, repoFullName, pr.Number)
+	openFindings := findingCounts.Blocking
 	findingsUnknown := false
 	if findingsErr != nil {
 		// Fail CLOSED for the ELIGIBILITY computation below -- see countOpenFindings' own doc comment for why a
@@ -698,7 +699,8 @@ func buildPROpenItem(ctx context.Context, deps Deps, pr ports.OpenPR, repoFullNa
 		Provenance:               &provenance,
 		RiskLabel:                riskLabel,
 		CIGreen:                  ciGreen,
-		Findings:                 openFindings,
+		Findings:                 findingCounts.Displayed(),
+		UnverifiedAdditions:      findingCounts.UnverifiedAdditions,
 		FindingsUnknown:          findingsUnknown,
 		IsHandoff:                isHandoffPR,
 		HasApprovingReview:       pr.HasApprovingReview,
@@ -1677,18 +1679,63 @@ func (b *codeOwnersBudget) take(ctx context.Context) bool {
 // buildPROpenItem degrades the affected row to non-ready_to_merge rather
 // than failing the whole read model; revalidate.go's RevalidateForMerge
 // propagates the error outright, refusing the merge.
-func countOpenFindings(ctx context.Context, deps Deps, repoFullName string, prNumber int) (int, error) {
+//
+// The result's Blocking is the merge gate's count, every caller's
+// eligibility input; UnverifiedAdditions is the display split of it
+// (openFindingCounts).
+func countOpenFindings(ctx context.Context, deps Deps, repoFullName string, prNumber int) (openFindingCounts, error) {
 	findings, err := deps.ReviewFindings.ListOpenAndRebutted(ctx, repoFullName, int32(prNumber))
 	if err != nil {
-		return 0, err
+		return openFindingCounts{}, err
 	}
-	count := 0
-	for _, f := range findings {
-		if reviewpost.FindingStatus(f.Status).BlocksMerge() {
-			count++
+	return tallyOpenFindings(findings), nil
+}
+
+// openFindingCounts is countOpenFindings' result.
+type openFindingCounts struct {
+	// Blocking counts every finding whose status still blocks merge
+	// (reviewpost.FindingStatus.BlocksMerge) -- the merge gate's own
+	// count, unchanged by §26.6's amendment: an unverified counter-review
+	// addition blocks merge exactly like any other open finding (§26.5).
+	Blocking int
+	// UnverifiedAdditions counts the part of Blocking that is
+	// counter-review additions the server could not count as checked
+	// (reviewpost.Finding.UnverifiedAddition) -- the inbox shows them
+	// apart from its findings count, as the posted comment, the readout
+	// and the Code review view do. Display only: no eligibility input
+	// reads it.
+	UnverifiedAdditions int
+}
+
+// Displayed is the findings count the inbox shows: Blocking without the
+// unverified additions, which it shows apart (Item.UnverifiedAdditions).
+func (c openFindingCounts) Displayed() int {
+	return c.Blocking - c.UnverifiedAdditions
+}
+
+// tallyOpenFindings is countOpenFindings' pure half: the merge gate's
+// count over rows, and the unverified additions among it. A row with no
+// source recorded -- last published before sources were recorded, or
+// posted without one -- is never an unverified addition.
+func tallyOpenFindings(rows []sqlcgen.ReviewFinding) openFindingCounts {
+	var out openFindingCounts
+	for _, f := range rows {
+		if !reviewpost.FindingStatus(f.Status).BlocksMerge() {
+			continue
+		}
+		out.Blocking++
+		finding := reviewpost.Finding{}
+		if f.ReportedSource != nil {
+			finding.Source = reviewpost.FindingSource(*f.ReportedSource)
+		}
+		if f.AdditionCheck != nil {
+			finding.AdditionCheck = reviewpost.AdditionCheck(*f.AdditionCheck)
+		}
+		if finding.UnverifiedAddition() {
+			out.UnverifiedAdditions++
 		}
 	}
-	return count, nil
+	return out
 }
 
 // isPlatformAuthored reports whether SOME Narvi session pushed and opened

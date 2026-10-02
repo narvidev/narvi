@@ -73,6 +73,8 @@ function baseFinding(overrides: Partial<ReviewReadoutFinding> = {}): ReviewReado
     rebuttalText: null,
     startLine: 10,
     endLine: 10,
+    source: null,
+    additionCheck: null,
     ...overrides,
   }
 }
@@ -646,5 +648,128 @@ describe('SentinelsPanel -- visual-QA sentinel status (§12.2 item 2)', () => {
     const html = withQueryClient(<SentinelsPanel verdict={null} visualQa={XSS_SCRIPT} />)
     expect(html).not.toContain('<script>')
     expect(html).toContain('&lt;script&gt;')
+  })
+})
+
+// §26.6's amendment: a finding the counter-reviewer adds is fact-checked,
+// or published marked unverified and counted apart. The readout carries
+// the server's resolution (source/additionCheck); these prove the view
+// marks it and never counts an unverified addition with the findings.
+describe('CodeReviewView -- counter-review additions (§26.6)', () => {
+  it('an unverified addition is marked, with the server reason', () => {
+    const html = withQueryClient(<FindingCard finding={baseFinding({ source: 'counter_review', additionCheck: 'not_found' })} canAct={false} sessionId="s1" />)
+    expect(html).toContain('unverified addition')
+    expect(html).toContain('Added by the counter-review and not fact-checked')
+    expect(html).toContain('none that started after the counter-review and completed was found')
+  })
+
+  it('an addition whose check could not be confirmed says so, never what the trace shows', () => {
+    const html = withQueryClient(<FindingCard finding={baseFinding({ source: 'counter_review', additionCheck: 'unconfirmed' })} canAct={false} sessionId="s1" />)
+    expect(html).toContain('could not be confirmed')
+    expect(html).not.toContain('was found in')
+  })
+
+  it('an addition with no resolution, or one this client does not know, is unverified -- never upgraded to checked', () => {
+    for (const additionCheck of [null, 'CHECKED', 'later-value']) {
+      const html = withQueryClient(<FindingCard finding={baseFinding({ source: 'counter_review', additionCheck })} canAct={false} sessionId="s1" />)
+      expect(html).toContain('unverified addition')
+    }
+  })
+
+  it('a checked addition is labeled as the counter-review\'s and not marked unverified', () => {
+    const html = withQueryClient(<FindingCard finding={baseFinding({ source: 'counter_review', additionCheck: 'checked' })} canAct={false} sessionId="s1" />)
+    expect(html).toContain('counter-review addition, checked')
+    expect(html).not.toContain('unverified')
+  })
+
+  it('a primary finding, or one with no source recorded, carries no addition marker', () => {
+    for (const source of ['primary', null]) {
+      const html = withQueryClient(<FindingCard finding={baseFinding({ source })} canAct={false} sessionId="s1" />)
+      expect(html).not.toContain('addition')
+      expect(html).not.toContain('unverified')
+    }
+  })
+
+  it('the appendix counts unverified additions apart from the total and the open count', () => {
+    const findings = [
+      baseFinding({ identityHash: 'p1', source: 'primary' }),
+      baseFinding({ identityHash: 'p2', source: null, status: 'rebutted' }),
+      baseFinding({ identityHash: 'c1', source: 'counter_review', additionCheck: 'checked' }),
+      baseFinding({ identityHash: 'u1', source: 'counter_review', additionCheck: 'not_run' }),
+      baseFinding({ identityHash: 'u2', source: 'counter_review', additionCheck: 'unconfirmed' }),
+    ]
+    const html = withQueryClient(<FindingsAppendix findings={findings} canAct={false} sessionId="s1" />)
+    expect(html).toContain('Findings (3 total, 2 open) · 2 unverified, counted apart')
+  })
+
+  it('the appendix shows no unverified count when there is none', () => {
+    const html = withQueryClient(<FindingsAppendix findings={[baseFinding({ source: 'primary' })]} canAct={false} sessionId="s1" />)
+    expect(html).toContain('Findings (1 total, 1 open)')
+    expect(html).not.toContain('unverified')
+  })
+
+  it('the Sentinels panel reports the second fact-check run apart from the first', () => {
+    const html = renderToStaticMarkup(
+      <SentinelsPanel verdict={baseVerdict({ factCheck: 'done', factCheckKilled: 2, additionsFactCheck: 'done', additionsFactCheckKilled: 1, additionsCheck: 'not_found' })} visualQa={null} />,
+    )
+    expect(html).toContain('fact check (additions)')
+    expect(html).toContain('done (1 killed) · additions unverified')
+  })
+
+  it('the Sentinels panel shows a dash when there was no second run to resolve', () => {
+    const html = renderToStaticMarkup(<SentinelsPanel verdict={baseVerdict()} visualQa={null} />)
+    expect(html).toContain('<dt>fact check (additions)</dt><dd>—</dd>')
+  })
+
+  it('the Sentinels panel never calls additions unverified when the second run removed every one', () => {
+    const html = renderToStaticMarkup(
+      <SentinelsPanel verdict={baseVerdict({ factCheck: 'done', factCheckKilled: 0, additionsFactCheck: 'done', additionsFactCheckKilled: 2, additionsCheck: null })} visualQa={null} />,
+    )
+    expect(html).toContain('<dt>fact check (additions)</dt><dd>done (2 killed) · no addition published</dd>')
+    expect(html).not.toContain('additions unverified')
+  })
+
+  it('the Sentinels panel never says no addition was published while a finding has no recorded source', () => {
+    const html = renderToStaticMarkup(
+      <SentinelsPanel verdict={baseVerdict({ additionsFactCheck: 'done', additionsFactCheckKilled: 0, additionsCheck: null })} visualQa={null} hasUnsourcedFinding />,
+    )
+    expect(html).toContain('<dt>fact check (additions)</dt><dd>done (0 killed) · not resolved -- a finding has no recorded source</dd>')
+    expect(html).not.toContain('no addition published')
+  })
+
+  // The expanded appendix: unverified additions are listed apart, under
+  // their own heading after the other findings, and never repeated among
+  // them.
+  it('the expanded appendix lists unverified additions apart, after the other findings, once each', () => {
+    const findings = [
+      baseFinding({ identityHash: 'u1', description: 'Unverified one.', source: 'counter_review', additionCheck: 'not_run' }),
+      baseFinding({ identityHash: 'p1', description: 'Primary one.', source: 'primary' }),
+      baseFinding({ identityHash: 'n1', description: 'No source one.', source: null }),
+      baseFinding({ identityHash: 'c1', description: 'Checked addition.', source: 'counter_review', additionCheck: 'checked' }),
+      baseFinding({ identityHash: 'u2', description: 'Unverified two.', source: 'counter_review', additionCheck: 'unconfirmed' }),
+    ]
+    const html = withQueryClient(<FindingsAppendix findings={findings} canAct={false} sessionId="s1" defaultOpen />)
+    const heading = '<h3>Unverified -- added by the counter-review and not fact-checked (2)</h3>'
+    expect(html.split(heading).length - 1).toBe(1)
+    const [listedPart, unverifiedPart] = html.split(heading)
+    for (const listed of ['Primary one.', 'No source one.', 'Checked addition.']) {
+      expect(listedPart).toContain(listed)
+      expect(unverifiedPart).not.toContain(listed)
+    }
+    // A card can render its description more than once (its text and a
+    // title); each unverified addition must appear exactly as often as one
+    // card of its own renders it -- listed once, never repeated.
+    for (const finding of findings.filter((f) => f.source === 'counter_review' && f.additionCheck !== 'checked')) {
+      const perCard = withQueryClient(<FindingCard finding={finding} canAct={false} sessionId="s1" />).split(finding.description).length - 1
+      expect(perCard).toBeGreaterThan(0)
+      expect(listedPart).not.toContain(finding.description)
+      expect(unverifiedPart.split(finding.description).length - 1).toBe(perCard)
+    }
+  })
+
+  it('the expanded appendix has no unverified section when there is no unverified addition', () => {
+    const html = withQueryClient(<FindingsAppendix findings={[baseFinding({ source: 'primary', description: 'Primary one.' })]} canAct={false} sessionId="s1" defaultOpen />)
+    expect(html).toContain('Primary one.')
+    expect(html).not.toContain('<h3>Unverified')
   })
 })

@@ -103,7 +103,7 @@ Two-phase terminalization's reconciliation above is scoped to a late signal that
 
 `pending → dispatched → processing → completed | failed | cancelled`. Exactly one `processing` per session. Enqueue → if no live sandbox, trigger spawn and return (dispatch happens when sandbox connects). The enqueue's own transaction arms the session's `dispatch` timer due at once (§2), so the dispatch evaluation the post-commit trigger asks for is delivered by the timer pump when that trigger fails — by the first replica able to host the session's actor that claims the timer — and every evaluation that commits deletes the timer; one that fails backs it off, and a spawn refused on policy ends the session's open turns. Dispatch arms `turn_deadline`. On terminal event: complete turn, trigger snapshot, re-derive session status, dispatch next pending. Stop/failure paths emit a **synthetic** `execution_complete` event so clients always see one terminal event per turn. The turn records the OpenCode conversation id **at turn start** (also reported on every heartbeat) so follow-up prompts on a fresh sandbox resume the same conversation — never lazily.
 
-**Receipt.** A turn is committed `processing` before its prompt is written to the sandbox's socket, in one frame nothing acknowledges, so a control plane that dies between that commit and the write, or a frame lost with its socket after a write that returned, leaves a turn `processing` on a sandbox that never received it. Both losses end the socket, and the agent's next `ready` on the same gen — its reconnect — is where such a prompt is found and sent again, to an agent that says it can tell. Every `ready` of an agent that can advertises `capabilities.promptReceipt`; the control plane counts readies (`sandboxes.ready_seq`) and records the capability against the gen whose latest `ready` advertised it (`sandboxes.prompt_receipt_gen`), the way it records boot evidence (§3.2), so no respawn, restore or resume inherits it and the capability is never inferred from the agent's build. A dispatch to a capable gen sets `receiptRequested` on the prompt and records in its own commit which `messageId` asked, when (the database's clock) and at which ready (`turns.receipt_requested_message_id`, `receipt_requested_at`, `receipt_checked_ready_seq`, migration `000154`); a dispatch to any other gen records nothing and clears an earlier request, and its prompt is byte-identical to one sent without receipts. The agent journals each prompt's `messageId` (appended and fsynced under `NARVI_AGENT_STATE_DIR`, keyed by session and gen, the file kept to complete lines: a torn tail is cut off at open, a failed append cut back off), answers every prompt that asked with a `prompt_received` event — a duplicate too — and runs a `messageId` at most once, across a restart of its process within the gen. A prompt that asked and cannot be journaled is neither run nor receipted; the agent then stops advertising the capability, reports the prompt in a non-fatal `error` event, and ends its connection, so its next `ready` records the gen as incapable: nothing is re-sent to it, and that turn ends at `turn_deadline`. When a dispatch evaluation sees a ready of the turn's own gen counted since the last one its check answered, it reads, in one statement, whether the receipt is stored and how long ago the dispatch asked, and claims that ready with a compare-and-set: with no receipt stored and within `PromptResendWindow` (10 min) it sends the same prompt again — the same `messageId`, which the agent dedups on and the verdict route resolves the turn by — so at most once per reconnect, at most `PromptResendMaxPerTurn` (3) times per dispatch, and never once the receipt is stored or the turn has left `processing`. The cap is the backstop for a loss that is not a one-off: each re-send is answered only after the next reconnect, so a frame the sandbox can never take would cause the very reconnect that re-sends it; past the cap one warning and `turn_prompt_resend_total{outcome="cap_reached"}`, and nothing is sent. No prompt frame is ever larger than `MaxPromptFrameBytes` (§6.1): a first dispatch or re-enqueue over it fails its turn as a refusal naming both sizes, and a re-send over it is refused and counted. A re-send re-arms nothing and moves none of `dispatched_at`, `dispatched_event_id` or `dispatched_sandbox_gen`: `turn_deadline` stays a firm bound from the original dispatch, and the stored token frames and §26.4's corroboration keep the turn's window. A re-send that fails, or that the rollout re-check refuses, fails nothing — the prompt may already be running — and the next reconnect asks again. Past the window nothing is sent: one warning, `turn_prompt_resend_total{outcome="window_expired"}`, and the turn ends as it always did, at `turn_deadline` or by a person's stop. A turn a stop flagged is never re-sent. The receipt is data, never an edge: `dispatched → processing` still commits with the dispatch, because a turn held in `dispatched` until its receipt came back would never complete on a control plane that completes only a `processing` turn — an older replica during a rolling deploy, or this one for an agent without the capability. The receipt is the stored event row, found by its deterministic key `prompt_received:{messageId}`, so a receipt stored by a replica that does not know the type, through its generic path, is the same row; a turn dispatched by such a replica asked for nothing and is never re-sent. An agent without the capability is never re-sent a prompt, and its lost prompt still ends at `turn_deadline`.
+**Receipt.** A turn is committed `processing` before its prompt is written to the sandbox's socket, in one frame nothing acknowledges, so a control plane that dies between that commit and the write, or a frame lost with its socket after a write that returned, leaves a turn `processing` on a sandbox that never received it. Both losses end the socket, and the agent's next `ready` on the same gen — its reconnect — is where such a prompt is found and sent again, to an agent that says it can tell. Every `ready` of an agent that can advertises `capabilities.promptReceipt`; the control plane counts readies (`sandboxes.ready_seq`) and records the capability against the gen whose latest `ready` advertised it (`sandboxes.prompt_receipt_gen`), the way it records boot evidence (§3.2), so no respawn, restore or resume inherits it and the capability is never inferred from the agent's build. A dispatch to a capable gen sets `receiptRequested` on the prompt and records in its own commit which `messageId` asked, when (the database's clock) and at which ready (`turns.receipt_requested_message_id`, `receipt_requested_at`, `receipt_checked_ready_seq`, migration `000155`); a dispatch to any other gen records nothing and clears an earlier request, and its prompt is byte-identical to one sent without receipts. The agent journals each prompt's `messageId` (appended and fsynced under `NARVI_AGENT_STATE_DIR`, keyed by session and gen, the file kept to complete lines: a torn tail is cut off at open, a failed append cut back off), answers every prompt that asked with a `prompt_received` event — a duplicate too — and runs a `messageId` at most once, across a restart of its process within the gen. A prompt that asked and cannot be journaled is neither run nor receipted; the agent then stops advertising the capability, reports the prompt in a non-fatal `error` event, and ends its connection, so its next `ready` records the gen as incapable: nothing is re-sent to it, and that turn ends at `turn_deadline`. When a dispatch evaluation sees a ready of the turn's own gen counted since the last one its check answered, it reads, in one statement, whether the receipt is stored and how long ago the dispatch asked, and claims that ready with a compare-and-set: with no receipt stored and within `PromptResendWindow` (10 min) it sends the same prompt again — the same `messageId`, which the agent dedups on and the verdict route resolves the turn by — so at most once per reconnect, at most `PromptResendMaxPerTurn` (3) times per dispatch, and never once the receipt is stored or the turn has left `processing`. The cap is the backstop for a loss that is not a one-off: each re-send is answered only after the next reconnect, so a frame the sandbox can never take would cause the very reconnect that re-sends it; past the cap one warning and `turn_prompt_resend_total{outcome="cap_reached"}`, and nothing is sent. No prompt frame is ever larger than `MaxPromptFrameBytes` (§6.1): a first dispatch or re-enqueue over it fails its turn as a refusal naming both sizes, and a re-send over it is refused and counted. A re-send re-arms nothing and moves none of `dispatched_at`, `dispatched_event_id` or `dispatched_sandbox_gen`: `turn_deadline` stays a firm bound from the original dispatch, and the stored token frames and §26.4's corroboration keep the turn's window. A re-send that fails, or that the rollout re-check refuses, fails nothing — the prompt may already be running — and the next reconnect asks again. Past the window nothing is sent: one warning, `turn_prompt_resend_total{outcome="window_expired"}`, and the turn ends as it always did, at `turn_deadline` or by a person's stop. A turn a stop flagged is never re-sent. The receipt is data, never an edge: `dispatched → processing` still commits with the dispatch, because a turn held in `dispatched` until its receipt came back would never complete on a control plane that completes only a `processing` turn — an older replica during a rolling deploy, or this one for an agent without the capability. The receipt is the stored event row, found by its deterministic key `prompt_received:{messageId}`, so a receipt stored by a replica that does not know the type, through its generic path, is the same row; a turn dispatched by such a replica asked for nothing and is never re-sent. An agent without the capability is never re-sent a prompt, and its lost prompt still ends at `turn_deadline`.
 
 **Stop.** `POST /api/sessions/{sessionID}/stop` stops a session and every session it started, through this machine's own `cancel` edge (legal from `pending`, `dispatched` and `processing`) — there is no second stop, and no new turn state, trigger or session status. An MCP client's stop is this same route, called through `narvi_stop_session` (§43.22). The request is data (§2): the turns open at that instant are flagged (`turns.stop_requested_at`), the session is flagged (`sessions.stop_requested_at`), and its `stop` timer is armed for now. A repeated request flags whatever is open by then; each turn keeps its first flag, and the session takes the latest request's instant. The actor then:
 
@@ -2469,6 +2469,59 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
     `needs_human` — strictly more conservative, never less — the same fail-conservative bias
     `CounterReviewSkipped`'s own "every cause floors identically" posture already commits to.
     Deliberately left unaddressed: no retries, no polling, no new timeout constant.
+  - **Extended to the second fact-check run (§26.6's amendment).** The same trace read now feeds
+    two checks, never two reads: `httpapi.readSubTaskTrace` reads the turn's sub-task events once,
+    whenever the deep path reports the counter-review done or the second fact-check run done, and
+    returns a `reviewverdict.SubTaskTrace` whose records carry each row's own `events.id`. Within one
+    session ids are allocated in commit order (`MaxEventIDForSession`), so comparing two records'
+    ids orders them as the trace recorded them, with no clock. `CounterReviewCorroborated` is
+    unchanged; `AdditionsFactCheckInTrace` reports whether a `fact-check` sub-task started after
+    every counter-reviewer event in the trace (each start and each finish belonging to one) and
+    completed, given at least one counter-review that completed. The first fact-check run starts
+    before the counter-review by the funnel's design, so without that ordering every deep review
+    would read as checked. `SubTaskTrace.ReadInFull` is false when any part of the trace could not
+    be read -- no dispatch gen or event id on the turn, a failed query, a row that did not decode --
+    and the additions then resolve to `unconfirmed`, "could not be confirmed", even when a
+    qualifying run is among the rows that were read: a checked addition is a claim that no later
+    counter-reviewer event exists, which a partial read cannot support. The counter-review claim
+    keeps its existing reading (a positive found among the decoded rows still corroborates).
+    A finish whose start is not in the trace also leaves it incomplete for the additions:
+    `sub_task_finish` carries no sub-agent type and is critical, while `sub_task_start` is
+    best-effort and can be evicted during a long disconnect, so a lone finish may be a
+    counter-review that ran after the second fact-check.
+  - **Bounded above as well.** A turn past `TurnDeadline` is marked failed without its agent being
+    stopped, the next turn is dispatched to the same sandbox at the same gen, and the first turn's
+    late verdict is still resolved by its own message id. Bounded below only, that verdict's trace
+    would hold the later turn's sub-tasks, and the later turn's routine first fact-check would read
+    as the earlier turn's second run. So the read stops at the next turn's own dispatch watermark
+    (`events.id <= next`, `turns.GetNextTurnDispatchedEventID`), for both checks, since they read
+    the same rows. Work the earlier turn did after the later one was dispatched is left out too,
+    deliberately unread, so the read is marked cut (`SubTaskTrace.CutAtNextTurn`), and the
+    additions resolve to `unconfirmed` ("could not be confirmed") whatever the window holds: a
+    second run missing from it may lie past the cut, and one found in it may have been followed,
+    past the cut, by another counter-reviewer pass -- `checked` claims that no counter-reviewer
+    event follows the run, which a cut read cannot support. The counter-review claim is positive
+    (a counter-reviewer ran and completed), so one found inside the window, this turn's own
+    events, still corroborates it, and one not found there leaves it uncorroborated. Another turn
+    dispatched at the same
+    watermark, with no event between the two dispatches, makes the two turns' events
+    indistinguishable, and the trace is then not read at all (`ReadInFull` false).
+  - **The later turn's read, when an earlier one may still be running.** The same race reaches the
+    later turn, whose read is bounded below only: the earlier turn's late sub-tasks land above its
+    watermark, at the same gen, and no sub-task event names the turn or prompt it belongs to, so
+    nothing attributes them -- an earlier turn's late fact-check would count as the later turn's own
+    second run, "checked" in the unsafe direction. The rule is conservative: when the session holds
+    an earlier turn, dispatched on the same gen, that ended without its own `execution_complete`
+    (the control plane appended a synthetic one naming it: timed out, stopped, abandoned or
+    refused, its agent possibly still running -- `turns.ExistsEarlierTurnLeftRunning`), the later
+    turn's trace is not read at all, and both its claims resolve unconfirmed. An earlier turn that
+    ended with a real `execution_complete`, or one on a gen since replaced, changes nothing, and
+    neither does one whose prompt certainly never reached the sandbox -- a dispatch refused before
+    the prompt was sent, or a send refused with no live connection, which writes nothing:
+    `failDispatchedTurn` marks its synthetic event `"delivered": false`, and no agent of it ever
+    ran. Any other send failure may have followed a partial write, and still counts. The cost is
+    named: until the sandbox's gen moves on, every later deep turn on that session reads its claims
+    as unconfirmed (the counter-review floored to `needs_human`).
 
 ### 26.5 Measuring the readout (Step 69, on Step 62's instrument)
 
@@ -2530,6 +2583,26 @@ N× boot cost with no real independence gain — each sub-agent already has a cl
   size), minified bundles and snapshots (shipped or asserted content), and MDX (compiled into
   pages). An operator whose repositories follow other conventions widens the list with
   `NARVI_REVIEW_SIZE_EXCLUDED_PATHS`.
+- **Precision per source, and unverified additions counted apart (§26.6's amendment).** Every
+  published finding records the source its payload reported, `primary` or `counter_review`
+  (`review_findings.reported_source`, migration `000154`), and, for a counter-review addition,
+  the server's resolution (`addition_check`: `checked`, `not_run`, `not_found`, `unconfirmed`).
+  Both describe the finding's latest publication and are overwritten on a re-report, like
+  `last_seen_at`; a residual, named: a finding the counter-reviewer introduced and the primary
+  reviewer later re-reports counts under `primary` from then on. The source is self-reported --
+  the server cannot see which pass wrote a finding -- and is recorded as such. The "Review finding
+  outcomes" KPI (`ReviewAnalytics.findingOutcomes`) leaves out every addition the server could not
+  count as checked, and `findingOutcomesBySource` counts every finding per source (`primary`,
+  `counter_review`, `counter_review_unverified`, `not_recorded`) and status, so precision per
+  source is the share of a source's findings a maintainer rebutted, and the §26.6 rule can be
+  revisited on numbers. A finding last published before migration `000154` has no source
+  recorded, and neither has one posted without a source by a turn whose prompt was rendered
+  before sources existed (§26.6's amendment, Validation): either reads as `not_recorded`, never
+  as `primary`, is never marked unverified, and stays in the main distribution as it always was.
+  The merge-gate's open-findings count is unchanged: an unverified addition blocks merge exactly
+  like any other open finding. The §16 decision inbox shows those additions apart from its
+  findings count (`DecisionInboxItem.unverifiedAdditions`), as the Code review view does; its
+  `findings` is a display count, and the gate still reads the full one.
 - The §21.3 deterministic digest and the §16 decision inbox surface the readout's `Summary` line
   per PR — reusing their existing aggregation, no new mechanism.
 - **Evals**: known-PR digest-quality cases (expected architecture decisions on reference diffs,
@@ -2554,8 +2627,9 @@ Counter-review is deep, adversarial, tool-equipped, and runs only on the deep pa
 pass is shallow, mechanical, and runs on **both**. On the deep path they compose as a funnel:
 
 primary reviewer's findings → **fact-check** (kills only provably-wrong-from-diff) →
-**counter-review** (§26.4, adjudicates the survivors, may itself surface new findings) →
-synthesis (unchanged) → publish
+**counter-review** (§26.4, adjudicates the survivors, may itself surface new findings, each
+stating the evidence triplet) → **second fact-check**, over the additions only (amendment below)
+→ synthesis (unchanged) → publish
 
 (`architecture-scribe` is orthogonal to this ordering — §26.4's own "virgin context, uncontaminated
 by the primary's finding hunt" design means it never consumes or feeds the findings list this
@@ -2635,6 +2709,66 @@ second fact-check sub-task, run after the counter-review in the same turn, is co
 turn's own sub-task events; any other is published marked unverified, and what the reviewer reports
 about coverage and source is recorded as self-reported. Every published finding records its source, primary or counter-review, so
 §26.5 reports precision per source and the rule can be revisited on numbers.
+
+As shipped:
+- **The instruction** (`internal/domain/review/context.go`). The counter-review step asks each
+  addition to state the defect, quoting the diff lines it rests on; the path that reaches it; and
+  the consequence -- and to drop one that cannot state all three. A fourth, deep-only step spawns a
+  new `fact-check` sub-task over the additions alone, after the counter-review has finished, under
+  step 1's diff-only rules; it is a fact-check spawn, so §26.7's budget check governs it unchanged.
+  The payload reports it as `additionsFactCheck` (`done`/`skipped`, omitted when the
+  counter-review added nothing) and `additionsFactCheckKilled`, apart from `factCheck`/
+  `factCheckKilled`, and every finding carries `source` (`primary` on light, where the text names
+  no other value; `primary` or `counter_review` on deep). Contracts 1.17.0.
+- **The rule** (`reviewpost.ResolveAdditionCheck`). An addition is `checked` only when the
+  reviewer reported the second run done AND the turn's trace shows a fact-check that started after
+  the counter-review and completed (§26.4's extension); otherwise it is `not_run` (reported
+  skipped, or not reported), `not_found` (reported, and the trace read when the verdict was posted
+  held none -- §26.4's accepted race included) or `unconfirmed` (the trace could not be read in
+  full). One resolution per verdict (`BuildSecondFactCheck`) marks every addition, so the verdict
+  and its findings cannot disagree. It is made only when the verdict publishes an addition: a
+  second run that removed every addition is recorded (its report and kill count) with no
+  resolution, so the readout shows "no addition published", never "additions unverified".
+- **Validation.** `source` is optional in the schema. A value that is present must be `primary` or
+  `counter_review` (a garbled one is `400`). An absent one is admitted in one case only: from a
+  turn whose own stored prompt predates the source instruction, on a payload that reports no
+  `additionsFactCheck`. The verdict body follows the review prompt, which is rendered once, when
+  the turn is created, and re-sent as stored on every dispatch, so a turn rendered before this
+  change -- queued, running, or re-sent to a respawned sandbox while the control plane is
+  deployed -- posts its findings without the field; refusing them would refuse the verdict its
+  own instructions shaped, and would make the contract's MINOR grade untrue. Such a finding is
+  recorded as not recorded. The server tells that turn apart by its stored prompt
+  (`turns.prompt`): both paths' source lines open with one exported marker,
+  `review.FindingSourceFieldMarker`, which the renderer builds them from and
+  `review.PromptInstructsFindingSource` looks for, so a later prompt edit cannot desynchronise
+  the two; and `additionsFactCheck`, which only the current prompt names, marks a current-prompt
+  payload on its own. From any other turn an absent source is refused with `400`, like a garbled
+  one: an addition its reviewer forgot to label is never published as an ordinary finding. A
+  `counter_review` source, or a
+  second-run report, is refused off the deep path; a kill count is refused unless the run is
+  reported `done`. On the deep path every other combination is admitted -- additions beside a
+  counter-review reported skipped included -- because whatever the payload claims, an addition is
+  checked only when the server finds the run, and refusing an inconsistent claim would only push a
+  reviewer to relabel an addition `primary`.
+- **Publication.** The posted comment lists an unverified addition under its own heading, after
+  the findings, with their count and the server's reason for each; a checked one stays among the
+  findings, marked as the counter-review's; every other finding renders as before. Each finding's
+  description has its line breaks folded onto its one line, primary and addition alike, as §26.1's
+  header already folds the adequacy explanation, so reviewer text cannot open a line that copies
+  the server's headings or markers, and an unclosed code fence in it cannot hide the server's note
+  or the rest of the comment. The readout
+  carries `source`/`additionCheck` per finding and `additionsFactCheck`/
+  `additionsFactCheckKilled`/`additionsCheck` on the verdict; the Code review view marks an
+  unverified addition, counts it apart in the appendix header and lists it apart, and the decision
+  inbox shows the count apart from its findings (§26.5). An unverified
+  addition raises the Shippable class no more than a checked one: `review.ComputeShippable` reads
+  no finding (§26.1), and neither the blockers nor the merge gate treat it differently.
+- **Storage.** `review_verdicts.additions_fact_check`/`additions_fact_check_killed`/
+  `additions_check` record the second run apart from the first; `review_findings.reported_source`/
+  `addition_check` record each finding's source and resolution (migration `000154`). The server
+  cannot see whether the diff disproved an addition -- `sub_task_finish` carries no content -- so
+  "an addition the diff disproves is not published" rests on the instruction, with the reviewer's
+  reported kill count recorded beside the run.
 
 ### 26.7 Per-review cost budget with look-ahead (Step 69 design, Step 70 wiring)
 
@@ -2740,8 +2874,10 @@ derived (propose $0.50 light / $5 deep per review, matching this plan's own conv
 a concrete, explicitly-tunable starting figure rather than leaving a blank, §24.6's
 `auto_retrigger_count` budget is the precedent). Light path's own ceiling is a degenerate,
 one-checkpoint case (the one optional pass it can run at all is §26.6's fact-check sub-task); deep
-path's is checked once before each of the two optional sub-tasks this ceiling actually governs —
-fact-check and `counter-reviewer` — in whatever order that orchestration dispatches them.
+path's is checked once before each optional sub-task dispatch this ceiling actually governs —
+fact-check (both runs, the second over the counter-review's additions, §26.6's amendment) and
+`counter-reviewer` — in whatever order that orchestration dispatches them; a skipped second
+fact-check leaves the additions published marked unverified.
 `architecture-scribe` is excluded from this check entirely (§26.9's own resolution: a
 budget-triggered scribe skip would floor nothing and appear nowhere, the silent downgrade the v1
 rigor invariant forbids) — it always runs regardless of cost.
