@@ -123,15 +123,17 @@ func TimerCanCreateWork(name string) bool {
 // kind whose fire has necessary conditions a row can show: the session's
 // status (technical plan §43.20) reads every armed timer through it.
 // review_retrigger_debounce inserts a turn only for a repository that
-// opted in and a pull request whose automatic re-review budget
-// (ReviewAutoRetriggerBudget) is not spent, so it counts only while
-// reviewRetriggerCanFire -- GetSessionActivityFacts'
-// review_retrigger_can_fire, read in the same snapshot -- says both hold.
-// The budget only grows and only a person switches the opt-in, so a
-// debounce this says cannot fire can create a turn later only after that
-// person's own input. Its other decline rules (the head already reviewed,
-// a plan awaiting approval, a live fetch that fails) are not read, so
-// they err toward scheduled. Every other kind is TimerCanCreateWork's.
+// opted in and an administrator has not revoked (§31.4), and a pull
+// request whose automatic re-review budget (ReviewAutoRetriggerBudget) is
+// not spent, so it counts only while reviewRetriggerCanFire --
+// GetSessionActivityFacts' review_retrigger_can_fire, read in the same
+// snapshot -- says all three hold. The budget only grows, only a person
+// switches the opt-in and only an administrator restores a repository, so
+// a debounce this says cannot fire can create a turn later only after
+// that person's own input. Its other decline rules (the head already
+// reviewed, a plan awaiting approval, a live fetch that fails, a
+// revocation of only the session's clone URL) are not read, so they err
+// toward scheduled. Every other kind is TimerCanCreateWork's.
 func TimerCountsAsScheduledWork(name string, reviewRetriggerCanFire bool) bool {
 	if name == TimerReviewRetriggerDebounce {
 		return reviewRetriggerCanFire

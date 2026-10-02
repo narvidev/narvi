@@ -248,8 +248,8 @@ ORDER BY day;
 -- id_idx, release_manifest_pending_session_id_idx,
 -- release_manifest_checks_running_session_id_idx); the escalation's
 -- follow-up checks go by primary key, by session_id over turns, and by
--- workflow_run_id (workflow_step_runs_run_step_idx), and repo_settings by
--- its primary key.
+-- workflow_run_id (workflow_step_runs_run_step_idx), and repo_settings and
+-- repo_entitlement_revocations by their primary keys.
 --
 -- escalated is the session's LIVE workflow escalation, never merely a run
 -- in needs_review: nothing moves a run out of needs_review, and the next
@@ -287,15 +287,19 @@ ORDER BY day;
 -- re-review debounce's fire can still insert a turn at all, on the
 -- conditions it reads from rows alone: the pull request's repository
 -- opted in (repo_settings.auto_retrigger_review_enabled; no row means
--- off) and its automatic re-review budget is not spent
+-- off), its automatic re-review budget is not spent
 -- (github_pr_sessions.auto_retrigger_count below
 -- review_auto_retrigger_budget, which the caller passes from
 -- sessionactor.ReviewAutoRetriggerBudget -- the one definition the fire
--- itself compares with). Both are necessary for the fire to insert a turn,
--- so a debounce armed while either fails can only decline; the fire's
--- other decline rules -- the head already reviewed, a plan awaiting
--- approval, a live fetch that fails -- are deliberately not copied here,
--- so the status errs toward scheduled on them, never toward settled.
+-- itself compares with), and an administrator has not revoked it (§31.4:
+-- no repo_entitlement_revocations row for the pull request's base
+-- repository, github_pr_sessions.repo_full_name, the claim key the fire
+-- reads too). Each is necessary for the fire to insert a turn, so a
+-- debounce armed while any fails can only decline; the fire's other
+-- decline rules -- the head already reviewed, a plan awaiting approval, a
+-- live fetch that fails, a revocation of only the session's clone URL (a
+-- fork's name, parsed in Go) -- are deliberately not copied here, so the
+-- status errs toward scheduled on them, never toward settled.
 -- release_check_pending_since/_claimed_at are a release PR's manifest
 -- check still to come or still running on this session: the oldest
 -- release_manifest_pending row's created_at, and the newest
@@ -435,6 +439,10 @@ LEFT JOIN LATERAL (
     SELECT bool_or(
         COALESCE(rs.auto_retrigger_review_enabled, false)
         AND gps.auto_retrigger_count < sqlc.arg('review_auto_retrigger_budget')::integer
+        AND NOT EXISTS (
+            SELECT 1 FROM repo_entitlement_revocations rev
+            WHERE rev.repo_full_name = gps.repo_full_name
+        )
     ) AS can_fire
     FROM github_pr_sessions gps
     LEFT JOIN repo_settings rs ON rs.repo_full_name = gps.repo_full_name

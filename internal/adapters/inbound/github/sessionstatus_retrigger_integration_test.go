@@ -295,12 +295,14 @@ func TestSessionStatus_ReReviewThatCannotFireReadsSettledAtOnce(t *testing.T) {
 
 // TestSessionStatus_ReReviewFireAndStatusAgree runs the debounce's real
 // fire and the status's read over one fixture table -- the opt-in (on,
-// off, no repo_settings row) and the automatic re-review count around
-// sessionactor.ReviewAutoRetriggerBudget, every other condition set so the
+// off, no repo_settings row), the automatic re-review count around
+// sessionactor.ReviewAutoRetriggerBudget, and an administrator's
+// revocation of the repository (§31.4), every other condition set so the
 // fire would insert a turn -- and asserts they agree on every row: the
 // status reads the armed debounce as scheduled exactly when the fire then
 // inserts the review turn, and finished exactly when it declines. The
-// budget is the one constant both compare with.
+// budget is the one constant both compare with. A push to a revoked
+// repository's pull request never reads as scheduled.
 func TestSessionStatus_ReReviewFireAndStatusAgree(t *testing.T) {
 	ctx := context.Background()
 	budget := int32(sessionactor.ReviewAutoRetriggerBudget)
@@ -309,14 +311,17 @@ func TestSessionStatus_ReReviewFireAndStatusAgree(t *testing.T) {
 		optedIn   bool
 		noSetting bool
 		count     int32
+		revoked   bool
 	}{
-		{"opted in, nothing spent", true, false, 0},
-		{"opted in, one re-review left", true, false, budget - 1},
-		{"opted in, budget spent", true, false, budget},
-		{"opted in, past the budget", true, false, budget + 1},
-		{"opted out, nothing spent", false, false, 0},
-		{"opted out, budget spent", false, false, budget},
-		{"no repo settings row", false, true, 0},
+		{"opted in, nothing spent", true, false, 0, false},
+		{"opted in, one re-review left", true, false, budget - 1, false},
+		{"opted in, budget spent", true, false, budget, false},
+		{"opted in, past the budget", true, false, budget + 1, false},
+		{"opted out, nothing spent", false, false, 0, false},
+		{"opted out, budget spent", false, false, budget, false},
+		{"no repo settings row", false, true, 0, false},
+		{"opted in, nothing spent, revoked by an administrator", true, false, 0, true},
+		{"opted in, one re-review left, revoked by an administrator", true, false, budget - 1, true},
 	} {
 		t.Run(row.name, func(t *testing.T) {
 			f := newRetriggerStatusFixture(ctx, t, row.optedIn)
@@ -328,6 +333,11 @@ func TestSessionStatus_ReReviewFireAndStatusAgree(t *testing.T) {
 					t.Fatalf("drop the repo settings row: %v", err)
 				}
 			}
+			if row.revoked {
+				if _, err := narvipg.NewRepoEntitlementRevocationStore(f.rig.pool).Revoke(ctx, f.repoFullName, pgtype.UUID{}, "frozen by an administrator"); err != nil {
+					t.Fatalf("revoke the repository: %v", err)
+				}
+			}
 			f.push(t, "sha-agreement-"+row.name)
 			if _, armed := f.debounceArmed(ctx, t); !armed {
 				t.Fatal("the synchronize webhook armed no debounce")
@@ -336,6 +346,9 @@ func TestSessionStatus_ReReviewFireAndStatusAgree(t *testing.T) {
 			statusCountsIt := got.Activity == restdtos.SessionActivityActivityScheduled
 			if !statusCountsIt && (got.Activity != restdtos.SessionActivityActivityFinished || !got.Settled) {
 				t.Fatalf("the status read %q settled %v, want scheduled or finished", got.Activity, got.Settled)
+			}
+			if row.revoked && statusCountsIt {
+				t.Fatalf("a push to a revoked repository's pull request read as scheduled: its re-review can only decline")
 			}
 
 			f.comeDue(ctx, t)
