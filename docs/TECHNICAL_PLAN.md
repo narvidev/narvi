@@ -749,6 +749,9 @@ Roles (global, one per user): **admin > maintainer > member > viewer**.
 | Manage automations, environments, repo/env secrets | ✓ | ✓ | — | — |
 | Edit review verdicts; re-trigger reviews; auto-approval eligibility config (§21) | ✓ | ✓ | — | — |
 | Integrations, global secrets, prompt-template activation, members & roles, per-repo auto-merge toggle (§21), sentinel auto-fix toggle (§17 — stricter than auto-merge since it ends in an unattended merge with no per-repo arming step, not a human Merge click), per-repo automatic re-review opt-in toggle (§24 — off by default, same admin-only row as the other automation-enabling toggles here), and — §40 — the per-repo autonomy level, spend cap and session-bound extension, and the platform-wide freeze (the level is a ceiling on the toggles in this row, so it is gated at least as strictly as any of them) | ✓ | — | — | — |
+| Revoke a repository's eligibility for new sessions, and restore it (§31.4) | ✓ | — | — | — |
+
+Revoking a repository's eligibility and restoring it are one admin-only action (`manage_repo_entitlement`), its status read included; a revocation binds every session-creation surface, pull-request mentions included, and the pending turns of the repository's existing sessions (§31.4).
 
 Stopping on own/joined sessions is owner decision O1 (default taken 2026-09-29, open to revision): a member can already start and prompt that work, and a stop only ever reduces what runs. Stopping a session also stops every session it started (§3.3), authorized by the one check on the session named. Resuming stays admin/maintainer only; in practice a person resumes a stopped session by prompting it, approving its plan, or approving or revising a workflow step awaiting their decision, each under its own permission (§3.3).
 
@@ -5131,6 +5134,54 @@ exists; `sessions.repos` has a fundamentally different trust grade than
 is NOT blocked**: its repository identity descends from the verified payload, which is precisely
 why it is the flagship first consumer (§31.6).
 
+**Un-entitlement: explicit operator revocation (Step 152).** Eligibility only grows: a repository
+becomes eligible when a verified webhook writes its first `github_pr_sessions` row, and nothing
+removes one -- not an uninstalled App, not a deleted repository. An administrator closes a
+repository instead by revoking it, the only shape that stays true with no network: a live
+installation re-read fails open or blocks creation whenever GitHub is unreachable, and an age
+expiry leaves a revoked repository eligible until its deadline.
+
+- **The fact.** A row in `repo_entitlement_revocations`, keyed by the exact `repo_full_name`
+  `github_pr_sessions` holds (no case-folding), with when, by whom and a required reason of 1 to
+  500 characters. Restore deletes the row. History lives in `audit_log` (`repo_entitlement.revoked`,
+  `repo_entitlement.restored`, each written in the transaction of its change, §13.3). Restore only
+  lifts the revocation: it never makes eligible a repository the deployment does not already know.
+- **One read.** Eligibility and revocation are read in one statement (`ReadRepoEntitlement`,
+  `GitHubPRSessionStore.RepoEntitlement`); no store method returns "known" without "revoked".
+  `authz.AuthorizeRepo` refuses a revoked repository before it looks at whether it is known, with an
+  error that unwraps to both `ErrRepoForbidden` and `ErrRepoRevoked`.
+- **Every creation path.** REST and MCP answer 403 `repository entitlement revoked by an
+  administrator: <repo>`, distinct from the `repository not entitled` of an unknown repository;
+  Slack and Linear acknowledge in words naming who closed the repository and who reopens it, never
+  "not configured"; automations record a failed run. GitHub-originated sessions keep their exemption
+  from "known" (a fork pull request's clone URL names the fork) but not from revocation, read for the
+  pull request's base repository and for the clone URL: a new mention, a follow-up on an existing
+  review session, a label re-trigger and a fork's mention are all refused silently, the delivery
+  claim kept; a sentinel auto-fix is skipped terminally, before its branch is created. Every refusal
+  is counted (`session_repo_entitlement_denied_total{reason="revoked"}`) and audited.
+- **Work in flight.** A turn already processing finishes, push, pull request and verdict included.
+  Every pending turn, whatever produced it, is refused where every turn passes before reaching a
+  sandbox -- at spawn and at dispatch, the §32.4 placements, in every rollout mode -- reading the
+  session's clone URLs and its pull-request claims (a review session's, a sentinel child's), and ends
+  forward with a banner and, for a review attempt, a check closed as not assessed
+  (`repo_entitlement_revoked`). A revocation read that fails at dispatch fails the turn as an
+  undelivered prompt and backs off, never as a refusal. Live sandboxes idle out; automations are not
+  paused; pending outbox deliveries, which report work already done, go out.
+- **The action.** `GET`, `POST .../revoke` and `POST .../restore` under
+  `/api/repos/{owner}/{repo}/entitlement`, admin-only (`manage_repo_entitlement`, §13.3), 404 for
+  an unknown repository, 409 for a second revoke or a restore of a repository not revoked. The
+  repository-scoped admin routes scope on "known" alone, so a revoked repository stays reachable --
+  which is how it is restored. The Repository settings screen carries the card; there is no MCP tool
+  and no CLI.
+- **The guard.** `internal/ops`' `ScanRepoEntitlementReads` fails the build when a reader could skip
+  revocation: a generated revocation read called outside the store, `RepoEntitlement` called from a
+  function its allowlist does not name, an `authz.RepoAdmission` literal without `Revoked:`, or a
+  named query reading `github_pr_sessions` in an `EXISTS` without the revocations table.
+- **Rollback re-opens.** A binary without the migration never reads the table: during a rolling
+  deploy old pods still admit, and after a rollback -- forced back with the rows kept, or the down,
+  which drops them -- every revoked repository is eligible again until this release is redeployed
+  (and, after the down, each is revoked again).
+
 ### 31.5 The index and the ports
 
 **Ship mode B without pgvector — the decisive fact is quantitative, and it falls out of the
@@ -5576,6 +5627,8 @@ rather than belonging to mode A alone.)
    layers hold "one query, one repo" but not "the right repo for this caller"; `kb_search` and
    the export stay blocked, and the webhook-path consumer is the only one running. The
    in-flight four-handler fix closes today's known leaks; it does not create the predicate.
+   Once delivered, the predicate is no longer one that only ever opens: an administrator's
+   revocation (§31.4, "Un-entitlement") closes a repository again, on every surface.
 2. **The semantic false precedent has no structural kill** (§31.7) — bounded and decayed by
    G4/G5/G6, not eliminated. Anyone extending the corpus to new content types re-inherits this
    limit and must re-argue it.
