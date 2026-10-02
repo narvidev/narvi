@@ -323,7 +323,8 @@ func scanRepoEntitlementFile(fset *token.FileSet, file *ast.File, rel string, is
 					return true
 				}
 				// A slice, array or map of authz.RepoAdmission (or of
-				// pointers to it) whose element literals elide their type.
+				// pointers to it) whose element literals elide their type:
+				// an elided *T element is a bare {...} in the AST too.
 				var elem ast.Expr
 				switch t := n.Type.(type) {
 				case *ast.ArrayType:
@@ -337,9 +338,6 @@ func scanRepoEntitlementFile(fset *token.FileSet, file *ast.File, rel string, is
 				for _, elt := range n.Elts {
 					if kv, ok := elt.(*ast.KeyValueExpr); ok {
 						elt = kv.Value
-					}
-					if u, ok := elt.(*ast.UnaryExpr); ok && u.Op == token.AND {
-						elt = u.X
 					}
 					if lit, ok := elt.(*ast.CompositeLit); ok && lit.Type == nil {
 						checkLiteral(lit)
