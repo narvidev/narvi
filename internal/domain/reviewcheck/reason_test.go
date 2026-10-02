@@ -7,7 +7,7 @@ import (
 
 func TestComputeOutputWithReason(t *testing.T) {
 	phases := []Phase{PhaseQueued, PhaseRunning, PhaseStale, PhaseTerminalAssessed, PhaseTerminalNotAssessed, Phase("bogus")}
-	reasons := []NotAssessedReason{"", NotAssessedPersonalLinkOnly, NotAssessedRolloutNotEnrolled, NotAssessedSubstrateUnsupported, NotAssessedPromptNotDelivered, NotAssessedReason("a_reason_this_binary_does_not_know")}
+	reasons := []NotAssessedReason{"", NotAssessedPersonalLinkOnly, NotAssessedRolloutNotEnrolled, NotAssessedSubstrateUnsupported, NotAssessedPromptNotDelivered, NotAssessedRepoEntitlementRevoked, NotAssessedReason("a_reason_this_binary_does_not_know")}
 	for _, p := range phases {
 		for _, r := range reasons {
 			t.Run(string(p)+"/"+string(r), func(t *testing.T) {
@@ -20,7 +20,7 @@ func TestComputeOutputWithReason(t *testing.T) {
 					t.Errorf("summary = %q, want it to begin with ComputeOutput's %q", got.Summary, base.Summary)
 				}
 				extended := got.Summary != base.Summary
-				named := r == NotAssessedPersonalLinkOnly || r == NotAssessedRolloutNotEnrolled || r == NotAssessedSubstrateUnsupported || r == NotAssessedPromptNotDelivered
+				named := r == NotAssessedPersonalLinkOnly || r == NotAssessedRolloutNotEnrolled || r == NotAssessedSubstrateUnsupported || r == NotAssessedPromptNotDelivered || r == NotAssessedRepoEntitlementRevoked
 				wantExtended := p == PhaseTerminalNotAssessed && named
 				if extended != wantExtended {
 					t.Errorf("summary extended = %v, want %v (summary %q)", extended, wantExtended, got.Summary)
@@ -56,6 +56,24 @@ func TestComputeOutputWithReason_SpawnRefusalsNameTheCauseAndTheRemedy(t *testin
 			if !strings.Contains(got.Summary, want) {
 				t.Errorf("%s: summary = %q, want it to contain %q", tc.reason, got.Summary, want)
 			}
+		}
+	}
+}
+
+// TestReasonExplanation_RepoEntitlementRevoked pins the sentence a review
+// check closed by an administrator's revocation adds (technical plan
+// §31.4): who stopped the review, and what lifts it. It never reads as an
+// installation or configuration problem.
+func TestReasonExplanation_RepoEntitlementRevoked(t *testing.T) {
+	got := ComputeOutputWithReason(PhaseTerminalNotAssessed, NotAssessedRepoEntitlementRevoked)
+	for _, want := range []string{"An administrator of this deployment revoked new work on its repository", "the review was not run", "An administrator can restore the repository, then request the review again."} {
+		if !strings.Contains(got.Summary, want) {
+			t.Errorf("summary = %q, want it to contain %q", got.Summary, want)
+		}
+	}
+	for _, banned := range []string{"installed", "configured", "access"} {
+		if strings.Contains(strings.ToLower(got.Summary), banned) {
+			t.Errorf("summary = %q, must not say %q", got.Summary, banned)
 		}
 	}
 }

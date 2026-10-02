@@ -26,8 +26,8 @@
 // endpoints that would gate on it; sessions.repos disqualified as
 // trivially self-serve at ordinary member privilege). This gate reuses
 // the IDENTICAL conclusion and the IDENTICAL signal --
-// GitHubPRSessionStore.RepoKnown -- rather than re-deriving a second,
-// possibly-drifting notion of "known repo": github_pr_sessions' only
+// GitHubPRSessionStore.RepoEntitlement's Known -- rather than re-deriving a
+// second, possibly-drifting notion of "known repo": github_pr_sessions' only
 // writer anywhere in this codebase is internal/adapters/inbound/github's
 // own HMAC-verified webhook ingress (coalesce.go), so bare row existence
 // is a sound, externally-verified proof this deployment is genuinely
@@ -45,12 +45,32 @@
 //
 // GitHub-originated sessions (req.SpawnSource == github --
 // coalesce.go's own WINNER path, and outboxworker's own sentinel-auto-fix
-// child sessions spawned from one) are EXEMPT from this gate entirely,
-// not merely coincidentally passing -- see ResolveRepoEntitlement's own
-// doc comment for why re-deriving identity from req.Repos[i].Url would be
-// actively WRONG there (a cross-repo/fork PR's own clone URL is
-// deliberately the fork, never the github_pr_sessions claim key), not
-// just redundant.
+// child sessions spawned from one) are EXEMPT from the "known" half of
+// this gate, not merely coincidentally passing -- see
+// ResolveRepoEntitlement's own doc comment for why re-deriving identity
+// from req.Repos[i].Url would be actively WRONG there (a cross-repo/fork
+// PR's own clone URL is deliberately the fork, never the
+// github_pr_sessions claim key), not just redundant. They are NOT exempt
+// from an administrator's revocation: see ResolveGitHubRepoEntitlement.
+//
+// # Un-entitlement: an administrator's revocation (§31.4)
+//
+// Eligibility only ever grows -- nothing removes a github_pr_sessions row.
+// An administrator closes a repository instead by revoking it
+// (repo_entitlement_revocations, POST /api/repos/{owner}/{repo}/
+// entitlement/revoke, repoentitlement.go). Every read here takes the
+// revocation in the SAME statement as eligibility
+// (GitHubPRSessionStore.RepoEntitlement), and authz.AuthorizeRepo refuses a
+// revoked repository before it looks at whether the repository is known.
+// The refusal says so in its own words ("repository entitlement revoked by
+// an administrator: ..."), with CreateSessionError.RepoEntitlementRevoked
+// set beside RepoEntitlementDenied, so a caller that only checks the
+// latter still treats it as permanent. A revocation that commits between
+// this resolution and the caller's insert leaves a session that can never
+// run: the session actor reads the revocation again before every spawn and
+// every dispatch (internal/app/sessionactor, refuseIfRepoRevoked and
+// revocationRefusalForDispatch), so no in-transaction re-read is needed
+// here.
 //
 // # Why this predicate lives in domain/authz, not only here
 //
@@ -87,7 +107,7 @@
 // This function used to be checkRepoEntitlementGate, taking a `tx pgx.Tx`
 // parameter and called from INSIDE CreateSessionOnTx, on the SAME
 // transaction the caller was already holding open. That was correct for
-// the entitlement READ itself (prSessions.WithTx(tx).RepoKnown -- same
+// the entitlement READ itself (a prSessions.WithTx(tx) read -- same
 // connection, same tx, free), but wrong for the denial AUDIT WRITE:
 // denyRepoEntitlement's own write always ran through the plain,
 // POOL-backed auditLog store (never .WithTx(tx)) -- necessary so that row
@@ -129,6 +149,7 @@ package httpapi
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"sync"
 
@@ -158,7 +179,7 @@ var sessionRepoEntitlementDeniedTotalCounter = sync.OnceValue(newSessionRepoEnti
 func newSessionRepoEntitlementDeniedTotalCounter() metric.Int64Counter {
 	c, err := otel.Meter(repoEntitlementGateMeterName).Int64Counter(
 		"session_repo_entitlement_denied_total",
-		metric.WithDescription("Count of every session-creation attempt refused by §31.4's per-repository entitlement predicate (authz.AuthorizeRepo) because a named repo has never been confirmed known to this deployment (github_pr_sessions, via GitHubPRSessionStore.RepoKnown) -- ResolveRepoEntitlement's own session-creation-time denials. Tagged by the \"spawn_source\" attribute. A misconfigured entitlement is loud here, never silent: a sustained nonzero rate on a repo an operator believes IS connected means it has not yet had a GitHub PR mention (see ResolveRepoEntitlement's own doc comment), not that Narvi is broken."),
+		metric.WithDescription("Count of every session-creation attempt refused by §31.4's per-repository entitlement predicate (authz.AuthorizeRepo), with stage \"create\": ResolveRepoEntitlement's and ResolveGitHubRepoEntitlement's own session-creation-time denials. It also counts every refusal the session actor makes because an administrator revoked an existing session's repository (internal/app/sessionactor registers the SAME instrument, with reason \"revoked\" and stage \"spawn\", \"dispatch\", \"resend\" for a prompt receipt re-send, or \"auto_retrigger\" for an automatic re-review debounce firing dropped, one per push). Tagged by \"spawn_source\", \"stage\" and \"reason\": \"unknown\" for a named repo never confirmed known to this deployment (github_pr_sessions), \"revoked\" for one an administrator revoked (repo_entitlement_revocations). A misconfigured entitlement is loud here, never silent: a sustained nonzero \"unknown\" rate on a repo an operator believes IS connected means it has not yet had a GitHub PR mention (see ResolveRepoEntitlement's own doc comment), not that Narvi is broken; a \"revoked\" rate is work still arriving for a repository an administrator closed."),
 		metric.WithUnit("{denial}"),
 	)
 	if err != nil {
@@ -170,10 +191,39 @@ func newSessionRepoEntitlementDeniedTotalCounter() metric.Int64Counter {
 	return c
 }
 
+// repoEntitlementDenialStage is the stage attribute every denial counted
+// here carries: a session creation refused. The session actor counts its
+// own refusals of an existing session's work on the same instrument, each
+// with its own stage (internal/app/sessionactor's repoEntitlementStage
+// constants), so a dashboard of creation denials filters on this one.
+const repoEntitlementDenialStage = "create"
+
 // recordRepoEntitlementDenial increments the denial counter by one, tagged
-// by spawnSource -- mirrors recordRolloutRefusal's own identical shape.
-func recordRepoEntitlementDenial(ctx context.Context, spawnSource string) {
-	sessionRepoEntitlementDeniedTotalCounter().Add(ctx, 1, metric.WithAttributes(attribute.String("spawn_source", spawnSource)))
+// by spawnSource, reason (repoEntitlementDenialReason) and stage "create"
+// -- mirrors recordRolloutRefusal's own shape.
+func recordRepoEntitlementDenial(ctx context.Context, spawnSource, reason string) {
+	sessionRepoEntitlementDeniedTotalCounter().Add(ctx, 1, metric.WithAttributes(
+		attribute.String("spawn_source", spawnSource),
+		attribute.String("reason", reason),
+		attribute.String("stage", repoEntitlementDenialStage),
+	))
+}
+
+// The two values of a denial's "reason" -- the counter attribute and the
+// session.repo_entitlement_denied audit row's detail.
+const (
+	repoEntitlementDenialRevoked = "revoked"
+	repoEntitlementDenialUnknown = "unknown"
+)
+
+// repoEntitlementDenialReason names the refusal authz.AuthorizeRepo
+// returned: "revoked" when an administrator revoked the repository
+// (authz.ErrRepoRevoked), "unknown" otherwise.
+func repoEntitlementDenialReason(aerr error) string {
+	if errors.Is(aerr, authz.ErrRepoRevoked) {
+		return repoEntitlementDenialRevoked
+	}
+	return repoEntitlementDenialUnknown
 }
 
 // actorFromCreatedBy builds the authz.Actor AuthorizeRepo/RepoForbiddenError
@@ -232,9 +282,13 @@ type RepoEntitlementDecision struct {
 // NARVI_ROLLOUT_MODE -- so every named repo is resolved and checked on
 // every call, unconditionally.
 //
-// req.SpawnSource == github is EXEMPT, unconditionally, before any repo is
-// even iterated -- NOT a convenience short-circuit, a correctness
-// requirement. Two reasons, both load-bearing:
+// req.SpawnSource == github is EXEMPT from the "known" half of this
+// predicate, before any repo is even iterated -- NOT a convenience
+// short-circuit, a correctness requirement -- and is checked against an
+// administrator's revocation alone (resolveGitHubRepoEntitlement, with no
+// pull-request claim: the server-side GitHub callers name theirs through
+// ResolveGitHubRepoEntitlement). Two reasons for the exemption, both
+// load-bearing:
 //
 // What makes the exemption SAFE is a guard in another file, and the
 // dependency is worth naming because nothing here can observe it: the
@@ -245,9 +299,9 @@ type RepoEntitlementDecision struct {
 // coalesce's winner, the sentinel auto-fix child) set for itself from a
 // verified payload. Were that rejection ever relaxed, an authenticated
 // caller could name any repository, claim github provenance, and skip
-// this gate entirely -- the exact clone amplification it exists to close.
-// TestCreateSession_NonWebSpawnSource_Rejected is what holds that end;
-// its own doc comment points back here.
+// this gate's "known" check entirely -- the exact clone amplification it
+// exists to close. TestCreateSession_NonWebSpawnSource_Rejected is what
+// holds that end; its own doc comment points back here.
 //
 //  1. Trust: §31.4's own words are that "sessions.repos is lower-trust
 //     than github_pr_sessions.repo_full_name (verified webhook payload)" --
@@ -268,7 +322,7 @@ type RepoEntitlementDecision struct {
 //     own mention.RepoCloneURL doc comment: "head repo -- may be a fork;
 //     the repo to actually clone"), while github_pr_sessions is keyed on
 //     the PR's BASE/upstream repo instead (mention.RepoFullName's own doc
-//     comment: "the claim key"). Checking RepoKnown against the FORK's own
+//     comment: "the claim key"). Checking Known against the FORK's own
 //     owner/repo would find no row (a fork essentially never independently
 //     accumulates its own github_pr_sessions history) and wrongly deny
 //     EVERY fork-based PR review and every sentinel-auto-fix spawned from
@@ -282,9 +336,7 @@ type RepoEntitlementDecision struct {
 // order, stopping at the FIRST failure -- mirroring
 // validateCreateSessionRequest/rollout.Decide's own identical "report the
 // first failure, never attempt to collect every one at once" precedent.
-// Three ways a repo can fail this gate, each folded into authz.
-// RepoAdmission.Known == false (fail-closed) before AuthorizeRepo ever
-// runs:
+// Four ways a repo can fail this gate:
 //
 //  1. The repo's URL cannot be resolved to a trusted, host-verified
 //     owner/repo identity at all (resolveTrustedRepoFullName's own ok ==
@@ -292,14 +344,18 @@ type RepoEntitlementDecision struct {
 //     This is a DEMONSTRATED, permanent fact -- re-parsing the identical
 //     URL can never produce a different answer -- so it is treated
 //     IDENTICALLY to a genuinely unknown repo: denied, counted, audited.
-//  2. github_pr_sessions has never seen this exact owner/repo (RepoKnown
-//     returns false, no error). Also a demonstrated, permanent fact as of
-//     right now (it can change the moment a real GitHub PR mention lands),
-//     denied/counted/audited identically to case 1.
-//  3. The github_pr_sessions read itself fails for an infrastructure
-//     reason (a context cancellation, a query timeout, any other degraded-
-//     read condition) -- NOT a demonstrated policy fact, so this refuses
-//     THIS attempt (fail-closed never widens: the repo is never silently
+//  2. An administrator revoked the repo (RepoEntitlement's Revoked):
+//     denied, counted and audited with reason "revoked", whatever Known
+//     holds -- authz.AuthorizeRepo checks it first.
+//  3. github_pr_sessions has never seen this exact owner/repo
+//     (RepoEntitlement's Known is false). Also a demonstrated, permanent
+//     fact as of right now (it can change the moment a real GitHub PR
+//     mention lands), denied/counted/audited identically to case 1, with
+//     reason "unknown".
+//  4. The RepoEntitlement read itself fails for an infrastructure reason
+//     (a context cancellation, a query timeout, any other degraded-read
+//     condition) -- NOT a demonstrated policy fact, so this refuses THIS
+//     attempt (fail-closed never widens: the repo is never silently
 //     admitted) but returns 503, not 403, and records NEITHER the denial
 //     metric NOR an audit_log row -- mirroring checkRolloutGate's own
 //     "fail-closed and terminal are different properties" split exactly
@@ -315,14 +371,10 @@ func ResolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 // Warn lines, denial counter and denial audit row are labelled with chosen
 // by the caller (§43.1): CreateSessionCore passes the source the session
 // would record, which is mcp for a create bridged from an MCP tool even
-// though its body says web. The label decides nothing: the github exemption
+// though its body says web. The label decides nothing: the github branch
 // still reads req.SpawnSource, so a create over MCP passes exactly the gate
 // a web create does.
 func resolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSessionStore, auditLog *postgres.AuditLogStore, createdBy pgtype.UUID, req restdtos.CreateSessionRequest, spawnSource string) (RepoEntitlementDecision, *CreateSessionError) {
-	if req.SpawnSource == restdtos.CreateSessionRequestSpawnSourceGithub {
-		return RepoEntitlementDecision{admitted: true}, nil
-	}
-
 	logger := platform.Logger(ctx)
 
 	// A nil prSessions is a caller-wiring defect (every real caller of
@@ -330,11 +382,13 @@ func resolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 	// doc comment), never a legitimate "no repos to check" signal --
 	// exactly the "actor whose entitlement cannot be determined" case this
 	// Step's own brief names explicitly. Fails closed the SAME way a
-	// genuine RepoKnown read error does (503, no metric, no audit row --
-	// this is an infrastructure/configuration defect, not a demonstrated
-	// policy denial) rather than a nil-pointer panic: a missing dependency
-	// must degrade like every other degraded-read case in this codebase,
-	// never crash the process that was about to create a session.
+	// genuine RepoEntitlement read error does (503, no metric, no audit
+	// row -- this is an infrastructure/configuration defect, not a
+	// demonstrated policy denial) rather than a nil-pointer panic: a
+	// missing dependency must degrade like every other degraded-read case
+	// in this codebase, never crash the process that was about to create a
+	// session. Checked before the github branch too: that branch reads
+	// revocations.
 	if prSessions == nil {
 		logger.Error("httpapi: repo entitlement gate: prSessions is nil; failing closed (treating as not known)",
 			"spawn_source", spawnSource)
@@ -344,6 +398,10 @@ func resolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 		}
 	}
 
+	if req.SpawnSource == restdtos.CreateSessionRequestSpawnSourceGithub {
+		return resolveGitHubRepoEntitlement(ctx, prSessions, auditLog, createdBy, req, "", spawnSource)
+	}
+
 	actor := actorFromCreatedBy(createdBy)
 
 	for _, repo := range req.Repos {
@@ -351,20 +409,23 @@ func resolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 		if !resolved {
 			logger.Warn("httpapi: repo entitlement gate: repo url could not be resolved to a trusted, host-verified owner/repo identity; treating as not known",
 				"url", repo.Url, "spawn_source", spawnSource)
-			return RepoEntitlementDecision{}, denyRepoEntitlement(ctx, auditLog, createdBy, actor, authz.RepoAdmission{FullName: repo.Url, Known: false}, spawnSource)
+			// A URL that names no repository is neither known nor
+			// revocable: case 1 above, refused as unknown.
+			unresolved := authz.RepoAdmission{FullName: repo.Url, Known: false, Revoked: false}
+			return RepoEntitlementDecision{}, denyRepoEntitlement(ctx, auditLog, createdBy, actor, unresolved.FullName, authz.AuthorizeRepo(actor, unresolved), spawnSource)
 		}
 
 		// Plain, pool-backed read -- deliberately not .WithTx(tx): no
 		// transaction is open at any point during this resolver's own
 		// execution (this file's own top doc comment, "Defect-1 audit
-		// fix"), so there is no tx left to scope this query to. A single,
-		// ordinary pooled connection is acquired and released for this one
-		// query, exactly like any other standalone read in this codebase.
-		known, err := prSessions.RepoKnown(ctx, fullName)
+		// fix"), so there is no tx left to scope this query to. One
+		// statement reads both facts (§31.4), so Known is never read
+		// without Revoked.
+		facts, err := prSessions.RepoEntitlement(ctx, fullName)
 		if err != nil {
-			// Case 3 above -- fail-closed, but NOT a demonstrated policy
+			// Case 4 above -- fail-closed, but NOT a demonstrated policy
 			// outcome. See this function's own doc comment.
-			logger.Warn("httpapi: repo entitlement gate: read github_pr_sessions failed; failing closed (treating as not known)",
+			logger.Warn("httpapi: repo entitlement gate: read repository entitlement failed; failing closed (treating as not known)",
 				"repo", fullName, "error", err, "spawn_source", spawnSource)
 			return RepoEntitlementDecision{}, &CreateSessionError{
 				Status:  http.StatusServiceUnavailable,
@@ -372,8 +433,99 @@ func resolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 			}
 		}
 
-		if aerr := authz.AuthorizeRepo(actor, authz.RepoAdmission{FullName: fullName, Known: known}); aerr != nil {
-			return RepoEntitlementDecision{}, denyRepoEntitlement(ctx, auditLog, createdBy, actor, authz.RepoAdmission{FullName: fullName, Known: known}, spawnSource)
+		if aerr := authz.AuthorizeRepo(actor, authz.RepoAdmission{FullName: fullName, Known: facts.Known, Revoked: facts.Revoked}); aerr != nil {
+			return RepoEntitlementDecision{}, denyRepoEntitlement(ctx, auditLog, createdBy, actor, fullName, aerr, spawnSource)
+		}
+	}
+
+	return RepoEntitlementDecision{admitted: true}, nil
+}
+
+// ResolveGitHubRepoEntitlement is ResolveRepoEntitlement for a session a
+// GitHub-originated server-side path creates -- coalesce.go's mention
+// (both its WINNER and REUSE branches stop on a refusal here) and the
+// sentinel auto-fix child (outboxworker) -- whose request carries
+// spawnSource github. claimRepoFullName is the pull request's BASE
+// repository, the github_pr_sessions claim key the verified payload named:
+// for a fork pull request req.Repos names the fork, which an
+// administrator's revocation of the base repository would never match.
+//
+// Only revocation applies to this source (§31.4). The verified payload is
+// the admission, so the claim and every repository req.Repos names are
+// admitted unless an administrator revoked one of them: the claim is read
+// first, then each URL that resolves to a trusted owner/repo (a URL that
+// resolves to none can match no revocation). A revoked one is denied,
+// counted and audited with reason "revoked", exactly as for every other
+// source. A read error fails closed with 503, like ResolveRepoEntitlement's
+// own.
+//
+// An empty claimRepoFullName fails closed with 503: every caller of this
+// function has one, so an empty one is a wiring defect, never "nothing to
+// check". A request whose spawnSource is not github never takes the GitHub
+// exemption from here: it is resolved by ResolveRepoEntitlement's own full
+// predicate instead, which never admits more.
+func ResolveGitHubRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSessionStore, auditLog *postgres.AuditLogStore, createdBy pgtype.UUID, req restdtos.CreateSessionRequest, claimRepoFullName string) (RepoEntitlementDecision, *CreateSessionError) {
+	spawnSource := string(req.SpawnSource)
+	if req.SpawnSource != restdtos.CreateSessionRequestSpawnSourceGithub {
+		return resolveRepoEntitlement(ctx, prSessions, auditLog, createdBy, req, spawnSource)
+	}
+	if claimRepoFullName == "" {
+		platform.Logger(ctx).Error("httpapi: repo entitlement gate: GitHub-originated request names no pull-request repository; failing closed",
+			"spawn_source", spawnSource)
+		return RepoEntitlementDecision{}, &CreateSessionError{
+			Status:  http.StatusServiceUnavailable,
+			Message: "repository entitlement could not be verified: no pull-request repository named",
+		}
+	}
+	return resolveGitHubRepoEntitlement(ctx, prSessions, auditLog, createdBy, req, claimRepoFullName, spawnSource)
+}
+
+// resolveGitHubRepoEntitlement is the GitHub-source branch both
+// ResolveGitHubRepoEntitlement (with the pull request's claim) and
+// ResolveRepoEntitlement (a github request with no claim, e.g.
+// CreateSessionForBot) take -- see ResolveGitHubRepoEntitlement's doc
+// comment.
+func resolveGitHubRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSessionStore, auditLog *postgres.AuditLogStore, createdBy pgtype.UUID, req restdtos.CreateSessionRequest, claimRepoFullName, spawnSource string) (RepoEntitlementDecision, *CreateSessionError) {
+	logger := platform.Logger(ctx)
+
+	if prSessions == nil {
+		logger.Error("httpapi: repo entitlement gate: prSessions is nil; failing closed",
+			"spawn_source", spawnSource)
+		return RepoEntitlementDecision{}, &CreateSessionError{
+			Status:  http.StatusServiceUnavailable,
+			Message: "repository entitlement could not be verified: entitlement store unavailable",
+		}
+	}
+
+	actor := actorFromCreatedBy(createdBy)
+
+	names := make([]string, 0, len(req.Repos)+1)
+	if claimRepoFullName != "" {
+		names = append(names, claimRepoFullName)
+	}
+	for _, repo := range req.Repos {
+		fullName, resolved := resolveTrustedRepoFullName(repo.Url)
+		if !resolved || fullName == claimRepoFullName {
+			continue
+		}
+		names = append(names, fullName)
+	}
+
+	for _, fullName := range names {
+		facts, err := prSessions.RepoEntitlement(ctx, fullName)
+		if err != nil {
+			logger.Warn("httpapi: repo entitlement gate: read repository entitlement failed; failing closed",
+				"repo", fullName, "error", err, "spawn_source", spawnSource)
+			return RepoEntitlementDecision{}, &CreateSessionError{
+				Status:  http.StatusServiceUnavailable,
+				Message: "repository entitlement could not be verified: " + fullName,
+			}
+		}
+		// Known: true -- for this source the verified webhook payload is
+		// the admission (ResolveRepoEntitlement's doc comment, "Trust" and
+		// "Correctness"); only an administrator's revocation refuses.
+		if aerr := authz.AuthorizeRepo(actor, authz.RepoAdmission{FullName: fullName, Known: true, Revoked: facts.Revoked}); aerr != nil {
+			return RepoEntitlementDecision{}, denyRepoEntitlement(ctx, auditLog, createdBy, actor, fullName, aerr, spawnSource)
 		}
 	}
 
@@ -381,10 +533,14 @@ func resolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 }
 
 // denyRepoEntitlement renders a genuine, DEMONSTRATED entitlement denial
-// (cases 1/2 in ResolveRepoEntitlement's own doc comment) into the
-// side effects §31.4 explicitly requires -- a Warn log, the denial
-// counter, and an audit_log row -- and the *CreateSessionError every
-// caller already knows how to propagate.
+// (cases 1-3 in ResolveRepoEntitlement's own doc comment) into the side
+// effects §31.4 explicitly requires -- a Warn log, the denial counter, and
+// an audit_log row, each naming the reason (repoEntitlementDenialReason of
+// aerr, authz.AuthorizeRepo's refusal) -- and the *CreateSessionError every
+// caller already knows how to propagate. A revoked repository answers
+// "repository entitlement revoked by an administrator: <repo>" with
+// RepoEntitlementRevoked set beside RepoEntitlementDenied; any other,
+// "repository not entitled: <repo>".
 //
 // The audit_log write deliberately does NOT run on any transaction: this
 // function runs entirely from ResolveRepoEntitlement, called by every
@@ -404,22 +560,32 @@ func resolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 // side channel failing must never flip an already-correct 403 into a
 // 500, nor -- the opposite, more dangerous mistake -- ever let the
 // caller through because a logging nicety could not be written.
-func denyRepoEntitlement(ctx context.Context, auditLogStore *postgres.AuditLogStore, createdBy pgtype.UUID, actor authz.Actor, admission authz.RepoAdmission, spawnSource string) *CreateSessionError {
+func denyRepoEntitlement(ctx context.Context, auditLogStore *postgres.AuditLogStore, createdBy pgtype.UUID, actor authz.Actor, repoFullName string, aerr error, spawnSource string) *CreateSessionError {
 	logger := platform.Logger(ctx)
+	reason := repoEntitlementDenialReason(aerr)
 	logger.Warn("httpapi: repo entitlement gate: session creation refused, repo not entitled",
-		"repo", admission.FullName, "spawn_source", spawnSource, "actor_user_id", actor.UserID)
+		"repo", repoFullName, "reason", reason, "spawn_source", spawnSource, "actor_user_id", actor.UserID)
 
-	recordRepoEntitlementDenial(ctx, spawnSource)
+	recordRepoEntitlementDenial(ctx, spawnSource, reason)
 
-	if err := auditlog.Record(ctx, auditLogStore, createdBy, "session.repo_entitlement_denied", "repo", admission.FullName, map[string]any{
+	if err := auditlog.Record(ctx, auditLogStore, createdBy, "session.repo_entitlement_denied", "repo", repoFullName, map[string]any{
 		"spawn_source": spawnSource,
+		"reason":       reason,
 	}); err != nil {
-		logger.Error("httpapi: repo entitlement gate: record denial audit log failed", "error", err, "repo", admission.FullName)
+		logger.Error("httpapi: repo entitlement gate: record denial audit log failed", "error", err, "repo", repoFullName)
 	}
 
+	if reason == repoEntitlementDenialRevoked {
+		return &CreateSessionError{
+			Status:                 http.StatusForbidden,
+			Message:                "repository entitlement revoked by an administrator: " + repoFullName,
+			RepoEntitlementDenied:  true,
+			RepoEntitlementRevoked: true,
+		}
+	}
 	return &CreateSessionError{
 		Status:                http.StatusForbidden,
-		Message:               "repository not entitled: " + admission.FullName,
+		Message:               "repository not entitled: " + repoFullName,
 		RepoEntitlementDenied: true,
 	}
 }

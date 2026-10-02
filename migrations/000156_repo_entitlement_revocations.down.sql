@@ -1,0 +1,30 @@
+-- Reverses this migration's up file. Every revocation goes with the table:
+-- EACH REVOKED REPOSITORY BECOMES ELIGIBLE FOR SESSION CREATION AGAIN.
+-- Record them first:
+--   SELECT repo_full_name, revoked_at, revoked_by, reason
+--   FROM repo_entitlement_revocations;
+-- and revoke them again once a release that carries this migration is
+-- deployed. Their history stays in audit_log (repo_entitlement.revoked,
+-- repo_entitlement.restored).
+--
+-- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary
+-- without this migration. Do not run it against live pods of a binary that
+-- carries it, for two reasons:
+--   - Every eligibility read of that binary names this table. After this
+--     down each session creation fails closed with 503 (SQLSTATE 42P01,
+--     relation does not exist, on ReadRepoEntitlement), and each turn
+--     dispatch fails its turn as an undelivered prompt, until the older
+--     binary replaces the pod.
+--   - A pod that carries this migration and restarts before the older
+--     binary replaces it applies it again at boot -- an empty table, every
+--     revocation already gone -- which locks the older binary out again
+--     ("no migration found for version 156").
+-- Guarded: IF EXISTS, so it also runs on a database a rollback already
+-- brought back to 155 with the table kept (`migrate force 155`, the up
+-- file's "Rolling back") and then forced up again.
+-- Locks: dropping the table drops its foreign key's triggers on users, so
+-- the drop takes ACCESS EXCLUSIVE on users -- reads included -- for the
+-- file's one implicit transaction, an instant once granted, waiting behind
+-- any open transaction that touched users. With the control plane scaled
+-- to zero, as above, nothing is waiting.
+DROP TABLE IF EXISTS repo_entitlement_revocations;

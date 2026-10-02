@@ -541,7 +541,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 
 	// §31.4: CreateSessionOnTx's own entitlement gate (ResolveRepoEntitlement,
 	// repoentitlementgate.go) now requires every named repo to be known to
-	// this deployment (github_pr_sessions, via GitHubPRSessionStore.RepoKnown)
+	// this deployment (github_pr_sessions, via GitHubPRSessionStore.RepoEntitlement)
 	// for every spawnSource other than github -- and POST /api/sessions
 	// (the ONLY REST session-creation surface this rig's own router mounts)
 	// hard-rejects any spawnSource other than "web" (create.go's own audit
@@ -884,6 +884,16 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		shadowOperatorReads := narvipg.NewShadowOperatorReadStore(rig.pool)
 		r.Get("/", httpapi.GetShadowLedger(shadowLedgerStore, shadowOperatorReads, rig.repoSettings, rig.prSessions))
 		r.Post("/activate", httpapi.PostActivateShadowLedger(shadowLedgerStore, shadowOperatorReads, rig.repoSettings, rig.auditLog, rig.prSessions))
+	})
+	// /api/repos/{owner}/{repo}/entitlement[/revoke|/restore] (§31.4) --
+	// mounted behind auth.Middleware, exactly like controlplane/serve.go's
+	// own wiring (see repoentitlement.go's own doc comment).
+	router.Route("/api/repos/{owner}/{repo}/entitlement", func(r chi.Router) {
+		r.Use(auth.Middleware(rig.userSessions, rig.users))
+		revocations := narvipg.NewRepoEntitlementRevocationStore(rig.pool)
+		r.Get("/", httpapi.GetRepoEntitlement(revocations, rig.prSessions))
+		r.Post("/revoke", httpapi.PostRevokeRepoEntitlement(rig.pool, revocations, rig.auditLog, rig.prSessions))
+		r.Post("/restore", httpapi.PostRestoreRepoEntitlement(rig.pool, revocations, rig.auditLog, rig.prSessions))
 	})
 	// /api/integrations (§12.5 amendment) -- mounted behind
 	// auth.Middleware, exactly like cmd/control-plane/main.go's own

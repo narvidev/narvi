@@ -750,6 +750,37 @@ customer's source code at rest in full, and that is treated as a
 strictly narrower audience than the rest of this section's already
 admin-gated rows.
 
+**Repository entitlement** — an administrator can revoke a repository's
+eligibility for new sessions, with a reason, and restore it later (§31.4).
+While a repository is revoked, no surface can start a session on it —
+the web, MCP, Slack, Linear, a pull-request mention, an automation, a
+sentinel auto-fix — and its existing sessions' queued turns are ended
+before they reach a sandbox; a turn already running finishes, unless its
+sandbox restarts or stops while the repository is revoked, which ends it. The
+Repository settings screen shows the status and offers both actions. A
+revocation names the repository by its owner and name: if the repository
+is renamed or moved on the code host, revoke the new name too.
+
+```json narvi-command
+{"name": "Get a repo's entitlement status", "route": "GET /api/repos/{owner}/{repo}/entitlement"}
+```
+
+```json narvi-command
+{"name": "Revoke a repo's eligibility for new sessions", "route": "POST /api/repos/{owner}/{repo}/entitlement/revoke"}
+```
+
+```json narvi-command
+{"name": "Restore a repo's eligibility for new sessions", "route": "POST /api/repos/{owner}/{repo}/entitlement/restore"}
+```
+
+**Negative.** All three are **admin-only** (`manage_repo_entitlement`,
+§13.3), the status read included: a maintainer, member or viewer gets
+`403`. A repository this deployment has never seen a pull-request session
+for answers `404`. Revoking a repository already revoked, or restoring one
+that is not, answers `409`, and a second revoke keeps the first one's who,
+when and why. Restoring never makes a repository eligible that was not
+already: it only lifts the revocation.
+
 **Per-repo, per-environment, and global provider credentials / sandbox
 secrets** — the SAME four-verb CRUD shape at three different scopes
 (§27.1/§27.2); a value set at a narrower scope always wins over a wider

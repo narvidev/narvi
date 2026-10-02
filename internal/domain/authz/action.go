@@ -634,6 +634,23 @@ const (
 	// ActionViewShadowLedger's own doc comment immediately above for why
 	// this pair carries no §13.3 table row.
 	ActionActivateShadowLedger Action = "activate_shadow_ledger"
+
+	// -- Row 7: "Revoke a repository's eligibility for new sessions, and
+	// restore it" (§31.4, "Un-entitlement") -- admin only.
+
+	// ActionManageRepoEntitlement gates the whole lifecycle of an
+	// administrator's revocation: reading a repository's entitlement status
+	// (GET /api/repos/{owner}/{repo}/entitlement), revoking it (POST
+	// .../entitlement/revoke) and restoring it (POST .../entitlement/
+	// restore). One action for one lifecycle, on the precedent
+	// ActionAcceptReviewVerdict sets for its own accept/revoke pair: the
+	// three routes act on the same resource for the same role, so a second
+	// name would only ever track this one. Admin only, its own §13.3 row: a
+	// revocation closes every session-creation surface of a repository and
+	// stops its sessions' pending turns, a deployment-posture change at least
+	// as strong as the row-6 toggles, and restoring re-opens it, which is
+	// never a weaker decision than closing it.
+	ActionManageRepoEntitlement Action = "manage_repo_entitlement"
 )
 
 // AllActions is every recognized Action, in this file's own declaration
@@ -688,4 +705,5 @@ var AllActions = []Action{
 	ActionUnblockReleaseComposition,
 	ActionViewShadowLedger,
 	ActionActivateShadowLedger,
+	ActionManageRepoEntitlement,
 }

@@ -151,6 +151,14 @@ const (
 	// stranger or a real one that simply has not yet had a qualifying
 	// GitHub PR mention.
 	ackRepoNotEntitledText = "This deployment is not configured for this repository."
+
+	// ackRepoRevokedText (§31.4, "Un-entitlement") is posted instead of
+	// ackRepoNotEntitledText when the refusal is an administrator's
+	// revocation of the default repository (CreateSessionError.
+	// RepoEntitlementRevoked): the same terminal in-thread ack, worded so
+	// it names who closed the repository and who can reopen it, and never
+	// reads as an installation or configuration problem.
+	ackRepoRevokedText = "An administrator of this deployment revoked new sessions on this repository. An administrator can restore them."
 )
 
 // ackPlanAwaitingText is this batch's own honest reply (§8.1
@@ -1128,6 +1136,15 @@ func resolveOrClaimSession(ctx context.Context, deps Deps, logger *slog.Logger, 
 		// RolloutRefusal branch immediately above exactly: post
 		// ackRepoNotEntitledText and return {Skip: true}, true (claim
 		// kept, never released).
+		// A revocation (§31.4, "Un-entitlement") is the same terminal
+		// refusal, answered with ackRepoRevokedText instead.
+		if cerr.RepoEntitlementRevoked {
+			logger.Warn("slack: create bare session refused: repo entitlement revoked", "channel", channel, "thread_key", key)
+			if ackErr := postAckBounded(ctx, deps.SlackClient, deps.AckTimeout, channel, key, ackRepoRevokedText); ackErr != nil {
+				logger.Warn("slack: post revoked ack failed", "error", ackErr)
+			}
+			return sessionResolution{Skip: true}, true
+		}
 		if cerr.RepoEntitlementDenied {
 			logger.Warn("slack: create bare session refused: repo not entitled", "channel", channel, "thread_key", key)
 			if ackErr := postAckBounded(ctx, deps.SlackClient, deps.AckTimeout, channel, key, ackRepoNotEntitledText); ackErr != nil {

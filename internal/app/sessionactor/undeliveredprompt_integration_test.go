@@ -66,6 +66,16 @@ func TestEndedTurn_LeftRunningOnlyWhenItsPromptMayHaveArrived(t *testing.T) {
 			wantRunning: false,
 		},
 		{
+			name:        "a dispatch refused because an administrator revoked the repository",
+			endA:        refuseDispatchByRevocation,
+			wantRunning: false,
+		},
+		{
+			name:        "a dispatch failed because the revocation could not be read",
+			endA:        failDispatchOnRevocationRead,
+			wantRunning: false,
+		},
+		{
 			name:          "a turn that timed out, its agent not stopped",
 			endA:          timeOutProcessingTurn,
 			wantRunning:   true,
@@ -173,6 +183,57 @@ func refuseDispatchByRollout(ctx context.Context, t *testing.T, pool *pgxpool.Po
 	waitForTurnStatus(ctx, t, turns, created.ID, sqlcgen.TurnStatusFailed)
 	if commander.callCount() != 0 {
 		t.Fatalf("commander sends = %d, want 0 (a refused dispatch sends nothing)", commander.callCount())
+	}
+	return sessionID, created
+}
+
+// refuseDispatchByRevocation dispatches a pending turn whose repository an
+// administrator revoked while its sandbox is ready (technical plan §31.4):
+// the dispatch is refused before SendCommand is ever called.
+func refuseDispatchByRevocation(ctx context.Context, t *testing.T, pool *pgxpool.Pool) (pgtype.UUID, sqlcgen.Turn) {
+	t.Helper()
+	const repoFullName = "acme/undelivered-prompt-revoked"
+	revokeRepoForActorTest(ctx, t, pool, repoFullName)
+	return dispatchToReadySandboxSendingNothing(ctx, t, pool, repoFullName)
+}
+
+// failDispatchOnRevocationRead dispatches a pending turn to a ready sandbox
+// while the revocation read fails (the table hidden for the dispatch): the
+// turn fails as an undelivered prompt before SendCommand is ever called.
+func failDispatchOnRevocationRead(ctx context.Context, t *testing.T, pool *pgxpool.Pool) (pgtype.UUID, sqlcgen.Turn) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `ALTER TABLE repo_entitlement_revocations RENAME TO repo_entitlement_revocations_hidden`); err != nil {
+		t.Fatalf("hide revocations: %v", err)
+	}
+	defer func() {
+		if _, err := pool.Exec(context.Background(), `ALTER TABLE repo_entitlement_revocations_hidden RENAME TO repo_entitlement_revocations`); err != nil {
+			t.Errorf("restore revocations table: %v", err)
+		}
+	}()
+	return dispatchToReadySandboxSendingNothing(ctx, t, pool, "acme/undelivered-prompt-unreadable")
+}
+
+// dispatchToReadySandboxSendingNothing dispatches a pending turn of a
+// session on repoFullName to its ready sandbox, through the real actor in
+// open rollout mode, and waits for the turn to fail without a send.
+func dispatchToReadySandboxSendingNothing(ctx context.Context, t *testing.T, pool *pgxpool.Pool, repoFullName string) (pgtype.UUID, sqlcgen.Turn) {
+	t.Helper()
+	sessionID := createTestSessionWithRepos(ctx, t, pool, pgtype.UUID{}, "widgets", "https://github.com/"+repoFullName+".git", "")
+	readySandbox(ctx, t, pool, sessionID)
+	turns := narvipg.NewTurnStore(pool)
+	created := createPendingTurn(ctx, t, turns, sessionID, "review this")
+
+	commander := &fakeSendCommander{}
+	r := newDispatchTestRegistryWithCommanderAndRolloutMode(t, ctx, pool, commander, rollout.ModeOpen)
+	defer func() { _ = r.Shutdown() }()
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	sendEnsureDispatched(ctx, t, a)
+	waitForTurnStatus(ctx, t, turns, created.ID, sqlcgen.TurnStatusFailed)
+	if commander.callCount() != 0 {
+		t.Fatalf("commander sends = %d, want 0 (a refused or unverified dispatch sends nothing)", commander.callCount())
 	}
 	return sessionID, created
 }

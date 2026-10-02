@@ -22,6 +22,8 @@
 //	| Integrations, global secrets, template activation, members  |  ✓    |     —      |   —    |   —    |
 //	  & roles, sentinel auto-fix toggle, blockOnHighRisk (§8.2),
 //	  workflow binding activation (§25.11)
+//	| Revoke a repository's eligibility for new sessions, and      |  ✓    |     —      |   —    |   —    |
+//	  restore it (§31.4)
 //
 // # Design: one map, not two parallel checks
 //

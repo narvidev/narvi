@@ -502,8 +502,9 @@ func TestSessionActivityFacts_LiveEscalation(t *testing.T) {
 // review_retrigger_can_fire (technical plan §43.20, review round 4's P3):
 // true only when the session backs a pull request whose repository opted
 // in to the automatic re-review (no repo_settings row reads as off, as the
-// fire reads it) and whose automatic re-review count is below the budget
-// passed in -- the fire's two conditions a row can show. The budget is the
+// fire reads it), whose automatic re-review count is below the budget
+// passed in, and whose repository an administrator has not revoked
+// (§31.4) -- the fire's three conditions a row can show. The budget is the
 // argument, never a literal in the statement.
 func TestSessionActivityFacts_ReviewRetriggerCanFire(t *testing.T) {
 	ctx := context.Background()
@@ -517,17 +518,19 @@ func TestSessionActivityFacts_ReviewRetriggerCanFire(t *testing.T) {
 		settings *bool
 		count    int32
 		budget   int32
+		revoked  bool
 		want     bool
 	}{
-		{"not a pull request session", false, nil, 0, budget, false},
-		{"no repo settings row", true, nil, 0, budget, false},
-		{"opted out", true, ptrBool(false), 0, budget, false},
-		{"opted in, nothing spent", true, ptrBool(true), 0, budget, true},
-		{"opted in, one re-review left", true, ptrBool(true), budget - 1, budget, true},
-		{"opted in, budget spent", true, ptrBool(true), budget, budget, false},
-		{"opted in, past the budget", true, ptrBool(true), budget + 3, budget, false},
-		{"opted in, the budget passed in decides", true, ptrBool(true), 3, 4, true},
-		{"opted in, a smaller budget passed in is spent", true, ptrBool(true), 4, 4, false},
+		{"not a pull request session", false, nil, 0, budget, false, false},
+		{"no repo settings row", true, nil, 0, budget, false, false},
+		{"opted out", true, ptrBool(false), 0, budget, false, false},
+		{"opted in, nothing spent", true, ptrBool(true), 0, budget, false, true},
+		{"opted in, one re-review left", true, ptrBool(true), budget - 1, budget, false, true},
+		{"opted in, budget spent", true, ptrBool(true), budget, budget, false, false},
+		{"opted in, past the budget", true, ptrBool(true), budget + 3, budget, false, false},
+		{"opted in, the budget passed in decides", true, ptrBool(true), 3, 4, false, true},
+		{"opted in, a smaller budget passed in is spent", true, ptrBool(true), 4, 4, false, false},
+		{"opted in, nothing spent, revoked by an administrator", true, ptrBool(true), 0, budget, true, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -541,6 +544,11 @@ func TestSessionActivityFacts_ReviewRetriggerCanFire(t *testing.T) {
 			if tc.settings != nil {
 				if _, err := pool.Exec(ctx, `INSERT INTO repo_settings (repo_full_name, auto_retrigger_review_enabled) VALUES ($1, $2)`, repo, *tc.settings); err != nil {
 					t.Fatalf("seed repo settings: %v", err)
+				}
+			}
+			if tc.revoked {
+				if _, err := narvipg.NewRepoEntitlementRevocationStore(pool).Revoke(ctx, repo, pgtype.UUID{}, "frozen by an administrator"); err != nil {
+					t.Fatalf("revoke: %v", err)
 				}
 			}
 			facts, err := sessions.ActivityFacts(ctx, sessionID, tc.budget)

@@ -449,6 +449,53 @@ func sdkCreateSessionViewer(t *testing.T, rig *oauthRouterRig) {
 	}
 }
 
+// sdkCreateSessionRevokedRepo is TestOAuth_ProductionRouter's
+// CreateSession_RevokedRepo_ToolErrorNamesRevocation_SDKClient (technical
+// plan §31.4, "Un-entitlement"): a member's create over MCP naming a
+// repository an administrator revoked is a tool error carrying the very
+// text REST's 403 gives the member's cookie -- the revocation's own words,
+// never "not entitled" -- and starts nothing. It names a repository of its
+// own, so createRepo stays open for the other subtests on this router.
+func sdkCreateSessionRevokedRepo(t *testing.T, rig *oauthRouterRig) {
+	ctx := oauthTestCtx(t)
+	const revoked = "acme/revoked-over-mcp"
+	if err := narvipg.NewGitHubPRSessionStore(rig.pool).EnsureRow(ctx, revoked, 1); err != nil {
+		t.Fatalf("make %s known: %v", revoked, err)
+	}
+	if _, err := narvipg.NewRepoEntitlementRevocationStore(rig.pool).Revoke(ctx, revoked, pgtype.UUID{}, "frozen by an administrator"); err != nil {
+		t.Fatalf("revoke %s: %v", revoked, err)
+	}
+	flow := rig.connectSDKClient(ctx, t, nil)
+
+	args := createArguments("touch the revoked repo", "b1c2d3e4-f5a6-4b7c-8d9e-0f1a2b3c4d5e")
+	args["repos"] = []any{map[string]any{"name": "revoked-over-mcp", "url": "https://github.com/" + revoked}}
+	res, err := flow.session.CallTool(ctx, &sdkmcp.CallToolParams{Name: "narvi_create_session", Arguments: args})
+	if err != nil || !res.IsError || len(res.Content) != 1 {
+		t.Fatalf("create on a revoked repo: res %+v err %v, want isError", res, err)
+	}
+	text, _ := res.Content[0].(*sdkmcp.TextContent)
+	if text == nil || text.Text != "repository entitlement revoked by an administrator: "+revoked {
+		t.Fatalf("MCP refusal %+v, want the revocation named", res.Content[0])
+	}
+
+	var rest struct {
+		Error string `json:"error"`
+	}
+	body := []byte(fmt.Sprintf(`{"spawnSource":"web","title":"Delegated","prompt":"touch the revoked repo","repos":[{"name":"revoked-over-mcp","url":"https://github.com/%s","branch":null}],"modelId":null,"effort":null,"planMode":false}`, revoked))
+	if status := rig.doJSON(t, http.MethodPost, "/api/sessions", body, &rest, flow.cookie); status != http.StatusForbidden {
+		t.Fatalf("REST create by the member's cookie: status %d, want 403", status)
+	}
+	if text.Text != rest.Error {
+		t.Fatalf("MCP refusal %q, REST's %q -- want the same text", text.Text, rest.Error)
+	}
+	if n := rig.countOf(ctx, t, `SELECT count(*) FROM sessions WHERE created_by = $1`, flow.member.ID); n != 0 {
+		t.Fatalf("a create on a revoked repo started %d session(s)", n)
+	}
+	if n := rig.countOf(ctx, t, `SELECT count(*) FROM audit_log WHERE action = 'session.repo_entitlement_denied' AND resource_id = $1 AND detail_json->>'reason' = 'revoked' AND detail_json->>'spawn_source' = 'mcp'`, revoked); n != 1 {
+		t.Fatalf("revoked denial audit rows labelled mcp = %d, want 1", n)
+	}
+}
+
 // mintScopedBearer is mintBuildBearer with the grant's and the token's
 // scopes chosen, on a client of its own, returning the token, the grant's
 // id and its client's client_id.

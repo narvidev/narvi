@@ -34,6 +34,13 @@ const (
 	// delivered to its sandbox -- the send failed, or no live connection
 	// was there to take it -- so the attempt ended before the review ran.
 	NotAssessedPromptNotDelivered NotAssessedReason = "prompt_not_delivered"
+
+	// NotAssessedRepoEntitlementRevoked means the review was not run because
+	// an administrator of this deployment revoked new work on the pull
+	// request's repository (technical plan §31.4): its sandbox was not
+	// started, or its prompt not sent to a live one, and the attempt ended
+	// before it ran.
+	NotAssessedRepoEntitlementRevoked NotAssessedReason = "repo_entitlement_revoked"
 )
 
 // notAssessedExplanations is the sentence each named reason adds to a
@@ -50,6 +57,8 @@ var notAssessedExplanations = map[NotAssessedReason]string{
 		"change the provider or the environment, then request the review again.",
 	NotAssessedPromptNotDelivered: "Its prompt could not be delivered to the review's sandbox, so the review " +
 		"did not run. Requesting the review again sends it anew.",
+	NotAssessedRepoEntitlementRevoked: "An administrator of this deployment revoked new work on its repository, " +
+		"so the review was not run. An administrator can restore the repository, then request the review again.",
 }
 
 // ComputeOutputWithReason is ComputeOutput, with a not-assessed check's

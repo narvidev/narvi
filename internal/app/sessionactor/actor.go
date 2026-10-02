@@ -209,6 +209,16 @@ type Actor struct {
 	sandboxCommitted *sandboxStatusKey
 	sandboxWritten   *sandboxStatusKey
 
+	// revokedResendWarned is the turn and same-gen ready whose receipt
+	// re-send refuseResendIfRepoRevoked (repoentitlement.go) last refused
+	// because an administrator revoked the session's repository. That
+	// reconnect is left unclaimed, so every heartbeat's evaluation finds it
+	// again while the revocation lasts; this keeps the refusal to one WARN
+	// and one count per turn and ready. Single-goroutine, like
+	// pendingBroadcast; a successor actor starts without it, and logs the
+	// same refusal once more.
+	revokedResendWarned revokedResendKey
+
 	registry *Registry
 
 	// lockGen is the lock-connection generation this Actor's advisory lock

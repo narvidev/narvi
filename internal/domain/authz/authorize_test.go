@@ -381,6 +381,17 @@ func TestAuthorize_ExhaustiveMatrix(t *testing.T) {
 		{"maintainer cannot configure preview links even if ownedOrJoined", authz.RoleMaintainer, authz.ActionConfigurePreviewLinks, true, false},
 		{"member cannot configure preview links", authz.RoleMember, authz.ActionConfigurePreviewLinks, false, false},
 		{"viewer cannot configure preview links", authz.RoleViewer, authz.ActionConfigurePreviewLinks, false, false},
+
+		// Row 7 (§31.4): revoking and restoring a repository's eligibility
+		// for new sessions, and reading its status -- admin only, never
+		// widened by ownership.
+		{"admin manages repo entitlement", authz.RoleAdmin, authz.ActionManageRepoEntitlement, false, true},
+		{"maintainer cannot manage repo entitlement", authz.RoleMaintainer, authz.ActionManageRepoEntitlement, false, false},
+		{"maintainer cannot manage repo entitlement even if ownedOrJoined", authz.RoleMaintainer, authz.ActionManageRepoEntitlement, true, false},
+		{"member cannot manage repo entitlement", authz.RoleMember, authz.ActionManageRepoEntitlement, false, false},
+		{"member cannot manage repo entitlement even if ownedOrJoined", authz.RoleMember, authz.ActionManageRepoEntitlement, true, false},
+		{"viewer cannot manage repo entitlement", authz.RoleViewer, authz.ActionManageRepoEntitlement, false, false},
+		{"viewer cannot manage repo entitlement even if ownedOrJoined", authz.RoleViewer, authz.ActionManageRepoEntitlement, true, false},
 	}
 
 	for _, tc := range tests {

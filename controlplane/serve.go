@@ -2343,6 +2343,20 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		r.Post("/activate", httpapi.PostActivateShadowLedger(shadowLedger, shadowOperatorReads, repoSettingsStore, auditLogStore, githubPRSessionStore))
 	})
 
+	// /api/repos/{owner}/{repo}/entitlement[/revoke|/restore] (§31.4,
+	// "Un-entitlement"): an administrator's revocation of a repository's
+	// eligibility for new sessions, its restore, and its status -- see
+	// httpapi/repoentitlement.go's own doc comment. Gated by the admin-only
+	// authz.ActionManageRepoEntitlement (§13.3) and scoped like every other
+	// repository-scoped route, which still reaches a revoked repository.
+	repoEntitlementRevocationStore := postgres.NewRepoEntitlementRevocationStore(pool)
+	router.Route("/api/repos/{owner}/{repo}/entitlement", func(r chi.Router) {
+		r.Use(auth.Middleware(userSessionStore, userStore))
+		r.Get("/", httpapi.GetRepoEntitlement(repoEntitlementRevocationStore, githubPRSessionStore))
+		r.Post("/revoke", httpapi.PostRevokeRepoEntitlement(pool, repoEntitlementRevocationStore, auditLogStore, githubPRSessionStore))
+		r.Post("/restore", httpapi.PostRestoreRepoEntitlement(pool, repoEntitlementRevocationStore, auditLogStore, githubPRSessionStore))
+	})
+
 	// /api/repos/{owner}/{repo}/false-positive-patterns ("review:
 	// learned false-positive patterns", §22.4): the audit-view/retire
 	// lifecycle surface -- see httpapi/falsepositivepatterns.go's own doc

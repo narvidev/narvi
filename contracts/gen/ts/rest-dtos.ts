@@ -3959,3 +3959,47 @@ export interface CreateMCPClientRequest {
    */
   clientUri?: string;
 }
+/**
+ * GET /api/repos/{owner}/{repo}/entitlement response body, and the body POST .../entitlement/revoke and POST .../entitlement/restore return on success (technical plan §31.4, "Un-entitlement"): whether an administrator revoked this repository's eligibility for new sessions. A revoked repository is refused on every session-creation surface, and its sessions' pending turns are refused before they reach a sandbox, until an administrator restores it; a restore re-opens only what the deployment already knows (a repository it has seen a pull-request session for), it never grants eligibility. ADMIN-ONLY (authz.ActionManageRepoEntitlement, §13.3). Every field is present; the four describing a revocation are null when the repository is not revoked.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "RepoEntitlement".
+ */
+export interface RepoEntitlement {
+  /**
+   * The natural 'owner/repo' key, exactly as the deployment's pull-request sessions name it -- revocation matches it exactly, never case-folded.
+   */
+  repoFullName: string;
+  /**
+   * True while an administrator's revocation is in force: no new session may name this repository, and its sessions' pending turns are refused.
+   */
+  revoked: boolean;
+  /**
+   * When the revocation in force was made. Null when not revoked.
+   */
+  revokedAt: string | null;
+  /**
+   * The administrator who made it. Null when not revoked, or once that user no longer exists.
+   */
+  revokedByUserId: string | null;
+  /**
+   * That administrator's display name. Null when not revoked, or once that user no longer exists.
+   */
+  revokedByDisplayName: string | null;
+  /**
+   * Why it was revoked, as the administrator wrote it (1 to 500 characters). Null when not revoked.
+   */
+  reason: string | null;
+}
+/**
+ * POST /api/repos/{owner}/{repo}/entitlement/revoke's request body (technical plan §31.4). reason is trimmed and must be 1 to 500 characters: blank is refused 400 "reason is required", longer is refused 400 "reason must be at most 500 characters", and one holding a NUL character is refused 400 "reason must not contain a NUL byte". A repository already revoked is refused 409 and keeps its first revocation's who, when and why; one the deployment does not know is refused 404.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "RevokeRepoEntitlementRequest".
+ */
+export interface RevokeRepoEntitlementRequest {
+  /**
+   * Why new sessions on this repository are revoked: 1 to 500 characters after trimming, kept with the revocation and in the audit log.
+   */
+  reason: string;
+}

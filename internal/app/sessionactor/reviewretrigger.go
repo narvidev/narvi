@@ -409,6 +409,21 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 			return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
 		}
 
+		// §31.4: a repository an administrator revoked gets no automatic
+		// re-review -- read here, once the opt-in holds and before the
+		// GitHub fetch, the turn insert and the budget increment of phase
+		// 3, so its pushes spend none of the pull request's budget and no
+		// budget-exhausted notice is ever posted for reviews that never
+		// ran. pending_retrigger_head_sha is left as it is, like the
+		// opt-in-off branch above: it is only ever compared, never
+		// trusted, and the next push after a restore writes its own head
+		// and re-arms the timer, which then re-reviews normally.
+		if revoked, err := a.autoRetriggerRepoRevoked(ctx, tx, prSession.RepoFullName, prSession.PrNumber); err != nil {
+			return err
+		} else if revoked {
+			return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
+		}
+
 		// §24.3 step 2: the latest posted verdict for this PR, for the
 		// customer-consequential pair (§30.8) -- GetLatestNonShadow: a
 		// shadow-era "already reviewed" fact must never suppress a REAL

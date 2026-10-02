@@ -1068,6 +1068,19 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 				w.WriteHeader(http.StatusOK)
 				return
 			}
+			if errors.Is(err, ErrRepoEntitlementRevoked) {
+				// §31.4, "Un-entitlement": an administrator revoked this
+				// pull request's repository (coalesce.go's own
+				// ErrRepoEntitlementRevoked doc comment). The same
+				// permanent-denial idiom as the branch below -- 200, the
+				// delivery claim kept, nothing posted on the pull request
+				// -- checked first only so the log names the revocation.
+				// The refusal is already audited (session.
+				// repo_entitlement_denied, reason "revoked").
+				logger.Info("github: mention refused: repo entitlement revoked", "repo", m.RepoFullName, "pr_number", m.PRNumber)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
 			if errors.Is(err, ErrRepoEntitlementDenied) {
 				// §31.4's own permanent-denial idiom (Defect-2 audit fix):
 				// this repo failed the per-repository entitlement
@@ -1075,11 +1088,10 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 				// doc comment for the full "why". Mirrors
 				// ErrRolloutNotEnrolled's own "acknowledge without
 				// releasing the claim, post no reply" shape immediately
-				// above in every respect, including reachability: today
-				// this branch can never actually fire (the WINNER path's
-				// own spawn source is always exempt from this predicate),
-				// but is kept for the same defensive-symmetry reason
-				// ErrRolloutNotEnrolled's own check is.
+				// above in every respect. For a GitHub-originated session
+				// the only denial is a revocation, taken by the branch
+				// above; this one is kept for the same defensive-symmetry
+				// reason ErrRolloutNotEnrolled's own check is.
 				logger.Info("github: mention refused: repo not entitled", "repo", m.RepoFullName, "pr_number", m.PRNumber)
 				w.WriteHeader(http.StatusOK)
 				return
