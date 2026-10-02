@@ -82,10 +82,12 @@ import type {
   RebutFindingRequest,
   ReleaseManifestReadout,
   RepoDigestScope,
+  RepoEntitlement,
   RepoSettings,
   ReviewAnalytics,
   ReviewFinding,
   ReviewReadout,
+  RevokeRepoEntitlementRequest,
   RotateCloudIdentitySigningKeyResponse,
   SandboxSecret,
   Session,
@@ -578,6 +580,21 @@ export function getShadowLedger(owner: string, repo: string, signal?: AbortSigna
 /** postActivateShadowLedger calls POST /api/repos/:owner/:repo/shadow-ledger/activate -- the graduation gesture that flips this repository's own live_egress_enabled from shadow to live (§30.8). Admin-only server-side (authz.ActionActivateShadowLedger); a 409 ApiError means unhandled shadow-era rows still remain for this repository (§30.8's own quarantine) -- the caller's own message names the count. Returns the freshly-rebuilt ShadowLedgerSummary on success, so the caller never needs a follow-up GET. */
 export function postActivateShadowLedger(owner: string, repo: string, signal?: AbortSignal): Promise<ShadowLedgerSummary> {
   return request<ShadowLedgerSummary>(repoSettingsPath(owner, repo, 'shadow-ledger/activate'), { method: 'POST', signal })
+}
+
+/** getRepoEntitlement calls GET /api/repos/:owner/:repo/entitlement -- whether an administrator revoked this repository's eligibility for new sessions, and when, by whom and why. ADMIN-ONLY server-side (authz.ActionManageRepoEntitlement), the read included: a non-admin gets a 403 ApiError. */
+export function getRepoEntitlement(owner: string, repo: string, signal?: AbortSignal): Promise<RepoEntitlement> {
+  return request<RepoEntitlement>(repoSettingsPath(owner, repo, 'entitlement'), { signal })
+}
+
+/** postRevokeRepoEntitlement calls POST /api/repos/:owner/:repo/entitlement/revoke -- no new session may then name this repository, on any surface, and its sessions' queued turns are refused; a turn already running finishes. Admin-only server-side. The reason is required, 1 to 500 characters after trimming (a 400 ApiError says which bound failed); a 409 ApiError means the repository is already revoked, and the first revocation is kept. Returns the updated RepoEntitlement. */
+export function postRevokeRepoEntitlement(owner: string, repo: string, body: RevokeRepoEntitlementRequest, signal?: AbortSignal): Promise<RepoEntitlement> {
+  return request<RepoEntitlement>(repoSettingsPath(owner, repo, 'entitlement/revoke'), { method: 'POST', body, signal })
+}
+
+/** postRestoreRepoEntitlement calls POST /api/repos/:owner/:repo/entitlement/restore -- lifts the revocation; it never makes eligible a repository the deployment does not already know. Admin-only server-side; a 409 ApiError means the repository is not revoked. Returns the updated RepoEntitlement. */
+export function postRestoreRepoEntitlement(owner: string, repo: string, signal?: AbortSignal): Promise<RepoEntitlement> {
+  return request<RepoEntitlement>(repoSettingsPath(owner, repo, 'entitlement/restore'), { method: 'POST', signal })
 }
 
 // -- secrets scope resolution (§27.1/§25.1, §12.2 item 5). --
