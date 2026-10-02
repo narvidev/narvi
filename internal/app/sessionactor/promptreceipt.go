@@ -65,13 +65,18 @@
 // dispatch asked, no stop flagged it, the live gen is capable and owes no
 // stop its retirement, and a ready has been recorded since the last one
 // answered. It then reads, in one statement on the database's clock,
-// whether the receipt is stored and how long ago the dispatch asked, claims
-// the ready with a compare-and-set on receipt_checked_ready_seq, and
+// whether the receipt is stored and how long ago the dispatch asked, and
 // turn.DecidePromptResend says what follows: a stored receipt sends
 // nothing; past PromptResendWindow nothing is sent either, and one WARN says
 // so; past PromptResendMaxPerTurn re-sends of the dispatch nothing is sent
-// either, with one WARN; otherwise executeReceiptResend writes the prompt
-// again. So a prompt is re-sent at most once per reconnect, at most
+// either, with one WARN; otherwise the prompt is to be written again. Before
+// it claims the ready with a compare-and-set on receipt_checked_ready_seq,
+// a re-send reads an administrator's revocation of the session's
+// repository (§31.4, resendRevokedRepo) in the same transaction, so a read
+// that fails rolls the claim back and the next heartbeat answers the
+// reconnect; a revocation claims the ready without counting a re-send, and
+// executeReceiptResend sends nothing. Otherwise executeReceiptResend writes
+// the prompt again. So a prompt is re-sent at most once per reconnect, at most
 // PromptResendMaxPerTurn times in all, and never once its receipt is stored
 // or its turn has left Processing. The cap is the backstop for a loss that
 // is not a one-off: each re-send is answered only after the next
@@ -85,9 +90,9 @@
 // and moves none of dispatched_at, dispatched_event_id or
 // dispatched_sandbox_gen: dispatched_event_id bounds the stored token frames
 // and §26.4's corroboration reads, and the prompt may in fact be running. A
-// re-send that fails, or that the rollout re-check refuses, is logged and
-// counted and fails nothing: the original may be running, and the next
-// reconnect asks again. At the window's bound the turn ends as it always
+// re-send that fails, or that the rollout re-check or an administrator's
+// revocation refuses, is logged and counted and fails nothing: the original
+// may be running, and the next reconnect asks again. At the window's bound the turn ends as it always
 // did, at turn_deadline or by a person's stop.
 
 package sessionactor
@@ -138,6 +143,11 @@ type receiptResendPlan struct {
 	// resends is how many times the dispatch's prompt had been re-sent
 	// before this check.
 	resends int32
+	// revokedRepo is the session's repository an administrator revoked
+	// (§31.4), read in the claim's own transaction (resendRevokedRepo) when
+	// outcome is PromptResendSend: the re-send is refused, and the claim
+	// counted no re-send. Empty when none is revoked.
+	revokedRepo string
 }
 
 // readyAdvertisesPromptReceipt reports whether a ready event advertises
@@ -234,13 +244,26 @@ func (a *Actor) tryPlanReceiptResend(
 	outcome := turn.DecidePromptResend(stored, since, a.timeouts.PromptResendWindow,
 		int(target.ReceiptResendCount), a.timeouts.PromptResendMaxPerTurn)
 
+	// §31.4: a re-send reads an administrator's revocation before the claim,
+	// on this transaction (resendRevokedRepo, repoentitlement.go): a read
+	// that fails returns here, the evaluation rolls back with the claim
+	// unmade, and the next heartbeat answers the reconnect.
+	var revokedRepo string
+	if outcome == turn.PromptResendSend {
+		if revokedRepo, err = a.resendRevokedRepo(ctx, tx, sessionRow); err != nil {
+			return nil, err
+		}
+	}
+	send := outcome == turn.PromptResendSend && revokedRepo == ""
+
 	// The claim counts the re-send it decides on in the same statement,
 	// and holds only while the count is the one decided on: the cap is
-	// enforced on the row state this evaluation read.
+	// enforced on the row state this evaluation read. A re-send refused by
+	// a revocation is not counted: it writes no frame.
 	messageID := *target.DispatchedMessageID
 	checked := *target.ReceiptCheckedReadySeq
 	moved, err := turns.MarkPromptReconnectAnswered(ctx, target.ID, messageID, checked, sandboxRow.ReadySeq,
-		target.ReceiptResendCount, outcome == turn.PromptResendSend)
+		target.ReceiptResendCount, send)
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: claim the reconnect for the prompt receipt check: %w", err)
 	}
@@ -257,7 +280,7 @@ func (a *Actor) tryPlanReceiptResend(
 	// turn_deadline re-arm, no dispatched_at, dispatched_event_id or
 	// dispatched_sandbox_gen -- this file's top comment says why.
 	var payload json.RawMessage
-	if outcome == turn.PromptResendSend {
+	if send {
 		if payload, err = BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, target, messageID, true); err != nil {
 			return nil, fmt.Errorf("sessionactor: build prompt payload (receipt re-send): %w", err)
 		}
@@ -275,6 +298,7 @@ func (a *Actor) tryPlanReceiptResend(
 			readySeq:        sandboxRow.ReadySeq,
 			sinceRequest:    since,
 			resends:         target.ReceiptResendCount,
+			revokedRepo:     revokedRepo,
 		},
 	}, nil
 }
@@ -284,11 +308,12 @@ func (a *Actor) tryPlanReceiptResend(
 // receipt, one WARN and a count past the window or the cap
 // (PromptResendMaxPerTurn), and otherwise the original prompt written
 // again. A re-send passes the same turn-dispatch-time checks every
-// dispatch does (executeDispatch) -- an administrator's revocation
-// (refuseResendIfRepoRevoked, §31.4), the rollout re-check and the
-// frame's size against platform.MaxPromptFrameBytes -- but neither a
-// refusal nor a failed write fails the turn, as executeDispatch's would: the prompt may
-// already be running, and the next reconnect asks again. The size check
+// dispatch does (executeDispatch) -- an administrator's revocation, read
+// before the claim (refuseResendIfRepoRevoked acts on it, §31.4), the
+// rollout re-check and the frame's size against
+// platform.MaxPromptFrameBytes -- but neither a refusal nor a failed write
+// fails the turn, as executeDispatch's would: the prompt may already be
+// running, and the next reconnect asks again. The size check
 // cannot refuse a frame the same dispatch already sent; it is there so no
 // frame over the limit is ever written, whatever produced it.
 //
@@ -320,9 +345,9 @@ func (a *Actor) executeReceiptResend(ctx context.Context, plan *dispatchPlan) er
 		return fmt.Errorf("sessionactor: unknown prompt resend outcome %v", rr.outcome)
 	}
 
-	// §31.4: an administrator's revocation refuses the re-send too, and
-	// never fails the turn -- see refuseResendIfRepoRevoked
-	// (repoentitlement.go).
+	// §31.4: an administrator's revocation, read before the claim, refuses
+	// the re-send too, and never fails the turn -- see
+	// refuseResendIfRepoRevoked (repoentitlement.go).
 	if a.refuseResendIfRepoRevoked(ctx, plan) {
 		return nil
 	}

@@ -131,7 +131,7 @@ func TestDispatch_RevokedRepo_ExistingReadySandbox_QueuedTurnRefusedNeverSent(t 
 	commander := &fakeSendCommander{}
 	r := newDispatchTestRegistryWithCommanderAndRolloutMode(t, ctx, pool, commander, rollout.ModeOpen)
 	t.Cleanup(func() { _ = r.Shutdown() })
-	before := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked")
+	before := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageDispatch)
 
 	a, err := r.GetOrSpawn(ctx, sessionID)
 	if err != nil {
@@ -156,8 +156,8 @@ func TestDispatch_RevokedRepo_ExistingReadySandbox_QueuedTurnRefusedNeverSent(t 
 	}
 	assertRefusedForRevocation(ctx, t, pool, sessionID, attempt, repo, "so the turn was not sent to its sandbox")
 	assertReviewCheckNamesRevocation(ctx, t, pool, sessionID, attempt)
-	if grew := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked") - before; grew != 1 {
-		t.Errorf("session_repo_entitlement_denied_total{reason=revoked} grew by %d, want 1", grew)
+	if grew := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageDispatch) - before; grew != 1 {
+		t.Errorf("session_repo_entitlement_denied_total{stage=dispatch} grew by %d, want 1", grew)
 	}
 }
 
@@ -176,7 +176,7 @@ func TestDispatch_RevokedRepo_RefusesSpawn(t *testing.T) {
 	provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "provider-should-never-be-called"}}
 	r := newDispatchTestRegistryWithRolloutMode(t, ctx, pool, provider, rollout.ModeOpen)
 	t.Cleanup(func() { _ = r.Shutdown() })
-	before := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked")
+	before := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageSpawn)
 
 	a, err := r.GetOrSpawn(ctx, sessionID)
 	if err != nil {
@@ -196,8 +196,8 @@ func TestDispatch_RevokedRepo_RefusesSpawn(t *testing.T) {
 		t.Error("a sandbox row was written: the refusal must come before any spawn claim")
 	}
 	assertRefusedForRevocation(ctx, t, pool, sessionID, queued, repo, "so no sandbox could be started")
-	if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked") - before; got != 1 {
-		t.Errorf("session_repo_entitlement_denied_total{revoked} grew by %d, want 1: the spawn refusal is counted once", got)
+	if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageSpawn) - before; got != 1 {
+		t.Errorf("session_repo_entitlement_denied_total{stage=spawn} grew by %d, want 1: the spawn refusal is counted once", got)
 	}
 	if _, ok := dispatchTimer(ctx, t, pool, sessionID); ok {
 		t.Error("a dispatch timer is left: the refusal would be evaluated again")
@@ -532,11 +532,24 @@ func TestDispatch_RevocationReadError_UndeliveredNotRefused(t *testing.T) {
 // rig's turn (its prompt asks for a receipt), then, with stored receipt or
 // not, an administrator's revocation of the session's repository and a
 // same-gen reconnect -- the point at which a prompt the sandbox has not
-// receipted would be sent again. It returns the rig.
-func receiptResendAfterRevocation(ctx context.Context, t *testing.T, receiptStored bool) *receiptRig {
+// receipted would be sent again. It returns the rig and the repository.
+func receiptResendAfterRevocation(ctx context.Context, t *testing.T, receiptStored bool) (*receiptRig, string) {
 	t.Helper()
-	repo := "acme/zz-revoked-resend-" + uuid.NewString()[:8]
-	rig := newReceiptRig(ctx, t, receiptRigOptions{repoFullName: repo})
+	rig, repo := receiptRigDispatchedOnce(ctx, t, "acme/zz-revoked-resend-", receiptStored, nil)
+	revokeRepoForActorTest(ctx, t, rig.pool, repo)
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	return rig, repo
+}
+
+// receiptRigDispatchedOnce is a receipt rig on a fresh repository named
+// from prefix, enrolled in the cohort rollout, with provider as its sandbox
+// provider, whose turn was dispatched once to a capable gen 1 -- its prompt
+// asking for a receipt -- and, with receiptStored, receipted: the agent
+// confirmed it is running the prompt.
+func receiptRigDispatchedOnce(ctx context.Context, t *testing.T, prefix string, receiptStored bool, provider ports.SandboxProvider) (*receiptRig, string) {
+	t.Helper()
+	repo := prefix + uuid.NewString()[:8]
+	rig := newReceiptRig(ctx, t, receiptRigOptions{repoFullName: repo, provider: provider})
 	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
 	prompts := rig.commander.prompts(t)
 	if len(prompts) != 1 || !prompts[0].asksReceipt(t) {
@@ -545,22 +558,24 @@ func receiptResendAfterRevocation(ctx context.Context, t *testing.T, receiptStor
 	if receiptStored {
 		sendAndSettle(ctx, t, rig.actor, promptReceivedEvent(prompts[0].MessageId, 1, false), 1)
 	}
-	revokeRepoForActorTest(ctx, t, rig.pool, repo)
-	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
-	return rig
+	return rig, repo
 }
 
 // assertProcessingNothingResent checks that a same-gen reconnect after a
-// revocation sent no second prompt and left the turn processing, with no
-// synthetic execution_complete: the prompt may be running, and running work
-// finishes.
+// revocation sent no second prompt, spent none of the turn's re-sends and
+// left the turn processing, with no synthetic execution_complete: the
+// prompt may be running, and running work finishes.
 func assertProcessingNothingResent(ctx context.Context, t *testing.T, rig *receiptRig) {
 	t.Helper()
 	if got := len(rig.commander.prompts(t)); got != 1 {
 		t.Errorf("prompts sent = %d, want the first dispatch alone: nothing is re-sent to a revoked repository", got)
 	}
-	if got := rig.turn(ctx, t); got.Status != sqlcgen.TurnStatusProcessing {
+	got := rig.turn(ctx, t)
+	if got.Status != sqlcgen.TurnStatusProcessing {
 		t.Errorf("turn status = %s, want processing: a refused re-send never fails the turn", got.Status)
+	}
+	if got.ReceiptResendCount != 0 {
+		t.Errorf("receipt_resend_count = %d, want 0: nothing was written, so none of the turn's re-sends is spent", got.ReceiptResendCount)
 	}
 	if _, synthetic := rig.executionCompleteRows(ctx, t); synthetic != 0 {
 		t.Errorf("synthetic execution_complete events = %d, want none", synthetic)
@@ -571,21 +586,36 @@ func assertProcessingNothingResent(ctx context.Context, t *testing.T, rig *recei
 // way to a capable gen, then an administrator's revocation, then a same-gen
 // reconnect: no receipt is stored, so the re-send would start the work
 // after the revocation -- it is refused, counted (refused on
-// turn_prompt_resend_total, revoked on session_repo_entitlement_denied_total),
-// and the turn stays processing.
+// turn_prompt_resend_total, stage resend on
+// session_repo_entitlement_denied_total), and the turn stays processing.
+// The refusal spent none of the turn's re-sends: once the repository is
+// restored, the next reconnect re-sends the prompt under its own
+// messageId, as the first re-send.
 func TestPromptReceipt_RevokedRepo_LostPromptNotResent(t *testing.T) {
 	ctx := context.Background()
 	refusedBefore := promptResendCount(ctx, t, promptResendOutcomeRefused)
-	revokedBefore := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked")
+	revokedBefore := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageResend)
 
-	rig := receiptResendAfterRevocation(ctx, t, false)
+	rig, repo := receiptResendAfterRevocation(ctx, t, false)
 
 	assertProcessingNothingResent(ctx, t, rig)
 	if got := promptResendCount(ctx, t, promptResendOutcomeRefused) - refusedBefore; got != 1 {
 		t.Errorf("turn_prompt_resend_total{refused} moved by %d, want 1", got)
 	}
-	if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked") - revokedBefore; got != 1 {
-		t.Errorf("session_repo_entitlement_denied_total{revoked} moved by %d, want 1", got)
+	if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageResend) - revokedBefore; got != 1 {
+		t.Errorf("session_repo_entitlement_denied_total{stage=resend} moved by %d, want 1", got)
+	}
+
+	if _, err := narvipg.NewRepoEntitlementRevocationStore(rig.pool).Restore(ctx, repo); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	prompts := rig.commander.prompts(t)
+	if len(prompts) != 2 || prompts[1].MessageId != prompts[0].MessageId {
+		t.Fatalf("after the restore and a reconnect: %d prompts; want the first re-sent under its own messageId", len(prompts))
+	}
+	if got := rig.turn(ctx, t); got.Status != sqlcgen.TurnStatusProcessing || got.ReceiptResendCount != 1 {
+		t.Errorf("turn status %s, receipt_resend_count %d; want processing, 1", got.Status, got.ReceiptResendCount)
 	}
 }
 
@@ -594,36 +624,142 @@ func TestPromptReceipt_RevokedRepo_LostPromptNotResent(t *testing.T) {
 // the reconnect sends nothing and the turn is not failed.
 func TestPromptReceipt_RevokedRepo_ReceiptStoredNothingSentNotFailed(t *testing.T) {
 	ctx := context.Background()
-	rig := receiptResendAfterRevocation(ctx, t, true)
+	rig, _ := receiptResendAfterRevocation(ctx, t, true)
 	assertProcessingNothingResent(ctx, t, rig)
 }
 
-// TestPromptReceipt_RevocationReadError_ResendNotSentNotFailed: a revocation
-// read that fails at a same-gen reconnect sends nothing and fails nothing --
-// the prompt may be running, and the next reconnect asks again.
-func TestPromptReceipt_RevocationReadError_ResendNotSentNotFailed(t *testing.T) {
+// TestPromptReceipt_RevocationReadError_ReconnectAnsweredOnceReadable: a
+// revocation read that fails at a same-gen reconnect is read in the
+// transaction that would claim the reconnect, so the evaluation rolls back
+// with it: nothing is sent, nothing fails, nothing is counted, and neither
+// the reconnect nor one of the turn's re-sends is spent. Heartbeats while
+// the read still fails change nothing; the first heartbeat once it
+// succeeds answers the reconnect, and the prompt is re-sent once.
+func TestPromptReceipt_RevocationReadError_ReconnectAnsweredOnceReadable(t *testing.T) {
 	ctx := context.Background()
-	repo := "acme/zz-unreadable-resend-" + uuid.NewString()[:8]
-	rig := newReceiptRig(ctx, t, receiptRigOptions{repoFullName: repo})
-	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
-	if got := len(rig.commander.prompts(t)); got != 1 {
-		t.Fatalf("prompts after the first dispatch = %d, want 1", got)
-	}
+	rig, _ := receiptRigDispatchedOnce(ctx, t, "acme/zz-unreadable-resend-", false, nil)
+	checkedBefore := rig.turn(ctx, t).ReceiptCheckedReadySeq
 	refusedBefore := promptResendCount(ctx, t, promptResendOutcomeRefused)
+	sentBefore := promptResendCount(ctx, t, promptResendOutcomeSent)
+
+	hidden := true
 	if _, err := rig.pool.Exec(ctx, `ALTER TABLE repo_entitlement_revocations RENAME TO repo_entitlement_revocations_hidden`); err != nil {
 		t.Fatalf("hide revocations: %v", err)
 	}
-	t.Cleanup(func() {
+	unhide := func() {
+		if !hidden {
+			return
+		}
+		hidden = false
 		if _, err := rig.pool.Exec(context.Background(), `ALTER TABLE repo_entitlement_revocations_hidden RENAME TO repo_entitlement_revocations`); err != nil {
 			t.Errorf("restore revocations table: %v", err)
 		}
-	})
+	}
+	t.Cleanup(unhide)
 	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	sendAndSettle(ctx, t, rig.actor, receiptHeartbeat(1), 1)
 
 	assertProcessingNothingResent(ctx, t, rig)
-	if got := promptResendCount(ctx, t, promptResendOutcomeRefused) - refusedBefore; got != 1 {
-		t.Errorf("turn_prompt_resend_total{refused} moved by %d, want 1", got)
+	got := rig.turn(ctx, t)
+	if got.ReceiptCheckedReadySeq == nil || checkedBefore == nil || *got.ReceiptCheckedReadySeq != *checkedBefore {
+		t.Errorf("receipt_checked_ready_seq = %v, want %v: a failed read claims no reconnect", got.ReceiptCheckedReadySeq, checkedBefore)
 	}
+	if moved := promptResendCount(ctx, t, promptResendOutcomeRefused) - refusedBefore; moved != 0 {
+		t.Errorf("turn_prompt_resend_total{refused} moved by %d, want 0: a failed read decided nothing", moved)
+	}
+
+	unhide()
+	sendAndSettle(ctx, t, rig.actor, receiptHeartbeat(1), 1)
+	prompts := rig.commander.prompts(t)
+	if len(prompts) != 2 || prompts[1].MessageId != prompts[0].MessageId {
+		t.Fatalf("once the read succeeds: %d prompts; want the first re-sent under its own messageId", len(prompts))
+	}
+	got = rig.turn(ctx, t)
+	if got.Status != sqlcgen.TurnStatusProcessing || got.ReceiptResendCount != 1 || got.ReceiptCheckedReadySeq == nil || *got.ReceiptCheckedReadySeq != rig.sandbox(ctx, t).ReadySeq {
+		t.Errorf("turn status %s, receipt_resend_count %d, receipt_checked_ready_seq %v; want processing, 1, the reconnect's ready_seq %d",
+			got.Status, got.ReceiptResendCount, got.ReceiptCheckedReadySeq, rig.sandbox(ctx, t).ReadySeq)
+	}
+	if moved := promptResendCount(ctx, t, promptResendOutcomeSent) - sentBefore; moved != 1 {
+		t.Errorf("turn_prompt_resend_total{sent} moved by %d, want 1", moved)
+	}
+}
+
+// assertEndedForRevocationAfterSandboxWent checks that rig's turn, which
+// was processing when its sandbox went, ended failed with repo's
+// revocation as its reason, and that its prompt was sent once only.
+func assertEndedForRevocationAfterSandboxWent(ctx context.Context, t *testing.T, rig *receiptRig, repo string) {
+	t.Helper()
+	if got := len(rig.commander.prompts(t)); got != 1 {
+		t.Errorf("prompts sent = %d, want the first dispatch alone", got)
+	}
+	if got := rig.turn(ctx, t); got.Status != sqlcgen.TurnStatusFailed {
+		t.Errorf("turn status = %s, want failed: the gen it ran on is gone and the repository is revoked", got.Status)
+	}
+	reasons := syntheticEndReasons(ctx, t, rig.pool, rig.sessionID)
+	if len(reasons) != 1 || reasons[0] != repoRevokedReason(repo) {
+		t.Errorf("synthetic execution_complete reasons = %q, want the revocation of %s", reasons, repo)
+	}
+}
+
+// TestRevokedRepo_ProcessingTurnEndsWhenItsSandboxGoes pins §31.4's one
+// exception to "a turn already processing finishes": its sandbox restarts
+// or dies while the repository is revoked. The agent confirmed it was
+// running the prompt (its receipt is stored), the repository is revoked,
+// and then the gen it ran on is gone:
+//
+//   - respawned as a new gen, Ready: re-sending the prompt to that gen is
+//     a dispatch to a gen that has not had it, refused like any other --
+//     the turn fails with the revocation reason, and its synthetic
+//     execution_complete carries "delivered": false, read for the new gen,
+//     on which nothing was sent;
+//   - stopped: the respawn is refused before any sandbox is created, and
+//     the turn ends with the revocation reason.
+func TestRevokedRepo_ProcessingTurnEndsWhenItsSandboxGoes(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("re-enqueued to a new Ready gen", func(t *testing.T) {
+		rig, repo := receiptRigDispatchedOnce(ctx, t, "acme/zz-revoked-reenqueue-", true, nil)
+		revokeRepoForActorTest(ctx, t, rig.pool, repo)
+		if _, err := rig.sandboxes.UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{SessionID: rig.sessionID}); err != nil {
+			t.Fatalf("respawn: %v", err)
+		}
+		if _, err := rig.sandboxes.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{SessionID: rig.sessionID, Status: sqlcgen.SandboxStatusReady}); err != nil {
+			t.Fatalf("move sandbox to ready: %v", err)
+		}
+		sendAndSettle(ctx, t, rig.actor, receiptReady(2, true), 2)
+
+		assertEndedForRevocationAfterSandboxWent(ctx, t, rig, repo)
+		var delivered *string
+		if err := rig.pool.QueryRow(ctx, `SELECT payload->>'delivered' FROM events WHERE session_id = $1 AND type = 'execution_complete' AND (payload->>'synthetic')::boolean`,
+			rig.sessionID).Scan(&delivered); err != nil {
+			t.Fatalf("read the synthetic execution_complete: %v", err)
+		}
+		if delivered == nil || *delivered != "false" {
+			t.Errorf(`synthetic execution_complete "delivered" = %v, want false: nothing was sent to gen 2`, delivered)
+		}
+		if got := rig.turn(ctx, t); got.DispatchedSandboxGen == nil || *got.DispatchedSandboxGen != 2 {
+			t.Errorf("dispatched_sandbox_gen = %v, want 2: the mark is read for the gen the re-send was refused on", got.DispatchedSandboxGen)
+		}
+	})
+
+	t.Run("its sandbox stopped", func(t *testing.T) {
+		provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "provider-should-never-be-called"}}
+		rig, repo := receiptRigDispatchedOnce(ctx, t, "acme/zz-revoked-stopped-", true, provider)
+		revokeRepoForActorTest(ctx, t, rig.pool, repo)
+		if _, err := rig.sandboxes.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{SessionID: rig.sessionID, Status: sqlcgen.SandboxStatusStopped}); err != nil {
+			t.Fatalf("move sandbox to stopped: %v", err)
+		}
+		sendEnsureDispatched(ctx, t, rig.actor)
+		waitUntil(t, 5*time.Second, func() bool { return rig.turn(ctx, t).Status != sqlcgen.TurnStatusProcessing })
+
+		assertEndedForRevocationAfterSandboxWent(ctx, t, rig, repo)
+		if got := provider.callCount(); got != 0 {
+			t.Errorf("CreateSandbox calls = %d, want 0: the respawn is refused", got)
+		}
+		if got := rig.sandbox(ctx, t).Gen; got != 1 {
+			t.Errorf("sandbox gen = %d, want 1: no respawn was claimed", got)
+		}
+	})
 }
 
 // workflowStepWithBlockedSelfEdge attaches attempt to a fresh workflow run
@@ -683,7 +819,7 @@ func TestDispatchRevocation_WorkflowStepEscalatesOnce_ReadErrorIsRetriedBackedOf
 			t.Fatal(err)
 		}
 		t.Cleanup(func() { _ = r.Shutdown() })
-		before := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked")
+		before := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageDispatch)
 		a, err := r.GetOrSpawn(ctx, sessionID)
 		if err != nil {
 			t.Fatal(err)
@@ -712,8 +848,8 @@ func TestDispatchRevocation_WorkflowStepEscalatesOnce_ReadErrorIsRetriedBackedOf
 		if _, ok := dispatchTimer(ctx, t, pool, sessionID); ok {
 			t.Error("a dispatch timer is left: something was queued behind the refusal")
 		}
-		if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked") - before; got != 1 {
-			t.Errorf("session_repo_entitlement_denied_total{revoked} grew by %d, want 1: the refusal is made once", got)
+		if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageDispatch) - before; got != 1 {
+			t.Errorf("session_repo_entitlement_denied_total{stage=dispatch} grew by %d, want 1: the refusal is made once", got)
 		}
 		if got := commander.callCount(); got != 0 {
 			t.Errorf("SendCommand calls = %d, want 0", got)
@@ -791,7 +927,7 @@ func TestReviewRetriggerDebounce_RevokedRepo_NoTurnNoBudgetNoNotice(t *testing.T
 
 	diffFetcher := &fakeReviewDiffFetcher{nextHeadSHA: "sha-live", nextBaseRef: "main", nextDiff: "+ line changed"}
 	r := newAutoRetriggerRegistry(ctx, t, pool, diffFetcher)
-	before := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked")
+	before := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageAutoRetrigger)
 	for i := 1; i <= ReviewAutoRetriggerBudget+1; i++ {
 		f.setPendingHeadSHA(ctx, t, fmt.Sprintf("sha-push-%d", i))
 		f.armDebounceTimer(ctx, t)
@@ -821,8 +957,8 @@ func TestReviewRetriggerDebounce_RevokedRepo_NoTurnNoBudgetNoNotice(t *testing.T
 	if reads != 0 {
 		t.Errorf("GitHub pull-request reads = %d, want 0: the revocation is read first", reads)
 	}
-	if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked") - before; got != int64(ReviewAutoRetriggerBudget+1) {
-		t.Errorf("session_repo_entitlement_denied_total{revoked} grew by %d, want one per firing (%d)", got, ReviewAutoRetriggerBudget+1)
+	if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageAutoRetrigger) - before; got != int64(ReviewAutoRetriggerBudget+1) {
+		t.Errorf("session_repo_entitlement_denied_total{stage=auto_retrigger} grew by %d, want one per firing (%d)", got, ReviewAutoRetriggerBudget+1)
 	}
 
 	if _, err := narvipg.NewRepoEntitlementRevocationStore(pool).Restore(ctx, f.repoFullName); err != nil {
