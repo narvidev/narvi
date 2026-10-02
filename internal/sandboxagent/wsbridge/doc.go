@@ -167,7 +167,7 @@
 // credential cache's is (internal/sandboxagent/credentials): the agent
 // runtime is a different, untrusted uid (§30.5). A journal that cannot be
 // opened leaves the Bridge exactly as it was before receipts -- no
-// capability, no receipt, no dedup -- and the control plane then never
+// promptReceipt, no receipt, no dedup -- and the control plane then never
 // re-sends to this gen.
 //
 // # The largest message a connection reads
@@ -177,7 +177,10 @@
 // library's default, 32 KiB, closed the connection on any longer prompt --
 // a review's, with its pull request's diff inlined -- and the prompt was
 // lost; with prompt receipts, every reconnect re-sent it, to be lost
-// again.
+// again. Every ready states this limit as capabilities.maxFrameBytes, and
+// the control plane holds this gen's prompts to it; an agent that states
+// none is held to that 32 KiB default unless it advertises promptReceipt
+// (technical plan §3.3).
 //
 // # Honest gaps this package documents rather than papers over
 //
