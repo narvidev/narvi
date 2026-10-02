@@ -85,16 +85,12 @@ var errRolloutRefused = errors.New("outboxworker: sentinelAutoFixNotifier: repo 
 // checks for this one specifically and takes the SAME terminal-skip
 // precedent (descriptionautofix.go: "return nil, and the outbox marks
 // this row delivered, never retried") rather than the outbox's ordinary
-// backoff/retry/dead-letter path. In practice this can never actually
-// fire here: spawnClaimedChildSession's own req.SpawnSource is always
-// restdtos.CreateSessionRequestSpawnSourceGithub (below), which
-// httpapi.ResolveRepoEntitlement exempts unconditionally before any
-// repo is even checked (repoentitlementgate.go's own doc comment) --
-// this sentinel exists for the SAME defensive-symmetry reason
-// errRolloutRefused's own check runs at this identical call site
-// regardless of reachability today, so a future change to that
-// exemption's own conditions is honored here automatically, with no
-// separate copy of this handling to remember to add.
+// backoff/retry/dead-letter path. For this GitHub-originated child the
+// denial is an administrator's revocation (§31.4, "Un-entitlement") of the
+// origin pull request's base repository or of the clone URL's repository
+// (httpapi.ResolveGitHubRepoEntitlement): retrying would only meet the
+// same revocation until someone restores the repository, and a restore is
+// not a reason to replay a fix the outbox already gave up on.
 var errRepoEntitlementDenied = errors.New("outboxworker: sentinelAutoFixNotifier: repo not entitled")
 
 // errParentStopped is spawnClaimedChildSession's own sentinel for "a
@@ -487,7 +483,7 @@ func (n *sentinelAutoFixNotifier) Deliver(ctx context.Context, notification port
 				// deliberately NOT called below, for the identical reason
 				// the errRolloutRefused branch above does not call it.
 				platform.Logger(ctx).Warn("outboxworker: sentinelAutoFixNotifier: fix child session refused: repo not entitled; skipping, never retried",
-					"repo", payload.RepoFullName, "origin_pr_number", payload.OriginPRNumber)
+					"repo", payload.RepoFullName, "origin_pr_number", payload.OriginPRNumber, "error", err)
 				return nil
 			}
 			if errors.Is(err, errParentStopped) {
@@ -575,6 +571,34 @@ func (n *sentinelAutoFixNotifier) spawnClaimedChildSession(ctx context.Context, 
 		return pgtype.UUID{}, fmt.Errorf("outboxworker: sentinelAutoFixNotifier: malformed originReviewSessionId %q: %w", payload.OriginReviewSessionID, err)
 	}
 
+	// §31.4 (Defect-1 audit fix): resolved with NO transaction open -- see
+	// httpapi.ResolveRepoEntitlement's own doc comment
+	// (repoentitlementgate.go) for why this must run strictly BEFORE
+	// n.pool.Begin below -- and before createFixBranch, so a repository an
+	// administrator revoked (§31.4, "Un-entitlement") gets no fix branch
+	// either. The child's spawnSource is github, so this is exempt from the
+	// "known" half of the predicate -- see ResolveRepoEntitlement's own doc
+	// comment ("req.SpawnSource == github is EXEMPT") for exactly why
+	// re-deriving it from payload.RepoCloneURL would be actively WRONG here
+	// (a cross-repo/fork PR's own clone URL is deliberately the fork, never
+	// the github_pr_sessions claim key) -- but not from a revocation, read
+	// for payload.RepoFullName (the origin pull request's base repository)
+	// and for the clone URL. The resolution reads only the request's
+	// spawnSource and URL, so the branch, created next, is not part of it.
+	entitlement, everr := httpapi.ResolveGitHubRepoEntitlement(ctx, n.prSessions, n.auditLog, pgtype.UUID{}, restdtos.CreateSessionRequest{
+		SpawnSource: restdtos.CreateSessionRequestSpawnSourceGithub,
+		Repos:       []restdtos.CreateSessionRequestReposElem{{Name: payload.RepoName, Url: payload.RepoCloneURL}},
+	}, payload.RepoFullName)
+	if everr != nil {
+		if everr.RepoEntitlementDenied {
+			// A PERMANENT policy refusal (errRepoEntitlementDenied's own
+			// doc comment): Deliver skips it terminally instead of letting
+			// the outbox retry it to a dead letter.
+			return pgtype.UUID{}, fmt.Errorf("outboxworker: sentinelAutoFixNotifier: resolve repo entitlement: %s: %w", everr.Message, errRepoEntitlementDenied)
+		}
+		return pgtype.UUID{}, fmt.Errorf("outboxworker: sentinelAutoFixNotifier: resolve repo entitlement: %s", everr.Message)
+	}
+
 	branch, err := n.createFixBranch(ctx, payload)
 	if err != nil {
 		return pgtype.UUID{}, fmt.Errorf("outboxworker: sentinelAutoFixNotifier: create fix session's own upstream branch: %w", err)
@@ -603,25 +627,6 @@ func (n *sentinelAutoFixNotifier) spawnClaimedChildSession(ctx context.Context, 
 				Branch: restdtos.CreateSessionRequestReposElemBranch(&branch),
 			},
 		},
-	}
-
-	// §31.4 (Defect-1 audit fix): resolved against the now-fully-built
-	// req, with NO transaction open -- see httpapi.ResolveRepoEntitlement's
-	// own doc comment (repoentitlementgate.go) for why this must run
-	// strictly BEFORE n.pool.Begin below. req.SpawnSource is always
-	// restdtos.CreateSessionRequestSpawnSourceGithub here (above), so this
-	// always takes that function's own unconditional exemption fast path
-	// -- see ResolveRepoEntitlement's own doc comment
-	// (repoentitlementgate.go, "req.SpawnSource == github is EXEMPT") for
-	// exactly why re-deriving entitlement from payload.RepoCloneURL would
-	// be actively WRONG here (a cross-repo/fork PR's own clone URL is
-	// deliberately the fork, never the github_pr_sessions claim key).
-	// Still resolved via the real function, never hand-rolled
-	// admitted-true, so a future change to the exemption's own conditions
-	// is honored here too, with no separate copy to keep in sync.
-	entitlement, everr := httpapi.ResolveRepoEntitlement(ctx, n.prSessions, n.auditLog, pgtype.UUID{}, req)
-	if everr != nil {
-		return pgtype.UUID{}, fmt.Errorf("outboxworker: sentinelAutoFixNotifier: resolve repo entitlement: %s", everr.Message)
 	}
 
 	tx, err := n.pool.Begin(ctx)
@@ -683,12 +688,10 @@ func (n *sentinelAutoFixNotifier) spawnClaimedChildSession(ctx context.Context, 
 		if cerr.RepoEntitlementDenied {
 			// (§31.4, Defect-2 audit fix): a PERMANENT policy refusal,
 			// mirroring the RolloutRefusal branch immediately above in
-			// every respect -- see errRepoEntitlementDenied's own doc
-			// comment for why this branch is structurally unreachable
-			// today (entitlement was already resolved, exempt, before this
-			// same function's own pool.Begin above) but kept anyway, for
-			// the identical defensive-symmetry reason that resolution
-			// itself is.
+			// every respect. Structurally unreachable today
+			// (CreateSessionOnTx only consults the decision resolved
+			// before createFixBranch above, which refuses there) but kept
+			// anyway, for the identical defensive-symmetry reason.
 			return pgtype.UUID{}, fmt.Errorf("outboxworker: sentinelAutoFixNotifier: spawn child session: %w", errRepoEntitlementDenied)
 		}
 		if cerr.ParentStopped {

@@ -47,6 +47,7 @@ GET /api/models
 GET /api/opencode-config
 GET /api/provider-credentials
 GET /api/repos/{owner}/{repo}/digest-scope
+GET /api/repos/{owner}/{repo}/entitlement
 GET /api/repos/{owner}/{repo}/false-positive-patterns
 GET /api/repos/{owner}/{repo}/preview-config
 GET /api/repos/{owner}/{repo}/provider-credentials
@@ -104,6 +105,8 @@ POST /api/mcp-clients/{clientID}/enable
 POST /api/me/chatgpt-link
 POST /api/members/{userID}/identities
 POST /api/provider-credentials
+POST /api/repos/{owner}/{repo}/entitlement/restore
+POST /api/repos/{owner}/{repo}/entitlement/revoke
 POST /api/repos/{owner}/{repo}/false-positive-patterns/{patternID}/retire
 POST /api/repos/{owner}/{repo}/provider-credentials
 POST /api/repos/{owner}/{repo}/sandbox-secrets

@@ -136,8 +136,8 @@ import (
 //     after SetSessionID succeeds -- see that file's own doc comment), a
 //     row only ever COMMITS with a non-NULL session_id: a denied or
 //     failed claim attempt rolls the whole transaction back, leaving no
-//     row behind at all. So bare existence (RepoKnownToDeployment, no
-//     separate session_id filter needed) already means "a real,
+//     row behind at all. So bare existence (ReadRepoEntitlement's
+//     repo_known, no separate session_id filter needed) already means "a real,
 //     HMAC-verified GitHub webhook genuinely produced a committed review
 //     session for this repo".
 //
@@ -166,25 +166,29 @@ func resolveKnownRepo(w http.ResponseWriter, r *http.Request, prSessions *postgr
 }
 
 // confirmRepoKnown checks repoFullName (already parsed/shape-validated by
-// the caller) against GitHubPRSessionStore.RepoKnown -- see
+// the caller) against GitHubPRSessionStore.RepoEntitlement's Known -- see
 // resolveKnownRepo's own extended doc comment (above) for the full "why
-// github_pr_sessions" reasoning. Writes 404 "repo not found" and returns
-// false on either a lookup error (fail-closed: an unconfirmable repo is
-// treated as unknown, never silently let through) or a genuinely unknown
-// repo. Split out from resolveKnownRepo so providercredentials.go's own
-// repo-scoped route group -- which resolves scopeTargetID slightly
-// differently, since its shared core functions also serve the
-// environment-/global-scoped route groups -- can reuse this SAME check
-// rather than a second, independently-maintained copy of it.
+// github_pr_sessions" reasoning. It reads Known ONLY, deliberately
+// ignoring Revoked (§31.4): this is the scoping of the repository-scoped
+// admin routes, not admission to new work, and an administrator must still
+// reach a revoked repository -- its settings, its history, and the
+// entitlement routes that restore it (repoentitlement.go). Writes 404
+// "repo not found" and returns false on either a lookup error (fail-closed:
+// an unconfirmable repo is treated as unknown, never silently let through)
+// or a genuinely unknown repo. Split out from resolveKnownRepo so
+// providercredentials.go's own repo-scoped route group -- which resolves
+// scopeTargetID slightly differently, since its shared core functions also
+// serve the environment-/global-scoped route groups -- can reuse this SAME
+// check rather than a second, independently-maintained copy of it.
 func confirmRepoKnown(w http.ResponseWriter, r *http.Request, prSessions *postgres.GitHubPRSessionStore, repoFullName string) bool {
 	ctx := r.Context()
-	known, err := prSessions.RepoKnown(ctx, repoFullName)
+	facts, err := prSessions.RepoEntitlement(ctx, repoFullName)
 	if err != nil {
 		platform.Logger(ctx).Error("httpapi: check repo known to deployment failed", "error", err, "repo", repoFullName)
 		writeError(w, http.StatusInternalServerError, "internal error")
 		return false
 	}
-	if !known {
+	if !facts.Known {
 		logUnknownRepoRefusal(r, repoFullName)
 		writeError(w, http.StatusNotFound, "repo not found")
 		return false

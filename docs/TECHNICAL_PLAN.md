@@ -753,6 +753,9 @@ Roles (global, one per user): **admin > maintainer > member > viewer**.
 | Manage automations, environments, repo/env secrets | ✓ | ✓ | — | — |
 | Edit review verdicts; re-trigger reviews; auto-approval eligibility config (§21) | ✓ | ✓ | — | — |
 | Integrations, global secrets, prompt-template activation, members & roles, per-repo auto-merge toggle (§21), sentinel auto-fix toggle (§17 — stricter than auto-merge since it ends in an unattended merge with no per-repo arming step, not a human Merge click), per-repo automatic re-review opt-in toggle (§24 — off by default, same admin-only row as the other automation-enabling toggles here), and — §40 — the per-repo autonomy level, spend cap and session-bound extension, and the platform-wide freeze (the level is a ceiling on the toggles in this row, so it is gated at least as strictly as any of them) | ✓ | — | — | — |
+| Revoke a repository's eligibility for new sessions, and restore it (§31.4) | ✓ | — | — | — |
+
+Revoking a repository's eligibility and restoring it are one admin-only action (`manage_repo_entitlement`), its status read included; a revocation binds every session-creation surface, pull-request mentions included, and the pending turns of the repository's existing sessions. It names the repository by its name, so a rename or transfer on the code host needs the new name revoked too (§31.4).
 
 Stopping on own/joined sessions is owner decision O1 (default taken 2026-09-29, open to revision): a member can already start and prompt that work, and a stop only ever reduces what runs. Stopping a session also stops every session it started (§3.3), authorized by the one check on the session named. Resuming stays admin/maintainer only; in practice a person resumes a stopped session by prompting it, approving its plan, or approving or revising a workflow step awaiting their decision, each under its own permission (§3.3).
 
@@ -5273,6 +5276,87 @@ exists; `sessions.repos` has a fundamentally different trust grade than
 is NOT blocked**: its repository identity descends from the verified payload, which is precisely
 why it is the flagship first consumer (§31.6).
 
+**Un-entitlement: explicit operator revocation (Step 152).** Eligibility only grows: a repository
+becomes eligible when a verified webhook writes its first `github_pr_sessions` row, and nothing
+removes one -- not an uninstalled App, not a deleted repository. An administrator closes a
+repository instead by revoking it, the only shape that stays true with no network: a live
+installation re-read fails open or blocks creation whenever GitHub is unreachable, and an age
+expiry leaves a revoked repository eligible until its deadline.
+
+- **The fact.** A row in `repo_entitlement_revocations`, keyed by the exact `repo_full_name`
+  `github_pr_sessions` holds (no case-folding), with when, by whom and a required reason of 1 to
+  500 characters. Restore deletes the row. History lives in `audit_log` (`repo_entitlement.revoked`,
+  `repo_entitlement.restored`, each written in the transaction of its change, §13.3). Restore only
+  lifts the revocation: it never makes eligible a repository the deployment does not already know.
+  A revocation names one repository by its name, the same key every table here uses (§31.9 limit
+  4): no stable repository id is parsed from the webhook or stored. After a rename or transfer on
+  the code host, a mention under the new name is admitted -- the GitHub path is exempt from "known"
+  -- and makes the new name known; the old name stays revoked, and its sessions stay refused
+  through their old-name claims. An administrator revokes the new name too; the settings card says
+  so.
+- **One read.** Eligibility and revocation are read in one statement (`ReadRepoEntitlement`,
+  `GitHubPRSessionStore.RepoEntitlement`); no store method returns "known" without "revoked".
+  `authz.AuthorizeRepo` refuses a revoked repository before it looks at whether it is known, with an
+  error that unwraps to both `ErrRepoForbidden` and `ErrRepoRevoked`.
+- **Every creation path.** REST and MCP answer 403 `repository entitlement revoked by an
+  administrator: <repo>`, distinct from the `repository not entitled` of an unknown repository;
+  Slack and Linear acknowledge in words naming who closed the repository and who reopens it, never
+  "not configured"; automations record a failed run. GitHub-originated sessions keep their exemption
+  from "known" (a fork pull request's clone URL names the fork) but not from revocation, read for the
+  pull request's base repository and for the clone URL: a new mention, a follow-up on an existing
+  review session, a label re-trigger and a fork's mention are all refused silently, the delivery
+  claim kept; a sentinel auto-fix is skipped terminally, before its branch is created. Every refusal
+  is counted (`session_repo_entitlement_denied_total{reason="revoked", stage="create"}`) and audited.
+- **Work in flight.** A turn already processing finishes, push, pull request and verdict included,
+  unless its sandbox restarts or dies while the repository is revoked: the gen it ran on is gone, the
+  respawn or the re-send to the new gen is refused like a first dispatch, and the turn ends with the
+  revocation reason. Every pending turn, whatever produced it, is refused before its prompt is
+  written to a sandbox gen that has not had it -- at spawn and at dispatch, the §32.4 placements, in
+  every rollout mode -- reading the session's clone URLs and its pull-request claims (a review
+  session's, a sentinel child's), and ends forward with a banner and, for a review attempt, a check
+  closed as not assessed (`repo_entitlement_revoked`); nothing was written to that gen, so its
+  synthetic `execution_complete` carries the `"delivered": false` mark (§26.4), which is read per gen,
+  and a later turn on the same gen keeps its trace. A revocation read that fails at dispatch fails the
+  turn as an undelivered prompt, marked the same way, and backs off, never as a refusal. A prompt
+  re-sent to the gen it was already sent to is never failed: its §3.3 receipt re-send after a same-gen
+  reconnect reads the revocation before the transaction claims the reconnect. A revocation leaves the
+  reconnect unclaimed, sends and counts nothing, logs once per turn and reconnect, and leaves the turn
+  processing; every heartbeat then reads the revocation again -- one read per heartbeat, for at most
+  `PromptResendWindow` from the dispatch -- so the first heartbeat after a restore re-sends the
+  prompt, and past the window the reconnect is claimed as expired and the turn ends at its deadline,
+  as any unreceipted prompt's would. A read that fails rolls the evaluation back, and the next
+  heartbeat answers the reconnect. Automatic re-review (§24) reads the revocation before it fetches anything,
+  inserts a turn or spends the pull request's budget, so a revoked repository's pushes spend nothing
+  and post no budget notice, and the session's status does not read the debounce they arm as
+  scheduled work (§43.20); after a restore the next push re-reviews. Each of these refusals is counted
+  on the same counter as creation's, by the stage it was made at (`spawn`, `dispatch`, `resend`,
+  `auto_retrigger`). Live sandboxes idle out. The revocation does not pause automations itself, but
+  each invocation with a revoked target fails and counts a strike (§3.5), so three such invocations
+  auto-pause the automation -- its targets nobody revoked included, which still run in each
+  invocation -- and a restore does not resume it: a person does. Pending outbox deliveries, which
+  report work already done, go out.
+- **The action.** `GET`, `POST .../revoke` and `POST .../restore` under
+  `/api/repos/{owner}/{repo}/entitlement`, admin-only (`manage_repo_entitlement`, §13.3), 404 for
+  an unknown repository, 409 for a second revoke or a restore of a repository not revoked. The
+  repository-scoped admin routes scope on "known" alone, so a revoked repository stays reachable --
+  which is how it is restored. The Repository settings screen carries the card; there is no MCP tool
+  and no CLI.
+- **The guard.** `internal/ops`' `ScanRepoEntitlementReads` is a name-based check on syntax that
+  fails the build on four shapes of a reader skipping revocation: (a) a generated revocation read
+  named anywhere but its one store method; (b) `RepoEntitlement` named -- called or as a method
+  value, the postgres adapter included -- from a function its allowlist does not list with a
+  reason; (c) an `authz.RepoAdmission` built without naming `Revoked` -- a literal (an elided or
+  pointer element included), a `var` of the type, `new`, or a type declared from it; (d) a named
+  query reading `github_pr_sessions` in any position without the revocations table, unless an
+  allowlist names it with a reason -- an entry for a query that reads the revocations table, or no
+  longer reads `github_pr_sessions`, fails as stale. It cannot see an allowlisted function that uses only "known"
+  from the result, a struct field of the type left at its zero value, reflection, or a read through
+  a view a migration defines.
+- **Rollback re-opens.** A binary without the migration never reads the table: during a rolling
+  deploy old pods still admit, and after a rollback -- forced back with the rows kept, or the down,
+  which drops them -- every revoked repository is eligible again until this release is redeployed
+  (and, after the down, each is revoked again).
+
 ### 31.5 The index and the ports
 
 **Ship mode B without pgvector — the decisive fact is quantitative, and it falls out of the
@@ -5718,6 +5802,8 @@ rather than belonging to mode A alone.)
    layers hold "one query, one repo" but not "the right repo for this caller"; `kb_search` and
    the export stay blocked, and the webhook-path consumer is the only one running. The
    in-flight four-handler fix closes today's known leaks; it does not create the predicate.
+   Once delivered, the predicate is no longer one that only ever opens: an administrator's
+   revocation (§31.4, "Un-entitlement") closes a repository again, on every surface.
 2. **The semantic false precedent has no structural kill** (§31.7) — bounded and decayed by
    G4/G5/G6, not eliminated. Anyone extending the corpus to new content types re-inherits this
    limit and must re-argue it.
@@ -5730,7 +5816,8 @@ rather than belonging to mode A alone.)
 4. **`repo_full_name` as the scope key**: a repository rename/transfer silently splits a corpus
    that outlives any PR session. Consistency with `repo_settings` and `github_pr_sessions`
    argues for keeping it and inheriting any future rename fix those tables get — accepted, and
-   noted rather than hidden.
+   noted rather than hidden. An administrator's revocation (§31.4) is keyed the same way: after a
+   rename or transfer the new name is not revoked until an administrator revokes it.
 5. **A new egress channel exists in mode B** — the embeddings provider receives customer-derived
    text. Surfaced (§31.8), key policy decided for shadow; the wire-compatible adapter (§31.5)
    is the named path to closing it entirely for self-hosters, and it is deferred, not dropped.
@@ -8934,20 +9021,23 @@ erring toward unsettled. A database `CHECK` on the kind was considered
 and not added: it would make every new timer kind a schema change with its own rollout order and
 down-migration, for a gap the backstop already keeps on the safe side.
 
-The re-review debounce counts only while its fire can insert a turn at all, on the fire's two
+The re-review debounce counts only while its fire can insert a turn at all, on the fire's three
 conditions a row shows: the pull request's repository opted in
-(`repo_settings.auto_retrigger_review_enabled`; no row reads as off, as it does for the fire) and its
+(`repo_settings.auto_retrigger_review_enabled`; no row reads as off, as it does for the fire), its
 automatic re-review count is below `sessionactor.ReviewAutoRetriggerBudget` — the one constant the fire compares
-with, passed into the statement rather than written there again — read in one lateral over
-`github_pr_sessions` and `repo_settings` (`review_retrigger_can_fire`). The count only grows and only
-the admin toggle writes the opt-in, so a debounce read as unable to fire can create a turn later only
-after a person switches the opt-in on: new input. The fire's other decline rules are deliberately not
-copied — the head already reviewed (the latest verdict's head, which a turn already marked failed can
-still post), a plan awaiting approval, a live fetch that fails. Leaving a decline rule out errs toward
+with, passed into the statement rather than written there again — and an administrator has not
+revoked it (§31.4: no `repo_entitlement_revocations` row for the pull request's base repository, the
+claim key the fire reads too), read in one lateral over `github_pr_sessions`, `repo_settings` and
+`repo_entitlement_revocations` (`review_retrigger_can_fire`). The count only grows, only the admin
+toggle writes the opt-in and only an administrator's restore lifts a revocation, so a debounce read
+as unable to fire can create a turn later only after a person's own input. The fire's other decline
+rules are deliberately not copied — the head already reviewed (the latest verdict's head, which a
+turn already marked failed can still post), a plan awaiting approval, a live fetch that fails, a
+revocation of only the session's clone URL (a fork's name, parsed in Go). Leaving a decline rule out errs toward
 `scheduled`, never toward settled: a false settled needs a copied rule stricter than the fire's own, or
 one that drifts from it, and `TestSessionStatus_ReReviewFireAndStatusAgree` runs the real fire and the
-status over one table of opt-ins and counts around the budget and asserts they agree on every row. A
-work-creating timer counts while it is armed; its handler deletes it in the transaction that inserts
+status over one table of opt-ins, counts around the budget and revocations and asserts they agree on
+every row. A work-creating timer counts while it is armed; its handler deletes it in the transaction that inserts
 the turn, or declines, so no snapshot holds neither. A handler that keeps failing leaves it armed,
 retried every `TimerClaimDuration`, and the status keeps reading `scheduled`: the server is still
 trying.

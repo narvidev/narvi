@@ -504,6 +504,16 @@ type CreateSessionError struct {
 	// field depends on.
 	RepoEntitlementDenied bool
 
+	// RepoEntitlementRevoked (§31.4, "Un-entitlement") is true iff the
+	// denial above is an administrator's revocation of a named repository
+	// (repo_entitlement_revocations), never an unknown one. It is only ever
+	// set together with RepoEntitlementDenied, so a caller that never
+	// checks this field still treats the refusal as permanent; a caller
+	// that does tells the person who can lift it (an administrator, by
+	// restoring the repository) in its own words instead of "not
+	// configured".
+	RepoEntitlementRevoked bool
+
 	// IdempotencyConflict (§43.8) is true iff the session insert failed on
 	// migrations/000150's unique (created_by, create_idempotency_key) index:
 	// a concurrent create by the same user with the same key committed

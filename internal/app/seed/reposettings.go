@@ -39,8 +39,8 @@ import (
 // (internal/adapters/inbound/github's own coalesce.go) commits it
 // ATOMICALLY alongside the session it claims a slot for -- so for a
 // repo that has never yet had an enrolled session, the claim rolls back
-// right along with the refused session, and github_pr_sessions.RepoKnown
-// stays false forever. REST enrollment is therefore structurally
+// right along with the refused session, and that repository's
+// GitHubPRSessionStore.RepoEntitlement Known stays false forever. REST enrollment is therefore structurally
 // impossible for EXACTLY the repos cohort rollout exists to enroll --
 // this seed tool bypasses confirmRepoKnown entirely (it writes
 // deps.RepoSettings directly, never through the REST layer), which is

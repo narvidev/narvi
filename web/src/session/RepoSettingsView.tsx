@@ -43,6 +43,12 @@
 // each card loads its own initial value from the already-fetched
 // RepoSettings, lets the operator edit, and sends the whole group back.
 //
+// Two cards here read and write endpoints of their own, outside
+// repo_settings, and are admin-only as a whole, their GET included:
+// ShadowLedgerCard (.../shadow-ledger) and RepoEntitlementCard
+// (.../entitlement, an administrator's revocation of the repository's
+// eligibility for new sessions, and its restore).
+//
 // # Two fields this screen deliberately does not offer a form for
 //
 // sessionsEnabled is not a field of RepoSettings at all -- §32.6 makes
@@ -87,12 +93,15 @@ import { useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 
-import type { RepoSettings, ShadowLedgerEntry } from '@narvi/contracts/rest-dtos'
+import type { RepoEntitlement, RepoSettings, ShadowLedgerEntry } from '@narvi/contracts/rest-dtos'
 
 import {
+  getRepoEntitlement,
   getRepoSettings,
   getShadowLedger,
   postActivateShadowLedger,
+  postRestoreRepoEntitlement,
+  postRevokeRepoEntitlement,
   putAutoApprovalSettings,
   putAutoMergeToggle,
   putAutoRetriggerReviewToggle,
@@ -102,7 +111,7 @@ import {
   putReviewDepthConfig,
 } from '../api/endpoints'
 import { ApiError } from '../api/http'
-import { repoSettingsQueryKeys, shadowLedgerQueryKeys } from '../api/queryKeys'
+import { repoEntitlementQueryKeys, repoSettingsQueryKeys, shadowLedgerQueryKeys } from '../api/queryKeys'
 import { meQueryOptions } from '../auth/session'
 import {
   BLAST_RADIUS_TAGS,
@@ -454,6 +463,139 @@ function ShadowLedgerCard({ owner, repo, role }: { owner: string; repo: string; 
             </>
           )}
           {mutation.isError && <MutationError error={mutation.error} />}
+        </>
+      )}
+    </div>
+  )
+}
+
+/** MAX_REVOCATION_REASON_CHARS is the longest reason a revocation keeps, after trimming -- the server refuses a longer one with a 400 that says so; this screen stops the operator first. */
+const MAX_REVOCATION_REASON_CHARS = 500
+
+/**
+ * RepoEntitlementStatus renders a repository's entitlement read-only:
+ * whether new sessions are allowed, or when, by whom and why an
+ * administrator revoked them. The reason and the display name are free
+ * text and render through T -- exported for direct render-safety testing
+ * (see __tests__/repoEntitlementCard.test.tsx).
+ */
+export function RepoEntitlementStatus({ entitlement }: { entitlement: RepoEntitlement }) {
+  if (!entitlement.revoked) {
+    return <p className="ph">New sessions are allowed on this repository.</p>
+  }
+  const row = { display: 'flex', justifyContent: 'space-between', gap: 12, padding: '4px 0', fontSize: 'var(--text-sm)', borderBottom: '1px solid var(--line)' } as const
+  return (
+    <>
+      <p className="sidebar-notice">
+        New sessions on this repository are revoked. No surface can start one, and the queued turns of its existing sessions are ended before they reach a sandbox; a turn already running finishes, unless its sandbox restarts or stops first, which ends it.
+      </p>
+      <div style={row}>
+        <span style={{ color: 'var(--faint)' }}>Revoked</span>
+        <span>{entitlement.revokedAt ? new Date(entitlement.revokedAt).toLocaleString() : '—'}</span>
+      </div>
+      <div style={row}>
+        <span style={{ color: 'var(--faint)' }}>By</span>
+        <span>{entitlement.revokedByDisplayName ? <T text={entitlement.revokedByDisplayName} /> : 'a user who no longer exists'}</span>
+      </div>
+      <div style={row}>
+        <span style={{ color: 'var(--faint)' }}>Reason</span>
+        <span>
+          <T text={entitlement.reason ?? ''} />
+        </span>
+      </div>
+    </>
+  )
+}
+
+/**
+ * RepoEntitlementCard is the operator action behind an administrator's
+ * revocation of a repository's eligibility for new sessions, and its
+ * restore. Like ShadowLedgerCard, the WHOLE card is admin-only -- its GET
+ * is gated too (authz.ActionManageRepoEntitlement) -- so it queries anyway
+ * and renders a forbidden note on a real 403, the server being the
+ * authority. Revoking takes a required reason; restoring is one button.
+ * Both answer the updated entitlement, written straight into the cache. A
+ * 409 means another administrator revoked or restored the repository
+ * first, so the cached status is stale: it is refetched, and the card
+ * shows the state the server holds beside the server's own message.
+ * Exported for the card's wiring test (repoEntitlementCard.test.tsx).
+ */
+export function RepoEntitlementCard({ owner, repo, role }: { owner: string; repo: string; role: string | undefined }) {
+  const queryClient = useQueryClient()
+  const repoFullName = `${owner}/${repo}`
+  const [reason, setReason] = useState('')
+
+  const query = useQuery({
+    queryKey: repoEntitlementQueryKeys.detail(repoFullName),
+    queryFn: ({ signal }) => getRepoEntitlement(owner, repo, signal),
+    retry: false,
+  })
+
+  const refetchIfStale = (error: unknown) => {
+    if (error instanceof ApiError && error.status === 409) {
+      void queryClient.invalidateQueries({ queryKey: repoEntitlementQueryKeys.detail(repoFullName) })
+    }
+  }
+
+  const revoke = useMutation({
+    mutationFn: () => postRevokeRepoEntitlement(owner, repo, { reason: reason.trim() }),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(repoEntitlementQueryKeys.detail(repoFullName), updated)
+      setReason('')
+    },
+    onError: refetchIfStale,
+  })
+
+  const restore = useMutation({
+    mutationFn: () => postRestoreRepoEntitlement(owner, repo),
+    onSuccess: (updated) => {
+      queryClient.setQueryData(repoEntitlementQueryKeys.detail(repoFullName), updated)
+    },
+    onError: refetchIfStale,
+  })
+
+  const forbidden = query.isError && query.error instanceof ApiError && query.error.status === 403
+  const trimmed = reason.trim()
+
+  return (
+    <div className="panel">
+      <h4>Session eligibility</h4>
+      <p className="ph">
+        An administrator can revoke this repository&rsquo;s eligibility for new sessions -- from the web, chat, pull-request mentions and automations alike -- and restore it later. Restoring only lifts the revocation: it never makes a
+        repository eligible that this deployment does not already know.
+      </p>
+      <p className="ph">
+        A revocation names one repository by its owner and name. If the repository is renamed or moved to another owner on the code host, its new name is not revoked: revoke the new name too.
+      </p>
+      {forbidden && <p className="notavailable">Revoking and restoring a repository is admin-only. Your role cannot view or change it -- enforced by the server, not merely hidden on this screen.</p>}
+      {!forbidden && query.isPending && <p className="rail-empty">Loading…</p>}
+      {!forbidden && query.isError && <p className="rail-empty">Couldn&rsquo;t load this repository&rsquo;s session eligibility.</p>}
+      {!forbidden && query.isSuccess && (
+        <>
+          <RepoEntitlementStatus entitlement={query.data} />
+          {!isAdmin(role) && <RoleGateNote requiredRole="admin" />}
+          {isAdmin(role) && query.data.revoked && (
+            <div className="formrow" style={{ marginTop: 8 }}>
+              <button type="button" className="btn primary" disabled={restore.isPending} onClick={() => restore.mutate()}>
+                {restore.isPending ? 'Restoring…' : 'Restore'}
+              </button>
+            </div>
+          )}
+          {isAdmin(role) && !query.data.revoked && (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+              <label className="ph" htmlFor={`revoke-reason-${repoFullName}`}>
+                Reason (required, at most {MAX_REVOCATION_REASON_CHARS} characters)
+              </label>
+              <textarea id={`revoke-reason-${repoFullName}`} value={reason} maxLength={MAX_REVOCATION_REASON_CHARS} rows={2} onChange={(e) => setReason(e.target.value)} />
+              <div className="formrow">
+                <button type="button" className="btn" disabled={revoke.isPending || trimmed.length === 0} onClick={() => revoke.mutate()}>
+                  {revoke.isPending ? 'Revoking…' : 'Revoke new sessions'}
+                </button>
+              </div>
+            </div>
+          )}
+          {revoke.isError && <MutationError error={revoke.error} />}
+          {restore.isError && <MutationError error={restore.error} />}
         </>
       )}
     </div>
@@ -829,6 +971,7 @@ export function RepoSettingsView() {
               <RiskPolicyCard owner={owner} repo={repo} settings={query.data} canEdit={isAdmin(role)} />
               <AutoMergeCard owner={owner} repo={repo} settings={query.data} canEdit={isAdmin(role)} />
               <ShadowLedgerCard owner={owner} repo={repo} role={role} />
+              <RepoEntitlementCard owner={owner} repo={repo} role={role} />
               <SlotOutlet id="repo-settings.governance" fallback={<GatekeeperAffordance />} />
               <AutoRetriggerReviewCard owner={owner} repo={repo} settings={query.data} canEdit={isAdmin(role)} />
               <DescriptionAutofixCard owner={owner} repo={repo} settings={query.data} canEdit={isAdmin(role)} />

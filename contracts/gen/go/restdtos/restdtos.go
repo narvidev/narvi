@@ -9267,6 +9267,89 @@ func (j *RepoDigestScope) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// GET /api/repos/{owner}/{repo}/entitlement response body, and the body POST
+// .../entitlement/revoke and POST .../entitlement/restore return on success
+// (technical plan §31.4, "Un-entitlement"): whether an administrator revoked this
+// repository's eligibility for new sessions. A revoked repository is refused on
+// every session-creation surface, and its sessions' pending turns are refused
+// before they reach a sandbox, until an administrator restores it; a restore
+// re-opens only what the deployment already knows (a repository it has seen a
+// pull-request session for), it never grants eligibility. ADMIN-ONLY
+// (authz.ActionManageRepoEntitlement, §13.3). Every field is present; the four
+// describing a revocation are null when the repository is not revoked.
+type RepoEntitlement struct {
+	// Why it was revoked, as the administrator wrote it (1 to 500 characters). Null
+	// when not revoked.
+	Reason RepoEntitlementReason `json:"reason" yaml:"reason" mapstructure:"reason"`
+
+	// The natural 'owner/repo' key, exactly as the deployment's pull-request sessions
+	// name it -- revocation matches it exactly, never case-folded.
+	RepoFullName string `json:"repoFullName" yaml:"repoFullName" mapstructure:"repoFullName"`
+
+	// True while an administrator's revocation is in force: no new session may name
+	// this repository, and its sessions' pending turns are refused.
+	Revoked bool `json:"revoked" yaml:"revoked" mapstructure:"revoked"`
+
+	// When the revocation in force was made. Null when not revoked.
+	RevokedAt RepoEntitlementRevokedAt `json:"revokedAt" yaml:"revokedAt" mapstructure:"revokedAt"`
+
+	// That administrator's display name. Null when not revoked, or once that user no
+	// longer exists.
+	RevokedByDisplayName RepoEntitlementRevokedByDisplayName `json:"revokedByDisplayName" yaml:"revokedByDisplayName" mapstructure:"revokedByDisplayName"`
+
+	// The administrator who made it. Null when not revoked, or once that user no
+	// longer exists.
+	RevokedByUserId RepoEntitlementRevokedByUserId `json:"revokedByUserId" yaml:"revokedByUserId" mapstructure:"revokedByUserId"`
+}
+
+// Why it was revoked, as the administrator wrote it (1 to 500 characters). Null
+// when not revoked.
+type RepoEntitlementReason *string
+
+// When the revocation in force was made. Null when not revoked.
+type RepoEntitlementRevokedAt = *time.Time
+
+// That administrator's display name. Null when not revoked, or once that user no
+// longer exists.
+type RepoEntitlementRevokedByDisplayName *string
+
+// The administrator who made it. Null when not revoked, or once that user no
+// longer exists.
+type RepoEntitlementRevokedByUserId *string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *RepoEntitlement) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["reason"]; raw != nil && !ok {
+		return fmt.Errorf("field reason in RepoEntitlement: required")
+	}
+	if _, ok := raw["repoFullName"]; raw != nil && !ok {
+		return fmt.Errorf("field repoFullName in RepoEntitlement: required")
+	}
+	if _, ok := raw["revoked"]; raw != nil && !ok {
+		return fmt.Errorf("field revoked in RepoEntitlement: required")
+	}
+	if _, ok := raw["revokedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field revokedAt in RepoEntitlement: required")
+	}
+	if _, ok := raw["revokedByDisplayName"]; raw != nil && !ok {
+		return fmt.Errorf("field revokedByDisplayName in RepoEntitlement: required")
+	}
+	if _, ok := raw["revokedByUserId"]; raw != nil && !ok {
+		return fmt.Errorf("field revokedByUserId in RepoEntitlement: required")
+	}
+	type Plain RepoEntitlement
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = RepoEntitlement(plain)
+	return nil
+}
+
 // GET/PUT /api/repos/{owner}/{repo}/settings response body (§8.2/§21.2) -- an
 // admin, per-repo policy-flag row (migrations/000044_repo_settings.up.sql).
 // Deliberately a small, extensible shape: §21's auto-merge toggle, §24's
@@ -11470,6 +11553,40 @@ func (j *ReviewVerdictHistoryEntry) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = ReviewVerdictHistoryEntry(plain)
+	return nil
+}
+
+// POST /api/repos/{owner}/{repo}/entitlement/revoke's request body (technical plan
+// §31.4). reason is trimmed and must be 1 to 500 characters: blank is refused 400
+// "reason is required", longer is refused 400 "reason must be at most 500
+// characters", and one holding a NUL character is refused 400 "reason must not
+// contain a NUL byte". A repository already revoked is refused 409 and keeps its
+// first revocation's who, when and why; one the deployment does not know is
+// refused 404.
+type RevokeRepoEntitlementRequest struct {
+	// Why new sessions on this repository are revoked: 1 to 500 characters after
+	// trimming, kept with the revocation and in the audit log.
+	Reason string `json:"reason" yaml:"reason" mapstructure:"reason"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *RevokeRepoEntitlementRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["reason"]; raw != nil && !ok {
+		return fmt.Errorf("field reason in RevokeRepoEntitlementRequest: required")
+	}
+	type Plain RevokeRepoEntitlementRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if utf8.RuneCountInString(string(plain.Reason)) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "reason", 1)
+	}
+	*j = RevokeRepoEntitlementRequest(plain)
 	return nil
 }
 
@@ -16195,7 +16312,19 @@ type WorkflowStepRunOutcomeSummary *string
 
 type WorkflowStepRunStatus string
 
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
+const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
+const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
+const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
+const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
+
+var enumValues_WorkflowStepRunStatus = []interface{}{
+	"awaiting_decision",
+	"running",
+	"completed",
+	"failed",
+	"cancelled",
+}
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
@@ -16215,22 +16344,6 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	}
 	*j = WorkflowStepRunStatus(v)
 	return nil
-}
-
-type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
-
-const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
-const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
-const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
-const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
-const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
-
-var enumValues_WorkflowStepRunStatus = []interface{}{
-	"awaiting_decision",
-	"running",
-	"completed",
-	"failed",
-	"cancelled",
 }
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
@@ -16295,4 +16408,8 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
 type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
+
+type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict

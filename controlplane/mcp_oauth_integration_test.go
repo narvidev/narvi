@@ -1230,6 +1230,9 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	t.Run("CreateSession_ViewerRefusedLikeREST_SDKClient", func(t *testing.T) {
 		sdkCreateSessionViewer(t, createRig)
 	})
+	t.Run("CreateSession_RevokedRepo_ToolErrorNamesRevocation_SDKClient", func(t *testing.T) {
+		sdkCreateSessionRevokedRepo(t, createRig)
+	})
 	// Row 183's plan decisions, revisions and prompts over MCP (technical
 	// plan §43.21), on createRig too: every approval or turn that is
 	// accepted spawns a session actor. mcp_plandecisions_integration_test.go

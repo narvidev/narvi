@@ -927,6 +927,13 @@ func (a *Actor) tryPlanSpawn(
 	// httpapi.CreateSessionCore's own up-front one, not a re-use of its
 	// result.
 	if action.Kind == sandbox.SpawnActionSpawn || action.Kind == sandbox.SpawnActionRestore || action.Kind == sandbox.SpawnActionResume {
+		// §31.4's spawn-time re-read of an administrator's revocation --
+		// first, and in every rollout mode: see refuseIfRepoRevoked's own
+		// doc comment (repoentitlement.go).
+		if err := a.refuseIfRepoRevoked(ctx, tx, sessionRow); err != nil {
+			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, sandboxGen(sandboxRow, hasSandbox), err, now)
+		}
+
 		dockerRequired, err := a.refuseIfSubstrateUnsupported(ctx, tx, sessionRow, caps)
 		if err != nil {
 			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, sandboxGen(sandboxRow, hasSandbox), err, now)
@@ -1330,9 +1337,10 @@ func sandboxGen(sandboxRow sqlcgen.Sandbox, hasSandbox bool) int {
 }
 
 // spawnRefusal is a spawn-time policy refusal: a fact about the session
-// that no retry of the same evaluation changes -- a repo the cohort
-// rollout does not admit, an environment the configured provider cannot
-// honor (technical plan §27.5, §32). refuseIfSubstrateUnsupported and
+// that no retry of the same evaluation changes -- a repo an administrator
+// revoked, a repo the cohort rollout does not admit, an environment the
+// configured provider cannot honor (technical plan §31.4, §27.5, §32).
+// refuseIfRepoRevoked, refuseIfSubstrateUnsupported and
 // refuseIfRolloutUnenrolled return it; tryPlanSpawn hands it to
 // endTurnsOnSpawnRefusal. Anything else those gates return is transient.
 type spawnRefusal struct {
@@ -2222,7 +2230,10 @@ func (a *Actor) tryPlanDispatch(
 // bypass this Step's own review found structurally unrepresentable rather
 // than merely undocumented -- a bare miss in ONE of several remembered
 // call sites can no longer silently let a de-enrolled repo's session keep
-// being dispatched.
+// being dispatched. (A receipt re-send -- a prompt sent again to the gen
+// it was already sent to, §3.3 -- leaves executeDispatch at its top for
+// executeReceiptResend, which runs its own rollout re-check, acts on the
+// revocation tryPlanReceiptResend read, and never fails the turn.)
 //
 // This runs AFTER tryPlanDispatch/tryPlanReenqueue's own transact has
 // already committed the turn Processing (this file's own top "#
@@ -2248,11 +2259,27 @@ func (a *Actor) tryPlanDispatch(
 // A plan carrying receiptResend -- technical plan §3.3's prompt-receipt
 // check of a same-gen reconnect -- goes to executeReceiptResend instead,
 // which runs the same rollout re-check but never fails the turn: its
-// prompt was already sent once, and may be running.
+// prompt was already sent to this gen, and may be running.
 func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainStart pgtype.Timestamptz) error {
 	if plan.receiptResend != nil {
 		return a.executeReceiptResend(ctx, plan)
 	}
+
+	// §31.4's turn-dispatch-time re-read of an administrator's revocation,
+	// in every rollout mode, for every dispatchPlan that sends a prompt to
+	// a gen that has not had it: a first dispatch, or tryPlanReenqueue's
+	// re-send of a turn that was processing on a gen since lost -- which
+	// this therefore ends with the revocation reason, as the spawn-time
+	// re-read ends one whose sandbox died. See revocationRefusalForDispatch's
+	// own doc comment (repoentitlement.go). A receiptResend plan re-sends a
+	// prompt to the gen it was already sent to, which may be running it, so
+	// it is never failed here: tryPlanReceiptResend read the revocation
+	// before its claim, and the re-send is only refused
+	// (refuseResendIfRepoRevoked).
+	if failure, fail := a.revocationRefusalForDispatch(ctx, plan.sessionRow, chainStart); fail {
+		return a.failDispatchedTurn(ctx, plan.turnID, failure)
+	}
+
 	if repo, refused, transient := a.rolloutRefusalForDispatch(ctx, plan.sessionRow); refused {
 		a.logger.Error("sessionactor: refusing to dispatch turn: configured repo is not enrolled in the cohort rollout (§10 Phase 6, §32 turn-dispatch-time fail-closed re-check)",
 			"session_id", a.sessionID.String(), "turn_id", plan.turnID.String(), "repo", repo, "transient", transient)

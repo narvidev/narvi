@@ -67,6 +67,13 @@ const busyReplyText = "Still working on the previous message in this thread — 
 // only tells the user the truth instead of nothing at all.
 const stopNotSupportedText = "Stopping an in-progress turn isn't supported yet — this request wasn't cancelled."
 
+// repoRevokedAckText (§31.4, "Un-entitlement") acknowledges a new agent
+// session refused because an administrator revoked the repository
+// (CreateSessionError.RepoEntitlementRevoked) -- the same words Slack posts
+// (slack's ackRepoRevokedText), naming who closed the repository and who
+// can reopen it, never an installation or configuration problem.
+const repoRevokedAckText = "An administrator of this deployment revoked new sessions on this repository. An administrator can restore them."
+
 // planAwaitingApprovalReplyText is this batch's own honest reply
 // (§8.1 follow-up fix), posted back to the thread when
 // handlePrompted's own ordinary-reply path declines to create a build turn
@@ -607,6 +614,19 @@ func (deps Deps) handleCreated(ctx context.Context, payload agentSessionEventWeb
 		// Worded like Slack's own identical ackRepoNotEntitledText (slack/
 		// handler.go) -- true without leaking whether this repository is
 		// otherwise known to Narvi at all.
+		// A revocation (§31.4, "Un-entitlement") is the same terminal
+		// refusal: release only the agent-session claim, ack terminally, and
+		// say who closed the repository and who can reopen it -- the same
+		// words Slack uses (ackRepoRevokedText), never "not configured".
+		if cerr.RepoEntitlementRevoked {
+			logger.Warn("linear: create session refused: repo entitlement revoked", "agent_session_id", payload.AgentSession.ID)
+			if releaseErr := deps.AgentSessions.Release(ctx, payload.AgentSession.ID); releaseErr != nil {
+				logger.Error("linear: release agent session claim failed", "error", releaseErr, "agent_session_id", payload.AgentSession.ID)
+			}
+			deps.postAcknowledgment(ctx, payload.OrganizationID, payload.AgentSession.ID, repoRevokedAckText, notice)
+			return true
+		}
+
 		if cerr.RepoEntitlementDenied {
 			logger.Warn("linear: create session refused: repo not entitled", "agent_session_id", payload.AgentSession.ID)
 			if releaseErr := deps.AgentSessions.Release(ctx, payload.AgentSession.ID); releaseErr != nil {

@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -197,14 +198,55 @@ func (s *GitHubPRSessionStore) RecordMergeOutcome(ctx context.Context, repoFullN
 	})
 }
 
-// RepoKnown is fix/repo-scoped-authorization's own entitlement signal:
-// reports whether ANY github_pr_sessions row exists for repoFullName --
-// see RepoKnownToDeployment's own generated doc comment for the full "why
-// this is a sound, externally-verified proof this deployment is genuinely
-// attached to repoFullName" reasoning. Used by httpapi's own
-// resolveKnownRepo (reposettings.go) to reject a request whose URL names a
-// repository this deployment has never actually seen GitHub webhook
-// traffic for.
-func (s *GitHubPRSessionStore) RepoKnown(ctx context.Context, repoFullName string) (bool, error) {
-	return s.q.RepoKnownToDeployment(ctx, repoFullName)
+// RepoEntitlementFacts is a repository's eligibility for session creation
+// as one statement read it (§31.4): Known, a github_pr_sessions row names
+// it (fix/repo-scoped-authorization's own entitlement signal -- see
+// ReadRepoEntitlement's generated doc comment for why that is a sound,
+// externally-verified proof this deployment is attached to the repository);
+// Revoked, an administrator revoked it (repo_entitlement_revocations). The
+// two are only ever read together, so no caller can hold Known without
+// Revoked.
+type RepoEntitlementFacts struct {
+	Known   bool
+	Revoked bool
+}
+
+// RepoEntitlement reads repoFullName's RepoEntitlementFacts in one
+// statement (ReadRepoEntitlement). Its callers are the session-creation
+// resolvers (httpapi's repoentitlementgate.go), which refuse on Revoked
+// before Known, and httpapi's confirmRepoKnown (reposettings.go), which
+// scopes the repository-scoped admin routes on Known alone so an
+// administrator can still reach a revoked repository -- its restore route
+// included. internal/ops' ScanRepoEntitlementReads pins that list.
+func (s *GitHubPRSessionStore) RepoEntitlement(ctx context.Context, repoFullName string) (RepoEntitlementFacts, error) {
+	row, err := s.q.ReadRepoEntitlement(ctx, repoFullName)
+	if err != nil {
+		return RepoEntitlementFacts{}, err
+	}
+	return RepoEntitlementFacts{Known: row.RepoKnown, Revoked: row.Revoked}, nil
+}
+
+// RevokedRepoForSession reports the first repository of sessionID an
+// administrator revoked (§31.4), and whether there is one: one of
+// repoFullNames (the session's clone URLs, already parsed by the caller),
+// or the base repository of a pull-request claim keyed to the session (a
+// review session's github_pr_sessions row, a sentinel auto-fix child's
+// sentinel_fixes row) -- see FirstRevokedRepoForSession's generated doc
+// comment. internal/app/sessionactor reads it before a spawn and before
+// each dispatch.
+func (s *GitHubPRSessionStore) RevokedRepoForSession(ctx context.Context, sessionID pgtype.UUID, repoFullNames []string) (string, bool, error) {
+	if repoFullNames == nil {
+		repoFullNames = []string{}
+	}
+	repo, err := s.q.FirstRevokedRepoForSession(ctx, sqlcgen.FirstRevokedRepoForSessionParams{
+		RepoFullNames: repoFullNames,
+		SessionID:     sessionID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return repo, true, nil
 }

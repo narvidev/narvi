@@ -110,3 +110,76 @@ func TestRepoForbiddenError_ErrorStringNamesRepoAndActor(t *testing.T) {
 		t.Errorf("Error() = %q, want it to name both the actor (%q) and the repo (%q)", got, "u42", "acme/widgets")
 	}
 }
+
+// TestAuthorizeRepo_RevokedDeniesEvenWhenKnown pins §31.4's revocation: a
+// repository this deployment knows, but an administrator revoked, is
+// refused for every role, with an error that unwraps to both
+// ErrRepoForbidden (every existing caller's refusal check) and
+// ErrRepoRevoked (the distinct reason), and names the repository and actor.
+func TestAuthorizeRepo_RevokedDeniesEvenWhenKnown(t *testing.T) {
+	t.Parallel()
+
+	for _, role := range authz.AllRoles {
+		role := role
+		t.Run(string(role), func(t *testing.T) {
+			t.Parallel()
+			actor := authz.Actor{UserID: "u7", Role: role}
+			err := authz.AuthorizeRepo(actor, authz.RepoAdmission{FullName: "acme/widgets", Known: true, Revoked: true})
+			if err == nil {
+				t.Fatalf("AuthorizeRepo(%s, known and revoked) = nil, want a refusal", role)
+			}
+			if !errors.Is(err, authz.ErrRepoForbidden) {
+				t.Errorf("errors.Is(err, ErrRepoForbidden) = false, want true (err=%v)", err)
+			}
+			if !errors.Is(err, authz.ErrRepoRevoked) {
+				t.Errorf("errors.Is(err, ErrRepoRevoked) = false, want true (err=%v)", err)
+			}
+			var revoked *authz.RepoRevokedError
+			if !errors.As(err, &revoked) {
+				t.Fatalf("errors.As(err, *RepoRevokedError) = false, want true (err=%v)", err)
+			}
+			if revoked.RepoFullName != "acme/widgets" || revoked.Actor != actor {
+				t.Errorf("RepoRevokedError = %+v, want repo acme/widgets and actor %+v", revoked, actor)
+			}
+			if got := err.Error(); !strings.Contains(got, "u7") || !strings.Contains(got, "acme/widgets") || !strings.Contains(got, "revoked") {
+				t.Errorf("Error() = %q, want it to name the actor, the repo and the revocation", got)
+			}
+		})
+	}
+}
+
+// TestAuthorizeRepo_RevokedTakesPrecedenceOverUnknown: a repository both
+// unknown and revoked is reported as revoked, and an unknown repository
+// that is not revoked is never reported as revoked -- the two refusals
+// stay distinct in both directions.
+func TestAuthorizeRepo_RevokedTakesPrecedenceOverUnknown(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name        string
+		admission   authz.RepoAdmission
+		wantErr     bool
+		wantRevoked bool
+	}{
+		{"known, not revoked", authz.RepoAdmission{FullName: "acme/widgets", Known: true, Revoked: false}, false, false},
+		{"known, revoked", authz.RepoAdmission{FullName: "acme/widgets", Known: true, Revoked: true}, true, true},
+		{"unknown, revoked", authz.RepoAdmission{FullName: "acme/widgets", Known: false, Revoked: true}, true, true},
+		{"unknown, not revoked", authz.RepoAdmission{FullName: "acme/widgets", Known: false, Revoked: false}, true, false},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := authz.AuthorizeRepo(authz.Actor{UserID: "u1", Role: authz.RoleAdmin}, tc.admission)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("AuthorizeRepo = %v, want error %v", err, tc.wantErr)
+			}
+			if got := errors.Is(err, authz.ErrRepoRevoked); got != tc.wantRevoked {
+				t.Errorf("errors.Is(err, ErrRepoRevoked) = %v, want %v (err=%v)", got, tc.wantRevoked, err)
+			}
+			var forbidden *authz.RepoForbiddenError
+			if got := errors.As(err, &forbidden); got != (tc.wantErr && !tc.wantRevoked) {
+				t.Errorf("errors.As(err, *RepoForbiddenError) = %v, want %v (err=%v)", got, tc.wantErr && !tc.wantRevoked, err)
+			}
+		})
+	}
+}

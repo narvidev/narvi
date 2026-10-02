@@ -190,6 +190,14 @@ export const shadowLedgerQueryKeys = {
   detail: (repoFullName: string) => ['shadow-ledger', repoFullName] as const,
 }
 
+// repoEntitlementQueryKeys -- an administrator's revocation of a
+// repository's eligibility for new sessions (GET .../entitlement), its own
+// admin-only endpoint and cache entry: revoking or restoring changes no
+// repo_settings field, so it never invalidates repoSettingsQueryKeys.
+export const repoEntitlementQueryKeys = {
+  detail: (repoFullName: string) => ['repo-entitlement', repoFullName] as const,
+}
+
 export const sandboxSecretQueryKeys = {
   list: (scope: Parameters<typeof scopeKeyParts>[0]) => ['sandbox-secrets', ...scopeKeyParts(scope)] as const,
 }

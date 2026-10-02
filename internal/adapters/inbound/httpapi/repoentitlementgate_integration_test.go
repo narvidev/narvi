@@ -4,7 +4,7 @@
 // primary, session-creation-time gate: ResolveRepoEntitlement
 // (repoentitlementgate.go), exercised both directly (the Defect-1 audit
 // fix moved essentially all of the interesting I/O-driven repo-name-
-// resolution/RepoKnown-read/denial logic into this one resolver, called
+// resolution/RepoEntitlement-read/denial logic into this one resolver, called
 // by every CreateSessionOnTx caller before any transaction opens) and
 // through the real, exported CreateSessionOnTx/CreateSessionCore entry
 // points -- deliberately in package httpapi (not httpapi_test), mirroring
@@ -17,11 +17,13 @@ package httpapi
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
@@ -243,19 +245,22 @@ func TestResolveRepoEntitlement_Denied_WritesAuditLogRow(t *testing.T) {
 	}
 }
 
-// TestCreateSessionOnTx_RepoEntitlementGate_GithubSpawnSourceExemptEvenWhenUnknown
-// is the mutation anchor for the fork-vs-base correctness fix this gate's
-// own doc comment explains at length: req.SpawnSource == github must be
-// admitted even for a repo with NO github_pr_sessions row at all --
-// removing this exemption would wrongly deny every cross-repo (fork-based)
-// PR review session in production, since a fork's own clone URL never
-// independently accumulates its own github_pr_sessions history.
+// TestResolveGitHubRepoEntitlement_UnknownClaimStillAdmitted is the
+// mutation anchor for the fork-vs-base correctness fix this gate's own doc
+// comment explains at length: a GitHub-originated request must be admitted
+// even when NEITHER its pull request's base repository (the claim) NOR its
+// clone URL has a github_pr_sessions row of its own -- requiring Known
+// there would wrongly deny every cross-repo (fork-based) PR review session
+// in production, since a fork's own clone URL never independently
+// accumulates its own github_pr_sessions history, and the claim row is
+// written only in the transaction this decision precedes. Only an
+// administrator's revocation refuses this source (§31.4); see
+// TestResolveGitHubRepoEntitlement_RevokedClaimRefusedEvenForForkURL.
 //
-// Mutation anchor: deleting ResolveRepoEntitlement's own `if
-// req.SpawnSource == restdtos.CreateSessionRequestSpawnSourceGithub {
-// return RepoEntitlementDecision{admitted: true}, nil }` short-circuit
-// makes this test fail (flips from admitted to refused).
-func TestCreateSessionOnTx_RepoEntitlementGate_GithubSpawnSourceExemptEvenWhenUnknown(t *testing.T) {
+// Mutation anchor: making resolveGitHubRepoEntitlement require Known (or
+// dropping the github branch so ResolveRepoEntitlement's full predicate
+// runs) makes this test fail (flips from admitted to refused).
+func TestResolveGitHubRepoEntitlement_UnknownClaimStillAdmitted(t *testing.T) {
 	ctx := context.Background()
 	pool := newCoreTestPool(t)
 	sessions := narvipg.NewSessionStore(pool)
@@ -274,9 +279,15 @@ func TestCreateSessionOnTx_RepoEntitlementGate_GithubSpawnSourceExemptEvenWhenUn
 	req := newEntitlementGateTestReq(restdtos.CreateSessionRequestSpawnSourceGithub, forkURL)
 	var nilCreator pgtype.UUID
 
-	entitlement, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req)
+	entitlement, everr := ResolveGitHubRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req, "acme/"+t.Name()+"-base")
 	if everr != nil {
-		t.Fatalf("ResolveRepoEntitlement: status=%d message=%q, want success -- spawnSource=github must be exempt even for a never-known (fork-shaped) repo", everr.Status, everr.Message)
+		t.Fatalf("ResolveGitHubRepoEntitlement: status=%d message=%q, want success -- a GitHub-originated request needs no known repository, only none revoked", everr.Status, everr.Message)
+	}
+
+	// ResolveRepoEntitlement takes the same branch for a github request with
+	// no claim (CreateSessionForBot).
+	if _, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, nilCreator, req); everr != nil {
+		t.Fatalf("ResolveRepoEntitlement(github): status=%d message=%q, want success", everr.Status, everr.Message)
 	}
 
 	tx, err := pool.Begin(ctx)
@@ -287,7 +298,7 @@ func TestCreateSessionOnTx_RepoEntitlementGate_GithubSpawnSourceExemptEvenWhenUn
 
 	created, _, cerr := CreateSessionOnTx(ctx, tx, sessions, turns, environments, auditLog, req, nilCreator, false, platform.RolloutModeOpen, repoSettings, entitlement)
 	if cerr != nil {
-		t.Fatalf("CreateSessionOnTx: status=%d message=%q, want success -- spawnSource=github must be exempt even for a never-known (fork-shaped) repo", cerr.Status, cerr.Message)
+		t.Fatalf("CreateSessionOnTx: status=%d message=%q, want success", cerr.Status, cerr.Message)
 	}
 	if !created.ID.Valid {
 		t.Fatal("created.ID is not valid -- CreateSessionOnTx did not actually insert a session")
@@ -365,7 +376,7 @@ func TestResolveRepoEntitlement_CrossHostSpoofRefused(t *testing.T) {
 // own fault-injection idiom, adapted for a resolver that (per the Defect-1
 // audit fix) takes no tx parameter at all: a context that is ALREADY
 // canceled before ResolveRepoEntitlement is ever called stands in for a
-// genuine github_pr_sessions read failure (RepoKnown's own pool-backed
+// genuine github_pr_sessions read failure (RepoEntitlement's own pool-backed
 // query surfaces context.Canceled the same way it would surface a real
 // Postgres outage -- a non-nil, non-ErrNoRows error). Fails closed (everr
 // != nil, never silently admitted) but RepoEntitlementDenied stays false
@@ -390,7 +401,7 @@ func TestResolveRepoEntitlement_ReadErrorFailsClosedButNotAsPolicy(t *testing.T)
 	canceledCtx, cancel := context.WithCancel(context.Background())
 	cancel()
 	// canceledCtx is now done -- any query issued with it (including
-	// ResolveRepoEntitlement's own prSessions.RepoKnown) returns a genuine
+	// ResolveRepoEntitlement's own prSessions.RepoEntitlement) returns a genuine
 	// error, standing in for a real Postgres outage (including a
 	// context-canceled or timed-out query, which pgx surfaces the SAME
 	// way: a non-nil, non-ErrNoRows error on the query call).
@@ -608,5 +619,280 @@ func TestCreateSessionCore_DeniedRepo_DoesNotNeedASecondPoolConnection(t *testin
 	}
 	if count != 1 {
 		t.Errorf("audit_log rows for denied repo %s = %d, want exactly 1 -- a denial must be loud (audited), never silent, even under pool pressure", deniedFullName, count)
+	}
+}
+
+// revokeForTest records an administrator's revocation of fullName (§31.4).
+func revokeForTest(ctx context.Context, t *testing.T, pool *pgxpool.Pool, fullName string) {
+	t.Helper()
+	if _, err := narvipg.NewRepoEntitlementRevocationStore(pool).Revoke(ctx, fullName, pgtype.UUID{}, "revoked by a test"); err != nil {
+		t.Fatalf("revoke %s: %v", fullName, err)
+	}
+}
+
+// deniedCount is session_repo_entitlement_denied_total for spawnSource and
+// reason, as httpapi's own meter scope reports it: every denial counted
+// here is a session creation's, so each point must carry stage "create".
+func deniedCount(ctx context.Context, t *testing.T, spawnSource, reason string) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := gateMetrics().Collect(ctx, &rm); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	var n int64
+	for _, sm := range rm.ScopeMetrics {
+		if sm.Scope.Name != repoEntitlementGateMeterName {
+			continue
+		}
+		for _, m := range sm.Metrics {
+			if m.Name != "session_repo_entitlement_denied_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("%s is a %T, want an int64 sum", m.Name, m.Data)
+			}
+			for _, point := range sum.DataPoints {
+				source, _ := point.Attributes.Value("spawn_source")
+				why, _ := point.Attributes.Value("reason")
+				if stage, _ := point.Attributes.Value("stage"); stage.AsString() != "create" {
+					t.Fatalf("a %s point carries stage %q, want \"create\": httpapi counts session creations only", m.Name, stage.AsString())
+				}
+				if source.AsString() == spawnSource && why.AsString() == reason {
+					n += point.Value
+				}
+			}
+		}
+	}
+	return n
+}
+
+// denialAuditReasons is the detail "reason" of every
+// session.repo_entitlement_denied row for fullName, oldest first.
+func denialAuditReasons(ctx context.Context, t *testing.T, pool *pgxpool.Pool, fullName string) []string {
+	t.Helper()
+	rows, err := pool.Query(ctx, `SELECT detail_json->>'reason' FROM audit_log WHERE action = 'session.repo_entitlement_denied' AND resource_type = 'repo' AND resource_id = $1 ORDER BY id`, fullName)
+	if err != nil {
+		t.Fatalf("query audit_log: %v", err)
+	}
+	var reasons []string
+	for rows.Next() {
+		var reason *string
+		if err := rows.Scan(&reason); err != nil {
+			rows.Close()
+			t.Fatalf("scan: %v", err)
+		}
+		if reason == nil {
+			reasons = append(reasons, "<none>")
+		} else {
+			reasons = append(reasons, *reason)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return reasons
+}
+
+// TestResolveRepoEntitlement_RevokedKnownRepoRefused is §31.4's
+// "Un-entitlement" at the resolver: a repository this deployment knows, but
+// an administrator revoked, is refused -- 403 with the revocation's own
+// message, RepoEntitlementDenied (so every caller treats it as permanent)
+// and RepoEntitlementRevoked (so a caller can say who lifts it), counted and
+// audited with reason "revoked". An unknown repository's denial stays
+// "unknown", with its own message.
+func TestResolveRepoEntitlement_RevokedKnownRepoRefused(t *testing.T) {
+	ctx := context.Background()
+	pool := newCoreTestPool(t)
+	auditLog := narvipg.NewAuditLogStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+
+	repoURL, fullName := entitlementTestRepo(t)
+	if err := prSessions.EnsureRow(ctx, fullName, 1); err != nil {
+		t.Fatalf("seed github_pr_sessions: %v", err)
+	}
+	revokeForTest(ctx, t, pool, fullName)
+
+	before := deniedCount(ctx, t, "web", "revoked")
+	decision, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, pgtype.UUID{}, newEntitlementGateTestReq(restdtos.CreateSessionRequestSpawnSourceWeb, repoURL))
+	if everr == nil || decision.admitted {
+		t.Fatalf("ResolveRepoEntitlement = (%+v, nil), want a refusal of a revoked repository", decision)
+	}
+	if everr.Status != http.StatusForbidden || !everr.RepoEntitlementDenied || !everr.RepoEntitlementRevoked {
+		t.Errorf("refusal = %+v, want 403 with RepoEntitlementDenied and RepoEntitlementRevoked", everr)
+	}
+	if want := "repository entitlement revoked by an administrator: " + fullName; everr.Message != want {
+		t.Errorf("message = %q, want %q", everr.Message, want)
+	}
+	if got := deniedCount(ctx, t, "web", "revoked") - before; got != 1 {
+		t.Errorf("session_repo_entitlement_denied_total{web, revoked} grew by %d, want 1", got)
+	}
+	if got := denialAuditReasons(ctx, t, pool, fullName); len(got) != 1 || got[0] != "revoked" {
+		t.Errorf("denial audit reasons = %v, want [revoked]", got)
+	}
+
+	unknownURL, unknownName := "https://github.com/acme/"+t.Name()+"-unknown.git", "acme/"+t.Name()+"-unknown"
+	_, everr = ResolveRepoEntitlement(ctx, prSessions, auditLog, pgtype.UUID{}, newEntitlementGateTestReq(restdtos.CreateSessionRequestSpawnSourceWeb, unknownURL))
+	if everr == nil || everr.RepoEntitlementRevoked || everr.Message != "repository not entitled: "+unknownName {
+		t.Errorf("unknown repo refusal = %+v, want not entitled, not revoked", everr)
+	}
+	if got := denialAuditReasons(ctx, t, pool, unknownName); len(got) != 1 || got[0] != "unknown" {
+		t.Errorf("unknown repo denial audit reasons = %v, want [unknown]", got)
+	}
+}
+
+// TestResolveRepoEntitlement_MultiRepo_OneRevokedRefuses: one revoked
+// repository among known ones refuses the whole request, naming it.
+func TestResolveRepoEntitlement_MultiRepo_OneRevokedRefuses(t *testing.T) {
+	ctx := context.Background()
+	pool := newCoreTestPool(t)
+	auditLog := narvipg.NewAuditLogStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+
+	openURL, openName := "https://github.com/acme/"+t.Name()+"-open.git", "acme/"+t.Name()+"-open"
+	revokedURL, revokedName := "https://github.com/acme/"+t.Name()+"-revoked.git", "acme/"+t.Name()+"-revoked"
+	for _, name := range []string{openName, revokedName} {
+		if err := prSessions.EnsureRow(ctx, name, 1); err != nil {
+			t.Fatalf("seed github_pr_sessions: %v", err)
+		}
+	}
+	revokeForTest(ctx, t, pool, revokedName)
+
+	_, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, pgtype.UUID{}, newEntitlementGateTestReq(restdtos.CreateSessionRequestSpawnSourceWeb, openURL, revokedURL))
+	if everr == nil || !everr.RepoEntitlementRevoked || !strings.HasSuffix(everr.Message, revokedName) {
+		t.Fatalf("refusal = %+v, want the revoked second repository named", everr)
+	}
+}
+
+// TestResolveRepoEntitlement_RevocationReadErrorFailsClosedButNotAsPolicy:
+// a read that fails, for a revoked repository, refuses this attempt with
+// 503 but is neither a denial nor a revocation: no flag set, nothing
+// counted, nothing audited.
+func TestResolveRepoEntitlement_RevocationReadErrorFailsClosedButNotAsPolicy(t *testing.T) {
+	ctx := context.Background()
+	pool := newCoreTestPool(t)
+	auditLog := narvipg.NewAuditLogStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+
+	repoURL, fullName := entitlementTestRepo(t)
+	if err := prSessions.EnsureRow(ctx, fullName, 1); err != nil {
+		t.Fatalf("seed github_pr_sessions: %v", err)
+	}
+	revokeForTest(ctx, t, pool, fullName)
+
+	canceledCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	before := deniedCount(ctx, t, "web", "revoked")
+	for _, resolve := range []func() *CreateSessionError{
+		func() *CreateSessionError {
+			_, everr := ResolveRepoEntitlement(canceledCtx, prSessions, auditLog, pgtype.UUID{}, newEntitlementGateTestReq(restdtos.CreateSessionRequestSpawnSourceWeb, repoURL))
+			return everr
+		},
+		func() *CreateSessionError {
+			_, everr := ResolveGitHubRepoEntitlement(canceledCtx, prSessions, auditLog, pgtype.UUID{}, newEntitlementGateTestReq(restdtos.CreateSessionRequestSpawnSourceGithub, repoURL), fullName)
+			return everr
+		},
+	} {
+		everr := resolve()
+		if everr == nil || everr.Status != http.StatusServiceUnavailable || everr.RepoEntitlementDenied || everr.RepoEntitlementRevoked {
+			t.Errorf("refusal on a failed read = %+v, want 503 and neither denial flag", everr)
+		}
+	}
+	if got := deniedCount(ctx, t, "web", "revoked") - before; got != 0 {
+		t.Errorf("session_repo_entitlement_denied_total grew by %d on a failed read, want 0", got)
+	}
+	if got := denialAuditReasons(ctx, t, pool, fullName); len(got) != 0 {
+		t.Errorf("denial audit rows on a failed read = %v, want none", got)
+	}
+}
+
+// TestResolveRepoEntitlement_RestoredRepoAdmittedAgain: once the
+// revocation is lifted, the same request is admitted again -- restore
+// re-opens what the deployment knows.
+func TestResolveRepoEntitlement_RestoredRepoAdmittedAgain(t *testing.T) {
+	ctx := context.Background()
+	pool := newCoreTestPool(t)
+	auditLog := narvipg.NewAuditLogStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+
+	repoURL, fullName := entitlementTestRepo(t)
+	if err := prSessions.EnsureRow(ctx, fullName, 1); err != nil {
+		t.Fatalf("seed github_pr_sessions: %v", err)
+	}
+	revokeForTest(ctx, t, pool, fullName)
+	req := newEntitlementGateTestReq(restdtos.CreateSessionRequestSpawnSourceWeb, repoURL)
+	if _, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, pgtype.UUID{}, req); everr == nil {
+		t.Fatal("ResolveRepoEntitlement admitted a revoked repository")
+	}
+	if _, err := narvipg.NewRepoEntitlementRevocationStore(pool).Restore(ctx, fullName); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	decision, everr := ResolveRepoEntitlement(ctx, prSessions, auditLog, pgtype.UUID{}, req)
+	if everr != nil || !decision.admitted {
+		t.Fatalf("ResolveRepoEntitlement after the restore = (%+v, %+v), want admitted", decision, everr)
+	}
+}
+
+// TestResolveGitHubRepoEntitlement_RevokedClaimRefusedEvenForForkURL: a
+// GitHub-originated request is refused when an administrator revoked the
+// pull request's base repository, even though its clone URL names a fork
+// no revocation matches -- the claim is read, not only the URL. A revoked
+// clone URL refuses too.
+func TestResolveGitHubRepoEntitlement_RevokedClaimRefusedEvenForForkURL(t *testing.T) {
+	ctx := context.Background()
+	pool := newCoreTestPool(t)
+	auditLog := narvipg.NewAuditLogStore(pool)
+	prSessions := narvipg.NewGitHubPRSessionStore(pool)
+
+	base := "acme/" + t.Name() + "-base"
+	forkURL := "https://github.com/contributor/" + t.Name() + "-base.git"
+	revokeForTest(ctx, t, pool, base)
+
+	before := deniedCount(ctx, t, "github", "revoked")
+	decision, everr := ResolveGitHubRepoEntitlement(ctx, prSessions, auditLog, pgtype.UUID{}, newEntitlementGateTestReq(restdtos.CreateSessionRequestSpawnSourceGithub, forkURL), base)
+	if everr == nil || decision.admitted {
+		t.Fatalf("ResolveGitHubRepoEntitlement = (%+v, nil), want the revoked base repository refused", decision)
+	}
+	if !everr.RepoEntitlementDenied || !everr.RepoEntitlementRevoked || everr.Message != "repository entitlement revoked by an administrator: "+base {
+		t.Errorf("refusal = %+v, want the revocation of %s", everr, base)
+	}
+	if got := deniedCount(ctx, t, "github", "revoked") - before; got != 1 {
+		t.Errorf("session_repo_entitlement_denied_total{github, revoked} grew by %d, want 1", got)
+	}
+	if got := denialAuditReasons(ctx, t, pool, base); len(got) != 1 || got[0] != "revoked" {
+		t.Errorf("denial audit reasons = %v, want [revoked]", got)
+	}
+
+	// The clone URL's own repository revoked, the claim not.
+	revokedFork := "contributor/" + t.Name() + "-fork"
+	revokeForTest(ctx, t, pool, revokedFork)
+	_, everr = ResolveGitHubRepoEntitlement(ctx, prSessions, auditLog, pgtype.UUID{}, newEntitlementGateTestReq(restdtos.CreateSessionRequestSpawnSourceGithub, "https://github.com/"+revokedFork+".git"), "acme/"+t.Name()+"-open-base")
+	if everr == nil || !everr.RepoEntitlementRevoked || !strings.HasSuffix(everr.Message, revokedFork) {
+		t.Errorf("refusal of a revoked clone URL = %+v, want it named", everr)
+	}
+}
+
+// TestResolveGitHubRepoEntitlement_EmptyClaimFailsClosed: every caller of
+// the GitHub resolver names the pull request's repository, so an empty one
+// is a wiring defect -- 503, never an admission and never a policy
+// refusal.
+func TestResolveGitHubRepoEntitlement_EmptyClaimFailsClosed(t *testing.T) {
+	ctx := context.Background()
+	pool := newCoreTestPool(t)
+	repoURL, _ := entitlementTestRepo(t)
+
+	decision, everr := ResolveGitHubRepoEntitlement(ctx, narvipg.NewGitHubPRSessionStore(pool), narvipg.NewAuditLogStore(pool), pgtype.UUID{}, newEntitlementGateTestReq(restdtos.CreateSessionRequestSpawnSourceGithub, repoURL), "")
+	if everr == nil || decision.admitted {
+		t.Fatalf("ResolveGitHubRepoEntitlement with no claim = (%+v, nil), want a refusal", decision)
+	}
+	if everr.Status != http.StatusServiceUnavailable || everr.RepoEntitlementDenied || everr.RepoEntitlementRevoked {
+		t.Errorf("refusal = %+v, want 503 with neither denial flag", everr)
+	}
+
+	// A nil store fails closed the same way, the GitHub branch included.
+	_, everr = ResolveGitHubRepoEntitlement(ctx, nil, narvipg.NewAuditLogStore(pool), pgtype.UUID{}, newEntitlementGateTestReq(restdtos.CreateSessionRequestSpawnSourceGithub, repoURL), "acme/base")
+	if everr == nil || everr.Status != http.StatusServiceUnavailable {
+		t.Errorf("nil store refusal = %+v, want 503", everr)
 	}
 }
