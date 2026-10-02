@@ -5336,8 +5336,9 @@ expiry leaves a revoked repository eligible until its deadline.
   reason; (c) an `authz.RepoAdmission` built without naming `Revoked` -- a literal (an elided or
   pointer element included), a `var` of the type, `new`, or a type declared from it; (d) a named
   query reading `github_pr_sessions` in any position without the revocations table, unless an
-  allowlist names it with a reason. It cannot see a struct field of the type left at its zero
-  value, reflection, or a read through a view a migration defines.
+  allowlist names it with a reason. It cannot see an allowlisted function that uses only "known"
+  from the result, a struct field of the type left at its zero value, reflection, or a read through
+  a view a migration defines.
 - **Rollback re-opens.** A binary without the migration never reads the table: during a rolling
   deploy old pods still admit, and after a rollback -- forced back with the rows kept, or the down,
   which drops them -- every revoked repository is eligible again until this release is redeployed
