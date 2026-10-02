@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,6 +58,11 @@ func TestEndedTurn_LeftRunningOnlyWhenItsPromptMayHaveArrived(t *testing.T) {
 		{
 			name:        "a dispatch refused by the cohort rollout before the prompt was sent",
 			endA:        refuseDispatchByRollout,
+			wantRunning: false,
+		},
+		{
+			name:        "a dispatch refused for a prompt frame larger than a sandbox accepts",
+			endA:        refuseOversizedPromptFrame,
 			wantRunning: false,
 		},
 		{
@@ -167,6 +173,33 @@ func refuseDispatchByRollout(ctx context.Context, t *testing.T, pool *pgxpool.Po
 	waitForTurnStatus(ctx, t, turns, created.ID, sqlcgen.TurnStatusFailed)
 	if commander.callCount() != 0 {
 		t.Fatalf("commander sends = %d, want 0 (a refused dispatch sends nothing)", commander.callCount())
+	}
+	return sessionID, created
+}
+
+// refuseOversizedPromptFrame dispatches a pending turn whose prompt frame,
+// once encoded, is larger than platform.MaxPromptFrameBytes, to a ready
+// sandbox: the dispatch is refused before SendCommand is ever called.
+func refuseOversizedPromptFrame(ctx context.Context, t *testing.T, pool *pgxpool.Pool) (pgtype.UUID, sqlcgen.Turn) {
+	t.Helper()
+	sessionID := createTestSession(ctx, t, pool)
+	readySandbox(ctx, t, pool, sessionID)
+	turns := narvipg.NewTurnStore(pool)
+	// Each '<' encodes as the six bytes <, so the text fits and
+	// only its frame does not.
+	created := createPendingTurn(ctx, t, turns, sessionID, strings.Repeat("<", platform.MaxPromptFrameBytes/6+1024))
+
+	commander := &fakeSendCommander{}
+	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	sendEnsureDispatched(ctx, t, a)
+	waitForTurnStatus(ctx, t, turns, created.ID, sqlcgen.TurnStatusFailed)
+	if commander.callCount() != 0 {
+		t.Fatalf("commander sends = %d, want 0 (a frame over the limit is never written)", commander.callCount())
 	}
 	return sessionID, created
 }

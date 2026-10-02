@@ -1,18 +1,23 @@
 package platform
 
 // MaxPromptFrameBytes is the largest prompt command, encoded, that the
-// control plane may write to a sandbox's WebSocket, and the read limit
-// every sandbox-agent connection sets (technical plan §6.1). Both sides
-// read this one constant: the agent calls Conn.SetReadLimit with it on
-// every connection it dials (internal/sandboxagent/wsbridge), and the
-// session actor measures every prompt frame before it is written -- a
-// first dispatch, a re-enqueue and a receipt re-send alike
-// (internal/app/sessionactor) -- and never sends one longer.
+// control plane may write to a sandbox's WebSocket, and the read limit a
+// sandbox agent built from this release sets on its connection (technical
+// plan §6.1). Both sides read this one constant: that agent calls
+// Conn.SetReadLimit with it on every connection it dials
+// (internal/sandboxagent/wsbridge), and the session actor measures every
+// prompt frame before it is written -- a first dispatch, a re-enqueue and
+// a receipt re-send alike (internal/app/sessionactor) -- and never sends
+// one longer.
 //
 // Before this bound the agent kept the WebSocket library's default read
 // limit, 32 KiB, so any prompt frame longer than that closed the agent's
 // connection (StatusMessageTooBig) and was lost, silently: a review prompt
-// inlines the pull request's whole diff, which made that common.
+// inlines the pull request's whole diff, which made that common. An agent
+// in an older snapshot or repo image keeps that default: it still loses a
+// larger prompt, it does not advertise the promptReceipt capability, so
+// nothing asks it for a receipt or re-sends to it, and its turn ends at
+// turn_deadline, as it did before.
 //
 // 32 MiB, chosen from what the control plane can build. The largest
 // prompts are a review's: its text carries the diff, which the GitHub

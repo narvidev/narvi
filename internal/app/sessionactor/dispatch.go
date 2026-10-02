@@ -2277,7 +2277,9 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainSt
 	// a retry, so the turn ends here as a refusal: named, with its sizes,
 	// in a session warning and on a review attempt's check, and never
 	// queued again by the workflow engine (OnTurnRefused) or backed off
-	// for a retry.
+	// for a retry. Nothing was written, so no agent of this turn can be
+	// running: its synthetic execution_complete carries the
+	// "delivered": false mark (dispatchFailure.undelivered).
 	if size := len(plan.payload); size > platform.MaxPromptFrameBytes {
 		a.logger.Error("sessionactor: refusing to dispatch turn: its prompt frame is larger than a sandbox accepts",
 			"session_id", a.sessionID.String(), "turn_id", plan.turnID.String(),
@@ -2288,6 +2290,8 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainSt
 				"Shorten the prompt, or split the work across turns, then send the turn again.", formatMiB(size), formatMiB(platform.MaxPromptFrameBytes)),
 			notAssessed: reviewcheck.NotAssessedPromptNotDelivered,
 			refused:     true,
+			// SendCommand is never called on this path either.
+			undelivered: true,
 		})
 	}
 
