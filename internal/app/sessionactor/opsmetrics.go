@@ -162,6 +162,15 @@ type opsMetrics struct {
 	// recordRolloutRefusal's own doc comment, below).
 	rolloutRefused metric.Int64Counter
 
+	// repoEntitlementDenied is session_repo_entitlement_denied_total
+	// (§31.4), registered under the SAME name httpapi's repo entitlement
+	// gate uses (repoentitlementgate.go), the way rolloutRefused shares
+	// session_rollout_refused_total: this package increments it, with
+	// reason "revoked", for every spawn or dispatch refused because an
+	// administrator revoked the session's repository
+	// (recordRepoEntitlementRevoked).
+	repoEntitlementDenied metric.Int64Counter
+
 	// bootEvidenceFallback counts every sandbox moved Booting -> Ready by
 	// §3.2's boot-evidence fallback (bootevidence.go): a generation that
 	// showed no boot evidence, Booting past
@@ -317,6 +326,15 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		return opsMetrics{}, fmt.Errorf("sessionactor: construct session_rollout_refused_total counter: %w", err)
 	}
 
+	repoEntitlementDenied, err := meter.Int64Counter(
+		"session_repo_entitlement_denied_total",
+		metric.WithDescription("Count of every session-creation attempt refused by §31.4's per-repository entitlement predicate, and of every spawn/restore/resume attempt or turn dispatch refused because an administrator revoked the session's repository -- the SAME instrument httpapi's repo entitlement gate registers (internal/adapters/inbound/httpapi/repoentitlementgate.go), incremented here for this package's two re-reads of a revocation (refuseIfRepoRevoked, revocationRefusalForDispatch) with reason \"revoked\". Tagged by spawn_source and reason. A revocation read that failed never counts: it is not a fact about the repository."),
+		metric.WithUnit("{denial}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct session_repo_entitlement_denied_total counter: %w", err)
+	}
+
 	bootEvidenceFallback, err := meter.Int64Counter(
 		"sandbox_boot_evidence_fallback_total",
 		metric.WithDescription("Count of every sandbox moved Booting -> Ready by §3.2's boot-evidence fallback: a generation that showed no boot evidence, Booting past platform.Timeouts.BootEvidenceFallback with its heartbeats still arriving, whose null boot phase was then accepted as boot completion. Only a sandbox-agent built before the 2026-09-28 fix, booting with no service and no Docker, reaches it -- typically from an old snapshot or repo image lineage: one built before boot_timing existed (2026-08-20) at every such boot, holding its first turn for the whole bound; one built since whenever its boot is still running at the bound, which is then read as complete mid-boot."),
@@ -363,21 +381,22 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 	}
 
 	return opsMetrics{
-		actorsLive:           actorsLive,
-		hydrations:           hydrations,
-		lockConnLost:         lockConnLost,
-		spawnDuration:        spawnDuration,
-		livenessGap:          livenessGap,
-		watchdogActivation:   watchdogActivation,
-		watchdogFalseAlarm:   watchdogFalseAlarm,
-		falseFailure:         falseFailure,
-		bootDuration:         bootDuration,
-		hookRerunDuration:    hookRerunDuration,
-		gitFetchDuration:     gitFetchDuration,
-		gitCheckoutDuration:  gitCheckoutDuration,
-		rolloutRefused:       rolloutRefused,
-		bootEvidenceFallback: bootEvidenceFallback,
-		unknownTimerKind:     unknownTimerKind,
+		actorsLive:            actorsLive,
+		hydrations:            hydrations,
+		lockConnLost:          lockConnLost,
+		spawnDuration:         spawnDuration,
+		livenessGap:           livenessGap,
+		watchdogActivation:    watchdogActivation,
+		watchdogFalseAlarm:    watchdogFalseAlarm,
+		falseFailure:          falseFailure,
+		bootDuration:          bootDuration,
+		hookRerunDuration:     hookRerunDuration,
+		gitFetchDuration:      gitFetchDuration,
+		gitCheckoutDuration:   gitCheckoutDuration,
+		rolloutRefused:        rolloutRefused,
+		repoEntitlementDenied: repoEntitlementDenied,
+		bootEvidenceFallback:  bootEvidenceFallback,
+		unknownTimerKind:      unknownTimerKind,
 	}, nil
 }
 
@@ -565,5 +584,19 @@ func (a *Actor) recordRolloutRefusal(ctx context.Context, spawnSource string) {
 	}
 	a.opsMetrics.rolloutRefused.Add(ctx, 1, metric.WithAttributes(
 		attribute.String("spawn_source", spawnSource),
+	))
+}
+
+// recordRepoEntitlementRevoked increments session_repo_entitlement_denied_total
+// with reason "revoked", tagged by spawnSource -- refuseIfRepoRevoked's and
+// revocationRefusalForDispatch's own call sites (repoentitlement.go), each
+// only for a revocation actually read, never for a read that failed.
+func (a *Actor) recordRepoEntitlementRevoked(ctx context.Context, spawnSource string) {
+	if a.opsMetrics.repoEntitlementDenied == nil {
+		return
+	}
+	a.opsMetrics.repoEntitlementDenied.Add(ctx, 1, metric.WithAttributes(
+		attribute.String("spawn_source", spawnSource),
+		attribute.String("reason", "revoked"),
 	))
 }

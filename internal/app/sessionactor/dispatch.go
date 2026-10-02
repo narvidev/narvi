@@ -897,6 +897,13 @@ func (a *Actor) tryPlanSpawn(
 	// httpapi.CreateSessionCore's own up-front one, not a re-use of its
 	// result.
 	if action.Kind == sandbox.SpawnActionSpawn || action.Kind == sandbox.SpawnActionRestore || action.Kind == sandbox.SpawnActionResume {
+		// §31.4's spawn-time re-read of an administrator's revocation --
+		// first, and in every rollout mode: see refuseIfRepoRevoked's own
+		// doc comment (repoentitlement.go).
+		if err := a.refuseIfRepoRevoked(ctx, tx, sessionRow); err != nil {
+			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, sandboxGen(sandboxRow, hasSandbox), err, now)
+		}
+
 		dockerRequired, err := a.refuseIfSubstrateUnsupported(ctx, tx, sessionRow, caps)
 		if err != nil {
 			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, sandboxGen(sandboxRow, hasSandbox), err, now)
@@ -1300,9 +1307,10 @@ func sandboxGen(sandboxRow sqlcgen.Sandbox, hasSandbox bool) int {
 }
 
 // spawnRefusal is a spawn-time policy refusal: a fact about the session
-// that no retry of the same evaluation changes -- a repo the cohort
-// rollout does not admit, an environment the configured provider cannot
-// honor (technical plan §27.5, §32). refuseIfSubstrateUnsupported and
+// that no retry of the same evaluation changes -- a repo an administrator
+// revoked, a repo the cohort rollout does not admit, an environment the
+// configured provider cannot honor (technical plan §31.4, §27.5, §32).
+// refuseIfRepoRevoked, refuseIfSubstrateUnsupported and
 // refuseIfRolloutUnenrolled return it; tryPlanSpawn hands it to
 // endTurnsOnSpawnRefusal. Anything else those gates return is transient.
 type spawnRefusal struct {
@@ -2196,6 +2204,14 @@ func (a *Actor) tryPlanDispatch(
 // planned this dispatch deleted (invalid when it deleted none): the first
 // arm of the chain a failed delivery backs off from (failDispatchedTurn).
 func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainStart pgtype.Timestamptz) error {
+	// §31.4's turn-dispatch-time re-read of an administrator's revocation,
+	// in every rollout mode, at this same one placement every dispatchPlan
+	// passes through: see revocationRefusalForDispatch's own doc comment
+	// (repoentitlement.go).
+	if failure, fail := a.revocationRefusalForDispatch(ctx, plan.sessionRow, chainStart); fail {
+		return a.failDispatchedTurn(ctx, plan.turnID, failure)
+	}
+
 	if repo, refused, transient := a.rolloutRefusalForDispatch(ctx, plan.sessionRow); refused {
 		a.logger.Error("sessionactor: refusing to dispatch turn: configured repo is not enrolled in the cohort rollout (§10 Phase 6, §32 turn-dispatch-time fail-closed re-check)",
 			"session_id", a.sessionID.String(), "turn_id", plan.turnID.String(), "repo", repo, "transient", transient)
