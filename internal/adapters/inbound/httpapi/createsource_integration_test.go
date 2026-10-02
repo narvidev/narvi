@@ -712,8 +712,8 @@ func TestCreateSession_McpRefusalsCarryTheMcpLabel(t *testing.T) {
 			t.Fatal(err)
 		}
 		stamp, _ := detail["mcp"].(map[string]any)
-		if detail["spawn_source"] != "mcp" || stamp["grant_id"] != grant.GrantID || stamp["client_id"] != grant.ClientID || len(stamp) != 2 || len(detail) != 2 {
-			t.Fatalf("denial audit detail = %s, want spawn_source mcp and exactly the grant and client", raw)
+		if detail["spawn_source"] != "mcp" || detail["reason"] != "unknown" || stamp["grant_id"] != grant.GrantID || stamp["client_id"] != grant.ClientID || len(stamp) != 2 || len(detail) != 3 {
+			t.Fatalf("denial audit detail = %s, want spawn_source mcp, reason unknown (§31.4) and exactly the grant and client", raw)
 		}
 	})
 

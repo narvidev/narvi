@@ -97,6 +97,41 @@ func (q *Queries) EnsureGitHubPRSessionRow(ctx context.Context, arg EnsureGitHub
 	return err
 }
 
+const firstRevokedRepoForSession = `-- name: FirstRevokedRepoForSession :one
+SELECT r.repo_full_name FROM repo_entitlement_revocations r
+WHERE r.repo_full_name = ANY ($1::text[])
+   OR r.repo_full_name IN (
+        SELECT g.repo_full_name FROM github_pr_sessions g WHERE g.session_id = $2
+        UNION
+        SELECT f.repo_full_name FROM sentinel_fixes f WHERE f.fix_child_session_id = $2)
+ORDER BY r.repo_full_name
+LIMIT 1
+`
+
+type FirstRevokedRepoForSessionParams struct {
+	RepoFullNames []string    `json:"repo_full_names"`
+	SessionID     pgtype.UUID `json:"session_id"`
+}
+
+// The first repository of a session that an administrator revoked
+// (§31.4), read again before the session's sandbox is spawned and before
+// each of its turns is dispatched (internal/app/sessionactor). A session
+// names its repositories two ways, and both are checked: the clone URLs in
+// sessions.repos, parsed by the caller into repo_full_names, and the
+// pull-request claims keyed to the session -- a review session's
+// github_pr_sessions row, and a sentinel auto-fix child's sentinel_fixes
+// row. The claims name the pull request's base repository, which the clone
+// URL of a fork pull request does not. pgx.ErrNoRows means none is revoked.
+// Indexed on every arm: repo_entitlement_revocations' primary key,
+// github_pr_sessions(session_id) (migrations/000032) and
+// sentinel_fixes(fix_child_session_id) (migrations/000047).
+func (q *Queries) FirstRevokedRepoForSession(ctx context.Context, arg FirstRevokedRepoForSessionParams) (string, error) {
+	row := q.db.QueryRow(ctx, firstRevokedRepoForSession, arg.RepoFullNames, arg.SessionID)
+	var repo_full_name string
+	err := row.Scan(&repo_full_name)
+	return repo_full_name, err
+}
+
 const getGitHubPRSessionByRepoAndPRNumber = `-- name: GetGitHubPRSessionByRepoAndPRNumber :one
 SELECT repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count FROM github_pr_sessions
 WHERE repo_full_name = $1 AND pr_number = $2
@@ -323,6 +358,46 @@ func (q *Queries) MarkAutoRetriggerBudgetNoticeSent(ctx context.Context, arg Mar
 	return i, err
 }
 
+const readRepoEntitlement = `-- name: ReadRepoEntitlement :one
+SELECT
+    EXISTS (SELECT 1 FROM github_pr_sessions g WHERE g.repo_full_name = $1) AS repo_known,
+    EXISTS (SELECT 1 FROM repo_entitlement_revocations r WHERE r.repo_full_name = $1) AS revoked
+`
+
+type ReadRepoEntitlementRow struct {
+	RepoKnown bool `json:"repo_known"`
+	Revoked   bool `json:"revoked"`
+}
+
+// The one read of a repository's eligibility for session creation (§31.4):
+// whether this deployment knows it, and whether an administrator revoked
+// it, in one statement and so one snapshot. No caller can read the first
+// without the second.
+//
+// repo_known: ANY github_pr_sessions row exists for repo_full_name, across
+// every pr_number -- the composite primary key's own leading column
+// (repo_full_name, pr_number) indexes this. This is a sound "this
+// deployment is genuinely attached to this repo" proof because the ONLY
+// writer of that table is internal/adapters/inbound/github's own
+// HMAC-verified webhook ingress (coalesce.go/handler.go) -- no httpapi REST
+// handler writes it -- and because a row only ever COMMITS with a non-NULL
+// session_id (coalesce.go's own single-transaction
+// EnsureRow+LockForUpdate+SetSessionID sequencing: a denied/failed claim
+// rolls back the whole transaction, leaving no row behind), so a bare
+// existence check needs no separate session_id IS NOT NULL filter. See
+// httpapi's own resolveKnownRepo (reposettings.go) for the full "why this
+// signal, and why repo_settings/sessions.repos are NOT sound" reasoning.
+//
+// revoked: an administrator revoked the repository
+// (repo_entitlement_revocations). Keyed by the exact
+// name, like repo_known; the primary key indexes it.
+func (q *Queries) ReadRepoEntitlement(ctx context.Context, repoFullName string) (ReadRepoEntitlementRow, error) {
+	row := q.db.QueryRow(ctx, readRepoEntitlement, repoFullName)
+	var i ReadRepoEntitlementRow
+	err := row.Scan(&i.RepoKnown, &i.Revoked)
+	return i, err
+}
+
 const recordMergeOutcome = `-- name: RecordMergeOutcome :one
 
 UPDATE github_pr_sessions
@@ -381,34 +456,6 @@ func (q *Queries) RecordMergeOutcome(ctx context.Context, arg RecordMergeOutcome
 		&i.MentionCount,
 	)
 	return i, err
-}
-
-const repoKnownToDeployment = `-- name: RepoKnownToDeployment :one
-SELECT EXISTS(
-    SELECT 1 FROM github_pr_sessions WHERE repo_full_name = $1
-) AS repo_known
-`
-
-// fix/repo-scoped-authorization's own entitlement signal: reports whether
-// ANY github_pr_sessions row exists for repoFullName, across every
-// pr_number -- the composite primary key's own leading column
-// (repo_full_name, pr_number) already indexes this efficiently, no new
-// index needed. This is a sound "this deployment is genuinely attached to
-// this repo" proof specifically because the ONLY writer of this table is
-// internal/adapters/inbound/github's own HMAC-verified webhook ingress
-// (coalesce.go/handler.go) -- no httpapi REST handler writes it -- and
-// because a row only ever COMMITS with a non-NULL session_id (coalesce.go's
-// own single-transaction EnsureRow+LockForUpdate+SetSessionID sequencing:
-// a denied/failed claim rolls back the whole transaction, leaving no row
-// behind), so a bare existence check needs no separate session_id IS NOT
-// NULL filter. See httpapi's own resolveKnownRepo (reposettings.go) for
-// the full "why this signal, and why repo_settings/sessions.repos are
-// NOT sound" reasoning.
-func (q *Queries) RepoKnownToDeployment(ctx context.Context, repoFullName string) (bool, error) {
-	row := q.db.QueryRow(ctx, repoKnownToDeployment, repoFullName)
-	var repo_known bool
-	err := row.Scan(&repo_known)
-	return repo_known, err
 }
 
 const setGitHubPRSessionID = `-- name: SetGitHubPRSessionID :exec

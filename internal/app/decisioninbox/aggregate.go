@@ -1751,7 +1751,7 @@ func resolveReviewSessionID(ctx context.Context, deps Deps, repoFullName string,
 	}
 	if !row.SessionID.Valid {
 		// Cannot actually happen against a real Postgres instance --
-		// RepoKnownToDeployment's own generated doc comment: "a row only
+		// ReadRepoEntitlement's own generated doc comment: "a row only
 		// ever COMMITS with a non-NULL session_id" (coalesce.go's single-
 		// transaction EnsureRow+LockForUpdate+SetSessionID sequencing
 		// rolls back a denied/failed claim wholesale). Handled anyway,

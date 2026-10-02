@@ -20,9 +20,11 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/inbound/linear"
@@ -161,5 +163,70 @@ func TestWebhookHandler_Created_RepoEntitlement_KnownRepoStillCreatesSession(t *
 	}
 	if !row.SessionID.Valid {
 		t.Error("agent session row has no session_id -- want a real created session for a known repo")
+	}
+}
+
+// TestWebhookHandler_Created_RepoEntitlementRevoked_AcknowledgesWithRevokedText
+// is §31.4's "Un-entitlement" on Linear: the default repository is known
+// but an administrator revoked it, so a new agent session is refused
+// terminally -- 200, the webhook-delivery claim kept, only the agent-session
+// claim released, no session -- and the acknowledgment posted back to
+// Linear says who closed the repository and who can reopen it, never "not
+// configured".
+func TestWebhookHandler_Created_RepoEntitlementRevoked_AcknowledgesWithRevokedText(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	deps := newHandlerDepsWithoutEntitlement(t, pool)
+	if err := narvipg.NewGitHubPRSessionStore(pool).EnsureRow(ctx, "narvidev/narvi", 1); err != nil {
+		t.Fatalf("seed github_pr_sessions entitlement: %v", err)
+	}
+	if _, err := narvipg.NewRepoEntitlementRevocationStore(pool).Revoke(ctx, "narvidev/narvi", pgtype.UUID{}, "frozen for an audit"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	organizationID := "org-" + t.Name()
+	installLinearFixture(ctx, t, pool, organizationID, deps.TokenEncryptionKey)
+	stub, posted := newGenericLinearGraphQLStub(t)
+	deps.LinearClient = linearapi.New(stub.Client(), stub.URL)
+
+	agentSessionID := "agent-session-" + t.Name()
+	deliveryID := "delivery-" + t.Name()
+	rec := postWebhook(t, linear.NewWebhookHandler(deps), agentSessionCreatedPayload(agentSessionID, organizationID), deliveryID)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+
+	bodies := posted()
+	var revokedAcks int
+	for _, body := range bodies {
+		if strings.Contains(body, "An administrator of this deployment revoked new sessions on this repository. An administrator can restore them.") {
+			revokedAcks++
+		}
+		for _, banned := range []string{"not configured", "installed", "access to"} {
+			if strings.Contains(body, banned) {
+				t.Errorf("posted body %q says %q", body, banned)
+			}
+		}
+	}
+	if revokedAcks != 1 {
+		t.Errorf("posted bodies = %v, want the revocation's acknowledgment once", bodies)
+	}
+
+	claim, err := narvipg.NewWebhookDeliveryStore(pool).Claim(ctx, "linear", deliveryID)
+	if err != nil {
+		t.Fatalf("re-claim webhook delivery: %v", err)
+	}
+	if claim.Inserted {
+		t.Error("webhook delivery claim was re-claimable -- want it kept after a revocation")
+	}
+	if _, err := narvipg.NewLinearAgentSessionStore(pool).GetByAgentSessionID(ctx, agentSessionID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Errorf("agent session claim lookup: err=%v, want pgx.ErrNoRows (released)", err)
+	}
+	var count int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE spawn_source = 'linear'`).Scan(&count); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("sessions count = %d, want 0", count)
 	}
 }

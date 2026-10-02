@@ -25,6 +25,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/inbound/slack"
@@ -223,5 +224,70 @@ func TestHandler_NewMention_RepoEntitlement_KnownRepoStillCreatesSession(t *test
 
 	if _, err := rig.threads.Get(ctx, "C0ENTITLEMENT2", "1700000051.000100"); err != nil {
 		t.Errorf("Get thread mapping: %v, want a real mapping -- a known repo must not be refused", err)
+	}
+}
+
+// TestHandler_NewMention_RepoEntitlementRevoked_PostsRevokedAckAndKeepsClaim
+// is §31.4's "Un-entitlement" on Slack: the default repository is known but
+// an administrator revoked it, so a new mention is refused with the
+// revocation's own words -- naming who closed it and who can reopen it,
+// never "not configured" -- no session or thread mapping is created, and
+// both delivery claims are kept, so Slack's retry never meets the same
+// refusal again.
+func TestHandler_NewMention_RepoEntitlementRevoked_PostsRevokedAckAndKeepsClaim(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	rig := newSlackAckTestRigWithoutEntitlement(t, pool)
+
+	if err := narvipg.NewGitHubPRSessionStore(pool).EnsureRow(ctx, "narvidev/narvi", 1); err != nil {
+		t.Fatalf("seed github_pr_sessions entitlement: %v", err)
+	}
+	if _, err := narvipg.NewRepoEntitlementRevocationStore(pool).Revoke(ctx, "narvidev/narvi", pgtype.UUID{}, "frozen for an audit"); err != nil {
+		t.Fatalf("revoke: %v", err)
+	}
+
+	const channel = "C0REVOKED"
+	const ts = "1700000060.000100"
+	eventID := "Ev0REVOKED001"
+	rec := httptest.NewRecorder()
+	rig.handler(rec, signedSlackRequest(t, appMentionEnvelope(eventID, channel, ts, "", "<@U0BOT> please fix the build")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	texts := rig.drainAckTexts(t)
+	var revokedAcks int
+	for _, text := range texts {
+		if text == "An administrator of this deployment revoked new sessions on this repository. An administrator can restore them." {
+			revokedAcks++
+		}
+		for _, banned := range []string{"not configured", "installed", "access"} {
+			if strings.Contains(text, banned) {
+				t.Errorf("posted ack %q says %q", text, banned)
+			}
+		}
+	}
+	if revokedAcks != 1 {
+		t.Errorf("posted ack texts = %v, want the revocation's ack once", texts)
+	}
+
+	if _, err := rig.threads.Get(ctx, channel, ts); err == nil {
+		t.Error("thread mapping was created -- want none: a revoked repository never gets a session")
+	}
+	var sessionCount int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM sessions`).Scan(&sessionCount); err != nil {
+		t.Fatalf("count sessions: %v", err)
+	}
+	if sessionCount != 0 {
+		t.Errorf("session count = %d, want 0", sessionCount)
+	}
+	for _, claim := range []struct{ provider, id string }{{"slack", eventID}, {"slack-message", channel + ":" + ts}} {
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM webhook_deliveries WHERE provider = $1 AND delivery_id = $2`, claim.provider, claim.id).Scan(&n); err != nil {
+			t.Fatalf("count %s claim: %v", claim.provider, err)
+		}
+		if n != 1 {
+			t.Errorf("%s claim rows = %d, want 1 (kept after a revocation)", claim.provider, n)
+		}
 	}
 }

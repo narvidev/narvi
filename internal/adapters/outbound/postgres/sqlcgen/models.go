@@ -2155,6 +2155,13 @@ type ReleaseManifestPending struct {
 	CreatedAt     pgtype.Timestamptz `json:"created_at"`
 }
 
+type RepoEntitlementRevocation struct {
+	RepoFullName string             `json:"repo_full_name"`
+	RevokedAt    pgtype.Timestamptz `json:"revoked_at"`
+	RevokedBy    pgtype.UUID        `json:"revoked_by"`
+	Reason       string             `json:"reason"`
+}
+
 type RepoSetting struct {
 	RepoFullName               string             `json:"repo_full_name"`
 	BlockOnHighRisk            bool               `json:"block_on_high_risk"`
