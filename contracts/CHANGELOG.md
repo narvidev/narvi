@@ -10,7 +10,7 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
-## [1.17.0]
+## [1.19.0]
 
 ### rest/v1/dtos.schema.json
 
@@ -47,6 +47,82 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   REST, a tool error over MCP), distinct from the `repository not entitled`
   refusal of an unknown repository. Three routes added grade MINOR
   (row 41).
+
+## [1.17.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `PostedFinding.source` (optional, string or null), the pass of the
+  review that produced a posted finding: `primary` or `counter_review`
+  (technical plan §26.6's amendment). Optional in the schema. A value
+  that is present must be one of the two (a garbled one is refused with
+  `400`), and `counter_review` is refused off the deep path. An absent one
+  is accepted in one case only: from a turn whose own stored prompt
+  predates the source instruction, on a payload that reports no
+  `additionsFactCheck` (a field only the new prompt names); it is stored
+  as "source not recorded", the state a finding last published before
+  this change already has. That case exists because this body follows the
+  review prompt, which is rendered once, when the turn is created, and
+  re-sent as stored: a turn rendered before this change -- queued,
+  running, or re-dispatched to a respawned sandbox while the control plane
+  is deployed -- posts its findings without the field, and refusing them
+  would refuse a request an older client's instructions shaped. From a
+  turn whose prompt asked for the field, an absent one is refused with
+  `400`, like a garbled one, so an addition its reviewer forgot to label is
+  never published as an ordinary finding. Self-reported: the server
+  records it as stated. A property added, not required, with every older
+  client's body still accepted, grades MINOR (row 2).
+- Added: `PostReviewVerdictRequest.additionsFactCheck` (optional, string or
+  null: `done` or `skipped`) and `additionsFactCheckKilled` (optional,
+  integer or null, minimum 0), the reviewer's report of the second, diff-only
+  fact-check run over what the counter-review added, recorded apart from
+  `factCheck`/`factCheckKilled`. Refused off the deep path; a kill count is
+  refused unless the run is reported `done`. Two properties added, not
+  required, grade MINOR (row 2).
+- Added: `ReviewReadoutFinding.source` and `ReviewReadoutFinding.additionCheck`
+  (required, string or null): the source the finding's latest publication
+  reported, null when none was recorded (a finding last published before
+  this change, or posted with no source by a turn rendered before it),
+  and, for a `counter_review` finding, the server's
+  resolution -- `checked`, `not_run`, `not_found` or `unconfirmed`. Every
+  value but `checked` marks the finding unverified. Required properties
+  added to a platform-produced shape grade MINOR (row 3).
+- Added: `ReviewReadoutVerdict.additionsFactCheck`,
+  `additionsFactCheckKilled` and `additionsCheck` (optional, nullable): the
+  second run as the reviewer reported it, and the server's resolution of
+  the counter-review additions the verdict published. `additionsCheck` is
+  null when the verdict published none -- including when the second run
+  removed every addition, whose report and kill count are still carried --
+  so every value but `checked` means additions were published marked
+  unverified. Properties added, not required, grade MINOR (row 2).
+- Added: `ReviewAnalytics.findingOutcomesBySource` (required, array or
+  null) and the `ReviewAnalyticsFindingSourceCount` `$def` (`source`,
+  `status`, `count`): every finding in the window counted per source --
+  `primary`, `counter_review`, `counter_review_unverified`, `not_recorded`
+  -- and status, the breakdown precision per source is read from
+  (technical plan §26.5); `not_recorded` counts every finding last
+  published with no source recorded. A required property added to a
+  platform-produced shape grades MINOR (row 3); a new `$def` grades MINOR
+  (row 32).
+- Added: `DecisionInboxItem.unverifiedAdditions` (optional, integer or
+  null): the still-open counter-review additions on a pull request that
+  the server could not count as checked, shown apart from `findings`, as
+  the posted comment, the readout and the Code review view show them. Set
+  whenever `findings` is. A property added, not required, grades MINOR
+  (row 2).
+- Changed (description only): `DecisionInboxItem.findings` now leaves out
+  those unverified additions, so the inbox row agrees with the Code review
+  view. It is a display count: the merge gate's own open-findings count
+  (technical plan §26.5) is unchanged and still includes them. PATCH
+  (row 35).
+- Changed (description only): `ReviewAnalytics.findingOutcomes` now counts
+  every finding except the counter-review additions the server could not
+  count as checked, which are counted apart in `findingOutcomesBySource`;
+  a computed result is empty only when every finding in the window is
+  such an addition. PATCH (row 35).
+- Unchanged: no route, no enum. Every new string is unconstrained, like
+  `ReviewReadoutVerdict.counterReview`, so a later value is not a breaking
+  change.
 
 ## [1.16.0]
 

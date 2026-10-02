@@ -57,6 +57,7 @@ func verdictRequestWithFinding(filePath, description string) string {
 				"severity":    "medium",
 				"filePath":    filePath,
 				"description": description,
+				"source":      "primary",
 			},
 		},
 		"digest": map[string]any{

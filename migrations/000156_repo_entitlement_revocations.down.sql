@@ -18,8 +18,8 @@
 --   - A pod that carries this migration and restarts before the older
 --     binary replaces it applies it again at boot -- an empty table, every
 --     revocation already gone -- which locks the older binary out again
---     ("no migration found for version 154").
+--     ("no migration found for version 156").
 -- Guarded: IF EXISTS, so it also runs on a database a rollback already
--- brought back to 153 with the table kept (`migrate force 153`, the up
+-- brought back to 155 with the table kept (`migrate force 155`, the up
 -- file's "Rolling back") and then forced up again.
 DROP TABLE IF EXISTS repo_entitlement_revocations;

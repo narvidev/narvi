@@ -161,9 +161,15 @@ func decisionInboxItemToDTO(it decisioninbox.Item) restdtos.DecisionInboxItem {
 		// Item.FindingsUnknown's own doc comment: that sentinel exists
 		// ONLY to fail the eligibility computation closed, and must never
 		// be presented on the wire as an honest, real findings count.
+		//
+		// unverifiedAdditions (§26.6's amendment) rides with findings: the
+		// counter-review additions the server could not count as checked,
+		// shown apart from it, null whenever findings is.
 		if !it.FindingsUnknown {
 			findings := it.Findings
 			dto.Findings = &findings
+			unverifiedAdditions := it.UnverifiedAdditions
+			dto.UnverifiedAdditions = &unverifiedAdditions
 		}
 		isHandoff := it.IsHandoff
 		dto.IsHandoff = &isHandoff

@@ -408,7 +408,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			FilesChanged:      3,
 		}
 		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
-		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict whose recorded ancestor chain matches the live resolution"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict whose recorded ancestor chain matches the live resolution"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 			t.Fatalf("insert second verdict with a matching ancestor chain: %v", err)
 		}
 
@@ -445,7 +445,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			FilesChanged:      3,
 		}
 		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
-		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict with a real ancestor chain"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict with a real ancestor chain"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 			t.Fatalf("insert second verdict with a real ancestor chain: %v", err)
 		}
 
@@ -568,7 +568,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			FilesChanged:      3,
 		}
 		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
-		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict whose ancestor chain has since advanced"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict whose ancestor chain has since advanced"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 			t.Fatalf("insert second verdict with an advanced ancestor chain: %v", err)
 		}
 
@@ -628,7 +628,7 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 			FilesChanged:      3,
 		}
 		verdict.Shippable = review.ComputeShippable(verdict.RiskLevel, verdict.TestsCoverage, verdict.Premise, review.DescriptionAdequacyOK, review.CounterReviewDone).Class()
-		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict whose ancestor chain advanced, unconfirmed"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+		if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, int32(pr.Number), pr.HeadSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "second, newer verdict whose ancestor chain advanced, unconfirmed"}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 			t.Fatalf("insert second verdict with an advanced-but-unconfirmed ancestor chain: %v", err)
 		}
 
@@ -781,6 +781,35 @@ func TestRevalidateForMerge_NegativeCases(t *testing.T) {
 		}
 		if ok {
 			t.Fatal("RevalidateForMerge() ok = true, want false (a reviewer requested changes)")
+		}
+		if reason == "" {
+			t.Error("reason is empty, want a human-readable explanation")
+		}
+	})
+
+	// §26.6's amendment: the inbox shows an unverified counter-review
+	// addition apart from its findings count, but the merge gate counts it
+	// like any other open finding (§26.5) -- a PR whose only open finding
+	// is one such addition is refused.
+	t.Run("OnlyAnUnverifiedAdditionOpen_Refused", func(t *testing.T) {
+		const repoFullName = "acme/revalidate-unverified-addition"
+		pr := rs.eligiblePR(ctx, t, pool, actorGitHubID, repoFullName, 110)
+		rs.replaceTargetPR(actorGitHubID, pr)
+		source, check := "counter_review", "not_found"
+		if _, err := narvipg.NewReviewFindingStore(pool).Upsert(ctx, sqlcgen.UpsertReviewFindingParams{
+			RepoFullName: repoFullName, PrNumber: int32(pr.Number), IdentityHash: "unverified-addition",
+			Severity: "high", FilePath: "internal/foo.go", Description: "an addition no second fact-check covered",
+			ReportedSource: &source, AdditionCheck: &check,
+		}); err != nil {
+			t.Fatalf("seed unverified addition: %v", err)
+		}
+
+		ok, _, reason, _, _, err := decisioninbox.RevalidateForMerge(ctx, rs.deps, rs.sourceControl, actorGitHubID, repoFullName, pr.Number, "tok")
+		if err != nil {
+			t.Fatalf("RevalidateForMerge() error = %v, want nil", err)
+		}
+		if ok {
+			t.Fatal("RevalidateForMerge() ok = true, want false (an unverified addition blocks merge like any other open finding)")
 		}
 		if reason == "" {
 			t.Error("reason is empty, want a human-readable explanation")
@@ -1493,7 +1522,7 @@ func TestRevalidateForMerge_LyingVerdictAgainstReal300FileSensitivePR(t *testing
 	// the model's own lie, which requires the NEWER context-freshness
 	// check to pass first so THOSE two criteria are what actually fire.
 	verdictContext := reviewverdict.Context{BaseRef: testEligibleBaseRef, BaseSHA: testEligibleBaseSHA, PolicyVersion: autoapproval.CurrentPolicyVersion}
-	if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, lyingVerdict, reviewpost.Digest{Summary: "Test-seeded lying verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, rs.deps.ReviewVerdict.ReviewVerdicts, rs.deps.ReviewVerdict.RepoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, lyingVerdict, reviewpost.Digest{Summary: "Test-seeded lying verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed lying review_verdicts row: %v", err)
 	}
 

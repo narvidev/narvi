@@ -44,15 +44,15 @@
 -- Every control-plane boot runs the embedded migrations up
 -- (controlplane/migrate.go), and golang-migrate refuses a database whose
 -- version it has no file for. So once this migration is applied, the
--- previous binary cannot boot ("no migration found for version 154"). A
+-- previous binary cannot boot ("no migration found for version 156"). A
 -- rollback therefore takes one of two steps first, with the control plane
 -- scaled to zero:
---   - Keep the rows: with the golang-migrate CLI, `migrate force 153`. The
+--   - Keep the rows: with the golang-migrate CLI, `migrate force 155`. The
 --     previous binary then boots and never reads them, so they are not
 --     enforced while it runs; when this release is deployed again, this
 --     file runs again, leaves the table and its rows as they are, and they
 --     are enforced again.
---   - Drop them: run this migration's down (`migrate goto 153`) with this
+--   - Drop them: run this migration's down (`migrate goto 155`) with this
 --     release's migrations. Every revocation goes with the table, and each
 --     repository has to be revoked again after this release is redeployed.
 -- Either way, EVERY REVOKED REPOSITORY IS ELIGIBLE FOR NEW SESSIONS AGAIN

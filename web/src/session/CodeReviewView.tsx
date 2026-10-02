@@ -57,7 +57,7 @@ import { applySuggestion, getReviewReadout, listFalsePositivePatterns, rebutRevi
 import { falsePositivePatternQueryKeys, reviewQueryKeys } from '../api/queryKeys'
 import { meQueryOptions } from '../auth/session'
 import { formatRelativeTime } from './relativeTime'
-import { descriptionAdequacyTone, findingStatusLabel, findingStatusTone, riskTone, sentinelFixLabel, sentinelFixTone, shippableLabel, shippableTone, visualQaTone } from './reviewFormat'
+import { additionCheckReason, additionsRunSummary, descriptionAdequacyTone, findingStatusLabel, findingStatusTone, isUnverifiedAddition, riskTone, sentinelFixLabel, sentinelFixTone, shippableLabel, shippableTone, visualQaTone } from './reviewFormat'
 import { truncateForDisplay } from './textSafety'
 import { isSafeHref } from './urlSafety'
 
@@ -204,6 +204,11 @@ export function FindingCard({
   })
 
   const actionable = finding.status === 'open'
+  // §26.6's amendment: a counter-review addition is marked as such, and
+  // one the server could not count as checked is marked unverified, with
+  // the server's reason. Every other finding renders as before.
+  const addition = finding.source === 'counter_review'
+  const unverified = isUnverifiedAddition(finding)
   const locLine = finding.startLine > 0 ? `${finding.startLine}${finding.endLine > finding.startLine ? `-${finding.endLine}` : ''}` : finding.line !== null && finding.line !== undefined ? String(finding.line) : null
 
   return (
@@ -220,6 +225,12 @@ export function FindingCard({
           <span className="dot" />
           {findingStatusLabel(finding.status)}
         </span>
+        {addition && (
+          <span className={`chip ${unverified ? 'warn' : 'neutral'}`} style={{ marginLeft: 6 }}>
+            <span className="dot" />
+            {unverified ? 'unverified addition' : 'counter-review addition, checked'}
+          </span>
+        )}
       </div>
       <span className="loc">
         <T text={finding.filePath} />
@@ -229,6 +240,7 @@ export function FindingCard({
       <p>
         <T text={finding.description} />
       </p>
+      {unverified && <p style={{ color: 'var(--faint)', fontSize: 'var(--text-sm-alt)' }}>Added by the counter-review and not fact-checked: {additionCheckReason(finding.additionCheck)}.</p>}
       {finding.suggestedFix && <pre className="snippet">{truncateForDisplay(finding.suggestedFix, 8000)}</pre>}
       {finding.status === 'rebutted' && finding.rebuttalText && (
         <p style={{ color: 'var(--faint)', fontSize: 'var(--text-sm-alt)' }}>
@@ -274,22 +286,39 @@ export function FindingCard({
   )
 }
 
-export function FindingsAppendix({ findings, canAct, sessionId }: { findings: ReviewReadoutFinding[]; canAct: boolean; sessionId: string }) {
-  const [open, setOpen] = useState(false)
+/**
+ * FindingsAppendix is the collapsed findings appendix. §26.6's amendment:
+ * counter-review additions the server could not count as checked are
+ * counted apart -- never in the total or the open count -- and listed
+ * apart, after the other findings, mirroring the posted comment.
+ * defaultOpen renders it expanded (collapsed by default).
+ */
+export function FindingsAppendix({ findings, canAct, sessionId, defaultOpen = false }: { findings: ReviewReadoutFinding[]; canAct: boolean; sessionId: string; defaultOpen?: boolean }) {
+  const [open, setOpen] = useState(defaultOpen)
   if (findings.length === 0) {
     return <p className="rail-empty">No findings have ever been posted for this PR.</p>
   }
-  const openCount = findings.filter((f) => f.status === 'open').length
+  const listed = findings.filter((f) => !isUnverifiedAddition(f))
+  const unverified = findings.filter((f) => isUnverifiedAddition(f))
+  const openCount = listed.filter((f) => f.status === 'open').length
   return (
     <div className="turn-block">
       <button type="button" className="appendix-toggle" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
-        {open ? '▾' : '▸'} Findings ({findings.length} total{openCount > 0 ? `, ${openCount} open` : ''})
+        {open ? '▾' : '▸'} Findings ({listed.length} total{openCount > 0 ? `, ${openCount} open` : ''}){unverified.length > 0 ? ` · ${unverified.length} unverified, counted apart` : ''}
       </button>
       {open && (
         <div className="timeline" style={{ padding: 0, marginTop: 10 }}>
-          {findings.map((f) => (
+          {listed.map((f) => (
             <FindingCard key={f.identityHash} finding={f} canAct={canAct} sessionId={sessionId} />
           ))}
+          {unverified.length > 0 && (
+            <>
+              <h3>Unverified -- added by the counter-review and not fact-checked ({unverified.length})</h3>
+              {unverified.map((f) => (
+                <FindingCard key={f.identityHash} finding={f} canAct={canAct} sessionId={sessionId} />
+              ))}
+            </>
+          )}
         </div>
       )}
     </div>
@@ -428,7 +457,12 @@ export function HandoffReadinessCard({ handoffReadiness }: { handoffReadiness: H
   )
 }
 
-export function SentinelsPanel({ verdict, visualQa }: { verdict: ReviewReadoutVerdict | null; visualQa: string | null }) {
+/**
+ * SentinelsPanel is the rail's sentinel summary. hasUnsourcedFinding says
+ * some published finding has no recorded source (§26.6's amendment): the
+ * second-run row then never claims that no addition was published.
+ */
+export function SentinelsPanel({ verdict, visualQa, hasUnsourcedFinding = false }: { verdict: ReviewReadoutVerdict | null; visualQa: string | null; hasUnsourcedFinding?: boolean }) {
   return (
     <div>
       <h3>Sentinels</h3>
@@ -471,6 +505,11 @@ export function SentinelsPanel({ verdict, visualQa }: { verdict: ReviewReadoutVe
         <dd>{verdict?.factCheck ?? '—'}</dd>
         <dt>counter-review</dt>
         <dd>{verdict?.counterReview ?? '—'}</dd>
+        {/* §26.6's amendment: the second fact-check run, over what the
+            counter-review added -- the reviewer's report beside the
+            server's resolution, apart from the first run above. */}
+        <dt>fact check (additions)</dt>
+        <dd>{additionsRunSummary(verdict, hasUnsourcedFinding)}</dd>
       </dl>
     </div>
   )
@@ -631,7 +670,7 @@ export function CodeReviewView({ sessionId }: { sessionId: string }) {
       <aside className="rail" aria-label="Review details">
         <ReviewSessionPanel sessionReuse={readout.sessionReuse} />
         <SentinelAutoFixPanel sentinelFix={sentinelFix} repoFullName={readout.repoFullName} />
-        <SentinelsPanel verdict={verdict} visualQa={visualQa} />
+        <SentinelsPanel verdict={verdict} visualQa={visualQa} hasUnsourcedFinding={readout.findings.some((f) => !f.source)} />
         <div>
           <h3>Actions</h3>
           <div className="btnrow" style={{ flexDirection: 'column', alignItems: 'stretch' }}>

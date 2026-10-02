@@ -46,6 +46,7 @@ func findingsVerdictRequestJSON(sentinelKind, description string) string {
 		"findings": [
 			{
 				"sentinelKind": %s,
+				"source": "primary",
 				"severity": "medium",
 				"filePath": "internal/foo/bar.go",
 				"line": 42,
@@ -114,7 +115,7 @@ func TestPostReviewVerdict_FindingReReportedAtShiftedLine_SameIdentity(t *testin
 	session := setupReviewSessionWithSandbox(ctx, t, rig, repoFullName, 22)
 	seedDispatchedTurn(ctx, t, rig, session.ID)
 
-	body1 := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"sentinelKind":"coverage","severity":"medium","filePath":"a.go","line":10,"description":"Missing coverage for X."}],"digest":{"summary":"Adds a helper; one coverage gap found.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
+	body1 := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"source":"primary","sentinelKind":"coverage","severity":"medium","filePath":"a.go","line":10,"description":"Missing coverage for X."}],"digest":{"summary":"Adds a helper; one coverage gap found.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
 	status, resp1 := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body1)
 	if status != http.StatusCreated {
 		t.Fatalf("first post status = %d, want %d", status, http.StatusCreated)
@@ -130,7 +131,7 @@ func TestPostReviewVerdict_FindingReReportedAtShiftedLine_SameIdentity(t *testin
 	}
 
 	// Re-report the SAME finding at a SHIFTED line (10 -> 25).
-	body2 := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"sentinelKind":"coverage","severity":"medium","filePath":"a.go","line":25,"description":"Missing coverage for X."}],"digest":{"summary":"Adds a helper; one coverage gap found.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
+	body2 := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"source":"primary","sentinelKind":"coverage","severity":"medium","filePath":"a.go","line":25,"description":"Missing coverage for X."}],"digest":{"summary":"Adds a helper; one coverage gap found.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
 	status2, resp2 := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body2)
 	if status2 != http.StatusCreated {
 		t.Fatalf("second post status = %d, want %d", status2, http.StatusCreated)
@@ -420,7 +421,7 @@ func setupFindingWithSuggestedFix(ctx context.Context, t *testing.T, rig testRig
 	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
 	seedDispatchedTurn(ctx, t, rig, session.ID)
 
-	body := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"severity":"low","filePath":"internal/foo/bar.go","description":"Stale comment.","suggestedFix":"--- a/internal/foo/bar.go\n+++ b/internal/foo/bar.go\n@@ -1,2 +1,2 @@\n package foo\n-// old comment\n+// new comment\n"}],"digest":{"summary":"Fixes a stale comment.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
+	body := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"source":"primary","severity":"low","filePath":"internal/foo/bar.go","description":"Stale comment.","suggestedFix":"--- a/internal/foo/bar.go\n+++ b/internal/foo/bar.go\n@@ -1,2 +1,2 @@\n package foo\n-// old comment\n+// new comment\n"}],"digest":{"summary":"Fixes a stale comment.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
 	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body)
 	if status != http.StatusCreated {
 		t.Fatalf("post verdict status = %d, want %d", status, http.StatusCreated)

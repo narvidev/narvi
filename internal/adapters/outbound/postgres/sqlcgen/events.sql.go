@@ -370,17 +370,24 @@ WHERE session_id = $1
   AND type = 'sub_task_finish'
   AND (payload->>'gen')::int = $2::int
   AND id > $3::bigint
+  AND ($4::bigint IS NULL OR id <= $4::bigint)
 ORDER BY id ASC
 `
 
 type ListSubTaskFinishEventsForTurnParams struct {
-	SessionID         pgtype.UUID `json:"session_id"`
-	Gen               int32       `json:"gen"`
-	DispatchedEventID int64       `json:"dispatched_event_id"`
+	SessionID             pgtype.UUID `json:"session_id"`
+	Gen                   int32       `json:"gen"`
+	DispatchedEventID     int64       `json:"dispatched_event_id"`
+	NextDispatchedEventID *int64      `json:"next_dispatched_event_id"`
 }
 
 func (q *Queries) ListSubTaskFinishEventsForTurn(ctx context.Context, arg ListSubTaskFinishEventsForTurnParams) ([]Event, error) {
-	rows, err := q.db.Query(ctx, listSubTaskFinishEventsForTurn, arg.SessionID, arg.Gen, arg.DispatchedEventID)
+	rows, err := q.db.Query(ctx, listSubTaskFinishEventsForTurn,
+		arg.SessionID,
+		arg.Gen,
+		arg.DispatchedEventID,
+		arg.NextDispatchedEventID,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -413,13 +420,15 @@ WHERE session_id = $1
   AND type = 'sub_task_start'
   AND (payload->>'gen')::int = $2::int
   AND id > $3::bigint
+  AND ($4::bigint IS NULL OR id <= $4::bigint)
 ORDER BY id ASC
 `
 
 type ListSubTaskStartEventsForTurnParams struct {
-	SessionID         pgtype.UUID `json:"session_id"`
-	Gen               int32       `json:"gen"`
-	DispatchedEventID int64       `json:"dispatched_event_id"`
+	SessionID             pgtype.UUID `json:"session_id"`
+	Gen                   int32       `json:"gen"`
+	DispatchedEventID     int64       `json:"dispatched_event_id"`
+	NextDispatchedEventID *int64      `json:"next_dispatched_event_id"`
 }
 
 // (§26.4/§7.1's own post-hoc sub-task corroboration): the two
@@ -508,13 +517,42 @@ type ListSubTaskStartEventsForTurnParams struct {
 // toward "matches nothing", never toward "over-matches" -- the same
 // fail-conservative direction this codebase's own closed-enum defaults
 // already commit to elsewhere (review/doc.go's "fail-conservative policy
-// for every closed enum" section). The caller (corroborateCounterReview,
+// for every closed enum" section). The caller (readSubTaskTrace,
 // internal/adapters/inbound/httpapi/reviewverdict.go) applies the
 // identical fail-conservative treatment when dispatched_event_id itself is
 // NULL (should be unreachable -- a turn being verdicted is by definition
 // already dispatched -- but never assumed).
+//
+// # The upper bound (§26.6's amendment)
+//
+// The lower bound alone assumes an earlier turn is over once a later one
+// is dispatched. It is not always: a turn that exceeds TurnDeadline is
+// marked failed without its agent being stopped, the next turn goes to
+// the same sandbox at the same gen, and the first turn's late verdict is
+// still resolved by its own message id. Its trace, bounded below only,
+// then holds the later turn's sub-tasks too -- and every review runs a
+// first fact-check, which would read as the earlier turn's second run
+// over its counter-review's additions. So the read is also bounded above,
+// by next_dispatched_event_id: the watermark of the next turn dispatched
+// on the session (GetNextTurnDispatchedEventID, queries/turns.sql), NULL
+// when there is none. Every event of that later turn has an id above its
+// watermark, so `id <= next_dispatched_event_id` excludes all of them.
+// Work the earlier turn did after the later one was dispatched is
+// excluded too, deliberately unread, so the caller marks such a read cut
+// (SubTaskTrace.CutAtNextTurn), and its additions resolve to "could not
+// be confirmed" (unconfirmed) whatever the window holds: a second run
+// missing from it may lie past the cut, and one found in it may have been
+// followed, past the cut, by another counter-reviewer pass. The
+// LATER turn's read keeps the lower bound alone, and an earlier turn that
+// may still be running at its gen makes it unreadable instead
+// (ExistsEarlierTurnLeftRunning, queries/turns.sql).
 func (q *Queries) ListSubTaskStartEventsForTurn(ctx context.Context, arg ListSubTaskStartEventsForTurnParams) ([]Event, error) {
-	rows, err := q.db.Query(ctx, listSubTaskStartEventsForTurn, arg.SessionID, arg.Gen, arg.DispatchedEventID)
+	rows, err := q.db.Query(ctx, listSubTaskStartEventsForTurn,
+		arg.SessionID,
+		arg.Gen,
+		arg.DispatchedEventID,
+		arg.NextDispatchedEventID,
+	)
 	if err != nil {
 		return nil, err
 	}

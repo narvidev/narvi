@@ -1685,7 +1685,7 @@ func deepPathVerdictRequestJSON(counterReview string) string {
 // every other test in this file that posts X-Sandbox-Gen: "1"). This is
 // the fixture every post-hoc-corroboration test below needs: a turn whose
 // own dispatched_sandbox_gen AND dispatched_at are what
-// corroborateCounterReview's own queries (ListSubTaskStartsForTurn/
+// readSubTaskTrace's own queries (ListSubTaskStartsForTurn/
 // ListSubTaskFinishesForTurn) actually filter on.
 //
 // Two dispatch columns are stamped here, and only ONE of them is what the
@@ -1795,7 +1795,7 @@ func dbDispatchedAt(ctx context.Context, t *testing.T, r testRig) time.Time {
 // sub_task_start/sub_task_finish event row via r.events -- the SAME
 // EventStore.Create path sessionactor's own appendRawEvent uses in
 // production (sandboxevent.go) to persist every recognized sandbox event
-// unconditionally -- so these tests exercise corroborateCounterReview's
+// unconditionally -- so these tests exercise readSubTaskTrace's
 // own two queries against genuinely persisted rows, decoded back out of
 // real JSONB, never a hand-built in-memory fixture. The payload shapes
 // mirror contracts/sandbox-ws/v1/events.schema.json's own SubTaskStart/
@@ -2027,7 +2027,7 @@ func verdictOutboxBody(ctx context.Context, t *testing.T, rig testRig, sessionID
 // Type_FloorsToNeedsHuman (§26.4) is the false-positive guard: the ONLY
 // sub-task this session's own trace shows is a DIFFERENT named sub-agent
 // (fact-check, §26.6) that genuinely started and completed -- proving
-// corroborateCounterReview/reviewverdict.CounterReviewCorroborated find
+// readSubTaskTrace/reviewverdict.CounterReviewCorroborated find
 // the RIGHT sub-agent's own trace, not merely "some completed sub-task
 // exists somewhere in this session". Shippable must still floor to
 // needs_human.
@@ -2059,7 +2059,7 @@ func TestPostReviewVerdict_CounterReviewUncorroborated_OnlyDifferentSubAgentType
 // never exercised against that exact shape at this level. Seeds a
 // genuine, completed fact-check sub-task pair ALONGSIDE the real
 // counter-reviewer pair, both at the SAME turn/gen, and confirms
-// Shippable is still NOT floored: corroborateCounterReview's own real I/O
+// Shippable is still NOT floored: readSubTaskTrace's own real I/O
 // path correctly finds the counter-reviewer's own trace among several,
 // not merely "some completed sub-task exists in this scope".
 func TestPostReviewVerdict_CounterReviewCorroborated_MultipleSubAgentTypes_NotFloored(t *testing.T) {
@@ -2128,7 +2128,7 @@ func TestSeedProcessingDeepPathTurn_StampsWatermarkBelowItsOwnEvents(t *testing.
 	}
 
 	// The REAL production query, at the seeded gen and watermark, finds it.
-	starts, err := rig.events.ListSubTaskStartsForTurn(ctx, session.ID, *turnRow.DispatchedSandboxGen, *turnRow.DispatchedEventID)
+	starts, err := rig.events.ListSubTaskStartsForTurn(ctx, session.ID, *turnRow.DispatchedSandboxGen, *turnRow.DispatchedEventID, nil)
 	if err != nil {
 		t.Fatalf("ListSubTaskStartsForTurn: %v", err)
 	}
@@ -2141,12 +2141,31 @@ func TestSeedProcessingDeepPathTurn_StampsWatermarkBelowItsOwnEvents(t *testing.
 	// them. Without this, the assertion above would still pass against a
 	// query that had quietly stopped filtering at all.
 	raised := minSeededID
-	excluded, err := rig.events.ListSubTaskStartsForTurn(ctx, session.ID, *turnRow.DispatchedSandboxGen, raised)
+	excluded, err := rig.events.ListSubTaskStartsForTurn(ctx, session.ID, *turnRow.DispatchedSandboxGen, raised, nil)
 	if err != nil {
 		t.Fatalf("ListSubTaskStartsForTurn (raised watermark): %v", err)
 	}
 	if len(excluded) != 0 {
 		t.Errorf("raising the watermark to %d still returned %d sub_task_start row(s): the id > dispatched_event_id bound is not actually filtering", raised, len(excluded))
+	}
+
+	// The upper bound (a later turn's watermark) filters too: one below
+	// those same events excludes them, one at or above them keeps them.
+	below := minSeededID - 1
+	capped, err := rig.events.ListSubTaskStartsForTurn(ctx, session.ID, *turnRow.DispatchedSandboxGen, *turnRow.DispatchedEventID, &below)
+	if err != nil {
+		t.Fatalf("ListSubTaskStartsForTurn (upper bound below): %v", err)
+	}
+	if len(capped) != 0 {
+		t.Errorf("an upper bound of %d still returned %d sub_task_start row(s) above it: the id <= next_dispatched_event_id bound is not actually filtering", below, len(capped))
+	}
+	atOrAbove := minSeededID
+	kept, err := rig.events.ListSubTaskStartsForTurn(ctx, session.ID, *turnRow.DispatchedSandboxGen, *turnRow.DispatchedEventID, &atOrAbove)
+	if err != nil {
+		t.Fatalf("ListSubTaskStartsForTurn (upper bound at): %v", err)
+	}
+	if len(kept) != len(starts) {
+		t.Errorf("an upper bound at the seeded start's own id returned %d row(s), want %d: the bound must include the row it names", len(kept), len(starts))
 	}
 }
 
@@ -2176,7 +2195,7 @@ func TestSeedProcessingDeepPathTurn_StampsWatermarkBelowItsOwnEvents(t *testing.
 // persisted for it.
 //
 // Before this Step's fix (gen-scoping alone, no created_at bound):
-// corroborateCounterReview's query would match turn 1's OLD
+// readSubTaskTrace's query would match turn 1's OLD
 // sub_task_start/finish rows purely on (session_id, gen) -- exactly the
 // SAME gen turn 2 was ALSO dispatched at -- wrongly corroborating turn
 // 2's fabricated self-report and leaving Shippable at its permissive

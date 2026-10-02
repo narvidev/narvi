@@ -586,6 +586,14 @@ export interface PostReviewVerdictRequest {
    * §26.4's own addition (§26.4, 'the deep path: adversarial counter-review'): whether the primary reviewer's orchestration spawned and adjudicated the counter-reviewer sub-task (§7.1's engine-native fan-out) before posting this verdict. One of 'done'/'skipped' when present, matching internal/domain/review.CounterReviewStatus's own two values -- deliberately modeled as an unconstrained nullable string here, not a schema-level enum (mirroring PostedFinding.sentinelKind's own identical precedent immediately above, itself mirroring UpdateMemberRoleRequest.role's precedent): null/absent is legal on every path (the light path never runs a counter-reviewer at all, §26.9), and the closed vocabulary plus the CONDITIONAL requirement (application-level REQUIRED whenever this session's own server-resolved review-depth is 'deep') are both enforced at the application layer (internal/domain/reviewpost.ValidateVerdictInput's own ErrInvalidCounterReview), which this JSON Schema cannot express (review-depth lives on the turn, not on this payload -- mirrors digest.archDecisions/stackRisks/unverifiedLimits' own identical conditional-requirement shape, §26.3. 'skipped' raises the server-computed Shippable floor to needs_human (review.CounterReviewFloor) -- the deliberate, load-bearing difference from factCheck above, which never raises anything.
    */
   counterReview?: string | null;
+  /**
+   * §26.6's amendment: the reviewer's report of the deep path's SECOND fact-check run, the diff-only pass over what the counter-review added, run after it and before publication -- 'done' or 'skipped' when present (internal/domain/reviewpost.ValidateVerdictInput's ErrInvalidAdditionsFactCheck), absent when the counter-review added nothing. Refused off the deep path (ErrCounterReviewAdditionOffDeepPath). Self-reported and recorded apart from factCheck, the first run. 'done' is necessary but never sufficient: an addition counts as checked only when the server also finds that run in the turn's own sub-task trace.
+   */
+  additionsFactCheck?: string | null;
+  /**
+   * §26.6's amendment: the count of counter-review additions the second fact-check run removed as provably wrong from the diff alone -- self-reported, and 0 or absent unless additionsFactCheck is 'done' (ErrAdditionsFactCheckKilledWithoutRun). Recorded apart from factCheckKilled.
+   */
+  additionsFactCheckKilled?: number | null;
 }
 /**
  * One finding's own typed fields, as posted by the verdict-posting tool call (§8.2 -- NEVER carries an identity hash (server-computed, internal/domain/reviewpost.ComputeFindingIdentity, never client-supplied -- the same 'don't trust the model with anything authoritative' discipline as PostReviewVerdictRequest.proposedShippable).
@@ -612,6 +620,10 @@ export interface PostedFinding {
    * An optional unified-diff/patch text the apply-suggestion endpoint (§12.2 item 2) can attempt to apply.
    */
   suggestedFix?: string | null;
+  /**
+   * §26.6's amendment: the pass of the review that produced this finding -- 'primary' (the primary reviewer, put through the first fact-check run) or 'counter_review' (an addition the counter-reviewer surfaced on its own, deep path only, which the first fact-check run never saw). Optional in the schema; a value that is present must be 'primary' or 'counter_review' (internal/domain/reviewpost.ValidateVerdictInput's ErrInvalidFindingSource), and 'counter_review' is refused off the deep path (ErrCounterReviewAdditionOffDeepPath). An absent source is admitted in one case only: from a turn whose own stored prompt predates the source instruction (it carries no 'source' entry in its finding object), on a payload that reports no additionsFactCheck, a field only the current prompt names. The verdict body follows the review prompt, which is rendered once, when the turn is created, and re-sent as stored, so such a turn posts its findings without the field; its finding is stored with no source recorded -- read as neither primary nor an addition, exactly like a finding last published before sources were recorded. From any other turn an absent source is refused with 400, like a garbled one. Self-reported: the server records it as the payload states it (review_findings.reported_source). A 'counter_review' finding is published as checked only when the server finds, in the turn's own sub-task trace, a fact-check sub-task that started after the counter-review and completed; otherwise it is published marked unverified and counted apart.
+   */
+  source?: string | null;
 }
 /**
  * §26.1's own additive extension (§26.1, 'review digest: verdict as merge readout'): the merge-readout's typed content -- 'what this PR does', architecture choices, and risks to the stack -- that fronts the rendered verdict, ahead of the pre-existing findings/coverage/docs-drift content (now collapsed into an appendix, internal/domain/reviewpost.RenderVerdictComment). Extended by §26.2 (§26.2, 'description adequacy + graduated remediation') with descriptionAdequacy/adequacyExplanation/proposedBody below, and by §26.3 (§26.3, light/deep review-depth triage) with a CONDITIONAL requirement on three more fields. REQUIRED on the request as a whole (unlike findings above): summary/descriptionAdequacy/adequacyExplanation within it are ALWAYS hard-required (internal/domain/reviewpost.ValidateVerdictInput); archDecisions/stackRisks/unverifiedLimits are requested on every review (the review-turn prompt asks the agent to fill them, internal/domain/review.RenderTurnPrompt) and are ADDITIONALLY hard-required -- rejected when empty/blank -- whenever this session's own review-depth routing decision (turns.review_depth, resolved server-side, never a field on this request body) is 'deep'. This JSON Schema cannot express that condition itself (review-depth lives on the turn, not on this payload) -- see ValidateVerdictInput's own doc comment (validate.go) for the exact, application-level enforced rule. proposedBody remains requested but never required, on every path.
@@ -923,6 +935,18 @@ export interface ReviewReadoutVerdict {
   factCheck: string | null;
   factCheckKilled: number;
   /**
+   * §26.6's amendment: the second fact-check run, over what the counter-review added, as the reviewer reported it -- 'done'/'skipped', or null when it reported none (a light-path verdict, a deep one whose counter-review added nothing, or one posted before this field existed). Self-reported; recorded apart from factCheck.
+   */
+  additionsFactCheck?: string | null;
+  /**
+   * §26.6's amendment: the count the reviewer reported the second run removed; null when it reported no second run. Self-reported; recorded apart from factCheckKilled.
+   */
+  additionsFactCheckKilled?: number | null;
+  /**
+   * §26.6's amendment: the server's resolution of this verdict's counter-review additions -- 'checked' (a fact-check sub-task that started after the counter-review and completed is in the turn's own trace, and the reviewer reported the run done), 'not_run' (the reviewer reported no such run), 'not_found' (reported, and the trace read when the verdict was posted held none), or 'unconfirmed' (the trace could not be read in full). Null when the verdict published no counter-review addition -- a light-path verdict, a deep one whose counter-review added nothing, one whose second run removed every addition (additionsFactCheck and additionsFactCheckKilled still say so), or one posted before this field existed -- since there was then nothing to resolve. Unconstrained here for the same reason counterReview is. So a value is present only when additions were published, and every value but 'checked' means they were published marked unverified.
+   */
+  additionsCheck?: string | null;
+  /**
    * The commit this verdict was produced against (§21.1).
    */
   headSha: string;
@@ -953,6 +977,14 @@ export interface ReviewReadoutFinding {
    * Paired with startLine -- see that field's own description.
    */
   endLine: number;
+  /**
+   * §26.6's amendment: the pass the finding's latest publication reported producing it -- 'primary' or 'counter_review' (self-reported, review_findings.reported_source). Null when no source was recorded: the finding was last published before sources were recorded, or by a turn whose prompt was rendered before they were (a posted finding with no source), and reads as neither.
+   */
+  source: string | null;
+  /**
+   * §26.6's amendment: for a 'counter_review' finding, the server's resolution at its latest publication -- 'checked', 'not_run', 'not_found' or 'unconfirmed' (see ReviewReadoutVerdict.additionsCheck); null for any other finding. A 'counter_review' finding whose additionCheck is anything but 'checked' is unverified, and a client marks it so and counts it apart from the other findings.
+   */
+  additionCheck: string | null;
 }
 /**
  * One prior verdict on this PR, summarized for the merge readout's own 'History' rail (§26.1 item 5) -- never the full ReviewReadoutVerdict shape, which only the latest verdict needs in full.
@@ -1347,9 +1379,13 @@ export interface ReviewAnalytics {
    */
   findingOutcomesComputed: boolean;
   /**
-   * Every reviewpost.FindingStatus present in the window, sorted by count descending then status ascending. Null iff findingOutcomesComputed is false -- like timeseries above, a real, computed result can never itself be an empty array (every counted status is non-empty by construction), so null is unambiguous here too.
+   * Every reviewpost.FindingStatus present in the window, sorted by count descending then status ascending, over every finding EXCEPT the counter-review additions the server could not count as checked (§26.6's amendment), which are counted apart, in findingOutcomesBySource. Null iff findingOutcomesComputed is false. A computed result is empty only when every finding in the window is such an addition.
    */
   findingOutcomes: ReviewAnalyticsFindingStatusCount[] | null;
+  /**
+   * §26.5/§26.6's amendment: every finding in the window counted per source and status -- the breakdown precision per source is read from (the share of a source's findings a maintainer rebutted). Sorted by source ('primary', 'counter_review', 'counter_review_unverified', 'not_recorded'), then count descending, then status ascending. Null iff findingOutcomesComputed is false.
+   */
+  findingOutcomesBySource: ReviewAnalyticsFindingSourceCount[] | null;
   /**
    * §26.4, §26.5: false means zero deep-path verdicts have been posted for this repo within the window (only a deep-path review ever produces an arch recap at all, §26.4/§26.9) -- distinct from a real, computed 0% rate, the SAME 'not yet computed' sentinel discipline as RepoSettings.contradictionRateComputed (reposettings.go).
    */
@@ -1400,6 +1436,20 @@ export interface ReviewAnalyticsTagCount {
  * via the `definition` "ReviewAnalyticsFindingStatusCount".
  */
 export interface ReviewAnalyticsFindingStatusCount {
+  status: 'open' | 'rebutted' | 'fix_pending' | 'fix_open' | 'fix_merged' | 'fix_applied' | 'fix_recorded';
+  count: number;
+}
+/**
+ * §26.5/§26.6's amendment: one (source, status) pair's count across the window's review_findings rows -- ReviewAnalytics.findingOutcomesBySource's own row (internal/domain/reviewverdict.FindingSourceStatusCount).
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "ReviewAnalyticsFindingSourceCount".
+ */
+export interface ReviewAnalyticsFindingSourceCount {
+  /**
+   * 'primary', 'counter_review' (an addition the server counted as checked), 'counter_review_unverified' (an addition it could not: counted apart), or 'not_recorded' (a finding last published with no source recorded: before sources were recorded, or by a turn whose prompt was rendered before they were). The source is self-reported by the reviewer. Unconstrained here, like ReviewReadoutVerdict.counterReview, so a later bucket is not a breaking change.
+   */
+  source: string;
   status: 'open' | 'rebutted' | 'fix_pending' | 'fix_open' | 'fix_merged' | 'fix_applied' | 'fix_recorded';
   count: number;
 }
@@ -2432,9 +2482,13 @@ export interface DecisionInboxItem {
    */
   ciGreen: boolean | null;
   /**
-   * Count of still-open (never rebutted/fixed) review findings on this PR. Set for any PR-shaped row -- see ciGreen's own description -- UNLESS the count itself could not be determined (a store error) -- a transient failure fails the *eligibility computation* closed (treated internally as though a blocking finding were present) but that fail-closed sentinel must never be presented on the wire as an honest, real count, so this is null in that case instead, never the synthetic value used internally.
+   * Count of still-open (never rebutted/fixed) review findings on this PR, as a client shows it: every one EXCEPT the counter-review additions the server could not count as checked, which unverifiedAdditions counts apart (§26.6's amendment), so the row agrees with the Code review view. A display count only: the merge gate's own open-findings count (§26.5) is unchanged and includes those additions, so a row can be blocked by an open finding while this reads 0 and unverifiedAdditions does not. Set for any PR-shaped row -- see ciGreen's own description -- UNLESS the count itself could not be determined (a store error) -- a transient failure fails the *eligibility computation* closed (treated internally as though a blocking finding were present) but that fail-closed sentinel must never be presented on the wire as an honest, real count, so this is null in that case instead, never the synthetic value used internally.
    */
   findings: number | null;
+  /**
+   * §26.6's amendment: count of still-open counter-review additions on this PR that the server could not count as checked -- shown apart from findings, never in it, as the posted comment, the readout and the Code review view count them. A display count: they block merge exactly like any other open finding (§26.5). Set whenever findings is, on any PR-shaped row; null or absent when findings is null, and on a row that is not a pull request.
+   */
+  unverifiedAdditions?: number | null;
   /**
    * True for a handoff-labeled PR (§14.4) riding kind=awaiting_approval instead of an ordinary code-review kind. Set (to true or false) for any PR-shaped row -- see ciGreen's own description; this is the field a client checks to tell a handoff PR apart from a plan awaiting approval within the SAME kind=awaiting_approval bucket.
    */

@@ -1,6 +1,9 @@
 package reviewverdict
 
-import "github.com/narvidev/narvi/internal/domain/review"
+import (
+	"github.com/narvidev/narvi/internal/domain/review"
+	"github.com/narvidev/narvi/internal/domain/reviewpost"
+)
 
 // This file implements §26.4's own named residual, closed by §26.4:
 // "Corroborating the claim against the persisted sub_task_finish trace is
@@ -54,7 +57,15 @@ import "github.com/narvidev/narvi/internal/domain/review"
 // taskInputSubAgentType for the extraction, and that field's own doc
 // comment for why THIS field, never the freeform Label, is what
 // corroboration keys off).
+//
+// EventID (§26.6's amendment) is the persisted event's own events.id.
+// Within one session ids are allocated in commit order (queries/
+// events.sql's MaxEventIDForSession), so comparing two records' EventIDs
+// orders them as the trace recorded them -- with no clock in it, the same
+// reason the corroboration queries bound a turn by dispatched_event_id.
+// AdditionsFactCheckInTrace is what reads it.
 type SubTaskStartRecord struct {
+	EventID      int64
 	SubTaskID    string
 	SubAgentType string
 }
@@ -65,9 +76,41 @@ type SubTaskStartRecord struct {
 // with which Outcome -- one of sandboxws's own ExecutionCompleteOutcome
 // wire strings ("completed"/"failed"/"cancelled", §7.1's own "reuses the
 // turn's own outcome taxonomy").
+//
+// EventID: see SubTaskStartRecord.
 type SubTaskFinishRecord struct {
+	EventID   int64
 	SubTaskID string
 	Outcome   string
+}
+
+// SubTaskTrace is one turn's sub-task trace as the caller read it (§26.6's
+// amendment): the decoded starts and finishes -- bounded below by the
+// turn's own dispatch watermark and above by the next turn's -- and
+// whether that read covered the whole trace. ReadInFull is false when any
+// part of it could not be read -- a failed query, a row whose payload did
+// not decode (the caller skips it), a turn with no dispatch scope to read
+// it in, one whose watermark another turn shares, or one dispatched after
+// an earlier turn on the same gen that may still be running -- and its
+// zero value is false, so a trace nobody read is never mistaken for an
+// empty one. AdditionsFactCheckInTrace also reads a finish with no start
+// in the trace as a trace not read in full.
+type SubTaskTrace struct {
+	Starts     []SubTaskStartRecord
+	Finishes   []SubTaskFinishRecord
+	ReadInFull bool
+	// CutAtNextTurn is true when the read stopped at the next turn's
+	// dispatch watermark: this turn's own events after it, if it kept
+	// running, were deliberately left unread, because they cannot be told
+	// from the next turn's. For the additions that is a partial read:
+	// "checked" claims no counter-reviewer event follows the second run,
+	// which events past the cut could contradict, so
+	// AdditionsFactCheckInTrace reports such a trace as not read in full.
+	// The counter-review claim is a positive one -- a counter-reviewer
+	// ran and completed -- and one found inside the window, this turn's
+	// own events, proves it whatever lies past the cut, so
+	// CounterReviewCorroborated reads the window as it is.
+	CutAtNextTurn bool
 }
 
 // counterReviewFinishOutcomeCompleted mirrors sandboxws.
@@ -87,13 +130,14 @@ const counterReviewFinishOutcomeCompleted = "completed"
 
 // CounterReviewCorroborated reports whether starts/finishes -- BOTH
 // already scoped by the caller to the SAME session, the SAME sandbox gen
-// the turn being verdicted was actually dispatched at, AND a created_at
-// lower bound at that same turn's own dispatched_at (see queries/
-// events.sql's own ListSubTaskStartEventsForTurn/
+// the turn being verdicted was actually dispatched at, AND an events.id
+// window running from that same turn's own dispatch watermark
+// (dispatched_event_id) up to the next turn's, when one was dispatched
+// after it (see queries/events.sql's own ListSubTaskStartEventsForTurn/
 // ListSubTaskFinishEventsForTurn doc comment for why gen-scoping ALONE was
 // found insufficient -- a real cross-turn contamination gap caught by
-// adversarial review -- and why the dispatched_at bound is required
-// alongside it, not merely session-scoping) -- together contain real, durable
+// adversarial review -- and why both bounds are required alongside it,
+// not merely session-scoping) -- together contain real, durable
 // evidence that the `counter-reviewer` sub-agent (review.
 // CounterReviewerAgentName, "counter-reviewer") was both dispatched and
 // actually completed.
@@ -135,6 +179,119 @@ func CounterReviewCorroborated(starts []SubTaskStartRecord, finishes []SubTaskFi
 			continue
 		}
 		if completedSubTaskIDs[s.SubTaskID] {
+			return true
+		}
+	}
+	return false
+}
+
+// AdditionsFactCheckInTrace (§26.6's amendment) extends the corroboration
+// above to the second fact-check run, over what the counter-review added:
+// it reports whether trace holds a fact-check sub-task (review.
+// FactCheckAgentName) that STARTED AFTER the counter-review and
+// completed. That ordering is the whole rule. The first fact-check run
+// starts before the counter-review by the funnel's own design (§26.6), so
+// "some completed fact-check exists" would always be true on a deep
+// review that ran its first pass, and would count every addition as
+// checked by a run that never saw it.
+//
+// "After the counter-review" means after every counter-reviewer event in
+// the trace: the start's EventID must exceed the EventID of every
+// counter-reviewer start and of every finish belonging to one. A second
+// counter-review run (a retry) that started after the fact-check could
+// have added findings that fact-check never saw. There must also be a
+// counter-review that completed (CounterReviewCorroborated): with none,
+// there is no counter-review for a run to come after.
+//
+// A finish whose start is not in the trace makes the trace incomplete for
+// this rule. A sub_task_finish carries no sub-agent type, so only its
+// start says whether it was a counter-reviewer's, and a start can be
+// missing while its finish is present: sub_task_start travels best-effort
+// and can be evicted from the sandbox's send buffer during a long
+// disconnect, where sub_task_finish is critical and always delivered. A
+// counter-review whose start was lost would raise no bound, and a
+// fact-check before it would qualify; so such a trace is read as not read
+// in full.
+//
+// Returns:
+//   - reviewpost.AdditionsTraceUnread when !trace.ReadInFull, or when a
+//     finish in the trace has no start in it -- even if a qualifying run
+//     is among the rows that were read: "checked" is a claim that no later
+//     counter-reviewer event exists, which a partial read cannot support.
+//     The caller resolves this to unconfirmed, "could not be confirmed",
+//     never to "the trace shows none".
+//   - reviewpost.AdditionsTraceUnread, too, for a read cut at the next
+//     turn's dispatch (CutAtNextTurn), whatever its window holds: this
+//     turn's own events past the cut were deliberately left unread, so a
+//     run not found in the window may lie past it, and a run found there
+//     may have been followed, past it, by another counter-reviewer pass
+//     -- the retry this rule exists to catch -- which a cut read cannot
+//     rule out.
+//   - reviewpost.AdditionsTraceRunFound when a qualifying run is present.
+//   - reviewpost.AdditionsTraceNoRunFound otherwise: the trace, read in
+//     full, holds no qualifying run -- which includes a run whose finish
+//     had not landed when the verdict was posted (§26.4's accepted race),
+//     so the caller's text says "not found when the verdict was posted",
+//     never "did not run".
+//
+// Pure: zero I/O, zero time.Now(), like CounterReviewCorroborated.
+func AdditionsFactCheckInTrace(trace SubTaskTrace) reviewpost.AdditionsTrace {
+	if !trace.ReadInFull || trace.CutAtNextTurn || hasFinishWithoutStart(trace) {
+		return reviewpost.AdditionsTraceUnread
+	}
+	if additionsRunInTrace(trace) {
+		return reviewpost.AdditionsTraceRunFound
+	}
+	return reviewpost.AdditionsTraceNoRunFound
+}
+
+// additionsRunInTrace is AdditionsFactCheckInTrace's ordering rule over
+// the rows that were read: a completed counter-review, and a fact-check
+// that started after every counter-reviewer event and completed.
+func additionsRunInTrace(trace SubTaskTrace) bool {
+	if !CounterReviewCorroborated(trace.Starts, trace.Finishes) {
+		return false
+	}
+
+	finishesBySubTask := make(map[string][]SubTaskFinishRecord, len(trace.Finishes))
+	for _, f := range trace.Finishes {
+		finishesBySubTask[f.SubTaskID] = append(finishesBySubTask[f.SubTaskID], f)
+	}
+
+	var lastCounterReviewEvent int64
+	for _, s := range trace.Starts {
+		if s.SubAgentType != review.CounterReviewerAgentName {
+			continue
+		}
+		lastCounterReviewEvent = max(lastCounterReviewEvent, s.EventID)
+		for _, f := range finishesBySubTask[s.SubTaskID] {
+			lastCounterReviewEvent = max(lastCounterReviewEvent, f.EventID)
+		}
+	}
+
+	for _, s := range trace.Starts {
+		if s.SubAgentType != review.FactCheckAgentName || s.EventID <= lastCounterReviewEvent {
+			continue
+		}
+		for _, f := range finishesBySubTask[s.SubTaskID] {
+			if f.Outcome == counterReviewFinishOutcomeCompleted {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// hasFinishWithoutStart reports whether trace holds a sub_task_finish whose
+// sub_task_start it does not hold (AdditionsFactCheckInTrace's doc comment
+// says why that leaves the trace incomplete).
+func hasFinishWithoutStart(trace SubTaskTrace) bool {
+	started := make(map[string]bool, len(trace.Starts))
+	for _, s := range trace.Starts {
+		started[s.SubTaskID] = true
+	}
+	for _, f := range trace.Finishes {
+		if !started[f.SubTaskID] {
 			return true
 		}
 	}

@@ -55,7 +55,7 @@ func seedNotShippableAutoVerdict(ctx context.Context, t *testing.T, pool *pgxpoo
 		BaseSHA:       testEligibleBaseSHA,
 		PolicyVersion: autoapproval.CurrentPolicyVersion,
 	}
-	if _, err := appreviewverdict.Insert(ctx, store, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, store, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, pgtype.UUID{}); err != nil {
 		t.Fatalf("seed not-shippable-auto review_verdicts row for %s#%d: %v", repoFullName, prNumber, err)
 	}
 }
@@ -432,7 +432,7 @@ func seedNotShippableAutoVerdictForAttempt(ctx context.Context, t *testing.T, po
 		BaseSHA:       testEligibleBaseSHA,
 		PolicyVersion: autoapproval.CurrentPolicyVersion,
 	}
-	if _, err := appreviewverdict.Insert(ctx, store, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, nil, nil, "", false, verdictContext, attemptID); err != nil {
+	if _, err := appreviewverdict.Insert(ctx, store, repoSettings, false, repoFullName, prNumber, headSHA, pgtype.UUID{}, verdict, reviewpost.Digest{Summary: "Test-seeded high-risk verdict."}, "", review.CounterReviewDone, reviewpost.FactCheckDone, 0, reviewpost.SecondFactCheck{}, nil, nil, "", false, verdictContext, attemptID); err != nil {
 		t.Fatalf("seed not-shippable-auto review_verdicts row for %s#%d: %v", repoFullName, prNumber, err)
 	}
 }

@@ -125,6 +125,36 @@ type VerdictInput struct {
 	// simply never querying at all. BuildVerdict's own second substitution
 	// (below) is the ONE place this field is read.
 	CounterReviewCorroborated bool
+
+	// AdditionsFactCheck (§26.6's amendment) is the reviewer's report of
+	// the deep path's SECOND fact-check run, over what the counter-review
+	// added: done, skipped, or "" when it reported none (the field is
+	// optional on the wire, omitted when the counter-review added
+	// nothing). Self-reported, and recorded apart from FactCheck, the
+	// first run. ValidateVerdictInput refuses it off the deep path.
+	AdditionsFactCheck FactCheckStatus
+	// AdditionsFactCheckKilled is the count the reviewer says the second
+	// run removed as provably wrong from the diff alone -- self-reported,
+	// 0 unless AdditionsFactCheck is done (ErrAdditionsFactCheckKilledWithoutRun).
+	AdditionsFactCheckKilled int
+	// AdditionsTrace (§26.6's amendment) is what the caller read from
+	// this turn's own sub-task trace about the second run
+	// (reviewverdict.AdditionsFactCheckInTrace) -- server-computed only,
+	// like CounterReviewCorroborated, and never read from the payload.
+	// Its zero value, AdditionsTraceUnread, can only resolve an addition
+	// to unconfirmed, never to checked (ResolveAdditionCheck).
+	AdditionsTrace AdditionsTrace
+	// SourceInstructed (§26.6's amendment) is whether the posting turn's
+	// own stored prompt asked every finding for a source
+	// (review.PromptInstructsFindingSource over turns.prompt) --
+	// server-computed only, never read from the payload. When it did, a
+	// finding with no source is refused like a garbled one; only a turn
+	// rendered before sources existed may post one (ErrInvalidFindingSource).
+	// Its zero value admits the absence, so a caller that cannot read the
+	// prompt behaves as for an older turn; the payload's own
+	// AdditionsFactCheck, which only the current prompt names, still
+	// refuses it.
+	SourceInstructed bool
 }
 
 // MaxDigestSummaryBytes/MaxDigestAdequacyExplanationBytes/
@@ -304,6 +334,34 @@ var (
 	ErrDigestProposedBodyTooLong        = errors.New("reviewpost: digest.proposedBody exceeds the maximum length")
 	ErrDigestContestedPointsTooLong     = errors.New("reviewpost: digest.contestedPoints exceeds the maximum length")
 	ErrDigestArchDecisionFieldTooLong   = errors.New("reviewpost: digest.archDecisions contains a field exceeding the maximum length")
+	// ErrInvalidFindingSource (§26.6's amendment): a posted finding names
+	// the pass that produced it, primary or counter_review. A garbled value
+	// is refused on every turn. An absent one is refused too, except from
+	// a turn rendered before sources existed: a turn's prompt is rendered
+	// once, when the turn is created, and re-sent as stored, so such a
+	// turn posts its findings without one, and refusing them would refuse
+	// a verdict its own instructions shaped. That absence is admitted only
+	// when the turn's stored prompt carries no source instruction
+	// (VerdictInput.SourceInstructed false) AND the payload reports no
+	// second fact-check run (AdditionsFactCheck, a field only the current
+	// prompt names), and is recorded as "source not recorded"
+	// (FindingSourceNotRecorded).
+	ErrInvalidFindingSource = errors.New("reviewpost: finding source must be one of primary/counter_review")
+	// ErrCounterReviewAdditionOffDeepPath (§26.6's amendment, §26.9): a
+	// finding sourced counter_review, or a report of the second
+	// fact-check run, on a verdict that is not deep. No counter-reviewer
+	// runs there, so it added nothing and there is nothing to re-check.
+	ErrCounterReviewAdditionOffDeepPath = errors.New("reviewpost: counter_review findings and additionsFactCheck exist only on a deep-path review")
+	// ErrInvalidAdditionsFactCheck (§26.6's amendment): the second
+	// fact-check run's report, when present, is done or skipped.
+	ErrInvalidAdditionsFactCheck = errors.New("reviewpost: additionsFactCheck must be one of done/skipped, or absent")
+	// ErrNegativeAdditionsFactCheckKilled mirrors ErrNegativeFactCheckKilled
+	// for the second run.
+	ErrNegativeAdditionsFactCheckKilled = errors.New("reviewpost: additionsFactCheckKilled must not be negative")
+	// ErrAdditionsFactCheckKilledWithoutRun mirrors ErrFactCheckKilledOnSkip
+	// for the second run: a run reported skipped, or not reported at all,
+	// removed nothing.
+	ErrAdditionsFactCheckKilledWithoutRun = errors.New("reviewpost: additionsFactCheckKilled must be 0 unless additionsFactCheck is done")
 )
 
 // ValidateVerdictInput rejects a malformed or partial verdict-posting-tool
@@ -320,7 +378,9 @@ var (
 // hardening, G3, LAST of all -- the seven digest length caps
 // (Digest.Summary/AdequacyExplanation/StackRisks/UnverifiedLimits/
 // ProposedBody/ContestedPoints/each ArchDecision field, unconditional on
-// path)) so a caller presenting more than one bad field always gets the
+// path), then -- §26.6's amendment, after the caps -- each finding's
+// Source and the second fact-check run's report) so a caller presenting
+// more than one bad field always gets the
 // SAME, deterministic first error rather than one that depends on map
 // iteration order or similar. Digest.Summary is checked next (
 // §26.1's own new required field), Digest.DescriptionAdequacy/Digest.
@@ -558,6 +618,51 @@ func ValidateVerdictInput(in VerdictInput) error {
 			len(ad.ConventionConformance) > MaxArchDecisionFieldBytes {
 			return ErrDigestArchDecisionFieldTooLong
 		}
+	}
+
+	// Finding sources and the second fact-check run (§26.6's amendment)
+	// -- appended after the length caps, so a payload that already fails
+	// an earlier check keeps reporting the same first error. A finding's
+	// source is primary or counter_review; an absent one is admitted only
+	// from a turn rendered before sources existed, recorded as not
+	// recorded and never a counter-review addition
+	// (ErrInvalidFindingSource's doc comment says exactly when). A
+	// counter-review source, or a second-run report, exists only on the
+	// deep path. On the deep path every combination is
+	// admitted, including additions beside a counter-review reported
+	// skipped: whatever the payload claims, an addition is published
+	// checked only when the server finds the second run in the trace
+	// (BuildSecondFactCheck), so an inconsistent claim can only leave
+	// additions marked unverified -- the safe direction -- and refusing it
+	// would only push a reviewer to relabel an addition primary.
+	sourceRequired := in.SourceInstructed || in.AdditionsFactCheck != ""
+	for _, f := range in.Findings {
+		switch f.Source {
+		case FindingSourcePrimary, FindingSourceCounterReview:
+		case FindingSourceNotRecorded:
+			if sourceRequired {
+				return ErrInvalidFindingSource
+			}
+		default:
+			return ErrInvalidFindingSource
+		}
+		if f.Source == FindingSourceCounterReview && in.ReviewDepth != reviewtriage.DepthDeep {
+			return ErrCounterReviewAdditionOffDeepPath
+		}
+	}
+	switch in.AdditionsFactCheck {
+	case "", FactCheckDone, FactCheckSkipped:
+	default:
+		return ErrInvalidAdditionsFactCheck
+	}
+	if in.AdditionsFactCheck != "" && in.ReviewDepth != reviewtriage.DepthDeep {
+		return ErrCounterReviewAdditionOffDeepPath
+	}
+	if in.AdditionsFactCheckKilled < 0 {
+		return ErrNegativeAdditionsFactCheckKilled
+	}
+	if in.AdditionsFactCheck != FactCheckDone && in.AdditionsFactCheckKilled != 0 {
+		return ErrAdditionsFactCheckKilledWithoutRun
 	}
 
 	return nil
@@ -808,6 +913,11 @@ func BuildFindings(in VerdictInput) []Finding {
 		counts[h]++
 	}
 
+	// One resolution for the whole verdict (§26.6's amendment): every
+	// counter-review addition carries the same AdditionCheck the verdict
+	// records, so the two can never disagree.
+	additionCheck := BuildSecondFactCheck(in).Resolved
+
 	seenInGroup := make(map[string]int, len(in.Findings))
 	out := make([]Finding, len(in.Findings))
 	for i, f := range in.Findings {
@@ -825,6 +935,10 @@ func BuildFindings(in VerdictInput) []Finding {
 			Line:         f.Line,
 			Description:  f.Description,
 			SuggestedFix: f.SuggestedFix,
+			Source:       f.Source,
+		}
+		if f.Source == FindingSourceCounterReview {
+			out[i].AdditionCheck = additionCheck
 		}
 	}
 	return out

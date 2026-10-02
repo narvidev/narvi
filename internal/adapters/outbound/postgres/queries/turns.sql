@@ -245,6 +245,79 @@ WHERE session_id = $1 AND status = 'processing';
 SELECT * FROM turns
 WHERE session_id = $1 AND dispatched_message_id = $2;
 
+-- name: GetNextTurnDispatchedEventID :one
+-- The upper bound of one turn's sub-task trace (§26.4's corroboration,
+-- §26.6's amendment): the lowest dispatched_event_id among the session's
+-- OTHER turns that is at or above this turn's own. Every event a later
+-- turn produces lands above that turn's watermark (MaxEventIDForSession,
+-- queries/events.sql), so a read of this turn's trace bounded by
+-- `id <= next` holds none of them. The bound is needed because a turn
+-- that timed out is marked failed without stopping its agent, the next
+-- turn is dispatched to the same sandbox at the same gen, and the timed-
+-- out turn's late verdict is still resolved by its own message id
+-- (GetTurnByDispatchedMessageID): without it, the later turn's sub-tasks
+-- -- its routine first fact-check included -- would read as the earlier
+-- turn's own.
+--
+-- ">=" rather than ">": another turn whose watermark EQUALS this one's
+-- was dispatched with no event between the two dispatches, so the event
+-- log cannot tell the two turns' events apart. The caller sees next ==
+-- its own watermark and treats the trace as not read in full, never as
+-- an empty one. A turn re-sent to a respawned sandbox carries the
+-- watermark of its latest dispatch, so a bound taken from it is that
+-- dispatch's. pgx.ErrNoRows: no other turn was dispatched at or after
+-- this one, and the trace has no upper bound.
+SELECT dispatched_event_id FROM turns
+WHERE session_id = $1
+  AND id <> $2
+  AND dispatched_event_id >= sqlc.arg('dispatched_event_id')::bigint
+ORDER BY dispatched_event_id ASC
+LIMIT 1;
+
+-- name: ExistsEarlierTurnLeftRunning :one
+-- Whether the session holds an EARLIER turn, dispatched to the same
+-- sandbox gen before this one, that ended without its own
+-- execution_complete (§26.6's amendment): timed out, stopped, abandoned
+-- or refused, so the control plane appended a synthetic one naming it
+-- (`"synthetic": true, "turn_id": <id>`, sessionactor's appendEvent).
+-- Nothing stops that turn's agent, so it may still be running in the same
+-- sandbox, at the same gen, while this turn runs, and its late sub-tasks
+-- land in this turn's window (bounded below only, by this turn's own
+-- watermark) where nothing tells them from this turn's own: no sub-task
+-- event names the turn or prompt it belongs to. The caller then reads
+-- this turn's trace as not read in full, for both checks. A turn that
+-- ended with a real execution_complete leaves no synthetic one, and
+-- changes nothing; an earlier turn on another gen ran in a sandbox
+-- incarnation that is gone, whose events the gen filter already excludes.
+-- The rule is conservative: it holds until the sandbox's gen moves on, so
+-- a session whose turn timed out reads every later turn's claims on that
+-- gen as unconfirmed.
+--
+-- A turn whose prompt certainly never reached the sandbox is not one of
+-- them: its agent never existed. sessionactor's failDispatchedTurn marks
+-- that synthetic event `"delivered": false` -- a dispatch refused before
+-- the prompt was sent, or a send refused with no live connection, which
+-- writes nothing -- and such an event is not counted. Any other synthetic
+-- event still is: a timeout, a stop, or a send failure that may have
+-- followed a partial write. Only a synthetic event without the mark can
+-- make a turn count, so a stray marked event for a turn that did time out
+-- cannot hide that turn's own unmarked one.
+SELECT EXISTS (
+    SELECT 1 FROM turns earlier
+    WHERE earlier.session_id = $1
+      AND earlier.id <> $2
+      AND earlier.dispatched_sandbox_gen = sqlc.arg('gen')::int
+      AND earlier.dispatched_event_id < sqlc.arg('dispatched_event_id')::bigint
+      AND EXISTS (
+          SELECT 1 FROM events e
+          WHERE e.session_id = earlier.session_id
+            AND e.type = 'execution_complete'
+            AND e.payload->>'synthetic' = 'true'
+            AND e.payload->>'turn_id' = earlier.id::text
+            AND COALESCE(e.payload->>'delivered', '') <> 'false'
+      )
+) AS left_running;
+
 -- name: SetTurnEpistemicOutcome :execrows
 -- The guarded UPDATE backing that same endpoint (§20.2) -- mirrors
 -- SetWorkflowStepRunOutcome's own "WHERE ... AND status = 'running'" guard
