@@ -10,6 +10,44 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.17.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `RepoEntitlement` (`repoFullName`, `revoked`, and `revokedAt`,
+  `revokedByUserId`, `revokedByDisplayName`, `reason`, each null when the
+  repository is not revoked; every field required,
+  `additionalProperties: false`), the body of the three entitlement routes
+  below: whether an administrator revoked a repository's eligibility for
+  new sessions (technical plan §31.4, "Un-entitlement"), and when, by whom
+  and why. A new `$def` grades MINOR (row 32).
+- Added: `RevokeRepoEntitlementRequest` (`reason`, required, `minLength`
+  1), the revoke route's request body. The reason is trimmed and must be 1
+  to 500 characters; `maxLength` is not a keyword this bundle's
+  compatibility checker grades, so the 500-character cap is the handler's
+  (a 400) and the table's (a CHECK), stated in the `description`. A new
+  `$def` grades MINOR (row 32).
+- Unchanged: no existing `$def`, no enum.
+
+### controlplane/testdata/routes.golden
+
+- Added: `GET /api/repos/{owner}/{repo}/entitlement`,
+  `POST /api/repos/{owner}/{repo}/entitlement/revoke` and
+  `POST /api/repos/{owner}/{repo}/entitlement/restore` -- an
+  administrator reads a repository's entitlement, revokes its eligibility
+  for new sessions with a reason, and restores it (technical plan §31.4).
+  All three answer `RepoEntitlement`; `403` unless
+  `authz.ActionManageRepoEntitlement` admits the caller (admin only,
+  §13.3), `404` for a repository the deployment does not know. Revoke
+  answers `400` for a blank or over-long reason and `409` when the
+  repository is already revoked, keeping the first revocation; restore
+  takes no body and answers `409` when the repository is not revoked.
+  While revoked, session creation on every surface answers the refusal
+  `repository entitlement revoked by an administrator: <repo>` (`403` over
+  REST, a tool error over MCP), distinct from the `repository not entitled`
+  refusal of an unknown repository. Three routes added grade MINOR
+  (row 41).
+
 ## [1.16.0]
 
 ### client-ws/v1/protocol.schema.json

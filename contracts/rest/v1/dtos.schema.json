@@ -6843,6 +6843,53 @@
           "description": "Optional https homepage of the client: at most 2048 bytes of printable ASCII, with a host and no userinfo, its host written in plain ASCII like a redirect URI's -- anything else is refused 400. The consent page shows its host."
         }
       }
+    },
+    "RepoEntitlement": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "GET /api/repos/{owner}/{repo}/entitlement response body, and the body POST .../entitlement/revoke and POST .../entitlement/restore return on success (technical plan §31.4, \"Un-entitlement\"): whether an administrator revoked this repository's eligibility for new sessions. A revoked repository is refused on every session-creation surface, and its sessions' pending turns are refused before they reach a sandbox, until an administrator restores it; a restore re-opens only what the deployment already knows (a repository it has seen a pull-request session for), it never grants eligibility. ADMIN-ONLY (authz.ActionManageRepoEntitlement, §13.3). Every field is present; the four describing a revocation are null when the repository is not revoked.",
+      "required": ["repoFullName", "revoked", "revokedAt", "revokedByUserId", "revokedByDisplayName", "reason"],
+      "properties": {
+        "repoFullName": {
+          "type": "string",
+          "description": "The natural 'owner/repo' key, exactly as the deployment's pull-request sessions name it -- revocation matches it exactly, never case-folded."
+        },
+        "revoked": {
+          "type": "boolean",
+          "description": "True while an administrator's revocation is in force: no new session may name this repository, and its sessions' pending turns are refused."
+        },
+        "revokedAt": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "When the revocation in force was made. Null when not revoked."
+        },
+        "revokedByUserId": {
+          "type": ["string", "null"],
+          "format": "uuid",
+          "description": "The administrator who made it. Null when not revoked, or once that user no longer exists."
+        },
+        "revokedByDisplayName": {
+          "type": ["string", "null"],
+          "description": "That administrator's display name. Null when not revoked, or once that user no longer exists."
+        },
+        "reason": {
+          "type": ["string", "null"],
+          "description": "Why it was revoked, as the administrator wrote it (1 to 500 characters). Null when not revoked."
+        }
+      }
+    },
+    "RevokeRepoEntitlementRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "POST /api/repos/{owner}/{repo}/entitlement/revoke's request body (technical plan §31.4). reason is trimmed and must be 1 to 500 characters: blank is refused 400 \"reason is required\", longer is refused 400 \"reason must be at most 500 characters\". A repository already revoked is refused 409 and keeps its first revocation's who, when and why; one the deployment does not know is refused 404.",
+      "required": ["reason"],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why new sessions on this repository are revoked: 1 to 500 characters after trimming, kept with the revocation and in the audit log."
+        }
+      }
     }
   }
 }
