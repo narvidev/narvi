@@ -29,8 +29,15 @@
 --
 -- # Locks
 --
--- A catalog-only create of an empty table: no existing table is locked or
--- rewritten.
+-- The create rewrites nothing, but its foreign key (revoked_by REFERENCES
+-- users) adds referential triggers to users, so the statement takes
+-- SHARE ROW EXCLUSIVE on users for the file's one implicit transaction --
+-- an instant once granted. It conflicts with any row write: the migration
+-- waits behind an open transaction that has written to users (a sign-in
+-- creating a user, a role change), and while it waits, new writes to users
+-- queue behind it. Reads of users are not blocked. controlplane/migrate.go
+-- sets no lock_timeout, so a long transaction on users holds the boot's
+-- migration until it ends.
 --
 -- # Rolling deploy
 --

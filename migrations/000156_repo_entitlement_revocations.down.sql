@@ -22,4 +22,9 @@
 -- Guarded: IF EXISTS, so it also runs on a database a rollback already
 -- brought back to 155 with the table kept (`migrate force 155`, the up
 -- file's "Rolling back") and then forced up again.
+-- Locks: dropping the table drops its foreign key's triggers on users, so
+-- the drop takes ACCESS EXCLUSIVE on users -- reads included -- for the
+-- file's one implicit transaction, an instant once granted, waiting behind
+-- any open transaction that touched users. With the control plane scaled
+-- to zero, as above, nothing is waiting.
 DROP TABLE IF EXISTS repo_entitlement_revocations;
