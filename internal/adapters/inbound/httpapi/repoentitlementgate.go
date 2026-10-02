@@ -179,7 +179,7 @@ var sessionRepoEntitlementDeniedTotalCounter = sync.OnceValue(newSessionRepoEnti
 func newSessionRepoEntitlementDeniedTotalCounter() metric.Int64Counter {
 	c, err := otel.Meter(repoEntitlementGateMeterName).Int64Counter(
 		"session_repo_entitlement_denied_total",
-		metric.WithDescription("Count of every session-creation attempt refused by §31.4's per-repository entitlement predicate (authz.AuthorizeRepo) -- ResolveRepoEntitlement's and ResolveGitHubRepoEntitlement's own session-creation-time denials -- and of every spawn or turn dispatch the session actor refuses because an administrator revoked the session's repository (internal/app/sessionactor registers the SAME instrument). Tagged by \"spawn_source\" and \"reason\": \"unknown\" for a named repo never confirmed known to this deployment (github_pr_sessions), \"revoked\" for one an administrator revoked (repo_entitlement_revocations). A misconfigured entitlement is loud here, never silent: a sustained nonzero \"unknown\" rate on a repo an operator believes IS connected means it has not yet had a GitHub PR mention (see ResolveRepoEntitlement's own doc comment), not that Narvi is broken; a \"revoked\" rate is work still arriving for a repository an administrator closed."),
+		metric.WithDescription("Count of every session-creation attempt refused by §31.4's per-repository entitlement predicate (authz.AuthorizeRepo), with stage \"create\": ResolveRepoEntitlement's and ResolveGitHubRepoEntitlement's own session-creation-time denials. It also counts every refusal the session actor makes because an administrator revoked an existing session's repository (internal/app/sessionactor registers the SAME instrument, with reason \"revoked\" and stage \"spawn\", \"dispatch\", \"resend\" for a prompt receipt re-send, or \"auto_retrigger\" for an automatic re-review debounce firing dropped, one per push). Tagged by \"spawn_source\", \"stage\" and \"reason\": \"unknown\" for a named repo never confirmed known to this deployment (github_pr_sessions), \"revoked\" for one an administrator revoked (repo_entitlement_revocations). A misconfigured entitlement is loud here, never silent: a sustained nonzero \"unknown\" rate on a repo an operator believes IS connected means it has not yet had a GitHub PR mention (see ResolveRepoEntitlement's own doc comment), not that Narvi is broken; a \"revoked\" rate is work still arriving for a repository an administrator closed."),
 		metric.WithUnit("{denial}"),
 	)
 	if err != nil {
@@ -191,13 +191,21 @@ func newSessionRepoEntitlementDeniedTotalCounter() metric.Int64Counter {
 	return c
 }
 
+// repoEntitlementDenialStage is the stage attribute every denial counted
+// here carries: a session creation refused. The session actor counts its
+// own refusals of an existing session's work on the same instrument, each
+// with its own stage (internal/app/sessionactor's repoEntitlementStage
+// constants), so a dashboard of creation denials filters on this one.
+const repoEntitlementDenialStage = "create"
+
 // recordRepoEntitlementDenial increments the denial counter by one, tagged
-// by spawnSource and reason (repoEntitlementDenialReason) -- mirrors
-// recordRolloutRefusal's own identical shape.
+// by spawnSource, reason (repoEntitlementDenialReason) and stage "create"
+// -- mirrors recordRolloutRefusal's own shape.
 func recordRepoEntitlementDenial(ctx context.Context, spawnSource, reason string) {
 	sessionRepoEntitlementDeniedTotalCounter().Add(ctx, 1, metric.WithAttributes(
 		attribute.String("spawn_source", spawnSource),
 		attribute.String("reason", reason),
+		attribute.String("stage", repoEntitlementDenialStage),
 	))
 }
 

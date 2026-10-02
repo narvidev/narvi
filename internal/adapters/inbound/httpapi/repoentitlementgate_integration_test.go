@@ -631,7 +631,8 @@ func revokeForTest(ctx context.Context, t *testing.T, pool *pgxpool.Pool, fullNa
 }
 
 // deniedCount is session_repo_entitlement_denied_total for spawnSource and
-// reason, as httpapi's own meter scope reports it.
+// reason, as httpapi's own meter scope reports it: every denial counted
+// here is a session creation's, so each point must carry stage "create".
 func deniedCount(ctx context.Context, t *testing.T, spawnSource, reason string) int64 {
 	t.Helper()
 	var rm metricdata.ResourceMetrics
@@ -654,6 +655,9 @@ func deniedCount(ctx context.Context, t *testing.T, spawnSource, reason string) 
 			for _, point := range sum.DataPoints {
 				source, _ := point.Attributes.Value("spawn_source")
 				why, _ := point.Attributes.Value("reason")
+				if stage, _ := point.Attributes.Value("stage"); stage.AsString() != "create" {
+					t.Fatalf("a %s point carries stage %q, want \"create\": httpapi counts session creations only", m.Name, stage.AsString())
+				}
 				if source.AsString() == spawnSource && why.AsString() == reason {
 					n += point.Value
 				}
