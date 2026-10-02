@@ -5304,24 +5304,31 @@ expiry leaves a revoked repository eligible until its deadline.
   pull request's base repository and for the clone URL: a new mention, a follow-up on an existing
   review session, a label re-trigger and a fork's mention are all refused silently, the delivery
   claim kept; a sentinel auto-fix is skipped terminally, before its branch is created. Every refusal
-  is counted (`session_repo_entitlement_denied_total{reason="revoked"}`) and audited.
-- **Work in flight.** A turn already processing finishes, push, pull request and verdict included.
-  Every pending turn, whatever produced it, is refused before its prompt is first written to a
-  sandbox -- at spawn and at dispatch, the §32.4 placements, in every rollout mode -- reading the
-  session's clone URLs and its pull-request claims (a review session's, a sentinel child's), and ends
-  forward with a banner and, for a review attempt, a check closed as not assessed
-  (`repo_entitlement_revoked`); nothing was written, so its synthetic `execution_complete` carries
-  the `"delivered": false` mark (§26.4) and a later turn on the same gen keeps its trace. A
-  revocation read that fails at dispatch fails the turn as an undelivered prompt, marked the same
-  way, and backs off, never as a refusal. A prompt already sent once is never failed: its §3.3
-  receipt re-send after a same-gen reconnect reads the revocation too, and a revocation (or a read
-  that fails) sends nothing and leaves the turn processing until it completes or its deadline ends
-  it. Automatic re-review (§24) reads the revocation before it fetches anything, inserts a turn or
-  spends the pull request's budget, so a revoked repository's pushes spend nothing and post no
-  budget notice; after a restore the next push re-reviews. Live sandboxes idle out. The revocation
-  does not pause automations itself, but each invocation with a revoked target fails and counts a
-  strike (§3.5), so three such invocations auto-pause the automation -- its targets nobody revoked
-  included -- and a restore does not resume it: a person does. Pending outbox deliveries, which
+  is counted (`session_repo_entitlement_denied_total{reason="revoked", stage="create"}`) and audited.
+- **Work in flight.** A turn already processing finishes, push, pull request and verdict included,
+  unless its sandbox restarts or dies while the repository is revoked: the gen it ran on is gone, the
+  respawn or the re-send to the new gen is refused like a first dispatch, and the turn ends with the
+  revocation reason. Every pending turn, whatever produced it, is refused before its prompt is
+  written to a sandbox gen that has not had it -- at spawn and at dispatch, the §32.4 placements, in
+  every rollout mode -- reading the session's clone URLs and its pull-request claims (a review
+  session's, a sentinel child's), and ends forward with a banner and, for a review attempt, a check
+  closed as not assessed (`repo_entitlement_revoked`); nothing was written to that gen, so its
+  synthetic `execution_complete` carries the `"delivered": false` mark (§26.4), which is read per gen,
+  and a later turn on the same gen keeps its trace. A revocation read that fails at dispatch fails the
+  turn as an undelivered prompt, marked the same way, and backs off, never as a refusal. A prompt
+  re-sent to the gen it was already sent to is never failed: its §3.3 receipt re-send after a same-gen
+  reconnect reads the revocation in the transaction that claims the reconnect, and a revocation
+  claims it without counting a re-send, sends nothing and leaves the turn processing until it
+  completes or its deadline ends it; a read that fails rolls the claim back, and the next heartbeat
+  answers the reconnect. Automatic re-review (§24) reads the revocation before it fetches anything,
+  inserts a turn or spends the pull request's budget, so a revoked repository's pushes spend nothing
+  and post no budget notice, and the session's status does not read the debounce they arm as
+  scheduled work (§43.20); after a restore the next push re-reviews. Each of these refusals is counted
+  on the same counter as creation's, by the stage it was made at (`spawn`, `dispatch`, `resend`,
+  `auto_retrigger`). Live sandboxes idle out. The revocation does not pause automations itself, but
+  each invocation with a revoked target fails and counts a strike (§3.5), so three such invocations
+  auto-pause the automation -- its targets nobody revoked included, which still run in each
+  invocation -- and a restore does not resume it: a person does. Pending outbox deliveries, which
   report work already done, go out.
 - **The action.** `GET`, `POST .../revoke` and `POST .../restore` under
   `/api/repos/{owner}/{repo}/entitlement`, admin-only (`manage_repo_entitlement`, §13.3), 404 for
@@ -5336,7 +5343,8 @@ expiry leaves a revoked repository eligible until its deadline.
   reason; (c) an `authz.RepoAdmission` built without naming `Revoked` -- a literal (an elided or
   pointer element included), a `var` of the type, `new`, or a type declared from it; (d) a named
   query reading `github_pr_sessions` in any position without the revocations table, unless an
-  allowlist names it with a reason. It cannot see an allowlisted function that uses only "known"
+  allowlist names it with a reason -- an entry for a query that reads the revocations table, or no
+  longer reads `github_pr_sessions`, fails as stale. It cannot see an allowlisted function that uses only "known"
   from the result, a struct field of the type left at its zero value, reflection, or a read through
   a view a migration defines.
 - **Rollback re-opens.** A binary without the migration never reads the table: during a rolling
@@ -9008,20 +9016,23 @@ erring toward unsettled. A database `CHECK` on the kind was considered
 and not added: it would make every new timer kind a schema change with its own rollout order and
 down-migration, for a gap the backstop already keeps on the safe side.
 
-The re-review debounce counts only while its fire can insert a turn at all, on the fire's two
+The re-review debounce counts only while its fire can insert a turn at all, on the fire's three
 conditions a row shows: the pull request's repository opted in
-(`repo_settings.auto_retrigger_review_enabled`; no row reads as off, as it does for the fire) and its
+(`repo_settings.auto_retrigger_review_enabled`; no row reads as off, as it does for the fire), its
 automatic re-review count is below `sessionactor.ReviewAutoRetriggerBudget` — the one constant the fire compares
-with, passed into the statement rather than written there again — read in one lateral over
-`github_pr_sessions` and `repo_settings` (`review_retrigger_can_fire`). The count only grows and only
-the admin toggle writes the opt-in, so a debounce read as unable to fire can create a turn later only
-after a person switches the opt-in on: new input. The fire's other decline rules are deliberately not
-copied — the head already reviewed (the latest verdict's head, which a turn already marked failed can
-still post), a plan awaiting approval, a live fetch that fails. Leaving a decline rule out errs toward
+with, passed into the statement rather than written there again — and an administrator has not
+revoked it (§31.4: no `repo_entitlement_revocations` row for the pull request's base repository, the
+claim key the fire reads too), read in one lateral over `github_pr_sessions`, `repo_settings` and
+`repo_entitlement_revocations` (`review_retrigger_can_fire`). The count only grows, only the admin
+toggle writes the opt-in and only an administrator's restore lifts a revocation, so a debounce read
+as unable to fire can create a turn later only after a person's own input. The fire's other decline
+rules are deliberately not copied — the head already reviewed (the latest verdict's head, which a
+turn already marked failed can still post), a plan awaiting approval, a live fetch that fails, a
+revocation of only the session's clone URL (a fork's name, parsed in Go). Leaving a decline rule out errs toward
 `scheduled`, never toward settled: a false settled needs a copied rule stricter than the fire's own, or
 one that drifts from it, and `TestSessionStatus_ReReviewFireAndStatusAgree` runs the real fire and the
-status over one table of opt-ins and counts around the budget and asserts they agree on every row. A
-work-creating timer counts while it is armed; its handler deletes it in the transaction that inserts
+status over one table of opt-ins, counts around the budget and revocations and asserts they agree on
+every row. A work-creating timer counts while it is armed; its handler deletes it in the transaction that inserts
 the turn, or declines, so no snapshot holds neither. A handler that keeps failing leaves it armed,
 retried every `TimerClaimDuration`, and the status keeps reading `scheduled`: the server is still
 trying.
