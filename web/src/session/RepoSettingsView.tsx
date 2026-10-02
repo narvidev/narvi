@@ -514,9 +514,13 @@ export function RepoEntitlementStatus({ entitlement }: { entitlement: RepoEntitl
  * is gated too (authz.ActionManageRepoEntitlement) -- so it queries anyway
  * and renders a forbidden note on a real 403, the server being the
  * authority. Revoking takes a required reason; restoring is one button.
- * Both answer the updated entitlement, written straight into the cache.
+ * Both answer the updated entitlement, written straight into the cache. A
+ * 409 means another administrator revoked or restored the repository
+ * first, so the cached status is stale: it is refetched, and the card
+ * shows the state the server holds beside the server's own message.
+ * Exported for the card's wiring test (repoEntitlementCard.test.tsx).
  */
-function RepoEntitlementCard({ owner, repo, role }: { owner: string; repo: string; role: string | undefined }) {
+export function RepoEntitlementCard({ owner, repo, role }: { owner: string; repo: string; role: string | undefined }) {
   const queryClient = useQueryClient()
   const repoFullName = `${owner}/${repo}`
   const [reason, setReason] = useState('')
@@ -527,12 +531,19 @@ function RepoEntitlementCard({ owner, repo, role }: { owner: string; repo: strin
     retry: false,
   })
 
+  const refetchIfStale = (error: unknown) => {
+    if (error instanceof ApiError && error.status === 409) {
+      void queryClient.invalidateQueries({ queryKey: repoEntitlementQueryKeys.detail(repoFullName) })
+    }
+  }
+
   const revoke = useMutation({
     mutationFn: () => postRevokeRepoEntitlement(owner, repo, { reason: reason.trim() }),
     onSuccess: (updated) => {
       queryClient.setQueryData(repoEntitlementQueryKeys.detail(repoFullName), updated)
       setReason('')
     },
+    onError: refetchIfStale,
   })
 
   const restore = useMutation({
@@ -540,6 +551,7 @@ function RepoEntitlementCard({ owner, repo, role }: { owner: string; repo: strin
     onSuccess: (updated) => {
       queryClient.setQueryData(repoEntitlementQueryKeys.detail(repoFullName), updated)
     },
+    onError: refetchIfStale,
   })
 
   const forbidden = query.isError && query.error instanceof ApiError && query.error.status === 403
@@ -551,6 +563,9 @@ function RepoEntitlementCard({ owner, repo, role }: { owner: string; repo: strin
       <p className="ph">
         An administrator can revoke this repository&rsquo;s eligibility for new sessions -- from the web, chat, pull-request mentions and automations alike -- and restore it later. Restoring only lifts the revocation: it never makes a
         repository eligible that this deployment does not already know.
+      </p>
+      <p className="ph">
+        A revocation names one repository by its owner and name. If the repository is renamed or moved to another owner on the code host, its new name is not revoked: revoke the new name too.
       </p>
       {forbidden && <p className="notavailable">Revoking and restoring a repository is admin-only. Your role cannot view or change it -- enforced by the server, not merely hidden on this screen.</p>}
       {!forbidden && query.isPending && <p className="rail-empty">Loading…</p>}
