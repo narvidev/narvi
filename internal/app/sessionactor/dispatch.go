@@ -2230,7 +2230,10 @@ func (a *Actor) tryPlanDispatch(
 // bypass this Step's own review found structurally unrepresentable rather
 // than merely undocumented -- a bare miss in ONE of several remembered
 // call sites can no longer silently let a de-enrolled repo's session keep
-// being dispatched.
+// being dispatched. (A receipt re-send -- a prompt already sent once,
+// §3.3 -- leaves executeDispatch at its top for executeReceiptResend,
+// which runs its own rollout and revocation re-checks and never fails the
+// turn.)
 //
 // This runs AFTER tryPlanDispatch/tryPlanReenqueue's own transact has
 // already committed the turn Processing (this file's own top "#
@@ -2263,9 +2266,12 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainSt
 	}
 
 	// §31.4's turn-dispatch-time re-read of an administrator's revocation,
-	// in every rollout mode: see revocationRefusalForDispatch's own doc
-	// comment (repoentitlement.go). A receiptResend plan is handed to
-	// executeReceiptResend above, before this re-read.
+	// in every rollout mode, for every dispatchPlan that sends a prompt for
+	// the first time: see revocationRefusalForDispatch's own doc comment
+	// (repoentitlement.go). A receiptResend plan re-sends a prompt already
+	// sent once, which may be running, so it is never failed here:
+	// executeReceiptResend reads the revocation itself and only refuses the
+	// re-send (refuseResendIfRepoRevoked).
 	if failure, fail := a.revocationRefusalForDispatch(ctx, plan.sessionRow, chainStart); fail {
 		return a.failDispatchedTurn(ctx, plan.turnID, failure)
 	}

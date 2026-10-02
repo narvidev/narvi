@@ -284,9 +284,10 @@ func (a *Actor) tryPlanReceiptResend(
 // receipt, one WARN and a count past the window or the cap
 // (PromptResendMaxPerTurn), and otherwise the original prompt written
 // again. A re-send passes the same turn-dispatch-time checks every
-// dispatch does (executeDispatch) -- the rollout re-check and the frame's
-// size against platform.MaxPromptFrameBytes -- but neither a refusal nor a
-// failed write fails the turn, as executeDispatch's would: the prompt may
+// dispatch does (executeDispatch) -- an administrator's revocation
+// (refuseResendIfRepoRevoked, §31.4), the rollout re-check and the
+// frame's size against platform.MaxPromptFrameBytes -- but neither a
+// refusal nor a failed write fails the turn, as executeDispatch's would: the prompt may
 // already be running, and the next reconnect asks again. The size check
 // cannot refuse a frame the same dispatch already sent; it is there so no
 // frame over the limit is ever written, whatever produced it.
@@ -319,6 +320,12 @@ func (a *Actor) executeReceiptResend(ctx context.Context, plan *dispatchPlan) er
 		return fmt.Errorf("sessionactor: unknown prompt resend outcome %v", rr.outcome)
 	}
 
+	// §31.4: an administrator's revocation refuses the re-send too, and
+	// never fails the turn -- see refuseResendIfRepoRevoked
+	// (repoentitlement.go).
+	if a.refuseResendIfRepoRevoked(ctx, plan) {
+		return nil
+	}
 	if repo, refused, transient := a.rolloutRefusalForDispatch(ctx, plan.sessionRow); refused {
 		a.logger.Warn("sessionactor: prompt re-send refused: configured repo is not enrolled in the cohort rollout; the turn stays processing",
 			"turn_id", plan.turnID.String(), "gen", rr.gen, "message_id", rr.messageID, "repo", repo, "transient", transient)

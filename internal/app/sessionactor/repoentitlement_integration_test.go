@@ -14,10 +14,12 @@ package sessionactor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -174,6 +176,7 @@ func TestDispatch_RevokedRepo_RefusesSpawn(t *testing.T) {
 	provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "provider-should-never-be-called"}}
 	r := newDispatchTestRegistryWithRolloutMode(t, ctx, pool, provider, rollout.ModeOpen)
 	t.Cleanup(func() { _ = r.Shutdown() })
+	before := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked")
 
 	a, err := r.GetOrSpawn(ctx, sessionID)
 	if err != nil {
@@ -193,6 +196,9 @@ func TestDispatch_RevokedRepo_RefusesSpawn(t *testing.T) {
 		t.Error("a sandbox row was written: the refusal must come before any spawn claim")
 	}
 	assertRefusedForRevocation(ctx, t, pool, sessionID, queued, repo, "so no sandbox could be started")
+	if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked") - before; got != 1 {
+		t.Errorf("session_repo_entitlement_denied_total{revoked} grew by %d, want 1: the spawn refusal is counted once", got)
+	}
 	if _, ok := dispatchTimer(ctx, t, pool, sessionID); ok {
 		t.Error("a dispatch timer is left: the refusal would be evaluated again")
 	}
@@ -415,9 +421,12 @@ func TestDispatch_RevokedRepo_RefusedInOpenAndCohortRolloutModes(t *testing.T) {
 // TestDispatch_RevocationReadError_UndeliveredNotRefused: a revocation read
 // that fails is not a fact about the repository. At dispatch it fails the
 // turn as an undelivered prompt -- prompt_not_delivered on its review
-// check, no banner, nothing counted, the dispatch timer backed off -- never
-// as a refusal; at spawn it leaves the turn pending and backs off. The
-// read is made to fail by hiding the table for the test's duration.
+// check, no banner, nothing counted -- never as a refusal; at spawn it
+// leaves the turn pending and backs its dispatch timer off. The read is made
+// to fail by hiding the table for the test's duration. At dispatch the
+// back-off is observable only once something re-arms the timer, which
+// TestDispatchRevocation_WorkflowStepEscalatesOnce_ReadErrorIsRetriedBackedOff
+// shows with a workflow step's blocked self edge.
 func TestDispatch_RevocationReadError_UndeliveredNotRefused(t *testing.T) {
 	ctx := context.Background()
 	hideRevocations := func(t *testing.T, pool *pgxpool.Pool) {
@@ -517,4 +526,319 @@ func TestDispatch_RevocationReadError_UndeliveredNotRefused(t *testing.T) {
 			t.Errorf("session warnings = %q, want none", warnings)
 		}
 	})
+}
+
+// receiptResendAfterRevocation drives a capable gen-1 dispatch of the
+// rig's turn (its prompt asks for a receipt), then, with stored receipt or
+// not, an administrator's revocation of the session's repository and a
+// same-gen reconnect -- the point at which a prompt the sandbox has not
+// receipted would be sent again. It returns the rig.
+func receiptResendAfterRevocation(ctx context.Context, t *testing.T, receiptStored bool) *receiptRig {
+	t.Helper()
+	repo := "acme/zz-revoked-resend-" + uuid.NewString()[:8]
+	rig := newReceiptRig(ctx, t, receiptRigOptions{repoFullName: repo})
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	prompts := rig.commander.prompts(t)
+	if len(prompts) != 1 || !prompts[0].asksReceipt(t) {
+		t.Fatalf("prompts after the first dispatch = %d, want one asking for a receipt", len(prompts))
+	}
+	if receiptStored {
+		sendAndSettle(ctx, t, rig.actor, promptReceivedEvent(prompts[0].MessageId, 1, false), 1)
+	}
+	revokeRepoForActorTest(ctx, t, rig.pool, repo)
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	return rig
+}
+
+// assertProcessingNothingResent checks that a same-gen reconnect after a
+// revocation sent no second prompt and left the turn processing, with no
+// synthetic execution_complete: the prompt may be running, and running work
+// finishes.
+func assertProcessingNothingResent(ctx context.Context, t *testing.T, rig *receiptRig) {
+	t.Helper()
+	if got := len(rig.commander.prompts(t)); got != 1 {
+		t.Errorf("prompts sent = %d, want the first dispatch alone: nothing is re-sent to a revoked repository", got)
+	}
+	if got := rig.turn(ctx, t); got.Status != sqlcgen.TurnStatusProcessing {
+		t.Errorf("turn status = %s, want processing: a refused re-send never fails the turn", got.Status)
+	}
+	if _, synthetic := rig.executionCompleteRows(ctx, t); synthetic != 0 {
+		t.Errorf("synthetic execution_complete events = %d, want none", synthetic)
+	}
+}
+
+// TestPromptReceipt_RevokedRepo_LostPromptNotResent: a prompt lost on its
+// way to a capable gen, then an administrator's revocation, then a same-gen
+// reconnect: no receipt is stored, so the re-send would start the work
+// after the revocation -- it is refused, counted (refused on
+// turn_prompt_resend_total, revoked on session_repo_entitlement_denied_total),
+// and the turn stays processing.
+func TestPromptReceipt_RevokedRepo_LostPromptNotResent(t *testing.T) {
+	ctx := context.Background()
+	refusedBefore := promptResendCount(ctx, t, promptResendOutcomeRefused)
+	revokedBefore := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked")
+
+	rig := receiptResendAfterRevocation(ctx, t, false)
+
+	assertProcessingNothingResent(ctx, t, rig)
+	if got := promptResendCount(ctx, t, promptResendOutcomeRefused) - refusedBefore; got != 1 {
+		t.Errorf("turn_prompt_resend_total{refused} moved by %d, want 1", got)
+	}
+	if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked") - revokedBefore; got != 1 {
+		t.Errorf("session_repo_entitlement_denied_total{revoked} moved by %d, want 1", got)
+	}
+}
+
+// TestPromptReceipt_RevokedRepo_ReceiptStoredNothingSentNotFailed: the same,
+// with the prompt's receipt stored, so the agent confirmed it is running:
+// the reconnect sends nothing and the turn is not failed.
+func TestPromptReceipt_RevokedRepo_ReceiptStoredNothingSentNotFailed(t *testing.T) {
+	ctx := context.Background()
+	rig := receiptResendAfterRevocation(ctx, t, true)
+	assertProcessingNothingResent(ctx, t, rig)
+}
+
+// TestPromptReceipt_RevocationReadError_ResendNotSentNotFailed: a revocation
+// read that fails at a same-gen reconnect sends nothing and fails nothing --
+// the prompt may be running, and the next reconnect asks again.
+func TestPromptReceipt_RevocationReadError_ResendNotSentNotFailed(t *testing.T) {
+	ctx := context.Background()
+	repo := "acme/zz-unreadable-resend-" + uuid.NewString()[:8]
+	rig := newReceiptRig(ctx, t, receiptRigOptions{repoFullName: repo})
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	if got := len(rig.commander.prompts(t)); got != 1 {
+		t.Fatalf("prompts after the first dispatch = %d, want 1", got)
+	}
+	refusedBefore := promptResendCount(ctx, t, promptResendOutcomeRefused)
+	if _, err := rig.pool.Exec(ctx, `ALTER TABLE repo_entitlement_revocations RENAME TO repo_entitlement_revocations_hidden`); err != nil {
+		t.Fatalf("hide revocations: %v", err)
+	}
+	t.Cleanup(func() {
+		if _, err := rig.pool.Exec(context.Background(), `ALTER TABLE repo_entitlement_revocations_hidden RENAME TO repo_entitlement_revocations`); err != nil {
+			t.Errorf("restore revocations table: %v", err)
+		}
+	})
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+
+	assertProcessingNothingResent(ctx, t, rig)
+	if got := promptResendCount(ctx, t, promptResendOutcomeRefused) - refusedBefore; got != 1 {
+		t.Errorf("turn_prompt_resend_total{refused} moved by %d, want 1", got)
+	}
+}
+
+// workflowStepWithBlockedSelfEdge attaches attempt to a fresh workflow run
+// whose one step has a blocked self edge, and returns the run.
+func workflowStepWithBlockedSelfEdge(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, attempt sqlcgen.Turn, name string) sqlcgen.WorkflowRun {
+	t.Helper()
+	var defID, stepID pgtype.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO workflow_definitions (lane, name, is_built_in, version) VALUES ('review', $1, false, 1) RETURNING id`, name).Scan(&defID); err != nil {
+		t.Fatalf("insert definition: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO workflow_step_definitions (workflow_definition_id, step_order, kind, prompt_template) VALUES ($1, 1, 'agent', '{{prompt}}') RETURNING id`, defID).Scan(&stepID); err != nil {
+		t.Fatalf("insert step definition: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO workflow_edges (workflow_definition_id, from_step_id, to_step_id, on_status) VALUES ($1, $2, $2, 'blocked')`, defID, stepID); err != nil {
+		t.Fatalf("insert blocked self edge: %v", err)
+	}
+	workflows := narvipg.NewWorkflowStore(pool)
+	run, err := workflows.CreateRun(ctx, sessionID, "review", defID, 1)
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stepRun, err := workflows.CreateStepRun(ctx, run.ID, stepID)
+	if err != nil {
+		t.Fatalf("create step run: %v", err)
+	}
+	if err := workflows.AttachTurn(ctx, stepRun.ID, attempt.ID); err != nil {
+		t.Fatalf("attach turn: %v", err)
+	}
+	return run
+}
+
+// TestDispatchRevocation_WorkflowStepEscalatesOnce_ReadErrorIsRetriedBackedOff
+// pins how the two dispatch-time outcomes reach a workflow step with a
+// blocked self edge:
+//
+//   - a revocation is a refusal (OnTurnRefused): with the pump ticking, the
+//     refusal is made once, no attempt is queued again, the run waits for a
+//     person (needs_review), and no dispatch timer is left;
+//   - a revocation read that fails is an undelivered prompt
+//     (OnTurnCompleted, then backOffAfterUndeliveredPrompt): the step's
+//     blocked self edge queues it again, the run is not escalated, and the
+//     dispatch timer the re-queued turn armed is backed off.
+func TestDispatchRevocation_WorkflowStepEscalatesOnce_ReadErrorIsRetriedBackedOff(t *testing.T) {
+	ctx := context.Background()
+	t.Run("revoked", func(t *testing.T) {
+		pool := newTestPool(t)
+		const repo = "acme/revoked-workflow"
+		sessionID, attempt := reviewSessionOn(ctx, t, pool, repo, "https://github.com/"+repo+".git", true)
+		run := workflowStepWithBlockedSelfEdge(ctx, t, pool, sessionID, attempt, "test-revoked-blocked-self-edge")
+		revokeRepoForActorTest(ctx, t, pool, repo)
+
+		timeouts := platform.DefaultTimeouts()
+		timeouts.TimerClaimDuration = 300 * time.Millisecond
+		commander := &fakeSendCommander{}
+		r, err := NewRegistry(ctx, pool, timeouts, nil, commander, nil, "http://localhost:8080", nil, nil, "", nil, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = r.Shutdown() })
+		before := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked")
+		a, err := r.GetOrSpawn(ctx, sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sendEnsureDispatched(ctx, t, a)
+		for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+			if err := r.PumpOnce(ctx); err != nil {
+				t.Fatal(err)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
+		if n := countRows(ctx, t, pool, `SELECT count(*) FROM turns WHERE session_id = $1`, sessionID); n != 1 {
+			t.Errorf("turns = %d, want the refused attempt alone: the refusal followed the blocked self edge", n)
+		}
+		if n := countRows(ctx, t, pool, `SELECT count(*) FROM workflow_step_runs WHERE workflow_run_id = $1`, run.ID); n != 1 {
+			t.Errorf("step runs = %d, want the refused attempt alone", n)
+		}
+		gotRun, err := narvipg.NewWorkflowStore(pool).GetRun(ctx, run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotRun.Status != sqlcgen.WorkflowRunStatusNeedsReview {
+			t.Errorf("run status = %s, want needs_review", gotRun.Status)
+		}
+		if _, ok := dispatchTimer(ctx, t, pool, sessionID); ok {
+			t.Error("a dispatch timer is left: something was queued behind the refusal")
+		}
+		if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked") - before; got != 1 {
+			t.Errorf("session_repo_entitlement_denied_total{revoked} grew by %d, want 1: the refusal is made once", got)
+		}
+		if got := commander.callCount(); got != 0 {
+			t.Errorf("SendCommand calls = %d, want 0", got)
+		}
+	})
+
+	t.Run("read error", func(t *testing.T) {
+		pool := newTestPool(t)
+		const repo = "acme/unreadable-workflow"
+		sessionID, attempt := reviewSessionOn(ctx, t, pool, repo, "https://github.com/"+repo+".git", true)
+		run := workflowStepWithBlockedSelfEdge(ctx, t, pool, sessionID, attempt, "test-unreadable-blocked-self-edge")
+		if _, err := pool.Exec(ctx, `ALTER TABLE repo_entitlement_revocations RENAME TO repo_entitlement_revocations_hidden`); err != nil {
+			t.Fatalf("hide revocations: %v", err)
+		}
+		t.Cleanup(func() {
+			if _, err := pool.Exec(context.Background(), `ALTER TABLE repo_entitlement_revocations_hidden RENAME TO repo_entitlement_revocations`); err != nil {
+				t.Errorf("restore revocations table: %v", err)
+			}
+		})
+
+		timeouts := platform.DefaultTimeouts()
+		timeouts.DispatchRetryBackoff = time.Minute
+		timeouts.DispatchRetryBackoffMax = 10 * time.Minute
+		commander := &fakeSendCommander{}
+		r, err := NewRegistry(ctx, pool, timeouts, nil, commander, nil, "http://localhost:8080", nil, nil, "", nil, false)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = r.Shutdown() })
+		a, err := r.GetOrSpawn(ctx, sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sendEnsureDispatched(ctx, t, a)
+		turns := narvipg.NewTurnStore(pool)
+		waitUntil(t, 5*time.Second, func() bool {
+			got, err := turns.Get(ctx, attempt.ID)
+			return err == nil && got.Status == sqlcgen.TurnStatusFailed
+		})
+		waitUntil(t, 5*time.Second, func() bool {
+			timer, ok := dispatchTimer(ctx, t, pool, sessionID)
+			return ok && timer.FiresAt.Time.After(time.Now().Add(30*time.Second))
+		})
+
+		gotRun, err := narvipg.NewWorkflowStore(pool).GetRun(ctx, run.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if gotRun.Status == sqlcgen.WorkflowRunStatusNeedsReview {
+			t.Errorf("run status = %s: a failed revocation read escalated the run", gotRun.Status)
+		}
+		if n := countRows(ctx, t, pool, `SELECT count(*) FROM turns WHERE session_id = $1`, sessionID); n != 2 {
+			t.Errorf("turns = %d, want the failed attempt and the step queued again behind the backoff", n)
+		}
+		if got := commander.callCount(); got != 0 {
+			t.Errorf("SendCommand calls = %d, want 0", got)
+		}
+	})
+}
+
+// TestReviewRetriggerDebounce_RevokedRepo_NoTurnNoBudgetNoNotice: pushes to
+// a pull request of a repository an administrator revoked (§31.4) create
+// no automatic re-review -- through eleven debounce firings, one past the
+// budget, no turn is inserted, no GitHub read is made, none of the pull
+// request's budget is spent, and no budget-exhausted notice is enqueued.
+// After a restore, the next push re-reviews as it always did.
+func TestReviewRetriggerDebounce_RevokedRepo_NoTurnNoBudgetNoNotice(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newAutoRetriggerFixture(ctx, t, pool)
+	if _, err := f.repoSettings.UpsertAutoRetriggerReviewToggle(ctx, f.repoFullName, true); err != nil {
+		t.Fatalf("enable auto-retrigger-review: %v", err)
+	}
+	revokeRepoForActorTest(ctx, t, pool, f.repoFullName)
+
+	diffFetcher := &fakeReviewDiffFetcher{nextHeadSHA: "sha-live", nextBaseRef: "main", nextDiff: "+ line changed"}
+	r := newAutoRetriggerRegistry(ctx, t, pool, diffFetcher)
+	before := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked")
+	for i := 1; i <= ReviewAutoRetriggerBudget+1; i++ {
+		f.setPendingHeadSHA(ctx, t, fmt.Sprintf("sha-push-%d", i))
+		f.armDebounceTimer(ctx, t)
+		fireDebounceTimer(ctx, t, r, f)
+	}
+
+	turns, err := f.turns.ListForSession(ctx, f.sessionID)
+	if err != nil {
+		t.Fatalf("list turns: %v", err)
+	}
+	if len(turns) != 0 {
+		t.Errorf("turns = %d, want 0: a revoked repository gets no automatic re-review", len(turns))
+	}
+	row := f.getPRSession(ctx, t)
+	if row.AutoRetriggerCount != 0 || row.AutoRetriggerBudgetNoticeSentAt.Valid {
+		t.Errorf("auto_retrigger_count = %d, notice sent = %v; want 0 and no notice: nothing ran, nothing is spent", row.AutoRetriggerCount, row.AutoRetriggerBudgetNoticeSentAt.Valid)
+	}
+	if n := f.countOutboxVerdictRows(ctx, t); n != 0 {
+		t.Errorf("github_verdict outbox rows = %d, want 0: no budget notice for reviews that never ran", n)
+	}
+	if n := len(outboxRows(ctx, t, pool, f.sessionID, ports.NotificationKindGitHubReviewCheck)); n != 0 {
+		t.Errorf("review-check outbox rows = %d, want 0", n)
+	}
+	diffFetcher.mu.Lock()
+	reads := diffFetcher.getPRCalls
+	diffFetcher.mu.Unlock()
+	if reads != 0 {
+		t.Errorf("GitHub pull-request reads = %d, want 0: the revocation is read first", reads)
+	}
+	if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "reason", "revoked") - before; got != int64(ReviewAutoRetriggerBudget+1) {
+		t.Errorf("session_repo_entitlement_denied_total{revoked} grew by %d, want one per firing (%d)", got, ReviewAutoRetriggerBudget+1)
+	}
+
+	if _, err := narvipg.NewRepoEntitlementRevocationStore(pool).Restore(ctx, f.repoFullName); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	f.setPendingHeadSHA(ctx, t, "sha-after-restore")
+	f.armDebounceTimer(ctx, t)
+	fireDebounceTimer(ctx, t, r, f)
+	turns, err = f.turns.ListForSession(ctx, f.sessionID)
+	if err != nil {
+		t.Fatalf("list turns: %v", err)
+	}
+	if len(turns) != 1 {
+		t.Errorf("turns after the restore = %d, want 1: the next push re-reviews", len(turns))
+	}
+	if row := f.getPRSession(ctx, t); row.AutoRetriggerCount != 1 {
+		t.Errorf("auto_retrigger_count after the restore = %d, want 1", row.AutoRetriggerCount)
+	}
 }

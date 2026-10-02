@@ -5,18 +5,35 @@
 // revocation keeps producing turns -- a person's prompt, a plan approval, a
 // manual or automatic re-review, a workflow step, a Slack or Linear
 // follow-up -- and none of those producers reads eligibility. So the
-// revocation is read again where every turn has to pass before it reaches a
-// sandbox, the two placements §32.4's rollout re-checks already use:
+// revocation is read again at the placements §32.4's rollout re-checks
+// use, which every prompt passes before it is written to a sandbox:
 //
 //   - refuseIfRepoRevoked, before a spawn, restore or resume (tryPlanSpawn),
 //     inside the evaluation's transaction. A revoked repository ends the
 //     session's open turns forward (endTurnsOnSpawnRefusal); a read that
 //     failed rolls the evaluation back and its dispatch timer backs off.
-//   - revocationRefusalForDispatch, before a turn's prompt is sent to a live
-//     sandbox (executeDispatch), on the pool. A revoked repository fails the
-//     turn as a policy refusal; a read that failed fails it as an
-//     undelivered prompt and backs the dispatch timer off -- never as a
-//     refusal, so a database blip never escalates a workflow run.
+//   - revocationRefusalForDispatch, before a turn's prompt is first sent to
+//     a live sandbox (executeDispatch, for every plan but a receipt
+//     re-send), on the pool. A revoked repository fails the turn as a
+//     policy refusal; a read that failed fails it as an undelivered prompt
+//     and backs the dispatch timer off -- never as a refusal, so a
+//     database blip never escalates a workflow run. Either way the prompt
+//     was never written, so the turn's synthetic execution_complete
+//     carries the "delivered": false mark (§26.4).
+//   - refuseResendIfRepoRevoked, before a prompt already sent once is sent
+//     again after a same-gen reconnect (executeReceiptResend, §3.3's prompt
+//     receipts). That prompt may be running, so neither a revocation nor a
+//     failed read fails the turn there: the re-send is not sent, it is
+//     counted, and the turn stays processing until it completes or its
+//     deadline ends it.
+//
+// One unattended producer is gated before it creates a turn at all:
+// automatic re-review (readReviewRetriggerState, reviewretrigger.go), whose
+// turns each spend a per-pull-request budget and, once it is spent, post a
+// notice on the pull request. A refusal at spawn or dispatch would come
+// after both, so a revoked repository's pushes would spend the budget on
+// reviews that never ran and announce it publicly; reading the revocation
+// first spends nothing and posts nothing.
 //
 // Unlike the rollout re-checks these run in every rollout mode: a
 // revocation binds every deployment. What runs is left alone: a turn
@@ -126,10 +143,13 @@ func repoRevokedSpawnRefusal(repo string) *spawnRefusal {
 }
 
 // revocationRefusalForDispatch is the turn-dispatch-time re-read of an
-// administrator's revocation (§31.4): the first thing executeDispatch does,
-// on the pool, after the turn was committed processing and before its
-// prompt is sent. It returns the dispatchFailure executeDispatch fails the
-// turn with, and whether to fail it:
+// administrator's revocation (§31.4): what executeDispatch does first for
+// every plan that sends a prompt for the first time (a receipt re-send goes
+// to refuseResendIfRepoRevoked instead), on the pool, after the turn was
+// committed processing and before its prompt is sent. It returns the
+// dispatchFailure executeDispatch fails the turn with, and whether to fail
+// it -- both failures marked undelivered, since SendCommand is never called
+// on either path:
 //
 //   - a revoked repository: a policy refusal (refused), with the banner and
 //     a review attempt's check closed as not assessed naming the
@@ -149,6 +169,8 @@ func (a *Actor) revocationRefusalForDispatch(ctx context.Context, sessionRow sql
 			reason:       repoEntitlementUnverifiedReason,
 			notAssessed:  reviewcheck.NotAssessedPromptNotDelivered,
 			backOffSince: chainStart,
+			// SendCommand is never called on this path.
+			undelivered: true,
 		}, true
 	}
 	if !revoked {
@@ -163,5 +185,61 @@ func (a *Actor) revocationRefusalForDispatch(ctx context.Context, sessionRow sql
 			"An administrator can restore the repository; then send the turn again.", repo),
 		notAssessed: reviewcheck.NotAssessedRepoEntitlementRevoked,
 		refused:     true,
+		// SendCommand is never called on this path.
+		undelivered: true,
 	}, true
+}
+
+// refuseResendIfRepoRevoked is the revocation re-read of a receipt re-send
+// (§3.3's prompt receipts, §31.4): executeReceiptResend calls it, beside its
+// rollout re-check, before writing again a prompt its sandbox has not
+// receipted after a same-gen reconnect. It reports whether the re-send must
+// not be sent. That prompt was already sent once and may be running, so
+// nothing here fails the turn: a revoked repository, or a revocation read
+// that failed, sends nothing, logs a warning and counts the re-send as
+// refused (turn_prompt_resend_total{outcome="refused"}; a revocation also
+// on session_repo_entitlement_denied_total{reason="revoked"}), and the turn
+// stays processing -- it ends when it completes or at its deadline, and the
+// next reconnect asks again.
+func (a *Actor) refuseResendIfRepoRevoked(ctx context.Context, plan *dispatchPlan) bool {
+	rr := plan.receiptResend
+	repo, revoked, err := a.revokedRepoForSession(ctx, a.stores.githubPRSession, plan.sessionRow)
+	if err != nil {
+		a.logger.Warn("sessionactor: prompt re-send not sent: the repository's entitlement could not be verified; the turn stays processing and the next reconnect asks again",
+			"turn_id", plan.turnID.String(), "gen", rr.gen, "message_id", rr.messageID, "error", err)
+		a.recordPromptResend(ctx, promptResendOutcomeRefused)
+		return true
+	}
+	if !revoked {
+		return false
+	}
+	a.logger.Warn("sessionactor: prompt re-send refused: an administrator revoked the session's repository (§31.4); the turn stays processing",
+		"turn_id", plan.turnID.String(), "gen", rr.gen, "message_id", rr.messageID, "repo", repo)
+	a.recordPromptResend(ctx, promptResendOutcomeRefused)
+	a.recordRepoEntitlementRevoked(ctx, string(plan.sessionRow.SpawnSource))
+	return true
+}
+
+// autoRetriggerRepoRevoked reports whether the review session's repository
+// was revoked by an administrator (§31.4), read on tx before automatic
+// re-review fetches anything, creates a turn or spends any of the pull
+// request's budget (readReviewRetriggerState). A revoked repository's
+// debounce firing is dropped with an Info line and counted on
+// session_repo_entitlement_denied_total{reason="revoked"}.
+func (a *Actor) autoRetriggerRepoRevoked(ctx context.Context, tx pgx.Tx, prRepoFullName string, prNumber int32) (bool, error) {
+	sessionRow, err := a.stores.session.WithTx(tx).Get(ctx, a.sessionID)
+	if err != nil {
+		return false, fmt.Errorf("sessionactor: review_retrigger_debounce: get session: %w", err)
+	}
+	repo, revoked, err := a.revokedRepoForSession(ctx, a.stores.githubPRSession.WithTx(tx), sessionRow)
+	if err != nil {
+		return false, fmt.Errorf("sessionactor: review_retrigger_debounce: read revocations: %w", err)
+	}
+	if !revoked {
+		return false, nil
+	}
+	a.logger.Info("sessionactor: review_retrigger_debounce: an administrator revoked this pull request's repository (§31.4); dropping the timer without a re-review, no budget spent",
+		"repo_full_name", prRepoFullName, "pr_number", prNumber, "revoked_repo", repo)
+	a.recordRepoEntitlementRevoked(ctx, string(sessionRow.SpawnSource))
+	return true, nil
 }
