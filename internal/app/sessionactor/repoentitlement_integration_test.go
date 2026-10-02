@@ -661,8 +661,11 @@ func TestPromptReceipt_RevocationReadError_ReconnectAnsweredOnceReadable(t *test
 
 	assertProcessingNothingResent(ctx, t, rig)
 	got := rig.turn(ctx, t)
-	if got.ReceiptCheckedReadySeq == nil || checkedBefore == nil || *got.ReceiptCheckedReadySeq != *checkedBefore {
-		t.Errorf("receipt_checked_ready_seq = %v, want %v: a failed read claims no reconnect", got.ReceiptCheckedReadySeq, checkedBefore)
+	if checkedBefore == nil {
+		t.Fatal("receipt_checked_ready_seq is NULL after the first dispatch, want the dispatch's ready_seq")
+	}
+	if got.ReceiptCheckedReadySeq == nil || *got.ReceiptCheckedReadySeq != *checkedBefore {
+		t.Errorf("receipt_checked_ready_seq = %s, want %d: a failed read claims no reconnect", int32PtrString(got.ReceiptCheckedReadySeq), *checkedBefore)
 	}
 	if moved := promptResendCount(ctx, t, promptResendOutcomeRefused) - refusedBefore; moved != 0 {
 		t.Errorf("turn_prompt_resend_total{refused} moved by %d, want 0: a failed read decided nothing", moved)
@@ -676,12 +679,20 @@ func TestPromptReceipt_RevocationReadError_ReconnectAnsweredOnceReadable(t *test
 	}
 	got = rig.turn(ctx, t)
 	if got.Status != sqlcgen.TurnStatusProcessing || got.ReceiptResendCount != 1 || got.ReceiptCheckedReadySeq == nil || *got.ReceiptCheckedReadySeq != rig.sandbox(ctx, t).ReadySeq {
-		t.Errorf("turn status %s, receipt_resend_count %d, receipt_checked_ready_seq %v; want processing, 1, the reconnect's ready_seq %d",
-			got.Status, got.ReceiptResendCount, got.ReceiptCheckedReadySeq, rig.sandbox(ctx, t).ReadySeq)
+		t.Errorf("turn status %s, receipt_resend_count %d, receipt_checked_ready_seq %s; want processing, 1, the reconnect's ready_seq %d",
+			got.Status, got.ReceiptResendCount, int32PtrString(got.ReceiptCheckedReadySeq), rig.sandbox(ctx, t).ReadySeq)
 	}
 	if moved := promptResendCount(ctx, t, promptResendOutcomeSent) - sentBefore; moved != 1 {
 		t.Errorf("turn_prompt_resend_total{sent} moved by %d, want 1", moved)
 	}
+}
+
+// int32PtrString prints p's value, or NULL.
+func int32PtrString(p *int32) string {
+	if p == nil {
+		return "NULL"
+	}
+	return fmt.Sprint(*p)
 }
 
 // assertEndedForRevocationAfterSandboxWent checks that rig's turn, which
