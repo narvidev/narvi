@@ -756,7 +756,9 @@ While a repository is revoked, no surface can start a session on it —
 the web, MCP, Slack, Linear, a pull-request mention, an automation, a
 sentinel auto-fix — and its existing sessions' queued turns are ended
 before they reach a sandbox; a turn already running finishes. The
-Repository settings screen shows the status and offers both actions.
+Repository settings screen shows the status and offers both actions. A
+revocation names the repository by its owner and name: if the repository
+is renamed or moved on the code host, revoke the new name too.
 
 ```json narvi-command
 {"name": "Get a repo's entitlement status", "route": "GET /api/repos/{owner}/{repo}/entitlement"}

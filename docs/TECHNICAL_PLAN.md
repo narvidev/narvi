@@ -755,7 +755,7 @@ Roles (global, one per user): **admin > maintainer > member > viewer**.
 | Integrations, global secrets, prompt-template activation, members & roles, per-repo auto-merge toggle (§21), sentinel auto-fix toggle (§17 — stricter than auto-merge since it ends in an unattended merge with no per-repo arming step, not a human Merge click), per-repo automatic re-review opt-in toggle (§24 — off by default, same admin-only row as the other automation-enabling toggles here), and — §40 — the per-repo autonomy level, spend cap and session-bound extension, and the platform-wide freeze (the level is a ceiling on the toggles in this row, so it is gated at least as strictly as any of them) | ✓ | — | — | — |
 | Revoke a repository's eligibility for new sessions, and restore it (§31.4) | ✓ | — | — | — |
 
-Revoking a repository's eligibility and restoring it are one admin-only action (`manage_repo_entitlement`), its status read included; a revocation binds every session-creation surface, pull-request mentions included, and the pending turns of the repository's existing sessions (§31.4).
+Revoking a repository's eligibility and restoring it are one admin-only action (`manage_repo_entitlement`), its status read included; a revocation binds every session-creation surface, pull-request mentions included, and the pending turns of the repository's existing sessions. It names the repository by its name, so a rename or transfer on the code host needs the new name revoked too (§31.4).
 
 Stopping on own/joined sessions is owner decision O1 (default taken 2026-09-29, open to revision): a member can already start and prompt that work, and a stop only ever reduces what runs. Stopping a session also stops every session it started (§3.3), authorized by the one check on the session named. Resuming stays admin/maintainer only; in practice a person resumes a stopped session by prompting it, approving its plan, or approving or revising a workflow step awaiting their decision, each under its own permission (§3.3).
 
@@ -5286,6 +5286,12 @@ expiry leaves a revoked repository eligible until its deadline.
   500 characters. Restore deletes the row. History lives in `audit_log` (`repo_entitlement.revoked`,
   `repo_entitlement.restored`, each written in the transaction of its change, §13.3). Restore only
   lifts the revocation: it never makes eligible a repository the deployment does not already know.
+  A revocation names one repository by its name, the same key every table here uses (§31.9 limit
+  4): no stable repository id is parsed from the webhook or stored. After a rename or transfer on
+  the code host, a mention under the new name is admitted -- the GitHub path is exempt from "known"
+  -- and makes the new name known; the old name stays revoked, and its sessions stay refused
+  through their old-name claims. An administrator revokes the new name too; the settings card says
+  so.
 - **One read.** Eligibility and revocation are read in one statement (`ReadRepoEntitlement`,
   `GitHubPRSessionStore.RepoEntitlement`); no store method returns "known" without "revoked".
   `authz.AuthorizeRepo` refuses a revoked repository before it looks at whether it is known, with an
@@ -5300,23 +5306,38 @@ expiry leaves a revoked repository eligible until its deadline.
   claim kept; a sentinel auto-fix is skipped terminally, before its branch is created. Every refusal
   is counted (`session_repo_entitlement_denied_total{reason="revoked"}`) and audited.
 - **Work in flight.** A turn already processing finishes, push, pull request and verdict included.
-  Every pending turn, whatever produced it, is refused where every turn passes before reaching a
+  Every pending turn, whatever produced it, is refused before its prompt is first written to a
   sandbox -- at spawn and at dispatch, the §32.4 placements, in every rollout mode -- reading the
   session's clone URLs and its pull-request claims (a review session's, a sentinel child's), and ends
   forward with a banner and, for a review attempt, a check closed as not assessed
-  (`repo_entitlement_revoked`). A revocation read that fails at dispatch fails the turn as an
-  undelivered prompt and backs off, never as a refusal. Live sandboxes idle out; automations are not
-  paused; pending outbox deliveries, which report work already done, go out.
+  (`repo_entitlement_revoked`); nothing was written, so its synthetic `execution_complete` carries
+  the `"delivered": false` mark (§26.4) and a later turn on the same gen keeps its trace. A
+  revocation read that fails at dispatch fails the turn as an undelivered prompt, marked the same
+  way, and backs off, never as a refusal. A prompt already sent once is never failed: its §3.3
+  receipt re-send after a same-gen reconnect reads the revocation too, and a revocation (or a read
+  that fails) sends nothing and leaves the turn processing until it completes or its deadline ends
+  it. Automatic re-review (§24) reads the revocation before it fetches anything, inserts a turn or
+  spends the pull request's budget, so a revoked repository's pushes spend nothing and post no
+  budget notice; after a restore the next push re-reviews. Live sandboxes idle out. The revocation
+  does not pause automations itself, but each invocation with a revoked target fails and counts a
+  strike (§3.5), so three such invocations auto-pause the automation -- its targets nobody revoked
+  included -- and a restore does not resume it: a person does. Pending outbox deliveries, which
+  report work already done, go out.
 - **The action.** `GET`, `POST .../revoke` and `POST .../restore` under
   `/api/repos/{owner}/{repo}/entitlement`, admin-only (`manage_repo_entitlement`, §13.3), 404 for
   an unknown repository, 409 for a second revoke or a restore of a repository not revoked. The
   repository-scoped admin routes scope on "known" alone, so a revoked repository stays reachable --
   which is how it is restored. The Repository settings screen carries the card; there is no MCP tool
   and no CLI.
-- **The guard.** `internal/ops`' `ScanRepoEntitlementReads` fails the build when a reader could skip
-  revocation: a generated revocation read called outside the store, `RepoEntitlement` called from a
-  function its allowlist does not name, an `authz.RepoAdmission` literal without `Revoked:`, or a
-  named query reading `github_pr_sessions` in an `EXISTS` without the revocations table.
+- **The guard.** `internal/ops`' `ScanRepoEntitlementReads` is a name-based check on syntax that
+  fails the build on four shapes of a reader skipping revocation: (a) a generated revocation read
+  named anywhere but its one store method; (b) `RepoEntitlement` named -- called or as a method
+  value, the postgres adapter included -- from a function its allowlist does not list with a
+  reason; (c) an `authz.RepoAdmission` built without naming `Revoked` -- a literal (an elided or
+  pointer element included), a `var` of the type, `new`, or a type declared from it; (d) a named
+  query reading `github_pr_sessions` in any position without the revocations table, unless an
+  allowlist names it with a reason. It cannot see a struct field of the type left at its zero
+  value, reflection, or a read through a view a migration defines.
 - **Rollback re-opens.** A binary without the migration never reads the table: during a rolling
   deploy old pods still admit, and after a rollback -- forced back with the rows kept, or the down,
   which drops them -- every revoked repository is eligible again until this release is redeployed
@@ -5781,7 +5802,8 @@ rather than belonging to mode A alone.)
 4. **`repo_full_name` as the scope key**: a repository rename/transfer silently splits a corpus
    that outlives any PR session. Consistency with `repo_settings` and `github_pr_sessions`
    argues for keeping it and inheriting any future rename fix those tables get — accepted, and
-   noted rather than hidden.
+   noted rather than hidden. An administrator's revocation (§31.4) is keyed the same way: after a
+   rename or transfer the new name is not revoked until an administrator revokes it.
 5. **A new egress channel exists in mode B** — the embeddings provider receives customer-derived
    text. Surfaced (§31.8), key policy decided for shadow; the wire-compatible adapter (§31.5)
    is the named path to closing it entirely for self-hosters, and it is deferred, not dropped.
