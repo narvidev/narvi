@@ -62,6 +62,11 @@ const (
 	// first place. See gitdir's own package doc comment for the full
 	// shape.
 	gitDirRootEnvVar = "NARVI_GIT_DIR_ROOT"
+
+	// agentStateDirEnvVar names the directory sandbox-agent keeps its own
+	// durable state in (Config.AgentStateDir): today, the prompt journal
+	// technical plan §3.3's prompt receipts dedup on.
+	agentStateDirEnvVar = "NARVI_AGENT_STATE_DIR"
 )
 
 // Defaults for every optional env var above.
@@ -122,6 +127,14 @@ const (
 	// the root as a plain parameter, never re-deriving a default of its
 	// own).
 	defaultGitDirRoot = "/var/lib/narvi/gitdirs"
+
+	// defaultAgentStateDir is used when NARVI_AGENT_STATE_DIR is unset:
+	// beside defaultCredentialCacheDir, and like it OUTSIDE
+	// defaultWorkspaceDir, the tree the agent runtime owns (§30.5). Under
+	// /tmp so it survives a restart of the agent process within one
+	// sandbox -- a Kubernetes container restart keeps the pod's /tmp
+	// emptyDir -- and goes with the sandbox.
+	defaultAgentStateDir = "/tmp/narvi-agent-state"
 )
 
 // Config is sandbox-agent's own typed, boot-time-validated configuration,
@@ -179,6 +192,21 @@ type Config struct {
 	// provide (the runtime could then reach it via an ordinary path
 	// inside its own tree).
 	GitDirRoot string
+
+	// AgentStateDir is where sandbox-agent keeps state that must survive a
+	// restart of its own process within one sandbox gen: the prompt journal
+	// (internal/sandboxagent/wsbridge's EnablePromptReceipts, technical plan
+	// §3.3's prompt receipts), which records every prompt messageId this
+	// gen has run so a copy re-sent after a reconnect is never run twice.
+	// Resolved by Load from NARVI_AGENT_STATE_DIR: unset or empty uses
+	// defaultAgentStateDir; set to a non-absolute path, one nested under
+	// (or equal to) WorkspaceDir, or one containing WorkspaceDir is a
+	// fail-fast *InvalidAgentStateDirError -- the agent runtime owns
+	// WorkspaceDir (§30.5), and a journal it can reach is one it can edit
+	// into running a prompt twice, or never. Like CredentialCacheDir, the
+	// directory itself is checked when it is opened: it must be this
+	// process's own, and writable by no one else.
+	AgentStateDir string
 
 	// SandboxID is the value internal/sandboxagent/wsbridge.New sends as
 	// the sandbox WS connection's X-Sandbox-ID header (§6.1). Resolved by
@@ -433,6 +461,41 @@ func validateGitDirRoot(root, workspaceDir string) error {
 	return nil
 }
 
+// InvalidAgentStateDirError is returned by Load when NARVI_AGENT_STATE_DIR
+// is set to a non-absolute path, or to one nested under, equal to, or
+// containing WorkspaceDir. See Config.AgentStateDir's own doc comment for
+// why.
+type InvalidAgentStateDirError struct {
+	Value  string
+	Reason string
+}
+
+func (e *InvalidAgentStateDirError) Error() string {
+	return fmt.Sprintf("boot: invalid %s=%q: %s", agentStateDirEnvVar, e.Value, e.Reason)
+}
+
+// validateAgentStateDir enforces Config.AgentStateDir's requirements:
+// non-empty, absolute, neither nested under (or equal to) workspaceDir nor
+// containing it -- the same two-direction check validateGitDirRoot makes,
+// on cleaned paths, for the same reason: the runtime owns workspaceDir.
+func validateAgentStateDir(dir, workspaceDir string) error {
+	if dir == "" {
+		return &InvalidAgentStateDirError{Value: dir, Reason: "must not be empty"}
+	}
+	if !filepath.IsAbs(dir) {
+		return &InvalidAgentStateDirError{Value: dir, Reason: "must be an absolute path"}
+	}
+	cleanDir := filepath.Clean(dir)
+	cleanWorkspace := filepath.Clean(workspaceDir)
+	if isPathUnderOrEqual(cleanDir, cleanWorkspace) {
+		return &InvalidAgentStateDirError{Value: dir, Reason: fmt.Sprintf("must not be nested under WorkspaceDir (%s) -- the agent runtime owns that tree, and could then edit the prompt journal", workspaceDir)}
+	}
+	if isPathUnderOrEqual(cleanWorkspace, cleanDir) {
+		return &InvalidAgentStateDirError{Value: dir, Reason: fmt.Sprintf("must not contain WorkspaceDir (%s) -- the agent runtime owns that tree", workspaceDir)}
+	}
+	return nil
+}
+
 // isPathUnderOrEqual reports whether path is base itself, or nested
 // anywhere under it -- checked via filepath.Rel: a relative result of "."
 // (equal) or one with no leading ".." segment (a strict descendant) both
@@ -540,6 +603,14 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	agentStateDir := os.Getenv(agentStateDirEnvVar)
+	if agentStateDir == "" {
+		agentStateDir = defaultAgentStateDir
+	}
+	if err := validateAgentStateDir(agentStateDir, workspaceDir); err != nil {
+		return Config{}, err
+	}
+
 	// sessionConfig is resolved BEFORE sandboxID below -- sandboxID's own
 	// resolution needs to know whether a SessionConfig is present (and,
 	// if so, its own SandboxId) to pick the right value/detect a mismatch.
@@ -563,6 +634,7 @@ func Load() (Config, error) {
 		RuntimeUID:         runtimeUID,
 		RuntimeGID:         runtimeGID,
 		GitDirRoot:         gitDirRoot,
+		AgentStateDir:      agentStateDir,
 		SandboxID:          sandboxID,
 		SessionConfig:      sessionConfig,
 	}, nil

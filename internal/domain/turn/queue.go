@@ -93,6 +93,12 @@ func InFlightTurn[ID any](turns []QueueEntry[ID]) (ID, bool) {
 // duplicate/corrupt an already-in-progress execution -- the single most
 // safety-critical property this function's own callers depend on).
 //
+// A same-gen turn is still never re-dispatched by this path. Technical plan
+// §3.3's prompt receipts (receipt.go) send its prompt once more only when
+// its gen advertised the capability and its own dispatch asked for a
+// receipt, after a reconnect that found none stored -- and then with the
+// SAME messageId, which such an agent runs at most once.
+//
 // dispatchedGen == nil is deliberately treated the SAME as a genuine
 // mismatch, not as "unknown, skip": the only way an in-flight turn can
 // have a nil dispatched_sandbox_gen is if it was dispatched by code that

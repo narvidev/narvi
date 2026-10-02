@@ -42,4 +42,9 @@
 // connection's X-Sandbox-ID header value. Nothing else in this package
 // changes: RunBoot, hook policy, and the fingerprint remain exactly as
 // §6.4/§14.2 left them.
+//
+// And NARVI_AGENT_STATE_DIR (default /tmp/narvi-agent-state, beside the
+// credential cache and likewise outside WorkspaceDir): where the sibling
+// wsbridge package keeps its prompt journal, technical plan §3.3's prompt
+// receipts -- see Config.AgentStateDir's own doc comment.
 package boot

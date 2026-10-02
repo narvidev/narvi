@@ -2340,6 +2340,8 @@ type Sandbox struct {
 	BootingSince                  pgtype.Timestamptz   `json:"booting_since"`
 	BootingSinceGen               *int32               `json:"booting_since_gen"`
 	StopRetireGen                 *int32               `json:"stop_retire_gen"`
+	PromptReceiptGen              *int32               `json:"prompt_receipt_gen"`
+	ReadySeq                      int32                `json:"ready_seq"`
 }
 
 type SandboxHistory struct {
@@ -2433,33 +2435,37 @@ type SlackThreadSession struct {
 }
 
 type Turn struct {
-	ID                      pgtype.UUID           `json:"id"`
-	SessionID               pgtype.UUID           `json:"session_id"`
-	Status                  TurnStatus            `json:"status"`
-	ConversationID          *string               `json:"conversation_id"`
-	CreatedAt               pgtype.Timestamptz    `json:"created_at"`
-	DispatchedAt            pgtype.Timestamptz    `json:"dispatched_at"`
-	CompletedAt             pgtype.Timestamptz    `json:"completed_at"`
-	Prompt                  *string               `json:"prompt"`
-	ModelID                 *string               `json:"model_id"`
-	PlanMode                bool                  `json:"plan_mode"`
-	DispatchedSandboxGen    *int32                `json:"dispatched_sandbox_gen"`
-	ProgressNotifiedAt      pgtype.Timestamptz    `json:"progress_notified_at"`
-	Effort                  *string               `json:"effort"`
-	EpistemicOutcome        *TurnEpistemicOutcome `json:"epistemic_outcome"`
-	ReviewHeadSha           *string               `json:"review_head_sha"`
-	AnswerOnly              *bool                 `json:"answer_only"`
-	ReviewDepth             *string               `json:"review_depth"`
-	ReviewDepthDecision     []byte                `json:"review_depth_decision"`
-	DispatchedEventID       *int64                `json:"dispatched_event_id"`
-	CostUsd                 pgtype.Numeric        `json:"cost_usd"`
-	ReviewKnowledgeMode     *string               `json:"review_knowledge_mode"`
-	ReviewKnowledgeDecision []byte                `json:"review_knowledge_decision"`
-	CorrelationID           *string               `json:"correlation_id"`
-	ReviewVerdictContext    []byte                `json:"review_verdict_context"`
-	DispatchedMessageID     *string               `json:"dispatched_message_id"`
-	IsReviewAttempt         bool                  `json:"is_review_attempt"`
-	StopRequestedAt         pgtype.Timestamptz    `json:"stop_requested_at"`
+	ID                        pgtype.UUID           `json:"id"`
+	SessionID                 pgtype.UUID           `json:"session_id"`
+	Status                    TurnStatus            `json:"status"`
+	ConversationID            *string               `json:"conversation_id"`
+	CreatedAt                 pgtype.Timestamptz    `json:"created_at"`
+	DispatchedAt              pgtype.Timestamptz    `json:"dispatched_at"`
+	CompletedAt               pgtype.Timestamptz    `json:"completed_at"`
+	Prompt                    *string               `json:"prompt"`
+	ModelID                   *string               `json:"model_id"`
+	PlanMode                  bool                  `json:"plan_mode"`
+	DispatchedSandboxGen      *int32                `json:"dispatched_sandbox_gen"`
+	ProgressNotifiedAt        pgtype.Timestamptz    `json:"progress_notified_at"`
+	Effort                    *string               `json:"effort"`
+	EpistemicOutcome          *TurnEpistemicOutcome `json:"epistemic_outcome"`
+	ReviewHeadSha             *string               `json:"review_head_sha"`
+	AnswerOnly                *bool                 `json:"answer_only"`
+	ReviewDepth               *string               `json:"review_depth"`
+	ReviewDepthDecision       []byte                `json:"review_depth_decision"`
+	DispatchedEventID         *int64                `json:"dispatched_event_id"`
+	CostUsd                   pgtype.Numeric        `json:"cost_usd"`
+	ReviewKnowledgeMode       *string               `json:"review_knowledge_mode"`
+	ReviewKnowledgeDecision   []byte                `json:"review_knowledge_decision"`
+	CorrelationID             *string               `json:"correlation_id"`
+	ReviewVerdictContext      []byte                `json:"review_verdict_context"`
+	DispatchedMessageID       *string               `json:"dispatched_message_id"`
+	IsReviewAttempt           bool                  `json:"is_review_attempt"`
+	StopRequestedAt           pgtype.Timestamptz    `json:"stop_requested_at"`
+	ReceiptRequestedMessageID *string               `json:"receipt_requested_message_id"`
+	ReceiptRequestedAt        pgtype.Timestamptz    `json:"receipt_requested_at"`
+	ReceiptCheckedReadySeq    *int32                `json:"receipt_checked_ready_seq"`
+	ReceiptResendCount        int32                 `json:"receipt_resend_count"`
 }
 
 type TurnStepCost struct {

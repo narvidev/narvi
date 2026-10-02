@@ -253,6 +253,21 @@ describe('buildSandboxRailModel', () => {
     expect(model.hasSandbox).toBe(true)
   })
 
+  it('a prompt_received (technical plan §3.3, prompt receipts) moves no status, transition or boot phase -- only gen and lastSeenAt, as any sandbox frame does', () => {
+    const snapshot: SandboxSnapshot = { id: 'sb-1', gen: 1, status: 'ready', lastSeenAt: null, createdAt: 'x', updatedAt: 'y', agentVersion: null, imageDigest: null }
+    const before: EventEnvelope[] = [
+      ev(1, 'boot_progress', { type: 'boot_progress', messageId: 'm1', sessionId: 's', gen: 1, phase: 'deps', timestamp: 'x' }, '2026-08-20T10:00:00.000Z'),
+    ]
+    const receipt = ev(2, 'prompt_received', { type: 'prompt_received', messageId: 'prompt_received:p1', sessionId: 's', gen: 1, promptMessageId: 'p1', duplicate: false }, '2026-08-20T10:00:09.000Z')
+    const without = buildSandboxRailModel(before, snapshot)
+    const withReceipt = buildSandboxRailModel([...before, receipt], snapshot)
+    expect(withReceipt.status).toBe(without.status)
+    expect(withReceipt.transitions).toEqual(without.transitions)
+    expect(withReceipt.bootPhases).toEqual(without.bootPhases)
+    expect(withReceipt.gen).toBe(1)
+    expect(withReceipt.lastSeenAt).toBe('2026-08-20T10:00:09.000Z')
+  })
+
   it('a later event\'s gen wins over an earlier one (respawn bumps gen forward)', () => {
     const events: EventEnvelope[] = [
       ev(1, 'tool_call', { type: 'tool_call', messageId: 'm1', sessionId: 's', gen: 1, callId: 'c1', toolName: 'Read', input: {} }, '2026-08-20T10:00:00Z'),

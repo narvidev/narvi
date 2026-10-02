@@ -10,6 +10,41 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.18.0]
+
+### sandbox-ws/v1/commands.schema.json
+
+- Added: optional `Prompt.receiptRequested` (boolean, no `default`).
+  True asks the agent to answer the prompt, and every later copy of it,
+  with a `prompt_received` event and never to run a copy twice (technical
+  plan §3.3, prompt receipts). The control plane sets it only on a prompt
+  to a gen whose `ready` advertised `capabilities.promptReceipt`, so an
+  older agent is never sent it, and a prompt to such an agent is
+  byte-identical to before. An agent that ignores unknown keys runs the
+  prompt once and sends no receipt. A property added, not required,
+  grades MINOR (row 2).
+
+### sandbox-ws/v1/events.schema.json
+
+- Added: optional `Ready.capabilities` (object, closed), with one optional
+  boolean, `promptReceipt`: what this gen's agent supports beyond the base
+  protocol, sent on every `ready`. Absent means no capability; the control
+  plane never infers one from `agentVersion`. A property added, not
+  required, grades MINOR (row 2); the `ready` union member changes only by
+  that property (row 30, recursing into row 2).
+- Added: `PromptReceived`, the new `prompt_received` event, appended to the
+  root `oneOf`: `promptMessageId` names the prompt it answers, `duplicate`
+  says the agent had already received it and did not run it again, and
+  `messageId` is deterministic, `prompt_received:{promptMessageId}`, so
+  every copy of one prompt's receipt is stored once, by whichever
+  control-plane binary stores it. Not critical: it carries no `ackId`, and
+  the six critical types are unchanged. A new `$defs` entry grades MINOR
+  (row 32), and a discriminated variant added under shape A grades MINOR
+  (row 28); `prompt_received` was never assigned in an earlier release, so
+  row 46 does not apply.
+- Changed: the root description says why `prompt_received` is not among
+  the critical types. A description grades PATCH (row 35).
+
 ## [1.17.0]
 
 ### rest/v1/dtos.schema.json

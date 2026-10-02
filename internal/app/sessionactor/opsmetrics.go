@@ -210,6 +210,13 @@ type opsMetrics struct {
 	// explains it. Which kind is in the WARN line logged with it -- the
 	// name is not an attribute, since a row can carry any text.
 	unknownTimerKind metric.Int64Counter
+
+	// promptResend is turn_prompt_resend_total: one per same-gen reconnect
+	// the prompt-receipt check answered without finding the receipt
+	// (promptreceipt.go), tagged outcome=sent|send_failed|refused|
+	// frame_too_large|window_expired|cap_reached. A reconnect that finds the
+	// receipt stored is not counted: nothing was lost.
+	promptResend metric.Int64Counter
 }
 
 // newOpsMetrics constructs all five instruments against meter -- the SAME
@@ -362,6 +369,15 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		return opsMetrics{}, fmt.Errorf("sessionactor: construct session_timer_unknown_kind_total counter: %w", err)
 	}
 
+	promptResend, err := meter.Int64Counter(
+		"turn_prompt_resend_total",
+		metric.WithDescription("Same-gen reconnects of a sandbox whose turn in flight asked for a prompt receipt and found none stored (technical plan §3.3, prompt receipts), by outcome: sent (the prompt was written again, with its original messageId, which the agent runs at most once); send_failed (that write failed; the turn stays Processing and the next reconnect tries again); refused (the turn-dispatch-time rollout re-check refused it; the turn stays Processing); frame_too_large (the re-sent frame would exceed MaxPromptFrameBytes, which the same dispatch's frame did not; it is not sent); window_expired (the dispatch asked longer ago than PromptResendWindow, so nothing was sent; the turn ends at turn_deadline or by a person's stop, as before receipts existed); cap_reached (the dispatch's prompt was already re-sent PromptResendMaxPerTurn times, so nothing was sent, with the same end as window_expired). The WARN line logged with each outcome but sent names the turn."),
+		metric.WithUnit("{reconnect}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct turn_prompt_resend_total counter: %w", err)
+	}
+
 	return opsMetrics{
 		actorsLive:           actorsLive,
 		hydrations:           hydrations,
@@ -378,7 +394,18 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		rolloutRefused:       rolloutRefused,
 		bootEvidenceFallback: bootEvidenceFallback,
 		unknownTimerKind:     unknownTimerKind,
+		promptResend:         promptResend,
 	}, nil
+}
+
+// recordPromptResend counts one same-gen reconnect the prompt-receipt
+// check answered without finding the receipt, by outcome (one of the
+// promptResendOutcome* values, promptreceipt.go).
+func (a *Actor) recordPromptResend(ctx context.Context, outcome string) {
+	if a.opsMetrics.promptResend == nil {
+		return
+	}
+	a.opsMetrics.promptResend.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
 }
 
 // recordUnknownTimer counts one timer of a kind this binary does not know

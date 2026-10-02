@@ -138,6 +138,12 @@ type Bridge struct {
 	// reason: the control plane decides Booting -> Ready from the boot
 	// phase heartbeats carry (§3.2).
 	forceHeartbeat chan struct{}
+
+	// journal is the prompt journal (promptjournal.go), nil unless
+	// EnablePromptReceipts opened it, which turns on technical plan §3.3's
+	// prompt receipts for this gen. Set once, before Run, and only read
+	// after; Run closes it when it returns.
+	journal *promptJournal
 }
 
 // InitialBootPhase is what every heartbeat reports as lastBootPhase from

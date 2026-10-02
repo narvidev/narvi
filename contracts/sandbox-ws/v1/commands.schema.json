@@ -23,7 +23,11 @@
         "effort": { "type": ["string", "null"], "description": "Reasoning-effort override for this turn; null means use the default." },
         "scmName": { "type": "string", "description": "Git author name for commit attribution." },
         "scmEmail": { "type": "string", "format": "email", "description": "Git author email for commit attribution." },
-        "planMode": { "type": "boolean", "default": false, "description": "§8.1: dispatch into plan mode instead of direct execution." }
+        "planMode": { "type": "boolean", "default": false, "description": "§8.1: dispatch into plan mode instead of direct execution." },
+        "receiptRequested": {
+          "type": "boolean",
+          "description": "Technical plan §3.3, prompt receipts: true asks the agent to answer this prompt, and every later copy of it, with a prompt_received event whose messageId is 'prompt_received:{this messageId}', and never to run a copy twice. Sent only to a gen whose ready advertised capabilities.promptReceipt. Absent or false: no receipt is asked."
+        }
       }
     },
     "Stop": {

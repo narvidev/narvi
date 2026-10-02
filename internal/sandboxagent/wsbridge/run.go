@@ -14,6 +14,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // Run connects (retrying with exponential backoff, bounded
@@ -38,6 +39,9 @@ import (
 // All concurrency (the heartbeat loop, the read loop) goes through an
 // errgroup.Group -- no naked "go" statement anywhere in this package.
 func (b *Bridge) Run(ctx context.Context) error {
+	if b.journal != nil {
+		defer b.journal.close()
+	}
 	backoff := b.reconnectMinBackoff
 
 	for {
@@ -141,6 +145,13 @@ func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn) error 
 	defer b.setConn(nil)
 	defer func() { _ = conn.CloseNow() }()
 
+	// The largest message this connection reads is the largest prompt
+	// frame the control plane may send (technical plan §6.1). The
+	// library's default, 32 KiB, closed the connection on any longer prompt
+	// -- a review's, with its pull request's diff inlined -- which was then
+	// lost.
+	conn.SetReadLimit(platform.MaxPromptFrameBytes)
+
 	if err := b.sendReady(ctx, conn); err != nil {
 		return fmt.Errorf("wsbridge: send ready: %w", err)
 	}
@@ -167,7 +178,13 @@ func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn) error 
 // it is genuinely fresh on every connection -- events.schema.json's own
 // Ready doc comment: "First event on a fresh WS connection, once the
 // agent is ready to receive commands" -- never something to replay
-// verbatim from a PRIOR connection's buffer.
+// verbatim from a PRIOR connection's buffer. Every ready is therefore one
+// reconnect, which is what the control plane answers a lost prompt on
+// (technical plan §3.3's prompt receipts).
+//
+// It advertises capabilities.promptReceipt when, and only when, the prompt
+// journal is open (EnablePromptReceipts) and no append to it has failed;
+// otherwise the key is absent, as from an agent that predates it.
 func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
 	msg := sandboxws.Ready{
 		Type:         "ready",
@@ -177,6 +194,10 @@ func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
 		Timestamp:    time.Now(),
 		AgentVersion: b.agentVersion,
 		ImageDigest:  b.imageDigest,
+	}
+	if b.promptReceiptsOn() {
+		promptReceipt := true
+		msg.Capabilities = &sandboxws.ReadyCapabilities{PromptReceipt: &promptReceipt}
 	}
 	payload, err := json.Marshal(msg)
 	if err != nil {

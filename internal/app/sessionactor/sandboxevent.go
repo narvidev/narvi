@@ -468,6 +468,21 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 			}
 		}
 
+		// Technical plan §3.3's prompt receipts (promptreceipt.go): count
+		// this connection's ready, and record whether this gen's agent
+		// advertised the capability -- the latest ready of the gen decides.
+		// The count is the reconnect a turn in flight on this gen may need
+		// its prompt re-sent after, answered by this event's own post-commit
+		// dispatch evaluation below. Not gated on `inserted`: a ready is
+		// written fresh on every connection, under a new messageId, and is
+		// never buffered or replayed (wsbridge's sendReady), so every one is
+		// a reconnect. The gen fence above has already dropped a stale gen's.
+		if cmd.Type == "ready" {
+			if err := a.stores.sandbox.WithTx(tx).RecordReady(ctx, a.sessionID, row.Gen, readyAdvertisesPromptReceipt(cmd.Raw)); err != nil {
+				return fmt.Errorf("sessionactor: record the ready: %w", err)
+			}
+		}
+
 		// A null phase from a gen with no evidence is absence of
 		// information, not boot completion. A fixed agent always shows
 		// evidence before it sends one, so in practice this is an agent
@@ -683,6 +698,20 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 			// genuinely-distinct tool_call in the SAME turn).
 			if err := a.maybeEnqueueLinearProgress(ctx, tx, inserted, pgtype.Timestamptz{Time: now, Valid: true}); err != nil {
 				return err
+			}
+		case "prompt_received":
+			// Technical plan §3.3's prompt receipts (promptreceipt.go): the
+			// stored row above IS the receipt, under its deterministic key,
+			// exactly as a binary that does not know this type stores it, so
+			// nothing more is written here. Logged only: a receipt stored for
+			// the first time that says duplicate means the sandbox held the
+			// prompt all along, and what was lost was its first receipt.
+			if inserted {
+				var evt sandboxws.PromptReceived
+				if err := json.Unmarshal(cmd.Raw, &evt); err == nil && evt.Duplicate {
+					a.logger.Info("sessionactor: prompt receipt stored from a duplicate: the sandbox already held the prompt",
+						"prompt_message_id", evt.PromptMessageId, "gen", row.Gen)
+				}
 			}
 		case "step_finish":
 			// §25.15: sum this step's own cost.usd (when present) onto
