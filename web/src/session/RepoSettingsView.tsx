@@ -487,7 +487,7 @@ export function RepoEntitlementStatus({ entitlement }: { entitlement: RepoEntitl
   return (
     <>
       <p className="sidebar-notice">
-        New sessions on this repository are revoked. No surface can start one, and the queued turns of its existing sessions are ended before they reach a sandbox; a turn already running finishes.
+        New sessions on this repository are revoked. No surface can start one, and the queued turns of its existing sessions are ended before they reach a sandbox; a turn already running finishes, unless its sandbox restarts or stops first, which ends it.
       </p>
       <div style={row}>
         <span style={{ color: 'var(--faint)' }}>Revoked</span>

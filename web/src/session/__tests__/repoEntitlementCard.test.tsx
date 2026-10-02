@@ -46,10 +46,10 @@ describe('RepoEntitlementStatus -- what an operator reads', () => {
     expect(html).not.toContain('revoked')
   })
 
-  it('a revoked repository says so, by whom and why, and that running turns finish', () => {
+  it('a revoked repository says so, by whom and why, and that running turns finish unless their sandbox goes', () => {
     const html = renderToStaticMarkup(<RepoEntitlementStatus entitlement={revoked()} />)
     expect(html).toContain('New sessions on this repository are revoked.')
-    expect(html).toContain('a turn already running finishes')
+    expect(html).toContain('a turn already running finishes, unless its sandbox restarts or stops first, which ends it.')
     expect(html).toContain('Rae Voker')
     expect(html).toContain('Credentials rotated, audit pending')
   })

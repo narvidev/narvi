@@ -587,7 +587,7 @@ export function getRepoEntitlement(owner: string, repo: string, signal?: AbortSi
   return request<RepoEntitlement>(repoSettingsPath(owner, repo, 'entitlement'), { signal })
 }
 
-/** postRevokeRepoEntitlement calls POST /api/repos/:owner/:repo/entitlement/revoke -- no new session may then name this repository, on any surface, and its sessions' queued turns are refused; a turn already running finishes. Admin-only server-side. The reason is required, 1 to 500 characters after trimming (a 400 ApiError says which bound failed); a 409 ApiError means the repository is already revoked, and the first revocation is kept. Returns the updated RepoEntitlement. */
+/** postRevokeRepoEntitlement calls POST /api/repos/:owner/:repo/entitlement/revoke -- no new session may then name this repository, on any surface, and its sessions' queued turns are refused; a turn already running finishes, unless its sandbox restarts or stops first. Admin-only server-side. The reason is required, 1 to 500 characters after trimming (a 400 ApiError says which bound failed); a 409 ApiError means the repository is already revoked, and the first revocation is kept. Returns the updated RepoEntitlement. */
 export function postRevokeRepoEntitlement(owner: string, repo: string, body: RevokeRepoEntitlementRequest, signal?: AbortSignal): Promise<RepoEntitlement> {
   return request<RepoEntitlement>(repoSettingsPath(owner, repo, 'entitlement/revoke'), { method: 'POST', body, signal })
 }
