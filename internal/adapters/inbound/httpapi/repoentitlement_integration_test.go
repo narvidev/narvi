@@ -213,8 +213,9 @@ func TestPostRevokeRepoEntitlement_AdminRevokes_AuditedWithReason(t *testing.T) 
 }
 
 // TestPostRevokeRepoEntitlement_BlankReason400: the reason is required,
-// trimmed, and at most 500 characters -- each refusal says which, and none
-// writes anything.
+// trimmed, at most 500 characters, and holds no NUL character (which a
+// Postgres TEXT column would refuse with a 500) -- each refusal says which,
+// and none writes anything.
 func TestPostRevokeRepoEntitlement_BlankReason400(t *testing.T) {
 	rig := newTestRig(t)
 	ctx := context.Background()
@@ -229,6 +230,7 @@ func TestPostRevokeRepoEntitlement_BlankReason400(t *testing.T) {
 		{"white space", `{"reason":" \t\n "}`, "reason is required"},
 		{"501 characters", `{"reason":"` + strings.Repeat("é", 501) + `"}`, "reason must be at most 500 characters"},
 		{"malformed", `not json`, "malformed request body"},
+		{"a NUL character", `{"reason":"frozen \u0000 for an audit"}`, "reason must not contain a NUL byte"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var body map[string]string

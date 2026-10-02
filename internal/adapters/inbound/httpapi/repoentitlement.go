@@ -83,9 +83,9 @@ func GetRepoEntitlement(revocations *postgres.RepoEntitlementRevocationStore, pr
 // PostRevokeRepoEntitlement backs POST
 // /api/repos/{owner}/{repo}/entitlement/revoke: 403 unless the caller
 // passes authz.ActionManageRepoEntitlement (admin only); 404 for a
-// repository this deployment does not know; 400 for a reason blank or
-// longer than 500 characters after trimming (restdtos.
-// RevokeRepoEntitlementRequest); 409 when the repository is already
+// repository this deployment does not know; 400 for a reason blank,
+// longer than 500 characters after trimming, or holding a NUL byte
+// (restdtos.RevokeRepoEntitlementRequest); 409 when the repository is already
 // revoked (the first revocation is kept); otherwise the revocation and its
 // repo_entitlement.revoked audit row commit together, and 200 answers the
 // repository's restdtos.RepoEntitlement.
@@ -128,6 +128,13 @@ func PostRevokeRepoEntitlement(pool *pgxpool.Pool, revocations *postgres.RepoEnt
 		}
 		if utf8.RuneCountInString(reason) > maxRepoEntitlementReasonChars {
 			writeError(w, http.StatusBadRequest, "reason must be at most 500 characters")
+			return
+		}
+		// A NUL byte is refused here, not by the table: a Postgres TEXT
+		// column rejects one outright, which would surface as a 500
+		// (containsNULByte, providercredentials.go).
+		if containsNULByte(reason) {
+			writeError(w, http.StatusBadRequest, "reason must not contain a NUL byte")
 			return
 		}
 

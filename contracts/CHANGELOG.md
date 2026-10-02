@@ -22,11 +22,11 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   new sessions (technical plan §31.4, "Un-entitlement"), and when, by whom
   and why. A new `$def` grades MINOR (row 32).
 - Added: `RevokeRepoEntitlementRequest` (`reason`, required, `minLength`
-  1), the revoke route's request body. The reason is trimmed and must be 1
-  to 500 characters; `maxLength` is not a keyword this bundle's
-  compatibility checker grades, so the 500-character cap is the handler's
-  (a 400) and the table's (a CHECK), stated in the `description`. A new
-  `$def` grades MINOR (row 32).
+  1), the revoke route's request body. The reason is trimmed, must be 1
+  to 500 characters and must hold no NUL character; `maxLength` is not a
+  keyword this bundle's compatibility checker grades, so the
+  500-character cap is the handler's (a 400) and the table's (a CHECK),
+  stated in the `description`. A new `$def` grades MINOR (row 32).
 - Unchanged: no existing `$def`, no enum.
 
 ### controlplane/testdata/routes.golden
@@ -39,9 +39,10 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   All three answer `RepoEntitlement`; `403` unless
   `authz.ActionManageRepoEntitlement` admits the caller (admin only,
   §13.3), `404` for a repository the deployment does not know. Revoke
-  answers `400` for a blank or over-long reason and `409` when the
-  repository is already revoked, keeping the first revocation; restore
-  takes no body and answers `409` when the repository is not revoked.
+  answers `400` for a blank or over-long reason, or one holding a NUL
+  character, and `409` when the repository is already revoked, keeping
+  the first revocation; restore takes no body and answers `409` when the
+  repository is not revoked.
   While revoked, session creation on every surface answers the refusal
   `repository entitlement revoked by an administrator: <repo>` (`403` over
   REST, a tool error over MCP), distinct from the `repository not entitled`

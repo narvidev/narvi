@@ -3992,7 +3992,7 @@ export interface RepoEntitlement {
   reason: string | null;
 }
 /**
- * POST /api/repos/{owner}/{repo}/entitlement/revoke's request body (technical plan §31.4). reason is trimmed and must be 1 to 500 characters: blank is refused 400 "reason is required", longer is refused 400 "reason must be at most 500 characters". A repository already revoked is refused 409 and keeps its first revocation's who, when and why; one the deployment does not know is refused 404.
+ * POST /api/repos/{owner}/{repo}/entitlement/revoke's request body (technical plan §31.4). reason is trimmed and must be 1 to 500 characters: blank is refused 400 "reason is required", longer is refused 400 "reason must be at most 500 characters", and one holding a NUL character is refused 400 "reason must not contain a NUL byte". A repository already revoked is refused 409 and keeps its first revocation's who, when and why; one the deployment does not know is refused 404.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "RevokeRepoEntitlementRequest".
