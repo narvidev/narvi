@@ -99,6 +99,19 @@ func previousRow(ctx context.Context, t *testing.T, db *sql.DB, want int, query 
 	}
 }
 
+// receiptColumns155 reads the sandbox columns 000155 added, and its gen,
+// by name: this release's GetSandbox names the columns of every later
+// migration too, which a database at 155 does not have.
+func receiptColumns155(ctx context.Context, t *testing.T, db *sql.DB, sessionID string) sqlcgen.Sandbox {
+	t.Helper()
+	var row sqlcgen.Sandbox
+	if err := db.QueryRowContext(ctx, `SELECT gen, ready_seq, prompt_receipt_gen FROM sandboxes WHERE session_id = $1`, sessionID).
+		Scan(&row.Gen, &row.ReadySeq, &row.PromptReceiptGen); err != nil {
+		t.Fatalf("read the sandbox's receipt columns: %v", err)
+	}
+	return row
+}
+
 func TestMigrationPromptReceipts_UpAndDown(t *testing.T) {
 	ctx := context.Background()
 	connStr, db := migrationTestDatabase(ctx, t, 154)
@@ -173,24 +186,19 @@ func TestMigrationPromptReceipts_UpAndDown(t *testing.T) {
 	}
 	defer pool.Close()
 	q := sqlcgen.New(pool)
-	var session pgtype.UUID
-	if err := session.Scan(sessionID); err != nil {
-		t.Fatal(err)
-	}
 	var turn pgtype.UUID
 	if err := turn.Scan(turnID); err != nil {
 		t.Fatal(err)
 	}
-	sandboxRow, err := q.GetSandbox(ctx, session)
-	if err != nil {
-		t.Fatalf("get sandbox: %v", err)
-	}
+	sandboxRow := receiptColumns155(ctx, t, db, sessionID)
 	if sandboxRow.ReadySeq != 0 || sandboxRow.PromptReceiptGen != nil {
 		t.Fatalf("an existing sandbox reads ready_seq %d, prompt_receipt_gen %v; want 0, NULL", sandboxRow.ReadySeq, sandboxRow.PromptReceiptGen)
 	}
 
-	// This release: a capable ready, then a dispatch that asks.
-	if err := q.RecordSandboxReady(ctx, sqlcgen.RecordSandboxReadyParams{PromptReceipt: true, SessionID: session, Gen: 1}); err != nil {
+	// This release: a capable ready, then a dispatch that asks. Its ready
+	// is recorded by the statement 000155's release sent: this database is
+	// at 155, and later releases' RecordSandboxReady names later columns.
+	if _, err := db.ExecContext(ctx, preFrameBoundRecordSandboxReady, true, sessionID, 1); err != nil {
 		t.Fatalf("record a ready: %v", err)
 	}
 	asked := "msg-asked"
@@ -233,10 +241,7 @@ func TestMigrationPromptReceipts_UpAndDown(t *testing.T) {
 		FROM turns WHERE session_id = $1 AND id <> $2`, sessionID, turnID).Scan(&pendingNull); err != nil || !pendingNull {
 		t.Fatalf("the previous binary's new turn carries a request (%v), want none", err)
 	}
-	respawned, err := q.GetSandbox(ctx, session)
-	if err != nil {
-		t.Fatal(err)
-	}
+	respawned := receiptColumns155(ctx, t, db, sessionID)
 	if respawned.Gen != 2 || respawned.ReadySeq != 1 || respawned.PromptReceiptGen == nil || *respawned.PromptReceiptGen != 1 {
 		t.Fatalf("after the previous binary's respawn: gen %d, ready_seq %d, prompt_receipt_gen %v; want 2, 1, 1 (stale, not matching)",
 			respawned.Gen, respawned.ReadySeq, respawned.PromptReceiptGen)

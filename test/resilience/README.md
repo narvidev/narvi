@@ -567,7 +567,9 @@ scenario #1's second pair of tests, above.
 - `TestResilience_Scenario22_PromptFrameOver32KiB_CapableAgent_DeliveredOnceAndCompletes`:
   a prompt frame over the WebSocket library's default 32 KiB read limit,
   which closed the agent's connection and was lost before the agent read up
-  to `platform.MaxPromptFrameBytes`, is read whole and run once.
+  to `platform.MaxPromptFrameBytes`, is read whole and run once. The agent's
+  every `ready` states that limit (`capabilities.maxFrameBytes`), which the
+  control plane holds its gen's prompts to (§3.3).
 - `TestResilience_Scenario22_PromptLostOnEveryDelivery_ResendCapStopsTheLoop`:
   a prompt lost on every delivery, each loss a reconnect, is re-sent
   `PromptResendMaxPerTurn` times and then no more, and the reconnects stop.

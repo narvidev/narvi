@@ -25,6 +25,8 @@
 // the capability and to NULL when it did not -- the latest ready decides.
 // Stored against the gen, like boot_evidence_gen (bootevidence.go): a
 // respawn, restore or resume bumps the gen, and the value stops matching.
+// The same statement records the read limit the ready states, by the same
+// rule; framebound.go says how a dispatch reads it.
 //
 // # The request, in the dispatch's commit
 //
@@ -83,9 +85,11 @@
 // PromptResendMaxPerTurn times in all, and never once its receipt is stored
 // or its turn has left Processing. The cap is the backstop for a loss that
 // is not a one-off: each re-send is answered only after the next
-// reconnect, and a frame the sandbox can never take -- one over its read
-// limit, before platform.MaxPromptFrameBytes existed -- causes the very
-// reconnect that would re-send it.
+// reconnect, and a frame the sandbox can never take causes the very
+// reconnect that would re-send it. A frame over the gen's read limit is
+// not among them: every re-send is measured against the gen's bound
+// (promptFrameBound, framebound.go), as the dispatch was, and one over it
+// is never written.
 //
 // The re-send is the original prompt: the same messageId, which the agent
 // dedups on and httpapi.PostReviewVerdict resolves the turn by. It re-arms
@@ -106,6 +110,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -114,7 +119,6 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/turn"
-	"github.com/narvidev/narvi/internal/platform"
 )
 
 // The outcome attribute of turn_prompt_resend_total (opsmetrics.go).
@@ -167,6 +171,27 @@ func readyAdvertisesPromptReceipt(raw json.RawMessage) bool {
 		return false
 	}
 	return evt.Capabilities != nil && evt.Capabilities.PromptReceipt != nil && *evt.Capabilities.PromptReceipt
+}
+
+// readyStatedMaxFrameBytes returns the read limit a ready event states,
+// capabilities.maxFrameBytes, which RecordSandboxReady records against the
+// gen and promptFrameBound (framebound.go) holds the gen's prompts to. It
+// returns nil when the ready states none, states zero or less, or fails
+// its schema decode -- the generated decoder refuses a value under 1, and
+// the ready then advertises no promptReceipt either: the gen then falls to
+// the smallest bound, never a larger one. A value past what an int32
+// column holds is saturated there: promptFrameBound clamps every stated
+// value to platform.MaxPromptFrameBytes, far below it.
+func readyStatedMaxFrameBytes(raw json.RawMessage) *int32 {
+	var evt sandboxws.Ready
+	if err := json.Unmarshal(raw, &evt); err != nil {
+		return nil
+	}
+	if evt.Capabilities == nil || evt.Capabilities.MaxFrameBytes == nil || *evt.Capabilities.MaxFrameBytes <= 0 {
+		return nil
+	}
+	stated := int32(min(*evt.Capabilities.MaxFrameBytes, math.MaxInt32))
+	return &stated
 }
 
 // promptReceiptCapable reports whether row's live gen advertised the
@@ -314,6 +339,7 @@ func (a *Actor) tryPlanReceiptResend(
 		turnID:        target.ID,
 		payload:       payload,
 		sessionRow:    sessionRow,
+		frameBound:    promptFrameBound(sandboxRow),
 		receiptResend: resend,
 	}, nil
 }
@@ -326,12 +352,14 @@ func (a *Actor) tryPlanReceiptResend(
 // dispatch does (executeDispatch) -- an administrator's revocation, read
 // before the claim, which it then leaves unmade (refuseResendIfRepoRevoked
 // acts on it, §31.4), the rollout re-check and the frame's size against
-// platform.MaxPromptFrameBytes -- but neither a refusal nor a failed write
-// fails the turn, as executeDispatch's would: the prompt may already be
-// running, and the next reconnect asks again -- or, after a revocation,
-// the next heartbeat once the repository is restored. The size check
-// cannot refuse a frame the same dispatch already sent; it is there so no
-// frame over the limit is ever written, whatever produced it.
+// the gen's bound (plan.frameBound, framebound.go) -- but neither a
+// refusal nor a failed write fails the turn, as executeDispatch's would:
+// the prompt may already be running, and the next reconnect asks again --
+// or, after a revocation, the next heartbeat once the repository is
+// restored. The size check refuses a frame the same dispatch already sent
+// only when a row changed since: the turn's prompt, or the gen's latest
+// ready stating a smaller read limit. It is there so no frame over the
+// gen's bound is ever written, whatever produced it.
 //
 // The payload tryPlanReceiptResend built carries the turn's own
 // dispatched_message_id -- never a new one -- and receiptRequested: the
@@ -373,10 +401,10 @@ func (a *Actor) executeReceiptResend(ctx context.Context, plan *dispatchPlan) er
 		a.recordPromptResend(ctx, promptResendOutcomeRefused)
 		return nil
 	}
-	if len(plan.payload) > platform.MaxPromptFrameBytes {
-		a.logger.Warn("sessionactor: prompt re-send refused: the frame is larger than a sandbox accepts; the turn stays processing",
+	if size, bound := len(plan.payload), plan.promptFrameBound(); size > bound {
+		a.logger.Warn("sessionactor: prompt re-send refused: the frame is larger than this sandbox's agent reads; the turn stays processing",
 			"turn_id", plan.turnID.String(), "gen", rr.gen, "message_id", rr.messageID,
-			"frame_bytes", len(plan.payload), "max_frame_bytes", platform.MaxPromptFrameBytes)
+			"frame_bytes", size, "max_frame_bytes", bound)
 		a.recordPromptResend(ctx, promptResendOutcomeFrameTooLarge)
 		return nil
 	}

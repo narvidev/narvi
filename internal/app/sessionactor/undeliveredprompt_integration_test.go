@@ -239,8 +239,9 @@ func dispatchToReadySandboxSendingNothing(ctx context.Context, t *testing.T, poo
 }
 
 // refuseOversizedPromptFrame dispatches a pending turn whose prompt frame,
-// once encoded, is larger than platform.MaxPromptFrameBytes, to a ready
-// sandbox: the dispatch is refused before SendCommand is ever called.
+// once encoded, is larger than platform.MaxPromptFrameBytes -- larger than
+// any gen's bound (promptFrameBound) -- to a ready sandbox: the dispatch is
+// refused before SendCommand is ever called.
 func refuseOversizedPromptFrame(ctx context.Context, t *testing.T, pool *pgxpool.Pool) (pgtype.UUID, sqlcgen.Turn) {
 	t.Helper()
 	sessionID := createTestSession(ctx, t, pool)

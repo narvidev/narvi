@@ -2349,6 +2349,8 @@ type Sandbox struct {
 	StopRetireGen                 *int32               `json:"stop_retire_gen"`
 	PromptReceiptGen              *int32               `json:"prompt_receipt_gen"`
 	ReadySeq                      int32                `json:"ready_seq"`
+	AgentMaxFrameBytes            *int32               `json:"agent_max_frame_bytes"`
+	AgentMaxFrameBytesGen         *int32               `json:"agent_max_frame_bytes_gen"`
 }
 
 type SandboxHistory struct {

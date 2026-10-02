@@ -296,6 +296,14 @@ type dispatchPlan struct {
 	// and returned.
 	sessionRow sqlcgen.Session
 
+	// frameBound is the largest prompt frame the gen this plan writes to
+	// reads (promptFrameBound, framebound.go), computed in the same
+	// transaction from the same sandbox row the payload was built for:
+	// executeDispatch and executeReceiptResend measure payload against it.
+	// Zero reads as platform.DefaultFrameReadLimitBytes
+	// (dispatchPlan.promptFrameBound).
+	frameBound int
+
 	// receiptResend is non-nil only on the plan of technical plan §3.3's
 	// prompt-receipt check of a same-gen reconnect (tryPlanReceiptResend,
 	// promptreceipt.go): executeDispatch hands it to executeReceiptResend,
@@ -827,7 +835,7 @@ func (a *Actor) tryPlanReenqueue(
 	a.logger.Info("sessionactor: re-enqueuing in-flight turn to a respawned sandbox incarnation",
 		"turn_id", target.ID.String(), "gen", sandboxRow.Gen)
 
-	return &dispatchPlan{turnID: target.ID, payload: payload, sessionRow: sessionRow}, nil
+	return &dispatchPlan{turnID: target.ID, payload: payload, sessionRow: sessionRow, frameBound: promptFrameBound(sandboxRow)}, nil
 }
 
 // tryPlanSpawn implements design decision 3a's own circuit-breaker-then-
@@ -2199,7 +2207,7 @@ func (a *Actor) tryPlanDispatch(
 		}
 	}
 
-	return &dispatchPlan{turnID: turnID, payload: payload, sessionRow: sessionRow}, nil
+	return &dispatchPlan{turnID: turnID, payload: payload, sessionRow: sessionRow, frameBound: promptFrameBound(sandboxRow)}, nil
 }
 
 // executeDispatch performs the actual SandboxCommander.SendCommand call
@@ -2251,10 +2259,10 @@ func (a *Actor) tryPlanDispatch(
 // planned this dispatch deleted (invalid when it deleted none): the first
 // arm of the chain a failed delivery backs off from (failDispatchedTurn).
 //
-// No frame larger than platform.MaxPromptFrameBytes is ever written: the
-// agent reads no longer message, and its connection would close on it
-// (§6.1). Such a turn fails here, through the same failDispatchedTurn, as
-// a refusal naming both sizes.
+// No frame larger than the gen's bound (plan.frameBound, framebound.go) is
+// ever written: the gen's agent reads no longer message, and its
+// connection would close on it (§3.3, §6.1). Such a turn fails here,
+// through the same failDispatchedTurn, as a refusal naming both sizes.
 //
 // A plan carrying receiptResend -- technical plan §3.3's prompt-receipt
 // check of a same-gen reconnect -- goes to executeReceiptResend instead,
@@ -2297,24 +2305,27 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainSt
 		})
 	}
 
-	// Technical plan §6.1: no prompt frame longer than a sandbox reads is
-	// ever written -- the agent's connection would close on it
-	// (StatusMessageTooBig) and the prompt be lost. The size is the encoded
-	// frame's, escaping included, and a prompt that big will not shrink on
-	// a retry, so the turn ends here as a refusal: named, with its sizes,
-	// in a session warning and on a review attempt's check, and never
-	// queued again by the workflow engine (OnTurnRefused) or backed off
-	// for a retry. Nothing was written, so no agent of this turn can be
-	// running: its synthetic execution_complete carries the
-	// "delivered": false mark (dispatchFailure.undelivered).
-	if size := len(plan.payload); size > platform.MaxPromptFrameBytes {
-		a.logger.Error("sessionactor: refusing to dispatch turn: its prompt frame is larger than a sandbox accepts",
+	// Technical plan §3.3, §6.1: no prompt frame longer than the gen's agent
+	// reads is ever written -- its connection would close on it
+	// (StatusMessageTooBig) and the prompt be lost. The bound is the gen's
+	// (promptFrameBound, framebound.go), read with the row the payload was
+	// built from: 32 KiB for an agent that states nothing and advertises
+	// no promptReceipt. The size is the encoded frame's, escaping included,
+	// and a prompt that big will not shrink on a retry, so the turn ends
+	// here as a refusal: named, with both sizes, in a session warning and
+	// on a review attempt's check, and never queued again by the workflow
+	// engine (OnTurnRefused) or backed off for a retry. Nothing was
+	// written, so no agent of this turn can be running: its synthetic
+	// execution_complete carries the "delivered": false mark
+	// (dispatchFailure.undelivered).
+	if size, bound := len(plan.payload), plan.promptFrameBound(); size > bound {
+		a.logger.Error("sessionactor: refusing to dispatch turn: its prompt frame is larger than this sandbox's agent reads",
 			"session_id", a.sessionID.String(), "turn_id", plan.turnID.String(),
-			"frame_bytes", size, "max_frame_bytes", platform.MaxPromptFrameBytes)
+			"frame_bytes", size, "max_frame_bytes", bound)
 		return a.failDispatchedTurn(ctx, plan.turnID, dispatchFailure{
-			reason: fmt.Sprintf("prompt frame of %d bytes is larger than the %d bytes a sandbox accepts", size, platform.MaxPromptFrameBytes),
-			warning: fmt.Sprintf("This session's turn was ended: its prompt is %s once encoded, more than the %s a sandbox accepts in one message, so it was not sent. "+
-				"Shorten the prompt, or split the work across turns, then send the turn again.", formatMiB(size), formatMiB(platform.MaxPromptFrameBytes)),
+			reason: fmt.Sprintf("prompt frame of %d bytes is larger than the %d bytes this sandbox's agent reads", size, bound),
+			warning: fmt.Sprintf("This session's turn was ended: its prompt is %s once encoded, more than the %s this sandbox's agent reads in one message, so it was not sent. "+
+				"Shorten the prompt, or split the work across turns, then send the turn again.", formatFrameBytes(size), formatFrameBytes(bound)),
 			notAssessed: reviewcheck.NotAssessedPromptNotDelivered,
 			refused:     true,
 			// SendCommand is never called on this path either.
@@ -2404,8 +2415,8 @@ func (a *Actor) rolloutRefusalForDispatch(ctx context.Context, sessionRow sqlcge
 //
 // Three callers reach this, all from executeDispatch: a genuine
 // SandboxCommander.SendCommand failure (this function's ORIGINAL, §9.3
-// reason for existing), a prompt frame larger than a sandbox accepts
-// (platform.MaxPromptFrameBytes, §6.1), and §10's own turn-dispatch-time
+// reason for existing), a prompt frame larger than the gen's agent reads
+// (promptFrameBound, §3.3, §6.1), and §10's own turn-dispatch-time
 // rollout refusal (rolloutRefusalForDispatch, above) -- deliberately the SAME
 // terminal path for both, not two parallel ones: from the turn's own
 // perspective, "the actor decided this prompt will never reach a
@@ -2606,8 +2617,8 @@ type dispatchFailure struct {
 	// warning, when set, is recorded as a session warning (the banner).
 	warning string
 	// refused marks a prompt that was never sent and would be refused
-	// again on a retry -- a policy refusal, or a frame larger than a
-	// sandbox accepts (platform.MaxPromptFrameBytes): the workflow engine
+	// again on a retry -- a policy refusal, or a frame larger than the
+	// gen's agent reads (promptFrameBound, framebound.go): the workflow engine
 	// hears it through OnTurnRefused, which escalates the run and queues
 	// nothing. Anything else is an undelivered prompt, and backs the
 	// session's dispatch timer off (backOffAfterUndeliveredPrompt).
@@ -2699,11 +2710,6 @@ func BuildPromptPayload(sessionID string, sessionRow sqlcgen.Session, sandboxRow
 		prompt.ReceiptRequested = &receiptRequested
 	}
 	return json.Marshal(prompt)
-}
-
-// formatMiB renders a byte count as MiB with one decimal, for a person.
-func formatMiB(bytes int) string {
-	return fmt.Sprintf("%.1f MiB", float64(bytes)/(1<<20))
 }
 
 // toQueueEntries adapts stored turn rows into the generic
