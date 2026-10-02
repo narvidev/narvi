@@ -21,9 +21,19 @@ import (
 // those into Known == false BEFORE ever calling AuthorizeRepo, the same
 // discipline internal/domain/rollout.RepoAdmission.Enrolled already
 // established for the cohort-rollout gate.
+//
+// Revoked is true when an administrator revoked the repository's
+// eligibility (§31.4, "Un-entitlement"): the caller reads it in the same
+// statement as Known (postgres.GitHubPRSessionStore.RepoEntitlement), and
+// AuthorizeRepo refuses on it before it looks at Known, so a revoked
+// repository is refused whatever its eligibility. Every literal of this
+// type outside this package names Revoked explicitly (internal/ops'
+// ScanRepoEntitlementReads, rule (c)), so no caller can drop it by
+// omission.
 type RepoAdmission struct {
 	FullName string
 	Known    bool
+	Revoked  bool
 }
 
 // ErrRepoForbidden is the sentinel every AuthorizeRepo rejection wraps --
@@ -34,6 +44,13 @@ type RepoAdmission struct {
 // (mirrors ErrForbidden/ErrUnknownAction's own "distinct sentinels for
 // distinct failure classes" precedent immediately above).
 var ErrRepoForbidden = errors.New("authz: repository forbidden")
+
+// ErrRepoRevoked is the sentinel a refusal of a REVOKED repository wraps
+// (§31.4), alongside ErrRepoForbidden: an administrator closed it, which a
+// caller tells apart from a repository this deployment has never known --
+// the two answer with different text, and only the first can be lifted by
+// a restore.
+var ErrRepoRevoked = errors.New("authz: repository entitlement revoked")
 
 // RepoForbiddenError is the detailed error AuthorizeRepo returns for any
 // (actor, repo) it rejects. Actor is carried verbatim, mirroring
@@ -49,6 +66,22 @@ func (e *RepoForbiddenError) Error() string {
 }
 
 func (e *RepoForbiddenError) Unwrap() error { return ErrRepoForbidden }
+
+// RepoRevokedError is the error AuthorizeRepo returns for a repository an
+// administrator revoked (admission.Revoked). It unwraps to BOTH
+// ErrRepoForbidden and ErrRepoRevoked, so every caller that already treats
+// errors.Is(err, ErrRepoForbidden) as a refusal keeps doing so, and a
+// caller that names the revocation can ask for it.
+type RepoRevokedError struct {
+	Actor        Actor
+	RepoFullName string
+}
+
+func (e *RepoRevokedError) Error() string {
+	return fmt.Sprintf("authz: repository entitlement revoked: %q may not use repository %q", e.Actor.UserID, e.RepoFullName)
+}
+
+func (e *RepoRevokedError) Unwrap() []error { return []error{ErrRepoForbidden, ErrRepoRevoked} }
 
 // AuthorizeRepo renders §31.4's own entitlement verdict: may actor use
 // admission's own named repository at all -- nil if so, *RepoForbiddenError
@@ -78,7 +111,15 @@ func (e *RepoForbiddenError) Unwrap() error { return ErrRepoForbidden }
 // comment for why github_pr_sessions -- not repo_settings, not
 // sessions.repos -- is the entitlement source of truth this predicate is
 // built on.
+//
+// Revocation takes precedence (§31.4): admission.Revoked refuses with
+// *RepoRevokedError whatever admission.Known holds, so a revoked repository
+// is never admitted, and a revoked repository that is also unknown is
+// reported as revoked.
 func AuthorizeRepo(actor Actor, admission RepoAdmission) error {
+	if admission.Revoked {
+		return &RepoRevokedError{Actor: actor, RepoFullName: admission.FullName}
+	}
 	if admission.Known {
 		return nil
 	}

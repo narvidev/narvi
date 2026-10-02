@@ -268,6 +268,11 @@ var matrix = map[Action]actionRule{
 	// precedent for an enforced-but-untabled action).
 	ActionViewShadowLedger:     {allow: roles(RoleAdmin)},
 	ActionActivateShadowLedger: {allow: roles(RoleAdmin)},
+
+	// Row 7 (§31.4): revoking a repository's eligibility for new sessions,
+	// restoring it, and reading its status -- admin only, no own/joined
+	// carve-out (a repository is not a session anyone owns).
+	ActionManageRepoEntitlement: {allow: roles(RoleAdmin)},
 }
 
 // Authorize renders the §13.3 verdict for actor attempting action against
