@@ -899,6 +899,13 @@ type Prompt struct {
 	// §8.1: dispatch into plan mode instead of direct execution.
 	PlanMode bool `json:"planMode,omitempty,omitzero" yaml:"planMode,omitempty" mapstructure:"planMode,omitempty"`
 
+	// Technical plan §3.3, prompt receipts: true asks the agent to answer this
+	// prompt, and every later copy of it, with a prompt_received event whose
+	// messageId is 'prompt_received:{this messageId}', and never to run a copy twice.
+	// Sent only to a gen whose ready advertised capabilities.promptReceipt. Absent or
+	// false: no receipt is asked.
+	ReceiptRequested *bool `json:"receiptRequested,omitempty,omitzero" yaml:"receiptRequested,omitempty" mapstructure:"receiptRequested,omitempty"`
+
 	// Git author email for commit attribution.
 	ScmEmail string `json:"scmEmail" yaml:"scmEmail" mapstructure:"scmEmail"`
 
@@ -925,6 +932,72 @@ type PromptEffort *string
 
 // Model override for this turn; null means use the session/plan default.
 type PromptModel *string
+
+// Technical plan §3.3, prompt receipts: the agent holds the prompt promptMessageId
+// names. Sent for every prompt that set receiptRequested, a duplicate included.
+// NOT critical (no ackId): a lost receipt is answered again when the control plane
+// re-sends the prompt after the gen's next reconnect. messageId is deterministic,
+// so every copy of one prompt's receipt is stored once, whichever control-plane
+// binary stores it, and is found by that key.
+type PromptReceived struct {
+	// True when this gen's agent had already received promptMessageId and did not run
+	// it again.
+	Duplicate bool `json:"duplicate" yaml:"duplicate" mapstructure:"duplicate"`
+
+	// Gen corresponds to the JSON schema field "gen".
+	Gen int `json:"gen" yaml:"gen" mapstructure:"gen"`
+
+	// 'prompt_received:{promptMessageId}'.
+	MessageId string `json:"messageId" yaml:"messageId" mapstructure:"messageId"`
+
+	// The messageId of the prompt command this answers.
+	PromptMessageId string `json:"promptMessageId" yaml:"promptMessageId" mapstructure:"promptMessageId"`
+
+	// SessionId corresponds to the JSON schema field "sessionId".
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+
+	// Type corresponds to the JSON schema field "type".
+	Type string `json:"type" yaml:"type" mapstructure:"type"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PromptReceived) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["duplicate"]; raw != nil && !ok {
+		return fmt.Errorf("field duplicate in PromptReceived: required")
+	}
+	if _, ok := raw["gen"]; raw != nil && !ok {
+		return fmt.Errorf("field gen in PromptReceived: required")
+	}
+	if _, ok := raw["messageId"]; raw != nil && !ok {
+		return fmt.Errorf("field messageId in PromptReceived: required")
+	}
+	if _, ok := raw["promptMessageId"]; raw != nil && !ok {
+		return fmt.Errorf("field promptMessageId in PromptReceived: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in PromptReceived: required")
+	}
+	if _, ok := raw["type"]; raw != nil && !ok {
+		return fmt.Errorf("field type in PromptReceived: required")
+	}
+	type Plain PromptReceived
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if matched, _ := regexp.MatchString(`^prompt_received:.+$`, string(plain.MessageId)); !matched {
+		return fmt.Errorf("field %s pattern match: must match %s", "MessageId", `^prompt_received:.+$`)
+	}
+	if plain.Type != "prompt_received" {
+		return fmt.Errorf("field %s: must be equal to %s", "type", "prompt_received")
+	}
+	*j = PromptReceived(plain)
+	return nil
+}
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *Prompt) UnmarshalJSON(value []byte) error {
@@ -1232,6 +1305,12 @@ type Ready struct {
 	// unset (no build-time version-stamping pipeline exists yet), never omitted.
 	AgentVersion string `json:"agentVersion" yaml:"agentVersion" mapstructure:"agentVersion"`
 
+	// What this gen's sandbox-agent supports beyond the base protocol, sent on every
+	// ready. Absent on an agent that predates it, which the control plane reads as no
+	// capability. Never inferred from agentVersion (technical plan §3.3, prompt
+	// receipts).
+	Capabilities *ReadyCapabilities `json:"capabilities,omitempty,omitzero" yaml:"capabilities,omitempty" mapstructure:"capabilities,omitempty"`
+
 	// Gen corresponds to the JSON schema field "gen".
 	Gen int `json:"gen" yaml:"gen" mapstructure:"gen"`
 
@@ -1253,6 +1332,17 @@ type Ready struct {
 
 	// Type corresponds to the JSON schema field "type".
 	Type string `json:"type" yaml:"type" mapstructure:"type"`
+}
+
+// What this gen's sandbox-agent supports beyond the base protocol, sent on every
+// ready. Absent on an agent that predates it, which the control plane reads as no
+// capability. Never inferred from agentVersion (technical plan §3.3, prompt
+// receipts).
+type ReadyCapabilities struct {
+	// True when the agent answers every prompt that sets receiptRequested with a
+	// prompt_received event, a duplicate included, and runs a prompt messageId at
+	// most once for its gen, across a restart of the agent process too.
+	PromptReceipt *bool `json:"promptReceipt,omitempty,omitzero" yaml:"promptReceipt,omitempty" mapstructure:"promptReceipt,omitempty"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.

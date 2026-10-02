@@ -711,3 +711,53 @@ func TestLoad_GitDirRootValidation_RelativeWorkspaceDirTableCases(t *testing.T) 
 		})
 	}
 }
+
+// TestLoad_AgentStateDir_DefaultAndValidation pins NARVI_AGENT_STATE_DIR
+// (technical plan §3.3's prompt receipts, the prompt journal's directory):
+// its default beside the credential cache, an override, and a refusal for
+// a relative path or one that overlaps WorkspaceDir in either direction --
+// the agent runtime owns WorkspaceDir (§30.5), and must not reach the
+// journal.
+func TestLoad_AgentStateDir_DefaultAndValidation(t *testing.T) {
+	tests := []struct {
+		name         string
+		workspaceDir string
+		stateDir     string
+		want         string
+		wantErr      bool
+	}{
+		{name: "unset uses the default", workspaceDir: "/workspace", stateDir: "", want: "/tmp/narvi-agent-state"},
+		{name: "override", workspaceDir: "/workspace", stateDir: "/var/lib/narvi/agent-state", want: "/var/lib/narvi/agent-state"},
+		{name: "relative", workspaceDir: "/workspace", stateDir: "narvi-agent-state", wantErr: true},
+		{name: "equal to the workspace", workspaceDir: "/workspace", stateDir: "/workspace/", wantErr: true},
+		{name: "nested under the workspace", workspaceDir: "/workspace", stateDir: "/workspace/.narvi", wantErr: true},
+		{name: "equal after .. normalization", workspaceDir: "/workspace", stateDir: "/workspace/x/..", wantErr: true},
+		{name: "containing the workspace", workspaceDir: "/srv/narvi/workspace", stateDir: "/srv/narvi", wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NARVI_BOOT_MODE", "fresh")
+			t.Setenv("NARVI_WORKSPACE_DIR", tc.workspaceDir)
+			t.Setenv("NARVI_GIT_DIR_ROOT", "/var/lib/narvi/gitdirs")
+			t.Setenv("NARVI_AGENT_STATE_DIR", tc.stateDir)
+
+			cfg, err := boot.Load()
+			if tc.wantErr {
+				var invalidErr *boot.InvalidAgentStateDirError
+				if !errors.As(err, &invalidErr) {
+					t.Fatalf("Load() error = %v (%T), want *boot.InvalidAgentStateDirError (workspaceDir=%q, stateDir=%q)", err, err, tc.workspaceDir, tc.stateDir)
+				}
+				if !strings.Contains(invalidErr.Error(), "NARVI_AGENT_STATE_DIR") {
+					t.Errorf("error %q does not name NARVI_AGENT_STATE_DIR", invalidErr.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("Load() error = %v, want nil", err)
+			}
+			if cfg.AgentStateDir != tc.want {
+				t.Errorf("AgentStateDir = %q, want %q", cfg.AgentStateDir, tc.want)
+			}
+		})
+	}
+}

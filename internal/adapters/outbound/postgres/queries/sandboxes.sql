@@ -239,6 +239,21 @@ SET boot_evidence_gen = gen,
 WHERE session_id = $1
   AND gen = $2;
 
+-- name: RecordSandboxReady :exec
+-- Technical plan §3.3, prompt receipts (migrations/000155_prompt_receipts.up.sql):
+-- counts a ready of gen $gen, and records whether it advertised
+-- capabilities.promptReceipt -- the latest ready of the live gen decides,
+-- so one that does not advertise it clears it. handleSandboxEvent
+-- (sandboxevent.go) calls it in the transaction that stores the ready.
+-- Guarded on gen like MarkSandboxBootEvidence: a ready of any other gen
+-- counts nothing and records nothing, so the capability can only ever be
+-- recorded for the gen that is live.
+UPDATE sandboxes
+SET ready_seq = ready_seq + 1,
+    prompt_receipt_gen = CASE WHEN sqlc.arg('prompt_receipt')::boolean THEN gen ELSE NULL END,
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;
+
 -- name: MarkSandboxBootingSince :exec
 -- Records when gen $2 entered Booting, on this database's clock (technical
 -- plan §3.2's boot-evidence fallback,

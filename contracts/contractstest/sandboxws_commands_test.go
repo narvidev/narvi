@@ -48,6 +48,24 @@ func TestSandboxCommandsRoundTrip(t *testing.T) {
 		})
 	})
 
+	t.Run("Prompt_ReceiptRequested", func(t *testing.T) {
+		// Technical plan §3.3, prompt receipts: receiptRequested is optional
+		// and carries no default, so a prompt that asks for no receipt omits
+		// the key (Prompt_OmittedConversationId above) and stays byte-identical
+		// to one an older control plane sends.
+		requested := true
+		roundTrip(t, sch, sandboxws.Prompt{
+			Type:             "prompt",
+			MessageId:        "m2r",
+			SessionId:        testSessionID,
+			Gen:              1,
+			Text:             "fix the failing test",
+			ScmName:          "Ada Lovelace",
+			ScmEmail:         "ada@example.com",
+			ReceiptRequested: &requested,
+		})
+	})
+
 	t.Run("Stop", func(t *testing.T) {
 		roundTrip(t, sch, sandboxws.Stop{
 			Type:      "stop",

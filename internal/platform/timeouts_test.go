@@ -2874,6 +2874,110 @@ func TestValidate_StopGrace(t *testing.T) {
 	}
 }
 
+// TestValidate_PromptResendWindow pins PromptResendWindow (technical plan
+// §3.3's prompt receipts): the shipped 10m, refused at zero or below,
+// refused unless TurnDeadline exceeds it by MinTimeoutMargin -- a re-sent
+// prompt keeps budget before a deadline its re-send never re-arms -- and
+// refused unless it exceeds, by MinTimeoutMargin, the slowest path from a
+// replica that died after its dispatch commit to a same-gen ready on
+// another replica: ActorLockServerReapTime plus
+// SandboxWSReconnectMaxBackoff plus ActorHydrateTimeout.
+func TestValidate_PromptResendWindow(t *testing.T) {
+	t.Parallel()
+
+	if got := platform.DefaultTimeouts().PromptResendWindow; got != 10*time.Minute {
+		t.Fatalf("DefaultTimeouts().PromptResendWindow = %v, want 10m", got)
+	}
+
+	takeover := func(to platform.Timeouts) time.Duration {
+		return to.ActorLockServerReapTime() + to.SandboxWSReconnectMaxBackoff + to.ActorHydrateTimeout
+	}
+	const takeoverChain = "PromptResendWindow > ActorLockServerReapTime + SandboxWSReconnectMaxBackoff + ActorHydrateTimeout"
+	for _, tc := range []struct {
+		name      string
+		window    func(platform.Timeouts) time.Duration
+		wantField string
+		wantChain string
+	}{
+		{name: "zero", window: func(platform.Timeouts) time.Duration { return 0 }, wantField: "PromptResendWindow"},
+		{name: "negative", window: func(platform.Timeouts) time.Duration { return -time.Second }, wantField: "PromptResendWindow"},
+		{name: "at TurnDeadline", window: func(to platform.Timeouts) time.Duration { return to.TurnDeadline }, wantChain: "TurnDeadline > PromptResendWindow"},
+		{name: "within the margin below TurnDeadline", window: func(to platform.Timeouts) time.Duration {
+			return to.TurnDeadline - platform.MinTimeoutMargin + time.Second
+		}, wantChain: "TurnDeadline > PromptResendWindow"},
+		{name: "at the takeover path", window: takeover, wantChain: takeoverChain},
+		{name: "within the margin above the takeover path", window: func(to platform.Timeouts) time.Duration {
+			return takeover(to) + platform.MinTimeoutMargin - time.Second
+		}, wantChain: takeoverChain},
+		{name: "exactly the margin below TurnDeadline", window: func(to platform.Timeouts) time.Duration {
+			return to.TurnDeadline - platform.MinTimeoutMargin
+		}},
+		{name: "exactly the margin above the takeover path", window: func(to platform.Timeouts) time.Duration {
+			return takeover(to) + platform.MinTimeoutMargin
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			to.PromptResendWindow = tc.window(to)
+			err := to.Validate()
+			switch {
+			case tc.wantField != "":
+				var pos *platform.TimeoutMustBePositiveError
+				if !errors.As(err, &pos) || pos.Field != tc.wantField {
+					t.Fatalf("Validate() = %v, want %s refused as non-positive", err, tc.wantField)
+				}
+			case tc.wantChain != "":
+				var inv *platform.TimeoutInvariantError
+				if !errors.As(err, &inv) || inv.Chain != tc.wantChain {
+					t.Fatalf("Validate() = %v, want the broken link %q", err, tc.wantChain)
+				}
+			default:
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+			}
+		})
+	}
+}
+
+// TestValidate_PromptResendMaxPerTurn pins PromptResendMaxPerTurn
+// (technical plan §3.3's prompt receipts): the shipped 3, refused at zero
+// or below -- a cap of zero would never re-send a lost prompt -- and one
+// accepted.
+func TestValidate_PromptResendMaxPerTurn(t *testing.T) {
+	t.Parallel()
+
+	if got := platform.DefaultTimeouts().PromptResendMaxPerTurn; got != 3 {
+		t.Fatalf("DefaultTimeouts().PromptResendMaxPerTurn = %d, want 3", got)
+	}
+	for _, tc := range []struct {
+		name    string
+		max     int
+		refused bool
+	}{
+		{name: "zero", max: 0, refused: true},
+		{name: "negative", max: -1, refused: true},
+		{name: "one", max: 1, refused: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			to.PromptResendMaxPerTurn = tc.max
+			err := to.Validate()
+			var cnt *platform.CountMustBePositiveError
+			refused := errors.As(err, &cnt) && cnt.Field == "PromptResendMaxPerTurn"
+			if refused != tc.refused {
+				t.Fatalf("Validate() = %v, want PromptResendMaxPerTurn refused = %v", err, tc.refused)
+			}
+			if !tc.refused && err != nil {
+				t.Fatalf("Validate() = %v, want nil", err)
+			}
+		})
+	}
+}
+
 // TestValidate_DispatchRetryBackoff pins the durable dispatch trigger's
 // retry after a failed evaluation (technical plan §2): the shipped bounds
 // (one minute, one hour), and each link -- the shortest delay above the

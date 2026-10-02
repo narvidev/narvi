@@ -56,6 +56,11 @@
 //     the real ack is delivered, so this test can also prove "never
 //     resent again" across that SECOND reconnect too, not merely "was
 //     resent once".
+//   - dropBackendType / dropClientType (scenario #22, a prompt lost on
+//     the wire, scenario22_lost_prompt_test.go): full bidirectional relay,
+//     except that the first frame of that type in that direction --
+//     backend->client, or client->backend -- is dropped, never relayed,
+//     and both sides are severed at once: a frame lost with its socket.
 //   - the zero value (the fallback once the scripted queue is exhausted):
 //     full bidirectional relay, forever, no severing.
 //
@@ -107,6 +112,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
 	"github.com/narvidev/narvi/internal/adapters/inbound/wshub"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/wsbridge"
 )
 
@@ -150,6 +156,8 @@ func (noopCommandHandler) HandleGitSyncComplete(context.Context, sandboxws.GitSy
 type wsProxyStep struct {
 	dropAfterClient   int
 	severAfterBackend int
+	dropBackendType   string
+	dropClientType    string
 }
 
 // wsProxy relays a single WS connection between a real wsbridge.Bridge
@@ -171,6 +179,18 @@ type wsProxy struct {
 	// is up) and the critical event itself (proving it was sent/resent),
 	// mirroring bridge_test.go's own readyCh/critCh two-channel precedent.
 	onRelay func(payload []byte)
+	// alwaysDropBackendType, when set, applies dropBackendType's drop and
+	// sever to every backend->client frame of that type on every connection
+	// (scenario #22's deterministic loss); dropped counts those frames.
+	alwaysDropBackendType string
+	dropped               int
+}
+
+// droppedCount returns how many frames alwaysDropBackendType dropped.
+func (p *wsProxy) droppedCount() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.dropped
 }
 
 func newWSProxy(backendURL string, onRelay func(payload []byte)) *wsProxy {
@@ -214,6 +234,11 @@ func forwardableHandshakeHeaders(r *http.Request) http.Header {
 
 func (p *wsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	step := p.nextStep()
+	p.mu.Lock()
+	if p.alwaysDropBackendType != "" {
+		step.dropBackendType = p.alwaysDropBackendType
+	}
+	p.mu.Unlock()
 
 	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
@@ -227,6 +252,10 @@ func (p *wsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer func() { _ = backendConn.CloseNow() }()
+	// The relay itself must never be what cuts a frame: it reads as much as
+	// a sandbox-agent does (technical plan §6.1).
+	clientConn.SetReadLimit(platform.MaxPromptFrameBytes)
+	backendConn.SetReadLimit(platform.MaxPromptFrameBytes)
 
 	if step.dropAfterClient > 0 {
 		for i := 0; i < step.dropAfterClient; i++ {
@@ -257,6 +286,11 @@ func (p *wsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			if err != nil {
 				return err
 			}
+			if step.dropClientType != "" && relayType(data) == step.dropClientType {
+				// Dropped with its socket: the deferred cancel and Close calls
+				// sever both sides before anything else is relayed.
+				return nil
+			}
 			p.onRelay(data)
 			if err := backendConn.Write(relayCtx, websocket.MessageText, data); err != nil {
 				return err
@@ -270,6 +304,13 @@ func (p *wsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			_, data, err := backendConn.Read(relayCtx)
 			if err != nil {
 				return err
+			}
+			if step.dropBackendType != "" && relayType(data) == step.dropBackendType {
+				// As above, backend->client.
+				p.mu.Lock()
+				p.dropped++
+				p.mu.Unlock()
+				return nil
 			}
 			if err := clientConn.Write(relayCtx, websocket.MessageText, data); err != nil {
 				return err
@@ -293,6 +334,13 @@ func (p *wsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // wshub/dispatch.go's own identical envelope-peeking precedent.
 type relayEnvelope struct {
 	Type string `json:"type"`
+}
+
+// relayType returns payload's "type", or "" when it has none.
+func relayType(payload []byte) string {
+	var env relayEnvelope
+	_ = json.Unmarshal(payload, &env)
+	return env.Type
 }
 
 // waitChan reads exactly one value from ch, failing the test if timeout

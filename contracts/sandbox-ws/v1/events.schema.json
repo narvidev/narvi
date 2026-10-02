@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://narvi.dev/contracts/sandbox-ws/v1/events.schema.json",
   "title": "SandboxEvent",
-  "description": "sandbox-agent -> control-plane WS events (technical plan §6.1). Every event carries the common envelope (type, messageId, sessionId, gen). The 6 CRITICAL types (execution_complete, error, snapshot_ready, push_complete, push_error, sub_task_finish) additionally require ackId, deterministically formatted '{type}:{messageId}' (enforced here via both a description and a per-type 'pattern' anchored on the literal type prefix) so the ack protocol (§6.1: sender buffers 1000 events, evicts oldest non-critical, re-sends on reconnect until acked; receiver dedupes by upsert-on-messageId) can redeliver them exactly once. sub_task_finish (§7.1) joins the critical set because it closes an 'active' state the UI tracks (a live sub-lane count) exactly like execution_complete does at the turn level — a dropped, never-redelivered sub_task_finish would leave a sub-lane stuck active forever. Field nullability convention: a property documented as 'nullable' is a REQUIRED key whose value may be JSON null, EXCEPT step_finish's cost.tokens.cached and cost.usd — §6.1 only specifies that 'tokens is an object, not a number'; the {input, output, cached?, usd?} breakdown and which of those sub-fields are optional is this contract's own invention, not literally specified by the technical plan.",
+  "description": "sandbox-agent -> control-plane WS events (technical plan §6.1). Every event carries the common envelope (type, messageId, sessionId, gen). The 6 CRITICAL types (execution_complete, error, snapshot_ready, push_complete, push_error, sub_task_finish) additionally require ackId, deterministically formatted '{type}:{messageId}' (enforced here via both a description and a per-type 'pattern' anchored on the literal type prefix) so the ack protocol (§6.1: sender buffers 1000 events, evicts oldest non-critical, re-sends on reconnect until acked; receiver dedupes by upsert-on-messageId) can redeliver them exactly once. sub_task_finish (§7.1) joins the critical set because it closes an 'active' state the UI tracks (a live sub-lane count) exactly like execution_complete does at the turn level — a dropped, never-redelivered sub_task_finish would leave a sub-lane stuck active forever. prompt_received (technical plan §3.3, prompt receipts) is deliberately not among them: a lost receipt is answered again by the next copy of its prompt, which the control plane re-sends after the gen's next reconnect. Field nullability convention: a property documented as 'nullable' is a REQUIRED key whose value may be JSON null, EXCEPT step_finish's cost.tokens.cached and cost.usd — §6.1 only specifies that 'tokens is an object, not a number'; the {input, output, cached?, usd?} breakdown and which of those sub-fields are optional is this contract's own invention, not literally specified by the technical plan.",
   "$defs": {
     "Ready": {
       "type": "object",
@@ -16,7 +16,18 @@
         "gen": { "type": "integer" },
         "timestamp": { "type": "string", "format": "date-time" },
         "agentVersion": { "type": "string", "description": "§12.2 item 1's own runtime-fingerprint gap (§5.3's own boot fingerprint, sandboxboot.BootFingerprint.AgentVersion): this gen's own sandbox-agent binary version. Always a real, non-empty string -- 'dev' when NARVI_AGENT_VERSION is unset (no build-time version-stamping pipeline exists yet), never omitted." },
-        "imageDigest": { "type": "string", "description": "§12.2 item 1's own runtime-fingerprint gap (sandboxboot.BootFingerprint.ImageDigest): this gen's own sandbox image digest. Always a real, non-empty string -- 'unknown' when NARVI_IMAGE_DIGEST is unset (a documented, honest gap: no mechanism yet injects it into a spawned sandbox), never omitted." }
+        "imageDigest": { "type": "string", "description": "§12.2 item 1's own runtime-fingerprint gap (sandboxboot.BootFingerprint.ImageDigest): this gen's own sandbox image digest. Always a real, non-empty string -- 'unknown' when NARVI_IMAGE_DIGEST is unset (a documented, honest gap: no mechanism yet injects it into a spawned sandbox), never omitted." },
+        "capabilities": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "What this gen's sandbox-agent supports beyond the base protocol, sent on every ready. Absent on an agent that predates it, which the control plane reads as no capability. Never inferred from agentVersion (technical plan §3.3, prompt receipts).",
+          "properties": {
+            "promptReceipt": {
+              "type": "boolean",
+              "description": "True when the agent answers every prompt that sets receiptRequested with a prompt_received event, a duplicate included, and runs a prompt messageId at most once for its gen, across a restart of the agent process too."
+            }
+          }
+        }
       }
     },
     "Heartbeat": {
@@ -378,6 +389,20 @@
         "subTaskId": { "type": "string", "description": "Same subTaskId this sub-task's own sub_task_start carried." },
         "outcome": { "type": "string", "enum": ["completed", "failed", "cancelled"], "description": "Reuses the turn's own outcome taxonomy (§3.3, §7.1)." }
       }
+    },
+    "PromptReceived": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Technical plan §3.3, prompt receipts: the agent holds the prompt promptMessageId names. Sent for every prompt that set receiptRequested, a duplicate included. NOT critical (no ackId): a lost receipt is answered again when the control plane re-sends the prompt after the gen's next reconnect. messageId is deterministic, so every copy of one prompt's receipt is stored once, whichever control-plane binary stores it, and is found by that key.",
+      "required": ["type", "messageId", "sessionId", "gen", "promptMessageId", "duplicate"],
+      "properties": {
+        "type": { "type": "string", "const": "prompt_received" },
+        "messageId": { "type": "string", "pattern": "^prompt_received:.+$", "description": "'prompt_received:{promptMessageId}'." },
+        "sessionId": { "type": "string", "format": "uuid" },
+        "gen": { "type": "integer" },
+        "promptMessageId": { "type": "string", "description": "The messageId of the prompt command this answers." },
+        "duplicate": { "type": "boolean", "description": "True when this gen's agent had already received promptMessageId and did not run it again." }
+      }
     }
   },
   "oneOf": [
@@ -400,6 +425,7 @@
     { "$ref": "#/$defs/SandboxErrorEvent" },
     { "$ref": "#/$defs/SnapshotReady" },
     { "$ref": "#/$defs/SubTaskStart" },
-    { "$ref": "#/$defs/SubTaskFinish" }
+    { "$ref": "#/$defs/SubTaskFinish" },
+    { "$ref": "#/$defs/PromptReceived" }
   ]
 }

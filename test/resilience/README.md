@@ -74,8 +74,19 @@ turn-resume-across-a-pod-kill mechanism exists anywhere in this codebase
 existing, already-documented scoping decision from when the test was
 written (Step 21), not something reopened here.
 
+One branch of it now resumes. When the pod is killed between a turn's
+dispatch commit and the write of its prompt, the turn is `Processing` on
+a sandbox that never received the prompt; since Step 226 (scenario #22
+below), a sandbox whose agent advertises prompt receipts is sent the
+same prompt again on its same-gen reconnect to the next pod, and the
+turn completes. An agent without that capability is sent nothing, and
+its turn still fails with a reason, at `turn_deadline`.
+
 - `TestResilience_KillPodMidTurn_TurnFailsWithReason_NoStuckProcessing`
   — `internal/app/sessionactor/resilience_killpod_integration_test.go`
+- `TestResilience_KillPodAfterDispatchCommit_CapableAgent_PromptResentOnSameGenReconnect`
+  and `TestResilience_KillPodAfterDispatchCommit_IncapableAgent_NotResent_EndsAtTurnDeadline`
+  — `internal/app/sessionactor/promptreceipt_killpod_integration_test.go`
 
 ### #2 — kill the sandbox mid-turn
 
@@ -526,11 +537,47 @@ generally — nothing to replay here.
   (the companion snapshot-creation-side guard and its own positive
   control) — same file
 
+## Scenario #22 (Step 226, §3.3)
+
+### #22 — a prompt lost between dispatch and the sandbox
+
+> A prompt lost between dispatch and the sandbox → the same-gen reconnect
+> re-sends it once to a capable agent, which runs it once; never re-sent
+> to an agent without the capability, whose turn ends at `turn_deadline`.
+
+**Status: covered.** The control plane commits a turn `Processing`, then
+writes its prompt in one frame nothing acknowledges. Here the frame is
+lost with its socket after the write returned: scenario #7's `wsProxy`,
+extended with `dropBackendType`/`dropClientType`, sits between a real
+`wsbridge.Bridge` and the real `wshub` sandbox handler, drops the first
+`prompt` it relays backend→client and severs both sides. The sandbox
+reconnects on the same gen. A capable agent (a real `Bridge`, its prompt
+journal open) is sent the prompt again with the same `messageId`, runs it
+once, and its `execution_complete` completes the turn. When the receipt
+is what is lost, the copy it is re-sent is answered `duplicate: true` and
+not run again. An agent built before receipts, its frames written by hand
+as `TestBootReady_PreFixAgentWire` writes them, advertises nothing, is
+sent nothing more, and its turn ends at `turn_deadline` as a timeout.
+The same exit with the dispatching replica killed after its commit is
+scenario #1's second pair of tests, above.
+
+- `TestResilience_Scenario22_LostPromptFrame_CapableAgent_DeliveredOnceAndCompletes`
+- `TestResilience_Scenario22_LostReceiptFrame_CapableAgent_RunsOnce`
+- `TestResilience_Scenario22_LostPromptFrame_PreChangeAgent_NeverResent_EndsAtTurnDeadline`
+- `TestResilience_Scenario22_PromptFrameOver32KiB_CapableAgent_DeliveredOnceAndCompletes`:
+  a prompt frame over the WebSocket library's default 32 KiB read limit,
+  which closed the agent's connection and was lost before the agent read up
+  to `platform.MaxPromptFrameBytes`, is read whole and run once.
+- `TestResilience_Scenario22_PromptLostOnEveryDelivery_ResendCapStopsTheLoop`:
+  a prompt lost on every delivery, each loss a reconnect, is re-sent
+  `PromptResendMaxPerTurn` times and then no more, and the reconnects stop.
+  — all five in `scenario22_lost_prompt_test.go`
+
 ## Summary
 
 | # | Scenario | Status |
 |---|---|---|
-| 1 | Kill CP pod mid-turn | Covered (fails-with-reason half only, documented since Step 21) |
+| 1 | Kill CP pod mid-turn | Covered (fails-with-reason, documented since Step 21; a prompt lost after the dispatch commit resumes for an agent with prompt receipts since Step 226) |
 | 2 | Kill sandbox mid-turn | Covered |
 | 3 | Slow boot | Covered |
 | 4 | Late `execution_complete` | Covered (automation-counter correction deferred to Phase 3+) |
@@ -547,7 +594,8 @@ generally — nothing to replay here.
 | 15 | Refresh-in-flight spawn | Covered — Step 42 |
 | 16 | Non-idempotent-setup boot | Covered — Step 42 |
 | 17 | Restore-with-docker | Covered — Step 74 |
+| 22 | A prompt lost between dispatch and the sandbox | Covered — Step 226 |
 
 Numbers 18-21 are taken by the scenarios `docs/TECHNICAL_PLAN.md` §9.3 appends for Phases 13, 15
 and 18 (rotation and the interrupted turn, fresh-lineage continuity, the spend cap and freeze, the
-Kubernetes provider), none built yet. A new scenario takes 22.
+Kubernetes provider), none built yet. 22 is Step 226's. A new scenario takes 23.

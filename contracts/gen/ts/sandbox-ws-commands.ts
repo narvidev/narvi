@@ -47,6 +47,10 @@ export interface Prompt {
    * §8.1: dispatch into plan mode instead of direct execution.
    */
   planMode?: boolean;
+  /**
+   * Technical plan §3.3, prompt receipts: true asks the agent to answer this prompt, and every later copy of it, with a prompt_received event whose messageId is 'prompt_received:{this messageId}', and never to run a copy twice. Sent only to a gen whose ready advertised capabilities.promptReceipt. Absent or false: no receipt is asked.
+   */
+  receiptRequested?: boolean;
 }
 /**
  * Cancel the in-flight turn. No fields beyond the common envelope.
