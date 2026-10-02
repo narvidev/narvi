@@ -5317,10 +5317,13 @@ expiry leaves a revoked repository eligible until its deadline.
   and a later turn on the same gen keeps its trace. A revocation read that fails at dispatch fails the
   turn as an undelivered prompt, marked the same way, and backs off, never as a refusal. A prompt
   re-sent to the gen it was already sent to is never failed: its §3.3 receipt re-send after a same-gen
-  reconnect reads the revocation in the transaction that claims the reconnect, and a revocation
-  claims it without counting a re-send, sends nothing and leaves the turn processing until it
-  completes or its deadline ends it; a read that fails rolls the claim back, and the next heartbeat
-  answers the reconnect. Automatic re-review (§24) reads the revocation before it fetches anything,
+  reconnect reads the revocation before the transaction claims the reconnect. A revocation leaves the
+  reconnect unclaimed, sends and counts nothing, logs once per turn and reconnect, and leaves the turn
+  processing; every heartbeat then reads the revocation again -- one read per heartbeat, for at most
+  `PromptResendWindow` from the dispatch -- so the first heartbeat after a restore re-sends the
+  prompt, and past the window the reconnect is claimed as expired and the turn ends at its deadline,
+  as any unreceipted prompt's would. A read that fails rolls the evaluation back, and the next
+  heartbeat answers the reconnect. Automatic re-review (§24) reads the revocation before it fetches anything,
   inserts a turn or spends the pull request's budget, so a revoked repository's pushes spend nothing
   and post no budget notice, and the session's status does not read the debounce they arm as
   scheduled work (§43.20); after a restore the next push re-reviews. Each of these refusals is counted

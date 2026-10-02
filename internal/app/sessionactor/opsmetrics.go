@@ -227,9 +227,10 @@ type opsMetrics struct {
 	// the prompt-receipt check answered without finding the receipt
 	// (promptreceipt.go), tagged outcome=sent|send_failed|refused|
 	// frame_too_large|window_expired|cap_reached; refused is the rollout
-	// re-check's refusal or an administrator's revocation (§31.4). A
-	// reconnect that finds the receipt stored is not counted: nothing was
-	// lost.
+	// re-check's refusal. A reconnect that finds the receipt stored is not
+	// counted: nothing was lost. Nor is one an administrator's revocation
+	// leaves unanswered (§31.4), until it is answered: sent after a
+	// restore, or window_expired.
 	promptResend metric.Int64Counter
 }
 
@@ -340,7 +341,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	repoEntitlementDenied, err := meter.Int64Counter(
 		"session_repo_entitlement_denied_total",
-		metric.WithDescription("Count of every session-creation attempt refused by §31.4's per-repository entitlement predicate (stage \"create\"), and of every refusal the session actor makes because an administrator revoked an existing session's repository -- the SAME instrument httpapi's repo entitlement gate registers (internal/adapters/inbound/httpapi/repoentitlementgate.go), incremented here with reason \"revoked\" and the stage of the refusal: \"spawn\" (a spawn, restore or resume refused, which ends the session's open turns, refuseIfRepoRevoked), \"dispatch\" (a turn's prompt refused before it was sent to a sandbox gen, revocationRefusalForDispatch), \"resend\" (a prompt receipt re-send refused, refuseResendIfRepoRevoked) and \"auto_retrigger\" (an automatic re-review debounce firing dropped, one per push to the pull request, autoRetriggerRepoRevoked). Tagged by spawn_source, reason and stage: only stage \"create\" counts session creations. A revocation read that failed never counts: it is not a fact about the repository."),
+		metric.WithDescription("Count of every session-creation attempt refused by §31.4's per-repository entitlement predicate (stage \"create\"), and of every refusal the session actor makes because an administrator revoked an existing session's repository -- the SAME instrument httpapi's repo entitlement gate registers (internal/adapters/inbound/httpapi/repoentitlementgate.go), incremented here with reason \"revoked\" and the stage of the refusal: \"spawn\" (a spawn, restore or resume refused, which ends the session's open turns, refuseIfRepoRevoked), \"dispatch\" (a turn's prompt refused before it was sent to a sandbox gen, revocationRefusalForDispatch), \"resend\" (a prompt receipt re-send refused, once per turn and same-gen reconnect, refuseResendIfRepoRevoked) and \"auto_retrigger\" (an automatic re-review debounce firing dropped, one per push to the pull request, autoRetriggerRepoRevoked). Tagged by spawn_source, reason and stage: only stage \"create\" counts session creations. A revocation read that failed never counts: it is not a fact about the repository."),
 		metric.WithUnit("{denial}"),
 	)
 	if err != nil {
@@ -394,7 +395,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	promptResend, err := meter.Int64Counter(
 		"turn_prompt_resend_total",
-		metric.WithDescription("Same-gen reconnects of a sandbox whose turn in flight asked for a prompt receipt and found none stored (technical plan §3.3, prompt receipts), by outcome: sent (the prompt was written again, with its original messageId, which the agent runs at most once); send_failed (that write failed; the turn stays Processing and the next reconnect tries again); refused (not sent: the turn-dispatch-time rollout re-check refused it, or an administrator revoked the session's repository (technical plan §31.4, also counted on session_repo_entitlement_denied_total{stage=\"resend\"}); the turn stays Processing, and a revocation read that fails counts nothing here -- the evaluation rolls back and the next heartbeat answers the reconnect); frame_too_large (the re-sent frame would exceed MaxPromptFrameBytes, which the same dispatch's frame did not; it is not sent); window_expired (the dispatch asked longer ago than PromptResendWindow, so nothing was sent; the turn ends at turn_deadline or by a person's stop, as before receipts existed); cap_reached (the dispatch's prompt was already re-sent PromptResendMaxPerTurn times, so nothing was sent, with the same end as window_expired). The WARN line logged with each outcome but sent names the turn."),
+		metric.WithDescription("Same-gen reconnects of a sandbox whose turn in flight asked for a prompt receipt and found none stored (technical plan §3.3, prompt receipts), by outcome: sent (the prompt was written again, with its original messageId, which the agent runs at most once); send_failed (that write failed; the turn stays Processing and the next reconnect tries again); refused (not sent: the turn-dispatch-time rollout re-check refused it; the turn stays Processing); frame_too_large (the re-sent frame would exceed MaxPromptFrameBytes, which the same dispatch's frame did not; it is not sent); window_expired (the dispatch asked longer ago than PromptResendWindow, so nothing was sent; the turn ends at turn_deadline or by a person's stop, as before receipts existed); cap_reached (the dispatch's prompt was already re-sent PromptResendMaxPerTurn times, so nothing was sent, with the same end as window_expired). The WARN line logged with each outcome but sent names the turn. An administrator's revocation of the session's repository (technical plan §31.4) counts nothing here: it leaves the reconnect unanswered, logged once per turn and reconnect and counted on session_repo_entitlement_denied_total{stage=\"resend\"}, and the reconnect is counted here once it is answered -- sent by the first heartbeat after a restore, or window_expired. A revocation read that fails counts nothing either: the evaluation rolls back and the next heartbeat answers the reconnect."),
 		metric.WithUnit("{reconnect}"),
 	)
 	if err != nil {

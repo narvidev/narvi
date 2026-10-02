@@ -27,11 +27,13 @@
 //     already sent to, after a same-gen reconnect (§3.3's prompt receipts):
 //     tryPlanReceiptResend reads it in its own transaction, before it
 //     claims the reconnect. That prompt may be running, so nothing fails
-//     the turn there: a revocation claims the reconnect without counting a
-//     re-send, refuseResendIfRepoRevoked sends nothing and counts it, and
-//     the turn stays processing until it completes or its deadline ends it;
-//     a read that failed rolls the claim back, and the next heartbeat
-//     answers the reconnect.
+//     the turn there. A revocation leaves the reconnect unclaimed and sends
+//     nothing, and refuseResendIfRepoRevoked logs it once per turn and
+//     ready: each heartbeat reads the revocation again, so the first one
+//     after a restore re-sends the prompt, for at most PromptResendWindow,
+//     past which the reconnect is claimed as window_expired. A read that
+//     failed rolls the evaluation back, and the next heartbeat answers the
+//     reconnect.
 //
 // One unattended producer is gated before it creates a turn at all:
 // automatic re-review (readReviewRetriggerState, reviewretrigger.go), whose
@@ -223,10 +225,11 @@ func (a *Actor) revocationRefusalForDispatch(ctx context.Context, sessionRow sql
 // prompt receipts, §31.4): tryPlanReceiptResend calls it on the
 // evaluation's transaction, before it claims a same-gen reconnect, when the
 // claim would send the prompt again. It returns the session's repository an
-// administrator revoked, or "" when none is. A read that fails is returned
-// as an error: the evaluation rolls back with the claim unmade, and the
-// next heartbeat's evaluation answers the reconnect, so a database blip
-// spends neither the reconnect nor one of PromptResendMaxPerTurn re-sends.
+// administrator revoked, or "" when none is; on a revocation the caller
+// leaves the reconnect unclaimed. A read that fails is returned as an
+// error: the evaluation rolls back with the claim unmade, and the next
+// heartbeat's evaluation answers the reconnect, so a database blip spends
+// neither the reconnect nor one of PromptResendMaxPerTurn re-sends.
 func (a *Actor) resendRevokedRepo(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session) (string, error) {
 	repo, revoked, err := a.revokedRepoForSession(ctx, a.stores.githubPRSession.WithTx(tx), sessionRow)
 	if err != nil {
@@ -238,25 +241,41 @@ func (a *Actor) resendRevokedRepo(ctx context.Context, tx pgx.Tx, sessionRow sql
 	return repo, nil
 }
 
-// refuseResendIfRepoRevoked acts, after the claim has committed, on the
-// revocation resendRevokedRepo read: executeReceiptResend calls it before
-// its rollout re-check, and it reports whether the re-send must not be
-// sent. The prompt was already sent to this gen and may be running, so
-// nothing here fails the turn: a revoked repository sends nothing, logs a
-// warning, and counts the re-send as refused
-// (turn_prompt_resend_total{outcome="refused"}) and the revocation
-// (session_repo_entitlement_denied_total{stage="resend"}); the turn stays
-// processing until it completes or its deadline ends it. The claim counted
-// no re-send, so after a restore the next reconnect still has the turn's
-// full PromptResendMaxPerTurn.
+// revokedResendKey names one turn and one same-gen ready of its sandbox:
+// what refuseResendIfRepoRevoked last logged a refusal for.
+type revokedResendKey struct {
+	turnID   pgtype.UUID
+	readySeq int32
+}
+
+// refuseResendIfRepoRevoked acts, after the evaluation has committed, on
+// the revocation resendRevokedRepo read: executeReceiptResend calls it
+// before its rollout re-check, and it reports whether the re-send must not
+// be sent. The prompt was already sent to this gen and may be running, so
+// nothing here fails the turn, and the reconnect was left unclaimed: the
+// turn stays processing, and every heartbeat's evaluation reads the
+// revocation again until a restore lets one re-send the prompt -- with the
+// turn's full PromptResendMaxPerTurn, since nothing was counted -- or
+// PromptResendWindow passes and the reconnect is claimed as window_expired.
+// So that does not log or count once per heartbeat, the refusal is logged
+// at WARN and counted on session_repo_entitlement_denied_total{stage="resend"}
+// once per turn and ready (Actor.revokedResendWarned); a successor actor
+// does so once more. turn_prompt_resend_total counts nothing here: the
+// reconnect is not answered yet, and is counted when it is (sent, or
+// window_expired).
 func (a *Actor) refuseResendIfRepoRevoked(ctx context.Context, plan *dispatchPlan) bool {
 	rr := plan.receiptResend
 	if rr.revokedRepo == "" {
 		return false
 	}
-	a.logger.Warn("sessionactor: prompt re-send refused: an administrator revoked the session's repository (§31.4); the turn stays processing",
-		"turn_id", plan.turnID.String(), "gen", rr.gen, "message_id", rr.messageID, "repo", rr.revokedRepo)
-	a.recordPromptResend(ctx, promptResendOutcomeRefused)
+	key := revokedResendKey{turnID: plan.turnID, readySeq: rr.readySeq}
+	if a.revokedResendWarned == key {
+		return true
+	}
+	a.revokedResendWarned = key
+	a.logger.Warn("sessionactor: prompt re-send refused: an administrator revoked the session's repository (§31.4); the reconnect stays unanswered and the turn processing, until a restore or the re-send window's end",
+		"turn_id", plan.turnID.String(), "gen", rr.gen, "message_id", rr.messageID, "repo", rr.revokedRepo,
+		"ready_seq", rr.readySeq, "since_request", rr.sinceRequest.String(), "window", a.timeouts.PromptResendWindow.String())
 	a.recordRepoEntitlementRevoked(ctx, string(plan.sessionRow.SpawnSource), repoEntitlementStageResend)
 	return true
 }

@@ -561,10 +561,10 @@ func receiptRigDispatchedOnce(ctx context.Context, t *testing.T, prefix string, 
 	return rig, repo
 }
 
-// assertProcessingNothingResent checks that a same-gen reconnect after a
-// revocation sent no second prompt, spent none of the turn's re-sends and
-// left the turn processing, with no synthetic execution_complete: the
-// prompt may be running, and running work finishes.
+// assertProcessingNothingResent checks that the turn's prompt was sent
+// once only, none of its re-sends is spent and it is still processing,
+// with no synthetic execution_complete: the prompt may be running, and a
+// refused re-send never fails the turn.
 func assertProcessingNothingResent(ctx context.Context, t *testing.T, rig *receiptRig) {
 	t.Helper()
 	if got := len(rig.commander.prompts(t)); got != 1 {
@@ -582,41 +582,152 @@ func assertProcessingNothingResent(ctx context.Context, t *testing.T, rig *recei
 	}
 }
 
+// revokedResendMsg is refuseResendIfRepoRevoked's WARN line.
+const revokedResendMsg = "sessionactor: prompt re-send refused: an administrator revoked the session's repository (§31.4); the reconnect stays unanswered and the turn processing, until a restore or the re-send window's end"
+
+// assertReconnectUnclaimed checks that the turn's receipt check has not
+// moved past wantChecked: the reconnect is still to be answered.
+func assertReconnectUnclaimed(ctx context.Context, t *testing.T, rig *receiptRig, wantChecked int32) {
+	t.Helper()
+	got := rig.turn(ctx, t)
+	if got.ReceiptCheckedReadySeq == nil || *got.ReceiptCheckedReadySeq != wantChecked {
+		t.Errorf("receipt_checked_ready_seq = %s, want %d: a revocation leaves the reconnect unclaimed", int32PtrString(got.ReceiptCheckedReadySeq), wantChecked)
+	}
+}
+
 // TestPromptReceipt_RevokedRepo_LostPromptNotResent: a prompt lost on its
 // way to a capable gen, then an administrator's revocation, then a same-gen
 // reconnect: no receipt is stored, so the re-send would start the work
-// after the revocation -- it is refused, counted (refused on
-// turn_prompt_resend_total, stage resend on
-// session_repo_entitlement_denied_total), and the turn stays processing.
-// The refusal spent none of the turn's re-sends: once the repository is
-// restored, the next reconnect re-sends the prompt under its own
-// messageId, as the first re-send.
+// after the revocation. It is refused, the turn stays processing, and the
+// reconnect is left unclaimed -- receipt_checked_ready_seq and
+// receipt_resend_count do not move, and turn_prompt_resend_total counts
+// nothing. Heartbeats read the revocation again, but the refusal is
+// logged and counted (session_repo_entitlement_denied_total{stage=resend})
+// once per turn and reconnect: once for the first ready and its
+// heartbeats, once more for a second ready.
 func TestPromptReceipt_RevokedRepo_LostPromptNotResent(t *testing.T) {
+	logs := captureDefaultLoggerJSONSync(t)
 	ctx := context.Background()
+	rig, repo := receiptRigDispatchedOnce(ctx, t, "acme/zz-revoked-resend-", false, nil)
+	checked := *rig.turn(ctx, t).ReceiptCheckedReadySeq
 	refusedBefore := promptResendCount(ctx, t, promptResendOutcomeRefused)
 	revokedBefore := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageResend)
 
-	rig, repo := receiptResendAfterRevocation(ctx, t, false)
+	revokeRepoForActorTest(ctx, t, rig.pool, repo)
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	for i := 0; i < 3; i++ {
+		sendAndSettle(ctx, t, rig.actor, receiptHeartbeat(1), 1)
+	}
 
 	assertProcessingNothingResent(ctx, t, rig)
-	if got := promptResendCount(ctx, t, promptResendOutcomeRefused) - refusedBefore; got != 1 {
-		t.Errorf("turn_prompt_resend_total{refused} moved by %d, want 1", got)
+	assertReconnectUnclaimed(ctx, t, rig, checked)
+	if got := promptResendCount(ctx, t, promptResendOutcomeRefused) - refusedBefore; got != 0 {
+		t.Errorf("turn_prompt_resend_total{refused} moved by %d, want 0: the reconnect is not answered yet", got)
 	}
 	if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageResend) - revokedBefore; got != 1 {
-		t.Errorf("session_repo_entitlement_denied_total{stage=resend} moved by %d, want 1", got)
+		t.Errorf("session_repo_entitlement_denied_total{stage=resend} moved by %d, want 1: once per turn and reconnect, not per heartbeat", got)
+	}
+	if got := countLogLines(t, logs, revokedResendMsg); got != 1 {
+		t.Errorf("%d revoked re-send WARN lines after one reconnect and its heartbeats, want 1", got)
+	}
+
+	// A second reconnect while still revoked: one more WARN and count.
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	assertProcessingNothingResent(ctx, t, rig)
+	assertReconnectUnclaimed(ctx, t, rig, checked)
+	if got := countLogLines(t, logs, revokedResendMsg); got != 2 {
+		t.Errorf("%d revoked re-send WARN lines after two reconnects, want 2", got)
+	}
+	if got := readCounterSumByAttr(ctx, t, otelReader, "session_repo_entitlement_denied_total", "stage", repoEntitlementStageResend) - revokedBefore; got != 2 {
+		t.Errorf("session_repo_entitlement_denied_total{stage=resend} moved by %d, want 2", got)
+	}
+}
+
+// TestPromptReceipt_RevokedRepo_RestoredWithinWindow_NextHeartbeatResendsOnce:
+// a prompt lost on its way to a capable gen, the repository revoked, one
+// same-gen reconnect -- the only one a lost prompt usually brings -- and
+// then the repository restored inside PromptResendWindow. No further
+// reconnect comes; the first heartbeat after the restore answers the one
+// the revocation left unclaimed, and re-sends the prompt once, under its
+// own messageId, as the turn's first re-send. Later heartbeats send
+// nothing more.
+func TestPromptReceipt_RevokedRepo_RestoredWithinWindow_NextHeartbeatResendsOnce(t *testing.T) {
+	ctx := context.Background()
+	rig, repo := receiptRigDispatchedOnce(ctx, t, "acme/zz-restored-resend-", false, nil)
+	sentBefore := promptResendCount(ctx, t, promptResendOutcomeSent)
+
+	revokeRepoForActorTest(ctx, t, rig.pool, repo)
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	if got := len(rig.commander.prompts(t)); got != 1 {
+		t.Fatalf("prompts after the revoked reconnect = %d, want the first dispatch alone", got)
+	}
+	if _, err := narvipg.NewRepoEntitlementRevocationStore(rig.pool).Restore(ctx, repo); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	for i := 0; i < 10; i++ {
+		sendAndSettle(ctx, t, rig.actor, receiptHeartbeat(1), 1)
+	}
+
+	prompts := rig.commander.prompts(t)
+	if len(prompts) != 2 || prompts[1].MessageId != prompts[0].MessageId || !prompts[1].asksReceipt(t) {
+		t.Fatalf("after the restore and 10 heartbeats: %d prompts; want exactly one re-send of the first, under its own messageId, asking", len(prompts))
+	}
+	got := rig.turn(ctx, t)
+	if got.Status != sqlcgen.TurnStatusProcessing || got.ReceiptResendCount != 1 {
+		t.Errorf("turn status %s, receipt_resend_count %d; want processing, 1", got.Status, got.ReceiptResendCount)
+	}
+	if ready := rig.sandbox(ctx, t).ReadySeq; got.ReceiptCheckedReadySeq == nil || *got.ReceiptCheckedReadySeq != ready {
+		t.Errorf("receipt_checked_ready_seq = %s, want the reconnect's ready_seq %d, answered", int32PtrString(got.ReceiptCheckedReadySeq), ready)
+	}
+	if moved := promptResendCount(ctx, t, promptResendOutcomeSent) - sentBefore; moved != 1 {
+		t.Errorf("turn_prompt_resend_total{sent} moved by %d, want 1", moved)
+	}
+}
+
+// TestPromptReceipt_RevokedRepo_WindowExpiresWhileRevoked_RestoreResendsNothing:
+// the unclaimed reconnect of a revoked repository is bounded by
+// PromptResendWindow. Once the dispatch asked longer ago than the window,
+// the next heartbeat answers the reconnect as window_expired, revoked or
+// not: the mark moves, nothing is sent, and one window WARN is logged. A
+// restore after that re-sends nothing; the turn ends at its deadline, as
+// any prompt not receipted inside the window does.
+func TestPromptReceipt_RevokedRepo_WindowExpiresWhileRevoked_RestoreResendsNothing(t *testing.T) {
+	logs := captureDefaultLoggerJSONSync(t)
+	ctx := context.Background()
+	rig, repo := receiptRigDispatchedOnce(ctx, t, "acme/zz-expired-resend-", false, nil)
+	checked := *rig.turn(ctx, t).ReceiptCheckedReadySeq
+	expiredBefore := promptResendCount(ctx, t, promptResendOutcomeWindowExpired)
+
+	revokeRepoForActorTest(ctx, t, rig.pool, repo)
+	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
+	assertReconnectUnclaimed(ctx, t, rig, checked)
+
+	window := platform.DefaultTimeouts().PromptResendWindow
+	if _, err := rig.pool.Exec(ctx,
+		`UPDATE turns SET receipt_requested_at = now() - make_interval(secs => $2::double precision) WHERE id = $1`,
+		rig.turnID, (window + time.Minute).Seconds()); err != nil {
+		t.Fatalf("age the request past the window: %v", err)
+	}
+	sendAndSettle(ctx, t, rig.actor, receiptHeartbeat(1), 1)
+
+	got := rig.turn(ctx, t)
+	if ready := rig.sandbox(ctx, t).ReadySeq; got.ReceiptCheckedReadySeq == nil || *got.ReceiptCheckedReadySeq != ready {
+		t.Fatalf("receipt_checked_ready_seq = %s, want the reconnect's ready_seq %d: past the window it is answered", int32PtrString(got.ReceiptCheckedReadySeq), ready)
+	}
+	if moved := promptResendCount(ctx, t, promptResendOutcomeWindowExpired) - expiredBefore; moved != 1 {
+		t.Errorf("turn_prompt_resend_total{window_expired} moved by %d, want 1", moved)
+	}
+	if n := countLogLines(t, logs, windowExpiredMsg); n != 1 {
+		t.Errorf("%d window WARN lines, want 1", n)
 	}
 
 	if _, err := narvipg.NewRepoEntitlementRevocationStore(rig.pool).Restore(ctx, repo); err != nil {
 		t.Fatalf("restore: %v", err)
 	}
-	sendAndSettle(ctx, t, rig.actor, receiptReady(1, true), 1)
-	prompts := rig.commander.prompts(t)
-	if len(prompts) != 2 || prompts[1].MessageId != prompts[0].MessageId {
-		t.Fatalf("after the restore and a reconnect: %d prompts; want the first re-sent under its own messageId", len(prompts))
+	for i := 0; i < 3; i++ {
+		sendAndSettle(ctx, t, rig.actor, receiptHeartbeat(1), 1)
 	}
-	if got := rig.turn(ctx, t); got.Status != sqlcgen.TurnStatusProcessing || got.ReceiptResendCount != 1 {
-		t.Errorf("turn status %s, receipt_resend_count %d; want processing, 1", got.Status, got.ReceiptResendCount)
-	}
+	assertProcessingNothingResent(ctx, t, rig)
 }
 
 // TestPromptReceipt_RevokedRepo_ReceiptStoredNothingSentNotFailed: the same,
