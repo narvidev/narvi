@@ -64,6 +64,7 @@ func TestScanRepoEntitlementReads_Rules(t *testing.T) {
 	exemptCases := map[string]bool{
 		"d: an exempt read, beside a write and an unrelated query": true,
 		"d: a stale exemption": true,
+		"d: an exemption of a query that reads the revocations table is stale": true,
 	}
 	tests := []struct {
 		name  string
@@ -169,6 +170,8 @@ func TestScanRepoEntitlementReads_Rules(t *testing.T) {
 			"-- name: GetGitHubPRSessionBySessionID :one\nSELECT * FROM github_pr_sessions WHERE session_id = $1;\n\n-- name: SetX :exec\nUPDATE github_pr_sessions SET session_id = $2 WHERE repo_full_name = $1;\n\n-- name: Ins :exec\nINSERT INTO github_pr_sessions (repo_full_name) VALUES ($1);\n\n-- name: Other :one\nSELECT 1 FROM sessions WHERE id = $1;\n", nil},
 		{"d: a stale exemption", query,
 			"-- name: Other :one\nSELECT 1 FROM sessions WHERE id = $1;\n", []string{"d"}},
+		{"d: an exemption of a query that reads the revocations table is stale", query,
+			"-- name: GetGitHubPRSessionBySessionID :one\nSELECT g.* FROM github_pr_sessions g WHERE g.session_id = $1\n  AND NOT EXISTS (SELECT 1 FROM repo_entitlement_revocations r WHERE r.repo_full_name = g.repo_full_name);\n", []string{"d"}},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

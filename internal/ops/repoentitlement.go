@@ -89,7 +89,6 @@ var RepoEntitlementQueryExemptions = []RepoEntitlementQueryExemption{
 	{Query: "ListSlackChannelsForRepoSince", Reason: "the daily digest's channel scoping: reports past review activity of a repository, never admits new work"},
 	{Query: "ListLinearOrganizationsForRepoSince", Reason: "the daily digest's organization scoping: reports past review activity of a repository, never admits new work"},
 	{Query: "ListDistinctReposWithRecentSessions", Reason: "the daily digest's repository enumeration: reports past review activity, never admits new work"},
-	{Query: "GetSessionActivityFacts", Reason: "a session's activity read model, which reads the pull request's automatic re-review opt-in and budget for display; whether a re-review may run is decided by the actor, which reads the revocation"},
 }
 
 // RepoEntitlementViolation is one place the source breaks §31.4's rule that
@@ -114,7 +113,8 @@ var RepoEntitlementQueryExemptions = []RepoEntitlementQueryExemption{
 //     statement, schema-qualified or quoted, comments of either kind
 //     removed -- without naming repo_entitlement_revocations, and
 //     RepoEntitlementQueryExemptions does not list it; or an exemption names
-//     a query that no longer reads the table.
+//     a query that no longer reads the table, or one that names the
+//     revocations table and so needs no exemption.
 //
 // Rules (a) and (b) apply to non-test Go code: a test reads what it
 // asserts. Rule (c) applies to every Go file but authz's own tests.
@@ -395,6 +395,7 @@ func scanRepoEntitlementQueries(root string, exemptions []RepoEntitlementQueryEx
 		exempt[e.Query] = true
 	}
 	readers := map[string]bool{}
+	readsRevocations := map[string]bool{}
 
 	var out []RepoEntitlementViolation
 	for _, e := range entries {
@@ -419,7 +420,11 @@ func scanRepoEntitlementQueries(root string, exemptions []RepoEntitlementQueryEx
 				continue
 			}
 			readers[name] = true
-			if strings.Contains(strings.ToLower(body), "repo_entitlement_revocations") || exempt[name] {
+			if strings.Contains(strings.ToLower(body), "repo_entitlement_revocations") {
+				readsRevocations[name] = true
+				continue
+			}
+			if exempt[name] {
 				continue
 			}
 			line := 1 + strings.Count(src[:h[0]], "\n")
@@ -432,11 +437,18 @@ func scanRepoEntitlementQueries(root string, exemptions []RepoEntitlementQueryEx
 		}
 	}
 	for _, e := range exemptions {
-		if !readers[e.Query] {
+		switch {
+		case !readers[e.Query]:
 			out = append(out, RepoEntitlementViolation{
 				File:   repoEntitlementQueriesDir,
 				Rule:   "d",
 				Detail: "internal/ops.RepoEntitlementQueryExemptions lists " + e.Query + ", which is no named query reading github_pr_sessions: drop the stale entry",
+			})
+		case readsRevocations[e.Query]:
+			out = append(out, RepoEntitlementViolation{
+				File:   repoEntitlementQueriesDir,
+				Rule:   "d",
+				Detail: "internal/ops.RepoEntitlementQueryExemptions lists " + e.Query + ", which already reads repo_entitlement_revocations and needs no exemption: drop the stale entry",
 			})
 		}
 	}
