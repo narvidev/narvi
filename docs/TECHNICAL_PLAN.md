@@ -1657,8 +1657,10 @@ it lands, and the queued ones run in full on diffs that no longer exist. Two rul
   update, never an insert: while a pushed head waits the debounce exists, since the hold re-arms
   it, and a debounce that is gone was removed on purpose -- the firing that inserted the review of
   its head, an opt-in switched off or a revocation, a person's stop -- which an insert would undo;
-  the one real upsert is the rule below's re-arm of an automatic request, whose turn's insert
-  consumed the debounce and whose moved base or ancestors emit no push to re-arm it. It skips a debounce
+  the one insert is the rule below's re-arm of an automatic request, whose turn's insert
+  consumed the debounce and whose moved base or ancestors emit no push to re-arm it -- and only
+  when no debounce is armed, since a push's quiet window keeps its trailing edge and a held one
+  is woken by the wake-up the same end runs. It skips a debounce
   armed at or before the session's standing stop request, the rule the stop timer deletes by
   (`disarmWorkCreatingTimers`, §3.3), comparing `created_at`, which no re-arm moves: the dispatch's
   stop gate cancels a flagged turn without disarming, and the stop timer may run after it. It runs
@@ -1715,6 +1717,55 @@ it lands, and the queued ones run in full on diffs that no longer exist. Two rul
   comparison that cannot be made lets the turn start, as today, and the turn records that its context
   was unconfirmed at start: an unknown is never read as fresh, and the verdict's own freshness check
   still stands behind it. A reminder turn (§36.2) is not a review attempt and is not checked.
+
+  As shipped for an automatic attempt (the second of the three PRs below). Before each dispatch
+  evaluation of a pull request's review session -- the GitHub lane's, the one kind whose turns a
+  review lane asks for, so no other session's dispatch reads anything for it -- the actor reads,
+  outside any transaction, the turn the evaluation is about to pick
+  (`GetReviewAttemptToCheck`: the session's oldest pending turn no stop flagged, when none is in
+  flight; whether a turn created before it is still open or ended after it was created -- the
+  ending replica's clock against the database's, so a turn ending within their skew of its
+  creation can read either way, and either way is safe: checked when it need not be, or started
+  unchecked as before; and whether the sandbox can take it now). For a review attempt the
+  automatic lane asked for (`turns.request_trigger = 'auto'`, which `insertAutoRetriggerTurn`
+  sets) that waited behind another turn, on a sandbox that is ready or suspect, it reads the pull
+  request live (`GetOpenPR`, bounded by `GitHubGetOpenPRTimeout`, then `reviewfreshness.ReadLive`)
+  through a source-control port the registry is handed (`RegistryOptions.ReviewLiveReader`, the
+  same decorated instance every other freshness read uses) with the bot's credential, and
+  compares the attempt's `review_head_sha` and `review_verdict_context` through
+  `autoapproval.CheckFreshness`, the recorded policy version set to the current one. An attempt
+  that waited behind nothing costs no read. `planDispatch` applies the answer where the turn
+  would be sent, and only to the turn it picks: with none for that turn -- no read, a read of
+  another, or one made while the sandbox could not take it -- it dispatches nothing and re-arms
+  the dispatch timer due at once, so the next evaluation reads its pick. Fresh, unconfirmed
+  (stamping `turns.context_unconfirmed_at`), or an automatic attempt that waited behind nothing,
+  dispatches and resets the pull request's count of moves in a row
+  (`github_pr_sessions.auto_retrigger_context_moves`): one of its attempts starts. Moved ends the
+  turn through the recorder with `turns.end_reason = 'context_moved'` -- the abandon edge, a
+  synthetic `execution_complete` from pending marked `"delivered": false`, no channel notice, no
+  check, no session warning, no workflow hook -- and re-derives the session's status without it;
+  in the same transaction the pull request's pending head becomes the live one unless a push
+  left one (`RequeueAutoRetrigger`), the move is counted, and the debounce is inserted due at
+  once when none is armed (`RequeueReviewRetriggerDebounce`); the next turn of the queue is
+  evaluated at once. The move that takes the count past `ReviewContextMoveMaxConsecutive` (3,
+  in `internal/platform/timeouts.go`; `Validate` keeps it at least one) drops the request
+  instead: the pending head cleared (`DropAutoRetrigger`), the debounce deleted, and when and on
+  which head recorded (`auto_retrigger_dropped_at`, `auto_retrigger_dropped_head_sha`, read in
+  the status's re-review lateral) and shown as `SessionActivity.reviewRetriggerDropped` until
+  the next push clears it (`UpsertPendingRetriggerHeadSHA`). The budget slot a moved attempt
+  spent is not given back: §24.6's count only grows, and the bound caps what moves can cost.
+  `session.DeriveStatus` drops every summary marked ignored -- a turn with any end reason -- and
+  reads `created` when none remains; a stored failed turn carries no reason, so a session whose
+  newest counted turn failed just before an ignored one reads failed with no reason recorded.
+  The readers of attempts keep `end_reason IS NULL`: the newest review attempt, whether a newer
+  attempt ran since a verdict was accepted, and the status's last run and the newest turn its
+  failure reason is read against; `TestReviewAttemptReadersExcludeContextMoved` fails on a sqlc
+  query that reads `is_review_attempt`, or orders turns newest first, without it. Migration 000159
+  adds the six columns, catalog changes only; the contracts' MINOR 1.23.0 adds the status
+  field. Since the hold, the lane inserts an attempt only when no turn of the session is open, so
+  a queued automatic attempt is one a replica without the hold inserted during a rolling deploy,
+  or one inserted before it shipped; the check is the mechanism the third PR extends to a
+  person's request, which queues routinely.
 
 The first shape is the ordinary case when an agent pushes fixes while a review runs. Phasing: Step
 198, Phase 11, in three PRs: the hold and its wake-up first; then the context check of a queued
@@ -9049,7 +9100,7 @@ The one such echo found, a review session's own push, no longer exists: a review
 | `turn_deadline` timer | a turn's dispatch; deleted at its completion | timer pump → session actor | No — it times out the turn that is processing, whose end can queue the workflow's next step in the same transaction, so it acts only while the snapshot already reads `running`; with no processing turn it deletes itself |
 | `stop` timer (§3.3) | a person's stop request (`POST /api/sessions/{sessionID}/stop`, which also wakes the actor); re-armed by its handler while a flagged turn is in flight | timer pump → session actor | No — it cancels only turns flagged when the request was made, which the snapshot already reads `queued` or `running`, and deletes the session's work-creating timers armed at or before the request; an attempt it cancels ends its workflow run `cancelled` with no next step; when a flagged turn's grace ends with no word from the agent it retires that turn's sandbox gen, and the dispatch that follows respawns or restores a sandbox only for a turn already queued; with nothing flagged open it deletes itself |
 | `dispatch` timer (§2, §3.3) | every turn insert, due at once, in the transaction that creates the turn (`TurnStore.CreateAndArmDispatch`) | timer pump → session actor, when the post-commit trigger failed; deleted first by every dispatch evaluation that commits, whatever asked for it; backed off (`DispatchRetryBackoff` to `DispatchRetryBackoffMax`) by one that fails | No — its firing is a dispatch evaluation, which dispatches, spawns or restores for, or ends (a stop's flag, a personal-link refusal or a spawn refused on policy, each queueing nothing), only a turn already pending, or re-sends one in flight: turns the snapshot already reads `queued` or `running`. It inserts no turn, and from a settled snapshot it deletes itself; after a trigger that succeeded it is already gone |
-| `review_retrigger_debounce` timer (§24) | the `pull_request`/`synchronize` webhook, on every push to a PR with a review session, opted in or not — never the review session's own, since a review session never pushes (next row); re-armed by its own firing while it holds (§24.9, `ReviewRetriggerHoldBackstop` out), and, once held, moved to now, never inserted, by the transaction of every turn's end | timer pump → session actor, `ReviewRetriggerDebounce` (2 min) after the last push, or at once after the end of the turn that held it | **Yes** — inserts a review turn with no further input when the repository opted in, the head moved, the budget allows and no turn of the session is open; while one is open it holds, re-arming itself with the pushed head kept; otherwise declines and deletes itself |
+| `review_retrigger_debounce` timer (§24) | the `pull_request`/`synchronize` webhook, on every push to a PR with a review session, opted in or not — never the review session's own, since a review session never pushes (next row); re-armed by its own firing while it holds (§24.9, `ReviewRetriggerHoldBackstop` out), and, once held, moved to now, never inserted, by the transaction of every turn's end; inserted due at once, only when none is armed, by the dispatch that ends a queued automatic attempt `context_moved` (§24.9) | timer pump → session actor, `ReviewRetriggerDebounce` (2 min) after the last push, or at once after the end of the turn that held it or of an attempt whose context moved | **Yes** — inserts a review turn with no further input when the repository opted in, the head moved, the budget allows and no turn of the session is open; while one is open it holds, re-arming itself with the pushed head kept; otherwise declines and deletes itself |
 | A PR review session's completed turn | — | — | No — a review session never pushes: `completeProcessingTurn` sends it no push command and starts no delivery, so its turn's end leaves nothing for the code host to echo back |
 | Release manifest check (§15) | a new review session on a release PR (`release_manifest_pending`, enqueued by the webhook) | `releasereview.Worker`, every `ReleaseManifestCheckPumpInterval` | **Yes** — when the aggregate review triggers, inserts the composition review turn on that same session |
 | A workflow's next step (§25) | a step's turn ending, or `/decide` | the same transaction | No gap — inserted in the transaction that ends the previous step's turn |
@@ -9112,7 +9163,13 @@ revocation of only the session's clone URL (a fork's name, parsed in Go). Leavin
 `scheduled`, never toward settled: a false settled needs a copied rule stricter than the fire's own, or
 one that drifts from it, and `TestSessionStatus_ReReviewFireAndStatusAgree` runs the real fire and the
 status over one table of opt-ins, counts around the budget and revocations and asserts they agree on
-every row. A work-creating timer counts while it is armed; its handler deletes it in the transaction that inserts
+every row. When the automatic re-review gives up on a pull request whose queued attempts keep meeting a
+moved context (§24.9), the dispatch that ends the last of them deletes the debounce in the same
+transaction, so nothing is scheduled and the session can read `finished`, settled; the status then
+carries `reviewRetriggerDropped` (the head given up on, when, and the open-enum reason
+`context_moved_bound`), read in the same lateral as `review_retrigger_can_fire`, so a client tells an
+automatic re-review that stopped from one never owed. It is absent otherwise, a plain read unchanged
+byte for byte, and the next push clears it. A work-creating timer counts while it is armed; its handler deletes it in the transaction that inserts
 the turn, or declines, or holds and re-arms it (§24.9: a turn of the session is open, which the same
 snapshot reads `queued` or `running`, and that turn's end moves the debounce to now in its own
 transaction), so no snapshot holds neither. A handler that keeps failing leaves it armed,
@@ -9236,11 +9293,13 @@ a turn is also queued or a delivery under way, and an escalation no longer once 
 since it escalated), the escalation still open whatever that order names first (`escalation`: the same
 facts-row run, so a client that needs the escalation itself — one open beside a plan or a step is not
 in `awaiting` — reads it here; contracts 1.16.0), how the newest terminal
-turn ended (`lastRun`), the sandbox status in the same snapshot
+turn ended (`lastRun`; a turn that ended `context_moved` without ever running is no run and is left
+aside, as it is by the newest turn below, §24.9), whether the automatic re-review of the session's pull
+request gave up (`reviewRetriggerDropped`, optional; contracts 1.23.0), the sandbox status in the same snapshot
 (informational; `activity` never derives from it), whether the session is archived, and `observedAt`,
 the database's clock at the snapshot. A turn row has no failure-reason column, so `lastRun.failureReason`
 is the session's recorded reason, given only when it can describe nothing else: the last run is the
-newest turn, did not complete, and the session's recorded outcome is that run's; otherwise `null`.
+newest turn that counts, did not complete, and the session's recorded outcome is that run's; otherwise `null`.
 
 **The web's run view reads the escalation here.** The session's workflow-run view
 (`WorkflowRunsView`) features the newest live run — one still `running`, or the run `escalation`
