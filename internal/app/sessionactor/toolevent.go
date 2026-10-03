@@ -157,8 +157,11 @@ func (a *Actor) appendCorrelatedEvent(ctx context.Context, tx pgx.Tx, cmd Sandbo
 // A `sub_task_start` is stored however late, as a `sub_task_finish` is: a
 // timed-out turn's late review verdict is accepted (PostReviewVerdict), and
 // the counter-review and fact-check corroboration of technical plan §26.4
-// reads that turn's sub-task starts from its dispatched_event_id up, a late
-// one included. A finish stored without its start reads as uncorroborated.
+// reads that turn's sub-task starts from its dispatched_event_id up to the
+// next dispatched turn's, so a late start counts while no later turn has
+// been dispatched; one stored after that lies past the bound, as it does on
+// a control plane that never gated it. A finish stored without its start
+// reads as uncorroborated.
 // The page reads a late one into the turn that ended, and opens no turn at
 // it (web/src/session/timelineModel.ts).
 func storedOnlyWhileATurnIsProcessing(eventType string) bool {
