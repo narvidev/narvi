@@ -49,6 +49,21 @@ func toolCallRaw(t *testing.T, sessionID string, gen int, messageID, callID stri
 	return raw
 }
 
+// toolCallEvent is a tool_call of assistant message messageID as wshub
+// delivers it: toolCallRaw's payload, and the callId the envelope peeks.
+func toolCallEvent(t *testing.T, sessionID string, gen int, messageID, callID string) SandboxEvent {
+	t.Helper()
+	return SandboxEvent{Type: "tool_call", Gen: gen, MessageID: messageID, CallID: callID, Raw: toolCallRaw(t, sessionID, gen, messageID, callID)}
+}
+
+// startMessage sends messageID's step_start, which a real turn sends
+// before any other event of the message, and which a tool_call of it needs
+// stored to be stored itself (toolevent.go).
+func startMessage(ctx context.Context, t *testing.T, a *Actor, sessionID, messageID string) {
+	t.Helper()
+	sendSandboxEventForTest(ctx, t, a, messageEventForTest(t, sessionID, "step_start", messageID, "prt_start_"+messageID))
+}
+
 // claimLinearAgentSessionForTest claims and attaches agentSessionID/
 // organizationID to sessionID -- mirrors
 // TestCompleteProcessingTurn_LinearOrigin_EnqueuesExactlyOneLinearOutboxRow's
@@ -94,12 +109,8 @@ func TestMaybeEnqueueLinearProgress_LinearOrigin_FirstToolCall_EnqueuesExactlyOn
 		t.Fatalf("GetOrSpawn: %v", err)
 	}
 
-	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
-		Type:      "tool_call",
-		Gen:       1,
-		MessageID: "toolcall-1",
-		Raw:       toolCallRaw(t, sessionID.String(), 1, "toolcall-1", "call-1"),
-	})
+	startMessage(ctx, t, a, sessionID.String(), "toolcall-1")
+	sendSandboxEventForTest(ctx, t, a, toolCallEvent(t, sessionID.String(), 1, "toolcall-1", "call-1"))
 
 	row := getSoleOutboxRowForSession(ctx, t, pool, sessionID)
 	if row.Kind != string(ports.NotificationKindLinearProgress) {
@@ -127,9 +138,9 @@ func TestMaybeEnqueueLinearProgress_LinearOrigin_FirstToolCall_EnqueuesExactlyOn
 // TestMaybeEnqueueLinearProgress_ResentDuplicateToolCall_DoesNotEnqueueSecondRow
 // proves guard (1) from progressnotify.go's own doc comment: a wire-level
 // redelivery of the SAME already-processed tool_call (identical
-// MessageID) is deduped by appendRawEvent's own upsert-on-messageId
-// (Inserted false), so it must never enqueue a second progress
-// notification.
+// MessageID and callId) is deduped by appendRawEvent's own upsert on the
+// key the callId derives (Inserted false), so it must never enqueue a
+// second progress notification.
 func TestMaybeEnqueueLinearProgress_ResentDuplicateToolCall_DoesNotEnqueueSecondRow(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -153,13 +164,14 @@ func TestMaybeEnqueueLinearProgress_ResentDuplicateToolCall_DoesNotEnqueueSecond
 		t.Fatalf("GetOrSpawn: %v", err)
 	}
 
-	raw := toolCallRaw(t, sessionID.String(), 1, "toolcall-1", "call-1")
+	startMessage(ctx, t, a, sessionID.String(), "toolcall-1")
+	call := toolCallEvent(t, sessionID.String(), 1, "toolcall-1", "call-1")
 	// First delivery: enqueues exactly one row.
-	sendSandboxEventForTest(ctx, t, a, SandboxEvent{Type: "tool_call", Gen: 1, MessageID: "toolcall-1", Raw: raw})
-	// Second delivery: the EXACT same MessageID/Raw, simulating the
+	sendSandboxEventForTest(ctx, t, a, call)
+	// Second delivery: the EXACT same MessageID/CallID/Raw, simulating the
 	// sandbox's own buffer/resend-on-reconnect protocol (§6.1) redelivering
 	// an event this session actor already processed.
-	sendSandboxEventForTest(ctx, t, a, SandboxEvent{Type: "tool_call", Gen: 1, MessageID: "toolcall-1", Raw: raw})
+	sendSandboxEventForTest(ctx, t, a, call)
 
 	if n := countOutboxRowsForSession(ctx, t, pool, sessionID); n != 1 {
 		t.Errorf("outbox row count after a resent duplicate tool_call = %d, want exactly 1", n)
@@ -194,16 +206,12 @@ func TestMaybeEnqueueLinearProgress_SecondDistinctToolCallSameTurn_DoesNotEnqueu
 		t.Fatalf("GetOrSpawn: %v", err)
 	}
 
-	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
-		Type: "tool_call", Gen: 1, MessageID: "toolcall-1",
-		Raw: toolCallRaw(t, sessionID.String(), 1, "toolcall-1", "call-1"),
-	})
+	startMessage(ctx, t, a, sessionID.String(), "toolcall-1")
+	sendSandboxEventForTest(ctx, t, a, toolCallEvent(t, sessionID.String(), 1, "toolcall-1", "call-1"))
 	// A second, distinct tool_call -- different MessageID/CallId entirely,
 	// a genuinely new insert into the events table, NOT a resend.
-	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
-		Type: "tool_call", Gen: 1, MessageID: "toolcall-2",
-		Raw: toolCallRaw(t, sessionID.String(), 1, "toolcall-2", "call-2"),
-	})
+	startMessage(ctx, t, a, sessionID.String(), "toolcall-2")
+	sendSandboxEventForTest(ctx, t, a, toolCallEvent(t, sessionID.String(), 1, "toolcall-2", "call-2"))
 
 	if n := countOutboxRowsForSession(ctx, t, pool, sessionID); n != 1 {
 		t.Errorf("outbox row count after a second, distinct tool_call in the same turn = %d, want exactly 1", n)
@@ -239,10 +247,8 @@ func TestMaybeEnqueueLinearProgress_SlackOrigin_ToolCall_EnqueuesNothing(t *test
 		t.Fatalf("GetOrSpawn: %v", err)
 	}
 
-	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
-		Type: "tool_call", Gen: 1, MessageID: "toolcall-1",
-		Raw: toolCallRaw(t, sessionID.String(), 1, "toolcall-1", "call-1"),
-	})
+	startMessage(ctx, t, a, sessionID.String(), "toolcall-1")
+	sendSandboxEventForTest(ctx, t, a, toolCallEvent(t, sessionID.String(), 1, "toolcall-1", "call-1"))
 
 	if n := countOutboxRowsForSession(ctx, t, pool, sessionID); n != 0 {
 		t.Errorf("outbox row count for slack-origin session's tool_call = %d, want 0", n)
@@ -282,10 +288,8 @@ func TestMaybeEnqueueLinearProgress_GitHubOrigin_ToolCall_EnqueuesNothing(t *tes
 		t.Fatalf("GetOrSpawn: %v", err)
 	}
 
-	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
-		Type: "tool_call", Gen: 1, MessageID: "toolcall-1",
-		Raw: toolCallRaw(t, sessionID.String(), 1, "toolcall-1", "call-1"),
-	})
+	startMessage(ctx, t, a, sessionID.String(), "toolcall-1")
+	sendSandboxEventForTest(ctx, t, a, toolCallEvent(t, sessionID.String(), 1, "toolcall-1", "call-1"))
 
 	if n := countOutboxRowsForSession(ctx, t, pool, sessionID); n != 0 {
 		t.Errorf("outbox row count for github-origin session's tool_call = %d, want 0", n)

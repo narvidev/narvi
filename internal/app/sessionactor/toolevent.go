@@ -55,20 +55,35 @@ import (
 // on its first reconnect after this file shipped it replays tool events the
 // first-wins rule swallowed, of turns long over.
 //
-// The rule, read inside the actor's transaction:
+// The rule, read inside the actor's transaction, anchors each of the three
+// on its message's `step_start`, the first event of the message, stored
+// under its bare id:
 //   - no turn Processing: no row.
-//   - the event's message already has a row under its bare id -- its
-//     `step_start`, the first event of the message -- at or below the
-//     Processing turn's dispatched_event_id: the message entered the log
-//     before this turn existed, so it is an earlier turn's. No row.
+//   - no row of the message under its bare id: no row. The message's
+//     `step_start` was never stored, so nothing places the message in a
+//     turn.
+//   - that row at or below the Processing turn's dispatched_event_id: the
+//     message entered the log before this turn existed, so it is an
+//     earlier turn's. No row.
 //   - otherwise the row is added (or, under a key already stored, deduped):
-//     the message's `step_start` lies in this turn's window, or no row of
-//     the message is stored yet and a turn is Processing.
+//     the message's `step_start` lies in this turn's window. A NULL
+//     dispatched_event_id places no window, as for `token`, and any stored
+//     `step_start` anchors the message.
 //
-// A late event whose message has no row at all cannot be placed, as a
-// `token` part none of whose frames was stored cannot: it is stored in the
-// window of whichever turn is Processing when it arrives. A NULL
-// dispatched_event_id places no window, as for `token`.
+// The anchor is what keeps a message the agent of an ended turn began
+// after that turn ended out of the next turn's window: turn_deadline ends a
+// turn without stopping its agent, and that message's `step_start`, sent
+// while no turn is Processing, is stored nowhere
+// (storedOnlyWhileATurnIsProcessing), so without the anchor its later tool
+// calls, results and step end landed in the window of the turn dispatched
+// next. The cost is a message whose
+// `step_start` was lost -- none of the four is critical, and the
+// sandbox-agent evicts best-effort events from its replay buffer when it
+// is full -- which then stores none of its tool calls, results or step
+// end. A `step_start` is a few short ids, which the sandbox-agent never
+// cuts (it cuts only a `token`, a `tool_call` or a `tool_result`). The
+// step's cost still reaches turns.cost_usd (stepcost.go), which reads the
+// event and not its row.
 //
 // History stored before this file is not backfilled: those payloads were
 // never kept. A sandbox alive at the deploy replays its buffered events on
@@ -94,9 +109,9 @@ func messageFromEarlierTurn(messageRowID int64, dispatchedEventID *int64) bool {
 // the branch of handleSandboxEvent's "persist ALWAYS" step for the three
 // types keyed by their correlator. Returns whether a row was inserted (and
 // so queued for broadcast), exactly like appendRawEvent: false for a
-// deduped resend, and for an event that arrives with no turn Processing or
-// whose message belongs to an earlier turn (see "Only while its turn is
-// live" above).
+// deduped resend, and for an event that arrives with no turn Processing,
+// whose message has no stored `step_start`, or whose message belongs to an
+// earlier turn (see "Only while its turn is live" above).
 func (a *Actor) appendCorrelatedEvent(ctx context.Context, tx pgx.Tx, cmd SandboxEvent) (bool, error) {
 	processing, err := a.stores.turn.WithTx(tx).GetProcessingTurnForSession(ctx, a.sessionID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -112,7 +127,12 @@ func (a *Actor) appendCorrelatedEvent(ctx context.Context, tx pgx.Tx, cmd Sandbo
 	if err != nil {
 		return false, fmt.Errorf("sessionactor: read the stored row of %s's message: %w", cmd.Type, err)
 	}
-	if found && messageFromEarlierTurn(messageRowID, processing.DispatchedEventID) {
+	if !found {
+		a.logger.Debug("sessionactor: tool or step event of a message with no stored step_start; adding no row",
+			"event_type", cmd.Type, "message_id", cmd.MessageID, "turn_id", processing.ID.String())
+		return false, nil
+	}
+	if messageFromEarlierTurn(messageRowID, processing.DispatchedEventID) {
 		a.logger.Debug("sessionactor: tool or step event of a message from an earlier turn; adding no row",
 			"event_type", cmd.Type, "message_id", cmd.MessageID, "message_row_id", messageRowID,
 			"turn_id", processing.ID.String())
@@ -121,27 +141,34 @@ func (a *Actor) appendCorrelatedEvent(ctx context.Context, tx pgx.Tx, cmd Sandbo
 	return a.appendRawEvent(ctx, tx, cmd.Type, eventkey.StorageKey(cmd.Type, cmd.MessageID, cmd.CallID, cmd.StepID), cmd.Raw)
 }
 
-// storedOnlyWhileATurnIsProcessing reports whether eventType is one of the
-// two other turn-scoped types the page opens a turn at that the agent can
-// still send after the control plane has ended its turn: a `step_start` and
-// a `sub_task_start`. turn_deadline ends a turn without stopping its agent,
-// which can work on and send both, and the page, which ends the turn it is
-// showing at the turn's synthetic execution_complete, opened a turn of its
-// own at each -- one that never ended, its calls running and its composer
-// locked. Neither is ever sent while no turn is Processing but late, so
-// with no turn Processing neither adds a row, as `token` frames and the
-// three correlated types do not (appendLiveTurnEvent). A sub_task_finish,
-// critical and acked, is still stored, and the page reads a late one into
-// the lane of the turn that ended without opening a turn
-// (web/src/session/timelineModel.ts).
+// storedOnlyWhileATurnIsProcessing reports whether eventType is the one
+// other turn-scoped type the page opens a turn at that the agent can still
+// send after the control plane has ended its turn: a `step_start`.
+// turn_deadline ends a turn without stopping its agent, which can begin a
+// new message and send its `step_start`, and the page, which ends the turn
+// it is showing at the turn's synthetic execution_complete, opened a turn
+// of its own at it -- one that never ended, its calls running and its
+// composer locked. A `step_start` is never sent while no turn is Processing
+// but late, so with no turn Processing it adds no row, as `token` frames
+// and the three correlated types do not (appendLiveTurnEvent), and the
+// rest of its message, anchored on it, adds none either
+// (appendCorrelatedEvent).
+//
+// A `sub_task_start` is stored however late, as a `sub_task_finish` is: a
+// timed-out turn's late review verdict is accepted (PostReviewVerdict), and
+// the counter-review and fact-check corroboration of technical plan §26.4
+// reads that turn's sub-task starts from its dispatched_event_id up, a late
+// one included. A finish stored without its start reads as uncorroborated.
+// The page reads a late one into the turn that ended, and opens no turn at
+// it (web/src/session/timelineModel.ts).
 func storedOnlyWhileATurnIsProcessing(eventType string) bool {
-	return eventType == "step_start" || eventType == "sub_task_start"
+	return eventType == "step_start"
 }
 
-// appendLiveTurnEvent stores one inbound `step_start` or `sub_task_start`
-// inside tx under its wire messageId, as every other type is stored, but
-// only while a turn is Processing (storedOnlyWhileATurnIsProcessing).
-// Returns whether a row was inserted, exactly like appendRawEvent.
+// appendLiveTurnEvent stores one inbound `step_start` inside tx under its
+// wire messageId, as every other type is stored, but only while a turn is
+// Processing (storedOnlyWhileATurnIsProcessing). Returns whether a row was
+// inserted, exactly like appendRawEvent.
 func (a *Actor) appendLiveTurnEvent(ctx context.Context, tx pgx.Tx, cmd SandboxEvent) (bool, error) {
 	if _, err := a.stores.turn.WithTx(tx).GetProcessingTurnForSession(ctx, a.sessionID); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

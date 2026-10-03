@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -174,8 +175,8 @@ func TestToolEvent_ProductionShape_EachStoredOnceUnderItsKey(t *testing.T) {
 // new, running turn. A tool_call, tool_result or step_finish of a message
 // from an ended turn adds no row and broadcasts nothing, whether no turn
 // is Processing or a later one is; the later turn's own message is stored;
-// and a message none of whose events is stored yet is stored while a turn
-// is Processing.
+// and a tool_call of a message whose step_start was never stored adds no
+// row either: nothing places it in the Processing turn.
 func TestToolEvent_ReplayedAfterItsTurn_AddsNoRow(t *testing.T) {
 	for _, nextTurnProcessing := range []bool{false, true} {
 		name := "no turn Processing during the replay"
@@ -242,8 +243,8 @@ func TestToolEvent_ReplayedAfterItsTurn_AddsNoRow(t *testing.T) {
 				return
 			}
 			// The next turn's own message is stored and broadcast, in its
-			// window: one whose step_start lies above its watermark, and one
-			// none of whose events was stored before its tool call.
+			// window, its step_start above its watermark; a tool call of a
+			// message none of whose events was stored before it is not.
 			for _, cmd := range oneMessageForTest(t, sid, "msg_3") {
 				sendSandboxEventForTest(ctx, t, a, cmd)
 			}
@@ -259,7 +260,6 @@ func TestToolEvent_ReplayedAfterItsTurn_AddsNoRow(t *testing.T) {
 				"tool_call msg_3#tool_call:call_msg_3",
 				"tool_result msg_3#tool_result:call_msg_3",
 				"step_finish msg_3#step_finish:prt_finish_msg_3",
-				"tool_call msg_4#tool_call:call_msg_4",
 			}
 			if strings.Join(inWindow, "|") != strings.Join(want, "|") {
 				t.Errorf("rows in the next turn's window = %q, want %q", inWindow, want)
@@ -271,13 +271,74 @@ func TestToolEvent_ReplayedAfterItsTurn_AddsNoRow(t *testing.T) {
 	}
 }
 
-// TestLateStepAndSubTaskStart_NoTurnProcessing_AddNoRow: turn_deadline ends
-// a turn without stopping its agent, which can go on sending a step_start
-// or a sub_task_start; stored once no turn is Processing, each opened a turn
-// on the page that nothing ended. Neither adds a row then, and both are
-// stored while a turn is Processing; a sub_task_finish, critical, is still
-// stored late.
-func TestLateStepAndSubTaskStart_NoTurnProcessing_AddNoRow(t *testing.T) {
+// TestToolEvent_MessageWithNoStoredStepStart_AddsNoRow: a tool_call,
+// tool_result or step_finish whose message has no stored step_start adds
+// no row and broadcasts nothing while a turn is Processing, whether that
+// turn places a window or not (a NULL dispatched_event_id); a message whose
+// step_start is stored has its tool call stored.
+func TestToolEvent_MessageWithNoStoredStepStart_AddsNoRow(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		stamped bool
+	}{
+		{name: "the turn places a window", stamped: true},
+		{name: "the turn places no window", stamped: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			sessionID := createTestSession(ctx, t, pool)
+			sid := sessionID.String()
+			if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+				t.Fatalf("create sandbox: %v", err)
+			}
+			if tc.stamped {
+				createDispatchedProcessingTurn(ctx, t, pool, sessionID)
+			} else {
+				createProcessingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID)
+			}
+			fb := &fakeBroadcaster{}
+			r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), fb, nil, nil, "", nil, nil, "", nil, false)
+			if err != nil {
+				t.Fatalf("NewRegistry: %v", err)
+			}
+			t.Cleanup(func() { _ = r.Shutdown() })
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+
+			for _, cmd := range oneMessageForTest(t, sid, "msg_x")[1:] {
+				if outcome := sendSandboxEventForTest(ctx, t, a, cmd); !outcome.Persisted {
+					t.Fatalf("%s: outcome %+v, want Persisted (handled, gen current)", cmd.Type, outcome)
+				}
+			}
+			if got := storedKeys(ctx, t, pool, sessionID, toolEventTypes...); len(got) != 0 {
+				t.Fatalf("with no step_start of its message stored, stored %q, want nothing", got)
+			}
+			if len(fb.calls) != 0 {
+				t.Fatalf("broadcast %d events, want none", len(fb.calls))
+			}
+
+			message := oneMessageForTest(t, sid, "msg_y")
+			sendSandboxEventForTest(ctx, t, a, message[0])
+			sendSandboxEventForTest(ctx, t, a, message[1])
+			want := []string{"step_start msg_y", "tool_call msg_y#tool_call:call_msg_y"}
+			if got := storedKeys(ctx, t, pool, sessionID, toolEventTypes...); strings.Join(got, "|") != strings.Join(want, "|") {
+				t.Fatalf("stored %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// TestLateStepStart_NoTurnProcessing_AddsNoRow: turn_deadline ends a turn
+// without stopping its agent, which can go on sending a step_start or a
+// sub_task_start. A step_start stored once no turn is Processing opened a
+// turn on the page that nothing ended: it adds no row then, and is stored
+// while a turn is Processing. A sub_task_start is stored either way, as a
+// late sub_task_finish, critical, is: §26.4's corroboration of a timed-out
+// turn's late verdict reads both.
+func TestLateStepStart_NoTurnProcessing_AddsNoRow(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
 	sessionID := createTestSession(ctx, t, pool)
@@ -311,24 +372,113 @@ func TestLateStepAndSubTaskStart_NoTurnProcessing_AddNoRow(t *testing.T) {
 		return SandboxEvent{Type: "sub_task_finish", Gen: 1, MessageID: id,
 			Raw: raw(sandboxws.SubTaskFinish{Type: "sub_task_finish", MessageId: id, SessionId: sid, Gen: 1, AckId: "sub_task_finish:" + id, SubTaskId: "ses_x", Outcome: sandboxws.SubTaskFinishOutcomeCancelled})}
 	}
+	types := []string{"step_start", "sub_task_start", "sub_task_finish"}
 
-	// No turn Processing: a late step_start and sub_task_start add no row;
-	// a late sub_task_finish is stored, and acked.
+	// No turn Processing: a late step_start adds no row; a late
+	// sub_task_start and sub_task_finish are stored, the finish acked.
 	sendSandboxEventForTest(ctx, t, a, messageEventForTest(t, sid, "step_start", "msg_late", "prt_late"))
-	sendSandboxEventForTest(ctx, t, a, subStart("sst_late"))
+	if outcome := sendSandboxEventForTest(ctx, t, a, subStart("sst_late")); !outcome.Persisted {
+		t.Fatalf("late sub_task_start outcome %+v, want Persisted", outcome)
+	}
 	if outcome := sendSandboxEventForTest(ctx, t, a, subFinish("ssf_late")); outcome.AckID != "sub_task_finish:ssf_late" {
 		t.Fatalf("late sub_task_finish outcome %+v, want it acked", outcome)
 	}
-	if got := storedKeys(ctx, t, pool, sessionID, "step_start", "sub_task_start", "sub_task_finish"); strings.Join(got, "|") != "sub_task_finish ssf_late" {
-		t.Fatalf("with no turn processing, stored %q, want the sub_task_finish alone", got)
+	late := []string{"sub_task_start sst_late", "sub_task_finish ssf_late"}
+	if got := storedKeys(ctx, t, pool, sessionID, types...); strings.Join(got, "|") != strings.Join(late, "|") {
+		t.Fatalf("with no turn processing, stored %q, want %q", got, late)
 	}
 
-	// A turn Processing: both are stored as before.
+	// A turn Processing: both starts are stored.
 	createDispatchedProcessingTurn(ctx, t, pool, sessionID)
 	sendSandboxEventForTest(ctx, t, a, messageEventForTest(t, sid, "step_start", "msg_1", "prt_1"))
 	sendSandboxEventForTest(ctx, t, a, subStart("sst_1"))
-	want := []string{"sub_task_finish ssf_late", "step_start msg_1", "sub_task_start sst_1"}
-	if got := storedKeys(ctx, t, pool, sessionID, "step_start", "sub_task_start", "sub_task_finish"); strings.Join(got, "|") != strings.Join(want, "|") {
+	want := []string{"sub_task_start sst_late", "sub_task_finish ssf_late", "step_start msg_1", "sub_task_start sst_1"}
+	if got := storedKeys(ctx, t, pool, sessionID, types...); strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("with a turn processing, stored %q, want %q", got, want)
+	}
+}
+
+// TestToolEvent_MessageBegunWhileNoTurnProcessing_AddsNoRowInTheNextTurn:
+// turn_deadline fails a turn without stopping its agent, which can begin a
+// message before the next turn is dispatched. Its step_start adds no row,
+// no turn being Processing, and its tool call, result and step end, sent
+// once the next turn is Processing, add none either: no stored step_start
+// places the message in that turn's window. Stored there, they were drawn
+// in the next turn and counted in its cost. The next turn's own message is
+// stored.
+func TestToolEvent_MessageBegunWhileNoTurnProcessing_AddsNoRowInTheNextTurn(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+	sid := sessionID.String()
+	if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	timeouts := platform.DefaultTimeouts()
+	timeouts.TurnDeadline = 50 * time.Millisecond // tiny, injected -- not the real 60m default
+	fb := &fakeBroadcaster{}
+	r, err := NewRegistry(ctx, pool, timeouts, fb, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	turns := narvipg.NewTurnStore(pool)
+
+	// Turn A runs a message, then its deadline passes.
+	turnA := createDispatchedProcessingTurn(ctx, t, pool, sessionID)
+	for _, cmd := range oneMessageForTest(t, sid, "msg_a") {
+		sendSandboxEventForTest(ctx, t, a, cmd)
+	}
+	if _, err := turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		ID:           turnA.ID,
+		Status:       sqlcgen.TurnStatusProcessing,
+		DispatchedAt: pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true},
+	}); err != nil {
+		t.Fatalf("age turn A's dispatched_at: %v", err)
+	}
+	if err := a.Send(ctx, TimerFired{Name: TimerTurnDeadline}); err != nil {
+		t.Fatalf("Send TimerFired turn_deadline: %v", err)
+	}
+	waitUntil(t, 5*time.Second, func() bool {
+		got, err := turns.Get(ctx, turnA.ID)
+		return err == nil && got.Status == sqlcgen.TurnStatusFailed
+	})
+
+	// A's agent begins a message in the gap; turn B is dispatched; the
+	// message goes on, and B's own message follows.
+	gap := oneMessageForTest(t, sid, "msg_m")
+	sendSandboxEventForTest(ctx, t, a, gap[0])
+	turnB := createDispatchedProcessingTurn(ctx, t, pool, sessionID)
+	broadcastsBefore := len(fb.calls)
+	for _, cmd := range gap[1:] {
+		if outcome := sendSandboxEventForTest(ctx, t, a, cmd); !outcome.Persisted {
+			t.Fatalf("%s of the gap message: outcome %+v, want Persisted (handled, gen current)", cmd.Type, outcome)
+		}
+	}
+	for _, cmd := range oneMessageForTest(t, sid, "msg_b") {
+		sendSandboxEventForTest(ctx, t, a, cmd)
+	}
+
+	var inWindow []string
+	for _, row := range listEventRows(ctx, t, pool, sessionID) {
+		if row.id > *turnB.DispatchedEventID {
+			inWindow = append(inWindow, row.eventType+" "+row.storageKey)
+		}
+	}
+	want := []string{
+		"step_start msg_b",
+		"tool_call msg_b#tool_call:call_msg_b",
+		"tool_result msg_b#tool_result:call_msg_b",
+		"step_finish msg_b#step_finish:prt_finish_msg_b",
+	}
+	if strings.Join(inWindow, "|") != strings.Join(want, "|") {
+		t.Errorf("rows in turn B's window = %q, want B's own message alone %q", inWindow, want)
+	}
+	if got := len(fb.calls) - broadcastsBefore; got != len(want) {
+		t.Errorf("broadcasts once B was Processing = %d, want %d (B's own events)", got, len(want))
 	}
 }

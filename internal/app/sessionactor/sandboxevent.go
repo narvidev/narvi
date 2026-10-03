@@ -382,10 +382,11 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// gets its own storage key (tokenframe.go). A `tool_call`,
 		// `tool_result` or `step_finish` carries its enclosing message's id,
 		// which that message's `step_start` stores first, so each is stored
-		// under a key derived from its callId or stepId (toolevent.go). All
-		// four are stored only while their turn is Processing, and so are a
-		// `step_start` and a `sub_task_start`, under their wire messageId
-		// (toolevent.go, appendLiveTurnEvent).
+		// under a key derived from its callId or stepId (toolevent.go), and
+		// only when that `step_start` is stored in the Processing turn's
+		// window. All four are stored only while their turn is Processing,
+		// and so is a `step_start`, under its wire messageId (toolevent.go,
+		// appendLiveTurnEvent).
 		var inserted bool
 		switch {
 		case cmd.Type == "token":
