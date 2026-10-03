@@ -31,6 +31,12 @@
 
 package plan
 
+import (
+	"sort"
+
+	"github.com/narvidev/narvi/internal/domain/framecut"
+)
+
 // ContentFallbackText is the fixed, honest placeholder ExtractContent
 // returns when no token event could be recovered inside the requested
 // window -- shared by every caller (the Slack/Linear cross-channel
@@ -60,11 +66,26 @@ const ContentFallbackText = "(plan content unavailable -- see the session's own 
 // per-frame suffix on every stored frame of a part but its first
 // (internal/app/sessionactor/tokenframe.go). Empty for every other event
 // type.
+//
+// Cut is the frame's `cut` property (framecut.DecodeCut), nil for a whole
+// frame and for every other event type: a frame the sandbox-agent cut on
+// its way to the control plane records it there, and this package learns a
+// cut only from it, never from the text (technical plan §6.1).
 type ContentEvent struct {
 	ID        int64
 	Type      string
 	MessageID string
 	Text      string
+	Cut       *framecut.Cut
+}
+
+// Final is a turn's final text as FinalText reads it: the text, and the
+// cut its frame records when the part's text is a cut frame (nil when it
+// is whole). A surface states the cut from Cut, never from the text, which
+// it may shorten for display.
+type Final struct {
+	Text string
+	Cut  *framecut.Cut
 }
 
 // ExtractContent recovers the final, rendered assistant text of ONE
@@ -72,13 +93,14 @@ type ContentEvent struct {
 // ContentFallbackText when FinalText finds none. See FinalText for the
 // window, the bounds, and which text is the turn's final one.
 //
-// Never fails: finding nothing in-window returns ContentFallbackText,
-// exactly like the original best-effort extraction this generalizes.
-func ExtractContent(events []ContentEvent, lowerBoundEventID, upperBoundEventID *int64) string {
-	if text, ok := FinalText(events, lowerBoundEventID, upperBoundEventID); ok {
-		return text
+// Never fails: finding nothing in-window returns ContentFallbackText, with
+// no cut, exactly like the original best-effort extraction this
+// generalizes.
+func ExtractContent(events []ContentEvent, lowerBoundEventID, upperBoundEventID *int64) Final {
+	if final, ok := FinalText(events, lowerBoundEventID, upperBoundEventID); ok {
+		return final
 	}
-	return ContentFallbackText
+	return Final{Text: ContentFallbackText}
 }
 
 // FinalText recovers the final, rendered assistant text of ONE turn's
@@ -117,9 +139,15 @@ func ExtractContent(events []ContentEvent, lowerBoundEventID, upperBoundEventID 
 //
 // Within the window, the text is the turn's LAST text part: the part
 // whose first in-window frame is newest, among the parts with at least one
-// non-empty frame there, read as its newest non-empty frame (§6.1: token
-// text is cumulative per messageId, so that frame is the part's full text
-// so far). A part is ordered by its FIRST frame, not its newest, because a
+// non-empty frame there, read as framecut.PartText reads its non-empty
+// frames: the newest that yields to no other (§6.1: token text is
+// cumulative per messageId, so with no cut that is the newest non-empty
+// frame, the part's full text so far). A cut frame yields to the whole text
+// it was taken from, and to a cut of that text keeping more, whatever order
+// they were stored in, so a part stored whole and then cut reads whole; a
+// part whose text is a cut frame reads as that frame, its marker included,
+// and Final.Cut reports the cut. A part is ordered by its FIRST frame, not
+// its newest, because a
 // part's later frame is not always stored right behind it: the turn
 // running when the control plane is deployed onto per-frame storage gets
 // its parts' later frames back from the sandbox's replay, stored at the
@@ -139,15 +167,17 @@ func ExtractContent(events []ContentEvent, lowerBoundEventID, upperBoundEventID 
 // cross-channel notifiers) and a session's result summary (row 182,
 // technical plan §43.20) both read through it, so the two can never
 // disagree about which text a turn ended on. ok is false when no text part
-// in the window has any text; text is then "", and the caller says so its
-// own way (ExtractContent with ContentFallbackText, the result with a null
-// summary). Never fails.
-func FinalText(events []ContentEvent, lowerBoundEventID, upperBoundEventID *int64) (text string, ok bool) {
+// in the window has any text; the Final is then empty, and the caller says
+// so its own way (ExtractContent with ContentFallbackText, the result with
+// a null summary). Never fails.
+func FinalText(events []ContentEvent, lowerBoundEventID, upperBoundEventID *int64) (Final, bool) {
+	type frame struct {
+		id    int64
+		frame framecut.Frame
+	}
 	type textPart struct {
-		firstID  int64 // its oldest in-window frame, empty or not
-		hasText  bool  // whether any in-window frame of it is non-empty
-		newestID int64 // its newest in-window non-empty frame, once hasText
-		text     string
+		firstID int64   // its oldest in-window frame, empty or not
+		frames  []frame // its non-empty in-window frames, in scan order
 	}
 	var parts []*textPart // in scan order, so the pick below is deterministic
 	byMessageID := make(map[string]*textPart)
@@ -168,19 +198,30 @@ func FinalText(events []ContentEvent, lowerBoundEventID, upperBoundEventID *int6
 			parts = append(parts, p)
 		}
 		p.firstID = min(p.firstID, e.ID)
-		if e.Text != "" && (!p.hasText || e.ID > p.newestID) {
-			p.hasText, p.newestID, p.text = true, e.ID, e.Text
+		if e.Text != "" {
+			p.frames = append(p.frames, frame{id: e.ID, frame: framecut.Frame{Text: e.Text, Cut: e.Cut}})
 		}
 	}
 
 	var last *textPart
 	for _, p := range parts {
-		if p.hasText && (last == nil || p.firstID > last.firstID) {
+		if len(p.frames) > 0 && (last == nil || p.firstID > last.firstID) {
 			last = p
 		}
 	}
 	if last == nil {
-		return "", false
+		return Final{}, false
 	}
-	return last.text, true
+	// framecut.PartText takes the frames in id order; callers supply the
+	// events newest first, but need not be strict about it.
+	sort.SliceStable(last.frames, func(i, j int) bool { return last.frames[i].id < last.frames[j].id })
+	inOrder := make([]framecut.Frame, len(last.frames))
+	for i, f := range last.frames {
+		inOrder[i] = f.frame
+	}
+	picked, ok := framecut.PartText(inOrder)
+	if !ok {
+		return Final{}, false
+	}
+	return Final(picked), true
 }

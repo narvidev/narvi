@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -16,6 +17,7 @@ import (
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 )
 
 // seedTokenPartEvent stores one event whose payload names partID as its
@@ -227,5 +229,124 @@ func TestEventStore_StoredTokenPart_UsesPartIndex(t *testing.T) {
 	}
 	if sorts != 0 {
 		t.Errorf("plan sorts %d times, want none (the index's trailing id column orders both scans); plan: %s", sorts, planJSON)
+	}
+}
+
+// seedTokenFrameWithCut stores one `token` frame of partID under storageKey
+// whose payload carries cut as its raw `cut` property ("" for none).
+func seedTokenFrameWithCut(ctx context.Context, t *testing.T, events *narvipg.EventStore, session pgtype.UUID, storageKey, partID, text, cut string) int64 {
+	t.Helper()
+	payload := `{"type":"token","messageId":` + mustJSON(t, partID) + `,"text":` + mustJSON(t, text)
+	if cut != "" {
+		payload += `,"cut":` + cut
+	}
+	payload += "}"
+	row, err := events.Create(ctx, sqlcgen.CreateEventParams{SessionID: session, Type: "token", MessageID: storageKey, Payload: []byte(payload)})
+	if err != nil {
+		t.Fatalf("seed token %s: %v", storageKey, err)
+	}
+	return row.ID
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal %v: %v", v, err)
+	}
+	return string(raw)
+}
+
+// TestEventStore_StoredTokenPart_ReadsTheFramesCuts pins the two `cut`
+// properties the lookup returns beside the texts (technical plan §6.1):
+// the first and the newest stored frame's each, nil for a frame that
+// carries none or carries null, the cut itself when well formed, and
+// framecut.Malformed -- never nil -- when present but unreadable, so the
+// session actor's guard fails closed on it.
+func TestEventStore_StoredTokenPart_ReadsTheFramesCuts(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	events := narvipg.NewEventStore(pool)
+	sessionID := createTestSession(ctx, t, pool)
+
+	malformed := framecut.Malformed
+	tests := []struct {
+		name                 string
+		firstCut, latestCut  string
+		wantFirst, wantLatst *framecut.Cut
+	}{
+		{name: "no cut on either frame", wantFirst: nil, wantLatst: nil},
+		{name: "a whole first frame and a cut newest one", latestCut: `{"kept":5,"total":40}`, wantLatst: &framecut.Cut{Kept: 5, Total: 40}},
+		{name: "a cut first frame and a null cut newest one", firstCut: `{"kept":3,"total":9}`, latestCut: `null`, wantFirst: &framecut.Cut{Kept: 3, Total: 9}},
+		{name: "a malformed cut is read as malformed", firstCut: `{"kept":"3","total":9}`, latestCut: `[1,2]`, wantFirst: &malformed, wantLatst: &malformed},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			part := fmt.Sprintf("prt_cut_%d", i)
+			seedTokenFrameWithCut(ctx, t, events, sessionID, part, part, "first", tt.firstCut)
+			seedTokenFrameWithCut(ctx, t, events, sessionID, part+"#2", part, "newest", tt.latestCut)
+			got, found, err := events.StoredTokenPart(ctx, sessionID, part)
+			if err != nil || !found {
+				t.Fatalf("StoredTokenPart: found %v, err %v", found, err)
+			}
+			if got.FirstText != "first" || got.LatestText != "newest" {
+				t.Errorf("texts = (%q, %q), want (first, newest)", got.FirstText, got.LatestText)
+			}
+			if !reflect.DeepEqual(got.FirstCut, tt.wantFirst) || !reflect.DeepEqual(got.LatestCut, tt.wantLatst) {
+				t.Errorf("cuts = (%+v, %+v), want (%+v, %+v)", got.FirstCut, got.LatestCut, tt.wantFirst, tt.wantLatst)
+			}
+		})
+	}
+}
+
+// TestEventStore_ListTokenFramesInWindow pins the decision inbox's read of
+// one turn's text (sessionactor.ReadPlanFinal): the session's `token`
+// frames with id above lower and, when upper is set, at or below it --
+// FinalText's own bounds -- newest first, capped at limit, and never
+// another event type or another session's frame.
+func TestEventStore_ListTokenFramesInWindow(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	events := narvipg.NewEventStore(pool)
+	sessionID := createTestSession(ctx, t, pool)
+	otherSession := createTestSession(ctx, t, pool)
+
+	before := seedTokenPartEvent(ctx, t, events, sessionID, "token", "prt_before", "prt_before", "an earlier turn")
+	first := seedTokenPartEvent(ctx, t, events, sessionID, "token", "prt_a", "prt_a", "")
+	seedTokenPartEvent(ctx, t, events, sessionID, "tool_call", "call-1", "prt_a", "not a token")
+	seedTokenPartEvent(ctx, t, events, otherSession, "token", "prt_other", "prt_other", "another session")
+	last := seedTokenPartEvent(ctx, t, events, sessionID, "token", "prt_a#2", "prt_a", "the text")
+	after := seedTokenPartEvent(ctx, t, events, sessionID, "token", "prt_later", "prt_later", "a later turn")
+
+	ids := func(rows []sqlcgen.Event) []int64 {
+		out := make([]int64, len(rows))
+		for i, r := range rows {
+			out[i] = r.ID
+		}
+		return out
+	}
+	upper := last
+	tests := []struct {
+		name  string
+		lower int64
+		upper *int64
+		limit int32
+		want  []int64
+	}{
+		{name: "bounded above, the upper bound included", lower: before, upper: &upper, limit: 10, want: []int64{last, first}},
+		{name: "unbounded above", lower: before, upper: nil, limit: 10, want: []int64{after, last, first}},
+		{name: "the lower bound excluded", lower: first, upper: &upper, limit: 10, want: []int64{last}},
+		{name: "capped, newest first", lower: before, upper: nil, limit: 2, want: []int64{after, last}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rows, err := events.ListTokenFramesInWindow(ctx, sessionID, tt.lower, tt.upper, tt.limit)
+			if err != nil {
+				t.Fatalf("ListTokenFramesInWindow: %v", err)
+			}
+			if got := ids(rows); !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("ids = %v, want %v", got, tt.want)
+			}
+		})
 	}
 }

@@ -78,10 +78,12 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewfreshness"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/automation"
 	"github.com/narvidev/narvi/internal/domain/decisioninbox"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 	"github.com/narvidev/narvi/internal/domain/handoff"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
@@ -97,8 +99,17 @@ const maxAttentionRowsPerSource = 100
 // process wiring time (cmd/control-plane/main.go), mirroring every other
 // app-layer Deps struct in this codebase.
 type Deps struct {
-	Plans          *postgres.PlanStore
-	Sessions       *postgres.SessionStore
+	Plans    *postgres.PlanStore
+	Sessions *postgres.SessionStore
+
+	// Turns and Events back each awaiting plan's cut report (Item.PlanCut,
+	// buildPlanItems): the plan's own turn window and its token frames,
+	// read as the approval reads them. Optional (nil-safe, like
+	// GitHubPRSessions below): without either, no row reports a cut, and
+	// the server still refuses to approve a cut plan.
+	Turns  *postgres.TurnStore
+	Events *postgres.EventStore
+
 	Participants   *postgres.ParticipantStore
 	Automations    *postgres.AutomationStore
 	Outbox         *postgres.OutboxStore
@@ -294,7 +305,7 @@ func Build(ctx context.Context, deps Deps, actorUserID pgtype.UUID, actorRole au
 		scmFetchFailed = true
 	}
 
-	planItems, err := buildPlanItems(ctx, deps, actorUserID, actorRole, now)
+	planItems, err := buildPlanItems(ctx, deps, actorUserID, actorRole, now, logger)
 	if err != nil {
 		logger.Error("decisioninbox: build plan items failed", "error", err)
 	} else {
@@ -1902,7 +1913,15 @@ func resolveReleaseCut(ctx context.Context, deps Deps, repoFullName string, prNu
 // entitled to approve (authz.ActionApprovePlan, the SAME verdict
 // httpapi.canActOnPlan already renders for the real approve/reject
 // endpoints).
-func buildPlanItems(ctx context.Context, deps Deps, actorUserID pgtype.UUID, actorRole authz.Role, now time.Time) ([]Item, error) {
+//
+// Each row carries its plan's cut report (Item.PlanCut, technical plan
+// §6.1), read from the plan's own turn window by the read the approval
+// makes (sessionactor.ReadPlanFinal: one turns read and one range of the
+// session's index per awaiting plan, never the tail of its whole log), so
+// the inbox never offers Approve for a plan the approval would refuse. A
+// read that fails is logged and reports no cut: the row still renders, and
+// the server still refuses a cut plan.
+func buildPlanItems(ctx context.Context, deps Deps, actorUserID pgtype.UUID, actorRole authz.Role, now time.Time, logger *slog.Logger) ([]Item, error) {
 	rows, err := deps.Plans.ListAwaitingApproval(ctx)
 	if err != nil {
 		return nil, err
@@ -1933,6 +1952,7 @@ func buildPlanItems(ctx context.Context, deps Deps, actorUserID pgtype.UUID, act
 			PlanID:           row.ID.String(),
 			SessionID:        row.SessionID.String(),
 			PlanSessionTitle: title,
+			PlanCut:          readPlanCut(ctx, deps, row.SessionID, row.TurnID, row.ID, logger),
 		}
 		if row.CreatedAt.Valid {
 			item.EnteredQueueAt = row.CreatedAt.Time
@@ -1944,6 +1964,22 @@ func buildPlanItems(ctx context.Context, deps Deps, actorUserID pgtype.UUID, act
 	}
 
 	return items, nil
+}
+
+// readPlanCut reads the cut report of the plan planID, produced by turnID
+// in sessionID (sessionactor.ReadPlanFinal). nil -- no cut reported --
+// when the plan's text is whole, when deps carries no Turns or Events
+// store, and when the read fails (logged).
+func readPlanCut(ctx context.Context, deps Deps, sessionID, turnID, planID pgtype.UUID, logger *slog.Logger) *framecut.Cut {
+	if deps.Turns == nil || deps.Events == nil {
+		return nil
+	}
+	final, _, err := sessionactor.ReadPlanFinal(ctx, deps.Turns, deps.Events, sessionID, turnID)
+	if err != nil {
+		logger.Warn("decisioninbox: read plan final text for its cut report failed; reporting no cut", "plan_id", planID.String(), "session_id", sessionID.String(), "error", err)
+		return nil
+	}
+	return final.Cut
 }
 
 // buildAttentionItems returns every needs_attention row -- ADMIN ONLY;

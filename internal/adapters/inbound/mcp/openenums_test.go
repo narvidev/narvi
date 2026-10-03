@@ -52,7 +52,8 @@ func openEnumTestPlan(version int, status, structured string) string {
 		"decidedAt": null,
 		"decidedBy": null,
 		"content": "Change the retry loop.",
-		"structured": ` + structured + `
+		"structured": ` + structured + `,
+		"cut": null
 	}`
 }
 

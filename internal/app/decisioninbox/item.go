@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/narvidev/narvi/internal/domain/decisioninbox"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 )
 
 // Item is one decision-inbox row, ready to convert 1:1 into the REST
@@ -279,6 +280,15 @@ type Item struct {
 
 	// Plan fields (KindAwaitingApproval, non-handoff).
 	PlanID string
+	// PlanCut is the plan's cut report (technical plan §6.1): set when its
+	// text is a frame the sandbox-agent cut on its way to the control
+	// plane, read from the plan's own turn window by the read the approval
+	// makes (sessionactor.ReadPlanFinal), so a row carrying it is one the
+	// approval refuses (httpapi.ErrPlanCut) -- a client shows the reason in
+	// place of Approve. nil for a whole plan, and when Deps carries no
+	// Turns/Events store or the read failed (logged): the server still
+	// refuses then.
+	PlanCut *framecut.Cut
 	// SessionID is set whenever this row has a resolvable Narvi session:
 	// a plan (KindAwaitingApproval), a failed session (KindNeedsAttention),
 	// OR a PR-shaped row (ready_to_merge/needs_review, including a release

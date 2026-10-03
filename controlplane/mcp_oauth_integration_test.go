@@ -1262,6 +1262,11 @@ func TestOAuth_ProductionRouter(t *testing.T) {
 	t.Run("WriteTwins_EveryArgumentLikeREST_SDKClient", func(t *testing.T) {
 		sdkWriteTwinsLikeREST(t, twinsRig, classifier)
 	})
+	// A plan whose text was cut on its way from the sandbox (technical plan
+	// §6.1): refused over MCP with REST's own reason, on the same router.
+	t.Run("MCPApprovePlan_CutPlan_ToolErrorGivesTheReason", func(t *testing.T) {
+		sdkApprovePlanCutPlan(t, twinsRig)
+	})
 	// Row 183's stop over MCP (technical plan §43.22), on routers of their
 	// own: every stop that is accepted wakes the actor of each session it
 	// reaches. mcp_stopsession_integration_test.go has each one's doc.

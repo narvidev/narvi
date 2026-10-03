@@ -9,6 +9,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 )
 
 // EventStore is a thin, pass-through wrapper around the sqlc-generated
@@ -54,8 +55,8 @@ func (s *EventStore) Create(ctx context.Context, arg sqlcgen.CreateEventParams) 
 }
 
 // StoredTokenPart is what is already stored of one streamed text part:
-// the id and text of its first stored `token` frame and the text of its
-// newest one.
+// the id, text and cut of its first stored `token` frame and the text and
+// cut of its newest one.
 type StoredTokenPart struct {
 	// FirstFrameID is the lowest events.id among the part's stored frames:
 	// where the part entered the log, which places it in a turn's window.
@@ -64,8 +65,14 @@ type StoredTokenPart struct {
 	// the bare part id, which a resend of it no longer matches by key.
 	FirstText string
 	// LatestText is the text of the part's highest-id stored frame, the
-	// one every reader shows.
+	// newest one stored.
 	LatestText string
+	// FirstCut and LatestCut are those two frames' `cut` properties
+	// (technical plan §6.1), nil for a whole frame, decoded fail-closed by
+	// framecut.DecodeCut: a `cut` present but unreadable is
+	// framecut.Malformed, never nil.
+	FirstCut  *framecut.Cut
+	LatestCut *framecut.Cut
 }
 
 // StoredTokenPart returns what is stored of the `token` part whose payload
@@ -85,7 +92,29 @@ func (s *EventStore) StoredTokenPart(ctx context.Context, sessionID pgtype.UUID,
 	if err != nil {
 		return StoredTokenPart{}, false, err
 	}
-	return StoredTokenPart{FirstFrameID: row.FirstID, FirstText: row.FirstText, LatestText: row.Text}, true, nil
+	return StoredTokenPart{
+		FirstFrameID: row.FirstID,
+		FirstText:    row.FirstText,
+		LatestText:   row.Text,
+		FirstCut:     framecut.DecodeCut(row.FirstCut),
+		LatestCut:    framecut.DecodeCut(row.Cut),
+	}, true, nil
+}
+
+// ListTokenFramesInWindow returns up to limit of sessionID's `token`
+// frames with id above lowerID and, when upperID is not nil, at or below
+// it, newest id first -- one turn's frames, in the window
+// sessionactor.TurnContentBounds gives and plan.FinalText reads. The
+// decision inbox reads an awaiting plan's final text through it, a range on
+// the session's own index rather than the tail of its whole log
+// (ListTokenFramesInWindow's doc comment, queries/events.sql).
+func (s *EventStore) ListTokenFramesInWindow(ctx context.Context, sessionID pgtype.UUID, lowerID int64, upperID *int64, limit int32) ([]sqlcgen.Event, error) {
+	return s.q.ListTokenFramesInWindow(ctx, sqlcgen.ListTokenFramesInWindowParams{
+		SessionID: sessionID,
+		LowerID:   lowerID,
+		UpperID:   upperID,
+		RowLimit:  limit,
+	})
 }
 
 // ListForSession returns up to limit events for sessionID with id >

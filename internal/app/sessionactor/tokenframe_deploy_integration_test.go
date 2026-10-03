@@ -366,8 +366,8 @@ func TestHandleSandboxEvent_TokenFrames_ReplayDuringTheTurnRunningAtDeploy(t *te
 	if err != nil {
 		t.Fatalf("list recent events: %v", err)
 	}
-	if got := plandomain.ExtractContent(ToContentEvents(recent), turn.DispatchedEventID, nil); got != stepTwoText {
-		t.Errorf("the turn's window reads %q, want %q (its last part)", got, stepTwoText)
+	if got := plandomain.ExtractContent(ToContentEvents(recent), turn.DispatchedEventID, nil); got != (plandomain.Final{Text: stepTwoText}) {
+		t.Errorf("the turn's window reads %+v, want %q (its last part), no cut", got, stepTwoText)
 	}
 
 	got := sessionLogAsFixture(ctx, t, pool, sessionID)
@@ -544,8 +544,8 @@ func TestHandleSandboxEvent_TokenFrames_OldAgentOrderDuringTheTurnRunningAtDeplo
 			if strings.Join(gotLog, "|") != strings.Join(tt.wantLog, "|") {
 				t.Fatalf("stored log = %q, want %q", gotLog, tt.wantLog)
 			}
-			if got := a.planContentText(ctx, turn); got != tt.wantPlan {
-				t.Errorf("planContentText = %q, want %q", got, tt.wantPlan)
+			if got := a.planContentText(ctx, turn); got != (plandomain.Final{Text: tt.wantPlan}) {
+				t.Errorf("planContentText = %+v, want %q, no cut", got, tt.wantPlan)
 			}
 		})
 	}

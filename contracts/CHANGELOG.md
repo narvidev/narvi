@@ -10,6 +10,53 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.21.0]
+
+### sandbox-ws/v1/events.schema.json
+
+- Added: optional `cut` on `Token`, `ToolCall` and `ToolResult` (an
+  object, closed, of the required integers `kept`, minimum 0, and
+  `total`, minimum 1): set only on a frame the sandbox-agent cut to fit
+  what the control plane's connection reads (technical plan §6.1), absent
+  on a whole frame. The cut shortens one string at a UTF-8 boundary -- a
+  `token`'s `text`, the longest string in a `tool_call`'s `input` or a
+  `tool_result`'s `output` -- and ends it with a line of its own,
+  `[text cut at <kept> of <total> bytes on its way from the sandbox]`;
+  `kept` is the bytes of that string kept and `total` its whole length,
+  in UTF-8 bytes of the unescaped string. Readers learn a cut only from
+  this property, never from the text, and a cut frame yields to the stored
+  whole text it was taken from and to a cut of that text keeping more.
+  Nothing produces it yet: this release adds the readers, before the
+  writer. A control plane that does not know it stores the raw payload,
+  so the property survives, and shows the marker in the text. A property
+  added, not required, grades MINOR (row 2), three times; each union
+  member changes only by that property (row 30, recursing into row 2).
+
+### rest/v1/dtos.schema.json
+
+- Added: `Plan.cut`, required and nullable (an inline object of the
+  required integers `kept` and `total`): the cut a plan's text carries
+  when it is a frame the sandbox-agent cut, read from the frames `content`
+  is read from (`plan.FinalText`'s cut report), never from the text; both
+  -1 when the frame carried a cut the server could not read. Null for a
+  whole plan, and for one whose `content` comes from its approval
+  snapshot. A plan with a cut cannot be approved: the approve route
+  answers `409` with the reason, and clients show it in place of Approve.
+  A required property added grades MINOR producer-to-client (row 3);
+  `Plan` is reachable from no request.
+- Added: `DecisionInboxItem.planCutKept` and `planCutTotal`, each a
+  required, nullable integer, flattened like `provenanceKind`: set on an
+  awaiting plan whose text is cut, from the plan's own turn window, the
+  read the approval itself makes; null otherwise. Row 3, twice, MINOR.
+- Added: `SessionOutcome.lastRun.summary.cut`, required and nullable (the
+  same inline object): set when the run's last text part is a cut frame.
+  Row 3, MINOR.
+- Changed: `SessionOutcome.lastRun.summary.text`'s description says the
+  part is read at its newest frame that yields to no other. A description
+  grades PATCH (row 35).
+- Unchanged: no route; a cut plan's refused approval is a `409` with the
+  existing `{"error": ...}` body, which this bundle does not grade.
+
 ## [1.20.0]
 
 ### sandbox-ws/v1/events.schema.json

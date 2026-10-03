@@ -5,6 +5,8 @@ import { describe, expect, it } from 'vitest'
 import type { EventEnvelope } from '../../ws/types'
 import { asExecutionComplete, asStepStart } from '../eventPayloads'
 import { buildTimelineModel } from '../timelineModel'
+import { decodeCut, MALFORMED_CUT } from '../tokenCut'
+import { readTokenCutVectors } from './tokenCutVectors'
 
 let nextId = 1
 function env(type: string, payload: unknown, createdAt = '2026-08-20T10:00:00Z'): EventEnvelope {
@@ -134,7 +136,7 @@ describe('buildTimelineModel', () => {
     const events = [env('token', { messageId: 'm1', text: 'Hello' }), env('token', { messageId: 'm1', text: 'Hello world' })]
     const model = buildTimelineModel(events)
     const step = model.turns[0]!.steps[0]!
-    expect(step.tokens).toEqual([{ messageId: 'm1', text: 'Hello world' }])
+    expect(step.tokens).toMatchObject([{ messageId: 'm1', text: 'Hello world' }])
   })
 
   // The event log's own shape since each distinct cumulative frame became its
@@ -160,8 +162,8 @@ describe('buildTimelineModel', () => {
     const model = buildTimelineModel(events)
     expect(model.turns).toHaveLength(1)
     const [first, second] = model.turns[0]!.steps
-    expect(first!.tokens).toEqual([{ messageId: 'prt_a', text: 'Let me check the tests.' }])
-    expect(second!.tokens).toEqual([{ messageId: 'prt_b', text: 'All tests pass.' }])
+    expect(first!.tokens).toMatchObject([{ messageId: 'prt_a', text: 'Let me check the tests.' }])
+    expect(second!.tokens).toMatchObject([{ messageId: 'prt_b', text: 'All tests pass.' }])
   })
 
   it('routes session_title/warning/error without opening a spurious turn', () => {
@@ -371,7 +373,7 @@ describe('buildTimelineModel over the log a reconnect replay can leave', () => {
       [false, 'completed'],
       [false, 'completed'],
     ])
-    expect(model.turns[1]!.steps[0]!.tokens).toEqual([{ messageId: 'prt_fixed', text: 'Turn two note.' }])
+    expect(model.turns[1]!.steps[0]!.tokens).toMatchObject([{ messageId: 'prt_fixed', text: 'Turn two note.' }])
     expect(hasOpenTurn(events)).toBe(false)
     expectNoPhantomTurn(events, 2)
   })
@@ -383,7 +385,7 @@ describe('buildTimelineModel over the log a reconnect replay can leave', () => {
     let model = buildTimelineModel(running)
     expect(model.turns).toHaveLength(2)
     expect(model.turns[1]!.live).toBe(true)
-    expect(model.turns[1]!.steps.flatMap((s) => s.tokens)).toEqual([{ messageId: 'prt_next', text: 'Turn two answer.' }])
+    expect(model.turns[1]!.steps.flatMap((s) => s.tokens)).toMatchObject([{ messageId: 'prt_next', text: 'Turn two answer.' }])
     expectNoPhantomTurn(running, 2)
 
     const done = [...earlier, ...next]
@@ -403,7 +405,7 @@ describe('buildTimelineModel over the log a reconnect replay can leave', () => {
     expect(model.turns).toHaveLength(2)
     expect(model.turns[1]!.live).toBe(true)
     expect(model.turns[1]!.outcome).toBeNull()
-    expect(model.turns[1]!.steps[0]!.tokens).toEqual([{ messageId: 'prt_legacy', text: 'Turn one final answer.' }])
+    expect(model.turns[1]!.steps[0]!.tokens).toMatchObject([{ messageId: 'prt_legacy', text: 'Turn one final answer.' }])
     expect(hasOpenTurn(late)).toBe(true)
 
     const thenNextTurn = [...late, ...storedTurn('s2', { prt_next: ['', 'Turn two answer.'] })]
@@ -504,5 +506,62 @@ describe('buildTimelineModel over the log a reconnect replay can leave', () => {
     expect([turn!.live, turn!.outcome?.outcome]).toEqual([false, 'completed'])
     expect(hasOpenTurn(events)).toBe(false)
     expectNoPhantomTurn(events, 1)
+  })
+})
+
+// A frame the sandbox-agent cut on its way to the control plane (technical
+// plan §6.1) carries `cut`, and a part can hold it and the whole text it was
+// taken from, in either order. The timeline reads a part as plan.FinalText
+// and the session actor's storage guard do, held to the same shared vector
+// file (fixtures/tokenCutFrames.json).
+describe('buildTimelineModel -- cut frames', () => {
+  for (const vector of readTokenCutVectors()) {
+    it(`reads the part as the shared vector says: ${vector.name}`, () => {
+      const events: EventEnvelope[] = vector.frames.map((f) => ({
+        id: f.id,
+        type: 'token',
+        payload: { type: 'token', messageId: 'prt_v', sessionId: '00000000-0000-4000-8000-000000000001', gen: 1, text: f.text, ...('cut' in f ? { cut: f.cut } : {}) },
+        createdAt: '2026-10-03T10:00:00Z',
+      }))
+      const [stream, ...others] = buildTimelineModel(events).turns[0]!.steps[0]!.tokens
+      expect(others).toEqual([])
+      if (vector.want === null) {
+        expect([stream!.text, stream!.cut]).toEqual(['', null])
+        return
+      }
+      const want = vector.frames.find((f) => f.id === vector.want!.id)!
+      expect([stream!.text, stream!.cut]).toEqual([want.text, vector.want.cut])
+      // The stream keeps the part's non-empty frames, each with its cut as
+      // the timeline read it.
+      expect(stream!.frames).toEqual(vector.frames.filter((f) => f.text !== '').map((f) => ({ text: f.text, cut: decodeCut(f.cut) })))
+    })
+  }
+
+  it('a part stored whole and then cut reads whole, where the newest row alone would read the cut', () => {
+    const whole = '1. Add the migration\n2. Wire the store\n' // 39 bytes
+    const cutText = '1. Add the\n[text cut at 10 of 39 bytes on its way from the sandbox]'
+    expect(new TextEncoder().encode(whole).length).toBe(39)
+    const events = [
+      env('step_start', { messageId: 'msg_1', stepId: 's1' }),
+      env('token', { messageId: 'prt_plan', text: '' }),
+      env('token', { messageId: 'prt_plan', text: whole }),
+      env('token', { messageId: 'prt_plan', text: cutText, cut: { kept: 10, total: 39 } }),
+      env('execution_complete', { messageId: 'm9', outcome: 'completed', reason: null }),
+    ]
+    const [stream] = buildTimelineModel(events).turns[0]!.steps[0]!.tokens
+    expect([stream!.text, stream!.cut]).toEqual([whole, null])
+  })
+
+  it('a part whose only text is cut reads as cut, its marker in the text and its cut on the stream', () => {
+    const cutText = '1. Add the\n[text cut at 10 of 40 bytes on its way from the sandbox]'
+    const events = [env('token', { messageId: 'prt_plan', text: '' }), env('token', { messageId: 'prt_plan', text: cutText, cut: { kept: 10, total: 40 } })]
+    const [stream] = buildTimelineModel(events).turns[0]!.steps[0]!.tokens
+    expect([stream!.text, stream!.cut]).toEqual([cutText, { kept: 10, total: 40 }])
+  })
+
+  it('a malformed cut reads as cut, never as whole', () => {
+    const events = [env('token', { messageId: 'prt_plan', text: 'Plan.\n[text cut at 5 of 90 bytes on its way from the sandbox]', cut: { kept: '5', total: 90 } })]
+    const [stream] = buildTimelineModel(events).turns[0]!.steps[0]!.tokens
+    expect(stream!.cut).toEqual(MALFORMED_CUT)
   })
 })

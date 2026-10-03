@@ -30,6 +30,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/identitylink"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -548,5 +549,62 @@ func TestInteractivityHandler_BlockActions_BoundedBySlackInteractivityAckTimeout
 	}
 	if dbStatus != sqlcgen.PlanStatusAwaitingApproval {
 		t.Errorf("db status = %q, want %q (the guarded update must never have run before the bounded context's deadline)", dbStatus, sqlcgen.PlanStatusAwaitingApproval)
+	}
+}
+
+// TestSlackInteractive_ApproveCutPlan_ReasonEphemeral_MessageKeepsItsBlocks
+// proves an Approve click on a plan whose text was cut on its way from the
+// sandbox (technical plan §6.1) -- a button a binary built before cuts
+// posted -- is refused (httpapi.ErrPlanCut) and answered to the clicking
+// user alone, through chat.postEphemeral carrying the reason, and that the
+// approval message is left as it is: no chat.update is sent, which would
+// strip its blocks -- the plan, and its Request changes and Reject buttons,
+// on a plan still awaiting approval. Nothing changes in the database.
+func TestSlackInteractive_ApproveCutPlan_ReasonEphemeral_MessageKeepsItsBlocks(t *testing.T) {
+	pool := newTestPool(t)
+	rig := newInteractiveTestRig(t, pool)
+	ctx := context.Background()
+
+	session, plan := seedSessionTurnAndAwaitingPlan(ctx, t, rig)
+	cut := seedCutPlanText(ctx, t, pool, session.ID, plan.TurnID)
+	value := slackapi.EncodePlanActionValue(plan.ID.String(), session.ID.String())
+
+	rec := httptest.NewRecorder()
+	rig.handler(rec, signedInteractivityRequest(t, blockActionsPayloadJSON(slackapi.ActionApprovePlan, value, "C1", "1700000000.000009", "trigger-cut")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d (body=%s)", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var dbStatus sqlcgen.PlanStatus
+	if err := pool.QueryRow(ctx, `SELECT status FROM plans WHERE id = $1`, plan.ID).Scan(&dbStatus); err != nil {
+		t.Fatalf("query plan row: %v", err)
+	}
+	if dbStatus != sqlcgen.PlanStatusAwaitingApproval {
+		t.Errorf("db status = %q, want %q", dbStatus, sqlcgen.PlanStatusAwaitingApproval)
+	}
+	if turns, err := rig.turns.ListForSession(ctx, session.ID); err != nil || len(turns) != 1 {
+		t.Errorf("turns = %d (err %v), want 1: no implementation turn", len(turns), err)
+	}
+
+	// The handler made every Slack call before it answered: collect them.
+	var updates, ephemerals []recordedSlackRequest
+	for len(rig.requests) > 0 {
+		got := <-rig.requests
+		switch got.path {
+		case "/chat.update":
+			updates = append(updates, got)
+		case "/chat.postEphemeral":
+			ephemerals = append(ephemerals, got)
+		}
+	}
+	if len(updates) != 0 {
+		t.Errorf("chat.update sent %d time(s) (%v), want none: the approval message must keep its blocks", len(updates), updates)
+	}
+	if len(ephemerals) != 1 {
+		t.Fatalf("chat.postEphemeral sent %d time(s), want exactly one", len(ephemerals))
+	}
+	got := ephemerals[0].body
+	if got["text"] != framecut.Reason(&cut) || got["channel"] != "C1" || got["user"] != interactivityDefaultUserID || got["thread_ts"] != "1700000000.000009" {
+		t.Errorf("chat.postEphemeral = %v, want the reason %q to %s in C1, on the message", got, framecut.Reason(&cut), interactivityDefaultUserID)
 	}
 }

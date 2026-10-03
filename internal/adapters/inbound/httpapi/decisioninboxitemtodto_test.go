@@ -39,6 +39,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/app/decisioninbox"
 	domaindecisioninbox "github.com/narvidev/narvi/internal/domain/decisioninbox"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 )
 
 // TestDecisionInboxItemToDTO_AcceptanceRendersOnIDNotJustification pins
@@ -312,6 +313,49 @@ func sameIntPtr(a, b *int) bool {
 func derefForTest(p *int) string {
 	if p == nil {
 		return "<nil>"
+	}
+	return strconv.Itoa(*p)
+}
+
+// TestDecisionInboxItemToDTO_PlanCut pins the plan row's cut report on the
+// wire (technical plan §6.1): planCutKept and planCutTotal set together
+// from Item.PlanCut -- the fail-closed sentinel's -1 included -- and both
+// null for a whole plan.
+func TestDecisionInboxItemToDTO_PlanCut(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name                string
+		cut                 *framecut.Cut
+		wantKept, wantTotal *int
+	}{
+		{name: "a whole plan", cut: nil},
+		{name: "a cut plan", cut: &framecut.Cut{Kept: 4096, Total: 40960}, wantKept: intPtr(4096), wantTotal: intPtr(40960)},
+		{name: "a cut the server could not read", cut: &framecut.Malformed, wantKept: intPtr(-1), wantTotal: intPtr(-1)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			dto := decisionInboxItemToDTO(decisioninbox.Item{Kind: domaindecisioninbox.KindAwaitingApproval, PlanID: "p1", SessionID: "s1", PlanCut: tt.cut})
+			if !equalIntPtr(dto.PlanCutKept, tt.wantKept) || !equalIntPtr(dto.PlanCutTotal, tt.wantTotal) {
+				t.Errorf("planCutKept/planCutTotal = %v/%v, want %v/%v", derefInt(dto.PlanCutKept), derefInt(dto.PlanCutTotal), derefInt(tt.wantKept), derefInt(tt.wantTotal))
+			}
+		})
+	}
+}
+
+func intPtr(n int) *int { return &n }
+
+func equalIntPtr(a, b *int) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+func derefInt(p *int) string {
+	if p == nil {
+		return "null"
 	}
 	return strconv.Itoa(*p)
 }

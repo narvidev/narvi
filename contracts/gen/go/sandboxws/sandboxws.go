@@ -2115,6 +2115,18 @@ func (j *SubTaskStart) UnmarshalJSON(value []byte) error {
 // replacement of the streamed text keyed by messageId (upsert-by-messageId), never
 // append the text onto a running buffer.
 type Token struct {
+	// Set only on a frame the sandbox-agent cut to fit what the control plane's
+	// connection reads (technical plan §6.1); absent on a whole frame. text was
+	// shortened at a UTF-8 boundary and ends with a line of its own, '[text cut at
+	// <kept> of <total> bytes on its way from the sandbox]'. kept is the bytes of the
+	// original string kept and total its whole length, both counted in UTF-8 bytes of
+	// the unescaped string, kept below total. Readers learn a cut only from this
+	// property, never from the text: a marker-shaped line in a frame without it is
+	// the agent's own text, and a frame with it yields to the stored whole text it
+	// was taken from (exactly total bytes, starting with the bytes kept) and to a cut
+	// of that text keeping more.
+	Cut *TokenCut `json:"cut,omitempty,omitzero" yaml:"cut,omitempty" mapstructure:"cut,omitempty"`
+
 	// Gen corresponds to the JSON schema field "gen".
 	Gen int `json:"gen" yaml:"gen" mapstructure:"gen"`
 
@@ -2135,6 +2147,51 @@ type Token struct {
 
 	// Type corresponds to the JSON schema field "type".
 	Type string `json:"type" yaml:"type" mapstructure:"type"`
+}
+
+// Set only on a frame the sandbox-agent cut to fit what the control plane's
+// connection reads (technical plan §6.1); absent on a whole frame. text was
+// shortened at a UTF-8 boundary and ends with a line of its own, '[text cut at
+// <kept> of <total> bytes on its way from the sandbox]'. kept is the bytes of the
+// original string kept and total its whole length, both counted in UTF-8 bytes of
+// the unescaped string, kept below total. Readers learn a cut only from this
+// property, never from the text: a marker-shaped line in a frame without it is the
+// agent's own text, and a frame with it yields to the stored whole text it was
+// taken from (exactly total bytes, starting with the bytes kept) and to a cut of
+// that text keeping more.
+type TokenCut struct {
+	// Kept corresponds to the JSON schema field "kept".
+	Kept int `json:"kept" yaml:"kept" mapstructure:"kept"`
+
+	// Total corresponds to the JSON schema field "total".
+	Total int `json:"total" yaml:"total" mapstructure:"total"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *TokenCut) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["kept"]; raw != nil && !ok {
+		return fmt.Errorf("field kept in TokenCut: required")
+	}
+	if _, ok := raw["total"]; raw != nil && !ok {
+		return fmt.Errorf("field total in TokenCut: required")
+	}
+	type Plain TokenCut
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 0 > plain.Kept {
+		return fmt.Errorf("field %s: must be >= %v", "kept", 0)
+	}
+	if 1 > plain.Total {
+		return fmt.Errorf("field %s: must be >= %v", "total", 1)
+	}
+	*j = TokenCut(plain)
+	return nil
 }
 
 // §6.1/§7.1 sub-task fan-out: OPTIONAL — absent or null means this event belongs
@@ -2180,6 +2237,18 @@ type ToolCall struct {
 	// CallId corresponds to the JSON schema field "callId".
 	CallId string `json:"callId" yaml:"callId" mapstructure:"callId"`
 
+	// Set only on a frame the sandbox-agent cut to fit what the control plane's
+	// connection reads (technical plan §6.1); absent on a whole frame. The longest
+	// string anywhere in input was shortened at a UTF-8 boundary and ends with a line
+	// of its own, '[text cut at <kept> of <total> bytes on its way from the
+	// sandbox]'. kept is the bytes of the original string kept and total its whole
+	// length, both counted in UTF-8 bytes of the unescaped string, kept below total.
+	// Readers learn a cut only from this property, never from the text: a
+	// marker-shaped line in a frame without it is the agent's own text, and a frame
+	// with it yields to the stored whole text it was taken from (exactly total bytes,
+	// starting with the bytes kept) and to a cut of that text keeping more.
+	Cut *ToolCallCut `json:"cut,omitempty,omitzero" yaml:"cut,omitempty" mapstructure:"cut,omitempty"`
+
 	// Gen corresponds to the JSON schema field "gen".
 	Gen int `json:"gen" yaml:"gen" mapstructure:"gen"`
 
@@ -2203,6 +2272,51 @@ type ToolCall struct {
 
 	// Type corresponds to the JSON schema field "type".
 	Type string `json:"type" yaml:"type" mapstructure:"type"`
+}
+
+// Set only on a frame the sandbox-agent cut to fit what the control plane's
+// connection reads (technical plan §6.1); absent on a whole frame. The longest
+// string anywhere in input was shortened at a UTF-8 boundary and ends with a line
+// of its own, '[text cut at <kept> of <total> bytes on its way from the sandbox]'.
+// kept is the bytes of the original string kept and total its whole length, both
+// counted in UTF-8 bytes of the unescaped string, kept below total. Readers learn
+// a cut only from this property, never from the text: a marker-shaped line in a
+// frame without it is the agent's own text, and a frame with it yields to the
+// stored whole text it was taken from (exactly total bytes, starting with the
+// bytes kept) and to a cut of that text keeping more.
+type ToolCallCut struct {
+	// Kept corresponds to the JSON schema field "kept".
+	Kept int `json:"kept" yaml:"kept" mapstructure:"kept"`
+
+	// Total corresponds to the JSON schema field "total".
+	Total int `json:"total" yaml:"total" mapstructure:"total"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ToolCallCut) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["kept"]; raw != nil && !ok {
+		return fmt.Errorf("field kept in ToolCallCut: required")
+	}
+	if _, ok := raw["total"]; raw != nil && !ok {
+		return fmt.Errorf("field total in ToolCallCut: required")
+	}
+	type Plain ToolCallCut
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 0 > plain.Kept {
+		return fmt.Errorf("field %s: must be >= %v", "kept", 0)
+	}
+	if 1 > plain.Total {
+		return fmt.Errorf("field %s: must be >= %v", "total", 1)
+	}
+	*j = ToolCallCut(plain)
+	return nil
 }
 
 // Freeform, tool-specific input.
@@ -2257,6 +2371,18 @@ type ToolResult struct {
 	// CallId corresponds to the JSON schema field "callId".
 	CallId string `json:"callId" yaml:"callId" mapstructure:"callId"`
 
+	// Set only on a frame the sandbox-agent cut to fit what the control plane's
+	// connection reads (technical plan §6.1); absent on a whole frame. The longest
+	// string anywhere in output was shortened at a UTF-8 boundary and ends with a
+	// line of its own, '[text cut at <kept> of <total> bytes on its way from the
+	// sandbox]'. kept is the bytes of the original string kept and total its whole
+	// length, both counted in UTF-8 bytes of the unescaped string, kept below total.
+	// Readers learn a cut only from this property, never from the text: a
+	// marker-shaped line in a frame without it is the agent's own text, and a frame
+	// with it yields to the stored whole text it was taken from (exactly total bytes,
+	// starting with the bytes kept) and to a cut of that text keeping more.
+	Cut *ToolResultCut `json:"cut,omitempty,omitzero" yaml:"cut,omitempty" mapstructure:"cut,omitempty"`
+
 	// Gen corresponds to the JSON schema field "gen".
 	Gen int `json:"gen" yaml:"gen" mapstructure:"gen"`
 
@@ -2280,6 +2406,51 @@ type ToolResult struct {
 
 	// Type corresponds to the JSON schema field "type".
 	Type string `json:"type" yaml:"type" mapstructure:"type"`
+}
+
+// Set only on a frame the sandbox-agent cut to fit what the control plane's
+// connection reads (technical plan §6.1); absent on a whole frame. The longest
+// string anywhere in output was shortened at a UTF-8 boundary and ends with a line
+// of its own, '[text cut at <kept> of <total> bytes on its way from the sandbox]'.
+// kept is the bytes of the original string kept and total its whole length, both
+// counted in UTF-8 bytes of the unescaped string, kept below total. Readers learn
+// a cut only from this property, never from the text: a marker-shaped line in a
+// frame without it is the agent's own text, and a frame with it yields to the
+// stored whole text it was taken from (exactly total bytes, starting with the
+// bytes kept) and to a cut of that text keeping more.
+type ToolResultCut struct {
+	// Kept corresponds to the JSON schema field "kept".
+	Kept int `json:"kept" yaml:"kept" mapstructure:"kept"`
+
+	// Total corresponds to the JSON schema field "total".
+	Total int `json:"total" yaml:"total" mapstructure:"total"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ToolResultCut) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["kept"]; raw != nil && !ok {
+		return fmt.Errorf("field kept in ToolResultCut: required")
+	}
+	if _, ok := raw["total"]; raw != nil && !ok {
+		return fmt.Errorf("field total in ToolResultCut: required")
+	}
+	type Plain ToolResultCut
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if 0 > plain.Kept {
+		return fmt.Errorf("field %s: must be >= %v", "kept", 0)
+	}
+	if 1 > plain.Total {
+		return fmt.Errorf("field %s: must be >= %v", "total", 1)
+	}
+	*j = ToolResultCut(plain)
+	return nil
 }
 
 // Freeform, tool-specific output.

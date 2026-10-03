@@ -466,6 +466,13 @@ export interface Plan {
      */
     scopeEstimate: string;
   } | null;
+  /**
+   * The cut this plan's text carries, when it is a frame the sandbox-agent cut on its way to the control plane (technical plan §6.1): kept, the bytes of the plan's text kept, and total, its whole length, both in UTF-8 bytes of the unescaped text; both -1 when the frame carried a cut this server could not read. Read from the frames content is read from (internal/domain/plan.FinalText's cut report), never from content's text, which ends with the cut's marker line, '[text cut at <kept> of <total> bytes on its way from the sandbox]', and which a client may shorten for display. A plan with a cut cannot be approved: POST /api/sessions/{sessionID}/plans/{planId}/approve answers 409 with the reason, and a client shows that reason where Approve would be, keeping Request changes and Reject. Null when the text is whole, and for a plan whose content comes from its approval snapshot (plan_documents), which records none: such a plan was approved whole.
+   */
+  cut: {
+    kept: number;
+    total: number;
+  } | null;
 }
 /**
  * One numbered step of a Plan's own structured document (§12.2 item 3: 'numbered steps with file refs') -- internal/domain/plan.Step's wire shape. Every field is model-authored, attacker-influenceable prose or a repository-relative path string; a client renders all three as plain text only (title/description) or inert text (fileRefs, never a clickable/navigable link built from an unvalidated path), never markup, matching content's own established discipline.
@@ -2562,6 +2569,14 @@ export interface DecisionInboxItem {
    */
   planId: string | null;
   /**
+   * kind=awaiting_approval, a plan (not a handoff PR) only: set, with planCutTotal, when the plan's text is a frame the sandbox-agent cut on its way to the control plane (technical plan §6.1) -- the bytes of the text kept, in UTF-8 bytes; -1 when the frame carried a cut this server could not read. Read from the plan's own turn window of the event log (internal/domain/plan.FinalText's cut report), the read the approval itself makes, so a row with a cut is one the approval refuses: a client shows the reason in place of Approve, keeping Open. Null for a whole plan, and for every other kind. Flattened like provenanceKind, per this object's own description.
+   */
+  planCutKept: number | null;
+  /**
+   * kind=awaiting_approval, a plan only: the cut text's whole length in UTF-8 bytes, set exactly when planCutKept is; -1 when the frame carried a cut this server could not read.
+   */
+  planCutTotal: number | null;
+  /**
    * Set for a plan (kind=awaiting_approval), a failed session (kind=needs_attention), or a PR-shaped row (ready_to_merge/needs_review, including a release cut) for which Narvi has actually run a review session against this exact pull request -- a client uses this to link into that review (or release-review) screen instead of an external GitHub link. Left null for a PR-shaped row Narvi has never been mentioned on, which is common and not an error.
    */
   sessionId: string | null;
@@ -3684,13 +3699,20 @@ export interface SessionOutcome {
      */
     summary: {
       /**
-       * The run's last text part, verbatim -- among the parts the run streamed with any text, the one that opened last, read at its newest frame: the one rule this system uses to read a turn's final text (the same one GET /api/sessions/{sessionID}/plans reads a plan with). Cut to at most 4,000 characters (Unicode code points). Null when the run left no text in the session's recent event history.
+       * The run's last text part, verbatim -- among the parts the run streamed with any text, the one that opened last, read at its newest frame that yields to no other (a frame cut on its way from the sandbox yields to the whole text it was taken from, see cut): the one rule this system uses to read a turn's final text (the same one GET /api/sessions/{sessionID}/plans reads a plan with). Cut to at most 4,000 characters (Unicode code points). Null when the run left no text in the session's recent event history.
        */
       text: string | null;
       /**
        * true when text was cut at 4,000 characters; the full text is in the transcript.
        */
       truncated: boolean;
+      /**
+       * Set when the run's last text part is a frame the sandbox-agent cut on its way to the control plane (technical plan §6.1), as GET /api/sessions/{sessionID}/plans reports it for a plan: kept, the bytes of the part's text kept, and total, its whole length, both in UTF-8 bytes of the unescaped text; both -1 when the frame carried a cut this server could not read. text then ends with the cut's marker line, unless truncated cut it first; this property, never the text, says the run's text was cut. Null when the text is whole, or when there is none.
+       */
+      cut: {
+        kept: number;
+        total: number;
+      } | null;
     };
   } | null;
   /**

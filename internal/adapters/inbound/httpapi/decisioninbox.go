@@ -283,6 +283,14 @@ func decisionInboxItemToDTO(it decisioninbox.Item) restdtos.DecisionInboxItem {
 	if it.PlanID != "" {
 		dto.PlanId = &it.PlanID
 	}
+	// planCutKept/planCutTotal: a plan whose text is a frame the
+	// sandbox-agent cut (technical plan §6.1), which the approval refuses
+	// (ErrPlanCut) -- set together, null for a whole plan.
+	if it.PlanCut != nil {
+		kept, total := it.PlanCut.Kept, it.PlanCut.Total
+		dto.PlanCutKept = &kept
+		dto.PlanCutTotal = &total
+	}
 	if it.SessionID != "" {
 		dto.SessionId = &it.SessionID
 	}

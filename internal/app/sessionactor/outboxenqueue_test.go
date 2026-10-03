@@ -7,8 +7,11 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/framecut"
+	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/domain/turn"
 )
 
@@ -123,4 +126,64 @@ func TestOutcomeText_TerminalTriggers(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestPlanApprovalLinearText_CutPlan_OffersNoApprove pins Linear's plan
+// notice for a plan whose text was cut on its way from the sandbox
+// (technical plan §6.1): it says why the plan cannot be approved
+// (framecut.Reason) and offers no approve keyword, pointing to the revise
+// prefix and the reject keywords instead. A whole plan's notice is
+// unchanged: the approve keywords, the reject keywords and the prefix.
+func TestPlanApprovalLinearText_CutPlan_OffersNoApprove(t *testing.T) {
+	t.Parallel()
+
+	content := "1. Add the migration\n[text cut at 20 of 40960 bytes on its way from the sandbox]"
+	cut := framecut.Cut{Kept: 20, Total: 40960}
+	tests := []struct {
+		name        string
+		cut         *framecut.Cut
+		wantApprove bool
+	}{
+		{name: "a cut plan", cut: &cut},
+		{name: "a cut the server could not read", cut: &framecut.Malformed},
+		{name: "a whole plan", wantApprove: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			text := planApprovalLinearText(3, content, tt.cut)
+			if !strings.HasPrefix(text, "Plan v3 is ready for review:\n\n"+content+"\n\n") {
+				t.Errorf("text = %q, want the plan's version and content first", text)
+			}
+			instructions := strings.TrimPrefix(text, "Plan v3 is ready for review:\n\n"+content)
+			for _, keyword := range plandomain.ApproveKeywords {
+				if got := containsWord(instructions, keyword); got != tt.wantApprove {
+					t.Errorf("instructions %q offer approve keyword %q: %v, want %v", instructions, keyword, got, tt.wantApprove)
+				}
+			}
+			if !strings.Contains(instructions, strings.Join(plandomain.RejectKeywords, "/")) {
+				t.Errorf("instructions %q, want the reject keywords", instructions)
+			}
+			if !strings.Contains(instructions, `"`+plandomain.RevisePrefix+`"`) {
+				t.Errorf("instructions %q, want the revise prefix", instructions)
+			}
+			if reason := framecut.Reason(tt.cut); tt.cut != nil && !strings.Contains(instructions, reason) {
+				t.Errorf("instructions %q, want the reason %q", instructions, reason)
+			}
+			if tt.cut == nil && strings.Contains(instructions, "cut") {
+				t.Errorf("a whole plan's instructions %q mention a cut", instructions)
+			}
+		})
+	}
+}
+
+// containsWord reports whether text holds word as a whole word, so the
+// approve keyword "approve" is not found inside "approved" or "approval".
+func containsWord(text, word string) bool {
+	for _, field := range strings.FieldsFunc(text, func(r rune) bool { return !unicode.IsLetter(r) }) {
+		if field == word {
+			return true
+		}
+	}
+	return false
 }

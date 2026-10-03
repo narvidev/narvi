@@ -56,7 +56,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"sort"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -66,6 +65,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -132,10 +132,12 @@ func ListPlans(sessions *postgres.SessionStore, plans *postgres.PlanStore, turns
 // planRenderedContent is one plan version's own rendered content/structured
 // pair, as planContentMap resolves it -- see that function's own doc
 // comment for the "snapshot first, live recompute as fallback" rule that
-// produces it.
+// produces it -- with the cut its text carries (technical plan §6.1), nil
+// for a whole text and for a snapshot, which records none.
 type planRenderedContent struct {
 	Content    string
 	Structured *plandomain.Structured
+	Cut        *framecut.Cut
 }
 
 // planContentMap resolves restdtos.Plan.content/structured for every row in
@@ -297,6 +299,15 @@ func usablePlanSnapshot(snapshot sqlcgen.PlanDocument, snapshotOK bool) bool {
 //     structured_steps on such a row is never consulted, since a snapshot
 //     with no prose to show has nothing authoritative to pair it with
 //     either.
+//
+// The cut (technical plan §6.1) comes only from the live recompute: its
+// Final reports whether the plan's text is a frame the sandbox-agent cut,
+// and a cut text has no structured steps (plandomain.ExtractStructured). A
+// snapshot reports none: it records what was approved, and the approval
+// refuses a cut plan (ErrPlanCut). A snapshot taken of a cut text by a
+// binary built before cuts existed -- the accepted rollback-window residue
+// -- keeps its marker in its content and reports no cut, by design: it is
+// the record of what a person approved.
 func resolvePlanRenderedContent(planRow sqlcgen.Plan, snapshot sqlcgen.PlanDocument, snapshotOK bool, allTurns []sqlcgen.Turn, contentEvents []plandomain.ContentEvent) (planRenderedContent, error) {
 	if usablePlanSnapshot(snapshot, snapshotOK) {
 		content := *snapshot.Content
@@ -307,12 +318,12 @@ func resolvePlanRenderedContent(planRow sqlcgen.Plan, snapshot sqlcgen.PlanDocum
 			}
 			return planRenderedContent{Content: content, Structured: &structured}, nil
 		}
-		return planRenderedContent{Content: content, Structured: plandomain.ExtractStructured(content)}, nil
+		return planRenderedContent{Content: content, Structured: plandomain.ExtractStructured(content, nil)}, nil
 	}
 
-	content := plandomain.ContentFallbackText
-	if lower, upper, ok := turnContentBounds(allTurns, planRow.TurnID); ok {
-		content = plandomain.ExtractContent(contentEvents, lower, upper)
+	final := plandomain.Final{Text: plandomain.ContentFallbackText}
+	if lower, upper, ok := sessionactor.TurnContentBounds(allTurns, planRow.TurnID); ok {
+		final = plandomain.ExtractContent(contentEvents, lower, upper)
 	}
 	// Defensive: the !ok branch above (plans.turn_id names no dispatched
 	// turn) should be unreachable in practice -- plans.turn_id is a NOT
@@ -321,51 +332,7 @@ func resolvePlanRenderedContent(planRow sqlcgen.Plan, snapshot sqlcgen.PlanDocum
 	// top doc comment) -- but degrades to the SAME honest fallback
 	// ExtractContent itself would return for an empty window, never a
 	// panic on a missing map key.
-	return planRenderedContent{Content: content, Structured: plandomain.ExtractStructured(content)}, nil
-}
-
-// turnContentBounds returns plandomain.ExtractContent's own (lower, upper)
-// bounds for turnID, given every turn dispatched in the session so far (any
-// order, any kind -- an approval-dispatched IMPLEMENTATION turn counts
-// exactly like a plan-producing one, see this file's own top doc comment):
-// lower is turnID's own DispatchedEventID; upper is the DispatchedEventID
-// of whichever DISPATCHED turn ran next in the session, if any (nil when
-// turnID's own turn is the most recently dispatched one so far). ok is
-// false when turnID names no turn in sessionTurns with a DispatchedEventID
-// set at all -- should be unreachable for any real plan's producing turn
-// (a plan row is only ever created once its producing turn has already
-// been dispatched), but is surfaced as a plain bool rather than a panic or
-// a silent unbounded scan, so every caller degrades the SAME honest way
-// (plandomain.ContentFallbackText) instead of assuming it can't happen.
-//
-// Factored out of planContentMap above so httpapi's OTHER caller of this
-// exact bounds calculation (decideplan.go's own approved-plan snapshot,
-// §31.3) shares ONE implementation of an algorithm this package has
-// already been bitten by an off-by-one in once (see plandomain.
-// ExtractContent's own doc comment) -- never a second, independently
-// re-derived copy that can silently drift from this one.
-func turnContentBounds(sessionTurns []sqlcgen.Turn, turnID pgtype.UUID) (lower, upper *int64, ok bool) {
-	dispatched := make([]sqlcgen.Turn, 0, len(sessionTurns))
-	for _, t := range sessionTurns {
-		if t.DispatchedEventID != nil {
-			dispatched = append(dispatched, t)
-		}
-	}
-	sort.Slice(dispatched, func(i, j int) bool {
-		return *dispatched[i].DispatchedEventID < *dispatched[j].DispatchedEventID
-	})
-
-	for i, t := range dispatched {
-		if t.ID != turnID {
-			continue
-		}
-		lower = dispatched[i].DispatchedEventID
-		if i+1 < len(dispatched) {
-			upper = dispatched[i+1].DispatchedEventID
-		}
-		return lower, upper, true
-	}
-	return nil, nil, false
+	return planRenderedContent{Content: final.Text, Structured: plandomain.ExtractStructured(final.Text, final.Cut), Cut: final.Cut}, nil
 }
 
 // planWireMap maps one sqlcgen.Plan row (plus its own separately-resolved
@@ -402,7 +369,17 @@ func planWireMap(p sqlcgen.Plan, rendered planRenderedContent) restdtos.Plan {
 		DecidedBy:   decidedBy,
 		Content:     rendered.Content,
 		Structured:  planStructuredWireMap(rendered.Structured),
+		Cut:         planCutWireMap(rendered.Cut),
 	}
+}
+
+// planCutWireMap maps a plan's cut report onto restdtos.PlanCut -- nil in,
+// nil out: a whole plan reports null, never an empty object.
+func planCutWireMap(c *framecut.Cut) *restdtos.PlanCut {
+	if c == nil {
+		return nil
+	}
+	return &restdtos.PlanCut{Kept: c.Kept, Total: c.Total}
 }
 
 // planStructuredWireMap maps plandomain.ExtractStructured's own output onto

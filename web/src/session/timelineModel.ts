@@ -47,6 +47,14 @@
 // running at deploy"). Placed by the open step, that text would show under
 // the wrong step, or a synthesized one, and its own step would stay blank.
 //
+// A part's text is read from all its frames, not only the newest: a frame
+// the sandbox-agent cut on its way to the control plane (its `cut` set,
+// technical plan §6.1) can be stored before or after the whole text it was
+// taken from, and gives way to it either way (tokenCut.ts's partText, the
+// same rule plan.FinalText applies server-side, held to one shared vector
+// file). A part whose only text is cut reads as cut, its marker in the
+// text and its `cut` on the stream.
+//
 // sub_task_start.parentMessageId correlates against a tool_call's own
 // `messageId` (NOT `callId` -- callId is what tool_result correlates
 // against instead, a distinct id on the very same event, §6.1). A
@@ -75,6 +83,7 @@ import {
   asWarning,
 } from './eventPayloads'
 import { asSandboxStatusChange, endsBootPhase } from './sandboxSnapshot'
+import { type CutFrame, type FrameCut, partText } from './tokenCut'
 
 export interface SubTaskNode {
   subTaskId: string
@@ -97,7 +106,12 @@ export interface ToolCallNode {
 
 export interface TokenStream {
   messageId: string
+  /** The part's text: its newest non-empty frame that yields to no other (tokenCut.ts's partText). */
   text: string
+  /** The cut of the frame text was read from, when the part reads as a frame cut on its way from the sandbox (§6.1); null when it is whole. */
+  cut: FrameCut | null
+  /** The part's non-empty frames in this turn, in log order -- what text and cut are read from. */
+  frames: CutFrame[]
 }
 
 export interface StepCost {
@@ -411,14 +425,20 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
       if (token.subTaskId) continue
       // Upsert-by-messageId, cumulative replace (§6.1), wherever in this
       // turn the part's first frame placed it (this file's top comment).
-      const existing = tokensByMessageId.get(token.messageId)
-      if (existing) {
-        existing.text = token.text
-        continue
+      // The part reads as its newest non-empty frame that yields to no
+      // other: a frame cut on its way from the sandbox gives way to the
+      // whole text it was taken from, whichever was stored first
+      // (tokenCut.ts) -- with no cut, simply the newest non-empty frame.
+      let stream = tokensByMessageId.get(token.messageId)
+      if (!stream) {
+        stream = { messageId: token.messageId, text: '', cut: null, frames: [] }
+        ensureOpenStep(turn, event).tokens.push(stream)
+        tokensByMessageId.set(stream.messageId, stream)
       }
-      const stream: TokenStream = { messageId: token.messageId, text: token.text }
-      ensureOpenStep(turn, event).tokens.push(stream)
-      tokensByMessageId.set(stream.messageId, stream)
+      if (token.text !== '') stream.frames.push({ text: token.text, cut: token.cut ?? null })
+      const picked = partText(stream.frames)
+      stream.text = picked?.text ?? ''
+      stream.cut = picked?.cut ?? null
       continue
     }
     const executionComplete = asExecutionComplete(event)

@@ -61,6 +61,7 @@ import (
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/domain/upload"
@@ -423,6 +424,61 @@ func sdkApprovePlanOpenTurnGate(t *testing.T, rig *oauthRouterRig) {
 		if mcpState.PlanStatus != "awaiting_approval" || mcpState.DecidedAtSet || len(mcpState.Implementations) != 0 || len(mcpState.Audit) != 0 || len(mcpState.OpenTurnStates) != 1 || mcpState.OpenTurnStates[0] != string(open) {
 			t.Fatalf("%s: state after the refused approval %+v, want the plan awaiting, nothing queued or audited, the revision still %s", stage, mcpState, open)
 		}
+	}
+}
+
+// sdkApprovePlanCutPlan is TestOAuth_ProductionRouter's
+// MCPApprovePlan_CutPlan_ToolErrorGivesTheReason, on
+// newWriteTwinsRouterRig's router: an approval over MCP of a plan whose
+// text was cut on its way from the sandbox (technical plan §6.1) is
+// refused with REST's own 409 body -- the reason, framecut.Reason -- as its
+// tool error (mapOutcome), as REST refuses it, and nothing changes: the
+// plan still awaits approval, nothing is queued, snapshotted or audited.
+// The cut frames are injected straight into each plan turn's window, since
+// nothing produces a cut yet.
+func sdkApprovePlanCutPlan(t *testing.T, rig *oauthRouterRig) {
+	ctx := oauthTestCtx(t)
+	flow := rig.connectSDKClient(ctx, t, nil)
+	mcpSession, mcpPlan := seedPlannedSession(ctx, t, rig, flow.member.ID, sqlcgen.PlanStatusAwaitingApproval)
+	restSession, restPlan := seedPlannedSession(ctx, t, rig, flow.member.ID, sqlcgen.PlanStatusAwaitingApproval)
+	cut := framecut.Cut{Kept: 20, Total: 40960}
+	for _, seeded := range []struct{ session, plan pgtype.UUID }{{mcpSession, mcpPlan}, {restSession, restPlan}} {
+		if _, err := rig.pool.Exec(ctx, `UPDATE turns SET dispatched_event_id = (SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id = $1) WHERE id = (SELECT turn_id FROM plans WHERE id = $2)`, seeded.session, seeded.plan); err != nil {
+			t.Fatalf("place the plan turn's window: %v", err)
+		}
+		for _, f := range []struct {
+			key, text string
+			cut       *framecut.Cut
+		}{
+			{key: "prt_plan", text: ""},
+			{key: "prt_plan#cut", text: "1. Add the migration\n[text cut at 20 of 40960 bytes on its way from the sandbox]", cut: &cut},
+		} {
+			payload := map[string]any{"type": "token", "messageId": "prt_plan", "sessionId": seeded.session.String(), "gen": 1, "text": f.text}
+			if f.cut != nil {
+				payload["cut"] = f.cut
+			}
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("marshal token frame: %v", err)
+			}
+			if _, err := rig.pool.Exec(ctx, `INSERT INTO events (session_id, type, payload, message_id) VALUES ($1, 'token', $2, $3)`, seeded.session, raw, f.key); err != nil {
+				t.Fatalf("store token frame: %v", err)
+			}
+		}
+	}
+
+	reason := framecut.Reason(&cut)
+	res := callTool(ctx, t, flow.session, "narvi_approve_plan", map[string]any{"sessionId": mcpSession.String(), "planId": mcpPlan.String()})
+	var refused restError
+	status := rig.doJSON(t, http.MethodPost, "/api/sessions/"+restSession.String()+"/plans/"+restPlan.String()+"/approve", nil, &refused, flow.cookie)
+	if status != http.StatusConflict || refused.Error != reason || !res.IsError || resultText(t, res) != reason {
+		t.Fatalf("REST %d %q, MCP isError %v %+v -- want both refused with the reason %q", status, refused.Error, res.IsError, res.Content, reason)
+	}
+	mcpState, _ := readDecisionState(ctx, t, rig, mcpSession, mcpPlan, flow.member.ID)
+	restState, _ := readDecisionState(ctx, t, rig, restSession, restPlan, flow.member.ID)
+	sameState(t, "a cut plan", mcpState, restState)
+	if mcpState.PlanStatus != "awaiting_approval" || mcpState.DecidedAtSet || len(mcpState.Implementations) != 0 || mcpState.Snapshots != 0 || len(mcpState.Audit) != 0 {
+		t.Fatalf("state after the refused approval %+v, want the plan awaiting, nothing queued, snapshotted or audited", mcpState)
 	}
 }
 

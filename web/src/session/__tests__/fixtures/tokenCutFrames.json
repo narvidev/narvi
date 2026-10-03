@@ -1,0 +1,675 @@
+[
+  {
+    "name": "a cut yields to the whole text it was taken from, stored before it",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration\n2. Wire the store\n3. Cover both with tests\n"
+      },
+      {
+        "id": 3,
+        "text": "1. Add the migration\n[text cut at 20 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 20,
+          "total": 64
+        }
+      }
+    ],
+    "want": {
+      "id": 2,
+      "cut": null
+    },
+    "stored": [
+      1,
+      2
+    ]
+  },
+  {
+    "name": "a cut yields to the whole text it was taken from, stored after it",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration\n[text cut at 20 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 20,
+          "total": 64
+        }
+      },
+      {
+        "id": 3,
+        "text": "1. Add the migration\n2. Wire the store\n3. Cover both with tests\n"
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": null
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "an earlier frame sharing the kept prefix but shorter than total never wins",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "Plan: read the store, then write th"
+      },
+      {
+        "id": 3,
+        "text": "Plan: read the store\n[text cut at 20 of 47 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 20,
+          "total": 47
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": 20,
+        "total": 47
+      }
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "a whole frame one byte longer than total is not the text a cut was taken from",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration\n2. Wire the store\n3. Cover both with tests\nx"
+      },
+      {
+        "id": 3,
+        "text": "1. Add the migration\n[text cut at 20 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 20,
+          "total": 64
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": 20,
+        "total": 64
+      }
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "a whole frame of total bytes that differs inside the kept prefix is not the text a cut was taken from",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add one migration\n2. Wire the store\n3. Cover both with tests\n"
+      },
+      {
+        "id": 3,
+        "text": "1. Add the migration\n[text cut at 20 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 20,
+          "total": 64
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": 20,
+        "total": 64
+      }
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "two cuts of one text: the one keeping more wins, stored first",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration\n2. Wire t\n[text cut at 30 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 30,
+          "total": 64
+        }
+      },
+      {
+        "id": 3,
+        "text": "1. Add the\n[text cut at 10 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 10,
+          "total": 64
+        }
+      }
+    ],
+    "want": {
+      "id": 2,
+      "cut": {
+        "kept": 30,
+        "total": 64
+      }
+    },
+    "stored": [
+      1,
+      2
+    ]
+  },
+  {
+    "name": "two cuts of one text: the one keeping more wins, stored last",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the\n[text cut at 10 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 10,
+          "total": 64
+        }
+      },
+      {
+        "id": 3,
+        "text": "1. Add the migration\n2. Wire t\n[text cut at 30 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 30,
+          "total": 64
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": 30,
+        "total": 64
+      }
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "two cuts of different texts never yield to each other",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration\n2. Wire t\n[text cut at 30 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 30,
+          "total": 64
+        }
+      },
+      {
+        "id": 3,
+        "text": "1. Add the\n[text cut at 10 of 59 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 10,
+          "total": 59
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": 10,
+        "total": 59
+      }
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "the same cut twice: neither yields, and the resend adds no row",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration\n2. Wire t\n[text cut at 30 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 30,
+          "total": 64
+        }
+      },
+      {
+        "id": 3,
+        "text": "1. Add the migration\n2. Wire t\n[text cut at 30 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 30,
+          "total": 64
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": 30,
+        "total": 64
+      }
+    },
+    "stored": [
+      1,
+      2
+    ]
+  },
+  {
+    "name": "a marker-shaped line without cut is text",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration\n2. Wire the store\n3. Cover both with tests\n"
+      },
+      {
+        "id": 3,
+        "text": "1. Add the migration\n[text cut at 20 of 64 bytes on its way from the sandbox]"
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": null
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "a cut ending right before a multi-byte rune yields to its whole text, measured in UTF-8 bytes",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "Schritt 1: Größe prüfen €€€ und dann bauen."
+      },
+      {
+        "id": 3,
+        "text": "Schritt 1: Größe prüfen \n[text cut at 27 of 52 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 27,
+          "total": 52
+        }
+      }
+    ],
+    "want": {
+      "id": 2,
+      "cut": null
+    },
+    "stored": [
+      1,
+      2
+    ]
+  },
+  {
+    "name": "a cut of a multi-byte text with no whole text stored is read as cut",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "Schritt 1: Größe prüfen \n[text cut at 27 of 52 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 27,
+          "total": 52
+        }
+      }
+    ],
+    "want": {
+      "id": 2,
+      "cut": {
+        "kept": 27,
+        "total": 52
+      }
+    },
+    "stored": [
+      1,
+      2
+    ]
+  },
+  {
+    "name": "a malformed cut never yields and is reported as a cut",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration\n2. Wire the store\n3. Cover both with tests\n"
+      },
+      {
+        "id": 3,
+        "text": "1. Add the migration\n[text cut at 20 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": "20",
+          "total": 64
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": -1,
+        "total": -1
+      }
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "a cut keeping its whole total is malformed",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration\n2. Wire the store\n3. Cover both with tests\n"
+      },
+      {
+        "id": 3,
+        "text": "1. Add the migration\n[text cut at 20 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 64,
+          "total": 64
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": -1,
+        "total": -1
+      }
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "a cut with a property the contract does not define is malformed",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration\n2. Wire the store\n3. Cover both with tests\n"
+      },
+      {
+        "id": 3,
+        "text": "1. Add the migration\n[text cut at 20 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 20,
+          "total": 64,
+          "extra": 1
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": -1,
+        "total": -1
+      }
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "a whole frame does not yield to a malformed cut",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration\n[text cut at 20 of 64 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": "20",
+          "total": 64
+        }
+      },
+      {
+        "id": 3,
+        "text": "1. Add the migration\n2. Wire the store\n3. Cover both with tests\n"
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": null
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "a null cut is a whole frame",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration\n2. Wire the store\n3. Cover both with tests\n",
+        "cut": null
+      }
+    ],
+    "want": {
+      "id": 2,
+      "cut": null
+    },
+    "stored": [
+      1,
+      2
+    ]
+  },
+  {
+    "name": "no cut anywhere: the newest non-empty frame",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "1. Add the migration"
+      },
+      {
+        "id": 3,
+        "text": "1. Add the migration\n2. Wire the store\n3. Cover both with tests\n"
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": null
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "a kept inside a character is compared byte for byte, and yields to a whole text holding that character",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "Größe"
+      },
+      {
+        "id": 3,
+        "text": "Grö\n[text cut at 3 of 7 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 3,
+          "total": 7
+        }
+      }
+    ],
+    "want": {
+      "id": 2,
+      "cut": null
+    },
+    "stored": [
+      1,
+      2
+    ]
+  },
+  {
+    "name": "a cut whose split character was replaced yields to nothing and is read as cut",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "Größe"
+      },
+      {
+        "id": 3,
+        "text": "Gr�\n[text cut at 3 of 7 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 3,
+          "total": 7
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": 3,
+        "total": 7
+      }
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "a cut keeping more than its text holds never yields",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "abcd\n\n"
+      },
+      {
+        "id": 3,
+        "text": "abcd",
+        "cut": {
+          "kept": 5,
+          "total": 6
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": 5,
+        "total": 6
+      }
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "only an empty frame: no text",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      }
+    ],
+    "want": null,
+    "stored": [
+      1
+    ]
+  }
+]

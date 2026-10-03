@@ -206,7 +206,9 @@ func (q *Queries) GetBootP95InWindow(ctx context.Context, createdAt pgtype.Times
 const getLatestTokenFrameForPart = `-- name: GetLatestTokenFrameForPart :one
 SELECT latest.id, COALESCE(latest.payload->>'text', '')::text AS text,
     first_frame.id AS first_id,
-    COALESCE(first_frame.payload->>'text', '')::text AS first_text
+    COALESCE(first_frame.payload->>'text', '')::text AS first_text,
+    COALESCE(latest.payload->'cut', 'null'::jsonb)::jsonb AS cut,
+    COALESCE(first_frame.payload->'cut', 'null'::jsonb)::jsonb AS first_cut
 FROM events AS latest
 CROSS JOIN LATERAL (
     SELECT part_frame.id, part_frame.payload
@@ -234,6 +236,8 @@ type GetLatestTokenFrameForPartRow struct {
 	Text      string `json:"text"`
 	FirstID   int64  `json:"first_id"`
 	FirstText string `json:"first_text"`
+	Cut       []byte `json:"cut"`
+	FirstCut  []byte `json:"first_cut"`
 }
 
 // The newest stored frame (highest id) of one streamed text part, plus the
@@ -259,6 +263,13 @@ type GetLatestTokenFrameForPartRow struct {
 // exists when the newest does -- the newest is itself a frame of the part
 // -- so the join never drops a row. pgx.ErrNoRows means no frame of this
 // part is stored yet.
+//
+// cut and first_cut are the two frames' `cut` properties, raw (JSON null
+// when a frame carries none): a frame the sandbox-agent cut on its way to
+// the control plane records it there (§6.1), and the session actor adds no
+// row for a cut frame that yields to the stored whole text it was taken
+// from (internal/domain/framecut). They read the payload already fetched,
+// so the index still serves both halves.
 func (q *Queries) GetLatestTokenFrameForPart(ctx context.Context, arg GetLatestTokenFrameForPartParams) (GetLatestTokenFrameForPartRow, error) {
 	row := q.db.QueryRow(ctx, getLatestTokenFrameForPart, arg.SessionID, arg.PartID)
 	var i GetLatestTokenFrameForPartRow
@@ -267,6 +278,8 @@ func (q *Queries) GetLatestTokenFrameForPart(ctx context.Context, arg GetLatestT
 		&i.Text,
 		&i.FirstID,
 		&i.FirstText,
+		&i.Cut,
+		&i.FirstCut,
 	)
 	return i, err
 }
@@ -552,6 +565,65 @@ func (q *Queries) ListSubTaskStartEventsForTurn(ctx context.Context, arg ListSub
 		arg.Gen,
 		arg.DispatchedEventID,
 		arg.NextDispatchedEventID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Event
+	for rows.Next() {
+		var i Event
+		if err := rows.Scan(
+			&i.ID,
+			&i.SessionID,
+			&i.Type,
+			&i.Payload,
+			&i.CreatedAt,
+			&i.MessageID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTokenFramesInWindow = `-- name: ListTokenFramesInWindow :many
+SELECT id, session_id, type, payload, created_at, message_id FROM events
+WHERE session_id = $1
+  AND type = 'token'
+  AND id > $2::bigint
+  AND ($3::bigint IS NULL OR id <= $3::bigint)
+ORDER BY id DESC
+LIMIT $4::int
+`
+
+type ListTokenFramesInWindowParams struct {
+	SessionID pgtype.UUID `json:"session_id"`
+	LowerID   int64       `json:"lower_id"`
+	UpperID   *int64      `json:"upper_id"`
+	RowLimit  int32       `json:"row_limit"`
+}
+
+// The `token` frames of one turn's window of session_id's log, newest id
+// first: id above lower_id (the turn's dispatched_event_id, exclusive) and,
+// when upper_id is not NULL, at or below it (the next dispatched turn's
+// dispatched_event_id, inclusive -- the bounds plan.FinalText applies,
+// sessionactor.TurnContentBounds). The decision inbox reads each awaiting
+// plan's final text through it, to report a cut plan (technical plan §16,
+// §6.1), instead of the 2000-event tail planContentText reads: a range on
+// events_session_id_id_idx (migrations/000008_events.up.sql) bounded by the
+// turn, of which only the token rows are returned. Capped by row_limit,
+// newest first, like every other bounded read of the log.
+func (q *Queries) ListTokenFramesInWindow(ctx context.Context, arg ListTokenFramesInWindowParams) ([]Event, error) {
+	rows, err := q.db.Query(ctx, listTokenFramesInWindow,
+		arg.SessionID,
+		arg.LowerID,
+		arg.UpperID,
+		arg.RowLimit,
 	)
 	if err != nil {
 		return nil, err

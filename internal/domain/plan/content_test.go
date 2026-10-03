@@ -1,6 +1,13 @@
 package plan
 
-import "testing"
+import (
+	"encoding/json"
+	"os"
+	"reflect"
+	"testing"
+
+	"github.com/narvidev/narvi/internal/domain/framecut"
+)
 
 func i64(n int64) *int64 { return &n }
 
@@ -271,8 +278,8 @@ func TestExtractContent(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := ExtractContent(tt.events, tt.lowerBoundEventID, tt.upperBoundEventID)
-			if got != tt.want {
-				t.Errorf("ExtractContent() = %q, want %q", got, tt.want)
+			if got != (Final{Text: tt.want}) {
+				t.Errorf("ExtractContent() = %+v, want %q with no cut", got, tt.want)
 			}
 		})
 	}
@@ -335,16 +342,183 @@ func TestFinalText(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, ok := FinalText(tt.events, tt.lower, tt.upper)
-			if got != tt.want || ok != tt.wantOK {
-				t.Errorf("FinalText() = (%q, %v), want (%q, %v)", got, ok, tt.want, tt.wantOK)
+			if got != (Final{Text: tt.want}) || ok != tt.wantOK {
+				t.Errorf("FinalText() = (%+v, %v), want (%q, %v) with no cut", got, ok, tt.want, tt.wantOK)
 			}
 			wantContent := tt.want
 			if !tt.wantOK {
 				wantContent = ContentFallbackText
 			}
-			if content := ExtractContent(tt.events, tt.lower, tt.upper); content != wantContent {
-				t.Errorf("ExtractContent() = %q, want FinalText's text or the placeholder, %q", content, wantContent)
+			if content := ExtractContent(tt.events, tt.lower, tt.upper); content != (Final{Text: wantContent}) {
+				t.Errorf("ExtractContent() = %+v, want FinalText's text or the placeholder, %q, with no cut", content, wantContent)
 			}
 		})
+	}
+}
+
+// tokenCutFramesFixture is the vector file framecut and the web timeline
+// read too (web/src/session/__tests__/fixtures/tokenCutFrames.json).
+const tokenCutFramesFixture = "../../../web/src/session/__tests__/fixtures/tokenCutFrames.json"
+
+type cutVector struct {
+	Name   string `json:"name"`
+	Frames []struct {
+		ID   int64           `json:"id"`
+		Text string          `json:"text"`
+		Cut  json.RawMessage `json:"cut"`
+	} `json:"frames"`
+	Want *struct {
+		ID  int64         `json:"id"`
+		Cut *framecut.Cut `json:"cut"`
+	} `json:"want"`
+}
+
+func readCutVectors(t *testing.T) []cutVector {
+	t.Helper()
+	raw, err := os.ReadFile(tokenCutFramesFixture)
+	if err != nil {
+		t.Fatalf("read %s: %v", tokenCutFramesFixture, err)
+	}
+	var cases []cutVector
+	if err := json.Unmarshal(raw, &cases); err != nil {
+		t.Fatalf("decode %s: %v", tokenCutFramesFixture, err)
+	}
+	if len(cases) == 0 {
+		t.Fatalf("%s holds no case", tokenCutFramesFixture)
+	}
+	return cases
+}
+
+// TestFinalText_SharedVectors reads each vector's part as the turn's last
+// text part, its frames stored at ids 11.. above a dispatch watermark of
+// 10, behind an earlier part of narration, with the events newest first as
+// every caller supplies them.
+func TestFinalText_SharedVectors(t *testing.T) {
+	for _, tt := range readCutVectors(t) {
+		t.Run(tt.Name, func(t *testing.T) {
+			events := []ContentEvent{
+				{ID: 11, Type: "token", MessageID: "prt_narration", Text: "Let me read the repository first."},
+				{ID: 12, Type: "step_start"},
+			}
+			byID := map[int64]Final{}
+			for _, f := range tt.Frames {
+				id := 12 + f.ID
+				cut := framecut.DecodeCut(f.Cut)
+				events = append(events, ContentEvent{ID: id, Type: "token", MessageID: "prt_plan", Text: f.Text, Cut: cut})
+				byID[f.ID] = Final{Text: f.Text, Cut: cut}
+			}
+			newestFirst := make([]ContentEvent, len(events))
+			for i, e := range events {
+				newestFirst[len(events)-1-i] = e
+			}
+
+			got, ok := FinalText(newestFirst, i64(10), nil)
+			if tt.Want == nil {
+				// The part has no text: the turn's final text is the
+				// narration before it, read whole.
+				if !ok || got != (Final{Text: "Let me read the repository first."}) {
+					t.Fatalf("FinalText() = (%+v, %v), want the narration part", got, ok)
+				}
+				return
+			}
+			want := Final{Text: byID[tt.Want.ID].Text, Cut: tt.Want.Cut}
+			if !ok || got.Text != want.Text || !reflect.DeepEqual(got.Cut, want.Cut) {
+				t.Errorf("FinalText() = (%q, %+v, %v), want frame %d (%q, %+v)", got.Text, got.Cut, ok, tt.Want.ID, want.Text, want.Cut)
+			}
+			if content := ExtractContent(newestFirst, i64(10), nil); content.Text != want.Text || !reflect.DeepEqual(content.Cut, want.Cut) {
+				t.Errorf("ExtractContent() = %+v, want FinalText's %+v", content, want)
+			}
+		})
+	}
+}
+
+// TestFinalText_MarkerShapedLineWithoutCut_IsText pins that FinalText and
+// the plan parser learn a cut only from `cut`: a part whose text ends in a
+// line shaped like the cutter's marker, carrying no `cut`, is the model's
+// own text, read whole, no cut reported, its structured steps read.
+func TestFinalText_MarkerShapedLineWithoutCut_IsText(t *testing.T) {
+	text := "The plan.\n\n```plan-steps\n" +
+		`{"steps":[{"title":"T","description":"D","fileRefs":["a.go"]}],"scopeEstimate":"1 file"}` +
+		"\n```\n[text cut at 12 of 40960 bytes on its way from the sandbox]"
+	events := []ContentEvent{
+		{ID: 13, Type: "token", MessageID: "prt_a", Text: text},
+		{ID: 12, Type: "token", MessageID: "prt_a", Text: ""},
+	}
+	got, ok := FinalText(events, i64(10), nil)
+	if !ok || got != (Final{Text: text}) {
+		t.Fatalf("FinalText() = (%+v, %v), want the whole text with no cut", got, ok)
+	}
+	if ExtractStructured(got.Text, got.Cut) == nil {
+		t.Error("ExtractStructured() = nil, want the plan's steps: a marker-shaped line is text")
+	}
+}
+
+// TestFinalText_ReportsOnlyTheLastPartsCut pins that the cut reported is
+// the final text's: a cut earlier part does not make the turn's final text
+// cut, and a cut last part does, whatever came before it.
+func TestFinalText_ReportsOnlyTheLastPartsCut(t *testing.T) {
+	cut := &framecut.Cut{Kept: 4, Total: 40}
+	cutText := "Narr\n[text cut at 4 of 40 bytes on its way from the sandbox]"
+	tests := []struct {
+		name   string
+		events []ContentEvent
+		want   Final
+	}{
+		{
+			name: "an earlier part cut, the last part whole",
+			events: []ContentEvent{
+				{ID: 15, Type: "token", MessageID: "prt_b", Text: "The plan."},
+				{ID: 14, Type: "token", MessageID: "prt_b", Text: ""},
+				{ID: 12, Type: "token", MessageID: "prt_a", Text: cutText, Cut: cut},
+				{ID: 11, Type: "token", MessageID: "prt_a", Text: ""},
+			},
+			want: Final{Text: "The plan."},
+		},
+		{
+			name: "the last part cut",
+			events: []ContentEvent{
+				{ID: 15, Type: "token", MessageID: "prt_b", Text: cutText, Cut: cut},
+				{ID: 14, Type: "token", MessageID: "prt_b", Text: ""},
+				{ID: 12, Type: "token", MessageID: "prt_a", Text: "Narration."},
+			},
+			want: Final{Text: cutText, Cut: cut},
+		},
+		{
+			// The part a reader would see last by its newest row is the
+			// earlier one; the part that opened last is cut, and is read.
+			name: "the part that opened last is cut, an earlier part's frame stored after it",
+			events: []ContentEvent{
+				{ID: 16, Type: "token", MessageID: "prt_a", Text: "Narration, replayed."},
+				{ID: 15, Type: "token", MessageID: "prt_b", Text: cutText, Cut: cut},
+				{ID: 13, Type: "token", MessageID: "prt_b", Text: ""},
+				{ID: 12, Type: "token", MessageID: "prt_a", Text: ""},
+			},
+			want: Final{Text: cutText, Cut: cut},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := FinalText(tt.events, i64(10), nil)
+			if !ok || got.Text != tt.want.Text || !reflect.DeepEqual(got.Cut, tt.want.Cut) {
+				t.Errorf("FinalText() = (%+v, %v), want %+v", got, ok, tt.want)
+			}
+		})
+	}
+}
+
+// TestExtractStructured_CutContent_NoStructure pins that a cut plan has no
+// structured steps even when the cut left a complete block intact near its
+// start: the content is not the plan the model wrote, whole.
+func TestExtractStructured_CutContent_NoStructure(t *testing.T) {
+	content := "```plan-steps\n" +
+		`{"steps":[{"title":"T","description":"D","fileRefs":["a.go"]}],"scopeEstimate":"1 file"}` +
+		"\n```\nProse that the cut ended early\n[text cut at 140 of 40960 bytes on its way from the sandbox]"
+	if ExtractStructured(content, nil) == nil {
+		t.Fatal("fixture bug: this content must extract when whole, or the check below is vacuous")
+	}
+	for _, cut := range []framecut.Cut{{Kept: 140, Total: 40960}, framecut.Malformed} {
+		if got := ExtractStructured(content, &cut); got != nil {
+			t.Errorf("ExtractStructured(content, %+v) = %+v, want nil", cut, got)
+		}
 	}
 }

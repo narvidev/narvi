@@ -140,9 +140,18 @@ LIMIT $2;
 -- exists when the newest does -- the newest is itself a frame of the part
 -- -- so the join never drops a row. pgx.ErrNoRows means no frame of this
 -- part is stored yet.
+--
+-- cut and first_cut are the two frames' `cut` properties, raw (JSON null
+-- when a frame carries none): a frame the sandbox-agent cut on its way to
+-- the control plane records it there (§6.1), and the session actor adds no
+-- row for a cut frame that yields to the stored whole text it was taken
+-- from (internal/domain/framecut). They read the payload already fetched,
+-- so the index still serves both halves.
 SELECT latest.id, COALESCE(latest.payload->>'text', '')::text AS text,
     first_frame.id AS first_id,
-    COALESCE(first_frame.payload->>'text', '')::text AS first_text
+    COALESCE(first_frame.payload->>'text', '')::text AS first_text,
+    COALESCE(latest.payload->'cut', 'null'::jsonb)::jsonb AS cut,
+    COALESCE(first_frame.payload->'cut', 'null'::jsonb)::jsonb AS first_cut
 FROM events AS latest
 CROSS JOIN LATERAL (
     SELECT part_frame.id, part_frame.payload
@@ -158,6 +167,25 @@ WHERE latest.session_id = sqlc.arg(session_id)
   AND latest.payload->>'messageId' = sqlc.arg(part_id)::text
 ORDER BY latest.id DESC
 LIMIT 1;
+
+-- name: ListTokenFramesInWindow :many
+-- The `token` frames of one turn's window of session_id's log, newest id
+-- first: id above lower_id (the turn's dispatched_event_id, exclusive) and,
+-- when upper_id is not NULL, at or below it (the next dispatched turn's
+-- dispatched_event_id, inclusive -- the bounds plan.FinalText applies,
+-- sessionactor.TurnContentBounds). The decision inbox reads each awaiting
+-- plan's final text through it, to report a cut plan (technical plan §16,
+-- §6.1), instead of the 2000-event tail planContentText reads: a range on
+-- events_session_id_id_idx (migrations/000008_events.up.sql) bounded by the
+-- turn, of which only the token rows are returned. Capped by row_limit,
+-- newest first, like every other bounded read of the log.
+SELECT * FROM events
+WHERE session_id = sqlc.arg(session_id)
+  AND type = 'token'
+  AND id > sqlc.arg(lower_id)::bigint
+  AND (sqlc.narg(upper_id)::bigint IS NULL OR id <= sqlc.narg(upper_id)::bigint)
+ORDER BY id DESC
+LIMIT sqlc.arg(row_limit)::int;
 
 -- (§26.4/§7.1's own post-hoc sub-task corroboration): the two
 -- queries below are this codebase's FIRST use of a payload->>'gen' JSONB

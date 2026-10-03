@@ -10,6 +10,8 @@ import (
 	"strings"
 
 	"github.com/jackc/pgx/v5"
+
+	"github.com/narvidev/narvi/internal/domain/framecut"
 )
 
 // This file decides how one streamed `token` frame reaches the append-only
@@ -39,10 +41,28 @@ import (
 // frame replayed out of order would overwrite a newer one. Each DISTINCT
 // frame is instead stored as its own row, so the log stays append-only and
 // every frame is broadcast once. Readers fold `token` rows by the
-// PAYLOAD's messageId: a part reads as its newest frame, and sits where its
+// PAYLOAD's messageId: a part reads as its newest frame -- the newest that
+// yields to no other, once a frame the sandbox-agent cut is among them
+// (internal/domain/framecut, "Cut frames" below) -- and sits where its
 // FIRST frame is (web timelineModel, plan.ExtractContent; see "The turn
 // running at deploy" for why the first); the storage key never leaves the
 // store.
+//
+// # Cut frames
+//
+// The sandbox-agent writes a frame cut to what a connection reads, its
+// `cut` property recording what it kept (§6.1), so one part can reach the
+// log whole on one connection and cut on another, in either order. Every
+// reader applies one rule to it, framecut.YieldsTo: a cut frame gives way
+// to the whole text it was taken from (exactly cut.total bytes, starting
+// with the bytes it kept) and to a cut of that text keeping more. Here
+// that rule is tokenFrameAddsNoRow's: a cut frame that yields to the part's
+// first or newest stored frame adds no row. The plan reader
+// (plan.FinalText) and the web timeline read a part by it whatever order
+// its frames were stored in, so a part stored cut and then whole reads
+// whole too. A part whose only text is cut reads as cut, its marker
+// visible and its cut reported, and a plan so read cannot be approved
+// (httpapi.ErrPlanCut).
 //
 // # Storage keys, and the binary before this one
 //
@@ -217,14 +237,26 @@ func tokenPartFromEarlierTurn(firstFrameID int64, dispatchedEventID *int64) bool
 	return dispatchedEventID != nil && firstFrameID <= *dispatchedEventID
 }
 
-// tokenFrameAddsNoRow reports whether a `token` frame whose text is
-// incoming must add no row, given first and latest, the texts of the first
-// and the newest frames already stored for the same part.
+// tokenFrameAddsNoRow reports whether the `token` frame incoming must add
+// no row, given first and latest, the first and the newest frames already
+// stored for the same part (each its text and its `cut`, §6.1).
 //
-// It adds no row when it is either of those frames again -- the first one
-// is stored under the bare part id, which a resend of it no longer matches
-// by key (tokenFrameStorageKey), and every other stored frame dedupes on
-// its key anyway -- or when it is an OLDER frame of the part replayed
+// It adds no row when it is either of those frames again -- the same text:
+// the first one is stored under the bare part id, which a resend of it no
+// longer matches by key (tokenFrameStorageKey), and every other stored
+// frame dedupes on its key anyway -- or when it is a cut frame that yields
+// to either of them (framecut.YieldsTo): that frame is the whole text the
+// cut was taken from, or a cut of that text keeping more. The
+// sandbox-agent cuts a frame to what a connection reads, so a part stored
+// whole on a connection that read it is written cut on the next one that
+// does not -- a control plane built before cuts, during a rolling deploy or
+// after a rollback -- and the replay brings the cut back here. Every reader
+// reads that part as its whole text either way (framecut.PartText); the
+// guard keeps the log from growing a row for it, two cuts included. A cut
+// frame that yields to neither -- one of a text never stored whole -- adds
+// its row, and the part reads as cut.
+//
+// It adds no row either when it is an OLDER frame of the part replayed
 // late: a strict prefix of latest that is missing some non-whitespace
 // text. That happens when an earlier frame failed to persist while a
 // later one succeeded, and the sandbox then replays its buffer after a
@@ -241,14 +273,17 @@ func tokenPartFromEarlierTurn(firstFrameID int64, dispatchedEventID *int64) bool
 // A frame that is not a prefix of latest at all is a rewrite, not a
 // replay, and adds its row: the newest arrival wins, as it does for every
 // other reader of the log.
-func tokenFrameAddsNoRow(incoming, first, latest string) bool {
-	if incoming == latest || incoming == first {
+func tokenFrameAddsNoRow(incoming, first, latest framecut.Frame) bool {
+	if incoming.Text == latest.Text || incoming.Text == first.Text {
 		return true
 	}
-	if len(incoming) > len(latest) || !strings.HasPrefix(latest, incoming) {
+	if framecut.YieldsTo(incoming, latest) || framecut.YieldsTo(incoming, first) {
+		return true
+	}
+	if len(incoming.Text) > len(latest.Text) || !strings.HasPrefix(latest.Text, incoming.Text) {
 		return false
 	}
-	return strings.TrimSpace(latest[len(incoming):]) != ""
+	return strings.TrimSpace(latest.Text[len(incoming.Text):]) != ""
 }
 
 // appendTokenFrame stores one inbound `token` frame inside tx: the
@@ -280,8 +315,9 @@ func (a *Actor) appendTokenFrame(ctx context.Context, tx pgx.Tx, cmd SandboxEven
 	}
 
 	var frame struct {
-		MessageID string `json:"messageId"`
-		Text      string `json:"text"`
+		MessageID string          `json:"messageId"`
+		Text      string          `json:"text"`
+		Cut       json.RawMessage `json:"cut"`
 	}
 	if err := json.Unmarshal(cmd.Raw, &frame); err != nil {
 		a.logger.Warn("sessionactor: token frame not decodable; storing it under its wire messageId",
@@ -300,7 +336,10 @@ func (a *Actor) appendTokenFrame(ctx context.Context, tx pgx.Tx, cmd SandboxEven
 				"turn_id", processing.ID.String())
 			return false, nil
 		}
-		if tokenFrameAddsNoRow(frame.Text, part.FirstText, part.LatestText) {
+		incoming := framecut.Frame{Text: frame.Text, Cut: framecut.DecodeCut(frame.Cut)}
+		first := framecut.Frame{Text: part.FirstText, Cut: part.FirstCut}
+		latest := framecut.Frame{Text: part.LatestText, Cut: part.LatestCut}
+		if tokenFrameAddsNoRow(incoming, first, latest) {
 			return false, nil
 		}
 	}

@@ -8,14 +8,27 @@
 // reviewRendering.test.tsx/membersRendering.test.tsx's own established
 // pattern exactly: renderToStaticMarkup, no jsdom needed, proving React's
 // default escaping is actually in effect.
-import { describe, expect, it } from 'vitest'
+import type { ReactNode } from 'react'
+import { describe, expect, it, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import type * as ReactRouter from '@tanstack/react-router'
 
 import type { DecisionInboxItem } from '@narvi/contracts/rest-dtos'
 
 import { DecisionInboxRow, RequiredChecksNotReadNotice, ScmStatusBanner } from '../DecisionInboxView'
+import { cutReason } from '../tokenCut'
 import { isSafeHref } from '../urlSafety'
+
+// A plan row links to its plan ("Open"), a TanStack Router <Link>, and a
+// static render has no router: Link renders as a bare anchor with no href
+// (workflowRunsViewWiring.test.tsx's own stand-in), so the plan row can be
+// rendered. No test below reads an href a Link would have built.
+vi.mock('@tanstack/react-router', async (importOriginal) => {
+  const actual = await importOriginal<typeof ReactRouter>()
+  const { createElement } = await import('react')
+  return { ...actual, Link: ({ children }: { children?: ReactNode }) => createElement('a', null, children) }
+})
 
 const XSS_IMG = '<img src=x onerror=alert(1)>'
 const XSS_SCRIPT = '<script>alert(document.cookie)</script>'
@@ -58,6 +71,8 @@ function baseItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem
     manifestCoveragePartial: null,
     aggregateReviewTriggered: null,
     planId: null,
+    planCutKept: null,
+    planCutTotal: null,
     sessionId: null,
     failureReason: null,
     automationId: null,
@@ -738,5 +753,34 @@ describe('RequiredChecksNotReadNotice -- outbound off is a stable notice, not a 
     expect(html).toContain('Merge is still offered on a pull request that meets everything else')
     expect(html).not.toContain('sync-banner-warn')
     expect(html).not.toContain('Temporarily unable')
+  })
+})
+
+// A plan whose text was cut on its way from the sandbox (planCutKept/
+// planCutTotal, technical plan §6.1) is one the server refuses to approve:
+// its row shows the reason in place of "Approve & build", and keeps Open.
+describe('DecisionInboxRow -- a cut plan', () => {
+  function planItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem {
+    return baseItem({ kind: 'awaiting_approval', title: 'A plan', planId: 'p1', sessionId: 's1', ...overrides })
+  }
+
+  it('the reason replaces "Approve & build", and Open stays', () => {
+    const html = withQueryClient(<DecisionInboxRow item={planItem({ planCutKept: 4096, planCutTotal: 40960 })} canMerge={false} />)
+    expect(html).not.toContain('Approve &amp; build')
+    expect(html).toContain(cutReason({ kept: 4096, total: 40960 }))
+    expect(html).toContain('>Open<')
+  })
+
+  it('a cut the server could not read is still a cut', () => {
+    const html = withQueryClient(<DecisionInboxRow item={planItem({ planCutKept: -1, planCutTotal: -1 })} canMerge={false} />)
+    expect(html).not.toContain('Approve &amp; build')
+    expect(html).toContain(cutReason({ kept: -1, total: -1 }))
+  })
+
+  it('a whole plan offers "Approve & build" and no cut reason', () => {
+    const html = withQueryClient(<DecisionInboxRow item={planItem()} canMerge={false} />)
+    expect(html).toContain('Approve &amp; build')
+    expect(html).not.toContain('No approval for this plan')
+    expect(html).toContain('>Open<')
   })
 })

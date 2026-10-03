@@ -3151,6 +3151,22 @@ type DecisionInboxItem struct {
 	// OutboxKind corresponds to the JSON schema field "outboxKind".
 	OutboxKind DecisionInboxItemOutboxKind `json:"outboxKind" yaml:"outboxKind" mapstructure:"outboxKind"`
 
+	// kind=awaiting_approval, a plan (not a handoff PR) only: set, with planCutTotal,
+	// when the plan's text is a frame the sandbox-agent cut on its way to the control
+	// plane (technical plan §6.1) -- the bytes of the text kept, in UTF-8 bytes; -1
+	// when the frame carried a cut this server could not read. Read from the plan's
+	// own turn window of the event log (internal/domain/plan.FinalText's cut report),
+	// the read the approval itself makes, so a row with a cut is one the approval
+	// refuses: a client shows the reason in place of Approve, keeping Open. Null for
+	// a whole plan, and for every other kind. Flattened like provenanceKind, per this
+	// object's own description.
+	PlanCutKept DecisionInboxItemPlanCutKept `json:"planCutKept" yaml:"planCutKept" mapstructure:"planCutKept"`
+
+	// kind=awaiting_approval, a plan only: the cut text's whole length in UTF-8
+	// bytes, set exactly when planCutKept is; -1 when the frame carried a cut this
+	// server could not read.
+	PlanCutTotal DecisionInboxItemPlanCutTotal `json:"planCutTotal" yaml:"planCutTotal" mapstructure:"planCutTotal"`
+
 	// kind=awaiting_approval, a plan (not a handoff PR) only.
 	PlanId DecisionInboxItemPlanId `json:"planId" yaml:"planId" mapstructure:"planId"`
 
@@ -3467,6 +3483,22 @@ type DecisionInboxItemOutboxId *string
 
 type DecisionInboxItemOutboxKind *string
 
+// kind=awaiting_approval, a plan (not a handoff PR) only: set, with planCutTotal,
+// when the plan's text is a frame the sandbox-agent cut on its way to the control
+// plane (technical plan §6.1) -- the bytes of the text kept, in UTF-8 bytes; -1
+// when the frame carried a cut this server could not read. Read from the plan's
+// own turn window of the event log (internal/domain/plan.FinalText's cut report),
+// the read the approval itself makes, so a row with a cut is one the approval
+// refuses: a client shows the reason in place of Approve, keeping Open. Null for a
+// whole plan, and for every other kind. Flattened like provenanceKind, per this
+// object's own description.
+type DecisionInboxItemPlanCutKept *int
+
+// kind=awaiting_approval, a plan only: the cut text's whole length in UTF-8 bytes,
+// set exactly when planCutKept is; -1 when the frame carried a cut this server
+// could not read.
+type DecisionInboxItemPlanCutTotal *int
+
 // kind=awaiting_approval, a plan (not a handoff PR) only.
 type DecisionInboxItemPlanId *string
 
@@ -3628,6 +3660,12 @@ func (j *DecisionInboxItem) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["outboxKind"]; raw != nil && !ok {
 		return fmt.Errorf("field outboxKind in DecisionInboxItem: required")
+	}
+	if _, ok := raw["planCutKept"]; raw != nil && !ok {
+		return fmt.Errorf("field planCutKept in DecisionInboxItem: required")
+	}
+	if _, ok := raw["planCutTotal"]; raw != nil && !ok {
+		return fmt.Errorf("field planCutTotal in DecisionInboxItem: required")
 	}
 	if _, ok := raw["planId"]; raw != nil && !ok {
 		return fmt.Errorf("field planId in DecisionInboxItem: required")
@@ -6206,6 +6244,21 @@ type Plan struct {
 	// CreatedAt corresponds to the JSON schema field "createdAt".
 	CreatedAt time.Time `json:"createdAt" yaml:"createdAt" mapstructure:"createdAt"`
 
+	// The cut this plan's text carries, when it is a frame the sandbox-agent cut on
+	// its way to the control plane (technical plan §6.1): kept, the bytes of the
+	// plan's text kept, and total, its whole length, both in UTF-8 bytes of the
+	// unescaped text; both -1 when the frame carried a cut this server could not
+	// read. Read from the frames content is read from
+	// (internal/domain/plan.FinalText's cut report), never from content's text, which
+	// ends with the cut's marker line, '[text cut at <kept> of <total> bytes on its
+	// way from the sandbox]', and which a client may shorten for display. A plan with
+	// a cut cannot be approved: POST /api/sessions/{sessionID}/plans/{planId}/approve
+	// answers 409 with the reason, and a client shows that reason where Approve would
+	// be, keeping Request changes and Reject. Null when the text is whole, and for a
+	// plan whose content comes from its approval snapshot (plan_documents), which
+	// records none: such a plan was approved whole.
+	Cut *PlanCut `json:"cut" yaml:"cut" mapstructure:"cut"`
+
 	// Null while status is 'awaiting_approval'; set the moment a decision
 	// (approve/reject, from any entry point) is recorded. goJSONSchema forces the
 	// literal *time.Time type (rather than go-jsonschema's own default generated
@@ -6337,6 +6390,48 @@ func (j *PlanActionResponse) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = PlanActionResponse(plain)
+	return nil
+}
+
+// The cut this plan's text carries, when it is a frame the sandbox-agent cut on
+// its way to the control plane (technical plan §6.1): kept, the bytes of the
+// plan's text kept, and total, its whole length, both in UTF-8 bytes of the
+// unescaped text; both -1 when the frame carried a cut this server could not read.
+// Read from the frames content is read from (internal/domain/plan.FinalText's cut
+// report), never from content's text, which ends with the cut's marker line,
+// '[text cut at <kept> of <total> bytes on its way from the sandbox]', and which a
+// client may shorten for display. A plan with a cut cannot be approved: POST
+// /api/sessions/{sessionID}/plans/{planId}/approve answers 409 with the reason,
+// and a client shows that reason where Approve would be, keeping Request changes
+// and Reject. Null when the text is whole, and for a plan whose content comes from
+// its approval snapshot (plan_documents), which records none: such a plan was
+// approved whole.
+type PlanCut struct {
+	// Kept corresponds to the JSON schema field "kept".
+	Kept int `json:"kept" yaml:"kept" mapstructure:"kept"`
+
+	// Total corresponds to the JSON schema field "total".
+	Total int `json:"total" yaml:"total" mapstructure:"total"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *PlanCut) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["kept"]; raw != nil && !ok {
+		return fmt.Errorf("field kept in PlanCut: required")
+	}
+	if _, ok := raw["total"]; raw != nil && !ok {
+		return fmt.Errorf("field total in PlanCut: required")
+	}
+	type Plain PlanCut
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = PlanCut(plain)
 	return nil
 }
 
@@ -6491,6 +6586,9 @@ func (j *Plan) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["createdAt"]; raw != nil && !ok {
 		return fmt.Errorf("field createdAt in Plan: required")
+	}
+	if _, ok := raw["cut"]; raw != nil && !ok {
+		return fmt.Errorf("field cut in Plan: required")
 	}
 	if _, ok := raw["decidedAt"]; raw != nil && !ok {
 		return fmt.Errorf("field decidedAt in Plan: required")
@@ -13028,23 +13126,71 @@ type SessionOutcomeLastRunStartedAt = *time.Time
 // The run's final assistant text: deterministic, copied from what the run itself
 // streamed, never written by a model.
 type SessionOutcomeLastRunSummary struct {
+	// Set when the run's last text part is a frame the sandbox-agent cut on its way
+	// to the control plane (technical plan §6.1), as GET
+	// /api/sessions/{sessionID}/plans reports it for a plan: kept, the bytes of the
+	// part's text kept, and total, its whole length, both in UTF-8 bytes of the
+	// unescaped text; both -1 when the frame carried a cut this server could not
+	// read. text then ends with the cut's marker line, unless truncated cut it first;
+	// this property, never the text, says the run's text was cut. Null when the text
+	// is whole, or when there is none.
+	Cut *SessionOutcomeLastRunSummaryCut `json:"cut" yaml:"cut" mapstructure:"cut"`
+
 	// The run's last text part, verbatim -- among the parts the run streamed with any
-	// text, the one that opened last, read at its newest frame: the one rule this
-	// system uses to read a turn's final text (the same one GET
-	// /api/sessions/{sessionID}/plans reads a plan with). Cut to at most 4,000
-	// characters (Unicode code points). Null when the run left no text in the
-	// session's recent event history.
+	// text, the one that opened last, read at its newest frame that yields to no
+	// other (a frame cut on its way from the sandbox yields to the whole text it was
+	// taken from, see cut): the one rule this system uses to read a turn's final text
+	// (the same one GET /api/sessions/{sessionID}/plans reads a plan with). Cut to at
+	// most 4,000 characters (Unicode code points). Null when the run left no text in
+	// the session's recent event history.
 	Text SessionOutcomeLastRunSummaryText `json:"text" yaml:"text" mapstructure:"text"`
 
 	// true when text was cut at 4,000 characters; the full text is in the transcript.
 	Truncated bool `json:"truncated" yaml:"truncated" mapstructure:"truncated"`
 }
 
+// Set when the run's last text part is a frame the sandbox-agent cut on its way to
+// the control plane (technical plan §6.1), as GET /api/sessions/{sessionID}/plans
+// reports it for a plan: kept, the bytes of the part's text kept, and total, its
+// whole length, both in UTF-8 bytes of the unescaped text; both -1 when the frame
+// carried a cut this server could not read. text then ends with the cut's marker
+// line, unless truncated cut it first; this property, never the text, says the
+// run's text was cut. Null when the text is whole, or when there is none.
+type SessionOutcomeLastRunSummaryCut struct {
+	// Kept corresponds to the JSON schema field "kept".
+	Kept int `json:"kept" yaml:"kept" mapstructure:"kept"`
+
+	// Total corresponds to the JSON schema field "total".
+	Total int `json:"total" yaml:"total" mapstructure:"total"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionOutcomeLastRunSummaryCut) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["kept"]; raw != nil && !ok {
+		return fmt.Errorf("field kept in SessionOutcomeLastRunSummaryCut: required")
+	}
+	if _, ok := raw["total"]; raw != nil && !ok {
+		return fmt.Errorf("field total in SessionOutcomeLastRunSummaryCut: required")
+	}
+	type Plain SessionOutcomeLastRunSummaryCut
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionOutcomeLastRunSummaryCut(plain)
+	return nil
+}
+
 // The run's last text part, verbatim -- among the parts the run streamed with any
-// text, the one that opened last, read at its newest frame: the one rule this
-// system uses to read a turn's final text (the same one GET
-// /api/sessions/{sessionID}/plans reads a plan with). Cut to at most 4,000
-// characters (Unicode code points). Null when the run left no text in the
+// text, the one that opened last, read at its newest frame that yields to no other
+// (a frame cut on its way from the sandbox yields to the whole text it was taken
+// from, see cut): the one rule this system uses to read a turn's final text (the
+// same one GET /api/sessions/{sessionID}/plans reads a plan with). Cut to at most
+// 4,000 characters (Unicode code points). Null when the run left no text in the
 // session's recent event history.
 type SessionOutcomeLastRunSummaryText *string
 
@@ -13053,6 +13199,9 @@ func (j *SessionOutcomeLastRunSummary) UnmarshalJSON(value []byte) error {
 	var raw map[string]interface{}
 	if err := json.Unmarshal(value, &raw); err != nil {
 		return err
+	}
+	if _, ok := raw["cut"]; raw != nil && !ok {
+		return fmt.Errorf("field cut in SessionOutcomeLastRunSummary: required")
 	}
 	if _, ok := raw["text"]; raw != nil && !ok {
 		return fmt.Errorf("field text in SessionOutcomeLastRunSummary: required")
@@ -16346,6 +16495,8 @@ func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
 // exists before any turn does.
@@ -16408,8 +16559,6 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
 
 type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
-
-type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict

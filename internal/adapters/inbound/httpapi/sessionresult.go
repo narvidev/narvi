@@ -423,17 +423,22 @@ func readLastRun(ctx context.Context, st resultStores, sessionID pgtype.UUID, fa
 	}
 
 	// The summary: the run's final text within its own window of the event
-	// log (turnContentBounds: its dispatch watermark, up to the next
-	// dispatched turn's), read by the one reader of a turn's final text. A
-	// run never dispatched has no window, and no text.
-	if lower, upper, ok := turnContentBounds(turns, run.ID); ok {
+	// log (sessionactor.TurnContentBounds: its dispatch watermark, up to the
+	// next dispatched turn's), read by the one reader of a turn's final
+	// text, with the cut it reports when that text is a frame the
+	// sandbox-agent cut (technical plan §6.1). A run never dispatched has no
+	// window, and no text.
+	if lower, upper, ok := sessionactor.TurnContentBounds(turns, run.ID); ok {
 		events, err := st.events.ListRecentForSession(ctx, sessionID, planContentEventFetchLimit)
 		if err != nil {
 			return nil, err
 		}
-		if text, found := plandomain.FinalText(sessionactor.ToContentEvents(events), lower, upper); found {
-			capped, truncated := capSummary(text)
+		if final, found := plandomain.FinalText(sessionactor.ToContentEvents(events), lower, upper); found {
+			capped, truncated := capSummary(final.Text)
 			out.Summary = restdtos.SessionOutcomeLastRunSummary{Text: &capped, Truncated: truncated}
+			if final.Cut != nil {
+				out.Summary.Cut = &restdtos.SessionOutcomeLastRunSummaryCut{Kept: final.Cut.Kept, Total: final.Cut.Total}
+			}
 		}
 	}
 	return out, nil

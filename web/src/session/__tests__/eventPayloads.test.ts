@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 
 import type { EventEnvelope } from '../../ws/types'
 import { asExecutionComplete, asStepFinish, asSubTaskStart, asToken, asToolCall, asToolResult } from '../eventPayloads'
+import { MALFORMED_CUT } from '../tokenCut'
 
 function env(type: string, payload: unknown): EventEnvelope {
   return { id: 1, type, payload, createdAt: '2026-08-20T10:00:00Z' }
@@ -74,5 +75,28 @@ describe('eventPayloads type guards', () => {
   it('accepts a token event and rejects one whose text field is missing', () => {
     expect(asToken(env('token', { messageId: 'm1', text: 'hello' }))).not.toBeNull()
     expect(asToken(env('token', { messageId: 'm1' }))).toBeNull()
+  })
+})
+
+// A token frame's `cut` (technical plan §6.1) reaches readers as tokenCut.ts
+// reads it: kept when well formed, the fail-closed sentinel when present and
+// unreadable, and absent when absent or null.
+describe('asToken -- the cut property', () => {
+  it('carries a well-formed cut', () => {
+    const t = asToken(env('token', { messageId: 'm1', text: 'ab\n[text cut at 2 of 9 bytes on its way from the sandbox]', cut: { kept: 2, total: 9 } }))
+    expect(t?.cut).toEqual({ kept: 2, total: 9 })
+  })
+
+  it('reads a malformed cut as the fail-closed sentinel, never dropping it', () => {
+    for (const cut of [{ kept: '2', total: 9 }, { kept: 9, total: 9 }, 'cut', [2, 9]]) {
+      const t = asToken(env('token', { messageId: 'm1', text: 'ab', cut }))
+      expect(t).not.toBeNull()
+      expect(t!.cut).toEqual(MALFORMED_CUT)
+    }
+  })
+
+  it('a null or absent cut is a whole frame', () => {
+    expect(asToken(env('token', { messageId: 'm1', text: 'ab', cut: null }))).not.toHaveProperty('cut')
+    expect(asToken(env('token', { messageId: 'm1', text: 'ab' }))).not.toHaveProperty('cut')
   })
 })

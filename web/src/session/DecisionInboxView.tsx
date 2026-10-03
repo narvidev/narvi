@@ -109,6 +109,7 @@ import {
 import { formatRelativeTime } from './relativeTime'
 import { RESUME_PROMPT } from './Timeline'
 import { truncateForDisplay } from './textSafety'
+import { cutReason, type FrameCut } from './tokenCut'
 import { isSafeHref } from './urlSafety'
 
 const MAX_FIELD_CHARS = 500
@@ -282,6 +283,26 @@ function ApprovePlanButton({ sessionId, planId }: { sessionId: string; planId: s
           {mutation.error instanceof ApiError ? <T text={mutation.error.message} /> : 'Approval failed. Try again.'}
         </span>
       )}
+    </span>
+  )
+}
+
+/**
+ * CutPlanNotice takes ApprovePlanButton's place for a plan whose text was
+ * cut on its way from the sandbox (planCutKept/planCutTotal, technical plan
+ * §6.1): the server refuses that approval, so the row gives the reason
+ * instead of "Approve & build", and keeps Open, where Request changes and
+ * Reject are.
+ */
+function CutPlanNotice({ sessionId, cut }: { sessionId: string; cut: FrameCut }) {
+  return (
+    <span className="btnrow" style={{ gap: 6, flex: 'none' }}>
+      <span className="cut-reason" role="note">
+        <T text={cutReason(cut)} />
+      </span>
+      <Link to="/session/$sessionId/plan" params={{ sessionId }} className="btn" style={{ textDecoration: 'none' }}>
+        Open
+      </Link>
     </span>
   )
 }
@@ -507,7 +528,14 @@ export function DecisionInboxRow({ item, canMerge }: { item: DecisionInboxItem; 
       {kind === 'release' &&
         (item.sessionId !== null ? <OpenReleaseReviewLink sessionId={item.sessionId} /> : <OpenOnGitHubLink htmlUrl={item.htmlUrl} />)}
       {kind === 'handoff' && <OpenOnGitHubLink htmlUrl={item.htmlUrl} />}
-      {kind === 'plan' && item.sessionId !== null && item.planId !== null && <ApprovePlanButton sessionId={item.sessionId} planId={item.planId} />}
+      {kind === 'plan' &&
+        item.sessionId !== null &&
+        item.planId !== null &&
+        (item.planCutKept !== null && item.planCutTotal !== null ? (
+          <CutPlanNotice sessionId={item.sessionId} cut={{ kept: item.planCutKept, total: item.planCutTotal }} />
+        ) : (
+          <ApprovePlanButton sessionId={item.sessionId} planId={item.planId} />
+        ))}
       {kind === 'session' && item.sessionId !== null && <ResumeSessionButton sessionId={item.sessionId} />}
       {kind === 'automation' && item.automationId !== null && <ResumeAutomationButton automationId={item.automationId} />}
 

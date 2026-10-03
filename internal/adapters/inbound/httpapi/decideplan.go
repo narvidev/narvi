@@ -95,6 +95,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
@@ -120,6 +121,33 @@ const (
 // currently implements a retry surface for this narrow race, matching
 // today's existing REST-only behavior).
 var ErrPlanOpenTurnInFlight = errors.New("httpapi: a turn is already pending, dispatched, or processing for this session")
+
+// ErrPlanCut is returned, as a *PlanCutError, by DecidePlanOnTx/DecidePlan
+// when an Approve verdict is refused because the plan's text is a frame the
+// sandbox-agent cut on its way to the control plane (technical plan §6.1):
+// what would be approved is not the plan the model wrote, whole, and its
+// structured steps are absent (plandomain.ExtractStructured). The plan stays
+// awaiting approval: Request changes, asking for a shorter plan, and Reject
+// stay open. Every caller relays the reason, PlanCutError.Error, each in a
+// case of its own as it relays ErrPlanOpenTurnInFlight: REST answers 409
+// with it (planapprove.go, and so MCP's narvi_approve_plan); Slack replies
+// with it in the thread, or ephemerally to a button click, leaving the
+// approval message intact; Linear posts it as an agent activity.
+var ErrPlanCut = errors.New("httpapi: the plan's text was cut on its way from the sandbox, so it cannot be approved")
+
+// PlanCutError is ErrPlanCut with the cut that refused the approval:
+// errors.Is(err, ErrPlanCut) holds for it, and Error is the one sentence
+// every surface gives for a cut plan (framecut.Reason).
+type PlanCutError struct {
+	Cut framecut.Cut
+}
+
+// Error returns framecut.Reason for the cut: why the plan cannot be
+// approved, and what to do instead.
+func (e *PlanCutError) Error() string { return framecut.Reason(&e.Cut) }
+
+// Is reports whether target is ErrPlanCut.
+func (e *PlanCutError) Is(target error) bool { return target == ErrPlanCut }
 
 // DecidePlanOutcome is DecidePlan/DecidePlanOnTx's uniform,
 // transport-agnostic result.
@@ -175,7 +203,10 @@ func planDecisionOutcomeText(verdict PlanVerdict) string {
 //
 // Sequencing: lock the session row (see top doc comment on why this is
 // unconditional) -> for Approve only, the SAME hasOpenTurn 409 gate
-// ApprovePlan's own top doc comment describes (ErrPlanOpenTurnInFlight) ->
+// ApprovePlan's own top doc comment describes (ErrPlanOpenTurnInFlight),
+// then, for a plan of this session still awaiting approval, its final text
+// read once (sessionactor.ReadPlanFinal) and the cut gate (ErrPlanCut,
+// before anything changes, so a refused plan stays awaiting approval) ->
 // the guarded conditional UPDATE (plans.ApproveIfAwaitingApproval/
 // RejectIfAwaitingApproval) -> re-fetch the plan row (to learn its REAL
 // current state either way, and -- on a win -- its own stored Slack message
@@ -230,6 +261,36 @@ func DecidePlanOnTx(
 		}
 		if hasOpenTurn(existingTurns) {
 			return DecidePlanOutcome{}, ErrPlanOpenTurnInFlight
+		}
+	}
+
+	// The cut gate (ErrPlanCut), Approve only: a plan whose text the
+	// sandbox-agent cut on its way here (§6.1) is refused before the guarded
+	// update, so it stays awaiting approval. The final text is read once,
+	// here, and handed to the snapshot below, which records the same text.
+	// A plan that is not this session's or no longer awaiting approval
+	// reads nothing: the guarded update below reports it as it always has.
+	// The turns are read through tx -- the session row lock taken above
+	// makes "every turn dispatched in this session so far" a stable
+	// snapshot for the rest of this transaction -- and the events through
+	// the pool, as every reader of the log does: every frame of the plan's
+	// window was committed by its producing turn before the plan existed.
+	var planFinal plandomain.Final
+	var planFinalFound bool
+	if verdict == PlanVerdictApprove {
+		candidate, err := plans.WithTx(tx).Get(ctx, planID)
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+		case err != nil:
+			return DecidePlanOutcome{}, fmt.Errorf("httpapi: read plan for the cut check: %w", err)
+		case candidate.SessionID == sessionRow.ID && candidate.Status == sqlcgen.PlanStatusAwaitingApproval:
+			planFinal, planFinalFound, err = sessionactor.ReadPlanFinal(ctx, turns.WithTx(tx), events, sessionRow.ID, candidate.TurnID)
+			if err != nil {
+				return DecidePlanOutcome{}, fmt.Errorf("httpapi: read plan final text: %w", err)
+			}
+			if planFinal.Cut != nil {
+				return DecidePlanOutcome{}, &PlanCutError{Cut: *planFinal.Cut}
+			}
 		}
 	}
 
@@ -333,7 +394,7 @@ func DecidePlanOnTx(
 		// must abort this whole decision -- and, via the caller's own
 		// tx.Rollback, the guarded UPDATE with it -- rather than let either
 		// one commit without the other.
-		if err := snapshotApprovedPlanContent(ctx, tx, turns, events, planDocuments, sessionRow.ID, planRow); err != nil {
+		if err := snapshotApprovedPlanContent(ctx, tx, planDocuments, planRow, planFinal, planFinalFound); err != nil {
 			return DecidePlanOutcome{}, fmt.Errorf("httpapi: snapshot approved plan content: %w", err)
 		}
 
@@ -423,14 +484,19 @@ func DecidePlanOnTx(
 	return outcome, nil
 }
 
-// snapshotApprovedPlanContent recovers planRow's own approved prose (the
-// SAME bounded events-log scan the plan-mode UI and the Slack/Linear
-// notifiers already use, plandomain.ExtractContent via turnContentBounds,
-// plans.go) and durably persists it into plan_documents, on tx -- §31.3's
-// durability fix: an approved plan's prose used to live ONLY in the events
-// log, which cascades away with its session exactly like plans' own
-// session_id does (see migrations/000112_plan_documents.up.sql's own
-// comment for the full "why").
+// snapshotApprovedPlanContent durably persists planRow's own approved
+// prose into plan_documents, on tx -- §31.3's durability fix: an approved
+// plan's prose used to live ONLY in the events log, which cascades away
+// with its session exactly like plans' own session_id does (see
+// migrations/000112_plan_documents.up.sql's own comment for the full
+// "why").
+//
+// final/found are the plan's final text as DecidePlanOnTx's cut gate read
+// it moments earlier, in this same transaction (sessionactor.ReadPlanFinal:
+// the producing turn's window of the events log, read by the same
+// plandomain.FinalText the plan views and the Slack/Linear notifiers use),
+// so the text approved is the text checked, read once. final.Cut is nil
+// here: a cut plan was refused before the guarded UPDATE.
 //
 // Called from DecidePlanOnTx's own PlanVerdictApprove branch, ONLY once
 // the guarded UPDATE has already won, BEFORE that branch does anything
@@ -441,40 +507,16 @@ func DecidePlanOnTx(
 // a durable snapshot" can never come apart.
 //
 // Content EXTRACTION itself stays exactly as best-effort as every existing
-// caller of plandomain.ExtractContent (sessionactor.planContentText,
-// plans.go's own planContentMap): an events-log read hiccup, or a
-// producing turn turnContentBounds cannot find (should be unreachable --
-// plans.turn_id is a NOT NULL FK to an already-dispatched turn by the time
-// a plan row exists at all), degrades to plandomain.ContentFallbackText
-// rather than failing the approval. Only the WRITE into plan_documents
-// itself is strict: a plan approved through this path always gets a row
-// here, and that row's content is never LESS honest than what every other
-// reader of this same log has always shown a human.
-//
-// turns is read via tx (turns.WithTx(tx).ListForSession): sessionRow's own
-// row lock (GetActorEpochForUpdate, taken earlier in DecidePlanOnTx) is
-// what makes "every turn dispatched in this session so far" a stable
-// snapshot for the rest of this transaction's duration, mirroring
-// DecidePlanOnTx's own pre-existing hasOpenTurn fetch immediately above.
-// events is read via the POOL-based EventStore, never WithTx --
-// EventStore's own doc comment ("no such transactional requirement...
-// never WithTx") and sessionactor.planContentText's own identical
-// precedent: every event this scan can possibly find was already
-// committed by the producing turn's own terminal-state write, long before
-// this approval could even begin.
-func snapshotApprovedPlanContent(ctx context.Context, tx pgx.Tx, turns *postgres.TurnStore, events *postgres.EventStore, planDocuments *postgres.PlanDocumentStore, sessionID pgtype.UUID, planRow sqlcgen.Plan) error {
-	sessionTurns, err := turns.WithTx(tx).ListForSession(ctx, sessionID)
-	if err != nil {
-		return fmt.Errorf("httpapi: list turns for plan snapshot: %w", err)
-	}
-
+// reader of a plan's text: a producing turn with no window, or a window
+// with no text, records plandomain.ContentFallbackText rather than failing
+// the approval. Only the WRITE into plan_documents itself is strict: a plan
+// approved through this path always gets a row here, and that row's
+// content is never LESS honest than what every other reader of this same
+// log has always shown a human.
+func snapshotApprovedPlanContent(ctx context.Context, tx pgx.Tx, planDocuments *postgres.PlanDocumentStore, planRow sqlcgen.Plan, final plandomain.Final, found bool) error {
 	content := plandomain.ContentFallbackText
-	if lower, upper, ok := turnContentBounds(sessionTurns, planRow.TurnID); ok {
-		recentEvents, err := events.ListRecentForSession(ctx, sessionID, planContentEventFetchLimit)
-		if err != nil {
-			return fmt.Errorf("httpapi: list events for plan snapshot: %w", err)
-		}
-		content = plandomain.ExtractContent(sessionactor.ToContentEvents(recentEvents), lower, upper)
+	if found {
+		content = final.Text
 	}
 
 	// §12.2 item 3's own structured-plan-document schema: the SAME
@@ -485,7 +527,7 @@ func snapshotApprovedPlanContent(ctx context.Context, tx pgx.Tx, turns *postgres
 	// migrations/000126_plan_documents_structured.up.sql's own comment for
 	// why NULL, not an empty object, is this column's only "no structure"
 	// representation.
-	structured := plandomain.ExtractStructured(content)
+	structured := plandomain.ExtractStructured(content, final.Cut)
 
 	if _, err := planDocuments.WithTx(tx).Create(ctx, planRow.ID, content, structured); err != nil {
 		return fmt.Errorf("httpapi: create plan document snapshot: %w", err)

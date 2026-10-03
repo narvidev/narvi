@@ -1,0 +1,23 @@
+[
+  {
+    "cut": {
+      "kept": 20,
+      "total": 64
+    },
+    "reason": "No approval for this plan: its text was cut on its way from the sandbox, keeping 20 of 64 bytes. Request changes for a shorter plan, or reject it."
+  },
+  {
+    "cut": {
+      "kept": 0,
+      "total": 40960
+    },
+    "reason": "No approval for this plan: its text was cut on its way from the sandbox, keeping 0 of 40960 bytes. Request changes for a shorter plan, or reject it."
+  },
+  {
+    "cut": {
+      "kept": -1,
+      "total": -1
+    },
+    "reason": "No approval for this plan: its text was cut on its way from the sandbox. Request changes for a shorter plan, or reject it."
+  }
+]
