@@ -48,6 +48,39 @@ func TestSandboxEventsRoundTrip(t *testing.T) {
 		})
 	})
 
+	t.Run("Ready_Capabilities_MaxFrameBytes", func(t *testing.T) {
+		// Technical plan §3.3, §6.1: the agent's read limit, stated on every
+		// ready, with or without promptReceipt.
+		maxFrameBytes := 32 << 20
+		roundTrip(t, sch, sandboxws.Ready{
+			Type:         "ready",
+			MessageId:    "e1d",
+			SessionId:    testSessionID,
+			Gen:          1,
+			Timestamp:    testTimestamp,
+			AgentVersion: "v1.4.2",
+			ImageDigest:  "sha256:9f31c00abcdef",
+			Capabilities: &sandboxws.ReadyCapabilities{MaxFrameBytes: &maxFrameBytes},
+		})
+	})
+
+	// A stated read limit is a positive byte count: the schema and the
+	// generated decoder alike refuse zero or less, and the session actor
+	// then reads the ready as stating nothing.
+	t.Run("Ready_Capabilities_MaxFrameBytesBelowOneRejected", func(t *testing.T) {
+		for _, value := range []string{"0", "-1"} {
+			payload := []byte(`{"type":"ready","messageId":"e1e","sessionId":"` + testSessionID +
+				`","gen":1,"timestamp":"2026-07-16T12:00:00Z","agentVersion":"v1","imageDigest":"d","capabilities":{"maxFrameBytes":` + value + `}}`)
+			if err := validateJSON(t, sch, payload); err == nil {
+				t.Fatalf("expected maxFrameBytes %s to fail validation, got nil error", value)
+			}
+			var event sandboxws.Ready
+			if err := json.Unmarshal(payload, &event); err == nil {
+				t.Fatalf("expected maxFrameBytes %s to fail Go unmarshal, got nil error", value)
+			}
+		}
+	})
+
 	t.Run("PromptReceived", func(t *testing.T) {
 		roundTrip(t, sch, sandboxws.PromptReceived{
 			Type:            "prompt_received",

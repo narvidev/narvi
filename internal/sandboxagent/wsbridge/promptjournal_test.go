@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/coder/websocket"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
+	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/wsbridge"
 )
 
@@ -171,7 +173,11 @@ func waitRuns(t *testing.T, counter *promptCounter, messageID string, want int) 
 	}
 }
 
-func TestReady_AdvertisesPromptReceiptOnlyWhenEnabled(t *testing.T) {
+// TestReady_StatesMaxFrameBytes_AdvertisesPromptReceiptOnlyWhenEnabled:
+// every ready states the agent's read limit, platform.MaxPromptFrameBytes,
+// as capabilities.maxFrameBytes, whether or not the journal is open
+// (technical plan §3.3, §6.1); promptReceipt is present only when it is.
+func TestReady_StatesMaxFrameBytes_AdvertisesPromptReceiptOnlyWhenEnabled(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range []struct {
@@ -192,20 +198,24 @@ func TestReady_AdvertisesPromptReceiptOnlyWhenEnabled(t *testing.T) {
 			startBridge(t, server, noopHandler{}, stateDir)
 
 			ready := waitChan(t, frames, testWait)
-			var keys map[string]json.RawMessage
+			var keys struct {
+				Capabilities map[string]json.RawMessage `json:"capabilities"`
+			}
 			if err := json.Unmarshal(ready, &keys); err != nil {
 				t.Fatalf("malformed ready: %v", err)
 			}
-			raw, has := keys["capabilities"]
-			if has != tc.enabled {
-				t.Fatalf("ready carries capabilities = %v, want %v (ready: %s)", has, tc.enabled, ready)
+			if got, want := string(keys.Capabilities["maxFrameBytes"]), strconv.Itoa(platform.MaxPromptFrameBytes); got != want {
+				t.Fatalf("ready states maxFrameBytes %q, want %s (ready: %s)", got, want, ready)
+			}
+			if _, has := keys.Capabilities["promptReceipt"]; has != tc.enabled {
+				t.Fatalf("ready carries promptReceipt = %v, want %v (ready: %s)", has, tc.enabled, ready)
 			}
 			var typed sandboxws.Ready
 			if err := json.Unmarshal(ready, &typed); err != nil {
 				t.Fatalf("ready fails its contract: %v", err)
 			}
 			if tc.enabled && (typed.Capabilities == nil || typed.Capabilities.PromptReceipt == nil || !*typed.Capabilities.PromptReceipt) {
-				t.Fatalf("capabilities = %s, want promptReceipt true", raw)
+				t.Fatalf("ready = %s, want promptReceipt true", ready)
 			}
 		})
 	}
@@ -499,9 +509,10 @@ func TestPrompt_JournalAppendFails_RequestedPromptNeitherRunNorReceipted(t *test
 		t.Fatalf("signal = %+v, want a non-fatal, critical error event naming the prompt", signal)
 	}
 
-	// The next connection: no capability, and prompts that ask for none run.
-	if ready := waitChan(t, frames2, testWait); strings.Contains(string(ready), "capabilities") {
-		t.Fatalf("the ready after a failed append advertises capabilities: %s", ready)
+	// The next connection: no promptReceipt -- the ready still states the
+	// agent's read limit -- and prompts that ask for none run.
+	if ready := waitChan(t, frames2, testWait); strings.Contains(string(ready), "promptReceipt") {
+		t.Fatalf("the ready after a failed append advertises promptReceipt: %s", ready)
 	}
 	waitRuns(t, counter, "last", 1)
 	if got := counter.count("asked"); got != 0 {
@@ -621,11 +632,12 @@ func TestEnablePromptReceipts_RejectsDirNotOursOrWritableByOthers(t *testing.T) 
 			if err := bridge.EnablePromptReceipts(tc.dir); err == nil {
 				t.Fatalf("EnablePromptReceipts(%s) error = nil, want a refusal", tc.dir)
 			}
-			// The Bridge stays exactly as it was: no capability advertised.
+			// The Bridge stays exactly as it was: no promptReceipt advertised
+			// (its ready still states its read limit).
 			stopBridge(t, bridge)
 			ready := waitChan(t, frames, testWait)
-			if strings.Contains(string(ready), "capabilities") {
-				t.Fatalf("ready advertises capabilities after a refused journal: %s", ready)
+			if strings.Contains(string(ready), "promptReceipt") {
+				t.Fatalf("ready advertises promptReceipt after a refused journal: %s", ready)
 			}
 		})
 	}

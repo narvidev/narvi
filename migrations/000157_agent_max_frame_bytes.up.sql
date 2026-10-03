@@ -1,0 +1,76 @@
+-- Technical plan §3.3 and §6.1: each gen's prompt bound. The session actor
+-- measures every prompt frame before it writes it, and until this release
+-- it measured against one constant, MaxPromptFrameBytes (32 MiB), the read
+-- limit of an agent built since that bound. An agent built before it, in
+-- an older snapshot or repo image, reads at the WebSocket library's
+-- default, 32768 bytes: a larger prompt closed its connection and was
+-- lost, and its turn ended at turn_deadline with nothing naming why. Every
+-- ready now states the agent's read limit (capabilities.maxFrameBytes),
+-- and the actor holds a gen's prompts to it: the stated value, clamped to
+-- MaxPromptFrameBytes; otherwise MaxPromptFrameBytes when the gen's latest
+-- ready advertised promptReceipt, since every agent that does was built
+-- with that read limit; otherwise 32768 (promptFrameBound,
+-- internal/app/sessionactor/framebound.go). A prompt over it fails its
+-- turn at dispatch, naming both sizes.
+--
+-- sandboxes.agent_max_frame_bytes: the maxFrameBytes the gen's latest
+-- ready stated, NULL when it stated none.
+--
+-- sandboxes.agent_max_frame_bytes_gen: the gen whose latest ready stated
+-- it, recorded the way prompt_receipt_gen is
+-- (migrations/000155_prompt_receipts.up.sql): written only for the live
+-- gen, by RecordSandboxReady, in the transaction that stores the ready,
+-- and NULL when that ready stated none -- the latest ready decides. Never
+-- reset: UpsertSandboxForSpawn bumps gen, and the value stops matching, so
+-- no respawn, restore or resume inherits it. The actor reads the stated
+-- value only while this column equals the live gen.
+--
+-- No backfill, no index. Every sandbox that exists when this runs reads
+-- "stated nothing" until its next ready, and is held to the promptReceipt
+-- rule meanwhile -- the bound the agent built since MaxPromptFrameBytes
+-- reads, or the library's default for one built before it.
+--
+-- # Locks
+--
+-- Each ADD COLUMN is nullable with no default, so it is a catalog change
+-- that rewrites nothing. Both take ACCESS EXCLUSIVE on sandboxes, for the
+-- file's one implicit transaction, for an instant.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with these columns present:
+--   - Every statement it sends names its columns (sqlc writes each
+--     SELECT * and RETURNING * out as a column list), so it neither reads
+--     nor writes them.
+--   - Its RecordSandboxReady counts the ready and records promptReceipt,
+--     and leaves both columns as they are. A ready it records therefore
+--     leaves the value the gen's earlier ready stated, if this release
+--     recorded one: the same gen is the same agent binary, whose read
+--     limit does not change within it. A gen whose every ready it records
+--     states nothing here, and is held to the promptReceipt rule.
+--   - Its UpsertSandboxForSpawn leaves both columns stale; the gen bump
+--     makes them not match.
+--   - It measures every prompt against MaxPromptFrameBytes, as it always
+--     did.
+-- migration000157_integration_test.go runs the previous binary's own
+-- statements against the columns.
+--
+-- # Rolling back
+--
+-- Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for. So once this migration is applied, the
+-- previous binary cannot boot ("no migration found for version 157"). A
+-- rollback therefore takes one of two steps first, with the control plane
+-- scaled to zero:
+--   - Keep the columns: with the golang-migrate CLI, `migrate force 156`.
+--     The previous binary then boots, since 156 is a version it has, and
+--     works with the columns present as above. When this release is
+--     deployed again, this file runs again and leaves the columns and
+--     their values as they are.
+--   - Drop them: run this migration's down (goto 156) with this release's
+--     migrations. The down file says what it removes.
+-- Nothing else needs undoing: no timer kind, event type or turn column is
+-- added.
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS agent_max_frame_bytes INTEGER;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS agent_max_frame_bytes_gen INTEGER;

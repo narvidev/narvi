@@ -926,14 +926,17 @@ func TestPromptReceipt_ResendCapStopsADeterministicLoss(t *testing.T) {
 }
 
 // TestPromptReceipt_PromptFrameOverTheLimit_RefusedNeverSent: a prompt
-// whose encoded frame is larger than a sandbox accepts
-// (platform.MaxPromptFrameBytes) is never written: its turn fails at
+// whose encoded frame is larger than its gen's agent reads -- here
+// platform.MaxPromptFrameBytes, the bound of a gen that advertised
+// promptReceipt (framebound.go) -- is never written: its turn fails at
 // dispatch as a refusal, with a session warning naming both sizes and a
 // synthetic execution_complete saying why. The size measured is the
 // encoded frame's: a text of '<' is a sixth of its frame.
 func TestPromptReceipt_PromptFrameOverTheLimit_RefusedNeverSent(t *testing.T) {
 	ctx := context.Background()
-	text := strings.Repeat("<", platform.MaxPromptFrameBytes/6+1024)
+	// Over the limit by more than the banner's one-decimal rounding, so it
+	// names both sizes in MiB (formatFrameSizes).
+	text := strings.Repeat("<", platform.MaxPromptFrameBytes/6+64*1024)
 	if len(text) >= platform.MaxPromptFrameBytes {
 		t.Fatal("the text alone must fit: only its encoding exceeds the limit")
 	}
@@ -953,10 +956,10 @@ func TestPromptReceipt_PromptFrameOverTheLimit_RefusedNeverSent(t *testing.T) {
 		rig.sessionID).Scan(&reason, &warning); err != nil {
 		t.Fatalf("read the turn's end: %v", err)
 	}
-	if !strings.Contains(reason, "larger than the 33554432 bytes a sandbox accepts") {
+	if !strings.Contains(reason, "larger than the 33554432 bytes this sandbox's agent reads") {
 		t.Fatalf("synthetic execution_complete reason = %q, want the sizes named", reason)
 	}
-	if !strings.Contains(warning, "32.0 MiB a sandbox accepts") {
+	if !strings.Contains(warning, "32.0 MiB this sandbox's agent reads") {
 		t.Fatalf("session warning = %q, want the limit named for a person", warning)
 	}
 }

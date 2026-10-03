@@ -1339,10 +1339,32 @@ type Ready struct {
 // capability. Never inferred from agentVersion (technical plan §3.3, prompt
 // receipts).
 type ReadyCapabilities struct {
+	// The largest message, in bytes, this agent reads. The control plane records it
+	// against the gen, the latest ready deciding, and never writes that gen a prompt
+	// frame longer than it, nor longer than its own MaxPromptFrameBytes. Absent: the
+	// gen is held to MaxPromptFrameBytes when this ready advertises promptReceipt,
+	// and otherwise to the WebSocket library's default read limit, 32768 bytes
+	// (technical plan §3.3, §6.1).
+	MaxFrameBytes *int `json:"maxFrameBytes,omitempty,omitzero" yaml:"maxFrameBytes,omitempty" mapstructure:"maxFrameBytes,omitempty"`
+
 	// True when the agent answers every prompt that sets receiptRequested with a
 	// prompt_received event, a duplicate included, and runs a prompt messageId at
 	// most once for its gen, across a restart of the agent process too.
 	PromptReceipt *bool `json:"promptReceipt,omitempty,omitzero" yaml:"promptReceipt,omitempty" mapstructure:"promptReceipt,omitempty"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ReadyCapabilities) UnmarshalJSON(value []byte) error {
+	type Plain ReadyCapabilities
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if plain.MaxFrameBytes != nil && 1 > *plain.MaxFrameBytes {
+		return fmt.Errorf("field %s: must be >= %v", "maxFrameBytes", 1)
+	}
+	*j = ReadyCapabilities(plain)
+	return nil
 }
 
 // UnmarshalJSON implements json.Unmarshaler.

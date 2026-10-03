@@ -245,12 +245,19 @@ WHERE session_id = $1
 -- capabilities.promptReceipt -- the latest ready of the live gen decides,
 -- so one that does not advertise it clears it. handleSandboxEvent
 -- (sandboxevent.go) calls it in the transaction that stores the ready.
+-- It also records the read limit the ready stated
+-- (capabilities.maxFrameBytes, migrations/000157_agent_max_frame_bytes.up.sql)
+-- against the gen, the same way: a ready that states none (a NULL
+-- max_frame_bytes) clears both columns, and the session actor holds the
+-- gen's prompts to the promptReceipt rule (promptFrameBound).
 -- Guarded on gen like MarkSandboxBootEvidence: a ready of any other gen
 -- counts nothing and records nothing, so the capability can only ever be
 -- recorded for the gen that is live.
 UPDATE sandboxes
 SET ready_seq = ready_seq + 1,
     prompt_receipt_gen = CASE WHEN sqlc.arg('prompt_receipt')::boolean THEN gen ELSE NULL END,
+    agent_max_frame_bytes = sqlc.narg('max_frame_bytes')::integer,
+    agent_max_frame_bytes_gen = CASE WHEN sqlc.narg('max_frame_bytes')::integer IS NULL THEN NULL ELSE gen END,
     updated_at = now()
 WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;
 

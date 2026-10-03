@@ -1764,7 +1764,7 @@ func run() error {
 		// journal, before bridge.Run, so every ready advertises the
 		// capability and no prompt messageId runs twice, across a restart of
 		// this process within the gen too. A journal that cannot be opened
-		// leaves the bridge as it was -- no capability, so the control plane
+		// leaves the bridge as it was -- no promptReceipt, so the control plane
 		// never re-sends to this gen -- and is logged by the bridge; it never
 		// fails the boot.
 		_ = bridge.EnablePromptReceipts(cfg.AgentStateDir)

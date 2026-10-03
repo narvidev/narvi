@@ -470,7 +470,9 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 
 		// Technical plan §3.3's prompt receipts (promptreceipt.go): count
 		// this connection's ready, and record whether this gen's agent
-		// advertised the capability -- the latest ready of the gen decides.
+		// advertised the capability and the read limit it stated, which
+		// this event's own dispatch evaluation then holds the gen's prompts
+		// to (framebound.go) -- the latest ready of the gen decides.
 		// The count is the reconnect a turn in flight on this gen may need
 		// its prompt re-sent after, answered by this event's own post-commit
 		// dispatch evaluation below. Not gated on `inserted`: a ready is
@@ -478,7 +480,8 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// never buffered or replayed (wsbridge's sendReady), so every one is
 		// a reconnect. The gen fence above has already dropped a stale gen's.
 		if cmd.Type == "ready" {
-			if err := a.stores.sandbox.WithTx(tx).RecordReady(ctx, a.sessionID, row.Gen, readyAdvertisesPromptReceipt(cmd.Raw)); err != nil {
+			if err := a.stores.sandbox.WithTx(tx).RecordReady(ctx, a.sessionID, row.Gen,
+				readyAdvertisesPromptReceipt(cmd.Raw), readyStatedMaxFrameBytes(cmd.Raw)); err != nil {
 				return fmt.Errorf("sessionactor: record the ready: %w", err)
 			}
 		}
