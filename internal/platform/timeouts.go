@@ -3050,11 +3050,14 @@ type Timeouts struct {
 	// re-arms itself while it holds (technical plan §24.9): a firing that
 	// finds a turn of the review session pending, dispatched or processing
 	// inserts no review, spends no budget, keeps the pushed head as the
-	// target and re-arms the debounce at now plus this. A pending turn has
-	// no deadline of its own to borrow, and every write that ends a turn
-	// moves the debounce to now in its own transaction, so this only bounds
-	// a wake-up that was lost; it also keeps the row armed, so the status
-	// (§43.20) counts the work. Validate keeps it above TimerClaimDuration
+	// target and re-arms the debounce at the database's now plus this. A
+	// pending turn has no deadline of its own to borrow, and every write
+	// that ends a turn moves the held debounce to now in its own
+	// transaction, so this only bounds a wake-up that was lost; it also
+	// keeps the row armed, so the status (§43.20) counts the work. The
+	// wake-up tells a held debounce from a push's quiet window by how far
+	// past its arm it fires, more than ReviewRetriggerDebounce plus
+	// MinTimeoutMargin. Validate keeps it above TimerClaimDuration
 	// (a held debounce is never re-delivered at the claim cadence), above
 	// ReviewRetriggerDebounce (it is never re-checked faster than the quiet
 	// window a push asks for), and below TurnDeadline (a lost wake-up costs

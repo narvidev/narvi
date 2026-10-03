@@ -359,7 +359,8 @@ func pagePlanScans(plan string) ([]pagePlanScan, error) {
 }
 
 // planScans returns every scan of relation in plan, EXPLAIN's JSON -- of
-// every relation when relation is "" -- and the buffers the whole statement
+// every relation, bitmap index scans included, when relation is "" -- and
+// the buffers the whole statement
 // read: the plan's top node's Shared Hit and Read Blocks, which count its
 // children's, init plans' and sub-plans' too.
 func planScans(plan, relation string) ([]pagePlanScan, float64, error) {
@@ -389,7 +390,10 @@ func planScans(plan, relation string) ([]pagePlanScan, float64, error) {
 		if err := json.Unmarshal(raw, &n); err != nil {
 			return 0, err
 		}
-		if n.Relation != "" && (relation == "" || n.Relation == relation) {
+		// A Bitmap Index Scan names its index but no relation: its parent
+		// Bitmap Heap Scan names the relation. Both count among every
+		// relation's scans.
+		if (n.Relation != "" && (relation == "" || n.Relation == relation)) || (relation == "" && n.Index != "") {
 			scans = append(scans, pagePlanScan{
 				Relation: n.Relation, Node: n.NodeType, Index: n.Index, Loops: n.Loops,
 				Buffers: n.SharedHit + n.SharedRead, RowsRemoved: n.RowsRemoved,

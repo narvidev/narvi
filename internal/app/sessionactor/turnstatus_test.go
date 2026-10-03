@@ -22,17 +22,47 @@ var turnStatusQueries = map[string]bool{
 	"UpdateTurnStatus": true,
 }
 
-// The files that may touch the write directly: the store, which runs the
-// query, and the recorder, which wraps the store.
+// The files that hold the two methods that may touch the write directly:
+// the store's UpdateStatus, which runs the query, and the recorder's, which
+// wraps the store.
 const (
 	turnStatusStoreFile    = "internal/adapters/outbound/postgres/turn_store.go"
 	turnStatusRecorderFile = "internal/app/sessionactor/turnstatus.go"
 )
 
-// turnStatusOwners may name the params in a signature.
-var turnStatusOwners = map[string]bool{
-	turnStatusStoreFile:    true,
-	turnStatusRecorderFile: true,
+// turnStatusOwner names the one method allowed each direct touch of the
+// write: the store's UpdateStatus may call the query, the recorder's may
+// call the store's, and only these two may name the params in a signature.
+type turnStatusOwner int
+
+const (
+	turnStatusNotOwner turnStatusOwner = iota
+	turnStatusStoreMethod
+	turnStatusRecorderMethod
+)
+
+// turnStatusOwnerOf reports which owner fd is: postgres.TurnStore's
+// UpdateStatus in the store file, turnWriter's UpdateStatus in the
+// recorder file, or neither.
+func turnStatusOwnerOf(rel string, fd *ast.FuncDecl) turnStatusOwner {
+	if fd.Recv == nil || len(fd.Recv.List) != 1 || fd.Name.Name != "UpdateStatus" {
+		return turnStatusNotOwner
+	}
+	recv := fd.Recv.List[0].Type
+	if star, ok := recv.(*ast.StarExpr); ok {
+		recv = star.X
+	}
+	id, ok := recv.(*ast.Ident)
+	switch {
+	case !ok:
+		return turnStatusNotOwner
+	case rel == turnStatusStoreFile && id.Name == "TurnStore":
+		return turnStatusStoreMethod
+	case rel == turnStatusRecorderFile && id.Name == "turnWriter":
+		return turnStatusRecorderMethod
+	default:
+		return turnStatusNotOwner
+	}
 }
 
 // TestTurnStatusWritesGoThroughTheRecorder keeps the re-review debounce's
@@ -42,23 +72,25 @@ var turnStatusOwners = map[string]bool{
 // package under internal, controlplane, cmd and extension (go/packages;
 // generated sqlcgen code aside) and fails on:
 //
-//   - a call or method value of postgres.TurnStore's UpdateStatus outside
-//     the recorder -- by the receiver's type, whatever the variable is
-//     called, through WithTx, a constructor chain or an embedding;
-//   - a call or method value of sqlcgen.Queries' UpdateTurnStatus outside
-//     the store;
+//   - a call or method value of postgres.TurnStore's UpdateStatus anywhere
+//     but inside turnWriter's UpdateStatus -- by the receiver's type,
+//     whatever the variable is called, through WithTx, a constructor chain
+//     or an embedding;
+//   - a call or method value of sqlcgen.Queries' UpdateTurnStatus anywhere
+//     but inside postgres.TurnStore's UpdateStatus, so no other store
+//     method, under any name, can run the write;
 //   - an identifier naming UpdateTurnStatusParams, unless it types a
 //     composite literal handed straight to a turnWriter method, or sits in
-//     a signature in the store or the recorder;
+//     the signature of one of those two UpdateStatus methods;
 //   - a string literal, or a constant string concatenation read whole
-//     (constStrings), that updates turns -- with or without ONLY, the table
-//     bare, "quoted" or public-qualified, aliased or not -- with a SET whose
-//     targets name status.
+//     (constStrings), that writes turns.status in a shape
+//     sqlWritesTurnStatus reads (TestSQLWritesTurnStatus pins them).
 //
 // A file the build constraints leave out of the type-checked load (none
 // writes turns today) gets the last two checks only. It does not see SQL
 // assembled at run time, or a write through reflection.
-// TestTurnStatusQueriesAreTheRecordedOnes covers the sqlc queries.
+// TestTurnStatusQueriesAreTheRecordedOnes covers the sqlc queries and the
+// migrations.
 func TestTurnStatusWritesGoThroughTheRecorder(t *testing.T) {
 	t.Parallel()
 
@@ -90,38 +122,42 @@ func checkTurnStatusWrites(t *testing.T, f productionFile) int {
 	}
 
 	recorded := 0
-	ast.Inspect(f.file, func(n ast.Node) bool {
-		switch n := n.(type) {
-		case *ast.FuncDecl:
-			if turnStatusOwners[f.rel] {
-				approve(n.Type)
+	for _, decl := range f.file.Decls {
+		owner := turnStatusNotOwner
+		if fd, ok := decl.(*ast.FuncDecl); ok {
+			if owner = turnStatusOwnerOf(f.rel, fd); owner != turnStatusNotOwner {
+				approve(fd.Type)
 			}
-		case *ast.CallExpr:
-			// Only the recorder's own methods take the params literal.
-			if sel, ok := n.Fun.(*ast.SelectorExpr); ok {
-				if m, ok := f.method(sel); ok && m.is(sessionactorPkgPath, "turnWriter") {
-					for _, arg := range n.Args {
-						if lit, ok := arg.(*ast.CompositeLit); ok {
-							approve(lit.Type)
-							recorded++
+		}
+		ast.Inspect(decl, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.CallExpr:
+				// Only the recorder's own methods take the params literal.
+				if sel, ok := n.Fun.(*ast.SelectorExpr); ok {
+					if m, ok := f.method(sel); ok && m.is(sessionactorPkgPath, "turnWriter") {
+						for _, arg := range n.Args {
+							if lit, ok := arg.(*ast.CompositeLit); ok {
+								approve(lit.Type)
+								recorded++
+							}
 						}
 					}
 				}
+			case *ast.SelectorExpr:
+				m, ok := f.method(n)
+				if !ok {
+					return true
+				}
+				switch {
+				case m.is(postgresPkgPath, "TurnStore") && m.name == "UpdateStatus" && owner != turnStatusRecorderMethod:
+					t.Errorf("%s: TurnStore.UpdateStatus outside the recorder: a turn it ends never wakes the held re-review (technical plan §24.9) -- call a.turnWrites(tx).UpdateStatus", fset.Position(n.Pos()))
+				case m.is(sqlcgenPkgPath, "Queries") && turnStatusQueries[m.name] && owner != turnStatusStoreMethod:
+					t.Errorf("%s: the %s query outside TurnStore.UpdateStatus: a turn it ends never wakes the held re-review (technical plan §24.9) -- write it through that method and turnWrites", fset.Position(n.Pos()), m.name)
+				}
 			}
-		case *ast.SelectorExpr:
-			m, ok := f.method(n)
-			if !ok {
-				return true
-			}
-			switch {
-			case m.is(postgresPkgPath, "TurnStore") && m.name == "UpdateStatus" && f.rel != turnStatusRecorderFile:
-				t.Errorf("%s: TurnStore.UpdateStatus outside the recorder: a turn it ends never wakes the held re-review (technical plan §24.9) -- call a.turnWrites(tx).UpdateStatus", fset.Position(n.Pos()))
-			case m.is(sqlcgenPkgPath, "Queries") && turnStatusQueries[m.name] && f.rel != turnStatusStoreFile:
-				t.Errorf("%s: the %s query outside the turn store: a turn it ends never wakes the held re-review (technical plan §24.9) -- write it through the store and turnWrites", fset.Position(n.Pos()), m.name)
-			}
-		}
-		return true
-	})
+			return true
+		})
+	}
 
 	ast.Inspect(f.file, func(n ast.Node) bool {
 		if id, ok := n.(*ast.Ident); ok && id.Name == turnStatusParams && !approved[id.Pos()] {
@@ -151,19 +187,41 @@ var (
 	// turnsTable is the turns table as a statement may name it: bare,
 	// "quoted", or qualified by the public schema, quoted or not.
 	turnsTable = `(?:(?:"public"|public)\s*\.\s*)?(?:"turns"|turns\b)`
+	// tableAlias is an alias after a table name, AS or not, quoted or not.
+	tableAlias = `(?:\s+(?:as\s+)?(?:"[^"]+"|[a-z_][a-z0-9_]*))?`
 	// updateTurnsSet matches an UPDATE of turns up to its SET, an alias
 	// between them allowed; the SET clause starts at the match's end.
-	updateTurnsSet = regexp.MustCompile(`(?is)\bupdate\s+(?:only\s+)?` + turnsTable + `(?:\s*\*)?(?:\s+(?:as\s+)?[a-z_][a-z0-9_]*)?\s+set\b`)
+	updateTurnsSet = regexp.MustCompile(`(?is)\bupdate\s+(?:only\s+)?` + turnsTable + `(?:\s*\*)?` + tableAlias + `\s+set\b`)
+	// mergeIntoTurns matches a MERGE into turns; mergeUpdateSet, each of its
+	// WHEN MATCHED actions' UPDATE SET, the SET clause starting at the
+	// match's end.
+	mergeIntoTurns = regexp.MustCompile(`(?is)\bmerge\s+into\s+(?:only\s+)?` + turnsTable + `(?:\s*\*)?` + tableAlias + `\s+using\b`)
+	mergeUpdateSet = regexp.MustCompile(`(?is)\bthen\s+update\s+set\b`)
 )
 
 // sqlWritesTurnStatus reports whether sql (comments already stripped)
-// updates turns with a SET naming status among its targets, singly
-// (status = ...) or in a column list ((status, completed_at) = ...), quoted
-// or not.
+// writes turns.status: an UPDATE of turns -- with or without ONLY, the
+// table bare, "quoted" or public-qualified, aliased or not, the alias
+// quoted or not -- or a MERGE into turns whose UPDATE SET names status
+// among its targets, singly (status = ...) or in a column list
+// ((status, completed_at) = ...), quoted or not.
 func sqlWritesTurnStatus(sql string) bool {
-	for _, loc := range updateTurnsSet.FindAllStringIndex(sql, -1) {
-		for _, target := range setTargets(sql[loc[1]:]) {
+	namesStatus := func(clause string) bool {
+		for _, target := range setTargets(clause) {
 			if target == "status" {
+				return true
+			}
+		}
+		return false
+	}
+	for _, loc := range updateTurnsSet.FindAllStringIndex(sql, -1) {
+		if namesStatus(sql[loc[1]:]) {
+			return true
+		}
+	}
+	for _, merge := range mergeIntoTurns.FindAllStringIndex(sql, -1) {
+		for _, loc := range mergeUpdateSet.FindAllStringIndex(sql[merge[1]:], -1) {
+			if namesStatus(sql[merge[1]+loc[1]:]) {
 				return true
 			}
 		}
@@ -173,12 +231,14 @@ func sqlWritesTurnStatus(sql string) bool {
 
 // TestTurnStatusQueriesAreTheRecordedOnes is the SQL half of
 // TestTurnStatusWritesGoThroughTheRecorder: the sqlc queries that write
-// turns.status are exactly the one turnWriter wraps, UpdateTurnStatus. A
-// query writes it when it updates turns -- with or without ONLY, the table
-// bare, "quoted" or public-qualified, aliased or not -- with a SET whose
-// targets name status. A new query of that kind gets params of its own, or
-// none, which the Go scan cannot see: route it through turnWrites, then add
-// it here. Comments are ignored; SQL assembled at run time is not seen.
+// turns.status are exactly the one turnWriter wraps, UpdateTurnStatus, and
+// no migration writes it. A statement writes it when it updates turns, or
+// merges into turns with an UPDATE SET, naming status among its targets
+// (sqlWritesTurnStatus; TestSQLWritesTurnStatus pins the shapes). A new
+// query of that kind gets params of its own, or none, which the Go scan
+// cannot see: route it through turnWrites, then add it here. Comments are
+// ignored; SQL assembled at run time, in Go or inside a migration's
+// EXECUTE, is not seen.
 func TestTurnStatusQueriesAreTheRecordedOnes(t *testing.T) {
 	t.Parallel()
 
@@ -213,6 +273,22 @@ func TestTurnStatusQueriesAreTheRecordedOnes(t *testing.T) {
 			t.Errorf("query %q no longer writes a turn's status, or is gone: the scan is broken, or the list is stale", name)
 		}
 	}
+
+	// No migration writes it either: a data fix that ends turns runs
+	// outside every actor, so none of its ends wakes a held re-review.
+	migrations, err := filepath.Glob(filepath.Join(root, "migrations", "*.sql"))
+	if err != nil || len(migrations) == 0 {
+		t.Fatalf("list the migrations: %v (%d files)", err, len(migrations))
+	}
+	for _, path := range migrations {
+		body, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if sqlWritesTurnStatus(sqlBlockComment.ReplaceAllString(sqlLineComment.ReplaceAllString(string(body), ""), "")) {
+			t.Errorf("%s: a migration writes a turn's status: a turn it ends never wakes the held re-review (technical plan §24.9) -- end turns through the session actor", path)
+		}
+	}
 }
 
 // TestSQLWritesTurnStatus pins the statement shapes the SQL guard reads as a
@@ -237,6 +313,12 @@ func TestSQLWritesTurnStatus(t *testing.T) {
 		{"a column list naming status second", `UPDATE turns SET (completed_at, status) = (now(), 'failed') WHERE id = $1`, true},
 		{"inside a CTE", `WITH t AS (UPDATE turns SET status = 'failed' WHERE id = $1 RETURNING *) SELECT * FROM t`, true},
 		{"lower case", `update turns set status = 'failed' where id = $1`, true},
+		{"a quoted alias", `UPDATE turns AS "t" SET status = 'failed' WHERE "t".id = $1`, true},
+		{"a quoted alias without AS", `UPDATE turns "t" SET status = 'failed' WHERE "t".id = $1`, true},
+		{"a merge", `MERGE INTO turns t USING (SELECT $1::uuid AS id) x ON t.id = x.id WHEN MATCHED THEN UPDATE SET status = 'failed'`, true},
+		{"a merge, quoted and aliased, a column list second", `MERGE INTO "public"."turns" AS "t" USING x ON "t".id = x.id WHEN MATCHED AND x.y THEN DELETE WHEN MATCHED THEN UPDATE SET (completed_at, status) = (now(), 'failed')`, true},
+		{"a merge updating another column", `MERGE INTO turns t USING x ON t.id = x.id WHEN MATCHED THEN UPDATE SET cost_usd = x.cost`, false},
+		{"a merge into another table", `MERGE INTO sessions s USING x ON s.id = x.id WHEN MATCHED THEN UPDATE SET status = 'failed'`, false},
 		{"another column only", `UPDATE turns SET stop_requested_at = COALESCE(stop_requested_at, now()) WHERE session_id = $1 AND status IN ('pending', 'dispatched', 'processing')`, false},
 		{"status read in the WHERE only", `UPDATE turns SET epistemic_outcome = $2 WHERE id = $1 AND status = 'processing'`, false},
 		{"status read on the right only", `UPDATE turns SET conversation_id = status::text WHERE id = $1`, false},

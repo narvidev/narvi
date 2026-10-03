@@ -514,15 +514,19 @@ func stopFlaggedPendingTurnIDs(turns []sqlcgen.Turn) []pgtype.UUID {
 // exists, loses that debounce with it. The route wakes the actor as it
 // answers, so that window is normally the actor's own queue.
 //
-// The wake-up a turn's end owes the re-review debounce (technical plan
-// §24.9, wakeReviewRetriggerIfTurnEnded) keeps to the same rule: it only
-// moves a debounce that exists, never inserts one, so a debounce deleted
-// here stays deleted when the cancelled turn's end is written; and it never
-// wakes one armed at or before the standing request, so a turn the
-// dispatch gate cancels before this timer runs cannot launch the review
-// this timer is about to delete. The hold's own re-arm keeps created_at,
-// so a debounce held since before the request is still read as armed
-// before it.
+// The re-review debounce's hold and the wake-up a turn's end owes it
+// (technical plan §24.9: holdReviewRetrigger,
+// wakeReviewRetriggerIfTurnEnded) keep to the same rule, by created_at,
+// which no re-arm moves. Both only move a debounce that exists and never
+// insert one, so a debounce deleted here stays deleted: a firing claimed
+// before this timer ran and handled after it holds without re-creating it,
+// and the cancelled turn's end wakes nothing. Neither moves one armed at
+// or before the standing request: the hold drops it, as this would, and
+// the wake-up leaves it, so a turn the dispatch gate cancels before this
+// timer runs cannot launch the review this timer is about to delete. A
+// firing that finds no hold to keep -- the session's turns all ended -- is
+// not covered: it inserts its review as it always did, the stop
+// notwithstanding.
 //
 // A kind ClassifyTimer does not know is left armed: this binary cannot tell
 // what it does, and handleTimerFired leaves one armed too, until the time

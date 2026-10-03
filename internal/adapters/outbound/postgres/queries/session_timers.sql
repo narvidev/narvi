@@ -27,16 +27,54 @@ VALUES ($1, 'dispatch', now())
 ON CONFLICT (session_id, name) DO UPDATE
     SET fires_at = now(), armed_at = now();
 
+-- name: HoldReviewRetriggerDebounce :execrows
+-- Technical plan §24.9: the re-review debounce's firing holds -- a turn of
+-- the review session is open -- and re-arms its own row backstop_seconds
+-- (ReviewRetriggerHoldBackstop) ahead, on the database's clock: fires_at
+-- and armed_at come from one now(), so a held row sits exactly the backstop
+-- past its last arm, the mark WakeReviewRetriggerDebounce reads.
+-- created_at is kept. 'review_retrigger_debounce' is
+-- sessionactor.TimerReviewRetriggerDebounce, named here like the kind
+-- ArmSessionDispatchTimer names.
+--
+-- An UPDATE, never an insert, under the stop rule sessionactor's
+-- disarmWorkCreatingTimers deletes by: a row that is gone -- a person's
+-- stop deleted it while this firing waited in the actor's mailbox -- stays
+-- gone, and a row armed at or before the session's standing stop request
+-- is not re-armed. Zero rows in either case; the actor then drops the
+-- firing's decision, deleting what is left.
+UPDATE session_timers AS st
+SET fires_at = now() + make_interval(secs => sqlc.arg('backstop_seconds')::float8),
+    armed_at = now()
+FROM sessions AS s
+WHERE st.session_id = sqlc.arg('session_id')
+  AND st.name = 'review_retrigger_debounce'
+  AND s.id = st.session_id
+  AND (s.stop_requested_at IS NULL OR st.created_at > s.stop_requested_at);
+
 -- name: WakeReviewRetriggerDebounce :execrows
--- Technical plan §24.9: the wake-up a turn's end owes the re-review
+-- Technical plan §24.9: the wake-up a turn's end owes a held re-review
 -- debounce, run by the session actor in the same transaction as the write
 -- that left a turn completed, failed or cancelled (sessionactor's
 -- turnWriter and transact). While a turn of the review session is open the
--- debounce holds, re-arming itself at ReviewRetriggerHoldBackstop; this
--- moves it to now, so the review the hold kept back runs, for the head
--- pushed last, as soon as the session is free. 'review_retrigger_debounce'
--- is sessionactor.TimerReviewRetriggerDebounce, named here like the kind
+-- debounce holds, re-arming itself at ReviewRetriggerHoldBackstop
+-- (HoldReviewRetriggerDebounce); this moves it to now, so the review the
+-- hold kept back runs, for the head pushed last, as soon as the session is
+-- free. 'review_retrigger_debounce' is
+-- sessionactor.TimerReviewRetriggerDebounce, named here like the kind
 -- ArmSessionDispatchTimer names, so no caller can wake another kind.
+--
+-- Only a held row: one whose fires_at sits at least held_lead_seconds past
+-- its armed_at. The hold re-arms the backstop ahead of its arm on the
+-- database's clock; a push arms ReviewRetriggerDebounce ahead, on its
+-- replica's clock, after its transaction began, so a few milliseconds
+-- more. The caller passes ReviewRetriggerDebounce plus MinTimeoutMargin,
+-- which Validate keeps at or below the backstop: a push's quiet window
+-- (§24.2) is never cut short by a turn's end, whenever that turn ends, and
+-- a held row is woken however close to its backstop the turn ends -- the
+-- mark is how far ahead the row was last armed, never how far ahead it
+-- still is. A pump's claim moves fires_at alone, so a held row the pump
+-- claimed reads as held too.
 --
 -- An UPDATE, never an insert: a debounce row exists while a push still
 -- waits for its review (the hold re-arms it), and one that is gone was
@@ -45,15 +83,17 @@ ON CONFLICT (session_id, name) DO UPDATE
 -- A debounce armed at or before the session's standing stop request is
 -- left alone (sessionactor's disarmWorkCreatingTimers deletes it when the
 -- stop timer runs, by the same rule), so a turn the stop's dispatch gate
--- cancels never wakes the work the stop asked to drop. armed_at is stamped
--- like every arm (UpsertSessionTimer); created_at, the instant a stop is
--- compared with, is kept. A session with no debounce updates nothing: one
--- probe of the (session_id, name) unique index.
+-- cancels never wakes the work the stop asked to drop: the rule compares
+-- created_at, which no re-arm moves, never armed_at. armed_at is stamped
+-- like every arm (UpsertSessionTimer); created_at is kept. A session with
+-- no debounce updates nothing: one probe of the (session_id, name) unique
+-- index.
 UPDATE session_timers AS st
 SET fires_at = now(), armed_at = now()
 FROM sessions AS s
 WHERE st.session_id = sqlc.arg('session_id')
   AND st.name = 'review_retrigger_debounce'
+  AND st.fires_at - st.armed_at >= make_interval(secs => sqlc.arg('held_lead_seconds')::float8)
   AND s.id = st.session_id
   AND (s.stop_requested_at IS NULL OR st.created_at > s.stop_requested_at);
 

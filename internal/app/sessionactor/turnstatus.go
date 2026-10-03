@@ -3,12 +3,14 @@ package sessionactor
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/turn"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // turnWriter is the one way this package writes a turn's status: every
@@ -16,11 +18,15 @@ import (
 // actor, so transact wakes the re-review debounce in the same transaction
 // as that write (wakeReviewRetriggerIfTurnEnded, technical plan §24.9).
 // While a turn of a review session is open the debounce holds
-// (reviewretrigger.go); every way a turn ends goes through here, so no
-// ending can lose the wake-up. TestTurnStatusWritesGoThroughTheRecorder
-// keeps every such write on it, and TestTurnStatusQueriesAreTheRecordedOnes
-// keeps UpdateTurnStatus the one query that writes turns.status. A turn is
-// never inserted terminal (postgres.ErrTurnNotPending).
+// (reviewretrigger.go); every way a turn ends today goes through here.
+// TestTurnStatusWritesGoThroughTheRecorder keeps every status write the Go
+// type checker can see on it -- the store's UpdateStatus, the query only
+// inside it, the params only in a literal handed here -- and
+// TestTurnStatusQueriesAreTheRecordedOnes keeps UpdateTurnStatus the one
+// sqlc query, and no migration, writing turns.status in the shapes
+// TestSQLWritesTurnStatus pins. SQL assembled at run time is not seen; a
+// wake-up lost that way costs ReviewRetriggerHoldBackstop at most. A turn
+// is never inserted terminal (postgres.ErrTurnNotPending).
 //
 // The writes it carries today, by what they do:
 //
@@ -59,22 +65,25 @@ func (w turnWriter) UpdateStatus(ctx context.Context, arg sqlcgen.UpdateTurnStat
 	return row, err
 }
 
-// wakeReviewRetriggerIfTurnEnded is the wake-up a turn's end owes the
+// wakeReviewRetriggerIfTurnEnded is the wake-up a turn's end owes a held
 // re-review debounce (technical plan §24.9): when the current transact
 // attempt wrote a terminal status through turnWrites, the session's
-// debounce, if it has one, is moved to now inside tx, the transaction of
-// that write, so the end and the wake-up commit together or not at all. It
-// runs whether or not another turn is still open -- the debounce then
-// holds again at its next firing -- so the statement stays one probe of
-// the timer's unique index. It never inserts a debounce, and never wakes
-// one armed at or before a standing stop request (TimerStore.
-// WakeReviewRetriggerDebounce). A session that is no review session has no
-// debounce, and nothing is written.
+// debounce, if the hold re-armed it, is moved to now inside tx, the
+// transaction of that write, so the end and the wake-up commit together or
+// not at all. A debounce a push armed that has not held is left to run out
+// its quiet window (§24.2), so a burst of pushes that straddles a turn's
+// end still reviews once, at its last head. It runs whether or not another
+// turn is still open -- the debounce then holds again at its next firing
+// -- so the statement stays one probe of the timer's unique index. It
+// never inserts a debounce, and never wakes one armed at or before a
+// standing stop request (TimerStore.WakeReviewRetriggerDebounce). A
+// session that is no review session has no debounce, and nothing is
+// written.
 func (a *Actor) wakeReviewRetriggerIfTurnEnded(ctx context.Context, tx pgx.Tx) error {
 	if !a.turnEnded {
 		return nil
 	}
-	woken, err := a.stores.timer.WithTx(tx).WakeReviewRetriggerDebounce(ctx, a.sessionID)
+	woken, err := a.stores.timer.WithTx(tx).WakeReviewRetriggerDebounce(ctx, a.sessionID, heldDebounceLead(a.timeouts))
 	if err != nil {
 		return fmt.Errorf("sessionactor: wake the re-review debounce after a turn ended: %w", err)
 	}
@@ -82,4 +91,18 @@ func (a *Actor) wakeReviewRetriggerIfTurnEnded(ctx context.Context, tx pgx.Tx) e
 		a.logger.Info("sessionactor: review_retrigger_debounce: a turn ended; the held re-review is due now")
 	}
 	return nil
+}
+
+// heldDebounceLead is how far past its last arm a re-review debounce's
+// fires_at must sit for the wake-up to read it as held. The hold re-arms
+// it ReviewRetriggerHoldBackstop ahead, fires_at and armed_at from one
+// now() on the database's clock (TimerStore.HoldReviewRetriggerDebounce); a
+// push arms it ReviewRetriggerDebounce ahead on its replica's clock, a few
+// milliseconds after its transaction stamped armed_at, so a push's lead is
+// a little over the window. Validate keeps the backstop at least
+// MinTimeoutMargin above the window, so the two leads never meet; and a
+// row's lead does not shrink as it ages, so a held row is woken however
+// close to its backstop the turn ends.
+func heldDebounceLead(t platform.Timeouts) time.Duration {
+	return t.ReviewRetriggerDebounce + platform.MinTimeoutMargin
 }

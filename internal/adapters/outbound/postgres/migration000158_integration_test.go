@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"net/url"
 	"testing"
 )
 
@@ -103,6 +104,56 @@ func TestMigration000158_KeepsAValidPrebuiltIndex(t *testing.T) {
 	defer func() { _ = mdb.Close() }()
 	if err := m.Migrate(158); err != nil {
 		t.Fatalf("up to 158: %v", err)
+	}
+	if got := assertOpenTurnIndexBuilt(ctx, t, db); got != prebuilt {
+		t.Errorf("turns_open_session_id_idx oid = %d after the migration, want the pre-built %d (not rebuilt)", got, prebuilt)
+	}
+	assertCleanVersion(t, connStr, 158)
+}
+
+// TestMigration000158_APrebuiltIndexTakesNoLockOnTurns is the rest of that
+// operator path: with the valid index pre-built, the migration takes no
+// lock on turns at all, so it never waits behind a write to turns in
+// flight, nor stalls the writes after it. The migrator runs with a short
+// lock_timeout while another transaction holds an uncommitted insert into
+// turns; a CREATE INDEX IF NOT EXISTS would queue for the SHARE lock on
+// turns before seeing the index, and time out.
+func TestMigration000158_APrebuiltIndexTakesNoLockOnTurns(t *testing.T) {
+	ctx := context.Background()
+	connStr, db := migrationTestDatabase(ctx, t, 157)
+	if _, err := db.ExecContext(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS turns_open_session_id_idx
+		ON turns (session_id) WHERE status NOT IN ('completed', 'failed', 'cancelled')`); err != nil {
+		t.Fatalf("pre-build the index concurrently: %v", err)
+	}
+	prebuilt := assertOpenTurnIndexBuilt(ctx, t, db)
+
+	var sessionID string
+	if err := db.QueryRowContext(ctx, `INSERT INTO sessions (spawn_source) VALUES ('web') RETURNING id::text`).Scan(&sessionID); err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+	writer, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = writer.Rollback() }()
+	if _, err := writer.ExecContext(ctx, `INSERT INTO turns (session_id, status) VALUES ($1, 'pending')`, sessionID); err != nil {
+		t.Fatalf("a write to turns in flight: %v", err)
+	}
+
+	u, err := url.Parse(connStr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := u.Query()
+	q.Set("lock_timeout", "2s")
+	u.RawQuery = q.Encode()
+	m, mdb := newMigrate(t, u.String())
+	defer func() { _ = mdb.Close() }()
+	if err := m.Migrate(158); err != nil {
+		t.Fatalf("up to 158 with a write to turns in flight: %v -- the migration waited for a lock on turns", err)
+	}
+	if err := writer.Commit(); err != nil {
+		t.Fatalf("the write in flight: %v", err)
 	}
 	if got := assertOpenTurnIndexBuilt(ctx, t, db); got != prebuilt {
 		t.Errorf("turns_open_session_id_idx oid = %d after the migration, want the pre-built %d (not rebuilt)", got, prebuilt)

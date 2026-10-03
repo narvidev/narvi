@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 const (
@@ -25,13 +27,23 @@ const (
 	// one open turn it finds. Walking the session's history reads a buffer
 	// for a few dozen turns; a scan of the table, hundreds.
 	holdReadMaxBuffers = 6
-	// holdWakeMaxBuffers bounds the turn end's wake-up of the debounce
-	// (WakeReviewRetriggerDebounce): a probe of session_timers' (session_id,
-	// name) unique index and the row's heap page, one of sessions_pkey and
-	// the session's page, and -- fires_at being indexed, so no update is
-	// heap-only -- the new row version and its entry in each of the
-	// table's three indexes.
-	holdWakeMaxBuffers = 12
+	// holdWakeMaxBuffers bounds the hold's re-arm and the turn end's
+	// wake-up of the debounce (HoldReviewRetriggerDebounce,
+	// WakeReviewRetriggerDebounce), each the row's first write in its
+	// transaction: a probe of session_timers' (session_id, name) unique
+	// index and the row's heap page, one of sessions_pkey and the session's
+	// page, and -- fires_at being indexed, so no update is heap-only -- the
+	// new row version and its entry in each of the table's three indexes.
+	// On the densely loaded tables below the row's page has no room for the
+	// new version, so the update also reads the free space map and extends
+	// the table: 19 or 20 buffers measured, whatever the table holds. A row
+	// updated again in the same transaction finds room on the page its last
+	// version went to, and reads 9.
+	holdWakeMaxBuffers = 24
+	// openTurnIndexEntryMaxBuffers bounds what adding a row version's entry
+	// to turns_open_session_id_idx reads: a descent of an index that holds
+	// the open turns only, one or two levels.
+	openTurnIndexEntryMaxBuffers = 2
 )
 
 // holdPlanMaxBuffers bounds what the statements reading a session's open
@@ -62,6 +74,14 @@ type holdPlanShape struct {
 	others, perOther, openEvery int
 	longEnded                   int
 	longOpen, longAfterAnalyze  bool
+	// splitOverOne gives 80,000 ended turns 26,600 completed, 26,600
+	// failed and 26,800 cancelled, the long session's all cancelled, and
+	// has ANALYZE read every row: the three frequencies the statistics
+	// store, each rounded to a float4, then sum to a hair over 1.0. A
+	// selectivity estimate of "status is none of the three" that sums them
+	// as disjoint finds the result out of range and falls back to treating
+	// them as independent -- about 30% of the table instead of none.
+	splitOverOne bool
 }
 
 // holdPlanProbe is one session a statement is measured for.
@@ -121,6 +141,13 @@ func storeHoldPlanShape(ctx context.Context, t *testing.T, pool *pgxpool.Pool, s
 			t.Fatalf("store %s: %v", what, err)
 		}
 	}
+	// Autovacuum stays off the measured tables, so every run reads its
+	// plans in one state -- the one a busy table is in between two vacuums,
+	// its visibility map unset -- rather than in whichever state a worker
+	// that happened by left it.
+	for _, table := range []string{"sessions", "turns", "session_timers"} {
+		exec("autovacuum off "+table, `ALTER TABLE `+table+` SET (autovacuum_enabled = false)`)
+	}
 	var others []string
 	if err := pool.QueryRow(ctx, `
 		WITH s AS (
@@ -134,9 +161,10 @@ func storeHoldPlanShape(ctx context.Context, t *testing.T, pool *pgxpool.Pool, s
 	exec("the other sessions' ended turns", `
 		INSERT INTO turns (session_id, status, created_at)
 		SELECT ($1::uuid[])[1 + g % cardinality($1::uuid[])],
-		       (ARRAY['completed', 'failed', 'cancelled'])[1 + g % 3]::turn_status,
+		       CASE WHEN NOT $3::boolean THEN (ARRAY['completed', 'failed', 'cancelled'])[1 + g % 3]
+		            WHEN g <= 26600 THEN 'completed' WHEN g <= 53200 THEN 'failed' ELSE 'cancelled' END::turn_status,
 		       now() - make_interval(secs => $2::int - g)
-		FROM generate_series(1, $2::int) g`, others, shape.others*shape.perOther)
+		FROM generate_series(1, $2::int) g`, others, shape.others*shape.perOther, shape.splitOverOne)
 	if shape.openEvery > 0 {
 		exec("the other sessions' open turns", `
 			INSERT INTO turns (session_id, status)
@@ -160,8 +188,9 @@ func storeHoldPlanShape(ctx context.Context, t *testing.T, pool *pgxpool.Pool, s
 		}
 		exec("the long session's ended turns", `
 			INSERT INTO turns (session_id, status, created_at)
-			SELECT $1, (ARRAY['completed', 'failed', 'cancelled'])[1 + g % 3]::turn_status, now() - make_interval(secs => $2::int - g)
-			FROM generate_series(1, $2::int) g`, long, shape.longEnded)
+			SELECT $1, CASE WHEN $3::boolean THEN 'cancelled' ELSE (ARRAY['completed', 'failed', 'cancelled'])[1 + g % 3] END::turn_status,
+			       now() - make_interval(secs => $2::int - g)
+			FROM generate_series(1, $2::int) g`, long, shape.longEnded, shape.splitOverOne)
 		if shape.longOpen {
 			exec("the long session's processing turn", `INSERT INTO turns (session_id, status, dispatched_at) VALUES ($1, 'processing', now())`, long)
 		}
@@ -171,6 +200,9 @@ func storeHoldPlanShape(ctx context.Context, t *testing.T, pool *pgxpool.Pool, s
 	}
 	if !shape.longAfterAnalyze {
 		storeLong()
+	}
+	if shape.splitOverOne {
+		exec("full statistics of status", `ALTER TABLE turns ALTER COLUMN status SET STATISTICS 1000`)
 	}
 	exec("analyze", `ANALYZE`)
 	if shape.longAfterAnalyze {
@@ -204,10 +236,14 @@ func boolInt(b bool) int {
 // five custom plans), args is what EXPLAIN EXECUTE passes it. A statement
 // that writes is measured inside a transaction rolled back.
 type holdPlanStatement struct {
-	name   string
-	writes bool
-	run    func(ctx context.Context, q pgx.Tx, probe holdPlanProbe) error
-	args   func(probe holdPlanProbe) string
+	name string
+	run  func(ctx context.Context, q pgx.Tx, probe holdPlanProbe) error
+	args func(probe holdPlanProbe) string
+	// writesOpenTurn is a write of an open turn that is never heap-only:
+	// once 000158 is in, its new row version also gets an entry in
+	// turns_open_session_id_idx, which it may read up to
+	// openTurnIndexEntryMaxBuffers more for.
+	writesOpenTurn bool
 }
 
 // holdPlanMeasurement is one statement's read for one probe and mode.
@@ -221,29 +257,41 @@ func (m holdPlanMeasurement) String() string {
 }
 
 // measureHoldPlan runs statement for probe through its store call eight
-// times and then under EXPLAIN (ANALYZE, BUFFERS) EXECUTE in mode, all on
-// the pool's one connection inside a transaction that is rolled back.
+// times in a transaction that is rolled back, and then once under EXPLAIN
+// (ANALYZE, BUFFERS) EXECUTE in mode in another, also rolled back, all on
+// the pool's one connection: the measured run finds the rows as the last
+// commit left them, as every production run of a write does, rather than
+// as eight writes of its own transaction did.
 func measureHoldPlan(ctx context.Context, t *testing.T, pool *pgxpool.Pool, statement holdPlanStatement, probe holdPlanProbe, mode string) holdPlanMeasurement {
 	t.Helper()
-	tx, err := pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
-	for i := 0; i < 8; i++ {
-		if err := statement.run(ctx, tx, probe); err != nil && !errors.Is(err, pgx.ErrNoRows) {
-			t.Fatalf("%s for %s: %v", statement.name, probe.name, err)
+	inTx := func(fn func(tx pgx.Tx)) {
+		tx, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
 		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		fn(tx)
 	}
-	if _, err := tx.Exec(ctx, "SET LOCAL plan_cache_mode = "+mode); err != nil {
-		t.Fatalf("set plan_cache_mode: %v", err)
-	}
-	plan := explainPlan(ctx, t, tx, statement.name, statement.args(probe))
-	scans, buffers, err := planScans(plan, "")
-	if err != nil {
-		t.Fatalf("read %s's plan: %v\n%s", statement.name, err, plan)
-	}
-	return holdPlanMeasurement{buffers: buffers, scans: scans}
+	inTx(func(tx pgx.Tx) {
+		for i := 0; i < 8; i++ {
+			if err := statement.run(ctx, tx, probe); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				t.Fatalf("%s for %s: %v", statement.name, probe.name, err)
+			}
+		}
+	})
+	var m holdPlanMeasurement
+	inTx(func(tx pgx.Tx) {
+		if _, err := tx.Exec(ctx, "SET LOCAL plan_cache_mode = "+mode); err != nil {
+			t.Fatalf("set plan_cache_mode: %v", err)
+		}
+		plan := explainPlan(ctx, t, tx, statement.name, statement.args(probe))
+		scans, buffers, err := planScans(plan, "")
+		if err != nil {
+			t.Fatalf("read %s's plan: %v\n%s", statement.name, err, plan)
+		}
+		m = holdPlanMeasurement{buffers: buffers, scans: scans}
+	})
+	return m
 }
 
 // TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns measures, by buffers
@@ -255,19 +303,29 @@ func measureHoldPlan(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stat
 // with none open; and the first with the long session stored after the
 // tables were analyzed, which a custom plan expects few turns of.
 //
-// Before migration 000158 and after it, the four statements that read a
+// Before migration 000158 and after it, the five statements that read a
 // session's open or in-flight turns -- GetSessionActivityFacts,
 // RequestStopOpenTurns, ListStopRequestedOpenTurns,
-// GetProcessingTurnForSession -- must read no more after than before, and
-// never more than holdPlanMaxBuffers of the session's own turns. After it,
-// the hold's read must read at most holdReadMaxBuffers, its only scan of
-// turns on turns_open_session_id_idx -- never a sequential or bitmap heap
-// scan of turns -- and the wake-up at most holdWakeMaxBuffers, through
-// index scans of session_timers' (session_id, name) key and sessions_pkey
-// alone, whatever the table holds.
+// GetProcessingTurnForSession, RecordTurnStepCost -- must read no more
+// after than before, and never more than holdPlanMaxBuffers of the
+// session's own turns. RecordTurnStepCost alone may read up to
+// openTurnIndexEntryMaxBuffers more: its update of a processing turn's
+// cost is never heap-only (cost_usd is in turns_cost_created_at_idx's
+// predicate), so the new version also gets an entry in the new index --
+// a write, not a read the index changed. After 000158, the hold's read
+// must read at most holdReadMaxBuffers, its only scan of turns on
+// turns_open_session_id_idx -- never a sequential or bitmap heap scan of
+// turns -- and the hold's re-arm and the wake-up at most
+// holdWakeMaxBuffers each, through index scans of session_timers'
+// (session_id, name) key and sessions_pkey alone, whatever the table
+// holds.
 func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 	const budget = 10
 	grace := (30 * time.Second).Seconds()
+	timeouts := platform.DefaultTimeouts()
+	backstop := timeouts.ReviewRetriggerHoldBackstop
+	// sessionactor's heldDebounceLead.
+	heldLead := timeouts.ReviewRetriggerDebounce + platform.MinTimeoutMargin
 	unchanged := []holdPlanStatement{
 		{
 			name: "GetSessionActivityFacts",
@@ -278,7 +336,7 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 			args: func(p holdPlanProbe) string { return fmt.Sprintf("%d, '%s'::uuid", budget, p.sessionID.String()) },
 		},
 		{
-			name: "RequestStopOpenTurns", writes: true,
+			name: "RequestStopOpenTurns",
 			run: func(ctx context.Context, tx pgx.Tx, p holdPlanProbe) error {
 				_, err := narvipg.NewTurnStore(nil).WithTx(tx).RequestStopOpen(ctx, p.sessionID)
 				return err
@@ -301,6 +359,18 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 			},
 			args: func(p holdPlanProbe) string { return fmt.Sprintf("'%s'::uuid", p.sessionID.String()) },
 		},
+		{
+			// Every step_finish of a processing turn: a step id never
+			// counted before, so the cost is added.
+			name: "RecordTurnStepCost", writesOpenTurn: true,
+			run: func(ctx context.Context, tx pgx.Tx, p holdPlanProbe) error {
+				_, err := narvipg.NewTurnStore(nil).WithTx(tx).RecordStepCostUSD(ctx, p.sessionID, freshStepID(), 0.01)
+				return err
+			},
+			args: func(p holdPlanProbe) string {
+				return fmt.Sprintf("'%s'::uuid, '%s', 0.01", p.sessionID.String(), freshStepID())
+			},
+		},
 	}
 	held := holdPlanStatement{
 		name: "ReviewRetriggerHeld",
@@ -313,13 +383,27 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 		},
 		args: func(p holdPlanProbe) string { return fmt.Sprintf("'%s'::uuid", p.sessionID.String()) },
 	}
+	// The long session's debounce sits ten minutes past its arm: held.
 	wake := holdPlanStatement{
-		name: "WakeReviewRetriggerDebounce", writes: true,
+		name: "WakeReviewRetriggerDebounce",
 		run: func(ctx context.Context, tx pgx.Tx, p holdPlanProbe) error {
-			_, err := narvipg.NewTimerStore(nil).WithTx(tx).WakeReviewRetriggerDebounce(ctx, p.sessionID)
+			_, err := narvipg.NewTimerStore(nil).WithTx(tx).WakeReviewRetriggerDebounce(ctx, p.sessionID, heldLead)
 			return err
 		},
-		args: func(p holdPlanProbe) string { return fmt.Sprintf("'%s'::uuid", p.sessionID.String()) },
+
+		args: func(p holdPlanProbe) string {
+			return fmt.Sprintf("'%s'::uuid, %v", p.sessionID.String(), heldLead.Seconds())
+		},
+	}
+	rearm := holdPlanStatement{
+		name: "HoldReviewRetriggerDebounce",
+		run: func(ctx context.Context, tx pgx.Tx, p holdPlanProbe) error {
+			_, err := narvipg.NewTimerStore(nil).WithTx(tx).HoldReviewRetriggerDebounce(ctx, p.sessionID, backstop)
+			return err
+		},
+		args: func(p holdPlanProbe) string {
+			return fmt.Sprintf("%v, '%s'::uuid", backstop.Seconds(), p.sessionID.String())
+		},
 	}
 	modes := []string{"force_custom_plan", "force_generic_plan"}
 
@@ -327,6 +411,7 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 		{name: "5,000 sessions of 6 turns, every 20th open, beside a review session of 4,000 ended turns and one processing", others: 5_000, perOther: 6, openEvery: 20, longEnded: 4_000, longOpen: true},
 		{name: "300 sessions of 200 ended turns beside one of 20,000, none open", others: 300, perOther: 200, longEnded: 20_000},
 		{name: "the first, the review session stored after ANALYZE", others: 5_000, perOther: 6, openEvery: 20, longEnded: 4_000, longOpen: true, longAfterAnalyze: true},
+		{name: "the second, its ended states' statistics summing a hair over the whole table", others: 300, perOther: 200, longEnded: 20_000, splitOverOne: true},
 	} {
 		t.Run(shape.name, func(t *testing.T) {
 			ctx := context.Background()
@@ -356,7 +441,11 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 						key := statement.name + ", " + probe.name + ", " + mode
 						after := measureHoldPlan(ctx, t, pool, statement, probe, mode)
 						t.Logf("%s: before 000158 %v; after %v", key, before[key], after)
-						if after.buffers > before[key].buffers {
+						allowance := 0.0
+						if statement.writesOpenTurn {
+							allowance = openTurnIndexEntryMaxBuffers
+						}
+						if after.buffers > before[key].buffers+allowance {
 							t.Errorf("%s: read %.0f buffers after 000158, %.0f before: the open-turn index made it worse", key, after.buffers, before[key].buffers)
 						}
 						if limit := holdPlanMaxBuffers(probe.turns); after.buffers > limit {
@@ -374,11 +463,15 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 						t.Errorf("ReviewRetriggerHeld, %s, %s: %s", probe.name, mode, problem)
 					}
 					// Every turn's end runs the wake-up, a review session's
-					// or not: the long one has a debounce, the small ones none.
-					got = measureHoldPlan(ctx, t, pool, wake, probe, mode)
-					t.Logf("WakeReviewRetriggerDebounce, %s, %s: %v", probe.name, mode, got)
-					if problem := holdWakeProblem(got); problem != "" {
-						t.Errorf("WakeReviewRetriggerDebounce, %s, %s: %s", probe.name, mode, problem)
+					// or not: the long one has a held debounce, the small
+					// ones none. The re-arm runs only for a review session
+					// with a turn open, and is measured on every probe too.
+					for _, statement := range []holdPlanStatement{wake, rearm} {
+						got = measureHoldPlan(ctx, t, pool, statement, probe, mode)
+						t.Logf("%s, %s, %s: %v", statement.name, probe.name, mode, got)
+						if problem := holdWakeProblem(got); problem != "" {
+							t.Errorf("%s, %s, %s: %s", statement.name, probe.name, mode, problem)
+						}
 					}
 				}
 			}
@@ -387,28 +480,49 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 }
 
 // holdReadProblem returns why the hold's read is not one probe of the open
-// turns' index, or "".
+// turns' index, or "": every scan of turns is an index scan of
+// turns_open_session_id_idx, or a bitmap heap scan whose bitmap comes from
+// that index alone -- never a sequential scan, nor a bitmap read through
+// another index of the session's turns.
 func holdReadProblem(m holdPlanMeasurement) string {
 	if m.buffers > holdReadMaxBuffers {
 		return fmt.Sprintf("reads %.0f buffers, over %d (%v)", m.buffers, holdReadMaxBuffers, m.scans)
 	}
+	const openTurns = "turns_open_session_id_idx"
 	onIndex := false
 	for _, s := range m.scans {
-		if s.Relation != "turns" {
-			continue
+		switch {
+		case s.Node == "Bitmap Index Scan":
+			if s.Index != openTurns {
+				return fmt.Sprintf("reads a bitmap of turns through another index: %s", s)
+			}
+			onIndex = true
+		case s.Relation != "turns":
+		case s.Node == "Bitmap Heap Scan":
+			// Its Bitmap Index Scans are checked above.
+		case (s.Node == "Index Scan" || s.Node == "Index Only Scan") && s.Index == openTurns:
+			onIndex = true
+		default:
+			return fmt.Sprintf("scans turns other than through %s: %s", openTurns, s)
 		}
-		if s.Index != "turns_open_session_id_idx" || strings.Contains(s.Node, "Seq Scan") || strings.Contains(s.Node, "Bitmap Heap Scan") {
-			return fmt.Sprintf("scans turns other than through turns_open_session_id_idx: %s", s)
-		}
-		onIndex = true
 	}
 	if !onIndex {
-		return fmt.Sprintf("never scans turns_open_session_id_idx (%v)", m.scans)
+		return fmt.Sprintf("never scans %s (%v)", openTurns, m.scans)
 	}
 	return ""
 }
 
-// holdWakeProblem returns why the wake-up is not two key probes, or "".
+// stepIDs numbers the step ids freshStepID hands out.
+var stepIDs atomic.Int64
+
+// freshStepID is a step id no step_finish has counted, so
+// RecordTurnStepCost adds the cost instead of skipping a redelivery.
+func freshStepID() string {
+	return fmt.Sprintf("step-%d", stepIDs.Add(1))
+}
+
+// holdWakeProblem returns why the hold's re-arm or the wake-up is not two
+// key probes, or "".
 func holdWakeProblem(m holdPlanMeasurement) string {
 	if m.buffers > holdWakeMaxBuffers {
 		return fmt.Sprintf("reads %.0f buffers, over %d (%v)", m.buffers, holdWakeMaxBuffers, m.scans)

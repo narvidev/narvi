@@ -83,8 +83,9 @@ const (
 //     by the actor with no further input (reviewretrigger.go). While a turn
 //     of the session is open it holds instead, re-arming itself at
 //     ReviewRetriggerHoldBackstop with the pushed head kept as its target,
-//     and every turn end moves it to now in that end's own transaction
-//     (technical plan §24.9). Otherwise it declines and deletes itself.
+//     and every turn end moves a held one -- never a push's quiet window
+//     -- to now in that end's own transaction (technical plan §24.9).
+//     Otherwise it declines and deletes itself.
 //     TimerCountsAsScheduledWork narrows it by the opt-in and the budget,
 //     which the status reads in its snapshot.
 //   - dispatch (armed due at once in the transaction that creates a turn,

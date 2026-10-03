@@ -257,9 +257,7 @@ func TestReviewRetriggerHold_FivePushesDuringOneReviewQueueOneReviewOfTheLastHea
 		last = fmt.Sprintf("sha-pushed-%d", push)
 		f.push(t, last)
 		f.comeDue(ctx, t)
-		before := time.Now()
 		f.pumpUntilHeld(ctx, t)
-		after := time.Now()
 
 		turns, err := f.rig.turns.ListForSession(ctx, f.sessionID)
 		if err != nil || len(turns) != 2 {
@@ -269,9 +267,12 @@ func TestReviewRetriggerHold_FivePushesDuringOneReviewQueueOneReviewOfTheLastHea
 		if row.PendingRetriggerHeadSha == nil || *row.PendingRetriggerHeadSha != last || row.AutoRetriggerCount != 0 {
 			t.Fatalf("push %d: pending %v, count %d; want %s pending and nothing spent", push, row.PendingRetriggerHeadSha, row.AutoRetriggerCount, last)
 		}
-		timer, armed := f.debounceArmed(ctx, t)
-		if !armed || timer.FiresAt.Time.Before(before.Add(backstop).Add(-time.Second)) || timer.FiresAt.Time.After(after.Add(backstop).Add(time.Second)) {
-			t.Fatalf("push %d: debounce armed %v at %v, want re-armed %v after the firing (between %v and %v)", push, armed, timer.FiresAt.Time, backstop, before.Add(backstop), after.Add(backstop))
+		// Re-armed by the firing, on the database's clock: exactly the
+		// backstop past an arm made within the last few seconds.
+		var rearmed bool
+		if err := f.rig.pool.QueryRow(ctx, `SELECT fires_at - armed_at = make_interval(secs => $3) AND armed_at > now() - interval '10 seconds'
+			FROM session_timers WHERE session_id = $1 AND name = $2`, f.sessionID, sessionactor.TimerReviewRetriggerDebounce, backstop.Seconds()).Scan(&rearmed); err != nil || !rearmed {
+			t.Fatalf("push %d: debounce re-armed the backstop (%v) past a fresh arm: %v (err %v), want true", push, backstop, rearmed, err)
 		}
 		if got := f.mustRead(t); got.Activity != restdtos.SessionActivityActivityRunning || got.Settled {
 			t.Fatalf("push %d held: activity %q settled %v, want running", push, got.Activity, got.Settled)
@@ -303,6 +304,56 @@ func TestReviewRetriggerHold_FivePushesDuringOneReviewQueueOneReviewOfTheLastHea
 	}
 	if got := f.mustRead(t); got.Activity != restdtos.SessionActivityActivityQueued || got.Settled || got.PendingTurns != 1 {
 		t.Fatalf("the held review queued: activity %q settled %v pending %d, want queued with one turn", got.Activity, got.Settled, got.PendingTurns)
+	}
+}
+
+// TestReviewRetriggerHold_ABurstStraddlingTheReviewsEndReviewsOnce: a push
+// lands while a review runs, the review ends inside that push's quiet
+// window, and a second push follows seconds later (technical plan §24.2,
+// §24.9). The review's end wakes only a debounce the hold re-armed, so it
+// leaves this push's window running: no pump tick before the window ends
+// queues anything, the second push re-arms the window, and when it fires
+// the burst gets exactly one review, of its last head, spending one budget
+// slot -- never a review of the first head now and one of the second
+// after it.
+func TestReviewRetriggerHold_ABurstStraddlingTheReviewsEndReviewsOnce(t *testing.T) {
+	ctx := context.Background()
+	f := newHoldStatusFixture(ctx, t)
+
+	f.push(t, "sha-burst-1")
+	f.endReview(ctx, t)
+	var due bool
+	if err := f.rig.pool.QueryRow(ctx, `SELECT fires_at <= now() FROM session_timers WHERE session_id = $1 AND name = $2`,
+		f.sessionID, sessionactor.TimerReviewRetriggerDebounce).Scan(&due); err != nil {
+		t.Fatalf("read the debounce after the review ended: %v", err)
+	}
+	if due {
+		t.Fatal("the review's end woke a push's quiet window: the burst's first head would be reviewed at once")
+	}
+	for range 3 {
+		if err := f.registry.PumpOnce(ctx); err != nil {
+			t.Fatalf("PumpOnce: %v", err)
+		}
+	}
+	if turns, err := f.rig.turns.ListForSession(ctx, f.sessionID); err != nil || len(turns) != 2 {
+		t.Fatalf("pump ticks inside the window: %d turns (err %v), want the old review and the ended one only", len(turns), err)
+	}
+
+	const last = "sha-burst-2"
+	f.push(t, last)
+	f.fetcher.setHead(last)
+	f.comeDue(ctx, t)
+	f.pumpUntilHandled(ctx, t)
+
+	turns, err := f.rig.turns.ListForSession(ctx, f.sessionID)
+	if err != nil || len(turns) != 3 {
+		t.Fatalf("after the burst's window ran out: %d turns (err %v), want exactly one more review", len(turns), err)
+	}
+	if review := turns[len(turns)-1]; !review.IsReviewAttempt || review.ReviewHeadSha == nil || *review.ReviewHeadSha != last {
+		t.Fatalf("the burst's review = %+v, want a review attempt of %s", review, last)
+	}
+	if row := f.prSession(ctx, t); row.PendingRetriggerHeadSha != nil || row.AutoRetriggerCount != 1 {
+		t.Fatalf("after the burst's review was queued: pending %v, count %d; want cleared and one slot spent", row.PendingRetriggerHeadSha, row.AutoRetriggerCount)
 	}
 }
 

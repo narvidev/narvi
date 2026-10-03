@@ -73,12 +73,14 @@
 // comparison and the budget have decided, it reads the hold
 // (reviewRetriggerHeld) and, held, inserts nothing, spends nothing, keeps
 // pending_retrigger_head_sha as the target and re-arms the same debounce
-// row at ReviewRetriggerHoldBackstop (holdReviewRetrigger). The hold is
-// read again at the insert, since a person's turn can be committed while
-// phase 2 fetches. Every write that ends a turn goes through turnWrites
-// (turnstatus.go), and transact then moves the debounce to now in that
-// same transaction, so the review the hold kept back runs as soon as the
-// session is free, for the head pushed last. Anything that launches a
+// row at ReviewRetriggerHoldBackstop (holdReviewRetrigger), an update
+// that never re-creates a row a person's stop deleted. The hold is read
+// again at the insert, since a person's turn can be committed while phase
+// 2 fetches. Every write that ends a turn goes through turnWrites
+// (turnstatus.go), and transact then moves the held debounce to now in
+// that same transaction, so the review the hold kept back runs as soon as
+// the session is free, for the head pushed last; a push's quiet window
+// that has not held yet is left to run out (§24.2). Anything that launches a
 // review through this debounce -- setting the pending head and arming the
 // timer -- is held the same way. A person's trigger (the label, the
 // button, a mention) inserts its turn directly and is never held.
@@ -90,7 +92,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -532,18 +533,37 @@ func (a *Actor) reviewRetriggerHeld(ctx context.Context, tx pgx.Tx) (bool, error
 // holdReviewRetrigger is a firing that holds (technical plan §24.9): it
 // inserts no turn and spends no budget, keeps pending_retrigger_head_sha --
 // the head pushed last, which the next push may still replace -- as the
-// review's target, and re-arms the one debounce row at
-// ReviewRetriggerHoldBackstop. UpsertSessionTimer keeps the row's
-// created_at, so a person's stop still sees when the debounce was first
-// armed (disarmWorkCreatingTimers), and stamps armed_at like every arm. The
+// review's target, and re-arms the one debounce row
+// ReviewRetriggerHoldBackstop ahead, on the database's clock
+// (TimerStore.HoldReviewRetriggerDebounce): that lead is the mark the
+// wake-up reads as held. The re-arm keeps the row's created_at, so a
+// person's stop still sees when the debounce was first armed
+// (disarmWorkCreatingTimers), and stamps armed_at like every arm. The
 // write that ends the turn holding it moves the row to now in its own
 // transaction (wakeReviewRetriggerIfTurnEnded), so the backstop only
 // bounds a wake-up that was lost; meanwhile the row keeps the session's
 // status reading the work as still to come (§43.20).
+//
+// The re-arm is an update, never an insert, under the stop's own rule.
+// When it moves no row, the firing's decision is dropped: the row is gone
+// -- a person's stop deleted it while this firing, claimed before, waited
+// in the mailbox -- and stays gone, or it was armed at or before the
+// session's standing stop request, and is deleted here as the stop timer
+// would delete it. Either way no debounce outlives the stop to be woken
+// by the stopped turn's end.
 func (a *Actor) holdReviewRetrigger(ctx context.Context, tx pgx.Tx, repoFullName string, prNumber int32) error {
+	held, err := a.stores.timer.WithTx(tx).HoldReviewRetriggerDebounce(ctx, a.sessionID, a.timeouts.ReviewRetriggerHoldBackstop)
+	if err != nil {
+		return fmt.Errorf("sessionactor: re-arm the held re-review debounce: %w", err)
+	}
+	if held == 0 {
+		a.logger.Info("sessionactor: review_retrigger_debounce: a turn of this review session is open, but the debounce is gone or predates a person's standing stop; dropping it",
+			"repo_full_name", repoFullName, "pr_number", prNumber)
+		return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
+	}
 	a.logger.Info("sessionactor: review_retrigger_debounce: held: a turn of this review session is open; the pushed head stays the target",
 		"repo_full_name", repoFullName, "pr_number", prNumber)
-	return a.armTimer(ctx, tx, TimerReviewRetriggerDebounce, time.Now().Add(a.timeouts.ReviewRetriggerHoldBackstop))
+	return nil
 }
 
 // fetchAutoRetriggerReviewContext live-fetches this PR's own current

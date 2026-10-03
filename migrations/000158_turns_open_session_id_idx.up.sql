@@ -1,9 +1,9 @@
 -- turns_open_session_id_idx: backs ReviewRetriggerHeld (queries/turns.sql),
 -- the read the re-review debounce makes before it inserts an automatic
--- review (technical plan §24.9): does any turn of this session sit outside
--- completed, failed and cancelled? While one does, the automatic review
--- holds -- the pushed head stays the target, no budget is spent, and the
--- debounce re-arms itself -- and every write that ends a turn moves the
+-- review (technical plan §24.9): is any turn of this session pending,
+-- dispatched or processing? While one is, the automatic review holds --
+-- the pushed head stays the target, no budget is spent, and the debounce
+-- re-arms itself -- and every write that ends a turn moves the held
 -- debounce to now in its own transaction.
 --
 -- The read is an EXISTS, and no index answers it today: turns has its
@@ -15,17 +15,29 @@
 -- EXISTS is costed to its first match, and open turns are a tiny fraction
 -- of any table. This partial index holds the open turns only -- a few per
 -- session at most, whatever the table's size -- so the read is one probe.
--- The query names the same literal status list as the predicate below, so
--- the planner proves it under a generic plan too.
+-- The query lists the open states literally, a list that implies the
+-- predicate below, so the planner proves the index under a generic plan
+-- too; and it lists them rather than excluding the ended ones so that a
+-- custom plan estimates next to nothing (ReviewRetriggerHeld's doc comment
+-- says why excluding them can estimate 30% of a long session).
 --
 -- The predicate is a deny list of the three terminal states, the one
--- turn.IsTerminal reads: a state added to turn_status later counts as open,
--- the safe direction for a hold. The statements that already read a
--- session's open or in-flight turns (RequestStopOpenTurns,
--- ListStopRequestedOpenTurns, GetProcessingTurnForSession, and
--- GetSessionActivityFacts' in-flight lateral) may plan with it too;
--- reviewretriggerhold_plan_integration_test.go measures each before and
--- after this migration.
+-- turn.IsTerminal reads: a state added to turn_status later is in the
+-- index, whatever the statements reading it list. The statements that
+-- already read a session's open or in-flight turns (RequestStopOpenTurns,
+-- ListStopRequestedOpenTurns, GetProcessingTurnForSession,
+-- RecordTurnStepCost's target, and GetSessionActivityFacts' in-flight
+-- lateral) may plan with it too; reviewretriggerhold_plan_integration_test.go
+-- measures each before and after this migration.
+--
+-- # What it costs a write
+--
+-- A write that leaves a turn open and is not heap-only also adds the new
+-- row version to this index: a dispatch's status writes, and a step's cost
+-- (RecordTurnStepCost -- cost_usd is in turns_cost_created_at_idx's
+-- predicate, so that update is never heap-only). One more buffer a write,
+-- the index holding the open turns only; a write that ends a turn adds
+-- nothing here, its new version being outside the predicate.
 --
 -- # A plain build, not CONCURRENTLY
 --
@@ -60,18 +72,23 @@
 --
 --   SELECT indisvalid FROM pg_index WHERE indexrelid = 'turns_open_session_id_idx'::regclass;
 --
--- This migration then finds the valid index and builds nothing. If that
--- concurrent build fails it leaves an INVALID index behind, which the
--- block below drops so the index is rebuilt here, in this transaction --
--- or drop it yourself (DROP INDEX CONCURRENTLY turns_open_session_id_idx)
--- and retry the concurrent build first.
+-- This migration then finds the valid index and builds nothing, and takes
+-- no lock on turns: the block below looks the index up in the catalog and
+-- runs the CREATE only when there is none. (A bare CREATE INDEX IF NOT
+-- EXISTS would not do: it queues for the SHARE lock on turns before it
+-- sees that the index exists, so it would still wait behind every open
+-- write to turns, and stall every new one behind it.) If that concurrent
+-- build fails it leaves an INVALID index behind, which the block below
+-- drops so the index is rebuilt here, in this transaction -- or drop it
+-- yourself (DROP INDEX CONCURRENTLY turns_open_session_id_idx) and retry
+-- the concurrent build first.
 --
 -- # An INVALID leftover
 --
--- IF NOT EXISTS alone would keep an INVALID index of this name -- one a
+-- A name check alone would keep an INVALID index of this name -- one a
 -- failed concurrent build left -- and Postgres never plans with an invalid
 -- index, so every hold read would walk the session's turns instead. It is
--- dropped first, in the same transaction, and built again below.
+-- dropped first, in the same transaction, and built again.
 --
 -- # Rolling deploy
 --
@@ -101,7 +118,8 @@ BEGIN
     ) THEN
         DROP INDEX turns_open_session_id_idx;
     END IF;
+    IF to_regclass('turns_open_session_id_idx') IS NULL THEN
+        CREATE INDEX turns_open_session_id_idx
+            ON turns (session_id) WHERE status NOT IN ('completed', 'failed', 'cancelled');
+    END IF;
 END $$;
-
-CREATE INDEX IF NOT EXISTS turns_open_session_id_idx
-    ON turns (session_id) WHERE status NOT IN ('completed', 'failed', 'cancelled');

@@ -937,28 +937,49 @@ func TestTransact_ATurnEndWakesTheDebounceInItsOwnTransaction(t *testing.T) {
 }
 
 // TestReviewRetriggerWake_TheTimerStoreWakesThisKind pins the kind the
-// wake-up's SQL names (TimerStore.WakeReviewRetriggerDebounce) to
-// TimerReviewRetriggerDebounce, the kind this package arms, classifies as
-// creating a turn and handles: it moves that row to the database's now and
-// no other kind's, and inserts none where the session has none.
+// hold's and the wake-up's SQL name (TimerStore.HoldReviewRetriggerDebounce
+// and WakeReviewRetriggerDebounce) to TimerReviewRetriggerDebounce, the
+// kind this package arms, classifies as creating a turn and handles: the
+// hold moves that row exactly the backstop past a new armed_at, keeping
+// created_at, the wake-up moves it to the database's now, neither touches
+// another kind's row, and neither inserts one where the session has none.
 func TestReviewRetriggerWake_TheTimerStoreWakesThisKind(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
 	f := newHoldFixture(ctx, t, pool, "acme/hold-kind", 900, pgtype.UUID{})
 
-	if n, err := f.timers.WakeReviewRetriggerDebounce(ctx, f.sessionID); err != nil || n != 0 {
+	timeouts := platform.DefaultTimeouts()
+	backstop, lead := timeouts.ReviewRetriggerHoldBackstop, heldDebounceLead(timeouts)
+
+	if n, err := f.timers.HoldReviewRetriggerDebounce(ctx, f.sessionID, backstop); err != nil || n != 0 {
+		t.Fatalf("holding a session with no debounce: %d rows (err %v), want 0", n, err)
+	}
+	if n, err := f.timers.WakeReviewRetriggerDebounce(ctx, f.sessionID, lead); err != nil || n != 0 {
 		t.Fatalf("waking a session with no debounce: %d rows (err %v), want 0", n, err)
 	}
 	if _, _, _, ok := f.debounce(ctx, t); ok {
-		t.Fatal("the wake-up inserted a debounce")
+		t.Fatal("the hold or the wake-up inserted a debounce")
 	}
 
-	f.armHeldDebounce(ctx, t)
+	f.armDebounce(ctx, t, time.Now())
+	armed, _, _, _ := f.debounce(ctx, t)
 	later := time.Now().Add(time.Hour)
 	if _, err := f.timers.Upsert(ctx, sqlcgen.UpsertSessionTimerParams{SessionID: f.sessionID, Name: TimerTurnDeadline, FiresAt: pgtype.Timestamptz{Time: later, Valid: true}}); err != nil {
 		t.Fatalf("arm another kind: %v", err)
 	}
-	if n, err := f.timers.WakeReviewRetriggerDebounce(ctx, f.sessionID); err != nil || n != 1 {
+	if n, err := f.timers.HoldReviewRetriggerDebounce(ctx, f.sessionID, backstop); err != nil || n != 1 {
+		t.Fatalf("HoldReviewRetriggerDebounce = %d rows (err %v), want 1", n, err)
+	}
+	var exactlyBackstop bool
+	if err := pool.QueryRow(ctx, `SELECT fires_at - armed_at = make_interval(secs => $3) AND armed_at > $4
+		FROM session_timers WHERE session_id = $1 AND name = $2`,
+		f.sessionID, TimerReviewRetriggerDebounce, backstop.Seconds(), armed.ArmedAt).Scan(&exactlyBackstop); err != nil || !exactlyBackstop {
+		t.Fatalf("the held row: fires_at exactly the backstop past a new armed_at %v (err %v), want true", exactlyBackstop, err)
+	}
+	if held, _, _, _ := f.debounce(ctx, t); !held.CreatedAt.Time.Equal(armed.CreatedAt.Time) {
+		t.Fatalf("the hold moved created_at from %v to %v", armed.CreatedAt.Time, held.CreatedAt.Time)
+	}
+	if n, err := f.timers.WakeReviewRetriggerDebounce(ctx, f.sessionID, lead); err != nil || n != 1 {
 		t.Fatalf("WakeReviewRetriggerDebounce = %d rows (err %v), want 1", n, err)
 	}
 	if _, due, _, ok := f.debounce(ctx, t); !ok || !due {
@@ -966,12 +987,251 @@ func TestReviewRetriggerWake_TheTimerStoreWakesThisKind(t *testing.T) {
 	}
 	other, err := f.timers.Get(ctx, sqlcgen.GetSessionTimerParams{SessionID: f.sessionID, Name: TimerTurnDeadline})
 	if err != nil || !other.FiresAt.Time.Equal(later.Truncate(time.Microsecond)) {
-		t.Fatalf("another kind after the wake-up: fires %v (err %v), want untouched at %v", other.FiresAt.Time, err, later)
+		t.Fatalf("another kind after the hold and the wake-up: fires %v (err %v), want untouched at %v", other.FiresAt.Time, err, later)
 	}
 	if work, ok := ClassifyTimer(TimerReviewRetriggerDebounce); !ok || work != TimerWorkCreatesTurn {
 		t.Fatalf("ClassifyTimer(%q) = %v, %v; want the kind that creates a turn", TimerReviewRetriggerDebounce, work, ok)
 	}
 	if !HasOwnTimerHandlerForTest(TimerReviewRetriggerDebounce) {
 		t.Fatal("the debounce kind has no handler of its own: the wake-up would deliver it to the unknown-kind path")
+	}
+}
+
+// TestReviewRetriggerWake_OnlyAHeldDebounceIsWoken: a turn's end wakes the
+// debounce the hold re-armed, and leaves a push's quiet window (technical
+// plan §24.2) to run out, so a burst of pushes that straddles the end still
+// reviews once, at its last head. The mark is how far past its last arm
+// the row fires (heldDebounceLead), never how soon it fires: a held row is
+// woken however close to its backstop the turn ends, and when the pump has
+// claimed it at its backstop; a push's row is left alone just armed, about
+// to run out, and with its replica's clock a second ahead of the
+// database's. Each case ends an open turn through transact, the path every
+// writer takes.
+func TestReviewRetriggerWake_OnlyAHeldDebounceIsWoken(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	timeouts := platform.DefaultTimeouts()
+	backstop, window := timeouts.ReviewRetriggerHoldBackstop.Seconds(), timeouts.ReviewRetriggerDebounce.Seconds()
+
+	for i, tc := range []struct {
+		name string
+		// arm leaves the session's debounce in the case's state.
+		arm      func(ctx context.Context, t *testing.T, f *holdFixture)
+		wantWoke bool
+	}{
+		{name: "held, just re-armed by the hold", wantWoke: true, arm: func(ctx context.Context, t *testing.T, f *holdFixture) {
+			f.armDebounce(ctx, t, time.Now())
+			if n, err := f.timers.HoldReviewRetriggerDebounce(ctx, f.sessionID, timeouts.ReviewRetriggerHoldBackstop); err != nil || n != 1 {
+				t.Fatalf("hold: %d rows (err %v)", n, err)
+			}
+		}},
+		{name: "held, its backstop five seconds away", wantWoke: true, arm: func(ctx context.Context, t *testing.T, f *holdFixture) {
+			f.setDebounceLead(ctx, t, backstop-5, backstop)
+		}},
+		{name: "held, claimed by the pump at its backstop", wantWoke: true, arm: func(ctx context.Context, t *testing.T, f *holdFixture) {
+			f.setDebounceLead(ctx, t, backstop, backstop+timeouts.TimerClaimDuration.Seconds())
+		}},
+		{name: "a push's quiet window, just armed by the webhook's own write", arm: func(ctx context.Context, t *testing.T, f *holdFixture) {
+			f.armDebounce(ctx, t, time.Now().Add(timeouts.ReviewRetriggerDebounce))
+		}},
+		{name: "a push's quiet window five seconds from running out", arm: func(ctx context.Context, t *testing.T, f *holdFixture) {
+			f.setDebounceLead(ctx, t, window-5, window)
+		}},
+		{name: "a push's quiet window armed by a replica a second ahead", arm: func(ctx context.Context, t *testing.T, f *holdFixture) {
+			f.setDebounceLead(ctx, t, 0, window+1)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newHoldFixture(ctx, t, pool, fmt.Sprintf("acme/hold-wake-%d", i), int32(1000+i), pgtype.UUID{})
+			open := holdOpenTurn(ctx, t, f, sqlcgen.TurnStatusPending, "review this pull request", nil, time.Time{})
+			tc.arm(ctx, t, f)
+			before, _, _, _ := f.debounce(ctx, t)
+			a := newHoldRig(ctx, t, pool, f.sessionID, nil).actor
+
+			if err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
+				_, err := a.turnWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+					ID: open.ID, Status: sqlcgen.TurnStatusCompleted, CompletedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+				})
+				return err
+			}); err != nil {
+				t.Fatalf("end the turn: %v", err)
+			}
+			if tc.wantWoke {
+				f.assertEndedAndWoken(ctx, t, open.ID, sqlcgen.TurnStatusCompleted)
+				return
+			}
+			after, due, _, ok := f.debounce(ctx, t)
+			if !ok || due || !after.FiresAt.Time.Equal(before.FiresAt.Time) || !after.ArmedAt.Time.Equal(before.ArmedAt.Time) {
+				t.Fatalf("a push's window after the turn ended: armed %v due %v fires %v (was %v); want it left to run out", ok, due, after.FiresAt.Time, before.FiresAt.Time)
+			}
+		})
+	}
+}
+
+// setDebounceLead arms the session's debounce, last armed agoSeconds ago on
+// the database's clock and firing leadSeconds after that arm.
+func (f *holdFixture) setDebounceLead(ctx context.Context, t *testing.T, agoSeconds, leadSeconds float64) {
+	t.Helper()
+	f.armDebounce(ctx, t, time.Now())
+	if _, err := f.pool.Exec(ctx, `UPDATE session_timers
+		SET armed_at = now() - make_interval(secs => $3),
+		    fires_at = now() - make_interval(secs => $3) + make_interval(secs => $4)
+		WHERE session_id = $1 AND name = $2`, f.sessionID, TimerReviewRetriggerDebounce, agoSeconds, leadSeconds); err != nil {
+		t.Fatalf("set the debounce's lead: %v", err)
+	}
+}
+
+// TestReviewRetriggerWake_TheStopRuleComparesCreatedAt: the hold's re-arm
+// and the wake-up leave alone a debounce first armed at or before the
+// session's standing stop request -- the row the stop timer deletes
+// (disarmWorkCreatingTimers) -- however recently it was last armed, and
+// move one first armed after it. The rule reads created_at, which no
+// re-arm moves, never armed_at, which a push after the stop moves past the
+// request.
+func TestReviewRetriggerWake_TheStopRuleComparesCreatedAt(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	timeouts := platform.DefaultTimeouts()
+
+	for i, tc := range []struct {
+		name      string
+		afterStop bool
+	}{
+		{name: "first armed before the stop, last armed after it"},
+		{name: "first armed after the stop", afterStop: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newHoldFixture(ctx, t, pool, fmt.Sprintf("acme/hold-stop-rule-%d", i), int32(1100+i), pgtype.UUID{})
+			if !tc.afterStop {
+				f.armDebounce(ctx, t, time.Now())
+			}
+			requestStop(ctx, t, pool, f.sessionID)
+			if tc.afterStop {
+				f.armDebounce(ctx, t, time.Now())
+			}
+			// Last armed after the stop, held: the mark the wake-up reads.
+			f.setDebounceLead(ctx, t, 0, timeouts.ReviewRetriggerHoldBackstop.Seconds())
+			var order string
+			if err := pool.QueryRow(ctx, `SELECT CASE WHEN st.created_at <= s.stop_requested_at THEN 'created before' ELSE 'created after' END
+				|| CASE WHEN st.armed_at > s.stop_requested_at THEN ', armed after' ELSE ', armed before' END
+				FROM session_timers st JOIN sessions s ON s.id = st.session_id WHERE st.session_id = $1 AND st.name = $2`,
+				f.sessionID, TimerReviewRetriggerDebounce).Scan(&order); err != nil {
+				t.Fatal(err)
+			}
+			if want := map[bool]string{false: "created before, armed after", true: "created after, armed after"}[tc.afterStop]; order != want {
+				t.Fatalf("the debounce is %s the stop, want %s", order, want)
+			}
+
+			want := int64(0)
+			if tc.afterStop {
+				want = 1
+			}
+			if n, err := f.timers.HoldReviewRetriggerDebounce(ctx, f.sessionID, timeouts.ReviewRetriggerHoldBackstop); err != nil || n != want {
+				t.Fatalf("HoldReviewRetriggerDebounce = %d rows (err %v), want %d", n, err, want)
+			}
+			if n, err := f.timers.WakeReviewRetriggerDebounce(ctx, f.sessionID, heldDebounceLead(timeouts)); err != nil || n != want {
+				t.Fatalf("WakeReviewRetriggerDebounce = %d rows (err %v), want %d", n, err, want)
+			}
+		})
+	}
+}
+
+// TestReviewRetriggerHold_ALateFiringNeverBringsBackADebounceAStopDeleted:
+// the pump claims a held debounce, and before its firing reaches the actor
+// a person's stop is handled -- the review is still inside its stop grace,
+// so it runs on, and the stop timer deletes the debounce. The late firing
+// finds the review open and holds, and its re-arm is an update: the row the
+// stop deleted stays deleted. When the review then ends, nothing is woken,
+// and no automatic review runs after the person's stop.
+func TestReviewRetriggerHold_ALateFiringNeverBringsBackADebounceAStopDeleted(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newHoldFixture(ctx, t, pool, "acme/hold-late-firing", 1200, pgtype.UUID{})
+	seedReadySandbox(ctx, t, pool, f.sessionID)
+	open := holdOpenTurn(ctx, t, f, sqlcgen.TurnStatusProcessing, "review this pull request", nil, time.Now())
+	f.armHeldDebounce(ctx, t)
+	requestStop(ctx, t, pool, f.sessionID)
+	rig := newHoldRig(ctx, t, pool, f.sessionID, nil)
+
+	if err := rig.actor.Send(ctx, TimerFired{Name: TimerStop}); err != nil {
+		t.Fatalf("Send TimerFired: %v", err)
+	}
+	waitUntil(t, 5*time.Second, func() bool {
+		_, _, _, ok := f.debounce(ctx, t)
+		return !ok
+	})
+	if got, err := f.turns.Get(ctx, open.ID); err != nil || got.Status != sqlcgen.TurnStatusProcessing {
+		t.Fatalf("the review after the stop timer: %v (err %v), want still processing inside its grace", got.Status, err)
+	}
+
+	// The late firing, then the review's end, in the actor's order.
+	if err := rig.actor.Send(ctx, TimerFired{Name: TimerReviewRetriggerDebounce}); err != nil {
+		t.Fatalf("Send TimerFired: %v", err)
+	}
+	executionCompleteEnding(sandboxws.ExecutionCompleteOutcomeCancelled)(ctx, t, f, rig)
+	waitForTurnStatus(ctx, t, f.turns, open.ID, sqlcgen.TurnStatusCancelled)
+	if _, _, _, ok := f.debounce(ctx, t); ok {
+		t.Fatal("a debounce exists after the late firing and the review's end: the hold re-created the row the stop deleted")
+	}
+	for range 3 {
+		if err := rig.registry.PumpOnce(ctx); err != nil {
+			t.Fatalf("PumpOnce: %v", err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := f.automaticReviews(ctx, t); got != 0 {
+		t.Fatalf("automatic reviews after the person's stop = %d, want 0", got)
+	}
+	if got := rig.fetcher.prCalls(); got != 0 {
+		t.Fatalf("GetPullRequest calls = %d, want 0: the late firing held, it never fetched", got)
+	}
+}
+
+// TestReviewRetriggerHold_AnOptOutOrARevocationDropsTheDebounceWhileATurnIsOpen:
+// the opt-in and the revocation are read before the hold, so with a review
+// running, a firing for a repository that opted out, or that an
+// administrator revoked, drops the debounce as it always did -- it is never
+// held for later -- and leaves the pushed head as it was.
+func TestReviewRetriggerHold_AnOptOutOrARevocationDropsTheDebounceWhileATurnIsOpen(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	for i, tc := range []struct {
+		name string
+		seed func(ctx context.Context, t *testing.T, f *holdFixture)
+	}{
+		{name: "the repository opted out", seed: func(ctx context.Context, t *testing.T, f *holdFixture) {
+			if _, err := narvipg.NewRepoSettingsStore(f.pool).UpsertAutoRetriggerReviewToggle(ctx, f.repoFullName, false); err != nil {
+				t.Fatalf("opt out: %v", err)
+			}
+		}},
+		{name: "an administrator revoked the repository", seed: func(ctx context.Context, t *testing.T, f *holdFixture) {
+			revokeRepoForActorTest(ctx, t, f.pool, f.repoFullName)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newHoldFixture(ctx, t, pool, fmt.Sprintf("acme/hold-drop-%d", i), int32(1300+i), pgtype.UUID{})
+			seedReadySandbox(ctx, t, pool, f.sessionID)
+			open := holdOpenTurn(ctx, t, f, sqlcgen.TurnStatusProcessing, "review this pull request", nil, time.Now())
+			tc.seed(ctx, t, f)
+			f.armDebounce(ctx, t, time.Now())
+			rig := newHoldRig(ctx, t, pool, f.sessionID, nil)
+
+			if err := rig.actor.Send(ctx, TimerFired{Name: TimerReviewRetriggerDebounce}); err != nil {
+				t.Fatalf("Send TimerFired: %v", err)
+			}
+			waitUntil(t, 5*time.Second, func() bool {
+				_, _, _, ok := f.debounce(ctx, t)
+				return !ok
+			})
+			row := f.prSession(ctx, t)
+			if row.PendingRetriggerHeadSha == nil || *row.PendingRetriggerHeadSha != holdPushedHead || row.AutoRetriggerCount != 0 {
+				t.Fatalf("pending %v, count %d; want %s left as it was and nothing spent", row.PendingRetriggerHeadSha, row.AutoRetriggerCount, holdPushedHead)
+			}
+			turns, err := f.turns.ListForSession(ctx, f.sessionID)
+			if err != nil || len(turns) != 1 || turns[0].ID != open.ID {
+				t.Fatalf("%d turns (err %v), want only the open review", len(turns), err)
+			}
+		})
 	}
 }
