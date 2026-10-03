@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -96,6 +97,13 @@ func (s *boundServer) frames(n int) []receivedFrame {
 		}
 	}
 	return out
+}
+
+// connCount returns how many connections the server has accepted.
+func (s *boundServer) connCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.conns
 }
 
 // waitFrames waits until connection n has carried at least want frames.
@@ -386,5 +394,117 @@ func TestFlushBuffer_OversizeNonCuttable_SkippedWarnedOnce_RestReplayed(t *testi
 	}
 	if len(warnings) != 1 {
 		t.Fatalf("%d distinct warnings went out, want one for the one skipped entry", len(warnings))
+	}
+}
+
+// warnCounter is a slog.Handler that counts the bridge's "event not
+// written" warnings for one bound.
+type warnCounter struct {
+	mu    sync.Mutex
+	bound int64
+	n     int
+}
+
+func (h *warnCounter) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *warnCounter) Handle(_ context.Context, r slog.Record) error {
+	if !strings.HasPrefix(r.Message, "wsbridge: event not written on this connection") {
+		return nil
+	}
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "bound_bytes" && a.Value.Int64() == h.bound {
+			h.mu.Lock()
+			h.n++
+			h.mu.Unlock()
+		}
+		return true
+	})
+	return nil
+}
+
+func (h *warnCounter) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *warnCounter) WithGroup(string) slog.Handler      { return h }
+
+func (h *warnCounter) count() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.n
+}
+
+// TestFlushBuffer_BoundBelowAWarning_ReplayEndsWarnedOnce: on a connection
+// whose control plane states a bound below even a warning's size, an entry
+// no cut fits is skipped and warned about once, and the warning, which
+// does not fit either, is skipped without a warning of its own -- so the
+// replay catches up. A warning about each skipped warning would be a new
+// entry behind it, and the replay, which goes on to every entry added
+// behind it, would never end. Not parallel: it reads the process's log.
+func TestFlushBuffer_BoundBelowAWarning_ReplayEndsWarnedOnce(t *testing.T) {
+	counter := &warnCounter{bound: 150}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(counter))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	srv := &boundServer{fallback: boundStep{header: "150"}}
+	server := httptest.NewServer(srv)
+	t.Cleanup(server.Close)
+	bridge := wsbridge.New(testSessionConfig("ws"+strings.TrimPrefix(server.URL, "http")), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
+		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
+	caughtUp := make(chan struct{}, 1)
+	wsbridge.SetReplayCaughtUpHookForTest(bridge, func() {
+		select {
+		case caughtUp <- struct{}{}:
+		default:
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	// Buffered before the connection: its replay meets it.
+	if err := bridge.SendBestEffort(ctx, bigToken("prt_1", 4*1024)); err != nil {
+		t.Fatalf("SendBestEffort: %v", err)
+	}
+	startBridgeRun(ctx, t, cancel, bridge)
+
+	waitChan(t, caughtUp, testWait)
+	if got := counter.count(); got != 1 {
+		t.Fatalf("%d warnings for the 150-byte bound, want 1: the entry, and never its warning", got)
+	}
+	if got := srv.frames(0); len(got) != 0 {
+		t.Fatalf("a control plane that reads 150 bytes was written %d frames, want none: nothing here fits", len(got))
+	}
+}
+
+// TestBestEffortSend_LiveFrameNoCutFits_WarnedOnItsConnection: a live send
+// that no cut fits to its connection's bound is not written, and the
+// warning naming it is written at once, on that connection -- not left to
+// the next connection's replay.
+func TestBestEffortSend_LiveFrameNoCutFits_WarnedOnItsConnection(t *testing.T) {
+	t.Parallel()
+
+	srv := &boundServer{fallback: boundStep{}}
+	server := httptest.NewServer(srv)
+	t.Cleanup(server.Close)
+	bridge := wsbridge.New(testSessionConfig("ws"+strings.TrimPrefix(server.URL, "http")), "sbx-1", "test-agent-version", "test-image-digest", noopHandler{},
+		testDialTimeout, testLongHeartbeat, testMinBackoff, testMaxBackoff)
+	caughtUp := make(chan struct{}, 1)
+	wsbridge.SetReplayCaughtUpHookForTest(bridge, func() {
+		select {
+		case caughtUp <- struct{}{}:
+		default:
+		}
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	startBridgeRun(ctx, t, cancel, bridge)
+	waitChan(t, caughtUp, testWait)
+
+	// The connection is up and its replay over: this send is written live.
+	oversize := map[string]any{"type": "artifact", "messageId": "art-live", "sessionId": testSessionID, "gen": testGen, "data": strings.Repeat("a", 40*1024)}
+	if err := bridge.SendBestEffort(ctx, oversize); err != nil {
+		t.Fatalf("SendBestEffort: %v", err)
+	}
+	got := srv.waitFrames(t, 1, 1)
+	if w := viewOf(t, got[0].data); w.Type != "warning" || !strings.Contains(w.Message, `"art-live"`) {
+		t.Fatalf("the connection was written %+v, want the warning naming the frame it could not be written", w)
+	}
+	if frames, conns := len(srv.frames(0)), srv.connCount(); frames != 1 || conns != 1 {
+		t.Fatalf("%d frames on %d connections, want the one warning on the first", frames, conns)
 	}
 }

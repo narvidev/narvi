@@ -3317,7 +3317,7 @@ export interface GetSessionStatusToolRequest {
   sessionId: string;
 }
 /**
- * The narvi_get_session_transcript MCP tool's own input (technical plan §43.20) -- the tool bridge's twin of GET /api/sessions/{sessionID}/events?cursor=&limit=, the paginated event history. sessionId becomes the path parameter; cursor and limit, when set, become the route's own query parameters, and when omitted leave the route's own defaults to run unchanged (from the beginning, 100 events per page).
+ * The narvi_get_session_transcript MCP tool's own input (technical plan §43.20) -- the tool bridge's twin of GET /api/sessions/{sessionID}/events?cursor=&limit=, the paginated event history. sessionId becomes the path parameter; cursor and limit, when set, become the route's own query parameters, and when omitted leave the route's own defaults to run unchanged (from the beginning, at most 100 events per page).
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "GetSessionTranscriptToolRequest".
@@ -3332,7 +3332,7 @@ export interface GetSessionTranscriptToolRequest {
    */
   cursor?: string;
   /**
-   * How many events per page. Omitted means the route's own default (100). minimum matches the route's own rejection of a value below one. Deliberately no "maximum": the route does not reject a larger value, it clamps it to 500, and tools/contractscompat's closed keyword allowlist does not recognize "maximum" (ListSessionsToolRequest.limit's own reasoning).
+   * The most events a page holds. Omitted means the route's own default (100). A page also stops at its byte budget (2 MiB of events, always at least one), so it can hold fewer and still not be the last: read on while nextCursor is set. minimum matches the route's own rejection of a value below one. Deliberately no "maximum": the route does not reject a larger value, it clamps it to 500, and tools/contractscompat's closed keyword allowlist does not recognize "maximum" (ListSessionsToolRequest.limit's own reasoning).
    */
   limit?: number;
 }

@@ -111,8 +111,11 @@ const DefaultFrameReadLimitBytes = 32768
 // this many bytes; up to hubConnBufferSize (64) distinct broadcast
 // payloads behind a slow browser connection, shared by every connection
 // of that session (wshub.Hub.Broadcast queues one shared slice per
-// payload), so at most 64 MiB; and one history page, bounded by
-// FetchHistoryMaxReplyBytes. The agent's buffer holds at most 1000
+// payload), so at most 64 MiB; and one history page, whose read is
+// bounded by FetchHistoryMaxReplyBytes, or is one event when the first
+// alone is larger -- the store measures each event before it reads it
+// (postgres.EventStore.ListPageForSession), so a page never holds events
+// it does not send. The agent's buffer holds at most 1000
 // best-effort entries (wsbridge's outboundBufferCap), each at most this
 // many bytes once cut at enqueue, so 1000 MiB in the worst case and a few
 // MiB in practice -- a pinned-runtime text part is two frames, one of
@@ -127,16 +130,22 @@ const MaxEventFrameBytes = 1 << 20
 
 // FetchHistoryMaxReplyBytes bounds one page of a session's event log, as
 // a client WS fetch_history reply and as GET /api/sessions/{id}/events
-// return it (technical plan §6.2, §6.3): a page keeps the longest run of
-// the events it read, oldest first, whose summed encoded sizes stay within
-// it, always at least one event, and sets nextCursor after the last event
-// it sent. The subscribe reply has its own, smaller budget
+// return it (technical plan §6.2, §6.3), and bounds what the page reads,
+// not only what it sends. A page holds the longest run of events after its
+// cursor, oldest first, whose sizes in the page sum to at most this, and
+// always at least one event; it sets nextCursor after the last event it
+// sent. The store measures each event in Postgres as it walks the page,
+// stops at the first that does not fit, and reads only the events that do
+// (postgres.EventStore.ListPageForSession), so the control plane holds at
+// most this much of a page, or one event when the first alone is larger,
+// and paging through a log reads each event once. The subscribe reply
+// reads its events the same way, under its own, smaller budget
 // (maxInitialReplayBytes, internal/adapters/inbound/wshub).
 //
 // 2 MiB. It is no smaller than MaxEventFrameBytes, so one maximal event
 // always fits with room for ordinary ones, and an ordinary 500-event page,
 // at about 2 KiB an event or less, is at most about 1 MiB and never cut.
-// Without it a page could reach 500 x MaxEventFrameBytes: 500 MiB, where
+// Without it a page could read 500 x MaxEventFrameBytes, 500 MiB, where
 // the 32 KiB read limit before it kept the worst page to 16 MiB.
 const FetchHistoryMaxReplyBytes = 2 << 20
 

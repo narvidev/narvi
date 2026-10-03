@@ -32,6 +32,11 @@ type outboundEntry struct {
 	// notice marks a warning this package raised itself about another
 	// entry it could not write (Bridge.warnOnce). A notice is never itself
 	// warned about: on a connection too small even for it, it is skipped.
+	// That is what ends the replay there. Each warning is a new entry, and
+	// the replay goes on to the entries added behind it, so warning about
+	// a warning would add one more for every one it skipped, and the
+	// replay would never catch up
+	// (TestFlushBuffer_BoundBelowAWarning_ReplayEndsWarnedOnce).
 	notice bool
 	// seq is the entry's position in send order, assigned by add and never
 	// reused: flushBuffer uses it to pick up exactly the entries added

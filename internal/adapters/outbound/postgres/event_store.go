@@ -118,17 +118,93 @@ func (s *EventStore) ListTokenFramesInWindow(ctx context.Context, sessionID pgty
 }
 
 // ListForSession returns up to limit events for sessionID with id >
-// afterID, oldest first (afterID = 0 means "from the beginning" -- a null
-// fetch_history cursor / the REST endpoint's own ?cursor= default). Shared
-// by both the client WS hub's fetch_history/initial-replay handling and
-// the REST GET .../events endpoint (§6.2, §6.3) -- one implementation,
-// two callers, no duplication.
+// afterID, oldest first (afterID = 0 means "from the beginning"), whatever
+// their size. It bounds a read by count alone, so no page a client reads
+// goes through it: the client WS hub's subscribe replay and fetch_history,
+// and the REST GET .../events endpoint (§6.2, §6.3), read through
+// ListPageForSession, which bounds the read by bytes too.
 func (s *EventStore) ListForSession(ctx context.Context, sessionID pgtype.UUID, afterID int64, limit int32) ([]sqlcgen.Event, error) {
 	return s.q.ListEventsForSession(ctx, sqlcgen.ListEventsForSessionParams{
 		SessionID: sessionID,
 		ID:        afterID,
 		Limit:     limit,
 	})
+}
+
+// EventPage is one page of a session's event log, read by
+// ListPageForSession.
+type EventPage struct {
+	// Events are the page's events, oldest first.
+	Events []sqlcgen.Event
+	// StoppedAtBudget reports that the page stopped at its byte budget: at
+	// least one more event follows the last one in Events.
+	StoppedAtBudget bool
+}
+
+// ListPageForSession reads one page of sessionID's events after afterID,
+// oldest first: at most maxRows events, and no more of them than fit in
+// maxBytes as a page carries them -- always at least one, so a page always
+// moves its reader on (technical plan §6.2, §6.3). The client WS hub's
+// subscribe replay and fetch_history, and the REST events route, read
+// every page through it.
+//
+// The budget bounds the read, not only the reply. The database measures
+// each event as it walks the page (ListEventPageExtentForSession, an upper
+// bound on the event's size in a page), stops at the first one that does
+// not fit, and the page then reads only the events that do
+// (ListEventsForSessionThrough). An event that does not fit is never read
+// into this process, so the next page, which starts after the last event
+// this one holds, reads it once: paging through a log reads each event
+// once, however large. What one page holds is at most maxBytes, or one
+// event when the first alone is larger. Reading a whole maxRows page and
+// cutting it after held up to maxRows events of up to
+// platform.MaxEventFrameBytes each, and read every dropped event again on
+// the next page.
+//
+// The two statements need no transaction: ids within a session are
+// allocated in commit order (CreateEvent), so the range the walk measured
+// holds the same events when they are read.
+func (s *EventStore) ListPageForSession(ctx context.Context, sessionID pgtype.UUID, afterID int64, maxRows int32, maxBytes int64) (EventPage, error) {
+	if maxRows <= 0 {
+		return EventPage{}, nil
+	}
+	extent, err := s.q.ListEventPageExtentForSession(ctx, sqlcgen.ListEventPageExtentForSessionParams{
+		SessionID: sessionID,
+		AfterID:   afterID,
+		MaxRows:   int64(maxRows),
+		MaxBytes:  maxBytes,
+	})
+	if err != nil {
+		return EventPage{}, err
+	}
+	fit, stopped := eventPageFit(extent, maxBytes)
+	if fit == 0 {
+		return EventPage{}, nil
+	}
+	events, err := s.q.ListEventsForSessionThrough(ctx, sqlcgen.ListEventsForSessionThroughParams{
+		SessionID: sessionID,
+		AfterID:   afterID,
+		ThroughID: extent[fit-1].ID,
+		MaxRows:   int32(fit),
+	})
+	if err != nil {
+		return EventPage{}, err
+	}
+	return EventPage{Events: events, StoppedAtBudget: stopped}, nil
+}
+
+// eventPageFit returns how many of the walked events a page holds -- every
+// one whose running size is within maxBytes, and the first whatever its
+// size -- and whether the walk stopped at the budget: an event after them
+// that does not fit.
+func eventPageFit(extent []sqlcgen.ListEventPageExtentForSessionRow, maxBytes int64) (fit int, stopped bool) {
+	for _, row := range extent {
+		if row.N > 1 && row.Running > maxBytes {
+			return fit, true
+		}
+		fit++
+	}
+	return fit, false
 }
 
 // ListRecentForSession returns up to limit of sessionID's own MOST RECENT

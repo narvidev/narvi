@@ -284,6 +284,108 @@ func (q *Queries) GetLatestTokenFrameForPart(ctx context.Context, arg GetLatestT
 	return i, err
 }
 
+const listEventPageExtentForSession = `-- name: ListEventPageExtentForSession :many
+WITH RECURSIVE page (id, n, running) AS (
+    (
+        SELECT head.id, 1::bigint,
+               (octet_length(t.p)
+                + 5 * (char_length(t.p) - char_length(translate(t.p, '<>&' || chr(8232) || chr(8233), '')))
+                + octet_length(head.type) + 128)::bigint
+        FROM (
+            SELECT e.id, e.type, e.payload FROM events e
+            WHERE e.session_id = $1 AND e.id > $2
+            ORDER BY e.id ASC
+            LIMIT 1
+        ) head
+        CROSS JOIN LATERAL (SELECT head.payload::text AS p OFFSET 0) t
+    )
+    UNION ALL
+    (
+        SELECT nxt.id, page.n + 1,
+               page.running
+               + (octet_length(t.p)
+                  + 5 * (char_length(t.p) - char_length(translate(t.p, '<>&' || chr(8232) || chr(8233), '')))
+                  + octet_length(nxt.type) + 128)::bigint
+        FROM page
+        CROSS JOIN LATERAL (
+            SELECT e.id, e.type, e.payload FROM events e
+            WHERE e.session_id = $1 AND e.id > page.id
+            ORDER BY e.id ASC
+            LIMIT 1
+        ) nxt
+        CROSS JOIN LATERAL (SELECT nxt.payload::text AS p OFFSET 0) t
+        WHERE page.n < $3::bigint AND (page.running <= $4::bigint OR page.n = 1)
+    )
+)
+SELECT id, n, running FROM page ORDER BY id ASC
+`
+
+type ListEventPageExtentForSessionParams struct {
+	SessionID pgtype.UUID `json:"session_id"`
+	AfterID   int64       `json:"after_id"`
+	MaxRows   int64       `json:"max_rows"`
+	MaxBytes  int64       `json:"max_bytes"`
+}
+
+type ListEventPageExtentForSessionRow struct {
+	ID      int64 `json:"id"`
+	N       int64 `json:"n"`
+	Running int64 `json:"running"`
+}
+
+// One page of the log, measured before it is read (technical plan §6.2,
+// §6.3): walks session_id's events after after_id one at a time, oldest
+// first, over events_session_id_id_idx, adding up each event's size, and
+// stops after max_rows events or after the first event past the first that
+// takes the sum past max_bytes -- that event is returned too, so the
+// caller learns the page stopped at its budget. A first event alone over
+// max_bytes does not stop the walk: the page holds it all the same, and
+// the walk goes on to the next event, which then takes the sum past
+// max_bytes, so a page of one oversized event still learns whether more
+// follow. It returns ids and sums only: no payload leaves the database
+// here, and a payload is converted to text, to be measured, only for the
+// events walked -- the page's own, and at most one more -- never for the
+// rest of max_rows. ListEventsForSessionThrough then reads the events that
+// fit.
+//
+// An event's size is an upper bound on what it takes in a page as the
+// control plane writes one (eventWireMap, marshaled, and a comma): the
+// payload's text, plus five bytes for each character encoding/json writes
+// as a six-byte escape and jsonb's text does not ('<', '>', '&', U+2028,
+// U+2029), plus its type, plus 128 bytes for the id, createdAt and the
+// keys. jsonb's text is never shorter than its compacted form, so a page
+// that fits by this measure fits as written.
+//
+// The non-recursive term reads its one event in a subquery with LIMIT, and
+// each payload's text is computed once, behind OFFSET 0, so the measure is
+// taken only for the event the index returns. The recursive term's filter
+// names only the walk's own columns, so it is applied before the next
+// event is read: nothing is measured once the walk has stopped.
+func (q *Queries) ListEventPageExtentForSession(ctx context.Context, arg ListEventPageExtentForSessionParams) ([]ListEventPageExtentForSessionRow, error) {
+	rows, err := q.db.Query(ctx, listEventPageExtentForSession,
+		arg.SessionID,
+		arg.AfterID,
+		arg.MaxRows,
+		arg.MaxBytes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEventPageExtentForSessionRow
+	for rows.Next() {
+		var i ListEventPageExtentForSessionRow
+		if err := rows.Scan(&i.ID, &i.N, &i.Running); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEventsForSession = `-- name: ListEventsForSession :many
 SELECT id, session_id, type, payload, created_at, message_id FROM events
 WHERE session_id = $1 AND id > $2
@@ -303,6 +405,57 @@ type ListEventsForSessionParams struct {
 // migrations/000008_events.up.sql's own doc comment).
 func (q *Queries) ListEventsForSession(ctx context.Context, arg ListEventsForSessionParams) ([]Event, error) {
 	rows, err := q.db.Query(ctx, listEventsForSession, arg.SessionID, arg.ID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Event
+	for rows.Next() {
+		var i Event
+		if err := rows.Scan(
+			&i.ID,
+			&i.SessionID,
+			&i.Type,
+			&i.Payload,
+			&i.CreatedAt,
+			&i.MessageID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEventsForSessionThrough = `-- name: ListEventsForSessionThrough :many
+SELECT id, session_id, type, payload, created_at, message_id FROM events
+WHERE session_id = $1 AND id > $2 AND id <= $3
+ORDER BY id ASC
+LIMIT $4
+`
+
+type ListEventsForSessionThroughParams struct {
+	SessionID pgtype.UUID `json:"session_id"`
+	AfterID   int64       `json:"after_id"`
+	ThroughID int64       `json:"through_id"`
+	MaxRows   int32       `json:"max_rows"`
+}
+
+// The events of one page ListEventPageExtentForSession measured: those of
+// session_id after after_id up to and including through_id, oldest first.
+// Ids within a session are allocated in commit order (CreateEvent), so the
+// range holds the events the walk saw, and no other: max_rows only guards
+// that.
+func (q *Queries) ListEventsForSessionThrough(ctx context.Context, arg ListEventsForSessionThroughParams) ([]Event, error) {
+	rows, err := q.db.Query(ctx, listEventsForSessionThrough,
+		arg.SessionID,
+		arg.AfterID,
+		arg.ThroughID,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}

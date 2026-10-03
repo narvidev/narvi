@@ -284,6 +284,12 @@ func (b *Bridge) flushBuffer(ctx context.Context, conn *websocket.Conn, bound in
 
 	var nextSeq uint64
 	for {
+		// A pass that writes nothing never meets ctx in conn.Write: checked
+		// here, so a replay whose every entry is skipped still ends when
+		// Run is canceled.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		b.connMu.Lock()
 		pending := b.buffer.snapshotFrom(nextSeq)
 		if len(pending) == 0 {
