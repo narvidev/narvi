@@ -266,3 +266,77 @@ describe('SessionHeader and CostPanel -- the rows one message leaves once stored
     expect(html).toContain('2 calls · 1280 tokens · $0.42')
   })
 })
+
+// A tool call's state is its own result and its turn's, never its place in
+// the list. Before the server stored a real turn's tool calls none reached
+// this view; now parallel calls of one message run side by side, and a turn
+// can end -- cancelled, timed out, its sandbox lost -- with a call that never
+// got a result, a result the agent sends after that being not stored
+// (technical plan §6.1). Neither may read as ✓.
+describe('Timeline -- a tool call without a result', () => {
+  let id = 1
+  const ev = (type: string, payload: unknown): EventEnvelope => ({ id: id++, type, payload, createdAt: '2026-10-03T10:00:00Z' })
+  const call = (callId: string, toolName: string) => ev('tool_call', { messageId: 'msg_1', callId, toolName, input: {} })
+  const render = (events: EventEnvelope[]) => withQueryClient(<Timeline sessionId="s1" turns={buildTimelineModel(events).turns} />)
+  const rows = (html: string, glyph: string, cls: string) => html.split(`<span class="st ${cls}">${glyph}</span>`).length - 1
+
+  it('two parallel calls of a live turn both read running, the first as well as the last', () => {
+    const html = render([
+      ev('step_start', { messageId: 'msg_1', stepId: 'prt_start' }),
+      call('ca', 'task'),
+      call('cb', 'task'),
+      ev('sub_task_start', { messageId: 'sa', subTaskId: 'st_a', label: 'Lane A', parentMessageId: 'msg_1', parentCallId: 'ca' }),
+      ev('sub_task_start', { messageId: 'sb', subTaskId: 'st_b', label: 'Lane B', parentMessageId: 'msg_1', parentCallId: 'cb' }),
+    ])
+    expect(rows(html, '●', 'live')).toBe(2)
+    expect(html.split('running…').length - 1).toBe(2)
+    expect(html).not.toContain('st done')
+  })
+
+  it('every call of a live turn without a result reads running, folded head and earlier steps too', () => {
+    const html = render([
+      ev('step_start', { messageId: 'msg_0', stepId: 'prt_start_0' }),
+      ev('tool_call', { messageId: 'msg_0', callId: 'c0', toolName: 'bash', input: {} }),
+      ev('step_finish', { messageId: 'msg_0', stepId: 'prt_finish_0', cost: { tokens: { input: 1, output: 1 } } }),
+      ev('step_start', { messageId: 'msg_1', stepId: 'prt_start' }),
+      call('c1', 'read'),
+      call('c2', 'read'),
+      call('c3', 'read'),
+      call('c4', 'read'),
+      call('c5', 'read'),
+    ])
+    // c0 in its closed step, c1 and c2 at the head of the fold, c5 at its tail.
+    expect(rows(html, '●', 'live')).toBe(4)
+    expect(html).not.toContain('st done')
+  })
+
+  it('a call of a turn the agent ended reads "no result", never ✓; a call with its result still reads ✓', () => {
+    const html = render([
+      ev('step_start', { messageId: 'msg_1', stepId: 'prt_start' }),
+      call('c1', 'read'),
+      ev('tool_result', { messageId: 'msg_1', callId: 'c1', output: { output: 'ok' }, isError: false }),
+      call('c2', 'bash'),
+      ev('execution_complete', { messageId: 'ec', outcome: 'cancelled', reason: 'opencode: turn context canceled before completion' }),
+    ])
+    expect(rows(html, '✓', 'done')).toBe(1)
+    expect(rows(html, '–', 'none')).toBe(1)
+    expect(html).toContain('no result')
+    expect(html).not.toContain('st live')
+  })
+
+  it('the control plane\'s synthetic execution_complete ends the turn, with its reason: the call reads "no result" beside the failure card', () => {
+    const events = [ev('step_start', { messageId: 'msg_1', stepId: 'prt_start' }), call('c1', 'bash'), ev('execution_complete', { turn_id: 't1', synthetic: true, reason: 'timeout' })]
+    const html = render(events)
+    expect(rows(html, '–', 'none')).toBe(1)
+    expect(html).not.toContain('st live')
+    expect(html).toContain('This turn ran out of time')
+    expect(html).toContain('turn failed')
+  })
+
+  it('a stop\'s synthetic execution_complete ends the turn cancelled', () => {
+    const html = render([call('c1', 'bash'), ev('execution_complete', { turn_id: 't1', synthetic: true, reason: 'stopped' })])
+    expect(rows(html, '–', 'none')).toBe(1)
+    expect(html).toContain('turn cancelled')
+    expect(html).toContain('reason: stopped')
+  })
+})

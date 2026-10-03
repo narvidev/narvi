@@ -142,6 +142,43 @@ export function asExecutionComplete(env: EventEnvelope): ExecutionComplete | nul
   return env.payload as unknown as ExecutionComplete
 }
 
+/**
+ * The reason the control plane writes on the turn end of a stop
+ * (internal/app/sessionactor/stop.go): the one synthetic end of a
+ * cancelled turn. Every other synthetic end -- turn_deadline, a dispatch
+ * whose prompt never got through, a refused spawn, the credential gate --
+ * ends a failed turn.
+ */
+const SYNTHETIC_STOP_REASON = 'stopped'
+
+/** A turn's end, as the timeline and the cost rollup read it: the agent's own execution_complete, or the one the control plane writes itself. */
+export interface TurnEnd {
+  outcome: 'completed' | 'failed' | 'cancelled'
+  reason: string | null
+  /** Set only on an agent's execution_complete of a sub-task lane, which ends no turn. */
+  subTaskId: string | null
+}
+
+/**
+ * asTurnEnd reads an `execution_complete` as the end of a turn, from either
+ * writer. The agent's carries its outcome (asExecutionComplete). The one the
+ * control plane writes when a turn ends without one -- its deadline passes,
+ * it is stopped, its dispatch or spawn is refused -- carries only
+ * `{turn_id, synthetic: true, reason}` (technical plan §3.3, "a synthetic
+ * execution_complete"), so its outcome is read from its reason: cancelled
+ * for a stop, failed for every other. Without this a turn that ended that
+ * way stayed live on the page for good, its calls running and its composer
+ * locked.
+ */
+export function asTurnEnd(env: EventEnvelope): TurnEnd | null {
+  const agent = asExecutionComplete(env)
+  if (agent !== null) return { outcome: agent.outcome, reason: agent.reason, subTaskId: agent.subTaskId ?? null }
+  if (env.type !== 'execution_complete' || !isPlainObject(env.payload)) return null
+  const p = env.payload
+  if (p.synthetic !== true || !isString(p.reason)) return null
+  return { outcome: p.reason === SYNTHETIC_STOP_REASON ? 'cancelled' : 'failed', reason: p.reason, subTaskId: null }
+}
+
 export function asWarning(env: EventEnvelope): Warning | null {
   if (env.type !== 'warning' || !isPlainObject(env.payload)) return null
   if (!isString(env.payload.message)) return null

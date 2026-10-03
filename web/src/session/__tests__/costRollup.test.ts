@@ -80,6 +80,17 @@ describe('buildCostRollup', () => {
     expect(rollup.sessionUsd).toBeCloseTo(0.3) // both turns
   })
 
+  it('the control plane\'s synthetic execution_complete ends the turn too', () => {
+    const events = [
+      stepFinish(1, 0.1, 10, 5),
+      { id: 2, type: 'execution_complete', payload: { turn_id: 't1', synthetic: true, reason: 'timeout' }, createdAt: '2026-08-20T10:00:02Z' },
+      stepFinish(3, 0.2, 20, 8),
+    ]
+    const rollup = buildCostRollup(events)
+    expect(rollup.turnUsd).toBeCloseTo(0.2)
+    expect(rollup.sessionUsd).toBeCloseTo(0.3)
+  })
+
   it('a SUB-TASK-tagged execution_complete never closes the main turn boundary', () => {
     const events = [
       stepFinish(1, 0.10, 10, 5),

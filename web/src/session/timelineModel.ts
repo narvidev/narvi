@@ -23,7 +23,9 @@
 // # Turn/step correlation, and what this module does NOT trust
 //
 // A turn boundary is inferred from execution_complete (the turn's own
-// terminal event, §3.3) -- everything from the end of the PREVIOUS
+// terminal event, §3.3: the agent's, or the synthetic one the control
+// plane writes when a turn ends without it -- asTurnEnd) -- everything
+// from the end of the PREVIOUS
 // execution_complete (or session start) up to and including the next one
 // is one turn; a trailing turn with no execution_complete yet is the
 // live, in-progress one (Timeline.tsx's own ".stream" card). A tool_call
@@ -84,7 +86,6 @@ import type { EventEnvelope } from '../ws/types'
 import {
   asArtifact,
   asBootProgress,
-  asExecutionComplete,
   asReady,
   asSandboxError,
   asSessionTitle,
@@ -95,6 +96,7 @@ import {
   asToken,
   asToolCall,
   asToolResult,
+  asTurnEnd,
   asWarning,
 } from './eventPayloads'
 import { asSandboxStatusChange, endsBootPhase } from './sandboxSnapshot'
@@ -512,11 +514,13 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
       stream.cut = picked?.cut ?? null
       continue
     }
-    const executionComplete = asExecutionComplete(event)
-    if (executionComplete !== null) {
+    // The agent's execution_complete, or the one the control plane writes
+    // when a turn ends without one (asTurnEnd): either ends the turn.
+    const turnEnd = asTurnEnd(event)
+    if (turnEnd !== null) {
       const turn = ensureTurn(event.id)
-      if (executionComplete.subTaskId) continue
-      turn.outcome = { outcome: executionComplete.outcome, reason: executionComplete.reason }
+      if (turnEnd.subTaskId) continue
+      turn.outcome = { outcome: turnEnd.outcome, reason: turnEnd.reason }
       turn.live = false
       for (const step of turn.steps) step.live = false
       settleUnattachedSubTasks(turn)

@@ -27,7 +27,7 @@
 // (technical plan §6.1). Before it did, no real session had a step_finish
 // row, and this rollup read "—" for every turn and session.
 import type { EventEnvelope } from '../ws/types'
-import { asExecutionComplete, asStepFinish } from './eventPayloads'
+import { asStepFinish, asTurnEnd } from './eventPayloads'
 
 export interface CostRollup {
   /** Null while no step_finish carrying a usd figure has been seen for the CURRENT (still-open, or most recently closed) turn -- distinct from 0, which would claim "measured, and free". */
@@ -72,9 +72,11 @@ export function buildCostRollup(events: readonly EventEnvelope[]): CostRollup {
     // loop over every turn in timelineModel. A sub-task-tagged
     // execution_complete (subTaskId non-null) never closes the MAIN
     // turn -- excluded here for the identical reason timelineModel.ts's
-    // own executionComplete branch excludes it from turn-outcome handling.
-    const executionComplete = asExecutionComplete(event)
-    if (executionComplete !== null && !executionComplete.subTaskId) {
+    // own turn-end branch excludes it from turn-outcome handling. A turn
+    // the control plane ended itself, with its synthetic
+    // execution_complete, ends here too (asTurnEnd).
+    const turnEnd = asTurnEnd(event)
+    if (turnEnd !== null && !turnEnd.subTaskId) {
       turnUsd = 0
       turnHasCost = false
       turnInputTokens = 0
