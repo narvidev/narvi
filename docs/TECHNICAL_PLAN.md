@@ -469,7 +469,7 @@ The two-mode knowledge capability: approved-plan durability; the per-repository 
 The path from an emitted metric to a backend that can evaluate an alert on it: a config-gated OTLP exporter in `platform.SetupOTel`, and the relay that carries the four sandbox-emitted histograms out of the sandbox.
 *Exit: an alert defined on a control-plane instrument fires from a real backend rather than from a process's own stdout, which is what closes P6's own exit criterion above. Step 112 gates no phase.*
 
-**Phase 11 — Named gaps (Steps 113-131, and the rows appended since: 152-156, 160-161, 171-179, 189, 198-205, 216, 218-229)**
+**Phase 11 — Named gaps (Steps 113-131, and the rows appended since: 152-156, 160-161, 171-179, 189, 198-205, 216, 218-231)**
 Real, non-speculative work that each shipping Step declared it was leaving out. A holding list until the owner chose to work it through in full, at which point it gained an execution order and a milestone like any other; the filing rule still governs what may enter it.
 *Exit: every row either shipped, or closed by a recorded decision saying why it will not be — never a silent omission.*
 
@@ -9503,8 +9503,11 @@ content has used since #334: among the text parts in the run's own window of the
 opened last, read at its newest frame. `plan.ExtractContent` is now `FinalText` with the plan
 placeholder, so the plan views, the approval snapshot, the cross-channel notifiers and the result read
 one rule; the result reports "no text" as `null` rather than the placeholder. The window is
-`turnContentBounds` (the run's dispatch watermark up to the next dispatched turn's) over the session's
-newest `planContentEventFetchLimit` events, as the plan views read it. The text is cut at 4,000
+`sessionactor.TurnContentBounds` (the run's dispatch watermark up to the next dispatched turn's), and
+the result reads that window's own `token` frames, at most `planContentEventFetchLimit` of them
+(`sessionactor.ReadWindowFinal`), as the plan views do, so a later turn's tool events cannot push the
+run's text out of what is read (Step 229); what that read scans to find the frames still grows with
+the session rather than the window (Step 231). The text is cut at 4,000
 characters (code points, never inside one), `truncated` saying so; the whole text stays in the events
 route. The spec's owner decision D13 (whether a part's stored row held its first frame, not its last) is
 settled by #334's per-frame storage.
