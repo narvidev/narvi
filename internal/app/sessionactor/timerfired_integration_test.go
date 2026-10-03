@@ -110,6 +110,18 @@ func TestTurnDeadlineTimerFired_FullRoundTrip(t *testing.T) {
 	if eventCount != 1 {
 		t.Errorf("execution_complete event count = %d, want 1 (synthetic completion, §3.3)", eventCount)
 	}
+	// The timed-out turn was the one in flight: its end carries the
+	// dispatched stamp a page ends the turn it shows on (syntheticend.go).
+	var dispatched bool
+	if err := pool.QueryRow(ctx,
+		`SELECT COALESCE((payload->>'dispatched')::boolean, false) FROM events WHERE session_id = $1 AND type = 'execution_complete'`,
+		sessionID,
+	).Scan(&dispatched); err != nil {
+		t.Fatalf("read the synthetic end's stamp: %v", err)
+	}
+	if !dispatched {
+		t.Error("the timed-out turn's synthetic end carries no dispatched stamp, want it")
+	}
 }
 
 // TestLivenessCheckTimerFired_FullRoundTrip proves the second half of this

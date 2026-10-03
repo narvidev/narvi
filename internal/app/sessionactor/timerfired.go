@@ -601,11 +601,7 @@ func (a *Actor) handleTurnDeadlineTimer(ctx context.Context) error {
 		// and DeriveFailureReason are used exactly as built, not
 		// reimplemented.
 		if turn.RequiresSyntheticExecutionComplete(turn.TriggerTimeout) {
-			if err := a.appendEvent(ctx, tx, "execution_complete", map[string]any{
-				"turn_id":   processing.ID.String(),
-				"synthetic": true,
-				"reason":    "timeout",
-			}); err != nil {
+			if err := a.appendEvent(ctx, tx, "execution_complete", syntheticExecutionComplete(processing.ID, turn.StateProcessing, "timeout")); err != nil {
 				return err
 			}
 		}

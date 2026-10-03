@@ -37,3 +37,17 @@ func RequiresSyntheticExecutionComplete(trig Trigger) bool {
 		return false
 	}
 }
+
+// SyntheticEndIsOfDispatchedTurn reports whether the synthetic
+// execution_complete of a turn ended from state from ends a dispatched
+// turn: one whose prompt was sent, the session's one turn in flight
+// (turns_one_processing_per_session), whose events a session's log -- and
+// the page reading it -- holds. A turn ended from pending never dispatched:
+// no event of the log belongs to it, so its synthetic end must not end the
+// turn a page is showing, which is another turn's (a turn queued behind a
+// running one and cancelled by a stop, refused at the credential gate, or
+// abandoned on a refused spawn). Terminal states end nothing and report
+// false.
+func SyntheticEndIsOfDispatchedTurn(from State) bool {
+	return from == StateDispatched || from == StateProcessing
+}

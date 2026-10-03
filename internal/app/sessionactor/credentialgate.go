@@ -184,11 +184,7 @@ func (a *Actor) refusePersonalLinkOnly(ctx context.Context, tx pgx.Tx, sessionRo
 	}, sessionRow, target.ID, reason)
 
 	if turn.RequiresSyntheticExecutionComplete(turn.TriggerAbandon) {
-		if err := a.appendEvent(ctx, tx, "execution_complete", map[string]any{
-			"turn_id":   target.ID.String(),
-			"synthetic": true,
-			"reason":    reason,
-		}); err != nil {
+		if err := a.appendEvent(ctx, tx, "execution_complete", syntheticExecutionComplete(target.ID, from, reason)); err != nil {
 			return err
 		}
 	}

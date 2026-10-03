@@ -59,15 +59,19 @@ type CreateEventRow struct {
 // after any update) -- callers use it to decide whether to (re-)broadcast
 // this event to live subscribers.
 //
-// message_id is the wire messageId, with one exception: every frame of a
+// message_id is the wire messageId, with two exceptions. Every frame of a
 // `token` part shares the part's messageId, and a plain first-wins key
 // would keep only the first one. So the session actor stores a part's
 // FIRST frame under the bare messageId, like any other event, and each
 // later distinct frame under messageId + "#" + a hash of its text
 // (sessionactor/tokenframe.go). The first frame keeps the bare key so
 // that a binary predating per-frame keys, which dedupes every frame on
-// it, still finds it. Readers never see the storage key -- they read the
-// payload, whose messageId is untouched.
+// it, still finds it. And a `tool_call`, `tool_result` or `step_finish`
+// carries its enclosing assistant message's id, which that message's
+// `step_start` stores first, so each is stored under messageId + "#" +
+// its type + ":" + its callId or stepId (internal/domain/eventkey).
+// Readers never see the storage key -- they read the payload, whose
+// messageId is untouched.
 //
 // # Why the session row is locked before the id is drawn
 //
@@ -201,6 +205,33 @@ func (q *Queries) GetBootP95InWindow(ctx context.Context, createdAt pgtype.Times
 	var i GetBootP95InWindowRow
 	err := row.Scan(&i.P95Seconds, &i.SampleSize)
 	return i, err
+}
+
+const getEventIDByMessageID = `-- name: GetEventIDByMessageID :one
+SELECT id FROM events
+WHERE session_id = $1 AND message_id = $2::text
+`
+
+type GetEventIDByMessageIDParams struct {
+	SessionID pgtype.UUID `json:"session_id"`
+	MessageID string      `json:"message_id"`
+}
+
+// The id of the event session_id stores under message_id, the key
+// CreateEvent dedupes on. The session actor reads it, for an assistant
+// message's id, before storing a `tool_call`, `tool_result` or
+// `step_finish` of that message (sessionactor/toolevent.go): the row under
+// the bare id is the message's `step_start`, the first event of the
+// message, and lying at or below the Processing turn's dispatched_event_id
+// it places the message in an earlier turn. One probe of
+// events_session_id_message_id_idx (migrations/000019), the unique index on
+// exactly these two columns, under a custom plan and a generic one alike.
+// pgx.ErrNoRows means nothing is stored under the key.
+func (q *Queries) GetEventIDByMessageID(ctx context.Context, arg GetEventIDByMessageIDParams) (int64, error) {
+	row := q.db.QueryRow(ctx, getEventIDByMessageID, arg.SessionID, arg.MessageID)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
 }
 
 const getLatestTokenFrameForPart = `-- name: GetLatestTokenFrameForPart :one
@@ -529,13 +560,15 @@ type ListRecentEventsForSessionParams struct {
 // The mirror-image pagination direction from ListEventsForSession's own
 // oldest-first cursor page: returns up to $2 of session_id's own MOST
 // RECENT events, newest id first -- for a caller that needs only the TAIL
-// of a possibly-long event log (e.g. sessionactor.planContentText's own
-// best-effort plan-content extraction, §8.1) without scanning forward
-// from the very beginning of a session's entire history, which for a
-// long-lived session (many prior turns) could leave the CURRENT turn's
-// own events entirely outside a bounded oldest-first window. Same
-// events_session_id_id_idx index (migrations/000008_events.up.sql) serves
-// this DESC scan equally well.
+// of a possibly-long event log, without scanning forward from the very
+// beginning of a session's entire history. Same events_session_id_id_idx
+// index (migrations/000008_events.up.sql) serves this DESC scan equally
+// well. No reader of a turn's text uses it any more: each reads its turn's
+// own window of `token` frames (ListTokenFramesInWindow,
+// sessionactor.ReadWindowFinal), since a later turn's tool calls, results
+// and step ends, about four rows a step, pushed an earlier turn's text out
+// of a tail of every type, whose read also carried every tool payload in
+// it.
 func (q *Queries) ListRecentEventsForSession(ctx context.Context, arg ListRecentEventsForSessionParams) ([]Event, error) {
 	rows, err := q.db.Query(ctx, listRecentEventsForSession, arg.SessionID, arg.Limit)
 	if err != nil {
@@ -800,10 +833,18 @@ type ListTokenFramesInWindowParams struct {
 // dispatched_event_id, inclusive -- the bounds plan.FinalText applies,
 // sessionactor.TurnContentBounds). The decision inbox reads each awaiting
 // plan's final text through it, to report a cut plan (technical plan §16,
-// §6.1), instead of the 2000-event tail planContentText reads: a range on
-// events_session_id_id_idx (migrations/000008_events.up.sql) bounded by the
-// turn, of which only the token rows are returned. Capped by row_limit,
-// newest first, like every other bounded read of the log.
+// §6.1), and so does every other reader of a turn's text
+// (sessionactor.ReadWindowFinal: the approval and its snapshot, the plan
+// views' fallback, the session result's summary, the plan notices). It
+// returns only the window's token rows, capped by row_limit, newest first,
+// like every other bounded read of the log -- but what it reads to find them
+// is not bounded by the turn (TestEventStore_ListTokenFramesInWindow_
+// ReadsTheTurnsWindow): a generic plan walks events_token_part_idx over every
+// token frame of the session, whose id, behind the part id, is no seek key,
+// about one buffer for 70 frames, and a custom plan reads events_pkey
+// across the window, its other rows included, about one buffer for 30. An
+// index of a session's token frames by id would bound it to the window; it
+// needs a migration.
 func (q *Queries) ListTokenFramesInWindow(ctx context.Context, arg ListTokenFramesInWindowParams) ([]Event, error) {
 	rows, err := q.db.Query(ctx, listTokenFramesInWindow,
 		arg.SessionID,

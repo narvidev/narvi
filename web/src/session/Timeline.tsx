@@ -53,16 +53,38 @@ function formatDuration(startIso: string, endIso: string): string {
   return `${(ms / 1000).toFixed(1)}s`
 }
 
-function ToolCallRow({ tc, live }: { tc: ToolCallNode; live: boolean }) {
+// A tool call's state comes from its own result and its turn, never from its
+// position: parallel calls of one message run side by side, so any call of a
+// live turn without a result is running, not only the last one drawn. A call
+// of an ended turn without a result never got one -- its turn was cancelled,
+// timed out or lost its sandbox, and a result the agent sends after that is
+// not stored (technical plan §6.1) -- so it reads "no result", never ✓.
+type ToolCallState = 'running' | 'done' | 'err' | 'none'
+
+const TOOL_CALL_GLYPH: Record<ToolCallState, { className: string; glyph: string }> = {
+  running: { className: 'live', glyph: '●' },
+  done: { className: 'done', glyph: '✓' },
+  err: { className: 'err', glyph: '✕' },
+  none: { className: 'none', glyph: '–' },
+}
+
+function toolCallState(tc: ToolCallNode, turnLive: boolean): ToolCallState {
+  if (tc.result === null) return turnLive ? 'running' : 'none'
+  return tc.result.isError ? 'err' : 'done'
+}
+
+function ToolCallRow({ tc, turnLive }: { tc: ToolCallNode; turnLive: boolean }) {
   const [open, setOpen] = useState(false)
-  const isLive = live && tc.result === null
-  const isError = tc.result?.isError === true
+  const state = toolCallState(tc, turnLive)
+  const { className, glyph } = TOOL_CALL_GLYPH[state]
   return (
     <div className="tool-block">
       <button type="button" className="tool tool-toggle" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
-        <span className={`st ${isLive ? 'live' : isError ? 'err' : 'done'}`}>{isLive ? '●' : isError ? '✕' : '✓'}</span>
+        <span className={`st ${className}`}>{glyph}</span>
         {tc.toolName}
-        <span className="dur">{isLive ? 'running…' : tc.result ? formatDuration(tc.startedAt, tc.result.finishedAt) : ''}</span>
+        <span className="dur">
+          {state === 'running' ? 'running…' : state === 'none' ? 'no result' : tc.result ? formatDuration(tc.startedAt, tc.result.finishedAt) : ''}
+        </span>
       </button>
       {open && (
         <pre className="evt-json">
@@ -95,15 +117,15 @@ function SubTaskLanes({ subTasks }: { subTasks: SubTaskNode[] }) {
   )
 }
 
-function ToolCallList({ toolCalls, live }: { toolCalls: ToolCallNode[]; live: boolean }) {
+function ToolCallList({ toolCalls, turnLive }: { toolCalls: ToolCallNode[]; turnLive: boolean }) {
   const [expanded, setExpanded] = useState(false)
   const HEAD = 2
   const TAIL = 1
   if (toolCalls.length <= HEAD + TAIL || expanded) {
     return (
       <>
-        {toolCalls.map((tc, i) => (
-          <ToolCallRow key={tc.callId || tc.messageId} tc={tc} live={live && i === toolCalls.length - 1} />
+        {toolCalls.map((tc) => (
+          <ToolCallRow key={tc.callId || tc.messageId} tc={tc} turnLive={turnLive} />
         ))}
       </>
     )
@@ -114,19 +136,22 @@ function ToolCallList({ toolCalls, live }: { toolCalls: ToolCallNode[]; live: bo
   return (
     <>
       {head.map((tc) => (
-        <ToolCallRow key={tc.callId || tc.messageId} tc={tc} live={false} />
+        <ToolCallRow key={tc.callId || tc.messageId} tc={tc} turnLive={turnLive} />
       ))}
       <button type="button" className="fold" onClick={() => setExpanded(true)}>
         ▸ {hidden} more tool call{hidden === 1 ? '' : 's'}
       </button>
-      {tail.map((tc, i) => (
-        <ToolCallRow key={tc.callId || tc.messageId} tc={tc} live={live && i === tail.length - 1} />
+      {tail.map((tc) => (
+        <ToolCallRow key={tc.callId || tc.messageId} tc={tc} turnLive={turnLive} />
       ))}
     </>
   )
 }
 
-function StepCard({ step, live }: { step: StepNode; live: boolean }) {
+// live marks the card the turn is streaming into (its last step); turnLive
+// is whether its turn is still running at all, which every tool call of
+// every step of the turn reads its state from.
+function StepCard({ step, live, turnLive }: { step: StepNode; live: boolean; turnLive: boolean }) {
   const tokenText = step.tokens.map((t) => t.text).join('\n\n')
   return (
     <div className={`card${live ? ' stream' : ''}`}>
@@ -136,7 +161,7 @@ function StepCard({ step, live }: { step: StepNode; live: boolean }) {
         {step.startedAt && <time>{new Date(step.startedAt).toLocaleTimeString()}</time>}
       </div>
       <div className="steps">
-        <ToolCallList toolCalls={step.toolCalls} live={live} />
+        <ToolCallList toolCalls={step.toolCalls} turnLive={turnLive} />
         {step.cost && (
           <div className="step-sum">
             {step.toolCalls.length} call{step.toolCalls.length === 1 ? '' : 's'} · {step.cost.inputTokens + step.cost.outputTokens} tokens
@@ -207,8 +232,10 @@ export function Timeline({ sessionId, turns }: { sessionId: string; turns: TurnN
       {shown.map((turn) => (
         <div key={turn.firstEventId} className="turn-block">
           {turn.steps.map((step, i) => (
-            <StepCard key={step.stepId} step={step} live={turn.live && i === turn.steps.length - 1} />
+            <StepCard key={step.stepId} step={step} live={turn.live && i === turn.steps.length - 1} turnLive={turn.live} />
           ))}
+          {/* Sub-tasks that found no spawning tool call: lanes of the turn itself, never dropped (timelineModel.ts). */}
+          {turn.subTasks.length > 0 && <SubTaskLanes subTasks={turn.subTasks} />}
           <FailureCard sessionId={sessionId} turn={turn} />
         </div>
       ))}

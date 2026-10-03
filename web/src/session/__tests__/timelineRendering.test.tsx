@@ -11,6 +11,8 @@
 // components ever started using dangerouslySetInnerHTML, these assertions
 // would start failing (a raw "<img" tag would appear in the output
 // instead of the escaped "&lt;img"), which is the whole point.
+import { readFileSync } from 'node:fs'
+
 import { describe, expect, it } from 'vitest'
 import { buildCostRollup } from '../costRollup'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -19,6 +21,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { Session } from '@narvi/contracts/rest-dtos'
 
 import { SessionHeader } from '../SessionHeader'
+import { CostPanel } from '../SessionRail'
 import { Timeline } from '../Timeline'
 import { buildTimelineModel } from '../timelineModel'
 import type { EventEnvelope } from '../../ws/types'
@@ -94,7 +97,7 @@ describe('Timeline rendering -- adversarial content stays text, never markup', (
 
   it('escapes a hostile sub-task label', () => {
     const events: EventEnvelope[] = [
-      { id: 1, type: 'tool_call', payload: { messageId: 'parent', callId: 'c1', toolName: 'Task', input: {} }, createdAt: '2026-08-20T10:00:00Z' },
+      { id: 1, type: 'tool_call', payload: { messageId: 'parent', callId: 'c1', toolName: 'task', input: {} }, createdAt: '2026-08-20T10:00:00Z' },
       {
         id: 2,
         type: 'sub_task_start',
@@ -217,5 +220,201 @@ describe('SessionHeader presence -- multiplayer indicator (§8.11)', () => {
       />,
     )
     expect(html).not.toContain('<img')
+  })
+})
+
+// What the header and the rail's cost panel draw from the rows one
+// assistant message leaves once the server stores its tool events
+// (technical plan §6.1) -- written by
+// TestResilience_ToolEventsOfOneMessage_EachStoredOnce from the rows the
+// real handler stores. Rendering checks: they pin what the page draws from
+// the rows it is given, and cannot see a loss on the server. Before the
+// server stored them, a real session had no tool_call or step_finish row:
+// the header drew neither cost nor calls, and the panel "—" throughout.
+describe('SessionHeader and CostPanel -- the rows one message leaves once stored', () => {
+  const rows = (): EventEnvelope[] => JSON.parse(readFileSync(new URL('./fixtures/toolEventsOfOneMessage.json', import.meta.url), 'utf8')) as EventEnvelope[]
+
+  it('the header shows the cost and the call count', () => {
+    const events = rows()
+    const html = renderToStaticMarkup(<SessionHeader session={baseSession()} model={buildTimelineModel(events)} cost={buildCostRollup(events)} participants={[]} />)
+    expect(html).toContain('$0.42 · 2 tool calls')
+  })
+
+  it('the panel shows the turn\'s and the session\'s cost while the turn runs, and the tokens', () => {
+    const live = rows().filter((e) => e.type !== 'execution_complete')
+    const html = renderToStaticMarkup(<CostPanel cost={buildCostRollup(live)} />)
+    expect(html).toContain('<dt>this turn</dt><dd>$0.42</dd>')
+    expect(html).toContain('<dt>session</dt><dd>$0.42</dd>')
+    expect(html).toContain('<dt>tokens</dt><dd>1.2k in · 80 out</dd>')
+  })
+
+  it('the timeline draws a sub-task that found no call as a lane of its turn', () => {
+    const events: EventEnvelope[] = [
+      { id: 1, type: 'tool_call', payload: { messageId: 'msg_1', callId: 'c1', toolName: 'read', input: {} }, createdAt: '2026-10-03T10:00:00Z' },
+      { id: 2, type: 'sub_task_start', payload: { messageId: 's1', subTaskId: 'st1', label: 'Orphan lane', parentMessageId: 'msg_1', parentCallId: 'c_never' }, createdAt: '2026-10-03T10:00:01Z' },
+      { id: 3, type: 'execution_complete', payload: { messageId: 'done', outcome: 'completed', reason: null }, createdAt: '2026-10-03T10:00:02Z' },
+    ]
+    const html = withQueryClient(<Timeline sessionId="s1" turns={buildTimelineModel(events).turns} />)
+    expect(html).toContain('Orphan lane')
+  })
+
+  it('the timeline draws each tool call and the step\'s cost', () => {
+    const html = withQueryClient(<Timeline sessionId="s1" turns={buildTimelineModel(rows()).turns} />)
+    expect(html).toContain('read')
+    expect(html).toContain('task')
+    expect(html).toContain('Second opinion')
+    expect(html).toContain('2 calls · 1280 tokens · $0.42')
+  })
+})
+
+// A tool call's state is its own result and its turn's, never its place in
+// the list. Before the server stored a real turn's tool calls none reached
+// this view; now parallel calls of one message run side by side, and a turn
+// can end -- cancelled, timed out, its sandbox lost -- with a call that never
+// got a result, a result the agent sends after that being not stored
+// (technical plan §6.1). Neither may read as ✓.
+describe('Timeline -- a tool call without a result', () => {
+  let id = 1
+  const ev = (type: string, payload: unknown): EventEnvelope => ({ id: id++, type, payload, createdAt: '2026-10-03T10:00:00Z' })
+  const call = (callId: string, toolName: string) => ev('tool_call', { messageId: 'msg_1', callId, toolName, input: {} })
+  const render = (events: EventEnvelope[]) => withQueryClient(<Timeline sessionId="s1" turns={buildTimelineModel(events).turns} />)
+  const rows = (html: string, glyph: string, cls: string) => html.split(`<span class="st ${cls}">${glyph}</span>`).length - 1
+
+  it('two parallel calls of a live turn both read running, the first as well as the last', () => {
+    const html = render([
+      ev('step_start', { messageId: 'msg_1', stepId: 'prt_start' }),
+      call('ca', 'task'),
+      call('cb', 'task'),
+      ev('sub_task_start', { messageId: 'sa', subTaskId: 'st_a', label: 'Lane A', parentMessageId: 'msg_1', parentCallId: 'ca' }),
+      ev('sub_task_start', { messageId: 'sb', subTaskId: 'st_b', label: 'Lane B', parentMessageId: 'msg_1', parentCallId: 'cb' }),
+    ])
+    expect(rows(html, '●', 'live')).toBe(2)
+    expect(html.split('running…').length - 1).toBe(2)
+    expect(html).not.toContain('st done')
+  })
+
+  it('every call of a live turn without a result reads running, folded head and earlier steps too', () => {
+    const html = render([
+      ev('step_start', { messageId: 'msg_0', stepId: 'prt_start_0' }),
+      ev('tool_call', { messageId: 'msg_0', callId: 'c0', toolName: 'bash', input: {} }),
+      ev('step_finish', { messageId: 'msg_0', stepId: 'prt_finish_0', cost: { tokens: { input: 1, output: 1 } } }),
+      ev('step_start', { messageId: 'msg_1', stepId: 'prt_start' }),
+      call('c1', 'read'),
+      call('c2', 'read'),
+      call('c3', 'read'),
+      call('c4', 'read'),
+      call('c5', 'read'),
+    ])
+    // c0 in its closed step, c1 and c2 at the head of the fold, c5 at its tail.
+    expect(rows(html, '●', 'live')).toBe(4)
+    expect(html).not.toContain('st done')
+  })
+
+  it('a call of a turn the agent ended reads "no result", never ✓; a call with its result still reads ✓', () => {
+    const html = render([
+      ev('step_start', { messageId: 'msg_1', stepId: 'prt_start' }),
+      call('c1', 'read'),
+      ev('tool_result', { messageId: 'msg_1', callId: 'c1', output: { output: 'ok' }, isError: false }),
+      call('c2', 'bash'),
+      ev('execution_complete', { messageId: 'ec', outcome: 'cancelled', reason: 'opencode: turn context canceled before completion' }),
+    ])
+    expect(rows(html, '✓', 'done')).toBe(1)
+    expect(rows(html, '–', 'none')).toBe(1)
+    expect(html).toContain('no result')
+    expect(html).not.toContain('st live')
+  })
+
+  it('the control plane\'s synthetic execution_complete ends the turn, with its reason: the call reads "no result" beside the failure card', () => {
+    const events = [ev('step_start', { messageId: 'msg_1', stepId: 'prt_start' }), call('c1', 'bash'), ev('execution_complete', { turn_id: 't1', synthetic: true, dispatched: true, reason: 'timeout' })]
+    const html = render(events)
+    expect(rows(html, '–', 'none')).toBe(1)
+    expect(html).not.toContain('st live')
+    expect(html).toContain('This turn ran out of time')
+    expect(html).toContain('turn failed')
+  })
+
+  it('a stop\'s synthetic execution_complete ends the turn cancelled', () => {
+    const html = render([call('c1', 'bash'), ev('execution_complete', { turn_id: 't1', synthetic: true, dispatched: true, reason: 'stopped' })])
+    expect(rows(html, '–', 'none')).toBe(1)
+    expect(html).toContain('turn cancelled')
+    expect(html).toContain('reason: stopped')
+  })
+})
+
+// What the page draws when the control plane ends a turn other than the
+// one it is streaming (a queued turn cancelled by a stop), or ends the
+// streaming turn before its agent does (a timeout, then the agent's own
+// late end). Rendering checks on the logs the timeline model's own
+// scenario tests read (timelineModel.test.ts, "the turn a synthetic end
+// ends").
+describe('Timeline -- the turn a synthetic end ends', () => {
+  let id = 1
+  const ev = (type: string, payload: unknown): EventEnvelope => ({ id: id++, type, payload, createdAt: '2026-10-03T10:00:00Z' })
+  const scenario = (tail: EventEnvelope[]): EventEnvelope[] => [
+    ev('step_start', { messageId: 'msgA', stepId: 'prtA_start' }),
+    ev('tool_call', { messageId: 'msgA', callId: 'cA1', toolName: 'bash', input: {} }),
+    ev('token', { messageId: 'prtA_text', text: 'working on' }),
+    ...tail,
+  ]
+  const queuedStopped = () => ev('execution_complete', { turn_id: 'turnB', synthetic: true, reason: 'stopped' })
+  const aRest = () => [
+    ev('tool_result', { messageId: 'msgA', callId: 'cA1', output: { output: 'ok' }, isError: false }),
+    ev('token', { messageId: 'prtA_text', text: 'working on it, done' }),
+    ev('step_finish', { messageId: 'msgA', stepId: 'prtA_finish', cost: { tokens: { input: 10, output: 5 }, usd: 0.5 } }),
+  ]
+  const render = (events: EventEnvelope[]) => withQueryClient(<Timeline sessionId="s1" turns={buildTimelineModel(events).turns} />)
+  const count = (html: string, needle: string) => html.split(needle).length - 1
+
+  it('S1: a queued turn stopped, the running turn completes anyway: no failure card, its call ✓', () => {
+    const html = render(scenario([queuedStopped(), ...aRest(), ev('execution_complete', { messageId: 'ecA', outcome: 'completed', reason: null })]))
+    expect(count(html, 'Resume turn')).toBe(0)
+    expect(html).toContain('<span class="st done">✓</span>bash')
+    expect(count(html, 'class="turn-block"')).toBe(1)
+  })
+
+  it('S1, before the running turn ends: still running, its call running, no failure card', () => {
+    const html = render(scenario([queuedStopped(), ...aRest().slice(1)]))
+    expect(count(html, 'Resume turn')).toBe(0)
+    expect(html).toContain('<span class="st live">●</span>bash')
+  })
+
+  it('S2: a queued turn stopped, the running turn obeys: one cancelled card', () => {
+    const html = render(scenario([queuedStopped(), ev('execution_complete', { messageId: 'ecA', outcome: 'cancelled', reason: null })]))
+    expect(count(html, 'Resume turn')).toBe(1)
+    expect(count(html, 'turn cancelled')).toBe(1)
+    expect(count(html, 'class="turn-block"')).toBe(1)
+  })
+
+  it('S3: the running turn times out, its agent\'s end arrives late: one failure card, its call "no result"', () => {
+    const html = render(
+      scenario([
+        ev('execution_complete', { turn_id: 'turnA', synthetic: true, dispatched: true, reason: 'timeout' }),
+        ev('execution_complete', { messageId: 'ecA', outcome: 'failed', reason: null }),
+      ]),
+    )
+    expect(count(html, 'Resume turn')).toBe(1)
+    expect(html).toContain('This turn ran out of time')
+    expect(html).toContain('<span class="st none">–</span>bash')
+    expect(count(html, 'class="turn-block"')).toBe(1)
+  })
+
+  it('a turn after a timeout, its prompt received, refused at once: its own failure card, with its reason', () => {
+    const html = render(
+      scenario([
+        ev('execution_complete', { turn_id: 'turnA', synthetic: true, dispatched: true, reason: 'timeout' }),
+        ev('prompt_received', { type: 'prompt_received', messageId: 'prompt_received:pB', sessionId: 's', gen: 1, promptMessageId: 'pB', duplicate: false }),
+        ev('execution_complete', { messageId: 'ecB', outcome: 'failed', reason: 'opencode: could not dispatch prompt' }),
+      ]),
+    )
+    expect(count(html, 'class="turn-block"')).toBe(2)
+    expect(count(html, 'Resume turn')).toBe(2)
+    expect(html).toContain('This turn ran out of time')
+    expect(html).toContain('reason: opencode: could not dispatch prompt')
+  })
+
+  it('S4 (control): the running turn stopped alone and obeys: one cancelled card', () => {
+    const html = render(scenario([ev('execution_complete', { messageId: 'ecA', outcome: 'cancelled', reason: null })]))
+    expect(count(html, 'Resume turn')).toBe(1)
+    expect(count(html, 'class="turn-block"')).toBe(1)
   })
 })

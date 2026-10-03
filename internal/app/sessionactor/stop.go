@@ -306,11 +306,7 @@ func (a *Actor) cancelStoppedTurns(ctx context.Context, tx pgx.Tx, sessionRow sq
 		}, sessionRow, id, turn.TriggerCancel)
 
 		if turn.RequiresSyntheticExecutionComplete(turn.TriggerCancel) {
-			if err := a.appendEvent(ctx, tx, "execution_complete", map[string]any{
-				"turn_id":   id.String(),
-				"synthetic": true,
-				"reason":    "stopped",
-			}); err != nil {
+			if err := a.appendEvent(ctx, tx, "execution_complete", syntheticExecutionComplete(id, from, "stopped")); err != nil {
 				return nil, err
 			}
 		}

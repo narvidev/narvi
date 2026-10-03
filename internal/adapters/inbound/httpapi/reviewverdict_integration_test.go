@@ -22,6 +22,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
@@ -2456,6 +2457,77 @@ func TestPostReviewVerdict_TimedOutTurnStillPostsAgainstOwnContext_NotTheNewerTu
 	}
 	if gotBaseSHA != "base-sha-turn-a" {
 		t.Errorf("base_sha = %q, want %q (turn A's own recorded base sha)", gotBaseSHA, "base-sha-turn-a")
+	}
+}
+
+// TestPostReviewVerdict_TimedOutTurn_CounterReviewerStartedAfterTheDeadline_Corroborated
+// (§26.4): turn_deadline fails a deep review's turn without stopping its
+// agent, and the agent's late verdict is accepted against that turn
+// (GetByDispatchedMessageID, no status filter). A counter-reviewer the agent
+// starts and completes after the deadline, with no turn Processing and none
+// dispatched since, reaches the actor as any sandbox event does, and both
+// its sub_task_start and its sub_task_finish are stored, so the trace the
+// verdict is read against corroborates its counterReview: done. With the
+// start dropped for want of a Processing turn, the finish alone floored
+// the verdict to needs_human.
+func TestPostReviewVerdict_TimedOutTurn_CounterReviewerStartedAfterTheDeadline_Corroborated(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	session := setupReviewSessionWithSandbox(ctx, t, rig, "acme/verdict-late-counter-review", 91)
+	turn := seedProcessingDeepPathTurn(ctx, t, rig, session.ID, "sha-late-counter-review", 1)
+
+	// The turn's deadline passes: dispatched long enough ago for the
+	// default turn_deadline, and the actor's real handler fails it.
+	if _, err := rig.pool.Exec(ctx, `UPDATE turns SET dispatched_at = now() - interval '2 hours' WHERE id = $1`, turn.ID); err != nil {
+		t.Fatalf("age dispatched_at: %v", err)
+	}
+	actor, err := rig.registry.GetOrSpawn(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	if err := actor.Send(ctx, sessionactor.TimerFired{Name: sessionactor.TimerTurnDeadline}); err != nil {
+		t.Fatalf("send turn_deadline: %v", err)
+	}
+	eventually(t, 10*time.Second, func() bool {
+		got, err := rig.turns.Get(ctx, turn.ID)
+		return err == nil && got.Status == sqlcgen.TurnStatusFailed
+	})
+	if _, err := rig.turns.GetProcessingTurnForSession(ctx, session.ID); err == nil {
+		t.Fatal("a turn is still Processing after the deadline")
+	}
+
+	// The agent goes on: its counter-reviewer starts and completes.
+	agentEvent(ctx, t, rig.registry, session.ID, "sub_task_start", 1, func(messageID string) any {
+		return map[string]any{
+			"type": "sub_task_start", "messageId": messageID, "sessionId": session.ID.String(), "gen": 1,
+			"subTaskId": "ses_late_counter_review", "label": "counter-review", "parentMessageId": "msg_review",
+			"subAgentType": review.CounterReviewerAgentName,
+		}
+	})
+	agentEvent(ctx, t, rig.registry, session.ID, "sub_task_finish", 1, func(messageID string) any {
+		return map[string]any{
+			"type": "sub_task_finish", "messageId": messageID, "sessionId": session.ID.String(), "gen": 1,
+			"ackId": "sub_task_finish:" + messageID, "subTaskId": "ses_late_counter_review", "outcome": "completed",
+		}
+	})
+	var starts int
+	if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'sub_task_start' AND id > $2`,
+		session.ID, *turn.DispatchedEventID).Scan(&starts); err != nil {
+		t.Fatalf("count sub_task_start rows: %v", err)
+	}
+	if starts != 1 {
+		t.Fatalf("sub_task_start rows in the turn's window = %d, want 1: the late start is stored", starts)
+	}
+
+	status, resp := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, deepPathVerdictRequestJSON("done"))
+	if status != http.StatusCreated {
+		t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+	}
+	if resp.Shippable != restdtos.PostReviewVerdictResponseShippableAuto {
+		t.Errorf("Shippable = %q, want %q: the counter-review started after the deadline is in the trace and corroborates", resp.Shippable, restdtos.PostReviewVerdictResponseShippableAuto)
+	}
+	if body := verdictOutboxBody(ctx, t, rig, session.ID); strings.Contains(body, "uncorroborated") {
+		t.Errorf("the verdict calls the counter-review uncorroborated, Body:\n%s", body)
 	}
 }
 

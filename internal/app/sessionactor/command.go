@@ -157,7 +157,16 @@ type SandboxEvent struct {
 	// up.sql).
 	AgentVersion *string
 	ImageDigest  *string
-	Reply        chan<- SandboxEventOutcome
+	// CallID/StepID are the wire message's own "callId" (a `tool_call` or
+	// `tool_result`) and "stepId" (a `step_start` or `step_finish`), "" on
+	// every other type: the correlators eventkey.StorageKey derives the
+	// storage key of a `tool_call`, `tool_result` or `step_finish` from
+	// (technical plan §6.1, toolevent.go). Every one of those events
+	// carries its enclosing message's id as its messageId, so without them
+	// it would dedupe onto that message's `step_start` row.
+	CallID string
+	StepID string
+	Reply  chan<- SandboxEventOutcome
 }
 
 func (SandboxEvent) isCommand() {}

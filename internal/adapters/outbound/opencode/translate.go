@@ -28,7 +28,11 @@ import (
 // for grouping/ordering across an entire turn), while Step/CallId answers
 // "which specific instance of a step/tool this is" (needed for the dedup
 // logic in sse.go's dispatchTool) — collapsing both onto the same id would
-// lose one of those two distinct pieces of information. Adapter-
+// lose one of those two distinct pieces of information. Since every one of
+// those events of a message shares its messageId, the control plane stores
+// a tool_call, tool_result and step_finish under a key it derives from the
+// messageId, the type and that correlator (internal/domain/eventkey), and
+// a step_start under the bare messageId. Adapter-
 // SYNTHESIZED events with no single originating OpenCode id
 // (execution_complete, sub_task_start, sub_task_finish) mint a fresh
 // uuid instead, via newEventID — mirroring
@@ -236,9 +240,17 @@ func translateSubTaskStart(cmd sandboxws.Prompt, p subtaskPart) sandboxws.SubTas
 // enclosing "task" tool_call's own messageID (p.MessageID) -- exactly the
 // "messageId of the main-lane tool_call event whose invocation spawned
 // this sub-task" the wire schema's own SubTaskStart.parentMessageId
-// documents. Label is best-effort from the task call's own "description"
-// input field (taskInputDescription below) -- a human-readable label, not
-// a correctness-bearing value. SubAgentType (§26.4/§7.1) is the
+// documents. ParentCallId is that same call's own callID (p.CallID), the
+// tool_call's own correlator (technical plan §6.1): parentMessageId names a
+// message, which may hold several tool calls, and this event reaches the
+// wire before its tool_call when the call's first "running" update already
+// carries the metadata, after it when a later update does, and two
+// parallel task calls in one message can emit both calls before either
+// sub-task (dispatchTool, sse.go) -- so a reader pairs a sub-task with its
+// call by ParentCallId, whichever came first. Label is best-effort from the
+// task call's own "description" input field (taskInputDescription below) --
+// a human-readable label, not a correctness-bearing value. SubAgentType
+// (§26.4/§7.1) is the
 // SAME task call's own "subagent_type" input field (taskInputSubAgentType
 // below) -- unlike Label, this IS the engine's own reliable dispatch
 // parameter, and is what post-hoc sub-task corroboration
@@ -254,6 +266,7 @@ func translateSubTaskStartFromTask(cmd sandboxws.Prompt, p toolPart, subTaskID s
 		SubTaskId:       subTaskID,
 		Label:           taskInputDescription(p.State.Input),
 		ParentMessageId: p.MessageID,
+		ParentCallId:    emptyStringToNilPtr(p.CallID),
 		SubAgentType:    subAgentTypePtr(taskInputSubAgentType(p.State.Input)),
 	}
 }

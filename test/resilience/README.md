@@ -616,13 +616,13 @@ stand in for both kinds of control plane:
 `sever()` forces a reconnect to whichever comes next. The agents are a
 real `wsbridge.Bridge`, or one written by hand as scenario #22's are. The
 `tool_result` cases use the pinned runtime's id shape, the enclosing
-message's id behind that message's `step_start`, so a `tool_result` adds
-no row today (Step 229 schedules storing it). They assert what the wire
-carries.
+message's id behind that message's `step_start`, so a `tool_result` is
+stored under the key its `callId` derives (Step 229). They assert what the
+wire carries and the one row it leaves.
 
 - `TestResilience_Scenario23_AgentEventOver32KiB_ReadOnOneConnection`: with
   the header forwarded, a 40 KiB text part is stored whole and a 40 KiB
-  `tool_result` reaches the handler whole and adds no row. The
+  `tool_result` reaches the handler whole and is stored once, whole. The
   `execution_complete` behind them completes the turn, after one `ready`.
 - `TestResilience_Scenario23_PushErrorOver32KiB_ReportedAndNextTurnCompletes`:
   a completed turn's push fails with 40 KiB of git stderr. Its `push_error`,
@@ -637,9 +637,11 @@ carries.
   with no header and a 32 KiB read, a plan-mode turn's 40 KiB text part
   arrives cut, its `cut` set. The plan reads as cut: no structured steps,
   though its plan-steps block survived the cut, and `ErrPlanCut` refuses
-  Approve. A 40 KiB `tool_result` arrives cut to 32 KiB, the turn
-  completes, and `ready_seq` stays at 1. A reconnect to a control plane
-  that states its limit then replays both whole and adds no row.
+  Approve. A 40 KiB `tool_result` arrives cut to 32 KiB and is stored
+  once, `cut` kept; the turn completes, and `ready_seq` stays at 1. A
+  reconnect to a control plane that states its limit then replays both
+  whole and adds no row: the turn is over, and the stored `tool_result`
+  stays the cut one, first wins.
 - `TestResilience_Scenario23_WholeThenCutOnRollback_FinalTextReadsWhole`:
   a part is stored whole, then replayed cut after a reconnect to a control
   plane that states nothing. The real handler adds no row for the cut,
@@ -666,6 +668,32 @@ carries.
   `execution_complete` marked `"delivered": false` and a warning naming
   both sizes, and its connection stays up.
   — both in `scenario23_prompt_frames_test.go`
+
+## Not a scenario: the tool events of one message (Step 229, §6.1)
+
+The runtime adapter gives every event it derives from a part of an
+assistant message that message's id, and the message's `step_start` comes
+first. Stored under the wire `messageId` alone, every `tool_call`,
+`tool_result` and `step_finish` of a real turn deduped onto that
+`step_start`'s row, and none was stored or broadcast; the tests that should
+have seen it minted a fresh id per event. Each is now stored under a key
+derived from its `callId` or `stepId`, only while its turn is live and its
+message's `step_start` is stored in that turn.
+
+- `TestResilience_ToolEventsOfOneMessage_EachStoredOnce`: the real OpenCode
+  adapter runs against a scripted runtime server, so the events are the ones
+  its translate path emits for one message -- a `read` call and a `task`
+  call that spawns a sub-task, each with its result, between a `step_start`
+  and a `step_finish` -- and reach the real handler and actor through a
+  real `wsbridge.Bridge`. Each is stored once under its key and broadcast
+  once to a subscribed page, the `sub_task_start` names its call
+  (`parentCallId`), a reconnect's replay adds no row and broadcasts none
+  again, and `fetch_history` on the real client socket returns the
+  message's `step_start`, `tool_call`s, `tool_result`s and `step_finish`.
+  The stored rows are pinned against
+  `web/src/session/__tests__/fixtures/toolEventsOfOneMessage.json`, which
+  the web timeline, cost and header tests read.
+  — in `tool_events_test.go`
 
 ## Summary
 

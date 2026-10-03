@@ -382,6 +382,12 @@
   background: var(--crit-soft);
   color: var(--crit);
 }
+/* A call of an ended turn that never got a result (Timeline.tsx): neither
+   succeeded nor failed, so neither ok nor crit. */
+.tool .st.none {
+  background: var(--warn-soft);
+  color: var(--warn);
+}
 .tool .dur {
   margin-left: auto;
   color: var(--faint);

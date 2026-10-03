@@ -25,8 +25,9 @@
 // built with the header; dropping it and reading at 32 KiB
 // (clientReadLimit), it is one built before. The `tool_result` cases use
 // the pinned runtime's id shape, the enclosing message's id behind that
-// message's `step_start`, so a `tool_result` adds no row today (technical
-// plan §6.1, "Stored token frames"): they assert what the wire carries.
+// message's `step_start`, so a `tool_result` is stored under the key its
+// callId derives (internal/domain/eventkey, technical plan §6.1): they
+// assert what the wire carries and the one row it leaves.
 package resilience_test
 
 import (
@@ -79,6 +80,10 @@ type eventFrameRig struct {
 
 	backendMu sync.Mutex
 	backend   [][]byte // backend->client frames the relay passed on
+
+	// clientURL is the backend's own socket route, which serves a web
+	// client's socket too when the rig was built with clientSocket.
+	clientURL string
 }
 
 type eventRigOptions struct {
@@ -86,6 +91,9 @@ type eventRigOptions struct {
 	prompt          string
 	planMode        bool
 	repos           []byte
+	// clientSocket mounts the real client handler beside the sandbox one,
+	// as the control plane serves both on one route (wshub.NewHandler).
+	clientSocket bool
 }
 
 // newEventFrameRig seeds a Ready sandbox at gen 1 and a pending turn, and
@@ -99,7 +107,13 @@ func newEventFrameRig(ctx context.Context, t *testing.T, opts eventRigOptions) *
 	t.Cleanup(func() { _ = registry.Shutdown() })
 
 	router := chi.NewRouter()
-	router.Get("/sessions/{sessionID}/ws", wshub.NewSandboxHandler(registry, h.Sandboxes, commander, h.Timeouts))
+	sandboxHandler := wshub.NewSandboxHandler(registry, h.Sandboxes, commander, h.Timeouts)
+	if opts.clientSocket {
+		router.Get("/sessions/{sessionID}/ws", wshub.NewHandler(sandboxHandler, wshub.NewClientHandler(registry, h.Sessions, h.Turns, h.Sandboxes,
+			h.Events, narvipg.NewArtifactStore(h.Pool), narvipg.NewWSTokenStore(h.Pool), narvipg.NewUserStore(h.Pool), h.Hub, h.Timeouts)))
+	} else {
+		router.Get("/sessions/{sessionID}/ws", sandboxHandler)
+	}
 	backend := httptest.NewServer(router)
 	t.Cleanup(backend.Close)
 
@@ -122,7 +136,8 @@ func newEventFrameRig(ctx context.Context, t *testing.T, opts eventRigOptions) *
 		t.Fatalf("create turn: %v", err)
 	}
 
-	rig := &eventFrameRig{lostPromptRig: &lostPromptRig{h: h, registry: registry, sessionID: session.ID, turnID: created.ID}}
+	rig := &eventFrameRig{lostPromptRig: &lostPromptRig{h: h, registry: registry, sessionID: session.ID, turnID: created.ID},
+		clientURL: "ws" + strings.TrimPrefix(backend.URL, "http") + "/sessions/" + session.ID.String() + "/ws?type=client"}
 	rig.proxy = newWSProxy("ws"+strings.TrimPrefix(backend.URL, "http"), func(payload []byte) {
 		rig.mu.Lock()
 		defer rig.mu.Unlock()
@@ -437,8 +452,8 @@ func planTextOfSize(n int) string {
 // TestResilience_Scenario23_AgentEventOver32KiB_ReadOnOneConnection: a
 // control plane that states its limit reads a 40 KiB text part and a 40
 // KiB tool_result on the connection they came on, after one ready: the
-// part is stored whole, the tool_result reaches it whole and adds no row,
-// and the execution_complete behind them completes the turn.
+// part is stored whole, the tool_result reaches it whole and is stored
+// once, whole, and the execution_complete behind them completes the turn.
 func TestResilience_Scenario23_AgentEventOver32KiB_ReadOnOneConnection(t *testing.T) {
 	ctx := context.Background()
 	rig := newEventFrameRig(ctx, t, eventRigOptions{first: headerControlPlane, fallback: headerControlPlane})
@@ -464,8 +479,8 @@ func TestResilience_Scenario23_AgentEventOver32KiB_ReadOnOneConnection(t *testin
 	if len(results) != 1 || len(results[0]) <= 40*1024 || strings.Contains(string(results[0]), `"cut"`) {
 		t.Fatalf("the control plane was written %d tool_results; want one, whole and over 40 KiB", len(results))
 	}
-	if n := rig.countType(ctx, t, "tool_result"); n != 0 {
-		t.Fatalf("%d tool_result rows, want none: it carries its message's id, which that message's step_start holds", n)
+	if rows := rig.toolResultRows(ctx, t); len(rows) != 1 || rows[0].key != "msg_1#tool_result:call_1" || rows[0].output != output || rows[0].cut {
+		t.Fatalf("stored tool_results %s; want one, whole, under the key its callId derives -- it carries its message's id, which that message's step_start holds", summarizeToolResults(rows))
 	}
 	if got := rig.readyCount(); got != 1 {
 		t.Fatalf("%d readies relayed, want 1: every frame was read on the connection it came on", got)
@@ -609,10 +624,11 @@ func TestResilience_Scenario23_PreChangeAgent_EventOver32KiB_Stored(t *testing.T
 // arrives cut, with `cut` set, so the plan reads as cut -- its marker
 // visible, no structured steps though the plan-steps block in its first 4
 // KiB survived the cut, and Approve refused -- and a 40 KiB tool_result
-// arrives cut to 32 KiB; the execution_complete behind them completes the
-// turn, and the connection stays the one the ready came on. Once the agent
-// reconnects to a control plane that states its limit, its replay writes
-// both whole, adding no row, the turn being over.
+// arrives cut to 32 KiB and is stored once, cut; the execution_complete
+// behind them completes the turn, and the connection stays the one the
+// ready came on. Once the agent reconnects to a control plane that states
+// its limit, its replay writes both whole, adding no row, the turn being
+// over: the stored tool_result stays the cut one, first wins.
 func TestResilience_Scenario23_PreChangeControlPlane_FramesCutToFit_NoReconnectLoop(t *testing.T) {
 	ctx := context.Background()
 	rig := newEventFrameRig(ctx, t, eventRigOptions{first: noHeaderControlPlane, fallback: noHeaderControlPlane, planMode: true})
@@ -660,6 +676,9 @@ func TestResilience_Scenario23_PreChangeControlPlane_FramesCutToFit_NoReconnectL
 	if len(results) != 1 || len(results[0]) > platform.DefaultFrameReadLimitBytes || !strings.Contains(string(results[0]), `"cut":{`) {
 		t.Fatalf("the control plane was written %d tool_results; want one, cut to at most 32 KiB", len(results))
 	}
+	if stored := rig.toolResultRows(ctx, t); len(stored) != 1 || stored[0].key != "msg_1#tool_result:call_1" || !stored[0].cut {
+		t.Fatalf("stored tool_results %s; want the one written, cut, `cut` kept", summarizeToolResults(stored))
+	}
 	for _, payload := range rig.relayedFrames("") {
 		if len(payload) > platform.DefaultFrameReadLimitBytes {
 			t.Fatalf("a %s frame of %d bytes reached a control plane that reads 32 KiB", relayType(payload), len(payload))
@@ -696,9 +715,53 @@ func TestResilience_Scenario23_PreChangeControlPlane_FramesCutToFit_NoReconnectL
 	if got := len(rig.tokenRows(ctx, t, "prt_plan")); got != rowsBefore {
 		t.Fatalf("%d frames of the part stored after the replay, want %d: no row once the turn is over", got, rowsBefore)
 	}
-	if n := rig.countType(ctx, t, "tool_result"); n != 0 {
-		t.Fatalf("%d tool_result rows, want none", n)
+	if stored := rig.toolResultRows(ctx, t); len(stored) != 1 || !stored[0].cut {
+		t.Fatalf("stored tool_results after the replay %s; want still the one stored cut: first wins, and the turn is over", summarizeToolResults(stored))
 	}
+}
+
+// storedToolResult is one stored `tool_result` row: its storage key, its
+// output's text and whether it carries a `cut`.
+type storedToolResult struct {
+	key    string
+	output string
+	cut    bool
+}
+
+// toolResultRows returns the session's stored `tool_result` rows, in id
+// order.
+func (r *eventFrameRig) toolResultRows(ctx context.Context, t *testing.T) []storedToolResult {
+	t.Helper()
+	rows, err := r.h.Pool.Query(ctx,
+		`SELECT message_id, COALESCE(payload->'output'->>'output', ''), payload ? 'cut' FROM events WHERE session_id = $1 AND type = 'tool_result' ORDER BY id`,
+		r.sessionID)
+	if err != nil {
+		t.Fatalf("query tool_result rows: %v", err)
+	}
+	var out []storedToolResult
+	for rows.Next() {
+		var row storedToolResult
+		if err := rows.Scan(&row.key, &row.output, &row.cut); err != nil {
+			rows.Close()
+			t.Fatalf("scan tool_result row: %v", err)
+		}
+		out = append(out, row)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate tool_result rows: %v", err)
+	}
+	return out
+}
+
+// summarizeToolResults names each stored tool_result by its key, its
+// output's length and its cut, for a failure message.
+func summarizeToolResults(rows []storedToolResult) string {
+	parts := make([]string, 0, len(rows))
+	for _, row := range rows {
+		parts = append(parts, fmt.Sprintf("{%s, %d bytes, cut %v}", row.key, len(row.output), row.cut))
+	}
+	return "[" + strings.Join(parts, " ") + "]"
 }
 
 // wholeThenCutFixture is the part the rollback test leaves in the log, as

@@ -441,7 +441,10 @@ func (a *Actor) drainMailbox() {
 // "messageId" (cmd.MessageID, command.go), except for a `token` part's
 // later frames: every frame of a text part shares one messageId, so each
 // frame after the part's first is stored under a per-frame key instead
-// (appendTokenFrame, tokenframe.go).
+// (appendTokenFrame, tokenframe.go); and for a `tool_call`, `tool_result`
+// or `step_finish`, stored under a key derived from its callId or stepId,
+// since each carries its enclosing message's id, which that message's
+// `step_start` holds (appendCorrelatedEvent, toolevent.go).
 // CreateEvent upserts on (session_id, messageID)
 // (§6.1), so a genuine resend of an already-persisted event is deduped
 // (Inserted false) rather than appended as an indistinguishable duplicate

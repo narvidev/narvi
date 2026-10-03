@@ -205,7 +205,7 @@ function ArtifactsPanel({ sessionId }: { sessionId: string }) {
   )
 }
 
-function CostPanel({ cost }: { cost: CostRollup }) {
+export function CostPanel({ cost }: { cost: CostRollup }) {
   return (
     <div>
       <h3>Cost</h3>

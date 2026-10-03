@@ -313,3 +313,65 @@ func TestHandleSandboxEvent_StepFinish_NilUsd_LeavesCostNull(t *testing.T) {
 		t.Errorf("turn cost_usd = %v (valid), want NULL (cost.usd was absent on the wire)", v)
 	}
 }
+
+// TestStepCost_StepFinishStored_CountedOnce: a step_finish in the shape
+// production sends -- under its message's id, behind that message's
+// step_start -- is stored once, under the key its stepId derives, and its
+// cost is counted once; a resend of the whole message, as a reconnect
+// replays it, adds neither a row nor money. The page sums its cost from
+// stored step_finish rows (web/src/session/costRollup.ts), so before the
+// row was stored the page read none, while turns.cost_usd, keyed on the
+// stepId, was right all along.
+func TestStepCost_StepFinishStored_CountedOnce(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+	if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	turn := createDispatchedProcessingTurn(ctx, t, pool, sessionID)
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	message := oneMessageForTest(t, sessionID.String(), "msg_1")
+	for range 2 { // sent, then replayed
+		for _, cmd := range message {
+			sendSandboxEventForTest(ctx, t, a, cmd)
+		}
+	}
+
+	var rows int
+	var stored []byte
+	if err := pool.QueryRow(ctx, `SELECT count(*), max(payload::text) FROM events WHERE session_id = $1 AND type = 'step_finish'`, sessionID).Scan(&rows, &stored); err != nil {
+		t.Fatalf("read the stored step_finish: %v", err)
+	}
+	if rows != 1 {
+		t.Fatalf("%d step_finish rows, want exactly 1", rows)
+	}
+	var finish sandboxws.StepFinish
+	if err := json.Unmarshal(stored, &finish); err != nil || finish.Cost.Usd == nil || *finish.Cost.Usd != 0.25 || finish.Cost.Tokens.Input != 100 {
+		t.Fatalf("stored step_finish = %s (%v), want the step's cost, $0.25 and 100 tokens in", stored, err)
+	}
+
+	got, err := narvipg.NewTurnStore(pool).Get(ctx, turn.ID)
+	if err != nil {
+		t.Fatalf("get turn: %v", err)
+	}
+	if v, ok := appreviewtriage.NumericToFloat64(got.CostUsd); !ok || v != 0.25 {
+		t.Fatalf("turn cost_usd = %v (valid %v), want 0.25, counted once", v, ok)
+	}
+	var steps int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM turn_step_costs WHERE turn_id = $1`, turn.ID).Scan(&steps); err != nil {
+		t.Fatalf("count turn_step_costs: %v", err)
+	}
+	if steps != 1 {
+		t.Fatalf("%d turn_step_costs rows, want 1", steps)
+	}
+}

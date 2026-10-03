@@ -23,7 +23,9 @@
 // # Turn/step correlation, and what this module does NOT trust
 //
 // A turn boundary is inferred from execution_complete (the turn's own
-// terminal event, §3.3) -- everything from the end of the PREVIOUS
+// terminal event, §3.3: the agent's, or the synthetic one the control
+// plane writes when a turn ends without it -- asTurnEnd) -- everything
+// from the end of the PREVIOUS
 // execution_complete (or session start) up to and including the next one
 // is one turn; a trailing turn with no execution_complete yet is the
 // live, in-progress one (Timeline.tsx's own ".stream" card). A tool_call
@@ -55,21 +57,36 @@
 // file). A part whose only text is cut reads as cut, its marker in the
 // text and its `cut` on the stream.
 //
-// sub_task_start.parentMessageId correlates against a tool_call's own
-// `messageId` (NOT `callId` -- callId is what tool_result correlates
-// against instead, a distinct id on the very same event, §6.1). A
-// sub-task whose parent hasn't been seen yet (out-of-order delivery) is
-// buffered and attached retroactively the moment its parent tool_call
-// does arrive; one that NEVER finds a parent (a malformed/hostile
-// producer) surfaces in `orphanedSubTasks` rather than being silently
-// dropped -- see this Step's own PR description for why silent data loss
-// is treated as a worse failure mode than an honest "unattributed"
-// bucket.
+// # Pairing, by the ids the events share
+//
+// Every event the runtime adapter derives from a part of an assistant
+// message carries that message's id as its messageId (technical plan
+// §6.1), so ids pair them, never their order alone:
+//   - a tool_result pairs with its tool_call by callId;
+//   - a step_finish pairs with its step_start by stepId when they share
+//     one, and otherwise -- the runtime's own shape, the two being two
+//     parts with two part ids -- with the open step its messageId started;
+//   - a sub-task hangs under the tool call that spawned it. A
+//     sub_task_start's parentCallId names that call, and the two pair by it
+//     whichever arrives first: the adapter emits the sub_task_start before
+//     its tool_call when the call's first running update already names the
+//     sub-task, after it otherwise, and two parallel task calls in one
+//     message can both precede either sub-task. One without parentCallId --
+//     an agent built before it, or the legacy subtask part -- names only its
+//     message, which may hold several calls: it hangs under the latest
+//     `task` call of its message, or else the next one, never under another
+//     tool's call. Two parallel task calls of such an agent are the one case
+//     this cannot tell apart: either lane may hang under either call.
+//
+// A sub-task that has found no call when its turn ends -- or, in the live
+// turn, has not found one yet -- is shown as a lane of the turn itself
+// (TurnNode.subTasks), never dropped. Only a sub_task_finish with no start
+// at all surfaces in `orphanedSubTasks`.
 import type { EventEnvelope } from '../ws/types'
 import {
   asArtifact,
   asBootProgress,
-  asExecutionComplete,
+  asPromptReceived,
   asReady,
   asSandboxError,
   asSessionTitle,
@@ -80,7 +97,9 @@ import {
   asToken,
   asToolCall,
   asToolResult,
+  asTurnEnd,
   asWarning,
+  readyGen,
 } from './eventPayloads'
 import { asSandboxStatusChange, endsBootPhase } from './sandboxSnapshot'
 import { type CutFrame, type FrameCut, partText } from './tokenCut'
@@ -140,6 +159,8 @@ export interface TurnNode {
   /** The id of the first event folded into this turn -- a stable React key (event ids are strictly monotonic, never reused, eventLog.ts's own top comment). */
   firstEventId: number
   steps: StepNode[]
+  /** Sub-tasks that found no spawning tool call -- by the turn's end, or, in the live turn, yet: lanes of the turn itself, never dropped. */
+  subTasks: SubTaskNode[]
   outcome: TurnOutcome | null
   /** True while this turn has no outcome yet AND is the last turn in the log -- the ".stream" card. */
   live: boolean
@@ -181,6 +202,16 @@ function subTaskStatusFromOutcome(outcome: 'completed' | 'failed' | 'cancelled')
   return outcome
 }
 
+/** The runtime's sub-agent tool: the one whose call spawns a sub-task (technical plan §7.1). */
+const TASK_TOOL_NAME = 'task'
+
+/** A sub-task that has found no spawning call yet, with what it names of one. */
+interface PendingSubTask {
+  node: SubTaskNode
+  parentMessageId: string
+  parentCallId: string | null
+}
+
 export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineModel {
   const turns: TurnNode[] = []
   const warnings: TimelineNotice[] = []
@@ -191,22 +222,34 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
   let sawAgentReady = false
 
   let currentTurn: TurnNode | null = null
+  // The turn the control plane's own synthetic execution_complete ended,
+  // while nothing since shows a later turn under way. Its agent may still
+  // be running (turn_deadline does not stop it): its own end of the turn
+  // ends nothing, and a sub-task it starts joins that turn. A turn event
+  // opens the next turn and clears it, and so do the two events that show a
+  // later prompt under way: the agent's receipt of a prompt, and the `ready`
+  // of a new generation.
+  let endedByControlPlane: TurnNode | null = null
+  // The highest generation a `ready` in the log has named so far.
+  let latestReadyGen: number | null = null
   // Per-turn correlation state -- reset every time a new turn opens
   // (this module's own top comment: turn-scoped, never bled across a
   // turn boundary even if a producer somehow reused an id).
-  let toolCallsByMessageId = new Map<string, ToolCallNode>()
+  let taskCallsByMessageId = new Map<string, ToolCallNode[]>()
   let toolCallsByCallId = new Map<string, ToolCallNode>()
   let stepsByStepId = new Map<string, StepNode>()
-  let pendingSubTasksByParent = new Map<string, SubTaskNode[]>()
+  let stepsByMessageId = new Map<string, StepNode[]>()
+  let pendingSubTasks: PendingSubTask[] = []
   let subTasksById = new Map<string, SubTaskNode>()
   let tokensByMessageId = new Map<string, TokenStream>()
   let openStepId: string | null = null
 
   function resetTurnState(): void {
-    toolCallsByMessageId = new Map()
+    taskCallsByMessageId = new Map()
     toolCallsByCallId = new Map()
     stepsByStepId = new Map()
-    pendingSubTasksByParent = new Map()
+    stepsByMessageId = new Map()
+    pendingSubTasks = []
     subTasksById = new Map()
     tokensByMessageId = new Map()
     openStepId = null
@@ -214,11 +257,19 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
 
   function ensureTurn(firstEventId: number): TurnNode {
     if (currentTurn === null) {
-      currentTurn = { firstEventId, steps: [], outcome: null, live: true }
+      currentTurn = { firstEventId, steps: [], subTasks: [], outcome: null, live: true }
       turns.push(currentTurn)
       resetTurnState()
+      endedByControlPlane = null
     }
     return currentTurn
+  }
+
+  // A sub-task waiting for its call ends as a lane of the turn itself: at
+  // the turn's end, or, for the live turn, as the log stands.
+  function settleUnattachedSubTasks(turn: TurnNode): void {
+    for (const pending of pendingSubTasks) turn.subTasks.push(pending.node)
+    pendingSubTasks = []
   }
 
   function ensureOpenStep(turn: TurnNode, event: EventEnvelope): StepNode {
@@ -244,15 +295,36 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
     return implicit
   }
 
-  function attachSubTask(node: SubTaskNode, parentMessageId: string): void {
-    const parent = toolCallsByMessageId.get(parentMessageId)
-    if (parent) {
-      parent.subTasks.push(node)
-      return
+  // A sub-task with parentCallId hangs under that call; one without hangs
+  // under the latest task call of its message (this file's top comment).
+  // False when it has found no call yet.
+  function attachSubTask(node: SubTaskNode, parentMessageId: string, parentCallId: string | null): boolean {
+    if (parentCallId !== null) {
+      const call = toolCallsByCallId.get(parentCallId)
+      if (!call) return false
+      call.subTasks.push(node)
+      return true
     }
-    const pending = pendingSubTasksByParent.get(parentMessageId) ?? []
-    pending.push(node)
-    pendingSubTasksByParent.set(parentMessageId, pending)
+    const taskCalls = taskCallsByMessageId.get(parentMessageId)
+    const latest = taskCalls?.[taskCalls.length - 1]
+    if (!latest) return false
+    latest.subTasks.push(node)
+    return true
+  }
+
+  // The sub-tasks waiting for call: those naming its callId, and, for a
+  // task call, those of its message that name no call.
+  function takePendingSubTasks(call: ToolCallNode): SubTaskNode[] {
+    const taken: SubTaskNode[] = []
+    pendingSubTasks = pendingSubTasks.filter((pending) => {
+      const mine =
+        pending.parentCallId !== null
+          ? pending.parentCallId === call.callId
+          : call.toolName === TASK_TOOL_NAME && pending.parentMessageId === call.messageId
+      if (mine) taken.push(pending.node)
+      return !mine
+    })
+    return taken
   }
 
   for (const event of events) {
@@ -284,8 +356,31 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
     // The agent's `ready` opens its connection, ahead of its boot: it
     // ends no phase. The server's own status report does, once the boot
     // is over -- or a new generation starts one afresh.
-    if (asReady(event) !== null) {
+    const ready = asReady(event)
+    if (ready !== null) {
       sawAgentReady = true
+      // A new generation's sandbox, its `ready` naming a generation above
+      // every earlier one's in the log: the gen fence drops every later
+      // event of an earlier generation, the agent's end of a turn the
+      // control plane ended included, so an end after it is a later turn's.
+      // A reconnect of the same generation sends its `ready` too, and
+      // changes nothing.
+      const gen = readyGen(ready)
+      if (gen !== null && (latestReadyGen === null || gen > latestReadyGen)) {
+        latestReadyGen = gen
+        endedByControlPlane = null
+      }
+      continue
+    }
+    // The agent's receipt of a prompt (technical plan §3.3), stored once, at
+    // the first copy that reached the control plane: a prompt dispatched
+    // after the turn the control plane ended, whose receipt came when it
+    // reached the sandbox -- the ended turn's came long before, but for a
+    // re-send the deadline overtook. The end that follows is that later
+    // turn's, which may send nothing else before it: a prompt the runtime
+    // refuses ends at once.
+    if (asPromptReceived(event) !== null) {
+      endedByControlPlane = null
       continue
     }
     const statusChange = asSandboxStatusChange(event)
@@ -302,12 +397,6 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
 
     const subTaskStart = asSubTaskStart(event)
     if (subTaskStart !== null) {
-      // Opens/reuses the current turn BEFORE touching pendingSubTasksByParent/
-      // subTasksById below -- both are turn-scoped state that resetTurnState()
-      // (inside ensureTurn) would otherwise wipe out from under a sub-task
-      // that arrived before its own turn had opened any OTHER event yet
-      // (e.g. a sub_task_start as the very first event of a turn).
-      ensureTurn(event.id)
       const node: SubTaskNode = {
         subTaskId: subTaskStart.subTaskId,
         label: subTaskStart.label,
@@ -316,13 +405,39 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
         finishedAt: null,
         status: 'running',
       }
+      const parentCallId = subTaskStart.parentCallId ?? null
+      if (endedByControlPlane !== null) {
+        // The agent of a turn the control plane ended, starting a sub-task:
+        // the server stores it however late (§26.4's corroboration reads it),
+        // and it joins that turn -- under its call, or else as a lane of the
+        // turn -- and opens none, which nothing would end.
+        subTasksById.set(node.subTaskId, node)
+        if (!attachSubTask(node, subTaskStart.parentMessageId, parentCallId)) endedByControlPlane.subTasks.push(node)
+        continue
+      }
+      // Opens/reuses the current turn BEFORE touching pendingSubTasks/
+      // subTasksById below -- both are turn-scoped state that resetTurnState()
+      // (inside ensureTurn) would otherwise wipe out from under a sub-task
+      // that arrived before its own turn had opened any OTHER event yet
+      // (e.g. a sub_task_start as the very first event of a turn).
+      ensureTurn(event.id)
       subTasksById.set(node.subTaskId, node)
-      attachSubTask(node, subTaskStart.parentMessageId)
+      // Not found yet: it waits for its call (takePendingSubTasks), or ends
+      // as a lane of its turn.
+      if (!attachSubTask(node, subTaskStart.parentMessageId, parentCallId)) {
+        pendingSubTasks.push({ node, parentMessageId: subTaskStart.parentMessageId, parentCallId })
+      }
       continue
     }
     const subTaskFinish = asSubTaskFinish(event)
     if (subTaskFinish !== null) {
-      ensureTurn(event.id) // see the identical call in the sub_task_start branch above for why
+      // A finish closes a lane the log already opened, so it never opens a
+      // turn: with no turn open it is the agent closing a sub-task of the
+      // turn that just ended -- the control plane ends a turn without
+      // stopping its agent, and a sub_task_finish, critical, is stored
+      // however late -- and it reaches that turn's lane, still in
+      // subTasksById, or else orphanedSubTasks. A turn opened at it would
+      // never end.
       const existing = subTasksById.get(subTaskFinish.subTaskId)
       if (existing) {
         existing.status = subTaskStatusFromOutcome(subTaskFinish.outcome)
@@ -356,8 +471,6 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
       const turn = ensureTurn(event.id)
       if (toolCall.subTaskId) continue
       const step = ensureOpenStep(turn, event)
-      const pending = pendingSubTasksByParent.get(toolCall.messageId) ?? []
-      pendingSubTasksByParent.delete(toolCall.messageId)
       const node: ToolCallNode = {
         callId: toolCall.callId,
         messageId: toolCall.messageId,
@@ -365,9 +478,14 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
         input: toolCall.input,
         startedAt: event.createdAt,
         result: null,
-        subTasks: pending,
+        subTasks: [],
       }
-      toolCallsByMessageId.set(node.messageId, node)
+      node.subTasks.push(...takePendingSubTasks(node))
+      if (node.toolName === TASK_TOOL_NAME) {
+        const taskCalls = taskCallsByMessageId.get(node.messageId) ?? []
+        taskCalls.push(node)
+        taskCallsByMessageId.set(node.messageId, taskCalls)
+      }
       toolCallsByCallId.set(node.callId, node)
       step.toolCalls.push(node)
       continue
@@ -390,6 +508,9 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
       if (!step) {
         step = { stepId: stepStart.stepId, toolCalls: [], tokens: [], cost: null, startedAt: event.createdAt, finishedAt: null, live: true }
         stepsByStepId.set(step.stepId, step)
+        const ofMessage = stepsByMessageId.get(stepStart.messageId) ?? []
+        ofMessage.push(step)
+        stepsByMessageId.set(stepStart.messageId, ofMessage)
         turn.steps.push(step)
       }
       openStepId = step.stepId
@@ -399,7 +520,11 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
     if (stepFinish !== null) {
       const turn = ensureTurn(event.id)
       if (stepFinish.subTaskId) continue
-      let step = stepsByStepId.get(stepFinish.stepId)
+      // Its own step_start by a shared stepId, or else the step its
+      // message started and nothing has closed: the runtime gives the two
+      // parts two ids and the message's id to both (this file's top
+      // comment).
+      let step = stepsByStepId.get(stepFinish.stepId) ?? stepsByMessageId.get(stepFinish.messageId)?.find((s) => s.finishedAt === null)
       if (!step) {
         // step_finish with no matching step_start -- still surfaced, not
         // dropped (this module's own top comment on honest handling of
@@ -441,14 +566,41 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
       stream.cut = picked?.cut ?? null
       continue
     }
-    const executionComplete = asExecutionComplete(event)
-    if (executionComplete !== null) {
+    // The agent's execution_complete, or the one the control plane writes
+    // when a turn ends without one (asTurnEnd): either ends the turn.
+    const turnEnd = asTurnEnd(event)
+    if (turnEnd !== null) {
+      // The agent's own end of a turn the control plane already ended, with
+      // nothing between them that shows a later turn under way: the server
+      // records nothing for it (completeProcessingTurn finds no turn
+      // processing and leaves the turn as its synthetic end left it), and
+      // neither does the page -- a turn opened at it would be one the server
+      // never had. A later turn whose end is its only event -- its prompt
+      // refused at once -- is told from it by its prompt's receipt, or by a
+      // new generation. From an agent that sends no receipt, on the same
+      // generation, the two are the same events, and read as this one.
+      if (!turnEnd.synthetic && endedByControlPlane !== null) continue
+      // The end of a turn whose prompt never reached the sandbox
+      // (`"delivered": false`): its agent never ran, so the log holds no
+      // event of it but this end, and none can follow. With no turn open, it
+      // closes a card of its own and leaves the turn state as it was -- the
+      // turn the control plane ended before it, and that turn's calls -- so
+      // the agent of that earlier turn, still running, has its late end
+      // read as that turn's and its late sub-task attached under its call.
+      // A turn open on the page holds events the server stored in this
+      // turn's window, and this end closes it.
+      if (!turnEnd.delivered && currentTurn === null) {
+        turns.push({ firstEventId: event.id, steps: [], subTasks: [], outcome: { outcome: turnEnd.outcome, reason: turnEnd.reason }, live: false })
+        continue
+      }
       const turn = ensureTurn(event.id)
-      if (executionComplete.subTaskId) continue
-      turn.outcome = { outcome: executionComplete.outcome, reason: executionComplete.reason }
+      if (turnEnd.subTaskId) continue
+      turn.outcome = { outcome: turnEnd.outcome, reason: turnEnd.reason }
       turn.live = false
       for (const step of turn.steps) step.live = false
+      settleUnattachedSubTasks(turn)
       currentTurn = null // the NEXT turn-scoped event (if any) starts fresh
+      endedByControlPlane = turnEnd.synthetic ? turn : null
       continue
     }
     // Every other recognized/unrecognized type (heartbeat, git_sync,
@@ -459,6 +611,10 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
     // crash either way: an unrecognized type is a documented no-op, not
     // a thrown error.
   }
+
+  // The live turn shows what has found no call yet as lanes of its own.
+  const liveTurn = turns[turns.length - 1]
+  if (liveTurn?.live) settleUnattachedSubTasks(liveTurn)
 
   return { turns, warnings, errors, latestTitle, orphanedSubTasks, latestBootPhase, sawAgentReady }
 }

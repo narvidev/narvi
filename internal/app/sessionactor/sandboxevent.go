@@ -115,6 +115,7 @@ import (
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/eventkey"
 	"github.com/narvidev/narvi/internal/domain/sandbox"
 )
 
@@ -375,15 +376,26 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// consume the SAME signal for the SAME reason, once this closure
 		// has already returned.
 		//
-		// `token` is the one type not always stored under its wire
-		// messageId as is: every frame of a streamed text part shares that
-		// id, so the part's first frame keeps it and each later distinct
-		// frame gets its own storage key, and a frame is stored only while
-		// its turn is Processing (tokenframe.go).
+		// Four types are not always stored under their wire messageId as
+		// is. Every frame of a streamed text part shares that id, so the
+		// part's first `token` frame keeps it and each later distinct frame
+		// gets its own storage key (tokenframe.go). A `tool_call`,
+		// `tool_result` or `step_finish` carries its enclosing message's id,
+		// which that message's `step_start` stores first, so each is stored
+		// under a key derived from its callId or stepId (toolevent.go), and
+		// only when that `step_start` is stored in the Processing turn's
+		// window. All four are stored only while their turn is Processing,
+		// and so is a `step_start`, under its wire messageId (toolevent.go,
+		// appendLiveTurnEvent).
 		var inserted bool
-		if cmd.Type == "token" {
+		switch {
+		case cmd.Type == "token":
 			inserted, err = a.appendTokenFrame(ctx, tx, cmd)
-		} else {
+		case eventkey.KeyedByCorrelator(cmd.Type):
+			inserted, err = a.appendCorrelatedEvent(ctx, tx, cmd)
+		case storedOnlyWhileATurnIsProcessing(cmd.Type):
+			inserted, err = a.appendLiveTurnEvent(ctx, tx, cmd)
+		default:
 			inserted, err = a.appendRawEvent(ctx, tx, cmd.Type, cmd.MessageID, cmd.Raw)
 		}
 		if err != nil {

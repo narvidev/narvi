@@ -435,6 +435,10 @@ export interface SubTaskStart {
    */
   parentMessageId: string;
   /**
+   * The callId of the main-lane tool_call whose invocation spawned this sub-task (technical plan §6.1, §7.1). parentMessageId names a message, which may hold several tool calls, and the sub_task_start may reach the control plane before or after its tool_call, so a reader pairs the two by this property, whichever arrives first. Optional and additive: absent on any producer that predates it, and on the legacy subtask-part translation path, which has no tool call to name; a reader without it falls back to a task tool call of parentMessageId's message.
+   */
+  parentCallId?: string;
+  /**
    * §26.4 (§26.4/§7.1): the task tool's own 'subagent_type' dispatch parameter -- the literal named sub-agent (e.g. 'counter-reviewer', 'architecture-scribe', 'fact-check') the engine was actually told to invoke, VERIFIED LIVE as one of the task tool's own real input fields ({"description","prompt","subagent_type"}). Unlike label above (freeform, explicitly documented there as 'not a correctness-bearing value'), this is the engine's own reliable dispatch parameter, which is why post-hoc sub-task corroboration (reviewverdict.CounterReviewCorroborated) keys off this field, never off label. Optional and additive: this event has real, already-shipped production consumers that predate this field, so adding it now is not a breaking wire-contract change. Absent/omitted on any producer that predates this field, and always absent on the legacy/unverified-live subtaskPart fallback translation path (translateSubTaskStart), which has no task-tool input to extract this from at all.
    */
   subAgentType?: string;

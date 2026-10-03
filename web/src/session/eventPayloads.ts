@@ -19,6 +19,7 @@ import type {
   Artifact,
   BootProgress,
   ExecutionComplete,
+  PromptReceived,
   Ready,
   SandboxErrorEvent,
   SessionTitle,
@@ -88,11 +89,20 @@ export function asStepFinish(env: EventEnvelope): StepFinish | null {
   return env.payload as unknown as StepFinish
 }
 
+/**
+ * asSubTaskStart narrows a `sub_task_start`. Its optional parentCallId
+ * (technical plan §6.1) is kept when it is a non-empty string and dropped
+ * otherwise -- never failing the event, so a sub-task whose call cannot be
+ * named still shows, paired by its message instead (timelineModel.ts).
+ */
 export function asSubTaskStart(env: EventEnvelope): SubTaskStart | null {
   if (env.type !== 'sub_task_start' || !isPlainObject(env.payload)) return null
   const p = env.payload
   if (!isString(p.messageId) || !isString(p.subTaskId) || !isString(p.label) || !isString(p.parentMessageId)) return null
-  return env.payload as unknown as SubTaskStart
+  if (p.parentCallId === undefined || (isString(p.parentCallId) && p.parentCallId !== '')) return env.payload as unknown as SubTaskStart
+  const start = { ...(env.payload as unknown as SubTaskStart) }
+  delete start.parentCallId
+  return start
 }
 
 export function asSubTaskFinish(env: EventEnvelope): SubTaskFinish | null {
@@ -133,6 +143,67 @@ export function asExecutionComplete(env: EventEnvelope): ExecutionComplete | nul
   return env.payload as unknown as ExecutionComplete
 }
 
+/**
+ * The reason the control plane writes on the turn end of a stop
+ * (internal/app/sessionactor/stop.go): the one synthetic end of a
+ * cancelled turn. Every other synthetic end -- turn_deadline, a dispatch
+ * whose prompt never got through, a refused spawn, the credential gate --
+ * ends a failed turn.
+ */
+const SYNTHETIC_STOP_REASON = 'stopped'
+
+/** A turn's end, as the timeline and the cost rollup read it: the agent's own execution_complete, or the one the control plane writes itself. */
+export interface TurnEnd {
+  outcome: 'completed' | 'failed' | 'cancelled'
+  reason: string | null
+  /** Set only on an agent's execution_complete of a sub-task lane, which ends no turn. */
+  subTaskId: string | null
+  /** True for the control plane's own synthetic end, false for the agent's. */
+  synthetic: boolean
+  /**
+   * False only on the control plane's end of a turn whose prompt certainly
+   * never reached the sandbox (`"delivered": false`,
+   * internal/app/sessionactor/dispatch.go's failDispatchedTurn): its agent
+   * never ran.
+   */
+  delivered: boolean
+}
+
+/**
+ * asTurnEnd reads an `execution_complete` as the end of a turn, from either
+ * writer. The agent's carries its outcome (asExecutionComplete). The one the
+ * control plane writes when it ends a turn itself -- its deadline passes, it
+ * is stopped, its dispatch or spawn is refused -- carries `{turn_id,
+ * synthetic: true, reason}` (technical plan §3.3, "a synthetic
+ * execution_complete"), so its outcome is read from its reason: cancelled
+ * for a stop, failed for every other.
+ *
+ * A synthetic end is a turn end here only when it also carries `dispatched:
+ * true` (internal/app/sessionactor/syntheticend.go): the turn it ends was
+ * the session's one turn in flight, whose events the log holds and the page
+ * is showing. A turn ended from pending -- queued behind a running one and
+ * cancelled by a stop, refused at the credential gate, abandoned on a
+ * refused spawn -- never dispatched and has no event in the log, and ending
+ * the page's turn on its end ended another turn, the one still running. So
+ * does a synthetic end stored before the stamp existed: it reads as it did
+ * before the page read synthetic ends at all, as no end. The page cannot
+ * match an end to its turn by `turn_id`, which no other event names.
+ */
+export function asTurnEnd(env: EventEnvelope): TurnEnd | null {
+  const agent = asExecutionComplete(env)
+  if (agent !== null) return { outcome: agent.outcome, reason: agent.reason, subTaskId: agent.subTaskId ?? null, synthetic: false, delivered: true }
+  if (env.type !== 'execution_complete' || !isPlainObject(env.payload)) return null
+  const p = env.payload
+  if (p.synthetic !== true || p.dispatched !== true || !isString(p.reason)) return null
+  return {
+    outcome: p.reason === SYNTHETIC_STOP_REASON ? 'cancelled' : 'failed',
+    reason: p.reason,
+    subTaskId: null,
+    synthetic: true,
+    delivered: p.delivered !== false,
+  }
+}
+
 export function asWarning(env: EventEnvelope): Warning | null {
   if (env.type !== 'warning' || !isPlainObject(env.payload)) return null
   if (!isString(env.payload.message)) return null
@@ -170,4 +241,18 @@ export function asBootProgress(env: EventEnvelope): BootProgress | null {
 export function asReady(env: EventEnvelope): Ready | null {
   if (env.type !== 'ready' || !isPlainObject(env.payload)) return null
   return env.payload as unknown as Ready
+}
+
+/** readyGen is the sandbox generation a `ready` names, or null when its `gen` is not a number. */
+export function readyGen(ready: Ready): number | null {
+  const gen: unknown = ready.gen
+  return isNumber(gen) ? gen : null
+}
+
+/** asPromptReceived narrows the agent's receipt of a prompt (technical plan §3.3, prompt receipts). */
+export function asPromptReceived(env: EventEnvelope): PromptReceived | null {
+  if (env.type !== 'prompt_received' || !isPlainObject(env.payload)) return null
+  const p = env.payload
+  if (!isString(p.messageId) || !isString(p.promptMessageId)) return null
+  return env.payload as unknown as PromptReceived
 }

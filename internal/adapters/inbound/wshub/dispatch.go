@@ -40,6 +40,27 @@ type envelope struct {
 	// carrying type.
 	AgentVersion *string `json:"agentVersion"`
 	ImageDigest  *string `json:"imageDigest"`
+	// CallID/StepID are the correlators of one instance of a tool call
+	// (`tool_call`, `tool_result`) and of a step (`step_start`,
+	// `step_finish`), from which the session actor derives the key those
+	// events are stored under (eventkey.StorageKey, technical plan §6.1).
+	// Peeked leniently: a value that is not a string reads as absent rather
+	// than failing the whole envelope, so a frame stored before they were
+	// peeked is still stored now.
+	CallID peekedString `json:"callId"`
+	StepID peekedString `json:"stepId"`
+}
+
+// peekedString is a JSON string field read leniently: any other JSON value
+// leaves it empty instead of failing the decode it is part of.
+type peekedString string
+
+func (p *peekedString) UnmarshalJSON(data []byte) error {
+	var s string
+	if json.Unmarshal(data, &s) == nil {
+		*p = peekedString(s)
+	}
+	return nil
 }
 
 // readLoop reads and dispatches inbound sandbox-WS frames on conn until
@@ -93,6 +114,8 @@ func readLoop(ctx context.Context, conn *websocket.Conn, actor *sessionactor.Act
 			ConversationID: env.ConversationID,
 			AgentVersion:   env.AgentVersion,
 			ImageDigest:    env.ImageDigest,
+			CallID:         string(env.CallID),
+			StepID:         string(env.StepID),
 			Reply:          reply,
 		}
 
