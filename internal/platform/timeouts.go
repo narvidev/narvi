@@ -3046,6 +3046,24 @@ type Timeouts struct {
 	// visible cause.
 	ReviewRetriggerDebounce time.Duration
 
+	// ReviewRetriggerHoldBackstop is how far ahead the re-review debounce
+	// re-arms itself while it holds (technical plan §24.9): a firing that
+	// finds a turn of the review session pending, dispatched or processing
+	// inserts no review, spends no budget, keeps the pushed head as the
+	// target and re-arms the debounce at now plus this. A pending turn has
+	// no deadline of its own to borrow, and every write that ends a turn
+	// moves the debounce to now in its own transaction, so this only bounds
+	// a wake-up that was lost; it also keeps the row armed, so the status
+	// (§43.20) counts the work. Validate keeps it above TimerClaimDuration
+	// (a held debounce is never re-delivered at the claim cadence), above
+	// ReviewRetriggerDebounce (it is never re-checked faster than the quiet
+	// window a push asks for), and below TurnDeadline (a lost wake-up costs
+	// less than one turn's own deadline). Not specified in the plan; ten
+	// minutes, under UnknownTimerGrace, so even a binary that did not know
+	// the kind would keep it at the claim cadence (every binary that has
+	// the debounce knows it).
+	ReviewRetriggerHoldBackstop time.Duration
+
 	// -- §26.5 ("review: wire the cost budget", §26.7/§26.9) -- no
 	// ordering relationship with either invariant chain above (or with any
 	// prior Step's standalone additions), so -- per those additions' own
@@ -4290,7 +4308,8 @@ func DefaultTimeouts() Timeouts {
 
 		FindingPositionResolveAllTimeout: 45 * time.Second, // §22 fix; not specified, chosen -- generous for several per-finding relocation calls (10s each) while bounding the worst case on a synchronous verdict-POST handler path
 
-		ReviewRetriggerDebounce: 2 * time.Minute, // §24.2; not specified, chosen -- long enough to collapse a short burst of fixup-commit pushes into one quiet window, short enough that a single push still reviews promptly
+		ReviewRetriggerDebounce:     2 * time.Minute,  // §24.2; not specified, chosen -- long enough to collapse a short burst of fixup-commit pushes into one quiet window, short enough that a single push still reviews promptly
+		ReviewRetriggerHoldBackstop: 10 * time.Minute, // §24.9; not specified, chosen -- every turn end wakes the debounce at once, so this only bounds a lost wake-up, see field doc comment
 
 		ReviewCostBudgetServerReadHeaderTimeout: 5 * time.Second, // §26.7/§26.9; not specified, chosen -- matches RepoSHADiscoveryTimeout/CredentialFetchTimeout's own "lightweight, purely local" precedent, see field doc comment
 
@@ -4675,6 +4694,17 @@ func (t Timeouts) Validate() error {
 		"DispatchRetryBackoffMax", t.DispatchRetryBackoffMax, "ActorIdleTTL", t.ActorIdleTTL)
 	check("DispatchRetryBackoffMax > DispatchRetryBackoff",
 		"DispatchRetryBackoffMax", t.DispatchRetryBackoffMax, "DispatchRetryBackoff", t.DispatchRetryBackoff)
+
+	// §24.9, the re-review debounce's hold: never re-delivered at the claim
+	// cadence, never re-checked faster than the quiet window a push asks
+	// for, and a lost wake-up costs less than one turn's own deadline. See
+	// ReviewRetriggerHoldBackstop's doc comment.
+	check("ReviewRetriggerHoldBackstop > TimerClaimDuration",
+		"ReviewRetriggerHoldBackstop", t.ReviewRetriggerHoldBackstop, "TimerClaimDuration", t.TimerClaimDuration)
+	check("ReviewRetriggerHoldBackstop > ReviewRetriggerDebounce",
+		"ReviewRetriggerHoldBackstop", t.ReviewRetriggerHoldBackstop, "ReviewRetriggerDebounce", t.ReviewRetriggerDebounce)
+	check("TurnDeadline > ReviewRetriggerHoldBackstop",
+		"TurnDeadline", t.TurnDeadline, "ReviewRetriggerHoldBackstop", t.ReviewRetriggerHoldBackstop)
 
 	// §3.3's stop, after the named session's commit: a zero walk bound
 	// reaches no session it started, and one at or past

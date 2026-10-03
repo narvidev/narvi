@@ -30,6 +30,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	"github.com/narvidev/narvi/internal/app/sessionactivity"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/platform"
@@ -52,6 +53,13 @@ type retriggerStatusFixture struct {
 }
 
 func newRetriggerStatusFixture(ctx context.Context, t *testing.T, optedIn bool) retriggerStatusFixture {
+	t.Helper()
+	return newRetriggerStatusFixtureWith(ctx, t, optedIn, &fakeReviewContextFetcher{pr: githubapi.PullRequest{HeadSHA: "sha-live-after-push", BaseRef: "main"}, diff: "+ a line the push changed"})
+}
+
+// newRetriggerStatusFixtureWith is newRetriggerStatusFixture with the
+// session registry's re-review fetching the pull request from fetcher.
+func newRetriggerStatusFixtureWith(ctx context.Context, t *testing.T, optedIn bool, fetcher reviewcontext.Fetcher) retriggerStatusFixture {
 	t.Helper()
 	pool := newTestPool(t)
 	timers := narvipg.NewTimerStore(pool)
@@ -85,7 +93,6 @@ func newRetriggerStatusFixture(ctx context.Context, t *testing.T, optedIn bool) 
 		t.Fatalf("create the completed review turn: %v", err)
 	}
 
-	fetcher := &fakeReviewContextFetcher{pr: githubapi.PullRequest{HeadSHA: "sha-live-after-push", BaseRef: "main"}, diff: "+ a line the push changed"}
 	registry, err := sessionactor.NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false,
 		sessionactor.RegistryOptions{ReviewDiffFetcher: fetcher, GitHubBotHandle: "narvi-bot", GitHubOutbound: platform.MustNewGitHubOutboundConfig("test-token")})
 	if err != nil {

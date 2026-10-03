@@ -562,7 +562,7 @@ func (a *Actor) handleTurnDeadlineTimer(ctx context.Context) error {
 			return fmt.Errorf("sessionactor: turn transition processing->failed: %w", err)
 		}
 
-		if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		if _, err := a.turnWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 			ID:          processing.ID,
 			Status:      sqlcgen.TurnStatus(to),
 			CompletedAt: pgtype.Timestamptz{Time: now, Valid: true},

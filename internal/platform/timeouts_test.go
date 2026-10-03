@@ -2978,6 +2978,80 @@ func TestValidate_PromptResendMaxPerTurn(t *testing.T) {
 	}
 }
 
+// TestValidate_ReviewRetriggerHoldBackstop pins how far ahead the re-review
+// debounce re-arms itself while it holds (technical plan §24.9): the
+// shipped ten minutes, and each link -- above the claim window, above the
+// debounce's own quiet window, below TurnDeadline -- refused when either
+// side moves past the other, and accepted at exactly MinTimeoutMargin.
+func TestValidate_ReviewRetriggerHoldBackstop(t *testing.T) {
+	t.Parallel()
+
+	if got := platform.DefaultTimeouts().ReviewRetriggerHoldBackstop; got != 10*time.Minute {
+		t.Fatalf("DefaultTimeouts().ReviewRetriggerHoldBackstop = %v, want 10m0s", got)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*platform.Timeouts)
+		wantChain string // the broken link, or "" for valid
+	}{
+		{name: "backstop at the claim window", mutate: func(to *platform.Timeouts) {
+			to.ReviewRetriggerHoldBackstop = to.TimerClaimDuration
+		}, wantChain: "ReviewRetriggerHoldBackstop > TimerClaimDuration"},
+		{name: "claim window raised past the backstop", mutate: func(to *platform.Timeouts) {
+			to.TimerClaimDuration = to.ReviewRetriggerHoldBackstop + time.Minute
+		}, wantChain: "ReviewRetriggerHoldBackstop > TimerClaimDuration"},
+		{name: "backstop exactly the margin above the claim window", mutate: func(to *platform.Timeouts) {
+			to.ReviewRetriggerHoldBackstop = to.TimerClaimDuration + platform.MinTimeoutMargin
+			to.ReviewRetriggerDebounce = to.TimerClaimDuration
+		}},
+		{name: "backstop at the debounce window", mutate: func(to *platform.Timeouts) {
+			to.ReviewRetriggerHoldBackstop = to.ReviewRetriggerDebounce
+		}, wantChain: "ReviewRetriggerHoldBackstop > ReviewRetriggerDebounce"},
+		{name: "debounce window raised past the backstop", mutate: func(to *platform.Timeouts) {
+			to.ReviewRetriggerDebounce = to.ReviewRetriggerHoldBackstop + time.Minute
+		}, wantChain: "ReviewRetriggerHoldBackstop > ReviewRetriggerDebounce"},
+		{name: "backstop exactly the margin above the debounce window", mutate: func(to *platform.Timeouts) {
+			to.ReviewRetriggerHoldBackstop = to.ReviewRetriggerDebounce + platform.MinTimeoutMargin
+		}},
+		{name: "backstop at the turn deadline", mutate: func(to *platform.Timeouts) {
+			to.ReviewRetriggerHoldBackstop = to.TurnDeadline
+		}, wantChain: "TurnDeadline > ReviewRetriggerHoldBackstop"},
+		{name: "turn deadline lowered past the backstop", mutate: func(to *platform.Timeouts) {
+			to.TurnDeadline = to.ReviewRetriggerHoldBackstop - time.Minute
+		}, wantChain: "TurnDeadline > ReviewRetriggerHoldBackstop"},
+		{name: "backstop exactly the margin below the turn deadline", mutate: func(to *platform.Timeouts) {
+			to.ReviewRetriggerHoldBackstop = to.TurnDeadline - platform.MinTimeoutMargin
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			if tc.wantChain == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			found := false
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				for _, e := range joined.Unwrap() {
+					var inv *platform.TimeoutInvariantError
+					if errors.As(e, &inv) && inv.Chain == tc.wantChain {
+						found = true
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("Validate() = %v, want the broken link %q among its errors", err, tc.wantChain)
+			}
+		})
+	}
+}
+
 // TestValidate_DispatchRetryBackoff pins the durable dispatch trigger's
 // retry after a failed evaluation (technical plan §2): the shipped bounds
 // (one minute, one hour), and each link -- the shortest delay above the

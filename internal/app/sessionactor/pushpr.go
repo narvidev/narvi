@@ -462,7 +462,7 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 	}
 
 	now := time.Now()
-	if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+	if _, err := a.turnWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 		ID:          processing.ID,
 		Status:      sqlcgen.TurnStatus(to),
 		CompletedAt: pgtype.Timestamptz{Time: now, Valid: true},

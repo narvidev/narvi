@@ -209,6 +209,13 @@ type Actor struct {
 	sandboxCommitted *sandboxStatusKey
 	sandboxWritten   *sandboxStatusKey
 
+	// turnEnded is whether the CURRENT transact attempt wrote a terminal
+	// turn status through turnWrites (turnstatus.go): transact then wakes
+	// the re-review debounce in the same transaction, before it commits
+	// (technical plan §24.9). Reset on every transact entry and exit.
+	// Single-goroutine, like pendingBroadcast.
+	turnEnded bool
+
 	// revokedResendWarned is the turn and same-gen ready whose receipt
 	// re-send refuseResendIfRepoRevoked (repoentitlement.go) last refused
 	// because an administrator revoked the session's repository. That
@@ -506,6 +513,14 @@ func (a *Actor) appendRawEvent(ctx context.Context, tx pgx.Tx, eventType string,
 // call's own queue) each payload handed to a.broadcaster.Broadcast, once
 // per item, in order. A nil a.broadcaster (some tests construct an Actor
 // without one) is guarded against by skipping the loop entirely.
+//
+// Two writes ride on what fn wrote, in the same transaction, before the
+// commit: the sandbox_status event, when fn changed the sandbox's status or
+// generation through sandboxWrites (appendSandboxStatusIfChanged), and the
+// re-review debounce's wake-up, when fn ended a turn through turnWrites
+// (wakeReviewRetriggerIfTurnEnded, technical plan §24.9). Neither depends on
+// which handler fn is, so a new way to end a turn or move a sandbox owes
+// nothing more than going through its recorder.
 func (a *Actor) transact(ctx context.Context, fn func(ctx context.Context, tx pgx.Tx) error) error {
 	conn, err := a.pool.Acquire(ctx)
 	if err != nil {
@@ -532,9 +547,11 @@ func (a *Actor) transact(ctx context.Context, fn func(ctx context.Context, tx pg
 	}
 
 	a.sandboxWritten = nil
+	a.turnEnded = false
 	if err := fn(ctx, tx); err != nil {
 		a.pendingBroadcast = nil
 		a.sandboxWritten = nil
+		a.turnEnded = false
 		return err
 	}
 	// The sandbox_status event commits with the write it reports (§2), and
@@ -542,14 +559,25 @@ func (a *Actor) transact(ctx context.Context, fn func(ctx context.Context, tx pg
 	if err := a.appendSandboxStatusIfChanged(ctx, tx); err != nil {
 		a.pendingBroadcast = nil
 		a.sandboxWritten = nil
+		a.turnEnded = false
+		return err
+	}
+	// A turn that ended in this transaction wakes the re-review debounce in
+	// it too (technical plan §24.9), whichever writer ended it.
+	if err := a.wakeReviewRetriggerIfTurnEnded(ctx, tx); err != nil {
+		a.pendingBroadcast = nil
+		a.sandboxWritten = nil
+		a.turnEnded = false
 		return err
 	}
 
 	if err := tx.Commit(ctx); err != nil {
 		a.pendingBroadcast = nil
 		a.sandboxWritten = nil
+		a.turnEnded = false
 		return fmt.Errorf("sessionactor: transact: commit: %w", err)
 	}
+	a.turnEnded = false
 	if a.sandboxWritten != nil {
 		a.sandboxCommitted = a.sandboxWritten
 		a.sandboxWritten = nil
