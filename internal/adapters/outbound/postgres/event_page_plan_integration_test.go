@@ -4,6 +4,7 @@ package postgres_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
@@ -58,191 +60,362 @@ func pagePlanDatabase(ctx context.Context, t *testing.T) *pgxpool.Pool {
 	return pool
 }
 
-// TestEventPage_GenericPlanReadsTheSessionIndex pins the plan a page read
-// settles on (technical plan §6.2, §6.3). pgx caches each statement it
-// prepares on a connection, and Postgres, by default
-// (plan_cache_mode = auto), may run a cached statement on a generic plan
-// from its sixth run on -- a plan made without the parameters' values. On
-// a log of few sessions and many events, a young deployment's, the generic
-// plan of a page statement written with a plain `id > $2` bound scanned
-// the primary key from the cursor and filtered every other session's
-// events out: a page read went from about 2 ms to over 100 ms on the same
-// connection, growing with the whole table. Written as row comparisons on
-// (session_id, id), bounded on both sides, every lookup the walk makes --
-// its first event and each next one -- is a range of
-// events_session_id_id_idx under any plan, and the page's events are then
-// read by their ids.
-//
-// The log here is 200,000 events of 20 other sessions, interleaved, then
-// the read session's 300, analyzed. The test reads a page on one
-// connection more times than the planner's custom-plan threshold, so
-// every statement the read prepares is in that connection's cache, then
-// forces generic plans (plan_cache_mode = force_generic_plan) and reads
-// each statement's plan (EXPLAIN EXECUTE): every scan of events must be a
-// range of events_session_id_id_idx, or, for the read of the page's own
-// events, a lookup of events_pkey by their ids.
-func TestEventPage_GenericPlanReadsTheSessionIndex(t *testing.T) {
-	ctx := context.Background()
-	pool := pagePlanDatabase(ctx, t)
-	sessions := narvipg.NewSessionStore(pool)
+const (
+	// pageLookupMaxBuffers bounds the buffers one lookup of the page walk
+	// reads, on average over its loops: a descent of
+	// events_session_id_id_idx to the cursor and the event's heap page --
+	// four on these logs -- with room to spare. A lookup that reads the
+	// session's entries up to the cursor, or the rest of the session to
+	// sort them, reads hundreds.
+	pageLookupMaxBuffers = 10
+	// pageMaxRowsRemoved bounds the rows a scan of events filters out, per
+	// loop: a positioned lookup filters none, and a scan of events_pkey
+	// from the table's first id filters out every other session's events.
+	pageMaxRowsRemoved = 100
+)
 
-	others := make([]string, 20)
-	for i := range others {
+// TestEventPage_WalkIsPositionedOnTheSessionIndex pins how far a page read
+// scans (technical plan §6.2, §6.3). Each lookup of the walk
+// (ListEventPageExtentForSession, its first event and each next one) must
+// start at the cursor on events_session_id_id_idx and read a few buffers,
+// however deep the cursor, under a custom plan and under the generic plan
+// pgx's statement cache lets Postgres settle on from a statement's sixth
+// run; and the read of the page's events by their ids must read a few
+// buffers an id. Shapes that each passed an index-name check read far
+// more: a plain `id > $2` scanned events_pkey from the cursor across every
+// session under a generic plan; a plain `session_id = $1` beside the row
+// comparisons became the index scan's start key, so every lookup read the
+// session from its first event to the cursor, and paging a long session
+// was quadratic; and ORDER BY id alone, with no equality on session_id,
+// does not match the index's order, so a lookup sorts the rest of the
+// session or scans events_pkey from the table's first id.
+//
+// It reads two logs, since the planner's choice turns on how many
+// sessions it sees: few sessions sharing many events, interleaved, and
+// many sessions beside one long one; each followed by a new session of
+// 300 events. In each it reads the long session from its middle and the
+// new session from its start, with EXPLAIN (ANALYZE, BUFFERS) under
+// plan_cache_mode = force_custom_plan and force_generic_plan, and compares
+// the page's time with the plain read it replaced (ListForSession) on the
+// same events.
+func TestEventPage_WalkIsPositionedOnTheSessionIndex(t *testing.T) {
+	for _, log := range []struct {
+		name string
+		// others sessions share total events with the long session, which
+		// takes every longEvery-th.
+		others, total, longEvery int
+	}{
+		{name: "two sessions share 200,000 events", others: 1, total: 200_000, longEvery: 2},
+		{name: "200 sessions beside one of 50,000 events", others: 200, total: 150_000, longEvery: 3},
+	} {
+		t.Run(log.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := pagePlanDatabase(ctx, t)
+			long, middle, fresh := storePageWalkLog(ctx, t, pool, log.others, log.total, log.longEvery)
+			events := narvipg.NewEventStore(pool)
+
+			for _, read := range []struct {
+				name      string
+				sessionID pgtype.UUID
+				cursor    int64
+			}{
+				{name: "the long session from its middle", sessionID: long, cursor: middle},
+				{name: "a new session from its start", sessionID: fresh, cursor: 0},
+			} {
+				// Under the plan_cache_mode a deployment runs, once every
+				// statement has run more than five times.
+				if _, err := pool.Exec(ctx, `RESET plan_cache_mode`); err != nil {
+					t.Fatalf("reset plan_cache_mode: %v", err)
+				}
+				comparePageReadTime(ctx, t, events, read.name, read.sessionID, read.cursor)
+
+				page, err := events.ListPageForSession(ctx, read.sessionID, read.cursor, 100, platform.FetchHistoryMaxReplyBytes)
+				if err != nil {
+					t.Fatalf("ListPageForSession: %v", err)
+				}
+				if len(page.Events) != 100 {
+					t.Fatalf("%s: read %d events, want 100", read.name, len(page.Events))
+				}
+				ids := make([]string, len(page.Events))
+				for i, e := range page.Events {
+					if e.SessionID != read.sessionID || e.ID <= read.cursor {
+						t.Fatalf("%s: read event %d of another session or before the cursor", read.name, e.ID)
+					}
+					ids[i] = fmt.Sprint(e.ID)
+				}
+
+				for _, mode := range []string{"force_custom_plan", "force_generic_plan"} {
+					if _, err := pool.Exec(ctx, "SET plan_cache_mode = "+mode); err != nil {
+						t.Fatalf("set plan_cache_mode: %v", err)
+					}
+					extent := explainPageStatement(ctx, t, pool, "ListEventPageExtentForSession",
+						fmt.Sprintf("'%s'::uuid, %d, 100, %d", read.sessionID.String(), read.cursor, platform.FetchHistoryMaxReplyBytes))
+					t.Logf("%s, %s: the walk's lookups: %s", read.name, mode, extent)
+					if problem := pageWalkProblem(extent); problem != "" {
+						t.Errorf("%s, %s: the walk %s", read.name, mode, problem)
+					}
+					byIDs := explainPageStatement(ctx, t, pool, "ListEventsForSessionByIDs",
+						fmt.Sprintf("ARRAY[%s]::bigint[], '%s'::uuid", strings.Join(ids, ", "), read.sessionID.String()))
+					t.Logf("%s, %s: the read by ids: %s", read.name, mode, byIDs)
+					if problem := pageReadByIDsProblem(byIDs, len(ids)); problem != "" {
+						t.Errorf("%s, %s: the read by ids %s", read.name, mode, problem)
+					}
+				}
+			}
+		})
+	}
+}
+
+// storePageWalkLog stores total events across a long session and others
+// other sessions, interleaved -- the long session takes every
+// longEvery-th, the others the rest in turn -- then a new session's 300
+// events, and analyzes the table. It returns the long session, the id of
+// its event at the middle, and the new session.
+func storePageWalkLog(ctx context.Context, t *testing.T, pool *pgxpool.Pool, others, total, longEvery int) (long pgtype.UUID, middle int64, fresh pgtype.UUID) {
+	t.Helper()
+	sessions := narvipg.NewSessionStore(pool)
+	create := func() pgtype.UUID {
 		created, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb})
 		if err != nil {
 			t.Fatalf("create session: %v", err)
 		}
-		others[i] = created.ID.String()
+		return created.ID
+	}
+	long = create()
+	otherIDs := make([]string, others)
+	for i := range otherIDs {
+		otherIDs[i] = create().String()
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO events (session_id, type, message_id, payload)
-		SELECT ($1::uuid[])[1 + g % 20], 'warning', 'other-' || g, '{"type":"warning","message":"other"}'::jsonb
-		FROM generate_series(1, 200000) g`, others); err != nil {
-		t.Fatalf("store other sessions' events: %v", err)
+		SELECT CASE WHEN g % $3 = 0 THEN $2::uuid ELSE ($1::uuid[])[1 + g % cardinality($1::uuid[])] END,
+		       'warning', 'log-' || g, '{"type":"warning","message":"log"}'::jsonb
+		FROM generate_series(1, $4::int) g`, otherIDs, long, longEvery, total); err != nil {
+		t.Fatalf("store the log: %v", err)
 	}
-	read, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb})
-	if err != nil {
-		t.Fatalf("create session: %v", err)
-	}
+	fresh = create()
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO events (session_id, type, message_id, payload)
-		SELECT $1, 'warning', 'read-' || g, '{"type":"warning","message":"read"}'::jsonb
-		FROM generate_series(1, 300) g`, read.ID); err != nil {
-		t.Fatalf("store the read session's events: %v", err)
+		SELECT $1, 'warning', 'fresh-' || g, '{"type":"warning","message":"fresh"}'::jsonb
+		FROM generate_series(1, 300) g`, fresh); err != nil {
+		t.Fatalf("store the new session's events: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM events WHERE session_id = $1 ORDER BY id OFFSET $2 LIMIT 1`,
+		long, total/longEvery/2).Scan(&middle); err != nil {
+		t.Fatalf("find the long session's middle: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `ANALYZE events`); err != nil {
 		t.Fatalf("analyze events: %v", err)
 	}
+	return long, middle, fresh
+}
 
-	events := narvipg.NewEventStore(pool)
-	for i := 0; i < 8; i++ {
-		page, err := events.ListPageForSession(ctx, read.ID, 0, 100, platform.FetchHistoryMaxReplyBytes)
-		if err != nil {
+// comparePageReadTime fails when a page read takes more than ten times the
+// plain read it replaced, ListForSession, of the same 100 events, plus
+// 10 ms: the fastest of five runs each, after eight runs each, so both
+// have settled on the plan their statement cache gives them. A lookup
+// that scans the session up to its cursor, or every session from the
+// table's first id, takes seconds a page here.
+func comparePageReadTime(ctx context.Context, t *testing.T, events *narvipg.EventStore, name string, sessionID pgtype.UUID, cursor int64) {
+	t.Helper()
+	page := func() {
+		if _, err := events.ListPageForSession(ctx, sessionID, cursor, 100, platform.FetchHistoryMaxReplyBytes); err != nil {
 			t.Fatalf("ListPageForSession: %v", err)
 		}
-		if len(page.Events) != 100 {
-			t.Fatalf("read %d events, want the session's first 100", len(page.Events))
+	}
+	plain := func() {
+		if _, err := events.ListForSession(ctx, sessionID, cursor, 100); err != nil {
+			t.Fatalf("ListForSession: %v", err)
 		}
 	}
-
-	// Every plan read from here on is the generic one.
-	if _, err := pool.Exec(ctx, `SET plan_cache_mode = force_generic_plan`); err != nil {
-		t.Fatalf("force generic plans: %v", err)
-	}
-	for _, tc := range []struct {
-		statement string
-		args      string
-	}{
-		{statement: "ListEventPageExtentForSession", args: fmt.Sprintf("'%s'::uuid, 0, 100, %d", read.ID.String(), platform.FetchHistoryMaxReplyBytes)},
-		{statement: "ListEventsForSessionByIDs", args: fmt.Sprintf("ARRAY[1, 2, 3]::bigint[], '%s'::uuid", read.ID.String())},
-	} {
-		var name string
-		if err := pool.QueryRow(ctx,
-			`SELECT name FROM pg_prepared_statements WHERE statement LIKE $1`,
-			"-- name: "+tc.statement+" %").Scan(&name); err != nil {
-			t.Fatalf("find %s among the connection's prepared statements: %v", tc.statement, err)
-		}
-		rows, err := pool.Query(ctx, "EXPLAIN EXECUTE "+pgx.Identifier{name}.Sanitize()+"("+tc.args+")", pgx.QueryExecModeSimpleProtocol)
-		if err != nil {
-			t.Fatalf("explain %s: %v", tc.statement, err)
-		}
-		var plan []string
-		for rows.Next() {
-			var line string
-			if err := rows.Scan(&line); err != nil {
-				rows.Close()
-				t.Fatalf("read %s's plan: %v", tc.statement, err)
+	fastest := func(read func()) time.Duration {
+		best := time.Duration(1<<63 - 1)
+		for i := 0; i < 5; i++ {
+			start := time.Now()
+			read()
+			if took := time.Since(start); took < best {
+				best = took
 			}
-			plan = append(plan, line)
 		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			t.Fatalf("read %s's plan: %v", tc.statement, err)
-		}
-		joined := strings.Join(plan, "\n")
-		t.Logf("%s's generic plan:\n%s", tc.statement, joined)
-		if reason := pagePlanScansOtherSessions(joined); reason != "" {
-			t.Fatalf("%s's generic plan %s", tc.statement, reason)
-		}
+		return best
+	}
+	for i := 0; i < 8; i++ {
+		page()
+		plain()
+	}
+	pageTook, plainTook := fastest(page), fastest(plain)
+	t.Logf("%s: a page read took %v, the plain read %v", name, pageTook, plainTook)
+	if pageTook > 10*plainTook+10*time.Millisecond {
+		t.Errorf("%s: a page read took %v, over ten times the plain read's %v plus 10 ms", name, pageTook, plainTook)
 	}
 }
 
-// pagePlanScansOtherSessions returns why plan, the generic plan of a page
-// statement, may read events of other sessions than the one it pages, or
-// "" when it may not: every scan of events must be a range of
-// events_session_id_id_idx bounded by the session, or a lookup of
-// events_pkey by exact ids -- never a range of events_pkey, a bitmap or
-// sequential scan, which read whatever lies in an id range or the table.
-func pagePlanScansOtherSessions(plan string) string {
-	lines := strings.Split(plan, "\n")
-	scans := 0
-	for i, line := range lines {
-		switch {
-		case strings.Contains(line, "Seq Scan on events"), strings.Contains(line, "Bitmap Heap Scan on events"):
-			return "scans events by a sequential or bitmap scan"
-		case strings.Contains(line, "Index Scan using events_session_id_id_idx"), strings.Contains(line, "Index Only Scan using events_session_id_id_idx"):
-			scans++
-		case strings.Contains(line, "using events_pkey"):
-			cond := ""
-			if i+1 < len(lines) {
-				cond = lines[i+1]
+// pagePlanScan is one scan of events in an executed plan.
+type pagePlanScan struct {
+	Node, Index    string
+	Loops, Buffers float64
+	// RowsRemoved is per loop, as EXPLAIN gives it.
+	RowsRemoved float64
+}
+
+func (s pagePlanScan) String() string {
+	on := s.Node
+	if s.Index != "" {
+		on += " using " + s.Index
+	}
+	return fmt.Sprintf("%s: %.0f loops, %.0f buffers, %.0f rows removed a loop", on, s.Loops, s.Buffers, s.RowsRemoved)
+}
+
+// explainPageStatement runs the connection's prepared statement for the
+// named query, found by its sqlc name, with args, under EXPLAIN (ANALYZE,
+// BUFFERS), and returns every scan of events the plan ran.
+func explainPageStatement(ctx context.Context, t *testing.T, pool *pgxpool.Pool, statement, args string) []pagePlanScan {
+	t.Helper()
+	var name string
+	if err := pool.QueryRow(ctx,
+		`SELECT name FROM pg_prepared_statements WHERE statement LIKE $1`,
+		"-- name: "+statement+" %").Scan(&name); err != nil {
+		t.Fatalf("find %s among the connection's prepared statements: %v", statement, err)
+	}
+	var plan string
+	if err := pool.QueryRow(ctx,
+		"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE "+pgx.Identifier{name}.Sanitize()+"("+args+")",
+		pgx.QueryExecModeSimpleProtocol).Scan(&plan); err != nil {
+		t.Fatalf("explain %s: %v", statement, err)
+	}
+	scans, err := pagePlanScans(plan)
+	if err != nil {
+		t.Fatalf("read %s's plan: %v\n%s", statement, err, plan)
+	}
+	return scans
+}
+
+// pagePlanScans returns every scan of events in plan, EXPLAIN's JSON.
+func pagePlanScans(plan string) ([]pagePlanScan, error) {
+	type node struct {
+		NodeType    string  `json:"Node Type"`
+		Relation    string  `json:"Relation Name"`
+		Index       string  `json:"Index Name"`
+		Loops       float64 `json:"Actual Loops"`
+		RowsRemoved float64 `json:"Rows Removed by Filter"`
+		SharedHit   float64 `json:"Shared Hit Blocks"`
+		SharedRead  float64 `json:"Shared Read Blocks"`
+		Plans       []json.RawMessage
+	}
+	var top []struct {
+		Plan json.RawMessage `json:"Plan"`
+	}
+	if err := json.Unmarshal([]byte(plan), &top); err != nil {
+		return nil, err
+	}
+	if len(top) != 1 {
+		return nil, fmt.Errorf("%d plans, want one", len(top))
+	}
+	var scans []pagePlanScan
+	var walk func(raw json.RawMessage) error
+	walk = func(raw json.RawMessage) error {
+		var n node
+		if err := json.Unmarshal(raw, &n); err != nil {
+			return err
+		}
+		if n.Relation == "events" {
+			scans = append(scans, pagePlanScan{
+				Node: n.NodeType, Index: n.Index, Loops: n.Loops,
+				Buffers: n.SharedHit + n.SharedRead, RowsRemoved: n.RowsRemoved,
+			})
+		}
+		for _, child := range n.Plans {
+			if err := walk(child); err != nil {
+				return err
 			}
-			if !strings.Contains(cond, "Index Cond: (id = ANY (") {
-				return "scans a range of events_pkey"
-			}
-			scans++
-		case strings.Contains(line, "Scan") && strings.Contains(line, " on events"):
-			return "scans events by another index: " + strings.TrimSpace(line)
+		}
+		return nil
+	}
+	if err := walk(top[0].Plan); err != nil {
+		return nil, err
+	}
+	return scans, nil
+}
+
+// pageWalkProblem returns why the walk's scans, its first event's lookup
+// and each next one's, are not positioned at the cursor, or "".
+func pageWalkProblem(scans []pagePlanScan) string {
+	ran := 0
+	for _, s := range scans {
+		if s.Loops == 0 {
+			continue
+		}
+		ran++
+		if perLoop := s.Buffers / s.Loops; perLoop > pageLookupMaxBuffers {
+			return fmt.Sprintf("reads %.0f buffers a lookup, over %d (%s)", perLoop, pageLookupMaxBuffers, s)
+		}
+		if s.RowsRemoved > pageMaxRowsRemoved {
+			return fmt.Sprintf("filters out %.0f rows a lookup, over %d (%s)", s.RowsRemoved, pageMaxRowsRemoved, s)
 		}
 	}
-	if scans == 0 {
-		return "reads events through no index this test knows"
+	if ran < 2 {
+		return fmt.Sprintf("ran %d scans of events, want its first event's lookup and the next one's", ran)
 	}
 	return ""
 }
 
-// TestPagePlanScansOtherSessions pins pagePlanScansOtherSessions against
-// plans in the shapes Postgres 17 prints for page statements, those of the
-// page statements before and after they kept to the session index
-// included, so the plan test above fails on a scan that may read other
-// sessions' events, and only on one.
-func TestPagePlanScansOtherSessions(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		plan     string
-		rejected bool
-	}{
-		{name: "a range of the session index", plan: `Limit
-  ->  Index Scan using events_session_id_id_idx on events e
-        Index Cond: ((ROW(session_id, id) > ROW($1, $2)) AND (ROW(session_id, id) <= ROW($1, '9223372036854775807'::bigint)) AND (session_id = $1))`},
-		{name: "exact ids on the session index", plan: `Index Scan using events_session_id_id_idx on events
-  Index Cond: ((session_id = $2) AND (id = ANY ($1)))`},
-		{name: "exact ids on the primary key", plan: `Index Scan using events_pkey on events
-  Index Cond: (id = ANY ($1))
-  Filter: (session_id = $2)`},
-		{name: "a range of the primary key", rejected: true, plan: `Limit
-  ->  Index Scan using events_pkey on events e
-        Index Cond: (id > $2)
-        Filter: (session_id = $1)`},
-		{name: "a range of the primary key between two ids", rejected: true, plan: `Index Scan using events_pkey on events
-  Index Cond: ((id >= ($1)[1]) AND (id <= ($1)[cardinality($1)]))
-  Filter: (session_id = $2)`},
-		{name: "a bitmap scan", rejected: true, plan: `Sort
-  ->  Bitmap Heap Scan on events
-        Recheck Cond: (session_id = $1)
-        ->  Bitmap Index Scan on events_session_id_message_id_idx
-              Index Cond: (session_id = $1)`},
-		{name: "a sequential scan", rejected: true, plan: `Seq Scan on events
-  Filter: (session_id = $1)`},
-		{name: "another index", rejected: true, plan: `Index Scan using events_session_id_message_id_idx on events
-  Index Cond: (session_id = $1)`},
-		{name: "no scan of events", rejected: true, plan: `Result`},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			reason := pagePlanScansOtherSessions(tc.plan)
-			if (reason != "") != tc.rejected {
-				t.Fatalf("pagePlanScansOtherSessions = %q, want rejected = %v", reason, tc.rejected)
-			}
-		})
+// pageReadByIDsProblem returns why the read of a page's ids events reads
+// more than a few buffers an id, or filters rows out, or "".
+func pageReadByIDsProblem(scans []pagePlanScan, ids int) string {
+	buffers := 0.0
+	for _, s := range scans {
+		buffers += s.Buffers
+		if s.RowsRemoved > pageMaxRowsRemoved {
+			return fmt.Sprintf("filters out %.0f rows a loop, over %d (%s)", s.RowsRemoved, pageMaxRowsRemoved, s)
+		}
+	}
+	if len(scans) == 0 {
+		return "ran no scan of events"
+	}
+	if limit := float64(pageLookupMaxBuffers * ids); buffers > limit {
+		return fmt.Sprintf("reads %.0f buffers for %d ids, over %.0f", buffers, ids, limit)
+	}
+	return ""
+}
+
+// TestPagePlanScans pins how the plan test above reads a plan: every scan
+// of events, at any depth, its buffers summed over its loops and its rows
+// removed per loop, as EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) gives them.
+func TestPagePlanScans(t *testing.T) {
+	const plan = `[{"Plan": {"Node Type": "Sort", "Actual Loops": 1, "Shared Hit Blocks": 520, "Plans": [
+		{"Node Type": "CTE Scan", "Actual Loops": 1, "Shared Hit Blocks": 520, "Plans": [
+			{"Node Type": "Recursive Union", "Actual Loops": 1, "Shared Hit Blocks": 520, "Plans": [
+				{"Node Type": "Limit", "Actual Loops": 1, "Shared Hit Blocks": 4, "Plans": [
+					{"Node Type": "Index Scan", "Relation Name": "events", "Index Name": "events_session_id_id_idx",
+					 "Actual Loops": 1, "Shared Hit Blocks": 3, "Shared Read Blocks": 1}]},
+				{"Node Type": "Limit", "Actual Loops": 99, "Shared Hit Blocks": 516, "Plans": [
+					{"Node Type": "Index Scan", "Relation Name": "events", "Index Name": "events_pkey",
+					 "Actual Loops": 99, "Rows Removed by Filter": 400101, "Shared Hit Blocks": 500, "Shared Read Blocks": 16}]}]}]}]},
+		"Planning Time": 0.1, "Execution Time": 2.5}]`
+	scans, err := pagePlanScans(plan)
+	if err != nil {
+		t.Fatalf("pagePlanScans: %v", err)
+	}
+	want := []pagePlanScan{
+		{Node: "Index Scan", Index: "events_session_id_id_idx", Loops: 1, Buffers: 4},
+		{Node: "Index Scan", Index: "events_pkey", Loops: 99, Buffers: 516, RowsRemoved: 400101},
+	}
+	if fmt.Sprint(scans) != fmt.Sprint(want) {
+		t.Fatalf("pagePlanScans = %v, want %v", scans, want)
+	}
+	if problem := pageWalkProblem(want[:1]); problem == "" {
+		t.Error("pageWalkProblem passes a walk of one lookup")
+	}
+	if problem := pageWalkProblem(want); !strings.Contains(problem, "filters out 400101 rows") {
+		t.Errorf("pageWalkProblem = %q, want the rows the second lookup filters out", problem)
+	}
+	deep := []pagePlanScan{want[0], {Node: "Index Scan", Index: "events_session_id_id_idx", Loops: 99, Buffers: 99 * 380}}
+	if problem := pageWalkProblem(deep); !strings.Contains(problem, "reads 380 buffers a lookup") {
+		t.Errorf("pageWalkProblem = %q, want the buffers the second lookup reads", problem)
+	}
+	positioned := []pagePlanScan{want[0], {Node: "Index Scan", Index: "events_session_id_id_idx", Loops: 99, Buffers: 99 * 4}}
+	if problem := pageWalkProblem(positioned); problem != "" {
+		t.Errorf("pageWalkProblem = %q for a positioned walk, want none", problem)
 	}
 }

@@ -126,13 +126,25 @@ LIMIT $3;
 -- text is never shorter than its compacted form, so a page that fits by
 -- this measure fits as written.
 --
--- Every lookup is a range of events_session_id_id_idx, whatever the plan:
--- the bounds are row comparisons on (session_id, id), on both sides, the
--- upper one the largest id. pgx caches this statement on each connection,
--- and Postgres may run it on a generic plan from its sixth run on, made
--- without the parameters' values; a plain `id > $2` let that plan scan
--- events_pkey from the cursor and filter every other session's events out,
--- a scan that grows with the whole table (TestEventPage_GenericPlanReadsTheSessionIndex).
+-- Every lookup starts at the cursor on events_session_id_id_idx and reads
+-- one entry, a few buffers however deep the cursor, under a custom plan and
+-- a generic one alike (TestEventPage_WalkIsPositionedOnTheSessionIndex).
+-- pgx caches this statement on each connection, and Postgres may run it on
+-- a generic plan from its sixth run on, made without the parameters'
+-- values. So the lookup is written as exactly two row comparisons on
+-- (session_id, id), the upper one at the largest id, which together hold
+-- it to the session, and is ordered by (session_id, id), the index's own
+-- order: the index scan then starts at (session_id, cursor) and the LIMIT
+-- stops it at the next entry. Each other shape tried read far more:
+--   - a plain `id > $2` let a generic plan scan events_pkey from the
+--     cursor and filter every other session's events out;
+--   - a plain `session_id = $1` beside the row comparisons becomes the
+--     index scan's start key in place of the cursor, so each lookup reads
+--     the session from its first event, and paging a long session is
+--     quadratic -- or the planner scans events_pkey from the table's
+--     first id;
+--   - ORDER BY id alone, without that equality, is not the index's order,
+--     and the planner scans events_pkey from the table's first id.
 --
 -- The non-recursive term reads its one event in a subquery with LIMIT, and
 -- each payload's text is computed once, behind OFFSET 0, so the measure is
@@ -147,10 +159,9 @@ WITH RECURSIVE page (id, n, running) AS (
                 + 6 * octet_length(head.type) + 128)::bigint
         FROM (
             SELECT e.id, e.type, e.payload FROM events e
-            WHERE e.session_id = sqlc.arg(session_id)
-              AND (e.session_id, e.id) > (sqlc.arg(session_id)::uuid, sqlc.arg(after_id)::bigint)
+            WHERE (e.session_id, e.id) > (sqlc.arg(session_id)::uuid, sqlc.arg(after_id)::bigint)
               AND (e.session_id, e.id) <= (sqlc.arg(session_id)::uuid, 9223372036854775807::bigint)
-            ORDER BY e.id ASC
+            ORDER BY e.session_id ASC, e.id ASC
             LIMIT 1
         ) head
         CROSS JOIN LATERAL (SELECT head.payload::text AS p OFFSET 0) t
@@ -165,10 +176,9 @@ WITH RECURSIVE page (id, n, running) AS (
         FROM page
         CROSS JOIN LATERAL (
             SELECT e.id, e.type, e.payload FROM events e
-            WHERE e.session_id = sqlc.arg(session_id)
-              AND (e.session_id, e.id) > (sqlc.arg(session_id)::uuid, page.id)
+            WHERE (e.session_id, e.id) > (sqlc.arg(session_id)::uuid, page.id)
               AND (e.session_id, e.id) <= (sqlc.arg(session_id)::uuid, 9223372036854775807::bigint)
-            ORDER BY e.id ASC
+            ORDER BY e.session_id ASC, e.id ASC
             LIMIT 1
         ) nxt
         CROSS JOIN LATERAL (SELECT nxt.payload::text AS p OFFSET 0) t
