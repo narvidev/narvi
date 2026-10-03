@@ -57,18 +57,18 @@ import (
 // can drift to a DIFFERENT wording").
 const planContentFallbackText = plandomain.ContentFallbackText
 
-// planContentEventFetchLimit bounds how many of the session's own MOST
-// RECENT events this reads back (a.stores.event.ListRecentForSession,
-// newest-first) -- generous for a single plan-mode turn's own streamed
-// output (a turn's own text/tool-call event count is overwhelmingly never
-// anywhere near this many), while still being a fixed, safe upper bound
-// rather than an unbounded full-table scan. Deliberately anchored to the
-// TAIL of the session's event log, not the beginning: a long-lived session
-// (many prior turns) can easily have accumulated more than this many
-// events in total by the time a LATER plan-mode turn completes, and this
-// turn's own token events -- the most recent activity in the session --
-// must still be found within the fetched window regardless of how much
-// earlier history precedes them.
+// planContentEventFetchLimit bounds how many `token` frames of one turn's
+// window of the log a reader of its final text reads back
+// (EventStore.ListTokenFramesInWindow, newest first, ReadWindowFinal):
+// generous for a single turn's own text parts -- two frames a part on the
+// pinned runtime -- while still a fixed, safe upper bound rather than an
+// unbounded scan. It bounds the turn's own frames, never the session's
+// tail: every reader of a turn's text reads that turn's window, of `token`
+// frames only, so neither the history before the turn nor what the session
+// logged after it -- the tool calls, results and step ends a turn stores
+// since technical plan §6.1's "Stored tool events", about four rows a step
+// -- can push the turn's text out of what is read, and no tool payload is
+// read along with it.
 const planContentEventFetchLimit = 2000
 
 // tokenEventPayload is the minimal shape this function reads out of a
@@ -93,14 +93,12 @@ type tokenEventPayload struct {
 }
 
 // planContentText best-effort recovers processing's own final streamed
-// assistant text -- the plan document's own actual content -- by fetching
-// the session's own event log, NEWEST FIRST (a.stores.event.
-// ListRecentForSession, pool-based per EventStore's own doc comment, so
-// this is always a plain read of already-committed rows, safe to call from
-// inside completeProcessingTurn's own transact), converting it to
-// plandomain.ContentEvent (decoding each "token" event's own raw payload;
-// every other event type carries no Text this scan needs), and delegating
-// the actual scan to plandomain.ExtractContent -- bounded below by
+// assistant text -- the plan document's own actual content -- by reading
+// the `token` frames of processing's own window of the event log, NEWEST
+// FIRST (ReadWindowFinal over a.stores.event, pool-based per EventStore's
+// own doc comment, so this is always a plain read of already-committed
+// rows, safe to call from inside completeProcessingTurn's own transact),
+// and scanning them as plandomain.ExtractContent does -- bounded below by
 // processing's own DispatchedEventID (the monotonic events.id watermark
 // stamped at dispatch, NOT a created_at/dispatched_at timestamp comparison:
 // the latter straddles the Postgres server clock and the application
@@ -124,22 +122,30 @@ type tokenEventPayload struct {
 // ErrPlanCut). A cut is settled by the time this runs: the notice goes out
 // as the turn completes, and no `token` frame adds a row once its turn has
 // ended (tokenframe.go).
+//
+// It reads the turn's own window rather than the session's newest 2000
+// events: a turn that streams its plan and then calls tools stores about
+// four rows a step after the text, and enough of them pushed the text out
+// of the tail, where the window keeps it.
 func (a *Actor) planContentText(ctx context.Context, processing sqlcgen.Turn) plandomain.Final {
-	events, err := a.stores.event.ListRecentForSession(ctx, a.sessionID, planContentEventFetchLimit)
+	final, found, err := ReadWindowFinal(ctx, a.stores.event, a.sessionID, processing.DispatchedEventID, nil)
 	if err != nil {
-		a.logger.Warn("sessionactor: list events for plan content extraction failed", "error", err)
+		a.logger.Warn("sessionactor: list token frames for plan content extraction failed", "error", err)
 		return plandomain.Final{Text: planContentFallbackText}
 	}
-
-	return plandomain.ExtractContent(ToContentEvents(events), processing.DispatchedEventID, nil)
+	if !found {
+		return plandomain.Final{Text: planContentFallbackText}
+	}
+	return final
 }
 
 // ToContentEvents converts a []sqlcgen.Event (newest-first, as
-// ListRecentForSession returns) into plandomain.ExtractContent's own
-// adapter-independent input shape -- the ONE conversion point the plan-mode
-// UI's own second caller (internal/adapters/inbound/httpapi/plans.go) also reuses,
-// so the sqlcgen.Event -> plandomain.ContentEvent boundary conversion
-// itself never drifts between the two call sites either. A "token" event
+// ListTokenFramesInWindow and ListRecentForSession return them) into
+// plandomain.ExtractContent's own adapter-independent input shape -- the ONE
+// conversion point every reader of a turn's text goes through
+// (ReadWindowFinal, and the tests that read a session's tail), so the
+// sqlcgen.Event -> plandomain.ContentEvent boundary conversion itself never
+// drifts between call sites. A "token" event
 // carries its payload's messageId (the text part's id) and text; every
 // other event type carries neither. A "token" event whose payload fails to
 // decode degrades to an empty Text (silently skipped by ExtractContent,
@@ -223,9 +229,8 @@ func TurnContentBounds(sessionTurns []sqlcgen.Turn, turnID pgtype.UUID) (lower, 
 // through it, in one read (httpapi.DecidePlanOnTx, which passes its own
 // transaction's TurnStore), and so does the decision inbox's cut report, so
 // the inbox never offers Approve for a plan the approval would refuse.
-// Reading the window rather than the session's 2000-event tail
-// (planContentText's read, a turn-completion-time read of the newest turn)
-// finds a plan's text however much the session has logged since.
+// Reading the window (ReadWindowFinal) rather than the session's newest
+// events finds a plan's text however much the session has logged since.
 func ReadPlanFinal(ctx context.Context, turns *postgres.TurnStore, events *postgres.EventStore, sessionID, turnID pgtype.UUID) (final plandomain.Final, found bool, err error) {
 	sessionTurns, err := turns.ListForSession(ctx, sessionID)
 	if err != nil {
@@ -235,9 +240,33 @@ func ReadPlanFinal(ctx context.Context, turns *postgres.TurnStore, events *postg
 	if !ok {
 		return plandomain.Final{}, false, nil
 	}
-	frames, err := events.ListTokenFramesInWindow(ctx, sessionID, *lower, upper, planContentEventFetchLimit)
+	return ReadWindowFinal(ctx, events, sessionID, lower, upper)
+}
+
+// ReadWindowFinal reads the final text of the turn whose window of
+// sessionID's log is (lower, upper] -- TurnContentBounds' bounds, upper nil
+// for the session's most recently dispatched turn -- as plandomain.FinalText
+// reads it, with the cut it reports: the window's `token` frames, newest
+// first, up to planContentEventFetchLimit (EventStore.ListTokenFramesInWindow,
+// a range of events_session_id_id_idx bounded by the turn, of which only
+// the token rows are read). A nil lower reads from the log's start, as
+// FinalText reads a nil lower bound. found is false when the window holds
+// no text.
+//
+// Every reader of a turn's text reads it here -- the approval and its
+// snapshot, the decision inbox, the plan views' fallback, the session
+// result's summary and the plan notices (planContentText) -- so none reads
+// the session's newest 2000 events of every type, whose window a later
+// turn's tool activity pushed an earlier turn's text out of, and whose read
+// carried every tool payload in it.
+func ReadWindowFinal(ctx context.Context, events *postgres.EventStore, sessionID pgtype.UUID, lower, upper *int64) (final plandomain.Final, found bool, err error) {
+	var lowerID int64
+	if lower != nil {
+		lowerID = *lower
+	}
+	frames, err := events.ListTokenFramesInWindow(ctx, sessionID, lowerID, upper, planContentEventFetchLimit)
 	if err != nil {
-		return plandomain.Final{}, false, fmt.Errorf("sessionactor: list token frames for plan final text: %w", err)
+		return plandomain.Final{}, false, fmt.Errorf("sessionactor: list token frames for a turn's final text: %w", err)
 	}
 	final, found = plandomain.FinalText(ToContentEvents(frames), lower, upper)
 	return final, found, nil

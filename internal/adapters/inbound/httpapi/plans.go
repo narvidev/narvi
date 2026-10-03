@@ -70,16 +70,6 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// planContentEventFetchLimit mirrors internal/app/sessionactor/
-// planapprovalcontent.go's own identically-named, identically-justified
-// constant (a fixed, safe upper bound on how much of the session's own
-// event-log TAIL this reads back, generous for any one turn's own streamed
-// output) -- kept as this package's own separate copy rather than an
-// exported cross-package constant, since the two callers' own tuning
-// concerns are independent (this one scans once per REQUEST, across
-// potentially several plan versions, not once per turn completion).
-const planContentEventFetchLimit = 2000
-
 // ListPlans backs GET /api/sessions/{sessionID}/plans (audit finding M3,
 // completeness). Session existence is checked first -- 404 if it doesn't
 // exist; otherwise every plan VERSION for the session (PlanStore.
@@ -145,28 +135,28 @@ type planRenderedContent struct {
 //
 // The durable plan_documents snapshot (migrations/000112_plan_documents.
 // up.sql, written once at approval time by decideplan.go's own
-// snapshotApprovedPlanContent) is now the FIRST choice, not merely a
-// coverage-measurement side table nothing in production ever read: past
-// this package's own planContentEventFetchLimit, the live recompute below
-// can only return plandomain.ContentFallbackText even though the exact
-// approved prose sits durably in that snapshot. The bounded live recompute
-// (exactly what this function did before the snapshot existed) is now the
-// FALLBACK, used only where no USABLE snapshot exists -- see
-// planDocumentSnapshotMap and resolvePlanRenderedContent below for the
+// snapshotApprovedPlanContent) is the FIRST choice: it is the record of what
+// a person approved, which a live recompute could only match or contradict.
+// The live recompute (exactly what this function did before the snapshot
+// existed) is the FALLBACK, used only where no USABLE snapshot exists --
+// see planDocumentSnapshotMap and resolvePlanRenderedContent below for the
 // precise three-way rule (no row / usable row / row with NULL content).
 //
 // ONE snapshot batch fetch (planDocumentSnapshotMap) always runs, and is
 // shared across every plan version in the session -- re-fetching it per plan
-// would be pure waste against the SAME underlying rows. The live-recompute
-// inputs -- ONE turns query (turns.ListForSession) and ONE events fetch (the
-// session's own most recent planContentEventFetchLimit events, newest
-// first, exactly like planapprovalcontent.go's own single-turn fetch) -- are
-// fetched AFTER the snapshot batch, and only when at least one plan row
-// lacks a usable snapshot (usablePlanSnapshot): when every row is usable,
-// resolvePlanRenderedContent takes the snapshot branch for all of them and
-// never consults either fetch, so skipping both is safe and is the whole
+// would be pure waste against the SAME underlying rows. The live recompute
+// reads ONE turns query (turns.ListForSession), fetched AFTER the snapshot
+// batch and only when at least one plan row lacks a usable snapshot
+// (usablePlanSnapshot), and, for each such row, its producing turn's own
+// window of the log (sessionactor.ReadWindowFinal: that window's `token`
+// frames, the read the approval and the decision inbox make). When every
+// row is usable, resolvePlanRenderedContent takes the snapshot branch for
+// all of them and reads neither, so skipping both is safe and is the whole
 // point of making the snapshot the first choice rather than merely trying
-// it first while still paying for the fallback unconditionally.
+// it first while still paying for the fallback unconditionally. It read
+// the session's newest 2000 events once, until a later turn's tool
+// activity -- about four rows a step -- pushed an awaiting, rejected or
+// superseded plan's text out of that tail.
 //
 // Bounds for the live recompute are derived from EVERY turn dispatched in
 // the session (turns.ListForSession), not only the plan-producing ones: a
@@ -190,15 +180,13 @@ func planContentMap(ctx context.Context, turns *postgres.TurnStore, events *post
 		return nil, err
 	}
 
-	// The live-recompute inputs (allTurns/contentEvents) are only fetched
-	// when at least one plan row lacks a usable snapshot -- see
-	// usablePlanSnapshot's own doc comment for why this predicate MUST be
-	// identical to the one resolvePlanRenderedContent below branches on.
-	// When every row is usable, both fetches (a turns query and a bounded
-	// 2000-event scan) are pure waste: resolvePlanRenderedContent will take
-	// the snapshot branch for every row and never consult allTurns/
-	// contentEvents, which is exactly the case the snapshot-first design
-	// was meant to make cheap.
+	// The live recompute's turns are only fetched when at least one plan
+	// row lacks a usable snapshot -- see usablePlanSnapshot's own doc
+	// comment for why this predicate MUST be identical to the one
+	// resolvePlanRenderedContent below branches on. When every row is
+	// usable, the fetch is pure waste: resolvePlanRenderedContent will take
+	// the snapshot branch for every row and never consult allTurns, which is
+	// exactly the case the snapshot-first design was meant to make cheap.
 	needsFallback := false
 	for _, p := range planRows {
 		snapshot, snapshotOK := snapshotByPlanID[p.ID.String()]
@@ -209,25 +197,18 @@ func planContentMap(ctx context.Context, turns *postgres.TurnStore, events *post
 	}
 
 	var allTurns []sqlcgen.Turn
-	var contentEvents []plandomain.ContentEvent
 	if needsFallback {
 		var err error
 		allTurns, err = turns.ListForSession(ctx, sessionID)
 		if err != nil {
 			return nil, err
 		}
-
-		recentEvents, err := events.ListRecentForSession(ctx, sessionID, planContentEventFetchLimit)
-		if err != nil {
-			return nil, err
-		}
-		contentEvents = sessionactor.ToContentEvents(recentEvents)
 	}
 
 	out := make(map[string]planRenderedContent, len(planRows))
 	for _, p := range planRows {
 		snapshot, snapshotOK := snapshotByPlanID[p.ID.String()]
-		rendered, err := resolvePlanRenderedContent(p, snapshot, snapshotOK, allTurns, contentEvents)
+		rendered, err := resolvePlanRenderedContent(ctx, events, p, snapshot, snapshotOK, allTurns)
 		if err != nil {
 			return nil, err
 		}
@@ -308,7 +289,7 @@ func usablePlanSnapshot(snapshot sqlcgen.PlanDocument, snapshotOK bool) bool {
 // binary built before cuts existed -- the accepted rollback-window residue
 // -- keeps its marker in its content and reports no cut, by design: it is
 // the record of what a person approved.
-func resolvePlanRenderedContent(planRow sqlcgen.Plan, snapshot sqlcgen.PlanDocument, snapshotOK bool, allTurns []sqlcgen.Turn, contentEvents []plandomain.ContentEvent) (planRenderedContent, error) {
+func resolvePlanRenderedContent(ctx context.Context, events *postgres.EventStore, planRow sqlcgen.Plan, snapshot sqlcgen.PlanDocument, snapshotOK bool, allTurns []sqlcgen.Turn) (planRenderedContent, error) {
 	if usablePlanSnapshot(snapshot, snapshotOK) {
 		content := *snapshot.Content
 		if snapshot.StructuredSteps != nil {
@@ -323,7 +304,13 @@ func resolvePlanRenderedContent(planRow sqlcgen.Plan, snapshot sqlcgen.PlanDocum
 
 	final := plandomain.Final{Text: plandomain.ContentFallbackText}
 	if lower, upper, ok := sessionactor.TurnContentBounds(allTurns, planRow.TurnID); ok {
-		final = plandomain.ExtractContent(contentEvents, lower, upper)
+		read, found, err := sessionactor.ReadWindowFinal(ctx, events, planRow.SessionID, lower, upper)
+		if err != nil {
+			return planRenderedContent{}, err
+		}
+		if found {
+			final = read
+		}
 	}
 	// Defensive: the !ok branch above (plans.turn_id names no dispatched
 	// turn) should be unreachable in practice -- plans.turn_id is a NOT

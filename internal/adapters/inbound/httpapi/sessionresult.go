@@ -25,7 +25,6 @@ import (
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowscm"
-	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/domain/session"
@@ -427,13 +426,17 @@ func readLastRun(ctx context.Context, st resultStores, sessionID pgtype.UUID, fa
 	// next dispatched turn's), read by the one reader of a turn's final
 	// text, with the cut it reports when that text is a frame the
 	// sandbox-agent cut (technical plan §6.1). A run never dispatched has no
-	// window, and no text.
+	// window, and no text. It reads the window's own `token` frames
+	// (sessionactor.ReadWindowFinal), never the session's newest events: a
+	// newer turn in flight logs its tool calls, results and step ends, about
+	// four rows a step, and enough of them pushed this run's text out of
+	// that tail.
 	if lower, upper, ok := sessionactor.TurnContentBounds(turns, run.ID); ok {
-		events, err := st.events.ListRecentForSession(ctx, sessionID, planContentEventFetchLimit)
+		final, found, err := sessionactor.ReadWindowFinal(ctx, st.events, sessionID, lower, upper)
 		if err != nil {
 			return nil, err
 		}
-		if final, found := plandomain.FinalText(sessionactor.ToContentEvents(events), lower, upper); found {
+		if found {
 			capped, truncated := capSummary(final.Text)
 			out.Summary = restdtos.SessionOutcomeLastRunSummary{Text: &capped, Truncated: truncated}
 			if final.Cut != nil {

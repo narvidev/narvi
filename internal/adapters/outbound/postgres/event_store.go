@@ -239,10 +239,11 @@ func eventPageFit(extent []sqlcgen.ListEventPageExtentForSessionRow, maxBytes in
 
 // ListRecentForSession returns up to limit of sessionID's own MOST RECENT
 // events, newest id first -- the mirror-image pagination direction of
-// ListForSession's own oldest-first cursor page. Used when a caller needs
-// only the TAIL of a possibly-long event log (e.g. sessionactor's own
-// best-effort plan-content extraction, §8.1) rather than a paginated
-// walk from the very beginning of a session's entire history.
+// ListForSession's own oldest-first cursor page, for a caller that needs
+// only the TAIL of a possibly-long event log. No reader of a turn's text
+// uses it: each reads its turn's own window of `token` frames
+// (ListTokenFramesInWindow), which a later turn's tool activity cannot push
+// its text out of.
 func (s *EventStore) ListRecentForSession(ctx context.Context, sessionID pgtype.UUID, limit int32) ([]sqlcgen.Event, error) {
 	return s.q.ListRecentEventsForSession(ctx, sqlcgen.ListRecentEventsForSessionParams{
 		SessionID: sessionID,

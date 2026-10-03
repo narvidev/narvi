@@ -560,13 +560,15 @@ type ListRecentEventsForSessionParams struct {
 // The mirror-image pagination direction from ListEventsForSession's own
 // oldest-first cursor page: returns up to $2 of session_id's own MOST
 // RECENT events, newest id first -- for a caller that needs only the TAIL
-// of a possibly-long event log (e.g. sessionactor.planContentText's own
-// best-effort plan-content extraction, §8.1) without scanning forward
-// from the very beginning of a session's entire history, which for a
-// long-lived session (many prior turns) could leave the CURRENT turn's
-// own events entirely outside a bounded oldest-first window. Same
-// events_session_id_id_idx index (migrations/000008_events.up.sql) serves
-// this DESC scan equally well.
+// of a possibly-long event log, without scanning forward from the very
+// beginning of a session's entire history. Same events_session_id_id_idx
+// index (migrations/000008_events.up.sql) serves this DESC scan equally
+// well. No reader of a turn's text uses it any more: each reads its turn's
+// own window of `token` frames (ListTokenFramesInWindow,
+// sessionactor.ReadWindowFinal), since a later turn's tool calls, results
+// and step ends, about four rows a step, pushed an earlier turn's text out
+// of a tail of every type, whose read also carried every tool payload in
+// it.
 func (q *Queries) ListRecentEventsForSession(ctx context.Context, arg ListRecentEventsForSessionParams) ([]Event, error) {
 	rows, err := q.db.Query(ctx, listRecentEventsForSession, arg.SessionID, arg.Limit)
 	if err != nil {
@@ -831,10 +833,12 @@ type ListTokenFramesInWindowParams struct {
 // dispatched_event_id, inclusive -- the bounds plan.FinalText applies,
 // sessionactor.TurnContentBounds). The decision inbox reads each awaiting
 // plan's final text through it, to report a cut plan (technical plan §16,
-// §6.1), instead of the 2000-event tail planContentText reads: a range on
-// events_session_id_id_idx (migrations/000008_events.up.sql) bounded by the
-// turn, of which only the token rows are returned. Capped by row_limit,
-// newest first, like every other bounded read of the log.
+// §6.1), and so does every other reader of a turn's text
+// (sessionactor.ReadWindowFinal: the approval and its snapshot, the plan
+// views' fallback, the session result's summary, the plan notices): a
+// range bounded by the turn, of which only the token rows are returned.
+// Capped by row_limit, newest first, like every other bounded read of the
+// log.
 func (q *Queries) ListTokenFramesInWindow(ctx context.Context, arg ListTokenFramesInWindowParams) ([]Event, error) {
 	rows, err := q.db.Query(ctx, listTokenFramesInWindow,
 		arg.SessionID,

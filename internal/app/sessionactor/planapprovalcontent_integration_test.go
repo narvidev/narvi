@@ -114,3 +114,74 @@ func TestPlanContentText_LongEventHistory_StillFindsCurrentTurnsTokenText(t *tes
 		t.Errorf("Text = %q, want %q (the plan-mode turn's own real token text, not the fallback)", payload.Text, wantPlanText)
 	}
 }
+
+// TestPlanContentText_ToolRowsAfterTheTextPastTheTail_StillFindsIt: a
+// plan-mode turn streams its plan, then works through 600 tool steps of
+// its own before it completes -- about four stored rows a step, since a
+// turn's tool calls, results and step ends are stored (technical plan
+// §6.1). The plan's text then lies more than 2000 rows below the log's end,
+// past the newest-2000 tail planContentText read it from before, which
+// sent the Slack approval notice the placeholder. It reads the turn's own
+// window now, and the notice carries the plan.
+func TestPlanContentText_ToolRowsAfterTheTextPastTheTail_StillFindsIt(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	sessionID := createTestSessionWithSpawnSource(ctx, t, pool, sqlcgen.SessionSpawnSourceSlack)
+	if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	if _, ok, err := narvipg.NewSlackThreadSessionStore(pool).Claim(ctx, "C123", "1700000000.000100", sessionID); err != nil || !ok {
+		t.Fatalf("claim slack thread session: ok=%v err=%v", ok, err)
+	}
+	turnStore := narvipg.NewTurnStore(pool)
+	turn := createProcessingTurnWithPlanMode(ctx, t, turnStore, sessionID, true, nil)
+	watermark, err := narvipg.NewEventStore(pool).MaxEventIDForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("read the watermark: %v", err)
+	}
+	if _, err := turnStore.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: turn.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedEventID: &watermark}); err != nil {
+		t.Fatalf("stamp dispatched_event_id: %v", err)
+	}
+
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	const wantPlanText = "1. Add the column\n2. Backfill it"
+	sendTokenFrame(ctx, t, a, sessionID, "prt_plan", "")
+	sendTokenFrame(ctx, t, a, sessionID, "prt_plan", wantPlanText)
+	// The turn's own tool steps after its plan, stored as the actor stores
+	// them (toolevent.go), in one statement for speed.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO events (session_id, type, message_id, payload)
+		SELECT $1, kind.type,
+		       CASE kind.type WHEN 'step_start' THEN 'msg_' || s ELSE 'msg_' || s || '#' || kind.type || ':c' || s END,
+		       jsonb_build_object('type', kind.type, 'messageId', 'msg_' || s, 'output', jsonb_build_object('output', repeat('o', 200)))
+		FROM generate_series(1, 600) s
+		CROSS JOIN LATERAL (VALUES (1, 'step_start'), (2, 'tool_call'), (3, 'tool_result'), (4, 'step_finish')) AS kind(ord, type)
+		ORDER BY s, kind.ord`, sessionID); err != nil {
+		t.Fatalf("store the turn's tool steps: %v", err)
+	}
+
+	sendSandboxEventForTest(ctx, t, a, SandboxEvent{
+		Type: "execution_complete",
+		Gen:  1,
+		Raw:  executionCompleteRaw(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeCompleted),
+	})
+
+	row := getSoleOutboxRowForSession(ctx, t, pool, sessionID)
+	var payload slackapi.PlanApprovalPayload
+	if err := json.Unmarshal(row.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload as slackapi.PlanApprovalPayload: %v", err)
+	}
+	if payload.Text != wantPlanText {
+		t.Errorf("notice text = %q, want the plan %q, read from the turn's own window", payload.Text, wantPlanText)
+	}
+}

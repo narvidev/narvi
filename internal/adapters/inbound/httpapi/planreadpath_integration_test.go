@@ -5,8 +5,9 @@
 // plan_documents snapshot (migrations/000112_plan_documents.up.sql,
 // written once at approval time by decideplan.go's own
 // snapshotApprovedPlanContent) its FIRST choice, falling back to the
-// bounded live event-log recompute (planContentEventFetchLimit-newest
-// events) only where no USABLE snapshot exists for a given plan.
+// live event-log recompute (the producing turn's own window of `token`
+// frames, sessionactor.ReadWindowFinal) only where no USABLE snapshot
+// exists for a given plan.
 //
 // Three eras, one uniform rule ("prefer the snapshot only where a usable
 // snapshot exists") -- each proven here by a test that FAILS if its own
@@ -15,9 +16,8 @@
 //   - no plan_documents row at all (an approved plan that predates the
 //     snapshot table, or otherwise never got one) -- falls back to EXACTLY
 //     today's pre-snapshot behavior, TestListPlans_ApprovedPlanWithNoSnapshotRow_FallsBackToLiveRecompute;
-//   - a snapshot row whose content has aged out of the live event-log
-//     window -- the durable snapshot answers where a live recompute could
-//     only return the placeholder, TestListPlans_ApprovedPlanEventsAgedOut_ReturnsDurableSnapshotNotPlaceholder;
+//   - a usable snapshot row -- the durable snapshot answers even where a
+//     live recompute would read something else, TestListPlans_ApprovedPlan_ReturnsDurableSnapshotOverLiveRecompute;
 //   - a snapshot row whose content is NULL (a future retention policy's own
 //     null-out) -- treated as "no usable snapshot", falls back exactly like
 //     the no-row case, TestListPlans_SnapshotRowWithNullContent_FallsBackToLiveRecompute;
@@ -42,13 +42,24 @@ import (
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 )
 
-// planReadPathEventFetchLimit mirrors plans.go's own unexported
-// planContentEventFetchLimit (this package's test binary is package
-// httpapi_test, an external test package, so it cannot reach an unexported
-// constant directly) -- kept as its own named copy, not a magic number, so
-// the "why 2000, and why one more than that" reasoning in the aging test
-// below is traceable back to the SAME bound plans.go itself enforces.
+// planReadPathEventFetchLimit is the size of the newest-events tail the plan
+// views' live recompute read before it read the producing turn's own
+// window: the tests below still flood the log past it, so they show that
+// the snapshot answers -- and that the window read finds a plan's text --
+// however much the session has logged since.
 const planReadPathEventFetchLimit = 2000
+
+// recordSnapshotContent sets plan planID's plan_documents content to
+// content, so the snapshot differs from what a live recompute of the plan's
+// window reads: since that recompute reads the producing turn's own window,
+// it finds the plan's text however much the log has grown, and only a
+// difference tells which one answered.
+func recordSnapshotContent(ctx context.Context, t *testing.T, r testRig, planID pgtype.UUID, content string) {
+	t.Helper()
+	if _, err := r.pool.Exec(ctx, `UPDATE plan_documents SET content = $2 WHERE plan_id = $1`, planID, content); err != nil {
+		t.Fatalf("record the snapshot's content: %v", err)
+	}
+}
 
 // seedFillerEvents bulk-inserts count "noise"-typed events for sessionID,
 // via one raw INSERT ... SELECT FROM generate_series -- a single round
@@ -72,18 +83,16 @@ func seedFillerEvents(ctx context.Context, t *testing.T, r testRig, sessionID pg
 	}
 }
 
-// TestListPlans_ApprovedPlanEventsAgedOut_ReturnsDurableSnapshotNotPlaceholder
-// is mutation-verification (a): an approved plan's own token event, once it
-// ages out of the live recompute's bounded window, must render from the
-// durable plan_documents snapshot -- NOT plandomain.ContentFallbackText.
-// Before this Step, GET .../plans recomputed content live on every
-// request, unconditionally, so this exact scenario returned the
-// placeholder even though the approved prose sat durably in plan_documents
-// the whole time (written by DecidePlanOnTx's own snapshotApprovedPlanContent,
-// but read by nothing in production). If the snapshot-first branch in
-// resolvePlanRenderedContent (plans.go) were removed or inverted, this
-// test observes the placeholder instead and fails.
-func TestListPlans_ApprovedPlanEventsAgedOut_ReturnsDurableSnapshotNotPlaceholder(t *testing.T) {
+// TestListPlans_ApprovedPlan_ReturnsDurableSnapshotOverLiveRecompute is
+// mutation-verification (a): an approved plan renders from the durable
+// plan_documents snapshot, the record of what was approved, even where a
+// live recompute of its window would read something else -- here, a
+// snapshot whose content differs from the plan's streamed text, after the
+// log has grown past the newest-events tail the recompute once read. If the
+// snapshot-first branch in resolvePlanRenderedContent (plans.go) were
+// removed or inverted, this test observes the streamed text instead and
+// fails.
+func TestListPlans_ApprovedPlan_ReturnsDurableSnapshotOverLiveRecompute(t *testing.T) {
 	rig := newTestRig(t)
 	ctx := context.Background()
 	owner, token := rig.createAuthenticatedUser(ctx, t)
@@ -94,7 +103,7 @@ func TestListPlans_ApprovedPlanEventsAgedOut_ReturnsDurableSnapshotNotPlaceholde
 		t.Fatalf("create producing turn: %v", err)
 	}
 	dispatchTurn(ctx, t, rig, session.ID, turn.ID)
-	const wantContent = "the durable approved prose -- must survive even once its own token event ages out of the live recompute window"
+	const wantContent = "the plan as it streamed -- the approval snapshots it, and a live recompute of its window still finds it"
 	seedTokenEvent(ctx, t, rig, session.ID, "aging-msg", wantContent)
 
 	plan, err := rig.plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: turn.ID, Version: 1, Status: sqlcgen.PlanStatusAwaitingApproval})
@@ -118,11 +127,11 @@ func TestListPlans_ApprovedPlanEventsAgedOut_ReturnsDurableSnapshotNotPlaceholde
 		t.Fatalf("sanity check failed: plan_documents.content = %v, want %q", doc.Content, wantContent)
 	}
 
-	// Flood the session's own event log with more filler than the live
-	// recompute's own window -- the ORIGINAL token event (the lowest id in
-	// the session) now sits well outside ListRecentForSession's own
-	// newest-planReadPathEventFetchLimit slice, so a live recompute alone
-	// can no longer find it.
+	// The snapshot is the record: make it differ from the streamed text a
+	// live recompute of the window still finds, and grow the log past the
+	// tail that recompute once read.
+	const recorded = "the durable approved prose, as recorded at approval"
+	recordSnapshotContent(ctx, t, rig, plan.ID, recorded)
 	seedFillerEvents(ctx, t, rig, session.ID, planReadPathEventFetchLimit+100)
 
 	var resp restdtos.ListPlansResponse
@@ -133,8 +142,8 @@ func TestListPlans_ApprovedPlanEventsAgedOut_ReturnsDurableSnapshotNotPlaceholde
 	if len(resp.Plans) != 1 {
 		t.Fatalf("len(Plans) = %d, want 1", len(resp.Plans))
 	}
-	if resp.Plans[0].Content != wantContent {
-		t.Errorf("Content = %q, want the durable snapshot's own prose %q -- if this is instead the placeholder, the read path fell back to a live recompute that can no longer see the aged-out token event", resp.Plans[0].Content, wantContent)
+	if resp.Plans[0].Content != recorded {
+		t.Errorf("Content = %q, want the durable snapshot's own prose %q -- if this is instead the streamed text, the read path recomputed live past a usable snapshot", resp.Plans[0].Content, recorded)
 	}
 }
 
@@ -352,23 +361,22 @@ func TestListPlans_SnapshotStructuredStepsNull_DerivesFromSnapshotContent(t *tes
 	}
 }
 
-// TestListPlans_AllPlansHaveUsableSnapshots_ContentComesFromSnapshotNotPlaceholder
+// TestListPlans_AllPlansHaveUsableSnapshots_ContentComesFromSnapshot
 // proves half (i) of planContentMap's own optimization (plans.go): when
 // EVERY plan row returned for a session has a usable snapshot
 // (usablePlanSnapshot), the handler must still render each plan's correct
-// content/structured -- and must do so FROM the snapshot, never the
-// placeholder a live recompute would produce if it ran against a window
-// that no longer holds the original token events. Two plan versions are
-// approved (each snapshotting real prose via the approve endpoint itself),
-// then the session's own event log is flooded past
-// planReadPathEventFetchLimit -- exactly TestListPlans_
-// ApprovedPlanEventsAgedOut_ReturnsDurableSnapshotNotPlaceholder's own
+// content/structured -- and must do so FROM the snapshot, never from a
+// live recompute of the window. Two plan versions are approved (each
+// snapshotting real prose via the approve endpoint itself), each snapshot
+// is then made to differ from the streamed text a recompute still finds
+// (TestListPlans_ApprovedPlan_ReturnsDurableSnapshotOverLiveRecompute's own
 // technique, extended to every row in the list rather than a single plan,
-// since this optimization's skip decision is keyed on "EVERY row usable".
-// If planContentMap ever stopped consulting the snapshot map first (or
+// since this optimization's skip decision is keyed on "EVERY row usable"),
+// and the log is flooded past planReadPathEventFetchLimit. If planContentMap
+// ever stopped consulting the snapshot map first (or
 // resolvePlanRenderedContent's own branch drifted from usablePlanSnapshot),
-// this test would observe the placeholder instead of the real prose.
-func TestListPlans_AllPlansHaveUsableSnapshots_ContentComesFromSnapshotNotPlaceholder(t *testing.T) {
+// this test would observe the streamed text instead of the snapshot's.
+func TestListPlans_AllPlansHaveUsableSnapshots_ContentComesFromSnapshot(t *testing.T) {
 	rig := newTestRig(t)
 	ctx := context.Background()
 	owner, token := rig.createAuthenticatedUser(ctx, t)
@@ -417,11 +425,14 @@ func TestListPlans_AllPlansHaveUsableSnapshots_ContentComesFromSnapshotNotPlaceh
 		t.Fatalf("approve plan2 status = %d, want 200", status)
 	}
 
-	// Both plans now have a usable plan_documents snapshot. Flood the event
-	// log well past the live-recompute window so that if planContentMap ever
-	// fell back to a live recompute for either plan (instead of skipping the
-	// fetch entirely, as it should when every row is usable), it would find
-	// neither original token event and return the placeholder.
+	// Both plans now have a usable plan_documents snapshot. Make each differ
+	// from its streamed text, so a live recompute for either plan (instead of
+	// the snapshot, as it should be when every row is usable) shows, and
+	// flood the log past the tail the recompute once read.
+	const recorded1 = "plan v1 as recorded at approval"
+	const recorded2 = "plan v2 as recorded at approval"
+	recordSnapshotContent(ctx, t, rig, plan1.ID, recorded1)
+	recordSnapshotContent(ctx, t, rig, plan2.ID, recorded2)
 	seedFillerEvents(ctx, t, rig, session.ID, planReadPathEventFetchLimit+100)
 
 	var resp restdtos.ListPlansResponse
@@ -436,11 +447,11 @@ func TestListPlans_AllPlansHaveUsableSnapshots_ContentComesFromSnapshotNotPlaceh
 	for _, p := range resp.Plans {
 		byID[p.Id] = p
 	}
-	if got := byID[plan1.ID.String()].Content; got != wantContent1 {
-		t.Errorf("plan1 Content = %q, want the durable snapshot's own prose %q -- if this is the placeholder, a live recompute ran even though every row had a usable snapshot", got, wantContent1)
+	if got := byID[plan1.ID.String()].Content; got != recorded1 {
+		t.Errorf("plan1 Content = %q, want the durable snapshot's own prose %q -- if this is the streamed text %q, a live recompute ran even though every row had a usable snapshot", got, recorded1, wantContent1)
 	}
-	if got := byID[plan2.ID.String()].Content; got != wantContent2 {
-		t.Errorf("plan2 Content = %q, want the durable snapshot's own prose %q -- if this is the placeholder, a live recompute ran even though every row had a usable snapshot", got, wantContent2)
+	if got := byID[plan2.ID.String()].Content; got != recorded2 {
+		t.Errorf("plan2 Content = %q, want the durable snapshot's own prose %q -- if this is the streamed text %q, a live recompute ran even though every row had a usable snapshot", got, recorded2, wantContent2)
 	}
 	// Neither wantContent1 nor wantContent2 embeds a ```plan-steps block, so
 	// the correct structured result is nil (plandomain.ExtractStructured's
@@ -468,9 +479,11 @@ func TestListPlans_AllPlansHaveUsableSnapshots_ContentComesFromSnapshotNotPlaceh
 // planContentMap's skip condition were loosened from "every row usable" to
 // "any row usable" (or the predicate otherwise drifted from
 // resolvePlanRenderedContent's own branch), plan2 would be handed an empty
-// allTurns/contentEvents and silently render plandomain.ContentFallbackText
+// allTurns and silently render plandomain.ContentFallbackText
 // instead of its real prose -- this test's plan2 assertion is what catches
-// that regression (see this Step's mutation-verification notes).
+// that regression (see this Step's mutation-verification notes). With no
+// turns the window read finds no window, so the fallback text it returns
+// is the placeholder.
 func TestListPlans_MixOfSnapshottedAndUnsnapshotted_FallbackFetchStillRunsForTheUnsnapshottedOne(t *testing.T) {
 	rig := newTestRig(t)
 	ctx := context.Background()

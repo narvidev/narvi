@@ -101,17 +101,26 @@ const DefaultFrameReadLimitBytes = 32768
 // output it is given on whole (translateToolResult,
 // internal/adapters/outbound/opencode/translate.go). So nothing on this
 // side bounds a tool's output but this constant: a `tool_result` over a
-// connection's bound is cut to it, one over this constant is cut at
-// enqueue, and neither changes anything stored today: a `tool_call` or
-// `tool_result` from that runtime carries its message's id, which that
-// message's `step_start` already holds, so it adds no row (technical plan
-// §6.1, "Stored token frames").
+// connection's bound is cut to it, and one over this constant is cut at
+// enqueue. Either way it is stored: every `tool_call` and `tool_result` a
+// live turn sends is stored under a key of its own and broadcast
+// (technical plan §6.1, "Stored tool events"; internal/domain/eventkey), so
+// a tool's input and output reach the log, every subscribed browser's hub
+// queue, history pages and transcript pages at up to this many bytes each
+// -- whole when they fit the connection that carried them, cut, `cut` set,
+// when they did not.
 //
 // What the control plane holds. One read per sandbox connection, of up to
 // this many bytes; up to hubConnBufferSize (64) distinct broadcast
 // payloads behind a slow browser connection, shared by every connection
 // of that session (wshub.Hub.Broadcast queues one shared slice per
-// payload), so at most 64 MiB; and one history page, whose read is
+// payload), so at most 64 MiB -- a bound a turn reaches in practice now that
+// tool results are broadcast, a run of large tool outputs filling a slow
+// connection's queue where text parts alone rarely did; past it, the hub
+// drops that connection's broadcasts, and the page, which takes a
+// broadcast only as its cue to page the history from its cursor
+// (web/src/ws/sessionStream.ts), reads what it missed on the next one; and
+// one history page, whose read is
 // bounded by FetchHistoryMaxReplyBytes, or is one event when the first
 // alone is larger -- the store measures each event before it reads it
 // (postgres.EventStore.ListPageForSession), so a page never holds events
@@ -144,7 +153,11 @@ const MaxEventFrameBytes = 1 << 20
 //
 // 2 MiB. It is no smaller than MaxEventFrameBytes, so one maximal event
 // always fits with room for ordinary ones, and an ordinary 500-event page,
-// at about 2 KiB an event or less, is at most about 1 MiB and never cut.
+// at about 2 KiB an event or less, is at most about 1 MiB and never cut. A
+// turn's tool calls and results are stored too, each up to
+// MaxEventFrameBytes, so a page of a session whose tools read or write
+// large files stops at this budget well before its count, and its reader
+// goes on from nextCursor.
 // Without it a page could read 500 x MaxEventFrameBytes, 500 MiB, where
 // the 32 KiB read limit before it kept the worst page to 16 MiB.
 const FetchHistoryMaxReplyBytes = 2 << 20
