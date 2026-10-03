@@ -28,16 +28,20 @@ func pageWireSize(t *testing.T, e sqlcgen.Event) int {
 	return len(b) + 1
 }
 
-// storeWarnings stores count `warning` events whose message is text
-// repeated to about size bytes, and returns their ids in order.
-func storeWarnings(ctx context.Context, t *testing.T, events *narvipg.EventStore, sessionID pgtype.UUID, prefix string, count, size int, text string) []int64 {
+// storeWarnings stores count warning events of type eventType, `warning`
+// when empty, whose message is text repeated to about size bytes, and
+// returns their ids in order.
+func storeWarnings(ctx context.Context, t *testing.T, events *narvipg.EventStore, sessionID pgtype.UUID, prefix, eventType string, count, size int, text string) []int64 {
 	t.Helper()
+	if eventType == "" {
+		eventType = "warning"
+	}
 	ids := make([]int64, 0, count)
 	for i := 0; i < count; i++ {
 		message := strings.Repeat(text, size/len(text))
 		created, err := events.Create(ctx, sqlcgen.CreateEventParams{
 			SessionID: sessionID,
-			Type:      "warning",
+			Type:      eventType,
 			MessageID: fmt.Sprintf("%s-%d", prefix, i),
 			Payload:   []byte(fmt.Sprintf(`{"type":"warning","message":%q}`, message)),
 		})
@@ -64,6 +68,7 @@ func TestEventStore_ListPageForSession_ReadsOnlyWhatFits(t *testing.T) {
 
 	for _, tc := range []struct {
 		name      string
+		eventType string
 		count     int
 		size      int
 		text      string
@@ -81,10 +86,16 @@ func TestEventStore_ListPageForSession_ReadsOnlyWhatFits(t *testing.T) {
 			budget: platform.FetchHistoryMaxReplyBytes, wantPages: []int{4, 4, 2}},
 		{name: "escape-heavy events are measured as written, six bytes a character", count: 12, size: 60 * 1024, text: "<&>", maxRows: 500,
 			budget: platform.FetchHistoryMaxReplyBytes},
+		// A type is measured as written too: each of these 100 bytes is
+		// written as \u003c or \u0001, so the type takes 600 bytes of a
+		// page, not 100, and an event about 700 -- a budget of 2000 holds
+		// two, where a type counted by its length would let seven in.
+		{name: "an escape-heavy type is measured as written, six bytes a byte", eventType: strings.Repeat("<\u0001", 50), count: 6, size: 10, text: "w", maxRows: 500,
+			budget: 2000, wantPages: []int{2, 2, 2}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			sessionID := createTestSession(ctx, t, pool)
-			ids := storeWarnings(ctx, t, events, sessionID, "page", tc.count, tc.size, tc.text)
+			ids := storeWarnings(ctx, t, events, sessionID, "page", tc.eventType, tc.count, tc.size, tc.text)
 
 			var read []int64
 			var pages []int

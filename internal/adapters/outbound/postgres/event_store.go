@@ -151,8 +151,8 @@ type EventPage struct {
 // The budget bounds the read, not only the reply. The database measures
 // each event as it walks the page (ListEventPageExtentForSession, an upper
 // bound on the event's size in a page), stops at the first one that does
-// not fit, and the page then reads only the events that do
-// (ListEventsForSessionThrough). An event that does not fit is never read
+// not fit, and the page then reads only the events that do, by their ids
+// (ListEventsForSessionByIDs). An event that does not fit is never read
 // into this process, so the next page, which starts after the last event
 // this one holds, reads it once: paging through a log reads each event
 // once, however large. What one page holds is at most maxBytes, or one
@@ -161,9 +161,14 @@ type EventPage struct {
 // platform.MaxEventFrameBytes each, and read every dropped event again on
 // the next page.
 //
-// The two statements need no transaction: ids within a session are
-// allocated in commit order (CreateEvent), so the range the walk measured
-// holds the same events when they are read.
+// The two statements need no transaction: no query updates or deletes an
+// event (only a deleted session takes its events with it, and then the
+// page is simply shorter), so the events the walk measured are the events
+// read by their ids. Both stay on events_session_id_id_idx, or on
+// events_pkey by exact ids, under any plan, the generic plan a cached
+// statement settles on included
+// (TestEventPage_GenericPlanReadsTheSessionIndex): neither scans another
+// session's events.
 func (s *EventStore) ListPageForSession(ctx context.Context, sessionID pgtype.UUID, afterID int64, maxRows int32, maxBytes int64) (EventPage, error) {
 	if maxRows <= 0 {
 		return EventPage{}, nil
@@ -181,11 +186,13 @@ func (s *EventStore) ListPageForSession(ctx context.Context, sessionID pgtype.UU
 	if fit == 0 {
 		return EventPage{}, nil
 	}
-	events, err := s.q.ListEventsForSessionThrough(ctx, sqlcgen.ListEventsForSessionThroughParams{
+	ids := make([]int64, fit)
+	for i, row := range extent[:fit] {
+		ids[i] = row.ID
+	}
+	events, err := s.q.ListEventsForSessionByIDs(ctx, sqlcgen.ListEventsForSessionByIDsParams{
+		Ids:       ids,
 		SessionID: sessionID,
-		AfterID:   afterID,
-		ThroughID: extent[fit-1].ID,
-		MaxRows:   int32(fit),
 	})
 	if err != nil {
 		return EventPage{}, err

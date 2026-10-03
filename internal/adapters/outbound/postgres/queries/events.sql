@@ -113,16 +113,26 @@ LIMIT $3;
 -- follow. It returns ids and sums only: no payload leaves the database
 -- here, and a payload is converted to text, to be measured, only for the
 -- events walked -- the page's own, and at most one more -- never for the
--- rest of max_rows. ListEventsForSessionThrough then reads the events that
+-- rest of max_rows. ListEventsForSessionByIDs then reads the events that
 -- fit.
 --
 -- An event's size is an upper bound on what it takes in a page as the
 -- control plane writes one (eventWireMap, marshaled, and a comma): the
 -- payload's text, plus five bytes for each character encoding/json writes
 -- as a six-byte escape and jsonb's text does not ('<', '>', '&', U+2028,
--- U+2029), plus its type, plus 128 bytes for the id, createdAt and the
--- keys. jsonb's text is never shorter than its compacted form, so a page
--- that fits by this measure fits as written.
+-- U+2029); six bytes for each byte of its type, the most encoding/json
+-- writes for one, since a sandbox chooses the type and it may hold any
+-- character; and 128 bytes for the id, createdAt and the keys. jsonb's
+-- text is never shorter than its compacted form, so a page that fits by
+-- this measure fits as written.
+--
+-- Every lookup is a range of events_session_id_id_idx, whatever the plan:
+-- the bounds are row comparisons on (session_id, id), on both sides, the
+-- upper one the largest id. pgx caches this statement on each connection,
+-- and Postgres may run it on a generic plan from its sixth run on, made
+-- without the parameters' values; a plain `id > $2` let that plan scan
+-- events_pkey from the cursor and filter every other session's events out,
+-- a scan that grows with the whole table (TestEventPage_GenericPlanReadsTheSessionIndex).
 --
 -- The non-recursive term reads its one event in a subquery with LIMIT, and
 -- each payload's text is computed once, behind OFFSET 0, so the measure is
@@ -134,10 +144,12 @@ WITH RECURSIVE page (id, n, running) AS (
         SELECT head.id, 1::bigint,
                (octet_length(t.p)
                 + 5 * (char_length(t.p) - char_length(translate(t.p, '<>&' || chr(8232) || chr(8233), '')))
-                + octet_length(head.type) + 128)::bigint
+                + 6 * octet_length(head.type) + 128)::bigint
         FROM (
             SELECT e.id, e.type, e.payload FROM events e
-            WHERE e.session_id = sqlc.arg(session_id) AND e.id > sqlc.arg(after_id)
+            WHERE e.session_id = sqlc.arg(session_id)
+              AND (e.session_id, e.id) > (sqlc.arg(session_id)::uuid, sqlc.arg(after_id)::bigint)
+              AND (e.session_id, e.id) <= (sqlc.arg(session_id)::uuid, 9223372036854775807::bigint)
             ORDER BY e.id ASC
             LIMIT 1
         ) head
@@ -149,11 +161,13 @@ WITH RECURSIVE page (id, n, running) AS (
                page.running
                + (octet_length(t.p)
                   + 5 * (char_length(t.p) - char_length(translate(t.p, '<>&' || chr(8232) || chr(8233), '')))
-                  + octet_length(nxt.type) + 128)::bigint
+                  + 6 * octet_length(nxt.type) + 128)::bigint
         FROM page
         CROSS JOIN LATERAL (
             SELECT e.id, e.type, e.payload FROM events e
-            WHERE e.session_id = sqlc.arg(session_id) AND e.id > page.id
+            WHERE e.session_id = sqlc.arg(session_id)
+              AND (e.session_id, e.id) > (sqlc.arg(session_id)::uuid, page.id)
+              AND (e.session_id, e.id) <= (sqlc.arg(session_id)::uuid, 9223372036854775807::bigint)
             ORDER BY e.id ASC
             LIMIT 1
         ) nxt
@@ -163,16 +177,18 @@ WITH RECURSIVE page (id, n, running) AS (
 )
 SELECT id, n, running FROM page ORDER BY id ASC;
 
--- name: ListEventsForSessionThrough :many
--- The events of one page ListEventPageExtentForSession measured: those of
--- session_id after after_id up to and including through_id, oldest first.
--- Ids within a session are allocated in commit order (CreateEvent), so the
--- range holds the events the walk saw, and no other: max_rows only guards
--- that.
+-- name: ListEventsForSessionByIDs :many
+-- The events of one page ListEventPageExtentForSession measured, read by
+-- their ids, oldest first: one index lookup each, by exact key, so the read
+-- is the page's own events and no other under any plan, the generic plan a
+-- cached statement settles on included. It replaces a range read through
+-- the page's last id, whose generic plan was a range of events_pkey that
+-- read every other session's events in it and filtered them out, or,
+-- written on (session_id, id), a bitmap scan of the whole session.
+-- session_id also guards that the ids are the session's.
 SELECT * FROM events
-WHERE session_id = sqlc.arg(session_id) AND id > sqlc.arg(after_id) AND id <= sqlc.arg(through_id)
-ORDER BY id ASC
-LIMIT sqlc.arg(max_rows);
+WHERE id = ANY(sqlc.arg(ids)::bigint[]) AND session_id = sqlc.arg(session_id)
+ORDER BY id ASC;
 
 -- name: ListRecentEventsForSession :many
 -- The mirror-image pagination direction from ListEventsForSession's own
