@@ -20,9 +20,10 @@
 --   - A pod that carries 000155 and restarts before the older binary
 --     replaces it applies 000155 again at boot, which locks the older binary
 --     out again ("no migration found for version 155").
--- Guarded: IF EXISTS, so it also runs on a database a rollback already
--- brought back to 154 with the columns kept (`migrate force 154`, the up
--- file's "Rolling back") and then forced to 155 again. Each drop is a
+-- Guarded: IF EXISTS, so it also runs when the columns are already gone --
+-- this down ran, the recorded version was then forced back to 155, and the
+-- down runs again. (With the columns kept, after `migrate force 154`, a
+-- plain DROP COLUMN would run anyway.) Each drop is a
 -- catalog change: it rewrites nothing, but takes ACCESS EXCLUSIVE on
 -- sandboxes, then on turns, for the file's one implicit transaction.
 ALTER TABLE sandboxes DROP COLUMN IF EXISTS ready_seq;

@@ -1,0 +1,27 @@
+-- Reverses 000157_agent_max_frame_bytes.up.sql. With the columns goes
+-- every sandbox's record of the read limit its agent stated. Nothing a
+-- binary without 000157 reads; a binary with it that runs 000157 again
+-- reads every sandbox as stating nothing until its next ready, and holds
+-- its prompts to the promptReceipt rule meanwhile.
+--
+-- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
+-- 000157. Do not run it against live pods of a binary that carries 000157,
+-- for two reasons:
+--   - Every query of that binary that returns a whole sandbox row names
+--     these columns (sqlc writes each SELECT * and RETURNING * out as a
+--     column list): creating, reading and updating sandboxes among them,
+--     and its RecordSandboxReady writes them. After this down each of them
+--     fails with SQLSTATE 42703 (column does not exist), so no ready is
+--     recorded and no turn is dispatched or completed until the older
+--     binary replaces the pod.
+--   - A pod that carries 000157 and restarts before the older binary
+--     replaces it applies 000157 again at boot, which locks the older binary
+--     out again ("no migration found for version 157").
+-- Guarded: IF EXISTS, so it also runs when the columns are already gone --
+-- this down ran, the recorded version was then forced back to 157, and the
+-- down runs again. (With the columns kept, after `migrate force 156`, a
+-- plain DROP COLUMN would run anyway.) Each drop is a
+-- catalog change: it rewrites nothing, but takes ACCESS EXCLUSIVE on
+-- sandboxes for the file's one implicit transaction.
+ALTER TABLE sandboxes DROP COLUMN IF EXISTS agent_max_frame_bytes_gen;
+ALTER TABLE sandboxes DROP COLUMN IF EXISTS agent_max_frame_bytes;

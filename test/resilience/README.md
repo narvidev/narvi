@@ -567,11 +567,44 @@ scenario #1's second pair of tests, above.
 - `TestResilience_Scenario22_PromptFrameOver32KiB_CapableAgent_DeliveredOnceAndCompletes`:
   a prompt frame over the WebSocket library's default 32 KiB read limit,
   which closed the agent's connection and was lost before the agent read up
-  to `platform.MaxPromptFrameBytes`, is read whole and run once.
+  to `platform.MaxPromptFrameBytes`, is read whole and run once. The agent's
+  every `ready` states that limit (`capabilities.maxFrameBytes`), which the
+  control plane holds its gen's prompts to (§3.3).
 - `TestResilience_Scenario22_PromptLostOnEveryDelivery_ResendCapStopsTheLoop`:
   a prompt lost on every delivery, each loss a reconnect, is re-sent
   `PromptResendMaxPerTurn` times and then no more, and the reconnects stop.
   — all five in `scenario22_lost_prompt_test.go`
+
+## Scenario #23 (Step 228, §3.3, §6.1) — in progress
+
+### #23 — frames over 32 KiB on the sandbox socket
+
+> An agent event over 32 KiB is read on the connection it came on by a
+> control plane that states a larger limit, and written cut to one that
+> states none, never a reconnect loop; a prompt over the bound its gen's
+> agent states is refused at dispatch with both sizes named.
+
+**Status: partly covered.** Step 228 ships in three PRs, and this section
+is completed by its third, which adds the event direction, its tests, and
+the scenario's entry in §9.3. The prompt direction is covered. Every
+`ready` of an agent built from Step 228 states its read limit
+(`capabilities.maxFrameBytes`), and the control plane holds each gen's
+prompts to the read limit its latest `ready` shows: the stated one, else
+32 MiB for an agent that advertises `promptReceipt`, else the library's
+32 KiB default. Both tests below use scenario #22's rig: the real `wshub`
+sandbox handler and session actor on Postgres, behind scenario #7's relay,
+with agents written by hand as they write and read the wire.
+
+- `TestResilience_Scenario23_Step226Agent_PromptOver32KiB_Delivered`: an
+  agent built since Step 226 but before Step 228, whose `ready` advertises
+  `promptReceipt` and states no limit, is sent a 40 KiB prompt whole on
+  the connection it came on, receipts it, and completes the turn.
+- `TestResilience_Scenario23_PromptOver32KiB_PreReceiptAgent_RefusedAtDispatch`:
+  an agent built before Step 226, with no capabilities and the 32 KiB
+  default, is written nothing; its turn fails at dispatch with a synthetic
+  `execution_complete` marked `"delivered": false` and a warning naming
+  both sizes, and its connection stays up.
+  — both in `scenario23_prompt_frames_test.go`
 
 ## Summary
 
@@ -595,7 +628,9 @@ scenario #1's second pair of tests, above.
 | 16 | Non-idempotent-setup boot | Covered — Step 42 |
 | 17 | Restore-with-docker | Covered — Step 74 |
 | 22 | A prompt lost between dispatch and the sandbox | Covered — Step 226 |
+| 23 | Frames over 32 KiB on the sandbox socket | Partly covered — Step 228 (prompt direction; the event direction is to come) |
 
 Numbers 18-21 are taken by the scenarios `docs/TECHNICAL_PLAN.md` §9.3 appends for Phases 13, 15
 and 18 (rotation and the interrupted turn, fresh-lineage continuity, the spend cap and freeze, the
-Kubernetes provider), none built yet. 22 is Step 226's. A new scenario takes 23.
+Kubernetes provider), none built yet. 22 is Step 226's, and 23 is Step 228's (in progress). A new
+scenario takes 24.

@@ -149,7 +149,7 @@ func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn) error 
 	// frame the control plane may send (technical plan §6.1). The
 	// library's default, 32 KiB, closed the connection on any longer prompt
 	// -- a review's, with its pull request's diff inlined -- which was then
-	// lost.
+	// lost. sendReady states this limit to the control plane.
 	conn.SetReadLimit(platform.MaxPromptFrameBytes)
 
 	if err := b.sendReady(ctx, conn); err != nil {
@@ -182,10 +182,14 @@ func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn) error 
 // reconnect, which is what the control plane answers a lost prompt on
 // (technical plan §3.3's prompt receipts).
 //
-// It advertises capabilities.promptReceipt when, and only when, the prompt
-// journal is open (EnablePromptReceipts) and no append to it has failed;
-// otherwise the key is absent, as from an agent that predates it.
+// Every ready states capabilities.maxFrameBytes, the read limit
+// runConnection set on conn: the control plane holds every prompt frame to
+// this gen to it (technical plan §3.3, §6.1). It advertises
+// capabilities.promptReceipt when, and only when, the prompt journal is
+// open (EnablePromptReceipts) and no append to it has failed; otherwise
+// that key is absent, as from an agent that predates it.
 func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
+	maxFrameBytes := platform.MaxPromptFrameBytes
 	msg := sandboxws.Ready{
 		Type:         "ready",
 		MessageId:    b.newMessageID(),
@@ -194,10 +198,11 @@ func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
 		Timestamp:    time.Now(),
 		AgentVersion: b.agentVersion,
 		ImageDigest:  b.imageDigest,
+		Capabilities: &sandboxws.ReadyCapabilities{MaxFrameBytes: &maxFrameBytes},
 	}
 	if b.promptReceiptsOn() {
 		promptReceipt := true
-		msg.Capabilities = &sandboxws.ReadyCapabilities{PromptReceipt: &promptReceipt}
+		msg.Capabilities.PromptReceipt = &promptReceipt
 	}
 	payload, err := json.Marshal(msg)
 	if err != nil {

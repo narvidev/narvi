@@ -246,7 +246,7 @@ func (j *promptJournal) record(id string) error {
 }
 
 // isBroken reports whether an append has failed: the journal records
-// nothing more, and the Bridge advertises no capability.
+// nothing more, and the Bridge advertises no promptReceipt.
 func (j *promptJournal) isBroken() bool {
 	j.mu.Lock()
 	defer j.mu.Unlock()
@@ -278,7 +278,7 @@ func (j *promptJournal) close() {
 // too. Call it once, before Run.
 //
 // On an error the journal is not opened and the Bridge stays exactly as it
-// was: no capability, no receipt, no dedup -- the safe direction, since the
+// was: no promptReceipt, no receipt, no dedup -- the safe direction, since the
 // control plane then never re-sends a prompt to this gen. The error is
 // logged here as well as returned.
 func (b *Bridge) EnablePromptReceipts(dir string) error {

@@ -25,6 +25,11 @@
             "promptReceipt": {
               "type": "boolean",
               "description": "True when the agent answers every prompt that sets receiptRequested with a prompt_received event, a duplicate included, and runs a prompt messageId at most once for its gen, across a restart of the agent process too."
+            },
+            "maxFrameBytes": {
+              "type": "integer",
+              "minimum": 1,
+              "description": "The largest message, in bytes, this agent reads. The control plane records it against the gen, the latest ready deciding, and never writes that gen a prompt frame longer than it, nor longer than its own MaxPromptFrameBytes. Absent: the gen is held to MaxPromptFrameBytes when this ready advertises promptReceipt, and otherwise to the WebSocket library's default read limit, 32768 bytes (technical plan §3.3, §6.1)."
             }
           }
         }

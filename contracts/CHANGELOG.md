@@ -10,7 +10,7 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
-## [1.20.0]
+## [1.21.0]
 
 ### sandbox-ws/v1/events.schema.json
 
@@ -56,6 +56,28 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   grades PATCH (row 35).
 - Unchanged: no route; a cut plan's refused approval is a `409` with the
   existing `{"error": ...}` body, which this bundle does not grade.
+
+## [1.20.0]
+
+### sandbox-ws/v1/events.schema.json
+
+- Added: optional `Ready.capabilities.maxFrameBytes` (integer, `minimum`
+  1): the largest message, in bytes, this agent reads. An agent built from
+  this release states it on every `ready`, with or without
+  `promptReceipt`: its read limit, `MaxPromptFrameBytes`, 33554432. The
+  control plane records it against the gen, the latest `ready` deciding,
+  and holds every prompt frame to that gen to it, and never past its own
+  `MaxPromptFrameBytes` (technical plan §3.3, §6.1). Absent, the gen is
+  held to `MaxPromptFrameBytes` when the `ready` advertises
+  `promptReceipt`, and otherwise to the WebSocket library's default read
+  limit, 32768 bytes: a prompt over its gen's bound fails its turn at
+  dispatch, naming both sizes, instead of being written to an agent that
+  would lose it. A control plane that predates the property ignores it and
+  still measures against `MaxPromptFrameBytes`, which an agent that states
+  it reads. A property added, not required, grades MINOR (row 2), under the
+  existing `capabilities` object; the `ready` union member changes only by
+  that property (row 30, recursing into row 2).
+- Unchanged: every other event, and the six critical types.
 
 ## [1.19.0]
 
