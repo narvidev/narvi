@@ -230,6 +230,8 @@ SELECT
     COALESCE(armed.names, '{}'::text[])::text[] AS armed_timer_names,
     COALESCE(armed.fires_at, '{}'::timestamptz[])::timestamptz[] AS armed_timer_fires_at,
     COALESCE(reretrigger.can_fire, false)::boolean AS review_retrigger_can_fire,
+    reretrigger.dropped_at::timestamptz AS review_retrigger_dropped_at,
+    COALESCE(reretrigger.dropped_head_sha, '')::text AS review_retrigger_dropped_head_sha,
     releasepending.pending_since::timestamptz AS release_check_pending_since,
     releaserunning.claimed_at::timestamptz AS release_check_claimed_at
 FROM sessions s
@@ -253,14 +255,14 @@ LEFT JOIN LATERAL (
 LEFT JOIN LATERAL (
     SELECT t.id, t.status, t.completed_at
     FROM turns t
-    WHERE t.session_id = s.id AND t.status IN ('completed', 'failed', 'cancelled')
+    WHERE t.session_id = s.id AND t.status IN ('completed', 'failed', 'cancelled') AND t.end_reason IS NULL
     ORDER BY t.created_at DESC, t.id DESC
     LIMIT 1
 ) lastrun ON true
 LEFT JOIN LATERAL (
     SELECT t.id
     FROM turns t
-    WHERE t.session_id = s.id
+    WHERE t.session_id = s.id AND t.end_reason IS NULL
     ORDER BY t.created_at DESC, t.id DESC
     LIMIT 1
 ) newest ON true
@@ -323,7 +325,9 @@ LEFT JOIN LATERAL (
             SELECT 1 FROM repo_entitlement_revocations rev
             WHERE rev.repo_full_name = gps.repo_full_name
         )
-    ) AS can_fire
+    ) AS can_fire,
+    max(gps.auto_retrigger_dropped_at) AS dropped_at,
+    (array_agg(gps.auto_retrigger_dropped_head_sha ORDER BY gps.auto_retrigger_dropped_at DESC NULLS LAST, gps.pr_number DESC))[1] AS dropped_head_sha
     FROM github_pr_sessions gps
     LEFT JOIN repo_settings rs ON rs.repo_full_name = gps.repo_full_name
     WHERE gps.session_id = s.id
@@ -347,32 +351,34 @@ type GetSessionActivityFactsParams struct {
 }
 
 type GetSessionActivityFactsRow struct {
-	SessionID                pgtype.UUID           `json:"session_id"`
-	SessionStatus            SessionStatus         `json:"session_status"`
-	SessionFailureReason     *SessionFailureReason `json:"session_failure_reason"`
-	Archived                 bool                  `json:"archived"`
-	SandboxStatus            *SandboxStatus        `json:"sandbox_status"`
-	PrDeliveryStartedAt      pgtype.Timestamptz    `json:"pr_delivery_started_at"`
-	ObservedAt               pgtype.Timestamptz    `json:"observed_at"`
-	TurnCounts               []byte                `json:"turn_counts"`
-	InFlightTurnID           pgtype.UUID           `json:"in_flight_turn_id"`
-	InFlightTurnStatus       string                `json:"in_flight_turn_status"`
-	InFlightDispatchedAt     pgtype.Timestamptz    `json:"in_flight_dispatched_at"`
-	LastRunTurnID            pgtype.UUID           `json:"last_run_turn_id"`
-	LastRunStatus            string                `json:"last_run_status"`
-	LastRunCompletedAt       pgtype.Timestamptz    `json:"last_run_completed_at"`
-	NewestTurnID             pgtype.UUID           `json:"newest_turn_id"`
-	AwaitingPlanID           pgtype.UUID           `json:"awaiting_plan_id"`
-	AwaitingPlanSince        pgtype.Timestamptz    `json:"awaiting_plan_since"`
-	AwaitingStepID           pgtype.UUID           `json:"awaiting_step_id"`
-	AwaitingStepSince        pgtype.Timestamptz    `json:"awaiting_step_since"`
-	EscalatedRunID           pgtype.UUID           `json:"escalated_run_id"`
-	EscalatedRunSince        pgtype.Timestamptz    `json:"escalated_run_since"`
-	ArmedTimerNames          []string              `json:"armed_timer_names"`
-	ArmedTimerFiresAt        []pgtype.Timestamptz  `json:"armed_timer_fires_at"`
-	ReviewRetriggerCanFire   bool                  `json:"review_retrigger_can_fire"`
-	ReleaseCheckPendingSince pgtype.Timestamptz    `json:"release_check_pending_since"`
-	ReleaseCheckClaimedAt    pgtype.Timestamptz    `json:"release_check_claimed_at"`
+	SessionID                     pgtype.UUID           `json:"session_id"`
+	SessionStatus                 SessionStatus         `json:"session_status"`
+	SessionFailureReason          *SessionFailureReason `json:"session_failure_reason"`
+	Archived                      bool                  `json:"archived"`
+	SandboxStatus                 *SandboxStatus        `json:"sandbox_status"`
+	PrDeliveryStartedAt           pgtype.Timestamptz    `json:"pr_delivery_started_at"`
+	ObservedAt                    pgtype.Timestamptz    `json:"observed_at"`
+	TurnCounts                    []byte                `json:"turn_counts"`
+	InFlightTurnID                pgtype.UUID           `json:"in_flight_turn_id"`
+	InFlightTurnStatus            string                `json:"in_flight_turn_status"`
+	InFlightDispatchedAt          pgtype.Timestamptz    `json:"in_flight_dispatched_at"`
+	LastRunTurnID                 pgtype.UUID           `json:"last_run_turn_id"`
+	LastRunStatus                 string                `json:"last_run_status"`
+	LastRunCompletedAt            pgtype.Timestamptz    `json:"last_run_completed_at"`
+	NewestTurnID                  pgtype.UUID           `json:"newest_turn_id"`
+	AwaitingPlanID                pgtype.UUID           `json:"awaiting_plan_id"`
+	AwaitingPlanSince             pgtype.Timestamptz    `json:"awaiting_plan_since"`
+	AwaitingStepID                pgtype.UUID           `json:"awaiting_step_id"`
+	AwaitingStepSince             pgtype.Timestamptz    `json:"awaiting_step_since"`
+	EscalatedRunID                pgtype.UUID           `json:"escalated_run_id"`
+	EscalatedRunSince             pgtype.Timestamptz    `json:"escalated_run_since"`
+	ArmedTimerNames               []string              `json:"armed_timer_names"`
+	ArmedTimerFiresAt             []pgtype.Timestamptz  `json:"armed_timer_fires_at"`
+	ReviewRetriggerCanFire        bool                  `json:"review_retrigger_can_fire"`
+	ReviewRetriggerDroppedAt      pgtype.Timestamptz    `json:"review_retrigger_dropped_at"`
+	ReviewRetriggerDroppedHeadSha string                `json:"review_retrigger_dropped_head_sha"`
+	ReleaseCheckPendingSince      pgtype.Timestamptz    `json:"release_check_pending_since"`
+	ReleaseCheckClaimedAt         pgtype.Timestamptz    `json:"release_check_claimed_at"`
 }
 
 // Every fact GET /api/sessions/{sessionID}/status derives a session's
@@ -451,6 +457,23 @@ type GetSessionActivityFactsRow struct {
 // live fetch that fails, a revocation of only the session's clone URL (a
 // fork's name, parsed in Go) -- are deliberately not copied here, so the
 // status errs toward scheduled on them, never toward settled.
+// review_retrigger_dropped_at/_head_sha are the automatic re-review's
+// drop (technical plan §24.9), read in the same lateral as
+// review_retrigger_can_fire, so the status reads no more rows for it: its
+// attempts met a moved context more times in a row than
+// ReviewContextMoveMaxConsecutive allows at dispatch, so it gave up on the
+// pull request's newest head, which it names; NULL until then,
+// and again once a push re-arms it (UpsertPendingRetriggerHeadSHA clears
+// them; the head is ” when there is no drop, like the turn statuses
+// below). The status shows them beside a settled reading -- the debounce
+// is gone, so nothing is scheduled -- so a client can tell an automatic
+// re-review that stopped from one that was never owed.
+//
+// lastrun and newest skip a turn with an end_reason (migrations/000159):
+// one ended context_moved never ran, so it is neither the last run nor the
+// turn sessions.failure_reason was derived from (session.DeriveStatus
+// skips it too), and the last run's failure reason is read against the
+// newest turn that counts.
 // release_check_pending_since/_claimed_at are a release PR's manifest
 // check still to come or still running on this session: the oldest
 // release_manifest_pending row's created_at, and the newest
@@ -504,6 +527,8 @@ func (q *Queries) GetSessionActivityFacts(ctx context.Context, arg GetSessionAct
 		&i.ArmedTimerNames,
 		&i.ArmedTimerFiresAt,
 		&i.ReviewRetriggerCanFire,
+		&i.ReviewRetriggerDroppedAt,
+		&i.ReviewRetriggerDroppedHeadSha,
 		&i.ReleaseCheckPendingSince,
 		&i.ReleaseCheckClaimedAt,
 	)

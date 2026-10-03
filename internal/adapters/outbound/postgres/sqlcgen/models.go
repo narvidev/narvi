@@ -1872,6 +1872,9 @@ type GithubPrSession struct {
 	PrMerged                        *bool              `json:"pr_merged"`
 	PrClosedAt                      pgtype.Timestamptz `json:"pr_closed_at"`
 	MentionCount                    int32              `json:"mention_count"`
+	AutoRetriggerContextMoves       int32              `json:"auto_retrigger_context_moves"`
+	AutoRetriggerDroppedAt          pgtype.Timestamptz `json:"auto_retrigger_dropped_at"`
+	AutoRetriggerDroppedHeadSha     *string            `json:"auto_retrigger_dropped_head_sha"`
 }
 
 type HandoffSentinelRun struct {
@@ -2475,6 +2478,9 @@ type Turn struct {
 	ReceiptRequestedAt        pgtype.Timestamptz    `json:"receipt_requested_at"`
 	ReceiptCheckedReadySeq    *int32                `json:"receipt_checked_ready_seq"`
 	ReceiptResendCount        int32                 `json:"receipt_resend_count"`
+	EndReason                 *string               `json:"end_reason"`
+	ContextUnconfirmedAt      pgtype.Timestamptz    `json:"context_unconfirmed_at"`
+	RequestTrigger            *string               `json:"request_trigger"`
 }
 
 type TurnStepCost struct {

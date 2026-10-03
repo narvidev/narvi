@@ -112,6 +112,28 @@ func receiptColumns155(ctx context.Context, t *testing.T, db *sql.DB, sessionID 
 	return row
 }
 
+// receiptDispatch155 is a dispatch as 000155's release wrote it -- its
+// UpdateTurnStatus SET, unchanged since -- returning only the id: a later
+// release's RETURNING names the columns of every later migration too,
+// which a database at 155 does not have.
+const receiptDispatch155 = `UPDATE turns
+SET status = $2,
+    dispatched_sandbox_gen = COALESCE($3, dispatched_sandbox_gen),
+    dispatched_message_id = COALESCE($4, dispatched_message_id)
+WHERE id = $1
+RETURNING id`
+
+// receiptTurn155 reads the turn columns the 000155 test asserts on, by
+// name, for the same reason.
+func receiptTurn155(ctx context.Context, t *testing.T, db *sql.DB, turnID string) (requested, dispatched *string) {
+	t.Helper()
+	if err := db.QueryRowContext(ctx, `SELECT receipt_requested_message_id, dispatched_message_id FROM turns WHERE id = $1`, turnID).
+		Scan(&requested, &dispatched); err != nil {
+		t.Fatalf("read the turn's receipt columns: %v", err)
+	}
+	return requested, dispatched
+}
+
 func TestMigrationPromptReceipts_UpAndDown(t *testing.T) {
 	ctx := context.Background()
 	connStr, db := migrationTestDatabase(ctx, t, 154)
@@ -203,7 +225,7 @@ func TestMigrationPromptReceipts_UpAndDown(t *testing.T) {
 	}
 	asked := "msg-asked"
 	gen1 := int32(1)
-	if _, err := q.UpdateTurnStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: turn, Status: sqlcgen.TurnStatusProcessing, DispatchedSandboxGen: &gen1, DispatchedMessageID: &asked}); err != nil {
+	if _, err := db.ExecContext(ctx, receiptDispatch155, turnID, string(sqlcgen.TurnStatusProcessing), gen1, asked); err != nil {
 		t.Fatalf("dispatch: %v", err)
 	}
 	if err := q.SetTurnPromptReceiptRequest(ctx, sqlcgen.SetTurnPromptReceiptRequestParams{MessageID: &asked, ReadySeq: 1, ID: turn}); err != nil {
@@ -221,13 +243,10 @@ func TestMigrationPromptReceipts_UpAndDown(t *testing.T) {
 	previousRow(ctx, t, db, sandboxColumns, previousUpsertSandboxSpawn, sessionID, "token-hash-2")
 	previousRow(ctx, t, db, turnColumns, previousUpdateTurnStatus, turnID, "processing", time.Now(), nil, 2, nil, "msg-previous-binary")
 
-	reenqueued, err := q.GetTurn(ctx, turn)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if reenqueued.ReceiptRequestedMessageID == nil || *reenqueued.ReceiptRequestedMessageID != asked || *reenqueued.DispatchedMessageID != "msg-previous-binary" {
+	requested, dispatched := receiptTurn155(ctx, t, db, turnID)
+	if requested == nil || *requested != asked || dispatched == nil || *dispatched != "msg-previous-binary" {
 		t.Fatalf("after the previous binary's re-enqueue: request %v, dispatched %v; want the stale %q left beside the new dispatch",
-			reenqueued.ReceiptRequestedMessageID, reenqueued.DispatchedMessageID, asked)
+			requested, dispatched, asked)
 	}
 	// Not asked: the check's compare-and-set refuses that dispatch.
 	moved, err := q.MarkTurnPromptReconnectAnswered(ctx, sqlcgen.MarkTurnPromptReconnectAnsweredParams{
@@ -275,8 +294,8 @@ func TestMigrationPromptReceipts_UpAndDown(t *testing.T) {
 	}
 	_ = adb.Close()
 	assertCleanVersion(t, connStr, 155)
-	if kept, err := q.GetTurn(ctx, turn); err != nil || kept.ReceiptRequestedMessageID == nil || *kept.ReceiptRequestedMessageID != asked {
-		t.Fatalf("after 000155 ran again the request is %v (%v), want %q, kept", kept.ReceiptRequestedMessageID, err, asked)
+	if kept, _ := receiptTurn155(ctx, t, db, turnID); kept == nil || *kept != asked {
+		t.Fatalf("after 000155 ran again the request is %v, want %q, kept", kept, asked)
 	}
 
 	// Down: the columns go, every row stays. Run twice -- the second time

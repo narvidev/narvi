@@ -82,6 +82,16 @@ func (s *TimerStore) WakeReviewRetriggerDebounce(ctx context.Context, sessionID 
 	})
 }
 
+// RequeueReviewRetriggerDebounce arms the session's re-review debounce due
+// at the database's now when the session has none, and reports the rows it
+// inserted: 0 when one is armed, which it leaves as it is. The re-request
+// of an automatic review whose attempt ended context_moved (technical plan
+// §24.9); see RequeueReviewRetriggerDebounce's doc comment in
+// queries/session_timers.sql.
+func (s *TimerStore) RequeueReviewRetriggerDebounce(ctx context.Context, sessionID pgtype.UUID) (int64, error) {
+	return s.q.RequeueReviewRetriggerDebounce(ctx, sessionID)
+}
+
 // DeleteDispatch deletes the session's dispatch timer and returns the
 // armed_at and created_at it carried, both invalid when the session had
 // none. The first write of every dispatch evaluation (technical plan §2).

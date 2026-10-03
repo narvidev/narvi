@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/url"
 	"strings"
 	"sync/atomic"
@@ -18,7 +19,12 @@ import (
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/platform"
+	"github.com/narvidev/narvi/migrations"
 )
+
+// holdPlanLatestVersion is the migration the hold's plan test migrates
+// to: the latest whose columns the statements it measures name.
+const holdPlanLatestVersion = 159
 
 const (
 	// holdReadMaxBuffers bounds what the re-review hold's read
@@ -303,7 +309,13 @@ func measureHoldPlan(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stat
 // with none open; and the first with the long session stored after the
 // tables were analyzed, which a custom plan expects few turns of.
 //
-// Before migration 000158 and after it, the five statements that read a
+// The statements measured are this release's, which name the columns of
+// every migration since 000158, so the database is migrated to the latest
+// of them (holdPlanLatestVersion); the open-turn index 000158 builds is
+// taken away before the tables are stored, for the measure before it, and
+// built again by 000158's own up migration for the measure after.
+//
+// Without that index and with it, the five statements that read a
 // session's open or in-flight turns -- GetSessionActivityFacts,
 // RequestStopOpenTurns, ListStopRequestedOpenTurns,
 // GetProcessingTurnForSession, RecordTurnStepCost -- must read no more
@@ -415,7 +427,10 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 	} {
 		t.Run(shape.name, func(t *testing.T) {
 			ctx := context.Background()
-			pool, connStr := holdPlanDatabase(ctx, t, 157)
+			pool, _ := holdPlanDatabase(ctx, t, holdPlanLatestVersion)
+			if _, err := pool.Exec(ctx, `DROP INDEX turns_open_session_id_idx`); err != nil {
+				t.Fatalf("take away 000158's index: %v", err)
+			}
 			probes := storeHoldPlanShape(ctx, t, pool, shape)
 
 			before := map[string]holdPlanMeasurement{}
@@ -428,11 +443,12 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 				}
 			}
 
-			m, mdb := newMigrate(t, connStr)
-			err := m.Migrate(158)
-			_ = mdb.Close()
+			up, err := fs.ReadFile(migrations.FS, "000158_turns_open_session_id_idx.up.sql")
 			if err != nil {
-				t.Fatalf("migrate to 158: %v", err)
+				t.Fatalf("read 000158: %v", err)
+			}
+			if _, err := pool.Exec(ctx, string(up)); err != nil {
+				t.Fatalf("build 000158's index again: %v", err)
 			}
 
 			for _, statement := range unchanged {
