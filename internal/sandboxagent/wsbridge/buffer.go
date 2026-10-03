@@ -11,15 +11,28 @@ import "sync"
 const outboundBufferCap = 1000
 
 // outboundEntry is one buffered, already-marshaled outbound message.
-// payload is the exact bytes written to the wire, stored once at Send time
-// so a resend never re-marshals (and can never re-marshal to something
-// subtly different).
+// payload is the bytes written to the wire, stored once at Send time so a
+// resend never re-marshals (and can never re-marshal to something subtly
+// different) -- except on a connection that reads less than payload, which
+// is written Fit's cut of it instead: deterministic, so every such write
+// of one entry to one bound is byte-identical too.
 type outboundEntry struct {
 	// ackID is "" for a non-critical (best-effort) entry -- only critical
 	// entries are ever looked up/removed by ack().
 	ackID    string
 	critical bool
 	payload  []byte
+	// cutPath is the path, from the frame's top level, of the one string
+	// SendBestEffort cut when the event was over platform.MaxEventFrameBytes
+	// (the enqueue cap, doc.go's "What a connection writes"); nil for an
+	// entry buffered whole. A connection that reads less is written a cut
+	// of that same string (Fit), which keeps the total the first cut
+	// recorded.
+	cutPath []string
+	// notice marks a warning this package raised itself about another
+	// entry it could not write (Bridge.warnOnce). A notice is never itself
+	// warned about: on a connection too small even for it, it is skipped.
+	notice bool
 	// seq is the entry's position in send order, assigned by add and never
 	// reused: flushBuffer uses it to pick up exactly the entries added
 	// while it was already writing, and eviction/ack never reorder it.
@@ -77,32 +90,37 @@ func newOutboundBuffer() *outboundBuffer {
 }
 
 // add appends entry, stamped with the next send-order seq, evicting one
-// existing entry first if evictionDecision says to.
-func (b *outboundBuffer) add(entry outboundEntry) {
+// existing entry first if evictionDecision says to. It returns entry as
+// buffered, its seq set, and the seq of the entry it evicted, if any, so
+// the caller can forget what it knew of that entry (Bridge.warned).
+func (b *outboundBuffer) add(entry outboundEntry) (added outboundEntry, evictedSeq uint64, evicted bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	if idx, evict := evictionDecision(b.entries, entry, outboundBufferCap); evict {
+		evictedSeq, evicted = b.entries[idx].seq, true
 		b.entries = append(b.entries[:idx], b.entries[idx+1:]...)
 	}
 	entry.seq = b.nextSeq
 	b.nextSeq++
 	b.entries = append(b.entries, entry)
+	return entry, evictedSeq, evicted
 }
 
-// ack permanently removes the critical entry matching ackID, if present.
-// Acking an unknown or already-removed ackID (e.g. a duplicate ack after a
-// reconnect) is a silent no-op -- never an error.
-func (b *outboundBuffer) ack(ackID string) {
+// ack permanently removes the critical entry matching ackID, if present,
+// and returns its seq. Acking an unknown or already-removed ackID (e.g. a
+// duplicate ack after a reconnect) is a silent no-op -- never an error.
+func (b *outboundBuffer) ack(ackID string) (seq uint64, removed bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
 	for i, e := range b.entries {
 		if e.critical && e.ackID == ackID {
 			b.entries = append(b.entries[:i], b.entries[i+1:]...)
-			return
+			return e.seq, true
 		}
 	}
+	return 0, false
 }
 
 // snapshot returns a stable copy of every currently-buffered entry, in

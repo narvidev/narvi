@@ -2,8 +2,10 @@ package wsbridge
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -88,10 +90,25 @@ type Bridge struct {
 	// flushBuffer (run.go).
 	connMu sync.Mutex
 	conn   *websocket.Conn
+	// connBound is the largest message conn's peer reads, published with
+	// conn: the control plane's platform.MaxFrameBytesHeader, or
+	// platform.DefaultFrameReadLimitBytes when its handshake stated none
+	// (frameWriteBound, run.go). Every live write on conn is fitted to it
+	// (bestEffortSend), as every replayed one is (flushBuffer). 0 while
+	// conn is nil.
+	connBound int
 	// replayDone is non-nil while a fresh connection replays the buffer,
 	// and closed when that replay ends, whether it caught up or failed. A
 	// send made meanwhile buffers its entry, then waits on it (enqueue).
 	replayDone chan struct{}
+
+	// warnMu guards warned: the seqs of the buffered entries a warning
+	// has already gone out for, because a connection could not be written
+	// them (warnOnce). One warning per buffered entry, however many
+	// connections skip it; an entry is forgotten when it leaves the buffer,
+	// by eviction or ack. Never held while taking connMu.
+	warnMu sync.Mutex
+	warned map[uint64]struct{}
 
 	// flushWriteHook, when non-nil, runs after flushBuffer writes each
 	// entry; enqueueHeldHook runs when a send has buffered its entry and is
@@ -197,6 +214,7 @@ func New(
 		reconnectMaxBackoff: reconnectMaxBackoff,
 
 		buffer: newOutboundBuffer(),
+		warned: make(map[uint64]struct{}),
 
 		lastBootPhase: &initialPhase,
 
@@ -208,10 +226,14 @@ func (b *Bridge) setConn(c *websocket.Conn) {
 	b.connMu.Lock()
 	defer b.connMu.Unlock()
 	b.conn = c
+	if c == nil {
+		b.connBound = 0
+	}
 }
 
-// enqueue buffers entry and returns the connection to write it on right
-// now, or nil when there is none.
+// enqueue buffers entry and returns it as buffered (its seq set), with the
+// connection to write it on right now and the largest message that
+// connection's peer reads (connBound), or nil and 0 when there is none.
 //
 // While a fresh connection is still replaying the buffer, the replay
 // itself writes the entry, after every older one, and enqueue HOLDS the
@@ -228,13 +250,13 @@ func (b *Bridge) setConn(c *websocket.Conn) {
 // the replay in one too, so an entry is always either written by the
 // replay or written live after it -- never live in the middle of it, and
 // never buffered behind a replay that has already made its last check.
-func (b *Bridge) enqueue(ctx context.Context, entry outboundEntry) *websocket.Conn {
+func (b *Bridge) enqueue(ctx context.Context, entry outboundEntry) (outboundEntry, *websocket.Conn, int) {
 	b.connMu.Lock()
-	b.buffer.add(entry)
-	conn, replay := b.conn, b.replayDone
+	entry = b.bufferLocked(entry)
+	conn, bound, replay := b.conn, b.connBound, b.replayDone
 	b.connMu.Unlock()
 	if replay == nil {
-		return conn
+		return entry, conn, bound
 	}
 	if b.enqueueHeldHook != nil {
 		b.enqueueHeldHook()
@@ -243,7 +265,82 @@ func (b *Bridge) enqueue(ctx context.Context, entry outboundEntry) *websocket.Co
 	case <-replay:
 	case <-ctx.Done():
 	}
-	return nil
+	return entry, nil, 0
+}
+
+// enqueueNoHold buffers entry without waiting on a running replay, and
+// returns it as buffered. It is for the warnings warnOnce raises from
+// inside flushBuffer, on Run's own goroutine: holding there would wait on
+// the very replay that goroutine is running. A replay in progress writes
+// the entry itself, after every older one; otherwise the caller writes it,
+// or the next connection's replay does.
+func (b *Bridge) enqueueNoHold(entry outboundEntry) outboundEntry {
+	b.connMu.Lock()
+	defer b.connMu.Unlock()
+	return b.bufferLocked(entry)
+}
+
+// bufferLocked adds entry to the buffer and forgets any warning sent for
+// the entry its add evicted. connMu must be held.
+func (b *Bridge) bufferLocked(entry outboundEntry) outboundEntry {
+	added, evictedSeq, evicted := b.buffer.add(entry)
+	if evicted {
+		b.forgetWarned(evictedSeq)
+	}
+	return added
+}
+
+// warnOnce buffers, once per buffered entry, a best-effort warning that
+// entry was not written on a connection whose peer reads at most bound
+// bytes (Fit could not make it fit), naming its type, messageId, size and
+// that bound; it returns the warning as buffered, and false when a warning
+// already went out for entry, or entry is itself such a warning. It never
+// waits on a running replay (enqueueNoHold): a replay in progress writes
+// the warning itself; a live caller writes it on its own connection
+// (bestEffortSend).
+//
+// Each warning carries a fresh messageId, so its replays dedupe on the
+// control plane. Once per buffered entry, not per messageId: a tool_call
+// and its tool_result carry the same messageId, their enclosing message's.
+func (b *Bridge) warnOnce(entry outboundEntry, bound int) (outboundEntry, bool) {
+	if entry.notice {
+		return outboundEntry{}, false
+	}
+	b.warnMu.Lock()
+	_, done := b.warned[entry.seq]
+	if !done {
+		b.warned[entry.seq] = struct{}{}
+	}
+	b.warnMu.Unlock()
+	if done {
+		return outboundEntry{}, false
+	}
+	slog.Warn("wsbridge: event not written on this connection: over what its control plane reads, and no cut fits it",
+		"bytes", len(entry.payload), "bound_bytes", bound, "critical", entry.critical)
+	payload, err := b.warningPayload(frameNotWrittenMessage(entry.payload, bound))
+	if err != nil {
+		return outboundEntry{}, false
+	}
+	return b.enqueueNoHold(outboundEntry{payload: payload, notice: true}), true
+}
+
+// forgetWarned drops seq from warned: its entry has left the buffer.
+func (b *Bridge) forgetWarned(seq uint64) {
+	b.warnMu.Lock()
+	defer b.warnMu.Unlock()
+	delete(b.warned, seq)
+}
+
+// warningPayload encodes a best-effort warning event carrying message,
+// under a fresh messageId.
+func (b *Bridge) warningPayload(message string) ([]byte, error) {
+	return json.Marshal(sandboxws.Warning{
+		Type:      "warning",
+		MessageId: b.newMessageID(),
+		SessionId: b.sessionID,
+		Gen:       b.sessionGen,
+		Message:   message,
+	})
 }
 
 // endReplay closes and clears replayDone, releasing every send held behind
