@@ -803,7 +803,7 @@ func (a *Actor) tryPlanReenqueue(
 	// (D1/D4/D6, second adversarial-review round: see that handler's own
 	// doc comment for the full "why refuse rather than degrade").
 	messageID := uuid.NewString()
-	if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+	if _, err := a.turnWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 		ID: target.ID,
 		// The turn's own CURRENT status, passed back unchanged -- this is
 		// NOT a transition (no turn.Transition call; see this function's
@@ -1422,7 +1422,7 @@ func (a *Actor) endTurnsOnSpawnRefusal(ctx context.Context, tx pgx.Tx, sessionRo
 		if err != nil {
 			return fmt.Errorf("sessionactor: end turn %s on a refused spawn: %w", t.ID.String(), err)
 		}
-		if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		if _, err := a.turnWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 			ID:          t.ID,
 			Status:      sqlcgen.TurnStatus(to),
 			CompletedAt: pgtype.Timestamptz{Time: now, Valid: true},
@@ -2122,7 +2122,7 @@ func (a *Actor) tryPlanDispatch(
 	// verdict-posting turn BY, instead of "whichever turn is processing
 	// for this session right now".
 	messageID := uuid.NewString()
-	if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+	if _, err := a.turnWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 		ID:                   turnID,
 		Status:               sqlcgen.TurnStatus(toDispatched),
 		DispatchedAt:         pgtype.Timestamptz{Time: now, Valid: true},
@@ -2159,7 +2159,7 @@ func (a *Actor) tryPlanDispatch(
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: turn transition dispatched->processing: %w", err)
 	}
-	if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+	if _, err := a.turnWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 		ID:     turnID,
 		Status: sqlcgen.TurnStatus(toProcessing),
 	}); err != nil {
@@ -2492,7 +2492,7 @@ func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, fail
 		}
 
 		now := time.Now()
-		if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		if _, err := a.turnWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 			ID:          turnID,
 			Status:      sqlcgen.TurnStatus(to),
 			CompletedAt: pgtype.Timestamptz{Time: now, Valid: true},

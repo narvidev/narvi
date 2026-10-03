@@ -1042,6 +1042,47 @@ func (q *Queries) RequestStopOpenTurns(ctx context.Context, sessionID pgtype.UUI
 	return items, nil
 }
 
+const reviewRetriggerHeld = `-- name: ReviewRetriggerHeld :one
+SELECT EXISTS (
+    SELECT 1 FROM turns t
+    WHERE t.session_id = $1
+      AND t.status IN ('pending', 'dispatched', 'processing')
+) AS held
+`
+
+// Technical plan §24.9: whether the re-review debounce of this session
+// holds -- some turn of the session is still open (pending, dispatched or
+// processing), so an automatic review would queue behind it with a prompt
+// built for a head that may move again before it runs. Read by the
+// debounce's fire (sessionactor's readReviewRetriggerState, then again in
+// finishReviewRetrigger just before the insert) inside the actor's
+// transaction, under the session's actor-epoch row lock that every turn
+// insert on an existing session also takes, so the answer is consistent
+// with every turn insert.
+//
+// The open states are listed, not the terminal ones excluded, for the
+// planner's sake. Its estimate of "status is none of the three terminal
+// states" sums their frequencies as disjoint, and when a table of ended
+// turns rounds those frequencies to a hair over the whole, it finds the
+// sum out of range and falls back to treating them as independent: about
+// 30% of a long session's turns read as open, and a custom plan then scans
+// the table sequentially for the first one (measured: 910 buffers on
+// 80,000 turns, against 2). Listing the open states estimates what is
+// there, next to nothing. turns_open_session_id_idx (migrations/000158)
+// keeps the deny list -- every state but the three terminal ones -- and
+// this list implies it, so the read is one probe of that index under a
+// custom plan and a generic one alike, never a walk of the session's
+// history. The list is turn.IsTerminal's complement today, and
+// TestReviewRetriggerHold_HeldMatchesTurnIsTerminal fails the day
+// turn_status gains a state, so the hold never quietly reads a new open
+// state as ended.
+func (q *Queries) ReviewRetriggerHeld(ctx context.Context, sessionID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, reviewRetriggerHeld, sessionID)
+	var held bool
+	err := row.Scan(&held)
+	return held, err
+}
+
 const setTurnEpistemicOutcome = `-- name: SetTurnEpistemicOutcome :execrows
 UPDATE turns
 SET epistemic_outcome = $2

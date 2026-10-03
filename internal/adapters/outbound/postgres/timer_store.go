@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -48,6 +49,37 @@ func (s *TimerStore) Upsert(ctx context.Context, arg sqlcgen.UpsertSessionTimerP
 // that failed, or a prompt its sandbox never received (technical plan §2).
 func (s *TimerStore) BackOffDispatch(ctx context.Context, arg sqlcgen.BackOffSessionDispatchTimerParams) (int64, error) {
 	return s.q.BackOffSessionDispatchTimer(ctx, arg)
+}
+
+// HoldReviewRetriggerDebounce re-arms the session's re-review debounce
+// backstop ahead of the database's now, stamping armed_at with that now and
+// keeping created_at, and reports how many rows it moved: zero when the
+// session has no debounce, or only one armed at or before its standing stop
+// request. It never inserts one. The session actor's held firing
+// (technical plan §24.9); see HoldReviewRetriggerDebounce's doc comment in
+// queries/session_timers.sql.
+func (s *TimerStore) HoldReviewRetriggerDebounce(ctx context.Context, sessionID pgtype.UUID, backstop time.Duration) (int64, error) {
+	return s.q.HoldReviewRetriggerDebounce(ctx, sqlcgen.HoldReviewRetriggerDebounceParams{
+		BackstopSeconds: backstop.Seconds(),
+		SessionID:       sessionID,
+	})
+}
+
+// WakeReviewRetriggerDebounce moves the session's held re-review debounce
+// -- one last armed at least heldLead before its fires_at: a row the hold
+// re-armed, or one the pump claimed after its quiet window ran out, whose
+// wake-up is harmless -- to the database's now, stamping armed_at and
+// keeping created_at, and reports how many rows it moved: zero when the
+// session has no debounce, only a push's window still running, or only
+// one armed at or before its standing stop request. It never inserts one. The session
+// actor runs it in the transaction of every write that ends a turn
+// (technical plan §24.9); see WakeReviewRetriggerDebounce's doc comment in
+// queries/session_timers.sql.
+func (s *TimerStore) WakeReviewRetriggerDebounce(ctx context.Context, sessionID pgtype.UUID, heldLead time.Duration) (int64, error) {
+	return s.q.WakeReviewRetriggerDebounce(ctx, sqlcgen.WakeReviewRetriggerDebounceParams{
+		SessionID:       sessionID,
+		HeldLeadSeconds: heldLead.Seconds(),
+	})
 }
 
 // DeleteDispatch deletes the session's dispatch timer and returns the

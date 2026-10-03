@@ -25,7 +25,14 @@
 // also happens at debounce-fire time, in the actor, not here; this
 // handler arms the SAME timer/pending-head-sha pair for a PR regardless
 // of whether the repo has opted in, deliberately keeping this webhook
-// handler thin (§24.3 step 1 is what actually gates on it).
+// handler thin (§24.3 step 1 is what actually gates on it). Nor does it
+// look at the session's turns: a push that lands while a review of the
+// session is running arms the debounce like any other, and the fire then
+// holds (§24.9) -- this push's head stays the target, the debounce re-arms
+// itself, and the turn's end wakes it -- so a burst of pushes during one
+// review yields one further review, of the head pushed last. A push the
+// fire has not held yet keeps its quiet window: a turn's end does not cut
+// it short.
 //
 // # Why a direct, actor-bypassing write
 //

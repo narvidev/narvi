@@ -51,6 +51,14 @@ func (s *TurnStore) Create(ctx context.Context, arg sqlcgen.CreateTurnParams) (s
 // together or not at all, which two autocommit statements cannot promise.
 var ErrTurnOutsideTransaction = errors.New("postgres: a turn is created only inside a transaction, with its dispatch timer")
 
+// ErrTurnNotPending is CreateAndArmDispatch's answer for a turn that would
+// not be created pending. A turn ends only through UpdateStatus, whose
+// terminal writes the session actor notes so the re-review debounce wakes
+// in the same transaction (technical plan §24.9); a turn inserted already
+// terminal would end with no wake-up at all. Every production caller
+// creates a pending turn.
+var ErrTurnNotPending = errors.New("postgres: a turn is created pending")
+
 // CreateAndArmDispatch is the one way production code creates a turn
 // (technical plan §2, §3.3): it inserts the turn and, in the same
 // transaction, arms the session's dispatch timer due at once on the
@@ -63,7 +71,8 @@ var ErrTurnOutsideTransaction = errors.New("postgres: a turn is created only ins
 // The actor deletes the timer at the start of every dispatch evaluation
 // (sessionactor's planDispatch), so after a trigger that succeeded it is
 // gone within that evaluation. Refuses with ErrTurnOutsideTransaction on a
-// store not built by WithTx, writing nothing.
+// store not built by WithTx, and with ErrTurnNotPending for a turn whose
+// status is not pending, writing nothing either way.
 //
 // A caller writing to a session that already exists holds the session's
 // actor-epoch row lock (SessionStore.GetActorEpochForUpdate) in the same
@@ -75,6 +84,9 @@ var ErrTurnOutsideTransaction = errors.New("postgres: a turn is created only ins
 func (s *TurnStore) CreateAndArmDispatch(ctx context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error) {
 	if !s.bound {
 		return sqlcgen.Turn{}, ErrTurnOutsideTransaction
+	}
+	if arg.Status != sqlcgen.TurnStatusPending {
+		return sqlcgen.Turn{}, fmt.Errorf("%w: status %q", ErrTurnNotPending, arg.Status)
 	}
 	created, err := s.q.CreateTurn(ctx, arg)
 	if err != nil {
@@ -162,9 +174,23 @@ func (s *TurnStore) NewestReviewAttempt(ctx context.Context, sessionID pgtype.UU
 
 // UpdateStatus sets a turn's status, plus dispatched_at/completed_at when
 // the caller supplies one (see UpdateTurnStatusParams' generated doc for
-// the COALESCE semantics).
+// the COALESCE semantics). It is the one write of turns.status, and the
+// session actor reaches it only through its recorder
+// (sessionactor's turnWrites), which notes a terminal write so the
+// re-review debounce wakes in the same transaction (technical plan §24.9);
+// TestTurnStatusWritesGoThroughTheRecorder keeps every caller there.
 func (s *TurnStore) UpdateStatus(ctx context.Context, arg sqlcgen.UpdateTurnStatusParams) (sqlcgen.Turn, error) {
 	return s.q.UpdateTurnStatus(ctx, arg)
+}
+
+// ReviewRetriggerHeld reports whether some turn of sessionID is still open
+// -- pending, dispatched or processing -- so the re-review debounce's fire
+// holds instead of inserting an automatic review (technical plan §24.9).
+// Meaningful on a store built via WithTx, under the session's actor-epoch
+// row lock, which every turn insert on an existing session also takes. See
+// ReviewRetriggerHeld's doc comment in queries/turns.sql.
+func (s *TurnStore) ReviewRetriggerHeld(ctx context.Context, sessionID pgtype.UUID) (bool, error) {
+	return s.q.ReviewRetriggerHeld(ctx, sessionID)
 }
 
 // MarkProgressNotified atomically sets id's own progress_notified_at to

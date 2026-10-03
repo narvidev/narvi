@@ -80,9 +80,14 @@ const (
 //     not -- never the review session's own, since a review session never
 //     pushes; §24): when it fires, an opted-in repo whose
 //     head moved and whose budget allows gets a new review turn, inserted
-//     by the actor with no further input (reviewretrigger.go). Otherwise it
-//     declines and deletes itself. TimerCountsAsScheduledWork narrows it by
-//     the opt-in and the budget, which the status reads in its snapshot.
+//     by the actor with no further input (reviewretrigger.go). While a turn
+//     of the session is open it holds instead, re-arming itself at
+//     ReviewRetriggerHoldBackstop with the pushed head kept as its target,
+//     and every turn end moves a held one -- never a push's quiet window
+//     -- to now in that end's own transaction (technical plan §24.9).
+//     Otherwise it declines and deletes itself.
+//     TimerCountsAsScheduledWork narrows it by the opt-in and the budget,
+//     which the status reads in its snapshot.
 //   - dispatch (armed due at once in the transaction that creates a turn,
 //     postgres.TurnStore.CreateAndArmDispatch; technical plan §2, §3.3):
 //     its firing is a dispatch evaluation (handleEnsureDispatched), which

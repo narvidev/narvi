@@ -131,12 +131,16 @@ type storeBundle struct {
 	handoffSentinelRuns *postgres.HandoffSentinelStore
 
 	// workflow is §25.6's ("workflow execution engine", §25.6) own
-	// addition: pushpr.go's completeProcessingTurn, timerfired.go's
-	// handleTurnDeadlineTimer, and dispatch.go's failDispatchedTurn each
-	// call internal/app/workflowengine.OnTurnCompleted with this store
-	// (WithTx'd onto their own already-open transact) the moment a turn
-	// reaches a real terminal state -- see that package's own doc.go for
-	// why all three call sites matter, not just the first.
+	// addition: every one of the six writes that ends a turn hands the end
+	// to internal/app/workflowengine with this store (WithTx'd onto its own
+	// already-open transact) -- pushpr.go's completeProcessingTurn,
+	// timerfired.go's handleTurnDeadlineTimer and stop.go's
+	// cancelStoppedTurns through OnTurnCompleted; dispatch.go's
+	// failDispatchedTurn through OnTurnCompleted or, for a policy refusal,
+	// OnTurnRefused; and dispatch.go's endTurnsOnSpawnRefusal and
+	// credentialgate.go's refusePersonalLinkOnly through OnTurnRefused. See
+	// that package's own doc.go for why every ending matters, and
+	// turnstatus.go for the list of those writes.
 	workflow *postgres.WorkflowStore
 
 	// repoSettings is §4.1's ("RWX provider + previews", §4.1.2 point

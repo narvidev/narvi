@@ -61,6 +61,29 @@
 // this firing's own "re-arm" half of that contract, so this handler
 // simply leaves it alone instead of performing its own now-stale
 // "delete" half on top of it.
+//
+// # One automatic review at a time (technical plan §24.9)
+//
+// A review runs far longer than the debounce's quiet window, so pushes
+// landing during one, each more than a window after the last, would each
+// insert a review turn queued behind it, each spending a slot of §24.6's
+// budget and each built for a head that no longer exists when it runs. So
+// the fire holds while any turn of the session is open (pending,
+// dispatched or processing): after the opt-in, the revocation, the heads
+// comparison and the budget have decided, it reads the hold
+// (reviewRetriggerHeld) and, held, inserts nothing, spends nothing, keeps
+// pending_retrigger_head_sha as the target and re-arms the same debounce
+// row at ReviewRetriggerHoldBackstop (holdReviewRetrigger), an update
+// that never re-creates a row a person's stop deleted. The hold is read
+// again at the insert, since a person's turn can be committed while phase
+// 2 fetches. Every write that ends a turn goes through turnWrites
+// (turnstatus.go), and transact then moves the held debounce to now in
+// that same transaction, so the review the hold kept back runs as soon as
+// the session is free, for the head pushed last; a push's quiet window
+// that has not held yet is left to run out (§24.2). Anything that launches a
+// review through this debounce -- setting the pending head and arming the
+// timer -- is held the same way. A person's trigger (the label, the
+// button, a mention) inserts its turn directly and is never held.
 
 package sessionactor
 
@@ -469,6 +492,19 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 		case prSession.AutoRetriggerCount >= ReviewAutoRetriggerBudget:
 			base.action = reviewRetriggerActionBudgetExhausted
 		default:
+			// §24.9: an automatic review waits for every open turn of the
+			// session. Read after the opt-in, the revocation, the heads
+			// comparison and the budget, so a held firing never spends
+			// budget, never delays the budget notice, and never keeps a
+			// debounce the opt-in or a revocation would drop.
+			held, err := a.reviewRetriggerHeld(ctx, tx)
+			if err != nil {
+				return err
+			}
+			if held {
+				// decision stays nil: fully handled in this transaction.
+				return a.holdReviewRetrigger(ctx, tx, prSession.RepoFullName, prSession.PrNumber)
+			}
 			base.action = reviewRetriggerActionEnqueue
 		}
 		decision = &base
@@ -478,6 +514,56 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 		return nil, err
 	}
 	return decision, nil
+}
+
+// reviewRetriggerHeld reports whether this session's re-review debounce
+// holds (technical plan §24.9): some turn of the session is still pending,
+// dispatched or processing. Read inside tx, which transact opened under the
+// session's actor-epoch row lock -- the lock every turn insert on an
+// existing session takes too -- so a turn committed before the lock is
+// seen, and one committed after it was inserted after this firing decided.
+func (a *Actor) reviewRetriggerHeld(ctx context.Context, tx pgx.Tx) (bool, error) {
+	held, err := a.stores.turn.WithTx(tx).ReviewRetriggerHeld(ctx, a.sessionID)
+	if err != nil {
+		return false, fmt.Errorf("sessionactor: read the re-review hold: %w", err)
+	}
+	return held, nil
+}
+
+// holdReviewRetrigger is a firing that holds (technical plan §24.9): it
+// inserts no turn and spends no budget, keeps pending_retrigger_head_sha --
+// the head pushed last, which the next push may still replace -- as the
+// review's target, and re-arms the one debounce row
+// ReviewRetriggerHoldBackstop ahead, on the database's clock
+// (TimerStore.HoldReviewRetriggerDebounce): that lead is the mark the
+// wake-up reads as held. The re-arm keeps the row's created_at, so a
+// person's stop still sees when the debounce was first armed
+// (disarmWorkCreatingTimers), and stamps armed_at like every arm. The
+// write that ends the turn holding it moves the row to now in its own
+// transaction (wakeReviewRetriggerIfTurnEnded), so the backstop only
+// bounds a wake-up that was lost; meanwhile the row keeps the session's
+// status reading the work as still to come (§43.20).
+//
+// The re-arm is an update, never an insert, under the stop's own rule.
+// When it moves no row, the firing's decision is dropped: the row is gone
+// -- a person's stop deleted it while this firing, claimed before, waited
+// in the mailbox -- and stays gone, or it was armed at or before the
+// session's standing stop request, and is deleted here as the stop timer
+// would delete it. Either way no debounce outlives the stop to be woken
+// by the stopped turn's end.
+func (a *Actor) holdReviewRetrigger(ctx context.Context, tx pgx.Tx, repoFullName string, prNumber int32) error {
+	held, err := a.stores.timer.WithTx(tx).HoldReviewRetriggerDebounce(ctx, a.sessionID, a.timeouts.ReviewRetriggerHoldBackstop)
+	if err != nil {
+		return fmt.Errorf("sessionactor: re-arm the held re-review debounce: %w", err)
+	}
+	if held == 0 {
+		a.logger.Info("sessionactor: review_retrigger_debounce: a turn of this review session is open, but the debounce is gone or predates a person's standing stop; dropping it",
+			"repo_full_name", repoFullName, "pr_number", prNumber)
+		return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
+	}
+	a.logger.Info("sessionactor: review_retrigger_debounce: held: a turn of this review session is open; the pushed head stays the target",
+		"repo_full_name", repoFullName, "pr_number", prNumber)
+	return nil
 }
 
 // fetchAutoRetriggerReviewContext live-fetches this PR's own current
@@ -573,6 +659,18 @@ func (a *Actor) finishReviewRetrigger(ctx context.Context, decision *reviewRetri
 			return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
 
 		case reviewRetriggerActionEnqueue:
+			// §24.9: the hold read again, at the insert. A person's turn
+			// (a mention, the label, the button, REST) can be committed
+			// while phase 2 fetched the pull request with no transaction
+			// open; it holds the lane like any other open turn. The prompt
+			// phase 2 composed is discarded, and enqueued stays false.
+			held, err := a.reviewRetriggerHeld(ctx, tx)
+			if err != nil {
+				return err
+			}
+			if held {
+				return a.holdReviewRetrigger(ctx, tx, decision.repoFullName, decision.prNumber)
+			}
 			// Rereview fix (finding 4): mirror createTurnLocked's own
 			// awaiting-plan gate (internal/adapters/inbound/httpapi/
 			// turn.go) -- an ordinary (planMode == false) turn, which

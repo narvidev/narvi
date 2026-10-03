@@ -160,7 +160,7 @@ func (a *Actor) refusePersonalLinkOnly(ctx context.Context, tx pgx.Tx, sessionRo
 	if err != nil {
 		return fmt.Errorf("sessionactor: refuse turn %s: %w", target.ID.String(), err)
 	}
-	if _, err := a.stores.turn.WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+	if _, err := a.turnWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 		ID:          target.ID,
 		Status:      sqlcgen.TurnStatus(to),
 		CompletedAt: pgtype.Timestamptz{Time: now, Valid: true},
