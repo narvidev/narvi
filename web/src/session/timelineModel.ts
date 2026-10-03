@@ -220,6 +220,11 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
   let sawAgentReady = false
 
   let currentTurn: TurnNode | null = null
+  // Set while the last turn the log ended was ended by the control plane's
+  // own synthetic execution_complete and no turn has opened since: the
+  // agent's own end of that turn may still arrive (turn_deadline does not
+  // stop the agent), and it ends nothing.
+  let endedByControlPlane = false
   // Per-turn correlation state -- reset every time a new turn opens
   // (this module's own top comment: turn-scoped, never bled across a
   // turn boundary even if a producer somehow reused an id).
@@ -248,6 +253,7 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
       currentTurn = { firstEventId, steps: [], subTasks: [], outcome: null, live: true }
       turns.push(currentTurn)
       resetTurnState()
+      endedByControlPlane = false
     }
     return currentTurn
   }
@@ -385,7 +391,13 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
     }
     const subTaskFinish = asSubTaskFinish(event)
     if (subTaskFinish !== null) {
-      ensureTurn(event.id) // see the identical call in the sub_task_start branch above for why
+      // A finish closes a lane the log already opened, so it never opens a
+      // turn: with no turn open it is the agent closing a sub-task of the
+      // turn that just ended -- the control plane ends a turn without
+      // stopping its agent, and a sub_task_finish, critical, is stored
+      // however late -- and it reaches that turn's lane, still in
+      // subTasksById, or else orphanedSubTasks. A turn opened at it would
+      // never end.
       const existing = subTasksById.get(subTaskFinish.subTaskId)
       if (existing) {
         existing.status = subTaskStatusFromOutcome(subTaskFinish.outcome)
@@ -518,6 +530,12 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
     // when a turn ends without one (asTurnEnd): either ends the turn.
     const turnEnd = asTurnEnd(event)
     if (turnEnd !== null) {
+      // The agent's own end of a turn the control plane already ended, no
+      // turn event between them: the server records nothing for it
+      // (completeProcessingTurn finds no turn processing and leaves the turn
+      // as its synthetic end left it), and neither does the page -- a turn
+      // opened at it would be one the server never had.
+      if (!turnEnd.synthetic && endedByControlPlane) continue
       const turn = ensureTurn(event.id)
       if (turnEnd.subTaskId) continue
       turn.outcome = { outcome: turnEnd.outcome, reason: turnEnd.reason }
@@ -525,6 +543,7 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
       for (const step of turn.steps) step.live = false
       settleUnattachedSubTasks(turn)
       currentTurn = null // the NEXT turn-scoped event (if any) starts fresh
+      endedByControlPlane = turnEnd.synthetic
       continue
     }
     // Every other recognized/unrecognized type (heartbeat, git_sync,

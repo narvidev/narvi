@@ -61,8 +61,9 @@ describe('buildTimelineModel', () => {
   it('ends a turn at the synthetic execution_complete the control plane writes, with its reason, and opens the next turn fresh', () => {
     // The control plane's own turn end carries {turn_id, synthetic, reason}
     // and no messageId or outcome (timerfired.go's turn_deadline, stop.go,
-    // dispatch.go, credentialgate.go): a stop's is cancelled, every other
-    // failed.
+    // dispatch.go, credentialgate.go), and `dispatched: true` when the turn
+    // it ends was the one in flight (syntheticend.go): a stop's is
+    // cancelled, every other failed.
     for (const [reason, outcome] of [
       ['timeout', 'failed'],
       ['stopped', 'cancelled'],
@@ -70,7 +71,7 @@ describe('buildTimelineModel', () => {
     ] as const) {
       const events = [
         env('tool_call', { messageId: 'm1', callId: 'c1', toolName: 'Bash', input: {} }),
-        env('execution_complete', { turn_id: 't1', synthetic: true, reason }),
+        env('execution_complete', { turn_id: 't1', synthetic: true, dispatched: true, reason }),
         env('tool_call', { messageId: 'm2', callId: 'c2', toolName: 'Read', input: {} }),
       ]
       const model = buildTimelineModel(events)
@@ -81,13 +82,123 @@ describe('buildTimelineModel', () => {
     }
   })
 
-  it('reads an execution_complete that is neither the agent\'s nor a synthetic one as no turn end', () => {
+  it('reads an execution_complete that is neither the agent\'s nor a dispatched turn\'s synthetic one as no turn end', () => {
     const events = [
       env('tool_call', { messageId: 'm1', callId: 'c1', toolName: 'Bash', input: {} }),
       env('execution_complete', { turn_id: 't1', synthetic: false, reason: 'timeout' }),
-      env('execution_complete', { turn_id: 't1', synthetic: true, reason: 7 }),
+      env('execution_complete', { turn_id: 't1', synthetic: true, dispatched: true, reason: 7 }),
+      // A pending turn's end, or one stored before the stamp: no end of the page's turn.
+      env('execution_complete', { turn_id: 't2', synthetic: true, reason: 'timeout' }),
     ]
     expect(buildTimelineModel(events).turns.map((t) => t.live)).toEqual([true])
+  })
+
+  // A synthetic execution_complete ends the turn the page shows only when it
+  // is the end of the session's turn in flight, and the agent's own end of a
+  // turn the control plane already ended ends nothing (the server leaves the
+  // turn as the synthetic end left it). Turn A runs; turn B, queued behind
+  // it, is cancelled at once by a person's stop (stop.go: a pending turn's
+  // synthetic end, no `dispatched` stamp) while A goes on through its stop
+  // grace; or A times out (turn_deadline: a dispatched turn's synthetic end)
+  // and its agent's own end follows.
+  describe('the turn a synthetic end ends', () => {
+    const scenario = (tail: EventEnvelope[]): EventEnvelope[] => [
+      env('step_start', { messageId: 'msgA', stepId: 'prtA_start' }),
+      env('tool_call', { messageId: 'msgA', callId: 'cA1', toolName: 'bash', input: {} }),
+      env('token', { messageId: 'prtA_text', text: 'working on' }),
+      ...tail,
+    ]
+    const queuedStopped = () => env('execution_complete', { turn_id: 'turnB', synthetic: true, reason: 'stopped' })
+    const aRest = () => [
+      env('tool_result', { messageId: 'msgA', callId: 'cA1', output: { output: 'ok' }, isError: false }),
+      env('token', { messageId: 'prtA_text', text: 'working on it, done' }),
+      env('step_finish', { messageId: 'msgA', stepId: 'prtA_finish', cost: { tokens: { input: 10, output: 5 }, usd: 0.5 } }),
+    ]
+    const shape = (events: EventEnvelope[]) =>
+      buildTimelineModel(events).turns.map((t) => ({
+        live: t.live,
+        outcome: t.outcome,
+        steps: t.steps.map((s) => s.stepId),
+        results: t.steps.flatMap((s) => s.toolCalls).map((c) => [c.callId, c.result === null ? null : 'result']),
+      }))
+
+    it('S1: a queued turn is stopped, and the running turn completes anyway: one turn, completed, holding all its events', () => {
+      const events = scenario([queuedStopped(), ...aRest(), env('execution_complete', { messageId: 'ecA', outcome: 'completed', reason: null })])
+      expect(shape(events)).toEqual([{ live: false, outcome: { outcome: 'completed', reason: null }, steps: ['prtA_start'], results: [['cA1', 'result']] }])
+      // Until its own end arrives, the running turn stays live: the queued
+      // turn's end does not end it.
+      expect(shape(events.slice(0, -1))[0]!.live).toBe(true)
+    })
+
+    it('S2: a queued turn is stopped, and the running turn obeys the stop: one turn, cancelled', () => {
+      const events = scenario([queuedStopped(), env('execution_complete', { messageId: 'ecA', outcome: 'cancelled', reason: null })])
+      expect(shape(events)).toEqual([{ live: false, outcome: { outcome: 'cancelled', reason: null }, steps: ['prtA_start'], results: [['cA1', null]] }])
+    })
+
+    it('S3: the running turn times out, and its agent\'s own end arrives late: one turn, failed by its timeout', () => {
+      const late = scenario([
+        env('execution_complete', { turn_id: 'turnA', synthetic: true, dispatched: true, reason: 'timeout' }),
+        env('sub_task_finish', { messageId: 'sf', subTaskId: 'st_never_started', outcome: 'cancelled' }),
+        env('execution_complete', { messageId: 'ecA', outcome: 'failed', reason: null }),
+      ])
+      const model = buildTimelineModel(late)
+      expect(shape(late)).toEqual([{ live: false, outcome: { outcome: 'failed', reason: 'timeout' }, steps: ['prtA_start'], results: [['cA1', null]] }])
+      expect(model.orphanedSubTasks.map((s) => s.subTaskId)).toEqual(['st_never_started'])
+      // The next turn opens fresh after them, and its own end ends it.
+      const nextEvents = [...late, env('step_start', { messageId: 'msgB', stepId: 'prtB_start' })]
+      expect(buildTimelineModel(nextEvents).turns.map((t) => [t.live, t.steps.map((s) => s.stepId)])).toEqual([
+        [false, ['prtA_start']],
+        [true, ['prtB_start']],
+      ])
+      const nextEnded = buildTimelineModel([...nextEvents, env('execution_complete', { messageId: 'ecB', outcome: 'completed', reason: null })])
+      expect(nextEnded.turns.map((t) => [t.live, t.outcome?.outcome])).toEqual([
+        [false, 'failed'],
+        [false, 'completed'],
+      ])
+    })
+
+    it('a turn the agent ended, then a turn whose only event is its own end: two turns, both ended', () => {
+      const events = [
+        env('step_start', { messageId: 'msgA', stepId: 'prtA_start' }),
+        env('execution_complete', { messageId: 'ecA', outcome: 'completed', reason: null }),
+        env('execution_complete', { messageId: 'ecB', outcome: 'failed', reason: null }),
+      ]
+      expect(buildTimelineModel(events).turns.map((t) => [t.live, t.outcome?.outcome])).toEqual([
+        [false, 'completed'],
+        [false, 'failed'],
+      ])
+    })
+
+    it('S4 (control): the running turn is stopped alone and obeys: one turn, cancelled', () => {
+      const events = scenario([env('execution_complete', { messageId: 'ecA', outcome: 'cancelled', reason: null })])
+      expect(shape(events)).toEqual([{ live: false, outcome: { outcome: 'cancelled', reason: null }, steps: ['prtA_start'], results: [['cA1', null]] }])
+    })
+
+    it('a late sub_task_finish of the turn that ended reaches its lane and opens no turn', () => {
+      const events = [
+        env('tool_call', { messageId: 'msgA', callId: 'ct', toolName: 'task', input: {} }),
+        env('sub_task_start', { messageId: 'ss', subTaskId: 'st1', label: 'lane', parentMessageId: 'msgA', parentCallId: 'ct' }),
+        env('execution_complete', { turn_id: 'turnA', synthetic: true, dispatched: true, reason: 'timeout' }),
+        env('sub_task_finish', { messageId: 'sf', subTaskId: 'st1', outcome: 'cancelled' }),
+      ]
+      const model = buildTimelineModel(events)
+      expect(model.turns).toHaveLength(1)
+      expect(model.turns[0]!.steps[0]!.toolCalls[0]!.subTasks.map((s) => [s.subTaskId, s.status])).toEqual([['st1', 'cancelled']])
+    })
+
+    it('a dispatched turn\'s synthetic end with no turn open shows that turn, ended, even after an earlier synthetic end', () => {
+      const events = [
+        env('step_start', { messageId: 'msgA', stepId: 'prtA_start' }),
+        env('execution_complete', { turn_id: 'turnA', synthetic: true, dispatched: true, reason: 'timeout' }),
+        // Turn B dispatched and its prompt never delivered: no event of its
+        // own but its end.
+        env('execution_complete', { turn_id: 'turnB', synthetic: true, dispatched: true, reason: 'prompt not delivered' }),
+      ]
+      expect(buildTimelineModel(events).turns.map((t) => [t.live, t.outcome?.reason])).toEqual([
+        [false, 'timeout'],
+        [false, 'prompt not delivered'],
+      ])
+    })
   })
 
   it('leaves the trailing turn live with no outcome when execution_complete has not arrived yet', () => {

@@ -157,26 +157,37 @@ export interface TurnEnd {
   reason: string | null
   /** Set only on an agent's execution_complete of a sub-task lane, which ends no turn. */
   subTaskId: string | null
+  /** True for the control plane's own synthetic end, false for the agent's. */
+  synthetic: boolean
 }
 
 /**
  * asTurnEnd reads an `execution_complete` as the end of a turn, from either
  * writer. The agent's carries its outcome (asExecutionComplete). The one the
- * control plane writes when a turn ends without one -- its deadline passes,
- * it is stopped, its dispatch or spawn is refused -- carries only
- * `{turn_id, synthetic: true, reason}` (technical plan §3.3, "a synthetic
+ * control plane writes when it ends a turn itself -- its deadline passes, it
+ * is stopped, its dispatch or spawn is refused -- carries `{turn_id,
+ * synthetic: true, reason}` (technical plan §3.3, "a synthetic
  * execution_complete"), so its outcome is read from its reason: cancelled
- * for a stop, failed for every other. Without this a turn that ended that
- * way stayed live on the page for good, its calls running and its composer
- * locked.
+ * for a stop, failed for every other.
+ *
+ * A synthetic end is a turn end here only when it also carries `dispatched:
+ * true` (internal/app/sessionactor/syntheticend.go): the turn it ends was
+ * the session's one turn in flight, whose events the log holds and the page
+ * is showing. A turn ended from pending -- queued behind a running one and
+ * cancelled by a stop, refused at the credential gate, abandoned on a
+ * refused spawn -- never dispatched and has no event in the log, and ending
+ * the page's turn on its end ended another turn, the one still running. So
+ * does a synthetic end stored before the stamp existed: it reads as it did
+ * before the page read synthetic ends at all, as no end. The page cannot
+ * match an end to its turn by `turn_id`, which no other event names.
  */
 export function asTurnEnd(env: EventEnvelope): TurnEnd | null {
   const agent = asExecutionComplete(env)
-  if (agent !== null) return { outcome: agent.outcome, reason: agent.reason, subTaskId: agent.subTaskId ?? null }
+  if (agent !== null) return { outcome: agent.outcome, reason: agent.reason, subTaskId: agent.subTaskId ?? null, synthetic: false }
   if (env.type !== 'execution_complete' || !isPlainObject(env.payload)) return null
   const p = env.payload
-  if (p.synthetic !== true || !isString(p.reason)) return null
-  return { outcome: p.reason === SYNTHETIC_STOP_REASON ? 'cancelled' : 'failed', reason: p.reason, subTaskId: null }
+  if (p.synthetic !== true || p.dispatched !== true || !isString(p.reason)) return null
+  return { outcome: p.reason === SYNTHETIC_STOP_REASON ? 'cancelled' : 'failed', reason: p.reason, subTaskId: null, synthetic: true }
 }
 
 export function asWarning(env: EventEnvelope): Warning | null {

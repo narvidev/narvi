@@ -325,7 +325,7 @@ describe('Timeline -- a tool call without a result', () => {
   })
 
   it('the control plane\'s synthetic execution_complete ends the turn, with its reason: the call reads "no result" beside the failure card', () => {
-    const events = [ev('step_start', { messageId: 'msg_1', stepId: 'prt_start' }), call('c1', 'bash'), ev('execution_complete', { turn_id: 't1', synthetic: true, reason: 'timeout' })]
+    const events = [ev('step_start', { messageId: 'msg_1', stepId: 'prt_start' }), call('c1', 'bash'), ev('execution_complete', { turn_id: 't1', synthetic: true, dispatched: true, reason: 'timeout' })]
     const html = render(events)
     expect(rows(html, '–', 'none')).toBe(1)
     expect(html).not.toContain('st live')
@@ -334,9 +334,73 @@ describe('Timeline -- a tool call without a result', () => {
   })
 
   it('a stop\'s synthetic execution_complete ends the turn cancelled', () => {
-    const html = render([call('c1', 'bash'), ev('execution_complete', { turn_id: 't1', synthetic: true, reason: 'stopped' })])
+    const html = render([call('c1', 'bash'), ev('execution_complete', { turn_id: 't1', synthetic: true, dispatched: true, reason: 'stopped' })])
     expect(rows(html, '–', 'none')).toBe(1)
     expect(html).toContain('turn cancelled')
     expect(html).toContain('reason: stopped')
+  })
+})
+
+// What the page draws when the control plane ends a turn other than the
+// one it is streaming (a queued turn cancelled by a stop), or ends the
+// streaming turn before its agent does (a timeout, then the agent's own
+// late end). Rendering checks on the logs the timeline model's own
+// scenario tests read (timelineModel.test.ts, "the turn a synthetic end
+// ends").
+describe('Timeline -- the turn a synthetic end ends', () => {
+  let id = 1
+  const ev = (type: string, payload: unknown): EventEnvelope => ({ id: id++, type, payload, createdAt: '2026-10-03T10:00:00Z' })
+  const scenario = (tail: EventEnvelope[]): EventEnvelope[] => [
+    ev('step_start', { messageId: 'msgA', stepId: 'prtA_start' }),
+    ev('tool_call', { messageId: 'msgA', callId: 'cA1', toolName: 'bash', input: {} }),
+    ev('token', { messageId: 'prtA_text', text: 'working on' }),
+    ...tail,
+  ]
+  const queuedStopped = () => ev('execution_complete', { turn_id: 'turnB', synthetic: true, reason: 'stopped' })
+  const aRest = () => [
+    ev('tool_result', { messageId: 'msgA', callId: 'cA1', output: { output: 'ok' }, isError: false }),
+    ev('token', { messageId: 'prtA_text', text: 'working on it, done' }),
+    ev('step_finish', { messageId: 'msgA', stepId: 'prtA_finish', cost: { tokens: { input: 10, output: 5 }, usd: 0.5 } }),
+  ]
+  const render = (events: EventEnvelope[]) => withQueryClient(<Timeline sessionId="s1" turns={buildTimelineModel(events).turns} />)
+  const count = (html: string, needle: string) => html.split(needle).length - 1
+
+  it('S1: a queued turn stopped, the running turn completes anyway: no failure card, its call ✓', () => {
+    const html = render(scenario([queuedStopped(), ...aRest(), ev('execution_complete', { messageId: 'ecA', outcome: 'completed', reason: null })]))
+    expect(count(html, 'Resume turn')).toBe(0)
+    expect(html).toContain('<span class="st done">✓</span>bash')
+    expect(count(html, 'class="turn-block"')).toBe(1)
+  })
+
+  it('S1, before the running turn ends: still running, its call running, no failure card', () => {
+    const html = render(scenario([queuedStopped(), ...aRest().slice(1)]))
+    expect(count(html, 'Resume turn')).toBe(0)
+    expect(html).toContain('<span class="st live">●</span>bash')
+  })
+
+  it('S2: a queued turn stopped, the running turn obeys: one cancelled card', () => {
+    const html = render(scenario([queuedStopped(), ev('execution_complete', { messageId: 'ecA', outcome: 'cancelled', reason: null })]))
+    expect(count(html, 'Resume turn')).toBe(1)
+    expect(count(html, 'turn cancelled')).toBe(1)
+    expect(count(html, 'class="turn-block"')).toBe(1)
+  })
+
+  it('S3: the running turn times out, its agent\'s end arrives late: one failure card, its call "no result"', () => {
+    const html = render(
+      scenario([
+        ev('execution_complete', { turn_id: 'turnA', synthetic: true, dispatched: true, reason: 'timeout' }),
+        ev('execution_complete', { messageId: 'ecA', outcome: 'failed', reason: null }),
+      ]),
+    )
+    expect(count(html, 'Resume turn')).toBe(1)
+    expect(html).toContain('This turn ran out of time')
+    expect(html).toContain('<span class="st none">–</span>bash')
+    expect(count(html, 'class="turn-block"')).toBe(1)
+  })
+
+  it('S4 (control): the running turn stopped alone and obeys: one cancelled card', () => {
+    const html = render(scenario([ev('execution_complete', { messageId: 'ecA', outcome: 'cancelled', reason: null })]))
+    expect(count(html, 'Resume turn')).toBe(1)
+    expect(count(html, 'class="turn-block"')).toBe(1)
   })
 })

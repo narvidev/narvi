@@ -83,12 +83,29 @@ describe('buildCostRollup', () => {
   it('the control plane\'s synthetic execution_complete ends the turn too', () => {
     const events = [
       stepFinish(1, 0.1, 10, 5),
-      { id: 2, type: 'execution_complete', payload: { turn_id: 't1', synthetic: true, reason: 'timeout' }, createdAt: '2026-08-20T10:00:02Z' },
+      { id: 2, type: 'execution_complete', payload: { turn_id: 't1', synthetic: true, dispatched: true, reason: 'timeout' }, createdAt: '2026-08-20T10:00:02Z' },
       stepFinish(3, 0.2, 20, 8),
     ]
     const rollup = buildCostRollup(events)
     expect(rollup.turnUsd).toBeCloseTo(0.2)
     expect(rollup.sessionUsd).toBeCloseTo(0.3)
+  })
+
+  // S1: turn B, queued behind A, is cancelled at once by a person's stop
+  // (a pending turn's synthetic end: no `dispatched` stamp), while A runs on
+  // and completes. B's end resets nothing mid-A; A's own end does.
+  it('a queued turn\'s synthetic end mid-turn resets nothing; the running turn\'s own end does', () => {
+    const events: EventEnvelope[] = [
+      stepFinish(1, 0.1, 10, 5),
+      { id: 2, type: 'execution_complete', payload: { turn_id: 'turnB', synthetic: true, reason: 'stopped' }, createdAt: '2026-08-20T10:00:02Z' },
+      stepFinish(3, 0.5, 20, 8),
+    ]
+    const mid = buildCostRollup(events)
+    expect(mid.turnUsd).toBeCloseTo(0.6)
+    expect(mid.turnInputTokens).toBe(30)
+    const ended = buildCostRollup([...events, executionComplete(4)])
+    expect(ended.turnUsd).toBeNull()
+    expect(ended.sessionUsd).toBeCloseTo(0.6)
   })
 
   it('a SUB-TASK-tagged execution_complete never closes the main turn boundary', () => {
