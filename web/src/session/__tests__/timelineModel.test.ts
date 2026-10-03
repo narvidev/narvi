@@ -267,6 +267,74 @@ describe('buildTimelineModel', () => {
       expect(model.orphanedSubTasks).toEqual([])
     })
 
+    // A turn C dispatched after A timed out whose prompt never reached the
+    // sandbox -- a frame over the gen's bound, a rollout or revocation
+    // refusal, no live connection -- ends with `"delivered": false`
+    // (failDispatchedTurn). C's agent never ran; A's still may.
+    const refusedUndelivered = () =>
+      env('execution_complete', { turn_id: 'turnC', synthetic: true, dispatched: true, delivered: false, reason: 'the prompt frame is larger than the sandbox reads' })
+    const cUndelivered = [false, { outcome: 'failed', reason: 'the prompt frame is larger than the sandbox reads' }]
+    const aWithItsTaskCall = (tail: EventEnvelope[]): EventEnvelope[] => [
+      env('step_start', { messageId: 'msgA', stepId: 'prtA_start' }),
+      env('tool_call', { messageId: 'msgA', callId: 'ct', toolName: 'task', input: {} }),
+      timedOut(),
+      refusedUndelivered(),
+      ...tail,
+    ]
+
+    it('a turn refused before its prompt was sent, after a timeout: its own card, and the timed-out turn\'s late sub-task still under its call', () => {
+      const events = aWithItsTaskCall([
+        env('sub_task_start', { messageId: 'ss1', subTaskId: 'st1', label: 'counter-review', parentMessageId: 'msgA', parentCallId: 'ct' }),
+        env('sub_task_finish', { messageId: 'sf1', subTaskId: 'st1', outcome: 'completed' }),
+        env('execution_complete', { messageId: 'ecA', outcome: 'completed', reason: null }),
+      ])
+      const model = buildTimelineModel(events)
+      expect(model.turns.map((t) => [t.live, t.outcome])).toEqual([aTimedOut, cUndelivered])
+      expect(model.turns[0]!.steps[0]!.toolCalls[0]!.subTasks.map((st) => [st.subTaskId, st.status])).toEqual([['st1', 'completed']])
+      expect(model.turns[1]!.steps).toEqual([])
+      expect(model.turns[1]!.subTasks).toEqual([])
+      expect(model.orphanedSubTasks).toEqual([])
+    })
+
+    it('the same, its late sub-task naming no call: under the task call of its message, or else a lane of the timed-out turn', () => {
+      const byMessage = buildTimelineModel(
+        aWithItsTaskCall([env('sub_task_start', { messageId: 'ss1', subTaskId: 'st1', label: 'counter-review', parentMessageId: 'msgA' })]),
+      )
+      expect(byMessage.turns.map((t) => [t.live, t.outcome])).toEqual([aTimedOut, cUndelivered])
+      expect(byMessage.turns[0]!.steps[0]!.toolCalls[0]!.subTasks.map((st) => st.subTaskId)).toEqual(['st1'])
+      expect(byMessage.turns[1]!.subTasks).toEqual([])
+
+      const noCall = buildTimelineModel(
+        aWithItsTaskCall([env('sub_task_start', { messageId: 'ss1', subTaskId: 'st1', label: 'fact-check', parentMessageId: 'msgM' })]),
+      )
+      expect(noCall.turns.map((t) => [t.live, t.outcome])).toEqual([aTimedOut, cUndelivered])
+      expect(noCall.turns[0]!.subTasks.map((st) => st.subTaskId)).toEqual(['st1'])
+      expect(noCall.turns[1]!.subTasks).toEqual([])
+    })
+
+    it('a delivered turn the control plane ended with no event of its own: its agent\'s late end still ends nothing', () => {
+      const events = [
+        env('step_start', { messageId: 'msgA', stepId: 'prtA_start' }),
+        env('execution_complete', { messageId: 'ecA', outcome: 'completed', reason: null }),
+        env('execution_complete', { turn_id: 'turnB', synthetic: true, dispatched: true, reason: 'timeout' }),
+        env('execution_complete', { messageId: 'ecB', outcome: 'failed', reason: null }),
+      ]
+      expect(ends(events)).toEqual([[false, { outcome: 'completed', reason: null }], [false, { outcome: 'failed', reason: 'timeout' }]])
+    })
+
+    it('a turn refused before its prompt was sent closes the turn open on the page, whose events the server stored in its window', () => {
+      const events = [
+        ...scenario([timedOut()]),
+        // The timed-out turn's agent begins a message once C is processing.
+        env('step_start', { messageId: 'msgM', stepId: 'prtM_start' }),
+        refusedUndelivered(),
+      ]
+      expect(buildTimelineModel(events).turns.map((t) => [t.live, t.outcome, t.steps.map((st) => st.stepId)])).toEqual([
+        [...aTimedOut, ['prtA_start']],
+        [...cUndelivered, ['prtM_start']],
+      ])
+    })
+
     it('a sub-task started once a later turn\'s prompt is received opens that turn', () => {
       const events = scenario([
         timedOut(),

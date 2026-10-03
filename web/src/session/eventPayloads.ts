@@ -160,6 +160,13 @@ export interface TurnEnd {
   subTaskId: string | null
   /** True for the control plane's own synthetic end, false for the agent's. */
   synthetic: boolean
+  /**
+   * False only on the control plane's end of a turn whose prompt certainly
+   * never reached the sandbox (`"delivered": false`,
+   * internal/app/sessionactor/dispatch.go's failDispatchedTurn): its agent
+   * never ran.
+   */
+  delivered: boolean
 }
 
 /**
@@ -184,11 +191,17 @@ export interface TurnEnd {
  */
 export function asTurnEnd(env: EventEnvelope): TurnEnd | null {
   const agent = asExecutionComplete(env)
-  if (agent !== null) return { outcome: agent.outcome, reason: agent.reason, subTaskId: agent.subTaskId ?? null, synthetic: false }
+  if (agent !== null) return { outcome: agent.outcome, reason: agent.reason, subTaskId: agent.subTaskId ?? null, synthetic: false, delivered: true }
   if (env.type !== 'execution_complete' || !isPlainObject(env.payload)) return null
   const p = env.payload
   if (p.synthetic !== true || p.dispatched !== true || !isString(p.reason)) return null
-  return { outcome: p.reason === SYNTHETIC_STOP_REASON ? 'cancelled' : 'failed', reason: p.reason, subTaskId: null, synthetic: true }
+  return {
+    outcome: p.reason === SYNTHETIC_STOP_REASON ? 'cancelled' : 'failed',
+    reason: p.reason,
+    subTaskId: null,
+    synthetic: true,
+    delivered: p.delivered !== false,
+  }
 }
 
 export function asWarning(env: EventEnvelope): Warning | null {

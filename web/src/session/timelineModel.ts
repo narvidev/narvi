@@ -580,6 +580,19 @@ export function buildTimelineModel(events: readonly EventEnvelope[]): TimelineMo
       // new generation. From an agent that sends no receipt, on the same
       // generation, the two are the same events, and read as this one.
       if (!turnEnd.synthetic && endedByControlPlane !== null) continue
+      // The end of a turn whose prompt never reached the sandbox
+      // (`"delivered": false`): its agent never ran, so the log holds no
+      // event of it but this end, and none can follow. With no turn open, it
+      // closes a card of its own and leaves the turn state as it was -- the
+      // turn the control plane ended before it, and that turn's calls -- so
+      // the agent of that earlier turn, still running, has its late end
+      // read as that turn's and its late sub-task attached under its call.
+      // A turn open on the page holds events the server stored in this
+      // turn's window, and this end closes it.
+      if (!turnEnd.delivered && currentTurn === null) {
+        turns.push({ firstEventId: event.id, steps: [], subTasks: [], outcome: { outcome: turnEnd.outcome, reason: turnEnd.reason }, live: false })
+        continue
+      }
       const turn = ensureTurn(event.id)
       if (turnEnd.subTaskId) continue
       turn.outcome = { outcome: turnEnd.outcome, reason: turnEnd.reason }
