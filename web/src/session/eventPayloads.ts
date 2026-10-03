@@ -19,6 +19,7 @@ import type {
   Artifact,
   BootProgress,
   ExecutionComplete,
+  PromptReceived,
   Ready,
   SandboxErrorEvent,
   SessionTitle,
@@ -227,4 +228,18 @@ export function asBootProgress(env: EventEnvelope): BootProgress | null {
 export function asReady(env: EventEnvelope): Ready | null {
   if (env.type !== 'ready' || !isPlainObject(env.payload)) return null
   return env.payload as unknown as Ready
+}
+
+/** readyGen is the sandbox generation a `ready` names, or null when its `gen` is not a number. */
+export function readyGen(ready: Ready): number | null {
+  const gen: unknown = ready.gen
+  return isNumber(gen) ? gen : null
+}
+
+/** asPromptReceived narrows the agent's receipt of a prompt (technical plan §3.3, prompt receipts). */
+export function asPromptReceived(env: EventEnvelope): PromptReceived | null {
+  if (env.type !== 'prompt_received' || !isPlainObject(env.payload)) return null
+  const p = env.payload
+  if (!isString(p.messageId) || !isString(p.promptMessageId)) return null
+  return env.payload as unknown as PromptReceived
 }

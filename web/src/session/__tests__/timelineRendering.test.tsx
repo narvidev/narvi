@@ -398,6 +398,20 @@ describe('Timeline -- the turn a synthetic end ends', () => {
     expect(count(html, 'class="turn-block"')).toBe(1)
   })
 
+  it('a turn after a timeout, its prompt received, refused at once: its own failure card, with its reason', () => {
+    const html = render(
+      scenario([
+        ev('execution_complete', { turn_id: 'turnA', synthetic: true, dispatched: true, reason: 'timeout' }),
+        ev('prompt_received', { type: 'prompt_received', messageId: 'prompt_received:pB', sessionId: 's', gen: 1, promptMessageId: 'pB', duplicate: false }),
+        ev('execution_complete', { messageId: 'ecB', outcome: 'failed', reason: 'opencode: could not dispatch prompt' }),
+      ]),
+    )
+    expect(count(html, 'class="turn-block"')).toBe(2)
+    expect(count(html, 'Resume turn')).toBe(2)
+    expect(html).toContain('This turn ran out of time')
+    expect(html).toContain('reason: opencode: could not dispatch prompt')
+  })
+
   it('S4 (control): the running turn stopped alone and obeys: one cancelled card', () => {
     const html = render(scenario([ev('execution_complete', { messageId: 'ecA', outcome: 'cancelled', reason: null })]))
     expect(count(html, 'Resume turn')).toBe(1)

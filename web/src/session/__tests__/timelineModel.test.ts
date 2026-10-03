@@ -186,6 +186,99 @@ describe('buildTimelineModel', () => {
       expect(model.turns[0]!.steps[0]!.toolCalls[0]!.subTasks.map((s) => [s.subTaskId, s.status])).toEqual([['st1', 'cancelled']])
     })
 
+    // The next turn B whose agent fails before any step -- its runtime
+    // refuses the prompt -- sends only its own end. The server books that
+    // end against B, which is Processing; the page tells it from the ended
+    // turn's late end by what shows B under way first: its prompt's receipt,
+    // or a new generation's `ready`.
+    const timedOut = () => env('execution_complete', { turn_id: 'turnA', synthetic: true, dispatched: true, reason: 'timeout' })
+    const stopped = () => env('execution_complete', { turn_id: 'turnA', synthetic: true, dispatched: true, reason: 'stopped' })
+    const receiptOfB = () =>
+      env('prompt_received', { type: 'prompt_received', messageId: 'prompt_received:pB', sessionId: 's', gen: 1, promptMessageId: 'pB', duplicate: false })
+    const refusedB = () => env('execution_complete', { messageId: 'ecB', outcome: 'failed', reason: 'opencode: could not dispatch prompt' })
+    const ends = (events: EventEnvelope[]) => buildTimelineModel(events).turns.map((t) => [t.live, t.outcome])
+    const aTimedOut = [false, { outcome: 'failed', reason: 'timeout' }]
+    const bRefused = [false, { outcome: 'failed', reason: 'opencode: could not dispatch prompt' }]
+
+    it('a turn after a timeout, its prompt received, whose only event is its own end: two turns, B failed with its reason', () => {
+      expect(ends(scenario([timedOut(), receiptOfB(), refusedB()]))).toEqual([aTimedOut, bRefused])
+    })
+
+    it('the ended turn\'s late end, then a later turn\'s receipt and end: two turns, the late end ending nothing', () => {
+      const events = scenario([timedOut(), env('execution_complete', { messageId: 'ecA', outcome: 'failed', reason: null }), receiptOfB(), refusedB()])
+      expect(ends(events)).toEqual([aTimedOut, bRefused])
+    })
+
+    it('a turn after a stop on a retired generation, a new generation\'s ready between and no receipt: two turns, B failed with its reason', () => {
+      const events = [
+        env('ready', { messageId: 'r1', sessionId: 's', gen: 1, timestamp: '2026-10-03T10:00:00Z' }),
+        ...scenario([stopped(), env('ready', { messageId: 'r2', sessionId: 's', gen: 2, timestamp: '2026-10-03T10:05:00Z' }), refusedB()]),
+      ]
+      expect(ends(events)).toEqual([[false, { outcome: 'cancelled', reason: 'stopped' }], bRefused])
+    })
+
+    it('a reconnect of the same generation shows no later turn: the ended turn\'s late end after it ends nothing', () => {
+      const events = [
+        env('ready', { messageId: 'r1', sessionId: 's', gen: 1, timestamp: '2026-10-03T10:00:00Z' }),
+        ...scenario([
+          timedOut(),
+          env('ready', { messageId: 'r1b', sessionId: 's', gen: 1, timestamp: '2026-10-03T10:05:00Z' }),
+          env('execution_complete', { messageId: 'ecA', outcome: 'failed', reason: null }),
+        ]),
+      ]
+      expect(ends(events)).toEqual([aTimedOut])
+    })
+
+    it('a ready that names no generation, or a receipt that names no prompt, shows no later turn', () => {
+      for (const between of [
+        env('ready', { messageId: 'r2', sessionId: 's', gen: 'two' }),
+        env('prompt_received', { type: 'prompt_received', messageId: 'prompt_received:pB', sessionId: 's', gen: 1, duplicate: false }),
+        env('prompt_received', { type: 'prompt_received', sessionId: 's', gen: 1, promptMessageId: 'pB', duplicate: false }),
+      ]) {
+        const events = scenario([timedOut(), between, env('execution_complete', { messageId: 'ecA', outcome: 'failed', reason: null })])
+        expect(ends(events), JSON.stringify(between.payload)).toEqual([aTimedOut])
+      }
+    })
+
+    it('a new generation\'s first ready in the log, after a synthetic end: the end that follows is a later turn\'s', () => {
+      const events = scenario([timedOut(), env('ready', { messageId: 'r2', sessionId: 's', gen: 2, timestamp: '2026-10-03T10:05:00Z' }), refusedB()])
+      expect(ends(events)).toEqual([aTimedOut, bRefused])
+    })
+
+    it('the limit, from an agent that sends no receipt: on the same generation a later turn\'s lone end reads as the ended turn\'s own, the events of S3', () => {
+      expect(ends(scenario([timedOut(), refusedB()]))).toEqual([aTimedOut])
+    })
+
+    it('a sub-task the ended turn\'s agent starts late joins that turn, under its call or as a lane of it, and opens none', () => {
+      const events = [
+        env('step_start', { messageId: 'msgA', stepId: 'prtA_start' }),
+        env('tool_call', { messageId: 'msgA', callId: 'ct', toolName: 'task', input: {} }),
+        timedOut(),
+        env('sub_task_start', { messageId: 'ss1', subTaskId: 'st1', label: 'counter-review', parentMessageId: 'msgA', parentCallId: 'ct' }),
+        env('sub_task_start', { messageId: 'ss2', subTaskId: 'st2', label: 'fact-check', parentMessageId: 'msgA', parentCallId: 'c_unseen' }),
+        env('sub_task_finish', { messageId: 'sf1', subTaskId: 'st1', outcome: 'completed' }),
+        env('execution_complete', { messageId: 'ecA', outcome: 'completed', reason: null }),
+      ]
+      const model = buildTimelineModel(events)
+      expect(model.turns.map((t) => [t.live, t.outcome])).toEqual([aTimedOut])
+      const turn = model.turns[0]!
+      expect(turn.steps[0]!.toolCalls[0]!.subTasks.map((st) => [st.subTaskId, st.status])).toEqual([['st1', 'completed']])
+      expect(turn.subTasks.map((st) => [st.subTaskId, st.status])).toEqual([['st2', 'running']])
+      expect(model.orphanedSubTasks).toEqual([])
+    })
+
+    it('a sub-task started once a later turn\'s prompt is received opens that turn', () => {
+      const events = scenario([
+        timedOut(),
+        receiptOfB(),
+        env('sub_task_start', { messageId: 'ss1', subTaskId: 'st1', label: 'lane', parentMessageId: 'msgB' }),
+        refusedB(),
+      ])
+      const model = buildTimelineModel(events)
+      expect(model.turns.map((t) => [t.live, t.outcome])).toEqual([aTimedOut, bRefused])
+      expect(model.turns[1]!.subTasks.map((st) => st.subTaskId)).toEqual(['st1'])
+    })
+
     it('a dispatched turn\'s synthetic end with no turn open shows that turn, ended, even after an earlier synthetic end', () => {
       const events = [
         env('step_start', { messageId: 'msgA', stepId: 'prtA_start' }),
@@ -338,7 +431,7 @@ describe('buildTimelineModel', () => {
     expect(buildTimelineModel(events).turns).toEqual([])
   })
 
-  it('keeps prompt_received (technical plan §3.3, prompt receipts) out of the model: it opens no turn after an execution_complete and leaves the boot signal alone', () => {
+  it('opens no turn at a prompt_received (technical plan §3.3, prompt receipts), after an execution_complete, and leaves the boot signal alone', () => {
     const events = [
       env('boot_progress', { messageId: 'm0', phase: 'installing deps', timestamp: '2026-08-20T10:00:00Z' }),
       env('tool_call', { messageId: 'm1', callId: 'c1', toolName: 'Read', input: {} }),
