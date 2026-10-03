@@ -189,6 +189,11 @@ func TestTranslateSubTaskStartAndFinish(t *testing.T) {
 	if start.SessionId != cmd.SessionId || start.Gen != cmd.Gen {
 		t.Errorf("translateSubTaskStart() SessionId/Gen not stamped from cmd: got %q/%d", start.SessionId, start.Gen)
 	}
+	// The legacy subtask part names no tool call: a reader falls back to a
+	// task call of its message.
+	if start.ParentCallId != nil {
+		t.Errorf("translateSubTaskStart() ParentCallId = %q, want absent: a subtask part has no tool call", *start.ParentCallId)
+	}
 
 	finish := translateSubTaskFinish(cmd, "prt_sub1", sandboxws.ExecutionCompleteOutcomeFailed)
 	if finish.SubTaskId != "prt_sub1" {

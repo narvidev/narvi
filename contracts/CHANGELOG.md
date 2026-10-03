@@ -10,6 +10,25 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.22.0]
+
+### sandbox-ws/v1/events.schema.json
+
+- Added: optional `parentCallId` on `SubTaskStart`, a string: the `callId`
+  of the main-lane `tool_call` whose invocation spawned the sub-task
+  (technical plan §6.1, §7.1). `parentMessageId` names a message, which may
+  hold several tool calls, and the runtime adapter emits a sub-task's
+  `sub_task_start` before its `tool_call` when the call's first running
+  update already names the sub-task, after it otherwise, and two parallel
+  `task` calls in one message can both precede either sub-task; nothing on
+  the wire named the call. The web timeline pairs a sub-task with its call
+  by this property, whichever arrives first. The OpenCode adapter sets it
+  on the task-tool path; it is absent on the legacy subtask-part path,
+  which has no tool call to name, and on any agent built before it, for
+  which the timeline falls back to a `task` call of `parentMessageId`'s
+  message. A property added, not required, grades MINOR (row 2); the union
+  member changes only by that property (row 30, recursing into row 2).
+
 ## [1.21.1]
 
 ### rest/v1/dtos.schema.json

@@ -2,6 +2,7 @@ package opencode
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
@@ -584,5 +585,118 @@ func TestDispatchTool_TaskSubtask_ChildModelAndErrorDoNotLeakIntoEnclosingDiagno
 	}
 	if err := ts.errorForOutcome(); err != nil {
 		t.Errorf("errorForOutcome() = %+v, want nil -- the child sub-agent's own error must never leak into the enclosing turn's diagnostic", err)
+	}
+}
+
+// taskToolPartJSON builds a "task" tool part of msg_main_asst for
+// message.part.updated: partID/callID name the call, status its state, and
+// childSessionID, when not "", the state.metadata naming the sub-agent's
+// session -- absent on a running update that does not carry it yet.
+func taskToolPartJSON(partID, callID, status, childSessionID string) []byte {
+	metadata := ""
+	if childSessionID != "" {
+		metadata = `,"metadata":{"parentSessionId":"` + testTaskMainSessionID + `","sessionId":"` + childSessionID + `"}`
+	}
+	output := ""
+	if status == "completed" {
+		output = `,"output":"done"`
+	}
+	return []byte(`{"sessionID":"` + testTaskMainSessionID + `","part":{
+		"id":"` + partID + `","messageID":"msg_main_asst","sessionID":"` + testTaskMainSessionID + `",
+		"type":"tool","tool":"task","callID":"` + callID + `",
+		"state":{"status":"` + status + `","input":{"description":"Review ` + callID + `","prompt":"Review it.","subagent_type":"general"}` + output + metadata + `}
+	}}`)
+}
+
+// TestDispatchTool_TaskSubtask_StampsParentCallId_BothOrders: through the
+// real dispatchEvent, every sub_task_start the task tool path emits names
+// its own call's callId, whichever of it and its tool_call reaches the
+// wire first -- the metadata on the call's first running update (the
+// sub_task_start first), on a later one (the tool_call first), and two
+// parallel task calls in one message emitting both calls before either
+// sub-task. parentMessageId alone names the message, which all of them
+// share.
+func TestDispatchTool_TaskSubtask_StampsParentCallId_BothOrders(t *testing.T) {
+	type update struct{ partID, callID, status, child string }
+	tests := []struct {
+		name    string
+		updates []update
+		// wantOrder is the emitted sequence, each a type and, for a
+		// sub_task_start or tool_call, the callId it names.
+		wantOrder []string
+	}{
+		{
+			name: "metadata on the first running update: the sub_task_start first",
+			updates: []update{
+				{"prt_t1", "call_a", "running", "ses_child_a"},
+				{"prt_t1", "call_a", "completed", "ses_child_a"},
+			},
+			wantOrder: []string{"sub_task_start:call_a", "tool_call:call_a", "sub_task_finish", "tool_result:call_a"},
+		},
+		{
+			name: "metadata on a later running update: the tool_call first",
+			updates: []update{
+				{"prt_t1", "call_a", "running", ""},
+				{"prt_t1", "call_a", "running", "ses_child_a"},
+				{"prt_t1", "call_a", "completed", "ses_child_a"},
+			},
+			wantOrder: []string{"tool_call:call_a", "sub_task_start:call_a", "sub_task_finish", "tool_result:call_a"},
+		},
+		{
+			name: "two parallel task calls in one message: both calls before either sub-task",
+			updates: []update{
+				{"prt_t1", "call_a", "running", ""},
+				{"prt_t2", "call_b", "running", ""},
+				{"prt_t2", "call_b", "running", "ses_child_b"},
+				{"prt_t1", "call_a", "running", "ses_child_a"},
+			},
+			wantOrder: []string{"tool_call:call_a", "tool_call:call_b", "sub_task_start:call_b", "sub_task_start:call_a"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			a := newDispatchTestAdapter(t)
+			sink, events := spyEventSink(t)
+			ts := newTurnState(sandboxws.Prompt{SessionId: testSessionID, Gen: 1}, sink)
+			a.registerTurn(testTaskMainSessionID, ts)
+			a.dispatchEvent(sseEnvelope{
+				Type:       "message.updated",
+				Properties: []byte(`{"sessionID":"` + testTaskMainSessionID + `","info":{"id":"msg_main_asst","role":"assistant"}}`),
+			})
+			for _, u := range tt.updates {
+				a.dispatchEvent(sseEnvelope{Type: "message.part.updated", Properties: taskToolPartJSON(u.partID, u.callID, u.status, u.child)})
+			}
+
+			var got []string
+			for _, e := range events() {
+				switch p := e.Payload.(type) {
+				case sandboxws.SubTaskStart:
+					if p.ParentMessageId != "msg_main_asst" {
+						t.Errorf("sub_task_start %s ParentMessageId = %q, want msg_main_asst", p.SubTaskId, p.ParentMessageId)
+					}
+					if p.ParentCallId == nil {
+						got = append(got, "sub_task_start:<none>")
+						continue
+					}
+					// Each sub-task names its own call: ses_child_a call_a's,
+					// ses_child_b call_b's.
+					if want := "call_" + p.SubTaskId[len("ses_child_"):]; *p.ParentCallId != want {
+						t.Errorf("sub_task_start %s ParentCallId = %q, want %q", p.SubTaskId, *p.ParentCallId, want)
+					}
+					got = append(got, "sub_task_start:"+*p.ParentCallId)
+				case sandboxws.ToolCall:
+					got = append(got, "tool_call:"+p.CallId)
+				case sandboxws.ToolResult:
+					got = append(got, "tool_result:"+p.CallId)
+				case sandboxws.SubTaskFinish:
+					got = append(got, "sub_task_finish")
+				default:
+					got = append(got, fmt.Sprintf("%T", p))
+				}
+			}
+			if fmt.Sprint(got) != fmt.Sprint(tt.wantOrder) {
+				t.Fatalf("emitted %v, want %v", got, tt.wantOrder)
+			}
+		})
 	}
 }

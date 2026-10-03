@@ -2041,6 +2041,16 @@ type SubTaskStart struct {
 	// MessageId corresponds to the JSON schema field "messageId".
 	MessageId string `json:"messageId" yaml:"messageId" mapstructure:"messageId"`
 
+	// The callId of the main-lane tool_call whose invocation spawned this sub-task
+	// (technical plan §6.1, §7.1). parentMessageId names a message, which may hold
+	// several tool calls, and the sub_task_start may reach the control plane before
+	// or after its tool_call, so a reader pairs the two by this property, whichever
+	// arrives first. Optional and additive: absent on any producer that predates it,
+	// and on the legacy subtask-part translation path, which has no tool call to
+	// name; a reader without it falls back to a task tool call of parentMessageId's
+	// message.
+	ParentCallId *string `json:"parentCallId,omitempty,omitzero" yaml:"parentCallId,omitempty" mapstructure:"parentCallId,omitempty"`
+
 	// The messageId of the enclosing main-lane message whose invocation spawned this
 	// sub-task.
 	ParentMessageId string `json:"parentMessageId" yaml:"parentMessageId" mapstructure:"parentMessageId"`
