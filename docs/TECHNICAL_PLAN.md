@@ -1641,14 +1641,19 @@ it lands, and the queued ones run in full on diffs that no longer exist. Two rul
   stopped turn's end.
 
   Every write that ends a turn moves a held debounce to now in the same transaction as that write
-  (`WakeReviewRetriggerDebounce`), stamping `armed_at` and keeping `created_at`. Only a held one:
-  a row whose `fires_at` sits more than `ReviewRetriggerDebounce` plus `MinTimeoutMargin` past its
-  `armed_at`, as only the hold's re-arm leaves it -- a push arms the window ahead, a few
-  milliseconds over it on its replica's clock, and `Validate` keeps the backstop at least the
-  margin above the window. A push's quiet window that has not held yet is left to run out, so a
-  burst that straddles a turn's end still reviews once, at its last head (§24.2); and since the
-  mark is how far ahead the row was last armed, never how soon it fires, a held row is woken
-  however close to its backstop the turn ends, or after the pump has claimed it. The wake-up is an
+  (`WakeReviewRetriggerDebounce`), stamping `armed_at` and keeping `created_at`. Only a row that
+  reads as held: one whose `fires_at` sits at least `ReviewRetriggerDebounce` plus
+  `MinTimeoutMargin` past its `armed_at`. A push arms the window ahead, a few milliseconds over it
+  on its replica's clock, and `Validate` keeps the backstop at least the margin above the window,
+  so a push's quiet window still running never reads as held and is left to run out: a burst that
+  straddles a turn's end still reviews once, at its last head (§24.2). Two kinds of row read as
+  held: one the hold re-armed, and a push's row the timer pump claimed once its window ran out
+  (a claim moves `fires_at` `TimerClaimDuration` ahead and leaves `armed_at`, so that row's lead
+  is at least the window plus the claim). Waking the second kind is harmless: its window is
+  already over, and the firing the claim delivered enqueues the review and clears the pending
+  head, so a second delivery finds nothing pending and only deletes the row. Since the mark is
+  how far ahead the row was last armed, never how soon it fires, a held row is woken however
+  close to its backstop the turn ends, or after the pump has claimed it. The wake-up is an
   update, never an insert: while a pushed head waits the debounce exists, since the hold re-arms
   it, and a debounce that is gone was removed on purpose -- the firing that inserted the review of
   its head, an opt-in switched off or a revocation, a person's stop -- which an insert would undo;

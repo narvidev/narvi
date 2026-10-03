@@ -100,9 +100,16 @@ func (a *Actor) wakeReviewRetriggerIfTurnEnded(ctx context.Context, tx pgx.Tx) e
 // push arms it ReviewRetriggerDebounce ahead on its replica's clock, a few
 // milliseconds after its transaction stamped armed_at, so a push's lead is
 // a little over the window. Validate keeps the backstop at least
-// MinTimeoutMargin above the window, so the two leads never meet; and a
-// row's lead does not shrink as it ages, so a held row is woken however
-// close to its backstop the turn ends.
+// MinTimeoutMargin above the window, so a push's row whose window is still
+// running never reads as held. Two kinds of row do: one the hold re-armed,
+// and one the timer pump claimed after its window ran out -- a claim moves
+// fires_at TimerClaimDuration ahead and leaves armed_at, so the claimed
+// row's lead is at least the window plus the claim. Waking the second kind
+// is harmless: its quiet window is already over, and the firing the claim
+// delivered either enqueued the review and cleared the pending head, so a
+// second delivery only deletes the row, or has yet to run. A row's lead
+// does not shrink as it ages, so a held row is woken however close to its
+// backstop the turn ends.
 func heldDebounceLead(t platform.Timeouts) time.Duration {
 	return t.ReviewRetriggerDebounce + platform.MinTimeoutMargin
 }

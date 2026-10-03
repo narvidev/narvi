@@ -999,14 +999,18 @@ func TestReviewRetriggerWake_TheTimerStoreWakesThisKind(t *testing.T) {
 
 // TestReviewRetriggerWake_OnlyAHeldDebounceIsWoken: a turn's end wakes the
 // debounce the hold re-armed, and leaves a push's quiet window (technical
-// plan §24.2) to run out, so a burst of pushes that straddles the end still
-// reviews once, at its last head. The mark is how far past its last arm
-// the row fires (heldDebounceLead), never how soon it fires: a held row is
-// woken however close to its backstop the turn ends, and when the pump has
-// claimed it at its backstop; a push's row is left alone just armed, about
-// to run out, and with its replica's clock a second ahead of the
-// database's. Each case ends an open turn through transact, the path every
-// writer takes.
+// plan §24.2) to run out while it runs, so a burst of pushes that
+// straddles the end still reviews once, at its last head. The mark is how
+// far past its last arm the row fires (heldDebounceLead), never how soon
+// it fires: a held row is woken however close to its backstop the turn
+// ends, and when the pump has claimed it at its backstop; a push's row is
+// left alone just armed, about to run out, and with its replica's clock a
+// second ahead of the database's. A push's row the pump claimed once its
+// window ran out reads as held too -- the claim moves fires_at alone -- and
+// waking it is harmless: the next pump tick delivers it, its firing queues
+// the one review and clears the pending head, and the claim's own delivery,
+// arriving after, finds nothing pending and queues nothing more. Each case
+// ends an open turn through transact, the path every writer takes.
 func TestReviewRetriggerWake_OnlyAHeldDebounceIsWoken(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -1018,6 +1022,8 @@ func TestReviewRetriggerWake_OnlyAHeldDebounceIsWoken(t *testing.T) {
 		// arm leaves the session's debounce in the case's state.
 		arm      func(ctx context.Context, t *testing.T, f *holdFixture)
 		wantWoke bool
+		// then runs after the end, on a woken row.
+		then func(ctx context.Context, t *testing.T, f *holdFixture, rig *holdRig)
 	}{
 		{name: "held, just re-armed by the hold", wantWoke: true, arm: func(ctx context.Context, t *testing.T, f *holdFixture) {
 			f.armDebounce(ctx, t, time.Now())
@@ -1031,6 +1037,34 @@ func TestReviewRetriggerWake_OnlyAHeldDebounceIsWoken(t *testing.T) {
 		{name: "held, claimed by the pump at its backstop", wantWoke: true, arm: func(ctx context.Context, t *testing.T, f *holdFixture) {
 			f.setDebounceLead(ctx, t, backstop, backstop+timeouts.TimerClaimDuration.Seconds())
 		}},
+		{
+			name: "a push's row the pump claimed once its window ran out", wantWoke: true,
+			arm: func(ctx context.Context, t *testing.T, f *holdFixture) {
+				// Armed a window and a second ago; the claim moved fires_at
+				// TimerClaimDuration past the window's end.
+				f.setDebounceLead(ctx, t, window+1, window+timeouts.TimerClaimDuration.Seconds())
+			},
+			then: func(ctx context.Context, t *testing.T, f *holdFixture, rig *holdRig) {
+				pumpUntilDebounceHandled(ctx, t, rig, f)
+				// The claim's own delivery, handled after: nothing pending.
+				if err := rig.actor.Send(ctx, TimerFired{Name: TimerReviewRetriggerDebounce}); err != nil {
+					t.Fatalf("Send TimerFired: %v", err)
+				}
+				// A frame the actor refuses replies at once: a barrier
+				// behind the delivery above, the actor handling commands
+				// in order.
+				sendSandboxEventForTest(ctx, t, rig.actor, SandboxEvent{})
+				if got := f.automaticReviews(ctx, t); got != 1 {
+					t.Fatalf("automatic reviews after the woken claimed row and its own delivery = %d, want exactly 1", got)
+				}
+				if row := f.prSession(ctx, t); row.PendingRetriggerHeadSha != nil || row.AutoRetriggerCount != 1 {
+					t.Fatalf("pending %v, count %d; want cleared and one slot spent", row.PendingRetriggerHeadSha, row.AutoRetriggerCount)
+				}
+				if _, _, _, ok := f.debounce(ctx, t); ok {
+					t.Fatal("the debounce is still armed after its review was queued")
+				}
+			},
+		},
 		{name: "a push's quiet window, just armed by the webhook's own write", arm: func(ctx context.Context, t *testing.T, f *holdFixture) {
 			f.armDebounce(ctx, t, time.Now().Add(timeouts.ReviewRetriggerDebounce))
 		}},
@@ -1046,7 +1080,8 @@ func TestReviewRetriggerWake_OnlyAHeldDebounceIsWoken(t *testing.T) {
 			open := holdOpenTurn(ctx, t, f, sqlcgen.TurnStatusPending, "review this pull request", nil, time.Time{})
 			tc.arm(ctx, t, f)
 			before, _, _, _ := f.debounce(ctx, t)
-			a := newHoldRig(ctx, t, pool, f.sessionID, nil).actor
+			rig := newHoldRig(ctx, t, pool, f.sessionID, nil)
+			a := rig.actor
 
 			if err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 				_, err := a.turnWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
@@ -1058,6 +1093,9 @@ func TestReviewRetriggerWake_OnlyAHeldDebounceIsWoken(t *testing.T) {
 			}
 			if tc.wantWoke {
 				f.assertEndedAndWoken(ctx, t, open.ID, sqlcgen.TurnStatusCompleted)
+				if tc.then != nil {
+					tc.then(ctx, t, f, rig)
+				}
 				return
 			}
 			after, due, _, ok := f.debounce(ctx, t)

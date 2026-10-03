@@ -66,11 +66,12 @@ func (s *TimerStore) HoldReviewRetriggerDebounce(ctx context.Context, sessionID 
 }
 
 // WakeReviewRetriggerDebounce moves the session's held re-review debounce
-// -- one last armed at least heldLead before its fires_at, as only the hold
-// arms it -- to the database's now, stamping armed_at and keeping
-// created_at, and reports how many rows it moved: zero when the session
-// has no debounce, only a push's quiet window, or only one armed at or
-// before its standing stop request. It never inserts one. The session
+// -- one last armed at least heldLead before its fires_at: a row the hold
+// re-armed, or one the pump claimed after its quiet window ran out, whose
+// wake-up is harmless -- to the database's now, stamping armed_at and
+// keeping created_at, and reports how many rows it moved: zero when the
+// session has no debounce, only a push's window still running, or only
+// one armed at or before its standing stop request. It never inserts one. The session
 // actor runs it in the transaction of every write that ends a turn
 // (technical plan §24.9); see WakeReviewRetriggerDebounce's doc comment in
 // queries/session_timers.sql.
