@@ -677,7 +677,8 @@ first. Stored under the wire `messageId` alone, every `tool_call`,
 `tool_result` and `step_finish` of a real turn deduped onto that
 `step_start`'s row, and none was stored or broadcast; the tests that should
 have seen it minted a fresh id per event. Each is now stored under a key
-derived from its `callId` or `stepId`, only while its turn is live.
+derived from its `callId` or `stepId`, only while its turn is live and its
+message's `step_start` is stored in that turn.
 
 - `TestResilience_ToolEventsOfOneMessage_EachStoredOnce`: the real OpenCode
   adapter runs against a scripted runtime server, so the events are the ones
