@@ -8,19 +8,29 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/coder/websocket"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
+	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
+	"github.com/narvidev/narvi/internal/sandboxagent/wsbridge"
 )
 
 // initRealGitRepoForPushTest creates a fresh, real git repo at dir on
@@ -358,5 +368,69 @@ func TestGitPushDashDash_RealDefenseInDepth(t *testing.T) {
 	if _, statErr := os.Stat(markerWithSeparator); !os.IsNotExist(statErr) {
 		t.Errorf(`marker file exists (stat error = %v) -- "--" did NOT stop option parsing; `+
 			"the malicious --receive-pack value was still executed", statErr)
+	}
+}
+
+// TestSendPushError_CapsGitPushStderr pins that sendPushError sends git
+// push's stderr capped (wsbridge.CapCriticalText): push_error is a critical
+// event, never cut, and SendCritical refuses one over the 32 KiB every
+// control plane reads, so an uncapped 40 KiB stderr would never be
+// reported at all -- the control plane would get a warning in its place
+// and no push failure (technical plan §6.1).
+func TestSendPushError_CapsGitPushStderr(t *testing.T) {
+	t.Parallel()
+
+	frames := make(chan []byte, 4)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set(platform.MaxFrameBytesHeader, strconv.Itoa(platform.MaxEventFrameBytes))
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = conn.CloseNow() }()
+		conn.SetReadLimit(platform.MaxEventFrameBytes)
+		for {
+			_, data, err := conn.Read(r.Context())
+			if err != nil {
+				return
+			}
+			var env struct {
+				Type string `json:"type"`
+			}
+			_ = json.Unmarshal(data, &env)
+			if env.Type != "ready" && env.Type != "heartbeat" {
+				frames <- data
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	bridge := wsbridge.New(sessionconfig.SessionConfig{
+		BootMode: sessionconfig.SessionConfigBootModeFresh, ControlPlaneWsUrl: server.URL, Gen: 1, SandboxToken: "t", SessionId: "s",
+	}, "sbx", "v", "d", nil, time.Second, time.Hour, 10*time.Millisecond, 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	var group errgroup.Group
+	group.Go(func() error { return bridge.Run(ctx) })
+	t.Cleanup(func() {
+		cancel()
+		_ = group.Wait()
+	})
+
+	h := &commandHandler{runCtx: ctx, bridge: bridge}
+	stderr := strings.Repeat("remote: error: refusing to update checked out branch\n", 800) // ~42 KiB
+	h.sendPushError(sandboxws.Push{Type: "push", MessageId: "push-1", SessionId: "s", Gen: 1}, errors.New("git push widgets: exited 1: "+stderr))
+
+	var data []byte
+	select {
+	case data = <-frames:
+	case <-time.After(5 * time.Second):
+		t.Fatal("nothing was sent")
+	}
+	var got sandboxws.PushError
+	if err := json.Unmarshal(data, &got); err != nil || got.Type != "push_error" {
+		t.Fatalf("sent %.200s (%v), want the push_error itself", data, err)
+	}
+	if len(got.Error) > 4096 || !strings.HasSuffix(got.Error, "...[truncated]") || !strings.HasPrefix(got.Error, "git push widgets: exited 1: remote: error") {
+		t.Fatalf("push_error carries %d bytes ending %q; want the head of git's stderr capped at 4096, marked", len(got.Error), got.Error[len(got.Error)-20:])
 	}
 }

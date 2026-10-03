@@ -91,8 +91,10 @@
 // What eviction can drop, therefore: while disconnected, best-effort
 // entries more than outboundBufferCap events old, never delivered -- the
 // soft cap §6.1 states; while connected, entries every one of which was
-// already written on this connection, by the replay or live; never a
-// critical entry, which leaves the buffer only when its ack arrives.
+// already written on this connection, by the replay or live, or that this
+// connection could not be written (below, "What a connection writes");
+// never a critical entry, which leaves the buffer only when its ack
+// arrives.
 //
 // # Dispatch-by-type-field is this package's own necessary pattern
 //
@@ -181,6 +183,60 @@
 // the control plane holds this gen's prompts to it; an agent that states
 // none is held to that 32 KiB default unless it advertises promptReceipt
 // (technical plan §3.3).
+//
+// # What a connection writes
+//
+// The control plane states the largest message it reads on a connection in
+// the handshake's response, platform.MaxFrameBytesHeader
+// (platform.MaxEventFrameBytes, 1 MiB, from a control plane built with
+// it). Every buffered entry written on that connection, live
+// (bestEffortSend) or replayed (flushBuffer), is fitted to that bound --
+// to platform.DefaultFrameReadLimitBytes, 32 KiB, when the header is
+// absent or not a positive integer: a control plane built before it,
+// during a rolling deploy or after a rollback, or a proxy that dropped
+// it (frameWriteBound, run.go). Before the bound, an event over 32 KiB
+// closed the connection, and every reconnect replayed it into the same
+// close: the socket looped, and nothing queued behind the frame arrived.
+//
+//   - The cut. A `token`, `tool_call` or `tool_result` over the bound is
+//     written cut (Fit, cut.go): one string -- a token's text, the longest
+//     string under a tool_result's output or a tool_call's input -- keeps
+//     its longest prefix that fits, at a UTF-8 boundary, and ends with a
+//     line for people, "[text cut at <kept> of <total> bytes on its way
+//     from the sandbox]"; the frame's added `cut` property, {kept, total},
+//     records it for machines, which read a cut only from it
+//     (internal/domain/framecut). The entry stays whole in the buffer, and
+//     every connection gets its own fit: one that reads more is written it
+//     whole, and one that reads less is written it cut even when an
+//     earlier connection was written it whole, since nothing tells this
+//     agent that write was stored. A cut is deterministic, so a replayed
+//     cut dedupes on the control plane.
+//   - Skip and warn. Any other frame over the bound, or one still over
+//     once cut, is not written on that connection: it stays buffered for
+//     a later connection that reads more, the replay goes on to the next
+//     entry so nothing behind it waits, and a best-effort `warning` naming
+//     its type, messageId, size and the bound goes out once per buffered
+//     entry (warnOnce) -- not per messageId, which a tool_call and its
+//     tool_result share. A warning raised inside the replay is buffered
+//     without waiting on it (enqueueNoHold), and the replay writes it. A
+//     skipped best-effort entry stays subject to eviction like any other,
+//     so it can be dropped without ever having been written: the soft cap
+//     above, applied to an entry no connection so far could read.
+//   - Critical events. None is ever cut, so none may be larger than every
+//     control plane reads: SendCritical refuses one over
+//     platform.DefaultFrameReadLimitBytes, buffering nothing, sends the
+//     same warning, and returns ErrFrameTooLarge. The one critical text
+//     nothing else bounds, push_error's git stderr, is capped first
+//     (CapCriticalText, 4096 bytes), so a real one never is.
+//   - The memory bound. SendBestEffort cuts an event over
+//     platform.MaxEventFrameBytes to it before buffering it, recording the
+//     cut string's path on the entry (cutPath), so a later, smaller cut of
+//     the entry shortens that same string and keeps its total; one that
+//     cannot be cut to fit is refused, warned about, and returns
+//     ErrFrameTooLarge. So the buffer's at most 1000 best-effort entries
+//     hold at most 1000 MiB, a few MiB in practice, where nothing bounded
+//     an entry before; critical entries, each at most 32 KiB, leave by
+//     ack.
 //
 // # Honest gaps this package documents rather than papers over
 //

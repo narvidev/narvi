@@ -284,6 +284,142 @@ func (q *Queries) GetLatestTokenFrameForPart(ctx context.Context, arg GetLatestT
 	return i, err
 }
 
+const listEventPageExtentForSession = `-- name: ListEventPageExtentForSession :many
+WITH RECURSIVE page (id, n, running) AS (
+    (
+        SELECT head.id, 1::bigint,
+               (octet_length(t.p)
+                + 5 * (char_length(t.p) - char_length(translate(t.p, '<>&' || chr(8232) || chr(8233), '')))
+                + 6 * octet_length(head.type) + 128)::bigint
+        FROM (
+            SELECT e.session_id, e.id, e.type, e.payload FROM events e
+            WHERE (e.session_id, e.id) > ($1::uuid, $2::bigint)
+            ORDER BY e.session_id ASC, e.id ASC
+            LIMIT 1
+        ) head
+        CROSS JOIN LATERAL (SELECT head.payload::text AS p OFFSET 0) t
+        WHERE head.session_id = $1::uuid
+    )
+    UNION ALL
+    (
+        SELECT nxt.id, page.n + 1,
+               page.running
+               + (octet_length(t.p)
+                  + 5 * (char_length(t.p) - char_length(translate(t.p, '<>&' || chr(8232) || chr(8233), '')))
+                  + 6 * octet_length(nxt.type) + 128)::bigint
+        FROM page
+        CROSS JOIN LATERAL (
+            SELECT e.session_id, e.id, e.type, e.payload FROM events e
+            WHERE (e.session_id, e.id) > ($1::uuid, page.id)
+            ORDER BY e.session_id ASC, e.id ASC
+            LIMIT 1
+        ) nxt
+        CROSS JOIN LATERAL (SELECT nxt.payload::text AS p OFFSET 0) t
+        WHERE page.n < $3::bigint AND (page.running <= $4::bigint OR page.n = 1)
+          AND nxt.session_id = $1::uuid
+    )
+)
+SELECT id, n, running FROM page ORDER BY id ASC
+`
+
+type ListEventPageExtentForSessionParams struct {
+	SessionID pgtype.UUID `json:"session_id"`
+	AfterID   int64       `json:"after_id"`
+	MaxRows   int64       `json:"max_rows"`
+	MaxBytes  int64       `json:"max_bytes"`
+}
+
+type ListEventPageExtentForSessionRow struct {
+	ID      int64 `json:"id"`
+	N       int64 `json:"n"`
+	Running int64 `json:"running"`
+}
+
+// One page of the log, measured before it is read (technical plan §6.2,
+// §6.3): walks session_id's events after after_id one at a time, oldest
+// first, over events_session_id_id_idx, adding up each event's size, and
+// stops after max_rows events or after the first event past the first that
+// takes the sum past max_bytes -- that event is returned too, so the
+// caller learns the page stopped at its budget. A first event alone over
+// max_bytes does not stop the walk: the page holds it all the same, and
+// the walk goes on to the next event, which then takes the sum past
+// max_bytes, so a page of one oversized event still learns whether more
+// follow. It returns ids and sums only: no payload leaves the database
+// here, and a payload is converted to text, to be measured, only for the
+// events walked -- the page's own, and at most one more -- never for the
+// rest of max_rows. ListEventsForSessionByIDs then reads the events that
+// fit.
+//
+// An event's size is an upper bound on what it takes in a page as the
+// control plane writes one (eventWireMap, marshaled, and a comma): the
+// payload's text, plus five bytes for each character encoding/json writes
+// as a six-byte escape and jsonb's text does not ('<', '>', '&', U+2028,
+// U+2029); six bytes for each byte of its type, the most encoding/json
+// writes for one, since a sandbox chooses the type and it may hold any
+// character; and 128 bytes for the id, createdAt and the keys. jsonb's
+// text is never shorter than its compacted form, so a page that fits by
+// this measure fits as written.
+//
+// Every lookup starts at the cursor on events_session_id_id_idx and reads
+// one entry, a few buffers however deep the cursor, under a custom plan and
+// a generic one alike, however many events a session the planner expects
+// (TestEventPage_WalkIsPositionedOnTheSessionIndex). pgx caches this
+// statement on each connection, and Postgres may run it on a generic plan
+// from its sixth run on, made without the parameters' values. So each
+// lookup is one row comparison, (session_id, id) > (session_id, cursor),
+// ordered by (session_id, id), the index's own order, under LIMIT 1: the
+// index scan starts at the cursor and stops at the next entry. The session
+// is tested outside the LIMIT, on the row the lookup returns, which ends
+// the walk when the session's events do -- at the cost of one entry of the
+// next session. Each other shape tried read far more:
+//   - a plain `id > $2` let a generic plan scan events_pkey from the
+//     cursor and filter every other session's events out;
+//   - a plain `session_id = $1` in the lookup becomes the index scan's
+//     start key in place of the cursor, so each lookup reads the session
+//     from its first event, and paging a long session is quadratic -- or
+//     the planner scans events_pkey from the table's first id;
+//   - ORDER BY id alone is not the index's order: the planner scans
+//     events_pkey from the table's first id, and, with no upper bound, the
+//     lookup returns another session's event;
+//   - a second row comparison in the lookup, (session_id, id) <=
+//     (session_id, the largest id), reduces with the first to a range of
+//     session_id alone, which, where the planner expects few events a
+//     session -- a generic plan on a log of small sessions, or a custom
+//     plan for a session that grew after the table was last analyzed -- it
+//     reads through events_session_id_message_id_idx from the session's
+//     first event, sorting by id and filtering on the cursor.
+//
+// The non-recursive term reads its one event in a subquery with LIMIT, and
+// each payload's text is computed once, behind OFFSET 0, so the measure is
+// taken only for the event the index returns. The recursive term's filter
+// on the walk's own columns is applied before the next event is read:
+// nothing is measured once the walk has stopped. Neither session test is
+// moved into its LIMIT subquery, which Postgres never does.
+func (q *Queries) ListEventPageExtentForSession(ctx context.Context, arg ListEventPageExtentForSessionParams) ([]ListEventPageExtentForSessionRow, error) {
+	rows, err := q.db.Query(ctx, listEventPageExtentForSession,
+		arg.SessionID,
+		arg.AfterID,
+		arg.MaxRows,
+		arg.MaxBytes,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListEventPageExtentForSessionRow
+	for rows.Next() {
+		var i ListEventPageExtentForSessionRow
+		if err := rows.Scan(&i.ID, &i.N, &i.Running); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEventsForSession = `-- name: ListEventsForSession :many
 SELECT id, session_id, type, payload, created_at, message_id FROM events
 WHERE session_id = $1 AND id > $2
@@ -303,6 +439,56 @@ type ListEventsForSessionParams struct {
 // migrations/000008_events.up.sql's own doc comment).
 func (q *Queries) ListEventsForSession(ctx context.Context, arg ListEventsForSessionParams) ([]Event, error) {
 	rows, err := q.db.Query(ctx, listEventsForSession, arg.SessionID, arg.ID, arg.Limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Event
+	for rows.Next() {
+		var i Event
+		if err := rows.Scan(
+			&i.ID,
+			&i.SessionID,
+			&i.Type,
+			&i.Payload,
+			&i.CreatedAt,
+			&i.MessageID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEventsForSessionByIDs = `-- name: ListEventsForSessionByIDs :many
+SELECT id, session_id, type, payload, created_at, message_id FROM (
+    SELECT id, session_id, type, payload, created_at, message_id FROM events WHERE id = ANY($1::bigint[]) OFFSET 0
+) page
+WHERE session_id = $2
+ORDER BY id ASC
+`
+
+type ListEventsForSessionByIDsParams struct {
+	Ids       []int64     `json:"ids"`
+	SessionID pgtype.UUID `json:"session_id"`
+}
+
+// The events of one page ListEventPageExtentForSession measured, read by
+// their ids, oldest first: a lookup of events_pkey by each, so the read is
+// the page's own events and no other under any plan. session_id guards
+// that the ids are the session's, and is tested outside an OFFSET 0 the
+// planner does not see through: beside id = ANY, a custom plan for a
+// session that grew after the table was last analyzed read the session's
+// every event by session_id and filtered on the ids
+// (TestEventPage_WalkIsPositionedOnTheSessionIndex). It replaces a range
+// read through the page's last id, whose generic plan was a range of
+// events_pkey that read every other session's events in it.
+func (q *Queries) ListEventsForSessionByIDs(ctx context.Context, arg ListEventsForSessionByIDsParams) ([]Event, error) {
+	rows, err := q.db.Query(ctx, listEventsForSessionByIDs, arg.Ids, arg.SessionID)
 	if err != nil {
 		return nil, err
 	}

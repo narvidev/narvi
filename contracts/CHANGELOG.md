@@ -10,6 +10,19 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.21.1]
+
+### rest/v1/dtos.schema.json
+
+- Changed (descriptions only, annotation-only PATCH):
+  `GetSessionTranscriptToolRequest.limit` now says it is the most events a
+  page holds, not how many it holds: a page of the events route also stops
+  at its 2 MiB byte budget (technical plan §6.3), so it can hold fewer and
+  still not be the last, and a reader goes on while `nextCursor` is set.
+  The request's own description says "at most 100 events per page" for
+  the default. No field, type, enum value or requiredness changed. A
+  description grades PATCH (row 35).
+
 ## [1.21.0]
 
 ### sandbox-ws/v1/events.schema.json

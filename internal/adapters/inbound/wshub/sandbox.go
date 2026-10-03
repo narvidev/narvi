@@ -68,8 +68,19 @@ import (
 //     sandbox agent (wsbridge.Run) never reads it and retries a 503 on
 //     its own exponential backoff, from SandboxWSReconnectMinBackoff (1 s)
 //     up; any other GetOrSpawn error -> 500.
-//  11. websocket.Accept, then the read/dispatch loop (dispatch.go) runs
-//     until conn.Read errors or ctx is done.
+//  11. websocket.Accept, its 101 response carrying
+//     platform.MaxFrameBytesHeader: the largest message this connection
+//     reads, platform.MaxEventFrameBytes, which the agent holds what it
+//     writes to (technical plan §6.1). An agent that finds no header -- a
+//     proxy dropped it -- holds its writes to the library's 32 KiB
+//     default, as it does for a control plane built before the header.
+//  12. conn.SetReadLimit(platform.MaxEventFrameBytes), the limit the header
+//     states, then the read/dispatch loop (dispatch.go) runs until
+//     conn.Read errors or ctx is done. A frame over the limit fails the
+//     read with ErrMessageTooBig, and the library closes the connection
+//     with StatusMessageTooBig; readLoop logs it at WARN with the limit,
+//     since only an agent built before the header sends one, and it sends
+//     it again on every reconnect.
 func NewSandboxHandler(registry *sessionactor.Registry, sandboxes *postgres.SandboxStore, commander *SandboxRegistry, timeouts platform.Timeouts) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// (1) ?type=sandbox -- the client-hub type is §6.2's own job,
@@ -178,12 +189,22 @@ func NewSandboxHandler(registry *sessionactor.Registry, sandboxes *postgres.Sand
 		// connection -- coder/websocket's Origin-header CSRF-style check
 		// exists to protect browser-facing endpoints from malicious pages,
 		// which does not apply here.
+		//
+		// The header is set before Accept, which keeps every header already
+		// on w and adds its own to the 101 response.
+		w.Header().Set(platform.MaxFrameBytesHeader, strconv.Itoa(platform.MaxEventFrameBytes))
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 		if err != nil {
 			logger.Error("wshub: websocket accept failed", "error", err)
 			return
 		}
 		defer func() { _ = conn.CloseNow() }()
+
+		// (12) The read limit the header above states. The library's
+		// default, 32 KiB, closed the connection on any longer event --
+		// a text part, a tool's input or output -- which the agent then
+		// replayed, closing every reconnect the same way.
+		conn.SetReadLimit(platform.MaxEventFrameBytes)
 
 		logger.Info("wshub: sandbox ws connected")
 

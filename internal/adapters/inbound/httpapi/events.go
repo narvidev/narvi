@@ -34,12 +34,21 @@ const (
 // eventsDefaultLimit and is capped at eventsMaxLimit regardless of what
 // the caller requests. Responds 200 with restdtos.EventsResponse: the
 // events and nextCursor of clientws.FetchHistoryResponse, backed by the
-// SAME EventStore.ListForSession the client WS hub's own fetch_history
+// SAME EventStore.ListPageForSession the client WS hub's own fetch_history
 // handler uses, one implementation, two callers. It deliberately leaves
 // out FetchHistoryResponse's sandbox: that row is a WS concern, what keeps
 // an open page's sandbox status current after a sandbox_status broadcast
 // (§6.2); a REST caller reads the status from GET
 // /api/sessions/{id}/status (SessionActivity.sandboxStatus).
+//
+// A page holds at most limit events and at most
+// platform.FetchHistoryMaxReplyBytes of them, always at least one, exactly
+// as a fetch_history page does, and the budget bounds what the page reads,
+// not only what it sends: the store reads only the events that fit
+// (EventStore.ListPageForSession), and eventsPageLen checks each one's
+// exact encoded size against the budget again. nextCursor is the id of the
+// last event sent whenever the page stopped at its byte budget or read its
+// full count, so a page shorter than limit can still have one after it.
 func ListEvents(sessions *postgres.SessionStore, events *postgres.EventStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
@@ -82,21 +91,23 @@ func ListEvents(sessions *postgres.SessionStore, events *postgres.EventStore) ht
 			}
 		}
 
-		rows, err := events.ListForSession(ctx, sessionID, cursor, int32(limit))
+		page, err := events.ListPageForSession(ctx, sessionID, cursor, int32(limit), platform.FetchHistoryMaxReplyBytes)
 		if err != nil {
 			logger.Error("httpapi: list events failed", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
+		rows := page.Events
 
-		wire := make([]restdtos.EventsResponseEventsElem, len(rows))
-		for i, e := range rows {
+		sent := eventsPageLen(rows, platform.FetchHistoryMaxReplyBytes)
+		wire := make([]restdtos.EventsResponseEventsElem, sent)
+		for i, e := range rows[:sent] {
 			wire[i] = eventWireMap(e)
 		}
 
 		var nextCursor *string
-		if len(rows) == limit {
-			s := strconv.FormatInt(rows[len(rows)-1].ID, 10)
+		if sent > 0 && (page.StoppedAtBudget || sent < len(rows) || len(rows) == limit) {
+			s := strconv.FormatInt(rows[sent-1].ID, 10)
 			nextCursor = &s
 		}
 
@@ -127,4 +138,28 @@ func eventWireMap(e sqlcgen.Event) map[string]interface{} {
 		"payload":   json.RawMessage(e.Payload),
 		"createdAt": e.CreatedAt,
 	}
+}
+
+// eventsPageLen mirrors internal/adapters/inbound/wshub's own
+// historyPageLen (client.go), duplicated for the reason eventWireMap is: it
+// returns how many of rows, oldest first, one page sends -- the longest run
+// from the first whose events, each encoded as eventWireMap gives it and
+// counted with the comma that follows it, sum to at most budget, and never
+// fewer than one for a non-empty rows, so a page always gives its reader a
+// cursor to go on from. The store already read no more than fits
+// (EventStore.ListPageForSession measures each event by an upper bound on
+// this size), so this is the exact check behind it, and it keeps every row
+// the store returns. A marshal failure counts as zero bytes: writeJSON's
+// own marshal reports it.
+func eventsPageLen(rows []sqlcgen.Event, budget int) int {
+	total := 0
+	for i, e := range rows {
+		if b, err := json.Marshal(eventWireMap(e)); err == nil {
+			total += len(b) + 1
+		}
+		if total > budget && i > 0 {
+			return i
+		}
+	}
+	return len(rows)
 }

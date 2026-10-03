@@ -194,6 +194,37 @@ const (
 	fetchHistoryMaxLimit     = 500
 )
 
+// historyPageLen returns how many of rows, oldest first, one history page
+// sends: the longest run from the first whose events, each encoded as
+// eventWireMap gives it and counted with the comma that follows it in the
+// reply, sum to at most budget (platform.FetchHistoryMaxReplyBytes for a
+// fetch_history reply, technical plan §6.2). It is never fewer than one
+// for a non-empty rows: a page that sent nothing would give its reader no
+// cursor to go on from, and the budget is no smaller than the largest
+// event the control plane reads, so one event is over it only when
+// something outside the sandbox socket stored it.
+//
+// fetchHistoryMaxLimit bounds a page by count; the budget bounds it by
+// bytes, as maxInitialReplayBytes bounds the subscribe reply. The store
+// already read no more than fits (EventStore.ListPageForSession measures
+// each event by an upper bound on this size), so this is the exact check
+// behind it, and it keeps every row the store returns. httpapi's
+// ListEvents keeps an identical copy, as it does of eventWireMap. A
+// marshal failure counts as zero bytes here, as in
+// truncateEventsToByteBudget: the reply's own marshal reports it.
+func historyPageLen(rows []sqlcgen.Event, budget int) int {
+	total := 0
+	for i, e := range rows {
+		if b, err := json.Marshal(eventWireMap(e)); err == nil {
+			total += len(b) + 1
+		}
+		if total > budget && i > 0 {
+			return i
+		}
+	}
+	return len(rows)
+}
+
 // NewClientHandler builds the HTTP handler backing GET
 // /sessions/{sessionID}/ws?type=client (§6.2) -- this file's own top
 // comment has the full handshake outcome table.
@@ -490,20 +521,23 @@ func buildSubscribedPayload(
 		return clientws.SubscribedPayload{}, err
 	}
 
-	// Fetched one row past initialReplayLimit, deliberately: getting
-	// initialReplayLimit+1 rows back is an exact, cheap ("+1" cost, no
-	// second query) proof that more history exists beyond what this
-	// payload can carry, unlike the len(rows)==limit heuristic this
-	// file's own fetch_history handler (below) and httpapi's own
-	// ListEvents (events.go) each use for their nextCursor -- a
-	// heuristic tolerable there because a false "there might be more"
-	// only costs a client one empty extra page, but wrong here would
-	// mean EventsTruncated itself lies.
-	eventRows, err := events.ListForSession(ctx, sessionID, 0, initialReplayLimit+1)
+	// Read as a page held to maxInitialReplayBytes, so the replay reads
+	// only the events it can carry (EventStore.ListPageForSession, which
+	// measures each event before reading it), not initialReplayLimit full
+	// rows to send 16 KiB of them; StoppedAtBudget is then the exact proof
+	// that more history exists past what the bytes allow. And one row past
+	// initialReplayLimit, deliberately: getting initialReplayLimit+1 rows
+	// back is an exact, cheap proof that more exists past the count.
+	// fetch_history (below) and httpapi's own ListEvents (events.go) set
+	// their nextCursor on the same exact byte-budget stop, and otherwise on
+	// the len(rows)==limit heuristic -- tolerable there because a false
+	// "there might be more" only costs a client one empty extra page, but
+	// wrong here it would mean EventsTruncated itself lies.
+	eventPage, err := events.ListPageForSession(ctx, sessionID, 0, initialReplayLimit+1, maxInitialReplayBytes)
 	if err != nil {
 		return clientws.SubscribedPayload{}, err
 	}
-	eventRows, countTruncated := trimToReplayLimit(eventRows)
+	eventRows, countTruncated := trimToReplayLimit(eventPage.Events)
 
 	artifactRows, err := artifacts.ListForSession(ctx, sessionID)
 	if err != nil {
@@ -535,7 +569,7 @@ func buildSubscribedPayload(
 			"correlationId": latestTurnCorrelationID(turnRows),
 		},
 		Events:          wireEvents,
-		EventsTruncated: countTruncated || byteTruncated,
+		EventsTruncated: countTruncated || eventPage.StoppedAtBudget || byteTruncated,
 		Artifacts:       subscribedArtifactsWire(artifactRows),
 		Participants:    participants,
 	}, nil
@@ -845,7 +879,7 @@ type clientEnvelope struct {
 // has elapsed since that last invocation is logged and dropped (matching
 // this function's own established "log and skip, connection stays open"
 // convention for other invalid input, e.g. handleFetchHistory's own
-// malformed-cursor case) -- events.ListForSession is not called and no
+// malformed-cursor case) -- events.ListPageForSession is not called and no
 // reply is written for it. Deliberately per-connection, not per-session or
 // global: this is a rate limit on one connection's own request cadence,
 // not cross-connection/cross-session coordination.
@@ -886,6 +920,15 @@ func readClientLoop(ctx context.Context, conn *websocket.Conn, sessionID pgtype.
 // connection stays open) rather than trusted, since a WS connection is
 // already scoped to exactly one session for its entire lifetime.
 //
+// A page holds at most the requested count of events and at most
+// platform.FetchHistoryMaxReplyBytes of them, always at least one. The
+// budget bounds what the page reads, not only what it sends: the store
+// reads only the events that fit (EventStore.ListPageForSession), and
+// historyPageLen checks each one's exact encoded size again. nextCursor is
+// the id of the last event sent whenever the page stopped at its byte
+// budget or read its full count, so the next page starts right after it;
+// nil otherwise.
+//
 // Every reply also carries the sandbox row as it stands when the reply is
 // assembled (FetchHistoryResponse.sandbox, sandboxWireMap's shape, nil
 // when the session has none yet), read after the page: the subscribe
@@ -924,20 +967,25 @@ func handleFetchHistory(ctx context.Context, conn *websocket.Conn, sessionID pgt
 		}
 	}
 
-	rows, err := events.ListForSession(ctx, sessionID, afterID, int32(limit))
+	page, err := events.ListPageForSession(ctx, sessionID, afterID, int32(limit), platform.FetchHistoryMaxReplyBytes)
 	if err != nil {
 		logger.Error("wshub: fetch_history: list events failed", "error", err)
 		return
 	}
+	rows := page.Events
 
-	wire := make([]clientws.FetchHistoryResponseEventsElem, len(rows))
-	for i, e := range rows {
+	// The page stops at its byte budget, in the store and, exactly, in
+	// historyPageLen; nextCursor is then the last event sent, so the next
+	// page starts right after it.
+	sent := historyPageLen(rows, platform.FetchHistoryMaxReplyBytes)
+	wire := make([]clientws.FetchHistoryResponseEventsElem, sent)
+	for i, e := range rows[:sent] {
 		wire[i] = eventWireMap(e)
 	}
 
 	var nextCursor *string
-	if len(rows) == limit {
-		s := strconv.FormatInt(rows[len(rows)-1].ID, 10)
+	if sent > 0 && (page.StoppedAtBudget || sent < len(rows) || len(rows) == limit) {
+		s := strconv.FormatInt(rows[sent-1].ID, 10)
 		nextCursor = &s
 	}
 

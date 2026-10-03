@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/coder/websocket"
@@ -67,7 +68,7 @@ func (b *Bridge) Run(ctx context.Context) error {
 
 		backoff = b.reconnectMinBackoff
 
-		runErr := b.runConnection(ctx, conn)
+		runErr := b.runConnection(ctx, conn, frameWriteBound(resp))
 		if errors.Is(runErr, ErrShutdownRequested) {
 			return ErrShutdownRequested
 		}
@@ -99,6 +100,27 @@ func (b *Bridge) dial(ctx context.Context) (*websocket.Conn, *http.Response, err
 	header.Set("X-Sandbox-Gen", strconv.Itoa(b.sessionGen))
 
 	return websocket.Dial(dialCtx, b.dialURL, &websocket.DialOptions{HTTPHeader: header})
+}
+
+// frameWriteBound returns the largest message the control plane reads on
+// the connection whose handshake answered resp: the value of its
+// platform.MaxFrameBytesHeader when that is a positive integer, otherwise
+// platform.DefaultFrameReadLimitBytes, the read limit of a control plane
+// that states none: one built before the header, met during a rolling
+// deploy or after a rollback, or one behind a proxy that dropped the
+// header. It bounds what this agent
+// writes on the connection (technical plan §6.1), never what it reads. A
+// value above platform.MaxEventFrameBytes is honoured as stated: every
+// buffered entry is already at most that (SendBestEffort).
+func frameWriteBound(resp *http.Response) int {
+	if resp == nil {
+		return platform.DefaultFrameReadLimitBytes
+	}
+	stated, err := strconv.Atoi(strings.TrimSpace(resp.Header.Get(platform.MaxFrameBytesHeader)))
+	if err != nil || stated <= 0 {
+		return platform.DefaultFrameReadLimitBytes
+	}
+	return stated
 }
 
 // isFatalStatus reports whether status is one of §6.1's 4 fatal handshake
@@ -141,7 +163,13 @@ func nextBackoff(current, maxBackoff time.Duration) time.Duration {
 // written ahead of older entries still waiting to be replayed. Commands
 // are read only after the replay, which the hold in enqueue keeps to one
 // pass over what was buffered plus at most one entry per sender.
-func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn) error {
+//
+// writeBound is the largest message the control plane reads on conn
+// (frameWriteBound): every buffered entry written on conn, replayed or
+// live, is fitted to it (Fit), and published with conn for live sends.
+// ready and heartbeats are written as they are: each is far below the
+// smallest bound a control plane has ever read at.
+func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn, writeBound int) error {
 	defer b.setConn(nil)
 	defer func() { _ = conn.CloseNow() }()
 
@@ -159,7 +187,7 @@ func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn) error 
 	if err := b.sendBootStartAfterReady(ctx, conn, &heartbeats); err != nil {
 		return fmt.Errorf("wsbridge: send boot-start heartbeat: %w", err)
 	}
-	if err := b.flushBuffer(ctx, conn); err != nil {
+	if err := b.flushBuffer(ctx, conn, writeBound); err != nil {
 		return fmt.Errorf("wsbridge: flush buffered events: %w", err)
 	}
 
@@ -233,7 +261,16 @@ func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
 // fast they are -- so commands, read only once it returns, wait for that
 // and no more. A failed write ends the replay too, releasing the held
 // sends; their entries stay buffered for the next connection.
-func (b *Bridge) flushBuffer(ctx context.Context, conn *websocket.Conn) (err error) {
+//
+// Every entry is written fitted to bound, the largest message the control
+// plane reads on conn (Fit): cut when it is over, even when an earlier
+// connection that read more wrote it whole, since nothing tells this agent
+// that write was stored. An entry that cannot be fitted is skipped -- it
+// stays buffered for a later connection that reads more, and the replay
+// goes on to the next entry, so nothing behind it waits -- and a warning
+// naming it goes out once (warnOnce), which this replay writes itself,
+// after every older entry.
+func (b *Bridge) flushBuffer(ctx context.Context, conn *websocket.Conn, bound int) (err error) {
 	b.connMu.Lock()
 	b.replayDone = make(chan struct{})
 	b.connMu.Unlock()
@@ -247,6 +284,12 @@ func (b *Bridge) flushBuffer(ctx context.Context, conn *websocket.Conn) (err err
 
 	var nextSeq uint64
 	for {
+		// A pass that writes nothing never meets ctx in conn.Write: checked
+		// here, so a replay whose every entry is skipped still ends when
+		// Run is canceled.
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		b.connMu.Lock()
 		pending := b.buffer.snapshotFrom(nextSeq)
 		if len(pending) == 0 {
@@ -254,6 +297,7 @@ func (b *Bridge) flushBuffer(ctx context.Context, conn *websocket.Conn) (err err
 				b.replayCaughtUpHook()
 			}
 			b.conn = conn
+			b.connBound = bound
 			b.endReplay()
 			b.connMu.Unlock()
 			return nil
@@ -261,10 +305,15 @@ func (b *Bridge) flushBuffer(ctx context.Context, conn *websocket.Conn) (err err
 		b.connMu.Unlock()
 
 		for _, entry := range pending {
-			if err := conn.Write(ctx, websocket.MessageText, entry.payload); err != nil {
+			nextSeq = entry.seq + 1
+			payload, _, ok := Fit(entry.payload, bound, entry.cutPath)
+			if !ok {
+				b.warnOnce(entry, bound)
+				continue
+			}
+			if err := conn.Write(ctx, websocket.MessageText, payload); err != nil {
 				return err
 			}
-			nextSeq = entry.seq + 1
 			if b.flushWriteHook != nil {
 				b.flushWriteHook()
 			}

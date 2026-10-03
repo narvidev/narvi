@@ -575,7 +575,7 @@ scenario #1's second pair of tests, above.
   `PromptResendMaxPerTurn` times and then no more, and the reconnects stop.
   — all five in `scenario22_lost_prompt_test.go`
 
-## Scenario #23 (Step 228, §3.3, §6.1) — in progress
+## Scenario #23 (Step 228, §3.3, §6.1)
 
 ### #23 — frames over 32 KiB on the sandbox socket
 
@@ -584,17 +584,78 @@ scenario #1's second pair of tests, above.
 > states none, never a reconnect loop; a prompt over the bound its gen's
 > agent states is refused at dispatch with both sizes named.
 
-**Status: partly covered.** Step 228 ships in three PRs, and this section
-is completed by its third, which adds the event direction, its tests, and
-the scenario's entry in §9.3. The prompt direction is covered. Every
-`ready` of an agent built from Step 228 states its read limit
-(`capabilities.maxFrameBytes`), and the control plane holds each gen's
-prompts to the read limit its latest `ready` shows: the stated one, else
-32 MiB for an agent that advertises `promptReceipt`, else the library's
-32 KiB default. Both tests below use scenario #22's rig: the real `wshub`
-sandbox handler and session actor on Postgres, behind scenario #7's relay,
-with agents written by hand as they write and read the wire.
+**Status: covered.** Before Step 228 the socket was bounded one way only.
+The control plane read it at the WebSocket library's 32 KiB default, and
+nothing bounded what an agent wrote: an event over 32 KiB closed the
+connection, and the agent, which replays its buffer on every reconnect,
+closed each one the same way, about 320 times a second, with nothing behind
+the frame ever arriving. In the other direction an agent built before Step
+226 read prompts at that default and lost a larger one in silence.
 
+Each side now states the largest frame it reads, and neither writes past
+what the other states. The control plane reads agent events up to
+`platform.MaxEventFrameBytes` (1 MiB) and states it in the handshake's
+`X-Max-Frame-Bytes` header. The agent holds every write to what its
+connection states, or to 32 KiB when the header is absent. A `token`,
+`tool_call` or `tool_result` over that bound is written cut, its `cut`
+property set. Any other frame over it is skipped and warned about once,
+and the replay goes on. Every `ready` states the agent's own read limit
+(`capabilities.maxFrameBytes`), and the control plane holds each gen's
+prompts to the latest `ready`: the stated limit, else 32 MiB for an agent
+that advertises `promptReceipt`, else the 32 KiB default.
+
+Every test below uses scenario #22's rig: the real `wshub` sandbox handler
+and session actor on Postgres, behind scenario #7's relay. Its two knobs
+stand in for both kinds of control plane:
+
+- `forwardMaxFrameHeader` forwards the backend's header, which makes the
+  relay a control plane built with it.
+- `clientReadLimit` set to 32768, with the header dropped as it is by
+  default, makes the relay a control plane built before it.
+
+`sever()` forces a reconnect to whichever comes next. The agents are a
+real `wsbridge.Bridge`, or one written by hand as scenario #22's are. The
+`tool_result` cases use the pinned runtime's id shape, the enclosing
+message's id behind that message's `step_start`, so a `tool_result` adds
+no row today (Step 229 schedules storing it). They assert what the wire
+carries.
+
+- `TestResilience_Scenario23_AgentEventOver32KiB_ReadOnOneConnection`: with
+  the header forwarded, a 40 KiB text part is stored whole and a 40 KiB
+  `tool_result` reaches the handler whole and adds no row. The
+  `execution_complete` behind them completes the turn, after one `ready`.
+- `TestResilience_Scenario23_PushErrorOver32KiB_ReportedAndNextTurnCompletes`:
+  a completed turn's push fails with 40 KiB of git stderr. Its `push_error`,
+  capped at 4096 bytes as the agent caps it (`wsbridge.CapCriticalText`),
+  is stored marked `...[truncated]` and acked, never replayed after, and
+  the delivery stamp ends. The next turn's `execution_complete` behind it
+  completes that turn.
+- `TestResilience_Scenario23_PreChangeAgent_EventOver32KiB_Stored`: an agent
+  built before the header, which bounds nothing it writes, has its 40 KiB
+  text part read on the connection it came on and stored whole.
+- `TestResilience_Scenario23_PreChangeControlPlane_FramesCutToFit_NoReconnectLoop`:
+  with no header and a 32 KiB read, a plan-mode turn's 40 KiB text part
+  arrives cut, its `cut` set. The plan reads as cut: no structured steps,
+  though its plan-steps block survived the cut, and `ErrPlanCut` refuses
+  Approve. A 40 KiB `tool_result` arrives cut to 32 KiB, the turn
+  completes, and `ready_seq` stays at 1. A reconnect to a control plane
+  that states its limit then replays both whole and adds no row.
+- `TestResilience_Scenario23_WholeThenCutOnRollback_FinalTextReadsWhole`:
+  a part is stored whole, then replayed cut after a reconnect to a control
+  plane that states nothing. The real handler adds no row for the cut,
+  which yields to the whole text, and a replica built before cuts stores
+  it anyway. The plan and the web timeline still read the part whole, and
+  the plan is approved. The stored rows are pinned against
+  `web/src/session/__tests__/fixtures/tokenWholeThenCutOnRollback.json`,
+  which the timeline test reads.
+- `TestResilience_Scenario23_EarlierFrameWholeThenFinalCut_CutReported`: a
+  35 KiB frame is stored whole, and its replayed cut adds no row. The final
+  45 KiB frame arrives cut. The plan reads that cut, never the earlier
+  frame, and the approval is refused.
+- `TestResilience_Scenario23_NoHeader_WritesHeldTo32KiB_PromptOver32KiBStillRead`:
+  a missing header bounds what the agent writes, never what it reads. A
+  40 KiB prompt is read and run once, and nothing over 32 KiB is written.
+  — the seven above in `scenario23_event_frames_test.go`
 - `TestResilience_Scenario23_Step226Agent_PromptOver32KiB_Delivered`: an
   agent built since Step 226 but before Step 228, whose `ready` advertises
   `promptReceipt` and states no limit, is sent a 40 KiB prompt whole on
@@ -628,9 +689,9 @@ with agents written by hand as they write and read the wire.
 | 16 | Non-idempotent-setup boot | Covered — Step 42 |
 | 17 | Restore-with-docker | Covered — Step 74 |
 | 22 | A prompt lost between dispatch and the sandbox | Covered — Step 226 |
-| 23 | Frames over 32 KiB on the sandbox socket | Partly covered — Step 228 (prompt direction; the event direction is to come) |
+| 23 | Frames over 32 KiB on the sandbox socket | Covered — Step 228 |
 
 Numbers 18-21 are taken by the scenarios `docs/TECHNICAL_PLAN.md` §9.3 appends for Phases 13, 15
 and 18 (rotation and the interrupted turn, fresh-lineage continuity, the spend cap and freeze, the
-Kubernetes provider), none built yet. 22 is Step 226's, and 23 is Step 228's (in progress). A new
-scenario takes 24.
+Kubernetes provider), none built yet. 22 is Step 226's, and 23 is Step 228's. A new scenario takes
+24.

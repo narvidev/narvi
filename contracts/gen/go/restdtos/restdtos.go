@@ -4224,8 +4224,8 @@ func (j *GetSessionToolRequest) UnmarshalJSON(value []byte) error {
 // the tool bridge's twin of GET /api/sessions/{sessionID}/events?cursor=&limit=,
 // the paginated event history. sessionId becomes the path parameter; cursor and
 // limit, when set, become the route's own query parameters, and when omitted leave
-// the route's own defaults to run unchanged (from the beginning, 100 events per
-// page).
+// the route's own defaults to run unchanged (from the beginning, at most 100
+// events per page).
 type GetSessionTranscriptToolRequest struct {
 	// Where the page starts: the previous page's EventsResponse.nextCursor, verbatim,
 	// or "0" (the default) for the beginning. An event id in decimal, a string like
@@ -4233,8 +4233,10 @@ type GetSessionTranscriptToolRequest struct {
 	// 400, reported as a tool execution error.
 	Cursor *string `json:"cursor,omitempty,omitzero" yaml:"cursor,omitempty" mapstructure:"cursor,omitempty"`
 
-	// How many events per page. Omitted means the route's own default (100). minimum
-	// matches the route's own rejection of a value below one. Deliberately no
+	// The most events a page holds. Omitted means the route's own default (100). A
+	// page also stops at its byte budget (2 MiB of events, always at least one), so
+	// it can hold fewer and still not be the last: read on while nextCursor is set.
+	// minimum matches the route's own rejection of a value below one. Deliberately no
 	// "maximum": the route does not reject a larger value, it clamps it to 500, and
 	// tools/contractscompat's closed keyword allowlist does not recognize "maximum"
 	// (ListSessionsToolRequest.limit's own reasoning).

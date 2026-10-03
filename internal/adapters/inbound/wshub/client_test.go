@@ -848,6 +848,109 @@ func TestClientHandler_FetchHistoryPagination(t *testing.T) {
 	}
 }
 
+// TestFetchHistory_ReplyHeldToItsByteBudget: a fetch_history page stops at
+// platform.FetchHistoryMaxReplyBytes, whatever count it asked for, with
+// nextCursor on the last event it sent, and the next page goes on from
+// there (technical plan §6.2). Five events of about 600 KiB each, asked for
+// 500 at a time: the first page holds three (about 1.8 MiB, a fourth would
+// pass 2 MiB), the second the last two.
+func TestFetchHistory_ReplyHeldToItsByteBudget(t *testing.T) {
+	timeouts := platform.DefaultTimeouts()
+	timeouts.ClientFetchHistoryMinInterval = 0
+	rig, sessionRow := newClientTestRig(t, timeouts)
+	ctx := context.Background()
+	token := createTestWSToken(ctx, t, rig.pool, sessionRow.ID, time.Now().Add(24*time.Hour))
+
+	const total = 5
+	var ids []int64
+	for i := 0; i < total; i++ {
+		created, err := rig.events.Create(ctx, sqlcgen.CreateEventParams{
+			SessionID: sessionRow.ID,
+			Type:      "tool_result",
+			MessageID: fmt.Sprintf("big-%d", i),
+			Payload:   []byte(fmt.Sprintf(`{"type":"tool_result","output":{"output":"%s"}}`, strings.Repeat("o", 600*1024))),
+		})
+		if err != nil {
+			t.Fatalf("create event %d: %v", i, err)
+		}
+		ids = append(ids, created.ID)
+	}
+
+	// A browser's WebSocket sets no per-message limit; this client reads
+	// as much, since even the subscribe reply keeps one 600 KiB event.
+	conn, _, err := websocket.Dial(ctx, rig.wsURL+"/sessions/"+sessionRow.ID.String()+"/ws?type=client", nil)
+	if err != nil {
+		t.Fatalf("Dial: %v", err)
+	}
+	defer func() { _ = conn.CloseNow() }()
+	conn.SetReadLimit(8 << 20)
+	subscribe, err := json.Marshal(clientws.SubscribeRequest{Token: token, ClientId: "test-client"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := conn.Write(ctx, websocket.MessageText, subscribe); err != nil {
+		t.Fatalf("Write subscribe: %v", err)
+	}
+	subscribed, cancelSubscribed := context.WithTimeout(ctx, 10*time.Second)
+	defer cancelSubscribed()
+	if _, _, err := conn.Read(subscribed); err != nil {
+		t.Fatalf("Read subscribed reply: %v", err)
+	}
+
+	fetchPage := func(cursor *string) (clientws.FetchHistoryResponse, int) {
+		t.Helper()
+		cursorJSON := "null"
+		if cursor != nil {
+			cursorJSON = strconv.Quote(*cursor)
+		}
+		msg := fmt.Sprintf(`{"type":"fetch_history","sessionId":%q,"cursor":%s,"limit":500}`, sessionRow.ID.String(), cursorJSON)
+		if err := conn.Write(ctx, websocket.MessageText, []byte(msg)); err != nil {
+			t.Fatalf("Write fetch_history: %v", err)
+		}
+		rc, cancel := context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+		_, data, err := conn.Read(rc)
+		if err != nil {
+			t.Fatalf("Read fetch_history response: %v", err)
+		}
+		var resp clientws.FetchHistoryResponse
+		if err := json.Unmarshal(data, &resp); err != nil {
+			t.Fatalf("unmarshal FetchHistoryResponse: %v", err)
+		}
+		return resp, len(data)
+	}
+	eventsBytes := func(resp clientws.FetchHistoryResponse) int {
+		n := 0
+		for _, e := range resp.Events {
+			b, err := json.Marshal(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			n += len(b) + 1
+		}
+		return n
+	}
+
+	page1, raw1 := fetchPage(nil)
+	if len(page1.Events) != 3 {
+		t.Fatalf("page 1 holds %d events (%d bytes), want 3: a fourth would pass the budget", len(page1.Events), raw1)
+	}
+	if got := eventsBytes(page1); got > platform.FetchHistoryMaxReplyBytes {
+		t.Fatalf("page 1's events are %d bytes, over the %d budget", got, platform.FetchHistoryMaxReplyBytes)
+	}
+	if page1.NextCursor == nil || *page1.NextCursor != strconv.FormatInt(ids[2], 10) {
+		t.Fatalf("page 1 nextCursor = %v, want the last event sent, %d", page1.NextCursor, ids[2])
+	}
+
+	page2, _ := fetchPage(page1.NextCursor)
+	if len(page2.Events) != 2 || page2.NextCursor != nil {
+		t.Fatalf("page 2 holds %d events, nextCursor %v; want the last 2 and no cursor", len(page2.Events), page2.NextCursor)
+	}
+	if first := page2.Events[0]["id"]; first != float64(ids[3]) {
+		t.Fatalf("page 2 starts at event %v, want %d, the one after page 1's last", first, ids[3])
+	}
+}
+
 // TestClientHandler_SubscribeSurvivesManyLargeEvents re-creates, end to
 // end, a real bug found in review: initialReplayLimit (an item-count cap)
 // alone did not bound the SubscribedPayload's own total marshaled size, so

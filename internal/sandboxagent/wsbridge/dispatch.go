@@ -58,7 +58,9 @@ func (b *Bridge) dispatch(ctx context.Context, msgType string, data []byte) erro
 			slog.Warn("wsbridge: dropping malformed ack", "error", err)
 			return nil
 		}
-		b.buffer.ack(cmd.AckId)
+		if seq, removed := b.buffer.ack(cmd.AckId); removed {
+			b.forgetWarned(seq)
+		}
 		return nil
 
 	case "shutdown":

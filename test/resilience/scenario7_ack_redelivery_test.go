@@ -61,8 +61,22 @@
 //     except that the first frame of that type in that direction --
 //     backend->client, or client->backend -- is dropped, never relayed,
 //     and both sides are severed at once: a frame lost with its socket.
-//   - the zero value (the fallback once the scripted queue is exhausted):
-//     full bidirectional relay, forever, no severing.
+//   - forwardMaxFrameHeader / clientReadLimit (scenario #23, frames over
+//     32 KiB on the sandbox socket, scenario23_event_frames_test.go): the
+//     relay never forwards the backend's handshake response headers, so by
+//     default it drops platform.MaxFrameBytesHeader -- the agent then holds
+//     its writes to the library's 32 KiB default, as for a control plane
+//     built before the header. forwardMaxFrameHeader dials the backend
+//     first and states, in the client's handshake, what the backend stated.
+//     clientReadLimit is the most the relay reads of one client->backend
+//     frame, platform.MaxPromptFrameBytes when 0; 32768 makes the relay a
+//     control plane built before the header, which reads at the default.
+//   - the zero value (the fallback once the scripted queue is exhausted,
+//     unless a test sets its own with setFallback): full bidirectional
+//     relay, forever, no severing.
+//
+// sever() cuts every connection the relay holds, both sides, so the bridge
+// reconnects -- through whatever step comes next.
 //
 // # Per-subtest shape
 //
@@ -158,6 +172,9 @@ type wsProxyStep struct {
 	severAfterBackend int
 	dropBackendType   string
 	dropClientType    string
+
+	forwardMaxFrameHeader bool
+	clientReadLimit       int64
 }
 
 // wsProxy relays a single WS connection between a real wsbridge.Bridge
@@ -184,6 +201,56 @@ type wsProxy struct {
 	// (scenario #22's deterministic loss); dropped counts those frames.
 	alwaysDropBackendType string
 	dropped               int
+	// onBackend, when set, is called with every backend->client payload
+	// the full relay passes on -- an ack among them.
+	onBackend func(payload []byte)
+	// fallback is the step every connection gets once steps is empty: the
+	// zero value unless setFallback set another.
+	fallback wsProxyStep
+	// active holds a cancel per connection the relay is serving, which
+	// sever() calls; nextConnID keys it.
+	active     map[int]context.CancelFunc
+	nextConnID int
+}
+
+// setFallback makes step the one every connection gets once the scripted
+// steps run out.
+func (p *wsProxy) setFallback(step wsProxyStep) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.fallback = step
+}
+
+// sever cuts every connection the relay is serving, both sides, so the
+// bridge reconnects.
+func (p *wsProxy) sever() {
+	p.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(p.active))
+	for _, cancel := range p.active {
+		cancels = append(cancels, cancel)
+	}
+	p.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+// track records cancel as one connection's, for sever, until the returned
+// func runs.
+func (p *wsProxy) track(cancel context.CancelFunc) func() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.active == nil {
+		p.active = map[int]context.CancelFunc{}
+	}
+	p.nextConnID++
+	id := p.nextConnID
+	p.active[id] = cancel
+	return func() {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		delete(p.active, id)
+	}
 }
 
 // droppedCount returns how many frames alwaysDropBackendType dropped.
@@ -208,7 +275,7 @@ func (p *wsProxy) nextStep() wsProxyStep {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if len(p.steps) == 0 {
-		return wsProxyStep{}
+		return p.fallback
 	}
 	step := p.steps[0]
 	p.steps = p.steps[1:]
@@ -240,31 +307,61 @@ func (p *wsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	p.mu.Unlock()
 
+	connCtx, cancelConn := context.WithCancel(r.Context())
+	defer cancelConn()
+	defer p.track(cancelConn)()
+
+	dialBackend := func() (*websocket.Conn, *http.Response, error) {
+		return websocket.Dial(connCtx, p.backendURL+r.URL.Path+"?"+r.URL.RawQuery,
+			&websocket.DialOptions{HTTPHeader: forwardableHandshakeHeaders(r)})
+	}
+	var backendConn *websocket.Conn
+	if step.forwardMaxFrameHeader {
+		// Dialed first, so the client's handshake can state what the
+		// backend's stated: the largest message it reads.
+		conn, resp, err := dialBackend()
+		if err != nil {
+			return
+		}
+		backendConn = conn
+		defer func() { _ = backendConn.CloseNow() }()
+		if stated := resp.Header.Get(platform.MaxFrameBytesHeader); stated != "" {
+			w.Header().Set(platform.MaxFrameBytesHeader, stated)
+		}
+	}
+
 	clientConn, err := websocket.Accept(w, r, &websocket.AcceptOptions{InsecureSkipVerify: true})
 	if err != nil {
 		return
 	}
 	defer func() { _ = clientConn.CloseNow() }()
 
-	backendConn, _, err := websocket.Dial(r.Context(), p.backendURL+r.URL.Path+"?"+r.URL.RawQuery,
-		&websocket.DialOptions{HTTPHeader: forwardableHandshakeHeaders(r)})
-	if err != nil {
-		return
+	if backendConn == nil {
+		conn, _, err := dialBackend()
+		if err != nil {
+			return
+		}
+		backendConn = conn
+		defer func() { _ = backendConn.CloseNow() }()
 	}
-	defer func() { _ = backendConn.CloseNow() }()
-	// The relay itself must never be what cuts a frame: it reads as much as
-	// a sandbox-agent does (technical plan §6.1).
-	clientConn.SetReadLimit(platform.MaxPromptFrameBytes)
+	// Unless a step says otherwise, the relay itself must never be what
+	// cuts a frame: it reads as much as a sandbox-agent does (technical
+	// plan §6.1).
+	clientReadLimit := step.clientReadLimit
+	if clientReadLimit == 0 {
+		clientReadLimit = platform.MaxPromptFrameBytes
+	}
+	clientConn.SetReadLimit(clientReadLimit)
 	backendConn.SetReadLimit(platform.MaxPromptFrameBytes)
 
 	if step.dropAfterClient > 0 {
 		for i := 0; i < step.dropAfterClient; i++ {
-			_, data, err := clientConn.Read(r.Context())
+			_, data, err := clientConn.Read(connCtx)
 			if err != nil {
 				return
 			}
 			p.onRelay(data)
-			if err := backendConn.Write(r.Context(), websocket.MessageText, data); err != nil {
+			if err := backendConn.Write(connCtx, websocket.MessageText, data); err != nil {
 				return
 			}
 		}
@@ -275,7 +372,7 @@ func (p *wsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	relayCtx, cancel := context.WithCancel(r.Context())
+	relayCtx, cancel := context.WithCancel(connCtx)
 	defer cancel()
 
 	var g errgroup.Group
@@ -311,6 +408,9 @@ func (p *wsProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				p.dropped++
 				p.mu.Unlock()
 				return nil
+			}
+			if p.onBackend != nil {
+				p.onBackend(data)
 			}
 			if err := clientConn.Write(relayCtx, websocket.MessageText, data); err != nil {
 				return err

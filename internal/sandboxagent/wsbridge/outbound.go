@@ -4,12 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net/url"
 	"time"
 
 	"github.com/coder/websocket"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
+	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/services"
 )
 
@@ -25,17 +27,30 @@ import (
 // The immediate send is best-effort: if it fails (e.g. no live connection
 // right now), that is NOT an error from this method -- the entry is
 // already buffered, so Run's own flushBuffer will deliver it on the next
-// (re)connect regardless. Only a msg marshal failure (a genuine caller
-// bug) is returned as an error. While a fresh connection replays the
-// buffer, the call waits for that replay to end, which writes the entry
-// itself (enqueue, bridge.go).
+// (re)connect regardless. While a fresh connection replays the buffer,
+// the call waits for that replay to end, which writes the entry itself
+// (enqueue, bridge.go).
+//
+// A critical event is never cut, so none may be larger than every control
+// plane reads: one over platform.DefaultFrameReadLimitBytes is refused --
+// nothing buffered, a warning naming it sent in its place -- and
+// SendCritical returns ErrFrameTooLarge. Its free text, where it carries
+// text from outside this process, is capped first (CapCriticalText), so a
+// real one never is. Otherwise only a marshal failure (a genuine caller
+// bug) is returned as an error.
 func (b *Bridge) SendCritical(ctx context.Context, msg any, ackID string) error {
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("wsbridge: marshal critical event %q: %w", ackID, err)
 	}
+	if len(payload) > platform.DefaultFrameReadLimitBytes {
+		b.warnNotSent(ctx, payload, platform.DefaultFrameReadLimitBytes)
+		return fmt.Errorf("%w: critical event %q is %d bytes, over the %d every control plane reads",
+			ErrFrameTooLarge, ackID, len(payload), platform.DefaultFrameReadLimitBytes)
+	}
 
-	b.bestEffortSend(ctx, b.enqueue(ctx, outboundEntry{ackID: ackID, critical: true, payload: payload}), payload)
+	entry, conn, bound := b.enqueue(ctx, outboundEntry{ackID: ackID, critical: true, payload: payload})
+	b.bestEffortSend(ctx, entry, conn, bound)
 	return nil
 }
 
@@ -45,14 +60,46 @@ func (b *Bridge) SendCritical(ctx context.Context, msg any, ackID string) error 
 // at cap and it is the oldest non-critical entry left (doc.go, "The replay
 // after a (re)connect", lists exactly when that can happen). Like
 // SendCritical, it waits while a fresh connection replays the buffer.
+//
+// An event over platform.MaxEventFrameBytes is cut to it before it is
+// buffered (Fit), the cut's path recorded on the entry, so no buffered
+// entry is larger -- the bound on the buffer's memory (doc.go, "What a
+// connection writes"). One that cannot be cut to fit is not buffered: a
+// warning naming it is sent in its place, and SendBestEffort returns
+// ErrFrameTooLarge.
 func (b *Bridge) SendBestEffort(ctx context.Context, msg any) error {
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return fmt.Errorf("wsbridge: marshal best-effort event: %w", err)
 	}
 
-	b.bestEffortSend(ctx, b.enqueue(ctx, outboundEntry{critical: false, payload: payload}), payload)
+	entry := outboundEntry{critical: false, payload: payload}
+	if len(payload) > platform.MaxEventFrameBytes {
+		fitted, path, ok := Fit(payload, platform.MaxEventFrameBytes, nil)
+		if !ok {
+			b.warnNotSent(ctx, payload, platform.MaxEventFrameBytes)
+			return fmt.Errorf("%w: best-effort event is %d bytes, over the %d buffered, and cannot be cut to fit",
+				ErrFrameTooLarge, len(payload), platform.MaxEventFrameBytes)
+		}
+		entry.payload, entry.cutPath = fitted, path
+	}
+
+	entry, conn, bound := b.enqueue(ctx, entry)
+	b.bestEffortSend(ctx, entry, conn, bound)
 	return nil
+}
+
+// warnNotSent sends a best-effort warning that payload was refused, never
+// buffered: it is over bound and cannot be cut to fit.
+func (b *Bridge) warnNotSent(ctx context.Context, payload []byte, bound int) {
+	slog.Warn("wsbridge: event refused, not buffered: over the bound it must fit, and no cut fits it",
+		"bytes", len(payload), "bound_bytes", bound)
+	warning, err := b.warningPayload(frameNotWrittenMessage(payload, bound))
+	if err != nil {
+		return
+	}
+	entry, conn, connBound := b.enqueue(ctx, outboundEntry{payload: warning, notice: true})
+	b.bestEffortSend(ctx, entry, conn, connBound)
 }
 
 // SendBootProgress translates one internal/sandboxagent/services.
@@ -87,16 +134,32 @@ func (b *Bridge) SendBootProgress(ctx context.Context, event services.BootProgre
 	return b.SendBestEffort(ctx, msg)
 }
 
-// bestEffortSend attempts to write payload on conn, the connection
-// enqueue returned when it buffered payload, silently doing nothing if
-// there was none or the write fails -- the caller (SendCritical/
-// SendBestEffort) has already buffered payload, so eventual delivery is
+// bestEffortSend attempts to write entry on conn, the connection enqueue
+// returned when it buffered entry, fitted to bound, the largest message
+// that connection's peer reads (Fit), silently doing nothing if there was
+// no connection or the write fails -- the caller (SendCritical/
+// SendBestEffort) has already buffered entry, so eventual delivery is
 // guaranteed via the next (re)connect's flushBuffer regardless of whether
 // THIS immediate attempt succeeds. conn is nil when the entry was buffered
 // while a fresh connection was replaying the buffer: that replay wrote
-// payload itself, after every older entry (see enqueue).
-func (b *Bridge) bestEffortSend(ctx context.Context, conn *websocket.Conn, payload []byte) {
+// entry itself, after every older one (see enqueue).
+//
+// An entry that cannot be fitted is not written on conn, and stays
+// buffered for a later connection that reads more; a warning naming it
+// goes out once (warnOnce), written here on conn.
+func (b *Bridge) bestEffortSend(ctx context.Context, entry outboundEntry, conn *websocket.Conn, bound int) {
 	if conn == nil {
+		return
+	}
+	payload, _, ok := Fit(entry.payload, bound, entry.cutPath)
+	if !ok {
+		warning, warned := b.warnOnce(entry, bound)
+		if !warned {
+			return
+		}
+		if payload, _, ok := Fit(warning.payload, bound, nil); ok {
+			_ = conn.Write(ctx, websocket.MessageText, payload)
+		}
 		return
 	}
 	_ = conn.Write(ctx, websocket.MessageText, payload)

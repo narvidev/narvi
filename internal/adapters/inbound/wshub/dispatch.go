@@ -3,6 +3,7 @@ package wshub
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"time"
 
 	"github.com/coder/websocket"
@@ -61,6 +62,15 @@ func readLoop(ctx context.Context, conn *websocket.Conn, actor *sessionactor.Act
 	for {
 		_, data, err := conn.Read(ctx)
 		if err != nil {
+			// A frame over the read limit (NewSandboxHandler, step 12)
+			// closes the connection, and its agent -- one built before the
+			// limit was stated to it -- replays the frame on every
+			// reconnect. Said here, with the limit: the agent's own log,
+			// inside the sandbox, is otherwise the only place it shows.
+			if errors.Is(err, websocket.ErrMessageTooBig) {
+				logger.Warn("wshub: sandbox frame over the read limit; connection closed",
+					"limit_bytes", platform.MaxEventFrameBytes, "error", err)
+			}
 			return
 		}
 

@@ -1000,7 +1000,7 @@ type Timeouts struct {
 	// inbound/wshub's client-WS read loop (client.go, readClientLoop)
 	// requires between two successive fetch_history requests it actually
 	// processes on one connection -- each processed request runs a real
-	// Postgres query (events.ListForSession), so this bounds how often a
+	// Postgres page read (events.ListPageForSession), so this bounds how often a
 	// single connection can trigger one, independent of the connection's
 	// own liveness. A fetch_history frame arriving before this interval
 	// has elapsed since the last one was processed is logged and dropped;

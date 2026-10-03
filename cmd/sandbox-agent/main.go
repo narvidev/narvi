@@ -759,6 +759,12 @@ func (h *commandHandler) sendPushComplete(cmd sandboxws.Push, repos []sandboxws.
 
 // sendPushError mirrors sendPushComplete for the failure path -- a single
 // error string, per PushError's own schema (no per-repo breakdown).
+//
+// The string carries git push's whole stderr (pushOneRepo), which nothing
+// else bounds, and push_error is a critical event, never cut: its text is
+// capped (wsbridge.CapCriticalText, its head kept and marked
+// "...[truncated]"), so the frame stays under the 32 KiB every control
+// plane reads and SendCritical never refuses it (technical plan §6.1).
 func (h *commandHandler) sendPushError(cmd sandboxws.Push, pushErr error) {
 	messageID := uuid.NewString()
 	msg := sandboxws.PushError{
@@ -767,7 +773,7 @@ func (h *commandHandler) sendPushError(cmd sandboxws.Push, pushErr error) {
 		SessionId: cmd.SessionId,
 		Gen:       cmd.Gen,
 		AckId:     "push_error:" + messageID,
-		Error:     pushErr.Error(),
+		Error:     wsbridge.CapCriticalText(pushErr.Error()),
 	}
 	if err := h.bridge.SendCritical(h.runCtx, msg, msg.AckId); err != nil {
 		slog.Warn("sandbox-agent: send push_error over WS bridge failed",

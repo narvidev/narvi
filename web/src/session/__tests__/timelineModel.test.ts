@@ -552,6 +552,25 @@ describe('buildTimelineModel -- cut frames', () => {
     expect([stream!.text, stream!.cut]).toEqual([whole, null])
   })
 
+  // The rows the real control plane and a replica built before cuts leave
+  // for a 40 KiB part written whole and then, on a reconnect to a control
+  // plane that states no limit, cut -- written by
+  // TestResilience_Scenario23_WholeThenCutOnRollback_FinalTextReadsWhole
+  // (test/resilience), which fails if what is stored stops matching this
+  // file. The cut is the part's newest row; the part reads whole.
+  it('the log a rollback leaves for a part stored whole then cut reads the part whole', () => {
+    const fixture = new URL('./fixtures/tokenWholeThenCutOnRollback.json', import.meta.url)
+    const events = JSON.parse(readFileSync(fixture, 'utf8')) as EventEnvelope[]
+    const tokens = events.filter((e) => e.type === 'token').map((e) => e.payload as { text: string; cut?: { kept: number; total: number } })
+    const whole = tokens.find((p) => p.text !== '' && p.cut === undefined)!
+    const wholeBytes = new TextEncoder().encode(whole.text).length
+    expect(wholeBytes).toBeGreaterThan(32 * 1024)
+    expect(tokens[tokens.length - 1]!.cut).toEqual({ kept: expect.any(Number), total: wholeBytes })
+    const [stream, ...others] = buildTimelineModel(events).turns[0]!.steps[0]!.tokens
+    expect(others).toEqual([])
+    expect([stream!.text, stream!.cut]).toEqual([whole.text, null])
+  })
+
   it('a part whose only text is cut reads as cut, its marker in the text and its cut on the stream', () => {
     const cutText = '1. Add the\n[text cut at 10 of 40 bytes on its way from the sandbox]'
     const events = [env('token', { messageId: 'prt_plan', text: '' }), env('token', { messageId: 'prt_plan', text: cutText, cut: { kept: 10, total: 40 } })]

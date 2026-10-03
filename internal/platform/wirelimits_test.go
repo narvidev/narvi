@@ -84,3 +84,30 @@ func TestDefaultFrameReadLimitBytes_IsTheLibraryDefault(t *testing.T) {
 		})
 	}
 }
+
+// TestWireLimits_Ordered pins the order the event direction's bounds rest
+// on: a history page holds at least one maximal event
+// (FetchHistoryMaxReplyBytes >= MaxEventFrameBytes), and the control plane
+// reads at least what an agent writes to a peer that states no limit
+// (MaxEventFrameBytes >= DefaultFrameReadLimitBytes).
+func TestWireLimits_Ordered(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name                    string
+		larger, smaller         int
+		largerName, smallerName string
+	}{
+		{name: "a history page holds a maximal event", larger: platform.FetchHistoryMaxReplyBytes, smaller: platform.MaxEventFrameBytes,
+			largerName: "FetchHistoryMaxReplyBytes", smallerName: "MaxEventFrameBytes"},
+		{name: "the control plane reads what an agent writes to a peer that states nothing", larger: platform.MaxEventFrameBytes, smaller: platform.DefaultFrameReadLimitBytes,
+			largerName: "MaxEventFrameBytes", smallerName: "DefaultFrameReadLimitBytes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if tc.larger < tc.smaller {
+				t.Fatalf("%s = %d is below %s = %d", tc.largerName, tc.larger, tc.smallerName, tc.smaller)
+			}
+		})
+	}
+}
