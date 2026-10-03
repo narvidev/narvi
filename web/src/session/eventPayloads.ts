@@ -88,11 +88,20 @@ export function asStepFinish(env: EventEnvelope): StepFinish | null {
   return env.payload as unknown as StepFinish
 }
 
+/**
+ * asSubTaskStart narrows a `sub_task_start`. Its optional parentCallId
+ * (technical plan §6.1) is kept when it is a non-empty string and dropped
+ * otherwise -- never failing the event, so a sub-task whose call cannot be
+ * named still shows, paired by its message instead (timelineModel.ts).
+ */
 export function asSubTaskStart(env: EventEnvelope): SubTaskStart | null {
   if (env.type !== 'sub_task_start' || !isPlainObject(env.payload)) return null
   const p = env.payload
   if (!isString(p.messageId) || !isString(p.subTaskId) || !isString(p.label) || !isString(p.parentMessageId)) return null
-  return env.payload as unknown as SubTaskStart
+  if (p.parentCallId === undefined || (isString(p.parentCallId) && p.parentCallId !== '')) return env.payload as unknown as SubTaskStart
+  const start = { ...(env.payload as unknown as SubTaskStart) }
+  delete start.parentCallId
+  return start
 }
 
 export function asSubTaskFinish(env: EventEnvelope): SubTaskFinish | null {

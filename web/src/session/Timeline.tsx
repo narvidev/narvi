@@ -209,6 +209,8 @@ export function Timeline({ sessionId, turns }: { sessionId: string; turns: TurnN
           {turn.steps.map((step, i) => (
             <StepCard key={step.stepId} step={step} live={turn.live && i === turn.steps.length - 1} />
           ))}
+          {/* Sub-tasks that found no spawning tool call: lanes of the turn itself, never dropped (timelineModel.ts). */}
+          {turn.subTasks.length > 0 && <SubTaskLanes subTasks={turn.subTasks} />}
           <FailureCard sessionId={sessionId} turn={turn} />
         </div>
       ))}

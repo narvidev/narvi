@@ -19,6 +19,13 @@
 // sub-task spend. This module reads the RAW event log instead, counting
 // every step_finish regardless of subTaskId -- the same event, read for a
 // different question.
+//
+// It reads nothing but step_finish rows, and never their messageId, so it
+// is only as good as the rows the server stores. A real step_finish carries
+// its assistant message's id, which that message's step_start stores first;
+// the server stores it under a key of its own, derived from its stepId
+// (technical plan §6.1). Before it did, no real session had a step_finish
+// row, and this rollup read "—" for every turn and session.
 import type { EventEnvelope } from '../ws/types'
 import { asExecutionComplete, asStepFinish } from './eventPayloads'
 

@@ -11,6 +11,8 @@
 // components ever started using dangerouslySetInnerHTML, these assertions
 // would start failing (a raw "<img" tag would appear in the output
 // instead of the escaped "&lt;img"), which is the whole point.
+import { readFileSync } from 'node:fs'
+
 import { describe, expect, it } from 'vitest'
 import { buildCostRollup } from '../costRollup'
 import { renderToStaticMarkup } from 'react-dom/server'
@@ -19,6 +21,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { Session } from '@narvi/contracts/rest-dtos'
 
 import { SessionHeader } from '../SessionHeader'
+import { CostPanel } from '../SessionRail'
 import { Timeline } from '../Timeline'
 import { buildTimelineModel } from '../timelineModel'
 import type { EventEnvelope } from '../../ws/types'
@@ -94,7 +97,7 @@ describe('Timeline rendering -- adversarial content stays text, never markup', (
 
   it('escapes a hostile sub-task label', () => {
     const events: EventEnvelope[] = [
-      { id: 1, type: 'tool_call', payload: { messageId: 'parent', callId: 'c1', toolName: 'Task', input: {} }, createdAt: '2026-08-20T10:00:00Z' },
+      { id: 1, type: 'tool_call', payload: { messageId: 'parent', callId: 'c1', toolName: 'task', input: {} }, createdAt: '2026-08-20T10:00:00Z' },
       {
         id: 2,
         type: 'sub_task_start',
@@ -217,5 +220,49 @@ describe('SessionHeader presence -- multiplayer indicator (§8.11)', () => {
       />,
     )
     expect(html).not.toContain('<img')
+  })
+})
+
+// What the header and the rail's cost panel draw from the rows one
+// assistant message leaves once the server stores its tool events
+// (technical plan §6.1) -- written by
+// TestResilience_ToolEventsOfOneMessage_EachStoredOnce from the rows the
+// real handler stores. Rendering checks: they pin what the page draws from
+// the rows it is given, and cannot see a loss on the server. Before the
+// server stored them, a real session had no tool_call or step_finish row:
+// the header drew neither cost nor calls, and the panel "—" throughout.
+describe('SessionHeader and CostPanel -- the rows one message leaves once stored', () => {
+  const rows = (): EventEnvelope[] => JSON.parse(readFileSync(new URL('./fixtures/toolEventsOfOneMessage.json', import.meta.url), 'utf8')) as EventEnvelope[]
+
+  it('the header shows the cost and the call count', () => {
+    const events = rows()
+    const html = renderToStaticMarkup(<SessionHeader session={baseSession()} model={buildTimelineModel(events)} cost={buildCostRollup(events)} participants={[]} />)
+    expect(html).toContain('$0.42 · 2 tool calls')
+  })
+
+  it('the panel shows the turn\'s and the session\'s cost while the turn runs, and the tokens', () => {
+    const live = rows().filter((e) => e.type !== 'execution_complete')
+    const html = renderToStaticMarkup(<CostPanel cost={buildCostRollup(live)} />)
+    expect(html).toContain('<dt>this turn</dt><dd>$0.42</dd>')
+    expect(html).toContain('<dt>session</dt><dd>$0.42</dd>')
+    expect(html).toContain('<dt>tokens</dt><dd>1.2k in · 80 out</dd>')
+  })
+
+  it('the timeline draws a sub-task that found no call as a lane of its turn', () => {
+    const events: EventEnvelope[] = [
+      { id: 1, type: 'tool_call', payload: { messageId: 'msg_1', callId: 'c1', toolName: 'read', input: {} }, createdAt: '2026-10-03T10:00:00Z' },
+      { id: 2, type: 'sub_task_start', payload: { messageId: 's1', subTaskId: 'st1', label: 'Orphan lane', parentMessageId: 'msg_1', parentCallId: 'c_never' }, createdAt: '2026-10-03T10:00:01Z' },
+      { id: 3, type: 'execution_complete', payload: { messageId: 'done', outcome: 'completed', reason: null }, createdAt: '2026-10-03T10:00:02Z' },
+    ]
+    const html = withQueryClient(<Timeline sessionId="s1" turns={buildTimelineModel(events).turns} />)
+    expect(html).toContain('Orphan lane')
+  })
+
+  it('the timeline draws each tool call and the step\'s cost', () => {
+    const html = withQueryClient(<Timeline sessionId="s1" turns={buildTimelineModel(rows()).turns} />)
+    expect(html).toContain('read')
+    expect(html).toContain('task')
+    expect(html).toContain('Second opinion')
+    expect(html).toContain('2 calls · 1280 tokens · $0.42')
   })
 })

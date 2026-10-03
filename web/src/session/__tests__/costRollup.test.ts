@@ -3,6 +3,8 @@
 // (sub-task spend) is included in the totals here, unlike
 // timelineModel.ts's own per-step cost, which deliberately EXCLUDES it
 // from the main lane it renders (that module's own top comment).
+import { readFileSync } from 'node:fs'
+
 import { describe, expect, it } from 'vitest'
 
 import type { EventEnvelope } from '../../ws/types'
@@ -86,5 +88,29 @@ describe('buildCostRollup', () => {
     ]
     const rollup = buildCostRollup(events)
     expect(rollup.turnUsd).toBeCloseTo(0.15) // both steps still in the SAME turn
+  })
+})
+
+// The rows one assistant message leaves once the server stores its tool
+// events (technical plan §6.1): its step_start, tool_calls, tool_results
+// and step_finish all share one msg_ id, as the runtime adapter gives it,
+// and the server keys each by its own correlator. Written by
+// TestResilience_ToolEventsOfOneMessage_EachStoredOnce (test/resilience)
+// from the rows the real handler stores. A rendering check: this module
+// never reads messageId, so it cannot see a loss on the server -- before
+// the server stored the step_finish, there was no row here to sum.
+describe('buildCostRollup -- the rows one message leaves once stored', () => {
+  const rows = (): EventEnvelope[] => JSON.parse(readFileSync(new URL('./fixtures/toolEventsOfOneMessage.json', import.meta.url), 'utf8')) as EventEnvelope[]
+
+  it('the turn and session totals and the tokens come from that step_finish while the turn runs', () => {
+    const live = rows().filter((e) => e.type !== 'execution_complete')
+    expect(live.filter((e) => e.type === 'step_finish')).toHaveLength(1)
+    const rollup = buildCostRollup(live)
+    expect(rollup).toEqual({ turnUsd: 0.42, turnInputTokens: 1200, turnOutputTokens: 80, sessionUsd: 0.42, sessionInputTokens: 1200, sessionOutputTokens: 80 })
+  })
+
+  it('once the turn has ended, the session keeps them', () => {
+    const rollup = buildCostRollup(rows())
+    expect([rollup.sessionUsd, rollup.sessionInputTokens, rollup.sessionOutputTokens]).toEqual([0.42, 1200, 80])
   })
 })

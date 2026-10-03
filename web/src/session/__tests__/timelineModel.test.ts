@@ -73,9 +73,9 @@ describe('buildTimelineModel', () => {
     expect(model.turns[0]!.steps[0]!.toolCalls).toHaveLength(1)
   })
 
-  it('nests a sub-task under the spawning tool call, by messageId (§7.1)', () => {
+  it('nests a sub-task that names no call under the task call of its message (§7.1)', () => {
     const events = [
-      env('tool_call', { messageId: 'parent-msg', callId: 'c1', toolName: 'Task', input: {} }),
+      env('tool_call', { messageId: 'parent-msg', callId: 'c1', toolName: 'task', input: {} }),
       env('sub_task_start', { messageId: 'm2', subTaskId: 'st1', label: 'counter-reviewer', parentMessageId: 'parent-msg' }),
       env('sub_task_finish', { messageId: 'm3', subTaskId: 'st1', outcome: 'completed' }),
     ]
@@ -89,7 +89,7 @@ describe('buildTimelineModel', () => {
   it('buffers a sub_task_start that arrives BEFORE its parent tool_call and attaches it once the parent appears (out-of-order delivery)', () => {
     const events = [
       env('sub_task_start', { messageId: 'm1', subTaskId: 'st1', label: 'fact-check', parentMessageId: 'parent-msg' }),
-      env('tool_call', { messageId: 'parent-msg', callId: 'c1', toolName: 'Task', input: {} }),
+      env('tool_call', { messageId: 'parent-msg', callId: 'c1', toolName: 'task', input: {} }),
     ]
     const model = buildTimelineModel(events)
     const toolCall = model.turns[0]!.steps[0]!.toolCalls[0]!
@@ -97,20 +97,19 @@ describe('buildTimelineModel', () => {
     expect(toolCall.subTasks[0]!.subTaskId).toBe('st1')
   })
 
-  it('surfaces a sub_task_start whose parent tool_call never appears as orphaned-under-no-one -- never silently dropped, but also never crashes', () => {
-    // The sub-task itself is only visible once ITS OWN parent tool_call
-    // is found; if it never is, it simply never renders anywhere (not
-    // tracked in orphanedSubTasks either, since a "sub_task_start with an
-    // unmatched parent" is architecturally indistinguishable from "the
-    // parent just hasn't arrived in this page yet" -- only a FINISH with
-    // no matching START, a structurally impossible ordering in a
-    // well-formed producer, is treated as evidence of corruption/hostile
-    // input and surfaced in orphanedSubTasks). This test pins that this
-    // case does not throw and does not fabricate a phantom tool call.
-    const events = [env('sub_task_start', { messageId: 'm1', subTaskId: 'st1', label: 'x', parentMessageId: 'never-appears' })]
-    expect(() => buildTimelineModel(events)).not.toThrow()
-    const model = buildTimelineModel(events)
-    expect(model.orphanedSubTasks).toEqual([])
+  it('shows a sub_task_start whose parent tool_call never appears as a lane of the turn -- never dropped, never a phantom tool call', () => {
+    // Only a FINISH with no matching START, a structurally impossible
+    // ordering in a well-formed producer, is surfaced in orphanedSubTasks;
+    // a start that has found no call is a lane of its turn, while the turn
+    // runs and once it has ended.
+    const start = env('sub_task_start', { messageId: 'm1', subTaskId: 'st1', label: 'x', parentMessageId: 'never-appears' })
+    expect(() => buildTimelineModel([start])).not.toThrow()
+    const live = buildTimelineModel([start])
+    expect(live.orphanedSubTasks).toEqual([])
+    expect(live.turns[0]!.steps).toEqual([])
+    expect(live.turns[0]!.subTasks.map((s) => s.subTaskId)).toEqual(['st1'])
+    const ended = buildTimelineModel([start, env('execution_complete', { messageId: 'done', outcome: 'completed', reason: null })])
+    expect(ended.turns[0]!.subTasks.map((s) => s.subTaskId)).toEqual(['st1'])
   })
 
   it('surfaces a sub_task_finish with no matching sub_task_start in orphanedSubTasks (finish-before-start / corrupt producer)', () => {
@@ -582,5 +581,147 @@ describe('buildTimelineModel -- cut frames', () => {
     const events = [env('token', { messageId: 'prt_plan', text: 'Plan.\n[text cut at 5 of 90 bytes on its way from the sandbox]', cut: { kept: '5', total: 90 } })]
     const [stream] = buildTimelineModel(events).turns[0]!.steps[0]!.tokens
     expect(stream!.cut).toEqual(MALFORMED_CUT)
+  })
+})
+
+// The rows a real turn's tool activity leaves once the server stores it
+// (technical plan §6.1): every event of an assistant message under that
+// message's id, its step_start first, each tool_call, tool_result and
+// step_finish stored under a key of its own. These are rendering checks:
+// they pin what the page draws from the rows it is given, and cannot see a
+// loss on the server -- the server's own tests do
+// (TestResilience_ToolEventsOfOneMessage_EachStoredOnce, test/resilience,
+// which writes fixtures/toolEventsOfOneMessage.json from the rows the real
+// handler stores; TestEvents_ToolEventsOfOneMessage_ReturnedByEventsAndHistory).
+describe('buildTimelineModel -- the tool events of a real turn', () => {
+  const sub = (subTaskId: string, parentMessageId: string, parentCallId?: string) =>
+    env('sub_task_start', { messageId: `start-${subTaskId}`, subTaskId, label: subTaskId, parentMessageId, ...(parentCallId ? { parentCallId } : {}) })
+  const call = (callId: string, toolName: string, messageId = 'msg_1') => env('tool_call', { messageId, callId, toolName, input: {} })
+  const result = (callId: string, messageId = 'msg_1') => env('tool_result', { messageId, callId, output: { output: 'ok' }, isError: false })
+  const lanes = (model: ReturnType<typeof buildTimelineModel>) =>
+    Object.fromEntries(model.turns[0]!.steps.flatMap((s) => s.toolCalls).map((c) => [c.callId, c.subTasks.map((st) => st.subTaskId)]))
+
+  it('the rows the server stores for one message: each tool call with its result, the sub-task under its task call, the step closed with its cost', () => {
+    const fixture = new URL('./fixtures/toolEventsOfOneMessage.json', import.meta.url)
+    const events = JSON.parse(readFileSync(fixture, 'utf8')) as EventEnvelope[]
+    const model = buildTimelineModel(events)
+    expect(model.turns).toHaveLength(1)
+    const [turn] = model.turns
+    expect([turn!.live, turn!.outcome?.outcome, turn!.subTasks]).toEqual([false, 'completed', []])
+    expect(turn!.steps).toHaveLength(1)
+    const [step] = turn!.steps
+    expect(step!.toolCalls.map((c) => [c.toolName, c.callId, c.result?.output])).toEqual([
+      ['read', 'call_read', { output: 'package main' }],
+      ['task', 'call_task', { output: 'Looks right.' }],
+    ])
+    expect(lanes(model)).toEqual({ call_read: [], call_task: ['ses_child'] })
+    expect(step!.toolCalls[1]!.subTasks[0]!.status).toBe('completed')
+    expect(step!.cost).toEqual({ inputTokens: 1200, outputTokens: 80, cachedTokens: 300, usd: 0.42 })
+    expect(step!.live).toBe(false)
+    expect(step!.tokens.map((tk) => tk.text)).toEqual(['Reading the file, then asking for a second opinion.'])
+  })
+
+  it('each tool call shows with its result, paired by callId under the one message id they share', () => {
+    const events = [env('step_start', { messageId: 'msg_1', stepId: 'prt_start' }), call('c1', 'read'), call('c2', 'bash'), result('c2'), result('c1')]
+    const [step] = buildTimelineModel(events).turns[0]!.steps
+    expect(step!.toolCalls.map((c) => [c.callId, c.result?.isError])).toEqual([
+      ['c1', false],
+      ['c2', false],
+    ])
+  })
+
+  it('a step closes at its step_finish with its cost, paired with its step_start by their shared message id, while the turn runs', () => {
+    const events = [
+      env('step_start', { messageId: 'msg_1', stepId: 'prt_start_1' }),
+      call('c1', 'read'),
+      env('step_finish', { messageId: 'msg_1', stepId: 'prt_finish_1', cost: { tokens: { input: 10, output: 5 }, usd: 0.02 } }),
+      env('step_start', { messageId: 'msg_2', stepId: 'prt_start_2' }),
+    ]
+    const [turn] = buildTimelineModel(events).turns
+    expect(turn!.live).toBe(true)
+    expect(turn!.steps.map((s) => [s.stepId, s.live, s.cost?.usd ?? null, s.toolCalls.length])).toEqual([
+      ['prt_start_1', false, 0.02, 1],
+      ['prt_start_2', true, null, 0],
+    ])
+  })
+
+  it('a step_finish pairs with the open step of its own message, never with another message\'s', () => {
+    const events = [
+      env('step_start', { messageId: 'msg_1', stepId: 'prt_start_1' }),
+      env('step_finish', { messageId: 'msg_1', stepId: 'prt_finish_1', cost: { tokens: { input: 1, output: 1 } } }),
+      env('step_start', { messageId: 'msg_2', stepId: 'prt_start_2' }),
+      env('step_finish', { messageId: 'msg_2', stepId: 'prt_finish_2', cost: { tokens: { input: 2, output: 2 } } }),
+    ]
+    const [turn] = buildTimelineModel(events).turns
+    expect(turn!.steps.map((s) => [s.stepId, s.live, s.cost?.inputTokens])).toEqual([
+      ['prt_start_1', false, 1],
+      ['prt_start_2', false, 2],
+    ])
+  })
+
+  it('two steps of one message each close at their own step_finish, in order', () => {
+    const events = [
+      env('step_start', { messageId: 'msg_1', stepId: 'prt_start_a' }),
+      env('step_finish', { messageId: 'msg_1', stepId: 'prt_finish_a', cost: { tokens: { input: 1, output: 1 } } }),
+      env('step_start', { messageId: 'msg_1', stepId: 'prt_start_b' }),
+      env('step_finish', { messageId: 'msg_1', stepId: 'prt_finish_b', cost: { tokens: { input: 2, output: 2 } } }),
+    ]
+    const [turn] = buildTimelineModel(events).turns
+    expect(turn!.steps.map((s) => [s.stepId, s.live, s.cost?.inputTokens])).toEqual([
+      ['prt_start_a', false, 1],
+      ['prt_start_b', false, 2],
+    ])
+  })
+
+  it('a sub-task hangs under its own task call by parentCallId, whether its sub_task_start comes before or after that call', () => {
+    const before = buildTimelineModel([call('c1', 'read'), sub('st1', 'msg_1', 'c2'), call('c2', 'task')])
+    expect(lanes(before)).toEqual({ c1: [], c2: ['st1'] })
+    const after = buildTimelineModel([call('c2', 'task'), call('c3', 'bash'), sub('st1', 'msg_1', 'c2')])
+    expect(lanes(after)).toEqual({ c2: ['st1'], c3: [] })
+  })
+
+  it('two parallel task calls each keep their own lane, whatever order their sub-tasks come in', () => {
+    const model = buildTimelineModel([call('ca', 'task'), call('cb', 'task'), sub('st_b', 'msg_1', 'cb'), sub('st_a', 'msg_1', 'ca')])
+    expect(lanes(model)).toEqual({ ca: ['st_a'], cb: ['st_b'] })
+    const early = buildTimelineModel([sub('st_b', 'msg_1', 'cb'), sub('st_a', 'msg_1', 'ca'), call('ca', 'task'), call('cb', 'task')])
+    expect(lanes(early)).toEqual({ ca: ['st_a'], cb: ['st_b'] })
+  })
+
+  it('a sub-task without parentCallId hangs under a task call of its message, never under a read or bash call', () => {
+    // read c1, the sub-task, then task c2: under c2, the next task call.
+    expect(lanes(buildTimelineModel([call('c1', 'read'), sub('st1', 'msg_1'), call('c2', 'task')]))).toEqual({ c1: [], c2: ['st1'] })
+    // task c2, bash c3, then the sub-task: under c2, the latest task call.
+    expect(lanes(buildTimelineModel([call('c2', 'task'), call('c3', 'bash'), sub('st1', 'msg_1')]))).toEqual({ c2: ['st1'], c3: [] })
+    // task c1, task c2, then the sub-task: under the latest, c2.
+    expect(lanes(buildTimelineModel([call('c1', 'task'), call('c2', 'task'), sub('st1', 'msg_1')]))).toEqual({ c1: [], c2: ['st1'] })
+    // The sub-task first, then bash c1, then task c2: the bash call that
+    // comes first does not take it; the task call after it does.
+    expect(lanes(buildTimelineModel([sub('st1', 'msg_1'), call('c1', 'bash'), call('c2', 'task')]))).toEqual({ c1: [], c2: ['st1'] })
+    // Another message's task call is not its message's.
+    const other = buildTimelineModel([call('c9', 'task', 'msg_9'), sub('st1', 'msg_1')])
+    expect(lanes(other)).toEqual({ c9: [] })
+    expect(other.turns[0]!.subTasks.map((s) => s.subTaskId)).toEqual(['st1'])
+  })
+
+  it('a sub-task left unattached at the turn\'s end shows as a turn-level lane, and its finish still reaches it', () => {
+    const model = buildTimelineModel([
+      call('c1', 'read'),
+      sub('st1', 'msg_1', 'c_never'),
+      env('sub_task_finish', { messageId: 'f1', subTaskId: 'st1', outcome: 'failed' }),
+      env('execution_complete', { messageId: 'done', outcome: 'completed', reason: null }),
+      call('c2', 'task', 'msg_next'),
+    ])
+    expect(model.turns).toHaveLength(2)
+    expect(model.turns[0]!.subTasks.map((s) => [s.subTaskId, s.status])).toEqual([['st1', 'failed']])
+    expect(lanes(model)).toEqual({ c1: [] })
+    expect(model.turns[1]!.subTasks).toEqual([]) // a new turn's call never takes an ended turn's sub-task
+    expect(model.orphanedSubTasks).toEqual([])
+  })
+
+  it('a parentCallId that is not a non-empty string is read as absent, never dropping the sub-task', () => {
+    for (const parentCallId of [7, '', null]) {
+      const model = buildTimelineModel([call('c2', 'task'), env('sub_task_start', { messageId: 's', subTaskId: 'st1', label: 'x', parentMessageId: 'msg_1', parentCallId })])
+      expect(lanes(model), `parentCallId ${JSON.stringify(parentCallId)}`).toEqual({ c2: ['st1'] })
+    }
   })
 })
