@@ -17,9 +17,10 @@
 --   - A pod that carries 000157 and restarts before the older binary
 --     replaces it applies 000157 again at boot, which locks the older binary
 --     out again ("no migration found for version 157").
--- Guarded: IF EXISTS, so it also runs on a database a rollback already
--- brought back to 156 with the columns kept (`migrate force 156`, the up
--- file's "Rolling back") and then forced to 157 again. Each drop is a
+-- Guarded: IF EXISTS, so it also runs when the columns are already gone --
+-- this down ran, the recorded version was then forced back to 157, and the
+-- down runs again. (With the columns kept, after `migrate force 156`, a
+-- plain DROP COLUMN would run anyway.) Each drop is a
 -- catalog change: it rewrites nothing, but takes ACCESS EXCLUSIVE on
 -- sandboxes for the file's one implicit transaction.
 ALTER TABLE sandboxes DROP COLUMN IF EXISTS agent_max_frame_bytes_gen;

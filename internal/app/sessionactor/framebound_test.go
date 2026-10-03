@@ -131,6 +131,34 @@ func TestFormatFrameBytes(t *testing.T) {
 	}
 }
 
+// TestFormatFrameSizes: a refused frame's size and its bound always read
+// differently to a person. Where formatFrameBytes would round both to the
+// same text -- a frame 1 to 51 bytes over 32 KiB, or just over 32 MiB --
+// both are given in exact bytes.
+func TestFormatFrameSizes(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		size, bound         int
+		wantSize, wantBound string
+	}{
+		{size: 41472, bound: platform.DefaultFrameReadLimitBytes, wantSize: "40.5 KiB", wantBound: "32.0 KiB"},
+		{size: platform.DefaultFrameReadLimitBytes + 1, bound: platform.DefaultFrameReadLimitBytes, wantSize: "32769 bytes", wantBound: "32768 bytes"},
+		{size: platform.DefaultFrameReadLimitBytes + 51, bound: platform.DefaultFrameReadLimitBytes, wantSize: "32819 bytes", wantBound: "32768 bytes"},
+		{size: platform.DefaultFrameReadLimitBytes + 52, bound: platform.DefaultFrameReadLimitBytes, wantSize: "32.1 KiB", wantBound: "32.0 KiB"},
+		{size: platform.MaxPromptFrameBytes + 1, bound: platform.MaxPromptFrameBytes, wantSize: "33554433 bytes", wantBound: "33554432 bytes"},
+		{size: platform.MaxPromptFrameBytes + 3<<19, bound: platform.MaxPromptFrameBytes, wantSize: "33.5 MiB", wantBound: "32.0 MiB"},
+		{size: 1 << 20, bound: 36864, wantSize: "1.0 MiB", wantBound: "36.0 KiB"},
+	} {
+		gotSize, gotBound := formatFrameSizes(tc.size, tc.bound)
+		if gotSize != tc.wantSize || gotBound != tc.wantBound {
+			t.Errorf("formatFrameSizes(%d, %d) = %q, %q; want %q, %q", tc.size, tc.bound, gotSize, gotBound, tc.wantSize, tc.wantBound)
+		}
+		if gotSize == gotBound {
+			t.Errorf("formatFrameSizes(%d, %d) renders both as %q", tc.size, tc.bound, gotSize)
+		}
+	}
+}
+
 // TestReadyStatedMaxFrameBytes pins how a ready's stated read limit is
 // read: a positive value is recorded, saturated at what an int32 column
 // holds; anything else -- absent, zero or less, or a ready that fails its

@@ -84,3 +84,16 @@ func formatFrameBytes(n int) string {
 	}
 	return fmt.Sprintf("%.1f MiB", float64(n)/(1<<20))
 }
+
+// formatFrameSizes renders a refused frame's size and the bound it went
+// over for a person, as formatFrameBytes does -- unless the two round to
+// the same text, as a frame up to about 51 bytes over 32 KiB does, when
+// both are given in exact bytes: a person told their prompt is "32.0 KiB,
+// more than the 32.0 KiB" the agent reads cannot tell how much to cut.
+func formatFrameSizes(size, bound int) (sizeText, boundText string) {
+	sizeText, boundText = formatFrameBytes(size), formatFrameBytes(bound)
+	if sizeText == boundText {
+		return fmt.Sprintf("%d bytes", size), fmt.Sprintf("%d bytes", bound)
+	}
+	return sizeText, boundText
+}

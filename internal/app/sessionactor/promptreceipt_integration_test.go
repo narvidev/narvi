@@ -934,7 +934,9 @@ func TestPromptReceipt_ResendCapStopsADeterministicLoss(t *testing.T) {
 // encoded frame's: a text of '<' is a sixth of its frame.
 func TestPromptReceipt_PromptFrameOverTheLimit_RefusedNeverSent(t *testing.T) {
 	ctx := context.Background()
-	text := strings.Repeat("<", platform.MaxPromptFrameBytes/6+1024)
+	// Over the limit by more than the banner's one-decimal rounding, so it
+	// names both sizes in MiB (formatFrameSizes).
+	text := strings.Repeat("<", platform.MaxPromptFrameBytes/6+64*1024)
 	if len(text) >= platform.MaxPromptFrameBytes {
 		t.Fatal("the text alone must fit: only its encoding exceeds the limit")
 	}

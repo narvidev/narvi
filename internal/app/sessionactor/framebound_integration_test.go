@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -70,9 +71,10 @@ func TestFrameBound_LatestReadyPerGen_ReadAtDispatch(t *testing.T) {
 		statedSmall      = 36 * 1024
 		statedOverTheMax = 64 << 20
 	)
-	// Each '<' encodes as the six bytes <, so this text's frame is over
-	// MaxPromptFrameBytes and under statedOverTheMax.
-	overTheMax := strings.Repeat("<", platform.MaxPromptFrameBytes/6+1024)
+	// Each '<' encodes as the six bytes \u003c, so this text's frame is over
+	// MaxPromptFrameBytes and under statedOverTheMax -- by more than the
+	// rounding of the banner's one decimal, so it names both in MiB.
+	overTheMax := strings.Repeat("<", platform.MaxPromptFrameBytes/6+64*1024)
 
 	for _, tc := range []struct {
 		name      string
@@ -315,4 +317,124 @@ func TestFrameBound_ReenqueueToARespawnedGen_MeasuredAgainstItsBound(t *testing.
 			}
 		})
 	}
+}
+
+// promptTextForFrame returns a prompt text whose prompt frame, as a
+// dispatch of rig's pending turn to its sandbox's live gen builds it,
+// encodes to exactly frameBytes bytes. The frame's other fields have a
+// fixed length -- the messageId is a fresh UUID -- so its overhead is
+// measured once with BuildPromptPayload on the rows the dispatch reads.
+func promptTextForFrame(ctx context.Context, t *testing.T, rig *receiptRig, frameBytes int, receiptRequested bool) string {
+	t.Helper()
+	sessionRow, err := narvipg.NewSessionStore(rig.pool).Get(ctx, rig.sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sandboxRow, err := rig.sandboxes.Get(ctx, rig.sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	turnRow := rig.turn(ctx, t)
+	probe := "a"
+	turnRow.Prompt = &probe
+	payload, err := BuildPromptPayload(rig.sessionID.String(), sessionRow, sandboxRow, turnRow, uuid.NewString(), receiptRequested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return strings.Repeat("a", frameBytes-(len(payload)-len(probe)))
+}
+
+// TestFrameBound_AFrameOfExactlyItsBound_WrittenOneByteMoreRefused pins the
+// comparison against the gen's bound to the agent's own: an agent reads a
+// message of exactly its read limit (TestDefaultFrameReadLimitBytes_IsTheLibraryDefault),
+// so a prompt frame of exactly its gen's bound is written and one a byte
+// longer is refused -- on a first dispatch to a gen held to the library's
+// default, and on a receipt re-send to a gen whose latest ready states a
+// limit. The refusal's banner shows the two sizes in exact bytes, where
+// rounded they would read the same.
+func TestFrameBound_AFrameOfExactlyItsBound_WrittenOneByteMoreRefused(t *testing.T) {
+	t.Run("dispatch", func(t *testing.T) {
+		for _, tc := range []struct {
+			name     string
+			frame    int
+			wantSent bool
+		}{
+			{name: "exactly the bound", frame: platform.DefaultFrameReadLimitBytes, wantSent: true},
+			{name: "a byte over it", frame: platform.DefaultFrameReadLimitBytes + 1},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := context.Background()
+				rig := newReceiptRig(ctx, t, receiptRigOptions{})
+				text := promptTextForFrame(ctx, t, rig, tc.frame, false)
+				if _, err := rig.pool.Exec(ctx, `UPDATE turns SET prompt = $2 WHERE id = $1`, rig.turnID, text); err != nil {
+					t.Fatal(err)
+				}
+				// A ready that states nothing and advertises nothing: the gen is
+				// held to the library's default.
+				sendAndSettle(ctx, t, rig.actor, frameBoundReady(1, ""), 1)
+
+				prompts := rig.commander.prompts(t)
+				got := rig.turn(ctx, t)
+				if !tc.wantSent {
+					if len(prompts) != 0 || got.Status != sqlcgen.TurnStatusFailed {
+						t.Fatalf("%d prompts sent, turn %s; want a %d-byte frame refused", len(prompts), got.Status, tc.frame)
+					}
+					var warning string
+					if err := rig.pool.QueryRow(ctx, `SELECT payload->>'message' FROM events WHERE session_id = $1 AND type = 'warning'`, rig.sessionID).Scan(&warning); err != nil {
+						t.Fatal(err)
+					}
+					if want := fmt.Sprintf("its prompt is %d bytes once encoded, more than the %d bytes this sandbox's agent reads", tc.frame, platform.DefaultFrameReadLimitBytes); !strings.Contains(warning, want) {
+						t.Fatalf("session warning = %q, want it to contain %q", warning, want)
+					}
+					return
+				}
+				if len(prompts) != 1 || got.Status != sqlcgen.TurnStatusProcessing {
+					t.Fatalf("%d prompts sent, turn %s; want a %d-byte frame written", len(prompts), got.Status, tc.frame)
+				}
+				if size := len(prompts[0].raw); size != tc.frame {
+					t.Fatalf("the prompt frame written is %d bytes, want exactly %d", size, tc.frame)
+				}
+			})
+		}
+	})
+
+	t.Run("receipt re-send", func(t *testing.T) {
+		for _, tc := range []struct {
+			name      string
+			overBound int // how far the frame is over the bound the later ready states
+			wantSent  bool
+		}{
+			{name: "exactly the bound", overBound: 0, wantSent: true},
+			{name: "a byte over it", overBound: 1},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				ctx := context.Background()
+				rig := newReceiptRig(ctx, t, receiptRigOptions{prompt: strings.Repeat("a", 40*1024)})
+				tooLargeBefore := promptResendCount(ctx, t, promptResendOutcomeFrameTooLarge)
+
+				sendAndSettle(ctx, t, rig.actor, frameBoundReady(1, `"promptReceipt":true,"maxFrameBytes":65536`), 1)
+				prompts := rig.commander.prompts(t)
+				if len(prompts) != 1 {
+					t.Fatalf("%d prompts sent, want the dispatch", len(prompts))
+				}
+				frame := len(prompts[0].raw)
+				sendAndSettle(ctx, t, rig.actor, frameBoundReady(1, fmt.Sprintf(`"promptReceipt":true,"maxFrameBytes":%d`, frame-tc.overBound)), 1)
+
+				prompts = rig.commander.prompts(t)
+				tooLarge := promptResendCount(ctx, t, promptResendOutcomeFrameTooLarge) - tooLargeBefore
+				if tc.wantSent {
+					if len(prompts) != 2 || len(prompts[1].raw) != frame || tooLarge != 0 {
+						t.Fatalf("%d prompts sent, frame_too_large moved by %d; want the %d-byte frame re-sent at a bound of %d", len(prompts), tooLarge, frame, frame)
+					}
+					return
+				}
+				if len(prompts) != 1 || tooLarge != 1 {
+					t.Fatalf("%d prompts sent, frame_too_large moved by %d; want the %d-byte frame refused at a bound of %d", len(prompts), tooLarge, frame, frame-1)
+				}
+				if got := rig.turn(ctx, t); got.Status != sqlcgen.TurnStatusProcessing {
+					t.Fatalf("turn status = %s, want processing", got.Status)
+				}
+			})
+		}
+	})
 }

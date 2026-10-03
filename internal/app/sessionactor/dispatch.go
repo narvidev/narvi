@@ -2322,10 +2322,11 @@ func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainSt
 		a.logger.Error("sessionactor: refusing to dispatch turn: its prompt frame is larger than this sandbox's agent reads",
 			"session_id", a.sessionID.String(), "turn_id", plan.turnID.String(),
 			"frame_bytes", size, "max_frame_bytes", bound)
+		sizeText, boundText := formatFrameSizes(size, bound)
 		return a.failDispatchedTurn(ctx, plan.turnID, dispatchFailure{
 			reason: fmt.Sprintf("prompt frame of %d bytes is larger than the %d bytes this sandbox's agent reads", size, bound),
 			warning: fmt.Sprintf("This session's turn was ended: its prompt is %s once encoded, more than the %s this sandbox's agent reads in one message, so it was not sent. "+
-				"Shorten the prompt, or split the work across turns, then send the turn again.", formatFrameBytes(size), formatFrameBytes(bound)),
+				"Shorten the prompt, or split the work across turns, then send the turn again.", sizeText, boundText),
 			notAssessed: reviewcheck.NotAssessedPromptNotDelivered,
 			refused:     true,
 			// SendCommand is never called on this path either.
