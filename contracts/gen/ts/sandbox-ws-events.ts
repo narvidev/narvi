@@ -104,6 +104,13 @@ export interface Token {
    * §6.1/§7.1 sub-task fan-out: OPTIONAL — absent or null means this event belongs to the turn's main lane; a non-null value is the subTaskId (same id sub_task_start/sub_task_finish carry) of the sub-task lane this event belongs to.
    */
   subTaskId?: string | null;
+  /**
+   * Set only on a frame the sandbox-agent cut to fit what the control plane's connection reads (technical plan §6.1); absent on a whole frame. text was shortened at a UTF-8 boundary and ends with a line of its own, '[text cut at <kept> of <total> bytes on its way from the sandbox]'. kept is the bytes of the original string kept and total its whole length, both counted in UTF-8 bytes of the unescaped string, kept below total. Readers learn a cut only from this property, never from the text: a marker-shaped line in a frame without it is the agent's own text, and a frame with it yields to the stored whole text it was taken from (exactly total bytes, starting with the bytes kept) and to a cut of that text keeping more.
+   */
+  cut?: {
+    kept: number;
+    total: number;
+  };
 }
 export interface ToolCall {
   type: 'tool_call';
@@ -122,6 +129,13 @@ export interface ToolCall {
    * §6.1/§7.1 sub-task fan-out: OPTIONAL — absent or null means this event belongs to the turn's main lane; a non-null value is the subTaskId (same id sub_task_start/sub_task_finish carry) of the sub-task lane this event belongs to.
    */
   subTaskId?: string | null;
+  /**
+   * Set only on a frame the sandbox-agent cut to fit what the control plane's connection reads (technical plan §6.1); absent on a whole frame. The longest string anywhere in input was shortened at a UTF-8 boundary and ends with a line of its own, '[text cut at <kept> of <total> bytes on its way from the sandbox]'. kept is the bytes of the original string kept and total its whole length, both counted in UTF-8 bytes of the unescaped string, kept below total. Readers learn a cut only from this property, never from the text: a marker-shaped line in a frame without it is the agent's own text, and a frame with it yields to the stored whole text it was taken from (exactly total bytes, starting with the bytes kept) and to a cut of that text keeping more.
+   */
+  cut?: {
+    kept: number;
+    total: number;
+  };
 }
 export interface ToolResult {
   type: 'tool_result';
@@ -140,6 +154,13 @@ export interface ToolResult {
    * §6.1/§7.1 sub-task fan-out: OPTIONAL — absent or null means this event belongs to the turn's main lane; a non-null value is the subTaskId (same id sub_task_start/sub_task_finish carry) of the sub-task lane this event belongs to.
    */
   subTaskId?: string | null;
+  /**
+   * Set only on a frame the sandbox-agent cut to fit what the control plane's connection reads (technical plan §6.1); absent on a whole frame. The longest string anywhere in output was shortened at a UTF-8 boundary and ends with a line of its own, '[text cut at <kept> of <total> bytes on its way from the sandbox]'. kept is the bytes of the original string kept and total its whole length, both counted in UTF-8 bytes of the unescaped string, kept below total. Readers learn a cut only from this property, never from the text: a marker-shaped line in a frame without it is the agent's own text, and a frame with it yields to the stored whole text it was taken from (exactly total bytes, starting with the bytes kept) and to a cut of that text keeping more.
+   */
+  cut?: {
+    kept: number;
+    total: number;
+  };
 }
 export interface StepStart {
   type: 'step_start';

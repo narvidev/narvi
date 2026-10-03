@@ -781,7 +781,8 @@
         "decidedAt",
         "decidedBy",
         "content",
-        "structured"
+        "structured",
+        "cut"
       ],
       "properties": {
         "id": {
@@ -861,6 +862,20 @@
               "type": "string",
               "minLength": 1,
               "description": "A short, non-empty, model-authored free-text summary of the plan's overall size (the mockup's own '6 files · 2 migrations' line, docs/design/mockups.html) -- plain text only, like every other model-authored string here."
+            }
+          }
+        },
+        "cut": {
+          "type": ["object", "null"],
+          "additionalProperties": false,
+          "description": "The cut this plan's text carries, when it is a frame the sandbox-agent cut on its way to the control plane (technical plan \u00a76.1): kept, the bytes of the plan's text kept, and total, its whole length, both in UTF-8 bytes of the unescaped text; both -1 when the frame carried a cut this server could not read. Read from the frames content is read from (internal/domain/plan.FinalText's cut report), never from content's text, which ends with the cut's marker line, '[text cut at <kept> of <total> bytes on its way from the sandbox]', and which a client may shorten for display. A plan with a cut cannot be approved: POST /api/sessions/{sessionID}/plans/{planId}/approve answers 409 with the reason, and a client shows that reason where Approve would be, keeping Request changes and Reject. Null when the text is whole, and for a plan whose content comes from its approval snapshot (plan_documents), which records none: such a plan was approved whole.",
+          "required": ["kept", "total"],
+          "properties": {
+            "kept": {
+              "type": "integer"
+            },
+            "total": {
+              "type": "integer"
             }
           }
         }
@@ -4443,6 +4458,8 @@
         "manifestCoveragePartial",
         "aggregateReviewTriggered",
         "planId",
+        "planCutKept",
+        "planCutTotal",
         "sessionId",
         "failureReason",
         "automationId",
@@ -4695,6 +4712,20 @@
           ],
           "format": "uuid",
           "description": "kind=awaiting_approval, a plan (not a handoff PR) only."
+        },
+        "planCutKept": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "kind=awaiting_approval, a plan (not a handoff PR) only: set, with planCutTotal, when the plan's text is a frame the sandbox-agent cut on its way to the control plane (technical plan \u00a76.1) -- the bytes of the text kept, in UTF-8 bytes; -1 when the frame carried a cut this server could not read. Read from the plan's own turn window of the event log (internal/domain/plan.FinalText's cut report), the read the approval itself makes, so a row with a cut is one the approval refuses: a client shows the reason in place of Approve, keeping Open. Null for a whole plan, and for every other kind. Flattened like provenanceKind, per this object's own description."
+        },
+        "planCutTotal": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "description": "kind=awaiting_approval, a plan only: the cut text's whole length in UTF-8 bytes, set exactly when planCutKept is; -1 when the frame carried a cut this server could not read."
         },
         "sessionId": {
           "type": [
@@ -6468,7 +6499,8 @@
               "description": "The run's final assistant text: deterministic, copied from what the run itself streamed, never written by a model.",
               "required": [
                 "text",
-                "truncated"
+                "truncated",
+                "cut"
               ],
               "properties": {
                 "text": {
@@ -6476,11 +6508,25 @@
                     "string",
                     "null"
                   ],
-                  "description": "The run's last text part, verbatim -- among the parts the run streamed with any text, the one that opened last, read at its newest frame: the one rule this system uses to read a turn's final text (the same one GET /api/sessions/{sessionID}/plans reads a plan with). Cut to at most 4,000 characters (Unicode code points). Null when the run left no text in the session's recent event history."
+                  "description": "The run's last text part, verbatim -- among the parts the run streamed with any text, the one that opened last, read at its newest frame that yields to no other (a frame cut on its way from the sandbox yields to the whole text it was taken from, see cut): the one rule this system uses to read a turn's final text (the same one GET /api/sessions/{sessionID}/plans reads a plan with). Cut to at most 4,000 characters (Unicode code points). Null when the run left no text in the session's recent event history."
                 },
                 "truncated": {
                   "type": "boolean",
                   "description": "true when text was cut at 4,000 characters; the full text is in the transcript."
+                },
+                "cut": {
+                  "type": ["object", "null"],
+                  "additionalProperties": false,
+                  "description": "Set when the run's last text part is a frame the sandbox-agent cut on its way to the control plane (technical plan \u00a76.1), as GET /api/sessions/{sessionID}/plans reports it for a plan: kept, the bytes of the part's text kept, and total, its whole length, both in UTF-8 bytes of the unescaped text; both -1 when the frame carried a cut this server could not read. text then ends with the cut's marker line, unless truncated cut it first; this property, never the text, says the run's text was cut. Null when the text is whole, or when there is none.",
+                  "required": ["kept", "total"],
+                  "properties": {
+                    "kept": {
+                      "type": "integer"
+                    },
+                    "total": {
+                      "type": "integer"
+                    }
+                  }
                 }
               }
             }
