@@ -291,3 +291,45 @@ func TestMaybeEnqueueLinearProgress_GitHubOrigin_ToolCall_EnqueuesNothing(t *tes
 		t.Errorf("outbox row count for github-origin session's tool_call = %d, want 0", n)
 	}
 }
+
+// TestLinearProgress_FirstToolCallOfATurn_ProductionShape_NotifiesOnce is
+// the shape a real turn sends, which every other test in this file missed:
+// a message's step_start first, then its tool calls, all under the
+// message's id (translate.go). Under the wire messageId alone each
+// tool_call deduped onto the step_start's row, insertedFresh was false,
+// and no Linear-origin session ever got this notice. Each tool_call now
+// has its own key, so the first of the turn notifies, once, and the
+// second does not.
+func TestLinearProgress_FirstToolCallOfATurn_ProductionShape_NotifiesOnce(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+
+	sessionID := createTestSessionWithSpawnSource(ctx, t, pool, sqlcgen.SessionSpawnSourceLinear)
+	if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	createDispatchedProcessingTurn(ctx, t, pool, sessionID)
+	claimLinearAgentSessionForTest(ctx, t, pool, sessionID, "agent-session-1", "org-1")
+
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+
+	sid := sessionID.String()
+	sendSandboxEventForTest(ctx, t, a, messageEventForTest(t, sid, "step_start", "msg_1", "prt_start"))
+	sendSandboxEventForTest(ctx, t, a, messageEventForTest(t, sid, "tool_call", "msg_1", "call_a"))
+	sendSandboxEventForTest(ctx, t, a, messageEventForTest(t, sid, "tool_call", "msg_1", "call_b"))
+
+	if n := countOutboxRowsForSessionKind(ctx, t, pool, sessionID, string(ports.NotificationKindLinearProgress)); n != 1 {
+		t.Fatalf("linear progress notices = %d, want exactly 1: the turn's first tool_call notifies, the second does not", n)
+	}
+	if got := storedKeys(ctx, t, pool, sessionID, "tool_call"); len(got) != 2 {
+		t.Fatalf("stored tool_calls %q, want both, each under its own key", got)
+	}
+}

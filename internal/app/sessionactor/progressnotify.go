@@ -69,16 +69,21 @@
 // deliberately NOT collapsed into one new, independently-invented dedupe
 // mechanism:
 //
-//  1. insertedFresh (appendRawEvent's own row.Inserted, threaded through by
-//     handleSandboxEvent) is false for a wire-level redelivery of an
-//     ALREADY-processed tool_call -- §6.1's own buffer/resend-on-reconnect
-//     protocol ("sender buffers 1000 events... re-sends on reconnect until
-//     acked; receiver dedupes by upsert-on-messageId") applies to every
-//     event type, not just the 6 critical ones, so a tool_call CAN be
-//     redelivered. A deduped resend must never re-run this file's own
-//     logic at all -- checked FIRST, before any DB read, so a redelivery
-//     costs nothing beyond the append-only persist handleSandboxEvent
-//     already always does.
+//  1. insertedFresh (appendCorrelatedEvent's own result, toolevent.go,
+//     threaded through by handleSandboxEvent) is false for a wire-level
+//     redelivery of an ALREADY-processed tool_call -- §6.1's own
+//     buffer/resend-on-reconnect protocol ("sender buffers 1000 events...
+//     re-sends on reconnect until acked; receiver dedupes by
+//     upsert-on-messageId") applies to every event type, not just the 6
+//     critical ones, so a tool_call CAN be redelivered -- and for one that
+//     arrives with no turn live. A deduped resend must never re-run this
+//     file's own logic at all -- checked FIRST, before any DB read, so a
+//     redelivery costs nothing beyond the append-only persist
+//     handleSandboxEvent already always does. A tool_call is stored under
+//     a key derived from its callId. Under its wire messageId alone, its
+//     enclosing assistant message's id, which that message's step_start
+//     stores first, insertedFresh was false for every real tool_call and
+//     this notice never fired; its tests had minted a fresh id per event.
 //  2. turns.progress_notified_at is a per-TURN marker, set at MOST once,
 //     atomically, by TurnStore.MarkProgressNotified's own conditional
 //     UPDATE ... WHERE progress_notified_at IS NULL (queries/turns.sql) --

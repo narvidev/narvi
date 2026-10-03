@@ -47,14 +47,18 @@ import (
 // step_finish.stepId (§6.1), which is one per step.
 //
 // It is deliberately NOT the `inserted` flag appendRawEvent returns, which
-// this function used to gate on. That flag answers "was this
-// (session_id, message_id) row new to the events table" -- a different
-// question, and one that is false for every step_finish ever sent:
-// step_start and step_finish are two parts of the same assistant message
-// and carry that message's id (translate.go: the token event is the sole
-// part-derived event that uses its own part id), so step_start always
-// claims the row first. Gated that way, no production step_finish reached
-// the cost write at all.
+// this function used to gate on. That flag answers "was this event's row
+// new to the events table" -- a different question. Until a step_finish
+// had a storage key of its own it was false for every step_finish ever
+// sent: step_start and step_finish are two parts of the same assistant
+// message and carry that message's id (translate.go: the token event is the
+// sole part-derived event that uses its own part id), so step_start always
+// claimed the row first, and gated that way no production step_finish
+// reached the cost write at all. A step_finish is now stored under a key
+// derived from its stepId (toolevent.go), but only while its turn is live,
+// and the cost write keeps its own key, the stepId, so that whether the
+// event's row is stored and whether its money is counted stay two answers
+// to two questions.
 func (a *Actor) recordStepFinishCost(ctx context.Context, tx pgx.Tx, raw json.RawMessage) error {
 	var evt sandboxws.StepFinish
 	if err := json.Unmarshal(raw, &evt); err != nil {

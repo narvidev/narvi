@@ -1,0 +1,168 @@
+[
+  {
+    "id": 1,
+    "type": "step_start",
+    "payload": {
+      "gen": 1,
+      "messageId": "msg_1",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "stepId": "prt_step",
+      "type": "step_start"
+    },
+    "createdAt": "2026-10-03T10:00:00Z"
+  },
+  {
+    "id": 2,
+    "type": "token",
+    "payload": {
+      "gen": 1,
+      "messageId": "prt_text",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "text": "",
+      "type": "token"
+    },
+    "createdAt": "2026-10-03T10:00:00Z"
+  },
+  {
+    "id": 3,
+    "type": "token",
+    "payload": {
+      "gen": 1,
+      "messageId": "prt_text",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "text": "Reading the file, then asking for a second opinion.",
+      "type": "token"
+    },
+    "createdAt": "2026-10-03T10:00:00Z"
+  },
+  {
+    "id": 4,
+    "type": "tool_call",
+    "payload": {
+      "callId": "call_read",
+      "gen": 1,
+      "input": {
+        "filePath": "main.go"
+      },
+      "messageId": "msg_1",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "toolName": "read",
+      "type": "tool_call"
+    },
+    "createdAt": "2026-10-03T10:00:00Z"
+  },
+  {
+    "id": 5,
+    "type": "tool_result",
+    "payload": {
+      "callId": "call_read",
+      "gen": 1,
+      "isError": false,
+      "messageId": "msg_1",
+      "output": {
+        "output": "package main"
+      },
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "type": "tool_result"
+    },
+    "createdAt": "2026-10-03T10:00:00Z"
+  },
+  {
+    "id": 6,
+    "type": "sub_task_start",
+    "payload": {
+      "gen": 1,
+      "label": "Second opinion",
+      "messageId": "sub_task_start-1",
+      "parentCallId": "call_task",
+      "parentMessageId": "msg_1",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "subAgentType": "counter-reviewer",
+      "subTaskId": "ses_child",
+      "type": "sub_task_start"
+    },
+    "createdAt": "2026-10-03T10:00:00Z"
+  },
+  {
+    "id": 7,
+    "type": "tool_call",
+    "payload": {
+      "callId": "call_task",
+      "gen": 1,
+      "input": {
+        "description": "Second opinion",
+        "prompt": "Review the change.",
+        "subagent_type": "counter-reviewer"
+      },
+      "messageId": "msg_1",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "toolName": "task",
+      "type": "tool_call"
+    },
+    "createdAt": "2026-10-03T10:00:00Z"
+  },
+  {
+    "id": 8,
+    "type": "sub_task_finish",
+    "payload": {
+      "ackId": "sub_task_finish:sub_task_finish-1",
+      "gen": 1,
+      "messageId": "sub_task_finish-1",
+      "outcome": "completed",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "subTaskId": "ses_child",
+      "type": "sub_task_finish"
+    },
+    "createdAt": "2026-10-03T10:00:00Z"
+  },
+  {
+    "id": 9,
+    "type": "tool_result",
+    "payload": {
+      "callId": "call_task",
+      "gen": 1,
+      "isError": false,
+      "messageId": "msg_1",
+      "output": {
+        "output": "Looks right."
+      },
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "type": "tool_result"
+    },
+    "createdAt": "2026-10-03T10:00:00Z"
+  },
+  {
+    "id": 10,
+    "type": "step_finish",
+    "payload": {
+      "cost": {
+        "tokens": {
+          "cached": 300,
+          "input": 1200,
+          "output": 80
+        },
+        "usd": 0.42
+      },
+      "gen": 1,
+      "messageId": "msg_1",
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "stepId": "prt_finish",
+      "type": "step_finish"
+    },
+    "createdAt": "2026-10-03T10:00:00Z"
+  },
+  {
+    "id": 11,
+    "type": "execution_complete",
+    "payload": {
+      "ackId": "execution_complete:execution_complete-1",
+      "gen": 1,
+      "messageId": "execution_complete-1",
+      "outcome": "completed",
+      "reason": null,
+      "sessionId": "00000000-0000-4000-8000-000000000001",
+      "type": "execution_complete"
+    },
+    "createdAt": "2026-10-03T10:00:00Z"
+  }
+]

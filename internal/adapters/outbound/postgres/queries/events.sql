@@ -19,15 +19,19 @@
 -- after any update) -- callers use it to decide whether to (re-)broadcast
 -- this event to live subscribers.
 --
--- message_id is the wire messageId, with one exception: every frame of a
+-- message_id is the wire messageId, with two exceptions. Every frame of a
 -- `token` part shares the part's messageId, and a plain first-wins key
 -- would keep only the first one. So the session actor stores a part's
 -- FIRST frame under the bare messageId, like any other event, and each
 -- later distinct frame under messageId + "#" + a hash of its text
 -- (sessionactor/tokenframe.go). The first frame keeps the bare key so
 -- that a binary predating per-frame keys, which dedupes every frame on
--- it, still finds it. Readers never see the storage key -- they read the
--- payload, whose messageId is untouched.
+-- it, still finds it. And a `tool_call`, `tool_result` or `step_finish`
+-- carries its enclosing assistant message's id, which that message's
+-- `step_start` stores first, so each is stored under messageId + "#" +
+-- its type + ":" + its callId or stepId (internal/domain/eventkey).
+-- Readers never see the storage key -- they read the payload, whose
+-- messageId is untouched.
 --
 -- # Why the session row is locked before the id is drawn
 --
@@ -89,6 +93,20 @@ SELECT sqlc.arg(session_id), sqlc.arg(type)::text, sqlc.arg(message_id)::text, s
 FROM session_row
 ON CONFLICT (session_id, message_id) DO UPDATE SET type = events.type
 RETURNING *, (xmax = 0) AS inserted;
+
+-- name: GetEventIDByMessageID :one
+-- The id of the event session_id stores under message_id, the key
+-- CreateEvent dedupes on. The session actor reads it, for an assistant
+-- message's id, before storing a `tool_call`, `tool_result` or
+-- `step_finish` of that message (sessionactor/toolevent.go): the row under
+-- the bare id is the message's `step_start`, the first event of the
+-- message, and lying at or below the Processing turn's dispatched_event_id
+-- it places the message in an earlier turn. One probe of
+-- events_session_id_message_id_idx (migrations/000019), the unique index on
+-- exactly these two columns, under a custom plan and a generic one alike.
+-- pgx.ErrNoRows means nothing is stored under the key.
+SELECT id FROM events
+WHERE session_id = sqlc.arg(session_id) AND message_id = sqlc.arg(message_id)::text;
 
 -- name: ListEventsForSession :many
 -- afterID = 0 means "from the beginning" -- matches a null fetch_history

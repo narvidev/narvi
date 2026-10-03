@@ -54,6 +54,27 @@ func (s *EventStore) Create(ctx context.Context, arg sqlcgen.CreateEventParams) 
 	return s.q.CreateEvent(ctx, arg)
 }
 
+// IDForMessageID returns the id of the event sessionID stores under
+// messageID, the key Create dedupes on, and whether one is stored at all --
+// none is found=false, never an error. The session actor calls it inside
+// its own transaction with an assistant message's bare id, to place a
+// `tool_call`, `tool_result` or `step_finish` of that message in a turn
+// (sessionactor/toolevent.go); events_session_id_message_id_idx makes it
+// one index probe however long the session's log is.
+func (s *EventStore) IDForMessageID(ctx context.Context, sessionID pgtype.UUID, messageID string) (id int64, found bool, err error) {
+	id, err = s.q.GetEventIDByMessageID(ctx, sqlcgen.GetEventIDByMessageIDParams{
+		SessionID: sessionID,
+		MessageID: messageID,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
+}
+
 // StoredTokenPart is what is already stored of one streamed text part:
 // the id, text and cut of its first stored `token` frame and the text and
 // cut of its newest one.
