@@ -171,3 +171,44 @@ func TestTruncateEventsToByteBudget(t *testing.T) {
 		}
 	})
 }
+
+// TestHistoryPageLen pins a history page's byte budget (technical plan
+// §6.2): the longest run from the first event whose encoded events, each
+// counted with the comma after it, stay within the budget, and never fewer
+// than one event.
+func TestHistoryPageLen(t *testing.T) {
+	t.Parallel()
+
+	event := func(id int64, payloadBytes int) sqlcgen.Event {
+		return sqlcgen.Event{ID: id, Type: "token", Payload: []byte(`{"text":"` + strings.Repeat("x", payloadBytes) + `"}`)}
+	}
+	size := func(e sqlcgen.Event) int {
+		b, err := json.Marshal(eventWireMap(e))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(b) + 1
+	}
+	rows := []sqlcgen.Event{event(1, 100), event(2, 100), event(3, 100), event(4, 100)}
+	one := size(rows[0])
+
+	for _, tc := range []struct {
+		name   string
+		rows   []sqlcgen.Event
+		budget int
+		want   int
+	}{
+		{name: "no rows", rows: nil, budget: 10, want: 0},
+		{name: "every row fits", rows: rows, budget: 4 * one, want: 4},
+		{name: "a budget of exactly three rows", rows: rows, budget: 3 * one, want: 3},
+		{name: "one byte short of three rows", rows: rows, budget: 3*one - 1, want: 2},
+		{name: "a first row over the budget is still sent", rows: []sqlcgen.Event{event(1, 5000), event(2, 1)}, budget: 100, want: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := historyPageLen(tc.rows, tc.budget); got != tc.want {
+				t.Fatalf("historyPageLen(%d rows, %d) = %d, want %d", len(tc.rows), tc.budget, got, tc.want)
+			}
+		})
+	}
+}

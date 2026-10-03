@@ -194,6 +194,35 @@ const (
 	fetchHistoryMaxLimit     = 500
 )
 
+// historyPageLen returns how many of rows, oldest first, one history page
+// sends: the longest run from the first whose events, each encoded as
+// eventWireMap gives it and counted with the comma that follows it in the
+// reply, sum to at most budget (platform.FetchHistoryMaxReplyBytes for a
+// fetch_history reply, technical plan §6.2). It is never fewer than one
+// for a non-empty rows: a page that sent nothing would give its reader no
+// cursor to go on from, and the budget is no smaller than the largest
+// event the control plane reads, so one event is over it only when
+// something outside the sandbox socket stored it.
+//
+// fetchHistoryMaxLimit bounds a page by count; this bounds it by bytes, as
+// maxInitialReplayBytes bounds the subscribe reply. A page without it could
+// carry fetchHistoryMaxLimit events of up to platform.MaxEventFrameBytes
+// each. httpapi's ListEvents keeps an identical copy, as it does of
+// eventWireMap. A marshal failure counts as zero bytes here, as in
+// truncateEventsToByteBudget: the reply's own marshal reports it.
+func historyPageLen(rows []sqlcgen.Event, budget int) int {
+	total := 0
+	for i, e := range rows {
+		if b, err := json.Marshal(eventWireMap(e)); err == nil {
+			total += len(b) + 1
+		}
+		if total > budget && i > 0 {
+			return i
+		}
+	}
+	return len(rows)
+}
+
 // NewClientHandler builds the HTTP handler backing GET
 // /sessions/{sessionID}/ws?type=client (§6.2) -- this file's own top
 // comment has the full handshake outcome table.
@@ -886,6 +915,12 @@ func readClientLoop(ctx context.Context, conn *websocket.Conn, sessionID pgtype.
 // connection stays open) rather than trusted, since a WS connection is
 // already scoped to exactly one session for its entire lifetime.
 //
+// A page holds at most the requested count of events and at most
+// platform.FetchHistoryMaxReplyBytes of them, always at least one
+// (historyPageLen). nextCursor is the id of the last event sent whenever
+// the page stopped at its byte budget or read its full count, so the next
+// page starts right after it; nil otherwise.
+//
 // Every reply also carries the sandbox row as it stands when the reply is
 // assembled (FetchHistoryResponse.sandbox, sandboxWireMap's shape, nil
 // when the session has none yet), read after the page: the subscribe
@@ -930,14 +965,17 @@ func handleFetchHistory(ctx context.Context, conn *websocket.Conn, sessionID pgt
 		return
 	}
 
-	wire := make([]clientws.FetchHistoryResponseEventsElem, len(rows))
-	for i, e := range rows {
+	// The page stops at its byte budget (historyPageLen); nextCursor is
+	// then the last event sent, so the next page starts right after it.
+	sent := historyPageLen(rows, platform.FetchHistoryMaxReplyBytes)
+	wire := make([]clientws.FetchHistoryResponseEventsElem, sent)
+	for i, e := range rows[:sent] {
 		wire[i] = eventWireMap(e)
 	}
 
 	var nextCursor *string
-	if len(rows) == limit {
-		s := strconv.FormatInt(rows[len(rows)-1].ID, 10)
+	if sent > 0 && (sent < len(rows) || len(rows) == limit) {
+		s := strconv.FormatInt(rows[sent-1].ID, 10)
 		nextCursor = &s
 	}
 

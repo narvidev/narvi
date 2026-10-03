@@ -50,10 +50,102 @@ const MaxPromptFrameBytes = 32 << 20
 // exactly 32768 bytes reads, and one of 32769 fails with ErrMessageTooBig
 // and closes the connection with StatusMessageTooBig.
 //
-// It is the read limit of a peer that states none. A sandbox agent built
-// before MaxPromptFrameBytes advertises no capability in its ready, so the
-// control plane holds every prompt to its gen to this many bytes
-// (technical plan §3.3, §6.1). TestDefaultFrameReadLimitBytes_IsTheLibraryDefault
-// reads one byte past it on a fresh connection, so a library upgrade that
-// moves the default fails there.
+// It is the read limit of a peer that states none, in either direction. A
+// sandbox agent built before MaxPromptFrameBytes advertises no capability
+// in its ready, so the control plane holds every prompt to its gen to this
+// many bytes (technical plan §3.3, §6.1). A control plane built before
+// MaxEventFrameBytes sends no MaxFrameBytesHeader, so an agent holds every
+// write on that connection to this many bytes; and no critical event is
+// ever larger, whatever the control plane states (wsbridge's SendCritical
+// refuses one), so every control plane reads every critical event.
+// TestDefaultFrameReadLimitBytes_IsTheLibraryDefault reads one byte past it
+// on a fresh connection, so a library upgrade that moves the default fails
+// there.
 const DefaultFrameReadLimitBytes = 32768
+
+// MaxEventFrameBytes is the largest agent event, encoded, the control plane
+// reads on a sandbox's WebSocket, and the largest entry a sandbox agent
+// keeps in its outbound buffer (technical plan §6.1). The control plane
+// sets it as the connection's read limit (Conn.SetReadLimit) and states it
+// to the agent in the handshake's MaxFrameBytesHeader response header
+// (internal/adapters/inbound/wshub); an agent built from this release holds
+// every write on that connection to what the header states, or to
+// DefaultFrameReadLimitBytes when it states nothing, cutting a `token`,
+// `tool_call` or `tool_result` frame that is over it
+// (internal/sandboxagent/wsbridge), and cuts a best-effort event over this
+// constant to it before buffering it.
+//
+// Before it the control plane read at the library's default, 32 KiB, and
+// nothing bounded what an agent wrote: an event over 32 KiB closed the
+// connection, the agent replayed it on every reconnect, and the sandbox's
+// socket looped, about 320 reconnects a second, with nothing behind the
+// frame ever arriving.
+//
+// 1 MiB, chosen from what the agent emits and what the control plane holds
+// at once.
+//
+// What the agent emits. A text part, or a tool's input (a file the agent
+// writes among them), is bounded by the model's output cap: about 256 KiB
+// of text at a 64K-token cap and about 4 bytes a token, which ordinary
+// prose and code grow to about 330 KiB once JSON-escaped (1.1 to 1.3
+// times). 1 MiB covers that three times over, and a 128K-token cap of
+// ordinary text. JSON escaping can grow text six-fold -- '<', '>', '&' and
+// the control characters without a 2-byte escape each become \u00XX --
+// and such a frame is cut, visibly (a marker line in the text and a `cut`
+// property; a cut plan is never offered for approval), not lost. A tool's
+// output is bounded by the agent runtime's own truncation, if any. This
+// repository records none for the pinned runtime (opencode-ai 1.17.15,
+// .github/workflows/ci.yml; defaultOpenCodeRuntimeVersion,
+// internal/platform/config.go): no test or note here measures how much of
+// a tool's output that binary passes on, and its adapter passes the
+// output it is given on whole (translateToolResult,
+// internal/adapters/outbound/opencode/translate.go). So nothing on this
+// side bounds a tool's output but this constant: a `tool_result` over a
+// connection's bound is cut to it, one over this constant is cut at
+// enqueue, and neither changes anything stored today: a `tool_call` or
+// `tool_result` from that runtime carries its message's id, which that
+// message's `step_start` already holds, so it adds no row (technical plan
+// §6.1, "Stored token frames").
+//
+// What the control plane holds. One read per sandbox connection, of up to
+// this many bytes; up to hubConnBufferSize (64) distinct broadcast
+// payloads behind a slow browser connection, shared by every connection
+// of that session (wshub.Hub.Broadcast queues one shared slice per
+// payload), so at most 64 MiB; and one history page, bounded by
+// FetchHistoryMaxReplyBytes. The agent's buffer holds at most 1000
+// best-effort entries (wsbridge's outboundBufferCap), each at most this
+// many bytes once cut at enqueue, so 1000 MiB in the worst case and a few
+// MiB in practice -- a pinned-runtime text part is two frames, one of
+// them empty -- where nothing bounded an entry before; a critical entry
+// is at most DefaultFrameReadLimitBytes.
+//
+// Not sized as MaxPromptFrameBytes was, to cover the six-fold worst case:
+// that would be 4 MiB, a 4 GiB worst case in the agent's buffer and 256
+// MiB behind each slow browser connection. A cut is a visible, non-fatal
+// outcome where an oversize prompt was a refused turn.
+const MaxEventFrameBytes = 1 << 20
+
+// FetchHistoryMaxReplyBytes bounds one page of a session's event log, as
+// a client WS fetch_history reply and as GET /api/sessions/{id}/events
+// return it (technical plan §6.2, §6.3): a page keeps the longest run of
+// the events it read, oldest first, whose summed encoded sizes stay within
+// it, always at least one event, and sets nextCursor after the last event
+// it sent. The subscribe reply has its own, smaller budget
+// (maxInitialReplayBytes, internal/adapters/inbound/wshub).
+//
+// 2 MiB. It is no smaller than MaxEventFrameBytes, so one maximal event
+// always fits with room for ordinary ones, and an ordinary 500-event page,
+// at about 2 KiB an event or less, is at most about 1 MiB and never cut.
+// Without it a page could reach 500 x MaxEventFrameBytes: 500 MiB, where
+// the 32 KiB read limit before it kept the worst page to 16 MiB.
+const FetchHistoryMaxReplyBytes = 2 << 20
+
+// MaxFrameBytesHeader is the response header of the sandbox WebSocket
+// handshake in which the control plane states the largest message it
+// reads on that connection: MaxEventFrameBytes, in decimal (technical plan
+// §6.1). A sandbox agent bounds what it writes on the connection by it,
+// and by DefaultFrameReadLimitBytes when it is absent or not a positive
+// integer -- a control plane built before it, during a rolling deploy or
+// after a rollback, or a proxy that drops the header. It bounds what the
+// agent writes, never what it reads.
+const MaxFrameBytesHeader = "X-Max-Frame-Bytes"

@@ -31,6 +31,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -2422,6 +2423,66 @@ func TestListEvents_HappyPath(t *testing.T) {
 	}
 	if page2.NextCursor != nil {
 		t.Errorf("page2.NextCursor = %v, want nil (exhausted)", *page2.NextCursor)
+	}
+}
+
+// TestListEvents_ReplyHeldToItsByteBudget: GET /api/sessions/{id}/events
+// stops a page at platform.FetchHistoryMaxReplyBytes, whatever limit it
+// was asked for, with nextCursor on the last event sent, and the next page
+// goes on from there -- fetch_history's own budget (technical plan §6.3).
+// Five events of about 600 KiB each: the first page holds three, the
+// second the last two.
+func TestListEvents_ReplyHeldToItsByteBudget(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	session := rig.createSession(ctx, t)
+	_, token := rig.createAuthenticatedUser(ctx, t)
+
+	var ids []int64
+	for i := 0; i < 5; i++ {
+		created, err := rig.events.Create(ctx, sqlcgen.CreateEventParams{
+			SessionID: session.ID,
+			Type:      "tool_result",
+			MessageID: fmt.Sprintf("big-%d", i),
+			Payload:   []byte(fmt.Sprintf(`{"type":"tool_result","output":{"output":"%s"}}`, strings.Repeat("o", 600*1024))),
+		})
+		if err != nil {
+			t.Fatalf("create event %d: %v", i, err)
+		}
+		ids = append(ids, created.ID)
+	}
+
+	var page1 restdtos.EventsResponse
+	if status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/events?limit=500", nil, &page1, token); status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+	if len(page1.Events) != 3 {
+		t.Fatalf("page 1 holds %d events, want 3: a fourth would pass the budget", len(page1.Events))
+	}
+	summed := 0
+	for _, e := range page1.Events {
+		b, err := json.Marshal(e)
+		if err != nil {
+			t.Fatal(err)
+		}
+		summed += len(b) + 1
+	}
+	if summed > platform.FetchHistoryMaxReplyBytes {
+		t.Fatalf("page 1's events are %d bytes, over the %d budget", summed, platform.FetchHistoryMaxReplyBytes)
+	}
+	if page1.NextCursor == nil || *page1.NextCursor != strconv.FormatInt(ids[2], 10) {
+		t.Fatalf("page 1 nextCursor = %v, want the last event sent, %d", page1.NextCursor, ids[2])
+	}
+
+	var page2 restdtos.EventsResponse
+	if status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/events?limit=500&cursor="+*page1.NextCursor, nil, &page2, token); status != http.StatusOK {
+		t.Fatalf("status = %d, want %d", status, http.StatusOK)
+	}
+	if len(page2.Events) != 2 || page2.NextCursor != nil {
+		t.Fatalf("page 2 holds %d events, nextCursor %v; want the last 2 and no cursor", len(page2.Events), page2.NextCursor)
+	}
+	if first := page2.Events[0]["id"]; first != float64(ids[3]) {
+		t.Fatalf("page 2 starts at event %v, want %d, the one after page 1's last", first, ids[3])
 	}
 }
 

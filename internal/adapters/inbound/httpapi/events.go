@@ -40,6 +40,12 @@ const (
 // an open page's sandbox status current after a sandbox_status broadcast
 // (§6.2); a REST caller reads the status from GET
 // /api/sessions/{id}/status (SessionActivity.sandboxStatus).
+//
+// A page holds at most limit events and at most
+// platform.FetchHistoryMaxReplyBytes of them, always at least one
+// (eventsPageLen), exactly as a fetch_history page does: nextCursor is the
+// id of the last event sent whenever the page stopped at its byte budget
+// or read its full count.
 func ListEvents(sessions *postgres.SessionStore, events *postgres.EventStore) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
@@ -89,14 +95,15 @@ func ListEvents(sessions *postgres.SessionStore, events *postgres.EventStore) ht
 			return
 		}
 
-		wire := make([]restdtos.EventsResponseEventsElem, len(rows))
-		for i, e := range rows {
+		sent := eventsPageLen(rows, platform.FetchHistoryMaxReplyBytes)
+		wire := make([]restdtos.EventsResponseEventsElem, sent)
+		for i, e := range rows[:sent] {
 			wire[i] = eventWireMap(e)
 		}
 
 		var nextCursor *string
-		if len(rows) == limit {
-			s := strconv.FormatInt(rows[len(rows)-1].ID, 10)
+		if sent > 0 && (sent < len(rows) || len(rows) == limit) {
+			s := strconv.FormatInt(rows[sent-1].ID, 10)
 			nextCursor = &s
 		}
 
@@ -127,4 +134,27 @@ func eventWireMap(e sqlcgen.Event) map[string]interface{} {
 		"payload":   json.RawMessage(e.Payload),
 		"createdAt": e.CreatedAt,
 	}
+}
+
+// eventsPageLen mirrors internal/adapters/inbound/wshub's own
+// historyPageLen (client.go), duplicated for the reason eventWireMap is: it
+// returns how many of rows, oldest first, one page sends -- the longest run
+// from the first whose events, each encoded as eventWireMap gives it and
+// counted with the comma that follows it, sum to at most budget, and never
+// fewer than one for a non-empty rows, so a page always gives its reader a
+// cursor to go on from. eventsMaxLimit bounds a page by count; this bounds
+// it by bytes, since an event can now be up to platform.MaxEventFrameBytes.
+// A marshal failure counts as zero bytes: writeJSON's own marshal reports
+// it.
+func eventsPageLen(rows []sqlcgen.Event, budget int) int {
+	total := 0
+	for i, e := range rows {
+		if b, err := json.Marshal(eventWireMap(e)); err == nil {
+			total += len(b) + 1
+		}
+		if total > budget && i > 0 {
+			return i
+		}
+	}
+	return len(rows)
 }
