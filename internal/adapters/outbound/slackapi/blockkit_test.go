@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 )
 
 // TestEncodeDecodePlanActionValue_RoundTrip proves the button-value
@@ -143,6 +144,115 @@ func TestPostPlanApprovalMessage_APIError(t *testing.T) {
 	_, _, err := client.PostPlanApprovalMessage(context.Background(), slackapi.PlanApprovalPayload{ChannelID: "C123", ThreadTS: "1.1"})
 	if err == nil {
 		t.Fatal("PostPlanApprovalMessage() error = nil, want non-nil")
+	}
+}
+
+// TestPlanApprovalMessage_CutPlan_OffersNoApprove proves a plan whose text
+// was cut on its way from the sandbox (payload.Cut, technical plan §6.1) is
+// posted without the Approve & build button -- its approval would be
+// refused (httpapi.ErrPlanCut) -- keeping Request changes and Reject, and
+// that the context line gives the cut's reason in place of "Awaiting
+// approval". A whole plan's message is unchanged: three buttons, Approve
+// first, and the awaiting line.
+func TestPlanApprovalMessage_CutPlan_OffersNoApprove(t *testing.T) {
+	t.Parallel()
+
+	cut := framecut.Cut{Kept: 4096, Total: 40960}
+	tests := []struct {
+		name        string
+		cut         *framecut.Cut
+		wantActions []string
+		wantContext string
+	}{
+		{
+			name:        "a cut plan",
+			cut:         &cut,
+			wantActions: []string{slackapi.ActionRequestChangesPlan, slackapi.ActionRejectPlan},
+			wantContext: framecut.Reason(&cut),
+		},
+		{
+			name:        "a cut the server could not read",
+			cut:         &framecut.Malformed,
+			wantActions: []string{slackapi.ActionRequestChangesPlan, slackapi.ActionRejectPlan},
+			wantContext: framecut.Reason(&framecut.Malformed),
+		},
+		{
+			name:        "a whole plan",
+			wantActions: []string{slackapi.ActionApprovePlan, slackapi.ActionRequestChangesPlan, slackapi.ActionRejectPlan},
+			wantContext: "Awaiting approval — first verdict wins, across Slack/Linear/web.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var gotBody map[string]any
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&gotBody)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "channel": "C999", "ts": "1700000000.000100"})
+			}))
+			defer server.Close()
+
+			client := slackapi.New(server.Client(), server.URL, "xoxb-test-token")
+			if _, _, err := client.PostPlanApprovalMessage(context.Background(), slackapi.PlanApprovalPayload{
+				PlanID: "plan-1", SessionID: "session-1", ChannelID: "C123", ThreadTS: "1234.5678", Version: 1,
+				Text: "1. Add the migration\n[text cut at 20 of 40960 bytes on its way from the sandbox]",
+				Cut:  tt.cut,
+			}); err != nil {
+				t.Fatalf("PostPlanApprovalMessage() error = %v", err)
+			}
+
+			blocks, _ := gotBody["blocks"].([]any)
+			var gotActions []string
+			var gotContext []string
+			for _, b := range blocks {
+				block, _ := b.(map[string]any)
+				switch block["type"] {
+				case "actions":
+					elements, _ := block["elements"].([]any)
+					for _, el := range elements {
+						elem, _ := el.(map[string]any)
+						actionID, _ := elem["action_id"].(string)
+						gotActions = append(gotActions, actionID)
+					}
+				case "context":
+					elements, _ := block["elements"].([]any)
+					for _, el := range elements {
+						elem, _ := el.(map[string]any)
+						text, _ := elem["text"].(string)
+						gotContext = append(gotContext, text)
+					}
+				}
+			}
+			if strings.Join(gotActions, ",") != strings.Join(tt.wantActions, ",") {
+				t.Errorf("actions = %v, want %v", gotActions, tt.wantActions)
+			}
+			if len(gotContext) != 1 || gotContext[0] != tt.wantContext {
+				t.Errorf("context = %q, want [%q]", gotContext, tt.wantContext)
+			}
+		})
+	}
+}
+
+// TestPlanApprovalPayload_WholePlanEncodesNoCut pins that a whole plan's
+// outbox payload is byte-identical to one enqueued before cuts existed --
+// no "cut" key -- and that a cut plan's carries it.
+func TestPlanApprovalPayload_WholePlanEncodesNoCut(t *testing.T) {
+	t.Parallel()
+
+	whole, err := json.Marshal(slackapi.PlanApprovalPayload{PlanID: "p", SessionID: "s", ChannelID: "C", ThreadTS: "1.1", Version: 1, Text: "t"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"plan_id":"p","session_id":"s","channel_id":"C","thread_ts":"1.1","version":1,"text":"t"}`; string(whole) != want {
+		t.Errorf("whole plan payload = %s, want %s", whole, want)
+	}
+	cut, err := json.Marshal(slackapi.PlanApprovalPayload{PlanID: "p", Cut: &framecut.Cut{Kept: 1, Total: 2}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(cut), `"cut":{"kept":1,"total":2}`) {
+		t.Errorf("cut plan payload = %s, want its cut", cut)
 	}
 }
 

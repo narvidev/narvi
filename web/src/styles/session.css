@@ -1262,6 +1262,14 @@
   font-size: var(--text-xs);
   color: var(--faint);
 }
+/* new: where Approve would be on a plan whose text was cut on its way from
+   the sandbox (technical plan §6.1) -- the server refuses that approval,
+   so the reason takes the button's place. No mockup precedent. */
+.cut-reason {
+  font-size: var(--text-sm);
+  color: var(--warn);
+  max-width: 48ch;
+}
 
 /* ---- automations (§12.2 item 4, Step 85) ---- */
 

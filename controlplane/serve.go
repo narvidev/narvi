@@ -1997,6 +1997,8 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	decisionInboxDeps := decisioninbox.Deps{
 		Plans:                 planStore,
 		Sessions:              sessionStore,
+		Turns:                 turnStore,
+		Events:                eventStore,
 		Participants:          participantStore,
 		Automations:           automationStore,
 		Outbox:                outboxStore,

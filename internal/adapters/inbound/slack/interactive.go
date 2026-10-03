@@ -639,6 +639,23 @@ func (deps InteractiveDeps) decideAndUpdateMessage(ctx context.Context, logger *
 
 	outcome, err := httpapi.DecidePlan(decideCtx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Events, deps.PlanDocuments, deps.Outbox, deps.LinearAgentSessions, deps.AuditLog, deps.Registry, sessionID, planID, verdict, decidedBy, deps.EpistemicCheckDefault)
 
+	if err != nil && errors.Is(err, httpapi.ErrPlanCut) {
+		// The plan's text was cut on its way from the sandbox, so it cannot
+		// be approved (httpapi.ErrPlanCut) -- a click on an Approve button
+		// a binary built before cuts posted, since this one posts none for
+		// a cut plan (slackapi.PostPlanApprovalMessage). The reason goes to
+		// the clicking user alone, and the approval message is left as it
+		// is, exactly as the not-yet-linked branch above leaves it:
+		// updateMessage's chat.update carries no blocks, which would strip
+		// the plan and its Request changes and Reject buttons from a plan
+		// still awaiting approval, and Request changes is the way on.
+		logger.Info("slack: interactivity: approval refused, plan text was cut", "plan_id", planIDStr, "session_id", sessionIDStr)
+		if pErr := deps.SlackClient.PostEphemeral(decideCtx, channel, slackUserID, messageTS, err.Error()); pErr != nil {
+			logger.Warn("slack: interactivity: post cut-plan ephemeral notice failed", "error", pErr)
+		}
+		return
+	}
+
 	var text string
 	switch {
 	case err != nil && errors.Is(err, httpapi.ErrPlanOpenTurnInFlight):

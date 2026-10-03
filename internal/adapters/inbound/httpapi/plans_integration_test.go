@@ -278,3 +278,67 @@ func TestGetSession_NilBuildModelAndEffort_WhenNeverSet(t *testing.T) {
 		t.Errorf("BuildEffort = %v, want nil", got.BuildEffort)
 	}
 }
+
+// TestListPlans_CutPlan_ReportsTheCut proves GET .../plans states a cut from
+// FinalText's report, never from the text (technical plan §6.1): an
+// awaiting plan whose final text is a cut frame reports cut {kept, total},
+// its content is the cut text with its marker, and it has no structured
+// steps even though the cut left a complete block at its start; a whole
+// plan in the same session reports null.
+func TestListPlans_CutPlan_ReportsTheCut(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	owner, token := rig.createAuthenticatedUser(ctx, t)
+	session := createSessionForUser(ctx, t, rig, owner.ID, nil)
+
+	whole := seedDispatchedPlan(ctx, t, rig, session.ID, 1, func() {
+		seedCutTokenFrame(ctx, t, rig, session.ID, "prt_v1", "prt_v1", "The first plan.\n\n"+cutPlanBlock, nil)
+	})
+	if _, err := rig.pool.Exec(ctx, `UPDATE plans SET status = 'superseded' WHERE id = $1`, whole.ID); err != nil {
+		t.Fatalf("supersede v1: %v", err)
+	}
+	const total = 40960
+	kept := len(cutPlanBlock) + 4
+	cutText := cutPlanBlock + "More" + cutMarker(kept, total)
+	cutPlan := seedDispatchedPlan(ctx, t, rig, session.ID, 2, func() {
+		seedCutTokenFrame(ctx, t, rig, session.ID, "prt_v2", "prt_v2", "", nil)
+		seedCutTokenFrame(ctx, t, rig, session.ID, "prt_v2#cut", "prt_v2", cutText, map[string]int{"kept": kept, "total": total})
+	})
+
+	var resp restdtos.ListPlansResponse
+	if status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/plans", nil, &resp, token); status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	byID := map[string]restdtos.Plan{}
+	for _, p := range resp.Plans {
+		byID[p.Id] = p
+	}
+	got := byID[cutPlan.ID.String()]
+	if got.Cut == nil || got.Cut.Kept != kept || got.Cut.Total != total {
+		t.Errorf("cut plan's cut = %+v, want {%d %d}", got.Cut, kept, total)
+	}
+	if got.Content != cutText {
+		t.Errorf("cut plan's content = %q, want the cut text with its marker", got.Content)
+	}
+	if got.Structured != nil {
+		t.Errorf("cut plan's structured = %+v, want null: a cut plan has no structured steps", got.Structured)
+	}
+	if w := byID[whole.ID.String()]; w.Cut != nil || w.Structured == nil {
+		t.Errorf("whole plan: cut = %+v, structured = %+v, want no cut and its steps", w.Cut, w.Structured)
+	}
+
+	// On the wire, a whole plan's cut is an explicit null.
+	var raw struct {
+		Plans []map[string]json.RawMessage `json:"plans"`
+	}
+	if status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/plans", nil, &raw, token); status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	for _, p := range raw.Plans {
+		if c, ok := p["cut"]; !ok {
+			t.Errorf("plan %s carries no cut key, want it present", p["id"])
+		} else if string(p["id"]) == `"`+whole.ID.String()+`"` && string(c) != "null" {
+			t.Errorf("whole plan's cut = %s, want null", c)
+		}
+	}
+}

@@ -1195,8 +1195,28 @@
                   "additionalProperties": false,
                   "description": "The run's final assistant text: deterministic, copied from what the run itself streamed, never written by a model.",
                   "properties": {
+                    "cut": {
+                      "additionalProperties": false,
+                      "description": "Set when the run's last text part is a frame the sandbox-agent cut on its way to the control plane (technical plan §6.1), as GET /api/sessions/{sessionID}/plans reports it for a plan: kept, the bytes of the part's text kept, and total, its whole length, both in UTF-8 bytes of the unescaped text; both -1 when the frame carried a cut this server could not read. text then ends with the cut's marker line, unless truncated cut it first; this property, never the text, says the run's text was cut. Null when the text is whole, or when there is none.",
+                      "properties": {
+                        "kept": {
+                          "type": "integer"
+                        },
+                        "total": {
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "kept",
+                        "total"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
                     "text": {
-                      "description": "The run's last text part, verbatim -- among the parts the run streamed with any text, the one that opened last, read at its newest frame: the one rule this system uses to read a turn's final text (the same one GET /api/sessions/{sessionID}/plans reads a plan with). Cut to at most 4,000 characters (Unicode code points). Null when the run left no text in the session's recent event history.",
+                      "description": "The run's last text part, verbatim -- among the parts the run streamed with any text, the one that opened last, read at its newest frame that yields to no other (a frame cut on its way from the sandbox yields to the whole text it was taken from, see cut): the one rule this system uses to read a turn's final text (the same one GET /api/sessions/{sessionID}/plans reads a plan with). Cut to at most 4,000 characters (Unicode code points). Null when the run left no text in the session's recent event history.",
                       "type": [
                         "string",
                         "null"
@@ -1209,7 +1229,8 @@
                   },
                   "required": [
                     "text",
-                    "truncated"
+                    "truncated",
+                    "cut"
                   ],
                   "type": "object"
                 },
@@ -1666,6 +1687,26 @@
               "format": "date-time",
               "type": "string"
             },
+            "cut": {
+              "additionalProperties": false,
+              "description": "The cut this plan's text carries, when it is a frame the sandbox-agent cut on its way to the control plane (technical plan §6.1): kept, the bytes of the plan's text kept, and total, its whole length, both in UTF-8 bytes of the unescaped text; both -1 when the frame carried a cut this server could not read. Read from the frames content is read from (internal/domain/plan.FinalText's cut report), never from content's text, which ends with the cut's marker line, '[text cut at \u003ckept\u003e of \u003ctotal\u003e bytes on its way from the sandbox]', and which a client may shorten for display. A plan with a cut cannot be approved: POST /api/sessions/{sessionID}/plans/{planId}/approve answers 409 with the reason, and a client shows that reason where Approve would be, keeping Request changes and Reject. Null when the text is whole, and for a plan whose content comes from its approval snapshot (plan_documents), which records none: such a plan was approved whole.",
+              "properties": {
+                "kept": {
+                  "type": "integer"
+                },
+                "total": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "kept",
+                "total"
+              ],
+              "type": [
+                "object",
+                "null"
+              ]
+            },
             "decidedAt": {
               "description": "Null while status is 'awaiting_approval'; set the moment a decision (approve/reject, from any entry point) is recorded. goJSONSchema forces the literal *time.Time type (rather than go-jsonschema's own default generated named-pointer-type wrapper, e.g. PlanModelId's own PlanPlanModelId *string above): a NAMED type whose underlying type is *time.Time (e.g. 'type PlanDecidedAt *time.Time') does NOT inherit time.Time's own UnmarshalJSON/MarshalJSON method set in Go (methods attach to the exact named type they're declared on, never promoted across a distinct named-pointer-type indirection), so encoding/json falls through to its generic struct decoder and fails on a date-time STRING value with 'cannot unmarshal string into Go struct field ... of type time.Time' -- this is the first nullable date-time field this schema has ever needed (no prior nullable-date-time property existed to surface this), caught by this batch's own new Plan round-trip test.",
               "format": "date-time",
@@ -1755,7 +1796,8 @@
             "decidedAt",
             "decidedBy",
             "content",
-            "structured"
+            "structured",
+            "cut"
           ],
           "type": "object"
         },
@@ -2043,7 +2085,7 @@
       "openWorldHint": true,
       "readOnlyHint": false
     },
-    "description": "Approve a plan awaiting approval, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/plans/{planId}/approve, with every check that route makes: that user's own role (an admin or maintainer may approve any session's plan, a member only a plan of a session they started or joined, a viewer none); no turn of the session queued or running (a request for changes being written would otherwise be overtaken by the older plan, so the call is refused and nothing changes); and the plan still awaiting approval and belonging to that session (the first decision wins, whichever channel made it: a later one is refused). Approving queues the implementation turn at once, in the session's own conversation: it runs code in the session's repositories and spends on models, and what it changes is delivered like any turn's. A plan revision requested afterwards never withdraws that approval. Returns the plan's id, its status (approved) and the implementation turn's id; follow it with narvi_wait_for_session.",
+    "description": "Approve a plan awaiting approval, as the user who approved this client -- the same as POST /api/sessions/{sessionID}/plans/{planId}/approve, with every check that route makes: that user's own role (an admin or maintainer may approve any session's plan, a member only a plan of a session they started or joined, a viewer none); no turn of the session queued or running (a request for changes being written would otherwise be overtaken by the older plan, so the call is refused and nothing changes); the plan still awaiting approval and belonging to that session (the first decision wins, whichever channel made it: a later one is refused); and the plan's text whole -- a plan whose text was cut on its way from the sandbox (its cut is set in narvi_list_plans) cannot be approved, and the call is refused with the reason and nothing changes: ask for a shorter plan with narvi_request_plan_revision, or reject it. Approving queues the implementation turn at once, in the session's own conversation: it runs code in the session's repositories and spends on models, and what it changes is delivered like any turn's. A plan revision requested afterwards never withdraws that approval. Returns the plan's id, its status (approved) and the implementation turn's id; follow it with narvi_wait_for_session.",
     "inputSchema": {
       "additionalProperties": false,
       "description": "The narvi_approve_plan MCP tool's own input (technical plan §43.21) -- the tool bridge's twin of POST /api/sessions/{sessionID}/plans/{planId}/approve, which takes no body: both path parameters are plain required fields. Self-contained: it references no other $def. The answer is PlanActionResponse, with the id of the implementation turn the approval queued.",

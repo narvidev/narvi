@@ -50,6 +50,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 	"github.com/narvidev/narvi/internal/domain/turn"
@@ -72,7 +73,23 @@ import (
 // fix closes). Now that a revise:-prefixed reply is a real, deterministic
 // "request changes" path (webhook.go's own handlePrompted), this
 // instruction is what makes it actually discoverable.
-func planApprovalLinearText(version int32, content string) string {
+//
+// cut is the plan's cut report (plandomain.Final.Cut, §6.1): for a plan
+// whose text the sandbox-agent cut on its way here, the notice says so,
+// with framecut.Reason, and offers no approve keyword -- an approval would
+// be refused (httpapi.ErrPlanCut) -- pointing to RevisePrefix, the way to a
+// shorter plan, and the reject keywords instead. A reply with an approve
+// keyword is still answered, with the same reason.
+func planApprovalLinearText(version int32, content string, cut *framecut.Cut) string {
+	if cut != nil {
+		return fmt.Sprintf(
+			"Plan v%d is ready for review:\n\n%s\n\n%s Start your reply with %q to request changes, or reply %s to reject it.",
+			version, content,
+			framecut.Reason(cut),
+			plandomain.RevisePrefix,
+			strings.Join(plandomain.RejectKeywords, "/"),
+		)
+	}
 	return fmt.Sprintf(
 		"Plan v%d is ready for review:\n\n%s\n\nReply %s to approve and build it, %s to reject it, or start your reply with %q to request changes.",
 		version, content,
@@ -177,6 +194,7 @@ func (a *Actor) enqueueOutboxNotification(ctx context.Context, tx pgx.Tx, sessio
 		}
 		if plan != nil {
 			kind = ports.NotificationKindSlackPlanApproval
+			final := a.planContentText(ctx, processing)
 			payload = slackapi.PlanApprovalPayload{
 				PlanID:    plan.ID.String(),
 				SessionID: a.sessionID.String(),
@@ -185,7 +203,10 @@ func (a *Actor) enqueueOutboxNotification(ctx context.Context, tx pgx.Tx, sessio
 				Version:   int(plan.Version),
 				// Stripped for the human reading it -- the machine block is
 				// noise in a Slack message (plandomain.StripStructureBlock).
-				Text: plandomain.StripStructureBlock(a.planContentText(ctx, processing)),
+				Text: plandomain.StripStructureBlock(final.Text),
+				// A cut plan's message offers no Approve
+				// (slackapi.PostPlanApprovalMessage).
+				Cut: final.Cut,
 			}
 		} else {
 			kind = ports.NotificationKindSlack
@@ -269,10 +290,11 @@ func (a *Actor) enqueueOutboxNotification(ctx context.Context, tx pgx.Tx, sessio
 		}
 		kind = ports.NotificationKindLinear
 		if plan != nil {
+			final := a.planContentText(ctx, processing)
 			payload = linearapi.Payload{
 				AgentSessionID: row.AgentSessionID,
 				OrganizationID: row.OrganizationID,
-				Text:           planApprovalLinearText(plan.Version, plandomain.StripStructureBlock(a.planContentText(ctx, processing))),
+				Text:           planApprovalLinearText(plan.Version, plandomain.StripStructureBlock(final.Text), final.Cut),
 				Success:        true,
 			}
 		} else {

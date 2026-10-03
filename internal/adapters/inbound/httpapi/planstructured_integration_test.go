@@ -245,7 +245,7 @@ func TestApprovePlan_SnapshotsStructuredStepsIntoPlanDocuments(t *testing.T) {
 // closes a real fixture gap this Step's own review found: every OTHER test
 // in this file has exactly one session, one plan, one turn -- so
 // planRow.TurnID (decideplan.go's own snapshotApprovedPlanContent) is
-// trivially the only candidate turnContentBounds could ever resolve to, and
+// trivially the only candidate sessionactor.TurnContentBounds could ever resolve to, and
 // a mutation that snapshots some OTHER turn instead (e.g. always the
 // session's first-dispatched one) would leave every one of those tests
 // green. This seeds TWO plan versions, each with its own producing turn and

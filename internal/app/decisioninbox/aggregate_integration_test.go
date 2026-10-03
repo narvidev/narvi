@@ -15,6 +15,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -37,6 +39,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/authz"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	decisioninboxdomain "github.com/narvidev/narvi/internal/domain/decisioninbox"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
@@ -4679,4 +4682,150 @@ func TestBuild_NotContested_WhenEngineWouldNotHaveApprovedAnyway(t *testing.T) {
 	if total != 0 || contested != 0 {
 		t.Errorf("outcome counts = (total=%d, contested=%d), want (0, 0) -- the engine would have refused this PR on its own (stale verdict), so HasChangesRequested is not a genuine contradiction to record", total, contested)
 	}
+}
+
+// TestBuildPlanItems_CutPlan_CarriesTheCut proves each awaiting plan row
+// carries its plan's cut report (Item.PlanCut, technical plan §6.1), read
+// from the plan's own turn window as the approval reads it: a plan whose
+// final text is a frame the sandbox-agent cut reports that cut; a plan
+// stored whole and then cut (a replay through a connection that read less)
+// reads whole and reports none; a whole plan reports none; and a Deps with
+// no Turns or Events store reports none for any of them, still listing
+// every plan. The frames are injected straight into `events`, since nothing
+// produces a cut yet.
+func TestBuildPlanItems_CutPlan_CarriesTheCut(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+
+	users := narvipg.NewUserStore(pool)
+	sessions := narvipg.NewSessionStore(pool)
+	turns := narvipg.NewTurnStore(pool)
+	plans := narvipg.NewPlanStore(pool)
+	events := narvipg.NewEventStore(pool)
+
+	actor, err := users.Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: "cut-plan-actor@example.com", DisplayName: "Actor", Role: sqlcgen.UserRoleMember})
+	if err != nil {
+		t.Fatalf("create actor: %v", err)
+	}
+
+	const whole = "1. Add the migration\n2. Wire the store\n"
+	wholeCut := framecut.Cut{Kept: 10, Total: len(whole)}
+	cut := framecut.Cut{Kept: 20, Total: 40960}
+	type frame struct {
+		key, text string
+		cut       *framecut.Cut
+	}
+	seedPlan := func(title string, frames []frame) pgtype.UUID {
+		t.Helper()
+		session, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{Title: strPtr(title), SpawnSource: sqlcgen.SessionSpawnSourceWeb, CreatedBy: actor.ID})
+		if err != nil {
+			t.Fatalf("create session: %v", err)
+		}
+		watermark, err := events.MaxEventIDForSession(ctx, session.ID)
+		if err != nil {
+			t.Fatalf("watermark: %v", err)
+		}
+		turn, err := turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+		if err != nil {
+			t.Fatalf("create turn: %v", err)
+		}
+		if _, err := turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: turn.ID, Status: sqlcgen.TurnStatusCompleted, DispatchedEventID: &watermark}); err != nil {
+			t.Fatalf("place the turn's window: %v", err)
+		}
+		for _, f := range frames {
+			payload := map[string]any{"type": "token", "messageId": "prt_plan", "sessionId": session.ID.String(), "gen": 1, "text": f.text}
+			if f.cut != nil {
+				payload["cut"] = f.cut
+			}
+			raw, err := json.Marshal(payload)
+			if err != nil {
+				t.Fatalf("marshal token frame: %v", err)
+			}
+			if _, err := events.Create(ctx, sqlcgen.CreateEventParams{SessionID: session.ID, Type: "token", MessageID: f.key, Payload: raw}); err != nil {
+				t.Fatalf("store token frame: %v", err)
+			}
+		}
+		plan, err := plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: turn.ID, Version: 1, Status: sqlcgen.PlanStatusAwaitingApproval})
+		if err != nil {
+			t.Fatalf("create plan: %v", err)
+		}
+		return plan.ID
+	}
+
+	cutPlan := seedPlan("a cut plan", []frame{
+		{key: "prt_plan", text: ""},
+		{key: "prt_plan#cut", text: "1. Add the migration\n[text cut at 20 of 40960 bytes on its way from the sandbox]", cut: &cut},
+	})
+	wholeThenCutPlan := seedPlan("a plan stored whole, then cut", []frame{
+		{key: "prt_plan", text: ""},
+		{key: "prt_plan#whole", text: whole},
+		{key: "prt_plan#cut", text: "1. Add the\n[text cut at 10 of 39 bytes on its way from the sandbox]", cut: &wholeCut},
+	})
+	wholePlan := seedPlan("a whole plan", []frame{
+		{key: "prt_plan", text: ""},
+		{key: "prt_plan#whole", text: whole},
+	})
+	if len(whole) != 39 {
+		t.Fatalf("fixture: the whole text is %d bytes, the cut of it says 39", len(whole))
+	}
+
+	baseDeps := decisioninbox.Deps{
+		GitHubOutbound: testBotOutbound,
+		Plans:          plans, Sessions: sessions, Participants: narvipg.NewParticipantStore(pool),
+		Automations: narvipg.NewAutomationStore(pool), Outbox: narvipg.NewOutboxStore(pool, false),
+		ReviewFindings: narvipg.NewReviewFindingStore(pool), SentinelFixes: narvipg.NewSentinelFixStore(pool),
+		Artifacts: narvipg.NewArtifactStore(pool), Identities: narvipg.NewIdentityStore(pool),
+		SCMCache:           decisioninbox.NewSCMCache(&fakeDecisionInboxSourceControl{}, platform.DefaultTimeouts()),
+		TokenEncryptionKey: []byte("01234567890123456789012345678901"),
+		Timeouts:           platform.DefaultTimeouts(),
+		ReviewVerdict:      appreviewverdict.Deps{ReviewVerdicts: narvipg.NewReviewVerdictStore(pool), RepoSettings: narvipg.NewRepoSettingsStore(pool), ReviewFindings: narvipg.NewReviewFindingStore(pool), AutoApprovalOutcomes: narvipg.NewAutoApprovalOutcomeStore(pool), Timeouts: platform.DefaultTimeouts()},
+	}
+	withStores := baseDeps
+	withStores.Turns, withStores.Events = turns, events
+
+	tests := []struct {
+		name string
+		deps decisioninbox.Deps
+		want map[string]*framecut.Cut
+	}{
+		{
+			name: "with the turn and event stores",
+			deps: withStores,
+			want: map[string]*framecut.Cut{cutPlan.String(): &cut, wholeThenCutPlan.String(): nil, wholePlan.String(): nil},
+		},
+		{
+			name: "without them: every plan listed, no cut reported",
+			deps: baseDeps,
+			want: map[string]*framecut.Cut{cutPlan.String(): nil, wholeThenCutPlan.String(): nil, wholePlan.String(): nil},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result, err := decisioninbox.Build(ctx, tt.deps, actor.ID, authz.RoleMember, time.Now())
+			if err != nil {
+				t.Fatalf("Build() error = %v", err)
+			}
+			got := map[string]*framecut.Cut{}
+			for _, it := range result.Items {
+				if it.Kind == decisioninboxdomain.KindAwaitingApproval && it.PlanID != "" {
+					got[it.PlanID] = it.PlanCut
+				}
+			}
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("plan cuts = %v, want %v", describeCuts(got), describeCuts(tt.want))
+			}
+		})
+	}
+}
+
+func describeCuts(cuts map[string]*framecut.Cut) map[string]string {
+	out := map[string]string{}
+	for id, c := range cuts {
+		if c == nil {
+			out[id] = "none"
+			continue
+		}
+		out[id] = strconv.Itoa(c.Kept) + "/" + strconv.Itoa(c.Total)
+	}
+	return out
 }

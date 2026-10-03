@@ -38,8 +38,14 @@ package sessionactor
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"sort"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 )
 
@@ -74,10 +80,16 @@ const planContentEventFetchLimit = 2000
 // key (sessionactor/tokenframe.go): plandomain.ExtractContent groups the
 // frames by it to tell which part opened last, since the newest row
 // is not always the last part's (see that function's doc comment).
+//
+// Cut is the frame's `cut` property, raw (§6.1): a frame the sandbox-agent
+// cut on its way to the control plane records what it kept there, and
+// ToContentEvents decodes it fail-closed (framecut.DecodeCut), so a reader
+// learns a cut only from it, never from the text.
 type tokenEventPayload struct {
-	Type      string `json:"type"`
-	MessageID string `json:"messageId"`
-	Text      string `json:"text"`
+	Type      string          `json:"type"`
+	MessageID string          `json:"messageId"`
+	Text      string          `json:"text"`
+	Cut       json.RawMessage `json:"cut"`
 }
 
 // planContentText best-effort recovers processing's own final streamed
@@ -102,14 +114,21 @@ type tokenEventPayload struct {
 // scan (see plandomain.ExtractContent's own doc comment for the case where
 // that assumption does NOT hold, and why that caller supplies a real upper
 // bound instead). Never fails the caller: any read error, or finding
-// nothing at all, returns planContentFallbackText rather than propagating
-// an error -- a best-effort notification enrichment must never block or
-// fail the turn-completion transaction it runs inside.
-func (a *Actor) planContentText(ctx context.Context, processing sqlcgen.Turn) string {
+// nothing at all, returns planContentFallbackText, with no cut, rather than
+// propagating an error -- a best-effort notification enrichment must never
+// block or fail the turn-completion transaction it runs inside.
+//
+// The Final's Cut reports a plan whose text is a frame the sandbox-agent
+// cut on its way here (§6.1): its notices offer no Approve
+// (outboxenqueue.go), since the approval would be refused (httpapi.
+// ErrPlanCut). A cut is settled by the time this runs: the notice goes out
+// as the turn completes, and no `token` frame adds a row once its turn has
+// ended (tokenframe.go).
+func (a *Actor) planContentText(ctx context.Context, processing sqlcgen.Turn) plandomain.Final {
 	events, err := a.stores.event.ListRecentForSession(ctx, a.sessionID, planContentEventFetchLimit)
 	if err != nil {
 		a.logger.Warn("sessionactor: list events for plan content extraction failed", "error", err)
-		return planContentFallbackText
+		return plandomain.Final{Text: planContentFallbackText}
 	}
 
 	return plandomain.ExtractContent(ToContentEvents(events), processing.DispatchedEventID, nil)
@@ -126,7 +145,9 @@ func (a *Actor) planContentText(ctx context.Context, processing sqlcgen.Turn) st
 // decode degrades to an empty Text (silently skipped by ExtractContent,
 // exactly like this function's own prior inline `continue` on a decode
 // error), never propagated as an error -- matching this file's own "never
-// fails the caller" discipline.
+// fails the caller" discipline. A "token" event's `cut` is decoded
+// fail-closed (framecut.DecodeCut): one present but unreadable is
+// framecut.Malformed, read as a cut, never as a whole frame.
 func ToContentEvents(events []sqlcgen.Event) []plandomain.ContentEvent {
 	out := make([]plandomain.ContentEvent, len(events))
 	for i, e := range events {
@@ -136,9 +157,88 @@ func ToContentEvents(events []sqlcgen.Event) []plandomain.ContentEvent {
 			if err := json.Unmarshal(e.Payload, &tok); err == nil {
 				ce.MessageID = tok.MessageID
 				ce.Text = tok.Text
+				ce.Cut = framecut.DecodeCut(tok.Cut)
 			}
 		}
 		out[i] = ce
 	}
 	return out
+}
+
+// TurnContentBounds returns plandomain.FinalText's own (lower, upper)
+// bounds for turnID, given every turn dispatched in the session so far (any
+// order, any kind -- an approval-dispatched IMPLEMENTATION turn counts
+// exactly like a plan-producing one): lower is turnID's own
+// DispatchedEventID; upper is the DispatchedEventID of whichever
+// DISPATCHED turn ran next in the session, if any (nil when turnID's own
+// turn is the most recently dispatched one so far). ok is false when
+// turnID names no turn in sessionTurns with a DispatchedEventID set at all
+// -- should be unreachable for any real plan's producing turn (a plan row
+// is only ever created once its producing turn has already been
+// dispatched), but is surfaced as a plain bool rather than a panic or a
+// silent unbounded scan, so every caller degrades the SAME honest way
+// (plandomain.ContentFallbackText) instead of assuming it can't happen.
+//
+// The one implementation of these bounds: the plan views, the approved
+// snapshot and the approval's cut check (internal/adapters/inbound/
+// httpapi), a session's result summary, and the decision inbox's cut report
+// (internal/app/decisioninbox) all window a turn's text by it, an algorithm
+// this codebase has already been bitten by an off-by-one in once (see
+// plandomain.FinalText's own doc comment) -- never a second, independently
+// re-derived copy that can silently drift from this one.
+func TurnContentBounds(sessionTurns []sqlcgen.Turn, turnID pgtype.UUID) (lower, upper *int64, ok bool) {
+	dispatched := make([]sqlcgen.Turn, 0, len(sessionTurns))
+	for _, t := range sessionTurns {
+		if t.DispatchedEventID != nil {
+			dispatched = append(dispatched, t)
+		}
+	}
+	sort.Slice(dispatched, func(i, j int) bool {
+		return *dispatched[i].DispatchedEventID < *dispatched[j].DispatchedEventID
+	})
+
+	for i, t := range dispatched {
+		if t.ID != turnID {
+			continue
+		}
+		lower = dispatched[i].DispatchedEventID
+		if i+1 < len(dispatched) {
+			upper = dispatched[i+1].DispatchedEventID
+		}
+		return lower, upper, true
+	}
+	return nil, nil, false
+}
+
+// ReadPlanFinal reads the final text of turnID, a plan's producing turn in
+// sessionID, as plandomain.FinalText reads it, with the cut it reports: the
+// turn's window of the log (TurnContentBounds, over every turn turns lists
+// for the session) and that window's `token` frames
+// (EventStore.ListTokenFramesInWindow, up to planContentEventFetchLimit,
+// newest first). found is false when the turn has no window or the window
+// no text; the Final is then empty, and the caller says so its own way
+// (plandomain.ContentFallbackText for a snapshot).
+//
+// The approval's cut check and the snapshot it writes read the plan
+// through it, in one read (httpapi.DecidePlanOnTx, which passes its own
+// transaction's TurnStore), and so does the decision inbox's cut report, so
+// the inbox never offers Approve for a plan the approval would refuse.
+// Reading the window rather than the session's 2000-event tail
+// (planContentText's read, a turn-completion-time read of the newest turn)
+// finds a plan's text however much the session has logged since.
+func ReadPlanFinal(ctx context.Context, turns *postgres.TurnStore, events *postgres.EventStore, sessionID, turnID pgtype.UUID) (final plandomain.Final, found bool, err error) {
+	sessionTurns, err := turns.ListForSession(ctx, sessionID)
+	if err != nil {
+		return plandomain.Final{}, false, fmt.Errorf("sessionactor: list turns for plan final text: %w", err)
+	}
+	lower, upper, ok := TurnContentBounds(sessionTurns, turnID)
+	if !ok {
+		return plandomain.Final{}, false, nil
+	}
+	frames, err := events.ListTokenFramesInWindow(ctx, sessionID, *lower, upper, planContentEventFetchLimit)
+	if err != nil {
+		return plandomain.Final{}, false, fmt.Errorf("sessionactor: list token frames for plan final text: %w", err)
+	}
+	final, found = plandomain.FinalText(ToContentEvents(frames), lower, upper)
+	return final, found, nil
 }

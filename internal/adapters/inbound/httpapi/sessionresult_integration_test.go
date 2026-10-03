@@ -944,6 +944,43 @@ func TestResult_SummaryBoundedAndNoTranscript(t *testing.T) {
 		}
 	})
 
+	// A last part whose text is a frame the sandbox-agent cut (technical
+	// plan §6.1) reports its cut beside the text, which ends with the
+	// marker; a cut that yields to the stored whole text it was taken from
+	// reports none, and the text is the whole one. On the wire the key is
+	// always present, null for a whole text.
+	t.Run("a cut last part reports its cut; a cut of a stored whole text reads whole", func(t *testing.T) {
+		const whole = "Done: the fix is in place, with its tests."
+		cutText := "Done: the fix" + cutMarker(13, len(whole))
+		cut := map[string]int{"kept": 13, "total": len(whole)}
+
+		sess := createSessionForUser(ctx, t, rig, user.ID, nil)
+		run := dispatchedRun(ctx, t, rig, sess.ID)
+		seedCutTokenFrame(ctx, t, rig, sess.ID, "prt_c", "prt_c", "", nil)
+		seedCutTokenFrame(ctx, t, rig, sess.ID, "prt_c#cut", "prt_c", cutText, cut)
+		transitionTurn(ctx, t, rig.turns, run.ID, turn.StateDispatched, turn.TriggerStartProcessing)
+		transitionTurn(ctx, t, rig.turns, run.ID, turn.StateProcessing, turn.TriggerComplete)
+		summary, _ := summaryOf(t, sess.ID)
+		if summary.Text == nil || *summary.Text != cutText || summary.Cut == nil || summary.Cut.Kept != 13 || summary.Cut.Total != len(whole) {
+			t.Fatalf("summary = %v cut %+v, want the cut text and its cut", summary.Text, summary.Cut)
+		}
+
+		sess = createSessionForUser(ctx, t, rig, user.ID, nil)
+		run = dispatchedRun(ctx, t, rig, sess.ID)
+		seedCutTokenFrame(ctx, t, rig, sess.ID, "prt_w", "prt_w", whole, nil)
+		seedCutTokenFrame(ctx, t, rig, sess.ID, "prt_w#cut", "prt_w", cutText, cut)
+		transitionTurn(ctx, t, rig.turns, run.ID, turn.StateDispatched, turn.TriggerStartProcessing)
+		transitionTurn(ctx, t, rig.turns, run.ID, turn.StateProcessing, turn.TriggerComplete)
+		summary, raw := summaryOf(t, sess.ID)
+		if summary.Text == nil || *summary.Text != whole || summary.Cut != nil {
+			t.Fatalf("summary = %v cut %+v, want the whole text and no cut", summary.Text, summary.Cut)
+		}
+		wireSummary, _ := raw["lastRun"].(map[string]any)["summary"].(map[string]any)
+		if c, ok := wireSummary["cut"]; !ok || c != nil {
+			t.Fatalf("summary.cut on the wire = %#v (present %v), want an explicit null", c, ok)
+		}
+	})
+
 	t.Run("no run ended: lastRun null", func(t *testing.T) {
 		sess := createSessionForUser(ctx, t, rig, user.ID, nil)
 		createTurn(ctx, t, rig.turns, sess.ID, false)

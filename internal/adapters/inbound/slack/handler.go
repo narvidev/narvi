@@ -986,6 +986,11 @@ func (deps Deps) handlePlanVerdict(ctx context.Context, logger *slog.Logger, cha
 
 	var text string
 	switch {
+	case err != nil && errors.Is(err, httpapi.ErrPlanCut):
+		// The plan's text was cut on its way from the sandbox: the reply is
+		// the reason, never the generic retry text -- retrying changes
+		// nothing; a request for changes does.
+		text = err.Error()
 	case err != nil && errors.Is(err, httpapi.ErrPlanOpenTurnInFlight):
 		text = "A revision is already in progress for this plan — try again once it completes."
 	case err != nil:

@@ -122,6 +122,7 @@ import { planQueryKeys, sessionListQueryKeys, sessionQueryKeys } from '../api/qu
 import { meQueryOptions } from '../auth/session'
 import { canActOnPlan, latestPlan, modelLabel, planStatusLabel, planStatusTone, stripStructureBlock } from './planFormat'
 import { truncateForDisplay } from './textSafety'
+import { cutReason } from './tokenCut'
 
 const MAX_CONTENT_CHARS = 8000
 
@@ -247,7 +248,16 @@ function ReviseBox({ sessionId, onDone }: { sessionId: string; onDone: () => voi
   )
 }
 
-function ApprovalBar({ sessionId, plan, canAct }: { sessionId: string; plan: Plan; canAct: boolean }) {
+/**
+ * ApprovalBar offers a plan's verdicts. A plan whose text was cut on its way
+ * from the sandbox (plan.cut, technical plan §6.1) is offered no Approve --
+ * the server refuses one (409) -- and shows the reason where Approve would
+ * be; Request changes, asking for a shorter plan, and Reject stay. An
+ * approve the server refuses with 409 shows the server's own reason (the
+ * plan was cut, already decided, or a turn is in flight) and re-reads the
+ * plans, so what this bar offers catches up with the server.
+ */
+export function ApprovalBar({ sessionId, plan, canAct }: { sessionId: string; plan: Plan; canAct: boolean }) {
   const queryClient = useQueryClient()
   const [revising, setRevising] = useState(false)
 
@@ -258,6 +268,9 @@ function ApprovalBar({ sessionId, plan, canAct }: { sessionId: string; plan: Pla
       void queryClient.invalidateQueries({ queryKey: sessionQueryKeys.detail(sessionId) })
       void queryClient.invalidateQueries({ queryKey: sessionListQueryKeys.list('mine') })
       void queryClient.invalidateQueries({ queryKey: sessionListQueryKeys.list('all') })
+    },
+    onError: (error) => {
+      if (error instanceof ApiError && error.status === 409) void queryClient.invalidateQueries({ queryKey: planQueryKeys.list(sessionId) })
     },
   })
   const rejectMutation = useMutation({
@@ -277,9 +290,15 @@ function ApprovalBar({ sessionId, plan, canAct }: { sessionId: string; plan: Pla
               can under-shoot a real "joined" member (see canActOnPlan's own doc comment), so a disabled-but-visible
               button, with the honest reason below, is more truthful than hiding it outright -- and either way, the
               server independently re-checks every call (this file's own top doc comment). */}
-          <button type="button" className="btn primary" disabled={!canAct || pending} onClick={() => approveMutation.mutate()} title={!canAct ? "You're not authorized to approve this plan (create it, join the session, or ask an admin/maintainer)" : undefined}>
-            {approveMutation.isPending ? 'Approving…' : 'Approve & build'}
-          </button>
+          {plan.cut ? (
+            <span className="cut-reason" role="note">
+              <T text={cutReason(plan.cut)} />
+            </span>
+          ) : (
+            <button type="button" className="btn primary" disabled={!canAct || pending} onClick={() => approveMutation.mutate()} title={!canAct ? "You're not authorized to approve this plan (create it, join the session, or ask an admin/maintainer)" : undefined}>
+              {approveMutation.isPending ? 'Approving…' : 'Approve & build'}
+            </button>
+          )}
           <button type="button" className="btn" disabled={!canAct || pending} onClick={() => setRevising(true)}>
             Request changes
           </button>
@@ -291,11 +310,15 @@ function ApprovalBar({ sessionId, plan, canAct }: { sessionId: string; plan: Pla
       )}
       {(approveMutation.isError || rejectMutation.isError) && (
         <p className="sidebar-notice" role="alert" style={{ width: '100%' }}>
-          {(approveMutation.error instanceof ApiError && approveMutation.error.status === 403) || (rejectMutation.error instanceof ApiError && rejectMutation.error.status === 403)
-            ? "The server refused this action: you're not authorized to decide this plan."
-            : (approveMutation.error instanceof ApiError && approveMutation.error.status === 409) || (rejectMutation.error instanceof ApiError && rejectMutation.error.status === 409)
-              ? 'This plan was already decided (or superseded) by someone else.'
-              : 'That action failed. Try again.'}
+          {(approveMutation.error instanceof ApiError && approveMutation.error.status === 403) || (rejectMutation.error instanceof ApiError && rejectMutation.error.status === 403) ? (
+            "The server refused this action: you're not authorized to decide this plan."
+          ) : approveMutation.error instanceof ApiError && approveMutation.error.status === 409 ? (
+            <T text={approveMutation.error.message} />
+          ) : rejectMutation.error instanceof ApiError && rejectMutation.error.status === 409 ? (
+            'This plan was already decided (or superseded) by someone else.'
+          ) : (
+            'That action failed. Try again.'
+          )}
         </p>
       )}
     </div>

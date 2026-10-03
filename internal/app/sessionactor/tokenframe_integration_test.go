@@ -376,7 +376,7 @@ func TestCompleteProcessingTurn_PlanApproval_MultiFrameToken_CarriesFinalText(t 
 				}
 				return payload.Text
 			},
-			want: planApprovalLinearText(1, tokenTestFullText),
+			want: planApprovalLinearText(1, tokenTestFullText, nil),
 		},
 	}
 
@@ -550,8 +550,8 @@ func TestHandleSandboxEvent_TokenFrames_LateFramesOfAnEndedTurnAddNoRow(t *testi
 				if err != nil {
 					t.Fatalf("list recent events: %v", err)
 				}
-				if got := plandomain.ExtractContent(ToContentEvents(recent), nextTurn.DispatchedEventID, nil); got != nextFinal {
-					t.Errorf("the next turn's window reads %q, want %q", got, nextFinal)
+				if got := plandomain.ExtractContent(ToContentEvents(recent), nextTurn.DispatchedEventID, nil); got != (plandomain.Final{Text: nextFinal}) {
+					t.Errorf("the next turn's window reads %+v, want %q, no cut", got, nextFinal)
 				}
 			})
 		}

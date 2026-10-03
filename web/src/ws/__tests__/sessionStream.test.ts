@@ -240,7 +240,7 @@ describe('SessionStream', () => {
 
     await waitFor(() => stream!.getSnapshot().events.length === 2)
     const tokens = buildTimelineModel(stream.getSnapshot().events).turns[0]!.steps[0]!.tokens
-    expect(tokens).toEqual([{ messageId: 'prt_plan', text: finalText }])
+    expect(tokens).toMatchObject([{ messageId: 'prt_plan', text: finalText, cut: null }])
   })
 
   it('a malformed element inside an otherwise-valid events array is dropped, not applied and not fatal -- its valid siblings still land', async () => {

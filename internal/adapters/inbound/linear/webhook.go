@@ -1107,6 +1107,13 @@ func (deps Deps) handlePlanVerdict(ctx context.Context, logger *slog.Logger, ses
 
 	outcome, err := httpapi.DecidePlan(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Events, deps.PlanDocuments, deps.Outbox, deps.AgentSessions, deps.AuditLog, deps.Registry, sessionID, planID, httpapi.PlanVerdict(verdict), decidedBy, deps.EpistemicCheckDefault)
 	if err != nil {
+		if errors.Is(err, httpapi.ErrPlanCut) {
+			// The plan's text was cut on its way from the sandbox, so it
+			// cannot be approved: the reason is posted, pointing to a
+			// request for changes ("revise:") or a rejection.
+			deps.postPlanOutcomeActivity(ctx, logger, organizationID, agentSessionID, err.Error(), identityNotice)
+			return true
+		}
 		if errors.Is(err, httpapi.ErrPlanOpenTurnInFlight) {
 			deps.postPlanOutcomeActivity(ctx, logger, organizationID, agentSessionID, "A revision is already in progress for this plan -- try again once it completes.", identityNotice)
 			return true

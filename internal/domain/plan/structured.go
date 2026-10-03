@@ -80,6 +80,8 @@ package plan
 import (
 	"encoding/json"
 	"strings"
+
+	"github.com/narvidev/narvi/internal/domain/framecut"
 )
 
 // StructureFenceOpen is the exact opening delimiter ExtractStructured looks
@@ -201,6 +203,12 @@ type wireStructured struct {
 // collapses to the SAME nil result, deliberately (this file's own top doc
 // comment):
 //
+//   - cut is non-nil: the content is a frame the sandbox-agent cut on its
+//     way to the control plane (Final.Cut, technical plan §6.1), so it is
+//     not the plan the model wrote, whole. Its fence is not looked for: the
+//     cut usually takes the block at the end, and a block the cut left
+//     whole near the start would still describe a plan whose rest nobody
+//     can read;
 //   - no open fence at all;
 //   - a SECOND open fence exists anywhere after the first (ambiguous --
 //     which block is authoritative is not this function's call to make,
@@ -226,7 +234,10 @@ type wireStructured struct {
 // nothing usable is exactly as valid an outcome as a plan that never had a
 // plan-mode turn at all, and every caller already has a well-defined
 // fallback (render Content in prose) for it.
-func ExtractStructured(content string) *Structured {
+func ExtractStructured(content string, cut *framecut.Cut) *Structured {
+	if cut != nil {
+		return nil
+	}
 	openIdx := strings.Index(content, StructureFenceOpen)
 	if openIdx == -1 {
 		return nil

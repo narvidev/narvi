@@ -34,6 +34,7 @@ import type {
 
 import type { EventEnvelope } from '../ws/types'
 import { isPlainObject } from '../ws/util'
+import { decodeCut } from './tokenCut'
 
 function isString(v: unknown): v is string {
   return typeof v === 'string'
@@ -102,12 +103,24 @@ export function asSubTaskFinish(env: EventEnvelope): SubTaskFinish | null {
   return env.payload as unknown as SubTaskFinish
 }
 
+/**
+ * asToken narrows a `token` frame, carrying its `cut` (technical plan §6.1)
+ * as tokenCut.ts's decodeCut reads it: absent or null is a whole frame (no
+ * `cut` on the result), a well-formed one is kept, and anything else present
+ * is MALFORMED_CUT -- never dropped, so a frame whose cut cannot be read is
+ * still read as cut, never as whole.
+ */
 export function asToken(env: EventEnvelope): Token | null {
   if (env.type !== 'token' || !isPlainObject(env.payload)) return null
   const p = env.payload
   if (!isString(p.messageId) || !isString(p.text)) return null
   if (!isOptionalNullableString(p.subTaskId)) return null
-  return env.payload as unknown as Token
+  if (p.cut === undefined) return env.payload as unknown as Token
+  const token = { ...(env.payload as unknown as Token) }
+  const cut = decodeCut(p.cut)
+  if (cut === null) delete token.cut
+  else token.cut = cut
+  return token
 }
 
 export function asExecutionComplete(env: EventEnvelope): ExecutionComplete | null {

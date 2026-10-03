@@ -237,7 +237,7 @@ func TestExtractStructured(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ExtractStructured(tt.content)
+			got := ExtractStructured(tt.content, nil)
 			if !reflect.DeepEqual(got, tt.want) {
 				t.Errorf("ExtractStructured() = %+v, want %+v", got, tt.want)
 			}
@@ -344,7 +344,7 @@ func TestStripStructureBlock_NeverStripsWhatExtractStructuredWouldRead(t *testin
 	content := "Prose first.\n\n```plan-steps\n" +
 		`{"steps":[{"title":"T","description":"D","fileRefs":["a.go"]}],"scopeEstimate":"1 file"}` +
 		"\n```\n"
-	if ExtractStructured(content) == nil {
+	if ExtractStructured(content, nil) == nil {
 		t.Fatal("fixture bug: this content must extract, or the invariant below is vacuous")
 	}
 	if got := StripStructureBlock(content); strings.Contains(got, "plan-steps") || strings.Contains(got, "scopeEstimate") {
@@ -370,10 +370,10 @@ func TestExtractStructured_StepCountBound(t *testing.T) {
 		return b.String()
 	}
 
-	if got := ExtractStructured(build(MaxSteps)); got == nil || len(got.Steps) != MaxSteps {
+	if got := ExtractStructured(build(MaxSteps), nil); got == nil || len(got.Steps) != MaxSteps {
 		t.Errorf("exactly MaxSteps (%d) steps must extract, got %v", MaxSteps, got)
 	}
-	if got := ExtractStructured(build(MaxSteps + 1)); got != nil {
+	if got := ExtractStructured(build(MaxSteps+1), nil); got != nil {
 		t.Errorf("MaxSteps+1 (%d) steps extracted %d steps, want nil -- past the bound a plan renders as prose, where the render cap does hold", MaxSteps+1, len(got.Steps))
 	}
 }
@@ -398,10 +398,10 @@ func TestExtractStructured_FileRefsCountBound(t *testing.T) {
 		return "```plan-steps\n" + `{"steps":[` + b.String() + `],"scopeEstimate":"s"}` + "\n```"
 	}
 
-	if got := ExtractStructured(build(MaxFileRefsPerStep)); got == nil || len(got.Steps[0].FileRefs) != MaxFileRefsPerStep {
+	if got := ExtractStructured(build(MaxFileRefsPerStep), nil); got == nil || len(got.Steps[0].FileRefs) != MaxFileRefsPerStep {
 		t.Errorf("exactly MaxFileRefsPerStep (%d) fileRefs must extract, got %v", MaxFileRefsPerStep, got)
 	}
-	if got := ExtractStructured(build(MaxFileRefsPerStep + 1)); got != nil {
+	if got := ExtractStructured(build(MaxFileRefsPerStep+1), nil); got != nil {
 		t.Errorf("MaxFileRefsPerStep+1 (%d) fileRefs extracted %d, want nil -- past the bound the step folds to prose", MaxFileRefsPerStep+1, len(got.Steps[0].FileRefs))
 	}
 }
@@ -448,10 +448,10 @@ func TestExtractStructured_FieldCharBound(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := ExtractStructured(tt.build(MaxFieldChars)); got == nil {
+			if got := ExtractStructured(tt.build(MaxFieldChars), nil); got == nil {
 				t.Errorf("a %s of exactly MaxFieldChars (%d) must extract, got nil", tt.name, MaxFieldChars)
 			}
-			if got := ExtractStructured(tt.build(MaxFieldChars + 1)); got != nil {
+			if got := ExtractStructured(tt.build(MaxFieldChars+1), nil); got != nil {
 				t.Errorf("a %s of MaxFieldChars+1 (%d) extracted, want nil -- past the bound the document folds to prose", tt.name, MaxFieldChars+1)
 			}
 		})

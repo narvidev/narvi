@@ -34,6 +34,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/narvidev/narvi/internal/domain/framecut"
 )
 
 // Block Kit interactive action_ids -- the fixed vocabulary this Step's own
@@ -209,13 +211,22 @@ func truncateForSection(text string) string {
 // plan's own rendered content -- steps/scope, best-effort extracted from the
 // producing turn's own event stream; see outboxenqueue.go's own doc comment
 // for the extraction this Step adds).
+//
+// Cut is the plan's cut report (plan.Final.Cut, technical plan §6.1): set
+// when the plan's text is a frame the sandbox-agent cut on its way to the
+// control plane. Such a plan cannot be approved (httpapi.ErrPlanCut), so
+// its message offers no Approve (PostPlanApprovalMessage). Omitted when
+// nil, so a payload enqueued by a binary that knows no cut decodes the
+// same, and one this binary enqueues for a whole plan is byte-identical to
+// before.
 type PlanApprovalPayload struct {
-	PlanID    string `json:"plan_id"`
-	SessionID string `json:"session_id"`
-	ChannelID string `json:"channel_id"`
-	ThreadTS  string `json:"thread_ts"`
-	Version   int    `json:"version"`
-	Text      string `json:"text"`
+	PlanID    string        `json:"plan_id"`
+	SessionID string        `json:"session_id"`
+	ChannelID string        `json:"channel_id"`
+	ThreadTS  string        `json:"thread_ts"`
+	Version   int           `json:"version"`
+	Text      string        `json:"text"`
+	Cut       *framecut.Cut `json:"cut,omitempty"`
 }
 
 // PlanDecidedPayload is the JSON shape this package expects to find in an
@@ -300,21 +311,38 @@ type postMessageWithBlocksResponse struct {
 // truncation bound itself is sized the way it is, so this reordering still
 // keeps the FINAL, converted text within Slack's own real section-text
 // length limit.
+//
+// A cut plan (payload.Cut set, technical plan §6.1) is posted without the
+// Approve & build button, whose click could only be refused
+// (httpapi.ErrPlanCut): Request changes, asking for a shorter plan, is the
+// way on, and Reject stays. Its context line gives the cut's reason
+// (framecut.Reason) in place of "Awaiting approval". A cut is settled by
+// the time this message is posted -- it goes out as the plan's turn
+// completes, and no frame adds a row once its turn has ended -- so a
+// button offered here would never become approvable.
 func (c *Client) PostPlanApprovalMessage(ctx context.Context, payload PlanApprovalPayload) (channel, ts string, err error) {
 	value := EncodePlanActionValue(payload.PlanID, payload.SessionID)
+
+	contextText := "Awaiting approval — first verdict wins, across Slack/Linear/web."
+	var buttons []buttonElement
+	if payload.Cut != nil {
+		contextText = framecut.Reason(payload.Cut)
+	} else {
+		buttons = append(buttons, buttonElement{Type: "button", Text: textObject{Type: "plain_text", Text: "Approve & build"}, ActionID: ActionApprovePlan, Value: value, Style: "primary"})
+	}
+	buttons = append(buttons,
+		buttonElement{Type: "button", Text: textObject{Type: "plain_text", Text: "Request changes"}, ActionID: ActionRequestChangesPlan, Value: value},
+		buttonElement{Type: "button", Text: textObject{Type: "plain_text", Text: "Reject"}, ActionID: ActionRejectPlan, Value: value, Style: "danger"},
+	)
 
 	blocks := []any{
 		sectionBlock{Type: "section", Text: &textObject{Type: "mrkdwn", Text: fmt.Sprintf("*Plan v%d ready for review*", payload.Version)}},
 		sectionBlock{Type: "section", Text: &textObject{Type: "mrkdwn", Text: MarkdownToMrkdwn(truncateForSection(payload.Text))}},
 		contextBlock{Type: "context", Elements: []textObject{
-			{Type: "mrkdwn", Text: "Awaiting approval — first verdict wins, across Slack/Linear/web."},
+			{Type: "mrkdwn", Text: contextText},
 		}},
 		dividerBlock{Type: "divider"},
-		actionsBlock{Type: "actions", Elements: []buttonElement{
-			{Type: "button", Text: textObject{Type: "plain_text", Text: "Approve & build"}, ActionID: ActionApprovePlan, Value: value, Style: "primary"},
-			{Type: "button", Text: textObject{Type: "plain_text", Text: "Request changes"}, ActionID: ActionRequestChangesPlan, Value: value},
-			{Type: "button", Text: textObject{Type: "plain_text", Text: "Reject"}, ActionID: ActionRejectPlan, Value: value, Style: "danger"},
-		}},
+		actionsBlock{Type: "actions", Elements: buttons},
 	}
 
 	reqBody, err := json.Marshal(postMessageWithBlocksRequest{

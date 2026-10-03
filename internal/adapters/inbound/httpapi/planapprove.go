@@ -176,6 +176,15 @@ func ApprovePlan(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *pos
 
 		outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, events, planDocuments, outbox, linearAgentSessions, auditLog, sessionRow, planID, PlanVerdictApprove, actorUserID, epistemicCheckDefault)
 		if err != nil {
+			var cutErr *PlanCutError
+			if errors.As(err, &cutErr) {
+				// The plan's text was cut on its way from the sandbox
+				// (ErrPlanCut, decideplan.go): nothing changed, and the
+				// body is the reason, which the web plan view shows and
+				// MCP's narvi_approve_plan returns as its tool error.
+				writeError(w, http.StatusConflict, cutErr.Error())
+				return
+			}
 			if errors.Is(err, ErrPlanOpenTurnInFlight) {
 				// Mirrors CreateTurn's own hasOpenTurn 409 gate (turn.go)
 				// exactly, including its message -- see this file's own

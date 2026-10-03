@@ -34,6 +34,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -459,5 +460,93 @@ drain:
 	}
 	if !gotDenialReply {
 		t.Error("no chat.postMessage call carried handlePlanVerdict's own plan-decision denial reply")
+	}
+}
+
+// TestSlackTextVerdict_ApproveCutPlan_RepliesWithTheReason proves a typed
+// "approve" on a plan whose text was cut on its way from the sandbox
+// (technical plan §6.1) is refused (httpapi.ErrPlanCut) and answered in the
+// thread with the reason -- never the generic retry text -- and changes
+// nothing: the plan stays awaiting approval, and no implementation turn is
+// queued.
+func TestSlackTextVerdict_ApproveCutPlan_RepliesWithTheReason(t *testing.T) {
+	const channel = "C0VERDICTCUT"
+	ctx := context.Background()
+	pool := newTestPool(t)
+	auditLog := narvipg.NewAuditLogStore(pool)
+
+	recordingServer, recordedBodies := newFakeSlackRecordingWithUsersInfo(t, "unused", "unused@example.com")
+	linkSlackIdentityForTest(ctx, t, pool, "U0TESTUSER", sqlcgen.UserRoleMaintainer)
+	linkSlackIdentityForTest(ctx, t, pool, "U0OTHERUSER", sqlcgen.UserRoleMaintainer)
+	rig := newSlackPlanGateTestRig(t, pool, recordingServer, auditLog)
+
+	rec := httptest.NewRecorder()
+	rig.handler(rec, signedSlackRequest(t, appMentionEnvelope("Ev0"+channel+"001", channel, "1700000071.000100", "", "start this task")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first mention: status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	mapping, err := rig.threads.Get(ctx, channel, "1700000071.000100")
+	if err != nil {
+		t.Fatalf("Get thread mapping: %v", err)
+	}
+	sessionID := mapping.SessionID
+	firstTurns, err := rig.turns.ListForSession(ctx, sessionID)
+	if err != nil || len(firstTurns) != 1 {
+		t.Fatalf("ListForSession after first mention: turns=%v err=%v, want exactly 1", firstTurns, err)
+	}
+	if _, err := rig.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+		ID:          firstTurns[0].ID,
+		Status:      sqlcgen.TurnStatusCompleted,
+		CompletedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+	}); err != nil {
+		t.Fatalf("UpdateStatus: %v", err)
+	}
+	cut := seedCutPlanText(ctx, t, pool, sessionID, firstTurns[0].ID)
+	plan := seedAwaitingApprovalPlanForSlack(ctx, t, rig.plans, sessionID, firstTurns[0].ID)
+
+	rec = httptest.NewRecorder()
+	rig.handler(rec, signedSlackRequest(t, messageEnvelope("Ev0"+channel+"002", channel, "1700000071.000200", "1700000071.000100", "approve")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reply: status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+
+	var dbStatus sqlcgen.PlanStatus
+	if err := pool.QueryRow(ctx, `SELECT status FROM plans WHERE id = $1`, plan.ID).Scan(&dbStatus); err != nil {
+		t.Fatalf("query plan row: %v", err)
+	}
+	if dbStatus != sqlcgen.PlanStatusAwaitingApproval {
+		t.Errorf("db status = %q, want %q (a refused approval changes nothing)", dbStatus, sqlcgen.PlanStatusAwaitingApproval)
+	}
+	if turns, err := rig.turns.ListForSession(ctx, sessionID); err != nil || len(turns) != 1 {
+		t.Errorf("turns after the reply = %d (err %v), want 1: no implementation turn", len(turns), err)
+	}
+
+	reason := framecut.Reason(&cut)
+	var replies []string
+drain:
+	for {
+		select {
+		case got := <-recordedBodies:
+			if got.path != "/chat.postMessage" {
+				continue
+			}
+			if text, ok := got.body["text"].(string); ok && got.body["thread_ts"] == "1700000071.000100" {
+				replies = append(replies, text)
+			}
+		default:
+			break drain
+		}
+	}
+	var gotReason bool
+	for _, text := range replies {
+		if text == reason {
+			gotReason = true
+		}
+		if strings.Contains(text, "try again") {
+			t.Errorf("a thread reply gave the generic retry text %q, want the reason", text)
+		}
+	}
+	if !gotReason {
+		t.Errorf("thread replies %q, want one that is the reason %q", replies, reason)
 	}
 }

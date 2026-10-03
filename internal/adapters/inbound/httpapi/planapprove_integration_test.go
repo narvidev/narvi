@@ -20,6 +20,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -746,4 +747,124 @@ type planActionResponseForTest struct {
 	PlanID string  `json:"planId"`
 	Status string  `json:"status"`
 	TurnID *string `json:"turnId"`
+}
+
+// --- ApprovePlan: a plan whose text was cut on its way from the sandbox ---
+
+// TestApprovePlan_CutPlan_409WithTheReason proves the cut gate
+// (ErrPlanCut, decideplan.go): a plan whose final text is a frame the
+// sandbox-agent cut (technical plan §6.1) -- here keeping a complete
+// plan-steps block at its start -- is refused with 409 and the reason, and
+// nothing changes: the plan stays awaiting approval, with no snapshot, no
+// implementation turn and no audit row. Reject stays open on it.
+func TestApprovePlan_CutPlan_409WithTheReason(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	owner, token := rig.createAuthenticatedUser(ctx, t)
+	session := createSessionForUser(ctx, t, rig, owner.ID, nil)
+
+	const total = 40960
+	kept := len(cutPlanBlock) + 12
+	cutText := cutPlanBlock + "Then wire t" + "h" + cutMarker(kept, total)
+	plan := seedDispatchedPlan(ctx, t, rig, session.ID, 1, func() {
+		seedCutTokenFrame(ctx, t, rig, session.ID, "prt_plan", "prt_plan", "", nil)
+		seedCutTokenFrame(ctx, t, rig, session.ID, "prt_plan#cut", "prt_plan", cutText, map[string]int{"kept": kept, "total": total})
+	})
+
+	var body struct {
+		Error string `json:"error"`
+	}
+	status := rig.doJSON(t, http.MethodPost,
+		"/api/sessions/"+session.ID.String()+"/plans/"+plan.ID.String()+"/approve", []byte{}, &body, token)
+	if status != http.StatusConflict {
+		t.Fatalf("status = %d, want %d", status, http.StatusConflict)
+	}
+	if want := framecut.Reason(&framecut.Cut{Kept: kept, Total: total}); body.Error != want {
+		t.Errorf("error = %q, want the reason %q", body.Error, want)
+	}
+	if got := planStatusOf(ctx, t, rig, plan.ID); got != sqlcgen.PlanStatusAwaitingApproval {
+		t.Errorf("plan status = %q, want %q (a refused approval changes nothing)", got, sqlcgen.PlanStatusAwaitingApproval)
+	}
+	if _, err := rig.planDocuments.GetByPlanID(ctx, plan.ID); err == nil {
+		t.Error("a plan_documents snapshot was written for a refused approval")
+	}
+	turns, err := rig.turns.ListForSession(ctx, session.ID)
+	if err != nil {
+		t.Fatalf("list turns: %v", err)
+	}
+	if len(turns) != 1 {
+		t.Errorf("len(turns) = %d, want 1: no implementation turn for a refused approval", len(turns))
+	}
+	var audits int
+	if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM audit_log WHERE resource_id = $1`, plan.ID.String()).Scan(&audits); err != nil {
+		t.Fatalf("count audit rows: %v", err)
+	}
+	if audits != 0 {
+		t.Errorf("audit rows for the plan = %d, want 0", audits)
+	}
+
+	var rejected planActionResponseForTest
+	if status := rig.doJSON(t, http.MethodPost,
+		"/api/sessions/"+session.ID.String()+"/plans/"+plan.ID.String()+"/reject", []byte{}, &rejected, token); status != http.StatusOK || rejected.Status != "rejected" {
+		t.Errorf("reject after the refused approval: status %d %q, want 200 rejected", status, rejected.Status)
+	}
+}
+
+// TestApprovePlan_ReadsTheCutFromTheFrameNeverTheText covers the two parts
+// of the rule a reader learns a cut by -- only from `cut`, never from the
+// text -- through the approve route: a part ending in a marker-shaped line
+// and carrying no `cut` is the model's own text and is approved, its
+// snapshot that text with its structured steps; and a part stored whole
+// and then cut (a replay through a connection that read less) reads as
+// the whole text, and is approved with the whole text snapshotted.
+func TestApprovePlan_ReadsTheCutFromTheFrameNeverTheText(t *testing.T) {
+	const whole = "The plan.\n\n" + cutPlanBlock + "Then the tests.\n"
+	tests := []struct {
+		name         string
+		frames       func(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID)
+		wantSnapshot string
+	}{
+		{
+			name: "a marker-shaped line without cut is text",
+			frames: func(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID) {
+				seedCutTokenFrame(ctx, t, rig, sessionID, "prt_plan", "prt_plan", "", nil)
+				seedCutTokenFrame(ctx, t, rig, sessionID, "prt_plan#1", "prt_plan", whole+cutMarker(12, 40960), nil)
+			},
+			wantSnapshot: whole + cutMarker(12, 40960),
+		},
+		{
+			name: "a cut of the stored whole text reads whole",
+			frames: func(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID) {
+				seedCutTokenFrame(ctx, t, rig, sessionID, "prt_plan", "prt_plan", "", nil)
+				seedCutTokenFrame(ctx, t, rig, sessionID, "prt_plan#whole", "prt_plan", whole, nil)
+				seedCutTokenFrame(ctx, t, rig, sessionID, "prt_plan#cut", "prt_plan", whole[:9]+cutMarker(9, len(whole)), map[string]int{"kept": 9, "total": len(whole)})
+			},
+			wantSnapshot: whole,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rig := newTestRig(t)
+			ctx := context.Background()
+			owner, token := rig.createAuthenticatedUser(ctx, t)
+			session := createSessionForUser(ctx, t, rig, owner.ID, nil)
+			plan := seedDispatchedPlan(ctx, t, rig, session.ID, 1, func() { tt.frames(ctx, t, rig, session.ID) })
+
+			var got planActionResponseForTest
+			if status := rig.doJSON(t, http.MethodPost,
+				"/api/sessions/"+session.ID.String()+"/plans/"+plan.ID.String()+"/approve", []byte{}, &got, token); status != http.StatusOK {
+				t.Fatalf("status = %d, want %d", status, http.StatusOK)
+			}
+			doc, err := rig.planDocuments.GetByPlanID(ctx, plan.ID)
+			if err != nil {
+				t.Fatalf("GetByPlanID: %v -- the approval must have snapshotted the plan", err)
+			}
+			if doc.Content == nil || *doc.Content != tt.wantSnapshot {
+				t.Errorf("snapshot content = %v, want %q", doc.Content, tt.wantSnapshot)
+			}
+			if doc.StructuredSteps == nil {
+				t.Error("snapshot structured_steps is NULL, want the plan's steps")
+			}
+		})
+	}
 }

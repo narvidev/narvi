@@ -68,7 +68,7 @@ func TestRenderStructureInstruction_MentionsTheExactFenceTagExtractStructuredLoo
 		StructureFenceOpen + "\n" +
 		`{"steps":[{"title":"t","description":"d","fileRefs":[]}],"scopeEstimate":"1 file"}` +
 		"\n```\n"
-	if ExtractStructured(simulatedReply) == nil {
+	if ExtractStructured(simulatedReply, nil) == nil {
 		t.Errorf("a minimal well-formed reply following this instruction's own documented shape failed to extract: %q", simulatedReply)
 	}
 }
@@ -85,7 +85,7 @@ func TestRenderStructureInstruction_MentionsTheExactFenceTagExtractStructuredLoo
 // the rule, and it keeps failing if anyone later edits the example, adds a
 // second one, or relaxes the extractor.
 func TestStructureInstruction_OwnExampleNeverParsesAsAPlan(t *testing.T) {
-	if got := ExtractStructured(RenderStructureInstruction()); got != nil {
+	if got := ExtractStructured(RenderStructureInstruction(), nil); got != nil {
 		t.Errorf("the instruction's own example parses as a plan (steps=%d, scope=%q) -- a model echoing the requested format would render a fabricated plan for a human to approve",
 			len(got.Steps), got.ScopeEstimate)
 	}
@@ -182,7 +182,7 @@ func TestStructureInstruction_ExampleRejectionIsExact(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := ExtractStructured(tt.content)
+			got := ExtractStructured(tt.content, nil)
 			if tt.wantNil && got != nil {
 				t.Errorf("ExtractStructured() = %+v, want nil (still the instruction's own placeholder)", got)
 			}

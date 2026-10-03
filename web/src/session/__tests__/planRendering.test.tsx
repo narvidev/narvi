@@ -7,13 +7,43 @@
 // reviewRendering.test.tsx's own established pattern exactly:
 // renderToStaticMarkup, no jsdom needed, proving React's default escaping
 // is actually in effect.
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import type * as ReactQuery from '@tanstack/react-query'
 
 import type { Plan } from '@narvi/contracts/rest-dtos'
 
-import { PlanCard, StructuredPlanSteps } from '../PlanModeView'
+import { ApiError } from '../../api/http'
+import { planQueryKeys } from '../../api/queryKeys'
+import { ApprovalBar, PlanCard, StructuredPlanSteps } from '../PlanModeView'
 import { latestPlan, stripStructureBlock } from '../planFormat'
+import { cutReason } from '../tokenCut'
+
+// The approval bar's mutations: every useMutation call's options are
+// recorded, in call order (ApprovalBar calls approve, then reject), and a
+// result can be forced over the real hook's for one of them, to render the
+// bar as it is after a refused request. The real hooks still run; with
+// nothing forced the wrapper changes nothing, so the PlanCard tests below
+// are unaffected.
+const hooks = vi.hoisted(() => ({ mutations: [] as unknown[], forced: [] as (object | undefined)[] }))
+
+vi.mock('@tanstack/react-query', async (importOriginal) => {
+  const actual = await importOriginal<typeof ReactQuery>()
+  const useMutation = ((...args: Parameters<typeof actual.useMutation>) => {
+    const index = hooks.mutations.length
+    hooks.mutations.push(args[0])
+    const result = actual.useMutation(...args)
+    const forced = hooks.forced[index]
+    return forced === undefined ? result : { ...result, ...forced }
+  }) as typeof actual.useMutation
+  return { ...actual, useMutation }
+})
+
+afterEach(() => {
+  hooks.mutations.length = 0
+  hooks.forced.length = 0
+})
 
 const XSS_IMG = '<img src=x onerror=alert(1)>'
 const XSS_SCRIPT = '<script>alert(document.cookie)</script>'
@@ -31,6 +61,7 @@ function basePlan(overrides: Partial<Plan> = {}): Plan {
     decidedBy: null,
     content: 'A normal plan.',
     structured: null,
+    cut: null,
     ...overrides,
   }
 }
@@ -295,5 +326,77 @@ describe('stripStructureBlock -- a human never reads the machine block', () => {
     // The <p class="plan-content"> must carry SOME text -- the raw,
     // unstripped reply -- rather than an empty element.
     expect(html).toMatch(/<p class="plan-content">[^<].*plan-steps/s)
+  })
+})
+
+// A plan whose text was cut on its way from the sandbox (plan.cut,
+// technical plan §6.1) cannot be approved: the server answers 409 with the
+// reason. The bar never offers Approve for one, and an approve refused with
+// 409 for any reason shows the server's own words.
+describe('ApprovalBar -- a cut plan', () => {
+  type CapturedMutation = { onError?: (...args: unknown[]) => unknown }
+
+  function renderBar(plan: Plan) {
+    hooks.mutations.length = 0
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    client.setQueryData(planQueryKeys.list(plan.sessionId), { plans: [plan] })
+    const html = renderToStaticMarkup(
+      <QueryClientProvider client={client}>
+        <ApprovalBar sessionId={plan.sessionId} plan={plan} canAct={true} />
+      </QueryClientProvider>,
+    )
+    const [approve, reject] = hooks.mutations as CapturedMutation[]
+    return { html, client, approve, reject }
+  }
+
+  const cut = { kept: 4096, total: 40960 }
+
+  it('a cut plan offers no Approve and shows the reason where it would be, keeping Request changes and Reject', () => {
+    const { html } = renderBar(basePlan({ cut }))
+    expect(html).not.toContain('Approve &amp; build')
+    expect(html).toContain(cutReason(cut))
+    expect(html).toContain('Request changes')
+    expect(html).toContain('Reject')
+  })
+
+  it('a malformed cut is still a cut: no Approve, and the reason without sizes', () => {
+    const { html } = renderBar(basePlan({ cut: { kept: -1, total: -1 } }))
+    expect(html).not.toContain('Approve &amp; build')
+    expect(html).toContain(cutReason({ kept: -1, total: -1 }))
+  })
+
+  it('a whole plan offers Approve and no cut reason', () => {
+    const { html } = renderBar(basePlan())
+    expect(html).toContain('Approve &amp; build')
+    expect(html).not.toContain('No approval for this plan')
+  })
+
+  it("an approve refused with 409 shows the server's own reason, the plan's cut among them", () => {
+    const reason = cutReason(cut)
+    hooks.forced[0] = { status: 'error', isError: true, isIdle: false, error: new ApiError(409, reason, { error: reason }) }
+    const { html } = renderBar(basePlan())
+    expect(html).toContain(reason)
+    expect(html).not.toContain('already decided')
+  })
+
+  it('a reject refused with 409 keeps its own text', () => {
+    hooks.forced[1] = { status: 'error', isError: true, isIdle: false, error: new ApiError(409, 'plan is not awaiting approval (already decided, or a stale id)', null) }
+    const { html } = renderBar(basePlan())
+    expect(html).toContain('This plan was already decided (or superseded) by someone else.')
+  })
+
+  it('an approve refused with 409 re-reads the plans, so the bar catches up with the server', () => {
+    const plan = basePlan()
+    const { client, approve } = renderBar(plan)
+    expect(client.getQueryState(planQueryKeys.list(plan.sessionId))?.isInvalidated).toBe(false)
+    approve.onError?.(new ApiError(409, cutReason(cut), null), undefined, undefined)
+    expect(client.getQueryState(planQueryKeys.list(plan.sessionId))?.isInvalidated).toBe(true)
+  })
+
+  it('an approve failing otherwise leaves the plans as they are', () => {
+    const plan = basePlan()
+    const { client, approve } = renderBar(plan)
+    approve.onError?.(new ApiError(500, 'internal error', null), undefined, undefined)
+    expect(client.getQueryState(planQueryKeys.list(plan.sessionId))?.isInvalidated).toBe(false)
   })
 })
