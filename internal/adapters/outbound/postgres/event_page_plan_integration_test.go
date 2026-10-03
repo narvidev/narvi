@@ -294,20 +294,28 @@ func comparePageReadTime(ctx context.Context, t *testing.T, events *narvipg.Even
 	}
 }
 
-// pagePlanScan is one scan of events in an executed plan.
+// pagePlanScan is one scan of a relation in an executed plan.
 type pagePlanScan struct {
-	Node, Index    string
-	Loops, Buffers float64
+	Relation, Node, Index string
+	Loops, Buffers        float64
 	// RowsRemoved is per loop, as EXPLAIN gives it.
 	RowsRemoved float64
 }
 
 func (s pagePlanScan) String() string {
 	on := s.Node
+	if s.Relation != "" {
+		on += " on " + s.Relation
+	}
 	if s.Index != "" {
 		on += " using " + s.Index
 	}
 	return fmt.Sprintf("%s: %.0f loops, %.0f buffers, %.0f rows removed a loop", on, s.Loops, s.Buffers, s.RowsRemoved)
+}
+
+// planQuerier runs a statement on a pool or inside a transaction.
+type planQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
 // explainPageStatement runs the connection's prepared statement for the
@@ -315,18 +323,7 @@ func (s pagePlanScan) String() string {
 // BUFFERS), and returns every scan of events the plan ran.
 func explainPageStatement(ctx context.Context, t *testing.T, pool *pgxpool.Pool, statement, args string) []pagePlanScan {
 	t.Helper()
-	var name string
-	if err := pool.QueryRow(ctx,
-		`SELECT name FROM pg_prepared_statements WHERE statement LIKE $1`,
-		"-- name: "+statement+" %").Scan(&name); err != nil {
-		t.Fatalf("find %s among the connection's prepared statements: %v", statement, err)
-	}
-	var plan string
-	if err := pool.QueryRow(ctx,
-		"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE "+pgx.Identifier{name}.Sanitize()+"("+args+")",
-		pgx.QueryExecModeSimpleProtocol).Scan(&plan); err != nil {
-		t.Fatalf("explain %s: %v", statement, err)
-	}
+	plan := explainPlan(ctx, t, pool, statement, args)
 	scans, err := pagePlanScans(plan)
 	if err != nil {
 		t.Fatalf("read %s's plan: %v\n%s", statement, err, plan)
@@ -334,8 +331,38 @@ func explainPageStatement(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 	return scans
 }
 
+// explainPlan runs the connection's prepared statement for the named
+// query, found by its sqlc name, with args, under EXPLAIN (ANALYZE,
+// BUFFERS, FORMAT JSON), on q -- the pool, or a transaction holding the
+// pool's one connection -- and returns the plan.
+func explainPlan(ctx context.Context, t *testing.T, q planQuerier, statement, args string) string {
+	t.Helper()
+	var name string
+	if err := q.QueryRow(ctx,
+		`SELECT name FROM pg_prepared_statements WHERE statement LIKE $1`,
+		"-- name: "+statement+" %").Scan(&name); err != nil {
+		t.Fatalf("find %s among the connection's prepared statements: %v", statement, err)
+	}
+	var plan string
+	if err := q.QueryRow(ctx,
+		"EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE "+pgx.Identifier{name}.Sanitize()+"("+args+")",
+		pgx.QueryExecModeSimpleProtocol).Scan(&plan); err != nil {
+		t.Fatalf("explain %s: %v", statement, err)
+	}
+	return plan
+}
+
 // pagePlanScans returns every scan of events in plan, EXPLAIN's JSON.
 func pagePlanScans(plan string) ([]pagePlanScan, error) {
+	scans, _, err := planScans(plan, "events")
+	return scans, err
+}
+
+// planScans returns every scan of relation in plan, EXPLAIN's JSON -- of
+// every relation when relation is "" -- and the buffers the whole statement
+// read: the plan's top node's Shared Hit and Read Blocks, which count its
+// children's, init plans' and sub-plans' too.
+func planScans(plan, relation string) ([]pagePlanScan, float64, error) {
 	type node struct {
 		NodeType    string  `json:"Node Type"`
 		Relation    string  `json:"Relation Name"`
@@ -350,35 +377,36 @@ func pagePlanScans(plan string) ([]pagePlanScan, error) {
 		Plan json.RawMessage `json:"Plan"`
 	}
 	if err := json.Unmarshal([]byte(plan), &top); err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if len(top) != 1 {
-		return nil, fmt.Errorf("%d plans, want one", len(top))
+		return nil, 0, fmt.Errorf("%d plans, want one", len(top))
 	}
 	var scans []pagePlanScan
-	var walk func(raw json.RawMessage) error
-	walk = func(raw json.RawMessage) error {
+	var walk func(raw json.RawMessage) (float64, error)
+	walk = func(raw json.RawMessage) (float64, error) {
 		var n node
 		if err := json.Unmarshal(raw, &n); err != nil {
-			return err
+			return 0, err
 		}
-		if n.Relation == "events" {
+		if n.Relation != "" && (relation == "" || n.Relation == relation) {
 			scans = append(scans, pagePlanScan{
-				Node: n.NodeType, Index: n.Index, Loops: n.Loops,
+				Relation: n.Relation, Node: n.NodeType, Index: n.Index, Loops: n.Loops,
 				Buffers: n.SharedHit + n.SharedRead, RowsRemoved: n.RowsRemoved,
 			})
 		}
 		for _, child := range n.Plans {
-			if err := walk(child); err != nil {
-				return err
+			if _, err := walk(child); err != nil {
+				return 0, err
 			}
 		}
-		return nil
+		return n.SharedHit + n.SharedRead, nil
 	}
-	if err := walk(top[0].Plan); err != nil {
-		return nil, err
+	buffers, err := walk(top[0].Plan)
+	if err != nil {
+		return nil, 0, err
 	}
-	return scans, nil
+	return scans, buffers, nil
 }
 
 // pageWalkProblem returns why the walk's scans, its first event's lookup
@@ -441,11 +469,14 @@ func TestPagePlanScans(t *testing.T) {
 		t.Fatalf("pagePlanScans: %v", err)
 	}
 	want := []pagePlanScan{
-		{Node: "Index Scan", Index: "events_session_id_id_idx", Loops: 1, Buffers: 4},
-		{Node: "Index Scan", Index: "events_pkey", Loops: 99, Buffers: 516, RowsRemoved: 400101},
+		{Relation: "events", Node: "Index Scan", Index: "events_session_id_id_idx", Loops: 1, Buffers: 4},
+		{Relation: "events", Node: "Index Scan", Index: "events_pkey", Loops: 99, Buffers: 516, RowsRemoved: 400101},
 	}
 	if fmt.Sprint(scans) != fmt.Sprint(want) {
 		t.Fatalf("pagePlanScans = %v, want %v", scans, want)
+	}
+	if _, total, err := planScans(plan, ""); err != nil || total != 520 {
+		t.Fatalf("planScans total = %v (err %v), want the top node's 520", total, err)
 	}
 	if problem := pageWalkProblem(want[:1]); problem == "" {
 		t.Error("pageWalkProblem passes a walk of one lookup")

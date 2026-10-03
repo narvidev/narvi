@@ -129,6 +129,27 @@ WHERE session_id = $1 AND is_review_attempt = true
 ORDER BY created_at DESC, id DESC
 LIMIT 1;
 
+-- name: ReviewRetriggerHeld :one
+-- Technical plan §24.9: whether the re-review debounce of this session
+-- holds -- some turn of the session is still open (pending, dispatched or
+-- processing), so an automatic review would queue behind it with a prompt
+-- built for a head that may move again before it runs. Read by the
+-- debounce's fire (sessionactor's readReviewRetriggerState, then again in
+-- finishReviewRetrigger just before the insert) inside the actor's
+-- transaction, under the session's actor-epoch row lock that every turn
+-- insert on an existing session also takes, so the answer is consistent
+-- with every turn insert. The status list is a deny list of the three
+-- terminal states, the one turn.IsTerminal reads -- a state added later
+-- reads as open, the safe direction -- written out literally so it matches
+-- the predicate of turns_open_session_id_idx (migrations/000158), which
+-- the planner must prove under a generic plan as well: the read is one
+-- probe of the session's open turns, never a walk of its history.
+SELECT EXISTS (
+    SELECT 1 FROM turns t
+    WHERE t.session_id = sqlc.arg('session_id')
+      AND t.status NOT IN ('completed', 'failed', 'cancelled')
+) AS held;
+
 -- name: UpdateTurnStatus :one
 -- Sets a turn's status, plus dispatched_at/completed_at/
 -- dispatched_sandbox_gen when the caller supplies one (sqlc.narg +

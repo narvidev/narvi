@@ -371,3 +371,42 @@ func (q *Queries) UpsertSessionTimer(ctx context.Context, arg UpsertSessionTimer
 	)
 	return i, err
 }
+
+const wakeReviewRetriggerDebounce = `-- name: WakeReviewRetriggerDebounce :execrows
+UPDATE session_timers AS st
+SET fires_at = now(), armed_at = now()
+FROM sessions AS s
+WHERE st.session_id = $1
+  AND st.name = 'review_retrigger_debounce'
+  AND s.id = st.session_id
+  AND (s.stop_requested_at IS NULL OR st.created_at > s.stop_requested_at)
+`
+
+// Technical plan §24.9: the wake-up a turn's end owes the re-review
+// debounce, run by the session actor in the same transaction as the write
+// that left a turn completed, failed or cancelled (sessionactor's
+// turnWriter and transact). While a turn of the review session is open the
+// debounce holds, re-arming itself at ReviewRetriggerHoldBackstop; this
+// moves it to now, so the review the hold kept back runs, for the head
+// pushed last, as soon as the session is free. 'review_retrigger_debounce'
+// is sessionactor.TimerReviewRetriggerDebounce, named here like the kind
+// ArmSessionDispatchTimer names, so no caller can wake another kind.
+//
+// An UPDATE, never an insert: a debounce row exists while a push still
+// waits for its review (the hold re-arms it), and one that is gone was
+// removed on purpose -- an enqueue that took its head, an opt-in switched
+// off or a revocation, or a person's stop -- which an insert would undo.
+// A debounce armed at or before the session's standing stop request is
+// left alone (sessionactor's disarmWorkCreatingTimers deletes it when the
+// stop timer runs, by the same rule), so a turn the stop's dispatch gate
+// cancels never wakes the work the stop asked to drop. armed_at is stamped
+// like every arm (UpsertSessionTimer); created_at, the instant a stop is
+// compared with, is kept. A session with no debounce updates nothing: one
+// probe of the (session_id, name) unique index.
+func (q *Queries) WakeReviewRetriggerDebounce(ctx context.Context, sessionID pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, wakeReviewRetriggerDebounce, sessionID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}

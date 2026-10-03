@@ -1,0 +1,15 @@
+-- Reverses 000158_turns_open_session_id_idx.up.sql. Without the index the
+-- re-review hold's read (ReviewRetriggerHeld) walks the session's turns
+-- instead of probing its open ones; nothing a binary without 000158 runs
+-- needs it, and no statement's result changes.
+--
+-- Drops the index without blocking writes to turns. A single statement, so
+-- golang-migrate sends it on its own, outside any transaction block, which
+-- CONCURRENTLY requires. Unlike a concurrent build (see the up migration),
+-- a concurrent drop waits only for transactions holding a lock on turns,
+-- never for older snapshots, so a second migrator waiting on
+-- golang-migrate's advisory lock cannot deadlock it. Pods of a binary that
+-- carries 000158 keep working meanwhile -- their statements name no index,
+-- only the hold read's plan changes -- but one that restarts applies 000158
+-- again at boot, so scale them away before deploying the older binary.
+DROP INDEX CONCURRENTLY IF EXISTS turns_open_session_id_idx;

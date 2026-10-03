@@ -146,6 +146,74 @@ func TestTurnStore_CreateAndArmDispatch(t *testing.T) {
 	}
 }
 
+// TestCreateAndArmDispatch_RefusesATerminalTurn: a turn is created pending,
+// never already ended. A turn ends only through UpdateStatus, whose
+// terminal writes the session actor notes so the re-review debounce wakes
+// in the same transaction (technical plan §24.9); one inserted ended would
+// end with no wake-up. Every status but pending is refused with
+// ErrTurnNotPending, writing neither the turn nor its dispatch timer, the
+// open in-flight states included -- the one path to them is the dispatch,
+// through the session actor -- and on LockedTurnCreator as well; pending is
+// created.
+func TestCreateAndArmDispatch_RefusesATerminalTurn(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	turns := narvipg.NewTurnStore(pool)
+	creator := narvipg.NewLockedTurnCreator(pool)
+	prompt := "review the pull request"
+
+	for _, tc := range []struct {
+		status    sqlcgen.TurnStatus
+		wantError bool
+	}{
+		{sqlcgen.TurnStatusPending, false},
+		{sqlcgen.TurnStatusDispatched, true},
+		{sqlcgen.TurnStatusProcessing, true},
+		{sqlcgen.TurnStatusCompleted, true},
+		{sqlcgen.TurnStatusFailed, true},
+		{sqlcgen.TurnStatusCancelled, true},
+		{"", true},
+	} {
+		t.Run(string(tc.status), func(t *testing.T) {
+			params := func(sessionID pgtype.UUID) sqlcgen.CreateTurnParams {
+				return sqlcgen.CreateTurnParams{SessionID: sessionID, Status: tc.status, Prompt: &prompt}
+			}
+			check := func(how string, sessionID pgtype.UUID, err error) {
+				t.Helper()
+				if tc.wantError != errors.Is(err, narvipg.ErrTurnNotPending) || (!tc.wantError && err != nil) {
+					t.Fatalf("%s with status %q = %v, want refused %v", how, tc.status, err, tc.wantError)
+				}
+				wantTurns := 1
+				if tc.wantError {
+					wantTurns = 0
+				}
+				if n := countTurns(ctx, t, pool, sessionID); n != wantTurns {
+					t.Fatalf("%s with status %q: %d turns, want %d", how, tc.status, n, wantTurns)
+				}
+				if _, _, armed := dispatchTimerRow(ctx, t, pool, sessionID); armed == tc.wantError {
+					t.Fatalf("%s with status %q: dispatch timer armed %v, want %v", how, tc.status, armed, !tc.wantError)
+				}
+			}
+
+			sessionID := createTestSession(ctx, t, pool)
+			tx, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = turns.WithTx(tx).CreateAndArmDispatch(ctx, params(sessionID))
+			// Committed either way: a refusal must have written nothing.
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			check("CreateAndArmDispatch", sessionID, err)
+
+			sessionID = createTestSession(ctx, t, pool)
+			_, err = creator.CreateLockedTurn(ctx, params(sessionID))
+			check("CreateLockedTurn", sessionID, err)
+		})
+	}
+}
+
 // TestLockedTurnCreator_CreatesUnderTheActorEpochLock pins the release
 // composition review's insert (postgres.LockedTurnCreator): it takes the
 // session's actor-epoch row lock before it writes, and its turn and the

@@ -1042,6 +1042,35 @@ func (q *Queries) RequestStopOpenTurns(ctx context.Context, sessionID pgtype.UUI
 	return items, nil
 }
 
+const reviewRetriggerHeld = `-- name: ReviewRetriggerHeld :one
+SELECT EXISTS (
+    SELECT 1 FROM turns t
+    WHERE t.session_id = $1
+      AND t.status NOT IN ('completed', 'failed', 'cancelled')
+) AS held
+`
+
+// Technical plan §24.9: whether the re-review debounce of this session
+// holds -- some turn of the session is still open (pending, dispatched or
+// processing), so an automatic review would queue behind it with a prompt
+// built for a head that may move again before it runs. Read by the
+// debounce's fire (sessionactor's readReviewRetriggerState, then again in
+// finishReviewRetrigger just before the insert) inside the actor's
+// transaction, under the session's actor-epoch row lock that every turn
+// insert on an existing session also takes, so the answer is consistent
+// with every turn insert. The status list is a deny list of the three
+// terminal states, the one turn.IsTerminal reads -- a state added later
+// reads as open, the safe direction -- written out literally so it matches
+// the predicate of turns_open_session_id_idx (migrations/000158), which
+// the planner must prove under a generic plan as well: the read is one
+// probe of the session's open turns, never a walk of its history.
+func (q *Queries) ReviewRetriggerHeld(ctx context.Context, sessionID pgtype.UUID) (bool, error) {
+	row := q.db.QueryRow(ctx, reviewRetriggerHeld, sessionID)
+	var held bool
+	err := row.Scan(&held)
+	return held, err
+}
+
 const setTurnEpistemicOutcome = `-- name: SetTurnEpistemicOutcome :execrows
 UPDATE turns
 SET epistemic_outcome = $2

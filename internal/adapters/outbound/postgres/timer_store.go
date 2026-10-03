@@ -50,6 +50,17 @@ func (s *TimerStore) BackOffDispatch(ctx context.Context, arg sqlcgen.BackOffSes
 	return s.q.BackOffSessionDispatchTimer(ctx, arg)
 }
 
+// WakeReviewRetriggerDebounce moves the session's re-review debounce to the
+// database's now, stamping armed_at and keeping created_at, and reports how
+// many rows it moved: zero when the session has no debounce, or only one
+// armed at or before its standing stop request. It never inserts one. The
+// session actor runs it in the transaction of every write that ends a turn
+// (technical plan §24.9); see WakeReviewRetriggerDebounce's doc comment in
+// queries/session_timers.sql.
+func (s *TimerStore) WakeReviewRetriggerDebounce(ctx context.Context, sessionID pgtype.UUID) (int64, error) {
+	return s.q.WakeReviewRetriggerDebounce(ctx, sessionID)
+}
+
 // DeleteDispatch deletes the session's dispatch timer and returns the
 // armed_at and created_at it carried, both invalid when the session had
 // none. The first write of every dispatch evaluation (technical plan §2).
