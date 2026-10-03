@@ -3605,7 +3605,7 @@ export interface SessionActivity {
     since: string;
   } | null;
   /**
-   * The most recently created turn that reached a terminal state; null when none has.
+   * The most recently created turn that reached a terminal state, leaving aside a turn that ended without ever running, for a reason of its own: a queued automatic review whose pull request moved before it started (technical plan §24.9), which is no run of the session's; null when none has.
    */
   lastRun: {
     turnId: string;
@@ -3618,6 +3618,23 @@ export interface SessionActivity {
      * When the run reached its terminal state; null when that was not recorded.
      */
     finishedAt: string | null;
+  } | null;
+  /**
+   * The automatic re-review of the session's pull request gave up, and why; absent when it has not (a plain read of a session that never had one is unchanged by it). An automatic review attempt that waited behind another turn checks, as it is dispatched, that the head, base and ancestor chain it was built for are still the pull request's; one whose pull request moved does not run, and the re-review asks again for the newest head. When its attempts meet a moved context more times in a row than the deployment allows (3 as shipped), it gives up instead: nothing is scheduled, so activity can read finished, and this says the automatic re-review stopped rather than was never owed. The next push to the pull request re-arms it and clears this. A person's re-review request (the label, the button, a mention) is never subject to it.
+   */
+  reviewRetriggerDropped?: {
+    /**
+     * The head the automatic re-review gave up on: the pull request's newest head when it did.
+     */
+    headSha: string;
+    /**
+     * When it gave up, on the database's clock.
+     */
+    droppedAt: string;
+    /**
+     * 'context_moved_bound': its attempts met a moved context more times in a row than the deployment allows. An OPEN enum (manifest.json's openEnums): a consumer MUST tolerate a value it does not recognise.
+     */
+    reason: 'context_moved_bound';
   } | null;
   /**
    * The session's sandbox status in the same snapshot, with Session.sandboxStatus's values; null when the session has no sandbox yet. Informational, and an input to suggestedDelaySeconds while queued: activity never derives from it.

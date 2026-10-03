@@ -341,18 +341,19 @@ func sessionActivityToDTO(facts sqlcgen.GetSessionActivityFactsRow, delays sessi
 	delay := session.SuggestedReadDelay(activity, sandboxState, scheduledDueIn, delays)
 
 	return restdtos.SessionActivity{
-		SessionId:             facts.SessionID.String(),
-		Activity:              restdtos.SessionActivityActivity(activity),
-		Settled:               activity.Settled(),
-		PendingTurns:          in.TurnCounts[turn.StatePending],
-		InFlightTurn:          inFlightTurnDTO(facts),
-		Awaiting:              awaitingDTO(facts),
-		Escalation:            escalationDTO(facts),
-		LastRun:               lastRunDTO(facts),
-		SandboxStatus:         sandboxStatus,
-		Archived:              facts.Archived,
-		SuggestedDelaySeconds: wholeSecondsRoundedUp(delay),
-		ObservedAt:            facts.ObservedAt.Time,
+		SessionId:              facts.SessionID.String(),
+		Activity:               restdtos.SessionActivityActivity(activity),
+		Settled:                activity.Settled(),
+		PendingTurns:           in.TurnCounts[turn.StatePending],
+		InFlightTurn:           inFlightTurnDTO(facts),
+		Awaiting:               awaitingDTO(facts),
+		Escalation:             escalationDTO(facts),
+		LastRun:                lastRunDTO(facts),
+		ReviewRetriggerDropped: reviewRetriggerDroppedDTO(facts),
+		SandboxStatus:          sandboxStatus,
+		Archived:               facts.Archived,
+		SuggestedDelaySeconds:  wholeSecondsRoundedUp(delay),
+		ObservedAt:             facts.ObservedAt.Time,
 	}, nil
 }
 
@@ -439,6 +440,25 @@ func lastRunDTO(facts sqlcgen.GetSessionActivityFactsRow) *restdtos.SessionActiv
 		out.FinishedAt = &at
 	}
 	return out
+}
+
+// reviewRetriggerDroppedDTO is SessionActivity.reviewRetriggerDropped
+// (technical plan §24.9): the automatic re-review of the session's pull
+// request gave up after its attempts met a moved context more times in a
+// row than ReviewContextMoveMaxConsecutive allows, on the head it names --
+// the facts row's drop, recorded in the transaction that ended the last
+// such attempt and cleared by the next push. nil, and absent from the
+// wire, otherwise. context_moved_bound is the one reason a drop is
+// recorded for today.
+func reviewRetriggerDroppedDTO(facts sqlcgen.GetSessionActivityFactsRow) *restdtos.SessionActivityReviewRetriggerDropped {
+	if !facts.ReviewRetriggerDroppedAt.Valid {
+		return nil
+	}
+	return &restdtos.SessionActivityReviewRetriggerDropped{
+		HeadSha:   facts.ReviewRetriggerDroppedHeadSha,
+		DroppedAt: facts.ReviewRetriggerDroppedAt.Time,
+		Reason:    restdtos.SessionActivityReviewRetriggerDroppedReasonContextMovedBound,
+	}
 }
 
 // lastRunFailureReason is SessionActivity.lastRun.failureReason:
