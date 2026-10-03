@@ -561,6 +561,35 @@ func (r *stopRig) syntheticCompletes(ctx context.Context, t *testing.T, sessionI
 	return out
 }
 
+// syntheticDispatched returns, per turn id, whether that turn's synthetic
+// execution_complete carries the `dispatched` stamp
+// (sessionactor/syntheticend.go): true only for the end of a turn that was
+// dispatched, the one a page is showing.
+func (r *stopRig) syntheticDispatched(ctx context.Context, t *testing.T, sessionID pgtype.UUID) map[string]bool {
+	t.Helper()
+	rows, err := r.pool.Query(ctx, `SELECT payload->>'turn_id', COALESCE((payload->>'dispatched')::boolean, false) FROM events
+		WHERE session_id = $1 AND type = 'execution_complete' AND (payload->>'synthetic')::boolean`, sessionID)
+	if err != nil {
+		t.Fatalf("query synthetic events: %v", err)
+	}
+	out := map[string]bool{}
+	var scanErr error
+	for rows.Next() {
+		var id string
+		var dispatched bool
+		if err := rows.Scan(&id, &dispatched); err != nil {
+			scanErr = err
+			break
+		}
+		out[id] = dispatched
+	}
+	rows.Close()
+	if scanErr != nil {
+		t.Fatal(scanErr)
+	}
+	return out
+}
+
 // timerNames returns the timers armed on sessionID, sorted.
 func (r *stopRig) timerNames(ctx context.Context, t *testing.T, sessionID pgtype.UUID) []string {
 	t.Helper()
@@ -880,9 +909,15 @@ func TestStopSession_DrainsQueueAndStopsInFlight(t *testing.T) {
 			return len(rig.commander.ofType(t, "stop")) > 0
 		})
 		synthetic := rig.syntheticCompletes(ctx, t, session.ID)
+		dispatched := rig.syntheticDispatched(ctx, t, session.ID)
 		for _, q := range queued {
 			if n := synthetic[q.ID.String()]; n != 1 {
 				t.Errorf("queued turn %s cancelled with %d synthetic execution_complete events, want exactly 1", q.ID.String(), n)
+			}
+			// A queued turn never dispatched: its end must not end the
+			// running turn a page shows.
+			if dispatched[q.ID.String()] {
+				t.Errorf("queued turn %s's synthetic end is stamped dispatched, want unstamped: it never dispatched", q.ID.String())
 			}
 		}
 		stops := rig.commander.ofType(t, "stop")
@@ -1000,6 +1035,9 @@ func TestStopSession_SilentAgentCancelledAfterGrace(t *testing.T) {
 			}
 			if n := rig.syntheticCompletes(ctx, t, session.ID)[running.ID.String()]; n != 1 {
 				t.Fatalf("%d synthetic execution_complete events for the cancelled turn, want exactly 1", n)
+			}
+			if !rig.syntheticDispatched(ctx, t, session.ID)[running.ID.String()] {
+				t.Fatal("the running turn's synthetic end carries no dispatched stamp, want it: it ends the turn a page shows")
 			}
 			if names := rig.timerNames(ctx, t, session.ID); len(names) != 0 {
 				t.Fatalf("timers = %v, want none: the stop and the turn's deadline both end with it", names)

@@ -120,3 +120,36 @@ func (a *Actor) appendCorrelatedEvent(ctx context.Context, tx pgx.Tx, cmd Sandbo
 	}
 	return a.appendRawEvent(ctx, tx, cmd.Type, eventkey.StorageKey(cmd.Type, cmd.MessageID, cmd.CallID, cmd.StepID), cmd.Raw)
 }
+
+// storedOnlyWhileATurnIsProcessing reports whether eventType is one of the
+// two other turn-scoped types the page opens a turn at that the agent can
+// still send after the control plane has ended its turn: a `step_start` and
+// a `sub_task_start`. turn_deadline ends a turn without stopping its agent,
+// which can work on and send both, and the page, which ends the turn it is
+// showing at the turn's synthetic execution_complete, opened a turn of its
+// own at each -- one that never ended, its calls running and its composer
+// locked. Neither is ever sent while no turn is Processing but late, so
+// with no turn Processing neither adds a row, as `token` frames and the
+// three correlated types do not (appendLiveTurnEvent). A sub_task_finish,
+// critical and acked, is still stored, and the page reads a late one into
+// the lane of the turn that ended without opening a turn
+// (web/src/session/timelineModel.ts).
+func storedOnlyWhileATurnIsProcessing(eventType string) bool {
+	return eventType == "step_start" || eventType == "sub_task_start"
+}
+
+// appendLiveTurnEvent stores one inbound `step_start` or `sub_task_start`
+// inside tx under its wire messageId, as every other type is stored, but
+// only while a turn is Processing (storedOnlyWhileATurnIsProcessing).
+// Returns whether a row was inserted, exactly like appendRawEvent.
+func (a *Actor) appendLiveTurnEvent(ctx context.Context, tx pgx.Tx, cmd SandboxEvent) (bool, error) {
+	if _, err := a.stores.turn.WithTx(tx).GetProcessingTurnForSession(ctx, a.sessionID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			a.logger.Debug("sessionactor: turn-scoped event with no turn processing; adding no row",
+				"event_type", cmd.Type, "message_id", cmd.MessageID)
+			return false, nil
+		}
+		return false, fmt.Errorf("sessionactor: read processing turn for %s: %w", cmd.Type, err)
+	}
+	return a.appendRawEvent(ctx, tx, cmd.Type, cmd.MessageID, cmd.Raw)
+}

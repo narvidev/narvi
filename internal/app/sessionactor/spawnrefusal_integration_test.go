@@ -51,6 +51,35 @@ func syntheticEndReasons(ctx context.Context, t *testing.T, pool *pgxpool.Pool, 
 	return out
 }
 
+// syntheticEndsDispatched returns, per turn id, whether that turn's
+// synthetic execution_complete carries the `dispatched` stamp
+// (syntheticend.go): the end of a turn that was dispatched, the one a page
+// is showing.
+func syntheticEndsDispatched(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID) map[string]bool {
+	t.Helper()
+	rows, err := pool.Query(ctx, `SELECT payload->>'turn_id', COALESCE((payload->>'dispatched')::boolean, false) FROM events
+		WHERE session_id = $1 AND type = 'execution_complete' AND (payload->>'synthetic')::boolean`, sessionID)
+	if err != nil {
+		t.Fatalf("read synthetic execution_complete events: %v", err)
+	}
+	out := map[string]bool{}
+	var scanErr error
+	for rows.Next() {
+		var id string
+		var dispatched bool
+		if err := rows.Scan(&id, &dispatched); err != nil {
+			scanErr = err
+			break
+		}
+		out[id] = dispatched
+	}
+	rows.Close()
+	if scanErr != nil {
+		t.Fatalf("scan: %v", scanErr)
+	}
+	return out
+}
+
 // TestSpawnRefusal_EndsTheOpenTurnsOnce is the spawn-time policy refusal
 // under the durable dispatch trigger (technical plan §2, §32.4): a repo the
 // cohort rollout does not admit (no repo_settings row), or an environment
@@ -156,6 +185,15 @@ func TestSpawnRefusal_EndsTheOpenTurnsOnce(t *testing.T) {
 				if !strings.Contains(r, tc.wantReason) {
 					t.Errorf("synthetic execution_complete reason %q, want it to name %q", r, tc.wantReason)
 				}
+			}
+			// The turn in flight was dispatched, the queued one never was: only
+			// the in-flight turn's end may end the turn a page shows.
+			stamps := syntheticEndsDispatched(ctx, t, pool, sessionID)
+			if stamps[queued.ID.String()] {
+				t.Errorf("the queued turn's synthetic end is stamped dispatched, want unstamped: it never dispatched")
+			}
+			if inFlight.ID.Valid && !stamps[inFlight.ID.String()] {
+				t.Errorf("the in-flight turn's synthetic end carries no dispatched stamp, want it")
 			}
 			if _, ok := dispatchTimer(ctx, t, pool, sessionID); ok {
 				t.Error("a dispatch timer is left after the refusal: the pump would bring the refusal back")

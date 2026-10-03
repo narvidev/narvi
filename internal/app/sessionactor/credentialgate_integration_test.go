@@ -198,11 +198,15 @@ func TestDispatchGate_PersonalLinkOnly(t *testing.T) {
 			}
 
 			var reason string
+			var dispatched bool
 			if err := pool.QueryRow(ctx,
-				`SELECT payload->>'reason' FROM events WHERE session_id = $1 AND type = 'execution_complete' AND (payload->>'synthetic')::boolean`,
+				`SELECT payload->>'reason', COALESCE((payload->>'dispatched')::boolean, false) FROM events WHERE session_id = $1 AND type = 'execution_complete' AND (payload->>'synthetic')::boolean`,
 				session.ID,
-			).Scan(&reason); err != nil {
+			).Scan(&reason, &dispatched); err != nil {
 				t.Fatalf("read the refused turn's terminal event: %v", err)
+			}
+			if dispatched {
+				t.Error("the refused turn's synthetic end is stamped dispatched, want unstamped: it never dispatched, and no page turn is its")
 			}
 			if !strings.HasPrefix(reason, string(providercredential.RefusalPersonalLinkOnly)+": ") || !strings.Contains(reason, *tc.model) {
 				t.Errorf("terminal reason = %q, want it to name %q and the model %q", reason, providercredential.RefusalPersonalLinkOnly, *tc.model)

@@ -38,3 +38,32 @@ func TestRequiresSyntheticExecutionComplete(t *testing.T) {
 		})
 	}
 }
+
+// TestSyntheticEndIsOfDispatchedTurn: a synthetic end of a turn ended from
+// dispatched or processing ends the session's turn in flight; one ended
+// from pending, never dispatched, does not, and neither does any other
+// state.
+func TestSyntheticEndIsOfDispatchedTurn(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		from turn.State
+		want bool
+	}{
+		{turn.StatePending, false},
+		{turn.StateDispatched, true},
+		{turn.StateProcessing, true},
+		{turn.StateCompleted, false},
+		{turn.StateFailed, false},
+		{turn.StateCancelled, false},
+		{turn.State("unknown"), false},
+	}
+	for _, tc := range tests {
+		t.Run(string(tc.from), func(t *testing.T) {
+			t.Parallel()
+			if got := turn.SyntheticEndIsOfDispatchedTurn(tc.from); got != tc.want {
+				t.Errorf("SyntheticEndIsOfDispatchedTurn(%q) = %v, want %v", tc.from, got, tc.want)
+			}
+		})
+	}
+}

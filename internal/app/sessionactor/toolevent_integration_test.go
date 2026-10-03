@@ -270,3 +270,65 @@ func TestToolEvent_ReplayedAfterItsTurn_AddsNoRow(t *testing.T) {
 		})
 	}
 }
+
+// TestLateStepAndSubTaskStart_NoTurnProcessing_AddNoRow: turn_deadline ends
+// a turn without stopping its agent, which can go on sending a step_start
+// or a sub_task_start; stored once no turn is Processing, each opened a turn
+// on the page that nothing ended. Neither adds a row then, and both are
+// stored while a turn is Processing; a sub_task_finish, critical, is still
+// stored late.
+func TestLateStepAndSubTaskStart_NoTurnProcessing_AddNoRow(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+	sid := sessionID.String()
+	if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+		t.Fatalf("create sandbox: %v", err)
+	}
+	fb := &fakeBroadcaster{}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), fb, nil, nil, "", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	raw := func(v any) json.RawMessage {
+		t.Helper()
+		b, err := json.Marshal(v)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		return b
+	}
+	subStart := func(id string) SandboxEvent {
+		return SandboxEvent{Type: "sub_task_start", Gen: 1, MessageID: id,
+			Raw: raw(sandboxws.SubTaskStart{Type: "sub_task_start", MessageId: id, SessionId: sid, Gen: 1, SubTaskId: "ses_" + id, Label: "lane", ParentMessageId: "msg_1"})}
+	}
+	subFinish := func(id string) SandboxEvent {
+		return SandboxEvent{Type: "sub_task_finish", Gen: 1, MessageID: id,
+			Raw: raw(sandboxws.SubTaskFinish{Type: "sub_task_finish", MessageId: id, SessionId: sid, Gen: 1, AckId: "sub_task_finish:" + id, SubTaskId: "ses_x", Outcome: sandboxws.SubTaskFinishOutcomeCancelled})}
+	}
+
+	// No turn Processing: a late step_start and sub_task_start add no row;
+	// a late sub_task_finish is stored, and acked.
+	sendSandboxEventForTest(ctx, t, a, messageEventForTest(t, sid, "step_start", "msg_late", "prt_late"))
+	sendSandboxEventForTest(ctx, t, a, subStart("sst_late"))
+	if outcome := sendSandboxEventForTest(ctx, t, a, subFinish("ssf_late")); outcome.AckID != "sub_task_finish:ssf_late" {
+		t.Fatalf("late sub_task_finish outcome %+v, want it acked", outcome)
+	}
+	if got := storedKeys(ctx, t, pool, sessionID, "step_start", "sub_task_start", "sub_task_finish"); strings.Join(got, "|") != "sub_task_finish ssf_late" {
+		t.Fatalf("with no turn processing, stored %q, want the sub_task_finish alone", got)
+	}
+
+	// A turn Processing: both are stored as before.
+	createDispatchedProcessingTurn(ctx, t, pool, sessionID)
+	sendSandboxEventForTest(ctx, t, a, messageEventForTest(t, sid, "step_start", "msg_1", "prt_1"))
+	sendSandboxEventForTest(ctx, t, a, subStart("sst_1"))
+	want := []string{"sub_task_finish ssf_late", "step_start msg_1", "sub_task_start sst_1"}
+	if got := storedKeys(ctx, t, pool, sessionID, "step_start", "sub_task_start", "sub_task_finish"); strings.Join(got, "|") != strings.Join(want, "|") {
+		t.Fatalf("with a turn processing, stored %q, want %q", got, want)
+	}
+}

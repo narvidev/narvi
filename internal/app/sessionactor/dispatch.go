@@ -1439,11 +1439,7 @@ func (a *Actor) endTurnsOnSpawnRefusal(ctx context.Context, tx pgx.Tx, sessionRo
 			EpistemicCheckDefault: a.epistemicCheckDefault,
 		}, sessionRow, t.ID, refusal.reason)
 		if turn.RequiresSyntheticExecutionComplete(trig) {
-			if err := a.appendEvent(ctx, tx, "execution_complete", map[string]any{
-				"turn_id":   t.ID.String(),
-				"synthetic": true,
-				"reason":    refusal.reason,
-			}); err != nil {
+			if err := a.appendEvent(ctx, tx, "execution_complete", syntheticExecutionComplete(t.ID, from, refusal.reason)); err != nil {
 				return err
 			}
 		}
@@ -2530,11 +2526,7 @@ func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, fail
 		}
 
 		if turn.RequiresSyntheticExecutionComplete(turn.TriggerTimeout) {
-			payload := map[string]any{
-				"turn_id":   turnID.String(),
-				"synthetic": true,
-				"reason":    failure.reason,
-			}
+			payload := syntheticExecutionComplete(turnID, turn.StateProcessing, failure.reason)
 			if failure.undelivered {
 				payload[syntheticUndeliveredKey] = false
 			}

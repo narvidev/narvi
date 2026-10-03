@@ -383,13 +383,17 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// `tool_result` or `step_finish` carries its enclosing message's id,
 		// which that message's `step_start` stores first, so each is stored
 		// under a key derived from its callId or stepId (toolevent.go). All
-		// four are stored only while their turn is Processing.
+		// four are stored only while their turn is Processing, and so are a
+		// `step_start` and a `sub_task_start`, under their wire messageId
+		// (toolevent.go, appendLiveTurnEvent).
 		var inserted bool
 		switch {
 		case cmd.Type == "token":
 			inserted, err = a.appendTokenFrame(ctx, tx, cmd)
 		case eventkey.KeyedByCorrelator(cmd.Type):
 			inserted, err = a.appendCorrelatedEvent(ctx, tx, cmd)
+		case storedOnlyWhileATurnIsProcessing(cmd.Type):
+			inserted, err = a.appendLiveTurnEvent(ctx, tx, cmd)
 		default:
 			inserted, err = a.appendRawEvent(ctx, tx, cmd.Type, cmd.MessageID, cmd.Raw)
 		}

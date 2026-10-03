@@ -16,13 +16,14 @@ import (
 // they were handed rather than one they name: the two append helpers, and
 // the sandbox ingress, which stores a frame under the frame's own type only
 // after refusing serverEventTypes (handleSandboxEvent, appendTokenFrame,
-// appendCorrelatedEvent).
+// appendCorrelatedEvent, appendLiveTurnEvent).
 var eventTypePassThroughs = map[string]bool{
 	"internal/app/sessionactor/actor.go:appendRawEvent":            true,
 	"internal/app/sessionactor/timerfired.go:appendEvent":          true,
 	"internal/app/sessionactor/sandboxevent.go:handleSandboxEvent": true,
 	"internal/app/sessionactor/tokenframe.go:appendTokenFrame":     true,
 	"internal/app/sessionactor/toolevent.go:appendCorrelatedEvent": true,
+	"internal/app/sessionactor/toolevent.go:appendLiveTurnEvent":   true,
 }
 
 // TestServerWrittenEventTypesAreReserved keeps serverEventTypes whole, so a
