@@ -120,6 +120,20 @@ type Actor struct {
 	reviewDiffFetcher reviewcontext.Fetcher
 	githubBotHandle   string
 
+	// reviewLiveReader is technical plan §24.9's context check's read of a
+	// pull request's live facts -- see Registry's own identical field doc
+	// comment (registry.go); reviewcontextcheck.go's preReadReviewContext
+	// is this Actor's one use of it. May be nil: a queued automatic review
+	// attempt then starts with its context unconfirmed.
+	reviewLiveReader ReviewLiveReader
+
+	// spawnSource is the session's sessions.spawn_source, read at hydration
+	// (it never changes). Technical plan §24.9's context check applies only
+	// to a pull request's review session -- the GitHub lane's -- the one
+	// kind whose turns a review lane asks for (contextCheckApplies), so
+	// every other session's dispatch makes no read for it.
+	spawnSource sqlcgen.SessionSpawnSource
+
 	// knowledgeRanker (§31.6/§34.7) is Registry.knowledgeRanker's own
 	// doc comment -- composeAutoRetriggerPrompt (reviewretrigger.go) is
 	// this Actor's own one use of it. May be nil (tests that never

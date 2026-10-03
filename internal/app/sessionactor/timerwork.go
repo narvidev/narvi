@@ -85,6 +85,9 @@ const (
 //     ReviewRetriggerHoldBackstop with the pushed head kept as its target,
 //     and every turn end moves a held one -- never a push's quiet window
 //     -- to now in that end's own transaction (technical plan §24.9).
+//     The dispatch that ends a queued automatic attempt context_moved also
+//     arms it due at once, when none is armed, with the live head pending
+//     (reviewcontextcheck.go): the same kind of work, asked again.
 //     Otherwise it declines and deletes itself.
 //     TimerCountsAsScheduledWork narrows it by the opt-in and the budget,
 //     which the status reads in its snapshot.
@@ -95,7 +98,9 @@ const (
 //     a person's stop, a personal-link refusal, which escalates a
 //     workflow run and queues nothing -- ends, only a turn already
 //     pending, or re-sends one already in flight: turns the same snapshot
-//     already reads as queued or running. It inserts no turn, and from a
+//     already reads as queued or running. A queued automatic attempt
+//     whose context moved is ended too, and its re-request is the
+//     debounce's (above). It inserts no turn, and from a
 //     settled snapshot it finds nothing to do. Every evaluation deletes
 //     it, so after a trigger that succeeded it is gone within that
 //     evaluation.

@@ -105,6 +105,46 @@ func TestDeriveStatus(t *testing.T) {
 			in:   []turn.Summary{{Status: turn.StateCompleted}},
 			want: session.DerivedStatus{Status: session.StatusCompleted},
 		},
+		// Technical plan §24.9: a turn that ended context_moved never ran,
+		// so it is no outcome of the session's.
+		{
+			name: "completed, then a last turn ignored -> completed",
+			in: []turn.Summary{
+				{Status: turn.StateCompleted},
+				{Status: turn.StateFailed, FailureReason: turn.FailureReasonNeverStarted, Ignored: true},
+			},
+			want: session.DerivedStatus{Status: session.StatusCompleted},
+		},
+		{
+			name: "cancelled, then a last turn ignored -> cancelled",
+			in: []turn.Summary{
+				{Status: turn.StateCancelled, FailureReason: turn.FailureReasonCancelled},
+				{Status: turn.StateFailed, FailureReason: turn.FailureReasonNeverStarted, Ignored: true},
+			},
+			want: session.DerivedStatus{Status: session.StatusCancelled, FailureReason: session.FailureReasonCancelled},
+		},
+		{
+			name: "an ignored turn between two outcomes -> the last outcome",
+			in: []turn.Summary{
+				{Status: turn.StateCompleted},
+				{Status: turn.StateFailed, FailureReason: turn.FailureReasonNeverStarted, Ignored: true},
+				{Status: turn.StateFailed, FailureReason: turn.FailureReasonTimeout},
+			},
+			want: session.DerivedStatus{Status: session.StatusFailed, FailureReason: session.FailureReasonTimeout},
+		},
+		{
+			name: "only an ignored turn -> created",
+			in:   []turn.Summary{{Status: turn.StateFailed, FailureReason: turn.FailureReasonNeverStarted, Ignored: true}},
+			want: session.DerivedStatus{Status: session.StatusCreated},
+		},
+		{
+			name: "an ignored turn beside a pending one -> active",
+			in: []turn.Summary{
+				{Status: turn.StateFailed, FailureReason: turn.FailureReasonNeverStarted, Ignored: true},
+				{Status: turn.StatePending},
+			},
+			want: session.DerivedStatus{Status: session.StatusActive},
+		},
 	}
 
 	for _, tc := range tests {

@@ -343,12 +343,34 @@ type dispatchPlan struct {
 // plan.createdBy/plan.environmentID and mutates its own disjoint state),
 // but they are kept adjacent here since they share this exact hook point
 // for the exact same structural reason.
+//
+// Technical plan §24.9 adds a read before each evaluation, outside any
+// transaction for the same reason: preReadReviewContext compares the
+// recorded context of the turn the evaluation is about to pick -- a review
+// attempt the automatic re-review asked for that waited behind another
+// turn -- with its pull request's live one, and planDispatch applies the
+// answer (reviewcontextcheck.go). When that turn's context moved,
+// planDispatch ends it without running it and commits, and the next turn
+// is evaluated at once, with a read of its own: each such round ends a
+// pending turn, so the loop ends.
 func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
-	spawn, dispatch, deleted, err := a.planDispatch(ctx)
-	if err != nil {
-		a.backOffDispatchTimer(ctx, err, deleted)
-		return err
+	for {
+		check := a.preReadReviewContext(ctx)
+		spawn, dispatch, deleted, repick, err := a.planDispatch(ctx, check)
+		if err != nil {
+			a.backOffDispatchTimer(ctx, err, deleted)
+			return err
+		}
+		if !repick {
+			return a.executePlans(ctx, spawn, dispatch, deleted)
+		}
 	}
+}
+
+// executePlans performs what one committed evaluation decided, outside any
+// transaction (handleEnsureDispatched): the provider call of a spawn,
+// restore or resume, or the send of a dispatch.
+func (a *Actor) executePlans(ctx context.Context, spawn *spawnPlan, dispatch *dispatchPlan, deleted sqlcgen.DeleteSessionDispatchTimerRow) error {
 	switch {
 	case spawn != nil && spawn.resume:
 		return a.executeResume(ctx, spawn)
@@ -434,13 +456,22 @@ func (a *Actor) backOffDispatchTimer(ctx context.Context, cause error, deleted s
 // handleEnsureDispatched backs off only the row this evaluation read, and
 // a prompt that is then never delivered carries that row's first arm on
 // (executeDispatch).
-func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, sqlcgen.DeleteSessionDispatchTimerRow, error) {
+//
+// check is the context check's pre-read for the turn this evaluation is
+// about to pick (technical plan §24.9, preReadReviewContext), nil when it
+// read none. A turn the check applies to is dispatched only on an answer
+// for that very turn (applyReviewContextCheck); repick is true when that
+// answer ended it context_moved, in this transaction, which then commits,
+// and the caller evaluates the next turn at once.
+func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*spawnPlan, *dispatchPlan, sqlcgen.DeleteSessionDispatchTimerRow, bool, error) {
 	var spawn *spawnPlan
 	var dispatch *dispatchPlan
 	var deleted sqlcgen.DeleteSessionDispatchTimerRow
+	var repick bool
 
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		now := time.Now()
+		repick = false
 
 		// The durable dispatch trigger (technical plan §2, §3.3): the
 		// transaction that created a turn armed the dispatch timer, and
@@ -598,6 +629,27 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, sq
 					"turn_id", pendingID.String(), "gen", sandboxRow.Gen)
 				return nil
 			}
+			// Technical plan §24.9: a review attempt the automatic
+			// re-review asked for, about to start after waiting behind
+			// another turn, starts only on a context still its pull
+			// request's (reviewcontextcheck.go). Applied here, where the
+			// turn is about to be sent: a sandbox still starting takes
+			// nothing yet, and the check runs once it is up.
+			target, ok := findTurnByID(turns, pendingID)
+			if !ok {
+				return fmt.Errorf("sessionactor: dispatch turn: turn %s not found among loaded turns", pendingID.String())
+			}
+			decision, err := a.applyReviewContextCheck(ctx, tx, turns, target, check, now)
+			if err != nil {
+				return err
+			}
+			switch decision {
+			case reviewContextHold:
+				return nil
+			case reviewContextEnded:
+				repick = true
+				return nil
+			}
 			d, err := a.tryPlanDispatch(ctx, tx, sessionRow, sandboxRow, pendingID, turns, now)
 			if err != nil {
 				return err
@@ -624,7 +676,7 @@ func (a *Actor) planDispatch(ctx context.Context) (*spawnPlan, *dispatchPlan, sq
 		return nil
 	})
 
-	return spawn, dispatch, deleted, err
+	return spawn, dispatch, deleted, repick, err
 }
 
 // planReenqueueOrRespawn implements §3.3's ("turn recovery", §9.3

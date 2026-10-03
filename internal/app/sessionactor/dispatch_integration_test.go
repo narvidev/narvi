@@ -944,7 +944,7 @@ func TestExecuteSpawn_StaleEpochOnRecord_PropagatesErrStaleEpoch(t *testing.T) {
 	// TestActorTransact_StaleEpochEvictsSelf's own precedent of testing
 	// transact's fencing behavior directly rather than only through the
 	// mailbox.
-	spawn, dispatch, _, err := a.planDispatch(ctx)
+	spawn, dispatch, _, _, err := a.planDispatch(ctx, nil)
 	if err != nil {
 		t.Fatalf("planDispatch: %v", err)
 	}

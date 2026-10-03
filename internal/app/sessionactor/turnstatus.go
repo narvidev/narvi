@@ -40,6 +40,9 @@ import (
 //     or planDispatch's gate;
 //   - refusePersonalLinkOnly (credentialgate.go): a model only a personal
 //     provider link could run;
+//   - endContextMovedTurn (reviewcontextcheck.go): a queued automatic
+//     review attempt whose pull request moved past the context it
+//     recorded, ended context_moved without running;
 //   - and three that end nothing: tryPlanDispatch's two (pending to
 //     dispatched to processing) and tryPlanReenqueue's re-stamp, which
 //     passes the status back unchanged.

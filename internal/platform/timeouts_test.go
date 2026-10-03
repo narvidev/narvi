@@ -2978,6 +2978,47 @@ func TestValidate_PromptResendMaxPerTurn(t *testing.T) {
 	}
 }
 
+// TestValidate_ReviewContextMoveMaxConsecutive pins how many automatic
+// review attempts of one pull request in a row may meet a moved context
+// before the automatic re-review gives up (technical plan §24.9): the
+// shipped 3, refused below one -- zero would drop every request at its
+// first move -- and accepted at one.
+func TestValidate_ReviewContextMoveMaxConsecutive(t *testing.T) {
+	t.Parallel()
+
+	if got := platform.DefaultTimeouts().ReviewContextMoveMaxConsecutive; got != 3 {
+		t.Fatalf("DefaultTimeouts().ReviewContextMoveMaxConsecutive = %d, want 3", got)
+	}
+	for _, tc := range []struct {
+		name    string
+		value   int
+		refused bool
+	}{
+		{name: "zero", value: 0, refused: true},
+		{name: "negative", value: -1, refused: true},
+		{name: "one", value: 1},
+		{name: "the shipped three", value: 3},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			to.ReviewContextMoveMaxConsecutive = tc.value
+			err := to.Validate()
+			if !tc.refused {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			var cnt *platform.CountMustBePositiveError
+			if !errors.As(err, &cnt) || cnt.Field != "ReviewContextMoveMaxConsecutive" {
+				t.Fatalf("Validate() = %v, want ReviewContextMoveMaxConsecutive refused as below one", err)
+			}
+		})
+	}
+}
+
 // TestValidate_ReviewRetriggerHoldBackstop pins how far ahead the re-review
 // debounce re-arms itself while it holds (technical plan §24.9): the
 // shipped ten minutes, and each link -- above the claim window, above the

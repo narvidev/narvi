@@ -84,6 +84,14 @@
 // review through this debounce -- setting the pending head and arming the
 // timer -- is held the same way. A person's trigger (the label, the
 // button, a mention) inserts its turn directly and is never held.
+//
+// Every attempt this lane inserts is marked request_trigger 'auto'
+// (insertAutoRetriggerTurn). One that nonetheless waited behind another
+// turn -- inserted by a replica without the hold, or before it shipped --
+// checks its context as it is dispatched (reviewcontextcheck.go); one
+// whose pull request moved ends context_moved without running and asks
+// this lane again: its head pending once more, the debounce due at once,
+// a bounded number of times in a row.
 
 package sessionactor
 
@@ -109,6 +117,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -956,6 +965,7 @@ func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision
 	if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
 		correlationID = &id
 	}
+	requestTrigger := turn.RequestTriggerAuto
 	created, err := a.stores.turn.WithTx(tx).CreateAndArmDispatch(ctx, sqlcgen.CreateTurnParams{
 		SessionID:               a.sessionID,
 		Status:                  sqlcgen.TurnStatusPending,
@@ -974,6 +984,11 @@ func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision
 		// review attempt.
 		IsReviewAttempt: true,
 		CorrelationID:   correlationID,
+		// RequestTrigger (technical plan §24.9): this lane's own mark, so a
+		// dispatch that finds the attempt waited behind another turn checks
+		// its context first (reviewcontextcheck.go), and one whose context
+		// moved asks this lane again.
+		RequestTrigger: &requestTrigger,
 	})
 	if err != nil {
 		return fmt.Errorf("sessionactor: insert automatic re-review turn: %w", err)

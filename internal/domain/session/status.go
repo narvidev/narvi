@@ -51,9 +51,12 @@ type DerivedStatus struct {
 
 // DeriveStatus derives a session's Status + FailureReason from an ordered
 // (oldest-first) slice of that session's turn.Summary (§3.1: "pending work
-// → active; else terminal per last turn outcome"):
+// → active; else terminal per last turn outcome"), after dropping every
+// summary marked Ignored -- a turn that ended without being an attempt at
+// all (turn.EndReasonContextMoved, technical plan §24.9), which is no
+// outcome of the session's and must never make it read failed:
 //
-//   - Zero turns: Created.
+//   - Zero turns (or none but ignored ones): Created.
 //   - Any turn still non-terminal (Pending/Dispatched/Processing): Active,
 //     no failure reason — regardless of any OTHER turn's outcome.
 //   - All turns terminal: derived from the LAST (most recent, i.e. final
@@ -61,7 +64,13 @@ type DerivedStatus struct {
 //     Failed/Cancelled → Failed/Cancelled respectively, with FailureReason
 //     copied verbatim from that turn's Summary (itself produced by
 //     turn.DeriveFailureReason) — this function does not re-derive it.
-func DeriveStatus(turns []turn.Summary) DerivedStatus {
+func DeriveStatus(all []turn.Summary) DerivedStatus {
+	turns := make([]turn.Summary, 0, len(all))
+	for _, t := range all {
+		if !t.Ignored {
+			turns = append(turns, t)
+		}
+	}
 	if len(turns) == 0 {
 		return DerivedStatus{Status: StatusCreated}
 	}

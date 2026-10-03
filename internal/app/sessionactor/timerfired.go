@@ -867,25 +867,39 @@ func summariesWithOverride(turns []sqlcgen.Turn, overrideID pgtype.UUID, overrid
 // failed row's reason is not in the row, so it stays empty, exactly as
 // before. Since a person's stop can cancel queued turns before an older
 // one ends (stop.go), the last turn of a session can be one cancelled
-// earlier, and its reason must not be lost when the older one ends.
+// earlier, and its reason must not be lost when the older one ends. A
+// turn with an end reason of its own -- one ended context_moved never ran
+// (technical plan §24.9) -- is marked Ignored, so DeriveStatus reads the
+// session as if it were not there.
+//
+// A stated limit: when the turn DeriveStatus then reads last is a failed
+// one stored earlier, its reason is not in its row, and the session reads
+// failed with no reason recorded. That arises only when an ignored turn is
+// the newest, and the turn before it failed: the reason an earlier
+// derivation wrote was replaced by active while the ignored turn waited.
 func storedTurnSummary(t sqlcgen.Turn) turn.Summary {
 	state := turn.State(t.Status)
 	reason, _ := turn.ImpliedFailureReason(state)
-	return turn.Summary{Status: state, FailureReason: reason}
+	return turn.Summary{Status: state, FailureReason: reason, Ignored: turn.IgnoredForEndReason(t.EndReason)}
 }
 
 // summariesForRederive builds the []turn.Summary domain/session.
 // DeriveStatus needs from stored turn rows, for a re-derivation NOT
 // accompanied by a turn status change of this call's own (see
 // rederiveSessionStatusUnchanged's doc for why currentFailureReason,
-// applied only to the last entry, is the correct source of truth here).
+// applied only to the last entry DeriveStatus reads, is the correct source
+// of truth here). A turn with an end reason is Ignored (storedTurnSummary),
+// so the reason goes to the last turn that is not.
 func summariesForRederive(turns []sqlcgen.Turn, currentFailureReason turn.FailureReason) []turn.Summary {
 	out := make([]turn.Summary, len(turns))
 	for i, t := range turns {
-		out[i] = turn.Summary{Status: turn.State(t.Status)}
+		out[i] = turn.Summary{Status: turn.State(t.Status), Ignored: turn.IgnoredForEndReason(t.EndReason)}
 	}
-	if n := len(out); n > 0 {
-		out[n-1].FailureReason = currentFailureReason
+	for i := len(out) - 1; i >= 0; i-- {
+		if !out[i].Ignored {
+			out[i].FailureReason = currentFailureReason
+			break
+		}
 	}
 	return out
 }

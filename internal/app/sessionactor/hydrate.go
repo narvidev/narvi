@@ -127,6 +127,8 @@ func (r *Registry) hydrateAndAcquire(ctx context.Context, sessionID pgtype.UUID)
 		openCodeRuntimeVersion: r.openCodeRuntimeVersion,
 		diffFetcher:            r.diffFetcher,
 		reviewDiffFetcher:      r.reviewDiffFetcher,
+		reviewLiveReader:       r.reviewLiveReader,
+		spawnSource:            sessionRow.SpawnSource,
 		knowledgeRanker:        r.knowledgeRanker,
 		githubOutbound:         r.githubOutbound,
 		githubBotHandle:        r.githubBotHandle,
