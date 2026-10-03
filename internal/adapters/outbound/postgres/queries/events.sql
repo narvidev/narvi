@@ -311,10 +311,16 @@ LIMIT 1;
 -- plan's final text through it, to report a cut plan (technical plan §16,
 -- §6.1), and so does every other reader of a turn's text
 -- (sessionactor.ReadWindowFinal: the approval and its snapshot, the plan
--- views' fallback, the session result's summary, the plan notices): a
--- range bounded by the turn, of which only the token rows are returned.
--- Capped by row_limit, newest first, like every other bounded read of the
--- log.
+-- views' fallback, the session result's summary, the plan notices). It
+-- returns only the window's token rows, capped by row_limit, newest first,
+-- like every other bounded read of the log -- but what it reads to find them
+-- is not bounded by the turn (TestEventStore_ListTokenFramesInWindow_
+-- ReadsTheTurnsWindow): a generic plan walks events_token_part_idx over every
+-- token frame of the session, whose id, behind the part id, is no seek key,
+-- about one buffer for 70 frames, and a custom plan reads events_pkey
+-- across the window, its other rows included, about one buffer for 30. An
+-- index of a session's token frames by id would bound it to the window; it
+-- needs a migration.
 SELECT * FROM events
 WHERE session_id = sqlc.arg(session_id)
   AND type = 'token'

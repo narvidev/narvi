@@ -247,11 +247,22 @@ func ReadPlanFinal(ctx context.Context, turns *postgres.TurnStore, events *postg
 // sessionID's log is (lower, upper] -- TurnContentBounds' bounds, upper nil
 // for the session's most recently dispatched turn -- as plandomain.FinalText
 // reads it, with the cut it reports: the window's `token` frames, newest
-// first, up to planContentEventFetchLimit (EventStore.ListTokenFramesInWindow,
-// a range of events_session_id_id_idx bounded by the turn, of which only
-// the token rows are read). A nil lower reads from the log's start, as
-// FinalText reads a nil lower bound. found is false when the window holds
-// no text.
+// first, up to planContentEventFetchLimit (EventStore.ListTokenFramesInWindow).
+// A nil lower reads from the log's start, as FinalText reads a nil lower
+// bound. found is false when the window holds no text.
+//
+// It returns the window's frames and no others, but what it reads to find
+// them is not bounded by the turn, as
+// TestEventStore_ListTokenFramesInWindow_ReadsTheTurnsWindow measured
+// (postgres): under the generic plan pgx's statement cache lets Postgres
+// settle on, it walks events_token_part_idx over every `token` frame the
+// session holds -- the window's id is no seek key behind the part id --
+// about one buffer for 70 frames; under a custom plan it reads events_pkey
+// across the window, passing over its tool events too, about one buffer for
+// 30 rows. Either way it reads no payload but the window's frames, where
+// the newest-2000-events read it replaced read every tool payload in the
+// tail. An index of a session's `token` frames by id would hold the read to
+// the window; that needs a migration, not taken here.
 //
 // Every reader of a turn's text reads it here -- the approval and its
 // snapshot, the decision inbox, the plan views' fallback, the session
