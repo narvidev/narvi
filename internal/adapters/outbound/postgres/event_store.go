@@ -165,11 +165,12 @@ type EventPage struct {
 // event (only a deleted session takes its events with it, and then the
 // page is simply shorter), so the events the walk measured are the events
 // read by their ids. Each lookup of the walk starts at the cursor on
-// events_session_id_id_idx and reads a few buffers, and the read takes
-// exact ids, under a custom plan and the generic plan a cached statement
-// settles on alike (TestEventPage_WalkIsPositionedOnTheSessionIndex):
-// neither reads another session's events, nor the session's own before
-// the cursor.
+// events_session_id_id_idx and reads a few buffers, and the read looks up
+// exact ids on events_pkey, under a custom plan and the generic plan a
+// cached statement settles on alike, however many events a session the
+// planner expects (TestEventPage_WalkIsPositionedOnTheSessionIndex):
+// neither reads the session's events before the cursor, and the walk reads
+// at most one entry of another session, where the session's events end.
 func (s *EventStore) ListPageForSession(ctx context.Context, sessionID pgtype.UUID, afterID int64, maxRows int32, maxBytes int64) (EventPage, error) {
 	if maxRows <= 0 {
 		return EventPage{}, nil

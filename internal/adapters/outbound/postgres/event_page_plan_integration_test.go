@@ -16,7 +16,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
-	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -81,37 +80,43 @@ const (
 // however deep the cursor, under a custom plan and under the generic plan
 // pgx's statement cache lets Postgres settle on from a statement's sixth
 // run; and the read of the page's events by their ids must read a few
-// buffers an id. Shapes that each passed an index-name check read far
+// buffers an id and filter out a few rows at most -- with session_id tested
+// beside id = ANY, a custom plan for a session that grew after the table
+// was last analyzed read every event of the session by session_id and
+// filtered on the ids. Walks that each passed an index-name check read far
 // more: a plain `id > $2` scanned events_pkey from the cursor across every
 // session under a generic plan; a plain `session_id = $1` beside the row
 // comparisons became the index scan's start key, so every lookup read the
-// session from its first event to the cursor, and paging a long session
-// was quadratic; and ORDER BY id alone, with no equality on session_id,
-// does not match the index's order, so a lookup sorts the rest of the
-// session or scans events_pkey from the table's first id.
+// session from its first event to the cursor, and paging a long session was
+// quadratic; ORDER BY id alone, with no equality on session_id, does not
+// match the index's order, so a lookup scanned events_pkey from the table's
+// first id; and an upper row comparison beside the lower one, the two
+// holding the lookup to the session, reduced to a range of session_id
+// alone, which, where the planner expects few events a session, it read
+// through events_session_id_message_id_idx from the session's first event,
+// sorting each session's events by id and filtering on the cursor.
 //
-// It reads two logs, since the planner's choice turns on how many
-// sessions it sees: few sessions sharing many events, interleaved, and
-// many sessions beside one long one; each followed by a new session of
-// 300 events. In each it reads the long session from its middle and the
-// new session from its start, with EXPLAIN (ANALYZE, BUFFERS) under
-// plan_cache_mode = force_custom_plan and force_generic_plan, and compares
-// the page's time with the plain read it replaced (ListForSession) on the
-// same events.
+// The planner's choice turns on how many events a session it expects, so
+// it reads four logs: few sessions sharing many events, interleaved; many
+// sessions beside one long one; many sessions of a few events each, which
+// is where a generic plan expects few; and a long session stored after
+// the table was analyzed, which a custom plan expects few events of. Each
+// also holds a new session of 300 events. In each it reads the long
+// session from its middle and the new session from its start, with
+// EXPLAIN (ANALYZE, BUFFERS) under plan_cache_mode = force_custom_plan and
+// force_generic_plan, and compares the page's time with the plain read it
+// replaced (ListForSession) on the same events.
 func TestEventPage_WalkIsPositionedOnTheSessionIndex(t *testing.T) {
-	for _, log := range []struct {
-		name string
-		// others sessions share total events with the long session, which
-		// takes every longEvery-th.
-		others, total, longEvery int
-	}{
-		{name: "two sessions share 200,000 events", others: 1, total: 200_000, longEvery: 2},
-		{name: "200 sessions beside one of 50,000 events", others: 200, total: 150_000, longEvery: 3},
+	for _, log := range []pageWalkLog{
+		{name: "two sessions share 200,000 events", others: 1, otherEvents: 100_000, long: 100_000},
+		{name: "200 sessions beside one of 50,000 events", others: 200, otherEvents: 100_000, long: 50_000},
+		{name: "5,000 sessions of 8 events beside one of 20,000", others: 5_000, otherEvents: 40_000, long: 20_000},
+		{name: "4,000 sessions of 25 events, and one of 8,000 stored after ANALYZE", others: 4_000, otherEvents: 100_000, long: 8_000, longAfterAnalyze: true},
 	} {
 		t.Run(log.name, func(t *testing.T) {
 			ctx := context.Background()
 			pool := pagePlanDatabase(ctx, t)
-			long, middle, fresh := storePageWalkLog(ctx, t, pool, log.others, log.total, log.longEvery)
+			long, middle, fresh := storePageWalkLog(ctx, t, pool, log)
 			events := narvipg.NewEventStore(pool)
 
 			for _, read := range []struct {
@@ -166,47 +171,85 @@ func TestEventPage_WalkIsPositionedOnTheSessionIndex(t *testing.T) {
 	}
 }
 
-// storePageWalkLog stores total events across a long session and others
-// other sessions, interleaved -- the long session takes every
-// longEvery-th, the others the rest in turn -- then a new session's 300
-// events, and analyzes the table. It returns the long session, the id of
-// its event at the middle, and the new session.
-func storePageWalkLog(ctx context.Context, t *testing.T, pool *pgxpool.Pool, others, total, longEvery int) (long pgtype.UUID, middle int64, fresh pgtype.UUID) {
+// pageWalkLog is a log TestEventPage_WalkIsPositionedOnTheSessionIndex
+// reads: others sessions holding otherEvents events between them, in turn,
+// and one long session of long events -- interleaved with theirs, taking
+// every few, or, when longAfterAnalyze, stored after the table was
+// analyzed, so its statistics know nothing of it.
+type pageWalkLog struct {
+	name                      string
+	others, otherEvents, long int
+	longAfterAnalyze          bool
+}
+
+// storePageWalkLog stores log, and a new session's 300 events, and
+// analyzes the table -- before the long session's events when
+// log.longAfterAnalyze. It returns the long session, the id of its event at
+// the middle, and the new session.
+func storePageWalkLog(ctx context.Context, t *testing.T, pool *pgxpool.Pool, log pageWalkLog) (long pgtype.UUID, middle int64, fresh pgtype.UUID) {
 	t.Helper()
-	sessions := narvipg.NewSessionStore(pool)
-	create := func() pgtype.UUID {
-		created, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceWeb})
-		if err != nil {
-			t.Fatalf("create session: %v", err)
+	var sessionIDs []string
+	if err := pool.QueryRow(ctx, `
+		WITH s AS (
+			INSERT INTO sessions (spawn_source, repos, spawn_depth)
+			SELECT 'web', '[]'::jsonb, 0 FROM generate_series(1, $1::int)
+			RETURNING id
+		)
+		SELECT array_agg(id::text) FROM s`, log.others+2).Scan(&sessionIDs); err != nil {
+		t.Fatalf("create sessions: %v", err)
+	}
+	if err := long.Scan(sessionIDs[0]); err != nil {
+		t.Fatalf("read the long session's id: %v", err)
+	}
+	if err := fresh.Scan(sessionIDs[1]); err != nil {
+		t.Fatalf("read the new session's id: %v", err)
+	}
+	others := sessionIDs[2:]
+
+	storeLong := func() {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO events (session_id, type, message_id, payload)
+			SELECT $1, 'warning', 'long-' || g, '{"type":"warning","message":"long"}'::jsonb
+			FROM generate_series(1, $2::int) g`, long, log.long); err != nil {
+			t.Fatalf("store the long session's events: %v", err)
 		}
-		return created.ID
 	}
-	long = create()
-	otherIDs := make([]string, others)
-	for i := range otherIDs {
-		otherIDs[i] = create().String()
+	if log.longAfterAnalyze {
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO events (session_id, type, message_id, payload)
+			SELECT ($1::uuid[])[1 + g % cardinality($1::uuid[])], 'warning', 'log-' || g, '{"type":"warning","message":"log"}'::jsonb
+			FROM generate_series(1, $2::int) g`, others, log.otherEvents); err != nil {
+			t.Fatalf("store the log: %v", err)
+		}
+	} else {
+		total := log.otherEvents + log.long
+		if total%log.long != 0 {
+			t.Fatalf("%d events do not interleave %d of the long session evenly", total, log.long)
+		}
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO events (session_id, type, message_id, payload)
+			SELECT CASE WHEN g % $3::int = 0 THEN $2::uuid ELSE ($1::uuid[])[1 + g % cardinality($1::uuid[])] END,
+			       'warning', 'log-' || g, '{"type":"warning","message":"log"}'::jsonb
+			FROM generate_series(1, $4::int) g`, others, long, total/log.long, total); err != nil {
+			t.Fatalf("store the log: %v", err)
+		}
 	}
-	if _, err := pool.Exec(ctx, `
-		INSERT INTO events (session_id, type, message_id, payload)
-		SELECT CASE WHEN g % $3 = 0 THEN $2::uuid ELSE ($1::uuid[])[1 + g % cardinality($1::uuid[])] END,
-		       'warning', 'log-' || g, '{"type":"warning","message":"log"}'::jsonb
-		FROM generate_series(1, $4::int) g`, otherIDs, long, longEvery, total); err != nil {
-		t.Fatalf("store the log: %v", err)
-	}
-	fresh = create()
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO events (session_id, type, message_id, payload)
 		SELECT $1, 'warning', 'fresh-' || g, '{"type":"warning","message":"fresh"}'::jsonb
 		FROM generate_series(1, 300) g`, fresh); err != nil {
 		t.Fatalf("store the new session's events: %v", err)
 	}
-	if err := pool.QueryRow(ctx,
-		`SELECT id FROM events WHERE session_id = $1 ORDER BY id OFFSET $2 LIMIT 1`,
-		long, total/longEvery/2).Scan(&middle); err != nil {
-		t.Fatalf("find the long session's middle: %v", err)
-	}
 	if _, err := pool.Exec(ctx, `ANALYZE events`); err != nil {
 		t.Fatalf("analyze events: %v", err)
+	}
+	if log.longAfterAnalyze {
+		storeLong()
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM events WHERE session_id = $1 ORDER BY id OFFSET $2 LIMIT 1`,
+		long, log.long/2).Scan(&middle); err != nil {
+		t.Fatalf("find the long session's middle: %v", err)
 	}
 	return long, middle, fresh
 }
