@@ -72,6 +72,10 @@ func (c *Cut) valid(text string) bool {
 // same text (the same Total) that kept strictly more, starting with what a
 // kept.
 //
+// The kept bytes are compared raw, never decoded: a Kept that falls inside
+// a character is compared byte for byte like any other -- a's own text
+// still holds that whole character -- as the web twin (tokenCut.ts) does.
+//
 // A whole frame never yields, and neither does a malformed cut, nor any
 // frame to a malformed cut. An earlier, shorter frame that shares the kept
 // prefix but is not Total bytes long -- an earlier cumulative frame of a

@@ -868,3 +868,60 @@ func TestApprovePlan_ReadsTheCutFromTheFrameNeverTheText(t *testing.T) {
 		})
 	}
 }
+
+// TestApprovePlan_LaterTurnsFramesStayOutOfThePlan pins the upper bound of
+// the window the approval reads a plan's text in (sessionactor.
+// ReadPlanFinal, ending at the next dispatched turn): a request for changes
+// that failed without producing a plan leaves v1 awaiting approval behind a
+// later dispatched turn whose frames are in the log. Approving v1 reads v1's
+// own text -- for the cut gate and for the snapshot -- never the later
+// turn's, whole or cut.
+func TestApprovePlan_LaterTurnsFramesStayOutOfThePlan(t *testing.T) {
+	const v1Text = "The plan v1 proposed.\n\n" + cutPlanBlock
+	tests := []struct {
+		name      string
+		laterText string
+		laterCut  any
+	}{
+		{name: "the later turn's text is whole", laterText: "The failed revision's own partial text."},
+		{name: "the later turn's text is cut", laterText: "The failed" + cutMarker(10, 40960), laterCut: map[string]int{"kept": 10, "total": 40960}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			rig := newTestRig(t)
+			ctx := context.Background()
+			owner, token := rig.createAuthenticatedUser(ctx, t)
+			session := createSessionForUser(ctx, t, rig, owner.ID, nil)
+			plan := seedDispatchedPlan(ctx, t, rig, session.ID, 1, func() {
+				seedCutTokenFrame(ctx, t, rig, session.ID, "prt_v1", "prt_v1", v1Text, nil)
+			})
+
+			revision, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+			if err != nil {
+				t.Fatalf("create the revision turn: %v", err)
+			}
+			dispatchTurn(ctx, t, rig, session.ID, revision.ID)
+			seedCutTokenFrame(ctx, t, rig, session.ID, "prt_v2", "prt_v2", "", nil)
+			seedCutTokenFrame(ctx, t, rig, session.ID, "prt_v2#2", "prt_v2", tt.laterText, tt.laterCut)
+			if _, err := rig.pool.Exec(ctx, `UPDATE turns SET status = 'failed' WHERE id = $1`, revision.ID); err != nil {
+				t.Fatalf("fail the revision turn: %v", err)
+			}
+
+			var got planActionResponseForTest
+			if status := rig.doJSON(t, http.MethodPost,
+				"/api/sessions/"+session.ID.String()+"/plans/"+plan.ID.String()+"/approve", []byte{}, &got, token); status != http.StatusOK {
+				t.Fatalf("approve v1 = %d, want 200: the later turn's frames are not v1's", status)
+			}
+			doc, err := rig.planDocuments.GetByPlanID(ctx, plan.ID)
+			if err != nil {
+				t.Fatalf("GetByPlanID: %v", err)
+			}
+			if doc.Content == nil || *doc.Content != v1Text {
+				t.Errorf("snapshot content = %v, want v1's own text %q", doc.Content, v1Text)
+			}
+			if doc.StructuredSteps == nil {
+				t.Error("snapshot structured_steps is NULL, want v1's steps")
+			}
+		})
+	}
+}

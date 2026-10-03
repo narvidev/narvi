@@ -27,6 +27,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowlinear"
 	"github.com/narvidev/narvi/internal/domain/authz"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/platform"
@@ -86,12 +87,46 @@ const repoRevokedAckText = "An administrator of this deployment revoked new sess
 // the parsing side (MatchVerdict/MatchRevise) itself checks against, so the
 // instructions here can never drift out of sync with what is actually
 // accepted.
-var planAwaitingApprovalReplyText = fmt.Sprintf(
-	"A plan is awaiting your approval for this session. Reply %s to approve it, %s to reject it, or start your reply with %q to request changes.",
-	strings.Join(plandomain.ApproveKeywords, "/"),
-	strings.Join(plandomain.RejectKeywords, "/"),
-	plandomain.RevisePrefix,
-)
+//
+// cut is the awaiting plan's cut report (sessionactor.ReadPlanCut,
+// technical plan §6.1). A plan whose text was cut on its way from the
+// sandbox cannot be approved (httpapi.ErrPlanCut), and its notice offers
+// no approve keyword (planApprovalLinearText), so for one this reply
+// offers none either: it gives the reason (framecut.Reason) and points to
+// the revise prefix and the reject keywords.
+func planAwaitingApprovalReplyText(cut *framecut.Cut) string {
+	if cut != nil {
+		return fmt.Sprintf(
+			"A plan is awaiting your decision for this session. %s Start your reply with %q to request changes, or reply %s to reject it.",
+			framecut.Reason(cut),
+			plandomain.RevisePrefix,
+			strings.Join(plandomain.RejectKeywords, "/"),
+		)
+	}
+	return fmt.Sprintf(
+		"A plan is awaiting your approval for this session. Reply %s to approve it, %s to reject it, or start your reply with %q to request changes.",
+		strings.Join(plandomain.ApproveKeywords, "/"),
+		strings.Join(plandomain.RejectKeywords, "/"),
+		plandomain.RevisePrefix,
+	)
+}
+
+// awaitingPlanCut reads the cut report of planID, sessionID's awaiting
+// plan, for planAwaitingApprovalReplyText: nil for a whole plan, and when a
+// store is missing or the read fails (logged) -- the reply then reads as
+// for a whole plan, and the approval it offers is still refused for a cut
+// one.
+func (deps Deps) awaitingPlanCut(ctx context.Context, logger *slog.Logger, sessionID, planID pgtype.UUID) *framecut.Cut {
+	if deps.Plans == nil || deps.Turns == nil || deps.Events == nil {
+		return nil
+	}
+	cut, err := sessionactor.ReadPlanCut(ctx, deps.Plans, deps.Turns, deps.Events, planID)
+	if err != nil {
+		logger.Warn("linear: read awaiting plan's cut report failed; replying as for a whole plan", "error", err, "session_id", sessionID.String(), "plan_id", planID.String())
+		return nil
+	}
+	return cut
+}
 
 // emptyReviseFeedbackReplyText is the audit-remediation batch's own SECOND
 // fix-pass addition (LOW audit finding, "the honest reply reused for the
@@ -826,8 +861,13 @@ func (deps Deps) handlePrompted(ctx context.Context, payload agentSessionEventWe
 	// feedback contains).
 	emptyReviseFeedback := false
 
+	// awaitingPlanID is the session's plan awaiting approval, when there is
+	// one: a reply the awaiting-plan gate declines is answered from its cut
+	// report (planAwaitingApprovalReplyText).
+	var awaitingPlanID pgtype.UUID
 	if deps.Plans != nil {
 		if planID, hasAwaiting := deps.findAwaitingApprovalPlanID(ctx, logger, sessionID); hasAwaiting {
+			awaitingPlanID = planID
 			if verdict, ok := plandomain.MatchVerdict(payload.AgentActivity.Content.Body); ok {
 				// handlePlanVerdict's own OTHER internal failures
 				// (DecidePlan erroring, the outcome-activity post failing)
@@ -966,7 +1006,11 @@ func (deps Deps) handlePrompted(ctx context.Context, payload agentSessionEventWe
 			// failure -- mirrors the !wasCreated busy-reply branch just
 			// below for the analogous open-turn case (M6 audit fix).
 			logger.Info("linear: ordinary reply blocked by awaiting-approval plan", "session_id", sessionID.String())
-			deps.postThoughtNotice(ctx, payload.OrganizationID, payload.AgentSession.ID, planAwaitingApprovalReplyText, notice)
+			var cut *framecut.Cut
+			if awaitingPlanID.Valid {
+				cut = deps.awaitingPlanCut(ctx, logger, sessionID, awaitingPlanID)
+			}
+			deps.postThoughtNotice(ctx, payload.OrganizationID, payload.AgentSession.ID, planAwaitingApprovalReplyText(cut), notice)
 			return true
 		}
 		logger.Error("linear: create turn failed", "status", cerr.Status, "message", cerr.Message, "session_id", sessionID.String())

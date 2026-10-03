@@ -4689,7 +4689,8 @@ func TestBuild_NotContested_WhenEngineWouldNotHaveApprovedAnyway(t *testing.T) {
 // from the plan's own turn window as the approval reads it: a plan whose
 // final text is a frame the sandbox-agent cut reports that cut; a plan
 // stored whole and then cut (a replay through a connection that read less)
-// reads whole and reports none; a whole plan reports none; and a Deps with
+// reads whole and reports none; a whole plan reports none, also when a
+// later turn's cut text lies past its window; and a Deps with
 // no Turns or Events store reports none for any of them, still listing
 // every plan. The frames are injected straight into `events`, since nothing
 // produces a cut yet.
@@ -4715,7 +4716,12 @@ func TestBuildPlanItems_CutPlan_CarriesTheCut(t *testing.T) {
 		key, text string
 		cut       *framecut.Cut
 	}
-	seedPlan := func(title string, frames []frame) pgtype.UUID {
+	// seedPlan creates a session whose plan turn holds frames, and an
+	// awaiting plan atop it. laterFrames, when set, belong to a later turn
+	// dispatched after the plan's, which failed without producing a plan --
+	// a request for changes that went nowhere -- so the plan stays awaiting
+	// with frames past its window.
+	seedPlan := func(title string, frames, laterFrames []frame) pgtype.UUID {
 		t.Helper()
 		session, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{Title: strPtr(title), SpawnSource: sqlcgen.SessionSpawnSourceWeb, CreatedBy: actor.ID})
 		if err != nil {
@@ -4749,21 +4755,54 @@ func TestBuildPlanItems_CutPlan_CarriesTheCut(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create plan: %v", err)
 		}
+		if len(laterFrames) > 0 {
+			laterWatermark, err := events.MaxEventIDForSession(ctx, session.ID)
+			if err != nil {
+				t.Fatalf("watermark: %v", err)
+			}
+			later, err := turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusFailed, PlanMode: true})
+			if err != nil {
+				t.Fatalf("create later turn: %v", err)
+			}
+			if _, err := turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{ID: later.ID, Status: sqlcgen.TurnStatusFailed, DispatchedEventID: &laterWatermark}); err != nil {
+				t.Fatalf("place the later turn's window: %v", err)
+			}
+			for _, f := range laterFrames {
+				payload := map[string]any{"type": "token", "messageId": "prt_later", "sessionId": session.ID.String(), "gen": 1, "text": f.text}
+				if f.cut != nil {
+					payload["cut"] = f.cut
+				}
+				raw, err := json.Marshal(payload)
+				if err != nil {
+					t.Fatalf("marshal token frame: %v", err)
+				}
+				if _, err := events.Create(ctx, sqlcgen.CreateEventParams{SessionID: session.ID, Type: "token", MessageID: f.key, Payload: raw}); err != nil {
+					t.Fatalf("store later token frame: %v", err)
+				}
+			}
+		}
 		return plan.ID
 	}
 
 	cutPlan := seedPlan("a cut plan", []frame{
 		{key: "prt_plan", text: ""},
 		{key: "prt_plan#cut", text: "1. Add the migration\n[text cut at 20 of 40960 bytes on its way from the sandbox]", cut: &cut},
-	})
+	}, nil)
 	wholeThenCutPlan := seedPlan("a plan stored whole, then cut", []frame{
 		{key: "prt_plan", text: ""},
 		{key: "prt_plan#whole", text: whole},
 		{key: "prt_plan#cut", text: "1. Add the\n[text cut at 10 of 39 bytes on its way from the sandbox]", cut: &wholeCut},
-	})
+	}, nil)
 	wholePlan := seedPlan("a whole plan", []frame{
 		{key: "prt_plan", text: ""},
 		{key: "prt_plan#whole", text: whole},
+	}, nil)
+	wholePlanLaterCut := seedPlan("a whole plan behind a later turn's cut text", []frame{
+		{key: "prt_plan", text: ""},
+		{key: "prt_plan#whole", text: whole},
+	}, []frame{
+		{key: "prt_later", text: ""},
+		{key: "prt_later#cut", text: "1. Add the migration\n[text cut at 20 of 40960 bytes on its way from the sandbox]", cut: &cut},
 	})
 	if len(whole) != 39 {
 		t.Fatalf("fixture: the whole text is %d bytes, the cut of it says 39", len(whole))
@@ -4791,12 +4830,12 @@ func TestBuildPlanItems_CutPlan_CarriesTheCut(t *testing.T) {
 		{
 			name: "with the turn and event stores",
 			deps: withStores,
-			want: map[string]*framecut.Cut{cutPlan.String(): &cut, wholeThenCutPlan.String(): nil, wholePlan.String(): nil},
+			want: map[string]*framecut.Cut{cutPlan.String(): &cut, wholeThenCutPlan.String(): nil, wholePlan.String(): nil, wholePlanLaterCut.String(): nil},
 		},
 		{
 			name: "without them: every plan listed, no cut reported",
 			deps: baseDeps,
-			want: map[string]*framecut.Cut{cutPlan.String(): nil, wholeThenCutPlan.String(): nil, wholePlan.String(): nil},
+			want: map[string]*framecut.Cut{cutPlan.String(): nil, wholeThenCutPlan.String(): nil, wholePlan.String(): nil, wholePlanLaterCut.String(): nil},
 		},
 	}
 	for _, tt := range tests {

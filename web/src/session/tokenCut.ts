@@ -20,8 +20,11 @@
 //
 // Sizes are UTF-8 bytes of the unescaped text, as the Go side counts them:
 // every comparison here is on `new TextEncoder().encode(text)`, never on a
-// JavaScript string's UTF-16 length. Nothing is decoded back, so a `kept`
-// that is not a character boundary simply matches nothing.
+// JavaScript string's UTF-16 length. The kept bytes are compared raw, never
+// decoded back, so a `kept` that falls inside a character is compared byte
+// for byte like any other: the cut's own text still holds that whole
+// character, and it yields to a whole text of `total` bytes that starts
+// with the same bytes, exactly as framecut.YieldsTo does.
 
 /** A frame's cut, as its `cut` property records it. MALFORMED_CUT when that property was present but unreadable. */
 export interface FrameCut {

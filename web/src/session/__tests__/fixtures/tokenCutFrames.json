@@ -565,6 +565,101 @@
     ]
   },
   {
+    "name": "a kept inside a character is compared byte for byte, and yields to a whole text holding that character",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "Größe"
+      },
+      {
+        "id": 3,
+        "text": "Grö\n[text cut at 3 of 7 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 3,
+          "total": 7
+        }
+      }
+    ],
+    "want": {
+      "id": 2,
+      "cut": null
+    },
+    "stored": [
+      1,
+      2
+    ]
+  },
+  {
+    "name": "a cut whose split character was replaced yields to nothing and is read as cut",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "Größe"
+      },
+      {
+        "id": 3,
+        "text": "Gr�\n[text cut at 3 of 7 bytes on its way from the sandbox]",
+        "cut": {
+          "kept": 3,
+          "total": 7
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": 3,
+        "total": 7
+      }
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
+    "name": "a cut keeping more than its text holds never yields",
+    "frames": [
+      {
+        "id": 1,
+        "text": ""
+      },
+      {
+        "id": 2,
+        "text": "abcd\n\n"
+      },
+      {
+        "id": 3,
+        "text": "abcd",
+        "cut": {
+          "kept": 5,
+          "total": 6
+        }
+      }
+    ],
+    "want": {
+      "id": 3,
+      "cut": {
+        "kept": 5,
+        "total": 6
+      }
+    },
+    "stored": [
+      1,
+      2,
+      3
+    ]
+  },
+  {
     "name": "only an empty frame: no text",
     "frames": [
       {

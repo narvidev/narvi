@@ -27,6 +27,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowslack"
 	"github.com/narvidev/narvi/internal/domain/authz"
+	"github.com/narvidev/narvi/internal/domain/framecut"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/platform"
@@ -176,12 +177,46 @@ const (
 // MatchVerdict/MatchRevise actually accept. The Approve/Reject BUTTONS
 // (interactive.go) remain the primary, always-available affordance either
 // way -- this is an additional accepted input, not a replacement.
-var ackPlanAwaitingText = fmt.Sprintf(
-	"A plan is awaiting approval for this session — reply %s to approve it, %s to reject it, use the Approve/Reject buttons above, or start your reply with %q to request changes.",
-	strings.Join(plandomain.ApproveKeywords, "/"),
-	strings.Join(plandomain.RejectKeywords, "/"),
-	plandomain.RevisePrefix,
-)
+//
+// cut is the awaiting plan's cut report (sessionactor.ReadPlanCut,
+// technical plan §6.1). A plan whose text was cut on its way from the
+// sandbox cannot be approved (httpapi.ErrPlanCut), and its message carries
+// no Approve button (slackapi.PostPlanApprovalMessage), so for one this
+// reply names no approve keyword and no Approve button: it gives the
+// reason (framecut.Reason) and points to the revise prefix, the reject
+// keywords and the Request changes and Reject buttons.
+func ackPlanAwaitingText(cut *framecut.Cut) string {
+	if cut != nil {
+		return fmt.Sprintf(
+			"A plan is awaiting a decision for this session. %s Start your reply with %q to request changes, reply %s to reject it, or use the Request changes or Reject button above.",
+			framecut.Reason(cut),
+			plandomain.RevisePrefix,
+			strings.Join(plandomain.RejectKeywords, "/"),
+		)
+	}
+	return fmt.Sprintf(
+		"A plan is awaiting approval for this session — reply %s to approve it, %s to reject it, use the Approve/Reject buttons above, or start your reply with %q to request changes.",
+		strings.Join(plandomain.ApproveKeywords, "/"),
+		strings.Join(plandomain.RejectKeywords, "/"),
+		plandomain.RevisePrefix,
+	)
+}
+
+// awaitingPlanCut reads the cut report of planID, sessionID's awaiting
+// plan, for ackPlanAwaitingText: nil for a whole plan, and when a store is
+// missing or the read fails (logged) -- the reply then reads as for a
+// whole plan, and the approval it offers is still refused for a cut one.
+func (deps Deps) awaitingPlanCut(ctx context.Context, logger *slog.Logger, sessionID, planID pgtype.UUID) *framecut.Cut {
+	if deps.Plans == nil || deps.Turns == nil || deps.Events == nil {
+		return nil
+	}
+	cut, err := sessionactor.ReadPlanCut(ctx, deps.Plans, deps.Turns, deps.Events, planID)
+	if err != nil {
+		logger.Warn("slack: read awaiting plan's cut report failed; replying as for a whole plan", "error", err, "session_id", sessionID.String(), "plan_id", planID.String())
+		return nil
+	}
+	return cut
+}
 
 // ackEmptyReviseFeedbackText is the audit-remediation batch's own SECOND
 // fix-pass addition (LOW audit finding, "the honest reply reused for the
@@ -774,8 +809,13 @@ func handleEvent(ctx context.Context, deps Deps, logger *slog.Logger, ev slackEv
 	// dispatching a genuine plan_mode=true revision turn with nothing at
 	// all for the agent to act on.
 	emptyReviseFeedback := false
+	// awaitingPlanID is the session's plan awaiting approval, when there is
+	// one: a reply the awaiting-plan gate declines is answered from its cut
+	// report (ackPlanAwaitingText).
+	var awaitingPlanID pgtype.UUID
 	if deps.Plans != nil {
 		if planID, hasAwaiting := findAwaitingApprovalPlanID(ctx, logger, deps.Plans, res.SessionID); hasAwaiting {
+			awaitingPlanID = planID
 			if verdict, verdictOK := plandomain.MatchVerdict(prompt); verdictOK {
 				return deps.handlePlanVerdict(ctx, logger, channel, key, res.SessionID, planID, verdict, actorUserID)
 			}
@@ -904,7 +944,11 @@ func handleEvent(ctx context.Context, deps Deps, logger *slog.Logger, ev slackEv
 	case emptyReviseFeedback:
 		ackText = ackEmptyReviseFeedbackText
 	case gatedByAwaitingPlan:
-		ackText = ackPlanAwaitingText
+		var cut *framecut.Cut
+		if awaitingPlanID.Valid {
+			cut = deps.awaitingPlanCut(ctx, logger, res.SessionID, awaitingPlanID)
+		}
+		ackText = ackPlanAwaitingText(cut)
 	case res.IsNewThread:
 		ackText = ackNewSessionText
 	case !created:

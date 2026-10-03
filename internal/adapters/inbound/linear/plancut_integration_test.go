@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -131,5 +132,108 @@ func TestWebhookHandler_Prompted_ApproveCutPlan_PostsTheReason(t *testing.T) {
 	}
 	if !posted {
 		t.Errorf("no agent activity carried the reason %q; bodies: %v", reason, recordedBodies())
+	}
+}
+
+// TestWebhookHandler_Prompted_AwaitingCutPlan_NonKeywordText_OffersNoApprove
+// proves the notice posted for a reply that neither decides nor revises a
+// plan awaiting approval reads that plan's cut report (technical plan
+// §6.1): for a plan whose text was cut on its way from the sandbox, it
+// gives the reason and offers no approve keyword, since the approval would
+// be refused; for a whole plan it offers them as before. Either way the
+// reply starts nothing and decides nothing.
+func TestWebhookHandler_Prompted_AwaitingCutPlan_NonKeywordText_OffersNoApprove(t *testing.T) {
+	tests := []struct {
+		name string
+		cut  bool
+	}{
+		{name: "a cut plan", cut: true},
+		{name: "a whole plan"},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pool := newTestPool(t)
+			deps := newHandlerDeps(t, pool)
+			deps.Plans = narvipg.NewPlanStore(pool)
+			deps.Events = narvipg.NewEventStore(pool)
+			deps.PlanDocuments = narvipg.NewPlanDocumentStore(pool)
+			deps.Outbox = narvipg.NewOutboxStore(pool, false)
+			deps.Participants = narvipg.NewParticipantStore(pool)
+
+			ctx := context.Background()
+			agentSessionID := "agent-session-awaiting-cut-" + strconv.Itoa(i)
+			organizationID := "org-awaiting-cut-" + strconv.Itoa(i)
+			installLinearFixture(ctx, t, pool, organizationID, deps.TokenEncryptionKey)
+			stub, recordedBodies := newGenericLinearGraphQLStub(t)
+			deps.LinearClient = linearapi.New(stub.Client(), stub.URL)
+			deps.IdentityLink = newIdentityLinkDepsForTest(pool, deps.AuditLog)
+			replierID := "linear-awaiting-cut-" + strconv.Itoa(i)
+			linkLinearIdentityForTest(ctx, t, pool, replierID, sqlcgen.UserRoleMaintainer)
+			handler := linear.NewWebhookHandler(deps)
+
+			turns := narvipg.NewTurnStore(pool)
+			agentSessions := narvipg.NewLinearAgentSessionStore(pool)
+			session, err := narvipg.NewSessionStore(pool).Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceLinear})
+			if err != nil {
+				t.Fatalf("create linear-origin session: %v", err)
+			}
+			if _, err := agentSessions.Claim(ctx, agentSessionID, organizationID); err != nil {
+				t.Fatalf("claim agent session: %v", err)
+			}
+			if err := agentSessions.SetSessionID(ctx, agentSessionID, session.ID); err != nil {
+				t.Fatalf("attach session id: %v", err)
+			}
+			producingTurn, err := turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusCompleted, PlanMode: true})
+			if err != nil {
+				t.Fatalf("seed producing turn: %v", err)
+			}
+			var cut framecut.Cut
+			if tt.cut {
+				cut = seedCutPlanTextForLinear(ctx, t, pool, session.ID, producingTurn.ID)
+			} else {
+				if _, err := pool.Exec(ctx, `UPDATE turns SET dispatched_event_id = (SELECT COALESCE(MAX(id), 0) FROM events WHERE session_id = $1) WHERE id = $2`, session.ID, producingTurn.ID); err != nil {
+					t.Fatalf("place the plan turn's window: %v", err)
+				}
+				if _, err := pool.Exec(ctx, `INSERT INTO events (session_id, type, payload, message_id) VALUES ($1, 'token', $2, 'prt_plan')`, session.ID, []byte(`{"type":"token","messageId":"prt_plan","gen":1,"text":"1. Add the migration"}`)); err != nil {
+					t.Fatalf("store token frame: %v", err)
+				}
+			}
+			plan, err := deps.Plans.Create(ctx, sqlcgen.CreatePlanParams{SessionID: session.ID, TurnID: producingTurn.ID, Version: 1, Status: sqlcgen.PlanStatusAwaitingApproval})
+			if err != nil {
+				t.Fatalf("seed awaiting_approval plan: %v", err)
+			}
+
+			rec := postWebhook(t, handler, agentSessionPromptedPayloadWithUser(agentSessionID, organizationID, replierID, "looks good, go ahead"), "delivery-awaiting-cut-"+strconv.Itoa(i))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+			if all, err := turns.ListForSession(ctx, session.ID); err != nil || len(all) != 1 {
+				t.Errorf("turns = %d (err %v), want 1", len(all), err)
+			}
+			var dbStatus sqlcgen.PlanStatus
+			if err := pool.QueryRow(ctx, `SELECT status FROM plans WHERE id = $1`, plan.ID).Scan(&dbStatus); err != nil {
+				t.Fatalf("query plan row: %v", err)
+			}
+			if dbStatus != sqlcgen.PlanStatusAwaitingApproval {
+				t.Errorf("db status = %q, want %q", dbStatus, sqlcgen.PlanStatusAwaitingApproval)
+			}
+
+			var notice string
+			for _, b := range recordedBodies() {
+				if strings.Contains(b, "agentActivityCreate") && strings.Contains(b, "A plan is awaiting your") {
+					notice = b
+				}
+			}
+			if notice == "" {
+				t.Fatalf("no awaiting-plan notice was posted; bodies: %v", recordedBodies())
+			}
+			offersApprove := strings.Contains(notice, "approve/approved/lgtm")
+			if offersApprove == tt.cut {
+				t.Errorf("notice %s offers the approve keywords: %v, want %v", notice, offersApprove, !tt.cut)
+			}
+			if tt.cut && !strings.Contains(notice, framecut.Reason(&cut)) {
+				t.Errorf("notice %s, want the reason %q", notice, framecut.Reason(&cut))
+			}
+		})
 	}
 }

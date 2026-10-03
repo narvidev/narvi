@@ -242,3 +242,20 @@ func ReadPlanFinal(ctx context.Context, turns *postgres.TurnStore, events *postg
 	final, found = plandomain.FinalText(ToContentEvents(frames), lower, upper)
 	return final, found, nil
 }
+
+// ReadPlanCut reads the cut report of the plan planID (ReadPlanFinal, over
+// the plan's own producing turn): nil for a plan whose text is whole. The
+// Slack and Linear replies to a message that neither decides nor revises a
+// plan awaiting approval read it, so they offer no approve keyword or
+// button for a plan the approval would refuse (httpapi.ErrPlanCut).
+func ReadPlanCut(ctx context.Context, plans *postgres.PlanStore, turns *postgres.TurnStore, events *postgres.EventStore, planID pgtype.UUID) (*framecut.Cut, error) {
+	plan, err := plans.Get(ctx, planID)
+	if err != nil {
+		return nil, fmt.Errorf("sessionactor: read plan for its cut report: %w", err)
+	}
+	final, _, err := ReadPlanFinal(ctx, turns, events, plan.SessionID, plan.TurnID)
+	if err != nil {
+		return nil, err
+	}
+	return final.Cut, nil
+}
