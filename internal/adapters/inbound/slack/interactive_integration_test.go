@@ -476,31 +476,39 @@ func TestInteractivityHandler_ViewSubmission_CreatesRequestChangesTurn(t *testin
 // SAME session, for far longer than the rig's own (deliberately small, for
 // test speed) SlackInteractivityAckTimeout. It asserts:
 //
-//   - the handler still returns well before the competing lock is released
-//     (proving the decide+update sequence was cut short by the new bounded
-//     context, not left blocked until the lock's own holder let go)
+//   - the handler answers within SlackInteractivityAckTimeout, well before
+//     the competing lock is released: the decision is cut short at its own
+//     share of the window (SlackInteractivityDecisionTimeout()), and the
+//     reply runs on the share kept for it
 //   - the handler still acks Slack with its own unconditional 200 anyway
 //     (Slack's own documented contract: ack within the window regardless of
 //     whether the underlying work actually finished)
+//   - the click whose decision outlived its share is still answered: the
+//     generic error text reaches the clicker alone, through
+//     chat.postEphemeral on a context detached from the expired decision's,
+//     and no chat.update strips the approval message of its plan and its
+//     buttons
 //   - the plan's own status is left untouched (still awaiting_approval),
-//     since the guarded UPDATE never got a chance to run before the shared
-//     bounded context's deadline hit
+//     since the guarded UPDATE never got a chance to run before the
+//     decision's deadline hit
 //
-// Against the PRE-FIX code (a bare r.Context() with no
-// SlackInteractivityAckTimeout wrap), this test would instead block for the
-// competing lock's FULL hold duration before ever seeing a response --
-// failing this test's own elapsed-time assertion below -- proving this is a
-// real regression test, not a tautology.
+// Against the PRE-FIX code (a bare r.Context() with no bound), this test
+// would instead block for the competing lock's FULL hold duration; a
+// decision run on the whole window would answer only after it; and a reply
+// run on the decision's own expired context would fail before any request
+// left, reaching nobody.
 func TestInteractivityHandler_BlockActions_BoundedBySlackInteractivityAckTimeout(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
 
-	const interactivityTimeout = 500 * time.Millisecond
+	const interactivityTimeout = 1500 * time.Millisecond
+	const replyTimeout = 500 * time.Millisecond
 	const lockHoldDuration = 3 * time.Second
 
 	timeouts := platform.DefaultTimeouts()
 	timeouts.WebhookTimestampFreshnessWindow = 5 * time.Minute
 	timeouts.SlackInteractivityAckTimeout = interactivityTimeout
+	timeouts.SlackInteractivityReplyTimeout = replyTimeout
 
 	rig := newInteractiveTestRigWithTimeouts(t, pool, timeouts)
 	session, plan := seedSessionTurnAndAwaitingPlan(ctx, t, rig)
@@ -537,10 +545,10 @@ func TestInteractivityHandler_BlockActions_BoundedBySlackInteractivityAckTimeout
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d, want %d (a bounded-context timeout must still ack Slack with 200)", rec.Code, http.StatusOK)
 	}
-	if elapsed >= lockHoldDuration {
-		t.Errorf("handler took %s to respond, want well under the %s competing lock hold -- the decide+update "+
-			"sequence should have been cut short by SlackInteractivityAckTimeout (%s), not blocked until the "+
-			"competing lock was released (proves the fix is actually wired in)", elapsed, lockHoldDuration, interactivityTimeout)
+	if elapsed >= interactivityTimeout {
+		t.Errorf("handler took %s to respond, want within SlackInteractivityAckTimeout (%s) -- the decision should have "+
+			"been cut short at its share of the window (%s), not blocked until the competing lock was released (%s) "+
+			"or run on the whole window", elapsed, interactivityTimeout, timeouts.SlackInteractivityDecisionTimeout(), lockHoldDuration)
 	}
 
 	var dbStatus sqlcgen.PlanStatus
@@ -549,6 +557,29 @@ func TestInteractivityHandler_BlockActions_BoundedBySlackInteractivityAckTimeout
 	}
 	if dbStatus != sqlcgen.PlanStatusAwaitingApproval {
 		t.Errorf("db status = %q, want %q (the guarded update must never have run before the bounded context's deadline)", dbStatus, sqlcgen.PlanStatusAwaitingApproval)
+	}
+
+	// The handler made every Slack call before it answered: collect them.
+	var updates, ephemerals []recordedSlackRequest
+	for len(rig.requests) > 0 {
+		got := <-rig.requests
+		switch got.path {
+		case "/chat.update":
+			updates = append(updates, got)
+		case "/chat.postEphemeral":
+			ephemerals = append(ephemerals, got)
+		}
+	}
+	if len(updates) != 0 {
+		t.Errorf("chat.update sent %d time(s) (%v), want none: the approval message must keep its plan and its buttons", len(updates), updates)
+	}
+	if len(ephemerals) != 1 {
+		t.Fatalf("chat.postEphemeral sent %d time(s), want exactly one: the click whose decision ran out of its share is still answered", len(ephemerals))
+	}
+	got := ephemerals[0].body
+	const wantText = "Something went wrong recording this decision. Please try again."
+	if got["text"] != wantText || got["channel"] != "C1" || got["user"] != interactivityDefaultUserID || got["thread_ts"] != "1700000000.000009" {
+		t.Errorf("chat.postEphemeral = %v, want %q to %s alone in C1, on the message", got, wantText, interactivityDefaultUserID)
 	}
 }
 

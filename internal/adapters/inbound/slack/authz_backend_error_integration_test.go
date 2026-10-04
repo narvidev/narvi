@@ -154,14 +154,15 @@ func TestHandler_ReplyOnMappedThread_AuthzBackendErrorReleasesClaim(t *testing.T
 // conflation): a genuine backend failure INSIDE it (deps.Sessions.Get
 // erroring for a reason having nothing to do with the actor's own
 // authorization) must NOT be silently conflated with a real denial. Before
-// this fix, the click still acked 200 (this route's own unconditional
-// contract, never changes), but chat.update showed the exact same
-// misleading "you don't have permission" text
-// (slackPlanForbiddenText/TestInteractivityHandler_BlockActions_ApprovePlan_DeniedForUnownedMember's
-// own counterpart) a real denial would -- silently discarding the actor's
-// real decision with no indication it was ever safe to retry. This proves
-// the message shown is now the HONEST generic-error text instead, and that
-// the plan itself was never actually decided (DecidePlan never reached).
+// that fix, the click still acked 200 (this route's own unconditional
+// contract, never changes), but showed the exact same misleading "you
+// don't have permission" text a real denial would -- silently discarding
+// the actor's real decision with no indication it was ever safe to retry.
+// This proves the answer is now the HONEST generic-error text instead, to
+// the clicking user alone through chat.postEphemeral, with no chat.update
+// -- which would strip the approval message of its plan and its buttons,
+// leaving the "try again" nothing to click -- and that the plan itself was
+// never actually decided (DecidePlan never reached).
 func TestInteractivityHandler_BlockActions_ApprovePlan_AuthzBackendError(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
@@ -252,27 +253,39 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_AuthzBackendError(t *test
 		t.Errorf("DecidedBy = %v, want invalid", updatedPlan.DecidedBy)
 	}
 
-	// This fixture user auto-links for the FIRST time here, so a
-	// chat.postEphemeral identity-link notice (resolveSlackActorSingleAttempt's
-	// own side effect, delivered BEFORE authorizeSessionAction ever runs)
-	// is recorded ahead of the chat.update this test actually cares about --
-	// drain past it rather than assuming chat.update is the first request
-	// on the channel.
-	deadline := time.After(5 * time.Second)
+	// The handler made every Slack call before it answered. This fixture
+	// user auto-links for the FIRST time here, so a chat.postEphemeral
+	// identity-link notice (resolveSlackActorSingleAttempt's own side
+	// effect, delivered BEFORE authorizeSessionAction ever runs) is
+	// recorded beside the reply this test cares about: the reply is the
+	// one ephemeral carrying the generic-error text.
+	const wantText = "Something went wrong recording this decision. Please try again."
+	var updates, replies []recordedIdentityRequest
+drain:
 	for {
 		select {
 		case got := <-requests:
-			if got.path != "/chat.update" {
-				continue
+			switch got.path {
+			case "/chat.update":
+				updates = append(updates, got)
+			case "/chat.postEphemeral":
+				if text, _ := got.body["text"].(string); text == wantText || text == "You don't have permission to approve or reject this plan." {
+					replies = append(replies, got)
+				}
 			}
-			text, _ := got.body["text"].(string)
-			if text != "Something went wrong recording this decision. Please try again." {
-				t.Errorf("chat.update text = %q, want the honest generic-error text -- NOT a misleading permission-denied message for what is actually a backend failure", text)
-			}
-			return
-		case <-deadline:
-			t.Fatal("timed out waiting for the synchronous chat.update call")
+		default:
+			break drain
 		}
+	}
+	if len(updates) != 0 {
+		t.Errorf("chat.update sent %d time(s) (%v), want none: the approval message must keep its plan and its buttons", len(updates), updates)
+	}
+	if len(replies) != 1 {
+		t.Fatalf("replies to the click = %v, want exactly one chat.postEphemeral with the honest generic-error text -- NOT a misleading permission-denied message for what is actually a backend failure", replies)
+	}
+	got := replies[0].body
+	if got["text"] != wantText || got["user"] != "U-IX-BACKEND-ERROR" || got["channel"] != "C-IX-BACKEND-ERROR" || got["thread_ts"] != "1700000000.000400" {
+		t.Errorf("chat.postEphemeral = %v, want %q to U-IX-BACKEND-ERROR alone in C-IX-BACKEND-ERROR, on the message", got, wantText)
 	}
 }
 
