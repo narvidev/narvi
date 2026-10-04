@@ -116,7 +116,11 @@ func owedScanProblem(m holdPlanMeasurement, limit float64) string {
 //   - GetReviewAttemptToCheck, whose walk now runs for a person's attempt
 //     too: for a person's pick, the context check's own bound (no more
 //     than holdPlanMaxBuffers of the session's own turns, never a scan of
-//     turns); for any other pick, no more than main's text of it.
+//     turns); for any other pick, no more than main's text of it, the two
+//     measured once the tables are settled for both (measureAgainstMain):
+//     the CreateTurn measurements just before leave rolled-back pending
+//     turns in the open turns' index, which whichever text first reads
+//     through a plain index scan pays for.
 func TestOwedReviewRequest_PlansReadTheSessionsOwnRows(t *testing.T) {
 	timeouts := platform.DefaultTimeouts()
 	uuidArg := func(p holdPlanProbe) string { return fmt.Sprintf("'%s'::uuid", p.sessionID.String()) }
@@ -339,16 +343,23 @@ func TestOwedReviewRequest_PlansReadTheSessionsOwnRows(t *testing.T) {
 						t.Errorf("%s: reads %.0f buffers, over %d (%v)", key("CreateTurn"), after.buffers, contextWriteMaxBuffers, after.scans)
 					}
 
-					pick := measureHoldPlan(ctx, t, pool, preRead, probe, mode)
-					t.Logf("%s: %v", key(preRead.name), pick)
+					// A person's pick is held to the context check's bound
+					// alone; any other pick to main's text of it too, both
+					// measured on settled tables (measureAgainstMain).
+					personsPick := shape.tailTrigger != "" && probe.sessionID == probes[0].sessionID
+					var pick, mainPick holdPlanMeasurement
+					if personsPick {
+						pick = measureHoldPlan(ctx, t, pool, preRead, probe, mode)
+						t.Logf("%s: %v", key(preRead.name), pick)
+					} else {
+						pick, mainPick = measureAgainstMain(ctx, t, pool, preRead, preReadBefore, probe, mode)
+						t.Logf("%s: main's text %v; this release's %v", key(preRead.name), mainPick, pick)
+					}
 					if problem := contextReadProblem(pick, probe.turns, true); problem != "" {
 						t.Errorf("%s: %s", key(preRead.name), problem)
 					}
-					if shape.tailTrigger == "" || probe.sessionID != probes[0].sessionID {
-						mainPick := measureHoldPlan(ctx, t, pool, preReadBefore, probe, mode)
-						if pick.buffers > mainPick.buffers {
-							t.Errorf("%s: reads %.0f buffers, main's text %.0f, for a pick that is no person's request", key(preRead.name), pick.buffers, mainPick.buffers)
-						}
+					if !personsPick && pick.buffers > mainPick.buffers {
+						t.Errorf("%s: reads %.0f buffers, main's text %.0f, for a pick that is no person's request", key(preRead.name), pick.buffers, mainPick.buffers)
 					}
 				}
 			}
