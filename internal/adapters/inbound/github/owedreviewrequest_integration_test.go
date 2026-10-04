@@ -288,6 +288,13 @@ func TestOwedReviewRequest_NotOptedIn_AMovedHumanRequestReRunsForTheNewHead(t *t
 		request = turns[1]
 		return true
 	})
+	// The request is read as having waited when the review ended after it
+	// was created -- the ending replica's clock against the database's --
+	// so it is moved a few seconds back, after the review's own creation:
+	// skew between the two clocks never decides the test.
+	if _, err := f.rig.pool.Exec(ctx, `UPDATE turns SET created_at = created_at - interval '5 seconds' WHERE id = $1`, request.ID); err != nil {
+		t.Fatal(err)
+	}
 	if request.Status != sqlcgen.TurnStatusPending || !request.IsReviewAttempt || request.ReviewHeadSha == nil || *request.ReviewHeadSha != "sha-under-review" ||
 		request.RequestTrigger == nil || *request.RequestTrigger != "label" || request.RequestedBy != f.maintainer.ID ||
 		request.RequestText == nil || *request.RequestText != "Manual re-review requested via the configured GitHub label." {
