@@ -114,10 +114,13 @@ func resolveSlackActor(ctx context.Context, logger *slog.Logger, slackClient sha
 // resolveSlackActorSingleAttempt is resolveSlackActor's own deliberately
 // FASTER sibling, used ONLY by interactive.go's decideAndUpdateMessage/
 // handleViewSubmission -- both share Slack's own hard ~3s interactivity-
-// ack window with a real Postgres write (DecidePlan/CreateTurnCore) AND a
-// second outbound Slack call (chat.update / views.open) inside the SAME
-// budget (see platform.Timeouts.SlackInteractivityAckTimeout's own doc
-// comment), so there is no room left for resolveSlackActor's own
+// ack window with a real Postgres write (DecidePlan/CreateTurnCore) AND,
+// for a click, a second outbound Slack call (the reply: chat.update or
+// chat.postEphemeral) inside the SAME window (see
+// platform.Timeouts.SlackInteractivityAckTimeout's own doc comment; for a
+// click this fetch runs inside the decision's share of it,
+// SlackInteractivityDecisionTimeout(), which Validate keeps it strictly
+// inside), so there is no room left for resolveSlackActor's own
 // multi-attempt backoff loop (identitylink.FetchEmailWithRetry). This
 // makes exactly ONE profile-email fetch attempt, bounded by fetchTimeout
 // (platform.Timeouts.SlackInteractivityIdentityFetchTimeout in
@@ -198,22 +201,25 @@ func resolveSlackActorSingleAttempt(ctx context.Context, logger *slog.Logger, sl
 // handling already did the right generic thing for both cases (post a
 // denial, don't release the claim). A confirmed 3-lens adversarial review
 // of that batch found this collapse actively harmful for exactly ONE
-// caller: interactive.go's own decideAndUpdateMessage responds to a denial
-// by calling deps.updateMessage, whose own chat.update request (see
+// caller: interactive.go's own decideAndUpdateMessage then answered a
+// denial by calling deps.updateMessage, whose own chat.update request (see
 // slackapi.Client.UpdateMessage's own doc comment) carries no "blocks"
 // field at all -- Slack's own API treats that as "remove every block from
-// this message", PERMANENTLY stripping the Approve/Reject buttons. For a
-// genuinely resolved-but-insufficient-role denial that is an existing,
-// arguably-acceptable side effect (a viewer will always be a viewer, so
-// there is nothing to usefully retry). For the NOT-YET-LINKED case it
-// directly broke this batch's own headline guarantee: the SAME actor
-// clicking the SAME button again, after linking, should succeed -- but
-// there was nothing left in Slack to click. See ErrActorNotLinked below,
-// the fix: a SEPARATE, more specific sentinel for the not-yet-linked case,
-// so decideAndUpdateMessage (and handleViewSubmission) can tell the two
-// apart and respond differently, while every OTHER caller's existing
-// errors.Is(err, ErrActorNotAuthorized) check keeps matching BOTH cases
-// unchanged (ErrActorNotLinked wraps this error, see below).
+// this message", PERMANENTLY stripping the Approve/Reject buttons. For the
+// NOT-YET-LINKED case it directly broke this batch's own headline
+// guarantee: the SAME actor clicking the SAME button again, after linking,
+// should succeed -- but there was nothing left in Slack to click. See
+// ErrActorNotLinked below, the fix: a SEPARATE, more specific sentinel for
+// the not-yet-linked case, so decideAndUpdateMessage (and
+// handleViewSubmission) can tell the two apart and say different things,
+// while every OTHER caller's existing errors.Is(err,
+// ErrActorNotAuthorized) check keeps matching BOTH cases unchanged
+// (ErrActorNotLinked wraps this error, see below). The stripping was no
+// more acceptable for a resolved-but-refused actor: the message is the
+// channel's, so a viewer's click took the buttons from every member who
+// could have decided. decideAndUpdateMessage now answers every denial, and
+// every other click that decides nothing, to the clicking user alone
+// (chat.postEphemeral), leaving the message and its buttons as they were.
 var ErrActorNotAuthorized = errors.New("slack: actor not authorized")
 
 // ErrActorNotLinked is authorizeSessionAction's own MORE SPECIFIC sentinel
@@ -270,10 +276,13 @@ var ErrActorNotLinked = fmt.Errorf("slack: actor not yet linked: %w", ErrActorNo
 // retryable backend failure -- applies UNCHANGED, with no caller-side edit
 // required; see handler.go's own authorizeExistingSessionReply (unchanged)
 // and interactive.go's own decideAndUpdateMessage/handleViewSubmission
-// (which DO need to tell ErrActorNotLinked apart from a resolved-but-denied
-// ErrActorNotAuthorized, to avoid destructively stripping the Approve/
-// Reject buttons off a message that a not-yet-linked actor should still be
-// able to retry once linked) for the confirmed call sites.
+// (which DO tell ErrActorNotLinked apart from a resolved-but-denied
+// ErrActorNotAuthorized, to tell a not-yet-linked actor to link and retry
+// rather than that they lack permission; neither answer touches the
+// approval message's Approve/Reject buttons) for the confirmed call sites.
+// This twin still reads actorauthz.AuthorizeResolvedActor's bool, so a role
+// it could not read is reported as ErrActorNotAuthorized; interactive.go's
+// twin reads the verdict and reports that as a backend failure.
 //
 // Returns ErrActorNotLinked when actorUserID is not linked at all (above,
 // itself matched by errors.Is(err, ErrActorNotAuthorized) too, see that
