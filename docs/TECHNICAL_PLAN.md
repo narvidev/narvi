@@ -6713,8 +6713,10 @@ That second half is the cheaper one to close and needs nothing from the sandbox 
 `sandboxes.lifetime_deadline_at`, written by the statement that creates a sandbox gen
 (`UpsertSandboxForSpawn`, which every spawn, restore and resume runs in the claim's transaction,
 before the provider is called): a conservative estimate (the claim's own `now()` plus the session
-kind's lifetime, kept in `lifetime_seconds`) overwritten by the exact value `sandbox-agent` reports
-on `ready` and on every `heartbeat` (§6.1). The estimate counts from the claim, never from
+kind's lifetime, kept in `lifetime_seconds`), which the exact value `sandbox-agent` reports on
+`ready` and on every `heartbeat` (§6.1) can only bring earlier, never later: the row keeps the
+earlier of its deadline and the report's (`LEAST(deadline, now() + reported)`), so one late or
+wrong report can never move it past the provider's own. The estimate counts from the claim, never from
 `created_at`: only a session's first gen stamps `created_at`, and a respawn or restore keeps it, so
 a deadline counted from it would already be past for every later gen. The deadline is recorded
 against its gen (`lifetime_deadline_gen`) and counts only while that is the live gen; anything else
@@ -6728,8 +6730,11 @@ exact value when it arrives — because a restored sandbox runs whatever `sandbo
 baked in, possibly for weeks, so no part of this may depend on an agent-side change having shipped.
 The per-session-type lifetime lives in one place, `Timeouts.SandboxLifetimeFor` in
 `platform/timeouts.go` (kinds `default` and `review`, the latter a pull request's review session),
-so a longer lifetime for a future session type is a one-line change and the rotation threshold
-follows it.
+and the rotation threshold follows it. Changing a session type's lifetime is a change to its field in
+that file, and nothing more while the value stays at or below `ProviderHardCap`; a longer lifetime
+also means raising `ProviderHardCap`, which `Validate` holds every kind under, and only after
+checking that the provider gives a sandbox that long (`docs/PRODUCTION_CHECKLIST.md`, item 14). A
+new session type adds its kind (`internal/domain/sandbox`) and a field and default of its own.
 
 ### 35.3 Rotation is the existing restore path, given a second trigger
 A rotation is `snapshot → stopped → shutdown → restore`, every step of which §3.2 already

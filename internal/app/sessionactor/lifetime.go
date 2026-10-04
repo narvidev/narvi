@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/sandbox"
@@ -36,20 +37,46 @@ func (a *Actor) sandboxLifetimeSeconds(ctx context.Context, tx pgx.Tx) (*int32, 
 	return &seconds, kind, nil
 }
 
-// logLifetimeDeadline records the deadline a spawn or restore claim
-// stamped on row, its new gen, in the claim's transaction (technical plan
-// §35.2) -- what an operator reads to tell a sandbox ended by its
-// provider's lifetime from one that failed.
-func (a *Actor) logLifetimeDeadline(claim string, kind sandbox.LifetimeKind, row sqlcgen.Sandbox) {
+// lifetimeStamp is what a spawn or restore claim stamped on its new gen
+// (technical plan §35.2), carried on its spawnPlan so it can be logged
+// once the claim has committed.
+type lifetimeStamp struct {
+	claim    string // "spawn" or "restore"
+	kind     sandbox.LifetimeKind
+	gen      int32
+	seconds  *int32
+	deadline pgtype.Timestamptz
+}
+
+// newLifetimeStamp reads the stamp off row, the row the claim's upsert
+// returned.
+func newLifetimeStamp(claim string, kind sandbox.LifetimeKind, row sqlcgen.Sandbox) *lifetimeStamp {
+	return &lifetimeStamp{claim: claim, kind: kind, gen: row.Gen, seconds: row.LifetimeSeconds, deadline: row.LifetimeDeadlineAt}
+}
+
+// logLifetimeDeadline records the deadline a committed spawn or restore
+// claim stamped on its gen (technical plan §35.2) -- what an operator
+// reads to tell a sandbox ended by its provider's lifetime from one that
+// failed. executePlans calls it after planDispatch's transaction has
+// committed, never inside it, so a claim that rolled back is never logged
+// as claimed. A resume plan carries no stamp and logs nothing.
+func (a *Actor) logLifetimeDeadline(plan *spawnPlan) {
+	stamp := plan.lifetime
+	if stamp == nil {
+		return
+	}
 	var deadline any
-	if row.LifetimeDeadlineAt.Valid {
-		deadline = row.LifetimeDeadlineAt.Time
+	if stamp.deadline.Valid {
+		deadline = stamp.deadline.Time
 	}
 	var seconds any
-	if row.LifetimeSeconds != nil {
-		seconds = *row.LifetimeSeconds
+	if stamp.seconds != nil {
+		seconds = *stamp.seconds
 	}
-	a.logger.Info("sessionactor: sandbox gen claimed with a lifetime deadline",
-		"session_id", a.sessionID.String(), "claim", claim, "gen", row.Gen,
-		"lifetime_kind", string(kind), "lifetime_seconds", seconds, "lifetime_deadline_at", deadline)
+	a.logger.Info(lifetimeClaimedLogMessage,
+		"session_id", a.sessionID.String(), "claim", stamp.claim, "gen", stamp.gen,
+		"lifetime_kind", string(stamp.kind), "lifetime_seconds", seconds, "lifetime_deadline_at", deadline)
 }
+
+// lifetimeClaimedLogMessage is logLifetimeDeadline's message.
+const lifetimeClaimedLogMessage = "sessionactor: sandbox gen claimed with a lifetime deadline"

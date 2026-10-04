@@ -1,8 +1,10 @@
 -- Technical plan §35.2: a sandbox's lifetime deadline is persisted state,
 -- never inferred at use. A provider's lifetime runs from its sandbox's own
 -- creation, not from the turn running inside it, so a turn dispatched onto
--- an old sandbox can run out of runway; the pre-dispatch runway gate
--- (§35.3) reads the deadline these columns record.
+-- an old sandbox can run out of runway. Nothing acts on these columns
+-- yet: the pre-dispatch runway gate that will read them (§35.3) is not
+-- built, so until it ships a turn is dispatched as before, whatever its
+-- sandbox's age.
 --
 -- sandboxes.lifetime_deadline_at: when the control plane estimates the
 -- provider will end the gen named by lifetime_deadline_gen. Stamped by
@@ -18,7 +20,7 @@
 --
 -- sandboxes.lifetime_seconds: the lifetime that estimate was stamped with,
 -- in whole seconds -- the kind's lifetime, so the runway gate's lifetime/6
--- (§35.3) follows the kind.
+-- (§35.3), once built, will follow the kind.
 --
 -- sandboxes.lifetime_deadline_gen: the gen the two columns above describe,
 -- recorded the way prompt_receipt_gen and agent_max_frame_bytes_gen are

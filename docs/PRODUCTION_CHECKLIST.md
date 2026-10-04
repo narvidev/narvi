@@ -404,17 +404,22 @@ carries a lifetime. It assumes one instead. When a claim spawns or
 restores a sandbox, it stamps the sandbox row's `lifetime_deadline_at`
 at the database's time plus the session kind's lifetime
 (`SandboxLifetimeFor`, `internal/platform/timeouts.go`;
-`docs/TECHNICAL_PLAN.md` §35.2), before the provider is called, and the
-pre-dispatch runway gate (§35.3) reads that deadline. Each kind's
-lifetime is held at or below `ProviderHardCap` (2 hours), the one
+`docs/TECHNICAL_PLAN.md` §35.2), before the provider is called. Each
+kind's lifetime is held at or below `ProviderHardCap` (2 hours), the one
 lifetime `timeouts.go` asserts of a provider (§5.4), and today both kinds
 equal it. So the recorded deadline is never later than the provider's
 own only if the provider really lets every sandbox run at least that
-long, counted from no earlier than its create or restore call. A
-provider that ends sandboxes sooner makes every recorded deadline late,
-which is the failure §35 exists to prevent: a turn dispatched onto a
-sandbox the row says has runway, then ended by the provider mid-turn.
-Nothing in this repository can read the provider's limit.
+long, counted from no earlier than its create or restore call. Nothing
+in this repository can read the provider's limit.
+
+Today nothing acts on the recorded deadline: a turn is dispatched as it
+always was, whatever its sandbox's age, so a sandbox near its provider's
+limit can still be ended mid-turn. The pre-dispatch runway gate that
+will read the deadline (§35.3) is Step 137, not yet built. Once it is, a
+provider that ends sandboxes sooner than assumed makes every recorded
+deadline late, and the gate would dispatch onto a sandbox the row says
+has runway -- the failure §35 exists to prevent. Check it now, so the
+deadline is right before anything relies on it.
 
 **Check.** In the provider's own configuration or documentation for the
 account this deployment uses, read the longest a sandbox may run and the

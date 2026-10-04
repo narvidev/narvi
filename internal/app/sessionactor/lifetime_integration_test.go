@@ -4,10 +4,14 @@ package sessionactor
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -326,6 +330,104 @@ func TestSandboxLifetime_ReviewSessionTakesItsKindsLifetime(t *testing.T) {
 			}
 
 			assertDeadlineWithinTheProvidersOwn(t, readLifetimeRow(ctx, t, pool, sessionID), clock.last(t), tc.want)
+		})
+	}
+}
+
+// TestSandboxLifetime_ARolledBackClaimLogsNoDeadline pins where the
+// "claimed with a lifetime deadline" line is written: after the claim's
+// transaction commits, never inside it. Here the claim's upsert runs and
+// stamps a deadline, then assembleSessionConfig refuses the public base
+// URL's scheme, a step after the upsert, and the whole claim rolls back --
+// no sandbox row, no provider call. The line must not name that gen and
+// deadline, which were never persisted.
+func TestSandboxLifetime_ARolledBackClaimLogsNoDeadline(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+	createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, "never claimed")
+
+	logs := captureDefaultLoggerJSONSync(t)
+	provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "lifetime-rolled-back"}}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, provider, "ftp://localhost:8080", nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	sendEnsureDispatched(ctx, t, a)
+
+	failed := waitForLogEntry(t, logs, 5*time.Second, "sessionactor: command handling failed")
+	if msg, _ := failed["error"].(string); !strings.Contains(msg, "unrecognized scheme") {
+		t.Fatalf("the claim failed with %q, want the public base URL's scheme refused after the upsert", msg)
+	}
+	if _, err := narvipg.NewSandboxStore(pool).Get(ctx, sessionID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("sandbox row after the failed claim: err = %v, want none (the claim rolled back)", err)
+	}
+	if got := provider.callCount(); got != 0 {
+		t.Fatalf("CreateSandbox called %d times, want 0", got)
+	}
+	// The actor writes its log lines in order, so a line written before
+	// the failure would already be in the buffer.
+	if n := countLogLines(t, logs, lifetimeClaimedLogMessage); n != 0 {
+		t.Errorf("a rolled-back claim was logged as claimed %d times:\n%s", n, logs.String())
+	}
+}
+
+// TestSandboxLifetime_ACommittedClaimLogsItsDeadline is the other half: a
+// spawn and a restore that commit each log their claim once, naming the
+// gen, the kind, the lifetime and the deadline the row holds.
+func TestSandboxLifetime_ACommittedClaimLogsItsDeadline(t *testing.T) {
+	tests := []struct {
+		name    string
+		restore bool
+		claim   string
+		gen     int32
+	}{
+		{"a spawn", false, "spawn", 1},
+		{"a restore", true, "restore", 2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			sessionID := createTestSession(ctx, t, pool)
+			createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, "claimed")
+			if tc.restore {
+				seedStoppedSandboxWithSnapshot(ctx, t, pool, sessionID, "snap-lifetime-log")
+			}
+
+			logs := captureDefaultLoggerJSONSync(t)
+			provider := &fakeSpawnProvider{
+				nextRef:        ports.SandboxRef{ProviderID: "lifetime-log"},
+				nextRestoreRef: ports.SandboxRef{ProviderID: "lifetime-log"},
+			}
+			r := newDispatchTestRegistry(t, ctx, pool, provider, nil)
+			t.Cleanup(func() { _ = r.Shutdown() })
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+			sendEnsureDispatched(ctx, t, a)
+			waitForConnecting(ctx, t, pool, sessionID)
+
+			line := waitForLogEntry(t, logs, 5*time.Second, lifetimeClaimedLogMessage)
+			row := readLifetimeRow(ctx, t, pool, sessionID)
+			deadline, err := time.Parse(time.RFC3339Nano, fmt.Sprint(line["lifetime_deadline_at"]))
+			if err != nil || row.deadline == nil || !deadline.Equal(*row.deadline) {
+				t.Errorf("logged lifetime_deadline_at %v (%v), want the row's %v", line["lifetime_deadline_at"], err, row.deadline)
+			}
+			if line["claim"] != tc.claim || line["gen"] != float64(tc.gen) || row.gen != tc.gen ||
+				line["lifetime_kind"] != string(sandbox.LifetimeKindDefault) || line["lifetime_seconds"] != float64(7200) ||
+				line["session_id"] != sessionID.String() {
+				t.Errorf("logged %v, want claim %q, gen %d, kind default, 7200 seconds, for session %s", line, tc.claim, tc.gen, sessionID.String())
+			}
+			if n := countLogLines(t, logs, lifetimeClaimedLogMessage); n != 1 {
+				t.Errorf("%d claimed lines, want 1", n)
+			}
 		})
 	}
 }

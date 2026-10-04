@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -3503,12 +3504,24 @@ func TestValidate_SandboxLifetime(t *testing.T) {
 
 // TestSandboxLifetimeFieldsAreReadOnlyInPlatform is the source half of
 // "the per-session-type lifetime lives in one place" (technical plan
-// §35.2): outside internal/platform, no production Go file names
-// SandboxLifetime or ReviewSandboxLifetime -- every caller asks
-// SandboxLifetimeFor, so a kind's lifetime is decided in one function. It
-// parses every non-test Go file of the module (node_modules, testdata and
-// .git aside) and fails on any selector naming either field. A test may
-// set them, as a deployment's own configuration would.
+// §35.2): SandboxLifetime and ReviewSandboxLifetime are read in one
+// function, Timeouts.SandboxLifetimeFor, and every caller asks it, so a
+// kind's lifetime -- the shorter-of-the-two fallback for an unknown kind
+// included -- is decided there alone. It parses every non-test Go file of
+// the module (node_modules, testdata and .git aside) and fails on:
+//
+//   - a selector naming either field anywhere but inside
+//     SandboxLifetimeFor in internal/platform -- outside the package, or a
+//     second reader inside it, such as another getter;
+//   - a string literal equal to either field's name, the way reflection
+//     reads a field by name (FieldByName);
+//   - a file that imports reflect and names Timeouts, since reflection
+//     over the struct can read the fields without naming them.
+//
+// DefaultTimeouts sets the fields as composite-literal keys, which are not
+// selectors, and a test may set them as a deployment's configuration
+// would. It does not see a read through unsafe, or a whole Timeouts value
+// serialised and parsed back (encoding/json, fmt's %+v).
 func TestSandboxLifetimeFieldsAreReadOnlyInPlatform(t *testing.T) {
 	t.Parallel()
 
@@ -3530,7 +3543,8 @@ func TestSandboxLifetimeFieldsAreReadOnlyInPlatform(t *testing.T) {
 		root = parent
 	}
 
-	scanned, inPlatform := 0, 0
+	scanned := 0
+	readInTheGetter := map[string]bool{}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -3550,28 +3564,76 @@ func TestSandboxLifetimeFieldsAreReadOnlyInPlatform(t *testing.T) {
 			return err
 		}
 		scanned++
-		local := filepath.Dir(path) == platformDir
-		ast.Inspect(file, func(n ast.Node) bool {
-			sel, ok := n.(*ast.SelectorExpr)
-			if !ok || !fields[sel.Sel.Name] {
-				return true
+		rel, _ := filepath.Rel(root, path)
+		inPlatform := filepath.Dir(path) == platformDir
+
+		importsReflect := false
+		for _, imp := range file.Imports {
+			if imp.Path.Value == `"reflect"` {
+				importsReflect = true
 			}
-			if local {
-				inPlatform++
+		}
+		namesTimeouts := false
+
+		// inspect walks n, declared in function fn ("" outside any).
+		inspect := func(n ast.Node, fn string) {
+			ast.Inspect(n, func(n ast.Node) bool {
+				switch n := n.(type) {
+				case *ast.SelectorExpr:
+					if n.Sel.Name == "Timeouts" {
+						namesTimeouts = true
+					}
+					if !fields[n.Sel.Name] {
+						return true
+					}
+					if inPlatform && fn == "Timeouts.SandboxLifetimeFor" {
+						readInTheGetter[n.Sel.Name] = true
+						return true
+					}
+					t.Errorf("%s names .%s in %q: read a sandbox kind's lifetime through platform.Timeouts.SandboxLifetimeFor only (technical plan §35.2)", rel, n.Sel.Name, fn)
+				case *ast.Ident:
+					if n.Name == "Timeouts" {
+						namesTimeouts = true
+					}
+				case *ast.BasicLit:
+					if n.Kind == token.STRING {
+						if v, err := strconv.Unquote(n.Value); err == nil && fields[v] {
+							t.Errorf("%s has the string %s: a field read by name, as reflection does, bypasses platform.Timeouts.SandboxLifetimeFor (technical plan §35.2)", rel, n.Value)
+						}
+					}
+				}
 				return true
+			})
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				inspect(decl, "")
+				continue
 			}
-			rel, _ := filepath.Rel(root, path)
-			t.Errorf("%s names .%s: read a sandbox kind's lifetime through platform.Timeouts.SandboxLifetimeFor only (technical plan §35.2)", rel, sel.Sel.Name)
-			return true
-		})
+			name := fn.Name.Name
+			if fn.Recv != nil && len(fn.Recv.List) == 1 {
+				recv := fn.Recv.List[0].Type
+				if star, ok := recv.(*ast.StarExpr); ok {
+					recv = star.X
+				}
+				if id, ok := recv.(*ast.Ident); ok {
+					name = id.Name + "." + name
+				}
+			}
+			inspect(fn, name)
+		}
+		if importsReflect && namesTimeouts {
+			t.Errorf("%s imports reflect and names Timeouts: reflection over the struct can read a sandbox kind's lifetime around platform.Timeouts.SandboxLifetimeFor (technical plan §35.2)", rel)
+		}
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("scan the module: %v", err)
 	}
-	// SandboxLifetimeFor reads each field: fewer than two names in
-	// internal/platform, or a near-empty scan, means the scan is broken.
-	if scanned < 500 || inPlatform < 2 {
-		t.Fatalf("scanned %d files and found %d reads in internal/platform: the scan is broken", scanned, inPlatform)
+	// SandboxLifetimeFor reads both fields: a near-empty scan, or a getter
+	// that reads neither, means the scan is broken.
+	if scanned < 500 || !readInTheGetter["SandboxLifetime"] || !readInTheGetter["ReviewSandboxLifetime"] {
+		t.Fatalf("scanned %d files, and SandboxLifetimeFor reads %v: the scan is broken", scanned, readInTheGetter)
 	}
 }
