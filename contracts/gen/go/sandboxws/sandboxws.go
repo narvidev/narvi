@@ -483,6 +483,272 @@ func (j *BootTiming) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// Technical plan §21.1, §30.4: check out, in each repo named, the commit a review
+// turn records, read from its pull request's ref in the base repository. The agent
+// fetches ref, checks out sha detached and forced, removes untracked files
+// (ignored files are kept), and answers with one checkout_result whose messageId
+// is 'checkout_result:{this messageId}'. Sent only to a gen whose ready advertised
+// capabilities.reviewCheckout; an agent that predates it skips it as an unknown
+// command.
+type Checkout struct {
+	// Gen corresponds to the JSON schema field "gen".
+	Gen int `json:"gen" yaml:"gen" mapstructure:"gen"`
+
+	// MessageId corresponds to the JSON schema field "messageId".
+	MessageId string `json:"messageId" yaml:"messageId" mapstructure:"messageId"`
+
+	// Per-repo checkout spec. Repos are always a list (§3.4); each name is a
+	// SessionConfig.repos[].name.
+	Repos []CheckoutReposElem `json:"repos" yaml:"repos" mapstructure:"repos"`
+
+	// SessionId corresponds to the JSON schema field "sessionId".
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+
+	// Type corresponds to the JSON schema field "type".
+	Type string `json:"type" yaml:"type" mapstructure:"type"`
+}
+
+type CheckoutReposElem struct {
+	// Name corresponds to the JSON schema field "name".
+	Name string `json:"name" yaml:"name" mapstructure:"name"`
+
+	// The pull request's head ref in the base repository.
+	Ref string `json:"ref" yaml:"ref" mapstructure:"ref"`
+
+	// The commit the turn records, in lowercase hex: 40 characters, or 64 in a
+	// SHA-256 repository.
+	Sha string `json:"sha" yaml:"sha" mapstructure:"sha"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *CheckoutReposElem) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["name"]; raw != nil && !ok {
+		return fmt.Errorf("field name in CheckoutReposElem: required")
+	}
+	if _, ok := raw["ref"]; raw != nil && !ok {
+		return fmt.Errorf("field ref in CheckoutReposElem: required")
+	}
+	if _, ok := raw["sha"]; raw != nil && !ok {
+		return fmt.Errorf("field sha in CheckoutReposElem: required")
+	}
+	type Plain CheckoutReposElem
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if matched, _ := regexp.MatchString(`^refs/pull/[1-9][0-9]*/head$`, string(plain.Ref)); !matched {
+		return fmt.Errorf("field %s pattern match: must match %s", "Ref", `^refs/pull/[1-9][0-9]*/head$`)
+	}
+	if matched, _ := regexp.MatchString(`^[0-9a-f]{40}([0-9a-f]{24})?$`, string(plain.Sha)); !matched {
+		return fmt.Errorf("field %s pattern match: must match %s", "Sha", `^[0-9a-f]{40}([0-9a-f]{24})?$`)
+	}
+	*j = CheckoutReposElem(plain)
+	return nil
+}
+
+// Technical plan §21.1, §30.4: what the agent holds after a checkout command, one
+// entry per repo it named. NOT critical (no ackId): a lost result is asked for
+// again by the next checkout. messageId is deterministic, so every copy of one
+// command's result is stored once, whichever control-plane binary stores it, and
+// is found by that key.
+type CheckoutResult struct {
+	// The messageId of the checkout command this answers.
+	CommandMessageId string `json:"commandMessageId" yaml:"commandMessageId" mapstructure:"commandMessageId"`
+
+	// Gen corresponds to the JSON schema field "gen".
+	Gen int `json:"gen" yaml:"gen" mapstructure:"gen"`
+
+	// 'checkout_result:{commandMessageId}'.
+	MessageId string `json:"messageId" yaml:"messageId" mapstructure:"messageId"`
+
+	// Repos corresponds to the JSON schema field "repos".
+	Repos []CheckoutResultReposElem `json:"repos" yaml:"repos" mapstructure:"repos"`
+
+	// SessionId corresponds to the JSON schema field "sessionId".
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+
+	// Type corresponds to the JSON schema field "type".
+	Type string `json:"type" yaml:"type" mapstructure:"type"`
+}
+
+type CheckoutResultReposElem struct {
+	// Why the outcome is not checked_out, at most 4096 bytes; null on checked_out.
+	Error CheckoutResultReposElemError `json:"error" yaml:"error" mapstructure:"error"`
+
+	// HEAD after a checked_out outcome; null otherwise.
+	HeadSha CheckoutResultReposElemHeadSha `json:"headSha" yaml:"headSha" mapstructure:"headSha"`
+
+	// Name corresponds to the JSON schema field "name".
+	Name string `json:"name" yaml:"name" mapstructure:"name"`
+
+	// checked_out: the worktree holds headSha. sha_absent: the ref was fetched, and
+	// the commit asked for is not in the repository; the worktree is untouched.
+	// fetch_failed: the ref could not be fetched. busy: a turn or the boot was
+	// running, so nothing was done. failed: anything else, named in error. An open
+	// enum: a reader treats a value it does not know as failed.
+	Outcome CheckoutResultReposElemOutcome `json:"outcome" yaml:"outcome" mapstructure:"outcome"`
+
+	// The tip of ref as fetched, whatever the outcome; null when it was never read.
+	RefSha CheckoutResultReposElemRefSha `json:"refSha" yaml:"refSha" mapstructure:"refSha"`
+}
+
+// Why the outcome is not checked_out, at most 4096 bytes; null on checked_out.
+type CheckoutResultReposElemError *string
+
+// HEAD after a checked_out outcome; null otherwise.
+type CheckoutResultReposElemHeadSha *string
+
+type CheckoutResultReposElemOutcome string
+
+const CheckoutResultReposElemOutcomeBusy CheckoutResultReposElemOutcome = "busy"
+const CheckoutResultReposElemOutcomeCheckedOut CheckoutResultReposElemOutcome = "checked_out"
+const CheckoutResultReposElemOutcomeFailed CheckoutResultReposElemOutcome = "failed"
+const CheckoutResultReposElemOutcomeFetchFailed CheckoutResultReposElemOutcome = "fetch_failed"
+const CheckoutResultReposElemOutcomeShaAbsent CheckoutResultReposElemOutcome = "sha_absent"
+
+var enumValues_CheckoutResultReposElemOutcome = []interface{}{
+	"checked_out",
+	"sha_absent",
+	"fetch_failed",
+	"busy",
+	"failed",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *CheckoutResultReposElemOutcome) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_CheckoutResultReposElemOutcome {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_CheckoutResultReposElemOutcome, v)
+	}
+	*j = CheckoutResultReposElemOutcome(v)
+	return nil
+}
+
+// The tip of ref as fetched, whatever the outcome; null when it was never read.
+type CheckoutResultReposElemRefSha *string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *CheckoutResultReposElem) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["error"]; raw != nil && !ok {
+		return fmt.Errorf("field error in CheckoutResultReposElem: required")
+	}
+	if _, ok := raw["headSha"]; raw != nil && !ok {
+		return fmt.Errorf("field headSha in CheckoutResultReposElem: required")
+	}
+	if _, ok := raw["name"]; raw != nil && !ok {
+		return fmt.Errorf("field name in CheckoutResultReposElem: required")
+	}
+	if _, ok := raw["outcome"]; raw != nil && !ok {
+		return fmt.Errorf("field outcome in CheckoutResultReposElem: required")
+	}
+	if _, ok := raw["refSha"]; raw != nil && !ok {
+		return fmt.Errorf("field refSha in CheckoutResultReposElem: required")
+	}
+	type Plain CheckoutResultReposElem
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = CheckoutResultReposElem(plain)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *CheckoutResult) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["commandMessageId"]; raw != nil && !ok {
+		return fmt.Errorf("field commandMessageId in CheckoutResult: required")
+	}
+	if _, ok := raw["gen"]; raw != nil && !ok {
+		return fmt.Errorf("field gen in CheckoutResult: required")
+	}
+	if _, ok := raw["messageId"]; raw != nil && !ok {
+		return fmt.Errorf("field messageId in CheckoutResult: required")
+	}
+	if _, ok := raw["repos"]; raw != nil && !ok {
+		return fmt.Errorf("field repos in CheckoutResult: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in CheckoutResult: required")
+	}
+	if _, ok := raw["type"]; raw != nil && !ok {
+		return fmt.Errorf("field type in CheckoutResult: required")
+	}
+	type Plain CheckoutResult
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if matched, _ := regexp.MatchString(`^checkout_result:.+$`, string(plain.MessageId)); !matched {
+		return fmt.Errorf("field %s pattern match: must match %s", "MessageId", `^checkout_result:.+$`)
+	}
+	if plain.Repos != nil && len(plain.Repos) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "repos", 1)
+	}
+	if plain.Type != "checkout_result" {
+		return fmt.Errorf("field %s: must be equal to %s", "type", "checkout_result")
+	}
+	*j = CheckoutResult(plain)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *Checkout) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["gen"]; raw != nil && !ok {
+		return fmt.Errorf("field gen in Checkout: required")
+	}
+	if _, ok := raw["messageId"]; raw != nil && !ok {
+		return fmt.Errorf("field messageId in Checkout: required")
+	}
+	if _, ok := raw["repos"]; raw != nil && !ok {
+		return fmt.Errorf("field repos in Checkout: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in Checkout: required")
+	}
+	if _, ok := raw["type"]; raw != nil && !ok {
+		return fmt.Errorf("field type in Checkout: required")
+	}
+	type Plain Checkout
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if plain.Repos != nil && len(plain.Repos) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "repos", 1)
+	}
+	if plain.Type != "checkout" {
+		return fmt.Errorf("field %s: must be equal to %s", "type", "checkout")
+	}
+	*j = Checkout(plain)
+	return nil
+}
+
 // CRITICAL (requires ackId). outcome MUST match the turn_status terminal states
 // (migrations/000005_turns.up.sql).
 type ExecutionComplete struct {
@@ -1351,6 +1617,11 @@ type ReadyCapabilities struct {
 	// prompt_received event, a duplicate included, and runs a prompt messageId at
 	// most once for its gen, across a restart of the agent process too.
 	PromptReceipt *bool `json:"promptReceipt,omitempty,omitzero" yaml:"promptReceipt,omitempty" mapstructure:"promptReceipt,omitempty"`
+
+	// True when the agent runs the checkout command, answering each with a
+	// checkout_result (technical plan §21.1, §30.4). Absent: the agent does not know
+	// the command, and skips it as an unknown one.
+	ReviewCheckout *bool `json:"reviewCheckout,omitempty,omitzero" yaml:"reviewCheckout,omitempty" mapstructure:"reviewCheckout,omitempty"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.

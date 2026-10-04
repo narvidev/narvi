@@ -1,6 +1,7 @@
 package contractstest
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
@@ -125,12 +126,61 @@ func TestSandboxCommandsRoundTrip(t *testing.T) {
 			Gen:       1,
 		})
 	})
+
+	t.Run("Checkout", func(t *testing.T) {
+		// Technical plan §21.1, §30.4: the commit a review turn records, read
+		// from its pull request's ref in the base repository -- a SHA-1 and a
+		// SHA-256 name alike.
+		roundTrip(t, sch, sandboxws.Checkout{
+			Type:      "checkout",
+			MessageId: "m9",
+			SessionId: testSessionID,
+			Gen:       1,
+			Repos: []sandboxws.CheckoutReposElem{
+				{Name: "widgets", Ref: "refs/pull/7/head", Sha: "0123456789abcdef0123456789abcdef01234567"},
+				{Name: "docs", Ref: "refs/pull/12/head", Sha: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+			},
+		})
+	})
+
+	// The ref and the sha reach the agent's git argument list, so the
+	// schema and the generated decoder alike refuse any other shape.
+	t.Run("Checkout_RefOrShaOutOfShapeRejected", func(t *testing.T) {
+		const goodRef, goodSha = "refs/pull/7/head", "0123456789abcdef0123456789abcdef01234567"
+		tests := []struct{ name, ref, sha string }{
+			{name: "a branch for ref", ref: "refs/heads/main", sha: goodSha},
+			{name: "an option for ref", ref: "--upload-pack=x", sha: goodSha},
+			{name: "an abbreviated sha", ref: goodRef, sha: goodSha[:12]},
+			{name: "an uppercase sha", ref: goodRef, sha: "0123456789ABCDEF0123456789ABCDEF01234567"},
+			{name: "a revision expression for sha", ref: goodRef, sha: "HEAD~1"},
+		}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				payload := []byte(`{"type":"checkout","messageId":"m10","sessionId":"` + testSessionID +
+					`","gen":1,"repos":[{"name":"widgets","ref":"` + tt.ref + `","sha":"` + tt.sha + `"}]}`)
+				if err := validateJSON(t, sch, payload); err == nil {
+					t.Fatal("expected schema validation to fail, got nil error")
+				}
+				var cmd sandboxws.Checkout
+				if err := json.Unmarshal(payload, &cmd); err == nil {
+					t.Fatal("expected Go unmarshal to fail, got nil error")
+				}
+			})
+		}
+	})
+
+	t.Run("Checkout_NoRepoRejected", func(t *testing.T) {
+		payload := []byte(`{"type":"checkout","messageId":"m11","sessionId":"` + testSessionID + `","gen":1,"repos":[]}`)
+		if err := validateJSON(t, sch, payload); err == nil {
+			t.Fatal("expected a checkout naming no repo to fail validation, got nil error")
+		}
+	})
 }
 
 func TestSandboxCommandsRejectUnknownType(t *testing.T) {
 	sch := compileSchema(t, "sandbox-ws/v1/commands.schema.json", "")
 
-	// "restart" is not one of the 7 §6.1 commands; the oneOf must reject it
+	// "restart" is not one of the 8 §6.1 commands; the oneOf must reject it
 	// (every branch's "type" const fails to match).
 	data := []byte(`{"type":"restart","messageId":"m1","sessionId":"` + testSessionID + `","gen":1}`)
 	if err := validateJSON(t, sch, data); err == nil {

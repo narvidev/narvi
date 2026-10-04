@@ -513,6 +513,24 @@ describe('buildTimelineModel', () => {
     expect(model.sawAgentReady).toBe(false)
   })
 
+  it('opens no turn at a checkout_result (technical plan §21.1) arriving between turns', () => {
+    const events = [
+      env('tool_call', { messageId: 'm1', callId: 'c1', toolName: 'Read', input: {} }),
+      env('execution_complete', { messageId: 'm2', outcome: 'completed', reason: null }),
+      env('checkout_result', {
+        type: 'checkout_result',
+        messageId: 'checkout_result:k1',
+        sessionId: 's',
+        gen: 1,
+        commandMessageId: 'k1',
+        repos: [{ name: 'widgets', outcome: 'checked_out', headSha: 'a'.repeat(40), refSha: 'a'.repeat(40), error: null }],
+      }),
+    ]
+    const model = buildTimelineModel(events)
+    expect(model.turns).toHaveLength(1)
+    expect(model.turns[0]!.live).toBe(false)
+  })
+
   it('reads a ready that advertises capabilities as any agent ready', () => {
     const events = [
       env('boot_progress', { messageId: 'm1', phase: 'installing deps', timestamp: '2026-08-20T10:00:00Z' }),

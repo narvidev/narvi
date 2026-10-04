@@ -117,6 +117,33 @@
         "sessionId": { "type": "string", "format": "uuid" },
         "gen": { "type": "integer" }
       }
+    },
+    "Checkout": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Technical plan §21.1, §30.4: check out, in each repo named, the commit a review turn records, read from its pull request's ref in the base repository. The agent fetches ref, checks out sha detached and forced, removes untracked files (ignored files are kept), and answers with one checkout_result whose messageId is 'checkout_result:{this messageId}'. Sent only to a gen whose ready advertised capabilities.reviewCheckout; an agent that predates it skips it as an unknown command.",
+      "required": ["type", "messageId", "sessionId", "gen", "repos"],
+      "properties": {
+        "type": { "type": "string", "const": "checkout" },
+        "messageId": { "type": "string" },
+        "sessionId": { "type": "string", "format": "uuid" },
+        "gen": { "type": "integer" },
+        "repos": {
+          "type": "array",
+          "minItems": 1,
+          "description": "Per-repo checkout spec. Repos are always a list (§3.4); each name is a SessionConfig.repos[].name.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "ref", "sha"],
+            "properties": {
+              "name": { "type": "string" },
+              "ref": { "type": "string", "pattern": "^refs/pull/[1-9][0-9]*/head$", "description": "The pull request's head ref in the base repository." },
+              "sha": { "type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$", "description": "The commit the turn records, in lowercase hex: 40 characters, or 64 in a SHA-256 repository." }
+            }
+          }
+        }
+      }
     }
   },
   "oneOf": [
@@ -126,6 +153,7 @@
     { "$ref": "#/$defs/Snapshot" },
     { "$ref": "#/$defs/Shutdown" },
     { "$ref": "#/$defs/Ack" },
-    { "$ref": "#/$defs/GitSyncComplete" }
+    { "$ref": "#/$defs/GitSyncComplete" },
+    { "$ref": "#/$defs/Checkout" }
   ]
 }

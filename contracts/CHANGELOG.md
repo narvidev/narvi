@@ -10,6 +10,59 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.24.0]
+
+### session-config/v1/session-config.schema.json
+
+- Added: optional `repos[].ref`, a nullable string matching
+  `^refs/pull/[1-9][0-9]*/head$`: the pull request's head ref in its base
+  repository (technical plan §21.1, §30.4). The control plane sets it on a
+  pull request's review session, when the repo's `url` names that base
+  repository, each time it assembles the document; it is never stored.
+  When set, the sandbox clones `url` and checks out the ref's tip,
+  detached, and `branch` is never checked out. An agent that predates it
+  ignores the key and clones as before; an older control plane never
+  writes it. A property added, not required, grades MINOR (row 2).
+
+### sandbox-ws/v1/commands.schema.json
+
+- Added: `Checkout`, the new `checkout` command, appended to the root
+  `oneOf`: for each repo it names (`name`, `ref`, `sha`), the agent fetches
+  the pull request's ref from the base repository, checks out `sha`
+  detached and forced, removes untracked files and keeps ignored ones, and
+  answers with one `checkout_result`. The control plane sends it only to a
+  gen whose `ready` advertised `capabilities.reviewCheckout`; nothing sends
+  it in this release. A new `$defs` entry grades MINOR (row 32), and a
+  discriminated variant added under shape A grades MINOR (row 28);
+  `checkout` was never assigned in an earlier release, so row 46 does not
+  apply.
+
+### sandbox-ws/v1/events.schema.json
+
+- Added: optional boolean `Ready.capabilities.reviewCheckout`: the agent
+  runs the `checkout` command. Absent means it does not, and skips the
+  command as an unknown one. A property added, not required, grades MINOR
+  (row 2); the `ready` union member changes only by that property (row 30,
+  recursing into row 2).
+- Added: `CheckoutResult`, the new `checkout_result` event, appended to the
+  root `oneOf`: `commandMessageId` names the command it answers, and each
+  repo entry carries its `outcome` (`checked_out`, `sha_absent`,
+  `fetch_failed`, `busy` or `failed`), the `headSha` the worktree holds
+  after a checkout, the `refSha` the ref's tip was fetched at, and an
+  `error`. `messageId` is deterministic,
+  `checkout_result:{commandMessageId}`, so every copy of one command's
+  result is stored once, by whichever control-plane binary stores it. Not
+  critical: it carries no `ackId`, and the six critical types are
+  unchanged. A new `$defs` entry grades MINOR (row 32), and a
+  discriminated variant added under shape A grades MINOR (row 28);
+  `checkout_result` was never assigned in an earlier release, so row 46
+  does not apply.
+- Added: `sandbox-ws/v1/events.schema.json#/$defs/CheckoutResult/properties/repos/items/properties/outcome`
+  to `manifest.json`'s `openEnums`, so a later outcome grades MINOR: a
+  reader MUST treat an outcome it does not recognise as `failed`. The
+  entry is not itself a graded finding; read from the merge base, it
+  applies from the next release.
+
 ## [1.23.0]
 
 ### rest/v1/dtos.schema.json

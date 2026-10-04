@@ -30,6 +30,10 @@
               "type": "integer",
               "minimum": 1,
               "description": "The largest message, in bytes, this agent reads. The control plane records it against the gen, the latest ready deciding, and never writes that gen a prompt frame longer than it, nor longer than its own MaxPromptFrameBytes. Absent: the gen is held to MaxPromptFrameBytes when this ready advertises promptReceipt, and otherwise to the WebSocket library's default read limit, 32768 bytes (technical plan §3.3, §6.1)."
+            },
+            "reviewCheckout": {
+              "type": "boolean",
+              "description": "True when the agent runs the checkout command, answering each with a checkout_result (technical plan §21.1, §30.4). Absent: the agent does not know the command, and skips it as an unknown one."
             }
           }
         }
@@ -415,6 +419,39 @@
         "promptMessageId": { "type": "string", "description": "The messageId of the prompt command this answers." },
         "duplicate": { "type": "boolean", "description": "True when this gen's agent had already received promptMessageId and did not run it again." }
       }
+    },
+    "CheckoutResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Technical plan §21.1, §30.4: what the agent holds after a checkout command, one entry per repo it named. NOT critical (no ackId): a lost result is asked for again by the next checkout. messageId is deterministic, so every copy of one command's result is stored once, whichever control-plane binary stores it, and is found by that key.",
+      "required": ["type", "messageId", "sessionId", "gen", "commandMessageId", "repos"],
+      "properties": {
+        "type": { "type": "string", "const": "checkout_result" },
+        "messageId": { "type": "string", "pattern": "^checkout_result:.+$", "description": "'checkout_result:{commandMessageId}'." },
+        "sessionId": { "type": "string", "format": "uuid" },
+        "gen": { "type": "integer" },
+        "commandMessageId": { "type": "string", "description": "The messageId of the checkout command this answers." },
+        "repos": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["name", "outcome", "headSha", "refSha", "error"],
+            "properties": {
+              "name": { "type": "string" },
+              "outcome": {
+                "type": "string",
+                "enum": ["checked_out", "sha_absent", "fetch_failed", "busy", "failed"],
+                "description": "checked_out: the worktree holds headSha. sha_absent: the ref was fetched, and the commit asked for is not in the repository; the worktree is untouched. fetch_failed: the ref could not be fetched. busy: a turn or the boot was running, so nothing was done. failed: anything else, named in error. An open enum: a reader treats a value it does not know as failed."
+              },
+              "headSha": { "type": ["string", "null"], "description": "HEAD after a checked_out outcome; null otherwise." },
+              "refSha": { "type": ["string", "null"], "description": "The tip of ref as fetched, whatever the outcome; null when it was never read." },
+              "error": { "type": ["string", "null"], "description": "Why the outcome is not checked_out, at most 4096 bytes; null on checked_out." }
+            }
+          }
+        }
+      }
     }
   },
   "oneOf": [
@@ -438,6 +475,7 @@
     { "$ref": "#/$defs/SnapshotReady" },
     { "$ref": "#/$defs/SubTaskStart" },
     { "$ref": "#/$defs/SubTaskFinish" },
-    { "$ref": "#/$defs/PromptReceived" }
+    { "$ref": "#/$defs/PromptReceived" },
+    { "$ref": "#/$defs/CheckoutResult" }
   ]
 }
