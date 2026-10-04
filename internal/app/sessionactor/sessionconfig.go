@@ -8,6 +8,7 @@ package sessionactor
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/environment"
 	"github.com/narvidev/narvi/internal/domain/provenance"
+	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -190,15 +192,12 @@ func (a *Actor) allowlistFloorHosts(ctx context.Context, repos []sessionconfig.S
 // place this decision is made, so an operator investigating "why did the
 // counter-reviewer run under model X" (or "why didn't it get an opposing
 // pin at all") has a single log line to search for, keyed by repo/PR.
-func (a *Actor) reviewCounterReviewerModel(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session) *string {
-	if a.stores.githubPRSession == nil {
-		return nil
-	}
-	prSession, err := a.stores.githubPRSession.WithTx(tx).GetBySessionID(ctx, sessionRow.ID)
-	if err != nil {
-		// pgx.ErrNoRows: not a review session at all -- every OTHER error
-		// (a genuine, unexpected read failure) degrades identically, never
-		// blocking this spawn over a best-effort, purely additive signal.
+//
+// prSession is the session's pull request claim, read once by reviewClaim
+// for this and the pull request ref alike; nil for every session that has
+// none.
+func (a *Actor) reviewCounterReviewerModel(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, prSession *sqlcgen.GithubPrSession) *string {
+	if prSession == nil {
 		return nil
 	}
 
@@ -225,6 +224,53 @@ func (a *Actor) reviewCounterReviewerModel(ctx context.Context, tx pgx.Tx, sessi
 		"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber,
 		"authoring_model", prov.AuthoringModel, "counter_reviewer_model", model)
 	return &model
+}
+
+// reviewClaim reads sessionRow's pull request claim (github_pr_sessions),
+// the one read assembleSessionConfig makes for both the pull request ref
+// (pullRequestRef) and the counter-reviewer override
+// (reviewCounterReviewerModel). nil for a session that is not a pull
+// request's review session (pgx.ErrNoRows, the overwhelming common case),
+// and nil, logged, on any other failure: both readers are best-effort and
+// never block a spawn (§10-P2), and a review session assembled without its
+// ref boots exactly as one did before the ref existed.
+func (a *Actor) reviewClaim(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session) *sqlcgen.GithubPrSession {
+	if a.stores.githubPRSession == nil {
+		return nil
+	}
+	prSession, err := a.stores.githubPRSession.WithTx(tx).GetBySessionID(ctx, sessionRow.ID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			platform.Logger(ctx).Warn("sessionactor: read the session's pull request claim for its session config failed, assembling it without",
+				"error", err)
+		}
+		return nil
+	}
+	return &prSession
+}
+
+// pullRequestRef is the ref a review session's primary repo is checked out
+// at (technical plan §21.1, §30.4): the pull request's head ref, which a
+// code host keeps in the pull request's base repository. It is derived
+// here, each time a SESSION_CONFIG is assembled, from the session's claim,
+// and never stored. nil when there is no claim, when the claim's number
+// makes no valid ref, or when repo's url does not name the claim's
+// repository: such a ref is not in the repository cloned -- a review
+// session opened before its spec named the base repository names the
+// fork's -- and that session boots on its branch as before.
+func pullRequestRef(prSession *sqlcgen.GithubPrSession, repo sessionconfig.SessionConfigReposElem) *string {
+	if prSession == nil {
+		return nil
+	}
+	owner, name, err := reposource.ParseOwnerRepo(repo.Url)
+	if err != nil || !strings.EqualFold(owner+"/"+name, prSession.RepoFullName) {
+		return nil
+	}
+	ref := reposource.PullHeadRef(prSession.PrNumber)
+	if reposource.ValidatePullHeadRef(ref) != nil {
+		return nil
+	}
+	return &ref
 }
 
 // reviewCredentialedProviders resolves the set of counterReviewerProviderPreference
@@ -327,7 +373,9 @@ func CounterReviewCredentialedProviders(ctx context.Context, prSessions credenti
 //     back from a previously-appended value, so the floor can never go
 //     stale (brief point B: "appended on the server as the policy is
 //     built, never merely validated at input").
-//   - Repos: read back from sessions.repos.
+//   - Repos: read back from sessions.repos; on a pull request's review
+//     session the primary repo also carries the pull request's head ref,
+//     derived from its claim (pullRequestRef), never stored.
 //   - SandboxId: sandboxID, the caller's already-known sandboxes.id
 //     (row.ID.String() at the one production call site, tryPlanSpawn) --
 //     this sandbox's own stable, real identity, closing the env-leak
@@ -349,6 +397,11 @@ func (a *Actor) assembleSessionConfig(
 	repos, err := reposFromJSON(sessionRow.Repos)
 	if err != nil {
 		return sessionconfig.SessionConfig{}, err
+	}
+
+	prSession := a.reviewClaim(ctx, tx, sessionRow)
+	if len(repos) > 0 {
+		repos[0].Ref = pullRequestRef(prSession, repos[0])
 	}
 
 	pathScope, dockerRequired, egressPolicy, err := a.environmentSubstrate(ctx, tx, sessionRow.EnvironmentID)
@@ -420,6 +473,6 @@ func (a *Actor) assembleSessionConfig(
 		// oppose -- see reviewCounterReviewerModel's own doc comment,
 		// above, for the full "why nil is the common case, not a
 		// degradation".
-		ReviewCounterReviewerModel: sessionconfig.SessionConfigReviewCounterReviewerModel(a.reviewCounterReviewerModel(ctx, tx, sessionRow)),
+		ReviewCounterReviewerModel: sessionconfig.SessionConfigReviewCounterReviewerModel(a.reviewCounterReviewerModel(ctx, tx, sessionRow, prSession)),
 	}, nil
 }

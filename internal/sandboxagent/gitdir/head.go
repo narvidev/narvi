@@ -172,17 +172,18 @@ func writeFileAtomic(path string, data []byte, mode os.FileMode) error {
 // agent git command actually moved the agent's own HEAD (a checkout, a
 // branch creation, ...).
 //
-// The agent's own HEAD must be a symbolic ref (a branch) -- "ref:
-// refs/heads/<branch>\n" -- never a detached sha: the agent side of this
-// split never legitimately detaches (every checkoutBranch/checkoutBase
-// call in gitclone either switches to or creates a named branch), so a
-// detached agent HEAD reaching this function is treated as an error
-// rather than silently detaching the runtime's own worktree to match.
+// The agent's own HEAD is one of the two shapes SyncHeadIn accepts: a
+// symbolic ref to a branch -- "ref: refs/heads/<branch>\n", what every
+// checkoutBranch/checkoutBase call in gitclone leaves -- or a detached
+// 40-character sha, what gitclone.CheckoutPullRef leaves when it checks
+// out a pull request's recorded head (technical plan §21.1). Anything
+// else is an error, and the runtime's HEAD is left as it was.
 //
-// The write itself runs `git -C <worktree> symbolic-ref HEAD
-// refs/heads/<branch>` AS THE RUNTIME's OWN IDENTITY (RuntimeGit) --
-// this is the runtime's own identity acting on its own .git, granted by
-// §30.5, and avoids a root-privileged write landing inside a
+// The write itself runs AS THE RUNTIME's OWN IDENTITY (RuntimeGit): `git
+// -C <worktree> symbolic-ref HEAD refs/heads/<branch>` for a branch, and
+// `git -C <worktree> update-ref --no-deref HEAD <sha>` for a detached
+// sha. This is the runtime's own identity acting on its own .git, granted
+// by §30.5, and avoids a root-privileged write landing inside a
 // runtime-owned directory (the same posture boot/workspaceowner.go's own
 // doc comment already establishes for why the chown itself, not its
 // absence, is the thing that "fails loudly").
@@ -193,9 +194,23 @@ func SyncHeadOut(ctx context.Context, sup *supervisor.Supervisor, repo githarden
 	}
 
 	s := string(data)
+	if detachedHeadPattern.MatchString(s) {
+		sha := strings.TrimSuffix(s, "\n")
+		result, err := RuntimeGit(ctx, sup, cred, repo.WorkTree, nil, nil, timeout, stopGrace, "update-ref", "--no-deref", "HEAD", sha)
+		if err != nil {
+			return fmt.Errorf("gitdir: sync head out: %w", err)
+		}
+		if result.Err != nil {
+			return fmt.Errorf("gitdir: sync head out: %w", result.Err)
+		}
+		if result.ExitCode != 0 {
+			return fmt.Errorf("gitdir: sync head out: git update-ref --no-deref HEAD exited %d", result.ExitCode)
+		}
+		return nil
+	}
 	rest, ok := strings.CutPrefix(s, "ref: refs/heads/")
 	if !ok {
-		return fmt.Errorf("gitdir: sync head out: agent HEAD is detached, never synced out: %q", s)
+		return fmt.Errorf("gitdir: sync head out: agent HEAD is neither a branch nor a detached sha, never synced out: %q", s)
 	}
 	branch, ok := strings.CutSuffix(rest, "\n")
 	if !ok || strings.Contains(branch, "\n") {

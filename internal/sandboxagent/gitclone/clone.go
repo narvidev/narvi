@@ -58,8 +58,17 @@ type CloneResult struct {
 // session-wide setting is a fatal configuration error for the whole spawn,
 // not a single repo's problem.
 //
-// On a primary (repos[0]) clone (or, when scoped, sparse-checkout)
-// failure, CloneAll returns immediately with a fatal error -- no repo
+// A repo with a Ref (a pull request's review session, technical plan
+// §21.1, §30.4) is cloned without its Branch, then CheckoutPullRef checks
+// out the ref's tip, detached, and applies pathScope in
+// applySparseCheckout's place. A ref that cannot be fetched is logged and
+// leaves the clone's default branch, scoped as any other clone: the
+// checkout command (cmd/sandbox-agent's HandleCheckout) fetches the ref
+// again for the head a turn records.
+//
+// On a primary (repos[0]) clone (or, when scoped, sparse-checkout, or
+// pull request checkout) failure, CloneAll returns immediately with a
+// fatal error -- no repo
 // after it is attempted, matching RunHooks' own "any fatal failure stops
 // immediately" semantics exactly. A secondary repo's failure is logged as
 // a warning and does not stop the loop; subsequent repos still get
@@ -144,7 +153,26 @@ func CloneAll(
 		if cloneErr == nil && chownRepo != nil {
 			cloneErr = chownRepo(dir)
 		}
-		if cloneErr == nil && scoped {
+		if cloneErr == nil && repo.Ref != nil {
+			// A pull request's review session (technical plan §21.1,
+			// §30.4): check out the ref's tip, which also applies the path
+			// scope. A ref that cannot be fetched is a warning, not a failed
+			// boot -- the checkout command fetches it again for the head a
+			// turn records -- and the clone's default branch is then scoped
+			// as any other fresh clone is.
+			checkout := CheckoutPullRef(ctx, sup, layout, cred, chownRepo, repo, *repo.Ref, "", pathScope, cloneTimeout, cloneTimeout, stopGrace)
+			switch checkout.Outcome {
+			case PullCheckoutCheckedOut:
+			case PullCheckoutFetchFailed:
+				platform.Logger(ctx).Warn("gitclone: pull request ref could not be fetched at boot, proceeding on the clone's default branch",
+					"repo", repo.Name, "ref", *repo.Ref, "error", checkout.Err)
+				if scoped {
+					cloneErr = applySparseCheckout(ctx, sup, repoHandle, cred, pathScope, cloneTimeout, stopGrace)
+				}
+			default:
+				cloneErr = checkout.Err
+			}
+		} else if cloneErr == nil && scoped {
 			cloneErr = applySparseCheckout(ctx, sup, repoHandle, cred, pathScope, cloneTimeout, stopGrace)
 		}
 		results = append(results, CloneResult{Repo: repo, Primary: primary, Dir: dir, Err: cloneErr})
@@ -382,9 +410,11 @@ func disableSparseCheckoutIfEnabled(ctx context.Context, sup *supervisor.Supervi
 // repo's fields need, in order, stopping at the first failure -- Branch
 // is validated only when non-nil (§3.4: nil means "the repo's own
 // default branch", reposource.ValidateBranch is never invoked for that
-// case). Called BEFORE any filepath.Join or sup.Spawn happens for this
-// repo (see CloneAll's own loop and reposource's own package doc comment
-// for the argument-injection/path-traversal reasoning this closes).
+// case), and Ref likewise (absent on every session but a pull request's
+// review session). Called BEFORE any filepath.Join or sup.Spawn happens
+// for this repo (see CloneAll's own loop and reposource's own package doc
+// comment for the argument-injection/path-traversal reasoning this
+// closes).
 func validateRepoSpec(repo sessionconfig.SessionConfigReposElem) error {
 	if err := reposource.ValidateRepoName(repo.Name); err != nil {
 		return fmt.Errorf("gitclone: invalid repo name: %w", err)
@@ -395,6 +425,11 @@ func validateRepoSpec(repo sessionconfig.SessionConfigReposElem) error {
 	if repo.Branch != nil {
 		if err := reposource.ValidateBranch(*repo.Branch); err != nil {
 			return fmt.Errorf("gitclone: invalid repo branch: %w", err)
+		}
+	}
+	if repo.Ref != nil {
+		if err := reposource.ValidatePullHeadRef(*repo.Ref); err != nil {
+			return fmt.Errorf("gitclone: invalid repo ref: %w", err)
 		}
 	}
 	return nil
@@ -448,7 +483,11 @@ func cloneOne(
 	// Username"), verified against real git. As a top-level override it is
 	// also never written into the runtime's .git/config.
 	clone := []string{"clone"}
-	if repo.Branch != nil {
+	// A repo with a pull request ref never clones its branch: the ref is
+	// checked out right after (CloneAll), and for a pull request from a
+	// fork the branch names the fork's head branch, which the base
+	// repository may not have at all, or may have as another commit.
+	if repo.Branch != nil && repo.Ref == nil {
 		clone = append(clone, "--branch", *repo.Branch)
 	}
 	// "--" ends option parsing for everything after it (verified directly

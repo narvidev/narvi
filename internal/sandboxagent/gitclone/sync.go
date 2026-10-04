@@ -151,6 +151,19 @@ func (r SyncResult) ToCloneResult() CloneResult {
 // non-empty pathScope re-narrows every repo's sparse-checkout
 // configuration (applySparseCheckout, clone.go) once that repo itself
 // reaches gitstate.StateReady.
+//
+// A repo with a Ref -- a pull request's review session, technical plan
+// §21.1, §30.4 -- takes none of the above: right after its git-dir is
+// seeded, CheckoutPullRef checks out the ref's tip, detached, discarding
+// whatever the previous turn left in the worktree, and applies pathScope
+// itself. A review session is read-only and never pushes, so its worktree
+// holds no edit to keep, and nothing is stashed (§3.4's P0 is scoped to
+// sessions that push). Such a repo never enters the gitstate machine: its
+// SyncResult carries no State and no Branch. A ref that cannot be fetched
+// is a warning, as a failed fetch is above, and leaves the worktree as it
+// was, with its path scope enforced: the checkout command
+// (cmd/sandbox-agent's HandleCheckout) fetches the ref again for the head
+// a turn records.
 func SyncAll(
 	ctx context.Context,
 	sup *supervisor.Supervisor,
@@ -249,6 +262,10 @@ func syncOne(
 	if err := gitdir.Seed(ctx, sup, repoHandle, repo.Url, cred, stepTimeout, stopGrace); err != nil {
 		return SyncResult{Repo: repo, Primary: primary, Dir: filepath.Join(workspaceDir, repo.Name),
 			Err: fmt.Errorf("gitclone: seed agent git-dir for %s: %w", repo.Name, err)}
+	}
+
+	if repo.Ref != nil {
+		return syncPullRef(ctx, sup, layout, cred, repo, primary, pathScope, fetchStepTimeout, stepTimeout, stopGrace, onGitSync)
 	}
 
 	dir := repoHandle.WorkTree
@@ -494,6 +511,61 @@ func syncOne(
 	// deferred call above, regardless of this success path or any earlier
 	// failure -- see its own comment for why.
 	result.State = state
+	return result
+}
+
+// syncPullRef is syncOne for a repo with a Ref, a pull request's review
+// session (technical plan §21.1, §30.4; see SyncAll's own doc comment):
+// CheckoutPullRef at the ref's tip, nothing stashed, the gitstate machine
+// never entered. The worktree is re-owned for the runtime by the boot's
+// own pass over the whole workspace, after SyncAll, so no chown runs here.
+//
+// When the checkout does not complete, the path scope is still enforced on
+// whatever the worktree holds, by the rule syncOne's deferred step
+// follows, and a failure to enforce it is added to the result's error: a
+// secondary repo's failure only warns, and its directory must not keep an
+// out-of-scope path for that (§14.1). A ref that could not be fetched is
+// a warning, not a failed repo.
+func syncPullRef(
+	ctx context.Context,
+	sup *supervisor.Supervisor,
+	layout gitdir.Layout,
+	cred *syscall.Credential,
+	repo sessionconfig.SessionConfigReposElem,
+	primary bool,
+	pathScope []string,
+	fetchStepTimeout, stepTimeout, stopGrace time.Duration,
+	onGitSync OnGitSync,
+) SyncResult {
+	handle := layout.Repo(repo.Name)
+	result := SyncResult{Repo: repo, Primary: primary, Dir: handle.WorkTree}
+
+	onGitSync(repo.Name, "checkout", *repo.Ref)
+	checkout := CheckoutPullRef(ctx, sup, layout, cred, nil, repo, *repo.Ref, "", pathScope, fetchStepTimeout, stepTimeout, stopGrace)
+	switch checkout.Outcome {
+	case PullCheckoutCheckedOut:
+		return result
+	case PullCheckoutFetchFailed:
+		platform.Logger(ctx).Warn("gitclone: pull request ref could not be fetched at boot, proceeding on the worktree as it was",
+			"repo", repo.Name, "ref", *repo.Ref, "error", checkout.Err)
+	default:
+		result.Err = fmt.Errorf("gitclone: check out %s for %s: %w", *repo.Ref, repo.Name, checkout.Err)
+	}
+
+	var scopeErr error
+	if len(pathScope) > 0 {
+		scopeErr = applySparseCheckout(ctx, sup, handle, cred, pathScope, stepTimeout, stopGrace)
+	} else {
+		scopeErr = disableSparseCheckoutIfEnabled(ctx, sup, handle, cred, stepTimeout, stopGrace)
+	}
+	if scopeErr != nil {
+		wrapped := fmt.Errorf("gitclone: path scope %s: %w", repo.Name, scopeErr)
+		if result.Err != nil {
+			result.Err = fmt.Errorf("%w (repo also failed to sync earlier: %v)", wrapped, result.Err)
+		} else {
+			result.Err = wrapped
+		}
+	}
 	return result
 }
 

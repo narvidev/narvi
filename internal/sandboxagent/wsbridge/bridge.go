@@ -30,6 +30,19 @@ type CommandHandler interface {
 	HandleGitSyncComplete(ctx context.Context, cmd sandboxws.GitSyncComplete)
 }
 
+// CheckoutHandler is the optional handler of the "checkout" command
+// (technical plan §21.1, §30.4): a CommandHandler that also implements it
+// is handed every gen-checked checkout, and every ready its Bridge sends
+// advertises capabilities.reviewCheckout. One that does not never sees the
+// command -- it is logged and skipped, as an unknown command is -- and no
+// ready advertises the capability, so the control plane never sends it.
+// It is an interface of its own so every CommandHandler written before it
+// keeps compiling unchanged. HandleCheckout is called on the read loop and
+// must return at once, answering later with a checkout_result.
+type CheckoutHandler interface {
+	HandleCheckout(ctx context.Context, cmd sandboxws.Checkout)
+}
+
 // FatalConnectError is returned by Run when the WS handshake itself
 // returns 401/403/404/410 (§6.1: "Agent treats 401/403/404/410 as fatal (no
 // retry)"). Any OTHER connect failure (network error, 5xx, timeout) is
