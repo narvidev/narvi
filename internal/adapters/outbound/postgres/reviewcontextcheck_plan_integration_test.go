@@ -58,6 +58,10 @@ type contextPlanShape struct {
 	longTail                    string
 	longAfterAnalyze            bool
 	interleave                  int
+	// tailTrigger is the lane the long session's "attempt" or "queued"
+	// tail recorded as asking for it: 'auto' when empty, a person's lane
+	// ('button' or 'label') for the owed requests' plan test.
+	tailTrigger string
 }
 
 // storeContextPlanShape stores shape in pool's database, migrated to 159,
@@ -148,14 +152,14 @@ func storeContextPlanShape(ctx context.Context, t *testing.T, pool *pgxpool.Pool
 		case "attempt":
 			exec("the long session's automatic attempt", `
 				INSERT INTO turns (session_id, status, is_review_attempt, review_head_sha, review_verdict_context, request_trigger)
-				VALUES ($1, 'pending', true, 'sha-queued', '{"baseRef":"main","baseSha":"b","policyVersion":1}', 'auto')`, long)
+				VALUES ($1, 'pending', true, 'sha-queued', '{"baseRef":"main","baseSha":"b","policyVersion":1}', COALESCE(NULLIF($2::text, ''), 'auto'))`, long, shape.tailTrigger)
 		case "queued":
 			// Created half a second before the session's last ended turn
 			// ended, after that turn was created.
 			exec("the long session's queued automatic attempt", `
 				INSERT INTO turns (session_id, status, created_at, is_review_attempt, review_head_sha, review_verdict_context, request_trigger)
-				SELECT $1, 'pending', max(completed_at) - interval '0.5 seconds', true, 'sha-queued', '{"baseRef":"main","baseSha":"b","policyVersion":1}', 'auto'
-				FROM turns WHERE session_id = $1`, long)
+				SELECT $1, 'pending', max(completed_at) - interval '0.5 seconds', true, 'sha-queued', '{"baseRef":"main","baseSha":"b","policyVersion":1}', COALESCE(NULLIF($2::text, ''), 'auto')
+				FROM turns WHERE session_id = $1`, long, shape.tailTrigger)
 		}
 		exec("the long session's claim", `INSERT INTO github_pr_sessions (repo_full_name, pr_number, session_id, pending_retrigger_head_sha) VALUES ('acme/long', 1, $1, 'sha-pending')`, long)
 		exec("the long session's timers", `

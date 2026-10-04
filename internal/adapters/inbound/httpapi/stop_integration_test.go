@@ -2981,7 +2981,7 @@ func TestStopSession_WorkflowCancelAfterAResumeEndsTheRun(t *testing.T) {
 			stopEventually(t, 10*time.Second, "the stop is sent", func() bool { return len(rig.commander.ofType(t, "stop")) == 1 })
 
 			if _, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, session.ID,
-				"@narvi carry on", nil, false, false, owner.ID, nil, nil, nil, nil, nil, nil, nil, nil, false); err != nil {
+				"@narvi carry on", nil, false, false, owner.ID, nil, nil, nil, nil, nil, nil, nil, nil, false, nil, nil); err != nil {
 				t.Fatalf("mention: %v", err)
 			}
 			if rig.sessionRow(ctx, t, session.ID).StopRequestedAt.Valid || !rig.turnRow(ctx, t, attempt.ID).StopRequestedAt.Valid || rig.turnRow(ctx, t, attempt.ID).Status != sqlcgen.TurnStatusProcessing {

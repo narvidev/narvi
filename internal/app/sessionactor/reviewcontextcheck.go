@@ -1,10 +1,9 @@
 // This file (reviewcontextcheck.go) implements technical plan §24.9's
-// second rule for an automatic review attempt: a review attempt that
-// waited behind another turn checks, as it is dispatched, that the head,
-// base and ancestor chain it recorded are still its pull request's. A
-// review runs with the diff and context captured when it was inserted, so
-// one queued behind a turn while the pull request moved would review code
-// that no longer exists.
+// second rule: a review attempt that waited behind another turn checks, as
+// it is dispatched, that the head, base and ancestor chain it recorded are
+// still its pull request's. A review runs with the diff and context
+// captured when it was inserted, so one queued behind a turn while the
+// pull request moved would review code that no longer exists.
 //
 // # Two halves, like every dispatch
 //
@@ -34,24 +33,31 @@
 //     through the machine's abandon edge with the end reason
 //     context_moved, which the session's status derivation and every
 //     reader of attempts skip: it notifies nobody, publishes no check, and
-//     fails nothing. In the same transaction the automatic request goes
+//     fails nothing. In the same transaction an automatic request goes
 //     back to the lane -- the pull request's pending head set again if no
 //     push left one, the debounce due at once if none is armed (its
 //     insert consumed it, and a moved base brings no push) -- and the
 //     count grows by one; past ReviewContextMoveMaxConsecutive the request
 //     is dropped instead, and the session's status shows the drop. When a
 //     younger automatic attempt already queued recorded the live head, it
-//     stands for the request, and nothing is asked again;
+//     stands for the request, and nothing is asked again. A person's
+//     request (the label, the button) is owed to its requester
+//     instead (oweReviewRequest): a row of owed_review_requests with its
+//     count of moves in a row, and the owed_review_request timer due at
+//     once, whose consumer re-runs it for the head the pull request has
+//     now (owedreviewrequest.go);
 //   - unconfirmed: a fact could not be read, or is unknown on either side.
 //     The attempt starts, as every attempt did before this rule, and its
 //     turn records that its context was unconfirmed at start; the
 //     verdict's own freshness check still stands behind it.
 //
-// Only a review attempt the automatic re-review asked for is checked
-// (turn.ContextCheckedAtDispatch), and only one that waited behind another
-// turn: an attempt dispatched at once costs no read of the code host. A
-// person's review request dispatches unchecked until a moved one can be
-// owed to its requester instead of lost.
+// Only a review attempt a lane that records its trigger asked for is
+// checked -- the automatic re-review, or a person's request
+// (turn.ContextCheckedAtDispatch) -- and only one that waited behind
+// another turn: an attempt dispatched at once costs no read of the code
+// host. A person's request queues routinely behind the review it follows,
+// so its check is the common case; an automatic one queues only rarely,
+// since the hold keeps the lane from inserting behind an open turn.
 
 package sessionactor
 
@@ -176,8 +182,8 @@ func (a *Actor) preReadReviewContext(ctx context.Context) *reviewContextCheck {
 		return check
 	}
 	check.outcome, check.reason, check.liveHeadSHA = a.compareReviewContext(ctx, row)
-	a.logger.Info("sessionactor: review context check: a queued automatic review attempt's context read before dispatch",
-		"turn_id", row.ID.String(), "outcome", check.outcome.String(), "reason", check.reason, "live_head_sha", check.liveHeadSHA)
+	a.logger.Info("sessionactor: review context check: a queued review attempt's context read before dispatch",
+		"turn_id", row.ID.String(), "request_trigger", stringOrEmpty(row.RequestTrigger), "outcome", check.outcome.String(), "reason", check.reason, "live_head_sha", check.liveHeadSHA)
 	return check
 }
 
@@ -326,8 +332,11 @@ const (
 //
 //   - unchecked (it waited behind no turn), fresh or unconfirmed: it is
 //     dispatched, an unconfirmed one first stamped context_unconfirmed_at,
-//     and the pull request's count of automatic attempts in a row that met
-//     a moved context starts again -- one of them is starting;
+//     and, for an automatic attempt, the pull request's count of automatic
+//     attempts in a row that met a moved context starts again -- one of
+//     them is starting. A person's request keeps its count on its own turn
+//     (turns.context_moves), so a turn of it that starts ends the request
+//     and its count with it;
 //   - moved: endContextMovedTurn ends it, and planDispatch evaluates again.
 func (a *Actor) applyReviewContextCheck(ctx context.Context, tx pgx.Tx, turns []sqlcgen.Turn, target sqlcgen.Turn, check *reviewContextCheck, now time.Time) (reviewContextDecision, error) {
 	if !a.contextCheckApplies(target.IsReviewAttempt, target.RequestTrigger) {
@@ -351,11 +360,14 @@ func (a *Actor) applyReviewContextCheck(ctx context.Context, tx pgx.Tx, turns []
 		if _, err := a.stores.turn.WithTx(tx).SetContextUnconfirmed(ctx, target.ID); err != nil {
 			return 0, fmt.Errorf("sessionactor: record the review attempt's unconfirmed context: %w", err)
 		}
-		a.logger.Warn("sessionactor: review context check: a queued automatic review attempt starts with its context unconfirmed",
-			"turn_id", target.ID.String(), "reason", check.reason)
+		a.logger.Warn("sessionactor: review context check: a queued review attempt starts with its context unconfirmed",
+			"turn_id", target.ID.String(), "request_trigger", stringOrEmpty(target.RequestTrigger), "reason", check.reason)
 	case reviewContextUnchecked, reviewContextFresh:
 	default:
 		return 0, fmt.Errorf("sessionactor: unhandled review context outcome %s", check.outcome)
+	}
+	if turn.IsHumanRequestTrigger(target.RequestTrigger) {
+		return reviewContextDispatch, nil
 	}
 	if _, err := a.stores.githubPRSession.WithTx(tx).ResetAutoRetriggerContextMoves(ctx, a.sessionID); err != nil {
 		return 0, fmt.Errorf("sessionactor: reset the automatic re-review's moved-context count: %w", err)
@@ -367,9 +379,9 @@ func (a *Actor) applyReviewContextCheck(ctx context.Context, tx pgx.Tx, turns []
 // synthetic execution_complete; the comparison's own reason follows it.
 const contextMovedReasonPrefix = "review context moved before the review started: "
 
-// endContextMovedTurn ends target, a pending automatic review attempt
-// whose recorded context the pull request has moved past, without running
-// it (technical plan §24.9), in planDispatch's transaction:
+// endContextMovedTurn ends target, a pending review attempt whose
+// recorded context the pull request has moved past, without running it
+// (technical plan §24.9), in planDispatch's transaction:
 //
 //   - the machine's abandon edge, pending to failed, written through the
 //     recorder with the end reason context_moved, so a held re-review
@@ -380,7 +392,12 @@ const contextMovedReasonPrefix = "review context moved before the review started
 //     no channel notice, no check, no session warning, no workflow hook:
 //     it notifies nobody and fails nothing;
 //   - the session's status re-derived without it;
-//   - the automatic request back to the lane: the pull request's pending
+//   - a person's request (the label, the button) owed to its
+//     requester (oweReviewRequest): a row of owed_review_requests, its
+//     count of moves in a row grown by one, and the owed_review_request
+//     timer due at once, whose consumer re-runs the request for the head
+//     the pull request has now or drops it past the bound;
+//   - an automatic request back to the lane: the pull request's pending
 //     head set to the live head unless a push left one, the count of
 //     moves in a row grown by one, and the debounce armed due at once if
 //     the session has none (a held one is woken by this very end) -- unless
@@ -425,10 +442,14 @@ func (a *Actor) endContextMovedTurn(ctx context.Context, tx pgx.Tx, turns []sqlc
 	if err := a.persistDerivedSessionStatus(ctx, tx, summaries); err != nil {
 		return err
 	}
-	a.logger.Info("sessionactor: review context check: a queued automatic review attempt's context moved; it ends without running and the re-review asks again",
-		"turn_id", target.ID.String(), "reason", check.reason, "live_head_sha", check.liveHeadSHA)
+	a.logger.Info("sessionactor: review context check: a queued review attempt's context moved; it ends without running and its request is asked again",
+		"turn_id", target.ID.String(), "request_trigger", stringOrEmpty(target.RequestTrigger), "reason", check.reason, "live_head_sha", check.liveHeadSHA)
 
-	if err := a.requeueAutoRetrigger(ctx, tx, turns, target, check); err != nil {
+	if turn.IsHumanRequestTrigger(target.RequestTrigger) {
+		if err := a.oweReviewRequest(ctx, tx, target); err != nil {
+			return err
+		}
+	} else if err := a.requeueAutoRetrigger(ctx, tx, turns, target, check); err != nil {
 		return err
 	}
 	return a.armDispatchNow(ctx, tx)
@@ -520,7 +541,7 @@ func liveHeadCoveredByYoungerAttempt(turns []sqlcgen.Turn, target sqlcgen.Turn, 
 	}
 	for _, t := range turns {
 		if t.ID == target.ID || turn.State(t.Status) != turn.StatePending ||
-			!turn.ContextCheckedAtDispatch(t.IsReviewAttempt, t.RequestTrigger) ||
+			!t.IsReviewAttempt || t.RequestTrigger == nil || *t.RequestTrigger != turn.RequestTriggerAuto ||
 			t.ReviewHeadSha == nil || *t.ReviewHeadSha != liveHead {
 			continue
 		}
@@ -541,4 +562,42 @@ func bytesAfter(a, b [16]byte) bool {
 		}
 	}
 	return false
+}
+
+// oweReviewRequest is endContextMovedTurn's re-request of a person's
+// review request (technical plan §24.9), in the same transaction: the
+// request target stood for -- who asked, through which lane, with what
+// text -- becomes a row of owed_review_requests, its count of moves in a
+// row the turn's own (none for a turn no re-run carried) plus this one,
+// and the session's owed_review_request
+// timer is armed due at once on the database's clock. The timer's consumer
+// (handleOwedReviewRequestTimer) re-runs it for the head the pull request
+// has now, on the person's path, or drops it past
+// ReviewContextMoveMaxConsecutive and tells its requester; meanwhile the
+// row holds the automatic lane (ReviewRetriggerHeld) and the timer keeps
+// the session reading scheduled. Both are rows, so a restart between the
+// move and the re-run loses nothing.
+func (a *Actor) oweReviewRequest(ctx context.Context, tx pgx.Tx, target sqlcgen.Turn) error {
+	moves := int32(1)
+	if target.ContextMoves != nil {
+		moves += *target.ContextMoves
+	}
+	owed, err := a.stores.owedReviewRequest.WithTx(tx).Insert(ctx, sqlcgen.InsertOwedReviewRequestParams{
+		SessionID:       a.sessionID,
+		RequestedBy:     target.RequestedBy,
+		Trigger:         *target.RequestTrigger,
+		RequestText:     target.RequestText,
+		IsReviewAttempt: target.IsReviewAttempt,
+		ContextMoves:    moves,
+		MovedTurnID:     target.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("sessionactor: owe the review request: %w", err)
+	}
+	if err := a.stores.timer.WithTx(tx).ArmOwedReviewRequest(ctx, a.sessionID); err != nil {
+		return fmt.Errorf("sessionactor: arm the owed review request timer: %w", err)
+	}
+	a.logger.Info("sessionactor: review context check: a person's review request is owed: it is re-run for the head the pull request has now",
+		"turn_id", target.ID.String(), "owed_id", owed.ID.String(), "request_trigger", owed.Trigger, "moves", owed.ContextMoves)
+	return nil
 }

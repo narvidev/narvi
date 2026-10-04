@@ -11,6 +11,30 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const armOwedReviewRequestTimer = `-- name: ArmOwedReviewRequestTimer :exec
+INSERT INTO session_timers (session_id, name, fires_at)
+VALUES ($1, 'owed_review_request', now())
+ON CONFLICT (session_id, name) DO UPDATE
+    SET fires_at = now(), armed_at = now()
+`
+
+// Technical plan §24.9: the owed_review_request timer, armed due at once on
+// the database's clock -- by the dispatching transaction that ends a
+// person's review attempt context_moved and owes its request
+// (sessionactor's oweReviewRequest), and by the timer's own consumer or a
+// person's stop when the session is still owed a request after the one it
+// served. Its firing is the consumer (sessionactor's
+// handleOwedReviewRequestTimer). 'owed_review_request' is
+// sessionactor.TimerOwedReviewRequest, named here like the kind
+// ArmSessionDispatchTimer names, so no caller can arm another kind this
+// way. A re-arm moves fires_at back to now even while the pump holds the
+// row claimed, stamps armed_at like every arm (UpsertSessionTimer), and
+// keeps created_at.
+func (q *Queries) ArmOwedReviewRequestTimer(ctx context.Context, sessionID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, armOwedReviewRequestTimer, sessionID)
+	return err
+}
+
 const armSessionDispatchTimer = `-- name: ArmSessionDispatchTimer :exec
 INSERT INTO session_timers (session_id, name, fires_at)
 VALUES ($1, 'dispatch', now())
@@ -33,6 +57,44 @@ ON CONFLICT (session_id, name) DO UPDATE
 func (q *Queries) ArmSessionDispatchTimer(ctx context.Context, sessionID pgtype.UUID) error {
 	_, err := q.db.Exec(ctx, armSessionDispatchTimer, sessionID)
 	return err
+}
+
+const backOffOwedReviewRequestTimer = `-- name: BackOffOwedReviewRequestTimer :execrows
+UPDATE session_timers
+SET fires_at = now() + LEAST(
+        GREATEST(now() - $1::timestamptz,
+                 make_interval(secs => $2::float8)),
+        make_interval(secs => $3::float8))
+WHERE session_id = $4 AND name = 'owed_review_request'
+`
+
+type BackOffOwedReviewRequestTimerParams struct {
+	Since       pgtype.Timestamptz `json:"since"`
+	BaseSeconds float64            `json:"base_seconds"`
+	MaxSeconds  float64            `json:"max_seconds"`
+	SessionID   pgtype.UUID        `json:"session_id"`
+}
+
+// Technical plan §24.9: the owed_review_request timer's consumer could not
+// read the pull request, or could not evaluate the requester's
+// authorization, and keeps the request: fires_at moves to now plus the age
+// of the request it served (since, its created_at), held between the two
+// bounds -- the dispatch timer's schedule (BackOffSessionDispatchTimer),
+// so a lasting failure is retried at a doubling delay, never at the claim
+// cadence, and the actor idles out between two tries. armed_at is not
+// moved: a backoff is not an arm. Zero rows when the session has no such
+// timer. 'owed_review_request' is sessionactor.TimerOwedReviewRequest.
+func (q *Queries) BackOffOwedReviewRequestTimer(ctx context.Context, arg BackOffOwedReviewRequestTimerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, backOffOwedReviewRequestTimer,
+		arg.Since,
+		arg.BaseSeconds,
+		arg.MaxSeconds,
+		arg.SessionID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const backOffSessionDispatchTimer = `-- name: BackOffSessionDispatchTimer :execrows

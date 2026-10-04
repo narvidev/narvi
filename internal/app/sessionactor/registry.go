@@ -195,6 +195,12 @@ type storeBundle struct {
 	// turn_false_failure_total OTel counter it already incremented (see
 	// that function's own doc comment for the full "why").
 	falseFailure *postgres.FalseFailureStore
+
+	// owedReviewRequest is technical plan §24.9's owed human review
+	// requests (migrations/000160): reviewcontextcheck.go's oweReviewRequest
+	// inserts a person's moved request, owedreviewrequest.go's consumer
+	// re-runs or drops it, and a person's stop drops the ones it predates.
+	owedReviewRequest *postgres.OwedReviewRequestStore
 }
 
 func newStoreBundle(pool *pgxpool.Pool, platformShadow bool) storeBundle {
@@ -226,6 +232,7 @@ func newStoreBundle(pool *pgxpool.Pool, platformShadow bool) storeBundle {
 		falsePositivePattern: postgres.NewFalsePositivePatternStore(pool),
 		providerCredential:   postgres.NewProviderCredentialStore(pool),
 		falseFailure:         postgres.NewFalseFailureStore(pool),
+		owedReviewRequest:    postgres.NewOwedReviewRequestStore(pool),
 	}
 }
 
@@ -377,6 +384,17 @@ type Registry struct {
 	// exercise the check): the check then cannot be made, and the attempt
 	// starts with its context unconfirmed, as before the check existed.
 	reviewLiveReader ReviewLiveReader
+
+	// reviewRequestAuthorizer is technical plan §24.9's addition, threaded
+	// through to every Actor this Registry hydrates like reviewLiveReader
+	// above: before it re-runs a person's review request whose pull request
+	// moved while it waited, the owed_review_request timer's consumer
+	// (owedreviewrequest.go) asks it whether that person may still have it
+	// run -- the actor cannot import the HTTP layer that checked it when the
+	// request was made. May be nil (tests that never exercise the path): no
+	// answer can then be had, and the request is dropped as unauthorized,
+	// never re-run unchecked.
+	reviewRequestAuthorizer ports.ReviewRequestAuthorizer
 
 	// knowledgeRanker (§31.6/§34.7) orders whatever the automatic
 	// re-review lane's own arch-decisions gate admits (a.stores.
@@ -569,32 +587,33 @@ func NewRegistry(
 
 	lifecycleCtx, cancel := context.WithCancel(ctx)
 	r := &Registry{
-		actors:                 make(map[pgtype.UUID]*Actor),
-		pool:                   pool,
-		timeouts:               timeouts,
-		stores:                 newStoreBundle(pool, opt.PlatformShadow),
-		broadcaster:            broadcaster,
-		commander:              commander,
-		provider:               provider,
-		publicBaseURL:          publicBaseURL,
-		sourceControl:          sourceControl,
-		tokenEncryptionKey:     tokenEncryptionKey,
-		openCodeRuntimeVersion: openCodeRuntimeVersion,
-		diffFetcher:            diffFetcher,
-		reviewDiffFetcher:      opt.ReviewDiffFetcher,
-		reviewLiveReader:       opt.ReviewLiveReader,
-		knowledgeRanker:        opt.KnowledgeRanker,
-		githubBotHandle:        opt.GitHubBotHandle,
-		githubOutbound:         opt.GitHubOutbound,
-		reviewModelDeep:        opt.ReviewModelDeep,
-		reviewSizeExclusions:   opt.ReviewSizeExclusions,
-		rolloutMode:            opt.RolloutMode,
-		contractDriftDetected:  contractDriftDetected,
-		opsMetrics:             opsMetrics,
-		repoAccessCache:        newRepoAccessCache(),
-		epistemicCheckDefault:  epistemicCheckDefault,
-		lifecycleCtx:           lifecycleCtx,
-		cancel:                 cancel,
+		actors:                  make(map[pgtype.UUID]*Actor),
+		pool:                    pool,
+		timeouts:                timeouts,
+		stores:                  newStoreBundle(pool, opt.PlatformShadow),
+		broadcaster:             broadcaster,
+		commander:               commander,
+		provider:                provider,
+		publicBaseURL:           publicBaseURL,
+		sourceControl:           sourceControl,
+		tokenEncryptionKey:      tokenEncryptionKey,
+		openCodeRuntimeVersion:  openCodeRuntimeVersion,
+		diffFetcher:             diffFetcher,
+		reviewDiffFetcher:       opt.ReviewDiffFetcher,
+		reviewLiveReader:        opt.ReviewLiveReader,
+		reviewRequestAuthorizer: opt.ReviewRequestAuthorizer,
+		knowledgeRanker:         opt.KnowledgeRanker,
+		githubBotHandle:         opt.GitHubBotHandle,
+		githubOutbound:          opt.GitHubOutbound,
+		reviewModelDeep:         opt.ReviewModelDeep,
+		reviewSizeExclusions:    opt.ReviewSizeExclusions,
+		rolloutMode:             opt.RolloutMode,
+		contractDriftDetected:   contractDriftDetected,
+		opsMetrics:              opsMetrics,
+		repoAccessCache:         newRepoAccessCache(),
+		epistemicCheckDefault:   epistemicCheckDefault,
+		lifecycleCtx:            lifecycleCtx,
+		cancel:                  cancel,
 	}
 	r.locks = newLockHolder(lifecycleCtx, pool, timeouts, r.onLockLost)
 	return r, nil
@@ -623,6 +642,9 @@ type RegistryOptions struct {
 	// ReviewLiveReader is technical plan §24.9's addition -- see Registry.
 	// reviewLiveReader's own doc comment.
 	ReviewLiveReader ReviewLiveReader
+	// ReviewRequestAuthorizer is technical plan §24.9's addition -- see
+	// Registry.reviewRequestAuthorizer's own doc comment.
+	ReviewRequestAuthorizer ports.ReviewRequestAuthorizer
 	// KnowledgeRanker (§31.6/§34.7) is Registry.knowledgeRanker's own
 	// doc comment -- knowledge.RecencyRanker{} (the public product's own
 	// default, controlplane.selectKnowledgeRanker's return value with no
