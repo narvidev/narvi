@@ -139,7 +139,7 @@
             "properties": {
               "name": { "type": "string" },
               "ref": { "type": "string", "pattern": "^refs/pull/[1-9][0-9]*/head$", "description": "The pull request's head ref in the base repository." },
-              "sha": { "type": "string", "pattern": "^[0-9a-f]{40}([0-9a-f]{24})?$", "description": "The commit the turn records, in lowercase hex: 40 characters, or 64 in a SHA-256 repository." }
+              "sha": { "type": "string", "pattern": "^[0-9a-f]{40}$", "description": "The commit the turn records: a full SHA-1 name, 40 lowercase hex characters. SHA-256 repositories are not supported." }
             }
           }
         }

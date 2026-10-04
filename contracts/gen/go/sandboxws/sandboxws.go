@@ -515,8 +515,8 @@ type CheckoutReposElem struct {
 	// The pull request's head ref in the base repository.
 	Ref string `json:"ref" yaml:"ref" mapstructure:"ref"`
 
-	// The commit the turn records, in lowercase hex: 40 characters, or 64 in a
-	// SHA-256 repository.
+	// The commit the turn records: a full SHA-1 name, 40 lowercase hex characters.
+	// SHA-256 repositories are not supported.
 	Sha string `json:"sha" yaml:"sha" mapstructure:"sha"`
 }
 
@@ -543,8 +543,8 @@ func (j *CheckoutReposElem) UnmarshalJSON(value []byte) error {
 	if matched, _ := regexp.MatchString(`^refs/pull/[1-9][0-9]*/head$`, string(plain.Ref)); !matched {
 		return fmt.Errorf("field %s pattern match: must match %s", "Ref", `^refs/pull/[1-9][0-9]*/head$`)
 	}
-	if matched, _ := regexp.MatchString(`^[0-9a-f]{40}([0-9a-f]{24})?$`, string(plain.Sha)); !matched {
-		return fmt.Errorf("field %s pattern match: must match %s", "Sha", `^[0-9a-f]{40}([0-9a-f]{24})?$`)
+	if matched, _ := regexp.MatchString(`^[0-9a-f]{40}$`, string(plain.Sha)); !matched {
+		return fmt.Errorf("field %s pattern match: must match %s", "Sha", `^[0-9a-f]{40}$`)
 	}
 	*j = CheckoutReposElem(plain)
 	return nil

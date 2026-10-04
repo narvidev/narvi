@@ -343,8 +343,9 @@ func TestValidatePullHeadRef(t *testing.T) {
 }
 
 // TestValidateCommitSHA pins the commit ids a checkout accepts: a full
-// SHA-1 or SHA-256 name in lowercase hex, never abbreviated, never a
-// revision expression or an option.
+// SHA-1 name in lowercase hex, never abbreviated, never a SHA-256 name the
+// agent's SHA-1 git-dir cannot check out, never a revision expression or
+// an option.
 func TestValidateCommitSHA(t *testing.T) {
 	t.Parallel()
 
@@ -356,7 +357,7 @@ func TestValidateCommitSHA(t *testing.T) {
 		wantErr bool
 	}{
 		{name: "a SHA-1 name", in: sha1},
-		{name: "a SHA-256 name", in: sha256},
+		{name: "a SHA-256 name", in: sha256, wantErr: true},
 		{name: "abbreviated", in: sha1[:12], wantErr: true},
 		{name: "41 characters", in: sha1 + "8", wantErr: true},
 		{name: "63 characters", in: sha256[:63], wantErr: true},

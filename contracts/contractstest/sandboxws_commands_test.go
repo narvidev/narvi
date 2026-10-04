@@ -129,8 +129,8 @@ func TestSandboxCommandsRoundTrip(t *testing.T) {
 
 	t.Run("Checkout", func(t *testing.T) {
 		// Technical plan §21.1, §30.4: the commit a review turn records, read
-		// from its pull request's ref in the base repository -- a SHA-1 and a
-		// SHA-256 name alike.
+		// from its pull request's ref in the base repository, a full SHA-1
+		// name, per repo.
 		roundTrip(t, sch, sandboxws.Checkout{
 			Type:      "checkout",
 			MessageId: "m9",
@@ -138,7 +138,7 @@ func TestSandboxCommandsRoundTrip(t *testing.T) {
 			Gen:       1,
 			Repos: []sandboxws.CheckoutReposElem{
 				{Name: "widgets", Ref: "refs/pull/7/head", Sha: "0123456789abcdef0123456789abcdef01234567"},
-				{Name: "docs", Ref: "refs/pull/12/head", Sha: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"},
+				{Name: "docs", Ref: "refs/pull/12/head", Sha: "89abcdef0123456789abcdef0123456789abcdef"},
 			},
 		})
 	})
@@ -153,6 +153,9 @@ func TestSandboxCommandsRoundTrip(t *testing.T) {
 			{name: "an abbreviated sha", ref: goodRef, sha: goodSha[:12]},
 			{name: "an uppercase sha", ref: goodRef, sha: "0123456789ABCDEF0123456789ABCDEF01234567"},
 			{name: "a revision expression for sha", ref: goodRef, sha: "HEAD~1"},
+			// The agent's git-dir is SHA-1 only: a SHA-256 name is refused
+			// rather than accepted and failed at the fetch.
+			{name: "a SHA-256 name for sha", ref: goodRef, sha: goodSha + "0123456789abcdef01234567"},
 		}
 		for _, tt := range tests {
 			t.Run(tt.name, func(t *testing.T) {

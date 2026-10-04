@@ -89,9 +89,9 @@ var (
 	// leading zero and at most ten digits.
 	ErrPullHeadRefShape = errors.New("reposource: pull request head ref is not refs/pull/<number>/head")
 
-	// ErrCommitSHAShape means a candidate commit id is not 40 or 64
-	// lowercase hexadecimal characters.
-	ErrCommitSHAShape = errors.New("reposource: commit sha is not 40 or 64 lowercase hex characters")
+	// ErrCommitSHAShape means a candidate commit id is not a full SHA-1
+	// name, 40 lowercase hexadecimal characters.
+	ErrCommitSHAShape = errors.New("reposource: commit sha is not 40 lowercase hex characters")
 )
 
 // pullHeadRefPattern is the one shape ValidatePullHeadRef accepts. The
@@ -100,8 +100,10 @@ var (
 var pullHeadRefPattern = regexp.MustCompile(`^refs/pull/[1-9][0-9]{0,9}/head$`)
 
 // commitSHAPattern is the one shape ValidateCommitSHA accepts: a full
-// SHA-1 or SHA-256 object name, lowercase, never abbreviated.
-var commitSHAPattern = regexp.MustCompile(`^(?:[0-9a-f]{40}|[0-9a-f]{64})$`)
+// SHA-1 object name, lowercase, never abbreviated. A SHA-256 name is
+// refused: the sandbox agent's own git-dir is SHA-1 (gitdir.Seed), so it
+// could never check one out.
+var commitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // bareIdentifierCharset matches exactly the characters a "bare identifier"
 // field -- one that is conceptually a single name, never a multi-segment
@@ -263,9 +265,9 @@ func ValidatePullHeadRef(ref string) error {
 
 // ValidateCommitSHA validates a candidate commit id (sandboxws.
 // CheckoutReposElem.Sha, a review turn's recorded head) before it reaches
-// a git subprocess's argument list: 40 or 64 lowercase hex characters, so
-// it can only ever name an object, never an option, a ref or a revision
-// expression.
+// a git subprocess's argument list: 40 lowercase hex characters, a full
+// SHA-1 name, so it can only ever name an object, never an option, a ref
+// or a revision expression.
 func ValidateCommitSHA(sha string) error {
 	if !commitSHAPattern.MatchString(sha) {
 		return fmt.Errorf("%w: %q", ErrCommitSHAShape, sha)

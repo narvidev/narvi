@@ -154,7 +154,7 @@ export interface Checkout {
        */
       ref: string;
       /**
-       * The commit the turn records, in lowercase hex: 40 characters, or 64 in a SHA-256 repository.
+       * The commit the turn records: a full SHA-1 name, 40 lowercase hex characters. SHA-256 repositories are not supported.
        */
       sha: string;
     },
@@ -165,7 +165,7 @@ export interface Checkout {
        */
       ref: string;
       /**
-       * The commit the turn records, in lowercase hex: 40 characters, or 64 in a SHA-256 repository.
+       * The commit the turn records: a full SHA-1 name, 40 lowercase hex characters. SHA-256 repositories are not supported.
        */
       sha: string;
     }[]

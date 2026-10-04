@@ -27,7 +27,9 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 ### sandbox-ws/v1/commands.schema.json
 
 - Added: `Checkout`, the new `checkout` command, appended to the root
-  `oneOf`: for each repo it names (`name`, `ref`, `sha`), the agent fetches
+  `oneOf`: for each repo it names (`name`, `ref`, and `sha`, a full SHA-1
+  name of 40 lowercase hex characters; SHA-256 repositories are not
+  supported, since the agent's own git-dir is SHA-1), the agent fetches
   the pull request's ref from the base repository, checks out `sha`
   detached and forced, removes untracked files and keeps ignored ones, and
   answers with one `checkout_result`. The control plane sends it only to a
