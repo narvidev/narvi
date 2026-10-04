@@ -31,9 +31,13 @@ import (
 // tokenWindowIndexVersion is the migration that builds events_token_window_idx.
 const tokenWindowIndexVersion = 161
 
-// wantTokenWindowIndexDef is pg_get_indexdef of the index 000161 builds.
-const wantTokenWindowIndexDef = "CREATE INDEX events_token_window_idx ON public.events USING btree " +
-	"(session_id, ((id + 0))) WHERE (type = 'token'::text)"
+// tokenWindowIndexDef is pg_get_indexdef of the index 000161 builds on
+// table, events qualified by its schema as pg_get_indexdef writes it, with
+// quote_all_identifiers off.
+func tokenWindowIndexDef(table string) string {
+	return "CREATE INDEX events_token_window_idx ON " + table + " USING btree " +
+		"(session_id, ((id + 0))) WHERE (type = 'token'::text)"
+}
 
 // migrationBefore returns the version of the embedded migration that
 // precedes version: the one a database is migrated to before version runs.
@@ -51,13 +55,26 @@ func migrationBefore(t *testing.T, version uint) uint {
 	return prev
 }
 
-// readTokenWindowIndex reports events_token_window_idx's oid, validity and
-// definition, and whether it exists at all.
+// readTokenWindowIndex reports the oid of the relation named
+// events_token_window_idx -- the index, or whatever else a test leaves
+// under the name -- its validity and definition when it is an index
+// (pg_get_indexdef, read with quote_all_identifiers off whatever the
+// database sets, so one string holds for every test), and whether it
+// exists at all.
 func readTokenWindowIndex(ctx context.Context, t *testing.T, db *sql.DB) (oid int64, valid bool, def string, found bool) {
 	t.Helper()
-	err := db.QueryRowContext(ctx,
-		`SELECT indexrelid::bigint, indisvalid, pg_get_indexdef(indexrelid)
-		 FROM pg_index WHERE indexrelid = to_regclass('events_token_window_idx')`,
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatalf("read events_token_window_idx: %v", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SET LOCAL quote_all_identifiers = off`); err != nil {
+		t.Fatalf("read events_token_window_idx: %v", err)
+	}
+	err = tx.QueryRowContext(ctx,
+		`SELECT c.oid::bigint, COALESCE(i.indisvalid, false), COALESCE(pg_get_indexdef(c.oid), '')
+		 FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid = c.oid
+		 WHERE c.oid = to_regclass('events_token_window_idx')`,
 	).Scan(&oid, &valid, &def)
 	if errors.Is(err, sql.ErrNoRows) {
 		return 0, false, "", false
@@ -69,9 +86,17 @@ func readTokenWindowIndex(ctx context.Context, t *testing.T, db *sql.DB) (oid in
 }
 
 // assertTokenWindowIndexBuilt fails unless events_token_window_idx exists,
-// is valid and has the definition 000161 builds; it returns the index's
-// oid.
+// is valid and has the definition 000161 builds on public.events; it
+// returns the index's oid.
 func assertTokenWindowIndexBuilt(ctx context.Context, t *testing.T, db *sql.DB) int64 {
+	t.Helper()
+	return assertTokenWindowIndexBuiltOn(ctx, t, db, "public.events")
+}
+
+// assertTokenWindowIndexBuiltOn is assertTokenWindowIndexBuilt for events
+// in another schema: table is events qualified by it, as pg_get_indexdef
+// writes it.
+func assertTokenWindowIndexBuiltOn(ctx context.Context, t *testing.T, db *sql.DB, table string) int64 {
 	t.Helper()
 	oid, valid, def, found := readTokenWindowIndex(ctx, t, db)
 	if !found {
@@ -80,22 +105,33 @@ func assertTokenWindowIndexBuilt(ctx context.Context, t *testing.T, db *sql.DB) 
 	if !valid {
 		t.Errorf("events_token_window_idx is INVALID")
 	}
-	if def != wantTokenWindowIndexDef {
-		t.Errorf("events_token_window_idx = %q, want %q", def, wantTokenWindowIndexDef)
+	if want := tokenWindowIndexDef(table); def != want {
+		t.Errorf("events_token_window_idx = %q, want %q", def, want)
 	}
 	return oid
 }
+
+// tokenWindowIndexPrebuild is the statement the up migration's operator
+// guidance gives, to build the index concurrently before deploying.
+const tokenWindowIndexPrebuild = `CREATE INDEX CONCURRENTLY IF NOT EXISTS events_token_window_idx
+	ON events (session_id, (id + 0)) WHERE type = 'token'`
 
 // prebuildTokenWindowIndex builds events_token_window_idx as the up
 // migration's operator guidance says to, concurrently from psql, and
 // returns its oid.
 func prebuildTokenWindowIndex(ctx context.Context, t *testing.T, db *sql.DB) int64 {
 	t.Helper()
-	if _, err := db.ExecContext(ctx, `CREATE INDEX CONCURRENTLY IF NOT EXISTS events_token_window_idx
-		ON events (session_id, (id + 0)) WHERE type = 'token'`); err != nil {
+	return prebuildTokenWindowIndexOn(ctx, t, db, "public.events")
+}
+
+// prebuildTokenWindowIndexOn is prebuildTokenWindowIndex for events in
+// another schema, as assertTokenWindowIndexBuiltOn names it.
+func prebuildTokenWindowIndexOn(ctx context.Context, t *testing.T, db *sql.DB, table string) int64 {
+	t.Helper()
+	if _, err := db.ExecContext(ctx, tokenWindowIndexPrebuild); err != nil {
 		t.Fatalf("pre-build the index concurrently: %v", err)
 	}
-	return assertTokenWindowIndexBuilt(ctx, t, db)
+	return assertTokenWindowIndexBuiltOn(ctx, t, db, table)
 }
 
 func TestMigration000161_UpDownUp(t *testing.T) {
@@ -248,6 +284,42 @@ func TestMigration000161_ConcurrentMigrators(t *testing.T) {
 	assertTokenWindowIndexBuilt(ctx, t, db)
 }
 
+// wrongTokenWindowRelation is a relation of the name events_token_window_idx
+// that is not the index 000161 builds: the statement that creates it, what
+// the migration's refusal says it found when events is public.events, and
+// the statement that drops it.
+type wrongTokenWindowRelation struct {
+	name, create, found, drop string
+}
+
+// wrongTokenWindowRelations are the relations 000161 must refuse.
+var wrongTokenWindowRelations = []wrongTokenWindowRelation{
+	{
+		name:   "the plain (session_id, id) index row 231 rejected",
+		create: `CREATE INDEX CONCURRENTLY events_token_window_idx ON events (session_id, id) WHERE type = 'token'`,
+		found:  "CREATE INDEX events_token_window_idx ON public.events USING btree (session_id, id) WHERE (type = 'token'::text)",
+		drop:   `DROP INDEX CONCURRENTLY events_token_window_idx`,
+	},
+	{
+		name:   "the expression without its predicate",
+		create: `CREATE INDEX CONCURRENTLY events_token_window_idx ON events (session_id, (id + 0))`,
+		found:  "CREATE INDEX events_token_window_idx ON public.events USING btree (session_id, ((id + 0)))",
+		drop:   `DROP INDEX CONCURRENTLY events_token_window_idx`,
+	},
+	{
+		name:   "a unique index of the same columns",
+		create: `CREATE UNIQUE INDEX CONCURRENTLY events_token_window_idx ON events (session_id, (id + 0)) WHERE type = 'token'`,
+		found:  "CREATE UNIQUE INDEX events_token_window_idx ON public.events USING btree (session_id, ((id + 0))) WHERE (type = 'token'::text)",
+		drop:   `DROP INDEX CONCURRENTLY events_token_window_idx`,
+	},
+	{
+		name:   "a sequence of the name",
+		create: `CREATE SEQUENCE events_token_window_idx`,
+		found:  "a relation that is not an index (pg_class.relkind 'S')",
+		drop:   `DROP SEQUENCE events_token_window_idx`,
+	},
+}
+
 // TestMigration000161_RefusesAnotherRelationOfItsName: an operator's
 // pre-build under this name with another definition, or any other relation
 // of the name, would leave the read's bounds on id + 0 with no index to
@@ -256,34 +328,7 @@ func TestMigration000161_ConcurrentMigrators(t *testing.T) {
 // dirty, and the relation is left as it was. Following the message --
 // drop it, force the version back, migrate again -- then builds the index.
 func TestMigration000161_RefusesAnotherRelationOfItsName(t *testing.T) {
-	for _, tt := range []struct {
-		name, create, found, drop string
-	}{
-		{
-			name:   "the plain (session_id, id) index row 231 rejected",
-			create: `CREATE INDEX CONCURRENTLY events_token_window_idx ON events (session_id, id) WHERE type = 'token'`,
-			found:  "CREATE INDEX events_token_window_idx ON public.events USING btree (session_id, id) WHERE (type = 'token'::text)",
-			drop:   `DROP INDEX CONCURRENTLY events_token_window_idx`,
-		},
-		{
-			name:   "the expression without its predicate",
-			create: `CREATE INDEX CONCURRENTLY events_token_window_idx ON events (session_id, (id + 0))`,
-			found:  "CREATE INDEX events_token_window_idx ON public.events USING btree (session_id, ((id + 0)))",
-			drop:   `DROP INDEX CONCURRENTLY events_token_window_idx`,
-		},
-		{
-			name:   "a unique index of the same columns",
-			create: `CREATE UNIQUE INDEX CONCURRENTLY events_token_window_idx ON events (session_id, (id + 0)) WHERE type = 'token'`,
-			found:  "CREATE UNIQUE INDEX events_token_window_idx ON public.events USING btree (session_id, ((id + 0))) WHERE (type = 'token'::text)",
-			drop:   `DROP INDEX CONCURRENTLY events_token_window_idx`,
-		},
-		{
-			name:   "a sequence of the name",
-			create: `CREATE SEQUENCE events_token_window_idx`,
-			found:  "a relation that is not an index (pg_class.relkind 'S')",
-			drop:   `DROP SEQUENCE events_token_window_idx`,
-		},
-	} {
+	for _, tt := range wrongTokenWindowRelations {
 		t.Run(tt.name, func(t *testing.T) {
 			ctx := context.Background()
 			before := migrationBefore(t, tokenWindowIndexVersion)
@@ -293,10 +338,9 @@ func TestMigration000161_RefusesAnotherRelationOfItsName(t *testing.T) {
 			}
 			relation := func() (oid int64, def string) {
 				t.Helper()
-				if err := db.QueryRowContext(ctx,
-					`SELECT oid::bigint, COALESCE(pg_get_indexdef(oid), '') FROM pg_class WHERE oid = to_regclass('events_token_window_idx')`,
-				).Scan(&oid, &def); err != nil {
-					t.Fatalf("read the relation named events_token_window_idx: %v", err)
+				oid, _, def, found := readTokenWindowIndex(ctx, t, db)
+				if !found {
+					t.Fatal("no relation named events_token_window_idx")
 				}
 				return oid, def
 			}
@@ -434,4 +478,122 @@ func insertWithLockTimeout(ctx context.Context, db *sql.DB, sessionID string) er
 		return err
 	}
 	return tx.Commit()
+}
+
+// TestMigration000161_ChecksTheDefinitionWhateverTheQuotingOrSchema: the
+// migration compares an existing index's pg_get_indexdef with the one it
+// builds, and that text changes with the session and the schema --
+// quote_all_identifiers quotes every identifier, and the table comes back
+// qualified by a schema whose name may need quoting. Under each setting
+// below, given to the database as an operator might, the migration must
+// accept the index it built itself, met again after `migrate force` back
+// to the version before it, and the operator guidance's own concurrent
+// pre-build, each by oid and with the version clean, and still refuse every
+// one of wrongTokenWindowRelations, leaving the version dirty and the
+// relation as it was.
+func TestMigration000161_ChecksTheDefinitionWhateverTheQuotingOrSchema(t *testing.T) {
+	alterDatabase := func(setting string) string {
+		return `DO $$ BEGIN EXECUTE format('ALTER DATABASE %I SET ` + setting + `', current_database()); END $$`
+	}
+	for _, tt := range []struct {
+		name          string
+		setup         []string
+		quoteAll      string
+		schema, table string
+	}{
+		{
+			name:     "quote_all_identifiers on",
+			setup:    []string{alterDatabase("quote_all_identifiers = on")},
+			quoteAll: "on", schema: "public", table: "public.events",
+		},
+		{
+			name:     "a schema named with a space",
+			setup:    []string{`CREATE SCHEMA "narvi prod"`, alterDatabase(`search_path = "narvi prod"`)},
+			quoteAll: "off", schema: "narvi prod", table: `"narvi prod".events`,
+		},
+		{
+			name:     "a quoted mixed-case schema",
+			setup:    []string{`CREATE SCHEMA "Narvi_Prod"`, alterDatabase(`search_path = "Narvi_Prod"`)},
+			quoteAll: "off", schema: "Narvi_Prod", table: `"Narvi_Prod".events`,
+		},
+		{
+			name: "quote_all_identifiers on, and a schema named with a space",
+			setup: []string{`CREATE SCHEMA "narvi prod"`, alterDatabase(`search_path = "narvi prod"`),
+				alterDatabase("quote_all_identifiers = on")},
+			quoteAll: "on", schema: "narvi prod", table: `"narvi prod".events`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			before := migrationBefore(t, tokenWindowIndexVersion)
+			connStr, db := migrationTestDatabase(ctx, t, before, tt.setup...)
+			var quoteAll, schema string
+			if err := db.QueryRowContext(ctx, `SELECT current_setting('quote_all_identifiers'), current_schema()`).Scan(&quoteAll, &schema); err != nil {
+				t.Fatalf("read the database's settings: %v", err)
+			}
+			if quoteAll != tt.quoteAll || schema != tt.schema {
+				t.Fatalf("quote_all_identifiers = %s, current_schema = %q; want %s, %q: the setup did not take", quoteAll, schema, tt.quoteAll, tt.schema)
+			}
+			m, mdb := newMigrate(t, connStr)
+			defer func() { _ = mdb.Close() }()
+			migrateAccepts := func(what string, want int64) {
+				t.Helper()
+				if err := m.Migrate(tokenWindowIndexVersion); err != nil {
+					t.Fatalf("up to %d with %s: %v", tokenWindowIndexVersion, what, err)
+				}
+				if got := assertTokenWindowIndexBuiltOn(ctx, t, db, tt.table); got != want {
+					t.Errorf("events_token_window_idx oid = %d after the migration, want %s's %d (kept, not rebuilt)", got, what, want)
+				}
+				assertCleanVersion(t, connStr, tokenWindowIndexVersion)
+			}
+
+			// The index the migration built itself, met again after the
+			// rollback guidance's `migrate force` back and a redeploy.
+			if err := m.Migrate(tokenWindowIndexVersion); err != nil {
+				t.Fatalf("up to %d: %v", tokenWindowIndexVersion, err)
+			}
+			built := assertTokenWindowIndexBuiltOn(ctx, t, db, tt.table)
+			if err := m.Force(int(before)); err != nil {
+				t.Fatalf("force %d: %v", before, err)
+			}
+			migrateAccepts("the index it built", built)
+
+			// The operator guidance's concurrent pre-build.
+			if err := m.Migrate(before); err != nil {
+				t.Fatalf("down to %d: %v", before, err)
+			}
+			migrateAccepts("the guidance's pre-build", prebuildTokenWindowIndexOn(ctx, t, db, tt.table))
+
+			// Every wrong relation is still refused.
+			if err := m.Migrate(before); err != nil {
+				t.Fatalf("down to %d: %v", before, err)
+			}
+			for _, wrong := range wrongTokenWindowRelations {
+				if _, err := db.ExecContext(ctx, wrong.create); err != nil {
+					t.Fatalf("%s: create it: %v", wrong.name, err)
+				}
+				oid, _, def, _ := readTokenWindowIndex(ctx, t, db)
+				err := m.Migrate(tokenWindowIndexVersion)
+				found := strings.ReplaceAll(wrong.found, "public.events", tt.table)
+				switch {
+				case err == nil:
+					t.Errorf("%s: up to %d kept %s; want the migration refused", wrong.name, tokenWindowIndexVersion, found)
+				case !strings.Contains(err.Error(), "events_token_window_idx exists but is not the index this migration builds: found "+found+", want"):
+					t.Errorf("%s: the migration's error does not name %q:\n%v", wrong.name, found, err)
+				}
+				if version, dirty, verr := m.Version(); verr != nil || version != tokenWindowIndexVersion || !dirty {
+					t.Errorf("%s: migration version = %d (dirty %v, err %v), want %d, dirty", wrong.name, version, dirty, verr, tokenWindowIndexVersion)
+				}
+				if gotOID, _, gotDef, _ := readTokenWindowIndex(ctx, t, db); gotOID != oid || gotDef != def {
+					t.Errorf("%s: the relation is now %d %q, want it left as it was, %d %q", wrong.name, gotOID, gotDef, oid, def)
+				}
+				if _, err := db.ExecContext(ctx, wrong.drop); err != nil {
+					t.Fatalf("%s: %s: %v", wrong.name, wrong.drop, err)
+				}
+				if err := m.Force(int(before)); err != nil {
+					t.Fatalf("%s: force %d: %v", wrong.name, before, err)
+				}
+			}
+		})
+	}
 }

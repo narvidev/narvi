@@ -129,8 +129,18 @@
 -- naming what it found and what to do, and golang-migrate leaves this
 -- version recorded as dirty, so no control plane boots until the operator
 -- has dropped the relation and forced the version back (the message says
--- how). The definition is compared as pg_get_indexdef gives it, with the
--- table's schema left out, so the check holds in any schema.
+-- how).
+--
+-- The definition is compared as pg_get_indexdef prints it, which depends
+-- on the session and the schema: quote_all_identifiers, which an operator
+-- may set on the database, the role or the connection, quotes every
+-- identifier, and the table comes back qualified by its schema, quoted
+-- when its name needs it ("narvi prod".events). So the block turns
+-- quote_all_identifiers off for its own transaction before it reads the
+-- definition, and takes out the table's qualified name exactly as
+-- pg_get_indexdef writes it -- format('%I.%I') of its schema and name,
+-- under the same setting -- rather than matching it by pattern. Neither
+-- the session's quoting nor the schema's name then changes the result.
 --
 -- # Rolling deploy
 --
@@ -197,15 +207,21 @@ BEGIN
             ON events (session_id, (id + 0)) WHERE type = 'token';
         RETURN;
     END IF;
+    PERFORM set_config('quote_all_identifiers', 'off', true);
     SELECT CASE WHEN i.indexrelid IS NULL
                 THEN format('a relation that is not an index (pg_class.relkind %L)', c.relkind)
                 ELSE pg_get_indexdef(c.oid) END,
            i.indexrelid IS NOT NULL
            AND i.indrelid = to_regclass('events')
-           AND regexp_replace(pg_get_indexdef(c.oid), ' ON [^ ]+ USING ', ' ON events USING ')
+           AND replace(pg_get_indexdef(c.oid),
+                       ' ON ' || format('%I.%I', tn.nspname, t.relname) || ' USING ',
+                       ' ON events USING ')
                = 'CREATE INDEX events_token_window_idx ON events USING btree (session_id, ((id + 0))) WHERE (type = ''token''::text)'
     INTO found_as, is_this_index
-    FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid = c.oid
+    FROM pg_class c
+    LEFT JOIN pg_index i ON i.indexrelid = c.oid
+    LEFT JOIN pg_class t ON t.oid = i.indrelid
+    LEFT JOIN pg_namespace tn ON tn.oid = t.relnamespace
     WHERE c.oid = existing;
     IF is_this_index IS NOT TRUE THEN
         RAISE EXCEPTION 'events_token_window_idx exists but is not the index this migration builds: found %, want CREATE INDEX events_token_window_idx ON events (session_id, (id + 0)) WHERE type = ''token''. Drop it (DROP INDEX CONCURRENTLY events_token_window_idx for an index, or the DROP statement of its kind), clear this dirty version with `migrate force 160`, and deploy again: this migration then builds the index, or finds the one you build first as its operator guidance says.', found_as;
