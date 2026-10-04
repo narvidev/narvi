@@ -55,7 +55,17 @@
 -- so the stall grows linearly with the table, and more on a cold cache;
 -- and with no lock_timeout, a transaction already holding ROW EXCLUSIVE on
 -- events when the build starts delays its lock, with every later insert
--- queued behind it.
+-- queued behind it. Reads of events go on meanwhile: a SHARE lock blocks
+-- writes only.
+--
+-- One path blocks reads as well: an INVALID leftover of this index (below).
+-- The block drops it with a plain DROP INDEX, which takes ACCESS EXCLUSIVE
+-- on events and holds it until the migration commits, through the whole
+-- build that follows. Every read of events then waits for the build too --
+-- the timeline and its page walk, every read of a turn's text, the
+-- actor's own reads before it stores a frame -- and the lock request first
+-- queues behind every open transaction on events, reads included, with
+-- every later read and write queued behind it.
 --
 -- CREATE INDEX CONCURRENTLY is not safe under this runner, for the reason
 -- 000144 gives: golang-migrate serializes migrators with a blocking
@@ -84,29 +94,71 @@
 -- runs the CREATE only when there is none. (A bare CREATE INDEX IF NOT
 -- EXISTS would not do: it queues for the SHARE lock on events before it
 -- sees that the index exists, so it would still wait behind every open
--- insert into events, and stall every new one behind it.) If that
--- concurrent build fails it leaves an INVALID index behind, which the
--- block below drops so the index is rebuilt here, in this transaction --
--- or drop it yourself (DROP INDEX CONCURRENTLY events_token_window_idx)
--- and retry the concurrent build first.
+-- insert into events, and stall every new one behind it.) Type the
+-- statement above as it is: the block checks that an index it finds under
+-- this name is that index, and fails the migration if it is not (below).
+--
+-- If that concurrent build fails it leaves an INVALID index behind. Drop it
+-- yourself, without blocking anything --
+--
+--   DROP INDEX CONCURRENTLY events_token_window_idx;
+--
+-- -- and retry the concurrent build before deploying. Left in place, the
+-- leftover is dropped and the index rebuilt by the block below, in this
+-- migration's transaction, and that blocks every read and write of events
+-- for the whole build (see above), not only inserts.
 --
 -- # An INVALID leftover
 --
 -- A name check alone would keep an INVALID index of this name -- one a
 -- failed concurrent build left -- and Postgres never plans with an invalid
 -- index, so every read of a turn's text would walk the session's text
--- instead. It is dropped first, in the same transaction, and built again.
+-- instead. It is dropped first, in the same transaction, and built again,
+-- under the ACCESS EXCLUSIVE lock described above.
+--
+-- # A relation of this name that is not this index
+--
+-- A valid index of this name with another definition -- (session_id, id),
+-- say, or the expression without its predicate -- would leave the read's
+-- bounds on id + 0 with no index to seek on, and the read would then fetch
+-- every `token` frame of the session, more than the previous binary's text
+-- reads. So would any other relation of this name. The block does not keep
+-- such a relation, and it does not drop it either: dropping it here would
+-- block every read and write of events for the rebuild, and it may be
+-- something an operator built on purpose. It fails the migration instead,
+-- naming what it found and what to do, and golang-migrate leaves this
+-- version recorded as dirty, so no control plane boots until the operator
+-- has dropped the relation and forced the version back (the message says
+-- how). The definition is compared as pg_get_indexdef gives it, with the
+-- table's schema left out, so the check holds in any schema.
 --
 -- # Rolling deploy
 --
 -- The previous binary works with the index present: it adds no column and
--- changes no statement's result, only the plans the planner may choose. Its
--- text of the read keeps its bounds on id, which this index cannot seek
--- on, so a generic plan of it may walk the session's `token` frames here
--- rather than on events_token_part_idx, at about the same cost: the plan
--- test's matrix, run on that text with the index present, read up to 1,662
--- buffers on the logs where it read 1,761 without it. Its pods read as
--- they did until they are replaced.
+-- changes no statement's result, only the plans the planner may choose. But
+-- one of its reads gets slower. Its text of the read keeps its bounds and
+-- order on plain id, and creating the index invalidates its cached plans,
+-- so its pods plan the read again and a generic plan may now take this
+-- index for the session_id equality -- where the bound on id is a filter on
+-- each heap row fetched, not a seek, so the read fetches every `token` frame
+-- of the session. On events_token_part_idx, which that text read before,
+-- the bound on id is a seek behind the part id.
+--
+-- Measured cell by cell on the plan test's matrix, that text with and
+-- without the index: on the two shapes whose windows were logged after the
+-- last ANALYZE, the generic plan of a window open above -- the session's
+-- latest turn, which the approval's cut check, the decision inbox and the
+-- Slack and Linear replies to an awaiting plan read -- went from about 150
+-- buffers and no row removed to 463, 805 and 1,662 buffers at 8, 300 and
+-- 1,000 characters of text, removing all 9,040 of the session's frames
+-- outside the window. On the same shapes the window bounded above read
+-- fewer buffers than before (942 to 1,763 became 463 to 1,662) but removed
+-- 9,040 rows instead of 6,040; the other 84 cells read about what they
+-- read without the index. Results are unchanged, and the worst cell stays
+-- under that text's own worst without the index (3,225 buffers, where two
+-- sessions share the log), but a long session's latest turn can cost the
+-- old pods three to eleven times what it did. A rolling deploy bounds that
+-- to the old pods' remaining life, within RollingDeployCeiling.
 --
 -- # Rolling back
 --
@@ -116,23 +168,46 @@
 -- previous binary cannot boot ("no migration found for version 161"). A
 -- rollback therefore takes one of two steps first, with the control plane
 -- scaled to zero:
---   - Keep the index: with the golang-migrate CLI, `migrate force 160`.
---     The previous binary then boots, since 160 is a version it has, and
---     works with the index present as above. When this release is deployed
---     again, this file runs again and keeps the valid index.
---   - Drop it: run this migration's down (goto 160) with this release's
---     migrations. The down file says what it removes.
+--   - Drop the index: run this migration's down (goto 160) with this
+--     release's migrations. The previous binary then reads exactly as it
+--     did before this release. Take this step for a rollback that will
+--     run for long. The down file says what it removes.
+--   - Keep the index, for a short rollback only: with the golang-migrate
+--     CLI, `migrate force 160`. The previous binary then boots, since 160
+--     is a version it has, but reads with the index present as above: the
+--     latest turn's text of a long session can cost it three to eleven
+--     times what it did, for as long as the rollback lasts. When this
+--     release is deployed again, this file runs again and keeps the valid
+--     index.
 -- Nothing else needs undoing: no column, timer kind or event type is added.
 DO $$
+DECLARE
+    existing regclass := to_regclass('events_token_window_idx');
+    found_as text;
+    is_this_index boolean;
 BEGIN
-    IF EXISTS (
-        SELECT 1 FROM pg_index
-        WHERE indexrelid = to_regclass('events_token_window_idx') AND NOT indisvalid
+    IF existing IS NOT NULL AND EXISTS (
+        SELECT 1 FROM pg_index WHERE indexrelid = existing AND NOT indisvalid
     ) THEN
         DROP INDEX events_token_window_idx;
+        existing := NULL;
     END IF;
-    IF to_regclass('events_token_window_idx') IS NULL THEN
+    IF existing IS NULL THEN
         CREATE INDEX events_token_window_idx
             ON events (session_id, (id + 0)) WHERE type = 'token';
+        RETURN;
+    END IF;
+    SELECT CASE WHEN i.indexrelid IS NULL
+                THEN format('a relation that is not an index (pg_class.relkind %L)', c.relkind)
+                ELSE pg_get_indexdef(c.oid) END,
+           i.indexrelid IS NOT NULL
+           AND i.indrelid = to_regclass('events')
+           AND regexp_replace(pg_get_indexdef(c.oid), ' ON [^ ]+ USING ', ' ON events USING ')
+               = 'CREATE INDEX events_token_window_idx ON events USING btree (session_id, ((id + 0))) WHERE (type = ''token''::text)'
+    INTO found_as, is_this_index
+    FROM pg_class c LEFT JOIN pg_index i ON i.indexrelid = c.oid
+    WHERE c.oid = existing;
+    IF is_this_index IS NOT TRUE THEN
+        RAISE EXCEPTION 'events_token_window_idx exists but is not the index this migration builds: found %, want CREATE INDEX events_token_window_idx ON events (session_id, (id + 0)) WHERE type = ''token''. Drop it (DROP INDEX CONCURRENTLY events_token_window_idx for an index, or the DROP statement of its kind), clear this dirty version with `migrate force 160`, and deploy again: this migration then builds the index, or finds the one you build first as its operator guidance says.', found_as;
     END IF;
 END $$;

@@ -6,10 +6,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"fmt"
 	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/golang-migrate/migrate/v4/source/iofs"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/migrations"
 )
@@ -19,9 +23,10 @@ import (
 // inside the shared container, migrated to the version before it first: up,
 // down and up again; the paths an operator's own concurrent pre-build
 // leaves behind (a valid index, kept without a lock on events; an INVALID
-// one, rebuilt); and two migrators at once, which a fresh install of
-// deploy/control-plane (replicas: 2) always has. What the index is for is
-// event_tokenwindow_plan_integration_test.go's.
+// one, rebuilt; a relation of the name that is not this index, refused);
+// two migrators at once, which a fresh install of deploy/control-plane
+// (replicas: 2) always has; and a down that never blocks inserts into
+// events. What the index is for is event_tokenwindow_plan_integration_test.go's.
 
 // tokenWindowIndexVersion is the migration that builds events_token_window_idx.
 const tokenWindowIndexVersion = 161
@@ -241,4 +246,192 @@ func TestMigration000161_ConcurrentMigrators(t *testing.T) {
 	connStr, db := migrationTestDatabase(ctx, t, migrationBefore(t, tokenWindowIndexVersion))
 	concurrentMigratorsUp(ctx, t, connStr, db, tokenWindowIndexVersion)
 	assertTokenWindowIndexBuilt(ctx, t, db)
+}
+
+// TestMigration000161_RefusesAnotherRelationOfItsName: an operator's
+// pre-build under this name with another definition, or any other relation
+// of the name, would leave the read's bounds on id + 0 with no index to
+// seek on. The migration must neither keep it nor drop it: it fails, naming
+// what it found and how to recover, golang-migrate leaves the version
+// dirty, and the relation is left as it was. Following the message --
+// drop it, force the version back, migrate again -- then builds the index.
+func TestMigration000161_RefusesAnotherRelationOfItsName(t *testing.T) {
+	for _, tt := range []struct {
+		name, create, found, drop string
+	}{
+		{
+			name:   "the plain (session_id, id) index row 231 rejected",
+			create: `CREATE INDEX CONCURRENTLY events_token_window_idx ON events (session_id, id) WHERE type = 'token'`,
+			found:  "CREATE INDEX events_token_window_idx ON public.events USING btree (session_id, id) WHERE (type = 'token'::text)",
+			drop:   `DROP INDEX CONCURRENTLY events_token_window_idx`,
+		},
+		{
+			name:   "the expression without its predicate",
+			create: `CREATE INDEX CONCURRENTLY events_token_window_idx ON events (session_id, (id + 0))`,
+			found:  "CREATE INDEX events_token_window_idx ON public.events USING btree (session_id, ((id + 0)))",
+			drop:   `DROP INDEX CONCURRENTLY events_token_window_idx`,
+		},
+		{
+			name:   "a unique index of the same columns",
+			create: `CREATE UNIQUE INDEX CONCURRENTLY events_token_window_idx ON events (session_id, (id + 0)) WHERE type = 'token'`,
+			found:  "CREATE UNIQUE INDEX events_token_window_idx ON public.events USING btree (session_id, ((id + 0))) WHERE (type = 'token'::text)",
+			drop:   `DROP INDEX CONCURRENTLY events_token_window_idx`,
+		},
+		{
+			name:   "a sequence of the name",
+			create: `CREATE SEQUENCE events_token_window_idx`,
+			found:  "a relation that is not an index (pg_class.relkind 'S')",
+			drop:   `DROP SEQUENCE events_token_window_idx`,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			before := migrationBefore(t, tokenWindowIndexVersion)
+			connStr, db := migrationTestDatabase(ctx, t, before)
+			if _, err := db.ExecContext(ctx, tt.create); err != nil {
+				t.Fatalf("create the relation: %v", err)
+			}
+			relation := func() (oid int64, def string) {
+				t.Helper()
+				if err := db.QueryRowContext(ctx,
+					`SELECT oid::bigint, COALESCE(pg_get_indexdef(oid), '') FROM pg_class WHERE oid = to_regclass('events_token_window_idx')`,
+				).Scan(&oid, &def); err != nil {
+					t.Fatalf("read the relation named events_token_window_idx: %v", err)
+				}
+				return oid, def
+			}
+			oid, def := relation()
+
+			m, mdb := newMigrate(t, connStr)
+			defer func() { _ = mdb.Close() }()
+			err := m.Migrate(tokenWindowIndexVersion)
+			if err == nil {
+				t.Fatalf("up to %d kept %s; want the migration refused", tokenWindowIndexVersion, tt.found)
+			}
+			for _, want := range []string{
+				"events_token_window_idx exists but is not the index this migration builds",
+				"found " + tt.found + ", want CREATE INDEX events_token_window_idx ON events (session_id, (id + 0)) WHERE type = 'token'",
+				fmt.Sprintf("clear this dirty version with `migrate force %d`", before),
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the migration's error does not say %q:\n%v", want, err)
+				}
+			}
+			version, dirty, verr := m.Version()
+			if verr != nil || version != tokenWindowIndexVersion || !dirty {
+				t.Errorf("migration version = %d (dirty %v, err %v), want %d, dirty", version, dirty, verr, tokenWindowIndexVersion)
+			}
+			if gotOID, gotDef := relation(); gotOID != oid || gotDef != def {
+				t.Errorf("the relation is now %d %q, want it left as it was, %d %q", gotOID, gotDef, oid, def)
+			}
+
+			// The message's remedy.
+			if _, err := db.ExecContext(ctx, tt.drop); err != nil {
+				t.Fatalf("%s: %v", tt.drop, err)
+			}
+			if err := m.Force(int(before)); err != nil {
+				t.Fatalf("force %d: %v", before, err)
+			}
+			if err := m.Migrate(tokenWindowIndexVersion); err != nil {
+				t.Fatalf("up to %d after the remedy: %v", tokenWindowIndexVersion, err)
+			}
+			assertTokenWindowIndexBuilt(ctx, t, db)
+			assertCleanVersion(t, connStr, tokenWindowIndexVersion)
+		})
+	}
+}
+
+// TestMigration000161_DownDoesNotBlockInserts pins what the down is for:
+// it drops the index without blocking inserts into events. A transaction
+// that has read events stays open, so the drop has to wait for it, and
+// while it waits an insert into events from another connection must go
+// through within a short lock_timeout. DROP INDEX CONCURRENTLY waits for
+// that transaction without taking a lock an insert conflicts with. A plain
+// DROP INDEX queues for ACCESS EXCLUSIVE on events behind the open
+// transaction, and every later insert queues behind it, so the insert times
+// out. The waiting drop is found by its wait event: the down file is longer
+// than pg_stat_activity shows of a query.
+func TestMigration000161_DownDoesNotBlockInserts(t *testing.T) {
+	ctx := context.Background()
+	before := migrationBefore(t, tokenWindowIndexVersion)
+	connStr, db := migrationTestDatabase(ctx, t, tokenWindowIndexVersion)
+	assertTokenWindowIndexBuilt(ctx, t, db)
+	var sessionID, dbName string
+	if err := db.QueryRowContext(ctx, `INSERT INTO sessions (spawn_source) VALUES ('web') RETURNING id::text, current_database()`).Scan(&sessionID, &dbName); err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+
+	reader, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = reader.Rollback() }()
+	var events int
+	if err := reader.QueryRowContext(ctx, `SELECT count(*) FROM events`).Scan(&events); err != nil {
+		t.Fatalf("read events in the open transaction: %v", err)
+	}
+
+	m, mdb := newMigrate(t, connStr)
+	defer func() { _ = mdb.Close() }()
+	var down errgroup.Group
+	var downErr error
+	down.Go(func() error {
+		downErr = m.Migrate(before)
+		return nil
+	})
+
+	// Nothing below fails the test before the reader is rolled back and the
+	// down has returned, so the down never outlives the test.
+	waiting := false
+	var pollErr, insertErr error
+	for deadline := time.Now().Add(30 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		var n int
+		if pollErr = db.QueryRowContext(ctx,
+			`SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND wait_event_type = 'Lock'`, dbName).Scan(&n); pollErr != nil || n > 0 {
+			waiting = pollErr == nil
+			break
+		}
+	}
+	if waiting {
+		insertErr = insertWithLockTimeout(ctx, db, sessionID)
+	}
+	_ = reader.Rollback()
+	_ = down.Wait()
+
+	if pollErr != nil {
+		t.Fatalf("look for the waiting drop: %v", pollErr)
+	}
+	if !waiting {
+		t.Fatal("the down never waited for the transaction that read events; the test needs it to")
+	}
+	if insertErr != nil {
+		t.Errorf("an insert into events while the down waited: %v -- the drop blocks inserts", insertErr)
+	}
+	if downErr != nil {
+		t.Fatalf("down to %d: %v", before, downErr)
+	}
+	if _, _, _, found := readTokenWindowIndex(ctx, t, db); found {
+		t.Error("events_token_window_idx still exists after down")
+	}
+	assertCleanVersion(t, connStr, before)
+}
+
+// insertWithLockTimeout inserts a `token` frame into events with a 2 s
+// lock_timeout, so an insert that queues for its lock fails rather than
+// waits.
+func insertWithLockTimeout(ctx context.Context, db *sql.DB, sessionID string) error {
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.ExecContext(ctx, `SET LOCAL lock_timeout = '2s'`); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO events (session_id, type, message_id, payload) VALUES ($1, 'token', 'prt_during_down', '{"messageId":"prt_during_down","text":"during the down"}')`,
+		sessionID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
