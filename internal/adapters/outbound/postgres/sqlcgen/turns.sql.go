@@ -13,9 +13,9 @@ import (
 
 const createTurn = `-- name: CreateTurn :one
 
-INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, is_review_attempt, request_trigger)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger
+INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, is_review_attempt, request_trigger, requested_by, request_text, context_moves)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves
 `
 
 type CreateTurnParams struct {
@@ -35,6 +35,9 @@ type CreateTurnParams struct {
 	ReviewVerdictContext    []byte      `json:"review_verdict_context"`
 	IsReviewAttempt         bool        `json:"is_review_attempt"`
 	RequestTrigger          *string     `json:"request_trigger"`
+	RequestedBy             pgtype.UUID `json:"requested_by"`
+	RequestText             *string     `json:"request_text"`
+	ContextMoves            *int32      `json:"context_moves"`
 }
 
 // Queries backing TurnStore (§4.3). Just enough to prove the pipeline end
@@ -123,10 +126,20 @@ type CreateTurnParams struct {
 // request_trigger (migrations/000159_turns_end_reason.up.sql, technical
 // plan §24.9) is what asked for the turn, for a lane that records it:
 // 'auto' for the automatic re-review (sessionactor's
-// insertAutoRetriggerTurn), nil for every other call site. Only a review
-// attempt the automatic lane asked for is checked against its pull
-// request's live context when it is dispatched after waiting behind
-// another turn (sessionactor's reviewcontextcheck.go).
+// insertAutoRetriggerTurn); 'label' or 'button' for a person's
+// (migrations/000160: the GitHub label lane, the web re-review button, and
+// the re-run of a request owed to its requester); nil for every other call
+// site, a mention's included. A review attempt one of those lanes asked
+// for is checked against its pull request's live context when it is
+// dispatched after waiting behind another turn (sessionactor's
+// reviewcontextcheck.go).
+//
+// requested_by, request_text and context_moves (migrations/000160) are
+// what a person's request owes its re-run when its context moved: who
+// asked, the lane's own text before any context was folded in, and the
+// moves in a row it met before this turn was inserted. nil for every turn
+// no human lane records, and context_moves nil for every turn but a
+// re-run.
 func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, error) {
 	row := q.db.QueryRow(ctx, createTurn,
 		arg.SessionID,
@@ -145,6 +158,9 @@ func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, e
 		arg.ReviewVerdictContext,
 		arg.IsReviewAttempt,
 		arg.RequestTrigger,
+		arg.RequestedBy,
+		arg.RequestText,
+		arg.ContextMoves,
 	)
 	var i Turn
 	err := row.Scan(
@@ -182,6 +198,9 @@ func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, e
 		&i.EndReason,
 		&i.ContextUnconfirmedAt,
 		&i.RequestTrigger,
+		&i.RequestedBy,
+		&i.RequestText,
+		&i.ContextMoves,
 	)
 	return i, err
 }
@@ -429,7 +448,7 @@ func (q *Queries) GetPlatformCostSummaryInWindow(ctx context.Context, createdAt 
 }
 
 const getProcessingTurnForSession = `-- name: GetProcessingTurnForSession :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves FROM turns
 WHERE session_id = $1 AND status = 'processing'
 `
 
@@ -480,6 +499,9 @@ func (q *Queries) GetProcessingTurnForSession(ctx context.Context, sessionID pgt
 		&i.EndReason,
 		&i.ContextUnconfirmedAt,
 		&i.RequestTrigger,
+		&i.RequestedBy,
+		&i.RequestText,
+		&i.ContextMoves,
 	)
 	return i, err
 }
@@ -491,7 +513,7 @@ SELECT
     b.request_trigger,
     b.review_head_sha,
     b.review_verdict_context,
-    (b.is_review_attempt AND COALESCE(b.request_trigger, '') = 'auto' AND EXISTS (
+    (b.is_review_attempt AND COALESCE(b.request_trigger, '') IN ('auto', 'label', 'button') AND EXISTS (
         SELECT 1 FROM turns o
         WHERE o.session_id = b.session_id
           AND (o.created_at < b.created_at OR (o.created_at = b.created_at AND o.id < b.id))
@@ -542,10 +564,13 @@ type GetReviewAttemptToCheckRow struct {
 // skew of this one's creation can read either way: read as queued, the
 // attempt is checked when it would not have been (a read of the code host
 // that may still find a moved context); read as not, it starts unchecked,
-// as every attempt did before this rule. Only a review attempt the
-// automatic lane asked for (request_trigger 'auto') is asked: the one kind
-// the check applies to, so no other pick -- a person's review request, a
-// follow-up -- costs the walk. The walk reads the pick's session's earlier
+// as every attempt did before this rule. Only a review attempt a lane that
+// records its trigger asked for is asked -- the automatic re-review
+// ('auto') or a person's request ('label', 'button',
+// migrations/000160), the kinds the check applies to
+// (turn.ContextCheckedAtDispatch) -- so no other pick, a follow-up or an
+// attempt an older binary inserted, costs the walk. The walk reads the
+// pick's session's earlier
 // turns through (session_id, dispatched_message_id) until it finds one
 // that keeps the pick queued: when none does, every one of them, about one
 // heap buffer per earlier turn on a session whose turns lie among other
@@ -572,7 +597,7 @@ func (q *Queries) GetReviewAttemptToCheck(ctx context.Context, sessionID pgtype.
 }
 
 const getTurn = `-- name: GetTurn :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves FROM turns
 WHERE id = $1
 `
 
@@ -614,12 +639,15 @@ func (q *Queries) GetTurn(ctx context.Context, id pgtype.UUID) (Turn, error) {
 		&i.EndReason,
 		&i.ContextUnconfirmedAt,
 		&i.RequestTrigger,
+		&i.RequestedBy,
+		&i.RequestText,
+		&i.ContextMoves,
 	)
 	return i, err
 }
 
 const getTurnByDispatchedMessageID = `-- name: GetTurnByDispatchedMessageID :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves FROM turns
 WHERE session_id = $1 AND dispatched_message_id = $2
 `
 
@@ -696,6 +724,9 @@ func (q *Queries) GetTurnByDispatchedMessageID(ctx context.Context, arg GetTurnB
 		&i.EndReason,
 		&i.ContextUnconfirmedAt,
 		&i.RequestTrigger,
+		&i.RequestedBy,
+		&i.RequestText,
+		&i.ContextMoves,
 	)
 	return i, err
 }
@@ -908,7 +939,7 @@ func (q *Queries) ListStopRequestedOpenTurns(ctx context.Context, arg ListStopRe
 }
 
 const listTurnsForSession = `-- name: ListTurnsForSession :many
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves FROM turns
 WHERE session_id = $1
 ORDER BY created_at ASC, id ASC
 `
@@ -964,6 +995,9 @@ func (q *Queries) ListTurnsForSession(ctx context.Context, sessionID pgtype.UUID
 			&i.EndReason,
 			&i.ContextUnconfirmedAt,
 			&i.RequestTrigger,
+			&i.RequestedBy,
+			&i.RequestText,
+			&i.ContextMoves,
 		); err != nil {
 			return nil, err
 		}
@@ -1169,17 +1203,25 @@ func (q *Queries) RequestStopOpenTurns(ctx context.Context, sessionID pgtype.UUI
 }
 
 const reviewRetriggerHeld = `-- name: ReviewRetriggerHeld :one
-SELECT EXISTS (
+SELECT (EXISTS (
     SELECT 1 FROM turns t
     WHERE t.session_id = $1
       AND t.status IN ('pending', 'dispatched', 'processing')
-) AS held
+) OR EXISTS (
+    SELECT 1 FROM owed_review_requests o
+    WHERE o.session_id = $1
+))::boolean AS held
 `
 
 // Technical plan §24.9: whether the re-review debounce of this session
 // holds -- some turn of the session is still open (pending, dispatched or
 // processing), so an automatic review would queue behind it with a prompt
-// built for a head that may move again before it runs. Read by the
+// built for a head that may move again before it runs; or a person's
+// review request is owed (owed_review_requests, migrations/000160): its
+// re-run, for the head the pull request has now, comes first, and its
+// consumer inserts it as an open turn that holds the lane in turn, or
+// drops it and wakes the held debounce. The owed term is one probe of
+// owed_review_requests_session_id_idx. Read by the
 // debounce's fire (sessionactor's readReviewRetriggerState, then again in
 // finishReviewRetrigger just before the insert) inside the actor's
 // transaction, under the session's actor-epoch row lock that every turn
@@ -1301,7 +1343,7 @@ SET status = $2,
     dispatched_message_id = COALESCE($7, dispatched_message_id),
     end_reason = COALESCE($8, end_reason)
 WHERE id = $1
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves
 `
 
 type UpdateTurnStatusParams struct {
@@ -1403,6 +1445,9 @@ func (q *Queries) UpdateTurnStatus(ctx context.Context, arg UpdateTurnStatusPara
 		&i.EndReason,
 		&i.ContextUnconfirmedAt,
 		&i.RequestTrigger,
+		&i.RequestedBy,
+		&i.RequestText,
+		&i.ContextMoves,
 	)
 	return i, err
 }

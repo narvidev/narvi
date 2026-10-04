@@ -69,6 +69,7 @@ func TestTimerNameConstants(t *testing.T) {
 		{sessionactor.TimerInactivity, "inactivity"},
 		{sessionactor.TimerTurnDeadline, "turn_deadline"},
 		{sessionactor.TimerTerminalGrace, "terminal_grace"},
+		{sessionactor.TimerOwedReviewRequest, "owed_review_request"},
 	}
 
 	for _, tc := range tests {

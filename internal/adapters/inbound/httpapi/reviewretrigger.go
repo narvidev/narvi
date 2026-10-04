@@ -45,6 +45,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/review"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -451,7 +452,15 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		// IsReviewAttempt: true (finding A4) -- a human explicitly clicked
 		// "re-run review" on this session; this is always a genuine
 		// review attempt, never an ordinary reply.
-		created, _, cerr := CreateTurnCore(ctx, pool, sessions, turns, plans, nil, auditLog, registry, sessionID, prompt, triageModelID, false, false, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, Effort: triageEffort, ReviewDepth: &reviewDepthStr, ReviewDepthDecision: triageRecordJSON, ReviewKnowledgeMode: &knowledgeMode, ReviewKnowledgeDecision: knowledgeDecisionJSON, ReviewVerdictContext: reviewVerdictContextJSON, IsReviewAttempt: true})
+		//
+		// RequestTrigger/RequestText (technical plan §24.9): this lane's
+		// own mark and its own fixed sentence, so a click that waits behind
+		// another turn and meets a moved pull request when it is dispatched
+		// is owed to actorUserID and re-run for the new head, its prompt
+		// composed from that sentence again
+		// (internal/app/sessionactor's owedreviewrequest.go).
+		requestTrigger, requestText := turn.RequestTriggerButton, manualRetriggerPromptText
+		created, _, cerr := CreateTurnCore(ctx, pool, sessions, turns, plans, nil, auditLog, registry, sessionID, prompt, triageModelID, false, false, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, Effort: triageEffort, ReviewDepth: &reviewDepthStr, ReviewDepthDecision: triageRecordJSON, ReviewKnowledgeMode: &knowledgeMode, ReviewKnowledgeDecision: knowledgeDecisionJSON, ReviewVerdictContext: reviewVerdictContextJSON, IsReviewAttempt: true, RequestTrigger: &requestTrigger, RequestText: &requestText})
 		if cerr != nil {
 			logger.Error("httpapi: retrigger review (create turn) failed", "status", cerr.Status, "message", cerr.Message)
 			writeError(w, cerr.Status, cerr.Message)

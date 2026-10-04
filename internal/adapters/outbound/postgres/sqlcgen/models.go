@@ -2068,6 +2068,18 @@ type Outbox struct {
 	ConsecutiveInterruptions int32              `json:"consecutive_interruptions"`
 }
 
+type OwedReviewRequest struct {
+	ID              pgtype.UUID        `json:"id"`
+	SessionID       pgtype.UUID        `json:"session_id"`
+	RequestedBy     pgtype.UUID        `json:"requested_by"`
+	Trigger         string             `json:"trigger"`
+	RequestText     *string            `json:"request_text"`
+	IsReviewAttempt bool               `json:"is_review_attempt"`
+	ContextMoves    int32              `json:"context_moves"`
+	MovedTurnID     pgtype.UUID        `json:"moved_turn_id"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
 type Participant struct {
 	ID         pgtype.UUID        `json:"id"`
 	SessionID  pgtype.UUID        `json:"session_id"`
@@ -2481,6 +2493,9 @@ type Turn struct {
 	EndReason                 *string               `json:"end_reason"`
 	ContextUnconfirmedAt      pgtype.Timestamptz    `json:"context_unconfirmed_at"`
 	RequestTrigger            *string               `json:"request_trigger"`
+	RequestedBy               pgtype.UUID           `json:"requested_by"`
+	RequestText               *string               `json:"request_text"`
+	ContextMoves              *int32                `json:"context_moves"`
 }
 
 type TurnStepCost struct {

@@ -40,9 +40,10 @@ import (
 //     or planDispatch's gate;
 //   - refusePersonalLinkOnly (credentialgate.go): a model only a personal
 //     provider link could run;
-//   - endContextMovedTurn (reviewcontextcheck.go): a queued automatic
-//     review attempt whose pull request moved past the context it
-//     recorded, ended context_moved without running;
+//   - endContextMovedTurn (reviewcontextcheck.go): a queued review
+//     attempt -- an automatic one or a person's -- whose pull request
+//     moved past the context it recorded, ended context_moved without
+//     running;
 //   - and three that end nothing: tryPlanDispatch's two (pending to
 //     dispatched to processing) and tryPlanReenqueue's re-stamp, which
 //     passes the status back unchanged.
@@ -86,12 +87,24 @@ func (a *Actor) wakeReviewRetriggerIfTurnEnded(ctx context.Context, tx pgx.Tx) e
 	if !a.turnEnded {
 		return nil
 	}
+	return a.wakeHeldReviewRetrigger(ctx, tx, "a turn ended")
+}
+
+// wakeHeldReviewRetrigger moves the session's re-review debounce to now
+// inside tx when the hold re-armed it (TimerStore.WakeReviewRetriggerDebounce,
+// under the stop's rule): the wake-up every end of what held the automatic
+// lane owes it, in the transaction of that end. A turn's end runs it
+// through wakeReviewRetriggerIfTurnEnded; the end of an owed request that
+// is dropped rather than re-run -- the hold's other term
+// (ReviewRetriggerHeld) -- runs it directly (owedreviewrequest.go), since
+// no turn ends then. cause names the end, for the log.
+func (a *Actor) wakeHeldReviewRetrigger(ctx context.Context, tx pgx.Tx, cause string) error {
 	woken, err := a.stores.timer.WithTx(tx).WakeReviewRetriggerDebounce(ctx, a.sessionID, heldDebounceLead(a.timeouts))
 	if err != nil {
-		return fmt.Errorf("sessionactor: wake the re-review debounce after a turn ended: %w", err)
+		return fmt.Errorf("sessionactor: wake the re-review debounce after %s: %w", cause, err)
 	}
 	if woken > 0 {
-		a.logger.Info("sessionactor: review_retrigger_debounce: a turn ended; the held re-review is due now")
+		a.logger.Info("sessionactor: review_retrigger_debounce: the held re-review is due now", "cause", cause)
 	}
 	return nil
 }

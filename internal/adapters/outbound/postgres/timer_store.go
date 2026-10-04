@@ -103,6 +103,31 @@ func (s *TimerStore) RequeueReviewRetriggerDebounce(ctx context.Context, session
 	return s.q.RequeueReviewRetriggerDebounce(ctx, sessionID)
 }
 
+// ArmOwedReviewRequest arms the session's owed_review_request timer due at
+// the database's now, or moves an armed one back to it, keeping its
+// created_at: a person's review request is owed (technical plan §24.9).
+// See ArmOwedReviewRequestTimer's doc comment in
+// queries/session_timers.sql.
+func (s *TimerStore) ArmOwedReviewRequest(ctx context.Context, sessionID pgtype.UUID) error {
+	return s.q.ArmOwedReviewRequestTimer(ctx, sessionID)
+}
+
+// BackOffOwedReviewRequest moves the session's owed_review_request timer to
+// the database's now plus the age of the request it served (since), held
+// between base and max, and reports the rows it moved: zero when the
+// session has none. armed_at is not moved. The consumer's backoff after a
+// read it could not make (technical plan §24.9); see
+// BackOffOwedReviewRequestTimer's doc comment in
+// queries/session_timers.sql.
+func (s *TimerStore) BackOffOwedReviewRequest(ctx context.Context, sessionID pgtype.UUID, since pgtype.Timestamptz, base, maxDelay time.Duration) (int64, error) {
+	return s.q.BackOffOwedReviewRequestTimer(ctx, sqlcgen.BackOffOwedReviewRequestTimerParams{
+		SessionID:   sessionID,
+		Since:       since,
+		BaseSeconds: base.Seconds(),
+		MaxSeconds:  maxDelay.Seconds(),
+	})
+}
+
 // DeleteDispatch deletes the session's dispatch timer and returns the
 // armed_at and created_at it carried, both invalid when the session had
 // none. The first write of every dispatch evaluation (technical plan §2).

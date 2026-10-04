@@ -86,12 +86,22 @@
 -- request_trigger (migrations/000159_turns_end_reason.up.sql, technical
 -- plan §24.9) is what asked for the turn, for a lane that records it:
 -- 'auto' for the automatic re-review (sessionactor's
--- insertAutoRetriggerTurn), nil for every other call site. Only a review
--- attempt the automatic lane asked for is checked against its pull
--- request's live context when it is dispatched after waiting behind
--- another turn (sessionactor's reviewcontextcheck.go).
-INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, is_review_attempt, request_trigger)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, sqlc.narg('request_trigger'))
+-- insertAutoRetriggerTurn); 'label' or 'button' for a person's
+-- (migrations/000160: the GitHub label lane, the web re-review button, and
+-- the re-run of a request owed to its requester); nil for every other call
+-- site, a mention's included. A review attempt one of those lanes asked
+-- for is checked against its pull request's live context when it is
+-- dispatched after waiting behind another turn (sessionactor's
+-- reviewcontextcheck.go).
+--
+-- requested_by, request_text and context_moves (migrations/000160) are
+-- what a person's request owes its re-run when its context moved: who
+-- asked, the lane's own text before any context was folded in, and the
+-- moves in a row it met before this turn was inserted. nil for every turn
+-- no human lane records, and context_moves nil for every turn but a
+-- re-run.
+INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, is_review_attempt, request_trigger, requested_by, request_text, context_moves)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, sqlc.narg('request_trigger'), sqlc.narg('requested_by'), sqlc.narg('request_text'), sqlc.narg('context_moves'))
 RETURNING *;
 
 -- name: GetTurn :one
@@ -165,10 +175,13 @@ LIMIT 1;
 -- skew of this one's creation can read either way: read as queued, the
 -- attempt is checked when it would not have been (a read of the code host
 -- that may still find a moved context); read as not, it starts unchecked,
--- as every attempt did before this rule. Only a review attempt the
--- automatic lane asked for (request_trigger 'auto') is asked: the one kind
--- the check applies to, so no other pick -- a person's review request, a
--- follow-up -- costs the walk. The walk reads the pick's session's earlier
+-- as every attempt did before this rule. Only a review attempt a lane that
+-- records its trigger asked for is asked -- the automatic re-review
+-- ('auto') or a person's request ('label', 'button',
+-- migrations/000160), the kinds the check applies to
+-- (turn.ContextCheckedAtDispatch) -- so no other pick, a follow-up or an
+-- attempt an older binary inserted, costs the walk. The walk reads the
+-- pick's session's earlier
 -- turns through (session_id, dispatched_message_id) until it finds one
 -- that keeps the pick queued: when none does, every one of them, about one
 -- heap buffer per earlier turn on a session whose turns lie among other
@@ -185,7 +198,7 @@ SELECT
     b.request_trigger,
     b.review_head_sha,
     b.review_verdict_context,
-    (b.is_review_attempt AND COALESCE(b.request_trigger, '') = 'auto' AND EXISTS (
+    (b.is_review_attempt AND COALESCE(b.request_trigger, '') IN ('auto', 'label', 'button') AND EXISTS (
         SELECT 1 FROM turns o
         WHERE o.session_id = b.session_id
           AND (o.created_at < b.created_at OR (o.created_at = b.created_at AND o.id < b.id))
@@ -223,7 +236,12 @@ WHERE id = $1 AND status = 'pending';
 -- Technical plan §24.9: whether the re-review debounce of this session
 -- holds -- some turn of the session is still open (pending, dispatched or
 -- processing), so an automatic review would queue behind it with a prompt
--- built for a head that may move again before it runs. Read by the
+-- built for a head that may move again before it runs; or a person's
+-- review request is owed (owed_review_requests, migrations/000160): its
+-- re-run, for the head the pull request has now, comes first, and its
+-- consumer inserts it as an open turn that holds the lane in turn, or
+-- drops it and wakes the held debounce. The owed term is one probe of
+-- owed_review_requests_session_id_idx. Read by the
 -- debounce's fire (sessionactor's readReviewRetriggerState, then again in
 -- finishReviewRetrigger just before the insert) inside the actor's
 -- transaction, under the session's actor-epoch row lock that every turn
@@ -246,11 +264,14 @@ WHERE id = $1 AND status = 'pending';
 -- TestReviewRetriggerHold_HeldMatchesTurnIsTerminal fails the day
 -- turn_status gains a state, so the hold never quietly reads a new open
 -- state as ended.
-SELECT EXISTS (
+SELECT (EXISTS (
     SELECT 1 FROM turns t
     WHERE t.session_id = sqlc.arg('session_id')
       AND t.status IN ('pending', 'dispatched', 'processing')
-) AS held;
+) OR EXISTS (
+    SELECT 1 FROM owed_review_requests o
+    WHERE o.session_id = sqlc.arg('session_id')
+))::boolean AS held;
 
 -- name: UpdateTurnStatus :one
 -- Sets a turn's status, plus dispatched_at/completed_at/

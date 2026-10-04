@@ -16,7 +16,10 @@
 // durable dispatch trigger (§2, §3.3) adds an 8th, dispatch, armed in the
 // transaction that creates a turn (postgres.TurnStore.CreateAndArmDispatch)
 // and handled by handleEnsureDispatched (dispatch.go), whose planDispatch
-// deletes it.
+// deletes it. Technical plan §24.9's owed human review requests add a
+// 9th, owed_review_request, armed by the dispatch that ends a person's
+// queued review attempt context_moved and handled by
+// handleOwedReviewRequestTimer (owedreviewrequest.go).
 //
 // All 5 named timers' RE-ARM/handling logic is fully wired here -- none
 // needed a SandboxProvider or AgentRuntime (neither port exists yet). The
@@ -137,6 +140,8 @@ func (a *Actor) timerHandler(name string) (func(context.Context) error, bool) {
 		// The evaluation deletes the row itself, first, in planDispatch's
 		// own transaction, as it does for every other caller.
 		return a.handleEnsureDispatched, true
+	case TimerOwedReviewRequest:
+		return a.handleOwedReviewRequestTimer, true
 	default:
 		return nil, false
 	}
