@@ -9721,8 +9721,10 @@ one rule; the result reports "no text" as `null` rather than the placeholder. Th
 `sessionactor.TurnContentBounds` (the run's dispatch watermark up to the next dispatched turn's), and
 the result reads that window's own `token` frames, at most `planContentEventFetchLimit` of them
 (`sessionactor.ReadWindowFinal`), as the plan views do, so a later turn's tool events cannot push the
-run's text out of what is read (Step 229); what that read scans to find the frames still grows with
-the session rather than the window (Step 231). The text is cut at 4,000
+run's text out of what is read (Step 229); and that read reads nothing else to find them, the range of
+an index of the session's `token` frames by id from the window's upper bound to its lower one, so what
+it costs grows with the window's frames, never with the session's other text or the events every other
+session logged during the run (Step 231). The text is cut at 4,000
 characters (code points, never inside one), `truncated` saying so; the whole text stays in the events
 route. The spec's owner decision D13 (whether a part's stored row held its first frame, not its last) is
 settled by #334's per-frame storage.

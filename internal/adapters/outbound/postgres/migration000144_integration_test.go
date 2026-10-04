@@ -35,8 +35,11 @@ var migrationDBCounter atomic.Int64
 // migrationTestDatabase creates an empty database in the shared container,
 // migrates it to version through golang-migrate, and returns its
 // connection string and a database/sql handle on it. Both are dropped at
-// cleanup.
-func migrationTestDatabase(ctx context.Context, t *testing.T, version uint) (string, *sql.DB) {
+// cleanup. Each of setup runs in the new database first, on a connection
+// of its own, before any other connects: a setting it gives the database
+// (ALTER DATABASE ... SET) holds for every connection after it, the
+// migrations' included.
+func migrationTestDatabase(ctx context.Context, t *testing.T, version uint, setup ...string) (string, *sql.DB) {
 	t.Helper()
 	admin, adminConnStr := IntegrationTestPoolAndConnStr(t)
 	name := fmt.Sprintf("m144_%d_%d", time.Now().UnixNano(), migrationDBCounter.Add(1))
@@ -60,6 +63,21 @@ func migrationTestDatabase(ctx context.Context, t *testing.T, version uint) (str
 			t.Errorf("drop database %s: %v", name, err)
 		}
 	})
+
+	// db has not connected yet: sql.Open connects on first use.
+	if len(setup) > 0 {
+		configure, err := sql.Open("pgx", connStr)
+		if err != nil {
+			t.Fatalf("open %s to set it up: %v", name, err)
+		}
+		for _, statement := range setup {
+			if _, err := configure.ExecContext(ctx, statement); err != nil {
+				_ = configure.Close()
+				t.Fatalf("set up %s: %s: %v", name, statement, err)
+			}
+		}
+		_ = configure.Close()
+	}
 
 	m, mdb := newMigrate(t, connStr)
 	defer func() { _ = mdb.Close() }()

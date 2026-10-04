@@ -251,18 +251,21 @@ func ReadPlanFinal(ctx context.Context, turns *postgres.TurnStore, events *postg
 // A nil lower reads from the log's start, as FinalText reads a nil lower
 // bound. found is false when the window holds no text.
 //
-// It returns the window's frames and no others, but what it reads to find
-// them is not bounded by the turn, as
-// TestEventStore_ListTokenFramesInWindow_ReadsTheTurnsWindow measured
-// (postgres): under the generic plan pgx's statement cache lets Postgres
-// settle on, it walks events_token_part_idx over every `token` frame the
-// session holds -- the window's id is no seek key behind the part id --
-// about one buffer for 70 frames; under a custom plan it reads events_pkey
-// across the window, passing over its tool events too, about one buffer for
-// 30 rows. Either way it reads no payload but the window's frames, where
-// the newest-2000-events read it replaced read every tool payload in the
-// tail. An index of a session's `token` frames by id would hold the read to
-// the window; that needs a migration, not taken here.
+// It returns the window's frames and no others, and reads nothing else to
+// find them: the range of events_token_window_idx from the window's upper
+// bound to its lower one, as a backward index scan under the generic plan
+// pgx's statement cache lets Postgres settle on, and as that scan or a
+// bitmap scan of the same range under a custom plan. So what it costs is
+// the index's few pages and one heap page a frame of the window at most,
+// whatever the session logged before or after the turn, the turn's own
+// tool events, and every other session's events logged during it: at most
+// 45 buffers for a window of 40 frames across
+// TestEventStore_ListTokenFramesInWindow_ReadsTheTurnsWindow's matrix
+// (postgres), where the read before that index walked every `token` frame
+// of the session or read events_pkey across the window, up to 3,225
+// buffers on the same logs. It reads no payload but the window's frames,
+// where the newest-2000-events read it replaced read every tool payload in
+// the tail.
 //
 // Every reader of a turn's text reads it here -- the approval and its
 // snapshot, the decision inbox, the plan views' fallback, the session
