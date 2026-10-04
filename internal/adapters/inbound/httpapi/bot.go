@@ -164,8 +164,13 @@ func CreateSessionForBot(ctx context.Context, pool *pgxpool.Pool, sessions *post
 // and ActionRetriggerReview). See CreateTurnOptions.IsReviewAttempt's own
 // doc comment (turn.go) for why this must never be inferred from
 // reviewHeadSHA's own presence.
-func CreateTurnForBot(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, reviewHeadSHA *string, classifyText *string, effort *string, reviewDepth *string, reviewDepthDecision []byte, reviewKnowledgeMode *string, reviewKnowledgeDecision []byte, reviewVerdictContextJSON []byte, isReviewAttempt bool) (sqlcgen.Turn, error) {
-	created, _, cerr := createTurnLocked(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, sessionID, prompt, modelID, planMode, epistemicCheckDefault, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, ClassifyText: classifyText, Effort: effort, ReviewDepth: reviewDepth, ReviewDepthDecision: reviewDepthDecision, ReviewKnowledgeMode: reviewKnowledgeMode, ReviewKnowledgeDecision: reviewKnowledgeDecision, ReviewVerdictContext: reviewVerdictContextJSON, IsReviewAttempt: isReviewAttempt})
+//
+// requestTrigger/requestText (technical plan §24.9) are the request lane
+// this turn came through ("label" or "mention") and the lane's own text --
+// see CreateTurnOptions.RequestTrigger/RequestText's own doc comment
+// (turn.go); with them the turn records actorUserID as its requester.
+func CreateTurnForBot(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, reviewHeadSHA *string, classifyText *string, effort *string, reviewDepth *string, reviewDepthDecision []byte, reviewKnowledgeMode *string, reviewKnowledgeDecision []byte, reviewVerdictContextJSON []byte, isReviewAttempt bool, requestTrigger *string, requestText *string) (sqlcgen.Turn, error) {
+	created, _, cerr := createTurnLocked(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, sessionID, prompt, modelID, planMode, epistemicCheckDefault, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, ClassifyText: classifyText, Effort: effort, ReviewDepth: reviewDepth, ReviewDepthDecision: reviewDepthDecision, ReviewKnowledgeMode: reviewKnowledgeMode, ReviewKnowledgeDecision: reviewKnowledgeDecision, ReviewVerdictContext: reviewVerdictContextJSON, IsReviewAttempt: isReviewAttempt, RequestTrigger: requestTrigger, RequestText: requestText})
 	if cerr != nil {
 		// %w, NOT %s (a follow-up fix, Finding 1): cerr's own
 		// Error() method returns exactly cerr.Message, so this produces the

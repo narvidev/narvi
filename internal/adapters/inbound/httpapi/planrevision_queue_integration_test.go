@@ -314,7 +314,7 @@ func TestRevisionQueuedBehindImplementation_LeavesItAuthorized(t *testing.T) {
 			// The revision, queued through CreateTurnForBot with plan mode
 			// on -- the pairing no ingress makes today (this file's top
 			// comment).
-			revision, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, r.registry, r.sessionID, feedback, nil, true, false, r.userID, nil, nil, nil, nil, nil, nil, nil, nil, false)
+			revision, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, r.registry, r.sessionID, feedback, nil, true, false, r.userID, nil, nil, nil, nil, nil, nil, nil, nil, false, nil, nil)
 			if err != nil {
 				t.Fatalf("CreateTurnForBot: %v", err)
 			}
@@ -468,7 +468,7 @@ func TestMentionBehindImplementation_QueuedAsAnOrdinaryTurn(t *testing.T) {
 		t.Helper()
 		// As the coalescer's reuse branch calls it for a mention: plan mode
 		// off, the mention's own text to classify.
-		created, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, r.registry, sessionID, mention, nil, false, false, r.userID, nil, &mention, nil, nil, nil, nil, nil, nil, false)
+		created, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, r.registry, sessionID, mention, nil, false, false, r.userID, nil, &mention, nil, nil, nil, nil, nil, nil, false, nil, nil)
 		if err != nil {
 			t.Fatalf("CreateTurnForBot: %v", err)
 		}

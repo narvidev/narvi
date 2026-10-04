@@ -157,6 +157,9 @@ func (a *Actor) handleStopTimer(ctx context.Context) error {
 		if err := a.disarmWorkCreatingTimers(ctx, tx, sessionRow.StopRequestedAt); err != nil {
 			return err
 		}
+		if err := a.dropOwedReviewRequestsForStop(ctx, tx, sessionRow); err != nil {
+			return err
+		}
 
 		if rearmAt.IsZero() {
 			return a.deleteTimer(ctx, tx, TimerStop)
@@ -497,7 +500,9 @@ func stopFlaggedPendingTurnIDs(turns []sqlcgen.Turn) []pgtype.UUID {
 
 // disarmWorkCreatingTimers deletes every timer of the session whose firing
 // creates a turn with no new input (ClassifyTimer's TimerWorkCreatesTurn --
-// today the re-review debounce) and that was armed at or before
+// today the re-review debounce and the owed review request's timer, whose
+// requests dropOwedReviewRequestsForStop drops by the same rule) and that
+// was armed at or before
 // requestedAt, the session's standing stop request: its latest request's
 // instant, which a repeated request moves forward (RequestSessionStop), so
 // a debounce a push armed between two requests goes with the second.
@@ -552,6 +557,57 @@ func (a *Actor) disarmWorkCreatingTimers(ctx context.Context, tx pgx.Tx, request
 			return err
 		}
 		a.logger.Info("sessionactor: work-creating timer disarmed by a stop", "timer", t.Name)
+	}
+	return nil
+}
+
+// dropOwedReviewRequestsForStop drops every review request the session
+// owed when a person's standing stop was made (technical plan §24.9,
+// §3.3): the owed_review_requests rows created at or before
+// sessionRow.StopRequestedAt, the rule disarmWorkCreatingTimers deletes
+// the owed_review_request timer by -- the database's clock on both sides.
+// A stop is the person's answer, so none of them is re-run and no
+// requester is told; each moved turn's workflow attempt, which the re-run
+// would have taken over, ends the way a stopped attempt ends
+// (settleOwedRequestWorkflow), and the hold's owed term is released
+// (wakeHeldReviewRetrigger, under the stop's own rule). A request owed
+// after the stop was made by a turn created after it -- the dispatch's
+// stop gate cancels every flagged one before it is checked -- so it is new
+// work and stays, and the owed_review_request timer the disarm may have
+// deleted with the older requests is armed again, due at once, for it.
+// Run by the stop timer after its disarm, and by the owed timer's consumer
+// first, so a request the stop predates is never re-run whichever fires
+// first. A NULL stop request -- none standing, or a person resumed the
+// session -- drops nothing.
+func (a *Actor) dropOwedReviewRequestsForStop(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session) error {
+	if !sessionRow.StopRequestedAt.Valid {
+		return nil
+	}
+	owed := a.stores.owedReviewRequest.WithTx(tx)
+	dropped, err := owed.DeleteForStop(ctx, a.sessionID, sessionRow.StopRequestedAt)
+	if err != nil {
+		return fmt.Errorf("sessionactor: drop the review requests a stop predates: %w", err)
+	}
+	if len(dropped) == 0 {
+		return nil
+	}
+	for _, d := range dropped {
+		a.settleOwedRequestWorkflow(ctx, tx, sessionRow, d.MovedTurnID)
+		a.logger.Info("sessionactor: an owed review request dropped by a person's stop",
+			"owed_id", d.ID.String(), "moved_turn_id", d.MovedTurnID.String(), "request_trigger", d.Trigger)
+	}
+	if err := a.wakeHeldReviewRetrigger(ctx, tx, "a stop dropped the owed review requests"); err != nil {
+		return err
+	}
+	left, err := owed.Exists(ctx, a.sessionID)
+	if err != nil {
+		return fmt.Errorf("sessionactor: read whether a review request is still owed: %w", err)
+	}
+	if !left {
+		return nil
+	}
+	if err := a.stores.timer.WithTx(tx).ArmOwedReviewRequest(ctx, a.sessionID); err != nil {
+		return fmt.Errorf("sessionactor: arm the owed review request timer: %w", err)
 	}
 	return nil
 }

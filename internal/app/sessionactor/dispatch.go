@@ -347,9 +347,9 @@ type dispatchPlan struct {
 // Technical plan §24.9 adds a read before each evaluation, outside any
 // transaction for the same reason: preReadReviewContext compares the
 // recorded context of the turn the evaluation is about to pick -- a review
-// attempt the automatic re-review asked for that waited behind another
-// turn -- with its pull request's live one, and planDispatch applies the
-// answer (reviewcontextcheck.go). When that turn's context moved,
+// attempt the automatic re-review or a person's request asked for, that
+// waited behind another turn -- with its pull request's live one, and
+// planDispatch applies the answer (reviewcontextcheck.go). When that turn's context moved,
 // planDispatch ends it without running it and commits, and the next turn
 // is evaluated at once, with a read of its own: each such round ends a
 // pending turn, so the loop ends.
@@ -630,9 +630,9 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 				return nil
 			}
 			// Technical plan §24.9: a review attempt the automatic
-			// re-review asked for, about to start after waiting behind
-			// another turn, starts only on a context still its pull
-			// request's (reviewcontextcheck.go). Applied here, where the
+			// re-review or a person's request asked for, about to start
+			// after waiting behind another turn, starts only on a context
+			// still its pull request's (reviewcontextcheck.go). Applied here, where the
 			// turn is about to be sent: a sandbox still starting takes
 			// nothing yet, and the check runs once it is up.
 			target, ok := findTurnByID(turns, pendingID)

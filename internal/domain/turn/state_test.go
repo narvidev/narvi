@@ -210,31 +210,39 @@ func TestIgnoredForEndReason(t *testing.T) {
 }
 
 // TestContextCheckedAtDispatch pins which turns technical plan §24.9's
-// context check applies to: a review attempt the automatic re-review asked
-// for, and nothing else -- not a person's review request, not a turn that
-// is no review attempt, not a turn with no recorded trigger.
+// context check applies to: a review attempt the automatic re-review or a
+// person's request lane asked for, and nothing else -- not a turn that is
+// no review attempt, not a turn with no recorded trigger or one no lane
+// records. It pins IsHumanRequestTrigger beside it: the three lanes whose
+// moved attempt is owed to its requester, never the automatic one.
 func TestContextCheckedAtDispatch(t *testing.T) {
 	t.Parallel()
 
-	auto := turn.RequestTriggerAuto
-	label, empty := "label", ""
+	ptr := func(s string) *string { return &s }
 	for _, tc := range []struct {
 		name            string
 		isReviewAttempt bool
 		trigger         *string
-		want            bool
+		checked, human  bool
 	}{
-		{name: "an automatic review attempt", isReviewAttempt: true, trigger: &auto, want: true},
-		{name: "a person's review attempt", isReviewAttempt: true, trigger: &label},
+		{name: "an automatic review attempt", isReviewAttempt: true, trigger: ptr(turn.RequestTriggerAuto), checked: true},
+		{name: "a review attempt the label asked for", isReviewAttempt: true, trigger: ptr(turn.RequestTriggerLabel), checked: true, human: true},
+		{name: "a review attempt the button asked for", isReviewAttempt: true, trigger: ptr(turn.RequestTriggerButton), checked: true, human: true},
+		{name: "a review attempt a mention asked for", isReviewAttempt: true, trigger: ptr(turn.RequestTriggerMention), checked: true, human: true},
 		{name: "a review attempt with no trigger recorded", isReviewAttempt: true},
-		{name: "a review attempt with an empty trigger", isReviewAttempt: true, trigger: &empty},
-		{name: "an automatic turn that is no review attempt", trigger: &auto},
+		{name: "a review attempt with an empty trigger", isReviewAttempt: true, trigger: ptr("")},
+		{name: "a review attempt with a trigger no lane records", isReviewAttempt: true, trigger: ptr("slack")},
+		{name: "an automatic turn that is no review attempt", trigger: ptr(turn.RequestTriggerAuto)},
+		{name: "a follow-up mention, no review attempt", trigger: ptr(turn.RequestTriggerMention), human: true},
 		{name: "a follow-up", trigger: nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := turn.ContextCheckedAtDispatch(tc.isReviewAttempt, tc.trigger); got != tc.want {
-				t.Errorf("ContextCheckedAtDispatch(%v, %v) = %v, want %v", tc.isReviewAttempt, tc.trigger, got, tc.want)
+			if got := turn.ContextCheckedAtDispatch(tc.isReviewAttempt, tc.trigger); got != tc.checked {
+				t.Errorf("ContextCheckedAtDispatch(%v, %v) = %v, want %v", tc.isReviewAttempt, tc.trigger, got, tc.checked)
+			}
+			if got := turn.IsHumanRequestTrigger(tc.trigger); got != tc.human {
+				t.Errorf("IsHumanRequestTrigger(%v) = %v, want %v", tc.trigger, got, tc.human)
 			}
 		})
 	}

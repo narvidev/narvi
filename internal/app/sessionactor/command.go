@@ -63,6 +63,23 @@ const (
 	// evaluation -- so after a trigger that succeeded the row is gone within
 	// that evaluation, and a firing that arrives later finds nothing to do.
 	TimerDispatch = "dispatch"
+
+	// TimerOwedReviewRequest is technical plan §24.9's owed human review
+	// request: a person's review attempt (the label, the button, a mention)
+	// that waited behind another turn and met a moved context when it was
+	// dispatched ends context_moved, and its request becomes a row of
+	// owed_review_requests (migrations/000160). The dispatching transaction
+	// that ends the attempt arms this timer due at once on the database's
+	// clock (TimerStore.ArmOwedReviewRequest, whose query names this kind),
+	// so the request survives a restart between the move and its re-run.
+	// Its firing (owedreviewrequest.go's handleOwedReviewRequestTimer)
+	// serves the session's oldest owed request: it reads the pull request
+	// again, composes the prompt for the head it has now, asks the
+	// requester's authorization again, and inserts the re-run turn -- or
+	// drops the request and tells its requester -- deleting the row in the
+	// same transaction, then re-arms itself while more are owed and
+	// deletes itself otherwise.
+	TimerOwedReviewRequest = "owed_review_request"
 )
 
 // Command is the sum type an Actor's mailbox carries (§2: "one goroutine

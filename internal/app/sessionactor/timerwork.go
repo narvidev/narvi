@@ -98,19 +98,28 @@ const (
 //     a person's stop, a personal-link refusal, which escalates a
 //     workflow run and queues nothing -- ends, only a turn already
 //     pending, or re-sends one already in flight: turns the same snapshot
-//     already reads as queued or running. A queued automatic attempt
-//     whose context moved is ended too, and its re-request is the
-//     debounce's (above). It inserts no turn, and from a
+//     already reads as queued or running. A queued review attempt whose
+//     context moved is ended too: an automatic one's re-request is the
+//     debounce's (above), a person's is owed_review_request's (below). It
+//     inserts no turn, and from a
 //     settled snapshot it finds nothing to do. Every evaluation deletes
 //     it, so after a trigger that succeeded it is gone within that
 //     evaluation.
+//   - owed_review_request (armed due at once by the dispatch that ends a
+//     person's queued review attempt context_moved, in that transaction,
+//     and re-armed by its own firing while more is owed; technical plan
+//     §24.9): its firing inserts the re-run turn of a person's request
+//     with no further input -- the attempt it stands for has ended, so the
+//     snapshot reads no open turn for it -- or drops the request and tells
+//     its requester. It counts whenever it is armed: the opt-in, the hold
+//     and the budget never decide a person's request.
 func ClassifyTimer(name string) (work TimerWork, ok bool) {
 	switch name {
 	case TimerConnectingDeadline, TimerLivenessCheck, TimerInactivity, TimerTerminalGrace:
 		return TimerWorkSandboxOnly, true
 	case TimerTurnDeadline, TimerStop, TimerDispatch:
 		return TimerWorkTurnInFlight, true
-	case TimerReviewRetriggerDebounce:
+	case TimerReviewRetriggerDebounce, TimerOwedReviewRequest:
 		return TimerWorkCreatesTurn, true
 	default:
 		return 0, false

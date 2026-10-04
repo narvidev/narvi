@@ -733,8 +733,10 @@ func TestReviewContext_AnAutomaticRequestStopsAtTheBoundAndSaysSo(t *testing.T) 
 // costs a read of the code host only for an attempt that waited behind
 // another turn (technical plan §24.9). One that finds the session free --
 // the turn before it ended before it was inserted -- starts unchecked, its
-// pull request's count of moves reset; a person's review request, queued
-// or not, starts unchecked too.
+// pull request's count of moves reset; a person's review request that
+// waited behind no turn starts unchecked too, and leaves the automatic
+// lane's count as it is; an attempt no lane recorded a trigger for starts
+// unchecked even queued.
 func TestReviewContext_AnAttemptDispatchedAtOnceIsNotChecked(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -747,7 +749,7 @@ func TestReviewContext_AnAttemptDispatchedAtOnceIsNotChecked(t *testing.T) {
 		reset   bool
 	}{
 		{name: "an automatic attempt that waited behind no turn", trigger: autoTrigger(), reset: true},
-		{name: "a person's review request queued behind a turn", trigger: &label, queued: true},
+		{name: "a person's review request that waited behind no turn", trigger: &label},
 		{name: "a review attempt with no trigger recorded, queued behind a turn", queued: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

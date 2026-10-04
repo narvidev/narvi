@@ -22,6 +22,7 @@ import (
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/reviewcheck"
+	domainturn "github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -441,6 +442,20 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	}
 	logger := platform.Logger(ctx)
 	reviewDepthPtr := reviewDepth
+	// requestTrigger/requestText (technical plan §24.9): the request lane
+	// this event came through -- the configured label or a mention -- and
+	// its own text, classifyText (the label's fixed sentence, or the
+	// mention's body, before any context was folded in), recorded on the
+	// turn either branch below creates with actor as its requester. A
+	// review attempt they ask for that meets a moved context when it is
+	// dispatched after waiting is owed to that person and re-run, from this
+	// text, for the new head (internal/app/sessionactor's
+	// owedreviewrequest.go).
+	requestTrigger := domainturn.RequestTriggerMention
+	if isLabelRetrigger {
+		requestTrigger = domainturn.RequestTriggerLabel
+	}
+	requestText := classifyText
 
 	// Resolved BEFORE any transaction opens -- see this function's own
 	// doc comment above for why. Only actually consulted by the WINNER
@@ -649,7 +664,7 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 		// should ever move the narvi/review check -- see turns.
 		// is_review_attempt's own migration doc comment for the full
 		// "why" an ordinary follow-up must NOT set this.
-		createdTurn, err := httpapi.CreateTurnForBot(ctx, c.Pool, c.Sessions, c.Turns, c.Plans, c.IntentClassifier, c.AuditLog, c.Registry, existing, prompt, triageModelID, req.PlanMode, false, actor, reviewHeadSHAPtr, &classifyText, triageEffort, reviewDepthPtr, triageRecordJSON, knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON, isLabelRetrigger)
+		createdTurn, err := httpapi.CreateTurnForBot(ctx, c.Pool, c.Sessions, c.Turns, c.Plans, c.IntentClassifier, c.AuditLog, c.Registry, existing, prompt, triageModelID, req.PlanMode, false, actor, reviewHeadSHAPtr, &classifyText, triageEffort, reviewDepthPtr, triageRecordJSON, knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON, isLabelRetrigger, &requestTrigger, &requestText)
 		if err != nil {
 			// mention_count untouched here too (audit fix): this is the
 			// OTHER denial route the increment used to run ahead of --
@@ -758,7 +773,7 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	// "§31.4 (Defect-1 audit fix)" comment there for the full "why"; a
 	// refusal returned before this branch was ever reached, so it is
 	// always an admitting decision here.
-	created, hasPrompt, cerr := httpapi.CreateSessionOnTx(ctx, tx, c.Sessions, c.Turns, c.Environments, c.AuditLog, req, actor, false, c.RolloutMode, c.RepoSettings, entitlement, httpapi.ChildSessionOptions{ReviewHeadSHA: reviewHeadSHAPtr, ReviewDepth: reviewDepthPtr, ReviewDepthDecision: triageRecordJSON, ReviewKnowledgeMode: knowledgeMode, ReviewKnowledgeDecision: knowledgeDecisionJSON, ReviewVerdictContext: reviewVerdictContextJSON})
+	created, hasPrompt, cerr := httpapi.CreateSessionOnTx(ctx, tx, c.Sessions, c.Turns, c.Environments, c.AuditLog, req, actor, false, c.RolloutMode, c.RepoSettings, entitlement, httpapi.ChildSessionOptions{ReviewHeadSHA: reviewHeadSHAPtr, ReviewDepth: reviewDepthPtr, ReviewDepthDecision: triageRecordJSON, ReviewKnowledgeMode: knowledgeMode, ReviewKnowledgeDecision: knowledgeDecisionJSON, ReviewVerdictContext: reviewVerdictContextJSON, RequestTrigger: &requestTrigger, RequestText: &requestText})
 	if cerr != nil {
 		if cerr.RolloutRefusal {
 			// §32's own permanent-denial idiom -- see ErrRolloutNotEnrolled's

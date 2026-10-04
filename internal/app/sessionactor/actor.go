@@ -127,6 +127,13 @@ type Actor struct {
 	// attempt then starts with its context unconfirmed.
 	reviewLiveReader ReviewLiveReader
 
+	// reviewRequestAuthorizer is technical plan §24.9's re-check of a
+	// person's authorization before their owed review request is re-run --
+	// see Registry's own identical field doc comment (registry.go);
+	// owedreviewrequest.go's consumer is this Actor's one use of it. May be
+	// nil: an owed request is then dropped as unauthorized.
+	reviewRequestAuthorizer ports.ReviewRequestAuthorizer
+
 	// spawnSource is the session's sessions.spawn_source, read at hydration
 	// (it never changes). Technical plan §24.9's context check applies only
 	// to a pull request's review session -- the GitHub lane's -- the one

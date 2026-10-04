@@ -83,6 +83,13 @@
 // private hybrid ranker is expected to be the second, entering only
 // through extension.Module.KnowledgeRanker.
 //
+// ReviewRequestAuthorizer (reviewrequestauthorizer.go) is the TENTH port,
+// added at §24.9: whether a person may still have a review request of
+// theirs re-run, asked by app/sessionactor before it re-runs a request
+// whose pull request moved while it waited. internal/adapters/inbound/
+// httpapi's role-based check is the first implementation; a code-host
+// permission check is the expected second.
+//
 // The remaining §4.3 ports — SessionStore/TurnStore/SandboxStore, Outbox,
 // TimerScheduler, Clock — are out of scope for this Step and land in their
 // own later Steps, each adding its own interface file here without

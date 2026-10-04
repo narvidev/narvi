@@ -126,6 +126,15 @@ type ChildSessionOptions struct {
 	// for the full "why".
 	ReviewVerdictContext []byte
 
+	// RequestTrigger and RequestText (technical plan §24.9) mirror
+	// CreateTurnOptions.RequestTrigger/RequestText (turn.go) for a new
+	// review session's first turn: github/coalesce.go's WINNER branch, the
+	// one caller with a request lane to record ("label" or "mention"), sets
+	// both, and the turn records createdBy as its requester with them. nil
+	// for every other caller.
+	RequestTrigger *string
+	RequestText    *string
+
 	// SpawnSource (§43.1) is the source the session records when it is not
 	// the request's own: the zero value records req.SpawnSource, as every
 	// caller did before. POST /api/sessions alone sets it, to
@@ -154,6 +163,16 @@ func childSessionOptionsFrom(opts []ChildSessionOptions) ChildSessionOptions {
 		return opts[0]
 	}
 	return ChildSessionOptions{}
+}
+
+// requestedByFor is the requester a turn records (turns.requested_by,
+// technical plan §24.9): who asked, when the lane that created the turn
+// records its trigger, and no one otherwise.
+func requestedByFor(requestTrigger *string, asker pgtype.UUID) pgtype.UUID {
+	if requestTrigger == nil {
+		return pgtype.UUID{}
+	}
+	return asker
 }
 
 // defaultContractsPath is the contracts_path value CreateSession stores
@@ -1166,6 +1185,9 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 			// REUSE branch instead).
 			IsReviewAttempt: opts.ReviewHeadSHA != nil,
 			CorrelationID:   correlationID,
+			RequestTrigger:  opts.RequestTrigger,
+			RequestedBy:     requestedByFor(opts.RequestTrigger, createdBy),
+			RequestText:     opts.RequestText,
 		}); err != nil {
 			logger.Error("httpapi: create turn failed", "error", err)
 			return sqlcgen.Session{}, false, &CreateSessionError{Status: http.StatusInternalServerError, Message: "internal error"}
