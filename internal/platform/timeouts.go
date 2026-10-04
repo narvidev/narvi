@@ -1339,20 +1339,27 @@ type Timeouts struct {
 
 	// --- §8.1 standalone addition ("plan mode, cross-channel", §8.1/
 	// §13.3): no ordering relationship with either invariant chain above (or
-	// with any prior Step's standalone additions), so -- per those
-	// additions' own precedent -- a plain field with a sensible default, not
-	// wired into a fake invariant link.
+	// with any prior Step's standalone additions). SlackInteractivityAckTimeout
+	// is a plain field with a sensible default; the reply budget beside it
+	// is linked to it and to SlackInteractivityIdentityFetchTimeout (see
+	// SlackInteractivityReplyTimeout's own doc comment).
 
 	// SlackInteractivityAckTimeout bounds the ENTIRE synchronous decide+
-	// update sequence internal/adapters/inbound/slack/interactive.go's
-	// block_actions handling runs for approve_plan/reject_plan: the shared
-	// httpapi.DecidePlan call (opens a tx, locks the session row, the
-	// guarded UPDATE, possibly inserting+dispatching a new turn, enqueuing
-	// cross-channel notifications, committing) followed by the real,
-	// synchronous chat.update call reflecting the outcome -- ONE shared
-	// bounded context covers both, not two separately-budgeted calls that
-	// could each individually fit within their own budget yet still
-	// together exceed Slack's real window.
+	// reply sequence internal/adapters/inbound/slack/interactive.go's
+	// block_actions handling runs for approve_plan/reject_plan: the decision
+	// -- resolving the clicking user's identity, checking their
+	// authorization, and the shared httpapi.DecidePlan call (opens a tx,
+	// locks the session row, the guarded UPDATE, possibly
+	// inserting+dispatching a new turn, enqueuing cross-channel
+	// notifications, committing) -- followed by the reply to the click: the
+	// real, synchronous chat.update reflecting an outcome, or the
+	// chat.postEphemeral telling the clicker alone why nothing was decided.
+	// The window is split in two, so the pair can never together exceed
+	// Slack's real window: the decision runs on
+	// SlackInteractivityDecisionTimeout() (this field less
+	// SlackInteractivityReplyTimeout), and the reply on
+	// SlackInteractivityReplyTimeout, on a context detached from the
+	// decision's, so a decision that used up its share is still answered.
 	//
 	// Deliberately a SEPARATE, much tighter constant from SlackAckTimeout
 	// above, even though both nominally guard "a Slack ack": SlackAckTimeout
@@ -1367,7 +1374,7 @@ type Timeouts struct {
 	// Narvi's own backend goes on to complete the action correctly a moment
 	// later. And unlike SlackAckTimeout's single POST, this budget must
 	// cover the WHOLE guarded-UPDATE transaction described above plus the
-	// follow-up chat.update, so it cannot reuse SlackAckTimeout's own more
+	// reply that follows it, so it cannot reuse SlackAckTimeout's own more
 	// generous 10s value without risking exactly the kind of DB-contention-
 	// blows-past-Slack's-real-budget failure this field exists to prevent.
 	// Not given an explicit figure in the plan; chosen as 2.5s -- leaves
@@ -1378,6 +1385,30 @@ type Timeouts struct {
 	// contention or a slow Slack response, rather than hang until either
 	// finishes.
 	SlackInteractivityAckTimeout time.Duration
+
+	// SlackInteractivityReplyTimeout is the share of
+	// SlackInteractivityAckTimeout kept for the reply to a click on a plan's
+	// Approve or Reject button (interactive.go's decideAndUpdateMessage):
+	// the chat.update that shows an outcome on the approval message, or the
+	// chat.postEphemeral that tells the clicker alone why nothing was
+	// decided. Every reply runs on its own context, bounded by this and
+	// detached from the decision's (context.WithoutCancel), so a decision
+	// that ran out of its share -- the session row's lock held by another
+	// transaction, say -- is still answered, and the decision runs on
+	// SlackInteractivityDecisionTimeout(), the rest of the window, so the two
+	// together never exceed it. A reply that fails even on this budget is
+	// logged and reaches nobody: an error reply leaves the approval message
+	// and its buttons as they were, so a second click is the retry.
+	//
+	// Validate keeps it positive (a zero budget would cancel every reply
+	// before it is sent) and keeps SlackInteractivityIdentityFetchTimeout
+	// strictly inside the decision's share, since the identity fetch is the
+	// decision's first step. Not specified in the plan; chosen as 800ms --
+	// one attempt at a single Slack Web API POST, the same figure
+	// SlackInteractivityIdentityFetchTimeout already budgets for one
+	// attempt at a single Slack Web API call -- which leaves the decision
+	// 1.7s of the 2.5s window, the identity fetch included.
+	SlackInteractivityReplyTimeout time.Duration
 
 	// --- §5.1 standalone additions ("outbox delivery", §5.1): no
 	// ordering relationship with either invariant chain above (or with any
@@ -1800,17 +1831,19 @@ type Timeouts struct {
 	// IdentityEmailFetchMaxAttempts' own general-purpose, retried budget,
 	// used by the Events API ingress path instead) -- this path shares
 	// Slack's own hard ~3s interactivity-ack window with DecidePlan's own
-	// guarded-UPDATE transaction AND the chat.update call that reflects
-	// its outcome (see SlackInteractivityAckTimeout's own doc comment),
-	// so there simply isn't room for a multi-attempt backoff loop here. A
+	// guarded-UPDATE transaction AND the reply to the click (see
+	// SlackInteractivityAckTimeout's own doc comment), so there simply
+	// isn't room for a multi-attempt backoff loop here. A
 	// failed/timed-out fetch on this path defers to bot attribution for
 	// THIS click; the SAME still-unlinked identity gets a full, properly-
 	// retried resolution attempt the next time any OTHER event from it
 	// arrives (an Events API message, a later click, a modal submission).
-	// Not specified in the plan; chosen as 800ms -- comfortably inside
-	// SlackInteractivityAckTimeout (2500ms) with real margin left for the
-	// DecidePlan+chat.update calls that follow it in the same shared
-	// budget.
+	// Not specified in the plan; chosen as 800ms -- for a button click, the
+	// fetch is the first step of the decision, so Validate keeps it
+	// strictly inside SlackInteractivityDecisionTimeout() (1700ms of the
+	// 2500ms window, the reply's SlackInteractivityReplyTimeout kept
+	// aside), with real margin left for the authorization check and
+	// DecidePlan that follow it in the same share.
 	//
 	// HIGH audit fix (see IdentityEmailFetchTimeout's own doc comment): THIS
 	// field's own 800ms was later reused, deliberately and directly, as
@@ -4085,6 +4118,15 @@ func (t Timeouts) ActorLockServerReapTime() time.Duration {
 	return t.ActorLockServerKeepaliveIdle + t.ActorLockServerKeepaliveInterval*time.Duration(t.ActorLockServerKeepaliveCount)
 }
 
+// SlackInteractivityDecisionTimeout is the decision's share of
+// SlackInteractivityAckTimeout for a click on a plan's Approve or Reject
+// button: the identity resolution, the authorization check and DecidePlan
+// together, the window less the SlackInteractivityReplyTimeout kept for the
+// reply (both fields' own doc comments).
+func (t Timeouts) SlackInteractivityDecisionTimeout() time.Duration {
+	return t.SlackInteractivityAckTimeout - t.SlackInteractivityReplyTimeout
+}
+
 // DefaultTimeouts returns the shipped defaults for every field, each
 // justified above on the struct field and (briefly) inline here.
 func DefaultTimeouts() Timeouts {
@@ -4228,7 +4270,8 @@ func DefaultTimeouts() Timeouts {
 
 		SlackAckTimeout: 10 * time.Second, // not specified; chosen, generous for a single Slack chat.postMessage POST, mirrors PRCreateTimeout's own reasoning
 
-		SlackInteractivityAckTimeout: 2500 * time.Millisecond, // not specified; chosen, a SEPARATE and much tighter budget than SlackAckTimeout -- see field doc comment for why (Slack's real interactivity ack window is a hard ~3s, covering the whole decide+update sequence, not just SlackAckTimeout's single POST)
+		SlackInteractivityAckTimeout:   2500 * time.Millisecond, // not specified; chosen, a SEPARATE and much tighter budget than SlackAckTimeout -- see field doc comment for why (Slack's real interactivity ack window is a hard ~3s, covering the whole decide+reply sequence, not just SlackAckTimeout's single POST)
+		SlackInteractivityReplyTimeout: 800 * time.Millisecond,  // not specified; chosen, one attempt at a single Slack Web API POST (SlackInteractivityIdentityFetchTimeout's figure), leaving the decision 1700ms of the window -- see field doc comment
 
 		OutboxPumpInterval:    5 * time.Second,  // not specified; chosen, near-real-time delivery, matches TimerPumpInterval's own reasoning
 		OutboxBackoffBase:     30 * time.Second, // not specified; chosen -- see domain/outbox.EvaluateBackoff's own doc comment for the schedule this produces
@@ -4246,7 +4289,7 @@ func DefaultTimeouts() Timeouts {
 		IdentityEmailFetchMaxAttempts:          2,                      // audit fix HIGH -- was 3; see field doc comment for why the attempt count, not the per-attempt timeout, absorbed the budget cut this time
 		IdentityEmailFetchRetryBaseDelay:       100 * time.Millisecond, // audit fix L5 -- was 200ms; see IdentityEmailFetchRetryMaxDelay's own doc comment
 		IdentityEmailFetchRetryMaxDelay:        150 * time.Millisecond, // audit fix L5 -- was 1s; see field doc comment for the full worst-case timing budget
-		SlackInteractivityIdentityFetchTimeout: 800 * time.Millisecond, // not specified; chosen, comfortably inside SlackInteractivityAckTimeout with margin for DecidePlan+chat.update
+		SlackInteractivityIdentityFetchTimeout: 800 * time.Millisecond, // not specified; chosen, inside the decision's share SlackInteractivityDecisionTimeout() (Validate) with margin for the authorization check and DecidePlan
 		IdentityLinkPromptTTL:                  24 * time.Hour,         // not specified beyond "short-lived"; chosen
 
 		GitHubGetPRTimeout: 10 * time.Second, // not specified (fix postdates the plan); chosen, generous for a single GitHub REST GET, mirrors PRCreateTimeout/SlackAckTimeout's own reasoning
@@ -5033,6 +5076,21 @@ func (t Timeouts) Validate() error {
 		"ActorLockServerReapTime", t.ActorLockServerReapTime())
 	strictlyBelow("TimerClaimDuration > ActorLockServerReapTime",
 		"ActorLockServerReapTime", t.ActorLockServerReapTime(), "TimerClaimDuration", t.TimerClaimDuration)
+
+	// §8.1, §13.2: a click on a plan's Approve or Reject button splits
+	// Slack's interactivity ack window between the decision and the reply
+	// (SlackInteractivityReplyTimeout's own doc comment). A zero reply
+	// budget would cancel every reply before it is sent, so it is refused.
+	// The identity fetch is the decision's first step, so it lies strictly
+	// inside the decision's share, with no margin: these values are
+	// milliseconds apart, far below MinTimeoutMargin. The reply and the
+	// decision fit the window by construction -- the decision's share is
+	// the window less the reply's -- and this link keeps that share
+	// positive whenever the identity fetch is.
+	mustBePositive("SlackInteractivityReplyTimeout", t.SlackInteractivityReplyTimeout)
+	strictlyBelow("SlackInteractivityAckTimeout - SlackInteractivityReplyTimeout > SlackInteractivityIdentityFetchTimeout",
+		"SlackInteractivityIdentityFetchTimeout", t.SlackInteractivityIdentityFetchTimeout,
+		"SlackInteractivityAckTimeout-SlackInteractivityReplyTimeout", t.SlackInteractivityDecisionTimeout())
 
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three
