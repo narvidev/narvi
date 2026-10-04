@@ -19,6 +19,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/narvidev/narvi/internal/domain/sandbox"
 )
 
 // MinTimeoutMargin is the minimum gap Validate requires between every
@@ -59,8 +61,36 @@ type Timeouts struct {
 	// --- Chain A: provider cap > supervisor turn cap > CP turn_deadline > OpenCode SSE inactivity ---
 
 	// ProviderHardCap is the absolute ceiling a sandbox provider enforces
-	// on a running sandbox. §5.4 gives this explicitly: 2h.
+	// on a running sandbox. §5.4 gives this explicitly: 2h. Nothing sends
+	// it to a provider: that the provider gives every sandbox at least this
+	// long is an operator's assertion (docs/PRODUCTION_CHECKLIST.md, item
+	// 14), and SandboxLifetime and ReviewSandboxLifetime are held at or
+	// below it.
 	ProviderHardCap time.Duration
+
+	// SandboxLifetime and ReviewSandboxLifetime are the lifetime the
+	// control plane assumes its sandbox provider gives a sandbox, counted
+	// from the claim that spawns or restores it (technical plan §35.2):
+	// SandboxLifetime for the default kind, ReviewSandboxLifetime for a
+	// pull request's review session (sandbox.LifetimeKind). The claim
+	// stamps the sandbox row's lifetime_deadline_at at the database's now
+	// plus the kind's lifetime, in the statement that bumps its gen
+	// (UpsertSandboxForSpawn), before the provider is called, so the
+	// estimate falls within the provider's own deadline whenever the
+	// provider's lifetime is at least this long. Read only through
+	// SandboxLifetimeFor, the one place a kind's lifetime is decided.
+	//
+	// Sent to no provider: neither adapter's create or restore request
+	// carries a lifetime. So Validate keeps each at or below
+	// ProviderHardCap, the one lifetime this file asserts a provider gives,
+	// and above SupervisorTurnCap and FirstConnectBudget plus
+	// BootEvidenceFallback by MinTimeoutMargin, as ProviderHardCap is, and
+	// in whole seconds, the unit the row persists (lifetime_seconds). Not
+	// given a value in the plan; both are ProviderHardCap, 2h, so a longer
+	// lifetime for one kind is a change to its field here and to the
+	// provider's cap.
+	SandboxLifetime       time.Duration
+	ReviewSandboxLifetime time.Duration
 
 	// SupervisorTurnCap's CURRENT role is an invariant-chain bound ensuring
 	// config sanity only: Validate below checks ProviderHardCap >
@@ -4114,6 +4144,22 @@ func (t Timeouts) PreEvidenceAgentBootCeiling() time.Duration {
 	return max(syncPrepare, clonePrepare) + shaProbes + hooks + buildCleanup
 }
 
+// SandboxLifetimeFor is the lifetime the control plane assumes its
+// provider gives a sandbox of kind (technical plan §35.2): the one read of
+// SandboxLifetime and ReviewSandboxLifetime (both fields' doc comment). A
+// kind this binary does not name gets the shorter of the two, so an
+// unknown kind's deadline is never later than a known one's.
+func (t Timeouts) SandboxLifetimeFor(kind sandbox.LifetimeKind) time.Duration {
+	switch kind {
+	case sandbox.LifetimeKindReview:
+		return t.ReviewSandboxLifetime
+	case sandbox.LifetimeKindDefault:
+		return t.SandboxLifetime
+	default:
+		return min(t.SandboxLifetime, t.ReviewSandboxLifetime)
+	}
+}
+
 // ActorLockServerReapTime is about how long the server keeps a session
 // actor lock backend whose client vanished without a word, counted from
 // the last byte it received: ActorLockServerKeepaliveIdle plus
@@ -4147,8 +4193,15 @@ func DefaultTimeouts() Timeouts {
 	automationDispatchRetryBaseDelay := 250 * time.Millisecond // D6 audit fix; not specified, chosen
 	automationDispatchRetryMaxDelay := 1 * time.Second         // D6 audit fix; not specified, chosen
 
+	// §35.2: each kind's sandbox lifetime is the provider's cap until a
+	// provider is told a lifetime of its own -- assigned from one value so
+	// the two cannot drift apart. See SandboxLifetime's doc comment.
+	providerHardCap := 2 * time.Hour // §5.4, explicit
+
 	return Timeouts{
-		ProviderHardCap:           2 * time.Hour,     // §5.4, explicit
+		ProviderHardCap:           providerHardCap,
+		SandboxLifetime:           providerHardCap,   // §35.2; not specified, chosen -- see field doc comment
+		ReviewSandboxLifetime:     providerHardCap,   // §35.2; not specified, chosen -- see field doc comment
 		SupervisorTurnCap:         90 * time.Minute,  // not specified; chosen with margin below ProviderHardCap
 		TurnDeadline:              60 * time.Minute,  // not specified; chosen with margin below SupervisorTurnCap
 		StopGrace:                 30 * time.Second,  // not specified; chosen (§3.3's stop)
@@ -5128,6 +5181,39 @@ func (t Timeouts) Validate() error {
 			GreaterValue:   t.AutomationDispatchTotalBudget,
 			RequiredMargin: perCall,
 		})
+	}
+
+	// §35.2: each kind's sandbox lifetime. The deadline stamped from it
+	// must not be later than the provider's own, and nothing tells the
+	// provider a lifetime, so it lies at or below ProviderHardCap, with no
+	// margin -- equal is the shipped value. It is the first term of §5.4's
+	// chain for a turn on a fresh sandbox of that kind, so it lies above
+	// SupervisorTurnCap and above FirstConnectBudget plus
+	// BootEvidenceFallback by MinTimeoutMargin, as ProviderHardCap does.
+	// The row persists it in whole seconds (lifetime_seconds). See
+	// SandboxLifetime's doc comment.
+	notAbove := func(chain, lesserField string, lesser time.Duration, greaterField string, greater time.Duration) {
+		if lesser > greater {
+			errs = append(errs, &TimeoutInvariantError{
+				Chain:        chain,
+				LesserField:  lesserField,
+				LesserValue:  lesser,
+				GreaterField: greaterField,
+				GreaterValue: greater,
+			})
+		}
+	}
+	for _, kind := range sandbox.AllLifetimeKinds() {
+		field := "SandboxLifetimeFor(" + string(kind) + ")"
+		lifetime := t.SandboxLifetimeFor(kind)
+		mustBePositive(field, lifetime)
+		mustBeWholeSeconds(field, lifetime)
+		notAbove("ProviderHardCap >= "+field,
+			field, lifetime, "ProviderHardCap", t.ProviderHardCap)
+		check(field+" > SupervisorTurnCap",
+			field, lifetime, "SupervisorTurnCap", t.SupervisorTurnCap)
+		check(field+" > FirstConnectBudget + BootEvidenceFallback",
+			field, lifetime, "FirstConnectBudget+BootEvidenceFallback", t.FirstConnectBudget+t.BootEvidenceFallback)
 	}
 
 	return errors.Join(errs...)

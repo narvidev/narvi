@@ -106,12 +106,37 @@ RETURNING *;
 -- stop_retire_gen (technical plan §3.3, migrations/000151) is cleared too:
 -- it names the gen a person's stop has still to retire, and a new gen owes
 -- nothing -- the one it replaces is fenced off by the bump itself.
-INSERT INTO sandboxes (session_id, gen, status, token_hash)
-VALUES ($1, 1, 'spawning', $2)
+--
+-- lifetime_deadline_at, lifetime_seconds and lifetime_deadline_gen
+-- (technical plan §35.2, migrations/000162) are stamped here, in the
+-- statement that creates the gen, because this is the one statement every
+-- spawn, restore and resume runs, and it runs in the claim's transaction,
+-- before the provider is called (dispatch.go): the database's now() plus
+-- lifetime_seconds, the session kind's lifetime, is therefore never later
+-- than the provider's own deadline when the provider gives a sandbox at
+-- least that long. Both branches stamp it from this statement's now(), not
+-- from created_at, which only the INSERT branch sets: a respawn or restore
+-- keeps the first gen's created_at, and a deadline counted from it would
+-- already be past. lifetime_deadline_gen records which gen the deadline is
+-- for; the deadline counts only while it equals gen.
+--
+-- A NULL lifetime_seconds is a resume's (planResume): the same provider
+-- object, never younger than it was, so a fresh stamp would be later than
+-- the provider's own deadline. It carries the deadline forward to the new
+-- gen when that deadline was the live gen's own, and leaves none when it
+-- was not -- a gen the previous binary created reads "deadline unknown"
+-- (the migration's rolling-deploy section). Named arguments only: sqlc
+-- does not mix them with $n.
+INSERT INTO sandboxes (session_id, gen, status, token_hash,
+                       lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen)
+VALUES (sqlc.arg('session_id'), 1, 'spawning', sqlc.narg('token_hash'),
+        now() + make_interval(secs => sqlc.narg('lifetime_seconds')::integer),
+        sqlc.narg('lifetime_seconds')::integer,
+        CASE WHEN sqlc.narg('lifetime_seconds')::integer IS NULL THEN NULL ELSE 1 END)
 ON CONFLICT (session_id) DO UPDATE
 SET gen = sandboxes.gen + 1,
     status = 'spawning',
-    token_hash = $2,
+    token_hash = EXCLUDED.token_hash,
     last_seen_at = now(),
     agent_version = NULL,
     image_digest = NULL,
@@ -119,6 +144,18 @@ SET gen = sandboxes.gen + 1,
     image_decision_fingerprint = NULL,
     pr_delivery_started_at = NULL,
     stop_retire_gen = NULL,
+    lifetime_deadline_at = CASE
+        WHEN sqlc.narg('lifetime_seconds')::integer IS NOT NULL THEN EXCLUDED.lifetime_deadline_at
+        WHEN sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.lifetime_deadline_at
+    END,
+    lifetime_seconds = CASE
+        WHEN sqlc.narg('lifetime_seconds')::integer IS NOT NULL THEN EXCLUDED.lifetime_seconds
+        WHEN sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.lifetime_seconds
+    END,
+    lifetime_deadline_gen = CASE
+        WHEN sqlc.narg('lifetime_seconds')::integer IS NOT NULL
+          OR sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.gen + 1
+    END,
     updated_at = now()
 RETURNING *;
 

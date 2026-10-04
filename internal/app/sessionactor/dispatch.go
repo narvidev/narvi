@@ -1594,13 +1594,22 @@ func (a *Actor) planFreshSpawn(
 	}
 	tokenHash := hashSandboxToken(token)
 
+	// §35.2: a spawn, a force-respawn included, is a new provider object,
+	// so it gets a fresh deadline, stamped in the upsert that creates its
+	// gen.
+	lifetimeSeconds, lifetimeKind, err := a.sandboxLifetimeSeconds(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := a.sandboxWrites(tx).UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{
-		SessionID: a.sessionID,
-		TokenHash: &tokenHash,
+		SessionID:       a.sessionID,
+		TokenHash:       &tokenHash,
+		LifetimeSeconds: lifetimeSeconds,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: upsert sandbox for spawn: %w", err)
 	}
+	a.logLifetimeDeadline("spawn", lifetimeKind, row)
 
 	// Arm connecting_deadline now, at spawn-write time -- closing an
 	// honest pre-existing gap (nothing armed this timer in production
@@ -1666,13 +1675,22 @@ func (a *Actor) planRestore(
 	}
 	tokenHash := hashSandboxToken(token)
 
+	// §35.2, §35.3: a restore is a new provider object too, so it gets a
+	// fresh deadline from the same upsert -- a fresh start date, which says
+	// nothing about how old the snapshot's contents are.
+	lifetimeSeconds, lifetimeKind, err := a.sandboxLifetimeSeconds(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := a.sandboxWrites(tx).UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{
-		SessionID: a.sessionID,
-		TokenHash: &tokenHash,
+		SessionID:       a.sessionID,
+		TokenHash:       &tokenHash,
+		LifetimeSeconds: lifetimeSeconds,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: upsert sandbox for restore: %w", err)
 	}
+	a.logLifetimeDeadline("restore", lifetimeKind, row)
 	if int(row.Gen) != newGen {
 		// Should be unreachable (this actor is this session's own single
 		// writer, per §2 -- nothing else can have written to this row
@@ -1782,9 +1800,15 @@ func (a *Actor) planResume(
 	}
 	tokenHash := hashSandboxToken(token)
 
+	// §35.2: a resume claims the same provider object, which is never
+	// younger than it was, so no lifetime is passed: the upsert carries the
+	// previous gen's deadline forward, or leaves none when that gen had
+	// none of its own. A fresh stamp would be later than the provider's own
+	// deadline.
 	row, err := a.sandboxWrites(tx).UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{
-		SessionID: a.sessionID,
-		TokenHash: &tokenHash,
+		SessionID:       a.sessionID,
+		TokenHash:       &tokenHash,
+		LifetimeSeconds: nil,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: upsert sandbox for resume: %w", err)

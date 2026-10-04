@@ -124,6 +124,15 @@ type fakeSpawnProvider struct {
 	// their behavior.
 	dockerSupported       bool
 	egressPolicySupported bool
+
+	// providerCreated is technical plan §35.2's own extension: an optional,
+	// test-supplied hook CreateSandbox and RestoreFromSnapshot call, after
+	// recording the call and outside the mutex, as the provider creates
+	// its sandbox -- lifetime_integration_test.go reads the database's
+	// clock there, the instant the provider's own lifetime counts from.
+	// nil (the zero value) for every other test, so nothing changes for
+	// them.
+	providerCreated func(context.Context)
 }
 
 // fakeRestoreCall records one RestoreFromSnapshot invocation's own
@@ -154,7 +163,11 @@ func (f *fakeSpawnProvider) CreateSandbox(ctx context.Context, spec ports.Create
 	block := f.createBlock
 	ref := f.nextRef
 	err := f.nextErr
+	created := f.providerCreated
 	f.mu.Unlock()
+	if created != nil {
+		created(ctx)
+	}
 
 	// The call is already recorded (above) BEFORE any blocking -- a test
 	// polling callCount() sees this call the instant it starts, not only
@@ -199,11 +212,16 @@ func (f *fakeSpawnProvider) TakeSnapshot(context.Context, ports.SandboxRef) (por
 	return "", errors.New("not implemented")
 }
 
-func (f *fakeSpawnProvider) RestoreFromSnapshot(_ context.Context, id ports.SnapshotID, spec ports.CreateSpec) (ports.SandboxRef, error) {
+func (f *fakeSpawnProvider) RestoreFromSnapshot(ctx context.Context, id ports.SnapshotID, spec ports.CreateSpec) (ports.SandboxRef, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 	f.restoreCalls = append(f.restoreCalls, fakeRestoreCall{snapshotID: id, spec: spec})
-	return f.nextRestoreRef, f.nextRestoreErr
+	ref, err := f.nextRestoreRef, f.nextRestoreErr
+	created := f.providerCreated
+	f.mu.Unlock()
+	if created != nil {
+		created(ctx)
+	}
+	return ref, err
 }
 func (f *fakeSpawnProvider) BuildImage(ctx context.Context, spec ports.ImageSpec) (ports.BuildOutcome, error) {
 	f.mu.Lock()

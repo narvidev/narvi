@@ -1,0 +1,77 @@
+-- Technical plan §35.2: a sandbox's lifetime deadline is persisted state,
+-- never inferred at use. A provider's lifetime runs from its sandbox's own
+-- creation, not from the turn running inside it, so a turn dispatched onto
+-- an old sandbox can run out of runway; the pre-dispatch runway gate
+-- (§35.3) reads the deadline these columns record.
+--
+-- sandboxes.lifetime_deadline_at: when the control plane estimates the
+-- provider will end the gen named by lifetime_deadline_gen. Stamped by
+-- UpsertSandboxForSpawn -- the one statement that creates a gen, for a
+-- spawn, a restore and a resume alike -- in both of its branches, at that
+-- statement's now() plus the session kind's lifetime
+-- (platform.Timeouts.SandboxLifetimeFor). Not created_at plus the lifetime:
+-- created_at is stamped by the INSERT branch only, and a respawn or restore
+-- leaves it at the first gen's value, so it would give every later gen a
+-- deadline already in the past. The claim runs before the provider is
+-- called, so the estimate is not later than the provider's own deadline
+-- whenever the provider's lifetime is at least the one assumed.
+--
+-- sandboxes.lifetime_seconds: the lifetime that estimate was stamped with,
+-- in whole seconds -- the kind's lifetime, so the runway gate's lifetime/6
+-- (§35.3) follows the kind.
+--
+-- sandboxes.lifetime_deadline_gen: the gen the two columns above describe,
+-- recorded the way prompt_receipt_gen and agent_max_frame_bytes_gen are
+-- (migrations/000155_prompt_receipts.up.sql, 000157). They count only
+-- while it equals the live gen; anything else reads "deadline unknown". A
+-- spawn and a restore stamp a fresh deadline for the new gen. A resume
+-- claims the same provider object, never younger than it was, so it
+-- carries the previous gen's deadline forward to the new gen when that
+-- deadline was the previous gen's own, and leaves none otherwise. An exact
+-- value, once a sandbox-agent reports what its provider stated, will only
+-- ever bring the deadline earlier, never later (§35.2).
+--
+-- No backfill, no index. Every sandbox that exists when this runs reads
+-- "deadline unknown" until its next spawn or restore; every live one is
+-- gone within ProviderHardCap, and its replacement is stamped. created_at
+-- plus the lifetime would be wrong for every gen after the first.
+--
+-- # Locks
+--
+-- Each ADD COLUMN is nullable with no default, so it is a catalog change
+-- that rewrites nothing. Each takes ACCESS EXCLUSIVE on sandboxes, for the
+-- file's one implicit transaction, for an instant.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with these columns present:
+--   - Every statement it sends names its columns (sqlc writes each
+--     SELECT * and RETURNING * out as a column list), so it neither reads
+--     nor writes them.
+--   - Its UpsertSandboxForSpawn bumps gen and leaves the three columns as
+--     they are, so lifetime_deadline_gen no longer matches: a gen it
+--     spawns or restores reads "deadline unknown" until its next spawn or
+--     restore by this release.
+-- migration000162_integration_test.go runs the previous binary's own
+-- statements against the columns.
+--
+-- # Rolling back
+--
+-- Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for. So once this migration is applied, the
+-- previous binary cannot boot ("no migration found for version 162"). A
+-- rollback therefore takes one of two steps first, with the control plane
+-- scaled to zero:
+--   - Keep the columns: with the golang-migrate CLI, `migrate force 161`.
+--     The previous binary then boots, since 161 is a version it has, and
+--     works with the columns present as above. When this release is
+--     deployed again, this file runs again and leaves the columns and
+--     their values as they are.
+--   - Drop them: run this migration's down (goto 161) with this release's
+--     migrations. The down file says what it removes.
+-- Nothing else needs undoing: no timer kind, event type or turn column is
+-- added.
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS lifetime_deadline_at TIMESTAMPTZ;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS lifetime_seconds INTEGER;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS lifetime_deadline_gen INTEGER;

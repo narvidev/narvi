@@ -16,6 +16,8 @@
 //     liveness.go).
 //   - The inactivity timeout (EvaluateInactivityTimeout, inactivity.go).
 //   - The warm-on-type decision (EvaluateWarmDecision, warmdecision.go).
+//   - The lifetime kind a session's sandbox is given (LifetimeKindFor,
+//     lifetime.go; §35.2). Its durations live in platform/timeouts.go.
 //
 // Every function here is pure per §11: no I/O, no time.Now(), no
 // randomness. Anything needing "the current time" takes it as an explicit
