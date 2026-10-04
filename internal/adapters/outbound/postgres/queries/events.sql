@@ -313,20 +313,40 @@ LIMIT 1;
 -- (sessionactor.ReadWindowFinal: the approval and its snapshot, the plan
 -- views' fallback, the session result's summary, the plan notices). It
 -- returns only the window's token rows, capped by row_limit, newest first,
--- like every other bounded read of the log -- but what it reads to find them
--- is not bounded by the turn (TestEventStore_ListTokenFramesInWindow_
--- ReadsTheTurnsWindow): a generic plan walks events_token_part_idx over every
--- token frame of the session, whose id, behind the part id, is no seek key,
--- about one buffer for 70 frames, and a custom plan reads events_pkey
--- across the window, its other rows included, about one buffer for 30. An
--- index of a session's token frames by id would bound it to the window; it
--- needs a migration.
+-- like every other bounded read of the log.
+--
+-- What it reads is the window and nothing else: the range of
+-- events_token_window_idx (migrations/*_events_token_window_idx.up.sql)
+-- from the window's upper bound down to its lower one -- under a generic
+-- plan a backward index scan, under a custom plan that scan or a bitmap
+-- scan of the same range whose rows, the window's frames alone, it then
+-- sorts. Either reads a few index pages and the heap pages of the window's
+-- own frames and removes no row by a filter, however much text the session
+-- holds on either side of the window and however many events other
+-- sessions logged inside it: at most 45 buffers for a window of 40 frames
+-- across the plan test's matrix (TestEventStore_ListTokenFramesInWindow_
+-- ReadsTheTurnsWindow), where this read's text before that index took up
+-- to 3,225. Four things in the text keep it there. The bounds are on
+-- id + 0, the expression that index holds, which neither events_pkey nor
+-- events_session_id_id_idx can serve, so no plan reads the window's id
+-- range across every session, or the session's whole log, instead. The
+-- order is on the same expression, so a plan can read the index backward
+-- and stop at row_limit: on a window of more frames than that, the generic
+-- plan does, where an order on plain id makes a plan sort the whole window
+-- first (TestEventStore_ListTokenFramesInWindow_GenericPlanStopsAtTheCap);
+-- a custom plan, which knows the window's size, may still read the whole
+-- window as a bitmap scan and sort it, a cost bounded by the window. The
+-- upper bound is a range even when upper_id is NULL (the largest bigint
+-- stands in), so a generic plan seeks on it rather than testing it on
+-- every frame above the window. And type = 'token' is the index's
+-- predicate, byte for byte, so the planner proves the partial index under
+-- a generic plan too.
 SELECT * FROM events
 WHERE session_id = sqlc.arg(session_id)
   AND type = 'token'
-  AND id > sqlc.arg(lower_id)::bigint
-  AND (sqlc.narg(upper_id)::bigint IS NULL OR id <= sqlc.narg(upper_id)::bigint)
-ORDER BY id DESC
+  AND id + 0 > sqlc.arg(lower_id)::bigint
+  AND id + 0 <= COALESCE(sqlc.narg(upper_id)::bigint, 9223372036854775807)
+ORDER BY id + 0 DESC
 LIMIT sqlc.arg(row_limit)::int;
 
 -- (§26.4/§7.1's own post-hoc sub-task corroboration): the two

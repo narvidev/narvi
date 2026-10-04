@@ -126,9 +126,10 @@ func (s *EventStore) StoredTokenPart(ctx context.Context, sessionID pgtype.UUID,
 // frames with id above lowerID and, when upperID is not nil, at or below
 // it, newest id first -- one turn's frames, in the window
 // sessionactor.TurnContentBounds gives and plan.FinalText reads. The
-// decision inbox reads an awaiting plan's final text through it, a range on
-// the session's own index rather than the tail of its whole log
-// (ListTokenFramesInWindow's doc comment, queries/events.sql).
+// decision inbox reads an awaiting plan's final text through it, a range of
+// events_token_window_idx, the session's `token` frames by id, rather than
+// the tail of its whole log (ListTokenFramesInWindow's doc comment,
+// queries/events.sql).
 func (s *EventStore) ListTokenFramesInWindow(ctx context.Context, sessionID pgtype.UUID, lowerID int64, upperID *int64, limit int32) ([]sqlcgen.Event, error) {
 	return s.q.ListTokenFramesInWindow(ctx, sqlcgen.ListTokenFramesInWindowParams{
 		SessionID: sessionID,
