@@ -436,7 +436,18 @@ func cloneOne(
 	// used to return this call's args COMPLETELY UNCHANGED -- every
 	// hardening flag silently absent despite the call site looking
 	// hardened. See ArgsForClone's own doc comment for the full story.
-	clone := []string{"clone", "-c", "credential.helper=" + credHelperArg}
+	//
+	// The credential helper is one of those top-level overrides, placed
+	// after hardeningFlags' own empty "credential.helper=" reset, so it is
+	// the one helper that survives it -- the order every other
+	// credentialed git call here (gitFetchRef, pushOneRepo) already has.
+	// It used to be clone's own "-c" (after "clone"), which writes it into
+	// the new repository's config, and repository config is read before
+	// the command line: the reset discarded it, so a clone that needed a
+	// credential was never given one and failed ("could not read
+	// Username"), verified against real git. As a top-level override it is
+	// also never written into the runtime's .git/config.
+	clone := []string{"clone"}
 	if repo.Branch != nil {
 		clone = append(clone, "--branch", *repo.Branch)
 	}
@@ -456,7 +467,7 @@ func cloneOne(
 	// githarden's own http.proxy/RepoURLProxyArg doc comments for why a
 	// command-line override for the EXACT clone url always closes this,
 	// even against a repository-authored entry for that same url.
-	topLevel := githarden.RepoURLProxyArg(repo.Url)
+	topLevel := append(githarden.RepoURLProxyArg(repo.Url), "-c", "credential.helper="+credHelperArg)
 
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path: "git",
