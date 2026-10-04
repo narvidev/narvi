@@ -24,6 +24,9 @@ var attemptReadersExempt = map[string]string{
 	// has not ended; and a turn ended context_moved that was ahead of it
 	// in the queue is a turn it waited behind, as any other.
 	"GetReviewAttemptToCheck": "reads a pending turn, which has not ended",
+	// It names owed_review_requests' own column of that name, as the value
+	// it writes; it reads no turn.
+	"InsertOwedReviewRequest": "writes owed_review_requests.is_review_attempt and reads no turn",
 }
 
 // attemptReadersKnown are the readers the scan must find: if it no longer

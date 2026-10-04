@@ -288,15 +288,23 @@ func turnStopRequested(ctx context.Context, deps Deps, turnID pgtype.UUID) (bool
 // like the rest of this file: a failed write is logged and the run left
 // where it is.
 func cancelStoppedRun(ctx context.Context, workflows *postgres.WorkflowStore, stepRun sqlcgen.WorkflowStepRun, runRow sqlcgen.WorkflowRun, trig turn.Trigger) {
+	cancelRun(ctx, workflows, stepRun, runRow, trig, "a stop")
+}
+
+// cancelRun is cancelStoppedRun's body, shared with OnTurnWithdrawn
+// (withdrawn.go): stepRun finished with the status trig implies, runRow
+// ended cancelled, workflow.NextStep never consulted and no notice posted.
+// cause names what ended it, for the log.
+func cancelRun(ctx context.Context, workflows *postgres.WorkflowStore, stepRun sqlcgen.WorkflowStepRun, runRow sqlcgen.WorkflowRun, trig turn.Trigger, cause string) {
 	logger := platform.Logger(ctx)
 	if _, err := workflows.FinishStepRun(ctx, stepRun.ID, stepRunTerminalStatus(trig), string(implicitOutcome(trig))); err != nil {
-		logger.Error("workflowengine: finish stopped step run failed", "step_run_id", stepRun.ID.String(), "error", err)
+		logger.Error("workflowengine: finish cancelled step run failed", "cause", cause, "step_run_id", stepRun.ID.String(), "error", err)
 		return
 	}
 	if _, err := workflows.CancelRun(ctx, runRow.ID); err != nil {
-		logger.Error("workflowengine: cancel stopped workflow run failed", "run_id", runRow.ID.String(), "error", err)
+		logger.Error("workflowengine: cancel workflow run failed", "cause", cause, "run_id", runRow.ID.String(), "error", err)
 		return
 	}
-	logger.Info("workflowengine: workflow run cancelled by a stop; next step not consulted",
-		"run_id", runRow.ID.String(), "step_run_id", stepRun.ID.String())
+	logger.Info("workflowengine: workflow run cancelled; next step not consulted",
+		"cause", cause, "run_id", runRow.ID.String(), "step_run_id", stepRun.ID.String())
 }

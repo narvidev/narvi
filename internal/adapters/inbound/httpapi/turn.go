@@ -412,6 +412,22 @@ type CreateTurnOptions struct {
 	// column, never on ReviewHeadSHA's mere presence.
 	IsReviewAttempt bool
 
+	// RequestTrigger and RequestText (technical plan §24.9, migrations/
+	// 000159 and 000160) are what a person's review-request lane records of
+	// the turn it creates: the lane ("button" or "label",
+	// internal/domain/turn's RequestTrigger* values) and the lane's own
+	// text, before any context was folded into the prompt -- the button's
+	// or the label's fixed sentence. Set together, by those lanes alone
+	// (reviewretrigger.go, bot.go's CreateTurnForBot for the label);
+	// with RequestTrigger set the turn also records actorUserID as its
+	// requester (turns.requested_by). A review attempt they ask for that
+	// meets a moved context when it is dispatched after waiting is owed to
+	// that requester and re-run, from this text, for the head the pull
+	// request has then (internal/app/sessionactor's owedreviewrequest.go).
+	// nil for every other caller, which records none of the three.
+	RequestTrigger *string
+	RequestText    *string
+
 	// ReviewKnowledgeMode/ReviewKnowledgeDecision (§31.2/§31.6's own mode
 	// buffer) mirror ReviewDepth/ReviewDepthDecision's own identical
 	// shape two fields further: non-nil ONLY for a review-session turn,
@@ -621,6 +637,7 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 	var reviewKnowledgeDecision []byte
 	var reviewVerdictContext []byte
 	var isReviewAttempt bool
+	var requestTrigger, requestText *string
 	if len(opts) > 0 {
 		attachmentIDs = opts[0].AttachmentIDs
 		storageConfigured = opts[0].StorageConfigured
@@ -633,7 +650,13 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 		reviewKnowledgeDecision = opts[0].ReviewKnowledgeDecision
 		reviewVerdictContext = opts[0].ReviewVerdictContext
 		isReviewAttempt = opts[0].IsReviewAttempt
+		requestTrigger = opts[0].RequestTrigger
+		requestText = opts[0].RequestText
 	}
+	// requestedBy (technical plan §24.9): the person a review-request lane
+	// records as having asked, so a request owed to them can be authorized
+	// again before it is re-run. Recorded only with a trigger.
+	requestedBy := requestedByFor(requestTrigger, actorUserID)
 
 	// §23 ("plan mode: follow-up intent classification", §23.1/§23.2):
 	// plan_followup classification, gated STRICTLY on "planMode is false
@@ -1024,8 +1047,11 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 		// value it can hold here is a pointer to false: the awaiting-plan
 		// gate above already returned early (no row ever inserted) for
 		// every case answerOnly points to true.
-		AnswerOnly:    answerOnly,
-		CorrelationID: correlationID,
+		AnswerOnly:     answerOnly,
+		CorrelationID:  correlationID,
+		RequestTrigger: requestTrigger,
+		RequestedBy:    requestedBy,
+		RequestText:    requestText,
 	})
 	if err != nil {
 		logger.Error("httpapi: create turn failed", "error", err)

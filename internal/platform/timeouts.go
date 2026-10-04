@@ -3048,8 +3048,9 @@ type Timeouts struct {
 
 	// ReviewRetriggerHoldBackstop is how far ahead the re-review debounce
 	// re-arms itself while it holds (technical plan §24.9): a firing that
-	// finds a turn of the review session pending, dispatched or processing
-	// inserts no review, spends no budget, keeps the pushed head as the
+	// finds a turn of the review session pending, dispatched or processing,
+	// or a person's review request owed, inserts no review, spends no
+	// budget, keeps the pushed head as the
 	// target and re-arms the debounce at the database's now plus this. A
 	// pending turn has no deadline of its own to borrow, and every write
 	// that ends a turn moves the held debounce to now in its own
@@ -3081,7 +3082,12 @@ type Timeouts struct {
 	// cleared, the debounce deleted, and the session's status shows the
 	// drop until the next push. Each re-request spends a slot of §24.6's budget like
 	// any automatic review, so this bounds what a pull request whose
-	// context keeps moving costs between two pushes. A count, not a
+	// context keeps moving costs between two pushes. A person's review
+	// request is held to the same bound: its count of moves in a row rides
+	// on its own turn and owed row (turns.context_moves,
+	// owed_review_requests.context_moves), the consumer of the
+	// owed_review_request timer drops the request whose count exceeds this,
+	// and its requester is told once. A count, not a
 	// duration; it sits here beside the backstop of the same rule, like
 	// PromptResendMaxPerTurn beside its window. Not given a value in the
 	// plan; 3 -- one move is the case the re-request exists for, and three

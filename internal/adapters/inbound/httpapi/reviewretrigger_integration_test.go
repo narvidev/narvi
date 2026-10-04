@@ -207,7 +207,7 @@ func TestRetriggerReview_Success(t *testing.T) {
 	rig := newTestRig(t)
 	ctx := context.Background()
 	owner, _ := rig.createAuthenticatedUser(ctx, t)
-	_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMaintainer)
+	maintainer, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMaintainer)
 
 	session := rig.createOwnedGitHubReviewSession(ctx, t, owner.ID, "acme/retrigger-repo", 55)
 
@@ -230,6 +230,21 @@ func TestRetriggerReview_Success(t *testing.T) {
 	}
 	if prompt != "Manual re-review requested via the web review button." {
 		t.Errorf("turn prompt = %q, want the fixed manualRetriggerPromptText constant", prompt)
+	}
+
+	// Technical plan §24.9: the button records the person's request -- its
+	// lane, its requester and its own sentence -- so a click that meets a
+	// moved pull request when it is dispatched can be owed to that person
+	// and re-run from that sentence.
+	var trigger, text *string
+	var requestedBy pgtype.UUID
+	var moves *int32
+	if err := rig.pool.QueryRow(ctx, `SELECT request_trigger, requested_by, request_text, context_moves FROM turns WHERE session_id = $1`, session.ID).
+		Scan(&trigger, &requestedBy, &text, &moves); err != nil {
+		t.Fatalf("read the turn's request: %v", err)
+	}
+	if trigger == nil || *trigger != "button" || requestedBy != maintainer.ID || text == nil || *text != prompt || moves != nil {
+		t.Errorf("turn's request = (%v, %v, %v, %v), want the button's, by the maintainer who clicked, with its own sentence and no move", trigger, requestedBy, text, moves)
 	}
 }
 

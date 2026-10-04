@@ -69,7 +69,9 @@
 // insert a review turn queued behind it, each spending a slot of §24.6's
 // budget and each built for a head that no longer exists when it runs. So
 // the fire holds while any turn of the session is open (pending,
-// dispatched or processing): after the opt-in, the revocation, the heads
+// dispatched or processing), or a person's review request is owed
+// (owedreviewrequest.go: its re-run for the head the pull request has now
+// comes first): after the opt-in, the revocation, the heads
 // comparison and the budget have decided, it reads the hold
 // (reviewRetriggerHeld) and, held, inserts nothing, spends nothing, keeps
 // pending_retrigger_head_sha as the target and re-arms the same debounce
@@ -83,7 +85,9 @@
 // that has not held yet is left to run out (§24.2). Anything that launches a
 // review through this debounce -- setting the pending head and arming the
 // timer -- is held the same way. A person's trigger (the label, the
-// button, a mention) inserts its turn directly and is never held.
+// button, a mention) inserts its turn directly and is never held; a label's
+// or the button's whose context moved while it waited is owed and re-run by
+// its own timer, never by this lane.
 //
 // Every attempt this lane inserts is marked request_trigger 'auto'
 // (insertAutoRetriggerTurn). One that nonetheless waited behind another
@@ -265,110 +269,16 @@ func (a *Actor) handleReviewRetriggerDebounceTimer(ctx context.Context) error {
 				"repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
 			decision.action = reviewRetriggerActionFetchFailed
 		} else {
-			// (§26.3): depth re-evaluated on the delta (this
-			// PR's own CURRENT diff, reviewCtx above), THEN floored at
-			// the PR's own previous depth ("once deep, a PR stays deep,
-			// even if the delta itself would independently route
-			// light") -- UNLESS this fresh decision is itself an explicit
-			// always_light admin override (D9, below). The prior depth is
-			// ComputeDecision's own third return value, the SAME floor
-			// read every other lane uses: unfiltered by shadow (a
-			// shadow-era depth is a fact about how this platform reviews,
-			// not an effect on anyone's repository, so a shadow
-			// evaluation escalates exactly like the live system it
-			// predicts), and stepping over any verdict whose depth was
-			// chosen only because its input could not be read, which is
-			// never a floor (reviewtriage.NonFloorReasons).
-			//
-			// Adversarial-review fix (§26.4/§26.7): computed
-			// BEFORE composeAutoRetriggerPrompt now, not after -- this
-			// lane previously rendered the prompt FIRST and only computed
-			// the floored depth afterward, so reviewCtx.DeepPath (never
-			// assigned at all) stayed permanently false regardless of what
-			// turns.review_depth eventually recorded: an auto-re-review
-			// turn floored to deep by §24's own history rule persisted
-			// review_depth="deep" while its OWN prompt kept telling the
-			// agent every deep-path-only field was merely "REQUESTED, not
-			// required" and never mentioned counterReview at all -- exactly
-			// the D2-class contradiction the OTHER two trigger lanes
-			// (internal/adapters/inbound/httpapi/reviewretrigger.go,
-			// internal/adapters/inbound/github/handler.go) were already
-			// fixed against, that this lane alone had never received. Previously
-			// this only mis-set the prompt's own wording; now it
-			// makes it a guaranteed 400 (reviewpost.ValidateVerdictInput's
-			// own ErrInvalidCounterReview/ErrEmptyDigestArchDecisions) on
-			// every such verdict, since the agent was never told
-			// counterReview/the three digest fields were required at all.
-			triageDeps := appreviewtriage.Deps{RepoSettings: a.stores.repoSettings, ReviewVerdicts: a.stores.reviewVerdict, Artifacts: a.stores.artifact, Sessions: a.stores.session, SizeExclusions: a.reviewSizeExclusions}
-			triageDecision, triageConfig, priorReviewDepth := appreviewtriage.ComputeDecision(ctx, triageDeps, decision.repoFullName, decision.prNumber, reviewCtx)
-			triageProvenance := appreviewtriage.ResolveProvenance(ctx, triageDeps, decision.repoFullName, decision.prNumber)
-			// D9 (adversarial-review fix): skip the floor entirely when
-			// the FRESH decision's own Reason is ReasonAlwaysLightConfig
-			// -- an explicit admin cost-control override (reviewDepth.
-			// mode=always_light) outranks this history-based "always add
-			// rigor" floor -- see domainreviewtriage.Floor's own doc
-			// comment (depth.go) for the full "why" this precedence exists
-			// and why it was never explicitly decided before this fix.
-			// Without this guard, a PR that had EVER gone deep once would
-			// stay deep on every subsequent auto-triggered push forever,
-			// even after an admin flipped this repo to always_light --
-			// and the persisted decision record would self-contradict
-			// (mode "always_light" alongside depth "deep").
-			flooredDepth := triageDecision.Depth
-			if triageDecision.Reason != domainreviewtriage.ReasonAlwaysLightConfig {
-				flooredDepth = domainreviewtriage.Floor(triageDecision.Depth, priorReviewDepth)
-			}
-			decision.finalReviewDepth = string(flooredDepth)
-			decision.triageModelID, decision.triageEffort = domainreviewtriage.ModelAndEffort(flooredDepth, a.reviewModelDeep)
-			// D4 (nice-to-have adversarial-review fix): see internal/
-			// adapters/inbound/httpapi/reviewretrigger.go's own identical
-			// log line for the full "why" -- an operator otherwise has no
-			// signal that a deep-routed turn's model-tier override is
-			// silently inert.
-			if flooredDepth == domainreviewtriage.DepthDeep && a.reviewModelDeep == "" {
-				a.logger.Info("sessionactor: automatic re-review routed deep but no deep-tier model configured (NARVI_REVIEW_MODEL_DEEP unset), dispatching with the default model at forced high effort", "repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
-			}
-			// (§31.6): computed once, reused both for the write-time
-			// stamp immediately below AND for the prior-decisions fetch
-			// composeAutoRetriggerPrompt performs -- see internal/
-			// adapters/inbound/github/handler.go's own identical addition
-			// for the full "why this carrier, why computed once" reasoning.
-			archTagStrings := autoapproval.TagStrings(autoapproval.ClassifyChangedPaths(reviewCtx.ChangedPaths))
-			archRoots := autoapproval.ClassifyChangedRoots(reviewCtx.ChangedPaths)
-			if recordJSON, marshalErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, decision.triageModelID, decision.triageEffort, reviewCtx.ChangedFilesCount, reviewCtx.Diff == "", reviewCtx.DiffTruncated, archTagStrings, archRoots)); marshalErr != nil {
-				a.logger.Warn("sessionactor: marshal review-depth decision record failed, turn will carry review_depth but no review_depth_decision", "error", marshalErr, "repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
-			} else {
-				decision.reviewDepthDecisionJSON = recordJSON
-			}
-
-			// reviewCtx is a plain value here (never a pointer) -- both of
-			// these MUST be set before composeAutoRetriggerPrompt below,
-			// the one and only place this lane calls review.RenderTurnPrompt.
-			reviewCtx.DeepPath = flooredDepth == domainreviewtriage.DepthDeep
-			reviewCtx.ReviewCostBudgetUSD = triageConfig.CostBudget.ForDepth(flooredDepth)
-			// B5 fix: threads reviewtriage.CostBudgetSafetyMargin through as
-			// a whole percentage -- review.PreFetchedContext.
-			// CostBudgetSafetyMarginPercent's own doc comment for why this
-			// package (which already imports reviewtriage) is the one that
-			// must set it, never review itself (doc.go's own "zero external
-			// imports" convention).
-			reviewCtx.CostBudgetSafetyMarginPercent = int(domainreviewtriage.CostBudgetSafetyMargin * 100)
-
-			// Rereview fix (finding 1): compose §22.3's own false-positive
-			// advisory block and §22.1's own already-answered-facts block
-			// HERE, in this phase-2 window with no transaction open --
-			// see composeAutoRetriggerPrompt's own doc comment for why
-			// FetchFalsePositivePatterns' own IncrementHitCount side
-			// effect must never run inside a transaction that might still
-			// roll back -- before calling review.RenderTurnPrompt, mirroring
-			// httpapi.RetriggerReview's own manual-button lane and
-			// internal/adapters/inbound/github/handler.go's own mention/
-			// label lane byte-for-byte in ordering. Moved to AFTER the
-			// depth/cost-budget computation above (§26.4, this
-			// block's own doc comment) -- reviewCtx.DeepPath/
-			// ReviewCostBudgetUSD must already reflect the FLOORED depth
-			// this turn is about to persist before its own prompt renders.
-			prompt, decision.knowledgeDecisionJSON = a.composeAutoRetriggerPrompt(ctx, decision.repoFullName, decision.prNumber, reviewCtx, archTagStrings, archRoots)
+			// (§26.3, §31.6, §22): the depth decision floored at the PR's
+			// own, the prompt composed for it -- composeReviewTurn, the one
+			// composition this package's review turns share (the owed
+			// request's re-run is the other, owedreviewrequest.go).
+			composed := a.composeReviewTurn(ctx, decision.repoFullName, decision.prNumber, reviewCtx, autoRetriggerPromptText)
+			prompt, reviewCtx = composed.prompt, composed.reviewCtx
+			decision.finalReviewDepth = composed.reviewDepth
+			decision.reviewDepthDecisionJSON = composed.reviewDepthDecisionJSON
+			decision.triageModelID, decision.triageEffort = composed.modelID, composed.effort
+			decision.knowledgeDecisionJSON = composed.knowledgeDecisionJSON
 		}
 	}
 
@@ -383,6 +293,138 @@ func (a *Actor) handleReviewRetriggerDebounceTimer(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// composedReviewTurn is what composeReviewTurn decides for a review turn
+// this package inserts, beside its head: the prompt, the depth and the
+// model tier it routes to, and the records of both decisions.
+type composedReviewTurn struct {
+	prompt                  string
+	reviewCtx               review.PreFetchedContext
+	reviewDepth             string
+	reviewDepthDecisionJSON []byte
+	modelID                 *string
+	effort                  *string
+	knowledgeDecisionJSON   []byte
+}
+
+// composeReviewTurn decides the depth of a review turn this package
+// inserts for repoFullName's pull request prNumber, from reviewCtx -- the
+// live read the turn is anchored to -- and composes its prompt from
+// baseText, the lane's own sentence: the automatic re-review's
+// (autoRetriggerPromptText), or a person's request's own text when its
+// re-run is composed for the head the pull request has now
+// (owedreviewrequest.go). Called with no transaction open, after the
+// live read: composeAutoRetriggerPrompt's false-positive fetch writes a hit
+// count that must never ride a transaction that may roll back.
+func (a *Actor) composeReviewTurn(ctx context.Context, repoFullName string, prNumber int32, reviewCtx review.PreFetchedContext, baseText string) composedReviewTurn {
+	var out composedReviewTurn
+	// (§26.3): depth re-evaluated on the delta (this
+	// PR's own CURRENT diff, reviewCtx above), THEN floored at
+	// the PR's own previous depth ("once deep, a PR stays deep,
+	// even if the delta itself would independently route
+	// light") -- UNLESS this fresh decision is itself an explicit
+	// always_light admin override (D9, below). The prior depth is
+	// ComputeDecision's own third return value, the SAME floor
+	// read every other lane uses: unfiltered by shadow (a
+	// shadow-era depth is a fact about how this platform reviews,
+	// not an effect on anyone's repository, so a shadow
+	// evaluation escalates exactly like the live system it
+	// predicts), and stepping over any verdict whose depth was
+	// chosen only because its input could not be read, which is
+	// never a floor (reviewtriage.NonFloorReasons).
+	//
+	// Adversarial-review fix (§26.4/§26.7): computed
+	// BEFORE composeAutoRetriggerPrompt now, not after -- this
+	// lane previously rendered the prompt FIRST and only computed
+	// the floored depth afterward, so reviewCtx.DeepPath (never
+	// assigned at all) stayed permanently false regardless of what
+	// turns.review_depth eventually recorded: an auto-re-review
+	// turn floored to deep by §24's own history rule persisted
+	// review_depth="deep" while its OWN prompt kept telling the
+	// agent every deep-path-only field was merely "REQUESTED, not
+	// required" and never mentioned counterReview at all -- exactly
+	// the D2-class contradiction the OTHER two trigger lanes
+	// (internal/adapters/inbound/httpapi/reviewretrigger.go,
+	// internal/adapters/inbound/github/handler.go) were already
+	// fixed against, that this lane alone had never received. Previously
+	// this only mis-set the prompt's own wording; now it
+	// makes it a guaranteed 400 (reviewpost.ValidateVerdictInput's
+	// own ErrInvalidCounterReview/ErrEmptyDigestArchDecisions) on
+	// every such verdict, since the agent was never told
+	// counterReview/the three digest fields were required at all.
+	triageDeps := appreviewtriage.Deps{RepoSettings: a.stores.repoSettings, ReviewVerdicts: a.stores.reviewVerdict, Artifacts: a.stores.artifact, Sessions: a.stores.session, SizeExclusions: a.reviewSizeExclusions}
+	triageDecision, triageConfig, priorReviewDepth := appreviewtriage.ComputeDecision(ctx, triageDeps, repoFullName, prNumber, reviewCtx)
+	triageProvenance := appreviewtriage.ResolveProvenance(ctx, triageDeps, repoFullName, prNumber)
+	// D9 (adversarial-review fix): skip the floor entirely when
+	// the FRESH decision's own Reason is ReasonAlwaysLightConfig
+	// -- an explicit admin cost-control override (reviewDepth.
+	// mode=always_light) outranks this history-based "always add
+	// rigor" floor -- see domainreviewtriage.Floor's own doc
+	// comment (depth.go) for the full "why" this precedence exists
+	// and why it was never explicitly decided before this fix.
+	// Without this guard, a PR that had EVER gone deep once would
+	// stay deep on every subsequent auto-triggered push forever,
+	// even after an admin flipped this repo to always_light --
+	// and the persisted decision record would self-contradict
+	// (mode "always_light" alongside depth "deep").
+	flooredDepth := triageDecision.Depth
+	if triageDecision.Reason != domainreviewtriage.ReasonAlwaysLightConfig {
+		flooredDepth = domainreviewtriage.Floor(triageDecision.Depth, priorReviewDepth)
+	}
+	out.reviewDepth = string(flooredDepth)
+	out.modelID, out.effort = domainreviewtriage.ModelAndEffort(flooredDepth, a.reviewModelDeep)
+	// D4 (nice-to-have adversarial-review fix): see internal/
+	// adapters/inbound/httpapi/reviewretrigger.go's own identical
+	// log line for the full "why" -- an operator otherwise has no
+	// signal that a deep-routed turn's model-tier override is
+	// silently inert.
+	if flooredDepth == domainreviewtriage.DepthDeep && a.reviewModelDeep == "" {
+		a.logger.Info("sessionactor: review routed deep but no deep-tier model configured (NARVI_REVIEW_MODEL_DEEP unset), dispatching with the default model at forced high effort", "repo_full_name", repoFullName, "pr_number", prNumber)
+	}
+	// (§31.6): computed once, reused both for the write-time
+	// stamp immediately below AND for the prior-decisions fetch
+	// composeAutoRetriggerPrompt performs -- see internal/
+	// adapters/inbound/github/handler.go's own identical addition
+	// for the full "why this carrier, why computed once" reasoning.
+	archTagStrings := autoapproval.TagStrings(autoapproval.ClassifyChangedPaths(reviewCtx.ChangedPaths))
+	archRoots := autoapproval.ClassifyChangedRoots(reviewCtx.ChangedPaths)
+	if recordJSON, marshalErr := json.Marshal(domainreviewtriage.NewDecisionRecord(triageDecision, triageConfig, flooredDepth, triageProvenance, out.modelID, out.effort, reviewCtx.ChangedFilesCount, reviewCtx.Diff == "", reviewCtx.DiffTruncated, archTagStrings, archRoots)); marshalErr != nil {
+		a.logger.Warn("sessionactor: marshal review-depth decision record failed, turn will carry review_depth but no review_depth_decision", "error", marshalErr, "repo_full_name", repoFullName, "pr_number", prNumber)
+	} else {
+		out.reviewDepthDecisionJSON = recordJSON
+	}
+
+	// reviewCtx is a plain value here (never a pointer) -- both of
+	// these MUST be set before composeAutoRetriggerPrompt below,
+	// the one and only place this lane calls review.RenderTurnPrompt.
+	reviewCtx.DeepPath = flooredDepth == domainreviewtriage.DepthDeep
+	reviewCtx.ReviewCostBudgetUSD = triageConfig.CostBudget.ForDepth(flooredDepth)
+	// B5 fix: threads reviewtriage.CostBudgetSafetyMargin through as
+	// a whole percentage -- review.PreFetchedContext.
+	// CostBudgetSafetyMarginPercent's own doc comment for why this
+	// package (which already imports reviewtriage) is the one that
+	// must set it, never review itself (doc.go's own "zero external
+	// imports" convention).
+	reviewCtx.CostBudgetSafetyMarginPercent = int(domainreviewtriage.CostBudgetSafetyMargin * 100)
+
+	// Rereview fix (finding 1): compose §22.3's own false-positive
+	// advisory block and §22.1's own already-answered-facts block
+	// HERE, in this phase-2 window with no transaction open --
+	// see composeAutoRetriggerPrompt's own doc comment for why
+	// FetchFalsePositivePatterns' own IncrementHitCount side
+	// effect must never run inside a transaction that might still
+	// roll back -- before calling review.RenderTurnPrompt, mirroring
+	// httpapi.RetriggerReview's own manual-button lane and
+	// internal/adapters/inbound/github/handler.go's own mention/
+	// label lane byte-for-byte in ordering. Moved to AFTER the
+	// depth/cost-budget computation above (§26.4, this
+	// block's own doc comment) -- reviewCtx.DeepPath/
+	// ReviewCostBudgetUSD must already reflect the FLOORED depth
+	// this turn is about to persist before its own prompt renders.
+	out.prompt, out.knowledgeDecisionJSON = a.composeAutoRetriggerPrompt(ctx, repoFullName, prNumber, reviewCtx, baseText, archTagStrings, archRoots)
+	out.reviewCtx = reviewCtx
+	return out
 }
 
 // readReviewRetriggerState is handleReviewRetriggerDebounceTimer's own
@@ -803,9 +845,12 @@ func (a *Actor) reviewSessionHasAwaitingApprovalPlan(ctx context.Context, tx pgx
 
 // composeAutoRetriggerPrompt builds the Enqueue branch's own final review-
 // turn prompt text -- called by handleReviewRetriggerDebounceTimer's own
-// phase 2, with NO transaction open (rereview fix, finding 1). Prepends
+// phase 2, with NO transaction open (rereview fix, finding 1), through
+// composeReviewTurn, which the owed request's re-run calls too
+// (owedreviewrequest.go). Prepends
 // §22.3's own learned false-positive advisory block, then §22.1's own
-// already-answered-facts block, to autoRetriggerPromptText, exactly like
+// already-answered-facts block, to baseText -- autoRetriggerPromptText for
+// this lane, a person's own request text for a re-run -- exactly like
 // httpapi.RetriggerReview's own manual-button lane and internal/adapters/
 // inbound/github/handler.go's own mention/label lane already do -- before
 // this fix, the automatic lane was the ONLY review-turn producer in this
@@ -834,8 +879,8 @@ func (a *Actor) reviewSessionHasAwaitingApprovalPlan(ctx context.Context, tx pgx
 // to persist onto decision.knowledgeDecisionJSON, exactly like
 // reviewDepthDecisionJSON's own identical "computed here, stored on
 // decision" shape.
-func (a *Actor) composeAutoRetriggerPrompt(ctx context.Context, repoFullName string, prNumber int32, reviewCtx review.PreFetchedContext, archTags, archRoots []string) (string, []byte) {
-	prompt := autoRetriggerPromptText
+func (a *Actor) composeAutoRetriggerPrompt(ctx context.Context, repoFullName string, prNumber int32, reviewCtx review.PreFetchedContext, baseText string, archTags, archRoots []string) (string, []byte) {
+	prompt := baseText
 	advisory := reviewcontext.FetchFalsePositivePatterns(ctx, a.logger, a.stores.falsePositivePattern, repoFullName)
 	if advisory != "" {
 		prompt = advisory + prompt

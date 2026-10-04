@@ -122,14 +122,15 @@ func TestReviewAttemptToCheck_ReadsThePickTheDispatchMakes(t *testing.T) {
 			wantQueued: true, wantAttempt: true,
 		},
 		{
-			// The walk is the automatic lane's alone: the check applies to
-			// nothing else, so nothing else pays for it.
-			name: "a person's review attempt is never read as queued",
+			// The walk runs for a person's review attempt too: the check
+			// applies to it, and one whose context moved is owed to its
+			// requester (technical plan §24.9's third PR).
+			name: "a person's review attempt that waited is read as queued",
 			seed: func(s pgtype.UUID) pgtype.UUID {
 				insertTurnAt(ctx, t, pool, s, "completed", 60, secs(5), false, nil)
 				return insertTurnAt(ctx, t, pool, s, "pending", 30, nil, true, &label)
 			},
-			sandbox: "ready", wantLive: true, wantAttempt: true,
+			sandbox: "ready", wantQueued: true, wantLive: true, wantAttempt: true,
 		},
 		{
 			name: "a review attempt with no trigger recorded is never read as queued",
