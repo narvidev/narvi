@@ -6,10 +6,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -216,6 +219,71 @@ func storeTokenWindowShape(ctx context.Context, t *testing.T, pool *pgxpool.Pool
 	return long, []tokenWindowRead{first, last}
 }
 
+// tokenWindowDatabases migrates one database to the latest version, as a
+// template, and returns a function that creates a database of its own for
+// one log from it, with a pool of exactly one connection on it, as
+// pagePlanDatabase does: each log's statistics are its own, and every
+// statement shares one connection's prepared-statement cache. Copying the
+// template takes a fraction of the time migrating each of the matrix's 24
+// databases from scratch took. The template and every copy are dropped at
+// cleanup.
+func tokenWindowDatabases(ctx context.Context, t *testing.T) func(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	admin, adminConnStr := IntegrationTestPoolAndConnStr(t)
+	u, err := url.Parse(adminConnStr)
+	if err != nil {
+		t.Fatalf("parse connection string: %v", err)
+	}
+	connStr := func(name string) string {
+		c := *u
+		c.Path = "/" + name
+		return c.String()
+	}
+	template := fmt.Sprintf("tokenwindow_%d", time.Now().UnixNano())
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{template}.Sanitize()); err != nil {
+		t.Fatalf("create database %s: %v", template, err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(context.Background(), "DROP DATABASE "+pgx.Identifier{template}.Sanitize()+" WITH (FORCE)"); err != nil {
+			t.Errorf("drop database %s: %v", template, err)
+		}
+	})
+	m, mdb := newMigrate(t, connStr(template))
+	upErr := m.Up()
+	// CREATE DATABASE ... TEMPLATE refuses a template anyone is connected
+	// to, so the migrator's own connection, which closing mdb leaves open,
+	// is closed too.
+	srcErr, dbErr := m.Close()
+	_ = mdb.Close()
+	if upErr != nil {
+		t.Fatalf("migrate %s up: %v", template, upErr)
+	}
+	if srcErr != nil || dbErr != nil {
+		t.Fatalf("close the migrator of %s: %v, %v", template, srcErr, dbErr)
+	}
+
+	copies := 0
+	return func(t *testing.T) *pgxpool.Pool {
+		t.Helper()
+		copies++
+		name := fmt.Sprintf("%s_%d", template, copies)
+		if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{template}.Sanitize()); err != nil {
+			t.Fatalf("create database %s from %s: %v", name, template, err)
+		}
+		pool, err := narvipg.NewPoolWithMaxConns(ctx, connStr(name), 1)
+		if err != nil {
+			t.Fatalf("open %s: %v", name, err)
+		}
+		t.Cleanup(func() {
+			pool.Close()
+			if _, err := admin.Exec(context.Background(), "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
+				t.Errorf("drop database %s: %v", name, err)
+			}
+		})
+		return pool
+	}
+}
+
 // tokenWindowReadPlan is how one read of a window ran: its scans -- of every
 // relation, bitmap index scans included -- the buffers the whole statement
 // read, and the rows its nodes removed by a filter or an index recheck.
@@ -338,6 +406,7 @@ func TestEventStore_ListTokenFramesInWindow_ReadsTheTurnsWindow(t *testing.T) {
 			others: 5_000, before: before, below: 3_000, inWindow: 20_000, above: 6_000,
 		}
 	}
+	newDatabase := tokenWindowDatabases(context.Background(), t)
 	shapes := []tokenWindowShape{
 		interleaved("no", 0),
 		interleaved("20,000", 20_000),
@@ -353,7 +422,7 @@ func TestEventStore_ListTokenFramesInWindow_ReadsTheTurnsWindow(t *testing.T) {
 			for _, textLen := range []int{8, 300, 1_000} {
 				t.Run(fmt.Sprintf("%d characters of text", textLen), func(t *testing.T) {
 					ctx := context.Background()
-					pool := pagePlanDatabase(ctx, t)
+					pool := newDatabase(t)
 					long, reads := storeTokenWindowShape(ctx, t, pool, shape, textLen)
 					events := narvipg.NewEventStore(pool)
 					for _, read := range reads {
