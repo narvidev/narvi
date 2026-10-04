@@ -365,6 +365,19 @@ type Registry struct {
 	// panic.
 	reviewDiffFetcher reviewcontext.Fetcher
 
+	// reviewLiveReader is technical plan §24.9's addition, threaded through
+	// to every Actor this Registry hydrates exactly like reviewDiffFetcher
+	// above: a review attempt the automatic re-review asked for, dispatched
+	// after waiting behind another turn, reads its pull request's live
+	// head, base and ancestor chain through it (GetOpenPR, then
+	// reviewfreshness.ReadLive's two calls) to compare with the context it
+	// recorded (reviewcontextcheck.go). The SAME source-control instance
+	// every other freshness read goes through -- ports.SourceControl
+	// satisfies ReviewLiveReader directly. May be nil (tests that never
+	// exercise the check): the check then cannot be made, and the attempt
+	// starts with its context unconfirmed, as before the check existed.
+	reviewLiveReader ReviewLiveReader
+
 	// knowledgeRanker (§31.6/§34.7) orders whatever the automatic
 	// re-review lane's own arch-decisions gate admits (a.stores.
 	// reviewVerdict, which already satisfies reviewcontext.
@@ -569,6 +582,7 @@ func NewRegistry(
 		openCodeRuntimeVersion: openCodeRuntimeVersion,
 		diffFetcher:            diffFetcher,
 		reviewDiffFetcher:      opt.ReviewDiffFetcher,
+		reviewLiveReader:       opt.ReviewLiveReader,
 		knowledgeRanker:        opt.KnowledgeRanker,
 		githubBotHandle:        opt.GitHubBotHandle,
 		githubOutbound:         opt.GitHubOutbound,
@@ -606,6 +620,9 @@ type RegistryOptions struct {
 	// ReviewDiffFetcher is §24's own addition -- see Registry.
 	// reviewDiffFetcher's own doc comment.
 	ReviewDiffFetcher reviewcontext.Fetcher
+	// ReviewLiveReader is technical plan §24.9's addition -- see Registry.
+	// reviewLiveReader's own doc comment.
+	ReviewLiveReader ReviewLiveReader
 	// KnowledgeRanker (§31.6/§34.7) is Registry.knowledgeRanker's own
 	// doc comment -- knowledge.RecencyRanker{} (the public product's own
 	// default, controlplane.selectKnowledgeRanker's return value with no

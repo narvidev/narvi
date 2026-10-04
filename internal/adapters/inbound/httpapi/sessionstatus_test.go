@@ -1,6 +1,8 @@
 package httpapi
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -291,3 +293,56 @@ func TestSessionActivityToDTO_ScheduledWork(t *testing.T) {
 }
 
 func durationPtr(d time.Duration) *time.Duration { return &d }
+
+// TestSessionActivityToDTO_ReviewRetriggerDropped pins the decode of the
+// automatic re-review's drop (technical plan §24.9): a facts row carrying
+// one renders SessionActivity.reviewRetriggerDropped with its head, its
+// instant and the one reason a drop is recorded for, beside the settled
+// reading the drop leaves -- no debounce, so nothing scheduled -- and a row
+// with none renders no property at all, so a plain read is unchanged.
+func TestSessionActivityToDTO_ReviewRetriggerDropped(t *testing.T) {
+	t.Parallel()
+
+	droppedAt := statusObservedAt.Add(-time.Minute)
+	for _, tc := range []struct {
+		name string
+		drop bool
+	}{
+		{name: "a drop", drop: true},
+		{name: "none", drop: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			facts := statusFactsRow(`{"completed":1,"failed":1}`)
+			if tc.drop {
+				facts.ReviewRetriggerDroppedAt = pgtype.Timestamptz{Time: droppedAt, Valid: true}
+				facts.ReviewRetriggerDroppedHeadSha = "sha-given-up-on"
+			}
+			got := statusDTO(t, facts)
+			if got.Activity != restdtos.SessionActivityActivityFinished || !got.Settled {
+				t.Fatalf("activity %q settled %v, want finished and settled", got.Activity, got.Settled)
+			}
+			if !tc.drop {
+				if got.ReviewRetriggerDropped != nil {
+					t.Fatalf("reviewRetriggerDropped = %+v, want absent", got.ReviewRetriggerDropped)
+				}
+				body, err := json.Marshal(got)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(string(body), "reviewRetriggerDropped") {
+					t.Fatalf("the wire carries reviewRetriggerDropped with no drop: %s", body)
+				}
+				return
+			}
+			want := restdtos.SessionActivityReviewRetriggerDropped{
+				HeadSha:   "sha-given-up-on",
+				DroppedAt: droppedAt,
+				Reason:    restdtos.SessionActivityReviewRetriggerDroppedReasonContextMovedBound,
+			}
+			if got.ReviewRetriggerDropped == nil || *got.ReviewRetriggerDropped != want {
+				t.Fatalf("reviewRetriggerDropped = %+v, want %+v", got.ReviewRetriggerDropped, want)
+			}
+		})
+	}
+}

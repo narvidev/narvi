@@ -1140,10 +1140,13 @@ func seedPlanVersions(ctx context.Context, t *testing.T, r *mcpTestRig, sessionI
 	}
 }
 
-// sessionActivityProperties is SessionActivity's own property set, read
-// from the embedded contract: the status body carries exactly these keys,
-// so no transcript (or anything else) rides along with it -- the wait
-// object only when waited (a read that waited, §43.20 piece (b)).
+// sessionActivityProperties is SessionActivity's own key set for these
+// reads, read from the embedded contract: the status body carries exactly
+// its required keys, so no transcript (or anything else) rides along with
+// it -- the wait object only when waited (a read that waited, §43.20 piece
+// (b)). An optional property is absent from a read that has nothing to say
+// in it -- reviewRetriggerDropped on a session whose automatic re-review
+// never gave up (§24.9) -- as on every session here.
 func sessionActivityProperties(t *testing.T, waited bool) []string {
 	t.Helper()
 	data, err := contracts.FS.ReadFile("rest/v1/dtos.schema.json")
@@ -1153,17 +1156,16 @@ func sessionActivityProperties(t *testing.T, waited bool) []string {
 	var doc struct {
 		Defs map[string]struct {
 			Properties map[string]json.RawMessage `json:"properties"`
+			Required   []string                   `json:"required"`
 		} `json:"$defs"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
 		t.Fatal(err)
 	}
-	names := make([]string, 0, len(doc.Defs["SessionActivity"].Properties))
-	for name := range doc.Defs["SessionActivity"].Properties {
-		if name == "wait" && !waited {
-			continue
-		}
-		names = append(names, name)
+	def := doc.Defs["SessionActivity"]
+	names := append([]string(nil), def.Required...)
+	if _, ok := def.Properties["wait"]; ok && waited {
+		names = append(names, "wait")
 	}
 	sort.Strings(names)
 	return names

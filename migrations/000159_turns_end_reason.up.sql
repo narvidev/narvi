@@ -1,0 +1,89 @@
+-- Technical plan §24.9's second rule, for an automatic review attempt: a
+-- review attempt that waited behind another turn checks, as it is
+-- dispatched, that the head, base and ancestor chain it recorded are still
+-- the pull request's. One whose context moved does not start: it ends
+-- with a reason of its own, and the automatic request goes back to the
+-- lane as its pending target, a bounded number of times in a row.
+--
+-- turns.end_reason: why a turn ended without being an attempt at all,
+-- NULL for every other turn. 'context_moved' (sessionactor's
+-- reviewcontextcheck.go) is the one value today. Such a turn is failed by
+-- the machine's abandon edge, like any turn given up on before it reached
+-- a sandbox; the session's status derivation skips it
+-- (session.DeriveStatus, turn.Summary.Ignored), and every reader of
+-- attempts excludes it (end_reason IS NULL): the newest review attempt,
+-- whether a newer attempt ran since a verdict was accepted, and a
+-- session's last run.
+--
+-- turns.context_unconfirmed_at: when the dispatch of a queued review
+-- attempt could not compare its context with the live one -- the live read
+-- failed, or a fact the comparison needs is unknown -- and let it start
+-- anyway, as before this rule. NULL for every other turn.
+--
+-- turns.request_trigger: what asked for the turn, for the lanes that
+-- record it: 'auto' for the automatic re-review (sessionactor's
+-- insertAutoRetriggerTurn); NULL for every other turn. Only an automatic
+-- review attempt is checked at dispatch until the human lanes record theirs.
+--
+-- github_pr_sessions.auto_retrigger_context_moves: how many automatic
+-- review attempts of the pull request in a row met a moved context at
+-- dispatch; reset when one of its automatic review attempts starts.
+-- auto_retrigger_dropped_at and auto_retrigger_dropped_head_sha: when the
+-- automatic re-review gave up after ReviewContextMoveMaxConsecutive such
+-- moves, and the head it was for; the session's status shows them until
+-- the next push clears them (UpsertPendingRetriggerHeadSHA).
+--
+-- No backfill, no index. Every turn that exists when this runs has no end
+-- reason, so it counts as the attempt or turn it was, and no trigger, so
+-- it is no automatic attempt: none of them is checked. Every pull request
+-- starts at no move and no drop.
+--
+-- # Locks
+--
+-- Each ADD COLUMN is nullable with no default, or NOT NULL with a constant
+-- default, which Postgres stores in the catalog: none rewrites a table.
+-- They take ACCESS EXCLUSIVE on turns and on github_pr_sessions, for the
+-- file's one implicit transaction, for an instant.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with these columns present:
+--   - Every statement it sends names its columns (sqlc writes each
+--     SELECT * and RETURNING * out as a column list), so it neither reads
+--     nor writes them: its turns are created with no trigger, and its
+--     github_pr_sessions writes leave the move count and the drop alone.
+--   - It never checks a context, so it dispatches every queued automatic
+--     attempt as it always did, and ends no turn context_moved.
+--   - It reads a context_moved turn this release ended as the failed turn
+--     its status is: its newest review attempt, its acceptance check, its
+--     last run, and a later re-derivation of the session's status by its
+--     actor count it, as they counted every abandoned turn. A session whose
+--     actor runs on it reads failed until this release re-derives it.
+--   - Its synchronize handler re-arms the debounce without clearing a drop
+--     this release recorded; the status shows the drop until a push lands
+--     on this release.
+-- migration000159_integration_test.go runs the previous binary's own
+-- statements against the columns.
+--
+-- # Rolling back
+--
+-- Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for. So once this migration is applied, the
+-- previous binary cannot boot ("no migration found for version 159"). A
+-- rollback therefore takes one of two steps first, with the control plane
+-- scaled to zero:
+--   - Keep the columns: with the golang-migrate CLI, `migrate force 158`.
+--     The previous binary then boots, since 158 is a version it has, and
+--     works with the columns present as above. When this release is
+--     deployed again, this file runs again and leaves the columns and
+--     their values as they are.
+--   - Drop them: run this migration's down (goto 158) with this release's
+--     migrations. The down file says what it removes.
+-- Nothing else needs undoing: no timer kind or event type is added.
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS end_reason TEXT;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS context_unconfirmed_at TIMESTAMPTZ;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS request_trigger TEXT;
+ALTER TABLE github_pr_sessions ADD COLUMN IF NOT EXISTS auto_retrigger_context_moves INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE github_pr_sessions ADD COLUMN IF NOT EXISTS auto_retrigger_dropped_at TIMESTAMPTZ;
+ALTER TABLE github_pr_sessions ADD COLUMN IF NOT EXISTS auto_retrigger_dropped_head_sha TEXT;

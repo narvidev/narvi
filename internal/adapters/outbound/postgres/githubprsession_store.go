@@ -182,6 +182,41 @@ func (s *GitHubPRSessionStore) MarkAutoRetriggerBudgetNoticeSent(ctx context.Con
 	})
 }
 
+// RequeueAutoRetrigger is technical plan §24.9's re-request of an
+// automatic re-review whose attempt ended context_moved: the pending head
+// becomes headSHA unless a push left one, and the count of moves in a row
+// grows by one; the returned row carries both. pgx.ErrNoRows (unwrapped):
+// no claim row with a session for this pull request. See
+// RequeueAutoRetrigger's generated doc comment.
+func (s *GitHubPRSessionStore) RequeueAutoRetrigger(ctx context.Context, repoFullName string, prNumber int32, headSHA string) (sqlcgen.GithubPrSession, error) {
+	return s.q.RequeueAutoRetrigger(ctx, sqlcgen.RequeueAutoRetriggerParams{
+		HeadSha:      headSHA,
+		RepoFullName: repoFullName,
+		PrNumber:     prNumber,
+	})
+}
+
+// DropAutoRetrigger is technical plan §24.9's bound: the automatic
+// re-review gives up on headSHA, its pending head, recording when and on
+// which head for the session's status. pgx.ErrNoRows (unwrapped): the
+// pending head is no longer headSHA. See DropAutoRetrigger's generated doc
+// comment.
+func (s *GitHubPRSessionStore) DropAutoRetrigger(ctx context.Context, repoFullName string, prNumber int32, headSHA string) (sqlcgen.GithubPrSession, error) {
+	return s.q.DropAutoRetrigger(ctx, sqlcgen.DropAutoRetriggerParams{
+		HeadSha:      headSHA,
+		RepoFullName: repoFullName,
+		PrNumber:     prNumber,
+	})
+}
+
+// ResetAutoRetriggerContextMoves starts sessionID's count of automatic
+// attempts in a row that met a moved context again, because one of them
+// started (technical plan §24.9); it reports the rows it wrote, 0 when the
+// count was already 0 or the session claims no pull request.
+func (s *GitHubPRSessionStore) ResetAutoRetriggerContextMoves(ctx context.Context, sessionID pgtype.UUID) (int64, error) {
+	return s.q.ResetAutoRetriggerContextMoves(ctx, sessionID)
+}
+
 // RecordMergeOutcome captures a `pull_request` "closed" webhook's own
 // merged/closed_at facts onto (repoFullName, prNumber)'s claim row --
 // §31.7's own G4 arming write. Guarded on session_id IS NOT NULL; a

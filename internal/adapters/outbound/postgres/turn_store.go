@@ -183,6 +183,23 @@ func (s *TurnStore) UpdateStatus(ctx context.Context, arg sqlcgen.UpdateTurnStat
 	return s.q.UpdateTurnStatus(ctx, arg)
 }
 
+// ReviewAttemptToCheck reads sessionID's next turn to dispatch as
+// technical plan §24.9's context check reads it: whether it is a review
+// attempt and which lane asked for it, the head and context it recorded,
+// whether it waited behind another turn, and whether the session's sandbox
+// can take it now. pgx.ErrNoRows: nothing to dispatch. See
+// GetReviewAttemptToCheck's generated doc comment.
+func (s *TurnStore) ReviewAttemptToCheck(ctx context.Context, sessionID pgtype.UUID) (sqlcgen.GetReviewAttemptToCheckRow, error) {
+	return s.q.GetReviewAttemptToCheck(ctx, sessionID)
+}
+
+// SetContextUnconfirmed records that the pending turn id starts with its
+// context unconfirmed (technical plan §24.9), and reports the rows it
+// wrote: 0 once the turn is no longer pending.
+func (s *TurnStore) SetContextUnconfirmed(ctx context.Context, id pgtype.UUID) (int64, error) {
+	return s.q.SetTurnContextUnconfirmed(ctx, id)
+}
+
 // ReviewRetriggerHeld reports whether some turn of sessionID is still open
 // -- pending, dispatched or processing -- so the re-review debounce's fire
 // holds instead of inserting an automatic review (technical plan §24.9).

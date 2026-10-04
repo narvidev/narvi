@@ -688,7 +688,12 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			GitHubOutbound:    cfg.GitHubOutbound,
 			GitHubBotHandle:   cfg.GitHubBotHandle,
 			ReviewDiffFetcher: sourceControl,
-			ReviewModelDeep:   cfg.ReviewModelDeep,
+			// ReviewLiveReader (§24.9): a queued automatic review
+			// attempt's context check reads the pull request's live
+			// head, base and ancestor chain through the SAME decorated
+			// sourceControl a session's result reads freshness with.
+			ReviewLiveReader: sourceControl,
+			ReviewModelDeep:  cfg.ReviewModelDeep,
 			// ReviewSizeExclusions (§26.3): the deployment's size
 			// patterns, the same list the other two review lanes' own
 			// appreviewtriage.Deps carry.

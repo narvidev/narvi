@@ -49,7 +49,8 @@ const (
 	// §2, §3.3). It is armed from OUTSIDE the actor, due at once, in the
 	// transaction that creates a turn -- postgres.TurnStore.
 	// CreateAndArmDispatch is the one way production code creates one, and
-	// its query (ArmSessionDispatchTimer) names this kind -- so a turn
+	// its query (ArmSessionDispatchTimer, which the actor's own re-arm
+	// shares, TimerStore.ArmDispatch) names this kind -- so a turn
 	// committed on a session always has either a dispatch evaluation still
 	// to come or this timer. The post-commit EnsureDispatched every
 	// turn-creating path sends is the fast path; when it fails

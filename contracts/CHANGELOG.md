@@ -10,6 +10,42 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.23.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: optional `SessionActivity.reviewRetriggerDropped`, nullable (an
+  object, closed, of the required `headSha`, `droppedAt` and `reason`):
+  the automatic re-review of the session's pull request gave up
+  (technical plan §24.9). An automatic review attempt that waited behind
+  another turn checks, as it is dispatched, that the head, base and
+  ancestor chain it was built for are still the pull request's; one whose
+  pull request moved does not run, and the re-review asks again for the
+  newest head. When its attempts meet a moved context more times in a row
+  than the deployment allows, it gives up: nothing is scheduled, so the
+  session can read `finished`, and this property says the automatic
+  re-review stopped rather than was never owed -- `headSha` the head it
+  gave up on, `droppedAt` when, `reason` why. The next push to the pull
+  request clears it. Absent otherwise, so a plain read of every other
+  session is unchanged byte for byte. A property added, not required,
+  grades MINOR (row 2). `narvi_get_session_status` and
+  `narvi_wait_for_session` publish it in their output schema, bundled
+  from this `$def` (`internal/adapters/inbound/mcp/testdata/
+  tools.golden.json`).
+- Added: `rest/v1/dtos.schema.json#/$defs/SessionActivity/properties/reviewRetriggerDropped/properties/reason`
+  to `manifest.json`'s `openEnums`, with one value, `context_moved_bound`,
+  so a later reason grades MINOR: a consumer MUST tolerate a `reason` it
+  does not recognise. The entry is not itself a graded finding.
+- Changed (description only, annotation-only PATCH):
+  `SessionActivity.lastRun` says it leaves aside a turn that ended without
+  ever running, for a reason of its own -- a queued automatic review whose
+  pull request moved before it started -- which is no run of the
+  session's; `SessionOutcome.lastRun`, its turn, follows. No field, type,
+  enum value or requiredness changed. A description grades PATCH (row
+  35).
+- Unchanged: no route, and `SessionOutcome`, whose `activity` is read from
+  the same snapshot, does not carry the drop.
+
 ## [1.22.0]
 
 ### sandbox-ws/v1/events.schema.json

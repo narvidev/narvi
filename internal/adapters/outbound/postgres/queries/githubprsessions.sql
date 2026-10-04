@@ -102,8 +102,17 @@ WHERE repo_full_name = $1 AND pr_number = $2;
 -- session to re-trigger", identical in kind to today's "no mention"
 -- no-op for comment events. Overwrites (never appends) on every event,
 -- per §24.2's own "upserted, not appended" rule.
+--
+-- A push re-arms an automatic re-review that gave up on a moved context
+-- (technical plan §24.9, DropAutoRetrigger below): the drop it recorded is
+-- cleared here, so the status stops showing it the moment the next head
+-- is owed a review. The move count is not touched: it counts automatic
+-- attempts that met a moved context in a row, and only one starting
+-- resets it (ResetAutoRetriggerContextMoves).
 UPDATE github_pr_sessions
-SET pending_retrigger_head_sha = $3
+SET pending_retrigger_head_sha = $3,
+    auto_retrigger_dropped_at = NULL,
+    auto_retrigger_dropped_head_sha = NULL
 WHERE repo_full_name = $1 AND pr_number = $2 AND session_id IS NOT NULL
 RETURNING *;
 
@@ -178,6 +187,57 @@ UPDATE github_pr_sessions
 SET auto_retrigger_count = auto_retrigger_count + 1
 WHERE repo_full_name = $1 AND pr_number = $2
 RETURNING *;
+
+-- name: RequeueAutoRetrigger :one
+-- Technical plan §24.9: an automatic review attempt met a moved context at
+-- its dispatch and ended context_moved without running, so the automatic
+-- re-review asks again, in that dispatching transaction: the pull
+-- request's pending head becomes head_sha -- the head the dispatch read
+-- live -- unless a push already left one pending, which is as new and
+-- stays (COALESCE), and the count of such moves in a row grows by one. The
+-- caller (sessionactor's endContextMovedTurn) arms the debounce if it has
+-- none, and drops the request past ReviewContextMoveMaxConsecutive
+-- (DropAutoRetrigger). Only the pull request's own session actor moves the
+-- count; the synchronize webhook writes the pending head too, and this
+-- statement's row lock orders the two. RETURNING the row, its new count
+-- among it. pgx.ErrNoRows: no row for this pull request, or one with no
+-- session.
+UPDATE github_pr_sessions
+SET pending_retrigger_head_sha = COALESCE(pending_retrigger_head_sha, sqlc.arg('head_sha')::text),
+    auto_retrigger_context_moves = auto_retrigger_context_moves + 1
+WHERE repo_full_name = sqlc.arg('repo_full_name') AND pr_number = sqlc.arg('pr_number') AND session_id IS NOT NULL
+RETURNING *;
+
+-- name: DropAutoRetrigger :one
+-- Technical plan §24.9's bound: the automatic re-review gives up after
+-- ReviewContextMoveMaxConsecutive of its attempts in a row met a moved
+-- context. In the transaction that recorded the last move
+-- (RequeueAutoRetrigger, whose row lock it still holds), it clears the
+-- pending head it just requeued -- only while the head is still that one,
+-- the guarded clear ClearPendingRetriggerHeadSHA makes -- and records when
+-- it gave up and the head it gave up on, which the session's status shows
+-- (GetSessionActivityFacts) until a push clears them
+-- (UpsertPendingRetriggerHeadSHA). The move count stays where it is: the
+-- next automatic attempt that starts resets it. pgx.ErrNoRows: the pending
+-- head is no longer head_sha.
+UPDATE github_pr_sessions
+SET pending_retrigger_head_sha = NULL,
+    auto_retrigger_dropped_at = now(),
+    auto_retrigger_dropped_head_sha = sqlc.arg('head_sha')::text
+WHERE repo_full_name = sqlc.arg('repo_full_name') AND pr_number = sqlc.arg('pr_number')
+  AND pending_retrigger_head_sha = sqlc.arg('head_sha')::text
+RETURNING *;
+
+-- name: ResetAutoRetriggerContextMoves :execrows
+-- Technical plan §24.9: one of the automatic re-review's attempts started
+-- -- its context fresh, unconfirmed, or never asked since it waited behind
+-- no turn -- so the count of its attempts in a row that met a moved
+-- context starts again, in the dispatching transaction. Only a row whose
+-- count is not already 0 is written, so an ordinary dispatch writes
+-- nothing; 0 rows then.
+UPDATE github_pr_sessions
+SET auto_retrigger_context_moves = 0
+WHERE session_id = sqlc.arg('session_id') AND auto_retrigger_context_moves <> 0;
 
 -- name: MarkAutoRetriggerBudgetNoticeSent :one
 -- §24.6's own "a one-time event, not repeated on every subsequent

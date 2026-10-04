@@ -3067,6 +3067,29 @@ type Timeouts struct {
 	// the debounce knows it).
 	ReviewRetriggerHoldBackstop time.Duration
 
+	// ReviewContextMoveMaxConsecutive is how many automatic review attempts
+	// of one pull request in a row may meet a moved context at dispatch
+	// and still ask again (technical plan §24.9): an attempt that waited
+	// behind another turn checks, as it is dispatched, that the head, base
+	// and ancestor chain it recorded are still the pull request's, and one
+	// whose context moved ends context_moved without running and asks
+	// again -- its pending head requeued, the debounce due at once. The
+	// count is kept beside the pull request
+	// (github_pr_sessions.auto_retrigger_context_moves) and starts again
+	// when one of its automatic attempts starts. A move that takes the
+	// count past this drops the request instead: the pending head is
+	// cleared, the debounce deleted, and the session's status shows the
+	// drop until the next push. Each re-request spends a slot of §24.6's budget like
+	// any automatic review, so this bounds what a pull request whose
+	// context keeps moving costs between two pushes. A count, not a
+	// duration; it sits here beside the backstop of the same rule, like
+	// PromptResendMaxPerTurn beside its window. Not given a value in the
+	// plan; 3 -- one move is the case the re-request exists for, and three
+	// in a row with no attempt starting between them is no accident.
+	// Validate keeps it positive: zero would drop every request at its
+	// first move.
+	ReviewContextMoveMaxConsecutive int
+
 	// -- §26.5 ("review: wire the cost budget", §26.7/§26.9) -- no
 	// ordering relationship with either invariant chain above (or with any
 	// prior Step's standalone additions), so -- per those additions' own
@@ -4314,6 +4337,8 @@ func DefaultTimeouts() Timeouts {
 		ReviewRetriggerDebounce:     2 * time.Minute,  // §24.2; not specified, chosen -- long enough to collapse a short burst of fixup-commit pushes into one quiet window, short enough that a single push still reviews promptly
 		ReviewRetriggerHoldBackstop: 10 * time.Minute, // §24.9; not specified, chosen -- every turn end wakes the debounce at once, so this only bounds a lost wake-up, see field doc comment
 
+		ReviewContextMoveMaxConsecutive: 3, // §24.9; not specified, chosen -- a count of automatic attempts in a row that met a moved context, see field doc comment
+
 		ReviewCostBudgetServerReadHeaderTimeout: 5 * time.Second, // §26.7/§26.9; not specified, chosen -- matches RepoSHADiscoveryTimeout/CredentialFetchTimeout's own "lightweight, purely local" precedent, see field doc comment
 
 		SandboxSecretFetchTimeout:         10 * time.Second,       // §27.1; not specified, chosen, matches ProviderCredentialFetchTimeout's own reasoning
@@ -4741,6 +4766,11 @@ func (t Timeouts) Validate() error {
 	// §3.3's prompt receipts: a cap of zero would never re-send a lost
 	// prompt at all. See PromptResendMaxPerTurn's own doc comment.
 	countMustBePositive("PromptResendMaxPerTurn", t.PromptResendMaxPerTurn)
+
+	// §24.9's context check: a bound of zero would drop every automatic
+	// re-review at its first moved context. See
+	// ReviewContextMoveMaxConsecutive's own doc comment.
+	countMustBePositive("ReviewContextMoveMaxConsecutive", t.ReviewContextMoveMaxConsecutive)
 
 	// §5.1: what the outbox delivery worker records once this process's
 	// shutdown has begun is written on a context that outlives the

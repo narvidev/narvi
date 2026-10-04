@@ -182,3 +182,60 @@ func TestIsTerminal(t *testing.T) {
 		})
 	}
 }
+
+// TestIgnoredForEndReason pins which turns the session's status derivation
+// skips (technical plan §24.9): any end reason at all, as every SQL reader
+// of attempts keeps only end_reason IS NULL.
+func TestIgnoredForEndReason(t *testing.T) {
+	t.Parallel()
+
+	contextMoved := turn.EndReasonContextMoved
+	unknown := "a_reason_a_newer_binary_wrote"
+	for _, tc := range []struct {
+		name      string
+		endReason *string
+		want      bool
+	}{
+		{name: "no end reason", endReason: nil, want: false},
+		{name: "context_moved", endReason: &contextMoved, want: true},
+		{name: "an end reason this binary does not know", endReason: &unknown, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := turn.IgnoredForEndReason(tc.endReason); got != tc.want {
+				t.Errorf("IgnoredForEndReason(%v) = %v, want %v", tc.endReason, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestContextCheckedAtDispatch pins which turns technical plan §24.9's
+// context check applies to: a review attempt the automatic re-review asked
+// for, and nothing else -- not a person's review request, not a turn that
+// is no review attempt, not a turn with no recorded trigger.
+func TestContextCheckedAtDispatch(t *testing.T) {
+	t.Parallel()
+
+	auto := turn.RequestTriggerAuto
+	label, empty := "label", ""
+	for _, tc := range []struct {
+		name            string
+		isReviewAttempt bool
+		trigger         *string
+		want            bool
+	}{
+		{name: "an automatic review attempt", isReviewAttempt: true, trigger: &auto, want: true},
+		{name: "a person's review attempt", isReviewAttempt: true, trigger: &label},
+		{name: "a review attempt with no trigger recorded", isReviewAttempt: true},
+		{name: "a review attempt with an empty trigger", isReviewAttempt: true, trigger: &empty},
+		{name: "an automatic turn that is no review attempt", trigger: &auto},
+		{name: "a follow-up", trigger: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := turn.ContextCheckedAtDispatch(tc.isReviewAttempt, tc.trigger); got != tc.want {
+				t.Errorf("ContextCheckedAtDispatch(%v, %v) = %v, want %v", tc.isReviewAttempt, tc.trigger, got, tc.want)
+			}
+		})
+	}
+}

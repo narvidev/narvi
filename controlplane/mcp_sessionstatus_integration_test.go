@@ -103,9 +103,12 @@ func toolText(t *testing.T, res *sdkmcp.CallToolResult) []byte {
 	return []byte(text.Text)
 }
 
-// sessionActivityKeys is SessionActivity's own property set, from the
-// embedded contract: every key of a plain read, and -- waited -- the wait
-// object too, which only a read that waited carries (§43.20, piece (b)).
+// sessionActivityKeys is SessionActivity's own key set for these reads,
+// from the embedded contract: every required key of a plain read, and --
+// waited -- the wait object too, which only a read that waited carries
+// (§43.20, piece (b)). An optional property is absent from a read that has
+// nothing to say in it -- reviewRetriggerDropped on a session whose
+// automatic re-review never gave up (§24.9) -- as on every session here.
 func sessionActivityKeys(t *testing.T, waited bool) []string {
 	t.Helper()
 	data, err := contracts.FS.ReadFile("rest/v1/dtos.schema.json")
@@ -115,17 +118,16 @@ func sessionActivityKeys(t *testing.T, waited bool) []string {
 	var doc struct {
 		Defs map[string]struct {
 			Properties map[string]json.RawMessage `json:"properties"`
+			Required   []string                   `json:"required"`
 		} `json:"$defs"`
 	}
 	if err := json.Unmarshal(data, &doc); err != nil {
 		t.Fatal(err)
 	}
-	keys := make([]string, 0)
-	for k := range doc.Defs["SessionActivity"].Properties {
-		if k == "wait" && !waited {
-			continue
-		}
-		keys = append(keys, k)
+	def := doc.Defs["SessionActivity"]
+	keys := append([]string(nil), def.Required...)
+	if _, ok := def.Properties["wait"]; ok && waited {
+		keys = append(keys, "wait")
 	}
 	sort.Strings(keys)
 	return keys

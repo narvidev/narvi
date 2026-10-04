@@ -205,3 +205,38 @@ func TestSummariesForRederive(t *testing.T) {
 		t.Errorf("summariesForRederive(nil, ...) = %v, want empty", got)
 	}
 }
+
+// TestSummariesForRederive_SkipsATurnEndedContextMoved: a turn with an end
+// reason is marked ignored, in the stored summaries and in the re-derive's,
+// and the re-derive's recorded reason goes to the last turn that is not --
+// the one DeriveStatus reads (technical plan §24.9).
+func TestSummariesForRederive_SkipsATurnEndedContextMoved(t *testing.T) {
+	t.Parallel()
+
+	moved := turn.EndReasonContextMoved
+	turns := []sqlcgen.Turn{
+		{Status: sqlcgen.TurnStatusFailed},
+		{Status: sqlcgen.TurnStatusFailed, EndReason: &moved},
+	}
+
+	got := summariesForRederive(turns, turn.FailureReasonTimeout)
+	want := []turn.Summary{
+		{Status: turn.StateFailed, FailureReason: turn.FailureReasonTimeout},
+		{Status: turn.StateFailed, Ignored: true},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("summariesForRederive() len = %d, want %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("summariesForRederive()[%d] = %+v, want %+v", i, got[i], want[i])
+		}
+	}
+
+	if got, want := storedTurnSummary(turns[1]), (turn.Summary{Status: turn.StateFailed, Ignored: true}); got != want {
+		t.Errorf("storedTurnSummary(context_moved) = %+v, want %+v", got, want)
+	}
+	if got := storedTurnSummary(turns[0]); got.Ignored {
+		t.Errorf("storedTurnSummary(no end reason) = %+v, want not ignored", got)
+	}
+}

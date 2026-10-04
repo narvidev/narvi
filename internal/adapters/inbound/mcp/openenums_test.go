@@ -34,6 +34,7 @@ const (
 	openPlanStatus        = "rest/v1/dtos.schema.json#/$defs/Plan/properties/status"
 	openPlanActionStatus  = "rest/v1/dtos.schema.json#/$defs/PlanActionResponse/properties/status"
 	openCreateTurnStatus  = "rest/v1/dtos.schema.json#/$defs/CreateTurnResponse/properties/status"
+	openDropReason        = "rest/v1/dtos.schema.json#/$defs/SessionActivity/properties/reviewRetriggerDropped/properties/reason"
 	openEnumTestSessionID = "5b1c1e2e-6b1a-4b1a-9b1a-6b1a4b1a9b1a"
 	openEnumTestPlanID    = "6c2d2f3f-7c2b-4c2b-8c2b-7c2b5c2b8c2b"
 	openEnumTestTurnID    = "7d3e3a4a-8d3c-4d3c-9d3c-8d3c6d3c9d3c"
@@ -116,6 +117,32 @@ var openEnumBodies = map[string]struct {
 		}`,
 		at: map[string]string{
 			"/excludedPullRequests/0/kind": openExcludedPRKind,
+		},
+	},
+	// The status and the wait (technical plan §43.20), on a session whose
+	// automatic re-review gave up (§24.9).
+	"SessionActivity": {
+		body: `{
+			"sessionId": "` + openEnumTestSessionID + `",
+			"activity": "finished",
+			"settled": true,
+			"pendingTurns": 0,
+			"inFlightTurn": null,
+			"awaiting": null,
+			"escalation": null,
+			"lastRun": null,
+			"reviewRetriggerDropped": {
+				"headSha": "0123456789abcdef0123456789abcdef01234567",
+				"droppedAt": "2026-01-01T00:00:00Z",
+				"reason": "context_moved_bound"
+			},
+			"sandboxStatus": null,
+			"archived": false,
+			"suggestedDelaySeconds": 300,
+			"observedAt": "2026-01-01T00:00:00Z"
+		}`,
+		at: map[string]string{
+			"/reviewRetriggerDropped/reason": openDropReason,
 		},
 	},
 	// Row 183's plan and turn tools (technical plan §43.21).

@@ -12147,8 +12147,10 @@ type SessionActivity struct {
 	// The turn dispatched to a sandbox or being processed; null when none is.
 	InFlightTurn *SessionActivityInFlightTurn `json:"inFlightTurn" yaml:"inFlightTurn" mapstructure:"inFlightTurn"`
 
-	// The most recently created turn that reached a terminal state; null when none
-	// has.
+	// The most recently created turn that reached a terminal state, leaving aside a
+	// turn that ended without ever running, for a reason of its own: a queued
+	// automatic review whose pull request moved before it started (technical plan
+	// §24.9), which is no run of the session's; null when none has.
 	LastRun *SessionActivityLastRun `json:"lastRun" yaml:"lastRun" mapstructure:"lastRun"`
 
 	// The database's clock when the snapshot was taken.
@@ -12156,6 +12158,19 @@ type SessionActivity struct {
 
 	// How many turns are queued (pending), not yet dispatched to a sandbox.
 	PendingTurns int `json:"pendingTurns" yaml:"pendingTurns" mapstructure:"pendingTurns"`
+
+	// The automatic re-review of the session's pull request gave up, and why; absent
+	// when it has not (a plain read of a session that never had one is unchanged by
+	// it). An automatic review attempt that waited behind another turn checks, as it
+	// is dispatched, that the head, base and ancestor chain it was built for are
+	// still the pull request's; one whose pull request moved does not run, and the
+	// re-review asks again for the newest head. When its attempts meet a moved
+	// context more times in a row than the deployment allows (3 as shipped), it gives
+	// up instead: nothing is scheduled, so activity can read finished, and this says
+	// the automatic re-review stopped rather than was never owed. The next push to
+	// the pull request re-arms it and clears this. A person's re-review request (the
+	// label, the button, a mention) is never subject to it.
+	ReviewRetriggerDropped *SessionActivityReviewRetriggerDropped `json:"reviewRetriggerDropped,omitempty,omitzero" yaml:"reviewRetriggerDropped,omitempty" mapstructure:"reviewRetriggerDropped,omitempty"`
 
 	// The session's sandbox status in the same snapshot, with Session.sandboxStatus's
 	// values; null when the session has no sandbox yet. Informational, and an input
@@ -12422,8 +12437,10 @@ func (j *SessionActivityInFlightTurn) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-// The most recently created turn that reached a terminal state; null when none
-// has.
+// The most recently created turn that reached a terminal state, leaving aside a
+// turn that ended without ever running, for a reason of its own: a queued
+// automatic review whose pull request moved before it started (technical plan
+// §24.9), which is no run of the session's; null when none has.
 type SessionActivityLastRun struct {
 	// Why the run did not complete, with Session.failureReason's values. A turn
 	// carries no reason of its own, so this is the session's recorded reason, given
@@ -12540,6 +12557,83 @@ func (j *SessionActivityLastRun) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = SessionActivityLastRun(plain)
+	return nil
+}
+
+// The automatic re-review of the session's pull request gave up, and why; absent
+// when it has not (a plain read of a session that never had one is unchanged by
+// it). An automatic review attempt that waited behind another turn checks, as it
+// is dispatched, that the head, base and ancestor chain it was built for are still
+// the pull request's; one whose pull request moved does not run, and the re-review
+// asks again for the newest head. When its attempts meet a moved context more
+// times in a row than the deployment allows (3 as shipped), it gives up instead:
+// nothing is scheduled, so activity can read finished, and this says the automatic
+// re-review stopped rather than was never owed. The next push to the pull request
+// re-arms it and clears this. A person's re-review request (the label, the button,
+// a mention) is never subject to it.
+type SessionActivityReviewRetriggerDropped struct {
+	// When it gave up, on the database's clock.
+	DroppedAt time.Time `json:"droppedAt" yaml:"droppedAt" mapstructure:"droppedAt"`
+
+	// The head the automatic re-review gave up on: the pull request's newest head
+	// when it did.
+	HeadSha string `json:"headSha" yaml:"headSha" mapstructure:"headSha"`
+
+	// 'context_moved_bound': its attempts met a moved context more times in a row
+	// than the deployment allows. An OPEN enum (manifest.json's openEnums): a
+	// consumer MUST tolerate a value it does not recognise.
+	Reason SessionActivityReviewRetriggerDroppedReason `json:"reason" yaml:"reason" mapstructure:"reason"`
+}
+
+type SessionActivityReviewRetriggerDroppedReason string
+
+const SessionActivityReviewRetriggerDroppedReasonContextMovedBound SessionActivityReviewRetriggerDroppedReason = "context_moved_bound"
+
+var enumValues_SessionActivityReviewRetriggerDroppedReason = []interface{}{
+	"context_moved_bound",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityReviewRetriggerDroppedReason) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_SessionActivityReviewRetriggerDroppedReason {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_SessionActivityReviewRetriggerDroppedReason, v)
+	}
+	*j = SessionActivityReviewRetriggerDroppedReason(v)
+	return nil
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *SessionActivityReviewRetriggerDropped) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["droppedAt"]; raw != nil && !ok {
+		return fmt.Errorf("field droppedAt in SessionActivityReviewRetriggerDropped: required")
+	}
+	if _, ok := raw["headSha"]; raw != nil && !ok {
+		return fmt.Errorf("field headSha in SessionActivityReviewRetriggerDropped: required")
+	}
+	if _, ok := raw["reason"]; raw != nil && !ok {
+		return fmt.Errorf("field reason in SessionActivityReviewRetriggerDropped: required")
+	}
+	type Plain SessionActivityReviewRetriggerDropped
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = SessionActivityReviewRetriggerDropped(plain)
 	return nil
 }
 
@@ -16469,36 +16563,6 @@ const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
 const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
 const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
 
-var enumValues_WorkflowStepRunStatus = []interface{}{
-	"awaiting_decision",
-	"running",
-	"completed",
-	"failed",
-	"cancelled",
-}
-
-// UnmarshalJSON implements json.Unmarshaler.
-func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
-	var v string
-	if err := json.Unmarshal(value, &v); err != nil {
-		return err
-	}
-	var ok bool
-	for _, expected := range enumValues_WorkflowStepRunStatus {
-		if reflect.DeepEqual(v, expected) {
-			ok = true
-			break
-		}
-	}
-	if !ok {
-		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_WorkflowStepRunStatus, v)
-	}
-	*j = WorkflowStepRunStatus(v)
-	return nil
-}
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
 // exists before any turn does.
@@ -16561,6 +16625,36 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
-
 type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
+
+var enumValues_WorkflowStepRunStatus = []interface{}{
+	"awaiting_decision",
+	"running",
+	"completed",
+	"failed",
+	"cancelled",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_WorkflowStepRunStatus {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_WorkflowStepRunStatus, v)
+	}
+	*j = WorkflowStepRunStatus(v)
+	return nil
+}
+
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict

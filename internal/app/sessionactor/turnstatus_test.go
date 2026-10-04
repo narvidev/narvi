@@ -98,10 +98,10 @@ func TestTurnStatusWritesGoThroughTheRecorder(t *testing.T) {
 	for _, f := range productionFiles(t) {
 		recorded += checkTurnStatusWrites(t, f)
 	}
-	// The nine writes the session actor makes (turnstatus.go lists them).
+	// The ten writes the session actor makes (turnstatus.go lists them).
 	// Fewer means the scan no longer sees them.
-	if recorded < 9 {
-		t.Fatalf("found %d turn status writes through turnWrites, want at least 9: the scan is broken", recorded)
+	if recorded < 10 {
+		t.Fatalf("found %d turn status writes through turnWrites, want at least 10: the scan is broken", recorded)
 	}
 }
 

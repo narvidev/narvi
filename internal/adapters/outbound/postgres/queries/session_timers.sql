@@ -16,9 +16,14 @@ RETURNING *;
 
 -- name: ArmSessionDispatchTimer :exec
 -- The session's dispatch timer (technical plan §2, §3.3), armed due at once
--- on the database's clock, in the transaction that creates a turn: the only
--- caller is TurnStore.CreateAndArmDispatch, which inserts the turn in the
--- same transaction. 'dispatch' is sessionactor.TimerDispatch; the kind is
+-- on the database's clock, in the transaction that creates a turn:
+-- TurnStore.CreateAndArmDispatch, which inserts the turn in the same
+-- transaction. The session actor re-arms it the same way, through
+-- TimerStore.ArmDispatch, when a dispatch evaluation leaves a pending turn
+-- for the next one (technical plan §24.9's context check: a pick its
+-- pre-read did not cover, or the queue behind an attempt it ended
+-- context_moved), so every arm of this timer is on one clock. 'dispatch' is
+-- sessionactor.TimerDispatch; the kind is
 -- named here rather than passed in, so no caller can arm another kind this
 -- way. A re-arm moves fires_at back to now even while the pump holds the
 -- row claimed, and stamps armed_at like every arm (UpsertSessionTimer).
@@ -102,6 +107,26 @@ WHERE st.session_id = sqlc.arg('session_id')
   AND st.fires_at - st.armed_at >= make_interval(secs => sqlc.arg('held_lead_seconds')::float8)
   AND s.id = st.session_id
   AND (s.stop_requested_at IS NULL OR st.created_at > s.stop_requested_at);
+
+-- name: RequeueReviewRetriggerDebounce :execrows
+-- Technical plan §24.9: the re-arm an automatic re-review whose attempt
+-- ended context_moved owes the lane, in the dispatching transaction
+-- (sessionactor's endContextMovedTurn): the debounce due at once on the
+-- database's clock, so its firing reviews the head the pull request has
+-- now -- the attempt's insert consumed the debounce, and a moved base or
+-- ancestor branch brings no push to arm another. Inserted only when the
+-- session has none: a push's quiet window still running keeps its
+-- trailing edge (§24.2), and a held debounce is moved to now by the
+-- wake-up the same transaction runs for the turn it ended
+-- (WakeReviewRetriggerDebounce). A new row's created_at is now, after any
+-- standing stop request, so the stop's rule leaves it: the attempt it
+-- stands for was itself created after that request, work the stop did not
+-- ask to drop. 'review_retrigger_debounce' is
+-- sessionactor.TimerReviewRetriggerDebounce, named here like the kind
+-- ArmSessionDispatchTimer names. 1 row inserted, or 0 when one was armed.
+INSERT INTO session_timers (session_id, name, fires_at)
+VALUES (sqlc.arg('session_id'), 'review_retrigger_debounce', now())
+ON CONFLICT (session_id, name) DO NOTHING;
 
 -- name: BackOffSessionDispatchTimer :execrows
 -- The session actor's backoff of its dispatch timer (sessionactor's
