@@ -881,7 +881,7 @@ func TestCheckoutPullRef_ReownsTheWorktreeOnEveryOutcomeAfterTheFetch(t *testing
 		ref         string
 		want        func(o *pullRefOrigin) string
 		pathScope   []string
-		prepare     func(t *testing.T, o *pullRefOrigin, layout gitdir.Layout, repo sessionconfig.SessionConfigReposElem, dir string)
+		prepare     func(t *testing.T, dir string)
 		wantOutcome gitclone.PullCheckoutOutcome
 		wantReowns  int
 	}{
@@ -894,7 +894,7 @@ func TestCheckoutPullRef_ReownsTheWorktreeOnEveryOutcomeAfterTheFetch(t *testing
 		{
 			name: "failed after the fetch", ref: testPullRef, want: func(o *pullRefOrigin) string { return o.s1 },
 			pathScope: []string{"/pr.txt"},
-			prepare: func(t *testing.T, o *pullRefOrigin, layout gitdir.Layout, repo sessionconfig.SessionConfigReposElem, dir string) {
+			prepare: func(t *testing.T, dir string) {
 				t.Helper()
 				// An edit to a file the scope leaves out: the scope's set
 				// will not remove a changed file, and says so.
@@ -913,7 +913,7 @@ func TestCheckoutPullRef_ReownsTheWorktreeOnEveryOutcomeAfterTheFetch(t *testing
 			o := newPullRefOrigin(t)
 			layout, repo, dir := clonedBase(t, o)
 			if tc.prepare != nil {
-				tc.prepare(t, o, layout, repo, dir)
+				tc.prepare(t, dir)
 			}
 			var reowned []string
 			chown := func(path string) error {
