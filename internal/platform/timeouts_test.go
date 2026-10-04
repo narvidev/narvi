@@ -2623,6 +2623,89 @@ func TestTimeouts_Validate_ActorLock(t *testing.T) {
 	}
 }
 
+// TestValidate_SlackInteractivityReplyTimeout pins the split of Slack's
+// interactivity ack window for a click on a plan's Approve or Reject button
+// (technical plan §8.1, §13.2): the shipped 800ms reply budget, the
+// decision's share being the window less it, so the two together fill the
+// window and never exceed it; a reply budget refused at zero or below; and
+// the identity fetch, the decision's first step, kept strictly inside the
+// decision's share, each broken link reported alone.
+func TestValidate_SlackInteractivityReplyTimeout(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	if got, want := to.SlackInteractivityReplyTimeout, 800*time.Millisecond; got != want {
+		t.Errorf("SlackInteractivityReplyTimeout = %v, want %v", got, want)
+	}
+	if got, want := to.SlackInteractivityDecisionTimeout(), 1700*time.Millisecond; got != want {
+		t.Errorf("SlackInteractivityDecisionTimeout() = %v, want %v", got, want)
+	}
+	if got := to.SlackInteractivityDecisionTimeout() + to.SlackInteractivityReplyTimeout; got != to.SlackInteractivityAckTimeout {
+		t.Errorf("decision share + reply budget = %v, want exactly SlackInteractivityAckTimeout = %v", got, to.SlackInteractivityAckTimeout)
+	}
+
+	const link = "SlackInteractivityAckTimeout - SlackInteractivityReplyTimeout > SlackInteractivityIdentityFetchTimeout"
+	for _, tc := range []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		chain  string // exactly one *TimeoutInvariantError with this Chain
+		field  string // or exactly one *TimeoutMustBePositiveError naming this field
+	}{
+		{name: "the shipped defaults hold", mutate: func(*platform.Timeouts) {}},
+		{name: "an identity fetch just inside the decision's share is accepted", mutate: func(to *platform.Timeouts) {
+			to.SlackInteractivityIdentityFetchTimeout = to.SlackInteractivityDecisionTimeout() - time.Millisecond
+		}},
+		{name: "an identity fetch as long as the decision's share", mutate: func(to *platform.Timeouts) {
+			to.SlackInteractivityIdentityFetchTimeout = to.SlackInteractivityDecisionTimeout()
+		}, chain: link},
+		{name: "a reply budget that leaves the identity fetch no room", mutate: func(to *platform.Timeouts) {
+			to.SlackInteractivityReplyTimeout = to.SlackInteractivityAckTimeout - to.SlackInteractivityIdentityFetchTimeout
+		}, chain: link},
+		{name: "a reply budget as long as the whole window", mutate: func(to *platform.Timeouts) {
+			to.SlackInteractivityReplyTimeout = to.SlackInteractivityAckTimeout
+		}, chain: link},
+		{name: "a window that leaves the identity fetch no room", mutate: func(to *platform.Timeouts) {
+			to.SlackInteractivityAckTimeout = to.SlackInteractivityReplyTimeout + to.SlackInteractivityIdentityFetchTimeout
+		}, chain: link},
+		{name: "a zero reply budget cancels every reply", mutate: func(to *platform.Timeouts) {
+			to.SlackInteractivityReplyTimeout = 0
+		}, field: "SlackInteractivityReplyTimeout"},
+		{name: "a negative reply budget", mutate: func(to *platform.Timeouts) {
+			to.SlackInteractivityReplyTimeout = -time.Millisecond
+		}, field: "SlackInteractivityReplyTimeout"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			if tc.chain == "" && tc.field == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			var errs []error
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				errs = joined.Unwrap()
+			} else if err != nil {
+				errs = []error{err}
+			}
+			if len(errs) != 1 {
+				t.Fatalf("Validate() reported %d errors, want exactly one (chain %q, field %q): %v", len(errs), tc.chain, tc.field, err)
+			}
+			var inv *platform.TimeoutInvariantError
+			var pos *platform.TimeoutMustBePositiveError
+			switch {
+			case tc.chain != "" && errors.As(errs[0], &inv) && inv.Chain == tc.chain:
+			case tc.field != "" && errors.As(errs[0], &pos) && pos.Field == tc.field:
+			default:
+				t.Fatalf("Validate() = %v, want only the broken link (chain %q, field %q)", err, tc.chain, tc.field)
+			}
+		})
+	}
+}
+
 // TestDefaultTimeouts_GitHubAppMintFinishesBeforeCredentialFetch pins the
 // order of two bounds on one request. The sandbox's credential helper
 // (internal/sandboxagent/credentials.CPClient) gives up on the control

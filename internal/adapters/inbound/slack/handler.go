@@ -975,8 +975,10 @@ func handleEvent(ctx context.Context, deps Deps, logger *slog.Logger, ev slackEv
 // performs"): this calls deps.authorizeSessionAction(..., authz.
 // ActionApprovePlan) -- the EXACT SAME method (identity.go), over the
 // EXACT SAME domain check (actorauthz.OwnedOrJoined +
-// actorauthz.AuthorizeResolvedActor), that InteractiveDeps.
-// authorizeSessionAction (interactive.go) renders for a button click --
+// actorauthz.AuthorizeResolvedActor, whose verdict form the button path's
+// copy reads, to tell a role it could not read from a refusal), that
+// InteractiveDeps.authorizeSessionAction (interactive.go) renders for a
+// button click --
 // both are thin, per-Deps-struct-type copies of the identical §13.3
 // verdict (see identity.go's own top doc comment for why this package
 // keeps them as two separate methods rather than one shared function:
