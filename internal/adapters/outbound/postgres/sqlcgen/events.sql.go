@@ -850,15 +850,21 @@ type ListTokenFramesInWindowParams struct {
 // sessions logged inside it: at most 45 buffers for a window of 40 frames
 // across the plan test's matrix (TestEventStore_ListTokenFramesInWindow_
 // ReadsTheTurnsWindow), where this read's text before that index took up
-// to 3,225. Three things in the text keep it there. The bounds and the order
-// are on id + 0, the expression that index holds, which neither
-// events_pkey nor events_session_id_id_idx can serve, so no plan reads the
-// window's id range across every session, or the session's whole log,
-// instead. The upper bound is a range even when upper_id is NULL (the
-// largest bigint stands in), so a generic plan seeks on it rather than
-// testing it on every frame above the window. And type = 'token' is the
-// index's predicate, byte for byte, so the planner proves the partial index
-// under a generic plan too.
+// to 3,225. Four things in the text keep it there. The bounds are on
+// id + 0, the expression that index holds, which neither events_pkey nor
+// events_session_id_id_idx can serve, so no plan reads the window's id
+// range across every session, or the session's whole log, instead. The
+// order is on the same expression, so a plan can read the index backward
+// and stop at row_limit: on a window of more frames than that, the generic
+// plan does, where an order on plain id makes a plan sort the whole window
+// first (TestEventStore_ListTokenFramesInWindow_GenericPlanStopsAtTheCap);
+// a custom plan, which knows the window's size, may still read the whole
+// window as a bitmap scan and sort it, a cost bounded by the window. The
+// upper bound is a range even when upper_id is NULL (the largest bigint
+// stands in), so a generic plan seeks on it rather than testing it on
+// every frame above the window. And type = 'token' is the index's
+// predicate, byte for byte, so the planner proves the partial index under
+// a generic plan too.
 func (q *Queries) ListTokenFramesInWindow(ctx context.Context, arg ListTokenFramesInWindowParams) ([]Event, error) {
 	rows, err := q.db.Query(ctx, listTokenFramesInWindow,
 		arg.SessionID,

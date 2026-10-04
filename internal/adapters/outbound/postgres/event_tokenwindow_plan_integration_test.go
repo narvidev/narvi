@@ -24,18 +24,21 @@ const (
 	// scan: its migration says why it is built as it is.
 	tokenWindowIndex = "events_token_window_idx"
 	// tokenWindowFrames is how many `token` frames each window of the long
-	// session holds: twenty text parts of two frames, as the pinned
-	// runtime stores a part.
+	// session holds unless its shape says otherwise: twenty text parts of
+	// two frames, as the pinned runtime stores a part.
 	tokenWindowFrames = 40
-	// tokenWindowSessionRows is how many rows of its own the long session
-	// logs in each window: its frames, and four tool events a frame --
+	// tokenWindowTools is how many tool events of its own the long session
+	// logs beside each frame of a window unless its shape says otherwise:
 	// step_start, tool_call, tool_result and step_finish, as a real turn
 	// stores them, each carrying 2 KB of tool output.
-	tokenWindowSessionRows = 5 * tokenWindowFrames
+	tokenWindowTools = 4
 	// tokenWindowIndexBuffers is what a read may read beyond one heap page a
-	// frame: a descent of events_token_window_idx and the leaf pages the
-	// window's entries span, up to five on these logs.
+	// frame and the leaf pages its entries span: a descent of
+	// events_token_window_idx, two or three pages on these logs.
 	tokenWindowIndexBuffers = 8
+	// tokenWindowRowLimit is the read's cap, planContentEventFetchLimit's
+	// value (sessionactor), which every read in this file passes.
+	tokenWindowRowLimit = 2000
 	// tokenWindowMaxRowsRemoved bounds the rows a read removes by a filter.
 	// A range scan of events_token_window_idx removes none: both bounds
 	// are index conditions. Reading the window's id range on events_pkey
@@ -44,9 +47,12 @@ const (
 	tokenWindowMaxRowsRemoved = 4
 )
 
-// tokenWindowMaxBuffers bounds what one read of a turn's window reads, the
-// whole statement's buffers: one heap page a frame of the window, at most,
-// and the few index pages tokenWindowIndexBuffers allows. It has no term
+// tokenWindowMaxBuffers bounds what one read of frames of a turn's window
+// reads, the whole statement's buffers: one heap page a frame, at most; the
+// leaf pages of events_token_window_idx the frames' entries span, about one
+// for a hundred entries at the half-full pages a session's own appends
+// leave, allowed one for fifty; and the few more pages
+// tokenWindowIndexBuffers allows. It has no term
 // for the session's other text, the window's other rows -- the session's
 // own tool events and every other session's events logged inside its id
 // range -- or the table, and never grows with any of them: whatever plan
@@ -58,8 +64,8 @@ const (
 // custom plan took that walk or events_pkey across the window's id range,
 // so what a read cost grew with the session's text or with what every
 // session logged during the turn: up to 3,225 buffers on this test's logs.
-func tokenWindowMaxBuffers(windowFrames int) float64 {
-	return float64(windowFrames + tokenWindowIndexBuffers)
+func tokenWindowMaxBuffers(frames int) float64 {
+	return float64(frames + frames/50 + tokenWindowIndexBuffers)
 }
 
 // tokenWindowAnalyze is when a log's statistics are last gathered.
@@ -77,10 +83,12 @@ const (
 )
 
 // tokenWindowShape is a log TestEventStore_ListTokenFramesInWindow_ReadsTheTurnsWindow
-// reads. Other sessions -- others of them -- log before events first; then
-// one long session logs below text frames of history, a turn whose window
-// holds tokenWindowSessionRows rows of its own among inWindow events of the
-// other sessions, above text frames of later turns, and a last turn like
+// and TestEventStore_ListTokenFramesInWindow_GenericPlanStopsAtTheCap read.
+// Other sessions -- others of them -- log before events first; then one
+// long session logs below text frames of history, a turn whose window holds
+// windowFrames frames and windowTools tool events beside each among
+// inWindow events of the other sessions, above text frames of later turns,
+// and a last turn like
 // the first; then the other sessions log after events more. Each history
 // frame sits beside a step event of the session's own, and one in five of
 // the other sessions' events is a `token` frame.
@@ -95,6 +103,26 @@ type tokenWindowShape struct {
 	below, inWindow, above int
 	after                  int
 	analyze                tokenWindowAnalyze
+	// frames and tools, when not zero, replace tokenWindowFrames and
+	// tokenWindowTools.
+	frames, tools int
+}
+
+// windowFrames is how many `token` frames each window of the shape holds.
+func (s tokenWindowShape) windowFrames() int {
+	if s.frames != 0 {
+		return s.frames
+	}
+	return tokenWindowFrames
+}
+
+// windowTools is how many tool events the long session logs beside each
+// frame of a window of the shape.
+func (s tokenWindowShape) windowTools() int {
+	if s.tools != 0 {
+		return s.tools
+	}
+	return tokenWindowTools
 }
 
 // tokenWindowRead is one read of a window of the long session: its bounds
@@ -164,18 +192,20 @@ func storeTokenWindowShape(ctx context.Context, t *testing.T, pool *pgxpool.Pool
 	// evenly among inWindow events of the other sessions, and returns its
 	// frames' ids, newest first.
 	storeWindow := func(what, prefix string) []int64 {
-		total := shape.inWindow + tokenWindowSessionRows
-		if total%tokenWindowSessionRows != 0 {
-			t.Fatalf("%d events do not interleave %d of the long session's evenly", total, tokenWindowSessionRows)
+		perFrame := 1 + shape.windowTools()
+		sessionRows := shape.windowFrames() * perFrame
+		total := shape.inWindow + sessionRows
+		if total%sessionRows != 0 {
+			t.Fatalf("%d events do not interleave %d of the long session's evenly", total, sessionRows)
 		}
-		every := total / tokenWindowSessionRows
+		every := total / sessionRows
 		exec(what, `INSERT INTO events (session_id, type, message_id, payload)
 			SELECT CASE WHEN g % $5::int = 0 THEN $6::uuid ELSE ($1::uuid[])[1 + g % cardinality($1::uuid[])] END,
-			       CASE WHEN g % $5::int = 0 AND (g / $5::int) % 5 = 0 THEN 'token'
+			       CASE WHEN g % $5::int = 0 AND (g / $5::int) % $7::int = 0 THEN 'token'
 			            WHEN g % $5::int = 0 THEN (ARRAY['step_start', 'tool_call', 'tool_result', 'step_finish'])[1 + (g / $5::int) % 4]
 			            ELSE (ARRAY['token', 'step_start', 'tool_call', 'tool_result', 'step_finish'])[1 + g % 5] END,
 			       $2::text || g,
-			       CASE WHEN g % $5::int = 0 AND (g / $5::int) % 5 = 0
+			       CASE WHEN g % $5::int = 0 AND (g / $5::int) % $7::int = 0
 			                THEN jsonb_build_object('type', 'token', 'messageId', $2::text || 'prt_' || (g / $5::int / 10), 'text', rpad($2::text || g, $3::int, 'x'))
 			            WHEN g % $5::int = 0
 			                THEN jsonb_build_object('type', 'tool_result', 'messageId', $2::text || 'msg_' || (g / $5::int / 5), 'callId', $2::text || 'call_' || g,
@@ -183,15 +213,15 @@ func storeTokenWindowShape(ctx context.Context, t *testing.T, pool *pgxpool.Pool
 			            WHEN g % 5 = 0
 			                THEN jsonb_build_object('type', 'token', 'messageId', $2::text || 'prt_o' || (g / 10), 'text', rpad($2::text || g, $3::int, 'x'))
 			            ELSE '{"type":"step_start"}'::jsonb END
-			FROM generate_series(1, $4::int) g`, others, prefix, textLen, total, every, long)
+			FROM generate_series(1, $4::int) g`, others, prefix, textLen, total, every, long, perFrame)
 		var ids []int64
 		if err := pool.QueryRow(ctx, `
 			SELECT array_agg(id ORDER BY id DESC) FROM events
 			WHERE session_id = $1 AND type = 'token' AND message_id LIKE $2::text || '%'`, long, prefix).Scan(&ids); err != nil {
 			t.Fatalf("read %s's frames: %v", what, err)
 		}
-		if len(ids) != tokenWindowFrames {
-			t.Fatalf("%s holds %d frames, want %d", what, len(ids), tokenWindowFrames)
+		if len(ids) != shape.windowFrames() {
+			t.Fatalf("%s holds %d frames, want %d", what, len(ids), shape.windowFrames())
 		}
 		return ids
 	}
@@ -286,11 +316,14 @@ func tokenWindowDatabases(ctx context.Context, t *testing.T) func(t *testing.T) 
 
 // tokenWindowReadPlan is how one read of a window ran: its scans -- of every
 // relation, bitmap index scans included -- the buffers the whole statement
-// read, and the rows its nodes removed by a filter or an index recheck.
+// read, the rows its nodes removed by a filter or an index recheck, the
+// rows its scans of events returned, and whether any node sorted.
 type tokenWindowReadPlan struct {
 	scans   []pagePlanScan
 	buffers float64
 	removed float64
+	read    float64
+	sorted  bool
 }
 
 // readTokenWindowPlan reads plan, EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON)
@@ -301,10 +334,13 @@ func readTokenWindowPlan(plan string) (tokenWindowReadPlan, error) {
 		return tokenWindowReadPlan{}, err
 	}
 	type node struct {
-		Loops   float64 `json:"Actual Loops"`
-		Filter  float64 `json:"Rows Removed by Filter"`
-		Recheck float64 `json:"Rows Removed by Index Recheck"`
-		Plans   []json.RawMessage
+		NodeType string  `json:"Node Type"`
+		Relation string  `json:"Relation Name"`
+		Rows     float64 `json:"Actual Rows"`
+		Loops    float64 `json:"Actual Loops"`
+		Filter   float64 `json:"Rows Removed by Filter"`
+		Recheck  float64 `json:"Rows Removed by Index Recheck"`
+		Plans    []json.RawMessage
 	}
 	var top []struct {
 		Plan json.RawMessage `json:"Plan"`
@@ -312,8 +348,9 @@ func readTokenWindowPlan(plan string) (tokenWindowReadPlan, error) {
 	if err := json.Unmarshal([]byte(plan), &top); err != nil {
 		return tokenWindowReadPlan{}, err
 	}
-	// EXPLAIN gives the rows a node removed per loop.
-	var removed float64
+	// EXPLAIN gives the rows a node returned or removed per loop.
+	var removed, read float64
+	sorted := false
 	var walk func(raw json.RawMessage) error
 	walk = func(raw json.RawMessage) error {
 		var n node
@@ -321,6 +358,10 @@ func readTokenWindowPlan(plan string) (tokenWindowReadPlan, error) {
 			return err
 		}
 		removed += (n.Filter + n.Recheck) * max(n.Loops, 1)
+		if n.Relation == "events" {
+			read += n.Rows * max(n.Loops, 1)
+		}
+		sorted = sorted || n.NodeType == "Sort" || n.NodeType == "Incremental Sort"
 		for _, child := range n.Plans {
 			if err := walk(child); err != nil {
 				return err
@@ -333,7 +374,7 @@ func readTokenWindowPlan(plan string) (tokenWindowReadPlan, error) {
 			return tokenWindowReadPlan{}, err
 		}
 	}
-	return tokenWindowReadPlan{scans: scans, buffers: buffers, removed: removed}, nil
+	return tokenWindowReadPlan{scans: scans, buffers: buffers, removed: removed, read: read, sorted: sorted}, nil
 }
 
 // scansTheWindowIndex reports whether scans read events through
@@ -432,7 +473,7 @@ func TestEventStore_ListTokenFramesInWindow_ReadsTheTurnsWindow(t *testing.T) {
 								t.Fatalf("set plan_cache_mode: %v", err)
 							}
 							for run := 0; run < 8; run++ {
-								frames, err := events.ListTokenFramesInWindow(ctx, long, read.lower, read.upper, 2000)
+								frames, err := events.ListTokenFramesInWindow(ctx, long, read.lower, read.upper, tokenWindowRowLimit)
 								if err != nil {
 									t.Fatalf("%s: ListTokenFramesInWindow: %v", cell, err)
 								}
@@ -448,7 +489,7 @@ func TestEventStore_ListTokenFramesInWindow_ReadsTheTurnsWindow(t *testing.T) {
 							if read.upper != nil {
 								upper = fmt.Sprint(*read.upper)
 							}
-							plan := explainPlan(ctx, t, pool, "ListTokenFramesInWindow", fmt.Sprintf("'%s'::uuid, %d, %s, 2000", long.String(), read.lower, upper))
+							plan := explainPlan(ctx, t, pool, "ListTokenFramesInWindow", fmt.Sprintf("'%s'::uuid, %d, %s, %d", long.String(), read.lower, upper, tokenWindowRowLimit))
 							problem, ran := tokenWindowReadProblem(plan, len(read.want))
 							t.Logf("cell | %s | %d | %s | %s | %s | %.0f | %.0f", shape.name, textLen, read.name, mode, scanShape(ran.scans), ran.buffers, ran.removed)
 							if problem != "" {
@@ -465,7 +506,115 @@ func TestEventStore_ListTokenFramesInWindow_ReadsTheTurnsWindow(t *testing.T) {
 	}
 }
 
-// TestTokenWindowReadProblem pins how the plan test above judges a read:
+// TestEventStore_ListTokenFramesInWindow_GenericPlanStopsAtTheCap pins what
+// the read's order on id + 0 buys, which the matrix above cannot see: its
+// windows hold 40 frames, and an ORDER BY on plain id, the bounds still on
+// id + 0, passed all its cells. Here each window holds 3,000 frames, more
+// than the read's cap of 2,000, with the session's text on both sides of the
+// first and other sessions' events inside both. Under the generic plan
+// pgx's statement cache settles on, the read must be one Index Scan of
+// events_token_window_idx with no sort above it, returning no more rows than
+// the cap: it reads the window backward from its upper bound and stops at
+// the cap. Ordered by plain id, which events_token_window_idx does not hold,
+// a plan sorts the whole window first, or reads the session's other rows
+// through an index that holds that order. A custom plan, which knows the
+// window's size, may still read the whole window as a bitmap scan and sort
+// it; that read is bounded by the window, as the matrix's are, and the test
+// holds it to that, its buffers counted for every frame of the window. Every
+// read logs one line, "cap | window | mode | scans | buffers | rows removed
+// | rows read | sorted".
+func TestEventStore_ListTokenFramesInWindow_GenericPlanStopsAtTheCap(t *testing.T) {
+	shape := tokenWindowShape{
+		name:   "windows of 3,000 frames over the cap",
+		others: 5_000, before: 20_000, below: 3_000, inWindow: 6_000, above: 3_000,
+		frames: 3_000, tools: 1,
+	}
+	ctx := context.Background()
+	pool := tokenWindowDatabases(ctx, t)(t)
+	long, reads := storeTokenWindowShape(ctx, t, pool, shape, 300)
+	events := narvipg.NewEventStore(pool)
+	for _, read := range reads {
+		want := read.want[:tokenWindowRowLimit]
+		for _, mode := range []string{"force_custom_plan", "force_generic_plan"} {
+			cell := fmt.Sprintf("%s, %s, %s", shape.name, read.name, mode)
+			if _, err := pool.Exec(ctx, "SET plan_cache_mode = "+mode); err != nil {
+				t.Fatalf("set plan_cache_mode: %v", err)
+			}
+			for run := 0; run < 8; run++ {
+				frames, err := events.ListTokenFramesInWindow(ctx, long, read.lower, read.upper, tokenWindowRowLimit)
+				if err != nil {
+					t.Fatalf("%s: ListTokenFramesInWindow: %v", cell, err)
+				}
+				got := make([]int64, len(frames))
+				for i, f := range frames {
+					got[i] = f.ID
+				}
+				if !slices.Equal(got, want) {
+					t.Fatalf("%s: run %d read %d frames, want the window's newest %d", cell, run, len(got), len(want))
+				}
+			}
+			upper := "NULL::bigint"
+			if read.upper != nil {
+				upper = fmt.Sprint(*read.upper)
+			}
+			plan := explainPlan(ctx, t, pool, "ListTokenFramesInWindow", fmt.Sprintf("'%s'::uuid, %d, %s, %d", long.String(), read.lower, upper, tokenWindowRowLimit))
+			// A generic plan's buffers are counted for the frames it returns, a
+			// custom plan's for every frame of the window.
+			frames := shape.windowFrames()
+			if mode == "force_generic_plan" {
+				frames = tokenWindowRowLimit
+			}
+			problem, ran := tokenWindowReadProblem(plan, frames)
+			t.Logf("cap | %s | %s | %s | %.0f | %.0f | %.0f | %v", read.name, mode, scanShape(ran.scans), ran.buffers, ran.removed, ran.read, ran.sorted)
+			if problem != "" {
+				t.Errorf("%s: the read %s", cell, problem)
+			}
+			if mode != "force_generic_plan" {
+				continue
+			}
+			if len(ran.scans) != 1 || ran.scans[0].Node != "Index Scan" || ran.sorted || ran.read > tokenWindowRowLimit {
+				t.Errorf("%s: the read is %s, sorted %v, reading %.0f rows of events; want one Index Scan of %s, no sort, at most the cap's %d rows -- it does not stop at the cap",
+					cell, scanShape(ran.scans), ran.sorted, ran.read, tokenWindowIndex, tokenWindowRowLimit)
+			}
+		}
+	}
+	if _, err := pool.Exec(ctx, `RESET plan_cache_mode`); err != nil {
+		t.Fatalf("reset plan_cache_mode: %v", err)
+	}
+}
+
+// TestReadTokenWindowPlan pins what the cap test reads from a plan: the
+// rows its scans of events returned, over every loop, and whether any node
+// sorted.
+func TestReadTokenWindowPlan(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		plan   string
+		read   float64
+		sorted bool
+	}{
+		{name: "a backward scan stopping at the cap", read: 2000, plan: `[{"Plan": {"Node Type": "Limit", "Actual Rows": 2000, "Actual Loops": 1, "Plans": [
+			{"Node Type": "Index Scan", "Relation Name": "events", "Index Name": "events_token_window_idx", "Actual Rows": 2000, "Actual Loops": 1}]}}]`},
+		{name: "a sort of the whole window", read: 3000, sorted: true, plan: `[{"Plan": {"Node Type": "Limit", "Actual Rows": 2000, "Actual Loops": 1, "Plans": [
+			{"Node Type": "Sort", "Actual Rows": 2000, "Actual Loops": 1, "Plans": [
+				{"Node Type": "Bitmap Heap Scan", "Relation Name": "events", "Actual Rows": 3000, "Actual Loops": 1, "Plans": [
+					{"Node Type": "Bitmap Index Scan", "Index Name": "events_token_window_idx", "Actual Rows": 3000, "Actual Loops": 1}]}]}]}}]`},
+		{name: "an incremental sort, rows over two loops", read: 400, sorted: true, plan: `[{"Plan": {"Node Type": "Incremental Sort", "Actual Rows": 400, "Actual Loops": 1, "Plans": [
+			{"Node Type": "Index Scan", "Relation Name": "events", "Index Name": "events_session_id_id_idx", "Actual Rows": 200, "Actual Loops": 2}]}}]`},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			ran, err := readTokenWindowPlan(tt.plan)
+			if err != nil {
+				t.Fatalf("readTokenWindowPlan: %v", err)
+			}
+			if ran.read != tt.read || ran.sorted != tt.sorted {
+				t.Errorf("readTokenWindowPlan = read %.0f, sorted %v; want read %.0f, sorted %v", ran.read, ran.sorted, tt.read, tt.sorted)
+			}
+		})
+	}
+}
+
+// TestTokenWindowReadProblem pins how the plan tests above judge a read:
 // an Index Scan of events_token_window_idx, or a bitmap scan of it, within
 // its buffers and rows removed passes; a read through another index, a
 // bitmap scan of another index or of more than one, or a read over either
