@@ -7,8 +7,13 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
+	"github.com/narvidev/narvi/internal/domain/turn"
 )
 
 // attemptReadersExempt are the sqlc queries that read is_review_attempt
@@ -191,6 +196,52 @@ func TestReviewContextOutcomeFor(t *testing.T) {
 			t.Parallel()
 			if got := reviewContextOutcomeFor(tc.reason); got != tc.want {
 				t.Errorf("reviewContextOutcomeFor(%q) = %s, want %s", tc.reason, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestLiveHeadCoveredByYoungerAttempt pins when a context_moved end asks
+// the automatic lane for nothing (technical plan §24.9): a younger pending
+// review attempt the automatic lane asked for already recorded the live
+// head. An older turn, one of another head, a person's attempt, a turn no
+// longer pending, or an empty live head covers nothing; a turn created in
+// the same instant is younger only when its id sorts after the target's,
+// the order the dispatch picks by.
+func TestLiveHeadCoveredByYoungerAttempt(t *testing.T) {
+	t.Parallel()
+
+	at := func(sec int) pgtype.Timestamptz {
+		return pgtype.Timestamptz{Time: time.Date(2026, 10, 4, 0, 0, sec, 0, time.UTC), Valid: true}
+	}
+	auto, label := turn.RequestTriggerAuto, "label"
+	live, other := "sha-live", "sha-other"
+	target := sqlcgen.Turn{ID: pgtype.UUID{Bytes: [16]byte{5}, Valid: true}, Status: sqlcgen.TurnStatusPending, CreatedAt: at(10), IsReviewAttempt: true, RequestTrigger: &auto}
+	attempt := func(id byte, created int, status sqlcgen.TurnStatus, trigger *string, head *string, review bool) sqlcgen.Turn {
+		return sqlcgen.Turn{ID: pgtype.UUID{Bytes: [16]byte{id}, Valid: true}, Status: status, CreatedAt: at(created), IsReviewAttempt: review, RequestTrigger: trigger, ReviewHeadSha: head}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		other    sqlcgen.Turn
+		liveHead string
+		want     bool
+	}{
+		{name: "a younger automatic attempt of the live head", other: attempt(9, 20, sqlcgen.TurnStatusPending, &auto, &live, true), liveHead: live, want: true},
+		{name: "one created in the same instant, its id after", other: attempt(9, 10, sqlcgen.TurnStatusPending, &auto, &live, true), liveHead: live, want: true},
+		{name: "one created in the same instant, its id before", other: attempt(1, 10, sqlcgen.TurnStatusPending, &auto, &live, true), liveHead: live},
+		{name: "an older one", other: attempt(9, 5, sqlcgen.TurnStatusPending, &auto, &live, true), liveHead: live},
+		{name: "a younger one of another head", other: attempt(9, 20, sqlcgen.TurnStatusPending, &auto, &other, true), liveHead: live},
+		{name: "a younger one already dispatched", other: attempt(9, 20, sqlcgen.TurnStatusProcessing, &auto, &live, true), liveHead: live},
+		{name: "a person's younger review request", other: attempt(9, 20, sqlcgen.TurnStatusPending, &label, &live, true), liveHead: live},
+		{name: "a younger turn that is no review attempt", other: attempt(9, 20, sqlcgen.TurnStatusPending, &auto, &live, false), liveHead: live},
+		{name: "no head recorded", other: attempt(9, 20, sqlcgen.TurnStatusPending, &auto, nil, true), liveHead: live},
+		{name: "no live head read", other: attempt(9, 20, sqlcgen.TurnStatusPending, &auto, &live, true), liveHead: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := liveHeadCoveredByYoungerAttempt([]sqlcgen.Turn{target, tc.other}, target, tc.liveHead); got != tc.want {
+				t.Errorf("liveHeadCoveredByYoungerAttempt = %v, want %v", got, tc.want)
 			}
 		})
 	}

@@ -47,7 +47,7 @@ func TestReviewAttemptToCheck_ReadsThePickTheDispatchMakes(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
 	turns := narvipg.NewTurnStore(pool)
-	auto := "auto"
+	auto, label := "auto", "label"
 
 	for _, tc := range []struct {
 		name string
@@ -120,6 +120,24 @@ func TestReviewAttemptToCheck_ReadsThePickTheDispatchMakes(t *testing.T) {
 				return insertTurnAt(ctx, t, pool, s, "pending", 30, nil, true, &auto)
 			},
 			wantQueued: true, wantAttempt: true,
+		},
+		{
+			// The walk is the automatic lane's alone: the check applies to
+			// nothing else, so nothing else pays for it.
+			name: "a person's review attempt is never read as queued",
+			seed: func(s pgtype.UUID) pgtype.UUID {
+				insertTurnAt(ctx, t, pool, s, "completed", 60, secs(5), false, nil)
+				return insertTurnAt(ctx, t, pool, s, "pending", 30, nil, true, &label)
+			},
+			sandbox: "ready", wantLive: true, wantAttempt: true,
+		},
+		{
+			name: "a review attempt with no trigger recorded is never read as queued",
+			seed: func(s pgtype.UUID) pgtype.UUID {
+				insertTurnAt(ctx, t, pool, s, "completed", 60, secs(5), false, nil)
+				return insertTurnAt(ctx, t, pool, s, "pending", 30, nil, true, nil)
+			},
+			sandbox: "ready", wantLive: true, wantAttempt: true,
 		},
 		{
 			name: "a turn that is no review attempt is never read as queued",

@@ -82,6 +82,17 @@ func (s *TimerStore) WakeReviewRetriggerDebounce(ctx context.Context, sessionID 
 	})
 }
 
+// ArmDispatch arms the session's dispatch timer due at the database's now,
+// or moves an armed one back to it (ArmSessionDispatchTimer, the statement
+// TurnStore.CreateAndArmDispatch arms it with), so a dispatch evaluation
+// that leaves a pending turn for the next evaluation arms the timer on the
+// same clock as every other arm of it: the session actor's context check
+// (technical plan §24.9). See ArmSessionDispatchTimer's doc comment in
+// queries/session_timers.sql.
+func (s *TimerStore) ArmDispatch(ctx context.Context, sessionID pgtype.UUID) error {
+	return s.q.ArmSessionDispatchTimer(ctx, sessionID)
+}
+
 // RequeueReviewRetriggerDebounce arms the session's re-review debounce due
 // at the database's now when the session has none, and reports the rows it
 // inserted: 0 when one is armed, which it leaves as it is. The re-request

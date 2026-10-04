@@ -87,11 +87,14 @@
 //
 // Every attempt this lane inserts is marked request_trigger 'auto'
 // (insertAutoRetriggerTurn). One that nonetheless waited behind another
-// turn -- inserted by a replica without the hold, or before it shipped --
-// checks its context as it is dispatched (reviewcontextcheck.go); one
-// whose pull request moved ends context_moved without running and asks
-// this lane again: its head pending once more, the debounce due at once,
-// a bounded number of times in a row.
+// turn -- a person's turn whose transaction began before this insert's
+// and committed after it sorts ahead of it, or the ending replica's clock
+// led the database's -- checks its context as it is dispatched
+// (reviewcontextcheck.go); one whose pull request moved ends context_moved
+// without running and asks this lane again: its head pending once more,
+// the debounce due at once, a bounded number of times in a row. An
+// attempt an older binary inserted carries no trigger and is never
+// checked.
 
 package sessionactor
 

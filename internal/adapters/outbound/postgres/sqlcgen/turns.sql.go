@@ -491,7 +491,7 @@ SELECT
     b.request_trigger,
     b.review_head_sha,
     b.review_verdict_context,
-    (b.is_review_attempt AND EXISTS (
+    (b.is_review_attempt AND COALESCE(b.request_trigger, '') = 'auto' AND EXISTS (
         SELECT 1 FROM turns o
         WHERE o.session_id = b.session_id
           AND (o.created_at < b.created_at OR (o.created_at = b.created_at AND o.id < b.id))
@@ -542,8 +542,15 @@ type GetReviewAttemptToCheckRow struct {
 // skew of this one's creation can read either way: read as queued, the
 // attempt is checked when it would not have been (a read of the code host
 // that may still find a moved context); read as not, it starts unchecked,
-// as every attempt did before this rule. Only a review attempt is asked,
-// so a session's other turns never cost the walk of its history.
+// as every attempt did before this rule. Only a review attempt the
+// automatic lane asked for (request_trigger 'auto') is asked: the one kind
+// the check applies to, so no other pick -- a person's review request, a
+// follow-up -- costs the walk. The walk reads the pick's session's earlier
+// turns through (session_id, dispatched_message_id) until it finds one
+// that keeps the pick queued: when none does, every one of them, about one
+// heap buffer per earlier turn on a session whose turns lie among other
+// sessions' (technical plan §24.9 gives the measure) -- the same turns
+// ListTurnsForSession reads in the evaluation that follows.
 //
 // sandbox_live: the session's sandbox is ready or suspect, the two states
 // planDispatch dispatches to: the actor reads the code host only then, so

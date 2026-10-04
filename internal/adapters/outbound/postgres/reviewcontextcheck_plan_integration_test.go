@@ -35,16 +35,29 @@ const contextWriteMaxBuffers = holdWakeMaxBuffers
 // nine seconds before the shape is stored, so before any turn stored after
 // it was created -- every fifth turn a
 // review attempt, some of those ended context_moved; and a long review
-// session whose last turn is longTail -- "processing", or "attempt", a
-// pending automatic review attempt nothing is in flight before: the
-// context check's pre-read then walks the session's own history to learn
-// whether it waited behind another turn.
+// session whose last turn is longTail:
+//
+//   - "processing", a turn in flight;
+//   - "attempt", a pending automatic review attempt that waited behind no
+//     turn -- every earlier turn of its session ended before it was
+//     created, so the context check's pre-read walks the whole of the
+//     session's history to learn it;
+//   - "queued", the same attempt created just before the session's last
+//     ended turn ended, so it waited behind that one turn: the pre-read
+//     walks until it finds it, which on a heap read in its physical order
+//     is the last.
+//
+// With interleave set, the long session's ended turns are stored one in
+// every interleave rows, the rest other sessions' turns stored in between
+// -- a session whose turns span months of a busy table, each on a heap
+// page of its own -- instead of one after another.
 type contextPlanShape struct {
 	name                        string
 	others, perOther, openEvery int
 	longEnded                   int
 	longTail                    string
 	longAfterAnalyze            bool
+	interleave                  int
 }
 
 // storeContextPlanShape stores shape in pool's database, migrated to 159,
@@ -114,14 +127,35 @@ func storeContextPlanShape(ctx context.Context, t *testing.T, pool *pgxpool.Pool
 		if err := pool.QueryRow(ctx, `INSERT INTO sessions (spawn_source, repos, spawn_depth) VALUES ('github', '[]'::jsonb, 0) RETURNING id`).Scan(&long); err != nil {
 			t.Fatalf("create the long session: %v", err)
 		}
-		turns("the long session's ended turns", long, shape.longEnded, `$1::uuid`)
+		if shape.interleave > 0 {
+			exec("the long session's ended turns, among others'", `
+				INSERT INTO turns (session_id, status, created_at, completed_at, is_review_attempt, review_head_sha, request_trigger, end_reason)
+				SELECT CASE WHEN g % $3::int = 0 THEN $1::uuid ELSE ($4::uuid[])[1 + g % cardinality($4::uuid[])] END,
+				       (ARRAY['completed', 'failed', 'cancelled'])[1 + (g / $3::int) % 3]::turn_status,
+				       now() - make_interval(secs => ($2::int * $3::int - g) / $3::int + 10),
+				       now() - make_interval(secs => ($2::int * $3::int - g) / $3::int + 9),
+				       (g / $3::int) % 5 = 0,
+				       CASE WHEN (g / $3::int) % 5 = 0 THEN 'sha-' || g END,
+				       CASE WHEN (g / $3::int) % 25 = 0 THEN 'auto' END,
+				       CASE WHEN (g / $3::int) % 175 = 0 THEN 'context_moved' END
+				FROM generate_series(1, $2::int * $3::int) g`, long, shape.longEnded, shape.interleave, others)
+		} else {
+			turns("the long session's ended turns", long, shape.longEnded, `$1::uuid`)
+		}
 		switch shape.longTail {
 		case "processing":
 			exec("the long session's processing turn", `INSERT INTO turns (session_id, status, dispatched_at) VALUES ($1, 'processing', now())`, long)
 		case "attempt":
-			exec("the long session's queued automatic attempt", `
+			exec("the long session's automatic attempt", `
 				INSERT INTO turns (session_id, status, is_review_attempt, review_head_sha, review_verdict_context, request_trigger)
 				VALUES ($1, 'pending', true, 'sha-queued', '{"baseRef":"main","baseSha":"b","policyVersion":1}', 'auto')`, long)
+		case "queued":
+			// Created half a second before the session's last ended turn
+			// ended, after that turn was created.
+			exec("the long session's queued automatic attempt", `
+				INSERT INTO turns (session_id, status, created_at, is_review_attempt, review_head_sha, review_verdict_context, request_trigger)
+				SELECT $1, 'pending', max(completed_at) - interval '0.5 seconds', true, 'sha-queued', '{"baseRef":"main","baseSha":"b","policyVersion":1}', 'auto'
+				FROM turns WHERE session_id = $1`, long)
 		}
 		exec("the long session's claim", `INSERT INTO github_pr_sessions (repo_full_name, pr_number, session_id, pending_retrigger_head_sha) VALUES ('acme/long', 1, $1, 'sha-pending')`, long)
 		exec("the long session's timers", `
@@ -136,19 +170,27 @@ func storeContextPlanShape(ctx context.Context, t *testing.T, pool *pgxpool.Pool
 		storeLong()
 	}
 
-	probes := []holdPlanProbe{{name: "the long session", sessionID: long, turns: shape.longEnded + boolInt(shape.longTail != ""), open: shape.longTail != ""}}
+	probes := []holdPlanProbe{{name: "the long session", sessionID: long, open: shape.longTail != ""}}
 	if shape.openEvery > 0 {
 		var open pgtype.UUID
 		if err := open.Scan(others[shape.openEvery-1]); err != nil {
 			t.Fatal(err)
 		}
-		probes = append(probes, holdPlanProbe{name: "a small session with an open turn", sessionID: open, turns: shape.perOther + 1, open: true})
+		probes = append(probes, holdPlanProbe{name: "a small session with an open turn", sessionID: open, open: true})
 	}
 	var closed pgtype.UUID
 	if err := closed.Scan(others[0]); err != nil {
 		t.Fatal(err)
 	}
-	return append(probes, holdPlanProbe{name: "a small session with none open", sessionID: closed, turns: shape.perOther})
+	probes = append(probes, holdPlanProbe{name: "a small session with none open", sessionID: closed})
+	// Each probe's own turns, counted: an interleaved shape gives the other
+	// sessions turns beyond perOther.
+	for i := range probes {
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM turns WHERE session_id = $1`, probes[i].sessionID).Scan(&probes[i].turns); err != nil {
+			t.Fatalf("count the turns of %s: %v", probes[i].name, err)
+		}
+	}
+	return probes
 }
 
 // generatedQuery returns the SQL sqlc generated for one query, read from
@@ -453,12 +495,23 @@ func TestReviewContextCheck_PlansReadTheSessionsOwnTurns(t *testing.T) {
 		{name: "5,000 sessions of 6 turns, every 20th open, beside a review session of 4,000 ended turns and one processing", others: 5_000, perOther: 6, openEvery: 20, longEnded: 4_000, longTail: "processing"},
 		{name: "300 sessions of 200 ended turns beside one of 20,000, none open", others: 300, perOther: 200, longEnded: 20_000},
 		{name: "the first, the review session stored after ANALYZE", others: 5_000, perOther: 6, openEvery: 20, longEnded: 4_000, longTail: "processing", longAfterAnalyze: true},
-		{name: "the first, the review session's last turn a queued automatic attempt", others: 5_000, perOther: 6, openEvery: 20, longEnded: 4_000, longTail: "attempt"},
+		{name: "the first, the review session's last turn an automatic attempt that waited behind no turn", others: 5_000, perOther: 6, openEvery: 20, longEnded: 4_000, longTail: "attempt"},
+		{name: "the first, the review session's 4,000 turns among 316,000 of the others', its last an automatic attempt that waited behind no turn", others: 5_000, perOther: 6, openEvery: 20, longEnded: 4_000, longTail: "attempt", interleave: 80},
+		{name: "the same, the attempt queued behind the session's last ended turn", others: 5_000, perOther: 6, openEvery: 20, longEnded: 4_000, longTail: "queued", interleave: 80},
 	} {
 		t.Run(shape.name, func(t *testing.T) {
 			ctx := context.Background()
 			pool, _ := holdPlanDatabase(ctx, t, holdPlanLatestVersion)
 			probes := storeContextPlanShape(ctx, t, pool, shape)
+			if shape.longTail == "attempt" || shape.longTail == "queued" {
+				pick, err := narvipg.NewTurnStore(pool).ReviewAttemptToCheck(ctx, probes[0].sessionID)
+				if err != nil {
+					t.Fatalf("the long session's pick: %v", err)
+				}
+				if want := shape.longTail == "queued"; pick.Queued != want {
+					t.Fatalf("the long session's attempt reads queued %v, want %v: the shape is not what it says", pick.Queued, want)
+				}
+			}
 			newest := map[pgtype.UUID]pgtype.UUID{}
 			claims := map[pgtype.UUID]struct {
 				repo string

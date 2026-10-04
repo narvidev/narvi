@@ -16,9 +16,14 @@ RETURNING *;
 
 -- name: ArmSessionDispatchTimer :exec
 -- The session's dispatch timer (technical plan §2, §3.3), armed due at once
--- on the database's clock, in the transaction that creates a turn: the only
--- caller is TurnStore.CreateAndArmDispatch, which inserts the turn in the
--- same transaction. 'dispatch' is sessionactor.TimerDispatch; the kind is
+-- on the database's clock, in the transaction that creates a turn:
+-- TurnStore.CreateAndArmDispatch, which inserts the turn in the same
+-- transaction. The session actor re-arms it the same way, through
+-- TimerStore.ArmDispatch, when a dispatch evaluation leaves a pending turn
+-- for the next one (technical plan §24.9's context check: a pick its
+-- pre-read did not cover, or the queue behind an attempt it ended
+-- context_moved), so every arm of this timer is on one clock. 'dispatch' is
+-- sessionactor.TimerDispatch; the kind is
 -- named here rather than passed in, so no caller can arm another kind this
 -- way. A re-arm moves fires_at back to now even while the pump holds the
 -- row claimed, and stamps armed_at like every arm (UpsertSessionTimer).

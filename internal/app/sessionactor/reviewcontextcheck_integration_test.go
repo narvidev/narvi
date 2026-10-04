@@ -20,6 +20,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/review"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
@@ -57,13 +58,24 @@ type fakeReviewLiveReader struct {
 	branches  map[string]string
 	branchErr error
 	ancestors map[string]bool // "ancestor..descendant"
-	calls     int
+	// cutShort makes GetOpenPR answer as a composite read the deadline cut
+	// partway does: it waits for its context to end, then answers no error
+	// and a pull request whose later reads were left blank.
+	cutShort bool
+	calls    int
 }
 
-func (f *fakeReviewLiveReader) GetOpenPR(_ context.Context, _, _ string, _ int, _ string) (ports.OpenPR, bool, error) {
+func (f *fakeReviewLiveReader) GetOpenPR(ctx context.Context, _, _ string, _ int, _ string) (ports.OpenPR, bool, error) {
+	f.mu.Lock()
+	f.calls++
+	cutShort := f.cutShort
+	f.mu.Unlock()
+	if cutShort {
+		<-ctx.Done()
+		return ports.OpenPR{Owner: f.pr.Owner, Repo: f.pr.Repo, Number: f.pr.Number}, true, nil
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.calls++
 	if f.prErr != nil {
 		return ports.OpenPR{}, false, f.prErr
 	}
@@ -210,13 +222,23 @@ func seedRunningTurn(ctx context.Context, t *testing.T, f *holdFixture) sqlcgen.
 
 // seedAttempt creates a pending review attempt of ctxRecordedHead with
 // recorded as its context, asked for by trigger (nil: no trigger
-// recorded), created ten seconds ago -- inserted the way a replica without
-// the hold inserts one behind an open turn.
+// recorded), created ten seconds ago, queued behind whatever turn is open.
+// With autoTrigger it is an attempt this release's automatic lane inserted
+// that still ended up queued -- a person's turn whose transaction began
+// before the lane's insert and committed after it sorts ahead of it, or
+// the ending replica's clock leads the database's (technical plan §24.9);
+// with no trigger, one an older binary inserted, which is never checked.
 func seedAttempt(ctx context.Context, t *testing.T, f *holdFixture, trigger *string, recorded []byte) sqlcgen.Turn {
 	t.Helper()
+	return seedAttemptOf(ctx, t, f, trigger, recorded, ctxRecordedHead, 10)
+}
+
+// seedAttemptOf is seedAttempt for an attempt of head, created secsAgo
+// seconds ago.
+func seedAttemptOf(ctx context.Context, t *testing.T, f *holdFixture, trigger *string, recorded []byte, head string, secsAgo int) sqlcgen.Turn {
+	t.Helper()
 	// The prompt names the head it was built for, so a send of it shows.
-	prompt := autoRetriggerPromptText + " Head: " + ctxRecordedHead
-	head := ctxRecordedHead
+	prompt := autoRetriggerPromptText + " Head: " + head
 	created, err := f.turns.Create(ctx, sqlcgen.CreateTurnParams{
 		SessionID: f.sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &prompt,
 		ReviewHeadSha: &head, ReviewVerdictContext: recorded,
@@ -225,7 +247,7 @@ func seedAttempt(ctx context.Context, t *testing.T, f *holdFixture, trigger *str
 	if err != nil {
 		t.Fatalf("create the review attempt: %v", err)
 	}
-	backdate(ctx, t, f, created.ID, 10)
+	backdate(ctx, t, f, created.ID, secsAgo)
 	return created
 }
 
@@ -552,8 +574,18 @@ func TestReviewContext_AnUnreadableContextStartsTheTurnUnconfirmed(t *testing.T)
 		recorded []byte
 		live     func(r *fakeReviewLiveReader)
 		noReader bool
+		timeouts func(*platform.Timeouts)
 	}{
 		{name: "the pull request's read fails", live: func(r *fakeReviewLiveReader) { r.prErr = errors.New("502 bad gateway") }},
+		{
+			// A deadline that cut the composite read partway answers no
+			// error and a blank head: never a fact, so never a move.
+			name: "the pull request's read runs out of time partway",
+			live: func(r *fakeReviewLiveReader) { r.cutShort = true },
+			timeouts: func(to *platform.Timeouts) {
+				to.GitHubGetOpenPRTimeout = 50 * time.Millisecond
+			},
+		},
 		{name: "the base branch's read fails", live: func(r *fakeReviewLiveReader) { r.branchErr = errors.New("502 bad gateway") }},
 		{name: "the pull request is no longer open", live: func(r *fakeReviewLiveReader) { r.notFound = true }},
 		{name: "no live reader is configured", noReader: true},
@@ -580,7 +612,11 @@ func TestReviewContext_AnUnreadableContextStartsTheTurnUnconfirmed(t *testing.T)
 					tc.live(reader)
 				}
 			}
-			rig := newContextRig(ctx, t, pool, f.sessionID, reader)
+			to := platform.DefaultTimeouts()
+			if tc.timeouts != nil {
+				tc.timeouts(&to)
+			}
+			rig := newContextRig(ctx, t, pool, f.sessionID, reader, to)
 
 			endRunningTurn(ctx, t, f, rig)
 			got := waitForAttempt(ctx, t, f, attempt.ID)
@@ -815,18 +851,31 @@ func TestReviewContext_TheDispatchHoldsAnAttemptItsReadDidNotCover(t *testing.T)
 			if err != nil || got.Status != sqlcgen.TurnStatusPending || got.EndReason != nil {
 				t.Fatalf("attempt: %s %v (err %v), want still pending", got.Status, got.EndReason, err)
 			}
-			row, ok := dispatchTimer(ctx, t, pool, f.sessionID)
-			if !ok {
-				t.Fatal("no dispatch timer: the held attempt has no trigger left")
-			}
-			var due bool
-			if err := pool.QueryRow(ctx, `SELECT $1::timestamptz <= now()`, row.FiresAt).Scan(&due); err != nil || !due {
-				t.Fatalf("dispatch timer due %v (err %v), want due at once", due, err)
-			}
+			assertDispatchArmedOnTheDatabaseClock(ctx, t, pool, f.sessionID, "the held attempt")
 		})
 	}
 	if got := sentPrompts(t, rig.commander); got != 0 {
 		t.Fatalf("prompts sent = %d, want 0", got)
+	}
+}
+
+// assertDispatchArmedOnTheDatabaseClock fails unless sessionID's dispatch
+// timer is armed, due at once on the database's clock, and was armed on
+// that clock -- fires_at and armed_at one now(), as every arm of the timer
+// sets them (TimerStore.ArmDispatch); an arm from this process's clock sets
+// fires_at apart from armed_at by the skew between the two.
+func assertDispatchArmedOnTheDatabaseClock(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, what string) {
+	t.Helper()
+	row, ok := dispatchTimer(ctx, t, pool, sessionID)
+	if !ok {
+		t.Fatalf("no dispatch timer: %s has no trigger left", what)
+	}
+	var due bool
+	if err := pool.QueryRow(ctx, `SELECT $1::timestamptz <= now()`, row.FiresAt).Scan(&due); err != nil || !due {
+		t.Fatalf("dispatch timer due %v (err %v), want due at once", due, err)
+	}
+	if !row.FiresAt.Time.Equal(row.ArmedAt.Time) {
+		t.Fatalf("dispatch timer fires %v, armed %v: want both the database's now, one clock for every arm", row.FiresAt.Time, row.ArmedAt.Time)
 	}
 }
 
@@ -939,5 +988,183 @@ func TestReviewContext_AStopFlaggedAttemptIsCancelledNotChecked(t *testing.T) {
 	}
 	if _, err := f.timers.Get(ctx, sqlcgen.GetSessionTimerParams{SessionID: f.sessionID, Name: TimerReviewRetriggerDebounce}); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("debounce after the stop: err %v, want none", err)
+	}
+}
+
+// TestReviewContext_AYoungerAttemptOfTheLiveHeadStandsForTheReRequest: an
+// automatic attempt whose context moved asks the lane for nothing when a
+// younger automatic attempt already queued behind it recorded the head
+// the pull request has now (technical plan §24.9). That attempt is checked
+// next, found fresh and started; once it ends -- with no live verdict, as
+// on a repository still in shadow mode -- no third review of the same head
+// runs, and the budget spends no slot more.
+func TestReviewContext_AYoungerAttemptOfTheLiveHeadStandsForTheReRequest(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newContextFixture(ctx, t, pool, "acme/context-younger", 710)
+	if _, err := pool.Exec(ctx, `UPDATE github_pr_sessions SET auto_retrigger_count = 2 WHERE session_id = $1`, f.sessionID); err != nil {
+		t.Fatal(err)
+	}
+	seedRunningTurn(ctx, t, f)
+	older := seedAttemptOf(ctx, t, f, autoTrigger(), recordedContext(t, defaultRecordedContext()), ctxRecordedHead, 10)
+	younger := seedAttemptOf(ctx, t, f, autoTrigger(), recordedContext(t, defaultRecordedContext()), ctxMovedHead, 5)
+	reader := unmovedLiveReader(f.repoFullName, f.prNumber)
+	reader.pr.HeadSHA = ctxMovedHead
+	rig := newContextRig(ctx, t, pool, f.sessionID, reader)
+
+	endRunningTurn(ctx, t, f, rig)
+	assertContextMoved(ctx, t, f, rig, older)
+	started := waitForAttempt(ctx, t, f, younger.ID)
+	if started.Status != sqlcgen.TurnStatusProcessing || started.EndReason != nil || started.ContextUnconfirmedAt.Valid {
+		t.Fatalf("younger attempt: status %s end reason %v unconfirmed %v; want it started, fresh", started.Status, started.EndReason, started.ContextUnconfirmedAt.Valid)
+	}
+	row := f.prSession(ctx, t)
+	if row.PendingRetriggerHeadSha != nil || row.AutoRetriggerContextMoves != 0 || row.AutoRetriggerCount != 2 {
+		t.Fatalf("pull request after the move: pending %v moves %d count %d; want nothing asked again, no move, the count kept", row.PendingRetriggerHeadSha, row.AutoRetriggerContextMoves, row.AutoRetriggerCount)
+	}
+	if _, _, _, ok := f.debounce(ctx, t); ok {
+		t.Fatal("a debounce was armed beside the younger attempt of the live head")
+	}
+
+	// The younger attempt ends with no live verdict.
+	executionCompleteEnding(sandboxws.ExecutionCompleteOutcomeCompleted)(ctx, t, f, rig)
+	waitForTurnStatus(ctx, t, f.turns, younger.ID, sqlcgen.TurnStatusCompleted)
+	for range 3 {
+		if err := rig.registry.PumpOnce(ctx); err != nil {
+			t.Fatalf("PumpOnce: %v", err)
+		}
+	}
+	time.Sleep(100 * time.Millisecond)
+	if n := countRows(ctx, t, pool, `SELECT count(*) FROM turns WHERE session_id = $1 AND is_review_attempt AND review_head_sha = $2 AND end_reason IS NULL`, f.sessionID, ctxMovedHead); n != 1 {
+		t.Fatalf("review attempts of %s = %d, want the younger one alone", ctxMovedHead, n)
+	}
+	if row := f.prSession(ctx, t); row.AutoRetriggerCount != 2 || row.PendingRetriggerHeadSha != nil {
+		t.Fatalf("after the younger attempt ended: count %d pending %v; want 2 and nothing pending", row.AutoRetriggerCount, row.PendingRetriggerHeadSha)
+	}
+}
+
+// TestReviewContext_TheDropClearsWhatAPushLeft: past the bound, the move
+// drops the automatic request whatever a push left meanwhile (technical
+// plan §24.9): the pending head the push wrote -- which is not the head
+// the dispatch read live -- is cleared and recorded as the head given up
+// on, and the debounce goes, a push's quiet window still running or one
+// the hold re-armed, so nothing reads as scheduled beside the drop.
+func TestReviewContext_TheDropClearsWhatAPushLeft(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	bound := platform.DefaultTimeouts().ReviewContextMoveMaxConsecutive
+	window := platform.DefaultTimeouts().ReviewRetriggerDebounce
+
+	for i, tc := range []struct {
+		name string
+		head string
+		arm  func(t *testing.T, f *holdFixture)
+	}{
+		{name: "a push's quiet window still running", head: "sha-push-in-window", arm: func(t *testing.T, f *holdFixture) {
+			f.armDebounce(ctx, t, time.Now().Add(window))
+		}},
+		{name: "a debounce the hold re-armed", head: "sha-push-held", arm: func(t *testing.T, f *holdFixture) {
+			f.armHeldDebounce(ctx, t)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newContextFixture(ctx, t, pool, fmt.Sprintf("acme/context-drop-%d", i), int32(720+i))
+			if _, err := pool.Exec(ctx, `UPDATE github_pr_sessions SET auto_retrigger_context_moves = $2 WHERE session_id = $1`, f.sessionID, bound); err != nil {
+				t.Fatal(err)
+			}
+			seedRunningTurn(ctx, t, f)
+			attempt := seedAttempt(ctx, t, f, autoTrigger(), recordedContext(t, defaultRecordedContext()))
+			reader := unmovedLiveReader(f.repoFullName, f.prNumber)
+			reader.pr.HeadSHA = ctxMovedHead
+			rig := newContextRig(ctx, t, pool, f.sessionID, reader)
+
+			endRunningTurn(ctx, t, f, rig, func() {
+				if _, err := f.prSessions.UpsertPendingRetriggerHeadSHA(ctx, f.repoFullName, f.prNumber, tc.head); err != nil {
+					t.Fatal(err)
+				}
+				tc.arm(t, f)
+			})
+			assertContextMoved(ctx, t, f, rig, attempt)
+
+			row := f.prSession(ctx, t)
+			_, _, _, armed := f.debounce(ctx, t)
+			if row.PendingRetriggerHeadSha != nil || armed {
+				t.Fatalf("past the bound: pending %v, debounce armed %v; want both gone", row.PendingRetriggerHeadSha, armed)
+			}
+			if !row.AutoRetriggerDroppedAt.Valid || row.AutoRetriggerDroppedHeadSha == nil || *row.AutoRetriggerDroppedHeadSha != tc.head {
+				t.Fatalf("drop: at %v on %v; want it recorded on the pushed head %s", row.AutoRetriggerDroppedAt.Valid, row.AutoRetriggerDroppedHeadSha, tc.head)
+			}
+			facts, err := narvipg.NewSessionStore(pool).ActivityFacts(ctx, f.sessionID, ReviewAutoRetriggerBudget)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, name := range facts.ArmedTimerNames {
+				if name == TimerReviewRetriggerDebounce {
+					t.Fatal("the status still reads the debounce as armed beside the drop")
+				}
+			}
+			if !facts.ReviewRetriggerDroppedAt.Valid || facts.ReviewRetriggerDroppedHeadSha != tc.head {
+				t.Fatalf("status facts: dropped %v on %q; want the drop on %s", facts.ReviewRetriggerDroppedAt.Valid, facts.ReviewRetriggerDroppedHeadSha, tc.head)
+			}
+		})
+	}
+}
+
+// TestReviewContext_AMovedEndLeavesTheQueueATrigger: the evaluation that
+// ends an attempt context_moved commits with the dispatch timer armed due
+// at once, on the database's clock, the durable trigger of the turns
+// queued behind it (technical plan §24.9) -- so a replica that dies before
+// its next evaluation leaves them to the pump, never stranded.
+func TestReviewContext_AMovedEndLeavesTheQueueATrigger(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newContextFixture(ctx, t, pool, "acme/context-trigger", 730)
+	attempt := seedAttempt(ctx, t, f, autoTrigger(), recordedContext(t, defaultRecordedContext()))
+	behind := createPendingTurn(ctx, t, f.turns, f.sessionID, "@narvi-bot and this one?")
+	rig := newContextRig(ctx, t, pool, f.sessionID, unmovedLiveReader(f.repoFullName, f.prNumber))
+
+	// Driven directly, like the hold test: the actor has no command in
+	// flight, and the evaluation the handler would run next is not run.
+	spawn, dispatch, _, repick, err := rig.actor.planDispatch(ctx, &reviewContextCheck{
+		turnID: attempt.ID, outcome: reviewContextMoved, reason: string(autoapproval.ReasonStaleVerdict), liveHeadSHA: ctxMovedHead,
+	})
+	if err != nil {
+		t.Fatalf("planDispatch: %v", err)
+	}
+	if spawn != nil || dispatch != nil || !repick {
+		t.Fatalf("planDispatch = spawn %v dispatch %v repick %v, want only a repick", spawn != nil, dispatch != nil, repick)
+	}
+	if got, err := f.turns.Get(ctx, attempt.ID); err != nil || got.EndReason == nil || *got.EndReason != turn.EndReasonContextMoved {
+		t.Fatalf("attempt end reason %v (err %v), want context_moved", got.EndReason, err)
+	}
+	if got, err := f.turns.Get(ctx, behind.ID); err != nil || got.Status != sqlcgen.TurnStatusPending {
+		t.Fatalf("the turn behind it: %s (err %v), want still pending", got.Status, err)
+	}
+	assertDispatchArmedOnTheDatabaseClock(ctx, t, pool, f.sessionID, "the turn behind the moved attempt")
+}
+
+// TestReviewContext_TheTurnQueuedBehindAMovedAttemptStartsAtOnce: once an
+// attempt ends context_moved, the turn queued behind it is evaluated in
+// the same handling, with a read of its own, and started -- not left to
+// the pump's next delivery of the dispatch timer (technical plan §24.9).
+func TestReviewContext_TheTurnQueuedBehindAMovedAttemptStartsAtOnce(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newContextFixture(ctx, t, pool, "acme/context-repick", 740)
+	seedRunningTurn(ctx, t, f)
+	attempt := seedAttempt(ctx, t, f, autoTrigger(), recordedContext(t, defaultRecordedContext()))
+	behind := createPendingTurn(ctx, t, f.turns, f.sessionID, "@narvi-bot and this one?")
+	backdate(ctx, t, f, behind.ID, 5)
+	reader := unmovedLiveReader(f.repoFullName, f.prNumber)
+	reader.pr.HeadSHA = ctxMovedHead
+	rig := newContextRig(ctx, t, pool, f.sessionID, reader)
+
+	endRunningTurn(ctx, t, f, rig)
+	assertContextMoved(ctx, t, f, rig, attempt)
+	// No pump runs here: only the handling that ended the attempt can
+	// start the turn behind it.
+	waitForTurnStatus(ctx, t, f.turns, behind.ID, sqlcgen.TurnStatusProcessing)
+	if got := sentPrompts(t, rig.commander); got != 1 {
+		t.Fatalf("prompts sent = %d, want the turn behind the moved attempt's", got)
 	}
 }

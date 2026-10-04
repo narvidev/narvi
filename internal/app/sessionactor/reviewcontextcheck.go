@@ -39,7 +39,9 @@
 //     push left one, the debounce due at once if none is armed (its
 //     insert consumed it, and a moved base brings no push) -- and the
 //     count grows by one; past ReviewContextMoveMaxConsecutive the request
-//     is dropped instead, and the session's status shows the drop;
+//     is dropped instead, and the session's status shows the drop. When a
+//     younger automatic attempt already queued recorded the live head, it
+//     stands for the request, and nothing is asked again;
 //   - unconfirmed: a fact could not be read, or is unknown on either side.
 //     The attempt starts, as every attempt did before this rule, and its
 //     turn records that its context was unconfirmed at start; the
@@ -334,7 +336,7 @@ func (a *Actor) applyReviewContextCheck(ctx context.Context, tx pgx.Tx, turns []
 	if check == nil || check.turnID != target.ID || check.outcome == reviewContextUnread {
 		a.logger.Info("sessionactor: review context check: the automatic review attempt to dispatch was not read before this evaluation; holding it for the next one",
 			"turn_id", target.ID.String())
-		if err := a.armTimer(ctx, tx, TimerDispatch, now); err != nil {
+		if err := a.armDispatchNow(ctx, tx); err != nil {
 			return 0, err
 		}
 		return reviewContextHold, nil
@@ -381,7 +383,9 @@ const contextMovedReasonPrefix = "review context moved before the review started
 //   - the automatic request back to the lane: the pull request's pending
 //     head set to the live head unless a push left one, the count of
 //     moves in a row grown by one, and the debounce armed due at once if
-//     the session has none (a held one is woken by this very end). A move
+//     the session has none (a held one is woken by this very end) -- unless
+//     a younger automatic attempt already queued recorded the live head,
+//     which then stands for the request (requeueAutoRetrigger). A move
 //     that takes the count past ReviewContextMoveMaxConsecutive drops the
 //     request instead: the pending head cleared and the drop recorded for
 //     the session's status, the debounce deleted. The budget slot the
@@ -424,10 +428,22 @@ func (a *Actor) endContextMovedTurn(ctx context.Context, tx pgx.Tx, turns []sqlc
 	a.logger.Info("sessionactor: review context check: a queued automatic review attempt's context moved; it ends without running and the re-review asks again",
 		"turn_id", target.ID.String(), "reason", check.reason, "live_head_sha", check.liveHeadSHA)
 
-	if err := a.requeueAutoRetrigger(ctx, tx, target, check); err != nil {
+	if err := a.requeueAutoRetrigger(ctx, tx, turns, target, check); err != nil {
 		return err
 	}
-	return a.armTimer(ctx, tx, TimerDispatch, now)
+	return a.armDispatchNow(ctx, tx)
+}
+
+// armDispatchNow arms the session's dispatch timer due at the database's
+// now, in tx -- the statement the transaction that creates a turn arms it
+// with (TimerStore.ArmDispatch), so every arm of this timer reads one
+// clock, and a pump that compares fires_at with the database's now finds it
+// due at once whatever this replica's clock says.
+func (a *Actor) armDispatchNow(ctx context.Context, tx pgx.Tx) error {
+	if err := a.stores.timer.WithTx(tx).ArmDispatch(ctx, a.sessionID); err != nil {
+		return fmt.Errorf("sessionactor: arm the dispatch timer: %w", err)
+	}
+	return nil
 }
 
 // requeueAutoRetrigger is endContextMovedTurn's re-request of the
@@ -436,7 +452,23 @@ func (a *Actor) endContextMovedTurn(ctx context.Context, tx pgx.Tx, turns []sqlc
 // has none -- or, past ReviewContextMoveMaxConsecutive, the drop. A review
 // session with no pull request claim has no lane to go back to, and the
 // turn's end alone stands.
-func (a *Actor) requeueAutoRetrigger(ctx context.Context, tx pgx.Tx, target sqlcgen.Turn, check *reviewContextCheck) error {
+//
+// Nothing is re-requested when a younger automatic attempt already queued
+// in the session recorded the head the pull request has now
+// (liveHeadCoveredByYoungerAttempt): the evaluation that follows picks it
+// next and checks it like this one, so it is the review of that head. A
+// re-request beside it would leave a pending head and a debounce that,
+// once it runs, review the same head again -- the heads comparison only
+// sees a posted live verdict, which a shadow repository or an attempt left
+// not assessed never leaves -- and spend another slot of the budget. The
+// move is not counted either: the request is not asked again, and the
+// younger attempt's own check counts or resets it.
+func (a *Actor) requeueAutoRetrigger(ctx context.Context, tx pgx.Tx, turns []sqlcgen.Turn, target sqlcgen.Turn, check *reviewContextCheck) error {
+	if liveHeadCoveredByYoungerAttempt(turns, target, check.liveHeadSHA) {
+		a.logger.Info("sessionactor: review context check: a younger automatic review attempt already queued is of the live head; nothing asked again",
+			"turn_id", target.ID.String(), "live_head_sha", check.liveHeadSHA)
+		return nil
+	}
 	prSessions := a.stores.githubPRSession.WithTx(tx)
 	prSession, err := prSessions.GetBySessionID(ctx, a.sessionID)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -475,4 +507,38 @@ func (a *Actor) requeueAutoRetrigger(ctx context.Context, tx pgx.Tx, target sqlc
 		return fmt.Errorf("sessionactor: re-arm the re-review debounce: %w", err)
 	}
 	return nil
+}
+
+// liveHeadCoveredByYoungerAttempt reports whether turns -- the session's,
+// as planDispatch read them -- hold a pending review attempt the automatic
+// lane asked for, created after target, that recorded liveHead: a review
+// of the head the pull request has now is already queued behind target,
+// and is checked in its turn. An empty liveHead covers nothing.
+func liveHeadCoveredByYoungerAttempt(turns []sqlcgen.Turn, target sqlcgen.Turn, liveHead string) bool {
+	if liveHead == "" {
+		return false
+	}
+	for _, t := range turns {
+		if t.ID == target.ID || turn.State(t.Status) != turn.StatePending ||
+			!turn.ContextCheckedAtDispatch(t.IsReviewAttempt, t.RequestTrigger) ||
+			t.ReviewHeadSha == nil || *t.ReviewHeadSha != liveHead {
+			continue
+		}
+		if t.CreatedAt.Time.After(target.CreatedAt.Time) ||
+			(t.CreatedAt.Time.Equal(target.CreatedAt.Time) && bytesAfter(t.ID.Bytes, target.ID.Bytes)) {
+			return true
+		}
+	}
+	return false
+}
+
+// bytesAfter orders two ids the way Postgres orders uuids, byte by byte:
+// the tie-break ListTurnsForSession and GetReviewAttemptToCheck read.
+func bytesAfter(a, b [16]byte) bool {
+	for i := range a {
+		if a[i] != b[i] {
+			return a[i] > b[i]
+		}
+	}
+	return false
 }

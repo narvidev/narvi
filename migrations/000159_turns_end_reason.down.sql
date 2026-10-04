@@ -3,9 +3,9 @@
 -- the automatic re-review asked for, and every pull request's count of
 -- moves and record of a drop. A binary without 000159 reads none of them,
 -- and reads a context_moved turn as the failed turn its status is; a binary
--- with it that runs 000159 again reads every earlier turn as an attempt
--- that ended for its own reason, and every pull request at no move and no
--- drop.
+-- with it that runs 000159 again reads every earlier turn as having no
+-- end reason -- counted as the attempt or turn it was -- and no trigger,
+-- and every pull request at no move and no drop.
 --
 -- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
 -- 000159. Do not run it against live pods of a binary that carries 000159,

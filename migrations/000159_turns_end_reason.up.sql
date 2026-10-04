@@ -33,9 +33,10 @@
 -- moves, and the head it was for; the session's status shows them until
 -- the next push clears them (UpsertPendingRetriggerHeadSHA).
 --
--- No backfill, no index. Every turn that exists when this runs reads as
--- an attempt that ended for its own reason, and as no automatic one: none
--- of them is checked. Every pull request starts at no move and no drop.
+-- No backfill, no index. Every turn that exists when this runs has no end
+-- reason, so it counts as the attempt or turn it was, and no trigger, so
+-- it is no automatic attempt: none of them is checked. Every pull request
+-- starts at no move and no drop.
 --
 -- # Locks
 --

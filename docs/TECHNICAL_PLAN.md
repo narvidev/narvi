@@ -1734,10 +1734,18 @@ it lands, and the queued ones run in full on diffs that no longer exist. Two rul
   same decorated instance every other freshness read uses) with the bot's credential, and
   compares the attempt's `review_head_sha` and `review_verdict_context` through
   `autoapproval.CheckFreshness`, the recorded policy version set to the current one. An attempt
-  that waited behind nothing costs no read. `planDispatch` applies the answer where the turn
-  would be sent, and only to the turn it picks: with none for that turn -- no read, a read of
-  another, or one made while the sandbox could not take it -- it dispatches nothing and re-arms
-  the dispatch timer due at once, so the next evaluation reads its pick. Fresh, unconfirmed
+  that waited behind nothing costs no read of the code host. To learn whether the pick waited,
+  the pre-read walks the session's earlier turns, only when the pick is such an attempt: one
+  probe of the open turns' index and 2 to 4 buffers for any other pick; for an automatic attempt,
+  60 buffers on a session of 4,000 turns stored together, and about one heap buffer per earlier
+  turn on one whose turns lie among other sessions' -- 3,974 for 4,000, queued or not, as the
+  walk finds the turn the attempt waited behind last in the heap's order -- no more than the
+  session's turn list (`ListTurnsForSession`, 3,970) the same evaluation reads.
+  `planDispatch` applies the answer where the turn would be sent, and only to the turn it picks:
+  with none for that turn -- no read, a read of another, or one made while the sandbox could not
+  take it -- it dispatches nothing and re-arms the dispatch timer due at once, on the database's
+  clock like every other arm of it (`TimerStore.ArmDispatch`), so the next evaluation reads its
+  pick. Fresh, unconfirmed
   (stamping `turns.context_unconfirmed_at`), or an automatic attempt that waited behind nothing,
   dispatches and resets the pull request's count of moves in a row
   (`github_pr_sessions.auto_retrigger_context_moves`): one of its attempts starts. Moved ends the
@@ -1746,8 +1754,12 @@ it lands, and the queued ones run in full on diffs that no longer exist. Two rul
   check, no session warning, no workflow hook -- and re-derives the session's status without it;
   in the same transaction the pull request's pending head becomes the live one unless a push
   left one (`RequeueAutoRetrigger`), the move is counted, and the debounce is inserted due at
-  once when none is armed (`RequeueReviewRetriggerDebounce`); the next turn of the queue is
-  evaluated at once. The move that takes the count past `ReviewContextMoveMaxConsecutive` (3,
+  once when none is armed (`RequeueReviewRetriggerDebounce`) -- unless a younger automatic
+  attempt already queued recorded the live head: it is checked next and stands for the request,
+  so nothing is asked again and the move is not counted, and no second review of that head runs
+  once it ends (the heads comparison sees only a posted live verdict, which a shadow repository or
+  an attempt left not assessed never leaves). The dispatch timer is re-armed due at once, and the
+  next turn of the queue is evaluated at once. The move that takes the count past `ReviewContextMoveMaxConsecutive` (3,
   in `internal/platform/timeouts.go`; `Validate` keeps it at least one) drops the request
   instead: the pending head cleared (`DropAutoRetrigger`), the debounce deleted, and when and on
   which head recorded (`auto_retrigger_dropped_at`, `auto_retrigger_dropped_head_sha`, read in
@@ -1762,10 +1774,14 @@ it lands, and the queued ones run in full on diffs that no longer exist. Two rul
   failure reason is read against; `TestReviewAttemptReadersExcludeContextMoved` fails on a sqlc
   query that reads `is_review_attempt`, or orders turns newest first, without it. Migration 000159
   adds the six columns, catalog changes only; the contracts' MINOR 1.23.0 adds the status
-  field. Since the hold, the lane inserts an attempt only when no turn of the session is open, so
-  a queued automatic attempt is one a replica without the hold inserted during a rolling deploy,
-  or one inserted before it shipped; the check is the mechanism the third PR extends to a
-  person's request, which queues routinely.
+  field. The check applies only to automatic attempts this release inserts, the ones that carry
+  the trigger; one an older binary inserted -- a replica without the hold during a rolling deploy,
+  or a binary before migration 000159 -- carries none and dispatches unchecked, as before. Since
+  the hold, the lane's insert re-reads the hold under the actor-epoch lock, so one of its attempts
+  ends up queued only rarely: behind a person's turn whose transaction began before the insert's
+  and committed after it (its earlier `created_at` sorts it first), or where the ending replica's
+  clock leads the database's. The check is the mechanism the third PR extends to a person's
+  request, which queues routinely.
 
 The first shape is the ordinary case when an agent pushes fixes while a review runs. Phasing: Step
 198, Phase 11, in three PRs: the hold and its wake-up first; then the context check of a queued
@@ -9135,7 +9151,7 @@ parses the package's `Timer*` constants and fails for one without a classificati
 field assignment or through a type alias, or SQL that writes `session_timers` — a raw `Exec`, a new
 sqlc query, a migration or backfill; today the writers are `UpsertSessionTimer`, reached only through
 `armTimer`, the stop route and the synchronize webhook, and `ArmSessionDispatchTimer`, which names the
-`dispatch` kind in its SQL, is reached only through `TurnStore.CreateAndArmDispatch`, and is pinned to
+`dispatch` kind in its SQL, is reached only through `TurnStore.CreateAndArmDispatch` and the actor's own re-arm on the same clock (`TimerStore.ArmDispatch`, §24.9's context check), and is pinned to
 `sessionactor.TimerDispatch` by `TestDispatchTimer_TheTurnStoreArmsThisKind`; and §24.9's
 `HoldReviewRetriggerDebounce` and `WakeReviewRetriggerDebounce`, which name the debounce kind in
 their SQL, only move a row that exists, are reached only through the session actor, and are pinned
