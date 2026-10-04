@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
+	"github.com/narvidev/narvi/internal/domain/gitstate"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitclone"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
 	"github.com/narvidev/narvi/internal/sandboxagent/supervisor"
@@ -20,10 +21,14 @@ import (
 
 const testPullRef = "refs/pull/7/head"
 
+// testHeadBranch is the pull request's head branch in the base repository
+// itself -- a same-repository pull request -- at S1.
+const testHeadBranch = "pr-branch"
+
 // pullRefOrigin is a base repository whose main holds a file of its own
 // (main-only.txt), and whose refs/pull/7/head holds S1, a contributor's
-// commit off an older main. S2, S1's child, exists only in the
-// contributor's clone until advancePullRef pushes it.
+// commit off an older main, as does its branch pr-branch. S2, S1's child,
+// exists only in the contributor's clone until advancePullRef pushes it.
 type pullRefOrigin struct {
 	url  string
 	work string
@@ -64,6 +69,7 @@ func newPullRefOrigin(t *testing.T) *pullRefOrigin {
 	o.main = commit("main-only.txt", "main\n", "main moves on")
 	runGit(t, work, "push", "-q", "origin", "main")
 	runGit(t, work, "push", "-q", "origin", o.s1+":"+testPullRef)
+	runGit(t, work, "push", "-q", "origin", o.s1+":refs/heads/"+testHeadBranch)
 
 	o.url = startGitHTTPSServer(t, parent).URL + "/widgets.git"
 	return o
@@ -110,6 +116,8 @@ func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }
+
+func strPtr(s string) *string { return &s }
 
 // TestCheckoutPullRef_ChecksOutTheRecordedHead: the recorded head is
 // fetched from the base repository's pull ref and checked out, detached --
@@ -396,14 +404,16 @@ func TestCheckoutPullRef_SpawnCount(t *testing.T) {
 	}
 
 	tests := []struct {
-		name      string
-		sparse    bool // the worktree is left sparse before the checkout
-		pathScope []string
-		wantLocal int
+		name         string
+		sparse       bool // the worktree is left sparse before the checkout
+		skipWorktree bool // README.md carries the skip-worktree bit, its file present
+		pathScope    []string
+		wantLocal    int
 	}{
-		{name: "unscoped, never sparse", wantLocal: 7},
-		{name: "scoped", pathScope: []string{"/pr.txt"}, wantLocal: 12},
-		{name: "unscoped, left sparse", sparse: true, wantLocal: gitclone.PullCheckoutMaxLocalGitSpawns},
+		{name: "unscoped, never sparse", wantLocal: 12},
+		{name: "unscoped, left sparse", sparse: true, wantLocal: 12},
+		{name: "scoped", pathScope: []string{"/pr.txt"}, wantLocal: 13},
+		{name: "scoped, a skip-worktree file present", skipWorktree: true, pathScope: []string{"/pr.txt"}, wantLocal: gitclone.PullCheckoutMaxLocalGitSpawns},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -415,6 +425,9 @@ func TestCheckoutPullRef_SpawnCount(t *testing.T) {
 				// Back to main, so the counted checkout moves HEAD and
 				// writes the runtime's, as every path counted here does.
 				runGit(t, dir, "checkout", "-q", "--detach", o.main)
+			}
+			if tc.skipWorktree {
+				runGit(t, dir, "update-index", "--skip-worktree", "README.md")
 			}
 
 			fakeDir := t.TempDir()
@@ -477,25 +490,64 @@ func TestCloneAll_PullRef_ForkHeadBranchIsNeverCloned(t *testing.T) {
 	}
 }
 
-// TestCloneAll_PullRef_RefThatCannotBeFetchedIsAWarning: the boot goes on,
-// on the clone's default branch, scoped like any clone.
-func TestCloneAll_PullRef_RefThatCannotBeFetchedIsAWarning(t *testing.T) {
+// TestCloneAll_PullRef_UnfetchableRefChecksOutTheHeadBranch: a fresh boot
+// whose pull ref cannot be fetched right after the clone never stays on the
+// clone's default branch. The spec names the head branch, which a
+// same-repository pull request has in the base repository, so the clone's
+// own origin/<branch> is checked out -- what `clone --branch` checked out
+// before refs existed -- and then scoped.
+func TestCloneAll_PullRef_UnfetchableRefChecksOutTheHeadBranch(t *testing.T) {
 	t.Parallel()
 	o := newPullRefOrigin(t)
 	layout := gitdir.Layout{Root: t.TempDir(), WorkspaceDir: t.TempDir()}
-	ref := "refs/pull/99/head"
-	repos := []sessionconfig.SessionConfigReposElem{{Name: "widgets", Url: o.url, Ref: &ref}}
+	branch, ref := testHeadBranch, "refs/pull/99/head"
+	repos := []sessionconfig.SessionConfigReposElem{{Name: "widgets", Url: o.url, Branch: &branch, Ref: &ref}}
 
-	results, err := gitclone.CloneAll(context.Background(), supervisor.New(), layout, nil, nil, repos, []string{"/README.md"}, testCloneTimeout, testStopGrace)
+	results, err := gitclone.CloneAll(context.Background(), supervisor.New(), layout, nil, nil, repos, []string{"/pr.txt"}, testCloneTimeout, testStopGrace)
 	if err != nil || len(results) != 1 || results[0].Err != nil {
-		t.Fatalf("CloneAll() = %+v, %v, want the boot to go on", results, err)
+		t.Fatalf("CloneAll() = %+v, %v, want the head branch checked out", results, err)
 	}
 	dir := filepath.Join(layout.WorkspaceDir, "widgets")
-	if head := headOf(t, dir); head != o.main {
-		t.Errorf("worktree HEAD = %s, want the default branch's %s", head, o.main)
+	if head := headOf(t, dir); head != o.s1 {
+		t.Errorf("worktree HEAD = %s, want the head branch's %s (the default branch is %s)", head, o.s1, o.main)
 	}
-	if exists(filepath.Join(dir, "main-only.txt")) {
-		t.Error("main-only.txt is in the worktree: the path scope was not applied")
+	if got := currentBranch(t, dir); got != testHeadBranch {
+		t.Errorf("checked-out branch = %q, want %q", got, testHeadBranch)
+	}
+	if exists(filepath.Join(dir, "README.md")) || !exists(filepath.Join(dir, "pr.txt")) {
+		t.Error("the path scope was not applied to the head branch")
+	}
+}
+
+// TestCloneAll_PullRef_UnfetchableRefFailsClosed: with no head branch to
+// fall back to -- none in the spec, or one the base repository does not
+// have -- a fresh boot whose pull ref cannot be fetched fails the primary
+// repo, never booting the review on the clone's default branch.
+func TestCloneAll_PullRef_UnfetchableRefFailsClosed(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		branch *string
+	}{
+		{name: "no head branch in the spec"},
+		{name: "a head branch the base repository does not have", branch: strPtr("feature")},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			o := newPullRefOrigin(t)
+			layout := gitdir.Layout{Root: t.TempDir(), WorkspaceDir: t.TempDir()}
+			ref := "refs/pull/99/head"
+			repos := []sessionconfig.SessionConfigReposElem{{Name: "widgets", Url: o.url, Branch: tc.branch, Ref: &ref}}
+
+			results, err := gitclone.CloneAll(context.Background(), supervisor.New(), layout, nil, nil, repos, nil, testCloneTimeout, testStopGrace)
+			if err == nil || len(results) != 1 || results[0].Err == nil {
+				t.Fatalf("CloneAll() = %+v, %v, want the primary repo failed", results, err)
+			}
+			if !strings.Contains(results[0].Err.Error(), "never boots on another tree") {
+				t.Errorf("error = %v, want it to say the review never boots on another tree", results[0].Err)
+			}
+		})
 	}
 }
 
@@ -559,24 +611,328 @@ func TestSyncAll_PullRef_WarmBootDiscardsThePreviousTurnsEdits(t *testing.T) {
 	}
 }
 
-// TestSyncAll_PullRef_RefThatCannotBeFetchedIsAWarning: the warm boot goes
-// on, the worktree as it was, its scope still enforced.
-func TestSyncAll_PullRef_RefThatCannotBeFetchedIsAWarning(t *testing.T) {
+// TestSyncAll_PullRef_UnfetchableRefSyncsTheHeadBranch: a warm boot (a
+// repo image, here built from the default branch) whose pull ref cannot be
+// fetched takes the §19.3 branch sequence for the spec's head branch, as it
+// did before refs existed: the branch is fetched and checked out, and the
+// boot never stays on the image's default branch.
+func TestSyncAll_PullRef_UnfetchableRefSyncsTheHeadBranch(t *testing.T) {
 	t.Parallel()
 	o := newPullRefOrigin(t)
 	layout, _, dir := clonedBase(t, o)
-	ref := "refs/pull/99/head"
-	repos := []sessionconfig.SessionConfigReposElem{{Name: "widgets", Url: o.url, Ref: &ref}}
+	branch, ref := testHeadBranch, "refs/pull/99/head"
+	repos := []sessionconfig.SessionConfigReposElem{{Name: "widgets", Url: o.url, Branch: &branch, Ref: &ref}}
 
-	results, err := gitclone.SyncAll(context.Background(), supervisor.New(), layout, nil, repos, []string{"/README.md"}, "33333333-3333-3333-3333-333333333333",
+	results, err := gitclone.SyncAll(context.Background(), supervisor.New(), layout, nil, repos, nil, "33333333-3333-3333-3333-333333333333",
 		testFetchStepTimeout, testSyncStepTimeout, testStopGrace, func(string, string, string) {}, noopGitFetchTiming, noopGitCheckoutTiming)
 	if err != nil || len(results) != 1 || results[0].Err != nil {
-		t.Fatalf("SyncAll() = %+v, %v, want the boot to go on", results, err)
+		t.Fatalf("SyncAll() = %+v, %v, want the head branch synced", results, err)
 	}
-	if head := headOf(t, dir); head != o.main {
-		t.Errorf("worktree HEAD = %s, want it as it was at %s", head, o.main)
+	if results[0].State != gitstate.StateReady || results[0].Branch != testHeadBranch {
+		t.Errorf("State, Branch = %q, %q, want ready on %q", results[0].State, results[0].Branch, testHeadBranch)
 	}
-	if exists(filepath.Join(dir, "main-only.txt")) {
-		t.Error("main-only.txt is in the worktree: the path scope was not enforced")
+	if head := headOf(t, dir); head != o.s1 {
+		t.Errorf("worktree HEAD = %s, want the head branch's %s (the image's default branch is %s)", head, o.s1, o.main)
+	}
+}
+
+// TestSyncAll_PullRef_UnfetchableRefFailsClosed: a warm boot whose pull ref
+// cannot be fetched fails the primary repo when the head branch is neither
+// local nor fetchable either (§19.3's rule for an explicit branch), or when
+// the spec names none -- the worktree left on the image's tree, its path
+// scope enforced, and never booted as the review's.
+func TestSyncAll_PullRef_UnfetchableRefFailsClosed(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		branch    *string
+		ref       string
+		goneURL   bool
+		wantState gitstate.State
+	}{
+		{name: "head branch neither local nor fetchable", branch: strPtr(testHeadBranch), ref: testPullRef, goneURL: true, wantState: gitstate.StateFetchFailed},
+		{name: "no head branch in the spec", ref: "refs/pull/99/head"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			o := newPullRefOrigin(t)
+			layout, _, dir := clonedBase(t, o)
+			url := o.url
+			if tc.goneURL {
+				url += "-gone"
+			}
+			ref := tc.ref
+			repos := []sessionconfig.SessionConfigReposElem{{Name: "widgets", Url: url, Branch: tc.branch, Ref: &ref}}
+
+			results, err := gitclone.SyncAll(context.Background(), supervisor.New(), layout, nil, repos, []string{"/README.md"}, "44444444-4444-4444-4444-444444444444",
+				testFetchStepTimeout, testSyncStepTimeout, testStopGrace, func(string, string, string) {}, noopGitFetchTiming, noopGitCheckoutTiming)
+			if err == nil || len(results) != 1 || results[0].Err == nil {
+				t.Fatalf("SyncAll() = %+v, %v, want the primary repo failed", results, err)
+			}
+			if results[0].State != tc.wantState {
+				t.Errorf("State = %q, want %q", results[0].State, tc.wantState)
+			}
+			if head := headOf(t, dir); head != o.main {
+				t.Errorf("worktree HEAD = %s, want it left on the image's %s", head, o.main)
+			}
+			if exists(filepath.Join(dir, "main-only.txt")) {
+				t.Error("main-only.txt is in the worktree: the path scope was not enforced on the failed repo")
+			}
+		})
+	}
+}
+
+// skipWorktreeEntries is what `git ls-files -v` marks skip-worktree in dir:
+// the paths whose tag is S, or s with assume-unchanged too.
+func skipWorktreeEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	var paths []string
+	for _, line := range strings.Split(strings.TrimSpace(gitOutput(t, dir, "ls-files", "-v")), "\n") {
+		if strings.HasPrefix(line, "S ") || strings.HasPrefix(line, "s ") {
+			paths = append(paths, line[2:])
+		}
+	}
+	return paths
+}
+
+// skipWorktreeCase is a previous turn that left skip-worktree state in the
+// shared index, and what a checkout of S2 must leave instead.
+type skipWorktreeCase struct {
+	name      string
+	pathScope []string
+	// plant runs in the runtime's worktree, as the previous turn's agent.
+	plant func(t *testing.T, dir string)
+	// check runs after the checkout of S2.
+	check func(t *testing.T, dir string)
+}
+
+func plantSkipWorktree(file, content string) func(t *testing.T, dir string) {
+	return func(t *testing.T, dir string) {
+		t.Helper()
+		runGit(t, dir, "update-index", "--skip-worktree", file)
+		if err := os.WriteFile(filepath.Join(dir, file), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", file, err)
+		}
+	}
+}
+
+func wantContent(file, content string) func(t *testing.T, dir string) {
+	return func(t *testing.T, dir string) {
+		t.Helper()
+		if body, err := os.ReadFile(filepath.Join(dir, file)); err != nil || string(body) != content {
+			t.Errorf("%s = %q (%v), want %q", file, body, err, content)
+		}
+	}
+}
+
+func skipWorktreeCases() []skipWorktreeCase {
+	return []skipWorktreeCase{
+		{
+			name:  "update-index on a file the next head leaves alone",
+			plant: plantSkipWorktree("README.md", "PLANTED readme\n"),
+			check: wantContent("README.md", "base\n"),
+		},
+		{
+			name: "the runtime's own sparse-checkout",
+			plant: func(t *testing.T, dir string) {
+				t.Helper()
+				runGit(t, dir, "sparse-checkout", "set", "--no-cone", "/README.md")
+			},
+			check: func(t *testing.T, dir string) {
+				t.Helper()
+				if !exists(filepath.Join(dir, ".gitignore")) || !exists(filepath.Join(dir, "pr.txt")) {
+					t.Error(".gitignore or pr.txt is missing: the runtime's sparse patterns survived")
+				}
+				if got := gitOutputAllowFailure(t, dir, "config", "--type=bool", "core.sparseCheckout"); got == "true" {
+					t.Error("the runtime's core.sparseCheckout is still true")
+				}
+			},
+		},
+		{
+			name:  "update-index on a file the next head changes",
+			plant: plantSkipWorktree("pr.txt", "PLANTED pr\n"),
+			check: wantContent("pr.txt", "second\n"),
+		},
+		{
+			// git clears the bit of a present file itself when it reads the
+			// index with sparse-checkout on, which every scoped checkout
+			// leaves on in the agent's config. With the runtime's own
+			// sparse-checkout turned off first, a boot's Seed imports it
+			// off, and only the explicit clear keeps the scope's set from
+			// reporting the planted file as left on disk.
+			name:      "the runtime turned its scope off and marked an in-scope file",
+			pathScope: []string{"/pr.txt"},
+			plant: func(t *testing.T, dir string) {
+				t.Helper()
+				runGit(t, dir, "sparse-checkout", "disable")
+				plantSkipWorktree("pr.txt", "PLANTED pr\n")(t, dir)
+			},
+			check: func(t *testing.T, dir string) {
+				t.Helper()
+				wantContent("pr.txt", "second\n")(t, dir)
+				if exists(filepath.Join(dir, "README.md")) {
+					t.Error("README.md, out of scope, is in the worktree")
+				}
+			},
+		},
+		{
+			name:      "update-index on an in-scope file of a scoped session",
+			pathScope: []string{"/pr.txt"},
+			plant:     plantSkipWorktree("pr.txt", "PLANTED pr\n"),
+			check: func(t *testing.T, dir string) {
+				t.Helper()
+				wantContent("pr.txt", "second\n")(t, dir)
+				if exists(filepath.Join(dir, "README.md")) {
+					t.Error("README.md, out of scope, is in the worktree")
+				}
+			},
+		},
+	}
+}
+
+// assertCleanAtS2 is what every skipWorktreeCase leaves after a checkout of
+// S2: HEAD at S2, a clean status, no skip-worktree bit but the scope's own,
+// and the case's own check.
+func assertCleanAtS2(t *testing.T, o *pullRefOrigin, dir string, tc skipWorktreeCase) {
+	t.Helper()
+	if head := headOf(t, dir); head != o.s2 {
+		t.Errorf("worktree HEAD = %s, want %s", head, o.s2)
+	}
+	if status := porcelain(t, dir); status != "" {
+		t.Errorf("status = %q, want clean", status)
+	}
+	for _, path := range skipWorktreeEntries(t, dir) {
+		if len(tc.pathScope) == 0 || path == "pr.txt" {
+			t.Errorf("%s still carries the skip-worktree bit", path)
+		}
+	}
+	tc.check(t, dir)
+}
+
+// TestCheckoutPullRef_ClearsAPreviousTurnsSkipWorktreeState: the index is
+// shared with the runtime, and a forced checkout never rewrites an entry
+// carrying the skip-worktree bit, nor does clean remove its file. A
+// previous turn's `update-index --skip-worktree` or its own sparse-checkout
+// would otherwise survive a checkout reported checked_out: a planted file
+// kept, tracked files missing, or every later checkout failing on a file
+// the heads change. The checkout command's path.
+func TestCheckoutPullRef_ClearsAPreviousTurnsSkipWorktreeState(t *testing.T) {
+	t.Parallel()
+	for _, tc := range skipWorktreeCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			o := newPullRefOrigin(t)
+			layout, repo, dir := clonedBase(t, o)
+			if got := checkoutPullRef(layout, repo, testPullRef, o.s1, tc.pathScope); got.Outcome != gitclone.PullCheckoutCheckedOut {
+				t.Fatalf("first CheckoutPullRef() = %+v, want checked_out", got)
+			}
+			tc.plant(t, dir)
+			o.advancePullRef(t, o.s2)
+
+			got := checkoutPullRef(layout, repo, testPullRef, o.s2, tc.pathScope)
+			if got.Outcome != gitclone.PullCheckoutCheckedOut || got.HeadSHA != o.s2 {
+				t.Fatalf("CheckoutPullRef(S2) = %+v, want checked_out at %s", got, o.s2)
+			}
+			assertCleanAtS2(t, o, dir, tc)
+		})
+	}
+}
+
+// TestSyncAll_PullRef_ClearsAPreviousTurnsSkipWorktreeState is the same
+// for a warm boot: a review sandbox restored with the previous turn's
+// skip-worktree state boots at the ref's new tip, exactly.
+func TestSyncAll_PullRef_ClearsAPreviousTurnsSkipWorktreeState(t *testing.T) {
+	t.Parallel()
+	for _, tc := range skipWorktreeCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			o := newPullRefOrigin(t)
+			layout := gitdir.Layout{Root: t.TempDir(), WorkspaceDir: t.TempDir()}
+			ref := testPullRef
+			repos := []sessionconfig.SessionConfigReposElem{{Name: "widgets", Url: o.url, Ref: &ref}}
+			if results, err := gitclone.CloneAll(context.Background(), supervisor.New(), layout, nil, nil, repos, tc.pathScope, testCloneTimeout, testStopGrace); err != nil || results[0].Err != nil {
+				t.Fatalf("CloneAll() = %+v, %v", results, err)
+			}
+			dir := filepath.Join(layout.WorkspaceDir, "widgets")
+			tc.plant(t, dir)
+			o.advancePullRef(t, o.s2)
+
+			results, err := gitclone.SyncAll(context.Background(), supervisor.New(), layout, nil, repos, tc.pathScope, "55555555-5555-5555-5555-555555555555",
+				testFetchStepTimeout, testSyncStepTimeout, testStopGrace, func(string, string, string) {}, noopGitFetchTiming, noopGitCheckoutTiming)
+			if err != nil || len(results) != 1 || results[0].Err != nil {
+				t.Fatalf("SyncAll() = %+v, %v, want one synced repo", results, err)
+			}
+			assertCleanAtS2(t, o, dir, tc)
+		})
+	}
+}
+
+// TestCheckoutPullRef_ReownsTheWorktreeOnEveryOutcomeAfterTheFetch: the
+// fetch and everything after it run as sandbox-agent's own identity and
+// can write into the runtime's tree -- new object directories on a
+// sha_absent fetch alone -- so the worktree is re-owned on every outcome
+// from the fetch on, and only an input refused before any git ran skips
+// it.
+func TestCheckoutPullRef_ReownsTheWorktreeOnEveryOutcomeAfterTheFetch(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		ref         string
+		want        func(o *pullRefOrigin) string
+		pathScope   []string
+		prepare     func(t *testing.T, o *pullRefOrigin, layout gitdir.Layout, repo sessionconfig.SessionConfigReposElem, dir string)
+		wantOutcome gitclone.PullCheckoutOutcome
+		wantReowns  int
+	}{
+		{name: "checked_out", ref: testPullRef, want: func(o *pullRefOrigin) string { return o.s1 },
+			wantOutcome: gitclone.PullCheckoutCheckedOut, wantReowns: 1},
+		{name: "sha_absent", ref: testPullRef, want: func(o *pullRefOrigin) string { return o.s2 },
+			wantOutcome: gitclone.PullCheckoutSHAAbsent, wantReowns: 1},
+		{name: "fetch_failed", ref: "refs/pull/99/head", want: func(o *pullRefOrigin) string { return o.s1 },
+			wantOutcome: gitclone.PullCheckoutFetchFailed, wantReowns: 1},
+		{
+			name: "failed after the fetch", ref: testPullRef, want: func(o *pullRefOrigin) string { return o.s1 },
+			pathScope: []string{"/pr.txt"},
+			prepare: func(t *testing.T, o *pullRefOrigin, layout gitdir.Layout, repo sessionconfig.SessionConfigReposElem, dir string) {
+				t.Helper()
+				// An edit to a file the scope leaves out: the scope's set
+				// will not remove a changed file, and says so.
+				if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("an out-of-scope edit\n"), 0o644); err != nil {
+					t.Fatalf("edit README.md: %v", err)
+				}
+			},
+			wantOutcome: gitclone.PullCheckoutFailed, wantReowns: 1,
+		},
+		{name: "failed before any git", ref: testPullRef, want: func(*pullRefOrigin) string { return "HEAD~1" },
+			wantOutcome: gitclone.PullCheckoutFailed, wantReowns: 0},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			o := newPullRefOrigin(t)
+			layout, repo, dir := clonedBase(t, o)
+			if tc.prepare != nil {
+				tc.prepare(t, o, layout, repo, dir)
+			}
+			var reowned []string
+			chown := func(path string) error {
+				reowned = append(reowned, path)
+				return nil
+			}
+			got := gitclone.CheckoutPullRef(context.Background(), supervisor.New(), layout, nil, chown, repo, tc.ref, tc.want(o), tc.pathScope,
+				testFetchStepTimeout, testSyncStepTimeout, testStopGrace)
+			if got.Outcome != tc.wantOutcome {
+				t.Fatalf("CheckoutPullRef() = %+v, want %s", got, tc.wantOutcome)
+			}
+			if len(reowned) != tc.wantReowns {
+				t.Fatalf("re-owned %d times, want %d", len(reowned), tc.wantReowns)
+			}
+			for _, path := range reowned {
+				if path != dir {
+					t.Errorf("re-owned %s, want the worktree %s", path, dir)
+				}
+			}
+		})
 	}
 }

@@ -5,6 +5,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -48,16 +50,18 @@ const PullHeadLocalRef = "refs/narvi/pull-head"
 // CheckoutPullRef call: one fetch, bounded by fetchTimeout, then at most
 // PullCheckoutMaxLocalGitSpawns local git processes, each bounded by its
 // own stepTimeout, and each by stopGrace more when it has to be stopped.
-// The longest path is an unscoped repo whose worktree was left sparse:
-// rev-parse of the ref and of the target (2), the forced checkout and the
-// runtime HEAD write its move causes (2), clean (1), the sparse-checkout
-// check, disable and the five-process mirror to the runtime's config (7),
-// and rev-parse HEAD (1). A scoped repo takes 12, the set and its mirror
-// (6) in place of those 7, and an unscoped repo that was never sparse 7.
-// TestCheckoutPullRef_SpawnCount pins all three.
+// The longest path is a scoped repo whose index holds a skip-worktree entry
+// whose file is present: rev-parse of the ref and of the target (2),
+// ls-files and the update-index that clears those bits (2), the
+// sparse-checkout set and the five-process mirror to the runtime's config
+// (6), the forced checkout and the runtime HEAD write its move causes (2),
+// clean (1) and rev-parse HEAD (1). A scoped repo with no such entry takes
+// 13, and an unscoped repo 12, the sparse-checkout disable and its mirror
+// (6) in place of the four sparse steps. TestCheckoutPullRef_SpawnCount pins
+// every path.
 const (
 	PullCheckoutNetworkGitSpawns  = 1
-	PullCheckoutMaxLocalGitSpawns = 13
+	PullCheckoutMaxLocalGitSpawns = 14
 )
 
 // PullCheckoutResult is one repo's outcome from CheckoutPullRef.
@@ -94,18 +98,29 @@ type PullCheckoutResult struct {
 //     ref that lags the push that made it, or a head that moved past it
 //     and was never fetched -- is PullCheckoutSHAAbsent, and the worktree
 //     is left as it was.
-//  5. `checkout --force --detach <target> --`, then `clean -ffd`: every
+//  5. Every skip-worktree bit is cleared and the sparse state the runtime
+//     may have changed since the boot is reset, before anything is checked
+//     out: the index is shared with the runtime, and a forced checkout
+//     never rewrites an entry carrying the bit, nor does clean remove its
+//     file. An unscoped session runs `sparse-checkout disable`, which
+//     clears every bit; a scoped one clears the bit of every entry whose
+//     file is present, then runs `sparse-checkout set` with its own
+//     patterns, which recomputes every other bit without ever writing an
+//     out-of-scope path (§14.1). Both are mirrored to the runtime's config.
+//  6. `checkout --force --detach <target> --`, then `clean -ffd`: every
 //     tracked change, staged or not, is discarded, and every untracked
 //     file that is not ignored is removed, nested repositories included.
 //     Ignored files are kept, so what setup.sh installed survives. The
 //     detached HEAD is synced out to the runtime's worktree by gitdir.Run
 //     (gitdir.SyncHeadOut).
-//  6. pathScope is re-applied, or sparse-checkout disabled for an
-//     unscoped session, by the same rule syncOne's deferred step follows,
-//     since the checkout reads whatever sparse state the worktree held.
 //  7. `rev-parse HEAD` gives HeadSHA, which must be the target.
-//  8. chownRepo re-owns the worktree for the runtime (nil skips it): the
-//     fetch and the checkout ran as sandbox-agent's own identity.
+//
+// chownRepo re-owns the worktree for the runtime (nil skips it) on every
+// outcome from the fetch on, whatever it is: the fetch, the checkout and
+// the rest ran as sandbox-agent's own identity, and a sha_absent fetch
+// alone can leave new object directories the runtime could not write to.
+// A failed re-own fails a checkout that had succeeded, and is added to the
+// error of one that had not.
 //
 // It is never a caller's job to know the ref is fresh: the fetch is the
 // first step every time. A review session is read-only and never pushes
@@ -121,7 +136,7 @@ func CheckoutPullRef(
 	ref, wantSHA string,
 	pathScope []string,
 	fetchTimeout, stepTimeout, stopGrace time.Duration,
-) PullCheckoutResult {
+) (result PullCheckoutResult) {
 	if err := validatePullCheckout(repo, ref, wantSHA, pathScope); err != nil {
 		return PullCheckoutResult{Outcome: PullCheckoutFailed, Err: err}
 	}
@@ -130,6 +145,20 @@ func CheckoutPullRef(
 		return PullCheckoutResult{Outcome: PullCheckoutFailed, Err: fmt.Errorf("gitclone: determine credential helper: %w", err)}
 	}
 	handle := layout.Repo(repo.Name)
+
+	defer func() {
+		if chownRepo == nil {
+			return
+		}
+		if err := chownRepo(handle.WorkTree); err != nil {
+			reown := fmt.Errorf("gitclone: re-own %s for the runtime: %w", repo.Name, err)
+			if result.Outcome == PullCheckoutCheckedOut {
+				result.Outcome, result.HeadSHA, result.Err = PullCheckoutFailed, "", reown
+				return
+			}
+			result.Err = fmt.Errorf("%w; %w", result.Err, reown)
+		}
+	}()
 
 	fetchArgs := []string{"-c", "credential.helper=" + credHelperArg, "fetch", "origin", "--no-tags", "--", "+" + ref + ":" + PullHeadLocalRef}
 	if _, err := runGitStep(ctx, sup, handle, cred, fetchArgs, fetchTimeout, stopGrace); err != nil {
@@ -143,7 +172,7 @@ func CheckoutPullRef(
 	if !found {
 		return PullCheckoutResult{Outcome: PullCheckoutFailed, Err: fmt.Errorf("gitclone: %s for %s was fetched but names no commit", ref, repo.Name)}
 	}
-	result := PullCheckoutResult{RefSHA: refSHA}
+	result = PullCheckoutResult{RefSHA: refSHA}
 
 	target := refSHA
 	if wantSHA != "" {
@@ -158,22 +187,25 @@ func CheckoutPullRef(
 		}
 	}
 
+	if len(pathScope) > 0 {
+		err = clearPresentSkipWorktree(ctx, sup, handle, cred, stepTimeout, stopGrace)
+		if err == nil {
+			err = applySparseCheckout(ctx, sup, handle, cred, pathScope, stepTimeout, stopGrace)
+		}
+	} else {
+		err = disableSparseCheckout(ctx, sup, handle, cred, stepTimeout, stopGrace)
+	}
+	if err != nil {
+		result.Outcome, result.Err = PullCheckoutFailed, fmt.Errorf("gitclone: reset the sparse state of %s: %w", repo.Name, err)
+		return result
+	}
+
 	if _, err := runGitStep(ctx, sup, handle, cred, []string{"checkout", "--quiet", "--force", "--detach", target, "--"}, stepTimeout, stopGrace); err != nil {
 		result.Outcome, result.Err = PullCheckoutFailed, fmt.Errorf("gitclone: check out %s in %s: %w", target, repo.Name, err)
 		return result
 	}
 	if _, err := runGitStep(ctx, sup, handle, cred, []string{"clean", "-ffd", "--quiet"}, stepTimeout, stopGrace); err != nil {
 		result.Outcome, result.Err = PullCheckoutFailed, fmt.Errorf("gitclone: clean %s: %w", repo.Name, err)
-		return result
-	}
-
-	if len(pathScope) > 0 {
-		err = applySparseCheckout(ctx, sup, handle, cred, pathScope, stepTimeout, stopGrace)
-	} else {
-		err = disableSparseCheckoutIfEnabled(ctx, sup, handle, cred, stepTimeout, stopGrace)
-	}
-	if err != nil {
-		result.Outcome, result.Err = PullCheckoutFailed, fmt.Errorf("gitclone: path scope for %s: %w", repo.Name, err)
 		return result
 	}
 
@@ -187,15 +219,47 @@ func CheckoutPullRef(
 		return result
 	}
 
-	if chownRepo != nil {
-		if err := chownRepo(handle.WorkTree); err != nil {
-			result.Outcome, result.Err = PullCheckoutFailed, fmt.Errorf("gitclone: re-own %s for the runtime: %w", repo.Name, err)
-			return result
-		}
-	}
-
 	result.Outcome, result.HeadSHA = PullCheckoutCheckedOut, headSHA
 	return result
+}
+
+// clearPresentSkipWorktree clears the skip-worktree bit of every index
+// entry whose file is present in repo's worktree -- an entry a previous
+// turn marked with `update-index --skip-worktree` and wrote, in scope or
+// not. Only those: every other bit is the scoped session's own, and
+// `sparse-checkout set` recomputes it. git clears such a bit itself when it
+// reads the index with sparse-checkout on in the reading config, as every
+// scoped checkout leaves the agent's; but a boot's Seed imports the
+// runtime's setting, which the runtime may have turned off. Left set then
+// on a present in-scope file, the bit would make set report the path as
+// already present, which applySparseCheckout reads as an out-of-scope path
+// left on disk; cleared, the file is an ordinary change the forced
+// checkout discards, and an out-of-scope one is removed by set or, when it
+// differs, reported. An index path that is not local to the worktree is
+// refused: git never writes one, so the index was written by hand.
+func clearPresentSkipWorktree(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, timeout, stopGrace time.Duration) error {
+	out, err := runGitStep(ctx, sup, repo, cred, []string{"ls-files", "-v", "-z"}, timeout, stopGrace)
+	if err != nil {
+		return err
+	}
+	var present []string
+	for _, entry := range strings.Split(out, "\x00") {
+		if len(entry) < 3 || entry[1] != ' ' || (entry[0] != 'S' && entry[0] != 's') {
+			continue
+		}
+		path := entry[2:]
+		if !filepath.IsLocal(path) {
+			return fmt.Errorf("index entry %q is not a path inside the worktree", path)
+		}
+		if _, err := os.Lstat(filepath.Join(repo.WorkTree, path)); err == nil {
+			present = append(present, path)
+		}
+	}
+	if len(present) == 0 {
+		return nil
+	}
+	_, err = runGitStep(ctx, sup, repo, cred, append([]string{"update-index", "--no-skip-worktree", "--"}, present...), timeout, stopGrace)
+	return err
 }
 
 // validatePullCheckout runs every check CheckoutPullRef makes before it

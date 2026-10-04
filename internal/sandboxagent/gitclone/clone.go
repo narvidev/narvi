@@ -61,10 +61,10 @@ type CloneResult struct {
 // A repo with a Ref (a pull request's review session, technical plan
 // §21.1, §30.4) is cloned without its Branch, then CheckoutPullRef checks
 // out the ref's tip, detached, and applies pathScope in
-// applySparseCheckout's place. A ref that cannot be fetched is logged and
-// leaves the clone's default branch, scoped as any other clone: the
-// checkout command (cmd/sandbox-agent's HandleCheckout) fetches the ref
-// again for the head a turn records.
+// applySparseCheckout's place. A review never boots on a tree other than
+// its head: when the ref cannot be fetched, the spec's head branch is
+// checked out from the clone (checkOutClonedHeadBranch), and with none to
+// check out the repo fails, fatally for the primary one.
 //
 // On a primary (repos[0]) clone (or, when scoped, sparse-checkout, or
 // pull request checkout) failure, CloneAll returns immediately with a
@@ -156,18 +156,21 @@ func CloneAll(
 		if cloneErr == nil && repo.Ref != nil {
 			// A pull request's review session (technical plan §21.1,
 			// §30.4): check out the ref's tip, which also applies the path
-			// scope. A ref that cannot be fetched is a warning, not a failed
-			// boot -- the checkout command fetches it again for the head a
-			// turn records -- and the clone's default branch is then scoped
-			// as any other fresh clone is.
+			// scope. A review never boots on a tree other than its head: a
+			// ref that cannot be fetched falls back to the spec's head
+			// branch, as the clone would have checked it out before refs
+			// existed, and with no head branch to fall back to the repo
+			// fails.
 			checkout := CheckoutPullRef(ctx, sup, layout, cred, chownRepo, repo, *repo.Ref, "", pathScope, cloneTimeout, cloneTimeout, stopGrace)
 			switch checkout.Outcome {
 			case PullCheckoutCheckedOut:
 			case PullCheckoutFetchFailed:
-				platform.Logger(ctx).Warn("gitclone: pull request ref could not be fetched at boot, proceeding on the clone's default branch",
-					"repo", repo.Name, "ref", *repo.Ref, "error", checkout.Err)
-				if scoped {
+				cloneErr = checkOutClonedHeadBranch(ctx, sup, repoHandle, cred, repo, checkout.Err, cloneTimeout, stopGrace)
+				if cloneErr == nil && scoped {
 					cloneErr = applySparseCheckout(ctx, sup, repoHandle, cred, pathScope, cloneTimeout, stopGrace)
+				}
+				if cloneErr == nil && chownRepo != nil {
+					cloneErr = chownRepo(dir)
 				}
 			default:
 				cloneErr = checkout.Err
@@ -373,7 +376,19 @@ func disableSparseCheckoutIfEnabled(ctx context.Context, sup *supervisor.Supervi
 	if !enabled {
 		return nil
 	}
+	return disableSparseCheckout(ctx, sup, repo, cred, timeout, stopGrace)
+}
 
+// disableSparseCheckout runs `sparse-checkout disable` whatever the
+// agent-owned config says, then mirrors the result to the runtime's config.
+// git clears every skip-worktree bit in the index doing so -- one a previous
+// turn set with `update-index --skip-worktree` too, with no sparse config
+// at all (verified against real git) -- and turns sparse-checkout off. It
+// exits 0 when a path whose bit it clears is already present, leaving that
+// file as an ordinary change. CheckoutPullRef runs it before every unscoped
+// checkout: the agent-owned config, which disableSparseCheckoutIfEnabled
+// reads, learns of a runtime's own sparse-checkout only at the next Seed.
+func disableSparseCheckout(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, timeout, stopGrace time.Duration) error {
 	// `sparse-checkout disable` re-materializes every previously-excluded
 	// path into the working tree -- the same class of operation as
 	// applySparseCheckout's own identical call just above in this file,
@@ -402,6 +417,39 @@ func disableSparseCheckoutIfEnabled(ctx context.Context, sup *supervisor.Supervi
 	// same reasoning as applySparseCheckout's own identical mirror call.
 	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, cred, timeout, stopGrace); err != nil {
 		return fmt.Errorf("git sparse-checkout disable: mirror to runtime config: %w", err)
+	}
+	return nil
+}
+
+// checkOutClonedHeadBranch is CloneAll's fallback when a repo's pull
+// request ref cannot be fetched right after its clone: it checks out the
+// spec's head branch from the clone's own origin/<branch> -- the clone
+// fetched every branch, so that is the commit `git clone --branch` checked
+// out before refs existed -- as a local branch, forced. With no head branch
+// in the spec (a pull request from a fork, or one whose head could not be
+// resolved), or one the base repository does not have, it is an error: the
+// clone's default branch is never a review's tree. refErr is the fetch's
+// own failure, carried into both the warning and the error.
+func checkOutClonedHeadBranch(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, spec sessionconfig.SessionConfigReposElem, refErr error, stepTimeout, stopGrace time.Duration) error {
+	if spec.Branch == nil {
+		return fmt.Errorf("gitclone: %s for %s could not be fetched, and the spec names no head branch to fall back to (a review never boots on another tree): %w", *spec.Ref, spec.Name, refErr)
+	}
+	branch := *spec.Branch
+	onOrigin, err := remoteBranchExists(ctx, sup, repo, cred, branch, stepTimeout, stopGrace)
+	if err != nil {
+		return fmt.Errorf("gitclone: look up head branch %s of %s: %w", branch, spec.Name, err)
+	}
+	if !onOrigin {
+		return fmt.Errorf("gitclone: %s for %s could not be fetched, and its head branch %s is not in the base repository (a review never boots on another tree): %w", *spec.Ref, spec.Name, branch, refErr)
+	}
+	platform.Logger(ctx).Warn("gitclone: pull request ref could not be fetched at boot, checking out its head branch from the clone",
+		"repo", spec.Name, "ref", *spec.Ref, "branch", branch, "error", refErr)
+	if _, err := runGitStep(ctx, sup, repo, cred, []string{"checkout", "--quiet", "--force", "-B", branch, "refs/remotes/origin/" + branch, "--"}, stepTimeout, stopGrace); err != nil {
+		return fmt.Errorf("gitclone: check out head branch %s of %s: %w", branch, spec.Name, err)
+	}
+	if err := mirrorBranchUpstreamFunc(ctx, sup, repo, cred, branch, stepTimeout, stopGrace); err != nil {
+		platform.Logger(ctx).Warn("gitclone: mirror upstream tracking onto runtime config failed, checkout itself already succeeded",
+			"repo", spec.Name, "branch", branch, "error", err)
 	}
 	return nil
 }
