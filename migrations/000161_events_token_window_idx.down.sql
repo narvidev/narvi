@@ -1,0 +1,18 @@
+-- Reverses the up migration of the same name. Without the index the read
+-- of a turn's text (ListTokenFramesInWindow) finds no index for its bounds
+-- on id + 0 and reads the session's `token` frames through another index
+-- of the session, removing every frame outside the window and sorting the
+-- rest; nothing a binary without this migration runs needs it, and no
+-- statement's result changes.
+--
+-- Drops the index without blocking inserts into events. A single
+-- statement, so golang-migrate sends it on its own, outside any
+-- transaction block, which CONCURRENTLY requires. Unlike a concurrent
+-- build (see the up migration), a concurrent drop waits only for
+-- transactions holding a lock on events, never for older snapshots, so a
+-- second migrator waiting on golang-migrate's advisory lock cannot
+-- deadlock it. Pods of a binary that carries this migration keep working
+-- meanwhile -- their statements name no index, only the read's plan
+-- changes -- but one that restarts applies it again at boot, so scale them
+-- away before deploying the older binary.
+DROP INDEX CONCURRENTLY IF EXISTS events_token_window_idx;
