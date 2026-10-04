@@ -340,6 +340,25 @@ func sentPayloads(c *fakeSendCommander) []json.RawMessage {
 	return append([]json.RawMessage(nil), c.payloads...)
 }
 
+// waitForPrompts waits until c has sent exactly want prompts, and fails if
+// it sends any other number: a turn is committed processing before its
+// prompt is sent, outside that transaction (dispatch.go's top comment), so
+// a test that sees the turn processing may still be ahead of the send.
+func waitForPrompts(t *testing.T, c *fakeSendCommander, want int, whose string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		got := sentPrompts(t, c)
+		if got == want {
+			return
+		}
+		if got > want || time.Now().After(deadline) {
+			t.Fatalf("prompts sent = %d, want %d: %s", got, want, whose)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // sentPrompts counts the prompts c sent, leaving aside every other
 // command (a turn's end starts a snapshot, sent the same way).
 func sentPrompts(t *testing.T, c *fakeSendCommander) int {
@@ -546,9 +565,7 @@ func TestReviewContext_OnlyTheHeadBaseAndAncestorsMove(t *testing.T) {
 			if got.Status != sqlcgen.TurnStatusProcessing || got.EndReason != nil || got.ContextUnconfirmedAt.Valid {
 				t.Fatalf("attempt: status %s end reason %v unconfirmed %v; want it started, confirmed", got.Status, got.EndReason, got.ContextUnconfirmedAt.Valid)
 			}
-			if got := sentPrompts(t, rig.commander); got != 1 {
-				t.Fatalf("prompts sent = %d, want the attempt's", got)
-			}
+			waitForPrompts(t, rig.commander, 1, "the attempt's")
 			if row = f.prSession(ctx, t); row.AutoRetriggerContextMoves != 0 {
 				t.Fatalf("moves = %d, want them reset by the attempt that started", row.AutoRetriggerContextMoves)
 			}
@@ -623,9 +640,7 @@ func TestReviewContext_AnUnreadableContextStartsTheTurnUnconfirmed(t *testing.T)
 			if got.Status != sqlcgen.TurnStatusProcessing || got.EndReason != nil || !got.ContextUnconfirmedAt.Valid {
 				t.Fatalf("attempt: status %s end reason %v unconfirmed %v; want it started, stamped unconfirmed", got.Status, got.EndReason, got.ContextUnconfirmedAt.Valid)
 			}
-			if got := sentPrompts(t, rig.commander); got != 1 {
-				t.Fatalf("prompts sent = %d, want the attempt's", got)
-			}
+			waitForPrompts(t, rig.commander, 1, "the attempt's")
 			if row := f.prSession(ctx, t); row.AutoRetriggerContextMoves != 0 || row.PendingRetriggerHeadSha != nil {
 				t.Fatalf("pull request: moves %d pending %v; want the moves reset by the attempt that started, nothing requeued", row.AutoRetriggerContextMoves, row.PendingRetriggerHeadSha)
 			}
@@ -1164,7 +1179,5 @@ func TestReviewContext_TheTurnQueuedBehindAMovedAttemptStartsAtOnce(t *testing.T
 	// No pump runs here: only the handling that ended the attempt can
 	// start the turn behind it.
 	waitForTurnStatus(ctx, t, f.turns, behind.ID, sqlcgen.TurnStatusProcessing)
-	if got := sentPrompts(t, rig.commander); got != 1 {
-		t.Fatalf("prompts sent = %d, want the turn behind the moved attempt's", got)
-	}
+	waitForPrompts(t, rig.commander, 1, "the turn behind the moved attempt's")
 }
