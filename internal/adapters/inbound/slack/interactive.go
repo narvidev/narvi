@@ -94,11 +94,13 @@ import (
 	"net/http"
 	"net/url"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/actorauthz"
 	"github.com/narvidev/narvi/internal/app/identitylink"
@@ -395,7 +397,9 @@ const (
 	// slackPlanOpenTurnText answers an Approve click DecidePlan refused
 	// because a turn of the session -- the plan's own revision, typically
 	// -- is still pending, dispatched or processing
-	// (httpapi.ErrPlanOpenTurnInFlight). It reaches the clicking user
+	// (httpapi.ErrPlanOpenTurnInFlight), on a plan still awaiting approval
+	// (answerOpenTurnRefusal reads it; a plan already decided gets its
+	// outcome instead). It reaches the clicking user
 	// alone, and the approval message keeps its plan and its buttons, so
 	// once that turn ends without recording a newer version, which would
 	// supersede this one, a click on the same message approves it. The
@@ -454,7 +458,9 @@ const (
 // establish for the REST API (planauthz.go, httpapi/turn.go).
 //
 // actorUserID.Valid == false (not yet linked -- the auto-link attempt for
-// this identity did not resolve) now returns ErrActorNotLinked immediately,
+// this identity completed and found no link; one that did not complete is
+// answered as a backend failure by both callers before they get here, see
+// resolveSlackActorSingleAttempt's err) now returns ErrActorNotLinked immediately,
 // with NO session/participants lookup at all -- audit-fix batch update
 // ("block unlinked actor state changes"): this used to return nil
 // (allowed), preserving §13.2's own original "unlinked actors get bot
@@ -569,11 +575,14 @@ var errActorRoleUnreadable = errors.New("slack: interactivity: the actor's role 
 // a plan this click decided, or one already decided or superseded, whose
 // buttons have nothing left to do -- replaces the message's text through
 // updateMessage, whose chat.update carries no blocks and so removes the
-// plan and its buttons, for everyone in the channel. Anything that leaves
-// the plan awaiting approval -- a not-yet-linked actor, a refused one, a
-// failed authorization check, a cut plan, a turn of the session still
-// open, any other DecidePlan failure, the decision's budget running out --
-// is answered to the clicking user alone through replyPrivately
+// plan and its buttons, for everyone in the channel -- an Approve click
+// refused because a turn of the session is open included, when the plan
+// it names turns out to be decided already (answerOpenTurnRefusal).
+// Anything that leaves the plan awaiting approval -- an identity that
+// could not be resolved, a not-yet-linked actor, a refused one, a failed
+// authorization check, a cut plan, a turn of the session still open, any
+// other DecidePlan failure, the decision's budget running out -- is
+// answered to the clicking user alone through replyPrivately
 // (chat.postEphemeral), and the message keeps its plan and its buttons for
 // the next click, this actor's or a permitted member's. Leaving the
 // message alone on an error never strands a decided plan behind live
@@ -624,10 +633,21 @@ func (deps InteractiveDeps) decideAndUpdateMessage(ctx context.Context, logger *
 	// user the first time this package sees them, WITHOUT the general
 	// algorithm's own multi-attempt retry (see that function's own doc
 	// comment for why this tightly-bounded interactivity path can't
-	// afford one). Still bot attribution whenever it can't resolve in
-	// time -- matching this package's own PREVIOUS unconditional
-	// precedent for that case exactly.
-	decidedBy, notice := resolveSlackActorSingleAttempt(decideCtx, logger, deps.SlackClient, deps.IdentityLink, deps.Timeouts.SlackInteractivityIdentityFetchTimeout, slackUserID)
+	// afford one).
+	//
+	// A resolution that did not complete -- the linked-identity read or
+	// Resolve failing, or the decision's share running out while they
+	// wait -- says nothing about whether the clicker is linked, so it is
+	// a backend failure, answered like every other: the generic text and
+	// its "try again", to the clicker alone, the buttons left in place.
+	// Only a resolution that completed and found no link is denied below
+	// as ErrActorNotLinked, with the not-linked text.
+	decidedBy, notice, err := resolveSlackActorSingleAttempt(decideCtx, logger, deps.SlackClient, deps.IdentityLink, deps.Timeouts.SlackInteractivityIdentityFetchTimeout, slackUserID)
+	if err != nil {
+		logger.Error("slack: interactivity: plan decision not made, the clicking user's identity could not be resolved", "error", err, "plan_id", planIDStr, "session_id", sessionIDStr)
+		deps.replyPrivately(decideCtx, logger, channel, slackUserID, messageTS, slackDecisionErrorText)
+		return
+	}
 
 	// Security-remediation addition ("identities + full RBAC",
 	// §13.2): notice (the "connected your account" confirmation, or --
@@ -716,13 +736,14 @@ func (deps InteractiveDeps) decideAndUpdateMessage(ctx context.Context, logger *
 		logger.Info("slack: interactivity: approval refused, plan text was cut", "plan_id", planIDStr, "session_id", sessionIDStr)
 		deps.replyPrivately(decideCtx, logger, channel, slackUserID, messageTS, err.Error())
 	case errors.Is(err, httpapi.ErrPlanOpenTurnInFlight):
-		// A turn of the session -- the plan's own revision, typically -- is
-		// still pending, dispatched or processing. The plan stays awaiting
-		// approval, and the buttons with it: once that turn ends without
-		// recording a newer version, a click on this same message approves
-		// the plan.
+		// A turn of the session is still pending, dispatched or
+		// processing. DecidePlanOnTx refuses before it reads the plan, so
+		// the plan may still await approval -- its own revision is the
+		// open turn, typically -- or be decided already, its own
+		// implementation the open turn: answerOpenTurnRefusal reads it and
+		// answers either.
 		logger.Info("slack: interactivity: approval refused, a turn of the session is open", "plan_id", planIDStr, "session_id", sessionIDStr)
-		deps.replyPrivately(decideCtx, logger, channel, slackUserID, messageTS, slackPlanOpenTurnText)
+		deps.answerOpenTurnRefusal(decideCtx, logger, sessionID, planID, channel, slackUserID, messageTS)
 	case err != nil:
 		// Any other failure, the decision's own budget running out
 		// included: the plan is as it was, unless the failure is the
@@ -772,35 +793,87 @@ func (deps InteractiveDeps) replyContext(decideCtx context.Context) (context.Con
 
 // replyPrivately answers a click that left the plan awaiting approval to
 // the clicking user alone: a chat.postEphemeral threaded on the approval
-// message, on replyContext's budget. It never touches the approval message,
-// so the plan and its buttons stay for the next click. A failure is logged
-// and reaches nobody; the buttons are still there, and a second click is
-// the retry.
+// message (postPrivately), on replyContext's budget. It never touches the
+// approval message, so the plan and its buttons stay for the next click. A
+// failure is logged and reaches nobody; the buttons are still there, and a
+// second click is the retry.
 func (deps InteractiveDeps) replyPrivately(decideCtx context.Context, logger *slog.Logger, channel, slackUserID, messageTS, text string) {
 	replyCtx, cancel := deps.replyContext(decideCtx)
 	defer cancel()
+	deps.postPrivately(replyCtx, logger, channel, slackUserID, messageTS, text)
+}
+
+// postPrivately is replyPrivately's send, on a reply context its caller
+// already holds.
+func (deps InteractiveDeps) postPrivately(replyCtx context.Context, logger *slog.Logger, channel, slackUserID, messageTS, text string) {
 	if err := deps.SlackClient.PostEphemeral(replyCtx, channel, slackUserID, messageTS, text); err != nil {
 		logger.Warn("slack: interactivity: private reply to a plan click failed, the approval message is left as it was", "error", err)
 	}
 }
 
 // updateMessage shows an outcome on the approval message itself: a
-// chat.update, on replyContext's budget, whose text replaces the plan and
-// whose missing blocks remove its buttons (slackapi.Client.UpdateMessage's
-// own doc comment). Only an outcome comes here -- a plan this click
-// decided, or one already decided or superseded -- since only then do the
-// buttons have nothing left to do; every other answer goes through
-// replyPrivately. A failure is logged: a decision that committed has also
-// enqueued the message's own update (decideAndUpdateMessage's doc comment).
+// chat.update (showOutcome), on replyContext's budget, whose text replaces
+// the plan and whose missing blocks remove its buttons
+// (slackapi.Client.UpdateMessage's own doc comment). Only an outcome comes
+// here -- a plan this click decided, or one already decided or superseded
+// -- since only then do the buttons have nothing left to do; every other
+// answer goes through replyPrivately. A failure is logged: a decision that
+// committed has also enqueued the message's own update
+// (decideAndUpdateMessage's doc comment).
 func (deps InteractiveDeps) updateMessage(decideCtx context.Context, logger *slog.Logger, channel, messageTS, text string) {
+	replyCtx, cancel := deps.replyContext(decideCtx)
+	defer cancel()
+	deps.showOutcome(replyCtx, logger, channel, messageTS, text)
+}
+
+// showOutcome is updateMessage's send, on a reply context its caller
+// already holds.
+func (deps InteractiveDeps) showOutcome(replyCtx context.Context, logger *slog.Logger, channel, messageTS, text string) {
 	if channel == "" || messageTS == "" {
 		logger.Warn("slack: interactivity: missing channel/message ts, skipping chat.update")
 		return
 	}
-	replyCtx, cancel := deps.replyContext(decideCtx)
-	defer cancel()
 	if err := deps.SlackClient.UpdateMessage(replyCtx, channel, messageTS, text); err != nil {
 		logger.Warn("slack: interactivity: chat.update failed", "error", err)
+	}
+}
+
+// answerOpenTurnRefusal answers an Approve click DecidePlan refused because
+// a turn of the session is pending, dispatched or processing
+// (httpapi.ErrPlanOpenTurnInFlight). DecidePlanOnTx runs that gate before
+// it reads the plan, so the refusal says nothing about the plan's own
+// status: right after an approval, the plan's own implementation is the
+// open turn. So the plan is read again, the read and the answer sharing one
+// replyContext, so the two together stay inside the reply's budget:
+//   - still awaiting approval: the busy text, to the clicker alone, the
+//     plan and its buttons left for a click once that turn ends;
+//   - decided or superseded: its outcome, shown on the message through
+//     chat.update, as a Reject click on the same message -- which that gate
+//     never refuses -- shows it;
+//   - not this session's plan, or gone: answered as DecidePlan answers
+//     such a plan, "no longer awaiting approval", never leaking another
+//     session's status;
+//   - a read that fails: the busy text, still true of this click.
+//
+// The REST, MCP and Linear answers to the same refusal are untouched: this
+// is the Slack button's own reading of it.
+func (deps InteractiveDeps) answerOpenTurnRefusal(decideCtx context.Context, logger *slog.Logger, sessionID, planID pgtype.UUID, channel, slackUserID, messageTS string) {
+	replyCtx, cancel := deps.replyContext(decideCtx)
+	defer cancel()
+
+	plan, err := deps.Plans.Get(replyCtx, planID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		deps.showOutcome(replyCtx, logger, channel, messageTS, renderPlanOutcomeText(httpapi.DecidePlanOutcome{}))
+	case err != nil:
+		logger.Warn("slack: interactivity: read the plan after an open-turn refusal failed, answering with the busy text", "error", err, "plan_id", planID.String())
+		deps.postPrivately(replyCtx, logger, channel, slackUserID, messageTS, slackPlanOpenTurnText)
+	case plan.SessionID != sessionID:
+		deps.showOutcome(replyCtx, logger, channel, messageTS, renderPlanOutcomeText(httpapi.DecidePlanOutcome{}))
+	case plan.Status == sqlcgen.PlanStatusAwaitingApproval:
+		deps.postPrivately(replyCtx, logger, channel, slackUserID, messageTS, slackPlanOpenTurnText)
+	default:
+		deps.showOutcome(replyCtx, logger, channel, messageTS, renderPlanOutcomeText(httpapi.DecidePlanOutcome{FinalStatus: string(plan.Status)}))
 	}
 }
 
@@ -976,7 +1049,16 @@ func (deps InteractiveDeps) handleViewSubmission(ctx context.Context, w http.Res
 	// handleEvent, which always has channel/key from the inbound event),
 	// so that helper looks the plan's own already-stored Slack channel/
 	// message-ts back up instead of relying on one being handed in here.
-	actorUserID, notice := resolveSlackActorSingleAttempt(ctx, logger, deps.SlackClient, deps.IdentityLink, deps.Timeouts.SlackInteractivityIdentityFetchTimeout, payload.User.ID)
+	//
+	// A resolution that did not complete (resolveSlackActorSingleAttempt's
+	// err) is a backend failure, not an unlinked submitter: the modal says
+	// so with the generic error and stays open, never the permission text.
+	actorUserID, notice, err := resolveSlackActorSingleAttempt(ctx, logger, deps.SlackClient, deps.IdentityLink, deps.Timeouts.SlackInteractivityIdentityFetchTimeout, payload.User.ID)
+	if err != nil {
+		logger.Error("slack: interactivity: request-changes turn not created, the submitting user's identity could not be resolved", "error", err, "session_id", sessionIDStr)
+		writeViewSubmissionError(w, slackRequestChangesErrorText)
+		return
+	}
 
 	// §13.2 ("identities + full RBAC", §13.2/§13.3) update: a resolved,
 	// linked actorUserID must still pass domain/authz.

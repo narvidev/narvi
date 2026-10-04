@@ -139,29 +139,45 @@ func resolveSlackActor(ctx context.Context, logger *slog.Logger, slackClient sha
 // fetch here eats directly into the sliver of Slack's ~3s non-retryable
 // interactivity-ack window this function's own doc comment above says is
 // already fully spoken for by other work.
-func resolveSlackActorSingleAttempt(ctx context.Context, logger *slog.Logger, slackClient shadowslack.Client, identityLinkDeps identitylink.Deps, fetchTimeout time.Duration, slackUserID string) (actorUserID pgtype.UUID, notice string) {
+//
+// err reports a resolution that did not complete -- the linked-identity
+// lookup or identitylink.Resolve failing, ctx's own deadline (the click's
+// decision share) running out included -- so the caller never mistakes it
+// for an actor found to have no link: a linked member whose identity read
+// failed is not "not yet linked", and both callers answer err with their
+// generic try-again text, never the not-linked or permission text. A
+// profile-email fetch that fails is NOT err: the lookup has already found
+// no link, so the actor is genuinely unlinked, and Resolve records that
+// attempt as it always has. A nil err with an invalid actorUserID is the
+// clean "no link" result, which callers deny as ErrActorNotLinked.
+func resolveSlackActorSingleAttempt(ctx context.Context, logger *slog.Logger, slackClient shadowslack.Client, identityLinkDeps identitylink.Deps, fetchTimeout time.Duration, slackUserID string) (actorUserID pgtype.UUID, notice string, err error) {
 	if slackUserID == "" {
-		return pgtype.UUID{}, ""
+		return pgtype.UUID{}, "", nil
 	}
 
-	if userID, linked, err := identitylink.LookupLinkedUserID(ctx, identityLinkDeps, sqlcgen.IdentityProviderSlack, slackUserID); err == nil && linked {
-		return userID, ""
+	userID, linked, err := identitylink.LookupLinkedUserID(ctx, identityLinkDeps, sqlcgen.IdentityProviderSlack, slackUserID)
+	if err != nil {
+		logger.Warn("slack: identity linked-lookup failed", "error", err, "slack_user_id", slackUserID)
+		return pgtype.UUID{}, "", fmt.Errorf("slack: look up the actor's linked identity: %w", err)
+	}
+	if linked {
+		return userID, "", nil
 	}
 
 	fetchCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
 
-	email, ok, err := slackClient.GetUserEmail(fetchCtx, slackUserID)
-	if err != nil {
+	email, ok, fetchErr := slackClient.GetUserEmail(fetchCtx, slackUserID)
+	if fetchErr != nil {
 		email, ok = "", false
 	}
 
 	res, err := identitylink.Resolve(ctx, identityLinkDeps, sqlcgen.IdentityProviderSlack, slackUserID, email, ok)
 	if err != nil {
 		logger.Warn("slack: identity auto-link resolve failed", "error", err, "slack_user_id", slackUserID)
-		return pgtype.UUID{}, ""
+		return pgtype.UUID{}, "", fmt.Errorf("slack: resolve the actor's identity: %w", err)
 	}
-	return res.UserID, res.NotificationText()
+	return res.UserID, res.NotificationText(), nil
 }
 
 // authorizeResolvedActor/ownedOrJoined used to live here (
