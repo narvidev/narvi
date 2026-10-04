@@ -843,8 +843,7 @@ func (deps InteractiveDeps) showOutcome(replyCtx context.Context, logger *slog.L
 // (httpapi.ErrPlanOpenTurnInFlight). DecidePlanOnTx runs that gate before
 // it reads the plan, so the refusal says nothing about the plan's own
 // status: right after an approval, the plan's own implementation is the
-// open turn. So the plan is read again, the read and the answer sharing one
-// replyContext, so the two together stay inside the reply's budget:
+// open turn. So the plan is read again, and the answer depends on it:
 //   - still awaiting approval: the busy text, to the clicker alone, the
 //     plan and its buttons left for a click once that turn ends;
 //   - decided or superseded: its outcome, shown on the message through
@@ -853,15 +852,26 @@ func (deps InteractiveDeps) showOutcome(replyCtx context.Context, logger *slog.L
 //   - not this session's plan, or gone: answered as DecidePlan answers
 //     such a plan, "no longer awaiting approval", never leaking another
 //     session's status;
-//   - a read that fails: the busy text, still true of this click.
+//   - a read that fails, or that runs out of time: the busy text, still
+//     true of this click.
+//
+// The read is the decision's last step: it runs on what is left of
+// decideCtx, the decision's share, and never on the reply's budget. The
+// answer then runs on a fresh replyContext, whatever the read did, so a
+// read stalled behind a lock on plans, or an exhausted pool, still leaves
+// the reply its whole SlackInteractivityReplyTimeout, and the worst case --
+// a read that waits out the decision's share, then a reply that waits out
+// its own -- still fits SlackInteractivityAckTimeout exactly as any other
+// click does. A refusal that comes at the very end of the share reads
+// nothing and answers with the busy text.
 //
 // The REST, MCP and Linear answers to the same refusal are untouched: this
 // is the Slack button's own reading of it.
 func (deps InteractiveDeps) answerOpenTurnRefusal(decideCtx context.Context, logger *slog.Logger, sessionID, planID pgtype.UUID, channel, slackUserID, messageTS string) {
+	plan, err := deps.Plans.Get(decideCtx, planID)
+
 	replyCtx, cancel := deps.replyContext(decideCtx)
 	defer cancel()
-
-	plan, err := deps.Plans.Get(replyCtx, planID)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		deps.showOutcome(replyCtx, logger, channel, messageTS, renderPlanOutcomeText(httpapi.DecidePlanOutcome{}))

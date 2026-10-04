@@ -832,12 +832,14 @@ func (c *contextRecordingSlack) OpenView(ctx context.Context, _, _, _ string) er
 }
 
 // TestSlackInteractive_ReplyAndNoticeContexts: the reply to a click -- an
-// outcome's chat.update, or a private reply -- runs on a context of its
-// own: bounded by SlackInteractivityReplyTimeout from the moment it is
-// made, never by the decision's deadline or by nothing, and carrying the
-// request's values (its correlation id). The identity-link notice a first
-// click gets is not the reply: it runs inside the decision's share, on the
-// decision's own deadline.
+// outcome's chat.update, or a private reply, the answer to an Approve
+// refused for an open turn included, on a plan still awaiting approval or
+// already decided -- runs on a context of its own: bounded by
+// SlackInteractivityReplyTimeout from the moment it is made, never by the
+// decision's deadline or by nothing, and carrying the request's values
+// (its correlation id). The identity-link notice a first click gets is not
+// the reply: it runs inside the decision's share, on the decision's own
+// deadline.
 func TestSlackInteractive_ReplyAndNoticeContexts(t *testing.T) {
 	const correlationID = "corr-plan-click"
 	tests := []struct {
@@ -846,9 +848,15 @@ func TestSlackInteractive_ReplyAndNoticeContexts(t *testing.T) {
 		// replyMethod is the client call that answers the click.
 		replyMethod string
 		wantNotice  bool
+		// planStatus, when set, replaces the seeded plan's status;
+		// openTurn, when set, seeds a turn of the session at that status.
+		planStatus sqlcgen.PlanStatus
+		openTurn   sqlcgen.TurnStatus
 	}{
 		{name: "a won decision's outcome", clicker: interactivityDefaultUserID, replyMethod: "UpdateMessage"},
 		{name: "a first click with no link", clicker: "U0FIRSTCLICK", replyMethod: "PostEphemeral", wantNotice: true},
+		{name: "an open-turn refusal on a plan awaiting approval", clicker: interactivityDefaultUserID, replyMethod: "PostEphemeral", openTurn: sqlcgen.TurnStatusProcessing},
+		{name: "an open-turn refusal on a plan already approved", clicker: interactivityDefaultUserID, replyMethod: "UpdateMessage", planStatus: sqlcgen.PlanStatusApproved, openTurn: sqlcgen.TurnStatusProcessing},
 	}
 
 	for _, tc := range tests {
@@ -861,6 +869,16 @@ func TestSlackInteractive_ReplyAndNoticeContexts(t *testing.T) {
 			client := &contextRecordingSlack{email: "nobody-first-click@example.com"}
 			deps.SlackClient = client
 			session, plan := seedSessionTurnAndAwaitingPlan(ctx, t, rig)
+			if tc.planStatus != "" {
+				if _, err := pool.Exec(ctx, `UPDATE plans SET status = $1 WHERE id = $2`, tc.planStatus, plan.ID); err != nil {
+					t.Fatalf("set the plan's status: %v", err)
+				}
+			}
+			if tc.openTurn != "" {
+				if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: tc.openTurn, PlanMode: tc.planStatus == ""}); err != nil {
+					t.Fatalf("seed the open turn: %v", err)
+				}
+			}
 
 			value := slackapi.EncodePlanActionValue(plan.ID.String(), session.ID.String())
 			req := signedInteractivityRequest(t, blockActionsPayloadJSONWithUser(slackapi.ActionApprovePlan, value, planClickChannel, planClickMessageTS, "trigger-plan-click", tc.clicker))
@@ -903,4 +921,56 @@ func TestSlackInteractive_ReplyAndNoticeContexts(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestSlackInteractive_OpenTurnRefusal_PlanReadStalled_BusyTextStillReachesTheClicker:
+// an Approve click refused for an open turn reads the plan again, and that
+// read can stall -- here another transaction holds every read of plans
+// (LOCK TABLE plans IN ACCESS EXCLUSIVE MODE), standing in for a migration
+// on plans or an exhausted pool. Nothing earlier in the click reads plans,
+// so the refusal comes at once and the read waits. The read runs on what
+// is left of the decision's share and the answer on a fresh reply budget,
+// so the busy text still reaches the clicker alone, no chat.update is
+// sent, and the handler answers within SlackInteractivityAckTimeout --
+// a read and a reply sharing one budget answered nobody.
+func TestSlackInteractive_OpenTurnRefusal_PlanReadStalled_BusyTextStillReachesTheClicker(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	timeouts := platform.DefaultTimeouts()
+	timeouts.SlackInteractivityAckTimeout = 1500 * time.Millisecond
+	timeouts.SlackInteractivityReplyTimeout = 500 * time.Millisecond
+	rig := newInteractiveTestRigWithTimeouts(t, pool, timeouts)
+
+	session, plan := seedSessionTurnAndAwaitingPlan(ctx, t, rig)
+	if _, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: session.ID, Status: sqlcgen.TurnStatusProcessing, PlanMode: true}); err != nil {
+		t.Fatalf("seed the plan's open revision: %v", err)
+	}
+
+	lockTx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin competing lock tx: %v", err)
+	}
+	if _, err := lockTx.Exec(ctx, `LOCK TABLE plans IN ACCESS EXCLUSIVE MODE`); err != nil {
+		_ = lockTx.Rollback(ctx)
+		t.Fatalf("lock plans: %v", err)
+	}
+	// Released at the latest a few seconds on, so a read with no bound at
+	// all fails this test on time instead of hanging it.
+	releaseTimer := time.AfterFunc(5*time.Second, func() { _ = lockTx.Rollback(ctx) })
+	t.Cleanup(func() {
+		releaseTimer.Stop()
+		_ = lockTx.Rollback(ctx)
+	})
+
+	elapsed := clickApprove(t, rig.handler, session, plan, interactivityDefaultUserID)
+	if elapsed >= timeouts.SlackInteractivityAckTimeout {
+		t.Errorf("handler answered after %s, want within SlackInteractivityAckTimeout (%s): the stalled read must end with the decision's share (%s)",
+			elapsed, timeouts.SlackInteractivityAckTimeout, timeouts.SlackInteractivityDecisionTimeout())
+	}
+	updates, ephemerals := takeSlackCalls(rig.requests)
+	assertAnsweredPrivately(t, updates, ephemerals, interactivityDefaultUserID, wantPlanOpenTurnText)
+
+	releaseTimer.Stop()
+	_ = lockTx.Rollback(ctx)
+	assertPlanStatus(ctx, t, pool, plan, sqlcgen.PlanStatusAwaitingApproval)
 }
