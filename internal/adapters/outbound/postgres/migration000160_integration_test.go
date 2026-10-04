@@ -203,9 +203,11 @@ func TestMigrationOwedReviewRequests_UpAndDown(t *testing.T) {
 
 	// Rolling back with the table and the columns kept: force 159, and the
 	// previous binary boots and works. Meanwhile §2's bound deletes the owed
-	// timer it does not know. Deploying this release again runs 000160
-	// again, which keeps the table, the columns and their values, and arms
-	// the timer again for the request still owed.
+	// timer it does not know on one session, and backs it off, ten minutes
+	// out, on another. Deploying this release again runs 000160 again,
+	// which keeps the table, the columns and their values, and makes the
+	// timer due at once for every request still owed: inserted where the
+	// bound deleted it, moved to now where it survived.
 	if err := m.Force(159); err != nil {
 		t.Fatalf("force 159: %v", err)
 	}
@@ -216,6 +218,22 @@ func TestMigrationOwedReviewRequests_UpAndDown(t *testing.T) {
 	_ = pdb.Close()
 	previousRow(ctx, t, db, turnColumns, previous160GetTurn, turnID)
 	if _, err := db.ExecContext(ctx, `DELETE FROM session_timers WHERE session_id = $1 AND name = 'owed_review_request'`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	var survivorSession, survivorTurn string
+	if err := db.QueryRowContext(ctx, `INSERT INTO sessions (spawn_source) VALUES ('github') RETURNING id::text`).Scan(&survivorSession); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.QueryRowContext(ctx, `INSERT INTO turns (session_id, status, is_review_attempt, request_trigger, end_reason) VALUES ($1, 'failed', true, 'label', 'context_moved') RETURNING id::text`, survivorSession).Scan(&survivorTurn); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `INSERT INTO owed_review_requests (session_id, trigger, is_review_attempt, context_moves, moved_turn_id) VALUES ($1, 'label', true, 1, $2)`, survivorSession, survivorTurn); err != nil {
+		t.Fatal(err)
+	}
+	// Armed two hours ago and backed off by the previous binary: due ten
+	// minutes from now.
+	if _, err := db.ExecContext(ctx, `INSERT INTO session_timers (session_id, name, fires_at, armed_at, created_at)
+		VALUES ($1, 'owed_review_request', now() + interval '10 minutes', now() - interval '2 hours', now() - interval '2 hours')`, survivorSession); err != nil {
 		t.Fatal(err)
 	}
 	again, adb := newMigrate(t, connStr)
@@ -232,6 +250,9 @@ func TestMigrationOwedReviewRequests_UpAndDown(t *testing.T) {
 	}
 	if n := count(`SELECT count(*) FROM session_timers WHERE session_id = $1 AND name = 'owed_review_request' AND fires_at <= now()`, sessionID); n != 1 {
 		t.Fatalf("owed timers after 000160 ran again = %d, want the one the request is owed armed again, due", n)
+	}
+	if n := count(`SELECT count(*) FROM session_timers WHERE session_id = $1 AND name = 'owed_review_request' AND fires_at <= now() AND armed_at > now() - interval '1 minute'`, survivorSession); n != 1 {
+		t.Fatalf("the surviving owed timer after 000160 ran again: %d due and freshly armed, want 1", n)
 	}
 
 	// Down: the table and the columns go, every owed timer with them, every

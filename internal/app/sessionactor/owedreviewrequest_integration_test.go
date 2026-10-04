@@ -314,8 +314,9 @@ func mailboxBarrier(ctx context.Context, t *testing.T, a *Actor) {
 
 // TestReviewContext_APersonsMovedRequestIsOwedInTheDispatchingTransaction
 // is the dispatch half of the exit's third sentence (technical plan
-// §24.9), for each of a person's three lanes: a review attempt the label,
-// the button or a mention asked for, queued behind a running turn, whose
+// §24.9), for each of a person's two lanes whose attempt can wait: a
+// review attempt the label or the button asked for, queued behind a
+// running turn, whose
 // pull request moved while it waited, does not start when that turn ends.
 // It ends context_moved, notifying nobody, and its request is owed: a row
 // naming its requester, lane, text and one move, and the
@@ -327,7 +328,7 @@ func TestReviewContext_APersonsMovedRequestIsOwedInTheDispatchingTransaction(t *
 	ctx := context.Background()
 	pool := newTestPool(t)
 
-	for i, trigger := range []string{turn.RequestTriggerLabel, turn.RequestTriggerButton, turn.RequestTriggerMention} {
+	for i, trigger := range []string{turn.RequestTriggerLabel, turn.RequestTriggerButton} {
 		t.Run(trigger, func(t *testing.T) {
 			f := newContextFixture(ctx, t, pool, fmt.Sprintf("acme/owed-dispatch-%d", i), int32(700+i))
 			requester := createRequester(ctx, t, pool, trigger)
@@ -560,6 +561,13 @@ func TestOwedReviewRequest_AHumanRequestStopsAtTheBoundAndSaysSoOnce(t *testing.
 // created for it, moved -- with the owed_review_request timer due.
 func seedOwedRequest(ctx context.Context, t *testing.T, f *holdFixture, requester pgtype.UUID) sqlcgen.OwedReviewRequest {
 	t.Helper()
+	return seedOwedRequestMoves(ctx, t, f, requester, 1)
+}
+
+// seedOwedRequestMoves is seedOwedRequest for a request that met moves
+// moved contexts in a row.
+func seedOwedRequestMoves(ctx context.Context, t *testing.T, f *holdFixture, requester pgtype.UUID, moves int32) sqlcgen.OwedReviewRequest {
+	t.Helper()
 	moved, err := f.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: f.sessionID, Status: sqlcgen.TurnStatusFailed, IsReviewAttempt: true})
 	if err != nil {
 		t.Fatalf("create the moved attempt: %v", err)
@@ -568,7 +576,7 @@ func seedOwedRequest(ctx context.Context, t *testing.T, f *holdFixture, requeste
 	text := owedButtonText
 	owed, err := narvipg.NewOwedReviewRequestStore(f.pool).Insert(ctx, sqlcgen.InsertOwedReviewRequestParams{
 		SessionID: f.sessionID, RequestedBy: requester, Trigger: turn.RequestTriggerButton, RequestText: &text,
-		IsReviewAttempt: true, ContextMoves: 1, MovedTurnID: moved.ID,
+		IsReviewAttempt: true, ContextMoves: moves, MovedTurnID: moved.ID,
 	})
 	if err != nil {
 		t.Fatalf("owe the request: %v", err)
@@ -702,34 +710,53 @@ func TestOwedReviewRequest_AFailedReadKeepsTheRequestAndBacksOff(t *testing.T) {
 // drops every request the session owed when it was made (technical plan
 // §24.9, §3.3), silently -- the stop is the answer. The stop timer drops
 // them itself, in the transaction that disarms the owed timer with them, so
-// nothing is left that no timer would ever serve; the owed timer's consumer
-// applies the same rule first when it runs before the stop timer. A request
-// owed after the stop was made stays, and the stop timer arms the owed
-// timer again for it, which then re-runs it.
+// nothing is left that no timer would ever serve: the moved attempt's
+// workflow run ends cancelled, and a debounce the owed term held is woken
+// (one armed after the stop, which the stop's own disarm keeps). The owed
+// timer's consumer applies the same rule first when it runs before the stop
+// timer, so such a request is neither authorized nor read again, and one
+// past the bound is not announced. A request owed at the very instant of
+// the stop is dropped too; one owed after it stays, and the stop timer arms
+// the owed timer again for it, which then re-runs it.
 func TestOwedReviewRequest_AStopDropsTheRequestsItPredates(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
+	maxMoves := int32(platform.DefaultTimeouts().ReviewContextMoveMaxConsecutive)
 
 	for i, tc := range []struct {
 		name        string
 		stopFirst   bool
 		owedAfterIt bool
+		atTheStop   bool
+		moves       int32
 	}{
-		{name: "the stop timer runs first", stopFirst: true},
-		{name: "the owed timer runs first", stopFirst: false},
-		{name: "a request owed after the stop stays", stopFirst: true, owedAfterIt: true},
+		{name: "the stop timer runs first", stopFirst: true, moves: 1},
+		{name: "the owed timer runs first", moves: 1},
+		{name: "the owed timer runs first, the request past the bound", moves: maxMoves + 1},
+		{name: "a request owed at the instant of the stop", stopFirst: true, atTheStop: true, moves: 1},
+		{name: "a request owed after the stop stays", stopFirst: true, owedAfterIt: true, moves: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newContextFixture(ctx, t, pool, fmt.Sprintf("acme/owed-stop-%d", i), int32(760+i))
 			requester := createRequester(ctx, t, pool, fmt.Sprintf("stop-%d", i))
-			seedOwedRequest(ctx, t, f, requester)
+			before := seedOwedRequestMoves(ctx, t, f, requester, tc.moves)
+			stepRun := builtInReviewStepRun(ctx, t, pool, f.sessionID, before.MovedTurnID)
 			requestStop(ctx, t, pool, f.sessionID)
+			if tc.atTheStop {
+				if _, err := pool.Exec(ctx, `UPDATE owed_review_requests o SET created_at = s.stop_requested_at FROM sessions s WHERE s.id = o.session_id AND o.id = $1`, before.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// A push after the stop, held by the owed request: the stop's
+			// disarm keeps it, and the drop releases it.
+			f.armHeldDebounce(ctx, t)
 			var after sqlcgen.OwedReviewRequest
 			if tc.owedAfterIt {
 				after = seedOwedRequest(ctx, t, f, requester)
 			}
 			auth := &fakeReviewRequestAuthorizer{allowed: true}
 			rig := newOwedRig(ctx, t, pool, f.sessionID, nil, auth)
+			fetchesBefore := rig.fetcher.prCalls()
 
 			first := TimerStop
 			if !tc.stopFirst {
@@ -748,22 +775,25 @@ func TestOwedReviewRequest_AStopDropsTheRequestsItPredates(t *testing.T) {
 			if runs := reRuns(ctx, t, f); len(runs) != 0 {
 				t.Fatalf("re-runs = %d after the first delivery, want none of a request the stop predates", len(runs))
 			}
+			if n := len(auth.requests()); n != 0 {
+				t.Fatalf("the authorizer was asked %d times about a request a stop predates, want none", n)
+			}
+			if got := rig.fetcher.prCalls(); got != fetchesBefore {
+				t.Fatalf("the pull request was read %d times for a request a stop predates, want none", got-fetchesBefore)
+			}
+			var runStatus string
+			if err := pool.QueryRow(ctx, `SELECT r.status::text FROM workflow_runs r JOIN workflow_step_runs s ON s.workflow_run_id = r.id WHERE s.id = $1`, stepRun).Scan(&runStatus); err != nil {
+				t.Fatal(err)
+			}
+			if runStatus != "cancelled" {
+				t.Fatalf("the dropped request's workflow run is %s, want cancelled", runStatus)
+			}
+			if _, debounceDue, _, ok := f.debounce(ctx, t); !ok || !debounceDue {
+				t.Fatalf("the debounce the owed term held: armed %v due %v, want it woken by the drop", ok, debounceDue)
+			}
 			if !tc.owedAfterIt {
 				if len(rows) != 0 || armed {
 					t.Fatalf("after the %s timer alone: owed %d, timer armed %v; want nothing owed and no timer", first, len(rows), armed)
-				}
-				// Whatever is still armed is delivered: nothing re-runs.
-				for range 3 {
-					if err := rig.registry.PumpOnce(ctx); err != nil {
-						t.Fatal(err)
-					}
-				}
-				if err := rig.actor.Send(ctx, TimerFired{Name: TimerStop}); err != nil {
-					t.Fatal(err)
-				}
-				mailboxBarrier(ctx, t, rig.actor)
-				if runs := reRuns(ctx, t, f); len(runs) != 0 {
-					t.Fatalf("re-runs = %d, want none", len(runs))
 				}
 				return
 			}
@@ -868,55 +898,220 @@ func builtInReviewStepRun(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 // TestOwedReviewRequest_TheReRunTakesOverTheMovedAttemptsWorkflowStep: a
 // moved attempt the workflow engine tracked keeps its step attempt live
 // while its request is owed (technical plan §24.9: the context_moved end
-// runs no workflow hook); the re-run takes it over, and a drop ends it the
-// way a failed attempt ends.
+// runs no workflow hook), and the re-run takes it over. A moved attempt no
+// run tracked leaves none running, so the re-run starts a run of its own,
+// as a person's fresh request does, and its first step tracks the re-run.
 func TestOwedReviewRequest_TheReRunTakesOverTheMovedAttemptsWorkflowStep(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
 
-	for i, tc := range []struct {
-		name    string
-		allowed bool
-	}{
-		{name: "re-run", allowed: true},
-		{name: "dropped", allowed: false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			f := newContextFixture(ctx, t, pool, fmt.Sprintf("acme/owed-workflow-%d", i), int32(780+i))
-			requester := createRequester(ctx, t, pool, fmt.Sprintf("workflow-%d", i))
+	for i, tracked := range []bool{true, false} {
+		name := "a tracked attempt hands its step over"
+		if !tracked {
+			name = "an untracked attempt's re-run starts a run of its own"
+		}
+		t.Run(name, func(t *testing.T) {
+			f := newContextFixture(ctx, t, pool, fmt.Sprintf("acme/owed-workflow-rerun-%d", i), int32(780+i))
+			requester := createRequester(ctx, t, pool, fmt.Sprintf("workflow-rerun-%d", i))
 			seedRunningTurn(ctx, t, f)
 			attempt := seedPersonsAttempt(ctx, t, f, turn.RequestTriggerButton, requester, 0)
-			stepRun := builtInReviewStepRun(ctx, t, pool, f.sessionID, attempt.ID)
-			auth := &fakeReviewRequestAuthorizer{allowed: tc.allowed}
+			var stepRun pgtype.UUID
+			if tracked {
+				stepRun = builtInReviewStepRun(ctx, t, pool, f.sessionID, attempt.ID)
+			}
+			auth := &fakeReviewRequestAuthorizer{allowed: true}
 			rig := newOwedRig(ctx, t, pool, f.sessionID, movedReader(f), auth)
 
 			endRunningTurn(ctx, t, f, rig)
 			assertContextMoved(ctx, t, f, rig, attempt)
-			var status string
-			var attached pgtype.UUID
-			read := func() {
-				t.Helper()
-				if err := pool.QueryRow(ctx, `SELECT status::text, turn_id FROM workflow_step_runs WHERE id = $1`, stepRun).Scan(&status, &attached); err != nil {
-					t.Fatal(err)
+			if tracked {
+				if status, attached := readStepRun(ctx, t, pool, stepRun); status != "running" || attached != attempt.ID {
+					t.Fatalf("while owed: step %s on %v, want running on the moved attempt", status, attached)
 				}
 			}
-			read()
-			if status != "running" || attached != attempt.ID {
-				t.Fatalf("while owed: step %s on %v, want running on the moved attempt", status, attached)
-			}
 			pumpUntilOwedServed(ctx, t, rig, f)
-			read()
-			if tc.allowed {
-				runs := reRuns(ctx, t, f)
-				if len(runs) != 1 || status != "running" || attached != runs[0].ID {
+			runs := reRuns(ctx, t, f)
+			if len(runs) != 1 {
+				t.Fatalf("re-runs = %d, want 1", len(runs))
+			}
+			if tracked {
+				if status, attached := readStepRun(ctx, t, pool, stepRun); status != "running" || attached != runs[0].ID {
 					t.Fatalf("after the re-run: step %s on %v, want running on the re-run", status, attached)
 				}
 				return
 			}
-			if status == "running" {
-				t.Fatalf("after the drop: step %s on %v, want it ended", status, attached)
+			if n := countRows(ctx, t, pool, `SELECT count(*) FROM workflow_step_runs s JOIN workflow_runs r ON r.id = s.workflow_run_id WHERE s.turn_id = $1 AND s.status = 'running' AND r.status = 'running'`, runs[0].ID); n != 1 {
+				t.Fatalf("running step attempts on the re-run = %d, want the first step of a run of its own", n)
+			}
+			if n := countRows(ctx, t, pool, `SELECT count(*) FROM workflow_step_runs s JOIN workflow_runs r ON r.id = s.workflow_run_id WHERE r.session_id = $1 AND s.turn_id IS NULL`, f.sessionID); n != 0 {
+				t.Fatalf("step attempts tracking no turn = %d, want none", n)
 			}
 		})
+	}
+}
+
+// readStepRun reads a workflow step attempt's status and turn.
+func readStepRun(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stepRun pgtype.UUID) (status string, attached pgtype.UUID) {
+	t.Helper()
+	if err := pool.QueryRow(ctx, `SELECT status::text, turn_id FROM workflow_step_runs WHERE id = $1`, stepRun).Scan(&status, &attached); err != nil {
+		t.Fatalf("read the step run: %v", err)
+	}
+	return status, attached
+}
+
+// customReviewStep is a custom review-lane workflow step: its prompt
+// template, model and effort, and whether it carries a self edge on
+// blocked -- a retry loop wired explicitly, the shape an implicit
+// "blocked" outcome would re-fire.
+type customReviewStep struct {
+	template        string
+	model, effort   *string
+	blockedSelfEdge bool
+}
+
+// customReviewStepRun attaches a live attempt of step, in a definition of
+// its own and a run of its own on sessionID, to turnID, and returns the
+// attempt and its run.
+func customReviewStepRun(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID, turnID pgtype.UUID, step customReviewStep) (stepRun, run pgtype.UUID) {
+	t.Helper()
+	var definition, stepDef pgtype.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO workflow_definitions (lane, name, is_built_in, version) VALUES ('review', $1, false, 1) RETURNING id`,
+		fmt.Sprintf("owed-custom-review-%d", time.Now().UnixNano())).Scan(&definition); err != nil {
+		t.Fatalf("insert the custom definition: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO workflow_step_definitions (workflow_definition_id, step_order, kind, prompt_template, model_id, effort) VALUES ($1, 1, 'agent', $2, $3, $4) RETURNING id`,
+		definition, step.template, step.model, step.effort).Scan(&stepDef); err != nil {
+		t.Fatalf("insert the custom step: %v", err)
+	}
+	if step.blockedSelfEdge {
+		if _, err := pool.Exec(ctx, `INSERT INTO workflow_edges (workflow_definition_id, from_step_id, to_step_id, on_status) VALUES ($1, $2, $2, 'blocked')`, definition, stepDef); err != nil {
+			t.Fatalf("insert the blocked self edge: %v", err)
+		}
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO workflow_runs (session_id, lane, workflow_definition_id, definition_version) VALUES ($1, 'review', $2, 1) RETURNING id`,
+		sessionID, definition).Scan(&run); err != nil {
+		t.Fatalf("start the run: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO workflow_step_runs (workflow_run_id, step_definition_id, turn_id) VALUES ($1, $2, $3) RETURNING id`,
+		run, stepDef, turnID).Scan(&stepRun); err != nil {
+		t.Fatalf("attach the step attempt: %v", err)
+	}
+	return stepRun, run
+}
+
+// prNotices counts the session's outbox rows that post a comment on its
+// pull request about a request or a workflow: the verdict-tool notice and
+// the workflow's decision notice.
+func prNotices(ctx context.Context, t *testing.T, f *holdFixture) int {
+	t.Helper()
+	return countRows(ctx, t, f.pool, `SELECT count(*) FROM outbox WHERE session_id = $1 AND kind IN ($2, $3)`, f.sessionID,
+		string(ports.NotificationKindGitHubVerdict), string(ports.NotificationKindGitHubWorkflowDecision))
+}
+
+// TestOwedReviewRequest_ADropCancelsTheWorkflowRunAndPostsOneNotice: a
+// dropped request -- its requester no longer authorized, or its moves past
+// the bound -- whose moved attempt a workflow run tracks ends that run
+// cancelled, the way a person's stop ends it (technical plan §24.9). A
+// drop is a policy decision, never the step's outcome: no edge is
+// followed, so a custom definition's blocked self edge queues no fresh
+// attempt of the step, and no escalation notice joins the drop's own, so
+// the built-in run posts nothing beside it. The pull request gets exactly
+// one notice, the drop's, and no turn is created.
+func TestOwedReviewRequest_ADropCancelsTheWorkflowRunAndPostsOneNotice(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	maxMoves := int32(platform.DefaultTimeouts().ReviewContextMoveMaxConsecutive)
+
+	i := 0
+	for _, definition := range []string{"built-in", "custom with a blocked self edge"} {
+		for _, drop := range []string{"unauthorized", "past the bound"} {
+			name := definition + ", " + drop
+			n := i
+			i++
+			t.Run(name, func(t *testing.T) {
+				f := newContextFixture(ctx, t, pool, fmt.Sprintf("acme/owed-drop-workflow-%d", n), int32(800+n))
+				requester := createRequester(ctx, t, pool, fmt.Sprintf("drop-workflow-%d", n))
+				seedRunningTurn(ctx, t, f)
+				moves := int32(0)
+				if drop == "past the bound" {
+					moves = maxMoves
+				}
+				attempt := seedPersonsAttempt(ctx, t, f, turn.RequestTriggerButton, requester, moves)
+				var stepRun, run pgtype.UUID
+				if definition == "built-in" {
+					stepRun = builtInReviewStepRun(ctx, t, pool, f.sessionID, attempt.ID)
+					if err := pool.QueryRow(ctx, `SELECT workflow_run_id FROM workflow_step_runs WHERE id = $1`, stepRun).Scan(&run); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					stepRun, run = customReviewStepRun(ctx, t, pool, f.sessionID, attempt.ID, customReviewStep{template: "{{prompt}}", blockedSelfEdge: true})
+				}
+				auth := &fakeReviewRequestAuthorizer{allowed: drop != "unauthorized"}
+				rig := newOwedRig(ctx, t, pool, f.sessionID, movedReader(f), auth)
+
+				endRunningTurn(ctx, t, f, rig)
+				assertContextMoved(ctx, t, f, rig, attempt)
+				turnsBefore := countRows(ctx, t, pool, `SELECT count(*) FROM turns WHERE session_id = $1`, f.sessionID)
+				noticesBefore := prNotices(ctx, t, f)
+
+				pumpUntilOwedServed(ctx, t, rig, f)
+				mailboxBarrier(ctx, t, rig.actor)
+				var runStatus string
+				if err := pool.QueryRow(ctx, `SELECT status::text FROM workflow_runs WHERE id = $1`, run).Scan(&runStatus); err != nil {
+					t.Fatal(err)
+				}
+				stepStatus, _ := readStepRun(ctx, t, pool, stepRun)
+				if runStatus != "cancelled" || stepStatus != "cancelled" {
+					t.Fatalf("after the drop: run %s, step %s; want both cancelled", runStatus, stepStatus)
+				}
+				if n := countRows(ctx, t, pool, `SELECT count(*) FROM workflow_step_runs WHERE workflow_run_id = $1`, run); n != 1 {
+					t.Fatalf("step attempts = %d, want the moved one alone: an edge queued the step again", n)
+				}
+				if got := countRows(ctx, t, pool, `SELECT count(*) FROM turns WHERE session_id = $1`, f.sessionID); got != turnsBefore {
+					t.Fatalf("turns after the drop = %d, want %d: the drop created a turn", got, turnsBefore)
+				}
+				notices := dropNotices(ctx, t, f)
+				if got := prNotices(ctx, t, f) - noticesBefore; got != 1 || len(notices) != 1 || !strings.Contains(notices[0], "was not run") {
+					t.Fatalf("pull request notices after the drop = %d (drop notices %q), want exactly the drop's", got, notices)
+				}
+			})
+		}
+	}
+}
+
+// TestOwedReviewRequest_TheReRunTakesTheStepsTemplateModelAndEffort: the
+// re-run of a request whose moved attempt a custom workflow step tracks is
+// shaped by that step, as createTurnLocked shapes a person's request
+// (technical plan §24.9, §25.6): the step's prompt template wraps the
+// composed prompt, and its model and effort replace the triage's.
+func TestOwedReviewRequest_TheReRunTakesTheStepsTemplateModelAndEffort(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newContextFixture(ctx, t, pool, "acme/owed-workflow-step", 810)
+	requester := createRequester(ctx, t, pool, "workflow-step")
+	seedRunningTurn(ctx, t, f)
+	attempt := seedPersonsAttempt(ctx, t, f, turn.RequestTriggerButton, requester, 0)
+	model, effort := "step-model", "high"
+	stepRun, _ := customReviewStepRun(ctx, t, pool, f.sessionID, attempt.ID, customReviewStep{template: "STEP-TEMPLATE: {{prompt}}", model: &model, effort: &effort})
+	auth := &fakeReviewRequestAuthorizer{allowed: true}
+	rig := newOwedRig(ctx, t, pool, f.sessionID, movedReader(f), auth)
+
+	endRunningTurn(ctx, t, f, rig)
+	assertContextMoved(ctx, t, f, rig, attempt)
+	pumpUntilOwedServed(ctx, t, rig, f)
+	runs := reRuns(ctx, t, f)
+	if len(runs) != 1 {
+		t.Fatalf("re-runs = %d, want 1", len(runs))
+	}
+	rerun := runs[0]
+	if rerun.ModelID == nil || *rerun.ModelID != model || rerun.Effort == nil || *rerun.Effort != effort {
+		t.Fatalf("the re-run's model %v, effort %v; want the step's %s, %s", rerun.ModelID, rerun.Effort, model, effort)
+	}
+	if rerun.Prompt == nil || !strings.HasPrefix(*rerun.Prompt, "STEP-TEMPLATE: ") || !strings.Contains(*rerun.Prompt, owedButtonText) || !strings.Contains(*rerun.Prompt, oneLineReadableDiff) {
+		t.Fatalf("the re-run's prompt = %v, want the step's template around the button's text and the new head's diff", rerun.Prompt)
+	}
+	if _, attached := readStepRun(ctx, t, pool, stepRun); attached != rerun.ID {
+		t.Fatalf("the step attempt is on %v, want the re-run %v", attached, rerun.ID)
 	}
 }
 
@@ -986,5 +1181,169 @@ func TestOwedReviewRequest_AStopDuringTheReadDropsTheRequest(t *testing.T) {
 	}
 	if n := len(dropNotices(ctx, t, f)); n != 0 {
 		t.Fatalf("notices = %d, want none: a stop drops silently", n)
+	}
+}
+
+// TestOwedReviewRequest_ARequesterDeletedBeforeTheMoveIsDroppedAndToldOnce:
+// the requester's account is deleted while their button request waits
+// behind another turn (technical plan §24.9). turns.requested_by keeps no
+// key to users, so the turn still names the account; the dispatch that
+// finds the request moved owes it as no one, rather than failing on
+// owed_review_requests' key and rolling back on every evaluation: the
+// attempt ends context_moved, the turn queued behind it starts, and the
+// consumer drops the request -- no one is left to ask for it -- telling
+// it once, without asking the authorizer or reading the pull request.
+func TestOwedReviewRequest_ARequesterDeletedBeforeTheMoveIsDroppedAndToldOnce(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newContextFixture(ctx, t, pool, "acme/owed-deleted-requester", 820)
+	requester := createRequester(ctx, t, pool, "deleted")
+	seedRunningTurn(ctx, t, f)
+	attempt := seedPersonsAttempt(ctx, t, f, turn.RequestTriggerButton, requester, 0)
+	followUpPrompt := "@narvi-bot and one more question"
+	followUp, err := f.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: f.sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &followUpPrompt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	backdate(ctx, t, f, followUp.ID, 5)
+	if _, err := pool.Exec(ctx, `DELETE FROM users WHERE id = $1`, requester); err != nil {
+		t.Fatalf("delete the requester: %v", err)
+	}
+	auth := &fakeReviewRequestAuthorizer{allowed: true}
+	rig := newOwedRig(ctx, t, pool, f.sessionID, movedReader(f), auth)
+
+	endRunningTurn(ctx, t, f, rig)
+	assertContextMoved(ctx, t, f, rig, attempt)
+	rows := owedRows(ctx, t, pool, f.sessionID)
+	if len(rows) != 1 || rows[0].RequestedBy.Valid || rows[0].MovedTurnID != attempt.ID {
+		t.Fatalf("owed requests = %+v, want the attempt's request owed to no one", rows)
+	}
+	if got := waitForAttempt(ctx, t, f, followUp.ID); got.Status == sqlcgen.TurnStatusPending {
+		t.Fatal("the turn queued behind the moved request never started: the session's dispatch is wedged")
+	}
+	fetchesBefore := rig.fetcher.prCalls()
+
+	pumpUntilOwedServed(ctx, t, rig, f)
+	if runs := reRuns(ctx, t, f); len(runs) != 0 {
+		t.Fatalf("re-runs = %d, want none for a requester no longer known", len(runs))
+	}
+	if notices := dropNotices(ctx, t, f); len(notices) != 1 || !strings.Contains(notices[0], "can no longer request reviews") {
+		t.Fatalf("notices = %q, want one saying the request was dropped for its requester", notices)
+	}
+	if n := len(auth.requests()); n != 0 {
+		t.Fatalf("the authorizer was asked %d times about no one, want none", n)
+	}
+	if got := rig.fetcher.prCalls(); got != fetchesBefore {
+		t.Fatalf("the pull request was read %d more times for a request that is dropped, want none", got-fetchesBefore)
+	}
+}
+
+// TestOwedReviewRequest_TheBackoffDoublesWithTheRequestsAgeUpToItsBound
+// pins the owed timer's backoff schedule (technical plan §24.9): fires_at
+// moves to now plus the age of the request it served, held between
+// DispatchRetryBackoff and DispatchRetryBackoffMax -- a fresh request comes
+// back after the base, one half an hour old after half an hour, one three
+// hours old after the bound.
+func TestOwedReviewRequest_TheBackoffDoublesWithTheRequestsAgeUpToItsBound(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	timeouts := platform.DefaultTimeouts()
+
+	for i, tc := range []struct {
+		name string
+		age  time.Duration
+		want time.Duration
+	}{
+		{name: "a fresh request: the base", age: 0, want: timeouts.DispatchRetryBackoff},
+		{name: "half an hour old: its age", age: 30 * time.Minute, want: 30 * time.Minute},
+		{name: "three hours old: the bound", age: 3 * time.Hour, want: timeouts.DispatchRetryBackoffMax},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newContextFixture(ctx, t, pool, fmt.Sprintf("acme/owed-backoff-age-%d", i), int32(830+i))
+			if err := f.timers.ArmOwedReviewRequest(ctx, f.sessionID); err != nil {
+				t.Fatal(err)
+			}
+			var since pgtype.Timestamptz
+			if err := pool.QueryRow(ctx, `SELECT now() - make_interval(secs => $1)`, tc.age.Seconds()).Scan(&since); err != nil {
+				t.Fatal(err)
+			}
+			if n, err := f.timers.BackOffOwedReviewRequest(ctx, f.sessionID, since, timeouts.DispatchRetryBackoff, timeouts.DispatchRetryBackoffMax); err != nil || n != 1 {
+				t.Fatalf("BackOffOwedReviewRequest = %d rows (err %v), want 1", n, err)
+			}
+			var ahead float64
+			if err := pool.QueryRow(ctx, `SELECT extract(epoch FROM fires_at - now()) FROM session_timers WHERE session_id = $1 AND name = $2`, f.sessionID, TimerOwedReviewRequest).Scan(&ahead); err != nil {
+				t.Fatal(err)
+			}
+			if got := time.Duration(ahead * float64(time.Second)); got < tc.want-10*time.Second || got > tc.want+10*time.Second {
+				t.Fatalf("the timer fires %v ahead, want about %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestOwedReviewRequest_TheConsumerDispatchesItsReRunItself: the delivery
+// that inserts the re-run dispatches it in the same command, as every turn
+// insert asks for its dispatch at once (technical plan §2): on a ready
+// sandbox the re-run's prompt is sent with no further timer delivered.
+func TestOwedReviewRequest_TheConsumerDispatchesItsReRunItself(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newContextFixture(ctx, t, pool, "acme/owed-dispatch-itself", 840)
+	seedOwedRequest(ctx, t, f, createRequester(ctx, t, pool, "dispatch-itself"))
+	auth := &fakeReviewRequestAuthorizer{allowed: true}
+	rig := newOwedRig(ctx, t, pool, f.sessionID, nil, auth)
+
+	if err := rig.actor.Send(ctx, TimerFired{Name: TimerOwedReviewRequest}); err != nil {
+		t.Fatal(err)
+	}
+	mailboxBarrier(ctx, t, rig.actor)
+	runs := reRuns(ctx, t, f)
+	if len(runs) != 1 || runs[0].Status == sqlcgen.TurnStatusPending {
+		t.Fatalf("re-runs %+v, want one already dispatched by the delivery that inserted it", runs)
+	}
+	if n := sentPrompts(t, rig.commander); n != 1 {
+		t.Fatalf("prompts sent = %d, want the re-run's", n)
+	}
+}
+
+// TestOwedReviewRequest_ARequestWithNoPullRequestIsDroppedSilently: a
+// request owed on a session that claims no pull request has nothing to be
+// re-run against (technical plan §24.9): it is dropped without a notice --
+// there is no pull request to post one on -- its workflow run cancelled and
+// a debounce its owed term held woken, in the transaction that drops it.
+func TestOwedReviewRequest_ARequestWithNoPullRequestIsDroppedSilently(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newContextFixture(ctx, t, pool, "acme/owed-no-pull-request", 850)
+	owed := seedOwedRequest(ctx, t, f, createRequester(ctx, t, pool, "no-pull-request"))
+	stepRun := builtInReviewStepRun(ctx, t, pool, f.sessionID, owed.MovedTurnID)
+	f.armHeldDebounce(ctx, t)
+	if _, err := pool.Exec(ctx, `DELETE FROM github_pr_sessions WHERE session_id = $1`, f.sessionID); err != nil {
+		t.Fatal(err)
+	}
+	auth := &fakeReviewRequestAuthorizer{allowed: true}
+	rig := newOwedRig(ctx, t, pool, f.sessionID, nil, auth)
+
+	if err := rig.actor.Send(ctx, TimerFired{Name: TimerOwedReviewRequest}); err != nil {
+		t.Fatal(err)
+	}
+	mailboxBarrier(ctx, t, rig.actor)
+	if rows := owedRows(ctx, t, pool, f.sessionID); len(rows) != 0 {
+		t.Fatalf("owed requests = %d, want the request dropped", len(rows))
+	}
+	if armed, _ := owedTimer(ctx, t, pool, f.sessionID); armed {
+		t.Fatal("the owed timer outlived the request it served")
+	}
+	if n := prNotices(ctx, t, f); n != 0 {
+		t.Fatalf("pull request notices = %d, want none", n)
+	}
+	if runs := reRuns(ctx, t, f); len(runs) != 0 {
+		t.Fatalf("re-runs = %d, want none", len(runs))
+	}
+	if status, _ := readStepRun(ctx, t, pool, stepRun); status != "cancelled" {
+		t.Fatalf("the moved attempt's step is %s, want cancelled", status)
+	}
+	if _, due, _, ok := f.debounce(ctx, t); !ok || !due {
+		t.Fatalf("the debounce the owed term held: armed %v due %v, want it woken by the drop", ok, due)
 	}
 }

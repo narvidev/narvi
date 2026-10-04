@@ -86,10 +86,10 @@
 -- request_trigger (migrations/000159_turns_end_reason.up.sql, technical
 -- plan §24.9) is what asked for the turn, for a lane that records it:
 -- 'auto' for the automatic re-review (sessionactor's
--- insertAutoRetriggerTurn); 'label', 'button' or 'mention' for a person's
--- (migrations/000160: the GitHub label and mention lanes, the web
--- re-review button, and the re-run of a request owed to its requester);
--- nil for every other call site. A review attempt one of those lanes asked
+-- insertAutoRetriggerTurn); 'label' or 'button' for a person's
+-- (migrations/000160: the GitHub label lane, the web re-review button, and
+-- the re-run of a request owed to its requester); nil for every other call
+-- site, a mention's included. A review attempt one of those lanes asked
 -- for is checked against its pull request's live context when it is
 -- dispatched after waiting behind another turn (sessionactor's
 -- reviewcontextcheck.go).
@@ -177,7 +177,7 @@ LIMIT 1;
 -- that may still find a moved context); read as not, it starts unchecked,
 -- as every attempt did before this rule. Only a review attempt a lane that
 -- records its trigger asked for is asked -- the automatic re-review
--- ('auto') or a person's request ('label', 'button', 'mention',
+-- ('auto') or a person's request ('label', 'button',
 -- migrations/000160), the kinds the check applies to
 -- (turn.ContextCheckedAtDispatch) -- so no other pick, a follow-up or an
 -- attempt an older binary inserted, costs the walk. The walk reads the
@@ -198,7 +198,7 @@ SELECT
     b.request_trigger,
     b.review_head_sha,
     b.review_verdict_context,
-    (b.is_review_attempt AND COALESCE(b.request_trigger, '') IN ('auto', 'label', 'button', 'mention') AND EXISTS (
+    (b.is_review_attempt AND COALESCE(b.request_trigger, '') IN ('auto', 'label', 'button') AND EXISTS (
         SELECT 1 FROM turns o
         WHERE o.session_id = b.session_id
           AND (o.created_at < b.created_at OR (o.created_at = b.created_at AND o.id < b.id))

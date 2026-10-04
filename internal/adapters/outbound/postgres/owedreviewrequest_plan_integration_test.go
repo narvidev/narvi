@@ -248,7 +248,7 @@ func TestOwedReviewRequest_PlansReadTheSessionsOwnRows(t *testing.T) {
 	// main's text of the pre-read compared the trigger with 'auto' alone.
 	preReadBefore := preparedStatement160("GetReviewAttemptToCheck",
 		before160(t, generatedQuery(t, "turns.sql.go", "getReviewAttemptToCheck"), "GetReviewAttemptToCheck",
-			[]textEdit{{old: "COALESCE(b.request_trigger, '') IN ('auto', 'label', 'button', 'mention')", new: "COALESCE(b.request_trigger, '') = 'auto'", n: 1}}),
+			[]textEdit{{old: "COALESCE(b.request_trigger, '') IN ('auto', 'label', 'button')", new: "COALESCE(b.request_trigger, '') = 'auto'", n: 1}}),
 		func(p holdPlanProbe) []any { return []any{p.sessionID} }, uuidArg)
 	modes := []string{"force_custom_plan", "force_generic_plan"}
 

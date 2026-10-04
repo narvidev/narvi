@@ -125,7 +125,7 @@ func newOwedLabelFixture(ctx context.Context, t *testing.T) owedLabelFixture {
 		sessionactor.RegistryOptions{
 			ReviewDiffFetcher: f.pr, ReviewLiveReader: f.pr, GitHubBotHandle: testBotHandleIntegration,
 			GitHubOutbound:          platform.MustNewGitHubOutboundConfig("test-token"),
-			ReviewRequestAuthorizer: httpapi.NewReviewRequestAuthorizer(users, sessions, participants),
+			ReviewRequestAuthorizer: httpapi.NewReviewRequestAuthorizer(users),
 		})
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)

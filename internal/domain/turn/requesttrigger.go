@@ -14,22 +14,25 @@ const (
 	// RequestTriggerButton is a person's request through the web re-review
 	// button (§8.2, §12.2).
 	RequestTriggerButton = "button"
-	// RequestTriggerMention is a person's request through a mention of the
-	// bot on the pull request (§8.2).
-	RequestTriggerMention = "mention"
 )
 
+// A mention records no trigger. On a session that exists, a mention's turn
+// is a follow-up, no review attempt (github/coalesce.go's REUSE branch);
+// on a new session it is the session's first turn, which waits behind
+// nothing. Either way no context check applies to it, so no mention is
+// ever owed.
+
 // IsHumanRequestTrigger reports whether requestTrigger names one of a
-// person's three request lanes -- the label, the button, a mention --
-// whose review attempt, when it meets a moved context at dispatch, is owed
-// to its requester rather than asked again of the automatic lane
-// (technical plan §24.9).
+// person's two request lanes that ask for a review attempt that can wait
+// behind another turn -- the label and the button -- whose attempt, when it
+// meets a moved context at dispatch, is owed to its requester rather than
+// asked again of the automatic lane (technical plan §24.9).
 func IsHumanRequestTrigger(requestTrigger *string) bool {
 	if requestTrigger == nil {
 		return false
 	}
 	switch *requestTrigger {
-	case RequestTriggerLabel, RequestTriggerButton, RequestTriggerMention:
+	case RequestTriggerLabel, RequestTriggerButton:
 		return true
 	default:
 		return false

@@ -567,9 +567,9 @@ func (a *Actor) disarmWorkCreatingTimers(ctx context.Context, tx pgx.Tx, request
 // sessionRow.StopRequestedAt, the rule disarmWorkCreatingTimers deletes
 // the owed_review_request timer by -- the database's clock on both sides.
 // A stop is the person's answer, so none of them is re-run and no
-// requester is told; each moved turn's workflow attempt, which the re-run
-// would have taken over, ends the way a stopped attempt ends
-// (settleOwedRequestWorkflow), and the hold's owed term is released
+// requester is told; each moved turn's workflow run, whose attempt the
+// re-run would have taken over, ends cancelled as a stopped run ends
+// (withdrawOwedRequestWorkflow), and the hold's owed term is released
 // (wakeHeldReviewRetrigger, under the stop's own rule). A request owed
 // after the stop was made by a turn created after it -- the dispatch's
 // stop gate cancels every flagged one before it is checked -- so it is new
@@ -592,7 +592,7 @@ func (a *Actor) dropOwedReviewRequestsForStop(ctx context.Context, tx pgx.Tx, se
 		return nil
 	}
 	for _, d := range dropped {
-		a.settleOwedRequestWorkflow(ctx, tx, sessionRow, d.MovedTurnID)
+		a.withdrawOwedRequestWorkflow(ctx, tx, d.MovedTurnID)
 		a.logger.Info("sessionactor: an owed review request dropped by a person's stop",
 			"owed_id", d.ID.String(), "moved_turn_id", d.MovedTurnID.String(), "request_trigger", d.Trigger)
 	}

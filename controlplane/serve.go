@@ -697,7 +697,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			// request whose pull request moved while it waited is re-run,
 			// the actor asks again the role check its lane applied when it
 			// was made -- httpapi's own, which the actor cannot import.
-			ReviewRequestAuthorizer: httpapi.NewReviewRequestAuthorizer(postgres.NewUserStore(pool), postgres.NewSessionStore(pool), postgres.NewParticipantStore(pool)),
+			ReviewRequestAuthorizer: httpapi.NewReviewRequestAuthorizer(postgres.NewUserStore(pool)),
 			ReviewModelDeep:         cfg.ReviewModelDeep,
 			// ReviewSizeExclusions (§26.3): the deployment's size
 			// patterns, the same list the other two review lanes' own

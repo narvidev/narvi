@@ -60,7 +60,7 @@ type contextPlanShape struct {
 	interleave                  int
 	// tailTrigger is the lane the long session's "attempt" or "queued"
 	// tail recorded as asking for it: 'auto' when empty, a person's lane
-	// ('button', 'label', 'mention') for the owed requests' plan test.
+	// ('button' or 'label') for the owed requests' plan test.
 	tailTrigger string
 }
 

@@ -26,7 +26,6 @@ func TestOwedRequestDropMessage(t *testing.T) {
 	}{
 		{name: "the button, past the bound", trigger: turn.RequestTriggerButton, why: owedRequestDropBound, moves: 4, want: []string{"the Re-run review button", "4 times in a row"}},
 		{name: "the label, no longer authorized", trigger: turn.RequestTriggerLabel, why: owedRequestDropUnauthorized, moves: 1, want: []string{"the re-review label", "can no longer request reviews"}},
-		{name: "a mention, no longer authorized", trigger: turn.RequestTriggerMention, why: owedRequestDropUnauthorized, moves: 2, want: []string{"a mention of the bot", "can no longer request reviews"}},
 		{name: "a lane no human records", trigger: turn.RequestTriggerAuto, why: owedRequestDropBound, moves: 5, want: []string{"a person", "5 times in a row"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

@@ -85,9 +85,9 @@
 // that has not held yet is left to run out (§24.2). Anything that launches a
 // review through this debounce -- setting the pending head and arming the
 // timer -- is held the same way. A person's trigger (the label, the
-// button, a mention) inserts its turn directly and is never held; one whose
-// context moved while it waited is owed and re-run by its own timer, never
-// by this lane.
+// button, a mention) inserts its turn directly and is never held; a label's
+// or the button's whose context moved while it waited is owed and re-run by
+// its own timer, never by this lane.
 //
 // Every attempt this lane inserts is marked request_trigger 'auto'
 // (insertAutoRetriggerTurn). One that nonetheless waited behind another

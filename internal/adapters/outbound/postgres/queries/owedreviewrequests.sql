@@ -1,6 +1,6 @@
 -- Queries backing OwedReviewRequestStore: technical plan §24.9's owed
 -- human review requests (migrations/000160). A person's review attempt
--- (the label, the web button, a mention) that waited behind another turn
+-- (the label or the web button) that waited behind another turn
 -- and found its pull request moved past the context it recorded ends
 -- context_moved, and its request becomes a row here, owed to its
 -- requester; the session actor's owed_review_request timer consumes the
@@ -14,8 +14,23 @@
 -- same transaction as that end and the arm of the owed_review_request
 -- timer. created_at is the database's now: the instant a person's stop
 -- compares with.
+--
+-- requested_by is the requester the turn recorded only while their account
+-- still exists: turns.requested_by takes no foreign key, so a turn queued
+-- before its requester's account was deleted still names it, and writing
+-- that id here would break this table's key and roll the whole dispatch
+-- back, on every evaluation. Read through users instead, a deleted
+-- requester is owed as no one (NULL), which the consumer reads as
+-- unauthorized: the request is dropped and told once.
 INSERT INTO owed_review_requests (session_id, requested_by, trigger, request_text, is_review_attempt, context_moves, moved_turn_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+VALUES (
+    sqlc.arg('session_id'),
+    (SELECT u.id FROM users u WHERE u.id = sqlc.narg('requested_by')::uuid),
+    sqlc.arg('trigger'),
+    sqlc.narg('request_text'),
+    sqlc.arg('is_review_attempt'),
+    sqlc.arg('context_moves'),
+    sqlc.arg('moved_turn_id'))
 RETURNING *;
 
 -- name: GetOldestOwedReviewRequest :one

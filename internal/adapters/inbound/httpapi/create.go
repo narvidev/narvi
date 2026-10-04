@@ -128,10 +128,10 @@ type ChildSessionOptions struct {
 
 	// RequestTrigger and RequestText (technical plan §24.9) mirror
 	// CreateTurnOptions.RequestTrigger/RequestText (turn.go) for a new
-	// review session's first turn: github/coalesce.go's WINNER branch, the
-	// one caller with a request lane to record ("label" or "mention"), sets
-	// both, and the turn records createdBy as its requester with them. nil
-	// for every other caller.
+	// review session's first turn: github/coalesce.go's WINNER branch sets
+	// both for a label event ("label"), and the turn records createdBy as
+	// its requester with them. nil for every other caller, a mention
+	// included.
 	RequestTrigger *string
 	RequestText    *string
 

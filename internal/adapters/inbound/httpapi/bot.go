@@ -166,7 +166,8 @@ func CreateSessionForBot(ctx context.Context, pool *pgxpool.Pool, sessions *post
 // reviewHeadSHA's own presence.
 //
 // requestTrigger/requestText (technical plan §24.9) are the request lane
-// this turn came through ("label" or "mention") and the lane's own text --
+// this turn came through ("label"; nil for a mention, which records none)
+// and the lane's own text --
 // see CreateTurnOptions.RequestTrigger/RequestText's own doc comment
 // (turn.go); with them the turn records actorUserID as its requester.
 func CreateTurnForBot(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, reviewHeadSHA *string, classifyText *string, effort *string, reviewDepth *string, reviewDepthDecision []byte, reviewKnowledgeMode *string, reviewKnowledgeDecision []byte, reviewVerdictContextJSON []byte, isReviewAttempt bool, requestTrigger *string, requestText *string) (sqlcgen.Turn, error) {

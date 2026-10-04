@@ -4,10 +4,12 @@
 //
 // # Where a request becomes owed
 //
-// A person's review request -- the configured GitHub label, the web
-// re-review button, a mention (turns.request_trigger 'label', 'button',
-// 'mention') -- queues its review attempt at once, behind whatever turn of
-// the session is open. When that attempt is dispatched after waiting, the
+// A person's review request through the configured GitHub label or the
+// web Re-run review button (turns.request_trigger 'label', 'button')
+// queues its review attempt at once, behind whatever turn of the session is
+// open. (A mention never does: on a session that exists it is no review
+// attempt, and on a new one it is the session's first turn, which waits
+// behind nothing.) When that attempt is dispatched after waiting, the
 // context check (reviewcontextcheck.go) compares the head, base and
 // ancestor chain it recorded with the pull request's live ones; one that
 // moved does not start. It ends context_moved, and its request is owed to
@@ -35,11 +37,14 @@
 //     head it has now from the request's own text (composeReviewTurn, the
 //     composition the automatic lane shares).
 //  3. One transaction deletes the request and inserts its re-run turn on the
-//     person's path (insertOwedReviewRequestTurn) -- never through the
+//     person's path (insertOwedReviewRequestTurn): the workflow step the
+//     person's own request resolves to shapes it -- its prompt template,
+//     model and effort -- as createTurnLocked's does, and never the
 //     automatic lane's opt-in, hold, budget or "already reviewed"
-//     comparison, which a person's request is exempt from -- or, for a
-//     requester no longer authorized, drops it and tells them once. The
-//     timer is re-armed due at once while more is owed, deleted otherwise.
+//     comparison, which a person's request is exempt from. Or, for a
+//     requester no longer authorized -- or no longer known, their account
+//     deleted -- it drops it and tells them once. The timer is re-armed due
+//     at once while more is owed, deleted otherwise.
 //
 // A pull request that cannot be read, or an authorization that cannot be
 // evaluated, keeps the request: the timer backs off on the dispatch
@@ -55,7 +60,9 @@
 // the drop's transaction (wakeHeldReviewRetrigger). A moved attempt the
 // workflow engine tracked keeps its step attempt live while the request is
 // owed: the re-run turn takes it over (handOverOwedRequestWorkflow), and a
-// drop ends it the way a failed attempt ends (settleOwedRequestWorkflow).
+// drop ends its run cancelled, the way a person's stop does
+// (workflowengine.OnTurnWithdrawn): a drop is a policy decision, not the
+// step's outcome, so no edge is followed and no second notice posted.
 
 package sessionactor
 
@@ -167,7 +174,7 @@ func (a *Actor) handleOwedReviewRequestTimer(ctx context.Context) error {
 		if stopPredates(sessionRow, served) {
 			// A stop requested while this read the pull request: the
 			// request is dropped as the stop timer would drop it.
-			a.settleOwedRequestWorkflow(ctx, tx, sessionRow, served.MovedTurnID)
+			a.withdrawOwedRequestWorkflow(ctx, tx, served.MovedTurnID)
 			if err := a.wakeHeldReviewRetrigger(ctx, tx, "a stop dropped an owed review request"); err != nil {
 				return err
 			}
@@ -175,16 +182,15 @@ func (a *Actor) handleOwedReviewRequestTimer(ctx context.Context) error {
 			return a.rearmOrDeleteOwedReviewRequestTimer(ctx, tx)
 		}
 		if !allowed {
-			if err := a.dropOwedReviewRequest(ctx, tx, sessionRow, served, owed.repoFullName, owed.prNumber, owedRequestDropUnauthorized); err != nil {
+			if err := a.dropOwedReviewRequest(ctx, tx, served, owed.repoFullName, owed.prNumber, owedRequestDropUnauthorized); err != nil {
 				return err
 			}
 			return a.rearmOrDeleteOwedReviewRequestTimer(ctx, tx)
 		}
-		created, err := a.insertOwedReviewRequestTurn(ctx, tx, served, composed, owed.repoFullName, owed.prNumber)
+		created, err := a.insertOwedReviewRequestTurn(ctx, tx, sessionRow, served, composed, owed.repoFullName, owed.prNumber)
 		if err != nil {
 			return err
 		}
-		a.handOverOwedRequestWorkflow(ctx, tx, served.MovedTurnID, created.ID)
 		a.logger.Info("sessionactor: owed_review_request: a person's review request re-run for the head the pull request has now",
 			"owed_id", served.ID.String(), "turn_id", created.ID.String(), "request_trigger", served.Trigger,
 			"head_sha", composed.reviewCtx.HeadSHA, "moves", served.ContextMoves)
@@ -236,7 +242,7 @@ func (a *Actor) readOwedReviewRequest(ctx context.Context) (*owedRequest, error)
 			if _, err := requests.Delete(ctx, row.ID); err != nil {
 				return fmt.Errorf("sessionactor: delete the owed review request: %w", err)
 			}
-			a.settleOwedRequestWorkflow(ctx, tx, sessionRow, row.MovedTurnID)
+			a.withdrawOwedRequestWorkflow(ctx, tx, row.MovedTurnID)
 			if err := a.wakeHeldReviewRetrigger(ctx, tx, "an owed review request with no pull request was dropped"); err != nil {
 				return err
 			}
@@ -251,7 +257,7 @@ func (a *Actor) readOwedReviewRequest(ctx context.Context) (*owedRequest, error)
 			if _, err := requests.Delete(ctx, row.ID); err != nil {
 				return fmt.Errorf("sessionactor: delete the owed review request: %w", err)
 			}
-			if err := a.dropOwedReviewRequest(ctx, tx, sessionRow, row, prSession.RepoFullName, prSession.PrNumber, owedRequestDropBound); err != nil {
+			if err := a.dropOwedReviewRequest(ctx, tx, row, prSession.RepoFullName, prSession.PrNumber, owedRequestDropBound); err != nil {
 				return err
 			}
 			return a.rearmOrDeleteOwedReviewRequestTimer(ctx, tx)
@@ -273,21 +279,23 @@ func stopPredates(sessionRow sqlcgen.Session, owed sqlcgen.OwedReviewRequest) bo
 
 // authorizeOwedReviewRequest asks the registry's ReviewRequestAuthorizer
 // whether owed's requester may still have it run on repoFullName's pull
-// request. With no authorizer wired, no answer can be had: the request is
-// read as unauthorized -- dropped and its requester told -- never re-run
-// unchecked.
+// request. A request whose requester is no longer known -- their account
+// deleted, before the request was owed or since -- is unauthorized without
+// asking: no one is left to ask for. With no authorizer wired, no answer
+// can be had either. Either way the request is dropped and its requester
+// told, never re-run unchecked.
 func (a *Actor) authorizeOwedReviewRequest(ctx context.Context, owed sqlcgen.OwedReviewRequest, repoFullName string) (bool, error) {
+	if !owed.RequestedBy.Valid {
+		a.logger.Info("sessionactor: owed_review_request: the requester's account no longer exists; the request is unauthorized", "owed_id", owed.ID.String())
+		return false, nil
+	}
 	if a.reviewRequestAuthorizer == nil {
 		a.logger.Warn("sessionactor: owed_review_request: no review request authorizer is configured; the request cannot be authorized again", "owed_id", owed.ID.String())
 		return false, nil
 	}
-	var requestedBy string
-	if owed.RequestedBy.Valid {
-		requestedBy = owed.RequestedBy.String()
-	}
 	return a.reviewRequestAuthorizer.AuthorizeReviewRequest(ctx, ports.ReviewRequest{
 		SessionID:    a.sessionID.String(),
-		RequestedBy:  requestedBy,
+		RequestedBy:  owed.RequestedBy.String(),
 		Trigger:      owed.Trigger,
 		RepoFullName: repoFullName,
 	})
@@ -328,16 +336,19 @@ func (a *Actor) rearmOrDeleteOwedReviewRequestTimer(ctx context.Context, tx pgx.
 }
 
 // insertOwedReviewRequestTurn inserts owed's re-run in tx, on the person's
-// path: the same store-level insert every turn takes
-// (TurnStore.CreateAndArmDispatch, which arms the dispatch timer) and the
-// audit row createTurnLocked writes, attributed to the requester -- and
+// path: the workflow step resolution createTurnLocked applies (the step's
+// prompt template, model and effort over the composed prompt and the
+// triage's model and effort), the same store-level insert every turn takes
+// (TurnStore.CreateAndArmDispatch, which arms the dispatch timer), the
+// step attempt -- the moved turn's, handed over, or a new run's -- and the
+// audit row createTurnLocked writes, attributed to the requester; and
 // nothing of the automatic lane's: no opt-in, hold, budget or "already
 // reviewed" check, which a person's request is exempt from, and no budget
 // slot spent. The turn carries the request on -- its trigger, requester,
 // text and count of moves in a row, so a move it meets in turn is counted
 // from there -- and the head, context, depth and prompt composed for the
 // head the pull request has now.
-func (a *Actor) insertOwedReviewRequestTurn(ctx context.Context, tx pgx.Tx, owed sqlcgen.OwedReviewRequest, composed composedReviewTurn, repoFullName string, prNumber int32) (sqlcgen.Turn, error) {
+func (a *Actor) insertOwedReviewRequestTurn(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, owed sqlcgen.OwedReviewRequest, composed composedReviewTurn, repoFullName string, prNumber int32) (sqlcgen.Turn, error) {
 	reviewCtx := composed.reviewCtx
 	verdictContextJSON, err := json.Marshal(reviewverdict.Context{
 		BaseRef:       reviewCtx.BaseRef,
@@ -359,16 +370,24 @@ func (a *Actor) insertOwedReviewRequestTurn(ctx context.Context, tx pgx.Tx, owed
 	if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
 		correlationID = &id
 	}
+	// The workflow step the person's request resolves to, as
+	// createTurnLocked resolves it (workflowengine.ResolveStepForNewTurn):
+	// its prompt template, model and effort shape the re-run. While the
+	// moved attempt's own step attempt is live, its run is running and that
+	// same step resolves; with none running, a new run starts and tracks
+	// the re-run, as it would a person's fresh request.
+	workflows := a.stores.workflow.WithTx(tx)
+	resolution := workflowengine.ResolveStepForNewTurn(ctx, workflows, sessionRow, composed.prompt, composed.modelID, composed.effort)
 	trigger := owed.Trigger
 	headSHA := reviewCtx.HeadSHA
-	prompt := composed.prompt
+	prompt := resolution.Prompt
 	moves := owed.ContextMoves
 	created, err := a.stores.turn.WithTx(tx).CreateAndArmDispatch(ctx, sqlcgen.CreateTurnParams{
 		SessionID:               a.sessionID,
 		Status:                  sqlcgen.TurnStatusPending,
 		Prompt:                  &prompt,
-		ModelID:                 composed.modelID,
-		Effort:                  composed.effort,
+		ModelID:                 resolution.ModelID,
+		Effort:                  resolution.Effort,
 		PlanMode:                false,
 		ReviewHeadSha:           &headSHA,
 		ReviewDepth:             reviewDepth,
@@ -385,6 +404,11 @@ func (a *Actor) insertOwedReviewRequestTurn(ctx context.Context, tx pgx.Tx, owed
 	})
 	if err != nil {
 		return sqlcgen.Turn{}, fmt.Errorf("sessionactor: insert the owed review request's re-run: %w", err)
+	}
+	if resolution.Tracked {
+		workflowengine.AttachTurn(ctx, workflows, resolution, created.ID)
+	} else {
+		a.handOverOwedRequestWorkflow(ctx, tx, owed.MovedTurnID, created.ID)
 	}
 	if err := auditlog.Record(ctx, a.stores.auditLog.WithTx(tx), owed.RequestedBy, "turn.create", "turn", created.ID.String(), map[string]any{
 		"session_id":      a.sessionID.String(),
@@ -407,8 +431,6 @@ func owedRequestLane(trigger string) string {
 		return "the Re-run review button"
 	case turn.RequestTriggerLabel:
 		return "the re-review label"
-	case turn.RequestTriggerMention:
-		return "a mention of the bot"
 	default:
 		return "a person"
 	}
@@ -429,12 +451,12 @@ func owedRequestDropMessage(trigger string, why owedRequestDrop, moves int32) st
 // through the verdict outbox -- the sanctioned way a review session posts
 // anything to a pull request (§5.2), like the budget notice
 // (enqueueAutoRetriggerBudgetExhaustedNotice), with no risk level so no
-// label moves -- and one session warning. The moved turn's workflow
-// attempt ends the way a failed attempt ends (settleOwedRequestWorkflow),
-// and the hold's owed term is released (wakeHeldReviewRetrigger), all in
-// tx: the row's delete and the notice commit together, so a drop is told
-// exactly once.
-func (a *Actor) dropOwedReviewRequest(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, owed sqlcgen.OwedReviewRequest, repoFullName string, prNumber int32, why owedRequestDrop) error {
+// label moves -- and one session warning. The moved turn's workflow run,
+// when one tracked it, ends cancelled with no edge followed and no notice
+// of its own (withdrawOwedRequestWorkflow), and the hold's owed term is
+// released (wakeHeldReviewRetrigger), all in tx: the row's delete and the
+// notice commit together, so a drop is told exactly once.
+func (a *Actor) dropOwedReviewRequest(ctx context.Context, tx pgx.Tx, owed sqlcgen.OwedReviewRequest, repoFullName string, prNumber int32, why owedRequestDrop) error {
 	message := owedRequestDropMessage(owed.Trigger, why, owed.ContextMoves)
 	if owner, repo, ok := reposource.SplitFullName(repoFullName); ok {
 		payload, err := json.Marshal(githubapi.VerdictPayload{
@@ -467,7 +489,7 @@ func (a *Actor) dropOwedReviewRequest(ctx context.Context, tx pgx.Tx, sessionRow
 	if err := a.recordSessionWarning(ctx, tx, gen, message); err != nil {
 		return err
 	}
-	a.settleOwedRequestWorkflow(ctx, tx, sessionRow, owed.MovedTurnID)
+	a.withdrawOwedRequestWorkflow(ctx, tx, owed.MovedTurnID)
 	if err := a.wakeHeldReviewRetrigger(ctx, tx, "an owed review request was dropped"); err != nil {
 		return err
 	}
@@ -498,19 +520,14 @@ func (a *Actor) handOverOwedRequestWorkflow(ctx context.Context, tx pgx.Tx, move
 	}
 }
 
-// settleOwedRequestWorkflow ends the workflow attempt the moved turn held,
-// when the workflow engine tracked it, now that its request is dropped:
-// the hook endContextMovedTurn deferred while the request was owed, run
-// for the moved turn's own abandon edge -- a failed attempt, or a cancelled
-// run while a person's stop stands. A no-op for an untracked turn.
-func (a *Actor) settleOwedRequestWorkflow(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, movedTurnID pgtype.UUID) {
-	workflowengine.OnTurnCompleted(ctx, workflowengine.Deps{
-		Workflows:             a.stores.workflow.WithTx(tx),
-		Turns:                 a.stores.turn.WithTx(tx),
-		SlackThreadSessions:   a.stores.slackThreadSession.WithTx(tx),
-		LinearAgentSessions:   a.stores.linearAgentSession.WithTx(tx),
-		GitHubPRSessions:      a.stores.githubPRSession.WithTx(tx),
-		Outbox:                a.stores.outbox.WithTx(tx),
-		EpistemicCheckDefault: a.epistemicCheckDefault,
-	}, sessionRow, movedTurnID, turn.TriggerAbandon)
+// withdrawOwedRequestWorkflow ends the workflow run the moved turn's step
+// attempt belongs to, when the engine tracked one, now that its request is
+// dropped: cancelled, the way a person's stop ends a run
+// (workflowengine.OnTurnWithdrawn). A drop is a policy decision -- the
+// requester may no longer ask, the pull request kept moving, a stop came
+// first -- never the step's outcome: no edge is followed, so no attempt of
+// the step is queued again, and no escalation notice joins the one the
+// drop posted. A no-op for an untracked turn.
+func (a *Actor) withdrawOwedRequestWorkflow(ctx context.Context, tx pgx.Tx, movedTurnID pgtype.UUID) {
+	workflowengine.OnTurnWithdrawn(ctx, a.stores.workflow.WithTx(tx), movedTurnID)
 }

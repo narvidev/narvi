@@ -210,11 +210,12 @@ func TestIgnoredForEndReason(t *testing.T) {
 }
 
 // TestContextCheckedAtDispatch pins which turns technical plan §24.9's
-// context check applies to: a review attempt the automatic re-review or a
-// person's request lane asked for, and nothing else -- not a turn that is
-// no review attempt, not a turn with no recorded trigger or one no lane
-// records. It pins IsHumanRequestTrigger beside it: the three lanes whose
-// moved attempt is owed to its requester, never the automatic one.
+// context check applies to: a review attempt the automatic re-review, the
+// label or the button asked for, and nothing else -- not a turn that is no
+// review attempt, not a turn with no recorded trigger or one no lane
+// records (a mention records none). It pins IsHumanRequestTrigger beside
+// it: the two lanes whose moved attempt is owed to its requester, never
+// the automatic one.
 func TestContextCheckedAtDispatch(t *testing.T) {
 	t.Parallel()
 
@@ -228,12 +229,12 @@ func TestContextCheckedAtDispatch(t *testing.T) {
 		{name: "an automatic review attempt", isReviewAttempt: true, trigger: ptr(turn.RequestTriggerAuto), checked: true},
 		{name: "a review attempt the label asked for", isReviewAttempt: true, trigger: ptr(turn.RequestTriggerLabel), checked: true, human: true},
 		{name: "a review attempt the button asked for", isReviewAttempt: true, trigger: ptr(turn.RequestTriggerButton), checked: true, human: true},
-		{name: "a review attempt a mention asked for", isReviewAttempt: true, trigger: ptr(turn.RequestTriggerMention), checked: true, human: true},
+		{name: "a review attempt with a trigger 'mention', which no lane records", isReviewAttempt: true, trigger: ptr("mention")},
 		{name: "a review attempt with no trigger recorded", isReviewAttempt: true},
 		{name: "a review attempt with an empty trigger", isReviewAttempt: true, trigger: ptr("")},
 		{name: "a review attempt with a trigger no lane records", isReviewAttempt: true, trigger: ptr("slack")},
 		{name: "an automatic turn that is no review attempt", trigger: ptr(turn.RequestTriggerAuto)},
-		{name: "a follow-up mention, no review attempt", trigger: ptr(turn.RequestTriggerMention), human: true},
+		{name: "a follow-up the button lane recorded, no review attempt", trigger: ptr(turn.RequestTriggerButton), human: true},
 		{name: "a follow-up", trigger: nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

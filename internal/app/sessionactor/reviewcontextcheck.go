@@ -41,7 +41,7 @@
 //     is dropped instead, and the session's status shows the drop. When a
 //     younger automatic attempt already queued recorded the live head, it
 //     stands for the request, and nothing is asked again. A person's
-//     request (the label, the button, a mention) is owed to its requester
+//     request (the label, the button) is owed to its requester
 //     instead (oweReviewRequest): a row of owed_review_requests with its
 //     count of moves in a row, and the owed_review_request timer due at
 //     once, whose consumer re-runs it for the head the pull request has
@@ -392,7 +392,7 @@ const contextMovedReasonPrefix = "review context moved before the review started
 //     no channel notice, no check, no session warning, no workflow hook:
 //     it notifies nobody and fails nothing;
 //   - the session's status re-derived without it;
-//   - a person's request (the label, the button, a mention) owed to its
+//   - a person's request (the label, the button) owed to its
 //     requester (oweReviewRequest): a row of owed_review_requests, its
 //     count of moves in a row grown by one, and the owed_review_request
 //     timer due at once, whose consumer re-runs the request for the head

@@ -14,8 +14,8 @@ type ReviewRequest struct {
 	// known (the account was deleted), which no implementation may read as
 	// authorized.
 	RequestedBy string
-	// Trigger is the lane the request came through: "label", "button" or
-	// "mention" (internal/domain/turn's RequestTrigger* values).
+	// Trigger is the lane the request came through: "label" or "button"
+	// (internal/domain/turn's RequestTrigger* values).
 	Trigger string
 	// RepoFullName is the pull request's base repository, owner/repo.
 	RepoFullName string

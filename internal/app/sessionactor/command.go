@@ -65,7 +65,7 @@ const (
 	TimerDispatch = "dispatch"
 
 	// TimerOwedReviewRequest is technical plan §24.9's owed human review
-	// request: a person's review attempt (the label, the button, a mention)
+	// request: a person's review attempt (the label, the button)
 	// that waited behind another turn and met a moved context when it was
 	// dispatched ends context_moved, and its request becomes a row of
 	// owed_review_requests (migrations/000160). The dispatching transaction

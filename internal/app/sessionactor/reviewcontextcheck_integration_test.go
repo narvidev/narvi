@@ -1183,3 +1183,33 @@ func TestReviewContext_TheTurnQueuedBehindAMovedAttemptStartsAtOnce(t *testing.T
 	waitForTurnStatus(ctx, t, f.turns, behind.ID, sqlcgen.TurnStatusProcessing)
 	waitForPrompts(t, rig.commander, 1, "the turn behind the moved attempt's")
 }
+
+// TestReviewContext_AYoungerPersonsAttemptOfTheLiveHeadDoesNotStandForTheAutomaticRequest:
+// an automatic attempt whose context moved is asked again of the automatic
+// lane unless a younger automatic attempt already queued recorded the live
+// head (technical plan §24.9). A person's attempt of the live head does not
+// stand for it: it is a person's request, which may itself be owed and
+// dropped, so the automatic request goes back to the lane -- its pending
+// head the live one, the debounce due at once.
+func TestReviewContext_AYoungerPersonsAttemptOfTheLiveHeadDoesNotStandForTheAutomaticRequest(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newContextFixture(ctx, t, pool, "acme/context-younger-person", 690)
+	seedRunningTurn(ctx, t, f)
+	attempt := seedAttempt(ctx, t, f, autoTrigger(), recordedContext(t, defaultRecordedContext()))
+	button := turn.RequestTriggerButton
+	seedAttemptOf(ctx, t, f, &button, recordedContext(t, defaultRecordedContext()), ctxMovedHead, 5)
+	reader := unmovedLiveReader(f.repoFullName, f.prNumber)
+	reader.pr.HeadSHA = ctxMovedHead
+	rig := newContextRig(ctx, t, pool, f.sessionID, reader)
+
+	endRunningTurn(ctx, t, f, rig)
+	assertContextMoved(ctx, t, f, rig, attempt)
+	row := f.prSession(ctx, t)
+	if row.PendingRetriggerHeadSha == nil || *row.PendingRetriggerHeadSha != ctxMovedHead || row.AutoRetriggerContextMoves != 1 {
+		t.Fatalf("pull request: pending %v moves %d; want the live head %s asked again of the lane, one move", row.PendingRetriggerHeadSha, row.AutoRetriggerContextMoves, ctxMovedHead)
+	}
+	if _, due, _, ok := f.debounce(ctx, t); !ok || !due {
+		t.Fatalf("debounce: armed %v due %v, want it armed due at once", ok, due)
+	}
+}

@@ -1705,7 +1705,8 @@ it lands, and the queued ones run in full on diffs that no longer exist. Two rul
   attempts excludes it (enumerated and pinned by a test); it notifies nobody, publishes no
   not-assessed check and fails nothing. The work is re-armed in the dispatching transaction, never by
   a call back into the actor handling the dispatch. An automatic request goes back to the lane as its
-  pending target. A human request becomes a row of an owed-requests table keeping its requester,
+  pending target. A human request -- the label's or the button's; a mention never queues a review
+  attempt, so it is never owed -- becomes a row of an owed-requests table keeping its requester,
   trigger and text, and the same transaction upserts a named session timer, classified in §43.20's
   timer table, whose handler is the consumer: outside any transaction it refetches the context,
   composes the prompt for the new head and checks the requester's authorization again through an
@@ -1784,12 +1785,14 @@ it lands, and the queued ones run in full on diffs that no longer exist. Two rul
   clock leads the database's. The third PR extends the check to a person's request, which queues
   routinely (below).
 
-  As shipped for a person's request (the third PR). The three human lanes record what asked for the
-  turn beside it: `turns.request_trigger` (`label`, `button`, `mention`), `turns.requested_by` and
-  `turns.request_text`, the lane's own text before any context is folded in -- the label's or the
-  button's fixed sentence, or the mention's body (`CreateTurnOptions.RequestTrigger`/`RequestText`,
-  `httpapi.CreateTurnForBot`, `ChildSessionOptions` for a new session's first turn). The pre-read
-  walks for a review attempt any of the four lanes asked for (`turn.ContextCheckedAtDispatch`); a
+  As shipped for a person's request (the third PR). The two human lanes whose request queues as a
+  review attempt record what asked for the turn beside it: `turns.request_trigger` (`label`,
+  `button`), `turns.requested_by` and `turns.request_text`, the lane's own text before any context
+  is folded in -- the label's or the button's fixed sentence (`CreateTurnOptions.RequestTrigger`/
+  `RequestText`, `httpapi.CreateTurnForBot`, `ChildSessionOptions` for the first turn of a session a
+  label opens). A mention records none: on a session that exists its turn is no review attempt, and
+  a new session's first turn waits behind nothing, so it is never owed. The pre-read walks for a
+  review attempt any of the three lanes asked for (`turn.ContextCheckedAtDispatch`); a
   person's that waited behind another turn is compared like an automatic one, and only an automatic
   one's start resets the pull request's count of moves. A person's moved attempt ends
   `context_moved` exactly as an automatic one does, and in the same transaction its request is owed
@@ -1803,27 +1806,34 @@ it lands, and the queued ones run in full on diffs that no longer exist. Two rul
   decides the depth and composes the prompt from the request's own text (`composeReviewTurn`, the
   composition the automatic lane shares) and asks whether the requester may still have it run
   (`ports.ReviewRequestAuthorizer`, which the control plane wires to `httpapi`'s
-  `ReviewRequestAuthorizer`: re-trigger reviews for the button and the label, prompt the session
-  for a mention, each through the GitHub lanes' linked-actor check); then one transaction deletes the
-  row and inserts the re-run through `TurnStore.CreateAndArmDispatch` with the audit row attributed
-  to the requester -- carrying the request's trigger, requester, text and moves on, spending no budget
-  slot and asking no opt-in, hold or "already reviewed" -- and hands it the workflow attempt the moved
-  turn held, if the engine tracked it; or, for a requester no longer authorized, drops it. A drop
-  posts one notice through the verdict outbox, with no risk level so no label moves, and one session
-  warning, in the transaction that deletes the row, runs the workflow hook the moved turn's end
-  deferred, and wakes a debounce the owed term held. The timer is re-armed due at once while more is
+  `ReviewRequestAuthorizer`: re-trigger reviews, the check both lanes applied, through the GitHub
+  lanes' linked-actor check); then one transaction deletes the row and inserts the re-run through
+  `TurnStore.CreateAndArmDispatch` with the audit row attributed to the requester -- carrying the
+  request's trigger, requester, text and moves on, spending no budget slot and asking no opt-in,
+  hold or "already reviewed", and shaped by the prompt template, model and effort of the workflow
+  step the request resolves to, as a person's turn is (`workflowengine.ResolveStepForNewTurn`) --
+  and hands it the workflow attempt the moved turn held, if the engine tracked it; or, for a
+  requester no longer authorized, drops it. A requester whose account was deleted before the move
+  is owed as no one (the insert reads the id through `users`, so the foreign key never refuses the
+  dispatching transaction) and dropped the same way. A drop posts one notice through the verdict
+  outbox, with no risk level so no label moves, and one session warning, in the transaction that
+  deletes the row, ends the moved turn's workflow run cancelled the way a stop ends one
+  (`workflowengine.OnTurnWithdrawn`: a drop is a policy decision, not the step's outcome, so no edge
+  is followed, no attempt is queued again and no escalation notice joins the drop's), and wakes a
+  debounce the owed term held. The timer is re-armed due at once while more is
   owed and deleted otherwise. A pull request that cannot be read, or an authorization that cannot be
   evaluated, keeps the row and backs the timer off on the dispatch timer's schedule
   (`BackOffOwedReviewRequestTimer`: the request's age, between `DispatchRetryBackoff` and
   `DispatchRetryBackoffMax`, `armed_at` kept). A person's stop drops every request owed at or before
-  it, silently, in the stop timer's transaction after it disarms the session's work-creating timers,
-  and the consumer applies the same rule first, so whichever runs first a request the stop predates
+  it, silently, cancelling its workflow run, in the stop timer's transaction after it disarms the
+  session's work-creating timers, and the consumer applies the same rule first, so whichever runs first a request the stop predates
   is never re-run; one owed after the stop stays, its timer armed again. Since the request and its
   timer are rows committed with the move, a replica that dies before the re-run loses nothing: any
   replica's pump re-runs it. Migration 000160 adds the table, its index and the three turn columns,
   catalog changes only on `turns`; its down deletes every `owed_review_request` timer with the
   table, since the requests they stand for go with it, and a re-run of the up after a rollback that
-  kept the table arms the timer again for every session still owed one. No contract changes. Measured
+  kept the table arms the timer due at once for every session still owed one, moving a timer that
+  survived the rollback, kept or backed off, to now. No contract changes. Measured
   by buffers under custom and generic plans on the context check's tables beside some 1,250 owed
   requests: the hold's read 2 to 4, the owed reads and the delete by id 2 to 5, the stop's delete 2
   plus about 2 for each of the session's own requests, the inserts and the timer's writes 2 to 12, the
@@ -9165,7 +9175,7 @@ The one such echo found, a review session's own push, no longer exists: a review
 | `stop` timer (§3.3) | a person's stop request (`POST /api/sessions/{sessionID}/stop`, which also wakes the actor); re-armed by its handler while a flagged turn is in flight | timer pump → session actor | No — it cancels only turns flagged when the request was made, which the snapshot already reads `queued` or `running`, and deletes the session's work-creating timers armed at or before the request; an attempt it cancels ends its workflow run `cancelled` with no next step; when a flagged turn's grace ends with no word from the agent it retires that turn's sandbox gen, and the dispatch that follows respawns or restores a sandbox only for a turn already queued; with nothing flagged open it deletes itself |
 | `dispatch` timer (§2, §3.3) | every turn insert, due at once, in the transaction that creates the turn (`TurnStore.CreateAndArmDispatch`) | timer pump → session actor, when the post-commit trigger failed; deleted first by every dispatch evaluation that commits, whatever asked for it; backed off (`DispatchRetryBackoff` to `DispatchRetryBackoffMax`) by one that fails | No — its firing is a dispatch evaluation, which dispatches, spawns or restores for, or ends (a stop's flag, a personal-link refusal or a spawn refused on policy, each queueing nothing), only a turn already pending, or re-sends one in flight: turns the snapshot already reads `queued` or `running`. It inserts no turn, and from a settled snapshot it deletes itself; after a trigger that succeeded it is already gone |
 | `review_retrigger_debounce` timer (§24) | the `pull_request`/`synchronize` webhook, on every push to a PR with a review session, opted in or not — never the review session's own, since a review session never pushes (next row); re-armed by its own firing while it holds (§24.9, `ReviewRetriggerHoldBackstop` out), and, once held, moved to now, never inserted, by the transaction of every turn's end; inserted due at once, only when none is armed, by the dispatch that ends a queued automatic attempt `context_moved` (§24.9) | timer pump → session actor, `ReviewRetriggerDebounce` (2 min) after the last push, or at once after the end of the turn that held it or of an attempt whose context moved | **Yes** — inserts a review turn with no further input when the repository opted in, the head moved, the budget allows, no turn of the session is open and no person's review request is owed; while one is open or owed it holds, re-arming itself with the pushed head kept; otherwise declines and deletes itself |
-| `owed_review_request` timer (§24.9) | the dispatch that ends a person's queued review attempt (the label, the button, a mention) `context_moved`, due at once, in that transaction, with the request's row in `owed_review_requests`; re-armed due at once by its own firing, or by a person's stop, while the session still owes a request; backed off (`DispatchRetryBackoff` to `DispatchRetryBackoffMax`) when its firing cannot read the pull request or evaluate the requester's authorization | timer pump → session actor | **Yes** — re-runs the session's oldest owed request with no further input: reads the pull request again, composes the prompt for the head it has now, asks the requester's authorization again through `ports.ReviewRequestAuthorizer`, and inserts the re-run turn on the person's path, never through the automatic lane's opt-in, hold or budget; or drops the request -- its requester no longer authorized, or its moves in a row past `ReviewContextMoveMaxConsecutive` -- telling them once on the pull request and in a session warning; a stop drops the requests it predates silently. It counts whenever it is armed: the attempt it stands for has ended, so the snapshot reads no open turn for it |
+| `owed_review_request` timer (§24.9) | the dispatch that ends a person's queued review attempt (the label or the button) `context_moved`, due at once, in that transaction, with the request's row in `owed_review_requests`; re-armed due at once by its own firing, or by a person's stop, while the session still owes a request; backed off (`DispatchRetryBackoff` to `DispatchRetryBackoffMax`) when its firing cannot read the pull request or evaluate the requester's authorization | timer pump → session actor | **Yes** — re-runs the session's oldest owed request with no further input: reads the pull request again, composes the prompt for the head it has now, asks the requester's authorization again through `ports.ReviewRequestAuthorizer`, and inserts the re-run turn on the person's path, never through the automatic lane's opt-in, hold or budget; or drops the request -- its requester no longer authorized or no longer known, or its moves in a row past `ReviewContextMoveMaxConsecutive` -- telling them once on the pull request and in a session warning and ending the moved attempt's workflow run cancelled; a stop drops the requests it predates silently. It counts whenever it is armed: the attempt it stands for has ended, so the snapshot reads no open turn for it |
 | A PR review session's completed turn | — | — | No — a review session never pushes: `completeProcessingTurn` sends it no push command and starts no delivery, so its turn's end leaves nothing for the code host to echo back |
 | Release manifest check (§15) | a new review session on a release PR (`release_manifest_pending`, enqueued by the webhook) | `releasereview.Worker`, every `ReleaseManifestCheckPumpInterval` | **Yes** — when the aggregate review triggers, inserts the composition review turn on that same session |
 | A workflow's next step (§25) | a step's turn ending, or `/decide` | the same transaction | No gap — inserted in the transaction that ends the previous step's turn |
@@ -9209,7 +9219,7 @@ and §24.9's `ArmOwedReviewRequestTimer` and `BackOffOwedReviewRequestTimer`, wh
 `owed_review_request` kind in their SQL, are reached only through the session actor, and are pinned to
 `sessionactor.TimerOwedReviewRequest` by `TestOwedReviewRequest_TheTimerStoreArmsThisKind` (migration
 000160's up also arms that kind, due at once, for every session still owed a request when it runs
-again after a rollback that kept its table, and its down deletes it). The runtime backstop covers what the tests cannot: a name the
+again after a rollback that kept its table, moving one that survived to now, and its down deletes it). The runtime backstop covers what the tests cannot: a name the
 table does not know counts as work, never as settled, and its handler leaves it armed until §2's bound
 on the time since its last arm (`armed_at`) deletes it (`UnknownTimerDeleteAfter`, a day; back at the
 claim cadence inside `UnknownTimerGrace`, at `UnknownTimerBackoff` past it), so the session reads `scheduled` while it is —

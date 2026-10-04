@@ -414,11 +414,11 @@ type CreateTurnOptions struct {
 
 	// RequestTrigger and RequestText (technical plan §24.9, migrations/
 	// 000159 and 000160) are what a person's review-request lane records of
-	// the turn it creates: the lane ("button", "label", "mention",
+	// the turn it creates: the lane ("button" or "label",
 	// internal/domain/turn's RequestTrigger* values) and the lane's own
 	// text, before any context was folded into the prompt -- the button's
-	// or the label's fixed sentence, or the mention's body. Set together,
-	// by those lanes alone (reviewretrigger.go, bot.go's CreateTurnForBot);
+	// or the label's fixed sentence. Set together, by those lanes alone
+	// (reviewretrigger.go, bot.go's CreateTurnForBot for the label);
 	// with RequestTrigger set the turn also records actorUserID as its
 	// requester (turns.requested_by). A review attempt they ask for that
 	// meets a moved context when it is dispatched after waiting is owed to

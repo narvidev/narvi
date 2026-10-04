@@ -1,6 +1,6 @@
 -- Technical plan §24.9's second rule, for a person's review request: a
--- review attempt a person asked for (the configured label, the web
--- re-review button, a mention) that waited behind another turn checks, as
+-- review attempt a person asked for (the configured label or the web
+-- re-review button) that waited behind another turn checks, as
 -- it is dispatched, that the head, base and ancestor chain it recorded are
 -- still the pull request's. One whose context moved does not start: it
 -- ends context_moved (migrations/000159), and the request is owed to its
@@ -15,9 +15,11 @@
 --   - requested_by: who asked (users, NULL once that account is deleted,
 --     which the authorization check then refuses).
 --   - trigger: the lane that asked, turns.request_trigger's value
---     ('label', 'button', 'mention').
+--     ('label' or 'button'; a mention is never owed: on a session that
+--     exists it is no review attempt, and on a new one it is the first
+--     turn, which waits behind nothing).
 --   - request_text: the lane's own text, before any context was folded in:
---     the label's or the button's fixed sentence, or the mention's body.
+--     the label's or the button's fixed sentence.
 --     The re-run's prompt is composed from it for the new head.
 --   - is_review_attempt: the moved turn's turns.is_review_attempt. Only a
 --     review attempt is checked today, so it is always true; kept so a
@@ -37,7 +39,7 @@
 -- delete, all scoped to one session and taken oldest first.
 --
 -- turns.requested_by, turns.request_text: who asked for the turn and the
--- lane's own text, recorded by the three human lanes beside
+-- lane's own text, recorded by the two human lanes beside
 -- request_trigger (000159), and carried onto a re-run turn; NULL for every
 -- other turn. turns.context_moves: the moves in a row the request behind
 -- the turn met before it was inserted, which the next move counts from;
@@ -96,9 +98,12 @@
 --     arm. When this release is deployed again, this file runs again and
 --     leaves the table, the columns and their rows as they are, and arms
 --     the timer again, due at once, for every session still owed a
---     request (the INSERT at the end, which inserts nothing on a first
---     run, the table being empty), so a request whose timer the bound
---     deleted meanwhile is re-run then rather than stranded.
+--     request (the statement at the end, which writes nothing on a first
+--     run, the table being empty): a timer the bound deleted meanwhile is
+--     inserted, and one that survived -- kept or backed off by the
+--     previous binary, or backed off by this release before the rollback
+--     -- is moved to now, so every request still owed is served at once
+--     rather than stranded or left waiting.
 --   - Drop them: run this migration's down (goto 159) with this release's
 --     migrations. The down file says what it removes.
 CREATE TABLE IF NOT EXISTS owed_review_requests (
@@ -118,4 +123,4 @@ ALTER TABLE turns ADD COLUMN IF NOT EXISTS request_text TEXT;
 ALTER TABLE turns ADD COLUMN IF NOT EXISTS context_moves INTEGER;
 INSERT INTO session_timers (session_id, name, fires_at)
 SELECT DISTINCT session_id, 'owed_review_request', now() FROM owed_review_requests
-ON CONFLICT (session_id, name) DO NOTHING;
+ON CONFLICT (session_id, name) DO UPDATE SET fires_at = now(), armed_at = now();
