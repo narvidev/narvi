@@ -216,11 +216,17 @@ func TestMain(m *testing.M) {
 	// leaked one never does -- past the package's -timeout, which stops
 	// with m.Run. poolGuard has failed the test that leaked it, and
 	// terminating the container ends the connection anyway; a leak it
-	// missed still fails the run.
+	// missed still fails the run. The count settles first, as at a test's
+	// end: the pool's own health check counts the idle connections it
+	// holds for a moment.
+	sharedPoolGuard.settle(pool, 0, time.Time{})
 	if out := pool.Stat().AcquiredConns(); out == 0 {
 		pool.Close()
 	} else {
-		fmt.Fprintf(os.Stderr, "httpapi: %d shared-pool connections still out at exit; not closing the pool\n", out)
+		sharedPoolGuard.mu.Lock()
+		traced := describeOut(sharedPoolGuard.outSinceLocked(time.Time{}, true))
+		sharedPoolGuard.mu.Unlock()
+		fmt.Fprintf(os.Stderr, "httpapi: %d shared-pool connections still out at exit; not closing the pool. Acquired at:\n%s", out, traced)
 		if code == 0 {
 			code = 1
 		}
@@ -523,38 +529,58 @@ const sharedPoolMaxConns = 4
 // where every connection then out was acquired.
 const poolAcquireBound = 10 * time.Second
 
-// poolSettleGrace is how long a test's end waits for the shared pool to
-// return to where the test found it: pgxpool destroys a connection
-// released mid-query (a session actor's, cancelled by Registry.Shutdown)
-// on a goroutine of its own, and counts it acquired until then.
+// poolSettleGrace is how long a test's end waits for what it acquired to
+// come back, and for the shared pool to return to where the test found it:
+// pgxpool destroys a connection released mid-query (a session actor's,
+// cancelled by Registry.Shutdown) on a goroutine of its own, and counts it
+// acquired until then.
 const poolSettleGrace = 5 * time.Second
 
 // errPoolExhausted is the cause of an acquire poolAcquireBound ended.
 var errPoolExhausted = errors.New("shared integration-test pool exhausted")
 
 // sharedPoolGuard is the shared pool's tracer; see poolGuard.
-var sharedPoolGuard = &poolGuard{held: map[*pgx.Conn]heldConn{}}
+var sharedPoolGuard = newPoolGuard(poolSettleGrace)
 
 // poolGuard fails the test that leaks a shared-pool connection, naming the
 // code that acquired it, rather than letting a later test hang on the
 // exhausted pool. As the pool's tracer (pgxpool's AcquireTracer and
 // ReleaseTracer, which Acquire and Release call synchronously) it keeps
-// where each connection now out was acquired, and bounds every acquire at
-// poolAcquireBound; watch checks each test's end. It is a pgx.QueryTracer
-// too, as ConnConfig.Tracer must be -- one that does nothing.
+// where each connection now out, or still being acquired, was asked for,
+// and bounds every acquire at poolAcquireBound; watch checks each test's
+// end. It is a pgx.QueryTracer too, as ConnConfig.Tracer must be -- one
+// that does nothing.
+//
+// It judges on what it traced, never on the pool's count alone. The count,
+// Stat().AcquiredConns(), also holds what the pool takes for itself:
+// pgxpool's health check -- every HealthCheckPeriod, and 500ms after a
+// release destroys a connection -- takes every idle connection through
+// puddle's AcquireAllIdle, with no tracer call, and counts it acquired
+// until it puts it back. Judged on that count, a test that leaked nothing
+// failed, with no connection to name. And puddle counts an Acquire's
+// connection before Acquire pings it or runs PrepareConn, and so before
+// TraceAcquireEnd: an acquire is tracked from TraceAcquireStart.
 type poolGuard struct {
+	grace     time.Duration // how long watch waits for a test's end to settle
 	mu        sync.Mutex
-	held      map[*pgx.Conn]heldConn
-	exhausted []string // reports of acquires that hit poolAcquireBound
-	test      string   // the test now running, for those reports
+	held      map[*pgx.Conn]*acquire // returned by Acquire, not yet released
+	acquiring map[*acquire]struct{}  // asked for, not yet returned
+	exhausted []string               // reports of acquires that hit poolAcquireBound
+	test      string                 // the test now running, for those reports
 }
 
-type heldConn struct {
-	at  time.Time
-	pcs []uintptr
+// acquire is one call to Acquire: when it began and where from.
+type acquire struct {
+	at     time.Time
+	pcs    []uintptr
+	cancel context.CancelFunc
 }
 
-type acquireCancelKey struct{}
+type acquireKey struct{}
+
+func newPoolGuard(grace time.Duration) *poolGuard {
+	return &poolGuard{grace: grace, held: map[*pgx.Conn]*acquire{}, acquiring: map[*acquire]struct{}{}}
+}
 
 func (g *poolGuard) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.TraceQueryStartData) context.Context {
 	return ctx
@@ -563,25 +589,32 @@ func (g *poolGuard) TraceQueryStart(ctx context.Context, _ *pgx.Conn, _ pgx.Trac
 func (g *poolGuard) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 func (g *poolGuard) TraceAcquireStart(ctx context.Context, _ *pgxpool.Pool, _ pgxpool.TraceAcquireStartData) context.Context {
-	ctx, cancel := context.WithTimeoutCause(ctx, poolAcquireBound, errPoolExhausted)
-	return context.WithValue(ctx, acquireCancelKey{}, cancel)
+	pcs := make([]uintptr, 48)
+	a := &acquire{at: time.Now(), pcs: pcs[:runtime.Callers(2, pcs)]}
+	ctx, a.cancel = context.WithTimeoutCause(ctx, poolAcquireBound, errPoolExhausted)
+	g.mu.Lock()
+	g.acquiring[a] = struct{}{}
+	g.mu.Unlock()
+	return context.WithValue(ctx, acquireKey{}, a)
 }
 
 // TraceAcquireEnd receives the context TraceAcquireStart returned.
 func (g *poolGuard) TraceAcquireEnd(ctx context.Context, pool *pgxpool.Pool, data pgxpool.TraceAcquireEndData) {
-	if cancel, ok := ctx.Value(acquireCancelKey{}).(context.CancelFunc); ok {
-		defer cancel()
+	a, _ := ctx.Value(acquireKey{}).(*acquire)
+	if a == nil {
+		panic("httpapi: poolGuard.TraceAcquireEnd without the context TraceAcquireStart returned")
 	}
+	defer a.cancel()
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	delete(g.acquiring, a)
 	if data.Err == nil {
-		pcs := make([]uintptr, 48)
-		g.held[data.Conn] = heldConn{at: time.Now(), pcs: pcs[:runtime.Callers(3, pcs)]}
+		g.held[data.Conn] = a
 		return
 	}
 	if errors.Is(context.Cause(ctx), errPoolExhausted) {
 		report := fmt.Sprintf("%s: an acquire waited %s on the shared pool, all %d connections out, acquired at:\n%s",
-			g.test, poolAcquireBound, pool.Stat().MaxConns(), g.heldSinceLocked(time.Time{}))
+			g.test, poolAcquireBound, pool.Stat().MaxConns(), describeOut(g.outSinceLocked(time.Time{}, false)))
 		if len(g.exhausted) == 0 {
 			// Now, as the test may never end; to stderr, as a test may have
 			// redirected log's output (slog.SetDefault does, for good).
@@ -597,13 +630,26 @@ func (g *poolGuard) TraceRelease(_ *pgxpool.Pool, data pgxpool.TraceReleaseData)
 	g.mu.Unlock()
 }
 
+// guardedTest is what watch needs of a test: a *testing.T, or the recorder
+// poolGuard's own test stands in for one.
+type guardedTest interface {
+	Helper()
+	Name() string
+	Cleanup(func())
+	Errorf(format string, args ...any)
+	Logf(format string, args ...any)
+}
+
 // watch fails t, once its cleanups registered after this call have run, if
-// the pool has more connections out than when t began -- a transaction
-// never ended, rows never closed, a connection never released, a session
-// actor whose Registry never shut down -- or if an acquire hit
-// poolAcquireBound meanwhile. The baseline keeps one test's leak from
-// failing every test after it.
-func (g *poolGuard) watch(t *testing.T, pool *pgxpool.Pool) {
+// a connection asked for during t is still out, or still being acquired --
+// a transaction never ended, rows never closed, a connection never
+// released, a session actor whose Registry never shut down -- or if an
+// acquire hit poolAcquireBound meanwhile. What was asked for before t began
+// is not t's, which keeps one test's leak from failing every test after
+// it. The pool's count is a cross-check, logged when it disagrees and never
+// a verdict: it counts what the pool's own health check holds for a moment,
+// which no test acquired.
+func (g *poolGuard) watch(t guardedTest, pool *pgxpool.Pool) {
 	t.Helper()
 	baseline, start := pool.Stat().AcquiredConns(), time.Now()
 	g.mu.Lock()
@@ -611,38 +657,77 @@ func (g *poolGuard) watch(t *testing.T, pool *pgxpool.Pool) {
 	g.test = t.Name()
 	g.mu.Unlock()
 	t.Cleanup(func() {
-		for deadline := time.Now().Add(poolSettleGrace); pool.Stat().AcquiredConns() > baseline && time.Now().Before(deadline); {
-			time.Sleep(10 * time.Millisecond)
-		}
+		g.settle(pool, baseline, start)
 		g.mu.Lock()
 		defer g.mu.Unlock()
 		if n := len(g.exhausted); n > 0 {
 			t.Errorf("httpapi: %d acquires hit poolAcquireBound; the first:\n%s", n, g.exhausted[0])
 		}
 		g.exhausted = nil
-		if out := pool.Stat().AcquiredConns(); out > baseline {
-			t.Errorf("httpapi: %d shared-pool connections out after this test and its cleanups, %d before it; acquired during it and never released:\n%s",
-				out, baseline, g.heldSinceLocked(start))
+		if out := g.outSinceLocked(start, true); len(out) > 0 {
+			t.Errorf("httpapi: %d shared-pool connections acquired during this test still out after it and its cleanups, acquired at:\n%s",
+				len(out), describeOut(out))
+		} else if n := pool.Stat().AcquiredConns(); n > baseline {
+			t.Logf("httpapi: the shared pool counts %d connections out, %d before this test, though nothing this test acquired is still out: "+
+				"the pool's own health check holding idle ones, or a connection still being destroyed; not a leak", n, baseline)
 		}
 		g.test = outer
 	})
 }
 
-// heldSinceLocked lists where each connection still out, acquired at or
-// after since, was acquired, oldest first, without pgx's own frames. g.mu
-// is held.
-func (g *poolGuard) heldSinceLocked(since time.Time) string {
-	var conns []heldConn
-	for _, h := range g.held {
-		if !h.at.Before(since) {
-			conns = append(conns, h)
+// settle waits, up to g.grace, until nothing asked for at or after since is
+// out or being acquired, and the pool counts at most baseline connections
+// out.
+func (g *poolGuard) settle(pool *pgxpool.Pool, baseline int32, since time.Time) {
+	for deadline := time.Now().Add(g.grace); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+		g.mu.Lock()
+		mine := len(g.outSinceLocked(since, true))
+		g.mu.Unlock()
+		if mine == 0 && pool.Stat().AcquiredConns() <= baseline {
+			return
 		}
 	}
-	slices.SortFunc(conns, func(a, b heldConn) int { return a.at.Compare(b.at) })
+}
+
+// outAcquire is a connection out: returned by Acquire, or not yet.
+type outAcquire struct {
+	*acquire
+	returned bool
+}
+
+// outSinceLocked lists, oldest first, the connections asked for at or after
+// since that Acquire returned and Release has yet to take back, and, with
+// acquiring, the acquires yet to return -- whose connection the pool may
+// count already. g.mu is held.
+func (g *poolGuard) outSinceLocked(since time.Time, acquiring bool) []outAcquire {
+	var out []outAcquire
+	for _, a := range g.held {
+		if !a.at.Before(since) {
+			out = append(out, outAcquire{acquire: a, returned: true})
+		}
+	}
+	if acquiring {
+		for a := range g.acquiring {
+			if !a.at.Before(since) {
+				out = append(out, outAcquire{acquire: a})
+			}
+		}
+	}
+	slices.SortFunc(out, func(a, b outAcquire) int { return a.at.Compare(b.at) })
+	return out
+}
+
+// describeOut says where each connection in out was asked for, without
+// pgx's own frames.
+func describeOut(out []outAcquire) string {
 	var b strings.Builder
-	for i, h := range conns {
-		fmt.Fprintf(&b, "  connection %d:\n", i+1)
-		frames := runtime.CallersFrames(h.pcs)
+	for i, o := range out {
+		if o.returned {
+			fmt.Fprintf(&b, "  connection %d:\n", i+1)
+		} else {
+			fmt.Fprintf(&b, "  connection %d, which Acquire has yet to return:\n", i+1)
+		}
+		frames := runtime.CallersFrames(o.pcs)
 		for {
 			f, more := frames.Next()
 			if !strings.HasPrefix(f.Function, "github.com/jackc/") {
