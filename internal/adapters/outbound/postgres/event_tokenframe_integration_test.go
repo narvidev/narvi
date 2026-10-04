@@ -336,6 +336,7 @@ func TestEventStore_ListTokenFramesInWindow(t *testing.T) {
 		{name: "bounded above, the upper bound included", lower: before, upper: &upper, limit: 10, want: []int64{last, first}},
 		{name: "unbounded above", lower: before, upper: nil, limit: 10, want: []int64{after, last, first}},
 		{name: "the lower bound excluded", lower: first, upper: &upper, limit: 10, want: []int64{last}},
+		{name: "from the log's start", lower: 0, upper: &upper, limit: 10, want: []int64{last, first, before}},
 		{name: "capped, newest first", lower: before, upper: nil, limit: 2, want: []int64{after, last}},
 	}
 	for _, tt := range tests {
