@@ -120,7 +120,7 @@ func owedScanProblem(m holdPlanMeasurement, limit float64) string {
 //     measured once the tables are settled for both (measureAgainstMain):
 //     the CreateTurn measurements just before leave rolled-back pending
 //     turns in the open turns' index, which whichever text first reads
-//     through a plain index scan pays for.
+//     through a plain index scan pays to mark dead.
 func TestOwedReviewRequest_PlansReadTheSessionsOwnRows(t *testing.T) {
 	timeouts := platform.DefaultTimeouts()
 	uuidArg := func(p holdPlanProbe) string { return fmt.Sprintf("'%s'::uuid", p.sessionID.String()) }

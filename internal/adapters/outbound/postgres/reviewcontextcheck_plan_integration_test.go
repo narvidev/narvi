@@ -262,15 +262,18 @@ func preparedStatement(name, sql string, args func(p holdPlanProbe) []any, expla
 // transactions wrote -- CreateTurn's pending turns, an update's new
 // version -- and those versions' index entries. The first plain index
 // scan to meet such an entry reads the heap page its version lies on,
-// learns it is dead and marks the entry so, and every later scan skips it
-// without that read; a bitmap index scan reads the page as well but marks
-// nothing. Measured one right after the other, the first text whose plan
-// is a plain index scan pays for both -- which one turns on whether the
-// eight runs before its EXPLAIN planned a bitmap or an index scan, which
-// ANALYZE's sample decides -- so the second reads less for the same plan.
-// Once each text has run its plans once, neither measured run can be the
-// first to meet an entry: each plan it runs has run since the last write,
-// and nothing writes in between.
+// learns it is dead and marks the entry so -- unless deduplication has
+// merged it into a posting list with a live version, which both texts
+// then pay alike -- and every later scan skips a marked entry without
+// that read. A bitmap plan's heap scan reads the page as well, but
+// nothing in a bitmap plan marks the entry. Measured one right after the
+// other, the first text whose plan is a plain index scan pays for the
+// marking -- which one turns on whether the eight runs before its EXPLAIN
+// planned a bitmap or an index scan, which ANALYZE's sample decides -- so
+// the second reads less for the same plan. Once each text has run its
+// plans once, neither measured run can be the first to mark an entry:
+// each plan it runs has run since the last write, and nothing writes in
+// between.
 func measureAgainstMain(ctx context.Context, t *testing.T, pool *pgxpool.Pool, changed, before holdPlanStatement, probe holdPlanProbe, mode string) (release, mainText holdPlanMeasurement) {
 	t.Helper()
 	for _, s := range []holdPlanStatement{changed, before} {
