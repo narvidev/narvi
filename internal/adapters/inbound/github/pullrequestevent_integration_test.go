@@ -19,6 +19,7 @@ import (
 	githubingress "github.com/narvidev/narvi/internal/adapters/inbound/github"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -66,6 +67,10 @@ func newSentinelFixTestServer(t *testing.T, pool *pgxpool.Pool, sentinelFixes *n
 		Participants: narvipg.NewParticipantStore(pool),
 	}
 	deliveries := narvipg.NewWebhookDeliveryStore(pool)
+	gate, err := autonomy.NewGate(pool)
+	if err != nil {
+		t.Fatalf("autonomy.NewGate: %v", err)
+	}
 	cfg := githubingress.Config{
 		WebhookSecret: testWebhookSecret,
 		BotHandle:     testBotHandleIntegration,
@@ -73,6 +78,7 @@ func newSentinelFixTestServer(t *testing.T, pool *pgxpool.Pool, sentinelFixes *n
 		SentinelFixes: sentinelFixes,
 		RepoSettings:  repoSettings,
 		AuditLog:      auditLog,
+		Autonomy:      gate,
 	}
 
 	handler, handlerErr := githubingress.NewHandler(coalescer, deliveries, cfg)

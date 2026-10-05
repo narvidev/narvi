@@ -38,7 +38,10 @@ ON CONFLICT (session_id, name) DO UPDATE
 -- (ReviewRetriggerHoldBackstop) ahead, on the database's clock: fires_at
 -- and armed_at come from one now(), so a held row sits exactly the backstop
 -- past its last arm, the mark WakeReviewRetriggerDebounce reads.
--- created_at is kept. 'review_retrigger_debounce' is
+-- created_at is kept. Its second caller is the autonomy freeze (§40.2):
+-- a frozen firing re-arms the row AutonomyFreezeRecheckInterval ahead
+-- (sessionactor's freezeReviewRetrigger), a lead under the held mark, so a
+-- turn's end does not wake it. 'review_retrigger_debounce' is
 -- sessionactor.TimerReviewRetriggerDebounce, named here like the kind
 -- ArmSessionDispatchTimer names.
 --

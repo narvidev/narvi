@@ -12,6 +12,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/automation"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/releasereview"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
@@ -279,6 +280,11 @@ type Config struct {
 	SentinelFixes *postgres.SentinelFixStore
 	RepoSettings  *postgres.RepoSettingsStore
 	AuditLog      *postgres.AuditLogStore
+	// Autonomy is the autonomy freeze (technical plan §40.2) the
+	// merge-gating lane reads before an allowed gate merges: required
+	// whenever SentinelFixes is set, so NewHandler refuses a lane that
+	// could merge without consulting it.
+	Autonomy *autonomy.Gate
 
 	// PendingChecks/ReleaseLabel/ReleaseBranchPattern ("release
 	// PR review", §15; PendingChecks itself is blocking-finding fix #1)
@@ -358,6 +364,9 @@ type Config struct {
 func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliveryStore, cfg Config) (http.HandlerFunc, error) {
 	if err := platform.RequireGitHubOutbound(cfg.Outbound, "github: new webhook handler"); err != nil {
 		return nil, err
+	}
+	if cfg.SentinelFixes != nil && cfg.Autonomy == nil {
+		return nil, errors.New("github: new webhook handler: the sentinel-fix merge gate is wired with no autonomy gate -- an unattended merge consults the freeze (§40.2)")
 	}
 	botToken := cfg.Outbound.BotToken()
 	mentionRE := compileMentionPattern(cfg.BotHandle)
@@ -491,7 +500,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		// unchanged, which acknowledges it as a no-op exactly like today.
 		if eventType == eventTypePullRequest && cfg.SentinelFixes != nil && readPullRequestEventAction(body) == "closed" {
 			dataSource := &githubMergeGateDataSource{diffFetcher: cfg.DiffFetcher, pullRequests: cfg.PullRequests, botToken: botToken, timeouts: cfg.Timeouts}
-			handlePullRequestClosed(ctx, w, body, cfg.SentinelFixes, cfg.RepoSettings, cfg.AuditLog, dataSource, notImplementedFixMerger{})
+			handlePullRequestClosed(ctx, w, body, cfg.SentinelFixes, cfg.RepoSettings, cfg.AuditLog, dataSource, notImplementedFixMerger{}, cfg.Autonomy)
 			return
 		}
 

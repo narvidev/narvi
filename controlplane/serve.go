@@ -71,6 +71,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/auditlog"
 	"github.com/narvidev/narvi/internal/app/automation"
 	"github.com/narvidev/narvi/internal/app/automerge"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/capability"
 	"github.com/narvidev/narvi/internal/app/chatgptlink"
 	"github.com/narvidev/narvi/internal/app/chatgptrefresh"
@@ -1161,12 +1162,15 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// this file already threads through (e.g. the GitHub/Slack/Linear
 	// ingress Deps below) -- a run's own session dispatch reuses that
 	// identical TriggerDispatch path, never a second one.
-	automationEngine := automation.NewEngine(
+	automationEngine, err := automation.NewEngine(
 		automationStore, automationInvocationStore, automationRunStore,
 		sessionStore, turnStore, environmentStore, auditLogStore,
 		pool, registry, cfg.Timeouts, cfg.EpistemicCheckDefault,
 		cfg.RolloutMode, repoSettingsStore, githubPRSessionStore,
 	)
+	if err != nil {
+		return nil, fmt.Errorf("construct automation engine: %w", err)
+	}
 
 	// The 3 stores backing §13.1's ("auth v1", §13.1/§13.4) own GitHub
 	// OAuth login, backend-issued session cookies, and route middleware --
@@ -1592,6 +1596,13 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// mount this route at all, so a webhook POST from GitHub 404s rather
 	// than reaching a handler built against an empty WebhookSecret.
 	if githubIngressEnabled {
+		// The sentinel-fix merge gate's unattended merge consults the
+		// autonomy freeze (§40.2) through a gate of its own, on the same
+		// pool.
+		githubAutonomy, err := autonomy.NewGate(pool)
+		if err != nil {
+			return nil, fmt.Errorf("construct github webhook autonomy gate: %w", err)
+		}
 		githubWebhookHandler, err := githubingress.NewHandler(
 			&githubingress.SessionCoalescer{
 				Pool:             pool,
@@ -1733,9 +1744,12 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 				LinkNotices:   githubActorLinkNoticeStore,
 				// SentinelFixes/RepoSettings/AuditLog (§17.4/§17.5):
 				// the SAME instances every other caller above already uses.
+				// Autonomy (§40.2) holds an allowed gate's merge while
+				// autonomy is frozen.
 				SentinelFixes: sentinelFixStore,
 				RepoSettings:  repoSettingsStore,
 				AuditLog:      auditLogStore,
+				Autonomy:      githubAutonomy,
 				// PendingChecks/ReleaseLabel/ReleaseBranchPattern (
 				// "release PR review", §15; PendingChecks itself is
 				// blocking-finding fix #1): releaseManifestPendingStore is the

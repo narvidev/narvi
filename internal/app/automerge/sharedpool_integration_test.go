@@ -30,6 +30,8 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"golang.org/x/sync/errgroup"
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
@@ -71,8 +73,17 @@ func TestMain(m *testing.M) {
 	sharedPool = pool
 	sharedConnStr = connStr
 
+	// The one meter provider this binary's counter assertions read
+	// (freeze_integration_test.go's autonomy_freeze_skip_total), installed
+	// before any test builds a Worker or an autonomy gate: each takes its
+	// instruments from the global provider when it is built.
+	otelReader = sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(otelReader))
+	otel.SetMeterProvider(mp)
+
 	code := m.Run()
 
+	_ = mp.Shutdown(context.Background())
 	pool.Close()
 	if err := testcontainers.TerminateContainer(container); err != nil {
 		log.Printf("automerge: terminate shared integration-test container: %v", err)

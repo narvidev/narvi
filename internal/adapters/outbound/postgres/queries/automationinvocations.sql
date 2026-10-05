@@ -85,6 +85,21 @@ SET fanned_out_at = now()
 WHERE id = $1 AND fanned_out_at IS NULL
 RETURNING *;
 
+-- name: ReleaseAutomationInvocationFanOutClaim :execrows
+-- Gives back a fan-out claim the engine took but did not fan out, because
+-- autonomy froze (technical plan §40.2) between its claim transaction and
+-- this invocation's turn: fanned_out_at back to NULL, so the invocation is
+-- listed again by ListDueForFanOut once the freeze lifts. A compare-and-
+-- swap on the claim's own fanned_out_at, still pending, and with no run
+-- yet: a claim taken since, a closed invocation, or one any run was
+-- created for is never released. 0 rows when the guard misses.
+UPDATE automation_invocations ai
+SET fanned_out_at = NULL
+WHERE ai.id = sqlc.arg('id')
+  AND ai.fanned_out_at = sqlc.arg('claimed_at')
+  AND ai.status = 'pending'
+  AND NOT EXISTS (SELECT 1 FROM automation_runs r WHERE r.invocation_id = ai.id);
+
 -- name: CloseAutomationInvocation :one
 -- Applies internal/domain/automation.InvocationTransition's own verdict --
 -- guarded by "AND status = 'pending'" so this invocation's own outcome is

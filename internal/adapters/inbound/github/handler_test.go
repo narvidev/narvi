@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -54,6 +55,48 @@ func TestNewHandler_RefusesNilOutbound(t *testing.T) {
 	}
 	if handler != nil {
 		t.Error("NewHandler(nil Outbound) returned a handler, want nil")
+	}
+}
+
+// TestNewHandler_MergeGateRequiresTheAutonomyGate proves the sentinel-fix
+// merge gate cannot be wired without the autonomy freeze (technical plan
+// §40.2): with SentinelFixes set, a nil Config.Autonomy is a construction
+// error, never a lane that could merge while frozen. Without SentinelFixes
+// the lane never fires, and no gate is needed.
+func TestNewHandler_MergeGateRequiresTheAutonomyGate(t *testing.T) {
+	gate, err := autonomy.NewGate(nil)
+	if err != nil {
+		t.Fatalf("autonomy.NewGate: %v", err)
+	}
+	for _, tc := range []struct {
+		name    string
+		cfg     func(*Config)
+		wantErr bool
+	}{
+		{name: "merge gate wired without a gate", cfg: func(c *Config) { c.SentinelFixes = postgres.NewSentinelFixStore(nil) }, wantErr: true},
+		{name: "merge gate wired with a gate", cfg: func(c *Config) {
+			c.SentinelFixes = postgres.NewSentinelFixStore(nil)
+			c.Autonomy = gate
+		}},
+		{name: "no merge gate", cfg: func(*Config) {}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{WebhookSecret: "s", BotHandle: "narvi-bot", Outbound: platform.MustNewGitHubOutboundConfig("test-bot-token")}
+			tc.cfg(&cfg)
+			handler, err := NewHandler(&SessionCoalescer{}, postgres.NewWebhookDeliveryStore(nil), cfg)
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "autonomy gate") {
+					t.Fatalf("NewHandler = %v, want a refusal naming the autonomy gate", err)
+				}
+				if handler != nil {
+					t.Error("NewHandler returned a handler alongside its refusal")
+				}
+				return
+			}
+			if err != nil || handler == nil {
+				t.Fatalf("NewHandler = (%v, %v), want a handler", handler != nil, err)
+			}
+		})
 	}
 }
 

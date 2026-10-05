@@ -16,6 +16,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -25,10 +26,12 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/auditlog"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/decisioninbox"
 	"github.com/narvidev/narvi/internal/app/ports"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
 	domainautomerge "github.com/narvidev/narvi/internal/domain/automerge"
+	domainautonomy "github.com/narvidev/narvi/internal/domain/autonomy"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -60,6 +63,12 @@ type Deps struct {
 	// until its auth guard dead-letters it.
 	Outbound *platform.GitHubOutboundConfig
 	Timeouts platform.Timeouts
+
+	// Autonomy is the autonomy freeze (technical plan §40.2): every
+	// candidate reads it before anything is spent on it, and again right
+	// before its merge. Required: New refuses a nil one, so no worker can
+	// merge without consulting the freeze.
+	Autonomy *autonomy.Gate
 }
 
 // Worker runs the auto-merge pump.
@@ -94,6 +103,9 @@ type Worker struct {
 func New(deps Deps) (*Worker, error) {
 	if err := platform.RequireGitHubOutbound(deps.Outbound, "automerge: new worker"); err != nil {
 		return nil, err
+	}
+	if deps.Autonomy == nil {
+		return nil, errors.New("automerge: new worker: no autonomy gate -- every merge consults the freeze (§40.2)")
 	}
 	meter := otel.Meter(meterName)
 	authDeadLetterCount, err := meter.Int64Counter(
@@ -148,36 +160,46 @@ func (w *Worker) PumpOnce(ctx context.Context, now time.Time) error {
 		return fmt.Errorf("automerge: list auto-merge-enabled repos: %w", err)
 	}
 
+	var held atomic.Int64
 	g, gctx := errgroup.WithContext(ctx)
 	for _, repo := range repos {
 		repo := repo
 		g.Go(func() error {
-			w.pumpRepo(gctx, repo.RepoFullName, now)
+			held.Add(int64(w.pumpRepo(gctx, repo.RepoFullName, now)))
 			return nil
 		})
 	}
-	return g.Wait()
+	err = g.Wait()
+	if n := held.Load(); n > 0 {
+		platform.Logger(ctx).Info("automerge: candidates held by the autonomy freeze this tick; each is listed again on the next one",
+			"outcome", domainautonomy.OutcomeSkipped, "held", n)
+	}
+	return err
 }
 
 // pumpRepo handles one repo's own candidates -- logged, never propagated,
 // since PumpOnce's own errgroup fans repos out independently and a
 // single repo's own failure must never abort every other armed repo's
-// tick.
-func (w *Worker) pumpRepo(ctx context.Context, repoFullName string, now time.Time) {
+// tick. It returns how many candidates the autonomy freeze held.
+func (w *Worker) pumpRepo(ctx context.Context, repoFullName string, now time.Time) int {
 	since := now.Add(-w.deps.Timeouts.AutoMergeCandidateLookback)
 	candidates, err := w.deps.DecisionInbox.ReviewVerdict.ReviewVerdicts.ListLatestAutoApproved(ctx, repoFullName, pgtype.Timestamptz{Time: since, Valid: true}, maxCandidatesPerRepoPerTick)
 	if err != nil {
 		platform.Logger(ctx).Error("automerge: list latest auto-approved verdicts failed", "error", err, "repo_full_name", repoFullName)
-		return
+		return 0
 	}
 
 	// One memo per repo per tick (§21.2): candidates into the same base
 	// read its required checks once, not once each. The next tick reads
 	// them again.
 	requiredChecks := decisioninbox.NewRequiredChecksMemo()
+	held := 0
 	for _, candidate := range candidates {
-		w.mergeCandidate(ctx, requiredChecks, repoFullName, int(candidate.PrNumber), now)
+		if w.mergeCandidate(ctx, requiredChecks, repoFullName, int(candidate.PrNumber), now) {
+			held++
+		}
 	}
+	return held
 }
 
 // mergeCandidate re-confirms one candidate live and merges it if still
@@ -193,8 +215,22 @@ func (w *Worker) pumpRepo(ctx context.Context, repoFullName string, now time.Tim
 // an injected clock) -- w.authGuard's own backoff/dead-letter decisions
 // (docs/TECHNICAL_PLAN.md §17) must be deterministic under it for tests
 // to drive multiple ticks without any real wall-clock sleep.
-func (w *Worker) mergeCandidate(ctx context.Context, requiredChecks *decisioninbox.RequiredChecksMemo, repoFullName string, prNumber int, now time.Time) {
+//
+// It returns true when the autonomy freeze (§40.2) held the candidate. The
+// freeze is read first, before the auth guard and the live re-validation:
+// a held candidate takes no auth-guard reservation, spends no GitHub read
+// and writes nothing -- the verdict row it was listed from is untouched,
+// so the next tick after the freeze lifts lists it again and re-validates
+// it live. The freeze is read again after the re-validation, right before
+// the merge, since re-validating is seconds of GitHub reads a freeze can
+// land during. A held candidate is a skip: none of this function's error
+// paths, no RecordConfirmed and no audit row.
+func (w *Worker) mergeCandidate(ctx context.Context, requiredChecks *decisioninbox.RequiredChecksMemo, repoFullName string, prNumber int, now time.Time) (held bool) {
 	logger := platform.Logger(ctx)
+
+	if skip, _ := w.deps.Autonomy.Check(ctx, domainautonomy.SiteAutoMerge, "repo_full_name", repoFullName, "pr_number", prNumber); skip {
+		return true
+	}
 
 	allowed, reservation := w.authGuard.allow(repoFullName, now)
 	if !allowed {
@@ -204,7 +240,7 @@ func (w *Worker) mergeCandidate(ctx context.Context, requiredChecks *decisioninb
 		// repeat log line on every subsequent skipped candidate/tick would
 		// reproduce exactly the "rate-limit noise" this fix exists to
 		// remove, so this path is silent by design.
-		return
+		return false
 	}
 	// reservation is threaded through to BOTH of this call's own
 	// recordAuthOutcome sites below -- it is the SAME single allow()
@@ -229,17 +265,22 @@ func (w *Worker) mergeCandidate(ctx context.Context, requiredChecks *decisioninb
 	if err != nil {
 		w.recordAuthOutcome(ctx, repoFullName, err, now, reservation)
 		logger.Error("automerge: revalidate for auto-merge failed", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)
-		return
+		return false
 	}
 	if !ok {
 		logger.Info("automerge: candidate no longer eligible", "repo_full_name", repoFullName, "pr_number", prNumber, "reason", reason)
-		return
+		return false
 	}
 
 	owner, repo, splitOK := reposource.SplitFullName(repoFullName)
 	if !splitOK {
 		logger.Error("automerge: repoFullName not shaped owner/repo", "repo_full_name", repoFullName)
-		return
+		return false
+	}
+
+	// §40.2: read again, last thing before the merge.
+	if skip, _ := w.deps.Autonomy.Check(ctx, domainautonomy.SiteAutoMerge, "repo_full_name", repoFullName, "pr_number", prNumber, "head_sha", headSHA); skip {
+		return true
 	}
 
 	mergeCtx, cancel := context.WithTimeout(ctx, w.deps.Timeouts.GitHubMergePRTimeout)
@@ -274,12 +315,12 @@ func (w *Worker) mergeCandidate(ctx context.Context, requiredChecks *decisioninb
 		}); err != nil {
 			logger.Error("automerge: record audit log for suppressed merge failed", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)
 		}
-		return
+		return false
 	}
 	if err != nil {
 		w.recordAuthOutcome(ctx, repoFullName, err, now, reservation)
 		logger.Error("automerge: merge pr failed", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)
-		return
+		return false
 	}
 	w.authGuard.recordSuccess(repoFullName)
 
@@ -319,6 +360,7 @@ func (w *Worker) mergeCandidate(ctx context.Context, requiredChecks *decisioninb
 		// own identical posture for the human-clicked path.
 		logger.Error("automerge: record audit log for merge failed", "error", err, "repo_full_name", repoFullName, "pr_number", prNumber)
 	}
+	return false
 }
 
 // recordAuthOutcome feeds one failed GitHub call (from either of

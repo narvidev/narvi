@@ -16,7 +16,9 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/ports"
+	domainautonomy "github.com/narvidev/narvi/internal/domain/autonomy"
 	domainoutbox "github.com/narvidev/narvi/internal/domain/outbox"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -49,6 +51,11 @@ type Builder struct {
 	// (§5.1) -- never inferred from a cancellation error. The process's
 	// one instance, shared with every other reader.
 	shutdown *platform.ShutdownState
+
+	// gate is the autonomy freeze (technical plan §40.2), built here from
+	// pool: attempt holds the kinds freeze.go marks FreezeHolds while
+	// autonomy is frozen, and PumpOnce leaves them out of the lag gauge.
+	gate *autonomy.Gate
 
 	outboxLag        metric.Int64Gauge
 	outboxDueBacklog metric.Int64Gauge
@@ -91,12 +98,22 @@ func NewBuilder(store *postgres.OutboxStore, pool *pgxpool.Pool, notifiers map[p
 	if err := checkRepeatability(notifiers); err != nil {
 		return nil, err
 	}
+	// §40.2's autonomy freeze needs the same of every registered kind:
+	// whether its delivery is an automatic action the freeze holds
+	// (freeze.go).
+	if err := classifyFreeze(notifiers); err != nil {
+		return nil, err
+	}
+	gate, err := autonomy.NewGate(pool)
+	if err != nil {
+		return nil, fmt.Errorf("outboxworker: %w", err)
+	}
 
 	meter := otel.Meter(meterName)
 
 	outboxLag, err := meter.Int64Gauge(
 		"outbox_lag_seconds",
-		metric.WithDescription("Age, in seconds, of the oldest still-due outbox row claimed at the start of the most recent pump tick (§5.3: outbox lag) -- zero when nothing was due."),
+		metric.WithDescription("Age, in seconds, of the oldest still-due outbox row claimed at the start of the most recent pump tick (§5.3: outbox lag) -- zero when nothing was due. While autonomy is frozen (§40.2), the rows the freeze holds are left out."),
 		metric.WithUnit("s"),
 	)
 	if err != nil {
@@ -136,6 +153,7 @@ func NewBuilder(store *postgres.OutboxStore, pool *pgxpool.Pool, notifiers map[p
 		notifiers:        notifiers,
 		timeouts:         timeouts,
 		shutdown:         shutdown,
+		gate:             gate,
 		outboxLag:        outboxLag,
 		outboxDueBacklog: outboxDueBacklog,
 		deadLetterCount:  deadLetterCount,
@@ -231,20 +249,25 @@ func (b *Builder) Run(ctx context.Context) error {
 // is in flight does not cancel it (§5.1). Once the shutdown has begun,
 // every row of the batch not yet attempted is handed back without spending
 // its attempt (attempt's own first check).
+//
+// While autonomy is frozen (§40.2), the rows of the kinds the freeze holds
+// (freeze.go) are left out of outbox_lag_seconds: such a row is due again
+// every AutonomyFreezeRecheckInterval and held again, so its age grows with
+// the freeze and would read as a stuck outbox (OutboxLagHigh) though
+// nothing is stuck. The tick reads the freeze once for this; a read that
+// fails leaves them out too, since attempt then holds them as well.
 func (b *Builder) PumpOnce(ctx context.Context) error {
-	claimed, oldestCreatedAt, err := b.claimBatch(ctx)
+	claimed, err := b.claimBatch(ctx)
 	if err != nil {
 		return fmt.Errorf("outboxworker: claim batch: %w", err)
 	}
 
-	lag := int64(0)
-	if !oldestCreatedAt.IsZero() {
-		lag = int64(time.Since(oldestCreatedAt).Seconds())
-		if lag < 0 {
-			lag = 0
-		}
+	holding := false
+	if len(claimed) > 0 {
+		frozen, err := b.gate.Frozen(ctx)
+		holding = frozen || err != nil
 	}
-	b.outboxLag.Record(ctx, lag)
+	b.outboxLag.Record(ctx, lagSeconds(claimed, holding, time.Now()))
 
 	if backlog, err := b.store.CountPending(ctx); err != nil {
 		platform.Logger(ctx).Error("outboxworker: count pending outbox backlog failed", "error", err)
@@ -254,10 +277,36 @@ func (b *Builder) PumpOnce(ctx context.Context) error {
 
 	outcomeCtx, release := newOutcomeContext(ctx, b.timeouts.OutboxShutdownRecordTimeout)
 	defer release()
+	held := 0
 	for _, row := range claimed {
-		b.attempt(ctx, outcomeCtx, row)
+		if b.attempt(ctx, outcomeCtx, row) {
+			held++
+		}
+	}
+	if held > 0 {
+		platform.Logger(ctx).Info("outboxworker: deliveries held by the autonomy freeze this tick; each is due again after the recheck interval, its attempt not counted",
+			"outcome", domainautonomy.OutcomeSkipped, "held", held, "recheck_interval", b.timeouts.AutonomyFreezeRecheckInterval)
 	}
 	return nil
+}
+
+// lagSeconds is outbox_lag_seconds for one tick: the age at now of the
+// oldest row claimed, zero when none was -- leaving out, when holding, the
+// rows of the kinds the autonomy freeze holds.
+func lagSeconds(claimed []sqlcgen.Outbox, holding bool, now time.Time) int64 {
+	var oldest time.Time
+	for _, row := range claimed {
+		if holding && freezeOf(ports.NotificationKind(row.Kind)).class == FreezeHolds {
+			continue
+		}
+		if row.CreatedAt.Valid && (oldest.IsZero() || row.CreatedAt.Time.Before(oldest)) {
+			oldest = row.CreatedAt.Time
+		}
+	}
+	if oldest.IsZero() {
+		return 0
+	}
+	return max(int64(now.Sub(oldest).Seconds()), 0)
 }
 
 // newOutcomeContext returns the context a pump tick records outcomes on
@@ -305,9 +354,8 @@ func newOutcomeContext(worker context.Context, bound time.Duration) (context.Con
 // double-claiming the same row), then Claim for each due row (bumps
 // next_attempt_at forward by OutboxClaimDuration, increments attempts),
 // then commits -- exactly mirroring imagebuild.Builder.claimBatch's own
-// shape. Also returns the oldest CreatedAt among the due rows (the zero
-// time.Time if none were due), so PumpOnce can record the outbox_lag_seconds
-// gauge for this tick.
+// shape. PumpOnce records the outbox_lag_seconds gauge for this tick from
+// the claimed rows' CreatedAt.
 //
 // The single now := time.Now() below is shared across every row in this
 // batch (up to pumpBatchSize), so every claimed row's own next_attempt_at
@@ -320,16 +368,16 @@ func newOutcomeContext(worker context.Context, bound time.Duration) (context.Con
 // immediately before the real delivery call -- this batch-level claim
 // below only ever needs to survive up to the moment attempt() runs for
 // that row, not the whole batch's own worst-case sequential duration.
-func (b *Builder) claimBatch(ctx context.Context) ([]sqlcgen.Outbox, time.Time, error) {
+func (b *Builder) claimBatch(ctx context.Context) ([]sqlcgen.Outbox, error) {
 	conn, err := b.pool.Acquire(ctx)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("acquire connection: %w", err)
+		return nil, fmt.Errorf("acquire connection: %w", err)
 	}
 	defer conn.Release()
 
 	tx, err := conn.Begin(ctx)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("begin: %w", err)
+		return nil, fmt.Errorf("begin: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
@@ -337,28 +385,23 @@ func (b *Builder) claimBatch(ctx context.Context) ([]sqlcgen.Outbox, time.Time, 
 
 	due, err := txStore.ListDuePending(ctx, pumpBatchSize)
 	if err != nil {
-		return nil, time.Time{}, fmt.Errorf("list due outbox entries: %w", err)
+		return nil, fmt.Errorf("list due outbox entries: %w", err)
 	}
 
-	var oldestCreatedAt time.Time
 	now := time.Now()
 	claimed := make([]sqlcgen.Outbox, 0, len(due))
 	for _, row := range due {
-		if row.CreatedAt.Valid && (oldestCreatedAt.IsZero() || row.CreatedAt.Time.Before(oldestCreatedAt)) {
-			oldestCreatedAt = row.CreatedAt.Time
-		}
-
 		c, err := txStore.Claim(ctx, row.ID, pgtype.Timestamptz{Time: now.Add(b.timeouts.OutboxClaimDuration), Valid: true})
 		if err != nil {
-			return nil, time.Time{}, fmt.Errorf("claim outbox entry %s: %w", row.ID.String(), err)
+			return nil, fmt.Errorf("claim outbox entry %s: %w", row.ID.String(), err)
 		}
 		claimed = append(claimed, c)
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, time.Time{}, fmt.Errorf("commit: %w", err)
+		return nil, fmt.Errorf("commit: %w", err)
 	}
-	return claimed, oldestCreatedAt, nil
+	return claimed, nil
 }
 
 // attempt performs the real (possibly slow, network-bound) delivery for
@@ -410,7 +453,12 @@ func (b *Builder) claimBatch(ctx context.Context) ([]sqlcgen.Outbox, time.Time, 
 // the attempt. Every outcome -- a failure, a success, a row handed back --
 // is written on outcomeCtx (newOutcomeContext), never on ctx, so a
 // shutdown that begins after either reading does not cancel the write.
-func (b *Builder) attempt(ctx, outcomeCtx context.Context, row sqlcgen.Outbox) {
+//
+// The autonomy freeze (§40.2) is read once the claim is renewed, for the
+// kinds freeze.go marks FreezeHolds, before the shadow check: a held row
+// reaches neither the world nor the suppression ledger until the freeze
+// lifts (holdFrozen). attempt returns true for a row it held so.
+func (b *Builder) attempt(ctx, outcomeCtx context.Context, row sqlcgen.Outbox) (held bool) {
 	var correlationID string
 	if row.CorrelationID != nil {
 		correlationID = *row.CorrelationID
@@ -432,7 +480,7 @@ func (b *Builder) attempt(ctx, outcomeCtx context.Context, row sqlcgen.Outbox) {
 			ShutdownBegun:            true,
 			NotStarted:               true,
 		}, "")
-		return
+		return false
 	}
 
 	notifier, ok := b.notifiers[ports.NotificationKind(row.Kind)]
@@ -442,7 +490,7 @@ func (b *Builder) attempt(ctx, outcomeCtx context.Context, row sqlcgen.Outbox) {
 			AttemptCount:             int(row.Attempts),
 			ConsecutiveInterruptions: int(row.ConsecutiveInterruptions),
 		}, fmt.Sprintf("no notifier registered for kind %q", row.Kind))
-		return
+		return false
 	}
 
 	renewed, err := b.store.RenewClaim(ctx, row.ID,
@@ -459,12 +507,23 @@ func (b *Builder) attempt(ctx, outcomeCtx context.Context, row sqlcgen.Outbox) {
 			// than risk a duplicate notifier.Deliver call for a row
 			// whose claim has already been superseded.
 			logger.Warn("outboxworker: renew claim no-op: row no longer pending or claim superseded by another builder")
-			return
+			return false
 		}
 		logger.Error("outboxworker: renew claim failed", "error", err)
-		return
+		return false
 	}
 	row = renewed
+
+	// §40.2: a kind whose delivery is itself an automatic action is held
+	// while autonomy is frozen, before the shadow check below -- a held row
+	// is not delivered to the ledger either. A freeze read that fails holds
+	// it too.
+	if entry := freezeOf(ports.NotificationKind(row.Kind)); entry.class == FreezeHolds {
+		if skip, reason := b.gate.Check(ctx, entry.site, "outbox_id", row.ID.String(), "kind", row.Kind); skip {
+			b.holdFrozen(outcomeCtx, logger, row, reason)
+			return true
+		}
+	}
 
 	// §30.8's own epoch discipline: "suppress if the stamp OR the current
 	// flag says shadow -- monotone toward suppression, in both
@@ -491,7 +550,7 @@ func (b *Builder) attempt(ctx, outcomeCtx context.Context, row sqlcgen.Outbox) {
 		}
 		if suppressed {
 			b.deliverToLedger(ctx, logger, row)
-			return
+			return false
 		}
 	}
 
@@ -520,7 +579,7 @@ func (b *Builder) attempt(ctx, outcomeCtx context.Context, row sqlcgen.Outbox) {
 			OutlivedDeliveryTimeout:  elapsed >= b.timeouts.OutboxDeliveryTimeout,
 			Repeatable:               repeatabilityOf(ports.NotificationKind(row.Kind)) == Repeatable,
 		}, err.Error())
-		return
+		return false
 	}
 
 	// A delivery that succeeded is recorded as delivered whenever the
@@ -532,10 +591,37 @@ func (b *Builder) attempt(ctx, outcomeCtx context.Context, row sqlcgen.Outbox) {
 			// race (e.g. a bug elsewhere ever double-claims a row); logged,
 			// not fatal to this tick.
 			logger.Warn("outboxworker: mark delivered no-op: row no longer pending")
-			return
+			return false
 		}
 		logger.Error("outboxworker: mark delivered failed", "error", err)
 	}
+	return false
+}
+
+// holdFrozen records a delivery the autonomy freeze held (§40.2): the row
+// stays pending, its attempt -- which the claim counted -- is given back
+// (DeferOutboxEntry, a compare-and-swap on the renewed claim, so it never
+// takes back an attempt another builder's claim counted), its run of
+// shutdown interruptions is left as it was, and it is due again
+// AutonomyFreezeRecheckInterval from now. last_error says it was skipped,
+// and why; attempts not moving is what tells it from a failure. Nothing
+// else is written: no branch, no session, no rewrite, no dead letter.
+// Written on the tick's outcome context, like every outcome.
+func (b *Builder) holdFrozen(ctx context.Context, logger *slog.Logger, row sqlcgen.Outbox, reason domainautonomy.SkipReason) {
+	lastError := fmt.Sprintf("skipped (%s): the autonomy freeze holds this delivery; attempt not counted", reason)
+	if _, err := b.store.Defer(ctx, row.ID,
+		pgtype.Timestamptz{Time: time.Now().Add(b.timeouts.AutonomyFreezeRecheckInterval), Valid: true},
+		row.NextAttemptAt, // CAS: the claim this attempt renewed.
+		&lastError, row.ConsecutiveInterruptions,
+	); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			logger.Warn("outboxworker: hold for the autonomy freeze no-op: row no longer pending or claimed by another builder since")
+			return
+		}
+		logger.Error("outboxworker: hold for the autonomy freeze failed", "error", err)
+		return
+	}
+	logger.Debug("outboxworker: delivery held by the autonomy freeze", "outcome", domainautonomy.OutcomeSkipped, "reason", string(reason))
 }
 
 // deliverToLedger records §30.6/§30.8's own terminal mark: row's own

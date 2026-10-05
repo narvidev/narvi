@@ -58,7 +58,10 @@ func newWhiteboxEngine(t *testing.T) (*Engine, *narvipg.AutomationStore, *narvip
 	// dereferenced by this file's own tests, which drive applyFailureStrike/
 	// closeInvocation directly and never call PumpOnce/fan-out.
 	prSessions := narvipg.NewGitHubPRSessionStore(pool)
-	engine := NewEngine(automations, invocations, runs, sessions, turns, environments, auditLog, pool, registry, platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions)
+	engine, err := NewEngine(automations, invocations, runs, sessions, turns, environments, auditLog, pool, registry, platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, prSessions)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
 	return engine, automations, invocations
 }
 

@@ -13,6 +13,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	domainautomation "github.com/narvidev/narvi/internal/domain/automation"
+	domainautonomy "github.com/narvidev/narvi/internal/domain/autonomy"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -109,8 +110,15 @@ func (e *Engine) evaluateCronTriggersAt(ctx context.Context, now time.Time) erro
 	}
 
 	logger := platform.Logger(ctx)
+	held := 0
 	for _, row := range rows {
-		e.evaluateCronAutomation(ctx, logger, row, now, toBucket)
+		if e.evaluateCronAutomation(ctx, logger, row, now, toBucket) {
+			held++
+		}
+	}
+	if held > 0 {
+		logger.Info("automation: cron fires held by the autonomy freeze this tick; none was claimed, so each fires on its first tick after the freeze lifts if its schedule still matches within the catch-up window",
+			"outcome", domainautonomy.OutcomeSkipped, "held", held)
 	}
 	return nil
 }
@@ -124,13 +132,21 @@ func (e *Engine) evaluateCronTriggersAt(ctx context.Context, now time.Time) erro
 // from exactly one granularity bucket back -- the SAME single-bucket window
 // CronMatches alone always evaluated, so a brand-new automation's very
 // first tick behaves identically to before this fix.
-func (e *Engine) evaluateCronAutomation(ctx context.Context, logger *slog.Logger, row sqlcgen.Automation, now time.Time, toBucket time.Time) {
+//
+// A matched fire is an action that starts without a person asking for it
+// right then, so it reads the autonomy freeze (§40.2) before it claims the
+// fire: while frozen nothing is claimed -- last_cron_fired_at stays where
+// it was and no invocation is created -- so a freeze never builds up a
+// burst. After the freeze lifts, the catch-up window above fires a missed
+// occurrence at most once, and a freeze longer than the window waits for
+// the next occurrence. It returns true for a fire the freeze held.
+func (e *Engine) evaluateCronAutomation(ctx context.Context, logger *slog.Logger, row sqlcgen.Automation, now time.Time, toBucket time.Time) (held bool) {
 	logger = logger.With("automation_id", row.ID.String())
 
 	cfg, err := unmarshalCronTriggerConfig(row.TriggerConfig)
 	if err != nil {
 		logger.Error("automation: decode cron trigger config failed", "error", err)
-		return
+		return false
 	}
 
 	from := toBucket.Add(-e.timeouts.AutomationCronGranularity)
@@ -148,10 +164,14 @@ func (e *Engine) evaluateCronAutomation(ctx context.Context, logger *slog.Logger
 	matched, err := domainautomation.CronMatchesWithin(cfg.Schedule, from, toBucket, e.timeouts.AutomationCronGranularity)
 	if err != nil {
 		logger.Error("automation: evaluate cron schedule failed", "error", err, "schedule", cfg.Schedule)
-		return
+		return false
 	}
 	if !matched {
-		return
+		return false
+	}
+
+	if skip, _ := e.gate.Check(ctx, domainautonomy.SiteAutomationCron, "automation_id", row.ID.String()); skip {
+		return true
 	}
 
 	minuteBucket := pgtype.Timestamptz{Time: toBucket, Valid: true}
@@ -162,19 +182,20 @@ func (e *Engine) evaluateCronAutomation(ctx context.Context, logger *slog.Logger
 			// tick (this pod's or another pod's own Engine) won the race
 			// first. Harmless no-op, the SAME "lost the race" outcome every
 			// other CAS-guarded write in this package treats identically.
-			return
+			return false
 		}
 		logger.Error("automation: claim cron fire failed", "error", err)
-		return
+		return false
 	}
 
 	targets, err := UnmarshalTargets(claimed.Repos)
 	if err != nil {
 		logger.Error("automation: decode automation repos for cron fire failed", "error", err)
-		return
+		return false
 	}
 
 	if _, err := CreateInvocation(ctx, e.invocations, claimed.ID, targets); err != nil {
 		logger.Error("automation: create invocation for cron fire failed", "error", err)
 	}
+	return false
 }

@@ -62,6 +62,8 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/auditlog"
+	"github.com/narvidev/narvi/internal/app/autonomy"
+	domainautonomy "github.com/narvidev/narvi/internal/domain/autonomy"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/sentinelfix"
 	"github.com/narvidev/narvi/internal/platform"
@@ -297,6 +299,7 @@ func handlePullRequestClosed(
 	auditLog *postgres.AuditLogStore,
 	dataSource mergeGateDataSource,
 	merger fixMerger,
+	gate *autonomy.Gate,
 ) {
 	logger := platform.Logger(ctx)
 
@@ -368,6 +371,23 @@ func handlePullRequestClosed(
 		decision = sentinelfix.EvaluateMergeGate(changedFiles, ciGreen, cherryPickClean, toggleEnabled)
 	}
 
+	// §40.2: an allowed gate is an unattended merge, which the autonomy
+	// freeze holds -- read here, after the four checks and before the
+	// fresh stack read and the merge. The gate runs once per close event of
+	// the origin, so a held merge is not re-evaluated after the freeze
+	// lifts: the fix pull request stays open as an ordinary review item,
+	// and its claim stays fix_open. The audit row below records the skip.
+	frozenSkip := domainautonomy.SkipReason("")
+	if decision.Allowed {
+		if skip, reason := gate.Check(ctx, domainautonomy.SiteSentinelFixMerge, "sentinel_fix_id", fix.ID.String(), "fix_pr_number", *fix.FixPrNumber); skip {
+			frozenSkip = reason
+			decision = sentinelfix.MergeGateDecision{Allowed: false, Reason: "skipped: autonomy is frozen"}
+			if reason != domainautonomy.SkipFrozen {
+				decision.Reason = "skipped: the autonomy freeze could not be read"
+			}
+		}
+	}
+
 	mergeAttempted := false
 	mergeErrString := ""
 	if decision.Allowed {
@@ -399,7 +419,7 @@ func handlePullRequestClosed(
 	// user_id is NULL: "the same allowance already made in the audit_log
 	// schema for actions with no human actor" (§17.5) -- this is a
 	// system-initiated check, never a delegated human one (§17.4).
-	if err := auditlog.Record(ctx, auditLog, pgtype.UUID{}, "sentinel_fix.merge_gate_evaluated", "sentinel_fix", fix.ID.String(), map[string]any{
+	auditDetail := map[string]any{
 		"repo_full_name":   payload.Repository.FullName,
 		"origin_pr_number": payload.PullRequest.Number,
 		"fix_pr_number":    *fix.FixPrNumber,
@@ -408,7 +428,13 @@ func handlePullRequestClosed(
 		"reason":           decision.Reason,
 		"merge_attempted":  mergeAttempted,
 		"merge_error":      mergeErrString,
-	}); err != nil {
+	}
+	// "skipped" is present only on a merge the freeze held (§40.2), naming
+	// its reason: frozen, or freeze_unreadable.
+	if frozenSkip != "" {
+		auditDetail["skipped"] = string(frozenSkip)
+	}
+	if err := auditlog.Record(ctx, auditLog, pgtype.UUID{}, "sentinel_fix.merge_gate_evaluated", "sentinel_fix", fix.ID.String(), auditDetail); err != nil {
 		logger.Error("github: record sentinel_fix.merge_gate_evaluated audit log failed", "error", err)
 	}
 

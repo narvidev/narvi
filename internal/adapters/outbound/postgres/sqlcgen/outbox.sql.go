@@ -184,10 +184,12 @@ type DeferOutboxEntryParams struct {
 // Records a failure of the class that does not consume an attempt
 // (domain/outbox.ClassDeferred, §5.1 and §44.2): gives back the attempt
 // ClaimOutboxEntry counted and makes the row due again at the caller's
-// own next_attempt_at, without moving it toward dead-letter. Today its one
-// cause is this process's own shutdown cutting a delivery short, or
-// reaching a claimed row before its delivery started; a rate limit whose
-// deadline GitHub stated (§44.2) is the next.
+// own next_attempt_at, without moving it toward dead-letter. Its causes
+// today: this process's own shutdown cutting a delivery short, or reaching
+// a claimed row before its delivery started; and the autonomy freeze
+// (§40.2) holding a delivery that is itself an automatic action
+// (outboxworker's holdFrozen). A rate limit whose deadline GitHub stated
+// (§44.2) is the next.
 //
 // A genuine compare-and-swap on next_attempt_at, like RenewOutboxClaim's,
 // not only a status guard: this statement takes an attempt BACK, so it must
