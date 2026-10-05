@@ -273,7 +273,8 @@ func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, repo g
 // patterns (a changed file, an unmerged entry, an untracked file in the
 // way) -- and an error when git could not run or exited non-zero.
 // applySparseCheckout fails on any such path; CheckoutPullRef tolerates
-// them before its forced checkout, which discards them.
+// them before its forced checkout, which discards them, and fails on any
+// that are left after it.
 func sparseCheckoutSet(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, patterns []string, timeout, stopGrace time.Duration) (string, error) {
 	// `sparse-checkout set` materializes newly-in-scope paths into the
 	// working tree -- exactly the class of operation that can run a

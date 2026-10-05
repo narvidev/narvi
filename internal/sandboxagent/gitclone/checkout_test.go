@@ -418,7 +418,7 @@ func TestCheckoutPullRef_SpawnCount(t *testing.T) {
 	}{
 		{name: "unscoped, never sparse", wantLocal: 13},
 		{name: "unscoped, left sparse", sparse: true, wantLocal: 13},
-		{name: "scoped", pathScope: []string{"/pr.txt"}, wantLocal: 14},
+		{name: "scoped", pathScope: []string{"/pr.txt"}, wantLocal: 15},
 		{name: "scoped, a skip-worktree file present", skipWorktree: true, pathScope: []string{"/pr.txt"}, wantLocal: gitclone.PullCheckoutMaxLocalGitSpawns},
 	}
 	for _, tc := range tests {
@@ -1287,6 +1287,75 @@ func TestSyncAll_PullRef_LeavesNothingOutsideTheScope(t *testing.T) {
 			t.Parallel()
 			bootAfterPreviousTurn(t, tc)
 		})
+	}
+}
+
+// plantUnremovable leaves docs/new.md, the path S3 adds out of the scope,
+// in a directory the runtime made read-only: git cannot remove it, so the
+// worktree cannot become S3's scoped tree. Root could remove it, so the
+// tests that use it skip under root.
+func plantUnremovable(t *testing.T, dir string) {
+	t.Helper()
+	writeWorktreeFile(t, dir, "docs/new.md", "PLANTED\n")
+	docs := filepath.Join(dir, "docs")
+	if err := os.Chmod(docs, 0o555); err != nil {
+		t.Fatalf("chmod docs: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(docs, 0o755) })
+}
+
+// TestCheckoutPullRef_APathLeftOutsideTheScopeFailsTheCheckout: when an
+// out-of-scope path is still on disk after the forced checkout and the
+// clean, the checkout reports failed, never checked_out: the worktree is
+// not the recorded head's scoped tree.
+func TestCheckoutPullRef_APathLeftOutsideTheScopeFailsTheCheckout(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root removes a file whatever its directory's mode")
+	}
+	t.Parallel()
+	o := newPullRefOrigin(t)
+	layout, repo, dir := clonedBase(t, o)
+	scope := []string{"/pr.txt"}
+	if got := checkoutPullRef(layout, repo, testPullRef, o.s1, scope); got.Outcome != gitclone.PullCheckoutCheckedOut {
+		t.Fatalf("first CheckoutPullRef() = %+v, want checked_out", got)
+	}
+	plantUnremovable(t, dir)
+	o.advancePullRef(t, o.s3)
+
+	got := checkoutPullRef(layout, repo, testPullRef, o.s3, scope)
+	if got.Outcome != gitclone.PullCheckoutFailed || got.HeadSHA != "" || got.Err == nil {
+		t.Fatalf("CheckoutPullRef(S3) = %+v, want failed", got)
+	}
+	if !strings.Contains(got.Err.Error(), "docs/new.md") {
+		t.Errorf("error = %v, want it to name docs/new.md", got.Err)
+	}
+}
+
+// TestSyncAll_PullRef_APathLeftOutsideTheScopeFailsTheRepo is the same on
+// a warm boot: the repo fails, never booted as the review's tree.
+func TestSyncAll_PullRef_APathLeftOutsideTheScopeFailsTheRepo(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root removes a file whatever its directory's mode")
+	}
+	t.Parallel()
+	o := newPullRefOrigin(t)
+	layout := gitdir.Layout{Root: t.TempDir(), WorkspaceDir: t.TempDir()}
+	ref := testPullRef
+	scope := []string{"/pr.txt"}
+	repos := []sessionconfig.SessionConfigReposElem{{Name: "widgets", Url: o.url, Ref: &ref}}
+	if results, err := gitclone.CloneAll(context.Background(), supervisor.New(), layout, nil, nil, repos, scope, testCloneTimeout, testStopGrace); err != nil || results[0].Err != nil {
+		t.Fatalf("CloneAll() = %+v, %v", results, err)
+	}
+	plantUnremovable(t, filepath.Join(layout.WorkspaceDir, "widgets"))
+	o.advancePullRef(t, o.s3)
+
+	results, err := gitclone.SyncAll(context.Background(), supervisor.New(), layout, nil, repos, scope, "77777777-7777-7777-7777-777777777777",
+		testFetchStepTimeout, testSyncStepTimeout, testStopGrace, func(string, string, string) {}, noopGitFetchTiming, noopGitCheckoutTiming)
+	if err == nil || len(results) != 1 || results[0].Err == nil {
+		t.Fatalf("SyncAll() = %+v, %v, want the primary repo failed", results, err)
+	}
+	if !strings.Contains(results[0].Err.Error(), "scoped tree") {
+		t.Errorf("error = %v, want it to say the tree is not the scoped tree", results[0].Err)
 	}
 }
 

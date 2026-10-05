@@ -28,8 +28,9 @@ type PullCheckoutOutcome string
 const (
 	// PullCheckoutCheckedOut means the worktree holds HeadSHA, the commit
 	// asked for, with every tracked change discarded, every untracked file
-	// that is not ignored removed, and no operation a turn started (a merge,
-	// a rebase, a cherry-pick, ...) left in progress.
+	// that is not ignored removed, no operation a turn started (a merge, a
+	// rebase, a cherry-pick, ...) left in progress, and, in a scoped
+	// session, no path outside the scope on disk.
 	PullCheckoutCheckedOut PullCheckoutOutcome = "checked_out"
 	// PullCheckoutSHAAbsent means the ref was fetched, and the commit asked for
 	// is not in the repository. The worktree is untouched.
@@ -56,15 +57,16 @@ const PullHeadLocalRef = "refs/narvi/pull-head"
 // read-tree that resets the index to the target (1), ls-files and the
 // update-index that clears those bits (2), the sparse-checkout set and the
 // five-process mirror to the runtime's config (6), the forced checkout and
-// the runtime HEAD write its move causes (2), clean (1) and rev-parse HEAD
-// (1). A scoped repo with no such entry takes 14, and an unscoped repo 13,
+// the runtime HEAD write its move causes (2), clean (1), the
+// sparse-checkout set that checks the scope holds (1) and rev-parse HEAD
+// (1). A scoped repo with no such entry takes 15, and an unscoped repo 13,
 // the sparse-checkout disable and its mirror (6) in place of the five
-// sparse steps. Clearing an operation a turn left in progress spawns
-// nothing.
+// sparse steps before the checkout and with no check after it. Clearing an
+// operation a turn left in progress spawns nothing.
 // TestCheckoutPullRef_SpawnCount pins every path.
 const (
 	PullCheckoutNetworkGitSpawns  = 1
-	PullCheckoutMaxLocalGitSpawns = 15
+	PullCheckoutMaxLocalGitSpawns = 16
 )
 
 // PullCheckoutResult is one repo's outcome from CheckoutPullRef.
@@ -126,14 +128,18 @@ type PullCheckoutResult struct {
 //     patterns, which recomputes every other bit without ever writing an
 //     out-of-scope path (§14.1). Here set may leave a changed file, or an
 //     untracked one in the way, and says so: the forced checkout discards
-//     them. Both are mirrored to the runtime's config.
+//     them, and step 7 fails the checkout if it did not. Both are mirrored
+//     to the runtime's config.
 //  6. `checkout --force --detach <target> --`, then `clean -ffd`: every
 //     tracked change, staged or not, is discarded, and every untracked
 //     file that is not ignored is removed, nested repositories included.
 //     Ignored files are kept, so what setup.sh installed survives. The
 //     detached HEAD is synced out to the runtime's worktree by gitdir.Run
 //     (gitdir.SyncHeadOut).
-//  7. `rev-parse HEAD` gives HeadSHA, which must be the target.
+//  7. A scoped session's patterns are set again, and a path git leaves on
+//     disk despite them fails the checkout: the worktree is then not the
+//     target's scoped tree (§14.1).
+//  8. `rev-parse HEAD` gives HeadSHA, which must be the target.
 //
 // chownRepo re-owns the worktree for the runtime (nil skips it) on every
 // outcome from the fetch on, whatever it is: the fetch, the checkout and
@@ -221,7 +227,8 @@ func CheckoutPullRef(
 		err = prepareScopedEntries(ctx, sup, layout, repo.Name, cred, stepTimeout, stopGrace)
 		if err == nil {
 			// What set leaves on disk here -- a changed out-of-scope file,
-			// an untracked file in the way -- the forced checkout discards.
+			// an untracked file in the way -- the forced checkout discards,
+			// and the check after it fails the checkout on anything left.
 			_, err = sparseCheckoutSet(ctx, sup, handle, cred, pathScope, stepTimeout, stopGrace)
 		}
 		if err == nil {
@@ -242,6 +249,17 @@ func CheckoutPullRef(
 	if _, err := runGitStep(ctx, sup, handle, cred, []string{"clean", "-ffd", "--quiet"}, stepTimeout, stopGrace); err != nil {
 		result.Outcome, result.Err = PullCheckoutFailed, fmt.Errorf("gitclone: clean %s: %w", repo.Name, err)
 		return result
+	}
+	if scoped {
+		left, err := sparseCheckoutSet(ctx, sup, handle, cred, pathScope, stepTimeout, stopGrace)
+		if err != nil {
+			result.Outcome, result.Err = PullCheckoutFailed, fmt.Errorf("gitclone: check the path scope of %s: %w", repo.Name, err)
+			return result
+		}
+		if left != "" {
+			result.Outcome, result.Err = PullCheckoutFailed, fmt.Errorf("gitclone: %s is not %s's scoped tree: git left paths on disk despite the path scope: %s", repo.Name, target, left)
+			return result
+		}
 	}
 
 	headSHA, err := runGitStep(ctx, sup, handle, cred, []string{"rev-parse", "HEAD"}, stepTimeout, stopGrace)
