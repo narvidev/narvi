@@ -2366,6 +2366,9 @@ type Sandbox struct {
 	ReadySeq                      int32                `json:"ready_seq"`
 	AgentMaxFrameBytes            *int32               `json:"agent_max_frame_bytes"`
 	AgentMaxFrameBytesGen         *int32               `json:"agent_max_frame_bytes_gen"`
+	LifetimeDeadlineAt            pgtype.Timestamptz   `json:"lifetime_deadline_at"`
+	LifetimeSeconds               *int32               `json:"lifetime_seconds"`
+	LifetimeDeadlineGen           *int32               `json:"lifetime_deadline_gen"`
 }
 
 type SandboxHistory struct {

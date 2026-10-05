@@ -269,6 +269,16 @@ type spawnPlan struct {
 	// (pgtype.UUID{}.Valid == false) for an ordinary, unscoped session --
 	// checkContractDrift's own first early-return checks exactly this.
 	environmentID pgtype.UUID
+
+	// lifetime is the deadline a spawn or restore claim stamped on its new
+	// gen (technical plan §35.2), set by planFreshSpawn and planRestore
+	// from the row their upsert returned, and nil on a resume plan, whose
+	// upsert carries a deadline rather than stamping one. executePlans logs
+	// it, so the line is written only once the claim has committed: a
+	// claim that rolls back after the upsert -- a later read, write or the
+	// commit itself failing -- never names a gen or a deadline that was not
+	// persisted.
+	lifetime *lifetimeStamp
 }
 
 // dispatchPlan is what planDispatch's own transact hands back to
@@ -371,6 +381,9 @@ func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 // transaction (handleEnsureDispatched): the provider call of a spawn,
 // restore or resume, or the send of a dispatch.
 func (a *Actor) executePlans(ctx context.Context, spawn *spawnPlan, dispatch *dispatchPlan, deleted sqlcgen.DeleteSessionDispatchTimerRow) error {
+	if spawn != nil {
+		a.logLifetimeDeadline(spawn)
+	}
 	switch {
 	case spawn != nil && spawn.resume:
 		return a.executeResume(ctx, spawn)
@@ -1594,9 +1607,17 @@ func (a *Actor) planFreshSpawn(
 	}
 	tokenHash := hashSandboxToken(token)
 
+	// §35.2: a spawn, a force-respawn included, is a new provider object,
+	// so it gets a fresh deadline, stamped in the upsert that creates its
+	// gen.
+	lifetimeSeconds, lifetimeKind, err := a.sandboxLifetimeSeconds(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := a.sandboxWrites(tx).UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{
-		SessionID: a.sessionID,
-		TokenHash: &tokenHash,
+		SessionID:       a.sessionID,
+		TokenHash:       &tokenHash,
+		LifetimeSeconds: lifetimeSeconds,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: upsert sandbox for spawn: %w", err)
@@ -1628,7 +1649,10 @@ func (a *Actor) planFreshSpawn(
 		return nil, fmt.Errorf("sessionactor: invalid create spec: %w", err)
 	}
 
-	return &spawnPlan{gen: int(row.Gen), spec: spec, createdBy: sessionRow.CreatedBy, environmentID: sessionRow.EnvironmentID}, nil
+	return &spawnPlan{
+		gen: int(row.Gen), spec: spec, createdBy: sessionRow.CreatedBy, environmentID: sessionRow.EnvironmentID,
+		lifetime: newLifetimeStamp("spawn", lifetimeKind, row),
+	}, nil
 }
 
 // planRestore implements design decision 6's own restore-specific write.
@@ -1666,9 +1690,17 @@ func (a *Actor) planRestore(
 	}
 	tokenHash := hashSandboxToken(token)
 
+	// §35.2, §35.3: a restore is a new provider object too, so it gets a
+	// fresh deadline from the same upsert -- a fresh start date, which says
+	// nothing about how old the snapshot's contents are.
+	lifetimeSeconds, lifetimeKind, err := a.sandboxLifetimeSeconds(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 	row, err := a.sandboxWrites(tx).UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{
-		SessionID: a.sessionID,
-		TokenHash: &tokenHash,
+		SessionID:       a.sessionID,
+		TokenHash:       &tokenHash,
+		LifetimeSeconds: lifetimeSeconds,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: upsert sandbox for restore: %w", err)
@@ -1709,6 +1741,7 @@ func (a *Actor) planRestore(
 		gen: int(row.Gen), spec: spec, restore: true,
 		snapshotID: ports.SnapshotID(snapshotImageID), createdBy: sessionRow.CreatedBy,
 		environmentID: sessionRow.EnvironmentID,
+		lifetime:      newLifetimeStamp("restore", lifetimeKind, row),
 	}, nil
 }
 
@@ -1782,9 +1815,15 @@ func (a *Actor) planResume(
 	}
 	tokenHash := hashSandboxToken(token)
 
+	// §35.2: a resume claims the same provider object, which is never
+	// younger than it was, so no lifetime is passed: the upsert carries the
+	// previous gen's deadline forward, or leaves none when that gen had
+	// none of its own. A fresh stamp would be later than the provider's own
+	// deadline.
 	row, err := a.sandboxWrites(tx).UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{
-		SessionID: a.sessionID,
-		TokenHash: &tokenHash,
+		SessionID:       a.sessionID,
+		TokenHash:       &tokenHash,
+		LifetimeSeconds: nil,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: upsert sandbox for resume: %w", err)

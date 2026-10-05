@@ -395,3 +395,37 @@ lower version needs, and running the three suites above on it first.
 past the refusal. Before provisioning, read the offering's major version
 on a server of the same plan (`SHOW server_version;`).
 
+
+## 14. The sandbox provider gives every sandbox at least `ProviderHardCap`
+
+**Why this is here.** The control plane never tells its sandbox provider
+how long a sandbox may live: neither adapter's create or restore request
+carries a lifetime. It assumes one instead. When a claim spawns or
+restores a sandbox, it stamps the sandbox row's `lifetime_deadline_at`
+at the database's time plus the session kind's lifetime
+(`SandboxLifetimeFor`, `internal/platform/timeouts.go`;
+`docs/TECHNICAL_PLAN.md` §35.2), before the provider is called. Each
+kind's lifetime is held at or below `ProviderHardCap` (2 hours), the one
+lifetime `timeouts.go` asserts of a provider (§5.4), and today both kinds
+equal it. So the recorded deadline is never later than the provider's
+own only if the provider really lets every sandbox run at least that
+long, counted from no earlier than its create or restore call. Nothing
+in this repository can read the provider's limit.
+
+Today nothing acts on the recorded deadline: a turn is dispatched as it
+always was, whatever its sandbox's age, so a sandbox near its provider's
+limit can still be ended mid-turn. The pre-dispatch runway gate that
+will read the deadline (§35.3) is Step 137, not yet built. Once it is, a
+provider that ends sandboxes sooner than assumed makes every recorded
+deadline late, and the gate would dispatch onto a sandbox the row says
+has runway -- the failure §35 exists to prevent. Check it now, so the
+deadline is right before anything relies on it.
+
+**Check.** In the provider's own configuration or documentation for the
+account this deployment uses, read the longest a sandbox may run and the
+instant that is counted from, and confirm it is at least `ProviderHardCap`
+counted from the create or restore call. If it is shorter, do not deploy:
+`ProviderHardCap`, `SandboxLifetime` and `ReviewSandboxLifetime` are
+compiled defaults (`DefaultTimeouts`), so lowering them to the provider's
+limit is a change to `timeouts.go` and a release, which `Validate` checks
+at boot.

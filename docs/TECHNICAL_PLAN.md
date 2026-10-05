@@ -255,7 +255,7 @@ type AgentRuntime interface {
 ### 5.4 Timeout hierarchy (single source: `platform/timeouts.go`)
 One struct, validated at boot with the invariant chain asserted in a unit test:
 `provider hard cap (2h) > supervisor turn cap > CP turn_deadline > OpenCode SSE inactivity timeout`, each with explicit margin. Also: `providerHTTPClientTimeout > provider worst cold start`; `first_connect_budget > image pull + boot p99`. No timeout literal anywhere else in the codebase.
-**The first term is not a property of the turn.** A provider's hard cap runs from its sandbox's own creation, not from the turn running inside it, so this chain is asserted of a turn dispatched onto a *fresh* sandbox and is simply false of one dispatched onto an old one — the boot-time invariant test cannot see the difference, because at boot there is no sandbox. §35 is what makes the first term true at dispatch rather than only at spawn; `RotationRunwayFloor` is this file's own entry for it. On the Kubernetes provider (§42.2) the first term is, for the first time, Narvi's own value: `KubernetesPodActiveDeadline`, set as the pod's `activeDeadlineSeconds`, this file's own entry, asserted in the same chain.
+**The first term is not a property of the turn.** A provider's hard cap runs from its sandbox's own creation, not from the turn running inside it, so this chain is asserted of a turn dispatched onto a *fresh* sandbox and is simply false of one dispatched onto an old one — the boot-time invariant test cannot see the difference, because at boot there is no sandbox. §35 is what makes the first term true at dispatch rather than only at spawn; `RotationRunwayFloor` is this file's own entry for it. The lifetime each session kind's sandbox is assumed to get (§35.2: `SandboxLifetime`, `ReviewSandboxLifetime`, read through `SandboxLifetimeFor`) is this file's entry for that first term at spawn: nothing sends it to the provider, so it is held at or below the provider hard cap with no margin, and above the supervisor turn cap and `first_connect_budget` plus the boot-evidence fallback with margin, in the same invariant test. On the Kubernetes provider (§42.2) the first term is, for the first time, Narvi's own value: `KubernetesPodActiveDeadline`, set as the pod's `activeDeadlineSeconds`, this file's own entry, asserted in the same chain.
 **The ladder has a session-level tier above the turn (§40.3).** `SessionWallClock > turn_deadline`, and `MaxTurnsPerSession` beside it, both with a human-session value and a stricter automation-session value — this file's own entries, asserted in the same invariant test, and the reason a session created by an automation has an end that someone chose.
 
 ## 6. Wire contracts (frontend and sandbox protocol)
@@ -6710,14 +6710,31 @@ dispatched into a socket that was already gone**, failing instantly with an elap
 That second half is the cheaper one to close and needs nothing from the sandbox side.
 
 ### 35.2 The deadline is persisted state, never inferred at use
-`sandbox.lifetime_deadline_at`, written in the same `UPDATE` that already stamps a spawn's or
-restore's `created_at`: a conservative estimate (`created_at + lifetime`, from the per-session-type
-lifetime constant this control plane already sends on the wire) overwritten by the exact value
-`sandbox-agent` reports on `ready` and on every `heartbeat` (§6.1). Estimate first, exact value
-when it arrives — because a restored sandbox runs whatever `sandbox-agent` its snapshot baked in,
-possibly for weeks, so no part of this may depend on an agent-side change having shipped. The
-per-session-type lifetime lives in one place, so a longer lifetime for a future session type is a
-one-line change and the rotation threshold follows it.
+`sandboxes.lifetime_deadline_at`, written by the statement that creates a sandbox gen
+(`UpsertSandboxForSpawn`, which every spawn, restore and resume runs in the claim's transaction,
+before the provider is called): a conservative estimate (the claim's own `now()` plus the session
+kind's lifetime, kept in `lifetime_seconds`), which the exact value `sandbox-agent` reports on
+`ready` and on every `heartbeat` (§6.1) can only bring earlier, never later: the row keeps the
+earlier of its deadline and the report's (`LEAST(deadline, now() + reported)`), so one late or
+wrong report can never move it past the provider's own. The estimate counts from the claim, never from
+`created_at`: only a session's first gen stamps `created_at`, and a respawn or restore keeps it, so
+a deadline counted from it would already be past for every later gen. The deadline is recorded
+against its gen (`lifetime_deadline_gen`) and counts only while that is the live gen; anything else
+reads "deadline unknown". A spawn and a restore are new provider objects and get a fresh deadline; a
+resume claims the same provider object, never younger than it was, so it carries the previous gen's
+deadline forward, or none when that gen had none of its own. No lifetime is sent to the provider —
+neither adapter's create or restore request carries one — so each kind's lifetime is the control
+plane's assumption about its provider, held at or below `ProviderHardCap` (§5.4), which
+`docs/PRODUCTION_CHECKLIST.md` (item 14) asserts the provider gives every sandbox. Estimate first,
+exact value when it arrives — because a restored sandbox runs whatever `sandbox-agent` its snapshot
+baked in, possibly for weeks, so no part of this may depend on an agent-side change having shipped.
+The per-session-type lifetime lives in one place, `Timeouts.SandboxLifetimeFor` in
+`platform/timeouts.go` (kinds `default` and `review`, the latter a pull request's review session),
+and the rotation threshold follows it. Changing a session type's lifetime is a change to its field in
+that file, and nothing more while the value stays at or below `ProviderHardCap`; a longer lifetime
+also means raising `ProviderHardCap`, which `Validate` holds every kind under, and only after
+checking that the provider gives a sandbox that long (`docs/PRODUCTION_CHECKLIST.md`, item 14). A
+new session type adds its kind (`internal/domain/sandbox`) and a field and default of its own.
 
 ### 35.3 Rotation is the existing restore path, given a second trigger
 A rotation is `snapshot → stopped → shutdown → restore`, every step of which §3.2 already

@@ -2,9 +2,21 @@ package platform_test
 
 import (
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
+	"io/fs"
+	"maps"
+	"os"
+	"path/filepath"
+	"runtime"
+	"slices"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/narvidev/narvi/internal/domain/sandbox"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -1399,7 +1411,7 @@ func TestValidate_ReportsAllViolations(t *testing.T) {
 	t.Parallel()
 
 	to := platform.DefaultTimeouts()
-	to.SupervisorTurnCap = to.ProviderHardCap   // breaks link 1
+	to.SupervisorTurnCap = to.ProviderHardCap   // breaks link 1, and each sandbox lifetime's link to it (§35.2)
 	to.ImagePullBootP99 = to.FirstConnectBudget // breaks link 5 (independent chain)
 
 	err := to.Validate()
@@ -1420,16 +1432,19 @@ func TestValidate_ReportsAllViolations(t *testing.T) {
 		}
 	}
 
-	for _, want := range []string{
+	wantChains := []string{
 		"ProviderHardCap > SupervisorTurnCap",
+		"SandboxLifetimeFor(default) > SupervisorTurnCap",
+		"SandboxLifetimeFor(review) > SupervisorTurnCap",
 		"FirstConnectBudget > ImagePullBootP99",
-	} {
+	}
+	for _, want := range wantChains {
 		if !gotChains[want] {
 			t.Errorf("Validate() did not report violated chain %q; got chains: %v", want, gotChains)
 		}
 	}
-	if len(gotChains) != 2 {
-		t.Errorf("Validate() reported %d distinct violated chains, want exactly 2 (got: %v)", len(gotChains), gotChains)
+	if len(gotChains) != len(wantChains) {
+		t.Errorf("Validate() reported %d distinct violated chains, want exactly %d (got: %v)", len(gotChains), len(wantChains), gotChains)
 	}
 }
 
@@ -3333,5 +3348,292 @@ func TestValidate_UnknownTimerBounds(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestSandboxLifetimeFor_EveryKindAndUnknown pins the one read of a sandbox
+// kind's lifetime (technical plan §35.2): each named kind gets its own
+// field, a kind this binary does not name gets the shorter of the two, and
+// the shipped defaults are both ProviderHardCap.
+func TestSandboxLifetimeFor_EveryKindAndUnknown(t *testing.T) {
+	t.Parallel()
+
+	defaults := platform.DefaultTimeouts()
+	for _, kind := range sandbox.AllLifetimeKinds() {
+		if got := defaults.SandboxLifetimeFor(kind); got != defaults.ProviderHardCap {
+			t.Errorf("DefaultTimeouts().SandboxLifetimeFor(%q) = %v, want ProviderHardCap %v", kind, got, defaults.ProviderHardCap)
+		}
+	}
+	if defaults.SandboxLifetime != 2*time.Hour || defaults.ReviewSandboxLifetime != 2*time.Hour {
+		t.Errorf("DefaultTimeouts() lifetimes = %v (default), %v (review), want 2h each",
+			defaults.SandboxLifetime, defaults.ReviewSandboxLifetime)
+	}
+
+	const unknown = sandbox.LifetimeKind("automation")
+	tests := []struct {
+		name            string
+		defaultLifetime time.Duration
+		reviewLifetime  time.Duration
+		kind            sandbox.LifetimeKind
+		want            time.Duration
+	}{
+		{"default kind", 110 * time.Minute, 100 * time.Minute, sandbox.LifetimeKindDefault, 110 * time.Minute},
+		{"review kind", 110 * time.Minute, 100 * time.Minute, sandbox.LifetimeKindReview, 100 * time.Minute},
+		{"unknown kind, review shorter", 110 * time.Minute, 100 * time.Minute, unknown, 100 * time.Minute},
+		{"unknown kind, default shorter", 95 * time.Minute, 100 * time.Minute, unknown, 95 * time.Minute},
+		{"empty kind", 95 * time.Minute, 100 * time.Minute, "", 95 * time.Minute},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			to.SandboxLifetime = tc.defaultLifetime
+			to.ReviewSandboxLifetime = tc.reviewLifetime
+			if got := to.SandboxLifetimeFor(tc.kind); got != tc.want {
+				t.Errorf("SandboxLifetimeFor(%q) = %v, want %v", tc.kind, got, tc.want)
+			}
+		})
+	}
+}
+
+// timeoutViolations is every violation Validate reports, one string each:
+// a broken link by its chain, a non-positive field as "positive: FIELD",
+// a fraction of a second as "whole seconds: FIELD".
+func timeoutViolations(t *testing.T, err error) map[string]bool {
+	t.Helper()
+	got := map[string]bool{}
+	if err == nil {
+		return got
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		t.Fatalf("Validate() error %v does not support errors.Join unwrapping", err)
+	}
+	for _, e := range joined.Unwrap() {
+		var inv *platform.TimeoutInvariantError
+		var pos *platform.TimeoutMustBePositiveError
+		var whole *platform.TimeoutMustBeWholeSecondsError
+		switch {
+		case errors.As(e, &inv):
+			got[inv.Chain] = true
+		case errors.As(e, &pos):
+			got["positive: "+pos.Field] = true
+		case errors.As(e, &whole):
+			got["whole seconds: "+whole.Field] = true
+		default:
+			got["other: "+e.Error()] = true
+		}
+	}
+	return got
+}
+
+// TestValidate_SandboxLifetime covers every Validate link of a sandbox
+// kind's lifetime (technical plan §35.2, §5.4): at or below ProviderHardCap
+// with no margin, since nothing tells the provider a lifetime; above
+// SupervisorTurnCap, and above FirstConnectBudget plus
+// BootEvidenceFallback, by MinTimeoutMargin; positive; and whole seconds,
+// the unit the sandbox row persists. Each case reports exactly the
+// violations listed, so a link that is dropped or that fires on its
+// neighbour's value fails here.
+func TestValidate_SandboxLifetime(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		want   []string
+	}{
+		{name: "the defaults, each at ProviderHardCap", mutate: func(*platform.Timeouts) {}},
+		{name: "AboveProviderHardCap, review", mutate: func(to *platform.Timeouts) {
+			to.ReviewSandboxLifetime = to.ProviderHardCap + time.Second
+		}, want: []string{"ProviderHardCap >= SandboxLifetimeFor(review)"}},
+		{name: "AboveProviderHardCap, default", mutate: func(to *platform.Timeouts) {
+			to.SandboxLifetime = to.ProviderHardCap + time.Minute
+		}, want: []string{"ProviderHardCap >= SandboxLifetimeFor(default)"}},
+		{name: "below ProviderHardCap", mutate: func(to *platform.Timeouts) {
+			to.ReviewSandboxLifetime = 100 * time.Minute
+			to.SandboxLifetime = 110 * time.Minute
+		}},
+		{name: "NotAboveSupervisorTurnCap, within the margin", mutate: func(to *platform.Timeouts) {
+			to.ReviewSandboxLifetime = to.SupervisorTurnCap + platform.MinTimeoutMargin - time.Second
+		}, want: []string{"SandboxLifetimeFor(review) > SupervisorTurnCap"}},
+		{name: "NotAboveSupervisorTurnCap, default", mutate: func(to *platform.Timeouts) {
+			to.SandboxLifetime = to.SupervisorTurnCap
+		}, want: []string{"SandboxLifetimeFor(default) > SupervisorTurnCap"}},
+		{name: "exactly the margin above SupervisorTurnCap", mutate: func(to *platform.Timeouts) {
+			to.ReviewSandboxLifetime = to.SupervisorTurnCap + platform.MinTimeoutMargin
+		}},
+		{name: "NotAboveBootFallback", mutate: func(to *platform.Timeouts) {
+			to.ReviewSandboxLifetime = 100 * time.Minute
+			to.BootEvidenceFallback = to.ReviewSandboxLifetime - to.FirstConnectBudget
+		}, want: []string{"SandboxLifetimeFor(review) > FirstConnectBudget + BootEvidenceFallback"}},
+		{name: "FractionalSeconds", mutate: func(to *platform.Timeouts) {
+			to.ReviewSandboxLifetime = 100*time.Minute + 500*time.Millisecond
+		}, want: []string{"whole seconds: SandboxLifetimeFor(review)"}},
+		{name: "Zero", mutate: func(to *platform.Timeouts) {
+			to.SandboxLifetime = 0
+		}, want: []string{
+			"positive: SandboxLifetimeFor(default)",
+			"SandboxLifetimeFor(default) > SupervisorTurnCap",
+			"SandboxLifetimeFor(default) > FirstConnectBudget + BootEvidenceFallback",
+		}},
+		{name: "negative", mutate: func(to *platform.Timeouts) {
+			to.ReviewSandboxLifetime = -time.Hour
+		}, want: []string{
+			"positive: SandboxLifetimeFor(review)",
+			"SandboxLifetimeFor(review) > SupervisorTurnCap",
+			"SandboxLifetimeFor(review) > FirstConnectBudget + BootEvidenceFallback",
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			got := timeoutViolations(t, to.Validate())
+			want := map[string]bool{}
+			for _, w := range tc.want {
+				want[w] = true
+			}
+			if !maps.Equal(got, want) {
+				t.Errorf("Validate() violations = %v, want %v", slices.Sorted(maps.Keys(got)), tc.want)
+			}
+		})
+	}
+}
+
+// TestSandboxLifetimeFieldsAreReadOnlyInPlatform is the source half of
+// "the per-session-type lifetime lives in one place" (technical plan
+// §35.2): SandboxLifetime and ReviewSandboxLifetime are read in one
+// function, Timeouts.SandboxLifetimeFor, and every caller asks it, so a
+// kind's lifetime -- the shorter-of-the-two fallback for an unknown kind
+// included -- is decided there alone. It parses every non-test Go file of
+// the module (node_modules, testdata and .git aside) and fails on:
+//
+//   - a selector naming either field anywhere but inside
+//     SandboxLifetimeFor in internal/platform -- outside the package, or a
+//     second reader inside it, such as another getter;
+//   - a string literal equal to either field's name, the way reflection
+//     reads a field by name (FieldByName);
+//   - a file that imports reflect and names Timeouts, since reflection
+//     over the struct can read the fields without naming them.
+//
+// DefaultTimeouts sets the fields as composite-literal keys, which are not
+// selectors, and a test may set them as a deployment's configuration
+// would. It does not see a read through unsafe, or a whole Timeouts value
+// serialised and parsed back (encoding/json, fmt's %+v).
+func TestSandboxLifetimeFieldsAreReadOnlyInPlatform(t *testing.T) {
+	t.Parallel()
+
+	fields := map[string]bool{"SandboxLifetime": true, "ReviewSandboxLifetime": true}
+	_, self, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	platformDir := filepath.Dir(self)
+	root := platformDir
+	for {
+		if _, err := os.Stat(filepath.Join(root, "go.mod")); err == nil {
+			break
+		}
+		parent := filepath.Dir(root)
+		if parent == root {
+			t.Fatal("go.mod not found above internal/platform")
+		}
+		root = parent
+	}
+
+	scanned := 0
+	readInTheGetter := map[string]bool{}
+	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() {
+			switch d.Name() {
+			case ".git", "node_modules", "testdata":
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.SkipObjectResolution)
+		if err != nil {
+			return err
+		}
+		scanned++
+		rel, _ := filepath.Rel(root, path)
+		inPlatform := filepath.Dir(path) == platformDir
+
+		importsReflect := false
+		for _, imp := range file.Imports {
+			if imp.Path.Value == `"reflect"` {
+				importsReflect = true
+			}
+		}
+		namesTimeouts := false
+
+		// inspect walks n, declared in function fn ("" outside any).
+		inspect := func(n ast.Node, fn string) {
+			ast.Inspect(n, func(n ast.Node) bool {
+				switch n := n.(type) {
+				case *ast.SelectorExpr:
+					if n.Sel.Name == "Timeouts" {
+						namesTimeouts = true
+					}
+					if !fields[n.Sel.Name] {
+						return true
+					}
+					if inPlatform && fn == "Timeouts.SandboxLifetimeFor" {
+						readInTheGetter[n.Sel.Name] = true
+						return true
+					}
+					t.Errorf("%s names .%s in %q: read a sandbox kind's lifetime through platform.Timeouts.SandboxLifetimeFor only (technical plan §35.2)", rel, n.Sel.Name, fn)
+				case *ast.Ident:
+					if n.Name == "Timeouts" {
+						namesTimeouts = true
+					}
+				case *ast.BasicLit:
+					if n.Kind == token.STRING {
+						if v, err := strconv.Unquote(n.Value); err == nil && fields[v] {
+							t.Errorf("%s has the string %s: a field read by name, as reflection does, bypasses platform.Timeouts.SandboxLifetimeFor (technical plan §35.2)", rel, n.Value)
+						}
+					}
+				}
+				return true
+			})
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				inspect(decl, "")
+				continue
+			}
+			name := fn.Name.Name
+			if fn.Recv != nil && len(fn.Recv.List) == 1 {
+				recv := fn.Recv.List[0].Type
+				if star, ok := recv.(*ast.StarExpr); ok {
+					recv = star.X
+				}
+				if id, ok := recv.(*ast.Ident); ok {
+					name = id.Name + "." + name
+				}
+			}
+			inspect(fn, name)
+		}
+		if importsReflect && namesTimeouts {
+			t.Errorf("%s imports reflect and names Timeouts: reflection over the struct can read a sandbox kind's lifetime around platform.Timeouts.SandboxLifetimeFor (technical plan §35.2)", rel)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("scan the module: %v", err)
+	}
+	// SandboxLifetimeFor reads both fields: a near-empty scan, or a getter
+	// that reads neither, means the scan is broken.
+	if scanned < 500 || !readInTheGetter["SandboxLifetime"] || !readInTheGetter["ReviewSandboxLifetime"] {
+		t.Fatalf("scanned %d files, and SandboxLifetimeFor reads %v: the scan is broken", scanned, readInTheGetter)
 	}
 }

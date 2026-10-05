@@ -269,6 +269,7 @@ func TestSQLWritesSandboxStatus(t *testing.T) {
 		{"a merge", `MERGE INTO sandboxes s USING x ON s.session_id = x.id WHEN MATCHED THEN UPDATE SET last_seen_at = now()`, true},
 		{"another column only", `UPDATE sandboxes SET last_seen_at = now() WHERE session_id = $1`, false},
 		{"status read on the right only", `UPDATE sandboxes SET pre_suspect_status = status WHERE session_id = $1`, false},
+		{"a column named for the gen", `UPDATE sandboxes SET lifetime_deadline_gen = gen, lifetime_deadline_at = CASE WHEN lifetime_deadline_gen = gen THEN lifetime_deadline_at END WHERE session_id = $1`, false},
 		{"status read in a function on the right", `UPDATE sandboxes SET last_seen_at = COALESCE(sqlc.narg('x'), last_seen_at), pre_suspect_status = NULLIF(status, 'suspect') WHERE status <> 'failed'`, false},
 		{"another table's status", `UPDATE sessions SET status = 'failed' WHERE id = $1`, false},
 		{"a table whose name starts with sandboxes", `UPDATE sandboxes_archive SET status = 'failed'`, false},
