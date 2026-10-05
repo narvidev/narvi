@@ -28,13 +28,15 @@ const testHeadBranch = "pr-branch"
 // pullRefOrigin is a base repository whose main holds a file of its own
 // (main-only.txt), and whose refs/pull/7/head holds S1, a contributor's
 // commit off an older main, as does its branch pr-branch. S2, S1's child,
-// exists only in the contributor's clone until advancePullRef pushes it.
+// changes pr.txt, and S3, S2's child, adds docs/new.md; both exist only in
+// the contributor's clone until advancePullRef pushes them.
 type pullRefOrigin struct {
 	url  string
 	work string
 	main string
 	s1   string
 	s2   string
+	s3   string
 }
 
 func newPullRefOrigin(t *testing.T) *pullRefOrigin {
@@ -65,6 +67,10 @@ func newPullRefOrigin(t *testing.T) *pullRefOrigin {
 	}
 	o.s1 = commit("pr.txt", "first\n", "the pull request's first head")
 	o.s2 = commit("pr.txt", "second\n", "the pull request's second head")
+	if err := os.MkdirAll(filepath.Join(work, "docs"), 0o755); err != nil {
+		t.Fatalf("mkdir docs: %v", err)
+	}
+	o.s3 = commit("docs/new.md", "real\n", "the pull request's third head")
 	runGit(t, work, "checkout", "-q", "main")
 	o.main = commit("main-only.txt", "main\n", "main moves on")
 	runGit(t, work, "push", "-q", "origin", "main")
@@ -410,9 +416,9 @@ func TestCheckoutPullRef_SpawnCount(t *testing.T) {
 		pathScope    []string
 		wantLocal    int
 	}{
-		{name: "unscoped, never sparse", wantLocal: 12},
-		{name: "unscoped, left sparse", sparse: true, wantLocal: 12},
-		{name: "scoped", pathScope: []string{"/pr.txt"}, wantLocal: 13},
+		{name: "unscoped, never sparse", wantLocal: 13},
+		{name: "unscoped, left sparse", sparse: true, wantLocal: 13},
+		{name: "scoped", pathScope: []string{"/pr.txt"}, wantLocal: 14},
 		{name: "scoped, a skip-worktree file present", skipWorktree: true, pathScope: []string{"/pr.txt"}, wantLocal: gitclone.PullCheckoutMaxLocalGitSpawns},
 	}
 	for _, tc := range tests {
@@ -880,8 +886,7 @@ func TestCheckoutPullRef_ReownsTheWorktreeOnEveryOutcomeAfterTheFetch(t *testing
 		name        string
 		ref         string
 		want        func(o *pullRefOrigin) string
-		pathScope   []string
-		prepare     func(t *testing.T, dir string)
+		prepare     func(t *testing.T, o *pullRefOrigin)
 		wantOutcome gitclone.PullCheckoutOutcome
 		wantReowns  int
 	}{
@@ -892,15 +897,13 @@ func TestCheckoutPullRef_ReownsTheWorktreeOnEveryOutcomeAfterTheFetch(t *testing
 		{name: "fetch_failed", ref: "refs/pull/99/head", want: func(o *pullRefOrigin) string { return o.s1 },
 			wantOutcome: gitclone.PullCheckoutFetchFailed, wantReowns: 1},
 		{
-			name: "failed after the fetch", ref: testPullRef, want: func(o *pullRefOrigin) string { return o.s1 },
-			pathScope: []string{"/pr.txt"},
-			prepare: func(t *testing.T, dir string) {
+			name: "failed after the fetch", ref: "refs/pull/8/head", want: func(o *pullRefOrigin) string { return o.s1 },
+			prepare: func(t *testing.T, o *pullRefOrigin) {
 				t.Helper()
-				// An edit to a file the scope leaves out: the scope's set
-				// will not remove a changed file, and says so.
-				if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("an out-of-scope edit\n"), 0o644); err != nil {
-					t.Fatalf("edit README.md: %v", err)
-				}
+				// A ref that names a tree, not a commit: fetched, then
+				// refused.
+				tree := strings.TrimSpace(gitOutput(t, o.work, "rev-parse", o.s1+"^{tree}"))
+				runGit(t, o.work, "push", "-q", "origin", tree+":refs/pull/8/head")
 			},
 			wantOutcome: gitclone.PullCheckoutFailed, wantReowns: 1,
 		},
@@ -913,14 +916,14 @@ func TestCheckoutPullRef_ReownsTheWorktreeOnEveryOutcomeAfterTheFetch(t *testing
 			o := newPullRefOrigin(t)
 			layout, repo, dir := clonedBase(t, o)
 			if tc.prepare != nil {
-				tc.prepare(t, dir)
+				tc.prepare(t, o)
 			}
 			var reowned []string
 			chown := func(path string) error {
 				reowned = append(reowned, path)
 				return nil
 			}
-			got := gitclone.CheckoutPullRef(context.Background(), supervisor.New(), layout, nil, chown, repo, tc.ref, tc.want(o), tc.pathScope,
+			got := gitclone.CheckoutPullRef(context.Background(), supervisor.New(), layout, nil, chown, repo, tc.ref, tc.want(o), nil,
 				testFetchStepTimeout, testSyncStepTimeout, testStopGrace)
 			if got.Outcome != tc.wantOutcome {
 				t.Fatalf("CheckoutPullRef() = %+v, want %s", got, tc.wantOutcome)
@@ -934,5 +937,410 @@ func TestCheckoutPullRef_ReownsTheWorktreeOnEveryOutcomeAfterTheFetch(t *testing
 				}
 			}
 		})
+	}
+}
+
+// asRuntime runs git in the runtime's worktree dir as a turn's agent does,
+// with an identity of its own and the C locale, and returns its combined
+// output and exit error unchecked: an operation that stops on a conflict
+// exits non-zero.
+func asRuntime(dir string, args ...string) (string, error) {
+	cmd := exec.Command("git", append([]string{"-c", "user.email=agent@example.com", "-c", "user.name=Agent"}, args...)...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "LC_ALL=C", "GIT_EDITOR=true")
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// mustAsRuntime is asRuntime for a step that must succeed.
+func mustAsRuntime(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	if out, err := asRuntime(dir, args...); err != nil {
+		t.Fatalf("runtime git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+func writeWorktreeFile(t *testing.T, dir, rel, content string) {
+	t.Helper()
+	path := filepath.Join(dir, rel)
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir for %s: %v", rel, err)
+	}
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write %s: %v", rel, err)
+	}
+}
+
+// divergeOn leaves the runtime on a branch "turn" off S1, whose two commits
+// change file, beside a branch "theirs" off S1 whose one commit changes it
+// otherwise: whatever the turn then merges, picks, reverts, rebases or
+// applies from one onto the other stops on a conflict in file, in the
+// scope or out of it.
+func divergeOn(t *testing.T, o *pullRefOrigin, dir, file string) {
+	t.Helper()
+	commit := func(content, message string) {
+		t.Helper()
+		writeWorktreeFile(t, dir, file, content)
+		mustAsRuntime(t, dir, "add", "--sparse", "--", file)
+		mustAsRuntime(t, dir, "commit", "-q", "-m", message)
+	}
+	mustAsRuntime(t, dir, "checkout", "-q", "-b", "turn", o.s1)
+	commit("ours\n", "ours")
+	commit("ours again\n", "ours again")
+	mustAsRuntime(t, dir, "checkout", "-q", "-b", "theirs", o.s1)
+	commit("theirs\n", "theirs")
+	mustAsRuntime(t, dir, "checkout", "-q", "turn")
+}
+
+// stopOnConflict runs `git <args...>` in the runtime's worktree dir and
+// checks that it stopped on a conflict, leaving unmerged entries.
+func stopOnConflict(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	if out, err := asRuntime(dir, args...); err == nil {
+		t.Fatalf("runtime git %s did not stop on a conflict:\n%s", strings.Join(args, " "), out)
+	}
+	if unmerged := gitOutput(t, dir, "ls-files", "-u"); strings.TrimSpace(unmerged) == "" {
+		t.Fatalf("runtime git %s left no unmerged entry", strings.Join(args, " "))
+	}
+}
+
+// stoppedOn is a previous turn whose `git <args...>` stopped on a conflict
+// in file.
+func stoppedOn(file string, args ...string) func(t *testing.T, o *pullRefOrigin, dir string) {
+	return func(t *testing.T, o *pullRefOrigin, dir string) {
+		t.Helper()
+		divergeOn(t, o, dir, file)
+		stopOnConflict(t, dir, args...)
+	}
+}
+
+// previousTurnCase is what a previous turn left in the worktree, the
+// shared index or the runtime's .git, and the head the next checkout asks
+// for.
+type previousTurnCase struct {
+	name      string
+	pathScope []string
+	// plant runs in the runtime's worktree, checked out at S1, as the
+	// previous turn's agent.
+	plant func(t *testing.T, o *pullRefOrigin, dir string)
+	// leaves is what plant leaves under the runtime's .git: there before
+	// the checkout, gone after it.
+	leaves []string
+	// next is the head the next checkout asks for.
+	next func(o *pullRefOrigin) string
+}
+
+func toS2(o *pullRefOrigin) string { return o.s2 }
+func toS3(o *pullRefOrigin) string { return o.s3 }
+
+// interruptedOperationCases are previous turns that left an operation in
+// progress: unmerged entries in the shared index, and its state under the
+// runtime's .git.
+func interruptedOperationCases() []previousTurnCase {
+	scope := []string{"/pr.txt"}
+	return []previousTurnCase{
+		{name: "a merge stopped on a conflict in the scope", pathScope: scope, next: toS2,
+			plant: stoppedOn("pr.txt", "merge", "theirs"), leaves: []string{"MERGE_HEAD"}},
+		{name: "a merge stopped on a conflict outside the scope", pathScope: scope, next: toS2,
+			plant: stoppedOn("README.md", "merge", "theirs"), leaves: []string{"MERGE_HEAD"}},
+		{name: "a cherry-pick stopped on a conflict", pathScope: scope, next: toS2,
+			plant: stoppedOn("pr.txt", "cherry-pick", "theirs"), leaves: []string{"CHERRY_PICK_HEAD"}},
+		{name: "a revert stopped on a conflict", next: toS2,
+			plant: stoppedOn("pr.txt", "revert", "--no-edit", "turn~1"), leaves: []string{"REVERT_HEAD"}},
+		{name: "a rebase stopped on a conflict", pathScope: scope, next: toS2,
+			plant: stoppedOn("pr.txt", "rebase", "turn", "theirs"), leaves: []string{"rebase-merge"}},
+		{name: "an unscoped rebase stopped on a conflict", next: toS2,
+			plant: stoppedOn("pr.txt", "rebase", "turn", "theirs"), leaves: []string{"rebase-merge"}},
+		{
+			name: "an am stopped on a conflict", next: toS2, leaves: []string{"rebase-apply"},
+			plant: func(t *testing.T, o *pullRefOrigin, dir string) {
+				t.Helper()
+				divergeOn(t, o, dir, "pr.txt")
+				patch, err := asRuntime(dir, "format-patch", "-1", "--stdout", "theirs")
+				if err != nil {
+					t.Fatalf("format-patch: %v\n%s", err, patch)
+				}
+				path := filepath.Join(t.TempDir(), "theirs.patch")
+				if err := os.WriteFile(path, []byte(patch), 0o644); err != nil {
+					t.Fatalf("write the patch: %v", err)
+				}
+				stopOnConflict(t, dir, "am", "-3", path)
+			},
+		},
+		{
+			name: "a bisect in progress", next: toS2, leaves: []string{"BISECT_START", "BISECT_LOG"},
+			plant: func(t *testing.T, o *pullRefOrigin, dir string) {
+				t.Helper()
+				divergeOn(t, o, dir, "pr.txt")
+				mustAsRuntime(t, dir, "bisect", "start", "turn", o.s1)
+			},
+		},
+	}
+}
+
+// outOfScopeCases are previous turns of a scoped session that left a path
+// outside the scope on disk, or one the next head adds.
+func outOfScopeCases() []previousTurnCase {
+	scope := []string{"/pr.txt"}
+	return []previousTurnCase{
+		{
+			name: "an untracked file where the next head adds an out-of-scope path", pathScope: scope, next: toS3,
+			plant: func(t *testing.T, _ *pullRefOrigin, dir string) {
+				t.Helper()
+				writeWorktreeFile(t, dir, "docs/new.md", "PLANTED\n")
+			},
+		},
+		{
+			name: "an untracked file holding what the next head adds out of scope", pathScope: scope, next: toS3,
+			plant: func(t *testing.T, _ *pullRefOrigin, dir string) {
+				t.Helper()
+				writeWorktreeFile(t, dir, "docs/new.md", "real\n")
+			},
+		},
+		{
+			name: "an out-of-scope file written", pathScope: scope, next: toS2,
+			plant: func(t *testing.T, _ *pullRefOrigin, dir string) {
+				t.Helper()
+				writeWorktreeFile(t, dir, "README.md", "PLANTED\n")
+			},
+		},
+		{
+			name: "the runtime's own scope turned off and an out-of-scope file edited", pathScope: scope, next: toS2,
+			plant: func(t *testing.T, _ *pullRefOrigin, dir string) {
+				t.Helper()
+				mustAsRuntime(t, dir, "sparse-checkout", "disable")
+				writeWorktreeFile(t, dir, "README.md", "PLANTED\n")
+			},
+		},
+		{
+			name: "a directory where the index has an out-of-scope file", pathScope: scope, next: toS2,
+			plant: func(t *testing.T, _ *pullRefOrigin, dir string) {
+				t.Helper()
+				writeWorktreeFile(t, dir, "README.md/inner.txt", "PLANTED\n")
+			},
+		},
+	}
+}
+
+// assertLeft checks that plant left each of leaves under dir's .git.
+func assertLeft(t *testing.T, dir string, leaves []string) {
+	t.Helper()
+	for _, entry := range leaves {
+		if !exists(filepath.Join(dir, ".git", entry)) {
+			t.Fatalf("the previous turn left no .git/%s", entry)
+		}
+	}
+}
+
+// assertNothingLeftOf checks that dir holds want's tree, as the scope has
+// it, and nothing the previous turn tc left: a clean status, no unmerged
+// entry, no operation in progress, no path outside the scope.
+func assertNothingLeftOf(t *testing.T, o *pullRefOrigin, dir string, tc previousTurnCase, want string) {
+	t.Helper()
+	if head := headOf(t, dir); head != want {
+		t.Errorf("worktree HEAD = %s, want %s", head, want)
+	}
+	if status := porcelain(t, dir); status != "" {
+		t.Errorf("status = %q, want clean", status)
+	}
+	if unmerged := strings.TrimSpace(gitOutput(t, dir, "ls-files", "-u")); unmerged != "" {
+		t.Errorf("unmerged entries left:\n%s", unmerged)
+	}
+	for _, entry := range tc.leaves {
+		if exists(filepath.Join(dir, ".git", entry)) {
+			t.Errorf(".git/%s is still there", entry)
+		}
+	}
+	long, err := asRuntime(dir, "status")
+	if err != nil {
+		t.Fatalf("runtime git status: %v\n%s", err, long)
+	}
+	for _, says := range []string{"merging", "in progress", "You are currently", "You are in the middle", "nmerged"} {
+		if strings.Contains(long, says) {
+			t.Errorf("the runtime's status still says %q:\n%s", says, long)
+		}
+	}
+	wantContent("pr.txt", "second\n")(t, dir)
+	if len(tc.pathScope) == 0 {
+		wantContent("README.md", "base\n")(t, dir)
+		if want == o.s3 {
+			wantContent("docs/new.md", "real\n")(t, dir)
+		}
+		return
+	}
+	for _, out := range []string{"README.md", ".gitignore", "docs"} {
+		if exists(filepath.Join(dir, out)) {
+			t.Errorf("%s, out of scope, is in the worktree", out)
+		}
+	}
+	skipped := map[string]bool{}
+	for _, path := range skipWorktreeEntries(t, dir) {
+		skipped[path] = true
+	}
+	for _, path := range strings.Fields(gitOutput(t, dir, "ls-files")) {
+		if skipped[path] == (path == "pr.txt") {
+			t.Errorf("%s: skip-worktree %v, want it only on the paths out of scope", path, skipped[path])
+		}
+	}
+}
+
+// checkOutAfterPreviousTurn is tc on the checkout command's path: a
+// checkout at S1, the previous turn, then a checkout of the next head.
+func checkOutAfterPreviousTurn(t *testing.T, tc previousTurnCase) {
+	t.Helper()
+	o := newPullRefOrigin(t)
+	layout, repo, dir := clonedBase(t, o)
+	if got := checkoutPullRef(layout, repo, testPullRef, o.s1, tc.pathScope); got.Outcome != gitclone.PullCheckoutCheckedOut {
+		t.Fatalf("first CheckoutPullRef() = %+v, want checked_out", got)
+	}
+	tc.plant(t, o, dir)
+	assertLeft(t, dir, tc.leaves)
+	want := tc.next(o)
+	o.advancePullRef(t, want)
+
+	got := checkoutPullRef(layout, repo, testPullRef, want, tc.pathScope)
+	if got.Outcome != gitclone.PullCheckoutCheckedOut || got.HeadSHA != want {
+		t.Fatalf("CheckoutPullRef(next head) = %+v, want checked_out at %s", got, want)
+	}
+	assertNothingLeftOf(t, o, dir, tc, want)
+}
+
+// bootAfterPreviousTurn is tc on a warm boot's path: a review sandbox
+// restored with the previous turn's state boots at the ref's next tip.
+func bootAfterPreviousTurn(t *testing.T, tc previousTurnCase) {
+	t.Helper()
+	o := newPullRefOrigin(t)
+	layout := gitdir.Layout{Root: t.TempDir(), WorkspaceDir: t.TempDir()}
+	ref := testPullRef
+	repos := []sessionconfig.SessionConfigReposElem{{Name: "widgets", Url: o.url, Ref: &ref}}
+	if results, err := gitclone.CloneAll(context.Background(), supervisor.New(), layout, nil, nil, repos, tc.pathScope, testCloneTimeout, testStopGrace); err != nil || results[0].Err != nil {
+		t.Fatalf("CloneAll() = %+v, %v", results, err)
+	}
+	dir := filepath.Join(layout.WorkspaceDir, "widgets")
+	tc.plant(t, o, dir)
+	assertLeft(t, dir, tc.leaves)
+	want := tc.next(o)
+	o.advancePullRef(t, want)
+
+	results, err := gitclone.SyncAll(context.Background(), supervisor.New(), layout, nil, repos, tc.pathScope, "66666666-6666-6666-6666-666666666666",
+		testFetchStepTimeout, testSyncStepTimeout, testStopGrace, func(string, string, string) {}, noopGitFetchTiming, noopGitCheckoutTiming)
+	if err != nil || len(results) != 1 || results[0].Err != nil {
+		t.Fatalf("SyncAll() = %+v, %v, want one synced repo", results, err)
+	}
+	assertNothingLeftOf(t, o, dir, tc, want)
+}
+
+// TestCheckoutPullRef_RecoversFromATurnsInterruptedOperation: a previous
+// turn's merge, cherry-pick, revert, rebase or am that stopped on a
+// conflict leaves unmerged entries in the shared index, and its state
+// under the runtime's .git; a bisect leaves its state. The checkout
+// command's path checks the next head out all the same, the first time,
+// and leaves no operation in progress for the runtime to continue or abort
+// over it. Unmerged entries once made a scoped session's sparse-checkout
+// set, run before the forced checkout, fail every later checkout.
+func TestCheckoutPullRef_RecoversFromATurnsInterruptedOperation(t *testing.T) {
+	t.Parallel()
+	for _, tc := range interruptedOperationCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			checkOutAfterPreviousTurn(t, tc)
+		})
+	}
+}
+
+// TestSyncAll_PullRef_RecoversFromATurnsInterruptedOperation is the same
+// on a warm boot.
+func TestSyncAll_PullRef_RecoversFromATurnsInterruptedOperation(t *testing.T) {
+	t.Parallel()
+	for _, tc := range interruptedOperationCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			bootAfterPreviousTurn(t, tc)
+		})
+	}
+}
+
+// TestCheckoutPullRef_LeavesNothingOutsideTheScope: a scoped session's
+// previous turn left a file where the next head adds a path outside the
+// scope, wrote an out-of-scope file, or put a directory where the index has
+// one. The checkout command's path leaves the next head's scoped tree,
+// every out-of-scope path absent (§14.1), the first time: a forced checkout
+// once kept the untracked file as the added path's content and reported
+// checked_out, and an out-of-scope change once made every later checkout
+// fail.
+func TestCheckoutPullRef_LeavesNothingOutsideTheScope(t *testing.T) {
+	t.Parallel()
+	for _, tc := range outOfScopeCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			checkOutAfterPreviousTurn(t, tc)
+		})
+	}
+}
+
+// TestSyncAll_PullRef_LeavesNothingOutsideTheScope is the same on a warm
+// boot.
+func TestSyncAll_PullRef_LeavesNothingOutsideTheScope(t *testing.T) {
+	t.Parallel()
+	for _, tc := range outOfScopeCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			bootAfterPreviousTurn(t, tc)
+		})
+	}
+}
+
+// TestCheckoutPullRef_LeavesASubmodulesDirectoryAlone: a submodule is a
+// directory in the index too, so a scoped checkout never removes it as a
+// directory a turn made where the index has a file, and what the
+// submodule's own checkout holds survives the next checkout.
+func TestCheckoutPullRef_LeavesASubmodulesDirectoryAlone(t *testing.T) {
+	t.Parallel()
+	o := newPullRefOrigin(t)
+	runGit(t, o.work, "checkout", "-q", "--detach", o.s2)
+	runGit(t, o.work, "update-index", "--add", "--cacheinfo", "160000,"+o.main+",sub")
+	runGit(t, o.work, "commit", "-q", "-m", "a submodule")
+	withSubmodule := headOf(t, o.work)
+	o.advancePullRef(t, withSubmodule)
+	layout, repo, dir := clonedBase(t, o)
+	scope := []string{"/pr.txt", "/sub"}
+	if got := checkoutPullRef(layout, repo, testPullRef, withSubmodule, scope); got.Outcome != gitclone.PullCheckoutCheckedOut {
+		t.Fatalf("first CheckoutPullRef() = %+v, want checked_out", got)
+	}
+	writeWorktreeFile(t, dir, "sub/inner.txt", "the submodule's own\n")
+
+	got := checkoutPullRef(layout, repo, testPullRef, withSubmodule, scope)
+	if got.Outcome != gitclone.PullCheckoutCheckedOut || got.HeadSHA != withSubmodule {
+		t.Fatalf("CheckoutPullRef() = %+v, want checked_out at %s", got, withSubmodule)
+	}
+	if !exists(filepath.Join(dir, "sub", "inner.txt")) {
+		t.Error("sub/inner.txt is gone: the submodule's directory was removed")
+	}
+}
+
+// TestCheckoutPullRef_NeverRemovesThroughASymlinkOutOfTheWorkspace: the
+// directory a scoped checkout removes where the index has a file is looked
+// up, and removed, inside the workspace only. A turn that turns a parent of
+// such a path into a symlink out of the workspace gets nothing removed out
+// there.
+func TestCheckoutPullRef_NeverRemovesThroughASymlinkOutOfTheWorkspace(t *testing.T) {
+	t.Parallel()
+	o := newPullRefOrigin(t)
+	layout, repo, dir := clonedBase(t, o)
+	scope := []string{"/pr.txt"}
+	if got := checkoutPullRef(layout, repo, testPullRef, o.s1, scope); got.Outcome != gitclone.PullCheckoutCheckedOut {
+		t.Fatalf("first CheckoutPullRef() = %+v, want checked_out", got)
+	}
+	outside := t.TempDir()
+	writeWorktreeFile(t, outside, "new.md/kept.txt", "outside the workspace\n")
+	if err := os.Symlink(outside, filepath.Join(dir, "docs")); err != nil {
+		t.Fatalf("symlink docs: %v", err)
+	}
+	o.advancePullRef(t, o.s3)
+
+	got := checkoutPullRef(layout, repo, testPullRef, o.s3, scope)
+	t.Logf("CheckoutPullRef(S3) = %s, %v", got.Outcome, got.Err)
+	if !exists(filepath.Join(outside, "new.md", "kept.txt")) {
+		t.Error("new.md/kept.txt, outside the workspace, was removed through the symlink")
 	}
 }

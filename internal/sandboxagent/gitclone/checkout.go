@@ -27,8 +27,9 @@ type PullCheckoutOutcome string
 
 const (
 	// PullCheckoutCheckedOut means the worktree holds HeadSHA, the commit
-	// asked for, with every tracked change discarded and every untracked file
-	// that is not ignored removed.
+	// asked for, with every tracked change discarded, every untracked file
+	// that is not ignored removed, and no operation a turn started (a merge,
+	// a rebase, a cherry-pick, ...) left in progress.
 	PullCheckoutCheckedOut PullCheckoutOutcome = "checked_out"
 	// PullCheckoutSHAAbsent means the ref was fetched, and the commit asked for
 	// is not in the repository. The worktree is untouched.
@@ -51,17 +52,19 @@ const PullHeadLocalRef = "refs/narvi/pull-head"
 // PullCheckoutMaxLocalGitSpawns local git processes, each bounded by its
 // own stepTimeout, and each by stopGrace more when it has to be stopped.
 // The longest path is a scoped repo whose index holds a skip-worktree entry
-// whose file is present: rev-parse of the ref and of the target (2),
-// ls-files and the update-index that clears those bits (2), the
-// sparse-checkout set and the five-process mirror to the runtime's config
-// (6), the forced checkout and the runtime HEAD write its move causes (2),
-// clean (1) and rev-parse HEAD (1). A scoped repo with no such entry takes
-// 13, and an unscoped repo 12, the sparse-checkout disable and its mirror
-// (6) in place of the four sparse steps. TestCheckoutPullRef_SpawnCount pins
-// every path.
+// whose file is present: rev-parse of the ref and of the target (2), the
+// read-tree that resets the index to the target (1), ls-files and the
+// update-index that clears those bits (2), the sparse-checkout set and the
+// five-process mirror to the runtime's config (6), the forced checkout and
+// the runtime HEAD write its move causes (2), clean (1) and rev-parse HEAD
+// (1). A scoped repo with no such entry takes 14, and an unscoped repo 13,
+// the sparse-checkout disable and its mirror (6) in place of the five
+// sparse steps. Clearing an operation a turn left in progress spawns
+// nothing.
+// TestCheckoutPullRef_SpawnCount pins every path.
 const (
 	PullCheckoutNetworkGitSpawns  = 1
-	PullCheckoutMaxLocalGitSpawns = 14
+	PullCheckoutMaxLocalGitSpawns = 15
 )
 
 // PullCheckoutResult is one repo's outcome from CheckoutPullRef.
@@ -98,15 +101,32 @@ type PullCheckoutResult struct {
 //     ref that lags the push that made it, or a head that moved past it
 //     and was never fetched -- is PullCheckoutSHAAbsent, and the worktree
 //     is left as it was.
-//  5. Every skip-worktree bit is cleared and the sparse state the runtime
-//     may have changed since the boot is reset, before anything is checked
-//     out: the index is shared with the runtime, and a forced checkout
-//     never rewrites an entry carrying the bit, nor does clean remove its
-//     file. An unscoped session runs `sparse-checkout disable`, which
-//     clears every bit; a scoped one clears the bit of every entry whose
-//     file is present, then runs `sparse-checkout set` with its own
+//  5. Whatever a previous turn left in the shared index and in the
+//     runtime's .git is reset before anything is checked out, and no file
+//     is written into the worktree doing so. An operation the turn left in
+//     progress (a merge, cherry-pick, revert, rebase, am or bisect that
+//     stopped) is forgotten by clearInterruptedOperation: the runtime's own
+//     --continue, --abort or `bisect reset` would otherwise act on it over
+//     the checked-out tree and move it off the target. Then `read-tree
+//     --reset -i <target>` makes the index the target's tree, discarding
+//     unmerged entries; -i keeps it from checking the worktree, which it
+//     never writes, so a changed skip-worktree file cannot stop it. A path
+//     whose file differs from the target's, or that the target adds where
+//     the turn left an untracked file, is then an index entry the forced
+//     checkout rewrites or, outside the scope, removes; left out of the
+//     index, an added path's file would be kept, and an unmerged entry
+//     would make the scope's set fail on every attempt. Last, the sparse
+//     state the runtime may have changed since the boot, and every
+//     skip-worktree bit, are reset: a forced checkout never rewrites an
+//     entry carrying the bit, nor does clean remove its file. An unscoped
+//     session runs `sparse-checkout disable`, which clears every bit. A
+//     scoped one clears the bit of every entry whose file is present and
+//     removes a directory a turn made where the index has a file
+//     (prepareScopedEntries), then runs `sparse-checkout set` with its own
 //     patterns, which recomputes every other bit without ever writing an
-//     out-of-scope path (§14.1). Both are mirrored to the runtime's config.
+//     out-of-scope path (§14.1). Here set may leave a changed file, or an
+//     untracked one in the way, and says so: the forced checkout discards
+//     them. Both are mirrored to the runtime's config.
 //  6. `checkout --force --detach <target> --`, then `clean -ffd`: every
 //     tracked change, staged or not, is discarded, and every untracked
 //     file that is not ignored is removed, nested repositories included.
@@ -187,10 +207,25 @@ func CheckoutPullRef(
 		}
 	}
 
-	if len(pathScope) > 0 {
-		err = clearPresentSkipWorktree(ctx, sup, handle, cred, stepTimeout, stopGrace)
+	if err := clearInterruptedOperation(layout.WorkspaceDir, repo.Name); err != nil {
+		result.Outcome, result.Err = PullCheckoutFailed, fmt.Errorf("gitclone: clear the operation a turn left in progress in %s: %w", repo.Name, err)
+		return result
+	}
+	if _, err := runGitStep(ctx, sup, handle, cred, []string{"read-tree", "--reset", "-i", target}, stepTimeout, stopGrace); err != nil {
+		result.Outcome, result.Err = PullCheckoutFailed, fmt.Errorf("gitclone: reset the index of %s to %s: %w", repo.Name, target, err)
+		return result
+	}
+
+	scoped := len(pathScope) > 0
+	if scoped {
+		err = prepareScopedEntries(ctx, sup, layout, repo.Name, cred, stepTimeout, stopGrace)
 		if err == nil {
-			err = applySparseCheckout(ctx, sup, handle, cred, pathScope, stepTimeout, stopGrace)
+			// What set leaves on disk here -- a changed out-of-scope file,
+			// an untracked file in the way -- the forced checkout discards.
+			_, err = sparseCheckoutSet(ctx, sup, handle, cred, pathScope, stepTimeout, stopGrace)
+		}
+		if err == nil {
+			err = gitdir.MirrorSparseCheckout(ctx, sup, handle, cred, stepTimeout, stopGrace)
 		}
 	} else {
 		err = disableSparseCheckout(ctx, sup, handle, cred, stepTimeout, stopGrace)
@@ -223,35 +258,107 @@ func CheckoutPullRef(
 	return result
 }
 
-// clearPresentSkipWorktree clears the skip-worktree bit of every index
-// entry whose file is present in repo's worktree -- an entry a previous
-// turn marked with `update-index --skip-worktree` and wrote, in scope or
-// not. Only those: every other bit is the scoped session's own, and
-// `sparse-checkout set` recomputes it. git clears such a bit itself when it
-// reads the index with sparse-checkout on in the reading config, as every
-// scoped checkout leaves the agent's; but a boot's Seed imports the
-// runtime's setting, which the runtime may have turned off. Left set then
-// on a present in-scope file, the bit would make set report the path as
-// already present, which applySparseCheckout reads as an out-of-scope path
-// left on disk; cleared, the file is an ordinary change the forced
-// checkout discards, and an out-of-scope one is removed by set or, when it
-// differs, reported. An index path that is not local to the worktree is
-// refused: git never writes one, so the index was written by hand.
-func clearPresentSkipWorktree(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, timeout, stopGrace time.Duration) error {
-	out, err := runGitStep(ctx, sup, repo, cred, []string{"ls-files", "-v", "-z"}, timeout, stopGrace)
+// interruptedOperationState is every entry under a worktree's .git that
+// records an operation git started there and did not finish: a merge, a
+// cherry-pick or revert of one commit or of a sequence, a rebase of either
+// backend or an am, and a bisect. git's status reads them to say the
+// operation is in progress, and its --continue, --abort and `bisect reset`
+// act on them.
+var interruptedOperationState = []string{
+	"MERGE_HEAD", "MERGE_MSG", "MERGE_MODE", "MERGE_RR", "AUTO_MERGE", "SQUASH_MSG",
+	"CHERRY_PICK_HEAD", "REVERT_HEAD", "sequencer",
+	"REBASE_HEAD", "rebase-merge", "rebase-apply",
+	"BISECT_START", "BISECT_LOG", "BISECT_TERMS", "BISECT_EXPECTED_REV", "BISECT_ANCESTORS_OK",
+	"BISECT_NAMES", "BISECT_RUN", "BISECT_FIRST_PARENT", "BISECT_HEAD",
+}
+
+// clearInterruptedOperation removes every interruptedOperationState entry
+// from the .git of repoName's worktree under workspaceDir. They live only
+// in the runtime's .git, never in the agent-owned git-dir, so no agent git
+// command can clear them. The removal goes through an os.Root opened at the
+// workspace directory, which the session config names: the worktree and its
+// .git are the runtime's, and a symlink it planted in either is never
+// followed out of the workspace.
+func clearInterruptedOperation(workspaceDir, repoName string) error {
+	root, err := os.OpenRoot(workspaceDir)
 	if err != nil {
 		return err
 	}
+	defer func() { _ = root.Close() }()
+	for _, name := range interruptedOperationState {
+		if err := root.RemoveAll(filepath.Join(repoName, ".git", name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// prepareScopedEntries readies a scoped session's index and worktree for
+// the forced checkout, entry by entry, from one `ls-files -s -v -z`:
+//
+//   - A directory a turn made where the index has a file or a symlink is
+//     removed. The forced checkout replaces such a directory with the
+//     entry only where it writes the entry, never where the scope leaves
+//     the path out; clean leaves it, and sparse-checkout set reports it as
+//     left on disk, so out of the scope it would fail every later
+//     checkout. A submodule's directory is a directory in the index too,
+//     and is left alone.
+//   - The skip-worktree bit of every entry whose file is present is
+//     cleared -- an entry a previous turn marked with `update-index
+//     --skip-worktree` and wrote, in scope or not. Only those: every other
+//     bit is the scoped session's own, and `sparse-checkout set`
+//     recomputes it. git clears such a bit itself when it reads the index
+//     with sparse-checkout on in the reading config, as every scoped
+//     checkout leaves the agent's; but a boot's Seed imports the runtime's
+//     setting, which the runtime may have turned off, and a git older than
+//     that rule never clears it. Left set on a present file the target
+//     does not change, the bit would keep the file through the forced
+//     checkout as it is; cleared, the file is an ordinary change the
+//     forced checkout discards, rewriting it in scope and removing it out
+//     of scope.
+//
+// Every path is looked up, and a directory removed, through an os.Root
+// opened at the workspace directory, as clearInterruptedOperation's
+// removals are. An index path that is not local to the worktree is
+// refused: git never writes one, so the index was written by hand.
+func prepareScopedEntries(ctx context.Context, sup *supervisor.Supervisor, layout gitdir.Layout, name string, cred *syscall.Credential, timeout, stopGrace time.Duration) error {
+	repo := layout.Repo(name)
+	out, err := runGitStep(ctx, sup, repo, cred, []string{"ls-files", "-s", "-v", "-z"}, timeout, stopGrace)
+	if err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(layout.WorkspaceDir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+
 	var present []string
 	for _, entry := range strings.Split(out, "\x00") {
-		if len(entry) < 3 || entry[1] != ' ' || (entry[0] != 'S' && entry[0] != 's') {
+		// "<tag> <mode> <object> <stage>\t<path>"
+		meta, path, ok := strings.Cut(entry, "\t")
+		if !ok {
 			continue
 		}
-		path := entry[2:]
+		fields := strings.Fields(meta)
+		if len(fields) != 4 {
+			return fmt.Errorf("unexpected index entry %q", entry)
+		}
 		if !filepath.IsLocal(path) {
 			return fmt.Errorf("index entry %q is not a path inside the worktree", path)
 		}
-		if _, err := os.Lstat(filepath.Join(repo.WorkTree, path)); err == nil {
+		inWorkspace := filepath.Join(name, path)
+		info, err := root.Lstat(inWorkspace)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() && fields[1] != gitlinkMode {
+			if err := root.RemoveAll(inWorkspace); err != nil {
+				return fmt.Errorf("remove the directory at %s, a file in the index: %w", path, err)
+			}
+			continue
+		}
+		if fields[0] == "S" || fields[0] == "s" {
 			present = append(present, path)
 		}
 	}
@@ -261,6 +368,9 @@ func clearPresentSkipWorktree(ctx context.Context, sup *supervisor.Supervisor, r
 	_, err = runGitStep(ctx, sup, repo, cred, append([]string{"update-index", "--no-skip-worktree", "--"}, present...), timeout, stopGrace)
 	return err
 }
+
+// gitlinkMode is the index mode of a submodule's commit.
+const gitlinkMode = "160000"
 
 // validatePullCheckout runs every check CheckoutPullRef makes before it
 // spawns anything: the repo name and url (validateRepoSpec), the ref

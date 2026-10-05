@@ -52,9 +52,11 @@
 // A repo whose Ref is set -- a pull request's review session, technical
 // plan §21.1, §30.4 -- reads that pull request's head from the base
 // repository, which keeps it as refs/pull/<number>/head: CheckoutPullRef
-// (checkout.go) fetches the ref, resets the sparse state and skip-worktree
-// bits the runtime may have left in the shared index, checks out one
-// commit detached and forced, and removes untracked files. CloneAll clones
+// (checkout.go) fetches the ref; forgets an operation a turn left in
+// progress, resets the shared index to the commit's tree, and resets the
+// sparse state and skip-worktree bits the runtime may have left in it;
+// and checks out the commit detached and forced and removes untracked
+// files. CloneAll clones
 // such a repo without its Branch and checks out the ref's tip; SyncAll
 // does the same in place of its stash, checkout and pop, since a review
 // session never pushes and its worktree holds no edit to keep; and

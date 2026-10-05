@@ -235,6 +235,46 @@ func CloneAll(
 // (path.Match's own grammar does not forbid a leading "-"), so this is a
 // real, not merely theoretical, defense-in-depth gap were "--" omitted.
 func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, patterns []string, timeout, stopGrace time.Duration) error {
+	left, err := sparseCheckoutSet(ctx, sup, repo, cred, patterns, timeout, stopGrace)
+	if err != nil {
+		return err
+	}
+	// A successful (0) exit code is NOT sufficient on its own -- see this
+	// function's own doc comment above: git leaves a dirty out-of-scope
+	// path on disk, untouched, and merely warns on stderr, rather than
+	// failing outright. Any stderr output at all here means at least one
+	// path did not actually leave the sandbox filesystem despite being out
+	// of pathScope -- exactly the §14.1 bypass this whole function exists
+	// to prevent -- so this is reported as a real, fatal error rather than
+	// accepted silently.
+	if left != "" {
+		return fmt.Errorf(
+			"git sparse-checkout set: succeeded but left at least one out-of-scope path on disk (uncommitted local changes prevented removal): %s",
+			left,
+		)
+	}
+
+	// §14.1's own path-scope enforcement must be visible to BOTH sides
+	// (the agent's own later `git status`, a runtime `git diff`, each
+	// consulting its own copy of core.sparseCheckout) -- mirror the value
+	// this call just set into the runtime's own worktree config too. See
+	// gitdir.MirrorSparseCheckout's own doc comment.
+	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, cred, timeout, stopGrace); err != nil {
+		return fmt.Errorf("git sparse-checkout set: mirror to runtime config: %w", err)
+	}
+	return nil
+}
+
+// sparseCheckoutSet runs the `sparse-checkout set --no-cone -- <patterns>`
+// applySparseCheckout is built on, and nothing else: it neither mirrors the
+// result to the runtime's config nor judges git's warnings. It returns
+// git's stderr, trimmed, when git exits 0 -- empty on an unqualified
+// success, and otherwise naming every path git left on disk despite the
+// patterns (a changed file, an unmerged entry, an untracked file in the
+// way) -- and an error when git could not run or exited non-zero.
+// applySparseCheckout fails on any such path; CheckoutPullRef tolerates
+// them before its forced checkout, which discards them.
+func sparseCheckoutSet(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, patterns []string, timeout, stopGrace time.Duration) (string, error) {
 	// `sparse-checkout set` materializes newly-in-scope paths into the
 	// working tree -- exactly the class of operation that can run a
 	// content filter, merge driver, or transport command a repository's
@@ -270,38 +310,15 @@ func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, repo g
 
 	result, err := gitdir.Run(ctx, sup, repo, cred, spec, timeout, stopGrace)
 	if err != nil {
-		return fmt.Errorf("git sparse-checkout set: %w", err)
+		return "", fmt.Errorf("git sparse-checkout set: %w", err)
 	}
 	if result.Err != nil {
-		return fmt.Errorf("git sparse-checkout set: %w", result.Err)
+		return "", fmt.Errorf("git sparse-checkout set: %w", result.Err)
 	}
 	if result.ExitCode != 0 {
-		return fmt.Errorf("git sparse-checkout set: exited %d", result.ExitCode)
+		return "", fmt.Errorf("git sparse-checkout set: exited %d", result.ExitCode)
 	}
-	// A successful (0) exit code is NOT sufficient on its own -- see this
-	// function's own doc comment above: git leaves a dirty out-of-scope
-	// path on disk, untouched, and merely warns on stderr, rather than
-	// failing outright. Any stderr output at all here means at least one
-	// path did not actually leave the sandbox filesystem despite being out
-	// of pathScope -- exactly the §14.1 bypass this whole function exists
-	// to prevent -- so this is reported as a real, fatal error rather than
-	// accepted silently.
-	if stderr.Len() > 0 {
-		return fmt.Errorf(
-			"git sparse-checkout set: succeeded but left at least one out-of-scope path on disk (uncommitted local changes prevented removal): %s",
-			strings.TrimSpace(stderr.String()),
-		)
-	}
-
-	// §14.1's own path-scope enforcement must be visible to BOTH sides
-	// (the agent's own later `git status`, a runtime `git diff`, each
-	// consulting its own copy of core.sparseCheckout) -- mirror the value
-	// this call just set into the runtime's own worktree config too. See
-	// gitdir.MirrorSparseCheckout's own doc comment.
-	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, cred, timeout, stopGrace); err != nil {
-		return fmt.Errorf("git sparse-checkout set: mirror to runtime config: %w", err)
-	}
-	return nil
+	return strings.TrimSpace(stderr.String()), nil
 }
 
 // isSparseCheckoutEnabled runs `git -C <dir> config --type=bool
