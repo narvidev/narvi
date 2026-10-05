@@ -3191,6 +3191,71 @@ func TestValidate_ReviewRetriggerHoldBackstop(t *testing.T) {
 	}
 }
 
+// TestValidate_AutonomyFreezeRecheckInterval pins how soon an automatic
+// action the autonomy freeze held is looked at again (technical plan
+// §40.2): the shipped minute, and each link refused when either side moves
+// past the other -- above the claim window, accepted at exactly
+// MinTimeoutMargin; at or below the re-review hold's backstop, an ordering
+// accepted at equality.
+func TestValidate_AutonomyFreezeRecheckInterval(t *testing.T) {
+	t.Parallel()
+
+	if got := platform.DefaultTimeouts().AutonomyFreezeRecheckInterval; got != time.Minute {
+		t.Fatalf("DefaultTimeouts().AutonomyFreezeRecheckInterval = %v, want 1m0s", got)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*platform.Timeouts)
+		wantChain string // the broken link, or "" for valid
+	}{
+		{name: "recheck at the claim window", mutate: func(to *platform.Timeouts) {
+			to.AutonomyFreezeRecheckInterval = to.TimerClaimDuration
+		}, wantChain: "AutonomyFreezeRecheckInterval > TimerClaimDuration"},
+		{name: "claim window raised past the recheck", mutate: func(to *platform.Timeouts) {
+			to.TimerClaimDuration = to.AutonomyFreezeRecheckInterval + time.Second
+		}, wantChain: "AutonomyFreezeRecheckInterval > TimerClaimDuration"},
+		{name: "recheck exactly the margin above the claim window", mutate: func(to *platform.Timeouts) {
+			to.AutonomyFreezeRecheckInterval = to.TimerClaimDuration + platform.MinTimeoutMargin
+		}},
+		{name: "recheck past the hold's backstop", mutate: func(to *platform.Timeouts) {
+			to.AutonomyFreezeRecheckInterval = to.ReviewRetriggerHoldBackstop + time.Second
+		}, wantChain: "ReviewRetriggerHoldBackstop >= AutonomyFreezeRecheckInterval"},
+		{name: "backstop lowered past the recheck", mutate: func(to *platform.Timeouts) {
+			to.ReviewRetriggerHoldBackstop = to.AutonomyFreezeRecheckInterval - time.Second
+		}, wantChain: "ReviewRetriggerHoldBackstop >= AutonomyFreezeRecheckInterval"},
+		{name: "recheck equal to the backstop", mutate: func(to *platform.Timeouts) {
+			to.AutonomyFreezeRecheckInterval = to.ReviewRetriggerHoldBackstop
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			if tc.wantChain == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			found := false
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				for _, e := range joined.Unwrap() {
+					var inv *platform.TimeoutInvariantError
+					if errors.As(e, &inv) && inv.Chain == tc.wantChain {
+						found = true
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("Validate() = %v, want the broken link %q among its errors", err, tc.wantChain)
+			}
+		})
+	}
+}
+
 // TestValidate_DispatchRetryBackoff pins the durable dispatch trigger's
 // retry after a failed evaluation (technical plan §2): the shipped bounds
 // (one minute, one hour), and each link -- the shortest delay above the
