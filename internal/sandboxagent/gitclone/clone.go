@@ -58,8 +58,17 @@ type CloneResult struct {
 // session-wide setting is a fatal configuration error for the whole spawn,
 // not a single repo's problem.
 //
-// On a primary (repos[0]) clone (or, when scoped, sparse-checkout)
-// failure, CloneAll returns immediately with a fatal error -- no repo
+// A repo with a Ref (a pull request's review session, technical plan
+// §21.1, §30.4) is cloned without its Branch, then CheckoutPullRef checks
+// out the ref's tip, detached, and applies pathScope in
+// applySparseCheckout's place. A review never boots on a tree other than
+// its head: when the ref cannot be fetched, the spec's head branch is
+// checked out from the clone (checkOutClonedHeadBranch), and with none to
+// check out the repo fails, fatally for the primary one.
+//
+// On a primary (repos[0]) clone (or, when scoped, sparse-checkout, or
+// pull request checkout) failure, CloneAll returns immediately with a
+// fatal error -- no repo
 // after it is attempted, matching RunHooks' own "any fatal failure stops
 // immediately" semantics exactly. A secondary repo's failure is logged as
 // a warning and does not stop the loop; subsequent repos still get
@@ -144,7 +153,29 @@ func CloneAll(
 		if cloneErr == nil && chownRepo != nil {
 			cloneErr = chownRepo(dir)
 		}
-		if cloneErr == nil && scoped {
+		if cloneErr == nil && repo.Ref != nil {
+			// A pull request's review session (technical plan §21.1,
+			// §30.4): check out the ref's tip, which also applies the path
+			// scope. A review never boots on a tree other than its head: a
+			// ref that cannot be fetched falls back to the spec's head
+			// branch, as the clone would have checked it out before refs
+			// existed, and with no head branch to fall back to the repo
+			// fails.
+			checkout := CheckoutPullRef(ctx, sup, layout, cred, chownRepo, repo, *repo.Ref, "", pathScope, cloneTimeout, cloneTimeout, stopGrace)
+			switch checkout.Outcome {
+			case PullCheckoutCheckedOut:
+			case PullCheckoutFetchFailed:
+				cloneErr = checkOutClonedHeadBranch(ctx, sup, repoHandle, cred, repo, checkout.Err, cloneTimeout, stopGrace)
+				if cloneErr == nil && scoped {
+					cloneErr = applySparseCheckout(ctx, sup, repoHandle, cred, pathScope, cloneTimeout, stopGrace)
+				}
+				if cloneErr == nil && chownRepo != nil {
+					cloneErr = chownRepo(dir)
+				}
+			default:
+				cloneErr = checkout.Err
+			}
+		} else if cloneErr == nil && scoped {
 			cloneErr = applySparseCheckout(ctx, sup, repoHandle, cred, pathScope, cloneTimeout, stopGrace)
 		}
 		results = append(results, CloneResult{Repo: repo, Primary: primary, Dir: dir, Err: cloneErr})
@@ -204,6 +235,47 @@ func CloneAll(
 // (path.Match's own grammar does not forbid a leading "-"), so this is a
 // real, not merely theoretical, defense-in-depth gap were "--" omitted.
 func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, patterns []string, timeout, stopGrace time.Duration) error {
+	left, err := sparseCheckoutSet(ctx, sup, repo, cred, patterns, timeout, stopGrace)
+	if err != nil {
+		return err
+	}
+	// A successful (0) exit code is NOT sufficient on its own -- see this
+	// function's own doc comment above: git leaves a dirty out-of-scope
+	// path on disk, untouched, and merely warns on stderr, rather than
+	// failing outright. Any stderr output at all here means at least one
+	// path did not actually leave the sandbox filesystem despite being out
+	// of pathScope -- exactly the §14.1 bypass this whole function exists
+	// to prevent -- so this is reported as a real, fatal error rather than
+	// accepted silently.
+	if left != "" {
+		return fmt.Errorf(
+			"git sparse-checkout set: succeeded but left at least one out-of-scope path on disk (uncommitted local changes prevented removal): %s",
+			left,
+		)
+	}
+
+	// §14.1's own path-scope enforcement must be visible to BOTH sides
+	// (the agent's own later `git status`, a runtime `git diff`, each
+	// consulting its own copy of core.sparseCheckout) -- mirror the value
+	// this call just set into the runtime's own worktree config too. See
+	// gitdir.MirrorSparseCheckout's own doc comment.
+	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, cred, timeout, stopGrace); err != nil {
+		return fmt.Errorf("git sparse-checkout set: mirror to runtime config: %w", err)
+	}
+	return nil
+}
+
+// sparseCheckoutSet runs the `sparse-checkout set --no-cone -- <patterns>`
+// applySparseCheckout is built on, and nothing else: it neither mirrors the
+// result to the runtime's config nor judges git's warnings. It returns
+// git's stderr, trimmed, when git exits 0 -- empty on an unqualified
+// success, and otherwise naming every path git left on disk despite the
+// patterns (a changed file, an unmerged entry, an untracked file in the
+// way) -- and an error when git could not run or exited non-zero.
+// applySparseCheckout fails on any such path; CheckoutPullRef tolerates
+// them before its forced checkout, which discards them, and fails on any
+// that are left after it.
+func sparseCheckoutSet(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, patterns []string, timeout, stopGrace time.Duration) (string, error) {
 	// `sparse-checkout set` materializes newly-in-scope paths into the
 	// working tree -- exactly the class of operation that can run a
 	// content filter, merge driver, or transport command a repository's
@@ -239,38 +311,15 @@ func applySparseCheckout(ctx context.Context, sup *supervisor.Supervisor, repo g
 
 	result, err := gitdir.Run(ctx, sup, repo, cred, spec, timeout, stopGrace)
 	if err != nil {
-		return fmt.Errorf("git sparse-checkout set: %w", err)
+		return "", fmt.Errorf("git sparse-checkout set: %w", err)
 	}
 	if result.Err != nil {
-		return fmt.Errorf("git sparse-checkout set: %w", result.Err)
+		return "", fmt.Errorf("git sparse-checkout set: %w", result.Err)
 	}
 	if result.ExitCode != 0 {
-		return fmt.Errorf("git sparse-checkout set: exited %d", result.ExitCode)
+		return "", fmt.Errorf("git sparse-checkout set: exited %d", result.ExitCode)
 	}
-	// A successful (0) exit code is NOT sufficient on its own -- see this
-	// function's own doc comment above: git leaves a dirty out-of-scope
-	// path on disk, untouched, and merely warns on stderr, rather than
-	// failing outright. Any stderr output at all here means at least one
-	// path did not actually leave the sandbox filesystem despite being out
-	// of pathScope -- exactly the §14.1 bypass this whole function exists
-	// to prevent -- so this is reported as a real, fatal error rather than
-	// accepted silently.
-	if stderr.Len() > 0 {
-		return fmt.Errorf(
-			"git sparse-checkout set: succeeded but left at least one out-of-scope path on disk (uncommitted local changes prevented removal): %s",
-			strings.TrimSpace(stderr.String()),
-		)
-	}
-
-	// §14.1's own path-scope enforcement must be visible to BOTH sides
-	// (the agent's own later `git status`, a runtime `git diff`, each
-	// consulting its own copy of core.sparseCheckout) -- mirror the value
-	// this call just set into the runtime's own worktree config too. See
-	// gitdir.MirrorSparseCheckout's own doc comment.
-	if err := gitdir.MirrorSparseCheckout(ctx, sup, repo, cred, timeout, stopGrace); err != nil {
-		return fmt.Errorf("git sparse-checkout set: mirror to runtime config: %w", err)
-	}
-	return nil
+	return strings.TrimSpace(stderr.String()), nil
 }
 
 // isSparseCheckoutEnabled runs `git -C <dir> config --type=bool
@@ -345,7 +394,19 @@ func disableSparseCheckoutIfEnabled(ctx context.Context, sup *supervisor.Supervi
 	if !enabled {
 		return nil
 	}
+	return disableSparseCheckout(ctx, sup, repo, cred, timeout, stopGrace)
+}
 
+// disableSparseCheckout runs `sparse-checkout disable` whatever the
+// agent-owned config says, then mirrors the result to the runtime's config.
+// git clears every skip-worktree bit in the index doing so -- one a previous
+// turn set with `update-index --skip-worktree` too, with no sparse config
+// at all (verified against real git) -- and turns sparse-checkout off. It
+// exits 0 when a path whose bit it clears is already present, leaving that
+// file as an ordinary change. CheckoutPullRef runs it before every unscoped
+// checkout: the agent-owned config, which disableSparseCheckoutIfEnabled
+// reads, learns of a runtime's own sparse-checkout only at the next Seed.
+func disableSparseCheckout(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, timeout, stopGrace time.Duration) error {
 	// `sparse-checkout disable` re-materializes every previously-excluded
 	// path into the working tree -- the same class of operation as
 	// applySparseCheckout's own identical call just above in this file,
@@ -378,13 +439,48 @@ func disableSparseCheckoutIfEnabled(ctx context.Context, sup *supervisor.Supervi
 	return nil
 }
 
+// checkOutClonedHeadBranch is CloneAll's fallback when a repo's pull
+// request ref cannot be fetched right after its clone: it checks out the
+// spec's head branch from the clone's own origin/<branch> -- the clone
+// fetched every branch, so that is the commit `git clone --branch` checked
+// out before refs existed -- as a local branch, forced. With no head branch
+// in the spec (a pull request from a fork, or one whose head could not be
+// resolved), or one the base repository does not have, it is an error: the
+// clone's default branch is never a review's tree. refErr is the fetch's
+// own failure, carried into both the warning and the error.
+func checkOutClonedHeadBranch(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, spec sessionconfig.SessionConfigReposElem, refErr error, stepTimeout, stopGrace time.Duration) error {
+	if spec.Branch == nil {
+		return fmt.Errorf("gitclone: %s for %s could not be fetched, and the spec names no head branch to fall back to (a review never boots on another tree): %w", *spec.Ref, spec.Name, refErr)
+	}
+	branch := *spec.Branch
+	onOrigin, err := remoteBranchExists(ctx, sup, repo, cred, branch, stepTimeout, stopGrace)
+	if err != nil {
+		return fmt.Errorf("gitclone: look up head branch %s of %s: %w", branch, spec.Name, err)
+	}
+	if !onOrigin {
+		return fmt.Errorf("gitclone: %s for %s could not be fetched, and its head branch %s is not in the base repository (a review never boots on another tree): %w", *spec.Ref, spec.Name, branch, refErr)
+	}
+	platform.Logger(ctx).Warn("gitclone: pull request ref could not be fetched at boot, checking out its head branch from the clone",
+		"repo", spec.Name, "ref", *spec.Ref, "branch", branch, "error", refErr)
+	if _, err := runGitStep(ctx, sup, repo, cred, []string{"checkout", "--quiet", "--force", "-B", branch, "refs/remotes/origin/" + branch, "--"}, stepTimeout, stopGrace); err != nil {
+		return fmt.Errorf("gitclone: check out head branch %s of %s: %w", branch, spec.Name, err)
+	}
+	if err := mirrorBranchUpstreamFunc(ctx, sup, repo, cred, branch, stepTimeout, stopGrace); err != nil {
+		platform.Logger(ctx).Warn("gitclone: mirror upstream tracking onto runtime config failed, checkout itself already succeeded",
+			"repo", spec.Name, "branch", branch, "error", err)
+	}
+	return nil
+}
+
 // validateRepoSpec runs every internal/domain/reposource validator this
 // repo's fields need, in order, stopping at the first failure -- Branch
 // is validated only when non-nil (§3.4: nil means "the repo's own
 // default branch", reposource.ValidateBranch is never invoked for that
-// case). Called BEFORE any filepath.Join or sup.Spawn happens for this
-// repo (see CloneAll's own loop and reposource's own package doc comment
-// for the argument-injection/path-traversal reasoning this closes).
+// case), and Ref likewise (absent on every session but a pull request's
+// review session). Called BEFORE any filepath.Join or sup.Spawn happens
+// for this repo (see CloneAll's own loop and reposource's own package doc
+// comment for the argument-injection/path-traversal reasoning this
+// closes).
 func validateRepoSpec(repo sessionconfig.SessionConfigReposElem) error {
 	if err := reposource.ValidateRepoName(repo.Name); err != nil {
 		return fmt.Errorf("gitclone: invalid repo name: %w", err)
@@ -395,6 +491,11 @@ func validateRepoSpec(repo sessionconfig.SessionConfigReposElem) error {
 	if repo.Branch != nil {
 		if err := reposource.ValidateBranch(*repo.Branch); err != nil {
 			return fmt.Errorf("gitclone: invalid repo branch: %w", err)
+		}
+	}
+	if repo.Ref != nil {
+		if err := reposource.ValidatePullHeadRef(*repo.Ref); err != nil {
+			return fmt.Errorf("gitclone: invalid repo ref: %w", err)
 		}
 	}
 	return nil
@@ -436,8 +537,23 @@ func cloneOne(
 	// used to return this call's args COMPLETELY UNCHANGED -- every
 	// hardening flag silently absent despite the call site looking
 	// hardened. See ArgsForClone's own doc comment for the full story.
-	clone := []string{"clone", "-c", "credential.helper=" + credHelperArg}
-	if repo.Branch != nil {
+	//
+	// The credential helper is one of those top-level overrides, placed
+	// after hardeningFlags' own empty "credential.helper=" reset, so it is
+	// the one helper that survives it -- the order every other
+	// credentialed git call here (gitFetchRef, pushOneRepo) already has.
+	// It used to be clone's own "-c" (after "clone"), which writes it into
+	// the new repository's config, and repository config is read before
+	// the command line: the reset discarded it, so a clone that needed a
+	// credential was never given one and failed ("could not read
+	// Username"), verified against real git. As a top-level override it is
+	// also never written into the runtime's .git/config.
+	clone := []string{"clone"}
+	// A repo with a pull request ref never clones its branch: the ref is
+	// checked out right after (CloneAll), and for a pull request from a
+	// fork the branch names the fork's head branch, which the base
+	// repository may not have at all, or may have as another commit.
+	if repo.Branch != nil && repo.Ref == nil {
 		clone = append(clone, "--branch", *repo.Branch)
 	}
 	// "--" ends option parsing for everything after it (verified directly
@@ -456,7 +572,7 @@ func cloneOne(
 	// githarden's own http.proxy/RepoURLProxyArg doc comments for why a
 	// command-line override for the EXACT clone url always closes this,
 	// even against a repository-authored entry for that same url.
-	topLevel := githarden.RepoURLProxyArg(repo.Url)
+	topLevel := append(githarden.RepoURLProxyArg(repo.Url), "-c", "credential.helper="+credHelperArg)
 
 	proc, err := sup.Spawn(supervisor.Spec{
 		Path: "git",

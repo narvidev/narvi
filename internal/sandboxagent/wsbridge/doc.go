@@ -104,10 +104,13 @@
 // with no shared marker beyond a `Type string` field. This package peeks
 // that field via a tiny envelope struct to decide which concrete
 // contracts/gen/go/sandboxws.{Prompt, Stop, Push, Snapshot, Shutdown, Ack,
-// GitSyncComplete} to unmarshal the same raw bytes into. An unrecognized
-// type value is logged and skipped, never fatal -- forward-compatible with
-// a command type a future Step adds that this package doesn't know about
-// yet.
+// GitSyncComplete, Checkout} to unmarshal the same raw bytes into. An
+// unrecognized type value is logged and skipped, never fatal -- forward-
+// compatible with a command type a future Step adds that this package
+// doesn't know about yet. A checkout reaches only a handler that implements
+// CheckoutHandler, and is skipped the same way for any other; every ready
+// advertises capabilities.reviewCheckout exactly when the handler
+// implements it (technical plan §21.1, §30.4).
 //
 // # Per-message gen-fencing
 //

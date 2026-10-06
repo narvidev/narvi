@@ -118,8 +118,9 @@ func runAgentGit(ctx context.Context, sup *supervisor.Supervisor, timeout, stopG
 // out) -> spawn spec (already built via githarden.Spec(repo, ...) or
 // githarden.Args(repo, ...) wrapped in a Spec by the caller) -> if the
 // command actually moved the agent's own HEAD (a checkout, a branch
-// creation, ...), SyncHeadOut (write that new branch back onto the
-// runtime's own worktree, as the runtime's own identity).
+// creation, a detached checkout, ...), SyncHeadOut (write that new HEAD,
+// a branch or a detached sha, back onto the runtime's own worktree, as the
+// runtime's own identity).
 //
 // No call site should ever assemble a hardened Spec and call sup.Spawn on
 // it directly -- doing so silently skips both brackets, leaving the

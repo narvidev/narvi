@@ -296,6 +296,71 @@ func TestCloneAll_HardensTheActualCloneInvocation(t *testing.T) {
 	}
 }
 
+// TestCloneAll_CredentialHelperSurvivesTheHardeningReset pins where the
+// clone's credential helper sits in its own argv: a top-level -c, after
+// the hardening flags' empty "credential.helper=" reset and before
+// "clone", the one place git keeps it. Given after "clone" (clone's own
+// -c), git writes it into the new repository's config, which it reads
+// before the command line, so the reset discarded it and a clone that
+// needed a credential failed for want of one -- verified against real git.
+// The real-binary half, a clone the server serves only to a token, is
+// TestHandleCheckout_PrivateForkWithoutTheApp_ReadFromTheBasePullRef.
+func TestCloneAll_CredentialHelperSurvivesTheHardeningReset(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatalf("exec.LookPath(git): %v", err)
+	}
+	fakeGitDir := t.TempDir()
+	captureFile := filepath.Join(t.TempDir(), "argv.txt")
+	// The clone invocation's argv, one argument per line, then a real,
+	// local, empty repository at its target, as the hardening test's fake
+	// git does; every other invocation runs the real git.
+	fakeGit := "#!/bin/sh\n" +
+		"is_clone=0\n" +
+		"for a in \"$@\"; do [ \"$a\" = clone ] && is_clone=1; done\n" +
+		"if [ \"$is_clone\" = 1 ]; then\n" +
+		"  for a in \"$@\"; do printf '%s\\n' \"$a\"; done > \"" + captureFile + "\"\n" +
+		"  cur=\"\"; for a in \"$@\"; do cur=\"$a\"; done\n" +
+		"  mkdir -p \"$cur\" && \"" + realGit + "\" init -q \"$cur\"\n" +
+		"  exit 0\n" +
+		"fi\n" +
+		"exec \"" + realGit + "\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(fakeGitDir, "git"), []byte(fakeGit), 0o755); err != nil {
+		t.Fatalf("write fake git: %v", err)
+	}
+	t.Setenv("PATH", fakeGitDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	repos := []sessionconfig.SessionConfigReposElem{{Name: "repo1", Url: "https://example.invalid/owner/repo.git"}}
+	results, err := gitclone.CloneAll(context.Background(), supervisor.New(), gitdir.Layout{Root: t.TempDir(), WorkspaceDir: t.TempDir()}, nil, nil, repos, nil, testCloneTimeout, testStopGrace)
+	if err != nil || len(results) != 1 || results[0].Err != nil {
+		t.Fatalf("CloneAll() = %+v, %v, want one successful result", results, err)
+	}
+	raw, err := os.ReadFile(captureFile)
+	if err != nil {
+		t.Fatalf("the clone was never invoked: %v", err)
+	}
+	argv := strings.Split(strings.TrimSuffix(string(raw), "\n"), "\n")
+
+	cloneAt, resetAt, helperAt := -1, -1, -1
+	for i, arg := range argv {
+		switch {
+		case arg == "clone" && cloneAt < 0:
+			cloneAt = i
+		case arg == "credential.helper=" && i > 0 && argv[i-1] == "-c":
+			resetAt = i
+		case strings.HasPrefix(arg, "credential.helper=") && strings.HasSuffix(arg, " credential-helper"):
+			helperAt = i
+		}
+	}
+	if cloneAt < 0 || resetAt < 0 || helperAt < 0 {
+		t.Fatalf("clone argv = %q: want the reset, the helper and \"clone\" all present", argv)
+	}
+	if resetAt > helperAt || helperAt > cloneAt || argv[helperAt-1] != "-c" {
+		t.Errorf("clone argv = %q: the helper (at %d) must be a top-level -c after the reset (at %d) and before \"clone\" (at %d)",
+			argv, helperAt, resetAt, cloneAt)
+	}
+}
+
 func TestCloneAll_ExplicitBranchChecksOutThatBranch(t *testing.T) {
 	t.Parallel()
 

@@ -280,3 +280,43 @@ func TestAssembleSessionConfig_ReviewCounterReviewerModel_NilWithoutPRSessionSto
 }
 
 func strPtr(s string) *string { return &s }
+
+// TestPullRequestRef pins which repo a review session's pull request ref is
+// put on (technical plan §21.1, §30.4): only one whose url names the
+// claim's repository, the base repository that keeps refs/pull/<n>/head,
+// compared case-insensitively and with or without ".git". A repo naming
+// another repository -- a review session opened while its spec still
+// named the fork -- gets none, and boots on its branch as before, and so
+// does every session with no claim.
+func TestPullRequestRef(t *testing.T) {
+	t.Parallel()
+
+	claim := &sqlcgen.GithubPrSession{RepoFullName: "acme/widgets", PrNumber: 7}
+	tests := []struct {
+		name  string
+		claim *sqlcgen.GithubPrSession
+		url   string
+		want  string // "" means no ref
+	}{
+		{name: "the base repository", claim: claim, url: "https://github.com/acme/widgets.git", want: "refs/pull/7/head"},
+		{name: "the base repository without .git", claim: claim, url: "https://github.com/acme/widgets", want: "refs/pull/7/head"},
+		{name: "the base repository in another case", claim: claim, url: "https://github.com/ACME/Widgets.git", want: "refs/pull/7/head"},
+		{name: "the fork", claim: claim, url: "https://github.com/contributor/widgets.git"},
+		{name: "another repository of the same owner", claim: claim, url: "https://github.com/acme/gadgets.git"},
+		{name: "a url with no owner/repo path", claim: claim, url: "https://github.com/acme"},
+		{name: "a claim whose number makes no ref", claim: &sqlcgen.GithubPrSession{RepoFullName: "acme/widgets"}, url: "https://github.com/acme/widgets.git"},
+		{name: "no claim", url: "https://github.com/acme/widgets.git"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got := pullRequestRef(tc.claim, sessionconfig.SessionConfigReposElem{Name: "widgets", Url: tc.url})
+			switch {
+			case tc.want == "" && got != nil:
+				t.Errorf("pullRequestRef() = %q, want none", *got)
+			case tc.want != "" && (got == nil || *got != tc.want):
+				t.Errorf("pullRequestRef() = %v, want %q", got, tc.want)
+			}
+		})
+	}
+}

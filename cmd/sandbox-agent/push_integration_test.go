@@ -103,15 +103,23 @@ func mustRunGit(t *testing.T, dir string, args ...string) string {
 	return string(out)
 }
 
+// pushTestWriteToken is the one credential startGitHTTPServer lets push:
+// the write-capable token newFakeControlPlane serves. Any other credential
+// -- a read-only installation token among them -- is refused a push with
+// 403, as the code host refuses one (technical plan §30.4).
+const pushTestWriteToken = "fake-oauth-access-token"
+
 // startGitHTTPServer serves reposParent via git's own smart-HTTP backend
 // (git-http-backend, via net/http/cgi -- a real git server, not a mock of
-// one), gating ONLY the git-receive-pack half (push) behind "any
-// Authorization header present" -- clone/fetch (git-upload-pack) is left
-// open. This is deliberately loose (it does not verify the credential's
-// own VALUE): internal/sandboxagent/credentials' own tests already
-// thoroughly prove the credential VALUE flows correctly end to end; this
-// test's own job is proving HandlePush's new git-push/rev-parse/event-
-// reporting logic, with a real credential round trip as supporting
+// one), gating ONLY the git-receive-pack half (push) behind a credential
+// whose password is pushTestWriteToken -- clone/fetch (git-upload-pack) is
+// left open. A request with no credential is challenged (401), and one
+// with any other credential refused (403): a review session's read-only
+// token cannot push (TestHandlePush_ReviewSessionsReadOnlyCredential_
+// RefusedByTheServer). internal/sandboxagent/credentials' own tests
+// already thoroughly prove the credential VALUE flows correctly end to
+// end; this test's own job is proving HandlePush's new git-push/rev-parse/
+// event-reporting logic, with a real credential round trip as supporting
 // infrastructure it depends on, not the primary thing under test.
 //
 // Deliberately TLS (httptest.NewUnstartedServer + StartTLS), not plain
@@ -150,9 +158,14 @@ func startGitHTTPServer(t *testing.T, reposParent string) *httptest.Server {
 		needsAuth := strings.Contains(r.URL.RawQuery, "service=git-receive-pack") ||
 			strings.HasSuffix(r.URL.Path, "git-receive-pack")
 		if needsAuth {
-			if _, _, ok := r.BasicAuth(); !ok {
+			_, password, ok := r.BasicAuth()
+			if !ok {
 				w.Header().Set("WWW-Authenticate", `Basic realm="test-git-server"`)
 				w.WriteHeader(http.StatusUnauthorized)
+				return
+			}
+			if password != pushTestWriteToken {
+				http.Error(w, "this credential cannot write to this repository", http.StatusForbidden)
 				return
 			}
 		}
@@ -184,15 +197,28 @@ type fakeControlPlane struct {
 	// refused for its credential from one that failed before ever needing
 	// one (it passed on any push_error while pushes could still race boot).
 	credentialRequests atomic.Int32
+
+	// password is the token scm-credentials serves: pushTestWriteToken,
+	// or, from newFakeControlPlaneServing, any other one.
+	password string
 }
 
 func newFakeControlPlane(t *testing.T, sessionID string, credentialShouldFail bool) *fakeControlPlane {
+	t.Helper()
+	return newFakeControlPlaneServing(t, sessionID, credentialShouldFail, pushTestWriteToken)
+}
+
+// newFakeControlPlaneServing is newFakeControlPlane with the token its
+// scm-credentials serves chosen by the caller -- a read-only installation
+// token, as a review session is served one (technical plan §30.4).
+func newFakeControlPlaneServing(t *testing.T, sessionID string, credentialShouldFail bool, password string) *fakeControlPlane {
 	t.Helper()
 	fcp := &fakeControlPlane{
 		sessionID:            sessionID,
 		credentialShouldFail: credentialShouldFail,
 		readyToPush:          make(chan struct{}),
 		result:               make(chan json.RawMessage, 1),
+		password:             password,
 	}
 
 	mux := http.NewServeMux()
@@ -205,7 +231,7 @@ func newFakeControlPlane(t *testing.T, sessionID string, credentialShouldFail bo
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"username":  "x-access-token",
-			"password":  "fake-oauth-access-token",
+			"password":  fcp.password,
 			"expiresAt": time.Now().Add(time.Hour).Format(time.RFC3339),
 		})
 	})
@@ -466,6 +492,16 @@ func runSandboxAgent(t *testing.T, binPath, gitServerURL, workspaceDir string, f
 		"sessionId": %q
 	}`, fcp.wsURL(), gitServerURL+"/repo.git", fcp.sessionID)
 
+	return startSandboxAgent(t, binPath, sessionConfigJSON, workspaceDir)
+}
+
+// startSandboxAgent is runSandboxAgent's process half, for a caller that
+// writes its own SESSION_CONFIG: the real binary, booting in fresh mode
+// against sessionConfigJSON, with every other setting runSandboxAgent's
+// own comments explain.
+func startSandboxAgent(t *testing.T, binPath, sessionConfigJSON, workspaceDir string) (out *syncBuffer, exited <-chan struct{}) {
+	t.Helper()
+
 	credCacheDir := t.TempDir()
 
 	timeouts := platform.DefaultTimeouts()
@@ -692,5 +728,56 @@ func TestHandlePush_CredentialRefused_ProducesPushError(t *testing.T) {
 	if fcp.credentialRequests.Load() == 0 {
 		t.Errorf("push_error (%q) arrived without the push ever asking for a credential -- it failed before "+
 			"authentication, so it says nothing about a refused credential; sandbox-agent output:\n%s", pushErr.Error, out.String())
+	}
+}
+
+// TestHandlePush_ReviewSessionsReadOnlyCredential_RefusedByTheServer is the
+// agent half of a review sandbox's credential not being able to push
+// (technical plan §30.4): the control plane serves it the read-only
+// installation token, and the code host -- here a git server that grants
+// git-receive-pack to a write token alone -- refuses the push it makes
+// with that token. The push asks for the credential, is refused, ends in
+// push_error, and the repository is not moved.
+func TestHandlePush_ReviewSessionsReadOnlyCredential_RefusedByTheServer(t *testing.T) {
+	binPath := buildSandboxAgentBinary(t)
+	gitServerURL := setUpBareRepoAndServer(t)
+	workspaceDir := t.TempDir()
+
+	fcp := newFakeControlPlaneServing(t, "push-read-only-session", false /* credentialShouldFail */, "read-only-installation-token")
+	out, exited := runSandboxAgent(t, binPath, gitServerURL, workspaceDir, fcp)
+
+	waitForBootComplete(t, out, exited)
+
+	repoDir := filepath.Join(workspaceDir, "widgets")
+	// The test server's certificate is self-signed, trusted here as the
+	// agent's own environment trusts it (GIT_SSL_NO_VERIFY).
+	before := strings.TrimSpace(mustRunGit(t, repoDir, "-c", "http.sslVerify=false", "ls-remote", "origin", "refs/heads/main"))
+	if err := os.WriteFile(filepath.Join(repoDir, "change.txt"), []byte("a change a review never delivers\n"), 0o644); err != nil {
+		t.Fatalf("write change file: %v", err)
+	}
+	mustRunGit(t, repoDir, "add", "change.txt")
+	mustRunGit(t, repoDir, "commit", "-m", "a change for a push the server refuses")
+
+	close(fcp.readyToPush)
+
+	var result json.RawMessage
+	select {
+	case result = <-fcp.result:
+	case <-time.After(pushTestTimeout):
+		t.Fatalf("timed out waiting for push_complete/push_error; sandbox-agent output:\n%s", out.String())
+	}
+	var pushErr sandboxws.PushError
+	if err := json.Unmarshal(result, &pushErr); err != nil || pushErr.Type != "push_error" {
+		t.Fatalf("result = %s (%v), want a push_error; sandbox-agent output:\n%s", result, err, out.String())
+	}
+	if !strings.Contains(pushErr.Error, "403") {
+		t.Errorf("push_error = %q, want the server's 403 refusal", pushErr.Error)
+	}
+	if fcp.credentialRequests.Load() == 0 {
+		t.Errorf("push_error (%q) arrived without the push ever asking for a credential -- it failed before "+
+			"the read-only token was ever presented; sandbox-agent output:\n%s", pushErr.Error, out.String())
+	}
+	if after := strings.TrimSpace(mustRunGit(t, repoDir, "-c", "http.sslVerify=false", "ls-remote", "origin", "refs/heads/main")); after != before {
+		t.Errorf("the remote's main moved from %q to %q: the read-only token pushed", before, after)
 	}
 }

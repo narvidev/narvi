@@ -396,10 +396,15 @@ func Spec(repo Repo, rest ...string) supervisor.Spec {
 
 // ArgsForClone returns the hardening flags for a `git clone` invocation
 // whose target directory does not exist yet, followed by rest (the
-// caller's own "clone" subcommand and its arguments, in full, e.g.
-// ["clone", "-c", "credential.helper=...", "--", url, dir]) -- dir itself
-// is one of rest's own trailing positionals, never a parameter of this
-// function: a fresh `git clone` creates its own pristine .git, so there is
+// caller's own top-level overrides, then its "clone" subcommand and its
+// arguments, in full, e.g. ["-c", "credential.helper=...", "clone", "--",
+// url, dir]) -- dir itself is one of rest's own trailing positionals, never
+// a parameter of this function. A credential helper must be one of those
+// top-level overrides, before "clone": as clone's own "-c" it is written
+// into the new repository's config, which git reads before the command
+// line, so hardeningFlags' empty "credential.helper=" reset discards it and
+// a clone that needs a credential is never given one (gitclone.cloneOne).
+// Nothing else is added: a fresh `git clone` creates its own pristine .git, so there is
 // no agent-owned git-dir to point at yet (internal/sandboxagent/gitdir.Seed
 // runs AFTER a successful clone, per gitclone.CloneAll's own ordering),
 // and no "-C <dir>"/--git-dir/--work-tree to add at all (-C requires its

@@ -236,12 +236,32 @@ type SessionConfigReposElem struct {
 	// Name corresponds to the JSON schema field "name".
 	Name string `json:"name" yaml:"name" mapstructure:"name"`
 
+	// Technical plan §21.1, §30.4: present on a pull request's review session only,
+	// when url names the pull request's base repository, which keeps every pull
+	// request's head as refs/pull/<number>/head. When set, the sandbox clones url and
+	// checks out this ref's tip, detached; branch is then never checked out. The
+	// control plane derives it from the session's pull request each time it assembles
+	// this document; it is never stored. Genuinely OPTIONAL: absent or null is the
+	// behavior from before this field existed, and an agent that predates it ignores
+	// it and clones as before.
+	Ref SessionConfigReposElemRef `json:"ref,omitempty,omitzero" yaml:"ref,omitempty" mapstructure:"ref,omitempty"`
+
 	// Url corresponds to the JSON schema field "url".
 	Url string `json:"url" yaml:"url" mapstructure:"url"`
 }
 
 // Null means create the session branch from the repo's default base branch.
 type SessionConfigReposElemBranch *string
+
+// Technical plan §21.1, §30.4: present on a pull request's review session only,
+// when url names the pull request's base repository, which keeps every pull
+// request's head as refs/pull/<number>/head. When set, the sandbox clones url and
+// checks out this ref's tip, detached; branch is then never checked out. The
+// control plane derives it from the session's pull request each time it assembles
+// this document; it is never stored. Genuinely OPTIONAL: absent or null is the
+// behavior from before this field existed, and an agent that predates it ignores
+// it and clones as before.
+type SessionConfigReposElemRef *string
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *SessionConfigReposElem) UnmarshalJSON(value []byte) error {
