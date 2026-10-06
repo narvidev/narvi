@@ -336,9 +336,15 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 	// execution_complete -- a retired gen's after a stop (stop.go), say --
 	// would still start a snapshot of the current gen's sandbox, mid-turn.
 	var staleGen bool
+	// lifetimeTightened is set when this event's report brought its gen's
+	// lifetime deadline earlier (technical plan §35.2, lifetimereport.go),
+	// and logged only once transact has committed, so a rolled-back pass is
+	// never logged as a tightening.
+	var lifetimeTightened *lifetimeTightening
 
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		staleGen = false
+		lifetimeTightened = nil
 		now := time.Now()
 
 		row, err := a.stores.sandbox.WithTx(tx).Get(ctx, a.sessionID)
@@ -496,6 +502,22 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 				readyAdvertisesPromptReceipt(cmd.Raw), readyStatedMaxFrameBytes(cmd.Raw)); err != nil {
 				return fmt.Errorf("sessionactor: record the ready: %w", err)
 			}
+		}
+
+		// Technical plan §35.2 (lifetimereport.go): a ready or heartbeat
+		// that reports how long the provider will still let the sandbox run
+		// brings the gen's deadline earlier when it is earlier than the
+		// claim's estimate, and never later. One that reports nothing --
+		// every agent until a provider states a deadline -- writes nothing.
+		// Not gated on `inserted`: neither frame is buffered or replayed, so
+		// each one is fresh, and the gen fence above has already dropped a
+		// stale gen's.
+		if cmd.Type == "ready" || cmd.Type == "heartbeat" {
+			tightened, err := a.tightenReportedLifetime(ctx, tx, cmd.Type, cmd.Raw, row.Gen)
+			if err != nil {
+				return err
+			}
+			lifetimeTightened = tightened
 		}
 
 		// A null phase from a gen with no evidence is absence of
@@ -766,6 +788,9 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 	if err == nil && !staleGen {
 		if bootEvidenceFallbackFired {
 			a.recordBootEvidenceFallback(ctx)
+		}
+		if lifetimeTightened != nil {
+			a.logLifetimeTightened(lifetimeTightened)
 		}
 
 		// §3.2 ("snapshots & restore"), design decision 1 -- CORRECTED
