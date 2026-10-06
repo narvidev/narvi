@@ -1,6 +1,6 @@
 .PHONY: build vet fmt tidy lint lint-web-assets test test-integration \
 	test-integration-group-1 test-integration-group-2 test-integration-group-3 test-integration-group-4 \
-	test-integration-postgres-floor \
+	test-integration-postgres test-integration-postgres-floor \
 	contracts-generate contracts-check contracts-compat dev \
 	web-typecheck web-lint web-check-dto-types web-test web-build web-check dist \
 	verify-control-plane-image
@@ -85,7 +85,9 @@ test-integration:
 # reintroducing the same-host container contention that caused the hangs
 # -p 1 fixed in the first place. See ci.yml's own comment on the
 # `test-integration` job for the bin-packing rationale, the timing data
-# it's based on, and how these four groups were chosen.
+# it's based on, and how these four groups were chosen. Group 3's leg also
+# runs the postgres adapter's suite, alone and on a time budget of its own,
+# once group 3's packages are done: see test-integration-postgres below.
 #
 # Groups 2-4 run at -p 2 (group 1 is httpapi alone -- a single package, so
 # -p has no effect there, left at -p 1). This was verified, not assumed:
@@ -103,7 +105,8 @@ test-integration:
 #
 # Groups 1-3 are deliberately short, explicit package lists -- the handful
 # of packages heavy enough to matter for balancing. Group 4 is everything
-# else, computed from `go list -tags=integration ./...` (the same package
+# else (but the postgres adapter, which group 3's leg runs), computed from
+# `go list -tags=integration ./...` (the same package
 # universe `go test -tags=integration ./...` would use -- test/resilience,
 # for instance, only exists as a package at all under that tag) rather than
 # hand-listed, so a newly added package is automatically covered (in group
@@ -133,15 +136,58 @@ test-integration-group-1:
 test-integration-group-2:
 	go test -tags=integration -race -p 2 $(INTEGRATION_GROUP_2)
 
+# Group 3's packages first, then the postgres adapter's suite alone
+# (test-integration-postgres): the second runs whatever the first does, and
+# the leg fails if either fails.
 test-integration-group-3:
-	go test -tags=integration -race -p 2 $(INTEGRATION_GROUP_3)
+	status=0; \
+	go test -tags=integration -race -p 2 $(INTEGRATION_GROUP_3) || status=1; \
+	$(POSTGRES_SUITE_TEST) || status=1; \
+	exit $$status
 
 test-integration-group-4:
 	@tmp="$$(mktemp)"; \
-	printf '%s\n' $(INTEGRATION_GROUP_1) $(INTEGRATION_GROUP_2) $(INTEGRATION_GROUP_3) > "$$tmp"; \
+	printf '%s\n' $(INTEGRATION_GROUP_1) $(INTEGRATION_GROUP_2) $(INTEGRATION_GROUP_3) $(INTEGRATION_POSTGRES) > "$$tmp"; \
 	pkgs="$$(go list -tags=integration ./... | grep -vxF -f "$$tmp")"; \
 	rm -f "$$tmp"; \
 	go test -tags=integration -race -p 2 $$pkgs
+
+# test-integration-postgres runs the postgres adapter's suite
+# (internal/adapters/outbound/postgres) alone, with a time budget of its own,
+# POSTGRES_SUITE_TIMEOUT. CI runs it in group 3's leg, on Postgres 17, and in
+# test-integration-postgres-floor, on the floor.
+#
+# Why alone. Its plan tests and migration tests made it the heaviest package
+# after httpapi, and it grew fast. In group 4, at -p 2 beside whatever other
+# package was running, it took 136-165 s on 2026-10-03 and 380-521 s by
+# 2026-10-06; then 603 s on main at 13d06ff (CI run 37494268063), where go
+# test's default 10-minute budget killed it mid-test -- not hung, slow -- as
+# it had once already on that commit's own pull request (run 37443723157).
+# Alone on a runner, as the floor job runs it on Postgres 16, the same suite
+# took 439-559 s. Group 4's leg ran 14-19 minutes, the matrix's longest by
+# far (groups 1-3: 4-8 minutes), so the suite moves out of group 4 to group
+# 3's leg, the shortest, after group 3's packages: it runs alone there, and
+# group 4 sheds its longest package. Not a fifth leg: the default branch's
+# ruleset requires the four test-integration legs by name, and group 4 stays
+# the longest leg either way.
+#
+# Why this budget. POSTGRES_SUITE_TIMEOUT is go test's -timeout for the
+# suite's one test binary, and a panic at it reads as a hang only while a
+# green run stays well inside it. Before migrated templates
+# (sharedpool_integration_test.go's migratedDatabase) cut the suite, its
+# slowest green run alone was 559 s (Postgres 16, CI run 37473730187), which
+# 15 minutes holds 1.6 times. If a green run ever takes more than half of
+# the budget, the panic stops meaning a hang: make the suite faster or
+# split it, measure again, and only then move the budget, with the new
+# numbers here. Every other package keeps go test's default 10 minutes,
+# still more than twice the slowest of them (decisioninbox, 214-219 s in
+# group 4).
+INTEGRATION_POSTGRES := $(INTEGRATION_MODULE)/internal/adapters/outbound/postgres
+POSTGRES_SUITE_TIMEOUT := 15m
+POSTGRES_SUITE_TEST = go test -tags=integration -race -p 1 -timeout $(POSTGRES_SUITE_TIMEOUT) $(INTEGRATION_POSTGRES)
+
+test-integration-postgres:
+	$(POSTGRES_SUITE_TEST)
 
 # test-integration-postgres-floor runs, on the oldest Postgres server the
 # control plane boots against (platform.MinPostgresServerVersionNum,
@@ -157,12 +203,13 @@ test-integration-group-4:
 # the image from NARVI_TEST_POSTGRES_IMAGE, the boot test fails if the
 # server it reached is not the major the image names, and internal/ops
 # checks that this image names the floor's major. CI runs this target as a
-# job of its own (.github/workflows/ci.yml).
+# job of its own (.github/workflows/ci.yml). The adapter's suite runs here on
+# test-integration-postgres's budget, POSTGRES_SUITE_TIMEOUT, which this
+# job's own runs size as well as group 3's.
 POSTGRES_FLOOR_IMAGE := postgres:16-alpine
 
 test-integration-postgres-floor:
-	NARVI_TEST_POSTGRES_IMAGE=$(POSTGRES_FLOOR_IMAGE) go test -tags=integration -race -p 1 \
-		$(INTEGRATION_MODULE)/internal/adapters/outbound/postgres
+	NARVI_TEST_POSTGRES_IMAGE=$(POSTGRES_FLOOR_IMAGE) $(POSTGRES_SUITE_TEST)
 	NARVI_TEST_POSTGRES_IMAGE=$(POSTGRES_FLOOR_IMAGE) go test -tags=integration -race -run '^TestLockHolder_' \
 		$(INTEGRATION_MODULE)/internal/app/sessionactor
 	NARVI_TEST_POSTGRES_IMAGE=$(POSTGRES_FLOOR_IMAGE) go test -tags=integration -race -v -run '^(TestPostgresPreflight_|TestRunRoutesCommand_)' \

@@ -210,6 +210,15 @@ jobs:
   # + Go setup + OpenCode install, ~30-45s each) for no benefit -- see this
   # PR's own description for the full timing table this was based on.
   #
+  # By 2026-10-06 that balance had gone: group 4's leg ran 14-19 minutes,
+  # groups 1-3 4-8, and within group 4 the postgres adapter's suite took
+  # 380-603s, passing go test's default 10-minute budget once on main.
+  # Group 3's leg, the shortest, now also runs that suite, alone, once its
+  # own packages are done, on a budget of its own (test-integration-postgres
+  # in the Makefile, which holds the timings and the budget's reasoning).
+  # Still four legs: the default branch's ruleset requires these four by
+  # name, and group 4 is still the longest of them.
+  #
   # The exact package groupings live in the Makefile (test-integration-
   # group-1..4), not here, so there's one source of truth for "which
   # packages are in which group" -- see the Makefile's own comment above
@@ -324,7 +333,8 @@ jobs:
   # test-integration runs everything on postgres:17-alpine: the postgres
   # adapter's whole suite, the lock connection's tests and boot's own reads
   # of the server. The Makefile target of the same name holds the image and
-  # the package list, and says why those three. No OpenCode install: none
+  # the package list, and says why those three; the adapter's suite runs on
+  # the budget test-integration-postgres sets it. No OpenCode install: none
   # of these tests spawns it.
   test-integration-postgres-floor:
     needs: checks
