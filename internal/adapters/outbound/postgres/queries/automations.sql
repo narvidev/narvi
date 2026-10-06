@@ -110,19 +110,23 @@ WHERE trigger_type = 'linear' AND status = 'active'
 ORDER BY id ASC;
 
 -- name: ClaimCronFire :one
--- The CAS half of the cron trigger pump's own per-automation fire guard:
--- "UPDATE ... WHERE last_cron_fired_at IS NULL OR last_cron_fired_at <
--- <this minute's own start>" -- guards against firing the SAME scheduled
--- minute twice (a slow previous tick, clock jitter, a second pod's own
--- concurrent pump), while still allowing every LATER minute's own match to
--- fire again -- unlike automation_invocations.fanned_out_at's one-way
--- NULL-to-non-NULL flip, this guard is a recurring per-minute bucket, not
--- a permanent latch. $2 is the current UTC minute's own truncated start
--- instant, used both as the new last_cron_fired_at value and as the
--- guard's own comparison point.
+-- The cron trigger pump's per-automation fire guard: a compare-and-swap on
+-- the last_cron_fired_at the tick read (expected, NULL for an automation
+-- that has never fired), setting it to the tick's own minute bucket. A
+-- tick decides whether to fire from the window that value opens
+-- (domain/automation.CronCatchUpFrom); once any other tick -- a second
+-- replica's pump, or a slow earlier tick of this one -- has claimed since,
+-- that window is stale, and this matches no row (pgx.ErrNoRows), so the
+-- occurrence it saw fires once, from the claim that won. Comparing with
+-- the bucket alone would not do: two replicas whose ticks straddle a
+-- minute boundary each read the same value, and the later bucket passes a
+-- "< bucket" guard after the earlier claim commits. The bucket must still
+-- be later than the value read, so a claim never moves the fire back.
 UPDATE automations
-SET last_cron_fired_at = $2
-WHERE id = $1 AND (last_cron_fired_at IS NULL OR last_cron_fired_at < $2)
+SET last_cron_fired_at = sqlc.arg('bucket')
+WHERE id = sqlc.arg('id')
+  AND last_cron_fired_at IS NOT DISTINCT FROM sqlc.narg('expected')
+  AND (last_cron_fired_at IS NULL OR last_cron_fired_at < sqlc.arg('bucket'))
 RETURNING *;
 
 -- name: UpdateAutomationLastRun :one

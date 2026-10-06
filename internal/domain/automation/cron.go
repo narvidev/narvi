@@ -292,3 +292,44 @@ func CronMatchesWithin(expr string, from, to time.Time, granularity time.Duratio
 	}
 	return false, nil
 }
+
+// CronCatchUpFrom returns the exclusive start of the window one cron
+// automation's tick evaluates -- CronMatchesWithin's from, with the tick's
+// own bucket (now truncated to granularity) as its to -- and whether the
+// catch-up ceiling cut a longer gap short.
+//
+// An automation that has fired (lastFired non-nil) counts from its last
+// fire, but never from further back than catchUp before now: a stalled
+// engine, or an autonomy freeze that held a fire without claiming it
+// (technical plan §40.2), backfills at most once, and only a match within
+// that ceiling. capped reports the ceiling applying.
+//
+// An automation that has never fired counts from the minute it was
+// created -- that minute's own bucket included, so a schedule matching
+// the minute an automation was created fires on its first tick in it, as
+// it always did -- under the same ceiling. A first occurrence a freeze
+// held is therefore caught up exactly as a later one is, while no
+// occurrence from before the automation existed ever fires. The start is
+// never later than the one bucket back the tick evaluates at the least,
+// so a creation time that reads later than now (a clock that leads)
+// narrows nothing.
+//
+// Pure: now and createdAt are the caller's.
+func CronCatchUpFrom(lastFired *time.Time, createdAt, now time.Time, granularity, catchUp time.Duration) (from time.Time, capped bool) {
+	ceiling := now.Add(-catchUp)
+	if lastFired != nil {
+		if lastFired.After(ceiling) {
+			return *lastFired, false
+		}
+		return ceiling, true
+	}
+	oneBucketBack := now.Truncate(granularity).Add(-granularity)
+	from = createdAt.Truncate(granularity).Add(-granularity)
+	if ceiling.After(from) {
+		from = ceiling
+	}
+	if from.After(oneBucketBack) {
+		from = oneBucketBack
+	}
+	return from, false
+}

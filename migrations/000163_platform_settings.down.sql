@@ -1,0 +1,29 @@
+-- Reverses this migration's up file. The row goes with the table: A FREEZE
+-- IN FORCE IS LIFTED, and a binary that carries this migration reads no
+-- freeze once it runs again (a missing row reads as never frozen). Record
+-- it first:
+--   SELECT autonomy_frozen, autonomy_frozen_at, autonomy_frozen_by,
+--          autonomy_freeze_reason FROM platform_settings WHERE id = 1;
+-- Its history stays in audit_log (autonomy.frozen, autonomy.unfrozen).
+--
+-- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary
+-- without this migration. Do not run it against live pods of a binary that
+-- carries it, for two reasons:
+--   - Every automatic action of that binary reads this table before it
+--     starts. After this down each read fails (SQLSTATE 42P01, relation
+--     does not exist), and a read that fails is a skip: no auto-merge, no
+--     sentinel auto-fix, no automatic re-review, no cron fire and no
+--     automation fan-out until the older binary replaces the pod.
+--   - A pod that carries this migration and restarts before the older
+--     binary replaces it applies it again at boot -- the row seeded, not
+--     frozen -- which locks the older binary out again ("no migration
+--     found for version N", N being this file's own number).
+-- Guarded: IF EXISTS, so it also runs on a database a rollback already
+-- brought back to the version before this one with the table kept
+-- (`migrate force`, the up file's "Rolling back") and then forced up again.
+-- Locks: dropping the table drops its foreign key's triggers on users, so
+-- the drop takes ACCESS EXCLUSIVE on users -- reads included -- for the
+-- file's one implicit transaction, an instant once granted, waiting behind
+-- any open transaction that touched users. With the control plane scaled
+-- to zero, as above, nothing is waiting.
+DROP TABLE IF EXISTS platform_settings;

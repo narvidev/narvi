@@ -77,6 +77,15 @@ func (s *OutboxStore) ListDuePending(ctx context.Context, limit int32) ([]sqlcge
 	return s.q.ListDuePendingOutboxEntries(ctx, limit)
 }
 
+// ListDuePendingOfKinds is ListDuePending restricted to the rows of kinds:
+// one lane of a tick while the autonomy freeze holds some kinds (technical
+// plan §40.2), so each held row is still claimed and its hold decided at
+// the delivery's call site, and no notification waits behind held rows.
+// Same transaction rule.
+func (s *OutboxStore) ListDuePendingOfKinds(ctx context.Context, limit int32, kinds []string) ([]sqlcgen.Outbox, error) {
+	return s.q.ListDuePendingOutboxEntriesOfKinds(ctx, sqlcgen.ListDuePendingOutboxEntriesOfKindsParams{Kinds: kinds, MaxRows: limit})
+}
+
 // Claim bumps id's row next_attempt_at forward by claimProtection (a
 // provisional protection window, see ClaimOutboxEntry's own generated doc
 // comment for why the outbox table needs this rather than a distinct

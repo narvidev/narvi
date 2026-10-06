@@ -14,6 +14,7 @@ import (
 	"go.opentelemetry.io/otel/metric"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	"github.com/narvidev/narvi/internal/platform"
@@ -208,6 +209,12 @@ type Actor struct {
 	// refuseIfRolloutUnenrolled, the dispatch-time half of §32's "fail-
 	// closed, twice" pair.
 	rolloutMode platform.RolloutMode
+
+	// autonomy is the autonomy freeze (§40.2), the SAME gate every Actor
+	// this Registry hydrates shares: the automatic re-review reads it
+	// before its turn insert (reviewretrigger.go). Nothing a person asks
+	// for reads it.
+	autonomy *autonomy.Gate
 
 	// pendingBroadcast queues each event appended (via appendEvent/
 	// appendRawEvent) during the CURRENT transact attempt, in order. Safe

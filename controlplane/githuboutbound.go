@@ -11,6 +11,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/automerge"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/decisioninbox"
 	"github.com/narvidev/narvi/internal/app/outboxworker"
 	"github.com/narvidev/narvi/internal/app/ports"
@@ -184,13 +185,19 @@ func buildGitHubOutbound(cfg *platform.Config, deps githubOutboundDeps) (*github
 	}
 	// Auto-merge (§21.2 stage 2): reads and merges pull requests as the
 	// bot, re-validating each candidate through the decision inbox's own
-	// stores (decisioninbox.RevalidateForAutoMerge).
+	// stores (decisioninbox.RevalidateForAutoMerge), and holding every
+	// candidate while autonomy is frozen (§40.2).
+	automergeAutonomy, err := autonomy.NewGate(deps.pool)
+	if err != nil {
+		return nil, fmt.Errorf("construct automerge autonomy gate: %w", err)
+	}
 	o.automergeWorker, err = automerge.New(automerge.Deps{
 		DecisionInbox: deps.decisionInbox,
 		SourceControl: deps.sourceControl,
 		AuditLog:      deps.auditLog,
 		Outbound:      outbound,
 		Timeouts:      cfg.Timeouts,
+		Autonomy:      automergeAutonomy,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("construct automerge worker: %w", err)

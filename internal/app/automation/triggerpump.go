@@ -13,6 +13,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	domainautomation "github.com/narvidev/narvi/internal/domain/automation"
+	domainautonomy "github.com/narvidev/narvi/internal/domain/autonomy"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -49,7 +50,8 @@ func unmarshalCronTriggerConfig(raw []byte) (domainautomation.CronTriggerConfig,
 // since that automation's own last fire (domainautomation.
 // CronMatchesWithin, capped at AutomationCronCatchUpWindow -- see this
 // function's own "review fix" paragraph below), attempts to claim the
-// CURRENT minute bucket (ClaimCronFire's CAS) and, on winning it, calls
+// CURRENT minute bucket (ClaimCronFire, a compare-and-swap on the last
+// fire the tick read) and, on winning it, calls
 // CreateInvocation with a fresh snapshot of the automation's own current
 // repos as targets -- ListActiveCronAutomations' own "AND status = 'active'"
 // filter is the SAME "check this automation is still active before ever
@@ -76,9 +78,10 @@ func unmarshalCronTriggerConfig(raw []byte) (domainautomation.CronTriggerConfig,
 // row's own window runs from max(row.LastCronFiredAt,
 // now-AutomationCronCatchUpWindow) through the current minute bucket
 // (domainautomation.CronMatchesWithin), firing AT MOST ONCE per tick even
-// when multiple buckets inside that window matched (CAS discipline is
-// unchanged -- ClaimCronFire still only ever records the CURRENT bucket as
-// this automation's own last fire, exactly as it always has).
+// when multiple buckets inside that window matched (ClaimCronFire records
+// only the CURRENT bucket as this automation's own last fire, and only if
+// the last fire is still the one the tick read, so two replicas' ticks
+// whose windows hold the same occurrence fire it once between them).
 //
 // Exported (rather than only reachable through Run's own loop) so tests
 // can drive exactly one tick deterministically, matching PumpOnce/
@@ -109,8 +112,15 @@ func (e *Engine) evaluateCronTriggersAt(ctx context.Context, now time.Time) erro
 	}
 
 	logger := platform.Logger(ctx)
+	held := 0
 	for _, row := range rows {
-		e.evaluateCronAutomation(ctx, logger, row, now, toBucket)
+		if e.evaluateCronAutomation(ctx, logger, row, now, toBucket) {
+			held++
+		}
+	}
+	if held > 0 {
+		logger.Info("automation: cron fires held by the autonomy freeze this tick; none was claimed, so each fires on its first tick after the freeze lifts if its schedule still matches within the catch-up window",
+			"outcome", domainautonomy.OutcomeSkipped, "held", held)
 	}
 	return nil
 }
@@ -120,61 +130,83 @@ func (e *Engine) evaluateCronTriggersAt(ctx context.Context, now time.Time) erro
 // automation's own last recorded fire, if any) and
 // now-AutomationCronCatchUpWindow (the catch-up ceiling, so a genuinely
 // long-down engine backfills a BOUNDED amount, never an ever-growing one);
-// an automation that has NEVER fired (row.LastCronFiredAt invalid) starts
-// from exactly one granularity bucket back -- the SAME single-bucket window
-// CronMatches alone always evaluated, so a brand-new automation's very
-// first tick behaves identically to before this fix.
-func (e *Engine) evaluateCronAutomation(ctx context.Context, logger *slog.Logger, row sqlcgen.Automation, now time.Time, toBucket time.Time) {
+// an automation that has NEVER fired (row.LastCronFiredAt invalid) counts
+// from the minute it was created, under the same ceiling
+// (domainautomation.CronCatchUpFrom), so a first occurrence a freeze held
+// is caught up like any later one, and nothing from before the automation
+// existed fires. Its window is never narrower than the single bucket
+// CronMatches alone always evaluated.
+//
+// A matched fire is an action that starts without a person asking for it
+// right then, so it reads the autonomy freeze (§40.2) before it claims the
+// fire: while frozen nothing is claimed -- last_cron_fired_at stays where
+// it was and no invocation is created -- so a freeze never builds up a
+// burst. After the freeze lifts, the catch-up window above fires a missed
+// occurrence at most once, and a freeze longer than the window waits for
+// the next occurrence. It returns true for a fire the freeze held.
+func (e *Engine) evaluateCronAutomation(ctx context.Context, logger *slog.Logger, row sqlcgen.Automation, now time.Time, toBucket time.Time) (held bool) {
 	logger = logger.With("automation_id", row.ID.String())
 
 	cfg, err := unmarshalCronTriggerConfig(row.TriggerConfig)
 	if err != nil {
 		logger.Error("automation: decode cron trigger config failed", "error", err)
-		return
+		return false
 	}
 
-	from := toBucket.Add(-e.timeouts.AutomationCronGranularity)
+	var lastFired *time.Time
 	if row.LastCronFiredAt.Valid {
-		catchUpFloor := now.Add(-e.timeouts.AutomationCronCatchUpWindow)
-		if row.LastCronFiredAt.Time.After(catchUpFloor) {
-			from = row.LastCronFiredAt.Time
-		} else {
-			from = catchUpFloor
-			logger.Warn("automation: cron catch-up window capped a longer gap",
-				"last_cron_fired_at", row.LastCronFiredAt.Time, "catch_up_floor", catchUpFloor)
-		}
+		lastFired = &row.LastCronFiredAt.Time
+	}
+	createdAt := now
+	if row.CreatedAt.Valid {
+		createdAt = row.CreatedAt.Time
+	}
+	from, capped := domainautomation.CronCatchUpFrom(lastFired, createdAt, now, e.timeouts.AutomationCronGranularity, e.timeouts.AutomationCronCatchUpWindow)
+	if capped {
+		logger.Warn("automation: cron catch-up window capped a longer gap",
+			"last_cron_fired_at", row.LastCronFiredAt.Time, "catch_up_floor", from)
 	}
 
 	matched, err := domainautomation.CronMatchesWithin(cfg.Schedule, from, toBucket, e.timeouts.AutomationCronGranularity)
 	if err != nil {
 		logger.Error("automation: evaluate cron schedule failed", "error", err, "schedule", cfg.Schedule)
-		return
+		return false
 	}
 	if !matched {
-		return
+		return false
 	}
 
+	if skip, _ := e.gate.Check(ctx, domainautonomy.SiteAutomationCron, "automation_id", row.ID.String()); skip {
+		return true
+	}
+
+	// The claim is a compare-and-swap on the last fire this tick read
+	// (row.LastCronFiredAt), the value its window was computed from: a
+	// tick of another replica that claimed since saw the same occurrence,
+	// and this one must not fire it again.
 	minuteBucket := pgtype.Timestamptz{Time: toBucket, Valid: true}
-	claimed, err := e.automations.ClaimCronFire(ctx, row.ID, minuteBucket)
+	claimed, err := e.automations.ClaimCronFire(ctx, row.ID, row.LastCronFiredAt, minuteBucket)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Already fired for this exact minute bucket -- a concurrent
-			// tick (this pod's or another pod's own Engine) won the race
-			// first. Harmless no-op, the SAME "lost the race" outcome every
-			// other CAS-guarded write in this package treats identically.
-			return
+			// Another tick -- this pod's or another pod's own Engine --
+			// claimed since this one read the row. Harmless no-op, the SAME
+			// "lost the race" outcome every other CAS-guarded write in this
+			// package treats identically: the occurrence fired once, from
+			// the claim that won.
+			return false
 		}
 		logger.Error("automation: claim cron fire failed", "error", err)
-		return
+		return false
 	}
 
 	targets, err := UnmarshalTargets(claimed.Repos)
 	if err != nil {
 		logger.Error("automation: decode automation repos for cron fire failed", "error", err)
-		return
+		return false
 	}
 
 	if _, err := CreateInvocation(ctx, e.invocations, claimed.ID, targets); err != nil {
 		logger.Error("automation: create invocation for cron fire failed", "error", err)
 	}
+	return false
 }

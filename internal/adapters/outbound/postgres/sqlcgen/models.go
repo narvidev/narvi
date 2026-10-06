@@ -2110,6 +2110,15 @@ type PlanDocument struct {
 	StructuredSteps []byte             `json:"structured_steps"`
 }
 
+type PlatformSetting struct {
+	ID                   int16              `json:"id"`
+	AutonomyFrozen       bool               `json:"autonomy_frozen"`
+	AutonomyFrozenAt     pgtype.Timestamptz `json:"autonomy_frozen_at"`
+	AutonomyFrozenBy     pgtype.UUID        `json:"autonomy_frozen_by"`
+	AutonomyFreezeReason *string            `json:"autonomy_freeze_reason"`
+	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+}
+
 type PromptTemplate struct {
 	Name      string             `json:"name"`
 	Template  string             `json:"template"`

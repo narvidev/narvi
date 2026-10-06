@@ -49,7 +49,10 @@ func newFixtureWithRolloutMode(t *testing.T, mode platform.RolloutMode) *testFix
 
 	repoSettings := narvipg.NewRepoSettingsStore(pool)
 	prSessions := narvipg.NewGitHubPRSessionStore(pool)
-	engine := automation.NewEngine(automations, invocations, runs, sessions, turns, environments, auditLog, pool, registry, platform.DefaultTimeouts(), false, mode, repoSettings, prSessions)
+	engine, err := automation.NewEngine(automations, invocations, runs, sessions, turns, environments, auditLog, pool, registry, platform.DefaultTimeouts(), false, mode, repoSettings, prSessions)
+	if err != nil {
+		t.Fatalf("NewEngine: %v", err)
+	}
 
 	return &testFixture{
 		pool: pool, automations: automations, invocations: invocations, runs: runs,

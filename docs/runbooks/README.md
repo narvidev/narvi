@@ -26,6 +26,7 @@ automated outbox dead-letter replay) is stated as a gap, not glossed over.
 | [sandbox-capability-refusals.md](sandbox-capability-refusals.md) | none (no metric exists yet — see entry) | #17 (restore-with-docker) |
 | [signing-key-rotation.md](signing-key-rotation.md) | none (routine admin procedure, not a failure) | n/a |
 | [mcp-client-cutoff.md](mcp-client-cutoff.md) | none (routine admin procedure, not a failure) | n/a |
+| [autonomy-freeze.md](autonomy-freeze.md) | none (an operator control, not a failure — see entry) | #20 (its freeze half is not built yet) |
 
 ## Cross-references, not duplicated here
 

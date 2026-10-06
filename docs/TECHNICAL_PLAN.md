@@ -7286,19 +7286,46 @@ and hopes nothing else is armed.
 
 **The freeze.** One persisted, platform-wide boolean — a row, never an environment variable, because
 a flip must be one audited write with no restart, and its state must be readable by Settings like any
-other value. Admin-only (§13.3). Consulted, and only consulted, at the sites where an action starts
-*without a human asking for it right then*: the auto-merge worker before `RevalidateForAutoMerge`; the
-sentinel auto-fix spawn (§17); the automatic re-review enqueue (§24.3 step 4); the automation scheduler
-at invocation start (§3.5); the workflow engine's auto-advance (§25); and, when Phase 14 ships, the
-chain enqueue (§38.3) and the train's verdict-gated advance (§39.3). **Never** consulted by a human
-command: a prompt, a plan approval, a manual merge click, a manual re-trigger, a manual automation
-run. This is §24.6's asymmetry applied to the freeze — the freeze stops what runs by itself, not what
-a person decided.
+other value: `platform_settings.autonomy_frozen`, the one row (id = 1) of platform-wide settings, with
+the when, who and why of the freeze in force. Admin-only (§13.3). Read on every action with no cache —
+§5.1's "no cache with authority", since a cached "not frozen" would let a merge through after the
+freeze committed — inside a site's own transaction where it has one, and again right before an effect
+that leaves the database; a read that fails is a skip, never a pass. Consulted, and only consulted, at
+the sites where an action starts *without a human asking for it right then* (each a `Site` of
+`internal/domain/autonomy`, registered with `internal/ops`' `ScanAutonomyFreezeSites`, which fails the
+build when a site's read is removed or a new site never registered): the auto-merge worker before
+`RevalidateForAutoMerge`, and again right before the merge; the sentinel-fix merge gate's unattended
+merge (§17.4); the sentinel auto-fix spawn (§17) and the description autofix (§26.2), the two outbox
+kinds whose delivery is itself the action; the automatic re-review enqueue (§24.3 step 4), before its
+GitHub read and again at the insert; the automation cron trigger before it claims a fire, and the
+automation fan-out where an invocation starts (§3.5); the workflow engine's auto-advance (§25); and,
+when Phase 14 ships, the chain enqueue (§38.3) and the train's verdict-gated advance (§39.3). **Never**
+consulted by a human command: a prompt, a plan approval, a manual merge click, a manual re-trigger, a
+workflow step decision, a stop or a resume, a manual automation run (which has no entry point yet) —
+nor by the consumer of a person's owed review request (§24.9), which re-runs that person's request on
+the person's path, nor by the dispatch of a turn already enqueued, which would hold every person's
+prompt queued behind it. This is §24.6's asymmetry applied to the freeze — the freeze stops what runs
+by itself, not what a person decided.
 
 **A frozen action is skipped, not failed, and not lost.** Each site records `skipped` with reason
-`frozen`, distinguishable from `failed` — §38.3's own distinction, made the general rule. Nothing is
-consumed: an auto-merge candidate is still a candidate after the freeze lifts, a debounced re-review
-still fires, a due automation runs on its next tick. This is deliberately a **call-site** check, the
+`frozen`, distinguishable from `failed` — §38.3's own distinction, made the general rule: one on
+`autonomy_freeze_skip_total{site, reason}` (reason `frozen`, or `freeze_unreadable` for a read that
+failed), plus the site's own durable trace — an outbox row's `last_error` with its attempt given back,
+a re-armed debounce, an invocation left unclaimed, the merge gate's audit row — never a failed status,
+a counted attempt, a strike or a dead letter. Nothing is consumed: an auto-merge candidate is still a
+candidate after the freeze lifts, a debounced re-review still fires, for the head pushed last, a due
+automation runs on its next tick. An event-triggered invocation is still recorded while frozen — the
+candidate — and held at fan-out. Pausing the automation defers that backlog, it does not discard it:
+pausing and resuming touch no invocation, so on resume every invocation held meanwhile fans out; a
+supported way to discard an automation's held invocations is a follow-up of the freeze's admin action.
+A cron fire is skipped before its claim, so a freeze never builds up a burst, and after the unfreeze a
+missed occurrence fires at most once, on the first tick within the catch-up window of it — an
+automation that has never fired counts its window from the minute it was created, so a first
+occurrence is caught up like any later one — and once however many replicas run the pump, since a
+fire is claimed by a compare-and-swap on the last fire its tick read. A site with no tick of its own — the held outbox kinds, the re-review's debounce — looks again every
+`AutonomyFreezeRecheckInterval` (a minute), the unfreeze latency. Three existing bounds still apply,
+unchanged by the freeze: `AutoMergeCandidateLookback` (seven days), the cron catch-up window (ten
+minutes), and the sentinel-fix merge gate, evaluated once per close event of the origin pull request. This is deliberately a **call-site** check, the
 opposite of the shadow guard's "query exclusion, never call-site checks" rule (`automerge/worker.go`,
 §30.8), and the difference is the point: shadow-era verdicts must *never* become candidates, whereas
 a frozen candidate must survive the freeze. A query exclusion would be the wrong tool here for the
@@ -7306,7 +7333,16 @@ same reason a call-site check is the wrong tool there.
 
 **What the freeze does not do.** Sever a running turn (§32.8, inherited and not re-solved). Stop a
 human. Pause the outbox — notifications about work already done still deliver, because a freeze that
-also silences the audit trail is a freeze nobody can verify.
+also silences the audit trail is a freeze nobody can verify; only the two kinds that are themselves
+automatic actions are held, claimed in a lane of their own while frozen so no notification waits behind
+them — each lane reading only its own kinds' due rows, through an index of the pending rows by kind and
+due time — and the outbox lag gauge leaves them out while frozen. Hold a row of those kinds born in shadow:
+by §30.8 it can only end in the suppression ledger, so its delivery starts nothing, and holding it
+would keep a person's shadow-to-live activation waiting for it to settle. Stop an action whose
+last read came before the freeze committed: that tail finishes, as a running turn's does — at most one
+merge per candidate, a delivery already started, one re-review turn per session, one cron invocation
+(then held at fan-out), one fan-out per replica, and a turn enqueued before the freeze — each bounded,
+cheaper than a row lock on every action to serialize against a write made a few times a year.
 
 **Surfaces.** The decision inbox (§16) shows one banner while frozen; `ready_to_merge` items remain
 listed, marked as held. Audit rows `autonomy.frozen` and `autonomy.unfrozen`, with actor, on the

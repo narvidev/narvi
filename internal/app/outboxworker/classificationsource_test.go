@@ -6,10 +6,16 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	domainautonomy "github.com/narvidev/narvi/internal/domain/autonomy"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -180,6 +186,148 @@ func TestNewBuilder_RefusesAKindWithoutRepeatability(t *testing.T) {
 	_, err := NewBuilder(nil, nil, map[ports.NotificationKind]ports.Notifier{kind: nil}, platform.DefaultTimeouts(), &platform.ShutdownState{})
 	if err == nil || !strings.Contains(err.Error(), string(kind)) {
 		t.Fatalf("NewBuilder = %v, want a refusal naming %q", err, kind)
+	}
+}
+
+// TestOutboxFreezeTable_EveryKindClassified is the same check for the
+// autonomy freeze table (freeze.go, technical plan §40.2): every kind the
+// port declares says whether its delivery is an automatic action the
+// freeze holds, and the table names no kind the port does not declare.
+func TestOutboxFreezeTable_EveryKindClassified(t *testing.T) {
+	declared := notificationKindsDeclaredInSource(t)
+	if len(declared) < 19 {
+		t.Fatalf("found only %d NotificationKind constants in the source; the parse is broken, not the table", len(declared))
+	}
+
+	declaredValues := make(map[string]bool, len(declared))
+	for _, name := range declared {
+		declaredValues[name.value] = true
+		if _, ok := notificationKindFreeze[ports.NotificationKind(name.value)]; !ok {
+			t.Errorf("%s (%q) is declared in internal/app/ports/notifier.go but has no autonomy freeze classification.\n"+
+				"    Say whether its delivery is itself an automatic action the freeze holds (§40.2),\n"+
+				"    in notificationKindFreeze, and why.",
+				name.constName, name.value)
+		}
+	}
+	for kind := range notificationKindFreeze {
+		if !declaredValues[string(kind)] {
+			t.Errorf("the freeze table carries %q, which no NotificationKind constant declares any more", kind)
+		}
+	}
+}
+
+// TestOutboxFreezeTable_EveryKindsValue pins what the freeze does to every
+// kind, not only its presence: exactly the sentinel auto-fix and the
+// description rewrite hold, each counted under its own site, and every
+// other kind delivers -- §40.2's "notifications about work already done
+// still deliver". Flipping any one value fails here.
+func TestOutboxFreezeTable_EveryKindsValue(t *testing.T) {
+	holds := map[ports.NotificationKind]domainautonomy.Site{
+		ports.NotificationKindSentinelAutoFix:          domainautonomy.SiteSentinelAutoFixSpawn,
+		ports.NotificationKindGitHubDescriptionAutofix: domainautonomy.SiteDescriptionAutofix,
+	}
+	for _, kind := range allKindsForFreezeTest(t) {
+		got := freezeOf(kind)
+		if site, ok := holds[kind]; ok {
+			if got.class != FreezeHolds || got.site != site {
+				t.Errorf("%q = (class %d, site %q), want held under %q: its delivery is itself an automatic action", kind, got.class, got.site, site)
+			}
+			continue
+		}
+		if got.class != FreezeDelivers || got.site != "" {
+			t.Errorf("%q = (class %d, site %q), want delivered with no site: a report of work already done is never held", kind, got.class, got.site)
+		}
+	}
+}
+
+// allKindsForFreezeTest is every kind the port declares, read from its
+// source.
+func allKindsForFreezeTest(t *testing.T) []ports.NotificationKind {
+	t.Helper()
+	var out []ports.NotificationKind
+	for _, d := range notificationKindsDeclaredInSource(t) {
+		out = append(out, ports.NotificationKind(d.value))
+	}
+	return out
+}
+
+// TestOutboxFreezeLanes_EveryDeclaredKindInOneLane pins the two lanes a
+// frozen tick claims (Builder.claimBatch): heldKinds and deliveringKinds
+// are equality lists, so together they must name every kind the port
+// declares, each in exactly one lane -- a declared kind in neither would
+// never be claimed while frozen, and one in both would be claimed twice.
+func TestOutboxFreezeLanes_EveryDeclaredKindInOneLane(t *testing.T) {
+	lane := map[string]string{}
+	for _, l := range []struct {
+		name  string
+		kinds []string
+	}{{"held", heldKinds()}, {"delivering", deliveringKinds()}} {
+		for _, kind := range l.kinds {
+			if prev, ok := lane[kind]; ok {
+				t.Errorf("%q is in the %s lane and the %s lane", kind, prev, l.name)
+			}
+			lane[kind] = l.name
+		}
+	}
+	for _, d := range notificationKindsDeclaredInSource(t) {
+		if _, ok := lane[d.value]; !ok {
+			t.Errorf("%s (%q) is in neither lane: a frozen tick would never claim it", d.constName, d.value)
+		}
+	}
+	if got := heldKinds(); !slices.Equal(got, []string{"github_description_autofix", "sentinel_auto_fix"}) {
+		t.Errorf("heldKinds() = %v, want the two kinds the freeze holds", got)
+	}
+}
+
+// TestNewBuilder_RefusesAnUnclassifiedKind pins that NewBuilder applies
+// classifyFreeze to its finished map: a registered kind with an egress and
+// a repeatability classification but no freeze one is refused, never
+// delivered unconsidered while frozen.
+func TestNewBuilder_RefusesAnUnclassifiedKind(t *testing.T) {
+	const kind = ports.NotificationKindSentinelAutoFix
+	saved, ok := notificationKindFreeze[kind]
+	if !ok {
+		t.Fatalf("%q has no freeze classification to remove", kind)
+	}
+	delete(notificationKindFreeze, kind)
+	t.Cleanup(func() { notificationKindFreeze[kind] = saved })
+
+	_, err := NewBuilder(nil, nil, map[ports.NotificationKind]ports.Notifier{kind: nil}, platform.DefaultTimeouts(), &platform.ShutdownState{})
+	if err == nil || !strings.Contains(err.Error(), string(kind)) || !strings.Contains(err.Error(), "autonomy freeze") {
+		t.Fatalf("NewBuilder = %v, want a refusal naming %q and the freeze", err, kind)
+	}
+}
+
+// TestLagSeconds pins what outbox_lag_seconds reads from one tick's
+// claimed rows: the oldest row's age, zero for none -- and, while the
+// autonomy freeze holds (§40.2), the oldest row of a kind that still
+// delivers, so a held row aging with the freeze never reads as a stuck
+// outbox.
+func TestLagSeconds(t *testing.T) {
+	now := time.Date(2026, 10, 5, 12, 0, 0, 0, time.UTC)
+	row := func(kind ports.NotificationKind, age time.Duration) sqlcgen.Outbox {
+		return sqlcgen.Outbox{Kind: string(kind), CreatedAt: pgtype.Timestamptz{Time: now.Add(-age), Valid: true}}
+	}
+	held := row(ports.NotificationKindSentinelAutoFix, 3*time.Hour)
+	heldDescription := row(ports.NotificationKindGitHubDescriptionAutofix, 2*time.Hour)
+	delivering := row(ports.NotificationKindSlack, 90*time.Second)
+	for _, tc := range []struct {
+		name    string
+		claimed []sqlcgen.Outbox
+		holding bool
+		want    int64
+	}{
+		{name: "nothing claimed", want: 0},
+		{name: "not frozen: the oldest row of any kind", claimed: []sqlcgen.Outbox{delivering, held, heldDescription}, want: 3 * 3600},
+		{name: "frozen: held rows left out", claimed: []sqlcgen.Outbox{delivering, held, heldDescription}, holding: true, want: 90},
+		{name: "frozen, only held rows: zero", claimed: []sqlcgen.Outbox{held, heldDescription}, holding: true, want: 0},
+		{name: "a row created after now reads zero", claimed: []sqlcgen.Outbox{row(ports.NotificationKindSlack, -time.Minute)}, want: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := lagSeconds(tc.claimed, tc.holding, now); got != tc.want {
+				t.Fatalf("lagSeconds = %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 

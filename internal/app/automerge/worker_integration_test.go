@@ -19,6 +19,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/automerge"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/decisioninbox"
 	"github.com/narvidev/narvi/internal/app/ports"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
@@ -130,6 +131,12 @@ type fakeAutoMergeSourceControl struct {
 	// concurrent call is genuinely in flight together by construction, or
 	// the barrier's own timeout fails the test loudly instead of hanging.
 	mergeRendezvous *rendezvousBarrier
+
+	// onGetOpenPR, when set, runs inside every GetOpenPR call, outside
+	// f.mu, before it answers -- a write committed while the worker's live
+	// re-validation is in flight (freeze_integration_test.go commits the
+	// autonomy freeze there).
+	onGetOpenPR func()
 }
 
 var _ ports.SourceControl = (*fakeAutoMergeSourceControl)(nil)
@@ -214,7 +221,12 @@ func (f *fakeAutoMergeSourceControl) GetOpenPR(ctx context.Context, owner, repo 
 	blockUntilCtxDone := f.getOpenPRBlockUntilCtxDone
 	key := owner + "/" + repo + "#" + itoa(number)
 	pr, ok := f.prsByKey[key]
+	onGetOpenPR := f.onGetOpenPR
 	f.mu.Unlock()
+
+	if onGetOpenPR != nil {
+		onGetOpenPR()
+	}
 
 	if err := ctx.Err(); err != nil {
 		f.setGetOpenPRBranch("ctx_err_at_entry")
@@ -460,13 +472,19 @@ type automergeTestRig struct {
 	repoSettings  *narvipg.RepoSettingsStore
 	reviewVerdict appreviewverdict.Deps
 	auditLog      *narvipg.AuditLogStore
+	autonomy      *autonomy.Gate
 }
 
 func newAutomergeTestRig(t *testing.T) *automergeTestRig {
 	t.Helper()
 	pool := newTestPool(t)
+	gate, err := autonomy.NewGate(pool)
+	if err != nil {
+		t.Fatalf("autonomy.NewGate: %v", err)
+	}
 	return &automergeTestRig{
 		pool:         pool,
+		autonomy:     gate,
 		repoSettings: narvipg.NewRepoSettingsStore(pool),
 		reviewVerdict: appreviewverdict.Deps{
 			ReviewVerdicts:       narvipg.NewReviewVerdictStore(pool),
@@ -510,6 +528,7 @@ func (rs *automergeTestRig) deps(sourceControl ports.SourceControl) automerge.De
 		AuditLog:      rs.auditLog,
 		Outbound:      outbound,
 		Timeouts:      platform.DefaultTimeouts(),
+		Autonomy:      rs.autonomy,
 	}
 }
 

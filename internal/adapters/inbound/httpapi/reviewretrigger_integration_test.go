@@ -19,6 +19,7 @@ import (
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
@@ -245,6 +246,36 @@ func TestRetriggerReview_Success(t *testing.T) {
 	}
 	if trigger == nil || *trigger != "button" || requestedBy != maintainer.ID || text == nil || *text != prompt || moves != nil {
 		t.Errorf("turn's request = (%v, %v, %v, %v), want the button's, by the maintainer who clicked, with its own sentence and no move", trigger, requestedBy, text, moves)
+	}
+}
+
+// TestFreeze_ButtonRetriggerInserts pins that the autonomy freeze
+// (technical plan §40.2) never stops a person: while autonomy is frozen, a
+// maintainer's click on the review button inserts the review turn, as the
+// button's own request, exactly as when nothing is frozen.
+func TestFreeze_ButtonRetriggerInserts(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	settings := narvipg.NewPlatformSettingsStore(rig.pool)
+	if _, err := settings.Freeze(ctx, pgtype.UUID{}, "an incident: hold every automatic action"); err != nil {
+		t.Fatalf("freeze autonomy: %v", err)
+	}
+	t.Cleanup(func() { _, _ = settings.Unfreeze(context.Background()) })
+	owner, _ := rig.createAuthenticatedUser(ctx, t)
+	maintainer, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMaintainer)
+	session := rig.createOwnedGitHubReviewSession(ctx, t, owner.ID, "acme/frozen-button-repo", 56)
+
+	var resp restdtos.CreateTurnResponse
+	if status := rig.doJSON(t, http.MethodPost, "/api/sessions/"+session.ID.String()+"/review/retrigger", nil, &resp, token); status != http.StatusCreated {
+		t.Fatalf("status while frozen = %d, want %d", status, http.StatusCreated)
+	}
+	var trigger *string
+	var requestedBy pgtype.UUID
+	if err := rig.pool.QueryRow(ctx, `SELECT request_trigger, requested_by FROM turns WHERE id = $1::uuid`, resp.Id).Scan(&trigger, &requestedBy); err != nil {
+		t.Fatalf("read the inserted turn: %v", err)
+	}
+	if trigger == nil || *trigger != "button" || requestedBy != maintainer.ID {
+		t.Fatalf("turn's request = (%v, %v), want the button's, by the maintainer who clicked", trigger, requestedBy)
 	}
 }
 

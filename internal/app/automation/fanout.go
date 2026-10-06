@@ -13,6 +13,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	domainautomation "github.com/narvidev/narvi/internal/domain/automation"
+	domainautonomy "github.com/narvidev/narvi/internal/domain/autonomy"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -28,16 +29,66 @@ import (
 // invocation's own fan-out failure is isolated: logged, and does NOT abort
 // the rest of the batch, exactly like app/imagebuild.Builder.PumpOnce's
 // own per-row isolation.
+//
+// An invocation's fan-out is where an automation run starts without a
+// person asking for it right then, so it consults the autonomy freeze
+// (§40.2): claimBatch claims nothing while frozen, and each claimed
+// invocation reads the freeze again right before it starts its runs. A
+// freeze that lands after the claim gives back this invocation's claim and
+// every one after it in the batch (releaseFrozen), so each is listed again
+// once the freeze lifts, in created_at order. Nothing is recorded against
+// the automation: no run, no failed run, no strike, no auto-pause.
 func (e *Engine) PumpOnce(ctx context.Context) error {
+	return e.pumpOnce(ctx, nil)
+}
+
+// pumpOnce is PumpOnce, running afterClaim, when set, once the batch's
+// claim has committed and before any invocation fans out -- where a test
+// commits a freeze that lands after the claim (export_test.go).
+func (e *Engine) pumpOnce(ctx context.Context, afterClaim func()) error {
 	claimed, err := e.claimBatch(ctx)
 	if err != nil {
 		return fmt.Errorf("automation: claim batch: %w", err)
 	}
+	if afterClaim != nil {
+		afterClaim()
+	}
 
-	for _, inv := range claimed {
+	for i, inv := range claimed {
+		if skip, reason := e.gate.Check(ctx, domainautonomy.SiteAutomationFanOut, "automation_invocation_id", inv.ID.String(), "automation_id", inv.AutomationID.String()); skip {
+			e.releaseFrozen(ctx, claimed[i:], reason)
+			return nil
+		}
 		e.fanOut(ctx, inv)
 	}
 	return nil
+}
+
+// releaseFrozen gives back the fan-out claims of held, which the autonomy
+// freeze stopped before any of their runs was created (§40.2), recording a
+// skip for each but the first -- whose skip the read that found the freeze
+// recorded -- and one Info line for the batch. Each release is a
+// compare-and-swap on the claim's own fanned_out_at (ReleaseFanOutClaim):
+// an invocation claimed again since, closed, or with a run already is left
+// as it is.
+func (e *Engine) releaseFrozen(ctx context.Context, held []sqlcgen.AutomationInvocation, reason domainautonomy.SkipReason) {
+	logger := platform.Logger(ctx)
+	for i, inv := range held {
+		if i > 0 {
+			e.gate.RecordSkip(ctx, domainautonomy.SiteAutomationFanOut, reason, "automation_invocation_id", inv.ID.String(), "automation_id", inv.AutomationID.String())
+		}
+		released, err := e.invocations.ReleaseFanOutClaim(ctx, inv.ID, inv.FannedOutAt)
+		switch {
+		case err != nil:
+			logger.Error("automation: give back a fan-out claim the autonomy freeze held failed; the invocation stays claimed and unfanned",
+				"error", err, "automation_invocation_id", inv.ID.String())
+		case !released:
+			logger.Warn("automation: fan-out claim the autonomy freeze held was not given back: claimed again, closed, or a run exists",
+				"automation_invocation_id", inv.ID.String())
+		}
+	}
+	logger.Info("automation: invocations held by the autonomy freeze after their claim; their claims are given back, and each fans out once the freeze lifts",
+		"outcome", domainautonomy.OutcomeSkipped, "reason", string(reason), "held", len(held))
 }
 
 // claimBatch runs the ENTIRE claim step inside one transaction:
@@ -64,6 +115,29 @@ func (e *Engine) claimBatch(ctx context.Context) ([]sqlcgen.AutomationInvocation
 	due, err := txInvocations.ListDueForFanOut(ctx, fanOutBatchSize)
 	if err != nil {
 		return nil, fmt.Errorf("list due invocations: %w", err)
+	}
+	if len(due) == 0 {
+		return nil, nil
+	}
+
+	// §40.2: read in this transaction, before anything is claimed -- a
+	// call-site check, never a query exclusion, so every due invocation is
+	// seen and counted as held. While frozen nothing is claimed: the
+	// transaction rolls back, and every one stays due for the first tick
+	// after the freeze lifts. A read that fails holds them too.
+	frozen, err := e.gate.FrozenTx(ctx, tx)
+	if err != nil || frozen {
+		reason := domainautonomy.SkipFrozen
+		if err != nil {
+			reason = domainautonomy.SkipFreezeUnreadable
+			platform.Logger(ctx).Warn("automation: the autonomy freeze could not be read; nothing is fanned out this tick", "error", err)
+		}
+		for _, row := range due {
+			e.gate.RecordSkip(ctx, domainautonomy.SiteAutomationFanOut, reason, "automation_invocation_id", row.ID.String(), "automation_id", row.AutomationID.String())
+		}
+		platform.Logger(ctx).Info("automation: due invocations held by the autonomy freeze this tick; none was claimed",
+			"outcome", domainautonomy.OutcomeSkipped, "reason", string(reason), "held", len(due))
+		return nil, nil
 	}
 
 	claimed := make([]sqlcgen.AutomationInvocation, 0, len(due))
