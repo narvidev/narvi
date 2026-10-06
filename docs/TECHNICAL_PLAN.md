@@ -6730,20 +6730,31 @@ plane's assumption about its provider, held at or below `ProviderHardCap` (§5.4
 `docs/PRODUCTION_CHECKLIST.md` (item 14) asserts the provider gives every sandbox. Estimate first,
 exact value when it arrives — because a restored sandbox runs whatever `sandbox-agent` its snapshot
 baked in, possibly for weeks, so no part of this may depend on an agent-side change having shipped.
-The exact value is `lifetimeRemainingSeconds`: the whole seconds, counted when the frame is written
-and never negative, until the instant the provider stated to the sandbox in `NARVI_SANDBOX_DEADLINE`
-(RFC 3339). It is relative, so the control plane's clock, not the sandbox's, places it, and neither
-frame is buffered or replayed, so it is never stale. The agent reports nothing when no deadline was
-stated, and never works one out itself: it starts after its provider created the sandbox, so a
+The exact value is `lifetimeRemainingSeconds`: the whole seconds, never negative, from the instant
+the frame is written to the instant the provider stated to the sandbox in `NARVI_SANDBOX_DEADLINE`
+(RFC 3339). Two clocks place it. The agent counts it on the sandbox's own clock
+(`wsbridge.Bridge`), and the control plane adds it to the database's `now()` when the transaction
+that stores the frame starts (`TightenSandboxLifetimeDeadline`), so the control plane's clock
+cancels out and the stored deadline lands at the provider's plus two terms: the sandbox clock's lag
+behind the provider's clock (a slow sandbox clock reports more seconds than are left; a fast one,
+fewer), and the frame's time from its write to that transaction (always later). Neither frame is
+buffered or replayed, so the second term is one live connection's delivery and the actor's queue,
+seconds at most; the first is whatever the sandbox's clock is off by. That error has a bound only on a
+gen with its own estimate, whose deadline the report can never move past the estimate. A live gen
+with no estimate takes the report as it comes, error included; a provider that sets the variable
+must keep the sandbox's clock synchronised with its own. The agent reports nothing when no deadline
+was stated, and never works one out itself: it starts after its provider created the sandbox, so a
 deadline counted from its own start would be later than the provider's. No provider sets the
 variable today — the same stated gap as `NARVI_IMAGE_DIGEST` — so every agent reports nothing and
-the estimate stands for every gen. The control plane reads the report leniently, never through the
-generated decoder (a `ready` that fails its decode loses the gen's `promptReceipt` and
-`maxFrameBytes`), clamped to whole seconds in [0, `ProviderHardCap`]; a report that would not bring
-the deadline earlier writes nothing, so a steady heartbeat costs no row version, and a report of a
-gen that is not live changes nothing. A live gen with no deadline of its own — one the previous
-binary spawned during a rolling deploy — takes the report as its deadline, recorded against it,
-with `lifetime_seconds` left empty since no kind's lifetime was stamped for it.
+the estimate stands for every gen. The control plane reads the report itself
+(`reportedLifetimeRemaining`, `internal/app/sessionactor/lifetimereport.go`), leniently, clamped to
+whole seconds in [0, `ProviderHardCap`], and decodes the rest of the frame without the key
+(`decodeReady`, `framekey.go`), so no value of it costs a `ready` its `promptReceipt` or
+`maxFrameBytes`. A report that would not bring the deadline earlier writes nothing, so a steady
+heartbeat costs no row version, and a report of a gen that is not live changes nothing. A live gen
+with no deadline of its own — one the previous binary spawned during a rolling deploy — takes the
+report as its deadline, recorded against it, with `lifetime_seconds` left empty since no kind's
+lifetime was stamped for it.
 The per-session-type lifetime lives in one place, `Timeouts.SandboxLifetimeFor` in
 `platform/timeouts.go` (kinds `default` and `review`, the latter a pull request's review session),
 and the rotation threshold follows it. Changing a session type's lifetime is a change to its field in
@@ -6839,7 +6850,10 @@ The minting `sandbox-agent` states it on its `snapshot_ready` (`provenance`, §6
 `runtimeVersion`, the agent runtime version it discovered when it spawned the runtime. Both binaries
 are in the snapshot, so a restore of it runs exactly them. Neither is `agentVersion`, which reads
 `dev` on every agent built without a stamped version, nor the image digest, nor anything the control
-plane holds — its own protocol, or the runtime version it would configure today.
+plane holds — its own protocol, or the runtime version it would configure today. The control
+plane, which does not record it yet, decodes `snapshot_ready` without the key
+(`decodeSnapshotReady`, `internal/app/sessionactor/framekey.go`), so no value of it costs the
+snapshot.
 
 Three states, treated differently and never collapsed: **compatible**, restored normally;
 **incompatible**, refused with a reason the operator can see, falling back to a fresh lineage under
