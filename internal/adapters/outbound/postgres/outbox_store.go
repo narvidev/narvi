@@ -77,16 +77,11 @@ func (s *OutboxStore) ListDuePending(ctx context.Context, limit int32) ([]sqlcge
 	return s.q.ListDuePendingOutboxEntries(ctx, limit)
 }
 
-// ListDuePendingExcludingKinds is ListDuePending without the rows of
-// kinds -- the delivering lane of a tick while the autonomy freeze holds
-// those kinds (technical plan §40.2). Same transaction rule.
-func (s *OutboxStore) ListDuePendingExcludingKinds(ctx context.Context, limit int32, kinds []string) ([]sqlcgen.Outbox, error) {
-	return s.q.ListDuePendingOutboxEntriesExcludingKinds(ctx, sqlcgen.ListDuePendingOutboxEntriesExcludingKindsParams{Kinds: kinds, MaxRows: limit})
-}
-
-// ListDuePendingOfKinds is ListDuePending restricted to the rows of kinds
-// -- that tick's other lane, so each held row is still claimed and its
-// hold decided at the delivery's call site. Same transaction rule.
+// ListDuePendingOfKinds is ListDuePending restricted to the rows of kinds:
+// one lane of a tick while the autonomy freeze holds some kinds (technical
+// plan §40.2), so each held row is still claimed and its hold decided at
+// the delivery's call site, and no notification waits behind held rows.
+// Same transaction rule.
 func (s *OutboxStore) ListDuePendingOfKinds(ctx context.Context, limit int32, kinds []string) ([]sqlcgen.Outbox, error) {
 	return s.q.ListDuePendingOutboxEntriesOfKinds(ctx, sqlcgen.ListDuePendingOutboxEntriesOfKindsParams{Kinds: kinds, MaxRows: limit})
 }

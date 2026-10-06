@@ -1,0 +1,16 @@
+-- Reverses the up migration of the same name. Without the index each lane
+-- of a frozen pump tick (ListDuePendingOutboxEntriesOfKinds) scans the
+-- whole outbox again; nothing a binary without this migration runs needs
+-- it, and no statement's result changes.
+--
+-- Drops the index without blocking writes to outbox. A single statement,
+-- so golang-migrate sends it on its own, outside any transaction block,
+-- which CONCURRENTLY requires. Unlike a concurrent build (see the up
+-- migration), a concurrent drop waits only for transactions holding a
+-- lock on outbox, never for older snapshots, so a second migrator waiting
+-- on golang-migrate's advisory lock cannot deadlock it. Pods of a binary
+-- that carries this migration keep working meanwhile -- their statements
+-- name no index, only the lanes' plans change -- but one that restarts
+-- applies it again at boot, so scale them away before deploying the older
+-- binary.
+DROP INDEX CONCURRENTLY IF EXISTS outbox_pending_kind_due_idx;

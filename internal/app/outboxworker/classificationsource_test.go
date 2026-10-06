@@ -6,6 +6,7 @@ import (
 	"go/token"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -248,6 +249,34 @@ func allKindsForFreezeTest(t *testing.T) []ports.NotificationKind {
 		out = append(out, ports.NotificationKind(d.value))
 	}
 	return out
+}
+
+// TestOutboxFreezeLanes_EveryDeclaredKindInOneLane pins the two lanes a
+// frozen tick claims (Builder.claimBatch): heldKinds and deliveringKinds
+// are equality lists, so together they must name every kind the port
+// declares, each in exactly one lane -- a declared kind in neither would
+// never be claimed while frozen, and one in both would be claimed twice.
+func TestOutboxFreezeLanes_EveryDeclaredKindInOneLane(t *testing.T) {
+	lane := map[string]string{}
+	for _, l := range []struct {
+		name  string
+		kinds []string
+	}{{"held", heldKinds()}, {"delivering", deliveringKinds()}} {
+		for _, kind := range l.kinds {
+			if prev, ok := lane[kind]; ok {
+				t.Errorf("%q is in the %s lane and the %s lane", kind, prev, l.name)
+			}
+			lane[kind] = l.name
+		}
+	}
+	for _, d := range notificationKindsDeclaredInSource(t) {
+		if _, ok := lane[d.value]; !ok {
+			t.Errorf("%s (%q) is in neither lane: a frozen tick would never claim it", d.constName, d.value)
+		}
+	}
+	if got := heldKinds(); !slices.Equal(got, []string{"github_description_autofix", "sentinel_auto_fix"}) {
+		t.Errorf("heldKinds() = %v, want the two kinds the freeze holds", got)
+	}
 }
 
 // TestNewBuilder_RefusesAnUnclassifiedKind pins that NewBuilder applies

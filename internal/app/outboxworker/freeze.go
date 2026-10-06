@@ -92,9 +92,21 @@ var notificationKindFreeze = map[ports.NotificationKind]freezeEntry{
 // kinds a tick claims in a lane of their own while autonomy is frozen
 // (Builder.claimBatch).
 func heldKinds() []string {
+	return kindsOf(FreezeHolds)
+}
+
+// deliveringKinds returns, sorted, every kind the table marks
+// FreezeDelivers: the other lane of that tick. It is the complement of
+// heldKinds over every kind the port declares, written out so the lane is
+// an equality list the outbox's index can seek on.
+func deliveringKinds() []string {
+	return kindsOf(FreezeDelivers)
+}
+
+func kindsOf(class FreezeClass) []string {
 	var kinds []string
 	for kind, entry := range notificationKindFreeze {
-		if entry.class == FreezeHolds {
+		if entry.class == class {
 			kinds = append(kinds, string(kind))
 		}
 	}

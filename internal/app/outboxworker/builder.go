@@ -368,7 +368,12 @@ func newOutcomeContext(worker context.Context, bound time.Duration) (context.Con
 // freeze does not hold, then the kinds it holds. Scheduling only: every due
 // row of a held kind is still claimed in its lane and decided at its own
 // attempt, so no row is passed over unrecorded, and a notification never
-// waits behind rows the freeze is holding.
+// waits behind rows the freeze is holding. Each lane names its kinds
+// (deliveringKinds, heldKinds), so it reads only its own due rows through
+// the outbox's (kind, next_attempt_at) index. A row of a kind this binary
+// does not declare -- one a newer binary enqueued -- is in neither lane, so
+// it waits while the freeze holds; it is one this binary could not deliver
+// anyway, and the single batch claims it again once the freeze lifts.
 //
 // The single now := time.Now() below is shared across every row in this
 // batch (up to pumpBatchSize), so every claimed row's own next_attempt_at
@@ -403,12 +408,11 @@ func (b *Builder) claimBatch(ctx context.Context, holding bool) ([]sqlcgen.Outbo
 			return nil, fmt.Errorf("list due outbox entries: %w", err)
 		}
 	} else {
-		kinds := heldKinds()
-		delivering, err := txStore.ListDuePendingExcludingKinds(ctx, pumpBatchSize, kinds)
+		delivering, err := txStore.ListDuePendingOfKinds(ctx, pumpBatchSize, deliveringKinds())
 		if err != nil {
 			return nil, fmt.Errorf("list due outbox entries of the delivering kinds: %w", err)
 		}
-		held, err := txStore.ListDuePendingOfKinds(ctx, pumpBatchSize, kinds)
+		held, err := txStore.ListDuePendingOfKinds(ctx, pumpBatchSize, heldKinds())
 		if err != nil {
 			return nil, fmt.Errorf("list due outbox entries of the held kinds: %w", err)
 		}

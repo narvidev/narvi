@@ -58,28 +58,24 @@ ORDER BY next_attempt_at
 LIMIT $1
 FOR UPDATE SKIP LOCKED;
 
--- name: ListDuePendingOutboxEntriesExcludingKinds :many
--- ListDuePendingOutboxEntries without the rows of kinds: the delivering
--- lane of a pump tick while the autonomy freeze holds those kinds
--- (technical plan §40.2, outboxworker's claimBatch). A row the freeze
+-- name: ListDuePendingOutboxEntriesOfKinds :many
+-- ListDuePendingOutboxEntries restricted to the rows of kinds: one lane of
+-- a pump tick while the autonomy freeze holds some kinds (technical plan
+-- §40.2, outboxworker's claimBatch), which runs it once for the kinds the
+-- freeze holds and once for every other kind it knows. A row the freeze
 -- holds is due again every recheck interval; in the one oldest-due-first
 -- batch, enough of them would take every slot and keep the notifications
--- behind them waiting. Same order, lock and SKIP LOCKED as its sibling.
+-- behind them waiting. Each row of a held kind is still claimed in its own
+-- lane and its hold decided and recorded at the delivery's call site
+-- (Builder.attempt), never skipped by this query.
+--
+-- The kinds are an equality list, never an exclusion, so the lane seeks
+-- outbox_pending_kind_due_idx (migrations/000164) on (kind, next_attempt_at)
+-- and reads the due pending rows of its own kinds and no others, whatever
+-- the table holds -- delivered rows are never deleted. Same order, lock
+-- and SKIP LOCKED as its sibling.
 SELECT * FROM outbox
-WHERE status = 'pending' AND next_attempt_at <= now()
-  AND kind <> ALL(sqlc.arg('kinds')::text[])
-ORDER BY next_attempt_at
-LIMIT sqlc.arg('max_rows')
-FOR UPDATE SKIP LOCKED;
-
--- name: ListDuePendingOutboxEntriesOfKinds :many
--- The other lane of that tick: only the rows of kinds, in a batch of
--- their own, so each is still claimed and its hold decided and recorded
--- at the delivery's own call site (Builder.attempt), never skipped by
--- this query. Same order, lock and SKIP LOCKED as its sibling.
-SELECT * FROM outbox
-WHERE status = 'pending' AND next_attempt_at <= now()
-  AND kind = ANY(sqlc.arg('kinds')::text[])
+WHERE status = 'pending' AND kind = ANY(sqlc.arg('kinds')::text[]) AND next_attempt_at <= now()
 ORDER BY next_attempt_at
 LIMIT sqlc.arg('max_rows')
 FOR UPDATE SKIP LOCKED;
