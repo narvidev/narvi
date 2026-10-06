@@ -61,6 +61,18 @@ func writeError(w http.ResponseWriter, status int, message string) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"error": message})
 }
 
+// writeErrorWithReason writes {"error": message, "reason": reason} at
+// status: writeError's body with a machine-readable reason beside the text,
+// for a refusal a client must tell apart from every other of the same
+// status -- the session guard's (technical plan §40.1). The key is not in
+// the REST schema: an error body is outside the contracts' compatibility
+// policy, like the status code itself.
+func writeErrorWithReason(w http.ResponseWriter, status int, message, reason string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"error": message, "reason": reason})
+}
+
 // writeJSON writes v as a JSON body at status.
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")

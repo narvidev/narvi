@@ -200,7 +200,7 @@ func OnTurnCompleted(ctx context.Context, deps Deps, sessionRow sqlcgen.Session,
 		// §25.9's own addition (§25.9): notify a human that this step
 		// now needs a decision -- best-effort, logged, never allowed to
 		// undo the awaiting_decision transition that just committed.
-		if err := enqueueWorkflowNotice(ctx, deps, sessionRow, awaitingDecisionNoticeText(runRow.ID, markedRun.ID)); err != nil {
+		if _, err := enqueueWorkflowNotice(ctx, deps, sessionRow, awaitingDecisionNoticeText(runRow.ID, markedRun.ID)); err != nil {
 			logger.Error("workflowengine: enqueue awaiting-decision notice failed", "step_run_id", stepRun.ID.String(), "error", err)
 		}
 		return

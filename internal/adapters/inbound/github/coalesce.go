@@ -18,6 +18,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 	"github.com/narvidev/narvi/internal/domain/reposource"
@@ -114,12 +115,17 @@ var ErrRepoEntitlementRevoked = fmt.Errorf("%w: revoked by an administrator", Er
 // classification entirely, so existing tests/wiring that don't care about
 // this Step keep working unchanged.
 type SessionCoalescer struct {
-	Pool             *pgxpool.Pool
-	PRSessions       *postgres.GitHubPRSessionStore
-	Sessions         *postgres.SessionStore
-	Turns            *postgres.TurnStore
-	Environments     *postgres.EnvironmentStore
-	Registry         *sessionactor.Registry
+	Pool         *pgxpool.Pool
+	PRSessions   *postgres.GitHubPRSessionStore
+	Sessions     *postgres.SessionStore
+	Turns        *postgres.TurnStore
+	Environments *postgres.EnvironmentStore
+	Registry     *sessionactor.Registry
+	// SessionGuard is the session guard (technical plan §40.1,
+	// internal/app/turnguard): every turn this adapter asks the control
+	// plane to create, and every plan approval, passes it, and a session
+	// that has spent its cap is refused with an honest reply.
+	SessionGuard     *turnguard.Guard
 	IntentClassifier *intentclassifier.Service
 
 	// Plans (a follow-up fix, §8.1) is threaded through to the
@@ -665,7 +671,7 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 		// should ever move the narvi/review check -- see turns.
 		// is_review_attempt's own migration doc comment for the full
 		// "why" an ordinary follow-up must NOT set this.
-		createdTurn, err := httpapi.CreateTurnForBot(ctx, c.Pool, c.Sessions, c.Turns, c.Plans, c.IntentClassifier, c.AuditLog, c.Registry, existing, prompt, triageModelID, req.PlanMode, false, actor, reviewHeadSHAPtr, &classifyText, triageEffort, reviewDepthPtr, triageRecordJSON, knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON, isLabelRetrigger, requestTrigger, requestText)
+		createdTurn, err := httpapi.CreateTurnForBot(ctx, c.Pool, c.Sessions, c.Turns, c.Plans, c.IntentClassifier, c.AuditLog, c.Registry, c.SessionGuard, existing, prompt, triageModelID, req.PlanMode, false, actor, reviewHeadSHAPtr, &classifyText, triageEffort, reviewDepthPtr, triageRecordJSON, knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON, isLabelRetrigger, requestTrigger, requestText)
 		if err != nil {
 			// mention_count untouched here too (audit fix): this is the
 			// OTHER denial route the increment used to run ahead of --

@@ -31,6 +31,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/releasereview"
 	"github.com/narvidev/narvi/internal/app/sessionactivity"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -127,6 +128,7 @@ func TestSessionStatus_ReleaseManifestCheckIsScheduledUntilItsCompositionTurnExi
 				CompositionDiffFetcher: &fakeReviewContextFetcher{pr: githubapi.PullRequest{HeadSHA: "sha-release-head", BaseRef: "main"}, diff: "+ the release's aggregate diff"},
 				CompositionTurns:       narvipg.NewLockedTurnCreator(pool),
 				CompositionDispatch:    noopCompositionDispatch{},
+				CompositionGuard:       turnguard.New(pool, nil, false),
 				Timeouts:               platform.DefaultTimeouts(),
 			}, platform.MustNewGitHubOutboundConfig("gho_bottoken"), platform.DefaultTimeouts())
 			if workerErr != nil {

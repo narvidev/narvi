@@ -38,6 +38,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/knowledge"
@@ -117,7 +118,7 @@ const manualRetriggerPromptText = "Manual re-review requested via the web review
 // internal/adapters/inbound/github's own identical Config.ArchDecisions/
 // KnowledgeRanker fields (handler.go) in shape -- see this function's own
 // FetchPriorArchDecisions call site for the full "why".
-func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, prSessions *postgres.GitHubPRSessionStore, diffFetcher reviewcontext.Fetcher, reviewFindings reviewcontext.FindingsFetcher, falsePositivePatterns reviewcontext.FalsePositivePatternsFetcher, archDecisions reviewcontext.ArchDecisionsFetcher, knowledgeRanker ports.KnowledgeRanker, outbound *platform.GitHubOutboundConfig, timeouts platform.Timeouts, reviewTriageDeps appreviewtriage.Deps, reviewModelDeep string) http.HandlerFunc {
+func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, guard *turnguard.Guard, prSessions *postgres.GitHubPRSessionStore, diffFetcher reviewcontext.Fetcher, reviewFindings reviewcontext.FindingsFetcher, falsePositivePatterns reviewcontext.FalsePositivePatternsFetcher, archDecisions reviewcontext.ArchDecisionsFetcher, knowledgeRanker ports.KnowledgeRanker, outbound *platform.GitHubOutboundConfig, timeouts platform.Timeouts, reviewTriageDeps appreviewtriage.Deps, reviewModelDeep string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
 		if !ok {
@@ -460,10 +461,10 @@ func RetriggerReview(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns 
 		// composed from that sentence again
 		// (internal/app/sessionactor's owedreviewrequest.go).
 		requestTrigger, requestText := turn.RequestTriggerButton, manualRetriggerPromptText
-		created, _, cerr := CreateTurnCore(ctx, pool, sessions, turns, plans, nil, auditLog, registry, sessionID, prompt, triageModelID, false, false, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, Effort: triageEffort, ReviewDepth: &reviewDepthStr, ReviewDepthDecision: triageRecordJSON, ReviewKnowledgeMode: &knowledgeMode, ReviewKnowledgeDecision: knowledgeDecisionJSON, ReviewVerdictContext: reviewVerdictContextJSON, IsReviewAttempt: true, RequestTrigger: &requestTrigger, RequestText: &requestText})
+		created, _, cerr := CreateTurnCore(ctx, pool, sessions, turns, plans, nil, auditLog, registry, guard, sessionID, prompt, triageModelID, false, false, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, Effort: triageEffort, ReviewDepth: &reviewDepthStr, ReviewDepthDecision: triageRecordJSON, ReviewKnowledgeMode: &knowledgeMode, ReviewKnowledgeDecision: knowledgeDecisionJSON, ReviewVerdictContext: reviewVerdictContextJSON, IsReviewAttempt: true, RequestTrigger: &requestTrigger, RequestText: &requestText})
 		if cerr != nil {
 			logger.Error("httpapi: retrigger review (create turn) failed", "status", cerr.Status, "message", cerr.Message)
-			writeError(w, cerr.Status, cerr.Message)
+			writeCreateTurnError(w, cerr)
 			return
 		}
 

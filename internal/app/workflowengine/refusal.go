@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/domain/workflow"
 	"github.com/narvidev/narvi/internal/platform"
@@ -43,7 +44,25 @@ import (
 // Fail-open like the rest of this package (doc.go): a store failure is
 // logged and the run left where it is, never allowed to undo the turn's
 // own terminal write. Left there, it is still not re-queued.
-func OnTurnRefused(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, turnID pgtype.UUID, reason string) {
+//
+// notified reports whether this call enqueued the run's one escalation
+// notice, which names reason: a caller that would tell the same refusal
+// through a notice of its own -- the session guard ending queued turns at
+// dispatch, technical plan §40.1 -- then sends none.
+func OnTurnRefused(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, turnID pgtype.UUID, reason string) (notified bool) {
+	return onTurnRefused(ctx, deps, sessionRow, turnID, func(runID pgtype.UUID) string { return refusalNoticeText(runID, reason) })
+}
+
+// OnTurnRefusedBySessionGuard is OnTurnRefused for a queued attempt the
+// session guard ended at dispatch (technical plan §40.1): the run escalates
+// the same way, and its one notice is the guard's own escalation notice
+// (sessionGuardNoticeText), the one an advance the guard refused sends too,
+// so a run the cap stopped is told the same whichever check stopped it.
+func OnTurnRefusedBySessionGuard(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, turnID pgtype.UUID, refusal sessionguard.Refusal) (notified bool) {
+	return onTurnRefused(ctx, deps, sessionRow, turnID, func(runID pgtype.UUID) string { return sessionGuardNoticeText(runID, refusal) })
+}
+
+func onTurnRefused(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, turnID pgtype.UUID, notice func(runID pgtype.UUID) string) (notified bool) {
 	logger := platform.Logger(ctx)
 	workflows := deps.Workflows
 
@@ -52,33 +71,33 @@ func OnTurnRefused(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, t
 		if !errors.Is(err, pgx.ErrNoRows) {
 			logger.Warn("workflowengine: get live step run by turn id failed", "turn_id", turnID.String(), "error", err)
 		}
-		return
+		return false
 	}
 	runRow, err := workflows.GetRun(ctx, stepRun.WorkflowRunID)
 	if err != nil {
 		logger.Error("workflowengine: get workflow run failed", "run_id", stepRun.WorkflowRunID.String(), "error", err)
-		return
+		return false
 	}
 	if sessionRow.StopRequestedAt.Valid {
 		cancelStoppedRun(ctx, workflows, stepRun, runRow, turn.TriggerAbandon)
-		return
+		return false
 	}
 
 	def, err := LoadDefinition(ctx, workflows, runRow.WorkflowDefinitionID)
 	if err != nil {
 		logger.Error("workflowengine: load definition for refused turn failed", "run_id", runRow.ID.String(), "error", err)
-		return
+		return false
 	}
 	stepID := workflow.ID(stepRun.StepDefinitionID.String())
 	next, err := workflow.NextStepAfterRefusal(def, stepID)
 	if err != nil {
 		logger.Error("workflowengine: next step after refusal failed", "run_id", runRow.ID.String(), "step_id", string(stepID), "error", err)
-		return
+		return false
 	}
 
 	if _, err := workflows.FinishStepRun(ctx, stepRun.ID, stepRunTerminalStatus(turn.TriggerAbandon), string(implicitOutcome(turn.TriggerAbandon))); err != nil {
 		logger.Error("workflowengine: finish refused step run failed", "step_run_id", stepRun.ID.String(), "error", err)
-		return
+		return false
 	}
 
 	if next.Kind != workflow.NextEscalate {
@@ -87,14 +106,16 @@ func OnTurnRefused(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, t
 		// advancing a refused run.
 		logger.Error("workflowengine: refusal verdict is not an escalation; leaving run as-is",
 			"run_id", runRow.ID.String(), "kind", next.Kind.String())
-		return
+		return false
 	}
-	if _, err := escalateRunWithNotice(ctx, deps, runRow, sessionRow, refusalNoticeText(runRow.ID, reason)); err != nil {
+	_, notified, err = escalateRunNotified(ctx, deps, runRow, sessionRow, notice(runRow.ID))
+	if err != nil {
 		logger.Error("workflowengine: escalate refused workflow run failed", "run_id", runRow.ID.String(), "error", err)
-		return
+		return false
 	}
 	logger.Info("workflowengine: workflow run escalated: its step was refused before it ran; no edge followed",
 		"run_id", runRow.ID.String(), "step_run_id", stepRun.ID.String())
+	return notified
 }
 
 // refusalNoticeText renders the one-time notice a refused run's escalation
@@ -102,4 +123,19 @@ func OnTurnRefused(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, t
 // rather than escalationNoticeText's retry-loop or unrouted-outcome causes.
 func refusalNoticeText(runID pgtype.UUID, reason string) string {
 	return fmt.Sprintf("This workflow run (%s) now needs your review: its step was refused before it ran (%s). No further automatic action will be taken until the configuration changes.", runID.String(), reason)
+}
+
+// sessionGuardNoticeText renders the one-time notice of a workflow run the
+// session guard stopped (technical plan §40.1) -- an advance it refused, or
+// a queued attempt it ended at dispatch -- server-rendered, never re-parsed
+// (§5.2). Like every other escalation notice it names the run and says it
+// now needs review; it says why -- the session reached its spend cap, the
+// guard's own text -- and that the run will not resume on its own: a run in
+// needs_review never runs again, so raising the cap re-admits the session's
+// next turn but does not restart the run, and a person sends the turn that
+// goes on.
+func sessionGuardNoticeText(runID pgtype.UUID, r sessionguard.Refusal) string {
+	return fmt.Sprintf("This workflow run (%s) now needs your review: the session reached its spend cap, so the run's next step was not started. "+
+		"The run will not resume on its own, even once the cap is raised: after an administrator raises the cap, send the session a new turn to go on. %s",
+		runID.String(), sessionguard.Text(r))
 }

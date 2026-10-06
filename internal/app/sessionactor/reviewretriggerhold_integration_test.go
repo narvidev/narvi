@@ -26,6 +26,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/providercredential"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/rollout"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -678,7 +679,7 @@ func (f *insertingFetcher) insertPersonsTurn(ctx context.Context) error {
 	prompt := "@narvi-bot why is this flagged?"
 	if _, err := narvipg.NewTurnStore(f.pool).WithTx(tx).CreateAndArmDispatch(ctx, sqlcgen.CreateTurnParams{
 		SessionID: f.sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &prompt,
-	}); err != nil {
+	}, sessionguard.AdmitNewSession(f.sessionID.Bytes)); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)

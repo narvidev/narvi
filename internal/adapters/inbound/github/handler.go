@@ -11,6 +11,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/automation"
 	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/ports"
@@ -18,12 +19,14 @@ import (
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/knowledge"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	domainreviewverdict "github.com/narvidev/narvi/internal/domain/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -1008,7 +1011,12 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 			return
 		}
 
-		session, turn, isNew, err := coalescer.CreateOrJoin(ctx, m.RepoFullName, m.PRNumber, req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
+		// Answered on this pull request (technical plan §40.1): a refusal of
+		// the review session is told here (sessionguardreply.go), and the
+		// crossing's notice, held meanwhile, is withdrawn once that reply
+		// lands -- delivered instead if it does not.
+		answerCtx := turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceGithub)
+		session, turn, isNew, err := coalescer.CreateOrJoin(answerCtx, m.RepoFullName, m.PRNumber, req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
 		if err != nil {
 			if errors.Is(err, ErrActorNotAuthorized) {
 				// ErrActorNotAuthorized fires for TWO distinct reasons
@@ -1102,6 +1110,24 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 				// above; this one is kept for the same defensive-symmetry
 				// reason ErrRolloutNotEnrolled's own check is.
 				logger.Info("github: mention refused: repo not entitled", "repo", m.RepoFullName, "pr_number", m.PRNumber)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if refusal, ok := sessionguard.AsRefusal(err); ok {
+				// Technical plan §40.1: the review session has spent its
+				// cap, so the REUSE path's own httpapi.CreateTurnForBot call
+				// (coalesce.go) was refused -- a deterministic state that
+				// lasts until an administrator raises the cap, so, as for
+				// an awaiting plan below, 200 without releasing the
+				// delivery claim (a redelivery would only meet the same
+				// refusal), and an honest reply on the pull request
+				// (sessionguardreply.go). Once that reply has landed, the
+				// crossing's held notice is withdrawn (turnguard.Answered);
+				// a reply that failed leaves it to be delivered.
+				logger.Info("github: mention refused by the session guard", "repo", m.RepoFullName, "pr_number", m.PRNumber, "reason", string(refusal.Reason))
+				if postSessionGuardReply(ctx, logger, cfg.Comments, botToken, m.RepoFullName, m.PRNumber, refusal, cfg.Timeouts.SessionGuardReplyTimeout) {
+					turnguard.Answered(answerCtx)
+				}
 				w.WriteHeader(http.StatusOK)
 				return
 			}

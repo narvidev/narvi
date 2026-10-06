@@ -7,13 +7,17 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/releasereview"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -112,13 +116,49 @@ type fakeCompositionTurnInserter struct {
 	lastParams sqlcgen.CreateTurnParams
 }
 
-func (f *fakeCompositionTurnInserter) CreateLockedTurn(_ context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error) {
+// CreateLockedTurn runs admit as postgres.LockedTurnCreator does, before
+// the insert -- with no transaction, which the fake guard never reads --
+// and returns its error, a refusal included, writing nothing.
+func (f *fakeCompositionTurnInserter) CreateLockedTurn(ctx context.Context, arg sqlcgen.CreateTurnParams, admit narvipg.TurnAdmit) (sqlcgen.Turn, error) {
 	f.calls++
 	f.lastParams = arg
+	if admit == nil {
+		return sqlcgen.Turn{}, narvipg.ErrTurnNotAdmitted
+	}
+	admission, err := admit(ctx, nil)
+	if err != nil {
+		return sqlcgen.Turn{}, err
+	}
+	if !admission.Admits(arg.SessionID.Bytes) {
+		return sqlcgen.Turn{}, narvipg.ErrTurnNotAdmitted
+	}
 	if f.err != nil {
 		return sqlcgen.Turn{}, f.err
 	}
 	return sqlcgen.Turn{ID: arg.SessionID}, nil
+}
+
+// fakeCompositionGuard is a test-only releasereview.CompositionGuard: it
+// admits every turn, unless refusal is set, which it returns instead, and
+// records each refusal it is asked to record.
+type fakeCompositionGuard struct {
+	refusal  *sessionguard.Refusal
+	stages   []turnguard.Stage
+	recorded []*sessionguard.Refusal
+}
+
+func (g *fakeCompositionGuard) Admitter(sessionID pgtype.UUID, _ sessionguard.Origin, stage turnguard.Stage) narvipg.TurnAdmit {
+	g.stages = append(g.stages, stage)
+	return func(context.Context, pgx.Tx) (sessionguard.Admission, error) {
+		if g.refusal != nil {
+			return sessionguard.Admission{}, g.refusal
+		}
+		return sessionguard.AdmitNewSession(sessionID.Bytes), nil
+	}
+}
+
+func (g *fakeCompositionGuard) RecordRefusal(_ context.Context, _ pgtype.UUID, r *sessionguard.Refusal) {
+	g.recorded = append(g.recorded, r)
 }
 
 // fakeCompositionDispatcher is a test-only releasereview.CompositionDispatcher.
@@ -146,6 +186,7 @@ func fullCompositionDeps(lister *fakeMergedPRLister, outbox *fakeOutboxEnqueuer,
 		CompositionDiffFetcher: diffFetcher,
 		CompositionTurns:       turns,
 		CompositionDispatch:    dispatch,
+		CompositionGuard:       &fakeCompositionGuard{},
 		Timeouts:               platform.DefaultTimeouts(),
 	}
 }
@@ -317,6 +358,7 @@ func TestRun_TruncatedCoverageAloneTriggersCompositionDispatch(t *testing.T) {
 		CompositionDiffFetcher: diffFetcher,
 		CompositionTurns:       turns,
 		CompositionDispatch:    dispatch,
+		CompositionGuard:       &fakeCompositionGuard{},
 		Timeouts:               platform.DefaultTimeouts(),
 	}, releasereview.Input{
 		SessionID: testSessionID(t),
@@ -455,7 +497,8 @@ func TestRun_NonTriggeringRelease_PersistsEmptyArrayNeverJSONNull(t *testing.T) 
 // Test-integrity fix: dispatchCompositionReview's own nil-check is a
 // single `||` chain (deps.CompositionTemplates == nil ||
 // deps.CompositionDiffFetcher == nil || deps.CompositionTurns == nil ||
-// deps.CompositionDispatch == nil) -- Go's `||` short-circuits, so a
+// deps.CompositionDispatch == nil || deps.CompositionGuard == nil) -- Go's
+// `||` short-circuits, so a
 // single test that nils ALL FOUR at once (as a prior version of this
 // test did, by simply never setting any of them) only ever actually
 // EVALUATES the FIRST clause (deps.CompositionTemplates == nil); the
@@ -493,11 +536,13 @@ func TestRun_CompositionDepsNotConfigured_DegradesGracefully(t *testing.T) {
 		{name: "CompositionDiffFetcher nil"},
 		{name: "CompositionTurns nil"},
 		{name: "CompositionDispatch nil"},
+		{name: "CompositionGuard nil"},
 	}
 	tests[0].nilField = "templates"
 	tests[1].nilField = "diffFetcher"
 	tests[2].nilField = "turns"
 	tests[3].nilField = "dispatch"
+	tests[4].nilField = "guard"
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -511,6 +556,7 @@ func TestRun_CompositionDepsNotConfigured_DegradesGracefully(t *testing.T) {
 				CompositionDiffFetcher: diffFetcher,
 				CompositionTurns:       turns,
 				CompositionDispatch:    dispatch,
+				CompositionGuard:       &fakeCompositionGuard{},
 				Timeouts:               platform.DefaultTimeouts(),
 			}
 			switch tt.nilField {
@@ -522,6 +568,8 @@ func TestRun_CompositionDepsNotConfigured_DegradesGracefully(t *testing.T) {
 				deps.CompositionTurns = nil
 			case "dispatch":
 				deps.CompositionDispatch = nil
+			case "guard":
+				deps.CompositionGuard = nil
 			default:
 				t.Fatalf("unrecognized nilField %q", tt.nilField)
 			}
@@ -743,6 +791,7 @@ func TestRun_CompositionAnchorRecorded_AtDispatchTime(t *testing.T) {
 		CompositionDiffFetcher: diffFetcher,
 		CompositionTurns:       turns,
 		CompositionDispatch:    dispatch,
+		CompositionGuard:       &fakeCompositionGuard{},
 		CompositionAnchor:      checks,
 		Timeouts:               platform.DefaultTimeouts(),
 	}, releasereview.Input{
@@ -795,6 +844,7 @@ func TestRun_CompositionAnchorNotConfigured_DegradesGracefully(t *testing.T) {
 		CompositionDiffFetcher: diffFetcher,
 		CompositionTurns:       turns,
 		CompositionDispatch:    dispatch,
+		CompositionGuard:       &fakeCompositionGuard{},
 		// CompositionAnchor deliberately left nil.
 		Timeouts: platform.DefaultTimeouts(),
 	}, releasereview.Input{
@@ -807,5 +857,75 @@ func TestRun_CompositionAnchorNotConfigured_DegradesGracefully(t *testing.T) {
 	}
 	if checks.anchorCalls != 0 {
 		t.Errorf("CompositionAnchor.UpdateCompositionAnchor calls = %d, want 0 (nil dep)", checks.anchorCalls)
+	}
+}
+
+// TestCompositionReview_AtSpendCap_Declined: a review session that has
+// spent its cap (technical plan §40.1) declines this cycle's composition
+// pass, as the two decline branches before the insert do -- the guard is
+// asked at the composition stage, inside CreateLockedTurn, no turn is
+// created and nothing is dispatched or anchored -- and the refusal is
+// recorded once, for its warning and notice, while the manifest check's
+// own comment is still enqueued.
+func TestCompositionReview_AtSpendCap_Declined(t *testing.T) {
+	t.Parallel()
+	refusal := &sessionguard.Refusal{Reason: sessionguard.ReasonSpendCap, Cap: 1_000_000, Spent: 1_400_000,
+		Source: sessionguard.CapSource{Kind: sessionguard.CapSourceRepo, Name: "acme/widgets", ID: "acme/widgets"}}
+	for _, tc := range []struct {
+		name     string
+		refusal  *sessionguard.Refusal
+		wantTurn bool
+	}{
+		{name: "under the cap dispatches", wantTurn: true},
+		{name: "at the cap declines", refusal: refusal},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			lister := &fakeMergedPRLister{merged: []ports.MergedPR{
+				{Number: 1, Title: "a", HasApprovingReview: true, Labels: []string{reviewpost.LabelHighRisk}},
+			}}
+			outbox := &fakeOutboxEnqueuer{}
+			templates := &fakeCompositionTemplateFetcher{template: "t"}
+			diffFetcher := &fakeCompositionDiffFetcher{pr: githubapi.PullRequest{HeadSHA: "deadbeef", BaseRef: "main"}, diff: "diff"}
+			turns := &fakeCompositionTurnInserter{}
+			dispatch := &fakeCompositionDispatcher{}
+			checks := &fakeReleaseManifestCheckStore{}
+			guard := &fakeCompositionGuard{refusal: tc.refusal}
+			deps := fullCompositionDeps(lister, outbox, templates, diffFetcher, turns, dispatch)
+			deps.CompositionGuard = guard
+			deps.ReleaseManifestChecks = checks
+			deps.CompositionAnchor = checks
+
+			releasereview.Run(context.Background(), discardLogger(), deps, releasereview.Input{
+				SessionID: testSessionID(t),
+				Owner:     "acme", Repo: "widgets", PRNumber: 1, BaseRef: "main", HeadRef: "release/1.0", Token: "t",
+			})
+
+			if outbox.calls != 1 {
+				t.Errorf("Outbox.Create calls = %d, want 1: the manifest check's comment is enqueued either way", outbox.calls)
+			}
+			if len(guard.stages) != 1 || guard.stages[0] != turnguard.StageComposition {
+				t.Errorf("guard asked at %v, want once at the composition stage", guard.stages)
+			}
+			wantDispatch := 0
+			if tc.wantTurn {
+				wantDispatch = 1
+			}
+			if dispatch.calls != wantDispatch {
+				t.Errorf("EnsureDispatched calls = %d, want %d", dispatch.calls, wantDispatch)
+			}
+			if tc.wantTurn {
+				if len(guard.recorded) != 0 {
+					t.Errorf("recorded %d refusals for an admitted turn", len(guard.recorded))
+				}
+				return
+			}
+			if len(guard.recorded) != 1 || guard.recorded[0] != tc.refusal {
+				t.Errorf("recorded refusals = %v, want the one refusal", guard.recorded)
+			}
+			if checks.anchorCalls != 0 {
+				t.Errorf("composition anchor written %d times for a declined pass, want 0", checks.anchorCalls)
+			}
+		})
 	}
 }

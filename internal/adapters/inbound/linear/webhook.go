@@ -26,10 +26,12 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowlinear"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	"github.com/narvidev/narvi/internal/domain/framecut"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -150,11 +152,16 @@ var emptyReviseFeedbackReplyText = fmt.Sprintf(
 // (§5.1), the full session-creation path (CreateSessionCore), the
 // Linear-specific dedupe/installation stores, and the outbound client.
 type Deps struct {
-	Pool          *pgxpool.Pool
-	Sessions      *postgres.SessionStore
-	Turns         *postgres.TurnStore
-	Environments  *postgres.EnvironmentStore
-	Registry      *sessionactor.Registry
+	Pool         *pgxpool.Pool
+	Sessions     *postgres.SessionStore
+	Turns        *postgres.TurnStore
+	Environments *postgres.EnvironmentStore
+	Registry     *sessionactor.Registry
+	// SessionGuard is the session guard (technical plan §40.1,
+	// internal/app/turnguard): every turn this adapter asks the control
+	// plane to create, and every plan approval, passes it, and a session
+	// that has spent its cap is refused with an honest reply.
+	SessionGuard  *turnguard.Guard
 	Deliveries    *postgres.WebhookDeliveryStore
 	AgentSessions *postgres.LinearAgentSessionStore
 	Installations *postgres.LinearInstallationStore
@@ -883,7 +890,11 @@ func (deps Deps) handlePrompted(ctx context.Context, payload agentSessionEventWe
 				// way -- it now returns ok=false here too, exactly mirroring
 				// this function's own ordinary-reply gate below, so it flows
 				// into the same release-the-claim-and-retry path.
-				return deps.handlePlanVerdict(ctx, logger, sessionID, planID, verdict, actorUserID, notice, payload.OrganizationID, payload.AgentSession.ID)
+				// Answered on this agent session (technical plan §40.1): a
+				// refusal is told here, and the crossing's notice, held
+				// meanwhile, is withdrawn once that reply lands
+				// (handlePlanVerdict).
+				return deps.handlePlanVerdict(turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceLinear), logger, sessionID, planID, verdict, actorUserID, notice, payload.OrganizationID, payload.AgentSession.ID)
 			}
 			// a follow-up fix (§8.1): a reply matching neither a
 			// verdict keyword NOR this deterministic revise: prefix falls
@@ -999,7 +1010,11 @@ func (deps Deps) handlePrompted(ctx context.Context, payload agentSessionEventWe
 	// actorUserID attributed) and L12 (this package's own copy-pasted
 	// hasOpenTurn helper is gone entirely -- httpapi's own copy, already
 	// unexported there, is the only one left).
-	createdTurn, wasCreated, cerr := httpapi.CreateTurnCore(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.IntentClassifier, deps.AuditLog, deps.Registry, sessionID, prompt, nil, planMode, deps.EpistemicCheckDefault, actorUserID, httpapi.DropIfOpen)
+	// Answered on this agent session (technical plan §40.1): a refusal is
+	// told here, and the crossing's notice, held meanwhile, is withdrawn
+	// once that reply lands -- delivered instead if it does not.
+	answerCtx := turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceLinear)
+	createdTurn, wasCreated, cerr := httpapi.CreateTurnCore(answerCtx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.IntentClassifier, deps.AuditLog, deps.Registry, deps.SessionGuard, sessionID, prompt, nil, planMode, deps.EpistemicCheckDefault, actorUserID, httpapi.DropIfOpen)
 	if cerr != nil {
 		if errors.Is(cerr, httpapi.ErrPlanAwaitingApproval) {
 			// a follow-up fix (§8.1): honest reply, never a hard
@@ -1011,6 +1026,16 @@ func (deps Deps) handlePrompted(ctx context.Context, payload agentSessionEventWe
 				cut = deps.awaitingPlanCut(ctx, logger, sessionID, awaitingPlanID)
 			}
 			deps.postThoughtNotice(ctx, payload.OrganizationID, payload.AgentSession.ID, planAwaitingApprovalReplyText(cut), notice)
+			return true
+		}
+		if refusal, ok := sessionguard.AsRefusal(cerr); ok {
+			// The session has spent its cap (technical plan §40.1): a
+			// deterministic state, never a failure a redelivery could
+			// fix, answered honestly with the refusal's own text.
+			logger.Info("linear: prompted reply refused by the session guard", "session_id", sessionID.String(), "reason", string(refusal.Reason))
+			if deps.postThoughtNotice(ctx, payload.OrganizationID, payload.AgentSession.ID, refusal.Error(), notice) {
+				turnguard.Answered(answerCtx)
+			}
 			return true
 		}
 		logger.Error("linear: create turn failed", "status", cerr.Status, "message", cerr.Message, "session_id", sessionID.String())
@@ -1149,7 +1174,7 @@ func (deps Deps) handlePlanVerdict(ctx context.Context, logger *slog.Logger, ses
 		return false
 	}
 
-	outcome, err := httpapi.DecidePlan(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Events, deps.PlanDocuments, deps.Outbox, deps.AgentSessions, deps.AuditLog, deps.Registry, sessionID, planID, httpapi.PlanVerdict(verdict), decidedBy, deps.EpistemicCheckDefault)
+	outcome, err := httpapi.DecidePlan(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Events, deps.PlanDocuments, deps.Outbox, deps.AgentSessions, deps.AuditLog, deps.Registry, deps.SessionGuard, sessionID, planID, httpapi.PlanVerdict(verdict), decidedBy, deps.EpistemicCheckDefault)
 	if err != nil {
 		if errors.Is(err, httpapi.ErrPlanCut) {
 			// The plan's text was cut on its way from the sandbox, so it
@@ -1160,6 +1185,18 @@ func (deps Deps) handlePlanVerdict(ctx context.Context, logger *slog.Logger, ses
 		}
 		if errors.Is(err, httpapi.ErrPlanOpenTurnInFlight) {
 			deps.postPlanOutcomeActivity(ctx, logger, organizationID, agentSessionID, "A revision is already in progress for this plan -- try again once it completes.", identityNotice)
+			return true
+		}
+		if refusal, ok := sessionguard.AsRefusal(err); ok {
+			// The session has spent its cap (technical plan §40.1): the
+			// plan stays awaiting approval, and the reply is the
+			// refusal's own text.
+			logger.Info("linear: plan approval refused by the session guard", "plan_id", planID.String(), "session_id", sessionID.String(), "reason", string(refusal.Reason))
+			if deps.postPlanOutcomeActivity(ctx, logger, organizationID, agentSessionID, refusal.Error(), identityNotice) {
+				// ctx is marked by the caller (turnguard.AnsweredOnChannel):
+				// the refusal was told here, so its held notice is withdrawn.
+				turnguard.Answered(ctx)
+			}
 			return true
 		}
 		logger.Error("linear: decide plan failed", "error", err, "plan_id", planID.String(), "session_id", sessionID.String())
@@ -1202,22 +1239,23 @@ func renderLinearPlanOutcomeText(outcome httpapi.DecidePlanOutcome) string {
 // normal outcome, never an "error" activity -- matches decideplan.go's own
 // identical Success:true convention for the cross-channel notify path).
 // Best-effort only: any failure is logged and swallowed, mirroring
-// postAcknowledgment's own identical tolerance.
-func (deps Deps) postPlanOutcomeActivity(ctx context.Context, logger *slog.Logger, organizationID, agentSessionID, text, identityNotice string) {
+// postAcknowledgment's own identical tolerance; it reports whether the
+// activity was posted.
+func (deps Deps) postPlanOutcomeActivity(ctx context.Context, logger *slog.Logger, organizationID, agentSessionID, text, identityNotice string) bool {
 	install, err := deps.Installations.GetByOrganizationID(ctx, organizationID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			logger.Warn("linear: no installation for organization, skipping plan-outcome activity", "organization_id", organizationID)
-			return
+			return false
 		}
 		logger.Error("linear: look up installation failed", "error", err, "organization_id", organizationID)
-		return
+		return false
 	}
 
 	accessToken, err := platform.DecryptToken(deps.TokenEncryptionKey, install.AccessTokenEncrypted)
 	if err != nil {
 		logger.Error("linear: decrypt installation access token failed", "error", err, "organization_id", organizationID)
-		return
+		return false
 	}
 
 	activityCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.LinearOutboundActivityTimeout)
@@ -1225,7 +1263,9 @@ func (deps Deps) postPlanOutcomeActivity(ctx context.Context, logger *slog.Logge
 
 	if err := deps.LinearClient.CreateResponseActivity(activityCtx, string(accessToken), agentSessionID, text, identityNotice); err != nil {
 		logger.Error("linear: post plan-outcome activity failed", "error", err, "agent_session_id", agentSessionID)
+		return false
 	}
+	return true
 }
 
 // postThoughtNotice posts body as a best-effort `thought` Agent Activity --
@@ -1237,13 +1277,13 @@ func (deps Deps) postPlanOutcomeActivity(ctx context.Context, logger *slog.Logge
 // own identical lookup+decrypt+bounded-call shape exactly (this package's
 // own established "small, documented duplication over a forced shared
 // abstraction" precedent -- see identity.go's own decryptLinearAccessToken
-// doc comment).
-func (deps Deps) postThoughtNotice(ctx context.Context, organizationID, agentSessionID, body, identityNotice string) {
+// doc comment). It reports whether the activity was posted.
+func (deps Deps) postThoughtNotice(ctx context.Context, organizationID, agentSessionID, body, identityNotice string) bool {
 	logger := platform.Logger(ctx)
 
 	accessToken, ok := deps.decryptLinearAccessToken(ctx, logger, organizationID)
 	if !ok {
-		return
+		return false
 	}
 
 	activityCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.LinearOutboundActivityTimeout)
@@ -1251,7 +1291,9 @@ func (deps Deps) postThoughtNotice(ctx context.Context, organizationID, agentSes
 
 	if err := deps.LinearClient.CreateThoughtActivity(activityCtx, accessToken, agentSessionID, body, identityNotice); err != nil {
 		logger.Warn("linear: post thought notice activity failed", "error", err, "agent_session_id", agentSessionID)
+		return false
 	}
+	return true
 }
 
 // postAcknowledgment posts the single, minimal `thought` Agent Activity

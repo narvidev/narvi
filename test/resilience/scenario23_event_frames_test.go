@@ -56,6 +56,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/framecut"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/platform"
@@ -287,7 +288,7 @@ func (r *eventFrameRig) approve(ctx context.Context, planID pgtype.UUID) (httpap
 	pool := r.h.Pool
 	return httpapi.DecidePlan(ctx, pool, r.h.Sessions, r.h.Turns, narvipg.NewPlanStore(pool), r.h.Events, narvipg.NewPlanDocumentStore(pool),
 		narvipg.NewOutboxStore(pool, false), narvipg.NewLinearAgentSessionStore(pool), narvipg.NewAuditLogStore(pool), r.registry,
-		r.sessionID, planID, httpapi.PlanVerdictApprove, pgtype.UUID{}, false)
+		turnguard.New(pool, nil, false), r.sessionID, planID, httpapi.PlanVerdictApprove, pgtype.UUID{}, false)
 }
 
 func (r *eventFrameRig) planStatus(ctx context.Context, t *testing.T, planID pgtype.UUID) sqlcgen.PlanStatus {

@@ -18,6 +18,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -202,6 +203,15 @@ type storeBundle struct {
 	// inserts a person's moved request, owedreviewrequest.go's consumer
 	// re-runs or drops it, and a person's stop drops the ones it predates.
 	owedReviewRequest *postgres.OwedReviewRequestStore
+
+	// sessionGuard is the session guard (internal/app/turnguard, technical
+	// plan §40.1): every turn this package inserts -- the automatic
+	// re-review, an owed review request's re-run, the workflow engine's
+	// advance -- is admitted by it first, and planDispatch asks it again
+	// before a queued turn is dispatched (sessionguard.go). Bound to each
+	// transaction with the actor's own event appender, so a warning it
+	// records is broadcast on commit like every other event.
+	sessionGuard *turnguard.Guard
 }
 
 func newStoreBundle(pool *pgxpool.Pool, platformShadow bool) storeBundle {
@@ -234,6 +244,7 @@ func newStoreBundle(pool *pgxpool.Pool, platformShadow bool) storeBundle {
 		providerCredential:   postgres.NewProviderCredentialStore(pool),
 		falseFailure:         postgres.NewFalseFailureStore(pool),
 		owedReviewRequest:    postgres.NewOwedReviewRequestStore(pool),
+		sessionGuard:         turnguard.New(pool, nil, platformShadow),
 	}
 }
 

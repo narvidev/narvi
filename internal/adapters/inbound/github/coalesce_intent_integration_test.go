@@ -28,6 +28,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/intentclassifier"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -109,6 +110,7 @@ func newTestRigWithIntentClassifier(t *testing.T, classifierTarget string) testR
 		Turns:            rig.turns,
 		Environments:     narvipg.NewEnvironmentStore(pool),
 		Registry:         registry,
+		SessionGuard:     turnguard.New(pool, nil, false),
 		IntentClassifier: intentSvc,
 		AuditLog:         narvipg.NewAuditLogStore(pool),
 		// Identities/Users/Participants (batch fix/deny-unlinked-github-

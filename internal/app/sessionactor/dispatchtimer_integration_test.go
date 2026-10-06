@@ -18,6 +18,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -36,7 +37,7 @@ func createTurnArmingDispatch(ctx context.Context, t *testing.T, pool *pgxpool.P
 		SessionID: sessionID,
 		Status:    sqlcgen.TurnStatusPending,
 		Prompt:    &prompt,
-	})
+	}, sessionguard.AdmitNewSession(sessionID.Bytes))
 	if err != nil {
 		t.Fatalf("create turn: %v", err)
 	}
@@ -451,7 +452,7 @@ func TestDispatchTimer_AWriterQueuedBehindAnEvaluationKeepsItsTimer(t *testing.T
 		prompt := "the turn behind the evaluation"
 		if _, err := narvipg.NewTurnStore(pool).WithTx(tx).CreateAndArmDispatch(ctx, sqlcgen.CreateTurnParams{
 			SessionID: sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &prompt,
-		}); err != nil {
+		}, sessionguard.AdmitNewSession(sessionID.Bytes)); err != nil {
 			return err
 		}
 		return tx.Commit(ctx)

@@ -21,6 +21,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/turn"
 )
 
@@ -45,7 +46,7 @@ func TestGetSessionStatus_TurnQueuedBehindTheEscalatingTurnNeverClosesIt(t *test
 	transitionTurn(ctx, t, rig.turns, a.ID, state, turn.TriggerStartProcessing)
 
 	b, created, cerr := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry,
-		sess.ID, "a mention queued behind the running turn", nil, false, false, pgtype.UUID{}, httpapi.AlwaysQueue)
+		turnguard.New(rig.pool, nil, false), sess.ID, "a mention queued behind the running turn", nil, false, false, pgtype.UUID{}, httpapi.AlwaysQueue)
 	if cerr != nil || !created {
 		t.Fatalf("CreateTurnCore(AlwaysQueue): created %v, %+v", created, cerr)
 	}

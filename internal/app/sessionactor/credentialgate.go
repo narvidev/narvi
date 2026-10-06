@@ -173,15 +173,7 @@ func (a *Actor) refusePersonalLinkOnly(ctx context.Context, tx pgx.Tx, sessionRo
 	// Never OnTurnCompleted: it would read the refusal as an implicit
 	// "blocked" and follow any blocked edge the step wires, queueing the
 	// same refused attempt again (refusal.go's doc comment).
-	workflowengine.OnTurnRefused(ctx, workflowengine.Deps{
-		Workflows:             a.stores.workflow.WithTx(tx),
-		Turns:                 a.stores.turn.WithTx(tx),
-		SlackThreadSessions:   a.stores.slackThreadSession.WithTx(tx),
-		LinearAgentSessions:   a.stores.linearAgentSession.WithTx(tx),
-		GitHubPRSessions:      a.stores.githubPRSession.WithTx(tx),
-		Outbox:                a.stores.outbox.WithTx(tx),
-		EpistemicCheckDefault: a.epistemicCheckDefault,
-	}, sessionRow, target.ID, reason)
+	workflowengine.OnTurnRefused(ctx, a.workflowDeps(tx), sessionRow, target.ID, reason)
 
 	if turn.RequiresSyntheticExecutionComplete(turn.TriggerAbandon) {
 		if err := a.appendEvent(ctx, tx, "execution_complete", syntheticExecutionComplete(target.ID, from, reason)); err != nil {

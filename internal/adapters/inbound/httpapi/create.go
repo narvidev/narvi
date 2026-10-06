@@ -22,6 +22,7 @@ import (
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/domain/provenance"
 	"github.com/narvidev/narvi/internal/domain/reposource"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -1188,7 +1189,13 @@ func CreateSessionOnTx(ctx context.Context, tx pgx.Tx, sessions *postgres.Sessio
 			RequestTrigger:  opts.RequestTrigger,
 			RequestedBy:     requestedByFor(opts.RequestTrigger, createdBy),
 			RequestText:     opts.RequestText,
-		}); err != nil {
+			// The session guard (technical plan §40.1) admits a session's
+			// first turn when the session is created in this same
+			// transaction: it has spent nothing, and no cap -- always
+			// above zero -- can refuse it. This is the one place
+			// sessionguard.AdmitNewSession is called
+			// (TestAdmitNewSessionOnlyInCreateSessionOnTx).
+		}, sessionguard.AdmitNewSession(created.ID.Bytes)); err != nil {
 			logger.Error("httpapi: create turn failed", "error", err)
 			return sqlcgen.Session{}, false, &CreateSessionError{Status: http.StatusInternalServerError, Message: "internal error"}
 		}

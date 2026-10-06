@@ -508,15 +508,7 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 	// OnTurnCompleted's own doc comment). Never returns an error: this is
 	// bookkeeping, never allowed to roll back a turn's own already-persisted
 	// completion. sessionRow is the SAME row already fetched above.
-	workflowengine.OnTurnCompleted(ctx, workflowengine.Deps{
-		Workflows:             a.stores.workflow.WithTx(tx),
-		Turns:                 a.stores.turn.WithTx(tx),
-		SlackThreadSessions:   a.stores.slackThreadSession.WithTx(tx),
-		LinearAgentSessions:   a.stores.linearAgentSession.WithTx(tx),
-		GitHubPRSessions:      a.stores.githubPRSession.WithTx(tx),
-		Outbox:                a.stores.outbox.WithTx(tx),
-		EpistemicCheckDefault: a.epistemicCheckDefault,
-	}, sessionRow, processing.ID, trig)
+	workflowengine.OnTurnCompleted(ctx, a.workflowDeps(tx), sessionRow, processing.ID, trig)
 
 	// §5.1 ("outbox delivery", §5.1): enqueue exactly one outbox
 	// notification for THIS turn's completion, in the SAME transaction as

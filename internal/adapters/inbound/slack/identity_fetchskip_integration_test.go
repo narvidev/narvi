@@ -22,6 +22,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -201,6 +202,7 @@ func TestInteractivityHandler_BlockActions_AlreadyLinkedIdentity_SkipsUsersInfoF
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
+		SessionGuard:        turnguard.New(pool, nil, false),
 		SlackClient:         slackClient,
 		AuditLog:            auditLog,
 		IdentityLink:        newIdentityLinkDepsForTest(pool, auditLog),
@@ -288,6 +290,7 @@ func TestInteractivityHandler_BlockActions_UnlinkedIdentity_CallsUsersInfoFetch(
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
+		SessionGuard:        turnguard.New(pool, nil, false),
 		SlackClient:         slackClient,
 		AuditLog:            auditLog,
 		IdentityLink:        newIdentityLinkDepsForTest(pool, auditLog),

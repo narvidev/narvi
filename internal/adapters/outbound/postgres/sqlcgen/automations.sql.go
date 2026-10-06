@@ -17,7 +17,7 @@ SET consecutive_failures = $2,
     status = $3,
     updated_at = now()
 WHERE id = $1
-RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since
+RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd
 `
 
 type ApplyFailureStrikeParams struct {
@@ -54,6 +54,7 @@ func (q *Queries) ApplyFailureStrike(ctx context.Context, arg ApplyFailureStrike
 		&i.LastRunStatus,
 		&i.ArtifactSummary,
 		&i.CreatorUnauthorizedSince,
+		&i.SessionSpendCapUsd,
 	)
 	return i, err
 }
@@ -64,7 +65,7 @@ SET last_cron_fired_at = $1
 WHERE id = $2
   AND last_cron_fired_at IS NOT DISTINCT FROM $3
   AND (last_cron_fired_at IS NULL OR last_cron_fired_at < $1)
-RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since
+RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd
 `
 
 type ClaimCronFireParams struct {
@@ -110,6 +111,7 @@ func (q *Queries) ClaimCronFire(ctx context.Context, arg ClaimCronFireParams) (A
 		&i.LastRunStatus,
 		&i.ArtifactSummary,
 		&i.CreatorUnauthorizedSince,
+		&i.SessionSpendCapUsd,
 	)
 	return i, err
 }
@@ -145,7 +147,7 @@ INSERT INTO automations (
     env_vars
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
-RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since
+RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd
 `
 
 type CreateAutomationParams struct {
@@ -210,12 +212,13 @@ func (q *Queries) CreateAutomation(ctx context.Context, arg CreateAutomationPara
 		&i.LastRunStatus,
 		&i.ArtifactSummary,
 		&i.CreatorUnauthorizedSince,
+		&i.SessionSpendCapUsd,
 	)
 	return i, err
 }
 
 const getAutomation = `-- name: GetAutomation :one
-SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since FROM automations
+SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd FROM automations
 WHERE id = $1
 `
 
@@ -244,12 +247,13 @@ func (q *Queries) GetAutomation(ctx context.Context, id pgtype.UUID) (Automation
 		&i.LastRunStatus,
 		&i.ArtifactSummary,
 		&i.CreatorUnauthorizedSince,
+		&i.SessionSpendCapUsd,
 	)
 	return i, err
 }
 
 const getAutomationByWebhookTokenHash = `-- name: GetAutomationByWebhookTokenHash :one
-SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since FROM automations
+SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd FROM automations
 WHERE webhook_token_hash = $1
 `
 
@@ -284,12 +288,13 @@ func (q *Queries) GetAutomationByWebhookTokenHash(ctx context.Context, webhookTo
 		&i.LastRunStatus,
 		&i.ArtifactSummary,
 		&i.CreatorUnauthorizedSince,
+		&i.SessionSpendCapUsd,
 	)
 	return i, err
 }
 
 const listActiveCronAutomations = `-- name: ListActiveCronAutomations :many
-SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since FROM automations
+SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd FROM automations
 WHERE trigger_type = 'cron' AND status = 'active'
 ORDER BY last_cron_fired_at ASC NULLS FIRST
 `
@@ -331,6 +336,7 @@ func (q *Queries) ListActiveCronAutomations(ctx context.Context) ([]Automation, 
 			&i.LastRunStatus,
 			&i.ArtifactSummary,
 			&i.CreatorUnauthorizedSince,
+			&i.SessionSpendCapUsd,
 		); err != nil {
 			return nil, err
 		}
@@ -343,7 +349,7 @@ func (q *Queries) ListActiveCronAutomations(ctx context.Context) ([]Automation, 
 }
 
 const listActiveGitHubAutomations = `-- name: ListActiveGitHubAutomations :many
-SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since FROM automations
+SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd FROM automations
 WHERE trigger_type = 'github' AND status = 'active'
 ORDER BY id ASC
 `
@@ -386,6 +392,7 @@ func (q *Queries) ListActiveGitHubAutomations(ctx context.Context) ([]Automation
 			&i.LastRunStatus,
 			&i.ArtifactSummary,
 			&i.CreatorUnauthorizedSince,
+			&i.SessionSpendCapUsd,
 		); err != nil {
 			return nil, err
 		}
@@ -398,7 +405,7 @@ func (q *Queries) ListActiveGitHubAutomations(ctx context.Context) ([]Automation
 }
 
 const listActiveLinearAutomations = `-- name: ListActiveLinearAutomations :many
-SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since FROM automations
+SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd FROM automations
 WHERE trigger_type = 'linear' AND status = 'active'
   AND trigger_config->>'organizationId' = $1::text
 ORDER BY id ASC
@@ -466,6 +473,7 @@ func (q *Queries) ListActiveLinearAutomations(ctx context.Context, organizationI
 			&i.LastRunStatus,
 			&i.ArtifactSummary,
 			&i.CreatorUnauthorizedSince,
+			&i.SessionSpendCapUsd,
 		); err != nil {
 			return nil, err
 		}
@@ -478,7 +486,7 @@ func (q *Queries) ListActiveLinearAutomations(ctx context.Context, organizationI
 }
 
 const listAutomations = `-- name: ListAutomations :many
-SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since FROM automations
+SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd FROM automations
 WHERE ($1::uuid IS NULL OR created_by = $1)
   AND ($2::automation_status IS NULL OR status = $2)
 ORDER BY created_at DESC
@@ -529,6 +537,7 @@ func (q *Queries) ListAutomations(ctx context.Context, arg ListAutomationsParams
 			&i.LastRunStatus,
 			&i.ArtifactSummary,
 			&i.CreatorUnauthorizedSince,
+			&i.SessionSpendCapUsd,
 		); err != nil {
 			return nil, err
 		}
@@ -541,7 +550,7 @@ func (q *Queries) ListAutomations(ctx context.Context, arg ListAutomationsParams
 }
 
 const lockAutomationForUpdate = `-- name: LockAutomationForUpdate :one
-SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since FROM automations
+SELECT id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd FROM automations
 WHERE id = $1
 FOR UPDATE
 `
@@ -578,6 +587,7 @@ func (q *Queries) LockAutomationForUpdate(ctx context.Context, id pgtype.UUID) (
 		&i.LastRunStatus,
 		&i.ArtifactSummary,
 		&i.CreatorUnauthorizedSince,
+		&i.SessionSpendCapUsd,
 	)
 	return i, err
 }
@@ -614,7 +624,7 @@ UPDATE automations
 SET status = 'paused',
     updated_at = now()
 WHERE id = $1 AND status = 'active'
-RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since
+RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd
 `
 
 // The manual-admin twin of ResumeAutomation below: backs internal/domain/
@@ -651,6 +661,7 @@ func (q *Queries) PauseAutomation(ctx context.Context, id pgtype.UUID) (Automati
 		&i.LastRunStatus,
 		&i.ArtifactSummary,
 		&i.CreatorUnauthorizedSince,
+		&i.SessionSpendCapUsd,
 	)
 	return i, err
 }
@@ -683,7 +694,7 @@ SET status = 'active',
     consecutive_failures = 0,
     updated_at = now()
 WHERE id = $1 AND status = 'paused'
-RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since
+RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd
 `
 
 // Backs automation.TriggerResume (internal/domain/automation) -- no HTTP
@@ -717,6 +728,7 @@ func (q *Queries) ResumeAutomation(ctx context.Context, id pgtype.UUID) (Automat
 		&i.LastRunStatus,
 		&i.ArtifactSummary,
 		&i.CreatorUnauthorizedSince,
+		&i.SessionSpendCapUsd,
 	)
 	return i, err
 }
@@ -726,7 +738,7 @@ UPDATE automations
 SET webhook_token_hash = NULL,
     updated_at = now()
 WHERE id = $1
-RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since
+RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd
 `
 
 // Review fix, same finding as RotateAutomationWebhookToken above -- backs
@@ -767,6 +779,7 @@ func (q *Queries) RevokeAutomationWebhookToken(ctx context.Context, id pgtype.UU
 		&i.LastRunStatus,
 		&i.ArtifactSummary,
 		&i.CreatorUnauthorizedSince,
+		&i.SessionSpendCapUsd,
 	)
 	return i, err
 }
@@ -776,7 +789,7 @@ UPDATE automations
 SET webhook_token_hash = $2,
     updated_at = now()
 WHERE id = $1 AND trigger_type = 'webhook'
-RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since
+RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd
 `
 
 type RotateAutomationWebhookTokenParams struct {
@@ -821,6 +834,7 @@ func (q *Queries) RotateAutomationWebhookToken(ctx context.Context, arg RotateAu
 		&i.LastRunStatus,
 		&i.ArtifactSummary,
 		&i.CreatorUnauthorizedSince,
+		&i.SessionSpendCapUsd,
 	)
 	return i, err
 }
@@ -832,7 +846,7 @@ SET last_run_at = $2,
     artifact_summary = $4,
     updated_at = now()
 WHERE id = $1
-RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since
+RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd
 `
 
 type UpdateAutomationLastRunParams struct {
@@ -877,6 +891,7 @@ func (q *Queries) UpdateAutomationLastRun(ctx context.Context, arg UpdateAutomat
 		&i.LastRunStatus,
 		&i.ArtifactSummary,
 		&i.CreatorUnauthorizedSince,
+		&i.SessionSpendCapUsd,
 	)
 	return i, err
 }

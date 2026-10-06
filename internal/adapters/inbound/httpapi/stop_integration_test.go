@@ -32,6 +32,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/provenance"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -261,13 +262,13 @@ func newStopRig(t *testing.T, cfg stopRigConfig) *stopRig {
 			Registry:         routeRegistry,
 			Timeouts:         timeouts,
 		}))
-		api.Post("/{sessionID}/turns", httpapi.CreateTurn(pool, r.sessions, r.turns, r.plans, r.participants, r.auditLog, r.registry, nil, nil, false))
-		api.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(pool, r.sessions, r.turns, r.plans, narvipg.NewEventStore(pool), narvipg.NewPlanDocumentStore(pool), r.participants, narvipg.NewOutboxStore(pool, false), narvipg.NewLinearAgentSessionStore(pool), r.auditLog, r.registry, false))
+		api.Post("/{sessionID}/turns", httpapi.CreateTurn(pool, r.sessions, r.turns, r.plans, r.participants, r.auditLog, r.registry, turnguard.New(pool, nil, false), nil, nil, false))
+		api.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(pool, r.sessions, r.turns, r.plans, narvipg.NewEventStore(pool), narvipg.NewPlanDocumentStore(pool), r.participants, narvipg.NewOutboxStore(pool, false), narvipg.NewLinearAgentSessionStore(pool), r.auditLog, r.registry, turnguard.New(pool, nil, false), false))
 	})
 	// Mounted as controlplane/serve.go mounts it.
 	router.Route("/api/workflow-runs", func(api chi.Router) {
 		api.Use(auth.Middleware(r.userSessions, r.users))
-		api.Post("/{runId}/steps/{stepRunId}/decide", httpapi.DecideWorkflowStep(pool, r.sessions, r.turns, r.participants, r.workflows, narvipg.NewSlackThreadSessionStore(pool), narvipg.NewLinearAgentSessionStore(pool), r.prSessions, narvipg.NewOutboxStore(pool, false), r.registry, false))
+		api.Post("/{runId}/steps/{stepRunId}/decide", httpapi.DecideWorkflowStep(pool, r.sessions, r.turns, r.participants, r.workflows, narvipg.NewSlackThreadSessionStore(pool), narvipg.NewLinearAgentSessionStore(pool), r.prSessions, narvipg.NewOutboxStore(pool, false), r.registry, turnguard.New(pool, nil, false), false))
 	})
 	r.server = httptest.NewServer(router)
 	t.Cleanup(r.server.Close)
@@ -2980,7 +2981,7 @@ func TestStopSession_WorkflowCancelAfterAResumeEndsTheRun(t *testing.T) {
 			}
 			stopEventually(t, 10*time.Second, "the stop is sent", func() bool { return len(rig.commander.ofType(t, "stop")) == 1 })
 
-			if _, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, session.ID,
+			if _, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID,
 				"@narvi carry on", nil, false, false, owner.ID, nil, nil, nil, nil, nil, nil, nil, nil, false, nil, nil); err != nil {
 				t.Fatalf("mention: %v", err)
 			}

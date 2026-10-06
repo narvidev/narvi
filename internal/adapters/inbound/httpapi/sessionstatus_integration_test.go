@@ -23,7 +23,9 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/app/workflowengine"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -242,7 +244,7 @@ func inTx(ctx context.Context, t *testing.T, rig testRig, fn func(tx pgx.Tx) err
 func createTurnThroughCore(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID) sqlcgen.Turn {
 	t.Helper()
 	created, wasCreated, cerr := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry,
-		sessionID, "carry on", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen)
+		turnguard.New(rig.pool, nil, false), sessionID, "carry on", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen)
 	if cerr != nil {
 		t.Fatalf("CreateTurnCore: %d %s", cerr.Status, cerr.Message)
 	}
@@ -283,6 +285,8 @@ func endProcessingTurnThroughEngine(ctx context.Context, t *testing.T, rig testR
 			LinearAgentSessions: rig.linearAgentSessions.WithTx(tx),
 			GitHubPRSessions:    narvipg.NewGitHubPRSessionStore(rig.pool).WithTx(tx),
 			Outbox:              rig.outbox.WithTx(tx),
+			Guard:               turnguard.New(rig.pool, nil, false).WithTx(tx, nil),
+			Origin:              sessionguard.OriginAutomatic,
 		}, sessionRow, turnID, trig)
 		return nil
 	}); err != nil {
@@ -1000,13 +1004,15 @@ func TestGetSessionStatus_EscalationNeverObservedAsFinished_Race(t *testing.T) {
 					LinearAgentSessions: rig.linearAgentSessions.WithTx(tx),
 					GitHubPRSessions:    narvipg.NewGitHubPRSessionStore(rig.pool).WithTx(tx),
 					Outbox:              rig.outbox.WithTx(tx),
+					Guard:               turnguard.New(rig.pool, nil, false).WithTx(tx, nil),
+					Origin:              sessionguard.OriginAutomatic,
 				}, sessionRow, current.ID, turn.TriggerFail)
 				return nil
 			}); err != nil {
 				return fmt.Errorf("fail the turn + escalate its run: %w", err)
 			}
 			created, wasCreated, cerr := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry,
-				sess.ID, "carry on", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen)
+				turnguard.New(rig.pool, nil, false), sess.ID, "carry on", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen)
 			if cerr != nil || !wasCreated {
 				return fmt.Errorf("follow-up through CreateTurnCore: created %v, %v", wasCreated, cerr)
 			}

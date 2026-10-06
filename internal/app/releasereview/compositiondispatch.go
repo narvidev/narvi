@@ -6,9 +6,12 @@ import (
 
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/review"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 )
 
 // This file (compositiondispatch.go) closes a named gap:
@@ -59,7 +62,7 @@ import (
 // releasemanifestreadout.go already renders as an honest "not yet
 // available" state (this file's own top doc comment).
 func dispatchCompositionReview(ctx context.Context, logger *slog.Logger, deps Deps, in Input, checkID pgtype.UUID) {
-	if deps.CompositionTemplates == nil || deps.CompositionDiffFetcher == nil || deps.CompositionTurns == nil || deps.CompositionDispatch == nil {
+	if deps.CompositionTemplates == nil || deps.CompositionDiffFetcher == nil || deps.CompositionTurns == nil || deps.CompositionDispatch == nil || deps.CompositionGuard == nil {
 		logger.Warn("releasereview: aggregate review triggered but composition-dispatch dependencies are not configured, the composition pass will not run for this release",
 			"owner", in.Owner, "repo", in.Repo, "pr_number", in.PRNumber)
 		return
@@ -132,13 +135,25 @@ func dispatchCompositionReview(ctx context.Context, logger *slog.Logger, deps De
 	// finding (D5's own framing) -- the fix is to stop writing it, not to
 	// invent a read path for a value no eligibility check will ever
 	// consult.
+	//
+	// The session guard (technical plan §40.1) admits the turn inside
+	// CreateLockedTurn's transaction, after the session's row lock: a
+	// session that has spent its cap declines this cycle's pass, as the two
+	// decline branches above do, and records the crossing's warning and,
+	// when it is new, its one notice. composition_reviewed_at stays NULL.
 	created, err := deps.CompositionTurns.CreateLockedTurn(ctx, sqlcgen.CreateTurnParams{
 		SessionID:     in.SessionID,
 		Status:        sqlcgen.TurnStatusPending,
 		Prompt:        &prompt,
 		ReviewHeadSha: &reviewCtx.HeadSHA,
 		CorrelationID: in.CorrelationID,
-	})
+	}, deps.CompositionGuard.Admitter(in.SessionID, sessionguard.OriginAutomatic, turnguard.StageComposition))
+	if refusal, ok := sessionguard.AsRefusal(err); ok {
+		logger.Info("releasereview: the review session has reached its spend cap, declining to dispatch the composition pass this cycle",
+			"owner", in.Owner, "repo", in.Repo, "pr_number", in.PRNumber, "reason", string(refusal.Reason))
+		deps.CompositionGuard.RecordRefusal(ctx, in.SessionID, refusal)
+		return
+	}
 	if err != nil {
 		logger.Error("releasereview: insert composition review turn failed",
 			"error", err, "owner", in.Owner, "repo", in.Repo, "pr_number", in.PRNumber)
@@ -201,10 +216,21 @@ type CompositionTemplateFetcher interface {
 // interface so a unit test can inject a fake with no real DB round trip.
 // CreateLockedTurn inserts the turn and arms the session's dispatch timer
 // in one transaction, under the session's actor-epoch row lock (technical
-// plan §2, §3.3). *postgres.TurnStore does not satisfy it: its plain
-// Create is one autocommit insert, with no lock and no timer.
+// plan §2, §3.3), once admit -- the session guard's admission, §40.1 --
+// admitted it under that lock. *postgres.TurnStore does not satisfy it:
+// its plain Create is one autocommit insert, with no lock and no timer.
 type CompositionTurnInserter interface {
-	CreateLockedTurn(ctx context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error)
+	CreateLockedTurn(ctx context.Context, arg sqlcgen.CreateTurnParams, admit postgres.TurnAdmit) (sqlcgen.Turn, error)
+}
+
+// CompositionGuard is the slice of the session guard
+// (*turnguard.Guard, technical plan §40.1) the composition review needs:
+// the admission CompositionTurnInserter runs under the session's row lock,
+// and the record of a refusal -- the crossing's warning and, when it is
+// new, its one notice -- made after that transaction rolled back.
+type CompositionGuard interface {
+	Admitter(sessionID pgtype.UUID, origin sessionguard.Origin, stage turnguard.Stage) postgres.TurnAdmit
+	RecordRefusal(ctx context.Context, sessionID pgtype.UUID, r *sessionguard.Refusal)
 }
 
 // CompositionAnchorUpdater is the narrow slice of

@@ -31,6 +31,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/linearapi"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -63,6 +64,7 @@ func newHandlerDepsWithoutEntitlement(t *testing.T, pool *pgxpool.Pool) linear.D
 		Turns:              narvipg.NewTurnStore(pool),
 		Environments:       narvipg.NewEnvironmentStore(pool),
 		Registry:           registry,
+		SessionGuard:       turnguard.New(pool, nil, false),
 		Deliveries:         narvipg.NewWebhookDeliveryStore(pool),
 		AgentSessions:      narvipg.NewLinearAgentSessionStore(pool),
 		Installations:      narvipg.NewLinearInstallationStore(pool),

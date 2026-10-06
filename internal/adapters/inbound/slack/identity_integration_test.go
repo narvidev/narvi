@@ -30,6 +30,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/identitylink"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -164,6 +165,7 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_AutoLinksUniqueMatch(t *t
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
+		SessionGuard:        turnguard.New(pool, nil, false),
 		SlackClient:         slackClient,
 		AuditLog:            auditLog,
 		IdentityLink:        newIdentityLinkDepsForTest(pool, auditLog),
@@ -269,6 +271,7 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_DeniedForUnownedMember(t 
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
+		SessionGuard:        turnguard.New(pool, nil, false),
 		SlackClient:         slackClient,
 		AuditLog:            auditLog,
 		IdentityLink:        newIdentityLinkDepsForTest(pool, auditLog),
@@ -367,6 +370,7 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_DeniedForViewerEvenIfOwne
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
+		SessionGuard:        turnguard.New(pool, nil, false),
 		SlackClient:         slackClient,
 		AuditLog:            auditLog,
 		IdentityLink:        newIdentityLinkDepsForTest(pool, auditLog),
@@ -458,6 +462,7 @@ func TestInteractivityHandler_ViewSubmission_DeniedForUnownedMember(t *testing.T
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
+		SessionGuard:        turnguard.New(pool, nil, false),
 		SlackClient:         slackClient,
 		AuditLog:            auditLog,
 		IdentityLink:        newIdentityLinkDepsForTest(pool, auditLog),
@@ -599,6 +604,7 @@ func newSlackHandlerRigForIdentityTests(t *testing.T, pool *pgxpool.Pool, record
 		Turns:        turns,
 		Environments: environments,
 		Registry:     registry,
+		SessionGuard: turnguard.New(pool, nil, false),
 		Deliveries:   deliveries,
 		Threads:      threads,
 		AuditLog:     auditLog,
@@ -1127,6 +1133,7 @@ func TestInteractivityHandler_ViewSubmission_UnknownActorDeniedAndNoticeDelivere
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
+		SessionGuard:        turnguard.New(pool, nil, false),
 		SlackClient:         slackClient,
 		AuditLog:            auditLog,
 		IdentityLink:        newIdentityLinkDepsForTest(pool, auditLog),
@@ -1291,6 +1298,7 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_RetrySucceedsOnceLinked(t
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
+		SessionGuard:        turnguard.New(pool, nil, false),
 		SlackClient:         slackClient,
 		AuditLog:            auditLog,
 		IdentityLink:        identityLinkDeps,

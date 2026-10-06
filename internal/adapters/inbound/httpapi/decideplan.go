@@ -95,8 +95,10 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/framecut"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -231,6 +233,17 @@ func planDecisionOutcomeText(verdict PlanVerdict) string {
 // operator-configured platform.Config.EpistemicCheckDefault: DecidePlanOnTx
 // is reached only for an ordinary (never review-session) plan-mode
 // session, so no F7-style hardcoded-false carve-out applies here.
+//
+// guard is the session guard (technical plan §40.1), consulted for an
+// Approve only, after the open-turn gate: a session that has spent its cap
+// takes no implementation turn, and the refusal -- a *sessionguard.Refusal,
+// recognized with sessionguard.AsRefusal -- is returned with nothing
+// changed, the plan still awaiting approval. The caller rolls back, records
+// the refusal (Guard.RecordRefusal, which takes the session-row lock and so
+// must wait for the rollback) and answers on its own surface: REST 409
+// with the reason, Slack and Linear an honest reply. A Reject creates no
+// turn and never consults it, so a caller deciding a rejection may pass
+// nil.
 func DecidePlanOnTx(
 	ctx context.Context,
 	tx pgx.Tx,
@@ -242,6 +255,7 @@ func DecidePlanOnTx(
 	outbox *postgres.OutboxStore,
 	linearAgentSessions *postgres.LinearAgentSessionStore,
 	auditLog *postgres.AuditLogStore,
+	guard *turnguard.Guard,
 	sessionRow sqlcgen.Session,
 	planID pgtype.UUID,
 	verdict PlanVerdict,
@@ -261,6 +275,30 @@ func DecidePlanOnTx(
 		}
 		if hasOpenTurn(existingTurns) {
 			return DecidePlanOutcome{}, ErrPlanOpenTurnInFlight
+		}
+	}
+
+	// The session guard (technical plan §40.1), Approve only: approving a
+	// plan creates its implementation turn, and a session that has spent its
+	// cap takes no new turn, whoever asks -- a person approving a plan
+	// included (§40.1's inversion of §24.6). Asked after the open-turn gate,
+	// whose reply keeps its precedence, and before anything changes, under
+	// the lock taken above: the refusal, a *sessionguard.Refusal, is returned
+	// as the error, the caller rolls back, and the plan stays awaiting
+	// approval -- approving it again after a raise works. The caller records
+	// the refusal once its transaction is gone (Guard.RecordRefusal) and
+	// answers on its own surface. A read that failed is an error, never a
+	// refusal.
+	var admission sessionguard.Admission
+	if verdict == PlanVerdictApprove {
+		var refusal *sessionguard.Refusal
+		var err error
+		admission, refusal, err = guard.Admit(ctx, tx, sessionRow.ID, turnguard.OriginForRequest(ctx, decidedBy), turnguard.StagePlanApproval)
+		if err != nil {
+			return DecidePlanOutcome{}, fmt.Errorf("httpapi: session guard for plan approval: %w", err)
+		}
+		if refusal != nil {
+			return DecidePlanOutcome{}, refusal
 		}
 	}
 
@@ -431,7 +469,7 @@ func DecidePlanOnTx(
 			Effort:        sessionRow.BuildEffort,
 			PlanMode:      false,
 			CorrelationID: correlationID,
-		})
+		}, admission)
 		if err != nil {
 			return DecidePlanOutcome{}, fmt.Errorf("httpapi: create implementation turn: %w", err)
 		}
@@ -661,6 +699,7 @@ func DecidePlan(
 	linearAgentSessions *postgres.LinearAgentSessionStore,
 	auditLog *postgres.AuditLogStore,
 	registry *sessionactor.Registry,
+	guard *turnguard.Guard,
 	sessionID, planID pgtype.UUID,
 	verdict PlanVerdict,
 	decidedBy pgtype.UUID,
@@ -679,8 +718,14 @@ func DecidePlan(
 		return DecidePlanOutcome{}, fmt.Errorf("httpapi: get session for plan decision: %w", err)
 	}
 
-	outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, events, planDocuments, outbox, linearAgentSessions, auditLog, sessionRow, planID, verdict, decidedBy, epistemicCheckDefault)
+	outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, events, planDocuments, outbox, linearAgentSessions, auditLog, guard, sessionRow, planID, verdict, decidedBy, epistemicCheckDefault)
 	if err != nil {
+		// A refusal of the session guard is recorded once this
+		// transaction, which holds the session-row lock, is gone.
+		if refusal, ok := sessionguard.AsRefusal(err); ok {
+			_ = tx.Rollback(ctx)
+			guard.RecordRefusal(ctx, sessionID, refusal)
+		}
 		return DecidePlanOutcome{}, err
 	}
 

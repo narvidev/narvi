@@ -67,14 +67,16 @@ func NewPlanSlackNotifier(client *slackapi.Client, plans *postgres.PlanStore) po
 // notification to n.client.Deliver UNCHANGED rather than duplicating its
 // chat.postMessage call here: n.client.Deliver never inspects n.Kind at
 // all (its own doc comment), so this is not a workaround, it is that
-// method's own documented, general contract.
+// method's own documented, general contract. The session guard's notice
+// (ports.NotificationKindSlackSessionGuard, technical plan §40.1) carries
+// the same payload shape and is forwarded the same way.
 func (n *planSlackNotifier) Deliver(ctx context.Context, notification ports.Notification) error {
 	switch notification.Kind {
 	case ports.NotificationKindSlackPlanApproval:
 		return n.deliverApproval(ctx, notification.Payload)
 	case ports.NotificationKindSlackPlanDecided:
 		return n.deliverDecided(ctx, notification.Payload)
-	case ports.NotificationKindSlackWorkflowDecision:
+	case ports.NotificationKindSlackWorkflowDecision, ports.NotificationKindSlackSessionGuard:
 		return n.client.Deliver(ctx, notification)
 	default:
 		return fmt.Errorf("outboxworker: planSlackNotifier: unrecognized notification kind %q", notification.Kind)

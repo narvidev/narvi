@@ -49,12 +49,14 @@ type freezeEntry struct {
 	site  domainautonomy.Site
 }
 
-// notificationKindFreeze classifies all 20 ports.NotificationKind
+// notificationKindFreeze classifies all 23 ports.NotificationKind
 // constants. Two hold; every other kind delivers, each a report of work
 // already done or hygiene:
 //   - the Slack, Linear and GitHub messages, plan approvals and decisions,
 //     progress, workflow decisions and digests report what a session or a
 //     person did, or ask a person to decide;
+//   - the session guard's notices (technical plan §40.1) report that a
+//     session stopped taking turns at its spend cap;
 //   - github_verdict and github_review_check publish a review that already
 //     ran; handoff_sentinel and release_manifest comment on a pull request
 //     a person or a review already acted on;
@@ -81,6 +83,9 @@ var notificationKindFreeze = map[ports.NotificationKind]freezeEntry{
 	ports.NotificationKindSlackDigest:            {class: FreezeDelivers},
 	ports.NotificationKindLinearDigest:           {class: FreezeDelivers},
 	ports.NotificationKindGitHubReviewCheck:      {class: FreezeDelivers},
+	ports.NotificationKindSlackSessionGuard:      {class: FreezeDelivers},
+	ports.NotificationKindLinearSessionGuard:     {class: FreezeDelivers},
+	ports.NotificationKindGitHubSessionGuard:     {class: FreezeDelivers},
 
 	// The sentinel auto-fix's branch and child session (§17.2).
 	ports.NotificationKindSentinelAutoFix: {class: FreezeHolds, site: domainautonomy.SiteSentinelAutoFixSpawn},

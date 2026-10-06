@@ -43,6 +43,8 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -142,7 +144,7 @@ func authorizePlanAction(w http.ResponseWriter, r *http.Request, participants *p
 // events/planDocuments (§31.3) are DecidePlanOnTx's own approved-plan
 // snapshot dependencies -- threaded through here rather than constructed
 // inline, exactly like every other store this handler already receives.
-func ApprovePlan(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, events *postgres.EventStore, planDocuments *postgres.PlanDocumentStore, participants *postgres.ParticipantStore, outbox *postgres.OutboxStore, linearAgentSessions *postgres.LinearAgentSessionStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, epistemicCheckDefault bool) http.HandlerFunc {
+func ApprovePlan(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, events *postgres.EventStore, planDocuments *postgres.PlanDocumentStore, participants *postgres.ParticipantStore, outbox *postgres.OutboxStore, linearAgentSessions *postgres.LinearAgentSessionStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, guard *turnguard.Guard, epistemicCheckDefault bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
 		if !ok {
@@ -174,8 +176,20 @@ func ApprovePlan(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *pos
 			return
 		}
 
-		outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, events, planDocuments, outbox, linearAgentSessions, auditLog, sessionRow, planID, PlanVerdictApprove, actorUserID, epistemicCheckDefault)
+		outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, events, planDocuments, outbox, linearAgentSessions, auditLog, guard, sessionRow, planID, PlanVerdictApprove, actorUserID, epistemicCheckDefault)
 		if err != nil {
+			if refusal, ok := sessionguard.AsRefusal(err); ok {
+				// The session has spent its cap (technical plan §40.1):
+				// nothing changed, the plan stays awaiting approval, and
+				// the body is the refusal's text with its typed reason,
+				// which MCP's narvi_approve_plan returns as its tool error.
+				// Recorded once this transaction, which holds the session
+				// row's lock, is gone.
+				_ = tx.Rollback(ctx)
+				guard.RecordRefusal(ctx, sessionID, refusal)
+				writeErrorWithReason(w, http.StatusConflict, refusal.Error(), string(refusal.Reason))
+				return
+			}
 			var cutErr *PlanCutError
 			if errors.As(err, &cutErr) {
 				// The plan's text was cut on its way from the sandbox
@@ -288,7 +302,7 @@ func RejectPlan(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *post
 			return
 		}
 
-		outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, events, planDocuments, outbox, linearAgentSessions, auditLog, sessionRow, planID, PlanVerdictReject, actorUserID, epistemicCheckDefault)
+		outcome, err := DecidePlanOnTx(ctx, tx, sessions, turns, plans, events, planDocuments, outbox, linearAgentSessions, auditLog, nil, sessionRow, planID, PlanVerdictReject, actorUserID, epistemicCheckDefault)
 		if err != nil {
 			logger.Error("httpapi: decide plan (reject) failed", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")

@@ -96,12 +96,13 @@ func TestEveryTurnInsertArmsTheDispatchTimer(t *testing.T) {
 			t.Fatalf("walk %s: %v", top, err)
 		}
 	}
-	// The six places a turn is inserted (technical plan §43.20):
+	// The seven places a turn is inserted (technical plan §43.20):
 	// createTurnLocked, session creation, plan approval, the workflow
-	// engine's advance, the re-review debounce's handler, the composition
-	// review. Fewer means the scan no longer sees them.
-	if arming < 6 {
-		t.Fatalf("found %d CreateTurnParams literals handed to an arming call, want at least 6: the scan is broken", arming)
+	// engine's advance, the re-review debounce's handler, an owed review
+	// request's re-run, the composition review. Fewer means the scan no
+	// longer sees them.
+	if arming < 7 {
+		t.Fatalf("found %d CreateTurnParams literals handed to an arming call, want at least 7: the scan is broken", arming)
 	}
 }
 

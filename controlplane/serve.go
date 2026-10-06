@@ -94,6 +94,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/shadowlinear"
 	"github.com/narvidev/narvi/internal/app/shadowscm"
 	"github.com/narvidev/narvi/internal/app/shadowslack"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/app/uploadsweep"
 	"github.com/narvidev/narvi/internal/domain/integrations"
 	"github.com/narvidev/narvi/internal/domain/mcpclient"
@@ -730,6 +731,16 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	if err != nil {
 		return nil, fmt.Errorf("construct session actor registry: %w", err)
 	}
+	// sessionGuard is the session guard (technical plan §40.1,
+	// internal/app/turnguard): every turn a request, a webhook or the
+	// release worker creates passes it, and a refusal's warning is
+	// broadcast to the session's live subscribers through hub. The session
+	// actors hold a guard of their own, built by the registry on the same
+	// pool, whose warnings ride their own commit-then-broadcast. A
+	// refusal's notice is held for the deployment's notice hold while its
+	// caller replies on the session's own channel (AnsweredOnChannel).
+	sessionGuard := turnguard.New(pool, hub, cfg.ShadowMode).WithNoticeHold(cfg.Timeouts.SessionGuardNoticeHold)
+
 	sessionStore := postgres.NewSessionStore(pool)
 	turnStore := postgres.NewTurnStore(pool)
 	sandboxStore := postgres.NewSandboxStore(pool)
@@ -1483,6 +1494,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			Turns:        turnStore,
 			Environments: environmentStore,
 			Registry:     registry,
+			SessionGuard: sessionGuard,
 			Deliveries:   webhookDeliveryStore,
 			Threads:      slackThreadSessionStore,
 			AuditLog:     auditLogStore,
@@ -1563,6 +1575,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			Outbox:              outboxStore,
 			LinearAgentSessions: linearAgentSessionStore,
 			Registry:            registry,
+			SessionGuard:        sessionGuard,
 			SlackClient:         slackDecorated,
 			AuditLog:            auditLogStore,
 			IdentityLink:        appIdentityLinkDeps,
@@ -1611,6 +1624,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 				Turns:            turnStore,
 				Environments:     environmentStore,
 				Registry:         registry,
+				SessionGuard:     sessionGuard,
 				IntentClassifier: intentClassifierSvc,
 				AuditLog:         auditLogStore,
 				// Identities/Users/Participants (batch fix/audit-github-actor-
@@ -2057,6 +2071,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		liveSourceControl:    liveSourceControl,
 		sourceControl:        sourceControl,
 		registry:             registry,
+		sessionGuard:         sessionGuard,
 		sessions:             sessionStore,
 		turns:                turnStore,
 		environments:         environmentStore,
@@ -2208,7 +2223,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// turns ("turn recovery", §8.7): the relaunch-and-resume
 		// REST API -- enqueues a new turn on an existing session, 409 if
 		// one is already in flight. See httpapi/turn.go's own doc comment.
-		r.Post("/{sessionID}/turns", httpapi.CreateTurn(pool, sessionStore, turnStore, planStore, participantStore, auditLogStore, registry, intentClassifierSvc, cfg.ObjectStorage, cfg.EpistemicCheckDefault))
+		r.Post("/{sessionID}/turns", httpapi.CreateTurn(pool, sessionStore, turnStore, planStore, participantStore, auditLogStore, registry, sessionGuard, intentClassifierSvc, cfg.ObjectStorage, cfg.EpistemicCheckDefault))
 		// stop (technical plan §3.3): a person's request to stop the
 		// session and every session it started, written as data under the
 		// session's actor-epoch lock; the actor does the rest. See
@@ -2229,7 +2244,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// doc comment for the full sequencing. outboxStore/
 		// linearAgentSessionStore (§8.1, "plan mode, cross-channel") feed
 		// DecidePlanOnTx's own cross-channel-notify step (decideplan.go).
-		r.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(pool, sessionStore, turnStore, planStore, eventStore, planDocumentStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, registry, cfg.EpistemicCheckDefault))
+		r.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(pool, sessionStore, turnStore, planStore, eventStore, planDocumentStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, registry, sessionGuard, cfg.EpistemicCheckDefault))
 		r.Post("/{sessionID}/plans/{planId}/reject", httpapi.RejectPlan(pool, sessionStore, turnStore, planStore, eventStore, planDocumentStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, cfg.EpistemicCheckDefault))
 		// Audit-fix batch (completeness/discoverability, M3): the read half
 		// plans/{planId}/approve|reject above was always missing -- a web
@@ -2244,7 +2259,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// second, independently-constructed copy. With GitHub outbound off
 		// (cfg.GitHubOutbound nil) the route stays mounted and re-reviews
 		// without pre-fetched context, making no GitHub call.
-		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(pool, sessionStore, turnStore, planStore, auditLogStore, registry, githubPRSessionStore, sourceControl, reviewFindingStore, falsePositivePatternStore, reviewVerdictStore, knowledgeRanker, cfg.GitHubOutbound, cfg.Timeouts, appreviewtriage.Deps{RepoSettings: repoSettingsStore, ReviewVerdicts: reviewVerdictStore, Artifacts: artifactStore, Sessions: sessionStore, SizeExclusions: cfg.ReviewSizeExcludedPaths}, cfg.ReviewModelDeep))
+		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(pool, sessionStore, turnStore, planStore, auditLogStore, registry, sessionGuard, githubPRSessionStore, sourceControl, reviewFindingStore, falsePositivePatternStore, reviewVerdictStore, knowledgeRanker, cfg.GitHubOutbound, cfg.Timeouts, appreviewtriage.Deps{RepoSettings: repoSettingsStore, ReviewVerdicts: reviewVerdictStore, Artifacts: artifactStore, Sessions: sessionStore, SizeExclusions: cfg.ReviewSizeExcludedPaths}, cfg.ReviewModelDeep))
 		// review/findings/{identityHash}/rebut + apply-suggestion (
 		// "sentinels + suggestions", §12.2 item 2/§22.1) -- maintainer+
 		// only (authz.ActionEditReviewVerdict, checked inside each
@@ -2298,7 +2313,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// runs, see httpapi/workflowruns.go's own doc comment.
 	router.Route("/api/workflow-runs", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessionStore, userStore))
-		r.Post("/{runId}/steps/{stepRunId}/decide", httpapi.DecideWorkflowStep(pool, sessionStore, turnStore, participantStore, workflowStore, slackThreadSessionStore, linearAgentSessionStore, githubPRSessionStore, outboxStore, registry, cfg.EpistemicCheckDefault))
+		r.Post("/{runId}/steps/{stepRunId}/decide", httpapi.DecideWorkflowStep(pool, sessionStore, turnStore, participantStore, workflowStore, slackThreadSessionStore, linearAgentSessionStore, githubPRSessionStore, outboxStore, registry, sessionGuard, cfg.EpistemicCheckDefault))
 		r.Get("/{runId}", httpapi.GetWorkflowRun(sessionStore, workflowStore))
 	})
 
@@ -2759,6 +2774,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 			Turns:              turnStore,
 			Environments:       environmentStore,
 			Registry:           registry,
+			SessionGuard:       sessionGuard,
 			Deliveries:         webhookDeliveryStore,
 			AgentSessions:      linearAgentSessionStore,
 			Installations:      linearInstallationStore,
@@ -2977,9 +2993,9 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		GetSessionResult: httpapi.GetSessionResult(sessionResultDeps),
 		CreateSession:    httpapi.CreateSession(pool, sessionStore, turnStore, environmentStore, auditLogStore, registry, intentClassifierSvc, cfg.EpistemicCheckDefault, cfg.RolloutMode, repoSettingsStore, githubPRSessionStore),
 		ListPlans:        httpapi.ListPlans(sessionStore, planStore, turnStore, eventStore, planDocumentStore),
-		ApprovePlan:      httpapi.ApprovePlan(pool, sessionStore, turnStore, planStore, eventStore, planDocumentStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, registry, cfg.EpistemicCheckDefault),
+		ApprovePlan:      httpapi.ApprovePlan(pool, sessionStore, turnStore, planStore, eventStore, planDocumentStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, registry, sessionGuard, cfg.EpistemicCheckDefault),
 		RejectPlan:       httpapi.RejectPlan(pool, sessionStore, turnStore, planStore, eventStore, planDocumentStore, participantStore, outboxStore, linearAgentSessionStore, auditLogStore, cfg.EpistemicCheckDefault),
-		CreateTurn:       httpapi.CreateTurn(pool, sessionStore, turnStore, planStore, participantStore, auditLogStore, registry, intentClassifierSvc, cfg.ObjectStorage, cfg.EpistemicCheckDefault),
+		CreateTurn:       httpapi.CreateTurn(pool, sessionStore, turnStore, planStore, participantStore, auditLogStore, registry, sessionGuard, intentClassifierSvc, cfg.ObjectStorage, cfg.EpistemicCheckDefault),
 		StopSession: httpapi.StopSession(httpapi.StopSessionDeps{
 			Pool:             pool,
 			Sessions:         sessionStore,
@@ -3118,6 +3134,10 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		// handling a second kind (see that type's own updated Deliver
 		// switch).
 		outboxNotifiers[ports.NotificationKindSlackWorkflowDecision] = planSlackNotifier
+		// Technical plan §40.1: the session guard's one notice per
+		// crossing (internal/app/turnguard), the same payload shape and
+		// the same notifier as the workflow decision notice.
+		outboxNotifiers[ports.NotificationKindSlackSessionGuard] = planSlackNotifier
 		// §21 ("review verdict persistence, analytics, digest &
 		// automated approval", §21.3): the deterministic daily digest's
 		// own Slack kind. digestSlackNotifier reuses the SAME
@@ -3136,6 +3156,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		outboxNotifiers[ports.NotificationKindLinear] = linearNotifier
 		outboxNotifiers[ports.NotificationKindLinearProgress] = linearNotifier
 		outboxNotifiers[ports.NotificationKindLinearWorkflowDecision] = linearNotifier
+		outboxNotifiers[ports.NotificationKindLinearSessionGuard] = linearNotifier
 		// digestLinearNotifier takes no dependencies at all -- see that
 		// type's own doc comment (outboxworker/digestlinearnotifier.go)
 		// for why it always returns a clear, typed error rather than

@@ -190,6 +190,7 @@ func TestIgnoredForEndReason(t *testing.T) {
 	t.Parallel()
 
 	contextMoved := turn.EndReasonContextMoved
+	spendCap := turn.EndReasonSpendCap
 	unknown := "a_reason_a_newer_binary_wrote"
 	for _, tc := range []struct {
 		name      string
@@ -198,6 +199,7 @@ func TestIgnoredForEndReason(t *testing.T) {
 	}{
 		{name: "no end reason", endReason: nil, want: false},
 		{name: "context_moved", endReason: &contextMoved, want: true},
+		{name: "spend_cap", endReason: &spendCap, want: true},
 		{name: "an end reason this binary does not know", endReason: &unknown, want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

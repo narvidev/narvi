@@ -203,6 +203,32 @@ SET attempts = GREATEST(attempts - 1, 0),
 WHERE id = $1 AND status = 'pending' AND next_attempt_at = sqlc.arg('expected_next_attempt_at')
 RETURNING *;
 
+-- name: HoldNewOutboxEntry :one
+-- Makes a row just created, in the same transaction, due only wait_seconds
+-- from the database's now: a notice the session guard enqueues for a
+-- refusal its caller is about to answer on the same channel itself
+-- (technical plan §40.1, internal/app/turnguard). The notice is delivered
+-- if that reply does not land, and withdrawn (MarkOutboxEntryDeliveredInPlace)
+-- if it does; the hold is longer than the reply's own deadline, so no
+-- builder claims the row while the reply may still land. Guarded on a row
+-- still pending and never attempted.
+UPDATE outbox
+SET next_attempt_at = now() + make_interval(secs => sqlc.arg('wait_seconds')::double precision)
+WHERE id = sqlc.arg('id') AND status = 'pending' AND attempts = 0
+RETURNING *;
+
+-- name: MarkOutboxEntryDeliveredInPlace :one
+-- Records that a notice's text reached its channel another way: the
+-- caller's own reply, posted on the same channel, said it (technical plan
+-- §40.1). status='delivered', delivered_at=now(), and the notifier never
+-- runs. Only a row still pending and never attempted matches: once a
+-- builder has claimed it (attempts counted), its delivery stands, and
+-- pgx.ErrNoRows is returned.
+UPDATE outbox
+SET status = 'delivered', delivered_at = now()
+WHERE id = $1 AND status = 'pending' AND attempts = 0
+RETURNING *;
+
 -- name: RenewOutboxClaim :one
 -- Audit fix (H6, correctness -- internal/app/outboxworker/builder.go): the
 -- per-row re-claim/heartbeat outboxworker.Builder's own attempt() calls

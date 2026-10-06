@@ -28,6 +28,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/intentclassifier"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 )
 
@@ -99,7 +100,7 @@ func TestCreateTurnCore_PlanFollowup_ClassifiesBeforeSessionRowLock(t *testing.T
 	templates := narvipg.NewPromptTemplateStore(rig.pool)
 	classifier := intentclassifier.New(llm, "anthropic", "claude-haiku-4-5", templates, nil, nil)
 
-	_, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, session.ID, "yes, exactly that one", nil, false, false, pgtype.UUID{}, RejectIfOpen)
+	_, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, "yes, exactly that one", nil, false, false, pgtype.UUID{}, RejectIfOpen)
 
 	assertAwaitingApprovalDecline(t, wasCreated, cerr)
 

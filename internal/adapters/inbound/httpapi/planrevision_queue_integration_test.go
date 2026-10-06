@@ -26,6 +26,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/intentclassifier"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -164,7 +165,7 @@ func newQueuedRevisionRig(ctx context.Context, t *testing.T, rig testRig, sandbo
 	router := chi.NewRouter()
 	router.Route("/api/sessions", func(r chi.Router) {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
-		r.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.participants, rig.outbox, rig.linearAgentSessions, rig.auditLog, registry, false))
+		r.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.participants, rig.outbox, rig.linearAgentSessions, rig.auditLog, registry, turnguard.New(rig.pool, nil, false), false))
 	})
 	server := httptest.NewServer(router)
 	t.Cleanup(server.Close)
@@ -314,7 +315,7 @@ func TestRevisionQueuedBehindImplementation_LeavesItAuthorized(t *testing.T) {
 			// The revision, queued through CreateTurnForBot with plan mode
 			// on -- the pairing no ingress makes today (this file's top
 			// comment).
-			revision, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, r.registry, r.sessionID, feedback, nil, true, false, r.userID, nil, nil, nil, nil, nil, nil, nil, nil, false, nil, nil)
+			revision, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, r.registry, turnguard.New(rig.pool, nil, false), r.sessionID, feedback, nil, true, false, r.userID, nil, nil, nil, nil, nil, nil, nil, nil, false, nil, nil)
 			if err != nil {
 				t.Fatalf("CreateTurnForBot: %v", err)
 			}
@@ -468,7 +469,7 @@ func TestMentionBehindImplementation_QueuedAsAnOrdinaryTurn(t *testing.T) {
 		t.Helper()
 		// As the coalescer's reuse branch calls it for a mention: plan mode
 		// off, the mention's own text to classify.
-		created, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, r.registry, sessionID, mention, nil, false, false, r.userID, nil, &mention, nil, nil, nil, nil, nil, nil, false, nil, nil)
+		created, err := httpapi.CreateTurnForBot(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, r.registry, turnguard.New(rig.pool, nil, false), sessionID, mention, nil, false, false, r.userID, nil, &mention, nil, nil, nil, nil, nil, nil, false, nil, nil)
 		if err != nil {
 			t.Fatalf("CreateTurnForBot: %v", err)
 		}

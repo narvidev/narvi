@@ -34,6 +34,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/identitylink"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -233,6 +234,7 @@ func newSlackTestRigWithEpistemicCheckDefault(t *testing.T, pool *pgxpool.Pool, 
 		Turns:         turns,
 		Environments:  environments,
 		Registry:      registry,
+		SessionGuard:  turnguard.New(pool, nil, false),
 		Deliveries:    deliveries,
 		Threads:       threads,
 		Plans:         plans,

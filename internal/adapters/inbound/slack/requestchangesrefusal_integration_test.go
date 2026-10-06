@@ -26,6 +26,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -299,7 +300,7 @@ func TestRequestChangesRefusalText_KeysOnTheSentinel(t *testing.T) {
 	rig := newInteractiveTestRig(t, pool)
 
 	busySession, _, _ := seedApprovedImplementation(ctx, t, rig, sqlcgen.TurnStatusProcessing)
-	_, _, openTurn := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, busySession.ID, "a revision", nil, true, false, rig.defaultActorUserID, httpapi.RejectIfOpen)
+	_, _, openTurn := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), busySession.ID, "a revision", nil, true, false, rig.defaultActorUserID, httpapi.RejectIfOpen)
 	if openTurn == nil || !errors.Is(openTurn, httpapi.ErrTurnAlreadyOpen) || openTurn.Status != http.StatusConflict {
 		t.Fatalf("CreateTurnCore on a busy session = %#v, want RejectIfOpen's 409 carrying httpapi.ErrTurnAlreadyOpen", openTurn)
 	}
@@ -307,7 +308,7 @@ func TestRequestChangesRefusalText_KeysOnTheSentinel(t *testing.T) {
 	reworded.Message = "a different wording of the same refusal"
 
 	awaitingSession, _ := seedSessionTurnAndAwaitingPlan(ctx, t, rig)
-	_, _, awaiting := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, awaitingSession.ID, "an ordinary prompt", nil, false, false, rig.defaultActorUserID, httpapi.RejectIfOpen)
+	_, _, awaiting := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), awaitingSession.ID, "an ordinary prompt", nil, false, false, rig.defaultActorUserID, httpapi.RejectIfOpen)
 	if awaiting == nil || !errors.Is(awaiting, httpapi.ErrPlanAwaitingApproval) || awaiting.Status != http.StatusConflict {
 		t.Fatalf("CreateTurnCore against a plan awaiting approval = %#v, want its 409 carrying httpapi.ErrPlanAwaitingApproval", awaiting)
 	}

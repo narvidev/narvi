@@ -307,6 +307,48 @@ func (q *Queries) GetOutboxEntry(ctx context.Context, id pgtype.UUID) (Outbox, e
 	return i, err
 }
 
+const holdNewOutboxEntry = `-- name: HoldNewOutboxEntry :one
+UPDATE outbox
+SET next_attempt_at = now() + make_interval(secs => $1::double precision)
+WHERE id = $2 AND status = 'pending' AND attempts = 0
+RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions
+`
+
+type HoldNewOutboxEntryParams struct {
+	WaitSeconds float64     `json:"wait_seconds"`
+	ID          pgtype.UUID `json:"id"`
+}
+
+// Makes a row just created, in the same transaction, due only wait_seconds
+// from the database's now: a notice the session guard enqueues for a
+// refusal its caller is about to answer on the same channel itself
+// (technical plan §40.1, internal/app/turnguard). The notice is delivered
+// if that reply does not land, and withdrawn (MarkOutboxEntryDeliveredInPlace)
+// if it does; the hold is longer than the reply's own deadline, so no
+// builder claims the row while the reply may still land. Guarded on a row
+// still pending and never attempted.
+func (q *Queries) HoldNewOutboxEntry(ctx context.Context, arg HoldNewOutboxEntryParams) (Outbox, error) {
+	row := q.db.QueryRow(ctx, holdNewOutboxEntry, arg.WaitSeconds, arg.ID)
+	var i Outbox
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.Kind,
+		&i.Payload,
+		&i.Status,
+		&i.Attempts,
+		&i.NextAttemptAt,
+		&i.DeliveredAt,
+		&i.LastError,
+		&i.CreatedAt,
+		&i.CorrelationID,
+		&i.SuppressedInShadow,
+		&i.DeliveredToLedger,
+		&i.ConsecutiveInterruptions,
+	)
+	return i, err
+}
+
 const listDeadLetterOutboxEntries = `-- name: ListDeadLetterOutboxEntries :many
 SELECT id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions FROM outbox
 WHERE status = 'dead_letter'
@@ -701,6 +743,41 @@ RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, deli
 // (§5.1, migrations/000152).
 func (q *Queries) MarkOutboxEntryDelivered(ctx context.Context, id pgtype.UUID) (Outbox, error) {
 	row := q.db.QueryRow(ctx, markOutboxEntryDelivered, id)
+	var i Outbox
+	err := row.Scan(
+		&i.ID,
+		&i.SessionID,
+		&i.Kind,
+		&i.Payload,
+		&i.Status,
+		&i.Attempts,
+		&i.NextAttemptAt,
+		&i.DeliveredAt,
+		&i.LastError,
+		&i.CreatedAt,
+		&i.CorrelationID,
+		&i.SuppressedInShadow,
+		&i.DeliveredToLedger,
+		&i.ConsecutiveInterruptions,
+	)
+	return i, err
+}
+
+const markOutboxEntryDeliveredInPlace = `-- name: MarkOutboxEntryDeliveredInPlace :one
+UPDATE outbox
+SET status = 'delivered', delivered_at = now()
+WHERE id = $1 AND status = 'pending' AND attempts = 0
+RETURNING id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions
+`
+
+// Records that a notice's text reached its channel another way: the
+// caller's own reply, posted on the same channel, said it (technical plan
+// §40.1). status='delivered', delivered_at=now(), and the notifier never
+// runs. Only a row still pending and never attempted matches: once a
+// builder has claimed it (attempts counted), its delivery stands, and
+// pgx.ErrNoRows is returned.
+func (q *Queries) MarkOutboxEntryDeliveredInPlace(ctx context.Context, id pgtype.UUID) (Outbox, error) {
+	row := q.db.QueryRow(ctx, markOutboxEntryDeliveredInPlace, id)
 	var i Outbox
 	err := row.Scan(
 		&i.ID,

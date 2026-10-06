@@ -589,15 +589,7 @@ func (a *Actor) handleTurnDeadlineTimer(ctx context.Context) error {
 		// execution_complete event would (pushpr.go's completeProcessingTurn)
 		// -- see OnTurnCompleted's own doc comment for why ALL THREE
 		// terminal-state call sites need this hook, not just that one.
-		workflowengine.OnTurnCompleted(ctx, workflowengine.Deps{
-			Workflows:             a.stores.workflow.WithTx(tx),
-			Turns:                 a.stores.turn.WithTx(tx),
-			SlackThreadSessions:   a.stores.slackThreadSession.WithTx(tx),
-			LinearAgentSessions:   a.stores.linearAgentSession.WithTx(tx),
-			GitHubPRSessions:      a.stores.githubPRSession.WithTx(tx),
-			Outbox:                a.stores.outbox.WithTx(tx),
-			EpistemicCheckDefault: a.epistemicCheckDefault,
-		}, sessionRow, processing.ID, turn.TriggerTimeout)
+		workflowengine.OnTurnCompleted(ctx, a.workflowDeps(tx), sessionRow, processing.ID, turn.TriggerTimeout)
 
 		// §3.3: "Stop/failure paths emit a synthetic execution_complete
 		// event so clients always see one terminal event per turn" --

@@ -3702,3 +3702,63 @@ func TestSandboxLifetimeFieldsAreReadOnlyInPlatform(t *testing.T) {
 		t.Fatalf("scanned %d files, and SandboxLifetimeFor reads %v: the scan is broken", scanned, readInTheGetter)
 	}
 }
+
+// TestValidate_SessionGuardNoticeHold pins how long the session guard holds
+// a crossing's notice while its caller replies on the session's own channel
+// (technical plan §40.1): the shipped two minutes and ten seconds, and the
+// hold refused unless it outlasts every reply that may withdraw it -- the
+// code host's, the chat surface's, the issue tracker's -- accepted at
+// exactly MinTimeoutMargin above each.
+func TestValidate_SessionGuardNoticeHold(t *testing.T) {
+	t.Parallel()
+
+	defaults := platform.DefaultTimeouts()
+	if defaults.SessionGuardNoticeHold != 2*time.Minute || defaults.SessionGuardReplyTimeout != 10*time.Second {
+		t.Fatalf("defaults = hold %v, reply %v; want 2m0s and 10s", defaults.SessionGuardNoticeHold, defaults.SessionGuardReplyTimeout)
+	}
+
+	for _, tc := range []struct {
+		name      string
+		mutate    func(*platform.Timeouts)
+		wantChain string // the broken link, or "" for valid
+	}{
+		{name: "hold at the code host's reply bound", mutate: func(to *platform.Timeouts) {
+			to.SessionGuardNoticeHold = to.SessionGuardReplyTimeout
+		}, wantChain: "SessionGuardNoticeHold > SessionGuardReplyTimeout"},
+		{name: "chat surface's reply bound raised past the hold", mutate: func(to *platform.Timeouts) {
+			to.SlackAckTimeout = to.SessionGuardNoticeHold
+		}, wantChain: "SessionGuardNoticeHold > SlackAckTimeout"},
+		{name: "issue tracker's reply bound raised past the hold", mutate: func(to *platform.Timeouts) {
+			to.LinearOutboundActivityTimeout = to.SessionGuardNoticeHold + time.Second
+		}, wantChain: "SessionGuardNoticeHold > LinearOutboundActivityTimeout"},
+		{name: "hold exactly the margin above every reply bound", mutate: func(to *platform.Timeouts) {
+			to.SessionGuardNoticeHold = max(to.SessionGuardReplyTimeout, to.SlackAckTimeout, to.LinearOutboundActivityTimeout) + platform.MinTimeoutMargin
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			if tc.wantChain == "" {
+				if err != nil {
+					t.Fatalf("Validate() = %v, want nil", err)
+				}
+				return
+			}
+			found := false
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				for _, e := range joined.Unwrap() {
+					var inv *platform.TimeoutInvariantError
+					if errors.As(e, &inv) && inv.Chain == tc.wantChain {
+						found = true
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("Validate() = %v, want the broken link %q among its errors", err, tc.wantChain)
+			}
+		})
+	}
+}

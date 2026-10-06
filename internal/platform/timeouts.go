@@ -3153,6 +3153,31 @@ type Timeouts struct {
 	// per frozen pull request per minute.
 	AutonomyFreezeRecheckInterval time.Duration
 
+	// SessionGuardReplyTimeout bounds the code host's reply to a mention
+	// the session guard refused (technical plan §40.1): the one comment the
+	// GitHub ingress posts on the pull request with the refusal's text
+	// (internal/adapters/inbound/github's postSessionGuardReply). The chat
+	// surface's and the issue tracker's replies have their own bounds
+	// already (SlackAckTimeout, LinearOutboundActivityTimeout). Not
+	// specified in the plan; 10 seconds, GitHubGetPRTimeout's figure for a
+	// single REST call.
+	SessionGuardReplyTimeout time.Duration
+
+	// SessionGuardNoticeHold is how long the session guard's notice for a
+	// crossing is held, undelivered, when the refused request came in on
+	// the session's own channel and its caller is answering it there
+	// (technical plan §40.1, turnguard.AnsweredOnChannel). The notice is
+	// written with the crossing's warning, before the reply is tried, and
+	// is due only this far ahead on the database's clock: a reply that
+	// lands withdraws it (turnguard.Answered), and one that fails, times
+	// out or never runs -- the process gone -- leaves it to be delivered,
+	// so the crossing is told once either way. Validate keeps it above each
+	// reply's own bound (SessionGuardReplyTimeout, SlackAckTimeout,
+	// LinearOutboundActivityTimeout), so no builder delivers the notice
+	// while its reply may still land. Not specified in the plan; two
+	// minutes: a failed reply is made good within about two minutes.
+	SessionGuardNoticeHold time.Duration
+
 	// ReviewContextMoveMaxConsecutive is how many automatic review attempts
 	// of one pull request in a row may meet a moved context at dispatch
 	// and still ask again (technical plan §24.9): an attempt that waited
@@ -4463,6 +4488,9 @@ func DefaultTimeouts() Timeouts {
 
 		AutonomyFreezeRecheckInterval: 60 * time.Second, // §40.2; not specified, chosen -- the unfreeze latency of a held re-review and a held outbox delivery, see field doc comment
 
+		SessionGuardReplyTimeout: 10 * time.Second, // §40.1; not specified, chosen -- GitHubGetPRTimeout's figure for a single REST call, see field doc comment
+		SessionGuardNoticeHold:   2 * time.Minute,  // §40.1; not specified, chosen -- above every refusal reply's own bound, see field doc comment
+
 		ReviewContextMoveMaxConsecutive: 3, // §24.9; not specified, chosen -- a count of automatic attempts in a row that met a moved context, see field doc comment
 
 		ReviewCostBudgetServerReadHeaderTimeout: 5 * time.Second, // §26.7/§26.9; not specified, chosen -- matches RepoSHADiscoveryTimeout/CredentialFetchTimeout's own "lightweight, purely local" precedent, see field doc comment
@@ -4876,6 +4904,17 @@ func (t Timeouts) Validate() error {
 			GreaterValue: t.ReviewRetriggerHoldBackstop,
 		})
 	}
+
+	// §40.1, a crossing told on the session's own channel: the held notice
+	// outlasts every reply that may withdraw it. See SessionGuardNoticeHold's
+	// doc comment.
+	check("SessionGuardNoticeHold > SessionGuardReplyTimeout",
+		"SessionGuardNoticeHold", t.SessionGuardNoticeHold, "SessionGuardReplyTimeout", t.SessionGuardReplyTimeout)
+	check("SessionGuardNoticeHold > SlackAckTimeout",
+		"SessionGuardNoticeHold", t.SessionGuardNoticeHold, "SlackAckTimeout", t.SlackAckTimeout)
+	check("SessionGuardNoticeHold > LinearOutboundActivityTimeout",
+		"SessionGuardNoticeHold", t.SessionGuardNoticeHold, "LinearOutboundActivityTimeout", t.LinearOutboundActivityTimeout)
+	mustBePositive("SessionGuardReplyTimeout", t.SessionGuardReplyTimeout)
 
 	// §3.3's stop, after the named session's commit: a zero walk bound
 	// reaches no session it started, and one at or past

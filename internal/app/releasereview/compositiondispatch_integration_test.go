@@ -18,6 +18,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/releasereview"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -116,6 +117,7 @@ func TestRun_CompositionTurnWithAFailedTriggerIsDispatchedByThePump(t *testing.T
 	}
 	deps := fullCompositionDeps(lister, &fakeOutboxEnqueuer{}, templates, diffFetcher, &fakeCompositionTurnInserter{}, &fakeCompositionDispatcher{})
 	deps.CompositionTurns = narvipg.NewLockedTurnCreator(pool)
+	deps.CompositionGuard = turnguard.New(pool, nil, false)
 	deps.CompositionDispatch = registryDispatcher{registry: worker}
 
 	releasereview.Run(ctx, discardLogger(), deps, releasereview.Input{

@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -148,6 +149,22 @@ func (s *OutboxStore) ListDeadLetter(ctx context.Context, limit int32) ([]sqlcge
 // see MarkOutboxEntryDelivered's own generated doc comment).
 func (s *OutboxStore) MarkDelivered(ctx context.Context, id pgtype.UUID) (sqlcgen.Outbox, error) {
 	return s.q.MarkOutboxEntryDelivered(ctx, id)
+}
+
+// HoldNew makes id's row, just created in this store's transaction and
+// never attempted, due only wait from the database's now
+// (HoldNewOutboxEntry). pgx.ErrNoRows when the row is not pending or was
+// attempted.
+func (s *OutboxStore) HoldNew(ctx context.Context, id pgtype.UUID, wait time.Duration) (sqlcgen.Outbox, error) {
+	return s.q.HoldNewOutboxEntry(ctx, sqlcgen.HoldNewOutboxEntryParams{ID: id, WaitSeconds: wait.Seconds()})
+}
+
+// MarkDeliveredInPlace records that id's notice reached its channel by
+// another way, so it is never delivered (MarkOutboxEntryDeliveredInPlace).
+// pgx.ErrNoRows when the row is no longer pending or a builder already
+// claimed it: its delivery then stands.
+func (s *OutboxStore) MarkDeliveredInPlace(ctx context.Context, id pgtype.UUID) (sqlcgen.Outbox, error) {
+	return s.q.MarkOutboxEntryDeliveredInPlace(ctx, id)
 }
 
 // RecordFailure records a failed delivery attempt still eligible for

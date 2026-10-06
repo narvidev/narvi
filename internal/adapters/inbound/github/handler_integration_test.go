@@ -33,6 +33,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
 	"github.com/narvidev/narvi/internal/domain/turn"
@@ -106,6 +107,7 @@ func newTestRig(t *testing.T, mutate ...func(*githubingress.Config)) testRig {
 		Turns:        rig.turns,
 		Environments: narvipg.NewEnvironmentStore(pool),
 		Registry:     registry,
+		SessionGuard: turnguard.New(pool, nil, false),
 		AuditLog:     narvipg.NewAuditLogStore(pool),
 		// Plans (a follow-up fix, Finding 1): wired unconditionally
 		// for every test in this file, mirroring cmd/control-plane/main.go's

@@ -42,6 +42,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/identitylink"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -382,6 +383,7 @@ func TestHandler_DualDelivery_FailedFirstAttemptReleasesBothClaimsForRedelivery(
 		Turns:           turns,
 		Environments:    narvipg.NewEnvironmentStore(pool),
 		Registry:        registry,
+		SessionGuard:    turnguard.New(pool, nil, false),
 		Deliveries:      deliveries,
 		Threads:         threads,
 		AuditLog:        auditLog,
@@ -451,6 +453,7 @@ func TestHandler_DualDelivery_FailedFirstAttemptReleasesBothClaimsForRedelivery(
 		Turns:           turns,
 		Environments:    narvipg.NewEnvironmentStore(pool),
 		Registry:        registry,
+		SessionGuard:    turnguard.New(pool, nil, false),
 		Deliveries:      deliveries,
 		Threads:         threads,
 		AuditLog:        auditLog,
@@ -677,6 +680,7 @@ func newSlackAckTestRigWithRepo(t *testing.T, pool *pgxpool.Pool, defaultRepoNam
 		Turns:           turns,
 		Environments:    environments,
 		Registry:        registry,
+		SessionGuard:    turnguard.New(pool, nil, false),
 		Deliveries:      deliveries,
 		Threads:         threads,
 		AuditLog:        auditLog,

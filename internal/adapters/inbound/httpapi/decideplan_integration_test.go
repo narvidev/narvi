@@ -17,6 +17,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/outboxworker"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -64,7 +65,7 @@ func TestDecidePlan_CrossChannelNotify_SlackMessageUpdated(t *testing.T) {
 
 	var noDecider pgtype.UUID
 	outcome, err := httpapi.DecidePlan(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.outbox, rig.linearAgentSessions, rig.auditLog, rig.registry,
-		session.ID, plan.ID, httpapi.PlanVerdictApprove, noDecider, false)
+		turnguard.New(rig.pool, nil, false), session.ID, plan.ID, httpapi.PlanVerdictApprove, noDecider, false)
 	if err != nil {
 		t.Fatalf("DecidePlan: %v", err)
 	}
@@ -158,7 +159,7 @@ func TestDecidePlan_FirstWinsAcrossChannels_ApproveVsReject(t *testing.T) {
 		eg.Go(func() error {
 			var noDecider pgtype.UUID
 			outcome, err := httpapi.DecidePlan(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.outbox, rig.linearAgentSessions, rig.auditLog, rig.registry,
-				session.ID, plan.ID, verdict, noDecider, false)
+				turnguard.New(rig.pool, nil, false), session.ID, plan.ID, verdict, noDecider, false)
 			results <- result{verdict: verdict, outcome: outcome, err: err}
 			return nil
 		})
@@ -257,7 +258,7 @@ func TestDecidePlan_CrossSessionPlanIDDoesNotLeakStatus(t *testing.T) {
 	// unambiguously surface.
 	var noDecider pgtype.UUID
 	decideOutcome, err := httpapi.DecidePlan(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.outbox, rig.linearAgentSessions, rig.auditLog, rig.registry,
-		sessionB.ID, planB.ID, httpapi.PlanVerdictApprove, noDecider, false)
+		turnguard.New(rig.pool, nil, false), sessionB.ID, planB.ID, httpapi.PlanVerdictApprove, noDecider, false)
 	if err != nil || !decideOutcome.Won || decideOutcome.FinalStatus != "approved" {
 		t.Fatalf("seed decision on session B's own plan: outcome=%+v err=%v, want Won=true FinalStatus=approved", decideOutcome, err)
 	}
@@ -266,7 +267,7 @@ func TestDecidePlan_CrossSessionPlanIDDoesNotLeakStatus(t *testing.T) {
 	// B's planID -- a planID that exists, and IS currently 'approved', but
 	// belongs to a session sessionA has no relationship to whatsoever.
 	outcome, err := httpapi.DecidePlan(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.outbox, rig.linearAgentSessions, rig.auditLog, rig.registry,
-		sessionA.ID, planB.ID, httpapi.PlanVerdictApprove, noDecider, false)
+		turnguard.New(rig.pool, nil, false), sessionA.ID, planB.ID, httpapi.PlanVerdictApprove, noDecider, false)
 	if err != nil {
 		t.Fatalf("DecidePlan(cross-session planID): unexpected error: %v", err)
 	}
@@ -323,7 +324,7 @@ func TestDecidePlanOnTx_Approve_AuditDetailCarriesTurnID(t *testing.T) {
 
 	var noDecider pgtype.UUID
 	outcome, err := httpapi.DecidePlan(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.outbox, rig.linearAgentSessions, rig.auditLog, rig.registry,
-		session.ID, plan.ID, httpapi.PlanVerdictApprove, noDecider, false)
+		turnguard.New(rig.pool, nil, false), session.ID, plan.ID, httpapi.PlanVerdictApprove, noDecider, false)
 	if err != nil {
 		t.Fatalf("DecidePlan: %v", err)
 	}
@@ -357,7 +358,7 @@ func TestDecidePlanOnTx_Reject_AuditDetailHasNoTurnID(t *testing.T) {
 
 	var noDecider pgtype.UUID
 	outcome, err := httpapi.DecidePlan(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.outbox, rig.linearAgentSessions, rig.auditLog, rig.registry,
-		session.ID, plan.ID, httpapi.PlanVerdictReject, noDecider, false)
+		turnguard.New(rig.pool, nil, false), session.ID, plan.ID, httpapi.PlanVerdictReject, noDecider, false)
 	if err != nil {
 		t.Fatalf("DecidePlan: %v", err)
 	}

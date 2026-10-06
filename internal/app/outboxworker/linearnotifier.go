@@ -67,14 +67,16 @@ func NewLinearNotifier(client *linearapi.Client, installations *postgres.LinearI
 // workflowengine's own enqueueWorkflowNotice, notify.go), the EXACT same
 // shape ports.NotificationKindLinear's own deliverOutcome already handles,
 // so this reuses that method verbatim rather than duplicating its
-// CreateResponseActivity call here.
+// CreateResponseActivity call here. The session guard's notice
+// (ports.NotificationKindLinearSessionGuard, technical plan §40.1) carries
+// the same payload shape and is delivered the same way.
 func (n *linearNotifier) Deliver(ctx context.Context, notification ports.Notification) error {
 	switch notification.Kind {
 	case ports.NotificationKindLinear:
 		return n.deliverOutcome(ctx, notification.Payload)
 	case ports.NotificationKindLinearProgress:
 		return n.deliverProgress(ctx, notification.Payload)
-	case ports.NotificationKindLinearWorkflowDecision:
+	case ports.NotificationKindLinearWorkflowDecision, ports.NotificationKindLinearSessionGuard:
 		return n.deliverOutcome(ctx, notification.Payload)
 	default:
 		return fmt.Errorf("outboxworker: linearNotifier: unrecognized notification kind %q", notification.Kind)

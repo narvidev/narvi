@@ -15,6 +15,7 @@ import (
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 )
 
 // dispatchTimerName is sessionactor.TimerDispatch, the kind
@@ -63,7 +64,7 @@ func TestTurnStore_CreateAndArmDispatch(t *testing.T) {
 	prompt := "do the thing"
 	params := sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &prompt}
 
-	if _, err := turns.CreateAndArmDispatch(ctx, params); !errors.Is(err, narvipg.ErrTurnOutsideTransaction) {
+	if _, err := turns.CreateAndArmDispatch(ctx, params, sessionguard.AdmitNewSession(params.SessionID.Bytes)); !errors.Is(err, narvipg.ErrTurnOutsideTransaction) {
 		t.Fatalf("CreateAndArmDispatch on the pool = %v, want ErrTurnOutsideTransaction", err)
 	}
 	if n := countTurns(ctx, t, pool, sessionID); n != 0 {
@@ -80,7 +81,7 @@ func TestTurnStore_CreateAndArmDispatch(t *testing.T) {
 			t.Fatal(err)
 		}
 		defer func() { _ = tx.Rollback(ctx) }()
-		if _, err := turns.WithTx(tx).CreateAndArmDispatch(ctx, params); err != nil {
+		if _, err := turns.WithTx(tx).CreateAndArmDispatch(ctx, params, sessionguard.AdmitNewSession(params.SessionID.Bytes)); err != nil {
 			t.Fatalf("CreateAndArmDispatch: %v", err)
 		}
 		timer, dbNow, ok := dispatchTimerRow(ctx, t, tx, sessionID)
@@ -200,7 +201,7 @@ func TestCreateAndArmDispatch_RefusesATerminalTurn(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			_, err = turns.WithTx(tx).CreateAndArmDispatch(ctx, params(sessionID))
+			_, err = turns.WithTx(tx).CreateAndArmDispatch(ctx, params(sessionID), sessionguard.AdmitNewSession(sessionID.Bytes))
 			// Committed either way: a refusal must have written nothing.
 			if err := tx.Commit(ctx); err != nil {
 				t.Fatal(err)
@@ -208,7 +209,7 @@ func TestCreateAndArmDispatch_RefusesATerminalTurn(t *testing.T) {
 			check("CreateAndArmDispatch", sessionID, err)
 
 			sessionID = createTestSession(ctx, t, pool)
-			_, err = creator.CreateLockedTurn(ctx, params(sessionID))
+			_, err = creator.CreateLockedTurn(ctx, params(sessionID), admitForTest(sessionID))
 			check("CreateLockedTurn", sessionID, err)
 		})
 	}
@@ -253,7 +254,7 @@ func TestLockedTurnCreator_CreatesUnderTheActorEpochLock(t *testing.T) {
 		var g errgroup.Group
 		done := make(chan error, 1)
 		g.Go(func() error {
-			_, err := creator.CreateLockedTurn(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &prompt})
+			_, err := creator.CreateLockedTurn(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &prompt}, admitForTest(sessionID))
 			done <- err
 			return nil
 		})
@@ -303,7 +304,7 @@ func TestLockedTurnCreator_CreatesUnderTheActorEpochLock(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if _, err := creator.CreateLockedTurn(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &prompt}); err == nil {
+		if _, err := creator.CreateLockedTurn(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &prompt}, admitForTest(sessionID)); err == nil {
 			t.Fatal("CreateLockedTurn succeeded with its dispatch timer refused")
 		}
 		if n := countTurns(ctx, t, pool, sessionID); n != 0 {
@@ -313,8 +314,18 @@ func TestLockedTurnCreator_CreatesUnderTheActorEpochLock(t *testing.T) {
 
 	t.Run("a session that does not exist", func(t *testing.T) {
 		missing := pgtype.UUID{Bytes: [16]byte{1, 2, 3}, Valid: true}
-		if _, err := creator.CreateLockedTurn(ctx, sqlcgen.CreateTurnParams{SessionID: missing, Status: sqlcgen.TurnStatusPending, Prompt: &prompt}); !errors.Is(err, pgx.ErrNoRows) {
+		if _, err := creator.CreateLockedTurn(ctx, sqlcgen.CreateTurnParams{SessionID: missing, Status: sqlcgen.TurnStatusPending, Prompt: &prompt}, admitForTest(missing)); !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("CreateLockedTurn on a missing session = %v, want pgx.ErrNoRows", err)
 		}
 	})
+}
+
+// admitForTest is a LockedTurnCreator admission that admits sessionID's
+// turn without reading anything: these tests are about the insert and its
+// lock, not the session guard, whose own tests read the facts
+// (sessionguard_store_integration_test.go).
+func admitForTest(sessionID pgtype.UUID) narvipg.TurnAdmit {
+	return func(context.Context, pgx.Tx) (sessionguard.Admission, error) {
+		return sessionguard.AdmitNewSession(sessionID.Bytes), nil
+	}
 }

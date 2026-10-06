@@ -26,6 +26,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
@@ -413,7 +414,7 @@ func TestCreateTurn_CarriesExistingConversationID(t *testing.T) {
 	router := chi.NewRouter()
 	router.Route("/api/sessions", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessions, users))
-		r.Post("/{sessionID}/turns", httpapi.CreateTurn(pool, sessions, turns, plans, participants, auditLog, registry, nil, nil, false))
+		r.Post("/{sessionID}/turns", httpapi.CreateTurn(pool, sessions, turns, plans, participants, auditLog, registry, turnguard.New(pool, nil, false), nil, nil, false))
 	})
 	server := httptest.NewServer(router)
 	t.Cleanup(server.Close)
@@ -569,7 +570,7 @@ func newEpistemicCheckTestRig(t *testing.T, epistemicCheckDefault bool) epistemi
 	router := chi.NewRouter()
 	router.Route("/api/sessions", func(r chi.Router) {
 		r.Use(auth.Middleware(userSessions, users))
-		r.Post("/{sessionID}/turns", httpapi.CreateTurn(pool, sessions, turns, plans, participants, auditLog, registry, nil, nil, epistemicCheckDefault))
+		r.Post("/{sessionID}/turns", httpapi.CreateTurn(pool, sessions, turns, plans, participants, auditLog, registry, turnguard.New(pool, nil, false), nil, nil, epistemicCheckDefault))
 	})
 	server := httptest.NewServer(router)
 	t.Cleanup(server.Close)

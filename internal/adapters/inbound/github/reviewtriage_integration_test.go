@@ -50,6 +50,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -100,6 +101,7 @@ func newTestRigWithReviewTriage(t *testing.T, fetcher *fakeReviewContextFetcher)
 		Turns:        rig.turns,
 		Environments: narvipg.NewEnvironmentStore(pool),
 		Registry:     registry,
+		SessionGuard: turnguard.New(pool, nil, false),
 		AuditLog:     narvipg.NewAuditLogStore(pool),
 		Plans:        rig.plans,
 		Identities:   rig.identities,

@@ -7244,15 +7244,68 @@ own schedule; §3.5's auto-pause counts failures, and a run-away that succeeds i
 
 **The cap.** `repo_settings.session_spend_cap_usd` (NULL = no cap, today's exact behavior) and
 `automations.session_spend_cap_usd` for the sessions an automation creates — the automation's own
-value when present, the repository's otherwise. It is checked at the one place a turn is created,
-`createTurnLocked`/`CreateTurnCore` (the single dispatch chokepoint §23 and §25.6 already rely on),
-against `SUM(cost_usd)` over the session's own turns — derived from the rows that exist, never a
-counter column, the same discipline §25.5's loop guard and §21.1's `DISTINCT ON` reduction follow. At
-or past the cap, the turn is refused with a typed reason; the session is **not** failed and **not**
-cancelled: a persisted `warning` event and one outbox notice say the cap was reached and name the
-value, the session keeps its sandbox under §2's ordinary idle rules, and an admin or maintainer
-raising the cap (an audited write) re-admits the next turn. §3.1's taxonomy is preserved: a capped
-session is a session waiting on a human, not a failed one.
+value when present; otherwise the strictest cap among the repositories the session names (its clone
+URLs, its pull-request claims, the repository a sentinel fix belongs to). It is read against
+`SUM(cost_usd)` over the session's dispatched turns — derived from the rows that exist, never a
+counter column, the same discipline §25.5's loop guard and §21.1's `DISTINCT ON` reduction follow —
+under the session's row lock, compared in whole micro-dollars, and the turn is refused at or past
+the cap.
+
+**Where it is checked: the insert, and the dispatch.** No one function creates every turn. Seven
+sites hand a turn to `TurnStore.CreateAndArmDispatch`: a person's or a bot's prompt through
+`createTurnLocked`, a new session's first turn, plan approval, the workflow engine's advance and
+revision, the automatic re-review, an owed review request's re-run, and the composition review
+(through `CreateLockedTurn`). The chokepoint is therefore the store: it refuses an insert that does not
+carry a `sessionguard.Admission` for that session, an admission is minted only by the guard's
+decision (`internal/app/turnguard`), read in the inserting transaction under the session's row lock,
+and a source scan holds every site to it. A new session's first turn is admitted without a read: a
+session with no turn has spent nothing. The second check runs at dispatch. Before the session actor
+dispatches a pending turn, or spawns a sandbox for one, it reads the guard again, and a session past
+its cap has every pending turn ended through the abandon edge with `end_reason = spend_cap` — a turn
+that never ran, which status ignores as it ignores `context_moved` — instead of dispatched. Without it,
+the turns queued behind the one in flight (a bot's mention, the review button, the composition review)
+would each dispatch after the crossing.
+
+**What a refusal does, by site.** The session is **not** failed and **not** cancelled. A person's or a
+bot's prompt inserts nothing. REST answers 409 with `{"error": <text>, "reason": "spend_cap"}`; MCP,
+per §43.8, returns the same text as an `isError` tool result, with no `reason` key. The chat surface and
+the issue tracker reply honestly, and the code host acknowledges 200, keeps the delivery claim and
+replies on the pull request. A plan approval is refused the same way, and the plan stays awaiting
+approval. A workflow advance escalates the run to `needs_review`, and its one escalation notice says
+three things: the run needs review; it will not resume on its own even once the cap is raised (a person
+sends the next turn); and the guard's text. A queued attempt ended at dispatch sends the same notice. A
+person's decision on a step is answered 409 and rolls back. The automatic
+re-review drops that firing, spending none of the pull request's re-review budget and keeping the
+pushed head for the next push; the freeze (40.2) is read before the guard there, so a frozen firing is
+skipped, consuming nothing, before the cap is asked. An owed review request is dropped before anything is read for it (the
+requester's authorization, the pull request, the composed prompt), and its requester is told once. The
+composition review is declined for the cycle. The session keeps whatever sandbox it has under §2's
+ordinary idle rules, and an admin or maintainer raising the cap (an audited write) re-admits the next
+turn. §3.1's taxonomy is preserved: a capped session is a session waiting on a human, not a failed one.
+
+**One warning and one telling per crossing.** A crossing is the session refused after it was last
+admitted a turn, under one cap. Every refusal records a persisted `warning` event at a message id
+derived from the session, the cap, where the cap was set and the session's turn count, so every
+refusal of one crossing writes one warning, and a crossing after the session took another turn writes
+a new one, even at a cap value it crossed before. A cap moved away and back with no turn taken in
+between is the same crossing. The text is true on every path that emits it: it names the spend and the
+cap, says a turn already running is left to finish and counted (so the spend shown can be past the
+cap) and that the figure is a lower bound, and that the session has not failed. The first time a
+crossing's warning is written, its channel is told once:
+- When the refused request came in on the session's own channel — a reply in its chat thread, a
+  prompt or verdict on its issue-tracker agent session, a mention on its pull request — the caller
+  answers there, and the crossing's outbox notice is still written with its warning, before that
+  reply is tried, but held undelivered for `SessionGuardNoticeHold`, which outlasts every reply's own
+  bound. A reply that lands withdraws the notice: it is marked delivered in place and never sent. A
+  reply that fails, times out, or never runs because the process is gone leaves it to be delivered
+  when the hold ends. The channel is told once either way, and a crash between a landed reply and the
+  withdrawal can only tell it twice, never not at all.
+- Otherwise, one outbox notice goes to the session's own channel. This covers a REST or MCP request,
+  a reply only the clicking or submitting person sees (a plan button, the Request-changes modal), and
+  an automatic producer.
+- A web- or MCP-origin session has no channel: its warning is its surface.
+- When a workflow escalation tells the crossing in the same transaction, the guard enqueues no
+  notice of its own.
 
 **Who the cap applies to, and why this inverts §24.6's rule.** §24.6 exempts the human's manual
 re-trigger from the automatic re-review budget, because that budget exists to stop a *loop*, and a
@@ -7266,14 +7319,17 @@ written. A cap of zero or less permits nothing — the same shape as `loopguard.
 which §25.5 calls a misconfiguration — so the write is refused, and NULL remains the only spelling of
 "no cap".
 
-**What the cap cannot do, stated rather than implied.** It refuses the *next* turn. It does not stop
-the one in flight: this control plane has no cancel command and no channel into a running turn
-(§32.8's own stated limitation, and §26.7's reason for putting the review budget inside the sandbox).
-The overshoot is therefore bounded by one turn's own spend under `turn_deadline`, and by nothing
-tighter. And §25.15's attribution caveat carries over: a `step_finish` landing after its turn
-terminalized is attributed to whatever turn is processing then, so the sum the cap reads is a lower
-bound, never an exact bill. Neither is closed here; both are named so nobody reads the cap as a hard
-ceiling on a bill.
+**What the cap cannot do, stated rather than implied.** It refuses the *next* turn. It lets the one
+in flight finish, by choice rather than for want of a channel: the stop (§3.3, §43.22) can reach a
+running turn, but the cap does not send it, and a person who wants that turn stopped can stop it. At
+most one turn is in flight at a time (`turns_one_processing_per_session`), and every pending turn is
+checked again as it is about to dispatch, so the only spend past the cap is the rest of the one turn
+that was in flight when the cap was crossed, under `turn_deadline` or a person's stop — that turn's
+re-run on a new sandbox gen included. Three things fall outside the sum. A `step_finish` landing after
+its turn ended is attributed to whatever turn is processing then, or to none (§25.15), so the sum the
+cap reads is a lower bound, never an exact bill. Child sessions spawned during the turn in flight run
+under their own caps. And sandbox compute is not in `cost_usd` at all. None is closed here; each is
+named so nobody reads the cap as a hard ceiling on a bill.
 
 ### 40.2 The freeze: no new automatic action starts
 
@@ -7478,8 +7534,10 @@ a Step.
 - **§16** shows the freeze and lists capped and bounded sessions as waiting on a human.
 - **§24.6**'s human-path exemption is restated for the freeze and *inverted* for the cap (40.1).
 - **§26.7** is unchanged: its per-path ceilings remain the review lane's own, beneath the session cap.
-- **§32.8**'s "never sever a running turn" is inherited by the cap, the bounds and the freeze — none
-  of them re-solves it, and the hard-kill mechanism it names stays its own future Step.
+- **§32.8**'s "never sever a running turn" is inherited by the bounds and the freeze — none of them
+  re-solves it, and the hard-kill mechanism it names stays its own future Step. The cap no longer
+  inherits it for want of a channel: the stop (§3.3, §43.22) reaches a turn in flight, and the cap
+  leaves that turn to finish by choice, which is what bounds its overshoot (40.1).
 - **§38.3 and §39.3** consult the freeze. Written now, while Phase 14 is unbuilt and it costs one line
   each, on §24.8's own precedent — a constraint on those Steps, not a note about this one.
 

@@ -21,6 +21,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 )
 
 func validEpistemicOutcomeRequestJSON(outcome string) string {
@@ -66,7 +67,7 @@ func postEpistemicOutcome(t *testing.T, r testRig, sessionID, bearer, gen, body 
 // real sandbox connection would get it there.
 func createProcessingTurn(ctx context.Context, t *testing.T, r testRig, sessionID pgtype.UUID, planMode bool) sqlcgen.Turn {
 	t.Helper()
-	created, _, cerr := httpapi.CreateTurnCore(ctx, r.pool, r.sessions, r.turns, r.plans, nil, r.auditLog, r.registry, sessionID, "do the thing", nil, planMode, false, pgtype.UUID{}, httpapi.RejectIfOpen)
+	created, _, cerr := httpapi.CreateTurnCore(ctx, r.pool, r.sessions, r.turns, r.plans, nil, r.auditLog, r.registry, turnguard.New(r.pool, nil, false), sessionID, "do the thing", nil, planMode, false, pgtype.UUID{}, httpapi.RejectIfOpen)
 	if cerr != nil {
 		t.Fatalf("CreateTurnCore: status=%d message=%q", cerr.Status, cerr.Message)
 	}
@@ -215,7 +216,7 @@ func TestPostEpistemicOutcome_AbsentUntilPosted(t *testing.T) {
 	ctx := context.Background()
 	session := bareSessionWithSandbox(ctx, t, rig, "epistemic-absent")
 
-	created, _, cerr := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, session.ID, "do the thing", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen)
+	created, _, cerr := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, "do the thing", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen)
 	if cerr != nil {
 		t.Fatalf("CreateTurnCore: status=%d message=%q", cerr.Status, cerr.Message)
 	}
