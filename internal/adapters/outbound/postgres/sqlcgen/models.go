@@ -2516,8 +2516,8 @@ type Turn struct {
 	CheckoutRequestedAt       pgtype.Timestamptz    `json:"checkout_requested_at"`
 	CheckoutSentAt            pgtype.Timestamptz    `json:"checkout_sent_at"`
 	CheckoutSentReadySeq      *int32                `json:"checkout_sent_ready_seq"`
-	CheckoutSends             int32                 `json:"checkout_sends"`
-	CheckoutFailures          int32                 `json:"checkout_failures"`
+	CheckoutSends             *int32                `json:"checkout_sends"`
+	CheckoutFailures          *int32                `json:"checkout_failures"`
 	CheckoutRetiredGen        *int32                `json:"checkout_retired_gen"`
 	CheckedOutSha             *string               `json:"checked_out_sha"`
 }

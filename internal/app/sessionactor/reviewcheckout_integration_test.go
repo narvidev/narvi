@@ -65,6 +65,14 @@ func seedReviewTurn(ctx context.Context, t *testing.T, f *holdFixture, head stri
 
 func triggerOf(v string) *string { return &v }
 
+// i32 reads a count the turn stores NULL until its first checkout as 0.
+func i32(p *int32) int32 {
+	if p == nil {
+		return 0
+	}
+	return *p
+}
+
 // checkoutReady is a ready of gen, advertising reviewCheckout when
 // capable.
 func checkoutReady(gen int, capable bool) SandboxEvent {
@@ -213,13 +221,30 @@ func reviewCheckoutCount(ctx context.Context, t *testing.T, outcome string) int6
 	return readCounterSumByAttr(ctx, t, otelReader, "review_checkout_total", "outcome", outcome)
 }
 
-// settle hands the actor an EnsureDispatched and returns once it has been
-// handled: a heartbeat of gen follows it, whose reply comes only once the
-// mailbox reached it.
-func settle(ctx context.Context, t *testing.T, a *Actor, gen int) {
+// barrier returns once a has finished every command sent before it, the
+// post-commit dispatch evaluation of each included: a frame with no type
+// is dropped with a reply and runs nothing after it, and the mailbox is
+// handled in order. A heartbeat cannot stand in for it, since its own
+// evaluation runs after its reply.
+func barrier(ctx context.Context, t *testing.T, a *Actor) {
+	t.Helper()
+	sendSandboxEvent(ctx, t, a, SandboxEvent{MessageID: "barrier-" + uuid.NewString(), Raw: json.RawMessage(`{}`)})
+}
+
+// deliver hands the actor cmd, as the sandbox's socket does, and returns
+// once it has been handled, its dispatch evaluation included.
+func deliver(ctx context.Context, t *testing.T, a *Actor, cmd SandboxEvent) {
+	t.Helper()
+	sendSandboxEvent(ctx, t, a, cmd)
+	barrier(ctx, t, a)
+}
+
+// settle hands the actor an EnsureDispatched -- a dispatch timer's firing,
+// a turn's creation -- and returns once it has been handled.
+func settle(ctx context.Context, t *testing.T, a *Actor) {
 	t.Helper()
 	sendEnsureDispatched(ctx, t, a)
-	sendSandboxEvent(ctx, t, a, receiptHeartbeat(gen))
+	barrier(ctx, t, a)
 }
 
 // TestReviewCheckout_TheTurnIsSentOnlyAfterItsSandboxReportsTheRecordedHead
@@ -237,7 +262,7 @@ func TestReviewCheckout_TheTurnIsSentOnlyAfterItsSandboxReportsTheRecordedHead(t
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 	sentBefore, checkedOutBefore := reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeSent), reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeCheckedOut)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
 
 	if got := sentCommandTypes(t, rig.commander); len(got) != 1 || got[0] != "checkout" {
 		t.Fatalf("commands sent before any reply = %v, want one checkout and no prompt", got)
@@ -252,20 +277,21 @@ func TestReviewCheckout_TheTurnIsSentOnlyAfterItsSandboxReportsTheRecordedHead(t
 		t.Fatalf("turn while its checkout is outstanding: %s, dispatched %v; want pending, not dispatched", waiting.Status, waiting.DispatchedAt.Valid)
 	}
 	if waiting.CheckoutMessageID == nil || *waiting.CheckoutMessageID != cmd.MessageId || waiting.CheckoutGen == nil || *waiting.CheckoutGen != 1 ||
-		waiting.CheckoutSends != 1 || !waiting.CheckoutRequestedAt.Valid || !waiting.CheckoutSentAt.Valid || waiting.CheckedOutSha != nil {
+		i32(waiting.CheckoutSends) != 1 || !waiting.CheckoutRequestedAt.Valid || !waiting.CheckoutSentAt.Valid || waiting.CheckedOutSha != nil {
 		t.Fatalf("recorded request = message %v gen %v sends %d requested %v sent %v checked out %v; want the command's, gen 1, 1, both stamped, none",
-			waiting.CheckoutMessageID, waiting.CheckoutGen, waiting.CheckoutSends, waiting.CheckoutRequestedAt.Valid, waiting.CheckoutSentAt.Valid, waiting.CheckedOutSha)
+			waiting.CheckoutMessageID, waiting.CheckoutGen, i32(waiting.CheckoutSends), waiting.CheckoutRequestedAt.Valid, waiting.CheckoutSentAt.Valid, waiting.CheckedOutSha)
 	}
 	// The handler returned without the reply: the heartbeat after the ready
 	// was handled, and more are, with the turn still pending.
 	for i := 0; i < 3; i++ {
 		sendSandboxEvent(ctx, t, rig.actor, receiptHeartbeat(1))
 	}
+	barrier(ctx, t, rig.actor)
 	if got := sentCommandTypes(t, rig.commander); len(got) != 1 {
 		t.Fatalf("commands after heartbeats with no reply = %v, want the one checkout", got)
 	}
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "checked_out", strp(coHead), strp(coHead), nil), 1)
+	deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "checked_out", strp(coHead), strp(coHead), nil))
 
 	if got := sentCommandTypes(t, rig.commander); len(got) != 2 || got[0] != "checkout" || got[1] != "prompt" {
 		t.Fatalf("commands = %v, want the checkout, then the prompt", got)
@@ -303,15 +329,14 @@ func TestReviewCheckout_TheWaitReArmsTheDispatchTimerAhead(t *testing.T) {
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 	timeouts := platform.DefaultTimeouts()
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
 	lead, ok := dispatchTimerLead(ctx, t, pool, f.sessionID)
 	if !ok || lead < timeouts.ReviewCheckoutTimeout-time.Minute || lead > timeouts.ReviewCheckoutTimeout {
 		t.Fatalf("dispatch timer after the send fires in %s (armed %v), want about ReviewCheckoutTimeout (%s) ahead", lead, ok, timeouts.ReviewCheckoutTimeout)
 	}
 
 	cmd := lastCheckout(t, rig.commander, 1)
-	sendSandboxEvent(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "sha_absent", nil, strp(coMoved), nil))
-	sendSandboxEvent(ctx, t, rig.actor, receiptHeartbeat(1))
+	deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "sha_absent", nil, strp(coMoved), nil))
 	lead, ok = dispatchTimerLead(ctx, t, pool, f.sessionID)
 	if !ok || lead <= 0 || lead > timeouts.ReviewCheckoutRefetchInterval {
 		t.Fatalf("dispatch timer after a lagging ref fires in %s (armed %v), want ahead, within ReviewCheckoutRefetchInterval (%s)", lead, ok, timeouts.ReviewCheckoutRefetchInterval)
@@ -334,9 +359,9 @@ func TestReviewCheckout_AnAttemptWhoseHeadMovedEndsContextMoved(t *testing.T) {
 			rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 			movedBefore := reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeContextMoved)
 
-			sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+			deliver(ctx, t, rig.actor, checkoutReady(1, true))
 			cmd := lastCheckout(t, rig.commander, 1)
-			sendAndSettle(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "checked_out", strp(coHead), strp(coMoved), nil), 1)
+			deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "checked_out", strp(coHead), strp(coMoved), nil))
 
 			assertContextMoved(ctx, t, f, rig, attempt)
 			if n := len(sentPromptsOf(t, rig.commander)); n != 0 {
@@ -376,15 +401,15 @@ func TestReviewCheckout_AHeadStillAbsentPastTheLagWindowIsMoved(t *testing.T) {
 	attempt := seedReviewTurn(ctx, t, f, coHead, triggerOf(turn.RequestTriggerAuto), true)
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
 	cmd := lastCheckout(t, rig.commander, 1)
-	sendAndSettle(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "sha_absent", nil, strp(coMoved), nil), 1)
+	deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "sha_absent", nil, strp(coMoved), nil))
 	if got := getTurn(ctx, t, f, attempt.ID); got.Status != sqlcgen.TurnStatusPending {
 		t.Fatalf("attempt after a lagging ref inside the window: %s, want pending", got.Status)
 	}
 
 	backdateCheckout(ctx, t, pool, attempt.ID, platform.DefaultTimeouts().ReviewCheckoutRefLagWindow+time.Second, time.Second)
-	settle(ctx, t, rig.actor, 1)
+	settle(ctx, t, rig.actor)
 	assertContextMoved(ctx, t, f, rig, attempt)
 	if row := f.prSession(ctx, t); row.PendingRetriggerHeadSha == nil || *row.PendingRetriggerHeadSha != coMoved {
 		t.Fatalf("pending head %v, want the ref's tip %s asked again", row.PendingRetriggerHeadSha, coMoved)
@@ -413,12 +438,12 @@ func TestReviewCheckout_AMentionsTurnRunsOnTheHeadItRecorded(t *testing.T) {
 			mention := seedReviewTurn(ctx, t, f, coHead, nil, tc.attempt)
 			rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 
-			sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+			deliver(ctx, t, rig.actor, checkoutReady(1, true))
 			cmd := lastCheckout(t, rig.commander, 1)
 			if cmd.Repos[0].Sha != coHead {
 				t.Fatalf("checkout asks for %s, want the recorded head %s", cmd.Repos[0].Sha, coHead)
 			}
-			sendAndSettle(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "checked_out", strp(coHead), strp(coMoved), nil), 1)
+			deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "checked_out", strp(coHead), strp(coMoved), nil))
 
 			got := getTurn(ctx, t, f, mention.ID)
 			if got.Status != sqlcgen.TurnStatusProcessing || got.EndReason != nil {
@@ -445,24 +470,24 @@ func TestReviewCheckout_ARefThatLagsIsFetchedAgain(t *testing.T) {
 	attempt := seedReviewTurn(ctx, t, f, coHead, triggerOf(turn.RequestTriggerAuto), true)
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
 	first := lastCheckout(t, rig.commander, 1)
-	sendAndSettle(ctx, t, rig.actor, checkoutReply(t, first, 1, "sha_absent", nil, strp(coMoved), nil), 1)
+	deliver(ctx, t, rig.actor, checkoutReply(t, first, 1, "sha_absent", nil, strp(coMoved), nil))
 	if got := getTurn(ctx, t, f, attempt.ID); got.Status != sqlcgen.TurnStatusPending || len(sentCheckouts(t, rig.commander)) != 1 {
 		t.Fatalf("right after a lagging ref: %s with %d checkouts; want pending, nothing sent again before the interval", got.Status, len(sentCheckouts(t, rig.commander)))
 	}
 
 	backdateCheckout(ctx, t, pool, attempt.ID, 11*time.Second, platform.DefaultTimeouts().ReviewCheckoutRefetchInterval+time.Second)
-	settle(ctx, t, rig.actor, 1)
+	settle(ctx, t, rig.actor)
 	second := lastCheckout(t, rig.commander, 2)
 	if second.MessageId == first.MessageId || second.Repos[0].Sha != coHead {
 		t.Fatalf("second checkout %+v, want a new command for the same head", second)
 	}
-	if got := getTurn(ctx, t, f, attempt.ID); got.CheckoutSends != 2 || got.CheckoutFailures != 0 {
-		t.Fatalf("sends %d, failures %d; want 2 and 0: a lag is no failure", got.CheckoutSends, got.CheckoutFailures)
+	if got := getTurn(ctx, t, f, attempt.ID); i32(got.CheckoutSends) != 2 || i32(got.CheckoutFailures) != 0 {
+		t.Fatalf("sends %d, failures %d; want 2 and 0: a lag is no failure", i32(got.CheckoutSends), i32(got.CheckoutFailures))
 	}
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReply(t, second, 1, "checked_out", strp(coHead), strp(coHead), nil), 1)
+	deliver(ctx, t, rig.actor, checkoutReply(t, second, 1, "checked_out", strp(coHead), strp(coHead), nil))
 	if got := getTurn(ctx, t, f, attempt.ID); got.Status != sqlcgen.TurnStatusProcessing || got.CheckedOutSha == nil || *got.CheckedOutSha != coHead {
 		t.Fatalf("turn once the ref holds the head: %s, checked out %v; want processing at %s", got.Status, got.CheckedOutSha, coHead)
 	}
@@ -478,23 +503,23 @@ func TestReviewCheckout_AReconnectSendsItAgain(t *testing.T) {
 	reviewTurn := seedReviewTurn(ctx, t, f, coHead, nil, true)
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
 	first := lastCheckout(t, rig.commander, 1)
 	// Heartbeats are no reconnect: nothing is sent again.
-	settle(ctx, t, rig.actor, 1)
+	settle(ctx, t, rig.actor)
 	lastCheckout(t, rig.commander, 1)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
 	second := lastCheckout(t, rig.commander, 2)
 	if second.MessageId == first.MessageId {
 		t.Fatal("the checkout sent again after a reconnect reuses the lost command's messageId")
 	}
 	got := getTurn(ctx, t, f, reviewTurn.ID)
-	if got.Status != sqlcgen.TurnStatusPending || got.CheckoutMessageID == nil || *got.CheckoutMessageID != second.MessageId || got.CheckoutSends != 2 {
-		t.Fatalf("turn: %s, message %v, sends %d; want pending, the second command's, 2", got.Status, got.CheckoutMessageID, got.CheckoutSends)
+	if got.Status != sqlcgen.TurnStatusPending || got.CheckoutMessageID == nil || *got.CheckoutMessageID != second.MessageId || i32(got.CheckoutSends) != 2 {
+		t.Fatalf("turn: %s, message %v, sends %d; want pending, the second command's, 2", got.Status, got.CheckoutMessageID, i32(got.CheckoutSends))
 	}
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReply(t, second, 1, "checked_out", strp(coHead), strp(coHead), nil), 1)
+	deliver(ctx, t, rig.actor, checkoutReply(t, second, 1, "checked_out", strp(coHead), strp(coHead), nil))
 	if n := len(sentPromptsOf(t, rig.commander)); n != 1 {
 		t.Fatalf("%d prompts sent, want 1", n)
 	}
@@ -511,7 +536,7 @@ func TestReviewCheckout_AGenChangeAsksTheNewGen(t *testing.T) {
 	reviewTurn := seedReviewTurn(ctx, t, f, coHead, nil, true)
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
 	old := lastCheckout(t, rig.commander, 1)
 	// Gen 1's reply, stored as the old gen sent it, before the gen moved on.
 	if _, err := narvipg.NewEventStore(pool).Create(ctx, sqlcgen.CreateEventParams{
@@ -524,7 +549,7 @@ func TestReviewCheckout_AGenChangeAsksTheNewGen(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET gen = 2, review_checkout_gen = 2 WHERE session_id = $1`, f.sessionID); err != nil {
 		t.Fatal(err)
 	}
-	settle(ctx, t, rig.actor, 2)
+	settle(ctx, t, rig.actor)
 
 	if n := len(sentPromptsOf(t, rig.commander)); n != 0 {
 		t.Fatalf("%d prompts sent to the new gen on the old gen's reply, want none", n)
@@ -534,8 +559,8 @@ func TestReviewCheckout_AGenChangeAsksTheNewGen(t *testing.T) {
 		t.Fatalf("checkout after the gen change = %+v, want a new command to gen 2", fresh)
 	}
 	got := getTurn(ctx, t, f, reviewTurn.ID)
-	if got.CheckoutGen == nil || *got.CheckoutGen != 2 || got.CheckoutSends != 1 {
-		t.Fatalf("checkout gen %v, sends %d; want gen 2, its first", got.CheckoutGen, got.CheckoutSends)
+	if got.CheckoutGen == nil || *got.CheckoutGen != 2 || i32(got.CheckoutSends) != 1 {
+		t.Fatalf("checkout gen %v, sends %d; want gen 2, its first", got.CheckoutGen, i32(got.CheckoutSends))
 	}
 	if lead, ok := dispatchTimerLead(ctx, t, pool, f.sessionID); !ok || lead < platform.DefaultTimeouts().ReviewCheckoutTimeout-time.Minute {
 		t.Fatalf("dispatch timer in %s (%v): the new gen's bound starts again", lead, ok)
@@ -544,11 +569,12 @@ func TestReviewCheckout_AGenChangeAsksTheNewGen(t *testing.T) {
 	// The old gen answers its command again, late: fenced off, not stored.
 	sendSandboxEvent(ctx, t, rig.actor, SandboxEvent{Type: "checkout_result", Gen: 1, MessageID: "checkout_result:late-" + old.MessageId,
 		Raw: checkoutResultRaw(t, old, 1, "checked_out", strp(coHead), strp(coHead), nil)})
+	barrier(ctx, t, rig.actor)
 	if n := countRows(ctx, t, pool, `SELECT count(*) FROM events WHERE session_id = $1 AND message_id = $2`, f.sessionID, "checkout_result:late-"+old.MessageId); n != 0 {
 		t.Fatalf("a stale gen's reply was stored (%d rows)", n)
 	}
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReply(t, fresh, 2, "checked_out", strp(coHead), strp(coHead), nil), 2)
+	deliver(ctx, t, rig.actor, checkoutReply(t, fresh, 2, "checked_out", strp(coHead), strp(coHead), nil))
 	if prompts := sentPromptsOf(t, rig.commander); len(prompts) != 1 || prompts[0].Gen != 2 {
 		t.Fatalf("prompts %+v, want one, to gen 2", prompts)
 	}
@@ -565,7 +591,7 @@ func TestReviewCheckout_AReplyStoredByAReplicaThatDoesNotKnowTheTypeIsFound(t *t
 	reviewTurn := seedReviewTurn(ctx, t, f, coHead, nil, true)
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
 	cmd := lastCheckout(t, rig.commander, 1)
 	if _, err := narvipg.NewEventStore(pool).Create(ctx, sqlcgen.CreateEventParams{
 		SessionID: f.sessionID, Type: "checkout_result", MessageID: "checkout_result:" + cmd.MessageId,
@@ -573,7 +599,7 @@ func TestReviewCheckout_AReplyStoredByAReplicaThatDoesNotKnowTheTypeIsFound(t *t
 	}); err != nil {
 		t.Fatalf("store the reply as another binary would: %v", err)
 	}
-	settle(ctx, t, rig.actor, 1)
+	settle(ctx, t, rig.actor)
 
 	if got := getTurn(ctx, t, f, reviewTurn.ID); got.Status != sqlcgen.TurnStatusProcessing || got.CheckedOutSha == nil || *got.CheckedOutSha != coHead {
 		t.Fatalf("turn: %s, checked out %v; want processing at %s", got.Status, got.CheckedOutSha, coHead)
@@ -595,7 +621,7 @@ func TestReviewCheckout_AnIncapableFreshGenIsRefusedWithItsRemedy(t *testing.T) 
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 	before := reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeUnsupported)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, false), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, false))
 
 	if n := len(sentCheckouts(t, rig.commander)); n != 0 {
 		t.Fatalf("%d checkouts sent to a gen that cannot check out, want none", n)
@@ -644,7 +670,7 @@ func TestReviewCheckout_ASnapshotRestoredOldAgentIsRespawnedFresh(t *testing.T) 
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 	before := reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeRetiredOldAgent)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, false), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, false))
 
 	if n := len(sentCheckouts(t, rig.commander)); n != 0 {
 		t.Fatalf("%d checkouts sent to a gen that cannot check out, want none", n)
@@ -670,7 +696,7 @@ func TestReviewCheckout_ASnapshotRestoredOldAgentIsRespawnedFresh(t *testing.T) 
 	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready' WHERE session_id = $1`, f.sessionID); err != nil {
 		t.Fatal(err)
 	}
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(2, false), 2)
+	deliver(ctx, t, rig.actor, checkoutReady(2, false))
 	if got := getTurn(ctx, t, f, reviewTurn.ID); got.Status != sqlcgen.TurnStatusFailed {
 		t.Fatalf("turn on a fresh gen that cannot check out: %s, want refused", got.Status)
 	}
@@ -691,15 +717,15 @@ func TestReviewCheckout_ASilentSandboxIsRefusedAtTheBound(t *testing.T) {
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 	before := reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeNoReport)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
 	backdateCheckout(ctx, t, pool, reviewTurn.ID, 14*time.Minute, 14*time.Minute)
-	settle(ctx, t, rig.actor, 1)
+	settle(ctx, t, rig.actor)
 	if got := getTurn(ctx, t, f, reviewTurn.ID); got.Status != sqlcgen.TurnStatusPending || len(sentCheckouts(t, rig.commander)) != 1 {
 		t.Fatalf("inside the bound: %s with %d checkouts; want pending, one", got.Status, len(sentCheckouts(t, rig.commander)))
 	}
 
 	backdateCheckout(ctx, t, pool, reviewTurn.ID, platform.DefaultTimeouts().ReviewCheckoutTimeout+time.Second, 15*time.Minute)
-	settle(ctx, t, rig.actor, 1)
+	settle(ctx, t, rig.actor)
 	got := getTurn(ctx, t, f, reviewTurn.ID)
 	if got.Status != sqlcgen.TurnStatusFailed {
 		t.Fatalf("at the bound: %s, want refused", got.Status)
@@ -729,32 +755,32 @@ func TestReviewCheckout_AFetchFailureIsRetriedThenRefused(t *testing.T) {
 	before := reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeError)
 	authErr := "fatal: Authentication failed for 'https://github.com/acme/co-fetch.git/'"
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
 	for i := 1; i <= 4; i++ {
 		cmd := lastCheckout(t, rig.commander, i)
-		sendAndSettle(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "fetch_failed", nil, nil, strp(authErr)), 1)
+		deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "fetch_failed", nil, nil, strp(authErr)))
 		if n := len(sentCheckouts(t, rig.commander)); n != i {
 			t.Fatalf("send %d: %d checkouts right after its failure, want %d: the next waits its interval", i, n, i)
 		}
 		// The next send is due RefetchInterval doubled once per send made.
 		spacing := platform.DefaultTimeouts().ReviewCheckoutRefetchInterval << (i - 1)
 		backdateCheckout(ctx, t, pool, reviewTurn.ID, time.Minute, spacing-time.Second)
-		settle(ctx, t, rig.actor, 1)
+		settle(ctx, t, rig.actor)
 		if n := len(sentCheckouts(t, rig.commander)); n != i {
 			t.Fatalf("send %d: sent again %s after it, before its interval %s", i, spacing-time.Second, spacing)
 		}
 		backdateCheckout(ctx, t, pool, reviewTurn.ID, time.Minute, spacing)
-		settle(ctx, t, rig.actor, 1)
+		settle(ctx, t, rig.actor)
 	}
 	got := getTurn(ctx, t, f, reviewTurn.ID)
-	if got.Status != sqlcgen.TurnStatusPending || got.CheckoutFailures != 0 || got.CheckoutRetiredGen != nil {
-		t.Fatalf("after four fetch failures: %s, failures %d, retired %v; want pending, none counted, none retired", got.Status, got.CheckoutFailures, got.CheckoutRetiredGen)
+	if got.Status != sqlcgen.TurnStatusPending || i32(got.CheckoutFailures) != 0 || got.CheckoutRetiredGen != nil {
+		t.Fatalf("after four fetch failures: %s, failures %d, retired %v; want pending, none counted, none retired", got.Status, i32(got.CheckoutFailures), got.CheckoutRetiredGen)
 	}
 
 	cmd := lastCheckout(t, rig.commander, 5)
-	sendSandboxEvent(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "fetch_failed", nil, nil, strp(authErr)))
+	deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "fetch_failed", nil, nil, strp(authErr)))
 	backdateCheckout(ctx, t, pool, reviewTurn.ID, platform.DefaultTimeouts().ReviewCheckoutTimeout, time.Second)
-	settle(ctx, t, rig.actor, 1)
+	settle(ctx, t, rig.actor)
 	if got := getTurn(ctx, t, f, reviewTurn.ID); got.Status != sqlcgen.TurnStatusFailed {
 		t.Fatalf("at the bound: %s, want refused", got.Status)
 	}
@@ -797,15 +823,15 @@ func TestReviewCheckout_AStaleIndexLockRetiresTheGenOnce(t *testing.T) {
 			if cmd.Gen != gen {
 				t.Fatalf("checkout %d to gen %d, want gen %d", i, cmd.Gen, gen)
 			}
-			sendAndSettle(ctx, t, rig.actor, checkoutReply(t, cmd, gen, "failed", nil, strp(coHead), strp(lockErr)), gen)
+			deliver(ctx, t, rig.actor, checkoutReply(t, cmd, gen, "failed", nil, strp(coHead), strp(lockErr)))
 			if i < to {
 				backdateCheckout(ctx, t, pool, reviewTurn.ID, time.Minute, timeouts.ReviewCheckoutRefetchInterval<<(i-from))
-				settle(ctx, t, rig.actor, gen)
+				settle(ctx, t, rig.actor)
 			}
 		}
 	}
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
 	failAll(1, 1, timeouts.ReviewCheckoutFailuresBeforeRetire)
 
 	got := getTurn(ctx, t, f, reviewTurn.ID)
@@ -832,16 +858,16 @@ func TestReviewCheckout_AStaleIndexLockRetiresTheGenOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := timeouts.ReviewCheckoutFailuresBeforeRetire
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(2, true), 2)
-	if got := getTurn(ctx, t, f, reviewTurn.ID); got.CheckoutSends != 1 || got.CheckoutFailures != 0 {
-		t.Fatalf("on the fresh gen: sends %d, failures %d; want its first send and no failure", got.CheckoutSends, got.CheckoutFailures)
+	deliver(ctx, t, rig.actor, checkoutReady(2, true))
+	if got := getTurn(ctx, t, f, reviewTurn.ID); i32(got.CheckoutSends) != 1 || i32(got.CheckoutFailures) != 0 {
+		t.Fatalf("on the fresh gen: sends %d, failures %d; want its first send and no failure", i32(got.CheckoutSends), i32(got.CheckoutFailures))
 	}
 	failAll(2, n+1, 2*n)
 	if got := getTurn(ctx, t, f, reviewTurn.ID); got.Status != sqlcgen.TurnStatusPending || *got.CheckoutRetiredGen != 1 || rig.provider.callCount() != 1 {
 		t.Fatalf("after the fresh gen's failures: %s, retired gen %v, spawns %d; want pending, still gen 1, one spawn", got.Status, *got.CheckoutRetiredGen, rig.provider.callCount())
 	}
 	backdateCheckout(ctx, t, pool, reviewTurn.ID, timeouts.ReviewCheckoutTimeout, time.Second)
-	settle(ctx, t, rig.actor, 2)
+	settle(ctx, t, rig.actor)
 	if got := getTurn(ctx, t, f, reviewTurn.ID); got.Status != sqlcgen.TurnStatusFailed {
 		t.Fatalf("at the fresh gen's bound: %s, want refused", got.Status)
 	}
@@ -873,7 +899,7 @@ func TestReviewCheckout_AReEnqueuedTurnChecksOutOnTheNewGen(t *testing.T) {
 	}
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(2, true), 2)
+	deliver(ctx, t, rig.actor, checkoutReady(2, true))
 	if got := sentCommandTypes(t, rig.commander); len(got) != 1 || got[0] != "checkout" {
 		t.Fatalf("commands to the new gen = %v, want the checkout before any prompt", got)
 	}
@@ -885,7 +911,7 @@ func TestReviewCheckout_AReEnqueuedTurnChecksOutOnTheNewGen(t *testing.T) {
 		t.Fatalf("turn while the new gen checks out: %s on gen %d; want processing, still gen 1's", got.Status, *got.DispatchedSandboxGen)
 	}
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReply(t, cmd, 2, "checked_out", strp(coHead), strp(coMoved), nil), 2)
+	deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 2, "checked_out", strp(coHead), strp(coMoved), nil))
 	prompts := sentPromptsOf(t, rig.commander)
 	if len(prompts) != 1 || prompts[0].Gen != 2 || prompts[0].MessageId == firstMessage {
 		t.Fatalf("prompts %+v, want the turn re-sent once to gen 2 under a new messageId", prompts)
@@ -919,7 +945,7 @@ func TestReviewCheckout_ARefusedReEnqueueIsFailedForward(t *testing.T) {
 	}
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(2, false), 2)
+	deliver(ctx, t, rig.actor, checkoutReady(2, false))
 	waitForTurnStatus(ctx, t, f.turns, reviewTurn.ID, sqlcgen.TurnStatusFailed)
 	if n := len(sentPayloads(rig.commander)); n != 0 {
 		t.Fatalf("%d commands sent, want none", n)
@@ -952,7 +978,7 @@ func TestReviewCheckout_ATurnWithNoRecordedHeadIsNotCheckedOut(t *testing.T) {
 			}
 			rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 
-			sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+			deliver(ctx, t, rig.actor, checkoutReady(1, true))
 			if got := sentCommandTypes(t, rig.commander); len(got) != 1 || got[0] != "prompt" {
 				t.Fatalf("commands %v, want the prompt alone", got)
 			}
@@ -1011,7 +1037,7 @@ func TestReviewCheckout_NonReviewSessionsDispatchAsBefore(t *testing.T) {
 			}
 			rig := newContextRig(ctx, t, pool, sessionID, nil)
 
-			sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+			deliver(ctx, t, rig.actor, checkoutReady(1, true))
 			if got := sentCommandTypes(t, rig.commander); len(got) != 1 || got[0] != "prompt" {
 				t.Fatalf("commands %v, want the prompt alone", got)
 			}
@@ -1032,13 +1058,13 @@ func TestReviewCheckout_AStopCancelsATurnWaitingOnItsCheckout(t *testing.T) {
 	reviewTurn := seedReviewTurn(ctx, t, f, coHead, nil, true)
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReady(1, true), 1)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
 	cmd := lastCheckout(t, rig.commander, 1)
 	requestStop(ctx, t, pool, f.sessionID)
-	settle(ctx, t, rig.actor, 1)
+	settle(ctx, t, rig.actor)
 	waitForTurnStatus(ctx, t, f.turns, reviewTurn.ID, sqlcgen.TurnStatusCancelled)
 
-	sendAndSettle(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "checked_out", strp(coHead), strp(coHead), nil), 1)
+	deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "checked_out", strp(coHead), strp(coHead), nil))
 	if n := len(sentPromptsOf(t, rig.commander)); n != 0 {
 		t.Fatalf("%d prompts sent after the stop, want none", n)
 	}
@@ -1105,12 +1131,12 @@ func TestReviewCheckout_OneCodeHostReadPerDispatch(t *testing.T) {
 	}
 
 	endRunningTurn(ctx, t, f, rig)
-	sendSandboxEvent(ctx, t, rig.actor, receiptHeartbeat(1))
+	barrier(ctx, t, rig.actor)
 	cmd := lastCheckout(t, rig.commander, 1)
 	if counter.count() != 0 {
 		t.Fatalf("%d code-host reads before the checkout was confirmed, want none", counter.count())
 	}
-	sendAndSettle(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "checked_out", strp(coHead), strp(coHead), nil), 1)
+	deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "checked_out", strp(coHead), strp(coHead), nil))
 
 	if got := getTurn(ctx, t, f, attempt.ID); got.Status != sqlcgen.TurnStatusProcessing {
 		t.Fatalf("attempt: %s, want processing", got.Status)

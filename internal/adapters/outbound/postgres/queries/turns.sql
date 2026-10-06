@@ -426,7 +426,8 @@ WHERE id = sqlc.arg('id')
 -- when it is sent and the gen's ready_seq then. The first request on a gen
 -- stamps checkout_requested_at, the start of the turn's bound on that gen,
 -- which every later request on the same gen keeps; a request on another
--- gen starts the bound again, and its counts with it. after_failure counts
+-- gen starts the bound again, and its counts with it (both NULL, read as
+-- 0, until the turn's first request). after_failure counts
 -- the reply this request answers -- the previous send's -- as failed.
 -- Only while the turn is open (pending, or processing for a re-send to a
 -- new gen); 0 rows otherwise, and nothing is sent.
@@ -435,9 +436,9 @@ SET checkout_requested_at = CASE WHEN checkout_gen IS NOT DISTINCT FROM sqlc.arg
                                       AND checkout_requested_at IS NOT NULL
                                  THEN checkout_requested_at ELSE now() END,
     checkout_sends = CASE WHEN checkout_gen IS NOT DISTINCT FROM sqlc.arg('gen')::integer
-                          THEN checkout_sends + 1 ELSE 1 END,
+                          THEN COALESCE(checkout_sends, 0) + 1 ELSE 1 END,
     checkout_failures = CASE WHEN checkout_gen IS NOT DISTINCT FROM sqlc.arg('gen')::integer
-                             THEN checkout_failures + CASE WHEN sqlc.arg('after_failure')::boolean THEN 1 ELSE 0 END
+                             THEN COALESCE(checkout_failures, 0) + CASE WHEN sqlc.arg('after_failure')::boolean THEN 1 ELSE 0 END
                              ELSE 0 END,
     checkout_gen = sqlc.arg('gen')::integer,
     checkout_message_id = sqlc.arg('message_id')::text,
@@ -463,8 +464,8 @@ WHERE id = sqlc.arg('id') AND status IN ('pending', 'processing');
 -- a gen that is no longer live.
 SELECT t.checkout_message_id,
        t.checkout_gen,
-       t.checkout_sends,
-       t.checkout_failures,
+       COALESCE(t.checkout_sends, 0)::integer AS checkout_sends,
+       COALESCE(t.checkout_failures, 0)::integer AS checkout_failures,
        t.checkout_retired_gen,
        t.checkout_sent_ready_seq,
        COALESCE((EXTRACT(EPOCH FROM (now() - t.checkout_requested_at)) * 1000000000)::bigint, 0)::bigint AS since_request_nanos,

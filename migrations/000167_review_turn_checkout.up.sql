@@ -24,11 +24,12 @@
 -- sandbox reconnected, and a command lost with its socket is sent again.
 --
 -- turns.checkout_sends, checkout_failures: how many commands were sent on
--- the gen, and how many of their replies said failed. A failure is
--- retried, the spacing doubling with each send; ReviewCheckoutFailuresBeforeRetire
--- failed replies retire the gen once per turn, so the next one boots
--- fresh -- a stale index.lock or a broken index a killed git left in the
--- worktree fails every checkout on that gen.
+-- the gen, and how many of their replies said failed; NULL, read as 0,
+-- until the turn's first request. A failure is retried, the spacing
+-- doubling with each send; ReviewCheckoutFailuresBeforeRetire failed
+-- replies retire the gen once per turn, so the next one boots fresh -- a
+-- stale index.lock or a broken index a killed git left in the worktree
+-- fails every checkout on that gen.
 --
 -- turns.checkout_retired_gen: the gen this turn's failed checkouts
 -- retired, NULL until they retire one. A turn retires at most one.
@@ -44,14 +45,17 @@
 -- the latest ready decides. Never reset: a spawn, restore or resume bumps
 -- the gen, and the value stops matching.
 --
--- No backfill, no index. Every turn that exists when this runs has sent no
--- checkout, so a pending review turn is asked for one at its next dispatch
--- evaluation. Every sandbox reads incapable until its next ready.
+-- No backfill, no index, no default. Every turn that exists when this runs
+-- has sent no checkout, so a pending review turn is asked for one at its
+-- next dispatch evaluation. Every sandbox reads incapable until its next
+-- ready. Every column is nullable with no default, so a turn that is never
+-- checked out -- every turn but a pull request review's -- stores nothing
+-- for them: its row is no wider on disk, and no read of turns pages more.
 --
 -- # Locks
 --
--- Each ADD COLUMN is nullable with no default, or NOT NULL with a constant
--- default, which Postgres stores in the catalog: none rewrites a table.
+-- Each ADD COLUMN is nullable with no default, a catalog change that
+-- rewrites no table.
 -- They take ACCESS EXCLUSIVE on turns and on sandboxes, for the file's one
 -- implicit transaction, for an instant. No index is needed: the reads are
 -- the turn by its primary key and the reply by
@@ -98,8 +102,8 @@ ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_gen INTEGER;
 ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_requested_at TIMESTAMPTZ;
 ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_sent_at TIMESTAMPTZ;
 ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_sent_ready_seq INTEGER;
-ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_sends INTEGER NOT NULL DEFAULT 0;
-ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_sends INTEGER;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_failures INTEGER;
 ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_retired_gen INTEGER;
 ALTER TABLE turns ADD COLUMN IF NOT EXISTS checked_out_sha TEXT;
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS review_checkout_gen INTEGER;

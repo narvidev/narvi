@@ -6,6 +6,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -29,6 +30,10 @@ import (
 // release recorded for the same gen; it cannot boot on 167; and it can
 // once the recorded version is forced back to 166 with the columns kept,
 // after which this release's migration runs again and keeps their values.
+
+// reviewCheckoutMigration is the migration's version: the plan tests that
+// run this release's whole-row turn statements migrate to it too.
+const reviewCheckoutMigration = 167
 
 // The column lists the previous binary's sqlc output wrote out for every
 // SELECT * and RETURNING * on turns and on sandboxes.
@@ -71,7 +76,7 @@ WHERE id = $5 AND status IN ('pending', 'processing')`
 type checkoutColumns167 struct {
 	messageID           *string
 	gen, sends          *int32
-	failures            int32
+	failures            *int32
 	checkedOut          *string
 	reviewCheckoutGen   *int32
 	readySeq, sandboxAt int32
@@ -91,7 +96,7 @@ func readCheckoutColumns167(ctx context.Context, t *testing.T, db *sql.DB, sessi
 
 func TestMigration000167_UpAndDown(t *testing.T) {
 	ctx := context.Background()
-	connStr, db := migrationTestDatabase(ctx, t, 166)
+	connStr, db := migrationTestDatabase(ctx, t, reviewCheckoutMigration-1)
 	turnColumns := len(strings.Split(previous167TurnColumns, ","))
 	sandboxColumns := len(strings.Split(previous167SandboxColumns, ","))
 
@@ -136,8 +141,8 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 
 	m, mdb := newMigrate(t, connStr)
 	defer func() { _ = mdb.Close() }()
-	if err := m.Migrate(167); err != nil {
-		t.Fatalf("up to 167: %v", err)
+	if err := m.Migrate(reviewCheckoutMigration); err != nil {
+		t.Fatalf("up: %v", err)
 	}
 	want := map[string]string{
 		"turns.checkout_message_id":     "YES  text",
@@ -145,8 +150,8 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 		"turns.checkout_requested_at":   "YES  timestamp with time zone",
 		"turns.checkout_sent_at":        "YES  timestamp with time zone",
 		"turns.checkout_sent_ready_seq": "YES  integer",
-		"turns.checkout_sends":          "NO 0 integer",
-		"turns.checkout_failures":       "NO 0 integer",
+		"turns.checkout_sends":          "YES  integer",
+		"turns.checkout_failures":       "YES  integer",
 		"turns.checkout_retired_gen":    "YES  integer",
 		"turns.checked_out_sha":         "YES  text",
 		"sandboxes.review_checkout_gen": "YES  integer",
@@ -161,9 +166,10 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 		}
 	}
 
-	// An existing turn has asked for no checkout, and an existing sandbox
-	// reads as unable to check out until its next ready.
-	if c := readCheckoutColumns167(ctx, t, db, sessionID, turnID); c.messageID != nil || c.sends != nil && *c.sends != 0 || c.failures != 0 || c.checkedOut != nil || c.reviewCheckoutGen != nil {
+	// An existing turn has asked for no checkout, and stores nothing for
+	// it; an existing sandbox reads as unable to check out until its next
+	// ready.
+	if c := readCheckoutColumns167(ctx, t, db, sessionID, turnID); c.messageID != nil || c.sends != nil || c.failures != nil || c.checkedOut != nil || c.reviewCheckoutGen != nil {
 		t.Fatalf("an existing turn and sandbox read %+v, want no request, nothing checked out, no capability", c)
 	}
 
@@ -202,32 +208,32 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 
 	// It cannot boot on 167: golang-migrate refuses a version it has no
 	// file for.
-	previous, pdb := previousBinaryMigrate(t, connStr, 166)
-	if err := previous.Up(); err == nil || !strings.Contains(err.Error(), "167") {
-		t.Fatalf("the previous binary's boot on 167 = %v, want a refusal naming 167", err)
+	previous, pdb := previousBinaryMigrate(t, connStr, reviewCheckoutMigration-1)
+	if err := previous.Up(); err == nil || !strings.Contains(err.Error(), strconv.Itoa(reviewCheckoutMigration)) {
+		t.Fatalf("the previous binary's boot on %d = %v, want a refusal naming it", reviewCheckoutMigration, err)
 	}
 	_ = pdb.Close()
 
 	// Rolling back with the columns kept: force 166, and the previous
 	// binary boots and works. Deploying this release again runs 000167
 	// again, which keeps the columns and their values.
-	if err := m.Force(166); err != nil {
-		t.Fatalf("force 166: %v", err)
+	if err := m.Force(reviewCheckoutMigration - 1); err != nil {
+		t.Fatalf("force the previous version: %v", err)
 	}
-	previous, pdb = previousBinaryMigrate(t, connStr, 166)
+	previous, pdb = previousBinaryMigrate(t, connStr, reviewCheckoutMigration-1)
 	if err := previous.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		t.Fatalf("the previous binary's boot after force 166 = %v, want no change", err)
+		t.Fatalf("the previous binary's boot after the force = %v, want no change", err)
 	}
 	_ = pdb.Close()
 	previousRow(ctx, t, db, turnColumns, `SELECT `+previous167TurnColumns+` FROM turns WHERE id = $1`, turnID)
-	// Pinned to 167, like every migration test here: Up would also apply
+	// Pinned to this migration, like every migration test here: Up would also apply
 	// whatever later migrations exist by the time this runs.
 	again, adb := newMigrate(t, connStr)
-	if err := again.Migrate(167); err != nil {
-		t.Fatalf("this release's migration after the rollback = %v, want 000167 applied again", err)
+	if err := again.Migrate(reviewCheckoutMigration); err != nil {
+		t.Fatalf("this release's migration after the rollback = %v, want it applied again", err)
 	}
 	_ = adb.Close()
-	assertCleanVersion(t, connStr, 167)
+	assertCleanVersion(t, connStr, reviewCheckoutMigration)
 	if c := readCheckoutColumns167(ctx, t, db, sessionID, turnID); c.messageID == nil || *c.messageID != "first" || !equalInt32Ptr(c.reviewCheckoutGen, ptrInt32(1)) {
 		t.Fatalf("after 000167 ran again: %+v, want the request and the capability kept", c)
 	}
@@ -245,8 +251,8 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 		return n
 	}
 	turnsBefore, sandboxesBefore := count("turns"), count("sandboxes")
-	if err := m.Migrate(166); err != nil {
-		t.Fatalf("down to 166: %v", err)
+	if err := m.Migrate(reviewCheckoutMigration - 1); err != nil {
+		t.Fatalf("down: %v", err)
 	}
 	if got := columns(); len(got) != 0 {
 		t.Fatalf("columns after the down: %v, want none", got)
@@ -256,16 +262,16 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 	}
 	previousRow(ctx, t, db, turnColumns, `SELECT `+previous167TurnColumns+` FROM turns WHERE id = $1`, turnID)
 	previousRow(ctx, t, db, sandboxColumns, `SELECT `+previous167SandboxColumns+` FROM sandboxes WHERE session_id = $1`, sessionID)
-	if err := m.Force(167); err != nil {
-		t.Fatalf("force 167: %v", err)
+	if err := m.Force(reviewCheckoutMigration); err != nil {
+		t.Fatalf("force this version: %v", err)
 	}
-	if err := m.Migrate(166); err != nil {
-		t.Fatalf("down to 166 again, the columns already gone: %v", err)
+	if err := m.Migrate(reviewCheckoutMigration - 1); err != nil {
+		t.Fatalf("down again, the columns already gone: %v", err)
 	}
-	if err := m.Migrate(167); err != nil {
-		t.Fatalf("up to 167 again: %v", err)
+	if err := m.Migrate(reviewCheckoutMigration); err != nil {
+		t.Fatalf("up again: %v", err)
 	}
-	assertCleanVersion(t, connStr, 167)
+	assertCleanVersion(t, connStr, reviewCheckoutMigration)
 	if got := columns(); len(got) != len(want) {
 		t.Fatalf("columns after up again = %v, want %v", got, want)
 	}

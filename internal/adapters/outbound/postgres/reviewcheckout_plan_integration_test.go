@@ -16,8 +16,8 @@ import (
 )
 
 // checkoutPlanVersion is the migration the review checkout's plan test
-// migrates to: 000167, which adds the columns its statements name.
-const checkoutPlanVersion = 167
+// migrates to: the one that adds the columns its statements name.
+const checkoutPlanVersion = reviewCheckoutMigration
 
 // The review checkout's statements, each the only access of its rows in
 // its transaction, read by key alone (technical plan §21.1):
