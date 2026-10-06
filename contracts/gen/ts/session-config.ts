@@ -44,6 +44,10 @@ export interface SessionConfig {
        * Null means create the session branch from the repo's default base branch.
        */
       branch: string | null;
+      /**
+       * Technical plan §21.1, §30.4: present on a pull request's review session only, when url names the pull request's base repository, which keeps every pull request's head as refs/pull/<number>/head. When set, the sandbox clones url and checks out this ref's tip, detached; branch is then never checked out. The control plane derives it from the session's pull request each time it assembles this document; it is never stored. Genuinely OPTIONAL: absent or null is the behavior from before this field existed, and an agent that predates it ignores it and clones as before.
+       */
+      ref?: string | null;
     },
     ...{
       name: string;
@@ -52,6 +56,10 @@ export interface SessionConfig {
        * Null means create the session branch from the repo's default base branch.
        */
       branch: string | null;
+      /**
+       * Technical plan §21.1, §30.4: present on a pull request's review session only, when url names the pull request's base repository, which keeps every pull request's head as refs/pull/<number>/head. When set, the sandbox clones url and checks out this ref's tip, detached; branch is then never checked out. The control plane derives it from the session's pull request each time it assembles this document; it is never stored. Genuinely OPTIONAL: absent or null is the behavior from before this field existed, and an agent that predates it ignores it and clones as before.
+       */
+      ref?: string | null;
     }[]
   ];
   /**

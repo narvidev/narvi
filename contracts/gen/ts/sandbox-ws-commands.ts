@@ -9,7 +9,7 @@
 /**
  * Control-plane -> sandbox-agent WS commands (technical plan §6.1). Every command carries the common envelope (type, messageId, sessionId, gen) so per-message gen-fencing (§3.2 'stale-gen inputs are rejected') does not rely solely on the connection-level X-Sandbox-Gen header. Field nullability convention used throughout /contracts: a property documented as 'nullable' is a REQUIRED key whose value may be JSON null (always sent, may carry no value); the sole exception is Prompt.conversationId, which is additionally OPTIONAL (both absence and null mean 'start a fresh conversation') per §6.1/§3.3.
  */
-export type SandboxCommand = Prompt | Stop | Push | Snapshot | Shutdown | Ack | GitSyncComplete;
+export type SandboxCommand = Prompt | Stop | Push | Snapshot | Shutdown | Ack | GitSyncComplete | Checkout;
 
 /**
  * Dispatch a turn. Carries author identity (scmName/scmEmail) for git commit attribution (§6.1) and the plan-mode toggle (§8.1).
@@ -132,4 +132,42 @@ export interface GitSyncComplete {
   messageId: string;
   sessionId: string;
   gen: number;
+}
+/**
+ * Technical plan §21.1, §30.4: check out, in each repo named, the commit a review turn records, read from its pull request's ref in the base repository. The agent fetches ref, checks out sha detached and forced, removes untracked files (ignored files are kept), and answers with one checkout_result whose messageId is 'checkout_result:{this messageId}'. Sent only to a gen whose ready advertised capabilities.reviewCheckout; an agent that predates it skips it as an unknown command.
+ */
+export interface Checkout {
+  type: 'checkout';
+  messageId: string;
+  sessionId: string;
+  gen: number;
+  /**
+   * Per-repo checkout spec. Repos are always a list (§3.4); each name is a SessionConfig.repos[].name.
+   *
+   * @minItems 1
+   */
+  repos: [
+    {
+      name: string;
+      /**
+       * The pull request's head ref in the base repository.
+       */
+      ref: string;
+      /**
+       * The commit the turn records: a full SHA-1 name, 40 lowercase hex characters. SHA-256 repositories are not supported.
+       */
+      sha: string;
+    },
+    ...{
+      name: string;
+      /**
+       * The pull request's head ref in the base repository.
+       */
+      ref: string;
+      /**
+       * The commit the turn records: a full SHA-1 name, 40 lowercase hex characters. SHA-256 repositories are not supported.
+       */
+      sha: string;
+    }[]
+  ];
 }

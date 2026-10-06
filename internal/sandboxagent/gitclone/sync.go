@@ -151,6 +151,19 @@ func (r SyncResult) ToCloneResult() CloneResult {
 // non-empty pathScope re-narrows every repo's sparse-checkout
 // configuration (applySparseCheckout, clone.go) once that repo itself
 // reaches gitstate.StateReady.
+//
+// A repo with a Ref -- a pull request's review session, technical plan
+// §21.1, §30.4 -- first takes none of the above: right after its git-dir
+// is seeded, CheckoutPullRef checks out the ref's tip, detached,
+// discarding whatever the previous turn left in the worktree, and applies
+// pathScope itself. A review session is read-only and never pushes, so its
+// worktree holds no edit to keep, and nothing is stashed (§3.4's P0 is
+// scoped to sessions that push). Checked out that way, the repo never
+// enters the gitstate machine: its SyncResult carries no State and no
+// Branch. A review never boots on a tree other than its head: when the ref
+// cannot be fetched, a spec that names the head branch takes the branch
+// sequence above for it, which fails the repo when the branch is neither
+// local nor fetchable, and one that names none fails the repo.
 func SyncAll(
 	ctx context.Context,
 	sup *supervisor.Supervisor,
@@ -249,6 +262,17 @@ func syncOne(
 	if err := gitdir.Seed(ctx, sup, repoHandle, repo.Url, cred, stepTimeout, stopGrace); err != nil {
 		return SyncResult{Repo: repo, Primary: primary, Dir: filepath.Join(workspaceDir, repo.Name),
 			Err: fmt.Errorf("gitclone: seed agent git-dir for %s: %w", repo.Name, err)}
+	}
+
+	if repo.Ref != nil {
+		pulled, toHeadBranch := syncPullRef(ctx, sup, layout, cred, repo, primary, pathScope, fetchStepTimeout, stepTimeout, stopGrace, onGitSync)
+		if !toHeadBranch {
+			return pulled
+		}
+		// The ref could not be fetched and the spec names the head branch:
+		// the §19.3 sequence below syncs that branch, as it did before refs
+		// existed, and fails the repo when the branch is neither local nor
+		// fetchable, never degrading to another branch.
 	}
 
 	dir := repoHandle.WorkTree
@@ -495,6 +519,65 @@ func syncOne(
 	// failure -- see its own comment for why.
 	result.State = state
 	return result
+}
+
+// syncPullRef is syncOne for a repo with a Ref, a pull request's review
+// session (technical plan §21.1, §30.4; see SyncAll's own doc comment):
+// CheckoutPullRef at the ref's tip, nothing stashed, the gitstate machine
+// never entered. The worktree is re-owned for the runtime by the boot's
+// own pass over the whole workspace, after SyncAll, so no chown runs here.
+//
+// A review never boots on a tree other than its head. When the ref cannot
+// be fetched and the spec names a head branch, syncPullRef returns
+// toHeadBranch true and syncOne goes on with the §19.3 branch sequence for
+// that branch, which fails the repo when the branch is neither local nor
+// fetchable. With no head branch, the repo fails.
+//
+// When the repo fails, the path scope is still enforced on whatever the
+// worktree holds, by the rule syncOne's deferred step follows, and a
+// failure to enforce it is added to the result's error: a secondary repo's
+// failure only warns, and its directory must not keep an out-of-scope path
+// for that (§14.1).
+func syncPullRef(
+	ctx context.Context,
+	sup *supervisor.Supervisor,
+	layout gitdir.Layout,
+	cred *syscall.Credential,
+	repo sessionconfig.SessionConfigReposElem,
+	primary bool,
+	pathScope []string,
+	fetchStepTimeout, stepTimeout, stopGrace time.Duration,
+	onGitSync OnGitSync,
+) (result SyncResult, toHeadBranch bool) {
+	handle := layout.Repo(repo.Name)
+	result = SyncResult{Repo: repo, Primary: primary, Dir: handle.WorkTree}
+
+	onGitSync(repo.Name, "checkout", *repo.Ref)
+	checkout := CheckoutPullRef(ctx, sup, layout, cred, nil, repo, *repo.Ref, "", pathScope, fetchStepTimeout, stepTimeout, stopGrace)
+	switch {
+	case checkout.Outcome == PullCheckoutCheckedOut:
+		return result, false
+	case checkout.Outcome == PullCheckoutFetchFailed && repo.Branch != nil:
+		platform.Logger(ctx).Warn("gitclone: pull request ref could not be fetched at boot, syncing its head branch",
+			"repo", repo.Name, "ref", *repo.Ref, "branch", *repo.Branch, "error", checkout.Err)
+		return result, true
+	case checkout.Outcome == PullCheckoutFetchFailed:
+		result.Err = fmt.Errorf("gitclone: %s for %s could not be fetched, and the spec names no head branch to fall back to (a review never boots on another tree): %w", *repo.Ref, repo.Name, checkout.Err)
+	default:
+		result.Err = fmt.Errorf("gitclone: check out %s for %s: %w", *repo.Ref, repo.Name, checkout.Err)
+	}
+
+	var scopeErr error
+	if len(pathScope) > 0 {
+		scopeErr = applySparseCheckout(ctx, sup, handle, cred, pathScope, stepTimeout, stopGrace)
+	} else {
+		scopeErr = disableSparseCheckoutIfEnabled(ctx, sup, handle, cred, stepTimeout, stopGrace)
+	}
+	if scopeErr != nil {
+		wrapped := fmt.Errorf("gitclone: path scope %s: %w", repo.Name, scopeErr)
+		result.Err = fmt.Errorf("%w (repo also failed to sync earlier: %v)", wrapped, result.Err)
+	}
+	return result, false
 }
 
 // logIfStashRecoveryNeeded logs, at Error level, exactly the P0 case §3.4

@@ -152,6 +152,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -362,8 +364,19 @@ type commandHandler struct {
 	// shutdown (run()'s own final drain) -- the SAME "one launched unit's
 	// own failure/completion must never cancel a sibling's independent
 	// work" reasoning as internal/sandboxagent/supervisor.Supervisor's own
-	// analogous field.
+	// analogous field. HandleCheckout runs each checkout on it too.
 	group errgroup.Group
+
+	// checkoutMu, runningTurns and bootComplete keep a checkout (technical
+	// plan §21.1, checkout.go) and a turn from ever running on one worktree
+	// at once: a checkout answers busy while the boot is still running
+	// (bootComplete false) or a turn is (runningTurns above zero), and runs
+	// holding checkoutMu, which every turn takes before it counts itself in
+	// -- so no turn starts during a checkout either. bootComplete is set
+	// just before the bridge's own MarkBootComplete (checkoutBootSignals).
+	checkoutMu   sync.Mutex
+	runningTurns atomic.Int32
+	bootComplete atomic.Bool
 }
 
 func (h *commandHandler) HandlePrompt(_ context.Context, cmd sandboxws.Prompt) {
@@ -410,6 +423,14 @@ func (h *commandHandler) HandlePrompt(_ context.Context, cmd sandboxws.Prompt) {
 	cmd.Text = renderCompositionFindingsToolPromptText(cmd.Text, h.cfg.SessionConfig)
 
 	h.group.Go(func() error {
+		// Counted in under checkoutMu, so the turn waits for a checkout
+		// already running, and every checkout after this answers busy until
+		// the turn has returned (commandHandler's own doc comment).
+		h.checkoutMu.Lock()
+		h.runningTurns.Add(1)
+		h.checkoutMu.Unlock()
+		defer h.runningTurns.Add(-1)
+
 		sink := func(event ports.AgentEvent) {
 			if event.Critical {
 				if err := h.bridge.SendCritical(h.runCtx, event.Payload, event.AckID); err != nil {
@@ -2093,7 +2114,7 @@ func run() error {
 	}
 	var signals bootSignals
 	if bridge != nil {
-		signals = bridge
+		signals = checkoutBootSignals{bootSignals: bridge, handler: handler}
 	}
 	bootErr := completeBoot(bootSteps{
 		signals: signals,

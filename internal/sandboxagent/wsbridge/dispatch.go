@@ -136,6 +136,27 @@ func (b *Bridge) dispatch(ctx context.Context, msgType string, data []byte) erro
 		b.handler.HandleGitSyncComplete(ctx, cmd)
 		return nil
 
+	case "checkout":
+		// Only a handler that implements CheckoutHandler runs it; for any
+		// other one it is skipped as an unknown command is, and no ready of
+		// this Bridge advertises the capability (sendReady), so the control
+		// plane never sends one.
+		checkouts, ok := b.handler.(CheckoutHandler)
+		if !ok {
+			slog.Warn("wsbridge: no handler for this inbound command type, skipping", "type", msgType)
+			return nil
+		}
+		var cmd sandboxws.Checkout
+		if err := json.Unmarshal(data, &cmd); err != nil {
+			slog.Warn("wsbridge: dropping malformed checkout command", "error", err)
+			return nil
+		}
+		if !b.checkGen("checkout", cmd.Gen) {
+			return nil
+		}
+		checkouts.HandleCheckout(ctx, cmd)
+		return nil
+
 	default:
 		slog.Warn("wsbridge: unrecognized inbound command type, skipping", "type", msgType)
 		return nil

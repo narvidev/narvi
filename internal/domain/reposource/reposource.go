@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -82,7 +83,27 @@ var (
 	// equal to 0x7f (a control character, including newlines) -- rejected
 	// defensively; no legitimate git ref name needs one.
 	ErrRefControlChar = errors.New("reposource: branch/remote name contains a control character")
+
+	// ErrPullHeadRefShape means a candidate pull request head ref is not
+	// exactly refs/pull/<number>/head, the number positive, without a
+	// leading zero and at most ten digits.
+	ErrPullHeadRefShape = errors.New("reposource: pull request head ref is not refs/pull/<number>/head")
+
+	// ErrCommitSHAShape means a candidate commit id is not a full SHA-1
+	// name, 40 lowercase hexadecimal characters.
+	ErrCommitSHAShape = errors.New("reposource: commit sha is not 40 lowercase hex characters")
 )
+
+// pullHeadRefPattern is the one shape ValidatePullHeadRef accepts. The
+// number is bounded to ten digits, so it is a plain decimal git reads as a
+// path segment and nothing longer ever reaches an argument list.
+var pullHeadRefPattern = regexp.MustCompile(`^refs/pull/[1-9][0-9]{0,9}/head$`)
+
+// commitSHAPattern is the one shape ValidateCommitSHA accepts: a full
+// SHA-1 object name, lowercase, never abbreviated. A SHA-256 name is
+// refused: the sandbox agent's own git-dir is SHA-1 (gitdir.Seed), so it
+// could never check one out.
+var commitSHAPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
 
 // bareIdentifierCharset matches exactly the characters a "bare identifier"
 // field -- one that is conceptually a single name, never a multi-segment
@@ -226,6 +247,39 @@ func validateRef(kind, value string) error {
 // validateRef for the exact rejection rules.
 func ValidateBranch(branch string) error {
 	return validateRef("branch", branch)
+}
+
+// ValidatePullHeadRef validates a candidate pull request head ref
+// (sessionconfig.SessionConfigReposElem.Ref, sandboxws.CheckoutReposElem.
+// Ref) before it reaches a git subprocess's argument list, as the source
+// half of a fetch refspec. Only the exact refs/pull/<number>/head shape a
+// code host keeps in a pull request's base repository passes: an allowlist,
+// like ValidateRepoURL, so no option, glob, "..", or other ref namespace is
+// ever fetched through it.
+func ValidatePullHeadRef(ref string) error {
+	if !pullHeadRefPattern.MatchString(ref) {
+		return fmt.Errorf("%w: %q", ErrPullHeadRefShape, ref)
+	}
+	return nil
+}
+
+// ValidateCommitSHA validates a candidate commit id (sandboxws.
+// CheckoutReposElem.Sha, a review turn's recorded head) before it reaches
+// a git subprocess's argument list: 40 lowercase hex characters, a full
+// SHA-1 name, so it can only ever name an object, never an option, a ref
+// or a revision expression.
+func ValidateCommitSHA(sha string) error {
+	if !commitSHAPattern.MatchString(sha) {
+		return fmt.Errorf("%w: %q", ErrCommitSHAShape, sha)
+	}
+	return nil
+}
+
+// PullHeadRef is the head ref a code host keeps for pull request number n
+// in its base repository: refs/pull/<n>/head. A number that is not
+// positive gives a ref ValidatePullHeadRef refuses.
+func PullHeadRef(n int32) string {
+	return "refs/pull/" + strconv.FormatInt(int64(n), 10) + "/head"
 }
 
 // InvalidRefError reports a single branch name ValidateBranch rejected,

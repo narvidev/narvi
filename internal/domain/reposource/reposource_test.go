@@ -299,6 +299,121 @@ func testValidateRef(t *testing.T, kind string, validate func(string) error) {
 	}
 }
 
+// TestValidatePullHeadRef pins the one shape a pull request head ref may
+// take before it is fetched: refs/pull/<number>/head, the number positive,
+// without a leading zero, at most ten digits. Anything else -- an option, a
+// glob, another namespace, a path escape -- is refused.
+func TestValidatePullHeadRef(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		in      string
+		wantErr bool
+	}{
+		{name: "a pull request's head ref", in: "refs/pull/7/head"},
+		{name: "ten digits", in: "refs/pull/1234567890/head"},
+		{name: "eleven digits", in: "refs/pull/12345678901/head", wantErr: true},
+		{name: "number zero", in: "refs/pull/0/head", wantErr: true},
+		{name: "leading zero", in: "refs/pull/07/head", wantErr: true},
+		{name: "negative number", in: "refs/pull/-7/head", wantErr: true},
+		{name: "the merge ref", in: "refs/pull/7/merge", wantErr: true},
+		{name: "a branch", in: "refs/heads/main", wantErr: true},
+		{name: "a glob", in: "refs/pull/*/head", wantErr: true},
+		{name: "an option", in: "--upload-pack=touch /tmp/pwned", wantErr: true},
+		{name: "a force prefix", in: "+refs/pull/7/head", wantErr: true},
+		{name: "a refspec", in: "refs/pull/7/head:refs/heads/main", wantErr: true},
+		{name: "a path escape", in: "refs/pull/7/../../head", wantErr: true},
+		{name: "a trailing newline", in: "refs/pull/7/head\n", wantErr: true},
+		{name: "empty", in: "", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := reposource.ValidatePullHeadRef(tt.in)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidatePullHeadRef(%q) error = %v, wantErr %v", tt.in, err, tt.wantErr)
+			}
+			if err != nil && !errors.Is(err, reposource.ErrPullHeadRefShape) {
+				t.Errorf("ValidatePullHeadRef(%q) error = %v, want errors.Is ErrPullHeadRefShape", tt.in, err)
+			}
+		})
+	}
+}
+
+// TestValidateCommitSHA pins the commit ids a checkout accepts: a full
+// SHA-1 name in lowercase hex, never abbreviated, never a SHA-256 name the
+// agent's SHA-1 git-dir cannot check out, never a revision expression or
+// an option.
+func TestValidateCommitSHA(t *testing.T) {
+	t.Parallel()
+
+	sha1 := "0123456789abcdef0123456789abcdef01234567"
+	sha256 := sha1 + "89abcdef0123456789abcdef"
+	tests := []struct {
+		name    string
+		in      string
+		wantErr bool
+	}{
+		{name: "a SHA-1 name", in: sha1},
+		{name: "a SHA-256 name", in: sha256, wantErr: true},
+		{name: "abbreviated", in: sha1[:12], wantErr: true},
+		{name: "41 characters", in: sha1 + "8", wantErr: true},
+		{name: "63 characters", in: sha256[:63], wantErr: true},
+		{name: "uppercase", in: "0123456789ABCDEF0123456789ABCDEF01234567", wantErr: true},
+		{name: "a revision expression", in: sha1[:38] + "^1", wantErr: true},
+		{name: "an option", in: "--orphan=0123456789abcdef0123456789abcdef", wantErr: true},
+		{name: "a branch", in: "main", wantErr: true},
+		{name: "a trailing newline", in: sha1 + "\n", wantErr: true},
+		{name: "empty", in: "", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := reposource.ValidateCommitSHA(tt.in)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("ValidateCommitSHA(%q) error = %v, wantErr %v", tt.in, err, tt.wantErr)
+			}
+			if err != nil && !errors.Is(err, reposource.ErrCommitSHAShape) {
+				t.Errorf("ValidateCommitSHA(%q) error = %v, want errors.Is ErrCommitSHAShape", tt.in, err)
+			}
+		})
+	}
+}
+
+// TestPullHeadRef pins the ref a pull request number names, and that a
+// number that is not positive gives one ValidatePullHeadRef refuses.
+func TestPullHeadRef(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		in        int32
+		want      string
+		wantValid bool
+	}{
+		{name: "pull request 7", in: 7, want: "refs/pull/7/head", wantValid: true},
+		{name: "the largest number", in: 2147483647, want: "refs/pull/2147483647/head", wantValid: true},
+		{name: "zero", in: 0, want: "refs/pull/0/head"},
+		{name: "negative", in: -3, want: "refs/pull/-3/head"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := reposource.PullHeadRef(tt.in)
+			if got != tt.want {
+				t.Fatalf("PullHeadRef(%d) = %q, want %q", tt.in, got, tt.want)
+			}
+			if valid := reposource.ValidatePullHeadRef(got) == nil; valid != tt.wantValid {
+				t.Errorf("ValidatePullHeadRef(PullHeadRef(%d)) valid = %v, want %v", tt.in, valid, tt.wantValid)
+			}
+		})
+	}
+}
+
 // TestValidateRemoteName proves ValidateRemoteName's own rule: the SAME
 // charset allowlist ValidateRepoName uses ([a-zA-Z0-9_.-]+, plus the
 // explicit "."/".." dot-segment rejection), NOT validateRef's permissive

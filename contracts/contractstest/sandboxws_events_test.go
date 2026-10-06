@@ -81,6 +81,67 @@ func TestSandboxEventsRoundTrip(t *testing.T) {
 		}
 	})
 
+	t.Run("Ready_Capabilities_ReviewCheckout", func(t *testing.T) {
+		// Technical plan §21.1, §30.4: an agent that runs the checkout
+		// command says so on every ready, beside its other capabilities.
+		reviewCheckout := true
+		maxFrameBytes := 32 << 20
+		roundTrip(t, sch, sandboxws.Ready{
+			Type:         "ready",
+			MessageId:    "e1f",
+			SessionId:    testSessionID,
+			Gen:          1,
+			Timestamp:    testTimestamp,
+			AgentVersion: "v1.4.2",
+			ImageDigest:  "sha256:9f31c00abcdef",
+			Capabilities: &sandboxws.ReadyCapabilities{MaxFrameBytes: &maxFrameBytes, ReviewCheckout: &reviewCheckout},
+		})
+	})
+
+	t.Run("CheckoutResult", func(t *testing.T) {
+		head := "0123456789abcdef0123456789abcdef01234567"
+		tip := "89abcdef0123456789abcdef0123456789abcdef"
+		failure := "fatal: could not read from remote repository"
+		roundTrip(t, sch, sandboxws.CheckoutResult{
+			Type:             "checkout_result",
+			MessageId:        "checkout_result:m9",
+			SessionId:        testSessionID,
+			Gen:              1,
+			CommandMessageId: "m9",
+			Repos: []sandboxws.CheckoutResultReposElem{
+				{Name: "widgets", Outcome: sandboxws.CheckoutResultReposElemOutcomeCheckedOut, HeadSha: &head, RefSha: &tip, Error: nil},
+				{Name: "docs", Outcome: sandboxws.CheckoutResultReposElemOutcomeFetchFailed, HeadSha: nil, RefSha: nil, Error: &failure},
+			},
+		})
+	})
+
+	// checkout_result's messageId is deterministic: the control plane finds
+	// a command's result by 'checkout_result:{commandMessageId}', so a result
+	// under any other key is refused by the schema and the generated decoder
+	// alike.
+	t.Run("CheckoutResult_MessageIdWithoutPrefixRejected", func(t *testing.T) {
+		payload := []byte(`{"type":"checkout_result","messageId":"m9","sessionId":"` + testSessionID +
+			`","gen":1,"commandMessageId":"m9","repos":[{"name":"widgets","outcome":"busy","headSha":null,"refSha":null,"error":null}]}`)
+		if err := validateJSON(t, sch, payload); err == nil {
+			t.Fatal("expected a checkout_result messageId without its prefix to fail validation, got nil error")
+		}
+		var event sandboxws.CheckoutResult
+		if err := json.Unmarshal(payload, &event); err == nil {
+			t.Fatal("expected a checkout_result messageId without its prefix to fail Go unmarshal, got nil error")
+		}
+	})
+
+	// outcome is an open enum for the compatibility grade (contracts/
+	// manifest.json): a later value grades MINOR, and a reader treats an
+	// unknown one as failed. This release's schema still knows exactly five.
+	t.Run("CheckoutResult_UnknownOutcomeRejectedByThisRelease", func(t *testing.T) {
+		payload := []byte(`{"type":"checkout_result","messageId":"checkout_result:m9","sessionId":"` + testSessionID +
+			`","gen":1,"commandMessageId":"m9","repos":[{"name":"widgets","outcome":"moved","headSha":null,"refSha":null,"error":null}]}`)
+		if err := validateJSON(t, sch, payload); err == nil {
+			t.Fatal("expected an outcome outside this release's enum to fail validation, got nil error")
+		}
+	})
+
 	t.Run("PromptReceived", func(t *testing.T) {
 		roundTrip(t, sch, sandboxws.PromptReceived{
 			Type:            "prompt_received",
