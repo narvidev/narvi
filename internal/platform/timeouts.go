@@ -3206,6 +3206,79 @@ type Timeouts struct {
 	// first move.
 	ReviewContextMoveMaxConsecutive int
 
+	// ReviewCheckoutTimeout bounds how long a review turn waits for its
+	// sandbox to report holding the head it recorded (technical plan
+	// §21.1, §30.4; internal/app/sessionactor's reviewcheckout.go). A turn
+	// of a pull request's review session that records a head stays pending
+	// -- its status reads queued -- while the session actor sends the
+	// sandbox a checkout command naming the pull request's ref and that
+	// head, and is dispatched only once the stored checkout_result says
+	// the worktree holds it. The bound starts at the turn's first checkout
+	// on a gen (turns.checkout_requested_at, the database's clock); a new
+	// gen starts it again. Past it with no reply the turn is refused --
+	// "the sandbox did not report its checkout" -- and past it after a
+	// fetch failure, a busy sandbox or a failed checkout, it is refused
+	// naming the error the agent reported. The session's dispatch timer
+	// is armed at the bound, so a sandbox that never answers is still
+	// decided.
+	//
+	// Validate keeps it above ReviewCheckoutAttemptCeiling plus
+	// ReviewCheckoutRefetchInterval by MinTimeoutMargin, so a slow but
+	// working checkout -- one sent after a first busy answer, every git
+	// step of it at its own timeout -- is never refused for slowness;
+	// above ActorLockServerReapTime plus SandboxWSReconnectMaxBackoff plus
+	// ActorHydrateTimeout, PromptResendWindow's expression, so a command
+	// lost with a replica that died after its commit is sent again on the
+	// sandbox's reconnect inside the bound; above
+	// ReviewCheckoutRefLagWindow, so a ref that lags is given its window;
+	// above ReviewCheckoutFailedRetireBackoff, so a gen whose checkouts fail
+	// at once is retired before its turn is refused; and below
+	// TurnDeadline, so a checkout that never answers costs less than one
+	// turn's own deadline. Not specified in the plan; 15 minutes, the
+	// first whole minute that clears the ceiling (13m40s with these
+	// defaults) and the margin.
+	ReviewCheckoutTimeout time.Duration
+
+	// ReviewCheckoutRefLagWindow is how long after a review turn's first
+	// checkout on a gen a reply saying the recorded head is not in the
+	// pull request's ref (sha_absent) is taken for a ref that lags a push
+	// and fetched again, every ReviewCheckoutRefetchInterval (technical
+	// plan §21.1). Past it, the head is gone: an attempt a lane can ask
+	// for again ends context_moved, as §24.9's context check ends one, and
+	// any other turn is refused naming the head and the ref's tip.
+	// Validate keeps it positive, below ReviewCheckoutTimeout and above
+	// ReviewCheckoutRefetchInterval by MinTimeoutMargin, so a lagging ref
+	// is fetched again at least once. Not specified in the plan; 1 minute.
+	ReviewCheckoutRefLagWindow time.Duration
+
+	// ReviewCheckoutRefetchInterval spaces a review turn's checkout
+	// commands on one gen (technical plan §21.1): a ref that lags is
+	// fetched again this long after the previous send, and a fetch
+	// failure, a busy sandbox or a failed checkout is tried again after
+	// this interval doubled with each send -- 10s, 20s, 40s -- until
+	// ReviewCheckoutTimeout. Validate keeps it positive. Not specified in
+	// the plan; 10 seconds.
+	ReviewCheckoutRefetchInterval time.Duration
+
+	// ReviewCheckoutFailuresBeforeRetire is how many checkouts of one
+	// review turn on one gen may answer failed before the session actor
+	// retires the gen and clears its snapshot, so the next gen boots fresh
+	// (technical plan §21.1). A git killed mid-command leaves a stale
+	// index.lock, or a broken index, in the worktree, and every later
+	// checkout on that gen fails on it; the snapshot taken after the turn
+	// holds it too. The turn stays pending, and its checkout is asked of
+	// the new gen, with a bound of its own. A turn retires at most one gen
+	// this way (turns.checkout_retired_gen): a fresh gen whose checkouts
+	// fail as well is refused at ReviewCheckoutTimeout, naming the error.
+	// A fetch failure or a busy sandbox never counts: a new gen fetches
+	// from the same remote, and a busy agent is running work. A count, not
+	// a duration; it sits here beside the bounds it shares a rule with,
+	// like ReviewContextMoveMaxConsecutive. Not specified in the plan; 3 --
+	// one failure can be a git step outlasting its timeout under load, and
+	// three in a row on one gen, ten and twenty seconds apart, are not.
+	// Validate keeps it positive.
+	ReviewCheckoutFailuresBeforeRetire int
+
 	// -- §26.5 ("review: wire the cost budget", §26.7/§26.9) -- no
 	// ordering relationship with either invariant chain above (or with any
 	// prior Step's standalone additions), so -- per those additions' own
@@ -4191,6 +4264,65 @@ func (t Timeouts) PreEvidenceAgentBootCeiling() time.Duration {
 	return max(syncPrepare, clonePrepare) + shaProbes + hooks + buildCleanup
 }
 
+// ReviewCheckoutNetworkGitSteps and ReviewCheckoutLocalGitSteps bound one
+// review checkout in the sandbox agent (technical plan §21.1): the git
+// processes gitclone.CheckoutPullRef spawns, at most one fetch bounded by
+// GitFetchStepTimeout and at most this many local steps, each bounded by
+// GitSyncStepTimeout -- gitclone's PullCheckoutNetworkGitSpawns and
+// PullCheckoutMaxLocalGitSpawns, which platform cannot import (gitclone
+// imports platform). TestReviewCheckoutAttemptCeiling_CountsEveryStep
+// fails when the two drift apart.
+const (
+	ReviewCheckoutNetworkGitSteps = 1
+	ReviewCheckoutLocalGitSteps   = 18
+)
+
+// ReviewCheckoutAttemptCeiling is the longest one review checkout can run
+// in the sandbox agent (technical plan §21.1), every git step at its own
+// timeout plus ProcessStopGracePeriod -- the most a step takes before it
+// is killed: ReviewCheckoutNetworkGitSteps fetch at GitFetchStepTimeout,
+// and ReviewCheckoutLocalGitSteps local steps at GitSyncStepTimeout. The
+// agent's other work -- re-owning the worktree, writing the reply --
+// spawns no git and takes a small fraction of MinTimeoutMargin. 13m40s
+// with these defaults. ReviewCheckoutTimeout must outlast it.
+func (t Timeouts) ReviewCheckoutAttemptCeiling() time.Duration {
+	step := func(timeout time.Duration) time.Duration { return timeout + t.ProcessStopGracePeriod }
+	return ReviewCheckoutNetworkGitSteps*step(t.GitFetchStepTimeout) + ReviewCheckoutLocalGitSteps*step(t.GitSyncStepTimeout)
+}
+
+// ReviewCheckoutFailedRetireBackoff is how long after a review turn's
+// first checkout on a gen the send whose failed reply retires that gen is
+// made, when every checkout fails at once (technical plan §21.1): the
+// waits between the first ReviewCheckoutFailuresBeforeRetire sends, each
+// ReviewCheckoutRefetchInterval doubled once more than the one before.
+// 30s with these defaults. ReviewCheckoutTimeout must outlast it, so a
+// gen whose worktree fails every checkout is retired before its turn is
+// refused. Saturates rather than overflows for a count so large no bound
+// could hold it; an interval that is not positive, which Validate refuses
+// on its own, waits nothing.
+func (t Timeouts) ReviewCheckoutFailedRetireBackoff() time.Duration {
+	var total time.Duration
+	wait := t.ReviewCheckoutRefetchInterval
+	for i := 1; i < t.ReviewCheckoutFailuresBeforeRetire; i++ {
+		if wait <= 0 {
+			return total
+		}
+		if total > maxDuration-wait {
+			return maxDuration
+		}
+		total += wait
+		if wait > maxDuration/2 {
+			wait = maxDuration
+		} else {
+			wait *= 2
+		}
+	}
+	return total
+}
+
+// maxDuration is the longest time.Duration.
+const maxDuration = time.Duration(1<<63 - 1)
+
 // SandboxLifetimeFor is the lifetime the control plane assumes its
 // provider gives a sandbox of kind (technical plan §35.2): the one read of
 // SandboxLifetime and ReviewSandboxLifetime (both fields' doc comment). A
@@ -4492,6 +4624,11 @@ func DefaultTimeouts() Timeouts {
 		SessionGuardNoticeHold:   2 * time.Minute,  // §40.1; not specified, chosen -- above every refusal reply's own bound, see field doc comment
 
 		ReviewContextMoveMaxConsecutive: 3, // §24.9; not specified, chosen -- a count of automatic attempts in a row that met a moved context, see field doc comment
+
+		ReviewCheckoutTimeout:              15 * time.Minute, // §21.1; not specified, chosen -- the first whole minute above ReviewCheckoutAttemptCeiling (13m40s) plus a re-fetch and the margin, see field doc comment
+		ReviewCheckoutRefLagWindow:         1 * time.Minute,  // §21.1; not specified, chosen -- how long a ref may lag a push, see field doc comment
+		ReviewCheckoutRefetchInterval:      10 * time.Second, // §21.1; not specified, chosen -- the spacing of a re-fetch, doubled for each failed send, see field doc comment
+		ReviewCheckoutFailuresBeforeRetire: 3,                // §21.1; not specified, chosen -- a count of failed checkouts of one turn on one gen, see field doc comment
 
 		ReviewCostBudgetServerReadHeaderTimeout: 5 * time.Second, // §26.7/§26.9; not specified, chosen -- matches RepoSHADiscoveryTimeout/CredentialFetchTimeout's own "lightweight, purely local" precedent, see field doc comment
 
@@ -4953,6 +5090,33 @@ func (t Timeouts) Validate() error {
 	// re-review at its first moved context. See
 	// ReviewContextMoveMaxConsecutive's own doc comment.
 	countMustBePositive("ReviewContextMoveMaxConsecutive", t.ReviewContextMoveMaxConsecutive)
+
+	// §21.1's review checkout: a slow but working sandbox is never refused
+	// for slowness; a command lost with a replica that died after its
+	// commit is sent again on the reconnect, inside the bound; a lagging
+	// ref is fetched again at least once; a gen whose checkouts fail at
+	// once is retired before its turn is refused; and a checkout that
+	// never answers costs less than one turn's own deadline. See
+	// ReviewCheckoutTimeout's own doc comment.
+	mustBePositive("ReviewCheckoutTimeout", t.ReviewCheckoutTimeout)
+	mustBePositive("ReviewCheckoutRefLagWindow", t.ReviewCheckoutRefLagWindow)
+	mustBePositive("ReviewCheckoutRefetchInterval", t.ReviewCheckoutRefetchInterval)
+	countMustBePositive("ReviewCheckoutFailuresBeforeRetire", t.ReviewCheckoutFailuresBeforeRetire)
+	check("ReviewCheckoutTimeout > ReviewCheckoutAttemptCeiling + ReviewCheckoutRefetchInterval",
+		"ReviewCheckoutTimeout", t.ReviewCheckoutTimeout,
+		"ReviewCheckoutAttemptCeiling + ReviewCheckoutRefetchInterval", t.ReviewCheckoutAttemptCeiling()+t.ReviewCheckoutRefetchInterval)
+	check("ReviewCheckoutTimeout > ActorLockServerReapTime + SandboxWSReconnectMaxBackoff + ActorHydrateTimeout",
+		"ReviewCheckoutTimeout", t.ReviewCheckoutTimeout,
+		"ActorLockServerReapTime + SandboxWSReconnectMaxBackoff + ActorHydrateTimeout",
+		t.ActorLockServerReapTime()+t.SandboxWSReconnectMaxBackoff+t.ActorHydrateTimeout)
+	check("ReviewCheckoutTimeout > ReviewCheckoutRefLagWindow",
+		"ReviewCheckoutTimeout", t.ReviewCheckoutTimeout, "ReviewCheckoutRefLagWindow", t.ReviewCheckoutRefLagWindow)
+	check("ReviewCheckoutTimeout > ReviewCheckoutFailedRetireBackoff",
+		"ReviewCheckoutTimeout", t.ReviewCheckoutTimeout, "ReviewCheckoutFailedRetireBackoff", t.ReviewCheckoutFailedRetireBackoff())
+	check("ReviewCheckoutRefLagWindow > ReviewCheckoutRefetchInterval",
+		"ReviewCheckoutRefLagWindow", t.ReviewCheckoutRefLagWindow, "ReviewCheckoutRefetchInterval", t.ReviewCheckoutRefetchInterval)
+	check("TurnDeadline > ReviewCheckoutTimeout",
+		"TurnDeadline", t.TurnDeadline, "ReviewCheckoutTimeout", t.ReviewCheckoutTimeout)
 
 	// §5.1: what the outbox delivery worker records once this process's
 	// shutdown has begun is written on a context that outlives the

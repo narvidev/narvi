@@ -416,6 +416,41 @@ func (s *TurnStore) SetPromptReceiptRequest(ctx context.Context, id pgtype.UUID,
 	})
 }
 
+// RecordCheckoutRequest records, in the dispatch evaluation's own
+// transaction, the checkout command about to be sent to id's sandbox gen
+// (technical plan §21.1, §30.4): messageID, gen, and the gen's ready_seq at
+// the send. afterFailure counts the reply this request answers as failed.
+// Reports the rows it wrote: 0 once the turn is no longer open, and then
+// nothing is to be sent. See RecordTurnCheckoutRequest's own generated doc
+// comment.
+func (s *TurnStore) RecordCheckoutRequest(ctx context.Context, id pgtype.UUID, gen int32, messageID string, readySeq int32, afterFailure bool) (int64, error) {
+	return s.q.RecordTurnCheckoutRequest(ctx, sqlcgen.RecordTurnCheckoutRequestParams{
+		Gen: gen, AfterFailure: afterFailure, MessageID: messageID, ReadySeq: readySeq, ID: id,
+	})
+}
+
+// CheckoutState reads the facts a review turn's checkout is decided on:
+// its latest request, how long ago the bound and the latest send started
+// on the database's clock, and the stored reply, nil when none is. See
+// GetTurnCheckoutState's own generated doc comment.
+func (s *TurnStore) CheckoutState(ctx context.Context, id pgtype.UUID) (sqlcgen.GetTurnCheckoutStateRow, error) {
+	return s.q.GetTurnCheckoutState(ctx, id)
+}
+
+// SetCheckedOut records sha as the commit id's sandbox reported holding,
+// in the commit that dispatches id, and reports the rows it wrote: 0 once
+// the turn is no longer open.
+func (s *TurnStore) SetCheckedOut(ctx context.Context, id pgtype.UUID, sha string) (int64, error) {
+	return s.q.SetTurnCheckedOut(ctx, sqlcgen.SetTurnCheckedOutParams{Sha: sha, ID: id})
+}
+
+// SetCheckoutRetiredGen records gen as the one id's failed checkouts
+// retired, so the turn retires no other, and reports the rows it wrote: 0
+// once the turn is no longer open.
+func (s *TurnStore) SetCheckoutRetiredGen(ctx context.Context, id pgtype.UUID, gen int32) (int64, error) {
+	return s.q.SetTurnCheckoutRetiredGen(ctx, sqlcgen.SetTurnCheckoutRetiredGenParams{Gen: gen, ID: id})
+}
+
 // PromptReceiptState reports whether the receipt of id's current dispatch
 // is stored, by its deterministic key, and how long ago that dispatch
 // asked for it, on the database's clock. ok is false when the dispatch

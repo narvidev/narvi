@@ -114,6 +114,12 @@ const (
 	reviewContextMoved
 	// reviewContextUnconfirmed: the comparison could not be made.
 	reviewContextUnconfirmed
+	// reviewContextAwaitingCheckout: the turn waits on its review checkout
+	// (technical plan §21.1, reviewcheckout.go), which the evaluation that
+	// follows holds it for before this check is reached, so the pre-read
+	// read nothing of the code host: it reads once the checkout is
+	// confirmed, in the evaluation that sends the prompt.
+	reviewContextAwaitingCheckout
 )
 
 func (o reviewContextOutcome) String() string {
@@ -128,6 +134,8 @@ func (o reviewContextOutcome) String() string {
 		return "moved"
 	case reviewContextUnconfirmed:
 		return "unconfirmed"
+	case reviewContextAwaitingCheckout:
+		return "awaiting_checkout"
 	default:
 		return fmt.Sprintf("reviewContextOutcome(%d)", int(o))
 	}
@@ -157,6 +165,11 @@ type reviewContextCheck struct {
 // there is no turn to dispatch, the turn is not one the check applies to,
 // or the read of the turn failed -- planDispatch then checks nothing, and
 // holds back only a turn the check applies to (applyReviewContextCheck).
+//
+// A turn whose review checkout is outstanding (technical plan §21.1,
+// reviewCheckoutOutstanding) is not compared: the evaluation that follows
+// holds it for the checkout before this check is reached, so the code host
+// is read once, in the evaluation that sends the prompt.
 func (a *Actor) preReadReviewContext(ctx context.Context) *reviewContextCheck {
 	if a.spawnSource != sqlcgen.SessionSpawnSourceGithub {
 		return nil
@@ -179,6 +192,9 @@ func (a *Actor) preReadReviewContext(ctx context.Context) *reviewContextCheck {
 		return check
 	case !row.SandboxLive:
 		check.outcome = reviewContextUnread
+		return check
+	case a.reviewCheckoutOutstanding(ctx, row):
+		check.outcome = reviewContextAwaitingCheckout
 		return check
 	}
 	check.outcome, check.reason, check.liveHeadSHA = a.compareReviewContext(ctx, row)
@@ -326,9 +342,10 @@ const (
 // to a live sandbox. A turn the check does not apply to is dispatched as
 // it always was. For one it applies to, check must be the pre-read's
 // answer for that very turn: with none (no pre-read, one for another turn,
-// or one that made no read), the pick is held back -- the dispatch timer
-// re-armed due at once, nothing dispatched -- and the next evaluation's
-// pre-read reads it. Otherwise:
+// one that made no read, or one that skipped the read while the turn's
+// review checkout was outstanding and found it confirmed here), the pick
+// is held back -- the dispatch timer re-armed due at once, nothing
+// dispatched -- and the next evaluation's pre-read reads it. Otherwise:
 //
 //   - unchecked (it waited behind no turn), fresh or unconfirmed: it is
 //     dispatched, an unconfirmed one first stamped context_unconfirmed_at,
@@ -342,7 +359,7 @@ func (a *Actor) applyReviewContextCheck(ctx context.Context, tx pgx.Tx, turns []
 	if !a.contextCheckApplies(target.IsReviewAttempt, target.RequestTrigger) {
 		return reviewContextDispatch, nil
 	}
-	if check == nil || check.turnID != target.ID || check.outcome == reviewContextUnread {
+	if check == nil || check.turnID != target.ID || check.outcome == reviewContextUnread || check.outcome == reviewContextAwaitingCheckout {
 		a.logger.Info("sessionactor: review context check: the automatic review attempt to dispatch was not read before this evaluation; holding it for the next one",
 			"turn_id", target.ID.String())
 		if err := a.armDispatchNow(ctx, tx); err != nil {

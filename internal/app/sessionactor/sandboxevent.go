@@ -491,9 +491,13 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// written fresh on every connection, under a new messageId, and is
 		// never buffered or replayed (wsbridge's sendReady), so every one is
 		// a reconnect. The gen fence above has already dropped a stale gen's.
+		// The same statement records whether the ready advertised the
+		// review-checkout capability (technical plan §21.1,
+		// reviewcheckout.go): a review turn's checkout is sent only to a
+		// gen whose latest ready did.
 		if cmd.Type == "ready" {
 			if err := a.stores.sandbox.WithTx(tx).RecordReady(ctx, a.sessionID, row.Gen,
-				readyAdvertisesPromptReceipt(cmd.Raw), readyStatedMaxFrameBytes(cmd.Raw)); err != nil {
+				readyAdvertisesPromptReceipt(cmd.Raw), readyAdvertisesReviewCheckout(cmd.Raw), readyStatedMaxFrameBytes(cmd.Raw)); err != nil {
 				return fmt.Errorf("sessionactor: record the ready: %w", err)
 			}
 		}
@@ -726,6 +730,25 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 				if err := json.Unmarshal(cmd.Raw, &evt); err == nil && evt.Duplicate {
 					a.logger.Info("sessionactor: prompt receipt stored from a duplicate: the sandbox already held the prompt",
 						"prompt_message_id", evt.PromptMessageId, "gen", row.Gen)
+				}
+			}
+		case "checkout_result":
+			// Technical plan §21.1's review checkout (reviewcheckout.go):
+			// the stored row above IS the reply, under its deterministic
+			// key, exactly as a binary that does not know this type stores
+			// it, so nothing more is written here; this event's own
+			// post-commit dispatch evaluation reads it. Logged only.
+			if inserted {
+				var evt struct {
+					CommandMessageID string                `json:"commandMessageId"`
+					Repos            []checkoutResultEntry `json:"repos"`
+				}
+				if err := json.Unmarshal(cmd.Raw, &evt); err == nil {
+					for _, entry := range evt.Repos {
+						a.logger.Info("sessionactor: review checkout: the sandbox reported its checkout",
+							"command_message_id", evt.CommandMessageID, "gen", row.Gen, "repo", entry.Name, "outcome", entry.Outcome,
+							"head_sha", stringOrEmpty(entry.HeadSha), "ref_sha", stringOrEmpty(entry.RefSha), "error", stringOrEmpty(entry.Error))
+					}
 				}
 			}
 		case "step_finish":

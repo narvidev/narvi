@@ -287,12 +287,17 @@ WHERE session_id = $1
 -- against the gen, the same way: a ready that states none (a NULL
 -- max_frame_bytes) clears both columns, and the session actor holds the
 -- gen's prompts to the promptReceipt rule (promptFrameBound).
+-- It records capabilities.reviewCheckout against the gen by the same rule
+-- (review_checkout_gen, migrations/000167_review_turn_checkout.up.sql):
+-- the session actor sends a review turn's checkout only to a gen whose
+-- latest ready advertised it (reviewcheckout.go).
 -- Guarded on gen like MarkSandboxBootEvidence: a ready of any other gen
 -- counts nothing and records nothing, so the capability can only ever be
 -- recorded for the gen that is live.
 UPDATE sandboxes
 SET ready_seq = ready_seq + 1,
     prompt_receipt_gen = CASE WHEN sqlc.arg('prompt_receipt')::boolean THEN gen ELSE NULL END,
+    review_checkout_gen = CASE WHEN sqlc.arg('review_checkout')::boolean THEN gen ELSE NULL END,
     agent_max_frame_bytes = sqlc.narg('max_frame_bytes')::integer,
     agent_max_frame_bytes_gen = CASE WHEN sqlc.narg('max_frame_bytes')::integer IS NULL THEN NULL ELSE gen END,
     updated_at = now()
@@ -458,6 +463,19 @@ WHERE session_id = $1;
 UPDATE sandboxes
 SET stop_retire_gen = sqlc.arg('gen')::integer, updated_at = now()
 WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;
+
+-- name: ClearSandboxSnapshot :execrows
+-- Technical plan §21.1 and §30.4: forgets the sandbox's snapshot, so the
+-- next gen boots fresh instead of restoring it. The session actor clears
+-- it in the transaction that retires a gen it will not send a review
+-- turn's checkout to -- one whose agent does not advertise
+-- capabilities.reviewCheckout, which a restore of the snapshot would bring
+-- back -- or a gen whose checkouts keep failing on what its worktree holds,
+-- which the snapshot holds too (reviewcheckout.go). The shadow bit describes
+-- the snapshot, so it goes with it. 0 rows when there was none.
+UPDATE sandboxes
+SET snapshot_id = NULL, snapshot_suppressed_in_shadow = false, updated_at = now()
+WHERE session_id = $1 AND snapshot_id IS NOT NULL;
 
 -- name: ClearSandboxStopRetireGen :exec
 -- Technical plan §3.3: the retirement SetSandboxStopRetireGen left owed is

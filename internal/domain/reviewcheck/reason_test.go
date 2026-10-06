@@ -7,7 +7,7 @@ import (
 
 func TestComputeOutputWithReason(t *testing.T) {
 	phases := []Phase{PhaseQueued, PhaseRunning, PhaseStale, PhaseTerminalAssessed, PhaseTerminalNotAssessed, Phase("bogus")}
-	reasons := []NotAssessedReason{"", NotAssessedPersonalLinkOnly, NotAssessedRolloutNotEnrolled, NotAssessedSubstrateUnsupported, NotAssessedPromptNotDelivered, NotAssessedRepoEntitlementRevoked, NotAssessedReason("a_reason_this_binary_does_not_know")}
+	reasons := []NotAssessedReason{"", NotAssessedPersonalLinkOnly, NotAssessedRolloutNotEnrolled, NotAssessedSubstrateUnsupported, NotAssessedPromptNotDelivered, NotAssessedRepoEntitlementRevoked, NotAssessedReviewCheckoutUnsupported, NotAssessedReviewCheckoutFailed, NotAssessedReason("a_reason_this_binary_does_not_know")}
 	for _, p := range phases {
 		for _, r := range reasons {
 			t.Run(string(p)+"/"+string(r), func(t *testing.T) {
@@ -20,7 +20,8 @@ func TestComputeOutputWithReason(t *testing.T) {
 					t.Errorf("summary = %q, want it to begin with ComputeOutput's %q", got.Summary, base.Summary)
 				}
 				extended := got.Summary != base.Summary
-				named := r == NotAssessedPersonalLinkOnly || r == NotAssessedRolloutNotEnrolled || r == NotAssessedSubstrateUnsupported || r == NotAssessedPromptNotDelivered || r == NotAssessedRepoEntitlementRevoked
+				named := r == NotAssessedPersonalLinkOnly || r == NotAssessedRolloutNotEnrolled || r == NotAssessedSubstrateUnsupported || r == NotAssessedPromptNotDelivered || r == NotAssessedRepoEntitlementRevoked ||
+					r == NotAssessedReviewCheckoutUnsupported || r == NotAssessedReviewCheckoutFailed
 				wantExtended := p == PhaseTerminalNotAssessed && named
 				if extended != wantExtended {
 					t.Errorf("summary extended = %v, want %v (summary %q)", extended, wantExtended, got.Summary)
@@ -74,6 +75,27 @@ func TestReasonExplanation_RepoEntitlementRevoked(t *testing.T) {
 	for _, banned := range []string{"installed", "configured", "access"} {
 		if strings.Contains(strings.ToLower(got.Summary), banned) {
 			t.Errorf("summary = %q, must not say %q", got.Summary, banned)
+		}
+	}
+}
+
+// TestReasonExplanation_ReviewCheckout pins the sentences a review check
+// closed at its checkout adds (technical plan §21.1): that the review was
+// not run on another tree, and what lifts it -- a rebuilt image for an
+// agent too old to check out, a new request otherwise.
+func TestReasonExplanation_ReviewCheckout(t *testing.T) {
+	for _, tc := range []struct {
+		reason NotAssessedReason
+		want   []string
+	}{
+		{NotAssessedReviewCheckoutUnsupported, []string{"agent too old to check out the commit", "not run on another tree", "Rebuild the sandbox image", "request the review again"}},
+		{NotAssessedReviewCheckoutFailed, []string{"did not check out the commit", "not run on another tree", "requesting the review again"}},
+	} {
+		got := ComputeOutputWithReason(PhaseTerminalNotAssessed, tc.reason)
+		for _, want := range tc.want {
+			if !strings.Contains(got.Summary, want) {
+				t.Errorf("%s: summary = %q, want it to contain %q", tc.reason, got.Summary, want)
+			}
 		}
 	}
 }

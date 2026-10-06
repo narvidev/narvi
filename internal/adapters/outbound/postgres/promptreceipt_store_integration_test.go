@@ -18,9 +18,11 @@ import (
 // (migrations/000155_prompt_receipts.up.sql), against real Postgres.
 
 // TestSandboxStore_RecordReady_GuardedOnGen: a ready counts, and records
-// its capability and the read limit it stated (technical plan §3.3,
-// migrations/000157_agent_max_frame_bytes.up.sql), only for the sandbox's
-// live gen; the latest ready of the gen decides; a gen bump leaves both on
+// its capabilities -- promptReceipt and reviewCheckout -- and the read
+// limit it stated (technical plan §3.3, §21.1,
+// migrations/000157_agent_max_frame_bytes.up.sql,
+// migrations/000167_review_turn_checkout.up.sql), only for the sandbox's
+// live gen; the latest ready of the gen decides; a gen bump leaves each on
 // a gen that is no longer live.
 func TestSandboxStore_RecordReady_GuardedOnGen(t *testing.T) {
 	ctx := context.Background()
@@ -32,14 +34,16 @@ func TestSandboxStore_RecordReady_GuardedOnGen(t *testing.T) {
 	}
 
 	steps := []struct {
-		name          string
-		gen           int32
-		promptReceipt bool
-		maxFrameBytes *int32
-		wantSeq       int32
-		wantGen       *int32
-		wantFrame     *int32
-		wantFrameGen  *int32
+		name            string
+		gen             int32
+		promptReceipt   bool
+		reviewCheckout  bool
+		maxFrameBytes   *int32
+		wantSeq         int32
+		wantGen         *int32
+		wantFrame       *int32
+		wantFrameGen    *int32
+		wantCheckoutGen *int32
 	}{
 		{name: "another gen's capable ready", gen: 2, promptReceipt: true, maxFrameBytes: ptrInt32(65536), wantSeq: 0},
 		{name: "the live gen's capable ready", gen: 1, promptReceipt: true, maxFrameBytes: ptrInt32(65536), wantSeq: 1, wantGen: ptrInt32(1), wantFrame: ptrInt32(65536), wantFrameGen: ptrInt32(1)},
@@ -49,9 +53,13 @@ func TestSandboxStore_RecordReady_GuardedOnGen(t *testing.T) {
 		{name: "a limit without promptReceipt", gen: 1, maxFrameBytes: ptrInt32(1 << 20), wantSeq: 4, wantFrame: ptrInt32(1 << 20), wantFrameGen: ptrInt32(1)},
 		{name: "promptReceipt without a limit", gen: 1, promptReceipt: true, wantSeq: 5, wantGen: ptrInt32(1)},
 		{name: "a limit again", gen: 1, promptReceipt: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 6, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1)},
+		{name: "another gen's ready that can check out", gen: 2, reviewCheckout: true, wantSeq: 6, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1)},
+		{name: "the live gen's ready that can check out", gen: 1, promptReceipt: true, reviewCheckout: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 7, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1), wantCheckoutGen: ptrInt32(1)},
+		{name: "a later ready that cannot clears it", gen: 1, promptReceipt: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 8, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1)},
+		{name: "able to check out again", gen: 1, promptReceipt: true, reviewCheckout: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 9, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1), wantCheckoutGen: ptrInt32(1)},
 	}
 	for _, step := range steps {
-		if err := store.RecordReady(ctx, sessionID, step.gen, step.promptReceipt, step.maxFrameBytes); err != nil {
+		if err := store.RecordReady(ctx, sessionID, step.gen, step.promptReceipt, step.reviewCheckout, step.maxFrameBytes); err != nil {
 			t.Fatalf("%s: RecordReady: %v", step.name, err)
 		}
 		row, err := store.Get(ctx, sessionID)
@@ -59,10 +67,11 @@ func TestSandboxStore_RecordReady_GuardedOnGen(t *testing.T) {
 			t.Fatal(err)
 		}
 		if row.ReadySeq != step.wantSeq || !equalInt32Ptr(row.PromptReceiptGen, step.wantGen) ||
-			!equalInt32Ptr(row.AgentMaxFrameBytes, step.wantFrame) || !equalInt32Ptr(row.AgentMaxFrameBytesGen, step.wantFrameGen) {
-			t.Fatalf("%s: ready_seq %d, prompt_receipt_gen %v, agent_max_frame_bytes %v at gen %v; want %d, %v, %v at gen %v", step.name,
-				row.ReadySeq, derefInt32(row.PromptReceiptGen), derefInt32(row.AgentMaxFrameBytes), derefInt32(row.AgentMaxFrameBytesGen),
-				step.wantSeq, derefInt32(step.wantGen), derefInt32(step.wantFrame), derefInt32(step.wantFrameGen))
+			!equalInt32Ptr(row.AgentMaxFrameBytes, step.wantFrame) || !equalInt32Ptr(row.AgentMaxFrameBytesGen, step.wantFrameGen) ||
+			!equalInt32Ptr(row.ReviewCheckoutGen, step.wantCheckoutGen) {
+			t.Fatalf("%s: ready_seq %d, prompt_receipt_gen %v, agent_max_frame_bytes %v at gen %v, review_checkout_gen %v; want %d, %v, %v at gen %v, %v", step.name,
+				row.ReadySeq, derefInt32(row.PromptReceiptGen), derefInt32(row.AgentMaxFrameBytes), derefInt32(row.AgentMaxFrameBytesGen), derefInt32(row.ReviewCheckoutGen),
+				step.wantSeq, derefInt32(step.wantGen), derefInt32(step.wantFrame), derefInt32(step.wantFrameGen), derefInt32(step.wantCheckoutGen))
 		}
 	}
 
@@ -72,17 +81,18 @@ func TestSandboxStore_RecordReady_GuardedOnGen(t *testing.T) {
 	if _, err := store.UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{SessionID: sessionID, TokenHash: &token}); err != nil {
 		t.Fatalf("respawn: %v", err)
 	}
-	if err := store.RecordReady(ctx, sessionID, 1, true, ptrInt32(4096)); err != nil {
+	if err := store.RecordReady(ctx, sessionID, 1, true, false, ptrInt32(4096)); err != nil {
 		t.Fatalf("RecordReady: %v", err)
 	}
 	row, err := store.Get(ctx, sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row.Gen != 2 || row.ReadySeq != 6 || !equalInt32Ptr(row.PromptReceiptGen, ptrInt32(1)) ||
-		!equalInt32Ptr(row.AgentMaxFrameBytes, ptrInt32(32<<20)) || !equalInt32Ptr(row.AgentMaxFrameBytesGen, ptrInt32(1)) {
-		t.Fatalf("after a respawn and a stale ready: gen %d, ready_seq %d, prompt_receipt_gen %v, agent_max_frame_bytes %v at gen %v; want 2, 6, 1, %d at gen 1 (stale, not matching)",
-			row.Gen, row.ReadySeq, derefInt32(row.PromptReceiptGen), derefInt32(row.AgentMaxFrameBytes), derefInt32(row.AgentMaxFrameBytesGen), 32<<20)
+	if row.Gen != 2 || row.ReadySeq != 9 || !equalInt32Ptr(row.PromptReceiptGen, ptrInt32(1)) ||
+		!equalInt32Ptr(row.AgentMaxFrameBytes, ptrInt32(32<<20)) || !equalInt32Ptr(row.AgentMaxFrameBytesGen, ptrInt32(1)) ||
+		!equalInt32Ptr(row.ReviewCheckoutGen, ptrInt32(1)) {
+		t.Fatalf("after a respawn and a stale ready: gen %d, ready_seq %d, prompt_receipt_gen %v, agent_max_frame_bytes %v at gen %v, review_checkout_gen %v; want 2, 9, 1, %d at gen 1, 1 (stale, not matching)",
+			row.Gen, row.ReadySeq, derefInt32(row.PromptReceiptGen), derefInt32(row.AgentMaxFrameBytes), derefInt32(row.AgentMaxFrameBytesGen), derefInt32(row.ReviewCheckoutGen), 32<<20)
 	}
 }
 

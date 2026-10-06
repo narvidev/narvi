@@ -1,0 +1,105 @@
+-- Technical plan §21.1 and §30.4: a review turn reads the commit it
+-- recorded. A turn of a pull request's review session that records a head
+-- (turns.review_head_sha) stays pending until its sandbox reports holding
+-- that head: the session actor sends the sandbox a checkout command naming
+-- the pull request's ref and the head, and dispatches the turn's prompt
+-- only once the stored checkout_result says the worktree holds it
+-- (internal/app/sessionactor/reviewcheckout.go). The checkout is data on
+-- the pending turn, never a turn state or edge, like §3.3's prompt
+-- receipts.
+--
+-- turns.checkout_message_id, checkout_gen: the messageId of the turn's
+-- latest checkout command and the sandbox gen it was sent to. The reply
+-- is the event the agent stores under 'checkout_result:{messageId}', read
+-- by that key through events_session_id_message_id_idx, whichever binary
+-- stored it.
+--
+-- turns.checkout_requested_at: when the turn's first checkout on that gen
+-- was asked for, on the database's clock -- the start of
+-- ReviewCheckoutTimeout and ReviewCheckoutRefLagWindow. A new gen starts a
+-- new bound.
+--
+-- turns.checkout_sent_at, checkout_sent_ready_seq: when the latest command
+-- was sent, and the gen's ready_seq then. A ready counted since means the
+-- sandbox reconnected, and a command lost with its socket is sent again.
+--
+-- turns.checkout_sends, checkout_failures: how many commands were sent on
+-- the gen, and how many of their replies said failed. A failure is
+-- retried, the spacing doubling with each send; ReviewCheckoutFailuresBeforeRetire
+-- failed replies retire the gen once per turn, so the next one boots
+-- fresh -- a stale index.lock or a broken index a killed git left in the
+-- worktree fails every checkout on that gen.
+--
+-- turns.checkout_retired_gen: the gen this turn's failed checkouts
+-- retired, NULL until they retire one. A turn retires at most one.
+--
+-- turns.checked_out_sha: the commit the sandbox reported holding, written
+-- in the commit that dispatches the turn. NULL for every turn that is not
+-- checked out.
+--
+-- sandboxes.review_checkout_gen: the gen whose latest ready advertised
+-- capabilities.reviewCheckout, recorded the way prompt_receipt_gen is
+-- (migrations/000155_prompt_receipts.up.sql): written only for the live
+-- gen, by RecordSandboxReady, NULL when that ready did not advertise it --
+-- the latest ready decides. Never reset: a spawn, restore or resume bumps
+-- the gen, and the value stops matching.
+--
+-- No backfill, no index. Every turn that exists when this runs has sent no
+-- checkout, so a pending review turn is asked for one at its next dispatch
+-- evaluation. Every sandbox reads incapable until its next ready.
+--
+-- # Locks
+--
+-- Each ADD COLUMN is nullable with no default, or NOT NULL with a constant
+-- default, which Postgres stores in the catalog: none rewrites a table.
+-- They take ACCESS EXCLUSIVE on turns and on sandboxes, for the file's one
+-- implicit transaction, for an instant. No index is needed: the reads are
+-- the turn by its primary key and the reply by
+-- events_session_id_message_id_idx.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with these columns present:
+--   - Every statement it sends names its columns (sqlc writes each
+--     SELECT * and RETURNING * out as a column list), so it neither reads
+--     nor writes them.
+--   - It dispatches every review turn unchecked, as it always did,
+--     including one this release left pending on its checkout.
+--   - Its RecordSandboxReady counts a ready and leaves review_checkout_gen
+--     as it is. A gen whose every ready it recorded reads incapable here:
+--     this release retires it once, clearing its snapshot, when it has
+--     one, and otherwise refuses its review turns, naming the remedy.
+--     A gen this release recorded capable keeps that through a ready the
+--     previous binary records: the same gen is the same agent.
+--   - It stores a checkout_result through its generic path, under the same
+--     wire messageId, so this release finds the reply by its key.
+-- migration000167_integration_test.go runs the previous binary's own
+-- statements against the columns.
+--
+-- # Rolling back
+--
+-- Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for. So once this migration is applied, the
+-- previous binary cannot boot ("no migration found for version 167"). A
+-- rollback therefore takes one of two steps first, with the control plane
+-- scaled to zero:
+--   - Keep the columns: with the golang-migrate CLI, `migrate force 166`.
+--     The previous binary then boots, since 166 is a version it has, and
+--     works with the columns present as above. When this release is
+--     deployed again, this file runs again and leaves the columns and
+--     their values as they are.
+--   - Drop them: run this migration's down (goto 166) with this release's
+--     migrations. The down file says what it removes.
+-- Nothing else needs undoing: no timer kind or event type is added. The
+-- checkout command and its checkout_result event are contracts 1.24.0's.
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_message_id TEXT;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_gen INTEGER;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_requested_at TIMESTAMPTZ;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_sent_at TIMESTAMPTZ;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_sent_ready_seq INTEGER;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_sends INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_failures INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS checkout_retired_gen INTEGER;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS checked_out_sha TEXT;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS review_checkout_gen INTEGER;

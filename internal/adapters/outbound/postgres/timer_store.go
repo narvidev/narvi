@@ -93,6 +93,17 @@ func (s *TimerStore) ArmDispatch(ctx context.Context, sessionID pgtype.UUID) err
 	return s.q.ArmSessionDispatchTimer(ctx, sessionID)
 }
 
+// ArmDispatchAfter arms the session's dispatch timer delay ahead of the
+// database's now, or moves an armed one there when that is sooner, never
+// later (ArmSessionDispatchTimerAfter): the session actor's next look at a
+// review turn waiting on its checkout (technical plan §21.1, §30.4). See
+// ArmSessionDispatchTimerAfter's doc comment in queries/session_timers.sql.
+func (s *TimerStore) ArmDispatchAfter(ctx context.Context, sessionID pgtype.UUID, delay time.Duration) error {
+	return s.q.ArmSessionDispatchTimerAfter(ctx, sqlcgen.ArmSessionDispatchTimerAfterParams{
+		SessionID: sessionID, DelaySeconds: delay.Seconds(),
+	})
+}
+
 // RequeueReviewRetriggerDebounce arms the session's re-review debounce due
 // at the database's now when the session has none, and reports the rows it
 // inserted: 0 when one is armed, which it leaves as it is. The re-request

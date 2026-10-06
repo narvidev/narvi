@@ -418,6 +418,83 @@ WHERE id = sqlc.arg('id')
   AND receipt_checked_ready_seq < sqlc.arg('ready_seq')::integer
   AND receipt_resend_count = sqlc.arg('resend_count')::integer;
 
+-- name: RecordTurnCheckoutRequest :execrows
+-- Technical plan §21.1 and §30.4 (migrations/000167_review_turn_checkout.up.sql):
+-- records, in the dispatch evaluation's own transaction, the checkout
+-- command the session actor is about to send a review turn's sandbox
+-- (sessionactor's reviewcheckout.go): its messageId, the gen it goes to,
+-- when it is sent and the gen's ready_seq then. The first request on a gen
+-- stamps checkout_requested_at, the start of the turn's bound on that gen,
+-- which every later request on the same gen keeps; a request on another
+-- gen starts the bound again, and its counts with it. after_failure counts
+-- the reply this request answers -- the previous send's -- as failed.
+-- Only while the turn is open (pending, or processing for a re-send to a
+-- new gen); 0 rows otherwise, and nothing is sent.
+UPDATE turns
+SET checkout_requested_at = CASE WHEN checkout_gen IS NOT DISTINCT FROM sqlc.arg('gen')::integer
+                                      AND checkout_requested_at IS NOT NULL
+                                 THEN checkout_requested_at ELSE now() END,
+    checkout_sends = CASE WHEN checkout_gen IS NOT DISTINCT FROM sqlc.arg('gen')::integer
+                          THEN checkout_sends + 1 ELSE 1 END,
+    checkout_failures = CASE WHEN checkout_gen IS NOT DISTINCT FROM sqlc.arg('gen')::integer
+                             THEN checkout_failures + CASE WHEN sqlc.arg('after_failure')::boolean THEN 1 ELSE 0 END
+                             ELSE 0 END,
+    checkout_gen = sqlc.arg('gen')::integer,
+    checkout_message_id = sqlc.arg('message_id')::text,
+    checkout_sent_at = now(),
+    checkout_sent_ready_seq = sqlc.arg('ready_seq')::integer
+WHERE id = sqlc.arg('id') AND status IN ('pending', 'processing');
+
+-- name: GetTurnCheckoutState :one
+-- Technical plan §21.1 and §30.4: the facts the session actor decides a
+-- review turn's checkout on (turn.DecideReviewCheckout), read in one
+-- statement on the database's clock: the turn's latest checkout request
+-- (its messageId, gen, ready_seq at the send and counts), how long ago the
+-- first request on that gen and the latest send were made, in nanoseconds
+-- (a time.Duration; 0 when none was made), and the reply, when one is
+-- stored. The reply is read by its key, never by scanning types: the agent
+-- gives it the deterministic messageId 'checkout_result:{command
+-- messageId}', so a reply stored by any binary -- one that does not know
+-- the type stores it through its generic path, under the same wire
+-- messageId -- is the same row, found through
+-- events_session_id_message_id_idx. The type check is an extra guard. A
+-- reply to an earlier command, or to another gen's, is never read: the
+-- key is the latest command's, and the gen fence never stores a reply of
+-- a gen that is no longer live.
+SELECT t.checkout_message_id,
+       t.checkout_gen,
+       t.checkout_sends,
+       t.checkout_failures,
+       t.checkout_retired_gen,
+       t.checkout_sent_ready_seq,
+       COALESCE((EXTRACT(EPOCH FROM (now() - t.checkout_requested_at)) * 1000000000)::bigint, 0)::bigint AS since_request_nanos,
+       COALESCE((EXTRACT(EPOCH FROM (now() - t.checkout_sent_at)) * 1000000000)::bigint, 0)::bigint AS since_send_nanos,
+       (SELECT e.payload FROM events e
+         WHERE e.session_id = t.session_id
+           AND e.message_id = 'checkout_result:' || t.checkout_message_id
+           AND e.type = 'checkout_result') AS reply
+FROM turns t
+WHERE t.id = $1;
+
+-- name: SetTurnCheckedOut :execrows
+-- Technical plan §21.1 and §30.4: the commit a review turn's sandbox
+-- reported holding, recorded in the commit that dispatches the turn (or
+-- re-sends it to a new gen) -- the audit fact that the turn ran on the
+-- head it recorded. Only while the turn is open; 0 rows otherwise.
+UPDATE turns
+SET checked_out_sha = sqlc.arg('sha')::text
+WHERE id = sqlc.arg('id') AND status IN ('pending', 'processing');
+
+-- name: SetTurnCheckoutRetiredGen :execrows
+-- Technical plan §21.1 and §30.4: the gen a review turn's failed checkouts
+-- retired (sessionactor's reviewcheckout.go), recorded in the transaction
+-- that retires it, so the turn retires no other: a turn retires at most
+-- one gen for its checkouts. Only while the turn is open; 0 rows
+-- otherwise.
+UPDATE turns
+SET checkout_retired_gen = sqlc.arg('gen')::integer
+WHERE id = sqlc.arg('id') AND status IN ('pending', 'processing');
+
 -- name: GetProcessingTurnForSession :one
 -- §20 ("builder epistemic pre-action check", §20.2) own epistemic-
 -- outcome-posting endpoint's first read -- mirrors WorkflowStore's own
