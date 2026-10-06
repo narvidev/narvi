@@ -7276,7 +7276,8 @@ three things: the run needs review; it will not resume on its own even once the 
 sends the next turn); and the guard's text. A queued attempt ended at dispatch sends the same notice. A
 person's decision on a step is answered 409 and rolls back. The automatic
 re-review drops that firing, spending none of the pull request's re-review budget and keeping the
-pushed head for the next push. An owed review request is dropped before anything is read for it (the
+pushed head for the next push; the freeze (40.2) is read before the guard there, so a frozen firing is
+skipped, consuming nothing, before the cap is asked. An owed review request is dropped before anything is read for it (the
 requester's authorization, the pull request, the composed prompt), and its requester is told once. The
 composition review is declined for the cycle. The session keeps whatever sandbox it has under §2's
 ordinary idle rules, and an admin or maintainer raising the cap (an audited write) re-admits the next

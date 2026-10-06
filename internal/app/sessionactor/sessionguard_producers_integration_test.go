@@ -6,11 +6,13 @@ import (
 	"context"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/ports"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/platform"
@@ -186,5 +188,51 @@ func TestOwedReviewRequest_AtSpendCap_DroppedAndRequesterTold(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAutoRetrigger_FrozenAtSpendCap_TheFreezeSkipsFirst: a debounce firing
+// while autonomy is frozen (technical plan §40.2) for a session that has
+// also spent its cap is skipped by the freeze, which consumes nothing --
+// the debounce re-armed to look again -- before the session guard is asked:
+// no review turn, none of the budget spent, and no warning or notice of the
+// cap. Once autonomy is unfrozen, the next firing meets the cap.
+func TestAutoRetrigger_FrozenAtSpendCap_TheFreezeSkipsFirst(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newHoldFixture(ctx, t, pool, "acme/frozen-at-cap", 902, pgtype.UUID{})
+	setRepoCap(ctx, t, pool, f.repoFullName, "1.00")
+	spendOn(ctx, t, pool, f.sessionID, "2.00")
+	f.armDebounce(ctx, t, time.Now())
+	before, _, _, _ := f.debounce(ctx, t)
+	freezeAutonomyForActorTest(ctx, t, pool)
+	rig := newHoldRig(ctx, t, pool, f.sessionID, nil)
+
+	if err := rig.actor.Send(ctx, TimerFired{Name: TimerReviewRetriggerDebounce}); err != nil {
+		t.Fatalf("Send TimerFired: %v", err)
+	}
+	waitFrozenRearm(ctx, t, f, before.ArmedAt.Time)
+	if n := f.reviewAttemptsOf(ctx, t, holdPushedHead); n != 0 {
+		t.Fatalf("review attempts = %d, want none while frozen", n)
+	}
+	if pr := f.prSession(ctx, t); pr.AutoRetriggerCount != 0 {
+		t.Fatalf("auto_retrigger_count = %d, want 0", pr.AutoRetriggerCount)
+	}
+	if warnings, notices := guardRecorded(ctx, t, pool, f.sessionID); warnings != 0 || notices != 0 {
+		t.Fatalf("guard warnings %d, notices %d; want none: the freeze skipped the firing before the guard was asked", warnings, notices)
+	}
+
+	if _, err := narvipg.NewPlatformSettingsStore(pool).Unfreeze(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := rig.actor.Send(ctx, TimerFired{Name: TimerReviewRetriggerDebounce}); err != nil {
+		t.Fatalf("Send TimerFired: %v", err)
+	}
+	waitUntil(t, 5*time.Second, func() bool {
+		warnings, _ := guardRecorded(ctx, t, pool, f.sessionID)
+		return warnings == 1
+	})
+	if n := f.reviewAttemptsOf(ctx, t, holdPushedHead); n != 0 {
+		t.Fatalf("review attempts = %d, want none past the cap", n)
 	}
 }

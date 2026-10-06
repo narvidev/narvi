@@ -519,22 +519,6 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 			return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
 		}
 
-		// Technical plan §40.1: a session that has spent its cap gets no
-		// automatic re-review. Read here, with the revocation, before the
-		// GitHub fetch, the turn insert and the budget increment of phase
-		// 3: the firing is dropped, spending none of the pull request's
-		// budget, and pending_retrigger_head_sha is kept as the target, so
-		// the next push after a raise re-arms the debounce and reviews
-		// normally. The refusal records the crossing's warning, and its
-		// one notice when the crossing is new (admitAutomaticTurn).
-		if _, refusal, err := a.admitAutomaticTurn(ctx, tx, turnguard.StageAutoRetrigger); err != nil {
-			return err
-		} else if refusal != nil {
-			a.logger.Info("sessionactor: review_retrigger_debounce: the session has reached its spend cap, dropping this firing without a re-review; the pushed head stays pending",
-				"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
-			return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
-		}
-
 		// §24.3 step 2: the latest posted verdict for this PR, for the
 		// customer-consequential pair (§30.8) -- GetLatestNonShadow: a
 		// shadow-era "already reviewed" fact must never suppress a REAL
@@ -592,6 +576,24 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 			} else if frozen {
 				// decision stays nil: fully handled in this transaction.
 				return a.freezeReviewRetrigger(ctx, tx, prSession.RepoFullName, prSession.PrNumber)
+			}
+			// Technical plan §40.1: a session that has spent its cap gets
+			// no automatic re-review. Read here, once the firing would
+			// review -- after the freeze, which skips the site consuming
+			// nothing (§40.2) -- and before the GitHub fetch, the turn
+			// insert and the budget increment of phase 3: the firing is
+			// dropped, spending none of the pull request's budget, and
+			// pending_retrigger_head_sha is kept as the target, so the
+			// next push after a raise re-arms the debounce and reviews
+			// normally. The refusal records the crossing's warning, and
+			// its one notice when the crossing is new
+			// (admitAutomaticTurn).
+			if _, refusal, err := a.admitAutomaticTurn(ctx, tx, turnguard.StageAutoRetrigger); err != nil {
+				return err
+			} else if refusal != nil {
+				a.logger.Info("sessionactor: review_retrigger_debounce: the session has reached its spend cap, dropping this firing without a re-review; the pushed head stays pending",
+					"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+				return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
 			}
 			// §24.9: an automatic review waits for every open turn of the
 			// session. Read after the opt-in, the revocation, the heads
