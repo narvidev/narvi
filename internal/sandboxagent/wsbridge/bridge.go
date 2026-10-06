@@ -192,8 +192,10 @@ type Bridge struct {
 // SetLifetimeDeadline records the instant the sandbox's provider stated it
 // will end this sandbox (technical plan §35.2), so that every ready and
 // heartbeat reports the whole seconds left until it as
-// lifetimeRemainingSeconds, counted when that frame is written. Call it
-// once, before Run. A Bridge it is never called on reports nothing, which
+// lifetimeRemainingSeconds, counted when that frame is written, on this
+// sandbox's clock: however far that clock is off from the provider's, the
+// report is off by as much. Call it once, before Run. A Bridge it is never
+// called on reports nothing, which
 // the control plane reads as "keep your own estimate": nothing is ever
 // derived in its place -- the agent starts after its provider created the
 // sandbox, so a deadline it worked out from its own start would be later
@@ -205,8 +207,8 @@ func (b *Bridge) SetLifetimeDeadline(deadline time.Time) {
 // lifetimeRemainingSeconds is what a frame written at now reports as
 // lifetimeRemainingSeconds: nil when no deadline was stated; otherwise the
 // whole seconds from now to the deadline, rounded down so it never states
-// more than is left, and 0 once the deadline has passed, never a negative
-// value.
+// more than is left on this clock, and 0 once the deadline has passed,
+// never a negative value.
 func (b *Bridge) lifetimeRemainingSeconds(now time.Time) *int {
 	if b.lifetimeDeadline.IsZero() {
 		return nil

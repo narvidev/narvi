@@ -356,14 +356,6 @@ type commandHandler struct {
 	// renderVerdictToolPromptText/renderUploadToolPromptText.
 	reviewCostBudgetURL string
 
-	// runtimeVersion is the agent runtime's version as this process
-	// discovered it when it spawned the runtime (opencodeproc's
-	// Result.Version) -- empty when it discovered none. HandleSnapshot
-	// reports it in snapshot_ready's provenance (technical plan §35.5b):
-	// the runtime binary is in the snapshot, so a restore of it runs this
-	// version, whatever the control plane would configure today.
-	runtimeVersion string
-
 	// group launches each HandlePrompt's own StartTurn call on its own
 	// goroutine (via errgroup.Group.Go, never a bare `go` statement, §11)
 	// so wsbridge's own readLoop -- which calls HandlePrompt synchronously
@@ -938,19 +930,21 @@ func (h *commandHandler) HandleSnapshot(_ context.Context, cmd sandboxws.Snapsho
 
 // snapshotProvenance is what a snapshot this process mints holds, as
 // snapshot_ready reports it (technical plan §35.5b): the contracts
-// protocol this binary was compiled with, and the agent runtime version it
-// discovered at spawn, absent when it discovered none. Both are facts of
-// the binaries the snapshot captures, which a restore of it runs. Neither
-// is a value this process was told: not cfg.AgentVersion, which is "dev"
-// on every agent built without a stamped version, nor anything the control
-// plane configures, which describes what it would run today, not what the
-// snapshot holds.
+// protocol this binary was compiled with, and the version of the agent
+// runtime it talks to, as the runtime's spawn discovered it -- the one the
+// adapter was built with (opencode.Adapter.RuntimeVersion), absent when it
+// was not discoverable. Both are facts of the binaries the snapshot
+// captures, which a restore of it runs. Neither is a value this process
+// was told: not cfg.AgentVersion, which is "dev" on every agent built
+// without a stamped version, nor anything the control plane configures,
+// which describes what it would run today, not what the snapshot holds.
 func (h *commandHandler) snapshotProvenance() *sandboxws.SnapshotReadyProvenance {
 	protocol := contracts.Version
 	provenance := &sandboxws.SnapshotReadyProvenance{AgentProtocol: &protocol}
-	if h.runtimeVersion != "" {
-		runtimeVersion := h.runtimeVersion
-		provenance.RuntimeVersion = &runtimeVersion
+	if h.adapter != nil {
+		if runtimeVersion := h.adapter.RuntimeVersion(); runtimeVersion != "" {
+			provenance.RuntimeVersion = &runtimeVersion
+		}
 	}
 	return provenance
 }
@@ -1225,15 +1219,37 @@ func spawnOpenCode(ctx context.Context, sup *supervisor.Supervisor, workDir stri
 	return opencodeproc.Spawn(ctx, sup, workDir, providerCredentialEnv, runtimeEnv, runtimeCredential, readinessTimeout, pollInterval)
 }
 
-// logSandboxDeadline says, once logging is set up, what boot.Load read of
-// the deadline the sandbox's provider stated (technical plan §35.2): the
-// deadline every ready and heartbeat counts down to, or, at WARN, a value
-// that is not an RFC 3339 instant and was ignored -- the control plane's
-// own estimate then stands, as it does when the provider states nothing,
-// which is logged as nothing at all.
-func logSandboxDeadline(logger *slog.Logger, cfg boot.Config) {
+// newSessionCommands builds a live session's commandHandler and the
+// wsbridge.Bridge it answers on -- the two-phase construction
+// commandHandler's own doc comment describes, since each needs the other --
+// and states the provider's deadline to the bridge (stateSandboxDeadline).
+// run() calls it once cfg.SessionConfig is known to be present and the
+// agent runtime is up; adapter carries the runtime version a snapshot
+// reports (snapshotProvenance).
+func newSessionCommands(ctx context.Context, logger *slog.Logger, cfg boot.Config, timeouts platform.Timeouts,
+	sup *supervisor.Supervisor, layout gitdir.Layout, cred *syscall.Credential,
+	adapter *opencode.Adapter, reviewCostBudgetURL string,
+) (*commandHandler, *wsbridge.Bridge) {
+	handler := &commandHandler{adapter: adapter, runCtx: ctx, cfg: cfg, timeouts: timeouts, sup: sup, layout: layout, cred: cred, reviewCostBudgetURL: reviewCostBudgetURL}
+	bridge := wsbridge.New(*cfg.SessionConfig, cfg.SandboxID, cfg.AgentVersion, cfg.ImageDigest, handler,
+		timeouts.SandboxWSDialTimeout, timeouts.SandboxWSHeartbeatInterval,
+		timeouts.SandboxWSReconnectMinBackoff, timeouts.SandboxWSReconnectMaxBackoff)
+	handler.bridge = bridge
+	stateSandboxDeadline(logger, bridge, cfg)
+	return handler, bridge
+}
+
+// stateSandboxDeadline hands bridge the deadline the sandbox's provider
+// stated (technical plan §35.2), which every ready and heartbeat then
+// counts down to, and says so; or says, at WARN, that NARVI_SANDBOX_DEADLINE
+// held a value that is not an RFC 3339 instant and was ignored. With no
+// deadline stated -- every sandbox today, see boot.Config.SandboxDeadline --
+// it does and logs nothing: nothing is reported, and the control plane's
+// own estimate stands.
+func stateSandboxDeadline(logger *slog.Logger, bridge *wsbridge.Bridge, cfg boot.Config) {
 	switch {
 	case cfg.SandboxDeadline != nil:
+		bridge.SetLifetimeDeadline(*cfg.SandboxDeadline)
 		logger.Info("sandbox-agent: the provider stated this sandbox's deadline; every ready and heartbeat reports the seconds left until it",
 			"deadline", cfg.SandboxDeadline.UTC().Format(time.RFC3339))
 	case cfg.SandboxDeadlineMalformed != "":
@@ -1253,7 +1269,6 @@ func run() error {
 
 	logger := platform.NewLogger(os.Stdout, cfg.LogLevel)
 	slog.SetDefault(logger)
-	logSandboxDeadline(logger, cfg)
 
 	// sandbox-agent has no env-driven timeout-override mechanism (neither
 	// does control-plane's own platform.Load(), which also always uses
@@ -1399,11 +1414,6 @@ func run() error {
 	// exist by then -- see this file's own package doc comment for the
 	// full reasoning.
 	var agentRuntime *opencode.Adapter
-	// agentRuntimeVersion is the version the runtime's spawn discovered
-	// (result.Version), empty when there is no session or it discovered
-	// none: what a snapshot of this sandbox holds, which commandHandler's
-	// HandleSnapshot reports (technical plan §35.5b).
-	var agentRuntimeVersion string
 	// budgetServer/reviewCostBudgetURL are §26.5's own addition (§26.7/
 	// §26.9): budgetServer is sandbox-agent's own FIRST HTTP server (a
 	// tiny, loopback-only listener serving GET /review-cost-budget,
@@ -1787,7 +1797,6 @@ func run() error {
 			result.Version, cfg.SessionConfig.SandboxId,
 			cfg.SessionConfig.CapabilityRestricted)
 		defer agentRuntime.Close()
-		agentRuntimeVersion = result.Version
 
 		// §7: "Pin the OpenCode version in the image; record it in the
 		// boot fingerprint" -- the FIRST fingerprint log (above)
@@ -1831,28 +1840,17 @@ func run() error {
 	// boot.Load()'s own resolveSandboxID value -- see Config.SandboxID's
 	// own doc comment for where it really comes from now.
 	//
-	// handler is constructed with adapter already set, passed to
-	// wsbridge.New as the CommandHandler interface value, THEN gets
-	// .bridge set on that SAME pointer once Bridge exists -- see
+	// newSessionCommands constructs handler with adapter already set,
+	// passes it to wsbridge.New as the CommandHandler interface value,
+	// THEN sets .bridge on that SAME pointer once Bridge exists -- see
 	// commandHandler's own doc comment for why this two-phase
 	// construction is necessary (Bridge and commandHandler each need a
-	// reference to the other).
+	// reference to the other) -- and states the provider's deadline to
+	// the bridge (technical plan §35.2).
 	var bridge *wsbridge.Bridge
 	var handler *commandHandler
 	if cfg.SessionConfig != nil {
-		handler = &commandHandler{adapter: agentRuntime, runCtx: ctx, cfg: cfg, timeouts: timeouts, sup: sup, layout: layout, cred: runtimeCredential, reviewCostBudgetURL: reviewCostBudgetURL, runtimeVersion: agentRuntimeVersion}
-		bridge = wsbridge.New(*cfg.SessionConfig, cfg.SandboxID, cfg.AgentVersion, cfg.ImageDigest, handler,
-			timeouts.SandboxWSDialTimeout, timeouts.SandboxWSHeartbeatInterval,
-			timeouts.SandboxWSReconnectMinBackoff, timeouts.SandboxWSReconnectMaxBackoff)
-		handler.bridge = bridge
-		// Technical plan §35.2: every ready and heartbeat reports the
-		// seconds left until the deadline the provider stated, when it
-		// stated one -- no provider does today (boot.Config.SandboxDeadline),
-		// and then nothing is reported and the control plane's own
-		// estimate stands.
-		if cfg.SandboxDeadline != nil {
-			bridge.SetLifetimeDeadline(*cfg.SandboxDeadline)
-		}
+		handler, bridge = newSessionCommands(ctx, logger, cfg, timeouts, sup, layout, runtimeCredential, agentRuntime, reviewCostBudgetURL)
 		// Technical plan §3.3's prompt receipts: open this gen's prompt
 		// journal, before bridge.Run, so every ready advertises the
 		// capability and no prompt messageId runs twice, across a restart of
