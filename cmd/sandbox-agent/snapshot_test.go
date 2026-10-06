@@ -17,6 +17,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,6 +30,7 @@ import (
 	"github.com/coder/websocket"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/narvidev/narvi/contracts"
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
 	"github.com/narvidev/narvi/internal/platform"
@@ -386,5 +389,127 @@ func TestHandleSnapshot_PurgeFailure_AbortsWithoutMinting(t *testing.T) {
 
 	if fcp.mintCalled {
 		t.Error("HandleSnapshot called the snapshot-mint endpoint despite a failed cache purge; want the mint request never built at all")
+	}
+}
+
+// TestHandleSnapshot_ProvenanceIsWhatTheBinaryHolds pins technical plan
+// §35.5b's source of truth for a snapshot's provenance: what the minting
+// binary holds, never a version it was told. agentProtocol is the
+// contracts version this binary was compiled with -- not
+// NARVI_AGENT_VERSION, set here to a value that must not appear -- and
+// runtimeVersion is the agent runtime version this process discovered at
+// spawn, absent when it discovered none.
+func TestHandleSnapshot_ProvenanceIsWhatTheBinaryHolds(t *testing.T) {
+	tests := []struct {
+		name           string
+		runtimeVersion string
+		wantRuntime    *string
+	}{
+		{name: "a discovered runtime version", runtimeVersion: "1.14.19", wantRuntime: strPtr("1.14.19")},
+		{name: "no runtime version discovered", runtimeVersion: "", wantRuntime: nil},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NARVI_BOOT_MODE", "fresh")
+			t.Setenv("NARVI_AGENT_VERSION", "9.9.9")
+			loaded, err := boot.Load()
+			if err != nil {
+				t.Fatalf("boot.Load: %v", err)
+			}
+			if loaded.AgentVersion != "9.9.9" {
+				t.Fatalf("AgentVersion = %q, want the environment's 9.9.9", loaded.AgentVersion)
+			}
+
+			fcp := newFakeSnapshotCP(t, fmt.Sprintf("snapshot-provenance-session-%d", i))
+			fcp.mintSnapshotID = "snap-provenance"
+			ctx, cancel := context.WithTimeout(context.Background(), snapshotTestWait)
+			t.Cleanup(cancel)
+
+			sc := sessionconfig.SessionConfig{
+				BootMode:          sessionconfig.SessionConfigBootModeFresh,
+				ControlPlaneWsUrl: fcp.wsURL(),
+				Gen:               2,
+				SandboxToken:      "test-sandbox-token",
+				SessionId:         fcp.sessionID,
+			}
+			cfg := loaded
+			cfg.SessionConfig = &sc
+			cfg.CredentialCacheDir = ""
+			timeouts := platform.DefaultTimeouts()
+			handler := &commandHandler{runCtx: ctx, cfg: cfg, timeouts: timeouts, runtimeVersion: tc.runtimeVersion}
+			bridge := wsbridge.New(sc, "sbx-1", cfg.AgentVersion, cfg.ImageDigest, handler,
+				timeouts.SandboxWSDialTimeout, timeouts.SandboxWSHeartbeatInterval,
+				timeouts.SandboxWSReconnectMinBackoff, timeouts.SandboxWSReconnectMaxBackoff)
+			handler.bridge = bridge
+			var group errgroup.Group
+			group.Go(func() error { return bridge.Run(ctx) })
+			t.Cleanup(func() { _ = group.Wait() })
+
+			handler.HandleSnapshot(ctx, sandboxws.Snapshot{Type: "snapshot", MessageId: "msg-p", SessionId: fcp.sessionID, Gen: 2})
+
+			raw := waitForFrameType(t, fcp, "snapshot_ready", snapshotTestWait)
+			var got sandboxws.SnapshotReady
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("unmarshal SnapshotReady: %v (raw: %s)", err, raw)
+			}
+			if got.Provenance == nil {
+				t.Fatalf("snapshot_ready carries no provenance: %s", raw)
+			}
+			if got.Provenance.AgentProtocol == nil || *got.Provenance.AgentProtocol != contracts.Version {
+				t.Errorf("provenance.agentProtocol = %v, want this binary's contracts version %q", got.Provenance.AgentProtocol, contracts.Version)
+			}
+			if strings.Contains(string(raw), "9.9.9") {
+				t.Errorf("snapshot_ready names NARVI_AGENT_VERSION's 9.9.9, a value this binary was told, not one it holds: %s", raw)
+			}
+			switch {
+			case tc.wantRuntime == nil && got.Provenance.RuntimeVersion != nil:
+				t.Errorf("provenance.runtimeVersion = %q, want none: no runtime version was discovered", *got.Provenance.RuntimeVersion)
+			case tc.wantRuntime != nil && (got.Provenance.RuntimeVersion == nil || *got.Provenance.RuntimeVersion != *tc.wantRuntime):
+				t.Errorf("provenance.runtimeVersion = %v, want the discovered %q", got.Provenance.RuntimeVersion, *tc.wantRuntime)
+			}
+		})
+	}
+}
+
+// TestLogSandboxDeadline pins the one line the agent writes, once logging
+// is set up, about the deadline its provider stated (technical plan
+// §35.2): the deadline at INFO, an ignored malformed value at WARN, and
+// nothing when none was stated.
+func TestLogSandboxDeadline(t *testing.T) {
+	t.Parallel()
+	stated := time.Date(2026, 10, 6, 14, 30, 0, 0, time.UTC)
+	tests := []struct {
+		name      string
+		cfg       boot.Config
+		wantLevel string
+		wantAttr  string
+	}{
+		{name: "none stated", cfg: boot.Config{}},
+		{name: "stated", cfg: boot.Config{SandboxDeadline: &stated}, wantLevel: "INFO", wantAttr: "2026-10-06T14:30:00Z"},
+		{name: "malformed", cfg: boot.Config{SandboxDeadlineMalformed: "tomorrow"}, wantLevel: "WARN", wantAttr: "tomorrow"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var buf strings.Builder
+			logSandboxDeadline(slog.New(slog.NewJSONHandler(&buf, nil)), tc.cfg)
+			lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+			if tc.wantLevel == "" {
+				if buf.Len() != 0 {
+					t.Fatalf("logged %q with no deadline stated, want nothing", buf.String())
+				}
+				return
+			}
+			if len(lines) != 1 {
+				t.Fatalf("logged %d lines, want 1:\n%s", len(lines), buf.String())
+			}
+			var line map[string]any
+			if err := json.Unmarshal([]byte(lines[0]), &line); err != nil {
+				t.Fatalf("malformed log line %q: %v", lines[0], err)
+			}
+			if line["level"] != tc.wantLevel || !strings.Contains(lines[0], tc.wantAttr) {
+				t.Errorf("logged %s, want one %s line naming %q", lines[0], tc.wantLevel, tc.wantAttr)
+			}
+		})
 	}
 }

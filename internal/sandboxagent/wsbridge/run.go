@@ -218,17 +218,24 @@ func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn, writeB
 // that key is absent, as from an agent that predates it. It advertises
 // capabilities.reviewCheckout exactly when the handler implements
 // CheckoutHandler, the one way a checkout command is ever run.
+//
+// It carries lifetimeRemainingSeconds when the provider stated a deadline
+// (SetLifetimeDeadline), counted at the ready's own timestamp, and
+// nothing otherwise (technical plan §35.2). Never buffered, so the value
+// is never stale.
 func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
 	maxFrameBytes := platform.MaxPromptFrameBytes
+	now := b.now()
 	msg := sandboxws.Ready{
-		Type:         "ready",
-		MessageId:    b.newMessageID(),
-		SessionId:    b.sessionID,
-		Gen:          b.sessionGen,
-		Timestamp:    time.Now(),
-		AgentVersion: b.agentVersion,
-		ImageDigest:  b.imageDigest,
-		Capabilities: &sandboxws.ReadyCapabilities{MaxFrameBytes: &maxFrameBytes},
+		Type:                     "ready",
+		MessageId:                b.newMessageID(),
+		SessionId:                b.sessionID,
+		Gen:                      b.sessionGen,
+		Timestamp:                now,
+		AgentVersion:             b.agentVersion,
+		ImageDigest:              b.imageDigest,
+		Capabilities:             &sandboxws.ReadyCapabilities{MaxFrameBytes: &maxFrameBytes},
+		LifetimeRemainingSeconds: b.lifetimeRemainingSeconds(now),
 	}
 	if b.promptReceiptsOn() {
 		promptReceipt := true
@@ -383,8 +390,11 @@ func (b *Bridge) sendHeartbeatNow(ctx context.Context, conn *websocket.Conn, hea
 	return nil
 }
 
-// writeHeartbeat writes one heartbeat frame reporting lastBootPhase.
+// writeHeartbeat writes one heartbeat frame reporting lastBootPhase, and,
+// when the provider stated a deadline, the whole seconds left until it,
+// counted at the heartbeat's own timestamp (technical plan §35.2).
 func (b *Bridge) writeHeartbeat(ctx context.Context, conn *websocket.Conn, lastBootPhase *string) error {
+	now := b.now()
 	msg := sandboxws.Heartbeat{
 		Type:      "heartbeat",
 		MessageId: b.newMessageID(),
@@ -394,9 +404,10 @@ func (b *Bridge) writeHeartbeat(ctx context.Context, conn *websocket.Conn, lastB
 		// recorded -- nil until the first turn's own StartTurn call
 		// (internal/adapters/outbound/opencode.Adapter, §7)
 		// resolves a real OpenCode conversation id.
-		ConversationId: b.getConversationID(),
-		LastBootPhase:  lastBootPhase,
-		Timestamp:      time.Now(),
+		ConversationId:           b.getConversationID(),
+		LastBootPhase:            lastBootPhase,
+		Timestamp:                now,
+		LifetimeRemainingSeconds: b.lifetimeRemainingSeconds(now),
 	}
 	payload, err := json.Marshal(msg)
 	if err != nil {

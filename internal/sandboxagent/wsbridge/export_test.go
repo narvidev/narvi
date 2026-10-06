@@ -1,5 +1,7 @@
 package wsbridge
 
+import "time"
+
 // SetFlushWriteHookForTest installs hook to run after flushBuffer writes
 // each buffered entry (see Bridge.flushWriteHook). Call it before Run; the
 // hook runs on Run's own goroutine, so it must not itself make a send that
@@ -46,4 +48,11 @@ func AssertStateDirIsOursForTest(dir string, uid int) error {
 // PromptJournalFileNameForTest is promptJournalFileName.
 func PromptJournalFileNameForTest(sessionID string, gen int) string {
 	return promptJournalFileName(sessionID, gen)
+}
+
+// SetClockForTest replaces the clock every ready and heartbeat is written
+// at (see Bridge.now) -- how a test moves time between two heartbeats
+// without sleeping. Call it before Run; now is read on Run's goroutines.
+func SetClockForTest(b *Bridge, now func() time.Time) {
+	b.now = now
 }

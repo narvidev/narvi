@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"sync"
 	"time"
 
@@ -174,6 +175,44 @@ type Bridge struct {
 	// prompt receipts for this gen. Set once, before Run, and only read
 	// after; Run closes it when it returns.
 	journal *promptJournal
+
+	// lifetimeDeadline is the instant the sandbox's provider stated it will
+	// end this sandbox (technical plan §35.2), set by SetLifetimeDeadline
+	// before Run and only read after. The zero value means none was
+	// stated, and then no ready or heartbeat carries
+	// lifetimeRemainingSeconds.
+	lifetimeDeadline time.Time
+
+	// now is the clock every ready and heartbeat is written at: its
+	// timestamp, and the instant its lifetimeRemainingSeconds counts from.
+	// time.Now, replaced only through export_test.go, before Run.
+	now func() time.Time
+}
+
+// SetLifetimeDeadline records the instant the sandbox's provider stated it
+// will end this sandbox (technical plan §35.2), so that every ready and
+// heartbeat reports the whole seconds left until it as
+// lifetimeRemainingSeconds, counted when that frame is written. Call it
+// once, before Run. A Bridge it is never called on reports nothing, which
+// the control plane reads as "keep your own estimate": nothing is ever
+// derived in its place -- the agent starts after its provider created the
+// sandbox, so a deadline it worked out from its own start would be later
+// than the provider's.
+func (b *Bridge) SetLifetimeDeadline(deadline time.Time) {
+	b.lifetimeDeadline = deadline
+}
+
+// lifetimeRemainingSeconds is what a frame written at now reports as
+// lifetimeRemainingSeconds: nil when no deadline was stated; otherwise the
+// whole seconds from now to the deadline, rounded down so it never states
+// more than is left, and 0 once the deadline has passed, never a negative
+// value.
+func (b *Bridge) lifetimeRemainingSeconds(now time.Time) *int {
+	if b.lifetimeDeadline.IsZero() {
+		return nil
+	}
+	remaining := max(0, int(math.Floor(b.lifetimeDeadline.Sub(now).Seconds())))
+	return &remaining
 }
 
 // InitialBootPhase is what every heartbeat reports as lastBootPhase from
@@ -228,6 +267,7 @@ func New(
 
 		buffer: newOutboundBuffer(),
 		warned: make(map[uint64]struct{}),
+		now:    time.Now,
 
 		lastBootPhase: &initialPhase,
 
