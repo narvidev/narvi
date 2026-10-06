@@ -128,10 +128,12 @@ func (e *Engine) evaluateCronTriggersAt(ctx context.Context, now time.Time) erro
 // automation's own last recorded fire, if any) and
 // now-AutomationCronCatchUpWindow (the catch-up ceiling, so a genuinely
 // long-down engine backfills a BOUNDED amount, never an ever-growing one);
-// an automation that has NEVER fired (row.LastCronFiredAt invalid) starts
-// from exactly one granularity bucket back -- the SAME single-bucket window
-// CronMatches alone always evaluated, so a brand-new automation's very
-// first tick behaves identically to before this fix.
+// an automation that has NEVER fired (row.LastCronFiredAt invalid) counts
+// from the minute it was created, under the same ceiling
+// (domainautomation.CronCatchUpFrom), so a first occurrence a freeze held
+// is caught up like any later one, and nothing from before the automation
+// existed fires. Its window is never narrower than the single bucket
+// CronMatches alone always evaluated.
 //
 // A matched fire is an action that starts without a person asking for it
 // right then, so it reads the autonomy freeze (§40.2) before it claims the
@@ -149,16 +151,18 @@ func (e *Engine) evaluateCronAutomation(ctx context.Context, logger *slog.Logger
 		return false
 	}
 
-	from := toBucket.Add(-e.timeouts.AutomationCronGranularity)
+	var lastFired *time.Time
 	if row.LastCronFiredAt.Valid {
-		catchUpFloor := now.Add(-e.timeouts.AutomationCronCatchUpWindow)
-		if row.LastCronFiredAt.Time.After(catchUpFloor) {
-			from = row.LastCronFiredAt.Time
-		} else {
-			from = catchUpFloor
-			logger.Warn("automation: cron catch-up window capped a longer gap",
-				"last_cron_fired_at", row.LastCronFiredAt.Time, "catch_up_floor", catchUpFloor)
-		}
+		lastFired = &row.LastCronFiredAt.Time
+	}
+	createdAt := now
+	if row.CreatedAt.Valid {
+		createdAt = row.CreatedAt.Time
+	}
+	from, capped := domainautomation.CronCatchUpFrom(lastFired, createdAt, now, e.timeouts.AutomationCronGranularity, e.timeouts.AutomationCronCatchUpWindow)
+	if capped {
+		logger.Warn("automation: cron catch-up window capped a longer gap",
+			"last_cron_fired_at", row.LastCronFiredAt.Time, "catch_up_floor", from)
 	}
 
 	matched, err := domainautomation.CronMatchesWithin(cfg.Schedule, from, toBucket, e.timeouts.AutomationCronGranularity)

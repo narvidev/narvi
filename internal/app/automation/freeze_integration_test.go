@@ -187,6 +187,99 @@ func TestCronTrigger_FrozenPastCatchUp_WaitsForNextOccurrence(t *testing.T) {
 	}
 }
 
+// setCreatedAt back-dates an automation's creation, so a tick the test
+// places in the past sees it existing then.
+func (f *testFixture) setCreatedAt(t *testing.T, id pgtype.UUID, at time.Time) {
+	t.Helper()
+	if _, err := f.pool.Exec(context.Background(), "UPDATE automations SET created_at = $1 WHERE id = $2", at, id); err != nil {
+		t.Fatalf("back-date the automation: %v", err)
+	}
+}
+
+// TestCronTrigger_NeverFired_Unfreeze_FiresOnceWithinCatchUp: an automation
+// that has never fired catches up its first occurrence like any later one.
+// Its first scheduled minute falls inside a freeze; the first tick after
+// the freeze lifts, within the catch-up window, fires it once, and later
+// ticks never again.
+func TestCronTrigger_NeverFired_Unfreeze_FiresOnceWithinCatchUp(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	occurrence := time.Now().UTC().Truncate(time.Minute).Add(-2 * time.Hour)
+	auto := f.createCronAutomation(t, "daily, never fired, held", dailyAt(occurrence), sqlcgen.AutomationStatusActive)
+	f.setCreatedAt(t, auto.ID, occurrence.Add(-time.Hour))
+	if fired := f.lastCronFiredAt(t, auto.ID); fired.Valid {
+		t.Fatalf("last_cron_fired_at = %v, want unset: the automation has never fired", fired.Time)
+	}
+	f.freeze(t)
+	if err := f.engine.EvaluateCronTriggersAtForTest(ctx, occurrence.Add(10*time.Second)); err != nil {
+		t.Fatalf("frozen tick: %v", err)
+	}
+	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
+		t.Fatalf("invocations while frozen = %d, want 0", got)
+	}
+
+	f.unfreeze(t)
+	for i, at := range []time.Time{
+		occurrence.Add(3*time.Minute + 10*time.Second),
+		occurrence.Add(3*time.Minute + 40*time.Second),
+		occurrence.Add(4*time.Minute + 10*time.Second),
+	} {
+		if err := f.engine.EvaluateCronTriggersAtForTest(ctx, at); err != nil {
+			t.Fatalf("tick %d at %s: %v", i, at.Format(time.TimeOnly), err)
+		}
+		if got := f.countInvocationsForAutomation(t, auto.ID); got != 1 {
+			t.Fatalf("invocations after tick %d at %s = %d, want 1: the held first occurrence fires once", i, at.Format(time.TimeOnly), got)
+		}
+	}
+}
+
+// TestCronTrigger_NeverFired_FrozenPastCatchUp_WaitsForNextOccurrence: a
+// freeze that outlasts the catch-up window does not fire the first
+// occurrence it held, and the next scheduled occurrence fires as usual.
+func TestCronTrigger_NeverFired_FrozenPastCatchUp_WaitsForNextOccurrence(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	occurrence := time.Now().UTC().Truncate(time.Minute).Add(-48 * time.Hour)
+	auto := f.createCronAutomation(t, "daily, never fired, frozen past the window", dailyAt(occurrence), sqlcgen.AutomationStatusActive)
+	f.setCreatedAt(t, auto.ID, occurrence.Add(-time.Hour))
+	f.freeze(t)
+	if err := f.engine.EvaluateCronTriggersAtForTest(ctx, occurrence.Add(10*time.Second)); err != nil {
+		t.Fatalf("frozen tick: %v", err)
+	}
+
+	f.unfreeze(t)
+	if err := f.engine.EvaluateCronTriggersAtForTest(ctx, occurrence.Add(15*time.Minute)); err != nil {
+		t.Fatalf("tick past the window: %v", err)
+	}
+	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
+		t.Fatalf("invocations after the freeze outlasted the window = %d, want 0", got)
+	}
+	if err := f.engine.EvaluateCronTriggersAtForTest(ctx, occurrence.Add(24*time.Hour+10*time.Second)); err != nil {
+		t.Fatalf("tick at the next occurrence: %v", err)
+	}
+	if got := f.countInvocationsForAutomation(t, auto.ID); got != 1 {
+		t.Fatalf("invocations at the next occurrence = %d, want 1", got)
+	}
+}
+
+// TestCronTrigger_NeverFired_AnOccurrenceBeforeItsCreationNeverFires: the
+// window of an automation that has never fired starts at its creation, so
+// a schedule that matched minutes before the automation existed does not
+// fire on its first tick, however close.
+func TestCronTrigger_NeverFired_AnOccurrenceBeforeItsCreationNeverFires(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	occurrence := time.Now().UTC().Truncate(time.Minute).Add(-3 * time.Hour)
+	auto := f.createCronAutomation(t, "daily, created after its occurrence", dailyAt(occurrence), sqlcgen.AutomationStatusActive)
+	f.setCreatedAt(t, auto.ID, occurrence.Add(2*time.Minute))
+	if err := f.engine.EvaluateCronTriggersAtForTest(ctx, occurrence.Add(3*time.Minute+10*time.Second)); err != nil {
+		t.Fatalf("tick: %v", err)
+	}
+	if got := f.countInvocationsForAutomation(t, auto.ID); got != 0 {
+		t.Fatalf("invocations = %d, want 0: the occurrence came before the automation existed", got)
+	}
+}
+
 // assertHeldInvocation checks an invocation the freeze held: pending,
 // unclaimed, with no run.
 func (f *testFixture) assertHeldInvocation(t *testing.T, id pgtype.UUID) {
@@ -256,6 +349,7 @@ func TestFanOut_FreezeAfterClaim_ClaimReleased(t *testing.T) {
 	second := f.createInvocation(t, auto.ID, targets)
 	t.Cleanup(func() { _, _ = narvipg.NewPlatformSettingsStore(f.pool).Unfreeze(context.Background()) })
 
+	before := freezeSkips(t, domainautonomy.SiteAutomationFanOut)
 	var freezeErr error
 	claimedBefore := 0
 	if err := f.engine.PumpOnceAfterClaimForTest(ctx, func() {
@@ -273,6 +367,50 @@ func TestFanOut_FreezeAfterClaim_ClaimReleased(t *testing.T) {
 	f.assertHeldInvocation(t, first.ID)
 	f.assertHeldInvocation(t, second.ID)
 	f.assertNothingCounted(t, auto.ID)
+	if got := freezeSkips(t, domainautonomy.SiteAutomationFanOut) - before; got != 2 {
+		t.Fatalf("autonomy_freeze_skip_total{site=automation_fan_out} rose by %d, want 2: each held invocation counted once", got)
+	}
+}
+
+// TestFanOut_HeldThroughAPause_FansOutOnResume pins what pausing does to
+// invocations the freeze held: it defers them, it does not discard them.
+// Paused, they stay pending and unclaimed after the freeze lifts; resumed,
+// every one of them fans out on the next tick.
+func TestFanOut_HeldThroughAPause_FansOutOnResume(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	auto, targets := f.createAutomation(t, "held, paused, resumed", 1)
+	f.freeze(t)
+	held := []sqlcgen.AutomationInvocation{
+		f.createInvocation(t, auto.ID, targets),
+		f.createInvocation(t, auto.ID, targets),
+		f.createInvocation(t, auto.ID, targets),
+	}
+	if err := f.engine.PumpOnce(ctx); err != nil {
+		t.Fatalf("frozen PumpOnce: %v", err)
+	}
+	if _, err := f.automations.Pause(ctx, auto.ID); err != nil {
+		t.Fatalf("pause the automation: %v", err)
+	}
+	f.unfreeze(t)
+	if err := f.engine.PumpOnce(ctx); err != nil {
+		t.Fatalf("PumpOnce while paused: %v", err)
+	}
+	for _, inv := range held {
+		f.assertHeldInvocation(t, inv.ID)
+	}
+
+	if _, err := f.automations.Resume(ctx, auto.ID); err != nil {
+		t.Fatalf("resume the automation: %v", err)
+	}
+	if err := f.engine.PumpOnce(ctx); err != nil {
+		t.Fatalf("PumpOnce after the resume: %v", err)
+	}
+	for i, inv := range held {
+		if runs := f.listRunsForInvocation(t, inv.ID); len(runs) != 1 {
+			t.Fatalf("invocation %d: runs after the resume = %d, want 1: pausing deferred it, it did not discard it", i, len(runs))
+		}
+	}
 }
 
 // TestFanOut_Unfreeze_FansOutInOrder: the invocations held through the
