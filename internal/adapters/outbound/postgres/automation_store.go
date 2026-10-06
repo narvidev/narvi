@@ -163,12 +163,14 @@ func (s *AutomationStore) ListActiveLinearAutomations(ctx context.Context, organ
 	return s.q.ListActiveLinearAutomations(ctx, organizationID)
 }
 
-// ClaimCronFire is the cron trigger pump's own per-automation CAS guard --
-// see ClaimCronFire's own generated doc comment. pgx.ErrNoRows means this
-// automation already fired for the given minute bucket (a concurrent tick
-// or pod won the race first) -- a harmless no-op, not an error.
-func (s *AutomationStore) ClaimCronFire(ctx context.Context, id pgtype.UUID, minuteBucket pgtype.Timestamptz) (sqlcgen.Automation, error) {
-	return s.q.ClaimCronFire(ctx, sqlcgen.ClaimCronFireParams{ID: id, LastCronFiredAt: minuteBucket})
+// ClaimCronFire is the cron trigger pump's per-automation compare-and-swap:
+// it records minuteBucket as the automation's last fire only if
+// last_cron_fired_at is still expected, the value the tick read (invalid
+// for an automation that has never fired) -- see ClaimCronFire's generated
+// doc comment. pgx.ErrNoRows means another tick or replica claimed since
+// that read: a harmless no-op, not an error, and the tick creates nothing.
+func (s *AutomationStore) ClaimCronFire(ctx context.Context, id pgtype.UUID, expected, minuteBucket pgtype.Timestamptz) (sqlcgen.Automation, error) {
+	return s.q.ClaimCronFire(ctx, sqlcgen.ClaimCronFireParams{ID: id, Expected: expected, Bucket: minuteBucket})
 }
 
 // UpdateLastRun persists §8.4's own "last_run + artifact_summary

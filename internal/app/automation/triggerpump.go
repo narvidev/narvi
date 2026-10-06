@@ -50,7 +50,8 @@ func unmarshalCronTriggerConfig(raw []byte) (domainautomation.CronTriggerConfig,
 // since that automation's own last fire (domainautomation.
 // CronMatchesWithin, capped at AutomationCronCatchUpWindow -- see this
 // function's own "review fix" paragraph below), attempts to claim the
-// CURRENT minute bucket (ClaimCronFire's CAS) and, on winning it, calls
+// CURRENT minute bucket (ClaimCronFire, a compare-and-swap on the last
+// fire the tick read) and, on winning it, calls
 // CreateInvocation with a fresh snapshot of the automation's own current
 // repos as targets -- ListActiveCronAutomations' own "AND status = 'active'"
 // filter is the SAME "check this automation is still active before ever
@@ -77,9 +78,10 @@ func unmarshalCronTriggerConfig(raw []byte) (domainautomation.CronTriggerConfig,
 // row's own window runs from max(row.LastCronFiredAt,
 // now-AutomationCronCatchUpWindow) through the current minute bucket
 // (domainautomation.CronMatchesWithin), firing AT MOST ONCE per tick even
-// when multiple buckets inside that window matched (CAS discipline is
-// unchanged -- ClaimCronFire still only ever records the CURRENT bucket as
-// this automation's own last fire, exactly as it always has).
+// when multiple buckets inside that window matched (ClaimCronFire records
+// only the CURRENT bucket as this automation's own last fire, and only if
+// the last fire is still the one the tick read, so two replicas' ticks
+// whose windows hold the same occurrence fire it once between them).
 //
 // Exported (rather than only reachable through Run's own loop) so tests
 // can drive exactly one tick deterministically, matching PumpOnce/
@@ -178,14 +180,19 @@ func (e *Engine) evaluateCronAutomation(ctx context.Context, logger *slog.Logger
 		return true
 	}
 
+	// The claim is a compare-and-swap on the last fire this tick read
+	// (row.LastCronFiredAt), the value its window was computed from: a
+	// tick of another replica that claimed since saw the same occurrence,
+	// and this one must not fire it again.
 	minuteBucket := pgtype.Timestamptz{Time: toBucket, Valid: true}
-	claimed, err := e.automations.ClaimCronFire(ctx, row.ID, minuteBucket)
+	claimed, err := e.automations.ClaimCronFire(ctx, row.ID, row.LastCronFiredAt, minuteBucket)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// Already fired for this exact minute bucket -- a concurrent
-			// tick (this pod's or another pod's own Engine) won the race
-			// first. Harmless no-op, the SAME "lost the race" outcome every
-			// other CAS-guarded write in this package treats identically.
+			// Another tick -- this pod's or another pod's own Engine --
+			// claimed since this one read the row. Harmless no-op, the SAME
+			// "lost the race" outcome every other CAS-guarded write in this
+			// package treats identically: the occurrence fired once, from
+			// the claim that won.
 			return false
 		}
 		logger.Error("automation: claim cron fire failed", "error", err)
