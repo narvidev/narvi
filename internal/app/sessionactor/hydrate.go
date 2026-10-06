@@ -140,6 +140,7 @@ func (r *Registry) hydrateAndAcquire(ctx context.Context, sessionID pgtype.UUID)
 		repoAccessCache:         r.repoAccessCache,
 		epistemicCheckDefault:   r.epistemicCheckDefault,
 		rolloutMode:             r.rolloutMode,
+		autonomy:                r.autonomy,
 		sandboxCommitted:        sandboxCommitted,
 		registry:                r,
 		lockGen:                 lockGen,

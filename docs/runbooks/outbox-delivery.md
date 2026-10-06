@@ -25,6 +25,13 @@ correct — this is specifically an *outbound-channel* symptom.
 - `outbox_due_backlog_count` (gauge) — total pending rows including
   mid-backoff ones. This is the one that stays honest during a backoff
   storm.
+- While autonomy is frozen ([autonomy-freeze.md](autonomy-freeze.md)),
+  the `sentinel_auto_fix` and `github_description_autofix` rows are held,
+  not stuck: pending, `last_error` starting `skipped (frozen)`, `attempts`
+  not moving, due again every minute, and claimed in a lane of their own
+  so no other kind waits behind them (one born in shadow is not held: it
+  resolves into the ledger as usual). `outbox_lag_seconds` leaves them out
+  while frozen; `outbox_due_backlog_count` still counts them.
 - `outbox_dead_letter_total` (counter) incrementing at all — each
   increment is one entry that exhausted `domain/outbox.MaxAttempts` (10)
   delivery attempts (`internal/domain/outbox/backoff.go`) and will never

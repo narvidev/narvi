@@ -56,6 +56,8 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
+	"go.opentelemetry.io/otel"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 
 	"golang.org/x/sync/errgroup"
 
@@ -72,12 +74,23 @@ var (
 	sharedConnStr     string
 	truncateStatement string
 	restoreStatements []string
+
+	// metricsReader backs the one meter provider TestMain installs, for
+	// the counter the autonomy freeze's skips are recorded on.
+	metricsReader *sdkmetric.ManualReader
 )
 
+// IntegrationMetricsReader returns the ManualReader behind this binary's
+// one meter provider, installed by TestMain before any Engine (and so any
+// autonomy gate) is built.
+func IntegrationMetricsReader() *sdkmetric.ManualReader {
+	return metricsReader
+}
+
 // TestMain starts exactly one shared Postgres container/pool for this
-// whole test binary -- mirrors app/imagebuild's own identical TestMain
-// exactly (minus the OTel MeterProvider wiring: this package constructs no
-// custom OTel instruments of its own).
+// whole test binary -- mirrors app/imagebuild's own identical TestMain,
+// with one meter provider for the autonomy gate's skip counter
+// (IntegrationMetricsReader).
 func TestMain(m *testing.M) {
 	ctx := context.Background()
 
@@ -124,8 +137,13 @@ func TestMain(m *testing.M) {
 	sharedPool = pool
 	sharedConnStr = connStr
 
+	metricsReader = sdkmetric.NewManualReader()
+	mp := sdkmetric.NewMeterProvider(sdkmetric.WithReader(metricsReader))
+	otel.SetMeterProvider(mp)
+
 	code := m.Run()
 
+	_ = mp.Shutdown(context.Background())
 	pool.Close()
 	if err := testcontainers.TerminateContainer(container); err != nil {
 		log.Printf("automation: terminate shared integration-test container: %v", err)

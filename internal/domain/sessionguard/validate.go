@@ -21,7 +21,7 @@ var ErrInvalidSessionSpendCap = errors.New("sessionguard: invalid session spend 
 // function is refused when written). nil is valid: it clears the cap, the
 // only spelling of "no cap". A cap must be a finite number -- NaN and the
 // infinities are refused, as the columns' CHECK constraints refuse them
-// (migrations/000163) -- above zero, since a cap of zero or less permits
+// (migrations/000165) -- above zero, since a cap of zero or less permits
 // nothing, with at most two decimal places and no larger than
 // MaxSessionSpendCapUSD, which is what NUMERIC(10, 2) holds exactly.
 func ValidateSessionSpendCap(v *float64) error {

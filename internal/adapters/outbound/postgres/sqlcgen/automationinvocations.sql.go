@@ -389,3 +389,32 @@ func (q *Queries) MarkAutomationInvocationFailureCounted(ctx context.Context, id
 	)
 	return i, err
 }
+
+const releaseAutomationInvocationFanOutClaim = `-- name: ReleaseAutomationInvocationFanOutClaim :execrows
+UPDATE automation_invocations ai
+SET fanned_out_at = NULL
+WHERE ai.id = $1
+  AND ai.fanned_out_at = $2
+  AND ai.status = 'pending'
+  AND NOT EXISTS (SELECT 1 FROM automation_runs r WHERE r.invocation_id = ai.id)
+`
+
+type ReleaseAutomationInvocationFanOutClaimParams struct {
+	ID        pgtype.UUID        `json:"id"`
+	ClaimedAt pgtype.Timestamptz `json:"claimed_at"`
+}
+
+// Gives back a fan-out claim the engine took but did not fan out, because
+// autonomy froze (technical plan §40.2) between its claim transaction and
+// this invocation's turn: fanned_out_at back to NULL, so the invocation is
+// listed again by ListDueForFanOut once the freeze lifts. A compare-and-
+// swap on the claim's own fanned_out_at, still pending, and with no run
+// yet: a claim taken since, a closed invocation, or one any run was
+// created for is never released. 0 rows when the guard misses.
+func (q *Queries) ReleaseAutomationInvocationFanOutClaim(ctx context.Context, arg ReleaseAutomationInvocationFanOutClaimParams) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseAutomationInvocationFanOutClaim, arg.ID, arg.ClaimedAt)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}

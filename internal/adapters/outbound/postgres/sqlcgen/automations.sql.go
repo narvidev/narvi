@@ -61,28 +61,33 @@ func (q *Queries) ApplyFailureStrike(ctx context.Context, arg ApplyFailureStrike
 
 const claimCronFire = `-- name: ClaimCronFire :one
 UPDATE automations
-SET last_cron_fired_at = $2
-WHERE id = $1 AND (last_cron_fired_at IS NULL OR last_cron_fired_at < $2)
+SET last_cron_fired_at = $1
+WHERE id = $2
+  AND last_cron_fired_at IS NOT DISTINCT FROM $3
+  AND (last_cron_fired_at IS NULL OR last_cron_fired_at < $1)
 RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd
 `
 
 type ClaimCronFireParams struct {
-	ID              pgtype.UUID        `json:"id"`
-	LastCronFiredAt pgtype.Timestamptz `json:"last_cron_fired_at"`
+	Bucket   pgtype.Timestamptz `json:"bucket"`
+	ID       pgtype.UUID        `json:"id"`
+	Expected pgtype.Timestamptz `json:"expected"`
 }
 
-// The CAS half of the cron trigger pump's own per-automation fire guard:
-// "UPDATE ... WHERE last_cron_fired_at IS NULL OR last_cron_fired_at <
-// <this minute's own start>" -- guards against firing the SAME scheduled
-// minute twice (a slow previous tick, clock jitter, a second pod's own
-// concurrent pump), while still allowing every LATER minute's own match to
-// fire again -- unlike automation_invocations.fanned_out_at's one-way
-// NULL-to-non-NULL flip, this guard is a recurring per-minute bucket, not
-// a permanent latch. $2 is the current UTC minute's own truncated start
-// instant, used both as the new last_cron_fired_at value and as the
-// guard's own comparison point.
+// The cron trigger pump's per-automation fire guard: a compare-and-swap on
+// the last_cron_fired_at the tick read (expected, NULL for an automation
+// that has never fired), setting it to the tick's own minute bucket. A
+// tick decides whether to fire from the window that value opens
+// (domain/automation.CronCatchUpFrom); once any other tick -- a second
+// replica's pump, or a slow earlier tick of this one -- has claimed since,
+// that window is stale, and this matches no row (pgx.ErrNoRows), so the
+// occurrence it saw fires once, from the claim that won. Comparing with
+// the bucket alone would not do: two replicas whose ticks straddle a
+// minute boundary each read the same value, and the later bucket passes a
+// "< bucket" guard after the earlier claim commits. The bucket must still
+// be later than the value read, so a claim never moves the fire back.
 func (q *Queries) ClaimCronFire(ctx context.Context, arg ClaimCronFireParams) (Automation, error) {
-	row := q.db.QueryRow(ctx, claimCronFire, arg.ID, arg.LastCronFiredAt)
+	row := q.db.QueryRow(ctx, claimCronFire, arg.Bucket, arg.ID, arg.Expected)
 	var i Automation
 	err := row.Scan(
 		&i.ID,

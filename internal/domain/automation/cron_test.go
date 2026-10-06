@@ -226,3 +226,69 @@ func TestCronMatchesWithin_NonPositiveGranularityErrors(t *testing.T) {
 		t.Fatal("expected an error for a negative granularity")
 	}
 }
+
+// TestCronCatchUpFrom pins the window one cron tick evaluates: from the
+// last fire under the catch-up ceiling for an automation that has fired,
+// and from the minute it was created under the same ceiling for one that
+// has not -- never further back than the ceiling, never later than one
+// bucket back.
+func TestCronCatchUpFrom(t *testing.T) {
+	const granularity, catchUp = time.Minute, 10 * time.Minute
+	now := time.Date(2026, 10, 6, 10, 13, 10, 0, time.UTC)
+	at := func(h, m, s int) time.Time { return time.Date(2026, 10, 6, h, m, s, 0, time.UTC) }
+	ptr := func(t time.Time) *time.Time { return &t }
+	for _, tc := range []struct {
+		name       string
+		lastFired  *time.Time
+		createdAt  time.Time
+		wantFrom   time.Time
+		wantCapped bool
+	}{
+		{name: "fired within the ceiling: from the last fire", lastFired: ptr(at(10, 8, 0)), createdAt: at(9, 0, 0), wantFrom: at(10, 8, 0)},
+		{name: "fired before the ceiling: the ceiling, capped", lastFired: ptr(at(9, 0, 0)), createdAt: at(8, 0, 0), wantFrom: at(10, 3, 10), wantCapped: true},
+		{name: "never fired, created long ago: the ceiling, not capped", createdAt: at(8, 0, 0), wantFrom: at(10, 3, 10)},
+		{name: "never fired, created within the ceiling: the bucket before its creation minute", createdAt: at(10, 7, 40), wantFrom: at(10, 6, 0)},
+		{name: "never fired, created this minute: one bucket back", createdAt: at(10, 13, 5), wantFrom: at(10, 12, 0)},
+		{name: "never fired, a creation time that reads later than now: one bucket back", createdAt: at(10, 14, 30), wantFrom: at(10, 12, 0)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			from, capped := automation.CronCatchUpFrom(tc.lastFired, tc.createdAt, now, granularity, catchUp)
+			if !from.Equal(tc.wantFrom) || capped != tc.wantCapped {
+				t.Fatalf("CronCatchUpFrom = (%v, %v), want (%v, %v)", from, capped, tc.wantFrom, tc.wantCapped)
+			}
+		})
+	}
+}
+
+// TestCronCatchUpFrom_NeverFiredCatchesItsFirstOccurrence pins what the
+// window means for an automation that has never fired, through
+// CronMatchesWithin: an occurrence after its creation and within the
+// ceiling fires on a later tick; one before its creation, or before the
+// ceiling, does not.
+func TestCronCatchUpFrom_NeverFiredCatchesItsFirstOccurrence(t *testing.T) {
+	const granularity, catchUp = time.Minute, 10 * time.Minute
+	occurrence := time.Date(2026, 10, 6, 10, 0, 0, 0, time.UTC)
+	schedule := "0 10 * * *"
+	for _, tc := range []struct {
+		name      string
+		createdAt time.Time
+		tick      time.Time
+		want      bool
+	}{
+		{name: "created before it, a tick three minutes after", createdAt: occurrence.Add(-time.Hour), tick: occurrence.Add(3*time.Minute + 10*time.Second), want: true},
+		{name: "created in its own minute, a tick in it", createdAt: occurrence.Add(30 * time.Second), tick: occurrence.Add(45 * time.Second), want: true},
+		{name: "created after it, a tick three minutes after", createdAt: occurrence.Add(2 * time.Minute), tick: occurrence.Add(3*time.Minute + 10*time.Second), want: false},
+		{name: "created before it, a tick past the ceiling", createdAt: occurrence.Add(-time.Hour), tick: occurrence.Add(15 * time.Minute), want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			from, _ := automation.CronCatchUpFrom(nil, tc.createdAt, tc.tick, granularity, catchUp)
+			got, err := automation.CronMatchesWithin(schedule, from, tc.tick.Truncate(granularity), granularity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.want {
+				t.Fatalf("matched = %v, want %v (window from %v)", got, tc.want, from)
+			}
+		})
+	}
+}

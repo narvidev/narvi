@@ -3131,6 +3131,28 @@ type Timeouts struct {
 	// the debounce knows it).
 	ReviewRetriggerHoldBackstop time.Duration
 
+	// AutonomyFreezeRecheckInterval is how soon an automatic action the
+	// autonomy freeze held (technical plan §40.2) is looked at again, for
+	// the sites that have no tick of their own to bring it back: the
+	// automatic re-review's debounce, re-armed this far ahead on the
+	// database's clock while frozen (its pushed head and budget kept), and
+	// a held outbox delivery -- the sentinel auto-fix and the description
+	// rewrite -- made due again this far ahead, its attempt given back. It
+	// is the unfreeze latency of both, plus the pump's own interval. The
+	// sites with a tick of their own (the auto-merge worker, the cron
+	// trigger, the automation fan-out) read the freeze again on their next
+	// tick. Validate keeps it above TimerClaimDuration (a frozen debounce
+	// is never re-delivered at the claim cadence) and at or below
+	// ReviewRetriggerHoldBackstop (a frozen debounce is looked at again at
+	// least as often as a held one, so an unfreeze is noticed no later
+	// than a lost wake-up). At the defaults its lead sits under the held mark a
+	// turn's end wakes (ReviewRetriggerDebounce plus MinTimeoutMargin), so
+	// a turn ending does not wake a frozen debounce; one that did would
+	// only read the freeze again and re-arm it. Not specified in the plan;
+	// one minute: about a minute of unfreeze latency, for one actor firing
+	// per frozen pull request per minute.
+	AutonomyFreezeRecheckInterval time.Duration
+
 	// ReviewContextMoveMaxConsecutive is how many automatic review attempts
 	// of one pull request in a row may meet a moved context at dispatch
 	// and still ask again (technical plan §24.9): an attempt that waited
@@ -4439,6 +4461,8 @@ func DefaultTimeouts() Timeouts {
 		ReviewRetriggerDebounce:     2 * time.Minute,  // §24.2; not specified, chosen -- long enough to collapse a short burst of fixup-commit pushes into one quiet window, short enough that a single push still reviews promptly
 		ReviewRetriggerHoldBackstop: 10 * time.Minute, // §24.9; not specified, chosen -- every turn end wakes the debounce at once, so this only bounds a lost wake-up, see field doc comment
 
+		AutonomyFreezeRecheckInterval: 60 * time.Second, // §40.2; not specified, chosen -- the unfreeze latency of a held re-review and a held outbox delivery, see field doc comment
+
 		ReviewContextMoveMaxConsecutive: 3, // §24.9; not specified, chosen -- a count of automatic attempts in a row that met a moved context, see field doc comment
 
 		ReviewCostBudgetServerReadHeaderTimeout: 5 * time.Second, // §26.7/§26.9; not specified, chosen -- matches RepoSHADiscoveryTimeout/CredentialFetchTimeout's own "lightweight, purely local" precedent, see field doc comment
@@ -4835,6 +4859,23 @@ func (t Timeouts) Validate() error {
 		"ReviewRetriggerHoldBackstop", t.ReviewRetriggerHoldBackstop, "ReviewRetriggerDebounce", t.ReviewRetriggerDebounce)
 	check("TurnDeadline > ReviewRetriggerHoldBackstop",
 		"TurnDeadline", t.TurnDeadline, "ReviewRetriggerHoldBackstop", t.ReviewRetriggerHoldBackstop)
+
+	// §40.2, the autonomy freeze's recheck: a frozen debounce is never
+	// re-delivered at the claim cadence, and is looked at again at least as
+	// often as a held one. The second is an ordering, not a race, so no
+	// margin, and equal is at least as often. See
+	// AutonomyFreezeRecheckInterval's doc comment.
+	check("AutonomyFreezeRecheckInterval > TimerClaimDuration",
+		"AutonomyFreezeRecheckInterval", t.AutonomyFreezeRecheckInterval, "TimerClaimDuration", t.TimerClaimDuration)
+	if t.AutonomyFreezeRecheckInterval > t.ReviewRetriggerHoldBackstop {
+		errs = append(errs, &TimeoutInvariantError{
+			Chain:        "ReviewRetriggerHoldBackstop >= AutonomyFreezeRecheckInterval",
+			LesserField:  "AutonomyFreezeRecheckInterval",
+			LesserValue:  t.AutonomyFreezeRecheckInterval,
+			GreaterField: "ReviewRetriggerHoldBackstop",
+			GreaterValue: t.ReviewRetriggerHoldBackstop,
+		})
+	}
 
 	// §3.3's stop, after the named session's commit: a zero walk bound
 	// reaches no session it started, and one at or past

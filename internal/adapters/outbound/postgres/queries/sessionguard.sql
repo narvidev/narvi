@@ -14,7 +14,7 @@
 -- arrives (RecordTurnStepCost), and a turn reaches processing only through
 -- dispatched, which stamps dispatched_at -- so naming dispatched_at IS NOT
 -- NULL loses nothing, and lets turns_session_dispatched_idx (migrations/
--- 000164) answer the read from the session's own dispatched turns. A cost
+-- 000166) answer the read from the session's own dispatched turns. A cost
 -- that arrives with no turn processing is counted nowhere, so this is a
 -- lower bound of the bill (§25.15). Cast to a scale of 6, cost_usd's own,
 -- so the guard converts it to micro-dollars exactly.
@@ -27,7 +27,7 @@
 -- refusal belongs to (sessionguard.WarningKey).
 --
 -- automation_*: the automation that created the session, read through its
--- earliest automation_runs row (automation_runs_session_id_idx, 000163),
+-- earliest automation_runs row (automation_runs_session_id_idx, 000165),
 -- then by its own key, and its cap; NULL for a session no automation
 -- created. The automation's cap takes precedence over the repositories'
 -- when it is set.

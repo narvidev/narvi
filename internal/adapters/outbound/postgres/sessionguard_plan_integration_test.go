@@ -395,7 +395,7 @@ func measureGuardWrite(ctx context.Context, t *testing.T, pool *pgxpool.Pool, st
 // read are at most a fixed number plus a few for each of the session's own
 // turns -- never a term in the table.
 //
-// It also measures, before and after migration 000164 builds that index,
+// It also measures, before and after migration 000166 builds that index,
 // the statements of turns it enters the plan space of. The reads of a
 // session's turns (ListTurnsForSession, GetTurnByDispatchedMessageID,
 // ReviewRetriggerHeld, GetSessionActivityFacts) read no more after; they
@@ -557,7 +557,7 @@ func TestSessionGuardFacts_ReadsTheSessionsOwnTurns(t *testing.T) {
 				}
 			}
 			if _, err := pool.Exec(ctx, `DROP INDEX turns_session_dispatched_idx`); err != nil {
-				t.Fatalf("take away 000164's index: %v", err)
+				t.Fatalf("take away 000166's index: %v", err)
 			}
 			probes := storeGuardPlanShape(ctx, t, pool, shape)
 
@@ -570,21 +570,21 @@ func TestSessionGuardFacts_ReadsTheSessionsOwnTurns(t *testing.T) {
 					}
 				}
 			}
-			up, err := fs.ReadFile(migrations.FS, "000164_turns_session_dispatched_idx.up.sql")
+			up, err := fs.ReadFile(migrations.FS, "000166_turns_session_dispatched_idx.up.sql")
 			if err != nil {
-				t.Fatalf("read 000164: %v", err)
+				t.Fatalf("read 000166: %v", err)
 			}
 			if _, err := pool.Exec(ctx, string(up)); err != nil {
-				t.Fatalf("build 000164's index again: %v", err)
+				t.Fatalf("build 000166's index again: %v", err)
 			}
 			for _, statement := range reads {
 				for _, probe := range probes {
 					for _, mode := range modes {
 						key := statement.name + ", " + probe.name + ", " + mode
 						after := measureGuardPlan(ctx, t, pool, statement, probe, mode, "")
-						t.Logf("%s: before 000164 %v; after %v", key, before[key], after)
+						t.Logf("%s: before 000166 %v; after %v", key, before[key], after)
 						if after.buffers > before[key].buffers {
-							t.Errorf("%s: read %.0f buffers after 000164, %.0f before: the index made it worse", key, after.buffers, before[key].buffers)
+							t.Errorf("%s: read %.0f buffers after 000166, %.0f before: the index made it worse", key, after.buffers, before[key].buffers)
 						}
 					}
 				}
@@ -612,9 +612,9 @@ func TestSessionGuardFacts_ReadsTheSessionsOwnTurns(t *testing.T) {
 						key := writeLabels[i] + ", " + probe.name + ", " + mode
 						without, with, levels := measureGuardWrite(ctx, t, pool, statement, probe, mode)
 						limit := sessionDispatchedIndexEntryMaxBuffers(levels)
-						t.Logf("%s: without 000164's index %v; with it (%d levels above its leaves) %v", key, without, levels, with)
+						t.Logf("%s: without 000166's index %v; with it (%d levels above its leaves) %v", key, without, levels, with)
 						if with.buffers > without.buffers+limit {
-							t.Errorf("%s: read %.0f buffers with 000164's index, %.0f without: more than its new entry's descent, %.0f", key, with.buffers, without.buffers, limit)
+							t.Errorf("%s: read %.0f buffers with 000166's index, %.0f without: more than its new entry's descent, %.0f", key, with.buffers, without.buffers, limit)
 						}
 					}
 				}

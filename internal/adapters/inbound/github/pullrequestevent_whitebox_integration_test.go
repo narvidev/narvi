@@ -41,11 +41,24 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 )
+
+// newWhiteboxAutonomyGate builds the autonomy gate handlePullRequestClosed
+// reads the freeze through (technical plan §40.2), on pool.
+func newWhiteboxAutonomyGate(t *testing.T, pool *pgxpool.Pool) *autonomy.Gate {
+	t.Helper()
+	gate, err := autonomy.NewGate(pool)
+	if err != nil {
+		t.Fatalf("autonomy.NewGate: %v", err)
+	}
+	return gate
+}
 
 // newPullRequestEventWhiteboxTestPool returns this package's own single,
 // shared Postgres pool -- started ONCE for the whole test binary by
@@ -227,7 +240,7 @@ func TestHandlePullRequestClosed_MergeAllowed_Succeeds_MarksMerged(t *testing.T)
 	merger := &fakeFixMerger{}
 
 	w := httptest.NewRecorder()
-	handlePullRequestClosed(ctx, w, pullRequestClosedBodyForTest(t, repoFullName, 300, true), sentinelFixes, repoSettings, auditLog, dataSource, merger)
+	handlePullRequestClosed(ctx, w, pullRequestClosedBodyForTest(t, repoFullName, 300, true), sentinelFixes, repoSettings, auditLog, dataSource, merger, newWhiteboxAutonomyGate(t, pool))
 
 	if w.Code != 200 {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -286,7 +299,7 @@ func TestHandlePullRequestClosed_MergeAllowed_CherryPickFails_RecordsErrorNeverM
 	merger := &fakeFixMerger{err: wantErr}
 
 	w := httptest.NewRecorder()
-	handlePullRequestClosed(ctx, w, pullRequestClosedBodyForTest(t, repoFullName, 400, true), sentinelFixes, repoSettings, auditLog, dataSource, merger)
+	handlePullRequestClosed(ctx, w, pullRequestClosedBodyForTest(t, repoFullName, 400, true), sentinelFixes, repoSettings, auditLog, dataSource, merger, newWhiteboxAutonomyGate(t, pool))
 
 	if w.Code != 200 {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -345,7 +358,7 @@ func TestHandlePullRequestClosed_UsesFreshStackRegistered_NeverPersistedColumn(t
 	merger := &fakeFixMerger{}
 
 	w := httptest.NewRecorder()
-	handlePullRequestClosed(ctx, w, pullRequestClosedBodyForTest(t, repoFullName, 500, true), sentinelFixes, repoSettings, auditLog, dataSource, merger)
+	handlePullRequestClosed(ctx, w, pullRequestClosedBodyForTest(t, repoFullName, 500, true), sentinelFixes, repoSettings, auditLog, dataSource, merger, newWhiteboxAutonomyGate(t, pool))
 
 	if w.Code != 200 {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -382,7 +395,7 @@ func TestHandlePullRequestClosed_StackRegisteredCheckFails_NeverMerges(t *testin
 	merger := &fakeFixMerger{}
 
 	w := httptest.NewRecorder()
-	handlePullRequestClosed(ctx, w, pullRequestClosedBodyForTest(t, repoFullName, 600, true), sentinelFixes, repoSettings, auditLog, dataSource, merger)
+	handlePullRequestClosed(ctx, w, pullRequestClosedBodyForTest(t, repoFullName, 600, true), sentinelFixes, repoSettings, auditLog, dataSource, merger, newWhiteboxAutonomyGate(t, pool))
 
 	if w.Code != 200 {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -430,7 +443,7 @@ func TestHandlePullRequestClosed_ChangedFilesBlindToRename_DeniesViaOldPath(t *t
 	merger := &fakeFixMerger{}
 
 	w := httptest.NewRecorder()
-	handlePullRequestClosed(ctx, w, pullRequestClosedBodyForTest(t, repoFullName, 700, true), sentinelFixes, repoSettings, auditLog, dataSource, merger)
+	handlePullRequestClosed(ctx, w, pullRequestClosedBodyForTest(t, repoFullName, 700, true), sentinelFixes, repoSettings, auditLog, dataSource, merger, newWhiteboxAutonomyGate(t, pool))
 
 	if w.Code != 200 {
 		t.Fatalf("status = %d, want 200", w.Code)
@@ -445,5 +458,67 @@ func TestHandlePullRequestClosed_ChangedFilesBlindToRename_DeniesViaOldPath(t *t
 	}
 	if got.Status == "fix_merged" {
 		t.Error("Status = fix_merged, want it denied (a renamed-away real production file must never slip through as \"every file is test/doc\")")
+	}
+}
+
+// TestSentinelFixMergeGate_Frozen_NoMergeAttempted pins technical plan
+// §40.2 at the sentinel-fix merge gate: with every check passing, an
+// allowed gate is an unattended merge the autonomy freeze holds. The
+// merger is never called and no fresh stack read is made, the claim stays
+// fix_open, and the gate's audit row records the skip -- allowed false,
+// reason "skipped: autonomy is frozen", skipped "frozen" -- distinct from
+// a refused or failed merge.
+func TestSentinelFixMergeGate_Frozen_NoMergeAttempted(t *testing.T) {
+	ctx := context.Background()
+	pool := newPullRequestEventWhiteboxTestPool(t)
+
+	repoFullName := "acme/whitebox-merge-frozen"
+	fix := wholeAllowedFixtureForTest(ctx, t, pool, repoFullName, 800, 801, false)
+
+	settings := narvipg.NewPlatformSettingsStore(pool)
+	if _, err := settings.Freeze(ctx, pgtype.UUID{}, "an incident: hold every automatic action"); err != nil {
+		t.Fatalf("freeze autonomy: %v", err)
+	}
+	t.Cleanup(func() { _, _ = settings.Unfreeze(context.Background()) })
+
+	dataSource := &fakeMergeGateDataSource{
+		changedFiles:    []string{"foo_test.go"},
+		ciGreen:         true,
+		mergeableClean:  true,
+		stackErr:        errors.New("the fresh stack read must not be made while frozen"),
+		stackRegistered: true,
+	}
+	merger := &fakeFixMerger{}
+
+	w := httptest.NewRecorder()
+	handlePullRequestClosed(ctx, w, pullRequestClosedBodyForTest(t, repoFullName, 800, true), narvipg.NewSentinelFixStore(pool), narvipg.NewRepoSettingsStore(pool), narvipg.NewAuditLogStore(pool), dataSource, merger, newWhiteboxAutonomyGate(t, pool))
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got := merger.callCount(); got != 0 {
+		t.Fatalf("CherryPickAndMerge called %d times while frozen, want 0", got)
+	}
+	got, err := narvipg.NewSentinelFixStore(pool).GetByID(ctx, fix.ID)
+	if err != nil {
+		t.Fatalf("get sentinel_fixes: %v", err)
+	}
+	if got.Status != "fix_open" {
+		t.Errorf("Status = %q, want fix_open: a held merge leaves the fix pull request as an ordinary review item", got.Status)
+	}
+
+	var allowed, mergeAttempted bool
+	var reason, skipped, mergeError string
+	if err := pool.QueryRow(ctx,
+		`SELECT (detail_json->>'allowed')::boolean, (detail_json->>'merge_attempted')::boolean,
+		        detail_json->>'reason', coalesce(detail_json->>'skipped', ''), detail_json->>'merge_error'
+		 FROM audit_log WHERE action = 'sentinel_fix.merge_gate_evaluated' AND resource_id = $1`,
+		fix.ID.String(),
+	).Scan(&allowed, &mergeAttempted, &reason, &skipped, &mergeError); err != nil {
+		t.Fatalf("query audit_log: %v", err)
+	}
+	if allowed || mergeAttempted || reason != "skipped: autonomy is frozen" || skipped != "frozen" || mergeError != "" {
+		t.Errorf("audit detail allowed=%v merge_attempted=%v reason=%q skipped=%q merge_error=%q; want false, false, %q, frozen and no error",
+			allowed, mergeAttempted, reason, skipped, mergeError, "skipped: autonomy is frozen")
 	}
 }

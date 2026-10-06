@@ -85,6 +85,15 @@ func (s *AutomationInvocationStore) ClaimForFanOut(ctx context.Context, id pgtyp
 	return s.q.ClaimAutomationInvocationForFanOut(ctx, id)
 }
 
+// ReleaseFanOutClaim gives back id's fan-out claim, taken at claimedAt,
+// when the autonomy freeze held the invocation before any run was created
+// (technical plan §40.2). Reports whether the claim was released: false
+// when it was taken again since, the invocation closed, or a run exists.
+func (s *AutomationInvocationStore) ReleaseFanOutClaim(ctx context.Context, id pgtype.UUID, claimedAt pgtype.Timestamptz) (bool, error) {
+	n, err := s.q.ReleaseAutomationInvocationFanOutClaim(ctx, sqlcgen.ReleaseAutomationInvocationFanOutClaimParams{ID: id, ClaimedAt: claimedAt})
+	return n == 1, err
+}
+
 // Close applies internal/domain/automation.InvocationTransition's own
 // verdict -- pgx.ErrNoRows means this invocation is already closed (a
 // concurrent closer won the race, or a defensive re-run).

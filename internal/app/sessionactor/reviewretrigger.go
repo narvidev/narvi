@@ -89,6 +89,21 @@
 // or the button's whose context moved while it waited is owed and re-run by
 // its own timer, never by this lane.
 //
+// # The autonomy freeze (technical plan §40.2)
+//
+// The automatic re-review is an action that starts without a person asking
+// for it right then, so it consults the autonomy freeze, at the hold's two
+// points and before it: in phase 1, after the opt-in, the revocation, the
+// heads comparison and the budget, before any GitHub read; and again at
+// the insert, since a freeze can be committed while phase 2 fetches. A
+// frozen firing (freezeReviewRetrigger) inserts nothing, spends nothing,
+// keeps the pushed head as the target and re-arms the debounce
+// AutonomyFreezeRecheckInterval ahead, so the review runs, for the head
+// pushed last, about a minute after the freeze lifts. A read of the freeze
+// that fails rolls the firing back, to be redelivered: a skip, never a
+// pass. A person's trigger never reads the freeze, nor does the owed
+// request's re-run (owedreviewrequest.go), which is a person's request.
+//
 // Every attempt this lane inserts is marked request_trigger 'auto'
 // (insertAutoRetriggerTurn). One that nonetheless waited behind another
 // turn -- a person's turn whose transaction began before this insert's
@@ -119,6 +134,7 @@ import (
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
+	domainautonomy "github.com/narvidev/narvi/internal/domain/autonomy"
 	"github.com/narvidev/narvi/internal/domain/knowledge"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/review"
@@ -564,6 +580,19 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 		case prSession.AutoRetriggerCount >= ReviewAutoRetriggerBudget:
 			base.action = reviewRetriggerActionBudgetExhausted
 		default:
+			// §40.2: while autonomy is frozen the automatic re-review
+			// inserts nothing. Read here, after the opt-in, the
+			// revocation, the heads comparison and the budget -- the same
+			// place as the hold below, and for the same reasons -- and
+			// before any GitHub read.
+			if frozen, err := a.autonomy.FrozenTx(ctx, tx); err != nil {
+				a.autonomy.RecordSkip(ctx, domainautonomy.SiteAutoReReview, domainautonomy.SkipFreezeUnreadable,
+					"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+				return err
+			} else if frozen {
+				// decision stays nil: fully handled in this transaction.
+				return a.freezeReviewRetrigger(ctx, tx, prSession.RepoFullName, prSession.PrNumber)
+			}
 			// §24.9: an automatic review waits for every open turn of the
 			// session. Read after the opt-in, the revocation, the heads
 			// comparison and the budget, so a held firing never spends
@@ -635,6 +664,41 @@ func (a *Actor) holdReviewRetrigger(ctx context.Context, tx pgx.Tx, repoFullName
 	}
 	a.logger.Info("sessionactor: review_retrigger_debounce: held: a turn of this review session is open; the pushed head stays the target",
 		"repo_full_name", repoFullName, "pr_number", prNumber)
+	return nil
+}
+
+// freezeReviewRetrigger is a firing the autonomy freeze holds (technical
+// plan §40.2), shaped like holdReviewRetrigger: it inserts no turn, spends
+// no budget, posts no budget notice and reads nothing from GitHub, keeps
+// pending_retrigger_head_sha as the review's target -- a push while frozen
+// moves it to the newer head, as during a hold -- and re-arms the one
+// debounce row AutonomyFreezeRecheckInterval ahead on the database's clock,
+// with the hold's own update (TimerStore.HoldReviewRetriggerDebounce): it
+// keeps created_at and never re-creates a row a person's stop deleted.
+// That lead sits under the held mark a turn's end wakes, so the freeze, not
+// a turn ending, decides when it is looked at again: the first firing after
+// the freeze lifts goes through the hold and the insert as any firing does,
+// and reviews the head pushed last. The armed row keeps the session's
+// status reading the review as still to come (§43.20), which it is.
+//
+// When the update moves no row the firing's decision is dropped, deleting
+// what is left, as holdReviewRetrigger does: the row is gone, or it
+// predates the session's standing stop.
+func (a *Actor) freezeReviewRetrigger(ctx context.Context, tx pgx.Tx, repoFullName string, prNumber int32) error {
+	rearmed, err := a.stores.timer.WithTx(tx).HoldReviewRetriggerDebounce(ctx, a.sessionID, a.timeouts.AutonomyFreezeRecheckInterval)
+	if err != nil {
+		return fmt.Errorf("sessionactor: re-arm the re-review debounce the autonomy freeze holds: %w", err)
+	}
+	if rearmed == 0 {
+		a.logger.Info("sessionactor: review_retrigger_debounce: autonomy is frozen, but the debounce is gone or predates a person's standing stop; dropping it",
+			"repo_full_name", repoFullName, "pr_number", prNumber)
+		return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
+	}
+	a.autonomy.RecordSkip(ctx, domainautonomy.SiteAutoReReview, domainautonomy.SkipFrozen,
+		"repo_full_name", repoFullName, "pr_number", prNumber)
+	a.logger.Info("sessionactor: review_retrigger_debounce: held by the autonomy freeze; the pushed head stays the target",
+		"outcome", domainautonomy.OutcomeSkipped, "repo_full_name", repoFullName, "pr_number", prNumber,
+		"recheck_interval", a.timeouts.AutonomyFreezeRecheckInterval)
 	return nil
 }
 
@@ -731,6 +795,18 @@ func (a *Actor) finishReviewRetrigger(ctx context.Context, decision *reviewRetri
 			return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
 
 		case reviewRetriggerActionEnqueue:
+			// §40.2: the freeze read again, at the insert -- a freeze
+			// committed while phase 2 fetched the pull request with no
+			// transaction open holds the review the same way phase 1's
+			// read would have. The prompt phase 2 composed is discarded,
+			// and enqueued stays false.
+			if frozen, err := a.autonomy.FrozenTx(ctx, tx); err != nil {
+				a.autonomy.RecordSkip(ctx, domainautonomy.SiteAutoReReview, domainautonomy.SkipFreezeUnreadable,
+					"repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
+				return err
+			} else if frozen {
+				return a.freezeReviewRetrigger(ctx, tx, decision.repoFullName, decision.prNumber)
+			}
 			// §24.9: the hold read again, at the insert. A person's turn
 			// (a mention, the label, the button, REST) can be committed
 			// while phase 2 fetched the pull request with no transaction

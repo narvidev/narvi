@@ -545,6 +545,52 @@ func TestGitHubIntegration_LabelRetrigger_ReusesExistingSession(t *testing.T) {
 	}
 }
 
+// TestFreeze_LabelRetriggerInserts pins that the autonomy freeze (technical
+// plan §40.2) never stops a person: while autonomy is frozen, a
+// maintainer's mention creates the review session and its turn, and a
+// later label re-trigger on the same pull request inserts its own turn --
+// a person's command, which never reads the freeze.
+func TestFreeze_LabelRetriggerInserts(t *testing.T) {
+	ctx := context.Background()
+	rig := newTestRig(t, func(cfg *githubingress.Config) {
+		cfg.ReReviewLabel = "run-review"
+	})
+	settings := narvipg.NewPlatformSettingsStore(rig.pool)
+	if _, err := settings.Freeze(ctx, pgtype.UUID{}, "an incident: hold every automatic action"); err != nil {
+		t.Fatalf("freeze autonomy: %v", err)
+	}
+	t.Cleanup(func() { _, _ = settings.Unfreeze(context.Background()) })
+
+	const repoFullName = "acme/frozen-label-repo"
+	const cloneURL = "https://github.com/acme/frozen-label-repo.git"
+	const prNumber = 607
+	const commenterID = 80000607
+	createLinkedGitHubUser(ctx, t, rig.users, rig.identities, commenterID, sqlcgen.UserRoleMaintainer)
+
+	if status := postWebhook(t, rig, issueCommentBodyWithCommenter(repoFullName, "frozen-label-repo", cloneURL, prNumber, "first-mention", commenterID, "frozen-label-user"), "delivery-frozen-label-1"); status != http.StatusOK {
+		t.Fatalf("mention delivery status = %d, want %d", status, http.StatusOK)
+	}
+	labelBody := pullRequestLabeledBody(repoFullName, "frozen-label-repo", cloneURL, prNumber, "run-review", commenterID, "frozen-label-user")
+	if status := postWebhookEventType(t, rig, labelBody, "delivery-frozen-label-2", "pull_request"); status != http.StatusOK {
+		t.Fatalf("label delivery status = %d, want %d", status, http.StatusOK)
+	}
+
+	var turns int
+	if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM turns t JOIN sessions s ON s.id = t.session_id WHERE s.spawn_source = 'github'`).Scan(&turns); err != nil {
+		t.Fatalf("count turns: %v", err)
+	}
+	if turns != 2 {
+		t.Fatalf("turns while frozen = %d, want 2: the mention's and the label re-trigger's", turns)
+	}
+	var labelTurns int
+	if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM turns WHERE request_trigger = 'label'`).Scan(&labelTurns); err != nil {
+		t.Fatalf("count label turns: %v", err)
+	}
+	if labelTurns != 1 {
+		t.Fatalf("label re-trigger turns while frozen = %d, want 1", labelTurns)
+	}
+}
+
 // TestGitHubIntegration_LabelRetrigger_MemberDenied_EvenAsSessionCreator is
 // this package's own regression test for a confirmed privilege-escalation
 // audit finding: the label-retrigger lane's REUSE branch (coalesce.go) used

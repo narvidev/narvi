@@ -15,6 +15,7 @@ import (
 	"golang.org/x/sync/singleflight"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	"github.com/narvidev/narvi/internal/app/turnguard"
@@ -487,6 +488,12 @@ type Registry struct {
 	// one mode value.
 	rolloutMode platform.RolloutMode
 
+	// autonomy is the autonomy freeze (§40.2), built once here from pool
+	// and threaded through to every Actor this Registry hydrates: the
+	// automatic re-review (reviewretrigger.go) reads it before it inserts
+	// a turn. No NewRegistry caller can omit it.
+	autonomy *autonomy.Gate
+
 	// group tracks every actor's mailbox-loop goroutine, so evicted/
 	// crashed actors are cleanly reaped and Shutdown can wait on all of
 	// them. Deliberately the zero value, NOT errgroup.WithContext(...) --
@@ -591,6 +598,11 @@ func NewRegistry(
 		return nil, err
 	}
 
+	gate, err := autonomy.NewGate(pool)
+	if err != nil {
+		return nil, fmt.Errorf("sessionactor: %w", err)
+	}
+
 	var opt RegistryOptions
 	if len(opts) > 0 {
 		opt = opts[0]
@@ -623,6 +635,7 @@ func NewRegistry(
 		opsMetrics:              opsMetrics,
 		repoAccessCache:         newRepoAccessCache(),
 		epistemicCheckDefault:   epistemicCheckDefault,
+		autonomy:                gate,
 		lifecycleCtx:            lifecycleCtx,
 		cancel:                  cancel,
 	}

@@ -1,8 +1,8 @@
--- Reverses 000164_turns_session_dispatched_idx.up.sql. Without the index
+-- Reverses 000166_turns_session_dispatched_idx.up.sql. Without the index
 -- the session guard's read of what a session has spent
 -- (GetSessionGuardFacts) walks the session's turns through the heap
 -- instead of one range of its dispatched ones; nothing a binary without
--- 000164 runs needs it, and no statement's result changes.
+-- 000166 runs needs it, and no statement's result changes.
 --
 -- Drops the index without blocking writes to turns. A single statement, so
 -- golang-migrate sends it on its own, outside any transaction block, which
@@ -10,8 +10,8 @@
 -- a concurrent drop waits only for transactions holding a lock on turns,
 -- never for older snapshots, so a second migrator waiting on
 -- golang-migrate's advisory lock cannot deadlock it. Pods of a binary that
--- carries 000164 keep working meanwhile -- their statements name no index,
+-- carries 000166 keep working meanwhile -- their statements name no index,
 -- only the guard read's plan changes -- but one that restarts applies
--- 000164 again at boot, so scale them away before deploying the older
+-- 000166 again at boot, so scale them away before deploying the older
 -- binary.
 DROP INDEX CONCURRENTLY IF EXISTS turns_session_dispatched_idx;

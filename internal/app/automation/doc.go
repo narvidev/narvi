@@ -174,8 +174,9 @@
 //     (internal/adapters/inbound/automationwebhook's own handler.go) still
 //     call invocationenqueue.go's own CreateInvocation -- neither has a
 //     genuine per-delivery identity to key idempotency on (a cron tick is
-//     already CAS-guarded per minute-bucket via ClaimCronFire; a generic
-//     webhook trigger's own "condition" IS its bearer-token
+//     already guarded by ClaimCronFire, a compare-and-swap on the last
+//     fire the tick read; a generic webhook trigger's own "condition" IS
+//     its bearer-token
 //     authentication, with no separate redeliverable-provider-delivery
 //     concept at all).
 //   - Live GitHub/Linear webhook dispatch (githubdispatch.go's own

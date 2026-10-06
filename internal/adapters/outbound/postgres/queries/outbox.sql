@@ -58,6 +58,28 @@ ORDER BY next_attempt_at
 LIMIT $1
 FOR UPDATE SKIP LOCKED;
 
+-- name: ListDuePendingOutboxEntriesOfKinds :many
+-- ListDuePendingOutboxEntries restricted to the rows of kinds: one lane of
+-- a pump tick while the autonomy freeze holds some kinds (technical plan
+-- §40.2, outboxworker's claimBatch), which runs it once for the kinds the
+-- freeze holds and once for every other kind it knows. A row the freeze
+-- holds is due again every recheck interval; in the one oldest-due-first
+-- batch, enough of them would take every slot and keep the notifications
+-- behind them waiting. Each row of a held kind is still claimed in its own
+-- lane and its hold decided and recorded at the delivery's call site
+-- (Builder.attempt), never skipped by this query.
+--
+-- The kinds are an equality list, never an exclusion, so the lane seeks
+-- outbox_pending_kind_due_idx (migrations/000164) on (kind, next_attempt_at)
+-- and reads the due pending rows of its own kinds and no others, whatever
+-- the table holds -- delivered rows are never deleted. Same order, lock
+-- and SKIP LOCKED as its sibling.
+SELECT * FROM outbox
+WHERE status = 'pending' AND kind = ANY(sqlc.arg('kinds')::text[]) AND next_attempt_at <= now()
+ORDER BY next_attempt_at
+LIMIT sqlc.arg('max_rows')
+FOR UPDATE SKIP LOCKED;
+
 -- name: ClaimOutboxEntry :one
 -- The claim half of the pump's own two-step (claim-then-attempt-outside-
 -- any-transaction) shape: bumps next_attempt_at forward by the caller's
@@ -153,10 +175,12 @@ RETURNING *;
 -- Records a failure of the class that does not consume an attempt
 -- (domain/outbox.ClassDeferred, §5.1 and §44.2): gives back the attempt
 -- ClaimOutboxEntry counted and makes the row due again at the caller's
--- own next_attempt_at, without moving it toward dead-letter. Today its one
--- cause is this process's own shutdown cutting a delivery short, or
--- reaching a claimed row before its delivery started; a rate limit whose
--- deadline GitHub stated (§44.2) is the next.
+-- own next_attempt_at, without moving it toward dead-letter. Its causes
+-- today: this process's own shutdown cutting a delivery short, or reaching
+-- a claimed row before its delivery started; and the autonomy freeze
+-- (§40.2) holding a delivery that is itself an automatic action
+-- (outboxworker's holdFrozen). A rate limit whose deadline GitHub stated
+-- (§44.2) is the next.
 --
 -- A genuine compare-and-swap on next_attempt_at, like RenewOutboxClaim's,
 -- not only a status guard: this statement takes an attempt BACK, so it must

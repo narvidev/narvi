@@ -2,12 +2,14 @@ package automation
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -73,6 +75,11 @@ type Engine struct {
 	// applies here too, one gate later: this Engine passes the SAME real
 	// githubPRSessionStore every other caller does, never a carve-out.
 	prSessions *postgres.GitHubPRSessionStore
+
+	// gate is the autonomy freeze (§40.2), built in NewEngine from pool:
+	// the cron trigger reads it before it claims a fire, and the fan-out
+	// before it claims an invocation and again before each one starts.
+	gate *autonomy.Gate
 }
 
 // NewEngine builds an Engine backed by the given stores/pool (pool is
@@ -83,7 +90,8 @@ type Engine struct {
 // httpapi.TriggerDispatch drives, once a run's own session is committed),
 // and timeouts (for AutomationEnginePumpInterval/AutomationSweepInterval/
 // the two orphan thresholds, consulted by Run/PumpOnce/ReconcileOnce/
-// SweepOnce).
+// SweepOnce). It fails only if the autonomy gate's counter cannot be
+// built.
 func NewEngine(
 	automations *postgres.AutomationStore,
 	invocations *postgres.AutomationInvocationStore,
@@ -99,7 +107,11 @@ func NewEngine(
 	rolloutMode platform.RolloutMode,
 	repoSettings *postgres.RepoSettingsStore,
 	prSessions *postgres.GitHubPRSessionStore,
-) *Engine {
+) (*Engine, error) {
+	gate, err := autonomy.NewGate(pool)
+	if err != nil {
+		return nil, fmt.Errorf("automation: %w", err)
+	}
 	return &Engine{
 		automations:           automations,
 		invocations:           invocations,
@@ -115,7 +127,8 @@ func NewEngine(
 		rolloutMode:           rolloutMode,
 		repoSettings:          repoSettings,
 		prSessions:            prSessions,
-	}
+		gate:                  gate,
+	}, nil
 }
 
 // Run runs the process-wide automation engine until ctx is done: FOUR

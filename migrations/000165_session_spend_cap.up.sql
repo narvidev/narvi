@@ -81,7 +81,7 @@
 --   - It reads no cap and enforces none: its turns are created as before.
 --     Every cap is NULL until a write path that sets one ships, so the two
 --     binaries behave alike throughout the rollout.
--- migration000163_integration_test.go runs the previous binary's own
+-- migration000165_integration_test.go runs the previous binary's own
 -- statements against the columns.
 --
 -- # Rolling back
@@ -89,17 +89,18 @@
 -- Every control-plane boot runs the embedded migrations up
 -- (controlplane/migrate.go), and golang-migrate refuses a database whose
 -- version it has no file for. So once this migration is applied, the
--- previous binary cannot boot ("no migration found for version 163"). A
+-- previous binary cannot boot ("no migration found for version 165"). A
 -- rollback therefore takes one of two steps first, with the control plane
 -- scaled to zero:
---   - Keep the columns: with the golang-migrate CLI, `migrate force 162`.
---     The previous binary then boots, since 162 is a version it has, and
+--   - Keep the columns: with the golang-migrate CLI, `migrate force 164`.
+--     The previous binary then boots, since 164 is a version it has, and
 --     works with the columns present as above: every cap is lifted, since
 --     it reads none. When this release is deployed again, this file runs
 --     again and keeps the columns, their values, the constraints and the
 --     index.
---   - Drop them: run this migration's down (goto 162) with this release's
---     migrations. The down file says what it removes.
+--   - Drop them: run this migration's down (goto 164) with this release's
+--     migrations, which runs 000166's down first. The down file says what
+--     it removes.
 -- Nothing else needs undoing: no timer kind or event type is added.
 ALTER TABLE repo_settings ADD COLUMN IF NOT EXISTS session_spend_cap_usd NUMERIC(10, 2);
 ALTER TABLE automations ADD COLUMN IF NOT EXISTS session_spend_cap_usd NUMERIC(10, 2);

@@ -106,15 +106,18 @@
 -- Every control-plane boot runs the embedded migrations up
 -- (controlplane/migrate.go), and golang-migrate refuses a database whose
 -- version it has no file for. So once this migration is applied, the
--- previous binary cannot boot ("no migration found for version 164"). A
+-- previous binary cannot boot ("no migration found for version 166"). A
 -- rollback therefore takes one of two steps first, with the control plane
 -- scaled to zero:
---   - Keep the index: with the golang-migrate CLI, `migrate force 163`.
---     The previous binary then boots, since 163 is a version it has, and
---     works with the index present as above. When this release is deployed
---     again, this file runs again and keeps the valid index.
---   - Drop it: run this migration's down (goto 163) with this release's
---     migrations. The down file says what it removes.
+--   - Keep the index: with the golang-migrate CLI, `migrate force 164`, the
+--     previous binary's last version: 000165 ships in this release too,
+--     and its own header says what forcing past it keeps. The previous
+--     binary then boots, and works with the index present as above. When
+--     this release is deployed again, this file runs again and keeps the
+--     valid index.
+--   - Drop it: run this migration's down (goto 165) with this release's
+--     migrations, then 000165's as its header says. The down file says what
+--     it removes.
 -- Nothing else needs undoing: no column, timer kind or event type is added.
 DO $$
 BEGIN
