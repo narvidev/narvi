@@ -177,3 +177,31 @@ func TestGate_FrozenReturnsTheReadError(t *testing.T) {
 		}
 	}
 }
+
+// TestBound_ReadsInTheBoundTransaction pins the bound gate the workflow
+// engine reads through (Deps.Autonomy): its FrozenTx reads in the
+// transaction it is bound to, returning a failed read's error and never
+// "not frozen"; its RecordSkip counts as the gate's does; and a nil gate
+// binds to nil, which the engine reads as no gate wired.
+func TestBound_ReadsInTheBoundTransaction(t *testing.T) {
+	gate, err := autonomy.NewGate(closedPool(t))
+	if err != nil {
+		t.Fatalf("NewGate: %v", err)
+	}
+	bound := gate.WithTx(failingTx{})
+	frozen, err := bound.FrozenTx(context.Background())
+	if err == nil || frozen {
+		t.Fatalf("FrozenTx on a failing bound transaction = (%v, %v), want the read's error and not frozen", frozen, err)
+	}
+
+	before := skipCount(t, domainautonomy.SiteWorkflowAdvance, domainautonomy.SkipFrozen)
+	bound.RecordSkip(context.Background(), domainautonomy.SiteWorkflowAdvance, domainautonomy.SkipFrozen)
+	if got := skipCount(t, domainautonomy.SiteWorkflowAdvance, domainautonomy.SkipFrozen) - before; got != 1 {
+		t.Fatalf("counter under (workflow_advance, frozen) rose by %d, want 1", got)
+	}
+
+	var none *autonomy.Gate
+	if b := none.WithTx(failingTx{}); b != nil {
+		t.Fatalf("a nil gate bound to %v, want nil", b)
+	}
+}

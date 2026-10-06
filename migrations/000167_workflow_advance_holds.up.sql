@@ -1,0 +1,90 @@
+-- workflow_advance_holds: the workflow engine's automatic advances the
+-- autonomy freeze holds (technical plan §40.2, §25.9). When a tracked
+-- attempt's turn ends and workflow.NextStep says advance while autonomy is
+-- frozen, the engine (internal/app/workflowengine's OnTurnCompleted)
+-- finishes the attempt as always -- its status, outcome and summary
+-- stored -- and, instead of dispatching the next attempt, writes one row
+-- here in the transaction that ended the turn. The run stays running, with
+-- no live step run, until the freeze lifts.
+--
+-- One row per held run:
+--   - workflow_run_id: the run whose advance is held (workflow_runs,
+--     cascading with it). A run holds at most one advance: a run with a
+--     hold has no live attempt to finish.
+--   - step_run_id: the finished attempt whose stored outcome the advance
+--     is applied from (workflow_step_runs, cascading with it).
+--   - session_id: the run's session (sessions, cascading with it), read
+--     by a person's stop, which drops the session's holds.
+--   - held_at: when the advance was held, on the database's clock -- the
+--     instant a person's stop compares with: a stop requested at or after
+--     it drops the hold and cancels the run (sessionactor's
+--     cancelHeldWorkflowAdvancesForStop), the rule the stop timer deletes
+--     the session's work-creating timers by.
+--
+-- A pump of its own, workflowengine.HeldAdvanceReleaser, reads the freeze
+-- every AutonomyFreezeRecheckInterval. Once it is lifted, the releaser
+-- takes the oldest holds first and, for each, in one transaction under the
+-- session's actor-epoch lock: reads the freeze again, deletes the row (a
+-- compare-and-swap: of two replicas releasing it, one deletes it and the
+-- other finds nothing), and applies the stored outcome -- the advance runs
+-- exactly once -- or, when a person's stop stands, cancels the run.
+--
+-- A side table rather than columns on workflow_runs: the releaser reads a
+-- table that is empty outside a freeze, and no index is built over
+-- workflow_runs. workflow_advance_holds_held_at_idx serves the releaser's
+-- oldest-first read; workflow_advance_holds_session_idx serves the stop's
+-- delete, scoped to one session.
+--
+-- # Locks
+--
+-- A new table, empty, so nothing is validated. Its foreign keys add
+-- referential triggers to workflow_runs, workflow_step_runs and sessions,
+-- so the create takes SHARE ROW EXCLUSIVE on each of the three for the
+-- file's one implicit transaction -- an instant once granted. It conflicts
+-- with any row write: the migration waits behind an open transaction that
+-- has written to one of them (a turn ending, a session's status derived),
+-- and while it waits, new writes to them queue behind it. Reads are not
+-- blocked. controlplane/migrate.go sets no lock_timeout.
+--
+-- # Rolling deploy
+--
+-- The previous binary never names this table. A replica of it that ends a
+-- tracked attempt while autonomy is frozen advances the run, as it always
+-- did: that is the deploy-time tail. A replica of it that is handed a new
+-- turn on a session whose advance this release held finds a running run
+-- with no live step run, and passes the turn through untracked, as it
+-- does for that shape today; this release's releaser applies the held
+-- advance once the freeze lifts, whichever replica ended the turn.
+--
+-- # Rolling back
+--
+-- Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for. So once this migration is applied, the
+-- previous binary cannot boot ("no migration found for version N", N being
+-- this file's own number). A rollback therefore takes one of two steps
+-- first, with the control plane scaled to zero, V being the version before
+-- this file's:
+--   - Keep the table: with the golang-migrate CLI, `migrate force V`. The
+--     previous binary then boots and never reads it. A run whose advance is
+--     held stays running with no live step run: every turn on its session
+--     passes through untracked, and no new run starts on that session
+--     (workflow_runs_one_running_per_session, migration 000057), until this
+--     release is deployed again -- this file then runs again and leaves the
+--     table and its rows as they are -- and its releaser applies the held
+--     advance once autonomy is not frozen.
+--   - Drop it: run this migration's down (`migrate goto V`) with this
+--     release's migrations. The down cancels every run whose advance is
+--     held -- the one kind of candidate a rollback loses -- then drops the
+--     table.
+-- To see the held advances first:
+--   SELECT workflow_run_id, step_run_id, session_id, held_at
+--   FROM workflow_advance_holds ORDER BY held_at;
+CREATE TABLE IF NOT EXISTS workflow_advance_holds (
+    workflow_run_id UUID PRIMARY KEY REFERENCES workflow_runs (id) ON DELETE CASCADE,
+    step_run_id     UUID NOT NULL REFERENCES workflow_step_runs (id) ON DELETE CASCADE,
+    session_id      UUID NOT NULL REFERENCES sessions (id) ON DELETE CASCADE,
+    held_at         TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS workflow_advance_holds_session_idx ON workflow_advance_holds (session_id, held_at);
+CREATE INDEX IF NOT EXISTS workflow_advance_holds_held_at_idx ON workflow_advance_holds (held_at);

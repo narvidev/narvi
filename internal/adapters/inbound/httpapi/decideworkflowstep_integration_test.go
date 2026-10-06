@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/sync/errgroup"
 
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 )
 
@@ -498,5 +499,41 @@ func TestDecideWorkflowStep_Viewer_NotOwnerOrParticipant_Returns403(t *testing.T
 	status := rig.doJSON(t, http.MethodPost, decidePath(runID, stepRunID), []byte(`{"verdict":"approve","text":null}`), nil, viewerToken)
 	if status != http.StatusForbidden {
 		t.Errorf("status = %d, want %d", status, http.StatusForbidden)
+	}
+}
+
+// TestFreeze_WorkflowDecisionApproveDispatches pins that the autonomy
+// freeze (technical plan §40.2) never stops a person: while autonomy is
+// frozen, a person's approval of a step awaiting their decision advances
+// the run and dispatches its next attempt's turn, exactly as when nothing
+// is frozen, and holds nothing.
+func TestFreeze_WorkflowDecisionApproveDispatches(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	settings := narvipg.NewPlatformSettingsStore(rig.pool)
+	if _, err := settings.Freeze(ctx, pgtype.UUID{}, "an incident: hold every automatic action"); err != nil {
+		t.Fatalf("freeze autonomy: %v", err)
+	}
+	t.Cleanup(func() { _, _ = settings.Unfreeze(context.Background()) })
+	owner, token := rig.createAuthenticatedUser(ctx, t)
+	session := createSessionForUser(ctx, t, rig, owner.ID, nil)
+	runID, stepRunID, stepIDs := seedAwaitingDecisionRun(ctx, t, rig, session.ID, 2, "ok")
+
+	var got workflowStepDecideResponseForTest
+	if status := rig.doJSON(t, http.MethodPost, decidePath(runID, stepRunID), []byte(`{"verdict":"approve","text":null}`), &got, token); status != http.StatusOK {
+		t.Fatalf("status while frozen = %d, want %d", status, http.StatusOK)
+	}
+	if got.RunStatus != "running" || got.TurnID == nil || *got.TurnID == "" {
+		t.Fatalf("response while frozen = run %q, turn %v; want the run advanced and the next attempt's turn dispatched", got.RunStatus, got.TurnID)
+	}
+	live, err := rig.workflows.GetLiveStepRunForRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("get live step run: %v", err)
+	}
+	if live.StepDefinitionID != stepIDs[1] || !live.TurnID.Valid || live.TurnID.String() != *got.TurnID {
+		t.Fatalf("live step run = step %v, turn %v; want step 2 with turn %s", live.StepDefinitionID, live.TurnID, *got.TurnID)
+	}
+	if _, err := rig.workflows.GetAdvanceHold(ctx, runID); err == nil {
+		t.Fatal("the run holds an advance after a person's approval: a person's decision is never held")
 	}
 }

@@ -26,6 +26,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/loopguard"
@@ -151,6 +152,14 @@ func inTx(t *testing.T, ctx context.Context, pool *pgxpool.Pool, deps workflowen
 	if bound.Origin == 0 {
 		bound.Origin = sessionguard.OriginAutomatic
 	}
+	// The autonomy freeze (technical plan §40.2), bound to the same
+	// transaction, as the session actor's workflowDeps binds it: the
+	// engine's own advance is held while autonomy is frozen.
+	gate, err := autonomy.NewGate(pool)
+	if err != nil {
+		t.Fatalf("autonomy gate: %v", err)
+	}
+	bound.Autonomy = gate.WithTx(tx)
 	fn(bound)
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("commit: %v", err)

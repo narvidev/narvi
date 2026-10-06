@@ -30,7 +30,7 @@ func TestSites_NamesAreDistinctLabels(t *testing.T) {
 			seen[s] = tc.kind
 		}
 	}
-	if got, want := len(autonomy.AllSites), 7; got != want {
+	if got, want := len(autonomy.AllSites), 8; got != want {
 		t.Errorf("len(AllSites) = %d, want %d: a site added or removed is registered with internal/ops' ScanAutonomyFreezeSites too", got, want)
 	}
 }

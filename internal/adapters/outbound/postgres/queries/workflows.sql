@@ -418,3 +418,42 @@ FROM workflow_step_runs sr
 LEFT JOIN turns t ON t.id = sr.turn_id
 WHERE sr.workflow_run_id = $1
 ORDER BY sr.created_at ASC, sr.id ASC;
+
+-- The autonomy freeze's held advances (technical plan §40.2, §25.9), the
+-- rows of workflow_advance_holds: OnTurnCompleted writes one in the
+-- transaction ending a tracked attempt whose next step would advance while
+-- autonomy is frozen, and workflowengine.HeldAdvanceReleaser deletes it,
+-- under the session's actor-epoch lock, as it applies the advance once the
+-- freeze lifts. A person's stop deletes the session's holds, and cancels
+-- their runs.
+
+-- name: HoldWorkflowAdvance :execrows
+-- One hold per run, held_at on the database's clock. Zero rows when the
+-- run already holds one, which a run with no live attempt cannot reach: the
+-- caller logs it.
+INSERT INTO workflow_advance_holds (workflow_run_id, step_run_id, session_id)
+VALUES (sqlc.arg('workflow_run_id'), sqlc.arg('step_run_id'), sqlc.arg('session_id'))
+ON CONFLICT (workflow_run_id) DO NOTHING;
+
+-- name: GetWorkflowAdvanceHold :one
+-- The run's held advance; pgx.ErrNoRows when it holds none.
+SELECT * FROM workflow_advance_holds WHERE workflow_run_id = $1;
+
+-- name: ListWorkflowAdvanceHolds :many
+-- The held advances, oldest first, at most sqlc.arg('max_holds'), through
+-- workflow_advance_holds_held_at_idx: the releaser's batch.
+SELECT * FROM workflow_advance_holds ORDER BY held_at, workflow_run_id LIMIT sqlc.arg('max_holds');
+
+-- name: ReleaseWorkflowAdvanceHold :one
+-- The release's compare-and-swap: deletes the run's hold and returns it.
+-- pgx.ErrNoRows when it is gone -- another replica released it, or a stop
+-- dropped it -- and the caller applies nothing.
+DELETE FROM workflow_advance_holds WHERE workflow_run_id = $1 RETURNING *;
+
+-- name: DeleteWorkflowAdvanceHoldsForStop :many
+-- A person's stop drops every advance the session held at or before the
+-- stop request -- the instant disarmWorkCreatingTimers compares with -- and
+-- returns the runs, which the caller cancels.
+DELETE FROM workflow_advance_holds
+WHERE session_id = sqlc.arg('session_id') AND held_at <= sqlc.arg('stop_requested_at')
+RETURNING workflow_run_id;

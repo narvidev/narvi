@@ -124,9 +124,13 @@ func passthrough(callerPrompt string, callerModelID, callerEffort *string) Resol
 //     Tracked=false -- creating a second live attempt here would violate
 //     workflow_step_runs_one_live_per_run (migration 000057).
 //
-// A defensive fourth case (a running run with NO live step-run at all --
-// should be unreachable given OnTurnCompleted's own invariants,
-// completion.go) also degrades to passthrough, logged.
+// A fourth case -- a running run with NO live step-run at all -- also
+// degrades to passthrough, untracked. It is reachable while the run's
+// advance is held by the autonomy freeze (technical plan §40.2,
+// release.go), logged at Info: a person's turn is never held, and the
+// advance is applied once the freeze lifts. Otherwise it should be
+// unreachable given OnTurnCompleted's own invariants (completion.go), and
+// is logged as a warning.
 func ResolveStepForNewTurn(ctx context.Context, workflows *postgres.WorkflowStore, sessionRow sqlcgen.Session, callerPrompt string, callerModelID, callerEffort *string) Resolution {
 	logger := platform.Logger(ctx)
 
@@ -195,16 +199,28 @@ func startNewRun(ctx context.Context, workflows *postgres.WorkflowStore, session
 }
 
 // resolveWithinRunningRun implements cases 2/3 of ResolveStepForNewTurn's
-// own doc comment above -- and its defensive fourth case (no live
-// step-run at all).
+// own doc comment above -- and its fourth case (no live step-run at all:
+// an advance the autonomy freeze holds, or a defensive fallback).
 func resolveWithinRunningRun(ctx context.Context, workflows *postgres.WorkflowStore, runRow sqlcgen.WorkflowRun, callerPrompt string, callerModelID, callerEffort *string) Resolution {
 	logger := platform.Logger(ctx)
 
 	liveStepRun, err := workflows.GetLiveStepRunForRun(ctx, runRow.ID)
 	if err != nil {
-		// Defensive: a running run should always have exactly one live
-		// step-run (OnTurnCompleted's own invariant, completion.go) --
-		// should be unreachable in practice.
+		if errors.Is(err, pgx.ErrNoRows) {
+			// Technical plan §40.2: a run whose advance the autonomy
+			// freeze holds (release.go) has no live step-run until the
+			// freeze lifts. A person's turn meanwhile is never held: it
+			// passes through untracked, and the held advance is applied
+			// after it, queued behind it.
+			if _, holdErr := workflows.GetAdvanceHold(ctx, runRow.ID); holdErr == nil {
+				logger.Info("workflowengine: advance held by the autonomy freeze; passing turn through untracked",
+					"run_id", runRow.ID.String())
+				return passthrough(callerPrompt, callerModelID, callerEffort)
+			}
+		}
+		// Defensive: a running run that holds no advance should always
+		// have exactly one live step-run (OnTurnCompleted's own
+		// invariant, completion.go) -- should be unreachable in practice.
 		logger.Warn("workflowengine: running run has no live step-run; passing turn through unchanged",
 			"run_id", runRow.ID.String(), "error", err)
 		return passthrough(callerPrompt, callerModelID, callerEffort)

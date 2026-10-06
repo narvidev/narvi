@@ -2543,6 +2543,13 @@ type WebhookDelivery struct {
 	ReceivedAt pgtype.Timestamptz `json:"received_at"`
 }
 
+type WorkflowAdvanceHold struct {
+	WorkflowRunID pgtype.UUID        `json:"workflow_run_id"`
+	StepRunID     pgtype.UUID        `json:"step_run_id"`
+	SessionID     pgtype.UUID        `json:"session_id"`
+	HeldAt        pgtype.Timestamptz `json:"held_at"`
+}
+
 type WorkflowBinding struct {
 	ID                   pgtype.UUID        `json:"id"`
 	Lane                 WorkflowLane       `json:"lane"`

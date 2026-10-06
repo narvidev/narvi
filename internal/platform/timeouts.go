@@ -3138,7 +3138,11 @@ type Timeouts struct {
 	// database's clock while frozen (its pushed head and budget kept), and
 	// a held outbox delivery -- the sentinel auto-fix and the description
 	// rewrite -- made due again this far ahead, its attempt given back. It
-	// is the unfreeze latency of both, plus the pump's own interval. The
+	// is the unfreeze latency of both, plus the pump's own interval. It is
+	// also the tick of the workflow engine's held-advance releaser
+	// (internal/app/workflowengine's HeldAdvanceReleaser), which applies,
+	// once the freeze lifts, each workflow advance it held: the unfreeze
+	// latency of a held advance. The
 	// sites with a tick of their own (the auto-merge worker, the cron
 	// trigger, the automation fan-out) read the freeze again on their next
 	// tick. Validate keeps it above TimerClaimDuration (a frozen debounce
@@ -4486,7 +4490,7 @@ func DefaultTimeouts() Timeouts {
 		ReviewRetriggerDebounce:     2 * time.Minute,  // §24.2; not specified, chosen -- long enough to collapse a short burst of fixup-commit pushes into one quiet window, short enough that a single push still reviews promptly
 		ReviewRetriggerHoldBackstop: 10 * time.Minute, // §24.9; not specified, chosen -- every turn end wakes the debounce at once, so this only bounds a lost wake-up, see field doc comment
 
-		AutonomyFreezeRecheckInterval: 60 * time.Second, // §40.2; not specified, chosen -- the unfreeze latency of a held re-review and a held outbox delivery, see field doc comment
+		AutonomyFreezeRecheckInterval: 60 * time.Second, // §40.2; not specified, chosen -- the unfreeze latency of a held re-review, a held outbox delivery and a held workflow advance, see field doc comment
 
 		SessionGuardReplyTimeout: 10 * time.Second, // §40.1; not specified, chosen -- GitHubGetPRTimeout's figure for a single REST call, see field doc comment
 		SessionGuardNoticeHold:   2 * time.Minute,  // §40.1; not specified, chosen -- above every refusal reply's own bound, see field doc comment

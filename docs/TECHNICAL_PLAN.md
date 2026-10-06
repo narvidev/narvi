@@ -2074,6 +2074,25 @@ consulted only when the `audit → fix` edge is about to re-fire; on escalate,
 touches or reuses `sentinel_fixes`/`SpawnSentinelFixChildSession` (Step 48) — the fix step here is
 structurally parallel to it, never a caller of it.
 
+**The automatic advance while autonomy is frozen (§40.2).** The engine's own advance — a step's turn
+ended and `NextStep` says advance — is an automatic action, so it reads the platform-wide freeze, in
+the transaction ending the turn and before the session guard (§40.1) is asked. While frozen, the
+attempt is finished as always, its outcome and summary stored, and instead of dispatching the next
+attempt the engine writes one `workflow_advance_holds` row (run, finished attempt, session, held at):
+the run stays `running` with no live attempt, nothing is dispatched, no notice is sent, and the skip
+is counted. Completing or escalating a run starts nothing and is never held; a needs_fix advance the
+circuit breaker would escalate is held too, and escalates on release. `HeldAdvanceReleaser` ticks every
+`AutonomyFreezeRecheckInterval`; once the freeze lifts it takes the oldest holds first and, for each,
+in one transaction under the session's actor-epoch lock — the decide endpoint's — reads the freeze
+again, deletes the row (a compare-and-swap, so of two replicas one applies it), and applies the stored
+outcome through `ApplyStepOutcome`, admitted by the session guard as any advance is; the next
+attempt's turn arms the session's dispatch timer in the same transaction. A person's stop drops the
+session's held advances and cancels their runs, by the stop's own rule (held at or before the
+request), and the releaser cancels a run whose stop stands when it gets there first. While a run holds
+its advance, a person's own turn on the session passes through untracked, and a person's decision on
+a step awaiting one is never read against the freeze. A rollback's down migration cancels every held
+run, the one kind of candidate a rollback loses.
+
 ### 25.10 Wire contracts
 
 New schema-first entities in `contracts/rest/v1/dtos.schema.json`: `WorkflowDefinition`/
@@ -7273,7 +7292,9 @@ the issue tracker reply honestly, and the code host acknowledges 200, keeps the 
 replies on the pull request. A plan approval is refused the same way, and the plan stays awaiting
 approval. A workflow advance escalates the run to `needs_review`, and its one escalation notice says
 three things: the run needs review; it will not resume on its own even once the cap is raised (a person
-sends the next turn); and the guard's text. A queued attempt ended at dispatch sends the same notice. A
+sends the next turn); and the guard's text. The freeze (40.2) is read before the guard there too: a
+frozen advance is held, recording no crossing, and meets the guard when it is released. A queued
+attempt ended at dispatch sends the same notice. A
 person's decision on a step is answered 409 and rolls back. The automatic
 re-review drops that firing, spending none of the pull request's re-review budget and keeping the
 pushed head for the next push; the freeze (40.2) is read before the guard there, so a frozen firing is
@@ -7354,7 +7375,9 @@ build when a site's read is removed or a new site never registered): the auto-me
 merge (§17.4); the sentinel auto-fix spawn (§17) and the description autofix (§26.2), the two outbox
 kinds whose delivery is itself the action; the automatic re-review enqueue (§24.3 step 4), before its
 GitHub read and again at the insert; the automation cron trigger before it claims a fire, and the
-automation fan-out where an invocation starts (§3.5); the workflow engine's auto-advance (§25); and,
+automation fan-out where an invocation starts (§3.5); the workflow engine's auto-advance (§25.9),
+once a step's turn ends and its next step would advance, before the session guard (40.1) is asked;
+and,
 when Phase 14 ships, the chain enqueue (§38.3) and the train's verdict-gated advance (§39.3). **Never**
 consulted by a human command: a prompt, a plan approval, a manual merge click, a manual re-trigger, a
 workflow step decision, a stop or a resume, a manual automation run (which has no entry point yet) —
@@ -7367,7 +7390,8 @@ by itself, not what a person decided.
 `frozen`, distinguishable from `failed` — §38.3's own distinction, made the general rule: one on
 `autonomy_freeze_skip_total{site, reason}` (reason `frozen`, or `freeze_unreadable` for a read that
 failed), plus the site's own durable trace — an outbox row's `last_error` with its attempt given back,
-a re-armed debounce, an invocation left unclaimed, the merge gate's audit row — never a failed status,
+a re-armed debounce, an invocation left unclaimed, the merge gate's audit row, a workflow run's held
+advance — never a failed status,
 a counted attempt, a strike or a dead letter. Nothing is consumed: an auto-merge candidate is still a
 candidate after the freeze lifts, a debounced re-review still fires, for the head pushed last, a due
 automation runs on its next tick. An event-triggered invocation is still recorded while frozen — the
@@ -7379,7 +7403,14 @@ missed occurrence fires at most once, on the first tick within the catch-up wind
 automation that has never fired counts its window from the minute it was created, so a first
 occurrence is caught up like any later one — and once however many replicas run the pump, since a
 fire is claimed by a compare-and-swap on the last fire its tick read. A site with no tick of its own — the held outbox kinds, the re-review's debounce — looks again every
-`AutonomyFreezeRecheckInterval` (a minute), the unfreeze latency. Three existing bounds still apply,
+`AutonomyFreezeRecheckInterval` (a minute), the unfreeze latency. A workflow advance is held in a row
+written with the end of its step's turn — the attempt finished as always, its outcome stored, the run
+still running with no live attempt — and a pump of its own, on the same interval, releases each one
+exactly once after the freeze lifts: it reads the freeze again under the session's lock, deletes the
+hold and applies the stored outcome as the turn's end would have, or cancels the run when a person's
+stop stands; a stop drops the session's held advances itself, and a person's own turn on a held run
+passes through untracked (§25.9). Completing or escalating a run starts nothing, so it is never
+held. Three existing bounds still apply,
 unchanged by the freeze: `AutoMergeCandidateLookback` (seven days), the cron catch-up window (ten
 minutes), and the sentinel-fix merge gate, evaluated once per close event of the origin pull request. This is deliberately a **call-site** check, the
 opposite of the shadow guard's "query exclusion, never call-site checks" rule (`automerge/worker.go`,
@@ -7397,7 +7428,8 @@ by §30.8 it can only end in the suppression ledger, so its delivery starts noth
 would keep a person's shadow-to-live activation waiting for it to settle. Stop an action whose
 last read came before the freeze committed: that tail finishes, as a running turn's does — at most one
 merge per candidate, a delivery already started, one re-review turn per session, one cron invocation
-(then held at fan-out), one fan-out per replica, and a turn enqueued before the freeze — each bounded,
+(then held at fan-out), one fan-out per replica, one workflow advance per run, and a turn enqueued
+before the freeze — each bounded,
 cheaper than a row lock on every action to serialize against a write made a few times a year.
 
 **Surfaces.** The decision inbox (§16) shows one banner while frozen; `ready_to_merge` items remain

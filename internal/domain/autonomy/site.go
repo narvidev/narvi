@@ -57,6 +57,10 @@ const (
 	// SiteAutomationFanOut is an automation invocation's start: its runs
 	// and their sessions (§3.5).
 	SiteAutomationFanOut Site = "automation_fan_out"
+	// SiteWorkflowAdvance is the workflow engine's automatic advance to a
+	// run's next attempt once a step's turn ends (§25.9): held in a row
+	// while frozen, and released exactly once after.
+	SiteWorkflowAdvance Site = "workflow_advance"
 )
 
 // The sites whose actions are specified but not built. Each consults the
@@ -80,6 +84,7 @@ var AllSites = []Site{
 	SiteAutoReReview,
 	SiteAutomationCron,
 	SiteAutomationFanOut,
+	SiteWorkflowAdvance,
 }
 
 // Reserved is every site whose action is not built yet.
