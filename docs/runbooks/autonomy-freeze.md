@@ -138,7 +138,11 @@ Every held candidate is still a candidate:
   for an automation that has never fired, after the later of the minute
   before it was created and ten minutes before the tick, so its first
   occurrence is caught up like any other and nothing from before it existed
-  fires. A freeze never builds up a burst.
+  fires. A freeze never builds up a burst. "Once" holds however many
+  replicas run the pump: a fire is claimed by a compare-and-swap on the
+  last fire the tick read, so when two replicas' ticks both see the
+  occurrence, the second claim finds the row claimed since and creates
+  nothing.
 
 Three existing bounds still apply. An auto-merge candidate older than
 `AutoMergeCandidateLookback` (seven days) ages out of the candidate list, as
@@ -153,7 +157,9 @@ the freeze lasts, and more are enqueued while reviews keep running. So while
 frozen -- or while the freeze cannot be read -- each pump tick claims the two
 held kinds in a lane of their own, beside the batch of every other kind:
 however many rows the freeze holds, a notification is never kept waiting
-behind them, and each held row is still claimed, held and counted.
+behind them, and each held row is still claimed, held and counted. Each
+lane reads only the due pending rows of its own kinds, through
+`outbox_pending_kind_due_idx`, never the rows the outbox has delivered.
 
 A held row's age grows with the freeze. While frozen, `outbox_lag_seconds`
 leaves the held kinds out, so a long freeze does not read as a stuck outbox

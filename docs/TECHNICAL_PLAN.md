@@ -7321,7 +7321,8 @@ supported way to discard an automation's held invocations is a follow-up of the 
 A cron fire is skipped before its claim, so a freeze never builds up a burst, and after the unfreeze a
 missed occurrence fires at most once, on the first tick within the catch-up window of it — an
 automation that has never fired counts its window from the minute it was created, so a first
-occurrence is caught up like any later one. A site with no tick of its own — the held outbox kinds, the re-review's debounce — looks again every
+occurrence is caught up like any later one — and once however many replicas run the pump, since a
+fire is claimed by a compare-and-swap on the last fire its tick read. A site with no tick of its own — the held outbox kinds, the re-review's debounce — looks again every
 `AutonomyFreezeRecheckInterval` (a minute), the unfreeze latency. Three existing bounds still apply,
 unchanged by the freeze: `AutoMergeCandidateLookback` (seven days), the cron catch-up window (ten
 minutes), and the sentinel-fix merge gate, evaluated once per close event of the origin pull request. This is deliberately a **call-site** check, the
@@ -7334,7 +7335,8 @@ same reason a call-site check is the wrong tool there.
 human. Pause the outbox — notifications about work already done still deliver, because a freeze that
 also silences the audit trail is a freeze nobody can verify; only the two kinds that are themselves
 automatic actions are held, claimed in a lane of their own while frozen so no notification waits behind
-them, and the outbox lag gauge leaves them out while frozen. Hold a row of those kinds born in shadow:
+them — each lane reading only its own kinds' due rows, through an index of the pending rows by kind and
+due time — and the outbox lag gauge leaves them out while frozen. Hold a row of those kinds born in shadow:
 by §30.8 it can only end in the suppression ledger, so its delivery starts nothing, and holding it
 would keep a person's shadow-to-live activation waiting for it to settle. Stop an action whose
 last read came before the freeze committed: that tail finishes, as a running turn's does — at most one
