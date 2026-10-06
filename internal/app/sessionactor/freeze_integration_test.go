@@ -12,12 +12,15 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	domainautonomy "github.com/narvidev/narvi/internal/domain/autonomy"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -45,6 +48,34 @@ func unfreezeAutonomyForActorTest(ctx context.Context, t *testing.T, pool *pgxpo
 	if _, err := narvipg.NewPlatformSettingsStore(pool).Unfreeze(ctx); err != nil {
 		t.Fatalf("unfreeze autonomy: %v", err)
 	}
+}
+
+// reReviewSkips reads autonomy_freeze_skip_total{site=auto_re_review,
+// reason=frozen} from this binary's one meter provider.
+func reReviewSkips(t *testing.T) int64 {
+	t.Helper()
+	var rm metricdata.ResourceMetrics
+	if err := otelReader.Collect(context.Background(), &rm); err != nil {
+		t.Fatalf("collect metrics: %v", err)
+	}
+	want := attribute.NewSet(attribute.String("site", string(domainautonomy.SiteAutoReReview)), attribute.String("reason", string(domainautonomy.SkipFrozen)))
+	for _, sm := range rm.ScopeMetrics {
+		for _, m := range sm.Metrics {
+			if m.Name != "autonomy_freeze_skip_total" {
+				continue
+			}
+			sum, ok := m.Data.(metricdata.Sum[int64])
+			if !ok {
+				t.Fatalf("autonomy_freeze_skip_total is %T, want a Sum[int64]", m.Data)
+			}
+			for _, dp := range sum.DataPoints {
+				if dp.Attributes.Equals(&want) {
+					return dp.Value
+				}
+			}
+		}
+	}
+	return 0
 }
 
 // frozenDebounce reads the session's debounce and reports whether a frozen
@@ -124,10 +155,14 @@ func TestAutoReReview_Frozen_NoTurnNoBudgetNoFetch(t *testing.T) {
 	freezeAutonomyForActorTest(ctx, t, pool)
 	rig := newHoldRig(ctx, t, pool, f.sessionID, nil)
 
+	skipsBefore := reReviewSkips(t)
 	if err := rig.actor.Send(ctx, TimerFired{Name: TimerReviewRetriggerDebounce}); err != nil {
 		t.Fatalf("Send TimerFired: %v", err)
 	}
 	row := waitFrozenRearm(ctx, t, f, before.ArmedAt.Time)
+	if got := reReviewSkips(t) - skipsBefore; got != 1 {
+		t.Errorf("autonomy_freeze_skip_total{site=auto_re_review, reason=frozen} rose by %d, want 1", got)
+	}
 	if !row.CreatedAt.Time.Equal(before.CreatedAt.Time) {
 		t.Errorf("created_at moved from %v to %v: a stop compares with it", before.CreatedAt.Time, row.CreatedAt.Time)
 	}
@@ -185,10 +220,14 @@ func TestAutoReReview_FreezeDuringFetch_NoInsert(t *testing.T) {
 	}
 	rig := newHoldRig(ctx, t, pool, f.sessionID, fetcher)
 
+	skipsBefore := reReviewSkips(t)
 	if err := rig.actor.Send(ctx, TimerFired{Name: TimerReviewRetriggerDebounce}); err != nil {
 		t.Fatalf("Send TimerFired: %v", err)
 	}
 	waitFrozenRearm(ctx, t, f, before.ArmedAt.Time)
+	if got := reReviewSkips(t) - skipsBefore; got != 1 {
+		t.Errorf("autonomy_freeze_skip_total{site=auto_re_review, reason=frozen} rose by %d, want 1", got)
+	}
 	if err := fetcher.freezeErr(); err != nil {
 		t.Fatalf("freeze during the fetch: %v", err)
 	}

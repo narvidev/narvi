@@ -150,3 +150,30 @@ func TestGate_FrozenTxReturnsTheReadError(t *testing.T) {
 		t.Fatal("FrozenTx returned frozen alongside its error; the caller must decide from the error alone")
 	}
 }
+
+// TestGate_FrozenReturnsTheReadError pins Frozen's contract: a read that
+// fails is returned, never reported as "not frozen", and records no skip
+// -- its caller, the outbox's lag gauge and lanes, treats the error as
+// holding.
+func TestGate_FrozenReturnsTheReadError(t *testing.T) {
+	gate, err := autonomy.NewGate(closedPool(t))
+	if err != nil {
+		t.Fatalf("NewGate: %v", err)
+	}
+	before := map[domainautonomy.Site]int64{}
+	for _, site := range domainautonomy.AllSites {
+		before[site] = skipCount(t, site, domainautonomy.SkipFreezeUnreadable)
+	}
+	frozen, err := gate.Frozen(context.Background())
+	if err == nil {
+		t.Fatalf("Frozen on an unreadable freeze = (%v, nil), want the read's error", frozen)
+	}
+	if frozen {
+		t.Fatal("Frozen returned frozen alongside its error; the caller must decide from the error alone")
+	}
+	for _, site := range domainautonomy.AllSites {
+		if got := skipCount(t, site, domainautonomy.SkipFreezeUnreadable) - before[site]; got != 0 {
+			t.Fatalf("Frozen recorded %d skip(s) for %s, want none: it is no site's read", got, site)
+		}
+	}
+}
