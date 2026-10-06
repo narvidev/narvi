@@ -669,6 +669,47 @@ wire carries and the one row it leaves.
   both sizes, and its connection stays up.
   — both in `scenario23_prompt_frames_test.go`
 
+## Scenario #24 (Step 204, §3.3, §21.1)
+
+### #24 — a review turn reads the commit it recorded
+
+> A review turn of a pull request's review session → its sandbox checks
+> out the head the turn recorded before the prompt is sent, including a
+> re-review in a warm sandbox whose tree the previous turn modified; a
+> control plane that restarts between the checkout's send and its reply
+> sends the prompt once.
+
+**Status: covered.** The control plane is real: a registry with a real
+`wshub` commander, the real sandbox handler, real Postgres, behind
+scenario #7's relay. The sandbox is a real `wsbridge.Bridge` whose
+`CheckoutHandler` runs the agent's own `gitclone.CheckoutPullRef` against
+a base repository, `acme/widgets`, served by `git-http-backend` over TLS,
+which keeps the pull request's head as `refs/pull/7/head`. The rest of the
+agent stands in: a prompt records the commit and the status of the
+worktree it finds, may leave edits behind as a turn does, and completes; a
+snapshot is answered at once.
+
+- `TestResilience_Scenario24_WarmReReview_EachTurnChecksOutItsOwnHead`:
+  the first review turn finds S1, its recorded head, in a clean tree and
+  leaves a tracked change, a staged file, a deleted file, an untracked file
+  and an ignored one behind; the contributor pushes S2, and the re-review,
+  on the same gen, finds S2 in a clean tree, the ignored file kept. Each
+  turn records the commit it was checked out at, and each checkout's reply
+  is stored before its prompt was sent.
+- `TestResilience_Scenario24_ControlPlaneRestartBetweenSendAndReply_PromptSentOnce`:
+  the replica that sent the checkout shuts down before the reply; the
+  sandbox reconnects to another, whose actor finds the request recorded and
+  the reconnect counted and asks again, while the reply in flight is
+  replayed and stored under its own key. The prompt is sent once, on the
+  recorded head.
+  — both in `scenario24_review_checkout_test.go`
+
+The sandbox-agent half of the exit is pinned in `cmd/sandbox-agent` and
+`internal/sandboxagent/gitclone` (Step 204's first part), and the control
+plane's decisions -- a moved head, a lagging ref, an old agent, a silent
+or failing sandbox -- in `internal/app/sessionactor`'s
+`reviewcheckout_integration_test.go`.
+
 ## Not a scenario: the tool events of one message (Step 229, §6.1)
 
 The runtime adapter gives every event it derives from a part of an
@@ -718,8 +759,9 @@ message's `step_start` is stored in that turn.
 | 17 | Restore-with-docker | Covered — Step 74 |
 | 22 | A prompt lost between dispatch and the sandbox | Covered — Step 226 |
 | 23 | Frames over 32 KiB on the sandbox socket | Covered — Step 228 |
+| 24 | A review turn reads the commit it recorded | Covered — Step 204 |
 
 Numbers 18-21 are taken by the scenarios `docs/TECHNICAL_PLAN.md` §9.3 appends for Phases 13, 15
 and 18 (rotation and the interrupted turn, fresh-lineage continuity, the spend cap and freeze, the
-Kubernetes provider), none built yet. 22 is Step 226's, and 23 is Step 228's. A new scenario takes
-24.
+Kubernetes provider), none built yet. 22 is Step 226's, 23 is Step 228's, and 24 is Step 204's. A
+new scenario takes 25.
