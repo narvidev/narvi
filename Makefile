@@ -173,17 +173,20 @@ test-integration-group-4:
 #
 # Why this budget. POSTGRES_SUITE_TIMEOUT is go test's -timeout for the
 # suite's one test binary, and a panic at it reads as a hang only while a
-# green run stays well inside it. Before migrated templates
-# (sharedpool_integration_test.go's migratedDatabase) cut the suite, its
-# slowest green run alone was 559 s (Postgres 16, CI run 37473730187), which
-# 15 minutes holds 1.6 times. If a green run ever takes more than half of
-# the budget, the panic stops meaning a hang: make the suite faster or
-# split it, measure again, and only then move the budget, with the new
-# numbers here. Every other package keeps go test's default 10 minutes,
-# still more than twice the slowest of them (decisioninbox, 214-219 s in
-# group 4).
+# green run stays well inside it: the budget is twice the slowest run
+# measured alone, rounded up to a whole five minutes. Alone, after migrated
+# templates (sharedpool_integration_test.go's migratedDatabase) cut the
+# suite, it took 370 s on Postgres 17 (group 3's leg) and 487 s on 16 (the
+# floor job), CI run 37508303728; before them, up to 559 s on 16 (run
+# 37473730187). Twice 559 s is 18.6 minutes: 20 minutes, which a hang still
+# reaches long before the job's own six-hour limit. If a green run ever takes
+# more than half of the budget, the panic stops meaning a hang: make the
+# suite faster or split it, measure again, and only then move the budget,
+# with the new numbers here. Every other package keeps go test's default 10
+# minutes, still more than twice the slowest of them (decisioninbox, 214-219
+# s in group 4).
 INTEGRATION_POSTGRES := $(INTEGRATION_MODULE)/internal/adapters/outbound/postgres
-POSTGRES_SUITE_TIMEOUT := 15m
+POSTGRES_SUITE_TIMEOUT := 20m
 POSTGRES_SUITE_TEST = go test -tags=integration -race -p 1 -timeout $(POSTGRES_SUITE_TIMEOUT) $(INTEGRATION_POSTGRES)
 
 test-integration-postgres:
