@@ -250,23 +250,29 @@ func (b *Builder) Run(ctx context.Context) error {
 // every row of the batch not yet attempted is handed back without spending
 // its attempt (attempt's own first check).
 //
-// While autonomy is frozen (§40.2), the rows of the kinds the freeze holds
-// (freeze.go) are left out of outbox_lag_seconds: such a row is due again
-// every AutonomyFreezeRecheckInterval and held again, so its age grows with
-// the freeze and would read as a stuck outbox (OutboxLagHigh) though
-// nothing is stuck. The tick reads the freeze once for this; a read that
-// fails leaves them out too, since attempt then holds them as well.
+// The tick reads the autonomy freeze (§40.2) once, before its claim, and
+// while it holds -- frozen, or a read that failed, since attempt then holds
+// those kinds as well -- two things change. The kinds the freeze holds
+// (freeze.go) are claimed in a lane of their own (claimBatch), so the rows
+// it holds, due again every AutonomyFreezeRecheckInterval, never take the
+// slots of the notifications behind them; and they are left out of
+// outbox_lag_seconds, since a held row's age grows with the freeze and
+// would read as a stuck outbox (OutboxLagHigh) though nothing is stuck. A
+// delivering row that is due is always claimed in its own lane, so the
+// gauge reads its age whenever there is one. Whether each held row is
+// held is still decided, and its skip recorded, at its own attempt.
 func (b *Builder) PumpOnce(ctx context.Context) error {
-	claimed, err := b.claimBatch(ctx)
+	frozen, freezeErr := b.gate.Frozen(ctx)
+	if freezeErr != nil {
+		platform.Logger(ctx).Warn("outboxworker: the autonomy freeze could not be read; the kinds it holds are claimed in their own lane this tick", "error", freezeErr)
+	}
+	holding := frozen || freezeErr != nil
+
+	claimed, err := b.claimBatch(ctx, holding)
 	if err != nil {
 		return fmt.Errorf("outboxworker: claim batch: %w", err)
 	}
 
-	holding := false
-	if len(claimed) > 0 {
-		frozen, err := b.gate.Frozen(ctx)
-		holding = frozen || err != nil
-	}
 	b.outboxLag.Record(ctx, lagSeconds(claimed, holding, time.Now()))
 
 	if backlog, err := b.store.CountPending(ctx); err != nil {
@@ -357,6 +363,13 @@ func newOutcomeContext(worker context.Context, bound time.Duration) (context.Con
 // shape. PumpOnce records the outbox_lag_seconds gauge for this tick from
 // the claimed rows' CreatedAt.
 //
+// While holding (PumpOnce's read of the autonomy freeze, §40.2) the batch
+// is two lanes, each up to pumpBatchSize oldest-due-first: the kinds the
+// freeze does not hold, then the kinds it holds. Scheduling only: every due
+// row of a held kind is still claimed in its lane and decided at its own
+// attempt, so no row is passed over unrecorded, and a notification never
+// waits behind rows the freeze is holding.
+//
 // The single now := time.Now() below is shared across every row in this
 // batch (up to pumpBatchSize), so every claimed row's own next_attempt_at
 // is stamped with the SAME provisional expiry, well before any of them
@@ -368,7 +381,7 @@ func newOutcomeContext(worker context.Context, bound time.Duration) (context.Con
 // immediately before the real delivery call -- this batch-level claim
 // below only ever needs to survive up to the moment attempt() runs for
 // that row, not the whole batch's own worst-case sequential duration.
-func (b *Builder) claimBatch(ctx context.Context) ([]sqlcgen.Outbox, error) {
+func (b *Builder) claimBatch(ctx context.Context, holding bool) ([]sqlcgen.Outbox, error) {
 	conn, err := b.pool.Acquire(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("acquire connection: %w", err)
@@ -383,9 +396,25 @@ func (b *Builder) claimBatch(ctx context.Context) ([]sqlcgen.Outbox, error) {
 
 	txStore := b.store.WithTx(tx)
 
-	due, err := txStore.ListDuePending(ctx, pumpBatchSize)
-	if err != nil {
-		return nil, fmt.Errorf("list due outbox entries: %w", err)
+	var due []sqlcgen.Outbox
+	if !holding {
+		due, err = txStore.ListDuePending(ctx, pumpBatchSize)
+		if err != nil {
+			return nil, fmt.Errorf("list due outbox entries: %w", err)
+		}
+	} else {
+		kinds := heldKinds()
+		delivering, err := txStore.ListDuePendingExcludingKinds(ctx, pumpBatchSize, kinds)
+		if err != nil {
+			return nil, fmt.Errorf("list due outbox entries of the delivering kinds: %w", err)
+		}
+		held, err := txStore.ListDuePendingOfKinds(ctx, pumpBatchSize, kinds)
+		if err != nil {
+			return nil, fmt.Errorf("list due outbox entries of the held kinds: %w", err)
+		}
+		due = make([]sqlcgen.Outbox, 0, len(delivering)+len(held))
+		due = append(due, delivering...)
+		due = append(due, held...)
 	}
 
 	now := time.Now()
@@ -457,7 +486,9 @@ func (b *Builder) claimBatch(ctx context.Context) ([]sqlcgen.Outbox, error) {
 // The autonomy freeze (§40.2) is read once the claim is renewed, for the
 // kinds freeze.go marks FreezeHolds, before the shadow check: a held row
 // reaches neither the world nor the suppression ledger until the freeze
-// lifts (holdFrozen). attempt returns true for a row it held so.
+// lifts (holdFrozen). A row stamped suppressed_in_shadow at enqueue is
+// never held: by §30.8 it can only end in the ledger, so its delivery
+// starts nothing. attempt returns true for a row it held.
 func (b *Builder) attempt(ctx, outcomeCtx context.Context, row sqlcgen.Outbox) (held bool) {
 	var correlationID string
 	if row.CorrelationID != nil {
@@ -518,7 +549,18 @@ func (b *Builder) attempt(ctx, outcomeCtx context.Context, row sqlcgen.Outbox) (
 	// while autonomy is frozen, before the shadow check below -- a held row
 	// is not delivered to the ledger either. A freeze read that fails holds
 	// it too.
-	if entry := freezeOf(ports.NotificationKind(row.Kind)); entry.class == FreezeHolds {
+	//
+	// Except a row born in shadow: §30.8 makes it terminally shadow, so its
+	// delivery can only record what would have happened -- the shadow block
+	// below sends a SUPPRESS kind to the ledger, and the sentinel auto-fix's
+	// own Deliver short-circuits to the ledger on the stamp before it claims
+	// or spawns anything. It starts no action, so the freeze has nothing to
+	// hold; holding it would only keep it pending, and a person's
+	// shadow-to-live Activate waits for every such row to settle
+	// (shadowoperator.ErrUnhandledShadowEraRows). Only the stamp is trusted
+	// here, never the current mode: a born-live row whose repository has
+	// been demoted since may still find it live again before it delivers.
+	if entry := freezeOf(ports.NotificationKind(row.Kind)); entry.class == FreezeHolds && !row.SuppressedInShadow {
 		if skip, reason := b.gate.Check(ctx, entry.site, "outbox_id", row.ID.String(), "kind", row.Kind); skip {
 			b.holdFrozen(outcomeCtx, logger, row, reason)
 			return true

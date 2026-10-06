@@ -58,6 +58,32 @@ ORDER BY next_attempt_at
 LIMIT $1
 FOR UPDATE SKIP LOCKED;
 
+-- name: ListDuePendingOutboxEntriesExcludingKinds :many
+-- ListDuePendingOutboxEntries without the rows of kinds: the delivering
+-- lane of a pump tick while the autonomy freeze holds those kinds
+-- (technical plan §40.2, outboxworker's claimBatch). A row the freeze
+-- holds is due again every recheck interval; in the one oldest-due-first
+-- batch, enough of them would take every slot and keep the notifications
+-- behind them waiting. Same order, lock and SKIP LOCKED as its sibling.
+SELECT * FROM outbox
+WHERE status = 'pending' AND next_attempt_at <= now()
+  AND kind <> ALL(sqlc.arg('kinds')::text[])
+ORDER BY next_attempt_at
+LIMIT sqlc.arg('max_rows')
+FOR UPDATE SKIP LOCKED;
+
+-- name: ListDuePendingOutboxEntriesOfKinds :many
+-- The other lane of that tick: only the rows of kinds, in a batch of
+-- their own, so each is still claimed and its hold decided and recorded
+-- at the delivery's own call site (Builder.attempt), never skipped by
+-- this query. Same order, lock and SKIP LOCKED as its sibling.
+SELECT * FROM outbox
+WHERE status = 'pending' AND next_attempt_at <= now()
+  AND kind = ANY(sqlc.arg('kinds')::text[])
+ORDER BY next_attempt_at
+LIMIT sqlc.arg('max_rows')
+FOR UPDATE SKIP LOCKED;
+
 -- name: ClaimOutboxEntry :one
 -- The claim half of the pump's own two-step (claim-then-attempt-outside-
 -- any-transaction) shape: bumps next_attempt_at forward by the caller's

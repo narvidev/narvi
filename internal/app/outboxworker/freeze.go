@@ -23,6 +23,7 @@ package outboxworker
 
 import (
 	"fmt"
+	"slices"
 
 	"github.com/narvidev/narvi/internal/app/ports"
 	domainautonomy "github.com/narvidev/narvi/internal/domain/autonomy"
@@ -85,6 +86,20 @@ var notificationKindFreeze = map[ports.NotificationKind]freezeEntry{
 	ports.NotificationKindSentinelAutoFix: {class: FreezeHolds, site: domainautonomy.SiteSentinelAutoFixSpawn},
 	// The unattended rewrite of a pull request's description (§26.2).
 	ports.NotificationKindGitHubDescriptionAutofix: {class: FreezeHolds, site: domainautonomy.SiteDescriptionAutofix},
+}
+
+// heldKinds returns, sorted, every kind the table marks FreezeHolds: the
+// kinds a tick claims in a lane of their own while autonomy is frozen
+// (Builder.claimBatch).
+func heldKinds() []string {
+	var kinds []string
+	for kind, entry := range notificationKindFreeze {
+		if entry.class == FreezeHolds {
+			kinds = append(kinds, string(kind))
+		}
+	}
+	slices.Sort(kinds)
+	return kinds
 }
 
 // freezeOf returns kind's freeze classification. A kind the table does not

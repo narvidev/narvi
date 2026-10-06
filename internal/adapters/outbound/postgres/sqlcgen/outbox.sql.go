@@ -424,6 +424,114 @@ func (q *Queries) ListDuePendingOutboxEntries(ctx context.Context, limit int32) 
 	return items, nil
 }
 
+const listDuePendingOutboxEntriesExcludingKinds = `-- name: ListDuePendingOutboxEntriesExcludingKinds :many
+SELECT id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions FROM outbox
+WHERE status = 'pending' AND next_attempt_at <= now()
+  AND kind <> ALL($1::text[])
+ORDER BY next_attempt_at
+LIMIT $2
+FOR UPDATE SKIP LOCKED
+`
+
+type ListDuePendingOutboxEntriesExcludingKindsParams struct {
+	Kinds   []string `json:"kinds"`
+	MaxRows int32    `json:"max_rows"`
+}
+
+// ListDuePendingOutboxEntries without the rows of kinds: the delivering
+// lane of a pump tick while the autonomy freeze holds those kinds
+// (technical plan §40.2, outboxworker's claimBatch). A row the freeze
+// holds is due again every recheck interval; in the one oldest-due-first
+// batch, enough of them would take every slot and keep the notifications
+// behind them waiting. Same order, lock and SKIP LOCKED as its sibling.
+func (q *Queries) ListDuePendingOutboxEntriesExcludingKinds(ctx context.Context, arg ListDuePendingOutboxEntriesExcludingKindsParams) ([]Outbox, error) {
+	rows, err := q.db.Query(ctx, listDuePendingOutboxEntriesExcludingKinds, arg.Kinds, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Outbox
+	for rows.Next() {
+		var i Outbox
+		if err := rows.Scan(
+			&i.ID,
+			&i.SessionID,
+			&i.Kind,
+			&i.Payload,
+			&i.Status,
+			&i.Attempts,
+			&i.NextAttemptAt,
+			&i.DeliveredAt,
+			&i.LastError,
+			&i.CreatedAt,
+			&i.CorrelationID,
+			&i.SuppressedInShadow,
+			&i.DeliveredToLedger,
+			&i.ConsecutiveInterruptions,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listDuePendingOutboxEntriesOfKinds = `-- name: ListDuePendingOutboxEntriesOfKinds :many
+SELECT id, session_id, kind, payload, status, attempts, next_attempt_at, delivered_at, last_error, created_at, correlation_id, suppressed_in_shadow, delivered_to_ledger, consecutive_interruptions FROM outbox
+WHERE status = 'pending' AND next_attempt_at <= now()
+  AND kind = ANY($1::text[])
+ORDER BY next_attempt_at
+LIMIT $2
+FOR UPDATE SKIP LOCKED
+`
+
+type ListDuePendingOutboxEntriesOfKindsParams struct {
+	Kinds   []string `json:"kinds"`
+	MaxRows int32    `json:"max_rows"`
+}
+
+// The other lane of that tick: only the rows of kinds, in a batch of
+// their own, so each is still claimed and its hold decided and recorded
+// at the delivery's own call site (Builder.attempt), never skipped by
+// this query. Same order, lock and SKIP LOCKED as its sibling.
+func (q *Queries) ListDuePendingOutboxEntriesOfKinds(ctx context.Context, arg ListDuePendingOutboxEntriesOfKindsParams) ([]Outbox, error) {
+	rows, err := q.db.Query(ctx, listDuePendingOutboxEntriesOfKinds, arg.Kinds, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Outbox
+	for rows.Next() {
+		var i Outbox
+		if err := rows.Scan(
+			&i.ID,
+			&i.SessionID,
+			&i.Kind,
+			&i.Payload,
+			&i.Status,
+			&i.Attempts,
+			&i.NextAttemptAt,
+			&i.DeliveredAt,
+			&i.LastError,
+			&i.CreatedAt,
+			&i.CorrelationID,
+			&i.SuppressedInShadow,
+			&i.DeliveredToLedger,
+			&i.ConsecutiveInterruptions,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listShadowSuppressedOutboxUnsettled = `-- name: ListShadowSuppressedOutboxUnsettled :many
 SELECT o.id AS id,
        o.session_id AS session_id,
