@@ -67,6 +67,10 @@ export interface Ready {
      */
     reviewCheckout?: boolean;
   };
+  /**
+   * Whole seconds, counted when this event was written, that the sandbox's provider will still let this sandbox run, as the provider stated it to the sandbox. Never negative. Absent when the provider stated nothing. The control plane keeps the earlier of now plus this and its own estimate (technical plan §35.2).
+   */
+  lifetimeRemainingSeconds?: number;
 }
 /**
  * §6.1: every 30s; carries conversation id + last_boot_phase so liveness (last_seen_at, §3.2) and turn-resume state stay current even with no other traffic.
@@ -85,6 +89,10 @@ export interface Heartbeat {
    */
   lastBootPhase: string | null;
   timestamp: string;
+  /**
+   * Whole seconds, counted when this event was written, that the sandbox's provider will still let this sandbox run, as the provider stated it to the sandbox. Never negative. Absent when the provider stated nothing. The control plane keeps the earlier of now plus this and its own estimate (technical plan §35.2).
+   */
+  lifetimeRemainingSeconds?: number;
 }
 /**
  * Named boot phase report; re-arms the connecting deadline during long boots (§3.2).
@@ -418,6 +426,19 @@ export interface SnapshotReady {
    * Echoes the messageId of the Snapshot command this event is completing (sandbox-agent sets this to the exact MessageId of the Snapshot command it received). Optional and additive: this event has zero real production consumers before its own first implementation, so adding this field now is not a breaking wire-contract change. Exists so the control plane can correlate a snapshot_ready back to the specific attempt it answers -- gen alone cannot, since neither the snapshot-start nor snapshot-complete transition is gen-fenced (a snapshot cycle happens within the same gen). Absent/omitted on any producer that predates this field.
    */
   commandMessageId?: string;
+  /**
+   * What the sandbox being snapshotted holds, as its own sandbox-agent reports it (technical plan §35.5b): the protocol its binary was compiled with, and the agent runtime version it discovered. Never a version the control plane supplied. Absent on an agent that predates it, which the control plane records as provenance unknown.
+   */
+  provenance?: {
+    /**
+     * The contracts VERSION the sandbox-agent binary was compiled with.
+     */
+    agentProtocol?: string;
+    /**
+     * The agent runtime's version, as the sandbox-agent discovered it when it spawned the runtime. Absent or null when it discovered none.
+     */
+    runtimeVersion?: string | null;
+  };
 }
 /**
  * §7.1: brackets a spawned sub-task's lifetime. NOT critical (no ackId) — only sub_task_finish closes an 'active' state the ack protocol must guarantee delivery of.

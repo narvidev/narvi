@@ -1,6 +1,7 @@
 package contractstest
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 	"time"
@@ -181,6 +182,65 @@ func TestSandboxEventsRoundTrip(t *testing.T) {
 			LastBootPhase:  &bootPhase,
 			Timestamp:      testTimestamp,
 		})
+	})
+
+	// Technical plan §35.2: the whole seconds the sandbox's provider stated
+	// it will still let the sandbox run, on a ready and on a heartbeat.
+	// Optional: an agent whose provider stated nothing sends neither
+	// (Ready and Heartbeat above). Zero is a value, never an absence.
+	t.Run("LifetimeRemainingSeconds", func(t *testing.T) {
+		for _, remaining := range []int{5400, 0} {
+			roundTrip(t, sch, sandboxws.Ready{
+				Type:                     "ready",
+				MessageId:                "e1l",
+				SessionId:                testSessionID,
+				Gen:                      1,
+				Timestamp:                testTimestamp,
+				AgentVersion:             "v1.4.2",
+				ImageDigest:              "sha256:9f31c00abcdef",
+				LifetimeRemainingSeconds: &remaining,
+			})
+			conversationID := "conv-123"
+			roundTrip(t, sch, sandboxws.Heartbeat{
+				Type:                     "heartbeat",
+				MessageId:                "e2l",
+				SessionId:                testSessionID,
+				Gen:                      1,
+				ConversationId:           &conversationID,
+				LastBootPhase:            nil,
+				Timestamp:                testTimestamp,
+				LifetimeRemainingSeconds: &remaining,
+			})
+		}
+		zero := 0
+		data, err := json.Marshal(sandboxws.Heartbeat{Type: "heartbeat", MessageId: "e2z", SessionId: testSessionID, Gen: 1, Timestamp: testTimestamp, LifetimeRemainingSeconds: &zero})
+		if err != nil || !bytes.Contains(data, []byte(`"lifetimeRemainingSeconds":0`)) {
+			t.Fatalf("a heartbeat stating zero seconds marshals as %s (%v); want the key present with 0", data, err)
+		}
+	})
+
+	// No minimum, deliberately: the generated decoder enforces one, and a
+	// ready that fails its decode loses the gen's promptReceipt and
+	// maxFrameBytes. A negative value from a misbehaving agent validates
+	// and decodes; the control plane clamps it.
+	t.Run("LifetimeRemainingSeconds_NegativeStillDecodes", func(t *testing.T) {
+		ready := []byte(`{"type":"ready","messageId":"e1n","sessionId":"` + testSessionID +
+			`","gen":1,"timestamp":"2026-07-16T12:00:00Z","agentVersion":"v1","imageDigest":"d","lifetimeRemainingSeconds":-5}`)
+		heartbeat := []byte(`{"type":"heartbeat","messageId":"e2n","sessionId":"` + testSessionID +
+			`","gen":1,"conversationId":null,"lastBootPhase":null,"timestamp":"2026-07-16T12:00:00Z","lifetimeRemainingSeconds":-5}`)
+		for _, payload := range [][]byte{ready, heartbeat} {
+			if err := validateJSON(t, sch, payload); err != nil {
+				t.Fatalf("a negative lifetimeRemainingSeconds fails validation: %v\npayload: %s", err, payload)
+			}
+		}
+		var readyEvent sandboxws.Ready
+		if err := json.Unmarshal(ready, &readyEvent); err != nil || readyEvent.LifetimeRemainingSeconds == nil || *readyEvent.LifetimeRemainingSeconds != -5 {
+			t.Fatalf("a ready with a negative lifetimeRemainingSeconds decodes to %v (%v); want -5", readyEvent.LifetimeRemainingSeconds, err)
+		}
+		var heartbeatEvent sandboxws.Heartbeat
+		if err := json.Unmarshal(heartbeat, &heartbeatEvent); err != nil || heartbeatEvent.LifetimeRemainingSeconds == nil || *heartbeatEvent.LifetimeRemainingSeconds != -5 {
+			t.Fatalf("a heartbeat with a negative lifetimeRemainingSeconds decodes to %v (%v); want -5", heartbeatEvent.LifetimeRemainingSeconds, err)
+		}
 	})
 
 	t.Run("Heartbeat_BeforeFirstTurn", func(t *testing.T) {
@@ -406,6 +466,52 @@ func TestSandboxEventsRoundTrip(t *testing.T) {
 			AckId:      "snapshot_ready:e17",
 			SnapshotId: "snap-1",
 		})
+	})
+
+	// Technical plan §35.5b: what the snapshotted sandbox holds, as its own
+	// sandbox-agent reports it. Optional, and so is each member: an agent
+	// that predates it sends none (SnapshotReady above), and one that
+	// discovered no runtime version sends it null or not at all.
+	t.Run("SnapshotReady_Provenance", func(t *testing.T) {
+		protocol := "1.25.0"
+		runtime := "1.14.19"
+		for _, provenance := range []*sandboxws.SnapshotReadyProvenance{
+			{AgentProtocol: &protocol, RuntimeVersion: &runtime},
+			{AgentProtocol: &protocol, RuntimeVersion: nil},
+			{},
+		} {
+			command := "m17"
+			roundTrip(t, sch, sandboxws.SnapshotReady{
+				Type:             "snapshot_ready",
+				MessageId:        "e17p",
+				SessionId:        testSessionID,
+				Gen:              1,
+				AckId:            "snapshot_ready:e17p",
+				SnapshotId:       "snap-1",
+				CommandMessageId: &command,
+				Provenance:       provenance,
+			})
+		}
+		payload := []byte(`{"type":"snapshot_ready","messageId":"e17q","sessionId":"` + testSessionID +
+			`","gen":1,"ackId":"snapshot_ready:e17q","snapshotId":"snap-1","provenance":{"agentProtocol":"1.25.0","runtimeVersion":null}}`)
+		if err := validateJSON(t, sch, payload); err != nil {
+			t.Fatalf("an explicit null runtimeVersion fails validation: %v", err)
+		}
+		var event sandboxws.SnapshotReady
+		if err := json.Unmarshal(payload, &event); err != nil || event.Provenance == nil || event.Provenance.RuntimeVersion != nil {
+			t.Fatalf("an explicit null runtimeVersion decodes to %+v (%v); want a provenance with no runtime version", event.Provenance, err)
+		}
+	})
+
+	// The provenance object is closed: a member this release does not name
+	// is refused by the schema, so a later one is a contract change graded
+	// like any other.
+	t.Run("SnapshotReady_ProvenanceUnknownMemberRejected", func(t *testing.T) {
+		payload := []byte(`{"type":"snapshot_ready","messageId":"e17r","sessionId":"` + testSessionID +
+			`","gen":1,"ackId":"snapshot_ready:e17r","snapshotId":"snap-1","provenance":{"agentProtocol":"1.25.0","imageDigest":"sha256:0"}}`)
+		if err := validateJSON(t, sch, payload); err == nil {
+			t.Fatal("expected a provenance member this release does not name to fail validation, got nil error")
+		}
 	})
 
 	t.Run("SubTaskStart", func(t *testing.T) {
