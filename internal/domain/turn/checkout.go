@@ -25,18 +25,18 @@ import "time"
 type CheckoutOutcome string
 
 const (
-	// CheckoutCheckedOut: the worktree holds the reply's head.
+	// CheckoutCheckedOut means the worktree holds the reply's head.
 	CheckoutCheckedOut CheckoutOutcome = "checked_out"
-	// CheckoutSHAAbsent: the ref was fetched, and the commit asked for is
+	// CheckoutSHAAbsent means the ref was fetched, and the commit asked for is
 	// not in the repository -- a ref that lags a push, or a head that is
 	// gone. The worktree is untouched.
 	CheckoutSHAAbsent CheckoutOutcome = "sha_absent"
-	// CheckoutFetchFailed: the ref could not be fetched.
+	// CheckoutFetchFailed means the ref could not be fetched.
 	CheckoutFetchFailed CheckoutOutcome = "fetch_failed"
-	// CheckoutBusy: a turn or the boot was running in the sandbox, so
+	// CheckoutBusy means a turn or the boot was running in the sandbox, so
 	// nothing was done.
 	CheckoutBusy CheckoutOutcome = "busy"
-	// CheckoutFailed: anything else, named in the reply's error.
+	// CheckoutFailed means anything else, named in the reply's error.
 	CheckoutFailed CheckoutOutcome = "failed"
 )
 
@@ -111,23 +111,27 @@ type CheckoutBounds struct {
 type CheckoutAction int
 
 const (
-	// CheckoutProceed: the sandbox holds WantSHA; dispatch the turn,
-	// recording the commit (turns.checked_out_sha).
+	// CheckoutProceed means the sandbox holds WantSHA: the turn is
+	// dispatched, and the commit recorded (turns.checked_out_sha).
 	CheckoutProceed CheckoutAction = iota + 1
-	// CheckoutSend: send a checkout command, with a new messageId, and
-	// look again NextLook from now. The turn stays as it is.
+	// CheckoutSend means a checkout command is sent, with a new messageId,
+	// and the turn looked at again NextLook from now. The turn stays as it
+	// is.
 	CheckoutSend
-	// CheckoutWait: send nothing; look again NextLook from now.
+	// CheckoutWait means nothing is sent, and the turn looked at again
+	// NextLook from now.
 	CheckoutWait
-	// CheckoutEndMoved: the pull request's head moved past WantSHA; end
-	// the pending attempt context_moved, as technical plan §24.9's check
-	// ends one, and ask for it again. LiveHeadSHA is the ref's tip.
+	// CheckoutEndMoved means the pull request's head moved past WantSHA:
+	// the pending attempt ends context_moved, as technical plan §24.9's
+	// check ends one, and is asked for again. The verdict's RefSHA is the
+	// ref's tip.
 	CheckoutEndMoved
-	// CheckoutRefuse: end the turn, refused for Refusal.
+	// CheckoutRefuse means the turn ends, refused for the verdict's
+	// Refusal.
 	CheckoutRefuse
-	// CheckoutRetireGen: retire the live gen and clear the sandbox's
-	// snapshot, for Retirement; the turn stays as it is, and the next gen
-	// boots fresh.
+	// CheckoutRetireGen means the live gen is retired and the sandbox's
+	// snapshot cleared, for the verdict's Retirement; the turn stays as it
+	// is, and the next gen boots fresh.
 	CheckoutRetireGen
 )
 
@@ -155,16 +159,16 @@ func (a CheckoutAction) String() string {
 type CheckoutRefusal string
 
 const (
-	// CheckoutRefusedUnsupported: the gen's agent cannot check out a
+	// CheckoutRefusedUnsupported means the gen's agent cannot check out a
 	// commit (it never advertised capabilities.reviewCheckout), and it has
 	// no snapshot whose restore a fresh gen would replace.
 	CheckoutRefusedUnsupported CheckoutRefusal = "unsupported"
-	// CheckoutRefusedNoReport: no reply came within the bound.
+	// CheckoutRefusedNoReport means no reply came within the bound.
 	CheckoutRefusedNoReport CheckoutRefusal = "no_report"
-	// CheckoutRefusedHeadAbsent: WantSHA is still not in the pull
+	// CheckoutRefusedHeadAbsent means WantSHA is still not in the pull
 	// request's ref past the lag window, on a turn no lane asks for again.
 	CheckoutRefusedHeadAbsent CheckoutRefusal = "head_absent"
-	// CheckoutRefusedError: the checkout kept failing -- a fetch failure,
+	// CheckoutRefusedError means the checkout kept failing -- a fetch failure,
 	// a busy sandbox or a failed checkout -- until the bound.
 	CheckoutRefusedError CheckoutRefusal = "error"
 )
@@ -173,11 +177,11 @@ const (
 type CheckoutRetirement string
 
 const (
-	// CheckoutRetiredOldAgent: the gen's agent cannot check out a commit,
+	// CheckoutRetiredOldAgent means the gen's agent cannot check out a commit,
 	// and the sandbox has a snapshot, which may have brought that agent
 	// back; a fresh gen boots a current one.
 	CheckoutRetiredOldAgent CheckoutRetirement = "old_agent"
-	// CheckoutRetiredFailing: the turn's checkouts on the gen failed
+	// CheckoutRetiredFailing means the turn's checkouts on the gen failed
 	// FailuresBeforeRetire times, on what its worktree holds.
 	CheckoutRetiredFailing CheckoutRetirement = "failing"
 )

@@ -642,5 +642,6 @@ func (a *Actor) reviewCheckoutOutstanding(ctx context.Context, row sqlcgen.GetRe
 		return false
 	}
 	facts := reviewCheckoutFacts(sandboxRow, state, target, false)
-	return !(facts.Reply != nil && facts.Reply.Outcome == turn.CheckoutCheckedOut && facts.Reply.HeadSHA == target.sha)
+	confirmed := facts.Reply != nil && facts.Reply.Outcome == turn.CheckoutCheckedOut && facts.Reply.HeadSHA == target.sha
+	return !confirmed
 }
