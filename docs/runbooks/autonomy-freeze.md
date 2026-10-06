@@ -18,17 +18,32 @@ every replica, with no restart.
 |---|---|---|
 | `auto_merge` | the auto-merge worker merges nothing, reads nothing from GitHub, confirms nothing | the auto-approved verdict, listed again on the next tick |
 | `sentinel_fix_merge` | an allowed sentinel-fix merge gate does not merge | the fix pull request stays open as an ordinary review item; its audit row says `"skipped": "frozen"`. The gate runs once per close event, so it is not re-run after the freeze lifts |
-| `sentinel_auto_fix_spawn` | no fix branch, no fix session | its outbox row: pending, attempt not counted, due again every minute |
-| `description_autofix` | no rewrite of a pull request's description | its outbox row: pending, attempt not counted, due again every minute |
+| `sentinel_auto_fix_spawn` | no fix branch, no fix session | its outbox row: pending, attempt not counted, due again every minute (a row born in shadow is not held: see below) |
+| `description_autofix` | no rewrite of a pull request's description | its outbox row: pending, attempt not counted, due again every minute (a row born in shadow is not held: see below) |
 | `auto_re_review` | no automatic review turn, no budget spent, no GitHub read | the debounce timer, re-armed every minute, with the pushed head kept as its target |
 | `automation_cron` | a matched schedule is not fired or claimed | nothing: see "After the freeze lifts" |
 | `automation_fan_out` | an invocation starts no run and no session; no failed run, no strike, no auto-pause | the invocation, pending and unclaimed |
 
 An event-triggered automation (GitHub, the issue tracker, the generic
 webhook) still records its invocation while frozen -- the webhook still
-answers 202 -- and the invocation waits at fan-out. Pausing an automation
-while frozen discards its backlog: a paused automation's invocations are
-never fanned out.
+answers 202 -- and the invocation waits at fan-out.
+
+**Pausing an automation defers its backlog; it does not discard it.** A
+paused automation's invocations are not fanned out while it stays paused,
+frozen or not, but pausing and resuming touch no invocation: when the
+automation is resumed, every invocation it recorded meanwhile -- the ones
+held through the freeze included -- fans out, five per tick per replica,
+each starting its runs and sessions on today's code. Nothing in the product
+discards them yet: keep a runaway automation paused until it can be
+resumed safely. A supported way to discard an automation's held invocations
+is a planned follow-up, with the freeze's admin action.
+
+An outbox row of the two held kinds that was born in shadow (its
+`suppressed_in_shadow` stamp set at enqueue, `docs/TECHNICAL_PLAN.md` §30.8)
+is not held: it can only ever be recorded in the suppression ledger, so its
+delivery starts nothing. It resolves into the ledger as usual while frozen,
+and a person's shadow-to-live Activate, which waits for every such row to
+settle, is never kept waiting by the freeze.
 
 ## What does not hold
 
@@ -114,11 +129,16 @@ Every held candidate is still a candidate:
 - the outbox and the automatic re-review: within a minute and five seconds
   (`AutonomyFreezeRecheckInterval` plus the pump's interval). The
   re-review reviews the head pushed last.
-- cron: on the next tick, a schedule that matched during the freeze fires
-  once if the match falls within the catch-up window
-  (`AutomationCronCatchUpWindow`, ten minutes) of the automation's last
-  fire; after a longer freeze it waits for its next occurrence. A freeze
-  never builds up a burst.
+- cron: an occurrence the freeze held fires once, on the first tick after
+  the freeze lifts, if that tick comes less than ten minutes
+  (`AutomationCronCatchUpWindow`) after the occurrence; otherwise it waits
+  for its next occurrence. The rule behind it: each tick fires an automation
+  at most once, when its schedule matches a minute after the later of its
+  last fire and ten minutes before the tick, up to the tick's own minute --
+  for an automation that has never fired, after the later of the minute
+  before it was created and ten minutes before the tick, so its first
+  occurrence is caught up like any other and nothing from before it existed
+  fires. A freeze never builds up a burst.
 
 Three existing bounds still apply. An auto-merge candidate older than
 `AutoMergeCandidateLookback` (seven days) ages out of the candidate list, as
@@ -126,17 +146,26 @@ it would on any idle week, and stays mergeable by a person in the decision
 inbox. The cron catch-up window above. And the sentinel-fix merge gate,
 evaluated once per close event of the origin pull request.
 
-## The outbox lag gauge
+## The outbox while frozen
 
-A held outbox row is due again every minute and held again, so its age grows
-with the freeze. While frozen, `outbox_lag_seconds` leaves the held kinds
-out, so a long freeze does not read as a stuck outbox (`OutboxLagHigh`,
-[outbox-delivery.md](outbox-delivery.md)). `outbox_due_backlog_count` still
-counts them.
+A held outbox row is due again every minute and held again, for as long as
+the freeze lasts, and more are enqueued while reviews keep running. So while
+frozen -- or while the freeze cannot be read -- each pump tick claims the two
+held kinds in a lane of their own, beside the batch of every other kind:
+however many rows the freeze holds, a notification is never kept waiting
+behind them, and each held row is still claimed, held and counted.
+
+A held row's age grows with the freeze. While frozen, `outbox_lag_seconds`
+leaves the held kinds out, so a long freeze does not read as a stuck outbox
+(`OutboxLagHigh`, [outbox-delivery.md](outbox-delivery.md)); a delivering row
+that is due is always claimed in its own lane, so the gauge still reads its
+age. `outbox_due_backlog_count` counts every pending row, the held ones
+included.
 
 ## Rolling back
 
 A binary without the freeze reads no freeze. Rolling back past it lifts any
 freeze in force, whatever the row says: turn off auto-merge and the other
 automatic toggles per repository, and pause automations, before rolling back
-during an incident.
+during an incident. A paused automation's invocations wait, and fan out when
+it is resumed (above).
