@@ -29,16 +29,21 @@ import (
 // heartbeat reports, in whole seconds within [0, ceiling], and false when
 // it reports none.
 //
-// It reads the one key leniently, never through the generated sandboxws
-// types: a value the contract does not allow -- negative, fractional,
-// larger than any lifetime -- is clamped, never a reason to fail the
-// frame's decode, since a ready that fails its decode loses the gen's
-// promptReceipt and maxFrameBytes (promptreceipt.go). A fraction is rounded
-// down and a negative value read as 0, both toward an earlier deadline;
-// anything above ceiling, ProviderHardCap, is ceiling, which no kind's
-// lifetime exceeds (platform.Timeouts.Validate). A key that is absent or
-// null, or that does not decode as a number, reports nothing, and the
-// estimate stands.
+// It reads the one key itself, leniently, never through the generated
+// sandboxws types, and the ready's other readers decode the frame without
+// it (decodeReady, framekey.go): whatever the key holds, the ready's
+// promptReceipt and maxFrameBytes read as they would without it. A value
+// the contract does not allow -- negative, fractional, larger than any
+// lifetime -- is clamped: a fraction is rounded down and a negative value
+// read as 0, both toward an earlier deadline; anything above ceiling,
+// ProviderHardCap, is ceiling, which no kind's lifetime exceeds
+// (platform.Timeouts.Validate). A key that is absent or null, or that does
+// not decode as a number, reports nothing, and the estimate stands.
+//
+// The value is counted on the sandbox's clock, from the instant its
+// provider stated, and the store adds it to the database's now(): the
+// sandbox clock's offset from the provider's, and the frame's delivery
+// time, both enter the deadline (technical plan §35.2).
 func reportedLifetimeRemaining(raw json.RawMessage, ceiling time.Duration) (int32, bool) {
 	var frame struct {
 		LifetimeRemainingSeconds *json.Number `json:"lifetimeRemainingSeconds"`

@@ -20,9 +20,11 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   (technical plan §35.2). Absent when the provider stated nothing, which
   is every sandbox today. The control plane keeps the earlier of now plus
   this and its own estimate, so a report only ever brings the deadline
-  earlier. Deliberately no `minimum`: the generated decoder would refuse a
-  negative value, and a `ready` that fails its decode loses the gen's
-  `promptReceipt` and `maxFrameBytes`; the control plane clamps instead. A
+  earlier. Deliberately no `minimum`, so a negative value still
+  validates; a reader clamps it. The control plane reads the key itself,
+  leniently, and decodes the rest of the frame without it
+  (`internal/app/sessionactor/lifetimereport.go`, `framekey.go`), so no
+  value of it costs a `ready` its `promptReceipt` or `maxFrameBytes`. A
   property added, not required, grades MINOR (row 2); the `ready` union
   member changes only by that property (row 30, recursing into row 2).
 - Added: optional integer `Heartbeat.lifetimeRemainingSeconds`, the same
@@ -35,8 +37,9 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   discovered, or null when it discovered none. Never a version the control
   plane supplied. Absent on an agent that predates it, which reads as
   provenance unknown. Neither member is required, and neither carries a
-  `pattern`: a `snapshot_ready` that fails its decode costs the snapshot.
-  A property added, not required, grades MINOR (row 2; an added property
+  `pattern`. The control plane decodes `snapshot_ready` without the key
+  (`internal/app/sessionactor/framekey.go`), so no value of it costs the
+  snapshot. A property added, not required, grades MINOR (row 2; an added property
   is not recursed into); the `snapshot_ready` union member changes only by
   that property (row 30, recursing into row 2).
 

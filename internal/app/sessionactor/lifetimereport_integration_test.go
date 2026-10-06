@@ -280,3 +280,38 @@ func TestSandboxLifetime_StaleGenReportIgnored(t *testing.T) {
 }
 
 func intPtr(n int) *int { return &n }
+
+// TestSandboxLifetime_AReportNeverCostsTheReadyItsCapabilities is the
+// event-path half of TestReadyCapabilities_SurviveAnyLifetimeReport: a
+// ready whose lifetimeRemainingSeconds the generated Ready cannot hold --
+// 60.0, 6e1 and 1e20 are integers the contract allows, the rest it does
+// not -- still records its promptReceipt and maxFrameBytes against the gen
+// (technical plan §3.3), and still tightens the deadline when the lenient
+// read takes the value.
+func TestSandboxLifetime_AReportNeverCostsTheReadyItsCapabilities(t *testing.T) {
+	ctx := context.Background()
+	rig := newLifetimeReportRig(ctx, t, nil)
+	for i, value := range []string{`60.0`, `6e1`, `1e20`, `99999999999999999999`, `59.9`, `"60"`, `1e400`, `"soon"`, `{}`} {
+		raw := json.RawMessage(`{"type":"ready","messageId":"r-capabilities-` + fmt.Sprint(i) + `","sessionId":"00000000-0000-0000-0000-000000000000","gen":1,` +
+			`"timestamp":"2026-10-06T12:00:00Z","agentVersion":"dev","imageDigest":"unknown",` +
+			`"capabilities":{"promptReceipt":true,"maxFrameBytes":1048576},"lifetimeRemainingSeconds":` + value + `}`)
+		if outcome, _, _ := rig.send(ctx, t, SandboxEvent{Type: "ready", Gen: 1, MessageID: fmt.Sprintf("r-capabilities-%d", i), Raw: raw}); !outcome.Persisted {
+			t.Fatalf("ready with lifetimeRemainingSeconds %s: Persisted = false, want true", value)
+		}
+		var promptReceiptGen, maxFrameBytes, maxFrameBytesGen *int32
+		if err := rig.pool.QueryRow(ctx, `SELECT prompt_receipt_gen, agent_max_frame_bytes, agent_max_frame_bytes_gen FROM sandboxes WHERE session_id = $1`, rig.sessionID).
+			Scan(&promptReceiptGen, &maxFrameBytes, &maxFrameBytesGen); err != nil {
+			t.Fatalf("read the recorded capabilities: %v", err)
+		}
+		if int32Value(promptReceiptGen) != int32(1) || int32Value(maxFrameBytes) != int32(1048576) || int32Value(maxFrameBytesGen) != int32(1) {
+			t.Errorf("ready with lifetimeRemainingSeconds %s recorded prompt_receipt_gen %v, agent_max_frame_bytes %v at gen %v; want gen 1, 1048576 at gen 1",
+				value, int32Value(promptReceiptGen), int32Value(maxFrameBytes), int32Value(maxFrameBytesGen))
+		}
+	}
+	// 59.9 is the earliest value the lenient read took: the deadline is
+	// that report's, not the estimate's.
+	row := readLifetimeRow(ctx, t, rig.pool, rig.sessionID)
+	if row.deadline == nil || time.Until(*row.deadline) > time.Minute {
+		t.Errorf("lifetime_deadline_at = %v, want it brought within a minute by the reports", row.deadline)
+	}
+}

@@ -219,10 +219,11 @@ func TestSandboxEventsRoundTrip(t *testing.T) {
 		}
 	})
 
-	// No minimum, deliberately: the generated decoder enforces one, and a
-	// ready that fails its decode loses the gen's promptReceipt and
-	// maxFrameBytes. A negative value from a misbehaving agent validates
-	// and decodes; the control plane clamps it.
+	// No minimum, deliberately: a negative value from a misbehaving agent
+	// validates, and decodes through the generated types, which would
+	// enforce a minimum; readers clamp it. (The control plane's own readers
+	// never decode the key through the generated types:
+	// internal/app/sessionactor/framekey.go.)
 	t.Run("LifetimeRemainingSeconds_NegativeStillDecodes", func(t *testing.T) {
 		ready := []byte(`{"type":"ready","messageId":"e1n","sessionId":"` + testSessionID +
 			`","gen":1,"timestamp":"2026-07-16T12:00:00Z","agentVersion":"v1","imageDigest":"d","lifetimeRemainingSeconds":-5}`)

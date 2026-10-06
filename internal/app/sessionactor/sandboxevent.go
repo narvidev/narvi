@@ -977,8 +977,8 @@ func (a *Actor) handleSnapshotReadyEvent(ctx context.Context, tx pgx.Tx, row sql
 		return nil
 	}
 
-	var evt sandboxws.SnapshotReady
-	if err := json.Unmarshal(raw, &evt); err != nil {
+	evt, err := decodeSnapshotReady(raw)
+	if err != nil {
 		// Fix (was: log-only, leaving the sandbox permanently stuck
 		// Snapshotting -- no watchdog covers that state, confirmed by both
 		// the implementer and two independent reviewers): "we can't
