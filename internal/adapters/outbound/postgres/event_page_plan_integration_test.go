@@ -6,7 +6,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -20,42 +19,19 @@ import (
 )
 
 // pagePlanDatabase creates a database of its own in the shared container,
-// migrated to the latest version, and returns a pool of exactly one
-// connection on it, so every statement a test runs shares one session's
-// prepared-statement cache, as a pool connection's does. The planner's
-// statistics are then this database's own: what other tests store leaves
-// them alone. Both are dropped at cleanup.
+// migrated to the latest version (migratedDatabase), and returns a pool of
+// exactly one connection on it, so every statement a test runs shares one
+// session's prepared-statement cache, as a pool connection's does. The
+// planner's statistics are then this database's own: what other tests store
+// leaves them alone. Both are dropped at cleanup.
 func pagePlanDatabase(ctx context.Context, t *testing.T) *pgxpool.Pool {
 	t.Helper()
-	admin, adminConnStr := IntegrationTestPoolAndConnStr(t)
-	name := fmt.Sprintf("pageplan_%d", time.Now().UnixNano())
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
-		t.Fatalf("create database %s: %v", name, err)
-	}
-	u, err := url.Parse(adminConnStr)
-	if err != nil {
-		t.Fatalf("parse connection string: %v", err)
-	}
-	u.Path = "/" + name
-	connStr := u.String()
-
-	m, mdb := newMigrate(t, connStr)
-	if err := m.Up(); err != nil {
-		_ = mdb.Close()
-		t.Fatalf("migrate %s up: %v", name, err)
-	}
-	_ = mdb.Close()
-
+	name, connStr := migratedDatabase(ctx, t, "pageplan", latestMigration)
 	pool, err := narvipg.NewPoolWithMaxConns(ctx, connStr, 1)
 	if err != nil {
 		t.Fatalf("open %s: %v", name, err)
 	}
-	t.Cleanup(func() {
-		pool.Close()
-		if _, err := admin.Exec(context.Background(), "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
-			t.Errorf("drop database %s: %v", name, err)
-		}
-	})
+	t.Cleanup(pool.Close)
 	return pool
 }
 
