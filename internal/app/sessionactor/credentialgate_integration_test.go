@@ -173,6 +173,10 @@ func TestDispatchGate_PersonalLinkOnly(t *testing.T) {
 				if got.Status != sqlcgen.TurnStatusProcessing {
 					t.Errorf("turn status = %s, want %s (dispatched as before)", got.Status, sqlcgen.TurnStatusProcessing)
 				}
+				// The prompt is written after the commit that makes the turn
+				// processing (technical plan §3.3), so the status above can be
+				// read before it is sent.
+				waitUntil(t, 5*time.Second, func() bool { return commander.callCount() >= 1 })
 				if n := commander.callCount(); n != 1 {
 					t.Errorf("prompts sent = %d, want 1", n)
 				}

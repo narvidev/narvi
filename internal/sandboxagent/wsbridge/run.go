@@ -215,7 +215,9 @@ func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn, writeB
 // this gen to it (technical plan §3.3, §6.1). It advertises
 // capabilities.promptReceipt when, and only when, the prompt journal is
 // open (EnablePromptReceipts) and no append to it has failed; otherwise
-// that key is absent, as from an agent that predates it.
+// that key is absent, as from an agent that predates it. It advertises
+// capabilities.reviewCheckout exactly when the handler implements
+// CheckoutHandler, the one way a checkout command is ever run.
 func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
 	maxFrameBytes := platform.MaxPromptFrameBytes
 	msg := sandboxws.Ready{
@@ -231,6 +233,10 @@ func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
 	if b.promptReceiptsOn() {
 		promptReceipt := true
 		msg.Capabilities.PromptReceipt = &promptReceipt
+	}
+	if _, ok := b.handler.(CheckoutHandler); ok {
+		reviewCheckout := true
+		msg.Capabilities.ReviewCheckout = &reviewCheckout
 	}
 	payload, err := json.Marshal(msg)
 	if err != nil {

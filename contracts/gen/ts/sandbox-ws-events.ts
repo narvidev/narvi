@@ -30,7 +30,8 @@ export type SandboxEvent =
   | SnapshotReady
   | SubTaskStart
   | SubTaskFinish
-  | PromptReceived;
+  | PromptReceived
+  | CheckoutResult;
 
 /**
  * First event on a fresh WS connection, once the agent is ready to receive commands.
@@ -61,6 +62,10 @@ export interface Ready {
      * The largest message, in bytes, this agent reads. The control plane records it against the gen, the latest ready deciding, and never writes that gen a prompt frame longer than it, nor longer than its own MaxPromptFrameBytes. Absent: the gen is held to MaxPromptFrameBytes when this ready advertises promptReceipt, and otherwise to the WebSocket library's default read limit, 32768 bytes (technical plan §3.3, §6.1).
      */
     maxFrameBytes?: number;
+    /**
+     * True when the agent runs the checkout command, answering each with a checkout_result (technical plan §21.1, §30.4). Absent: the agent does not know the command, and skips it as an unknown one.
+     */
+    reviewCheckout?: boolean;
   };
 }
 /**
@@ -483,4 +488,63 @@ export interface PromptReceived {
    * True when this gen's agent had already received promptMessageId and did not run it again.
    */
   duplicate: boolean;
+}
+/**
+ * Technical plan §21.1, §30.4: what the agent holds after a checkout command, one entry per repo it named. NOT critical (no ackId): a lost result is asked for again by the next checkout. messageId is deterministic, so every copy of one command's result is stored once, whichever control-plane binary stores it, and is found by that key.
+ */
+export interface CheckoutResult {
+  type: 'checkout_result';
+  /**
+   * 'checkout_result:{commandMessageId}'.
+   */
+  messageId: string;
+  sessionId: string;
+  gen: number;
+  /**
+   * The messageId of the checkout command this answers.
+   */
+  commandMessageId: string;
+  /**
+   * @minItems 1
+   */
+  repos: [
+    {
+      name: string;
+      /**
+       * checked_out: the worktree holds headSha. sha_absent: the ref was fetched, and the commit asked for is not in the repository; the worktree is untouched. fetch_failed: the ref could not be fetched. busy: a turn or the boot was running, so nothing was done. failed: anything else, named in error. An open enum: a reader treats a value it does not know as failed.
+       */
+      outcome: 'checked_out' | 'sha_absent' | 'fetch_failed' | 'busy' | 'failed';
+      /**
+       * HEAD after a checked_out outcome; null otherwise.
+       */
+      headSha: string | null;
+      /**
+       * The tip of ref as fetched, whatever the outcome; null when it was never read.
+       */
+      refSha: string | null;
+      /**
+       * Why the outcome is not checked_out, at most 4096 bytes; null on checked_out.
+       */
+      error: string | null;
+    },
+    ...{
+      name: string;
+      /**
+       * checked_out: the worktree holds headSha. sha_absent: the ref was fetched, and the commit asked for is not in the repository; the worktree is untouched. fetch_failed: the ref could not be fetched. busy: a turn or the boot was running, so nothing was done. failed: anything else, named in error. An open enum: a reader treats a value it does not know as failed.
+       */
+      outcome: 'checked_out' | 'sha_absent' | 'fetch_failed' | 'busy' | 'failed';
+      /**
+       * HEAD after a checked_out outcome; null otherwise.
+       */
+      headSha: string | null;
+      /**
+       * The tip of ref as fetched, whatever the outcome; null when it was never read.
+       */
+      refSha: string | null;
+      /**
+       * Why the outcome is not checked_out, at most 4096 bytes; null on checked_out.
+       */
+      error: string | null;
+    }[]
+  ];
 }

@@ -322,6 +322,59 @@ func TestRun_SyncsAgentHeadInBeforeEverySpawn(t *testing.T) {
 	}
 }
 
+// TestRun_SyncsADetachedCheckoutOutToTheRuntime pins SyncHeadOut's two
+// shapes through Run: an agent-side `checkout --detach <sha>` leaves the
+// runtime's own HEAD detached at that sha (a pull request review reads its
+// recorded head this way, technical plan §21.1), and a later checkout of a
+// branch makes it a symbolic ref again. Before detached heads were synced
+// out, the detached checkout itself succeeded and Run then failed, leaving
+// the runtime's HEAD on the branch while the shared index held the other
+// commit's tree.
+func TestRun_SyncsADetachedCheckoutOutToTheRuntime(t *testing.T) {
+	base := t.TempDir()
+	workspaceDir := filepath.Join(base, "workspace")
+	wt := filepath.Join(workspaceDir, "repo1")
+	initRunTestRepo(t, wt)
+	first := strings.TrimSpace(runGitOutputForRunTest(t, wt, "rev-parse", "HEAD"))
+	if err := os.WriteFile(filepath.Join(wt, "second.txt"), []byte("second\n"), 0o644); err != nil {
+		t.Fatalf("write second.txt: %v", err)
+	}
+	runGitForRunTest(t, wt, "add", ".")
+	runGitForRunTest(t, wt, "commit", "-qm", "second")
+
+	gitDirRoot := filepath.Join(base, "gitdirs")
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot: %v", err)
+	}
+	repo := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}.Repo("repo1")
+	sup := supervisor.New()
+	ctx := context.Background()
+	if err := gitdir.Seed(ctx, sup, repo, "https://example.invalid/repo1.git", nil, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed: %v", err)
+	}
+
+	runHardened(ctx, t, sup, repo, "checkout", "--quiet", "--force", "--detach", first, "--")
+	runtimeHead, err := os.ReadFile(filepath.Join(wt, ".git", "HEAD"))
+	if err != nil {
+		t.Fatalf("read runtime HEAD: %v", err)
+	}
+	if got, want := string(runtimeHead), first+"\n"; got != want {
+		t.Fatalf("runtime HEAD after a detached checkout = %q, want %q", got, want)
+	}
+	if got := strings.TrimSpace(runGitOutputForRunTest(t, wt, "status", "--porcelain")); got != "" {
+		t.Errorf("runtime status after a detached checkout = %q, want clean: its HEAD and the shared index disagree", got)
+	}
+
+	runHardened(ctx, t, sup, repo, "checkout", "--quiet", "main", "--")
+	runtimeHead, err = os.ReadFile(filepath.Join(wt, ".git", "HEAD"))
+	if err != nil {
+		t.Fatalf("read runtime HEAD: %v", err)
+	}
+	if got, want := string(runtimeHead), "ref: refs/heads/main\n"; got != want {
+		t.Errorf("runtime HEAD after checking out main again = %q, want %q", got, want)
+	}
+}
+
 // TestMirrorSparseCheckout_RuntimeHasLinkedWorktree reproduces the
 // finding directly against real git: the runtime is free to run an
 // ordinary, unprivileged `git worktree add` at any point during a
