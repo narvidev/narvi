@@ -890,7 +890,10 @@ func (deps Deps) handlePrompted(ctx context.Context, payload agentSessionEventWe
 				// way -- it now returns ok=false here too, exactly mirroring
 				// this function's own ordinary-reply gate below, so it flows
 				// into the same release-the-claim-and-retry path.
-				return deps.handlePlanVerdict(ctx, logger, sessionID, planID, verdict, actorUserID, notice, payload.OrganizationID, payload.AgentSession.ID)
+				// Answered on this agent session (technical plan §40.1): a
+				// refusal tells the session's channel here, and no notice
+				// repeats it.
+				return deps.handlePlanVerdict(turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceLinear), logger, sessionID, planID, verdict, actorUserID, notice, payload.OrganizationID, payload.AgentSession.ID)
 			}
 			// a follow-up fix (§8.1): a reply matching neither a
 			// verdict keyword NOR this deterministic revise: prefix falls
@@ -1006,7 +1009,9 @@ func (deps Deps) handlePrompted(ctx context.Context, payload agentSessionEventWe
 	// actorUserID attributed) and L12 (this package's own copy-pasted
 	// hasOpenTurn helper is gone entirely -- httpapi's own copy, already
 	// unexported there, is the only one left).
-	createdTurn, wasCreated, cerr := httpapi.CreateTurnCore(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.IntentClassifier, deps.AuditLog, deps.Registry, deps.SessionGuard, sessionID, prompt, nil, planMode, deps.EpistemicCheckDefault, actorUserID, httpapi.DropIfOpen)
+	// Answered on this agent session (technical plan §40.1): a refusal tells
+	// the session's channel here, and no notice repeats it.
+	createdTurn, wasCreated, cerr := httpapi.CreateTurnCore(turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceLinear), deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.IntentClassifier, deps.AuditLog, deps.Registry, deps.SessionGuard, sessionID, prompt, nil, planMode, deps.EpistemicCheckDefault, actorUserID, httpapi.DropIfOpen)
 	if cerr != nil {
 		if errors.Is(cerr, httpapi.ErrPlanAwaitingApproval) {
 			// a follow-up fix (§8.1): honest reply, never a hard

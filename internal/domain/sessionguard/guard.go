@@ -86,6 +86,12 @@ type Facts struct {
 	// repositories, nil when none sets one.
 	RepoCap    *MicroUSD
 	RepoSource CapSource
+	// Turns is how many turns the session has: every turn it was ever
+	// admitted, whatever became of it. Turns are never deleted, and a turn
+	// exists only once the guard admitted it, so the count grows exactly
+	// when the session is admitted a turn -- it names the crossing a
+	// refusal belongs to (WarningKey).
+	Turns int64
 }
 
 // EffectiveCap is the cap the session is held to, and where it was set:
@@ -115,6 +121,8 @@ type Refusal struct {
 	Spent MicroUSD
 	// Source is where Cap was set.
 	Source CapSource
+	// Turns is Facts.Turns at the refusal: the crossing it belongs to.
+	Turns int64
 }
 
 // Error is the refusal's text: what every surface tells a person (Text).
@@ -166,6 +174,7 @@ func Decide(f Facts, origin Origin) (Admission, *Refusal) {
 			Cap:       *limit,
 			Spent:     f.SpentUSD,
 			Source:    source,
+			Turns:     f.Turns,
 		}
 	}
 	return Admission{sessionID: f.SessionID, ok: true}, nil
@@ -181,14 +190,25 @@ func AdmitNewSession(sessionID [16]byte) Admission {
 }
 
 // WarningKey is the stable name of one crossing of the guard: the session,
-// the reason, and what the decision compared against -- for the cap, its
-// value and where it was set. Every refusal of the same crossing has the
-// same key, so the warning it records (internal/app/turnguard derives its
-// message id from this key) is stored once however many turns are refused;
-// a raised or moved cap is a new crossing, with a key of its own.
+// the reason, what the decision compared against -- for the cap, its value
+// and where it was set -- and the session's turn count (Refusal.Turns).
+//
+// A crossing is the session refused after it was last admitted a turn,
+// under one cap. Every refusal of the same crossing has the same key, so
+// the warning it records (internal/app/turnguard derives its message id
+// from this key) is stored once however many turns are refused: while the
+// session is refused it is admitted nothing, so its turn count holds still,
+// and the turn in flight, its re-sends, and the queued turns ended at
+// dispatch were all counted before the crossing. Once the session is
+// admitted a turn again -- the cap raised, cleared or moved, and a turn
+// taken -- its count has grown, so the next refusal is a new crossing even
+// at a cap value the session crossed before; and a cap changed to a new
+// value or source is a new crossing at once. A cap moved away and back with
+// no turn admitted in between is the same crossing: the session took
+// nothing in between, and its warning still says what it spent.
 func WarningKey(r Refusal) string {
-	return fmt.Sprintf("urn:narvi:session-guard:%s:%s:%d:%s:%s",
-		r.Reason, formatSessionID(r.SessionID), int64(r.Cap), r.Source.Kind, r.Source.ID)
+	return fmt.Sprintf("urn:narvi:session-guard:%s:%s:%d:%s:%s:%d",
+		r.Reason, formatSessionID(r.SessionID), int64(r.Cap), r.Source.Kind, r.Source.ID, r.Turns)
 }
 
 // formatSessionID prints id in the canonical 8-4-4-4-12 form.

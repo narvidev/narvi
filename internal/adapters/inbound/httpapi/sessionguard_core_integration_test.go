@@ -87,7 +87,7 @@ func TestCreateTurnCore_AtSpendCap_RefusedWithTypedReason(t *testing.T) {
 			repo := "acme/core-" + string(tc.source)
 			session := coreCapSession(ctx, t, rig, tc.source, repo, "3.00", "3.000000")
 			want := sessionguard.Refusal{Reason: sessionguard.ReasonSpendCap, SessionID: session.ID.Bytes, Cap: 3_000_000, Spent: 3_000_000,
-				Source: sessionguard.CapSource{Kind: sessionguard.CapSourceRepo, Name: repo, ID: repo}}
+				Source: sessionguard.CapSource{Kind: sessionguard.CapSourceRepo, Name: repo, ID: repo}, Turns: 1}
 
 			for attempt := 1; attempt <= 2; attempt++ {
 				_, created, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false),

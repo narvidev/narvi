@@ -5,6 +5,7 @@ package sessionactor
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -47,8 +48,8 @@ func setRepoCap(ctx context.Context, t *testing.T, pool *pgxpool.Pool, repo, lim
 }
 
 // guardRefusalFor is the refusal the guard makes for sessionID against
-// repo's cap limit, having spent spent.
-func guardRefusalFor(t *testing.T, sessionID pgtype.UUID, repo, limit, spent string) sessionguard.Refusal {
+// repo's cap limit, having spent spent, with turns turns: the crossing.
+func guardRefusalFor(t *testing.T, sessionID pgtype.UUID, repo, limit, spent string, turns int64) sessionguard.Refusal {
 	t.Helper()
 	c, err := sessionguard.ParseMicroUSD(limit)
 	if err != nil {
@@ -59,7 +60,7 @@ func guardRefusalFor(t *testing.T, sessionID pgtype.UUID, repo, limit, spent str
 		t.Fatal(err)
 	}
 	return sessionguard.Refusal{Reason: sessionguard.ReasonSpendCap, SessionID: sessionID.Bytes, Cap: c, Spent: s,
-		Source: sessionguard.CapSource{Kind: sessionguard.CapSourceRepo, Name: repo, ID: repo}}
+		Source: sessionguard.CapSource{Kind: sessionguard.CapSourceRepo, Name: repo, ID: repo}, Turns: turns}
 }
 
 // admitTurn creates a pending turn the way a writer outside the actor
@@ -238,7 +239,7 @@ func TestSpendCap_OvershootIsBoundedByTheTurnInFlight(t *testing.T) {
 	if spent != "1.400000" {
 		t.Fatalf("spend = %s, want 1.400000: the turn in flight's own cost past the cap, and nothing more", spent)
 	}
-	want := guardRefusalFor(t, sessionID, repo, "1.00", "1.40")
+	want := guardRefusalFor(t, sessionID, repo, "1.00", "1.40", 3)
 	atID, warnings, notices := guardCounts(ctx, t, pool, sessionID, want)
 	if atID != 1 || notices != 1 {
 		t.Fatalf("warnings at the crossing's id = %d (of %d), notices = %d; want one of each", atID, warnings, notices)
@@ -429,10 +430,11 @@ func TestSpendCap_OneWarningAndOneNoticePerCrossing(t *testing.T) {
 	if _, err := pool.Exec(ctx, `INSERT INTO turns (session_id, status, dispatched_at, completed_at, cost_usd) VALUES ($1, 'completed', now(), now(), 2)`, sessionID); err != nil {
 		t.Fatal(err)
 	}
+	// Queued before the crossing, as a turn admitted under the cap is.
+	queued := createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, "queued")
 	_ = refuseTurn(ctx, t, pool, sessionID)
 	_ = refuseTurn(ctx, t, pool, sessionID)
 
-	queued := createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, "queued")
 	seedReadySandbox(ctx, t, pool, sessionID)
 	r := newDispatchTestRegistry(t, ctx, pool, nil, &fakeSendCommander{})
 	t.Cleanup(func() { _ = r.Shutdown() })
@@ -447,7 +449,7 @@ func TestSpendCap_OneWarningAndOneNoticePerCrossing(t *testing.T) {
 		return err == nil && got.EndReason != nil
 	})
 
-	atID, warnings, notices := guardCounts(ctx, t, pool, sessionID, guardRefusalFor(t, sessionID, repo, "2.00", "2"))
+	atID, warnings, notices := guardCounts(ctx, t, pool, sessionID, guardRefusalFor(t, sessionID, repo, "2.00", "2", 2))
 	if atID != 1 || warnings != 1 || notices != 1 {
 		t.Fatalf("warnings %d (%d at the crossing's id), notices %d; want one warning and one notice for one crossing", warnings, atID, notices)
 	}
@@ -455,26 +457,191 @@ func TestSpendCap_OneWarningAndOneNoticePerCrossing(t *testing.T) {
 
 // TestSpendCap_ANewCrossingAfterARaiseNotifiesAgain: a raised cap is a new
 // crossing -- reached again, it records a warning and sends a notice of its
-// own.
+// own -- even with no turn taken in between: the turn in flight when the
+// cap was raised went on spending past the raised cap too.
 func TestSpendCap_ANewCrossingAfterARaiseNotifiesAgain(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
 	const repo = "acme/new-crossing"
 	sessionID := capReviewSession(ctx, t, pool, repo, "1.00")
-	if _, err := pool.Exec(ctx, `INSERT INTO turns (session_id, status, dispatched_at, completed_at, cost_usd) VALUES ($1, 'completed', now(), now(), 1)`, sessionID); err != nil {
+	var inFlight pgtype.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO turns (session_id, status, dispatched_at, cost_usd) VALUES ($1, 'processing', now(), 1) RETURNING id`, sessionID).Scan(&inFlight); err != nil {
 		t.Fatal(err)
 	}
 	_ = refuseTurn(ctx, t, pool, sessionID)
 
 	setRepoCap(ctx, t, pool, repo, "3.00")
-	if _, err := pool.Exec(ctx, `INSERT INTO turns (session_id, status, dispatched_at, completed_at, cost_usd) VALUES ($1, 'completed', now(), now(), 2.5)`, sessionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE turns SET cost_usd = 3.5 WHERE id = $1`, inFlight); err != nil {
 		t.Fatal(err)
 	}
 	_ = refuseTurn(ctx, t, pool, sessionID)
 
-	first, warnings, notices := guardCounts(ctx, t, pool, sessionID, guardRefusalFor(t, sessionID, repo, "1.00", "1"))
-	second, _, _ := guardCounts(ctx, t, pool, sessionID, guardRefusalFor(t, sessionID, repo, "3.00", "3.5"))
+	first, warnings, notices := guardCounts(ctx, t, pool, sessionID, guardRefusalFor(t, sessionID, repo, "1.00", "1", 1))
+	second, _, _ := guardCounts(ctx, t, pool, sessionID, guardRefusalFor(t, sessionID, repo, "3.00", "3.5", 1))
 	if first != 1 || second != 1 || warnings != 2 || notices != 2 {
 		t.Fatalf("crossings' warnings %d and %d (of %d), notices %d; want one warning and one notice for each crossing", first, second, warnings, notices)
+	}
+}
+
+// TestSpendCap_ACrossingAtACapValueSeenBeforeIsANewCrossing: a crossing is
+// the session refused after it was last admitted a turn, so a session that
+// crossed a cap, was admitted another turn once the cap was cleared, and
+// meets the same cap value again is told again -- a new warning naming what
+// it spent now, and a new notice -- whichever check meets it: a refused
+// creation, or a queued turn ended at dispatch.
+func TestSpendCap_ACrossingAtACapValueSeenBeforeIsANewCrossing(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		dispatch bool
+	}{
+		{name: "refused at creation"},
+		{name: "ended at dispatch", dispatch: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newTestPool(t)
+			const repo = "acme/same-cap-again"
+			sessionID := capReviewSession(ctx, t, pool, repo, "1.00")
+			var first pgtype.UUID
+			if err := pool.QueryRow(ctx, `INSERT INTO turns (session_id, status, dispatched_at, completed_at, cost_usd) VALUES ($1, 'completed', now(), now(), 1) RETURNING id`, sessionID).Scan(&first); err != nil {
+				t.Fatal(err)
+			}
+			_ = refuseTurn(ctx, t, pool, sessionID)
+
+			// The cap cleared, a turn admitted, the spend at $5.00, and the
+			// same cap set again.
+			if _, err := pool.Exec(ctx, `UPDATE repo_settings SET session_spend_cap_usd = NULL WHERE repo_full_name = $1`, repo); err != nil {
+				t.Fatal(err)
+			}
+			admitted := admitTurn(ctx, t, pool, sessionID, "taken while uncapped")
+			if tc.dispatch {
+				if _, err := pool.Exec(ctx, `UPDATE turns SET cost_usd = 5 WHERE id = $1`, first); err != nil {
+					t.Fatal(err)
+				}
+			} else if _, err := pool.Exec(ctx, `UPDATE turns SET status = 'completed', dispatched_at = now(), completed_at = now(), cost_usd = 4 WHERE id = $1`, admitted.ID); err != nil {
+				t.Fatal(err)
+			}
+			setRepoCap(ctx, t, pool, repo, "1.00")
+
+			commander := &fakeSendCommander{}
+			if tc.dispatch {
+				seedReadySandbox(ctx, t, pool, sessionID)
+				r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
+				t.Cleanup(func() { _ = r.Shutdown() })
+				a, err := r.GetOrSpawn(ctx, sessionID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				sendEnsureDispatched(ctx, t, a)
+				store := narvipg.NewTurnStore(pool)
+				waitUntil(t, 5*time.Second, func() bool {
+					got, err := store.Get(ctx, admitted.ID)
+					return err == nil && got.EndReason != nil && *got.EndReason == turn.EndReasonSpendCap
+				})
+			} else {
+				_ = refuseTurn(ctx, t, pool, sessionID)
+			}
+
+			before := guardRefusalFor(t, sessionID, repo, "1.00", "1", 1)
+			again := guardRefusalFor(t, sessionID, repo, "1.00", "5", 2)
+			firstAt, warnings, notices := guardCounts(ctx, t, pool, sessionID, before)
+			againAt, _, _ := guardCounts(ctx, t, pool, sessionID, again)
+			if firstAt != 1 || againAt != 1 || warnings != 2 || notices != 2 {
+				t.Fatalf("warnings %d and %d at the two crossings' ids (of %d), notices %d; want one warning and one notice for each crossing", firstAt, againAt, warnings, notices)
+			}
+			var message string
+			if err := pool.QueryRow(ctx, `SELECT payload->>'message' FROM events WHERE session_id = $1 AND message_id = $2`, sessionID, turnguard.WarningMessageID(again)).Scan(&message); err != nil {
+				t.Fatal(err)
+			}
+			if message != sessionguard.Text(again) {
+				t.Fatalf("the new crossing's warning = %q, want %q: it names what the session spent now", message, sessionguard.Text(again))
+			}
+			if n := promptCount(commander); n != 0 {
+				t.Fatalf("prompts sent = %d, want none", n)
+			}
+		})
+	}
+}
+
+// TestSpendCap_AWorkflowAttemptEndedAtDispatchEscalatesItsRun: a queued
+// attempt a workflow run tracks, ended at dispatch because the session has
+// spent its cap, finishes its step run and escalates its run to
+// needs_review, with the guard's escalation notice as the crossing's one
+// notice -- the run named, its review asked for, that it will not resume
+// on its own, and the guard's text -- and no guard notice beside it. The
+// attempt gets its undelivered execution_complete, nothing is sent to the
+// sandbox, one warning is recorded, and the session reads completed.
+func TestSpendCap_AWorkflowAttemptEndedAtDispatchEscalatesItsRun(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	const repo = "acme/workflow-at-dispatch"
+	sessionID := capReviewSession(ctx, t, pool, repo, "1.00")
+	if _, err := pool.Exec(ctx, `INSERT INTO turns (session_id, status, dispatched_at, completed_at, cost_usd) VALUES ($1, 'completed', now(), now(), 1.5)`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	attempt := createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, "the workflow's next attempt")
+	run := workflowStepWithBlockedSelfEdge(ctx, t, pool, sessionID, attempt, "test-guard-ended-attempt")
+	seedReadySandbox(ctx, t, pool, sessionID)
+
+	commander := &fakeSendCommander{}
+	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendEnsureDispatched(ctx, t, a)
+	store := narvipg.NewTurnStore(pool)
+	waitUntil(t, 5*time.Second, func() bool {
+		got, err := store.Get(ctx, attempt.ID)
+		return err == nil && got.EndReason != nil
+	})
+
+	if got, err := store.Get(ctx, attempt.ID); err != nil || *got.EndReason != turn.EndReasonSpendCap || got.DispatchedAt.Valid {
+		t.Fatalf("the attempt: %+v (%v); want ended spend_cap, never dispatched", got, err)
+	}
+	workflows := narvipg.NewWorkflowStore(pool)
+	runRow, err := workflows.GetRun(ctx, run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(runRow.Status) != "needs_review" {
+		t.Fatalf("run status = %q, want needs_review", runRow.Status)
+	}
+	var stepStatus string
+	var finished bool
+	if err := pool.QueryRow(ctx, `SELECT status::text, finished_at IS NOT NULL FROM workflow_step_runs WHERE workflow_run_id = $1`, run.ID).Scan(&stepStatus, &finished); err != nil {
+		t.Fatal(err)
+	}
+	if stepStatus == "running" || !finished {
+		t.Fatalf("step run %s (finished %v), want finished: the attempt is no longer live", stepStatus, finished)
+	}
+
+	want := guardRefusalFor(t, sessionID, repo, "1.00", "1.5", 2)
+	var notice string
+	if err := pool.QueryRow(ctx, `SELECT payload->>'text' FROM outbox WHERE session_id = $1 AND kind = $2`, sessionID, string(ports.NotificationKindGitHubWorkflowDecision)).Scan(&notice); err != nil {
+		t.Fatalf("the run's escalation notice: %v", err)
+	}
+	for _, part := range []string{"This workflow run (" + run.ID.String() + ") now needs your review", "will not resume on its own", sessionguard.Text(want)} {
+		if !strings.Contains(notice, part) {
+			t.Errorf("escalation notice %q does not say %q", notice, part)
+		}
+	}
+	atID, warnings, notices := guardCounts(ctx, t, pool, sessionID, want)
+	if atID != 1 || warnings != 1 || notices != 0 {
+		t.Fatalf("warnings %d (%d at the crossing's id), guard notices %d; want one warning and no guard notice beside the run's", warnings, atID, notices)
+	}
+	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'execution_complete' AND payload->>'delivered' = 'false'`, sessionID); n != 1 {
+		t.Fatalf("undelivered execution_complete events = %d, want 1", n)
+	}
+	if n := promptCount(commander); n != 0 {
+		t.Fatalf("prompts sent = %d, want none", n)
+	}
+	sessionRow, err := narvipg.NewSessionStore(pool).Get(ctx, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sessionRow.Status != sqlcgen.SessionStatusCompleted {
+		t.Fatalf("session status = %q, want completed: a turn ended at the cap fails nothing", sessionRow.Status)
 	}
 }

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -114,7 +115,8 @@ func micro(t *testing.T, s string) sessionguard.MicroUSD {
 // cost_usd over the session's dispatched turns -- a cost on a turn never
 // dispatched, which no writer produces (TestEveryTurnCostWriterTargetsA
 // ProcessingTurn), is not read, a turn with no cost adds nothing, and
-// another session's turns are not the session's.
+// another session's turns are not the session's. The turn count is every
+// turn of the session, dispatched or not.
 func TestSessionGuardFacts_SumsDispatchedTurnsOnly(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -159,6 +161,9 @@ func TestSessionGuardFacts_SumsDispatchedTurnsOnly(t *testing.T) {
 			}
 			if facts.AutomationCap != nil || facts.RepoCap != nil {
 				t.Fatalf("caps = %v, %v for a session with none", facts.AutomationCap, facts.RepoCap)
+			}
+			if facts.Turns != int64(len(tc.turns)) {
+				t.Fatalf("turns = %d, want %d: every turn of the session, dispatched or not, and none of another's", facts.Turns, len(tc.turns))
 			}
 		})
 	}
@@ -422,4 +427,41 @@ func TestCreateAndArmDispatch_RefusesWithoutAnAdmission(t *testing.T) {
 			t.Fatalf("the session's row is still locked after a refused CreateLockedTurn: %v", err)
 		}
 	})
+}
+
+// TestLockedTurnCreator_AdmitsUnderTheLock: CreateLockedTurn runs its
+// admission inside the transaction that holds the session's row lock, after
+// taking it -- so the guard's read sees every step cost committed by a
+// transaction that held the lock before it, and none can be written while
+// it decides. Asked from another connection while the admission runs, the
+// lock cannot be had.
+func TestLockedTurnCreator_AdmitsUnderTheLock(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+	prompt := "review the release"
+
+	var probeErr error
+	probed := false
+	_, err := narvipg.NewLockedTurnCreator(pool).CreateLockedTurn(ctx, sqlcgen.CreateTurnParams{SessionID: sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &prompt},
+		func(ctx context.Context, tx pgx.Tx) (sessionguard.Admission, error) {
+			probed = true
+			other, err := pool.Begin(ctx)
+			if err != nil {
+				return sessionguard.Admission{}, err
+			}
+			defer func() { _ = other.Rollback(ctx) }()
+			_, probeErr = other.Exec(ctx, `SELECT 1 FROM sessions WHERE id = $1 FOR UPDATE NOWAIT`, sessionID)
+			return admitForTest(sessionID)(ctx, tx)
+		})
+	if err != nil {
+		t.Fatalf("CreateLockedTurn: %v", err)
+	}
+	if !probed {
+		t.Fatal("the admission was never asked")
+	}
+	var pgErr *pgconn.PgError
+	if !errors.As(probeErr, &pgErr) || pgErr.Code != "55P03" {
+		t.Fatalf("locking the session's row from another connection during the admission = %v, want lock_not_available (55P03): the admission runs before the lock is taken", probeErr)
+	}
 }

@@ -22,9 +22,11 @@ import (
 // §40.1) is acknowledged 200 without releasing the delivery's claim -- a
 // redelivery would only meet the same refusal until an administrator raises
 // the cap -- creates no turn, leaves mention_count alone, and is answered on
-// the pull request with the refusal's own text. The crossing's warning and
-// its one notice are recorded once: a second refused mention replies again
-// and records nothing new.
+// the pull request with the refusal's own text. The crossing's warning is
+// recorded once, and the reply on the pull request, the session's own
+// channel, is the crossing's one telling: no outbox notice posts the same
+// text there again. A second refused mention replies again and records
+// nothing new.
 func TestGitHubMention_AtSpendCap_AcknowledgedClaimKeptHonestReply(t *testing.T) {
 	ctx := context.Background()
 
@@ -60,6 +62,7 @@ func TestGitHubMention_AtSpendCap_AcknowledgedClaimKeptHonestReply(t *testing.T)
 	refusal := sessionguard.Refusal{
 		Reason: sessionguard.ReasonSpendCap, SessionID: sessionID.Bytes, Cap: 1_000_000, Spent: 1_250_000,
 		Source: sessionguard.CapSource{Kind: sessionguard.CapSourceRepo, Name: repoFullName, ID: repoFullName},
+		Turns:  1,
 	}
 
 	for i, deliveryID := range []string{"delivery-spend-cap-2", "delivery-spend-cap-3"} {
@@ -104,7 +107,7 @@ func TestGitHubMention_AtSpendCap_AcknowledgedClaimKeptHonestReply(t *testing.T)
 	if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE session_id = $1 AND kind = $2`, sessionID, string(ports.NotificationKindGitHubSessionGuard)).Scan(&notices); err != nil {
 		t.Fatal(err)
 	}
-	if warnings != 1 || notices != 1 {
-		t.Errorf("warnings %d, notices %d; want the crossing's one of each", warnings, notices)
+	if warnings != 1 || notices != 0 {
+		t.Errorf("warnings %d, notices %d; want the crossing's warning, and no notice beside the replies on the pull request", warnings, notices)
 	}
 }

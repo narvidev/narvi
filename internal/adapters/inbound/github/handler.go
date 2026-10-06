@@ -11,12 +11,14 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/automation"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/releasereview"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
 	appreviewverdict "github.com/narvidev/narvi/internal/app/reviewverdict"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/knowledge"
 	"github.com/narvidev/narvi/internal/domain/reposource"
@@ -1000,7 +1002,10 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 			return
 		}
 
-		session, turn, isNew, err := coalescer.CreateOrJoin(ctx, m.RepoFullName, m.PRNumber, req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
+		// Answered on this pull request (technical plan §40.1): a refusal of
+		// the review session tells its channel here (sessionguardreply.go),
+		// and no notice repeats it.
+		session, turn, isNew, err := coalescer.CreateOrJoin(turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceGithub), m.RepoFullName, m.PRNumber, req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
 		if err != nil {
 			if errors.Is(err, ErrActorNotAuthorized) {
 				// ErrActorNotAuthorized fires for TWO distinct reasons

@@ -202,12 +202,13 @@ func advance(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, def wor
 // refusal is answered by who asked (deps.Origin):
 //
 //   - the session actor's own advance (sessionguard.OriginAutomatic): the
-//     run escalates to needs_review with the guard's text as its one
-//     notice, and the session records the crossing's warning, with the
-//     guard's own notice only when the escalation sent none -- the run
-//     was notified already, say -- so the crossing is told once. The
-//     escalated Outcome is returned with no error: the session now waits
-//     on a person, and nothing failed.
+//     run escalates to needs_review, its one notice the guard's escalation
+//     notice (sessionGuardNoticeText: the run needs review, will not resume
+//     on its own, and why), and the session records the crossing's
+//     warning, with the guard's own notice only when the escalation sent
+//     none -- the run was notified already, say -- so the crossing is told
+//     once. The escalated Outcome is returned with no error: the session
+//     now waits on a person, and it has not failed.
 //   - a person's decision (sessionguard.OriginPerson): the refusal, a
 //     *sessionguard.Refusal, is returned as the error, and the decide
 //     endpoint answers 409 and rolls the decision back.
@@ -222,7 +223,7 @@ func admitNextAttempt(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun
 	if deps.Origin != sessionguard.OriginAutomatic {
 		return sessionguard.Admission{}, nil, refusal
 	}
-	escalated, notified, err := escalateRunNotified(ctx, deps, runRow, sessionRow, sessionguard.Text(*refusal))
+	escalated, notified, err := escalateRunNotified(ctx, deps, runRow, sessionRow, sessionGuardNoticeText(runRow.ID, *refusal))
 	if err != nil {
 		return sessionguard.Admission{}, nil, err
 	}

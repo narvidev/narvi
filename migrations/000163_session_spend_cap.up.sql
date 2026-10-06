@@ -18,8 +18,13 @@
 --
 -- NULL is "no cap", today's exact behavior, and the only spelling of it:
 -- a cap of zero or less permits nothing, so it is refused when written
--- (technical plan §37) -- by the write path's own validator, which answers
--- 400, and by the CHECK constraints below, which back it. NUMERIC(10, 2),
+-- (technical plan §37) -- by the write path's own validator
+-- (sessionguard.ValidateSessionSpendCap), which answers 400, and by the
+-- CHECK constraints below, which back it. So is a cap that is no number:
+-- NUMERIC orders NaN above every number, so "> 0" alone would admit a NaN,
+-- which the guard cannot compare and would answer with a failed read on
+-- every turn of the sessions it caps; "< 'Infinity'" refuses it, and the
+-- infinities, which NUMERIC(10, 2) cannot hold anyway. NUMERIC(10, 2),
 -- for the reason migrations/000085 gives for the review cost budget, the
 -- first ceiling a person types in dollars: a NUMERIC compares exactly, a
 -- float does not. The guard compares in integer micro-dollars.
@@ -102,11 +107,11 @@ DO $$
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'repo_settings_session_spend_cap_usd_positive') THEN
         ALTER TABLE repo_settings ADD CONSTRAINT repo_settings_session_spend_cap_usd_positive
-            CHECK (session_spend_cap_usd > 0);
+            CHECK (session_spend_cap_usd > 0 AND session_spend_cap_usd < 'Infinity');
     END IF;
     IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'automations_session_spend_cap_usd_positive') THEN
         ALTER TABLE automations ADD CONSTRAINT automations_session_spend_cap_usd_positive
-            CHECK (session_spend_cap_usd > 0);
+            CHECK (session_spend_cap_usd > 0 AND session_spend_cap_usd < 'Infinity');
     END IF;
     IF EXISTS (
         SELECT 1 FROM pg_index

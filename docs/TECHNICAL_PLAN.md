@@ -7267,20 +7267,39 @@ the turns queued behind the one in flight (a bot's mention, the review button, t
 would each dispatch after the crossing.
 
 **What a refusal does, by site.** The session is **not** failed and **not** cancelled. A person's or a
-bot's prompt inserts nothing: REST and MCP answer 409 with `{"error": <text>, "reason": "spend_cap"}`,
-the chat surface and the issue tracker reply honestly, and the code host acknowledges 200, keeps the
-delivery claim and replies on the pull request. A plan approval is refused the same way, and the plan
-stays awaiting approval. A workflow advance escalates the run to `needs_review`, its one escalation
-notice carrying the guard's text; a person's decision on a step is answered 409 and rolls back. The
-automatic re-review drops that firing, spending none of the pull request's re-review budget and keeping
-the pushed head for the next push. An owed review request is dropped and its requester told once. The
-composition review is declined for the cycle. Every refusal records a persisted `warning` event, one
-per crossing — its message id derives from the session, the cap and where the cap was set — that says
-the cap was reached and names the value, and the first time that warning is written, one outbox notice
-goes to the session's own channel (none for a web- or MCP-origin session, whose warning is its
-surface). The session keeps its sandbox under §2's ordinary idle rules, and an admin or maintainer
-raising the cap (an audited write) re-admits the next turn. §3.1's taxonomy is preserved: a capped
-session is a session waiting on a human, not a failed one.
+bot's prompt inserts nothing. REST answers 409 with `{"error": <text>, "reason": "spend_cap"}`; MCP,
+per §43.8, returns the same text as an `isError` tool result, with no `reason` key. The chat surface and
+the issue tracker reply honestly, and the code host acknowledges 200, keeps the delivery claim and
+replies on the pull request. A plan approval is refused the same way, and the plan stays awaiting
+approval. A workflow advance escalates the run to `needs_review`, and its one escalation notice says
+three things: the run needs review; it will not resume on its own even once the cap is raised (a person
+sends the next turn); and the guard's text. A queued attempt ended at dispatch sends the same notice. A
+person's decision on a step is answered 409 and rolls back. The automatic
+re-review drops that firing, spending none of the pull request's re-review budget and keeping the
+pushed head for the next push. An owed review request is dropped before anything is read for it (the
+requester's authorization, the pull request, the composed prompt), and its requester is told once. The
+composition review is declined for the cycle. The session keeps whatever sandbox it has under §2's
+ordinary idle rules, and an admin or maintainer raising the cap (an audited write) re-admits the next
+turn. §3.1's taxonomy is preserved: a capped session is a session waiting on a human, not a failed one.
+
+**One warning and one telling per crossing.** A crossing is the session refused after it was last
+admitted a turn, under one cap. Every refusal records a persisted `warning` event at a message id
+derived from the session, the cap, where the cap was set and the session's turn count, so every
+refusal of one crossing writes one warning, and a crossing after the session took another turn writes
+a new one, even at a cap value it crossed before. A cap moved away and back with no turn taken in
+between is the same crossing. The text is true on every path that emits it: it names the spend and the
+cap, says a turn already running is left to finish and counted (so the spend shown can be past the
+cap) and that the figure is a lower bound, and that the session has not failed. The first time a
+crossing's warning is written, its channel is told once:
+- When the refused request came in on the session's own channel — a reply in its chat thread, a
+  prompt or verdict on its issue-tracker agent session, a mention on its pull request — the reply
+  there is the telling, and no outbox notice is enqueued.
+- Otherwise, one outbox notice goes to the session's own channel. This covers a REST or MCP request,
+  a reply only the clicking or submitting person sees (a plan button, the Request-changes modal), and
+  an automatic producer.
+- A web- or MCP-origin session has no channel: its warning is its surface.
+- When a workflow escalation tells the crossing in the same transaction, the guard enqueues no
+  notice of its own.
 
 **Who the cap applies to, and why this inverts §24.6's rule.** §24.6 exempts the human's manual
 re-trigger from the automatic re-review budget, because that budget exists to stop a *loop*, and a

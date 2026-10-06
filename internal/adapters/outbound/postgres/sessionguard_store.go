@@ -14,8 +14,8 @@ import (
 
 // SessionGuardStore reads what the session guard decides on
 // (internal/domain/sessionguard, technical plan §40.1): a session's
-// recorded spend and the caps that apply to it. A thin wrapper around
-// GetSessionGuardFacts; the decision is the domain's.
+// recorded spend, its turn count and the caps that apply to it. A thin
+// wrapper around GetSessionGuardFacts; the decision is the domain's.
 type SessionGuardStore struct {
 	q *sqlcgen.Queries
 }
@@ -31,8 +31,8 @@ func (s *SessionGuardStore) WithTx(tx pgx.Tx) *SessionGuardStore {
 	return &SessionGuardStore{q: s.q.WithTx(tx)}
 }
 
-// Facts reads sessionID's spend and caps (GetSessionGuardFacts's doc
-// comment says what each is and why the read is exact under the session's
+// Facts reads sessionID's spend, turn count and caps (GetSessionGuardFacts's
+// doc comment says what each is and why the read is exact under the session's
 // row lock). repoFullNames are the owner/name of the repositories the
 // session's clone URLs name; the session's pull-request claims are read
 // beside them. The amounts convert to micro-dollars exactly, and an amount
@@ -57,6 +57,7 @@ func (s *SessionGuardStore) Facts(ctx context.Context, sessionID pgtype.UUID, re
 		SessionID:  row.SessionID.Bytes,
 		ObservedAt: row.ObservedAt.Time,
 		SpentUSD:   spent,
+		Turns:      row.TurnCount,
 	}
 	if row.AutomationCapUsd != "" {
 		limit, err := sessionguard.ParseMicroUSD(row.AutomationCapUsd)

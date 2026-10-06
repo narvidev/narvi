@@ -139,11 +139,37 @@ func (b *Bound) Record(ctx context.Context, sessionRow sqlcgen.Session, r *sessi
 	return out, nil
 }
 
+// answeredOnKey is the context key AnsweredOnChannel sets.
+type answeredOnKey struct{}
+
+// AnsweredOnChannel returns ctx marked as a request that came in on, and
+// whose refusal the caller answers on, the channel of a session whose
+// spawn source is source: a reply in a chat thread answered in that thread,
+// a prompt on an issue tracker's agent session answered there, a mention on
+// a pull request answered on it. RecordRefusal then enqueues no notice for
+// a refusal of a session of that source: the caller's reply is that
+// session's channel told, and a notice beside it would say the same thing
+// again in the same place. A caller that answers somewhere else -- a REST
+// or MCP response, a private reply to the one person who clicked or
+// submitted -- leaves ctx unmarked, and the channel gets the notice.
+func AnsweredOnChannel(ctx context.Context, source sqlcgen.SessionSpawnSource) context.Context {
+	return context.WithValue(ctx, answeredOnKey{}, source)
+}
+
+// answeredOnSessionChannel reports whether ctx was marked by
+// AnsweredOnChannel with sessionRow's own spawn source.
+func answeredOnSessionChannel(ctx context.Context, sessionRow sqlcgen.Session) bool {
+	source, ok := ctx.Value(answeredOnKey{}).(sqlcgen.SessionSpawnSource)
+	return ok && source == sessionRow.SpawnSource
+}
+
 // RecordRefusal records r for sessionID outside the session actor, after
 // the refusing transaction rolled back: a person's or bot's turn refused at
 // creation, a plan approval or workflow decision refused, the composition
 // review declined. In a transaction of its own it takes the session's row
-// lock, records the warning and, when it is new, the notice (Bound.Record),
+// lock, records the warning and, when it is new, the notice (Bound.Record)
+// -- unless the caller answers the refusal on the session's own channel
+// (AnsweredOnChannel), whose reply is then the crossing's one telling --
 // commits, and broadcasts the warning to the session's live subscribers.
 // Best effort: the refusal has been answered already, so a failure here is
 // logged and changes nothing the caller returns. The caller must not hold
@@ -177,7 +203,7 @@ func (g *Guard) recordRefusal(ctx context.Context, sessionID pgtype.UUID, r *ses
 	if err != nil {
 		return Recorded{}, fmt.Errorf("turnguard: read the session: %w", err)
 	}
-	recorded, err := g.WithTx(tx, nil).Record(ctx, sessionRow, r, true)
+	recorded, err := g.WithTx(tx, nil).Record(ctx, sessionRow, r, !answeredOnSessionChannel(ctx, sessionRow))
 	if err != nil {
 		return Recorded{}, err
 	}

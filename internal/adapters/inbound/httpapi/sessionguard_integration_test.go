@@ -54,9 +54,15 @@ func seedSpendCap(ctx context.Context, t *testing.T, pool *pgxpool.Pool, session
 	}
 }
 
-// expectedRefusal is the refusal the guard makes for seed on sessionID.
-func expectedRefusal(t *testing.T, sessionID pgtype.UUID, seed spendCapSeed) sessionguard.Refusal {
+// expectedRefusal is the refusal the guard makes for seed on sessionID,
+// with the turns the session has now: a refusal inserts none, so this is
+// its crossing once it was refused.
+func expectedRefusal(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, seed spendCapSeed) sessionguard.Refusal {
 	t.Helper()
+	var turns int64
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM turns WHERE session_id = $1`, sessionID).Scan(&turns); err != nil {
+		t.Fatalf("count the session's turns: %v", err)
+	}
 	limit, err := sessionguard.ParseMicroUSD(seed.cap)
 	if err != nil {
 		t.Fatal(err)
@@ -68,6 +74,7 @@ func expectedRefusal(t *testing.T, sessionID pgtype.UUID, seed spendCapSeed) ses
 	return sessionguard.Refusal{
 		Reason: sessionguard.ReasonSpendCap, SessionID: sessionID.Bytes, Cap: limit, Spent: spent,
 		Source: sessionguard.CapSource{Kind: sessionguard.CapSourceRepo, Name: seed.repo, ID: seed.repo},
+		Turns:  turns,
 	}
 }
 
@@ -163,7 +170,7 @@ func TestSpendCap_RefusesEveryoneRegardlessOfWhoAsked(t *testing.T) {
 // (wantTurns), no dispatch timer, and one warning at the crossing's id.
 func assertSpendCapRefusal(ctx context.Context, t *testing.T, rig testRig, sessionID pgtype.UUID, seed spendCapSeed, status int, body refusalBody, wantTurns int) {
 	t.Helper()
-	want := expectedRefusal(t, sessionID, seed)
+	want := expectedRefusal(ctx, t, rig.pool, sessionID, seed)
 	if status != http.StatusConflict {
 		t.Fatalf("status = %d, want 409", status)
 	}
@@ -252,7 +259,7 @@ func TestSpendCap_RaisedCapReadmitsTheNextTurn(t *testing.T) {
 	}
 	raised := seed
 	raised.cap = "5.00"
-	if all, atID := guardWarnings(ctx, t, rig.pool, session.ID, turnguard.WarningMessageID(expectedRefusal(t, session.ID, raised))); all != 2 || atID != 1 {
+	if all, atID := guardWarnings(ctx, t, rig.pool, session.ID, turnguard.WarningMessageID(expectedRefusal(ctx, t, rig.pool, session.ID, raised))); all != 2 || atID != 1 {
 		t.Fatalf("warnings = %d (%d at the new crossing's id), want two, one a crossing", all, atID)
 	}
 }
@@ -280,10 +287,10 @@ func TestSpendCap_CreateResponseIsTheRefusalText(t *testing.T) {
 	if err := json.Unmarshal(raw["error"], &text); err != nil {
 		t.Fatal(err)
 	}
-	if want := sessionguard.Text(expectedRefusal(t, session.ID, seed)); text != want {
+	if want := sessionguard.Text(expectedRefusal(ctx, t, rig.pool, session.ID, seed)); text != want {
 		t.Fatalf("error = %q, want %q", text, want)
 	}
-	if fmt.Sprint(expectedRefusal(t, session.ID, seed).Spent) != "$0.75" {
+	if fmt.Sprint(expectedRefusal(ctx, t, rig.pool, session.ID, seed).Spent) != "$0.75" {
 		t.Fatal("the refusal reads the session's spend wrong")
 	}
 }
@@ -321,7 +328,7 @@ func TestDecidePlan_AtSpendCap_PlanStaysAwaiting(t *testing.T) {
 	if n := countSessionTurns(ctx, t, rig.pool, session.ID); n != 2 {
 		t.Fatalf("turns = %d, want the spend's and the plan's: no implementation turn", n)
 	}
-	if all, atID := guardWarnings(ctx, t, rig.pool, session.ID, turnguard.WarningMessageID(expectedRefusal(t, session.ID, seed))); all != 1 || atID != 1 {
+	if all, atID := guardWarnings(ctx, t, rig.pool, session.ID, turnguard.WarningMessageID(expectedRefusal(ctx, t, rig.pool, session.ID, seed))); all != 1 || atID != 1 {
 		t.Fatalf("warnings = %d (%d at the crossing's id), want one", all, atID)
 	}
 
@@ -337,7 +344,8 @@ func TestDecidePlan_AtSpendCap_PlanStaysAwaiting(t *testing.T) {
 // TestDecideWorkflowStep_AtSpendCap_409AndRolledBack: a person approving or
 // revising a workflow step of a session past its cap is answered 409 with
 // the typed reason, and the decision rolls back: the step stays awaiting
-// its decision, no attempt is created, and the run is not escalated.
+// its decision, no attempt is created, and the run is not escalated. The
+// crossing's warning is recorded.
 func TestDecideWorkflowStep_AtSpendCap_409AndRolledBack(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct{ name, body string }{
@@ -354,7 +362,7 @@ func TestDecideWorkflowStep_AtSpendCap_409AndRolledBack(t *testing.T) {
 
 			var got refusalBody
 			status := rig.doJSON(t, http.MethodPost, decidePath(runID, stepRunID), []byte(tc.body), &got, token)
-			if status != http.StatusConflict || got.Reason != "spend_cap" || got.Error != sessionguard.Text(expectedRefusal(t, session.ID, seed)) {
+			if status != http.StatusConflict || got.Reason != "spend_cap" || got.Error != sessionguard.Text(expectedRefusal(ctx, t, rig.pool, session.ID, seed)) {
 				t.Fatalf("status %d, body %+v; want 409 with the refusal", status, got)
 			}
 			stepRun, err := rig.workflows.GetStepRun(ctx, stepRunID)
@@ -380,6 +388,9 @@ func TestDecideWorkflowStep_AtSpendCap_409AndRolledBack(t *testing.T) {
 			}
 			if n := countSessionTurns(ctx, t, rig.pool, session.ID); n != 1 {
 				t.Fatalf("turns = %d, want the spend's alone", n)
+			}
+			if all, atID := guardWarnings(ctx, t, rig.pool, session.ID, turnguard.WarningMessageID(expectedRefusal(ctx, t, rig.pool, session.ID, seed))); all != 1 || atID != 1 {
+				t.Fatalf("warnings = %d (%d at the crossing's id), want one: a person's refused decision is recorded", all, atID)
 			}
 		})
 	}

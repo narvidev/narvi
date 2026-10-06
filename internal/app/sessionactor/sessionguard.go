@@ -118,8 +118,9 @@ func endReasonForRefusal(r *sessionguard.Refusal) (string, error) {
 //     of attempts skip it; with a synthetic execution_complete marked
 //     "delivered": false -- no prompt was sent;
 //   - a turn the workflow engine tracks ends its step run through
-//     OnTurnRefused, which escalates the run with the guard's text as its
-//     one notice;
+//     OnTurnRefusedBySessionGuard, which escalates the run with the
+//     guard's escalation notice as its one notice -- the one a refused
+//     advance sends too;
 //   - the session's status is re-derived with every ended turn ignored, so
 //     it reads its last real turn's outcome, never failed;
 //   - then the crossing's warning, and its one notice when the warning is
@@ -166,7 +167,7 @@ func (a *Actor) endPendingTurnsIfGuardClosed(ctx context.Context, tx pgx.Tx, ses
 		}); err != nil {
 			return false, fmt.Errorf("sessionactor: update turn status: %w", err)
 		}
-		if workflowengine.OnTurnRefused(ctx, a.workflowDeps(tx), sessionRow, target.ID, text) {
+		if workflowengine.OnTurnRefusedBySessionGuard(ctx, a.workflowDeps(tx), sessionRow, target.ID, *refusal) {
 			escalationNotified = true
 		}
 		if turn.RequiresSyntheticExecutionComplete(turn.TriggerAbandon) {

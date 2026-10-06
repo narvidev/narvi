@@ -824,7 +824,9 @@ func handleEvent(ctx context.Context, deps Deps, logger *slog.Logger, ev slackEv
 		if planID, hasAwaiting := findAwaitingApprovalPlanID(ctx, logger, deps.Plans, res.SessionID); hasAwaiting {
 			awaitingPlanID = planID
 			if verdict, verdictOK := plandomain.MatchVerdict(prompt); verdictOK {
-				return deps.handlePlanVerdict(ctx, logger, channel, key, res.SessionID, planID, verdict, actorUserID)
+				// Answered in this thread (technical plan §40.1): a refusal
+				// tells the session's channel here, and no notice repeats it.
+				return deps.handlePlanVerdict(turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceSlack), logger, channel, key, res.SessionID, planID, verdict, actorUserID)
 			}
 			if feedback, reviseOK := plandomain.MatchRevise(prompt); reviseOK {
 				// plandomain.IsBlankFeedback (LOW audit fix, confirmed finding
@@ -875,7 +877,9 @@ func handleEvent(ctx context.Context, deps Deps, logger *slog.Logger, ev slackEv
 		logger.Info("slack: revise: reply had empty feedback, blocked by awaiting-approval plan guard", "session_id", res.SessionID)
 	} else {
 		var err error
-		createdTurn, created, err = addTurn(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.IntentClassifier, deps.AuditLog, deps.Registry, deps.SessionGuard, res.SessionID, prompt, planMode, deps.EpistemicCheckDefault, actorUserID)
+		// Answered in this thread (technical plan §40.1): a refusal tells the
+		// session's channel here, and no notice repeats it.
+		createdTurn, created, err = addTurn(turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceSlack), deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.IntentClassifier, deps.AuditLog, deps.Registry, deps.SessionGuard, res.SessionID, prompt, planMode, deps.EpistemicCheckDefault, actorUserID)
 		if err != nil {
 			if refusal, ok := sessionguard.AsRefusal(err); ok {
 				// The session has spent its cap: a deterministic state, not a

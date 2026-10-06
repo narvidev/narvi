@@ -16,7 +16,8 @@ import (
 // migrated to the version before it first. The up adds technical plan
 // §40.1's caps -- repo_settings.session_spend_cap_usd and
 // automations.session_spend_cap_usd, NUMERIC(10, 2), NULL for no cap --
-// their CHECK constraints, which refuse a cap of zero or less, and
+// their CHECK constraints, which refuse a cap of zero or less and one that
+// is no number, and
 // automation_runs_session_id_idx, which the session guard reads a session's
 // automation through; the down removes them.
 //
@@ -119,7 +120,7 @@ func assertSpendCapSchema(ctx context.Context, t *testing.T, db *sql.DB) {
 		if shape := got.columns[table+".session_spend_cap_usd"]; shape != "YES numeric(10,2)" {
 			t.Errorf("%s.session_spend_cap_usd = %q, want a nullable NUMERIC(10, 2)", table, shape)
 		}
-		if def := got.constraints[table+"_session_spend_cap_usd_positive"]; def != "CHECK ((session_spend_cap_usd > (0)::numeric))" {
+		if def := got.constraints[table+"_session_spend_cap_usd_positive"]; def != "CHECK (((session_spend_cap_usd > (0)::numeric) AND (session_spend_cap_usd < 'Infinity'::numeric)))" {
 			t.Errorf("%s's positive-cap constraint = %q", table, def)
 		}
 	}
@@ -138,8 +139,11 @@ func assertNoSpendCapSchema(ctx context.Context, t *testing.T, db *sql.DB) {
 }
 
 // TestMigration000163_UpDownUp: the up adds the columns, the constraints
-// and the index; a cap of zero or less is refused by the database itself
-// and NULL is accepted; the down removes all of it; the up runs again.
+// and the index; a cap of zero or less is refused by the database itself,
+// and so is one that is no number -- NaN, which "> 0" alone would admit
+// since NUMERIC orders it above every number, refused by the CHECK, and the
+// infinities -- and NULL is accepted; the down removes all of it; the up
+// runs again.
 func TestMigration000163_UpDownUp(t *testing.T) {
 	ctx := context.Background()
 	connStr, db := migrationTestDatabase(ctx, t, spendCapMigration-1)
@@ -155,6 +159,7 @@ func TestMigration000163_UpDownUp(t *testing.T) {
 	for i, tc := range []struct {
 		value   any
 		refused bool
+		byCheck bool
 	}{
 		{value: nil},
 		{value: "0.01"},
@@ -162,15 +167,18 @@ func TestMigration000163_UpDownUp(t *testing.T) {
 		{value: "0", refused: true},
 		{value: "0.00", refused: true},
 		{value: "-1.00", refused: true},
+		{value: "NaN", refused: true, byCheck: true},
+		{value: "Infinity", refused: true},
+		{value: "-Infinity", refused: true},
 	} {
 		_, err := db.ExecContext(ctx, `INSERT INTO repo_settings (repo_full_name, session_spend_cap_usd) VALUES ($1, $2::numeric)`,
 			fmt.Sprintf("acme/cap-check-%d", i), tc.value)
-		if (err != nil) != tc.refused {
-			t.Errorf("repo_settings cap %v: error %v, want refused %v", tc.value, err, tc.refused)
+		if (err != nil) != tc.refused || (tc.byCheck && !strings.Contains(fmt.Sprint(err), "23514")) {
+			t.Errorf("repo_settings cap %v: error %v, want refused %v (by the CHECK: %v)", tc.value, err, tc.refused, tc.byCheck)
 		}
 		_, err = db.ExecContext(ctx, `INSERT INTO automations (name, repos, session_spend_cap_usd) VALUES ('a', '[]'::jsonb, $1::numeric)`, tc.value)
-		if (err != nil) != tc.refused {
-			t.Errorf("automations cap %v: error %v, want refused %v", tc.value, err, tc.refused)
+		if (err != nil) != tc.refused || (tc.byCheck && !strings.Contains(fmt.Sprint(err), "23514")) {
+			t.Errorf("automations cap %v: error %v, want refused %v (by the CHECK: %v)", tc.value, err, tc.refused, tc.byCheck)
 		}
 	}
 

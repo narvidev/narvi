@@ -36,11 +36,10 @@
 -- predicates of turns_one_processing_per_session and
 -- turns_open_session_id_idx read; a step's cost changes cost_usd, which
 -- turns_cost_created_at_idx's predicate reads. So each such write adds one
--- entry to this index -- a descent to its leaf, at most four more buffers
--- on the tables sessionguard_plan_integration_test.go measures -- and never
--- turns a heap-only update into one that is not. A turn inserted pending,
--- and every write while it stays pending, adds nothing: it is outside the
--- predicate.
+-- entry to this index -- a descent from its root to a leaf, which
+-- sessionguard_plan_integration_test.go measures -- and never turns a
+-- heap-only update into one that is not. A turn inserted pending, and every
+-- write while it stays pending, adds nothing: it is outside the predicate.
 --
 -- # A plain build, not CONCURRENTLY
 --

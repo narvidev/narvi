@@ -30,27 +30,32 @@ const guardPlanLatestVersion = sessionDispatchedMigration
 // index probes -- the session's row, its automation's first run and the
 // automation, its pull-request claims, the repository caps -- and, for the
 // spend, a range of turns_session_dispatched_idx over the session's own
-// dispatched turns with each one's heap page while the visibility map is
-// unset, as on a table between two vacuums. Never a term in another
+// dispatched turns and, for the turn count, a range of (session_id,
+// dispatched_message_id) over all its turns, with each one's heap page
+// while the visibility map is unset, as on a table between two vacuums. Never a term in another
 // session's turns: a scan of the table reads every page of it.
 const (
 	guardReadFixedBuffers   = 60
 	guardReadBuffersPerTurn = 2
 )
 
-func guardReadMaxBuffers(ownDispatched int) float64 {
-	return float64(guardReadFixedBuffers + guardReadBuffersPerTurn*ownDispatched)
+func guardReadMaxBuffers(ownTurns int) float64 {
+	return float64(guardReadFixedBuffers + guardReadBuffersPerTurn*ownTurns)
 }
 
-// sessionDispatchedIndexEntryMaxBuffers bounds what adding a row version's
-// entry to turns_session_dispatched_idx reads: the index's metapage, its
-// root and the leaf the entry goes to -- these tables' index is one level
-// below its root -- and one page more, the leaf's right sibling when the
-// insertion moves right or the page a full leaf's split adds, which one
-// measure in a few reads.
-const sessionDispatchedIndexEntryMaxBuffers = 4
+// sessionDispatchedIndexEntryMaxBuffers is what adding one entry to
+// turns_session_dispatched_idx can read, for an index levels levels above
+// its leaves (bt_metap's level of its root): its metapage, when the
+// relation's cached copy of it is gone -- turns' description rebuilt after
+// a DROP INDEX rolled back drops it -- and one page of each level from the
+// root down to the leaf the entry goes to. Nothing more, once the measure
+// is settled (measureGuardWrite): no leaf fills while it is measured, so
+// none splits, and no dead entry is left to delete on the way.
+func sessionDispatchedIndexEntryMaxBuffers(levels int) float64 {
+	return float64(1 + levels + 1)
+}
 
-// guardPlanShape is a table TestSessionGuardFacts_ReadsTheSessionsOwnDispatchedTurns
+// guardPlanShape is a table TestSessionGuardFacts_ReadsTheSessionsOwnTurns
 // reads: others sessions of perOther dispatched, completed, costed turns
 // each, every pendingEvery-th with one pending turn more, beside a long
 // session of longDispatched such turns, plus one processing when
@@ -260,10 +265,6 @@ type guardPlanStatement struct {
 	run     func(ctx context.Context, tx pgx.Tx, p guardPlanProbe) error
 	args    func(p guardPlanProbe) string
 	applies func(p guardPlanProbe) bool
-	// writesDispatchedTurn is a write of a dispatched turn's row that is
-	// never heap-only: once turns_session_dispatched_idx is in, its new
-	// row version also gets an entry there.
-	writesDispatchedTurn bool
 }
 
 // measureGuardPlan measures statement for probe as measureHoldPlan does --
@@ -315,9 +316,68 @@ func measureGuardPlan(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sta
 	return m
 }
 
-// TestSessionGuardFacts_ReadsTheSessionsOwnDispatchedTurns measures, by
+// measureGuardWrite measures statement, a write of a turn's row, for probe
+// in mode as measureGuardPlan does, once without turns_session_dispatched_idx
+// (dropped inside each measuring transaction, which the rollback restores)
+// and once with it, on tables settled for both, and returns how many levels
+// the index has above its leaves.
+//
+// Each measure writes nine row versions of one turn (eight warm-up calls and
+// the measured one, each rolled back), and every index of turns takes an
+// entry for each. Two things in the index pages the writes reach then decide
+// what the measured write reads, rather than the write itself: a leaf that
+// fills splits, reading and writing pages a write that fits never touches;
+// and dead entries a plain VACUUM leaves behind -- it skips index cleanup
+// when few heap pages hold dead rows -- are deleted from a full leaf by the
+// write that needs the room, reading their heap pages. Which measure meets
+// either turns on where the session's entries fall in the leaves, which
+// the tables' random ids decide, so an unsettled pair of measures can
+// differ by a split on one side alone. So both measures run once
+// unmeasured first: any leaf the nine entries do not fit splits then. And
+// each measure runs on a table vacuumed with INDEX_CLEANUP ON, which removes
+// every dead entry: each leaf the measure reaches then has room for at
+// least the nine entries it takes, since it took them, or more, in the
+// unmeasured run.
+//
+// Dropping the index, even in a transaction rolled back, invalidates turns'
+// cached description, and the measured write rebuilds it, reading the
+// catalog. So the measure with the index drops another index of turns in
+// its transactions: turns_guard_measure_twin_idx, built here to hold no
+// entry (its predicate is never true) and so cost no write anything. Both
+// measures then rebuild the same description, each with one index fewer.
+// What the index adds to the measured write is then its own descent alone
+// (sessionDispatchedIndexEntryMaxBuffers).
+func measureGuardWrite(ctx context.Context, t *testing.T, pool *pgxpool.Pool, statement guardPlanStatement, probe guardPlanProbe, mode string) (without, with holdPlanMeasurement, levels int) {
+	t.Helper()
+	const (
+		dropIndex = `DROP INDEX turns_session_dispatched_idx`
+		dropTwin  = `DROP INDEX turns_guard_measure_twin_idx`
+	)
+	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS turns_guard_measure_twin_idx ON turns (id) WHERE id IS NULL`); err != nil {
+		t.Fatalf("build the measure's twin index: %v", err)
+	}
+	vacuum := func() {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `VACUUM (INDEX_CLEANUP ON) turns`); err != nil {
+			t.Fatalf("vacuum: %v", err)
+		}
+	}
+	measureGuardPlan(ctx, t, pool, statement, probe, mode, dropIndex)
+	measureGuardPlan(ctx, t, pool, statement, probe, mode, dropTwin)
+	vacuum()
+	without = measureGuardPlan(ctx, t, pool, statement, probe, mode, dropIndex)
+	vacuum()
+	with = measureGuardPlan(ctx, t, pool, statement, probe, mode, dropTwin)
+	if err := pool.QueryRow(ctx, `SELECT level FROM bt_metap('turns_session_dispatched_idx')`).Scan(&levels); err != nil {
+		t.Fatalf("read the index's levels: %v", err)
+	}
+	return without, with, levels
+}
+
+// TestSessionGuardFacts_ReadsTheSessionsOwnTurns measures, by
 // buffers read and by the scans the plan runs, the session guard's read of
-// a session's spend and caps (GetSessionGuardFacts, technical plan §40.1)
+// a session's spend, turn count and caps (GetSessionGuardFacts, technical
+// plan §40.1)
 // -- made before every turn it admits and before every queued turn's
 // dispatch -- under a custom plan and under the generic plan pgx's
 // statement cache lets Postgres settle on from a statement's sixth run, as
@@ -333,20 +393,21 @@ func measureGuardPlan(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sta
 // scan, or a bitmap heap scan whose bitmap comes from it alone), every
 // other relation is read through its key or claim index, and the buffers
 // read are at most a fixed number plus a few for each of the session's own
-// dispatched turns -- never a term in the table.
+// turns -- never a term in the table.
 //
 // It also measures, before and after migration 000164 builds that index,
 // the statements of turns it enters the plan space of. The reads of a
 // session's turns (ListTurnsForSession, GetTurnByDispatchedMessageID,
 // ReviewRetriggerHeld, GetSessionActivityFacts) read no more after; they
 // are measured first, before any write leaves a dead row version behind.
-// The writes of a dispatched turn's row (RecordTurnStepCost, and
+// The writes of a turn's row (CreateTurn, RecordTurnStepCost, and
 // UpdateTurnStatus as a dispatch and as an end) read at most
-// sessionDispatchedIndexEntryMaxBuffers more, their new entry in the
-// index: each is measured on a vacuumed table, without the index -- dropped
-// inside its measuring transactions, which the rollback restores -- and
-// then with it, so the two measures see one table.
-func TestSessionGuardFacts_ReadsTheSessionsOwnDispatchedTurns(t *testing.T) {
+// sessionDispatchedIndexEntryMaxBuffers more, their new entry's descent of
+// the index: each is measured without the index and with it, on tables
+// settled for both (measureGuardWrite), so the two measures differ by the
+// index alone. Every statement is measured serially (no parallel workers),
+// so its buffers are its plan's own.
+func TestSessionGuardFacts_ReadsTheSessionsOwnTurns(t *testing.T) {
 	const budget = 10
 	modes := []string{"force_custom_plan", "force_generic_plan"}
 
@@ -405,7 +466,18 @@ func TestSessionGuardFacts_ReadsTheSessionsOwnDispatchedTurns(t *testing.T) {
 			args: func(p guardPlanProbe) string { return fmt.Sprintf("%d, '%s'::uuid", budget, p.sessionID.String()) },
 		},
 		{
-			name: "RecordTurnStepCost", writesDispatchedTurn: true,
+			// A turn inserted pending: its row's first entry in the index.
+			name: "CreateTurn", applies: always,
+			run: func(ctx context.Context, tx pgx.Tx, p guardPlanProbe) error {
+				_, err := narvipg.NewTurnStore(nil).WithTx(tx).Create(ctx, sqlcgen.CreateTurnParams{SessionID: p.sessionID, Status: sqlcgen.TurnStatusPending})
+				return err
+			},
+			args: func(p guardPlanProbe) string {
+				return fmt.Sprintf("'%s'::uuid, 'pending', NULL, NULL, false, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, false, NULL, NULL, NULL, NULL", p.sessionID.String())
+			},
+		},
+		{
+			name:    "RecordTurnStepCost",
 			applies: func(p guardPlanProbe) bool { return p.processingTurn.Valid },
 			run: func(ctx context.Context, tx pgx.Tx, p guardPlanProbe) error {
 				_, err := narvipg.NewTurnStore(nil).WithTx(tx).RecordStepCostUSD(ctx, p.sessionID, freshStepID(), 0.01)
@@ -418,7 +490,7 @@ func TestSessionGuardFacts_ReadsTheSessionsOwnDispatchedTurns(t *testing.T) {
 		{
 			// A pending turn dispatched: dispatched_at stamped, so its new
 			// row version enters the index.
-			name: "UpdateTurnStatus", writesDispatchedTurn: true,
+			name:    "UpdateTurnStatus",
 			applies: func(p guardPlanProbe) bool { return p.pendingTurn.Valid },
 			run: func(ctx context.Context, tx pgx.Tx, p guardPlanProbe) error {
 				_, err := narvipg.NewTurnStore(nil).WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
@@ -435,7 +507,7 @@ func TestSessionGuardFacts_ReadsTheSessionsOwnDispatchedTurns(t *testing.T) {
 	// A processing turn ended -- measured on its own, by name, so its
 	// before and after are its own.
 	end := guardPlanStatement{
-		name: "UpdateTurnStatus", writesDispatchedTurn: true,
+		name:    "UpdateTurnStatus",
 		applies: func(p guardPlanProbe) bool { return p.processingTurn.Valid },
 		run: func(ctx context.Context, tx pgx.Tx, p guardPlanProbe) error {
 			_, err := narvipg.NewTurnStore(nil).WithTx(tx).UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
@@ -449,8 +521,8 @@ func TestSessionGuardFacts_ReadsTheSessionsOwnDispatchedTurns(t *testing.T) {
 		},
 	}
 	reads := unchanged[:4]
-	writes := []guardPlanStatement{unchanged[4], unchanged[5], end}
-	writeLabels := []string{"RecordTurnStepCost", "UpdateTurnStatus (dispatch)", "UpdateTurnStatus (end)"}
+	writes := []guardPlanStatement{unchanged[4], unchanged[5], unchanged[6], end}
+	writeLabels := []string{"CreateTurn", "RecordTurnStepCost", "UpdateTurnStatus (dispatch)", "UpdateTurnStatus (end)"}
 
 	for _, shape := range []guardPlanShape{
 		{name: "5,000 sessions of 6 dispatched turns, every 20th with one pending, beside one of 4,000 and one processing", others: 5_000, perOther: 6, pendingEvery: 20, longDispatched: 4_000, longProcessing: true},
@@ -463,6 +535,27 @@ func TestSessionGuardFacts_ReadsTheSessionsOwnDispatchedTurns(t *testing.T) {
 		t.Run(shape.name, func(t *testing.T) {
 			ctx := context.Background()
 			pool, _ := holdPlanDatabase(ctx, t, guardPlanLatestVersion)
+			if _, err := pool.Exec(ctx, `CREATE EXTENSION IF NOT EXISTS pageinspect`); err != nil {
+				t.Fatalf("create pageinspect, which reads the index's levels: %v", err)
+			}
+			// Every statement runs serially. A parallel plan's workers each
+			// build turns' description from the catalog as they start, and
+			// their reads count in the leader's Gather -- a few buffers that
+			// vary from run to run with what the backends have cached, and
+			// change with the index's own catalog rows, whatever the plan
+			// reads of turns. Serial, a statement's buffers are its plan's.
+			var database string
+			if err := pool.QueryRow(ctx, `SELECT current_database()`).Scan(&database); err != nil {
+				t.Fatal(err)
+			}
+			for _, statement := range []string{
+				`ALTER DATABASE ` + pgx.Identifier{database}.Sanitize() + ` SET max_parallel_workers_per_gather = 0`,
+				`SET max_parallel_workers_per_gather = 0`,
+			} {
+				if _, err := pool.Exec(ctx, statement); err != nil {
+					t.Fatalf("%s: %v", statement, err)
+				}
+			}
 			if _, err := pool.Exec(ctx, `DROP INDEX turns_session_dispatched_idx`); err != nil {
 				t.Fatalf("take away 000164's index: %v", err)
 			}
@@ -502,14 +595,14 @@ func TestSessionGuardFacts_ReadsTheSessionsOwnDispatchedTurns(t *testing.T) {
 				for _, mode := range modes {
 					got := measureGuardPlan(ctx, t, pool, guard, probe, mode, "")
 					t.Logf("GetSessionGuardFacts, %s (%d dispatched turns of %d), %s: %v", probe.name, probe.dispatched, probe.turns, mode, got)
-					if problem := guardReadProblem(got, probe.dispatched); problem != "" {
+					if problem := guardReadProblem(got, probe.turns); problem != "" {
 						t.Errorf("GetSessionGuardFacts, %s, %s: %s", probe.name, mode, problem)
 					}
 				}
 			}
 
-			// The writes, each on a vacuumed table without the index and
-			// then with it.
+			// The writes, each without the index and with it, on tables
+			// settled for both.
 			for i, statement := range writes {
 				for _, probe := range probes {
 					if !statement.applies(probe) {
@@ -517,17 +610,11 @@ func TestSessionGuardFacts_ReadsTheSessionsOwnDispatchedTurns(t *testing.T) {
 					}
 					for _, mode := range modes {
 						key := writeLabels[i] + ", " + probe.name + ", " + mode
-						if _, err := pool.Exec(ctx, `VACUUM turns`); err != nil {
-							t.Fatalf("vacuum: %v", err)
-						}
-						without := measureGuardPlan(ctx, t, pool, statement, probe, mode, `DROP INDEX turns_session_dispatched_idx`)
-						if _, err := pool.Exec(ctx, `VACUUM turns`); err != nil {
-							t.Fatalf("vacuum: %v", err)
-						}
-						with := measureGuardPlan(ctx, t, pool, statement, probe, mode, "")
-						t.Logf("%s: without 000164's index %v; with it %v", key, without, with)
-						if with.buffers > without.buffers+sessionDispatchedIndexEntryMaxBuffers {
-							t.Errorf("%s: read %.0f buffers with 000164's index, %.0f without: more than its new entry", key, with.buffers, without.buffers)
+						without, with, levels := measureGuardWrite(ctx, t, pool, statement, probe, mode)
+						limit := sessionDispatchedIndexEntryMaxBuffers(levels)
+						t.Logf("%s: without 000164's index %v; with it (%d levels above its leaves) %v", key, without, levels, with)
+						if with.buffers > without.buffers+limit {
+							t.Errorf("%s: read %.0f buffers with 000164's index, %.0f without: more than its new entry's descent, %.0f", key, with.buffers, without.buffers, limit)
 						}
 					}
 				}
@@ -537,8 +624,10 @@ func TestSessionGuardFacts_ReadsTheSessionsOwnDispatchedTurns(t *testing.T) {
 }
 
 // guardReadIndexes is the one index the guard's read may scan each
-// relation through: turns through the session's dispatched turns, every
-// other relation through its key or the session's claim on it.
+// relation through: turns, for the spend, through the session's own range
+// of turns_session_dispatched_idx (and, for the turn count, through
+// guardReadCountIndex), every other relation through its key or the
+// session's claim on it.
 var guardReadIndexes = map[string]string{
 	"turns":              "turns_session_dispatched_idx",
 	"sessions":           "sessions_pkey",
@@ -549,6 +638,11 @@ var guardReadIndexes = map[string]string{
 	"sentinel_fixes":     "sentinel_fixes_fix_child_session_id_idx",
 }
 
+// guardReadCountIndex is the index the guard's read counts the session's
+// turns through: (session_id, dispatched_message_id), 000131's, the one
+// index of turns that holds every turn of a session.
+const guardReadCountIndex = "turns_session_id_dispatched_message_id_idx"
+
 // guardSmallTableSeqScanMaxBuffers bounds the one sequential scan the
 // guard's read may run: of automations, the deployment's configured
 // automations -- a table the size of its configuration, never of its
@@ -558,31 +652,33 @@ var guardReadIndexes = map[string]string{
 const guardSmallTableSeqScanMaxBuffers = 4
 
 // guardReadProblem returns why the guard's read is not a range of the
-// session's own dispatched turns and key probes elsewhere, or "": every
+// session's own turns and key probes elsewhere, or "": every
 // scan of a relation is an index scan of its one index in
 // guardReadIndexes, or a bitmap heap scan whose bitmap comes from that
 // index alone -- never a sequential scan, nor a scan through another index,
 // automations' few pages aside (guardSmallTableSeqScanMaxBuffers) -- and
 // the buffers read are within guardReadMaxBuffers of the session's own
-// dispatched turns.
-func guardReadProblem(m holdPlanMeasurement, ownDispatched int) string {
-	if limit := guardReadMaxBuffers(ownDispatched); m.buffers > limit {
-		return fmt.Sprintf("reads %.0f buffers, over %.0f for %d dispatched turns of its own (%v)", m.buffers, limit, ownDispatched, m.scans)
+// turns.
+func guardReadProblem(m holdPlanMeasurement, ownTurns int) string {
+	if limit := guardReadMaxBuffers(ownTurns); m.buffers > limit {
+		return fmt.Sprintf("reads %.0f buffers, over %.0f for %d turns of its own (%v)", m.buffers, limit, ownTurns, m.scans)
 	}
-	allowedBitmaps := map[string]bool{}
+	allowedBitmaps := map[string]bool{guardReadCountIndex: true}
 	for _, index := range guardReadIndexes {
 		allowedBitmaps[index] = true
 	}
-	sawTurns := false
+	sawSpend, sawCount := false, false
+	saw := func(index string) {
+		sawSpend = sawSpend || index == guardReadIndexes["turns"]
+		sawCount = sawCount || index == guardReadCountIndex
+	}
 	for _, s := range m.scans {
 		switch {
 		case s.Node == "Bitmap Index Scan":
 			if !allowedBitmaps[s.Index] {
 				return fmt.Sprintf("reads a bitmap through an index it has no use for: %s", s)
 			}
-			if s.Index == guardReadIndexes["turns"] {
-				sawTurns = true
-			}
+			saw(s.Index)
 		case s.Node == "Bitmap Heap Scan":
 			// Its Bitmap Index Scans are checked above.
 		case s.Relation == "":
@@ -592,16 +688,15 @@ func guardReadProblem(m holdPlanMeasurement, ownDispatched int) string {
 			if !ok {
 				return fmt.Sprintf("scans a relation it has no use for: %s", s)
 			}
-			if (s.Node != "Index Scan" && s.Node != "Index Only Scan") || s.Index != want {
+			index := (s.Node == "Index Scan" || s.Node == "Index Only Scan") && (s.Index == want || (s.Relation == "turns" && s.Index == guardReadCountIndex))
+			if !index {
 				return fmt.Sprintf("scans %s other than through %s: %s", s.Relation, want, s)
 			}
-			if s.Relation == "turns" {
-				sawTurns = true
-			}
+			saw(s.Index)
 		}
 	}
-	if !sawTurns {
-		return fmt.Sprintf("never reads turns through %s (%v)", guardReadIndexes["turns"], m.scans)
+	if !sawSpend || !sawCount {
+		return fmt.Sprintf("never reads turns through %s, for the spend, and %s, for the count (%v)", guardReadIndexes["turns"], guardReadCountIndex, m.scans)
 	}
 	return ""
 }

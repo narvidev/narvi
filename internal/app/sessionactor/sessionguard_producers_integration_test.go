@@ -122,32 +122,69 @@ func TestAutoRetrigger_AtSpendCap_DropsWithoutSpendingBudget(t *testing.T) {
 // request owed after its pull request moved, served when the session has
 // since reached its spend cap, is dropped rather than re-run, and its
 // requester is told once, why -- beside the crossing's own warning and
-// notice. Nothing is inserted.
+// notice. Nothing is inserted. Past the cap when the timer fires, it is
+// refused before anything is done for it: the requester's authorization is
+// not asked, the pull request is not read, and composing no prompt bumps no
+// false-positive pattern's hit count. Past the cap by a cost recorded while
+// phase 2 ran, it is refused again under the lock, at the insert.
 func TestOwedReviewRequest_AtSpendCap_DroppedAndRequesterTold(t *testing.T) {
 	ctx := context.Background()
-	pool := newTestPool(t)
-	f := newContextFixture(ctx, t, pool, "acme/owed-at-cap", 860)
-	setRepoCap(ctx, t, pool, f.repoFullName, "1.00")
-	seedOwedRequest(ctx, t, f, createRequester(ctx, t, pool, "at-cap"))
-	spendOn(ctx, t, pool, f.sessionID, "1.25")
-	auth := &fakeReviewRequestAuthorizer{allowed: true}
-	rig := newOwedRig(ctx, t, pool, f.sessionID, nil, auth)
+	for _, tc := range []struct {
+		name            string
+		spentBefore     string
+		duringAuthorize string
+		wantAsked       int
+		wantPRReads     int
+	}{
+		{name: "past the cap when it fires", spentBefore: "1.25", wantAsked: 0, wantPRReads: 0},
+		{name: "past the cap by a cost recorded while it was authorized", spentBefore: "0.25", duringAuthorize: "1.00", wantAsked: 1, wantPRReads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newTestPool(t)
+			f := newContextFixture(ctx, t, pool, "acme/owed-at-cap", 860)
+			setRepoCap(ctx, t, pool, f.repoFullName, "1.00")
+			if _, err := pool.Exec(ctx, `INSERT INTO review_false_positive_patterns (repo_full_name, comment_id, comment_type, reason) VALUES ($1, 1, 'issue_comment', 'a known false positive')`, f.repoFullName); err != nil {
+				t.Fatal(err)
+			}
+			seedOwedRequest(ctx, t, f, createRequester(ctx, t, pool, "at-cap"))
+			spendOn(ctx, t, pool, f.sessionID, tc.spentBefore)
+			auth := &fakeReviewRequestAuthorizer{allowed: true}
+			if tc.duringAuthorize != "" {
+				auth.onAsk = func() { spendOn(ctx, t, pool, f.sessionID, tc.duringAuthorize) }
+			}
+			rig := newOwedRig(ctx, t, pool, f.sessionID, nil, auth)
 
-	pumpUntilOwedServed(ctx, t, rig, f)
-	if runs := reRuns(ctx, t, f); len(runs) != 0 {
-		t.Fatalf("re-runs = %d, want none past the cap", len(runs))
-	}
-	notices := dropNotices(ctx, t, f)
-	if len(notices) != 1 || !strings.Contains(notices[0], "the Re-run review button") || !strings.Contains(notices[0], "spend cap") {
-		t.Fatalf("drop notices = %q, want one telling the requester the session reached its spend cap", notices)
-	}
-	if warnings := dropWarnings(ctx, t, f); len(warnings) != 1 || !strings.Contains(warnings[0], "spend cap") {
-		t.Fatalf("drop warnings = %q, want one saying why", warnings)
-	}
-	if warnings, notices := guardRecorded(ctx, t, pool, f.sessionID); warnings != 1 || notices != 1 {
-		t.Fatalf("guard warnings %d, notices %d; want the crossing's one of each", warnings, notices)
-	}
-	if n := sentPrompts(t, rig.commander); n != 0 {
-		t.Fatalf("prompts sent = %d, want none", n)
+			pumpUntilOwedServed(ctx, t, rig, f)
+			if runs := reRuns(ctx, t, f); len(runs) != 0 {
+				t.Fatalf("re-runs = %d, want none past the cap", len(runs))
+			}
+			notices := dropNotices(ctx, t, f)
+			if len(notices) != 1 || !strings.Contains(notices[0], "the Re-run review button") || !strings.Contains(notices[0], "spend cap") {
+				t.Fatalf("drop notices = %q, want one telling the requester the session reached its spend cap", notices)
+			}
+			if warnings := dropWarnings(ctx, t, f); len(warnings) != 1 || !strings.Contains(warnings[0], "spend cap") {
+				t.Fatalf("drop warnings = %q, want one saying why", warnings)
+			}
+			if warnings, notices := guardRecorded(ctx, t, pool, f.sessionID); warnings != 1 || notices != 1 {
+				t.Fatalf("guard warnings %d, notices %d; want the crossing's one of each", warnings, notices)
+			}
+			if n := sentPrompts(t, rig.commander); n != 0 {
+				t.Fatalf("prompts sent = %d, want none", n)
+			}
+			if n := len(auth.requests()); n != tc.wantAsked {
+				t.Fatalf("authorizations asked = %d, want %d", n, tc.wantAsked)
+			}
+			rig.fetcher.mu.Lock()
+			reads := rig.fetcher.getPRCalls
+			rig.fetcher.mu.Unlock()
+			if n := reads; n != tc.wantPRReads {
+				t.Fatalf("pull request reads = %d, want %d", n, tc.wantPRReads)
+			}
+			if tc.wantPRReads == 0 {
+				if hits := scalarInt(ctx, t, pool, `SELECT hit_count FROM review_false_positive_patterns WHERE repo_full_name = $1`, f.repoFullName); hits != 0 {
+					t.Fatalf("false-positive hit count = %d, want 0: no prompt was composed for a request refused before it", hits)
+				}
+			}
+		})
 	}
 }

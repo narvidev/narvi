@@ -5,13 +5,19 @@ package workflowengine_test
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
+	"github.com/narvidev/narvi/internal/adapters/outbound/linearapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
+	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/sessionnotice"
 	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/sessionguard"
@@ -87,7 +93,7 @@ func refusedAdvance(ctx context.Context, t *testing.T, pool *pgxpool.Pool, repo,
 		completeWithOutcome(t, ctx, deps, session, auditStepRunID, auditTurnID, "needs_fix")
 	})
 	return session, runID, sessionguard.Refusal{Reason: sessionguard.ReasonSpendCap, SessionID: session.ID.Bytes, Cap: 1_000_000, Spent: 1_500_000,
-		Source: sessionguard.CapSource{Kind: sessionguard.CapSourceRepo, Name: repo, ID: repo}}
+		Source: sessionguard.CapSource{Kind: sessionguard.CapSourceRepo, Name: repo, ID: repo}, Turns: 1}
 }
 
 // TestWorkflowAdvance_AtSpendCap_EscalatesWithoutATurn: the engine's
@@ -116,16 +122,18 @@ func TestWorkflowAdvance_AtSpendCap_EscalatesWithoutATurn(t *testing.T) {
 }
 
 // TestSpendCap_WorkflowEscalationCarriesTheOneNotice: the crossing an
-// automatic advance meets is told once. The run's escalation notice
-// carries the guard's text, the crossing's warning is recorded, and no
-// separate guard notice is sent; when the run was already notified of an
-// earlier escalation, the guard's own notice goes out instead.
+// automatic advance meets is told once. The run's escalation notice names
+// the run, says it needs review and will not resume on its own even once
+// the cap is raised, and carries the guard's text; the crossing's warning
+// is recorded, and no separate guard notice is sent. When the run was
+// already notified of an earlier escalation, the guard's own notice goes
+// out instead.
 func TestSpendCap_WorkflowEscalationCarriesTheOneNotice(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("the escalation's notice carries the guard's text", func(t *testing.T) {
 		pool := newTestPool(t)
-		session, _, refusal := refusedAdvance(ctx, t, pool, "acme/workflow-notice", "2222.0002", false)
+		session, runID, refusal := refusedAdvance(ctx, t, pool, "acme/workflow-notice", "2222.0002", false)
 		var payload []byte
 		if err := pool.QueryRow(ctx, `SELECT payload FROM outbox WHERE session_id = $1 AND kind = 'slack_workflow_decision'`, session.ID).Scan(&payload); err != nil {
 			t.Fatalf("the escalation notice: %v", err)
@@ -136,8 +144,16 @@ func TestSpendCap_WorkflowEscalationCarriesTheOneNotice(t *testing.T) {
 		if err := json.Unmarshal(payload, &notice); err != nil {
 			t.Fatal(err)
 		}
-		if notice.Text != sessionguard.Text(refusal) {
-			t.Fatalf("escalation notice = %q, want the guard's text", notice.Text)
+		for _, part := range []string{
+			"This workflow run (" + runID.String() + ") now needs your review",
+			"the session reached its spend cap, so the run's next step was not started",
+			"The run will not resume on its own, even once the cap is raised",
+			"send the session a new turn",
+			sessionguard.Text(refusal),
+		} {
+			if !strings.Contains(notice.Text, part) {
+				t.Errorf("escalation notice %q does not say %q", notice.Text, part)
+			}
 		}
 		if n := countWhere(ctx, t, pool, `SELECT count(*) FROM outbox WHERE session_id = $1 AND kind = 'slack_session_guard'`, session.ID); n != 0 {
 			t.Fatalf("guard notices = %d, want none: the escalation carries the one notice", n)
@@ -202,5 +218,88 @@ func TestDispatchSameStepRevision_AtSpendCap_ReturnsTheRefusal(t *testing.T) {
 	}
 	if n := countWhere(ctx, t, pool, `SELECT count(*) FROM workflow_step_runs WHERE workflow_run_id = $1`, runID); n != 1 {
 		t.Fatalf("step runs = %d, want 1: a refused revision creates none", n)
+	}
+}
+
+// TestSessionNoticeEnqueue_CarriesEachChannelsPayload: the one router of a
+// session's notices (internal/app/sessionnotice) -- the workflow engine's
+// and the session guard's -- enqueues to each source's own channel the
+// payload its notifier delivers: the Slack thread, the issue tracker's
+// agent session as a response (Success: an error activity otherwise), the
+// pull request; and nothing for a web-origin session.
+func TestSessionNoticeEnqueue_CarriesEachChannelsPayload(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessions := postgres.NewSessionStore(pool)
+	stores := sessionnotice.Stores{
+		SlackThreadSessions: postgres.NewSlackThreadSessionStore(pool),
+		LinearAgentSessions: postgres.NewLinearAgentSessionStore(pool),
+		GitHubPRSessions:    postgres.NewGitHubPRSessionStore(pool),
+		Outbox:              postgres.NewOutboxStore(pool, false),
+	}
+	newSession := func(source sqlcgen.SessionSpawnSource) sqlcgen.Session {
+		t.Helper()
+		s, err := sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: source})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	payloadOf := func(sessionID pgtype.UUID, kind string, into any) {
+		t.Helper()
+		var raw []byte
+		if err := pool.QueryRow(ctx, `SELECT payload FROM outbox WHERE session_id = $1 AND kind = $2`, sessionID, kind).Scan(&raw); err != nil {
+			t.Fatalf("the %s notice: %v", kind, err)
+		}
+		if err := json.Unmarshal(raw, into); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const text = "the notice's text"
+
+	slackSession := newSession(sqlcgen.SessionSpawnSourceSlack)
+	if _, ok, err := stores.SlackThreadSessions.Claim(ctx, "C-NOTICE", "3333.0001", slackSession.ID); err != nil || !ok {
+		t.Fatalf("map the thread: %v %v", ok, err)
+	}
+	linearSession := newSession(sqlcgen.SessionSpawnSourceLinear)
+	if _, err := stores.LinearAgentSessions.Claim(ctx, "agent-session-notice", "org-notice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := stores.LinearAgentSessions.SetSessionID(ctx, "agent-session-notice", linearSession.ID); err != nil {
+		t.Fatal(err)
+	}
+	githubSession := newSession(sqlcgen.SessionSpawnSourceGithub)
+	if _, err := pool.Exec(ctx, `INSERT INTO github_pr_sessions (repo_full_name, pr_number, session_id) VALUES ('acme/notice', 77, $1)`, githubSession.ID); err != nil {
+		t.Fatal(err)
+	}
+	webSession := newSession(sqlcgen.SessionSpawnSourceWeb)
+
+	for _, s := range []sqlcgen.Session{slackSession, linearSession, githubSession, webSession} {
+		enqueued, err := sessionnotice.Enqueue(ctx, stores, s, turnguard.NoticeKinds, text)
+		if err != nil {
+			t.Fatalf("%s: %v", s.SpawnSource, err)
+		}
+		if want := s.SpawnSource != sqlcgen.SessionSpawnSourceWeb; enqueued != want {
+			t.Fatalf("%s: enqueued %v, want %v", s.SpawnSource, enqueued, want)
+		}
+	}
+
+	var slackPayload slackapi.Payload
+	payloadOf(slackSession.ID, string(ports.NotificationKindSlackSessionGuard), &slackPayload)
+	if slackPayload != (slackapi.Payload{ChannelID: "C-NOTICE", ThreadTS: "3333.0001", Text: text}) {
+		t.Errorf("slack payload = %+v", slackPayload)
+	}
+	var linearPayload linearapi.Payload
+	payloadOf(linearSession.ID, string(ports.NotificationKindLinearSessionGuard), &linearPayload)
+	if linearPayload != (linearapi.Payload{AgentSessionID: "agent-session-notice", OrganizationID: "org-notice", Text: text, Success: true}) {
+		t.Errorf("issue tracker payload = %+v, want a response (Success) on its agent session", linearPayload)
+	}
+	var githubPayload githubapi.Payload
+	payloadOf(githubSession.ID, string(ports.NotificationKindGitHubSessionGuard), &githubPayload)
+	if githubPayload != (githubapi.Payload{Owner: "acme", Repo: "notice", PRNumber: 77, Text: text}) {
+		t.Errorf("code host payload = %+v", githubPayload)
+	}
+	if n := countWhere(ctx, t, pool, `SELECT count(*) FROM outbox WHERE session_id = $1`, webSession.ID); n != 0 {
+		t.Errorf("web session notices = %d, want none", n)
 	}
 }

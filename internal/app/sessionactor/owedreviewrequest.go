@@ -28,7 +28,9 @@
 //     dropping every request a person's standing stop predates
 //     (dropOwedReviewRequestsForStop). A request past
 //     ReviewContextMoveMaxConsecutive moves in a row is dropped there, and
-//     its requester told once (dropOwedReviewRequest).
+//     its requester told once (dropOwedReviewRequest); so is one of a
+//     session that has spent its cap (technical plan §40.1), which then
+//     costs no authorization, read or composition.
 //  2. With no transaction open, it asks whether the requester may still
 //     have it run (Actor.reviewRequestAuthorizer, a port the control plane
 //     wires to the HTTP layer's own checks, which this package cannot
@@ -43,7 +45,8 @@
 //     automatic lane's opt-in, hold, budget or "already reviewed"
 //     comparison, which a person's request is exempt from. Or, for a
 //     requester no longer authorized -- or no longer known, their account
-//     deleted -- it drops it and tells them once. The timer is re-armed due
+//     deleted -- or a session that reached its cap while phase 2 ran, it
+//     drops it and tells them once. The timer is re-armed due
 //     at once while more is owed, deleted otherwise.
 //
 // A pull request that cannot be read, or an authorization that cannot be
@@ -194,12 +197,14 @@ func (a *Actor) handleOwedReviewRequestTimer(ctx context.Context) error {
 			}
 			return a.rearmOrDeleteOwedReviewRequestTimer(ctx, tx)
 		}
-		// Technical plan §40.1: the session guard, under the lock, before
-		// the re-run is inserted. A session that has spent its cap drops
-		// the request and tells its requester once, as an unauthorized
-		// one is: a request kept would only be refused again, and nothing
-		// waits held for a raise. The crossing's warning and notice are
-		// recorded beside the drop's own (admitAutomaticTurn).
+		// Technical plan §40.1: the session guard again, under the lock,
+		// before the re-run is inserted -- phase 1 asked before phase 2
+		// read anything, and a cost recorded since counts here. A session
+		// that has spent its cap drops the request and tells its requester
+		// once, as an unauthorized one is: a request kept would only be
+		// refused again, and nothing waits held for a raise. The crossing's
+		// warning and notice are recorded beside the drop's own
+		// (admitAutomaticTurn).
 		admission, refusal, err := a.admitAutomaticTurn(ctx, tx, turnguard.StageOwedRequest)
 		if err != nil {
 			return err
@@ -238,9 +243,9 @@ func (a *Actor) handleOwedReviewRequestTimer(ctx context.Context) error {
 // owed. A request whose session claims no pull request has nothing to be
 // re-run against and is dropped silently; one past
 // ReviewContextMoveMaxConsecutive moves in a row is dropped and its
-// requester told once. Either way nil is returned, and the timer re-armed
-// due at once when more is owed, so the next is served at the next pump
-// tick.
+// requester told once, and so is one the session guard refuses (technical
+// plan §40.1). Either way nil is returned, and the timer re-armed due at
+// once when more is owed, so the next is served at the next pump tick.
 func (a *Actor) readOwedReviewRequest(ctx context.Context) (*owedRequest, error) {
 	var owed *owedRequest
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
@@ -281,6 +286,24 @@ func (a *Actor) readOwedReviewRequest(ctx context.Context) (*owedRequest, error)
 				return fmt.Errorf("sessionactor: delete the owed review request: %w", err)
 			}
 			if err := a.dropOwedReviewRequest(ctx, tx, row, prSession.RepoFullName, prSession.PrNumber, owedRequestDropBound); err != nil {
+				return err
+			}
+			return a.rearmOrDeleteOwedReviewRequestTimer(ctx, tx)
+		}
+		// Technical plan §40.1: the session guard, here, before the
+		// requester's authorization, the code host's read and the prompt's
+		// composition -- a request a session past its cap would only have
+		// refused costs none of them, as the automatic re-review's firing
+		// is refused before its fetch. Dropped and its requester told once,
+		// as phase 3 drops one; phase 3 asks again, for a cost recorded
+		// while phase 2 ran.
+		if _, refusal, err := a.admitAutomaticTurn(ctx, tx, turnguard.StageOwedRequest); err != nil {
+			return err
+		} else if refusal != nil {
+			if _, err := requests.Delete(ctx, row.ID); err != nil {
+				return fmt.Errorf("sessionactor: delete the owed review request: %w", err)
+			}
+			if err := a.dropOwedReviewRequest(ctx, tx, row, prSession.RepoFullName, prSession.PrNumber, owedRequestDropSessionGuard); err != nil {
 				return err
 			}
 			return a.rearmOrDeleteOwedReviewRequestTimer(ctx, tx)

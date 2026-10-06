@@ -19,6 +19,13 @@
 -- lower bound of the bill (§25.15). Cast to a scale of 6, cost_usd's own,
 -- so the guard converts it to micro-dollars exactly.
 --
+-- turn_count: how many turns the session has, every status, read from the
+-- session's own range of (session_id, dispatched_message_id) (000131), the
+-- one index of turns that covers every turn of a session. A turn exists
+-- only once the guard admitted it and is never deleted, so the count grows
+-- exactly when the session is admitted a turn: it names the crossing a
+-- refusal belongs to (sessionguard.WarningKey).
+--
 -- automation_*: the automation that created the session, read through its
 -- earliest automation_runs row (automation_runs_session_id_idx, 000163),
 -- then by its own key, and its cap; NULL for a session no automation
@@ -50,6 +57,7 @@ SELECT
     now()::timestamptz AS observed_at,
     COALESCE((SELECT SUM(t.cost_usd) FROM turns t
               WHERE t.session_id = s.id AND t.dispatched_at IS NOT NULL), 0)::numeric(20, 6)::text AS spent_usd,
+    (SELECT COUNT(*) FROM turns c WHERE c.session_id = s.id)::bigint AS turn_count,
     ac.automation_id::uuid AS automation_id,
     COALESCE(ac.automation_name, '')::text AS automation_name,
     COALESCE(ac.automation_cap_usd::text, '')::text AS automation_cap_usd,

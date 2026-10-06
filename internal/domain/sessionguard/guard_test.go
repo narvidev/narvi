@@ -54,7 +54,7 @@ func TestDecide_SpendCap(t *testing.T) {
 		for _, origin := range origins {
 			t.Run(fmt.Sprintf("%s/%s", tc.name, origin), func(t *testing.T) {
 				t.Parallel()
-				f := sessionguard.Facts{SessionID: sessionA, SpentUSD: *usd(t, tc.spent)}
+				f := sessionguard.Facts{SessionID: sessionA, SpentUSD: *usd(t, tc.spent), Turns: 4}
 				if tc.autoCap != "" {
 					f.AutomationCap, f.AutomationSource = usd(t, tc.autoCap), autoSrc
 				}
@@ -80,7 +80,7 @@ func TestDecide_SpendCap(t *testing.T) {
 				if admission.Admits(sessionA) {
 					t.Fatal("a refusal came with an admission")
 				}
-				if refusal.Reason != sessionguard.ReasonSpendCap || refusal.Cap != *usd(t, tc.wantCap) || refusal.Spent != f.SpentUSD || refusal.Source != tc.wantSource || refusal.SessionID != sessionA {
+				if refusal.Reason != sessionguard.ReasonSpendCap || refusal.Cap != *usd(t, tc.wantCap) || refusal.Spent != f.SpentUSD || refusal.Source != tc.wantSource || refusal.SessionID != sessionA || refusal.Turns != f.Turns {
 					t.Fatalf("refusal = %+v", *refusal)
 				}
 				if !errors.Is(refusal, sessionguard.ErrSpendCapReached) {
@@ -125,11 +125,13 @@ func TestAdmission_ZeroAndNewSession(t *testing.T) {
 }
 
 // TestWarningKey: one key per crossing -- the same for every refusal of
-// the same session against the same cap from the same source, whatever was
-// spent, and a new one when the cap or its source changes.
+// the same session against the same cap from the same source while it is
+// admitted nothing, whatever was spent meanwhile, and a new one when the
+// cap or its source changes, or when the session has since been admitted a
+// turn, even at a cap value it crossed before.
 func TestWarningKey(t *testing.T) {
 	t.Parallel()
-	base := sessionguard.Refusal{Reason: sessionguard.ReasonSpendCap, SessionID: sessionA, Cap: 25_000_000, Spent: 25_000_000, Source: repoSrc}
+	base := sessionguard.Refusal{Reason: sessionguard.ReasonSpendCap, SessionID: sessionA, Cap: 25_000_000, Spent: 25_000_000, Source: repoSrc, Turns: 7}
 	same := base
 	same.Spent = 31_400_000
 	raised := base
@@ -138,23 +140,30 @@ func TestWarningKey(t *testing.T) {
 	moved.Source = autoSrc
 	other := base
 	other.SessionID = sessionB
+	againAfterATurn := base
+	againAfterATurn.Turns = 8
+	againAfterATurn.Spent = 26_000_000
 
 	if sessionguard.WarningKey(base) != sessionguard.WarningKey(same) {
 		t.Fatal("two refusals of one crossing have different keys")
 	}
-	for name, r := range map[string]sessionguard.Refusal{"raised cap": raised, "moved cap": moved, "other session": other} {
+	for name, r := range map[string]sessionguard.Refusal{"raised cap": raised, "moved cap": moved, "other session": other, "same cap, crossed again after a turn": againAfterATurn} {
 		if sessionguard.WarningKey(base) == sessionguard.WarningKey(r) {
 			t.Errorf("%s: the key did not change", name)
 		}
 	}
-	if want := "urn:narvi:session-guard:spend_cap:01020304-0506-0708-090a-0b0c0d0e0f10:25000000:repo:acme/widgets"; sessionguard.WarningKey(base) != want {
+	if want := "urn:narvi:session-guard:spend_cap:01020304-0506-0708-090a-0b0c0d0e0f10:25000000:repo:acme/widgets:7"; sessionguard.WarningKey(base) != want {
 		t.Fatalf("key = %q, want %q", sessionguard.WarningKey(base), want)
 	}
 }
 
 // TestText_SpendCap: the refusal's text names the spend, the cap and where
-// it was set, the overshoot by the turn in flight, the lower bound, that
-// nothing failed, and the remedy.
+// it was set, the overshoot a running turn can add, the lower bound, that
+// the session has not failed, and the remedy -- and makes no claim that is
+// false on some path that emits it: none that a turn reached the cap, which
+// a cap set below the recorded spend never has, none that nothing failed,
+// which a workflow step the guard stops contradicts, and none about a
+// sandbox, which a session may not have.
 func TestText_SpendCap(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -173,13 +182,18 @@ func TestText_SpendCap(t *testing.T) {
 			for _, want := range []string{
 				"it has spent $1.40, at or past its spend cap of $1.00",
 				tc.want,
-				"left to finish, so spending can pass the cap by up to that one turn's own cost",
+				"A turn already running when a session reaches its cap is left to finish and its cost is counted, so the spend shown can be past the cap",
 				"lower bound of the bill",
-				"Nothing has failed",
+				"The session itself has not failed",
 				"An administrator can raise the cap",
 			} {
 				if !strings.Contains(text, want) {
 					t.Errorf("text %q does not contain %q", text, want)
+				}
+			}
+			for _, claim := range []string{"The turn that reached the cap", "Nothing has failed", "sandbox", "by up to"} {
+				if strings.Contains(text, claim) {
+					t.Errorf("text %q claims %q, which is false on some path that emits it", text, claim)
 				}
 			}
 			if r.Error() != text {

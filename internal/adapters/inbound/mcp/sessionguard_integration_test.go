@@ -37,7 +37,7 @@ func TestSendPrompt_AtSpendCap_ReturnsTheRefusal(t *testing.T) {
 	}
 	refusal := sessionguard.Refusal{
 		Reason: sessionguard.ReasonSpendCap, SessionID: session.ID.Bytes, Cap: 1_000_000, Spent: 1_250_000,
-		Source: sessionguard.CapSource{Kind: sessionguard.CapSourceRepo, Name: repo, ID: repo},
+		Source: sessionguard.CapSource{Kind: sessionguard.CapSourceRepo, Name: repo, ID: repo}, Turns: 1,
 	}
 
 	mcpStatus, env := rig.callTool(t, "narvi_send_prompt", fmt.Sprintf(`{"sessionId":%q,"prompt":"one more thing"}`, session.ID.String()), bearer)
