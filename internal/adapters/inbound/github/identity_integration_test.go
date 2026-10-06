@@ -28,6 +28,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -73,6 +74,7 @@ func newIdentityTestRig(t *testing.T) identityTestRig {
 		Turns:        rig.turns,
 		Environments: narvipg.NewEnvironmentStore(pool),
 		Registry:     registry,
+		SessionGuard: turnguard.New(pool, nil, false),
 		AuditLog:     narvipg.NewAuditLogStore(pool),
 		Identities:   rig.identities,
 		Users:        rig.users,

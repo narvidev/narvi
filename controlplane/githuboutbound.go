@@ -17,6 +17,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/releasereview"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowscm"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/integrations"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -36,6 +37,7 @@ var githubOutboundKinds = []ports.NotificationKind{
 	// Publication (§44.4: what a publish credential posts).
 	ports.NotificationKindGitHub,
 	ports.NotificationKindGitHubWorkflowDecision,
+	ports.NotificationKindGitHubSessionGuard,
 	ports.NotificationKindGitHubVerdict,
 	ports.NotificationKindHandoffSentinel,
 	ports.NotificationKindReleaseManifest,
@@ -76,6 +78,9 @@ type githubOutboundDeps struct {
 	sourceControl     *shadowscm.Decorator
 
 	registry *sessionactor.Registry
+	// sessionGuard admits the release composition review's turn
+	// (technical plan §40.1).
+	sessionGuard *turnguard.Guard
 
 	sessions             *postgres.SessionStore
 	turns                *postgres.TurnStore
@@ -113,15 +118,16 @@ func buildGitHubOutbound(cfg *platform.Config, deps githubOutboundDeps) (*github
 	//
 	// githubNotifier wraps the SAME transport-gated adapter as every other
 	// GitHub notifier (BotNotifier is a sibling type over its doPost
-	// machinery, not a second client). It serves two kinds: the generic
-	// turn-outcome comment and §25.9's workflow decision notice --
-	// Deliver never inspects the kind.
+	// machinery, not a second client). It serves three kinds: the generic
+	// turn-outcome comment, §25.9's workflow decision notice and §40.1's
+	// session guard notice -- Deliver never inspects the kind.
 	githubNotifier, err := githubapi.NewBotNotifier(deps.liveSourceControl, outbound)
 	if err != nil {
 		return nil, fmt.Errorf("construct github comment notifier: %w", err)
 	}
 	o.notifiers[ports.NotificationKindGitHub] = githubNotifier
 	o.notifiers[ports.NotificationKindGitHubWorkflowDecision] = githubNotifier
+	o.notifiers[ports.NotificationKindGitHubSessionGuard] = githubNotifier
 	// The formal review and the review:*-risk labels ("server-side
 	// verdict", §8.2).
 	verdictNotifier, err := githubapi.NewVerdictNotifier(deps.liveSourceControl, outbound)
@@ -215,6 +221,7 @@ func buildGitHubOutbound(cfg *platform.Config, deps githubOutboundDeps) (*github
 		CompositionTurns:       postgres.NewLockedTurnCreator(deps.pool),
 		CompositionDispatch:    releaseCompositionDispatcher{registry: deps.registry},
 		CompositionAnchor:      deps.releaseChecks,
+		CompositionGuard:       deps.sessionGuard,
 		Timeouts:               cfg.Timeouts,
 	}, outbound, cfg.Timeouts)
 	if err != nil {

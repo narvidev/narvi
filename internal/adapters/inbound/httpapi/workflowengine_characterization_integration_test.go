@@ -52,6 +52,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 )
 
@@ -160,7 +161,7 @@ func TestCharacterization_RequestLane_ZeroConfig_IdenticalPromptJSON(t *testing.
 	inputPrompt := "please refactor the widget loader"
 	inputModelID := "anthropic/claude-sonnet-5"
 
-	created, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, session.ID, inputPrompt, &inputModelID, false, false, pgtype.UUID{}, RejectIfOpen)
+	created, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, inputPrompt, &inputModelID, false, false, pgtype.UUID{}, RejectIfOpen)
 	if cerr != nil {
 		t.Fatalf("CreateTurnCore: status=%d message=%q", cerr.Status, cerr.Message)
 	}
@@ -221,7 +222,7 @@ func TestCharacterization_ReviewLane_ZeroConfig_IdenticalPromptJSON(t *testing.T
 	// the request-lane test above.
 	inputPrompt := "## Review request\n\nPlease review PR #42 in acme/widgets."
 
-	created, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, session.ID, inputPrompt, nil, false, false, pgtype.UUID{}, AlwaysQueue)
+	created, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, inputPrompt, nil, false, false, pgtype.UUID{}, AlwaysQueue)
 	if cerr != nil {
 		t.Fatalf("CreateTurnCore: status=%d message=%q", cerr.Status, cerr.Message)
 	}
@@ -284,7 +285,7 @@ func TestCharacterization_PlanLane_FirstTurn_ZeroConfig_IdenticalPromptJSON(t *t
 
 	inputPrompt := "draft a plan for adding dark mode"
 
-	created, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, session.ID, inputPrompt, nil, true, false, pgtype.UUID{}, RejectIfOpen)
+	created, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, inputPrompt, nil, true, false, pgtype.UUID{}, RejectIfOpen)
 	if cerr != nil {
 		t.Fatalf("CreateTurnCore: status=%d message=%q", cerr.Status, cerr.Message)
 	}
@@ -349,7 +350,7 @@ func TestCharacterization_PlanLane_ApprovalTurn_UnaffectedByEngine(t *testing.T)
 	linearAgentSessions := postgres.NewLinearAgentSessionStore(rig.pool)
 	events := postgres.NewEventStore(rig.pool)
 	planDocuments := postgres.NewPlanDocumentStore(rig.pool)
-	outcome, err := DecidePlan(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, events, planDocuments, outbox, linearAgentSessions, rig.auditLog, rig.registry, session.ID, plan.ID, PlanVerdictApprove, pgtype.UUID{}, false)
+	outcome, err := DecidePlan(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, events, planDocuments, outbox, linearAgentSessions, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, plan.ID, PlanVerdictApprove, pgtype.UUID{}, false)
 	if err != nil {
 		t.Fatalf("DecidePlan: %v", err)
 	}

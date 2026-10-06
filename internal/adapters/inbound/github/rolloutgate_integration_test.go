@@ -27,6 +27,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -69,6 +70,7 @@ func newRolloutTestRig(t *testing.T, mode platform.RolloutMode) (testRig, *narvi
 		Turns:        rig.turns,
 		Environments: narvipg.NewEnvironmentStore(pool),
 		Registry:     registry,
+		SessionGuard: turnguard.New(pool, nil, false),
 		AuditLog:     narvipg.NewAuditLogStore(pool),
 		Plans:        rig.plans,
 		Identities:   rig.identities,

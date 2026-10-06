@@ -60,7 +60,9 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/loopguard"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/domain/workflow"
 	"github.com/narvidev/narvi/internal/platform"
@@ -179,11 +181,57 @@ func advance(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, def wor
 		}
 	}
 
-	turnID, err := dispatchNextAttempt(ctx, deps, runRow.ID, toStep, promptText, sessionRow)
+	admission, escalated, err := admitNextAttempt(ctx, deps, runRow, sessionRow)
+	if err != nil {
+		return Outcome{}, err
+	}
+	if escalated != nil {
+		return *escalated, nil
+	}
+	turnID, err := dispatchNextAttempt(ctx, deps, runRow.ID, toStep, promptText, sessionRow, admission)
 	if err != nil {
 		return Outcome{}, fmt.Errorf("workflowengine: dispatch next attempt: %w", err)
 	}
 	return Outcome{RunStatus: string(runRow.Status), DispatchedTurnID: &turnID}, nil
+}
+
+// admitNextAttempt asks the session guard (deps.Guard, technical plan
+// §40.1) whether sessionRow may take the attempt advance is about to
+// dispatch, before its step run is created, so a refused attempt leaves no
+// orphan step run. A read that failed is an error, never a refusal. A
+// refusal is answered by who asked (deps.Origin):
+//
+//   - the session actor's own advance (sessionguard.OriginAutomatic): the
+//     run escalates to needs_review with the guard's text as its one
+//     notice, and the session records the crossing's warning, with the
+//     guard's own notice only when the escalation sent none -- the run
+//     was notified already, say -- so the crossing is told once. The
+//     escalated Outcome is returned with no error: the session now waits
+//     on a person, and nothing failed.
+//   - a person's decision (sessionguard.OriginPerson): the refusal, a
+//     *sessionguard.Refusal, is returned as the error, and the decide
+//     endpoint answers 409 and rolls the decision back.
+func admitNextAttempt(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, sessionRow sqlcgen.Session) (sessionguard.Admission, *Outcome, error) {
+	admission, refusal, err := deps.Guard.Admit(ctx, sessionRow.ID, deps.Origin, turnguard.StageWorkflowAdvance)
+	if err != nil {
+		return sessionguard.Admission{}, nil, fmt.Errorf("workflowengine: session guard: %w", err)
+	}
+	if refusal == nil {
+		return admission, nil, nil
+	}
+	if deps.Origin != sessionguard.OriginAutomatic {
+		return sessionguard.Admission{}, nil, refusal
+	}
+	escalated, notified, err := escalateRunNotified(ctx, deps, runRow, sessionRow, sessionguard.Text(*refusal))
+	if err != nil {
+		return sessionguard.Admission{}, nil, err
+	}
+	if _, err := deps.Guard.Record(ctx, sessionRow, refusal, !notified); err != nil {
+		return sessionguard.Admission{}, nil, fmt.Errorf("workflowengine: record the session guard's refusal: %w", err)
+	}
+	platform.Logger(ctx).Info("workflowengine: workflow run escalated: the session guard refused its next attempt",
+		"run_id", runRow.ID.String(), "reason", string(refusal.Reason))
+	return sessionguard.Admission{}, &escalated, nil
 }
 
 // DispatchSameStepRevision is the HITL decide endpoint's own EXCLUSIVE entry
@@ -205,16 +253,30 @@ func advance(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, def wor
 // itself simply never calls the function that consults it, mirroring
 // §24.6's own "a human's manual re-trigger is never subject to [the
 // automatic budget]" exemption exactly.
+//
+// The session guard is not exempted (technical plan §40.1 inverts §24.6 for
+// money): the revision is admitted by deps.Guard first, before its step run
+// is created, and a refusal -- a *sessionguard.Refusal -- is returned as the
+// error, which the decide endpoint answers 409 and rolls back. A revision
+// is always a person's decision, whatever deps.Origin says.
 func DispatchSameStepRevision(ctx context.Context, deps Deps, runID pgtype.UUID, step workflow.StepDefinition, feedback string, sessionRow sqlcgen.Session) (pgtype.UUID, error) {
-	return dispatchNextAttempt(ctx, deps, runID, step, feedback, sessionRow)
+	admission, refusal, err := deps.Guard.Admit(ctx, sessionRow.ID, sessionguard.OriginPerson, turnguard.StageWorkflowAdvance)
+	if err != nil {
+		return pgtype.UUID{}, fmt.Errorf("workflowengine: session guard: %w", err)
+	}
+	if refusal != nil {
+		return pgtype.UUID{}, refusal
+	}
+	return dispatchNextAttempt(ctx, deps, runID, step, feedback, sessionRow, admission)
 }
 
 // dispatchNextAttempt creates toStep's own NEXT workflow_step_runs attempt
 // within runID and dispatches a real ordinary turn for it -- see this
 // file's own top doc comment for why this bypasses createTurnLocked/
 // CreateTurnCore entirely and needs no explicit dispatch-trigger call of
-// its own.
-func dispatchNextAttempt(ctx context.Context, deps Deps, runID pgtype.UUID, toStep workflow.StepDefinition, promptText string, sessionRow sqlcgen.Session) (pgtype.UUID, error) {
+// its own. admission is the session guard's, which its caller asked for
+// before calling this (admitNextAttempt, DispatchSameStepRevision).
+func dispatchNextAttempt(ctx context.Context, deps Deps, runID pgtype.UUID, toStep workflow.StepDefinition, promptText string, sessionRow sqlcgen.Session, admission sessionguard.Admission) (pgtype.UUID, error) {
 	toID, err := parseWorkflowID(toStep.ID)
 	if err != nil {
 		return pgtype.UUID{}, fmt.Errorf("parse to-step id: %w", err)
@@ -264,7 +326,7 @@ func dispatchNextAttempt(ctx context.Context, deps Deps, runID pgtype.UUID, toSt
 		Effort:        res.Effort,
 		PlanMode:      false,
 		CorrelationID: correlationID,
-	})
+	}, admission)
 	if err != nil {
 		return pgtype.UUID{}, fmt.Errorf("create next turn: %w", err)
 	}
@@ -294,11 +356,19 @@ func escalateRun(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, ses
 // escalationNoticeText's two causes. The one-time claim is the same, so a
 // run is still notified at most once, whichever cause escalates it first.
 func escalateRunWithNotice(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, sessionRow sqlcgen.Session, notice string) (Outcome, error) {
+	out, _, err := escalateRunNotified(ctx, deps, runRow, sessionRow, notice)
+	return out, err
+}
+
+// escalateRunNotified is escalateRunWithNotice, reporting whether this call
+// enqueued the run's one notice: false when an earlier escalation of the
+// run claimed it, or the session has no channel to send it to.
+func escalateRunNotified(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, sessionRow sqlcgen.Session, notice string) (Outcome, bool, error) {
 	logger := platform.Logger(ctx)
 
 	run, err := deps.Workflows.EscalateRun(ctx, runRow.ID)
 	if err != nil {
-		return Outcome{}, fmt.Errorf("workflowengine: escalate workflow run: %w", err)
+		return Outcome{}, false, fmt.Errorf("workflowengine: escalate workflow run: %w", err)
 	}
 
 	claimed, err := deps.Workflows.ClaimEscalationNotice(ctx, runRow.ID)
@@ -309,17 +379,18 @@ func escalateRunWithNotice(ctx context.Context, deps Deps, runRow sqlcgen.Workfl
 		// itself (fail-open, mirroring OnTurnCompleted's own overall
 		// discipline for this class of bookkeeping/notification concern).
 		logger.Error("workflowengine: claim workflow run escalation notice failed", "run_id", runRow.ID.String(), "error", err)
-		return Outcome{RunStatus: string(run.Status)}, nil
+		return Outcome{RunStatus: string(run.Status)}, false, nil
 	}
 	if claimed == 0 {
 		// Already notified by an earlier escalation of this SAME run.
-		return Outcome{RunStatus: string(run.Status)}, nil
+		return Outcome{RunStatus: string(run.Status)}, false, nil
 	}
 
-	if err := enqueueWorkflowNotice(ctx, deps, sessionRow, notice); err != nil {
+	enqueued, err := enqueueWorkflowNotice(ctx, deps, sessionRow, notice)
+	if err != nil {
 		logger.Error("workflowengine: enqueue workflow run escalation notice failed", "run_id", runRow.ID.String(), "error", err)
 	}
-	return Outcome{RunStatus: string(run.Status)}, nil
+	return Outcome{RunStatus: string(run.Status)}, enqueued, nil
 }
 
 // escalationNoticeText renders the ONE-TIME notice a human sees when a run

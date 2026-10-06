@@ -30,6 +30,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -103,6 +104,7 @@ func TestHandler_ReplyOnMappedThread_AuthzBackendErrorReleasesClaim(t *testing.T
 		Turns:           turns,
 		Environments:    narvipg.NewEnvironmentStore(pool),
 		Registry:        registry,
+		SessionGuard:    turnguard.New(pool, nil, false),
 		Deliveries:      narvipg.NewWebhookDeliveryStore(pool),
 		Threads:         threads,
 		AuditLog:        auditLog,
@@ -224,6 +226,7 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_AuthzBackendError(t *test
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
+		SessionGuard:        turnguard.New(pool, nil, false),
 		SlackClient:         slackClient,
 		AuditLog:            auditLog,
 		IdentityLink:        newIdentityLinkDepsForTest(pool, auditLog),
@@ -355,6 +358,7 @@ func TestInteractivityHandler_ViewSubmission_AuthzBackendError(t *testing.T) {
 		Outbox:              narvipg.NewOutboxStore(pool, false),
 		LinearAgentSessions: narvipg.NewLinearAgentSessionStore(pool),
 		Registry:            registry,
+		SessionGuard:        turnguard.New(pool, nil, false),
 		SlackClient:         slackClient,
 		AuditLog:            auditLog,
 		IdentityLink:        newIdentityLinkDepsForTest(pool, auditLog),

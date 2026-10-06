@@ -6,13 +6,14 @@
 // a run escalating to needs_review), the caller supplying different text
 // for each (see advance.go's own two call sites).
 //
-// Destination resolution mirrors internal/app/sessionactor's own
-// enqueueOutboxNotification (outboxenqueue.go) exactly: reverse-lookup the
-// session's own slack_thread_sessions/linear_agent_sessions/
-// github_pr_sessions row (whichever one exists, keyed by spawn_source),
-// reusing the SAME three wire payload shapes those existing plain
-// notifiers already consume (slackapi.Payload/linearapi.Payload/
-// githubapi.Payload) -- no new payload type anywhere in this file. A
+// Destination resolution is internal/app/sessionnotice's Enqueue, the one
+// router every notice of this shape shares (the session guard's included),
+// mirroring internal/app/sessionactor's own enqueueOutboxNotification
+// (outboxenqueue.go): reverse-lookup the session's own
+// slack_thread_sessions/linear_agent_sessions/github_pr_sessions row
+// (whichever one exists, keyed by spawn_source), reusing the SAME three
+// wire payload shapes those existing plain notifiers already consume
+// (slackapi.Payload/linearapi.Payload/githubapi.Payload). A
 // 'web'- or 'mcp'-origin session enqueues nothing and logs nothing: neither
 // has an external channel (the browser re-reads the session, and an MCP
 // client polls its status or waits on it, technical plan §43.20). A bot-
@@ -27,20 +28,13 @@ package workflowengine
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
 
-	"github.com/jackc/pgx/v5"
-
-	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
-	"github.com/narvidev/narvi/internal/adapters/outbound/linearapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
-	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/ports"
-	"github.com/narvidev/narvi/internal/domain/reposource"
-	"github.com/narvidev/narvi/internal/platform"
+	"github.com/narvidev/narvi/internal/app/sessionnotice"
+	"github.com/narvidev/narvi/internal/app/turnguard"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 )
 
 // Deps bundles every collaborator OnTurnCompleted (completion.go) and the
@@ -82,6 +76,23 @@ type Deps struct {
 	// this Step ever enqueues per event.
 	Outbox *postgres.OutboxStore
 
+	// Guard is the session guard (internal/app/turnguard, technical plan
+	// §40.1), bound to the caller's transaction, which holds the session's
+	// row lock: every attempt this package dispatches is admitted by it
+	// first (advance.go's admitNextAttempt), before its step run is
+	// created, so a refused attempt leaves no orphan step run. Never nil
+	// where an attempt can be dispatched: a nil Guard admits nothing, and
+	// the attempt is not created.
+	Guard *turnguard.Bound
+	// Origin is who asked for the attempts this call may dispatch:
+	// sessionguard.OriginAutomatic for the session actor's own advance
+	// (OnTurnCompleted), sessionguard.OriginPerson for the decide
+	// endpoint's approve and revise. It decides what a refusal does: an
+	// automatic advance escalates the run with the guard's text as its one
+	// notice; a person's decision is answered with the refusal and rolled
+	// back.
+	Origin sessionguard.Origin
+
 	// EpistemicCheckDefault (F6, adversarial review) is the SAME
 	// platform.Config.EpistemicCheckDefault value every other
 	// createTurnLocked-reaching caller in this codebase now threads
@@ -99,96 +110,32 @@ type Deps struct {
 	EpistemicCheckDefault bool
 }
 
+// workflowNoticeKinds are the outbox kinds a workflow notice travels
+// under, one a channel.
+var workflowNoticeKinds = sessionnotice.Kinds{
+	Slack:  ports.NotificationKindSlackWorkflowDecision,
+	Linear: ports.NotificationKindLinearWorkflowDecision,
+	GitHub: ports.NotificationKindGitHubWorkflowDecision,
+}
+
 // enqueueWorkflowNotice enqueues one outbox row carrying text to
-// sessionRow's own resolved destination -- see this file's own top doc
-// comment for the full destination-resolution/no-op-cases contract. Never
-// returns an error for a "no destination" outcome (a legitimate, common
-// case -- e.g. a 'web'- or 'mcp'-origin session); only a genuine store failure
-// (a reverse-lookup query itself erroring, not merely finding no row, or
-// the outbox insert itself failing) is returned, so the caller can decide
-// whether that is worth failing its own larger operation over (both of
-// advance.go's own two call sites log and continue rather than propagate,
-// mirroring OnTurnCompleted's own fail-open discipline for this exact class
-// of bookkeeping/notification concern).
-func enqueueWorkflowNotice(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, text string) error {
-	logger := platform.Logger(ctx)
-
-	if sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceWeb || sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceMcp {
-		return nil
-	}
-
-	var kind ports.NotificationKind
-	var payload any
-
-	switch sessionRow.SpawnSource {
-	case sqlcgen.SessionSpawnSourceSlack:
-		row, err := deps.SlackThreadSessions.GetBySessionID(ctx, sessionRow.ID)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				logger.Warn("workflowengine: enqueue workflow notice: slack-origin session has no slack_thread_sessions row; skipping")
-				return nil
-			}
-			return fmt.Errorf("workflowengine: get slack thread session: %w", err)
-		}
-		kind = ports.NotificationKindSlackWorkflowDecision
-		payload = slackapi.Payload{ChannelID: row.ChannelID, ThreadTS: row.ThreadTs, Text: text}
-
-	case sqlcgen.SessionSpawnSourceLinear:
-		row, err := deps.LinearAgentSessions.GetBySessionID(ctx, sessionRow.ID)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				logger.Warn("workflowengine: enqueue workflow notice: linear-origin session has no linear_agent_sessions row; skipping")
-				return nil
-			}
-			return fmt.Errorf("workflowengine: get linear agent session: %w", err)
-		}
-		kind = ports.NotificationKindLinearWorkflowDecision
-		payload = linearapi.Payload{AgentSessionID: row.AgentSessionID, OrganizationID: row.OrganizationID, Text: text, Success: true}
-
-	case sqlcgen.SessionSpawnSourceGithub:
-		row, err := deps.GitHubPRSessions.GetBySessionID(ctx, sessionRow.ID)
-		if err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				logger.Warn("workflowengine: enqueue workflow notice: github-origin session has no github_pr_sessions row; skipping")
-				return nil
-			}
-			return fmt.Errorf("workflowengine: get github pr session: %w", err)
-		}
-		owner, repo, ok := reposource.SplitFullName(row.RepoFullName)
-		if !ok {
-			logger.Warn("workflowengine: enqueue workflow notice: could not split repo_full_name; skipping", "repo_full_name", row.RepoFullName)
-			return nil
-		}
-		kind = ports.NotificationKindGitHubWorkflowDecision
-		payload = githubapi.Payload{Owner: owner, Repo: repo, PRNumber: int(row.PrNumber), Text: text}
-
-	default:
-		// A source this binary has no channel for. Session.spawnSource is
-		// an open enum (contracts/manifest.json's openEnums), so a newer
-		// migration can add a value that an older binary, still serving
-		// during a rolling deploy, reads here. With no channel to notify,
-		// nothing is enqueued; the source is logged so the gap shows.
-		logger.Warn("workflowengine: enqueue workflow notice: unrecognized spawn_source; skipping", "spawn_source", string(sessionRow.SpawnSource))
-		return nil
-	}
-
-	rawPayload, err := json.Marshal(payload)
-	if err != nil {
-		return fmt.Errorf("workflowengine: marshal workflow notice payload: %w", err)
-	}
-
-	var correlationID *string
-	if id, ok := platform.CorrelationIDFromContext(ctx); ok && id != "" {
-		correlationID = &id
-	}
-
-	if _, err := deps.Outbox.Create(ctx, sqlcgen.CreateOutboxEntryParams{
-		SessionID:     sessionRow.ID,
-		Kind:          string(kind),
-		Payload:       rawPayload,
-		CorrelationID: correlationID,
-	}); err != nil {
-		return fmt.Errorf("workflowengine: create workflow notice outbox entry: %w", err)
-	}
-	return nil
+// sessionRow's own resolved destination, under the workflow decision kinds
+// -- sessionnotice.Enqueue, the one router of a session's notices, holds
+// the destination resolution and the no-op cases this file's top doc
+// comment describes. Never returns an error for a "no destination" outcome
+// (a legitimate, common case -- e.g. a 'web'- or 'mcp'-origin session);
+// only a genuine store failure (a reverse-lookup query itself erroring,
+// not merely finding no row, or the outbox insert itself failing) is
+// returned, so the caller can decide whether that is worth failing its own
+// larger operation over (both of advance.go's own two call sites log and
+// continue rather than propagate, mirroring OnTurnCompleted's own
+// fail-open discipline for this exact class of bookkeeping/notification
+// concern). enqueued reports whether a row was written.
+func enqueueWorkflowNotice(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, text string) (enqueued bool, err error) {
+	return sessionnotice.Enqueue(ctx, sessionnotice.Stores{
+		SlackThreadSessions: deps.SlackThreadSessions,
+		LinearAgentSessions: deps.LinearAgentSessions,
+		GitHubPRSessions:    deps.GitHubPRSessions,
+		Outbox:              deps.Outbox,
+	}, sessionRow, workflowNoticeKinds, text)
 }

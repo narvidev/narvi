@@ -28,6 +28,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -66,6 +67,7 @@ func newTestRigWithOutbox(t *testing.T) (testRig, *fakeReviewContextFetcher) {
 		Turns:        rig.turns,
 		Environments: narvipg.NewEnvironmentStore(pool),
 		Registry:     registry,
+		SessionGuard: turnguard.New(pool, nil, false),
 		AuditLog:     narvipg.NewAuditLogStore(pool),
 		Plans:        rig.plans,
 		Identities:   rig.identities,

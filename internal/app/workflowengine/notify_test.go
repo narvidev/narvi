@@ -24,7 +24,7 @@ func TestEnqueueWorkflowNotice_UnknownSpawnSource(t *testing.T) {
 	for _, source := range []sqlcgen.SessionSpawnSource{"a_future_source", "Mcp"} {
 		t.Run(string(source), func(t *testing.T) {
 			t.Parallel()
-			if err := enqueueWorkflowNotice(context.Background(), Deps{}, sqlcgen.Session{SpawnSource: source}, "A step is waiting for a decision."); err != nil {
+			if _, err := enqueueWorkflowNotice(context.Background(), Deps{}, sqlcgen.Session{SpawnSource: source}, "A step is waiting for a decision."); err != nil {
 				t.Fatalf("enqueueWorkflowNotice = %v, want nil", err)
 			}
 		})
@@ -62,7 +62,7 @@ func TestEnqueueWorkflowNotice_McpEnqueuesNothingNoWarn(t *testing.T) {
 	} {
 		t.Run(string(tc.source), func(t *testing.T) {
 			logs.Reset()
-			if err := enqueueWorkflowNotice(context.Background(), Deps{}, sqlcgen.Session{SpawnSource: tc.source}, "A step is waiting for a decision."); err != nil {
+			if _, err := enqueueWorkflowNotice(context.Background(), Deps{}, sqlcgen.Session{SpawnSource: tc.source}, "A step is waiting for a decision."); err != nil {
 				t.Fatalf("enqueueWorkflowNotice = %v, want nil", err)
 			}
 

@@ -30,6 +30,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/identitylink"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/framecut"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
 	"github.com/narvidev/narvi/internal/platform"
@@ -155,6 +156,7 @@ func newInteractiveTestRigWithDeps(t *testing.T, pool *pgxpool.Pool, timeouts pl
 		Outbox:              outbox,
 		LinearAgentSessions: linearAgentSessions,
 		Registry:            registry,
+		SessionGuard:        turnguard.New(pool, nil, false),
 		SlackClient:         slackClient,
 		AuditLog:            auditLog,
 		// Participants/IdentityLink (audit-fix batch addition): now that

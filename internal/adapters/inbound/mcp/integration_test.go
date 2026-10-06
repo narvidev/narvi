@@ -39,6 +39,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactivity"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/mcpscope"
 	"github.com/narvidev/narvi/internal/platform"
@@ -169,9 +170,9 @@ func newMCPTestRig(t *testing.T) *mcpTestRig {
 	participants, auditLog := narvipg.NewParticipantStore(pool), narvipg.NewAuditLogStore(pool)
 	outbox, linearAgentSessions := narvipg.NewOutboxStore(pool, false), narvipg.NewLinearAgentSessionStore(pool)
 	listPlans := httpapi.ListPlans(rig.sessions, plans, rig.turns, rig.events, planDocuments)
-	approvePlan := httpapi.ApprovePlan(pool, rig.sessions, rig.turns, plans, rig.events, planDocuments, participants, outbox, linearAgentSessions, auditLog, registry, false)
+	approvePlan := httpapi.ApprovePlan(pool, rig.sessions, rig.turns, plans, rig.events, planDocuments, participants, outbox, linearAgentSessions, auditLog, registry, turnguard.New(pool, nil, false), false)
 	rejectPlan := httpapi.RejectPlan(pool, rig.sessions, rig.turns, plans, rig.events, planDocuments, participants, outbox, linearAgentSessions, auditLog, false)
-	createTurn := httpapi.CreateTurn(pool, rig.sessions, rig.turns, plans, participants, auditLog, registry, nil, nil, false)
+	createTurn := httpapi.CreateTurn(pool, rig.sessions, rig.turns, plans, participants, auditLog, registry, turnguard.New(pool, nil, false), nil, nil, false)
 	// One stop handler for the REST route and the MCP twin alike, as
 	// controlplane wires it (technical plan §43.22).
 	stopSession := httpapi.StopSession(httpapi.StopSessionDeps{

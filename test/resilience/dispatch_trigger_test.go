@@ -24,6 +24,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -158,7 +159,7 @@ func otherTimers(ctx context.Context, t *testing.T, h *Harness, sessionID pgtype
 // and MCP reach -- whose post-commit trigger runs on via.
 func createTurnThroughREST(ctx context.Context, t *testing.T, h *Harness, via *sessionactor.Registry, sessionID pgtype.UUID) {
 	t.Helper()
-	if _, _, cerr := httpapi.CreateTurnCore(ctx, h.Pool, h.Sessions, h.Turns, nil, nil, narvipg.NewAuditLogStore(h.Pool), via, sessionID,
+	if _, _, cerr := httpapi.CreateTurnCore(ctx, h.Pool, h.Sessions, h.Turns, nil, nil, narvipg.NewAuditLogStore(h.Pool), via, turnguard.New(h.Pool, nil, false), sessionID,
 		"do the thing", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen); cerr != nil {
 		t.Fatalf("CreateTurnCore: %d %s", cerr.Status, cerr.Message)
 	}

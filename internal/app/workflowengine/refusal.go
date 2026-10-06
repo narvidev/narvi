@@ -43,7 +43,12 @@ import (
 // Fail-open like the rest of this package (doc.go): a store failure is
 // logged and the run left where it is, never allowed to undo the turn's
 // own terminal write. Left there, it is still not re-queued.
-func OnTurnRefused(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, turnID pgtype.UUID, reason string) {
+//
+// notified reports whether this call enqueued the run's one escalation
+// notice, which names reason: a caller that would tell the same refusal
+// through a notice of its own -- the session guard ending queued turns at
+// dispatch, technical plan §40.1 -- then sends none.
+func OnTurnRefused(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, turnID pgtype.UUID, reason string) (notified bool) {
 	logger := platform.Logger(ctx)
 	workflows := deps.Workflows
 
@@ -52,33 +57,33 @@ func OnTurnRefused(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, t
 		if !errors.Is(err, pgx.ErrNoRows) {
 			logger.Warn("workflowengine: get live step run by turn id failed", "turn_id", turnID.String(), "error", err)
 		}
-		return
+		return false
 	}
 	runRow, err := workflows.GetRun(ctx, stepRun.WorkflowRunID)
 	if err != nil {
 		logger.Error("workflowengine: get workflow run failed", "run_id", stepRun.WorkflowRunID.String(), "error", err)
-		return
+		return false
 	}
 	if sessionRow.StopRequestedAt.Valid {
 		cancelStoppedRun(ctx, workflows, stepRun, runRow, turn.TriggerAbandon)
-		return
+		return false
 	}
 
 	def, err := LoadDefinition(ctx, workflows, runRow.WorkflowDefinitionID)
 	if err != nil {
 		logger.Error("workflowengine: load definition for refused turn failed", "run_id", runRow.ID.String(), "error", err)
-		return
+		return false
 	}
 	stepID := workflow.ID(stepRun.StepDefinitionID.String())
 	next, err := workflow.NextStepAfterRefusal(def, stepID)
 	if err != nil {
 		logger.Error("workflowengine: next step after refusal failed", "run_id", runRow.ID.String(), "step_id", string(stepID), "error", err)
-		return
+		return false
 	}
 
 	if _, err := workflows.FinishStepRun(ctx, stepRun.ID, stepRunTerminalStatus(turn.TriggerAbandon), string(implicitOutcome(turn.TriggerAbandon))); err != nil {
 		logger.Error("workflowengine: finish refused step run failed", "step_run_id", stepRun.ID.String(), "error", err)
-		return
+		return false
 	}
 
 	if next.Kind != workflow.NextEscalate {
@@ -87,14 +92,16 @@ func OnTurnRefused(ctx context.Context, deps Deps, sessionRow sqlcgen.Session, t
 		// advancing a refused run.
 		logger.Error("workflowengine: refusal verdict is not an escalation; leaving run as-is",
 			"run_id", runRow.ID.String(), "kind", next.Kind.String())
-		return
+		return false
 	}
-	if _, err := escalateRunWithNotice(ctx, deps, runRow, sessionRow, refusalNoticeText(runRow.ID, reason)); err != nil {
+	_, notified, err = escalateRunNotified(ctx, deps, runRow, sessionRow, refusalNoticeText(runRow.ID, reason))
+	if err != nil {
 		logger.Error("workflowengine: escalate refused workflow run failed", "run_id", runRow.ID.String(), "error", err)
-		return
+		return false
 	}
 	logger.Info("workflowengine: workflow run escalated: its step was refused before it ran; no edge followed",
 		"run_id", runRow.ID.String(), "step_run_id", stepRun.ID.String())
+	return notified
 }
 
 // refusalNoticeText renders the one-time notice a refused run's escalation

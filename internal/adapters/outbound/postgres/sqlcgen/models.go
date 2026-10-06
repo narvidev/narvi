@@ -1746,6 +1746,7 @@ type Automation struct {
 	LastRunStatus            *AutomationInvocationStatus `json:"last_run_status"`
 	ArtifactSummary          *string                     `json:"artifact_summary"`
 	CreatorUnauthorizedSince pgtype.Timestamptz          `json:"creator_unauthorized_since"`
+	SessionSpendCapUsd       pgtype.Numeric              `json:"session_spend_cap_usd"`
 }
 
 type AutomationInvocation struct {
@@ -2199,6 +2200,7 @@ type RepoSetting struct {
 	LiveEgressEnabled          bool               `json:"live_egress_enabled"`
 	LiveEgressPromotedAt       pgtype.Timestamptz `json:"live_egress_promoted_at"`
 	DemotionSweepPendingAt     pgtype.Timestamptz `json:"demotion_sweep_pending_at"`
+	SessionSpendCapUsd         pgtype.Numeric     `json:"session_spend_cap_usd"`
 }
 
 type ReviewCheckRun struct {

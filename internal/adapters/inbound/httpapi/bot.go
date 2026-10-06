@@ -12,6 +12,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/intentclassifier"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -165,13 +166,20 @@ func CreateSessionForBot(ctx context.Context, pool *pgxpool.Pool, sessions *post
 // doc comment (turn.go) for why this must never be inferred from
 // reviewHeadSHA's own presence.
 //
+// guard is the session guard (technical plan §40.1), which createTurnLocked
+// asks before it inserts: a session that has spent its cap refuses this
+// mention or label re-trigger like every other turn, and the error wraps
+// the 409 CreateTurnError whose sentinel is the *sessionguard.Refusal, so
+// the GitHub handler recognizes it (sessionguard.AsRefusal) and replies
+// honestly rather than releasing the delivery claim.
+//
 // requestTrigger/requestText (technical plan §24.9) are the request lane
 // this turn came through ("label"; nil for a mention, which records none)
 // and the lane's own text --
 // see CreateTurnOptions.RequestTrigger/RequestText's own doc comment
 // (turn.go); with them the turn records actorUserID as its requester.
-func CreateTurnForBot(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, reviewHeadSHA *string, classifyText *string, effort *string, reviewDepth *string, reviewDepthDecision []byte, reviewKnowledgeMode *string, reviewKnowledgeDecision []byte, reviewVerdictContextJSON []byte, isReviewAttempt bool, requestTrigger *string, requestText *string) (sqlcgen.Turn, error) {
-	created, _, cerr := createTurnLocked(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, sessionID, prompt, modelID, planMode, epistemicCheckDefault, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, ClassifyText: classifyText, Effort: effort, ReviewDepth: reviewDepth, ReviewDepthDecision: reviewDepthDecision, ReviewKnowledgeMode: reviewKnowledgeMode, ReviewKnowledgeDecision: reviewKnowledgeDecision, ReviewVerdictContext: reviewVerdictContextJSON, IsReviewAttempt: isReviewAttempt, RequestTrigger: requestTrigger, RequestText: requestText})
+func CreateTurnForBot(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, guard *turnguard.Guard, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, reviewHeadSHA *string, classifyText *string, effort *string, reviewDepth *string, reviewDepthDecision []byte, reviewKnowledgeMode *string, reviewKnowledgeDecision []byte, reviewVerdictContextJSON []byte, isReviewAttempt bool, requestTrigger *string, requestText *string) (sqlcgen.Turn, error) {
+	created, _, cerr := createTurnLocked(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, guard, sessionID, prompt, modelID, planMode, epistemicCheckDefault, actorUserID, AlwaysQueue, CreateTurnOptions{ReviewHeadSHA: reviewHeadSHA, ClassifyText: classifyText, Effort: effort, ReviewDepth: reviewDepth, ReviewDepthDecision: reviewDepthDecision, ReviewKnowledgeMode: reviewKnowledgeMode, ReviewKnowledgeDecision: reviewKnowledgeDecision, ReviewVerdictContext: reviewVerdictContextJSON, IsReviewAttempt: isReviewAttempt, RequestTrigger: requestTrigger, RequestText: requestText})
 	if cerr != nil {
 		// %w, NOT %s (a follow-up fix, Finding 1): cerr's own
 		// Error() method returns exactly cerr.Message, so this produces the

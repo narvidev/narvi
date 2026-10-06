@@ -15,10 +15,12 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/intentclassifier"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	domainupload "github.com/narvidev/narvi/internal/domain/upload"
 	"github.com/narvidev/narvi/internal/platform"
@@ -97,7 +99,7 @@ func hasOpenTurn(turns []sqlcgen.Turn) bool {
 // checks) -- never consulted for anything else here; nil is a completely
 // valid, ordinary value (a deployment with no object storage configured
 // at all), never a caller error.
-func CreateTurn(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, participants *postgres.ParticipantStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, intentSvc *intentclassifier.Service, objCfg *platform.ObjectStorageConfig, epistemicCheckDefault bool) http.HandlerFunc {
+func CreateTurn(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, participants *postgres.ParticipantStore, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, guard *turnguard.Guard, intentSvc *intentclassifier.Service, objCfg *platform.ObjectStorageConfig, epistemicCheckDefault bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		sessionID, ok := parseSessionID(w, r)
 		if !ok {
@@ -176,14 +178,14 @@ func CreateTurn(pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *post
 			attachmentIDs = append(attachmentIDs, id)
 		}
 
-		created, _, cerr := CreateTurnCore(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, sessionID, req.Prompt, (*string)(req.ModelId), req.PlanMode, epistemicCheckDefault, actorUserID, RejectIfOpen, CreateTurnOptions{
+		created, _, cerr := CreateTurnCore(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, guard, sessionID, req.Prompt, (*string)(req.ModelId), req.PlanMode, epistemicCheckDefault, actorUserID, RejectIfOpen, CreateTurnOptions{
 			AttachmentIDs:     attachmentIDs,
 			StorageConfigured: objCfg != nil,
 			Effort:            (*string)(req.Effort),
 		})
 		if cerr != nil {
 			logger.Error("httpapi: create turn failed", "status", cerr.Status, "message", cerr.Message)
-			writeError(w, cerr.Status, cerr.Message)
+			writeCreateTurnError(w, cerr)
 			return
 		}
 
@@ -222,6 +224,27 @@ func (e *CreateTurnError) Error() string { return e.Message }
 // errors.Is (e.g. errors.Is(cerr, ErrPlanAwaitingApproval)) without needing
 // to string-match Message or duplicate the exact Status this core uses.
 func (e *CreateTurnError) Unwrap() error { return e.sentinel }
+
+// writeCreateTurnError writes cerr as a REST error body: {"error":
+// cerr.Message}, plus, for a refusal of the session guard (technical plan
+// §40.1), the refusal's typed reason under "reason" ("spend_cap"), so a
+// client tells it from every other 409 without reading the text
+// (writeErrorWithReason). The MCP tools that call these routes answer with
+// the same text.
+func writeCreateTurnError(w http.ResponseWriter, cerr *CreateTurnError) {
+	if refusal, ok := sessionguard.AsRefusal(cerr); ok {
+		writeErrorWithReason(w, cerr.Status, cerr.Message, string(refusal.Reason))
+		return
+	}
+	writeError(w, cerr.Status, cerr.Message)
+}
+
+// A refusal of the session guard (technical plan §40.1) is the third
+// reason a caller recognizes: createTurnLocked returns it as a 409
+// CreateTurnError whose sentinel is the *sessionguard.Refusal itself, so
+// errors.Is(cerr, sessionguard.ErrSpendCapReached) holds and
+// sessionguard.AsRefusal reads it whole. Its Message is the refusal's own
+// text (sessionguard.Text).
 
 // ErrPlanAwaitingApproval is createTurnLocked's own sentinel (this batch's
 // own follow-up fix to §8.1, closing the "reply matching no
@@ -542,7 +565,7 @@ type CreateTurnOptions struct {
 // travel together into createTurnLocked's own turn.ResolveEpistemicCheck
 // Enabled/turn.ShouldInjectEpistemicPreamble calls (see that function's
 // own doc comment).
-func CreateTurnCore(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, policy CreateTurnPolicy, opts ...CreateTurnOptions) (sqlcgen.Turn, bool, *CreateTurnError) {
+func CreateTurnCore(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, guard *turnguard.Guard, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, policy CreateTurnPolicy, opts ...CreateTurnOptions) (sqlcgen.Turn, bool, *CreateTurnError) {
 	logger := platform.Logger(ctx)
 
 	if _, err := sessions.Get(ctx, sessionID); err != nil {
@@ -553,7 +576,7 @@ func CreateTurnCore(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.
 		return sqlcgen.Turn{}, false, &CreateTurnError{Status: http.StatusInternalServerError, Message: "internal error"}
 	}
 
-	return createTurnLocked(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, sessionID, prompt, modelID, planMode, epistemicCheckDefault, actorUserID, policy, opts...)
+	return createTurnLocked(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, guard, sessionID, prompt, modelID, planMode, epistemicCheckDefault, actorUserID, policy, opts...)
 }
 
 // createTurnLocked is the genuinely shared core every one of this batch's
@@ -618,7 +641,25 @@ func CreateTurnCore(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.
 // independently-constructed copy. See the plan_followup block below (just
 // before tx.Begin) and the awaiting-plan gate further down for how this is
 // actually consulted.
-func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, policy CreateTurnPolicy, opts ...CreateTurnOptions) (sqlcgen.Turn, bool, *CreateTurnError) {
+//
+// guard is the session guard (technical plan §40.1, internal/app/turnguard),
+// asked after the busy and awaiting-plan gates -- their replies keep their
+// precedence, for Finding 3's reason above -- and before anything is
+// resolved or inserted, still under the session-row lock, so the spend it
+// reads is the session's own at this instant. The cap applies to every turn
+// on the session regardless of who asked for it -- a person's prompt, a
+// Slack or Linear reply, a GitHub mention, the re-review button: this is
+// §40.1's inversion of §24.6, which exempts a person's manual re-trigger from
+// the automatic re-review budget because that budget stops loops, while a
+// cap stops money, and a cap a prompt can walk past is not one. The human's
+// remedy is the audited raise of the cap, never a bypass. A refused turn is
+// never inserted, no dispatch timer is armed, and the session's stop request
+// is left as it was: the transaction rolls back, the refusal's warning and,
+// for a new crossing, its one notice are recorded after it
+// (Guard.RecordRefusal), and the caller answers on its own surface with the
+// 409 this returns (its sentinel the *sessionguard.Refusal). A guard read that
+// failed is a 500, never a refusal. guard nil admits nothing.
+func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, guard *turnguard.Guard, sessionID pgtype.UUID, prompt string, modelID *string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID, policy CreateTurnPolicy, opts ...CreateTurnOptions) (sqlcgen.Turn, bool, *CreateTurnError) {
 	logger := platform.Logger(ctx)
 
 	// opts is a trailing variadic (CreateTurnOptions' own doc comment)
@@ -839,6 +880,24 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 		}
 	}
 
+	// Technical plan §40.1: the session guard, after the busy and
+	// awaiting-plan gates and before anything is resolved or inserted, under
+	// the session-row lock taken above. It applies to every turn regardless
+	// of who asked -- §40.1's inversion of §24.6, stated in this function's
+	// doc comment -- so no caller of this core can walk past a spent cap.
+	admission, refusal, err := guard.Admit(ctx, tx, sessionID, turnguard.OriginForRequest(ctx, actorUserID), turnguard.StageCreate)
+	if err != nil {
+		logger.Error("httpapi: session guard read failed", "error", err)
+		return sqlcgen.Turn{}, false, &CreateTurnError{Status: http.StatusInternalServerError, Message: "internal error"}
+	}
+	if refusal != nil {
+		// Released before the refusal is recorded: RecordRefusal takes the
+		// session-row lock this transaction holds.
+		_ = tx.Rollback(ctx)
+		guard.RecordRefusal(ctx, sessionID, refusal)
+		return sqlcgen.Turn{}, false, &CreateTurnError{Status: http.StatusConflict, Message: sessionguard.Text(*refusal), sentinel: refusal}
+	}
+
 	// §25.6 ("workflow execution engine", §25.6): resolve which
 	// WorkflowDefinition/StepDefinition governs this new turn, and use its
 	// PromptTemplate/ModelID to build it -- internal/app/workflowengine's
@@ -1052,7 +1111,7 @@ func createTurnLocked(ctx context.Context, pool *pgxpool.Pool, sessions *postgre
 		RequestTrigger: requestTrigger,
 		RequestedBy:    requestedBy,
 		RequestText:    requestText,
-	})
+	}, admission)
 	if err != nil {
 		logger.Error("httpapi: create turn failed", "error", err)
 		return sqlcgen.Turn{}, false, &CreateTurnError{Status: http.StatusInternalServerError, Message: "internal error"}

@@ -298,15 +298,7 @@ func (a *Actor) cancelStoppedTurns(ctx context.Context, tx pgx.Tx, sessionRow sq
 			return nil, fmt.Errorf("sessionactor: update turn status: %w", err)
 		}
 
-		workflowengine.OnTurnCompleted(ctx, workflowengine.Deps{
-			Workflows:             a.stores.workflow.WithTx(tx),
-			Turns:                 a.stores.turn.WithTx(tx),
-			SlackThreadSessions:   a.stores.slackThreadSession.WithTx(tx),
-			LinearAgentSessions:   a.stores.linearAgentSession.WithTx(tx),
-			GitHubPRSessions:      a.stores.githubPRSession.WithTx(tx),
-			Outbox:                a.stores.outbox.WithTx(tx),
-			EpistemicCheckDefault: a.epistemicCheckDefault,
-		}, sessionRow, id, turn.TriggerCancel)
+		workflowengine.OnTurnCompleted(ctx, a.workflowDeps(tx), sessionRow, id, turn.TriggerCancel)
 
 		if turn.RequiresSyntheticExecutionComplete(turn.TriggerCancel) {
 			if err := a.appendEvent(ctx, tx, "execution_complete", syntheticExecutionComplete(id, from, "stopped")); err != nil {

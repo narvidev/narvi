@@ -18,6 +18,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/reviewcheck"
 	"github.com/narvidev/narvi/internal/domain/rollout"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -604,7 +605,7 @@ func TestDispatchTimer_ABackoffNeverPostponesAReArm(t *testing.T) {
 		prompt := "the turn a non-hosting replica created"
 		if _, err := narvipg.NewTurnStore(pool).WithTx(tx).CreateAndArmDispatch(ctx, sqlcgen.CreateTurnParams{
 			SessionID: sessionID, Status: sqlcgen.TurnStatusPending, Prompt: &prompt,
-		}); err != nil {
+		}, sessionguard.AdmitNewSession(sessionID.Bytes)); err != nil {
 			return err
 		}
 		return tx.Commit(ctx)

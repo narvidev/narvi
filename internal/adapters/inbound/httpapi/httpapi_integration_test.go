@@ -58,6 +58,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/sessionactivity"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowledger"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/integrations"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/platform"
@@ -635,8 +636,8 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Post("/{sessionID}/uploads/{uploadID}/complete", httpapi.ConfirmUploadAPI(rig.sessions, rig.participants, rig.pool, rig.artifacts, rig.events, rig.outbox, rig.sandboxes, rig.broadcaster, rig.blobStore, rig.objCfg))
 		r.Get("/{sessionID}/uploads/{uploadID}/content", httpapi.UploadContentAPI(rig.sessions, rig.artifacts, rig.blobStore, rig.objCfg, platform.DefaultTimeouts()))
 		r.Post("/{sessionID}/ws-token", httpapi.MintWSToken(rig.sessions, rig.wsTokens, platform.DefaultTimeouts()))
-		r.Post("/{sessionID}/turns", httpapi.CreateTurn(rig.pool, rig.sessions, rig.turns, rig.plans, rig.participants, rig.auditLog, rig.registry, nil, rig.objCfg, false))
-		r.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.participants, rig.outbox, rig.linearAgentSessions, rig.auditLog, rig.registry, false))
+		r.Post("/{sessionID}/turns", httpapi.CreateTurn(rig.pool, rig.sessions, rig.turns, rig.plans, rig.participants, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), nil, rig.objCfg, false))
+		r.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.participants, rig.outbox, rig.linearAgentSessions, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), false))
 		r.Post("/{sessionID}/plans/{planId}/reject", httpapi.RejectPlan(rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.participants, rig.outbox, rig.linearAgentSessions, rig.auditLog, false))
 		// Audit-fix batch (completeness/discoverability, M3) -- see
 		// httpapi/plans.go's own doc comment.
@@ -663,7 +664,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		// SizeExclusions is the deployment's default size patterns, the
 		// value serve.go wires from platform.Config when
 		// NARVI_REVIEW_SIZE_EXCLUDED_PATHS is unset.
-		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(rig.pool, rig.sessions, rig.turns, rig.plans, rig.auditLog, rig.registry, rig.prSessions, rig.diffFetcher, rig.reviewFindings, rig.falsePositivePatterns, rig.reviewVerdicts, nil, rig.outbound, platform.DefaultTimeouts(), appreviewtriage.Deps{RepoSettings: rig.repoSettings, ReviewVerdicts: rig.reviewVerdicts, SizeExclusions: domainreviewtriage.DefaultSizeExclusions()}, ""))
+		r.Post("/{sessionID}/review/retrigger", httpapi.RetriggerReview(rig.pool, rig.sessions, rig.turns, rig.plans, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), rig.prSessions, rig.diffFetcher, rig.reviewFindings, rig.falsePositivePatterns, rig.reviewVerdicts, nil, rig.outbound, platform.DefaultTimeouts(), appreviewtriage.Deps{RepoSettings: rig.repoSettings, ReviewVerdicts: rig.reviewVerdicts, SizeExclusions: domainreviewtriage.DefaultSizeExclusions()}, ""))
 		// review readout (§26.1's merge readout, §12.2 item 2) -- see
 		// reviewreadout.go's own doc comment. rig.diffFetcher/rig.
 		// positionResolver default nil, mirroring review/retrigger's own
@@ -824,7 +825,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 	// wiring (see decideworkflowstep.go's own doc comment).
 	router.Route("/api/workflow-runs", func(r chi.Router) {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
-		r.Post("/{runId}/steps/{stepRunId}/decide", httpapi.DecideWorkflowStep(rig.pool, rig.sessions, rig.turns, rig.participants, rig.workflows, rig.slackThreadSession, rig.linearAgentSessions, rig.prSessions, rig.outbox, rig.registry, false))
+		r.Post("/{runId}/steps/{stepRunId}/decide", httpapi.DecideWorkflowStep(rig.pool, rig.sessions, rig.turns, rig.participants, rig.workflows, rig.slackThreadSession, rig.linearAgentSessions, rig.prSessions, rig.outbox, rig.registry, turnguard.New(rig.pool, nil, false), false))
 		// GET /{runId} ("workflow definition & run API", §25.10) -- see
 		// httpapi/workflowruns.go's own doc comment.
 		r.Get("/{runId}", httpapi.GetWorkflowRun(rig.sessions, rig.workflows))

@@ -29,6 +29,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/intentclassifier"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 )
 
 // addTurn enqueues a new Pending turn carrying prompt on the EXISTING
@@ -49,7 +50,9 @@ import (
 // function's own doc comment. err is a plain *httpapi.CreateTurnError
 // (never unwrapped/converted) specifically so a caller can recognize
 // httpapi.ErrPlanAwaitingApproval via errors.Is -- handleEvent does exactly
-// that to post an honest reply instead of treating this as a hard failure.
+// that to post an honest reply instead of treating this as a hard failure
+// -- and a refusal of the session guard (guard, technical plan §40.1) via
+// sessionguard.AsRefusal, which it answers with the refusal's own text.
 //
 // actorUserID (audit-fix batch addition) is attributed onto the resulting
 // turn.create audit_log row only -- turns itself carries no per-row actor
@@ -62,8 +65,8 @@ import (
 // immediately before it -- handleEvent's own caller passes the SAME
 // deps.IntentClassifier every other classification use in this package
 // already does (handler.go).
-func addTurn(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, sessionID pgtype.UUID, prompt string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID) (turn sqlcgen.Turn, created bool, err error) {
-	turnRow, wasCreated, cerr := httpapi.CreateTurnCore(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, sessionID, prompt, nil, planMode, epistemicCheckDefault, actorUserID, httpapi.DropIfOpen)
+func addTurn(ctx context.Context, pool *pgxpool.Pool, sessions *postgres.SessionStore, turns *postgres.TurnStore, plans *postgres.PlanStore, intentSvc *intentclassifier.Service, auditLog *postgres.AuditLogStore, registry *sessionactor.Registry, guard *turnguard.Guard, sessionID pgtype.UUID, prompt string, planMode bool, epistemicCheckDefault bool, actorUserID pgtype.UUID) (turn sqlcgen.Turn, created bool, err error) {
+	turnRow, wasCreated, cerr := httpapi.CreateTurnCore(ctx, pool, sessions, turns, plans, intentSvc, auditLog, registry, guard, sessionID, prompt, nil, planMode, epistemicCheckDefault, actorUserID, httpapi.DropIfOpen)
 	if cerr != nil {
 		return sqlcgen.Turn{}, false, cerr
 	}

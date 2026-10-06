@@ -26,8 +26,10 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/loopguard"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/domain/workflow"
 )
@@ -142,6 +144,13 @@ func inTx(t *testing.T, ctx context.Context, pool *pgxpool.Pool, deps workflowen
 	bound.LinearAgentSessions = deps.LinearAgentSessions.WithTx(tx)
 	bound.GitHubPRSessions = deps.GitHubPRSessions.WithTx(tx)
 	bound.Outbox = deps.Outbox.WithTx(tx)
+	// The session guard (technical plan §40.1), bound to the same
+	// transaction, as the session actor's workflowDeps binds it: every
+	// attempt the engine dispatches is admitted by it first.
+	bound.Guard = turnguard.New(pool, nil, false).WithTx(tx, nil)
+	if bound.Origin == 0 {
+		bound.Origin = sessionguard.OriginAutomatic
+	}
 	fn(bound)
 	if err := tx.Commit(ctx); err != nil {
 		t.Fatalf("commit: %v", err)

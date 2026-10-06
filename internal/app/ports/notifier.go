@@ -176,6 +176,30 @@ const (
 	// above for the full "why a distinct Kind" reasoning.
 	NotificationKindGitHubWorkflowDecision NotificationKind = "github_workflow_decision"
 
+	// NotificationKindSlackSessionGuard is the session guard's one notice
+	// per crossing (technical plan §40.1, internal/app/turnguard): the
+	// session has reached its spend cap and takes no new turn until an
+	// administrator raises it. Enqueued only in the transaction that
+	// records the crossing's persisted warning for the first time
+	// (turnguard's Bound.Record), so every refusal of one crossing -- a
+	// person's turn refused at creation, a queued turn ended at dispatch,
+	// an automatic producer declined -- tells the session's channel once.
+	// Its payload is the plain slackapi.Payload a workflow decision notice
+	// carries, routed by sessionnotice.Enqueue, and delivered by the same
+	// planSlackNotifier instance; a kind of its own because it reports a
+	// different event, the "a distinct Kind marks a distinct triggering
+	// semantic" precedent NotificationKindSlackWorkflowDecision states.
+	NotificationKindSlackSessionGuard NotificationKind = "slack_session_guard"
+	// NotificationKindLinearSessionGuard is NotificationKindSlackSessionGuard's
+	// Linear twin: a plain linearapi.Payload (Success always true),
+	// delivered by linearNotifier's deliverOutcome.
+	NotificationKindLinearSessionGuard NotificationKind = "linear_session_guard"
+	// NotificationKindGitHubSessionGuard is NotificationKindSlackSessionGuard's
+	// GitHub twin: a plain githubapi.Payload, delivered as a pull request
+	// comment by the same githubapi.BotNotifier instance the workflow
+	// decision notice uses, which never inspects the kind.
+	NotificationKindGitHubSessionGuard NotificationKind = "github_session_guard"
+
 	// NotificationKindRWXPreviewDispatch is §4.1's ("RWX provider +
 	// previews", §4.1.2 point 2) own addition: routes to
 	// internal/adapters/outbound/rwx's own ports.Notifier implementation,

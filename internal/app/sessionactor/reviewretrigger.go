@@ -117,6 +117,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/reviewcontext"
 	appreviewtriage "github.com/narvidev/narvi/internal/app/reviewtriage"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/autoapproval"
 	"github.com/narvidev/narvi/internal/domain/knowledge"
 	"github.com/narvidev/narvi/internal/domain/reposource"
@@ -124,6 +125,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -501,6 +503,22 @@ func (a *Actor) readReviewRetriggerState(ctx context.Context) (*reviewRetriggerD
 			return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
 		}
 
+		// Technical plan §40.1: a session that has spent its cap gets no
+		// automatic re-review. Read here, with the revocation, before the
+		// GitHub fetch, the turn insert and the budget increment of phase
+		// 3: the firing is dropped, spending none of the pull request's
+		// budget, and pending_retrigger_head_sha is kept as the target, so
+		// the next push after a raise re-arms the debounce and reviews
+		// normally. The refusal records the crossing's warning, and its
+		// one notice when the crossing is new (admitAutomaticTurn).
+		if _, refusal, err := a.admitAutomaticTurn(ctx, tx, turnguard.StageAutoRetrigger); err != nil {
+			return err
+		} else if refusal != nil {
+			a.logger.Info("sessionactor: review_retrigger_debounce: the session has reached its spend cap, dropping this firing without a re-review; the pushed head stays pending",
+				"repo_full_name", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+			return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
+		}
+
 		// §24.3 step 2: the latest posted verdict for this PR, for the
 		// customer-consequential pair (§30.8) -- GetLatestNonShadow: a
 		// shadow-era "already reviewed" fact must never suppress a REAL
@@ -738,6 +756,24 @@ func (a *Actor) finishReviewRetrigger(ctx context.Context, decision *reviewRetri
 			if err != nil {
 				return err
 			}
+			// Technical plan §40.1: the session guard, read again holding
+			// the lock, at the insert -- a cost recorded while phase 2
+			// fetched counts. A refusal drops this firing as phase 1's
+			// would: no turn, no budget spent, the pushed head kept as
+			// the target, the debounce deleted.
+			var admission sessionguard.Admission
+			if !awaitingPlan {
+				var refusal *sessionguard.Refusal
+				admission, refusal, err = a.admitAutomaticTurn(ctx, tx, turnguard.StageAutoRetrigger)
+				if err != nil {
+					return err
+				}
+				if refusal != nil {
+					a.logger.Info("sessionactor: review_retrigger_debounce: the session has reached its spend cap, dropping this firing without a re-review; the pushed head stays pending",
+						"repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
+					return a.deleteTimer(ctx, tx, TimerReviewRetriggerDebounce)
+				}
+			}
 			if awaitingPlan {
 				a.logger.Info("sessionactor: review_retrigger_debounce: declining to enqueue an automatic re-review turn -- a plan is awaiting approval on this session",
 					"repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
@@ -759,7 +795,7 @@ func (a *Actor) finishReviewRetrigger(ctx context.Context, decision *reviewRetri
 						"error", verdictContextErr, "repo_full_name", decision.repoFullName, "pr_number", decision.prNumber)
 					reviewVerdictContextJSON = nil
 				}
-				if err := a.insertAutoRetriggerTurn(ctx, tx, decision, prompt, reviewCtx.HeadSHA, reviewVerdictContextJSON); err != nil {
+				if err := a.insertAutoRetriggerTurn(ctx, tx, decision, prompt, reviewCtx.HeadSHA, reviewVerdictContextJSON, admission); err != nil {
 					return err
 				}
 				if _, err := a.stores.githubPRSession.WithTx(tx).IncrementAutoRetriggerCount(ctx, decision.repoFullName, decision.prNumber); err != nil {
@@ -995,7 +1031,7 @@ func (a *Actor) composeAutoRetriggerPrompt(ctx context.Context, repoFullName str
 // identical "already resolved by this function's one caller,
 // finishReviewRetrigger, just persisted here" shape -- see that call
 // site's own doc comment for the full "why".
-func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision *reviewRetriggerDecision, prompt string, headSHA string, reviewVerdictContextJSON []byte) error {
+func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision *reviewRetriggerDecision, prompt string, headSHA string, reviewVerdictContextJSON []byte, admission sessionguard.Admission) error {
 	var reviewDepth *string
 	if decision.finalReviewDepth != "" {
 		reviewDepth = &decision.finalReviewDepth
@@ -1037,7 +1073,7 @@ func (a *Actor) insertAutoRetriggerTurn(ctx context.Context, tx pgx.Tx, decision
 		// its context first (reviewcontextcheck.go), and one whose context
 		// moved asks this lane again.
 		RequestTrigger: &requestTrigger,
-	})
+	}, admission)
 	if err != nil {
 		return fmt.Errorf("sessionactor: insert automatic re-review turn: %w", err)
 	}

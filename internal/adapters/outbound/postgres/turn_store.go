@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 )
 
 // TurnStore is a thin, pass-through wrapper around the sqlc-generated turn
@@ -59,6 +60,16 @@ var ErrTurnOutsideTransaction = errors.New("postgres: a turn is created only ins
 // creates a pending turn.
 var ErrTurnNotPending = errors.New("postgres: a turn is created pending")
 
+// ErrTurnNotAdmitted is CreateAndArmDispatch's answer for a turn the
+// session guard did not admit: admitted is the zero Admission, or one the
+// guard minted for another session. Every turn production code creates
+// passes the guard first (technical plan §40.1, internal/domain/
+// sessionguard): an Admission is minted only by sessionguard.Decide,
+// which internal/app/turnguard calls under the session-row lock, or by
+// sessionguard.AdmitNewSession for the first turn of a session created in
+// the same transaction.
+var ErrTurnNotAdmitted = errors.New("postgres: a turn is created only once the session guard admitted it")
+
 // CreateAndArmDispatch is the one way production code creates a turn
 // (technical plan §2, §3.3): it inserts the turn and, in the same
 // transaction, arms the session's dispatch timer due at once on the
@@ -70,9 +81,12 @@ var ErrTurnNotPending = errors.New("postgres: a turn is created pending")
 // whichever replica claims the timer, and again after each claim window.
 // The actor deletes the timer at the start of every dispatch evaluation
 // (sessionactor's planDispatch), so after a trigger that succeeded it is
-// gone within that evaluation. Refuses with ErrTurnOutsideTransaction on a
-// store not built by WithTx, and with ErrTurnNotPending for a turn whose
-// status is not pending, writing nothing either way.
+// gone within that evaluation. Refuses with ErrTurnNotAdmitted unless
+// admitted admits arg.SessionID -- the session guard's proof that the
+// session may take this turn (technical plan §40.1) -- with
+// ErrTurnOutsideTransaction on a store not built by WithTx, and with
+// ErrTurnNotPending for a turn whose status is not pending, writing nothing
+// in any case.
 //
 // A caller writing to a session that already exists holds the session's
 // actor-epoch row lock (SessionStore.GetActorEpochForUpdate) in the same
@@ -81,7 +95,10 @@ var ErrTurnNotPending = errors.New("postgres: a turn is created pending")
 // turn or runs after its timer was armed. A caller creating the session in
 // the same transaction needs no lock: nothing else can see the session
 // before it commits.
-func (s *TurnStore) CreateAndArmDispatch(ctx context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error) {
+func (s *TurnStore) CreateAndArmDispatch(ctx context.Context, arg sqlcgen.CreateTurnParams, admitted sessionguard.Admission) (sqlcgen.Turn, error) {
+	if !arg.SessionID.Valid || !admitted.Admits(arg.SessionID.Bytes) {
+		return sqlcgen.Turn{}, ErrTurnNotAdmitted
+	}
 	if !s.bound {
 		return sqlcgen.Turn{}, ErrTurnOutsideTransaction
 	}
@@ -97,6 +114,13 @@ func (s *TurnStore) CreateAndArmDispatch(ctx context.Context, arg sqlcgen.Create
 	}
 	return created, nil
 }
+
+// TurnAdmit is the session guard's admission of a turn, run by
+// LockedTurnCreator.CreateLockedTurn in its own transaction, after the
+// session's row lock and before the insert, so the guard reads the
+// session's spend under that lock (internal/app/turnguard's Admitter). A
+// refusal is returned as its error, a *sessionguard.Refusal.
+type TurnAdmit func(ctx context.Context, tx pgx.Tx) (sessionguard.Admission, error)
 
 // LockedTurnCreator creates a turn in a transaction of its own, under the
 // session's actor-epoch row lock (SessionStore.GetActorEpochForUpdate) --
@@ -114,10 +138,11 @@ func NewLockedTurnCreator(pool *pgxpool.Pool) *LockedTurnCreator {
 }
 
 // CreateLockedTurn begins a transaction, locks arg.SessionID's
-// actor-epoch row, creates the turn and arms its dispatch timer
-// (CreateAndArmDispatch), and commits. pgx.ErrNoRows when the session does
-// not exist; nothing is written on any error.
-func (c *LockedTurnCreator) CreateLockedTurn(ctx context.Context, arg sqlcgen.CreateTurnParams) (sqlcgen.Turn, error) {
+// actor-epoch row, asks admit whether the session may take the turn,
+// creates the turn and arms its dispatch timer (CreateAndArmDispatch), and
+// commits. pgx.ErrNoRows when the session does not exist; admit's error,
+// a refusal included, as it returned it; nothing is written on any error.
+func (c *LockedTurnCreator) CreateLockedTurn(ctx context.Context, arg sqlcgen.CreateTurnParams, admit TurnAdmit) (sqlcgen.Turn, error) {
 	tx, err := c.pool.Begin(ctx)
 	if err != nil {
 		return sqlcgen.Turn{}, fmt.Errorf("postgres: begin the turn transaction: %w", err)
@@ -128,7 +153,14 @@ func (c *LockedTurnCreator) CreateLockedTurn(ctx context.Context, arg sqlcgen.Cr
 	if _, err := q.GetSessionActorEpochForUpdate(ctx, arg.SessionID); err != nil {
 		return sqlcgen.Turn{}, fmt.Errorf("postgres: lock the session's actor epoch: %w", err)
 	}
-	created, err := (&TurnStore{q: q, bound: true}).CreateAndArmDispatch(ctx, arg)
+	if admit == nil {
+		return sqlcgen.Turn{}, ErrTurnNotAdmitted
+	}
+	admission, err := admit(ctx, tx)
+	if err != nil {
+		return sqlcgen.Turn{}, err
+	}
+	created, err := (&TurnStore{q: q, bound: true}).CreateAndArmDispatch(ctx, arg, admission)
 	if err != nil {
 		return sqlcgen.Turn{}, err
 	}

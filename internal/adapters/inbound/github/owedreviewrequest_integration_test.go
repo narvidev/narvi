@@ -38,6 +38,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactivity"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -138,7 +139,8 @@ func newOwedLabelFixture(ctx context.Context, t *testing.T) owedLabelFixture {
 		users: users, identities: narvipg.NewIdentityStore(pool), linkNotices: narvipg.NewGitHubActorLinkNoticeStore(pool),
 	}
 	coalescer := &githubingress.SessionCoalescer{
-		Pool: pool, PRSessions: narvipg.NewGitHubPRSessionStore(pool), Sessions: sessions, Turns: f.rig.turns,
+		Pool: pool, SessionGuard: turnguard.New(pool, nil, false),
+		PRSessions: narvipg.NewGitHubPRSessionStore(pool), Sessions: sessions, Turns: f.rig.turns,
 		Environments: narvipg.NewEnvironmentStore(pool), Registry: registry, AuditLog: narvipg.NewAuditLogStore(pool),
 		Plans: f.rig.plans, Identities: f.rig.identities, Users: users, Participants: participants,
 	}

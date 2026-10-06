@@ -23,6 +23,7 @@ import (
 	"github.com/narvidev/narvi/internal/domain/review"
 	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
 	domainreviewverdict "github.com/narvidev/narvi/internal/domain/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -1093,6 +1094,20 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 				// above; this one is kept for the same defensive-symmetry
 				// reason ErrRolloutNotEnrolled's own check is.
 				logger.Info("github: mention refused: repo not entitled", "repo", m.RepoFullName, "pr_number", m.PRNumber)
+				w.WriteHeader(http.StatusOK)
+				return
+			}
+			if refusal, ok := sessionguard.AsRefusal(err); ok {
+				// Technical plan §40.1: the review session has spent its
+				// cap, so the REUSE path's own httpapi.CreateTurnForBot call
+				// (coalesce.go) was refused -- a deterministic state that
+				// lasts until an administrator raises the cap, so, as for
+				// an awaiting plan below, 200 without releasing the
+				// delivery claim (a redelivery would only meet the same
+				// refusal), and an honest reply on the pull request
+				// (sessionguardreply.go).
+				logger.Info("github: mention refused by the session guard", "repo", m.RepoFullName, "pr_number", m.PRNumber, "reason", string(refusal.Reason))
+				postSessionGuardReply(ctx, logger, cfg.Comments, botToken, m.RepoFullName, m.PRNumber, refusal)
 				w.WriteHeader(http.StatusOK)
 				return
 			}

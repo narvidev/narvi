@@ -48,6 +48,7 @@ var notificationKindRepeatability = map[ports.NotificationKind]Repeatability{
 	ports.NotificationKindSlack:                 NotRepeatable,
 	ports.NotificationKindSlackPlanApproval:     NotRepeatable,
 	ports.NotificationKindSlackWorkflowDecision: NotRepeatable,
+	ports.NotificationKindSlackSessionGuard:     NotRepeatable,
 	ports.NotificationKindSlackDigest:           NotRepeatable,
 	// chat.update on the message whose channel and ts the payload already
 	// carries: a repeat rewrites the same text onto the same message.
@@ -59,6 +60,7 @@ var notificationKindRepeatability = map[ports.NotificationKind]Repeatability{
 	ports.NotificationKindLinear:                 NotRepeatable,
 	ports.NotificationKindLinearProgress:         NotRepeatable,
 	ports.NotificationKindLinearWorkflowDecision: NotRepeatable,
+	ports.NotificationKindLinearSessionGuard:     NotRepeatable,
 	// digestLinearNotifier always returns its typed error and writes
 	// nothing anywhere.
 	ports.NotificationKindLinearDigest: Repeatable,
@@ -67,6 +69,7 @@ var notificationKindRepeatability = map[ports.NotificationKind]Repeatability{
 	// second comment.
 	ports.NotificationKindGitHub:                 NotRepeatable,
 	ports.NotificationKindGitHubWorkflowDecision: NotRepeatable,
+	ports.NotificationKindGitHubSessionGuard:     NotRepeatable,
 	// The formal review (githubapi.VerdictNotifier, CreateReview) and its
 	// label sync: a repeat submits a second review (§21.1b).
 	ports.NotificationKindGitHubVerdict: NotRepeatable,

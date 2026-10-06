@@ -34,6 +34,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/framecut"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -416,6 +417,7 @@ func TestHandlePlanVerdict_UnauthorizedActor_DeniedByOwnAuthorizationCheck(t *te
 		LinearAgentSessions: linearAgentSessions,
 		AuditLog:            auditLog,
 		Registry:            registry,
+		SessionGuard:        turnguard.New(pool, nil, false),
 		Participants:        participants,
 		IdentityLink:        newIdentityLinkDepsForTest(pool, auditLog),
 		SlackClient:         slackapi.New(recordingServer.Client(), recordingServer.URL, "test-bot-token"),

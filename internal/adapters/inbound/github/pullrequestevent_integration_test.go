@@ -19,6 +19,7 @@ import (
 	githubingress "github.com/narvidev/narvi/internal/adapters/inbound/github"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -55,6 +56,7 @@ func newSentinelFixTestServer(t *testing.T, pool *pgxpool.Pool, sentinelFixes *n
 
 	coalescer := &githubingress.SessionCoalescer{
 		Pool:         pool,
+		SessionGuard: turnguard.New(pool, nil, false),
 		PRSessions:   narvipg.NewGitHubPRSessionStore(pool),
 		Sessions:     narvipg.NewSessionStore(pool),
 		Turns:        narvipg.NewTurnStore(pool),

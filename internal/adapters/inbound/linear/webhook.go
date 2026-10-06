@@ -26,10 +26,12 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowlinear"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	"github.com/narvidev/narvi/internal/domain/framecut"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -150,11 +152,16 @@ var emptyReviseFeedbackReplyText = fmt.Sprintf(
 // (§5.1), the full session-creation path (CreateSessionCore), the
 // Linear-specific dedupe/installation stores, and the outbound client.
 type Deps struct {
-	Pool          *pgxpool.Pool
-	Sessions      *postgres.SessionStore
-	Turns         *postgres.TurnStore
-	Environments  *postgres.EnvironmentStore
-	Registry      *sessionactor.Registry
+	Pool         *pgxpool.Pool
+	Sessions     *postgres.SessionStore
+	Turns        *postgres.TurnStore
+	Environments *postgres.EnvironmentStore
+	Registry     *sessionactor.Registry
+	// SessionGuard is the session guard (technical plan §40.1,
+	// internal/app/turnguard): every turn this adapter asks the control
+	// plane to create, and every plan approval, passes it, and a session
+	// that has spent its cap is refused with an honest reply.
+	SessionGuard  *turnguard.Guard
 	Deliveries    *postgres.WebhookDeliveryStore
 	AgentSessions *postgres.LinearAgentSessionStore
 	Installations *postgres.LinearInstallationStore
@@ -999,7 +1006,7 @@ func (deps Deps) handlePrompted(ctx context.Context, payload agentSessionEventWe
 	// actorUserID attributed) and L12 (this package's own copy-pasted
 	// hasOpenTurn helper is gone entirely -- httpapi's own copy, already
 	// unexported there, is the only one left).
-	createdTurn, wasCreated, cerr := httpapi.CreateTurnCore(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.IntentClassifier, deps.AuditLog, deps.Registry, sessionID, prompt, nil, planMode, deps.EpistemicCheckDefault, actorUserID, httpapi.DropIfOpen)
+	createdTurn, wasCreated, cerr := httpapi.CreateTurnCore(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.IntentClassifier, deps.AuditLog, deps.Registry, deps.SessionGuard, sessionID, prompt, nil, planMode, deps.EpistemicCheckDefault, actorUserID, httpapi.DropIfOpen)
 	if cerr != nil {
 		if errors.Is(cerr, httpapi.ErrPlanAwaitingApproval) {
 			// a follow-up fix (§8.1): honest reply, never a hard
@@ -1011,6 +1018,14 @@ func (deps Deps) handlePrompted(ctx context.Context, payload agentSessionEventWe
 				cut = deps.awaitingPlanCut(ctx, logger, sessionID, awaitingPlanID)
 			}
 			deps.postThoughtNotice(ctx, payload.OrganizationID, payload.AgentSession.ID, planAwaitingApprovalReplyText(cut), notice)
+			return true
+		}
+		if refusal, ok := sessionguard.AsRefusal(cerr); ok {
+			// The session has spent its cap (technical plan §40.1): a
+			// deterministic state, never a failure a redelivery could
+			// fix, answered honestly with the refusal's own text.
+			logger.Info("linear: prompted reply refused by the session guard", "session_id", sessionID.String(), "reason", string(refusal.Reason))
+			deps.postThoughtNotice(ctx, payload.OrganizationID, payload.AgentSession.ID, refusal.Error(), notice)
 			return true
 		}
 		logger.Error("linear: create turn failed", "status", cerr.Status, "message", cerr.Message, "session_id", sessionID.String())
@@ -1149,7 +1164,7 @@ func (deps Deps) handlePlanVerdict(ctx context.Context, logger *slog.Logger, ses
 		return false
 	}
 
-	outcome, err := httpapi.DecidePlan(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Events, deps.PlanDocuments, deps.Outbox, deps.AgentSessions, deps.AuditLog, deps.Registry, sessionID, planID, httpapi.PlanVerdict(verdict), decidedBy, deps.EpistemicCheckDefault)
+	outcome, err := httpapi.DecidePlan(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Events, deps.PlanDocuments, deps.Outbox, deps.AgentSessions, deps.AuditLog, deps.Registry, deps.SessionGuard, sessionID, planID, httpapi.PlanVerdict(verdict), decidedBy, deps.EpistemicCheckDefault)
 	if err != nil {
 		if errors.Is(err, httpapi.ErrPlanCut) {
 			// The plan's text was cut on its way from the sandbox, so it
@@ -1160,6 +1175,14 @@ func (deps Deps) handlePlanVerdict(ctx context.Context, logger *slog.Logger, ses
 		}
 		if errors.Is(err, httpapi.ErrPlanOpenTurnInFlight) {
 			deps.postPlanOutcomeActivity(ctx, logger, organizationID, agentSessionID, "A revision is already in progress for this plan -- try again once it completes.", identityNotice)
+			return true
+		}
+		if refusal, ok := sessionguard.AsRefusal(err); ok {
+			// The session has spent its cap (technical plan §40.1): the
+			// plan stays awaiting approval, and the reply is the
+			// refusal's own text.
+			logger.Info("linear: plan approval refused by the session guard", "plan_id", planID.String(), "session_id", sessionID.String(), "reason", string(refusal.Reason))
+			deps.postPlanOutcomeActivity(ctx, logger, organizationID, agentSessionID, refusal.Error(), identityNotice)
 			return true
 		}
 		logger.Error("linear: decide plan failed", "error", err, "plan_id", planID.String(), "session_id", sessionID.String())

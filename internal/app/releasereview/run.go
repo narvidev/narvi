@@ -111,7 +111,14 @@ type Deps struct {
 	// unset simply means a dispatched composition review's own findings
 	// carry no recorded anchor, never a panic or a degraded manifest check.
 	CompositionAnchor CompositionAnchorUpdater
-	Timeouts          platform.Timeouts
+	// CompositionGuard is the session guard (internal/app/turnguard,
+	// technical plan §40.1): the composition review's turn is admitted by
+	// it under the session's row lock, in CompositionTurns' own
+	// transaction, and declined for this cycle when the session has
+	// spent its cap. Required like CompositionTurns: unset declines the
+	// pass, since no turn is created without the guard.
+	CompositionGuard CompositionGuard
+	Timeouts         platform.Timeouts
 }
 
 // Input is what Run needs to know about the just-detected release PR.

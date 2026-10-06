@@ -19,6 +19,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 )
 
 func validStepOutcomeRequestJSON() string {
@@ -147,7 +148,7 @@ func TestPostWorkflowStepOutcome_Success_RecordsOnLiveStepRun(t *testing.T) {
 	ctx := context.Background()
 	session := bareSessionWithSandbox(ctx, t, rig, "step-outcome-success")
 
-	created, _, cerr := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, session.ID, "do the thing", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen)
+	created, _, cerr := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, "do the thing", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen)
 	if cerr != nil {
 		t.Fatalf("CreateTurnCore: status=%d message=%q", cerr.Status, cerr.Message)
 	}
@@ -198,7 +199,7 @@ func TestPostWorkflowStepOutcome_SecondCallAfterStepFinished_BadRequest(t *testi
 	ctx := context.Background()
 	session := bareSessionWithSandbox(ctx, t, rig, "step-outcome-conflict")
 
-	if _, _, cerr := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, session.ID, "do the thing", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen); cerr != nil {
+	if _, _, cerr := httpapi.CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, "do the thing", nil, false, false, pgtype.UUID{}, httpapi.RejectIfOpen); cerr != nil {
 		t.Fatalf("CreateTurnCore: status=%d message=%q", cerr.Status, cerr.Message)
 	}
 

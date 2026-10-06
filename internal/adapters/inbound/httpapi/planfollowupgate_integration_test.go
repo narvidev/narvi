@@ -21,6 +21,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/intentclassifier"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	intentdomain "github.com/narvidev/narvi/internal/domain/intent"
 )
 
@@ -91,7 +92,7 @@ func TestCreateTurnCore_PlanFollowup_ConfidentAmend_PromotesToRevisionTurn(t *te
 	templates := narvipg.NewPromptTemplateStore(rig.pool)
 	classifier := intentclassifier.New(llm, "anthropic", "claude-haiku-4-5", templates, nil, nil)
 
-	created, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, session.ID, "actually let's do it differently", nil, false, false, pgtype.UUID{}, RejectIfOpen)
+	created, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, "actually let's do it differently", nil, false, false, pgtype.UUID{}, RejectIfOpen)
 
 	if cerr != nil {
 		t.Fatalf("cerr = %+v, want nil (a confident amend verdict must unblock dispatch)", cerr)
@@ -127,7 +128,7 @@ func TestCreateTurnCore_PlanFollowup_ConfidentAnswer_StillBlocked(t *testing.T) 
 	templates := narvipg.NewPromptTemplateStore(rig.pool)
 	classifier := intentclassifier.New(llm, "anthropic", "claude-haiku-4-5", templates, nil, nil)
 
-	_, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, session.ID, "yes, the staging one", nil, false, false, pgtype.UUID{}, RejectIfOpen)
+	_, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, "yes, the staging one", nil, false, false, pgtype.UUID{}, RejectIfOpen)
 
 	assertAwaitingApprovalDecline(t, wasCreated, cerr)
 	if llm.calls != 1 {
@@ -149,7 +150,7 @@ func TestCreateTurnCore_PlanFollowup_LowConfidence_FailsOpenToBlocked(t *testing
 	templates := narvipg.NewPromptTemplateStore(rig.pool)
 	classifier := intentclassifier.New(llm, "anthropic", "claude-haiku-4-5", templates, nil, nil)
 
-	_, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, session.ID, "maybe? not sure", nil, false, false, pgtype.UUID{}, RejectIfOpen)
+	_, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, "maybe? not sure", nil, false, false, pgtype.UUID{}, RejectIfOpen)
 
 	assertAwaitingApprovalDecline(t, wasCreated, cerr)
 }
@@ -169,7 +170,7 @@ func TestCreateTurnCore_PlanFollowup_ClassifierError_FailsOpenToBlocked(t *testi
 	templates := narvipg.NewPromptTemplateStore(rig.pool)
 	classifier := intentclassifier.New(llm, "anthropic", "claude-haiku-4-5", templates, nil, nil)
 
-	_, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, session.ID, "let's change the approach", nil, false, false, pgtype.UUID{}, RejectIfOpen)
+	_, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, "let's change the approach", nil, false, false, pgtype.UUID{}, RejectIfOpen)
 
 	assertAwaitingApprovalDecline(t, wasCreated, cerr)
 }
@@ -184,7 +185,7 @@ func TestCreateTurnCore_PlanFollowup_NilClassifier_FailsOpenToBlocked(t *testing
 	session := rig.newFixtureSession(t, ctx)
 	rig.seedAwaitingApprovalPlan(t, ctx, session.ID)
 
-	_, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, session.ID, "let's change the approach", nil, false, false, pgtype.UUID{}, RejectIfOpen)
+	_, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, nil, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, "let's change the approach", nil, false, false, pgtype.UUID{}, RejectIfOpen)
 
 	assertAwaitingApprovalDecline(t, wasCreated, cerr)
 }
@@ -205,7 +206,7 @@ func TestCreateTurnCore_PlanFollowup_PlanModeTrue_NeverClassifies(t *testing.T) 
 	templates := narvipg.NewPromptTemplateStore(rig.pool)
 	classifier := intentclassifier.New(llm, "anthropic", "claude-haiku-4-5", templates, nil, nil)
 
-	created, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, session.ID, "revise: drop the retry", nil, true, false, pgtype.UUID{}, RejectIfOpen)
+	created, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, "revise: drop the retry", nil, true, false, pgtype.UUID{}, RejectIfOpen)
 
 	if cerr != nil {
 		t.Fatalf("cerr = %+v, want nil (planMode=true must always bypass the awaiting-plan gate)", cerr)
@@ -237,7 +238,7 @@ func TestCreateTurnCore_PlanFollowup_NoAwaitingPlan_NeverClassifies(t *testing.T
 	templates := narvipg.NewPromptTemplateStore(rig.pool)
 	classifier := intentclassifier.New(llm, "anthropic", "claude-haiku-4-5", templates, nil, nil)
 
-	created, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, session.ID, "an ordinary message", nil, false, false, pgtype.UUID{}, RejectIfOpen)
+	created, wasCreated, cerr := CreateTurnCore(ctx, rig.pool, rig.sessions, rig.turns, rig.plans, classifier, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), session.ID, "an ordinary message", nil, false, false, pgtype.UUID{}, RejectIfOpen)
 
 	if cerr != nil {
 		t.Fatalf("cerr = %+v, want nil", cerr)

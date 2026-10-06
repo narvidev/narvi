@@ -565,6 +565,23 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 			return err
 		}
 		entries = toQueueEntries(turns)
+
+		// Technical plan §40.1: the session guard's second check, made as a
+		// queued turn is about to be dispatched, before anything is spawned
+		// or sent for it (sessionguard.go). A session that has spent its cap
+		// dispatches nothing more: every pending turn ends, never failing
+		// the session, and the round ends here. Only a pending pick reaches
+		// it, so no turn is in flight: the guard never reaches one that
+		// is, and a re-send of one (the branch below) is never asked about.
+		if hasPending {
+			closed, err := a.endPendingTurnsIfGuardClosed(ctx, tx, sessionRow, turns, now)
+			if err != nil {
+				return err
+			}
+			if closed {
+				return nil
+			}
+		}
 		if !hasPending {
 			// §3.3 ("turn recovery", §9.3 scenario #2): no dispatchable
 			// Pending turn -- but there may still be an in-flight
@@ -1494,15 +1511,7 @@ func (a *Actor) endTurnsOnSpawnRefusal(ctx context.Context, tx pgx.Tx, sessionRo
 		}); err != nil {
 			return fmt.Errorf("sessionactor: update turn status: %w", err)
 		}
-		workflowengine.OnTurnRefused(ctx, workflowengine.Deps{
-			Workflows:             a.stores.workflow.WithTx(tx),
-			Turns:                 a.stores.turn.WithTx(tx),
-			SlackThreadSessions:   a.stores.slackThreadSession.WithTx(tx),
-			LinearAgentSessions:   a.stores.linearAgentSession.WithTx(tx),
-			GitHubPRSessions:      a.stores.githubPRSession.WithTx(tx),
-			Outbox:                a.stores.outbox.WithTx(tx),
-			EpistemicCheckDefault: a.epistemicCheckDefault,
-		}, sessionRow, t.ID, refusal.reason)
+		workflowengine.OnTurnRefused(ctx, a.workflowDeps(tx), sessionRow, t.ID, refusal.reason)
 		if turn.RequiresSyntheticExecutionComplete(trig) {
 			if err := a.appendEvent(ctx, tx, "execution_complete", syntheticExecutionComplete(t.ID, from, refusal.reason)); err != nil {
 				return err
@@ -2601,15 +2610,7 @@ func (a *Actor) failDispatchedTurn(ctx context.Context, turnID pgtype.UUID, fail
 		if err != nil {
 			return fmt.Errorf("sessionactor: get session: %w", err)
 		}
-		deps := workflowengine.Deps{
-			Workflows:             a.stores.workflow.WithTx(tx),
-			Turns:                 a.stores.turn.WithTx(tx),
-			SlackThreadSessions:   a.stores.slackThreadSession.WithTx(tx),
-			LinearAgentSessions:   a.stores.linearAgentSession.WithTx(tx),
-			GitHubPRSessions:      a.stores.githubPRSession.WithTx(tx),
-			Outbox:                a.stores.outbox.WithTx(tx),
-			EpistemicCheckDefault: a.epistemicCheckDefault,
-		}
+		deps := a.workflowDeps(tx)
 		if failure.refused {
 			workflowengine.OnTurnRefused(ctx, deps, sessionRow, turnID, failure.reason)
 		} else {

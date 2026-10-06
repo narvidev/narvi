@@ -106,8 +106,10 @@ import (
 	"github.com/narvidev/narvi/internal/app/identitylink"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowslack"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -132,6 +134,11 @@ type InteractiveDeps struct {
 	Outbox              *postgres.OutboxStore
 	LinearAgentSessions *postgres.LinearAgentSessionStore
 	Registry            *sessionactor.Registry
+	// SessionGuard is the session guard (technical plan §40.1,
+	// internal/app/turnguard): every turn this adapter asks the control
+	// plane to create, and every plan approval, passes it, and a session
+	// that has spent its cap is refused with an honest reply.
+	SessionGuard *turnguard.Guard
 	// SlackClient is typed as the shadowslack.Client interface, never the
 	// concrete *slackapi.Client -- this package no longer constructs a
 	// client of its own (§30.3's "one client per provider, ingress
@@ -723,7 +730,7 @@ func (deps InteractiveDeps) decideAndUpdateMessage(ctx context.Context, logger *
 		return
 	}
 
-	outcome, err := httpapi.DecidePlan(decideCtx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Events, deps.PlanDocuments, deps.Outbox, deps.LinearAgentSessions, deps.AuditLog, deps.Registry, sessionID, planID, verdict, decidedBy, deps.EpistemicCheckDefault)
+	outcome, err := httpapi.DecidePlan(decideCtx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.Events, deps.PlanDocuments, deps.Outbox, deps.LinearAgentSessions, deps.AuditLog, deps.Registry, deps.SessionGuard, sessionID, planID, verdict, decidedBy, deps.EpistemicCheckDefault)
 
 	switch {
 	case errors.Is(err, httpapi.ErrPlanCut):
@@ -744,6 +751,13 @@ func (deps InteractiveDeps) decideAndUpdateMessage(ctx context.Context, logger *
 		// answers either.
 		logger.Info("slack: interactivity: approval refused, a turn of the session is open", "plan_id", planIDStr, "session_id", sessionIDStr)
 		deps.answerOpenTurnRefusal(decideCtx, logger, sessionID, planID, channel, slackUserID, messageTS)
+	case isSessionGuardRefusal(err):
+		// The session has spent its cap (technical plan §40.1): the plan
+		// stays awaiting approval and the approval message is left as it
+		// is, so the click works again once an administrator raises the
+		// cap. The reason goes to the clicking user alone, like a cut's.
+		logger.Info("slack: interactivity: approval refused by the session guard", "plan_id", planIDStr, "session_id", sessionIDStr)
+		deps.replyPrivately(decideCtx, logger, channel, slackUserID, messageTS, err.Error())
 	case err != nil:
 		// Any other failure, the decision's own budget running out
 		// included: the plan is as it was, unless the failure is the
@@ -943,13 +957,25 @@ func writeViewSubmissionError(w http.ResponseWriter, text string) {
 // requestChangesRefusalText picks the modal text for a CreateTurnCore
 // failure: the busy text when the refusal is RejectIfOpen's open-turn 409,
 // recognized by its sentinel (httpapi.ErrTurnAlreadyOpen) and never by its
-// Message or its Status alone, and the generic error text for anything
-// else.
+// Message or its Status alone; the session guard's own text when the
+// session has spent its cap (technical plan §40.1), recognized by its
+// refusal; and the generic error text for anything else.
 func requestChangesRefusalText(cerr *httpapi.CreateTurnError) string {
 	if errors.Is(cerr, httpapi.ErrTurnAlreadyOpen) {
 		return slackRequestChangesBusyErrorText
 	}
+	if refusal, ok := sessionguard.AsRefusal(cerr); ok {
+		return refusal.Error()
+	}
 	return slackRequestChangesErrorText
+}
+
+// isSessionGuardRefusal reports whether err is the session guard's refusal
+// (technical plan §40.1): the session has spent its cap and takes no new
+// turn. Its Error is the text the person is told.
+func isSessionGuardRefusal(err error) bool {
+	_, ok := sessionguard.AsRefusal(err)
+	return ok
 }
 
 // handleViewSubmission processes the "Request changes" modal's own
@@ -1126,7 +1152,7 @@ func (deps InteractiveDeps) handleViewSubmission(ctx context.Context, w http.Res
 	// picks, so the feedback stays in the field. Nothing is queued. Warn,
 	// not Error: CreateTurnCore already logs its own internal failures at
 	// Error, and an open turn is an expected state, not a fault.
-	if _, _, cerr := httpapi.CreateTurnCore(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, nil, deps.AuditLog, deps.Registry, sessionID, feedback, nil, true, deps.EpistemicCheckDefault, actorUserID, httpapi.RejectIfOpen); cerr != nil {
+	if _, _, cerr := httpapi.CreateTurnCore(ctx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, nil, deps.AuditLog, deps.Registry, deps.SessionGuard, sessionID, feedback, nil, true, deps.EpistemicCheckDefault, actorUserID, httpapi.RejectIfOpen); cerr != nil {
 		logger.Warn("slack: interactivity: create request-changes turn failed", "status", cerr.Status, "message", cerr.Message, "session_id", sessionIDStr)
 		writeViewSubmissionError(w, requestChangesRefusalText(cerr))
 		return

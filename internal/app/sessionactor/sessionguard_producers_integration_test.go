@@ -1,0 +1,153 @@
+//go:build integration
+
+package sessionactor
+
+import (
+	"context"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
+	"github.com/narvidev/narvi/internal/app/ports"
+	domainreviewtriage "github.com/narvidev/narvi/internal/domain/reviewtriage"
+	"github.com/narvidev/narvi/internal/platform"
+)
+
+// This file is technical plan §40.1's spend cap as the session actor's own
+// automatic producers meet it: the automatic re-review and an owed review
+// request's re-run, each refused, never failing anything and spending
+// nothing a person would miss.
+
+// spendOn stores a completed, dispatched turn of sessionID that cost usd.
+func spendOn(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, usd string) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `INSERT INTO turns (session_id, status, dispatched_at, completed_at, cost_usd) VALUES ($1, 'completed', now(), now(), $2::numeric)`, sessionID, usd); err != nil {
+		t.Fatalf("store the spend: %v", err)
+	}
+}
+
+// guardRecorded counts sessionID's warnings saying it reached its spend cap
+// and its code-host guard notices.
+func guardRecorded(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID) (warnings, notices int) {
+	t.Helper()
+	warnings = scalarInt(ctx, t, pool, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'warning' AND payload->>'message' LIKE 'This session has stopped taking new turns%'`, sessionID)
+	notices = scalarInt(ctx, t, pool, `SELECT count(*) FROM outbox WHERE session_id = $1 AND kind = $2`, sessionID, string(ports.NotificationKindGitHubSessionGuard))
+	return warnings, notices
+}
+
+// costOnFetch is a review diff fetcher that, as the pull request is read
+// -- with no transaction of the actor's open -- runs onRead first.
+type costOnFetch struct {
+	*fakeReviewDiffFetcher
+	onRead func()
+}
+
+func (f *costOnFetch) GetPullRequest(ctx context.Context, owner, repo string, number int32, token string) (githubapi.PullRequest, error) {
+	if f.onRead != nil {
+		f.onRead()
+		f.onRead = nil
+	}
+	return f.fakeReviewDiffFetcher.GetPullRequest(ctx, owner, repo, number, token)
+}
+
+// TestAutoRetrigger_AtSpendCap_DropsWithoutSpendingBudget: a debounce
+// firing for a review session past its cap drops that firing -- no turn,
+// none of the pull request's re-review budget spent, the pushed head kept
+// as the target for the next push after a raise, the debounce deleted --
+// and records the crossing's warning and its one notice. Refused before
+// the code host is read; and, when a cost committed while it was read
+// takes the session past its cap, refused again at the insert.
+func TestAutoRetrigger_AtSpendCap_DropsWithoutSpendingBudget(t *testing.T) {
+	ctx := context.Background()
+
+	for _, tc := range []struct {
+		name        string
+		spentBefore string
+		duringFetch string
+		wantPRReads int
+	}{
+		{name: "past the cap when it fires", spentBefore: "2.00", wantPRReads: 0},
+		{name: "past the cap by a cost recorded while the pull request was read", spentBefore: "0.50", duringFetch: "1.50", wantPRReads: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newTestPool(t)
+			f := newAutoRetriggerFixture(ctx, t, pool)
+			if _, err := f.repoSettings.UpsertAutoRetriggerReviewToggle(ctx, f.repoFullName, true); err != nil {
+				t.Fatal(err)
+			}
+			setRepoCap(ctx, t, pool, f.repoFullName, "1.00")
+			spendOn(ctx, t, pool, f.sessionID, tc.spentBefore)
+			f.setPendingHeadSHA(ctx, t, "sha-pushed-past-the-cap")
+			f.armDebounceTimer(ctx, t)
+			before := f.getPRSession(ctx, t).AutoRetriggerCount
+
+			inner := &fakeReviewDiffFetcher{nextHeadSHA: "sha-live", nextBaseRef: "main", nextDiff: oneLineReadableDiff}
+			fetcher := &costOnFetch{fakeReviewDiffFetcher: inner}
+			if tc.duringFetch != "" {
+				fetcher.onRead = func() { spendOn(ctx, t, pool, f.sessionID, tc.duringFetch) }
+			}
+			r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false,
+				RegistryOptions{ReviewDiffFetcher: fetcher, GitHubBotHandle: "narvi-bot", GitHubOutbound: platform.MustNewGitHubOutboundConfig("test-token"), ReviewSizeExclusions: domainreviewtriage.DefaultSizeExclusions()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = r.Shutdown() })
+			fireDebounceTimer(ctx, t, r, f)
+
+			reviews := scalarInt(ctx, t, pool, `SELECT count(*) FROM turns WHERE session_id = $1 AND is_review_attempt`, f.sessionID)
+			if reviews != 0 {
+				t.Fatalf("review turns = %d, want none past the cap", reviews)
+			}
+			row := f.getPRSession(ctx, t)
+			if row.AutoRetriggerCount != before {
+				t.Fatalf("auto_retrigger_count = %d, want %d: a refused firing spends no budget", row.AutoRetriggerCount, before)
+			}
+			if row.PendingRetriggerHeadSha == nil || *row.PendingRetriggerHeadSha != "sha-pushed-past-the-cap" {
+				t.Fatalf("pending head = %v, want kept for the next push after a raise", row.PendingRetriggerHeadSha)
+			}
+			if inner.getPRCalls != tc.wantPRReads {
+				t.Fatalf("pull request reads = %d, want %d", inner.getPRCalls, tc.wantPRReads)
+			}
+			if warnings, notices := guardRecorded(ctx, t, pool, f.sessionID); warnings != 1 || notices != 1 {
+				t.Fatalf("guard warnings %d, notices %d; want one of each", warnings, notices)
+			}
+		})
+	}
+}
+
+// TestOwedReviewRequest_AtSpendCap_DroppedAndRequesterTold: a person's
+// request owed after its pull request moved, served when the session has
+// since reached its spend cap, is dropped rather than re-run, and its
+// requester is told once, why -- beside the crossing's own warning and
+// notice. Nothing is inserted.
+func TestOwedReviewRequest_AtSpendCap_DroppedAndRequesterTold(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := newContextFixture(ctx, t, pool, "acme/owed-at-cap", 860)
+	setRepoCap(ctx, t, pool, f.repoFullName, "1.00")
+	seedOwedRequest(ctx, t, f, createRequester(ctx, t, pool, "at-cap"))
+	spendOn(ctx, t, pool, f.sessionID, "1.25")
+	auth := &fakeReviewRequestAuthorizer{allowed: true}
+	rig := newOwedRig(ctx, t, pool, f.sessionID, nil, auth)
+
+	pumpUntilOwedServed(ctx, t, rig, f)
+	if runs := reRuns(ctx, t, f); len(runs) != 0 {
+		t.Fatalf("re-runs = %d, want none past the cap", len(runs))
+	}
+	notices := dropNotices(ctx, t, f)
+	if len(notices) != 1 || !strings.Contains(notices[0], "the Re-run review button") || !strings.Contains(notices[0], "spend cap") {
+		t.Fatalf("drop notices = %q, want one telling the requester the session reached its spend cap", notices)
+	}
+	if warnings := dropWarnings(ctx, t, f); len(warnings) != 1 || !strings.Contains(warnings[0], "spend cap") {
+		t.Fatalf("drop warnings = %q, want one saying why", warnings)
+	}
+	if warnings, notices := guardRecorded(ctx, t, pool, f.sessionID); warnings != 1 || notices != 1 {
+		t.Fatalf("guard warnings %d, notices %d; want the crossing's one of each", warnings, notices)
+	}
+	if n := sentPrompts(t, rig.commander); n != 0 {
+		t.Fatalf("prompts sent = %d, want none", n)
+	}
+}

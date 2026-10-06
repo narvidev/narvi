@@ -79,11 +79,13 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/auditlog"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/knowledge"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/reviewpost"
 	"github.com/narvidev/narvi/internal/domain/reviewverdict"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -102,6 +104,9 @@ const (
 	// owedRequestDropBound: the request met a moved context more times in
 	// a row than ReviewContextMoveMaxConsecutive allows.
 	owedRequestDropBound
+	// owedRequestDropSessionGuard: the session has reached its spend cap
+	// (technical plan §40.1), so its re-run would be refused.
+	owedRequestDropSessionGuard
 )
 
 func (d owedRequestDrop) String() string {
@@ -110,6 +115,8 @@ func (d owedRequestDrop) String() string {
 		return "unauthorized"
 	case owedRequestDropBound:
 		return "context_moved_bound"
+	case owedRequestDropSessionGuard:
+		return "session_guard"
 	default:
 		return fmt.Sprintf("owedRequestDrop(%d)", int(d))
 	}
@@ -187,7 +194,23 @@ func (a *Actor) handleOwedReviewRequestTimer(ctx context.Context) error {
 			}
 			return a.rearmOrDeleteOwedReviewRequestTimer(ctx, tx)
 		}
-		created, err := a.insertOwedReviewRequestTurn(ctx, tx, sessionRow, served, composed, owed.repoFullName, owed.prNumber)
+		// Technical plan §40.1: the session guard, under the lock, before
+		// the re-run is inserted. A session that has spent its cap drops
+		// the request and tells its requester once, as an unauthorized
+		// one is: a request kept would only be refused again, and nothing
+		// waits held for a raise. The crossing's warning and notice are
+		// recorded beside the drop's own (admitAutomaticTurn).
+		admission, refusal, err := a.admitAutomaticTurn(ctx, tx, turnguard.StageOwedRequest)
+		if err != nil {
+			return err
+		}
+		if refusal != nil {
+			if err := a.dropOwedReviewRequest(ctx, tx, served, owed.repoFullName, owed.prNumber, owedRequestDropSessionGuard); err != nil {
+				return err
+			}
+			return a.rearmOrDeleteOwedReviewRequestTimer(ctx, tx)
+		}
+		created, err := a.insertOwedReviewRequestTurn(ctx, tx, sessionRow, served, composed, owed.repoFullName, owed.prNumber, admission)
 		if err != nil {
 			return err
 		}
@@ -348,7 +371,7 @@ func (a *Actor) rearmOrDeleteOwedReviewRequestTimer(ctx context.Context, tx pgx.
 // text and count of moves in a row, so a move it meets in turn is counted
 // from there -- and the head, context, depth and prompt composed for the
 // head the pull request has now.
-func (a *Actor) insertOwedReviewRequestTurn(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, owed sqlcgen.OwedReviewRequest, composed composedReviewTurn, repoFullName string, prNumber int32) (sqlcgen.Turn, error) {
+func (a *Actor) insertOwedReviewRequestTurn(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, owed sqlcgen.OwedReviewRequest, composed composedReviewTurn, repoFullName string, prNumber int32, admission sessionguard.Admission) (sqlcgen.Turn, error) {
 	reviewCtx := composed.reviewCtx
 	verdictContextJSON, err := json.Marshal(reviewverdict.Context{
 		BaseRef:       reviewCtx.BaseRef,
@@ -401,7 +424,7 @@ func (a *Actor) insertOwedReviewRequestTurn(ctx context.Context, tx pgx.Tx, sess
 		RequestedBy:             owed.RequestedBy,
 		RequestText:             owed.RequestText,
 		ContextMoves:            &moves,
-	})
+	}, admission)
 	if err != nil {
 		return sqlcgen.Turn{}, fmt.Errorf("sessionactor: insert the owed review request's re-run: %w", err)
 	}
@@ -442,6 +465,9 @@ func owedRequestDropMessage(trigger string, why owedRequestDrop, moves int32) st
 	lane := owedRequestLane(trigger)
 	if why == owedRequestDropBound {
 		return fmt.Sprintf("A review requested through %s was not run: the pull request changed while it waited, %d times in a row, so it was not run again for the new head.", lane, moves)
+	}
+	if why == owedRequestDropSessionGuard {
+		return fmt.Sprintf("A review requested through %s was not run: the pull request changed while it waited, and this session has since reached its spend cap, so it takes no new turn until an administrator raises the cap. Ask for the review again once it is raised.", lane)
 	}
 	return fmt.Sprintf("A review requested through %s was not run: the pull request changed while it waited, and the person who asked can no longer request reviews here, so it was not run again for the new head.", lane)
 }

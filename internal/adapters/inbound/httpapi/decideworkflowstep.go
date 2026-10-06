@@ -77,8 +77,10 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/app/workflowengine"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
+	"github.com/narvidev/narvi/internal/domain/sessionguard"
 	"github.com/narvidev/narvi/internal/domain/workflow"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -120,6 +122,7 @@ func DecideWorkflowStep(
 	githubPRSessions *postgres.GitHubPRSessionStore,
 	outbox *postgres.OutboxStore,
 	registry *sessionactor.Registry,
+	guard *turnguard.Guard,
 	epistemicCheckDefault bool,
 ) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -272,13 +275,34 @@ func DecideWorkflowStep(
 		}
 
 		deps := workflowengine.Deps{
-			Workflows:             txWorkflows,
-			Turns:                 turns.WithTx(tx),
-			SlackThreadSessions:   slackThreadSessions.WithTx(tx),
-			LinearAgentSessions:   linearAgentSessions.WithTx(tx),
-			GitHubPRSessions:      githubPRSessions.WithTx(tx),
-			Outbox:                outbox.WithTx(tx),
+			Workflows:           txWorkflows,
+			Turns:               turns.WithTx(tx),
+			SlackThreadSessions: slackThreadSessions.WithTx(tx),
+			LinearAgentSessions: linearAgentSessions.WithTx(tx),
+			GitHubPRSessions:    githubPRSessions.WithTx(tx),
+			Outbox:              outbox.WithTx(tx),
+			// Technical plan §40.1: the attempt an approve or a revise
+			// dispatches is admitted by the session guard first, and a
+			// refusal -- a person's decision, so never an escalation -- is
+			// answered 409 below and rolled back (refuseWorkflowDecision).
+			Guard:                 guard.WithTx(tx, nil),
+			Origin:                sessionguard.OriginPerson,
 			EpistemicCheckDefault: epistemicCheckDefault,
+		}
+		// refuseWorkflowDecision answers a refusal of the session guard: the
+		// decision rolls back -- the step stays awaiting a decision, the
+		// stop request stays as it was -- the refusal is recorded once this
+		// transaction, which holds the session row's lock, is gone, and the
+		// person is told why, with the typed reason.
+		refuseWorkflowDecision := func(err error) bool {
+			refusal, ok := sessionguard.AsRefusal(err)
+			if !ok {
+				return false
+			}
+			_ = tx.Rollback(ctx)
+			guard.RecordRefusal(ctx, sessionRow.ID, refusal)
+			writeErrorWithReason(w, http.StatusConflict, refusal.Error(), string(refusal.Reason))
+			return true
 		}
 
 		// §3.3: approve and revise resume a stopped session (this file's
@@ -309,6 +333,9 @@ func DecideWorkflowStep(
 			}
 			stepID := workflow.ID(stepRun.StepDefinitionID.String())
 			result, aerr := workflowengine.ApplyStepOutcome(ctx, deps, runRow, def, sessionRow, stepID, outcome, stepRun.OutcomeSummary)
+			if refuseWorkflowDecision(aerr) {
+				return
+			}
 			if aerr != nil {
 				logger.Error("httpapi: apply step outcome for decide (approve) failed", "error", aerr)
 				writeError(w, http.StatusInternalServerError, "internal error")
@@ -349,6 +376,9 @@ func DecideWorkflowStep(
 				return
 			}
 			newTurnID, derr := workflowengine.DispatchSameStepRevision(ctx, deps, runRow.ID, sameStep, *text, sessionRow)
+			if refuseWorkflowDecision(derr) {
+				return
+			}
 			if derr != nil {
 				logger.Error("httpapi: dispatch same-step revision failed", "error", derr)
 				writeError(w, http.StatusInternalServerError, "internal error")

@@ -105,6 +105,9 @@ var allKnownNotificationKinds = []ports.NotificationKind{
 	ports.NotificationKindSlackWorkflowDecision,
 	ports.NotificationKindLinearWorkflowDecision,
 	ports.NotificationKindGitHubWorkflowDecision,
+	ports.NotificationKindSlackSessionGuard,
+	ports.NotificationKindLinearSessionGuard,
+	ports.NotificationKindGitHubSessionGuard,
 	ports.NotificationKindRWXPreviewDispatch,
 	ports.NotificationKindGitHubPreviewLink,
 	ports.NotificationKindBlobDelete,
@@ -115,12 +118,12 @@ var allKnownNotificationKinds = []ports.NotificationKind{
 
 // TestNotificationKindClassification_CoversEveryKnownKind proves
 // notificationKindClassification is exhaustive over allKnownNotificationKinds
-// above -- registering all 19 in one notifiers map and constructing a
+// above -- registering all 22 in one notifiers map and constructing a
 // Builder must succeed. If a new kind is added to ports/notifier.go and
 // to allKnownNotificationKinds above but NOT to classification.go's own
 // map, this test fails with that kind's own name.
 func TestNotificationKindClassification_CoversEveryKnownKind(t *testing.T) {
-	if got, want := len(allKnownNotificationKinds), 19; got != want {
+	if got, want := len(allKnownNotificationKinds), 22; got != want {
 		t.Fatalf("len(allKnownNotificationKinds) = %d, want %d -- this Step's own verified count of ports.NotificationKind constants; update both this list and classification.go's own map together if that count ever changes", got, want)
 	}
 
