@@ -825,7 +825,8 @@ func handleEvent(ctx context.Context, deps Deps, logger *slog.Logger, ev slackEv
 			awaitingPlanID = planID
 			if verdict, verdictOK := plandomain.MatchVerdict(prompt); verdictOK {
 				// Answered in this thread (technical plan §40.1): a refusal
-				// tells the session's channel here, and no notice repeats it.
+				// is told here, and the crossing's notice, held meanwhile,
+				// is withdrawn once that reply lands (handlePlanVerdict).
 				return deps.handlePlanVerdict(turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceSlack), logger, channel, key, res.SessionID, planID, verdict, actorUserID)
 			}
 			if feedback, reviseOK := plandomain.MatchRevise(prompt); reviseOK {
@@ -851,6 +852,11 @@ func handleEvent(ctx context.Context, deps Deps, logger *slog.Logger, ev slackEv
 	// (technical plan §40.1): the session has spent its cap. Answered in the
 	// thread with the refusal's own text, never a hard failure.
 	var guardRefusal *sessionguard.Refusal
+	// answerCtx marks this reply as answered in this thread (technical plan
+	// §40.1): a refusal is told here, and the crossing's notice, held
+	// meanwhile, is withdrawn once that reply lands -- delivered instead if
+	// it does not.
+	answerCtx := turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceSlack)
 	var createdTurn sqlcgen.Turn
 	var created bool
 	if emptyReviseFeedback {
@@ -877,9 +883,7 @@ func handleEvent(ctx context.Context, deps Deps, logger *slog.Logger, ev slackEv
 		logger.Info("slack: revise: reply had empty feedback, blocked by awaiting-approval plan guard", "session_id", res.SessionID)
 	} else {
 		var err error
-		// Answered in this thread (technical plan §40.1): a refusal tells the
-		// session's channel here, and no notice repeats it.
-		createdTurn, created, err = addTurn(turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceSlack), deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.IntentClassifier, deps.AuditLog, deps.Registry, deps.SessionGuard, res.SessionID, prompt, planMode, deps.EpistemicCheckDefault, actorUserID)
+		createdTurn, created, err = addTurn(answerCtx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.IntentClassifier, deps.AuditLog, deps.Registry, deps.SessionGuard, res.SessionID, prompt, planMode, deps.EpistemicCheckDefault, actorUserID)
 		if err != nil {
 			if refusal, ok := sessionguard.AsRefusal(err); ok {
 				// The session has spent its cap: a deterministic state, not a
@@ -982,6 +986,9 @@ func handleEvent(ctx context.Context, deps Deps, logger *slog.Logger, ev slackEv
 	// scoped to ev.User (§13.2's own security-remediation addition).
 	if err := postAckBounded(ctx, deps.SlackClient, deps.AckTimeout, channel, key, ackText); err != nil {
 		logger.Warn("slack: post in-thread ack failed", "error", err)
+	} else if guardRefusal != nil {
+		// The refusal was told in the thread: its held notice is withdrawn.
+		turnguard.Answered(answerCtx)
 	}
 	return handleEventResult{OK: true}
 }
@@ -1081,6 +1088,10 @@ func (deps Deps) handlePlanVerdict(ctx context.Context, logger *slog.Logger, cha
 	logger.Info("slack: text plan verdict decided", "session_id", sessionID.String(), "plan_id", planID.String(), "verdict", verdict)
 	if ackErr := postAckBounded(ctx, deps.SlackClient, deps.AckTimeout, channel, key, text); ackErr != nil {
 		logger.Warn("slack: post plan-verdict outcome ack failed", "error", ackErr)
+	} else if err != nil && isSessionGuardRefusal(err) {
+		// The refusal was told in the thread (ctx is marked by the caller,
+		// turnguard.AnsweredOnChannel): its held notice is withdrawn.
+		turnguard.Answered(ctx)
 	}
 	return handleEventResult{OK: true}
 }

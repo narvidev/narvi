@@ -7293,8 +7293,13 @@ cap, says a turn already running is left to finish and counted (so the spend sho
 cap) and that the figure is a lower bound, and that the session has not failed. The first time a
 crossing's warning is written, its channel is told once:
 - When the refused request came in on the session's own channel — a reply in its chat thread, a
-  prompt or verdict on its issue-tracker agent session, a mention on its pull request — the reply
-  there is the telling, and no outbox notice is enqueued.
+  prompt or verdict on its issue-tracker agent session, a mention on its pull request — the caller
+  answers there, and the crossing's outbox notice is still written with its warning, before that
+  reply is tried, but held undelivered for `SessionGuardNoticeHold`, which outlasts every reply's own
+  bound. A reply that lands withdraws the notice: it is marked delivered in place and never sent. A
+  reply that fails, times out, or never runs because the process is gone leaves it to be delivered
+  when the hold ends. The channel is told once either way, and a crash between a landed reply and the
+  withdrawal can only tell it twice, never not at all.
 - Otherwise, one outbox notice goes to the session's own channel. This covers a REST or MCP request,
   a reply only the clicking or submitting person sees (a plan button, the Request-changes modal), and
   an automatic producer.

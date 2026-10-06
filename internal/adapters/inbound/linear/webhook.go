@@ -891,8 +891,9 @@ func (deps Deps) handlePrompted(ctx context.Context, payload agentSessionEventWe
 				// this function's own ordinary-reply gate below, so it flows
 				// into the same release-the-claim-and-retry path.
 				// Answered on this agent session (technical plan §40.1): a
-				// refusal tells the session's channel here, and no notice
-				// repeats it.
+				// refusal is told here, and the crossing's notice, held
+				// meanwhile, is withdrawn once that reply lands
+				// (handlePlanVerdict).
 				return deps.handlePlanVerdict(turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceLinear), logger, sessionID, planID, verdict, actorUserID, notice, payload.OrganizationID, payload.AgentSession.ID)
 			}
 			// a follow-up fix (§8.1): a reply matching neither a
@@ -1009,9 +1010,11 @@ func (deps Deps) handlePrompted(ctx context.Context, payload agentSessionEventWe
 	// actorUserID attributed) and L12 (this package's own copy-pasted
 	// hasOpenTurn helper is gone entirely -- httpapi's own copy, already
 	// unexported there, is the only one left).
-	// Answered on this agent session (technical plan §40.1): a refusal tells
-	// the session's channel here, and no notice repeats it.
-	createdTurn, wasCreated, cerr := httpapi.CreateTurnCore(turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceLinear), deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.IntentClassifier, deps.AuditLog, deps.Registry, deps.SessionGuard, sessionID, prompt, nil, planMode, deps.EpistemicCheckDefault, actorUserID, httpapi.DropIfOpen)
+	// Answered on this agent session (technical plan §40.1): a refusal is
+	// told here, and the crossing's notice, held meanwhile, is withdrawn
+	// once that reply lands -- delivered instead if it does not.
+	answerCtx := turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceLinear)
+	createdTurn, wasCreated, cerr := httpapi.CreateTurnCore(answerCtx, deps.Pool, deps.Sessions, deps.Turns, deps.Plans, deps.IntentClassifier, deps.AuditLog, deps.Registry, deps.SessionGuard, sessionID, prompt, nil, planMode, deps.EpistemicCheckDefault, actorUserID, httpapi.DropIfOpen)
 	if cerr != nil {
 		if errors.Is(cerr, httpapi.ErrPlanAwaitingApproval) {
 			// a follow-up fix (§8.1): honest reply, never a hard
@@ -1030,7 +1033,9 @@ func (deps Deps) handlePrompted(ctx context.Context, payload agentSessionEventWe
 			// deterministic state, never a failure a redelivery could
 			// fix, answered honestly with the refusal's own text.
 			logger.Info("linear: prompted reply refused by the session guard", "session_id", sessionID.String(), "reason", string(refusal.Reason))
-			deps.postThoughtNotice(ctx, payload.OrganizationID, payload.AgentSession.ID, refusal.Error(), notice)
+			if deps.postThoughtNotice(ctx, payload.OrganizationID, payload.AgentSession.ID, refusal.Error(), notice) {
+				turnguard.Answered(answerCtx)
+			}
 			return true
 		}
 		logger.Error("linear: create turn failed", "status", cerr.Status, "message", cerr.Message, "session_id", sessionID.String())
@@ -1187,7 +1192,11 @@ func (deps Deps) handlePlanVerdict(ctx context.Context, logger *slog.Logger, ses
 			// plan stays awaiting approval, and the reply is the
 			// refusal's own text.
 			logger.Info("linear: plan approval refused by the session guard", "plan_id", planID.String(), "session_id", sessionID.String(), "reason", string(refusal.Reason))
-			deps.postPlanOutcomeActivity(ctx, logger, organizationID, agentSessionID, refusal.Error(), identityNotice)
+			if deps.postPlanOutcomeActivity(ctx, logger, organizationID, agentSessionID, refusal.Error(), identityNotice) {
+				// ctx is marked by the caller (turnguard.AnsweredOnChannel):
+				// the refusal was told here, so its held notice is withdrawn.
+				turnguard.Answered(ctx)
+			}
 			return true
 		}
 		logger.Error("linear: decide plan failed", "error", err, "plan_id", planID.String(), "session_id", sessionID.String())
@@ -1230,22 +1239,23 @@ func renderLinearPlanOutcomeText(outcome httpapi.DecidePlanOutcome) string {
 // normal outcome, never an "error" activity -- matches decideplan.go's own
 // identical Success:true convention for the cross-channel notify path).
 // Best-effort only: any failure is logged and swallowed, mirroring
-// postAcknowledgment's own identical tolerance.
-func (deps Deps) postPlanOutcomeActivity(ctx context.Context, logger *slog.Logger, organizationID, agentSessionID, text, identityNotice string) {
+// postAcknowledgment's own identical tolerance; it reports whether the
+// activity was posted.
+func (deps Deps) postPlanOutcomeActivity(ctx context.Context, logger *slog.Logger, organizationID, agentSessionID, text, identityNotice string) bool {
 	install, err := deps.Installations.GetByOrganizationID(ctx, organizationID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			logger.Warn("linear: no installation for organization, skipping plan-outcome activity", "organization_id", organizationID)
-			return
+			return false
 		}
 		logger.Error("linear: look up installation failed", "error", err, "organization_id", organizationID)
-		return
+		return false
 	}
 
 	accessToken, err := platform.DecryptToken(deps.TokenEncryptionKey, install.AccessTokenEncrypted)
 	if err != nil {
 		logger.Error("linear: decrypt installation access token failed", "error", err, "organization_id", organizationID)
-		return
+		return false
 	}
 
 	activityCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.LinearOutboundActivityTimeout)
@@ -1253,7 +1263,9 @@ func (deps Deps) postPlanOutcomeActivity(ctx context.Context, logger *slog.Logge
 
 	if err := deps.LinearClient.CreateResponseActivity(activityCtx, string(accessToken), agentSessionID, text, identityNotice); err != nil {
 		logger.Error("linear: post plan-outcome activity failed", "error", err, "agent_session_id", agentSessionID)
+		return false
 	}
+	return true
 }
 
 // postThoughtNotice posts body as a best-effort `thought` Agent Activity --
@@ -1265,13 +1277,13 @@ func (deps Deps) postPlanOutcomeActivity(ctx context.Context, logger *slog.Logge
 // own identical lookup+decrypt+bounded-call shape exactly (this package's
 // own established "small, documented duplication over a forced shared
 // abstraction" precedent -- see identity.go's own decryptLinearAccessToken
-// doc comment).
-func (deps Deps) postThoughtNotice(ctx context.Context, organizationID, agentSessionID, body, identityNotice string) {
+// doc comment). It reports whether the activity was posted.
+func (deps Deps) postThoughtNotice(ctx context.Context, organizationID, agentSessionID, body, identityNotice string) bool {
 	logger := platform.Logger(ctx)
 
 	accessToken, ok := deps.decryptLinearAccessToken(ctx, logger, organizationID)
 	if !ok {
-		return
+		return false
 	}
 
 	activityCtx, cancel := context.WithTimeout(ctx, deps.Timeouts.LinearOutboundActivityTimeout)
@@ -1279,7 +1291,9 @@ func (deps Deps) postThoughtNotice(ctx context.Context, organizationID, agentSes
 
 	if err := deps.LinearClient.CreateThoughtActivity(activityCtx, accessToken, agentSessionID, body, identityNotice); err != nil {
 		logger.Warn("linear: post thought notice activity failed", "error", err, "agent_session_id", agentSessionID)
+		return false
 	}
+	return true
 }
 
 // postAcknowledgment posts the single, minimal `thought` Agent Activity

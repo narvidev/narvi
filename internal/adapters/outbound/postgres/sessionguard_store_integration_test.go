@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -463,5 +464,65 @@ func TestLockedTurnCreator_AdmitsUnderTheLock(t *testing.T) {
 	var pgErr *pgconn.PgError
 	if !errors.As(probeErr, &pgErr) || pgErr.Code != "55P03" {
 		t.Fatalf("locking the session's row from another connection during the admission = %v, want lock_not_available (55P03): the admission runs before the lock is taken", probeErr)
+	}
+}
+
+// TestOutboxStore_HoldNewAndMarkDeliveredInPlace: the two writes the
+// session guard's held notice makes (technical plan §40.1). HoldNew makes a
+// new, never-attempted row due only its hold ahead on the database's clock,
+// so no builder claims it meanwhile; MarkDeliveredInPlace withdraws a row
+// still pending and never attempted -- the reply on its channel said it --
+// and leaves one a builder already claimed to the delivery it stands for.
+func TestOutboxStore_HoldNewAndMarkDeliveredInPlace(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	store := narvipg.NewOutboxStore(pool, false)
+	create := func() sqlcgen.Outbox {
+		t.Helper()
+		row, err := store.Create(ctx, sqlcgen.CreateOutboxEntryParams{Kind: "github_session_guard", Payload: []byte(`{"text":"held"}`)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return row
+	}
+
+	held := create()
+	var dbNow time.Time
+	if err := pool.QueryRow(ctx, `SELECT now()`).Scan(&dbNow); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.HoldNew(ctx, held.ID, 2*time.Minute)
+	if err != nil {
+		t.Fatalf("HoldNew: %v", err)
+	}
+	if lead := got.NextAttemptAt.Time.Sub(dbNow); lead < 2*time.Minute || lead > 2*time.Minute+time.Minute {
+		t.Fatalf("held row due %v ahead, want the 2m hold", lead)
+	}
+	due, err := store.ListDuePending(ctx, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range due {
+		if row.ID == held.ID {
+			t.Fatal("a held row is due: a builder would deliver it while its reply may still land")
+		}
+	}
+	withdrawn, err := store.MarkDeliveredInPlace(ctx, held.ID)
+	if err != nil || withdrawn.Status != sqlcgen.OutboxStatusDelivered || withdrawn.Attempts != 0 || !withdrawn.DeliveredAt.Valid {
+		t.Fatalf("MarkDeliveredInPlace = %+v, %v; want delivered in place, never attempted", withdrawn, err)
+	}
+
+	claimed := create()
+	if _, err := store.Claim(ctx, claimed.ID, pgtype.Timestamptz{Time: time.Now().Add(time.Minute), Valid: true}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkDeliveredInPlace(ctx, claimed.ID); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("MarkDeliveredInPlace on a claimed row = %v, want pgx.ErrNoRows: its delivery stands", err)
+	}
+	if _, err := store.HoldNew(ctx, claimed.ID, time.Minute); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("HoldNew on an attempted row = %v, want pgx.ErrNoRows", err)
+	}
+	if row, err := store.Get(ctx, claimed.ID); err != nil || row.Status != sqlcgen.OutboxStatusPending || row.Attempts != 1 {
+		t.Fatalf("the claimed row = %+v, %v; want it pending, its attempt counted", row, err)
 	}
 }

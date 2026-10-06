@@ -1012,9 +1012,11 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		}
 
 		// Answered on this pull request (technical plan §40.1): a refusal of
-		// the review session tells its channel here (sessionguardreply.go),
-		// and no notice repeats it.
-		session, turn, isNew, err := coalescer.CreateOrJoin(turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceGithub), m.RepoFullName, m.PRNumber, req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
+		// the review session is told here (sessionguardreply.go), and the
+		// crossing's notice, held meanwhile, is withdrawn once that reply
+		// lands -- delivered instead if it does not.
+		answerCtx := turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceGithub)
+		session, turn, isNew, err := coalescer.CreateOrJoin(answerCtx, m.RepoFullName, m.PRNumber, req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
 		if err != nil {
 			if errors.Is(err, ErrActorNotAuthorized) {
 				// ErrActorNotAuthorized fires for TWO distinct reasons
@@ -1119,9 +1121,13 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 				// an awaiting plan below, 200 without releasing the
 				// delivery claim (a redelivery would only meet the same
 				// refusal), and an honest reply on the pull request
-				// (sessionguardreply.go).
+				// (sessionguardreply.go). Once that reply has landed, the
+				// crossing's held notice is withdrawn (turnguard.Answered);
+				// a reply that failed leaves it to be delivered.
 				logger.Info("github: mention refused by the session guard", "repo", m.RepoFullName, "pr_number", m.PRNumber, "reason", string(refusal.Reason))
-				postSessionGuardReply(ctx, logger, cfg.Comments, botToken, m.RepoFullName, m.PRNumber, refusal)
+				if postSessionGuardReply(ctx, logger, cfg.Comments, botToken, m.RepoFullName, m.PRNumber, refusal, cfg.Timeouts.SessionGuardReplyTimeout) {
+					turnguard.Answered(answerCtx)
+				}
 				w.WriteHeader(http.StatusOK)
 				return
 			}

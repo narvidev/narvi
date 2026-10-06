@@ -61,10 +61,19 @@ type Kinds struct {
 // a store failure is an error: a lookup that failed rather than found
 // nothing, or the outbox insert.
 func Enqueue(ctx context.Context, stores Stores, sessionRow sqlcgen.Session, kinds Kinds, text string) (bool, error) {
+	_, enqueued, err := EnqueueEntry(ctx, stores, sessionRow, kinds, text)
+	return enqueued, err
+}
+
+// EnqueueEntry is Enqueue that also returns the outbox row it created, for
+// a caller that acts on the row in the same transaction (the session
+// guard's held notice, internal/app/turnguard). The row is the zero value
+// when nothing was enqueued.
+func EnqueueEntry(ctx context.Context, stores Stores, sessionRow sqlcgen.Session, kinds Kinds, text string) (sqlcgen.Outbox, bool, error) {
 	logger := platform.Logger(ctx)
 
 	if sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceWeb || sessionRow.SpawnSource == sqlcgen.SessionSpawnSourceMcp {
-		return false, nil
+		return sqlcgen.Outbox{}, false, nil
 	}
 
 	var kind ports.NotificationKind
@@ -76,9 +85,9 @@ func Enqueue(ctx context.Context, stores Stores, sessionRow sqlcgen.Session, kin
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				logger.Warn("sessionnotice: slack-origin session has no slack_thread_sessions row; skipping", "kind", string(kinds.Slack))
-				return false, nil
+				return sqlcgen.Outbox{}, false, nil
 			}
-			return false, fmt.Errorf("sessionnotice: get slack thread session: %w", err)
+			return sqlcgen.Outbox{}, false, fmt.Errorf("sessionnotice: get slack thread session: %w", err)
 		}
 		kind = kinds.Slack
 		payload = slackapi.Payload{ChannelID: row.ChannelID, ThreadTS: row.ThreadTs, Text: text}
@@ -88,9 +97,9 @@ func Enqueue(ctx context.Context, stores Stores, sessionRow sqlcgen.Session, kin
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				logger.Warn("sessionnotice: linear-origin session has no linear_agent_sessions row; skipping", "kind", string(kinds.Linear))
-				return false, nil
+				return sqlcgen.Outbox{}, false, nil
 			}
-			return false, fmt.Errorf("sessionnotice: get linear agent session: %w", err)
+			return sqlcgen.Outbox{}, false, fmt.Errorf("sessionnotice: get linear agent session: %w", err)
 		}
 		kind = kinds.Linear
 		payload = linearapi.Payload{AgentSessionID: row.AgentSessionID, OrganizationID: row.OrganizationID, Text: text, Success: true}
@@ -100,14 +109,14 @@ func Enqueue(ctx context.Context, stores Stores, sessionRow sqlcgen.Session, kin
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				logger.Warn("sessionnotice: github-origin session has no github_pr_sessions row; skipping", "kind", string(kinds.GitHub))
-				return false, nil
+				return sqlcgen.Outbox{}, false, nil
 			}
-			return false, fmt.Errorf("sessionnotice: get github pr session: %w", err)
+			return sqlcgen.Outbox{}, false, fmt.Errorf("sessionnotice: get github pr session: %w", err)
 		}
 		owner, repo, ok := reposource.SplitFullName(row.RepoFullName)
 		if !ok {
 			logger.Warn("sessionnotice: could not split repo_full_name; skipping", "repo_full_name", row.RepoFullName, "kind", string(kinds.GitHub))
-			return false, nil
+			return sqlcgen.Outbox{}, false, nil
 		}
 		kind = kinds.GitHub
 		payload = githubapi.Payload{Owner: owner, Repo: repo, PRNumber: int(row.PrNumber), Text: text}
@@ -119,12 +128,12 @@ func Enqueue(ctx context.Context, stores Stores, sessionRow sqlcgen.Session, kin
 		// during a rolling deploy, reads here. With no channel to notify,
 		// nothing is enqueued; the source is logged so the gap shows.
 		logger.Warn("sessionnotice: unrecognized spawn_source; skipping", "spawn_source", string(sessionRow.SpawnSource))
-		return false, nil
+		return sqlcgen.Outbox{}, false, nil
 	}
 
 	rawPayload, err := json.Marshal(payload)
 	if err != nil {
-		return false, fmt.Errorf("sessionnotice: marshal notice payload: %w", err)
+		return sqlcgen.Outbox{}, false, fmt.Errorf("sessionnotice: marshal notice payload: %w", err)
 	}
 
 	var correlationID *string
@@ -132,13 +141,14 @@ func Enqueue(ctx context.Context, stores Stores, sessionRow sqlcgen.Session, kin
 		correlationID = &id
 	}
 
-	if _, err := stores.Outbox.Create(ctx, sqlcgen.CreateOutboxEntryParams{
+	row, err := stores.Outbox.Create(ctx, sqlcgen.CreateOutboxEntryParams{
 		SessionID:     sessionRow.ID,
 		Kind:          string(kind),
 		Payload:       rawPayload,
 		CorrelationID: correlationID,
-	}); err != nil {
-		return false, fmt.Errorf("sessionnotice: create notice outbox entry: %w", err)
+	})
+	if err != nil {
+		return sqlcgen.Outbox{}, false, fmt.Errorf("sessionnotice: create notice outbox entry: %w", err)
 	}
-	return true, nil
+	return row, true, nil
 }

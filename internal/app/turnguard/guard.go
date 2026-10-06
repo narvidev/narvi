@@ -29,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -113,6 +114,9 @@ type Guard struct {
 	github      *postgres.GitHubPRSessionStore
 	outbox      *postgres.OutboxStore
 	broadcaster ports.EventBroadcaster
+	// noticeHold is how long a refusal's notice is held for the caller's
+	// own reply on the session's channel (AnsweredOnChannel).
+	noticeHold time.Duration
 }
 
 // New builds a Guard on pool. broadcaster delivers the warning
@@ -132,7 +136,19 @@ func New(pool *pgxpool.Pool, broadcaster ports.EventBroadcaster, platformShadow 
 		github:      postgres.NewGitHubPRSessionStore(pool),
 		outbox:      postgres.NewOutboxStore(pool, platformShadow),
 		broadcaster: broadcaster,
+		noticeHold:  platform.DefaultTimeouts().SessionGuardNoticeHold,
 	}
+}
+
+// WithNoticeHold sets how long g holds a refusal's notice while the caller
+// replies on the session's own channel (AnsweredOnChannel) -- the
+// deployment's platform.Timeouts.SessionGuardNoticeHold -- and returns g.
+// A Guard built by New holds it for the default.
+func (g *Guard) WithNoticeHold(hold time.Duration) *Guard {
+	if g != nil {
+		g.noticeHold = hold
+	}
+	return g
 }
 
 // ErrNoGuard is the answer of a nil Guard: no admission without a guard.

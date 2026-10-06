@@ -31,16 +31,31 @@ import (
 // with the session's turns as they stand: a refusal adds none.
 func capSessionAt(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID, turnID pgtype.UUID, repo string) sessionguard.Refusal {
 	t.Helper()
+	// Under the session's row lock, as every writer of a session's turns
+	// is: the session actor may be evaluating the first mention's turn for
+	// dispatch, and a write it does not wait for could land between its
+	// read of the turn and its read of the cap.
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := narvipg.NewSessionStore(pool).WithTx(tx).GetActorEpochForUpdate(ctx, sessionID); err != nil {
+		t.Fatalf("lock the session: %v", err)
+	}
 	if turnID.Valid {
-		if _, err := pool.Exec(ctx, `UPDATE turns SET status = 'completed', dispatched_at = now(), completed_at = now(), cost_usd = 1.25 WHERE id = $1`, turnID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE turns SET status = 'completed', dispatched_at = now(), completed_at = now(), cost_usd = 1.25 WHERE id = $1`, turnID); err != nil {
 			t.Fatalf("record the turn's spend: %v", err)
 		}
-	} else if _, err := pool.Exec(ctx, `INSERT INTO turns (session_id, status, dispatched_at, completed_at, cost_usd) VALUES ($1, 'completed', now(), now(), 1.25)`, sessionID); err != nil {
+	} else if _, err := tx.Exec(ctx, `INSERT INTO turns (session_id, status, dispatched_at, completed_at, cost_usd) VALUES ($1, 'completed', now(), now(), 1.25)`, sessionID); err != nil {
 		t.Fatalf("store the session's spend: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `INSERT INTO repo_settings (repo_full_name, session_spend_cap_usd) VALUES ($1, 1.00)
+	if _, err := tx.Exec(ctx, `INSERT INTO repo_settings (repo_full_name, session_spend_cap_usd) VALUES ($1, 1.00)
 		ON CONFLICT (repo_full_name) DO UPDATE SET session_spend_cap_usd = EXCLUDED.session_spend_cap_usd`, repo); err != nil {
 		t.Fatalf("cap the repository: %v", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
 	}
 	var turns int64
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM turns WHERE session_id = $1`, sessionID).Scan(&turns); err != nil {
@@ -52,15 +67,29 @@ func capSessionAt(ctx context.Context, t *testing.T, pool *pgxpool.Pool, session
 	}
 }
 
-// guardRecords counts sessionID's warnings at refusal's crossing and its
-// Slack guard notices.
-func guardRecords(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, refusal sessionguard.Refusal) (warnings, notices int) {
+// slackNotices is the state of a session's chat-surface guard notices:
+// held (pending, never attempted, due later: its reply was being tried),
+// due (pending, never attempted, due now), withdrawn (delivered in place,
+// never attempted: the reply in the thread told the crossing), and any
+// other row.
+type slackNotices struct {
+	held, due, withdrawn, other int
+}
+
+// guardRecords counts sessionID's warnings at refusal's crossing and reads
+// its chat-surface guard notices.
+func guardRecords(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, refusal sessionguard.Refusal) (warnings int, notices slackNotices) {
 	t.Helper()
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'warning' AND message_id = $2`, sessionID, turnguard.WarningMessageID(refusal)).Scan(&warnings); err != nil {
 		t.Fatalf("count warnings: %v", err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE session_id = $1 AND kind = $2`, sessionID, string(ports.NotificationKindSlackSessionGuard)).Scan(&notices); err != nil {
-		t.Fatalf("count notices: %v", err)
+	if err := pool.QueryRow(ctx, `SELECT
+			count(*) FILTER (WHERE status = 'pending' AND attempts = 0 AND next_attempt_at > now()),
+			count(*) FILTER (WHERE status = 'pending' AND attempts = 0 AND next_attempt_at <= now()),
+			count(*) FILTER (WHERE status = 'delivered' AND attempts = 0),
+			count(*) FILTER (WHERE NOT (attempts = 0 AND status IN ('pending', 'delivered')))
+		FROM outbox WHERE session_id = $1 AND kind = $2`, sessionID, string(ports.NotificationKindSlackSessionGuard)).Scan(&notices.held, &notices.due, &notices.withdrawn, &notices.other); err != nil {
+		t.Fatalf("read notices: %v", err)
 	}
 	return warnings, notices
 }
@@ -69,7 +98,8 @@ func guardRecords(ctx context.Context, t *testing.T, pool *pgxpool.Pool, session
 // session that has spent its cap creates no turn and is answered in the
 // thread with the refusal's own text -- never a failed delivery. The
 // crossing's warning is recorded, and that reply in the session's own
-// thread is the crossing's one telling: no outbox notice repeats it there.
+// thread is the crossing's one telling: the notice held while it was tried
+// is withdrawn, never delivered.
 func TestSlackAddTurn_AtSpendCap_HonestReply(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -129,8 +159,8 @@ drain:
 	if len(replies) != 1 || replies[0] != sessionguard.Text(refusal) {
 		t.Fatalf("thread replies = %q, want the refusal's text alone", replies)
 	}
-	if warnings, notices := guardRecords(ctx, t, pool, mapping.SessionID, refusal); warnings != 1 || notices != 0 {
-		t.Fatalf("warnings %d, notices %d; want the crossing's warning, and no notice beside the thread reply", warnings, notices)
+	if warnings, notices := guardRecords(ctx, t, pool, mapping.SessionID, refusal); warnings != 1 || notices != (slackNotices{withdrawn: 1}) {
+		t.Fatalf("warnings %d, notices %+v; want the crossing's warning, and its held notice withdrawn: the thread reply told it", warnings, notices)
 	}
 }
 
@@ -226,15 +256,16 @@ func TestSlackApproveButton_AtSpendCap_ClickerToldAndTheThreadNoticed(t *testing
 	if turns, err := rig.turns.ListForSession(ctx, session.ID); err != nil || len(turns) != 2 {
 		t.Fatalf("turns = %d (%v), want the 2 seeded: no implementation turn", len(turns), err)
 	}
-	if warnings, notices := guardRecords(ctx, t, pool, session.ID, refusal); warnings != 1 || notices != 1 {
-		t.Fatalf("warnings %d, notices %d; want the crossing's warning and its one notice to the thread", warnings, notices)
+	if warnings, notices := guardRecords(ctx, t, pool, session.ID, refusal); warnings != 1 || notices != (slackNotices{due: 1}) {
+		t.Fatalf("warnings %d, notices %+v; want the crossing's warning and its one notice to the thread, due at once", warnings, notices)
 	}
 }
 
 // TestSlackTypedApprove_AtSpendCap_HonestReplyInTheThread: "approve" typed
 // in the thread of a session that has spent its cap is refused: the plan
 // stays awaiting approval, and the thread is answered with the refusal's
-// own text -- the crossing's one telling, so no notice repeats it.
+// own text -- the crossing's one telling, so the notice held while it was
+// tried is withdrawn.
 func TestSlackTypedApprove_AtSpendCap_HonestReplyInTheThread(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -270,7 +301,77 @@ drain:
 	if len(replies) != 1 || replies[0] != sessionguard.Text(refusal) {
 		t.Fatalf("thread replies = %q, want the refusal's text alone", replies)
 	}
-	if warnings, notices := guardRecords(ctx, t, pool, session.ID, refusal); warnings != 1 || notices != 0 {
-		t.Fatalf("warnings %d, notices %d; want the crossing's warning, and no notice beside the thread reply", warnings, notices)
+	if warnings, notices := guardRecords(ctx, t, pool, session.ID, refusal); warnings != 1 || notices != (slackNotices{withdrawn: 1}) {
+		t.Fatalf("warnings %d, notices %+v; want the crossing's warning, and its held notice withdrawn: the thread reply told it", warnings, notices)
+	}
+}
+
+// TestSlackAddTurn_AtSpendCap_FailedReplyLeavesOneDurableNotice: when the
+// reply in the thread fails (the chat surface answers 500), the crossing is
+// still told exactly once: the notice held while the reply was tried stays,
+// undelivered until its hold ends, and is the one notice the thread gets.
+func TestSlackAddTurn_AtSpendCap_FailedReplyLeavesOneDurableNotice(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	auditLog := narvipg.NewAuditLogStore(pool)
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(failing.Close)
+	linkSlackIdentityForTest(ctx, t, pool, "U0TESTUSER", sqlcgen.UserRoleMaintainer)
+	linkSlackIdentityForTest(ctx, t, pool, "U0OTHERUSER", sqlcgen.UserRoleMaintainer)
+	rig := newSlackPlanGateTestRig(t, pool, failing, auditLog)
+
+	rec := httptest.NewRecorder()
+	rig.handler(rec, signedSlackRequest(t, appMentionEnvelope("Ev0SPENDCAPF01", "C0SPENDCAPF", "1700000060.000100", "", "start this task")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first mention: status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	mapping, err := rig.threads.Get(ctx, "C0SPENDCAPF", "1700000060.000100")
+	if err != nil {
+		t.Fatalf("Get thread mapping: %v", err)
+	}
+	firstTurns, err := rig.turns.ListForSession(ctx, mapping.SessionID)
+	if err != nil || len(firstTurns) != 1 {
+		t.Fatalf("ListForSession after first mention: turns=%v err=%v, want exactly 1", firstTurns, err)
+	}
+	refusal := capSessionAt(ctx, t, pool, mapping.SessionID, firstTurns[0].ID, "narvidev/narvi")
+
+	rec = httptest.NewRecorder()
+	rig.handler(rec, signedSlackRequest(t, messageEnvelope("Ev0SPENDCAPF02", "C0SPENDCAPF", "1700000061.000200", "1700000060.000100", "one more thing please")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reply: status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	if warnings, notices := guardRecords(ctx, t, pool, mapping.SessionID, refusal); warnings != 1 || notices != (slackNotices{held: 1}) {
+		t.Fatalf("warnings %d, notices %+v; want the crossing's warning and its notice held, to be delivered: the thread reply failed", warnings, notices)
+	}
+}
+
+// TestSlackTypedApprove_AtSpendCap_FailedReplyLeavesOneDurableNotice:
+// "approve" typed in the thread of a session past its cap, whose answer in
+// the thread fails (the chat surface answers 500), leaves the crossing's
+// notice held, to be delivered: the thread is still told exactly once.
+func TestSlackTypedApprove_AtSpendCap_FailedReplyLeavesOneDurableNotice(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	auditLog := narvipg.NewAuditLogStore(pool)
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(failing.Close)
+	linkSlackIdentityForTest(ctx, t, pool, "U0TESTUSER", sqlcgen.UserRoleMaintainer)
+	linkSlackIdentityForTest(ctx, t, pool, "U0OTHERUSER", sqlcgen.UserRoleMaintainer)
+	rig := newSlackPlanGateTestRig(t, pool, failing, auditLog)
+	const channel, thread = "C0TYPEDCAPF", "1700000091.000100"
+	session, plan, refusal := slackSessionAtCapWithAwaitingPlan(ctx, t, pool, rig.sessions, rig.turns, rig.plans, channel, thread, "acme/typed-cap-failed")
+
+	rec := httptest.NewRecorder()
+	rig.handler(rec, signedSlackRequest(t, messageEnvelope("Ev0TYPEDCAPF02", channel, "1700000091.000200", thread, "approve")))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("reply: status = %d, want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	assertPlanStatus(ctx, t, pool, plan, sqlcgen.PlanStatusAwaitingApproval)
+	if warnings, notices := guardRecords(ctx, t, pool, session.ID, refusal); warnings != 1 || notices != (slackNotices{held: 1}) {
+		t.Fatalf("warnings %d, notices %+v; want the crossing's warning and its notice held, to be delivered: the thread reply failed", warnings, notices)
 	}
 }

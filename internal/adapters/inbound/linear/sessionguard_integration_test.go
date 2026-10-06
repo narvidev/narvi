@@ -3,9 +3,12 @@
 package linear_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -64,14 +67,26 @@ func linearSessionAtCap(ctx context.Context, t *testing.T, pool *pgxpool.Pool, a
 	}
 }
 
+// linearNotices is the state of a session's issue-tracker guard notices:
+// held (pending, never attempted, due later: its reply was being tried),
+// withdrawn (delivered in place, never attempted: the reply on the agent
+// session told the crossing), and any other row.
+type linearNotices struct {
+	held, withdrawn, other int
+}
+
 // linearGuardRecords counts sessionID's warnings at refusal's crossing,
-// its issue-tracker guard notices, and its turns.
-func linearGuardRecords(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, refusal sessionguard.Refusal) (warnings, notices, turns int) {
+// reads its issue-tracker guard notices, and counts its turns.
+func linearGuardRecords(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, refusal sessionguard.Refusal) (warnings int, notices linearNotices, turns int) {
 	t.Helper()
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'warning' AND message_id = $2`, sessionID, turnguard.WarningMessageID(refusal)).Scan(&warnings); err != nil {
 		t.Fatal(err)
 	}
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE session_id = $1 AND kind = $2`, sessionID, string(ports.NotificationKindLinearSessionGuard)).Scan(&notices); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT
+			count(*) FILTER (WHERE status = 'pending' AND attempts = 0 AND next_attempt_at > now()),
+			count(*) FILTER (WHERE status = 'delivered' AND attempts = 0),
+			count(*) FILTER (WHERE NOT ((status = 'pending' AND attempts = 0 AND next_attempt_at > now()) OR (status = 'delivered' AND attempts = 0)))
+		FROM outbox WHERE session_id = $1 AND kind = $2`, sessionID, string(ports.NotificationKindLinearSessionGuard)).Scan(&notices.held, &notices.withdrawn, &notices.other); err != nil {
 		t.Fatal(err)
 	}
 	if err := pool.QueryRow(ctx, `SELECT count(*) FROM turns WHERE session_id = $1`, sessionID).Scan(&turns); err != nil {
@@ -85,17 +100,23 @@ func linearGuardRecords(ctx context.Context, t *testing.T, pool *pgxpool.Pool, s
 // its cap (technical plan §40.1) creates no turn and is answered on the
 // agent session with the refusal's own text -- a deterministic state, never
 // a failed delivery. The plan stays awaiting approval. The crossing's
-// warning is recorded, and that answer on the session's own agent session
-// is the crossing's one telling: no outbox notice repeats it there.
+// warning is recorded, and it is told on the agent session exactly once:
+// when the answer there lands, it is the telling, and the notice held while
+// it was tried is withdrawn; when it fails (the issue tracker answers 500),
+// that held notice stays, to be delivered.
 func TestLinearPrompt_AtSpendCap_HonestReply(t *testing.T) {
 	ctx := context.Background()
 	for _, tc := range []struct {
-		name     string
-		text     string
-		withPlan bool
+		name        string
+		text        string
+		withPlan    bool
+		replyFails  bool
+		wantNotices linearNotices
 	}{
-		{name: "a prompt", text: "one more change please"},
-		{name: "an approval of the awaiting plan", text: "approve", withPlan: true},
+		{name: "a prompt", text: "one more change please", wantNotices: linearNotices{withdrawn: 1}},
+		{name: "an approval of the awaiting plan", text: "approve", withPlan: true, wantNotices: linearNotices{withdrawn: 1}},
+		{name: "a prompt whose answer fails", text: "one more change please", replyFails: true, wantNotices: linearNotices{held: 1}},
+		{name: "an approval whose answer fails", text: "approve", withPlan: true, replyFails: true, wantNotices: linearNotices{held: 1}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			pool := newTestPool(t)
@@ -111,11 +132,41 @@ func TestLinearPrompt_AtSpendCap_HonestReply(t *testing.T) {
 			installLinearFixture(ctx, t, pool, organizationID, deps.TokenEncryptionKey)
 			stub, recordedBodies := newGenericLinearGraphQLStub(t)
 			deps.LinearClient = linearapi.New(stub.Client(), stub.URL)
+			var refusalText string
+			if tc.replyFails {
+				// Every call carrying the refusal's text fails; every other
+				// call goes to the recording stub.
+				failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					raw, _ := io.ReadAll(r.Body)
+					if refusalText != "" && carriesString(raw, refusalText) {
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					forward, err := http.NewRequestWithContext(r.Context(), r.Method, stub.URL+r.URL.Path, bytes.NewReader(raw))
+					if err != nil {
+						w.WriteHeader(http.StatusInternalServerError)
+						return
+					}
+					forward.Header = r.Header.Clone()
+					resp, err := stub.Client().Do(forward)
+					if err != nil {
+						w.WriteHeader(http.StatusBadGateway)
+						return
+					}
+					defer func() { _ = resp.Body.Close() }()
+					w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+					w.WriteHeader(resp.StatusCode)
+					_, _ = io.Copy(w, resp.Body)
+				}))
+				t.Cleanup(failing.Close)
+				deps.LinearClient = linearapi.New(failing.Client(), failing.URL)
+			}
 			deps.IdentityLink = newIdentityLinkDepsForTest(pool, deps.AuditLog)
 			const replierID = "linear-spend-cap-1"
 			linkLinearIdentityForTest(ctx, t, pool, replierID, sqlcgen.UserRoleMaintainer)
 			handler := linear.NewWebhookHandler(deps)
 			session, plan, refusal := linearSessionAtCap(ctx, t, pool, agentSessionID, organizationID, "acme/linear-cap", tc.withPlan)
+			refusalText = sessionguard.Text(refusal)
 			_, _, turnsBefore := linearGuardRecords(ctx, t, pool, session.ID, refusal)
 
 			rec := postWebhook(t, handler, agentSessionPromptedPayloadWithUser(agentSessionID, organizationID, replierID, tc.text), "delivery-spend-cap")
@@ -129,15 +180,15 @@ func TestLinearPrompt_AtSpendCap_HonestReply(t *testing.T) {
 					replies++
 				}
 			}
-			if replies != 1 {
-				t.Fatalf("activities carrying the refusal's text = %d, want 1 (bodies %q)", replies, recordedBodies())
+			if want := map[bool]int{false: 1, true: 0}[tc.replyFails]; replies != want {
+				t.Fatalf("activities carrying the refusal's text that landed = %d, want %d (bodies %q)", replies, want, recordedBodies())
 			}
 			warnings, notices, turns := linearGuardRecords(ctx, t, pool, session.ID, refusal)
 			if turns != turnsBefore {
 				t.Fatalf("turns = %d, want the %d it had", turns, turnsBefore)
 			}
-			if warnings != 1 || notices != 0 {
-				t.Fatalf("warnings %d, notices %d; want the crossing's warning, and no notice beside the answer on the agent session", warnings, notices)
+			if warnings != 1 || notices != tc.wantNotices {
+				t.Fatalf("warnings %d, notices %+v; want the crossing's warning, and notices %+v", warnings, notices, tc.wantNotices)
 			}
 			if tc.withPlan {
 				var status sqlcgen.PlanStatus

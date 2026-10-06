@@ -736,8 +736,10 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// release worker creates passes it, and a refusal's warning is
 	// broadcast to the session's live subscribers through hub. The session
 	// actors hold a guard of their own, built by the registry on the same
-	// pool, whose warnings ride their own commit-then-broadcast.
-	sessionGuard := turnguard.New(pool, hub, cfg.ShadowMode)
+	// pool, whose warnings ride their own commit-then-broadcast. A
+	// refusal's notice is held for the deployment's notice hold while its
+	// caller replies on the session's own channel (AnsweredOnChannel).
+	sessionGuard := turnguard.New(pool, hub, cfg.ShadowMode).WithNoticeHold(cfg.Timeouts.SessionGuardNoticeHold)
 
 	sessionStore := postgres.NewSessionStore(pool)
 	turnStore := postgres.NewTurnStore(pool)
