@@ -2,6 +2,7 @@ package gitclone_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -399,9 +400,11 @@ func TestCheckoutPullRef_InvalidInputSpawnsNothing(t *testing.T) {
 
 // TestCheckoutPullRef_SpawnCount pins the git processes one checkout
 // spawns -- one fetch, and at most PullCheckoutMaxLocalGitSpawns local
-// ones, each with its own bound -- along its three paths, the longest
-// reaching that maximum exactly. The bound on a whole checkout is built
-// from these counts, so a step added without counting it fails here.
+// ones, each with its own bound -- along its paths, the longest reaching
+// that maximum exactly. The bound on a whole checkout is built from these
+// counts, so a step added without counting it fails here. Every row but
+// one starts from the base's main, whose main-only.txt S1 lacks, so the
+// index has an entry to put back after its reset.
 func TestCheckoutPullRef_SpawnCount(t *testing.T) {
 	o := newPullRefOrigin(t)
 	realGit, err := exec.LookPath("git")
@@ -413,12 +416,14 @@ func TestCheckoutPullRef_SpawnCount(t *testing.T) {
 		name         string
 		sparse       bool // the worktree is left sparse before the checkout
 		skipWorktree bool // README.md carries the skip-worktree bit, its file present
+		fromS1Parent bool // the index holds S1's parent, which tracks nothing S1 lacks
 		pathScope    []string
 		wantLocal    int
 	}{
-		{name: "unscoped, never sparse", wantLocal: 13},
-		{name: "unscoped, left sparse", sparse: true, wantLocal: 13},
-		{name: "scoped", pathScope: []string{"/pr.txt"}, wantLocal: 15},
+		{name: "unscoped, the index tracks nothing the target lacks", fromS1Parent: true, wantLocal: 14},
+		{name: "unscoped, never sparse", wantLocal: 15},
+		{name: "unscoped, left sparse", sparse: true, wantLocal: 15},
+		{name: "scoped", pathScope: []string{"/pr.txt"}, wantLocal: 17},
 		{name: "scoped, a skip-worktree file present", skipWorktree: true, pathScope: []string{"/pr.txt"}, wantLocal: gitclone.PullCheckoutMaxLocalGitSpawns},
 	}
 	for _, tc := range tests {
@@ -431,6 +436,12 @@ func TestCheckoutPullRef_SpawnCount(t *testing.T) {
 				// Back to main, so the counted checkout moves HEAD and
 				// writes the runtime's, as every path counted here does.
 				runGit(t, dir, "checkout", "-q", "--detach", o.main)
+			}
+			if tc.fromS1Parent {
+				if got := checkoutPullRef(layout, repo, testPullRef, o.s1, nil); got.Outcome != gitclone.PullCheckoutCheckedOut {
+					t.Fatalf("first CheckoutPullRef() = %+v", got)
+				}
+				runGit(t, dir, "checkout", "-q", "--detach", o.s1+"~1")
 			}
 			if tc.skipWorktree {
 				runGit(t, dir, "update-index", "--skip-worktree", "README.md")
@@ -1412,4 +1423,293 @@ func TestCheckoutPullRef_NeverRemovesThroughASymlinkOutOfTheWorkspace(t *testing
 	if !exists(filepath.Join(outside, "new.md", "kept.txt")) {
 		t.Error("new.md/kept.txt, outside the workspace, was removed through the symlink")
 	}
+}
+
+// commitAll commits everything in work and returns the new commit.
+func commitAll(t *testing.T, work, message string) string {
+	t.Helper()
+	runGit(t, work, "add", "-A")
+	runGit(t, work, "commit", "-q", "-m", message)
+	return strings.TrimSpace(gitOutput(t, work, "rev-parse", "HEAD"))
+}
+
+// newOriginWith is a base repository whose history build makes in a
+// contributor's clone work: build commits main's tip on main, branches off
+// it, and returns main's tip and the pull request's two heads. main is
+// pushed, and refs/pull/7/head at the first head.
+func newOriginWith(t *testing.T, build func(t *testing.T, work string) (main, s1, s2 string)) *pullRefOrigin {
+	t.Helper()
+	parent := t.TempDir()
+	bare := filepath.Join(parent, "widgets.git")
+	runGit(t, parent, "init", "--bare", "-q", "-b", "main", bare)
+	work := filepath.Join(t.TempDir(), "work")
+	runGit(t, parent, "clone", "-q", bare, work)
+	runGit(t, work, "config", "user.email", "test@example.com")
+	runGit(t, work, "config", "user.name", "Test")
+
+	o := &pullRefOrigin{work: work}
+	o.main, o.s1, o.s2 = build(t, work)
+	runGit(t, work, "push", "-q", "origin", o.main+":refs/heads/main")
+	runGit(t, work, "push", "-q", "origin", o.s1+":"+testPullRef)
+	o.url = startGitHTTPSServer(t, parent).URL + "/widgets.git"
+	return o
+}
+
+// newUntrackedBuildOrigin is a pull request that stops committing a build
+// output and ignores it: main tracks dist/app.js, S1 adds pr.txt, and S2
+// untracks dist/app.js and adds dist/ to .gitignore.
+func newUntrackedBuildOrigin(t *testing.T) *pullRefOrigin {
+	t.Helper()
+	return newOriginWith(t, func(t *testing.T, work string) (string, string, string) {
+		t.Helper()
+		writeWorktreeFile(t, work, "README.md", "base\n")
+		writeWorktreeFile(t, work, "dist/app.js", "MAIN BUILD\n")
+		main := commitAll(t, work, "main commits its build")
+		runGit(t, work, "checkout", "-q", "-b", "pr")
+		writeWorktreeFile(t, work, "pr.txt", "first\n")
+		s1 := commitAll(t, work, "the pull request's first head")
+		runGit(t, work, "rm", "-q", "--cached", "dist/app.js")
+		writeWorktreeFile(t, work, ".gitignore", "dist/\n")
+		writeWorktreeFile(t, work, "pr.txt", "second\n")
+		s2 := commitAll(t, work, "the pull request stops committing the build")
+		return main, s1, s2
+	})
+}
+
+// assertBuildGone checks that dir holds S2 of a newUntrackedBuildOrigin,
+// clean, and none of the dist/app.js the pull request stopped tracking.
+func assertBuildGone(t *testing.T, o *pullRefOrigin, dir string) {
+	t.Helper()
+	if head := headOf(t, dir); head != o.s2 {
+		t.Errorf("worktree HEAD = %s, want %s", head, o.s2)
+	}
+	if exists(filepath.Join(dir, "dist", "app.js")) {
+		body, _ := os.ReadFile(filepath.Join(dir, "dist", "app.js"))
+		t.Errorf("dist/app.js, which %s no longer tracks, is still on disk: %q", o.s2, body)
+	}
+	if status := porcelain(t, dir); status != "" {
+		t.Errorf("status = %q, want clean", status)
+	}
+	wantContent("pr.txt", "second\n")(t, dir)
+}
+
+// moveRuntimeHEADToMain is a turn that checked out the base's main itself,
+// which tracks dist/app.js and writes it.
+func moveRuntimeHEADToMain(t *testing.T, o *pullRefOrigin, dir string) {
+	t.Helper()
+	mustAsRuntime(t, dir, "checkout", "-q", "--detach", o.main)
+	if !exists(filepath.Join(dir, "dist", "app.js")) {
+		t.Fatal("the runtime's checkout of main wrote no dist/app.js")
+	}
+}
+
+// TestCheckoutPullRef_DeletesWhatTheHeadStoppedTracking: a path the
+// previous index tracked and the recorded head lacks is deleted, as a plain
+// forced checkout deletes it, even when the head's .gitignore matches it:
+// left untracked, clean would keep it, and the pull request would be
+// reviewed with a file it deleted. The checkout command's path.
+func TestCheckoutPullRef_DeletesWhatTheHeadStoppedTracking(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		pathScope []string
+		// before runs in the runtime's worktree, checked out at S1, then at
+		// S2 when it moves HEAD itself.
+		before    func(t *testing.T, o *pullRefOrigin, dir string)
+		firstToS2 bool
+	}{
+		{name: "unscoped"},
+		{name: "scoped, the path in the scope", pathScope: []string{"/pr.txt", "/dist/"}},
+		{name: "the runtime moved HEAD itself", firstToS2: true, before: moveRuntimeHEADToMain},
+		{name: "the runtime moved HEAD itself, scoped", pathScope: []string{"/pr.txt", "/dist/"}, firstToS2: true, before: moveRuntimeHEADToMain},
+		{
+			name: "a conflict the turn left on the path",
+			before: func(t *testing.T, o *pullRefOrigin, dir string) {
+				t.Helper()
+				divergeOn(t, o, dir, "dist/app.js")
+				stopOnConflict(t, dir, "merge", "theirs")
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			o := newUntrackedBuildOrigin(t)
+			layout, repo, dir := clonedBase(t, o)
+			first := o.s1
+			if tc.firstToS2 {
+				o.advancePullRef(t, o.s2)
+				first = o.s2
+			}
+			if got := checkoutPullRef(layout, repo, testPullRef, first, tc.pathScope); got.Outcome != gitclone.PullCheckoutCheckedOut {
+				t.Fatalf("first CheckoutPullRef() = %+v, want checked_out", got)
+			}
+			if tc.before != nil {
+				tc.before(t, o, dir)
+			}
+			o.advancePullRef(t, o.s2)
+
+			got := checkoutPullRef(layout, repo, testPullRef, o.s2, tc.pathScope)
+			if got.Outcome != gitclone.PullCheckoutCheckedOut || got.HeadSHA != o.s2 {
+				t.Fatalf("CheckoutPullRef(S2) = %+v, want checked_out at %s", got, o.s2)
+			}
+			assertBuildGone(t, o, dir)
+		})
+	}
+}
+
+// TestCloneAll_PullRef_DeletesWhatTheHeadStoppedTracking is the same on a
+// fresh boot: the clone checks out the base's main, which tracks
+// dist/app.js, and the boot at the pull request's head deletes it, in the
+// scope or out of it.
+func TestCloneAll_PullRef_DeletesWhatTheHeadStoppedTracking(t *testing.T) {
+	t.Parallel()
+	for _, scope := range [][]string{nil, {"/pr.txt"}} {
+		t.Run(fmt.Sprintf("scope %v", scope), func(t *testing.T) {
+			t.Parallel()
+			o := newUntrackedBuildOrigin(t)
+			o.advancePullRef(t, o.s2)
+			layout := gitdir.Layout{Root: t.TempDir(), WorkspaceDir: t.TempDir()}
+			ref := testPullRef
+			repos := []sessionconfig.SessionConfigReposElem{{Name: "widgets", Url: o.url, Ref: &ref}}
+
+			results, err := gitclone.CloneAll(context.Background(), supervisor.New(), layout, nil, nil, repos, scope, testCloneTimeout, testStopGrace)
+			if err != nil || len(results) != 1 || results[0].Err != nil {
+				t.Fatalf("CloneAll() = %+v, %v, want one cloned repo", results, err)
+			}
+			assertBuildGone(t, o, filepath.Join(layout.WorkspaceDir, "widgets"))
+		})
+	}
+}
+
+// TestSyncAll_PullRef_DeletesWhatTheHeadStoppedTracking is the same on a
+// warm boot: a review sandbox restored at S1, or one whose runtime checked
+// out the base's main itself, boots at S2 without main's dist/app.js.
+func TestSyncAll_PullRef_DeletesWhatTheHeadStoppedTracking(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		pathScope []string
+		bootAtS2  bool
+		before    func(t *testing.T, o *pullRefOrigin, dir string)
+	}{
+		{name: "unscoped"},
+		{name: "scoped, the path in the scope", pathScope: []string{"/pr.txt", "/dist/"}},
+		{name: "scoped, the path outside the scope", pathScope: []string{"/pr.txt"}},
+		{name: "the runtime moved HEAD itself", bootAtS2: true, before: moveRuntimeHEADToMain},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			o := newUntrackedBuildOrigin(t)
+			if tc.bootAtS2 {
+				o.advancePullRef(t, o.s2)
+			}
+			layout := gitdir.Layout{Root: t.TempDir(), WorkspaceDir: t.TempDir()}
+			ref := testPullRef
+			repos := []sessionconfig.SessionConfigReposElem{{Name: "widgets", Url: o.url, Ref: &ref}}
+			if results, err := gitclone.CloneAll(context.Background(), supervisor.New(), layout, nil, nil, repos, tc.pathScope, testCloneTimeout, testStopGrace); err != nil || results[0].Err != nil {
+				t.Fatalf("CloneAll() = %+v, %v", results, err)
+			}
+			dir := filepath.Join(layout.WorkspaceDir, "widgets")
+			if tc.before != nil {
+				tc.before(t, o, dir)
+			}
+			o.advancePullRef(t, o.s2)
+
+			results, err := gitclone.SyncAll(context.Background(), supervisor.New(), layout, nil, repos, tc.pathScope, "88888888-8888-8888-8888-888888888888",
+				testFetchStepTimeout, testSyncStepTimeout, testStopGrace, func(string, string, string) {}, noopGitFetchTiming, noopGitCheckoutTiming)
+			if err != nil || len(results) != 1 || results[0].Err != nil {
+				t.Fatalf("SyncAll() = %+v, %v, want one synced repo", results, err)
+			}
+			assertBuildGone(t, o, dir)
+		})
+	}
+}
+
+// newSymlinkToDirectoryOrigin is a pull request that turns a symlink into
+// a directory: S1 tracks lib, a symlink to pkg, and pkg/util/a.go; S2
+// replaces lib with a directory holding the file lib/util. *.log is
+// ignored throughout.
+func newSymlinkToDirectoryOrigin(t *testing.T) *pullRefOrigin {
+	t.Helper()
+	return newOriginWith(t, func(t *testing.T, work string) (string, string, string) {
+		t.Helper()
+		writeWorktreeFile(t, work, "README.md", "base\n")
+		writeWorktreeFile(t, work, ".gitignore", "*.log\n")
+		main := commitAll(t, work, "main")
+		runGit(t, work, "checkout", "-q", "-b", "pr")
+		writeWorktreeFile(t, work, "pkg/util/a.go", "package util\n")
+		if err := os.Symlink("pkg", filepath.Join(work, "lib")); err != nil {
+			t.Fatalf("symlink lib: %v", err)
+		}
+		writeWorktreeFile(t, work, "pr.txt", "first\n")
+		s1 := commitAll(t, work, "lib is a symlink to pkg")
+		if err := os.Remove(filepath.Join(work, "lib")); err != nil {
+			t.Fatalf("remove lib: %v", err)
+		}
+		writeWorktreeFile(t, work, "lib/util", "a file of its own\n")
+		writeWorktreeFile(t, work, "pr.txt", "second\n")
+		s2 := commitAll(t, work, "lib is a directory")
+		return main, s1, s2
+	})
+}
+
+// TestCheckoutPullRef_NeverRemovesThroughASymlinkedParent: a scoped
+// checkout removes a directory a turn made where the index has a file only
+// when every leading directory of that path is a real directory, as git
+// itself never follows a symlink there. Through a symlink, the directory
+// belongs to another path -- of the same repo, or of another repo in the
+// workspace -- and nothing outside the entry's own path is removed.
+func TestCheckoutPullRef_NeverRemovesThroughASymlinkedParent(t *testing.T) {
+	t.Parallel()
+	t.Run("a turn's symlink to another repo of the workspace", func(t *testing.T) {
+		t.Parallel()
+		o := newPullRefOrigin(t)
+		layout, repo, dir := clonedBase(t, o)
+		scope := []string{"/pr.txt"}
+		if got := checkoutPullRef(layout, repo, testPullRef, o.s1, scope); got.Outcome != gitclone.PullCheckoutCheckedOut {
+			t.Fatalf("first CheckoutPullRef() = %+v, want checked_out", got)
+		}
+		other := filepath.Join(layout.WorkspaceDir, "other")
+		writeWorktreeFile(t, other, "new.md/kept.txt", "another repo's\n")
+		if err := os.Symlink(filepath.Join("..", "other"), filepath.Join(dir, "docs")); err != nil {
+			t.Fatalf("symlink docs: %v", err)
+		}
+		o.advancePullRef(t, o.s3)
+
+		got := checkoutPullRef(layout, repo, testPullRef, o.s3, scope)
+		if got.Outcome != gitclone.PullCheckoutCheckedOut || got.HeadSHA != o.s3 {
+			t.Errorf("CheckoutPullRef(S3) = %+v, want checked_out at %s", got, o.s3)
+		}
+		if !exists(filepath.Join(other, "new.md", "kept.txt")) {
+			t.Error("other/new.md/kept.txt, another repo's, was removed through the symlink")
+		}
+	})
+	t.Run("a head that turns a symlink into a directory", func(t *testing.T) {
+		t.Parallel()
+		o := newSymlinkToDirectoryOrigin(t)
+		layout, repo, dir := clonedBase(t, o)
+		scope := []string{"/pr.txt", "/pkg/", "/lib", "/lib/"}
+		if got := checkoutPullRef(layout, repo, testPullRef, o.s1, scope); got.Outcome != gitclone.PullCheckoutCheckedOut {
+			t.Fatalf("first CheckoutPullRef() = %+v, want checked_out", got)
+		}
+		if info, err := os.Lstat(filepath.Join(dir, "lib")); err != nil || info.Mode()&os.ModeSymlink == 0 {
+			t.Fatalf("lib = %v, %v, want the symlink S1 tracks", info, err)
+		}
+		writeWorktreeFile(t, dir, "pkg/util/cache.log", "what setup wrote\n")
+		o.advancePullRef(t, o.s2)
+
+		got := checkoutPullRef(layout, repo, testPullRef, o.s2, scope)
+		if got.Outcome != gitclone.PullCheckoutCheckedOut || got.HeadSHA != o.s2 {
+			t.Fatalf("CheckoutPullRef(S2) = %+v, want checked_out at %s", got, o.s2)
+		}
+		if !exists(filepath.Join(dir, "pkg", "util", "cache.log")) {
+			t.Error("pkg/util/cache.log, an ignored file, was removed through the old lib symlink")
+		}
+		if info, err := os.Lstat(filepath.Join(dir, "lib")); err != nil || !info.IsDir() {
+			t.Errorf("lib = %v, %v, want the directory S2 tracks", info, err)
+		}
+		wantContent("lib/util", "a file of its own\n")(t, dir)
+	})
 }

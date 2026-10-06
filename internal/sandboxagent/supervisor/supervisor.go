@@ -38,6 +38,13 @@ type Spec struct {
 	Stdout io.Writer
 	Stderr io.Writer
 
+	// Stdin, when non-nil, is the spawned process's standard input
+	// (exec.Cmd's own Stdin, passed through verbatim): a git plumbing
+	// command that reads its records there (`update-index --index-info`)
+	// takes any number of them, where its argv could not. nil, the zero
+	// value, connects it to the null device, as before this field existed.
+	Stdin io.Reader
+
 	// Credential, when non-nil, is assigned verbatim to the spawned
 	// child's own SysProcAttr.Credential -- a KERNEL-ENFORCED UID/GID
 	// drop (TECHNICAL_PLAN.md §30.5: "OS-level isolation between
@@ -128,6 +135,7 @@ func (s *Supervisor) Spawn(spec Spec) (*Process, error) {
 	cmd.Env = spec.Env
 	cmd.Stdout = spec.Stdout
 	cmd.Stderr = spec.Stderr
+	cmd.Stdin = spec.Stdin
 	cmd.SysProcAttr = sysProcAttrFor(spec)
 
 	if err := cmd.Start(); err != nil {

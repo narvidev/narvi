@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,10 +28,12 @@ type PullCheckoutOutcome string
 
 const (
 	// PullCheckoutCheckedOut means the worktree holds HeadSHA, the commit
-	// asked for, with every tracked change discarded, every untracked file
-	// that is not ignored removed, no operation a turn started (a merge, a
-	// rebase, a cherry-pick, ...) left in progress, and, in a scoped
-	// session, no path outside the scope on disk.
+	// asked for, with every tracked change discarded, every path the
+	// previous index tracked and HeadSHA lacks deleted (ignored or not, as
+	// a plain forced checkout deletes it), every untracked file that is not
+	// ignored removed, no operation a turn started (a merge, a rebase, a
+	// cherry-pick, ...) left in progress, and, in a scoped session, no path
+	// of HeadSHA outside the scope on disk.
 	PullCheckoutCheckedOut PullCheckoutOutcome = "checked_out"
 	// PullCheckoutSHAAbsent means the ref was fetched, and the commit asked for
 	// is not in the repository. The worktree is untouched.
@@ -52,21 +55,24 @@ const PullHeadLocalRef = "refs/narvi/pull-head"
 // CheckoutPullRef call: one fetch, bounded by fetchTimeout, then at most
 // PullCheckoutMaxLocalGitSpawns local git processes, each bounded by its
 // own stepTimeout, and each by stopGrace more when it has to be stopped.
-// The longest path is a scoped repo whose index holds a skip-worktree entry
-// whose file is present: rev-parse of the ref and of the target (2), the
-// read-tree that resets the index to the target (1), ls-files and the
-// update-index that clears those bits (2), the sparse-checkout set and the
-// five-process mirror to the runtime's config (6), the forced checkout and
-// the runtime HEAD write its move causes (2), clean (1), the
-// sparse-checkout set that checks the scope holds (1) and rev-parse HEAD
-// (1). A scoped repo with no such entry takes 15, and an unscoped repo 13,
-// the sparse-checkout disable and its mirror (6) in place of the five
-// sparse steps before the checkout and with no check after it. Clearing an
-// operation a turn left in progress spawns nothing.
-// TestCheckoutPullRef_SpawnCount pins every path.
+// The longest path is a scoped repo whose index tracks a path the target
+// lacks and holds a skip-worktree entry whose file is present: rev-parse of
+// the ref and of the target (2), the diff-index that lists what the index
+// tracks and the target lacks (1), the read-tree that resets the index to
+// the target and the update-index that puts those entries back (2),
+// ls-files and the update-index that clears those bits (2), the
+// sparse-checkout set and the five-process mirror to the runtime's config
+// (6), the forced checkout and the runtime HEAD write its move causes (2),
+// clean (1), the sparse-checkout set that checks the scope holds (1) and
+// rev-parse HEAD (1). Each of those two update-index steps runs only when it
+// has an entry to write. An unscoped repo takes at most 15: the
+// sparse-checkout disable and its mirror (6) in place of the five sparse
+// steps before the checkout, and no check after it. Clearing an operation a
+// turn left in progress spawns nothing. TestCheckoutPullRef_SpawnCount pins
+// every path.
 const (
 	PullCheckoutNetworkGitSpawns  = 1
-	PullCheckoutMaxLocalGitSpawns = 16
+	PullCheckoutMaxLocalGitSpawns = 18
 )
 
 // PullCheckoutResult is one repo's outcome from CheckoutPullRef.
@@ -109,27 +115,33 @@ type PullCheckoutResult struct {
 //     progress (a merge, cherry-pick, revert, rebase, am or bisect that
 //     stopped) is forgotten by clearInterruptedOperation: the runtime's own
 //     --continue, --abort or `bisect reset` would otherwise act on it over
-//     the checked-out tree and move it off the target. Then `read-tree
-//     --reset -i <target>` makes the index the target's tree, discarding
-//     unmerged entries; -i keeps it from checking the worktree, which it
-//     never writes, so a changed skip-worktree file cannot stop it. A path
-//     whose file differs from the target's, or that the target adds where
-//     the turn left an untracked file, is then an index entry the forced
-//     checkout rewrites or, outside the scope, removes; left out of the
-//     index, an added path's file would be kept, and an unmerged entry
-//     would make the scope's set fail on every attempt. Last, the sparse
-//     state the runtime may have changed since the boot, and every
-//     skip-worktree bit, are reset: a forced checkout never rewrites an
-//     entry carrying the bit, nor does clean remove its file. An unscoped
-//     session runs `sparse-checkout disable`, which clears every bit. A
-//     scoped one clears the bit of every entry whose file is present and
-//     removes a directory a turn made where the index has a file
-//     (prepareScopedEntries), then runs `sparse-checkout set` with its own
-//     patterns, which recomputes every other bit without ever writing an
-//     out-of-scope path (§14.1). Here set may leave a changed file, or an
-//     untracked one in the way, and says so: the forced checkout discards
-//     them, and step 7 fails the checkout if it did not. Both are mirrored
-//     to the runtime's config.
+//     the checked-out tree and move it off the target. Then the index is
+//     made the union of the target's tree and every entry the index had
+//     that the target lacks. `diff-index --cached` lists those entries,
+//     `read-tree --reset -i <target>` makes the index the target's tree,
+//     discarding unmerged entries, and `update-index --index-info` puts the
+//     listed entries back at stage 0 (droppedIndexInfo). -i keeps the
+//     read-tree from checking the worktree, which it never writes, so a
+//     changed skip-worktree file cannot stop it. A path the target has is
+//     then an index entry the forced checkout rewrites or, outside the
+//     scope, removes, even where the turn left an untracked file in its
+//     place; and a path the target lacks is one it deletes, as a plain
+//     forced checkout from the previous index does, ignored or not. Left
+//     out of the index, an added path's untracked file would be kept as its
+//     content, a deleted path that the target's .gitignore matches would
+//     stay on disk, and an unmerged entry would make the scope's set fail
+//     on every attempt. Last, the sparse state the runtime may have changed
+//     since the boot, and every skip-worktree bit, are reset: a forced
+//     checkout never rewrites an entry carrying the bit, nor does clean
+//     remove its file. An unscoped session runs `sparse-checkout disable`,
+//     which clears every bit. A scoped one clears the bit of every entry
+//     whose file is present and removes a directory a turn made where the
+//     index has a file (prepareScopedEntries), then runs `sparse-checkout
+//     set` with its own patterns, which recomputes every other bit without
+//     ever writing an out-of-scope path (§14.1). Here set may leave a
+//     changed file, or an untracked one in the way, and says so: the forced
+//     checkout discards them, and step 7 fails the checkout if it did not.
+//     Both are mirrored to the runtime's config.
 //  6. `checkout --force --detach <target> --`, then `clean -ffd`: every
 //     tracked change, staged or not, is discarded, and every untracked
 //     file that is not ignored is removed, nested repositories included.
@@ -217,7 +229,7 @@ func CheckoutPullRef(
 		result.Outcome, result.Err = PullCheckoutFailed, fmt.Errorf("gitclone: clear the operation a turn left in progress in %s: %w", repo.Name, err)
 		return result
 	}
-	if _, err := runGitStep(ctx, sup, handle, cred, []string{"read-tree", "--reset", "-i", target}, stepTimeout, stopGrace); err != nil {
+	if err := resetIndexToTarget(ctx, sup, handle, cred, target, stepTimeout, stopGrace); err != nil {
 		result.Outcome, result.Err = PullCheckoutFailed, fmt.Errorf("gitclone: reset the index of %s to %s: %w", repo.Name, target, err)
 		return result
 	}
@@ -276,6 +288,96 @@ func CheckoutPullRef(
 	return result
 }
 
+// resetIndexToTarget makes repo's index the union of target's tree and
+// every entry the index had that target lacks, each at stage 0 (step 5 of
+// CheckoutPullRef): `diff-index --cached` lists those entries while the
+// index still has them, `read-tree --reset -i <target>` makes the index
+// target's tree, discarding every unmerged entry, and `update-index -z
+// --index-info` writes the listed entries back, through its stdin, so
+// their number is not bounded by an argv. It runs only when there is an
+// entry to write. An entry that collides with one of target's paths (a
+// file where target has a directory, or the reverse) replaces it, as it
+// stood in the previous index.
+func resetIndexToTarget(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, target string, timeout, stopGrace time.Duration) error {
+	listed, err := runGitStepRaw(ctx, sup, repo, cred, []string{"diff-index", "--cached", "-z", "--no-renames", "--diff-filter=AU", target, "--"}, nil, timeout, stopGrace)
+	if err != nil {
+		return err
+	}
+	info, err := droppedIndexInfo(listed)
+	if err != nil {
+		return fmt.Errorf("read what the index tracks and %s lacks: %w", target, err)
+	}
+	if _, err := runGitStep(ctx, sup, repo, cred, []string{"read-tree", "--reset", "-i", target}, timeout, stopGrace); err != nil {
+		return err
+	}
+	if len(info) == 0 {
+		return nil
+	}
+	_, err = runGitStepRaw(ctx, sup, repo, cred, []string{"update-index", "-z", "--index-info"}, info, timeout, stopGrace)
+	return err
+}
+
+// emptyBlobSHA1 is the object name of the empty blob in a SHA-1
+// repository, which the agent's git-dir always is (gitdir.Seed).
+const emptyBlobSHA1 = "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391"
+
+// droppedIndexInfo turns the -z output of `diff-index --cached --no-renames
+// --diff-filter=AU <target>` into the `update-index -z --index-info` input
+// that puts each listed entry back at stage 0:
+//
+//   - An entry the index has and target lacks (A) keeps its own mode and
+//     object.
+//   - An unmerged path target lacks (U, with no mode on target's side) has
+//     no single object; it is written with the empty blob's name. The
+//     forced checkout only deletes it, and never reads that object.
+//   - An unmerged path target has is left out: read-tree has put target's
+//     entry there.
+//
+// A path that is not local to the worktree, or that has a .git component,
+// is left out too: git never writes either, and update-index refuses both.
+// Anything else that is not diff-index's raw shape is an error.
+func droppedIndexInfo(listed string) ([]byte, error) {
+	var info bytes.Buffer
+	fields := strings.Split(listed, "\x00")
+	if n := len(fields); n > 0 && fields[n-1] == "" {
+		fields = fields[:n-1]
+	}
+	if len(fields)%2 != 0 {
+		return nil, fmt.Errorf("unexpected diff-index output: %d fields", len(fields))
+	}
+	for i := 0; i < len(fields); i += 2 {
+		meta, path := fields[i], fields[i+1]
+		parts := strings.Fields(strings.TrimPrefix(meta, ":"))
+		if !strings.HasPrefix(meta, ":") || len(parts) != 5 {
+			return nil, fmt.Errorf("unexpected diff-index record %q", meta)
+		}
+		targetMode, mode, object, status := parts[0], parts[1], parts[3], parts[4]
+		if !filepath.IsLocal(path) || hasDotGitComponent(path) {
+			continue
+		}
+		switch {
+		case status == "A":
+		case status == "U" && targetMode == "000000":
+			mode, object = "100644", emptyBlobSHA1
+		default:
+			continue
+		}
+		fmt.Fprintf(&info, "%s %s\t%s\x00", mode, object, path)
+	}
+	return info.Bytes(), nil
+}
+
+// hasDotGitComponent reports whether a slash-separated path has a
+// component that names a .git directory, in any case.
+func hasDotGitComponent(path string) bool {
+	for _, component := range strings.Split(path, "/") {
+		if strings.EqualFold(component, ".git") {
+			return true
+		}
+	}
+	return false
+}
+
 // interruptedOperationState is every entry under a worktree's .git that
 // records an operation git started there and did not finish: a merge, a
 // cherry-pick or revert of one commit or of a sequence, a rebase of either
@@ -293,34 +395,113 @@ var interruptedOperationState = []string{
 // clearInterruptedOperation removes every interruptedOperationState entry
 // from the .git of repoName's worktree under workspaceDir. They live only
 // in the runtime's .git, never in the agent-owned git-dir, so no agent git
-// command can clear them. The removal goes through an os.Root opened at the
-// workspace directory, which the session config names: the worktree and its
-// .git are the runtime's, and a symlink it planted in either is never
-// followed out of the workspace.
+// command can clear them. The worktree and its .git are reached through
+// openRealDir, from an os.Root opened at the workspace directory, which the
+// session config names: a symlink the runtime made of either is never
+// followed, to another repo of the workspace or out of it, and makes the
+// clear fail.
 func clearInterruptedOperation(workspaceDir, repoName string) error {
 	root, err := os.OpenRoot(workspaceDir)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = root.Close() }()
+	gitDir, err := openRealDir(root, repoName, ".git")
+	if err != nil {
+		return err
+	}
+	if gitDir == nil {
+		return fmt.Errorf("%s/.git is not a directory reached without a symlink", repoName)
+	}
+	defer func() { _ = gitDir.Close() }()
 	for _, name := range interruptedOperationState {
-		if err := root.RemoveAll(filepath.Join(repoName, ".git", name)); err != nil {
+		if err := gitDir.RemoveAll(name); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// openRealDir opens, as an os.Root, the directory components names under
+// root, one component at a time, each from its parent's own Root. It
+// returns nil, and no error, when one of them is absent, a symlink or not a
+// directory: git never follows a symlink in a path's leading directories
+// (it replaces the symlink instead), and neither does anything that removes
+// a path here. A component swapped for a symlink between its Lstat and its
+// open is still resolved only inside its parent.
+func openRealDir(root *os.Root, components ...string) (*os.Root, error) {
+	cur, owned := root, false
+	release := func() {
+		if owned {
+			_ = cur.Close()
+		}
+	}
+	for _, component := range components {
+		if component == "" || component == "." {
+			continue
+		}
+		info, err := cur.Lstat(component)
+		if errors.Is(err, fs.ErrNotExist) {
+			release()
+			return nil, nil
+		}
+		if err != nil {
+			release()
+			return nil, err
+		}
+		if !info.IsDir() {
+			release()
+			return nil, nil
+		}
+		next, err := cur.OpenRoot(component)
+		release()
+		if err != nil {
+			return nil, err
+		}
+		cur, owned = next, true
+	}
+	if !owned {
+		return nil, errors.New("no directory named")
+	}
+	return cur, nil
+}
+
+// removeTurnsDirectory removes the directory at path, an index entry's path
+// in repoName's worktree, when it is a real directory reached through real
+// directories only (openRealDir). A path below a symlink is left to the
+// forced checkout, which replaces the symlink as git does.
+func removeTurnsDirectory(root *os.Root, repoName, path string) error {
+	components := []string{repoName}
+	if dir := filepath.Dir(path); dir != "." {
+		components = append(components, strings.Split(filepath.ToSlash(dir), "/")...)
+	}
+	parent, err := openRealDir(root, components...)
+	if err != nil || parent == nil {
+		return err
+	}
+	defer func() { _ = parent.Close() }()
+	base := filepath.Base(path)
+	info, err := parent.Lstat(base)
+	if err != nil || !info.IsDir() {
+		return nil
+	}
+	return parent.RemoveAll(base)
+}
+
 // prepareScopedEntries readies a scoped session's index and worktree for
 // the forced checkout, entry by entry, from one `ls-files -s -v -z`:
 //
 //   - A directory a turn made where the index has a file or a symlink is
-//     removed. The forced checkout replaces such a directory with the
-//     entry only where it writes the entry, never where the scope leaves
-//     the path out; clean leaves it, and sparse-checkout set reports it as
-//     left on disk, so out of the scope it would fail every later
-//     checkout. A submodule's directory is a directory in the index too,
-//     and is left alone.
+//     removed (removeTurnsDirectory). The forced checkout replaces such a
+//     directory with the entry only where it writes the entry, never where
+//     the scope leaves the path out; clean leaves it, and sparse-checkout
+//     set reports it as left on disk, so out of the scope it would fail
+//     every later checkout. A directory reached through a symlink in the
+//     path's leading directories is not that path's, and is left alone,
+//     as git leaves it. A submodule's directory is a directory in the index
+//     too, and is left alone; so a directory a turn fills at the path of a
+//     submodule outside the scope still fails each scoped checkout until it
+//     is removed (no review session is scoped today).
 //   - The skip-worktree bit of every entry whose file is present is
 //     cleared -- an entry a previous turn marked with `update-index
 //     --skip-worktree` and wrote, in scope or not. Only those: every other
@@ -371,7 +552,7 @@ func prepareScopedEntries(ctx context.Context, sup *supervisor.Supervisor, layou
 			continue
 		}
 		if info.IsDir() && fields[1] != gitlinkMode {
-			if err := root.RemoveAll(inWorkspace); err != nil {
+			if err := removeTurnsDirectory(root, name, path); err != nil {
 				return fmt.Errorf("remove the directory at %s, a file in the index: %w", path, err)
 			}
 			continue
@@ -425,6 +606,14 @@ const gitStepStderrMaxBytes = 1024
 // wrapping errGitStepExit and carrying the end of git's stderr, so a
 // failed fetch says why (an authentication refusal, a missing ref, ...).
 func runGitStep(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, args []string, timeout, stopGrace time.Duration) (string, error) {
+	out, err := runGitStepRaw(ctx, sup, repo, cred, args, nil, timeout, stopGrace)
+	return strings.TrimSpace(out), err
+}
+
+// runGitStepRaw is runGitStep with stdin, when it is not nil, fed to git,
+// and git's stdout returned as it is, for a -z output whose first or last
+// path may start or end with a space.
+func runGitStepRaw(ctx context.Context, sup *supervisor.Supervisor, repo githarden.Repo, cred *syscall.Credential, args []string, stdin []byte, timeout, stopGrace time.Duration) (string, error) {
 	var stdout, stderr bytes.Buffer
 	spec := supervisor.Spec{
 		Path:   "git",
@@ -432,6 +621,9 @@ func runGitStep(ctx context.Context, sup *supervisor.Supervisor, repo githarden.
 		Env:    githarden.Env(nil),
 		Stdout: &stdout,
 		Stderr: &stderr,
+	}
+	if stdin != nil {
+		spec.Stdin = bytes.NewReader(stdin)
 	}
 	result, err := gitdir.Run(ctx, sup, repo, cred, spec, timeout, stopGrace)
 	name := gitStepName(args)
@@ -444,7 +636,7 @@ func runGitStep(ctx context.Context, sup *supervisor.Supervisor, repo githarden.
 	if result.ExitCode != 0 {
 		return "", fmt.Errorf("git %s: %w (%d): %s", name, errGitStepExit, result.ExitCode, stderrTail(stderr.String()))
 	}
-	return strings.TrimSpace(stdout.String()), nil
+	return stdout.String(), nil
 }
 
 // gitStepName is the subcommand args runs, for an error: the first
