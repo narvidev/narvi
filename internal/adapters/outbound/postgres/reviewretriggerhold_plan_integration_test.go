@@ -23,7 +23,8 @@ import (
 
 // holdPlanLatestVersion is the migration the hold's plan test migrates
 // to: the latest whose columns or tables the statements it measures name --
-// GetSessionActivityFacts reads workflow_advance_holds.
+// GetSessionActivityFacts reads workflow_advance_holds, which comes after
+// the review checkout's columns (reviewCheckoutGenMigration).
 const holdPlanLatestVersion = workflowAdvanceHoldsMigration
 
 const (

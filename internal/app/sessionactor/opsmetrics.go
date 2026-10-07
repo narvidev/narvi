@@ -232,6 +232,15 @@ type opsMetrics struct {
 	// leaves unanswered (§31.4), until it is answered: sent after a
 	// restore, or window_expired.
 	promptResend metric.Int64Counter
+
+	// reviewCheckout is review_checkout_total: one per step of a review
+	// turn's checkout (technical plan §21.1, reviewcheckout.go) -- a
+	// command written or not, a confirmation, and each way the wait ends
+	// otherwise -- tagged outcome=sent|send_failed|checked_out|
+	// context_moved|unsupported|no_report|head_absent|error|
+	// retired_old_agent|retired_failing. A wait is not counted: it is the
+	// absence of an outcome, looked at again on each evaluation.
+	reviewCheckout metric.Int64Counter
 }
 
 // newOpsMetrics constructs all five instruments against meter -- the SAME
@@ -402,6 +411,15 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		return opsMetrics{}, fmt.Errorf("sessionactor: construct turn_prompt_resend_total counter: %w", err)
 	}
 
+	reviewCheckout, err := meter.Int64Counter(
+		"review_checkout_total",
+		metric.WithDescription("Steps of a review turn's checkout (technical plan §21.1): a turn of a pull request's review session that records a head is sent only once its sandbox reports holding that head, checked out from the pull request's ref in the base repository. By outcome: sent (a checkout command was written to the sandbox, a first one or one sent again after a reconnect, a ref that lags or a failed try); send_failed (that write failed; the request stays recorded, and a reconnect or the bound decides what follows); checked_out (the sandbox holds the head, and the turn was dispatched); context_moved (the pull request's head moved past the recorded one, and an attempt a lane asks for again ended without running); unsupported (the sandbox's agent cannot check out a commit and there was no snapshot to clear; the turn was refused, naming the remedy: rebuild the image); no_report (no reply within ReviewCheckoutTimeout; refused); head_absent (the recorded head was still not in the pull request's ref past ReviewCheckoutRefLagWindow, on a turn no lane asks for again; refused); error (the checkout kept failing -- a fetch failure, a busy sandbox or a failed checkout -- until ReviewCheckoutTimeout; refused, naming the agent's error); retired_old_agent (the sandbox's agent cannot check out a commit and the sandbox had a snapshot: the gen was retired and the snapshot cleared, so the next boots fresh); retired_failing (ReviewCheckoutFailuresBeforeRetire checkouts of one turn on one gen failed: the gen was retired the same way, once per turn). The WARN line logged with each refusal and retirement names the turn."),
+		metric.WithUnit("{checkout}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct review_checkout_total counter: %w", err)
+	}
+
 	return opsMetrics{
 		actorsLive:            actorsLive,
 		hydrations:            hydrations,
@@ -420,7 +438,19 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		bootEvidenceFallback:  bootEvidenceFallback,
 		unknownTimerKind:      unknownTimerKind,
 		promptResend:          promptResend,
+		reviewCheckout:        reviewCheckout,
 	}, nil
+}
+
+// recordReviewCheckout counts one step of a review turn's checkout, by
+// outcome (one of the reviewCheckoutOutcome* values, reviewcheckout.go),
+// once the transaction that decided it has committed, or the command's
+// write has returned.
+func (a *Actor) recordReviewCheckout(ctx context.Context, outcome string) {
+	if a.opsMetrics.reviewCheckout == nil {
+		return
+	}
+	a.opsMetrics.reviewCheckout.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", outcome)))
 }
 
 // recordPromptResend counts one same-gen reconnect the prompt-receipt

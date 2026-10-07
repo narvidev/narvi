@@ -22,9 +22,11 @@ import (
 
 // guardPlanLatestVersion is the migration the session guard's plan test
 // migrates to: the latest whose columns or tables the statements it
-// measures name -- GetSessionActivityFacts reads workflow_advance_holds --
-// which is past the one that builds turns_session_dispatched_idx, so the
-// test takes that index away and builds it again itself.
+// measures name -- GetSessionActivityFacts reads workflow_advance_holds,
+// which comes after the review checkout's columns
+// (reviewCheckoutGenMigration) -- which is past the one that builds
+// turns_session_dispatched_idx (sessionDispatchedMigration), so the test
+// takes that index away and builds it again itself.
 const guardPlanLatestVersion = workflowAdvanceHoldsMigration
 
 // guardReadFixedBuffers and guardReadBuffersPerTurn bound what the session

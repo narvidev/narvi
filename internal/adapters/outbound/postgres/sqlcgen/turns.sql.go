@@ -15,7 +15,7 @@ const createTurn = `-- name: CreateTurn :one
 
 INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, is_review_attempt, request_trigger, requested_by, request_text, context_moves)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha
 `
 
 type CreateTurnParams struct {
@@ -201,6 +201,15 @@ func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, e
 		&i.RequestedBy,
 		&i.RequestText,
 		&i.ContextMoves,
+		&i.CheckoutMessageID,
+		&i.CheckoutGen,
+		&i.CheckoutRequestedAt,
+		&i.CheckoutSentAt,
+		&i.CheckoutSentReadySeq,
+		&i.CheckoutSends,
+		&i.CheckoutFailures,
+		&i.CheckoutRetiredGen,
+		&i.CheckedOutSha,
 	)
 	return i, err
 }
@@ -448,7 +457,7 @@ func (q *Queries) GetPlatformCostSummaryInWindow(ctx context.Context, createdAt 
 }
 
 const getProcessingTurnForSession = `-- name: GetProcessingTurnForSession :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha FROM turns
 WHERE session_id = $1 AND status = 'processing'
 `
 
@@ -502,6 +511,15 @@ func (q *Queries) GetProcessingTurnForSession(ctx context.Context, sessionID pgt
 		&i.RequestedBy,
 		&i.RequestText,
 		&i.ContextMoves,
+		&i.CheckoutMessageID,
+		&i.CheckoutGen,
+		&i.CheckoutRequestedAt,
+		&i.CheckoutSentAt,
+		&i.CheckoutSentReadySeq,
+		&i.CheckoutSends,
+		&i.CheckoutFailures,
+		&i.CheckoutRetiredGen,
+		&i.CheckedOutSha,
 	)
 	return i, err
 }
@@ -597,7 +615,7 @@ func (q *Queries) GetReviewAttemptToCheck(ctx context.Context, sessionID pgtype.
 }
 
 const getTurn = `-- name: GetTurn :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha FROM turns
 WHERE id = $1
 `
 
@@ -642,12 +660,21 @@ func (q *Queries) GetTurn(ctx context.Context, id pgtype.UUID) (Turn, error) {
 		&i.RequestedBy,
 		&i.RequestText,
 		&i.ContextMoves,
+		&i.CheckoutMessageID,
+		&i.CheckoutGen,
+		&i.CheckoutRequestedAt,
+		&i.CheckoutSentAt,
+		&i.CheckoutSentReadySeq,
+		&i.CheckoutSends,
+		&i.CheckoutFailures,
+		&i.CheckoutRetiredGen,
+		&i.CheckedOutSha,
 	)
 	return i, err
 }
 
 const getTurnByDispatchedMessageID = `-- name: GetTurnByDispatchedMessageID :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha FROM turns
 WHERE session_id = $1 AND dispatched_message_id = $2
 `
 
@@ -727,6 +754,76 @@ func (q *Queries) GetTurnByDispatchedMessageID(ctx context.Context, arg GetTurnB
 		&i.RequestedBy,
 		&i.RequestText,
 		&i.ContextMoves,
+		&i.CheckoutMessageID,
+		&i.CheckoutGen,
+		&i.CheckoutRequestedAt,
+		&i.CheckoutSentAt,
+		&i.CheckoutSentReadySeq,
+		&i.CheckoutSends,
+		&i.CheckoutFailures,
+		&i.CheckoutRetiredGen,
+		&i.CheckedOutSha,
+	)
+	return i, err
+}
+
+const getTurnCheckoutState = `-- name: GetTurnCheckoutState :one
+SELECT t.checkout_message_id,
+       t.checkout_gen,
+       COALESCE(t.checkout_sends, 0)::integer AS checkout_sends,
+       COALESCE(t.checkout_failures, 0)::integer AS checkout_failures,
+       t.checkout_retired_gen,
+       t.checkout_sent_ready_seq,
+       COALESCE((EXTRACT(EPOCH FROM (now() - t.checkout_requested_at)) * 1000000000)::bigint, 0)::bigint AS since_request_nanos,
+       COALESCE((EXTRACT(EPOCH FROM (now() - t.checkout_sent_at)) * 1000000000)::bigint, 0)::bigint AS since_send_nanos,
+       (SELECT e.payload FROM events e
+         WHERE e.session_id = t.session_id
+           AND e.message_id = 'checkout_result:' || t.checkout_message_id
+           AND e.type = 'checkout_result') AS reply
+FROM turns t
+WHERE t.id = $1
+`
+
+type GetTurnCheckoutStateRow struct {
+	CheckoutMessageID    *string `json:"checkout_message_id"`
+	CheckoutGen          *int32  `json:"checkout_gen"`
+	CheckoutSends        int32   `json:"checkout_sends"`
+	CheckoutFailures     int32   `json:"checkout_failures"`
+	CheckoutRetiredGen   *int32  `json:"checkout_retired_gen"`
+	CheckoutSentReadySeq *int32  `json:"checkout_sent_ready_seq"`
+	SinceRequestNanos    int64   `json:"since_request_nanos"`
+	SinceSendNanos       int64   `json:"since_send_nanos"`
+	Reply                []byte  `json:"reply"`
+}
+
+// Technical plan §21.1 and §30.4: the facts the session actor decides a
+// review turn's checkout on (turn.DecideReviewCheckout), read in one
+// statement on the database's clock: the turn's latest checkout request
+// (its messageId, gen, ready_seq at the send and counts), how long ago the
+// first request on that gen and the latest send were made, in nanoseconds
+// (a time.Duration; 0 when none was made), and the reply, when one is
+// stored. The reply is read by its key, never by scanning types: the agent
+// gives it the deterministic messageId 'checkout_result:{command
+// messageId}', so a reply stored by any binary -- one that does not know
+// the type stores it through its generic path, under the same wire
+// messageId -- is the same row, found through
+// events_session_id_message_id_idx. The type check is an extra guard. A
+// reply to an earlier command, or to another gen's, is never read: the
+// key is the latest command's, and the gen fence never stores a reply of
+// a gen that is no longer live.
+func (q *Queries) GetTurnCheckoutState(ctx context.Context, id pgtype.UUID) (GetTurnCheckoutStateRow, error) {
+	row := q.db.QueryRow(ctx, getTurnCheckoutState, id)
+	var i GetTurnCheckoutStateRow
+	err := row.Scan(
+		&i.CheckoutMessageID,
+		&i.CheckoutGen,
+		&i.CheckoutSends,
+		&i.CheckoutFailures,
+		&i.CheckoutRetiredGen,
+		&i.CheckoutSentReadySeq,
+		&i.SinceRequestNanos,
+		&i.SinceSendNanos,
+		&i.Reply,
 	)
 	return i, err
 }
@@ -939,7 +1036,7 @@ func (q *Queries) ListStopRequestedOpenTurns(ctx context.Context, arg ListStopRe
 }
 
 const listTurnsForSession = `-- name: ListTurnsForSession :many
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha FROM turns
 WHERE session_id = $1
 ORDER BY created_at ASC, id ASC
 `
@@ -998,6 +1095,15 @@ func (q *Queries) ListTurnsForSession(ctx context.Context, sessionID pgtype.UUID
 			&i.RequestedBy,
 			&i.RequestText,
 			&i.ContextMoves,
+			&i.CheckoutMessageID,
+			&i.CheckoutGen,
+			&i.CheckoutRequestedAt,
+			&i.CheckoutSentAt,
+			&i.CheckoutSentReadySeq,
+			&i.CheckoutSends,
+			&i.CheckoutFailures,
+			&i.CheckoutRetiredGen,
+			&i.CheckedOutSha,
 		); err != nil {
 			return nil, err
 		}
@@ -1082,6 +1188,57 @@ func (q *Queries) MarkTurnPromptReconnectAnswered(ctx context.Context, arg MarkT
 		arg.MessageID,
 		arg.CheckedReadySeq,
 		arg.ResendCount,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordTurnCheckoutRequest = `-- name: RecordTurnCheckoutRequest :execrows
+UPDATE turns
+SET checkout_requested_at = CASE WHEN checkout_gen IS NOT DISTINCT FROM $1::integer
+                                      AND checkout_requested_at IS NOT NULL
+                                 THEN checkout_requested_at ELSE now() END,
+    checkout_sends = CASE WHEN checkout_gen IS NOT DISTINCT FROM $1::integer
+                          THEN COALESCE(checkout_sends, 0) + 1 ELSE 1 END,
+    checkout_failures = CASE WHEN checkout_gen IS NOT DISTINCT FROM $1::integer
+                             THEN COALESCE(checkout_failures, 0) + CASE WHEN $2::boolean THEN 1 ELSE 0 END
+                             ELSE 0 END,
+    checkout_gen = $1::integer,
+    checkout_message_id = $3::text,
+    checkout_sent_at = now(),
+    checkout_sent_ready_seq = $4::integer
+WHERE id = $5 AND status IN ('pending', 'processing')
+`
+
+type RecordTurnCheckoutRequestParams struct {
+	Gen          int32       `json:"gen"`
+	AfterFailure bool        `json:"after_failure"`
+	MessageID    string      `json:"message_id"`
+	ReadySeq     int32       `json:"ready_seq"`
+	ID           pgtype.UUID `json:"id"`
+}
+
+// Technical plan §21.1 and §30.4 (migrations/000167_review_turn_checkout.up.sql):
+// records, in the dispatch evaluation's own transaction, the checkout
+// command the session actor is about to send a review turn's sandbox
+// (sessionactor's reviewcheckout.go): its messageId, the gen it goes to,
+// when it is sent and the gen's ready_seq then. The first request on a gen
+// stamps checkout_requested_at, the start of the turn's bound on that gen,
+// which every later request on the same gen keeps; a request on another
+// gen starts the bound again, and its counts with it (both NULL, read as
+// 0, until the turn's first request). after_failure counts
+// the reply this request answers -- the previous send's -- as failed.
+// Only while the turn is open (pending, or processing for a re-send to a
+// new gen); 0 rows otherwise, and nothing is sent.
+func (q *Queries) RecordTurnCheckoutRequest(ctx context.Context, arg RecordTurnCheckoutRequestParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordTurnCheckoutRequest,
+		arg.Gen,
+		arg.AfterFailure,
+		arg.MessageID,
+		arg.ReadySeq,
+		arg.ID,
 	)
 	if err != nil {
 		return 0, err
@@ -1251,6 +1408,53 @@ func (q *Queries) ReviewRetriggerHeld(ctx context.Context, sessionID pgtype.UUID
 	return held, err
 }
 
+const setTurnCheckedOut = `-- name: SetTurnCheckedOut :execrows
+UPDATE turns
+SET checked_out_sha = $1::text
+WHERE id = $2 AND status IN ('pending', 'processing')
+`
+
+type SetTurnCheckedOutParams struct {
+	Sha string      `json:"sha"`
+	ID  pgtype.UUID `json:"id"`
+}
+
+// Technical plan §21.1 and §30.4: the commit a review turn's sandbox
+// reported holding, recorded in the commit that dispatches the turn (or
+// re-sends it to a new gen) -- the audit fact that the turn ran on the
+// head it recorded. Only while the turn is open; 0 rows otherwise.
+func (q *Queries) SetTurnCheckedOut(ctx context.Context, arg SetTurnCheckedOutParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setTurnCheckedOut, arg.Sha, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setTurnCheckoutRetiredGen = `-- name: SetTurnCheckoutRetiredGen :execrows
+UPDATE turns
+SET checkout_retired_gen = $1::integer
+WHERE id = $2 AND status IN ('pending', 'processing')
+`
+
+type SetTurnCheckoutRetiredGenParams struct {
+	Gen int32       `json:"gen"`
+	ID  pgtype.UUID `json:"id"`
+}
+
+// Technical plan §21.1 and §30.4: the gen a review turn's failed checkouts
+// retired (sessionactor's reviewcheckout.go), recorded in the transaction
+// that retires it, so the turn retires no other: a turn retires at most
+// one gen for its checkouts. Only while the turn is open; 0 rows
+// otherwise.
+func (q *Queries) SetTurnCheckoutRetiredGen(ctx context.Context, arg SetTurnCheckoutRetiredGenParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setTurnCheckoutRetiredGen, arg.Gen, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setTurnContextUnconfirmed = `-- name: SetTurnContextUnconfirmed :execrows
 UPDATE turns
 SET context_unconfirmed_at = now()
@@ -1343,7 +1547,7 @@ SET status = $2,
     dispatched_message_id = COALESCE($7, dispatched_message_id),
     end_reason = COALESCE($8, end_reason)
 WHERE id = $1
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha
 `
 
 type UpdateTurnStatusParams struct {
@@ -1448,6 +1652,15 @@ func (q *Queries) UpdateTurnStatus(ctx context.Context, arg UpdateTurnStatusPara
 		&i.RequestedBy,
 		&i.RequestText,
 		&i.ContextMoves,
+		&i.CheckoutMessageID,
+		&i.CheckoutGen,
+		&i.CheckoutRequestedAt,
+		&i.CheckoutSentAt,
+		&i.CheckoutSentReadySeq,
+		&i.CheckoutSends,
+		&i.CheckoutFailures,
+		&i.CheckoutRetiredGen,
+		&i.CheckedOutSha,
 	)
 	return i, err
 }

@@ -2380,6 +2380,7 @@ type Sandbox struct {
 	LifetimeDeadlineAt            pgtype.Timestamptz   `json:"lifetime_deadline_at"`
 	LifetimeSeconds               *int32               `json:"lifetime_seconds"`
 	LifetimeDeadlineGen           *int32               `json:"lifetime_deadline_gen"`
+	ReviewCheckoutGen             *int32               `json:"review_checkout_gen"`
 }
 
 type SandboxHistory struct {
@@ -2510,6 +2511,15 @@ type Turn struct {
 	RequestedBy               pgtype.UUID           `json:"requested_by"`
 	RequestText               *string               `json:"request_text"`
 	ContextMoves              *int32                `json:"context_moves"`
+	CheckoutMessageID         *string               `json:"checkout_message_id"`
+	CheckoutGen               *int32                `json:"checkout_gen"`
+	CheckoutRequestedAt       pgtype.Timestamptz    `json:"checkout_requested_at"`
+	CheckoutSentAt            pgtype.Timestamptz    `json:"checkout_sent_at"`
+	CheckoutSentReadySeq      *int32                `json:"checkout_sent_ready_seq"`
+	CheckoutSends             *int32                `json:"checkout_sends"`
+	CheckoutFailures          *int32                `json:"checkout_failures"`
+	CheckoutRetiredGen        *int32                `json:"checkout_retired_gen"`
+	CheckedOutSha             *string               `json:"checked_out_sha"`
 }
 
 type TurnStepCost struct {

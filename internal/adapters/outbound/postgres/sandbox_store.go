@@ -76,14 +76,24 @@ func (s *SandboxStore) MarkBootEvidence(ctx context.Context, sessionID pgtype.UU
 }
 
 // RecordReady counts a ready of gen and records whether it advertised the
-// prompt-receipt capability (technical plan §3.3, prompt receipts) and the
+// prompt-receipt capability (technical plan §3.3, prompt receipts), whether
+// it advertised the review-checkout capability (§21.1, §30.4), and the
 // read limit it stated, maxFrameBytes, nil when it stated none, when gen
 // is still the sandbox's live gen, and does nothing otherwise -- see
 // RecordSandboxReady's own generated doc comment.
-func (s *SandboxStore) RecordReady(ctx context.Context, sessionID pgtype.UUID, gen int32, promptReceipt bool, maxFrameBytes *int32) error {
+func (s *SandboxStore) RecordReady(ctx context.Context, sessionID pgtype.UUID, gen int32, promptReceipt, reviewCheckout bool, maxFrameBytes *int32) error {
 	return s.q.RecordSandboxReady(ctx, sqlcgen.RecordSandboxReadyParams{
-		PromptReceipt: promptReceipt, MaxFrameBytes: maxFrameBytes, SessionID: sessionID, Gen: gen,
+		PromptReceipt: promptReceipt, ReviewCheckout: reviewCheckout, MaxFrameBytes: maxFrameBytes, SessionID: sessionID, Gen: gen,
 	})
+}
+
+// ClearSnapshot forgets the session's sandbox snapshot, so the next gen
+// boots fresh rather than restoring it, and reports the rows it wrote: 0
+// when there was none. The session actor's retirement of a gen it will not
+// send a review turn's checkout to (technical plan §21.1, §30.4); see
+// ClearSandboxSnapshot's own generated doc comment.
+func (s *SandboxStore) ClearSnapshot(ctx context.Context, sessionID pgtype.UUID) (int64, error) {
+	return s.q.ClearSandboxSnapshot(ctx, sessionID)
 }
 
 // TightenLifetimeDeadline records what a sandbox-agent of gen reported its

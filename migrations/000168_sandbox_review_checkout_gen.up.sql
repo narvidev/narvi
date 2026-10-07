@@ -1,0 +1,57 @@
+-- Technical plan §21.1 and §30.4: the sandbox half of a review turn's
+-- checkout (000167 adds the turn's). The session actor sends a review
+-- turn's checkout command only to a gen whose agent says it can check out a
+-- commit (internal/app/sessionactor/reviewcheckout.go).
+--
+-- sandboxes.review_checkout_gen: the gen whose latest ready advertised
+-- capabilities.reviewCheckout, recorded the way prompt_receipt_gen is
+-- (migrations/000155_prompt_receipts.up.sql): written only for the live
+-- gen, by RecordSandboxReady, NULL when that ready did not advertise it --
+-- the latest ready decides. Never reset: a spawn, restore or resume bumps
+-- the gen, and the value stops matching. A gen that has sent no ready yet
+-- -- one that went suspect while still spawning or connecting -- is waited
+-- for rather than read as unable.
+--
+-- No backfill, no index, no default. Every sandbox reads as unable to
+-- check out until its next ready.
+--
+-- # Locks
+--
+-- golang-migrate sends this file as one batch, one implicit transaction,
+-- of its own: the ADD COLUMN, nullable with no default, is a catalog
+-- change that rewrites nothing, but takes ACCESS EXCLUSIVE on sandboxes
+-- until the file ends -- an instant once granted. The migration waits
+-- behind any open transaction that has read or written sandboxes (every
+-- session actor's dispatch evaluation and sandbox event reads it), and
+-- while it waits, every new read and write of sandboxes queues behind it.
+-- controlplane/migrate.go sets no lock_timeout, so a long transaction on
+-- sandboxes holds the boot's migration, and every sandbox read with it,
+-- until it ends. The file touches sandboxes alone and holds no lock on
+-- turns, which 000167 released at its own commit, so it cannot deadlock
+-- with a transaction that reads sandboxes before turns, as the actor's do
+-- (000167 says why that order matters).
+--
+-- # Rolling deploy
+--
+-- The previous binary works with this column present:
+--   - Every statement it sends names its columns, so it neither reads nor
+--     writes it.
+--   - Its RecordSandboxReady counts a ready and leaves review_checkout_gen
+--     as it is. A gen whose every ready it recorded reads as unable here:
+--     this release retires it once, clearing its snapshot, when it has
+--     one, and otherwise refuses its review turns, naming the remedy. A gen
+--     this release recorded capable keeps that through a ready the previous
+--     binary records: the same gen is the same agent.
+-- migration000167_integration_test.go runs the previous binary's own
+-- statements against the column, and
+-- migration000167_lock_integration_test.go an actor-shaped transaction
+-- against this file and 000167.
+--
+-- # Rolling back
+--
+-- As 000167's: the previous binary cannot boot on 168 ("no migration found
+-- for version 168"). With the control plane scaled to zero, either keep
+-- the columns (`migrate force 166`, then this file and 000167 run again,
+-- keeping their values, when this release is deployed again) or run both
+-- downs (goto 166).
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS review_checkout_gen INTEGER;
