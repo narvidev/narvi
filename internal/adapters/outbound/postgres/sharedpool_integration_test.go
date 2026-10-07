@@ -71,8 +71,11 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -425,4 +428,109 @@ func resetSharedTestDatabase(t *testing.T) {
 			t.Fatalf("postgres: reset shared integration-test database (restore seed data): %v", err)
 		}
 	}
+}
+
+// latestMigration, passed to migratedDatabase as the version, asks for a
+// database migrated through every migration in migrations.FS.
+const latestMigration = ^uint(0)
+
+// migratedTemplates holds, for each version migratedDatabase was asked for,
+// the template database it migrated to that version, once for the whole
+// test binary. A template is never dropped: it goes with the container.
+var migratedTemplates = struct {
+	sync.Mutex
+	names map[uint]string
+}{names: map[uint]string{}}
+
+// migratedCopies makes every database migratedDatabase creates a name of its
+// own.
+var migratedCopies atomic.Int64
+
+// migratedDatabase creates a database of its own in the shared container,
+// migrated to version (latestMigration: every migration), and returns its
+// name -- prefix and a unique suffix -- and its connection string. It is
+// dropped at cleanup. The plan tests and the migration tests each want a database of
+// their own: the plan tests so that the planner's statistics are those of
+// what they store alone, the migration tests so that they can move one
+// schema up and down.
+//
+// The first call for a version migrates a template database to it; every
+// call then copies that template (CREATE DATABASE ... TEMPLATE). Running the
+// 160-odd migrations into an empty database takes about 0.7 s on a laptop,
+// several times that on a CI runner, and this package needs over 80 such
+// databases at some 25 versions; a copy takes a fraction of it. A copy holds
+// what migrating from scratch leaves -- the template's catalog and files: the
+// same schema, seed rows, schema_migrations version and pg_class sizes -- and
+// starts with no cumulative statistics, which the planner does not read. The
+// plan tests ANALYZE what they store and turn autovacuum off on what they
+// measure, as before. The template is closed to connections once migrated
+// (ALLOW_CONNECTIONS false): CREATE DATABASE refuses a template anyone is
+// connected to, and autovacuum then never opens it.
+func migratedDatabase(ctx context.Context, t *testing.T, prefix string, version uint) (name, connStr string) {
+	t.Helper()
+	admin, adminConnStr := IntegrationTestPoolAndConnStr(t)
+	u, err := url.Parse(adminConnStr)
+	if err != nil {
+		t.Fatalf("parse connection string: %v", err)
+	}
+	connStrOf := func(name string) string {
+		c := *u
+		c.Path = "/" + name
+		return c.String()
+	}
+	template := migratedTemplate(ctx, t, admin, connStrOf, version)
+
+	name = fmt.Sprintf("%s_%d_%d", prefix, time.Now().UnixNano(), migratedCopies.Add(1))
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()+" TEMPLATE "+pgx.Identifier{template}.Sanitize()); err != nil {
+		t.Fatalf("create database %s from %s: %v", name, template, err)
+	}
+	t.Cleanup(func() {
+		if _, err := admin.Exec(context.Background(), "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
+			t.Errorf("drop database %s: %v", name, err)
+		}
+	})
+	return name, connStrOf(name)
+}
+
+// migratedTemplate returns the template database migrated to version,
+// migrating one first if no test has asked for that version yet.
+func migratedTemplate(ctx context.Context, t *testing.T, admin *pgxpool.Pool, connStrOf func(string) string, version uint) string {
+	t.Helper()
+	migratedTemplates.Lock()
+	defer migratedTemplates.Unlock()
+	if name, ok := migratedTemplates.names[version]; ok {
+		return name
+	}
+
+	label := fmt.Sprint(version)
+	if version == latestMigration {
+		label = "latest"
+	}
+	name := fmt.Sprintf("migrated_%s_%d", label, time.Now().UnixNano())
+	quoted := pgx.Identifier{name}.Sanitize()
+	if _, err := admin.Exec(ctx, "CREATE DATABASE "+quoted); err != nil {
+		t.Fatalf("create template database %s: %v", name, err)
+	}
+	m, mdb := newMigrate(t, connStrOf(name))
+	var upErr error
+	if version == latestMigration {
+		upErr = m.Up()
+	} else {
+		upErr = m.Migrate(version)
+	}
+	// Closing mdb alone leaves the migrator's own connection open, which
+	// would make CREATE DATABASE ... TEMPLATE refuse the template.
+	srcErr, dbErr := m.Close()
+	_ = mdb.Close()
+	if upErr != nil {
+		t.Fatalf("migrate template %s to %s: %v", name, label, upErr)
+	}
+	if srcErr != nil || dbErr != nil {
+		t.Fatalf("close the migrator of template %s: %v, %v", name, srcErr, dbErr)
+	}
+	if _, err := admin.Exec(ctx, "ALTER DATABASE "+quoted+" WITH ALLOW_CONNECTIONS false"); err != nil {
+		t.Fatalf("close template %s to connections: %v", name, err)
+	}
+	migratedTemplates.names[version] = name
+	return name
 }
