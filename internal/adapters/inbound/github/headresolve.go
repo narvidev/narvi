@@ -12,9 +12,12 @@
 // resolveIssueCommentHead below closes that gap with one authenticated
 // GitHub REST API call (githubapi.Adapter.GetPullRequest, GET
 // /repos/{owner}/{repo}/pulls/{number}), resolving the PR's TRUE head
-// branch AND head repo (which may be a fork) BEFORE handler.go turns the
-// mention into the session's own repo spec -- mirroring exactly what
-// pull_request_review_comment's own payload already carries for free.
+// branch, head commit and head repository (which may be a fork) BEFORE
+// handler.go turns the mention into the session's own repo spec --
+// mirroring exactly what pull_request_review_comment's own payload already
+// carries for free. The session clones the base repository whatever the
+// head repository is (mention.RepoName's doc comment); the head
+// repository only says whether the head branch is in it.
 
 package github
 
@@ -64,13 +67,14 @@ type PullRequestResolver interface {
 //     (internal/app/sessionactor/pushpr.go) rather than dropping the
 //     mention/failing the whole webhook delivery over a single
 //     best-effort lookup.
-//   - A successful call: m.HeadBranch is set to the PR's real head ref.
-//     m.RepoName/RepoCloneURL are updated to the PR's real head repo (may
-//     be a fork) IF GitHub reported one -- when GitHub's own head.repo was
-//     null (the head/fork repo has since been deleted), m.RepoName/
-//     RepoCloneURL are left exactly as parseIssueComment already set them
-//     (the base repo), mirroring L15's identical fallback for
-//     pull_request_review_comment's own sibling nullable field. m.Stack is
+//   - A successful call: m.HeadBranch is set to the PR's real head ref,
+//     and m.HeadRepoFullName to its head repository's full name (a fork's
+//     for a pull request from a fork; empty when GitHub's own head.repo
+//     was null, the head repository deleted, mirroring L15's handling of
+//     pull_request_review_comment's own sibling nullable field).
+//     m.RepoName/RepoCloneURL are never changed: they stay the base
+//     repository parseIssueComment set, the one every review session
+//     clones (technical plan §21.1, §30.4). m.Stack is
 //     ALSO set here ("review sessions", §17.6's amendment) when
 //     GitHub reports one -- the exact "incremental addition to a call this
 //     ingress already makes for every issue_comment mention, not a new
@@ -116,18 +120,11 @@ func resolveIssueCommentHead(ctx context.Context, logger *slog.Logger, resolver 
 		headSHA := pr.HeadSHA
 		m.HeadSHA = &headSHA
 	}
-	if pr.HeadRepoName != "" && pr.HeadRepoCloneURL != "" {
-		// The PR's real head repo (may be a fork; identical to what
-		// pull_request_review_comment's own payload already carries
-		// directly for the sibling event type) -- the repo to actually
-		// clone.
-		m.RepoName = pr.HeadRepoName
-		m.RepoCloneURL = pr.HeadRepoCloneURL
-	}
-	// else: GitHub's own head.repo was null (the head/fork repo has been
-	// deleted) -- keep m.RepoName/RepoCloneURL exactly as parseIssueComment
-	// already set them (the base repo), mirroring L15's identical fallback
-	// in parsePullRequestReviewComment for the analogous situation.
+	// The PR's head repository (may be a fork; identical to what
+	// pull_request_review_comment's own payload carries directly for the
+	// sibling event type) -- empty when GitHub's own head.repo was null.
+	// It never replaces the repository the session clones.
+	m.HeadRepoFullName = pr.HeadRepoFullName
 
 	if pr.Stack != nil {
 		m.Stack = &review.StackContext{

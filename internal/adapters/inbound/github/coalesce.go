@@ -485,8 +485,9 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	// package ever builds, so this is exempt from the "known" half of the
 	// predicate -- see ResolveRepoEntitlement's own doc comment for exactly
 	// why re-deriving it from req.Repos[0].Url would be actively WRONG here
-	// (a cross-repo/fork PR's own clone URL is deliberately the fork, never
-	// repoFullName's own base-repository claim key) -- but not from an
+	// (the claim key, repoFullName, is the pull request's identity; a fork
+	// pull request's review session created before its spec named the base
+	// repository, technical plan §30.4, clones the fork) -- but not from an
 	// administrator's revocation (§31.4, "Un-entitlement"), read here for
 	// repoFullName, the pull request's base repository, and for the clone
 	// URL. A refusal stops BOTH branches below: a new mention, a follow-up

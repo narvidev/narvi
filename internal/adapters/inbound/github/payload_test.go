@@ -150,29 +150,53 @@ func TestParsePullRequestReviewComment(t *testing.T) {
 		check   func(t *testing.T, m mention)
 	}{
 		{
-			name: "review comment mentioning bot on a fork PR -- actionable, head repo used for clone",
+			name: "review comment mentioning bot on a fork PR -- actionable, the base repo cloned, the fork recorded as the head's",
 			body: `{
 				"action": "created",
 				"comment": {"body": "@narvi-bot what do you think of this line?"},
 				"pull_request": {
 					"number": 99,
-					"head": {"ref": "feature-x", "repo": {"name": "widgets", "clone_url": "https://github.com/contributor/widgets.git"}}
+					"head": {"ref": "feature-x", "sha": "sha-fork-head", "repo": {"name": "widgets", "full_name": "contributor/widgets", "clone_url": "https://github.com/contributor/widgets.git"}}
 				},
-				"repository": {"full_name": "acme/widgets"}
+				"repository": {"full_name": "acme/widgets", "name": "widgets", "clone_url": "https://github.com/acme/widgets.git"}
 			}`,
 			wantOK: true,
 			check: func(t *testing.T, m mention) {
 				if m.RepoFullName != "acme/widgets" {
 					t.Errorf("RepoFullName = %q, want %q (base repo, the claim key)", m.RepoFullName, "acme/widgets")
 				}
-				if m.RepoCloneURL != "https://github.com/contributor/widgets.git" {
-					t.Errorf("RepoCloneURL = %q, want the HEAD (fork) repo's own clone url", m.RepoCloneURL)
+				if m.RepoName != "widgets" || m.RepoCloneURL != "https://github.com/acme/widgets.git" {
+					t.Errorf("RepoName/RepoCloneURL = %q/%q, want the BASE repo's: the head is read from its pull ref, never the fork", m.RepoName, m.RepoCloneURL)
+				}
+				if m.HeadRepoFullName != "contributor/widgets" {
+					t.Errorf("HeadRepoFullName = %q, want the fork %q", m.HeadRepoFullName, "contributor/widgets")
 				}
 				if m.PRNumber != 99 {
 					t.Errorf("PRNumber = %d, want 99", m.PRNumber)
 				}
 				if m.HeadBranch == nil || *m.HeadBranch != "feature-x" {
 					t.Errorf("HeadBranch = %v, want %q", m.HeadBranch, "feature-x")
+				}
+				if m.HeadSHA == nil || *m.HeadSHA != "sha-fork-head" {
+					t.Errorf("HeadSHA = %v, want %q", m.HeadSHA, "sha-fork-head")
+				}
+			},
+		},
+		{
+			name: "review comment mentioning bot on a same-repository PR -- the head repository is the base",
+			body: `{
+				"action": "created",
+				"comment": {"body": "@narvi-bot what do you think of this line?"},
+				"pull_request": {
+					"number": 98,
+					"head": {"ref": "feature-y", "repo": {"name": "widgets", "full_name": "acme/widgets", "clone_url": "https://github.com/acme/widgets.git"}}
+				},
+				"repository": {"full_name": "acme/widgets", "name": "widgets", "clone_url": "https://github.com/acme/widgets.git"}
+			}`,
+			wantOK: true,
+			check: func(t *testing.T, m mention) {
+				if m.RepoCloneURL != "https://github.com/acme/widgets.git" || m.HeadRepoFullName != "acme/widgets" {
+					t.Errorf("RepoCloneURL/HeadRepoFullName = %q/%q, want the base repo for both", m.RepoCloneURL, m.HeadRepoFullName)
 				}
 			},
 		},
@@ -213,8 +237,9 @@ func TestParsePullRequestReviewComment(t *testing.T) {
 			// proves the fix: falls back to the BASE repo (repository.name/
 			// clone_url), exactly like parseIssueComment's own existing
 			// fallback for the analogous situation, and is still a genuine,
-			// actionable mention (ok=true, no error).
-			name: "head.repo null (deleted fork) -- falls back to base repo, still actionable",
+			// actionable mention (ok=true, no error). The head repository is
+			// unknown, so the spec will carry no branch.
+			name: "head.repo null (deleted fork) -- the base repo, head repository unknown, still actionable",
 			body: `{
 				"action": "created",
 				"comment": {"body": "@narvi-bot what do you think of this line?"},
@@ -237,6 +262,9 @@ func TestParsePullRequestReviewComment(t *testing.T) {
 				}
 				if m.HeadBranch == nil || *m.HeadBranch != "feature-x" {
 					t.Errorf("HeadBranch = %v, want %q (head.ref itself is never null, only head.repo)", m.HeadBranch, "feature-x")
+				}
+				if m.HeadRepoFullName != "" {
+					t.Errorf("HeadRepoFullName = %q, want empty: a deleted head repository is unknown", m.HeadRepoFullName)
 				}
 			},
 		},
@@ -423,7 +451,7 @@ func TestParsePullRequestLabeled(t *testing.T) {
 				"sender": {"id": 42, "login": "maintainer-x"},
 				"pull_request": {
 					"number": 7,
-					"head": {"ref": "feature-x", "repo": {"name": "widgets", "clone_url": "https://github.com/contributor/widgets.git"}}
+					"head": {"ref": "feature-x", "repo": {"name": "widgets", "full_name": "contributor/widgets", "clone_url": "https://github.com/contributor/widgets.git"}}
 				},
 				"repository": {"full_name": "acme/widgets", "name": "widgets", "clone_url": "https://github.com/acme/widgets.git"}
 			}`,
@@ -439,8 +467,11 @@ func TestParsePullRequestLabeled(t *testing.T) {
 				if m.HeadBranch == nil || *m.HeadBranch != "feature-x" {
 					t.Errorf("HeadBranch = %v, want %q", m.HeadBranch, "feature-x")
 				}
-				if m.RepoName != "widgets" || m.RepoCloneURL != "https://github.com/contributor/widgets.git" {
-					t.Errorf("RepoName/RepoCloneURL = %q/%q, want the PR's own head (fork) repo", m.RepoName, m.RepoCloneURL)
+				if m.RepoName != "widgets" || m.RepoCloneURL != "https://github.com/acme/widgets.git" {
+					t.Errorf("RepoName/RepoCloneURL = %q/%q, want the BASE repo's, never the fork's", m.RepoName, m.RepoCloneURL)
+				}
+				if m.HeadRepoFullName != "contributor/widgets" {
+					t.Errorf("HeadRepoFullName = %q, want the fork %q", m.HeadRepoFullName, "contributor/widgets")
 				}
 				if m.CommentBody != labelRetriggerPromptText {
 					t.Errorf("CommentBody = %q, want the fixed labelRetriggerPromptText constant", m.CommentBody)
@@ -496,7 +527,10 @@ func TestParsePullRequestLabeled(t *testing.T) {
 			wantOK:        true,
 			check: func(t *testing.T, m mention) {
 				if m.RepoName != "widgets" || m.RepoCloneURL != "https://github.com/acme/widgets.git" {
-					t.Errorf("RepoName/RepoCloneURL = %q/%q, want the base repo fallback", m.RepoName, m.RepoCloneURL)
+					t.Errorf("RepoName/RepoCloneURL = %q/%q, want the base repo", m.RepoName, m.RepoCloneURL)
+				}
+				if m.HeadRepoFullName != "" {
+					t.Errorf("HeadRepoFullName = %q, want empty: a deleted head repository is unknown", m.HeadRepoFullName)
 				}
 			},
 		},

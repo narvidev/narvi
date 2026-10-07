@@ -48,9 +48,10 @@
 // child sessions spawned from one) are EXEMPT from the "known" half of
 // this gate, not merely coincidentally passing -- see
 // ResolveRepoEntitlement's own doc comment for why re-deriving identity
-// from req.Repos[i].Url would be actively WRONG there (a cross-repo/fork
-// PR's own clone URL is deliberately the fork, never the
-// github_pr_sessions claim key), not just redundant. They are NOT exempt
+// from req.Repos[i].Url would be actively WRONG there (a fork PR's review
+// session created before its spec named the base repository clones the
+// fork, never the github_pr_sessions claim key; technical plan §30.4), not
+// just redundant. They are NOT exempt
 // from an administrator's revocation: see ResolveGitHubRepoEntitlement.
 //
 // # Un-entitlement: an administrator's revocation (§31.4)
@@ -318,11 +319,12 @@ type RepoEntitlementDecision struct {
 //     police.
 //  2. Correctness: this predicate resolves identity from req.Repos[i].Url
 //     via reposource.ParseOwnerRepo -- but for a CROSS-REPO (fork-based)
-//     PR, that URL is deliberately the PR's own HEAD repo (payload.go's
-//     own mention.RepoCloneURL doc comment: "head repo -- may be a fork;
-//     the repo to actually clone"), while github_pr_sessions is keyed on
-//     the PR's BASE/upstream repo instead (mention.RepoFullName's own doc
-//     comment: "the claim key"). Checking Known against the FORK's own
+//     PR, that URL named the PR's own HEAD repo until review sessions were
+//     moved onto their base repository (technical plan §30.4; payload.go's
+//     own mention.RepoCloneURL doc comment), and a session created before
+//     that, until it is moved, still names it, while github_pr_sessions is
+//     keyed on the PR's BASE/upstream repo instead (mention.RepoFullName's
+//     own doc comment: "the claim key"). Checking Known against the FORK's own
 //     owner/repo would find no row (a fork essentially never independently
 //     accumulates its own github_pr_sessions history) and wrongly deny
 //     EVERY fork-based PR review and every sentinel-auto-fix spawned from
@@ -446,9 +448,10 @@ func resolveRepoEntitlement(ctx context.Context, prSessions *postgres.GitHubPRSe
 // (both its WINNER and REUSE branches stop on a refusal here) and the
 // sentinel auto-fix child (outboxworker) -- whose request carries
 // spawnSource github. claimRepoFullName is the pull request's BASE
-// repository, the github_pr_sessions claim key the verified payload named:
-// for a fork pull request req.Repos names the fork, which an
-// administrator's revocation of the base repository would never match.
+// repository, the github_pr_sessions claim key the verified payload named,
+// read first whatever req.Repos names: the GitHub ingress writes the base
+// repository there for every pull request (technical plan §30.4), and a
+// sentinel auto-fix child's spec is its origin session's.
 //
 // Only revocation applies to this source (§31.4). The verified payload is
 // the admission, so the claim and every repository req.Repos names are
