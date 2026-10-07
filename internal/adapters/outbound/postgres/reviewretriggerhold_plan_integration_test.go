@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -99,39 +98,16 @@ type holdPlanProbe struct {
 }
 
 // holdPlanDatabase creates a database of its own in the shared container,
-// migrated to version, and returns a pool of exactly one connection on it
-// and its connection string, like pagePlanDatabase.
+// migrated to version (migratedDatabase), and returns a pool of exactly one
+// connection on it and its connection string, like pagePlanDatabase.
 func holdPlanDatabase(ctx context.Context, t *testing.T, version uint) (*pgxpool.Pool, string) {
 	t.Helper()
-	admin, adminConnStr := IntegrationTestPoolAndConnStr(t)
-	name := fmt.Sprintf("holdplan_%d", time.Now().UnixNano())
-	if _, err := admin.Exec(ctx, "CREATE DATABASE "+pgx.Identifier{name}.Sanitize()); err != nil {
-		t.Fatalf("create database %s: %v", name, err)
-	}
-	u, err := url.Parse(adminConnStr)
-	if err != nil {
-		t.Fatalf("parse connection string: %v", err)
-	}
-	u.Path = "/" + name
-	connStr := u.String()
-
-	m, mdb := newMigrate(t, connStr)
-	if err := m.Migrate(version); err != nil {
-		_ = mdb.Close()
-		t.Fatalf("migrate %s to %d: %v", name, version, err)
-	}
-	_ = mdb.Close()
-
+	name, connStr := migratedDatabase(ctx, t, "holdplan", version)
 	pool, err := narvipg.NewPoolWithMaxConns(ctx, connStr, 1)
 	if err != nil {
 		t.Fatalf("open %s: %v", name, err)
 	}
-	t.Cleanup(func() {
-		pool.Close()
-		if _, err := admin.Exec(context.Background(), "DROP DATABASE "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)"); err != nil {
-			t.Errorf("drop database %s: %v", name, err)
-		}
-	})
+	t.Cleanup(pool.Close)
 	return pool, connStr
 }
 
