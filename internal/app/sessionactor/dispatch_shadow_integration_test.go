@@ -4,6 +4,7 @@ package sessionactor
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -91,6 +92,31 @@ func TestHandleEnsureDispatched_ShadowSession_RefusesRestoreOfUnstampedSnapshot(
 	if row.SnapshotID == nil || *row.SnapshotID != "snap-shadow-refused-1" {
 		t.Errorf("sandbox snapshot_id = %v, want unchanged %q (a fresh spawn does not clear it)", row.SnapshotID, "snap-shadow-refused-1")
 	}
+
+	// Technical plan §35.5b: the downgrade is visible -- one persisted
+	// warning at the new gen naming the snapshot and the shadow mode -- and
+	// written once per snapshot: the sandbox's next death downgrades the
+	// same snapshot again, silently.
+	assertOneSnapshotWarning := func() {
+		t.Helper()
+		warnings := storedWarnings(ctx, t, pool, sessionID)
+		if len(warnings) != 1 || warnings[0].messageID != snapshotRefusalMessageIDPrefix+"snap-shadow-refused-1" || warnings[0].gen != 2 ||
+			!strings.Contains(warnings[0].message, "snap-shadow-refused-1") || !strings.Contains(warnings[0].message, "shadow mode") {
+			t.Fatalf("warnings %+v, want one at gen 2 naming snap-shadow-refused-1 and shadow mode", warnings)
+		}
+	}
+	waitForConnecting(ctx, t, pool, sessionID)
+	assertOneSnapshotWarning()
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'stopped' WHERE session_id = $1`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	sendEnsureDispatched(ctx, t, a)
+	waitUntil(t, 5*time.Second, func() bool { return provider.callCount() == 2 })
+	waitForConnecting(ctx, t, pool, sessionID)
+	if provider.restoreCallCount() != 0 {
+		t.Fatalf("RestoreFromSnapshot called %d times on the second death, want 0", provider.restoreCallCount())
+	}
+	assertOneSnapshotWarning()
 }
 
 // TestHandleEnsureDispatched_ShadowSession_RestoresSnapshotStampedShadow

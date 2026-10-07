@@ -22,8 +22,8 @@ const (
 	// lifetimeReportKey is ready's and heartbeat's lifetimeRemainingSeconds,
 	// read by reportedLifetimeRemaining (lifetimereport.go).
 	lifetimeReportKey = "lifetimeRemainingSeconds"
-	// snapshotProvenanceKey is snapshot_ready's provenance, which nothing
-	// in this package reads yet.
+	// snapshotProvenanceKey is snapshot_ready's provenance, read by
+	// reportedSnapshotProvenance (snapshotrestore.go).
 	snapshotProvenanceKey = "provenance"
 )
 
@@ -77,10 +77,11 @@ func frameWithout(raw json.RawMessage, key string) json.RawMessage {
 }
 
 // decodeSnapshotReady decodes a snapshot_ready event through the generated
-// type, without its provenance: nothing in this package reads it yet, and
-// no value the minting agent reported there may cost the snapshot, as none
-// could before the generated type named it (technical plan §35.5b). Every
-// other field decodes as it always has.
+// type, without its provenance: reportedSnapshotProvenance
+// (snapshotrestore.go) reads that on its own, and no value the minting
+// agent reported there may cost the snapshot, as none could before the
+// generated type named it (technical plan §35.5b). Every other field
+// decodes as it always has.
 func decodeSnapshotReady(raw json.RawMessage) (sandboxws.SnapshotReady, error) {
 	var evt sandboxws.SnapshotReady
 	err := json.Unmarshal(frameWithout(raw, snapshotProvenanceKey), &evt)

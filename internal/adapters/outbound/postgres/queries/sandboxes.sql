@@ -210,9 +210,29 @@ RETURNING *;
 -- (handleSnapshotReadyEvent) and never re-derived by anything that later
 -- reads this column back (app/sessionactor/dispatch.go's own restore-time
 -- refusal check).
+--
+-- The snapshot's provenance (technical plan §35.5b, migrations/
+-- 000170_snapshot_runtime_provenance.up.sql) is recorded in this SAME
+-- statement too: what the sandbox-agent that minted it reported about
+-- itself on its snapshot_ready -- agent_protocol, the contracts VERSION
+-- its binary was compiled with, and runtime_version, the agent runtime's
+-- version it discovered, each NULL when it reported none -- the
+-- database's now() as the mint's instant, and snapshot_provenance_id set
+-- to the snapshot id they describe. The id key is what makes a snapshot
+-- the previous binary records, whose statement moves snapshot_id alone,
+-- read "provenance unknown" rather than the snapshot before it. Never a
+-- version the control plane holds. Named arguments only: sqlc does not
+-- mix them with $n.
 UPDATE sandboxes
-SET snapshot_id = $2, snapshot_suppressed_in_shadow = $3, pending_snapshot_message_id = NULL, updated_at = now()
-WHERE session_id = $1
+SET snapshot_id = sqlc.arg('snapshot_id'),
+    snapshot_suppressed_in_shadow = sqlc.arg('snapshot_suppressed_in_shadow'),
+    pending_snapshot_message_id = NULL,
+    snapshot_provenance_id = sqlc.arg('snapshot_id'),
+    snapshot_agent_protocol = sqlc.narg('agent_protocol'),
+    snapshot_runtime_version = sqlc.narg('runtime_version'),
+    snapshot_minted_at = now(),
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id')
 RETURNING *;
 
 -- name: UpdateSandboxStatusToSuspect :one
@@ -509,10 +529,27 @@ WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;
 -- capabilities.reviewCheckout, which a restore of the snapshot would bring
 -- back -- or a gen whose checkouts keep failing on what its worktree holds,
 -- which the snapshot holds too (reviewcheckout.go). The shadow bit describes
--- the snapshot, so it goes with it. 0 rows when there was none.
+-- the snapshot, so it goes with it. 0 rows when there was none, or the
+-- sandbox holds another one.
+--
+-- Technical plan §35.5b: the restore of a snapshot whose recorded
+-- provenance this control plane does not restore is refused, and the
+-- snapshot cleared here too, in the transaction that spawns the sandbox
+-- fresh instead (snapshotrestore.go): a floor only rises, so a refused
+-- snapshot never becomes restorable, and a later death of the new gen must
+-- not offer it again. The provenance describes the snapshot as well
+-- (migrations/000170), so it goes with it. Guarded on the snapshot the
+-- caller decided on, so a snapshot recorded since that decision is never
+-- cleared.
 UPDATE sandboxes
-SET snapshot_id = NULL, snapshot_suppressed_in_shadow = false, updated_at = now()
-WHERE session_id = $1 AND snapshot_id IS NOT NULL;
+SET snapshot_id = NULL,
+    snapshot_suppressed_in_shadow = false,
+    snapshot_provenance_id = NULL,
+    snapshot_agent_protocol = NULL,
+    snapshot_runtime_version = NULL,
+    snapshot_minted_at = NULL,
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id') AND snapshot_id = sqlc.arg('snapshot_id')::text;
 
 -- name: ClearSandboxStopRetireGen :exec
 -- Technical plan §3.3: the retirement SetSandboxStopRetireGen left owed is

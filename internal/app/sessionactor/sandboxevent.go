@@ -1077,11 +1077,18 @@ func (a *Actor) handleSnapshotReadyEvent(ctx context.Context, tx pgx.Tx, row sql
 
 	// Also clears pending_snapshot_message_id back to nil in this SAME
 	// statement -- see UpdateSandboxSnapshotID's own generated doc
-	// comment (queries/sandboxes.sql).
+	// comment (queries/sandboxes.sql) -- and records the snapshot's
+	// provenance (technical plan §35.5b): what the minting agent reported
+	// about itself, read leniently off the raw frame, never a version this
+	// control plane holds. An agent that reports none records NULLs for
+	// this snapshot, which reads "provenance unknown".
+	agentProtocol, runtimeVersion := reportedSnapshotProvenance(raw)
 	if _, err := a.stores.sandbox.WithTx(tx).UpdateSnapshotID(ctx, sqlcgen.UpdateSandboxSnapshotIDParams{
 		SessionID:                  a.sessionID,
 		SnapshotID:                 &evt.SnapshotId,
 		SnapshotSuppressedInShadow: suppressedInShadow,
+		AgentProtocol:              agentProtocol,
+		RuntimeVersion:             runtimeVersion,
 	}); err != nil {
 		return fmt.Errorf("sessionactor: record snapshot id: %w", err)
 	}

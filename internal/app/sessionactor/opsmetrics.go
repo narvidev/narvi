@@ -241,6 +241,14 @@ type opsMetrics struct {
 	// retired_old_agent|retired_failing. A wait is not counted: it is the
 	// absence of an outcome, looked at again on each evaluation.
 	reviewCheckout metric.Int64Counter
+
+	// snapshotRestore is sandbox_snapshot_restore_total: one per restore
+	// decided on a snapshot's recorded provenance (technical plan §35.5b,
+	// snapshotrestore.go), once its claim has committed, tagged
+	// provenance=compatible|incompatible|unknown and outcome=restored|
+	// refused. A restore downgraded to a fresh spawn before the decision
+	// (§27.8, §30.4(3)) is not counted.
+	snapshotRestore metric.Int64Counter
 }
 
 // newOpsMetrics constructs all five instruments against meter -- the SAME
@@ -420,6 +428,15 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		return opsMetrics{}, fmt.Errorf("sessionactor: construct review_checkout_total counter: %w", err)
 	}
 
+	snapshotRestore, err := meter.Int64Counter(
+		"sandbox_snapshot_restore_total",
+		metric.WithDescription("Restores of a sandbox snapshot decided on what the sandbox-agent that minted it reported about itself (technical plan §35.5b): the protocol its binary was compiled with and the agent runtime version it discovered, recorded with the snapshot. By provenance: compatible (an agent of this control plane's MAJOR, at or above the restore floor); incompatible (another MAJOR, or below a floor); unknown (nothing readable recorded -- every snapshot minted by an agent that predates the report, or recorded by a control plane that predates the record -- never counted as compatible). By outcome: restored, or refused (the sandbox was spawned fresh instead, the snapshot cleared, and a session warning written; the WARN line logged with it names the snapshot). A restore downgraded to a fresh spawn before the decision -- a Docker-required session (§27.8), a shadow session and a snapshot not taken in shadow (§30.4(3)) -- is not counted."),
+		metric.WithUnit("{restore}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct sandbox_snapshot_restore_total counter: %w", err)
+	}
+
 	return opsMetrics{
 		actorsLive:            actorsLive,
 		hydrations:            hydrations,
@@ -439,6 +456,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		unknownTimerKind:      unknownTimerKind,
 		promptResend:          promptResend,
 		reviewCheckout:        reviewCheckout,
+		snapshotRestore:       snapshotRestore,
 	}, nil
 }
 
