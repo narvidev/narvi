@@ -1084,6 +1084,12 @@ type Heartbeat struct {
 	// Null once boot has completed (no more boot phases to report).
 	LastBootPhase HeartbeatLastBootPhase `json:"lastBootPhase" yaml:"lastBootPhase" mapstructure:"lastBootPhase"`
 
+	// Whole seconds, counted when this event was written, that the sandbox's provider
+	// will still let this sandbox run, as the provider stated it to the sandbox.
+	// Never negative. Absent when the provider stated nothing. The control plane
+	// keeps the earlier of now plus this and its own estimate (technical plan §35.2).
+	LifetimeRemainingSeconds *int `json:"lifetimeRemainingSeconds,omitempty,omitzero" yaml:"lifetimeRemainingSeconds,omitempty" mapstructure:"lifetimeRemainingSeconds,omitempty"`
+
 	// MessageId corresponds to the JSON schema field "messageId".
 	MessageId string `json:"messageId" yaml:"messageId" mapstructure:"messageId"`
 
@@ -1587,6 +1593,12 @@ type Ready struct {
 	// never omitted.
 	ImageDigest string `json:"imageDigest" yaml:"imageDigest" mapstructure:"imageDigest"`
 
+	// Whole seconds, counted when this event was written, that the sandbox's provider
+	// will still let this sandbox run, as the provider stated it to the sandbox.
+	// Never negative. Absent when the provider stated nothing. The control plane
+	// keeps the earlier of now plus this and its own estimate (technical plan §35.2).
+	LifetimeRemainingSeconds *int `json:"lifetimeRemainingSeconds,omitempty,omitzero" yaml:"lifetimeRemainingSeconds,omitempty" mapstructure:"lifetimeRemainingSeconds,omitempty"`
+
 	// MessageId corresponds to the JSON schema field "messageId".
 	MessageId string `json:"messageId" yaml:"messageId" mapstructure:"messageId"`
 
@@ -1877,6 +1889,13 @@ type SnapshotReady struct {
 	// MessageId corresponds to the JSON schema field "messageId".
 	MessageId string `json:"messageId" yaml:"messageId" mapstructure:"messageId"`
 
+	// What the sandbox being snapshotted holds, as its own sandbox-agent reports it
+	// (technical plan §35.5b): the protocol its binary was compiled with, and the
+	// agent runtime version it discovered. Never a version the control plane
+	// supplied. Absent on an agent that predates it, which the control plane records
+	// as provenance unknown.
+	Provenance *SnapshotReadyProvenance `json:"provenance,omitempty,omitzero" yaml:"provenance,omitempty" mapstructure:"provenance,omitempty"`
+
 	// SessionId corresponds to the JSON schema field "sessionId".
 	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
 
@@ -1886,6 +1905,24 @@ type SnapshotReady struct {
 	// Type corresponds to the JSON schema field "type".
 	Type string `json:"type" yaml:"type" mapstructure:"type"`
 }
+
+// What the sandbox being snapshotted holds, as its own sandbox-agent reports it
+// (technical plan §35.5b): the protocol its binary was compiled with, and the
+// agent runtime version it discovered. Never a version the control plane supplied.
+// Absent on an agent that predates it, which the control plane records as
+// provenance unknown.
+type SnapshotReadyProvenance struct {
+	// The contracts VERSION the sandbox-agent binary was compiled with.
+	AgentProtocol *string `json:"agentProtocol,omitempty,omitzero" yaml:"agentProtocol,omitempty" mapstructure:"agentProtocol,omitempty"`
+
+	// The agent runtime's version, as the sandbox-agent discovered it when it spawned
+	// the runtime. Absent or null when it discovered none.
+	RuntimeVersion SnapshotReadyProvenanceRuntimeVersion `json:"runtimeVersion,omitempty,omitzero" yaml:"runtimeVersion,omitempty" mapstructure:"runtimeVersion,omitempty"`
+}
+
+// The agent runtime's version, as the sandbox-agent discovered it when it spawned
+// the runtime. Absent or null when it discovered none.
+type SnapshotReadyProvenanceRuntimeVersion *string
 
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *SnapshotReady) UnmarshalJSON(value []byte) error {

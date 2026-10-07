@@ -10,6 +10,39 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.25.0]
+
+### sandbox-ws/v1/events.schema.json
+
+- Added: optional integer `Ready.lifetimeRemainingSeconds`: the whole
+  seconds, counted when the `ready` was written, that the sandbox's
+  provider will still let it run, as the provider stated it to the sandbox
+  (technical plan §35.2). Absent when the provider stated nothing, which
+  is every sandbox today. The control plane keeps the earlier of now plus
+  this and its own estimate, so a report only ever brings the deadline
+  earlier. Deliberately no `minimum`, so a negative value still
+  validates; a reader clamps it. The control plane reads the key itself,
+  leniently, and decodes the rest of the frame without it
+  (`internal/app/sessionactor/lifetimereport.go`, `framekey.go`), so no
+  value of it costs a `ready` its `promptReceipt` or `maxFrameBytes`. A
+  property added, not required, grades MINOR (row 2); the `ready` union
+  member changes only by that property (row 30, recursing into row 2).
+- Added: optional integer `Heartbeat.lifetimeRemainingSeconds`, the same
+  value, on every `heartbeat`. Graded as the `ready` one: MINOR (rows 2
+  and 30).
+- Added: optional object `SnapshotReady.provenance`, `{agentProtocol,
+  runtimeVersion}`: what the snapshotted sandbox holds, as its own
+  sandbox-agent reports it (technical plan §35.5b) -- the `contracts`
+  VERSION its binary was compiled with, and the agent runtime version it
+  discovered, or null when it discovered none. Never a version the control
+  plane supplied. Absent on an agent that predates it, which reads as
+  provenance unknown. Neither member is required, and neither carries a
+  `pattern`. The control plane decodes `snapshot_ready` without the key
+  (`internal/app/sessionactor/framekey.go`), so no value of it costs the
+  snapshot. A property added, not required, grades MINOR (row 2; an added property
+  is not recursed into); the `snapshot_ready` union member changes only by
+  that property (row 30, recursing into row 2).
+
 ## [1.24.0]
 
 ### session-config/v1/session-config.schema.json

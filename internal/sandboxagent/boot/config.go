@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
 	"github.com/narvidev/narvi/internal/domain/sandboxboot"
@@ -67,6 +68,17 @@ const (
 	// durable state in (Config.AgentStateDir): today, the prompt journal
 	// technical plan §3.3's prompt receipts dedup on.
 	agentStateDirEnvVar = "NARVI_AGENT_STATE_DIR"
+
+	// sandboxDeadlineEnvVar names the instant, RFC 3339, the sandbox's
+	// provider stated it will end this sandbox (Config.SandboxDeadline):
+	// the one source of the lifetimeRemainingSeconds every ready and
+	// heartbeat reports (technical plan §35.2). HONEST GAP, the same as
+	// NARVI_IMAGE_DIGEST's: no provider sets it today -- neither adapter's
+	// create or restore request can put an arbitrary variable into a
+	// sandbox's environment -- so every agent reports nothing and the
+	// control plane's own estimate stands, until a provider that states a
+	// deadline sets it.
+	sandboxDeadlineEnvVar = "NARVI_SANDBOX_DEADLINE"
 )
 
 // Defaults for every optional env var above.
@@ -233,6 +245,21 @@ type Config struct {
 	// one -- the same fail-fast reconciliation ModeMismatchError already
 	// applies to a diverging NARVI_BOOT_MODE/SessionConfig.BootMode pair.
 	SandboxID string
+
+	// SandboxDeadline is the instant the sandbox's provider stated it will
+	// end this sandbox, read by Load from NARVI_SANDBOX_DEADLINE as RFC
+	// 3339 (technical plan §35.2): every ready and heartbeat reports the
+	// whole seconds left until it (wsbridge.Bridge.SetLifetimeDeadline).
+	// Nil when the variable is unset -- every sandbox today, see
+	// sandboxDeadlineEnvVar -- and when it is set but is not an RFC 3339
+	// instant, which never fails the boot: the deadline is an optional
+	// refinement of the control plane's own estimate, which stands without
+	// it. SandboxDeadlineMalformed then holds the value, for one WARN once
+	// logging is set up (Load runs before it is).
+	SandboxDeadline *time.Time
+	// SandboxDeadlineMalformed is NARVI_SANDBOX_DEADLINE's value when it is
+	// set but not an RFC 3339 instant, and empty otherwise.
+	SandboxDeadlineMalformed string
 
 	// SessionConfig is the full SESSION_CONFIG document (§6.4), parsed
 	// from NARVI_SESSION_CONFIG when present -- nil when that env var is
@@ -624,6 +651,8 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 
+	sandboxDeadline, sandboxDeadlineMalformed := parseSandboxDeadline(os.Getenv(sandboxDeadlineEnvVar))
+
 	return Config{
 		BootMode:           mode,
 		AgentVersion:       agentVersion,
@@ -637,7 +666,25 @@ func Load() (Config, error) {
 		AgentStateDir:      agentStateDir,
 		SandboxID:          sandboxID,
 		SessionConfig:      sessionConfig,
+
+		SandboxDeadline:          sandboxDeadline,
+		SandboxDeadlineMalformed: sandboxDeadlineMalformed,
 	}, nil
+}
+
+// parseSandboxDeadline reads raw, NARVI_SANDBOX_DEADLINE's value, as an
+// RFC 3339 instant (Config.SandboxDeadline). An empty raw states no
+// deadline. A value that does not parse states none either, and is
+// returned as malformed so the caller can say so; it is never an error.
+func parseSandboxDeadline(raw string) (deadline *time.Time, malformed string) {
+	if raw == "" {
+		return nil, ""
+	}
+	parsed, err := time.Parse(time.RFC3339, raw)
+	if err != nil {
+		return nil, raw
+	}
+	return &parsed, ""
 }
 
 // resolveSandboxID implements Config.SandboxID's own documented priority

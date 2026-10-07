@@ -36,6 +36,10 @@
               "description": "True when the agent runs the checkout command, answering each with a checkout_result (technical plan §21.1, §30.4). Absent: the agent does not know the command, and skips it as an unknown one."
             }
           }
+        },
+        "lifetimeRemainingSeconds": {
+          "type": "integer",
+          "description": "Whole seconds, counted when this event was written, that the sandbox's provider will still let this sandbox run, as the provider stated it to the sandbox. Never negative. Absent when the provider stated nothing. The control plane keeps the earlier of now plus this and its own estimate (technical plan §35.2)."
         }
       }
     },
@@ -51,7 +55,11 @@
         "gen": { "type": "integer" },
         "conversationId": { "type": ["string", "null"], "description": "Null before the first turn has started a conversation." },
         "lastBootPhase": { "type": ["string", "null"], "description": "Null once boot has completed (no more boot phases to report)." },
-        "timestamp": { "type": "string", "format": "date-time" }
+        "timestamp": { "type": "string", "format": "date-time" },
+        "lifetimeRemainingSeconds": {
+          "type": "integer",
+          "description": "Whole seconds, counted when this event was written, that the sandbox's provider will still let this sandbox run, as the provider stated it to the sandbox. Never negative. Absent when the provider stated nothing. The control plane keeps the earlier of now plus this and its own estimate (technical plan §35.2)."
+        }
       }
     },
     "BootProgress": {
@@ -337,6 +345,21 @@
         "commandMessageId": {
           "type": "string",
           "description": "Echoes the messageId of the Snapshot command this event is completing (sandbox-agent sets this to the exact MessageId of the Snapshot command it received). Optional and additive: this event has zero real production consumers before its own first implementation, so adding this field now is not a breaking wire-contract change. Exists so the control plane can correlate a snapshot_ready back to the specific attempt it answers -- gen alone cannot, since neither the snapshot-start nor snapshot-complete transition is gen-fenced (a snapshot cycle happens within the same gen). Absent/omitted on any producer that predates this field."
+        },
+        "provenance": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "What the sandbox being snapshotted holds, as its own sandbox-agent reports it (technical plan §35.5b): the protocol its binary was compiled with, and the agent runtime version it discovered. Never a version the control plane supplied. Absent on an agent that predates it, which the control plane records as provenance unknown.",
+          "properties": {
+            "agentProtocol": {
+              "type": "string",
+              "description": "The contracts VERSION the sandbox-agent binary was compiled with."
+            },
+            "runtimeVersion": {
+              "type": ["string", "null"],
+              "description": "The agent runtime's version, as the sandbox-agent discovered it when it spawned the runtime. Absent or null when it discovered none."
+            }
+          }
         }
       }
     },
