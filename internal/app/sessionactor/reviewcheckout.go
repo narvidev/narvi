@@ -158,10 +158,11 @@ func reviewCheckoutTargetFor(claim *sqlcgen.GithubPrSession, sessionRepos []byte
 // readyAdvertisesReviewCheckout reports whether a ready event advertises
 // capabilities.reviewCheckout. A ready that fails its schema decode counts
 // as not advertising it -- the safe direction, in which no checkout is
-// sent -- as readyAdvertisesPromptReceipt does (promptreceipt.go).
+// sent -- as readyAdvertisesPromptReceipt does (promptreceipt.go). Its
+// lifetimeRemainingSeconds plays no part (decodeReady, framekey.go).
 func readyAdvertisesReviewCheckout(raw json.RawMessage) bool {
-	var evt sandboxws.Ready
-	if err := json.Unmarshal(raw, &evt); err != nil {
+	evt, err := decodeReady(raw)
+	if err != nil {
 		return false
 	}
 	return evt.Capabilities != nil && evt.Capabilities.ReviewCheckout != nil && *evt.Capabilities.ReviewCheckout

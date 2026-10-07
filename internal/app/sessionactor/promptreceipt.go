@@ -116,7 +116,6 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
-	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/domain/turn"
 )
@@ -164,10 +163,11 @@ type receiptResendPlan struct {
 // capabilities.promptReceipt. A ready that fails its schema decode counts
 // as not advertising it -- the safe direction, in which nothing is ever
 // re-sent -- as a boot_timing that fails its decode is no boot evidence
-// (bootevidence.go).
+// (bootevidence.go). Its lifetimeRemainingSeconds plays no part
+// (decodeReady, framekey.go).
 func readyAdvertisesPromptReceipt(raw json.RawMessage) bool {
-	var evt sandboxws.Ready
-	if err := json.Unmarshal(raw, &evt); err != nil {
+	evt, err := decodeReady(raw)
+	if err != nil {
 		return false
 	}
 	return evt.Capabilities != nil && evt.Capabilities.PromptReceipt != nil && *evt.Capabilities.PromptReceipt
@@ -181,10 +181,11 @@ func readyAdvertisesPromptReceipt(raw json.RawMessage) bool {
 // the ready then advertises no promptReceipt either: the gen then falls to
 // the smallest bound, never a larger one. A value past what an int32
 // column holds is saturated there: promptFrameBound clamps every stated
-// value to platform.MaxPromptFrameBytes, far below it.
+// value to platform.MaxPromptFrameBytes, far below it. Its
+// lifetimeRemainingSeconds plays no part (decodeReady, framekey.go).
 func readyStatedMaxFrameBytes(raw json.RawMessage) *int32 {
-	var evt sandboxws.Ready
-	if err := json.Unmarshal(raw, &evt); err != nil {
+	evt, err := decodeReady(raw)
+	if err != nil {
 		return nil
 	}
 	if evt.Capabilities == nil || evt.Capabilities.MaxFrameBytes == nil || *evt.Capabilities.MaxFrameBytes <= 0 {

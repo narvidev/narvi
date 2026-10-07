@@ -303,6 +303,43 @@ SET ready_seq = ready_seq + 1,
     updated_at = now()
 WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;
 
+-- name: TightenSandboxLifetimeDeadline :execrows
+-- Technical plan §35.2 (migrations/000162_sandbox_lifetime_deadline.up.sql):
+-- the exact value a sandbox-agent reports on a ready or heartbeat of gen
+-- $gen -- the whole seconds its provider stated it will still let the
+-- sandbox run, $remaining_seconds, counted when the frame was written --
+-- only ever brings the deadline earlier: the row keeps the earlier of its
+-- deadline and now() plus the report. A later report means the provider
+-- created the sandbox after the claim stamped its estimate, or gives it
+-- longer than the control plane assumes; either way the estimate is still
+-- within the provider's own, and overwriting it would let one late or
+-- wrong report move the deadline past it. handleSandboxEvent
+-- (sandboxevent.go) calls it in the transaction that stores the event,
+-- with the report already clamped to [0, ProviderHardCap].
+--
+-- Guarded on gen like RecordSandboxReady: a report of any other gen
+-- changes nothing. When the live gen has no deadline of its own -- a gen
+-- the previous binary spawned, whose lifetime_deadline_gen is an older
+-- gen's -- the report is its deadline, recorded against the gen, and
+-- lifetime_seconds is cleared: the kind's lifetime was never stamped for
+-- it. The last WHERE term makes a report that would change nothing write
+-- nothing, so a heartbeat every 30 seconds costs no row version; the
+-- LEAST stays, so the statement can never move a deadline later, whatever
+-- the WHERE clause says.
+UPDATE sandboxes
+SET lifetime_deadline_at = CASE
+        WHEN lifetime_deadline_gen = gen AND lifetime_deadline_at IS NOT NULL
+        THEN LEAST(lifetime_deadline_at, now() + make_interval(secs => sqlc.arg('remaining_seconds')::integer))
+        ELSE now() + make_interval(secs => sqlc.arg('remaining_seconds')::integer)
+    END,
+    lifetime_seconds = CASE WHEN lifetime_deadline_gen = gen THEN lifetime_seconds END,
+    lifetime_deadline_gen = gen,
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer
+  AND (lifetime_deadline_gen IS DISTINCT FROM gen
+       OR lifetime_deadline_at IS NULL
+       OR lifetime_deadline_at > now() + make_interval(secs => sqlc.arg('remaining_seconds')::integer));
+
 -- name: MarkSandboxBootingSince :exec
 -- Records when gen $2 entered Booting, on this database's clock (technical
 -- plan §3.2's boot-evidence fallback,

@@ -96,6 +96,23 @@ func (s *SandboxStore) ClearSnapshot(ctx context.Context, sessionID pgtype.UUID)
 	return s.q.ClearSandboxSnapshot(ctx, sessionID)
 }
 
+// TightenLifetimeDeadline records what a sandbox-agent of gen reported its
+// provider will still give the sandbox, remainingSeconds from now
+// (technical plan §35.2), when gen is still the sandbox's live gen: the
+// deadline becomes the earlier of itself and now plus remainingSeconds,
+// never later. It reports whether the row changed -- false when the
+// report would not bring the deadline earlier, or gen is not the live
+// gen. See TightenSandboxLifetimeDeadline's own generated doc comment.
+func (s *SandboxStore) TightenLifetimeDeadline(ctx context.Context, sessionID pgtype.UUID, gen, remainingSeconds int32) (bool, error) {
+	rows, err := s.q.TightenSandboxLifetimeDeadline(ctx, sqlcgen.TightenSandboxLifetimeDeadlineParams{
+		RemainingSeconds: remainingSeconds, SessionID: sessionID, Gen: gen,
+	})
+	if err != nil {
+		return false, err
+	}
+	return rows > 0, nil
+}
+
 // MarkBootingSince records, on the database's clock, when gen entered
 // Booting -- once per gen, and only while gen is the sandbox's live gen.
 // §3.2's boot-evidence fallback; see MarkSandboxBootingSince's own
