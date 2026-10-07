@@ -896,6 +896,62 @@ func TestReviewCheckout_AStaleIndexLockRetiresTheGenOnce(t *testing.T) {
 	}
 }
 
+// TestReviewCheckout_ASlowFailureIsRetiredAtTheBound: a worktree whose
+// checkouts fail only after minutes of work -- the first reply, failed, 9
+// minutes into the bound -- leaves its re-send still running when the
+// bound comes. A gen that answered failed is retired then, its snapshot
+// cleared so the next boots fresh, as it is when the latest reply is in:
+// never kept in place while its turn is refused for want of a report.
+func TestReviewCheckout_ASlowFailureIsRetiredAtTheBound(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := checkoutFixture(ctx, t, pool, "acme/co-slow-failure", 830)
+	reviewTurn := seedReviewTurn(ctx, t, f, coHead, nil, true)
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET snapshot_id = 'snap-slow-failure' WHERE session_id = $1`, f.sessionID); err != nil {
+		t.Fatal(err)
+	}
+	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
+	retiredBefore, noReportBefore := reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeRetiredFailing), reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeNoReport)
+	timeouts := platform.DefaultTimeouts()
+
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
+	first := lastCheckout(t, rig.commander, 1)
+	// The first checkout fails after 5 minutes of work, 9 minutes into the
+	// bound; the re-send goes at once.
+	backdateCheckout(ctx, t, pool, reviewTurn.ID, 9*time.Minute, 5*time.Minute)
+	deliver(ctx, t, rig.actor, checkoutReply(t, first, 1, "failed", nil, strp(coHead), strp("fatal: index file corrupt")))
+	resend := lastCheckout(t, rig.commander, 2)
+	if got := getTurn(ctx, t, f, reviewTurn.ID); resend.Gen != 1 || got.Status != sqlcgen.TurnStatusPending || i32(got.CheckoutFailures) != 1 || i32(got.CheckoutSends) != 2 {
+		t.Fatalf("after the first failure: re-sent to gen %d, %s, failures %d, sends %d; want gen 1, pending, 1, 2", resend.Gen, got.Status, i32(got.CheckoutFailures), i32(got.CheckoutSends))
+	}
+
+	// The re-send works on past the bound, unanswered.
+	backdateCheckout(ctx, t, pool, reviewTurn.ID, timeouts.ReviewCheckoutTimeout+time.Second, 6*time.Minute+time.Second)
+	settle(ctx, t, rig.actor)
+
+	got := getTurn(ctx, t, f, reviewTurn.ID)
+	if got.Status != sqlcgen.TurnStatusPending || got.CheckoutRetiredGen == nil || *got.CheckoutRetiredGen != 1 {
+		t.Fatalf("at the bound with the re-send unanswered: %s, retired gen %v; want pending, gen 1 retired", got.Status, got.CheckoutRetiredGen)
+	}
+	sb, err := narvipg.NewSandboxStore(pool).Get(ctx, f.sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.SnapshotID != nil || sb.Gen != 2 || rig.provider.callCount() != 1 || rig.provider.restoreCallCount() != 0 {
+		t.Fatalf("sandbox: snapshot %v, gen %d, spawns %d, restores %d; want the snapshot cleared and one fresh spawn of gen 2",
+			sb.SnapshotID, sb.Gen, rig.provider.callCount(), rig.provider.restoreCallCount())
+	}
+	if n := countRows(ctx, t, pool, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'warning' AND payload::text LIKE '%did not report its checkout%'`, f.sessionID); n != 0 {
+		t.Fatalf("%d warnings that the sandbox did not report, want none", n)
+	}
+	if got := reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeRetiredFailing) - retiredBefore; got != 1 {
+		t.Fatalf("review_checkout_total{retired_failing} moved by %d, want 1", got)
+	}
+	if got := reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeNoReport) - noReportBefore; got != 0 {
+		t.Fatalf("review_checkout_total{no_report} moved by %d, want 0", got)
+	}
+}
+
 // TestReviewCheckout_AReEnqueuedTurnChecksOutOnTheNewGen is exit 3 for a
 // re-enqueue: a turn processing on a gen that is gone is re-sent to the
 // new one only once the new gen holds the turn's head -- the new tree is a

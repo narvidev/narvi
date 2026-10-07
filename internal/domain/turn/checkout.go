@@ -227,9 +227,10 @@ type CheckoutVerdict struct {
 //     older agent, and a fresh gen boots a current one -- and otherwise
 //     the turn is refused, naming the remedy;
 //   - no request on the live gen: send one; a new gen starts a new bound;
-//   - no reply: past the bound, refuse; after a reconnect, send again,
-//     since the command may have been lost with its socket; otherwise wait
-//     for the bound;
+//   - no reply: past the bound, retire a gen that answered failed before
+//     this send, as below, and otherwise refuse; after a reconnect, send
+//     again, since the command may have been lost with its socket;
+//     otherwise wait for the bound;
 //   - checked_out at WantSHA: proceed, unless the ref's tip is not
 //     WantSHA and the turn is a pending attempt a lane asks for again.
 //     Then, within the lag window, the ref may still lag a push whose head
@@ -267,6 +268,11 @@ func DecideReviewCheckout(f CheckoutFacts, b CheckoutBounds) CheckoutVerdict {
 	remaining := b.Timeout - f.SinceRequest
 	if f.Reply == nil {
 		switch {
+		case remaining <= 0 && f.Failures > 0 && !f.RetiredAGen:
+			// A gen that answered failed before this send is retired at the
+			// bound, as it is when the latest reply is in: a checkout that
+			// fails slowly leaves its re-send unanswered at the bound.
+			return CheckoutVerdict{Action: CheckoutRetireGen, Retirement: CheckoutRetiredFailing}
 		case remaining <= 0:
 			return CheckoutVerdict{Action: CheckoutRefuse, Refusal: CheckoutRefusedNoReport}
 		case f.ReconnectedSinceSend:

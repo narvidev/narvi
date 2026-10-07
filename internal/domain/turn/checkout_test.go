@@ -121,6 +121,24 @@ func TestDecideReviewCheckout(t *testing.T) {
 			edit:  func(f *turn.CheckoutFacts) { f.ReconnectedSinceSend = true },
 			want:  turn.CheckoutVerdict{Action: turn.CheckoutRefuse, Refusal: turn.CheckoutRefusedNoReport},
 		},
+		{
+			name:  "no reply at the bound, after a failed reply on the gen, retires it: the re-send of a slow failure is still running",
+			facts: requested(b.Timeout, 6*time.Minute, 2, nil),
+			edit:  func(f *turn.CheckoutFacts) { f.Failures = 1 },
+			want:  turn.CheckoutVerdict{Action: turn.CheckoutRetireGen, Retirement: turn.CheckoutRetiredFailing},
+		},
+		{
+			name:  "no reply at the bound, after a failed reply, refuses once the turn has retired a gen",
+			facts: requested(b.Timeout, 6*time.Minute, 2, nil),
+			edit:  func(f *turn.CheckoutFacts) { f.Failures, f.RetiredAGen = 1, true },
+			want:  turn.CheckoutVerdict{Action: turn.CheckoutRefuse, Refusal: turn.CheckoutRefusedNoReport},
+		},
+		{
+			name:  "no reply inside the bound, after a failed reply, waits for it",
+			facts: requested(b.Timeout-time.Minute, 6*time.Minute, 2, nil),
+			edit:  func(f *turn.CheckoutFacts) { f.Failures = 1 },
+			want:  turn.CheckoutVerdict{Action: turn.CheckoutWait, NextLook: time.Minute},
+		},
 		// checked_out.
 		{
 			name:  "checked out at the head, ref at the head, proceeds",
@@ -378,25 +396,35 @@ func TestDecideReviewCheckout_TheWaitIsNeverDueNow(t *testing.T) {
 // first, once one checkout has failed the gen is retired, never the turn
 // refused, and within FailedRetireBackoff of the first failed reply when
 // the bound leaves room. Before any failure, the turn may end for what came
-// first: a head still absent past the lag window, or busy sends spaced past
-// the bound. Each send is answered a second later, its reply's evaluation
-// the next look.
+// first: a head still absent past the lag window, busy sends spaced past
+// the bound, or a reply that never came before it. Each send is answered a
+// fixed time later -- a second, as a stale index.lock fails, or minutes,
+// up to 13, as a checkout that fails after slow work -- its reply's
+// evaluation the next look. A slow failure's re-send is still unanswered
+// when the bound comes, and the gen is retired then.
 func TestDecideReviewCheckout_AFailingWorktreeIsAlwaysRetired(t *testing.T) {
 	t.Parallel()
 
 	b := checkoutBounds()
-	const answer = time.Second
 	retireBackoff := 30 * time.Second // RefetchInterval, then doubled: 10s + 20s
 	type before struct {
 		outcome turn.CheckoutOutcome // "" is a reconnect with no reply
 		n       int
+		// answer is how long each send takes to be answered: a checkout
+		// that fails at once, or one that fails after minutes of work,
+		// up to most of the bound.
+		answer time.Duration
 	}
 	var cases []before
-	for n := 0; n <= 8; n++ {
-		cases = append(cases, before{turn.CheckoutSHAAbsent, n}, before{turn.CheckoutBusy, n}, before{turn.CheckoutFetchFailed, n}, before{"", n})
+	for _, answer := range []time.Duration{time.Second, 90 * time.Second, 5*time.Minute + time.Second, 6*time.Minute + 40*time.Second, 13 * time.Minute} {
+		for n := 0; n <= 8; n++ {
+			cases = append(cases, before{turn.CheckoutSHAAbsent, n, answer}, before{turn.CheckoutBusy, n, answer},
+				before{turn.CheckoutFetchFailed, n, answer}, before{"", n, answer})
+		}
 	}
 	for _, c := range cases {
-		t.Run(fmt.Sprintf("%d %q first", c.n, c.outcome), func(t *testing.T) {
+		answer := c.answer
+		t.Run(fmt.Sprintf("%d %q first, answered in %s", c.n, c.outcome, answer), func(t *testing.T) {
 			t.Parallel()
 			var sinceRequest, sinceSend time.Duration
 			sends, failures, answered := 1, 0, 0
@@ -434,7 +462,11 @@ func TestDecideReviewCheckout_AFailingWorktreeIsAlwaysRetired(t *testing.T) {
 						t.Fatalf("%s at %s (%s, %s) after a failure at %s: a failing worktree's gen is never left unretired",
 							v.Action, sinceRequest, v.Refusal, v.Outcome, firstFailure)
 					}
-					if v.Outcome != c.outcome || c.n < 6 {
+					// With no failure seen, a turn answered at once ends only
+					// once its lag window or bound has run through the replies
+					// before the failures; a slow one may reach the bound
+					// first.
+					if answer == time.Second && (v.Outcome != c.outcome || c.n < 6) {
 						t.Fatalf("%s at %s (%s, %s) with no failure seen, after only %d %q replies", v.Action, sinceRequest, v.Refusal, v.Outcome, c.n, c.outcome)
 					}
 					return
