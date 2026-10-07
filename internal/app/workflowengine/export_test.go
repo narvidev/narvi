@@ -14,3 +14,9 @@ func (r *HeldAdvanceReleaser) ReleaseHoldForTest(ctx context.Context, h sqlcgen.
 	result, err := r.releaseHold(ctx, h)
 	return result == releaseApplied || result == releaseCancelled, err
 }
+
+// SetPageSizeForTest sets how many held advances one page of a release
+// tick reads, so a test pages over a few holds rather than fifty.
+func (r *HeldAdvanceReleaser) SetPageSizeForTest(n int32) {
+	r.pageSize = n
+}

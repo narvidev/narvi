@@ -350,12 +350,17 @@ func TestWorkflowAdvance_Unfreeze_ReleasedOnce(t *testing.T) {
 	}
 }
 
-// TestWorkflowAdvance_StopWhileHeld_RunCancelled: a person's stop reaches a
-// held advance whichever comes first. The stop timer drops the hold and
-// cancels the run, so the advance is never applied, even once the person
-// resumes the session and autonomy is unfrozen; and a releaser that meets
-// the standing stop first cancels the run itself. Either way: no next
-// attempt, no turn, the first attempt kept as it finished.
+// TestWorkflowAdvance_StopWhileHeld_RunCancelled covers the fallbacks
+// behind the stop route's own drop of a held advance (httpapi's
+// TestStopSession_DropsHeldWorkflowAdvancesInItsOwnTransaction): the stop
+// here is recorded as a replica of the previous release records it
+// (requestStop: the turns flagged, the request, the timer -- no hold
+// dropped), and still reaches the held advance whichever comes first. The
+// stop timer drops the hold and cancels the run, so the advance is never
+// applied, even once the person resumes the session and autonomy is
+// unfrozen; and a releaser that meets the standing stop first cancels the
+// run itself. Either way: no next attempt, no turn, the first attempt kept
+// as it finished.
 func TestWorkflowAdvance_StopWhileHeld_RunCancelled(t *testing.T) {
 	ctx := context.Background()
 	for i, tc := range []struct {

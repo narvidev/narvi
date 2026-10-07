@@ -260,11 +260,14 @@ func OnTurnCompleted(ctx context.Context, deps Deps, sessionRow sqlcgen.Session,
 	// the automatic re-review: a frozen advance records no crossing -- no
 	// warning, no notice, no escalation -- and meets the guard once it is
 	// released, as any advance does. A needs_fix advance the circuit
-	// breaker would escalate is held too, and escalates on release: the
-	// breaker is part of applying the advance. The held advance is a row
-	// (workflow_advance_holds), written in this transaction: the run stays
-	// running with no live attempt, and HeldAdvanceReleaser (release.go)
-	// applies the stored outcome exactly once after the freeze lifts.
+	// breaker turns into an escalation (breakerEscalates) is not held
+	// either: it escalates now, through ApplyStepOutcome below, so the
+	// person it asks to review the run is told during the freeze. The held
+	// advance is a row (workflow_advance_holds), written in this
+	// transaction: the run stays running with no live attempt, the
+	// session's status reads it as scheduled work, and HeldAdvanceReleaser
+	// (release.go) applies the stored outcome exactly once after the freeze
+	// lifts.
 	if next, err := workflow.NextStep(def, stepID, outcome); err == nil && next.Kind == workflow.NextAdvance {
 		if deps.Autonomy == nil {
 			logger.Error("workflowengine: no autonomy freeze is wired for this advance; applying it unread",
@@ -282,7 +285,22 @@ func OnTurnCompleted(ctx context.Context, deps Deps, sessionRow sqlcgen.Session,
 					"run_id", runRow.ID.String(), "step_run_id", finished.ID.String(), "error", err)
 				return
 			}
+			escalates := false
 			if frozen {
+				if escalates, _, err = breakerEscalates(ctx, deps, runRow, outcome, next.ToStepID); err != nil {
+					// The failed read has aborted the caller's transaction:
+					// the turn's end is retried, as on a freeze read that
+					// fails.
+					logger.Error("workflowengine: read the circuit breaker for a frozen advance failed; the advance is not applied",
+						"run_id", runRow.ID.String(), "step_run_id", finished.ID.String(), "error", err)
+					return
+				}
+				if escalates {
+					logger.Info("workflowengine: a frozen advance the circuit breaker escalates is escalated now, not held",
+						"run_id", runRow.ID.String(), "step_run_id", finished.ID.String(), "next_step_id", string(next.ToStepID))
+				}
+			}
+			if frozen && !escalates {
 				if err := holdAdvance(ctx, deps, runRow, finished, sessionRow); err != nil {
 					logger.Error("workflowengine: hold the advance the autonomy freeze holds failed",
 						"run_id", runRow.ID.String(), "step_run_id", finished.ID.String(), "error", err)

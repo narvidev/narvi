@@ -2080,18 +2080,25 @@ the transaction ending the turn and before the session guard (§40.1) is asked. 
 attempt is finished as always, its outcome and summary stored, and instead of dispatching the next
 attempt the engine writes one `workflow_advance_holds` row (run, finished attempt, session, held at):
 the run stays `running` with no live attempt, nothing is dispatched, no notice is sent, and the skip
-is counted. Completing or escalating a run starts nothing and is never held; a needs_fix advance the
-circuit breaker would escalate is held too, and escalates on release. `HeldAdvanceReleaser` ticks every
-`AutonomyFreezeRecheckInterval`; once the freeze lifts it takes the oldest holds first and, for each,
-in one transaction under the session's actor-epoch lock — the decide endpoint's — reads the freeze
-again, deletes the row (a compare-and-swap, so of two replicas one applies it), and applies the stored
-outcome through `ApplyStepOutcome`, admitted by the session guard as any advance is; the next
-attempt's turn arms the session's dispatch timer in the same transaction. A person's stop drops the
-session's held advances and cancels their runs, by the stop's own rule (held at or before the
-request), and the releaser cancels a run whose stop stands when it gets there first. While a run holds
-its advance, a person's own turn on the session passes through untracked, and a person's decision on
-a step awaiting one is never read against the freeze. A rollback's down migration cancels every held
-run, the one kind of candidate a rollback loses.
+is counted. The session's status reads the hold as scheduled work, never settled (§43.20): it will
+create a turn with no new input. Completing or escalating a run starts nothing and is never held — a
+needs_fix advance the circuit breaker turns into an escalation included: while frozen it escalates at
+once, with its one notice, so the person it asks to review the run is told during the freeze.
+`HeldAdvanceReleaser` releases once when it starts and then ticks every
+`AutonomyFreezeRecheckInterval`; the first tick that finds the freeze lifted releases every hold,
+oldest first, a page at a time, each page read after the last row of the one before. For each, in one
+transaction under the session's actor-epoch lock — the decide endpoint's — it reads the freeze again,
+deletes the row (a compare-and-swap, so of two replicas one applies it), and applies the stored outcome
+through `ApplyStepOutcome`, the stored summary telling the next attempt what the finished step found,
+admitted by the session guard as any advance is; the next attempt's turn arms the session's dispatch
+timer in the same transaction. A person's stop drops the session's held advances and cancels their
+runs in the stop request's own transaction, by the stop's own rule (held at or before the request), so
+a resume that commits right after it cannot revive one; the stop timer and the releaser's own check of
+a standing stop catch a stop a replica of the previous release recorded during a rolling deploy. While
+a run holds its advance, a person's own turn on the session passes through untracked, and a person's
+decision on a step awaiting one is never read against the freeze. A rollback's down migration cancels
+every held run, the one kind of candidate a rollback loses; and a binary without the hold advances
+every run whose step ends while frozen.
 
 ### 25.10 Wire contracts
 
@@ -7405,12 +7412,14 @@ occurrence is caught up like any later one — and once however many replicas ru
 fire is claimed by a compare-and-swap on the last fire its tick read. A site with no tick of its own — the held outbox kinds, the re-review's debounce — looks again every
 `AutonomyFreezeRecheckInterval` (a minute), the unfreeze latency. A workflow advance is held in a row
 written with the end of its step's turn — the attempt finished as always, its outcome stored, the run
-still running with no live attempt — and a pump of its own, on the same interval, releases each one
-exactly once after the freeze lifts: it reads the freeze again under the session's lock, deletes the
-hold and applies the stored outcome as the turn's end would have, or cancels the run when a person's
-stop stands; a stop drops the session's held advances itself, and a person's own turn on a held run
-passes through untracked (§25.9). Completing or escalating a run starts nothing, so it is never
-held. Three existing bounds still apply,
+still running with no live attempt, the session's status reading it as scheduled work (§43.20) — and a
+pump of its own, on the same interval, releases every one exactly once in the first tick that finds the
+freeze lifted, a page at a time: it reads the freeze again under the session's lock, deletes the hold
+and applies the stored outcome as the turn's end would have, or cancels the run when a person's stop
+stands; a stop drops the session's held advances in the stop request's own transaction, and a
+person's own turn on a held run passes through untracked (§25.9). Completing or escalating a run
+starts nothing, so it is never held — a circuit-breaker escalation included, which escalates at once.
+Three existing bounds still apply,
 unchanged by the freeze: `AutoMergeCandidateLookback` (seven days), the cron catch-up window (ten
 minutes), and the sentinel-fix merge gate, evaluated once per close event of the origin pull request. This is deliberately a **call-site** check, the
 opposite of the shadow guard's "query exclusion, never call-site checks" rule (`automerge/worker.go`,
@@ -9323,7 +9332,8 @@ The one such echo found, a review session's own push, no longer exists: a review
 | `owed_review_request` timer (§24.9) | the dispatch that ends a person's queued review attempt (the label or the button) `context_moved`, due at once, in that transaction, with the request's row in `owed_review_requests`; re-armed due at once by its own firing, or by a person's stop, while the session still owes a request; backed off (`DispatchRetryBackoff` to `DispatchRetryBackoffMax`) when its firing cannot read the pull request or evaluate the requester's authorization | timer pump → session actor | **Yes** — re-runs the session's oldest owed request with no further input: reads the pull request again, composes the prompt for the head it has now, asks the requester's authorization again through `ports.ReviewRequestAuthorizer`, and inserts the re-run turn on the person's path, never through the automatic lane's opt-in, hold or budget; or drops the request -- its requester no longer authorized or no longer known, or its moves in a row past `ReviewContextMoveMaxConsecutive` -- telling them once on the pull request and in a session warning and ending the moved attempt's workflow run cancelled; a stop drops the requests it predates silently. It counts whenever it is armed: the attempt it stands for has ended, so the snapshot reads no open turn for it |
 | A PR review session's completed turn | — | — | No — a review session never pushes: `completeProcessingTurn` sends it no push command and starts no delivery, so its turn's end leaves nothing for the code host to echo back |
 | Release manifest check (§15) | a new review session on a release PR (`release_manifest_pending`, enqueued by the webhook) | `releasereview.Worker`, every `ReleaseManifestCheckPumpInterval` | **Yes** — when the aggregate review triggers, inserts the composition review turn on that same session |
-| A workflow's next step (§25) | a step's turn ending, or `/decide` | the same transaction | No gap — inserted in the transaction that ends the previous step's turn |
+| A workflow's next step (§25) | a step's turn ending, or `/decide` | the same transaction | No gap — inserted in the transaction that ends the previous step's turn, unless the autonomy freeze holds the advance (next row) |
+| A workflow advance the autonomy freeze holds (§40.2) | a step's turn ending while autonomy is frozen and its next step would advance (`workflow_advance_holds`, in the transaction that ends the turn); dropped by a person's stop in the stop request's own transaction | `workflowengine.HeldAdvanceReleaser`, when it starts and every `AutonomyFreezeRecheckInterval`, once the freeze lifts | **Yes** — applies the stored outcome, creating the run's next attempt and its turn with no further input (or escalating the run); the status reads the hold as scheduled work, due a recheck after the snapshot while the freeze lasts |
 | A plan's implementation turn (§8.1) | a person approving the plan | the same transaction | Human input |
 | Mentions, the review label, the re-review button, REST, Slack and Linear turns | a person | the request itself | Human input; the turn is inserted before the request returns |
 | A completed turn's push and pull request | the turn's completion | its `push_complete` | Covered by `delivering` (above); a PR review session has none (the row two above) |
@@ -9343,7 +9353,9 @@ creates new sessions. What it posts to Slack is a bot message Slack ingress drop
 acts only on the agent-session events a person causes (`created`, `prompted`).
 
 The mechanisms that can create work are read in the status's one statement, and a session holding any
-of them reads `scheduled` — never settled — with `awaiting` still reporting any gate open beside it.
+of them reads `scheduled` — never settled — with `awaiting` still reporting any gate open beside it. A
+held workflow advance is read there as an `EXISTS` over `workflow_advance_holds_session_idx`, one index
+descent whatever other sessions hold.
 Timers are read by kind: the statement returns every armed timer of the session (`session_timers`, one
 row per name), and `sessionactor.ClassifyTimer` is the one table that says what each kind can do (the
 three classes above: sandbox only, a turn already in flight only, creates a turn). Two tests keep it

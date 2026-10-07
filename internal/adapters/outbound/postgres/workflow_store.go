@@ -332,9 +332,34 @@ func (s *WorkflowStore) GetAdvanceHold(ctx context.Context, runID pgtype.UUID) (
 	return s.q.GetWorkflowAdvanceHold(ctx, runID)
 }
 
-// ListAdvanceHolds returns at most limit held advances, oldest first.
-func (s *WorkflowStore) ListAdvanceHolds(ctx context.Context, limit int32) ([]sqlcgen.WorkflowAdvanceHold, error) {
-	return s.q.ListWorkflowAdvanceHolds(ctx, limit)
+// AdvanceHoldCursor is where a page of held advances starts: after the
+// hold at (HeldAt, RunID) in (held_at, workflow_run_id) order.
+type AdvanceHoldCursor struct {
+	HeldAt pgtype.Timestamptz
+	RunID  pgtype.UUID
+}
+
+// FirstAdvanceHolds is the cursor of the first page: -infinity and the nil
+// uuid, before every hold.
+var FirstAdvanceHolds = AdvanceHoldCursor{
+	HeldAt: pgtype.Timestamptz{InfinityModifier: pgtype.NegativeInfinity, Valid: true},
+	RunID:  pgtype.UUID{Valid: true},
+}
+
+// AdvanceHoldCursorAfter is the cursor of the page that follows the one h
+// ended.
+func AdvanceHoldCursorAfter(h sqlcgen.WorkflowAdvanceHold) AdvanceHoldCursor {
+	return AdvanceHoldCursor{HeldAt: h.HeldAt, RunID: h.WorkflowRunID}
+}
+
+// ListAdvanceHolds returns at most limit held advances after cursor,
+// oldest first: one page.
+func (s *WorkflowStore) ListAdvanceHolds(ctx context.Context, cursor AdvanceHoldCursor, limit int32) ([]sqlcgen.WorkflowAdvanceHold, error) {
+	return s.q.ListWorkflowAdvanceHolds(ctx, sqlcgen.ListWorkflowAdvanceHoldsParams{
+		AfterHeldAt: cursor.HeldAt,
+		AfterRunID:  cursor.RunID,
+		MaxHolds:    limit,
+	})
 }
 
 // ReleaseAdvanceHold deletes runID's held advance and returns it: the

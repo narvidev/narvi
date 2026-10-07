@@ -46,9 +46,11 @@
 //     -- are deleted; one armed after it is new input, and stays.
 //   - By the same rule, a workflow advance the autonomy freeze held at or
 //     before the request (technical plan §40.2) is dropped, and its run
-//     ends cancelled (cancelHeldWorkflowAdvancesForStop), so the advance is
-//     never applied once the freeze lifts, even after a person resumes the
-//     session.
+//     ends cancelled (cancelHeldWorkflowAdvancesForStop). The stop request
+//     itself does this, in its own transaction (httpapi's stop route), so
+//     the advance is never applied, even after a person resumes the
+//     session; this handler catches a stop recorded without it, by a
+//     replica of the previous release during a rolling deploy.
 //
 // A turn created after the request carries no flag and runs normally. A
 // person's next act that sets the session going again also clears the
@@ -618,10 +620,12 @@ func (a *Actor) dropOwedReviewRequestsForStop(ctx context.Context, tx pgx.Tx, se
 // deletes by, the database's clock on both sides -- and ends each held
 // run cancelled (workflowengine.CancelHeldAdvancesForStop). A stop is the
 // person's answer, so the held advance is never applied, and nobody is
-// told. Run by the stop timer after the owed requests are dropped; the
-// releaser, which takes the same actor-epoch lock, cancels the run itself
-// when it reaches a hold first. A NULL stop request -- none standing, or a
-// person resumed the session -- drops nothing.
+// told. The stop route drops them in the request's own transaction; this,
+// run by the stop timer after the owed requests are dropped, catches a stop
+// a replica of the previous release recorded without dropping them, as
+// does the releaser, which takes the same actor-epoch lock and cancels the
+// run itself when it reaches such a hold first. A NULL stop request -- none
+// standing, or a person resumed the session -- drops nothing.
 func (a *Actor) cancelHeldWorkflowAdvancesForStop(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session) error {
 	if err := workflowengine.CancelHeldAdvancesForStop(ctx, a.stores.workflow.WithTx(tx), a.sessionID, sessionRow.StopRequestedAt); err != nil {
 		return fmt.Errorf("sessionactor: %w", err)

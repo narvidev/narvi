@@ -154,31 +154,14 @@ func advance(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, def wor
 		// invariant silently.
 		return Outcome{}, fmt.Errorf("workflowengine: next step %q not found in definition %q", toStepID, def.ID)
 	}
-	toID, err := parseWorkflowID(toStepID)
+	escalate, attempts, err := breakerEscalates(ctx, deps, runRow, outcome, toStepID)
 	if err != nil {
-		return Outcome{}, fmt.Errorf("workflowengine: parse next step id: %w", err)
+		return Outcome{}, err
 	}
-
-	if outcome == workflow.StepOutcomeNeedsFix {
-		attempts, err := deps.Workflows.CountStepRunsForStepDefinition(ctx, runRow.ID, toID)
-		if err != nil {
-			return Outcome{}, fmt.Errorf("workflowengine: count step runs for step definition: %w", err)
-		}
-		if attempts > 0 {
-			// A genuine re-fire (§25.9): toStepID already has at least one
-			// prior attempt in this run, so creating another one now would
-			// be this SAME needs_fix edge firing again -- consult the
-			// circuit breaker before proceeding.
-			decision := loopguard.Evaluate(
-				loopguard.State{AttemptCount: int(attempts)},
-				loopguard.Config{MaxAttempts: loopguard.DefaultMaxAttempts},
-			)
-			if decision.ShouldEscalate {
-				logger.Info("workflowengine: circuit breaker escalated a re-firing needs_fix edge",
-					"run_id", runRow.ID.String(), "from_step_id", string(currentStepID), "to_step_id", string(toStepID), "attempt_count", attempts)
-				return escalateRun(ctx, deps, runRow, sessionRow)
-			}
-		}
+	if escalate {
+		logger.Info("workflowengine: circuit breaker escalated a re-firing needs_fix edge",
+			"run_id", runRow.ID.String(), "from_step_id", string(currentStepID), "to_step_id", string(toStepID), "attempt_count", attempts)
+		return escalateRun(ctx, deps, runRow, sessionRow)
 	}
 
 	admission, escalated, err := admitNextAttempt(ctx, deps, runRow, sessionRow)
@@ -193,6 +176,37 @@ func advance(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, def wor
 		return Outcome{}, fmt.Errorf("workflowengine: dispatch next attempt: %w", err)
 	}
 	return Outcome{RunStatus: string(runRow.Status), DispatchedTurnID: &turnID}, nil
+}
+
+// breakerEscalates reports whether the circuit breaker (§25.9) escalates
+// the advance with outcome to toStepID instead of letting it proceed, and
+// how many attempts of toStepID the run already holds. Only a genuine
+// needs_fix re-fire consults loopguard.Evaluate -- toStepID already has at
+// least one prior attempt in this run, so creating another one would be
+// this SAME needs_fix edge firing again (this file's top doc comment); any
+// other advance proceeds. Read in the caller's transaction: advance, and
+// OnTurnCompleted while autonomy is frozen, where an escalation -- which
+// starts nothing -- is not held (completion.go).
+func breakerEscalates(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, outcome workflow.StepOutcomeStatus, toStepID workflow.ID) (bool, int64, error) {
+	if outcome != workflow.StepOutcomeNeedsFix {
+		return false, 0, nil
+	}
+	toID, err := parseWorkflowID(toStepID)
+	if err != nil {
+		return false, 0, fmt.Errorf("workflowengine: parse next step id: %w", err)
+	}
+	attempts, err := deps.Workflows.CountStepRunsForStepDefinition(ctx, runRow.ID, toID)
+	if err != nil {
+		return false, 0, fmt.Errorf("workflowengine: count step runs for step definition: %w", err)
+	}
+	if attempts == 0 {
+		return false, 0, nil
+	}
+	decision := loopguard.Evaluate(
+		loopguard.State{AttemptCount: int(attempts)},
+		loopguard.Config{MaxAttempts: loopguard.DefaultMaxAttempts},
+	)
+	return decision.ShouldEscalate, attempts, nil
 }
 
 // admitNextAttempt asks the session guard (deps.Guard, technical plan

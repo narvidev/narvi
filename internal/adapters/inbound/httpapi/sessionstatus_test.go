@@ -346,3 +346,60 @@ func TestSessionActivityToDTO_ReviewRetriggerDropped(t *testing.T) {
 		})
 	}
 }
+
+// TestSessionActivityToDTO_HeldWorkflowAdvance pins the status's half of
+// the autonomy freeze at the workflow engine (technical plan §40.2,
+// §43.20): a workflow advance the freeze holds is work the server keeps
+// that will create a turn with no new input once the freeze lifts, so a
+// session holding one reads scheduled, never settled -- due when the
+// releaser next looks, AutonomyFreezeRecheckInterval out at the latest --
+// whatever else it holds.
+func TestSessionActivityToDTO_HeldWorkflowAdvance(t *testing.T) {
+	t.Parallel()
+
+	planID := pgtype.UUID{Bytes: [16]byte{0xb}, Valid: true}
+	for _, tc := range []struct {
+		name         string
+		turnCounts   string
+		debounceIn   *time.Duration
+		plan         bool
+		wantActivity restdtos.SessionActivityActivity
+		wantDelay    int
+	}{
+		{name: "a held advance alone, the step's turn done -> scheduled", turnCounts: `{"completed":1}`, wantActivity: restdtos.SessionActivityActivityScheduled, wantDelay: 15},
+		{name: "a held advance beside an open plan -> scheduled, the plan still reported", turnCounts: `{"completed":1}`, plan: true, wantActivity: restdtos.SessionActivityActivityScheduled, wantDelay: 15},
+		{name: "a held advance beside a debounce due in 3 s -> the earlier decides the delay", turnCounts: `{"completed":1}`, debounceIn: durationPtr(3 * time.Second), wantActivity: restdtos.SessionActivityActivityScheduled, wantDelay: 8},
+		{name: "a held advance behind a person's queued turn -> queued", turnCounts: `{"completed":1,"pending":1}`, wantActivity: restdtos.SessionActivityActivityQueued, wantDelay: 15},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			facts := statusFactsRow(tc.turnCounts)
+			facts.WorkflowAdvanceHeld = true
+			facts.ReviewRetriggerCanFire = true
+			facts.ArmedTimerNames = []string{}
+			facts.ArmedTimerFiresAt = []pgtype.Timestamptz{}
+			if tc.debounceIn != nil {
+				facts.ArmedTimerNames = append(facts.ArmedTimerNames, "review_retrigger_debounce")
+				facts.ArmedTimerFiresAt = append(facts.ArmedTimerFiresAt, pgtype.Timestamptz{Time: statusObservedAt.Add(*tc.debounceIn), Valid: true})
+			}
+			if tc.plan {
+				facts.AwaitingPlanID, facts.AwaitingPlanSince = planID, pgtype.Timestamptz{Time: statusObservedAt.Add(-time.Minute), Valid: true}
+			}
+			got := statusDTO(t, facts)
+			if got.Activity != tc.wantActivity || got.Settled || got.SuggestedDelaySeconds != tc.wantDelay {
+				t.Fatalf("activity %q settled %v delay %d, want %q, unsettled, %d", got.Activity, got.Settled, got.SuggestedDelaySeconds, tc.wantActivity, tc.wantDelay)
+			}
+			if tc.plan && (got.Awaiting == nil || got.Awaiting.Kind != restdtos.SessionActivityAwaitingKindPlan) {
+				t.Fatalf("awaiting = %+v, want the plan reported beside the held advance", got.Awaiting)
+			}
+		})
+	}
+
+	t.Run("no held advance, nothing else -> finished", func(t *testing.T) {
+		t.Parallel()
+		facts := statusFactsRow(`{"completed":1}`)
+		if got := statusDTO(t, facts); got.Activity != restdtos.SessionActivityActivityFinished || !got.Settled {
+			t.Fatalf("activity %q settled %v, want finished, settled", got.Activity, got.Settled)
+		}
+	})
+}

@@ -960,13 +960,27 @@ func (q *Queries) HoldWorkflowAdvance(ctx context.Context, arg HoldWorkflowAdvan
 }
 
 const listWorkflowAdvanceHolds = `-- name: ListWorkflowAdvanceHolds :many
-SELECT workflow_run_id, step_run_id, session_id, held_at FROM workflow_advance_holds ORDER BY held_at, workflow_run_id LIMIT $1
+SELECT workflow_run_id, step_run_id, session_id, held_at FROM workflow_advance_holds
+WHERE (held_at, workflow_run_id) > ($1::timestamptz, $2::uuid)
+ORDER BY held_at, workflow_run_id
+LIMIT $3
 `
 
-// The held advances, oldest first, at most sqlc.arg('max_holds'), through
-// workflow_advance_holds_held_at_idx: the releaser's batch.
-func (q *Queries) ListWorkflowAdvanceHolds(ctx context.Context, maxHolds int32) ([]WorkflowAdvanceHold, error) {
-	rows, err := q.db.Query(ctx, listWorkflowAdvanceHolds, maxHolds)
+type ListWorkflowAdvanceHoldsParams struct {
+	AfterHeldAt pgtype.Timestamptz `json:"after_held_at"`
+	AfterRunID  pgtype.UUID        `json:"after_run_id"`
+	MaxHolds    int32              `json:"max_holds"`
+}
+
+// One page of the held advances, oldest first, at most
+// sqlc.arg('max_holds'): the ones after (after_held_at, after_run_id) in
+// (held_at, workflow_run_id) order -- the last row of the page before, or
+// -infinity and the nil uuid for the first -- through
+// workflow_advance_holds_held_at_idx, whose key is that pair, so each page
+// starts where the last ended, however many rows came before it. The
+// releaser reads every page in one tick.
+func (q *Queries) ListWorkflowAdvanceHolds(ctx context.Context, arg ListWorkflowAdvanceHoldsParams) ([]WorkflowAdvanceHold, error) {
+	rows, err := q.db.Query(ctx, listWorkflowAdvanceHolds, arg.AfterHeldAt, arg.AfterRunID, arg.MaxHolds)
 	if err != nil {
 		return nil, err
 	}

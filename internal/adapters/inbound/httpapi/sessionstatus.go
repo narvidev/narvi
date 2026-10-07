@@ -229,6 +229,11 @@ type statusBounds struct {
 	// releaseCheckWindow bounds a claimed check whose worker died:
 	// ReleaseManifestCheckTimeout plus MCPStatusScheduledMargin.
 	releaseCheckWindow time.Duration
+	// heldAdvanceRecheck is how soon the workflow engine's releaser looks
+	// at a held advance again (AutonomyFreezeRecheckInterval): it comes due
+	// then at the earliest, and again a recheck later while the freeze
+	// lasts.
+	heldAdvanceRecheck time.Duration
 }
 
 func statusBoundsFrom(t platform.Timeouts) statusBounds {
@@ -237,6 +242,7 @@ func statusBoundsFrom(t platform.Timeouts) statusBounds {
 		releaseCheckPumpInterval: t.ReleaseManifestCheckPumpInterval,
 		releaseCheckTimeout:      t.ReleaseManifestCheckTimeout,
 		releaseCheckWindow:       t.ReleaseManifestCheckTimeout + t.MCPStatusScheduledMargin,
+		heldAdvanceRecheck:       t.AutonomyFreezeRecheckInterval,
 	}
 }
 
@@ -255,7 +261,13 @@ func statusBoundsFrom(t platform.Timeouts) statusBounds {
 //     due at the worker's next tick after it was enqueued;
 //   - a release manifest check running (release_manifest_checks_running)
 //     and claimed within releaseCheckWindow of the snapshot, due when its
-//     worker's deadline ends it.
+//     worker's deadline ends it;
+//   - a workflow advance the autonomy freeze holds (workflow_advance_held,
+//     technical plan §40.2), which the releaser applies -- creating the
+//     run's next attempt and its turn -- once the freeze lifts: due when
+//     the releaser next looks, heldAdvanceRecheck after the snapshot at
+//     the latest. While the freeze lasts every read finds it due a recheck
+//     ahead, as a frozen re-review debounce is re-armed.
 //
 // Both instants in every comparison are the database's clock.
 func scheduledWork(facts sqlcgen.GetSessionActivityFactsRow, bounds statusBounds) (armed bool, dueAt time.Time, err error) {
@@ -278,6 +290,9 @@ func scheduledWork(facts sqlcgen.GetSessionActivityFactsRow, bounds statusBounds
 	}
 	if facts.ReleaseCheckClaimedAt.Valid && session.ClaimedWorkOpen(facts.ReleaseCheckClaimedAt.Time, facts.ObservedAt.Time, bounds.releaseCheckWindow) {
 		consider(facts.ReleaseCheckClaimedAt.Time.Add(bounds.releaseCheckTimeout))
+	}
+	if facts.WorkflowAdvanceHeld {
+		consider(facts.ObservedAt.Time.Add(bounds.heldAdvanceRecheck))
 	}
 	return armed, dueAt, nil
 }

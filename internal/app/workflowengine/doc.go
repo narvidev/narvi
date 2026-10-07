@@ -55,7 +55,8 @@
 // OnTurnCompleted's advance is an automatic action: while autonomy is
 // frozen it is held in a row instead of applied, and HeldAdvanceReleaser
 // (release.go) applies it exactly once after the freeze lifts. Completing
-// or escalating a run, and a person's decision on a step, are never held.
+// or escalating a run -- the circuit breaker's escalation included -- and a
+// person's decision on a step are never held.
 // One exception to the fail-open rule below: a freeze that cannot be read
 // is a skip, never a pass, so the advance is not applied -- the failed read
 // has aborted the caller's transaction, whose turn end is then retried.

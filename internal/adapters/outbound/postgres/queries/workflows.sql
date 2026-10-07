@@ -440,9 +440,17 @@ ON CONFLICT (workflow_run_id) DO NOTHING;
 SELECT * FROM workflow_advance_holds WHERE workflow_run_id = $1;
 
 -- name: ListWorkflowAdvanceHolds :many
--- The held advances, oldest first, at most sqlc.arg('max_holds'), through
--- workflow_advance_holds_held_at_idx: the releaser's batch.
-SELECT * FROM workflow_advance_holds ORDER BY held_at, workflow_run_id LIMIT sqlc.arg('max_holds');
+-- One page of the held advances, oldest first, at most
+-- sqlc.arg('max_holds'): the ones after (after_held_at, after_run_id) in
+-- (held_at, workflow_run_id) order -- the last row of the page before, or
+-- -infinity and the nil uuid for the first -- through
+-- workflow_advance_holds_held_at_idx, whose key is that pair, so each page
+-- starts where the last ended, however many rows came before it. The
+-- releaser reads every page in one tick.
+SELECT * FROM workflow_advance_holds
+WHERE (held_at, workflow_run_id) > (sqlc.arg('after_held_at')::timestamptz, sqlc.arg('after_run_id')::uuid)
+ORDER BY held_at, workflow_run_id
+LIMIT sqlc.arg('max_holds');
 
 -- name: ReleaseWorkflowAdvanceHold :one
 -- The release's compare-and-swap: deletes the run's hold and returns it.

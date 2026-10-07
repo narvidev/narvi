@@ -23,8 +23,9 @@ import (
 )
 
 // holdPlanLatestVersion is the migration the hold's plan test migrates
-// to: the latest whose columns the statements it measures name.
-const holdPlanLatestVersion = 160
+// to: the latest whose columns or tables the statements it measures name --
+// GetSessionActivityFacts reads workflow_advance_holds.
+const holdPlanLatestVersion = workflowAdvanceHoldsMigration
 
 const (
 	// holdReadMaxBuffers bounds what the re-review hold's read

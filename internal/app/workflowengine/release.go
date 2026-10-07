@@ -14,10 +14,15 @@
 // While a run holds its advance, a person's own turn on the session is
 // never held: ResolveStepForNewTurn (dispatch.go) passes it through
 // untracked, as it does for any running run with no live attempt. A
-// person's decision on a step awaiting one never reaches here.
+// person's decision on a step awaiting one never reaches here. The
+// session's status reads the hold as scheduled work, never settled
+// (GetSessionActivityFacts, technical plan §43.20): it creates a turn with
+// no new input once the freeze lifts.
 //
 // Once the freeze lifts, HeldAdvanceReleaser applies each held advance
-// exactly once: in one transaction under the session's actor-epoch lock --
+// exactly once -- every one in the tick that first finds the freeze lifted,
+// oldest first, a page at a time -- in one transaction under the session's
+// actor-epoch lock --
 // the lock the decide endpoint and every session actor transaction take --
 // it reads the freeze again, deletes the row (a compare-and-swap: of two
 // replicas releasing it, one deletes it and the other finds nothing), and
@@ -27,6 +32,13 @@
 // same transaction, so the timer pump dispatches it with no further
 // trigger. When a person's stop stands on the session, the run is
 // cancelled instead, as OnTurnCompleted's stopped branch ends one.
+//
+// A person's stop drops the session's held advances in the stop request's
+// own transaction (CancelHeldAdvancesForStop, from httpapi's stop route),
+// so a resume that commits right after it cannot revive them. The stop
+// timer's handler and the releaser's own check of a standing stop catch a
+// stop written without that -- by a replica of the previous release during
+// a rolling deploy.
 
 package workflowengine
 
@@ -50,11 +62,14 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
-// releaseBatchSize bounds how many held advances one release tick takes,
-// oldest first. A batch size, not a duration, so not a platform.Timeouts
-// field -- the automation engine's reconcileBatchSize precedent. Each
-// release is one short transaction; a longer freeze's backlog drains over
-// successive ticks.
+// releaseBatchSize bounds how many held advances one page of a release tick
+// reads, oldest first. A page size, not a duration, so not a
+// platform.Timeouts field -- the automation engine's reconcileBatchSize
+// precedent. A tick reads every page, each after the last row of the one
+// before (postgres.AdvanceHoldCursor), so however many advances a long
+// freeze held, every one is released within the tick that first finds the
+// freeze lifted, and each is tried at most once in that tick; each release
+// is one short transaction of its own.
 const releaseBatchSize = 50
 
 // holdAdvance writes the advance past finished -- runRow's attempt, just
@@ -78,11 +93,15 @@ func holdAdvance(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, fin
 // session's work-creating timers by -- is dropped, and its run, still
 // running, ends cancelled, as OnTurnCompleted's stopped branch ends one.
 // Its finished attempt keeps its status and outcome, workflow.NextStep is
-// not consulted again and no notice is sent: nothing follows a stop. So
-// the stop holds even once a person resumes the session. Run by the session
-// actor's stop timer, in its transaction, which workflows is bound to; a
-// NULL stopRequestedAt -- no stop standing -- drops nothing. An error is a
-// store failure, which the caller's transaction rolls back.
+// not consulted again and no notice is sent: nothing follows a stop. Run
+// by the stop request itself (httpapi's stop route), in the transaction
+// that records it, under the session's actor-epoch lock, so a resume that
+// commits after it finds nothing to revive -- the stop holds even once a
+// person resumes the session -- and again by the session actor's stop
+// timer, which catches a stop a replica of the previous release recorded
+// without it. workflows is bound to the caller's transaction; a NULL
+// stopRequestedAt -- no stop standing -- drops nothing. An error is a store
+// failure, which the caller's transaction rolls back.
 func CancelHeldAdvancesForStop(ctx context.Context, workflows *postgres.WorkflowStore, sessionID pgtype.UUID, stopRequestedAt pgtype.Timestamptz) error {
 	if !stopRequestedAt.Valid {
 		return nil
@@ -133,6 +152,8 @@ type HeldAdvanceReleaser struct {
 	outbox                *postgres.OutboxStore
 	interval              time.Duration
 	epistemicCheckDefault bool
+	// pageSize is releaseBatchSize; a test pages smaller.
+	pageSize int32
 }
 
 // NewHeldAdvanceReleaser builds the releaser on pool. guard is the session
@@ -165,24 +186,31 @@ func NewHeldAdvanceReleaser(pool *pgxpool.Pool, guard *turnguard.Guard, timeouts
 		outbox:                postgres.NewOutboxStore(pool, platformShadow),
 		interval:              timeouts.AutonomyFreezeRecheckInterval,
 		epistemicCheckDefault: epistemicCheckDefault,
+		pageSize:              releaseBatchSize,
 	}, nil
 }
 
-// Run releases held advances every AutonomyFreezeRecheckInterval until ctx
-// is done: the unfreeze latency of a held advance. A tick that fails is
-// logged and the next one tries again.
+// Run releases held advances once when it starts -- a freeze lifted while
+// no replica ran the releaser costs no wait -- and then every
+// AutonomyFreezeRecheckInterval until ctx is done: the unfreeze latency of
+// every held advance. A tick that fails is logged and the next one tries
+// again.
 func (r *HeldAdvanceReleaser) Run(ctx context.Context) error {
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
 
+	tick := func() {
+		if _, err := r.ReleaseOnce(ctx); err != nil && ctx.Err() == nil {
+			platform.Logger(ctx).Error("workflowengine: held-advance release tick failed", "error", err)
+		}
+	}
+	tick()
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if _, err := r.ReleaseOnce(ctx); err != nil {
-				platform.Logger(ctx).Error("workflowengine: held-advance release tick failed", "error", err)
-			}
+			tick()
 		}
 	}
 }
@@ -203,15 +231,16 @@ const (
 	releaseCancelled
 )
 
-// ReleaseOnce runs one tick: unless autonomy is frozen, it releases up to
-// releaseBatchSize held advances, oldest first, each in its own
-// transaction, and reports how many it applied or cancelled. It reads the
-// freeze first on the pool, recording nothing -- each advance it holds was
-// counted as skipped when it was held -- and again inside each release's
-// transaction, which is the read that decides: a freeze that lands during
-// the tick stops it there. A read that fails releases nothing. One hold
-// whose release fails is logged, stays held for the next tick, and leaves
-// the others to be released.
+// ReleaseOnce runs one tick: unless autonomy is frozen, it releases every
+// held advance, oldest first -- page after page of pageSize, each read
+// after the last row of the one before -- each in its own transaction, and
+// reports how many it applied or cancelled. It reads the freeze first on
+// the pool, recording nothing -- each advance it holds was counted as
+// skipped when it was held -- and again inside each release's transaction,
+// which is the read that decides: a freeze that lands during the tick
+// stops it there. A read that fails releases nothing. One hold whose
+// release fails is logged, stays held for the next tick, and leaves the
+// others to be released: the next page starts after it.
 func (r *HeldAdvanceReleaser) ReleaseOnce(ctx context.Context) (int, error) {
 	logger := platform.Logger(ctx)
 	frozen, err := r.gate.Frozen(ctx)
@@ -221,29 +250,41 @@ func (r *HeldAdvanceReleaser) ReleaseOnce(ctx context.Context) (int, error) {
 	if frozen {
 		return 0, nil
 	}
-	holds, err := r.workflows.ListAdvanceHolds(ctx, releaseBatchSize)
-	if err != nil {
-		return 0, fmt.Errorf("workflowengine: list held advances: %w", err)
-	}
 
 	released := 0
-	for _, h := range holds {
-		result, err := r.releaseHold(ctx, h)
+	report := func() {
+		if released > 0 {
+			logger.Info("workflowengine: released workflow advances the autonomy freeze held", "released", released)
+		}
+	}
+	defer report()
+	cursor := postgres.FirstAdvanceHolds
+	for {
+		holds, err := r.workflows.ListAdvanceHolds(ctx, cursor, r.pageSize)
 		if err != nil {
-			logger.Error("workflowengine: release a held workflow advance failed; it stays held for the next tick",
-				"run_id", h.WorkflowRunID.String(), "error", err)
+			return released, fmt.Errorf("workflowengine: list held advances: %w", err)
 		}
-		if result == releaseHeld {
-			break
+		for _, h := range holds {
+			result, err := r.releaseHold(ctx, h)
+			if err != nil {
+				logger.Error("workflowengine: release a held workflow advance failed; it stays held for the next tick",
+					"run_id", h.WorkflowRunID.String(), "error", err)
+			}
+			if result == releaseHeld {
+				return released, nil
+			}
+			if result == releaseApplied || result == releaseCancelled {
+				released++
+			}
 		}
-		if result == releaseApplied || result == releaseCancelled {
-			released++
+		if len(holds) < int(r.pageSize) {
+			return released, nil
 		}
+		if err := ctx.Err(); err != nil {
+			return released, err
+		}
+		cursor = postgres.AdvanceHoldCursorAfter(holds[len(holds)-1])
 	}
-	if released > 0 {
-		logger.Info("workflowengine: released workflow advances the autonomy freeze held", "released", released)
-	}
-	return released, nil
 }
 
 // releaseHold releases h in a transaction of its own -- see this file's top

@@ -17,13 +17,18 @@
 --     by a person's stop, which drops the session's holds.
 --   - held_at: when the advance was held, on the database's clock -- the
 --     instant a person's stop compares with: a stop requested at or after
---     it drops the hold and cancels the run (sessionactor's
---     cancelHeldWorkflowAdvancesForStop), the rule the stop timer deletes
---     the session's work-creating timers by.
+--     it drops the hold and cancels the run, in the stop request's own
+--     transaction (httpapi's requestSessionStop, through
+--     workflowengine.CancelHeldAdvancesForStop), the rule the stop timer
+--     deletes the session's work-creating timers by.
+-- While a session holds an advance its status reads scheduled work, never
+-- settled (GetSessionActivityFacts, technical plan §43.20): the advance
+-- creates a turn with no new input once the freeze lifts.
 --
 -- A pump of its own, workflowengine.HeldAdvanceReleaser, reads the freeze
--- every AutonomyFreezeRecheckInterval. Once it is lifted, the releaser
--- takes the oldest holds first and, for each, in one transaction under the
+-- when it starts and every AutonomyFreezeRecheckInterval after. Once it is
+-- lifted, the releaser drains every hold in one tick, oldest first, a page
+-- at a time, and, for each, in one transaction under the
 -- session's actor-epoch lock: reads the freeze again, deletes the row (a
 -- compare-and-swap: of two replicas releasing it, one deletes it and the
 -- other finds nothing), and applies the stored outcome -- the advance runs
@@ -31,9 +36,10 @@
 --
 -- A side table rather than columns on workflow_runs: the releaser reads a
 -- table that is empty outside a freeze, and no index is built over
--- workflow_runs. workflow_advance_holds_held_at_idx serves the releaser's
--- oldest-first read; workflow_advance_holds_session_idx serves the stop's
--- delete, scoped to one session.
+-- workflow_runs. workflow_advance_holds_held_at_idx, (held_at,
+-- workflow_run_id), serves the releaser's oldest-first pages, each read
+-- after the last row of the one before; workflow_advance_holds_session_idx
+-- serves the stop's delete and the status's read, scoped to one session.
 --
 -- # Locks
 --
@@ -65,6 +71,11 @@
 -- this file's own number). A rollback therefore takes one of two steps
 -- first, with the control plane scaled to zero, V being the version before
 -- this file's:
+-- Either way, A FREEZE STOPS HOLDING WORKFLOW ADVANCES under the previous
+-- binary: it reads the freeze at the other automatic sites, but a workflow
+-- run whose step's turn ends while frozen advances to its next step, as it
+-- did before this release. Before rolling back during a freeze, stop the
+-- sessions whose workflow runs must not move on.
 --   - Keep the table: with the golang-migrate CLI, `migrate force V`. The
 --     previous binary then boots and never reads it. A run whose advance is
 --     held stays running with no live step run: every turn on its session
@@ -87,4 +98,4 @@ CREATE TABLE IF NOT EXISTS workflow_advance_holds (
     held_at         TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS workflow_advance_holds_session_idx ON workflow_advance_holds (session_id, held_at);
-CREATE INDEX IF NOT EXISTS workflow_advance_holds_held_at_idx ON workflow_advance_holds (held_at);
+CREATE INDEX IF NOT EXISTS workflow_advance_holds_held_at_idx ON workflow_advance_holds (held_at, workflow_run_id);

@@ -29,6 +29,14 @@ import (
 // shape of write.
 const contextWriteMaxBuffers = holdWakeMaxBuffers
 
+// contextTurnStatusIndexEntryMaxBuffers is what UpdateTurnStatus reads
+// beyond contextWriteMaxBuffers since the plan tests migrate past 000166
+// (holdPlanLatestVersion): its new row version's entry in
+// turns_session_dispatched_idx, an index this test's bound predates -- a
+// descent of one or two levels to the leaf the entry goes to.
+// sessionDispatchedIndexEntryMaxBuffers measures that entry exactly.
+const contextTurnStatusIndexEntryMaxBuffers = 2
+
 // contextPlanShape is a table TestReviewContextCheck_PlansReadTheSessionsOwnTurns
 // reads: holdPlanShape's sessions, every one claiming a pull request, whose
 // ended turns ended a second after they were created -- the last of them
@@ -332,7 +340,9 @@ func contextReadProblem(m holdPlanMeasurement, ownTurns int, noSeqScan bool) str
 // text of each, and the new SetTurnContextUnconfirmed,
 // RequeueAutoRetrigger, DropAutoRetrigger, ResetAutoRetriggerContextMoves
 // and RequeueReviewRetriggerDebounce -- must read at most
-// contextWriteMaxBuffers each, whatever the table holds; the two changed
+// contextWriteMaxBuffers each, whatever the table holds (UpdateTurnStatus
+// contextTurnStatusIndexEntryMaxBuffers more, for its entry in an index
+// added since); the two changed
 // ones on main's own access path too (a write's own buffers vary by one
 // between two runs, as its new row version lands).
 func TestReviewContextCheck_PlansReadTheSessionsOwnTurns(t *testing.T) {
@@ -599,8 +609,12 @@ func TestReviewContextCheck_PlansReadTheSessionsOwnTurns(t *testing.T) {
 							if got, want := scanShape(after.scans), scanShape(before.scans); got != want {
 								t.Errorf("%s: plans %s, main's text %s: the change moved its access path", key, got, want)
 							}
-							if after.buffers > contextWriteMaxBuffers {
-								t.Errorf("%s: reads %.0f buffers, over %d (%v)", key, after.buffers, contextWriteMaxBuffers, after.scans)
+							limit := float64(contextWriteMaxBuffers)
+							if pr.changed.name == "UpdateTurnStatus" {
+								limit += contextTurnStatusIndexEntryMaxBuffers
+							}
+							if after.buffers > limit {
+								t.Errorf("%s: reads %.0f buffers, over %.0f (%v)", key, after.buffers, limit, after.scans)
 							}
 							continue
 						}

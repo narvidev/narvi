@@ -3141,8 +3141,9 @@ type Timeouts struct {
 	// is the unfreeze latency of both, plus the pump's own interval. It is
 	// also the tick of the workflow engine's held-advance releaser
 	// (internal/app/workflowengine's HeldAdvanceReleaser), which applies,
-	// once the freeze lifts, each workflow advance it held: the unfreeze
-	// latency of a held advance. The
+	// once the freeze lifts, every workflow advance the freeze held, all in
+	// the one tick, page by page: the unfreeze latency of every held
+	// advance, however many. The
 	// sites with a tick of their own (the auto-merge worker, the cron
 	// trigger, the automation fan-out) read the freeze again on their next
 	// tick. Validate keeps it above TimerClaimDuration (a frozen debounce
