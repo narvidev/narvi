@@ -59,6 +59,32 @@ func (q *Queries) ArmSessionDispatchTimer(ctx context.Context, sessionID pgtype.
 	return err
 }
 
+const armSessionDispatchTimerAfter = `-- name: ArmSessionDispatchTimerAfter :exec
+INSERT INTO session_timers (session_id, name, fires_at)
+VALUES ($1, 'dispatch', now() + make_interval(secs => $2::double precision))
+ON CONFLICT (session_id, name) DO UPDATE
+    SET fires_at = LEAST(session_timers.fires_at, EXCLUDED.fires_at), armed_at = now()
+`
+
+type ArmSessionDispatchTimerAfterParams struct {
+	SessionID    pgtype.UUID `json:"session_id"`
+	DelaySeconds float64     `json:"delay_seconds"`
+}
+
+// The session's dispatch timer, armed delay_seconds ahead on the database's
+// clock: the session actor's next look at a review turn waiting on its
+// checkout (technical plan §21.1, §30.4; sessionactor's reviewcheckout.go)
+// -- the bound, a re-fetch of a ref that lags, or a failed checkout's next
+// try -- so a sandbox that never answers is still decided, and the wait
+// never spins. A timer already due sooner keeps its instant (LEAST): a turn
+// created meanwhile arms it due at once, and that arm wins. 'dispatch' is
+// sessionactor.TimerDispatch, named here like ArmSessionDispatchTimer
+// names it. armed_at is stamped like every arm (UpsertSessionTimer).
+func (q *Queries) ArmSessionDispatchTimerAfter(ctx context.Context, arg ArmSessionDispatchTimerAfterParams) error {
+	_, err := q.db.Exec(ctx, armSessionDispatchTimerAfter, arg.SessionID, arg.DelaySeconds)
+	return err
+}
+
 const backOffOwedReviewRequestTimer = `-- name: BackOffOwedReviewRequestTimer :execrows
 UPDATE session_timers
 SET fires_at = now() + LEAST(

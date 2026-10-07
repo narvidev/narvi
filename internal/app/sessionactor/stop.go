@@ -367,10 +367,31 @@ func (a *Actor) retireStoppedGen(ctx context.Context, tx pgx.Tx, dispatched []*i
 	if sandbox.IsDeadSandboxStatus(from) || !ranOnGen(dispatched, int(row.Gen)) {
 		return nil, nil
 	}
+	retired, err := a.retireLiveGen(ctx, tx, row)
+	if err != nil {
+		return nil, err
+	}
+	a.logger.Warn("sessionactor: a stopped turn's grace ended with no word from the agent; its sandbox gen is retired, and the next turn runs on a new one",
+		"gen", row.Gen, "from", string(from), "provider_id", retired.providerID)
+	return retired, nil
+}
 
+// retireLiveGen moves row's live gen -- its sandbox not dead -- to stopped
+// in tx, through the machine's own two edges, each validated by
+// sandbox.Transition: the live state to suspect, then suspect to stopped
+// by TriggerGraceExpired, stopped being the outcome it reserves for an
+// explicit stop. The caller's reason stands in for terminal_grace, so none
+// is armed, and one a watchdog armed earlier is deleted. The next dispatch
+// finds a dead sandbox and restores or respawns it under a new gen, and
+// handleSandboxEvent's gen fence drops every event the old gen still
+// sends. Shared by a person's stop (retireStoppedGen) and a review turn's
+// checkout (retireGenForCheckout); the caller stops the provider object
+// after its commit (stopSandboxOfRetiredGen).
+func (a *Actor) retireLiveGen(ctx context.Context, tx pgx.Tx, row sqlcgen.Sandbox) (*retiredGen, error) {
+	from := sandbox.State(row.Status)
 	if from != sandbox.StateSuspect {
 		if _, err := sandbox.Transition(from, int(row.Gen), sandbox.SuspectTrigger()); err != nil {
-			return nil, fmt.Errorf("sessionactor: retire stopped sandbox gen: %w", err)
+			return nil, fmt.Errorf("sessionactor: retire sandbox gen: %w", err)
 		}
 		preSuspect := sqlcgen.SandboxStatus(from)
 		if _, err := a.sandboxWrites(tx).UpdateStatusToSuspect(ctx, sqlcgen.UpdateSandboxStatusToSuspectParams{
@@ -382,7 +403,7 @@ func (a *Actor) retireStoppedGen(ctx context.Context, tx pgx.Tx, dispatched []*i
 	}
 	to, err := sandbox.Transition(sandbox.StateSuspect, int(row.Gen), sandbox.GraceExpiredTrigger(sandbox.StateStopped))
 	if err != nil {
-		return nil, fmt.Errorf("sessionactor: retire stopped sandbox gen: %w", err)
+		return nil, fmt.Errorf("sessionactor: retire sandbox gen: %w", err)
 	}
 	if _, err := a.sandboxWrites(tx).UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{
 		SessionID: a.sessionID,
@@ -398,8 +419,6 @@ func (a *Actor) retireStoppedGen(ctx context.Context, tx pgx.Tx, dispatched []*i
 	if row.ProviderID != nil {
 		providerID = *row.ProviderID
 	}
-	a.logger.Warn("sessionactor: a stopped turn's grace ended with no word from the agent; its sandbox gen is retired, and the next turn runs on a new one",
-		"gen", row.Gen, "from", string(from), "provider_id", providerID)
 	return &retiredGen{gen: int(row.Gen), providerID: providerID}, nil
 }
 

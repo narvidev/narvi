@@ -21,9 +21,10 @@ import (
 )
 
 // guardPlanLatestVersion is the migration the session guard's plan test
-// migrates to: the one that builds turns_session_dispatched_idx, the latest
-// whose columns the statements it measures name.
-const guardPlanLatestVersion = sessionDispatchedMigration
+// migrates to: the latest whose columns the statements it measures name,
+// after the one that builds turns_session_dispatched_idx
+// (sessionDispatchedMigration).
+const guardPlanLatestVersion = reviewCheckoutGenMigration
 
 // guardReadFixedBuffers and guardReadBuffersPerTurn bound what the session
 // guard's read (GetSessionGuardFacts) reads: a fixed number of key and claim

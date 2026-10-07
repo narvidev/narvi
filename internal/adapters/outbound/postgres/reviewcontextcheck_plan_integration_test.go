@@ -29,6 +29,28 @@ import (
 // shape of write.
 const contextWriteMaxBuffers = holdWakeMaxBuffers
 
+// contextTurnWriteMaxBuffers bounds such a write of a turn: since migration
+// 000166, a turn's new version also goes through
+// turns_session_dispatched_idx, whose key and INCLUDE columns
+// (completed_at among them) no status write leaves alone, which reads up
+// to seven buffers more on these tables -- UpdateTurnStatus measured 15 to
+// 18 buffers at 165 and 22 to 25 at 166 -- so the bound is
+// contextWriteMaxBuffers plus that. The test migrates to the latest
+// migration whose columns its statements name, which comes after 000166.
+const contextTurnWriteMaxBuffers = contextWriteMaxBuffers + 8
+
+// contextWriteLimit is the bound m, one of the context check's writes, is
+// held to: contextTurnWriteMaxBuffers for a write of turns,
+// contextWriteMaxBuffers for any other.
+func contextWriteLimit(m holdPlanMeasurement) float64 {
+	for _, s := range m.scans {
+		if s.Relation == "turns" && s.Node == "ModifyTable" {
+			return contextTurnWriteMaxBuffers
+		}
+	}
+	return contextWriteMaxBuffers
+}
+
 // contextPlanShape is a table TestReviewContextCheck_PlansReadTheSessionsOwnTurns
 // reads: holdPlanShape's sessions, every one claiming a pull request, whose
 // ended turns ended a second after they were created -- the last of them
@@ -599,8 +621,8 @@ func TestReviewContextCheck_PlansReadTheSessionsOwnTurns(t *testing.T) {
 							if got, want := scanShape(after.scans), scanShape(before.scans); got != want {
 								t.Errorf("%s: plans %s, main's text %s: the change moved its access path", key, got, want)
 							}
-							if after.buffers > contextWriteMaxBuffers {
-								t.Errorf("%s: reads %.0f buffers, over %d (%v)", key, after.buffers, contextWriteMaxBuffers, after.scans)
+							if limit := contextWriteLimit(after); after.buffers > limit {
+								t.Errorf("%s: reads %.0f buffers, over %.0f (%v)", key, after.buffers, limit, after.scans)
 							}
 							continue
 						}
@@ -619,8 +641,8 @@ func TestReviewContextCheck_PlansReadTheSessionsOwnTurns(t *testing.T) {
 					for _, w := range writes {
 						got := measureHoldPlan(ctx, t, pool, w, probe, mode)
 						t.Logf("%s, %s, %s: %v", w.name, probe.name, mode, got)
-						if got.buffers > contextWriteMaxBuffers {
-							t.Errorf("%s, %s, %s: reads %.0f buffers, over %d (%v)", w.name, probe.name, mode, got.buffers, contextWriteMaxBuffers, got.scans)
+						if limit := contextWriteLimit(got); got.buffers > limit {
+							t.Errorf("%s, %s, %s: reads %.0f buffers, over %.0f (%v)", w.name, probe.name, mode, got.buffers, limit, got.scans)
 						}
 					}
 				}

@@ -320,6 +320,17 @@ type dispatchPlan struct {
 	// which sends payload only for turn.PromptResendSend and never fails the
 	// turn. payload is nil for the other two outcomes.
 	receiptResend *receiptResendPlan
+
+	// checkout, checkoutRetire and checkoutFailure are a review turn's
+	// checkout (technical plan §21.1, reviewcheckout.go), at most one set,
+	// and payload nil with each: a checkout command the evaluation recorded,
+	// which executeDispatch sends (executeCheckout); a gen it retired,
+	// whose provider object handleEnsureDispatched stops before it
+	// evaluates again; or the failure of a turn re-sent to a new gen whose
+	// checkout was refused, which executeDispatch fails forward.
+	checkout        *checkoutPlan
+	checkoutRetire  *retiredGen
+	checkoutFailure *dispatchFailure
 }
 
 // handleEnsureDispatched implements the EnsureDispatched command
@@ -363,6 +374,11 @@ type dispatchPlan struct {
 // planDispatch ends it without running it and commits, and the next turn
 // is evaluated at once, with a read of its own: each such round ends a
 // pending turn, so the loop ends.
+//
+// A review turn's checkout (technical plan §21.1, reviewcheckout.go) that
+// retires its sandbox's gen evaluates again too, once the gen's provider
+// object is stopped: the next evaluation finds the sandbox dead and spawns
+// a fresh one, so it runs once.
 func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 	for {
 		check := a.preReadReviewContext(ctx)
@@ -371,9 +387,14 @@ func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 			a.backOffDispatchTimer(ctx, err, deleted)
 			return err
 		}
-		if !repick {
-			return a.executePlans(ctx, spawn, dispatch, deleted)
+		if repick {
+			continue
 		}
+		if dispatch != nil && dispatch.checkoutRetire != nil {
+			a.stopSandboxOfRetiredGen(ctx, *dispatch.checkoutRetire)
+			continue
+		}
+		return a.executePlans(ctx, spawn, dispatch, deleted)
 	}
 }
 
@@ -481,10 +502,15 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 	var dispatch *dispatchPlan
 	var deleted sqlcgen.DeleteSessionDispatchTimerRow
 	var repick bool
+	// checkoutCounted is the review_checkout_total outcome a review turn's
+	// checkout decided in this evaluation (reviewcheckout.go), counted only
+	// once the evaluation has committed.
+	var checkoutCounted string
 
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		now := time.Now()
 		repick = false
+		spawn, dispatch, checkoutCounted = nil, nil, ""
 
 		// The durable dispatch trigger (technical plan §2, §3.3): the
 		// transaction that created a turn armed the dispatch timer, and
@@ -592,12 +618,13 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 			// the SAME HasInFlightTurn predicate), so this branch and the
 			// three below it never both fire for the same planDispatch
 			// call.
-			sp, d, err := a.planReenqueueOrRespawn(ctx, tx, sessionRow, sandboxRow, hasSandbox, entries, turns, now)
+			sp, d, counted, err := a.planReenqueueOrRespawn(ctx, tx, sessionRow, sandboxRow, hasSandbox, entries, turns, now)
 			if err != nil {
 				return err
 			}
 			spawn = sp
 			dispatch = d
+			checkoutCounted = counted
 			return nil
 		}
 
@@ -659,16 +686,33 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 					"turn_id", pendingID.String(), "gen", sandboxRow.Gen)
 				return nil
 			}
+			target, ok := findTurnByID(turns, pendingID)
+			if !ok {
+				return fmt.Errorf("sessionactor: dispatch turn: turn %s not found among loaded turns", pendingID.String())
+			}
+			// Technical plan §21.1: a review turn that records a head is
+			// sent only once its sandbox reports holding that head
+			// (reviewcheckout.go). First, so §24.9's check below reads the
+			// code host only for a turn whose checkout is confirmed.
+			checkout, err := a.applyReviewCheckout(ctx, tx, sessionRow, sandboxRow, turns, target, now)
+			if err != nil {
+				return err
+			}
+			checkoutCounted = checkout.counted
+			switch checkout.decision {
+			case reviewCheckoutHold, reviewCheckoutFailForward:
+				dispatch = checkout.plan
+				return nil
+			case reviewCheckoutEnded:
+				repick = true
+				return nil
+			}
 			// Technical plan §24.9: a review attempt the automatic
 			// re-review or a person's request asked for, about to start
 			// after waiting behind another turn, starts only on a context
 			// still its pull request's (reviewcontextcheck.go). Applied here, where the
 			// turn is about to be sent: a sandbox still starting takes
 			// nothing yet, and the check runs once it is up.
-			target, ok := findTurnByID(turns, pendingID)
-			if !ok {
-				return fmt.Errorf("sessionactor: dispatch turn: turn %s not found among loaded turns", pendingID.String())
-			}
 			decision, err := a.applyReviewContextCheck(ctx, tx, turns, target, check, now)
 			if err != nil {
 				return err
@@ -682,6 +726,9 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 			}
 			d, err := a.tryPlanDispatch(ctx, tx, sessionRow, sandboxRow, pendingID, turns, now)
 			if err != nil {
+				return err
+			}
+			if checkoutCounted, err = a.recordCheckedOut(ctx, tx, d, checkout); err != nil {
 				return err
 			}
 			dispatch = d
@@ -705,8 +752,27 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 		spawn = sp
 		return nil
 	})
+	if err == nil && checkoutCounted != "" {
+		a.recordReviewCheckout(ctx, checkoutCounted)
+	}
 
 	return spawn, dispatch, deleted, repick, err
+}
+
+// recordCheckedOut records, in the commit that dispatches d's turn, the
+// commit its sandbox reported holding, when its checkout was confirmed
+// (technical plan §21.1, turns.checked_out_sha) -- the audit fact that the
+// turn ran on the head it recorded -- and returns the review_checkout_total
+// outcome to count once that commit lands: checked_out, or "" when nothing
+// was confirmed. A nil d sent nothing, so nothing is recorded.
+func (a *Actor) recordCheckedOut(ctx context.Context, tx pgx.Tx, d *dispatchPlan, checkout reviewCheckoutResult) (string, error) {
+	if d == nil || checkout.decision != reviewCheckoutConfirmed {
+		return "", nil
+	}
+	if _, err := a.stores.turn.WithTx(tx).SetCheckedOut(ctx, d.turnID, checkout.sha); err != nil {
+		return "", fmt.Errorf("sessionactor: record the commit the turn was checked out at: %w", err)
+	}
+	return reviewCheckoutOutcomeCheckedOut, nil
 }
 
 // planReenqueueOrRespawn implements §3.3's ("turn recovery", §9.3
@@ -744,18 +810,25 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 //
 // hasSandbox/entries/turns/now are exactly what planDispatch's own
 // transact already loaded -- no second read.
+//
+// A turn re-sent to a new gen passes its review checkout first (technical
+// plan §21.1, reviewcheckout.go): the new gen's tree is a fresh boot's,
+// and the turn's run had started on the head it recorded, so it is
+// re-sent only once the new gen holds that head -- a moved head never
+// ends it -- and a checkout refused fails it forward. counted is the
+// review_checkout_total outcome that checkout decided, "" for none.
 func (a *Actor) planReenqueueOrRespawn(
 	ctx context.Context, tx pgx.Tx,
 	sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, hasSandbox bool,
 	entries []turn.QueueEntry[pgtype.UUID], turns []sqlcgen.Turn,
 	now time.Time,
-) (*spawnPlan, *dispatchPlan, error) {
+) (*spawnPlan, *dispatchPlan, string, error) {
 	inFlightID, hasInFlight := turn.InFlightTurn(entries)
 	if !hasInFlight {
 		// No turn at all, or every turn is already terminal -- nothing
 		// for this session to do this round, exactly like planDispatch's
 		// own pre-existing early return.
-		return nil, nil, nil
+		return nil, nil, "", nil
 	}
 
 	// Technical plan §3.3's stop: a turn in flight that a person's stop
@@ -766,17 +839,17 @@ func (a *Actor) planReenqueueOrRespawn(
 	// that retirement is owed).
 	if target, ok := findTurnByID(turns, inFlightID); ok && target.StopRequestedAt.Valid {
 		a.logger.Info("sessionactor: in-flight turn flagged by a stop; not re-sent", "turn_id", inFlightID.String())
-		return nil, nil, nil
+		return nil, nil, "", nil
 	}
 
 	if !hasSandbox || sandbox.IsDeadSandboxStatus(sandbox.State(sandboxRow.Status)) {
 		sp, err := a.tryPlanSpawn(ctx, tx, sessionRow, sandboxRow, hasSandbox, now)
-		return sp, nil, err
+		return sp, nil, "", err
 	}
 
 	target, ok := findTurnByID(turns, inFlightID)
 	if !ok {
-		return nil, nil, fmt.Errorf("sessionactor: in-flight turn %s not found among loaded turns", inFlightID.String())
+		return nil, nil, "", fmt.Errorf("sessionactor: in-flight turn %s not found among loaded turns", inFlightID.String())
 	}
 
 	status := sandbox.State(sandboxRow.Status)
@@ -800,14 +873,32 @@ func (a *Actor) planReenqueueOrRespawn(
 			// comment above for the regression test proving an incapable
 			// gen's turn is never re-sent.
 			d, err := a.tryPlanReceiptResend(ctx, tx, sessionRow, sandboxRow, target)
-			return nil, d, err
+			return nil, d, "", err
+		}
+		checkout, err := a.applyReviewCheckout(ctx, tx, sessionRow, sandboxRow, turns, target, now)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		switch checkout.decision {
+		case reviewCheckoutHold, reviewCheckoutFailForward, reviewCheckoutEnded:
+			// A processing turn is never ended here (applyReviewCheckout
+			// fails it forward instead), so reviewCheckoutEnded is listed
+			// only so no decision falls through to a re-send.
+			return nil, checkout.plan, checkout.counted, nil
 		}
 		d, err := a.tryPlanReenqueue(ctx, tx, sessionRow, sandboxRow, target, now)
-		return nil, d, err
+		if err != nil {
+			return nil, nil, "", err
+		}
+		counted, err := a.recordCheckedOut(ctx, tx, d, checkout)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		return nil, d, counted, nil
 	}
 
 	sp, err := a.tryPlanSpawn(ctx, tx, sessionRow, sandboxRow, hasSandbox, now)
-	return sp, nil, err
+	return sp, nil, "", err
 }
 
 // tryPlanReenqueue implements §3.3's ("turn recovery") own re-enqueue
@@ -2367,6 +2458,16 @@ func (a *Actor) tryPlanDispatch(
 func (a *Actor) executeDispatch(ctx context.Context, plan *dispatchPlan, chainStart pgtype.Timestamptz) error {
 	if plan.receiptResend != nil {
 		return a.executeReceiptResend(ctx, plan)
+	}
+	// Technical plan §21.1's review checkout (reviewcheckout.go): a
+	// checkout command to send while the turn waits, or a turn re-sent to
+	// a new gen whose checkout was refused, failed forward. Neither sends
+	// the turn's prompt.
+	if plan.checkout != nil {
+		return a.executeCheckout(ctx, plan)
+	}
+	if plan.checkoutFailure != nil {
+		return a.failDispatchedTurn(ctx, plan.turnID, *plan.checkoutFailure)
 	}
 
 	// §31.4's turn-dispatch-time re-read of an administrator's revocation,

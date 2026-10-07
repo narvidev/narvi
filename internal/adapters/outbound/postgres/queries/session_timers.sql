@@ -32,6 +32,21 @@ VALUES ($1, 'dispatch', now())
 ON CONFLICT (session_id, name) DO UPDATE
     SET fires_at = now(), armed_at = now();
 
+-- name: ArmSessionDispatchTimerAfter :exec
+-- The session's dispatch timer, armed delay_seconds ahead on the database's
+-- clock: the session actor's next look at a review turn waiting on its
+-- checkout (technical plan §21.1, §30.4; sessionactor's reviewcheckout.go)
+-- -- the bound, a re-fetch of a ref that lags, or a failed checkout's next
+-- try -- so a sandbox that never answers is still decided, and the wait
+-- never spins. A timer already due sooner keeps its instant (LEAST): a turn
+-- created meanwhile arms it due at once, and that arm wins. 'dispatch' is
+-- sessionactor.TimerDispatch, named here like ArmSessionDispatchTimer
+-- names it. armed_at is stamped like every arm (UpsertSessionTimer).
+INSERT INTO session_timers (session_id, name, fires_at)
+VALUES (sqlc.arg('session_id'), 'dispatch', now() + make_interval(secs => sqlc.arg('delay_seconds')::double precision))
+ON CONFLICT (session_id, name) DO UPDATE
+    SET fires_at = LEAST(session_timers.fires_at, EXCLUDED.fires_at), armed_at = now();
+
 -- name: HoldReviewRetriggerDebounce :execrows
 -- Technical plan §24.9: the re-review debounce's firing holds -- a turn of
 -- the review session is open -- and re-arms its own row backstop_seconds

@@ -285,8 +285,8 @@ func intPtr(n int) *int { return &n }
 // event-path half of TestReadyCapabilities_SurviveAnyLifetimeReport: a
 // ready whose lifetimeRemainingSeconds the generated Ready cannot hold --
 // 60.0, 6e1 and 1e20 are integers the contract allows, the rest it does
-// not -- still records its promptReceipt and maxFrameBytes against the gen
-// (technical plan §3.3), and still tightens the deadline when the lenient
+// not -- still records its promptReceipt, reviewCheckout and maxFrameBytes
+// against the gen (technical plan §3.3, §21.1), and still tightens the deadline when the lenient
 // read takes the value.
 func TestSandboxLifetime_AReportNeverCostsTheReadyItsCapabilities(t *testing.T) {
 	ctx := context.Background()
@@ -294,18 +294,19 @@ func TestSandboxLifetime_AReportNeverCostsTheReadyItsCapabilities(t *testing.T) 
 	for i, value := range []string{`60.0`, `6e1`, `1e20`, `99999999999999999999`, `59.9`, `"60"`, `1e400`, `"soon"`, `{}`} {
 		raw := json.RawMessage(`{"type":"ready","messageId":"r-capabilities-` + fmt.Sprint(i) + `","sessionId":"00000000-0000-0000-0000-000000000000","gen":1,` +
 			`"timestamp":"2026-10-06T12:00:00Z","agentVersion":"dev","imageDigest":"unknown",` +
-			`"capabilities":{"promptReceipt":true,"maxFrameBytes":1048576},"lifetimeRemainingSeconds":` + value + `}`)
+			`"capabilities":{"promptReceipt":true,"reviewCheckout":true,"maxFrameBytes":1048576},"lifetimeRemainingSeconds":` + value + `}`)
 		if outcome, _, _ := rig.send(ctx, t, SandboxEvent{Type: "ready", Gen: 1, MessageID: fmt.Sprintf("r-capabilities-%d", i), Raw: raw}); !outcome.Persisted {
 			t.Fatalf("ready with lifetimeRemainingSeconds %s: Persisted = false, want true", value)
 		}
-		var promptReceiptGen, maxFrameBytes, maxFrameBytesGen *int32
-		if err := rig.pool.QueryRow(ctx, `SELECT prompt_receipt_gen, agent_max_frame_bytes, agent_max_frame_bytes_gen FROM sandboxes WHERE session_id = $1`, rig.sessionID).
-			Scan(&promptReceiptGen, &maxFrameBytes, &maxFrameBytesGen); err != nil {
+		var promptReceiptGen, reviewCheckoutGen, maxFrameBytes, maxFrameBytesGen *int32
+		if err := rig.pool.QueryRow(ctx, `SELECT prompt_receipt_gen, review_checkout_gen, agent_max_frame_bytes, agent_max_frame_bytes_gen FROM sandboxes WHERE session_id = $1`, rig.sessionID).
+			Scan(&promptReceiptGen, &reviewCheckoutGen, &maxFrameBytes, &maxFrameBytesGen); err != nil {
 			t.Fatalf("read the recorded capabilities: %v", err)
 		}
-		if int32Value(promptReceiptGen) != int32(1) || int32Value(maxFrameBytes) != int32(1048576) || int32Value(maxFrameBytesGen) != int32(1) {
-			t.Errorf("ready with lifetimeRemainingSeconds %s recorded prompt_receipt_gen %v, agent_max_frame_bytes %v at gen %v; want gen 1, 1048576 at gen 1",
-				value, int32Value(promptReceiptGen), int32Value(maxFrameBytes), int32Value(maxFrameBytesGen))
+		if int32Value(promptReceiptGen) != int32(1) || int32Value(reviewCheckoutGen) != int32(1) ||
+			int32Value(maxFrameBytes) != int32(1048576) || int32Value(maxFrameBytesGen) != int32(1) {
+			t.Errorf("ready with lifetimeRemainingSeconds %s recorded prompt_receipt_gen %v, review_checkout_gen %v, agent_max_frame_bytes %v at gen %v; want gen 1, gen 1, 1048576 at gen 1",
+				value, int32Value(promptReceiptGen), int32Value(reviewCheckoutGen), int32Value(maxFrameBytes), int32Value(maxFrameBytesGen))
 		}
 	}
 	// 59.9 is the earliest value the lenient read took: the deadline is

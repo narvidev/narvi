@@ -63,12 +63,12 @@ var lifetimeReportValues = []string{
 // TestReadyCapabilities_SurviveAnyLifetimeReport pins that the ready's
 // lifetimeRemainingSeconds can never cost it its capabilities (technical
 // plan §3.3, §35.2): whatever the key holds -- under its own name or with
-// another case, which encoding/json would also match -- promptReceipt and
-// maxFrameBytes read exactly as they do without it, as they did before
-// the generated Ready named the key.
+// another case, which encoding/json would also match -- promptReceipt,
+// reviewCheckout and maxFrameBytes read exactly as they do without it, as
+// they did before the generated Ready named the key.
 func TestReadyCapabilities_SurviveAnyLifetimeReport(t *testing.T) {
 	t.Parallel()
-	const base = `"type":"ready","messageId":"r1","sessionId":"s","gen":3,"timestamp":"2026-10-01T12:00:00Z","agentVersion":"dev","imageDigest":"unknown","capabilities":{"promptReceipt":true,"maxFrameBytes":1048576}`
+	const base = `"type":"ready","messageId":"r1","sessionId":"s","gen":3,"timestamp":"2026-10-01T12:00:00Z","agentVersion":"dev","imageDigest":"unknown","capabilities":{"promptReceipt":true,"reviewCheckout":true,"maxFrameBytes":1048576}`
 	for _, key := range []string{"lifetimeRemainingSeconds", "LifetimeRemainingSeconds", "lifetimeremainingseconds"} {
 		for _, value := range lifetimeReportValues {
 			raw := json.RawMessage(`{` + base + `,"` + key + `":` + value + `}`)
@@ -76,6 +76,9 @@ func TestReadyCapabilities_SurviveAnyLifetimeReport(t *testing.T) {
 				t.Parallel()
 				if !readyAdvertisesPromptReceipt(raw) {
 					t.Errorf("readyAdvertisesPromptReceipt(%s) = false, want true", raw)
+				}
+				if !readyAdvertisesReviewCheckout(raw) {
+					t.Errorf("readyAdvertisesReviewCheckout(%s) = false, want true", raw)
 				}
 				if got := readyStatedMaxFrameBytes(raw); got == nil || *got != 1048576 {
 					t.Errorf("readyStatedMaxFrameBytes(%s) = %v, want 1048576", raw, derefInt32(got))

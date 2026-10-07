@@ -41,6 +41,19 @@ const (
 	// started, or its prompt not sent to a live one, and the attempt ended
 	// before it ran.
 	NotAssessedRepoEntitlementRevoked NotAssessedReason = "repo_entitlement_revoked"
+
+	// NotAssessedReviewCheckoutUnsupported means the review was not run
+	// because its sandbox's agent cannot check out the commit the review
+	// was asked about (technical plan §21.1): the agent predates the
+	// checkout, so the sandbox image needs rebuilding with a current one.
+	NotAssessedReviewCheckoutUnsupported NotAssessedReason = "review_checkout_unsupported"
+
+	// NotAssessedReviewCheckoutFailed means the review was not run because
+	// its sandbox did not check out the commit the review was asked about
+	// within the bound (technical plan §21.1): the sandbox never reported,
+	// the pull request's ref could not be fetched or no longer holds that
+	// commit, or the checkout kept failing.
+	NotAssessedReviewCheckoutFailed NotAssessedReason = "review_checkout_failed"
 )
 
 // notAssessedExplanations is the sentence each named reason adds to a
@@ -59,6 +72,12 @@ var notAssessedExplanations = map[NotAssessedReason]string{
 		"did not run. Requesting the review again sends it anew.",
 	NotAssessedRepoEntitlementRevoked: "An administrator of this deployment revoked new work on its repository, " +
 		"so the review was not run. An administrator can restore the repository, then request the review again.",
+	NotAssessedReviewCheckoutUnsupported: "The review's sandbox runs an agent too old to check out the commit the review " +
+		"was asked about, so the review was not run on another tree. Rebuild the sandbox image so it carries a " +
+		"current agent, then request the review again.",
+	NotAssessedReviewCheckoutFailed: "The review's sandbox did not check out the commit the review was asked about, " +
+		"so the review was not run on another tree. The session names what the sandbox reported; requesting the " +
+		"review again checks the commit out anew.",
 }
 
 // ComputeOutputWithReason is ComputeOutput, with a not-assessed check's
