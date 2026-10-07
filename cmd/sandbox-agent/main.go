@@ -1219,6 +1219,22 @@ func spawnOpenCode(ctx context.Context, sup *supervisor.Supervisor, workDir stri
 	return opencodeproc.Spawn(ctx, sup, workDir, providerCredentialEnv, runtimeEnv, runtimeCredential, readinessTimeout, pollInterval)
 }
 
+// newAgentRuntime builds the adapter to the agent runtime spawnOpenCode
+// started, from that spawn's result. result.Version and
+// cfg.SessionConfig.SandboxId (§7.3) are the SAME two adapter-side facts
+// the post-spawn boot fingerprint sources its "opencode_version" from --
+// threaded into the adapter so a provider-failure diagnostic can name them
+// without a second lookup, and so a snapshot reports the version as what
+// it holds (snapshotProvenance, technical plan §35.5b). cfg.SessionConfig
+// must be present, as it is whenever run() spawns the runtime.
+func newAgentRuntime(result opencodeproc.Result, cfg boot.Config, timeouts platform.Timeouts) *opencode.Adapter {
+	return opencode.New(result.BaseURL, timeouts.SSEInactivityTimeout,
+		timeouts.OpenCodeSSEReconnectInterval, timeouts.OpenCodeRequestTimeout,
+		timeouts.OpenCodeSummarizeTimeout, timeouts.OpenCodeTransientRetryBackoff,
+		result.Version, cfg.SessionConfig.SandboxId,
+		cfg.SessionConfig.CapabilityRestricted)
+}
+
 // newSessionCommands builds a live session's commandHandler and the
 // wsbridge.Bridge it answers on -- the two-phase construction
 // commandHandler's own doc comment describes, since each needs the other --
@@ -1786,16 +1802,7 @@ func run() error {
 			return fmt.Errorf("sandbox-agent: spawn opencode: %w", spawnErr)
 		}
 
-		// result.Version/cfg.SessionConfig.SandboxId (§7.3): the
-		// SAME two adapter-side facts the post-spawn boot fingerprint
-		// below sources its own "opencode_version" from -- threaded into
-		// the adapter itself so a provider-failure diagnostic can name
-		// them without a second lookup.
-		agentRuntime = opencode.New(result.BaseURL, timeouts.SSEInactivityTimeout,
-			timeouts.OpenCodeSSEReconnectInterval, timeouts.OpenCodeRequestTimeout,
-			timeouts.OpenCodeSummarizeTimeout, timeouts.OpenCodeTransientRetryBackoff,
-			result.Version, cfg.SessionConfig.SandboxId,
-			cfg.SessionConfig.CapabilityRestricted)
+		agentRuntime = newAgentRuntime(result, cfg, timeouts)
 		defer agentRuntime.Close()
 
 		// §7: "Pin the OpenCode version in the image; record it in the

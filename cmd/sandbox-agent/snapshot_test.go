@@ -38,6 +38,7 @@ import (
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
 	"github.com/narvidev/narvi/internal/sandboxagent/credentials"
 	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
+	"github.com/narvidev/narvi/internal/sandboxagent/opencodeproc"
 	"github.com/narvidev/narvi/internal/sandboxagent/wsbridge"
 )
 
@@ -403,19 +404,17 @@ func TestHandleSnapshot_PurgeFailure_AbortsWithoutMinting(t *testing.T) {
 	}
 }
 
-// newVersionedTestAdapter is an agent-runtime adapter built as run() builds
-// it, with runtimeVersion as the version its spawn discovered, against a
-// server that answers nothing: no turn runs here, so the adapter only ever
-// retries its event stream until the test closes it.
+// newVersionedTestAdapter is the agent-runtime adapter run() builds,
+// through newAgentRuntime, from a spawn whose discovered version was
+// runtimeVersion, against a server that answers nothing: no turn runs
+// here, so the adapter only ever retries its event stream until the test
+// closes it.
 func newVersionedTestAdapter(t *testing.T, runtimeVersion string) *opencode.Adapter {
 	t.Helper()
 	srv := httptest.NewServer(http.NotFoundHandler())
 	t.Cleanup(srv.Close)
-	timeouts := platform.DefaultTimeouts()
-	adapter := opencode.New(srv.URL, timeouts.SSEInactivityTimeout,
-		timeouts.OpenCodeSSEReconnectInterval, timeouts.OpenCodeRequestTimeout,
-		timeouts.OpenCodeSummarizeTimeout, timeouts.OpenCodeTransientRetryBackoff,
-		runtimeVersion, "sbx-provenance")
+	cfg := boot.Config{SessionConfig: &sessionconfig.SessionConfig{SandboxId: "sbx-provenance"}}
+	adapter := newAgentRuntime(opencodeproc.Result{BaseURL: srv.URL, Version: runtimeVersion}, cfg, platform.DefaultTimeouts())
 	t.Cleanup(adapter.Close)
 	return adapter
 }
@@ -449,8 +448,9 @@ func startSessionCommands(t *testing.T, fcp *fakeSnapshotCP, cfg boot.Config, lo
 // contracts version this binary was compiled with -- not
 // NARVI_AGENT_VERSION, set here to a value that must not appear -- and
 // runtimeVersion is the agent runtime's version as its spawn discovered
-// it, carried by the adapter run() builds the session's commands with
-// (newSessionCommands), absent when it was not discoverable.
+// it, carried from the spawn's result by the adapter run() builds
+// (newAgentRuntime) into the session's commands (newSessionCommands),
+// absent when it was not discoverable.
 func TestHandleSnapshot_ProvenanceIsWhatTheBinaryHolds(t *testing.T) {
 	tests := []struct {
 		name           string
