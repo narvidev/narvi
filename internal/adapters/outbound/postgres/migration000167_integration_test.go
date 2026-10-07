@@ -13,27 +13,40 @@ import (
 	"github.com/golang-migrate/migrate/v4"
 )
 
-// This file runs migration 000167 (review_turn_checkout) through
-// golang-migrate against real Postgres, in a database of its own migrated
-// to 166 first. The up adds what technical plan §21.1's review checkout
-// reads and writes: nine turn columns (the latest checkout request, its
-// bound, its sends and failures, the gen its failures retired and the
-// commit the turn was checked out at) and one sandbox column (the gen
-// whose latest ready advertised the capability); the down removes them.
+// This file runs migrations 000167 (review_turn_checkout) and 000168
+// (sandbox_review_checkout_gen) through golang-migrate against real
+// Postgres, in a database of its own migrated to 166 first. 000167 adds
+// what technical plan §21.1's review checkout reads and writes of a turn:
+// nine turn columns (the latest checkout request, its bound, its sends and
+// failures, the gen its failures retired and the commit the turn was
+// checked out at); 000168, in a transaction of its own, the sandbox's: the
+// gen whose latest ready advertised the capability. Their downs remove
+// them.
 //
-// It also pins what the migration's own "Rolling deploy" and "Rolling back"
+// It also pins what the migrations' own "Rolling deploy" and "Rolling back"
 // sections say of the previous binary: its whole-row turn and sandbox
 // statements -- the column lists below, copied verbatim from the sqlc
 // output it was built with -- run with the columns present and leave them
 // alone; its RecordSandboxReady (frameBoundRecordSandboxReady, unchanged
 // since 000157's release) counts a ready and leaves the capability this
-// release recorded for the same gen; it cannot boot on 167; and it can
+// release recorded for the same gen; it cannot boot on 168; and it can
 // once the recorded version is forced back to 166 with the columns kept,
-// after which this release's migration runs again and keeps their values.
+// after which this release's migrations run again and keep their values.
+// This release's own statements are read from the sqlc output
+// (generatedQuery), so they cannot drift from what the store sends.
+//
+// TestMigration000167_168_NeverDeadlockWithAnActorsTransaction runs both
+// against a transaction shaped like the session actor's -- the session row
+// locked, then sandboxes read, then turns -- and shows, as its control, that
+// one file altering turns then sandboxes deadlocks with it.
 
-// reviewCheckoutMigration is the migration's version: the plan tests that
-// run this release's whole-row turn statements migrate to it too.
-const reviewCheckoutMigration = 167
+// reviewCheckoutMigration is 000167's version, reviewCheckoutGenMigration
+// 000168's: the plan tests that run this release's whole-row statements
+// migrate to the latter.
+const (
+	reviewCheckoutMigration    = 167
+	reviewCheckoutGenMigration = reviewCheckoutMigration + 1
+)
 
 // The column lists the previous binary's sqlc output wrote out for every
 // SELECT * and RETURNING * on turns and on sandboxes.
@@ -42,34 +55,18 @@ const (
 	previous167SandboxColumns = "id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen"
 )
 
-// checkoutRecordSandboxReady is RecordSandboxReady as 000167's release
+// thisReleasesRecordReady is RecordSandboxReady as this release's store
 // sends it ($1 promptReceipt, $2 reviewCheckout, $3 maxFrameBytes, $4
-// session, $5 gen).
-const checkoutRecordSandboxReady = `UPDATE sandboxes
-SET ready_seq = ready_seq + 1,
-    prompt_receipt_gen = CASE WHEN $1::boolean THEN gen ELSE NULL END,
-    review_checkout_gen = CASE WHEN $2::boolean THEN gen ELSE NULL END,
-    agent_max_frame_bytes = $3::integer,
-    agent_max_frame_bytes_gen = CASE WHEN $3::integer IS NULL THEN NULL ELSE gen END,
-    updated_at = now()
-WHERE session_id = $4 AND gen = $5::integer`
+// session, $5 gen), and thisReleasesCheckoutRequest RecordTurnCheckoutRequest
+// ($1 gen, $2 afterFailure, $3 messageId, $4 readySeq, $5 turn), both read
+// from the sqlc output.
+func thisReleasesRecordReady(t *testing.T) string {
+	return generatedQuery(t, "sandboxes.sql.go", "recordSandboxReady")
+}
 
-// checkoutRequest167 is RecordTurnCheckoutRequest as 000167's release
-// sends it, returning nothing a later migration's columns would break.
-const checkoutRequest167 = `UPDATE turns
-SET checkout_requested_at = CASE WHEN checkout_gen IS NOT DISTINCT FROM $1::integer
-                                      AND checkout_requested_at IS NOT NULL
-                                 THEN checkout_requested_at ELSE now() END,
-    checkout_sends = CASE WHEN checkout_gen IS NOT DISTINCT FROM $1::integer
-                          THEN checkout_sends + 1 ELSE 1 END,
-    checkout_failures = CASE WHEN checkout_gen IS NOT DISTINCT FROM $1::integer
-                             THEN checkout_failures + CASE WHEN $2::boolean THEN 1 ELSE 0 END
-                             ELSE 0 END,
-    checkout_gen = $1::integer,
-    checkout_message_id = $3::text,
-    checkout_sent_at = now(),
-    checkout_sent_ready_seq = $4::integer
-WHERE id = $5 AND status IN ('pending', 'processing')`
+func thisReleasesCheckoutRequest(t *testing.T) string {
+	return generatedQuery(t, "turns.sql.go", "recordTurnCheckoutRequest")
+}
 
 // checkoutColumns167 is the part of a turn and its sandbox 000167 is about,
 // read by name.
@@ -142,7 +139,13 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 	m, mdb := newMigrate(t, connStr)
 	defer func() { _ = mdb.Close() }()
 	if err := m.Migrate(reviewCheckoutMigration); err != nil {
-		t.Fatalf("up: %v", err)
+		t.Fatalf("up to 000167: %v", err)
+	}
+	if got := columns(); len(got) != 9 || got["sandboxes.review_checkout_gen"] != "" {
+		t.Fatalf("columns at 000167 = %v, want the nine turn columns alone: 000168 adds the sandbox's", got)
+	}
+	if err := m.Migrate(reviewCheckoutGenMigration); err != nil {
+		t.Fatalf("up to 000168: %v", err)
 	}
 	want := map[string]string{
 		"turns.checkout_message_id":     "YES  text",
@@ -157,7 +160,7 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 		"sandboxes.review_checkout_gen": "YES  integer",
 	}
 	if got := columns(); len(got) != len(want) {
-		t.Fatalf("columns at 167 = %v, want %v", got, want)
+		t.Fatalf("columns at 000168 = %v, want %v", got, want)
 	} else {
 		for name, shape := range want {
 			if got[name] != shape {
@@ -175,10 +178,10 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 
 	// This release: a ready of gen 1 that can check out, and the turn's
 	// first request on it.
-	if _, err := db.ExecContext(ctx, checkoutRecordSandboxReady, true, true, nil, sessionID, 1); err != nil {
+	if _, err := db.ExecContext(ctx, thisReleasesRecordReady(t), true, true, nil, sessionID, 1); err != nil {
 		t.Fatalf("this release records a ready: %v", err)
 	}
-	if _, err := db.ExecContext(ctx, checkoutRequest167, 1, false, "first", 1, turnID); err != nil {
+	if _, err := db.ExecContext(ctx, thisReleasesCheckoutRequest(t), 1, false, "first", 1, turnID); err != nil {
 		t.Fatalf("this release records a checkout request: %v", err)
 	}
 	if c := readCheckoutColumns167(ctx, t, db, sessionID, turnID); c.messageID == nil || *c.messageID != "first" || c.sends == nil || *c.sends != 1 ||
@@ -195,7 +198,7 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 	previousRow(ctx, t, db, turnColumns, `UPDATE turns SET status = 'pending' WHERE id = $1 RETURNING `+previous167TurnColumns, turnID)
 	previousRow(ctx, t, db, sandboxColumns, `SELECT `+previous167SandboxColumns+` FROM sandboxes WHERE session_id = $1`, sessionID)
 	if _, err := db.ExecContext(ctx, frameBoundRecordSandboxReady, false, nil, sessionID, 1); err != nil {
-		t.Fatalf("the previous binary records a ready at 167: %v", err)
+		t.Fatalf("the previous binary records a ready at 168: %v", err)
 	}
 	if c := readCheckoutColumns167(ctx, t, db, sessionID, turnID); c.readySeq != 2 || !equalInt32Ptr(c.reviewCheckoutGen, ptrInt32(1)) ||
 		c.messageID == nil || *c.messageID != "first" {
@@ -206,17 +209,17 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 		t.Fatalf("after the previous binary's respawn: %+v, want gen 2 and the capability left at gen 1 (stale, not matching)", c)
 	}
 
-	// It cannot boot on 167: golang-migrate refuses a version it has no
+	// It cannot boot on 168: golang-migrate refuses a version it has no
 	// file for.
 	previous, pdb := previousBinaryMigrate(t, connStr, reviewCheckoutMigration-1)
-	if err := previous.Up(); err == nil || !strings.Contains(err.Error(), strconv.Itoa(reviewCheckoutMigration)) {
-		t.Fatalf("the previous binary's boot on %d = %v, want a refusal naming it", reviewCheckoutMigration, err)
+	if err := previous.Up(); err == nil || !strings.Contains(err.Error(), strconv.Itoa(reviewCheckoutGenMigration)) {
+		t.Fatalf("the previous binary's boot on %d = %v, want a refusal naming it", reviewCheckoutGenMigration, err)
 	}
 	_ = pdb.Close()
 
 	// Rolling back with the columns kept: force 166, and the previous
 	// binary boots and works. Deploying this release again runs 000167
-	// again, which keeps the columns and their values.
+	// and 000168 again, which keep the columns and their values.
 	if err := m.Force(reviewCheckoutMigration - 1); err != nil {
 		t.Fatalf("force the previous version: %v", err)
 	}
@@ -229,19 +232,19 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 	// Pinned to this migration, like every migration test here: Up would also apply
 	// whatever later migrations exist by the time this runs.
 	again, adb := newMigrate(t, connStr)
-	if err := again.Migrate(reviewCheckoutMigration); err != nil {
-		t.Fatalf("this release's migration after the rollback = %v, want it applied again", err)
+	if err := again.Migrate(reviewCheckoutGenMigration); err != nil {
+		t.Fatalf("this release's migrations after the rollback = %v, want them applied again", err)
 	}
 	_ = adb.Close()
-	assertCleanVersion(t, connStr, reviewCheckoutMigration)
+	assertCleanVersion(t, connStr, reviewCheckoutGenMigration)
 	if c := readCheckoutColumns167(ctx, t, db, sessionID, turnID); c.messageID == nil || *c.messageID != "first" || !equalInt32Ptr(c.reviewCheckoutGen, ptrInt32(1)) {
-		t.Fatalf("after 000167 ran again: %+v, want the request and the capability kept", c)
+		t.Fatalf("after 000167 and 000168 ran again: %+v, want the request and the capability kept", c)
 	}
 
-	// Down: the columns go, every row stays. Run twice -- the second time
-	// on a database a rollback already brought back to 166 with the
-	// columns dropped, forced to 167 again -- which the IF EXISTS guard
-	// allows. Up again works on that state.
+	// Down: 000168's, then 000167's; the columns go, every row stays. Run
+	// twice -- the second time on a database a rollback already brought
+	// back to 166 with the columns dropped, forced to 168 again -- which the
+	// IF EXISTS guards allow. Up again works on that state.
 	count := func(table string) int {
 		t.Helper()
 		var n int
@@ -262,16 +265,16 @@ func TestMigration000167_UpAndDown(t *testing.T) {
 	}
 	previousRow(ctx, t, db, turnColumns, `SELECT `+previous167TurnColumns+` FROM turns WHERE id = $1`, turnID)
 	previousRow(ctx, t, db, sandboxColumns, `SELECT `+previous167SandboxColumns+` FROM sandboxes WHERE session_id = $1`, sessionID)
-	if err := m.Force(reviewCheckoutMigration); err != nil {
+	if err := m.Force(reviewCheckoutGenMigration); err != nil {
 		t.Fatalf("force this version: %v", err)
 	}
 	if err := m.Migrate(reviewCheckoutMigration - 1); err != nil {
 		t.Fatalf("down again, the columns already gone: %v", err)
 	}
-	if err := m.Migrate(reviewCheckoutMigration); err != nil {
+	if err := m.Migrate(reviewCheckoutGenMigration); err != nil {
 		t.Fatalf("up again: %v", err)
 	}
-	assertCleanVersion(t, connStr, reviewCheckoutMigration)
+	assertCleanVersion(t, connStr, reviewCheckoutGenMigration)
 	if got := columns(); len(got) != len(want) {
 		t.Fatalf("columns after up again = %v, want %v", got, want)
 	}

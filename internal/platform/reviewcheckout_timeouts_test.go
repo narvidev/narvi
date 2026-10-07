@@ -86,8 +86,9 @@ func TestReviewCheckoutFailedRetireBackoff(t *testing.T) {
 //     again on the reconnect inside the bound;
 //   - above the lag window, which stays above the re-fetch interval, so a
 //     lagging ref is fetched again at least once;
-//   - above the waits before a gen whose checkouts fail at once is
-//     retired;
+//   - above the lag window plus the waits between a gen's first failed
+//     reply and the one that retires it, so a gen whose checkouts fail
+//     once its ref has caught up is retired before the bound;
 //   - below TurnDeadline.
 func TestValidate_ReviewCheckout(t *testing.T) {
 	t.Parallel()
@@ -103,7 +104,7 @@ func TestValidate_ReviewCheckout(t *testing.T) {
 		ceilingChain  = "ReviewCheckoutTimeout > ReviewCheckoutAttemptCeiling + ReviewCheckoutRefetchInterval"
 		takeoverChain = "ReviewCheckoutTimeout > ActorLockServerReapTime + SandboxWSReconnectMaxBackoff + ActorHydrateTimeout"
 		lagChain      = "ReviewCheckoutTimeout > ReviewCheckoutRefLagWindow"
-		retireChain   = "ReviewCheckoutTimeout > ReviewCheckoutFailedRetireBackoff"
+		retireChain   = "ReviewCheckoutTimeout > ReviewCheckoutRefLagWindow + ReviewCheckoutFailedRetireBackoff"
 		refetchChain  = "ReviewCheckoutRefLagWindow > ReviewCheckoutRefetchInterval"
 		deadlineChain = "TurnDeadline > ReviewCheckoutTimeout"
 	)
@@ -152,12 +153,20 @@ func TestValidate_ReviewCheckout(t *testing.T) {
 		{name: "retire waits past the timeout", edit: func(to *platform.Timeouts) {
 			to.ReviewCheckoutFailuresBeforeRetire = 8 // 10s * (2^7 - 1) = 21m10s
 		}, chain: retireChain, broken: true},
-		{name: "retire waits within the margin below the timeout", edit: func(to *platform.Timeouts) {
-			to.ReviewCheckoutTimeout = to.ReviewCheckoutFailedRetireBackoff() + margin - time.Second
+		{name: "retire waits after the lag window within the margin below the timeout", edit: func(to *platform.Timeouts) {
+			to.ReviewCheckoutTimeout = to.ReviewCheckoutRefLagWindow + to.ReviewCheckoutFailedRetireBackoff() + margin - time.Second
 		}, chain: retireChain, broken: true},
-		{name: "retire waits exactly the margin below the timeout", edit: func(to *platform.Timeouts) {
-			to.ReviewCheckoutTimeout = to.ReviewCheckoutFailedRetireBackoff() + margin
+		{name: "retire waits after the lag window exactly the margin below the timeout", edit: func(to *platform.Timeouts) {
+			to.ReviewCheckoutTimeout = to.ReviewCheckoutRefLagWindow + to.ReviewCheckoutFailedRetireBackoff() + margin
 		}, chain: retireChain},
+		{name: "a lag window that leaves no room for the retire waits", edit: func(to *platform.Timeouts) {
+			// Still the margin below the timeout on its own: only the sum breaks.
+			to.ReviewCheckoutRefLagWindow = to.ReviewCheckoutTimeout - to.ReviewCheckoutFailedRetireBackoff() - margin + time.Second
+		}, chain: retireChain, broken: true},
+		{name: "a lag window so long the sum would overflow", edit: func(to *platform.Timeouts) {
+			to.ReviewCheckoutRefLagWindow = time.Duration(1<<63 - 1)
+			to.ReviewCheckoutFailuresBeforeRetire = 200
+		}, chain: retireChain, broken: true},
 
 		{name: "re-fetch interval within the margin below the lag window", edit: func(to *platform.Timeouts) {
 			to.ReviewCheckoutRefetchInterval = to.ReviewCheckoutRefLagWindow - margin + time.Second

@@ -36,7 +36,7 @@ const contextWriteMaxBuffers = holdWakeMaxBuffers
 // to seven buffers more on these tables -- UpdateTurnStatus measured 15 to
 // 18 buffers at 165 and 22 to 25 at 166 -- so the bound is
 // contextWriteMaxBuffers plus that. The test migrates to the latest
-// migration whose turn columns its statements name, which carries 000166.
+// migration whose columns its statements name, which comes after 000166.
 const contextTurnWriteMaxBuffers = contextWriteMaxBuffers + 8
 
 // contextWriteLimit is the bound m, one of the context check's writes, is

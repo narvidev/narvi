@@ -59,6 +59,12 @@ type CheckoutReply struct {
 type CheckoutFacts struct {
 	// WantSHA is the head the turn recorded: the commit to check out.
 	WantSHA string
+	// AwaitingReady is true when the live gen has sent no ready yet: the
+	// sandbox went suspect while it was still spawning or connecting -- a
+	// restore or a respawn slow to connect, or one a provider failed. Its
+	// capability is unknown, not absent, so nothing is decided about it
+	// until it connects or is replaced.
+	AwaitingReady bool
 	// GenCapable is true when the live gen's latest ready advertised
 	// capabilities.reviewCheckout (sandboxes.review_checkout_gen = gen).
 	GenCapable bool
@@ -81,8 +87,8 @@ type CheckoutFacts struct {
 	// gen was asked for; SinceSend how long ago the latest was sent. Both
 	// on the database's clock.
 	SinceRequest, SinceSend time.Duration
-	// Sends is how many commands were sent on the live gen, Failures how
-	// many of the replies before the latest said failed.
+	// Sends is how many commands were sent on the live gen, of any kind.
+	// Failures is how many of the replies before the latest said failed.
 	Sends, Failures int
 	// RetiredAGen is true when this turn's failed checkouts already
 	// retired a gen (turns.checkout_retired_gen): it retires no other.
@@ -213,6 +219,9 @@ type CheckoutVerdict struct {
 // DecideReviewCheckout decides what to do about a review turn's checkout
 // (technical plan §21.1's table, in order):
 //
+//   - a gen that has sent no ready yet is waited for: whether it can check
+//     out is not known until it connects, and a slow restore is no old
+//     agent;
 //   - a gen that cannot check out is retired, its snapshot cleared, when
 //     the sandbox has a snapshot -- its restore may have brought back an
 //     older agent, and a fresh gen boots a current one -- and otherwise
@@ -221,19 +230,31 @@ type CheckoutVerdict struct {
 //   - no reply: past the bound, refuse; after a reconnect, send again,
 //     since the command may have been lost with its socket; otherwise wait
 //     for the bound;
-//   - checked_out at WantSHA: proceed, unless the ref's tip moved past it
-//     and the turn is a pending attempt a lane asks for again, which ends
-//     context_moved; any other turn runs on WantSHA, the head it recorded;
+//   - checked_out at WantSHA: proceed, unless the ref's tip is not
+//     WantSHA and the turn is a pending attempt a lane asks for again.
+//     Then, within the lag window, the ref may still lag a push whose head
+//     is already in the clone -- a fresh boot clones every branch -- so it
+//     is fetched again every RefetchInterval, as for sha_absent; past the
+//     window the head moved, and the attempt ends context_moved. Any other
+//     turn runs on WantSHA, the head it recorded, at once;
 //   - sha_absent within the lag window: fetch again every
 //     RefetchInterval; past it, the head is gone, which ends an attempt a
 //     lane asks for again context_moved and refuses any other turn;
 //   - fetch_failed, busy, failed -- and a checked_out at another head, or
 //     an outcome the decision does not know, read as failed: the
-//     FailuresBeforeRetire'th failed reply retires the gen, once per turn;
-//     past the bound, refuse with the error; otherwise send again once
-//     RefetchInterval, doubled for each send made, has passed since the
-//     latest.
+//     FailuresBeforeRetire'th failed reply on the gen retires it, once per
+//     turn; at the bound, a gen that answered failed at least once is
+//     retired the same way rather than the turn refused, and any other
+//     error refuses the turn, naming it; otherwise send again once the
+//     wait has passed since the latest send: RefetchInterval doubled once
+//     per earlier failed reply after a failed one, so a failing worktree
+//     is retired FailedRetireBackoff after its first failure whatever came
+//     before, and doubled once per earlier send after busy or
+//     fetch_failed.
 func DecideReviewCheckout(f CheckoutFacts, b CheckoutBounds) CheckoutVerdict {
+	if f.AwaitingReady {
+		return CheckoutVerdict{Action: CheckoutWait, NextLook: b.RefetchInterval}
+	}
 	if !f.GenCapable {
 		if f.HasSnapshot {
 			return CheckoutVerdict{Action: CheckoutRetireGen, Retirement: CheckoutRetiredOldAgent}
@@ -268,19 +289,17 @@ func DecideReviewCheckout(f CheckoutFacts, b CheckoutBounds) CheckoutVerdict {
 
 	switch v.Outcome {
 	case CheckoutCheckedOut:
-		if v.RefSHA != "" && v.RefSHA != f.WantSHA && f.MovedEndsTurn {
-			v.Action = CheckoutEndMoved
+		if v.RefSHA == "" || v.RefSHA == f.WantSHA || !f.MovedEndsTurn {
+			v.Action = CheckoutProceed
 			return v
 		}
-		v.Action = CheckoutProceed
+		if refetchLaggingRef(&v, f, b, remaining) {
+			return v
+		}
+		v.Action = CheckoutEndMoved
 		return v
 	case CheckoutSHAAbsent:
-		if f.SinceRequest < b.RefLagWindow && remaining > 0 {
-			if f.SinceSend >= b.RefetchInterval {
-				v.Action, v.NextLook = CheckoutSend, remaining
-				return v
-			}
-			v.Action, v.NextLook = CheckoutWait, min(b.RefetchInterval-f.SinceSend, remaining)
+		if refetchLaggingRef(&v, f, b, remaining) {
 			return v
 		}
 		if f.MovedEndsTurn {
@@ -292,15 +311,27 @@ func DecideReviewCheckout(f CheckoutFacts, b CheckoutBounds) CheckoutVerdict {
 	}
 
 	failed := v.Outcome == CheckoutFailed
-	if failed && !f.RetiredAGen && f.Failures+1 >= b.FailuresBeforeRetire {
+	failures := f.Failures
+	if failed {
+		failures++
+	}
+	if failed && !f.RetiredAGen && failures >= b.FailuresBeforeRetire {
 		v.Action, v.Retirement = CheckoutRetireGen, CheckoutRetiredFailing
 		return v
 	}
 	if remaining <= 0 {
+		if failures > 0 && !f.RetiredAGen {
+			v.Action, v.Retirement = CheckoutRetireGen, CheckoutRetiredFailing
+			return v
+		}
 		v.Action, v.Refusal = CheckoutRefuse, CheckoutRefusedError
 		return v
 	}
-	if backoff := checkoutBackoff(b.RefetchInterval, f.Sends); f.SinceSend < backoff {
+	backoff := checkoutBackoff(b.RefetchInterval, f.Sends)
+	if failed {
+		backoff = checkoutBackoff(b.RefetchInterval, failures)
+	}
+	if f.SinceSend < backoff {
 		v.Action, v.NextLook = CheckoutWait, min(backoff-f.SinceSend, remaining)
 		return v
 	}
@@ -308,12 +339,29 @@ func DecideReviewCheckout(f CheckoutFacts, b CheckoutBounds) CheckoutVerdict {
 	return v
 }
 
-// checkoutBackoff is how long after the latest of sends commands the next
-// is sent when a reply failed: interval, doubled for each send after the
-// first -- saturating, never overflowing.
-func checkoutBackoff(interval time.Duration, sends int) time.Duration {
+// refetchLaggingRef sets v to fetch the ref again, or to wait for that,
+// while the ref may still lag the push that made WantSHA: within the lag
+// window and the bound, a send once RefetchInterval has passed since the
+// latest, a wait until then. It reports whether it did; past the window
+// it leaves v alone.
+func refetchLaggingRef(v *CheckoutVerdict, f CheckoutFacts, b CheckoutBounds, remaining time.Duration) bool {
+	if f.SinceRequest >= b.RefLagWindow || remaining <= 0 {
+		return false
+	}
+	if f.SinceSend >= b.RefetchInterval {
+		v.Action, v.NextLook = CheckoutSend, remaining
+		return true
+	}
+	v.Action, v.NextLook = CheckoutWait, min(b.RefetchInterval-f.SinceSend, remaining)
+	return true
+}
+
+// checkoutBackoff is the wait before the next send after the nth reply
+// that called for one: interval, doubled n-1 times -- saturating, never
+// overflowing.
+func checkoutBackoff(interval time.Duration, n int) time.Duration {
 	backoff := interval
-	for i := 1; i < sends; i++ {
+	for i := 1; i < n; i++ {
 		if backoff > maxCheckoutBackoff/2 {
 			return maxCheckoutBackoff
 		}

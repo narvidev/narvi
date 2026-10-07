@@ -216,6 +216,17 @@ func backdateCheckout(ctx context.Context, t *testing.T, pool *pgxpool.Pool, id 
 	}
 }
 
+// shiftCheckout moves the turn's checkout bound and latest send d into the
+// past together, as if d had passed since each: a send made since the bound
+// started shows in the gap between them.
+func shiftCheckout(ctx context.Context, t *testing.T, pool *pgxpool.Pool, id pgtype.UUID, d time.Duration) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `UPDATE turns SET checkout_requested_at = checkout_requested_at - make_interval(secs => $2::double precision),
+		checkout_sent_at = checkout_sent_at - make_interval(secs => $2::double precision) WHERE id = $1`, id, d.Seconds()); err != nil {
+		t.Fatalf("shift the checkout: %v", err)
+	}
+}
+
 func reviewCheckoutCount(ctx context.Context, t *testing.T, outcome string) int64 {
 	t.Helper()
 	return readCounterSumByAttr(ctx, t, otelReader, "review_checkout_total", "outcome", outcome)
@@ -345,10 +356,11 @@ func TestReviewCheckout_TheWaitReArmsTheDispatchTimerAhead(t *testing.T) {
 
 // TestReviewCheckout_AnAttemptWhoseHeadMovedEndsContextMoved is exit 4 for
 // every lane that asks for a review attempt again: the sandbox holds the
-// recorded head, but the pull request's ref has moved past it, so the
-// attempt ends context_moved without running -- technical plan §24.9's
-// end -- and its request is asked again for the head the pull request has
-// now: the automatic lane's pending head, or a person's request owed.
+// recorded head, but the pull request's ref is elsewhere, and still is past
+// the lag window, so the attempt ends context_moved without running --
+// technical plan §24.9's end -- and its request is asked again for the head
+// the pull request has now: the automatic lane's pending head, or a
+// person's request owed.
 func TestReviewCheckout_AnAttemptWhoseHeadMovedEndsContextMoved(t *testing.T) {
 	for i, trigger := range []string{turn.RequestTriggerAuto, turn.RequestTriggerLabel, turn.RequestTriggerButton} {
 		t.Run(trigger, func(t *testing.T) {
@@ -362,6 +374,13 @@ func TestReviewCheckout_AnAttemptWhoseHeadMovedEndsContextMoved(t *testing.T) {
 			deliver(ctx, t, rig.actor, checkoutReady(1, true))
 			cmd := lastCheckout(t, rig.commander, 1)
 			deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "checked_out", strp(coHead), strp(coMoved), nil))
+			// Inside the lag window the ref may still lag a head the clone
+			// already holds: the attempt waits for a re-fetch.
+			if got := getTurn(ctx, t, f, attempt.ID); got.Status != sqlcgen.TurnStatusPending || got.EndReason != nil {
+				t.Fatalf("attempt inside the lag window: %s, end reason %v; want pending, waiting for a re-fetch", got.Status, got.EndReason)
+			}
+			backdateCheckout(ctx, t, pool, attempt.ID, platform.DefaultTimeouts().ReviewCheckoutRefLagWindow+time.Second, time.Second)
+			settle(ctx, t, rig.actor)
 
 			assertContextMoved(ctx, t, f, rig, attempt)
 			if n := len(sentPromptsOf(t, rig.commander)); n != 0 {
@@ -743,8 +762,9 @@ func TestReviewCheckout_ASilentSandboxIsRefusedAtTheBound(t *testing.T) {
 
 // TestReviewCheckout_AFetchFailureIsRetriedThenRefused: a ref that cannot
 // be fetched is tried again, the spacing doubling with each send, and at
-// the bound the turn is refused naming the agent's error and the remedy:
-// the App, with read access, on the base repository. A fetch failure never
+// the bound the turn is refused naming the agent's error and, since the
+// error says the code host refused the read, the remedy: the App, with
+// read access, on the base repository, named. A fetch failure never
 // retires the gen.
 func TestReviewCheckout_AFetchFailureIsRetriedThenRefused(t *testing.T) {
 	ctx := context.Background()
@@ -784,7 +804,7 @@ func TestReviewCheckout_AFetchFailureIsRetriedThenRefused(t *testing.T) {
 	if got := getTurn(ctx, t, f, reviewTurn.ID); got.Status != sqlcgen.TurnStatusFailed {
 		t.Fatalf("at the bound: %s, want refused", got.Status)
 	}
-	if n := countRows(ctx, t, pool, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'warning' AND payload::text LIKE '%Authentication failed%' AND payload::text LIKE '%install the App on that repository, with read access%'`, f.sessionID); n != 1 {
+	if n := countRows(ctx, t, pool, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'warning' AND payload::text LIKE '%Authentication failed%' AND payload::text LIKE '%install the App on acme/co-fetch, with read access%'`, f.sessionID); n != 1 {
 		t.Fatalf("%d warnings naming the error and the remedy, want 1", n)
 	}
 	if rig.provider.callCount() != 0 {
@@ -1094,6 +1114,33 @@ func (c *getOpenPRCounter) count() int {
 	return c.reads
 }
 
+// newCountingContextRig is newContextRig with reader, any ReviewLiveReader,
+// as the context check's live reader, handed to the registry before the
+// actor is hosted.
+func newCountingContextRig(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, reader ReviewLiveReader) *holdRig {
+	t.Helper()
+	rig := &holdRig{
+		commander: &fakeSendCommander{},
+		provider:  &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "provider-counting"}},
+		fetcher:   &fakeReviewDiffFetcher{nextHeadSHA: coHead, nextBaseRef: "main", nextDiff: oneLineReadableDiff},
+	}
+	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, rig.commander, rig.provider, "http://localhost:8080", nil, nil, "", nil, false, RegistryOptions{
+		ReviewDiffFetcher: rig.fetcher, GitHubBotHandle: "narvi-bot",
+		GitHubOutbound:       platform.MustNewGitHubOutboundConfig("test-token"),
+		ReviewSizeExclusions: domainreviewtriage.DefaultSizeExclusions(),
+		ReviewLiveReader:     reader,
+	})
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	t.Cleanup(func() { _ = r.Shutdown() })
+	rig.registry = r
+	if rig.actor, err = r.GetOrSpawn(ctx, sessionID); err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	return rig
+}
+
 // TestReviewCheckout_OneCodeHostReadPerDispatch: a queued automatic attempt
 // passes its checkout first, and technical plan §24.9's context check
 // reads the code host once, in the evaluation that sends the prompt -- the
@@ -1110,25 +1157,7 @@ func TestReviewCheckout_OneCodeHostReadPerDispatch(t *testing.T) {
 	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET review_checkout_gen = gen WHERE session_id = $1`, f.sessionID); err != nil {
 		t.Fatal(err)
 	}
-	rig := &holdRig{
-		commander: &fakeSendCommander{},
-		provider:  &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "provider-one-read"}},
-		fetcher:   &fakeReviewDiffFetcher{nextHeadSHA: coHead, nextBaseRef: "main", nextDiff: oneLineReadableDiff},
-	}
-	r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, rig.commander, rig.provider, "http://localhost:8080", nil, nil, "", nil, false, RegistryOptions{
-		ReviewDiffFetcher: rig.fetcher, GitHubBotHandle: "narvi-bot",
-		GitHubOutbound:       platform.MustNewGitHubOutboundConfig("test-token"),
-		ReviewSizeExclusions: domainreviewtriage.DefaultSizeExclusions(),
-		ReviewLiveReader:     counter,
-	})
-	if err != nil {
-		t.Fatalf("NewRegistry: %v", err)
-	}
-	t.Cleanup(func() { _ = r.Shutdown() })
-	rig.registry = r
-	if rig.actor, err = r.GetOrSpawn(ctx, f.sessionID); err != nil {
-		t.Fatalf("GetOrSpawn: %v", err)
-	}
+	rig := newCountingContextRig(ctx, t, pool, f.sessionID, counter)
 
 	endRunningTurn(ctx, t, f, rig)
 	barrier(ctx, t, rig.actor)
@@ -1143,5 +1172,247 @@ func TestReviewCheckout_OneCodeHostReadPerDispatch(t *testing.T) {
 	}
 	if counter.count() != 1 {
 		t.Fatalf("GetOpenPR read %d times for one dispatch, want 1", counter.count())
+	}
+}
+
+// TestReviewCheckout_TheBoundRunsFromTheFirstRequestOnTheGen: the lag window
+// and the bound run from the turn's first checkout on the gen, whatever is
+// sent after it. A head that never appears in the ref is fetched again
+// every interval, each re-fetch a new command, and as time passes -- the
+// bound and the latest send moved back together, so only the sends since
+// the first can restart the bound -- the attempt ends once the window has
+// run, rather than re-fetching for ever.
+func TestReviewCheckout_TheBoundRunsFromTheFirstRequestOnTheGen(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := checkoutFixture(ctx, t, pool, "acme/co-bound", 880)
+	attempt := seedReviewTurn(ctx, t, f, coHead, triggerOf(turn.RequestTriggerAuto), true)
+	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
+	timeouts := platform.DefaultTimeouts()
+
+	// Each step: the latest command's reply, then one interval and a
+	// second pass, and the evaluation that follows.
+	step := timeouts.ReviewCheckoutRefetchInterval + time.Second
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
+	for sends := 1; ; sends++ {
+		cmd := lastCheckout(t, rig.commander, sends)
+		deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "sha_absent", nil, strp(coMoved), nil))
+		if got := getTurn(ctx, t, f, attempt.ID); got.Status != sqlcgen.TurnStatusPending {
+			t.Fatalf("attempt ended on the reply to send %d, %s after the first request, inside the lag window", sends, time.Duration(sends-1)*step)
+		}
+		shiftCheckout(ctx, t, pool, attempt.ID, step)
+		settle(ctx, t, rig.actor)
+		elapsed := time.Duration(sends) * step
+		if got := getTurn(ctx, t, f, attempt.ID); got.Status != sqlcgen.TurnStatusPending {
+			if elapsed < timeouts.ReviewCheckoutRefLagWindow {
+				t.Fatalf("attempt ended %s after the first request, before the lag window ran", elapsed)
+			}
+			if sends < 2 {
+				t.Fatalf("attempt ended after %d send, want re-fetches first", sends)
+			}
+			assertContextMoved(ctx, t, f, rig, attempt)
+			return
+		}
+		if elapsed > 2*timeouts.ReviewCheckoutRefLagWindow {
+			t.Fatalf("still pending after %d sends, %s after the first request: the bound restarted on a send", sends, elapsed)
+		}
+	}
+}
+
+// TestReviewCheckout_ARefLaggingBehindAHeadTheCloneHoldsIsFetchedAgain: a
+// fresh boot clones every branch, so a same-repository pull request's new
+// head is in the clone before the pull request's ref shows it, and the
+// checkout answers checked_out at the head with the ref still at the old
+// tip. Inside the lag window that is a lag, not a move: the attempt is
+// fetched again, never ended context_moved nor its lane pointed at the
+// older tip, and runs once the ref shows its head.
+func TestReviewCheckout_ARefLaggingBehindAHeadTheCloneHoldsIsFetchedAgain(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := checkoutFixture(ctx, t, pool, "acme/co-lag-behind", 890)
+	attempt := seedReviewTurn(ctx, t, f, coHead, triggerOf(turn.RequestTriggerAuto), true)
+	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
+	const olderTip = "c0ffee0000000000000000000000000000000000"
+
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
+	first := lastCheckout(t, rig.commander, 1)
+	deliver(ctx, t, rig.actor, checkoutReply(t, first, 1, "checked_out", strp(coHead), strp(olderTip), nil))
+	if got := getTurn(ctx, t, f, attempt.ID); got.Status != sqlcgen.TurnStatusPending || got.EndReason != nil {
+		t.Fatalf("attempt after a ref behind its head: %s, end reason %v; want pending", got.Status, got.EndReason)
+	}
+
+	backdateCheckout(ctx, t, pool, attempt.ID, 11*time.Second, platform.DefaultTimeouts().ReviewCheckoutRefetchInterval)
+	settle(ctx, t, rig.actor)
+	second := lastCheckout(t, rig.commander, 2)
+	deliver(ctx, t, rig.actor, checkoutReply(t, second, 1, "checked_out", strp(coHead), strp(coHead), nil))
+
+	got := getTurn(ctx, t, f, attempt.ID)
+	if got.Status != sqlcgen.TurnStatusProcessing || got.EndReason != nil || got.CheckedOutSha == nil || *got.CheckedOutSha != coHead {
+		t.Fatalf("attempt once the ref shows its head: %s, end reason %v, checked out %v; want processing at %s", got.Status, got.EndReason, got.CheckedOutSha, coHead)
+	}
+	if row := f.prSession(ctx, t); row.PendingRetriggerHeadSha != nil || row.AutoRetriggerContextMoves != 0 {
+		t.Fatalf("pending head %v, moves %d; want none: a lag is no move, and the lane is not pointed at the older tip", row.PendingRetriggerHeadSha, row.AutoRetriggerContextMoves)
+	}
+}
+
+// TestReviewCheckout_AMovedHeadSpendsNoCodeHostRead: a queued attempt whose
+// checkout says the ref is elsewhere is waited on, and then ended by the
+// checkout, never by the context check: §24.9's pre-read, deciding with the
+// checkout's own rules, reads nothing of the code host for it.
+func TestReviewCheckout_AMovedHeadSpendsNoCodeHostRead(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	f := checkoutFixture(ctx, t, pool, "acme/co-moved-no-read", 895)
+	seedRunningTurn(ctx, t, f)
+	attempt := seedAttemptOf(ctx, t, f, autoTrigger(), recordedContext(t, defaultRecordedContext()), coHead, 10)
+	reader := unmovedLiveReader(f.repoFullName, f.prNumber)
+	reader.pr.HeadSHA = coMoved
+	counter := &getOpenPRCounter{fakeReviewLiveReader: reader}
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET review_checkout_gen = gen WHERE session_id = $1`, f.sessionID); err != nil {
+		t.Fatal(err)
+	}
+	rig := newCountingContextRig(ctx, t, pool, f.sessionID, counter)
+
+	endRunningTurn(ctx, t, f, rig)
+	barrier(ctx, t, rig.actor)
+	cmd := lastCheckout(t, rig.commander, 1)
+	deliver(ctx, t, rig.actor, checkoutReply(t, cmd, 1, "checked_out", strp(coHead), strp(coMoved), nil))
+	backdateCheckout(ctx, t, pool, attempt.ID, platform.DefaultTimeouts().ReviewCheckoutRefLagWindow+time.Second, time.Second)
+	settle(ctx, t, rig.actor)
+
+	assertContextMoved(ctx, t, f, rig, attempt)
+	if n := counter.count(); n != 0 {
+		t.Fatalf("GetOpenPR read %d times for an attempt the checkout ended, want none", n)
+	}
+}
+
+// slowRestoreFixture is a review session whose gen 1 advertised the
+// checkout, then stopped -- with a snapshot when snapshot is set -- and a
+// review turn whose dispatch has started gen 2, a restore or a respawn,
+// still connecting when its connecting deadline found it silent: suspect,
+// pre_suspect connecting, its capability not known. processing makes the
+// turn one in flight on gen 1, re-sent to the new gen.
+func slowRestoreFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool, repo string, pr int32, snapshot, processing bool) (*holdFixture, *holdRig, sqlcgen.Turn) {
+	t.Helper()
+	f := checkoutFixture(ctx, t, pool, repo, pr)
+	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
+	deliver(ctx, t, rig.actor, checkoutReady(1, true))
+	snapshotID := any(nil)
+	if snapshot {
+		snapshotID = "snap-good"
+	}
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'stopped', snapshot_id = $2 WHERE session_id = $1`, f.sessionID, snapshotID); err != nil {
+		t.Fatal(err)
+	}
+	reviewTurn := seedReviewTurn(ctx, t, f, coHead, nil, true)
+	if processing {
+		gen1, message := int32(1), "msg-gen-1"
+		if _, err := f.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+			ID: reviewTurn.ID, Status: sqlcgen.TurnStatusProcessing,
+			DispatchedAt:         pgtype.Timestamptz{Time: time.Now(), Valid: true},
+			DispatchedSandboxGen: &gen1, DispatchedMessageID: &message,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	settle(ctx, t, rig.actor)
+	sb, err := narvipg.NewSandboxStore(pool).Get(ctx, f.sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.Gen != 2 || sb.Status != sqlcgen.SandboxStatusConnecting {
+		t.Fatalf("after the dispatch: gen %d %s, want gen 2 connecting", sb.Gen, sb.Status)
+	}
+	// Its connecting deadline finds it silent: a respawn's claim stamps
+	// last_seen_at, so the steady budget applies.
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET last_seen_at = now() - interval '241 seconds', created_at = now() - interval '2 hours' WHERE session_id = $1`, f.sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := rig.actor.Send(ctx, TimerFired{Name: TimerConnectingDeadline}); err != nil {
+		t.Fatal(err)
+	}
+	barrier(ctx, t, rig.actor)
+	if sb, err = narvipg.NewSandboxStore(pool).Get(ctx, f.sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if sb.Status != sqlcgen.SandboxStatusSuspect || sb.PreSuspectStatus == nil || *sb.PreSuspectStatus != sqlcgen.SandboxStatusConnecting ||
+		sb.ReviewCheckoutGen == nil || *sb.ReviewCheckoutGen != 1 {
+		t.Fatalf("after the connecting deadline: %s pre %v, review_checkout_gen %v; want suspect while connecting, still gen 1's", sb.Status, sb.PreSuspectStatus, sb.ReviewCheckoutGen)
+	}
+	return f, rig, reviewTurn
+}
+
+// TestReviewCheckout_AGenThatHasNotConnectedIsWaitedFor: a gen that has
+// sent no ready yet -- a restore or a respawn slow to connect, gone suspect
+// while connecting -- is no old agent: a dispatch evaluation in its grace
+// waits for it, never retiring it, clearing the session's snapshot or
+// refusing the turn with a request to rebuild the image. Once it connects
+// and advertises the checkout, its turn is checked out on it. Covered for a
+// slow restore, a slow respawn with no snapshot, and a turn re-sent to a
+// restoring gen.
+func TestReviewCheckout_AGenThatHasNotConnectedIsWaitedFor(t *testing.T) {
+	for i, tc := range []struct {
+		name                 string
+		snapshot, processing bool
+	}{
+		{name: "a slow restore, with a snapshot", snapshot: true},
+		{name: "a slow respawn, no snapshot"},
+		{name: "a turn re-sent to a restoring gen", snapshot: true, processing: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			f, rig, reviewTurn := slowRestoreFixture(ctx, t, pool, fmt.Sprintf("acme/co-slow-%d", i), int32(900+i), tc.snapshot, tc.processing)
+			spawnsBefore, restoresBefore := rig.provider.callCount(), rig.provider.restoreCallCount()
+			retiredBefore, unsupportedBefore := reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeRetiredOldAgent), reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeUnsupported)
+			// A person's follow-up, inserted in the grace, asks for an
+			// evaluation.
+			createTurnArmingDispatch(ctx, t, pool, f.sessionID, "a follow-up question")
+			settle(ctx, t, rig.actor)
+
+			sb, err := narvipg.NewSandboxStore(pool).Get(ctx, f.sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sb.Gen != 2 || sb.Status != sqlcgen.SandboxStatusSuspect {
+				t.Fatalf("sandbox: gen %d %s, want gen 2 still suspect: never retired", sb.Gen, sb.Status)
+			}
+			if tc.snapshot && (sb.SnapshotID == nil || *sb.SnapshotID != "snap-good") {
+				t.Fatalf("snapshot %v, want snap-good kept", sb.SnapshotID)
+			}
+			if rig.provider.callCount() != spawnsBefore || rig.provider.restoreCallCount() != restoresBefore {
+				t.Fatalf("spawns %d, restores %d after the evaluation; want no new one", rig.provider.callCount()-spawnsBefore, rig.provider.restoreCallCount()-restoresBefore)
+			}
+			got := getTurn(ctx, t, f, reviewTurn.ID)
+			wantStatus := sqlcgen.TurnStatusPending
+			if tc.processing {
+				wantStatus = sqlcgen.TurnStatusProcessing
+			}
+			if got.Status != wantStatus {
+				t.Fatalf("review turn: %s, want %s, waiting", got.Status, wantStatus)
+			}
+			if n := countRows(ctx, t, pool, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'warning' AND payload::text LIKE '%Rebuild the sandbox image%'`, f.sessionID); n != 0 {
+				t.Fatalf("%d warnings asking to rebuild the image, want none", n)
+			}
+			if n := len(sentPayloads(rig.commander)); n != 0 {
+				t.Fatalf("%d commands sent to a gen that has not connected, want none", n)
+			}
+			if reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeRetiredOldAgent) != retiredBefore || reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeUnsupported) != unsupportedBefore {
+				t.Fatal("review_checkout_total counted a retirement or a refusal for a gen that has not connected")
+			}
+			if lead, ok := dispatchTimerLead(ctx, t, pool, f.sessionID); !ok || lead <= 0 {
+				t.Fatalf("dispatch timer in %s (%v), want it ahead: the wait looks again", lead, ok)
+			}
+
+			// It connects, advertising the checkout: its turn is checked out
+			// on it.
+			if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', pre_suspect_status = NULL WHERE session_id = $1`, f.sessionID); err != nil {
+				t.Fatal(err)
+			}
+			deliver(ctx, t, rig.actor, checkoutReady(2, true))
+			if cmd := lastCheckout(t, rig.commander, 1); cmd.Gen != 2 || cmd.Repos[0].Sha != coHead {
+				t.Fatalf("checkout = %+v, want gen 2 at %s", cmd, coHead)
+			}
+		})
 	}
 }

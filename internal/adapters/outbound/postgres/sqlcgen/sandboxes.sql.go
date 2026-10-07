@@ -687,7 +687,7 @@ type RecordSandboxReadyParams struct {
 // max_frame_bytes) clears both columns, and the session actor holds the
 // gen's prompts to the promptReceipt rule (promptFrameBound).
 // It records capabilities.reviewCheckout against the gen by the same rule
-// (review_checkout_gen, migrations/000167_review_turn_checkout.up.sql):
+// (review_checkout_gen, migrations/000168_sandbox_review_checkout_gen.up.sql):
 // the session actor sends a review turn's checkout only to a gen whose
 // latest ready advertised it (reviewcheckout.go).
 // Guarded on gen like MarkSandboxBootEvidence: a ready of any other gen

@@ -24,7 +24,7 @@ import (
 
 // holdPlanLatestVersion is the migration the hold's plan test migrates
 // to: the latest whose columns the statements it measures name.
-const holdPlanLatestVersion = reviewCheckoutMigration
+const holdPlanLatestVersion = reviewCheckoutGenMigration
 
 const (
 	// holdReadMaxBuffers bounds what the re-review hold's read

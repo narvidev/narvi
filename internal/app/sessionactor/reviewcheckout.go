@@ -87,6 +87,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -98,6 +99,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/reviewcheck"
+	"github.com/narvidev/narvi/internal/domain/sandbox"
 	"github.com/narvidev/narvi/internal/domain/turn"
 )
 
@@ -122,6 +124,8 @@ type reviewCheckoutTarget struct {
 	repoName string
 	ref      string
 	sha      string
+	// repoFullName is the base repository, owner/name, the claim's.
+	repoFullName string
 }
 
 // reviewCheckoutTargetFor returns the checkout a turn needs, and false when
@@ -148,7 +152,7 @@ func reviewCheckoutTargetFor(claim *sqlcgen.GithubPrSession, sessionRepos []byte
 	if reposource.ValidateCommitSHA(*headSHA) != nil {
 		return reviewCheckoutTarget{}, false, true, nil
 	}
-	return reviewCheckoutTarget{repoName: repos[0].Name, ref: *ref, sha: *headSHA}, true, false, nil
+	return reviewCheckoutTarget{repoName: repos[0].Name, ref: *ref, sha: *headSHA, repoFullName: claim.RepoFullName}, true, false, nil
 }
 
 // readyAdvertisesReviewCheckout reports whether a ready event advertises
@@ -161,6 +165,25 @@ func readyAdvertisesReviewCheckout(raw json.RawMessage) bool {
 		return false
 	}
 	return evt.Capabilities != nil && evt.Capabilities.ReviewCheckout != nil && *evt.Capabilities.ReviewCheckout
+}
+
+// genAwaitingReady reports whether row's live gen has sent no ready yet:
+// it went suspect while still spawning or connecting -- a restore or a
+// respawn slow to connect, its connecting deadline past, or one whose
+// provider call failed -- and the dispatch evaluation sees it suspect,
+// which it dispatches to. Every other live state follows a ready: a ready
+// moves a connecting gen to booting. review_checkout_gen still names an
+// earlier gen then, so the gen's capability is unknown rather than absent.
+func genAwaitingReady(row sqlcgen.Sandbox) bool {
+	if sandbox.State(row.Status) != sandbox.StateSuspect || row.PreSuspectStatus == nil {
+		return false
+	}
+	switch *row.PreSuspectStatus {
+	case sqlcgen.SandboxStatusSpawning, sqlcgen.SandboxStatusConnecting:
+		return true
+	default:
+		return false
+	}
 }
 
 // reviewCheckoutCapable reports whether row's live gen advertised the
@@ -302,12 +325,7 @@ func (a *Actor) applyReviewCheckout(ctx context.Context, tx pgx.Tx, sessionRow s
 	}
 	pending := turn.State(target.Status) == turn.StatePending
 	facts := reviewCheckoutFacts(sandboxRow, state, checkoutTarget, pending && turn.ContextCheckedAtDispatch(target.IsReviewAttempt, target.RequestTrigger))
-	verdict := turn.DecideReviewCheckout(facts, turn.CheckoutBounds{
-		Timeout:              a.timeouts.ReviewCheckoutTimeout,
-		RefLagWindow:         a.timeouts.ReviewCheckoutRefLagWindow,
-		RefetchInterval:      a.timeouts.ReviewCheckoutRefetchInterval,
-		FailuresBeforeRetire: a.timeouts.ReviewCheckoutFailuresBeforeRetire,
-	})
+	verdict := turn.DecideReviewCheckout(facts, a.reviewCheckoutBounds())
 
 	switch verdict.Action {
 	case turn.CheckoutProceed:
@@ -382,12 +400,24 @@ func (a *Actor) applyReviewCheckout(ctx context.Context, tx pgx.Tx, sessionRow s
 	}
 }
 
+// reviewCheckoutBounds are the platform.Timeouts turn.DecideReviewCheckout
+// measures against.
+func (a *Actor) reviewCheckoutBounds() turn.CheckoutBounds {
+	return turn.CheckoutBounds{
+		Timeout:              a.timeouts.ReviewCheckoutTimeout,
+		RefLagWindow:         a.timeouts.ReviewCheckoutRefLagWindow,
+		RefetchInterval:      a.timeouts.ReviewCheckoutRefetchInterval,
+		FailuresBeforeRetire: a.timeouts.ReviewCheckoutFailuresBeforeRetire,
+	}
+}
+
 // reviewCheckoutFacts reads, from rows the evaluation already holds and the
 // turn's checkout state, the facts turn.DecideReviewCheckout decides on.
 func reviewCheckoutFacts(sandboxRow sqlcgen.Sandbox, state sqlcgen.GetTurnCheckoutStateRow, target reviewCheckoutTarget, movedEndsTurn bool) turn.CheckoutFacts {
 	requested := state.CheckoutMessageID != nil && state.CheckoutGen != nil && *state.CheckoutGen == sandboxRow.Gen
 	facts := turn.CheckoutFacts{
 		WantSHA:        target.sha,
+		AwaitingReady:  genAwaitingReady(sandboxRow),
 		GenCapable:     reviewCheckoutCapable(sandboxRow),
 		HasSnapshot:    sandboxRow.SnapshotID != nil && *sandboxRow.SnapshotID != "",
 		RequestedOnGen: requested,
@@ -513,15 +543,49 @@ func (a *Actor) checkoutRefusal(target reviewCheckoutTarget, verdict turn.Checko
 		if errText == "" {
 			errText = "no error was named"
 		}
-		t.reason = fmt.Sprintf("the sandbox did not check out %s from %s within %s: %s: %s", target.sha, target.ref, a.timeouts.ReviewCheckoutTimeout, verdict.Outcome, errText)
+		t.reason = fmt.Sprintf("the sandbox did not check out %s from %s of %s within %s: %s: %s", target.sha, target.ref, target.repoFullName, a.timeouts.ReviewCheckoutTimeout, verdict.Outcome, errText)
 		t.warning = "This review was not run: " + t.reason + "."
-		if verdict.Outcome == turn.CheckoutFetchFailed {
-			t.warning += " The pull request's ref is read from its base repository with the GitHub App's installation token: " +
-				"install the App on that repository, with read access to its contents, then request the review again."
+		switch {
+		case verdict.Outcome == turn.CheckoutFetchFailed && fetchRefusedAccess(verdict.Error):
+			t.warning += fmt.Sprintf(" %s refused the read: the pull request's ref is read with the GitHub App's installation token, so "+
+				"install the App on %s, with read access to its contents, then request the review again.", target.repoFullName, target.repoFullName)
+		case verdict.Outcome == turn.CheckoutFetchFailed:
+			t.warning += fmt.Sprintf(" The sandbox could not fetch the pull request's ref from %s for the reason above; "+
+				"request the review again once it can.", target.repoFullName)
 		}
 		t.notAssessed, t.counted = reviewcheck.NotAssessedReviewCheckoutFailed, reviewCheckoutOutcomeError
 	}
 	return t
+}
+
+// fetchAccessRefusals are the phrases git prints when a remote refuses a
+// read for want of access -- no credential, a credential it does not
+// accept, or a repository it will not show -- as opposed to a host it
+// cannot reach, a fetch that timed out or a ref that is not there.
+var fetchAccessRefusals = []string{
+	"authentication failed",
+	"could not read username",
+	"could not read password",
+	"invalid username or password",
+	"terminal prompts disabled",
+	"repository not found",
+	"permission denied",
+	"access denied",
+	"returned error: 401",
+	"returned error: 403",
+}
+
+// fetchRefusedAccess reports whether errText, a fetch_failed reply's error,
+// says the base repository refused the read for want of access: only then
+// is installing the App the remedy.
+func fetchRefusedAccess(errText string) bool {
+	lower := strings.ToLower(errText)
+	for _, phrase := range fetchAccessRefusals {
+		if strings.Contains(lower, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // refuseReviewCheckout ends target, still pending, as a turn refused
@@ -609,14 +673,16 @@ func (a *Actor) retireGenForCheckout(ctx context.Context, tx pgx.Tx, sandboxRow 
 
 // reviewCheckoutOutstanding is §24.9's pre-read asking whether row's turn
 // waits on its checkout, outside any transaction: the turn needs one
-// (reviewCheckoutTargetFor) and no reply to a request on the live gen says
-// the sandbox holds its head. Then the dispatch evaluation that follows
-// holds the turn for its checkout before the context check is reached, and
-// the pre-read reads nothing of the code host for it. It is decided with
-// applyReviewCheckout's own rules over the same rows, so a turn the gate
-// sends on is never one the pre-read skipped: that would hold it for a
-// read never made. A read that fails answers false -- the code host is
-// read, which costs one read and never holds a turn.
+// (reviewCheckoutTargetFor), and turn.DecideReviewCheckout, over the same
+// rows and with the same bounds applyReviewCheckout reads in the
+// evaluation that follows, does not let it proceed -- it waits, sends,
+// ends the attempt context_moved, retires the gen or refuses the turn, all
+// before the context check is reached. The pre-read then reads nothing of
+// the code host for it. A turn the decision lets proceed is read, so a
+// turn the gate sends is never one the pre-read skipped, which would hold
+// it for a read never made. A read that fails answers false -- the code
+// host is read, which costs one read and never holds a turn. row is a
+// pending pick the context check applies to, so a moved head ends it.
 func (a *Actor) reviewCheckoutOutstanding(ctx context.Context, row sqlcgen.GetReviewAttemptToCheckRow) bool {
 	if row.ReviewHeadSha == nil || *row.ReviewHeadSha == "" || a.stores.githubPRSession == nil {
 		return false
@@ -641,7 +707,6 @@ func (a *Actor) reviewCheckoutOutstanding(ctx context.Context, row sqlcgen.GetRe
 	if err != nil {
 		return false
 	}
-	facts := reviewCheckoutFacts(sandboxRow, state, target, false)
-	confirmed := facts.Reply != nil && facts.Reply.Outcome == turn.CheckoutCheckedOut && facts.Reply.HeadSHA == target.sha
-	return !confirmed
+	facts := reviewCheckoutFacts(sandboxRow, state, target, turn.ContextCheckedAtDispatch(row.IsReviewAttempt, row.RequestTrigger))
+	return turn.DecideReviewCheckout(facts, a.reviewCheckoutBounds()).Action != turn.CheckoutProceed
 }

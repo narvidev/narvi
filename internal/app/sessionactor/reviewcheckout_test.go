@@ -98,9 +98,9 @@ func TestReviewCheckoutTargetFor(t *testing.T) {
 		wantErr    bool
 	}{
 		{name: "the base repository's review session", claim: claim, repos: repos("https://github.com/acme/widgets.git"), head: &head,
-			want: reviewCheckoutTarget{repoName: "widgets", ref: "refs/pull/7/head", sha: unitHead}, wantOK: true},
+			want: reviewCheckoutTarget{repoName: "widgets", ref: "refs/pull/7/head", sha: unitHead, repoFullName: "acme/widgets"}, wantOK: true},
 		{name: "names the repository in another case", claim: claim, repos: repos("https://github.com/ACME/Widgets"), head: &head,
-			want: reviewCheckoutTarget{repoName: "widgets", ref: "refs/pull/7/head", sha: unitHead}, wantOK: true},
+			want: reviewCheckoutTarget{repoName: "widgets", ref: "refs/pull/7/head", sha: unitHead, repoFullName: "acme/widgets"}, wantOK: true},
 		{name: "a legacy session whose spec names the fork", claim: claim, repos: repos("https://github.com/contributor/widgets.git"), head: &head},
 		{name: "no claim", repos: repos("https://github.com/acme/widgets.git"), head: &head},
 		{name: "no recorded head", claim: claim, repos: repos("https://github.com/acme/widgets.git")},
@@ -180,12 +180,13 @@ func TestCheckoutRefusal(t *testing.T) {
 	t.Parallel()
 
 	a := &Actor{timeouts: platform.DefaultTimeouts()}
-	target := reviewCheckoutTarget{repoName: "widgets", ref: "refs/pull/7/head", sha: unitHead}
+	target := reviewCheckoutTarget{repoName: "widgets", ref: "refs/pull/7/head", sha: unitHead, repoFullName: "acme/widgets"}
 	for _, tc := range []struct {
 		name        string
 		verdict     turn.CheckoutVerdict
 		reason      []string
 		warning     []string
+		notWarning  []string
 		notAssessed reviewcheck.NotAssessedReason
 		counted     string
 	}{
@@ -201,13 +202,30 @@ func TestCheckoutRefusal(t *testing.T) {
 			reason:      []string{unitHead, "refs/pull/7/head", "whose tip is " + unitTip},
 			warning:     []string{"Ask again for the pull request's head as it is now"},
 			notAssessed: reviewcheck.NotAssessedReviewCheckoutFailed, counted: reviewCheckoutOutcomeHeadAbsent},
-		{name: "a fetch that kept failing names the App", verdict: turn.CheckoutVerdict{Refusal: turn.CheckoutRefusedError, Outcome: turn.CheckoutFetchFailed, Error: "Authentication failed"},
-			reason:      []string{"did not check out " + unitHead + " from refs/pull/7/head within 15m0s", "fetch_failed: Authentication failed"},
-			warning:     []string{"install the App on that repository, with read access to its contents"},
+		{name: "a fetch the base repository refused names the App on it", verdict: turn.CheckoutVerdict{Refusal: turn.CheckoutRefusedError, Outcome: turn.CheckoutFetchFailed,
+			Error: "fatal: Authentication failed for 'https://github.com/acme/widgets.git/'"},
+			reason:      []string{"did not check out " + unitHead + " from refs/pull/7/head of acme/widgets within 15m0s", "fetch_failed: fatal: Authentication failed"},
+			warning:     []string{"acme/widgets refused the read", "install the App on acme/widgets, with read access to its contents"},
+			notAssessed: reviewcheck.NotAssessedReviewCheckoutFailed, counted: reviewCheckoutOutcomeError},
+		{name: "a fetch the code host answered with not found names the App too", verdict: turn.CheckoutVerdict{Refusal: turn.CheckoutRefusedError, Outcome: turn.CheckoutFetchFailed,
+			Error: "remote: Repository not found.\nfatal: repository 'https://github.com/acme/widgets.git/' not found"},
+			warning:     []string{"install the App on acme/widgets"},
+			notAssessed: reviewcheck.NotAssessedReviewCheckoutFailed, counted: reviewCheckoutOutcomeError},
+		{name: "a fetch that could not reach the host names the cause, not the App", verdict: turn.CheckoutVerdict{Refusal: turn.CheckoutRefusedError, Outcome: turn.CheckoutFetchFailed,
+			Error: "fatal: unable to access 'https://github.com/acme/widgets.git/': Could not resolve host: github.com"},
+			reason:      []string{"Could not resolve host: github.com"},
+			warning:     []string{"could not fetch the pull request's ref from acme/widgets for the reason above", "request the review again once it can"},
+			notWarning:  []string{"install the App"},
+			notAssessed: reviewcheck.NotAssessedReviewCheckoutFailed, counted: reviewCheckoutOutcomeError},
+		{name: "a fetch that timed out names the cause, not the App", verdict: turn.CheckoutVerdict{Refusal: turn.CheckoutRefusedError, Outcome: turn.CheckoutFetchFailed,
+			Error: "gitclone: fetch refs/pull/7/head for widgets: context deadline exceeded"},
+			warning:     []string{"context deadline exceeded", "for the reason above"},
+			notWarning:  []string{"install the App"},
 			notAssessed: reviewcheck.NotAssessedReviewCheckoutFailed, counted: reviewCheckoutOutcomeError},
 		{name: "a checkout that kept failing", verdict: turn.CheckoutVerdict{Refusal: turn.CheckoutRefusedError, Outcome: turn.CheckoutFailed, Error: "index.lock: File exists"},
 			reason:      []string{"failed: index.lock: File exists"},
 			warning:     []string{"This review was not run"},
+			notWarning:  []string{"install the App", "could not fetch"},
 			notAssessed: reviewcheck.NotAssessedReviewCheckoutFailed, counted: reviewCheckoutOutcomeError},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -223,8 +241,45 @@ func TestCheckoutRefusal(t *testing.T) {
 					t.Errorf("warning = %q, want it to contain %q", got.warning, want)
 				}
 			}
+			for _, banned := range tc.notWarning {
+				if strings.Contains(got.warning, banned) {
+					t.Errorf("warning = %q, must not say %q", got.warning, banned)
+				}
+			}
 			if got.notAssessed != tc.notAssessed || got.counted != tc.counted {
 				t.Errorf("not assessed %q, counted %q; want %q, %q", got.notAssessed, got.counted, tc.notAssessed, tc.counted)
+			}
+		})
+	}
+}
+
+// TestGenAwaitingReady pins which gens have sent no ready yet: only one
+// that went suspect while still spawning or connecting. Any other live
+// state follows a ready, which moves a connecting gen to booting.
+func TestGenAwaitingReady(t *testing.T) {
+	t.Parallel()
+
+	pre := func(s sqlcgen.SandboxStatus) *sqlcgen.SandboxStatus { return &s }
+	for _, tc := range []struct {
+		name string
+		row  sqlcgen.Sandbox
+		want bool
+	}{
+		{name: "suspect while connecting", row: sqlcgen.Sandbox{Status: sqlcgen.SandboxStatusSuspect, PreSuspectStatus: pre(sqlcgen.SandboxStatusConnecting)}, want: true},
+		{name: "suspect while spawning", row: sqlcgen.Sandbox{Status: sqlcgen.SandboxStatusSuspect, PreSuspectStatus: pre(sqlcgen.SandboxStatusSpawning)}, want: true},
+		{name: "suspect while booting, after its ready", row: sqlcgen.Sandbox{Status: sqlcgen.SandboxStatusSuspect, PreSuspectStatus: pre(sqlcgen.SandboxStatusBooting)}},
+		{name: "suspect while ready", row: sqlcgen.Sandbox{Status: sqlcgen.SandboxStatusSuspect, PreSuspectStatus: pre(sqlcgen.SandboxStatusReady)}},
+		{name: "suspect with no state recorded", row: sqlcgen.Sandbox{Status: sqlcgen.SandboxStatusSuspect}},
+		{name: "ready", row: sqlcgen.Sandbox{Status: sqlcgen.SandboxStatusReady}},
+		// Only suspect reads the state it was entered from: a status that
+		// left suspect may still carry it.
+		{name: "ready again, its pre-suspect state still connecting", row: sqlcgen.Sandbox{Status: sqlcgen.SandboxStatusReady, PreSuspectStatus: pre(sqlcgen.SandboxStatusConnecting)}},
+		{name: "failed, its pre-suspect state still connecting", row: sqlcgen.Sandbox{Status: sqlcgen.SandboxStatusFailed, PreSuspectStatus: pre(sqlcgen.SandboxStatusConnecting)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := genAwaitingReady(tc.row); got != tc.want {
+				t.Errorf("genAwaitingReady(%+v) = %v, want %v", tc.row, got, tc.want)
 			}
 		})
 	}

@@ -1,6 +1,7 @@
 package turn_test
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
@@ -53,6 +54,27 @@ func TestDecideReviewCheckout(t *testing.T) {
 		edit  func(*turn.CheckoutFacts)
 		want  turn.CheckoutVerdict
 	}{
+		// A gen that has sent no ready yet.
+		{
+			name:  "a gen that has sent no ready yet is waited for, never retired, snapshot or not",
+			facts: turn.CheckoutFacts{WantSHA: checkoutHead, AwaitingReady: true, HasSnapshot: true},
+			want:  turn.CheckoutVerdict{Action: turn.CheckoutWait, NextLook: b.RefetchInterval},
+		},
+		{
+			name:  "a gen that has sent no ready yet is waited for, never refused",
+			facts: turn.CheckoutFacts{WantSHA: checkoutHead, AwaitingReady: true},
+			want:  turn.CheckoutVerdict{Action: turn.CheckoutWait, NextLook: b.RefetchInterval},
+		},
+		{
+			name:  "a gen that has sent no ready yet is sent nothing, even with a request on an earlier gen",
+			facts: requested(time.Minute, time.Minute, 1, nil),
+			edit: func(f *turn.CheckoutFacts) {
+				f.AwaitingReady = true
+				f.RequestedOnGen = false
+				f.GenCapable = false
+			},
+			want: turn.CheckoutVerdict{Action: turn.CheckoutWait, NextLook: b.RefetchInterval},
+		},
 		// An agent too old to check out.
 		{
 			name:  "incapable gen with a snapshot is retired",
@@ -112,10 +134,29 @@ func TestDecideReviewCheckout(t *testing.T) {
 			want:  turn.CheckoutVerdict{Action: turn.CheckoutProceed, Outcome: turn.CheckoutCheckedOut, HeadSHA: checkoutHead},
 		},
 		{
-			name:  "checked out at the head with the ref moved ends an attempt a lane asks for again",
+			name:  "checked out at the head with the ref elsewhere past the lag window ends an attempt a lane asks for again",
 			facts: requested(time.Minute, time.Minute, 1, reply(turn.CheckoutCheckedOut, checkoutHead, checkoutMoved, "")),
 			edit:  func(f *turn.CheckoutFacts) { f.MovedEndsTurn = true },
 			want:  turn.CheckoutVerdict{Action: turn.CheckoutEndMoved, Outcome: turn.CheckoutCheckedOut, HeadSHA: checkoutHead, RefSHA: checkoutMoved},
+		},
+		{
+			name:  "checked out at the head with the ref elsewhere inside the lag window waits for a re-fetch: the ref may lag a head the clone already has",
+			facts: requested(5*time.Second, 5*time.Second, 1, reply(turn.CheckoutCheckedOut, checkoutHead, checkoutMoved, "")),
+			edit:  func(f *turn.CheckoutFacts) { f.MovedEndsTurn = true },
+			want: turn.CheckoutVerdict{Action: turn.CheckoutWait, NextLook: 5 * time.Second,
+				Outcome: turn.CheckoutCheckedOut, HeadSHA: checkoutHead, RefSHA: checkoutMoved},
+		},
+		{
+			name:  "checked out at the head with the ref elsewhere inside the lag window is fetched again at the interval",
+			facts: requested(30*time.Second, b.RefetchInterval, 2, reply(turn.CheckoutCheckedOut, checkoutHead, checkoutMoved, "")),
+			edit:  func(f *turn.CheckoutFacts) { f.MovedEndsTurn = true },
+			want: turn.CheckoutVerdict{Action: turn.CheckoutSend, NextLook: b.Timeout - 30*time.Second,
+				Outcome: turn.CheckoutCheckedOut, HeadSHA: checkoutHead, RefSHA: checkoutMoved},
+		},
+		{
+			name:  "checked out at the head with the ref elsewhere inside the lag window runs any other turn at once",
+			facts: requested(5*time.Second, 5*time.Second, 1, reply(turn.CheckoutCheckedOut, checkoutHead, checkoutMoved, "")),
+			want:  turn.CheckoutVerdict{Action: turn.CheckoutProceed, Outcome: turn.CheckoutCheckedOut, HeadSHA: checkoutHead, RefSHA: checkoutMoved},
 		},
 		{
 			name:  "checked out at the head with the ref moved runs any other turn on its head",
@@ -232,6 +273,28 @@ func TestDecideReviewCheckout(t *testing.T) {
 			want:  turn.CheckoutVerdict{Action: turn.CheckoutSend, NextLook: b.Timeout - 10*time.Second, AfterFailure: true, Outcome: turn.CheckoutFailed, Error: "?"},
 		},
 		{
+			name:  "a first failed reply at the bound retires the gen rather than refuse the turn",
+			facts: requested(b.Timeout, time.Minute, 6, reply(turn.CheckoutFailed, "", "", "index.lock")),
+			want:  turn.CheckoutVerdict{Action: turn.CheckoutRetireGen, Retirement: turn.CheckoutRetiredFailing, Outcome: turn.CheckoutFailed, Error: "index.lock"},
+		},
+		{
+			name:  "a fetch failure at the bound, after a failed reply on the gen, retires it",
+			facts: requested(b.Timeout, time.Minute, 6, reply(turn.CheckoutFetchFailed, "", "", "timeout")),
+			edit:  func(f *turn.CheckoutFacts) { f.Failures = 1 },
+			want:  turn.CheckoutVerdict{Action: turn.CheckoutRetireGen, Retirement: turn.CheckoutRetiredFailing, Outcome: turn.CheckoutFetchFailed, Error: "timeout"},
+		},
+		{
+			name:  "a failed reply after many sends of other kinds waits the first failure's interval, not the sends'",
+			facts: requested(2*time.Minute, 5*time.Second, 7, reply(turn.CheckoutFailed, "", "", "index.lock")),
+			want:  turn.CheckoutVerdict{Action: turn.CheckoutWait, NextLook: 5 * time.Second, Outcome: turn.CheckoutFailed, Error: "index.lock"},
+		},
+		{
+			name:  "a second failed reply waits the interval doubled once",
+			facts: requested(2*time.Minute, 19*time.Second, 8, reply(turn.CheckoutFailed, "", "", "index.lock")),
+			edit:  func(f *turn.CheckoutFacts) { f.Failures = 1 },
+			want:  turn.CheckoutVerdict{Action: turn.CheckoutWait, NextLook: time.Second, Outcome: turn.CheckoutFailed, Error: "index.lock"},
+		},
+		{
 			name:  "failed at the bound with a gen already retired refuses, naming the error",
 			facts: requested(b.Timeout, time.Minute, 4, reply(turn.CheckoutFailed, "", "", "index.lock")),
 			edit:  func(f *turn.CheckoutFacts) { f.RetiredAGen = true },
@@ -305,5 +368,97 @@ func TestDecideReviewCheckout_TheWaitIsNeverDueNow(t *testing.T) {
 		}
 		sinceRequest += v.NextLook
 		sinceSend += v.NextLook
+	}
+}
+
+// TestDecideReviewCheckout_AFailingWorktreeIsAlwaysRetired walks a gen
+// whose checkouts answer other things first -- a ref that lags, a busy
+// sandbox, a fetch that fails, a reconnect with no reply -- and then fail
+// on what its worktree holds, a stale index.lock, every time: whatever came
+// first, once one checkout has failed the gen is retired, never the turn
+// refused, and within FailedRetireBackoff of the first failed reply when
+// the bound leaves room. Before any failure, the turn may end for what came
+// first: a head still absent past the lag window, or busy sends spaced past
+// the bound. Each send is answered a second later, its reply's evaluation
+// the next look.
+func TestDecideReviewCheckout_AFailingWorktreeIsAlwaysRetired(t *testing.T) {
+	t.Parallel()
+
+	b := checkoutBounds()
+	const answer = time.Second
+	retireBackoff := 30 * time.Second // RefetchInterval, then doubled: 10s + 20s
+	type before struct {
+		outcome turn.CheckoutOutcome // "" is a reconnect with no reply
+		n       int
+	}
+	var cases []before
+	for n := 0; n <= 8; n++ {
+		cases = append(cases, before{turn.CheckoutSHAAbsent, n}, before{turn.CheckoutBusy, n}, before{turn.CheckoutFetchFailed, n}, before{"", n})
+	}
+	for _, c := range cases {
+		t.Run(fmt.Sprintf("%d %q first", c.n, c.outcome), func(t *testing.T) {
+			t.Parallel()
+			var sinceRequest, sinceSend time.Duration
+			sends, failures, answered := 1, 0, 0
+			firstFailure := time.Duration(-1)
+			for looks := 0; ; looks++ {
+				if looks > 10_000 {
+					t.Fatal("no end")
+				}
+				var r *turn.CheckoutReply
+				reconnected := false
+				switch {
+				case sinceSend < answer:
+					// The reply is not in yet.
+				case answered < c.n && c.outcome == "":
+					reconnected = true
+				case answered < c.n:
+					r = reply(c.outcome, "", checkoutHead, "x")
+				default:
+					r = reply(turn.CheckoutFailed, "", checkoutHead, "index.lock")
+					if firstFailure < 0 {
+						firstFailure = sinceRequest
+					}
+				}
+				f := requested(sinceRequest, sinceSend, sends, r)
+				f.Failures, f.ReconnectedSinceSend = failures, reconnected
+				v := turn.DecideReviewCheckout(f, b)
+				switch v.Action {
+				case turn.CheckoutRetireGen:
+					if firstFailure >= 0 && firstFailure+retireBackoff+3*answer < b.Timeout && sinceRequest > firstFailure+retireBackoff+3*answer {
+						t.Fatalf("retired %s after its first failure at %s, want within %s", sinceRequest-firstFailure, firstFailure, retireBackoff)
+					}
+					return
+				case turn.CheckoutRefuse, turn.CheckoutEndMoved:
+					if firstFailure >= 0 {
+						t.Fatalf("%s at %s (%s, %s) after a failure at %s: a failing worktree's gen is never left unretired",
+							v.Action, sinceRequest, v.Refusal, v.Outcome, firstFailure)
+					}
+					if v.Outcome != c.outcome || c.n < 6 {
+						t.Fatalf("%s at %s (%s, %s) with no failure seen, after only %d %q replies", v.Action, sinceRequest, v.Refusal, v.Outcome, c.n, c.outcome)
+					}
+					return
+				case turn.CheckoutSend:
+					if v.AfterFailure {
+						failures++
+					}
+					sends++
+					if r != nil || reconnected {
+						answered++
+					}
+					sinceSend = 0
+					continue
+				case turn.CheckoutWait:
+					step := v.NextLook
+					if sinceSend < answer && answer-sinceSend < step {
+						step = answer - sinceSend
+					}
+					sinceRequest += step
+					sinceSend += step
+				default:
+					t.Fatalf("unexpected verdict %+v", v)
+				}
+			}
+		})
 	}
 }

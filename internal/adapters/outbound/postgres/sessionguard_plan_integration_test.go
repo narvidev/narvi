@@ -24,7 +24,7 @@ import (
 // migrates to: the latest whose columns the statements it measures name,
 // after the one that builds turns_session_dispatched_idx
 // (sessionDispatchedMigration).
-const guardPlanLatestVersion = reviewCheckoutMigration
+const guardPlanLatestVersion = reviewCheckoutGenMigration
 
 // guardReadFixedBuffers and guardReadBuffersPerTurn bound what the session
 // guard's read (GetSessionGuardFacts) reads: a fixed number of key and claim

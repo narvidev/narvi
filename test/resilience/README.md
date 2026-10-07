@@ -706,8 +706,9 @@ snapshot is answered at once.
 
 The sandbox-agent half of the exit is pinned in `cmd/sandbox-agent` and
 `internal/sandboxagent/gitclone` (Step 204's first part), and the control
-plane's decisions -- a moved head, a lagging ref, an old agent, a silent
-or failing sandbox -- in `internal/app/sessionactor`'s
+plane's decisions -- a moved head, a lagging ref, an old agent, a gen
+not connected yet, a silent or failing sandbox -- in
+`internal/app/sessionactor`'s
 `reviewcheckout_integration_test.go`.
 
 ## Not a scenario: the tool events of one message (Step 229, §6.1)

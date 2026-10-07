@@ -3231,8 +3231,9 @@ type Timeouts struct {
 	// lost with a replica that died after its commit is sent again on the
 	// sandbox's reconnect inside the bound; above
 	// ReviewCheckoutRefLagWindow, so a ref that lags is given its window;
-	// above ReviewCheckoutFailedRetireBackoff, so a gen whose checkouts fail
-	// at once is retired before its turn is refused; and below
+	// above ReviewCheckoutRefLagWindow plus ReviewCheckoutFailedRetireBackoff,
+	// so a gen whose checkouts fail once its ref has caught up is retired
+	// before the bound, whatever lag re-fetches came first; and below
 	// TurnDeadline, so a checkout that never answers costs less than one
 	// turn's own deadline. Not specified in the plan; 15 minutes, the
 	// first whole minute that clears the ceiling (13m40s with these
@@ -3253,9 +3254,13 @@ type Timeouts struct {
 
 	// ReviewCheckoutRefetchInterval spaces a review turn's checkout
 	// commands on one gen (technical plan §21.1): a ref that lags is
-	// fetched again this long after the previous send, and a fetch
-	// failure, a busy sandbox or a failed checkout is tried again after
-	// this interval doubled with each send -- 10s, 20s, 40s -- until
+	// fetched again this long after the previous send. A failed checkout
+	// is tried again after this interval doubled once per failed reply
+	// before it on the gen -- 10s, then 20s -- so the
+	// ReviewCheckoutFailuresBeforeRetire'th failure comes
+	// ReviewCheckoutFailedRetireBackoff after the first, whatever sends came
+	// before it; a fetch failure or a busy sandbox is tried again after it
+	// doubled once per send made on the gen -- 10s, 20s, 40s -- until
 	// ReviewCheckoutTimeout. Validate keeps it positive. Not specified in
 	// the plan; 10 seconds.
 	ReviewCheckoutRefetchInterval time.Duration
@@ -3270,6 +3275,9 @@ type Timeouts struct {
 	// the new gen, with a bound of its own. A turn retires at most one gen
 	// this way (turns.checkout_retired_gen): a fresh gen whose checkouts
 	// fail as well is refused at ReviewCheckoutTimeout, naming the error.
+	// A gen that answered failed at least once, but fewer times than this
+	// before the bound, is retired at the bound the same way, rather than
+	// its turn refused: its worktree may be the broken one.
 	// A fetch failure or a busy sandbox never counts: a new gen fetches
 	// from the same remote, and a busy agent is running work. A count, not
 	// a duration; it sits here beside the bounds it shares a rule with,
@@ -4290,16 +4298,20 @@ func (t Timeouts) ReviewCheckoutAttemptCeiling() time.Duration {
 	return ReviewCheckoutNetworkGitSteps*step(t.GitFetchStepTimeout) + ReviewCheckoutLocalGitSteps*step(t.GitSyncStepTimeout)
 }
 
-// ReviewCheckoutFailedRetireBackoff is how long after a review turn's
-// first checkout on a gen the send whose failed reply retires that gen is
-// made, when every checkout fails at once (technical plan §21.1): the
-// waits between the first ReviewCheckoutFailuresBeforeRetire sends, each
-// ReviewCheckoutRefetchInterval doubled once more than the one before.
-// 30s with these defaults. ReviewCheckoutTimeout must outlast it, so a
-// gen whose worktree fails every checkout is retired before its turn is
-// refused. Saturates rather than overflows for a count so large no bound
-// could hold it; an interval that is not positive, which Validate refuses
-// on its own, waits nothing.
+// ReviewCheckoutFailedRetireBackoff is how long after a gen's first failed
+// checkout reply for a review turn the send whose failed reply retires
+// that gen is made (technical plan §21.1): the waits after each of the
+// first ReviewCheckoutFailuresBeforeRetire-1 failed replies, each
+// ReviewCheckoutRefetchInterval doubled once per failed reply before it.
+// The waits count failures, not sends, so the lag re-fetches, busy
+// answers and reconnects that came before the first failure add nothing
+// to them. 30s with these defaults. ReviewCheckoutTimeout must outlast
+// ReviewCheckoutRefLagWindow plus it, so a gen whose worktree fails every
+// checkout once the ref has caught up is retired before its turn's
+// bound; one whose failures start later still is retired at the bound.
+// Saturates rather than overflows for a count so large no bound could
+// hold it; an interval that is not positive, which Validate refuses on
+// its own, waits nothing.
 func (t Timeouts) ReviewCheckoutFailedRetireBackoff() time.Duration {
 	var total time.Duration
 	wait := t.ReviewCheckoutRefetchInterval
@@ -5094,10 +5106,10 @@ func (t Timeouts) Validate() error {
 	// §21.1's review checkout: a slow but working sandbox is never refused
 	// for slowness; a command lost with a replica that died after its
 	// commit is sent again on the reconnect, inside the bound; a lagging
-	// ref is fetched again at least once; a gen whose checkouts fail at
-	// once is retired before its turn is refused; and a checkout that
-	// never answers costs less than one turn's own deadline. See
-	// ReviewCheckoutTimeout's own doc comment.
+	// ref is fetched again at least once; a gen whose checkouts fail once
+	// its ref has caught up is retired before its turn's bound; and a
+	// checkout that never answers costs less than one turn's own deadline.
+	// See ReviewCheckoutTimeout's own doc comment.
 	mustBePositive("ReviewCheckoutTimeout", t.ReviewCheckoutTimeout)
 	mustBePositive("ReviewCheckoutRefLagWindow", t.ReviewCheckoutRefLagWindow)
 	mustBePositive("ReviewCheckoutRefetchInterval", t.ReviewCheckoutRefetchInterval)
@@ -5111,8 +5123,15 @@ func (t Timeouts) Validate() error {
 		t.ActorLockServerReapTime()+t.SandboxWSReconnectMaxBackoff+t.ActorHydrateTimeout)
 	check("ReviewCheckoutTimeout > ReviewCheckoutRefLagWindow",
 		"ReviewCheckoutTimeout", t.ReviewCheckoutTimeout, "ReviewCheckoutRefLagWindow", t.ReviewCheckoutRefLagWindow)
-	check("ReviewCheckoutTimeout > ReviewCheckoutFailedRetireBackoff",
-		"ReviewCheckoutTimeout", t.ReviewCheckoutTimeout, "ReviewCheckoutFailedRetireBackoff", t.ReviewCheckoutFailedRetireBackoff())
+	// Saturated below the margin check adds, so a count or a window no
+	// bound could hold breaks the link rather than wrapping past it.
+	retireBy := maxDuration - MinTimeoutMargin
+	if retire := t.ReviewCheckoutFailedRetireBackoff(); retire <= retireBy-t.ReviewCheckoutRefLagWindow {
+		retireBy = t.ReviewCheckoutRefLagWindow + retire
+	}
+	check("ReviewCheckoutTimeout > ReviewCheckoutRefLagWindow + ReviewCheckoutFailedRetireBackoff",
+		"ReviewCheckoutTimeout", t.ReviewCheckoutTimeout,
+		"ReviewCheckoutRefLagWindow + ReviewCheckoutFailedRetireBackoff", retireBy)
 	check("ReviewCheckoutRefLagWindow > ReviewCheckoutRefetchInterval",
 		"ReviewCheckoutRefLagWindow", t.ReviewCheckoutRefLagWindow, "ReviewCheckoutRefetchInterval", t.ReviewCheckoutRefetchInterval)
 	check("TurnDeadline > ReviewCheckoutTimeout",

@@ -21,7 +21,7 @@ import (
 // its capabilities -- promptReceipt and reviewCheckout -- and the read
 // limit it stated (technical plan §3.3, §21.1,
 // migrations/000157_agent_max_frame_bytes.up.sql,
-// migrations/000167_review_turn_checkout.up.sql), only for the sandbox's
+// migrations/000168_sandbox_review_checkout_gen.up.sql), only for the sandbox's
 // live gen; the latest ready of the gen decides; a gen bump leaves each on
 // a gen that is no longer live.
 func TestSandboxStore_RecordReady_GuardedOnGen(t *testing.T) {
