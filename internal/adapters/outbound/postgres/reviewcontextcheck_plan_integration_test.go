@@ -32,10 +32,13 @@ const contextWriteMaxBuffers = holdWakeMaxBuffers
 // contextTurnStatusIndexEntryMaxBuffers is what UpdateTurnStatus reads
 // beyond contextWriteMaxBuffers since the plan tests migrate past 000166
 // (holdPlanLatestVersion): its new row version's entry in
-// turns_session_dispatched_idx, an index this test's bound predates -- a
-// descent of one or two levels to the leaf the entry goes to.
-// sessionDispatchedIndexEntryMaxBuffers measures that entry exactly.
-const contextTurnStatusIndexEntryMaxBuffers = 2
+// turns_session_dispatched_idx, an index this test's bound predates. It is
+// the session guard's plan test's own measure of that entry
+// (sessionDispatchedIndexEntryMaxBuffers) for an index two levels above its
+// leaves, which it is on the tables below, of up to 316,000 turns: the
+// metapage and one page of each level down to the leaf. main's text of the
+// statement reads the same.
+var contextTurnStatusIndexEntryMaxBuffers = sessionDispatchedIndexEntryMaxBuffers(2)
 
 // contextPlanShape is a table TestReviewContextCheck_PlansReadTheSessionsOwnTurns
 // reads: holdPlanShape's sessions, every one claiming a pull request, whose
