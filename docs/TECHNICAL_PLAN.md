@@ -2109,10 +2109,12 @@ transaction under the session's actor-epoch lock — the decide endpoint's — i
 deletes the row (a compare-and-swap, so of two replicas one applies it), and applies the stored outcome
 through `ApplyStepOutcome`, the stored summary telling the next attempt what the finished step found,
 admitted by the session guard as any advance is; the next attempt's turn arms the session's dispatch
-timer in the same transaction. A person's stop drops the session's held advances and cancels their
-runs in the stop request's own transaction, by the stop's own rule (held at or before the request), so
-a resume that commits right after it cannot revive one; the stop timer and the releaser's own check of
-a standing stop catch a stop a replica of the previous release recorded during a rolling deploy. While
+timer in the same transaction. A person's stop drops every advance the session holds and cancels their
+runs in the stop request's own transaction, whatever their `held_at`: under the actor-epoch lock, every
+hold it reads committed before the stop, one whose transaction began after the request's included. So
+a resume that commits right after it cannot revive one. The stop timer, by the stop's own rule (held at
+or before the request), and the releaser's own check of a standing stop catch a stop a replica of the
+previous release recorded during a rolling deploy. While
 a run holds its advance, a person's own turn on the session passes through untracked, and a person's
 decision on a step awaiting one is never read against the freeze. A rollback's down migration cancels
 every held run, the one kind of candidate a rollback loses; and a binary without the hold advances

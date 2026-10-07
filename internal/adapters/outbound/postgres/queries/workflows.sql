@@ -458,8 +458,18 @@ LIMIT sqlc.arg('max_holds');
 -- dropped it -- and the caller applies nothing.
 DELETE FROM workflow_advance_holds WHERE workflow_run_id = $1 RETURNING *;
 
+-- name: DeleteWorkflowAdvanceHoldsForStopRequest :many
+-- The stop request's own drop: every advance the session holds, whatever
+-- its held_at, and returns the runs, which the caller cancels. Run under
+-- the session's actor-epoch lock, which every transaction that holds an
+-- advance takes, so every hold it reads committed before the stop -- one
+-- whose transaction began after the stop request's did included.
+DELETE FROM workflow_advance_holds
+WHERE session_id = sqlc.arg('session_id')
+RETURNING workflow_run_id;
+
 -- name: DeleteWorkflowAdvanceHoldsForStop :many
--- A person's stop drops every advance the session held at or before the
+-- The stop timer's drop: every advance the session held at or before the
 -- stop request -- the instant disarmWorkCreatingTimers compares with -- and
 -- returns the runs, which the caller cancels.
 DELETE FROM workflow_advance_holds

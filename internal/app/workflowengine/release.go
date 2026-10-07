@@ -2,7 +2,8 @@
 // freeze (technical plan §40.2): the automatic advance OnTurnCompleted holds
 // while autonomy is frozen (completion.go, holdAdvance below), its release
 // once the freeze lifts (HeldAdvanceReleaser), and its drop when a person
-// stops the session (CancelHeldAdvancesForStop).
+// stops the session (CancelHeldAdvancesForStopRequest, and
+// CancelHeldAdvancesForStop for the stop timer).
 //
 // A held advance is one workflow_advance_holds row, written in the
 // transaction that ended the attempt's turn. The attempt is finished as it
@@ -33,12 +34,13 @@
 // trigger. When a person's stop stands on the session, the run is
 // cancelled instead, as OnTurnCompleted's stopped branch ends one.
 //
-// A person's stop drops the session's held advances in the stop request's
-// own transaction (CancelHeldAdvancesForStop, from httpapi's stop route),
-// so a resume that commits right after it cannot revive them. The stop
-// timer's handler and the releaser's own check of a standing stop catch a
-// stop written without that -- by a replica of the previous release during
-// a rolling deploy.
+// A person's stop drops every advance the session holds in the stop
+// request's own transaction (CancelHeldAdvancesForStopRequest, from
+// httpapi's stop route), so a resume that commits right after it cannot
+// revive one. The stop timer's handler (CancelHeldAdvancesForStop, by the
+// stop's held_at rule) and the releaser's own check of a standing stop
+// catch a stop written without that -- by a replica of the previous
+// release during a rolling deploy.
 
 package workflowengine
 
@@ -87,21 +89,40 @@ func holdAdvance(ctx context.Context, deps Deps, runRow sqlcgen.WorkflowRun, fin
 	return nil
 }
 
-// CancelHeldAdvancesForStop is a person's stop (technical plan §3.3)
-// reaching the advances the autonomy freeze holds on sessionID: every one
-// held at or before stopRequestedAt -- the rule the stop timer deletes the
-// session's work-creating timers by -- is dropped, and its run, still
-// running, ends cancelled, as OnTurnCompleted's stopped branch ends one.
-// Its finished attempt keeps its status and outcome, workflow.NextStep is
-// not consulted again and no notice is sent: nothing follows a stop. Run
-// by the stop request itself (httpapi's stop route), in the transaction
-// that records it, under the session's actor-epoch lock, so a resume that
-// commits after it finds nothing to revive -- the stop holds even once a
-// person resumes the session -- and again by the session actor's stop
-// timer, which catches a stop a replica of the previous release recorded
-// without it. workflows is bound to the caller's transaction; a NULL
-// stopRequestedAt -- no stop standing -- drops nothing. An error is a store
-// failure, which the caller's transaction rolls back.
+// CancelHeldAdvancesForStopRequest is a person's stop request (technical
+// plan §3.3) reaching the advances the autonomy freeze holds on sessionID,
+// in the transaction that records the request (httpapi's stop route),
+// under the session's actor-epoch lock: every one the session holds is
+// dropped, whatever its held_at, and its run, still running, ends
+// cancelled, as OnTurnCompleted's stopped branch ends one. Its finished
+// attempt keeps its status and outcome, workflow.NextStep is not consulted
+// again and no notice is sent: nothing follows a stop.
+//
+// Every hold is written under the same lock, so every one this reads
+// committed before the stop. That includes a hold whose transaction began
+// after the stop request's: its held_at, that transaction's start, is then
+// later than the request's instant, and a held_at rule
+// (CancelHeldAdvancesForStop) would keep it. So a resume that commits
+// after the stop finds nothing to revive, and the stop holds even once a
+// person resumes the session. workflows is bound to the caller's
+// transaction; an error is a store failure, which it rolls back.
+func CancelHeldAdvancesForStopRequest(ctx context.Context, workflows *postgres.WorkflowStore, sessionID pgtype.UUID) error {
+	runIDs, err := workflows.DeleteAdvanceHoldsForStopRequest(ctx, sessionID)
+	if err != nil {
+		return fmt.Errorf("workflowengine: drop the advances a stop request reaches: %w", err)
+	}
+	return cancelHeldRuns(ctx, workflows, runIDs, "a stop")
+}
+
+// CancelHeldAdvancesForStop is the session actor's stop timer reaching the
+// advances the autonomy freeze holds on sessionID: every one held at or
+// before stopRequestedAt -- the rule the stop timer deletes the session's
+// work-creating timers by -- is dropped and its run ended cancelled, as
+// CancelHeldAdvancesForStopRequest does. It catches a stop that a replica
+// of the previous release recorded without dropping the holds itself.
+// workflows is bound to the caller's transaction; a NULL stopRequestedAt
+// -- no stop standing -- drops nothing. An error is a store failure, which
+// the caller's transaction rolls back.
 func CancelHeldAdvancesForStop(ctx context.Context, workflows *postgres.WorkflowStore, sessionID pgtype.UUID, stopRequestedAt pgtype.Timestamptz) error {
 	if !stopRequestedAt.Valid {
 		return nil
@@ -110,8 +131,14 @@ func CancelHeldAdvancesForStop(ctx context.Context, workflows *postgres.Workflow
 	if err != nil {
 		return fmt.Errorf("workflowengine: drop the advances a stop predates: %w", err)
 	}
+	return cancelHeldRuns(ctx, workflows, runIDs, "a stop")
+}
+
+// cancelHeldRuns ends each of runIDs cancelled (cancelHeldRun), their holds
+// already dropped.
+func cancelHeldRuns(ctx context.Context, workflows *postgres.WorkflowStore, runIDs []pgtype.UUID, cause string) error {
 	for _, runID := range runIDs {
-		if err := cancelHeldRun(ctx, workflows, runID, "a stop"); err != nil {
+		if err := cancelHeldRun(ctx, workflows, runID, cause); err != nil {
 			return err
 		}
 	}

@@ -369,8 +369,16 @@ func (s *WorkflowStore) ReleaseAdvanceHold(ctx context.Context, runID pgtype.UUI
 	return s.q.ReleaseWorkflowAdvanceHold(ctx, runID)
 }
 
+// DeleteAdvanceHoldsForStopRequest deletes every advance sessionID holds,
+// whatever its held_at -- the stop request's own drop, under the session's
+// actor-epoch lock -- and returns their runs.
+func (s *WorkflowStore) DeleteAdvanceHoldsForStopRequest(ctx context.Context, sessionID pgtype.UUID) ([]pgtype.UUID, error) {
+	return s.q.DeleteWorkflowAdvanceHoldsForStopRequest(ctx, sessionID)
+}
+
 // DeleteAdvanceHoldsForStop deletes every advance sessionID held at or
-// before stopRequestedAt -- a person's stop -- and returns their runs.
+// before stopRequestedAt -- the stop timer's drop -- and returns their
+// runs.
 func (s *WorkflowStore) DeleteAdvanceHoldsForStop(ctx context.Context, sessionID pgtype.UUID, stopRequestedAt pgtype.Timestamptz) ([]pgtype.UUID, error) {
 	return s.q.DeleteWorkflowAdvanceHoldsForStop(ctx, sqlcgen.DeleteWorkflowAdvanceHoldsForStopParams{
 		SessionID:       sessionID,

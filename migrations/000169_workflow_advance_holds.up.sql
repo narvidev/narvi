@@ -16,11 +16,13 @@
 --   - session_id: the run's session (sessions, cascading with it), read
 --     by a person's stop, which drops the session's holds.
 --   - held_at: when the advance was held, on the database's clock -- the
---     instant a person's stop compares with: a stop requested at or after
---     it drops the hold and cancels the run, in the stop request's own
---     transaction (httpapi's requestSessionStop, through
---     workflowengine.CancelHeldAdvancesForStop), the rule the stop timer
---     deletes the session's work-creating timers by.
+--     instant the stop timer compares with: a stop requested at or after
+--     it drops the hold and cancels the run
+--     (workflowengine.CancelHeldAdvancesForStop), the rule the stop timer
+--     deletes the session's work-creating timers by. The stop request
+--     itself drops every hold of the session, whatever its held_at, in its
+--     own transaction (httpapi's requestSessionStop, through
+--     workflowengine.CancelHeldAdvancesForStopRequest).
 -- While a session holds an advance its status reads scheduled work, never
 -- settled (GetSessionActivityFacts, technical plan §43.20): the advance
 -- creates a turn with no new input once the freeze lifts.

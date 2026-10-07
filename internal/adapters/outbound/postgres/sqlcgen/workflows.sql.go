@@ -401,11 +401,42 @@ type DeleteWorkflowAdvanceHoldsForStopParams struct {
 	StopRequestedAt pgtype.Timestamptz `json:"stop_requested_at"`
 }
 
-// A person's stop drops every advance the session held at or before the
+// The stop timer's drop: every advance the session held at or before the
 // stop request -- the instant disarmWorkCreatingTimers compares with -- and
 // returns the runs, which the caller cancels.
 func (q *Queries) DeleteWorkflowAdvanceHoldsForStop(ctx context.Context, arg DeleteWorkflowAdvanceHoldsForStopParams) ([]pgtype.UUID, error) {
 	rows, err := q.db.Query(ctx, deleteWorkflowAdvanceHoldsForStop, arg.SessionID, arg.StopRequestedAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var workflow_run_id pgtype.UUID
+		if err := rows.Scan(&workflow_run_id); err != nil {
+			return nil, err
+		}
+		items = append(items, workflow_run_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const deleteWorkflowAdvanceHoldsForStopRequest = `-- name: DeleteWorkflowAdvanceHoldsForStopRequest :many
+DELETE FROM workflow_advance_holds
+WHERE session_id = $1
+RETURNING workflow_run_id
+`
+
+// The stop request's own drop: every advance the session holds, whatever
+// its held_at, and returns the runs, which the caller cancels. Run under
+// the session's actor-epoch lock, which every transaction that holds an
+// advance takes, so every hold it reads committed before the stop -- one
+// whose transaction began after the stop request's did included.
+func (q *Queries) DeleteWorkflowAdvanceHoldsForStopRequest(ctx context.Context, sessionID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, deleteWorkflowAdvanceHoldsForStopRequest, sessionID)
 	if err != nil {
 		return nil, err
 	}

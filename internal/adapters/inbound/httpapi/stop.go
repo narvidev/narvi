@@ -17,13 +17,17 @@
 //   - and the one transition it makes itself: every workflow advance the
 //     autonomy freeze holds on the session (technical plan §40.2) is
 //     dropped and its run ended cancelled
-//     (workflowengine.CancelHeldAdvancesForStop). A held advance has no
-//     turn to flag, so the request has to reach it here: a person's next
-//     prompt, which clears sessions.stop_requested_at, could otherwise
+//     (workflowengine.CancelHeldAdvancesForStopRequest). A held advance
+//     has no turn to flag, so the request has to reach it here: a person's
+//     next prompt, which clears sessions.stop_requested_at, could otherwise
 //     commit before the actor handles the stop timer, and the advance
-//     would be applied once the freeze lifts. A held run is a workflow
-//     run, not the actor's machine state, which the decide endpoint also
-//     writes under the same lock.
+//     would be applied once the freeze lifts. Every hold the session has
+//     goes, whatever its held_at: every one is written under the same
+//     lock, so each committed before the stop, even one whose transaction
+//     began after this one did, and so holds a later held_at than the
+//     request's instant. A held run is a workflow run, not the actor's
+//     machine state, which the decide endpoint also writes under the same
+//     lock.
 //
 // After the named session's commit, its descendants are walked through
 // parent_session_id, breadth first, each reached only after its parent's
@@ -310,10 +314,11 @@ func requestSessionStop(ctx context.Context, deps StopSessionDeps, sessionID, ac
 	if err != nil {
 		return pgtype.Timestamptz{}, 0, err
 	}
-	// Technical plan §40.2: the advances the autonomy freeze holds on the
-	// session are dropped with the request, so a resume committed after it
-	// cannot revive one (this file's top comment).
-	if err := workflowengine.CancelHeldAdvancesForStop(ctx, postgres.NewWorkflowStore(deps.Pool).WithTx(tx), sessionID, requestedAt); err != nil {
+	// Technical plan §40.2: every advance the autonomy freeze holds on the
+	// session is dropped with the request, whatever its held_at, so a
+	// resume committed after it cannot revive one (this file's top
+	// comment).
+	if err := workflowengine.CancelHeldAdvancesForStopRequest(ctx, postgres.NewWorkflowStore(deps.Pool).WithTx(tx), sessionID); err != nil {
 		return pgtype.Timestamptz{}, 0, err
 	}
 	// Due at once. requestedAt is on the database's clock -- the clock the
