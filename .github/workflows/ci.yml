@@ -215,7 +215,8 @@ jobs:
   # 380-603s, passing go test's default 10-minute budget once on main.
   # Group 3's leg, the shortest, now also runs that suite, alone, once its
   # own packages are done, on a budget of its own (test-integration-postgres
-  # in the Makefile, which holds the timings and the budget's reasoning).
+  # in the Makefile). httpapi and sessionactor run on budgets of their own
+  # too: the Makefile's "Time budgets" holds the rule and the timings.
   # Still four legs: the default branch's ruleset requires these four by
   # name, and group 4 is still the longest of them.
   #

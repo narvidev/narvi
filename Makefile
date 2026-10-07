@@ -88,20 +88,24 @@ test-integration:
 # it's based on, and how these four groups were chosen. Group 3's leg also
 # runs the postgres adapter's suite, alone and on a time budget of its own,
 # once group 3's packages are done: see test-integration-postgres below.
+# Three packages run on budgets of their own: see "Time budgets" below.
 #
 # Groups 2-4 run at -p 2 (group 1 is httpapi alone -- a single package, so
-# -p has no effect there, left at -p 1). This was verified, not assumed:
-# group 3 alone ran 5 independent real CI repeats at -p 2 (4m56s-5m13s,
-# vs. a 7m32s -p 1 baseline -- a consistent ~33% improvement) with zero
-# hang recurrence before this was extended to groups 2 and 4 as well.
+# -p has no effect there, left at -p 1; sessionactor, in group 2, and the
+# postgres adapter, in group 3's leg, run alone after their group's other
+# packages). This was verified, not assumed: group 3 alone ran 5
+# independent real CI repeats at -p 2 (4m56s-5m13s, vs. a 7m32s -p 1
+# baseline -- a consistent ~33% improvement) with zero hang recurrence
+# before this was extended to groups 2 and 4 as well.
 # Groups 2 and 4 were not individually put through that same 5-repeat
 # verification -- the extension rests on group 3's result plus the same
 # per-VM isolation PR #133's own job-matrix split already provides (no
 # cross-group Docker daemon contention, only WITHIN-group contention is
-# still possible at -p 2). If a hang symptom (a "test timed out after
-# 10m0s" panic) resurfaces on group 2 or 4 specifically, that's a real
-# signal this extension went too far for those groups' own package mix --
-# drop that one group back to -p 1 rather than reverting all of them.
+# still possible at -p 2). If a hang symptom (a "test timed out" panic, at
+# go test's default 10 minutes or at a package's own budget) resurfaces on
+# group 2 or 4 specifically, that's a real signal this extension went too
+# far for those groups' own package mix -- drop that one group back to -p 1
+# rather than reverting all of them.
 #
 # Groups 1-3 are deliberately short, explicit package lists -- the handful
 # of packages heavy enough to matter for balancing. Group 4 is everything
@@ -116,8 +120,10 @@ INTEGRATION_MODULE := github.com/narvidev/narvi
 
 INTEGRATION_GROUP_1 := $(INTEGRATION_MODULE)/internal/adapters/inbound/httpapi
 
+INTEGRATION_SESSIONACTOR := $(INTEGRATION_MODULE)/internal/app/sessionactor
+
 INTEGRATION_GROUP_2 := \
-	$(INTEGRATION_MODULE)/internal/app/sessionactor \
+	$(INTEGRATION_SESSIONACTOR) \
 	$(INTEGRATION_MODULE)/internal/app/outboxworker \
 	$(INTEGRATION_MODULE)/internal/app/actorauthz \
 	$(INTEGRATION_MODULE)/internal/app/reconciler
@@ -130,11 +136,49 @@ INTEGRATION_GROUP_3 := \
 	$(INTEGRATION_MODULE)/cmd/sandbox-agent \
 	$(INTEGRATION_MODULE)/test/resilience
 
-test-integration-group-1:
-	go test -tags=integration -race -p 1 $(INTEGRATION_GROUP_1)
+# Time budgets. go test's -timeout panics a test binary that runs past it,
+# and the groups here read that panic as a hang -- which it is only while a
+# green run of the package stays well inside its budget. So a package whose
+# slowest green CI run takes more than half of go test's default 10 minutes
+# gets a budget of its own: twice that run, rounded up to a whole five
+# minutes, in a go test of its own, so that the packages beside it keep the
+# default. Once a green run takes more than half of a budget, the panic stops
+# meaning a hang: make the suite faster or split it, measure again, and only
+# then move the budget, with the new numbers here.
+#
+# Slowest green runs, in CI runs 37197596784, 37198329408, 37199845054,
+# 37322887438, 37432205678, 37445859200 and 37494268063 (main, 2026-10-04
+# to 2026-10-06) and 37508303728 and 37518094978 (the change that set these
+# budgets), against each package's budget:
+#
+#   internal/adapters/outbound/postgres  559 s alone, Postgres 16   20m
+#                                        (run 37473730187; see
+#                                        test-integration-postgres)
+#   internal/app/sessionactor            338 s in group 2, at -p 2  15m
+#   internal/adapters/inbound/httpapi    310 s alone, in group 1    15m
+#   internal/app/decisioninbox           220 s in group 4           10m (default)
+#   internal/adapters/outbound/opencode  203 s in group 3           10m
+#   controlplane                         183 s in group 4           10m
+#   cmd/sandbox-agent                    140 s in group 3           10m
+#   every other package                  125 s or less              10m
+#
+# sessionactor's runs shared the runner with group 2's other packages; it
+# now runs after them, alone. The floor job's runs of a few of sessionactor's
+# and controlplane's tests (52 s and 15 s at most) keep the default.
+HTTPAPI_SUITE_TIMEOUT := 15m
+SESSIONACTOR_SUITE_TIMEOUT := 15m
 
+test-integration-group-1:
+	go test -tags=integration -race -p 1 -timeout $(HTTPAPI_SUITE_TIMEOUT) $(INTEGRATION_GROUP_1)
+
+# Group 2's other packages first, then sessionactor alone, on its own
+# budget: the second runs whatever the first does, and the leg fails if
+# either fails.
 test-integration-group-2:
-	go test -tags=integration -race -p 2 $(INTEGRATION_GROUP_2)
+	status=0; \
+	go test -tags=integration -race -p 2 $(filter-out $(INTEGRATION_SESSIONACTOR),$(INTEGRATION_GROUP_2)) || status=1; \
+	go test -tags=integration -race -p 1 -timeout $(SESSIONACTOR_SUITE_TIMEOUT) $(INTEGRATION_SESSIONACTOR) || status=1; \
+	exit $$status
 
 # Group 3's packages first, then the postgres adapter's suite alone
 # (test-integration-postgres): the second runs whatever the first does, and
@@ -171,20 +215,13 @@ test-integration-group-4:
 # ruleset requires the four test-integration legs by name, and group 4 stays
 # the longest leg either way.
 #
-# Why this budget. POSTGRES_SUITE_TIMEOUT is go test's -timeout for the
-# suite's one test binary, and a panic at it reads as a hang only while a
-# green run stays well inside it: the budget is twice the slowest run
-# measured alone, rounded up to a whole five minutes. Alone, after migrated
-# templates (sharedpool_integration_test.go's migratedDatabase) cut the
-# suite, it took 370 s on Postgres 17 (group 3's leg) and 487 s on 16 (the
-# floor job), CI run 37508303728; before them, up to 559 s on 16 (run
-# 37473730187). Twice 559 s is 18.6 minutes: 20 minutes, which a hang still
-# reaches long before the job's own six-hour limit. If a green run ever takes
-# more than half of the budget, the panic stops meaning a hang: make the
-# suite faster or split it, measure again, and only then move the budget,
-# with the new numbers here. Every other package keeps go test's default 10
-# minutes, still more than twice the slowest of them (decisioninbox, 214-219
-# s in group 4).
+# Why this budget. POSTGRES_SUITE_TIMEOUT follows the rule under "Time
+# budgets" above. Alone, after migrated templates
+# (sharedpool_integration_test.go's migratedDatabase) cut the suite, it took
+# 370 s and 486 s on Postgres 17 (group 3's leg) and 487 s and 392 s on 16
+# (the floor job), CI runs 37508303728 and 37518094978; before them, up to
+# 559 s on 16 (run 37473730187). Twice 559 s is 18.6 minutes: 20 minutes,
+# which a hang still reaches long before the job's own six-hour limit.
 INTEGRATION_POSTGRES := $(INTEGRATION_MODULE)/internal/adapters/outbound/postgres
 POSTGRES_SUITE_TIMEOUT := 20m
 POSTGRES_SUITE_TEST = go test -tags=integration -race -p 1 -timeout $(POSTGRES_SUITE_TIMEOUT) $(INTEGRATION_POSTGRES)
