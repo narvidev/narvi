@@ -766,9 +766,20 @@ func PostReviewVerdict(
 				// eligible to trigger another, regardless of what its own
 				// verdict finds.
 				autoFixCandidate = false
-			case reposErr != nil || len(repos) == 0 || repos[0].Branch == nil || *repos[0].Branch == "":
-				logger.Warn("httpapi: review-verdict: could not determine origin head branch from session repos, skipping sentinel-auto-fix trigger",
+			case reposErr != nil || len(repos) == 0:
+				logger.Warn("httpapi: review-verdict: could not read the session's repos, skipping sentinel-auto-fix trigger",
 					"error", reposErr)
+				autoFixCandidate = false
+			case repos[0].Branch == nil || *repos[0].Branch == "":
+				// A review session's spec names a head branch only when it is
+				// a branch of the pull request's base repository (technical
+				// plan §30.4): a pull request from a fork keeps its head in
+				// the fork, where a fix branch cut from the base's
+				// same-named branch would fix something else; a review
+				// whose head could not be read when it started records none
+				// either. Expected, so not a warning.
+				logger.Info("httpapi: review-verdict: the review session names no head branch in the base repository (a pull request from a fork, or a head not read when the review started), skipping sentinel-auto-fix trigger",
+					"repo", prSession.RepoFullName, "pr_number", prSession.PrNumber)
 				autoFixCandidate = false
 			default:
 				originHeadBranch = *repos[0].Branch

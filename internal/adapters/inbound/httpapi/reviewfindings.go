@@ -192,8 +192,11 @@ func RebutReviewFinding(sessions *postgres.SessionStore, prSessions *postgres.Gi
 // mutually-exclusive path (a sentinel-auto-fix child session already
 // fix_pending/fix_open/fix_merged, or a prior fix_applied/fix_recorded) --
 // §17.3: "the two remediation paths are mutually exclusive per finding";
-// 403 if the acting maintainer has no usable GitHub credential; 200 with
-// the resulting restdtos.ApplySuggestionResponse otherwise.
+// 409 too when the review session names no head branch in the pull
+// request's base repository -- a pull request from a fork, whose head this
+// endpoint never writes to (§30.4) -- with a message saying so; 403 if the
+// acting maintainer has no usable GitHub credential; 200 with the
+// resulting restdtos.ApplySuggestionResponse otherwise.
 //
 // # §30.7/§30.9 (resolved): a shadow-suppressed commit is recorded, not applied
 //
@@ -258,6 +261,45 @@ func ApplySuggestion(sessions *postgres.SessionStore, prSessions *postgres.GitHu
 			return
 		}
 
+		// The PR's own CURRENT head branch -- github_pr_sessions has no
+		// branch column of its own (it only ever maps repo/pr -> session
+		// id, migrations/000028's own doc comment); the review turn's own
+		// session row carries the branch it was created against
+		// (sessions.repos[0].branch, set at PR-mention time from the
+		// PR's real head branch, internal/adapters/inbound/github/
+		// handler.go's reviewSessionRepo) -- the same source
+		// reviewverdict.go's own sentinel-auto-fix trigger already reads.
+		// Read before the acting maintainer's credential: a pull request
+		// whose head this endpoint cannot write to is refused whoever asks.
+		sessionRow, err := sessions.Get(ctx, sessionID)
+		if err != nil {
+			logger.Error("httpapi: get session for apply-suggestion branch resolution failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		var repos []restdtos.CreateSessionRequestReposElem
+		if jsonErr := json.Unmarshal(sessionRow.Repos, &repos); jsonErr != nil || len(repos) == 0 {
+			logger.Error("httpapi: could not read the session's repos for apply-suggestion", "error", jsonErr)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if repos[0].Branch == nil || *repos[0].Branch == "" {
+			// A review session's spec names a head branch only when that
+			// branch is in the pull request's base repository (technical
+			// plan §30.4): a pull request from a fork keeps its head in the
+			// fork, which this endpoint never writes to -- it commits to
+			// prSession.RepoFullName, the base -- and the spec of one whose
+			// head could not be read when its review started names none
+			// either. Committing to a same-named branch of the base would
+			// change a branch other than the pull request's, so this is a
+			// conflict with the pull request's shape, answered as one.
+			logger.Info("httpapi: apply-suggestion refused: the review session names no head branch in the base repository",
+				"repo", prSession.RepoFullName, "pr_number", prSession.PrNumber)
+			writeError(w, http.StatusConflict, applySuggestionNoHeadBranchMessage(prSession.RepoFullName))
+			return
+		}
+		branch := *repos[0].Branch
+
 		identity, err := identities.GetByUserAndProvider(ctx, actorUserID, sqlcgen.IdentityProviderGithub)
 		if err != nil {
 			if !errors.Is(err, pgx.ErrNoRows) {
@@ -286,28 +328,6 @@ func ApplySuggestion(sessions *postgres.SessionStore, prSessions *postgres.GitHu
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-
-		// The PR's own CURRENT head branch -- github_pr_sessions has no
-		// branch column of its own (it only ever maps repo/pr -> session
-		// id, migrations/000028's own doc comment); the review turn's own
-		// session row carries the branch it was created against
-		// (sessions.repos[0].branch, set at PR-mention time from the
-		// PR's real head branch, internal/adapters/inbound/github/
-		// headresolve.go) -- the same source reviewverdict.go's own
-		// sentinel-auto-fix trigger already reads.
-		sessionRow, err := sessions.Get(ctx, sessionID)
-		if err != nil {
-			logger.Error("httpapi: get session for apply-suggestion branch resolution failed", "error", err)
-			writeError(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-		var repos []restdtos.CreateSessionRequestReposElem
-		if jsonErr := json.Unmarshal(sessionRow.Repos, &repos); jsonErr != nil || len(repos) == 0 || repos[0].Branch == nil || *repos[0].Branch == "" {
-			logger.Error("httpapi: could not determine pr head branch from session repos", "error", jsonErr)
-			writeError(w, http.StatusInternalServerError, "internal error")
-			return
-		}
-		branch := *repos[0].Branch
 
 		getCtx, cancel := context.WithTimeout(ctx, timeouts.GitHubGetPRTimeout)
 		currentContent, currentSHA, exists, err := sourceControl.GetFileContent(getCtx, ports.GetFileContentSpec{
@@ -401,4 +421,15 @@ func ApplySuggestion(sessions *postgres.SessionStore, prSessions *postgres.GitHu
 			Message:      "Suggested fix applied",
 		})
 	}
+}
+
+// applySuggestionNoHeadBranchMessage is the 409 ApplySuggestion answers for
+// a review session whose spec names no head branch in baseRepoFullName, the
+// pull request's base repository: a pull request from a fork, the common
+// case, or one whose head could not be read when its review started.
+func applySuggestionNoHeadBranchMessage(baseRepoFullName string) string {
+	return "this pull request's head branch is not in " + baseRepoFullName +
+		": a pull request from a fork keeps its head in the fork, which Narvi never writes to " +
+		"(and a review that started while the pull request's head could not be read recorded none); " +
+		"apply the suggestion on the pull request itself"
 }
