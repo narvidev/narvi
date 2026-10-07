@@ -35,9 +35,12 @@
 // (github_pr_sessions), whose recorded head is a full commit id, and whose
 // primary repo's url names the claim's repository -- the rule
 // SESSION_CONFIG's ref is set by (pullRequestRef), so the ref a checkout
-// names is the one the sandbox booted with. A review session whose spec
-// still names a fork dispatches as before until its spec names the base
-// repository. Every other turn dispatches exactly as before.
+// names is the one the sandbox booted with. The GitHub ingress writes the
+// base repository for every pull request, a fork's included; a session
+// created before it did names the fork, and is moved onto the base only
+// when no gen holds its old spec (reviewbaserepository.go) -- until then,
+// on the gen that cloned the fork, it dispatches as before. Every other
+// turn dispatches exactly as before.
 //
 // # What ends the wait
 //

@@ -1108,6 +1108,20 @@ func (a *Actor) tryPlanSpawn(
 	// httpapi.CreateSessionCore's own up-front one, not a re-use of its
 	// result.
 	if action.Kind == sandbox.SpawnActionSpawn || action.Kind == sandbox.SpawnActionRestore || action.Kind == sandbox.SpawnActionResume {
+		// §30.4: a review session whose spec still names its pull
+		// request's head repository moves onto its base repository here,
+		// before anything below reads the spec, and before the new gen's
+		// SESSION_CONFIG is assembled -- the one moment no gen holds the
+		// old spec (reviewbaserepository.go). Never on a resume, which
+		// delivers no new SESSION_CONFIG.
+		if action.Kind != sandbox.SpawnActionResume {
+			movedRow, err := a.moveReviewSessionToBaseRepository(ctx, tx, sessionRow)
+			if err != nil {
+				return nil, err
+			}
+			sessionRow = movedRow
+		}
+
 		// §31.4's spawn-time re-read of an administrator's revocation --
 		// first, and in every rollout mode: see refuseIfRepoRevoked's own
 		// doc comment (repoentitlement.go).

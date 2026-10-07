@@ -1,0 +1,11 @@
+-- Reverses review_sessions_base_repository.up.sql by changing nothing,
+-- deliberately. The up moved legacy review sessions of pull requests from
+-- forks onto their base repository, keeping no copy of the fork's url or
+-- branch: there is nothing to restore them from, and nothing to restore
+-- them for. A binary without this migration reads a moved session as a
+-- review session of its base repository with no branch -- it sets the
+-- pull request's ref in that session's SESSION_CONFIG, so its next gen
+-- still clones and boots, on the base repository at the pull request's
+-- head -- and a session moved later by this release's actor reads the
+-- same way. Applying the up again moves nothing already moved.
+SELECT 1;

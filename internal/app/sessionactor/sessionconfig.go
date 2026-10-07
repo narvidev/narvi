@@ -255,9 +255,13 @@ func (a *Actor) reviewClaim(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.S
 // here, each time a SESSION_CONFIG is assembled, from the session's claim,
 // and never stored. nil when there is no claim, when the claim's number
 // makes no valid ref, or when repo's url does not name the claim's
-// repository: such a ref is not in the repository cloned -- a review
-// session opened before its spec named the base repository names the
-// fork's -- and that session boots on its branch as before.
+// repository: such a ref is not in the repository cloned. The GitHub
+// ingress writes the base repository for every pull request; a session
+// created before it did names the fork, and is moved onto the base in the
+// transaction that spawns or restores its next gen, before this runs
+// (reviewbaserepository.go). A spec the move cannot read -- not one https
+// repo in owner/name shape -- is left as it is, and that session boots on
+// its branch as before.
 func pullRequestRef(prSession *sqlcgen.GithubPrSession, repo sessionconfig.SessionConfigReposElem) *string {
 	if prSession == nil {
 		return nil
