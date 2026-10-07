@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/narvidev/narvi/internal/domain/sandboxboot"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
@@ -757,6 +758,50 @@ func TestLoad_AgentStateDir_DefaultAndValidation(t *testing.T) {
 			}
 			if cfg.AgentStateDir != tc.want {
 				t.Errorf("AgentStateDir = %q, want %q", cfg.AgentStateDir, tc.want)
+			}
+		})
+	}
+}
+
+// TestLoad_SandboxDeadline pins NARVI_SANDBOX_DEADLINE (technical plan
+// §35.2): the instant the sandbox's provider stated it will end the
+// sandbox, read as RFC 3339. Unset states no deadline. A value that is not
+// an RFC 3339 instant states none either and never fails the boot -- the
+// control plane's own estimate stands without it -- and is kept for the
+// one WARN the caller logs.
+func TestLoad_SandboxDeadline(t *testing.T) {
+	stated := time.Date(2026, 10, 6, 14, 30, 0, 0, time.UTC)
+	tests := []struct {
+		name          string
+		value         string
+		want          *time.Time
+		wantMalformed string
+	}{
+		{name: "Unset", value: ""},
+		{name: "Valid", value: "2026-10-06T14:30:00Z", want: &stated},
+		{name: "ValidWithAnOffset", value: "2026-10-06T16:30:00+02:00", want: &stated},
+		{name: "ValidWithFractionalSeconds", value: "2026-10-06T14:30:00.000Z", want: &stated},
+		{name: "Malformed", value: "tomorrow", wantMalformed: "tomorrow"},
+		{name: "MalformedWithoutAZone", value: "2026-10-06T14:30:00", wantMalformed: "2026-10-06T14:30:00"},
+		{name: "MalformedUnixSeconds", value: "1791297000", wantMalformed: "1791297000"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NARVI_BOOT_MODE", "fresh")
+			t.Setenv("NARVI_SANDBOX_DEADLINE", tc.value)
+
+			cfg, err := boot.Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v, want nil: a deadline never fails the boot", err)
+			}
+			switch {
+			case tc.want == nil && cfg.SandboxDeadline != nil:
+				t.Errorf("SandboxDeadline = %v, want nil", *cfg.SandboxDeadline)
+			case tc.want != nil && (cfg.SandboxDeadline == nil || !cfg.SandboxDeadline.Equal(*tc.want)):
+				t.Errorf("SandboxDeadline = %v, want %v", cfg.SandboxDeadline, *tc.want)
+			}
+			if cfg.SandboxDeadlineMalformed != tc.wantMalformed {
+				t.Errorf("SandboxDeadlineMalformed = %q, want %q", cfg.SandboxDeadlineMalformed, tc.wantMalformed)
 			}
 		})
 	}

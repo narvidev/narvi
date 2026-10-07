@@ -17,6 +17,8 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -28,11 +30,15 @@ import (
 	"github.com/coder/websocket"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/narvidev/narvi/contracts"
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/contracts/gen/go/sessionconfig"
+	"github.com/narvidev/narvi/internal/adapters/outbound/opencode"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/internal/sandboxagent/boot"
 	"github.com/narvidev/narvi/internal/sandboxagent/credentials"
+	"github.com/narvidev/narvi/internal/sandboxagent/gitdir"
+	"github.com/narvidev/narvi/internal/sandboxagent/opencodeproc"
 	"github.com/narvidev/narvi/internal/sandboxagent/wsbridge"
 )
 
@@ -52,6 +58,9 @@ type fakeSnapshotCP struct {
 	// HTTP status (and a failure body) instead of a real 200 + snapshotId.
 	mintStatus int
 	frames     chan json.RawMessage
+	// ready receives each connection's first frame, the bridge's "ready",
+	// which frames never sees.
+	ready chan json.RawMessage
 	// gotMintGenHeader records the real X-Sandbox-Gen header value the
 	// snapshot-mint request actually carried (audit remediation:
 	// snapshotclient.Client.Mint now always sends one) -- proves the wiring
@@ -72,6 +81,7 @@ func newFakeSnapshotCP(t *testing.T, sessionID string) *fakeSnapshotCP {
 	fcp := &fakeSnapshotCP{
 		sessionID: sessionID,
 		frames:    make(chan json.RawMessage, 8),
+		ready:     make(chan json.RawMessage, 4),
 	}
 
 	mux := http.NewServeMux()
@@ -93,8 +103,13 @@ func newFakeSnapshotCP(t *testing.T, sessionID string) *fakeSnapshotCP {
 		defer func() { _ = conn.CloseNow() }()
 
 		ctx := r.Context()
-		if _, _, err := conn.Read(ctx); err != nil { // the bridge's own first "ready" event
+		_, ready, err := conn.Read(ctx) // the bridge's own first "ready" event
+		if err != nil {
 			return
+		}
+		select {
+		case fcp.ready <- json.RawMessage(ready):
+		default:
 		}
 		for {
 			_, data, err := conn.Read(ctx)
@@ -386,5 +401,169 @@ func TestHandleSnapshot_PurgeFailure_AbortsWithoutMinting(t *testing.T) {
 
 	if fcp.mintCalled {
 		t.Error("HandleSnapshot called the snapshot-mint endpoint despite a failed cache purge; want the mint request never built at all")
+	}
+}
+
+// newVersionedTestAdapter is the agent-runtime adapter run() builds,
+// through newAgentRuntime, from a spawn whose discovered version was
+// runtimeVersion, against a server that answers nothing: no turn runs
+// here, so the adapter only ever retries its event stream until the test
+// closes it.
+func newVersionedTestAdapter(t *testing.T, runtimeVersion string) *opencode.Adapter {
+	t.Helper()
+	srv := httptest.NewServer(http.NotFoundHandler())
+	t.Cleanup(srv.Close)
+	cfg := boot.Config{SessionConfig: &sessionconfig.SessionConfig{SandboxId: "sbx-provenance"}}
+	adapter := newAgentRuntime(opencodeproc.Result{BaseURL: srv.URL, Version: runtimeVersion}, cfg, platform.DefaultTimeouts())
+	t.Cleanup(adapter.Close)
+	return adapter
+}
+
+// startSessionCommands builds a session's handler and bridge the way run()
+// does, through newSessionCommands, against fcp, and runs the bridge until
+// the test ends.
+func startSessionCommands(t *testing.T, fcp *fakeSnapshotCP, cfg boot.Config, logger *slog.Logger, adapter *opencode.Adapter) (context.Context, *commandHandler) {
+	t.Helper()
+	cfg.SessionConfig = &sessionconfig.SessionConfig{
+		BootMode:          sessionconfig.SessionConfigBootModeFresh,
+		ControlPlaneWsUrl: fcp.wsURL(),
+		Gen:               2,
+		SandboxToken:      "test-sandbox-token",
+		SessionId:         fcp.sessionID,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTestWait)
+	handler, bridge := newSessionCommands(ctx, logger, cfg, platform.DefaultTimeouts(), nil, gitdir.Layout{}, nil, adapter, "")
+	var group errgroup.Group
+	group.Go(func() error { return bridge.Run(ctx) })
+	t.Cleanup(func() {
+		cancel()
+		_ = group.Wait()
+	})
+	return ctx, handler
+}
+
+// TestHandleSnapshot_ProvenanceIsWhatTheBinaryHolds pins technical plan
+// §35.5b's source of truth for a snapshot's provenance: what the minting
+// binary holds, never a version it was told. agentProtocol is the
+// contracts version this binary was compiled with -- not
+// NARVI_AGENT_VERSION, set here to a value that must not appear -- and
+// runtimeVersion is the agent runtime's version as its spawn discovered
+// it, carried from the spawn's result by the adapter run() builds
+// (newAgentRuntime) into the session's commands (newSessionCommands),
+// absent when it was not discoverable.
+func TestHandleSnapshot_ProvenanceIsWhatTheBinaryHolds(t *testing.T) {
+	tests := []struct {
+		name           string
+		runtimeVersion string
+		wantRuntime    *string
+	}{
+		{name: "a discovered runtime version", runtimeVersion: "1.14.19", wantRuntime: strPtr("1.14.19")},
+		{name: "no runtime version discovered", runtimeVersion: "", wantRuntime: nil},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("NARVI_BOOT_MODE", "fresh")
+			t.Setenv("NARVI_AGENT_VERSION", "9.9.9")
+			loaded, err := boot.Load()
+			if err != nil {
+				t.Fatalf("boot.Load: %v", err)
+			}
+			if loaded.AgentVersion != "9.9.9" {
+				t.Fatalf("AgentVersion = %q, want the environment's 9.9.9", loaded.AgentVersion)
+			}
+			loaded.CredentialCacheDir = ""
+
+			fcp := newFakeSnapshotCP(t, fmt.Sprintf("snapshot-provenance-session-%d", i))
+			fcp.mintSnapshotID = "snap-provenance"
+			ctx, handler := startSessionCommands(t, fcp, loaded, slog.New(slog.DiscardHandler), newVersionedTestAdapter(t, tc.runtimeVersion))
+
+			handler.HandleSnapshot(ctx, sandboxws.Snapshot{Type: "snapshot", MessageId: "msg-p", SessionId: fcp.sessionID, Gen: 2})
+
+			raw := waitForFrameType(t, fcp, "snapshot_ready", snapshotTestWait)
+			var got sandboxws.SnapshotReady
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("unmarshal SnapshotReady: %v (raw: %s)", err, raw)
+			}
+			if got.Provenance == nil {
+				t.Fatalf("snapshot_ready carries no provenance: %s", raw)
+			}
+			if got.Provenance.AgentProtocol == nil || *got.Provenance.AgentProtocol != contracts.Version {
+				t.Errorf("provenance.agentProtocol = %v, want this binary's contracts version %q", got.Provenance.AgentProtocol, contracts.Version)
+			}
+			if strings.Contains(string(raw), "9.9.9") {
+				t.Errorf("snapshot_ready names NARVI_AGENT_VERSION's 9.9.9, a value this binary was told, not one it holds: %s", raw)
+			}
+			switch {
+			case tc.wantRuntime == nil && got.Provenance.RuntimeVersion != nil:
+				t.Errorf("provenance.runtimeVersion = %q, want none: no runtime version was discovered", *got.Provenance.RuntimeVersion)
+			case tc.wantRuntime != nil && (got.Provenance.RuntimeVersion == nil || *got.Provenance.RuntimeVersion != *tc.wantRuntime):
+				t.Errorf("provenance.runtimeVersion = %v, want the discovered %q", got.Provenance.RuntimeVersion, *tc.wantRuntime)
+			}
+		})
+	}
+}
+
+// TestNewSessionCommands_StatesTheProvidersDeadline pins how run() wires
+// the deadline the sandbox's provider stated (technical plan §35.2): the
+// session's bridge counts every ready down to it, and one line says so; a
+// value that is not an RFC 3339 instant is ignored with one WARN; with none
+// stated, the ready carries no lifetimeRemainingSeconds and nothing is
+// logged.
+func TestNewSessionCommands_StatesTheProvidersDeadline(t *testing.T) {
+	stated := time.Now().Add(90 * time.Minute).Truncate(time.Second)
+	tests := []struct {
+		name      string
+		cfg       boot.Config
+		wantReady bool // the ready carries lifetimeRemainingSeconds
+		wantLevel string
+		wantAttr  string
+	}{
+		{name: "a stated deadline", cfg: boot.Config{SandboxDeadline: &stated}, wantReady: true, wantLevel: "INFO", wantAttr: stated.UTC().Format(time.RFC3339)},
+		{name: "none stated", cfg: boot.Config{}},
+		{name: "a malformed one", cfg: boot.Config{SandboxDeadlineMalformed: "tomorrow"}, wantLevel: "WARN", wantAttr: "tomorrow"},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var logs strings.Builder
+			fcp := newFakeSnapshotCP(t, fmt.Sprintf("session-deadline-%d", i))
+			startSessionCommands(t, fcp, tc.cfg, slog.New(slog.NewJSONHandler(&logs, nil)), newVersionedTestAdapter(t, ""))
+
+			var ready json.RawMessage
+			select {
+			case ready = <-fcp.ready:
+			case <-time.After(snapshotTestWait):
+				t.Fatal("no ready arrived")
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(ready, &fields); err != nil {
+				t.Fatalf("malformed ready %s: %v", ready, err)
+			}
+			remaining, present := fields["lifetimeRemainingSeconds"]
+			switch {
+			case present && !tc.wantReady:
+				t.Errorf("ready lifetimeRemainingSeconds = %s, want the key absent", remaining)
+			case tc.wantReady:
+				var seconds int
+				if err := json.Unmarshal(remaining, &seconds); err != nil || seconds > 5400 || seconds < 5400-60 {
+					t.Errorf("ready lifetimeRemainingSeconds = %s, want the 90 minutes left until the stated deadline", remaining)
+				}
+			}
+
+			out := strings.TrimSpace(logs.String())
+			if tc.wantLevel == "" {
+				if out != "" {
+					t.Errorf("logged %q with no deadline stated, want nothing", out)
+				}
+				return
+			}
+			lines := strings.Split(out, "\n")
+			var line map[string]any
+			if len(lines) != 1 || json.Unmarshal([]byte(lines[0]), &line) != nil {
+				t.Fatalf("logged %q, want exactly one JSON line", out)
+			}
+			if line["level"] != tc.wantLevel || !strings.Contains(lines[0], tc.wantAttr) {
+				t.Errorf("logged %s, want one %s line naming %q", lines[0], tc.wantLevel, tc.wantAttr)
+			}
+		})
 	}
 }

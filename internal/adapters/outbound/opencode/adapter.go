@@ -353,6 +353,15 @@ func (a *Adapter) Close() {
 	_ = a.group.Wait()
 }
 
+// RuntimeVersion is the version of the runtime binary this adapter talks
+// to, as its spawn discovered it (New's runtimeVersion), "" when it was not
+// discoverable. Like Close, not part of ports.AgentRuntime: cmd/sandbox-agent
+// reports it as what a snapshot of this sandbox holds (technical plan
+// §35.5b).
+func (a *Adapter) RuntimeVersion() string {
+	return a.runtimeVersion
+}
+
 // Connected blocks until the persistent SSE stream has observed at least
 // one server.connected handshake, or ctx is done — used by this package's
 // own tests to prove the stream came up; not required for StartTurn's own
