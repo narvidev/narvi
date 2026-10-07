@@ -29,16 +29,29 @@ import (
 // shape of write.
 const contextWriteMaxBuffers = holdWakeMaxBuffers
 
-// contextTurnStatusIndexEntryMaxBuffers is what UpdateTurnStatus reads
-// beyond contextWriteMaxBuffers since the plan tests migrate past 000166
-// (holdPlanLatestVersion): its new row version's entry in
-// turns_session_dispatched_idx, an index this test's bound predates. It is
-// the session guard's plan test's own measure of that entry
-// (sessionDispatchedIndexEntryMaxBuffers) for an index two levels above its
-// leaves, which it is on the tables below, of up to 316,000 turns: the
-// metapage and one page of each level down to the leaf. main's text of the
-// statement reads the same.
-var contextTurnStatusIndexEntryMaxBuffers = sessionDispatchedIndexEntryMaxBuffers(2)
+// contextTurnWriteIndexEntryMaxBuffers is what a write of a turn that is
+// never heap-only (contextWritesTurns) reads beyond contextWriteMaxBuffers
+// since the plan tests migrate past 000166 (holdPlanLatestVersion): its new
+// row version's entry in turns_session_dispatched_idx, an index this test's
+// bound predates. It is the session guard's plan test's own measure of that
+// entry (sessionDispatchedIndexEntryMaxBuffers) for an index two levels
+// above its leaves, which it is on the tables below, of up to 316,000
+// turns: the metapage and one page of each level down to the leaf. main's
+// text of UpdateTurnStatus reads the same.
+var contextTurnWriteIndexEntryMaxBuffers = sessionDispatchedIndexEntryMaxBuffers(2)
+
+// contextWritesTurns names the measured writes of a turn: each new row
+// version gets an entry in every index of turns, the one 000166 added
+// included.
+var contextWritesTurns = map[string]bool{"UpdateTurnStatus": true, "SetTurnContextUnconfirmed": true}
+
+// contextWriteLimit is what the write named name may read.
+func contextWriteLimit(name string) float64 {
+	if contextWritesTurns[name] {
+		return contextWriteMaxBuffers + contextTurnWriteIndexEntryMaxBuffers
+	}
+	return contextWriteMaxBuffers
+}
 
 // contextPlanShape is a table TestReviewContextCheck_PlansReadTheSessionsOwnTurns
 // reads: holdPlanShape's sessions, every one claiming a pull request, whose
@@ -343,9 +356,9 @@ func contextReadProblem(m holdPlanMeasurement, ownTurns int, noSeqScan bool) str
 // text of each, and the new SetTurnContextUnconfirmed,
 // RequeueAutoRetrigger, DropAutoRetrigger, ResetAutoRetriggerContextMoves
 // and RequeueReviewRetriggerDebounce -- must read at most
-// contextWriteMaxBuffers each, whatever the table holds (UpdateTurnStatus
-// contextTurnStatusIndexEntryMaxBuffers more, for its entry in an index
-// added since); the two changed
+// contextWriteMaxBuffers each, whatever the table holds (a write of a turn
+// contextTurnWriteIndexEntryMaxBuffers more, for its entry in an index
+// added since: contextWriteLimit); the two changed
 // ones on main's own access path too (a write's own buffers vary by one
 // between two runs, as its new row version lands).
 func TestReviewContextCheck_PlansReadTheSessionsOwnTurns(t *testing.T) {
@@ -612,12 +625,8 @@ func TestReviewContextCheck_PlansReadTheSessionsOwnTurns(t *testing.T) {
 							if got, want := scanShape(after.scans), scanShape(before.scans); got != want {
 								t.Errorf("%s: plans %s, main's text %s: the change moved its access path", key, got, want)
 							}
-							limit := float64(contextWriteMaxBuffers)
-							if pr.changed.name == "UpdateTurnStatus" {
-								limit += contextTurnStatusIndexEntryMaxBuffers
-							}
-							if after.buffers > limit {
-								t.Errorf("%s: reads %.0f buffers, over %.0f (%v)", key, after.buffers, limit, after.scans)
+							if limit := contextWriteLimit(pr.changed.name); after.buffers > limit {
+								t.Errorf("%s: reads %.0f buffers, over %.0f (%v)", key, after.buffers, contextWriteLimit(pr.changed.name), after.scans)
 							}
 							continue
 						}
@@ -636,8 +645,8 @@ func TestReviewContextCheck_PlansReadTheSessionsOwnTurns(t *testing.T) {
 					for _, w := range writes {
 						got := measureHoldPlan(ctx, t, pool, w, probe, mode)
 						t.Logf("%s, %s, %s: %v", w.name, probe.name, mode, got)
-						if got.buffers > contextWriteMaxBuffers {
-							t.Errorf("%s, %s, %s: reads %.0f buffers, over %d (%v)", w.name, probe.name, mode, got.buffers, contextWriteMaxBuffers, got.scans)
+						if got.buffers > contextWriteLimit(w.name) {
+							t.Errorf("%s, %s, %s: reads %.0f buffers, over %.0f (%v)", w.name, probe.name, mode, got.buffers, contextWriteLimit(w.name), got.scans)
 						}
 					}
 				}
