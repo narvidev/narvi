@@ -323,7 +323,7 @@ type RepoEntitlementDecision struct {
 //     moved onto their base repository (technical plan §30.4; payload.go's
 //     own mention.RepoCloneURL doc comment), and a session created before
 //     that, until it is moved, still names it, while github_pr_sessions is
-//     keyed on the PR's BASE/upstream repo instead (mention.RepoFullName's
+//     keyed on the PR's BASE repository instead (mention.RepoFullName's
 //     own doc comment: "the claim key"). Checking Known against the FORK's own
 //     owner/repo would find no row (a fork essentially never independently
 //     accumulates its own github_pr_sessions history) and wrongly deny
