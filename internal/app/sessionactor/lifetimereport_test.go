@@ -2,9 +2,11 @@ package sessionactor
 
 import (
 	"encoding/json"
-	"strings"
+	"reflect"
 	"testing"
 	"time"
+
+	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 )
 
 // TestReportedLifetimeRemaining pins how the control plane reads the
@@ -109,46 +111,99 @@ func TestDecodeSnapshotReady_AnyProvenanceKeepsTheSnapshot(t *testing.T) {
 	}
 }
 
-// TestFrameWithout pins the helper both decodes above go through: the key
-// goes, under every case encoding/json would match, and nothing else
-// changes; a frame without it, or that is not an object, is returned as it
-// was.
+// TestFrameWithout pins the helper both decodes above go through: every
+// member the key names goes, under every case encoding/json would match,
+// and every other member stays exactly as it was, in its place,
+// duplicates included; a frame without the key, or that is not a single
+// object, is returned as it was.
 func TestFrameWithout(t *testing.T) {
 	t.Parallel()
 	tests := []struct {
 		name string
 		raw  string
-		want map[string]string // nil: raw returned unchanged
+		want string
 	}{
-		{name: "the key", raw: `{"a":1,"lifetimeRemainingSeconds":60.0}`, want: map[string]string{"a": `1`}},
-		{name: "every case of it", raw: `{"a":1,"LifetimeRemainingSeconds":1,"lifetimeremainingseconds":2}`, want: map[string]string{"a": `1`}},
-		{name: "other values kept verbatim", raw: `{"n":1e400,"s":"x","o":{"lifetimeRemainingSeconds":1},"lifetimeRemainingSeconds":1}`,
-			want: map[string]string{"n": `1e400`, "s": `"x"`, "o": `{"lifetimeRemainingSeconds":1}`}},
-		{name: "without the key", raw: `{"a":1}`},
-		{name: "not an object", raw: `[1,2]`},
-		{name: "not JSON", raw: `{"a":`},
+		{name: "the key, last", raw: `{"b":1,"a":"x","lifetimeRemainingSeconds":60.0}`, want: `{"b":1,"a":"x"}`},
+		{name: "the key, first", raw: `{"lifetimeRemainingSeconds":60,"b":1,"a":2}`, want: `{"b":1,"a":2}`},
+		{name: "the key, in the middle", raw: `{"b":1,"lifetimeRemainingSeconds":-5,"a":2}`, want: `{"b":1,"a":2}`},
+		{name: "every case of it", raw: `{"z":0,"LifetimeRemainingSeconds":1,"y":true,"lifetimeremainingseconds":2}`, want: `{"z":0,"y":true}`},
+		{name: "its name escaped", raw: `{"a":1,"lifetime\u0052emainingSeconds":1}`, want: `{"a":1}`},
+		{name: "the only member", raw: `{"lifetimeRemainingSeconds":1}`, want: `{}`},
+		{name: "other values kept verbatim", raw: `{"n":1e400,"s":"x\u00e9","o":{"lifetimeRemainingSeconds":1},"lifetimeRemainingSeconds":1,"f":60.0}`,
+			want: `{"n":1e400,"s":"x\u00e9","o":{"lifetimeRemainingSeconds":1},"f":60.0}`},
+		{name: "duplicates and case variants of others kept in order", raw: `{"c":{"p":true},"C":{"p":false},"lifetimeRemainingSeconds":1,"c":3}`,
+			want: `{"c":{"p":true},"C":{"p":false},"c":3}`},
+		{name: "whitespace", raw: " {\n  \"a\" : 1 ,\n  \"lifetimeRemainingSeconds\" : 1 ,\n  \"b\" : [ 2 ]\n} ", want: "{\"a\" : 1,\n  \"b\" : [ 2 ]}"},
+		{name: "without the key", raw: `{"b":1,"a":2}`, want: `{"b":1,"a":2}`},
+		{name: "not an object", raw: `[1,2]`, want: `[1,2]`},
+		{name: "not JSON", raw: `{"a":`, want: `{"a":`},
+		{name: "invalid after the key", raw: `{"lifetimeRemainingSeconds":1,"a":}`, want: `{"lifetimeRemainingSeconds":1,"a":}`},
+		{name: "something after the object", raw: `{"lifetimeRemainingSeconds":1} {}`, want: `{"lifetimeRemainingSeconds":1} {}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			got := frameWithout(json.RawMessage(tc.raw), lifetimeReportKey)
-			if tc.want == nil {
-				if string(got) != tc.raw {
-					t.Errorf("frameWithout(%s) = %s, want it unchanged", tc.raw, got)
-				}
-				return
+			if string(got) != tc.want {
+				t.Errorf("frameWithout(%s) = %s, want %s", tc.raw, got, tc.want)
 			}
-			var fields map[string]json.RawMessage
-			if err := json.Unmarshal(got, &fields); err != nil {
-				t.Fatalf("frameWithout(%s) = %s: %v", tc.raw, got, err)
+		})
+	}
+}
+
+// TestFrameWithout_EveryOtherFieldDecodesAsWithoutTheKey pins what the
+// decodes through frameWithout promise: a frame decodes, field for field,
+// exactly as the same frame never carrying the stripped key does -- the
+// way it decoded before the generated types named that key -- including a
+// frame whose other members repeat or vary in case, where encoding/json
+// lets the last of them on the wire win.
+func TestFrameWithout_EveryOtherFieldDecodesAsWithoutTheKey(t *testing.T) {
+	t.Parallel()
+	const ready = `"type":"ready","messageId":"r1","sessionId":"s","gen":3,"timestamp":"2026-10-01T12:00:00Z","agentVersion":"dev","imageDigest":"unknown"`
+	const snapshot = `"type":"snapshot_ready","messageId":"m1","sessionId":"s","gen":2,"ackId":"snapshot_ready:m1","commandMessageId":"c1"`
+	readyTests := []struct{ name, before, after string }{
+		{name: "capabilities then Capabilities", before: ready + `,"capabilities":{"promptReceipt":true,"maxFrameBytes":1048576},"Capabilities":{"promptReceipt":false}`},
+		{name: "Capabilities then capabilities", before: ready + `,"Capabilities":{"promptReceipt":false},"capabilities":{"promptReceipt":true,"maxFrameBytes":1048576}`},
+		{name: "the same member twice", before: ready + `,"capabilities":{"promptReceipt":true},"capabilities":{"maxFrameBytes":65536}`},
+		{name: "the key between the variants", before: ready + `,"capabilities":{"promptReceipt":true}`, after: `"Capabilities":{"promptReceipt":false}`},
+		{name: "agentVersion in two cases", before: ready + `,"AgentVersion":"v2","capabilities":{"promptReceipt":true}`},
+	}
+	for _, tc := range readyTests {
+		t.Run("ready/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			members := tc.before
+			if tc.after != "" {
+				members += "," + tc.after
 			}
-			if len(fields) != len(tc.want) {
-				t.Errorf("frameWithout(%s) = %s, want exactly %v", tc.raw, got, tc.want)
+			withKey := `{` + tc.before + `,"lifetimeRemainingSeconds":60.0`
+			if tc.after != "" {
+				withKey += "," + tc.after
 			}
-			for name, value := range tc.want {
-				if strings.TrimSpace(string(fields[name])) != value {
-					t.Errorf("frameWithout(%s)[%q] = %s, want %s", tc.raw, name, fields[name], value)
-				}
+			withKey += `}`
+			var want sandboxws.Ready
+			wantErr := json.Unmarshal([]byte(`{`+members+`}`), &want)
+			got, err := decodeReady(json.RawMessage(withKey))
+			if (err == nil) != (wantErr == nil) || !reflect.DeepEqual(got, want) {
+				t.Errorf("decodeReady(%s) = %+v (%v), want %+v (%v): what the frame decodes to without the key", withKey, got, err, want, wantErr)
+			}
+		})
+	}
+	snapshotTests := []struct{ name, members string }{
+		{name: "snapshotId then SnapshotId", members: snapshot + `,"snapshotId":"good","SnapshotId":"last"`},
+		{name: "SnapshotId then snapshotId", members: snapshot + `,"SnapshotId":"first","snapshotId":"last"`},
+	}
+	for _, tc := range snapshotTests {
+		t.Run("snapshot_ready/"+tc.name, func(t *testing.T) {
+			t.Parallel()
+			withKey := `{"provenance":{"agentProtocol":42},` + tc.members + `}`
+			var want sandboxws.SnapshotReady
+			wantErr := json.Unmarshal([]byte(`{`+tc.members+`}`), &want)
+			got, err := decodeSnapshotReady(json.RawMessage(withKey))
+			if (err == nil) != (wantErr == nil) || !reflect.DeepEqual(got, want) {
+				t.Errorf("decodeSnapshotReady(%s) = %+v (%v), want %+v (%v): what the frame decodes to without the key", withKey, got, err, want, wantErr)
+			}
+			if got.SnapshotId != "last" {
+				t.Errorf("decodeSnapshotReady(%s).SnapshotId = %q, want the last on the wire", withKey, got.SnapshotId)
 			}
 		})
 	}

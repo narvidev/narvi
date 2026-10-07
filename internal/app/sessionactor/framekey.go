@@ -1,7 +1,10 @@
 package sessionactor
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
+	"io"
 	"strings"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
@@ -25,31 +28,52 @@ const (
 )
 
 // frameWithout returns raw without its top-level key, for a decode through
-// a generated type that must not see it: every key that matches it
-// case-insensitively goes, since encoding/json matches a struct field's
-// name that way. raw is returned unchanged when it has no such key, or is
-// not a JSON object -- the decode that follows then fails, or succeeds,
-// exactly as it would have.
+// a generated type that must not see it: every member whose name matches
+// it case-insensitively goes, since encoding/json matches a struct field's
+// name that way. Every other member is kept as it is in raw, byte for byte
+// and in its place, duplicates included, so a decode of the result reads
+// what a decode of raw reads for every other field -- encoding/json lets
+// the last of several members that name one field win. raw is returned
+// unchanged when it has no such member, or is not a single JSON object --
+// the decode that follows then fails, or succeeds, exactly as it would
+// have.
 func frameWithout(raw json.RawMessage, key string) json.RawMessage {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &fields); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return raw
 	}
+	var kept [][]byte
 	removed := false
-	for name := range fields {
-		if strings.EqualFold(name, key) {
-			delete(fields, name)
-			removed = true
+	for dec.More() {
+		// A member runs from the end of the one before it (or the opening
+		// brace), its separating comma included, to the end of its value.
+		start := dec.InputOffset()
+		name, err := dec.Token()
+		if err != nil {
+			return raw
 		}
+		var value json.RawMessage
+		if err := dec.Decode(&value); err != nil {
+			return raw
+		}
+		if name, ok := name.(string); ok && strings.EqualFold(name, key) {
+			removed = true
+			continue
+		}
+		member := bytes.TrimLeft(raw[start:dec.InputOffset()], " \t\r\n")
+		kept = append(kept, bytes.TrimPrefix(member, []byte(",")))
 	}
 	if !removed {
 		return raw
 	}
-	stripped, err := json.Marshal(fields)
-	if err != nil {
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('}') {
 		return raw
 	}
-	return stripped
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return raw
+	}
+	stripped := append([]byte("{"), bytes.Join(kept, []byte(","))...)
+	return append(stripped, '}')
 }
 
 // decodeSnapshotReady decodes a snapshot_ready event through the generated
