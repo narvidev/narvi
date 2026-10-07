@@ -246,7 +246,8 @@ ORDER BY day;
 -- workflow_runs_session_id_idx, workflow_step_runs_one_live_per_run,
 -- session_timers' UNIQUE (session_id, name), github_pr_sessions_session_
 -- id_idx, release_manifest_pending_session_id_idx,
--- release_manifest_checks_running_session_id_idx); the escalation's
+-- release_manifest_checks_running_session_id_idx,
+-- workflow_advance_holds_session_idx); the escalation's
 -- follow-up checks go by primary key, by session_id over turns, and by
 -- workflow_run_id (workflow_step_runs_run_step_idx), and repo_settings and
 -- repo_entitlement_revocations by their primary keys.
@@ -326,6 +327,15 @@ ORDER BY day;
 -- reads them as scheduled work, never settled; each is written in (or
 -- before) the transaction that arms it, and removed only after the turn
 -- it creates has committed.
+-- workflow_advance_held is whether a workflow advance the autonomy freeze
+-- holds is waiting on this session (workflow_advance_holds, technical plan
+-- §40.2): once the freeze lifts, the releaser applies it and the run's
+-- next attempt creates a turn with no new input, so the handler reads it
+-- as scheduled work too, never settled. The hold is written in the
+-- transaction that ends the step's turn and deleted in the one that
+-- applies the advance, so no snapshot sees neither. An EXISTS over
+-- workflow_advance_holds_session_idx: one descent, however many holds
+-- other sessions have.
 --
 -- pr_delivery_started_at is the push and pull request a completed turn
 -- handed off and that have not finished (migrations/000145): the handler
@@ -370,7 +380,10 @@ SELECT
     reretrigger.dropped_at::timestamptz AS review_retrigger_dropped_at,
     COALESCE(reretrigger.dropped_head_sha, '')::text AS review_retrigger_dropped_head_sha,
     releasepending.pending_since::timestamptz AS release_check_pending_since,
-    releaserunning.claimed_at::timestamptz AS release_check_claimed_at
+    releaserunning.claimed_at::timestamptz AS release_check_claimed_at,
+    EXISTS (
+        SELECT 1 FROM workflow_advance_holds h WHERE h.session_id = s.id
+    )::boolean AS workflow_advance_held
 FROM sessions s
 LEFT JOIN sandboxes sb ON sb.session_id = s.id
 LEFT JOIN LATERAL (

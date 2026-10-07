@@ -418,3 +418,60 @@ FROM workflow_step_runs sr
 LEFT JOIN turns t ON t.id = sr.turn_id
 WHERE sr.workflow_run_id = $1
 ORDER BY sr.created_at ASC, sr.id ASC;
+
+-- The autonomy freeze's held advances (technical plan §40.2, §25.9), the
+-- rows of workflow_advance_holds: OnTurnCompleted writes one in the
+-- transaction ending a tracked attempt whose next step would advance while
+-- autonomy is frozen, and workflowengine.HeldAdvanceReleaser deletes it,
+-- under the session's actor-epoch lock, as it applies the advance once the
+-- freeze lifts. A person's stop deletes the session's holds, and cancels
+-- their runs.
+
+-- name: HoldWorkflowAdvance :execrows
+-- One hold per run, held_at on the database's clock. Zero rows when the
+-- run already holds one, which a run with no live attempt cannot reach: the
+-- caller logs it.
+INSERT INTO workflow_advance_holds (workflow_run_id, step_run_id, session_id)
+VALUES (sqlc.arg('workflow_run_id'), sqlc.arg('step_run_id'), sqlc.arg('session_id'))
+ON CONFLICT (workflow_run_id) DO NOTHING;
+
+-- name: GetWorkflowAdvanceHold :one
+-- The run's held advance; pgx.ErrNoRows when it holds none.
+SELECT * FROM workflow_advance_holds WHERE workflow_run_id = $1;
+
+-- name: ListWorkflowAdvanceHolds :many
+-- One page of the held advances, oldest first, at most
+-- sqlc.arg('max_holds'): the ones after (after_held_at, after_run_id) in
+-- (held_at, workflow_run_id) order -- the last row of the page before, or
+-- -infinity and the nil uuid for the first -- through
+-- workflow_advance_holds_held_at_idx, whose key is that pair, so each page
+-- starts where the last ended, however many rows came before it. The
+-- releaser reads every page in one tick.
+SELECT * FROM workflow_advance_holds
+WHERE (held_at, workflow_run_id) > (sqlc.arg('after_held_at')::timestamptz, sqlc.arg('after_run_id')::uuid)
+ORDER BY held_at, workflow_run_id
+LIMIT sqlc.arg('max_holds');
+
+-- name: ReleaseWorkflowAdvanceHold :one
+-- The release's compare-and-swap: deletes the run's hold and returns it.
+-- pgx.ErrNoRows when it is gone -- another replica released it, or a stop
+-- dropped it -- and the caller applies nothing.
+DELETE FROM workflow_advance_holds WHERE workflow_run_id = $1 RETURNING *;
+
+-- name: DeleteWorkflowAdvanceHoldsForStopRequest :many
+-- The stop request's own drop: every advance the session holds, whatever
+-- its held_at, and returns the runs, which the caller cancels. Run under
+-- the session's actor-epoch lock, which every transaction that holds an
+-- advance takes, so every hold it reads committed before the stop -- one
+-- whose transaction began after the stop request's did included.
+DELETE FROM workflow_advance_holds
+WHERE session_id = sqlc.arg('session_id')
+RETURNING workflow_run_id;
+
+-- name: DeleteWorkflowAdvanceHoldsForStop :many
+-- The stop timer's drop: every advance the session held at or before the
+-- stop request -- the instant disarmWorkCreatingTimers compares with -- and
+-- returns the runs, which the caller cancels.
+DELETE FROM workflow_advance_holds
+WHERE session_id = sqlc.arg('session_id') AND held_at <= sqlc.arg('stop_requested_at')
+RETURNING workflow_run_id;

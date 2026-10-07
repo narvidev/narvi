@@ -51,6 +51,38 @@ func contextWriteLimit(m holdPlanMeasurement) float64 {
 	return contextWriteMaxBuffers
 }
 
+// contextWritesTurns names the measured writes of a turn, the ones
+// measured on turns settled for them (measureTurnWrites).
+var contextWritesTurns = map[string]bool{"UpdateTurnStatus": true, "SetTurnContextUnconfirmed": true}
+
+// measureTurnWrites measures each of statements, writes of one turn, as
+// measureHoldPlan does, on turns settled for it as measureGuardWrite
+// settles them. Every measure writes nine row versions of the probe's
+// newest turn, rolled back, and each takes an entry in every index of
+// turns, in the leaves the turn's keys fall in -- the same leaves for
+// every measure of the turn. Unsettled, those leaves fill with the dead
+// entries of the measures before, and the measured write then deletes
+// them to make room, reading their heap pages: the same write of the same
+// turn read 24 buffers, then 29 in every measure after. So each statement
+// runs once unmeasured first, and a leaf its entries do not fit splits
+// then; and each measure runs on turns vacuumed with INDEX_CLEANUP ON,
+// which removes every dead entry, so each leaf it reaches has room for
+// the nine entries it took in the unmeasured run.
+func measureTurnWrites(ctx context.Context, t *testing.T, pool *pgxpool.Pool, probe holdPlanProbe, mode string, statements ...holdPlanStatement) []holdPlanMeasurement {
+	t.Helper()
+	for _, s := range statements {
+		measureHoldPlan(ctx, t, pool, s, probe, mode)
+	}
+	out := make([]holdPlanMeasurement, len(statements))
+	for i, s := range statements {
+		if _, err := pool.Exec(ctx, `VACUUM (INDEX_CLEANUP ON) turns`); err != nil {
+			t.Fatalf("vacuum turns: %v", err)
+		}
+		out[i] = measureHoldPlan(ctx, t, pool, s, probe, mode)
+	}
+	return out
+}
+
 // contextPlanShape is a table TestReviewContextCheck_PlansReadTheSessionsOwnTurns
 // reads: holdPlanShape's sessions, every one claiming a pull request, whose
 // ended turns ended a second after they were created -- the last of them
@@ -354,9 +386,12 @@ func contextReadProblem(m holdPlanMeasurement, ownTurns int, noSeqScan bool) str
 // text of each, and the new SetTurnContextUnconfirmed,
 // RequeueAutoRetrigger, DropAutoRetrigger, ResetAutoRetriggerContextMoves
 // and RequeueReviewRetriggerDebounce -- must read at most
-// contextWriteMaxBuffers each, whatever the table holds; the two changed
+// contextWriteMaxBuffers each, whatever the table holds (a write of a turn
+// contextTurnWriteMaxBuffers: contextWriteLimit); the two changed
 // ones on main's own access path too (a write's own buffers vary by one
-// between two runs, as its new row version lands).
+// between two runs, as its new row version lands). The writes are
+// measured after every read, a write of a turn on turns settled for it
+// (measureTurnWrites).
 func TestReviewContextCheck_PlansReadTheSessionsOwnTurns(t *testing.T) {
 	const budget = 10
 	uuidArg := func(p holdPlanProbe) string { return fmt.Sprintf("'%s'::uuid", p.sessionID.String()) }
@@ -601,31 +636,18 @@ func TestReviewContextCheck_PlansReadTheSessionsOwnTurns(t *testing.T) {
 			newestTurn = func(p holdPlanProbe) pgtype.UUID { return newest[p.sessionID] }
 			claim = func(p holdPlanProbe) (string, int32) { c := claims[p.sessionID]; return c.repo, c.pr }
 
+			// The reads first, on turns as the shape stored them: settling a
+			// write of a turn vacuums turns, which would set the visibility
+			// map the reads are measured without.
 			for _, probe := range probes {
 				for _, mode := range modes {
 					for _, pr := range pairs {
-						key := pr.changed.name + ", " + probe.name + ", " + mode
-						var before, after holdPlanMeasurement
 						if pr.write {
-							before = measureHoldPlan(ctx, t, pool, pr.before, probe, mode)
-							after = measureHoldPlan(ctx, t, pool, pr.changed, probe, mode)
-						} else {
-							after, before = measureAgainstMain(ctx, t, pool, pr.changed, pr.before, probe, mode)
-						}
-						t.Logf("%s: main's text %v; this release's %v", key, before, after)
-						if pr.write {
-							// A write's own buffers vary by one between two
-							// runs on a densely loaded table -- where its new
-							// row version lands -- so its plan is held to
-							// main's, its read to the bound.
-							if got, want := scanShape(after.scans), scanShape(before.scans); got != want {
-								t.Errorf("%s: plans %s, main's text %s: the change moved its access path", key, got, want)
-							}
-							if limit := contextWriteLimit(after); after.buffers > limit {
-								t.Errorf("%s: reads %.0f buffers, over %.0f (%v)", key, after.buffers, limit, after.scans)
-							}
 							continue
 						}
+						key := pr.changed.name + ", " + probe.name + ", " + mode
+						after, before := measureAgainstMain(ctx, t, pool, pr.changed, pr.before, probe, mode)
+						t.Logf("%s: main's text %v; this release's %v", key, before, after)
 						if after.buffers > before.buffers {
 							t.Errorf("%s: reads %.0f buffers, main's text %.0f: the change made it worse", key, after.buffers, before.buffers)
 						}
@@ -638,8 +660,44 @@ func TestReviewContextCheck_PlansReadTheSessionsOwnTurns(t *testing.T) {
 					if problem := contextReadProblem(got, probe.turns, true); problem != "" {
 						t.Errorf("GetReviewAttemptToCheck, %s, %s: %s", probe.name, mode, problem)
 					}
+				}
+			}
+			// measure measures statements, texts of the write named name, in
+			// turn: on turns settled for them when it writes a turn
+			// (measureTurnWrites).
+			measure := func(name string, probe holdPlanProbe, mode string, statements ...holdPlanStatement) []holdPlanMeasurement {
+				if contextWritesTurns[name] {
+					return measureTurnWrites(ctx, t, pool, probe, mode, statements...)
+				}
+				out := make([]holdPlanMeasurement, len(statements))
+				for i, s := range statements {
+					out[i] = measureHoldPlan(ctx, t, pool, s, probe, mode)
+				}
+				return out
+			}
+			for _, probe := range probes {
+				for _, mode := range modes {
+					for _, pr := range pairs {
+						if !pr.write {
+							continue
+						}
+						key := pr.changed.name + ", " + probe.name + ", " + mode
+						m := measure(pr.changed.name, probe, mode, pr.before, pr.changed)
+						before, after := m[0], m[1]
+						t.Logf("%s: main's text %v; this release's %v", key, before, after)
+						// A write's own buffers vary by one between two
+						// runs on a densely loaded table -- where its new
+						// row version lands -- so its plan is held to
+						// main's, its read to the bound.
+						if got, want := scanShape(after.scans), scanShape(before.scans); got != want {
+							t.Errorf("%s: plans %s, main's text %s: the change moved its access path", key, got, want)
+						}
+						if limit := contextWriteLimit(after); after.buffers > limit {
+							t.Errorf("%s: reads %.0f buffers, over %.0f (%v)", key, after.buffers, limit, after.scans)
+						}
+					}
 					for _, w := range writes {
-						got := measureHoldPlan(ctx, t, pool, w, probe, mode)
+						got := measure(w.name, probe, mode, w)[0]
 						t.Logf("%s, %s, %s: %v", w.name, probe.name, mode, got)
 						if limit := contextWriteLimit(got); got.buffers > limit {
 							t.Errorf("%s, %s, %s: reads %.0f buffers, over %.0f (%v)", w.name, probe.name, mode, got.buffers, limit, got.scans)

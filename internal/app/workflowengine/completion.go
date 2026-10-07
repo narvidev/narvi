@@ -51,6 +51,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	domainautonomy "github.com/narvidev/narvi/internal/domain/autonomy"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/domain/workflow"
 	"github.com/narvidev/narvi/internal/platform"
@@ -94,7 +95,10 @@ func stepRunTerminalStatus(trig turn.Trigger) string {
 // up whether turnID is a live, engine-tracked attempt; if so, finalizes it
 // and -- unless the step is HITLAfter-gated -- consults workflow.NextStep
 // (via ApplyStepOutcome, advance.go) to advance, complete, or escalate the
-// owning run. sessionRow is the SAME row the caller (pushpr.go/timerfired.go/
+// owning run -- an advance the autonomy freeze holds (technical plan §40.2,
+// deps.Autonomy) is written as a row instead, and HeldAdvanceReleaser
+// (release.go) applies it once the freeze lifts. sessionRow is the SAME row
+// the caller (pushpr.go/timerfired.go/
 // dispatch.go/stop.go, all four already fetch or hold it for their own
 // unrelated reasons) already has in scope -- used for BuildModelID on an
 // advance, for notification-destination resolution, and for the session's
@@ -245,6 +249,71 @@ func OnTurnCompleted(ctx context.Context, deps Deps, sessionRow sqlcgen.Session,
 		logger.Info("workflowengine: outcome posted concurrently during turn completion; using finish step run's own authoritative value instead of the earlier stale read",
 			"step_run_id", stepRun.ID.String(), "pre_read_outcome", string(outcome), "authoritative_outcome", string(authoritative))
 		outcome = authoritative
+	}
+
+	// Technical plan §40.2: while autonomy is frozen a run does not advance
+	// on its own. Read here -- once the attempt is finished with its
+	// authoritative outcome, and only when workflow.NextStep says advance:
+	// completing or escalating a run starts nothing, so it proceeds while
+	// frozen -- and before ApplyStepOutcome asks the session guard (§40.1)
+	// to admit the next attempt. The freeze is read before the cap, as at
+	// the automatic re-review: a frozen advance records no crossing -- no
+	// warning, no notice, no escalation -- and meets the guard once it is
+	// released, as any advance does. A needs_fix advance the circuit
+	// breaker turns into an escalation (breakerEscalates) is not held
+	// either: it escalates now, through ApplyStepOutcome below, so the
+	// person it asks to review the run is told during the freeze. The held
+	// advance is a row (workflow_advance_holds), written in this
+	// transaction: the run stays running with no live attempt, the
+	// session's status reads it as scheduled work, and HeldAdvanceReleaser
+	// (release.go) applies the stored outcome exactly once after the freeze
+	// lifts.
+	if next, err := workflow.NextStep(def, stepID, outcome); err == nil && next.Kind == workflow.NextAdvance {
+		if deps.Autonomy == nil {
+			logger.Error("workflowengine: no autonomy freeze is wired for this advance; applying it unread",
+				"run_id", runRow.ID.String(), "step_run_id", finished.ID.String())
+		} else {
+			frozen, err := deps.Autonomy.FrozenTx(ctx)
+			if err != nil {
+				// A read that fails is a skip, never a pass (§40.2). The
+				// failed read has already aborted the caller's
+				// transaction, so its commit fails and the whole terminal
+				// write is retried.
+				deps.Autonomy.RecordSkip(ctx, domainautonomy.SiteWorkflowAdvance, domainautonomy.SkipFreezeUnreadable,
+					"run_id", runRow.ID.String(), "step_run_id", finished.ID.String())
+				logger.Error("workflowengine: the autonomy freeze could not be read; the advance is not applied",
+					"run_id", runRow.ID.String(), "step_run_id", finished.ID.String(), "error", err)
+				return
+			}
+			escalates := false
+			if frozen {
+				if escalates, _, err = breakerEscalates(ctx, deps, runRow, outcome, next.ToStepID); err != nil {
+					// The failed read has aborted the caller's transaction:
+					// the turn's end is retried, as on a freeze read that
+					// fails.
+					logger.Error("workflowengine: read the circuit breaker for a frozen advance failed; the advance is not applied",
+						"run_id", runRow.ID.String(), "step_run_id", finished.ID.String(), "error", err)
+					return
+				}
+				if escalates {
+					logger.Info("workflowengine: a frozen advance the circuit breaker escalates is escalated now, not held",
+						"run_id", runRow.ID.String(), "step_run_id", finished.ID.String(), "next_step_id", string(next.ToStepID))
+				}
+			}
+			if frozen && !escalates {
+				if err := holdAdvance(ctx, deps, runRow, finished, sessionRow); err != nil {
+					logger.Error("workflowengine: hold the advance the autonomy freeze holds failed",
+						"run_id", runRow.ID.String(), "step_run_id", finished.ID.String(), "error", err)
+					return
+				}
+				deps.Autonomy.RecordSkip(ctx, domainautonomy.SiteWorkflowAdvance, domainautonomy.SkipFrozen,
+					"run_id", runRow.ID.String(), "step_run_id", finished.ID.String())
+				logger.Info("workflowengine: workflow advance held by the autonomy freeze; released once it lifts",
+					"outcome", domainautonomy.OutcomeSkipped, "run_id", runRow.ID.String(), "step_run_id", finished.ID.String(),
+					"step_id", string(stepID), "step_outcome", string(outcome), "next_step_id", string(next.ToStepID))
+				return
+			}
+		}
 	}
 
 	// (§25.9): ApplyStepOutcome (advance.go) is the SAME shared

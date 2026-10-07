@@ -31,6 +31,7 @@ import (
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/autonomy"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionnotice"
 	"github.com/narvidev/narvi/internal/app/turnguard"
@@ -92,6 +93,18 @@ type Deps struct {
 	// notice; a person's decision is answered with the refusal and rolled
 	// back.
 	Origin sessionguard.Origin
+
+	// Autonomy is the autonomy freeze (internal/app/autonomy, technical
+	// plan §40.2), bound to the caller's transaction: OnTurnCompleted reads
+	// it once an attempt's next step would advance, and holds the advance
+	// in a row while autonomy is frozen (completion.go). Only the session
+	// actor's own advance sets it -- a person's decision on a step is never
+	// read against the freeze, so the decide endpoint leaves it nil, and
+	// never reaches OnTurnCompleted. A nil Autonomy where OnTurnCompleted
+	// runs is a wiring bug, logged at Error, and the advance proceeds (the
+	// package's fail-open rule, doc.go): a source test in
+	// internal/app/sessionactor keeps every caller wiring it.
+	Autonomy *autonomy.Bound
 
 	// EpistemicCheckDefault (F6, adversarial review) is the SAME
 	// platform.Config.EpistemicCheckDefault value every other

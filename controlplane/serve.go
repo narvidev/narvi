@@ -96,6 +96,7 @@ import (
 	"github.com/narvidev/narvi/internal/app/shadowslack"
 	"github.com/narvidev/narvi/internal/app/turnguard"
 	"github.com/narvidev/narvi/internal/app/uploadsweep"
+	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/integrations"
 	"github.com/narvidev/narvi/internal/domain/mcpclient"
 	"github.com/narvidev/narvi/internal/domain/mcpscope"
@@ -174,6 +175,7 @@ type App struct {
 	releaseManifestWorker   *releasereview.Worker
 	automationEngine        *automation.Engine
 	automergeWorker         *automerge.Worker
+	heldAdvanceReleaser     *workflowengine.HeldAdvanceReleaser
 	digestPump              *digest.Pump
 	uploadSweeper           *uploadsweep.Sweeper
 	providerCredentialStore *postgres.ProviderCredentialStore
@@ -2094,6 +2096,16 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	}
 	automergeWorker, releaseManifestWorker := githubOutboundAxis.workers()
 
+	// heldAdvanceReleaser (technical plan §40.2, §25.9) applies, once the
+	// autonomy freeze lifts, each workflow advance the session actors held
+	// while it was set -- exactly once, under the session's actor-epoch
+	// lock, admitted by the same session guard every turn is. Started
+	// below, through the same errgroup as every other background loop.
+	heldAdvanceReleaser, err := workflowengine.NewHeldAdvanceReleaser(pool, sessionGuard, cfg.Timeouts, cfg.ShadowMode, cfg.EpistemicCheckDefault)
+	if err != nil {
+		return nil, fmt.Errorf("construct the held workflow advance releaser: %w", err)
+	}
+
 	// digestPump (§21.3): started below, alongside every other background
 	// loop, through the SAME errgroup (§11: no naked goroutine).
 	digestPump := digest.New(digest.Deps{
@@ -3223,6 +3235,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		releaseManifestWorker:   releaseManifestWorker,
 		automationEngine:        automationEngine,
 		automergeWorker:         automergeWorker,
+		heldAdvanceReleaser:     heldAdvanceReleaser,
 		digestPump:              digestPump,
 		uploadSweeper:           uploadSweeper,
 		providerCredentialStore: providerCredentialStore,
@@ -3251,6 +3264,7 @@ func (a *App) Run(ctx context.Context, addr string) error {
 	releaseManifestWorker := a.releaseManifestWorker
 	automationEngine := a.automationEngine
 	automergeWorker := a.automergeWorker
+	heldAdvanceReleaser := a.heldAdvanceReleaser
 	digestPump := a.digestPump
 	uploadSweeper := a.uploadSweeper
 	providerCredentialStore := a.providerCredentialStore
@@ -3390,6 +3404,17 @@ func (a *App) Run(ctx context.Context, addr string) error {
 			return nil
 		})
 	}
+
+	// (§40.2, §25.9): the held workflow advance releaser, always built --
+	// it reads an empty table outside a freeze -- and started/shut down
+	// through this SAME errgroup, no naked goroutine (§11), with the same
+	// context.Canceled carve-out.
+	group.Go(func() error {
+		if err := heldAdvanceReleaser.Run(groupCtx); err != nil && !errors.Is(err, context.Canceled) {
+			return fmt.Errorf("held workflow advance releaser: %w", err)
+		}
+		return nil
+	})
 
 	// (§21.3, "deterministic daily digest"): started/shut down
 	// through this SAME errgroup as every other background loop above --

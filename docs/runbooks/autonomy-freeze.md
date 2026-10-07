@@ -23,6 +23,7 @@ every replica, with no restart.
 | `auto_re_review` | no automatic review turn, no budget spent, no GitHub read | the debounce timer, re-armed every minute, with the pushed head kept as its target |
 | `automation_cron` | a matched schedule is not fired or claimed | nothing: see "After the freeze lifts" |
 | `automation_fan_out` | an invocation starts no run and no session; no failed run, no strike, no auto-pause | the invocation, pending and unclaimed |
+| `workflow_advance` | a workflow run does not advance to its next step on its own: no next attempt, no turn, no session-guard check, no notice. The attempt that just ended is finished as always, its outcome stored. Completing or escalating a run is not held -- a circuit-breaker escalation included, which escalates at once and sends its one notice | a `workflow_advance_holds` row, the run still `running` with no live attempt; the session's status reads `scheduled`, never settled |
 
 An event-triggered automation (GitHub, the issue tracker, the generic
 webhook) still records its invocation while frozen -- the webhook still
@@ -61,8 +62,13 @@ settle, is never kept waiting by the freeze.
   asked for.
 - **Infrastructure**: the reconciler, image builds, digests, sweeps, token
   refresh, sandbox rotation, idle stop.
+- **A person's decision on a workflow step** awaiting one: an approval or a
+  revision dispatches the next attempt, frozen or not. A person's own turn
+  on a session whose run holds its advance runs too, untracked by the run.
 
-The workflow engine's automatic advance between steps is not held yet.
+A person's stop still reaches a held workflow advance: the stop request drops
+it and cancels its run in the request's own transaction, so it is never
+applied, even when the session is resumed a moment later.
 
 ## Confirm
 
@@ -75,11 +81,14 @@ The workflow engine's automatic advance between steps is not held yet.
   could not be read: a read that fails is a skip, never a pass, so a
   database problem holds automatic actions rather than letting them run.
 - Each pump logs one Info line per tick with how many actions it held,
+  with `outcome=skipped`. The workflow engine logs each advance it holds,
   with `outcome=skipped`.
 - A held outbox row's `last_error` reads
   `skipped (frozen): the autonomy freeze holds this delivery; attempt not
   counted`, and its `attempts` does not move: that is what tells it from a
   failed delivery.
+- The workflow advances held: `SELECT workflow_run_id, step_run_id,
+  session_id, held_at FROM workflow_advance_holds ORDER BY held_at;`
 - To read the freeze in force, on the control plane's database:
   `SELECT autonomy_frozen, autonomy_frozen_at, autonomy_frozen_by,
   autonomy_freeze_reason FROM platform_settings WHERE id = 1;` -- a missing
@@ -118,6 +127,8 @@ finishes, the way a running turn does. Each is bounded:
 - cron: a claim whose read preceded the freeze -- one pending invocation,
   then held at fan-out;
 - fan-out: an invocation whose read preceded the freeze, one per replica;
+- the workflow engine: an advance whose read, in the transaction ending its
+  step's turn, preceded the freeze, one turn per run, which then dispatches;
 - a turn enqueued automatically before the freeze dispatches.
 
 ## After the freeze lifts
@@ -129,6 +140,17 @@ Every held candidate is still a candidate:
 - the outbox and the automatic re-review: within a minute and five seconds
   (`AutonomyFreezeRecheckInterval` plus the pump's interval). The
   re-review reviews the head pushed last.
+- workflow advances: within a minute (`AutonomyFreezeRecheckInterval`, the
+  releaser's tick; a replica that starts releases at once), oldest first,
+  each exactly once -- every held advance in that one tick, however many a
+  long freeze held: the releaser reads them a page of fifty at a time, each
+  page after the last row of the one before, each release one short
+  transaction. It reads the freeze again in each advance's own transaction,
+  under the session's lock, deletes the hold and applies the stored outcome
+  as the turn's end would have: the session guard admits the next attempt or
+  escalates the run, as for any advance, and the next attempt's turn is told
+  the finished step's stored summary and is dispatched like any queued turn.
+  A run a person stopped meanwhile is cancelled instead.
 - cron: an occurrence the freeze held fires once, on the first tick after
   the freeze lifts, if that tick comes less than ten minutes
   (`AutomationCronCatchUpWindow`) after the occurrence; otherwise it waits
@@ -175,3 +197,18 @@ freeze in force, whatever the row says: turn off auto-merge and the other
 automatic toggles per repository, and pause automations, before rolling back
 during an incident. A paused automation's invocations wait, and fan out when
 it is resumed (above).
+
+A binary without the held workflow advance reads the freeze at the other
+sites but **advances every workflow run whose step's turn ends while frozen**,
+as the engine did before the advance was held: rolling back past it lifts the
+freeze at `workflow_advance`, whatever the row says. Before rolling back
+during an incident, stop the sessions whose workflow runs must not move on
+(a stop ends a run's next attempt cancelled, in either binary).
+
+It does not know `workflow_advance_holds` either. Its migration's down
+cancels every run whose advance is held, the one kind of candidate a rollback
+loses; rolling back with the table kept (`migrate force`) leaves each such
+run running with no live attempt -- every turn on its session untracked by the
+run, and no new run starting on it -- until the release that holds them
+returns and releases them. Both are spelled out in the migration's own
+header.

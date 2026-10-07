@@ -309,6 +309,83 @@ func (s *WorkflowStore) ClaimEscalationNotice(ctx context.Context, runID pgtype.
 	return s.q.ClaimWorkflowRunEscalationNotice(ctx, runID)
 }
 
+// --- The autonomy freeze's held advances (technical plan §40.2, §25.9):
+// workflow_advance_holds, one row per run whose automatic advance the
+// freeze holds. internal/app/workflowengine writes and releases them.
+
+// HoldAdvance records that runID's advance past its finished attempt
+// stepRunID is held, at now on the database's clock. It reports whether a
+// row was written: false when the run already holds one, which a run with
+// no live attempt cannot reach.
+func (s *WorkflowStore) HoldAdvance(ctx context.Context, runID, stepRunID, sessionID pgtype.UUID) (bool, error) {
+	n, err := s.q.HoldWorkflowAdvance(ctx, sqlcgen.HoldWorkflowAdvanceParams{
+		WorkflowRunID: runID,
+		StepRunID:     stepRunID,
+		SessionID:     sessionID,
+	})
+	return n == 1, err
+}
+
+// GetAdvanceHold returns runID's held advance; pgx.ErrNoRows (unwrapped)
+// when it holds none.
+func (s *WorkflowStore) GetAdvanceHold(ctx context.Context, runID pgtype.UUID) (sqlcgen.WorkflowAdvanceHold, error) {
+	return s.q.GetWorkflowAdvanceHold(ctx, runID)
+}
+
+// AdvanceHoldCursor is where a page of held advances starts: after the
+// hold at (HeldAt, RunID) in (held_at, workflow_run_id) order.
+type AdvanceHoldCursor struct {
+	HeldAt pgtype.Timestamptz
+	RunID  pgtype.UUID
+}
+
+// FirstAdvanceHolds is the cursor of the first page: -infinity and the nil
+// uuid, before every hold.
+var FirstAdvanceHolds = AdvanceHoldCursor{
+	HeldAt: pgtype.Timestamptz{InfinityModifier: pgtype.NegativeInfinity, Valid: true},
+	RunID:  pgtype.UUID{Valid: true},
+}
+
+// AdvanceHoldCursorAfter is the cursor of the page that follows the one h
+// ended.
+func AdvanceHoldCursorAfter(h sqlcgen.WorkflowAdvanceHold) AdvanceHoldCursor {
+	return AdvanceHoldCursor{HeldAt: h.HeldAt, RunID: h.WorkflowRunID}
+}
+
+// ListAdvanceHolds returns at most limit held advances after cursor,
+// oldest first: one page.
+func (s *WorkflowStore) ListAdvanceHolds(ctx context.Context, cursor AdvanceHoldCursor, limit int32) ([]sqlcgen.WorkflowAdvanceHold, error) {
+	return s.q.ListWorkflowAdvanceHolds(ctx, sqlcgen.ListWorkflowAdvanceHoldsParams{
+		AfterHeldAt: cursor.HeldAt,
+		AfterRunID:  cursor.RunID,
+		MaxHolds:    limit,
+	})
+}
+
+// ReleaseAdvanceHold deletes runID's held advance and returns it: the
+// release's compare-and-swap. pgx.ErrNoRows (unwrapped) when it is gone --
+// another replica released it, or a person's stop dropped it.
+func (s *WorkflowStore) ReleaseAdvanceHold(ctx context.Context, runID pgtype.UUID) (sqlcgen.WorkflowAdvanceHold, error) {
+	return s.q.ReleaseWorkflowAdvanceHold(ctx, runID)
+}
+
+// DeleteAdvanceHoldsForStopRequest deletes every advance sessionID holds,
+// whatever its held_at -- the stop request's own drop, under the session's
+// actor-epoch lock -- and returns their runs.
+func (s *WorkflowStore) DeleteAdvanceHoldsForStopRequest(ctx context.Context, sessionID pgtype.UUID) ([]pgtype.UUID, error) {
+	return s.q.DeleteWorkflowAdvanceHoldsForStopRequest(ctx, sessionID)
+}
+
+// DeleteAdvanceHoldsForStop deletes every advance sessionID held at or
+// before stopRequestedAt -- the stop timer's drop -- and returns their
+// runs.
+func (s *WorkflowStore) DeleteAdvanceHoldsForStop(ctx context.Context, sessionID pgtype.UUID, stopRequestedAt pgtype.Timestamptz) ([]pgtype.UUID, error) {
+	return s.q.DeleteWorkflowAdvanceHoldsForStop(ctx, sqlcgen.DeleteWorkflowAdvanceHoldsForStopParams{
+		SessionID:       sessionID,
+		StopRequestedAt: stopRequestedAt,
+	})
+}
+
 // --- "workflow definition & run API" (§25.10/§25.11) own additions
 // below: the definition/binding CRUD + duplicate surface, and
 // the two run-history list reads the run view needs. Definition writes

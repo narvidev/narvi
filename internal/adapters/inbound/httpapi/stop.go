@@ -1,9 +1,11 @@
 // This file (stop.go) implements POST /api/sessions/{sessionID}/stop
 // (technical plan §3.3): a person's request to stop a session and every
 // session it started. The route writes the request as data and changes no
-// state itself -- every transition stays with each session's actor (§2),
-// through §3.3's existing cancel edge (internal/app/sessionactor's
-// stop.go). In one transaction per session, under the session's
+// session, turn or sandbox state itself -- every such transition stays with
+// each session's actor (§2), through §3.3's existing cancel edge
+// (internal/app/sessionactor's stop.go); the one exception, a workflow run
+// whose advance the freeze holds, is the last item below. In one
+// transaction per session, under the session's
 // actor-epoch lock (the lock REST already takes to insert a turn, and the
 // review webhook to write a timer):
 //
@@ -11,7 +13,21 @@
 //   - sessions.stop_requested_at;
 //   - the session's `stop` timer upserted to now -- what makes the request
 //     survive the loss of a replica;
-//   - one session.stop audit row.
+//   - one session.stop audit row;
+//   - and the one transition it makes itself: every workflow advance the
+//     autonomy freeze holds on the session (technical plan §40.2) is
+//     dropped and its run ended cancelled
+//     (workflowengine.CancelHeldAdvancesForStopRequest). A held advance
+//     has no turn to flag, so the request has to reach it here: a person's
+//     next prompt, which clears sessions.stop_requested_at, could otherwise
+//     commit before the actor handles the stop timer, and the advance
+//     would be applied once the freeze lifts. Every hold the session has
+//     goes, whatever its held_at: every one is written under the same
+//     lock, so each committed before the stop, even one whose transaction
+//     began after this one did, and so holds a later held_at than the
+//     request's instant. A held run is a workflow run, not the actor's
+//     machine state, which the decide endpoint also writes under the same
+//     lock.
 //
 // After the named session's commit, its descendants are walked through
 // parent_session_id, breadth first, each reached only after its parent's
@@ -48,6 +64,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
+	"github.com/narvidev/narvi/internal/app/workflowengine"
 	"github.com/narvidev/narvi/internal/domain/authz"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -295,6 +312,13 @@ func requestSessionStop(ctx context.Context, deps StopSessionDeps, sessionID, ac
 	}
 	requestedAt, err := deps.Sessions.WithTx(tx).RequestStop(ctx, sessionID)
 	if err != nil {
+		return pgtype.Timestamptz{}, 0, err
+	}
+	// Technical plan §40.2: every advance the autonomy freeze holds on the
+	// session is dropped with the request, whatever its held_at, so a
+	// resume committed after it cannot revive one (this file's top
+	// comment).
+	if err := workflowengine.CancelHeldAdvancesForStopRequest(ctx, postgres.NewWorkflowStore(deps.Pool).WithTx(tx), sessionID); err != nil {
 		return pgtype.Timestamptz{}, 0, err
 	}
 	// Due at once. requestedAt is on the database's clock -- the clock the

@@ -95,6 +95,14 @@ var AutonomyFreezeChecks = []AutonomyFreezeCheck{
 		Site: "SiteAutomationFanOut", File: "internal/app/automation/fanout.go", Function: "pumpOnce", Reads: 1,
 		Reason: "each claimed invocation reads the freeze again right before its runs start, giving back the claims a freeze landed on",
 	},
+	{
+		Site: "SiteWorkflowAdvance", File: "internal/app/workflowengine/completion.go", Function: "OnTurnCompleted", Reads: 1,
+		Reason: "the workflow engine reads the freeze in the transaction ending an attempt whose next step would advance, before the session guard is asked, and holds the advance in a row while frozen",
+	},
+	{
+		Site: "SiteWorkflowAdvance", File: "internal/app/workflowengine/release.go", Function: "releaseHold", Reads: 1,
+		Reason: "the releaser reads the freeze again inside each held advance's own transaction, under the session's lock, before it deletes the hold and applies the advance",
+	},
 }
 
 // AutonomyFreezeHumanPath is one file holding a person's command, which

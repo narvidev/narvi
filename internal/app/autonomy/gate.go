@@ -108,6 +108,38 @@ func (g *Gate) FrozenTx(ctx context.Context, tx pgx.Tx) (bool, error) {
 	return frozen, nil
 }
 
+// Bound is a Gate bound to one transaction: how a site that is handed its
+// caller's transaction, rather than opening one, reads the freeze -- the
+// workflow engine's automatic advance (internal/app/workflowengine's
+// Deps.Autonomy), run inside the session actor's transaction as the
+// session guard's turnguard.Bound is.
+type Bound struct {
+	g  *Gate
+	tx pgx.Tx
+}
+
+// WithTx binds g to tx. A nil Gate binds to nil, which the caller reads as
+// no gate wired.
+func (g *Gate) WithTx(tx pgx.Tx) *Bound {
+	if g == nil {
+		return nil
+	}
+	return &Bound{g: g, tx: tx}
+}
+
+// FrozenTx is Gate.FrozenTx in the bound transaction: a read that fails
+// returns its error, the transaction already aborted, and a frozen read
+// records nothing -- the caller records the skip once its own durable trace
+// is written.
+func (b *Bound) FrozenTx(ctx context.Context) (bool, error) {
+	return b.g.FrozenTx(ctx, b.tx)
+}
+
+// RecordSkip is Gate.RecordSkip.
+func (b *Bound) RecordSkip(ctx context.Context, site domainautonomy.Site, reason domainautonomy.SkipReason, attrs ...any) {
+	b.g.RecordSkip(ctx, site, reason, attrs...)
+}
+
 // RecordSkip records that site skipped one action for reason: one on
 // autonomy_freeze_skip_total{site, reason}, and a Debug line with outcome
 // skipped and attrs. A skip is never a failure, so it is never logged as

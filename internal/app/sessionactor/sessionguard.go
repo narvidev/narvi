@@ -52,7 +52,10 @@ func (a *Actor) sessionGuard(tx pgx.Tx) *turnguard.Bound {
 // bound to tx, with the session guard and the origin of an automatic
 // advance: the engine's next attempt is admitted by the guard first, and a
 // refusal escalates the run rather than failing anything
-// (workflowengine's admitNextAttempt).
+// (workflowengine's admitNextAttempt). And the autonomy freeze (technical
+// plan §40.2), bound to tx: the engine's own advance -- this package's,
+// never a person's decision -- is held while autonomy is frozen, read
+// before the guard is asked (workflowengine's OnTurnCompleted).
 func (a *Actor) workflowDeps(tx pgx.Tx) workflowengine.Deps {
 	return workflowengine.Deps{
 		Workflows:             a.stores.workflow.WithTx(tx),
@@ -63,6 +66,7 @@ func (a *Actor) workflowDeps(tx pgx.Tx) workflowengine.Deps {
 		Outbox:                a.stores.outbox.WithTx(tx),
 		Guard:                 a.sessionGuard(tx),
 		Origin:                sessionguard.OriginAutomatic,
+		Autonomy:              a.autonomy.WithTx(tx),
 		EpistemicCheckDefault: a.epistemicCheckDefault,
 	}
 }

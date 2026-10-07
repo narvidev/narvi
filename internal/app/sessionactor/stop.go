@@ -44,6 +44,14 @@
 //     timers (ClassifyTimer: TimerWorkCreatesTurn) armed at or before the
 //     request -- its latest instant, which a repeated request moves forward
 //     -- are deleted; one armed after it is new input, and stays.
+//   - By the same rule, a workflow advance the autonomy freeze held at or
+//     before the request (technical plan §40.2) is dropped, and its run
+//     ends cancelled (cancelHeldWorkflowAdvancesForStop). The stop request
+//     itself drops every advance the session holds, whatever its held_at,
+//     in its own transaction (httpapi's stop route), so the advance is
+//     never applied, even after a person resumes the session; this handler
+//     catches a stop recorded without it, by a replica of the previous
+//     release during a rolling deploy.
 //
 // A turn created after the request carries no flag and runs normally. A
 // person's next act that sets the session going again also clears the
@@ -158,6 +166,9 @@ func (a *Actor) handleStopTimer(ctx context.Context) error {
 			return err
 		}
 		if err := a.dropOwedReviewRequestsForStop(ctx, tx, sessionRow); err != nil {
+			return err
+		}
+		if err := a.cancelHeldWorkflowAdvancesForStop(ctx, tx, sessionRow); err != nil {
 			return err
 		}
 
@@ -619,6 +630,27 @@ func (a *Actor) dropOwedReviewRequestsForStop(ctx context.Context, tx pgx.Tx, se
 	}
 	if err := a.stores.timer.WithTx(tx).ArmOwedReviewRequest(ctx, a.sessionID); err != nil {
 		return fmt.Errorf("sessionactor: arm the owed review request timer: %w", err)
+	}
+	return nil
+}
+
+// cancelHeldWorkflowAdvancesForStop drops every workflow advance the
+// autonomy freeze held on this session at or before the person's standing
+// stop (technical plan §40.2, §3.3) -- the rule disarmWorkCreatingTimers
+// deletes by, the database's clock on both sides -- and ends each held
+// run cancelled (workflowengine.CancelHeldAdvancesForStop). A stop is the
+// person's answer, so the held advance is never applied, and nobody is
+// told. The stop route drops every advance the session holds, whatever its
+// held_at, in the request's own transaction
+// (workflowengine.CancelHeldAdvancesForStopRequest); this, run by the stop
+// timer after the owed requests are dropped, catches a stop
+// a replica of the previous release recorded without dropping them, as
+// does the releaser, which takes the same actor-epoch lock and cancels the
+// run itself when it reaches such a hold first. A NULL stop request -- none
+// standing, or a person resumed the session -- drops nothing.
+func (a *Actor) cancelHeldWorkflowAdvancesForStop(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session) error {
+	if err := workflowengine.CancelHeldAdvancesForStop(ctx, a.stores.workflow.WithTx(tx), a.sessionID, sessionRow.StopRequestedAt); err != nil {
+		return fmt.Errorf("sessionactor: %w", err)
 	}
 	return nil
 }

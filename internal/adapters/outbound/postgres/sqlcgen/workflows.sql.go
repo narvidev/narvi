@@ -390,6 +390,71 @@ func (q *Queries) DecideWorkflowStepRunRevise(ctx context.Context, arg DecideWor
 	return result.RowsAffected(), nil
 }
 
+const deleteWorkflowAdvanceHoldsForStop = `-- name: DeleteWorkflowAdvanceHoldsForStop :many
+DELETE FROM workflow_advance_holds
+WHERE session_id = $1 AND held_at <= $2
+RETURNING workflow_run_id
+`
+
+type DeleteWorkflowAdvanceHoldsForStopParams struct {
+	SessionID       pgtype.UUID        `json:"session_id"`
+	StopRequestedAt pgtype.Timestamptz `json:"stop_requested_at"`
+}
+
+// The stop timer's drop: every advance the session held at or before the
+// stop request -- the instant disarmWorkCreatingTimers compares with -- and
+// returns the runs, which the caller cancels.
+func (q *Queries) DeleteWorkflowAdvanceHoldsForStop(ctx context.Context, arg DeleteWorkflowAdvanceHoldsForStopParams) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, deleteWorkflowAdvanceHoldsForStop, arg.SessionID, arg.StopRequestedAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var workflow_run_id pgtype.UUID
+		if err := rows.Scan(&workflow_run_id); err != nil {
+			return nil, err
+		}
+		items = append(items, workflow_run_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const deleteWorkflowAdvanceHoldsForStopRequest = `-- name: DeleteWorkflowAdvanceHoldsForStopRequest :many
+DELETE FROM workflow_advance_holds
+WHERE session_id = $1
+RETURNING workflow_run_id
+`
+
+// The stop request's own drop: every advance the session holds, whatever
+// its held_at, and returns the runs, which the caller cancels. Run under
+// the session's actor-epoch lock, which every transaction that holds an
+// advance takes, so every hold it reads committed before the stop -- one
+// whose transaction began after the stop request's did included.
+func (q *Queries) DeleteWorkflowAdvanceHoldsForStopRequest(ctx context.Context, sessionID pgtype.UUID) ([]pgtype.UUID, error) {
+	rows, err := q.db.Query(ctx, deleteWorkflowAdvanceHoldsForStopRequest, sessionID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []pgtype.UUID
+	for rows.Next() {
+		var workflow_run_id pgtype.UUID
+		if err := rows.Scan(&workflow_run_id); err != nil {
+			return nil, err
+		}
+		items = append(items, workflow_run_id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const deleteWorkflowDefinition = `-- name: DeleteWorkflowDefinition :execrows
 DELETE FROM workflow_definitions WHERE id = $1
 `
@@ -673,6 +738,23 @@ func (q *Queries) GetRunningWorkflowRunForSession(ctx context.Context, sessionID
 	return i, err
 }
 
+const getWorkflowAdvanceHold = `-- name: GetWorkflowAdvanceHold :one
+SELECT workflow_run_id, step_run_id, session_id, held_at FROM workflow_advance_holds WHERE workflow_run_id = $1
+`
+
+// The run's held advance; pgx.ErrNoRows when it holds none.
+func (q *Queries) GetWorkflowAdvanceHold(ctx context.Context, workflowRunID pgtype.UUID) (WorkflowAdvanceHold, error) {
+	row := q.db.QueryRow(ctx, getWorkflowAdvanceHold, workflowRunID)
+	var i WorkflowAdvanceHold
+	err := row.Scan(
+		&i.WorkflowRunID,
+		&i.StepRunID,
+		&i.SessionID,
+		&i.HeldAt,
+	)
+	return i, err
+}
+
 const getWorkflowBindingForRepo = `-- name: GetWorkflowBindingForRepo :one
 
 SELECT id, lane, repo_full_name, workflow_definition_id, definition_version, created_at, updated_at FROM workflow_bindings WHERE lane = $1 AND repo_full_name = $2
@@ -875,6 +957,82 @@ func (q *Queries) GetWorkflowStepRun(ctx context.Context, id pgtype.UUID) (Workf
 		&i.FinishedAt,
 	)
 	return i, err
+}
+
+const holdWorkflowAdvance = `-- name: HoldWorkflowAdvance :execrows
+
+INSERT INTO workflow_advance_holds (workflow_run_id, step_run_id, session_id)
+VALUES ($1, $2, $3)
+ON CONFLICT (workflow_run_id) DO NOTHING
+`
+
+type HoldWorkflowAdvanceParams struct {
+	WorkflowRunID pgtype.UUID `json:"workflow_run_id"`
+	StepRunID     pgtype.UUID `json:"step_run_id"`
+	SessionID     pgtype.UUID `json:"session_id"`
+}
+
+// The autonomy freeze's held advances (technical plan §40.2, §25.9), the
+// rows of workflow_advance_holds: OnTurnCompleted writes one in the
+// transaction ending a tracked attempt whose next step would advance while
+// autonomy is frozen, and workflowengine.HeldAdvanceReleaser deletes it,
+// under the session's actor-epoch lock, as it applies the advance once the
+// freeze lifts. A person's stop deletes the session's holds, and cancels
+// their runs.
+// One hold per run, held_at on the database's clock. Zero rows when the
+// run already holds one, which a run with no live attempt cannot reach: the
+// caller logs it.
+func (q *Queries) HoldWorkflowAdvance(ctx context.Context, arg HoldWorkflowAdvanceParams) (int64, error) {
+	result, err := q.db.Exec(ctx, holdWorkflowAdvance, arg.WorkflowRunID, arg.StepRunID, arg.SessionID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const listWorkflowAdvanceHolds = `-- name: ListWorkflowAdvanceHolds :many
+SELECT workflow_run_id, step_run_id, session_id, held_at FROM workflow_advance_holds
+WHERE (held_at, workflow_run_id) > ($1::timestamptz, $2::uuid)
+ORDER BY held_at, workflow_run_id
+LIMIT $3
+`
+
+type ListWorkflowAdvanceHoldsParams struct {
+	AfterHeldAt pgtype.Timestamptz `json:"after_held_at"`
+	AfterRunID  pgtype.UUID        `json:"after_run_id"`
+	MaxHolds    int32              `json:"max_holds"`
+}
+
+// One page of the held advances, oldest first, at most
+// sqlc.arg('max_holds'): the ones after (after_held_at, after_run_id) in
+// (held_at, workflow_run_id) order -- the last row of the page before, or
+// -infinity and the nil uuid for the first -- through
+// workflow_advance_holds_held_at_idx, whose key is that pair, so each page
+// starts where the last ended, however many rows came before it. The
+// releaser reads every page in one tick.
+func (q *Queries) ListWorkflowAdvanceHolds(ctx context.Context, arg ListWorkflowAdvanceHoldsParams) ([]WorkflowAdvanceHold, error) {
+	rows, err := q.db.Query(ctx, listWorkflowAdvanceHolds, arg.AfterHeldAt, arg.AfterRunID, arg.MaxHolds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []WorkflowAdvanceHold
+	for rows.Next() {
+		var i WorkflowAdvanceHold
+		if err := rows.Scan(
+			&i.WorkflowRunID,
+			&i.StepRunID,
+			&i.SessionID,
+			&i.HeldAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listWorkflowBindings = `-- name: ListWorkflowBindings :many
@@ -1285,6 +1443,25 @@ func (q *Queries) MarkWorkflowStepRunAwaitingDecision(ctx context.Context, arg M
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.FinishedAt,
+	)
+	return i, err
+}
+
+const releaseWorkflowAdvanceHold = `-- name: ReleaseWorkflowAdvanceHold :one
+DELETE FROM workflow_advance_holds WHERE workflow_run_id = $1 RETURNING workflow_run_id, step_run_id, session_id, held_at
+`
+
+// The release's compare-and-swap: deletes the run's hold and returns it.
+// pgx.ErrNoRows when it is gone -- another replica released it, or a stop
+// dropped it -- and the caller applies nothing.
+func (q *Queries) ReleaseWorkflowAdvanceHold(ctx context.Context, workflowRunID pgtype.UUID) (WorkflowAdvanceHold, error) {
+	row := q.db.QueryRow(ctx, releaseWorkflowAdvanceHold, workflowRunID)
+	var i WorkflowAdvanceHold
+	err := row.Scan(
+		&i.WorkflowRunID,
+		&i.StepRunID,
+		&i.SessionID,
+		&i.HeldAt,
 	)
 	return i, err
 }
