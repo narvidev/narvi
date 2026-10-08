@@ -669,15 +669,17 @@ wire carries and the one row it leaves.
   both sizes, and its connection stays up.
   — both in `scenario23_prompt_frames_test.go`
 
-## Scenario #24 (Step 204, §3.3, §21.1)
+## Scenario #24 (Step 204, §3.3, §21.1, §30.4)
 
 ### #24 — a review turn reads the commit it recorded
 
 > A review turn of a pull request's review session → its sandbox checks
 > out the head the turn recorded before the prompt is sent, including a
-> re-review in a warm sandbox whose tree the previous turn modified; a
-> control plane that restarts between the checkout's send and its reply
-> sends the prompt once.
+> re-review in a warm sandbox whose tree the previous turn modified, and a
+> pull request from a private fork whose owner never installed the App,
+> read from the base repository's pull ref without the fork ever being
+> asked; a control plane that restarts between the checkout's send and its
+> reply sends the prompt once.
 
 **Status: covered.** The control plane is real: a registry with a real
 `wshub` commander, the real sandbox handler, real Postgres, behind
@@ -703,13 +705,31 @@ snapshot is answered at once.
   replayed and stored under its own key. The prompt is sent once, on the
   recorded head.
   — both in `scenario24_review_checkout_test.go`
+- `TestResilience_Scenario24_PrivateForkWithoutTheApp_ReviewedAtItsRecordedHead`:
+  the real GitHub ingress receives a signed review-comment mention on
+  `acme/widgets#7`, whose head, S1, lives in `contributor/widgets` on a
+  branch named `main` like the base's own; the fork is private, and every
+  request for it answers 404. The session the webhook opens names the base
+  repository with no branch, and its turn records S1; the actor spawns its
+  sandbox through a provider that hands over the SESSION_CONFIG, which names
+  the base repository at `refs/pull/7/head`; the agent boots from it with
+  `gitclone.CloneAll`, and the checkout gate has it check out S1 from the
+  base's pull ref before the prompt is sent. The turn completes with S1 as
+  its checked-out commit, the prompt finds S1 in a clean tree, never the
+  base's `main`, and no request ever reached the fork.
+  — in `scenario24_private_fork_test.go`
 
 The sandbox-agent half of the exit is pinned in `cmd/sandbox-agent` and
-`internal/sandboxagent/gitclone` (Step 204's first part), and the control
+`internal/sandboxagent/gitclone` (Step 204's first part), the control
 plane's decisions -- a moved head, a lagging ref, an old agent, a gen
 not connected yet, a silent or failing sandbox -- in
 `internal/app/sessionactor`'s
-`reviewcheckout_integration_test.go`.
+`reviewcheckout_integration_test.go`, and the spec the ingress writes, the
+credential minted on the base installation in every mode, and the legacy
+sessions' move (the `review_sessions_base_repository` migration, and the actor's at a session's next
+boot) in `internal/adapters/inbound/github`, `internal/adapters/inbound/httpapi`,
+`internal/adapters/outbound/postgres` and `internal/app/sessionactor`
+(Step 204's third part).
 
 ## Not a scenario: the tool events of one message (Step 229, §6.1)
 

@@ -541,3 +541,45 @@ FOR SHARE;
 SELECT id FROM sessions
 WHERE parent_session_id = $1
 ORDER BY created_at, id;
+
+-- name: MoveReviewSessionToBaseRepository :one
+-- Technical plan §21.1, §30.4: a pull request's review session clones the
+-- pull request's base repository, and reads the head from the base's
+-- refs/pull/<number>/head. A review session created before its spec named
+-- the base repository names its pull request's head repository -- for a
+-- pull request from a fork, the fork -- with the fork's branch. This moves
+-- one such session's primary repo onto the base repository its claim names
+-- (github_pr_sessions.repo_full_name), on the same host, with no branch
+-- (a fork's branch names nothing in the base); the name is kept, so a
+-- restored workspace keeps its directory.
+--
+-- The session actor runs it in the transaction that is about to spawn or
+-- restore the session's next gen, before that gen's SESSION_CONFIG is
+-- assembled (tryPlanSpawn): the spec moves only when no gen holds the old
+-- one, since a gen keeps the spec it booted with and its clone's origin
+-- is the fork's -- a checkout of the base's pull ref there would fail
+-- (sessionactor's reviewCheckoutTargetFor reads the spec as the one the
+-- live gen booted with). The review_sessions_base_repository migration
+-- moved, the same way, every such session that held no live gen when it
+-- ran; this statement is its expression, for one session.
+--
+-- RETURNING the moved repos; pgx.ErrNoRows when there is nothing to move:
+-- no claim, more than one claim, a spec that is not one https repo in
+-- owner/name shape, a claim that is not, or a spec already naming the
+-- claim's repository (compared without regard to case or a ".git" suffix,
+-- as sessionactor's pullRequestRef compares them). Idempotent.
+UPDATE sessions s
+SET repos = jsonb_set(
+        jsonb_set(s.repos, '{0,url}',
+            to_jsonb(substring(s.repos->0->>'url' from '^(https://[^/]+/)') || g.repo_full_name || '.git')),
+        '{0,branch}', 'null'::jsonb)
+FROM github_pr_sessions g
+WHERE s.id = sqlc.arg('session_id')
+  AND g.session_id = s.id
+  AND (SELECT count(*) FROM github_pr_sessions c WHERE c.session_id = s.id) = 1
+  AND g.repo_full_name ~ '^[^/]+/[^/]+$'
+  AND CASE WHEN jsonb_typeof(s.repos) = 'array' THEN jsonb_array_length(s.repos) END = 1
+  AND s.repos->0->>'url' ~ '^https://[^/]+/[^/]+/[^/]+$'
+  AND lower(regexp_replace(substring(s.repos->0->>'url' from '^https://[^/]+/(.*)$'), '\.git$', ''))
+      <> lower(g.repo_full_name)
+RETURNING s.repos;

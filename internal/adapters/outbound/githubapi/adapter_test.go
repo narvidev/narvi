@@ -438,6 +438,7 @@ func TestGetPullRequest_Success(t *testing.T) {
 				"ref": "feature-x",
 				"repo": map[string]any{
 					"name":      "widgets",
+					"full_name": "contributor/widgets",
 					"clone_url": "https://github.com/contributor/widgets.git",
 				},
 			},
@@ -465,11 +466,8 @@ func TestGetPullRequest_Success(t *testing.T) {
 	if pr.HeadRef != "feature-x" {
 		t.Errorf("PullRequest.HeadRef = %q, want %q", pr.HeadRef, "feature-x")
 	}
-	if pr.HeadRepoName != "widgets" {
-		t.Errorf("PullRequest.HeadRepoName = %q, want %q", pr.HeadRepoName, "widgets")
-	}
-	if pr.HeadRepoCloneURL != "https://github.com/contributor/widgets.git" {
-		t.Errorf("PullRequest.HeadRepoCloneURL = %q, want %q", pr.HeadRepoCloneURL, "https://github.com/contributor/widgets.git")
+	if pr.HeadRepoFullName != "contributor/widgets" {
+		t.Errorf("PullRequest.HeadRepoFullName = %q, want %q", pr.HeadRepoFullName, "contributor/widgets")
 	}
 	if pr.Title != "Fix the retry loop" {
 		t.Errorf("PullRequest.Title = %q, want %q", pr.Title, "Fix the retry loop")
@@ -510,8 +508,8 @@ func TestGetPullRequest_NullBody(t *testing.T) {
 
 // TestGetPullRequest_NullHeadRepo proves a real "head.repo: null" response
 // (GitHub's own documented shape when the head/fork repo has been deleted)
-// resolves to an empty HeadRepoName/HeadRepoCloneURL rather than an error
-// or a panic -- L15's own sibling fix, mirrored here on the outbound side.
+// resolves to an empty HeadRepoFullName, unknown, rather than an error or a
+// panic -- L15's own sibling fix, mirrored here on the outbound side.
 func TestGetPullRequest_NullHeadRepo(t *testing.T) {
 	t.Parallel()
 
@@ -531,11 +529,8 @@ func TestGetPullRequest_NullHeadRepo(t *testing.T) {
 	if pr.HeadRef != "feature-x" {
 		t.Errorf("PullRequest.HeadRef = %q, want %q", pr.HeadRef, "feature-x")
 	}
-	if pr.HeadRepoName != "" {
-		t.Errorf("PullRequest.HeadRepoName = %q, want empty (head.repo was null)", pr.HeadRepoName)
-	}
-	if pr.HeadRepoCloneURL != "" {
-		t.Errorf("PullRequest.HeadRepoCloneURL = %q, want empty (head.repo was null)", pr.HeadRepoCloneURL)
+	if pr.HeadRepoFullName != "" {
+		t.Errorf("PullRequest.HeadRepoFullName = %q, want empty (head.repo was null)", pr.HeadRepoFullName)
 	}
 }
 

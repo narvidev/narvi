@@ -49,6 +49,17 @@ type Scope struct {
 	// URL parses, primary first (§3.4, "position 0 = primary"). A repo
 	// that does not parse is skipped, never an error: one malformed entry
 	// must not withhold every other repo's credential.
+	//
+	// It is empty for a pull request's review session whose head is not
+	// known to be a branch of its base repository
+	// (reposource.ReviewHeadInBaseRepository; technical plan §30.4): a
+	// pull request from a fork, a deleted fork's, one whose head could not
+	// be read when its review started, a legacy session still naming the
+	// fork. Its spec names the base repository, but its sandbox runs the
+	// pull request's head -- code a person outside the base repository may
+	// have written -- and its agent runtime runs tools over it, so the
+	// base repository's repository-scoped credentials are not resolved for
+	// it; the environment and global scopes are, as for any review session.
 	RepoFullNames []string
 	// EnvironmentID is sessions.environment_id, stringified; nil when the
 	// session has no Environment.
@@ -69,11 +80,15 @@ func Load(ctx context.Context, prSessions PRSessionReader, sessionRow sqlcgen.Se
 	}
 
 	review := true
-	if _, err := prSessions.GetBySessionID(ctx, sessionRow.ID); err != nil {
+	claim, err := prSessions.GetBySessionID(ctx, sessionRow.ID)
+	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			return Scope{}, fmt.Errorf("credentialscope: read github pr session: %w", err)
 		}
 		review = false
+	}
+	if review && !reposource.ReviewHeadInBaseRepository(claim.RepoFullName, sessionRow.Repos) {
+		repoFullNames = nil
 	}
 
 	scope := Scope{

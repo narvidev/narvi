@@ -168,11 +168,16 @@ type sentinelAutoFixNotifier struct {
 	// field -- which is the CORRECT outcome, not merely a convenient
 	// one: payload.RepoCloneURL (below)
 	// "lets the child session check out the SAME repo the origin session
-	// did" (ports.SentinelAutoFixPayload's own doc comment), and for a
-	// cross-repo/fork PR the origin session's own clone URL is the fork,
-	// which has no github_pr_sessions row of its own -- re-deriving
-	// entitlement from it here (rather than exempting this spawn source)
-	// would wrongly deny every fix session for a fork-based finding. Still
+	// did" (ports.SentinelAutoFixPayload's own doc comment), and the claim
+	// key, not that URL, is the pull request's identity: a review session
+	// opened before its spec named the base repository (technical plan
+	// §30.4) still names the fork until it moves, and a fork has no
+	// github_pr_sessions row of its own -- re-deriving entitlement from the
+	// URL here (rather than exempting this spawn source) would wrongly deny
+	// such a fix session. (The trigger itself skips any review session
+	// whose head is not known to be a branch of its base repository --
+	// reviewverdict.go -- so a fork's pull request spawns no fix child at
+	// all.) Still
 	// threaded through as the real store, never a nil/fake stand-in, for
 	// the same "an omittable gate dependency is an omitted gate" reason
 	// coalesce.go's own identical parameter is.
@@ -580,8 +585,10 @@ func (n *sentinelAutoFixNotifier) spawnClaimedChildSession(ctx context.Context, 
 	// "known" half of the predicate -- see ResolveRepoEntitlement's own doc
 	// comment ("req.SpawnSource == github is EXEMPT") for exactly why
 	// re-deriving it from payload.RepoCloneURL would be actively WRONG here
-	// (a cross-repo/fork PR's own clone URL is deliberately the fork, never
-	// the github_pr_sessions claim key) -- but not from a revocation, read
+	// (the github_pr_sessions claim key, not a clone URL, is the pull
+	// request's identity; a review session opened before its spec named
+	// the base repository, §30.4, names the fork until it moves) -- but not
+	// from a revocation, read
 	// for payload.RepoFullName (the origin pull request's base repository)
 	// and for the clone URL. The resolution reads only the request's
 	// spawnSource and URL, so the branch, created next, is not part of it.

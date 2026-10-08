@@ -41,8 +41,10 @@
 -- sentinel auto-fix child's sentinel_fixes row
 -- (sentinel_fixes_fix_child_session_id_idx, 000047). The claims name the
 -- pull request's base repository, which the clone URL of a fork pull
--- request does not, so a fork pull request's review session takes the base
--- repository's cap. The three lists are one array, so repo_settings is read
+-- request's review session opened before its spec named the base
+-- (technical plan §30.4) does not until it moves, so such a session takes
+-- the base repository's cap too. The three lists are one array, so
+-- repo_settings is read
 -- by its primary key, one probe a name, whatever the table holds.
 --
 -- The amounts are returned as the database prints them, scale 6 for the

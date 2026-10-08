@@ -717,10 +717,10 @@ type pullRequestResponse struct {
 		// states this field is nullable: null when the head repository has
 		// been deleted (e.g. a fork removed after the PR was opened).
 		// Mirrors payload.go's own identical nullable-pointer fix for the
-		// SAME underlying GitHub concept (L15 audit fix).
+		// SAME underlying GitHub concept (L15 audit fix). Only its
+		// full_name is read (PullRequest.HeadRepoFullName).
 		Repo *struct {
-			Name     string `json:"name"`
-			CloneURL string `json:"clone_url"`
+			FullName string `json:"full_name"`
 		} `json:"repo"`
 	} `json:"head"`
 
@@ -794,7 +794,7 @@ type stackResponse struct {
 }
 
 // PullRequest is GetPullRequest's own return shape: enough to resolve a
-// PR's TRUE head branch/repo (H5 audit fix), plus ("review
+// PR's TRUE head branch and the repository it lives in (H5 audit fix), plus ("review
 // sessions", §8.2/§17.6) its GitHub-native stack context, when present.
 type PullRequest struct {
 	// Title/Body are this PR's own CURRENT title/body (GitHub's own top-
@@ -823,8 +823,8 @@ type PullRequest struct {
 	// Body is this PR's own CURRENT description -- empty when GitHub's own
 	// "body" was null (a PR opened with no description at all, a real and
 	// common case) OR empty string; both collapse to Go's own empty string
-	// here, mirroring HeadRepoName/HeadRepoCloneURL's own "nullable field
-	// collapses to its zero value" precedent immediately below, since
+	// here, mirroring HeadRepoFullName's own "nullable field collapses to
+	// its zero value" precedent immediately below, since
 	// nothing downstream of this adapter (review.RenderTurnPrompt) needs to
 	// distinguish "no body at all" from "an explicitly empty body".
 	Body string
@@ -837,14 +837,15 @@ type PullRequest struct {
 	// no head SHA already in hand from its own trigger payload (see that
 	// package's own doc comment).
 	HeadSHA string
-	// HeadRepoName/HeadRepoCloneURL are the PR's real head repo (may be a
-	// fork) -- empty when GitHub's own "head.repo" was null (the head/fork
-	// repo has since been deleted). Callers MUST treat this exactly like
-	// payload.go's own pull_request_review_comment nullable-head-repo
-	// fallback: fall back to the base repo, never proceed with an empty
-	// repo spec.
-	HeadRepoName     string
-	HeadRepoCloneURL string
+	// HeadRepoFullName is the "owner/name" of the PR's head repository
+	// (GitHub's own "head.repo.full_name"): the base repository for a pull
+	// request opened from one of its own branches, a fork's otherwise --
+	// empty when GitHub's own "head.repo" was null (the head repository
+	// has since been deleted), which a caller reads as unknown. A review
+	// session never clones it: the head is read from the base repository's
+	// pull ref (technical plan §21.1, §30.4); it only says whether HeadRef
+	// is a branch of the base repository.
+	HeadRepoFullName string
 	// BaseRef (§15.1) is this PR's own real base branch name.
 	//
 	// D11 (second adversarial-review round): this struct previously also
@@ -935,8 +936,7 @@ func (a *Adapter) GetPullRequest(ctx context.Context, owner, repo string, number
 		pr.Body = *parsed.Body
 	}
 	if parsed.Head.Repo != nil {
-		pr.HeadRepoName = parsed.Head.Repo.Name
-		pr.HeadRepoCloneURL = parsed.Head.Repo.CloneURL
+		pr.HeadRepoFullName = parsed.Head.Repo.FullName
 	}
 	if len(parsed.Labels) > 0 {
 		pr.Labels = make([]string, len(parsed.Labels))

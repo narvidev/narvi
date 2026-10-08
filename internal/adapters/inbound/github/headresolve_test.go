@@ -53,16 +53,18 @@ func baseIssueCommentMention() mention {
 }
 
 // TestResolveIssueCommentHead_Success proves a successful GetPullRequest
-// call resolves the mention's REAL head branch AND head repo -- the H5
-// audit fix's own headline case: a mention on the Conversation tab of a PR
-// whose head branch differs from the base repo's default branch resolves
-// to that REAL head branch, not nil/default.
+// call resolves the mention's REAL head branch AND head repository -- the
+// H5 audit fix's own headline case: a mention on the Conversation tab of a
+// PR whose head branch differs from the base repo's default branch
+// resolves to that REAL head branch, not nil/default. The head repository
+// here is a fork: it is recorded as the head's, and the repository the
+// session clones stays the base (technical plan §30.4).
 func TestResolveIssueCommentHead_Success(t *testing.T) {
 	resolver := &fakePullRequestResolver{
 		pr: githubapi.PullRequest{
 			HeadRef:          "feature-x",
-			HeadRepoName:     "widgets",
-			HeadRepoCloneURL: "https://github.com/contributor/widgets.git",
+			HeadSHA:          "c0ffee0000000000000000000000000000000001",
+			HeadRepoFullName: "contributor/widgets",
 		},
 	}
 
@@ -84,9 +86,15 @@ func TestResolveIssueCommentHead_Success(t *testing.T) {
 	if got.HeadBranch == nil || *got.HeadBranch != "feature-x" {
 		t.Errorf("HeadBranch = %v, want %q (the REAL head branch, not nil/default)", got.HeadBranch, "feature-x")
 	}
-	if got.RepoName != "widgets" || got.RepoCloneURL != "https://github.com/contributor/widgets.git" {
-		t.Errorf("RepoName/RepoCloneURL = %q/%q, want the PR's real head repo %q/%q",
-			got.RepoName, got.RepoCloneURL, "widgets", "https://github.com/contributor/widgets.git")
+	if got.HeadRepoFullName != "contributor/widgets" {
+		t.Errorf("HeadRepoFullName = %q, want the PR's real head repository %q", got.HeadRepoFullName, "contributor/widgets")
+	}
+	if got.HeadSHA == nil || *got.HeadSHA != "c0ffee0000000000000000000000000000000001" {
+		t.Errorf("HeadSHA = %v, want the PR's head commit", got.HeadSHA)
+	}
+	if got.RepoName != "widgets" || got.RepoCloneURL != "https://github.com/acme/widgets.git" {
+		t.Errorf("RepoName/RepoCloneURL = %q/%q, want the base repository %q/%q, never the fork",
+			got.RepoName, got.RepoCloneURL, "widgets", "https://github.com/acme/widgets.git")
 	}
 }
 
@@ -142,9 +150,9 @@ func TestResolveIssueCommentHead_EmptyHeadRefFallsBack(t *testing.T) {
 // TestResolveIssueCommentHead_NullHeadRepoKeepsBaseRepo proves the L15
 // "deleted fork" case is handled on this path too: a successful
 // GetPullRequest call that reports a real head ref but an empty head repo
-// (GitHub's own head.repo was null) still resolves HeadBranch, but leaves
-// RepoName/RepoCloneURL as the base repo parseIssueComment already set --
-// never an empty repo spec.
+// (GitHub's own head.repo was null) still resolves HeadBranch, leaves the
+// head repository unknown, and keeps RepoName/RepoCloneURL the base repo
+// parseIssueComment already set.
 func TestResolveIssueCommentHead_NullHeadRepoKeepsBaseRepo(t *testing.T) {
 	resolver := &fakePullRequestResolver{pr: githubapi.PullRequest{HeadRef: "feature-x"}}
 
@@ -157,6 +165,9 @@ func TestResolveIssueCommentHead_NullHeadRepoKeepsBaseRepo(t *testing.T) {
 	if got.RepoName != m.RepoName || got.RepoCloneURL != m.RepoCloneURL {
 		t.Errorf("RepoName/RepoCloneURL = %q/%q, want unchanged base repo %q/%q (head.repo was null)",
 			got.RepoName, got.RepoCloneURL, m.RepoName, m.RepoCloneURL)
+	}
+	if got.HeadRepoFullName != "" {
+		t.Errorf("HeadRepoFullName = %q, want empty: a deleted head repository is unknown", got.HeadRepoFullName)
 	}
 }
 

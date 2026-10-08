@@ -1043,7 +1043,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Delete("/{secretID}", httpapi.DeleteGlobalSandboxSecret(rig.sandboxSecrets))
 	})
 	router.Post("/sessions/{sessionID}/sandbox-secrets",
-		httpapi.SandboxSecretsDelivery(rig.sessions, rig.sandboxes, rig.sandboxSecrets, rig.tokenEncryptionKey))
+		httpapi.SandboxSecretsDelivery(rig.sessions, rig.sandboxes, rig.prSessions, rig.sandboxSecrets, rig.tokenEncryptionKey))
 	// automation-env-vars delivery (§8 item 4) -- mounted exactly like
 	// cmd/control-plane/main.go's own wiring (see
 	// automationenvvarsdelivery.go's own doc comment).
@@ -1627,8 +1627,10 @@ func TestCreateSession_MultipleRepos_SecondInvalid_Rejected(t *testing.T) {
 // This test now carries a SECOND property it did not when it was written,
 // and the two must not be separated. ResolveRepoEntitlement exempts
 // spawnSource == github from the per-repository entitlement check
-// entirely, because a cross-repo PR's clone URL is deliberately the fork
-// while the trusted claim key is the base repo. That exemption is only
+// entirely, because the trusted claim key, not a clone URL, is a pull
+// request's identity -- a review session opened before its spec named the
+// base repository (technical plan §30.4) still names the fork until it
+// moves. That exemption is only
 // safe because of the rejection below: it means "github" can never be a
 // caller's assertion on this endpoint, only something a server-side
 // ingress path set for itself. Relaxing this rejection -- for an internal

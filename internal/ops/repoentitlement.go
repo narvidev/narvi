@@ -90,6 +90,7 @@ var RepoEntitlementQueryExemptions = []RepoEntitlementQueryExemption{
 	{Query: "ListLinearOrganizationsForRepoSince", Reason: "the daily digest's organization scoping: reports past review activity of a repository, never admits new work"},
 	{Query: "ListDistinctReposWithRecentSessions", Reason: "the daily digest's repository enumeration: reports past review activity, never admits new work"},
 	{Query: "GetSessionGuardFacts", Reason: "the session guard's read of the spend caps a session's repositories set (technical plan §40.1): it reads a review session's claim to find its base repository's cap, and only ever refuses a turn, never admits work a revocation would refuse -- the actor's revocation re-reads still apply"},
+	{Query: "MoveReviewSessionToBaseRepository", Reason: "moves a legacy review session's spec onto the base repository its own claim names (technical plan §30.4), in the spawn transaction before the spawn's revocation re-read (refuseIfRepoRevoked), which then reads the moved spec and the claim; it admits nothing"},
 }
 
 // RepoEntitlementViolation is one place the source breaks §31.4's rule that
