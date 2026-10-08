@@ -219,3 +219,40 @@ func TestSpawn_ALegacyForkReviewSessionIsNeverMovedOnAResume(t *testing.T) {
 		t.Errorf("sessions.repos = %s after a resume, want it unchanged, %s: the resumed gen keeps the spec it booted with", got, legacySpec)
 	}
 }
+
+// TestSpawn_ALegacyForkReviewSessionIsNeverMovedUnderABootingGen: a gen a
+// previous replica just spawned on the fork's spec -- spawning, connecting
+// or booting, recently enough that the spawn decision waits for it ("already
+// <status>") -- holds that spec. A dispatch evaluation of the session's
+// pending turn neither spawns nor moves the spec under it.
+func TestSpawn_ALegacyForkReviewSessionIsNeverMovedUnderABootingGen(t *testing.T) {
+	for i, status := range []string{"spawning", "connecting", "booting"} {
+		t.Run(status, func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			sessionID := legacyForkReviewSession(ctx, t, pool, int32(30+i))
+			createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, "review the pull request")
+			if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sessionID); err != nil {
+				t.Fatalf("create sandbox: %v", err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = $2::sandbox_status, gen = 1, created_at = now(), last_seen_at = now() WHERE session_id = $1`, sessionID, status); err != nil {
+				t.Fatalf("move the sandbox to %s: %v", status, err)
+			}
+
+			provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "never-spawned-" + status}}
+			r := newDispatchTestRegistry(t, ctx, pool, provider, nil)
+			t.Cleanup(func() { _ = r.Shutdown() })
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+			settle(ctx, t, a)
+			if got := provider.callCount() + provider.restoreCallCount(); got != 0 {
+				t.Fatalf("spawns and restores = %d, want none: the gen is still booting", got)
+			}
+			if got := storedRepos(ctx, t, pool, sessionID); got != legacySpec {
+				t.Errorf("sessions.repos = %s under a %s gen, want it unchanged, %s", got, status, legacySpec)
+			}
+		})
+	}
+}

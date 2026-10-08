@@ -25,10 +25,11 @@ import (
 )
 
 // forkReviewCommentBody is a "pull_request_review_comment" mention on
-// baseFullName's pull request prNumber whose head lives in a fork at
-// forkCloneURL -- the payload names the fork as the head's repository, and
-// the base repository as the pull request's own, the one a review session
-// clones (technical plan §30.4).
+// baseFullName's pull request prNumber whose head lives in a fork,
+// contributor/<baseName>, cloned from forkCloneURL -- head.repo.full_name
+// names the fork as the head's repository, and the top-level repository
+// the base as the pull request's own, the one a review session clones
+// (technical plan §30.4).
 func forkReviewCommentBody(baseFullName, baseName, forkCloneURL string, prNumber int, label string, commenterID int64, commenterLogin string) []byte {
 	body, err := json.Marshal(map[string]any{
 		"action": "created",
@@ -40,9 +41,11 @@ func forkReviewCommentBody(baseFullName, baseName, forkCloneURL string, prNumber
 		"pull_request": map[string]any{
 			"number": prNumber,
 			"head": map[string]any{
-				"ref":  "contributor-patch",
-				"sha":  "sha-fork-head",
-				"repo": map[string]any{"name": baseName, "clone_url": forkCloneURL},
+				"ref": "contributor-patch",
+				"sha": "sha-fork-head",
+				// full_name is what the ingress reads to tell a fork's
+				// head from a branch of the base (reviewSessionRepo).
+				"repo": map[string]any{"name": baseName, "full_name": "contributor/" + baseName, "clone_url": forkCloneURL},
 			},
 		},
 		"repository": map[string]any{
