@@ -68,6 +68,8 @@ func TestHandleEnsureDispatched_ShadowSession_RefusesRestoreOfUnstampedSnapshot(
 
 	sandboxStore := seedStoppedSandboxWithSnapshot(ctx, t, pool, sessionID, "snap-shadow-refused-1")
 
+	logs := captureDefaultLoggerJSONSync(t)
+	before := restoreCounts(ctx, t)
 	provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "fresh-spawn-1"}}
 	r := newDispatchTestRegistry(t, ctx, pool, provider, nil)
 	t.Cleanup(func() { _ = r.Shutdown() })
@@ -117,6 +119,9 @@ func TestHandleEnsureDispatched_ShadowSession_RefusesRestoreOfUnstampedSnapshot(
 		t.Fatalf("RestoreFromSnapshot called %d times on the second death, want 0", provider.restoreCallCount())
 	}
 	assertOneSnapshotWarning()
+	// A downgraded restore is a fresh spawn: it is never decided on the
+	// snapshot's provenance, so neither death is logged or counted as one.
+	assertNoRestoreDecision(ctx, t, logs, before)
 }
 
 // TestHandleEnsureDispatched_ShadowSession_RestoresSnapshotStampedShadow

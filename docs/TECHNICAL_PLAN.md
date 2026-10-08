@@ -6930,10 +6930,12 @@ snapshots older than X") and `MinRestorableRuntimeVersion` (none):
   `sandbox_snapshot_restore_total{provenance="incompatible", outcome="refused"}` counts it. The
   warning's `messageId` is `snapshot_restore_refused:{snapshot id}`, which the event store dedupes
   on, so a snapshot is announced once whichever path discards it: §27.8's and §30.4(3)'s restore
-  downgrades write theirs through the same helper (`recordSnapshotRefusal`), keeping the snapshot
-  since either may stop applying, and so does the review checkout's retirement of a gen whose
-  snapshot it clears (§3.3). The warning is in `fetch_history` and the session's event history, so it
-  survives a reload; it is posted to no channel. The fresh lineage it starts is §35.5's, and the
+  downgrades write theirs through the same helper (`recordSnapshotRefusal`) and keep the snapshot,
+  as each always did: a shadow session may leave shadow mode, while a Docker-required session's
+  environment never changes, so its snapshot is downgraded again at every death, without a second
+  warning. The review checkout's retirement of a gen whose snapshot it clears writes one too
+  (§3.3). The warning is in `fetch_history` and the session's event history, so it survives a
+  reload; it is posted to no channel. The fresh lineage it starts is §35.5's, and the
   recap that explains what was lost is its to add.
 - **provenance unknown** — nothing recorded for the snapshot, no protocol reported, or one that is
   not `MAJOR.MINOR.PATCH` (and, with a runtime floor set, a runtime version absent or unreadable) —

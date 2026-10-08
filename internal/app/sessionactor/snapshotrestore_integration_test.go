@@ -184,6 +184,23 @@ func countDelta(before, after map[string]int64) map[string]int64 {
 	return out
 }
 
+// assertNoRestoreDecision fails when a restore decision on a snapshot's
+// provenance was logged or counted since before -- what a restore
+// downgraded to a fresh spawn (§27.8, §30.4(3)) never is: the decision runs
+// only on a restore that is still a restore after both downgrades.
+func assertNoRestoreDecision(ctx context.Context, t *testing.T, logs *syncLogBuffer, before map[string]int64) {
+	t.Helper()
+	if got := countDelta(before, restoreCounts(ctx, t)); len(got) != 0 {
+		t.Errorf("sandbox_snapshot_restore_total moved by %v for a downgraded restore, want nothing", got)
+	}
+	if n := countLogLines(t, logs, snapshotRestoreUnknownLogMessage); n != 0 {
+		t.Errorf("%d unknown-provenance lines for a downgraded restore, want none", n)
+	}
+	if n := countLogLines(t, logs, snapshotRestoreRefusedLogMessage); n != 0 {
+		t.Errorf("%d provenance refusal lines for a downgraded restore, want none", n)
+	}
+}
+
 // storedWarning is one warning event as the event store lists it.
 type storedWarning struct {
 	messageID string
@@ -472,6 +489,66 @@ func TestSnapshotRestore_IncompatibleIsRefusedVisibly(t *testing.T) {
 			if got := countDelta(before, restoreCounts(ctx, t)); len(got) != 1 || got["incompatible/refused"] != 1 {
 				t.Errorf("sandbox_snapshot_restore_total moved by %v, want incompatible/refused by 1 alone", got)
 			}
+		})
+	}
+}
+
+// TestSnapshotRestore_ADowngradedRestoreIsNeverDecidedOnProvenance: the
+// §27.8 and §30.4(3) downgrades run before the decision on provenance, so a
+// snapshot whose provenance this control plane would refuse, in a
+// Docker-required or a shadow session, is the downgrade's: kept, under the
+// downgrade's own warning, and neither cleared under the provenance
+// refusal's nor logged or counted as a decision.
+func TestSnapshotRestore_ADowngradedRestoreIsNeverDecidedOnProvenance(t *testing.T) {
+	tests := []struct {
+		name    string
+		session func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) pgtype.UUID
+		docker  bool
+		names   string
+	}{
+		{"a shadow session", func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) pgtype.UUID {
+			return createTestSessionWithRepos(ctx, t, pool, pgtype.UUID{}, "repo", "https://github.com/acme/downgrade-shadow.git", "main")
+		}, false, "shadow mode"},
+		{"a Docker-required session", func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) pgtype.UUID {
+			return createTestSessionWithEnvironment(ctx, t, pool, createTestEnvironmentWithDocker(ctx, t, pool))
+		}, true, "requires Docker"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			sessionID := tc.session(ctx, t, pool)
+			createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, "downgraded restore")
+			const snapshotID = "snap-downgraded-incompatible"
+			seedStoppedSandboxWithProvenance(ctx, t, pool, sessionID, snapshotID, strPtr("1.24.0"), nil)
+
+			logs := captureDefaultLoggerJSONSync(t)
+			before := restoreCounts(ctx, t)
+			provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "fresh-downgraded"}, dockerSupported: tc.docker}
+			r := newDispatchTestRegistry(t, ctx, pool, provider, nil)
+			t.Cleanup(func() { _ = r.Shutdown() })
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+			sendEnsureDispatched(ctx, t, a)
+			waitUntil(t, 5*time.Second, func() bool { return provider.callCount() == 1 })
+			waitForConnecting(ctx, t, pool, sessionID)
+
+			if provider.restoreCallCount() != 0 {
+				t.Fatalf("RestoreFromSnapshot called %d times, want 0", provider.restoreCallCount())
+			}
+			row := readProvenanceRow(ctx, t, pool, sessionID)
+			if row.gen != 2 || row.snapshotID == nil || *row.snapshotID != snapshotID || row.provenanceID == nil || *row.provenanceID != snapshotID ||
+				stringOrEmpty(row.agentProtocol) != "1.24.0" {
+				t.Fatalf("after the downgrade: %v; want gen 2 with %s and its provenance kept", row, snapshotID)
+			}
+			warnings := storedWarnings(ctx, t, pool, sessionID)
+			if len(warnings) != 1 || warnings[0].messageID != snapshotRefusalMessageIDPrefix+snapshotID ||
+				!strings.Contains(warnings[0].message, tc.names) || strings.Contains(warnings[0].message, "built for protocol") {
+				t.Fatalf("warnings %+v, want one naming %q, the downgrade's, and not the provenance refusal's", warnings, tc.names)
+			}
+			assertNoRestoreDecision(ctx, t, logs, before)
 		})
 	}
 }

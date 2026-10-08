@@ -186,6 +186,8 @@ func TestResilienceScenario17_RestoreWithDocker_NeverRestoresStaleSnapshot(t *te
 	turnStore := narvipg.NewTurnStore(pool)
 	createPendingTurn(ctx, t, turnStore, sessionID, "recover me")
 
+	logs := captureDefaultLoggerJSONSync(t)
+	before := restoreCounts(ctx, t)
 	provider := &fakeSpawnProvider{
 		nextRef:         ports.SandboxRef{ProviderID: "fresh-spawn-not-a-restore"},
 		dockerSupported: true, // supported in general -- the refusal is about THIS restore specifically, not provider capability
@@ -241,6 +243,9 @@ func TestResilienceScenario17_RestoreWithDocker_NeverRestoresStaleSnapshot(t *te
 		t.Fatalf("RestoreFromSnapshot called %d times on the second death, want 0", got)
 	}
 	assertOneSnapshotWarning()
+	// A downgraded restore is a fresh spawn: it is never decided on the
+	// snapshot's provenance, so neither death is logged or counted as one.
+	assertNoRestoreDecision(ctx, t, logs, before)
 }
 
 // TestResilienceScenario17_RestoreWithDocker_DockerFalseStillRestores is

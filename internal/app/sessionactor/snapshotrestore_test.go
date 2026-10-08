@@ -179,7 +179,8 @@ func TestSnapshotRefusalWarnings(t *testing.T) {
 
 // TestEvaluateSnapshotRestore_RefusalClearsOnlyOnProvenance pins which
 // fresh spawns clear the snapshot: a refusal on its provenance, which never
-// stops applying, and neither downgrade, which may.
+// stops applying, and neither downgrade, which keeps it as it always did --
+// a shadow session may leave shadow mode.
 func TestEvaluateSnapshotRestore_RefusalClearsOnlyOnProvenance(t *testing.T) {
 	t.Parallel()
 	s := func(v string) *string { return &v }
