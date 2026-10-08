@@ -3325,6 +3325,19 @@ sandbox_secrets(id, scope sandbox_secret_scope ENUM('automation','environment','
 - **Delivery**: sibling sandbox-facing endpoint `POST /sessions/{id}/sandbox-secrets` mirroring
   `providercredentialsdelivery.go`'s handshake verbatim; response is a plain name→plaintext map of
   RESOLVED winners only, losers never decrypted (Step 53's decrypt-only-the-winner discipline).
+- **A pull request's review session whose head is not known to be a branch of its base repository
+  gets no secret** (Step 204): `reposource.ReviewHeadInBaseRepository` is true only when the
+  session's primary repo names its `github_pr_sessions` claim's repository and carries a branch.
+  Such a session's spec names the base repository for a pull request from a fork too (§30.4), and
+  its sandbox boots on the pull request's head and runs that head's `setup.sh` and `start.sh` with
+  every delivered secret in their environment -- code a person outside the base repository may have
+  written. So a fork's pull request, a deleted fork's, one whose head could not be read when its
+  review started, and a legacy session still naming the fork are answered as a session with no
+  secrets is: an empty map, global, environment and repository scopes alike, the table never read,
+  logged at Info. This is the rule a CI system applies to a pull request from a fork: its code runs,
+  the repository's secrets do not reach it. A session with no claim, and a review session of a pull
+  request opened from a branch of its base repository, resolve as above; a claim read that fails is
+  a 500, never a delivery.
 - **Injection**: sandbox-agent fetches once, before the first hook runs, with bounded retry;
   threads the map into every process it spawns — hooks (through `runRepoHooks`' existing
   `EnvWithout` seam, `hooks.go:141`), `services.yml` services, and `opencode serve` (appended
@@ -4639,17 +4652,26 @@ recommendation:**
    reviews, never on a contributor's account, and a fork owner's installation is never asked for: a
    pull request from a private fork whose owner never installed the App is reviewed. Every reader that
    resolves a repository from the spec — this mint, the outbox's egress mode, the rollout and
-   entitlement re-checks, the provider-credential scope — resolves the base repository the claim
-   names. The spec carries the head branch only when it is a branch of the base repository: the
-   readers that act on the spec's branch act on the spec's repository, so a fork's branch name, often
-   the base's own `main`, would name a branch that is not the pull request's — for a fork, the
-   sentinel auto-fix (§17.1) cuts no fix branch, and apply-suggestion answers 409 naming the fork
-   instead of committing to the base. A review session opened before the spec named the base names
+   entitlement re-checks — resolves the base repository the claim names. The readers that hand the
+   sandbox something of the base repository's own, or act on the base at the spec's branch, ask one
+   more question first: is the session's head known to be a branch of its base repository
+   (`reposource.ReviewHeadInBaseRepository`: the primary repo names the claim's repository and
+   carries a branch, which the spec does only when the head repository is the base)? A fork's pull
+   request runs a head a person outside the base repository may have written, so when the answer is
+   no the sandbox secrets delivery hands it no secret at all (§27.1), the provider-credential scope
+   resolves no repository-scoped credential of the base (the environment and global scopes stay, as
+   while its spec named the fork), the sentinel auto-fix (§17.1) cuts no fix branch, and
+   apply-suggestion — which commits to the claim's repository at the spec's branch, a fork's branch
+   name often being the base's own `main` — answers 409 naming the fork instead of committing to the
+   base. A review session opened before the spec named the base names
    the fork, and its gens cloned the fork, whose origin holds no pull ref; it moves onto the base
    only when no gen holds its old spec — migration `000170` moved every such session with no live gen,
    and the actor moves the rest in the transaction that spawns or restores the next gen, before that
-   gen's SESSION_CONFIG is assembled, never on a resume, which delivers none (§3.3). Until it moves, it
-   is minted and reviewed as before, unchecked, on the gen that cloned the fork.
+   gen's SESSION_CONFIG is assembled, never on a resume, which delivers none (§3.3); a session a previous
+   replica opens while the migration runs is left to the actor too, since the migration moves only
+   the sessions it locked. Until it moves, it is minted and reviewed as before, unchecked, on the gen
+   that cloned the fork; its head is not known to be a branch of the base, so it gets no secret and
+   apply-suggestion and the sentinel auto-fix refuse it as they refuse a fork's.
 2. **The image-build path must never hold a write token — this is an in-repo bug, not an
    external-service caveat.** `gitclone.CleanForImageBuild`
    (`internal/sandboxagent/gitclone/sync.go:941`), the pre-snapshot cleanup for `BootModeBuild`,
