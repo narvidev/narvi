@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -63,6 +64,16 @@ func baseRepositoryCases() []baseRepositoryCase {
 		{name: "a fork's session whose gen is spawning waits for the actor", repos: forked, claims: []string{"acme/widgets"}, sandbox: "spawning", actorMoves: onBase},
 		{name: "a fork's session whose gen is suspect waits for the actor", repos: forked, claims: []string{"acme/widgets"}, sandbox: "suspect", actorMoves: onBase},
 		{name: "a fork's session whose gen is snapshotting waits for the actor", repos: forked, claims: []string{"acme/widgets"}, sandbox: "snapshotting", actorMoves: onBase},
+		{name: "a fork's session whose gen is connecting waits for the actor", repos: forked, claims: []string{"acme/widgets"}, sandbox: "connecting", actorMoves: onBase},
+		{name: "a fork's session whose gen is booting waits for the actor", repos: forked, claims: []string{"acme/widgets"}, sandbox: "booting", actorMoves: onBase},
+		{
+			// The actor's statement keeps the host, as the migration's does.
+			name:       "a fork's session on another host whose gen is ready waits for the actor, which keeps the host",
+			repos:      `[{"name":"tools","url":"https://ghes.example.test/someone/tools.git","branch":"patch-1"}]`,
+			claims:     []string{"Acme/Tools"},
+			sandbox:    "ready",
+			actorMoves: `[{"name":"tools","url":"https://ghes.example.test/Acme/Tools.git","branch":null}]`,
+		},
 		{
 			name:   "a fork url without .git moves, the host kept",
 			repos:  `[{"name":"tools","url":"https://code.example.test/someone/tools","branch":"patch-1"}]`,
@@ -308,5 +319,109 @@ func TestMigrationReviewSessionsBaseRepository_NeverMovesASessionUnderAGenSpawne
 	onBase := decodeRepos(t, []byte(`[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":null}]`))
 	if got := sessionRepos(ctx, t, db, control); !reflect.DeepEqual(got, onBase) {
 		t.Errorf("the control session, stopped throughout: repos = %v, want %v", got, onBase)
+	}
+}
+
+// TestMigrationReviewSessionsBaseRepository_NeverMovesASessionOpenedWhileItRuns:
+// during a rolling deploy a previous replica keeps opening fork review
+// sessions, on the fork's spec, and spawning their first gen. Session Y,
+// a candidate, is held by an actor's transaction, so the migration's lock
+// statement waits on it. Meanwhile a new fork session X is committed, and
+// its first spawn locks X and starts a gen booting on the fork's spec. Once
+// Y's holder commits, the migration moves Y -- it locked Y -- and must leave
+// X, which it never locked, to the actor's next spawn or restore, whether
+// the spawn commits before or after the migration's update would have
+// reached X.
+func TestMigrationReviewSessionsBaseRepository_NeverMovesASessionOpenedWhileItRuns(t *testing.T) {
+	ctx := context.Background()
+	previousVersion := versionBefore(t, reviewSessionsBaseRepositoryMigration)
+	connStr, db := migrationTestDatabase(ctx, t, previousVersion)
+
+	const ySpec = `[{"name":"widgets","url":"https://github.com/contributor/widgets.git","branch":"main"}]`
+	y := seedBaseRepositoryCase(ctx, t, db, baseRepositoryCase{name: "held while the migration starts", repos: ySpec, claims: []string{"acme/widgets"}, sandbox: "stopped"}, 1)
+
+	holder, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = holder.Rollback() }()
+	if _, err := holder.ExecContext(ctx, `SELECT actor_epoch FROM sessions WHERE id = $1 FOR UPDATE`, y); err != nil {
+		t.Fatalf("hold Y: %v", err)
+	}
+
+	m, mdb := newMigrate(t, connStr)
+	defer func() { _ = mdb.Close() }()
+	var group errgroup.Group
+	var migrated atomic.Bool
+	group.Go(func() error {
+		defer migrated.Store(true)
+		return m.Migrate(reviewSessionsBaseRepositoryMigration)
+	})
+	waitingOn := func(pid int) bool {
+		t.Helper()
+		var n int
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity
+			WHERE datname = current_database() AND wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))`, pid).Scan(&n); err != nil {
+			t.Fatalf("read pg_stat_activity: %v", err)
+		}
+		return n > 0
+	}
+	var holderPID int
+	if err := holder.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&holderPID); err != nil {
+		t.Fatal(err)
+	}
+	waitFor(t, "the migration to wait on Y's holder", func() bool { return waitingOn(holderPID) })
+
+	// A previous replica opens X, a fork's review session, and spawns its
+	// first gen, booting on the fork's spec.
+	const xSpec = `[{"name":"gadgets","url":"https://github.com/contributor/gadgets.git","branch":"feature"}]`
+	x := seedBaseRepositoryCase(ctx, t, db, baseRepositoryCase{name: "opened while the migration runs", repos: xSpec, claims: []string{"acme/gadgets"}}, 2)
+	spawn, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = spawn.Rollback() }()
+	var spawnPID int
+	if err := spawn.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&spawnPID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spawn.ExecContext(ctx, `SELECT repos FROM sessions WHERE id = $1 FOR UPDATE`, x); err != nil {
+		t.Fatalf("the spawn's lock on X: %v", err)
+	}
+	if _, err := spawn.ExecContext(ctx, `INSERT INTO sandboxes (session_id, status) VALUES ($1, 'spawning')`, x); err != nil {
+		t.Fatalf("the spawn's sandbox: %v", err)
+	}
+
+	if err := holder.Commit(); err != nil {
+		t.Fatalf("commit Y's holder: %v", err)
+	}
+	// Either the migration finishes without touching X, or -- a migration
+	// that would move X -- it waits on the spawn's lock on X.
+	waitFor(t, "the migration to finish or to wait on X's spawn", func() bool { return migrated.Load() || waitingOn(spawnPID) })
+	if err := spawn.Commit(); err != nil {
+		t.Fatalf("commit X's spawn: %v", err)
+	}
+	if err := group.Wait(); err != nil {
+		t.Fatalf("up to %d: %v", reviewSessionsBaseRepositoryMigration, err)
+	}
+
+	if got, want := sessionRepos(ctx, t, db, x), decodeRepos(t, []byte(xSpec)); !reflect.DeepEqual(got, want) {
+		t.Errorf("X, opened and spawned while the migration ran: repos = %v, want the fork's %v kept for its booting gen", got, want)
+	}
+	onBase := decodeRepos(t, []byte(`[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":null}]`))
+	if got := sessionRepos(ctx, t, db, y); !reflect.DeepEqual(got, onBase) {
+		t.Errorf("Y, which the migration locked: repos = %v, want %v", got, onBase)
+	}
+}
+
+// waitFor polls cond until it holds, or fails the test after 30 seconds.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }

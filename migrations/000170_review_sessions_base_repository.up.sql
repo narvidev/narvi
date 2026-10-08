@@ -39,16 +39,30 @@
 -- # Locks
 --
 -- golang-migrate sends this file as one batch, one implicit transaction,
--- and Postgres takes a snapshot per statement. The first statement locks
--- every candidate session's row, in id order (FOR UPDATE OF s): it waits
--- for any transaction holding one -- every session actor's transaction
--- locks its own session's row first (GetSessionActorEpochForUpdate), a
--- spawn's included -- and from then on no actor of those sessions can
--- write, so the second statement, on a fresh snapshot, reads each
--- sandbox's status as it stands and moves exactly the sessions with no
--- live gen. Without the first, the UPDATE's snapshot could read a sandbox
--- stopped that a spawn committing while the UPDATE waited on its row had
--- just started, and move the spec under that gen.
+-- and under READ COMMITTED Postgres takes a snapshot per statement. Every
+-- session actor's transaction locks its own session's row first
+-- (GetSessionActorEpochForUpdate), a spawn's included, so a session whose
+-- row this transaction holds can start no gen until it commits.
+--
+--   1. A temporary table, dropped at commit, holds the ids this file
+--      locks.
+--   2. INSERT ... SELECT ... FOR UPDATE OF s locks every candidate
+--      session's row its snapshot sees, in id order, waiting for any
+--      transaction holding one, and records each id it locked.
+--   3. The UPDATE, on a fresh snapshot taken once all of them are held,
+--      reads each locked session's sandbox as it stands and moves exactly
+--      those with no live gen -- and only sessions step 2 locked.
+--   4. The temporary table is dropped: it never outlives the file, and the
+--      schema this file leaves (which sqlc also reads) has no trace of it.
+--
+-- Without step 2, the UPDATE's own snapshot could read a sandbox stopped
+-- that a spawn committing while the UPDATE waited on its row had just
+-- started, and move the spec under that gen. Without the locked ids
+-- carried into step 3, its fresh snapshot would also see a session a
+-- previous replica opened while step 2 ran -- one step 2 never locked --
+-- and could move it while that session's first spawn, booting on the
+-- fork's spec, committed. Such a session is left for the actor to move at
+-- its next spawn or restore.
 --
 -- Only rows are locked: no table lock stronger than ROW EXCLUSIVE on
 -- sessions and ACCESS SHARE on github_pr_sessions and sandboxes, which
@@ -84,6 +98,9 @@
 -- moved sessions stay on their base repository, which the previous binary
 -- reads as described above, and this file, run again, moves nothing it
 -- already moved.
+CREATE TEMPORARY TABLE review_sessions_base_repository_locked (id UUID PRIMARY KEY) ON COMMIT DROP;
+
+INSERT INTO review_sessions_base_repository_locked (id)
 SELECT s.id
 FROM sessions s
 JOIN github_pr_sessions g ON g.session_id = s.id
@@ -101,8 +118,9 @@ SET repos = jsonb_set(
         jsonb_set(s.repos, '{0,url}',
             to_jsonb(substring(s.repos->0->>'url' from '^(https://[^/]+/)') || g.repo_full_name || '.git')),
         '{0,branch}', 'null'::jsonb)
-FROM github_pr_sessions g
-WHERE g.session_id = s.id
+FROM github_pr_sessions g, review_sessions_base_repository_locked locked
+WHERE locked.id = s.id
+  AND g.session_id = s.id
   AND (SELECT count(*) FROM github_pr_sessions c WHERE c.session_id = s.id) = 1
   AND g.repo_full_name ~ '^[^/]+/[^/]+$'
   AND CASE WHEN jsonb_typeof(s.repos) = 'array' THEN jsonb_array_length(s.repos) END = 1
@@ -113,3 +131,5 @@ WHERE g.session_id = s.id
       SELECT 1 FROM sandboxes x
       WHERE x.session_id = s.id
         AND x.status NOT IN ('pending', 'stopped', 'failed'));
+
+DROP TABLE review_sessions_base_repository_locked;
