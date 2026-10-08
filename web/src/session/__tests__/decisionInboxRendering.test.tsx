@@ -14,9 +14,9 @@ import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type * as ReactRouter from '@tanstack/react-router'
 
-import type { DecisionInboxItem } from '@narvi/contracts/rest-dtos'
+import type { AutonomyFreeze, DecisionInboxHeldWorkflowAdvance, DecisionInboxItem } from '@narvi/contracts/rest-dtos'
 
-import { DecisionInboxRow, RequiredChecksNotReadNotice, ScmStatusBanner } from '../DecisionInboxView'
+import { AutonomyFreezeBanner, DecisionInboxRow, HeldWorkflowAdvancesSection, RequiredChecksNotReadNotice, ScmStatusBanner } from '../DecisionInboxView'
 import { cutReason } from '../tokenCut'
 import { isSafeHref } from '../urlSafety'
 
@@ -42,6 +42,7 @@ function withQueryClient(node: React.ReactNode) {
 function baseItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem {
   return {
     kind: 'ready_to_merge',
+    heldByFreeze: false,
     title: 'A normal title',
     enteredQueueAt: '2026-08-20T00:00:00Z',
     ageSeconds: 3600,
@@ -782,5 +783,113 @@ describe('DecisionInboxRow -- a cut plan', () => {
     expect(html).toContain('Approve &amp; build')
     expect(html).not.toContain('No approval for this plan')
     expect(html).toContain('>Open<')
+  })
+})
+
+// The autonomy freeze (technical plan §40.2): one banner for every role
+// while frozen, an unread state that never reads "not frozen", a held chip
+// on a row whose automatic merge the freeze holds -- with Merge still
+// offered, since a person is never held -- and the held workflow advances.
+const NOT_FROZEN: AutonomyFreeze = { frozen: false, frozenAt: null, frozenByUserId: null, frozenByDisplayName: null, reason: null }
+
+function frozen(overrides: Partial<AutonomyFreeze> = {}): AutonomyFreeze {
+  return {
+    frozen: true,
+    frozenAt: '2026-10-07T09:30:00Z',
+    frozenByUserId: '7d1f2a3b-4c5d-4e6f-8a7b-9c0d1e2f3a4b',
+    frozenByDisplayName: 'Ada Admin',
+    reason: 'an incident: hold every automatic action',
+    ...overrides,
+  }
+}
+
+describe('AutonomyFreezeBanner -- one banner while frozen, and an unread freeze is never "not frozen"', () => {
+  it('renders nothing while autonomy is not frozen and the freeze was read', () => {
+    expect(renderToStaticMarkup(<AutonomyFreezeBanner freeze={NOT_FROZEN} unread={false} />)).toBe('')
+  })
+
+  it('renders nothing for a replica that predates the freeze (no field at all)', () => {
+    expect(renderToStaticMarkup(<AutonomyFreezeBanner freeze={undefined} unread={undefined} />)).toBe('')
+  })
+
+  it('names when, by whom and why, that nothing automatic starts, and that your own actions still work', () => {
+    const html = renderToStaticMarkup(<AutonomyFreezeBanner freeze={frozen()} unread={false} />)
+    expect(html).toContain('role="status"')
+    expect(html).toContain('sync-banner-warn')
+    expect(html).toContain('Autonomy is frozen since')
+    expect(html).toContain(new Date('2026-10-07T09:30:00Z').toLocaleString())
+    expect(html).toContain('Ada Admin')
+    expect(html).toContain('an incident: hold every automatic action')
+    expect(html).toContain('Nothing automatic starts: no auto-merge, auto-fix, automatic re-review, automation run or workflow advance.')
+    expect(html).toContain('Your own actions still work.')
+  })
+
+  it('a freeze by a user who no longer exists still names the freeze', () => {
+    const html = renderToStaticMarkup(<AutonomyFreezeBanner freeze={frozen({ frozenByUserId: null, frozenByDisplayName: null })} unread={false} />)
+    expect(html).toContain('a user who no longer exists')
+  })
+
+  it('an unread freeze says the state is unknown -- in the warning style -- and never that autonomy runs', () => {
+    const html = renderToStaticMarkup(<AutonomyFreezeBanner freeze={NOT_FROZEN} unread={true} />)
+    expect(html).toContain('sync-banner-warn')
+    expect(html).toContain('Temporarily unable to read whether autonomy is frozen')
+    expect(html).not.toBe('')
+    expect(html).not.toContain('Autonomy is frozen since')
+    expect(html).not.toContain('not frozen')
+  })
+
+  it('an adversarial reason and display name stay text, never markup', () => {
+    const html = renderToStaticMarkup(<AutonomyFreezeBanner freeze={frozen({ reason: XSS_SCRIPT, frozenByDisplayName: XSS_IMG })} unread={false} />)
+    expect(html).not.toContain('<script>')
+    expect(html).not.toContain('<img')
+    expect(html).toContain('&lt;script&gt;')
+    expect(html).toContain('&lt;img')
+  })
+})
+
+describe('DecisionInboxRow -- a row the freeze holds is marked held and keeps its Merge button', () => {
+  it('a held ready_to_merge row carries the held chip and still offers Merge, enabled', () => {
+    const item = prItem({ kind: 'ready_to_merge', heldByFreeze: true, hasChangesRequested: false })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).toContain('held · autonomy frozen')
+    expect(html).toContain('>Merge<')
+    expect(html).not.toMatch(/<button[^>]*disabled/)
+  })
+
+  it('a row the freeze does not hold carries no held chip', () => {
+    const item = prItem({ kind: 'ready_to_merge', heldByFreeze: false })
+    const html = withQueryClient(<DecisionInboxRow item={item} canMerge={true} />)
+    expect(html).not.toContain('held · autonomy frozen')
+    expect(html).toContain('>Merge<')
+  })
+})
+
+describe('HeldWorkflowAdvancesSection -- the workflow runs the freeze holds', () => {
+  const advance: DecisionInboxHeldWorkflowAdvance = {
+    workflowRunId: 'run-1',
+    sessionId: 'session-1',
+    sessionTitle: 'the owner\'s build',
+    workflowName: 'build then test',
+    heldAt: '2026-10-07T09:45:00Z',
+  }
+
+  it('renders nothing when no advance is held', () => {
+    expect(withQueryClient(<HeldWorkflowAdvancesSection held={[]} />)).toBe('')
+  })
+
+  it('lists each held run with its session, its workflow and a link to the session', () => {
+    const html = withQueryClient(<HeldWorkflowAdvancesSection held={[advance, { ...advance, workflowRunId: 'run-2', sessionTitle: null }]} />)
+    expect(html).toContain('Held by the freeze')
+    expect(html).toContain('2 · workflow runs whose next step starts once autonomy is unfrozen')
+    expect(html).toContain('the owner&#x27;s build')
+    expect(html).toContain('held · build then test')
+    expect(html).toContain('untitled session')
+    expect(html).toContain('Open session')
+  })
+
+  it('an adversarial session title and workflow name stay text, never markup', () => {
+    const html = withQueryClient(<HeldWorkflowAdvancesSection held={[{ ...advance, sessionTitle: XSS_SCRIPT, workflowName: XSS_IMG }]} />)
+    expect(html).not.toContain('<script>')
+    expect(html).not.toContain('<img')
   })
 })

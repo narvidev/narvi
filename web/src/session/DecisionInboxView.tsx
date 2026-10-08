@@ -71,6 +71,13 @@
 // ArtifactRow precedent, including its identical "link unavailable"
 // fallback text for a rejected URL.
 //
+// The autonomy freeze (technical plan §40.2) adds four more, each through
+// T: AutonomyFreezeBanner's freeze.reason (an administrator's free text)
+// and freeze.frozenByDisplayName (a user-chosen name), and
+// HeldWorkflowAdvancesSection's advance.sessionTitle and
+// advance.workflowName (a session's and a workflow definition's names,
+// both user-authored).
+//
 // This list is audited against the code, not the other way around: T7
 // (round 4, adversarial review) found it DRIFTED from DecisionInboxRow/
 // MergeButton/ApprovePlanButton/ResumeSessionButton/ResumeAutomationButton
@@ -83,7 +90,7 @@ import { useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
 
-import type { DecisionInboxItem } from '@narvi/contracts/rest-dtos'
+import type { AutonomyFreeze, DecisionInboxHeldWorkflowAdvance, DecisionInboxItem } from '@narvi/contracts/rest-dtos'
 
 import { approvePlan, createTurn, listDecisionInbox, mergePullRequest, resumeAutomation } from '../api/endpoints'
 import { ApiError } from '../api/http'
@@ -118,6 +125,7 @@ const MAX_FIELD_CHARS = 500
 // derivation below for why this must be a single shared reference rather
 // than a fresh `[]` literal on every render.
 const EMPTY_ITEMS: DecisionInboxItem[] = []
+const EMPTY_HELD: DecisionInboxHeldWorkflowAdvance[] = []
 
 function T({ text }: { text: string }) {
   return <>{truncateForDisplay(text, MAX_FIELD_CHARS)}</>
@@ -721,6 +729,78 @@ export function RequiredChecksNotReadNotice({ requiredChecksNotRead }: { require
   )
 }
 
+/**
+ * AutonomyFreezeBanner -- technical plan §40.2: while autonomy is frozen,
+ * every role's inbox shows this one banner, naming when, by whom and why,
+ * and that a person's own actions still work. It shows no held counts. When
+ * the freeze could not be read (ListDecisionInboxResponse.
+ * autonomyFreezeUnread) it says so, worded like ScmStatusBanner's own
+ * degraded state -- never rendered as "not frozen", which is all
+ * autonomyFreeze reads then. Exported for direct render testing
+ * (decisionInboxRendering.test.tsx).
+ */
+export function AutonomyFreezeBanner({ freeze, unread }: { freeze: AutonomyFreeze | undefined; unread: boolean | undefined }) {
+  if (unread === true) {
+    return (
+      <div className="sync-banner sync-banner-warn" role="status">
+        Temporarily unable to read whether autonomy is frozen — try again shortly. Every automatic action reads the freeze itself before it starts.
+      </div>
+    )
+  }
+  // undefined: a replica that predates the freeze's fields answered, in a
+  // rolling deploy -- it knows no freeze, so there is nothing to show.
+  if (freeze === undefined || !freeze.frozen) {
+    return null
+  }
+  return (
+    <div className="sync-banner sync-banner-warn" role="status">
+      Autonomy is frozen since {freeze.frozenAt ? new Date(freeze.frozenAt).toLocaleString() : 'an unknown time'} by{' '}
+      {freeze.frozenByDisplayName ? <T text={freeze.frozenByDisplayName} /> : 'a user who no longer exists'}: <T text={freeze.reason ?? ''} />. Nothing automatic starts: no
+      auto-merge, auto-fix, automatic re-review, automation run or workflow advance. Your own actions still work.
+    </div>
+  )
+}
+
+/**
+ * HeldWorkflowAdvancesSection lists the workflow runs whose next step the
+ * autonomy freeze holds (ListDecisionInboxResponse.heldWorkflowAdvances,
+ * technical plan §40.2, §25.9) -- the server lists only those on sessions
+ * the caller may decide workflow steps on. Each starts its next step once
+ * the freeze lifts; stopping the session drops it instead. Nothing renders
+ * when none is held.
+ */
+export function HeldWorkflowAdvancesSection({ held }: { held: DecisionInboxHeldWorkflowAdvance[] }) {
+  if (held.length === 0) {
+    return null
+  }
+  return (
+    <div>
+      <div className="qhead">
+        <h4>Held by the freeze</h4>
+        <span className="qcount">{held.length} · workflow runs whose next step starts once autonomy is unfrozen</span>
+      </div>
+      <div className="qrows">
+        {held.map((advance) => (
+          <div className="qrow" key={advance.workflowRunId}>
+            <span className="qkind">workflow</span>
+            <span className="qt">
+              <T text={advance.sessionTitle ?? 'untitled session'} />
+            </span>
+            <span className="chip warn">
+              <span className="dot" />
+              <T text={`held · ${advance.workflowName}`} />
+            </span>
+            <span className="qage">held {formatRelativeTime(advance.heldAt)} ago</span>
+            <Link to="/session/$sessionId" params={{ sessionId: advance.sessionId }} className="btn" style={{ textDecoration: 'none' }}>
+              Open session →
+            </Link>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 export function DecisionInboxView() {
   const meQuery = useQuery(meQueryOptions)
   const [repoFilter, setRepoFilter] = useState('all')
@@ -791,6 +871,7 @@ export function DecisionInboxView() {
           )}
         </div>
 
+        {inboxQuery.isSuccess && <AutonomyFreezeBanner freeze={inboxQuery.data.autonomyFreeze} unread={inboxQuery.data.autonomyFreezeUnread} />}
         {inboxQuery.isSuccess && <ScmStatusBanner scmAsOf={inboxQuery.data.scmAsOf} scmFetchFailed={inboxQuery.data.scmFetchFailed} />}
         {inboxQuery.isSuccess && <RequiredChecksNotReadNotice requiredChecksNotRead={inboxQuery.data.requiredChecksNotRead} />}
 
@@ -807,6 +888,7 @@ export function DecisionInboxView() {
 
         {inboxQuery.isSuccess && (
           <div className="inbox">
+            <HeldWorkflowAdvancesSection held={inboxQuery.data.heldWorkflowAdvances ?? EMPTY_HELD} />
             {SECTION_ORDER.filter((kind) => kind !== 'needs_attention' || isAdmin).map((kind) => (
               <Section key={kind} kind={kind} items={visibleItems.filter((it) => it.kind === kind)} canMerge={canMerge} />
             ))}
