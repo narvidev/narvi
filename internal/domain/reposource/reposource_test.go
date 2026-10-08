@@ -2,6 +2,7 @@ package reposource_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/narvidev/narvi/internal/domain/reposource"
@@ -211,15 +212,38 @@ func TestValidateBranch(t *testing.T) {
 	testValidateRef(t, "branch", reposource.ValidateBranch)
 }
 
+// TestValidateBranch_LeadingPlusRefused: git accepts each of these as a
+// branch name, but a branch reaches `git push` as a refspec, where a
+// leading "+" forces the update -- `git push -- origin +main` overwrites
+// the remote's main even when that discards commits only the remote holds.
+// Each is refused as ErrRefPlusPrefix, and the error names the value.
+func TestValidateBranch_LeadingPlusRefused(t *testing.T) {
+	t.Parallel()
+	for _, in := range []string{"+main", "+feature/foo", "+refs/heads/main", "++main", "+"} {
+		t.Run(in, func(t *testing.T) {
+			t.Parallel()
+			err := reposource.ValidateBranch(in)
+			if !errors.Is(err, reposource.ErrRefPlusPrefix) {
+				t.Fatalf("ValidateBranch(%q) = %v, want an error wrapping ErrRefPlusPrefix", in, err)
+			}
+			var refErr *reposource.InvalidRefError
+			if !errors.As(err, &refErr) || refErr.Value != in || !strings.Contains(err.Error(), "forced push") {
+				t.Errorf("ValidateBranch(%q) = %v, want an *InvalidRefError naming the value and the forced push", in, err)
+			}
+		})
+	}
+}
+
 // testValidateRef runs the shared table ValidateBranch must satisfy
 // (validateRef's own rules) -- kind is used only to build readable subtest
 // names. ValidateRemoteName no longer shares this table (see
 // TestValidateRemoteName below): a remote name's own rule is the stricter
-// charset allowlist ValidateRepoName uses, not validateRef's permissive
-// "reject empty/leading-dash/control-chars only" rule -- most notably, a
-// name containing "/" (e.g. "feature/foo") is legitimate for a branch but
-// must be REJECTED for a remote, so the two validators' test tables must
-// not be conflated.
+// charset allowlist ValidateRepoName uses, not validateRef's git-refname
+// rule -- most notably, a name containing "/" (e.g. "feature/foo") is
+// legitimate for a branch but must be REJECTED for a remote, so the two
+// validators' test tables must not be conflated. Whether each row agrees
+// with git itself is TestValidateBranch_AgreesWithGitCheckRefFormat's job
+// (cmd/sandbox-agent, which may run git).
 func testValidateRef(t *testing.T, kind string, validate func(string) error) {
 	t.Helper()
 
@@ -267,6 +291,35 @@ func testValidateRef(t *testing.T, kind string, validate func(string) error) {
 			wantErr:    true,
 			wantReason: reposource.ErrRefControlChar,
 		},
+		// Names git accepts as a branch, which a push reads as that branch.
+		{name: "dots inside a name are valid", in: "release/1.2.3"},
+		{name: "a component ending in a dot, not the last, is valid", in: "a./b"},
+		{name: "a plus that does not lead is valid", in: "feature/+x"},
+		{name: "an at sign that is not HEAD's spelling is valid", in: "user@host"},
+		{name: "a brace without a preceding at sign is valid", in: "a{b}"},
+		{name: "non-ASCII is valid", in: "café"},
+		// Names git refuses as a branch. On `git push` the colon deletes or
+		// redirects, the star globs, the caret negates, and the rest are no
+		// ref at all.
+		{name: "leading colon is rejected (a push deleting the remote branch)", in: ":main", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "embedded colon is rejected (a push onto another remote branch)", in: "work:main", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "star is rejected (a push of every matching branch)", in: "refs/heads/*", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "leading caret is rejected (a negative refspec)", in: "^main", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "tilde is rejected", in: "main~1", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "question mark is rejected", in: "ma?n", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "open bracket is rejected", in: "ma[i]n", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "backslash is rejected", in: `a\b`, wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "space is rejected", in: "a b", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "two dots are rejected", in: "a..b", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "at-brace is rejected", in: "main@{1}", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "HEAD is rejected", in: "HEAD", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "a lone at sign is rejected (git reads it as HEAD)", in: "@", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "trailing dot is rejected", in: "main.", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "leading slash is rejected", in: "/main", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "trailing slash is rejected", in: "main/", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "double slash is rejected", in: "a//b", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "a component beginning with a dot is rejected", in: "a/.b", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "a component ending with .lock is rejected", in: "a.lock/b", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
 	}
 
 	for _, tc := range tests {

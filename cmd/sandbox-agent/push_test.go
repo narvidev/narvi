@@ -434,3 +434,170 @@ func TestSendPushError_CapsGitPushStderr(t *testing.T) {
 		t.Fatalf("push_error carries %d bytes ending %q; want the head of git's stderr capped at 4096, marked", len(got.Error), got.Error[len(got.Error)-20:])
 	}
 }
+
+// TestPushOneRepo_RefspecShapedBranchRejectedBeforeSpawn: a branch reaches
+// pushOneRepo's `git push -- <remote> <branch>` as a refspec, so a value
+// git would read as something other than that one branch is refused by
+// reposource.ValidateBranch before any git process starts -- the spawn
+// count does not move, and the error is the validator's own. "+main" is
+// the forced push technical plan §35.3 rules out; the others delete,
+// redirect, glob or name HEAD (TestGitPushRefspecBranch_RealPremise shows
+// the first two against real git).
+func TestPushOneRepo_RefspecShapedBranchRejectedBeforeSpawn(t *testing.T) {
+	h := newSeededPushTestHandler(t, t.TempDir(), "widgets")
+
+	tests := []struct {
+		branch string
+		reason error
+	}{
+		{branch: "+main", reason: reposource.ErrRefPlusPrefix},
+		{branch: "+refs/heads/main", reason: reposource.ErrRefPlusPrefix},
+		{branch: ":main", reason: reposource.ErrRefNotBranchName},
+		{branch: "work:main", reason: reposource.ErrRefNotBranchName},
+		{branch: "refs/heads/*", reason: reposource.ErrRefNotBranchName},
+		{branch: "@", reason: reposource.ErrRefNotBranchName},
+	}
+	for _, tc := range tests {
+		t.Run(tc.branch, func(t *testing.T) {
+			spec := sandboxws.PushReposElem{Name: "widgets", Branch: tc.branch}
+			before := h.sup.SpawnCount()
+			_, err := h.pushOneRepo(spec)
+			if spawned := h.sup.SpawnCount() - before; spawned != 0 {
+				t.Errorf("pushOneRepo(%+v) spawned %d process(es), want 0 -- git ran before the branch was refused", spec, spawned)
+			}
+			var refErr *reposource.InvalidRefError
+			if !errors.As(err, &refErr) || !errors.Is(err, tc.reason) {
+				t.Fatalf("pushOneRepo(%+v) error = %v, want the validator's *InvalidRefError wrapping %v", spec, err, tc.reason)
+			}
+		})
+	}
+}
+
+// TestGitPushRefspecBranch_RealPremise pins, against the real git binary,
+// why reposource.ValidateBranch refuses a leading "+" and a ":": pushed
+// the way pushOneRepo pushes (`git push -- <remote> <branch>`), "+main"
+// overwrites a remote main the local one does not contain, and ":feature"
+// deletes the remote's feature. Plain "main" is refused as
+// non-fast-forward, which is what a push from a sandbox must always get.
+// ValidateBranch refuses both spellings and accepts "main".
+func TestGitPushRefspecBranch_RealPremise(t *testing.T) {
+	tests := []struct {
+		branch string
+		// effect checks the remote after the push, given the remote's
+		// main and feature before it and the local main's commit.
+		effect string
+		reason error
+	}{
+		{branch: "main", effect: "unchanged"},
+		{branch: "+main", effect: "main overwritten", reason: reposource.ErrRefPlusPrefix},
+		{branch: ":feature", effect: "feature deleted", reason: reposource.ErrRefNotBranchName},
+	}
+	for _, tc := range tests {
+		t.Run(tc.branch, func(t *testing.T) {
+			tmp := t.TempDir()
+			git := func(dir string, args ...string) string {
+				t.Helper()
+				cmd := exec.Command("git", append([]string{"-c", "user.name=Test", "-c", "user.email=test@example.com"}, args...)...)
+				cmd.Dir = dir
+				out, err := cmd.CombinedOutput()
+				if err != nil {
+					t.Fatalf("git %v (dir=%s): %v\n%s", args, dir, err, out)
+				}
+				return strings.TrimSpace(string(out))
+			}
+
+			// The remote: main at C1 then C2, and a feature branch.
+			bareDir := filepath.Join(tmp, "remote.git")
+			git(tmp, "init", "-q", "--bare", "-b", "main", bareDir)
+			other := filepath.Join(tmp, "other")
+			initRealGitRepoForPushTest(t, other)
+			git(other, "remote", "add", "origin", bareDir)
+			git(other, "commit", "-q", "--allow-empty", "-m", "C2")
+			git(other, "push", "-q", "origin", "main", "main:feature")
+			remoteMain := git(bareDir, "rev-parse", "main")
+
+			// The sandbox: a clone at C1 with a commit of its own, C3.
+			local := filepath.Join(tmp, "local")
+			git(tmp, "clone", "-q", bareDir, local)
+			git(local, "reset", "-q", "--hard", "HEAD~1")
+			git(local, "commit", "-q", "--allow-empty", "-m", "C3")
+			localMain := git(local, "rev-parse", "main")
+
+			pushErr := exec.Command("git", "-C", local, "push", "--", "origin", tc.branch).Run()
+
+			refs := git(bareDir, "for-each-ref", "--format=%(refname) %(objectname)")
+			switch tc.effect {
+			case "unchanged":
+				if pushErr == nil || !strings.Contains(refs, "refs/heads/main "+remoteMain) || !strings.Contains(refs, "refs/heads/feature ") {
+					t.Fatalf("git push -- origin %s: err %v, remote refs %q; want it refused and the remote unchanged", tc.branch, pushErr, refs)
+				}
+			case "main overwritten":
+				if !strings.Contains(refs, "refs/heads/main "+localMain) {
+					t.Fatalf("git push -- origin %s: remote refs %q; the premise no longer holds: it did not force main to %s", tc.branch, refs, localMain)
+				}
+			case "feature deleted":
+				if strings.Contains(refs, "refs/heads/feature ") {
+					t.Fatalf("git push -- origin %s: remote refs %q; the premise no longer holds: feature was not deleted", tc.branch, refs)
+				}
+			}
+
+			err := reposource.ValidateBranch(tc.branch)
+			if tc.reason == nil {
+				if err != nil {
+					t.Errorf("ValidateBranch(%q) = %v, want nil", tc.branch, err)
+				}
+			} else if !errors.Is(err, tc.reason) {
+				t.Errorf("ValidateBranch(%q) = %v, want an error wrapping %v", tc.branch, err, tc.reason)
+			}
+		})
+	}
+}
+
+// TestValidateBranch_AgreesWithGitCheckRefFormat holds reposource.
+// ValidateBranch, which cannot run git itself (no I/O in /internal/domain),
+// to the real git binary: it accepts a name exactly when `git check-ref-
+// format --branch` does, run outside any repository so nothing like
+// "@{-1}" is expanded, except for the names git accepts but would read as
+// something other than that branch on `git push` -- a leading "+" (a
+// forced push) and "@" (HEAD) -- which it refuses.
+func TestValidateBranch_AgreesWithGitCheckRefFormat(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatalf("EvalSymlinks: %v", err)
+	}
+	gitAccepts := func(name string) bool {
+		cmd := exec.Command("git", "check-ref-format", "--branch", name)
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GIT_CEILING_DIRECTORIES="+filepath.Dir(dir))
+		return cmd.Run() == nil
+	}
+
+	stricterThanGit := map[string]bool{"+main": true, "+": true, "++main": true, "+feature/x": true, "@": true}
+	names := []string{
+		// accepted by both
+		"main", "feature/foo", "release/1.2.3", "narvi/0b9c6f0e-1d2a-4c3b-9e8f-7a6b5c4d3e2f",
+		"a./b", "a.lock.b", "a.b/c", "café", "a{b}", "@a", "a@", "user@host", "a+b", "feature/+x",
+		"a]b", "a!b", "a#b", "a'b", `a"b`, "a;b", "a|b", "a$b", "a%b", "a&b", "a=b", "a<b>", "a,b", "a`b",
+		"refs/heads/main", "origin/main",
+		// refused by both
+		"", "-", "-x", "--force", "HEAD", "a b", "a\tb", "a\nb", "a\x7f", "a..b", "..", ".", ".a", "a.", "a/.b", "a/b.",
+		"/", "/a", "a/", "a//b", "*", "refs/heads/*", "a*", ":", ":main", "work:main", "^main", "a^b", "main~1", "a~b",
+		"a?b", "a[b", `a\b`, "main@{1}", "@{-1}", "a@{b", "main.lock", "a.lock/b", "a/b.lock/c",
+	}
+	for name := range stricterThanGit {
+		names = append(names, name)
+	}
+
+	for _, name := range names {
+		git := gitAccepts(name)
+		ours := reposource.ValidateBranch(name) == nil
+		switch {
+		case stricterThanGit[name]:
+			if !git || ours {
+				t.Errorf("%q: git accepts=%v, ValidateBranch accepts=%v; want git to accept it and ValidateBranch to refuse it", name, git, ours)
+			}
+		case git != ours:
+			t.Errorf("%q: git accepts=%v, ValidateBranch accepts=%v; want them to agree", name, git, ours)
+		}
+	}
+}

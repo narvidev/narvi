@@ -6833,6 +6833,11 @@ stopped by inactivity and restored on the next prompt, exactly as now.
   An older snapshot rewinds the workspace and the conversation, and that restore succeeds, so §35.5's
   fresh-lineage recap does not fire for it: the rotation records a persisted warning of its own naming
   the snapshot it fell back to, so the next turn and a reader know that work since then was lost.
+  Commits already pushed that the older workspace lacks stay on their branch: the next push is the
+  ordinary `git push -- <remote> <branch>`, never forced, so git refuses it as non-fast-forward and
+  `push_error` stores git's reason. The branch is the refspec, so `reposource.ValidateBranch` accepts
+  only a name `git check-ref-format --branch` accepts, less a leading `+` (a forced push) and a lone
+  `@` (HEAD); `:`, which would delete the remote branch or push onto another, is one git refuses.
 
 `RotationRunwayFloor` is a new entry in `platform/timeouts.go` and nowhere else (§11), and the gate
 itself is a pure decision function in `internal/domain/sandbox`, added to the exhaustive
