@@ -314,9 +314,17 @@ func (fcp *fakeControlPlane) wsURL() string {
 // never pre-populates that directory itself).
 func setUpBareRepoAndServer(t *testing.T) (gitServerURL string) {
 	t.Helper()
+	gitServerURL, _ = setUpServedBareRepo(t)
+	return gitServerURL
+}
+
+// setUpServedBareRepo is setUpBareRepoAndServer that also returns the bare
+// repository's own directory, for a test that moves the remote itself.
+func setUpServedBareRepo(t *testing.T) (gitServerURL, bareRepoDir string) {
+	t.Helper()
 
 	reposParent := t.TempDir()
-	bareRepoDir := filepath.Join(reposParent, "repo.git")
+	bareRepoDir = filepath.Join(reposParent, "repo.git")
 	if err := os.MkdirAll(bareRepoDir, 0o755); err != nil {
 		t.Fatalf("mkdir bare repo dir: %v", err)
 	}
@@ -338,7 +346,7 @@ func setUpBareRepoAndServer(t *testing.T) (gitServerURL string) {
 	mustRunGit(t, seedDir, "push", "origin", "main")
 
 	gitServer := startGitHTTPServer(t, reposParent)
-	return gitServer.URL
+	return gitServer.URL, bareRepoDir
 }
 
 // waitForBootComplete blocks until the sandbox-agent subprocess logs
@@ -779,5 +787,82 @@ func TestHandlePush_ReviewSessionsReadOnlyCredential_RefusedByTheServer(t *testi
 	}
 	if after := strings.TrimSpace(mustRunGit(t, repoDir, "-c", "http.sslVerify=false", "ls-remote", "origin", "refs/heads/main")); after != before {
 		t.Errorf("the remote's main moved from %q to %q: the read-only token pushed", before, after)
+	}
+}
+
+// TestHandlePush_BehindItsRemote_RefusedNotForced is technical plan §35.3's
+// "never forced", for a sandbox whose workspace lacks commits already on
+// its branch -- as after a rotation that fell back to an older snapshot.
+// The remote's main holds C1 then C2, pushed after the sandbox cloned; the
+// sandbox's main holds C1 then a commit of its own, C3. The push the real
+// binary makes is refused as a non-fast-forward update: a push_error
+// carrying git's own reason, which the control plane stores as the event's
+// error (TestResilience_Scenario23_PushErrorOver32KiB_ReportedAndNextTurnCompletes),
+// and the remote's main still at C2. git words the refusal by whether the
+// sandbox has fetched C2 -- a restored sandbox's boot fetch usually has --
+// so both are run.
+func TestHandlePush_BehindItsRemote_RefusedNotForced(t *testing.T) {
+	binPath := buildSandboxAgentBinary(t)
+
+	tests := []struct {
+		name    string
+		fetched bool
+		reason  string
+	}{
+		{name: "the sandbox fetched the remote's commit", fetched: true, reason: "(non-fast-forward)"},
+		{name: "the sandbox never saw the remote's commit", fetched: false, reason: "(fetch first)"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			gitServerURL, bareRepoDir := setUpServedBareRepo(t)
+			workspaceDir := t.TempDir()
+
+			fcp := newFakeControlPlane(t, "push-behind-its-remote-session", false /* credentialShouldFail */)
+			out, exited := runSandboxAgent(t, binPath, gitServerURL, workspaceDir, fcp)
+			waitForBootComplete(t, out, exited)
+
+			// C2: someone else's push to main, after the sandbox's clone.
+			otherDir := t.TempDir()
+			mustRunGit(t, otherDir, "clone", bareRepoDir, ".")
+			if err := os.WriteFile(filepath.Join(otherDir, "theirs.txt"), []byte("pushed before the sandbox's push\n"), 0o644); err != nil {
+				t.Fatalf("write theirs.txt: %v", err)
+			}
+			mustRunGit(t, otherDir, "add", "theirs.txt")
+			mustRunGit(t, otherDir, "commit", "-m", "C2")
+			mustRunGit(t, otherDir, "push", "origin", "main")
+			remoteMain := strings.TrimSpace(mustRunGit(t, bareRepoDir, "rev-parse", "main"))
+
+			// C3: the sandbox's own commit, on the C1 it cloned.
+			repoDir := filepath.Join(workspaceDir, "widgets")
+			if err := os.WriteFile(filepath.Join(repoDir, "ours.txt"), []byte("the sandbox's own work\n"), 0o644); err != nil {
+				t.Fatalf("write ours.txt: %v", err)
+			}
+			mustRunGit(t, repoDir, "add", "ours.txt")
+			mustRunGit(t, repoDir, "commit", "-m", "C3")
+			if tc.fetched {
+				// The test server's certificate is self-signed, trusted
+				// here as the agent's own environment trusts it.
+				mustRunGit(t, repoDir, "-c", "http.sslVerify=false", "fetch", "origin")
+			}
+
+			close(fcp.readyToPush)
+
+			var result json.RawMessage
+			select {
+			case result = <-fcp.result:
+			case <-time.After(pushTestTimeout):
+				t.Fatalf("timed out waiting for push_complete/push_error; sandbox-agent output:\n%s", out.String())
+			}
+			var pushErr sandboxws.PushError
+			if err := json.Unmarshal(result, &pushErr); err != nil || pushErr.Type != "push_error" {
+				t.Fatalf("result = %s (%v), want a push_error; sandbox-agent output:\n%s", result, err, out.String())
+			}
+			if !strings.Contains(pushErr.Error, "[rejected]") || !strings.Contains(pushErr.Error, "main -> main "+tc.reason) {
+				t.Errorf("push_error = %q, want git's refusal of main -> main %s", pushErr.Error, tc.reason)
+			}
+			if after := strings.TrimSpace(mustRunGit(t, bareRepoDir, "rev-parse", "main")); after != remoteMain {
+				t.Errorf("the remote's main moved from %s (C2) to %s: the push overwrote a commit it did not contain", remoteMain, after)
+			}
+		})
 	}
 }
