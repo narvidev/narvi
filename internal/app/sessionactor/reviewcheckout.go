@@ -649,9 +649,20 @@ func (a *Actor) refuseReviewCheckout(ctx context.Context, tx pgx.Tx, sessionRow 
 // (stopSandboxOfRetiredGen) and the next evaluation spawns the new gen.
 // A fresh gen that is old too takes no snapshot, since no turn runs on it,
 // so an old agent costs at most one respawn before its turn is refused.
+//
+// A snapshot cleared here takes the session's context with it, so its
+// clearing is made visible as a refused restore's is (technical plan
+// §35.5b): one persisted session warning, at the retired gen, through
+// recordSnapshotRefusal, naming the snapshot and why it was discarded.
 func (a *Actor) retireGenForCheckout(ctx context.Context, tx pgx.Tx, sandboxRow sqlcgen.Sandbox, target sqlcgen.Turn, verdict turn.CheckoutVerdict) (*retiredGen, error) {
-	if _, err := a.stores.sandbox.WithTx(tx).ClearSnapshot(ctx, a.sessionID); err != nil {
-		return nil, fmt.Errorf("sessionactor: review checkout: clear the sandbox's snapshot: %w", err)
+	if sandboxRow.SnapshotID != nil && *sandboxRow.SnapshotID != "" {
+		snapshotID := *sandboxRow.SnapshotID
+		if err := a.recordSnapshotRefusal(ctx, tx, int(sandboxRow.Gen), snapshotID, checkoutRetirementWarning(sandboxRow, snapshotID, verdict)); err != nil {
+			return nil, err
+		}
+		if _, err := a.stores.sandbox.WithTx(tx).ClearSnapshot(ctx, a.sessionID, snapshotID); err != nil {
+			return nil, fmt.Errorf("sessionactor: review checkout: clear the sandbox's snapshot: %w", err)
+		}
 	}
 	retired, err := a.retireLiveGen(ctx, tx, sandboxRow)
 	if err != nil {
@@ -673,6 +684,26 @@ func (a *Actor) retireGenForCheckout(ctx context.Context, tx pgx.Tx, sandboxRow 
 		"turn_id", target.ID.String(), "gen", sandboxRow.Gen, "retirement", string(verdict.Retirement),
 		"snapshot_id", snapshotID, "outcome", string(verdict.Outcome), "error", verdict.Error, "provider_id", retired.providerID)
 	return retired, nil
+}
+
+// checkoutRetirementWarning is the session warning of a snapshot,
+// snapshotID, that retireGenForCheckout discards with sandboxRow's gen:
+// for an agent that cannot check out, what the snapshot records of the
+// agent it holds -- its protocol, or that nothing was recorded -- and for
+// checkouts that kept failing, that the snapshot holds the same worktree.
+func checkoutRetirementWarning(sandboxRow sqlcgen.Sandbox, snapshotID string, verdict turn.CheckoutVerdict) string {
+	const opening = "This review's sandbox was stopped and its last snapshot, %s, discarded: "
+	const closing = " A fresh sandbox is starting from the repository. Work that was not pushed, and the agent's own conversation, are not in the new sandbox."
+	if verdict.Retirement == turn.CheckoutRetiredFailing {
+		return fmt.Sprintf(opening, snapshotID) +
+			"checkouts of the commit this review is asked about kept failing on what the sandbox's worktree holds, which the snapshot holds too." + closing
+	}
+	recorded := "nothing was recorded of the agent the snapshot holds"
+	if p := snapshotProvenance(sandboxRow); p.Recorded && p.AgentProtocol != "" {
+		recorded = "the snapshot records an agent of protocol " + p.AgentProtocol
+	}
+	return fmt.Sprintf(opening, snapshotID) +
+		"the sandbox's agent cannot check out the commit a review is asked about, and a restore of the snapshot may bring that agent back (" + recorded + ")." + closing
 }
 
 // reviewCheckoutOutstanding is §24.9's pre-read asking whether row's turn

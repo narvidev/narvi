@@ -13,6 +13,7 @@ package sessionactor
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -185,6 +186,8 @@ func TestResilienceScenario17_RestoreWithDocker_NeverRestoresStaleSnapshot(t *te
 	turnStore := narvipg.NewTurnStore(pool)
 	createPendingTurn(ctx, t, turnStore, sessionID, "recover me")
 
+	logs := captureDefaultLoggerJSONSync(t)
+	before := restoreCounts(ctx, t)
 	provider := &fakeSpawnProvider{
 		nextRef:         ports.SandboxRef{ProviderID: "fresh-spawn-not-a-restore"},
 		dockerSupported: true, // supported in general -- the refusal is about THIS restore specifically, not provider capability
@@ -208,6 +211,41 @@ func TestResilienceScenario17_RestoreWithDocker_NeverRestoresStaleSnapshot(t *te
 	if !spec.Docker {
 		t.Error("the fresh spawn's own CreateSpec.Docker = false, want true (still a real Docker-required spawn, just via CreateSandbox not RestoreFromSnapshot)")
 	}
+
+	// Technical plan §35.5b: the downgrade is visible -- one persisted
+	// warning at the new gen naming the snapshot and the Docker
+	// requirement -- the snapshot is kept, and the warning is written once
+	// per snapshot: the sandbox's next death downgrades it again, silently.
+	assertOneSnapshotWarning := func() {
+		t.Helper()
+		warnings := storedWarnings(ctx, t, pool, sessionID)
+		if len(warnings) != 1 || warnings[0].messageID != snapshotRefusalMessageIDPrefix+staleSnapshotID || warnings[0].gen != 2 ||
+			!strings.Contains(warnings[0].message, staleSnapshotID) || !strings.Contains(warnings[0].message, "requires Docker") {
+			t.Fatalf("warnings %+v, want one at gen 2 naming %s and the Docker requirement", warnings, staleSnapshotID)
+		}
+		row, err := sandboxStore.Get(ctx, sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if row.SnapshotID == nil || *row.SnapshotID != staleSnapshotID {
+			t.Fatalf("snapshot_id = %v, want %s kept", row.SnapshotID, staleSnapshotID)
+		}
+	}
+	waitForConnecting(ctx, t, pool, sessionID)
+	assertOneSnapshotWarning()
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'stopped' WHERE session_id = $1`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	sendEnsureDispatched(ctx, t, a)
+	waitUntil(t, 5*time.Second, func() bool { return provider.callCount() == 2 })
+	waitForConnecting(ctx, t, pool, sessionID)
+	if got := provider.restoreCallCount(); got != 0 {
+		t.Fatalf("RestoreFromSnapshot called %d times on the second death, want 0", got)
+	}
+	assertOneSnapshotWarning()
+	// A downgraded restore is a fresh spawn: it is never decided on the
+	// snapshot's provenance, so neither death is logged or counted as one.
+	assertNoRestoreDecision(ctx, t, logs, before)
 }
 
 // TestResilienceScenario17_RestoreWithDocker_DockerFalseStillRestores is

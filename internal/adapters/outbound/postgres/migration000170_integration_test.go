@@ -5,423 +5,266 @@ package postgres_test
 import (
 	"context"
 	"database/sql"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"reflect"
 	"strings"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/golang-migrate/migrate/v4"
-	"github.com/jackc/pgx/v5/pgtype"
-	"golang.org/x/sync/errgroup"
-
-	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 )
 
-// This file runs the review_sessions_base_repository migration through
-// golang-migrate against real Postgres, in a database of its own migrated
-// to the version before it. The up moves a legacy review session of a pull
-// request from a fork -- its spec naming the fork -- onto the pull
-// request's base repository (technical plan §21.1, §30.4), only when its
-// sandbox holds no live gen; every other session is untouched, a second
-// run moves nothing, and the down changes nothing. It also pins that the
-// actor's statement for one session, MoveReviewSessionToBaseRepository,
-// moves what the migration left for it the same way and nothing else, and
-// that a gen a spawn starts while the migration waits on its session is
-// never moved under.
+// This file runs the snapshot runtime provenance migration
+// (snapshot_runtime_provenance) through golang-migrate against real
+// Postgres, in a database of its own migrated to the version before it
+// first. The up adds what technical plan §35.5b records of a snapshot: the
+// protocol and agent runtime version its minting agent reported
+// (sandboxes.snapshot_agent_protocol, snapshot_runtime_version), when it
+// was recorded (snapshot_minted_at), and the snapshot id they describe
+// (snapshot_provenance_id); the down removes them.
+//
+// It also pins what the migration's "Rolling deploy" and "Rolling back"
+// sections say of the previous binary: its sandbox statements -- copied
+// below verbatim from the sqlc output it was built with -- run with the
+// columns present and leave them alone, so a snapshot it records, or
+// clears, no longer matches snapshot_provenance_id and reads "provenance
+// unknown", never the provenance of the snapshot before it; it cannot boot
+// on this version; and it can once the recorded version is forced back
+// with the columns kept, after which this release's migration runs again
+// and keeps their values. This release's own statement is read from the
+// sqlc output (generatedQuery), so it cannot drift from what the store
+// sends.
 
-// reviewSessionsBaseRepositoryMigration is this migration's version.
-const reviewSessionsBaseRepositoryMigration = 170
+// snapshotProvenanceMigration is the migration's version.
+const snapshotProvenanceMigration = 170
 
-// baseRepositoryCase is one session the migration is run over.
-type baseRepositoryCase struct {
-	name string
-	// repos is the session's spec before the migration.
-	repos string
-	// claims are the github_pr_sessions rows naming the session.
-	claims []string
-	// sandbox is the sandbox row's status; "" for no sandbox row.
-	sandbox string
-	// moved is the spec after the migration; "" when it is untouched.
-	moved string
-	// actorMoves is the spec the actor's statement moves a session the
-	// migration left to; "" when it moves nothing.
-	actorMoves string
+// The previous binary's sandbox statements, as its sqlc output sent them:
+// the column list of every SELECT * and RETURNING * on sandboxes, and the
+// two statements that write snapshot_id.
+const (
+	preProvenanceSandboxColumns = previous167SandboxColumns + ", review_checkout_gen"
+	preProvenanceGetSandbox     = `SELECT ` + preProvenanceSandboxColumns + ` FROM sandboxes WHERE session_id = $1`
+	preProvenanceUpdateSnapshot = `UPDATE sandboxes
+SET snapshot_id = $2, snapshot_suppressed_in_shadow = $3, pending_snapshot_message_id = NULL, updated_at = now()
+WHERE session_id = $1
+RETURNING ` + preProvenanceSandboxColumns
+	preProvenanceClearSnapshot = `UPDATE sandboxes
+SET snapshot_id = NULL, snapshot_suppressed_in_shadow = false, updated_at = now()
+WHERE session_id = $1 AND snapshot_id IS NOT NULL`
+)
+
+// provenanceColumns is the part of a sandbox row the migration is about,
+// read by name, with the snapshot id it is keyed to.
+type provenanceColumns struct {
+	snapshotID, provenanceID      *string
+	agentProtocol, runtimeVersion *string
+	mintedAt                      sql.NullTime
 }
 
-func baseRepositoryCases() []baseRepositoryCase {
-	const forked = `[{"name":"widgets-fork","url":"https://github.com/contributor/widgets-fork.git","branch":"main"}]`
-	const onBase = `[{"name":"widgets-fork","url":"https://github.com/acme/widgets.git","branch":null}]`
-	return []baseRepositoryCase{
-		{name: "a fork's session with no sandbox moves", repos: forked, claims: []string{"acme/widgets"}, moved: onBase},
-		{name: "a fork's session whose sandbox is pending moves", repos: forked, claims: []string{"acme/widgets"}, sandbox: "pending", moved: onBase},
-		{name: "a fork's session whose sandbox stopped moves", repos: forked, claims: []string{"acme/widgets"}, sandbox: "stopped", moved: onBase},
-		{name: "a fork's session whose sandbox failed moves", repos: forked, claims: []string{"acme/widgets"}, sandbox: "failed", moved: onBase},
-		{name: "a fork's session whose gen is ready waits for the actor", repos: forked, claims: []string{"acme/widgets"}, sandbox: "ready", actorMoves: onBase},
-		{name: "a fork's session whose gen is spawning waits for the actor", repos: forked, claims: []string{"acme/widgets"}, sandbox: "spawning", actorMoves: onBase},
-		{name: "a fork's session whose gen is suspect waits for the actor", repos: forked, claims: []string{"acme/widgets"}, sandbox: "suspect", actorMoves: onBase},
-		{name: "a fork's session whose gen is snapshotting waits for the actor", repos: forked, claims: []string{"acme/widgets"}, sandbox: "snapshotting", actorMoves: onBase},
-		{name: "a fork's session whose gen is connecting waits for the actor", repos: forked, claims: []string{"acme/widgets"}, sandbox: "connecting", actorMoves: onBase},
-		{name: "a fork's session whose gen is booting waits for the actor", repos: forked, claims: []string{"acme/widgets"}, sandbox: "booting", actorMoves: onBase},
-		{
-			// The actor's statement keeps the host, as the migration's does.
-			name:       "a fork's session on another host whose gen is ready waits for the actor, which keeps the host",
-			repos:      `[{"name":"tools","url":"https://ghes.example.test/someone/tools.git","branch":"patch-1"}]`,
-			claims:     []string{"Acme/Tools"},
-			sandbox:    "ready",
-			actorMoves: `[{"name":"tools","url":"https://ghes.example.test/Acme/Tools.git","branch":null}]`,
-		},
-		{
-			name:   "a fork url without .git moves, the host kept",
-			repos:  `[{"name":"tools","url":"https://code.example.test/someone/tools","branch":"patch-1"}]`,
-			claims: []string{"Acme/Tools"},
-			moved:  `[{"name":"tools","url":"https://code.example.test/Acme/Tools.git","branch":null}]`,
-		},
-		{
-			name:   "a same-repository session is untouched, its branch kept",
-			repos:  `[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":"feature-x"}]`,
-			claims: []string{"acme/widgets"},
-		},
-		{
-			name:   "a same-repository session is untouched whatever the case and suffix",
-			repos:  `[{"name":"widgets","url":"https://github.com/ACME/Widgets","branch":"feature-x"}]`,
-			claims: []string{"acme/widgets"},
-		},
-		{
-			name:  "a session with no claim is untouched",
-			repos: `[{"name":"widgets","url":"https://github.com/contributor/widgets.git","branch":"main"}]`,
-		},
-		{
-			name:   "a session with two claims is untouched",
-			repos:  forked,
-			claims: []string{"acme/widgets", "acme/other"},
-		},
-		{
-			name:   "a multi-repo session is untouched",
-			repos:  `[{"name":"a","url":"https://github.com/contributor/a.git","branch":"main"},{"name":"b","url":"https://github.com/acme/b.git","branch":null}]`,
-			claims: []string{"acme/a"},
-		},
-		{
-			name:   "a url that is not https is untouched",
-			repos:  `[{"name":"widgets","url":"http://github.com/contributor/widgets.git","branch":"main"}]`,
-			claims: []string{"acme/widgets"},
-		},
-		{
-			name:   "a url with a nested path is untouched",
-			repos:  `[{"name":"widgets","url":"https://github.com/group/sub/widgets.git","branch":"main"}]`,
-			claims: []string{"acme/widgets"},
-		},
-		{name: "a session with no repos is untouched", repos: `[]`, claims: []string{"acme/widgets"}},
-	}
-}
-
-// seedBaseRepositoryCase inserts tc's session, claims and sandbox, and
-// returns the session's id.
-func seedBaseRepositoryCase(ctx context.Context, t *testing.T, db *sql.DB, tc baseRepositoryCase, prNumber int) string {
+func readProvenanceColumns(ctx context.Context, t *testing.T, db *sql.DB, sessionID string) provenanceColumns {
 	t.Helper()
-	var id string
-	if err := db.QueryRowContext(ctx, `INSERT INTO sessions (spawn_source, repos) VALUES ('github', $1::jsonb) RETURNING id::text`, tc.repos).Scan(&id); err != nil {
-		t.Fatalf("%s: insert the session: %v", tc.name, err)
+	var c provenanceColumns
+	if err := db.QueryRowContext(ctx, `SELECT snapshot_id, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at
+		FROM sandboxes WHERE session_id = $1`, sessionID).Scan(&c.snapshotID, &c.provenanceID, &c.agentProtocol, &c.runtimeVersion, &c.mintedAt); err != nil {
+		t.Fatalf("read the sandbox's provenance columns: %v", err)
 	}
-	for i, claim := range tc.claims {
-		if _, err := db.ExecContext(ctx, `INSERT INTO github_pr_sessions (repo_full_name, pr_number, session_id) VALUES ($1, $2, $3)`, claim, prNumber*10+i, id); err != nil {
-			t.Fatalf("%s: insert a claim: %v", tc.name, err)
+	return c
+}
+
+// recorded reports whether the columns describe the row's snapshot: the
+// id key matches it.
+func (c provenanceColumns) recorded() bool {
+	return c.snapshotID != nil && c.provenanceID != nil && *c.snapshotID == *c.provenanceID
+}
+
+func (c provenanceColumns) String() string {
+	str := func(p *string) string {
+		if p == nil {
+			return "NULL"
 		}
+		return *p
 	}
-	if tc.sandbox != "" {
-		if _, err := db.ExecContext(ctx, `INSERT INTO sandboxes (session_id, status) VALUES ($1, $2::sandbox_status)`, id, tc.sandbox); err != nil {
-			t.Fatalf("%s: insert the sandbox: %v", tc.name, err)
-		}
+	minted := "NULL"
+	if c.mintedAt.Valid {
+		minted = c.mintedAt.Time.Format(time.RFC3339Nano)
 	}
-	return id
+	return fmt.Sprintf("snapshot_id %s, snapshot_provenance_id %s, snapshot_agent_protocol %s, snapshot_runtime_version %s, snapshot_minted_at %s",
+		str(c.snapshotID), str(c.provenanceID), str(c.agentProtocol), str(c.runtimeVersion), minted)
 }
 
-// sessionRepos reads a session's spec, decoded so specs compare by value.
-func sessionRepos(ctx context.Context, t *testing.T, db *sql.DB, id string) any {
-	t.Helper()
-	var raw []byte
-	if err := db.QueryRowContext(ctx, `SELECT repos FROM sessions WHERE id = $1`, id).Scan(&raw); err != nil {
-		t.Fatalf("read session %s: %v", id, err)
-	}
-	return decodeRepos(t, raw)
-}
-
-func decodeRepos(t *testing.T, raw []byte) any {
-	t.Helper()
-	var v any
-	if err := json.Unmarshal(raw, &v); err != nil {
-		t.Fatalf("decode repos %s: %v", raw, err)
-	}
-	return v
-}
-
-func TestMigrationReviewSessionsBaseRepository_MovesALegacyForkReviewSessionOnlyWithNoLiveGen(t *testing.T) {
+func TestMigrationSnapshotRuntimeProvenance_UpAndDown(t *testing.T) {
 	ctx := context.Background()
-	previousVersion := versionBefore(t, reviewSessionsBaseRepositoryMigration)
-	connStr, db := migrationTestDatabase(ctx, t, previousVersion)
+	previous := versionBefore(t, snapshotProvenanceMigration)
+	connStr, db := migrationTestDatabase(ctx, t, previous)
+	sandboxColumns := len(strings.Split(preProvenanceSandboxColumns, ","))
 
-	cases := baseRepositoryCases()
-	ids := make([]string, len(cases))
-	for i, tc := range cases {
-		ids[i] = seedBaseRepositoryCase(ctx, t, db, tc, i+1)
-	}
-	assertSpecs := func(stage string, want func(baseRepositoryCase) string) {
+	columns := func() map[string]string {
 		t.Helper()
-		for i, tc := range cases {
-			wantRepos := decodeRepos(t, []byte(want(tc)))
-			if got := sessionRepos(ctx, t, db, ids[i]); !reflect.DeepEqual(got, wantRepos) {
-				t.Errorf("%s, %s: repos = %v, want %v", stage, tc.name, got, wantRepos)
+		rows, err := db.QueryContext(ctx, `SELECT table_name || '.' || column_name, is_nullable || ' ' || coalesce(column_default, '') || ' ' || data_type
+			FROM information_schema.columns
+			WHERE table_name = 'sandboxes' AND column_name IN ('snapshot_provenance_id', 'snapshot_agent_protocol', 'snapshot_runtime_version', 'snapshot_minted_at')`)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got := map[string]string{}
+		for rows.Next() {
+			var name, shape string
+			if err := rows.Scan(&name, &shape); err != nil {
+				_ = rows.Close()
+				t.Fatal(err)
+			}
+			got[name] = shape
+		}
+		iterErr := rows.Err()
+		_ = rows.Close()
+		if iterErr != nil {
+			t.Fatal(iterErr)
+		}
+		return got
+	}
+
+	if got := columns(); len(got) != 0 {
+		t.Fatalf("provenance columns at %d: %v, want none", previous, got)
+	}
+	var sessionID string
+	if err := db.QueryRowContext(ctx, `INSERT INTO sessions (spawn_source) VALUES ('web') RETURNING id::text`).Scan(&sessionID); err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+	previousRow(ctx, t, db, sandboxColumns, `INSERT INTO sandboxes (session_id) VALUES ($1) RETURNING `+preProvenanceSandboxColumns, sessionID)
+	// A snapshot recorded before the migration, by the previous binary.
+	previousRow(ctx, t, db, sandboxColumns, preProvenanceUpdateSnapshot, sessionID, "snap-before", false)
+
+	m, mdb := newMigrate(t, connStr)
+	defer func() { _ = mdb.Close() }()
+	if err := m.Migrate(snapshotProvenanceMigration); err != nil {
+		t.Fatalf("up to %d: %v", snapshotProvenanceMigration, err)
+	}
+	want := map[string]string{
+		"sandboxes.snapshot_provenance_id":   "YES  text",
+		"sandboxes.snapshot_agent_protocol":  "YES  text",
+		"sandboxes.snapshot_runtime_version": "YES  text",
+		"sandboxes.snapshot_minted_at":       "YES  timestamp with time zone",
+	}
+	if got := columns(); len(got) != len(want) {
+		t.Fatalf("columns at %d = %v, want %v", snapshotProvenanceMigration, got, want)
+	} else {
+		for name, shape := range want {
+			if got[name] != shape {
+				t.Fatalf("%s is (nullable, default, type) %q, want %q", name, got[name], shape)
 			}
 		}
 	}
-	afterUp := func(tc baseRepositoryCase) string {
-		if tc.moved != "" {
-			return tc.moved
-		}
-		return tc.repos
+
+	// A snapshot that exists at the migration has no provenance: no
+	// backfill, so it reads "provenance unknown".
+	if c := readProvenanceColumns(ctx, t, db, sessionID); c.recorded() || c.agentProtocol != nil || c.runtimeVersion != nil || c.mintedAt.Valid {
+		t.Fatalf("a snapshot that existed at the migration reads %v; want its provenance unrecorded", c)
 	}
 
-	m, mdb := newMigrate(t, connStr)
-	defer func() { _ = mdb.Close() }()
-	if err := m.Migrate(reviewSessionsBaseRepositoryMigration); err != nil {
-		t.Fatalf("up to %d: %v", reviewSessionsBaseRepositoryMigration, err)
+	// This release records a snapshot with what its agent reported.
+	updateSnapshot := generatedQuery(t, "sandboxes.sql.go", "updateSandboxSnapshotID")
+	if _, err := db.ExecContext(ctx, updateSnapshot, "snap-1", false, "1.24.0", "1.14.19", sessionID); err != nil {
+		t.Fatalf("this release's UpdateSandboxSnapshotID: %v", err)
 	}
-	assertSpecs("after the up", afterUp)
+	first := readProvenanceColumns(ctx, t, db, sessionID)
+	if !first.recorded() || *first.snapshotID != "snap-1" || first.agentProtocol == nil || *first.agentProtocol != "1.24.0" ||
+		first.runtimeVersion == nil || *first.runtimeVersion != "1.14.19" || !first.mintedAt.Valid {
+		t.Fatalf("after this release's mint: %v; want snap-1 recorded with 1.24.0 and 1.14.19, and a mint time", first)
+	}
 
-	// Run again -- as a redeploy after `migrate force` to the previous version
-	// does: nothing
-	// already moved moves again, nothing else moves.
-	if err := m.Force(int(previousVersion)); err != nil {
-		t.Fatalf("force %d: %v", previousVersion, err)
+	// The previous binary, still running during a rolling deploy: it reads
+	// sandboxes with the columns present, and its mint moves snapshot_id
+	// alone, so the id key no longer matches -- snap-2 reads "provenance
+	// unknown", never snap-1's protocol.
+	previousRow(ctx, t, db, sandboxColumns, preProvenanceGetSandbox, sessionID)
+	previousRow(ctx, t, db, sandboxColumns, preProvenanceUpdateSnapshot, sessionID, "snap-2", true)
+	if c := readProvenanceColumns(ctx, t, db, sessionID); c.recorded() || c.snapshotID == nil || *c.snapshotID != "snap-2" ||
+		c.provenanceID == nil || *c.provenanceID != "snap-1" || c.agentProtocol == nil || *c.agentProtocol != "1.24.0" {
+		t.Fatalf("after the previous binary's mint: %v; want snap-2 with snap-1's provenance left on snap-1 (not matching)", c)
 	}
-	if err := m.Migrate(reviewSessionsBaseRepositoryMigration); err != nil {
-		t.Fatalf("up to %d again: %v", reviewSessionsBaseRepositoryMigration, err)
+	// Its clear leaves the provenance on the snapshot it cleared, which no
+	// longer matches either.
+	if _, err := db.ExecContext(ctx, preProvenanceClearSnapshot, sessionID); err != nil {
+		t.Fatalf("the previous binary's ClearSandboxSnapshot: %v", err)
 	}
-	assertSpecs("after a second up", afterUp)
+	if c := readProvenanceColumns(ctx, t, db, sessionID); c.recorded() || c.snapshotID != nil {
+		t.Fatalf("after the previous binary's clear: %v; want no snapshot and nothing recorded for it", c)
+	}
+	// This release's next mint records again, over whatever was left.
+	if _, err := db.ExecContext(ctx, updateSnapshot, "snap-3", false, nil, nil, sessionID); err != nil {
+		t.Fatalf("this release's next mint: %v", err)
+	}
+	third := readProvenanceColumns(ctx, t, db, sessionID)
+	if !third.recorded() || *third.snapshotID != "snap-3" || third.agentProtocol != nil || third.runtimeVersion != nil || !third.mintedAt.Valid {
+		t.Fatalf("after this release's mint by an agent that reported nothing: %v; want snap-3 recorded with no protocol and no runtime", third)
+	}
 
-	// The down changes nothing.
-	if err := m.Migrate(previousVersion); err != nil {
-		t.Fatalf("down to %d: %v", previousVersion, err)
-	}
-	assertSpecs("after the down", afterUp)
-
-	// The previous binary cannot boot on this version: golang-migrate refuses a
-	// version it has no file for.
-	if err := m.Migrate(reviewSessionsBaseRepositoryMigration); err != nil {
-		t.Fatalf("up to %d after the down: %v", reviewSessionsBaseRepositoryMigration, err)
-	}
-	previous, pdb := previousBinaryMigrate(t, connStr, int(previousVersion))
-	if err := previous.Up(); err == nil || !strings.Contains(err.Error(), fmt.Sprint(reviewSessionsBaseRepositoryMigration)) {
-		t.Fatalf("the previous binary's boot on %d = %v, want a refusal naming %d", reviewSessionsBaseRepositoryMigration, err, reviewSessionsBaseRepositoryMigration)
+	// It cannot boot on this version: golang-migrate refuses a version it
+	// has no file for.
+	previousMigrate, pdb := previousBinaryMigrate(t, connStr, int(previous))
+	if err := previousMigrate.Up(); err == nil || !strings.Contains(err.Error(), fmt.Sprint(snapshotProvenanceMigration)) {
+		t.Fatalf("the previous binary's boot on %d = %v, want a refusal naming %d", snapshotProvenanceMigration, err, snapshotProvenanceMigration)
 	}
 	_ = pdb.Close()
 
-	// The actor's statement, for one session, moves exactly what the
-	// migration left to it -- a session whose gen was live -- the same way,
-	// and nothing else; a second call moves nothing.
-	pool, err := narvipg.NewPool(ctx, connStr)
-	if err != nil {
-		t.Fatalf("NewPool: %v", err)
+	// Rolling back with the columns kept: force the previous version, and
+	// the previous binary boots and works. Deploying this release again
+	// runs the migration again, which keeps the columns and their values.
+	if err := m.Force(int(previous)); err != nil {
+		t.Fatalf("force %d: %v", previous, err)
 	}
-	defer pool.Close()
-	sessions := narvipg.NewSessionStore(pool)
-	for i, tc := range cases {
-		var id pgtype.UUID
-		if err := id.Scan(ids[i]); err != nil {
-			t.Fatal(err)
-		}
-		repos, moved, err := sessions.MoveReviewSessionToBaseRepository(ctx, id)
-		if err != nil {
-			t.Fatalf("%s: MoveReviewSessionToBaseRepository: %v", tc.name, err)
-		}
-		if moved != (tc.actorMoves != "") {
-			t.Errorf("%s: the actor's statement moved = %v, want %v", tc.name, moved, tc.actorMoves != "")
-			continue
-		}
-		if !moved {
-			continue
-		}
-		want := decodeRepos(t, []byte(tc.actorMoves))
-		if got := decodeRepos(t, repos); !reflect.DeepEqual(got, want) {
-			t.Errorf("%s: the actor's statement returned %v, want %v", tc.name, got, want)
-		}
-		if got := sessionRepos(ctx, t, db, ids[i]); !reflect.DeepEqual(got, want) {
-			t.Errorf("%s: after the actor's statement repos = %v, want %v", tc.name, got, want)
-		}
-		if _, again, err := sessions.MoveReviewSessionToBaseRepository(ctx, id); err != nil || again {
-			t.Errorf("%s: a second call moved = %v (err %v), want nothing", tc.name, again, err)
-		}
+	previousMigrate, pdb = previousBinaryMigrate(t, connStr, int(previous))
+	if err := previousMigrate.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("the previous binary's boot after force %d = %v, want no change", previous, err)
 	}
-}
-
-// TestMigrationReviewSessionsBaseRepository_NeverMovesASessionUnderAGenSpawnedWhileItWaits: a
-// spawn holds a legacy session's lock -- as every actor transaction does,
-// GetSessionActorEpochForUpdate -- and moves its stopped sandbox to
-// spawning, a gen whose SESSION_CONFIG names the fork. The migration starts
-// while that spawn is open and waits on the session's row; once the spawn
-// commits, the gen is live, so the session must stay on the fork's spec
-// for the actor to move at its next boot.
-func TestMigrationReviewSessionsBaseRepository_NeverMovesASessionUnderAGenSpawnedWhileItWaits(t *testing.T) {
-	ctx := context.Background()
-	previousVersion := versionBefore(t, reviewSessionsBaseRepositoryMigration)
-	connStr, db := migrationTestDatabase(ctx, t, previousVersion)
-
-	const forked = `[{"name":"widgets","url":"https://github.com/contributor/widgets.git","branch":"main"}]`
-	id := seedBaseRepositoryCase(ctx, t, db, baseRepositoryCase{name: "spawning while the migration waits", repos: forked, claims: []string{"acme/widgets"}, sandbox: "stopped"}, 1)
-	control := seedBaseRepositoryCase(ctx, t, db, baseRepositoryCase{name: "stopped throughout", repos: forked, claims: []string{"acme/widgets"}, sandbox: "stopped"}, 2)
-
-	spawn, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
+	_ = pdb.Close()
+	previousRow(ctx, t, db, sandboxColumns, preProvenanceGetSandbox, sessionID)
+	// Pinned to this version, like every migration test here: Up would
+	// also apply whatever later migrations exist by the time this runs.
+	again, adb := newMigrate(t, connStr)
+	if err := again.Migrate(snapshotProvenanceMigration); err != nil {
+		t.Fatalf("this release's migration after the rollback = %v, want it applied again", err)
 	}
-	defer func() { _ = spawn.Rollback() }()
-	if _, err := spawn.ExecContext(ctx, `SELECT actor_epoch FROM sessions WHERE id = $1 FOR UPDATE`, id); err != nil {
-		t.Fatalf("the spawn's session lock: %v", err)
-	}
-	if _, err := spawn.ExecContext(ctx, `UPDATE sandboxes SET status = 'spawning', gen = gen + 1 WHERE session_id = $1`, id); err != nil {
-		t.Fatalf("the spawn's sandbox write: %v", err)
+	_ = adb.Close()
+	assertCleanVersion(t, connStr, snapshotProvenanceMigration)
+	if c := readProvenanceColumns(ctx, t, db, sessionID); c.String() != third.String() {
+		t.Fatalf("after the migration ran again: %v; want %v, kept", c, third)
 	}
 
-	m, mdb := newMigrate(t, connStr)
-	defer func() { _ = mdb.Close() }()
-	var group errgroup.Group
-	group.Go(func() error { return m.Migrate(reviewSessionsBaseRepositoryMigration) })
-
-	// The migration is waiting on the spawn's lock.
-	deadline := time.Now().Add(30 * time.Second)
-	for {
-		var waiting int
-		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND pid <> pg_backend_pid() AND wait_event_type = 'Lock'`).Scan(&waiting); err != nil {
-			t.Fatalf("read pg_stat_activity: %v", err)
-		}
-		if waiting > 0 {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("the migration never waited on the spawn's lock")
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if err := spawn.Commit(); err != nil {
-		t.Fatalf("commit the spawn: %v", err)
-	}
-	if err := group.Wait(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		t.Fatalf("up to %d: %v", reviewSessionsBaseRepositoryMigration, err)
-	}
-
-	if got, want := sessionRepos(ctx, t, db, id), decodeRepos(t, []byte(forked)); !reflect.DeepEqual(got, want) {
-		t.Errorf("the session a spawn started a gen for while the migration waited: repos = %v, want the fork's %v kept for that gen", got, want)
-	}
-	onBase := decodeRepos(t, []byte(`[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":null}]`))
-	if got := sessionRepos(ctx, t, db, control); !reflect.DeepEqual(got, onBase) {
-		t.Errorf("the control session, stopped throughout: repos = %v, want %v", got, onBase)
-	}
-}
-
-// TestMigrationReviewSessionsBaseRepository_NeverMovesASessionOpenedWhileItRuns:
-// during a rolling deploy a previous replica keeps opening fork review
-// sessions, on the fork's spec, and spawning their first gen. Session Y,
-// a candidate, is held by an actor's transaction, so the migration's lock
-// statement waits on it. Meanwhile a new fork session X is committed, and
-// its first spawn locks X and starts a gen booting on the fork's spec. Once
-// Y's holder commits, the migration moves Y -- it locked Y -- and must leave
-// X, which it never locked, to the actor's next spawn or restore, whether
-// the spawn commits before or after the migration's update would have
-// reached X.
-func TestMigrationReviewSessionsBaseRepository_NeverMovesASessionOpenedWhileItRuns(t *testing.T) {
-	ctx := context.Background()
-	previousVersion := versionBefore(t, reviewSessionsBaseRepositoryMigration)
-	connStr, db := migrationTestDatabase(ctx, t, previousVersion)
-
-	const ySpec = `[{"name":"widgets","url":"https://github.com/contributor/widgets.git","branch":"main"}]`
-	y := seedBaseRepositoryCase(ctx, t, db, baseRepositoryCase{name: "held while the migration starts", repos: ySpec, claims: []string{"acme/widgets"}, sandbox: "stopped"}, 1)
-
-	holder, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = holder.Rollback() }()
-	if _, err := holder.ExecContext(ctx, `SELECT actor_epoch FROM sessions WHERE id = $1 FOR UPDATE`, y); err != nil {
-		t.Fatalf("hold Y: %v", err)
-	}
-
-	m, mdb := newMigrate(t, connStr)
-	defer func() { _ = mdb.Close() }()
-	var group errgroup.Group
-	var migrated atomic.Bool
-	group.Go(func() error {
-		defer migrated.Store(true)
-		return m.Migrate(reviewSessionsBaseRepositoryMigration)
-	})
-	waitingOn := func(pid int) bool {
+	// Down: the columns go, every row stays. Run twice -- the second time
+	// on a database a rollback already brought back to the previous
+	// version with the columns dropped, forced forward again -- which the
+	// IF EXISTS guard allows. Up again works on that state.
+	countSandboxes := func() int {
 		t.Helper()
 		var n int
-		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM pg_stat_activity
-			WHERE datname = current_database() AND wait_event_type = 'Lock' AND $1 = ANY(pg_blocking_pids(pid))`, pid).Scan(&n); err != nil {
-			t.Fatalf("read pg_stat_activity: %v", err)
+		if err := db.QueryRowContext(ctx, `SELECT count(*) FROM sandboxes`).Scan(&n); err != nil {
+			t.Fatal(err)
 		}
-		return n > 0
+		return n
 	}
-	var holderPID int
-	if err := holder.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&holderPID); err != nil {
-		t.Fatal(err)
+	before := countSandboxes()
+	if err := m.Migrate(previous); err != nil {
+		t.Fatalf("down to %d: %v", previous, err)
 	}
-	waitFor(t, "the migration to wait on Y's holder", func() bool { return waitingOn(holderPID) })
-
-	// A previous replica opens X, a fork's review session, and spawns its
-	// first gen, booting on the fork's spec.
-	const xSpec = `[{"name":"gadgets","url":"https://github.com/contributor/gadgets.git","branch":"feature"}]`
-	x := seedBaseRepositoryCase(ctx, t, db, baseRepositoryCase{name: "opened while the migration runs", repos: xSpec, claims: []string{"acme/gadgets"}}, 2)
-	spawn, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
+	if got := columns(); len(got) != 0 {
+		t.Fatalf("columns after the down: %v, want none", got)
 	}
-	defer func() { _ = spawn.Rollback() }()
-	var spawnPID int
-	if err := spawn.QueryRowContext(ctx, `SELECT pg_backend_pid()`).Scan(&spawnPID); err != nil {
-		t.Fatal(err)
+	if after := countSandboxes(); after != before {
+		t.Fatalf("sandboxes after the down: %d, want %d", after, before)
 	}
-	if _, err := spawn.ExecContext(ctx, `SELECT repos FROM sessions WHERE id = $1 FOR UPDATE`, x); err != nil {
-		t.Fatalf("the spawn's lock on X: %v", err)
+	previousRow(ctx, t, db, sandboxColumns, preProvenanceGetSandbox, sessionID)
+	if err := m.Force(snapshotProvenanceMigration); err != nil {
+		t.Fatalf("force %d: %v", snapshotProvenanceMigration, err)
 	}
-	if _, err := spawn.ExecContext(ctx, `INSERT INTO sandboxes (session_id, status) VALUES ($1, 'spawning')`, x); err != nil {
-		t.Fatalf("the spawn's sandbox: %v", err)
+	if err := m.Migrate(previous); err != nil {
+		t.Fatalf("down to %d again, the columns already gone: %v", previous, err)
 	}
-
-	if err := holder.Commit(); err != nil {
-		t.Fatalf("commit Y's holder: %v", err)
+	if err := m.Migrate(snapshotProvenanceMigration); err != nil {
+		t.Fatalf("up to %d again: %v", snapshotProvenanceMigration, err)
 	}
-	// Either the migration finishes without touching X, or -- a migration
-	// that would move X -- it waits on the spawn's lock on X.
-	waitFor(t, "the migration to finish or to wait on X's spawn", func() bool { return migrated.Load() || waitingOn(spawnPID) })
-	if err := spawn.Commit(); err != nil {
-		t.Fatalf("commit X's spawn: %v", err)
-	}
-	if err := group.Wait(); err != nil {
-		t.Fatalf("up to %d: %v", reviewSessionsBaseRepositoryMigration, err)
-	}
-
-	if got, want := sessionRepos(ctx, t, db, x), decodeRepos(t, []byte(xSpec)); !reflect.DeepEqual(got, want) {
-		t.Errorf("X, opened and spawned while the migration ran: repos = %v, want the fork's %v kept for its booting gen", got, want)
-	}
-	onBase := decodeRepos(t, []byte(`[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":null}]`))
-	if got := sessionRepos(ctx, t, db, y); !reflect.DeepEqual(got, onBase) {
-		t.Errorf("Y, which the migration locked: repos = %v, want %v", got, onBase)
-	}
-}
-
-// waitFor polls cond until it holds, or fails the test after 30 seconds.
-func waitFor(t *testing.T, what string, cond func() bool) {
-	t.Helper()
-	deadline := time.Now().Add(30 * time.Second)
-	for !cond() {
-		if time.Now().After(deadline) {
-			t.Fatalf("timed out waiting for %s", what)
-		}
-		time.Sleep(20 * time.Millisecond)
+	assertCleanVersion(t, connStr, snapshotProvenanceMigration)
+	if got := columns(); len(got) != len(want) {
+		t.Fatalf("columns after up again = %v, want %v", got, want)
 	}
 }
