@@ -147,6 +147,20 @@ func EvaluateSpawnDecision(state SpawnState, cfg SpawnConfig, now time.Time, isS
 		return SpawnAction{Kind: SpawnActionSkip, Reason: fmt.Sprintf("already %s", state.Status)}
 	}
 
+	// Snapshotting is a live sandbox mid-snapshot, and the machine has no
+	// spawn edge out of it: no force-respawn, unlike the boot states above
+	// (state.go). Its own snapshot report returns it to Ready, a watchdog
+	// to Suspect, and the runway gate's deadline row (EvaluateRunway)
+	// retires it once its deadline has passed; a spawn decision must not
+	// race them, so there is no staleness carve-out here either. Without
+	// this row, a pending turn evaluated during a post-turn snapshot fell
+	// through to Spawn once the cooldown had passed -- a decision the
+	// caller could only refuse as an error, every evaluation until the
+	// snapshot ended.
+	if state.Status == StateSnapshotting {
+		return SpawnAction{Kind: SpawnActionSkip, Reason: "snapshot in progress"}
+	}
+
 	// Suspect is mid-grace-period (§3.2: a watchdog silence/timeout parks a
 	// live sandbox in Suspect before deciding Stopped/Failed/Stale; "any
 	// liveness signal during grace returns to previous state"). Spawning

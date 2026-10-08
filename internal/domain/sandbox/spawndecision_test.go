@@ -88,6 +88,30 @@ func TestEvaluateSpawnDecision(t *testing.T) {
 			wantContains: "suspect",
 		},
 		{
+			// Before this row, a snapshotting sandbox past the cooldown fell
+			// through to Spawn, which has no edge from snapshotting: every
+			// dispatch evaluation of a turn queued behind a post-turn
+			// snapshot failed and backed off until the snapshot ended.
+			name: "skip when snapshotting, even long past every other window",
+			state: sandbox.SpawnState{
+				Status:     sandbox.StateSnapshotting,
+				CreatedAt:  now.Add(-(cfg.SpawningTimeout + cfg.Cooldown + cfg.ReadyWait + time.Hour)),
+				LastSeenAt: now.Add(-(cfg.SpawningTimeout + time.Hour)),
+			},
+			wantKind:     sandbox.SpawnActionSkip,
+			wantContains: "snapshot in progress",
+		},
+		{
+			name: "skip when snapshotting, even with a snapshot to restore and a provider object to resume",
+			state: sandbox.SpawnState{
+				Status: sandbox.StateSnapshotting, CreatedAt: now.Add(-time.Hour),
+				SnapshotImageID: "img-abc123", ProviderObjectID: "provider-object-1",
+			},
+			supportsPersistentResume: true,
+			wantKind:                 sandbox.SpawnActionSkip,
+			wantContains:             "snapshot in progress",
+		},
+		{
 			name: "spawn when stuck in spawning past the spawning timeout (recovers interrupted spawn)",
 			state: sandbox.SpawnState{
 				Status: sandbox.StateSpawning, CreatedAt: now.Add(-(cfg.SpawningTimeout + time.Second)),
@@ -316,6 +340,58 @@ func TestEvaluateSpawnDecision(t *testing.T) {
 				t.Errorf("action %+v does not contain %q", got, tc.wantContains)
 			}
 		})
+	}
+}
+
+// TestEvaluateSpawnDecision_ActsOnlyOverAnEdge cross-checks the decision
+// against the machine's transition table (state.go), which the caller
+// validates every write against: for every state, long past every window,
+// with and without a snapshot, a provider object and the resume
+// capability, a Spawn has a spawn or force-respawn edge, a Restore a
+// restore edge and a Resume a resume edge out of that state. A decision
+// with no edge is one the caller can only refuse as an error, every time
+// it is evaluated -- what a snapshotting sandbox's Spawn was.
+func TestEvaluateSpawnDecision_ActsOnlyOverAnEdge(t *testing.T) {
+	t.Parallel()
+
+	cfg := sandbox.SpawnConfig{Cooldown: 30 * time.Second, ReadyWait: 60 * time.Second, SpawningTimeout: 120 * time.Second}
+	now := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	longAgo := now.Add(-time.Hour)
+	const gen = 1
+
+	for _, status := range allStates {
+		for _, snapshot := range []string{"", "img-abc123"} {
+			for _, providerObject := range []string{"", "provider-object-1"} {
+				for _, resume := range []bool{false, true} {
+					state := sandbox.SpawnState{
+						Status: status, CreatedAt: longAgo, LastSeenAt: longAgo,
+						SnapshotImageID: snapshot, ProviderObjectID: providerObject,
+					}
+					action := sandbox.EvaluateSpawnDecision(state, cfg, now, false, resume)
+					var edges []sandbox.Trigger
+					switch action.Kind {
+					case sandbox.SpawnActionSpawn:
+						edges = []sandbox.Trigger{sandbox.SpawnTrigger(gen + 1), sandbox.ForceRespawnTrigger(gen + 1)}
+					case sandbox.SpawnActionRestore:
+						edges = []sandbox.Trigger{sandbox.RestoreTrigger(gen + 1)}
+					case sandbox.SpawnActionResume:
+						edges = []sandbox.Trigger{sandbox.ResumeTrigger(gen + 1)}
+					default:
+						continue
+					}
+					legal := false
+					for _, trig := range edges {
+						if _, err := sandbox.Transition(status, gen, trig); err == nil {
+							legal = true
+						}
+					}
+					if !legal {
+						t.Errorf("EvaluateSpawnDecision(%+v, resume=%v) = %s, but the machine has no such edge out of %s",
+							state, resume, action.Kind, status)
+					}
+				}
+			}
+		}
 	}
 }
 
