@@ -30,7 +30,6 @@ import (
 	"errors"
 	"net/http"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
@@ -223,7 +222,7 @@ func PostUnfreezeAutonomy(pool *pgxpool.Pool, settings *postgres.PlatformSetting
 		}
 
 		if err := auditlog.Record(ctx, auditLog.WithTx(tx), actorUserID, auditActionAutonomyUnfrozen, auditResourceTypePlatform, auditResourceIDAutonomy,
-			unfreezeAuditDetail(lifted, time.Now())); err != nil {
+			unfreezeAuditDetail(lifted)); err != nil {
 			logger.Error("httpapi: unfreeze autonomy: record audit log failed", "error", err)
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
@@ -241,19 +240,20 @@ func PostUnfreezeAutonomy(pool *pgxpool.Pool, settings *postgres.PlatformSetting
 }
 
 // unfreezeAuditDetail is the autonomy.unfrozen audit row's detail: the
-// freeze that was lifted -- when it was set, by whom (null once that user
-// is gone), why -- and how long it held, in whole seconds as of now, never
-// negative.
-func unfreezeAuditDetail(lifted sqlcgen.UnfreezeAutonomyRow, now time.Time) map[string]any {
+// freeze that was lifted -- when it was set, by whom (null when that is not
+// on record), why -- and how long it held, in whole seconds. That duration
+// is the unfreeze statement's own (UnfreezeAutonomy's frozen_seconds),
+// measured on the database's clock at both ends, as the audit row's
+// created_at is: a replica's clock never enters it.
+func unfreezeAuditDetail(lifted sqlcgen.UnfreezeAutonomyRow) map[string]any {
 	detail := map[string]any{
 		"frozen_at":      nil,
 		"frozen_by":      nil,
 		"reason":         lifted.Reason,
-		"frozen_seconds": int64(0),
+		"frozen_seconds": lifted.FrozenSeconds,
 	}
 	if lifted.FrozenAt.Valid {
 		detail["frozen_at"] = lifted.FrozenAt.Time
-		detail["frozen_seconds"] = max(int64(0), int64(now.Sub(lifted.FrozenAt.Time).Seconds()))
 	}
 	if lifted.FrozenBy.Valid {
 		detail["frozen_by"] = lifted.FrozenBy.String()

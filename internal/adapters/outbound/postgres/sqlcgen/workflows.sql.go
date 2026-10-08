@@ -1046,7 +1046,8 @@ SELECT
         OR EXISTS (
             SELECT 1 FROM participants p
             WHERE p.session_id = h.session_id AND p.user_id = $1::uuid
-        ))::boolean AS owned_or_joined
+        ))::boolean AS owned_or_joined,
+    (COUNT(*) OVER ())::bigint AS total
 FROM workflow_advance_holds h
 JOIN sessions s ON s.id = h.session_id
 JOIN workflow_runs r ON r.id = h.workflow_run_id
@@ -1074,6 +1075,7 @@ type ListWorkflowAdvanceHoldsForInboxRow struct {
 	SessionTitle  *string            `json:"session_title"`
 	WorkflowName  string             `json:"workflow_name"`
 	OwnedOrJoined bool               `json:"owned_or_joined"`
+	Total         int64              `json:"total"`
 }
 
 // The decision inbox's held workflow advances (technical plan §40.2, §16):
@@ -1082,10 +1084,12 @@ type ListWorkflowAdvanceHoldsForInboxRow struct {
 // sqlc.arg('every_session') is true (an administrator or maintainer, who
 // may decide any session's workflow steps), and otherwise only those on a
 // session sqlc.arg('actor_user_id') created or joined (participants).
-// owned_or_joined says which, for the caller's authz.Authorize. The holds
-// are read through workflow_advance_holds_held_at_idx, a table empty
-// outside a freeze; the run, its definition and its session by primary
-// key.
+// owned_or_joined says which, for the caller's authz.Authorize. total is
+// how many holds match before the bound, the same on every row (a window
+// count, computed before LIMIT), so a caller shown the oldest max_holds can
+// say how many there are. The holds are read through
+// workflow_advance_holds_held_at_idx, a table empty outside a freeze; the
+// run, its definition and its session by primary key.
 func (q *Queries) ListWorkflowAdvanceHoldsForInbox(ctx context.Context, arg ListWorkflowAdvanceHoldsForInboxParams) ([]ListWorkflowAdvanceHoldsForInboxRow, error) {
 	rows, err := q.db.Query(ctx, listWorkflowAdvanceHoldsForInbox, arg.ActorUserID, arg.EverySession, arg.MaxHolds)
 	if err != nil {
@@ -1102,6 +1106,7 @@ func (q *Queries) ListWorkflowAdvanceHoldsForInbox(ctx context.Context, arg List
 			&i.SessionTitle,
 			&i.WorkflowName,
 			&i.OwnedOrJoined,
+			&i.Total,
 		); err != nil {
 			return nil, err
 		}

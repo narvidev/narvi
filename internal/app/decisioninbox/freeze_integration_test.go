@@ -335,10 +335,49 @@ func TestDecisionInbox_HeldWorkflowAdvances_ListedToWhoMayDecide(t *testing.T) {
 		t.Errorf("held advance = %+v, want the owner's session, its workflow and title, held two minutes ago", h)
 	}
 
+	if result.HeldWorkflowAdvancesTotal != 1 {
+		t.Errorf("owner's held advance total = %d, want 1", result.HeldWorkflowAdvancesTotal)
+	}
+
 	if _, err := narvipg.NewWorkflowStore(pool).ReleaseAdvanceHold(ctx, ownedRun); err != nil {
 		t.Fatalf("release the owner's hold: %v", err)
 	}
 	if got := runsOf(owner); len(got) != 0 {
 		t.Errorf("held advances after the release = %v, want none", got)
+	}
+}
+
+// TestDecisionInbox_HeldWorkflowAdvances_ACutListSaysHowManyAreHeld: the
+// list is bounded at 100, oldest first, and says how many advances are held
+// in all, so a cut list never reads as the whole.
+func TestDecisionInbox_HeldWorkflowAdvances_ACutListSaysHowManyAreHeld(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	admin, err := narvipg.NewUserStore(pool).Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: "held-cap-admin@example.com", DisplayName: "Admin", Role: sqlcgen.UserRoleAdmin})
+	if err != nil {
+		t.Fatalf("create admin: %v", err)
+	}
+	const held = 102
+	oldest := time.Now().UTC().Truncate(time.Second).Add(-time.Duration(held) * time.Minute)
+	var oldestRun pgtype.UUID
+	for i := 0; i < held; i++ {
+		_, run := heldAdvanceOn(ctx, t, pool, admin.ID, fmt.Sprintf("build %d", i), fmt.Sprintf("workflow %d", i), oldest.Add(time.Duration(i)*time.Minute))
+		if i == 0 {
+			oldestRun = run
+		}
+	}
+
+	result, err := decisioninbox.Build(ctx, freezeInboxDeps(pool, &fakeDecisionInboxSourceControl{}, []byte("01234567890123456789012345678901")), admin.ID, authz.RoleAdmin, time.Now())
+	if err != nil {
+		t.Fatalf("Build(): %v", err)
+	}
+	if got := len(result.HeldWorkflowAdvances); got != 100 {
+		t.Fatalf("held advances listed = %d, want the bound, 100", got)
+	}
+	if result.HeldWorkflowAdvancesTotal != held {
+		t.Errorf("held advance total = %d, want %d: the list was cut, and must say how many are held", result.HeldWorkflowAdvancesTotal, held)
+	}
+	if result.HeldWorkflowAdvances[0].WorkflowRunID != oldestRun.String() {
+		t.Errorf("first listed = %s, want the oldest hold %s", result.HeldWorkflowAdvances[0].WorkflowRunID, oldestRun.String())
 	}
 }

@@ -2624,6 +2624,10 @@ export interface ListDecisionInboxResponse {
    */
   heldWorkflowAdvances: DecisionInboxHeldWorkflowAdvance[];
   /**
+   * How many held workflow advances the caller may see in all: more than heldWorkflowAdvances holds when the 100 bound cut the list, which then shows the oldest. 0 when none is held, or when the read failed.
+   */
+  heldWorkflowAdvancesTotal: number;
+  /**
    * When the PR-derived rows (ready_to_merge/needs_review) were actually fetched from GitHub (§16.2: 'the response carries its as-of timestamp... never presented as live truth') -- null iff the caller has no linked GitHub identity, so no SCM read was attempted AT ALL. Distinct from scmFetchFailed below: scmAsOf==null alone used to be the ONLY signal here, which meant a GitHub outage or a revoked token (a read that WAS attempted and failed) was indistinguishable from never having linked GitHub in the first place -- a contract-abiding client would render 'no GitHub linked' for what was actually a transient failure. goJSONSchema forces the literal *time.Time type -- see Plan.decidedAt's own doc comment for why a named pointer-type wrapper silently breaks encoding/json here.
    */
   scmAsOf: string | null;
@@ -2646,7 +2650,7 @@ export interface ListDecisionInboxResponse {
   decisionLatencyComputed: boolean;
 }
 /**
- * GET /api/autonomy response body, the body POST /api/autonomy/freeze and POST /api/autonomy/unfreeze return on success, and ListDecisionInboxResponse.autonomyFreeze (technical plan §40.2): whether autonomy is frozen platform-wide. While frozen, no automatic action starts -- no auto-merge, no sentinel-fix merge, no sentinel auto-fix, no description rewrite, no automatic re-review, no automation run and no workflow advance -- and each waits, consuming nothing, until an administrator lifts the freeze; a person's own commands are never held, and a turn already running finishes. Readable by every signed-in role (authz.ActionViewSessions); freezing and unfreezing are admin only (authz.ActionManageAutonomyFreeze, §13.3). Every field is present; the four describing the freeze are null when autonomy is not frozen.
+ * GET /api/autonomy response body, the body POST /api/autonomy/freeze and POST /api/autonomy/unfreeze return on success, and ListDecisionInboxResponse.autonomyFreeze (technical plan §40.2): whether autonomy is frozen platform-wide. While frozen, no automatic action starts -- no auto-merge, no sentinel-fix merge, no sentinel auto-fix, no description rewrite, no automatic re-review, no automation run and no workflow advance -- and each starts again once an administrator lifts the freeze, but for §40.2's bounds: a scheduled automation run held past its ten-minute catch-up window waits for its next occurrence, and a sentinel fix held from merging is not merged automatically; a person's own commands are never held, and a turn already running finishes. Readable by every signed-in role (authz.ActionViewSessions); freezing and unfreezing are admin only (authz.ActionManageAutonomyFreeze, §13.3). Every field is present; the four describing the freeze are null when autonomy is not frozen.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "AutonomyFreeze".
@@ -2661,11 +2665,11 @@ export interface AutonomyFreeze {
    */
   frozenAt: string | null;
   /**
-   * The administrator who set it. Null when not frozen, or once that user no longer exists.
+   * The administrator who set it. Null when not frozen, or when who set it is not on record: that user no longer exists, or the freeze was written by hand, with no user, as an earlier release's runbook did.
    */
   frozenByUserId: string | null;
   /**
-   * That administrator's display name. Null when not frozen, or once that user no longer exists.
+   * That administrator's display name. Null whenever frozenByUserId is.
    */
   frozenByDisplayName: string | null;
   /**

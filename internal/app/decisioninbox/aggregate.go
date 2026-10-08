@@ -288,8 +288,11 @@ type Result struct {
 	AutonomyFreezeUnread bool
 	// HeldWorkflowAdvances are the workflow runs whose automatic advance the
 	// freeze holds (§40.2, §25.9), on sessions the actor may decide
-	// workflow steps on, oldest first -- see buildHeldWorkflowAdvances.
-	HeldWorkflowAdvances []HeldWorkflowAdvance
+	// workflow steps on, oldest first, at most maxHeldWorkflowAdvances --
+	// see buildHeldWorkflowAdvances. HeldWorkflowAdvancesTotal is how many
+	// there are: more than the list holds when the bound cut it.
+	HeldWorkflowAdvances      []HeldWorkflowAdvance
+	HeldWorkflowAdvancesTotal int
 }
 
 // Build assembles, ranks, and returns the full decision inbox for
@@ -348,6 +351,7 @@ func Build(ctx context.Context, deps Deps, actorUserID pgtype.UUID, actorRole au
 	}
 
 	markHeldByFreeze(ctx, deps, items, freeze.AutonomyFrozen)
+	heldAdvances, heldAdvancesTotal := buildHeldWorkflowAdvances(ctx, deps, actorUserID, actorRole, logger)
 
 	items = rank(items)
 
@@ -366,7 +370,8 @@ func Build(ctx context.Context, deps Deps, actorUserID pgtype.UUID, actorRole au
 		DecisionLatencyComputed:   computed,
 		AutonomyFreeze:            freeze,
 		AutonomyFreezeUnread:      freezeUnread,
-		HeldWorkflowAdvances:      buildHeldWorkflowAdvances(ctx, deps, actorUserID, actorRole, logger),
+		HeldWorkflowAdvances:      heldAdvances,
+		HeldWorkflowAdvancesTotal: heldAdvancesTotal,
 	}, nil
 }
 

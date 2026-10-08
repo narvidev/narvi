@@ -51,26 +51,25 @@ func TestAutonomyFreezeDTO(t *testing.T) {
 	}
 }
 
+// TestUnfreezeAuditDetail: the autonomy.unfrozen detail names the freeze
+// lifted and carries the unfreeze statement's own frozen_seconds, measured
+// on the database's clock -- never a duration of its own.
 func TestUnfreezeAuditDetail(t *testing.T) {
 	frozenAt := time.Date(2026, 10, 7, 9, 0, 0, 0, time.UTC)
 	by := pgtype.UUID{Bytes: [16]byte{9}, Valid: true}
 	reason := "a bad deploy"
 	for _, tc := range []struct {
-		name        string
-		lifted      sqlcgen.UnfreezeAutonomyRow
-		now         time.Time
-		wantSeconds int64
-		wantBy      any
+		name   string
+		lifted sqlcgen.UnfreezeAutonomyRow
+		wantBy any
 	}{
-		{"held ninety minutes", sqlcgen.UnfreezeAutonomyRow{FrozenAt: pgtype.Timestamptz{Time: frozenAt, Valid: true}, FrozenBy: by, Reason: &reason},
-			frozenAt.Add(90*time.Minute + 400*time.Millisecond), 5400, by.String()},
-		{"a clock behind the freeze never reads negative", sqlcgen.UnfreezeAutonomyRow{FrozenAt: pgtype.Timestamptz{Time: frozenAt, Valid: true}, Reason: &reason},
-			frozenAt.Add(-time.Minute), 0, nil},
+		{"held ninety minutes", sqlcgen.UnfreezeAutonomyRow{FrozenAt: pgtype.Timestamptz{Time: frozenAt, Valid: true}, FrozenBy: by, Reason: &reason, FrozenSeconds: 5400}, by.String()},
+		{"set by a user not on record", sqlcgen.UnfreezeAutonomyRow{FrozenAt: pgtype.Timestamptz{Time: frozenAt, Valid: true}, Reason: &reason, FrozenSeconds: 12}, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			d := unfreezeAuditDetail(tc.lifted, tc.now)
-			if d["frozen_seconds"] != tc.wantSeconds || d["frozen_by"] != tc.wantBy || d["reason"] != tc.lifted.Reason || d["frozen_at"] != tc.lifted.FrozenAt.Time {
-				t.Errorf("unfreezeAuditDetail = %v, want frozen_seconds %d, frozen_by %v, the reason and frozen_at", d, tc.wantSeconds, tc.wantBy)
+			d := unfreezeAuditDetail(tc.lifted)
+			if d["frozen_seconds"] != tc.lifted.FrozenSeconds || d["frozen_by"] != tc.wantBy || d["reason"] != tc.lifted.Reason || d["frozen_at"] != tc.lifted.FrozenAt.Time {
+				t.Errorf("unfreezeAuditDetail = %v, want frozen_seconds %d, frozen_by %v, the reason and frozen_at", d, tc.lifted.FrozenSeconds, tc.wantBy)
 			}
 		})
 	}
@@ -92,6 +91,7 @@ func TestDecisionInboxResultToDTO_FreezeFields(t *testing.T) {
 		HeldWorkflowAdvances: []decisioninbox.HeldWorkflowAdvance{{
 			WorkflowRunID: "run-1", SessionID: "session-1", SessionTitle: &title, WorkflowName: "build then test", HeldAt: heldAt,
 		}},
+		HeldWorkflowAdvancesTotal: 250,
 	}
 	dto := decisionInboxResultToDTO(result)
 	if !dto.AutonomyFreeze.Frozen || dto.AutonomyFreeze.Reason == nil || *dto.AutonomyFreeze.Reason != reason || dto.AutonomyFreezeUnread {
@@ -104,12 +104,15 @@ func TestDecisionInboxResultToDTO_FreezeFields(t *testing.T) {
 		dto.HeldWorkflowAdvances[0].SessionTitle == nil || *dto.HeldWorkflowAdvances[0].SessionTitle != title || !dto.HeldWorkflowAdvances[0].HeldAt.Equal(heldAt) {
 		t.Errorf("held advances = %+v, want the one run", dto.HeldWorkflowAdvances)
 	}
+	if dto.HeldWorkflowAdvancesTotal != 250 {
+		t.Errorf("heldWorkflowAdvancesTotal = %d, want 250: a list the bound cut says how many are held", dto.HeldWorkflowAdvancesTotal)
+	}
 
 	empty, err := json.Marshal(decisionInboxResultToDTO(decisioninbox.Result{AutonomyFreezeUnread: true}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{`"heldWorkflowAdvances":[]`, `"autonomyFreezeUnread":true`, `"autonomyFreeze":{"frozen":false,`} {
+	for _, want := range []string{`"heldWorkflowAdvances":[]`, `"heldWorkflowAdvancesTotal":0`, `"autonomyFreezeUnread":true`, `"autonomyFreeze":{"frozen":false,`} {
 		if !strings.Contains(string(empty), want) {
 			t.Errorf("an empty inbox's body %s lacks %s", empty, want)
 		}

@@ -120,9 +120,10 @@ func decisionInboxResultToDTO(result decisioninbox.Result) restdtos.ListDecision
 		DecisionLatencyComputed:   result.DecisionLatencyComputed,
 		// The freeze's banner (§40.2) says what GET /api/autonomy says, in
 		// the same shape.
-		AutonomyFreeze:       autonomyFreezeDTO(result.AutonomyFreeze),
-		AutonomyFreezeUnread: result.AutonomyFreezeUnread,
-		HeldWorkflowAdvances: held,
+		AutonomyFreeze:            autonomyFreezeDTO(result.AutonomyFreeze),
+		AutonomyFreezeUnread:      result.AutonomyFreezeUnread,
+		HeldWorkflowAdvances:      held,
+		HeldWorkflowAdvancesTotal: result.HeldWorkflowAdvancesTotal,
 	}
 	if result.DecisionLatencyComputed {
 		seconds := result.DecisionLatencyMedian.Seconds()

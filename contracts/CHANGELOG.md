@@ -20,9 +20,13 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   of the three autonomy routes below and of
   `ListDecisionInboxResponse.autonomyFreeze`: whether autonomy is frozen
   platform-wide, and since when, by whom and why (technical plan §40.2).
-  While frozen no automatic action starts, and each waits, consuming
-  nothing, until the freeze is lifted. A new `$def` grades MINOR
-  (row 32).
+  While frozen no automatic action starts; once the freeze is lifted each
+  held action starts again, but for the bounds §40.2 names (a scheduled
+  automation run held past its ten-minute catch-up window waits for its
+  next occurrence, and a sentinel fix's automatic merge is not retried).
+  Who set it is null when that is not on record: the user no longer
+  exists, or the freeze was written by hand, as an earlier release's
+  runbook did. A new `$def` grades MINOR (row 32).
 - Added: `FreezeAutonomyRequest` (`reason`, required, `minLength` 1), the
   freeze route's request body. The reason is trimmed, must be 1 to 500
   characters and must hold no NUL character; as for
@@ -41,8 +45,10 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   failed read as "not frozen" -- and required
   `ListDecisionInboxResponse.heldWorkflowAdvances`, an array of
   `DecisionInboxHeldWorkflowAdvance`: the held advances on sessions the
-  caller may decide workflow steps on, oldest first, at most 100. Every
-  role reads the same freeze. Platform-to-client only: no `*Request` root
+  caller may decide workflow steps on, oldest first, at most 100 -- and
+  required integer `ListDecisionInboxResponse.heldWorkflowAdvancesTotal`,
+  how many there are, so a list the bound cut says so. Every role reads
+  the same freeze. Platform-to-client only: no `*Request` root
   reaches this def. Each required property added grades MINOR on the
   platform-to-client side (row 3).
 - Added: required boolean `DecisionInboxItem.heldByFreeze`: true on a

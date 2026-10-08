@@ -9,19 +9,26 @@
 package httpapi_test
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
+	"github.com/narvidev/narvi/internal/adapters/inbound/auth"
+	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // autonomyAuditRows returns the detail of every audit_log row with action
@@ -326,6 +333,88 @@ func TestUnfreezeAutonomy_AuditNamesWhatWasLifted(t *testing.T) {
 	seconds, ok := d["frozen_seconds"].(float64)
 	if !ok || seconds < 90*60-60 || seconds > 90*60+60 {
 		t.Errorf("frozen_seconds = %v, want about 5400 (90 minutes)", d["frozen_seconds"])
+	}
+}
+
+// TestUnfreezeAutonomy_FrozenSecondsOnTheDatabaseClock: how long a freeze
+// held is measured on the database's clock at both ends, as the audit
+// rows' own created_at is, never on a replica's. Here the database's clock
+// runs an hour behind this process's -- now() resolves, through the
+// routes' pool's search_path, to a function an hour behind pg_catalog's --
+// so a duration taken against this process's clock would read about 3600
+// seconds for a freeze held a moment.
+func TestUnfreezeAutonomy_FrozenSecondsOnTheDatabaseClock(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleAdmin)
+	_, connStr := httpapi.IntegrationTestPoolAndConnStr(t)
+
+	for _, stmt := range []string{
+		`CREATE SCHEMA autonomy_test_skew`,
+		`CREATE FUNCTION autonomy_test_skew.now() RETURNS timestamptz LANGUAGE sql STABLE AS $$ SELECT pg_catalog.now() - interval '1 hour' $$`,
+	} {
+		if _, err := rig.pool.Exec(ctx, stmt); err != nil {
+			t.Fatalf("skew the database clock: %v", err)
+		}
+	}
+	t.Cleanup(func() { _, _ = rig.pool.Exec(context.Background(), `DROP SCHEMA IF EXISTS autonomy_test_skew CASCADE`) })
+	cfg, err := pgxpool.ParseConfig(connStr)
+	if err != nil {
+		t.Fatalf("parse pool config: %v", err)
+	}
+	cfg.MaxConns = 4
+	cfg.ConnConfig.RuntimeParams["search_path"] = "autonomy_test_skew, pg_catalog, public"
+	skewed, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("open the skewed pool: %v", err)
+	}
+	t.Cleanup(skewed.Close)
+
+	settings := narvipg.NewPlatformSettingsStore(skewed)
+	router := chi.NewRouter()
+	router.Route("/api/autonomy", func(r chi.Router) {
+		r.Use(auth.Middleware(narvipg.NewUserSessionStore(skewed), narvipg.NewUserStore(skewed)))
+		r.Post("/freeze", httpapi.PostFreezeAutonomy(skewed, settings, narvipg.NewAuditLogStore(skewed)))
+		r.Post("/unfreeze", httpapi.PostUnfreezeAutonomy(skewed, settings, narvipg.NewAuditLogStore(skewed)))
+	})
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+	post := func(path, body string) *http.Response {
+		t.Helper()
+		req, err := http.NewRequest(http.MethodPost, server.URL+path, bytes.NewReader([]byte(body)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: token})
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("POST %s: %v", path, err)
+		}
+		return resp
+	}
+
+	resp := post("/api/autonomy/freeze", `{"reason":"an incident on a skewed clock"}`)
+	var frozen restdtos.AutonomyFreeze
+	if err := json.NewDecoder(resp.Body).Decode(&frozen); err != nil {
+		t.Fatalf("decode the freeze: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || frozen.FrozenAt == nil || time.Since(*frozen.FrozenAt) < 50*time.Minute {
+		t.Fatalf("freeze: status %d, frozen at %v; want 200, stamped about an hour behind this process's clock", resp.StatusCode, frozen.FrozenAt)
+	}
+	resp = post("/api/autonomy/unfreeze", "")
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("unfreeze: status %d, want 200", resp.StatusCode)
+	}
+
+	details, _ := autonomyAuditRows(ctx, t, rig, "autonomy.unfrozen")
+	if len(details) != 1 {
+		t.Fatalf("autonomy.unfrozen rows = %v, want one", details)
+	}
+	if seconds, ok := details[0]["frozen_seconds"].(float64); !ok || seconds < 0 || seconds > 60 {
+		t.Errorf("frozen_seconds = %v, want the moment the freeze held on the database's clock, not an hour measured against this process's", details[0]["frozen_seconds"])
 	}
 }
 

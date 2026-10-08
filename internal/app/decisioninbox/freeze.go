@@ -96,7 +96,8 @@ func markHeldByFreeze(ctx context.Context, deps Deps, items []Item, frozen bool)
 // the freeze holds, on the sessions whose workflow steps the actor may
 // decide (authz.ActionDecideWorkflowStep): every session for an
 // administrator or maintainer, those they created or joined for a member,
-// none for a viewer. Oldest first, at most maxHeldWorkflowAdvances. The
+// none for a viewer. Oldest first, at most maxHeldWorkflowAdvances; total
+// is how many there are, so a list cut at the bound says so. The
 // holds are read whatever this load read of the freeze: a hold outlives the
 // freeze until the releaser applies it, within AutonomyFreezeRecheckInterval
 // of the unfreeze, and is listed until then. Best-effort, as the plan and
@@ -108,23 +109,24 @@ func markHeldByFreeze(ctx context.Context, deps Deps, items []Item, frozen bool)
 // bound by others'; and authz.Authorize decides each row, as it does each
 // plan row, so the matrix stays the one authority. Either alone keeps a
 // member to their own sessions.
-func buildHeldWorkflowAdvances(ctx context.Context, deps Deps, actorUserID pgtype.UUID, actorRole authz.Role, logger *slog.Logger) []HeldWorkflowAdvance {
+func buildHeldWorkflowAdvances(ctx context.Context, deps Deps, actorUserID pgtype.UUID, actorRole authz.Role, logger *slog.Logger) (held []HeldWorkflowAdvance, total int) {
 	if deps.Workflows == nil {
-		return nil
+		return nil, 0
 	}
 	actor := authz.Actor{UserID: actorUserID.String(), Role: actorRole}
 	if authz.Authorize(actor, authz.ActionDecideWorkflowStep, authz.Resource{OwnedOrJoined: true}) != nil {
-		return nil
+		return nil, 0
 	}
 	everySession := authz.Authorize(actor, authz.ActionDecideWorkflowStep, authz.Resource{}) == nil
 
 	rows, err := deps.Workflows.ListAdvanceHoldsForInbox(ctx, actorUserID, everySession, maxHeldWorkflowAdvances)
 	if err != nil {
 		logger.Error("decisioninbox: list held workflow advances failed", "error", err)
-		return nil
+		return nil, 0
 	}
-	held := make([]HeldWorkflowAdvance, 0, len(rows))
+	held = make([]HeldWorkflowAdvance, 0, len(rows))
 	for _, row := range rows {
+		total = int(row.Total)
 		if authz.Authorize(actor, authz.ActionDecideWorkflowStep, authz.Resource{OwnedOrJoined: row.OwnedOrJoined}) != nil {
 			continue
 		}
@@ -136,5 +138,5 @@ func buildHeldWorkflowAdvances(ctx context.Context, deps Deps, actorUserID pgtyp
 			HeldAt:        row.HeldAt.Time,
 		})
 	}
-	return held
+	return held, total
 }
