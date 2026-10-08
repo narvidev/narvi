@@ -93,6 +93,7 @@ var stepRefPins = []stepRefPin{
 	{"docs/runbooks/README.md", "73", "cloud identity: OIDC federation + kubeconfig"},
 	{"docs/runbooks/README.md", "74", "sandbox substrate: docker, egress policy, toolchain"},
 	{"docs/runbooks/README.md", "76", "cohort rollout"},
+	{"docs/runbooks/autonomy-freeze.md", "232", "a held automation invocation can be fanned out, never discarded"},
 	{"docs/runbooks/sandbox-capability-refusals.md", "74", "sandbox substrate: docker, egress policy, toolchain"},
 	{"docs/runbooks/signing-key-rotation.md", "73", "cloud identity: OIDC federation + kubeconfig"},
 	{"docs/runbooks/signing-key-rotation.md", "74", "sandbox substrate: docker, egress policy, toolchain"},

@@ -122,6 +122,7 @@ var AutonomyFreezeHumanPaths = []AutonomyFreezeHumanPath{
 	{File: "internal/adapters/inbound/httpapi/decideworkflowstep.go", Reason: "a workflow step decision is a person's decision"},
 	{File: "internal/app/sessionactor/owedreviewrequest.go", Reason: "the owed request's re-run is a person's request, inserted on the person's path"},
 	{File: "internal/adapters/inbound/mcp/tools.go", Reason: "an MCP tool call is a person's command through their client"},
+	{File: "internal/adapters/inbound/httpapi/autonomyfreeze.go", Reason: "freezing and lifting the freeze are an administrator's commands; gated by the freeze, an unreadable freeze would skip the very unfreeze meant to end it"},
 }
 
 // AutonomyFreezeViolation is one place the source breaks §40.2's rule that

@@ -22,6 +22,7 @@ import {
 function baseItem(overrides: Partial<DecisionInboxItem> = {}): DecisionInboxItem {
   return {
     kind: 'ready_to_merge',
+    heldByFreeze: false,
     title: 'A normal title',
     enteredQueueAt: '2026-08-20T00:00:00Z',
     ageSeconds: 3600,

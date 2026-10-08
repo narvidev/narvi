@@ -166,7 +166,7 @@ export interface DecisionInboxChip {
  * "not green" when genuinely unknown.
  */
 export function prChipData(
-  item: Pick<DecisionInboxItem, 'riskLabel' | 'findings' | 'unverifiedAdditions' | 'ciGreen' | 'hasChangesRequested' | 'acceptanceId'>,
+  item: Pick<DecisionInboxItem, 'riskLabel' | 'findings' | 'unverifiedAdditions' | 'ciGreen' | 'hasChangesRequested' | 'acceptanceId'> & Partial<Pick<DecisionInboxItem, 'heldByFreeze'>>,
 ): DecisionInboxChip[] {
   const chips: DecisionInboxChip[] = []
 
@@ -185,10 +185,20 @@ export function prChipData(
     chips.push({ tone: 'crit', text: 'changes requested' })
   }
 
+  // heldByFreeze (technical plan §40.2): auto-merge is armed on this
+  // repository and the freeze holds the merge it would make. Only the
+  // automatic merge waits -- the row keeps its Merge button.
+  if (item.heldByFreeze === true) {
+    chips.push({ tone: 'warn', text: HELD_BY_FREEZE_CHIP })
+  }
+
   chips.push(...acceptedOverrideChipData(item))
 
   return chips
 }
+
+/** HELD_BY_FREEZE_CHIP is the held chip's text (prChipData): the automatic merge this row would get is held by the autonomy freeze. */
+export const HELD_BY_FREEZE_CHIP = 'held · autonomy frozen'
 
 /**
  * findingCountsText renders a PR row's open findings and, apart from them,

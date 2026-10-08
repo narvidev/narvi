@@ -1026,6 +1026,85 @@ func (j *Automation) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// GET /api/autonomy response body, the body POST /api/autonomy/freeze and POST
+// /api/autonomy/unfreeze return on success, and
+// ListDecisionInboxResponse.autonomyFreeze (technical plan §40.2): whether
+// autonomy is frozen platform-wide. While frozen, no automatic action starts -- no
+// auto-merge, no sentinel-fix merge, no sentinel auto-fix, no description rewrite,
+// no automatic re-review, no automation run and no workflow advance -- and each
+// starts again once an administrator lifts the freeze, but for §40.2's bounds: a
+// scheduled automation run held past its ten-minute catch-up window waits for its
+// next occurrence, and a sentinel fix held from merging is not merged
+// automatically; a person's own commands are never held, and a turn already
+// running finishes. Readable by every signed-in role (authz.ActionViewSessions);
+// freezing and unfreezing are admin only (authz.ActionManageAutonomyFreeze,
+// §13.3). Every field is present; the four describing the freeze are null when
+// autonomy is not frozen.
+type AutonomyFreeze struct {
+	// True while a freeze is in force: no automatic action starts on any replica.
+	Frozen bool `json:"frozen" yaml:"frozen" mapstructure:"frozen"`
+
+	// When the freeze in force was set. Null when not frozen.
+	FrozenAt AutonomyFreezeFrozenAt `json:"frozenAt" yaml:"frozenAt" mapstructure:"frozenAt"`
+
+	// That administrator's display name. Null whenever frozenByUserId is.
+	FrozenByDisplayName AutonomyFreezeFrozenByDisplayName `json:"frozenByDisplayName" yaml:"frozenByDisplayName" mapstructure:"frozenByDisplayName"`
+
+	// The administrator who set it. Null when not frozen, or when who set it is not
+	// on record: that user no longer exists, or the freeze was written by hand, with
+	// no user, as an earlier release's runbook did.
+	FrozenByUserId AutonomyFreezeFrozenByUserId `json:"frozenByUserId" yaml:"frozenByUserId" mapstructure:"frozenByUserId"`
+
+	// Why autonomy was frozen, as the administrator wrote it (1 to 500 characters).
+	// Null when not frozen.
+	Reason AutonomyFreezeReason `json:"reason" yaml:"reason" mapstructure:"reason"`
+}
+
+// When the freeze in force was set. Null when not frozen.
+type AutonomyFreezeFrozenAt = *time.Time
+
+// That administrator's display name. Null whenever frozenByUserId is.
+type AutonomyFreezeFrozenByDisplayName *string
+
+// The administrator who set it. Null when not frozen, or when who set it is not on
+// record: that user no longer exists, or the freeze was written by hand, with no
+// user, as an earlier release's runbook did.
+type AutonomyFreezeFrozenByUserId *string
+
+// Why autonomy was frozen, as the administrator wrote it (1 to 500 characters).
+// Null when not frozen.
+type AutonomyFreezeReason *string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *AutonomyFreeze) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["frozen"]; raw != nil && !ok {
+		return fmt.Errorf("field frozen in AutonomyFreeze: required")
+	}
+	if _, ok := raw["frozenAt"]; raw != nil && !ok {
+		return fmt.Errorf("field frozenAt in AutonomyFreeze: required")
+	}
+	if _, ok := raw["frozenByDisplayName"]; raw != nil && !ok {
+		return fmt.Errorf("field frozenByDisplayName in AutonomyFreeze: required")
+	}
+	if _, ok := raw["frozenByUserId"]; raw != nil && !ok {
+		return fmt.Errorf("field frozenByUserId in AutonomyFreeze: required")
+	}
+	if _, ok := raw["reason"]; raw != nil && !ok {
+		return fmt.Errorf("field reason in AutonomyFreeze: required")
+	}
+	type Plain AutonomyFreeze
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = AutonomyFreeze(plain)
+	return nil
+}
+
 // GET /api/capabilities's own response body (technical plan §34,
 // docs/design/boundaries-design.md section 4) -- a DERIVED read model, mounted
 // behind auth.Middleware and readable by every role including viewer. Drives the
@@ -2919,6 +2998,62 @@ func (j *CreateWorkflowDefinitionRequest) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
+// One workflow run whose automatic advance to its next step the autonomy freeze
+// holds (technical plan §40.2, §25.9;
+// ListDecisionInboxResponse.heldWorkflowAdvances): the step's attempt finished and
+// its outcome is stored, the run is still running with no live attempt, and its
+// next attempt starts once the freeze lifts -- exactly once. A person's stop of
+// the session drops the hold and cancels the run instead.
+type DecisionInboxHeldWorkflowAdvance struct {
+	// When the advance was held: the end of the step's turn.
+	HeldAt time.Time `json:"heldAt" yaml:"heldAt" mapstructure:"heldAt"`
+
+	// The run's session, where the next attempt runs once the freeze lifts.
+	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+
+	// The session's title. Null when the session has none.
+	SessionTitle DecisionInboxHeldWorkflowAdvanceSessionTitle `json:"sessionTitle" yaml:"sessionTitle" mapstructure:"sessionTitle"`
+
+	// The name of the workflow definition the run follows.
+	WorkflowName string `json:"workflowName" yaml:"workflowName" mapstructure:"workflowName"`
+
+	// WorkflowRunId corresponds to the JSON schema field "workflowRunId".
+	WorkflowRunId string `json:"workflowRunId" yaml:"workflowRunId" mapstructure:"workflowRunId"`
+}
+
+// The session's title. Null when the session has none.
+type DecisionInboxHeldWorkflowAdvanceSessionTitle *string
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *DecisionInboxHeldWorkflowAdvance) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["heldAt"]; raw != nil && !ok {
+		return fmt.Errorf("field heldAt in DecisionInboxHeldWorkflowAdvance: required")
+	}
+	if _, ok := raw["sessionId"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionId in DecisionInboxHeldWorkflowAdvance: required")
+	}
+	if _, ok := raw["sessionTitle"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionTitle in DecisionInboxHeldWorkflowAdvance: required")
+	}
+	if _, ok := raw["workflowName"]; raw != nil && !ok {
+		return fmt.Errorf("field workflowName in DecisionInboxHeldWorkflowAdvance: required")
+	}
+	if _, ok := raw["workflowRunId"]; raw != nil && !ok {
+		return fmt.Errorf("field workflowRunId in DecisionInboxHeldWorkflowAdvance: required")
+	}
+	type Plain DecisionInboxHeldWorkflowAdvance
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = DecisionInboxHeldWorkflowAdvance(plain)
+	return nil
+}
+
 // §16 ('decision inbox: read model + API', §16): one decision-inbox row. Only the
 // fields relevant to `kind` are populated -- every OTHER field is present but
 // null, matching this schema's own established nullability convention (this file's
@@ -3082,6 +3217,15 @@ type DecisionInboxItem struct {
 	// was taken -- what a Merge click must still match server-side at click time
 	// (§16.2, §5.2).
 	HeadSha DecisionInboxItemHeadSha `json:"headSha" yaml:"headSha" mapstructure:"headSha"`
+
+	// Technical plan §40.2: true on a ready_to_merge row whose repository has
+	// auto-merge armed while autonomy is frozen
+	// (ListDecisionInboxResponse.autonomyFreeze) -- the auto-merge worker would merge
+	// it, and the freeze holds that merge. The row stays listed and a person's own
+	// Merge click still works: the freeze never holds a person. False on every other
+	// row, and on every row when autonomy is not frozen or the freeze could not be
+	// read.
+	HeldByFreeze bool `json:"heldByFreeze" yaml:"heldByFreeze" mapstructure:"heldByFreeze"`
 
 	// HtmlUrl corresponds to the JSON schema field "htmlUrl".
 	HtmlUrl DecisionInboxItemHtmlUrl `json:"htmlUrl" yaml:"htmlUrl" mapstructure:"htmlUrl"`
@@ -3634,6 +3778,9 @@ func (j *DecisionInboxItem) UnmarshalJSON(value []byte) error {
 	if _, ok := raw["headSha"]; raw != nil && !ok {
 		return fmt.Errorf("field headSha in DecisionInboxItem: required")
 	}
+	if _, ok := raw["heldByFreeze"]; raw != nil && !ok {
+		return fmt.Errorf("field heldByFreeze in DecisionInboxItem: required")
+	}
 	if _, ok := raw["htmlUrl"]; raw != nil && !ok {
 		return fmt.Errorf("field htmlUrl in DecisionInboxItem: required")
 	}
@@ -4128,6 +4275,40 @@ func (j *FalsePositivePattern) UnmarshalJSON(value []byte) error {
 		return err
 	}
 	*j = FalsePositivePattern(plain)
+	return nil
+}
+
+// POST /api/autonomy/freeze's request body (technical plan §40.2). reason is
+// trimmed and must be 1 to 500 characters: blank is refused 400 "reason is
+// required", longer is refused 400 "reason must be at most 500 characters", and
+// one holding a NUL character is refused 400 "reason must not contain a NUL byte".
+// Autonomy already frozen is refused 409 "autonomy is already frozen" and keeps
+// the first freeze's who, when and why.
+type FreezeAutonomyRequest struct {
+	// Why autonomy is frozen: 1 to 500 characters after trimming, kept with the
+	// freeze, shown on every role's decision inbox while it holds, and written to the
+	// audit log.
+	Reason string `json:"reason" yaml:"reason" mapstructure:"reason"`
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *FreezeAutonomyRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["reason"]; raw != nil && !ok {
+		return fmt.Errorf("field reason in FreezeAutonomyRequest: required")
+	}
+	type Plain FreezeAutonomyRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	if utf8.RuneCountInString(string(plain.Reason)) < 1 {
+		return fmt.Errorf("field %s length: must be >= %d", "reason", 1)
+	}
+	*j = FreezeAutonomyRequest(plain)
 	return nil
 }
 
@@ -4690,6 +4871,20 @@ func (j *ListCloudIdentityBindingsResponse) UnmarshalJSON(value []byte) error {
 // GET /api/decision-inbox's own response body (§16.2/§16.3 -- Phase 5 half: read
 // model + endpoints; the UI is Phase 7).
 type ListDecisionInboxResponse struct {
+	// AutonomyFreeze corresponds to the JSON schema field "autonomyFreeze".
+	AutonomyFreeze AutonomyFreeze `json:"autonomyFreeze" yaml:"autonomyFreeze" mapstructure:"autonomyFreeze"`
+
+	// autonomyFreeze is the autonomy freeze as this load read it (technical plan
+	// §40.2), once and never cached, the same for every role: while frozen, a client
+	// shows one banner naming when, by whom and why, and that nothing automatic
+	// starts while a person's own actions still work. This field is true when the
+	// freeze could not be read for this load: autonomyFreeze then reads not frozen
+	// only because nothing could be read, and a client must say the freeze state is
+	// unknown, never render it as 'not frozen'. Every automatic action reads the
+	// freeze itself and treats a failed read as frozen, so an unread state here never
+	// means automatic actions run unchecked.
+	AutonomyFreezeUnread bool `json:"autonomyFreezeUnread" yaml:"autonomyFreezeUnread" mapstructure:"autonomyFreezeUnread"`
+
 	// DecisionLatencyComputed corresponds to the JSON schema field
 	// "decisionLatencyComputed".
 	DecisionLatencyComputed bool `json:"decisionLatencyComputed" yaml:"decisionLatencyComputed" mapstructure:"decisionLatencyComputed"`
@@ -4703,6 +4898,20 @@ type ListDecisionInboxResponse struct {
 	// How many already-decided items fed decisionLatencyMedianSeconds -- 0 whenever
 	// decisionLatencyComputed is false.
 	DecisionLatencySampleSize int `json:"decisionLatencySampleSize" yaml:"decisionLatencySampleSize" mapstructure:"decisionLatencySampleSize"`
+
+	// The workflow runs whose automatic advance the autonomy freeze holds (technical
+	// plan §40.2, §25.9), oldest first, at most 100: those on sessions the caller may
+	// decide workflow steps on (authz.ActionDecideWorkflowStep -- an administrator or
+	// maintainer sees every one, a member those on sessions they created or joined, a
+	// viewer none). Empty outside a freeze, and once the freeze lifts and each
+	// advance is applied. Best-effort: a read that fails lists none, logged
+	// server-side.
+	HeldWorkflowAdvances []DecisionInboxHeldWorkflowAdvance `json:"heldWorkflowAdvances" yaml:"heldWorkflowAdvances" mapstructure:"heldWorkflowAdvances"`
+
+	// How many held workflow advances the caller may see in all: more than
+	// heldWorkflowAdvances holds when the 100 bound cut the list, which then shows
+	// the oldest. 0 when none is held, or when the read failed.
+	HeldWorkflowAdvancesTotal int `json:"heldWorkflowAdvancesTotal" yaml:"heldWorkflowAdvancesTotal" mapstructure:"heldWorkflowAdvancesTotal"`
 
 	// Already ranked server-side (§16.1: decision cost then age) -- a client renders
 	// this order as-is, never re-sorts.
@@ -4766,6 +4975,12 @@ func (j *ListDecisionInboxResponse) UnmarshalJSON(value []byte) error {
 	if err := json.Unmarshal(value, &raw); err != nil {
 		return err
 	}
+	if _, ok := raw["autonomyFreeze"]; raw != nil && !ok {
+		return fmt.Errorf("field autonomyFreeze in ListDecisionInboxResponse: required")
+	}
+	if _, ok := raw["autonomyFreezeUnread"]; raw != nil && !ok {
+		return fmt.Errorf("field autonomyFreezeUnread in ListDecisionInboxResponse: required")
+	}
 	if _, ok := raw["decisionLatencyComputed"]; raw != nil && !ok {
 		return fmt.Errorf("field decisionLatencyComputed in ListDecisionInboxResponse: required")
 	}
@@ -4774,6 +4989,12 @@ func (j *ListDecisionInboxResponse) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["decisionLatencySampleSize"]; raw != nil && !ok {
 		return fmt.Errorf("field decisionLatencySampleSize in ListDecisionInboxResponse: required")
+	}
+	if _, ok := raw["heldWorkflowAdvances"]; raw != nil && !ok {
+		return fmt.Errorf("field heldWorkflowAdvances in ListDecisionInboxResponse: required")
+	}
+	if _, ok := raw["heldWorkflowAdvancesTotal"]; raw != nil && !ok {
+		return fmt.Errorf("field heldWorkflowAdvancesTotal in ListDecisionInboxResponse: required")
 	}
 	if _, ok := raw["items"]; raw != nil && !ok {
 		return fmt.Errorf("field items in ListDecisionInboxResponse: required")
@@ -16557,11 +16778,43 @@ type WorkflowStepRunOutcomeSummary *string
 
 type WorkflowStepRunStatus string
 
+type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
+
+type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict
+
 const WorkflowStepRunStatusAwaitingDecision WorkflowStepRunStatus = "awaiting_decision"
 const WorkflowStepRunStatusCancelled WorkflowStepRunStatus = "cancelled"
 const WorkflowStepRunStatusCompleted WorkflowStepRunStatus = "completed"
 const WorkflowStepRunStatusFailed WorkflowStepRunStatus = "failed"
 const WorkflowStepRunStatusRunning WorkflowStepRunStatus = "running"
+
+var enumValues_WorkflowStepRunStatus = []interface{}{
+	"awaiting_decision",
+	"running",
+	"completed",
+	"failed",
+	"cancelled",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_WorkflowStepRunStatus {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_WorkflowStepRunStatus, v)
+	}
+	*j = WorkflowStepRunStatus(v)
+	return nil
+}
 
 // The ordinary turn this attempt dispatched as (§25.6: 'every step is an ordinary
 // sequential turn'). Null while an awaiting_decision (hitlBefore-gated) attempt
@@ -16626,35 +16879,3 @@ func (j *WorkflowStepRun) UnmarshalJSON(value []byte) error {
 }
 
 type SessionOutcomeReviewVerdict_0 = SessionOutcomeVerdict
-
-var enumValues_WorkflowStepRunStatus = []interface{}{
-	"awaiting_decision",
-	"running",
-	"completed",
-	"failed",
-	"cancelled",
-}
-
-// UnmarshalJSON implements json.Unmarshaler.
-func (j *WorkflowStepRunStatus) UnmarshalJSON(value []byte) error {
-	var v string
-	if err := json.Unmarshal(value, &v); err != nil {
-		return err
-	}
-	var ok bool
-	for _, expected := range enumValues_WorkflowStepRunStatus {
-		if reflect.DeepEqual(v, expected) {
-			ok = true
-			break
-		}
-	}
-	if !ok {
-		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_WorkflowStepRunStatus, v)
-	}
-	*j = WorkflowStepRunStatus(v)
-	return nil
-}
-
-type ReviewReadoutLatestVerdict_0 = ReviewReadoutVerdict
-
-type SessionOutcomeReviewSupersededVerdict_0 = SessionOutcomeVerdict

@@ -45,10 +45,16 @@ RETURNING *;
 
 -- name: UnfreezeAutonomy :one
 -- Lifts the freeze in force and returns what was lifted -- its when, who
--- and why -- for the audit row. Only when autonomy is frozen: pgx.ErrNoRows
--- otherwise. The CTE reads the freeze FOR UPDATE, so of two unfreezes at
--- once the second waits for the first, then reads it no longer frozen and
--- matches no row.
+-- and why -- for the audit row, and how long it held, in whole seconds.
+-- Only when autonomy is frozen: pgx.ErrNoRows otherwise. The CTE reads the
+-- freeze FOR UPDATE, so of two unfreezes at once the second waits for the
+-- first, then reads it no longer frozen and matches no row.
+--
+-- frozen_seconds is measured on the database's clock, both ends: the
+-- freeze stamped autonomy_frozen_at with now(), and this statement
+-- subtracts it from its own now(), so a replica's clock never enters the
+-- audit row (GetSandboxBootingElapsed's rule). GREATEST guards only a
+-- database clock stepped back between the two.
 WITH lifted AS (
     SELECT autonomy_frozen_at, autonomy_frozen_by, autonomy_freeze_reason
     FROM platform_settings
@@ -65,4 +71,5 @@ FROM lifted
 WHERE p.id = 1 AND p.autonomy_frozen
 RETURNING lifted.autonomy_frozen_at AS frozen_at,
           lifted.autonomy_frozen_by AS frozen_by,
-          lifted.autonomy_freeze_reason AS reason;
+          lifted.autonomy_freeze_reason AS reason,
+          GREATEST(0, floor(EXTRACT(EPOCH FROM (now() - lifted.autonomy_frozen_at))))::bigint AS frozen_seconds;

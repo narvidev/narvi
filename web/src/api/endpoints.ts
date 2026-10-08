@@ -24,6 +24,7 @@ import type {
   ArtifactsResponse,
   AuditLogEntry,
   AuthCapabilitiesResponse,
+  AutonomyFreeze,
   CapabilitiesResponse,
   ChatGPTLinkStatus,
   CloudIdentityBinding,
@@ -42,6 +43,7 @@ import type {
   Environment,
   EventsResponse,
   FalsePositivePattern,
+  FreezeAutonomyRequest,
   LinkMemberIdentityRequest,
   ListAuditLogResponse,
   ListAutomationInvocationsResponse,
@@ -137,6 +139,23 @@ export function listDecisionInbox(signal?: AbortSignal): Promise<ListDecisionInb
  */
 export function mergePullRequest(body: MergePullRequestRequest, signal?: AbortSignal): Promise<MergePullRequestResponse> {
   return request<MergePullRequestResponse>('/api/decision-inbox/merge', { method: 'POST', body, signal })
+}
+
+// -- the autonomy freeze (technical plan §40.2). --
+
+/** getAutonomyFreeze calls GET /api/autonomy -- whether autonomy is frozen platform-wide, and since when, by whom and why. Readable by every signed-in role (the decision inbox shows every role the same banner). */
+export function getAutonomyFreeze(signal?: AbortSignal): Promise<AutonomyFreeze> {
+  return request<AutonomyFreeze>('/api/autonomy', { signal })
+}
+
+/** postFreezeAutonomy calls POST /api/autonomy/freeze -- no automatic action then starts anywhere until the freeze is lifted; a person's own commands are never held, and a turn already running finishes. Admin-only server-side (authz.ActionManageAutonomyFreeze). The reason is required, 1 to 500 characters after trimming (a 400 ApiError says which bound failed); a 409 ApiError means autonomy is already frozen, and the first freeze is kept. Returns the freeze in force. */
+export function postFreezeAutonomy(body: FreezeAutonomyRequest, signal?: AbortSignal): Promise<AutonomyFreeze> {
+  return request<AutonomyFreeze>('/api/autonomy/freeze', { method: 'POST', body, signal })
+}
+
+/** postUnfreezeAutonomy calls POST /api/autonomy/unfreeze -- lifts the freeze; held actions start within about a minute, except a scheduled automation run held past its ten-minute catch-up window, which waits for its next occurrence, and a sentinel fix held from merging, which stays open for a person (technical plan §40.2's bounds). Admin-only server-side; a 409 ApiError means autonomy is not frozen. Returns autonomy no longer frozen. */
+export function postUnfreezeAutonomy(signal?: AbortSignal): Promise<AutonomyFreeze> {
+  return request<AutonomyFreeze>('/api/autonomy/unfreeze', { method: 'POST', signal })
 }
 
 export function createSession(body: CreateSessionRequest, signal?: AbortSignal): Promise<Session> {

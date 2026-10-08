@@ -4466,7 +4466,8 @@
         "artifactSummary",
         "outboxId",
         "outboxKind",
-        "lastError"
+        "lastError",
+        "heldByFreeze"
       ],
       "properties": {
         "kind": {
@@ -4478,6 +4479,10 @@
             "needs_attention"
           ],
           "description": "Matches internal/domain/decisioninbox.Kind's own four values exactly (\u00a716.1). needs_attention is only ever present for an admin caller (\u00a716.1's own parenthetical) -- enforced server-side, never a client-side filter."
+        },
+        "heldByFreeze": {
+          "type": "boolean",
+          "description": "Technical plan \u00a740.2: true on a ready_to_merge row whose repository has auto-merge armed while autonomy is frozen (ListDecisionInboxResponse.autonomyFreeze) -- the auto-merge worker would merge it, and the freeze holds that merge. The row stays listed and a person's own Merge click still works: the freeze never holds a person. False on every other row, and on every row when autonomy is not frozen or the freeze could not be read."
         },
         "title": {
           "type": "string"
@@ -4790,7 +4795,11 @@
         "requiredChecksNotRead",
         "decisionLatencyMedianSeconds",
         "decisionLatencySampleSize",
-        "decisionLatencyComputed"
+        "decisionLatencyComputed",
+        "autonomyFreeze",
+        "autonomyFreezeUnread",
+        "heldWorkflowAdvances",
+        "heldWorkflowAdvancesTotal"
       ],
       "properties": {
         "items": {
@@ -4799,6 +4808,24 @@
           "items": {
             "$ref": "#/$defs/DecisionInboxItem"
           }
+        },
+        "autonomyFreeze": {
+          "$ref": "#/$defs/AutonomyFreeze"
+        },
+        "autonomyFreezeUnread": {
+          "type": "boolean",
+          "description": "autonomyFreeze is the autonomy freeze as this load read it (technical plan \u00a740.2), once and never cached, the same for every role: while frozen, a client shows one banner naming when, by whom and why, and that nothing automatic starts while a person's own actions still work. This field is true when the freeze could not be read for this load: autonomyFreeze then reads not frozen only because nothing could be read, and a client must say the freeze state is unknown, never render it as 'not frozen'. Every automatic action reads the freeze itself and treats a failed read as frozen, so an unread state here never means automatic actions run unchecked."
+        },
+        "heldWorkflowAdvances": {
+          "type": "array",
+          "description": "The workflow runs whose automatic advance the autonomy freeze holds (technical plan \u00a740.2, \u00a725.9), oldest first, at most 100: those on sessions the caller may decide workflow steps on (authz.ActionDecideWorkflowStep -- an administrator or maintainer sees every one, a member those on sessions they created or joined, a viewer none). Empty outside a freeze, and once the freeze lifts and each advance is applied. Best-effort: a read that fails lists none, logged server-side.",
+          "items": {
+            "$ref": "#/$defs/DecisionInboxHeldWorkflowAdvance"
+          }
+        },
+        "heldWorkflowAdvancesTotal": {
+          "type": "integer",
+          "description": "How many held workflow advances the caller may see in all: more than heldWorkflowAdvances holds when the 100 bound cut the list, which then shows the oldest. 0 when none is held, or when the read failed."
         },
         "scmAsOf": {
           "type": [
@@ -7049,6 +7076,79 @@
           "type": "string",
           "minLength": 1,
           "description": "Why new sessions on this repository are revoked: 1 to 500 characters after trimming, kept with the revocation and in the audit log."
+        }
+      }
+    },
+    "AutonomyFreeze": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "GET /api/autonomy response body, the body POST /api/autonomy/freeze and POST /api/autonomy/unfreeze return on success, and ListDecisionInboxResponse.autonomyFreeze (technical plan §40.2): whether autonomy is frozen platform-wide. While frozen, no automatic action starts -- no auto-merge, no sentinel-fix merge, no sentinel auto-fix, no description rewrite, no automatic re-review, no automation run and no workflow advance -- and each starts again once an administrator lifts the freeze, but for §40.2's bounds: a scheduled automation run held past its ten-minute catch-up window waits for its next occurrence, and a sentinel fix held from merging is not merged automatically; a person's own commands are never held, and a turn already running finishes. Readable by every signed-in role (authz.ActionViewSessions); freezing and unfreezing are admin only (authz.ActionManageAutonomyFreeze, §13.3). Every field is present; the four describing the freeze are null when autonomy is not frozen.",
+      "required": ["frozen", "frozenAt", "frozenByUserId", "frozenByDisplayName", "reason"],
+      "properties": {
+        "frozen": {
+          "type": "boolean",
+          "description": "True while a freeze is in force: no automatic action starts on any replica."
+        },
+        "frozenAt": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "When the freeze in force was set. Null when not frozen."
+        },
+        "frozenByUserId": {
+          "type": ["string", "null"],
+          "format": "uuid",
+          "description": "The administrator who set it. Null when not frozen, or when who set it is not on record: that user no longer exists, or the freeze was written by hand, with no user, as an earlier release's runbook did."
+        },
+        "frozenByDisplayName": {
+          "type": ["string", "null"],
+          "description": "That administrator's display name. Null whenever frozenByUserId is."
+        },
+        "reason": {
+          "type": ["string", "null"],
+          "description": "Why autonomy was frozen, as the administrator wrote it (1 to 500 characters). Null when not frozen."
+        }
+      }
+    },
+    "FreezeAutonomyRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "POST /api/autonomy/freeze's request body (technical plan §40.2). reason is trimmed and must be 1 to 500 characters: blank is refused 400 \"reason is required\", longer is refused 400 \"reason must be at most 500 characters\", and one holding a NUL character is refused 400 \"reason must not contain a NUL byte\". Autonomy already frozen is refused 409 \"autonomy is already frozen\" and keeps the first freeze's who, when and why.",
+      "required": ["reason"],
+      "properties": {
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Why autonomy is frozen: 1 to 500 characters after trimming, kept with the freeze, shown on every role's decision inbox while it holds, and written to the audit log."
+        }
+      }
+    },
+    "DecisionInboxHeldWorkflowAdvance": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "One workflow run whose automatic advance to its next step the autonomy freeze holds (technical plan §40.2, §25.9; ListDecisionInboxResponse.heldWorkflowAdvances): the step's attempt finished and its outcome is stored, the run is still running with no live attempt, and its next attempt starts once the freeze lifts -- exactly once. A person's stop of the session drops the hold and cancels the run instead.",
+      "required": ["workflowRunId", "sessionId", "sessionTitle", "workflowName", "heldAt"],
+      "properties": {
+        "workflowRunId": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "sessionId": {
+          "type": "string",
+          "format": "uuid",
+          "description": "The run's session, where the next attempt runs once the freeze lifts."
+        },
+        "sessionTitle": {
+          "type": ["string", "null"],
+          "description": "The session's title. Null when the session has none."
+        },
+        "workflowName": {
+          "type": "string",
+          "description": "The name of the workflow definition the run follows."
+        },
+        "heldAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the advance was held: the end of the step's turn."
         }
       }
     }
