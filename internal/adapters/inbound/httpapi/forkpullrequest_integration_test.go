@@ -214,8 +214,7 @@ func TestApplySuggestion_ForkPullRequest_ConflictNamesTheFork(t *testing.T) {
 	session := rig.createOwnedGitHubReviewSessionWithRepos(ctx, t, owner.ID, repoFullName, 71, forkSpec("fork-pr-apply"))
 	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
 	seedDispatchedTurn(ctx, t, rig, session.ID)
-	body := `{"riskLevel":"low","premise":"ok","blastRadius":[],"filesChanged":1,"testsCoverage":"insufficient","docsDrift":"none","proposedShippable":"auto","summary":"s","findings":[{"source":"primary","severity":"low","filePath":"internal/foo/bar.go","description":"Stale comment.","suggestedFix":"--- a/internal/foo/bar.go\n+++ b/internal/foo/bar.go\n@@ -1,2 +1,2 @@\n package foo\n-// old comment\n+// new comment\n"}],"digest":{"summary":"Fixes a stale comment.","descriptionAdequacy":"ok","adequacyExplanation":"Accurate."},"factCheck":"done","factCheckKilled":0}`
-	status, verdict := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, body)
+	status, verdict := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, suggestedFixVerdictBody)
 	if status != http.StatusCreated {
 		t.Fatalf("post verdict status = %d, want %d", status, http.StatusCreated)
 	}

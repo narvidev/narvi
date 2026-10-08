@@ -770,15 +770,18 @@ func PostReviewVerdict(
 				logger.Warn("httpapi: review-verdict: could not read the session's repos, skipping sentinel-auto-fix trigger",
 					"error", reposErr)
 				autoFixCandidate = false
-			case repos[0].Branch == nil || *repos[0].Branch == "":
-				// A review session's spec names a head branch only when it is
-				// a branch of the pull request's base repository (technical
-				// plan §30.4): a pull request from a fork keeps its head in
-				// the fork, where a fix branch cut from the base's
-				// same-named branch would fix something else; a review
-				// whose head could not be read when it started records none
-				// either. Expected, so not a warning.
-				logger.Info("httpapi: review-verdict: the review session names no head branch in the base repository (a pull request from a fork, or a head not read when the review started), skipping sentinel-auto-fix trigger",
+			case !reposource.ReviewHeadInBaseRepository(prSession.RepoFullName, sessionRow.Repos):
+				// The fix is cut from the spec's branch, in the spec's
+				// repository -- so only when that branch is the pull
+				// request's head in its base repository (technical plan
+				// §30.4): the spec's primary repo names the claim's
+				// repository and carries a branch. A pull request from a
+				// fork keeps its head in the fork; its spec names no branch,
+				// and neither does one whose head could not be read when its
+				// review started. A legacy session not yet moved still names
+				// the fork and the fork's branch, and a fix child would act
+				// on the fork. Expected, so not a warning.
+				logger.Info("httpapi: review-verdict: the review session's head is not known to be a branch of its base repository (a pull request from a fork, a legacy session still naming the fork, or a head not read when the review started), skipping sentinel-auto-fix trigger",
 					"repo", prSession.RepoFullName, "pr_number", prSession.PrNumber)
 				autoFixCandidate = false
 			default:

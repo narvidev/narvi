@@ -227,7 +227,10 @@ func TestPostReviewVerdict_SentinelAutoFix_TriggersWhenToggleOn(t *testing.T) {
 	ctx := context.Background()
 	repoFullName := "acme/sentinel-trigger-on-repo"
 	owner, _ := rig.createAuthenticatedUser(ctx, t)
-	session := createOwnedGitHubReviewSessionWithBranch(ctx, t, rig, owner.ID, repoFullName, 40, "widgets", "https://github.com/acme/widgets.git", "feature-branch")
+	// The spec names the claim's repository with its head branch: a pull
+	// request opened from a branch of its base repository, the one shape
+	// whose head the sentinel auto-fix may cut a fix from (§30.4).
+	session := createOwnedGitHubReviewSessionWithBranch(ctx, t, rig, owner.ID, repoFullName, 40, "widgets", "https://github.com/"+repoFullName+".git", "feature-branch")
 	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
 	seedDispatchedTurn(ctx, t, rig, session.ID)
 
@@ -417,7 +420,10 @@ var _ ports.SourceControl = (*applySuggestionFakeSourceControl)(nil)
 func setupFindingWithSuggestedFix(ctx context.Context, t *testing.T, rig testRig, repoFullName string, prNumber int32) (sqlcgen.Session, string) {
 	t.Helper()
 	owner, _ := rig.createAuthenticatedUser(ctx, t)
-	session := createOwnedGitHubReviewSessionWithBranch(ctx, t, rig, owner.ID, repoFullName, prNumber, "widgets", "https://github.com/acme/widgets.git", "pr-head-branch")
+	// The spec names the claim's repository with its head branch: a pull
+	// request opened from a branch of its base repository, the one shape
+	// apply-suggestion commits to (§30.4).
+	session := createOwnedGitHubReviewSessionWithBranch(ctx, t, rig, owner.ID, repoFullName, prNumber, "widgets", "https://github.com/"+repoFullName+".git", "pr-head-branch")
 	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
 	seedDispatchedTurn(ctx, t, rig, session.ID)
 

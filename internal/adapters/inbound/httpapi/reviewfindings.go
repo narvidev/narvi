@@ -192,9 +192,11 @@ func RebutReviewFinding(sessions *postgres.SessionStore, prSessions *postgres.Gi
 // mutually-exclusive path (a sentinel-auto-fix child session already
 // fix_pending/fix_open/fix_merged, or a prior fix_applied/fix_recorded) --
 // §17.3: "the two remediation paths are mutually exclusive per finding";
-// 409 too when the review session names no head branch in the pull
-// request's base repository -- a pull request from a fork, whose head this
-// endpoint never writes to (§30.4) -- with a message saying so; 403 if the
+// 409 too when the review session's head is not known to be a branch of
+// the pull request's base repository (reposource.ReviewHeadInBaseRepository)
+// -- a pull request from a fork, whose head this endpoint never writes to
+// (§30.4), a legacy session still naming the fork, or a head not read when
+// the review started -- with a message saying so; 403 if the
 // acting maintainer has no usable GitHub credential; 200 with the
 // resulting restdtos.ApplySuggestionResponse otherwise.
 //
@@ -283,16 +285,21 @@ func ApplySuggestion(sessions *postgres.SessionStore, prSessions *postgres.GitHu
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		if repos[0].Branch == nil || *repos[0].Branch == "" {
-			// A review session's spec names a head branch only when that
-			// branch is in the pull request's base repository (technical
-			// plan §30.4): a pull request from a fork keeps its head in the
-			// fork, which this endpoint never writes to -- it commits to
-			// prSession.RepoFullName, the base -- and the spec of one whose
-			// head could not be read when its review started names none
-			// either. Committing to a same-named branch of the base would
-			// change a branch other than the pull request's, so this is a
-			// conflict with the pull request's shape, answered as one.
+		if !reposource.ReviewHeadInBaseRepository(prSession.RepoFullName, sessionRow.Repos) {
+			// This endpoint commits to prSession.RepoFullName, the base
+			// repository, at the spec's branch -- so only when that branch
+			// is the pull request's head in the base (technical plan §30.4):
+			// the spec's primary repo names the claim's repository and
+			// carries a branch. A pull request from a fork keeps its head
+			// in the fork, which this endpoint never writes to; its spec
+			// names no branch, and neither does one whose head could not be
+			// read when its review started. A legacy session opened before
+			// the spec named the base, and not yet moved, still names the
+			// fork and the fork's branch -- often "main", which in the base
+			// is the base's own. Committing to a same-named branch of the
+			// base would change a branch other than the pull request's, so
+			// this is a conflict with the pull request's shape, answered as
+			// one.
 			logger.Info("httpapi: apply-suggestion refused: the review session names no head branch in the base repository",
 				"repo", prSession.RepoFullName, "pr_number", prSession.PrNumber)
 			writeError(w, http.StatusConflict, applySuggestionNoHeadBranchMessage(prSession.RepoFullName))
@@ -424,9 +431,10 @@ func ApplySuggestion(sessions *postgres.SessionStore, prSessions *postgres.GitHu
 }
 
 // applySuggestionNoHeadBranchMessage is the 409 ApplySuggestion answers for
-// a review session whose spec names no head branch in baseRepoFullName, the
-// pull request's base repository: a pull request from a fork, the common
-// case, or one whose head could not be read when its review started.
+// a review session whose head is not known to be a branch of
+// baseRepoFullName, the pull request's base repository: a pull request from
+// a fork, the common case -- a legacy session still naming the fork among
+// them -- or one whose head could not be read when its review started.
 func applySuggestionNoHeadBranchMessage(baseRepoFullName string) string {
 	return "this pull request's head branch is not in " + baseRepoFullName +
 		": a pull request from a fork keeps its head in the fork, which Narvi never writes to " +
