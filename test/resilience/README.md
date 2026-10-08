@@ -537,6 +537,52 @@ generally — nothing to replay here.
   (the companion snapshot-creation-side guard and its own positive
   control) — same file
 
+## Scenario #20, the freeze half (Step 149, §40.2)
+
+### #20 — the freeze flipped with candidates pending
+
+> Session spend reaches its cap mid-run → [the cap half, Step 148's]; and
+> the freeze flipped with auto-merge candidates pending → no merge, no
+> auto-fix spawn, no re-review enqueue and no automation invocation occurs
+> while frozen, every candidate is still a candidate after unfreeze, a
+> human command still works, and no running turn is severed (§40.1,
+> §40.2).
+
+**Status: the freeze half is covered; the cap half waits on Step 148.** One
+database and the components the control plane runs, driven tick by tick: a
+registry whose sandboxes are real `wsbridge.Bridge` agents on the real
+sandbox handler (each answers its snapshots, counts any stop, and completes
+a prompt at once or when the test says), the auto-merge worker, the outbox
+builder with the real sentinel auto-fix notifier, the automation engine, the
+held workflow advance releaser, and the audited admin routes that freeze and
+unfreeze. One code host stands in for GitHub: an armed pull request, open
+until merged, and the fix branch.
+
+- `TestResilience_Scenario20_Freeze_NothingAutomaticStarts`: an armed
+  auto-merge candidate, a sentinel auto-fix delivery, a debounced
+  re-review, an every-minute cron schedule, a workflow step's turn, and a
+  person's turn processing on its sandbox are all pending when an
+  administrator freezes autonomy through `POST /api/autonomy/freeze`.
+  While frozen: no pull request read and no merge; the fix delivery held
+  with no attempt counted, no branch and no session; the re-review's
+  debounce re-armed with no turn; no cron invocation; an invocation
+  recorded meanwhile, as an event's is, left unclaimed with no run; the
+  workflow step's turn completes and its advance is held, which the
+  decision inbox lists beside the freeze; a person's prompt on another
+  session is dispatched and completes; and the processing turn is left
+  processing. After `POST /api/autonomy/unfreeze`, two ticks of each site:
+  one merge, one fix branch and session on one counted attempt, one
+  review of the pushed head, one cron invocation, one run per invocation,
+  and the held advance released exactly once, its second step run and
+  completed. The processing turn then completes on its own: no stop was
+  ever sent to its sandbox and its gen lives. No turn failed or was
+  cancelled, and each change wrote its one audit row.
+  — in `scenario20_freeze_test.go`
+
+Each site's own freeze behaviour is pinned beside it (Step 149's three
+parts), and the admin action's in `internal/adapters/inbound/httpapi`'s
+`autonomyfreeze_integration_test.go`.
+
 ## Scenario #22 (Step 226, §3.3)
 
 ### #22 — a prompt lost between dispatch and the sandbox
@@ -758,11 +804,12 @@ message's `step_start` is stored in that turn.
 | 15 | Refresh-in-flight spawn | Covered — Step 42 |
 | 16 | Non-idempotent-setup boot | Covered — Step 42 |
 | 17 | Restore-with-docker | Covered — Step 74 |
+| 20 | Spend cap mid-run; the freeze | Freeze half covered, Step 149; cap half waits on Step 148 |
 | 22 | A prompt lost between dispatch and the sandbox | Covered — Step 226 |
 | 23 | Frames over 32 KiB on the sandbox socket | Covered — Step 228 |
 | 24 | A review turn reads the commit it recorded | Covered — Step 204 |
 
 Numbers 18-21 are taken by the scenarios `docs/TECHNICAL_PLAN.md` §9.3 appends for Phases 13, 15
 and 18 (rotation and the interrupted turn, fresh-lineage continuity, the spend cap and freeze, the
-Kubernetes provider), none built yet. 22 is Step 226's, 23 is Step 228's, and 24 is Step 204's. A
-new scenario takes 25.
+Kubernetes provider); of those, only 20's freeze half is built (Step 149). 22 is Step 226's, 23 is
+Step 228's, and 24 is Step 204's. A new scenario takes 25.
