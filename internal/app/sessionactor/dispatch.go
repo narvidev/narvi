@@ -279,6 +279,14 @@ type spawnPlan struct {
 	// commit itself failing -- never names a gen or a deadline that was not
 	// persisted.
 	lifetime *lifetimeStamp
+
+	// restoreDecision is the decision tryPlanSpawn made on the snapshot's
+	// recorded provenance (technical plan §35.5b, snapshotrestore.go) when
+	// the spawn decision was a restore: on a restore plan, the restore it
+	// let through; on a fresh-spawn plan, the restore it refused. nil when
+	// no such decision was made. executePlans logs and counts it once the
+	// claim has committed (logSnapshotRestore).
+	restoreDecision *snapshotRestoreDecision
 }
 
 // dispatchPlan is what planDispatch's own transact hands back to
@@ -404,6 +412,7 @@ func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 func (a *Actor) executePlans(ctx context.Context, spawn *spawnPlan, dispatch *dispatchPlan, deleted sqlcgen.DeleteSessionDispatchTimerRow) error {
 	if spawn != nil {
 		a.logLifetimeDeadline(spawn)
+		a.logSnapshotRestore(ctx, spawn)
 	}
 	switch {
 	case spawn != nil && spawn.resume:
@@ -1107,6 +1116,15 @@ func (a *Actor) tryPlanSpawn(
 	// own doc comment for why this is a SEPARATE, independent check from
 	// httpapi.CreateSessionCore's own up-front one, not a re-use of its
 	// result.
+	//
+	// refusal is a restore turned into a fresh spawn below -- by §27.8's or
+	// §30.4(3)'s downgrade, or on the snapshot's provenance (technical plan
+	// §35.5b) -- which the Spawn arm makes visible in the claim's own
+	// transaction (applySnapshotRefusal); restoreDecision is the decision
+	// on the snapshot's provenance, logged and counted once the claim has
+	// committed.
+	var refusal *snapshotRefusal
+	var restoreDecision *snapshotRestoreDecision
 	if action.Kind == sandbox.SpawnActionSpawn || action.Kind == sandbox.SpawnActionRestore || action.Kind == sandbox.SpawnActionResume {
 		// §31.4's spawn-time re-read of an administrator's revocation --
 		// first, and in every rollout mode: see refuseIfRepoRevoked's own
@@ -1154,6 +1172,7 @@ func (a *Actor) tryPlanSpawn(
 		if action.Kind == sandbox.SpawnActionRestore && dockerRequired {
 			a.logger.Warn("sessionactor: refusing snapshot restore for a Docker-required session; forcing a fresh spawn instead of an unverified cross-runtime restore (§27.8)",
 				"session_id", a.sessionID.String(), "snapshot_id", action.SnapshotImageID)
+			refusal = dockerRestoreRefusal(sandboxRow, action.SnapshotImageID)
 			action = sandbox.SpawnAction{Kind: sandbox.SpawnActionSpawn}
 		}
 
@@ -1191,20 +1210,45 @@ func (a *Actor) tryPlanSpawn(
 			a.stores.outbox.WithTx(tx).ResolveEffectiveMode(ctx, a.sessionID) {
 			a.logger.Warn("sessionactor: refusing snapshot restore into a shadow session: the snapshot's own shadow bit is absent/false, treated as live (§30.4(3)); forcing a fresh spawn instead",
 				"session_id", a.sessionID.String(), "snapshot_id", action.SnapshotImageID)
+			refusal = shadowRestoreRefusal(sandboxRow, action.SnapshotImageID)
+			action = sandbox.SpawnAction{Kind: sandbox.SpawnActionSpawn}
+		}
+	}
+
+	// Technical plan §35.5b: a restore that is still a restore is decided
+	// on what the snapshot holds, as the agent that minted it reported it.
+	// Compatible and unknown restore; incompatible spawns fresh, and the
+	// Spawn arm writes the warning and clears the snapshot.
+	if action.Kind == sandbox.SpawnActionRestore {
+		restoreDecision, refusal = evaluateSnapshotRestore(sandboxRow, action.SnapshotImageID)
+		if refusal != nil {
 			action = sandbox.SpawnAction{Kind: sandbox.SpawnActionSpawn}
 		}
 	}
 
 	switch action.Kind {
 	case sandbox.SpawnActionSpawn:
-		return a.planFreshSpawn(ctx, tx, sessionRow, hasSandbox, sandboxRow, now)
+		plan, err := a.planFreshSpawn(ctx, tx, sessionRow, hasSandbox, sandboxRow, now)
+		if err != nil || plan == nil || refusal == nil {
+			return plan, err
+		}
+		if err := a.applySnapshotRefusal(ctx, tx, plan, refusal); err != nil {
+			return nil, err
+		}
+		plan.restoreDecision = restoreDecision
+		return plan, nil
 	case sandbox.SpawnActionRestore:
 		// Only reachable when hasSandbox is true (EvaluateSpawnDecision's
 		// own Restore branch requires SnapshotImageID != "" AND status in
 		// {Stopped, Failed, Stale} -- none of which a brand-new,
 		// no-sandbox-row session can have), so sandboxRow is a real,
 		// already-loaded row here, not the zero value.
-		return a.planRestore(ctx, tx, sessionRow, sandboxRow, action.SnapshotImageID, now)
+		plan, err := a.planRestore(ctx, tx, sessionRow, sandboxRow, action.SnapshotImageID, now)
+		if err != nil {
+			return nil, err
+		}
+		plan.restoreDecision = restoreDecision
+		return plan, nil
 	case sandbox.SpawnActionResume:
 		// Only reachable when hasSandbox is true (EvaluateSpawnDecision's
 		// own Resume branch requires ProviderObjectID != "" AND status in

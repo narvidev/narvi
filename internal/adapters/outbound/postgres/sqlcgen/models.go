@@ -2381,6 +2381,10 @@ type Sandbox struct {
 	LifetimeSeconds               *int32               `json:"lifetime_seconds"`
 	LifetimeDeadlineGen           *int32               `json:"lifetime_deadline_gen"`
 	ReviewCheckoutGen             *int32               `json:"review_checkout_gen"`
+	SnapshotProvenanceID          *string              `json:"snapshot_provenance_id"`
+	SnapshotAgentProtocol         *string              `json:"snapshot_agent_protocol"`
+	SnapshotRuntimeVersion        *string              `json:"snapshot_runtime_version"`
+	SnapshotMintedAt              pgtype.Timestamptz   `json:"snapshot_minted_at"`
 }
 
 type SandboxHistory struct {

@@ -724,6 +724,63 @@ func TestReviewCheckout_ASnapshotRestoredOldAgentIsRespawnedFresh(t *testing.T) 
 	}
 }
 
+// TestReviewCheckout_ASnapshotRestoredOldAgentIsRespawnedFresh_Visibly:
+// the retirement that clears a snapshot whose agent cannot check out a
+// commit makes the loss visible as a refused restore does (technical plan
+// §35.5b): one persisted warning at the retired gen, through the same
+// helper and key, naming the snapshot and what it records of its agent;
+// the snapshot's provenance goes with it.
+func TestReviewCheckout_ASnapshotRestoredOldAgentIsRespawnedFresh_Visibly(t *testing.T) {
+	tests := []struct {
+		name     string
+		protocol *string
+		names    string
+	}{
+		{"nothing recorded of the snapshot's agent", nil, "nothing was recorded of the agent the snapshot holds"},
+		{"the snapshot's agent recorded", strPtr("1.25.0"), "an agent of protocol 1.25.0"},
+	}
+	for i, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			f := checkoutFixture(ctx, t, pool, "acme/co-snapshot-visible", int32(791+i))
+			seedReviewTurn(ctx, t, f, coHead, nil, true)
+			const snapshotID = "snap-old-agent-visible"
+			if _, err := narvipg.NewSandboxStore(pool).UpdateSnapshotID(ctx, sqlcgen.UpdateSandboxSnapshotIDParams{
+				SessionID: f.sessionID, SnapshotID: strPtr(snapshotID), SnapshotSuppressedInShadow: true, AgentProtocol: tc.protocol,
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.protocol == nil {
+				// Recorded by a control plane that predates the record.
+				if _, err := pool.Exec(ctx, `UPDATE sandboxes SET snapshot_provenance_id = NULL WHERE session_id = $1`, f.sessionID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rig := newContextRig(ctx, t, pool, f.sessionID, nil)
+
+			deliver(ctx, t, rig.actor, checkoutReady(1, false))
+
+			if rig.provider.restoreCallCount() != 0 || rig.provider.callCount() != 1 {
+				t.Fatalf("restores %d, fresh spawns %d; want the next gen spawned fresh", rig.provider.restoreCallCount(), rig.provider.callCount())
+			}
+			warnings := storedWarnings(ctx, t, pool, f.sessionID)
+			if len(warnings) != 1 || warnings[0].messageID != snapshotRefusalMessageIDPrefix+snapshotID || warnings[0].gen != 1 {
+				t.Fatalf("warnings %+v, want exactly one, %s%s, at the retired gen 1", warnings, snapshotRefusalMessageIDPrefix, snapshotID)
+			}
+			for _, want := range []string{snapshotID, "cannot check out the commit", tc.names, "starting from the repository"} {
+				if !strings.Contains(warnings[0].message, want) {
+					t.Errorf("warning %q does not name %q", warnings[0].message, want)
+				}
+			}
+			row := readProvenanceRow(ctx, t, pool, f.sessionID)
+			if row.snapshotID != nil || row.provenanceID != nil || row.agentProtocol != nil || row.mintedAt.Valid || row.suppressedInShadow {
+				t.Fatalf("sandbox after the retirement: %v; want the snapshot cleared with its provenance and shadow bit", row)
+			}
+		})
+	}
+}
+
 // TestReviewCheckout_ASilentSandboxIsRefusedAtTheBound: a capable sandbox
 // that never answers keeps the turn waiting -- nothing sent again without
 // a reconnect -- until ReviewCheckoutTimeout, when the turn is refused,
@@ -867,6 +924,12 @@ func TestReviewCheckout_AStaleIndexLockRetiresTheGenOnce(t *testing.T) {
 	}
 	if sb.SnapshotID != nil || sb.Gen != 2 {
 		t.Fatalf("sandbox: snapshot %v, gen %d; want the snapshot cleared and gen 2", sb.SnapshotID, sb.Gen)
+	}
+	// The cleared snapshot is named in one persisted warning (technical
+	// plan §35.5b), at the retired gen.
+	if w := storedWarnings(ctx, t, pool, f.sessionID); len(w) != 1 || w[0].messageID != snapshotRefusalMessageIDPrefix+"snap-with-the-lock" ||
+		w[0].gen != 1 || !strings.Contains(w[0].message, "snap-with-the-lock") || !strings.Contains(w[0].message, "kept failing") {
+		t.Fatalf("warnings %+v, want one at gen 1 naming snap-with-the-lock and the failing checkouts", w)
 	}
 	if got := reviewCheckoutCount(ctx, t, reviewCheckoutOutcomeRetiredFailing) - before; got != 1 {
 		t.Fatalf("review_checkout_total{retired_failing} moved by %d, want 1", got)

@@ -16,9 +16,10 @@ import (
 )
 
 // checkoutPlanVersion is the migration the review checkout's plan test
-// migrates to: 000168, after 000167, the two that add the columns its
-// statements name.
-const checkoutPlanVersion = reviewCheckoutGenMigration
+// migrates to: the latest whose columns its statements name -- 000167 and
+// 000168 add the checkout's, and ClearSandboxSnapshot clears the
+// snapshot's provenance too, which snapshotProvenanceMigration adds.
+const checkoutPlanVersion = snapshotProvenanceMigration
 
 // The review checkout's statements, each the only access of its rows in
 // its transaction, read by key alone (technical plan §21.1):
@@ -185,10 +186,10 @@ func TestReviewCheckout_PlansReadByKey(t *testing.T) {
 		statement{holdPlanStatement{
 			name: "ClearSandboxSnapshot",
 			run: func(ctx context.Context, tx pgx.Tx, _ holdPlanProbe) error {
-				_, err := sandboxes.WithTx(tx).ClearSnapshot(ctx, session)
+				_, err := sandboxes.WithTx(tx).ClearSnapshot(ctx, session, "snap-"+session.String())
 				return err
 			},
-			args: func(holdPlanProbe) string { return quote(session) },
+			args: func(holdPlanProbe) string { return quote(session) + ", 'snap-" + session.String() + "'" },
 		}, checkoutSandboxWriteMaxBuffers, []string{"sandboxes"}},
 	)
 

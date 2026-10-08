@@ -1,0 +1,81 @@
+-- Technical plan §35.5b: a snapshot carries the runtime it was minted
+-- under. A restore brings back the sandbox-agent binary and the agent
+-- runtime the snapshot holds, whatever this control plane would boot
+-- today, so a restore is decided on what the snapshot holds, recorded when
+-- it was taken -- never on a version stamped onto it later.
+--
+-- sandboxes.snapshot_agent_protocol: the contracts VERSION the
+-- sandbox-agent that answered the snapshot command was compiled with, as
+-- that agent reported it on its snapshot_ready (provenance.agentProtocol,
+-- contracts 1.25.0). NULL when it reported none: every agent built before
+-- that release.
+--
+-- sandboxes.snapshot_runtime_version: the agent runtime's version, as that
+-- agent discovered it when it spawned the runtime
+-- (provenance.runtimeVersion). NULL when it reported none.
+--
+-- sandboxes.snapshot_minted_at: the database's now() when the snapshot was
+-- recorded -- the age the refusal warning names, and what the population
+-- of unversioned snapshots is measured by.
+--
+-- sandboxes.snapshot_provenance_id: the snapshot id the three columns
+-- above describe. UpdateSandboxSnapshotID writes all four with snapshot_id,
+-- in one statement, so they count only while snapshot_provenance_id equals
+-- snapshot_id: a snapshot whose agent reported nothing reads "provenance
+-- unknown", never another snapshot's provenance. The session actor reads
+-- them before every restore (internal/domain/sandbox.
+-- EvaluateSnapshotRestore): compatible restores, incompatible is refused
+-- visibly and the snapshot cleared, unknown restores and is counted as
+-- unknown.
+--
+-- Never recorded here, because each would label an old snapshot with a
+-- current version: agent_version, which reads "dev" on every agent built
+-- without a stamped version; image_digest, which reads "unknown"; and any
+-- version the control plane holds, its own protocol or the runtime version
+-- it would configure today.
+--
+-- No backfill. Every snapshot that exists when this runs was minted by an
+-- agent that reported nothing, so every one reads "provenance unknown"
+-- until the sandbox's next snapshot -- and keeps reading so for as long as
+-- its lineage is restored, since a restored gen runs the snapshot's own
+-- agent. Inferring a version for one would be the mislabel §35.5b
+-- forbids. No sandbox_history mirror either, unlike 000106's shadow bit:
+-- nothing writes that table (000022).
+--
+-- # Locks
+--
+-- Each ADD COLUMN is nullable with no default, so it is a catalog change
+-- that rewrites nothing. Each takes ACCESS EXCLUSIVE on sandboxes, for the
+-- file's one implicit transaction, for an instant once granted; the file
+-- touches sandboxes alone.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with these columns present:
+--   - Every statement it sends names its columns (sqlc writes each
+--     SELECT * and RETURNING * out as a column list), so it neither reads
+--     nor writes them.
+--   - Its UpdateSandboxSnapshotID moves snapshot_id and leaves the four
+--     columns on the snapshot before, so a snapshot it records reads
+--     "provenance unknown" here, never the earlier snapshot's provenance.
+--   - It restores every snapshot, as it always has.
+-- migration000170_integration_test.go runs the previous binary's own
+-- statements against the columns.
+--
+-- # Rolling back
+--
+-- Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for, so the previous binary cannot boot on this
+-- version ("no migration found for version 170"). With the control plane
+-- scaled to zero, either:
+--   - keep the columns: `migrate force 169`, after which the previous
+--     binary boots and works with them present as above, and this file
+--     runs again, keeping their values, when this release is deployed
+--     again; or
+--   - drop them: run this migration's down (goto 169) with this release's
+--     migrations. The down file says what it removes.
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_provenance_id TEXT;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_agent_protocol TEXT;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_runtime_version TEXT;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_minted_at TIMESTAMPTZ;
