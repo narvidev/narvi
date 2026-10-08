@@ -7471,7 +7471,8 @@ candidate after the freeze lifts, a debounced re-review still fires, for the hea
 automation runs on its next tick. An event-triggered invocation is still recorded while frozen — the
 candidate — and held at fan-out. Pausing the automation defers that backlog, it does not discard it:
 pausing and resuming touch no invocation, so on resume every invocation held meanwhile fans out; a
-supported way to discard an automation's held invocations is a follow-up of the freeze's admin action.
+supported way to discard an automation's held invocations is a follow-up of the freeze's admin action,
+filed as Step 232.
 A cron fire is skipped before its claim, so a freeze never builds up a burst, and after the unfreeze a
 missed occurrence fires at most once, on the first tick within the catch-up window of it — an
 automation that has never fired counts its window from the minute it was created, so a first

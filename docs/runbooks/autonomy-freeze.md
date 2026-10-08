@@ -38,7 +38,8 @@ each starting its runs and sessions on today's code. Nothing in the product
 discards them yet: keep a runaway automation paused until it can be
 resumed safely. A supported way to discard an automation's held invocations
 is not built: it remains a follow-up of the freeze's admin action, which
-sets and lifts the freeze only.
+sets and lifts the freeze only, and is planned as Step 232
+(`docs/IMPLEMENTATION_PLAN.md`).
 
 An outbox row of the two held kinds that was born in shadow (its
 `suppressed_in_shadow` stamp set at enqueue, `docs/TECHNICAL_PLAN.md` §30.8)
@@ -125,7 +126,9 @@ merges it -- and the workflow runs whose next step is held are listed under
 the banner, to whoever may decide their steps.
 
 Do not write `platform_settings` by hand: the admin action is the one
-supported writer, and a hand write leaves no audit row.
+supported writer, and a hand write leaves no audit row. The one exception is
+lifting a freeze after a rollback to a release without the admin action:
+see "Rolling back past the admin action" below.
 
 ## The tail
 
@@ -204,6 +207,45 @@ age. `outbox_due_backlog_count` counts every pending row, the held ones
 included.
 
 ## Rolling back
+
+### Rolling back past the admin action: unfreeze first
+
+The release before the admin action (the Settings card and
+`/api/autonomy`) still reads the freeze at every site, but has no way to
+show it or lift it: no route, no card, no banner. Rolling back to it changes
+nothing in `platform_settings`, so **a freeze in force stays in force**, and
+every automatic action stays held, with nothing in the product to say why or
+to end it.
+
+So **unfreeze before rolling back past the admin action**: Settings →
+General → Unfreeze, or `POST /api/autonomy/unfreeze`. Its `autonomy.unfrozen`
+audit row records what was lifted. If the incident still needs everything
+automatic held across the rollback, turn off auto-merge and the other
+automatic toggles per repository, and pause automations, instead of keeping
+the freeze.
+
+If a rollback already happened with the freeze on, the older release has one
+way to lift it: this statement, on the control plane's database. It is the
+one supported hand write of `platform_settings`, and it keeps the row's
+CHECK (all four freeze columns cleared together):
+
+```sql
+SELECT autonomy_frozen_at, autonomy_frozen_by, autonomy_freeze_reason
+FROM platform_settings WHERE id = 1;
+
+UPDATE platform_settings
+SET autonomy_frozen = false, autonomy_frozen_at = NULL, autonomy_frozen_by = NULL,
+    autonomy_freeze_reason = NULL, updated_at = now()
+WHERE id = 1 AND autonomy_frozen;
+```
+
+It writes no audit row. Record by hand, in the incident: who lifted the
+freeze, when, and the freeze it lifted -- the `SELECT`'s when, who and why,
+and the `autonomy.frozen` audit row it matches. Every site reads the row on
+its next action, on every replica: held actions start again within about a
+minute, but for the bounds in "After the freeze lifts".
+
+### Rolling back past the freeze, or the held workflow advance
 
 A binary without the freeze reads no freeze. Rolling back past it lifts any
 freeze in force, whatever the row says: turn off auto-merge and the other
