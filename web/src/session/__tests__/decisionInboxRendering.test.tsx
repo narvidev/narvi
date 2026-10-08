@@ -824,9 +824,10 @@ describe('AutonomyFreezeBanner -- one banner while frozen, and an unread freeze 
     expect(html).toContain('Your own actions still work.')
   })
 
-  it('a freeze by a user who no longer exists still names the freeze', () => {
+  it('a freeze with no one on record -- a deleted user, or one written by hand -- says so, never that a user was deleted', () => {
     const html = renderToStaticMarkup(<AutonomyFreezeBanner freeze={frozen({ frozenByUserId: null, frozenByDisplayName: null })} unread={false} />)
-    expect(html).toContain('a user who no longer exists')
+    expect(html).toContain('by someone not on record: an incident: hold every automatic action.')
+    expect(html).not.toContain('no longer exists')
   })
 
   it('an unread freeze says the state is unknown -- in the warning style -- and never that autonomy runs', () => {
@@ -885,6 +886,27 @@ describe('HeldWorkflowAdvancesSection -- the workflow runs the freeze holds', ()
     expect(html).toContain('held · build then test')
     expect(html).toContain('untitled session')
     expect(html).toContain('Open session')
+  })
+
+  it('a list the 100 bound cut says how many are held, and that the oldest are shown', () => {
+    const shown = Array.from({ length: 100 }, (_, i) => ({ ...advance, workflowRunId: `run-${i}` }))
+    const html = withQueryClient(<HeldWorkflowAdvancesSection held={shown} total={250} />)
+    expect(html).toContain('250 held · the oldest 100 shown')
+    expect(html).not.toContain('100 · workflow runs')
+  })
+
+  it('a list the bound did not cut, or from a server without the total, counts what it shows', () => {
+    for (const total of [2, undefined]) {
+      const html = withQueryClient(<HeldWorkflowAdvancesSection held={[advance, { ...advance, workflowRunId: 'run-2' }]} total={total} />)
+      expect(html).toContain('2 · workflow runs whose next step starts once autonomy is unfrozen')
+      expect(html).not.toContain('shown')
+    }
+  })
+
+  it('a hold under a minute old reads "held just now", never "just now ago"', () => {
+    const html = withQueryClient(<HeldWorkflowAdvancesSection held={[{ ...advance, heldAt: new Date(Date.now() - 20_000).toISOString() }]} />)
+    expect(html).toContain('held just now')
+    expect(html).not.toContain('just now ago')
   })
 
   it('an adversarial session title and workflow name stay text, never markup', () => {

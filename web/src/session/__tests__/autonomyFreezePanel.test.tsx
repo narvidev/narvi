@@ -20,7 +20,10 @@ import { ApiError } from '../../api/http'
 import { autonomyFreezeQueryKeys, decisionInboxQueryKeys } from '../../api/queryKeys'
 import { AutonomyFreezePanel, AutonomyFreezeStatus } from '../AutonomyFreezePanel'
 
-const hooks = vi.hoisted(() => ({ mutations: [] as unknown[], forcedQuery: undefined as object | undefined }))
+// The options of every useMutation call, in call order; how many times
+// each one's reset was called; and a result the next useQuery reports
+// instead of its own, when set.
+const hooks = vi.hoisted(() => ({ mutations: [] as unknown[], resets: [] as number[], forcedQuery: undefined as object | undefined }))
 
 vi.mock('@tanstack/react-query', async (importOriginal) => {
   const actual = await importOriginal<typeof ReactQuery>()
@@ -29,14 +32,24 @@ vi.mock('@tanstack/react-query', async (importOriginal) => {
     return hooks.forcedQuery === undefined ? result : { ...result, ...hooks.forcedQuery }
   }) as typeof actual.useQuery
   const useMutation = ((...args: Parameters<typeof actual.useMutation>) => {
+    const index = hooks.mutations.length
     hooks.mutations.push(args[0])
-    return actual.useMutation(...args)
+    hooks.resets[index] = 0
+    const result = actual.useMutation(...args)
+    return {
+      ...result,
+      reset: () => {
+        hooks.resets[index] += 1
+        result.reset()
+      },
+    }
   }) as typeof actual.useMutation
   return { ...actual, useQuery, useMutation }
 })
 
 afterEach(() => {
   hooks.mutations.length = 0
+  hooks.resets.length = 0
   hooks.forcedQuery = undefined
 })
 
@@ -64,6 +77,7 @@ function frozen(): AutonomyFreeze {
 // and the freeze and unfreeze mutations' options, in the card's order.
 function render(role: string | undefined, freeze: AutonomyFreeze | undefined) {
   hooks.mutations.length = 0
+  hooks.resets.length = 0
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   if (freeze !== undefined) {
     client.setQueryData(KEY, freeze)
@@ -156,9 +170,10 @@ describe('AutonomyFreezeStatus -- the freeze read-only, its free text as text', 
     expect(html).toContain('own actions still work')
   })
 
-  it('a freeze by a user who no longer exists says so', () => {
+  it('a freeze with no one on record -- a deleted user, or a freeze written by hand -- says so, never that a user was deleted', () => {
     const html = renderToStaticMarkup(<AutonomyFreezeStatus freeze={{ ...frozen(), frozenByUserId: null, frozenByDisplayName: null }} />)
-    expect(html).toContain('a user who no longer exists')
+    expect(html).toContain('someone not on record')
+    expect(html).not.toContain('no longer exists')
   })
 
   it('an adversarial reason and display name stay text, never markup', () => {
@@ -166,5 +181,53 @@ describe('AutonomyFreezeStatus -- the freeze read-only, its free text as text', 
     expect(html).not.toContain('<script>')
     expect(html).not.toContain('<img')
     expect(html).toContain('&lt;script&gt;')
+  })
+})
+
+// What a lifted freeze brings back is bounded (technical plan §40.2): a
+// scheduled run held past its catch-up window waits for its next
+// occurrence, and a sentinel fix held from merging is not merged
+// automatically. The card says so wherever it says held actions start
+// again, and never promises that nothing is lost.
+describe('AutonomyFreezePanel -- what a lifted freeze brings back is stated with its bounds', () => {
+  const BOUNDS = 'a scheduled automation run held more than ten minutes waits for its next occurrence, and a sentinel fix held from merging is not merged automatically'
+
+  for (const [name, freeze] of [['not frozen', notFrozen()], ['frozen', frozen()]] as const) {
+    it(`the card states both bounds and never that nothing is lost (${name})`, () => {
+      const { html } = render('admin', freeze)
+      expect(html).toContain('held actions start')
+      expect(html).toContain(BOUNDS)
+      expect(html).not.toMatch(/nothing is lost/i)
+    })
+  }
+
+  it('the frozen status states both bounds where it says held actions start again', () => {
+    const html = renderToStaticMarkup(<AutonomyFreezeStatus freeze={frozen()} />)
+    expect(html).toContain('Held actions start once the freeze is lifted.')
+    expect(html).toContain(BOUNDS)
+    expect(html).not.toContain('Each waits, and starts once the freeze is lifted')
+  })
+})
+
+// A 409 left on the card is about the state before it flipped: the next
+// successful action, either way, clears the other's error, so the card
+// never shows a state beside an error that contradicts it.
+describe('AutonomyFreezePanel -- a successful change clears the other action\'s stale error', () => {
+  it('a successful freeze resets the unfreeze, and only it', () => {
+    const { freeze } = render('admin', notFrozen())
+    freeze.onSuccess?.(frozen(), undefined, undefined)
+    expect(hooks.resets).toEqual([0, 1])
+  })
+
+  it('a successful unfreeze resets the freeze, and only it', () => {
+    const { unfreeze } = render('admin', frozen())
+    unfreeze.onSuccess?.(notFrozen(), undefined, undefined)
+    expect(hooks.resets).toEqual([1, 0])
+  })
+
+  it('a refused change resets nothing: its own 409 stays, beside the state the server holds', () => {
+    const rendered = render('admin', frozen())
+    rendered.unfreeze.onError?.(new ApiError(409, 'autonomy is not frozen', null), undefined, undefined)
+    expect(hooks.resets).toEqual([0, 0])
   })
 })

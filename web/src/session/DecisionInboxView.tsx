@@ -113,6 +113,7 @@ import {
   sectionBlurb,
   sectionTitle,
 } from './decisionInboxFormat'
+import { frozenByText, heldAdvancesCountText, heldAgoText } from './autonomyFreezeFormat'
 import { formatRelativeTime } from './relativeTime'
 import { RESUME_PROMPT } from './Timeline'
 import { truncateForDisplay } from './textSafety'
@@ -755,7 +756,7 @@ export function AutonomyFreezeBanner({ freeze, unread }: { freeze: AutonomyFreez
   return (
     <div className="sync-banner sync-banner-warn" role="status">
       Autonomy is frozen since {freeze.frozenAt ? new Date(freeze.frozenAt).toLocaleString() : 'an unknown time'} by{' '}
-      {freeze.frozenByDisplayName ? <T text={freeze.frozenByDisplayName} /> : 'a user who no longer exists'}: <T text={freeze.reason ?? ''} />. Nothing automatic starts: no
+      <T text={frozenByText(freeze)} />: <T text={freeze.reason ?? ''} />. Nothing automatic starts: no
       auto-merge, auto-fix, automatic re-review, automation run or workflow advance. Your own actions still work.
     </div>
   )
@@ -767,9 +768,11 @@ export function AutonomyFreezeBanner({ freeze, unread }: { freeze: AutonomyFreez
  * technical plan §40.2, §25.9) -- the server lists only those on sessions
  * the caller may decide workflow steps on. Each starts its next step once
  * the freeze lifts; stopping the session drops it instead. Nothing renders
- * when none is held.
+ * when none is held. The list is bounded at 100, oldest first: total, the
+ * server's count of every held advance the caller may see, makes a cut list
+ * say so.
  */
-export function HeldWorkflowAdvancesSection({ held }: { held: DecisionInboxHeldWorkflowAdvance[] }) {
+export function HeldWorkflowAdvancesSection({ held, total }: { held: DecisionInboxHeldWorkflowAdvance[]; total?: number }) {
   if (held.length === 0) {
     return null
   }
@@ -777,7 +780,7 @@ export function HeldWorkflowAdvancesSection({ held }: { held: DecisionInboxHeldW
     <div>
       <div className="qhead">
         <h4>Held by the freeze</h4>
-        <span className="qcount">{held.length} · workflow runs whose next step starts once autonomy is unfrozen</span>
+        <span className="qcount">{heldAdvancesCountText(held.length, total)}</span>
       </div>
       <div className="qrows">
         {held.map((advance) => (
@@ -790,7 +793,7 @@ export function HeldWorkflowAdvancesSection({ held }: { held: DecisionInboxHeldW
               <span className="dot" />
               <T text={`held · ${advance.workflowName}`} />
             </span>
-            <span className="qage">held {formatRelativeTime(advance.heldAt)} ago</span>
+            <span className="qage">{heldAgoText(advance.heldAt)}</span>
             <Link to="/session/$sessionId" params={{ sessionId: advance.sessionId }} className="btn" style={{ textDecoration: 'none' }}>
               Open session →
             </Link>
@@ -888,7 +891,7 @@ export function DecisionInboxView() {
 
         {inboxQuery.isSuccess && (
           <div className="inbox">
-            <HeldWorkflowAdvancesSection held={inboxQuery.data.heldWorkflowAdvances ?? EMPTY_HELD} />
+            <HeldWorkflowAdvancesSection held={inboxQuery.data.heldWorkflowAdvances ?? EMPTY_HELD} total={inboxQuery.data.heldWorkflowAdvancesTotal} />
             {SECTION_ORDER.filter((kind) => kind !== 'needs_attention' || isAdmin).map((kind) => (
               <Section key={kind} kind={kind} items={visibleItems.filter((it) => it.kind === kind)} canMerge={canMerge} />
             ))}

@@ -649,8 +649,12 @@ this route at all.
 with a reason, and lift the freeze later (technical plan §40.2). While
 frozen, nothing automatic starts: no auto-merge, no sentinel-fix merge,
 no sentinel auto-fix, no description rewrite, no automatic re-review, no
-automation run and no workflow advance. Each waits, consuming nothing,
-and starts once the freeze is lifted, within about a minute. A person's
+automation run and no workflow advance. Held actions start again within
+about a minute of the freeze being lifted, with three exceptions: a
+scheduled automation run held more than ten minutes waits for its next
+occurrence; a sentinel fix held from merging is not merged automatically,
+and stays open for a person; and a pull request auto-approved more than
+seven days ago is left to a person's Merge click. A person's
 own commands -- a prompt, a plan approval, a Merge click, a re-review
 request, a workflow step decision, a stop -- are never held, and a turn
 already running finishes. Settings → General shows the freeze to every

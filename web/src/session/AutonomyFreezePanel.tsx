@@ -24,6 +24,7 @@ import type { AutonomyFreeze } from '@narvi/contracts/rest-dtos'
 import { getAutonomyFreeze, postFreezeAutonomy, postUnfreezeAutonomy } from '../api/endpoints'
 import { ApiError } from '../api/http'
 import { autonomyFreezeQueryKeys, decisionInboxQueryKeys } from '../api/queryKeys'
+import { FREEZE_RESUME_BOUNDS, frozenByText } from './autonomyFreezeFormat'
 import { truncateForDisplay } from './textSafety'
 
 const MAX_FIELD_CHARS = 500
@@ -60,8 +61,8 @@ export function AutonomyFreezeStatus({ freeze }: { freeze: AutonomyFreeze }) {
           <span className="dot" />
           frozen
         </span>{' '}
-        Nothing automatic starts: no auto-merge, auto-fix, automatic re-review, automation run or workflow advance. Each waits, and starts once the freeze is lifted. A person&rsquo;s own actions still work, and a turn already running
-        finishes.
+        Nothing automatic starts: no auto-merge, auto-fix, automatic re-review, automation run or workflow advance. Held actions start once the freeze is lifted. {FREEZE_RESUME_BOUNDS} A person&rsquo;s own actions still work, and a
+        turn already running finishes.
       </p>
       <div style={row}>
         <span style={{ color: 'var(--faint)' }}>Frozen since</span>
@@ -69,7 +70,9 @@ export function AutonomyFreezeStatus({ freeze }: { freeze: AutonomyFreeze }) {
       </div>
       <div style={row}>
         <span style={{ color: 'var(--faint)' }}>By</span>
-        <span>{freeze.frozenByDisplayName ? <T text={freeze.frozenByDisplayName} /> : 'a user who no longer exists'}</span>
+        <span>
+          <T text={frozenByText(freeze)} />
+        </span>
       </div>
       <div style={row}>
         <span style={{ color: 'var(--faint)' }}>Reason</span>
@@ -96,7 +99,9 @@ function MutationError({ error }: { error: unknown }) {
  * decision inbox is refetched, since its banner and held rows change with
  * it. A 409 means another administrator froze or unfroze first, so the
  * cached freeze is stale: it is refetched, and the card shows the state the
- * server holds beside the server's own message.
+ * server holds beside the server's own message. Either action's success
+ * clears the other's error, so a 409 from before the state flipped never
+ * stands under the state that contradicts it.
  */
 export function AutonomyFreezePanel({ role }: { role: string | undefined }) {
   const queryClient = useQueryClient()
@@ -124,13 +129,17 @@ export function AutonomyFreezePanel({ role }: { role: string | undefined }) {
     onSuccess: (updated) => {
       settle(updated)
       setReason('')
+      unfreeze.reset()
     },
     onError: refetchIfStale,
   })
 
   const unfreeze = useMutation({
     mutationFn: () => postUnfreezeAutonomy(),
-    onSuccess: settle,
+    onSuccess: (updated) => {
+      settle(updated)
+      freeze.reset()
+    },
     onError: refetchIfStale,
   })
 
@@ -141,8 +150,8 @@ export function AutonomyFreezePanel({ role }: { role: string | undefined }) {
       <h4>Autonomy freeze</h4>
       <p className="ph">platform-wide · audited · a person&rsquo;s own actions are never held</p>
       <p className="ph">
-        Freezing stops every automatic action at once, on every replica: auto-merge, sentinel auto-fix, description rewrites, automatic re-reviews, automation runs and workflow advances. Nothing is lost: each held action starts once
-        the freeze is lifted, within about a minute.
+        Freezing stops every automatic action at once, on every replica: auto-merge, sentinel auto-fix, description rewrites, automatic re-reviews, automation runs and workflow advances. Once the freeze is lifted, held actions start
+        within about a minute. {FREEZE_RESUME_BOUNDS}
       </p>
       {query.isPending && <p className="rail-empty">Loading…</p>}
       {query.isError && <p className="rail-empty">Couldn&rsquo;t read whether autonomy is frozen. Every automatic action reads the freeze itself before it starts.</p>}

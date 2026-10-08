@@ -153,7 +153,7 @@ export function postFreezeAutonomy(body: FreezeAutonomyRequest, signal?: AbortSi
   return request<AutonomyFreeze>('/api/autonomy/freeze', { method: 'POST', body, signal })
 }
 
-/** postUnfreezeAutonomy calls POST /api/autonomy/unfreeze -- lifts the freeze; every held action is still a candidate and starts within about a minute. Admin-only server-side; a 409 ApiError means autonomy is not frozen. Returns autonomy no longer frozen. */
+/** postUnfreezeAutonomy calls POST /api/autonomy/unfreeze -- lifts the freeze; held actions start within about a minute, except a scheduled automation run held past its ten-minute catch-up window, which waits for its next occurrence, and a sentinel fix held from merging, which stays open for a person (technical plan §40.2's bounds). Admin-only server-side; a 409 ApiError means autonomy is not frozen. Returns autonomy no longer frozen. */
 export function postUnfreezeAutonomy(signal?: AbortSignal): Promise<AutonomyFreeze> {
   return request<AutonomyFreeze>('/api/autonomy/unfreeze', { method: 'POST', signal })
 }
