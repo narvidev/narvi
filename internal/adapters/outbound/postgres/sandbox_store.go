@@ -87,13 +87,15 @@ func (s *SandboxStore) RecordReady(ctx context.Context, sessionID pgtype.UUID, g
 	})
 }
 
-// ClearSnapshot forgets the session's sandbox snapshot, so the next gen
-// boots fresh rather than restoring it, and reports the rows it wrote: 0
-// when there was none. The session actor's retirement of a gen it will not
-// send a review turn's checkout to (technical plan §21.1, §30.4); see
-// ClearSandboxSnapshot's own generated doc comment.
-func (s *SandboxStore) ClearSnapshot(ctx context.Context, sessionID pgtype.UUID) (int64, error) {
-	return s.q.ClearSandboxSnapshot(ctx, sessionID)
+// ClearSnapshot forgets the session's sandbox snapshot snapshotID, with
+// the provenance recorded for it, so the next gen boots fresh rather than
+// restoring it, and reports the rows it wrote: 0 when the sandbox holds no
+// snapshot, or another one. The session actor's retirement of a gen it
+// will not send a review turn's checkout to (technical plan §21.1, §30.4),
+// and its refusal of a snapshot whose provenance it does not restore
+// (§35.5b); see ClearSandboxSnapshot's own generated doc comment.
+func (s *SandboxStore) ClearSnapshot(ctx context.Context, sessionID pgtype.UUID, snapshotID string) (int64, error) {
+	return s.q.ClearSandboxSnapshot(ctx, sqlcgen.ClearSandboxSnapshotParams{SessionID: sessionID, SnapshotID: snapshotID})
 }
 
 // TightenLifetimeDeadline records what a sandbox-agent of gen reported its
@@ -157,7 +159,9 @@ func (s *SandboxStore) UpdateCircuitBreaker(ctx context.Context, arg sqlcgen.Upd
 // UpdateSnapshotID records a real, sandbox-confirmed snapshot id once a
 // "snapshot_ready" wire event arrives (§3.2, "snapshots & restore",
 // design decision 3). Also clears pending_snapshot_message_id back to
-// NULL in the same statement -- see UpdateSandboxSnapshotID's own
+// NULL in the same statement, and records the snapshot's provenance, what
+// the minting sandbox-agent reported about itself (technical plan
+// §35.5b), keyed by the snapshot id -- see UpdateSandboxSnapshotID's own
 // generated doc comment.
 func (s *SandboxStore) UpdateSnapshotID(ctx context.Context, arg sqlcgen.UpdateSandboxSnapshotIDParams) (sqlcgen.Sandbox, error) {
 	return s.q.UpdateSandboxSnapshotID(ctx, arg)
