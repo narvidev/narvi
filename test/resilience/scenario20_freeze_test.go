@@ -655,7 +655,14 @@ func TestResilience_Scenario20_Freeze_NothingAutomaticStarts(t *testing.T) {
 
 	reviewSession := s.debouncedReReview(ctx, t)
 
-	cronAutomation, _ := s.automationOn(ctx, t, "s20-cron", "* * * * *")
+	// A daily schedule whose one occurrence, three minutes ago, falls in the
+	// freeze, created an hour before it: a candidate that fires once, so a
+	// second firing after the unfreeze is a fault, never a new occurrence.
+	occurrence := time.Now().UTC().Truncate(time.Minute).Add(-3 * time.Minute)
+	cronAutomation, _ := s.automationOn(ctx, t, "s20-cron", fmt.Sprintf("%d %d * * *", occurrence.Minute(), occurrence.Hour()))
+	if _, err := h.Pool.Exec(ctx, `UPDATE automations SET created_at = $2 WHERE id = $1`, cronAutomation.ID, occurrence.Add(-time.Hour)); err != nil {
+		t.Fatalf("date the cron automation: %v", err)
+	}
 	eventAutomation, eventTargets := s.automationOn(ctx, t, "s20-event", "")
 	invocations := narvipg.NewAutomationInvocationStore(h.Pool)
 	engine, err := automation.NewEngine(narvipg.NewAutomationStore(h.Pool), invocations, narvipg.NewAutomationRunStore(h.Pool), h.Sessions, h.Turns,
@@ -831,15 +838,40 @@ func TestResilience_Scenario20_Freeze_NothingAutomaticStarts(t *testing.T) {
 		}
 		return s.count(ctx, t, `SELECT count(*) FROM turns WHERE session_id = $1 AND is_review_attempt`, reviewSession) > 0
 	})
-	if n := s.count(ctx, t, `SELECT count(*) FROM turns WHERE session_id = $1 AND is_review_attempt AND review_head_sha = 'sha-s20-pushed'`, reviewSession); n != 1 {
-		t.Fatalf("after the unfreeze: %d automatic reviews of the pushed head, want 1", n)
+	// A second firing of the debounce, due again, reviews nothing more: the
+	// pushed head was reviewed, once.
+	s.makeDebounceDue(ctx, t, reviewSession)
+	for tick := 0; tick < 2; tick++ {
+		if err := s.registry.PumpOnce(ctx); err != nil {
+			t.Fatalf("timer pump after the review: %v", err)
+		}
+	}
+	if n := s.count(ctx, t, `SELECT count(*) FROM turns WHERE session_id = $1 AND is_review_attempt`, reviewSession); n != 1 {
+		t.Fatalf("after the unfreeze: %d automatic reviews, want the pushed head reviewed once", n)
 	}
 
+	// The held occurrence fires on the first tick after the unfreeze, and a
+	// tick in a later minute does not fire it again. That later minute is
+	// the recorded fire aged by one: a tick in the next minute reads its
+	// window from the fire the first tick recorded, a minute behind its own,
+	// which is exactly what the second tick here reads.
+	cronInvocations := func() int {
+		return s.count(ctx, t, `SELECT count(*) FROM automation_invocations WHERE automation_id = $1`, cronAutomation.ID)
+	}
 	if err := engine.EvaluateCronTriggersOnce(ctx); err != nil {
 		t.Fatalf("cron tick after the unfreeze: %v", err)
 	}
-	if n := s.count(ctx, t, `SELECT count(*) FROM automation_invocations WHERE automation_id = $1`, cronAutomation.ID); n != 1 {
+	if n := cronInvocations(); n != 1 {
 		t.Fatalf("after the unfreeze: %d cron invocations, want the held occurrence once", n)
+	}
+	if _, err := h.Pool.Exec(ctx, `UPDATE automations SET last_cron_fired_at = last_cron_fired_at - interval '1 minute' WHERE id = $1`, cronAutomation.ID); err != nil {
+		t.Fatalf("age the recorded fire by a minute: %v", err)
+	}
+	if err := engine.EvaluateCronTriggersOnce(ctx); err != nil {
+		t.Fatalf("cron tick a minute later: %v", err)
+	}
+	if n := cronInvocations(); n != 1 {
+		t.Fatalf("a minute after the catch-up fire: %d cron invocations, want the held occurrence still once", n)
 	}
 	for tick := 0; tick < 2; tick++ {
 		if err := engine.PumpOnce(ctx); err != nil {

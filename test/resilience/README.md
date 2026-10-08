@@ -560,7 +560,8 @@ until merged, and the fix branch.
 
 - `TestResilience_Scenario20_Freeze_NothingAutomaticStarts`: an armed
   auto-merge candidate, a sentinel auto-fix delivery, a debounced
-  re-review, an every-minute cron schedule, a workflow step's turn, and a
+  re-review, a daily cron schedule whose one occurrence falls in the
+  freeze, a workflow step's turn, and a
   person's turn processing on its sandbox are all pending when an
   administrator freezes autonomy through `POST /api/autonomy/freeze`.
   While frozen: no pull request read and no merge; the fix delivery held
@@ -570,11 +571,15 @@ until merged, and the fix branch.
   workflow step's turn completes and its advance is held, which the
   decision inbox lists beside the freeze; a person's prompt on another
   session is dispatched and completes; and the processing turn is left
-  processing. After `POST /api/autonomy/unfreeze`, two ticks of each site:
-  one merge, one fix branch and session on one counted attempt, one
-  review of the pushed head, one cron invocation, one run per invocation,
-  and the held advance released exactly once, its second step run and
-  completed. The processing turn then completes on its own: no stop was
+  processing. After `POST /api/autonomy/unfreeze`, each site runs its
+  candidate once and a second tick runs nothing more: two auto-merge ticks,
+  one merge; two outbox ticks, one fix branch and session on one counted
+  attempt; the debounce pumped until it reviews, then due again and pumped
+  twice, one review of the pushed head; the cron trigger ticked, then
+  ticked again as a tick in the next minute reads it (the recorded fire
+  aged by one minute), one invocation of the held occurrence; two fan-out
+  ticks, one run per invocation; and two release ticks, the held advance
+  released exactly once, its second step run and completed. The processing turn then completes on its own: no stop was
   ever sent to its sandbox and its gen lives. No turn failed or was
   cancelled, and each change wrote its one audit row.
   — in `scenario20_freeze_test.go`
