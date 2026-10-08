@@ -762,6 +762,8 @@ Roles (global, one per user): **admin > maintainer > member > viewer**.
 
 Revoking a repository's eligibility and restoring it are one admin-only action (`manage_repo_entitlement`), its status read included; a revocation binds every session-creation surface, pull-request mentions included, and the pending turns of the repository's existing sessions. It names the repository by its name, so a rename or transfer on the code host needs the new name revoked too (§31.4).
 
+Freezing autonomy platform-wide and lifting the freeze (§40.2) are one admin-only action (`manage_autonomy_freeze`), audited as `autonomy.frozen` and `autonomy.unfrozen` in the change's own transaction. Reading the freeze is not: every role reads it (`view_sessions`), since the decision inbox shows every role the same banner (§16.1).
+
 Stopping on own/joined sessions is owner decision O1 (default taken 2026-09-29, open to revision): a member can already start and prompt that work, and a stop only ever reduces what runs. Stopping a session also stops every session it started (§3.3), authorized by the one check on the session named. Resuming stays admin/maintainer only; in practice a person resumes a stopped session by prompting it, approving its plan, or approving or revising a workflow step awaiting their decision, each under its own permission (§3.3).
 
 O1 does not reach a pull request's review session — a session a `github_pr_sessions` row points at (decided 2026-09-29, review of Step 217). That session is shared: every review attempt on the pull request runs in it, a maintainer's label re-trigger and the automatic re-review included, and the sentinel auto-fix sessions it starts are its descendants. Its creator is only whoever first mentioned the bot on the pull request. A stop would let that member end work they could not have started, so stopping a review session needs admin or maintainer, as before O1, whoever created or joined it.
@@ -866,15 +868,17 @@ Problem this solves: the session-centric UI answers "what are the agents doing?"
 
 ### 16.1 Item taxonomy
 Each row is a pending human decision — with one narrow, admin-toggled exception (sentinel auto-fix follow-up PRs, §17, disabled by default) that merges without appearing here at all, precisely because there is no decision left for a human to make once its own checks pass. Otherwise, every row is one of:
-- **ready_to_merge**: open PR authored by a platform session, auto-approved by the deterministic eligibility engine (§21 — CI green, no floor raised, diff size under a configurable threshold, no sensitive path touched; a `review: needs-human` label forces a PR out of auto-approval regardless of criteria; `visual-qa: pass/skip` unaffected), CI green at head, and assigned to the user — directly, as requested reviewer, or via CODEOWNERS. Action: Merge (1-click confirm while a repo's auto-merge toggle, §21, is unarmed; once armed, these merge without ever appearing here).
+- **ready_to_merge**: open PR authored by a platform session, auto-approved by the deterministic eligibility engine (§21 — CI green, no floor raised, diff size under a configurable threshold, no sensitive path touched; a `review: needs-human` label forces a PR out of auto-approval regardless of criteria; `visual-qa: pass/skip` unaffected), CI green at head, and assigned to the user — directly, as requested reviewer, or via CODEOWNERS. Action: Merge (1-click confirm). Once a repo's auto-merge toggle (§21) is armed, the auto-merge worker merges these on its next tick; until it does they stay listed here like any other row, the Merge click included. While autonomy is frozen (§40.2) such a row is marked **held** (`heldByFreeze`): the worker's merge waits for the unfreeze, and a person's own Merge click still merges it.
 - **needs_review**: PRs where the user is requested reviewer/code owner and the verdict is ≥ medium or a formal review is gated; includes release cuts with manifest flags (§15).
 - **awaiting_approval**: plan-mode plans the user is entitled to approve (per `Authorize`, §13.3) and handoff items (§14.4) sitting in the engineering queue.
 - **needs_attention**: sessions failed-with-resume-available, auto-paused automations, dead-lettered outbox deliveries (admin only).
 
 Ranking: by decision cost then age — quick confirmations (ready_to_merge) first; per-row age shown, stale items (>48h, configurable) visually flagged. Every row prints its **assignment provenance** ("yours via CODEOWNERS · internal/app/scheduler/**" vs "assigned directly" vs "requested reviewer") — a queue whose origin the user can't trust becomes a feed they ignore.
 
+**The autonomy freeze (§40.2).** While autonomy is frozen, every role's inbox shows one banner naming when, by whom and why, and that nothing automatic starts while a person's own actions still work — no held counts. Beneath it, the workflow runs whose next step the freeze holds are listed, oldest first, to whoever may decide those runs' steps (`authz.ActionDecideWorkflowStep`: an administrator or maintainer every one, a member those on sessions they created or joined); each starts its next step once the freeze lifts, and stopping its session drops it instead. A freeze the read could not load is said to be unknown (`autonomyFreezeUnread`), never rendered as "not frozen".
+
 ### 16.2 Data & enforcement
-- **A read model, not new state**: the inbox aggregates existing Postgres state (plans, review sessions, sessions, automations, outbox) plus SCM data. No new state machine, no new writer.
+- **A read model, not new state**: the inbox aggregates existing Postgres state (plans, review sessions, sessions, automations, outbox, the autonomy freeze's `platform_settings` row and `workflow_advance_holds`) plus SCM data. No new state machine, no new writer. The freeze is read once per load, with no cache; the held mark reads each repository's auto-merge toggle once per load.
 - `SourceControl` (§4.3) gains `ListOpenPRsForUser(ctx, user) ([]OpenPR, error)` (review state, CI at head SHA, labels, assignees/reviewers) and `ResolveCodeOwners(ctx, repo, paths) ([]Owner, error)`. CODEOWNERS teams resolve to persons through the identity graph (§13.2). SCM data is cached with a short TTL and the staleness is displayed ("as of 2 min ago") — never presented as live truth.
 - **Actions re-validate server-side at click time**: the Merge endpoint re-checks CI status, approval state, and `Authorize(actor, merge, pr)` before calling the SCM — the rendered queue is never trusted as authority (same policy-on-the-server invariant as verdicts, §5.2). Viewer role sees the queue read-only.
 - Metric: **decision latency** (median time from item entering the queue to its action) joins the analytics KPIs (§12.2 item 6) — the human bottleneck, made visible.
@@ -1515,7 +1519,7 @@ Step 46 already specifies re-trigger "via label/button" — a human applying tha
 This entire feature is **off by default**, enabled per repository (Settings, admin-only — the same row as the auto-merge and sentinel-auto-fix toggles, §13.3), for the same reason those two are admin-gated: it changes what runs unattended on a repo's own PRs. If the setting cannot be read (a transient Postgres error, a missing row), the safe direction is treated as OFF — no re-review is triggered, logged, nothing retried; a repo that hasn't explicitly opted in never gets surprised by this running anyway. **This automation never auto-approves anything on its own** — it only ever enqueues an ordinary review turn through Step 46's existing dispatch; whether the resulting verdict lets a PR through auto-approval is entirely §21.2's own eligibility engine's decision, made independently, later, from the fresh verdict this produces.
 
 ### 24.6 Per-PR re-review budget
-An automated fix session (§17, sentinel auto-fix, or any future automation that pushes commits) can itself trigger the very re-review this feature exists to provide, which can in turn flag something that triggers another automated fix — a loop with no natural end. A per-PR counter (`github_pr_sessions.auto_retrigger_count`, alongside `pending_retrigger_head_sha`) bounds this: each time §24.3 step 4 actually enqueues an automatic re-review turn, the counter increments; a default budget (not given an explicit figure elsewhere in this plan — propose 10 per PR, configurable, mirroring how other new intervals in this plan are proposed) caps it. This budget governs ONLY the automatic path — a human's manual re-trigger (label/button, Step 46) is never subject to it and always works, regardless of how many automatic re-reviews already fired; the two tracks are independent by design, not merely by accident.
+An automated fix session (§17, sentinel auto-fix, or any future automation that pushes commits) can itself trigger the very re-review this feature exists to provide, which can in turn flag something that triggers another automated fix — a loop with no natural end. A per-PR counter (`github_pr_sessions.auto_retrigger_count`, alongside `pending_retrigger_head_sha`) bounds this: each time §24.3 step 4 actually enqueues an automatic re-review turn, the counter increments; a default budget (not given an explicit figure elsewhere in this plan — propose 10 per PR, configurable, mirroring how other new intervals in this plan are proposed) caps it. This budget governs ONLY the automatic path — a human's manual re-trigger (label/button, Step 46) is never subject to it and always works, regardless of how many automatic re-reviews already fired; the two tracks are independent by design, not merely by accident. The autonomy freeze (§40.2) keeps the same asymmetry: it holds only the automatic path — a frozen firing spends no budget, keeps the pushed head and re-arms its debounce — and never the manual re-trigger, which inserts while frozen exactly as it does otherwise.
 
 Once the counter reaches the budget, §24.3 step 4's "otherwise" branch stops enqueueing a turn: it still clears `pending_retrigger_head_sha` (so a later manual re-trigger starts clean) and deletes the `review_retrigger_debounce` timer (the same re-arm-or-delete contract every named-timer handler follows, `timerfired.go`) but does not dispatch. The FIRST time this happens for a given PR, the review session additionally posts one server-side verdict-tool notice (§5.2 — never a raw comment) that automatic re-review has reached its budget and further pushes need the existing manual re-trigger — a one-time event, not repeated on every subsequent debounce firing, so hitting the ceiling is observable without becoming noise. Later `synchronize` events on that same PR keep re-arming the debounce timer exactly as before (a cheap upsert either way); each firing simply finds the budget still exhausted and no-ops without posting a second notice.
 
@@ -7108,6 +7112,11 @@ that can never match is §37's write-time refusal. That §37 case is the sharper
 its symptom is a run recorded skipped for "conditions not met" — byte-identical to what a correct
 condition produces when the data genuinely does not match.
 
+A chain's deterministic enqueue of its target is an automatic action, so it consults the autonomy
+freeze (§40.2) before it enqueues, through `internal/app/autonomy.Gate` and its reserved site
+`chain_enqueue`: a frozen enqueue is recorded skipped with reason `frozen`, never failed, and the
+target is still a candidate once the freeze lifts.
+
 ### 38.4 Phasing
 Appended with §39, after Phase 13. It depends on Step 141 (§36): a chain whose source can silently
 report nothing is a chain that stalls with no signal, and building the chaining first would mean
@@ -7192,6 +7201,10 @@ Two consequences worth stating, because both are cheap here and expensive to ret
   a re-review of the same PR comes back worse. Blocking a link that is already running therefore
   has to stop the work, not merely mark the row — otherwise the train's documented hard stop is a
   hard stop only on paper.
+- **The advance consults the autonomy freeze (§40.2).** A verdict-gated advance starts a successor
+  no person asked for right then, so it reads the freeze through `internal/app/autonomy.Gate`, at
+  its reserved site `train_advance`, before it claims the advance: while frozen the successor is
+  held, not failed, and is still promoted once the freeze lifts.
 
 ### 39.4 A blocked link self-corrects before it escalates
 A train that stops dead on a raised floor and waits for a human is the version of this feature
@@ -7495,9 +7508,21 @@ merge per candidate, a delivery already started, one re-review turn per session,
 before the freeze — each bounded,
 cheaper than a row lock on every action to serialize against a write made a few times a year.
 
-**Surfaces.** The decision inbox (§16) shows one banner while frozen; `ready_to_merge` items remain
-listed, marked as held. Audit rows `autonomy.frozen` and `autonomy.unfrozen`, with actor, on the
-`auto_merge.merged` naming precedent.
+**Surfaces.** An administrator freezes autonomy, with a required reason (1 to 500 characters), and
+lifts the freeze, through `POST /api/autonomy/freeze` and `POST /api/autonomy/unfreeze`
+(`manage_autonomy_freeze`, admin only, §13.3); every role reads it through `GET /api/autonomy`. A
+second freeze answers 409 and keeps the first one's who, when and why; an unfreeze when nothing is
+frozen answers 409. Each change writes its audit row — `autonomy.frozen` with the reason,
+`autonomy.unfrozen` naming the freeze it lifted and how long it held, the admin as actor, resource
+`platform`/`autonomy`, on the `auto_merge.merged` naming precedent — in the change's own
+transaction, so a failed audit insert changes nothing. Freezing and unfreezing never read the freeze
+through the gate (`ScanAutonomyFreezeSites` lists the admin action among the human paths): gated, a
+freeze that could not be read would skip the very unfreeze meant to end it. Settings → General
+carries the card, the state for every role and the two actions for an administrator. The decision
+inbox (§16.1) shows one banner while frozen, for every role, with no held counts; `ready_to_merge`
+items remain listed, those whose repository has auto-merge armed marked as held, their Merge button
+kept; the workflow runs whose advance is held are listed under the banner to whoever may decide
+their steps; and a freeze the inbox could not read is shown as unknown, never as "not frozen".
 
 ### 40.3 Session bounds: turns and wall-clock
 

@@ -37,7 +37,8 @@ held through the freeze included -- fans out, five per tick per replica,
 each starting its runs and sessions on today's code. Nothing in the product
 discards them yet: keep a runaway automation paused until it can be
 resumed safely. A supported way to discard an automation's held invocations
-is a planned follow-up, with the freeze's admin action.
+is not built: it remains a follow-up of the freeze's admin action, which
+sets and lifts the freeze only.
 
 An outbox row of the two held kinds that was born in shadow (its
 `suppressed_in_shadow` stamp set at enqueue, `docs/TECHNICAL_PLAN.md` §30.8)
@@ -96,23 +97,35 @@ applied, even when the session is resumed a moment later.
 
 ## Setting and lifting it
 
-The admin action -- a Settings card and the routes behind it, each change
-audited as `autonomy.frozen` or `autonomy.unfrozen` -- is not built yet, and
-nothing in the product writes the row. During an incident before then, an
-operator with access to the control plane's database can set it directly.
-This writes no audit row: record who froze, when and why in the incident.
+An administrator sets and lifts the freeze; every signed-in role can see it.
 
-```sql
-UPDATE platform_settings
-SET autonomy_frozen = true, autonomy_frozen_at = now(),
-    autonomy_freeze_reason = '<why, 1 to 500 characters>', updated_at = now()
-WHERE id = 1 AND NOT autonomy_frozen;
+- **Settings → General → Autonomy freeze.** The card shows the freeze in
+  force to every role. An administrator sees **Freeze autonomy**, with a
+  required reason, while autonomy runs, and **Unfreeze** while it is
+  frozen.
+- **The routes behind it**, for a script or an incident tool:
+  `POST /api/autonomy/freeze` with `{"reason": "..."}` and
+  `POST /api/autonomy/unfreeze` (no body), both admin only
+  (`manage_autonomy_freeze`); `GET /api/autonomy` reads the freeze for any
+  signed-in role. The reason is required, 1 to 500 characters (`400`
+  otherwise). Freezing while frozen answers `409` and keeps the first
+  freeze's who, when and why; unfreezing when nothing is frozen answers
+  `409` too.
 
-UPDATE platform_settings
-SET autonomy_frozen = false, autonomy_frozen_at = NULL, autonomy_frozen_by = NULL,
-    autonomy_freeze_reason = NULL, updated_at = now()
-WHERE id = 1;
-```
+Each change is audited in its own transaction -- `autonomy.frozen` with
+the reason, `autonomy.unfrozen` naming the freeze it lifted (when, by whom,
+why) and how long it held, the administrator as actor, resource
+`platform`/`autonomy` -- so a freeze is never set or lifted without its
+audit row. The history is the audit log (Settings → Members, "Audit log").
+
+While frozen, every role's decision inbox shows a banner naming when, by
+whom and why. A `ready_to_merge` row in a repository with auto-merge armed
+is marked held -- the automatic merge waits; a person's Merge click still
+merges it -- and the workflow runs whose next step is held are listed under
+the banner, to whoever may decide their steps.
+
+Do not write `platform_settings` by hand: the admin action is the one
+supported writer, and a hand write leaves no audit row.
 
 ## The tail
 
