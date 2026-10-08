@@ -1035,6 +1035,84 @@ func (q *Queries) ListWorkflowAdvanceHolds(ctx context.Context, arg ListWorkflow
 	return items, nil
 }
 
+const listWorkflowAdvanceHoldsForInbox = `-- name: ListWorkflowAdvanceHoldsForInbox :many
+SELECT
+    h.workflow_run_id,
+    h.session_id,
+    h.held_at,
+    s.title AS session_title,
+    d.name AS workflow_name,
+    (COALESCE(s.created_by = $1::uuid, false)
+        OR EXISTS (
+            SELECT 1 FROM participants p
+            WHERE p.session_id = h.session_id AND p.user_id = $1::uuid
+        ))::boolean AS owned_or_joined
+FROM workflow_advance_holds h
+JOIN sessions s ON s.id = h.session_id
+JOIN workflow_runs r ON r.id = h.workflow_run_id
+JOIN workflow_definitions d ON d.id = r.workflow_definition_id
+WHERE $2::boolean
+   OR COALESCE(s.created_by = $1::uuid, false)
+   OR EXISTS (
+        SELECT 1 FROM participants p
+        WHERE p.session_id = h.session_id AND p.user_id = $1::uuid
+   )
+ORDER BY h.held_at, h.workflow_run_id
+LIMIT $3
+`
+
+type ListWorkflowAdvanceHoldsForInboxParams struct {
+	ActorUserID  pgtype.UUID `json:"actor_user_id"`
+	EverySession bool        `json:"every_session"`
+	MaxHolds     int32       `json:"max_holds"`
+}
+
+type ListWorkflowAdvanceHoldsForInboxRow struct {
+	WorkflowRunID pgtype.UUID        `json:"workflow_run_id"`
+	SessionID     pgtype.UUID        `json:"session_id"`
+	HeldAt        pgtype.Timestamptz `json:"held_at"`
+	SessionTitle  *string            `json:"session_title"`
+	WorkflowName  string             `json:"workflow_name"`
+	OwnedOrJoined bool               `json:"owned_or_joined"`
+}
+
+// The decision inbox's held workflow advances (technical plan §40.2, §16):
+// every hold, oldest first, at most sqlc.arg('max_holds'), with its run's
+// workflow name and its session's title -- those on every session when
+// sqlc.arg('every_session') is true (an administrator or maintainer, who
+// may decide any session's workflow steps), and otherwise only those on a
+// session sqlc.arg('actor_user_id') created or joined (participants).
+// owned_or_joined says which, for the caller's authz.Authorize. The holds
+// are read through workflow_advance_holds_held_at_idx, a table empty
+// outside a freeze; the run, its definition and its session by primary
+// key.
+func (q *Queries) ListWorkflowAdvanceHoldsForInbox(ctx context.Context, arg ListWorkflowAdvanceHoldsForInboxParams) ([]ListWorkflowAdvanceHoldsForInboxRow, error) {
+	rows, err := q.db.Query(ctx, listWorkflowAdvanceHoldsForInbox, arg.ActorUserID, arg.EverySession, arg.MaxHolds)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListWorkflowAdvanceHoldsForInboxRow
+	for rows.Next() {
+		var i ListWorkflowAdvanceHoldsForInboxRow
+		if err := rows.Scan(
+			&i.WorkflowRunID,
+			&i.SessionID,
+			&i.HeldAt,
+			&i.SessionTitle,
+			&i.WorkflowName,
+			&i.OwnedOrJoined,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listWorkflowBindings = `-- name: ListWorkflowBindings :many
 SELECT id, lane, repo_full_name, workflow_definition_id, definition_version, created_at, updated_at FROM workflow_bindings ORDER BY lane, repo_full_name NULLS FIRST
 `

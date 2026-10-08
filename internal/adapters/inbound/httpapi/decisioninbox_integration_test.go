@@ -343,7 +343,10 @@ func newDecisionInboxTestRigWithOutbound(t *testing.T, sourceControl ports.Sourc
 		Identities:            identities,
 		GitHubPRSessions:      githubPRSessions,
 		ReleaseManifestChecks: releaseManifestChecks,
-		SCMCache:              decisioninbox.NewSCMCache(sourceControl, platform.DefaultTimeouts()),
+		// The freeze's banner and held marks (§40.2), as serve.go wires them.
+		PlatformSettings: narvipg.NewPlatformSettingsStore(pool),
+		Workflows:        narvipg.NewWorkflowStore(pool),
+		SCMCache:         decisioninbox.NewSCMCache(sourceControl, platform.DefaultTimeouts()),
 		// The bot credential the read model reads a base branch's required
 		// checks with (§21.2), as controlplane/serve.go wires it.
 		GitHubOutbound:     outbound,

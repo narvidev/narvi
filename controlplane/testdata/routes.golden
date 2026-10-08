@@ -26,6 +26,7 @@ GET /api/audit-log
 GET /api/automations
 GET /api/automations/{automationID}
 GET /api/automations/{automationID}/invocations
+GET /api/autonomy
 GET /api/capabilities
 GET /api/cloud-identity-bindings
 GET /api/decision-inbox
@@ -89,6 +90,8 @@ POST /api/automations
 POST /api/automations/{automationID}/pause
 POST /api/automations/{automationID}/resume
 POST /api/automations/{automationID}/webhook-token
+POST /api/autonomy/freeze
+POST /api/autonomy/unfreeze
 POST /api/cloud-identity-bindings
 POST /api/cloud-identity/signing-keys/rotate
 POST /api/decision-inbox/accept-verdict

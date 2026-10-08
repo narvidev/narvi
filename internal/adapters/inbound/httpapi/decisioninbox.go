@@ -98,6 +98,19 @@ func decisionInboxResultToDTO(result decisioninbox.Result) restdtos.ListDecision
 		items[i] = decisionInboxItemToDTO(it)
 	}
 
+	// heldWorkflowAdvances is never null on the wire: an empty list when
+	// nothing is held (the contract's array, required).
+	held := make([]restdtos.DecisionInboxHeldWorkflowAdvance, len(result.HeldWorkflowAdvances))
+	for i, h := range result.HeldWorkflowAdvances {
+		held[i] = restdtos.DecisionInboxHeldWorkflowAdvance{
+			WorkflowRunId: h.WorkflowRunID,
+			SessionId:     h.SessionID,
+			SessionTitle:  h.SessionTitle,
+			WorkflowName:  h.WorkflowName,
+			HeldAt:        h.HeldAt,
+		}
+	}
+
 	resp := restdtos.ListDecisionInboxResponse{
 		Items:                     items,
 		ScmAsOf:                   result.SCMAsOf,
@@ -105,6 +118,11 @@ func decisionInboxResultToDTO(result decisioninbox.Result) restdtos.ListDecision
 		RequiredChecksNotRead:     result.RequiredChecksNotRead,
 		DecisionLatencySampleSize: result.DecisionLatencySampleSize,
 		DecisionLatencyComputed:   result.DecisionLatencyComputed,
+		// The freeze's banner (§40.2) says what GET /api/autonomy says, in
+		// the same shape.
+		AutonomyFreeze:       autonomyFreezeDTO(result.AutonomyFreeze),
+		AutonomyFreezeUnread: result.AutonomyFreezeUnread,
+		HeldWorkflowAdvances: held,
 	}
 	if result.DecisionLatencyComputed {
 		seconds := result.DecisionLatencyMedian.Seconds()
@@ -120,6 +138,7 @@ func decisionInboxItemToDTO(it decisioninbox.Item) restdtos.DecisionInboxItem {
 		EnteredQueueAt: it.EnteredQueueAt,
 		AgeSeconds:     int(it.AgeSeconds),
 		Stale:          it.Stale,
+		HeldByFreeze:   it.HeldByFreeze,
 	}
 
 	if it.RepoFullName != "" {

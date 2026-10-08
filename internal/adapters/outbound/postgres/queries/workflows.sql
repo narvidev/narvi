@@ -475,3 +475,38 @@ RETURNING workflow_run_id;
 DELETE FROM workflow_advance_holds
 WHERE session_id = sqlc.arg('session_id') AND held_at <= sqlc.arg('stop_requested_at')
 RETURNING workflow_run_id;
+
+-- name: ListWorkflowAdvanceHoldsForInbox :many
+-- The decision inbox's held workflow advances (technical plan §40.2, §16):
+-- every hold, oldest first, at most sqlc.arg('max_holds'), with its run's
+-- workflow name and its session's title -- those on every session when
+-- sqlc.arg('every_session') is true (an administrator or maintainer, who
+-- may decide any session's workflow steps), and otherwise only those on a
+-- session sqlc.arg('actor_user_id') created or joined (participants).
+-- owned_or_joined says which, for the caller's authz.Authorize. The holds
+-- are read through workflow_advance_holds_held_at_idx, a table empty
+-- outside a freeze; the run, its definition and its session by primary
+-- key.
+SELECT
+    h.workflow_run_id,
+    h.session_id,
+    h.held_at,
+    s.title AS session_title,
+    d.name AS workflow_name,
+    (COALESCE(s.created_by = sqlc.arg('actor_user_id')::uuid, false)
+        OR EXISTS (
+            SELECT 1 FROM participants p
+            WHERE p.session_id = h.session_id AND p.user_id = sqlc.arg('actor_user_id')::uuid
+        ))::boolean AS owned_or_joined
+FROM workflow_advance_holds h
+JOIN sessions s ON s.id = h.session_id
+JOIN workflow_runs r ON r.id = h.workflow_run_id
+JOIN workflow_definitions d ON d.id = r.workflow_definition_id
+WHERE sqlc.arg('every_session')::boolean
+   OR COALESCE(s.created_by = sqlc.arg('actor_user_id')::uuid, false)
+   OR EXISTS (
+        SELECT 1 FROM participants p
+        WHERE p.session_id = h.session_id AND p.user_id = sqlc.arg('actor_user_id')::uuid
+   )
+ORDER BY h.held_at, h.workflow_run_id
+LIMIT sqlc.arg('max_holds');

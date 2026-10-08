@@ -651,6 +651,21 @@ const (
 	// as strong as the row-6 toggles, and restoring re-opens it, which is
 	// never a weaker decision than closing it.
 	ActionManageRepoEntitlement Action = "manage_repo_entitlement"
+
+	// -- Row 8: "the platform-wide freeze" (§40.2), named in §13.3's
+	// admin-only row of automation-enabling toggles -- admin only.
+
+	// ActionManageAutonomyFreeze gates freezing autonomy and lifting the
+	// freeze (POST /api/autonomy/freeze, POST /api/autonomy/unfreeze): one
+	// action for the pair, on ActionManageRepoEntitlement's precedent. A
+	// freeze stops every automatic action on the platform at once, so it is
+	// gated at least as strictly as every toggle it overrides (§13.3's
+	// admin row: auto-merge, sentinel auto-fix, automatic re-review), and
+	// lifting it re-arms all of them at once, which is never a weaker
+	// decision. Reading the freeze is NOT this action: the decision inbox
+	// shows every role the same banner, so GET /api/autonomy is gated by
+	// ActionViewSessions.
+	ActionManageAutonomyFreeze Action = "manage_autonomy_freeze"
 )
 
 // AllActions is every recognized Action, in this file's own declaration
@@ -706,4 +721,5 @@ var AllActions = []Action{
 	ActionViewShadowLedger,
 	ActionActivateShadowLedger,
 	ActionManageRepoEntitlement,
+	ActionManageAutonomyFreeze,
 }

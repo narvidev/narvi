@@ -273,6 +273,11 @@ var matrix = map[Action]actionRule{
 	// restoring it, and reading its status -- admin only, no own/joined
 	// carve-out (a repository is not a session anyone owns).
 	ActionManageRepoEntitlement: {allow: roles(RoleAdmin)},
+
+	// Row 8 (§13.3's admin row, §40.2): freezing autonomy platform-wide and
+	// lifting the freeze -- admin only, no own/joined carve-out (the
+	// platform is not a session anyone owns).
+	ActionManageAutonomyFreeze: {allow: roles(RoleAdmin)},
 }
 
 // Authorize renders the §13.3 verdict for actor attempting action against
