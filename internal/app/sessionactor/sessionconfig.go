@@ -266,8 +266,7 @@ func pullRequestRef(prSession *sqlcgen.GithubPrSession, repo sessionconfig.Sessi
 	if prSession == nil {
 		return nil
 	}
-	owner, name, err := reposource.ParseOwnerRepo(repo.Url)
-	if err != nil || !strings.EqualFold(owner+"/"+name, prSession.RepoFullName) {
+	if !reposource.URLNamesRepository(repo.Url, prSession.RepoFullName) {
 		return nil
 	}
 	ref := reposource.PullHeadRef(prSession.PrNumber)

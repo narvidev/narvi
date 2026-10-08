@@ -14,13 +14,14 @@ import (
 )
 
 type fakePRSessions struct {
+	claim string
 	err   error
 	calls int
 }
 
 func (f *fakePRSessions) GetBySessionID(_ context.Context, _ pgtype.UUID) (sqlcgen.GithubPrSession, error) {
 	f.calls++
-	return sqlcgen.GithubPrSession{}, f.err
+	return sqlcgen.GithubPrSession{RepoFullName: f.claim}, f.err
 }
 
 // fakeLister answers like ListProviderCredentialsForResolution: every row
@@ -74,12 +75,19 @@ const (
 // every time.
 func TestLoad(t *testing.T) {
 	repos := []byte(`[{"name":"widgets","url":"https://github.com/acme/widgets","branch":null},{"name":"bad","url":"not a url","branch":null},{"name":"gears","url":"https://github.com/acme/gears","branch":null}]`)
+	baseBranchRepos := []byte(`[{"name":"widgets","url":"https://github.com/acme/widgets","branch":"feature-x"},{"name":"bad","url":"not a url","branch":null},{"name":"gears","url":"https://github.com/acme/gears","branch":null}]`)
+	legacyForkRepos := []byte(`[{"name":"widgets","url":"https://github.com/contributor/widgets","branch":"main"},{"name":"bad","url":"not a url","branch":null},{"name":"gears","url":"https://github.com/acme/gears","branch":null}]`)
+	allRepos := []string{"acme/widgets", "acme/gears"}
 	tests := []struct {
 		name       string
 		session    sqlcgen.Session
+		claim      string
 		prErr      error
 		wantOrigin providercredential.SessionOrigin
 		wantUser   bool
+		// noRepos: the repository scope is not resolved at all;
+		// otherwise it is allRepos.
+		noRepos bool
 	}{
 		{
 			name:       "web session its owner created",
@@ -89,10 +97,28 @@ func TestLoad(t *testing.T) {
 			wantUser:   true,
 		},
 		{
-			name:       "review session",
-			session:    sqlcgen.Session{CreatedBy: uuidFrom(t, creatorID), Repos: repos, SpawnSource: sqlcgen.SessionSpawnSourceGithub},
-			prErr:      nil,
+			name:       "review session of a pull request from a branch of its base repository",
+			session:    sqlcgen.Session{CreatedBy: uuidFrom(t, creatorID), Repos: baseBranchRepos, SpawnSource: sqlcgen.SessionSpawnSourceGithub},
+			claim:      "acme/widgets",
 			wantOrigin: providercredential.SessionOrigin{CreatedBy: creatorID, PullRequestReview: true},
+		},
+		{
+			// The spec names the base with no branch: a fork's pull
+			// request, a deleted fork's, or a head not read. Its sandbox
+			// runs the pull request's head, so the base repository's
+			// repository-scoped credentials are not resolved.
+			name:       "review session whose head is not known to be in its base repository",
+			session:    sqlcgen.Session{CreatedBy: uuidFrom(t, creatorID), Repos: repos, SpawnSource: sqlcgen.SessionSpawnSourceGithub},
+			claim:      "acme/widgets",
+			wantOrigin: providercredential.SessionOrigin{CreatedBy: creatorID, PullRequestReview: true},
+			noRepos:    true,
+		},
+		{
+			name:       "legacy review session still naming the fork, with the fork's branch",
+			session:    sqlcgen.Session{CreatedBy: uuidFrom(t, creatorID), Repos: legacyForkRepos, SpawnSource: sqlcgen.SessionSpawnSourceGithub},
+			claim:      "acme/widgets",
+			wantOrigin: providercredential.SessionOrigin{CreatedBy: creatorID, PullRequestReview: true},
+			noRepos:    true,
 		},
 		{
 			name:       "automation session",
@@ -116,7 +142,7 @@ func TestLoad(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			prSessions := &fakePRSessions{err: tc.prErr}
+			prSessions := &fakePRSessions{claim: tc.claim, err: tc.prErr}
 			scope, err := Load(context.Background(), prSessions, tc.session)
 			if err != nil {
 				t.Fatalf("Load: %v", err)
@@ -127,8 +153,11 @@ func TestLoad(t *testing.T) {
 			if scope.Origin != tc.wantOrigin {
 				t.Errorf("Origin = %+v, want %+v", scope.Origin, tc.wantOrigin)
 			}
-			if want := []string{"acme/widgets", "acme/gears"}; !reflect.DeepEqual(scope.RepoFullNames, want) {
-				t.Errorf("RepoFullNames = %v, want %v (unparseable skipped, order kept)", scope.RepoFullNames, want)
+			switch {
+			case tc.noRepos && len(scope.RepoFullNames) != 0:
+				t.Errorf("RepoFullNames = %v, want none: the review session's head is not known to be in its base repository", scope.RepoFullNames)
+			case !tc.noRepos && !reflect.DeepEqual(scope.RepoFullNames, allRepos):
+				t.Errorf("RepoFullNames = %v, want %v (unparseable skipped, order kept)", scope.RepoFullNames, allRepos)
 			}
 			id := scope.UserID()
 			switch {

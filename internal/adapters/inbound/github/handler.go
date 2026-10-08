@@ -367,19 +367,26 @@ type Config struct {
 // (sessionactor's pullRequestRef), the sandbox fetches the head from there
 // with the base repository's own installation token, and every reader that
 // resolves a repository from the spec -- the credential mint, the outbox's
-// egress mode, the rollout and entitlement re-checks, the provider-
-// credential scope -- resolves the base repository the claim names.
+// egress mode, the rollout and entitlement re-checks -- resolves the base
+// repository the claim names.
 //
 // The branch is the pull request's head branch only when that branch lives
 // in the base repository (the head repository's full name is the base's,
 // compared without regard to case, as GitHub compares names). A fork's
 // head branch is not a branch of the base repository -- a fork opened from
-// its own "main" would name the base's "main" -- and the spec's readers
-// that act on its branch act on the spec's repository: the sentinel
-// auto-fix cuts its fix branch from it and apply-suggestion commits to it.
-// So a pull request from a fork, one whose head repository was deleted, and
-// one whose head repository is not known (an issue_comment mention whose
-// head lookup failed) carry no branch.
+// its own "main" would name the base's "main". So a pull request from a
+// fork, one whose head repository was deleted, and one whose head
+// repository is not known (an issue_comment mention whose head lookup
+// failed) carry no branch, and the branch is what tells the readers that
+// must not treat such a head as the base's own: reposource.
+// ReviewHeadInBaseRepository is true only for a spec naming the claim's
+// repository with a branch. The sandbox secrets delivery then hands the
+// session no secret, the provider-credential scope resolves none of the
+// base repository's repository-scoped credentials -- the head's setup.sh,
+// start.sh and the tools the agent runs over it are code a person outside
+// the base repository may have written -- and apply-suggestion and the
+// sentinel auto-fix, which act on the base repository at the spec's
+// branch, refuse it.
 func reviewSessionRepo(m mention) restdtos.CreateSessionRequestReposElem {
 	repo := restdtos.CreateSessionRequestReposElem{Name: m.RepoName, Url: m.RepoCloneURL}
 	if m.HeadBranch != nil && m.HeadRepoFullName != "" && strings.EqualFold(m.HeadRepoFullName, m.RepoFullName) {
