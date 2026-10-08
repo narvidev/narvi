@@ -10,6 +10,63 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.26.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `AutonomyFreeze` (`frozen`, and `frozenAt`, `frozenByUserId`,
+  `frozenByDisplayName`, `reason`, each null when autonomy is not
+  frozen; every field required, `additionalProperties: false`), the body
+  of the three autonomy routes below and of
+  `ListDecisionInboxResponse.autonomyFreeze`: whether autonomy is frozen
+  platform-wide, and since when, by whom and why (technical plan §40.2).
+  While frozen no automatic action starts, and each waits, consuming
+  nothing, until the freeze is lifted. A new `$def` grades MINOR
+  (row 32).
+- Added: `FreezeAutonomyRequest` (`reason`, required, `minLength` 1), the
+  freeze route's request body. The reason is trimmed, must be 1 to 500
+  characters and must hold no NUL character; as for
+  `RevokeRepoEntitlementRequest`, the 500-character cap is the handler's
+  (a 400) and the table's (a CHECK), stated in the `description`. A new
+  `$def` grades MINOR (row 32).
+- Added: `DecisionInboxHeldWorkflowAdvance` (`workflowRunId`, `sessionId`,
+  `sessionTitle`, nullable, `workflowName`, `heldAt`; every field
+  required, `additionalProperties: false`): one workflow run whose
+  automatic advance the freeze holds (§40.2, §25.9). A new `$def` grades
+  MINOR (row 32).
+- Added: required `ListDecisionInboxResponse.autonomyFreeze`
+  (`AutonomyFreeze`), required boolean
+  `ListDecisionInboxResponse.autonomyFreezeUnread` -- true when the
+  freeze could not be read for the load, so a client never renders a
+  failed read as "not frozen" -- and required
+  `ListDecisionInboxResponse.heldWorkflowAdvances`, an array of
+  `DecisionInboxHeldWorkflowAdvance`: the held advances on sessions the
+  caller may decide workflow steps on, oldest first, at most 100. Every
+  role reads the same freeze. Platform-to-client only: no `*Request` root
+  reaches this def. Each required property added grades MINOR on the
+  platform-to-client side (row 3).
+- Added: required boolean `DecisionInboxItem.heldByFreeze`: true on a
+  `ready_to_merge` row whose repository has auto-merge armed while
+  autonomy is frozen -- the merge the worker would make is held; a
+  person's Merge click still works. False on every other row.
+  Platform-to-client only, reached only through
+  `ListDecisionInboxResponse.items`. A required property added grades
+  MINOR on the platform-to-client side (row 3).
+- Unchanged: no existing property, no enum.
+
+### controlplane/testdata/routes.golden
+
+- Added: `GET /api/autonomy`, `POST /api/autonomy/freeze` and
+  `POST /api/autonomy/unfreeze` -- every signed-in role reads the freeze
+  (`authz.ActionViewSessions`); an administrator freezes autonomy with a
+  reason and lifts the freeze (`authz.ActionManageAutonomyFreeze`, admin
+  only, §13.3), each change audited as `autonomy.frozen` or
+  `autonomy.unfrozen` in its own transaction. All three answer
+  `AutonomyFreeze`. Freeze answers `400` for a blank or over-long reason,
+  or one holding a NUL character, and `409` "autonomy is already frozen",
+  keeping the first freeze; unfreeze takes no body and answers `409`
+  "autonomy is not frozen". Three routes added grade MINOR (row 41).
+
 ## [1.25.0]
 
 ### sandbox-ws/v1/events.schema.json

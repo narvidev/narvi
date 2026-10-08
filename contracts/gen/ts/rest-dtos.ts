@@ -2445,6 +2445,10 @@ export interface DecisionInboxItem {
    * Matches internal/domain/decisioninbox.Kind's own four values exactly (§16.1). needs_attention is only ever present for an admin caller (§16.1's own parenthetical) -- enforced server-side, never a client-side filter.
    */
   kind: 'ready_to_merge' | 'needs_review' | 'awaiting_approval' | 'needs_attention';
+  /**
+   * Technical plan §40.2: true on a ready_to_merge row whose repository has auto-merge armed while autonomy is frozen (ListDecisionInboxResponse.autonomyFreeze) -- the auto-merge worker would merge it, and the freeze holds that merge. The row stays listed and a person's own Merge click still works: the freeze never holds a person. False on every other row, and on every row when autonomy is not frozen or the freeze could not be read.
+   */
+  heldByFreeze: boolean;
   title: string;
   /**
    * When this row first became a pending decision -- the ranking (§16.1: 'by decision cost then age') and staleness reference point. For a PR row this is an APPROXIMATION (the PR's own GitHub creation time, not the instant it became assigned/eligible for this specific user) -- see internal/app/decisioninbox.Item.EnteredQueueAt's own doc comment for why, and for the direction this approximation errs in (it can only ever UNDER-state how recently a PR became a decision, so `stale` below can over-fire on an old-but-recently-assigned PR).
@@ -2610,6 +2614,15 @@ export interface ListDecisionInboxResponse {
    * Already ranked server-side (§16.1: decision cost then age) -- a client renders this order as-is, never re-sorts.
    */
   items: DecisionInboxItem[];
+  autonomyFreeze: AutonomyFreeze;
+  /**
+   * autonomyFreeze is the autonomy freeze as this load read it (technical plan §40.2), once and never cached, the same for every role: while frozen, a client shows one banner naming when, by whom and why, and that nothing automatic starts while a person's own actions still work. This field is true when the freeze could not be read for this load: autonomyFreeze then reads not frozen only because nothing could be read, and a client must say the freeze state is unknown, never render it as 'not frozen'. Every automatic action reads the freeze itself and treats a failed read as frozen, so an unread state here never means automatic actions run unchecked.
+   */
+  autonomyFreezeUnread: boolean;
+  /**
+   * The workflow runs whose automatic advance the autonomy freeze holds (technical plan §40.2, §25.9), oldest first, at most 100: those on sessions the caller may decide workflow steps on (authz.ActionDecideWorkflowStep -- an administrator or maintainer sees every one, a member those on sessions they created or joined, a viewer none). Empty outside a freeze, and once the freeze lifts and each advance is applied. Best-effort: a read that fails lists none, logged server-side.
+   */
+  heldWorkflowAdvances: DecisionInboxHeldWorkflowAdvance[];
   /**
    * When the PR-derived rows (ready_to_merge/needs_review) were actually fetched from GitHub (§16.2: 'the response carries its as-of timestamp... never presented as live truth') -- null iff the caller has no linked GitHub identity, so no SCM read was attempted AT ALL. Distinct from scmFetchFailed below: scmAsOf==null alone used to be the ONLY signal here, which meant a GitHub outage or a revoked token (a read that WAS attempted and failed) was indistinguishable from never having linked GitHub in the first place -- a contract-abiding client would render 'no GitHub linked' for what was actually a transient failure. goJSONSchema forces the literal *time.Time type -- see Plan.decidedAt's own doc comment for why a named pointer-type wrapper silently breaks encoding/json here.
    */
@@ -2631,6 +2644,59 @@ export interface ListDecisionInboxResponse {
    */
   decisionLatencySampleSize: number;
   decisionLatencyComputed: boolean;
+}
+/**
+ * GET /api/autonomy response body, the body POST /api/autonomy/freeze and POST /api/autonomy/unfreeze return on success, and ListDecisionInboxResponse.autonomyFreeze (technical plan §40.2): whether autonomy is frozen platform-wide. While frozen, no automatic action starts -- no auto-merge, no sentinel-fix merge, no sentinel auto-fix, no description rewrite, no automatic re-review, no automation run and no workflow advance -- and each waits, consuming nothing, until an administrator lifts the freeze; a person's own commands are never held, and a turn already running finishes. Readable by every signed-in role (authz.ActionViewSessions); freezing and unfreezing are admin only (authz.ActionManageAutonomyFreeze, §13.3). Every field is present; the four describing the freeze are null when autonomy is not frozen.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "AutonomyFreeze".
+ */
+export interface AutonomyFreeze {
+  /**
+   * True while a freeze is in force: no automatic action starts on any replica.
+   */
+  frozen: boolean;
+  /**
+   * When the freeze in force was set. Null when not frozen.
+   */
+  frozenAt: string | null;
+  /**
+   * The administrator who set it. Null when not frozen, or once that user no longer exists.
+   */
+  frozenByUserId: string | null;
+  /**
+   * That administrator's display name. Null when not frozen, or once that user no longer exists.
+   */
+  frozenByDisplayName: string | null;
+  /**
+   * Why autonomy was frozen, as the administrator wrote it (1 to 500 characters). Null when not frozen.
+   */
+  reason: string | null;
+}
+/**
+ * One workflow run whose automatic advance to its next step the autonomy freeze holds (technical plan §40.2, §25.9; ListDecisionInboxResponse.heldWorkflowAdvances): the step's attempt finished and its outcome is stored, the run is still running with no live attempt, and its next attempt starts once the freeze lifts -- exactly once. A person's stop of the session drops the hold and cancels the run instead.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "DecisionInboxHeldWorkflowAdvance".
+ */
+export interface DecisionInboxHeldWorkflowAdvance {
+  workflowRunId: string;
+  /**
+   * The run's session, where the next attempt runs once the freeze lifts.
+   */
+  sessionId: string;
+  /**
+   * The session's title. Null when the session has none.
+   */
+  sessionTitle: string | null;
+  /**
+   * The name of the workflow definition the run follows.
+   */
+  workflowName: string;
+  /**
+   * When the advance was held: the end of the step's turn.
+   */
+  heldAt: string;
 }
 /**
  * POST /api/decision-inbox/merge's own request body (§16.2's own Merge endpoint, mockups.html decision 33: 'Auto-approved still means human-merged... re-validates CI, approval state, and RBAC server-side at click time').
@@ -4039,6 +4105,18 @@ export interface RepoEntitlement {
 export interface RevokeRepoEntitlementRequest {
   /**
    * Why new sessions on this repository are revoked: 1 to 500 characters after trimming, kept with the revocation and in the audit log.
+   */
+  reason: string;
+}
+/**
+ * POST /api/autonomy/freeze's request body (technical plan §40.2). reason is trimmed and must be 1 to 500 characters: blank is refused 400 "reason is required", longer is refused 400 "reason must be at most 500 characters", and one holding a NUL character is refused 400 "reason must not contain a NUL byte". Autonomy already frozen is refused 409 "autonomy is already frozen" and keeps the first freeze's who, when and why.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "FreezeAutonomyRequest".
+ */
+export interface FreezeAutonomyRequest {
+  /**
+   * Why autonomy is frozen: 1 to 500 characters after trimming, kept with the freeze, shown on every role's decision inbox while it holds, and written to the audit log.
    */
   reason: string;
 }

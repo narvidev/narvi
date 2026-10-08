@@ -981,6 +981,7 @@ func TestListDecisionInboxResponseRoundTrip(t *testing.T) {
 		median := 11520.0 // 3.2h in seconds
 		roundTrip(t, sch, restdtos.ListDecisionInboxResponse{
 			Items:                        []restdtos.DecisionInboxItem{},
+			HeldWorkflowAdvances:         []restdtos.DecisionInboxHeldWorkflowAdvance{},
 			ScmAsOf:                      &scmAsOf,
 			ScmFetchFailed:               false,
 			DecisionLatencyMedianSeconds: &median,
@@ -996,6 +997,7 @@ func TestListDecisionInboxResponseRoundTrip(t *testing.T) {
 		scmAsOf := time.Date(2026, 9, 30, 12, 0, 0, 0, time.UTC)
 		roundTrip(t, sch, restdtos.ListDecisionInboxResponse{
 			Items:                        []restdtos.DecisionInboxItem{},
+			HeldWorkflowAdvances:         []restdtos.DecisionInboxHeldWorkflowAdvance{},
 			ScmAsOf:                      &scmAsOf,
 			ScmFetchFailed:               false,
 			RequiredChecksNotRead:        true,
@@ -1008,6 +1010,7 @@ func TestListDecisionInboxResponseRoundTrip(t *testing.T) {
 	t.Run("NoGitHubIdentityNoDecisionsYet", func(t *testing.T) {
 		roundTrip(t, sch, restdtos.ListDecisionInboxResponse{
 			Items:                        []restdtos.DecisionInboxItem{},
+			HeldWorkflowAdvances:         []restdtos.DecisionInboxHeldWorkflowAdvance{},
 			ScmAsOf:                      nil,
 			ScmFetchFailed:               false,
 			DecisionLatencyMedianSeconds: nil,
@@ -1025,6 +1028,7 @@ func TestListDecisionInboxResponseRoundTrip(t *testing.T) {
 	t.Run("GitHubLinkedButFetchFailed", func(t *testing.T) {
 		roundTrip(t, sch, restdtos.ListDecisionInboxResponse{
 			Items:                        []restdtos.DecisionInboxItem{},
+			HeldWorkflowAdvances:         []restdtos.DecisionInboxHeldWorkflowAdvance{},
 			ScmAsOf:                      nil,
 			ScmFetchFailed:               true,
 			DecisionLatencyMedianSeconds: nil,
@@ -1049,6 +1053,7 @@ func TestListDecisionInboxResponseRoundTrip(t *testing.T) {
 		scmAsOf := time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC)
 		roundTrip(t, sch, restdtos.ListDecisionInboxResponse{
 			Items:                        []restdtos.DecisionInboxItem{},
+			HeldWorkflowAdvances:         []restdtos.DecisionInboxHeldWorkflowAdvance{},
 			ScmAsOf:                      &scmAsOf,
 			ScmFetchFailed:               true,
 			DecisionLatencyMedianSeconds: nil,
@@ -1056,6 +1061,74 @@ func TestListDecisionInboxResponseRoundTrip(t *testing.T) {
 			DecisionLatencyComputed:      false,
 		})
 	})
+
+	// Frozen (technical plan §40.2): the freeze every role's banner shows,
+	// and one workflow advance it holds.
+	t.Run("Frozen", func(t *testing.T) {
+		frozenAt := time.Date(2026, 10, 7, 9, 30, 0, 0, time.UTC)
+		heldAt := time.Date(2026, 10, 7, 9, 45, 0, 0, time.UTC)
+		by, name, reason := "7d1f2a3b-4c5d-4e6f-8a7b-9c0d1e2f3a4b", "Ada Admin", "an incident: hold every automatic action"
+		roundTrip(t, sch, restdtos.ListDecisionInboxResponse{
+			Items: []restdtos.DecisionInboxItem{},
+			AutonomyFreeze: restdtos.AutonomyFreeze{
+				Frozen: true, FrozenAt: &frozenAt, FrozenByUserId: &by, FrozenByDisplayName: &name, Reason: &reason,
+			},
+			HeldWorkflowAdvances: []restdtos.DecisionInboxHeldWorkflowAdvance{{
+				WorkflowRunId: "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d", SessionId: "2b3c4d5e-6f7a-4b8c-9d0e-1f2a3b4c5d6e",
+				SessionTitle: nil, WorkflowName: "review then fix", HeldAt: heldAt,
+			}},
+			DecisionLatencyMedianSeconds: nil,
+		})
+	})
+
+	// FreezeUnread: the freeze could not be read, so autonomyFreeze reads
+	// not frozen only for want of a read -- the flag tells a client so.
+	t.Run("FreezeUnread", func(t *testing.T) {
+		roundTrip(t, sch, restdtos.ListDecisionInboxResponse{
+			Items:                []restdtos.DecisionInboxItem{},
+			AutonomyFreezeUnread: true,
+			HeldWorkflowAdvances: []restdtos.DecisionInboxHeldWorkflowAdvance{},
+		})
+	})
+}
+
+// TestAutonomyFreezeRoundTrip (technical plan §40.2): the body of the three
+// autonomy routes, frozen with its who, when and why, and not frozen with
+// all four null.
+func TestAutonomyFreezeRoundTrip(t *testing.T) {
+	sch := compileSchema(t, restDTOsSchemaPath, "#/$defs/AutonomyFreeze")
+
+	t.Run("Frozen", func(t *testing.T) {
+		frozenAt := time.Date(2026, 10, 7, 9, 30, 0, 0, time.UTC)
+		by, name, reason := "7d1f2a3b-4c5d-4e6f-8a7b-9c0d1e2f3a4b", "Ada Admin", "an incident: hold every automatic action"
+		roundTrip(t, sch, restdtos.AutonomyFreeze{Frozen: true, FrozenAt: &frozenAt, FrozenByUserId: &by, FrozenByDisplayName: &name, Reason: &reason})
+	})
+	t.Run("FrozenByADeletedUser", func(t *testing.T) {
+		frozenAt := time.Date(2026, 10, 7, 9, 30, 0, 0, time.UTC)
+		reason := "an incident"
+		roundTrip(t, sch, restdtos.AutonomyFreeze{Frozen: true, FrozenAt: &frozenAt, Reason: &reason})
+	})
+	t.Run("NotFrozen", func(t *testing.T) {
+		roundTrip(t, sch, restdtos.AutonomyFreeze{})
+	})
+	t.Run("EveryFieldRequired", func(t *testing.T) {
+		if err := validateJSON(t, sch, []byte(`{"frozen":false}`)); err == nil {
+			t.Fatal("a body naming only frozen validated, want the four freeze fields required")
+		}
+	})
+}
+
+// TestFreezeAutonomyRequestRoundTrip: the freeze route's body; an empty
+// reason is refused by the schema itself (minLength 1).
+func TestFreezeAutonomyRequestRoundTrip(t *testing.T) {
+	sch := compileSchema(t, restDTOsSchemaPath, "#/$defs/FreezeAutonomyRequest")
+
+	roundTrip(t, sch, restdtos.FreezeAutonomyRequest{Reason: "an incident: hold every automatic action"})
+	for _, body := range []string{`{}`, `{"reason":""}`, `{"reason":"x","extra":1}`} {
+		if err := validateJSON(t, sch, []byte(body)); err == nil {
+			t.Errorf("%s validated, want it refused", body)
+		}
+	}
 }
 
 func TestMergePullRequestRequestRoundTrip(t *testing.T) {
