@@ -1816,6 +1816,90 @@ func TestHandleEnsureDispatched_HealthySpawning_WithinStuckTimeout_NoChange(t *t
 	}
 }
 
+// TestHandleEnsureDispatched_PendingTurnWhileSnapshotting_HeldNoErrorNoBackoff
+// pins the spawn decision's snapshotting row through the real evaluation
+// (technical plan §35.3; §3.3's "complete turn -> trigger snapshot -> ...
+// -> dispatch next"): a turn queued behind a post-turn snapshot, on a
+// sandbox spawned longer ago than SpawnCooldown -- in production, every
+// one -- is held, not failed. The evaluation commits, deleting the
+// dispatch timer, and spawns, sends and moves nothing; the snapshot's own
+// snapshot_ready then returns the sandbox to Ready and the same gen takes
+// the turn. Before the row, the decision fell through to Spawn, which
+// planFreshSpawn refused (no spawn edge out of snapshotting): the
+// evaluation rolled back and the dispatch timer was backed off, on every
+// evaluation until the snapshot ended.
+func TestHandleEnsureDispatched_PendingTurnWhileSnapshotting_HeldNoErrorNoBackoff(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+
+	// Gen 1, mid post-turn snapshot, spawned and last seen an hour ago:
+	// past SpawnCooldown, SpawnReadyWait and SpawnStuckTimeout alike.
+	seedReadySandbox(ctx, t, pool, sessionID)
+	const snapshotCommandID = "snapshot-command-1"
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'snapshotting', pending_snapshot_message_id = $2,
+		created_at = now() - interval '1 hour', last_seen_at = now() - interval '1 hour' WHERE session_id = $1`,
+		sessionID, snapshotCommandID); err != nil {
+		t.Fatalf("seed the snapshotting sandbox: %v", err)
+	}
+	queued := createTurnArmingDispatch(ctx, t, pool, sessionID, "the turn queued behind the snapshot")
+
+	commander := &fakeSendCommander{}
+	provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "provider-object-should-never-be-used"}}
+	r := newDispatchTestRegistry(t, ctx, pool, provider, commander)
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	sendEnsureDispatched(ctx, t, a)
+
+	// The evaluation either commits, deleting the dispatch timer, or fails,
+	// rolls back and backs the timer off past now: wait for either.
+	waitUntil(t, 5*time.Second, func() bool {
+		row, ok := dispatchTimer(ctx, t, pool, sessionID)
+		return !ok || row.FiresAt.Time.After(time.Now())
+	})
+	if row, ok := dispatchTimer(ctx, t, pool, sessionID); ok {
+		t.Fatalf("dispatch timer still armed, due %v: the evaluation failed and backed off instead of holding the turn", row.FiresAt.Time)
+	}
+	if n := provider.callCount() + provider.restoreCallCount() + provider.resumeCallCount(); n != 0 {
+		t.Errorf("provider called %d times, want none: a snapshotting sandbox is neither respawned nor replaced", n)
+	}
+	if n := commander.callCount(); n != 0 {
+		t.Errorf("SendCommand called %d times, want none while the snapshot is in progress", n)
+	}
+	sandboxRow, err := narvipg.NewSandboxStore(pool).Get(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if sandboxRow.Status != sqlcgen.SandboxStatusSnapshotting || sandboxRow.Gen != 1 {
+		t.Errorf("sandbox = %s at gen %d, want snapshotting at gen 1, untouched", sandboxRow.Status, sandboxRow.Gen)
+	}
+	turnStore := narvipg.NewTurnStore(pool)
+	if got, err := turnStore.Get(ctx, queued.ID); err != nil || got.Status != sqlcgen.TurnStatusPending {
+		t.Fatalf("queued turn = %v (err %v), want it still pending", got.Status, err)
+	}
+
+	// The snapshot's own report ends the hold: the turn goes to the same gen.
+	outcome := sendSandboxEvent(ctx, t, a, SandboxEvent{Type: "snapshot_ready", Gen: 1, Raw: json.RawMessage(
+		`{"type":"snapshot_ready","messageId":"sr-1","sessionId":"s","gen":1,"ackId":"snapshot_ready:sr-1","snapshotId":"snap-1","commandMessageId":"` + snapshotCommandID + `"}`)})
+	if !outcome.Persisted {
+		t.Fatal("snapshot_ready: Persisted = false, want true")
+	}
+	waitUntil(t, 5*time.Second, func() bool { return promptCount(commander) == 1 })
+	got, err := turnStore.Get(ctx, queued.ID)
+	if err != nil {
+		t.Fatalf("get turn: %v", err)
+	}
+	if got.Status != sqlcgen.TurnStatusProcessing || got.DispatchedSandboxGen == nil || *got.DispatchedSandboxGen != 1 {
+		t.Errorf("queued turn = %s on gen %v, want processing on gen 1", got.Status, got.DispatchedSandboxGen)
+	}
+	if n := provider.callCount() + provider.restoreCallCount() + provider.resumeCallCount(); n != 0 {
+		t.Errorf("provider called %d times, want none", n)
+	}
+}
+
 // --- §3.2 ("resume"), §3.2/§8.7: executeResume's own decision-tree
 // coverage, mirroring this file's own existing spawn/restore-path tests
 // exactly (same rig helpers, same fakeSpawnProvider, same

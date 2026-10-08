@@ -1729,10 +1729,14 @@ func (a *Actor) planFreshSpawn(
 			"session_id", a.sessionID.String(), "from_status", string(fromState),
 			"gen", currentGen, "new_gen", newGen)
 	default:
-		// StateSuspect can never reach here: EvaluateSpawnDecision's own
-		// Suspect branch always returns Skip (no staleness carve-out), so
-		// action.Kind would already be SpawnActionSkip, not
-		// SpawnActionSpawn, and this function would have returned above.
+		// StateSuspect and StateSnapshotting can never reach here:
+		// EvaluateSpawnDecision's own Suspect and Snapshotting branches
+		// always return Skip (no staleness carve-out), so action.Kind
+		// would already be SpawnActionSkip, not SpawnActionSpawn, and this
+		// function would have returned above. (Snapshotting used to reach
+		// here, failing every evaluation of a turn queued behind a
+		// post-turn snapshot: TestHandleEnsureDispatched_
+		// PendingTurnWhileSnapshotting_HeldNoErrorNoBackoff.)
 		// Any OTHER unrecognized status reaching here means
 		// EvaluateSpawnDecision's own logic and this trigger-selection
 		// switch have drifted out of sync -- fail loudly rather than fall
