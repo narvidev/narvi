@@ -23,9 +23,11 @@ import (
 
 // holdPlanLatestVersion is the migration the hold's plan test migrates
 // to: the latest whose columns or tables the statements it measures name --
-// GetSessionActivityFacts reads workflow_advance_holds, which comes after
-// the review checkout's columns (reviewCheckoutGenMigration).
-const holdPlanLatestVersion = workflowAdvanceHoldsMigration
+// UpsertPendingRetriggerHeadSHA returns the claim's whole row, which names
+// github_pr_sessions.head_in_base (headInBaseMigration), after
+// workflow_advance_holds, which GetSessionActivityFacts reads, and the
+// review checkout's columns (reviewCheckoutGenMigration).
+const holdPlanLatestVersion = headInBaseMigration
 
 const (
 	// holdReadMaxBuffers bounds what the re-review hold's read

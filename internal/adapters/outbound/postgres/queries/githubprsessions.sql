@@ -329,3 +329,15 @@ UPDATE github_pr_sessions
 SET pr_merged = $3, pr_closed_at = $4
 WHERE repo_full_name = $1 AND pr_number = $2 AND session_id IS NOT NULL
 RETURNING *;
+
+-- name: RecordGitHubPRSessionHeadInBase :exec
+-- Technical plan §27.1, §30.4, migrations/000172: records whether the pull
+-- request's head branch is a branch of its base repository, from the
+-- mention the GitHub ingress is handling. Run inside the claim transaction,
+-- under LockGitHubPRSessionForUpdate's row lock, on every mention -- a new
+-- review session's and one joining an existing session alike -- so the
+-- latest delivery's head.repo decides: a fork's, a deleted fork's and an
+-- unread head record false, a branch of the base true.
+UPDATE github_pr_sessions
+SET head_in_base = sqlc.arg('head_in_base')::boolean
+WHERE repo_full_name = sqlc.arg('repo_full_name') AND pr_number = sqlc.arg('pr_number');

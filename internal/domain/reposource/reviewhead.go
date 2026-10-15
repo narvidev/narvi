@@ -24,20 +24,30 @@ func URLNamesRepository(rawURL, fullName string) bool {
 
 // ReviewHeadInBaseRepository reports whether a pull request's review
 // session's head is known to be a branch of the pull request's base
-// repository (technical plan §30.4): the session's primary repo, position 0
-// of sessionRepos (sessions.repos), is an https URL naming
-// claimRepoFullName, the repository the session's github_pr_sessions claim
-// names, and carries a branch.
+// repository (technical plan §27.1, §30.4). Both must hold:
 //
-// The GitHub ingress writes a branch into a review session's spec only when
-// the pull request's head repository is its base repository
-// (internal/adapters/inbound/github's reviewSessionRepo), so this is false
-// for a pull request from a fork, from a deleted fork, and one whose head
-// could not be read when the review started -- and for a legacy session
-// whose url still names the fork, whatever its branch. It fails closed:
-// sessionRepos that do not decode, an empty list, a url that is not https
-// or names no owner/name, and a claim not in owner/name shape all read
-// false.
+//   - claimHeadInBase, the session's github_pr_sessions claim's record
+//     (head_in_base, migrations/000172), is true. The GitHub ingress writes
+//     it on every mention from the delivery's head.repo: true only when the
+//     head repository is the claim's, false for a fork's, a deleted fork's
+//     and an unread head. A claim nothing has recorded yet (nil) is unknown,
+//     and reads false until the pull request's next mention records it.
+//   - the session's primary repo, position 0 of sessionRepos
+//     (sessions.repos), is an https URL naming claimRepoFullName and carries
+//     a branch -- the spec the ingress writes for a same-repository pull
+//     request, and the branch apply-suggestion and the sentinel auto-fix
+//     act on.
+//
+// The spec alone cannot decide it: a pull request whose fork was deleted
+// before its first mention got, from the ingress before the record existed,
+// the base repository's url with the deleted fork's branch name -- the
+// same-repository shape exactly. The record does. A fork's spec, a legacy
+// session's still naming the fork, and one whose head lookup failed (no
+// branch) fail the second condition whatever the record says.
+//
+// It fails closed: an unrecorded claim, sessionRepos that do not decode, an
+// empty list, a url that is not https or names no owner/name, and a claim
+// not in owner/name shape all read false.
 //
 // Whatever reads false is code a person outside the base repository may
 // have written, or a branch that is not the pull request's: the sandbox
@@ -45,7 +55,10 @@ func URLNamesRepository(rawURL, fullName string) bool {
 // repository are withheld from such a session, and apply-suggestion and the
 // sentinel auto-fix, which act on the base repository at the spec's branch,
 // refuse it.
-func ReviewHeadInBaseRepository(claimRepoFullName string, sessionRepos []byte) bool {
+func ReviewHeadInBaseRepository(claimRepoFullName string, claimHeadInBase *bool, sessionRepos []byte) bool {
+	if claimHeadInBase == nil || !*claimHeadInBase {
+		return false
+	}
 	var repos []struct {
 		URL    string  `json:"url"`
 		Branch *string `json:"branch"`

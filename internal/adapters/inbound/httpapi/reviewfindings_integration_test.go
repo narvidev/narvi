@@ -215,6 +215,12 @@ func createOwnedGitHubReviewSessionWithBranch(ctx context.Context, t *testing.T,
 	if err := r.prSessions.SetSessionID(ctx, repoFullName, prNumber, session.ID); err != nil {
 		t.Fatalf("set github_pr_sessions session id: %v", err)
 	}
+	// A spec with a branch is a pull request opened from a branch of its
+	// base repository, which the ingress records on the claim at its
+	// mention (§27.1): the head is in the base.
+	if err := r.prSessions.RecordHeadInBase(ctx, repoFullName, prNumber, true); err != nil {
+		t.Fatalf("record the head in the base: %v", err)
+	}
 	return session
 }
 

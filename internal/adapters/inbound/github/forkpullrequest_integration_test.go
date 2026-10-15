@@ -15,6 +15,7 @@ package github_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"reflect"
@@ -201,6 +202,9 @@ func TestGitHubIntegration_ForkPullRequest_ReviewSessionNamesTheBaseRepository(t
 				if err := rig.pool.QueryRow(ctx, `SELECT repo_full_name FROM github_pr_sessions WHERE session_id = $1 AND pr_number = $2`, id, prNumber).Scan(&claimed); err != nil || claimed != forkBaseFullName {
 					t.Errorf("claim = %q (%v), want the pull request on %s", claimed, err, forkBaseFullName)
 				}
+				if got, want := recordedHeadInBase(ctx, t, rig, prNumber), head.wantBranch != nil; got == nil || *got != want {
+					t.Errorf("the claim's head_in_base = %v, want %v: recorded from this delivery's head.repo", got, want)
+				}
 			})
 		}
 	}
@@ -256,5 +260,94 @@ func TestOutboxEgressMode_ForkPullRequestResolvesItsBaseRepository(t *testing.T)
 	shadow, confirmed := narvipg.NewOutboxStore(rig.pool, false).ResolveEffectiveModeConfirmed(ctx, sessionID)
 	if shadow || !confirmed {
 		t.Errorf("egress mode shadow = %v, confirmed = %v; want live, read: the session names its live base, not the fork", shadow, confirmed)
+	}
+}
+
+// recordedHeadInBase reads forkBaseFullName#prNumber's claim's record of
+// whether its head is a branch of the base; nil when nothing recorded it.
+func recordedHeadInBase(ctx context.Context, t *testing.T, rig testRig, prNumber int) *bool {
+	t.Helper()
+	var got *bool
+	if err := rig.pool.QueryRow(ctx, `SELECT head_in_base FROM github_pr_sessions WHERE repo_full_name = $1 AND pr_number = $2`, forkBaseFullName, prNumber).Scan(&got); err != nil {
+		t.Fatalf("read the claim's head_in_base: %v", err)
+	}
+	return got
+}
+
+// TestGitHubIntegration_AMentionOnAnExistingSessionRecordsWhetherTheHeadIsInTheBase:
+// the claim's record is written by every mention, a mention joining the
+// pull request's existing review session included. A claim the previous
+// ingress left unrecorded -- its session's spec possibly a deleted fork's,
+// byte for byte a same-repository spec -- is recorded by the pull request's
+// next mention, from that delivery's head.repo: in the base for a branch of
+// the base, not in the base once the head repository is gone.
+func TestGitHubIntegration_AMentionOnAnExistingSessionRecordsWhetherTheHeadIsInTheBase(t *testing.T) {
+	ctx := context.Background()
+	ev := forkCaseEvents()[1]
+	heads := forkCaseHeads()
+	sameRepo, deleted, fork := heads[2], heads[1], heads[0]
+	rig := newForkCaseRig(t, ev, sameRepo)
+	const commenterID = 91790010
+	createLinkedGitHubUser(ctx, t, rig.users, rig.identities, commenterID, sqlcgen.UserRoleMaintainer)
+	const prNumber = 1795
+	forget := func() {
+		t.Helper()
+		if _, err := rig.pool.Exec(ctx, `UPDATE github_pr_sessions SET head_in_base = NULL WHERE repo_full_name = $1 AND pr_number = $2`, forkBaseFullName, prNumber); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	for i, step := range []struct {
+		name string
+		head forkCaseHead
+		// forgetFirst: the claim reads as the previous ingress left it.
+		forgetFirst bool
+		want        bool
+	}{
+		{name: "the first mention, opening the session", head: sameRepo, want: true},
+		{name: "a mention on the existing session, the claim unrecorded", head: sameRepo, forgetFirst: true, want: true},
+		{name: "a mention on the existing session once its head repository is gone", head: deleted, forgetFirst: true, want: false},
+		{name: "a mention on the existing session naming a fork's head", head: fork, want: false},
+		{name: "a mention on the existing session naming a branch of the base again", head: sameRepo, want: true},
+	} {
+		if step.forgetFirst {
+			forget()
+		}
+		if status := postWebhookEventType(t, rig, ev.body(step.head, prNumber, commenterID), fmt.Sprintf("delivery-reuse-record-%d", i), ev.eventType); status != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200", step.name, status)
+		}
+		if got := recordedHeadInBase(ctx, t, rig, prNumber); got == nil || *got != step.want {
+			t.Errorf("%s: the claim's head_in_base = %v, want %v", step.name, got, step.want)
+		}
+	}
+	if n := countRows(ctx, t, rig, `SELECT count(*) FROM sessions WHERE spawn_source = 'github'`); n != 1 {
+		t.Fatalf("sessions = %d, want the one every mention joined", n)
+	}
+	if n := countRows(ctx, t, rig, `SELECT count(*) FROM turns`); n != 5 {
+		t.Errorf("turns = %d, want 5: each mention joined the session", n)
+	}
+}
+
+// TestGitHubIntegration_AFailedHeadLookupRecordsTheHeadNotInTheBase: an
+// issue_comment mention whose pull request lookup fails has no head
+// repository to read; it records the head not in the base -- fail closed.
+// The pull request's next mention records it again, as
+// TestGitHubIntegration_AMentionOnAnExistingSessionRecordsWhetherTheHeadIsInTheBase
+// pins for a mention joining an existing session.
+func TestGitHubIntegration_AFailedHeadLookupRecordsTheHeadNotInTheBase(t *testing.T) {
+	ctx := context.Background()
+	rig := newTestRig(t, func(cfg *githubingress.Config) {
+		cfg.PullRequests = &fakePullRequestResolver{err: errors.New("simulated GitHub API outage")}
+		cfg.Timeouts = platform.DefaultTimeouts()
+	})
+	const commenterID = 91790011
+	createLinkedGitHubUser(ctx, t, rig.users, rig.identities, commenterID, sqlcgen.UserRoleMaintainer)
+	const prNumber = 1796
+	body := issueCommentBodyWithCommenter(forkBaseFullName, forkBaseName, forkBaseCloneURL, prNumber, "failed-lookup", commenterID, "fork-reviewer")
+	if status := postWebhook(t, rig, body, "delivery-failed-lookup-record"); status != http.StatusOK {
+		t.Fatalf("status = %d, want 200", status)
+	}
+	if got := recordedHeadInBase(ctx, t, rig, prNumber); got == nil || *got {
+		t.Errorf("the claim's head_in_base = %v, want false: a head the ingress could not read is not in the base", got)
 	}
 }

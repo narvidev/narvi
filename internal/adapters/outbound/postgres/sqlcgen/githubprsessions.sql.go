@@ -15,7 +15,7 @@ const clearPendingRetriggerHeadSHA = `-- name: ClearPendingRetriggerHeadSHA :one
 UPDATE github_pr_sessions
 SET pending_retrigger_head_sha = NULL
 WHERE repo_full_name = $1 AND pr_number = $2 AND pending_retrigger_head_sha = $3
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha, head_in_base
 `
 
 type ClearPendingRetriggerHeadSHAParams struct {
@@ -67,6 +67,7 @@ func (q *Queries) ClearPendingRetriggerHeadSHA(ctx context.Context, arg ClearPen
 		&i.AutoRetriggerContextMoves,
 		&i.AutoRetriggerDroppedAt,
 		&i.AutoRetriggerDroppedHeadSha,
+		&i.HeadInBase,
 	)
 	return i, err
 }
@@ -78,7 +79,7 @@ SET pending_retrigger_head_sha = NULL,
     auto_retrigger_dropped_head_sha = $1::text
 WHERE repo_full_name = $2 AND pr_number = $3
   AND pending_retrigger_head_sha = $1::text
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha, head_in_base
 `
 
 type DropAutoRetriggerParams struct {
@@ -115,6 +116,7 @@ func (q *Queries) DropAutoRetrigger(ctx context.Context, arg DropAutoRetriggerPa
 		&i.AutoRetriggerContextMoves,
 		&i.AutoRetriggerDroppedAt,
 		&i.AutoRetriggerDroppedHeadSha,
+		&i.HeadInBase,
 	)
 	return i, err
 }
@@ -184,7 +186,7 @@ func (q *Queries) FirstRevokedRepoForSession(ctx context.Context, arg FirstRevok
 }
 
 const getGitHubPRSessionByRepoAndPRNumber = `-- name: GetGitHubPRSessionByRepoAndPRNumber :one
-SELECT repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha FROM github_pr_sessions
+SELECT repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha, head_in_base FROM github_pr_sessions
 WHERE repo_full_name = $1 AND pr_number = $2
 `
 
@@ -227,12 +229,13 @@ func (q *Queries) GetGitHubPRSessionByRepoAndPRNumber(ctx context.Context, arg G
 		&i.AutoRetriggerContextMoves,
 		&i.AutoRetriggerDroppedAt,
 		&i.AutoRetriggerDroppedHeadSha,
+		&i.HeadInBase,
 	)
 	return i, err
 }
 
 const getGitHubPRSessionBySessionID = `-- name: GetGitHubPRSessionBySessionID :one
-SELECT repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha FROM github_pr_sessions
+SELECT repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha, head_in_base FROM github_pr_sessions
 WHERE session_id = $1
 `
 
@@ -261,6 +264,7 @@ func (q *Queries) GetGitHubPRSessionBySessionID(ctx context.Context, sessionID p
 		&i.AutoRetriggerContextMoves,
 		&i.AutoRetriggerDroppedAt,
 		&i.AutoRetriggerDroppedHeadSha,
+		&i.HeadInBase,
 	)
 	return i, err
 }
@@ -269,7 +273,7 @@ const incrementAutoRetriggerCount = `-- name: IncrementAutoRetriggerCount :one
 UPDATE github_pr_sessions
 SET auto_retrigger_count = auto_retrigger_count + 1
 WHERE repo_full_name = $1 AND pr_number = $2
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha, head_in_base
 `
 
 type IncrementAutoRetriggerCountParams struct {
@@ -301,6 +305,7 @@ func (q *Queries) IncrementAutoRetriggerCount(ctx context.Context, arg Increment
 		&i.AutoRetriggerContextMoves,
 		&i.AutoRetriggerDroppedAt,
 		&i.AutoRetriggerDroppedHeadSha,
+		&i.HeadInBase,
 	)
 	return i, err
 }
@@ -309,7 +314,7 @@ const incrementGitHubPRSessionMentionCount = `-- name: IncrementGitHubPRSessionM
 UPDATE github_pr_sessions
 SET mention_count = mention_count + 1
 WHERE repo_full_name = $1 AND pr_number = $2
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha, head_in_base
 `
 
 type IncrementGitHubPRSessionMentionCountParams struct {
@@ -355,6 +360,7 @@ func (q *Queries) IncrementGitHubPRSessionMentionCount(ctx context.Context, arg 
 		&i.AutoRetriggerContextMoves,
 		&i.AutoRetriggerDroppedAt,
 		&i.AutoRetriggerDroppedHeadSha,
+		&i.HeadInBase,
 	)
 	return i, err
 }
@@ -388,7 +394,7 @@ const markAutoRetriggerBudgetNoticeSent = `-- name: MarkAutoRetriggerBudgetNotic
 UPDATE github_pr_sessions
 SET auto_retrigger_budget_notice_sent_at = now()
 WHERE repo_full_name = $1 AND pr_number = $2 AND auto_retrigger_budget_notice_sent_at IS NULL
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha, head_in_base
 `
 
 type MarkAutoRetriggerBudgetNoticeSentParams struct {
@@ -420,6 +426,7 @@ func (q *Queries) MarkAutoRetriggerBudgetNoticeSent(ctx context.Context, arg Mar
 		&i.AutoRetriggerContextMoves,
 		&i.AutoRetriggerDroppedAt,
 		&i.AutoRetriggerDroppedHeadSha,
+		&i.HeadInBase,
 	)
 	return i, err
 }
@@ -464,12 +471,36 @@ func (q *Queries) ReadRepoEntitlement(ctx context.Context, repoFullName string) 
 	return i, err
 }
 
+const recordGitHubPRSessionHeadInBase = `-- name: RecordGitHubPRSessionHeadInBase :exec
+UPDATE github_pr_sessions
+SET head_in_base = $1::boolean
+WHERE repo_full_name = $2 AND pr_number = $3
+`
+
+type RecordGitHubPRSessionHeadInBaseParams struct {
+	HeadInBase   bool   `json:"head_in_base"`
+	RepoFullName string `json:"repo_full_name"`
+	PrNumber     int32  `json:"pr_number"`
+}
+
+// Technical plan §27.1, §30.4, migrations/000172: records whether the pull
+// request's head branch is a branch of its base repository, from the
+// mention the GitHub ingress is handling. Run inside the claim transaction,
+// under LockGitHubPRSessionForUpdate's row lock, on every mention -- a new
+// review session's and one joining an existing session alike -- so the
+// latest delivery's head.repo decides: a fork's, a deleted fork's and an
+// unread head record false, a branch of the base true.
+func (q *Queries) RecordGitHubPRSessionHeadInBase(ctx context.Context, arg RecordGitHubPRSessionHeadInBaseParams) error {
+	_, err := q.db.Exec(ctx, recordGitHubPRSessionHeadInBase, arg.HeadInBase, arg.RepoFullName, arg.PrNumber)
+	return err
+}
+
 const recordMergeOutcome = `-- name: RecordMergeOutcome :one
 
 UPDATE github_pr_sessions
 SET pr_merged = $3, pr_closed_at = $4
 WHERE repo_full_name = $1 AND pr_number = $2 AND session_id IS NOT NULL
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha, head_in_base
 `
 
 type RecordMergeOutcomeParams struct {
@@ -523,6 +554,7 @@ func (q *Queries) RecordMergeOutcome(ctx context.Context, arg RecordMergeOutcome
 		&i.AutoRetriggerContextMoves,
 		&i.AutoRetriggerDroppedAt,
 		&i.AutoRetriggerDroppedHeadSha,
+		&i.HeadInBase,
 	)
 	return i, err
 }
@@ -532,7 +564,7 @@ UPDATE github_pr_sessions
 SET pending_retrigger_head_sha = COALESCE(pending_retrigger_head_sha, $1::text),
     auto_retrigger_context_moves = auto_retrigger_context_moves + 1
 WHERE repo_full_name = $2 AND pr_number = $3 AND session_id IS NOT NULL
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha, head_in_base
 `
 
 type RequeueAutoRetriggerParams struct {
@@ -571,6 +603,7 @@ func (q *Queries) RequeueAutoRetrigger(ctx context.Context, arg RequeueAutoRetri
 		&i.AutoRetriggerContextMoves,
 		&i.AutoRetriggerDroppedAt,
 		&i.AutoRetriggerDroppedHeadSha,
+		&i.HeadInBase,
 	)
 	return i, err
 }
@@ -626,7 +659,7 @@ SET pending_retrigger_head_sha = $3,
     auto_retrigger_dropped_at = NULL,
     auto_retrigger_dropped_head_sha = NULL
 WHERE repo_full_name = $1 AND pr_number = $2 AND session_id IS NOT NULL
-RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha
+RETURNING repo_full_name, pr_number, session_id, claimed_at, pending_retrigger_head_sha, auto_retrigger_count, auto_retrigger_budget_notice_sent_at, pr_merged, pr_closed_at, mention_count, auto_retrigger_context_moves, auto_retrigger_dropped_at, auto_retrigger_dropped_head_sha, head_in_base
 `
 
 type UpsertPendingRetriggerHeadSHAParams struct {
@@ -686,6 +719,7 @@ func (q *Queries) UpsertPendingRetriggerHeadSHA(ctx context.Context, arg UpsertP
 		&i.AutoRetriggerContextMoves,
 		&i.AutoRetriggerDroppedAt,
 		&i.AutoRetriggerDroppedHeadSha,
+		&i.HeadInBase,
 	)
 	return i, err
 }

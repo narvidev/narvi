@@ -378,8 +378,9 @@ type Config struct {
 // fork, one whose head repository was deleted, and one whose head
 // repository is not known (an issue_comment mention whose head lookup
 // failed) carry no branch, and the branch is what tells the readers that
-// must not treat such a head as the base's own: reposource.
-// ReviewHeadInBaseRepository is true only for a spec naming the claim's
+// must not treat such a head as the base's own, with the claim's record
+// (headInBaseRepository): reposource.ReviewHeadInBaseRepository is true
+// only for a claim recorded in the base and a spec naming the claim's
 // repository with a branch. The sandbox secrets delivery then hands the
 // session no secret, the provider-credential scope resolves none of the
 // base repository's repository-scoped credentials -- the head's setup.sh,
@@ -389,10 +390,24 @@ type Config struct {
 // branch, refuse it.
 func reviewSessionRepo(m mention) restdtos.CreateSessionRequestReposElem {
 	repo := restdtos.CreateSessionRequestReposElem{Name: m.RepoName, Url: m.RepoCloneURL}
-	if m.HeadBranch != nil && m.HeadRepoFullName != "" && strings.EqualFold(m.HeadRepoFullName, m.RepoFullName) {
+	if m.HeadBranch != nil && headInBaseRepository(m) {
 		repo.Branch = restdtos.CreateSessionRequestReposElemBranch(m.HeadBranch)
 	}
 	return repo
+}
+
+// headInBaseRepository reports whether m's pull request's head repository
+// is its base repository: the delivery's head.repo.full_name (or the
+// issue_comment lookup's) names m.RepoFullName, compared without regard to
+// case, as GitHub compares names. False for a fork, for a deleted fork
+// (head.repo null) and for a head the ingress could not read. Every mention
+// records it on the pull request's claim (SessionCoalescer.CreateOrJoin,
+// github_pr_sessions.head_in_base), where reposource.
+// ReviewHeadInBaseRepository reads it: the spec alone cannot tell a branch
+// of the base from a deleted fork's branch on a session the previous
+// ingress opened.
+func headInBaseRepository(m mention) bool {
+	return m.HeadRepoFullName != "" && strings.EqualFold(m.HeadRepoFullName, m.RepoFullName)
 }
 
 // NewHandler builds the POST /webhooks/github handler (controlplane/
@@ -1046,7 +1061,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		// crossing's notice, held meanwhile, is withdrawn once that reply
 		// lands -- delivered instead if it does not.
 		answerCtx := turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceGithub)
-		session, turn, isNew, err := coalescer.CreateOrJoin(answerCtx, m.RepoFullName, m.PRNumber, req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
+		session, turn, isNew, err := coalescer.CreateOrJoin(answerCtx, m.RepoFullName, m.PRNumber, headInBaseRepository(m), req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
 		if err != nil {
 			if errors.Is(err, ErrActorNotAuthorized) {
 				// ErrActorNotAuthorized fires for TWO distinct reasons

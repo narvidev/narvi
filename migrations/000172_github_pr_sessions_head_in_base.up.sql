@@ -1,0 +1,67 @@
+-- Technical plan §27.1, §30.4: whether a pull request's head branch is a
+-- branch of its base repository, recorded on the pull request's claim.
+--
+-- github_pr_sessions.head_in_base: true when the pull request's head
+-- repository is its base repository (head.repo.full_name names the
+-- claim's repository, compared without regard to case); false for a pull
+-- request from a fork, one whose head repository was deleted (head.repo
+-- null), and one whose head the ingress could not read (an issue_comment
+-- mention whose pull request lookup failed); NULL when nothing has
+-- recorded it yet. The GitHub ingress writes it on every mention it
+-- handles -- a new review session's and one joining an existing session
+-- alike -- under the claim's own row lock, from the delivery's own
+-- head.repo (internal/adapters/inbound/github's headInBaseRepository).
+--
+-- reposource.ReviewHeadInBaseRepository reads it: a review session's head
+-- counts as the base repository's own only when the record is true and
+-- the session's spec names the claim's repository with a branch. The spec
+-- alone cannot tell a branch of the base from a deleted fork's branch:
+-- the previous ingress wrote, for a pull request whose fork was already
+-- deleted, the base repository's url with the deleted fork's branch name,
+-- the exact spec a same-repository pull request gets. Whatever reads
+-- false gets no sandbox secret and none of the base repository's
+-- repository-scoped provider credentials, and apply-suggestion and the
+-- sentinel auto-fix refuse it.
+--
+-- No backfill: the fact is in the webhook delivery, not in the database.
+-- Every claim that exists when this runs reads NULL, unknown, and is
+-- treated as not in the base -- fail closed -- until the pull request's
+-- next mention records it. A same-repository pull request's review session
+-- opened before this release therefore gets no secret, no repository-scoped
+-- provider credential, no apply-suggestion and no sentinel auto-fix until
+-- someone mentions the bot on that pull request again; that mention
+-- restores them. No index: the column is read with the claim row, by the
+-- claim's existing keys.
+--
+-- # Locks
+--
+-- golang-migrate sends this file as one batch, one implicit transaction.
+-- The ADD COLUMN, nullable with no default, is a catalog change that
+-- rewrites nothing, but takes ACCESS EXCLUSIVE on github_pr_sessions until
+-- the file ends -- an instant once granted. It waits behind any open
+-- transaction that has read or written github_pr_sessions (the ingress's
+-- claim transaction, the actor's and the delivery endpoints' claim reads),
+-- and while it waits every new read and write of the table queues behind
+-- it; controlplane/migrate.go sets no lock_timeout. The file touches
+-- github_pr_sessions alone, so it holds no lock another table's waiters
+-- could need: it cannot close a cycle with a transaction that reads this
+-- table after another.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with this column present: every statement it
+-- sends names its columns (sqlc writes each SELECT * and RETURNING * out as
+-- a column list), so it neither reads nor writes it. A mention it handles
+-- during the rollout records nothing, so a claim it creates reads NULL,
+-- not in the base, until a mention this release handles. Its own readers
+-- decide from the spec alone, as they did before this release.
+--
+-- # Rolling back
+--
+-- The previous binary cannot boot on this version: golang-migrate finds no
+-- file for it. With the control plane scaled to zero, either `migrate
+-- force` the previous version, keeping the column and its values (this
+-- file, run again, keeps them), or run the down (goto the previous
+-- version), which drops the column; this release, deployed again, then
+-- reads every claim as unknown until its next mention.
+ALTER TABLE github_pr_sessions ADD COLUMN IF NOT EXISTS head_in_base BOOLEAN;

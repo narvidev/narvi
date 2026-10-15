@@ -166,6 +166,11 @@ func TestReviewVerdict_ForkPullRequestCutsNoSentinelFixBranch(t *testing.T) {
 			}
 			owner, _ := rig.createAuthenticatedUser(ctx, t)
 			session := rig.createOwnedGitHubReviewSessionWithRepos(ctx, t, owner.ID, repoFullName, 70, spec)
+			// The ingress records, at the mention, whether the head is a
+			// branch of the base (§27.1).
+			if err := rig.prSessions.RecordHeadInBase(ctx, repoFullName, 70, tc.branch != ""); err != nil {
+				t.Fatal(err)
+			}
 			createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
 			seedDispatchedTurn(ctx, t, rig, session.ID)
 			if _, err := rig.repoSettings.Upsert(ctx, repoFullName, false, true); err != nil {

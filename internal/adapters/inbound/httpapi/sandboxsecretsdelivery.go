@@ -44,15 +44,17 @@
 // A session that claims a pull request (github_pr_sessions) is delivered no
 // sandbox secret at all -- global, environment or repository-scoped --
 // unless its head is known to be a branch of the base repository
-// (reposource.ReviewHeadInBaseRepository: the primary repo names the
-// claim's repository and carries a branch; technical plan §27.1, §30.4).
+// (reposource.ReviewHeadInBaseRepository: the claim records the head in
+// the base, and the primary repo names the claim's repository and carries
+// a branch; technical plan §27.1, §30.4).
 // Its spec names the base repository for a pull request from a fork too,
 // and its sandbox boots on the pull request's head and runs that head's
 // setup.sh and start.sh with every secret delivered here in their
 // environment: code a person outside the base repository may have written.
 // So a fork's pull request, a deleted fork's, one whose head could not be
-// read when its review started, and a legacy session still naming the fork
-// get the answer a session with no secrets gets -- 200 with an empty map,
+// read at its latest mention, a legacy session still naming the fork, and
+// a claim no mention has recorded yet (unknown, so not in the base until
+// its next mention) get the answer a session with no secrets gets -- 200 with an empty map,
 // the secrets table never read, so nothing about which secrets exist leaks
 // -- logged at Info. This is the rule a CI system applies to a pull request
 // from a fork: its code runs, the repository's secrets do not reach it. A
@@ -171,7 +173,7 @@ func SandboxSecretsDelivery(
 		prSession, err := prSessions.GetBySessionID(ctx, sessionID)
 		switch {
 		case err == nil:
-			if !reposource.ReviewHeadInBaseRepository(prSession.RepoFullName, sessionRow.Repos) {
+			if !reposource.ReviewHeadInBaseRepository(prSession.RepoFullName, prSession.HeadInBase, sessionRow.Repos) {
 				logger.Info("httpapi: sandbox-secrets: delivering none: the review session's head is not known to be a branch of its base repository",
 					"repo", prSession.RepoFullName, "pr_number", prSession.PrNumber)
 				writeJSON(w, http.StatusOK, sandboxSecretsResponse{Secrets: map[string]string{}})

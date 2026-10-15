@@ -396,6 +396,10 @@ type SessionCoalescer struct {
 // avoid. Reused verbatim, never recaptured: both categories classify the
 // EXACT same raw mention text.
 //
+// headInBase is whether this delivery's pull request's head is a branch of
+// its base repository (handler.go's headInBaseRepository), recorded on the
+// claim row by both branches below (github_pr_sessions.head_in_base, §27.1).
+//
 // reviewHeadSHA is the commit
 // SHA handler.go's own reviewcontext.Fetch call just anchored req.Prompt's
 // own pre-fetched diff to (empty when that fetch failed/never ran) --
@@ -441,7 +445,7 @@ type SessionCoalescer struct {
 // reviewing agent will read, block and all, so the record of what that
 // block actually contained must be captured from the SAME resolution,
 // never recomputed here.
-func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string, prNumber int32, req restdtos.CreateSessionRequest, actor pgtype.UUID, isLabelRetrigger bool, classifyText string, reviewHeadSHA string, reviewDepth *string, triageModelID *string, triageEffort *string, triageRecordJSON []byte, knowledgeMode *string, knowledgeDecisionJSON []byte, reviewVerdictContextJSON []byte) (session sqlcgen.Session, turn sqlcgen.Turn, isNewSession bool, err error) {
+func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string, prNumber int32, headInBase bool, req restdtos.CreateSessionRequest, actor pgtype.UUID, isLabelRetrigger bool, classifyText string, reviewHeadSHA string, reviewDepth *string, triageModelID *string, triageEffort *string, triageRecordJSON []byte, knowledgeMode *string, knowledgeDecisionJSON []byte, reviewVerdictContextJSON []byte) (session sqlcgen.Session, turn sqlcgen.Turn, isNewSession bool, err error) {
 	var reviewHeadSHAPtr *string
 	if reviewHeadSHA != "" {
 		reviewHeadSHAPtr = &reviewHeadSHA
@@ -532,6 +536,21 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	existing, err := txPRSessions.LockForUpdate(ctx, repoFullName, prNumber)
 	if err != nil {
 		return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: lock claim row: %w", err)
+	}
+
+	// Technical plan §27.1, §30.4: record, under the claim's own row lock
+	// and before the two branches split, whether this pull request's head
+	// is a branch of its base repository, from this delivery's head.repo
+	// (headInBaseRepository). Every mention writes it -- a new review
+	// session's and one joining an existing session alike, the second
+	// committed with this transaction's early commit below -- so a claim
+	// the previous ingress left unrecorded (NULL, read as not in the base)
+	// is recorded by its pull request's next mention. The fact comes from
+	// GitHub's signed delivery or the bot's own lookup, never from the
+	// commenter, so a mention this function goes on to refuse records it
+	// too, when its branch commits.
+	if err := txPRSessions.RecordHeadInBase(ctx, repoFullName, prNumber, headInBase); err != nil {
+		return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: record whether the head is in the base repository: %w", err)
 	}
 
 	if existing.Valid {

@@ -54,8 +54,9 @@ type Scope struct {
 	// known to be a branch of its base repository
 	// (reposource.ReviewHeadInBaseRepository; technical plan §30.4): a
 	// pull request from a fork, a deleted fork's, one whose head could not
-	// be read when its review started, a legacy session still naming the
-	// fork. Its spec names the base repository, but its sandbox runs the
+	// be read at its latest mention, a legacy session still naming the
+	// fork, and one whose claim no mention has recorded yet (its
+	// head_in_base NULL, unknown until the next mention). Its spec names the base repository, but its sandbox runs the
 	// pull request's head -- code a person outside the base repository may
 	// have written -- and its agent runtime runs tools over it, so the
 	// base repository's repository-scoped credentials are not resolved for
@@ -87,7 +88,7 @@ func Load(ctx context.Context, prSessions PRSessionReader, sessionRow sqlcgen.Se
 		}
 		review = false
 	}
-	if review && !reposource.ReviewHeadInBaseRepository(claim.RepoFullName, sessionRow.Repos) {
+	if review && !reposource.ReviewHeadInBaseRepository(claim.RepoFullName, claim.HeadInBase, sessionRow.Repos) {
 		repoFullNames = nil
 	}
 

@@ -4,11 +4,42 @@ import "testing"
 
 // TestReviewHeadInBaseRepository pins the one rule that says a review
 // session's head is a branch of its pull request's base repository: the
-// primary repo names the claim's repository and carries a branch. Every
-// other shape -- a fork's, a deleted fork's, a failed head lookup's, a legacy
-// session still naming the fork, anything that does not parse -- is false.
+// claim records the head in the base, and the primary repo names the claim's
+// repository and carries a branch. Every other shape -- a fork's, a deleted
+// fork's, a failed head lookup's, a legacy session still naming the fork, an
+// unrecorded claim, anything that does not parse -- is false.
 func TestReviewHeadInBaseRepository(t *testing.T) {
 	const claim = "acme/widgets"
+	yes, no := true, false
+	const sameRepo = `[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":"feature-x"}]`
+	// The spec the ingress wrote, before the claim recorded anything, for a
+	// pull request whose fork was already deleted: the base's url, the
+	// deleted fork's branch name -- byte for byte a same-repository spec.
+	const deletedForkLegacy = `[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":"main"}]`
+	recordTests := []struct {
+		name   string
+		record *bool
+		repos  string
+		want   bool
+	}{
+		{name: "a same-repository spec, recorded in the base", record: &yes, repos: sameRepo, want: true},
+		{name: "a same-repository spec, unrecorded: unknown, so not in the base", repos: sameRepo},
+		{name: "a same-repository spec, recorded not in the base", record: &no, repos: sameRepo},
+		{name: "a deleted fork's legacy spec, unrecorded", repos: deletedForkLegacy},
+		{name: "a deleted fork's legacy spec, recorded not in the base", record: &no, repos: deletedForkLegacy},
+		{name: "a fork's spec, recorded in the base: the spec still fails", record: &yes, repos: `[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":null}]`},
+		{name: "a legacy fork spec, recorded in the base: the spec still fails", record: &yes, repos: `[{"name":"widgets","url":"https://github.com/contributor/widgets.git","branch":"main"}]`},
+	}
+	for _, tc := range recordTests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ReviewHeadInBaseRepository(claim, tc.record, []byte(tc.repos)); got != tc.want {
+				t.Errorf("ReviewHeadInBaseRepository(%q, %v, %s) = %v, want %v", claim, tc.record, tc.repos, got, tc.want)
+			}
+		})
+	}
+
+	// The spec's own conditions, on a claim that records the head in the
+	// base.
 	tests := []struct {
 		name  string
 		claim string
@@ -34,8 +65,8 @@ func TestReviewHeadInBaseRepository(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := ReviewHeadInBaseRepository(tc.claim, []byte(tc.repos)); got != tc.want {
-				t.Errorf("ReviewHeadInBaseRepository(%q, %s) = %v, want %v", tc.claim, tc.repos, got, tc.want)
+			if got := ReviewHeadInBaseRepository(tc.claim, &yes, []byte(tc.repos)); got != tc.want {
+				t.Errorf("ReviewHeadInBaseRepository(%q, true, %s) = %v, want %v", tc.claim, tc.repos, got, tc.want)
 			}
 		})
 	}

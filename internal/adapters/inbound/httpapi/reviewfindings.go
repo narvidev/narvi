@@ -195,8 +195,9 @@ func RebutReviewFinding(sessions *postgres.SessionStore, prSessions *postgres.Gi
 // 409 too when the review session's head is not known to be a branch of
 // the pull request's base repository (reposource.ReviewHeadInBaseRepository)
 // -- a pull request from a fork, whose head this endpoint never writes to
-// (§30.4), a legacy session still naming the fork, or a head not read when
-// the review started -- with a message saying so; 403 if the
+// (§30.4), a legacy session still naming the fork, a head not read at the
+// latest mention, or a claim no mention has recorded yet -- with a message
+// saying so; 403 if the
 // acting maintainer has no usable GitHub credential; 200 with the
 // resulting restdtos.ApplySuggestionResponse otherwise.
 //
@@ -285,18 +286,21 @@ func ApplySuggestion(sessions *postgres.SessionStore, prSessions *postgres.GitHu
 			writeError(w, http.StatusInternalServerError, "internal error")
 			return
 		}
-		if !reposource.ReviewHeadInBaseRepository(prSession.RepoFullName, sessionRow.Repos) {
+		if !reposource.ReviewHeadInBaseRepository(prSession.RepoFullName, prSession.HeadInBase, sessionRow.Repos) {
 			// This endpoint commits to prSession.RepoFullName, the base
 			// repository, at the spec's branch -- so only when that branch
 			// is the pull request's head in the base (technical plan §30.4):
-			// the spec's primary repo names the claim's repository and
-			// carries a branch. A pull request from a fork keeps its head
-			// in the fork, which this endpoint never writes to; its spec
-			// names no branch, and neither does one whose head could not be
-			// read when its review started. A legacy session opened before
-			// the spec named the base, and not yet moved, still names the
-			// fork and the fork's branch -- often "main", which in the base
-			// is the base's own. Committing to a same-named branch of the
+			// the claim records the head in the base, and the spec's
+			// primary repo names the claim's repository and carries a
+			// branch. A pull request from a fork keeps its head in the
+			// fork, which this endpoint never writes to; its spec names no
+			// branch, and neither does one whose head could not be read
+			// when its review started. A legacy session opened before the
+			// spec named the base, and not yet moved, still names the fork
+			// and the fork's branch -- often "main", which in the base is
+			// the base's own -- and one whose fork was already deleted
+			// names the base's url with that branch, which only the
+			// claim's record tells from a branch of the base. Committing to a same-named branch of the
 			// base would change a branch other than the pull request's, so
 			// this is a conflict with the pull request's shape, answered as
 			// one.
@@ -434,10 +438,13 @@ func ApplySuggestion(sessions *postgres.SessionStore, prSessions *postgres.GitHu
 // a review session whose head is not known to be a branch of
 // baseRepoFullName, the pull request's base repository: a pull request from
 // a fork, the common case -- a legacy session still naming the fork among
-// them -- or one whose head could not be read when its review started.
+// them -- one whose head could not be read at its latest mention, or one
+// whose claim no mention has recorded yet (technical plan §27.1). The last
+// two are repaired by a mention, so the message says so.
 func applySuggestionNoHeadBranchMessage(baseRepoFullName string) string {
-	return "this pull request's head branch is not in " + baseRepoFullName +
-		": a pull request from a fork keeps its head in the fork, which Narvi never writes to " +
-		"(and a review that started while the pull request's head could not be read recorded none); " +
-		"apply the suggestion on the pull request itself"
+	return "this pull request's head branch is not known to be in " + baseRepoFullName +
+		": a pull request from a fork keeps its head in the fork, which Narvi never writes to, " +
+		"so apply the suggestion on the pull request itself; " +
+		"if its head is a branch of " + baseRepoFullName +
+		", mention Narvi on the pull request again so it records the head, then retry"
 }
