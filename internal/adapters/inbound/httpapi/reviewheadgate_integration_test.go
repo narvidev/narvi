@@ -19,8 +19,8 @@ import (
 // reach, through the real endpoints (technical plan §27.1, §30.4): a pull
 // request's review session whose head is not known to be a branch of its
 // base repository -- reposource.ReviewHeadInBaseRepository: a fork's pull
-// request, a deleted fork's, a head not read at the latest mention, a
-// legacy session still naming the fork, a claim no mention has recorded
+// request, a deleted fork's, a session opened while its head could not be
+// read, a legacy session still naming the fork, a claim no mention has recorded
 // yet (a deleted fork's legacy spec is byte for byte a same-repository
 // one, so only the claim's record tells them apart) -- runs code a person outside the
 // base repository may have written. It is delivered no sandbox secret and
@@ -36,8 +36,9 @@ type reviewHeadCase struct {
 	spec string
 	// claimed: the session has a github_pr_sessions claim on acme/<name>.
 	claimed bool
-	// record is the claim's head_in_base, as the ingress's latest mention
-	// recorded it; nil for a claim nothing has recorded yet.
+	// record is the claim's head_in_base, as the last mention that read
+	// the pull request's head recorded it; nil for a claim nothing has
+	// recorded yet.
 	record *bool
 	// headInBase is what reposource.ReviewHeadInBaseRepository reads.
 	headInBase bool
@@ -60,7 +61,12 @@ func reviewHeadCases() []reviewHeadCase {
 		{name: "a legacy fork session not yet moved: the fork, its branch", spec: `[{"name":"%[1]s-fork","url":"https://github.com/contributor/%[1]s-fork.git","branch":"main"}]`, claimed: true},
 		{name: "a legacy deleted-fork session, unrecorded: the base, the deleted fork's branch", spec: deletedForkLegacySpec, claimed: true},
 		{name: "a legacy deleted-fork session after a mention recorded its head not in the base", spec: deletedForkLegacySpec, claimed: true, record: &notInBase},
-		{name: "a same-repository pull request whose head lookup failed", spec: `[{"name":"%[1]s","url":"https://github.com/acme/%[1]s.git","branch":null}]`, claimed: true, record: &notInBase},
+		// Its first mention's head lookup failed: no branch, nothing recorded.
+		{name: "a same-repository pull request opened while its head could not be read", spec: `[{"name":"%[1]s","url":"https://github.com/acme/%[1]s.git","branch":null}]`, claimed: true},
+		// A later mention read the head in the base; the gate still needs
+		// the spec's branch, which that mention gives it
+		// (TestReviewHeadGate_AMentionGivingTheSpecItsHeadBranchOpensEveryGate).
+		{name: "the same, recorded in the base, its spec not yet given the head branch", spec: `[{"name":"%[1]s","url":"https://github.com/acme/%[1]s.git","branch":null}]`, claimed: true, record: &inBase},
 		{name: "a legacy same-repository session, unrecorded until its next mention", spec: sameRepoSpec, claimed: true},
 		{name: "a same-repository pull request, its mention recorded in the base", spec: sameRepoSpec, claimed: true, record: &inBase, headInBase: true},
 		{name: "a same-repository pull request, its url in another case", spec: `[{"name":"%[1]s","url":"https://github.com/ACME/%[1]s","branch":"feature-x"}]`, claimed: true, record: &inBase, headInBase: true, caseOnly: true},
@@ -324,6 +330,159 @@ func TestReviewVerdict_LegacyForkSessionCutsNoSentinelFixBranch(t *testing.T) {
 			if queued != 0 {
 				t.Errorf("sentinel auto-fix outbox rows = %d, want 0", queued)
 			}
+		})
+	}
+}
+
+// TestReviewHeadGate_AMentionGivingTheSpecItsHeadBranchOpensEveryGate: a
+// same-repository pull request's review session opened while its head
+// could not be read names the base with no branch. A later mention that
+// reads the head in the base records it (head_in_base true) and gives the
+// spec the head's branch with the sessions store's
+// SetReviewSessionHeadBranch, the statement the GitHub ingress runs
+// (technical plan §27.1). The record alone opens no gate; after the
+// statement every gate is open: the sandbox secrets, the base repository's
+// repository-scoped provider credential, apply-suggestion committing to
+// the head branch, and the sentinel auto-fix claiming a fix from it.
+func TestReviewHeadGate_AMentionGivingTheSpecItsHeadBranchOpensEveryGate(t *testing.T) {
+	const headBranch = "feature-x"
+	for i, repaired := range []bool{false, true} {
+		name := map[bool]string{
+			false: "recorded in the base, the spec not yet given the head branch",
+			true:  "after the mention gave the spec its head branch",
+		}[repaired]
+		t.Run(name, func(t *testing.T) {
+			// seed opens acme/<repoName>#prNumber's session as the ingress
+			// leaves it, with a ready sandbox and a dispatched turn.
+			seed := func(ctx context.Context, t *testing.T, rig testRig, repoName string, prNumber int32) sqlcgen.Session {
+				t.Helper()
+				owner, _ := rig.createAuthenticatedUser(ctx, t)
+				repoFullName := "acme/" + repoName
+				url := "https://github.com/" + repoFullName + ".git"
+				session := rig.createOwnedGitHubReviewSessionWithRepos(ctx, t, owner.ID, repoFullName, prNumber, fmt.Sprintf(`[{"name":%q,"url":%q,"branch":null}]`, repoName, url))
+				if err := rig.prSessions.RecordHeadInBase(ctx, repoFullName, prNumber, true); err != nil {
+					t.Fatal(err)
+				}
+				if repaired {
+					set, err := rig.sessions.SetReviewSessionHeadBranch(ctx, session.ID, repoFullName, prNumber, url, headBranch)
+					if err != nil || !set {
+						t.Fatalf("give the spec its head branch: set %v, %v", set, err)
+					}
+				}
+				createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
+				moveSandboxStatus(ctx, t, rig, session.ID, sqlcgen.SandboxStatusReady)
+				seedDispatchedTurn(ctx, t, rig, session.ID)
+				return session
+			}
+
+			t.Run("sandbox secrets", func(t *testing.T) {
+				rig := newTestRig(t)
+				ctx := context.Background()
+				repoName := fmt.Sprintf("repair-secrets-%d-%d", i, time.Now().UnixNano())
+				repoFullName := "acme/" + repoName
+				if _, err := rig.sandboxSecrets.Create(ctx, sqlcgen.SandboxSecretScopeGlobal, nil, "GLOBAL_TOKEN", encryptSecretForTest(t, rig, "global-value")); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := rig.sandboxSecrets.Create(ctx, sqlcgen.SandboxSecretScopeRepo, &repoFullName, "DEPLOY_TOKEN", encryptSecretForTest(t, rig, "base-repo-value")); err != nil {
+					t.Fatal(err)
+				}
+				session := seed(ctx, t, rig, repoName, 120)
+				status, got := postSandboxSecrets(t, rig, session.ID.String(), "sandbox-bearer-token", "1")
+				if status != http.StatusOK {
+					t.Fatalf("status = %d, want %d", status, http.StatusOK)
+				}
+				want := map[string]string{}
+				if repaired {
+					want = map[string]string{"GLOBAL_TOKEN": "global-value", "DEPLOY_TOKEN": "base-repo-value"}
+				}
+				if got.Secrets == nil {
+					got.Secrets = map[string]string{}
+				}
+				if !reflect.DeepEqual(got.Secrets, want) {
+					t.Errorf("secrets = %v, want %v", got.Secrets, want)
+				}
+			})
+
+			t.Run("provider credential", func(t *testing.T) {
+				rig := newTestRig(t)
+				ctx := context.Background()
+				repoName := fmt.Sprintf("repair-providers-%d-%d", i, time.Now().UnixNano())
+				repoFullName := "acme/" + repoName
+				if _, err := rig.providerCredentials.Create(ctx, sqlcgen.ProviderCredentialScopeGlobal, nil, sqlcgen.ProviderCredentialProviderOpenai, encryptForTest(t, rig, "global-openai-key")); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := rig.providerCredentials.Create(ctx, sqlcgen.ProviderCredentialScopeRepo, &repoFullName, sqlcgen.ProviderCredentialProviderOpenai, encryptForTest(t, rig, "base-repo-openai-key")); err != nil {
+					t.Fatal(err)
+				}
+				session := seed(ctx, t, rig, repoName, 121)
+				status, got := postProviderCredentials(t, rig, session.ID.String(), "sandbox-bearer-token", "1")
+				if status != http.StatusOK {
+					t.Fatalf("status = %d, want %d", status, http.StatusOK)
+				}
+				want := map[bool]string{false: "global-openai-key", true: "base-repo-openai-key"}[repaired]
+				if got := apiKey(got.Credentials["openai"]); got != want {
+					t.Errorf("openai credential = %q, want %q", got, want)
+				}
+			})
+
+			t.Run("apply-suggestion", func(t *testing.T) {
+				fake := &applySuggestionFakeSourceControl{content: "package foo\n// old comment\n", sha: "blob-sha", exists: true}
+				rig := newTestRig(t, func(r *testRig) { r.sourceControl = fake })
+				ctx := context.Background()
+				repoName := fmt.Sprintf("repair-apply-%d-%d", i, time.Now().UnixNano())
+				session := seed(ctx, t, rig, repoName, 122)
+				status, verdict := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1", testDispatchMessageID, suggestedFixVerdictBody)
+				if status != http.StatusCreated {
+					t.Fatalf("post verdict status = %d, want %d", status, http.StatusCreated)
+				}
+				_, maintainerToken := createMaintainerWithGitHubToken(ctx, t, rig, "acting-maintainer-token")
+				var resp struct {
+					Error string `json:"error"`
+				}
+				got := rig.doJSON(t, http.MethodPost, "/api/sessions/"+session.ID.String()+"/review/findings/"+verdict.FindingIdentityHashes[0]+"/apply-suggestion", nil, &resp, maintainerToken)
+				if !repaired {
+					if got != http.StatusConflict || fake.updateCalls != 0 {
+						t.Fatalf("status = %d (%q), %d commits; want 409 and none", got, resp.Error, fake.updateCalls)
+					}
+					return
+				}
+				if got != http.StatusOK {
+					t.Fatalf("status = %d (%q), want %d", got, resp.Error, http.StatusOK)
+				}
+				if fake.updateCalls != 1 || fake.lastUpdate.Branch != headBranch || fake.lastUpdate.Repo != repoName {
+					t.Errorf("commits = %d, last onto %s/%s@%s; want one onto acme/%s@%s", fake.updateCalls, fake.lastUpdate.Owner, fake.lastUpdate.Repo, fake.lastUpdate.Branch, repoName, headBranch)
+				}
+			})
+
+			t.Run("sentinel auto-fix", func(t *testing.T) {
+				rig := newTestRig(t)
+				ctx := context.Background()
+				repoName := fmt.Sprintf("repair-sentinel-%d-%d", i, time.Now().UnixNano())
+				repoFullName := "acme/" + repoName
+				if _, err := rig.repoSettings.Upsert(ctx, repoFullName, false, true); err != nil {
+					t.Fatalf("turn the sentinel auto-fix on: %v", err)
+				}
+				session := seed(ctx, t, rig, repoName, 123)
+				status, _ := postReviewVerdict(t, rig, session.ID.String(), "sandbox-bearer-token", "1",
+					testDispatchMessageID, findingsVerdictRequestJSON("coverage", "Missing test for the retry path."))
+				if status != http.StatusCreated {
+					t.Fatalf("status = %d, want %d", status, http.StatusCreated)
+				}
+				fix, err := rig.sentinelFixes.Get(ctx, repoFullName, 123)
+				switch {
+				case repaired && (err != nil || fix.OriginHeadBranch != headBranch):
+					t.Errorf("sentinel fix = %+v (%v), want one claimed from %s", fix, err, headBranch)
+				case !repaired && err == nil:
+					t.Errorf("sentinel fix %+v claimed before the spec names the head branch, want none", fix)
+				}
+				var queued int
+				if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM outbox WHERE session_id = $1 AND kind = $2`, session.ID, string(ports.NotificationKindSentinelAutoFix)).Scan(&queued); err != nil {
+					t.Fatal(err)
+				}
+				if want := map[bool]int{false: 0, true: 1}[repaired]; queued != want {
+					t.Errorf("sentinel auto-fix outbox rows = %d, want %d", queued, want)
+				}
+			})
 		})
 	}
 }

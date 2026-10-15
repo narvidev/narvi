@@ -75,7 +75,9 @@ func (s *GitHubPRSessionStore) SetSessionID(ctx context.Context, repoFullName st
 // RecordHeadInBase records, on the (repoFullName, prNumber) claim row,
 // whether the pull request's head branch is a branch of its base repository
 // (technical plan §27.1, §30.4): the GitHub ingress calls it for every
-// mention, inside the claim transaction, under LockForUpdate's row lock.
+// mention that read its pull request's head, inside the claim transaction,
+// under LockForUpdate's row lock -- never for one that read none, which
+// would only lose what an earlier read recorded.
 // reposource.ReviewHeadInBaseRepository reads the record; NULL, never
 // recorded, reads as not in the base.
 func (s *GitHubPRSessionStore) RecordHeadInBase(ctx context.Context, repoFullName string, prNumber int32, headInBase bool) error {

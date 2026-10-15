@@ -195,9 +195,9 @@ func RebutReviewFinding(sessions *postgres.SessionStore, prSessions *postgres.Gi
 // 409 too when the review session's head is not known to be a branch of
 // the pull request's base repository (reposource.ReviewHeadInBaseRepository)
 // -- a pull request from a fork, whose head this endpoint never writes to
-// (§30.4), a legacy session still naming the fork, a head not read at the
-// latest mention, or a claim no mention has recorded yet -- with a message
-// saying so; 403 if the
+// (§30.4), a legacy session still naming the fork, a session opened while
+// its head could not be read, or a claim no mention has recorded yet --
+// with a message saying so; 403 if the
 // acting maintainer has no usable GitHub credential; 200 with the
 // resulting restdtos.ApplySuggestionResponse otherwise.
 //
@@ -300,7 +300,10 @@ func ApplySuggestion(sessions *postgres.SessionStore, prSessions *postgres.GitHu
 			// and the fork's branch -- often "main", which in the base is
 			// the base's own -- and one whose fork was already deleted
 			// names the base's url with that branch, which only the
-			// claim's record tells from a branch of the base. Committing to a same-named branch of the
+			// claim's record tells from a branch of the base. A
+			// same-repository session opened while its head could not be
+			// read names no branch until a mention that reads the head
+			// gives it one. Committing to a same-named branch of the
 			// base would change a branch other than the pull request's, so
 			// this is a conflict with the pull request's shape, answered as
 			// one.
@@ -438,13 +441,17 @@ func ApplySuggestion(sessions *postgres.SessionStore, prSessions *postgres.GitHu
 // a review session whose head is not known to be a branch of
 // baseRepoFullName, the pull request's base repository: a pull request from
 // a fork, the common case -- a legacy session still naming the fork among
-// them -- one whose head could not be read at its latest mention, or one
-// whose claim no mention has recorded yet (technical plan §27.1). The last
-// two are repaired by a mention, so the message says so.
+// them -- one opened while its head could not be read, or one whose claim
+// no mention has recorded yet (technical plan §27.1). For a pull request
+// whose head is a branch of the base, the last two are repaired by a
+// mention that reads the head: it records the head in the base and, for a
+// spec with no branch, gives the spec the head's branch
+// (internal/adapters/inbound/github's repairHeadBranch), after which this
+// endpoint applies the suggestion -- so the message says so.
 func applySuggestionNoHeadBranchMessage(baseRepoFullName string) string {
 	return "this pull request's head branch is not known to be in " + baseRepoFullName +
 		": a pull request from a fork keeps its head in the fork, which Narvi never writes to, " +
 		"so apply the suggestion on the pull request itself; " +
 		"if its head is a branch of " + baseRepoFullName +
-		", mention Narvi on the pull request again so it records the head, then retry"
+		", mention Narvi on the pull request again, and once that mention has recorded the head, retry"
 }

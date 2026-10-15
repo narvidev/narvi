@@ -2,7 +2,7 @@
 -- every claim's record of whether its pull request's head is a branch of
 -- its base repository. A binary without this migration does not read it;
 -- a binary with it that runs the up again reads every claim as unknown --
--- not in the base, fail closed -- until the pull request's next mention.
+-- not in the base, fail closed -- until a mention reads its head.
 --
 -- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
 -- this migration. Do not run it against live pods of a binary that carries

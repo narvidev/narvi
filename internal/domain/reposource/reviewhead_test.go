@@ -90,3 +90,36 @@ func TestURLNamesRepository(t *testing.T) {
 		}
 	}
 }
+
+// TestReviewSpecAwaitsHeadBranch pins which specs a mention that reads the
+// head in the base gives the head's branch: only the base's own repo with
+// no branch -- what the ingress writes when it could not read the head.
+// A spec with a branch is never rewritten, nor one naming another
+// repository.
+func TestReviewSpecAwaitsHeadBranch(t *testing.T) {
+	const claim = "acme/widgets"
+	tests := []struct {
+		name    string
+		repos   string
+		wantURL string
+	}{
+		{name: "the base, no branch", repos: `[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":null}]`, wantURL: "https://github.com/acme/widgets.git"},
+		{name: "the base, no branch key", repos: `[{"name":"widgets","url":"https://github.com/acme/widgets.git"}]`, wantURL: "https://github.com/acme/widgets.git"},
+		{name: "the base, an empty branch", repos: `[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":""}]`, wantURL: "https://github.com/acme/widgets.git"},
+		{name: "the base in another case", repos: `[{"name":"widgets","url":"https://github.com/ACME/Widgets","branch":null}]`, wantURL: "https://github.com/ACME/Widgets"},
+		{name: "the base with a branch", repos: `[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":"feature-x"}]`},
+		{name: "a deleted fork's legacy spec", repos: `[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":"main"}]`},
+		{name: "a legacy fork spec", repos: `[{"name":"widgets","url":"https://github.com/contributor/widgets.git","branch":null}]`},
+		{name: "not https", repos: `[{"name":"widgets","url":"http://github.com/acme/widgets.git","branch":null}]`},
+		{name: "empty", repos: `[]`},
+		{name: "not a list", repos: `{"url":"https://github.com/acme/widgets.git"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			url, ok := ReviewSpecAwaitsHeadBranch(claim, []byte(tc.repos))
+			if ok != (tc.wantURL != "") || url != tc.wantURL {
+				t.Errorf("ReviewSpecAwaitsHeadBranch(%q, %s) = %q, %v; want %q", claim, tc.repos, url, ok, tc.wantURL)
+			}
+		})
+	}
+}

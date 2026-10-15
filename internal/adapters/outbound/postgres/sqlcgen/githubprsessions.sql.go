@@ -486,10 +486,13 @@ type RecordGitHubPRSessionHeadInBaseParams struct {
 // Technical plan §27.1, §30.4, migrations/000172: records whether the pull
 // request's head branch is a branch of its base repository, from the
 // mention the GitHub ingress is handling. Run inside the claim transaction,
-// under LockGitHubPRSessionForUpdate's row lock, on every mention -- a new
-// review session's and one joining an existing session alike -- so the
-// latest delivery's head.repo decides: a fork's, a deleted fork's and an
-// unread head record false, a branch of the base true.
+// under LockGitHubPRSessionForUpdate's row lock, on every mention that read
+// its pull request's head -- a new review session's and one joining an
+// existing session alike: a branch of the base records true, a fork's and
+// a deleted fork's (head.repo null) false. A mention that read no head (an
+// issue_comment whose pull request lookup failed) never runs it, so the
+// record keeps what the last mention that read the head wrote, and a new
+// claim stays NULL.
 func (q *Queries) RecordGitHubPRSessionHeadInBase(ctx context.Context, arg RecordGitHubPRSessionHeadInBaseParams) error {
 	_, err := q.db.Exec(ctx, recordGitHubPRSessionHeadInBase, arg.HeadInBase, arg.RepoFullName, arg.PrNumber)
 	return err

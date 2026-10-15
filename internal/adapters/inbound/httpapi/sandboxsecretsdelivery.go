@@ -51,10 +51,11 @@
 // and its sandbox boots on the pull request's head and runs that head's
 // setup.sh and start.sh with every secret delivered here in their
 // environment: code a person outside the base repository may have written.
-// So a fork's pull request, a deleted fork's, one whose head could not be
-// read at its latest mention, a legacy session still naming the fork, and
-// a claim no mention has recorded yet (unknown, so not in the base until
-// its next mention) get the answer a session with no secrets gets -- 200 with an empty map,
+// So a fork's pull request, a deleted fork's, one opened while its head
+// could not be read (no branch, until a mention that reads the head in the
+// base gives it one), a legacy session still naming the fork, and a claim
+// no mention has recorded yet (unknown, so not in the base until a mention
+// reads the head) get the answer a session with no secrets gets -- 200 with an empty map,
 // the secrets table never read, so nothing about which secrets exist leaks
 // -- logged at Info. This is the rule a CI system applies to a pull request
 // from a fork: its code runs, the repository's secrets do not reach it. A

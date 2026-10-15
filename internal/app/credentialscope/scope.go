@@ -53,10 +53,12 @@ type Scope struct {
 	// It is empty for a pull request's review session whose head is not
 	// known to be a branch of its base repository
 	// (reposource.ReviewHeadInBaseRepository; technical plan §30.4): a
-	// pull request from a fork, a deleted fork's, one whose head could not
-	// be read at its latest mention, a legacy session still naming the
+	// pull request from a fork, a deleted fork's, one opened while its head
+	// could not be read (no branch yet), a legacy session still naming the
 	// fork, and one whose claim no mention has recorded yet (its
-	// head_in_base NULL, unknown until the next mention). Its spec names the base repository, but its sandbox runs the
+	// head_in_base NULL, unknown until a mention reads the head). The
+	// sandbox agent fetches these credentials once, at boot, so a session
+	// a mention later repairs gets them at its next boot. Its spec names the base repository, but its sandbox runs the
 	// pull request's head -- code a person outside the base repository may
 	// have written -- and its agent runtime runs tools over it, so the
 	// base repository's repository-scoped credentials are not resolved for

@@ -784,9 +784,9 @@ func PostReviewVerdict(
 				// the fork; one whose fork was already deleted names the
 				// base's url with the fork's branch, which only the claim's
 				// record tells from a branch of the base. A claim no mention
-				// has recorded yet is unknown until the next mention.
-				// Expected, so not a warning.
-				logger.Info("httpapi: review-verdict: the review session's head is not known to be a branch of its base repository (a pull request from a fork, a legacy session, a head not read at the latest mention, or a claim not yet recorded), skipping sentinel-auto-fix trigger",
+				// has recorded yet is unknown until a mention reads the
+				// head. Expected, so not a warning.
+				logger.Info("httpapi: review-verdict: the review session's head is not known to be a branch of its base repository (a pull request from a fork, a legacy session, a session opened while its head could not be read, or a claim not yet recorded), skipping sentinel-auto-fix trigger",
 					"repo", prSession.RepoFullName, "pr_number", prSession.PrNumber)
 				autoFixCandidate = false
 			default:

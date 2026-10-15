@@ -583,3 +583,36 @@ WHERE s.id = sqlc.arg('session_id')
   AND lower(regexp_replace(substring(s.repos->0->>'url' from '^https://[^/]+/(.*)$'), '\.git$', ''))
       <> lower(g.repo_full_name)
 RETURNING s.repos;
+
+-- name: SetReviewSessionHeadBranch :execrows
+-- Technical plan §27.1, §30.4: a pull request's review session opened by a
+-- mention that could not read the pull request's head (an issue_comment
+-- whose pull request lookup failed) has a spec naming the base repository
+-- with no branch, which the review-head rule reads as not the base's own
+-- whatever the claim records. A later mention that reads the head in the
+-- base gives the spec that head's branch here, so the session is what a
+-- first mention that read the head would have opened.
+--
+-- The GitHub ingress runs it after the mention's claim transaction has
+-- committed the record, never under the claim's row lock: every session
+-- actor transaction locks its session's row before it writes the claim
+-- (the automatic re-review's counters), so taking the session's row under
+-- the claim's would invert that order. It needs no other lock: it writes
+-- only when the claim still records the head in the base, the session is
+-- that claim's only one, and its primary repo is still the url the ingress
+-- read, with no branch -- so it never replaces a branch, never acts for a
+-- fork's pull request, and running it twice writes once. A live gen keeps
+-- the SESSION_CONFIG it booted with; the spec's branch reaches the next one.
+-- 0 rows: nothing to repair.
+UPDATE sessions s
+SET repos = jsonb_set(s.repos, '{0,branch}', to_jsonb(sqlc.arg('branch')::text))
+FROM github_pr_sessions g
+WHERE s.id = sqlc.arg('session_id')
+  AND g.session_id = s.id
+  AND g.repo_full_name = sqlc.arg('repo_full_name')
+  AND g.pr_number = sqlc.arg('pr_number')
+  AND g.head_in_base
+  AND (SELECT count(*) FROM github_pr_sessions c WHERE c.session_id = s.id) = 1
+  AND jsonb_typeof(s.repos) = 'array'
+  AND s.repos->0->>'url' = sqlc.arg('url')::text
+  AND coalesce(s.repos->0->>'branch', '') = '';

@@ -3330,24 +3330,35 @@ sandbox_secrets(id, scope sandbox_secret_scope ENUM('automation','environment','
   gets no secret** (Step 204): `reposource.ReviewHeadInBaseRepository` is true only when the
   session's `github_pr_sessions` claim records the head in the base (`head_in_base`, migration
   `000172`) and the session's primary repo names the claim's repository and carries a branch. The
-  GitHub ingress writes the record on every mention -- a new session's and one joining an existing
-  session alike -- from the delivery's `head.repo`: true only when the head repository is the base,
-  false for a fork, a deleted fork and a head it could not read. The spec alone cannot decide: the
-  ingress before the record wrote, for a pull request whose fork was already deleted, the base's url
-  with the deleted fork's branch name, byte for byte a same-repository spec. A claim nothing has
-  recorded is unknown and reads false. The cost of failing closed: a same-repository pull request's
-  review session opened before the record existed gets no secret, no repository-scoped provider
-  credential, no apply-suggestion and no sentinel auto-fix until someone mentions the bot on the pull
-  request again. That mention records the head before its turn is dispatched, so every delivery and
-  gate after it reads the record: the secrets reach a sandbox at its next boot, as any secret does
-  (Injection, below), the rest at their next read. An operator who needs them sooner mentions the
-  bot. The same mention repairs a same-repository pull request whose first head lookup failed.
+  GitHub ingress writes the record on every mention that reads the pull request's head -- a new
+  session's and one joining an existing session alike -- from its `head.repo`: true only when the
+  head repository is the base, false for a fork and for a deleted fork (`head.repo` null). Review
+  comments and labels carry the head; an issue comment reads it through the pull request lookup. A
+  mention that reads no head -- an issue comment whose lookup failed or timed out -- records nothing:
+  a pull request's head repository never changes, so what an earlier mention read stays, and a claim
+  no mention has read stays NULL. The spec alone cannot decide: the ingress before the record wrote,
+  for a pull request whose fork was already deleted, the base's url with the deleted fork's branch
+  name, byte for byte a same-repository spec. A claim nothing has recorded is unknown and reads
+  false. A session opened while its head could not be read names the base with no branch; the next
+  mention that reads the head in the base records it and gives the spec the head's branch, before
+  that mention's turn is created, so the session is what a first mention that read the head would
+  have opened. That write never replaces a branch, and runs only while the claim records the head in
+  the base. The cost of failing closed: a same-repository pull request's review session opened
+  before the record existed gets no secret, no repository-scoped provider credential, no
+  apply-suggestion and no sentinel auto-fix until someone mentions the bot on the pull request again,
+  and so does one opened while its head could not be read. That mention updates the record, and the
+  spec when it has no branch; it pushes nothing into a sandbox already running. The sandbox agent
+  fetches the secrets and the provider credentials once, at boot (Injection, below), so both reach
+  the session's sandbox at its next boot: one already running keeps what it booted with, for this
+  turn too, until it stops and boots again. Apply-suggestion and the sentinel auto-fix read the
+  record and the spec on every use, so they work from the mention's own turn on. An operator who
+  needs them mentions the bot.
   Such a session's spec names the base repository for a pull request from a fork too (§30.4), and
   its sandbox boots on the pull request's head and runs that head's `setup.sh` and `start.sh` with
   every delivered secret in their environment -- code a person outside the base repository may have
-  written. So a fork's pull request, a deleted fork's, one whose head could not be read at its
-  latest mention, a legacy session still naming the fork, and a claim not yet recorded are answered
-  as a session with no secrets is: an empty map, global, environment and repository scopes alike, the table never read,
+  written. So a fork's pull request, a deleted fork's, one opened while its head could not be read
+  and not yet given its branch, a legacy session still naming the fork, and a claim not yet recorded
+  are answered as a session with no secrets is: an empty map, global, environment and repository scopes alike, the table never read,
   logged at Info. This is the rule a CI system applies to a pull request from a fork: its code runs,
   the repository's secrets do not reach it. A session with no claim, and a review session of a pull
   request opened from a branch of its base repository, resolve as above; a claim read that fails is
@@ -4670,16 +4681,18 @@ recommendation:**
    sandbox something of the base repository's own, or act on the base at the spec's branch, ask one
    more question first: is the session's head known to be a branch of its base repository
    (`reposource.ReviewHeadInBaseRepository`: the claim records the head in the base -- the ingress
-   writes `github_pr_sessions.head_in_base` on every mention from the delivery's `head.repo`, and an
-   unrecorded claim reads false until its next mention, §27.1 -- and the primary repo names the
-   claim's repository and carries a branch)? A fork's pull
+   writes `github_pr_sessions.head_in_base` on every mention that reads the pull request's
+   `head.repo`, and an unrecorded claim reads false until a mention reads it, §27.1 -- and the primary
+   repo names the claim's repository and carries a branch, which a mention that reads the head in
+   the base gives a session opened while its head could not be read)? A fork's pull
    request runs a head a person outside the base repository may have written, so when the answer is
    no the sandbox secrets delivery hands it no secret at all (§27.1), the provider-credential scope
    resolves no repository-scoped credential of the base (the environment and global scopes stay, as
    while its spec named the fork), the sentinel auto-fix (§17.1) cuts no fix branch, and
    apply-suggestion — which commits to the claim's repository at the spec's branch, a fork's branch
    name often being the base's own `main` — answers 409 naming the fork, and saying that a mention
-   records a same-repository head, instead of committing to the base. A review session opened before the spec named the base names
+   records a same-repository head, after which a retry applies the suggestion, instead of committing
+   to the base. A review session opened before the spec named the base names
    the fork, and its gens cloned the fork, whose origin holds no pull ref; it moves onto the base
    only when no gen holds its old spec — migration `000171` moved every such session with no live gen,
    and the actor moves the rest in the transaction that spawns or restores the next gen, before that

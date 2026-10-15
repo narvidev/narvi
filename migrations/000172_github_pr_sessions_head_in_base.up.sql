@@ -4,13 +4,15 @@
 -- github_pr_sessions.head_in_base: true when the pull request's head
 -- repository is its base repository (head.repo.full_name names the
 -- claim's repository, compared without regard to case); false for a pull
--- request from a fork, one whose head repository was deleted (head.repo
--- null), and one whose head the ingress could not read (an issue_comment
--- mention whose pull request lookup failed); NULL when nothing has
--- recorded it yet. The GitHub ingress writes it on every mention it
--- handles -- a new review session's and one joining an existing session
--- alike -- under the claim's own row lock, from the delivery's own
--- head.repo (internal/adapters/inbound/github's headInBaseRepository).
+-- request from a fork and one whose head repository was deleted
+-- (head.repo null); NULL when nothing has recorded it yet. The GitHub
+-- ingress writes it on every mention that reads the pull request's head
+-- -- a new review session's and one joining an existing session alike --
+-- under the claim's own row lock (internal/adapters/inbound/github's
+-- headInBaseRecord). A mention that reads no head (an issue_comment whose
+-- pull request lookup failed) writes nothing: a pull request's head
+-- repository never changes, so what an earlier mention read stays, and a
+-- new claim stays NULL.
 --
 -- reposource.ReviewHeadInBaseRepository reads it: a review session's head
 -- counts as the base repository's own only when the record is true and
@@ -25,13 +27,17 @@
 --
 -- No backfill: the fact is in the webhook delivery, not in the database.
 -- Every claim that exists when this runs reads NULL, unknown, and is
--- treated as not in the base -- fail closed -- until the pull request's
--- next mention records it. A same-repository pull request's review session
+-- treated as not in the base -- fail closed -- until a mention reads the
+-- pull request's head. A same-repository pull request's review session
 -- opened before this release therefore gets no secret, no repository-scoped
 -- provider credential, no apply-suggestion and no sentinel auto-fix until
--- someone mentions the bot on that pull request again; that mention
--- restores them. No index: the column is read with the claim row, by the
--- claim's existing keys.
+-- someone mentions the bot on that pull request again. That mention
+-- updates the record, and pushes nothing into a running sandbox: the
+-- sandbox agent fetches the secrets and the provider credentials once, at
+-- boot, so they reach the session's sandbox at its next boot;
+-- apply-suggestion and the sentinel auto-fix work from that mention's own
+-- turn. No index: the column is read with the claim row, by the claim's
+-- existing keys.
 --
 -- # Locks
 --
@@ -63,5 +69,5 @@
 -- force` the previous version, keeping the column and its values (this
 -- file, run again, keeps them), or run the down (goto the previous
 -- version), which drops the column; this release, deployed again, then
--- reads every claim as unknown until its next mention.
+-- reads every claim as unknown until a mention reads its head.
 ALTER TABLE github_pr_sessions ADD COLUMN IF NOT EXISTS head_in_base BOOLEAN;

@@ -28,10 +28,11 @@ func URLNamesRepository(rawURL, fullName string) bool {
 //
 //   - claimHeadInBase, the session's github_pr_sessions claim's record
 //     (head_in_base, migrations/000172), is true. The GitHub ingress writes
-//     it on every mention from the delivery's head.repo: true only when the
-//     head repository is the claim's, false for a fork's, a deleted fork's
-//     and an unread head. A claim nothing has recorded yet (nil) is unknown,
-//     and reads false until the pull request's next mention records it.
+//     it on every mention that read the pull request's head, from its
+//     head.repo: true only when the head repository is the claim's, false
+//     for a fork's and a deleted fork's. A mention that read no head writes
+//     nothing. A claim nothing has recorded yet (nil) is unknown, and reads
+//     false until a mention reads the head.
 //   - the session's primary repo, position 0 of sessionRepos
 //     (sessions.repos), is an https URL naming claimRepoFullName and carries
 //     a branch -- the spec the ingress writes for a same-repository pull
@@ -41,9 +42,11 @@ func URLNamesRepository(rawURL, fullName string) bool {
 // The spec alone cannot decide it: a pull request whose fork was deleted
 // before its first mention got, from the ingress before the record existed,
 // the base repository's url with the deleted fork's branch name -- the
-// same-repository shape exactly. The record does. A fork's spec, a legacy
-// session's still naming the fork, and one whose head lookup failed (no
-// branch) fail the second condition whatever the record says.
+// same-repository shape exactly. The record does. A fork's spec and a
+// legacy session's still naming the fork fail the second condition whatever
+// the record says, and so does a same-repository session opened while its
+// head could not be read (no branch) -- until a mention that reads the head
+// in the base gives its spec the branch (ReviewSpecAwaitsHeadBranch).
 //
 // It fails closed: an unrecorded claim, sessionRepos that do not decode, an
 // empty list, a url that is not https or names no owner/name, and a claim
@@ -74,4 +77,33 @@ func ReviewHeadInBaseRepository(claimRepoFullName string, claimHeadInBase *bool,
 		return false
 	}
 	return URLNamesRepository(primary.URL, claimRepoFullName)
+}
+
+// ReviewSpecAwaitsHeadBranch reports whether a pull request's review
+// session's spec is the one the GitHub ingress writes when it could not
+// read the pull request's head: the primary repo, position 0 of
+// sessionRepos, an https URL naming claimRepoFullName, with no branch. It
+// returns that repo's url, which the repair (the sessions store's
+// SetReviewSessionHeadBranch) requires unchanged when it writes the head
+// branch a later mention read in the base (technical plan §27.1, §30.4).
+// A spec that already carries a branch -- a same-repository one, or a
+// legacy deleted fork's naming the fork's branch -- a fork's legacy spec
+// still naming the fork, and anything that does not decode read false:
+// the repair never replaces a branch and never acts on another repository.
+func ReviewSpecAwaitsHeadBranch(claimRepoFullName string, sessionRepos []byte) (primaryURL string, ok bool) {
+	var repos []struct {
+		URL    string  `json:"url"`
+		Branch *string `json:"branch"`
+	}
+	if err := json.Unmarshal(sessionRepos, &repos); err != nil || len(repos) == 0 {
+		return "", false
+	}
+	primary := repos[0]
+	if primary.Branch != nil && *primary.Branch != "" {
+		return "", false
+	}
+	if ValidateRepoURL(primary.URL) != nil || !URLNamesRepository(primary.URL, claimRepoFullName) {
+		return "", false
+	}
+	return primary.URL, true
 }

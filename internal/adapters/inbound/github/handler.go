@@ -379,7 +379,7 @@ type Config struct {
 // repository is not known (an issue_comment mention whose head lookup
 // failed) carry no branch, and the branch is what tells the readers that
 // must not treat such a head as the base's own, with the claim's record
-// (headInBaseRepository): reposource.ReviewHeadInBaseRepository is true
+// (headInBaseRecord): reposource.ReviewHeadInBaseRepository is true
 // only for a claim recorded in the base and a spec naming the claim's
 // repository with a branch. The sandbox secrets delivery then hands the
 // session no secret, the provider-credential scope resolves none of the
@@ -387,7 +387,9 @@ type Config struct {
 // start.sh and the tools the agent runs over it are code a person outside
 // the base repository may have written -- and apply-suggestion and the
 // sentinel auto-fix, which act on the base repository at the spec's
-// branch, refuse it.
+// branch, refuse it. A same-repository pull request's session opened while
+// its head could not be read gets its branch from the next mention that
+// reads the head in the base (SessionCoalescer.repairHeadBranch).
 func reviewSessionRepo(m mention) restdtos.CreateSessionRequestReposElem {
 	repo := restdtos.CreateSessionRequestReposElem{Name: m.RepoName, Url: m.RepoCloneURL}
 	if m.HeadBranch != nil && headInBaseRepository(m) {
@@ -400,14 +402,37 @@ func reviewSessionRepo(m mention) restdtos.CreateSessionRequestReposElem {
 // is its base repository: the delivery's head.repo.full_name (or the
 // issue_comment lookup's) names m.RepoFullName, compared without regard to
 // case, as GitHub compares names. False for a fork, for a deleted fork
-// (head.repo null) and for a head the ingress could not read. Every mention
-// records it on the pull request's claim (SessionCoalescer.CreateOrJoin,
-// github_pr_sessions.head_in_base), where reposource.
-// ReviewHeadInBaseRepository reads it: the spec alone cannot tell a branch
-// of the base from a deleted fork's branch on a session the previous
-// ingress opened.
+// (head.repo null) and for a head the ingress could not read.
 func headInBaseRepository(m mention) bool {
 	return m.HeadRepoFullName != "" && strings.EqualFold(m.HeadRepoFullName, m.RepoFullName)
+}
+
+// headRead reports whether m read its pull request's head: its head branch
+// (head.ref) is known. pull_request_review_comment and pull_request
+// "labeled" deliveries carry the pull request's head, head.repo included
+// (null once the head repository is deleted); an issue_comment delivery
+// carries none, and reads it only through resolveIssueCommentHead's lookup,
+// which sets HeadBranch, and HeadRepoFullName with it, when it succeeds and
+// leaves both unset when it fails, times out or reports no head ref.
+func headRead(m mention) bool {
+	return m.HeadBranch != nil && *m.HeadBranch != ""
+}
+
+// headInBaseRecord is what m tells the pull request's claim about whether
+// its head is a branch of its base repository (SessionCoalescer.
+// CreateOrJoin, github_pr_sessions.head_in_base), where reposource.
+// ReviewHeadInBaseRepository reads it: the spec alone cannot tell a branch
+// of the base from a deleted fork's branch on a session the previous
+// ingress opened. True when m read a head in the base, false when it read
+// a fork's or a deleted fork's; nil when it read no head, which records
+// nothing -- a pull request's head repository never changes, so a lookup
+// that failed must not overwrite what an earlier one read.
+func headInBaseRecord(m mention) *bool {
+	if !headRead(m) {
+		return nil
+	}
+	inBase := headInBaseRepository(m)
+	return &inBase
 }
 
 // NewHandler builds the POST /webhooks/github handler (controlplane/
@@ -1061,7 +1086,7 @@ func NewHandler(coalescer *SessionCoalescer, deliveries *postgres.WebhookDeliver
 		// crossing's notice, held meanwhile, is withdrawn once that reply
 		// lands -- delivered instead if it does not.
 		answerCtx := turnguard.AnsweredOnChannel(ctx, sqlcgen.SessionSpawnSourceGithub)
-		session, turn, isNew, err := coalescer.CreateOrJoin(answerCtx, m.RepoFullName, m.PRNumber, headInBaseRepository(m), req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
+		session, turn, isNew, err := coalescer.CreateOrJoin(answerCtx, m.RepoFullName, m.PRNumber, headInBaseRecord(m), m.HeadBranch, req, actor, m.IsLabelRetrigger, mentionText, fetchedHeadSHA, &reviewDepthStr, triageModelID, triageEffort, triageRecordJSON, &knowledgeMode, knowledgeDecisionJSON, reviewVerdictContextJSON)
 		if err != nil {
 			if errors.Is(err, ErrActorNotAuthorized) {
 				// ErrActorNotAuthorized fires for TWO distinct reasons

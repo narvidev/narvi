@@ -971,6 +971,62 @@ func (q *Queries) RequestSessionStop(ctx context.Context, id pgtype.UUID) (pgtyp
 	return stop_requested_at, err
 }
 
+const setReviewSessionHeadBranch = `-- name: SetReviewSessionHeadBranch :execrows
+UPDATE sessions s
+SET repos = jsonb_set(s.repos, '{0,branch}', to_jsonb($1::text))
+FROM github_pr_sessions g
+WHERE s.id = $2
+  AND g.session_id = s.id
+  AND g.repo_full_name = $3
+  AND g.pr_number = $4
+  AND g.head_in_base
+  AND (SELECT count(*) FROM github_pr_sessions c WHERE c.session_id = s.id) = 1
+  AND jsonb_typeof(s.repos) = 'array'
+  AND s.repos->0->>'url' = $5::text
+  AND coalesce(s.repos->0->>'branch', '') = ''
+`
+
+type SetReviewSessionHeadBranchParams struct {
+	Branch       string      `json:"branch"`
+	SessionID    pgtype.UUID `json:"session_id"`
+	RepoFullName string      `json:"repo_full_name"`
+	PrNumber     int32       `json:"pr_number"`
+	Url          string      `json:"url"`
+}
+
+// Technical plan §27.1, §30.4: a pull request's review session opened by a
+// mention that could not read the pull request's head (an issue_comment
+// whose pull request lookup failed) has a spec naming the base repository
+// with no branch, which the review-head rule reads as not the base's own
+// whatever the claim records. A later mention that reads the head in the
+// base gives the spec that head's branch here, so the session is what a
+// first mention that read the head would have opened.
+//
+// The GitHub ingress runs it after the mention's claim transaction has
+// committed the record, never under the claim's row lock: every session
+// actor transaction locks its session's row before it writes the claim
+// (the automatic re-review's counters), so taking the session's row under
+// the claim's would invert that order. It needs no other lock: it writes
+// only when the claim still records the head in the base, the session is
+// that claim's only one, and its primary repo is still the url the ingress
+// read, with no branch -- so it never replaces a branch, never acts for a
+// fork's pull request, and running it twice writes once. A live gen keeps
+// the SESSION_CONFIG it booted with; the spec's branch reaches the next one.
+// 0 rows: nothing to repair.
+func (q *Queries) SetReviewSessionHeadBranch(ctx context.Context, arg SetReviewSessionHeadBranchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setReviewSessionHeadBranch,
+		arg.Branch,
+		arg.SessionID,
+		arg.RepoFullName,
+		arg.PrNumber,
+		arg.Url,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateSessionConversationID = `-- name: UpdateSessionConversationID :one
 UPDATE sessions
 SET opencode_conversation_id = $2, updated_at = now()

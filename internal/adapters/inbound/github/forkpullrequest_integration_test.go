@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"net/http"
 	"reflect"
+	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -27,6 +28,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -328,26 +330,223 @@ func TestGitHubIntegration_AMentionOnAnExistingSessionRecordsWhetherTheHeadIsInT
 	}
 }
 
-// TestGitHubIntegration_AFailedHeadLookupRecordsTheHeadNotInTheBase: an
-// issue_comment mention whose pull request lookup fails has no head
-// repository to read; it records the head not in the base -- fail closed.
-// The pull request's next mention records it again, as
-// TestGitHubIntegration_AMentionOnAnExistingSessionRecordsWhetherTheHeadIsInTheBase
-// pins for a mention joining an existing session.
-func TestGitHubIntegration_AFailedHeadLookupRecordsTheHeadNotInTheBase(t *testing.T) {
-	ctx := context.Background()
+// switchablePullRequestResolver answers an issue_comment mention's head
+// lookup as the test last set it: a pull request, or an error. The handler
+// calls it from the server's goroutine, so it is guarded.
+type switchablePullRequestResolver struct {
+	mu  sync.Mutex
+	pr  githubapi.PullRequest
+	err error
+}
+
+func (f *switchablePullRequestResolver) set(pr githubapi.PullRequest, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pr, f.err = pr, err
+}
+
+func (f *switchablePullRequestResolver) GetPullRequest(_ context.Context, _, _ string, _ int32, _ string) (githubapi.PullRequest, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.pr, f.err
+}
+
+// errLookupOutage is what a failed issue_comment head lookup answers.
+var errLookupOutage = errors.New("simulated GitHub API outage")
+
+// newSwitchableLookupRig is newTestRig wired as production wires the head
+// lookup and the label lane, its lookup failing until the test sets it.
+func newSwitchableLookupRig(t *testing.T) (testRig, *switchablePullRequestResolver) {
+	t.Helper()
+	resolver := &switchablePullRequestResolver{err: errLookupOutage}
 	rig := newTestRig(t, func(cfg *githubingress.Config) {
-		cfg.PullRequests = &fakePullRequestResolver{err: errors.New("simulated GitHub API outage")}
+		cfg.ReReviewLabel = "run-review"
 		cfg.Timeouts = platform.DefaultTimeouts()
+		cfg.PullRequests = resolver
 	})
-	const commenterID = 91790011
-	createLinkedGitHubUser(ctx, t, rig.users, rig.identities, commenterID, sqlcgen.UserRoleMaintainer)
-	const prNumber = 1796
-	body := issueCommentBodyWithCommenter(forkBaseFullName, forkBaseName, forkBaseCloneURL, prNumber, "failed-lookup", commenterID, "fork-reviewer")
-	if status := postWebhook(t, rig, body, "delivery-failed-lookup-record"); status != http.StatusOK {
-		t.Fatalf("status = %d, want 200", status)
+	return rig, resolver
+}
+
+// claimedSessionSpec reads forkBaseFullName#prNumber's review session's
+// spec, raw.
+func claimedSessionSpec(ctx context.Context, t *testing.T, rig testRig, prNumber int) []byte {
+	t.Helper()
+	var raw []byte
+	if err := rig.pool.QueryRow(ctx, `SELECT s.repos FROM sessions s JOIN github_pr_sessions g ON g.session_id = s.id
+		WHERE g.repo_full_name = $1 AND g.pr_number = $2`, forkBaseFullName, prNumber).Scan(&raw); err != nil {
+		t.Fatalf("read the review session's spec: %v", err)
 	}
-	if got := recordedHeadInBase(ctx, t, rig, prNumber); got == nil || *got {
-		t.Errorf("the claim's head_in_base = %v, want false: a head the ingress could not read is not in the base", got)
+	return raw
+}
+
+// specBranch is a spec's primary repo's branch; nil for none.
+func specBranch(t *testing.T, raw []byte) *string {
+	t.Helper()
+	var repos []struct {
+		Branch *string `json:"branch"`
+	}
+	if err := json.Unmarshal(raw, &repos); err != nil || len(repos) == 0 {
+		t.Fatalf("decode the spec %s: %v", raw, err)
+	}
+	return repos[0].Branch
+}
+
+// TestGitHubIntegration_AMentionThatReadsNoHeadRecordsNothing: an
+// issue_comment mention whose pull request lookup fails has read no head,
+// so it records nothing on the claim (technical plan §27.1) -- a pull
+// request's head repository never changes, so what an earlier mention read
+// stays, and a claim no mention has read stays NULL, which fails closed.
+// The mention still joins the session and starts its turn, and its
+// session's spec is left as it was.
+func TestGitHubIntegration_AMentionThatReadsNoHeadRecordsNothing(t *testing.T) {
+	inBase, notInBase := true, false
+	for i, tc := range []struct {
+		name string
+		// prior is the claim's record before the mention that reads no
+		// head; set after the first mention opened the session.
+		prior *bool
+	}{
+		{name: "recorded in the base", prior: &inBase},
+		{name: "recorded not in the base", prior: &notInBase},
+		{name: "never recorded", prior: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			rig, _ := newSwitchableLookupRig(t)
+			commenterID := int64(91790020 + i)
+			createLinkedGitHubUser(ctx, t, rig.users, rig.identities, commenterID, sqlcgen.UserRoleMaintainer)
+			prNumber := 1910 + i
+			sameRepo := forkCaseHeads()[2]
+
+			// The first mention, a review comment, carries the head.
+			if status := postWebhookEventType(t, rig, reviewCommentOn(sameRepo, prNumber, commenterID), fmt.Sprintf("delivery-no-head-open-%d", i), "pull_request_review_comment"); status != http.StatusOK {
+				t.Fatalf("first mention: status = %d, want 200", status)
+			}
+			if _, err := rig.pool.Exec(ctx, `UPDATE github_pr_sessions SET head_in_base = $3 WHERE repo_full_name = $1 AND pr_number = $2`, forkBaseFullName, prNumber, tc.prior); err != nil {
+				t.Fatal(err)
+			}
+			specBefore := claimedSessionSpec(ctx, t, rig, prNumber)
+
+			// The next one, an issue comment, whose lookup fails.
+			body := issueCommentBodyWithCommenter(forkBaseFullName, forkBaseName, forkBaseCloneURL, prNumber, "no-head", commenterID, "fork-reviewer")
+			if status := postWebhook(t, rig, body, fmt.Sprintf("delivery-no-head-join-%d", i)); status != http.StatusOK {
+				t.Fatalf("mention reading no head: status = %d, want 200", status)
+			}
+			got := recordedHeadInBase(ctx, t, rig, prNumber)
+			if (got == nil) != (tc.prior == nil) || (got != nil && *got != *tc.prior) {
+				t.Errorf("the claim's head_in_base = %v after a mention that read no head, want %v kept", got, tc.prior)
+			}
+			if specAfter := claimedSessionSpec(ctx, t, rig, prNumber); string(specAfter) != string(specBefore) {
+				t.Errorf("the spec = %s after a mention that read no head, want %s", specAfter, specBefore)
+			}
+			if n := countRows(ctx, t, rig, `SELECT count(*) FROM turns`); n != 2 {
+				t.Errorf("turns = %d, want 2: the mention joined the session all the same", n)
+			}
+		})
+	}
+
+	t.Run("a new claim", func(t *testing.T) {
+		ctx := context.Background()
+		rig, _ := newSwitchableLookupRig(t)
+		const commenterID = 91790029
+		createLinkedGitHubUser(ctx, t, rig.users, rig.identities, commenterID, sqlcgen.UserRoleMaintainer)
+		const prNumber = 1919
+		body := issueCommentBodyWithCommenter(forkBaseFullName, forkBaseName, forkBaseCloneURL, prNumber, "no-head", commenterID, "fork-reviewer")
+		if status := postWebhook(t, rig, body, "delivery-no-head-new"); status != http.StatusOK {
+			t.Fatalf("status = %d, want 200", status)
+		}
+		if got := recordedHeadInBase(ctx, t, rig, prNumber); got != nil {
+			t.Errorf("the claim's head_in_base = %v, want NULL: a head the ingress could not read is unknown", *got)
+		}
+		if branch := specBranch(t, claimedSessionSpec(ctx, t, rig, prNumber)); branch != nil {
+			t.Errorf("the spec's branch = %q, want none: the head was not read", *branch)
+		}
+	})
+}
+
+// TestGitHubIntegration_AMentionThatReadsTheHeadInTheBaseGivesTheSpecItsBranch:
+// a same-repository pull request's first mention, an issue comment whose
+// lookup fails, opens a session naming the base with no branch, and
+// records nothing. A later mention that reads the head in the base -- an
+// issue comment whose lookup succeeds, a review comment, a label --
+// records it and gives the spec the head's branch, so the review-head rule
+// reads the session as the base's own, as if its first mention had read
+// the head. A mention that then reads no head changes neither.
+func TestGitHubIntegration_AMentionThatReadsTheHeadInTheBaseGivesTheSpecItsBranch(t *testing.T) {
+	sameRepo := forkCaseHeads()[2]
+	for i, tc := range []struct {
+		name      string
+		eventType string
+		body      func(prNumber int, commenterID int64) []byte
+	}{
+		{name: "an issue comment whose lookup succeeds", eventType: "issue_comment", body: func(prNumber int, commenterID int64) []byte {
+			return issueCommentBodyWithCommenter(forkBaseFullName, forkBaseName, forkBaseCloneURL, prNumber, "lookup-ok", commenterID, "fork-reviewer")
+		}},
+		{name: "a review comment", eventType: "pull_request_review_comment", body: func(prNumber int, commenterID int64) []byte {
+			return reviewCommentOn(sameRepo, prNumber, commenterID)
+		}},
+		{name: "a label", eventType: "pull_request", body: func(prNumber int, commenterID int64) []byte {
+			return labeledOn(sameRepo, prNumber, commenterID)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			rig, resolver := newSwitchableLookupRig(t)
+			commenterID := int64(91790030 + i)
+			createLinkedGitHubUser(ctx, t, rig.users, rig.identities, commenterID, sqlcgen.UserRoleMaintainer)
+			prNumber := 1920 + i
+			issueComment := func(label string) []byte {
+				return issueCommentBodyWithCommenter(forkBaseFullName, forkBaseName, forkBaseCloneURL, prNumber, label, commenterID, "fork-reviewer")
+			}
+
+			if status := postWebhook(t, rig, issueComment("lookup-failed"), fmt.Sprintf("delivery-repair-open-%d", i)); status != http.StatusOK {
+				t.Fatalf("first mention: status = %d, want 200", status)
+			}
+			if branch := specBranch(t, claimedSessionSpec(ctx, t, rig, prNumber)); branch != nil {
+				t.Fatalf("the spec's branch = %q after a failed lookup, want none", *branch)
+			}
+			if got := recordedHeadInBase(ctx, t, rig, prNumber); got != nil {
+				t.Fatalf("the claim's head_in_base = %v after a failed lookup, want NULL", *got)
+			}
+
+			resolver.set(githubapi.PullRequest{HeadRef: sameRepo.ref, HeadSHA: "sha-head-" + sameRepo.ref, HeadRepoFullName: forkBaseFullName}, nil)
+			if status := postWebhookEventType(t, rig, tc.body(prNumber, commenterID), fmt.Sprintf("delivery-repair-read-%d", i), tc.eventType); status != http.StatusOK {
+				t.Fatalf("mention reading the head: status = %d, want 200", status)
+			}
+			assertRepaired := func(after string) {
+				t.Helper()
+				spec := claimedSessionSpec(ctx, t, rig, prNumber)
+				if branch := specBranch(t, spec); branch == nil || *branch != sameRepo.ref {
+					t.Errorf("%s: the spec = %s, want its branch %q", after, spec, sameRepo.ref)
+				}
+				var repos []struct {
+					URL string `json:"url"`
+				}
+				if err := json.Unmarshal(spec, &repos); err != nil || len(repos) != 1 || repos[0].URL != forkBaseCloneURL {
+					t.Errorf("%s: the spec = %s (%v), want one repo, the base's %q", after, spec, err, forkBaseCloneURL)
+				}
+				record := recordedHeadInBase(ctx, t, rig, prNumber)
+				if record == nil || !*record {
+					t.Errorf("%s: the claim's head_in_base = %v, want true", after, record)
+				}
+				if !reposource.ReviewHeadInBaseRepository(forkBaseFullName, record, spec) {
+					t.Errorf("%s: the review-head rule reads the session as not the base's own (record %v, spec %s)", after, record, spec)
+				}
+			}
+			assertRepaired("after the mention that read the head")
+
+			resolver.set(githubapi.PullRequest{}, errLookupOutage)
+			if status := postWebhook(t, rig, issueComment("lookup-failed-again"), fmt.Sprintf("delivery-repair-unread-%d", i)); status != http.StatusOK {
+				t.Fatalf("mention reading no head: status = %d, want 200", status)
+			}
+			assertRepaired("after a later mention that read no head")
+
+			if n := countRows(ctx, t, rig, `SELECT count(*) FROM sessions WHERE spawn_source = 'github'`); n != 1 {
+				t.Errorf("sessions = %d, want the one every mention joined", n)
+			}
+			if n := countRows(ctx, t, rig, `SELECT count(*) FROM turns`); n != 3 {
+				t.Errorf("turns = %d, want 3", n)
+			}
+		})
 	}
 }
