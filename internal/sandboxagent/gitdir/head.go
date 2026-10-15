@@ -49,7 +49,7 @@ var detachedHeadPattern = regexp.MustCompile(`^[0-9a-f]{40}\n$`)
 //     and open) and REJECTED unless it is a regular file no larger than
 //     maxHeadBytes.
 //   - the content is accepted ONLY if it is EXACTLY one of two shapes:
-//     "ref: refs/heads/<name>\n" with reposource.ValidateBranch(name)
+//     "ref: refs/heads/<name>\n" with reposource.ValidateBranchName(name)
 //     passing, or a bare 40-character lowercase hex sha followed by "\n"
 //     (a detached HEAD). Anything else is a hard error -- the error text
 //     never includes the offending bytes: a root process reading an
@@ -100,19 +100,19 @@ func SyncHeadIn(repo githarden.Repo) error {
 // validHeadContents reports whether data is exactly one of the two shapes
 // SyncHeadIn accepts. See its own doc comment.
 //
-// The branch name is checked TWICE, against two DIFFERENT rules, and both
-// must pass: reposource.ValidateBranch (this codebase's own general
-// argument-injection guard -- empty/leading-dash/control-chars only,
-// deliberately permissive about "." otherwise, since it exists to keep a
-// session-supplied branch name from being misread as a git command-line
-// flag, not to fully validate git's own refname grammar) is NOT sufficient
-// on its own here: it accepts a name containing "..", which git's OWN
-// check-ref-format rules forbid ANYWHERE in a refname (git-check-ref-
-// format(1): "They cannot have two consecutive dots .. anywhere"). A
-// runtime-planted "ref: refs/heads/../x\n" is exactly the shape that rule
-// exists to catch -- rejected here explicitly, independent of whatever a
-// later git invocation resolving this same HEAD would separately do with
-// it, since this package's own posture is "validate before trusting a
+// The branch name must pass reposource.ValidateBranchName, git's own
+// branch-name rule (git-check-ref-format(1) --branch) -- so it refuses
+// ".." anywhere ("They cannot have two consecutive dots .. anywhere").
+// Not reposource.ValidateBranch: that is the rule for a branch about to
+// become a refspec, and it refuses names git accepts, such as "+wip",
+// which the runtime may legitimately have checked out; refusing its HEAD
+// would stop every agent git call and a restore boot's Seed. This name
+// never becomes a refspec.
+//
+// A runtime-planted "ref: refs/heads/../x\n" is exactly the shape git's
+// rule exists to catch -- rejected here, independent of whatever a later
+// git invocation resolving this same HEAD would separately do with it,
+// since this package's own posture is "validate before trusting a
 // runtime-authored value," never "assume a downstream git call will also
 // catch it."
 func validHeadContents(data []byte) bool {
@@ -122,10 +122,7 @@ func validHeadContents(data []byte) bool {
 		if !ok || strings.Contains(name, "\n") {
 			return false
 		}
-		if strings.Contains(name, "..") {
-			return false
-		}
-		return reposource.ValidateBranch(name) == nil
+		return reposource.ValidateBranchName(name) == nil
 	}
 	return detachedHeadPattern.MatchString(s)
 }
@@ -216,7 +213,10 @@ func SyncHeadOut(ctx context.Context, sup *supervisor.Supervisor, repo githarden
 	if !ok || strings.Contains(branch, "\n") {
 		return fmt.Errorf("gitdir: sync head out: agent HEAD is not a well-formed symbolic ref: %q", s)
 	}
-	if err := reposource.ValidateBranch(branch); err != nil {
+	// git's own branch-name rule, as SyncHeadIn applies it (see
+	// validHeadContents): the name only ever follows "refs/heads/" here,
+	// never a refspec.
+	if err := reposource.ValidateBranchName(branch); err != nil {
 		return fmt.Errorf("gitdir: sync head out: invalid branch %q: %w", branch, err)
 	}
 
