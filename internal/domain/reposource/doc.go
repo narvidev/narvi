@@ -35,7 +35,9 @@
 //     allowlist is not appropriate there), and accepts only a name git
 //     itself accepts as a branch that `git push` reads as exactly that
 //     branch: no leading "+" (a forced push), no ":" (a deletion or
-//     another destination). ValidateRemoteName closes the
+//     another destination). ValidateBranchName is git's rule alone, for
+//     a branch name read back from git's own state that never becomes a
+//     refspec (a HEAD file). ValidateRemoteName closes the
 //     remote half more strictly still, with its OWN charset allowlist
 //     (the same one ValidateRepoName uses, [a-zA-Z0-9_.-]+, explicitly
 //     rejecting the literal "." and ".." segments too) rather than

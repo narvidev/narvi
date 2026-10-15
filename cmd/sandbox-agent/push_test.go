@@ -455,7 +455,7 @@ func TestPushOneRepo_RefspecShapedBranchRejectedBeforeSpawn(t *testing.T) {
 		{branch: ":main", reason: reposource.ErrRefNotBranchName},
 		{branch: "work:main", reason: reposource.ErrRefNotBranchName},
 		{branch: "refs/heads/*", reason: reposource.ErrRefNotBranchName},
-		{branch: "@", reason: reposource.ErrRefNotBranchName},
+		{branch: "@", reason: reposource.ErrRefLoneAt},
 	}
 	for _, tc := range tests {
 		t.Run(tc.branch, func(t *testing.T) {
@@ -553,13 +553,14 @@ func TestGitPushRefspecBranch_RealPremise(t *testing.T) {
 	}
 }
 
-// TestValidateBranch_AgreesWithGitCheckRefFormat holds reposource.
-// ValidateBranch, which cannot run git itself (no I/O in /internal/domain),
-// to the real git binary: it accepts a name exactly when `git check-ref-
-// format --branch` does, run outside any repository so nothing like
-// "@{-1}" is expanded, except for the names git accepts but would read as
-// something other than that branch on `git push` -- a leading "+" (a
-// forced push) and "@" (HEAD) -- which it refuses.
+// TestValidateBranch_AgreesWithGitCheckRefFormat holds reposource's two
+// branch checks, which cannot run git themselves (no I/O in
+// /internal/domain), to the real git binary, run outside any repository so
+// nothing like "@{-1}" is expanded. ValidateBranchName accepts a name
+// exactly when `git check-ref-format --branch` does. ValidateBranch agrees
+// too, except for the names git accepts but would read as something other
+// than that branch on `git push` -- a leading "+" (a forced push) and "@"
+// (HEAD) -- which it refuses.
 func TestValidateBranch_AgreesWithGitCheckRefFormat(t *testing.T) {
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
@@ -590,6 +591,9 @@ func TestValidateBranch_AgreesWithGitCheckRefFormat(t *testing.T) {
 
 	for _, name := range names {
 		git := gitAccepts(name)
+		if plain := reposource.ValidateBranchName(name) == nil; plain != git {
+			t.Errorf("%q: git accepts=%v, ValidateBranchName accepts=%v; want them to agree", name, git, plain)
+		}
 		ours := reposource.ValidateBranch(name) == nil
 		switch {
 		case stricterThanGit[name]:

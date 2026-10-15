@@ -234,6 +234,49 @@ func TestValidateBranch_LeadingPlusRefused(t *testing.T) {
 	}
 }
 
+// TestValidateBranchName: git's own branch-name rule, for a name read back
+// from git's state that never becomes a refspec (a HEAD file). It accepts
+// what git accepts -- "+wip" and "@" included, which ValidateBranch
+// refuses -- and refuses what git refuses, for the same reasons.
+func TestValidateBranchName(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		in         string
+		wantReason error // nil: accepted
+	}{
+		{in: "main"},
+		{in: "feature/foo"},
+		{in: "+wip"},
+		{in: "+"},
+		{in: "++main"},
+		{in: "@"},
+		{in: "", wantReason: reposource.ErrRefEmpty},
+		{in: "-x", wantReason: reposource.ErrRefDashPrefix},
+		{in: "a\nb", wantReason: reposource.ErrRefControlChar},
+		{in: ":main", wantReason: reposource.ErrRefNotBranchName},
+		{in: "a..b", wantReason: reposource.ErrRefNotBranchName},
+		{in: "HEAD", wantReason: reposource.ErrRefNotBranchName},
+		{in: "refs/heads/*", wantReason: reposource.ErrRefNotBranchName},
+		{in: "+a:b", wantReason: reposource.ErrRefNotBranchName},
+	}
+	for _, tc := range tests {
+		t.Run(tc.in, func(t *testing.T) {
+			t.Parallel()
+			err := reposource.ValidateBranchName(tc.in)
+			if tc.wantReason == nil {
+				if err != nil {
+					t.Fatalf("ValidateBranchName(%q) = %v, want nil: git accepts it as a branch name", tc.in, err)
+				}
+				return
+			}
+			var refErr *reposource.InvalidRefError
+			if !errors.Is(err, tc.wantReason) || !errors.As(err, &refErr) {
+				t.Fatalf("ValidateBranchName(%q) = %v, want an *InvalidRefError wrapping %v", tc.in, err, tc.wantReason)
+			}
+		})
+	}
+}
+
 // testValidateRef runs the shared table ValidateBranch must satisfy
 // (validateRef's own rules) -- kind is used only to build readable subtest
 // names. ValidateRemoteName no longer shares this table (see
@@ -313,7 +356,7 @@ func testValidateRef(t *testing.T, kind string, validate func(string) error) {
 		{name: "two dots are rejected", in: "a..b", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
 		{name: "at-brace is rejected", in: "main@{1}", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
 		{name: "HEAD is rejected", in: "HEAD", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
-		{name: "a lone at sign is rejected (git reads it as HEAD)", in: "@", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
+		{name: "a lone at sign is rejected (git reads it as HEAD)", in: "@", wantErr: true, wantReason: reposource.ErrRefLoneAt},
 		{name: "trailing dot is rejected", in: "main.", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
 		{name: "leading slash is rejected", in: "/main", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
 		{name: "trailing slash is rejected", in: "main/", wantErr: true, wantReason: reposource.ErrRefNotBranchName},
