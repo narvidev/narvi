@@ -42,8 +42,10 @@ describe('heldAdvancesCountText', () => {
 })
 
 describe('FREEZE_RESUME_BOUNDS', () => {
-  it('names the two held actions a lifted freeze does not bring back', () => {
+  it('names the three held actions a lifted freeze does not bring back, as §40.2, the guide and the runbook do', () => {
+    expect(FREEZE_RESUME_BOUNDS).toMatch(/^Three do not: /)
     expect(FREEZE_RESUME_BOUNDS).toContain('a scheduled automation run held more than ten minutes waits for its next occurrence')
-    expect(FREEZE_RESUME_BOUNDS).toContain('a sentinel fix held from merging is not merged automatically')
+    expect(FREEZE_RESUME_BOUNDS).toContain('a sentinel fix held from merging stays open for a person')
+    expect(FREEZE_RESUME_BOUNDS).toContain("a pull request auto-approved more than seven days ago waits for a person's Merge click")
   })
 })

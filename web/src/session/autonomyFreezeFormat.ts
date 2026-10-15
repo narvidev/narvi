@@ -7,14 +7,19 @@ import { formatRelativeTime } from './relativeTime'
 
 /**
  * FREEZE_RESUME_BOUNDS is what a lifted freeze does not bring back, in
- * the words a person reads: §40.2's bounds. A scheduled run is caught up
- * only within its ten-minute catch-up window (AutomationCronCatchUpWindow),
- * and the sentinel-fix merge gate runs once per close event of the
- * origin, so a merge it skipped while frozen is never retried. Every
- * promise that held actions start again carries this sentence.
+ * the words a person reads: §40.2's three bounds, one clause each. A
+ * scheduled run is caught up only within its ten-minute catch-up window
+ * (AutomationCronCatchUpWindow); the sentinel-fix merge gate runs once per
+ * close event of the origin, so a merge it skipped while frozen is never
+ * retried; and the auto-merge worker lists only verdicts newer than
+ * AutoMergeCandidateLookback (seven days), so one that aged past it while
+ * frozen is left to a person's Merge click. Every promise that held
+ * actions start again carries this sentence, and the web guide, §40.2,
+ * the runbook, the AutonomyFreeze contract and postUnfreezeAutonomy's doc
+ * name the same three.
  */
 export const FREEZE_RESUME_BOUNDS =
-  'Two do not: a scheduled automation run held more than ten minutes waits for its next occurrence, and a sentinel fix held from merging is not merged automatically -- it stays open for a person.'
+  "Three do not: a scheduled automation run held more than ten minutes waits for its next occurrence; a sentinel fix held from merging stays open for a person; and a pull request auto-approved more than seven days ago waits for a person's Merge click."
 
 /**
  * frozenByText names who set the freeze: the administrator's display name,

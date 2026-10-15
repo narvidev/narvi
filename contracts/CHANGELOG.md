@@ -21,9 +21,11 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
   `ListDecisionInboxResponse.autonomyFreeze`: whether autonomy is frozen
   platform-wide, and since when, by whom and why (technical plan §40.2).
   While frozen no automatic action starts; once the freeze is lifted each
-  held action starts again, but for the bounds §40.2 names (a scheduled
-  automation run held past its ten-minute catch-up window waits for its
-  next occurrence, and a sentinel fix's automatic merge is not retried).
+  held action starts again, but for the three bounds §40.2 names (a
+  scheduled automation run held past its ten-minute catch-up window waits
+  for its next occurrence, a sentinel fix's automatic merge is not
+  retried, and a pull request auto-approved more than seven days ago is
+  left to a person's Merge click).
   Who set it is null when that is not on record: the user no longer
   exists, or the freeze was written by hand, as an earlier release's
   runbook did. A new `$def` grades MINOR (row 32).

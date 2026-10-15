@@ -184,27 +184,38 @@ describe('AutonomyFreezeStatus -- the freeze read-only, its free text as text', 
   })
 })
 
-// What a lifted freeze brings back is bounded (technical plan §40.2): a
-// scheduled run held past its catch-up window waits for its next
-// occurrence, and a sentinel fix held from merging is not merged
-// automatically. The card says so wherever it says held actions start
-// again, and never promises that nothing is lost.
+// What a lifted freeze brings back is bounded (technical plan §40.2's three
+// bounds): a scheduled run held past its catch-up window waits for its next
+// occurrence, a sentinel fix held from merging stays open for a person, and
+// a pull request auto-approved more than seven days ago waits for a
+// person's Merge click. The card says all three wherever it says held
+// actions start again, and never promises that nothing is lost.
 describe('AutonomyFreezePanel -- what a lifted freeze brings back is stated with its bounds', () => {
-  const BOUNDS = 'a scheduled automation run held more than ten minutes waits for its next occurrence, and a sentinel fix held from merging is not merged automatically'
+  // As rendered: React escapes the apostrophe.
+  const BOUNDS = [
+    'Three do not:',
+    'a scheduled automation run held more than ten minutes waits for its next occurrence',
+    'a sentinel fix held from merging stays open for a person',
+    'a pull request auto-approved more than seven days ago waits for a person&#x27;s Merge click',
+  ]
 
   for (const [name, freeze] of [['not frozen', notFrozen()], ['frozen', frozen()]] as const) {
-    it(`the card states both bounds and never that nothing is lost (${name})`, () => {
+    it(`the card states all three bounds and never that nothing is lost (${name})`, () => {
       const { html } = render('admin', freeze)
       expect(html).toContain('held actions start')
-      expect(html).toContain(BOUNDS)
-      expect(html).not.toMatch(/nothing is lost/i)
+      for (const bound of BOUNDS) {
+        expect(html).toContain(bound)
+      }
+      expect(html).not.toMatch(/nothing is lost|Two do not/i)
     })
   }
 
-  it('the frozen status states both bounds where it says held actions start again', () => {
+  it('the frozen status states all three bounds where it says held actions start again', () => {
     const html = renderToStaticMarkup(<AutonomyFreezeStatus freeze={frozen()} />)
     expect(html).toContain('Held actions start once the freeze is lifted.')
-    expect(html).toContain(BOUNDS)
+    for (const bound of BOUNDS) {
+      expect(html).toContain(bound)
+    }
     expect(html).not.toContain('Each waits, and starts once the freeze is lifted')
   })
 })

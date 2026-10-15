@@ -1032,14 +1032,15 @@ func (j *Automation) UnmarshalJSON(value []byte) error {
 // autonomy is frozen platform-wide. While frozen, no automatic action starts -- no
 // auto-merge, no sentinel-fix merge, no sentinel auto-fix, no description rewrite,
 // no automatic re-review, no automation run and no workflow advance -- and each
-// starts again once an administrator lifts the freeze, but for §40.2's bounds: a
-// scheduled automation run held past its ten-minute catch-up window waits for its
-// next occurrence, and a sentinel fix held from merging is not merged
-// automatically; a person's own commands are never held, and a turn already
-// running finishes. Readable by every signed-in role (authz.ActionViewSessions);
-// freezing and unfreezing are admin only (authz.ActionManageAutonomyFreeze,
-// §13.3). Every field is present; the four describing the freeze are null when
-// autonomy is not frozen.
+// starts again once an administrator lifts the freeze, but for §40.2's three
+// bounds: a scheduled automation run held past its ten-minute catch-up window
+// waits for its next occurrence, a sentinel fix held from merging is not merged
+// automatically, and a pull request auto-approved more than seven days ago
+// (AutoMergeCandidateLookback) is left to a person's Merge click; a person's own
+// commands are never held, and a turn already running finishes. Readable by every
+// signed-in role (authz.ActionViewSessions); freezing and unfreezing are admin
+// only (authz.ActionManageAutonomyFreeze, §13.3). Every field is present; the four
+// describing the freeze are null when autonomy is not frozen.
 type AutonomyFreeze struct {
 	// True while a freeze is in force: no automatic action starts on any replica.
 	Frozen bool `json:"frozen" yaml:"frozen" mapstructure:"frozen"`
