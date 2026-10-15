@@ -156,6 +156,33 @@ type Timeouts struct {
 	// (TestRotationFieldsAreReadOnlyInPlatform).
 	RotationSnapshotWait time.Duration
 
+	// SnapshotReportWait bounds how long a pending turn is held behind a
+	// snapshot that is not a rotation's -- the post-turn snapshot (§3.3)
+	// -- measured on the database's clock from the snapshot's start
+	// (sandboxes.snapshot_started_at). The agent reports a failed mint
+	// with no frame, and one that dies mid-mint reports nothing, so
+	// without a bound a snapshot that never reports would hold the turn
+	// until the sandbox's deadline, or for good when none is known. Past
+	// it the runway gate gives the snapshot up (technical plan §35.3,
+	// sandbox.EvaluateRunway's rows 7 to 7b): when the agent has been
+	// silent for SteadyHeartbeatBudget too -- its heartbeats run apart
+	// from the read loop the snapshot blocks -- it is gone and the gen is
+	// retired, so the turn runs on a replacement; otherwise only the
+	// snapshot failed, the sandbox goes back to ready with its work, and
+	// takes the turn. Not given a value in the plan; derived from this
+	// file alone, as the larger of two sums: an idle agent's whole answer
+	// to the snapshot command (SandboxCommandSendTimeout plus
+	// SnapshotMintTimeout, plus MinTimeoutMargin: 100s), and a heartbeat
+	// budget run in full within the wait, so a silent agent has been
+	// silent past it when the wait ends (SteadyHeartbeatBudget plus
+	// MinTimeoutMargin: 120s) -- 2 minutes. A snapshot queued on the
+	// agent's read loop behind an earlier push can still be answered
+	// later than that; it is then given up early, which costs that one
+	// snapshot, never the turn: its late report finds the command
+	// forgotten and is ignored. Validate keeps it positive and above both
+	// sums.
+	SnapshotReportWait time.Duration
+
 	// SupervisorTurnCap's CURRENT role is an invariant-chain bound ensuring
 	// config sanity only: Validate below checks ProviderHardCap >
 	// SupervisorTurnCap > TurnDeadline as a pairwise VALUE comparison, and
@@ -4464,6 +4491,7 @@ func DefaultTimeouts() Timeouts {
 		ReviewSandboxLifetime:     providerHardCap,   // §35.2; not specified, chosen -- see field doc comment
 		RotationRunwayFloor:       13 * time.Minute,  // §35.3; not specified, derived -- see field doc comment
 		RotationSnapshotWait:      2 * time.Minute,   // §35.3; not specified, derived -- see field doc comment
+		SnapshotReportWait:        2 * time.Minute,   // §35.3; not specified, derived -- see field doc comment
 		SupervisorTurnCap:         90 * time.Minute,  // not specified; chosen with margin below ProviderHardCap
 		TurnDeadline:              60 * time.Minute,  // not specified; chosen with margin below SupervisorTurnCap
 		StopGrace:                 30 * time.Second,  // not specified; chosen (§3.3's stop)
@@ -5563,6 +5591,17 @@ func (t Timeouts) Validate() error {
 	check("RotationSnapshotWait > SnapshotMintTimeout + SandboxCommandSendTimeout",
 		"RotationSnapshotWait", t.RotationSnapshotWait,
 		"SnapshotMintTimeout+SandboxCommandSendTimeout", t.SnapshotMintTimeout+t.SandboxCommandSendTimeout)
+	// A snapshot that is not a rotation's holds a pending turn for at most
+	// SnapshotReportWait: longer than an idle agent's answer, and long
+	// enough for a silent agent to have missed its heartbeat budget. See
+	// SnapshotReportWait's doc comment.
+	mustBePositive("SnapshotReportWait", t.SnapshotReportWait)
+	check("SnapshotReportWait > SnapshotMintTimeout + SandboxCommandSendTimeout",
+		"SnapshotReportWait", t.SnapshotReportWait,
+		"SnapshotMintTimeout+SandboxCommandSendTimeout", t.SnapshotMintTimeout+t.SandboxCommandSendTimeout)
+	check("SnapshotReportWait > SteadyHeartbeatBudget",
+		"SnapshotReportWait", t.SnapshotReportWait,
+		"SteadyHeartbeatBudget", t.SteadyHeartbeatBudget)
 	check("RotationRunwayFloor > MCPStatusDeliveryWindow + RotationSnapshotWait",
 		"RotationRunwayFloor", t.RotationRunwayFloor,
 		"MCPStatusDeliveryWindow+RotationSnapshotWait", t.MCPStatusDeliveryWindow+t.RotationSnapshotWait)

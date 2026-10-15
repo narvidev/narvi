@@ -3703,13 +3703,69 @@ func TestValidate_RotationSnapshotWait(t *testing.T) {
 		}},
 		{name: "a mint timeout raised past the wait", mutate: func(to *platform.Timeouts) {
 			to.SnapshotMintTimeout = to.RotationSnapshotWait
-		}, want: []string{waitLink}},
+		}, want: []string{waitLink, "SnapshotReportWait > SnapshotMintTimeout + SandboxCommandSendTimeout"}},
 		{name: "raised past the floor's room", mutate: func(to *platform.Timeouts) {
 			to.RotationSnapshotWait = 3 * time.Minute
 		}, want: []string{
 			"RotationRunwayFloor > MCPStatusDeliveryWindow + RotationSnapshotWait",
 			"RotationThreshold(default) > MCPStatusDeliveryWindow + RotationSnapshotWait",
 			"RotationThreshold(review) > MCPStatusDeliveryWindow + RotationSnapshotWait",
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assertViolations(t, tc.mutate, tc.want)
+		})
+	}
+}
+
+// TestValidate_SnapshotReportWait covers every Validate link of the bound
+// on a snapshot that is not a rotation's (technical plan §35.3,
+// sandbox.EvaluateRunway's rows 7 to 7b): the shipped 2 minutes; positive;
+// above an idle agent's answer to the snapshot command and above the
+// steady heartbeat budget, each by MinTimeoutMargin, with the boundary at
+// exactly the margin accepted. Each case reports exactly the violations
+// listed.
+func TestValidate_SnapshotReportWait(t *testing.T) {
+	t.Parallel()
+
+	if got := platform.DefaultTimeouts().SnapshotReportWait; got != 2*time.Minute {
+		t.Fatalf("DefaultTimeouts().SnapshotReportWait = %v, want 2m", got)
+	}
+	const (
+		answerLink    = "SnapshotReportWait > SnapshotMintTimeout + SandboxCommandSendTimeout"
+		heartbeatLink = "SnapshotReportWait > SteadyHeartbeatBudget"
+	)
+	tests := []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		want   []string
+	}{
+		{name: "the shipped value", mutate: func(*platform.Timeouts) {}},
+		{name: "zero", mutate: func(to *platform.Timeouts) { to.SnapshotReportWait = 0 },
+			want: []string{"positive: SnapshotReportWait", answerLink, heartbeatLink}},
+		{name: "negative", mutate: func(to *platform.Timeouts) { to.SnapshotReportWait = -time.Second },
+			want: []string{"positive: SnapshotReportWait", answerLink, heartbeatLink}},
+		{name: "exactly the margin above the heartbeat budget", mutate: func(to *platform.Timeouts) {
+			to.SnapshotReportWait = to.SteadyHeartbeatBudget + platform.MinTimeoutMargin
+		}},
+		{name: "a second short of the heartbeat budget's margin", mutate: func(to *platform.Timeouts) {
+			to.SnapshotReportWait = to.SteadyHeartbeatBudget + platform.MinTimeoutMargin - time.Second
+		}, want: []string{heartbeatLink}},
+		{name: "a heartbeat budget raised past the wait", mutate: func(to *platform.Timeouts) {
+			to.SteadyHeartbeatBudget = to.SnapshotReportWait
+		}, want: []string{heartbeatLink}},
+		{name: "exactly the margin above the mint and the send", mutate: func(to *platform.Timeouts) {
+			to.SteadyHeartbeatBudget = time.Minute
+			to.SnapshotReportWait = to.SnapshotMintTimeout + to.SandboxCommandSendTimeout + platform.MinTimeoutMargin
+		}},
+		{name: "a second short of the mint and the send's margin", mutate: func(to *platform.Timeouts) {
+			to.SteadyHeartbeatBudget = time.Minute
+			to.SnapshotReportWait = to.SnapshotMintTimeout + to.SandboxCommandSendTimeout + platform.MinTimeoutMargin - time.Second
+		}, want: []string{answerLink}},
+		{name: "independent of the rotation's wait", mutate: func(to *platform.Timeouts) {
+			to.SnapshotReportWait = 10 * time.Minute
 		}},
 	}
 	for _, tc := range tests {

@@ -23,7 +23,8 @@
 //     incompatible or unknown, against the restore floors.
 //   - The pre-dispatch runway gate (EvaluateRunway and RotationThreshold,
 //     runway.go; §35.3): pass, hold, rotate or retire a live sandbox
-//     against its lifetime deadline.
+//     against its lifetime deadline, and give up a snapshot that is never
+//     reported (revert it, or retire a gen whose agent is gone).
 //
 // Every function here is pure per §11: no I/O, no time.Now(), no
 // randomness. Anything needing "the current time" takes it as an explicit

@@ -16,9 +16,13 @@ var allStates = []sandbox.State{
 }
 
 // runwayConfig is the gate at the shipped values (platform.DefaultTimeouts:
-// RotationRunwayFloor 13m, RotationSnapshotWait 2m), restated here because
-// a domain test does not import platform.
-var runwayConfig = sandbox.RunwayConfig{Floor: 13 * time.Minute, SnapshotWait: 2 * time.Minute}
+// RotationRunwayFloor 13m, RotationSnapshotWait 2m, SnapshotReportWait 2m,
+// SteadyHeartbeatBudget 90s), restated here because a domain test does not
+// import platform.
+var runwayConfig = sandbox.RunwayConfig{
+	Floor: 13 * time.Minute, SnapshotWait: 2 * time.Minute,
+	ReportWait: 2 * time.Minute, HeartbeatBudget: 90 * time.Second,
+}
 
 // healthyRunway is a ready sandbox at the shipped 2h lifetime, its
 // deadline known and an hour away, a provider that snapshots, nothing in
@@ -154,15 +158,53 @@ func TestEvaluateRunway(t *testing.T) {
 		{name: "row 6 precedes the runway: rotating with an hour left", facts: func(f *sandbox.RunwayFacts) { f.Rotating = true },
 			wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonRotationSnapshotFailed},
 
-		// Row 7: a snapshot that is not a rotation's is in progress.
-		{name: "row 7: an hour left", facts: func(f *sandbox.RunwayFacts) { f.Status = sandbox.StateSnapshotting },
-			wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSnapshotInProgress, wantNextLook: time.Hour},
-		{name: "row 7: below the threshold, never rotated", facts: func(f *sandbox.RunwayFacts) {
-			f.Status, f.Runway = sandbox.StateSnapshotting, 5*time.Minute
-		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSnapshotInProgress, wantNextLook: 5 * time.Minute},
-		{name: "row 7: no deadline known, only the snapshot's report ends it", facts: func(f *sandbox.RunwayFacts) {
-			f.Status, f.DeadlineKnown, f.Runway = sandbox.StateSnapshotting, false, 5*time.Minute
-		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSnapshotInProgress},
+		// Row 7: a snapshot that is not a rotation's is in progress, within
+		// its report wait.
+		{name: "row 7: just started, an hour left", facts: func(f *sandbox.RunwayFacts) { f.Status = sandbox.StateSnapshotting },
+			wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSnapshotInProgress, wantNextLook: 2 * time.Minute},
+		{name: "row 7: within the wait", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.SinceSnapshotStart = sandbox.StateSnapshotting, 30*time.Second
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSnapshotInProgress, wantNextLook: 90 * time.Second},
+		{name: "row 7: below the threshold, never rotated, the deadline comes first", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.Runway, f.SinceSnapshotStart = sandbox.StateSnapshotting, time.Minute, 30*time.Second
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSnapshotInProgress, wantNextLook: time.Minute},
+		{name: "row 7: no deadline known, the wait alone", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.DeadlineKnown, f.Runway, f.SinceSnapshotStart = sandbox.StateSnapshotting, false, 10*time.Second, 30*time.Second
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSnapshotInProgress, wantNextLook: 90 * time.Second},
+		{name: "row 7 within the wait, its agent silent: the wait comes first", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.SinceSnapshotStart, f.SinceLastSeen = sandbox.StateSnapshotting, time.Minute, time.Hour
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSnapshotInProgress, wantNextLook: time.Minute},
+		{name: "row 7 uses the report wait, not the rotation's", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.SinceSnapshotStart = sandbox.StateSnapshotting, 2*time.Minute
+		}, cfg: &sandbox.RunwayConfig{Floor: threshold, SnapshotWait: 2 * time.Minute, ReportWait: 5 * time.Minute, HeartbeatBudget: 90 * time.Second},
+			wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSnapshotInProgress, wantNextLook: 3 * time.Minute},
+
+		// Row 7a: the wait has run and the agent is silent past the
+		// heartbeat budget: gone, so the gen is retired.
+		{name: "row 7a: exactly at the wait, silent exactly the budget", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.SinceSnapshotStart, f.SinceLastSeen = sandbox.StateSnapshotting, 2*time.Minute, 90*time.Second
+		}, wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonSnapshotAgentSilent},
+		{name: "row 7a: no deadline known", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.DeadlineKnown, f.SinceSnapshotStart, f.SinceLastSeen = sandbox.StateSnapshotting, false, time.Hour, 3*time.Hour
+		}, wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonSnapshotAgentSilent},
+		{name: "row 7a follows row 4: a rotation's snapshot is the rotation's", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.Rotating, f.SinceRotationStart, f.SinceSnapshotStart, f.SinceLastSeen = sandbox.StateSnapshotting, true, 3*time.Minute, 3*time.Minute, time.Hour
+		}, wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonRotationSnapshotNotReported},
+
+		// Row 7b: the wait has run and the agent is still heard from: the
+		// snapshot alone failed, and the sandbox goes back to ready.
+		{name: "row 7b: exactly at the wait, heard from just now", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.SinceSnapshotStart = sandbox.StateSnapshotting, 2*time.Minute
+		}, wantAction: sandbox.RunwayRevert, wantReason: sandbox.RunwayReasonSnapshotNotReported},
+		{name: "row 7b: silent a nanosecond short of the budget", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.SinceSnapshotStart, f.SinceLastSeen = sandbox.StateSnapshotting, time.Hour, 90*time.Second-1
+		}, wantAction: sandbox.RunwayRevert, wantReason: sandbox.RunwayReasonSnapshotNotReported},
+		{name: "row 7b: below the threshold, no deadline row", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.Runway, f.SinceSnapshotStart = sandbox.StateSnapshotting, 5*time.Minute, 10*time.Minute
+		}, wantAction: sandbox.RunwayRevert, wantReason: sandbox.RunwayReasonSnapshotNotReported},
+		{name: "row 2 precedes row 7b: past the deadline, heard from", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.Runway, f.SinceSnapshotStart = sandbox.StateSnapshotting, -time.Second, 10*time.Minute
+		}, wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonDeadlinePassed},
 
 		// Row 8: no deadline known, declined.
 		{name: "row 8: ready", facts: func(f *sandbox.RunwayFacts) { f.DeadlineKnown, f.Runway = false, time.Second },
@@ -225,7 +267,7 @@ func TestEvaluateRunway(t *testing.T) {
 		{name: "row 14: a nanosecond left", facts: func(f *sandbox.RunwayFacts) { f.Runway = 1 },
 			wantAction: sandbox.RunwayRotate, wantReason: sandbox.RunwayReasonBelowThreshold, wantNextLook: 2 * time.Minute},
 		{name: "row 14: the wait is the configured one", facts: func(f *sandbox.RunwayFacts) { f.Runway = 5 * time.Minute },
-			cfg:        &sandbox.RunwayConfig{Floor: threshold, SnapshotWait: 3 * time.Minute},
+			cfg:        &sandbox.RunwayConfig{Floor: threshold, SnapshotWait: 3 * time.Minute, ReportWait: 2 * time.Minute, HeartbeatBudget: 90 * time.Second},
 			wantAction: sandbox.RunwayRotate, wantReason: sandbox.RunwayReasonBelowThreshold, wantNextLook: 3 * time.Minute},
 	}
 	for _, tc := range tests {
@@ -252,10 +294,12 @@ func TestEvaluateRunway(t *testing.T) {
 // runwaySweep calls visit with every combination of the gate's facts over
 // a grid that straddles each boundary of its table: every state, the
 // deadline known or not, runways on either side of zero and the
-// threshold, rotation ages on either side of the wait, and every boolean.
+// threshold, rotation and snapshot ages on either side of the waits, an
+// agent heard from or silent past the budget, and every boolean.
 func runwaySweep(visit func(sandbox.RunwayFacts)) {
 	runways := []time.Duration{-time.Hour, -1, 0, 1, time.Minute, 13*time.Minute - 1, 13 * time.Minute, time.Hour}
 	sinces := []time.Duration{0, time.Minute, 2*time.Minute - 1, 2 * time.Minute, time.Hour}
+	silences := []time.Duration{0, 90 * time.Second}
 	lifetimes := []time.Duration{0, time.Hour, 2 * time.Hour}
 	bools := []bool{false, true}
 	for _, status := range allStates {
@@ -268,12 +312,15 @@ func runwaySweep(visit func(sandbox.RunwayFacts)) {
 								for _, since := range sinces {
 									for _, taken := range bools {
 										for _, delivery := range bools {
-											visit(sandbox.RunwayFacts{
-												Status: status, DeadlineKnown: known, Runway: runway, Lifetime: lifetime,
-												TurnInFlight: inFlight, CanSnapshot: canSnapshot,
-												Rotating: rotating, SinceRotationStart: since, RotationSnapshotTaken: taken,
-												DeliveryOpen: delivery, DeliveryRemaining: 3 * time.Minute,
-											})
+											for _, silence := range silences {
+												visit(sandbox.RunwayFacts{
+													Status: status, DeadlineKnown: known, Runway: runway, Lifetime: lifetime,
+													TurnInFlight: inFlight, CanSnapshot: canSnapshot,
+													Rotating: rotating, SinceRotationStart: since, RotationSnapshotTaken: taken,
+													SinceSnapshotStart: since, SinceLastSeen: silence,
+													DeliveryOpen: delivery, DeliveryRemaining: 3 * time.Minute,
+												})
+											}
 										}
 									}
 								}
@@ -300,10 +347,12 @@ func runwaySweep(visit func(sandbox.RunwayFacts)) {
 //   - a rotation starts only from ready, over ready -> snapshotting;
 //   - a retirement starts only from a state the machine can take to
 //     stopped, through suspect;
+//   - a revert starts only from snapshotting, over snapshotting -> ready,
+//     once the report wait has run and while the agent is heard from;
 //   - a passed dispatch has at least the threshold of runway, unless the
 //     gate declined;
-//   - every hold or rotation names when to look again, unless only an
-//     event can end it: a snapshot with no deadline known.
+//   - every hold or rotation names when to look again: a hold always
+//     ends, a snapshot that never reports included.
 func TestEvaluateRunway_Properties(t *testing.T) {
 	t.Parallel()
 
@@ -324,7 +373,7 @@ func TestEvaluateRunway_Properties(t *testing.T) {
 			fail("threshold is not RotationThreshold(floor, lifetime)")
 		}
 		if f.Status == sandbox.StateSnapshotting && (d.Action == sandbox.RunwayPass || d.Action == sandbox.RunwayRotate) {
-			fail("a snapshotting sandbox is only held or retired")
+			fail("a snapshotting sandbox is only held, retired or reverted")
 		}
 		if live[f.Status] && f.DeadlineKnown && f.Runway <= 0 && (d.Action != sandbox.RunwayRetire || d.Reason != sandbox.RunwayReasonDeadlinePassed) {
 			fail("a live sandbox past its deadline is retired as such")
@@ -359,10 +408,19 @@ func TestEvaluateRunway_Properties(t *testing.T) {
 			if d.NextLook != 0 {
 				fail("a pass names no next look")
 			}
+		case sandbox.RunwayRevert:
+			if _, err := sandbox.Transition(f.Status, 1, sandbox.SnapshotCompleteTrigger()); err != nil || f.Status != sandbox.StateSnapshotting {
+				fail("a revert starts from %s: %v", f.Status, err)
+			}
+			if f.Rotating || f.SinceSnapshotStart < runwayConfig.ReportWait || f.SinceLastSeen >= runwayConfig.HeartbeatBudget {
+				fail("reverted a rotation's snapshot, within the report wait, or with its agent silent")
+			}
+			if d.NextLook != 0 {
+				fail("a revert names no next look")
+			}
 		case sandbox.RunwayHold:
-			eventOnly := d.Reason == sandbox.RunwayReasonSnapshotInProgress && !f.DeadlineKnown
-			if (d.NextLook <= 0) != eventOnly {
-				fail("a hold looks again after a positive delay unless only an event ends it")
+			if d.NextLook <= 0 {
+				fail("a hold looks again after a positive delay")
 			}
 		default:
 			fail("unknown action")
@@ -400,8 +458,8 @@ func TestEvaluateRunway_RaisingTheFloorBringsTheRotationForward(t *testing.T) {
 				if f1 >= f2 || f2 >= lifetime/6 {
 					t.Fatalf("floors %v, %v: want f1 < f2 < lifetime/6 (%v)", f1, f2, lifetime/6)
 				}
-				low := sandbox.RunwayConfig{Floor: f1, SnapshotWait: runwayConfig.SnapshotWait}
-				high := sandbox.RunwayConfig{Floor: f2, SnapshotWait: runwayConfig.SnapshotWait}
+				low, high := runwayConfig, runwayConfig
+				low.Floor, high.Floor = f1, f2
 				inGap := 0
 				for _, runway := range runways {
 					// The implication, over every fact a rotation can depend on.
