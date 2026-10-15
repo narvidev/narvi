@@ -1277,10 +1277,37 @@ func (a *Actor) tryPlanSpawn(
 		// this default case exists so a future SpawnActionKind addition
 		// fails safely into a no-op (logged) rather than being silently
 		// mishandled by one of the cases above.
+		if hasSandbox && action.Kind == sandbox.SpawnActionSkip && sandbox.State(sandboxRow.Status) == sandbox.StateSnapshotting {
+			return nil, a.logHeldBehindSnapshot(ctx, tx, sandboxRow)
+		}
 		a.logger.Info("sessionactor: spawn decision is not Spawn/Restore/Resume this round; no-op",
 			"kind", action.Kind.String(), "reason", action.Reason)
 		return nil, nil
 	}
+}
+
+// logHeldBehindSnapshot logs a turn held behind its sandbox's snapshot
+// (EvaluateSpawnDecision's snapshotting Skip), with the gen and how long
+// the sandbox has been snapshotting, read from the sandbox_status event
+// that recorded the change (postgres.EventStore.SandboxStatusAge). Nothing
+// bounds that hold yet: a snapshot the agent never reports keeps the turn
+// pending, and this line, repeated at each evaluation with a growing age,
+// is what shows it -- where each such evaluation used to fail and back the
+// dispatch timer off. A failed read fails the evaluation, as any read in
+// it does.
+func (a *Actor) logHeldBehindSnapshot(ctx context.Context, tx pgx.Tx, row sqlcgen.Sandbox) error {
+	seconds, known, err := a.stores.event.WithTx(tx).SandboxStatusAge(ctx, a.sessionID, row.Gen, row.Status)
+	if err != nil {
+		return fmt.Errorf("sessionactor: read how long the sandbox has been snapshotting: %w", err)
+	}
+	attrs := []any{"gen", row.Gen, "pending_snapshot_message_id", stringOrEmpty(row.PendingSnapshotMessageID)}
+	if known {
+		attrs = append(attrs, "snapshotting_seconds", seconds)
+	} else {
+		attrs = append(attrs, "snapshotting_seconds_unknown", true)
+	}
+	a.logger.Info("sessionactor: turn held: its sandbox is snapshotting", attrs...)
+	return nil
 }
 
 // refuseIfSubstrateUnsupported implements §27.5's own dispatch-time
@@ -1743,10 +1770,14 @@ func (a *Actor) planFreshSpawn(
 			"session_id", a.sessionID.String(), "from_status", string(fromState),
 			"gen", currentGen, "new_gen", newGen)
 	default:
-		// StateSuspect can never reach here: EvaluateSpawnDecision's own
-		// Suspect branch always returns Skip (no staleness carve-out), so
-		// action.Kind would already be SpawnActionSkip, not
-		// SpawnActionSpawn, and this function would have returned above.
+		// StateSuspect and StateSnapshotting can never reach here:
+		// EvaluateSpawnDecision's own Suspect and Snapshotting branches
+		// always return Skip (no staleness carve-out), so action.Kind
+		// would already be SpawnActionSkip, not SpawnActionSpawn, and this
+		// function would have returned above. (Snapshotting used to reach
+		// here, failing every evaluation of a turn queued behind a
+		// post-turn snapshot: TestHandleEnsureDispatched_
+		// PendingTurnWhileSnapshotting_HeldNoErrorNoBackoff.)
 		// Any OTHER unrecognized status reaching here means
 		// EvaluateSpawnDecision's own logic and this trigger-selection
 		// switch have drifted out of sync -- fail loudly rather than fall

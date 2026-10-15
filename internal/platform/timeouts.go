@@ -92,6 +92,70 @@ type Timeouts struct {
 	SandboxLifetime       time.Duration
 	ReviewSandboxLifetime time.Duration
 
+	// RotationRunwayFloor is the pre-dispatch gate's floor (technical plan
+	// §35.3, sandbox.EvaluateRunway): a turn is never dispatched into a
+	// live sandbox with less than min(RotationRunwayFloor, lifetime/6) of
+	// its lifetime deadline left (sandbox.RotationThreshold); below it the
+	// sandbox is rotated first. Not given a value in the plan; derived from
+	// this file alone: the least runway at which a rotation started at the
+	// threshold still has its snapshot taken before the deadline when the
+	// agent's delivery ends within its window. The agent runs push and
+	// snapshot one after the other on one read loop, so the gate holds a
+	// rotation behind a completed turn's open delivery, for at most
+	// MCPStatusDeliveryWindow from its start, then waits
+	// RotationSnapshotWait for the snapshot; plus MinTimeoutMargin, 12m30s,
+	// rounded up to the next whole minute: 13 minutes. At the shipped 2h
+	// lifetimes lifetime/6 is 20 minutes, so the floor binds, and raising
+	// it brings the rotation forward up to 20.
+	//
+	// What that covers, and what it does not. Validate holds the post-turn
+	// mint and one repository's whole push chain inside
+	// MCPStatusDeliveryWindow, so a delivery of one repository, or of
+	// several that push in time, ends before the hold does. A session's
+	// repositories push one after another, with no bound on how many, so
+	// several slow ones can still be pushing when the window ends (that
+	// field's doc says as much), and no fixed floor covers every count: a
+	// larger one would be false one repository later, and would rotate
+	// every session earlier. The gate then starts the rotation behind the
+	// push; its snapshot can miss RotationSnapshotWait, and the rotation
+	// falls back to the previous snapshot, as any rotation whose snapshot
+	// is not reported does (sandbox.EvaluateRunway's rows 3 and 4) --
+	// normally the post-turn one, taken before the push, which a push does
+	// not change. That residual is bounded by the wait and ends before the
+	// deadline, since the floor outlasts the window and the wait; it costs
+	// a fallback, not a turn. A push still running when the gen is then
+	// retired ends with it, leaving the repositories it had not reached
+	// unpushed for that turn.
+	//
+	// It is not §5.4's turn chain: the gate promises a turn at least the
+	// threshold, never its whole TurnDeadline, and a turn that outlives its
+	// sandbox is §35.4's interruption. Validate keeps it positive, above
+	// MCPStatusDeliveryWindow plus RotationSnapshotWait by
+	// MinTimeoutMargin, and, for every lifetime kind, keeps that kind's
+	// threshold above the same sum -- a rotation at the threshold is
+	// feasible -- and the kind's lifetime above its threshold plus
+	// FirstConnectBudget plus BootEvidenceFallback by MinTimeoutMargin, so
+	// a replacement that boots as slowly as allowed still starts above its
+	// own threshold and a rotation never leads straight into another. Read
+	// only by Validate and the session actor's runway gate
+	// (TestRotationFieldsAreReadOnlyInPlatform).
+	RotationRunwayFloor time.Duration
+
+	// RotationSnapshotWait is how long a rotation waits for its snapshot to
+	// be reported (snapshot_ready) before it treats the snapshot as failed,
+	// retires the gen anyway, and the restore falls back to the previous
+	// valid snapshot (technical plan §35.3). The control plane hears
+	// nothing of a failed mint, so silence past this wait is the failure
+	// signal. Not given a value in the plan; derived from this file alone:
+	// the longest an agent whose read loop is idle takes to answer the
+	// snapshot command -- the command's write (SandboxCommandSendTimeout)
+	// and the agent's mint call (SnapshotMintTimeout), plus
+	// MinTimeoutMargin: 100s, rounded up to the next whole minute, 2
+	// minutes. Validate keeps it positive and above that sum. Read only by
+	// Validate and the session actor's runway gate
+	// (TestRotationFieldsAreReadOnlyInPlatform).
+	RotationSnapshotWait time.Duration
+
 	// SupervisorTurnCap's CURRENT role is an invariant-chain bound ensuring
 	// config sanity only: Validate below checks ProviderHardCap >
 	// SupervisorTurnCap > TurnDeadline as a pairwise VALUE comparison, and
@@ -4398,6 +4462,8 @@ func DefaultTimeouts() Timeouts {
 		ProviderHardCap:           providerHardCap,
 		SandboxLifetime:           providerHardCap,   // §35.2; not specified, chosen -- see field doc comment
 		ReviewSandboxLifetime:     providerHardCap,   // §35.2; not specified, chosen -- see field doc comment
+		RotationRunwayFloor:       13 * time.Minute,  // §35.3; not specified, derived -- see field doc comment
+		RotationSnapshotWait:      2 * time.Minute,   // §35.3; not specified, derived -- see field doc comment
 		SupervisorTurnCap:         90 * time.Minute,  // not specified; chosen with margin below ProviderHardCap
 		TurnDeadline:              60 * time.Minute,  // not specified; chosen with margin below SupervisorTurnCap
 		StopGrace:                 30 * time.Second,  // not specified; chosen (§3.3's stop)
@@ -5482,6 +5548,35 @@ func (t Timeouts) Validate() error {
 			field, lifetime, "SupervisorTurnCap", t.SupervisorTurnCap)
 		check(field+" > FirstConnectBudget + BootEvidenceFallback",
 			field, lifetime, "FirstConnectBudget+BootEvidenceFallback", t.FirstConnectBudget+t.BootEvidenceFallback)
+	}
+
+	// §35.3: the pre-dispatch runway gate. The snapshot wait outlasts an
+	// idle agent's answer to the snapshot command; the floor outlasts an
+	// open delivery and then that wait, and so does each kind's threshold,
+	// the floor or a sixth of the kind's lifetime, whichever is less
+	// (sandbox.RotationThreshold, the gate's own); and each kind's lifetime
+	// outlasts its threshold and the slowest boot allowed, so a
+	// replacement starts above its own threshold. See
+	// RotationRunwayFloor's and RotationSnapshotWait's doc comments.
+	mustBePositive("RotationSnapshotWait", t.RotationSnapshotWait)
+	mustBePositive("RotationRunwayFloor", t.RotationRunwayFloor)
+	check("RotationSnapshotWait > SnapshotMintTimeout + SandboxCommandSendTimeout",
+		"RotationSnapshotWait", t.RotationSnapshotWait,
+		"SnapshotMintTimeout+SandboxCommandSendTimeout", t.SnapshotMintTimeout+t.SandboxCommandSendTimeout)
+	check("RotationRunwayFloor > MCPStatusDeliveryWindow + RotationSnapshotWait",
+		"RotationRunwayFloor", t.RotationRunwayFloor,
+		"MCPStatusDeliveryWindow+RotationSnapshotWait", t.MCPStatusDeliveryWindow+t.RotationSnapshotWait)
+	for _, kind := range sandbox.AllLifetimeKinds() {
+		lifetimeField := "SandboxLifetimeFor(" + string(kind) + ")"
+		thresholdField := "RotationThreshold(" + string(kind) + ")"
+		lifetime := t.SandboxLifetimeFor(kind)
+		threshold := sandbox.RotationThreshold(t.RotationRunwayFloor, lifetime)
+		check(thresholdField+" > MCPStatusDeliveryWindow + RotationSnapshotWait",
+			thresholdField, threshold,
+			"MCPStatusDeliveryWindow+RotationSnapshotWait", t.MCPStatusDeliveryWindow+t.RotationSnapshotWait)
+		check(lifetimeField+" > "+thresholdField+" + FirstConnectBudget + BootEvidenceFallback",
+			lifetimeField, lifetime,
+			thresholdField+"+FirstConnectBudget+BootEvidenceFallback", threshold+t.FirstConnectBudget+t.BootEvidenceFallback)
 	}
 
 	return errors.Join(errs...)

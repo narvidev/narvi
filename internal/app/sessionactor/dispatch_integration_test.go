@@ -3,9 +3,11 @@
 package sessionactor
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -1814,6 +1816,151 @@ func TestHandleEnsureDispatched_HealthySpawning_WithinStuckTimeout_NoChange(t *t
 	if row.Gen != created.Gen {
 		t.Errorf("sandbox gen = %d, want unchanged %d", row.Gen, created.Gen)
 	}
+}
+
+// TestHandleEnsureDispatched_PendingTurnWhileSnapshotting_HeldNoErrorNoBackoff
+// pins the spawn decision's snapshotting row through the real evaluation
+// (technical plan §35.3; §3.3's "complete turn -> trigger snapshot -> ...
+// -> dispatch next"): a turn queued behind a post-turn snapshot, on a
+// sandbox spawned longer ago than SpawnCooldown -- in production, every
+// one -- is held, not failed. The evaluation commits, deleting the
+// dispatch timer, and spawns, sends and moves nothing; the snapshot's own
+// snapshot_ready then returns the sandbox to Ready and the same gen takes
+// the turn. Before the row, the decision fell through to Spawn, which
+// planFreshSpawn refused (no spawn edge out of snapshotting): the
+// evaluation rolled back and the dispatch timer was backed off, on every
+// evaluation until the snapshot ended. Nothing bounds the hold yet, so
+// each held evaluation logs the gen and how long the sandbox has been
+// snapshotting, read from the sandbox_status event that recorded it.
+func TestHandleEnsureDispatched_PendingTurnWhileSnapshotting_HeldNoErrorNoBackoff(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
+
+	// Gen 1, mid post-turn snapshot, spawned and last seen an hour ago:
+	// past SpawnCooldown, SpawnReadyWait and SpawnStuckTimeout alike.
+	seedReadySandbox(ctx, t, pool, sessionID)
+	const snapshotCommandID = "snapshot-command-1"
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'snapshotting', pending_snapshot_message_id = $2,
+		created_at = now() - interval '1 hour', last_seen_at = now() - interval '1 hour' WHERE session_id = $1`,
+		sessionID, snapshotCommandID); err != nil {
+		t.Fatalf("seed the snapshotting sandbox: %v", err)
+	}
+	// The sandbox_status event the move to snapshotting stored, 10 minutes ago.
+	if _, err := pool.Exec(ctx, `INSERT INTO events (session_id, type, payload, message_id, created_at)
+		VALUES ($1, $2, '{"sandbox": {"gen": 1, "status": "snapshotting"}}', 'seeded-sandbox-status', now() - interval '10 minutes')`,
+		sessionID, SandboxStatusEventType); err != nil {
+		t.Fatalf("seed the sandbox_status event: %v", err)
+	}
+	queued := createTurnArmingDispatch(ctx, t, pool, sessionID, "the turn queued behind the snapshot")
+	logs := captureDefaultLoggerLocked(t) // before GetOrSpawn: the actor takes its logger at hydrate
+
+	commander := &fakeSendCommander{}
+	provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "provider-object-should-never-be-used"}}
+	r := newDispatchTestRegistry(t, ctx, pool, provider, commander)
+	t.Cleanup(func() { _ = r.Shutdown() })
+	a, err := r.GetOrSpawn(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("GetOrSpawn: %v", err)
+	}
+	sendEnsureDispatched(ctx, t, a)
+
+	// The evaluation either commits, deleting the dispatch timer, or fails,
+	// rolls back and backs the timer off past now: wait for either.
+	waitUntil(t, 5*time.Second, func() bool {
+		row, ok := dispatchTimer(ctx, t, pool, sessionID)
+		return !ok || row.FiresAt.Time.After(time.Now())
+	})
+	if row, ok := dispatchTimer(ctx, t, pool, sessionID); ok {
+		t.Fatalf("dispatch timer still armed, due %v: the evaluation failed and backed off instead of holding the turn", row.FiresAt.Time)
+	}
+	if n := provider.callCount() + provider.restoreCallCount() + provider.resumeCallCount(); n != 0 {
+		t.Errorf("provider called %d times, want none: a snapshotting sandbox is neither respawned nor replaced", n)
+	}
+	if n := commander.callCount(); n != 0 {
+		t.Errorf("SendCommand called %d times, want none while the snapshot is in progress", n)
+	}
+	sandboxRow, err := narvipg.NewSandboxStore(pool).Get(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("get sandbox: %v", err)
+	}
+	if sandboxRow.Status != sqlcgen.SandboxStatusSnapshotting || sandboxRow.Gen != 1 {
+		t.Errorf("sandbox = %s at gen %d, want snapshotting at gen 1, untouched", sandboxRow.Status, sandboxRow.Gen)
+	}
+	turnStore := narvipg.NewTurnStore(pool)
+	if got, err := turnStore.Get(ctx, queued.ID); err != nil || got.Status != sqlcgen.TurnStatusPending {
+		t.Fatalf("queued turn = %v (err %v), want it still pending", got.Status, err)
+	}
+	held := logs.entry(t, "sessionactor: turn held: its sandbox is snapshotting")
+	if held["gen"] != float64(1) || held["pending_snapshot_message_id"] != snapshotCommandID {
+		t.Errorf("held-turn log = %v, want gen 1 and the pending snapshot command", held)
+	}
+	if secs, ok := held["snapshotting_seconds"].(float64); !ok || secs < 600 || secs > 660 {
+		t.Errorf("held-turn log snapshotting_seconds = %v, want about 600 (the sandbox_status event's age)", held["snapshotting_seconds"])
+	}
+
+	// The snapshot's own report ends the hold: the turn goes to the same gen.
+	outcome := sendSandboxEvent(ctx, t, a, SandboxEvent{Type: "snapshot_ready", Gen: 1, Raw: json.RawMessage(
+		`{"type":"snapshot_ready","messageId":"sr-1","sessionId":"s","gen":1,"ackId":"snapshot_ready:sr-1","snapshotId":"snap-1","commandMessageId":"` + snapshotCommandID + `"}`)})
+	if !outcome.Persisted {
+		t.Fatal("snapshot_ready: Persisted = false, want true")
+	}
+	waitUntil(t, 5*time.Second, func() bool { return promptCount(commander) == 1 })
+	got, err := turnStore.Get(ctx, queued.ID)
+	if err != nil {
+		t.Fatalf("get turn: %v", err)
+	}
+	if got.Status != sqlcgen.TurnStatusProcessing || got.DispatchedSandboxGen == nil || *got.DispatchedSandboxGen != 1 {
+		t.Errorf("queued turn = %s on gen %v, want processing on gen 1", got.Status, got.DispatchedSandboxGen)
+	}
+	if n := provider.callCount() + provider.restoreCallCount() + provider.resumeCallCount(); n != 0 {
+		t.Errorf("provider called %d times, want none", n)
+	}
+}
+
+// lockedLog is slog.Default's output, captured as JSON lines under a mutex:
+// the actor logs on its own goroutine while the test polls.
+type lockedLog struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (l *lockedLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+// captureDefaultLoggerLocked installs a lockedLog as slog.Default until the
+// test ends. Install it before GetOrSpawn: the actor takes its logger once,
+// at hydrate.
+func captureDefaultLoggerLocked(t *testing.T) *lockedLog {
+	t.Helper()
+	l := &lockedLog{}
+	orig := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(l, nil)))
+	t.Cleanup(func() { slog.SetDefault(orig) })
+	return l
+}
+
+// entry waits up to 5 s for the first line whose msg is msg, and returns
+// its fields.
+func (l *lockedLog) entry(t *testing.T, msg string) map[string]any {
+	t.Helper()
+	var found map[string]any
+	waitUntil(t, 5*time.Second, func() bool {
+		l.mu.Lock()
+		defer l.mu.Unlock()
+		for _, line := range bytes.Split(l.buf.Bytes(), []byte("\n")) {
+			var e map[string]any
+			if json.Unmarshal(line, &e) == nil && e["msg"] == msg {
+				found = e
+				return true
+			}
+		}
+		return false
+	})
+	return found
 }
 
 // --- §3.2 ("resume"), §3.2/§8.7: executeResume's own decision-tree
