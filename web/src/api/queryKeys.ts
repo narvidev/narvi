@@ -38,6 +38,14 @@ export const decisionInboxQueryKeys = {
   list: () => ['decision-inbox', 'list'] as const,
 }
 
+// autonomyFreezeQueryKeys (technical plan §40.2) -- the platform-wide
+// freeze, GET /api/autonomy: one key, no params, like the inbox's. A freeze
+// or an unfreeze also changes what the inbox shows (its banner, its held
+// rows), so the mutations invalidate decisionInboxQueryKeys too.
+export const autonomyFreezeQueryKeys = {
+  detail: () => ['autonomy-freeze'] as const,
+}
+
 // authQueryKeys (§13.1) -- the sign-in view's own "am I signed
 // in, and as whom" query (GET /api/me). One key, no params: there is only
 // ever one meaningful "current caller" per browser session, unlike

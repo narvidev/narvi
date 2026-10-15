@@ -392,6 +392,16 @@ func TestAuthorize_ExhaustiveMatrix(t *testing.T) {
 		{"member cannot manage repo entitlement even if ownedOrJoined", authz.RoleMember, authz.ActionManageRepoEntitlement, true, false},
 		{"viewer cannot manage repo entitlement", authz.RoleViewer, authz.ActionManageRepoEntitlement, false, false},
 		{"viewer cannot manage repo entitlement even if ownedOrJoined", authz.RoleViewer, authz.ActionManageRepoEntitlement, true, false},
+
+		// Row 8 (§40.2): freezing autonomy platform-wide and lifting the
+		// freeze -- admin only, never widened by ownership.
+		{"admin manages the autonomy freeze", authz.RoleAdmin, authz.ActionManageAutonomyFreeze, false, true},
+		{"maintainer cannot manage the autonomy freeze", authz.RoleMaintainer, authz.ActionManageAutonomyFreeze, false, false},
+		{"maintainer cannot manage the autonomy freeze even if ownedOrJoined", authz.RoleMaintainer, authz.ActionManageAutonomyFreeze, true, false},
+		{"member cannot manage the autonomy freeze", authz.RoleMember, authz.ActionManageAutonomyFreeze, false, false},
+		{"member cannot manage the autonomy freeze even if ownedOrJoined", authz.RoleMember, authz.ActionManageAutonomyFreeze, true, false},
+		{"viewer cannot manage the autonomy freeze", authz.RoleViewer, authz.ActionManageAutonomyFreeze, false, false},
+		{"viewer cannot manage the autonomy freeze even if ownedOrJoined", authz.RoleViewer, authz.ActionManageAutonomyFreeze, true, false},
 	}
 
 	for _, tc := range tests {

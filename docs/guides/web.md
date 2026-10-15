@@ -469,6 +469,16 @@ carries `mergeableIfRequiredChecksPass` and still shows Merge, with a line
 saying the required checks are read when you merge: the click reads them
 with your own token, and answers `409` naming the check when one is unmet.
 
+While autonomy is frozen (technical plan §40.2, "Autonomy freeze" below),
+every role's inbox shows one banner naming when, by whom and why. A
+`ready_to_merge` row in a repository with auto-merge armed carries
+`heldByFreeze` and a "held" chip: the automatic merge waits, and your own
+Merge click still merges it. The workflow runs whose next step the freeze
+holds are listed under the banner (`heldWorkflowAdvances`), to whoever may
+decide their steps. When the freeze cannot be read, the response carries
+`autonomyFreezeUnread` and the inbox says the freeze state is unknown --
+never "not frozen".
+
 ## Uploads
 
 ```json narvi-command
@@ -634,6 +644,43 @@ a maintainer gets `403` on those specifically, not a degraded response.
 One row per ingress surface (Slack, Linear, GitHub) — a derived read
 model, never a connect/disconnect write; there is no POST/PUT/DELETE on
 this route at all.
+
+**Autonomy freeze** — an administrator can freeze autonomy platform-wide,
+with a reason, and lift the freeze later (technical plan §40.2). While
+frozen, nothing automatic starts: no auto-merge, no sentinel-fix merge,
+no sentinel auto-fix, no description rewrite, no automatic re-review, no
+automation run and no workflow advance. Held actions start again within
+about a minute of the freeze being lifted, with three exceptions: a
+scheduled automation run held more than ten minutes waits for its next
+occurrence; a sentinel fix held from merging is not merged automatically,
+and stays open for a person; and a pull request auto-approved more than
+seven days ago is left to a person's Merge click. A person's
+own commands -- a prompt, a plan approval, a Merge click, a re-review
+request, a workflow step decision, a stop -- are never held, and a turn
+already running finishes. Settings → General shows the freeze to every
+role and offers Freeze and Unfreeze to an administrator; the decision
+inbox shows a banner while it holds. The operator's runbook is
+[autonomy-freeze.md](../runbooks/autonomy-freeze.md).
+
+```json narvi-command
+{"name": "Get the autonomy freeze", "route": "GET /api/autonomy"}
+```
+
+```json narvi-command
+{"name": "Freeze autonomy platform-wide", "route": "POST /api/autonomy/freeze"}
+```
+
+```json narvi-command
+{"name": "Lift the autonomy freeze", "route": "POST /api/autonomy/unfreeze"}
+```
+
+**Negative.** Freezing and unfreezing are **admin-only**
+(`manage_autonomy_freeze`, §13.3): a maintainer, member or viewer gets
+`403`. Reading the freeze is open to every signed-in role. The reason is
+required, 1 to 500 characters; a blank or longer one answers `400`.
+Freezing while frozen answers `409` and keeps the first freeze's who, when
+and why; unfreezing when nothing is frozen answers `409`. Each change is
+audited (`autonomy.frozen`, `autonomy.unfrozen`) in its own transaction.
 
 **Capabilities**
 
