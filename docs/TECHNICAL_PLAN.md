@@ -6838,6 +6838,13 @@ stopped by inactivity and restored on the next prompt, exactly as now.
   `push_error` stores git's reason. The branch is the refspec, so `reposource.ValidateBranch` accepts
   only a name `git check-ref-format --branch` accepts, less a leading `+` (a forced push) and a lone
   `@` (HEAD); `:`, which would delete the remote branch or push onto another, is one git refuses.
+  The control plane applies it too before it sends a push: a session stored before the rule with a
+  branch it now refuses gets no push command, whatever agent its restored sandbox runs, and one
+  session-visible warning per completed turn names the branch and git's reason. A current agent also
+  refuses such a branch at boot, before git runs: fatal for the primary repo, a warning for a
+  secondary one. The runtime's own `HEAD` is checked with git's rule alone
+  (`reposource.ValidateBranchName`): it never becomes a refspec, and git lets the runtime check out
+  `+wip`.
 
 `RotationRunwayFloor` is a new entry in `platform/timeouts.go` and nowhere else (§11), and the gate
 itself is a pure decision function in `internal/domain/sandbox`, added to the exhaustive
