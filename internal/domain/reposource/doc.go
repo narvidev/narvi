@@ -32,7 +32,12 @@
 //     schemes one at a time. ValidateBranch closes the branch half of the
 //     same bug by rejecting any value beginning with "-" (branches
 //     legitimately contain "/", e.g. "feature/foo", so a charset
-//     allowlist is not appropriate there). ValidateRemoteName closes the
+//     allowlist is not appropriate there), and accepts only a name git
+//     itself accepts as a branch that `git push` reads as exactly that
+//     branch: no leading "+" (a forced push), no ":" (a deletion or
+//     another destination). ValidateBranchName is git's rule alone, for
+//     a branch name read back from git's own state that never becomes a
+//     refspec (a HEAD file). ValidateRemoteName closes the
 //     remote half more strictly still, with its OWN charset allowlist
 //     (the same one ValidateRepoName uses, [a-zA-Z0-9_.-]+, explicitly
 //     rejecting the literal "." and ".." segments too) rather than

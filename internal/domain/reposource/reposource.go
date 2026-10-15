@@ -84,6 +84,29 @@ var (
 	// defensively; no legitimate git ref name needs one.
 	ErrRefControlChar = errors.New("reposource: branch/remote name contains a control character")
 
+	// ErrRefPlusPrefix means a branch name begins with "+". git accepts
+	// "+" in a branch name, but a branch reaches `git push` as a refspec,
+	// and in git's refspec grammar ("[+]<src>[:<dst>]") a leading "+"
+	// forces the update: `git push -- origin +main` pushes the local main
+	// over the remote's even when that discards commits only the remote
+	// holds. A push from a sandbox is never forced (technical plan §35.3).
+	// ValidateBranch refuses it; ValidateBranchName, git's own rule, does
+	// not.
+	ErrRefPlusPrefix = errors.New(`reposource: branch name begins with "+", which git reads as a forced push`)
+
+	// ErrRefLoneAt means a branch name is exactly "@". git's format check
+	// accepts it, but every git command line reads "@" as HEAD, so `git
+	// push -- origin @` pushes whatever is checked out. ValidateBranch
+	// refuses it; ValidateBranchName does not.
+	ErrRefLoneAt = errors.New(`reposource: branch name is "@", which git reads as HEAD`)
+
+	// ErrRefNotBranchName means a branch name is one git itself refuses as
+	// a branch name (git-check-ref-format(1) --branch). The error wrapping
+	// it names the rule broken. ":" is among them: it is the refspec
+	// separator, so `git push -- origin :main` deletes the remote's main
+	// and `x:main` pushes x onto it.
+	ErrRefNotBranchName = errors.New("reposource: branch name is not one git accepts for a branch")
+
 	// ErrPullHeadRefShape means a candidate pull request head ref is not
 	// exactly refs/pull/<number>/head, the number positive, without a
 	// leading zero and at most ten digits.
@@ -213,16 +236,22 @@ func (e *InvalidRepoURLError) Error() string {
 
 func (e *InvalidRepoURLError) Unwrap() error { return e.Reason }
 
-// validateRef implements ValidateBranch's own rejection rule: reject
-// empty, reject a leading "-" (the non-negotiable rule closing the
-// argument-injection class this whole package exists for -- a branch
-// reaching `git push <remote> <branch>` as a trailing positional argument
-// must never be readable as an option), and reject any control character/
-// newline for good measure. Branches legitimately contain "/" (e.g.
-// "feature/foo"), so -- unlike ValidateRepoName/ValidateRemoteName's own
-// charset allowlist -- this rule is deliberately a narrower denylist, not
-// a charset allowlist. kind names the field in the returned error
-// ("branch") so a caller/log line can tell which one was rejected.
+// validateRef implements ValidateBranchName's rule, git's own: it accepts
+// exactly the names `git check-ref-format --branch` accepts. It rejects:
+//
+//   - empty (ErrRefEmpty);
+//   - a leading "-" (ErrRefDashPrefix), the non-negotiable rule closing
+//     the argument-injection class this whole package exists for: a branch
+//     reaching git's argument list must never be readable as an option;
+//   - any control character or newline (ErrRefControlChar);
+//   - anything else git refuses as a branch name (ErrRefNotBranchName;
+//     branchNameProblem says which rule).
+//
+// Branches legitimately contain "/" (e.g. "feature/foo"), so -- unlike
+// ValidateRepoName/ValidateRemoteName's own charset allowlist -- this is
+// git's own refname grammar, not a charset. kind names the field in the
+// returned error ("branch") so a caller/log line can tell which one was
+// rejected.
 func validateRef(kind, value string) error {
 	if value == "" {
 		return &InvalidRefError{Kind: kind, Value: value, Reason: ErrRefEmpty}
@@ -235,7 +264,60 @@ func validateRef(kind, value string) error {
 			return &InvalidRefError{Kind: kind, Value: value, Reason: ErrRefControlChar}
 		}
 	}
+	if problem := branchNameProblem(value); problem != "" {
+		return &InvalidRefError{Kind: kind, Value: value, Reason: fmt.Errorf("%w: %s", ErrRefNotBranchName, problem)}
+	}
 	return nil
+}
+
+// branchNameProblem says why git would refuse name as a branch name, or
+// returns "" when git accepts it: git-check-ref-format(1)'s rule for
+// refs/heads/<name>, as `git check-ref-format --branch` applies it outside
+// a repository, for a name validateRef has already found free of control
+// characters and of a leading "-".
+// TestValidateBranch_AgreesWithGitCheckRefFormat (cmd/sandbox-agent) holds
+// this function to the real git binary.
+func branchNameProblem(name string) string {
+	if name == "HEAD" {
+		return `it is "HEAD"`
+	}
+	// git's forbidden characters: space; "~", "^" and ":", revision and
+	// refspec syntax (":" splits a refspec's source from its destination);
+	// "?", "*" and "[", glob syntax; and "\".
+	if i := strings.IndexAny(name, ` ~^:?*[\`); i >= 0 {
+		return fmt.Sprintf("it contains %q", name[i:i+1])
+	}
+	if strings.Contains(name, "..") {
+		return `it contains ".."`
+	}
+	if strings.Contains(name, "@{") {
+		return `it contains "@{"`
+	}
+	if strings.HasSuffix(name, ".") {
+		return `it ends with "."`
+	}
+	for _, component := range strings.Split(name, "/") {
+		switch {
+		case component == "":
+			return `it has an empty "/"-separated component`
+		case component[0] == '.':
+			return `a "/"-separated component begins with "."`
+		case strings.HasSuffix(component, ".lock"):
+			return `a "/"-separated component ends with ".lock"`
+		}
+	}
+	return ""
+}
+
+// ValidateBranchName reports whether git itself accepts name as a branch
+// name: exactly `git check-ref-format --branch` (see validateRef). Use it
+// for a name read back from git's own state that never becomes a refspec
+// -- the branch a HEAD file names (gitdir.SyncHeadIn/SyncHeadOut), which
+// the agent runtime may have created with any name git allows, "+wip"
+// included. Use ValidateBranch for a name that reaches git as an argument
+// or a refspec.
+func ValidateBranchName(name string) error {
+	return validateRef("branch", name)
 }
 
 // ValidateBranch validates a candidate branch name (sessionconfig.
@@ -243,10 +325,27 @@ func validateRef(kind, value string) error {
 // reaches a git subprocess's argument list (as `--branch <branch>` for
 // clone, or as a trailing positional refspec for push). Branch is
 // optional/nullable upstream -- callers only invoke this when a branch
-// value is actually present, never for a nil/absent branch. See
-// validateRef for the exact rejection rules.
+// value is actually present, never for a nil/absent branch.
+//
+// It is ValidateBranchName -- git's own branch-name rule -- less the two
+// names git accepts as a branch but would push as something else: a
+// leading "+", a forced refspec (ErrRefPlusPrefix), and a lone "@", HEAD
+// (ErrRefLoneAt). So `git push -- <remote> <branch>` reads every name it
+// accepts as that one branch, pushed to the same name, fast-forward only.
+// Use it wherever a session's branch becomes a git argument or refspec:
+// session and automation creation, the seed manifest, the sandbox's clone,
+// sync and push, and the control plane before it sends a push.
 func ValidateBranch(branch string) error {
-	return validateRef("branch", branch)
+	if err := validateRef("branch", branch); err != nil {
+		return err
+	}
+	if branch[0] == '+' {
+		return &InvalidRefError{Kind: "branch", Value: branch, Reason: ErrRefPlusPrefix}
+	}
+	if branch == "@" {
+		return &InvalidRefError{Kind: "branch", Value: branch, Reason: ErrRefLoneAt}
+	}
+	return nil
 }
 
 // ValidatePullHeadRef validates a candidate pull request head ref
@@ -282,15 +381,17 @@ func PullHeadRef(n int32) string {
 	return "refs/pull/" + strconv.FormatInt(int64(n), 10) + "/head"
 }
 
-// InvalidRefError reports a single branch name ValidateBranch rejected,
-// and why.
+// InvalidRefError reports a single branch name ValidateBranch or
+// ValidateBranchName rejected, and why.
 type InvalidRefError struct {
 	// Kind is "branch" -- which field was being validated.
 	Kind string
 	// Value is the offending branch name, verbatim.
 	Value string
-	// Reason is one of ErrRefEmpty, ErrRefDashPrefix, or
-	// ErrRefControlChar -- the base sentinel this error unwraps to.
+	// Reason is ErrRefEmpty, ErrRefDashPrefix, ErrRefControlChar,
+	// ErrRefPlusPrefix or ErrRefLoneAt, or an error wrapping
+	// ErrRefNotBranchName that names the rule broken -- what this error
+	// unwraps to.
 	Reason error
 }
 
@@ -304,7 +405,7 @@ func (e *InvalidRefError) Unwrap() error { return e.Reason }
 // Push.Repos[].Remote, session-controlled and overridable from its
 // default of "origin") before it reaches `git push` as a trailing
 // positional argument. Unlike ValidateBranch, this is NOT validateRef's
-// permissive "reject empty/leading-dash/control-chars only" rule: a git
+// git-refname rule, which accepts "/" in a branch name: a git
 // remote name is conceptually a bare identifier (like "origin", "upstream",
 // "fork"), never a path or a URL, so it shares ValidateRepoName's own
 // stricter charset-allowlist rule instead (via the same
