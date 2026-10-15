@@ -1169,6 +1169,7 @@ func TestRepoSettingsRoundTrip(t *testing.T) {
 			restdtos.RepoSettingsSensitiveBlastRadiusTagsElemMigrations,
 		}
 		percent := 12.5
+		spendCap := 25.5
 		roundTrip(t, sch, restdtos.RepoSettings{
 			RepoFullName:               "acme/widgets",
 			BlockOnHighRisk:            true,
@@ -1179,6 +1180,7 @@ func TestRepoSettingsRoundTrip(t *testing.T) {
 			ContradictionRateComputed:  true,
 			ContradictionRatePercent:   &percent,
 			ContradictionSampleSize:    8,
+			SessionSpendCapUsd:         &spendCap,
 		})
 	})
 
@@ -1193,7 +1195,43 @@ func TestRepoSettingsRoundTrip(t *testing.T) {
 			ContradictionRateComputed:  false,
 			ContradictionRatePercent:   nil,
 			ContradictionSampleSize:    0,
+			SessionSpendCapUsd:         nil,
 		})
+	})
+
+	// §40.1: sessionSpendCapUsd is required and nullable -- a body that
+	// leaves it out is refused, so a client never reads a missing cap as
+	// "no cap".
+	t.Run("SessionSpendCapRequired", func(t *testing.T) {
+		body := []byte(`{"repoFullName":"acme/widgets","blockOnHighRisk":false,"sentinelAutofixEnabled":false,"autoMergeEnabled":false,` +
+			`"maxAutoApproveFilesChanged":null,"sensitiveBlastRadiusTags":null,"contradictionRateComputed":false,"contradictionRatePercent":null,` +
+			`"contradictionSampleSize":0,"autoRetriggerReviewEnabled":false,"descriptionAutofixEnabled":false,"reviewDepthMode":null,` +
+			`"reviewDepthDeepPaths":null,"reviewCostBudgetLightUsd":null,"reviewCostBudgetDeepUsd":null}`)
+		if err := validateJSON(t, sch, body); err == nil {
+			t.Fatal("a RepoSettings without sessionSpendCapUsd validated, want it required")
+		}
+	})
+}
+
+// TestUpdateSessionSpendCapRequestRoundTrip: the body of both session spend
+// cap routes (§40.1) -- a cap, or null to clear it; capUsd is required, so
+// an empty body never clears a cap by accident.
+func TestUpdateSessionSpendCapRequestRoundTrip(t *testing.T) {
+	sch := compileSchema(t, restDTOsSchemaPath, "#/$defs/UpdateSessionSpendCapRequest")
+
+	t.Run("Set", func(t *testing.T) {
+		limit := 25.5
+		roundTrip(t, sch, restdtos.UpdateSessionSpendCapRequest{CapUsd: &limit})
+	})
+	t.Run("Cleared", func(t *testing.T) {
+		roundTrip(t, sch, restdtos.UpdateSessionSpendCapRequest{CapUsd: nil})
+	})
+	t.Run("Refused", func(t *testing.T) {
+		for _, body := range []string{`{}`, `{"capUsd":"25"}`, `{"capUsd":25,"extra":1}`} {
+			if err := validateJSON(t, sch, []byte(body)); err == nil {
+				t.Errorf("%s validated, want it refused", body)
+			}
+		}
 	})
 }
 
@@ -1332,6 +1370,7 @@ func TestAutomationRoundTrip(t *testing.T) {
 
 	t.Run("PopulatedLastRunAt", func(t *testing.T) {
 		lastRunAt := time.Date(2026, 7, 27, 11, 14, 30, 0, time.UTC)
+		spendCap := 40.0
 		artifactSummary := "Closed 2 flaky-test findings."
 		roundTrip(t, sch, restdtos.Automation{
 			Id:                    testSessionID,
@@ -1352,6 +1391,8 @@ func TestAutomationRoundTrip(t *testing.T) {
 			LastRunAt:             restdtos.AutomationLastRunAt(&lastRunAt),
 			LastRunStatus:         &restdtos.AutomationLastRunStatus{Value: "succeeded"},
 			ArtifactSummary:       restdtos.AutomationArtifactSummary(&artifactSummary),
+			// §40.1: a cap the automation sets for every session it creates.
+			SessionSpendCapUsd: restdtos.AutomationSessionSpendCapUsd(&spendCap),
 		})
 	})
 

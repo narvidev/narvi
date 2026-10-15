@@ -665,7 +665,7 @@
             },
             "lastRun": {
               "additionalProperties": false,
-              "description": "The most recently created turn that reached a terminal state, leaving aside a turn that ended without ever running, for a reason of its own: a queued automatic review whose pull request moved before it started (technical plan §24.9), which is no run of the session's; null when none has.",
+              "description": "The most recently created turn that reached a terminal state, leaving aside a turn that ended without ever running, for a reason of its own -- a queued automatic review whose pull request moved before it started (technical plan §24.9), or a queued turn ended before its dispatch because the session guard refuses the session new turns, as it does once the session has spent its cap (technical plan §40.1) -- which is no run of the session's; null when none has.",
               "properties": {
                 "failureReason": {
                   "description": "Why the run did not complete, with Session.failureReason's values. A turn carries no reason of its own, so this is the session's recorded reason, given only when it can describe nothing but this run: the run is the session's newest turn, did not complete, and the session's recorded outcome is this run's. Null otherwise, and always null when the run completed.",
@@ -980,7 +980,7 @@
             },
             "lastRun": {
               "additionalProperties": false,
-              "description": "The most recently created turn that reached a terminal state, leaving aside a turn that ended without ever running, for a reason of its own: a queued automatic review whose pull request moved before it started (technical plan §24.9), which is no run of the session's; null when none has.",
+              "description": "The most recently created turn that reached a terminal state, leaving aside a turn that ended without ever running, for a reason of its own -- a queued automatic review whose pull request moved before it started (technical plan §24.9), or a queued turn ended before its dispatch because the session guard refuses the session new turns, as it does once the session has spent its cap (technical plan §40.1) -- which is no run of the session's; null when none has.",
               "properties": {
                 "failureReason": {
                   "description": "Why the run did not complete, with Session.failureReason's values. A turn carries no reason of its own, so this is the session's recorded reason, given only when it can describe nothing but this run: the run is the session's newest turn, did not complete, and the session's recorded outcome is this run's. Null otherwise, and always null when the run completed.",

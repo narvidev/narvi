@@ -48,11 +48,28 @@ func (s *AutomationStore) Get(ctx context.Context, id pgtype.UUID) (sqlcgen.Auto
 
 // LockForUpdate reads and row-locks the automations row for id -- callers
 // MUST be inside an open transaction (WithTx) and MUST subsequently call
-// either ApplyFailureStrike or nothing before committing/rolling back; see
-// LockAutomationForUpdate's own generated doc comment for the concurrent-
-// invocation-closure race this lock closes.
+// ApplyFailureStrike, UpdateSessionSpendCap, or nothing before committing/
+// rolling back; see LockAutomationForUpdate's own generated doc comment for
+// the races this lock closes.
 func (s *AutomationStore) LockForUpdate(ctx context.Context, id pgtype.UUID) (sqlcgen.Automation, error) {
 	return s.q.LockAutomationForUpdate(ctx, id)
+}
+
+// UpdateSessionSpendCap writes id's session spend cap (technical plan
+// §40.1) and returns the whole row; nil clears it. Callers hold
+// LockForUpdate's row lock in the same transaction, and have validated the
+// cap (sessionguard.ValidateSessionSpendCap); a value that cannot convert
+// is an error here, never a NULL that would lift the cap. pgx.ErrNoRows
+// when the automation does not exist.
+func (s *AutomationStore) UpdateSessionSpendCap(ctx context.Context, id pgtype.UUID, capUSD *float64) (sqlcgen.Automation, error) {
+	limit, err := sessionSpendCapNumeric(capUSD)
+	if err != nil {
+		return sqlcgen.Automation{}, err
+	}
+	return s.q.UpdateAutomationSessionSpendCap(ctx, sqlcgen.UpdateAutomationSessionSpendCapParams{
+		ID:                 id,
+		SessionSpendCapUsd: limit,
+	})
 }
 
 // ApplyFailureStrike records automation.EvaluateFailureStrike's own

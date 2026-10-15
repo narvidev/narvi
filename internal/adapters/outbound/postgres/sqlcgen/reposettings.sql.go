@@ -198,6 +198,33 @@ func (q *Queries) ListReposOwedDemotionSweep(ctx context.Context, limit int32) (
 	return items, nil
 }
 
+const lockRepoSessionSpendCap = `-- name: LockRepoSessionSpendCap :one
+INSERT INTO repo_settings (repo_full_name, updated_at)
+VALUES ($1, now())
+ON CONFLICT (repo_full_name)
+DO UPDATE SET updated_at = repo_settings.updated_at
+RETURNING session_spend_cap_usd
+`
+
+// The first statement of a session spend cap write (technical plan §40.1,
+// httpapi's PutSessionSpendCap): row-locks the repository's settings row
+// and returns its cap as it stands, NULL for none, for the
+// session_spend_cap.set audit row's previous value. The row is created,
+// with every column at its default, when the repository has none yet --
+// as any column-scoped upsert of this table creates it -- so there is
+// always a row to lock: a SELECT ... FOR UPDATE of a missing row locks
+// nothing, and two first writes at once would each audit "no previous
+// cap". The conflict arm rewrites updated_at with its own value, a write
+// that changes nothing but takes the row's lock; under READ COMMITTED it
+// acts on the row's latest committed version, so of two writes at once
+// the second waits for the first and reads the cap the first wrote.
+func (q *Queries) LockRepoSessionSpendCap(ctx context.Context, repoFullName string) (pgtype.Numeric, error) {
+	row := q.db.QueryRow(ctx, lockRepoSessionSpendCap, repoFullName)
+	var session_spend_cap_usd pgtype.Numeric
+	err := row.Scan(&session_spend_cap_usd)
+	return session_spend_cap_usd, err
+}
+
 const upsertAutoApprovalEligibility = `-- name: UpsertAutoApprovalEligibility :one
 INSERT INTO repo_settings (repo_full_name, max_auto_approve_files_changed, sensitive_blast_radius_tags, updated_at)
 VALUES ($1, $2, $3, now())
@@ -796,6 +823,58 @@ type UpsertReviewDepthConfigParams struct {
 // race with this one at the database level.
 func (q *Queries) UpsertReviewDepthConfig(ctx context.Context, arg UpsertReviewDepthConfigParams) (RepoSetting, error) {
 	row := q.db.QueryRow(ctx, upsertReviewDepthConfig, arg.RepoFullName, arg.ReviewDepthMode, arg.ReviewDepthDeepPaths)
+	var i RepoSetting
+	err := row.Scan(
+		&i.RepoFullName,
+		&i.BlockOnHighRisk,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.SentinelAutofixEnabled,
+		&i.RwxPreviewDispatchKey,
+		&i.RwxPreviewEndpointTemplate,
+		&i.RwxPreviewOrgSlug,
+		&i.AutoMergeEnabled,
+		&i.MaxAutoApproveFilesChanged,
+		&i.SensitiveBlastRadiusTags,
+		&i.AutoRetriggerReviewEnabled,
+		&i.DescriptionAutofixEnabled,
+		&i.ReviewDepthMode,
+		&i.ReviewDepthDeepPaths,
+		&i.ReviewCostBudgetLightUsd,
+		&i.ReviewCostBudgetDeepUsd,
+		&i.SessionsEnabled,
+		&i.LiveEgressEnabled,
+		&i.LiveEgressPromotedAt,
+		&i.DemotionSweepPendingAt,
+		&i.SessionSpendCapUsd,
+	)
+	return i, err
+}
+
+const upsertSessionSpendCap = `-- name: UpsertSessionSpendCap :one
+INSERT INTO repo_settings (repo_full_name, session_spend_cap_usd, updated_at)
+VALUES ($1, $2, now())
+ON CONFLICT (repo_full_name)
+DO UPDATE SET session_spend_cap_usd = EXCLUDED.session_spend_cap_usd, updated_at = now()
+RETURNING repo_full_name, block_on_high_risk, created_at, updated_at, sentinel_autofix_enabled, rwx_preview_dispatch_key, rwx_preview_endpoint_template, rwx_preview_org_slug, auto_merge_enabled, max_auto_approve_files_changed, sensitive_blast_radius_tags, auto_retrigger_review_enabled, description_autofix_enabled, review_depth_mode, review_depth_deep_paths, review_cost_budget_light_usd, review_cost_budget_deep_usd, sessions_enabled, live_egress_enabled, live_egress_promoted_at, demotion_sweep_pending_at, session_spend_cap_usd
+`
+
+type UpsertSessionSpendCapParams struct {
+	RepoFullName       string         `json:"repo_full_name"`
+	SessionSpendCapUsd pgtype.Numeric `json:"session_spend_cap_usd"`
+}
+
+// Technical plan §40.1's per-repo session spend cap
+// (repo_settings.session_spend_cap_usd, migrations/000165): sets, raises,
+// lowers or clears it (NULL: no cap), mirroring UpsertReviewCostBudget's
+// column-scoped shape immediately above -- every other repo_settings
+// column is left untouched. Written only after LockRepoSessionSpendCap in
+// the same transaction, with the session_spend_cap.set audit row. A cap of
+// zero or less, or no number at all, is refused before it reaches here
+// (sessionguard.ValidateSessionSpendCap, a 400) and by the column's CHECK
+// constraint behind it.
+func (q *Queries) UpsertSessionSpendCap(ctx context.Context, arg UpsertSessionSpendCapParams) (RepoSetting, error) {
+	row := q.db.QueryRow(ctx, upsertSessionSpendCap, arg.RepoFullName, arg.SessionSpendCapUsd)
 	var i RepoSetting
 	err := row.Scan(
 		&i.RepoFullName,

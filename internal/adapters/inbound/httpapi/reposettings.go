@@ -284,13 +284,14 @@ func GetRepoSettings(repoSettings *postgres.RepoSettingsStore, reviewVerdictDeps
 		// actions this endpoint originally gated on alone (see
 		// authorizeAny's own doc comment above). (§24.5) adds
 		// ActionToggleAutoRetriggerReview, (§26.2) adds
-		// ActionToggleDescriptionAutofix, and (§26.7) adds
-		// ActionConfigureReviewCostBudget, to this SAME "any one of these
+		// ActionToggleDescriptionAutofix, (§26.7) adds
+		// ActionConfigureReviewCostBudget, and (§40.1) adds
+		// ActionSetSessionSpendCap, to this SAME "any one of these
 		// suffices to read" list -- all the SAME admin-only row as
 		// ActionToggleAutoMerge, so this changes nothing about who could
 		// already read this endpoint, only documents each new toggle's
 		// own read gate explicitly.
-		if !authorizeAny(w, r, authz.Resource{}, authz.ActionConfigureBlockOnHighRisk, authz.ActionConfigureAutoApprove, authz.ActionToggleAutoMerge, authz.ActionToggleAutoRetriggerReview, authz.ActionToggleDescriptionAutofix, authz.ActionConfigureReviewDepth, authz.ActionConfigureReviewCostBudget) {
+		if !authorizeAny(w, r, authz.Resource{}, authz.ActionConfigureBlockOnHighRisk, authz.ActionConfigureAutoApprove, authz.ActionToggleAutoMerge, authz.ActionToggleAutoRetriggerReview, authz.ActionToggleDescriptionAutofix, authz.ActionConfigureReviewDepth, authz.ActionConfigureReviewCostBudget, authz.ActionSetSessionSpendCap) {
 			return
 		}
 
@@ -316,20 +317,7 @@ func GetRepoSettings(repoSettings *postgres.RepoSettingsStore, reviewVerdictDeps
 			// (this table's own established precedent), resp already
 			// carries the zero-value false/nil defaults for every field.
 		} else {
-			resp.BlockOnHighRisk = settings.BlockOnHighRisk
-			resp.SentinelAutofixEnabled = settings.SentinelAutofixEnabled
-			resp.AutoMergeEnabled = settings.AutoMergeEnabled
-			resp.AutoRetriggerReviewEnabled = settings.AutoRetriggerReviewEnabled
-			resp.DescriptionAutofixEnabled = settings.DescriptionAutofixEnabled
-			if settings.MaxAutoApproveFilesChanged != nil {
-				v := int(*settings.MaxAutoApproveFilesChanged)
-				resp.MaxAutoApproveFilesChanged = &v
-			}
-			if tags := autoApprovalTagsFromJSON(settings.SensitiveBlastRadiusTags); tags != nil {
-				resp.SensitiveBlastRadiusTags = &tags
-			}
-			resp.ReviewDepthMode, resp.ReviewDepthDeepPaths = reviewDepthFieldsFromRow(settings)
-			resp.ReviewCostBudgetLightUsd, resp.ReviewCostBudgetDeepUsd = reviewCostBudgetFieldsFromRow(settings)
+			resp = repoSettingsFromRow(repoFullName, settings)
 		}
 
 		rate, _, sampleSize, computed, err := appreviewverdict.ContradictionRate(ctx, reviewVerdictDeps, repoFullName, time.Now())
@@ -364,6 +352,33 @@ func autoApprovalTagsFromJSON(raw []byte) restdtos.RepoSettingsSensitiveBlastRad
 		out[i] = restdtos.RepoSettingsSensitiveBlastRadiusTagsElem(t)
 	}
 	return out
+}
+
+// repoSettingsFromRow renders one repo_settings row as restdtos.RepoSettings:
+// every field the row holds, so no handler rendering a whole row drifts from
+// another. The contradiction-rate fields are not the row's: GetRepoSettings
+// computes them beside it, and every other caller leaves them at "not
+// computed".
+func repoSettingsFromRow(repoFullName string, settings sqlcgen.RepoSetting) restdtos.RepoSettings {
+	resp := restdtos.RepoSettings{
+		RepoFullName:               repoFullName,
+		BlockOnHighRisk:            settings.BlockOnHighRisk,
+		SentinelAutofixEnabled:     settings.SentinelAutofixEnabled,
+		AutoMergeEnabled:           settings.AutoMergeEnabled,
+		AutoRetriggerReviewEnabled: settings.AutoRetriggerReviewEnabled,
+		DescriptionAutofixEnabled:  settings.DescriptionAutofixEnabled,
+		SessionSpendCapUsd:         sessionSpendCapUSD(settings.SessionSpendCapUsd),
+	}
+	if settings.MaxAutoApproveFilesChanged != nil {
+		v := int(*settings.MaxAutoApproveFilesChanged)
+		resp.MaxAutoApproveFilesChanged = &v
+	}
+	if tags := autoApprovalTagsFromJSON(settings.SensitiveBlastRadiusTags); tags != nil {
+		resp.SensitiveBlastRadiusTags = &tags
+	}
+	resp.ReviewDepthMode, resp.ReviewDepthDeepPaths = reviewDepthFieldsFromRow(settings)
+	resp.ReviewCostBudgetLightUsd, resp.ReviewCostBudgetDeepUsd = reviewCostBudgetFieldsFromRow(settings)
+	return resp
 }
 
 // reviewDepthFieldsFromRow renders settings' own review_depth_mode/
@@ -475,6 +490,7 @@ func PutRepoSettings(repoSettings *postgres.RepoSettingsStore, prSessions *postg
 			ReviewDepthDeepPaths:     deepPaths,
 			ReviewCostBudgetLightUsd: costBudgetLight,
 			ReviewCostBudgetDeepUsd:  costBudgetDeep,
+			SessionSpendCapUsd:       sessionSpendCapUSD(settings.SessionSpendCapUsd),
 		})
 	}
 }
@@ -628,25 +644,7 @@ func PutAutoRetriggerReviewToggle(repoSettings *postgres.RepoSettingsStore, prSe
 			return
 		}
 
-		resp := restdtos.RepoSettings{
-			RepoFullName:               repoFullName,
-			BlockOnHighRisk:            settings.BlockOnHighRisk,
-			SentinelAutofixEnabled:     settings.SentinelAutofixEnabled,
-			AutoMergeEnabled:           settings.AutoMergeEnabled,
-			AutoRetriggerReviewEnabled: settings.AutoRetriggerReviewEnabled,
-			DescriptionAutofixEnabled:  settings.DescriptionAutofixEnabled,
-		}
-		if settings.MaxAutoApproveFilesChanged != nil {
-			v := int(*settings.MaxAutoApproveFilesChanged)
-			resp.MaxAutoApproveFilesChanged = &v
-		}
-		if tags := autoApprovalTagsFromJSON(settings.SensitiveBlastRadiusTags); tags != nil {
-			resp.SensitiveBlastRadiusTags = &tags
-		}
-		resp.ReviewDepthMode, resp.ReviewDepthDeepPaths = reviewDepthFieldsFromRow(settings)
-		resp.ReviewCostBudgetLightUsd, resp.ReviewCostBudgetDeepUsd = reviewCostBudgetFieldsFromRow(settings)
-
-		writeJSON(w, http.StatusOK, resp)
+		writeJSON(w, http.StatusOK, repoSettingsFromRow(repoFullName, settings))
 	}
 }
 
@@ -695,25 +693,7 @@ func PutDescriptionAutofixToggle(repoSettings *postgres.RepoSettingsStore, prSes
 			return
 		}
 
-		resp := restdtos.RepoSettings{
-			RepoFullName:               repoFullName,
-			BlockOnHighRisk:            settings.BlockOnHighRisk,
-			SentinelAutofixEnabled:     settings.SentinelAutofixEnabled,
-			AutoMergeEnabled:           settings.AutoMergeEnabled,
-			AutoRetriggerReviewEnabled: settings.AutoRetriggerReviewEnabled,
-			DescriptionAutofixEnabled:  settings.DescriptionAutofixEnabled,
-		}
-		if settings.MaxAutoApproveFilesChanged != nil {
-			v := int(*settings.MaxAutoApproveFilesChanged)
-			resp.MaxAutoApproveFilesChanged = &v
-		}
-		if tags := autoApprovalTagsFromJSON(settings.SensitiveBlastRadiusTags); tags != nil {
-			resp.SensitiveBlastRadiusTags = &tags
-		}
-		resp.ReviewDepthMode, resp.ReviewDepthDeepPaths = reviewDepthFieldsFromRow(settings)
-		resp.ReviewCostBudgetLightUsd, resp.ReviewCostBudgetDeepUsd = reviewCostBudgetFieldsFromRow(settings)
-
-		writeJSON(w, http.StatusOK, resp)
+		writeJSON(w, http.StatusOK, repoSettingsFromRow(repoFullName, settings))
 	}
 }
 
@@ -743,6 +723,7 @@ func autoApprovalSettingsToRepoSettingsDTO(ctx context.Context, repoSettings *po
 		resp.SentinelAutofixEnabled = settings.SentinelAutofixEnabled
 		resp.ReviewDepthMode, resp.ReviewDepthDeepPaths = reviewDepthFieldsFromRow(settings)
 		resp.ReviewCostBudgetLightUsd, resp.ReviewCostBudgetDeepUsd = reviewCostBudgetFieldsFromRow(settings)
+		resp.SessionSpendCapUsd = sessionSpendCapUSD(settings.SessionSpendCapUsd)
 	} else if !errors.Is(err, pgx.ErrNoRows) {
 		platform.Logger(ctx).Error("httpapi: read back block-on-high-risk/sentinel-autofix fields failed", "error", err)
 	}
@@ -839,25 +820,7 @@ func PutReviewDepthConfig(repoSettings *postgres.RepoSettingsStore, prSessions *
 			return
 		}
 
-		resp := restdtos.RepoSettings{
-			RepoFullName:               repoFullName,
-			BlockOnHighRisk:            settings.BlockOnHighRisk,
-			SentinelAutofixEnabled:     settings.SentinelAutofixEnabled,
-			AutoMergeEnabled:           settings.AutoMergeEnabled,
-			AutoRetriggerReviewEnabled: settings.AutoRetriggerReviewEnabled,
-			DescriptionAutofixEnabled:  settings.DescriptionAutofixEnabled,
-		}
-		if settings.MaxAutoApproveFilesChanged != nil {
-			v := int(*settings.MaxAutoApproveFilesChanged)
-			resp.MaxAutoApproveFilesChanged = &v
-		}
-		if tags := autoApprovalTagsFromJSON(settings.SensitiveBlastRadiusTags); tags != nil {
-			resp.SensitiveBlastRadiusTags = &tags
-		}
-		resp.ReviewDepthMode, resp.ReviewDepthDeepPaths = reviewDepthFieldsFromRow(settings)
-		resp.ReviewCostBudgetLightUsd, resp.ReviewCostBudgetDeepUsd = reviewCostBudgetFieldsFromRow(settings)
-
-		writeJSON(w, http.StatusOK, resp)
+		writeJSON(w, http.StatusOK, repoSettingsFromRow(repoFullName, settings))
 	}
 }
 
@@ -923,24 +886,6 @@ func PutReviewCostBudget(repoSettings *postgres.RepoSettingsStore, prSessions *p
 			return
 		}
 
-		resp := restdtos.RepoSettings{
-			RepoFullName:               repoFullName,
-			BlockOnHighRisk:            settings.BlockOnHighRisk,
-			SentinelAutofixEnabled:     settings.SentinelAutofixEnabled,
-			AutoMergeEnabled:           settings.AutoMergeEnabled,
-			AutoRetriggerReviewEnabled: settings.AutoRetriggerReviewEnabled,
-			DescriptionAutofixEnabled:  settings.DescriptionAutofixEnabled,
-		}
-		if settings.MaxAutoApproveFilesChanged != nil {
-			v := int(*settings.MaxAutoApproveFilesChanged)
-			resp.MaxAutoApproveFilesChanged = &v
-		}
-		if tags := autoApprovalTagsFromJSON(settings.SensitiveBlastRadiusTags); tags != nil {
-			resp.SensitiveBlastRadiusTags = &tags
-		}
-		resp.ReviewDepthMode, resp.ReviewDepthDeepPaths = reviewDepthFieldsFromRow(settings)
-		resp.ReviewCostBudgetLightUsd, resp.ReviewCostBudgetDeepUsd = reviewCostBudgetFieldsFromRow(settings)
-
-		writeJSON(w, http.StatusOK, resp)
+		writeJSON(w, http.StatusOK, repoSettingsFromRow(repoFullName, settings))
 	}
 }

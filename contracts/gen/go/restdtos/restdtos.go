@@ -426,6 +426,18 @@ type Automation struct {
 	// automation fans out.
 	SandboxPathScope *AutomationSandboxPathScope `json:"sandboxPathScope" yaml:"sandboxPathScope" mapstructure:"sandboxPathScope"`
 
+	// §40.1: the session spend cap of every session this automation creates, in USD,
+	// at most two decimal places. When set it takes precedence over the caps of the
+	// session's repositories (RepoSettings.sessionSpendCapUsd), above or below them.
+	// A session whose recorded spend -- the sum of its dispatched turns' cost, a
+	// lower bound of the bill -- is at or past its cap takes no new turn, whoever
+	// asks; the turn already running is left to finish. Null means the automation
+	// sets no cap of its own. Set, raised or cleared only through PUT
+	// /api/automations/{automationID}/session-spend-cap
+	// (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as
+	// session_spend_cap.set -- never at creation, which a maintainer may do.
+	SessionSpendCapUsd AutomationSessionSpendCapUsd `json:"sessionSpendCapUsd" yaml:"sessionSpendCapUsd" mapstructure:"sessionSpendCapUsd"`
+
 	// Matches Postgres automation_status exactly.
 	Status AutomationStatus `json:"status" yaml:"status" mapstructure:"status"`
 
@@ -882,6 +894,18 @@ type AutomationSandboxContractsPath *string
 // automation fans out.
 type AutomationSandboxPathScope []string
 
+// §40.1: the session spend cap of every session this automation creates, in USD,
+// at most two decimal places. When set it takes precedence over the caps of the
+// session's repositories (RepoSettings.sessionSpendCapUsd), above or below them. A
+// session whose recorded spend -- the sum of its dispatched turns' cost, a lower
+// bound of the bill -- is at or past its cap takes no new turn, whoever asks; the
+// turn already running is left to finish. Null means the automation sets no cap of
+// its own. Set, raised or cleared only through PUT
+// /api/automations/{automationID}/session-spend-cap
+// (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as
+// session_spend_cap.set -- never at creation, which a maintainer may do.
+type AutomationSessionSpendCapUsd *float64
+
 type AutomationStatus string
 
 const AutomationStatusActive AutomationStatus = "active"
@@ -998,6 +1022,9 @@ func (j *Automation) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["sandboxPathScope"]; raw != nil && !ok {
 		return fmt.Errorf("field sandboxPathScope in Automation: required")
+	}
+	if _, ok := raw["sessionSpendCapUsd"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionSpendCapUsd in Automation: required")
 	}
 	if _, ok := raw["status"]; raw != nil && !ok {
 		return fmt.Errorf("field status in Automation: required")
@@ -9809,6 +9836,19 @@ type RepoSettings struct {
 	// merge-gated follow-up PR). A stricter gate than blockOnHighRisk/the
 	// criteria-driven auto-approval config, since it ends in an unattended merge.
 	SentinelAutofixEnabled bool `json:"sentinelAutofixEnabled" yaml:"sentinelAutofixEnabled" mapstructure:"sentinelAutofixEnabled"`
+
+	// §40.1: the session spend cap of every session that names this repository, in
+	// USD, at most two decimal places. A session whose recorded spend -- the sum of
+	// its dispatched turns' cost, a lower bound of the bill -- is at or past its cap
+	// takes no new turn, whoever asks; the turn already running is left to finish, so
+	// the spend can pass the cap by that one turn's cost. A session naming several
+	// repositories takes the strictest of their caps, and a session an automation
+	// created takes the automation's cap instead when the automation sets one
+	// (Automation.sessionSpendCapUsd). Null means no cap. Set, raised or cleared only
+	// through PUT /api/repos/{owner}/{repo}/session-spend-cap
+	// (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as
+	// session_spend_cap.set; a raise lets a refused session take its next turn.
+	SessionSpendCapUsd RepoSettingsSessionSpendCapUsd `json:"sessionSpendCapUsd" yaml:"sessionSpendCapUsd" mapstructure:"sessionSpendCapUsd"`
 }
 
 // Null iff contradictionRateComputed is false. The fraction of auto-approved PRs a
@@ -9920,6 +9960,19 @@ func (j *RepoSettingsSensitiveBlastRadiusTagsElem) UnmarshalJSON(value []byte) e
 	return nil
 }
 
+// §40.1: the session spend cap of every session that names this repository, in
+// USD, at most two decimal places. A session whose recorded spend -- the sum of
+// its dispatched turns' cost, a lower bound of the bill -- is at or past its cap
+// takes no new turn, whoever asks; the turn already running is left to finish, so
+// the spend can pass the cap by that one turn's cost. A session naming several
+// repositories takes the strictest of their caps, and a session an automation
+// created takes the automation's cap instead when the automation sets one
+// (Automation.sessionSpendCapUsd). Null means no cap. Set, raised or cleared only
+// through PUT /api/repos/{owner}/{repo}/session-spend-cap
+// (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as
+// session_spend_cap.set; a raise lets a refused session take its next turn.
+type RepoSettingsSessionSpendCapUsd *float64
+
 // UnmarshalJSON implements json.Unmarshaler.
 func (j *RepoSettings) UnmarshalJSON(value []byte) error {
 	var raw map[string]interface{}
@@ -9970,6 +10023,9 @@ func (j *RepoSettings) UnmarshalJSON(value []byte) error {
 	}
 	if _, ok := raw["sentinelAutofixEnabled"]; raw != nil && !ok {
 		return fmt.Errorf("field sentinelAutofixEnabled in RepoSettings: required")
+	}
+	if _, ok := raw["sessionSpendCapUsd"]; raw != nil && !ok {
+		return fmt.Errorf("field sessionSpendCapUsd in RepoSettings: required")
 	}
 	type Plain RepoSettings
 	var plain Plain
@@ -12370,9 +12426,11 @@ type SessionActivity struct {
 	InFlightTurn *SessionActivityInFlightTurn `json:"inFlightTurn" yaml:"inFlightTurn" mapstructure:"inFlightTurn"`
 
 	// The most recently created turn that reached a terminal state, leaving aside a
-	// turn that ended without ever running, for a reason of its own: a queued
+	// turn that ended without ever running, for a reason of its own -- a queued
 	// automatic review whose pull request moved before it started (technical plan
-	// §24.9), which is no run of the session's; null when none has.
+	// §24.9), or a queued turn ended before its dispatch because the session guard
+	// refuses the session new turns, as it does once the session has spent its cap
+	// (technical plan §40.1) -- which is no run of the session's; null when none has.
 	LastRun *SessionActivityLastRun `json:"lastRun" yaml:"lastRun" mapstructure:"lastRun"`
 
 	// The database's clock when the snapshot was taken.
@@ -12660,9 +12718,11 @@ func (j *SessionActivityInFlightTurn) UnmarshalJSON(value []byte) error {
 }
 
 // The most recently created turn that reached a terminal state, leaving aside a
-// turn that ended without ever running, for a reason of its own: a queued
+// turn that ended without ever running, for a reason of its own -- a queued
 // automatic review whose pull request moved before it started (technical plan
-// §24.9), which is no run of the session's; null when none has.
+// §24.9), or a queued turn ended before its dispatch because the session guard
+// refuses the session new turns, as it does once the session has spent its cap
+// (technical plan §40.1) -- which is no run of the session's; null when none has.
 type SessionActivityLastRun struct {
 	// Why the run did not complete, with Session.failureReason's values. A turn
 	// carries no reason of its own, so this is the session's recorded reason, given
@@ -15430,6 +15490,47 @@ func (j *UpdateSandboxSecretRequest) UnmarshalJSON(value []byte) error {
 		return fmt.Errorf("field %s length: must be >= %d", "value", 1)
 	}
 	*j = UpdateSandboxSecretRequest(plain)
+	return nil
+}
+
+// Request body for PUT /api/repos/{owner}/{repo}/session-spend-cap and PUT
+// /api/automations/{automationID}/session-spend-cap (§40.1): sets, raises, lowers
+// or clears the session spend cap of a repository or of an automation. Admin only
+// (authz.ActionSetSessionSpendCap, §13.3); each write and its
+// session_spend_cap.set audit row, naming the previous and the new cap, commit
+// together. The repository route answers RepoSettings, the automation route
+// Automation.
+type UpdateSessionSpendCapRequest struct {
+	// The cap in USD, or null to clear it -- the only spelling of 'no cap'. Validated
+	// application-side (§37: a value that cannot function is refused when written), a
+	// 400 otherwise: above zero, since a cap of zero or less permits nothing; at most
+	// two decimal places; at most 99999999.99. The database's CHECK constraint backs
+	// the first rule.
+	CapUsd UpdateSessionSpendCapRequestCapUsd `json:"capUsd" yaml:"capUsd" mapstructure:"capUsd"`
+}
+
+// The cap in USD, or null to clear it -- the only spelling of 'no cap'. Validated
+// application-side (§37: a value that cannot function is refused when written), a
+// 400 otherwise: above zero, since a cap of zero or less permits nothing; at most
+// two decimal places; at most 99999999.99. The database's CHECK constraint backs
+// the first rule.
+type UpdateSessionSpendCapRequestCapUsd *float64
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *UpdateSessionSpendCapRequest) UnmarshalJSON(value []byte) error {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(value, &raw); err != nil {
+		return err
+	}
+	if _, ok := raw["capUsd"]; raw != nil && !ok {
+		return fmt.Errorf("field capUsd in UpdateSessionSpendCapRequest: required")
+	}
+	type Plain UpdateSessionSpendCapRequest
+	var plain Plain
+	if err := json.Unmarshal(value, &plain); err != nil {
+		return err
+	}
+	*j = UpdateSessionSpendCapRequest(plain)
 	return nil
 }
 

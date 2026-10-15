@@ -561,7 +561,11 @@ FOR UPDATE
 // so two invocations belonging to the SAME automation that close (fail)
 // concurrently apply their own automation.EvaluateFailureStrike
 // consequence one at a time, never as a lost update racing against each
-// other's own read-then-write of consecutive_failures.
+// other's own read-then-write of consecutive_failures. Also the first
+// statement of a session spend cap write (httpapi's
+// PutAutomationSessionSpendCap): the cap it reads is the
+// session_spend_cap.set audit row's previous value, and of two writes at
+// once the second waits and reads the first one's cap.
 func (q *Queries) LockAutomationForUpdate(ctx context.Context, id pgtype.UUID) (Automation, error) {
 	row := q.db.QueryRow(ctx, lockAutomationForUpdate, id)
 	var i Automation
@@ -868,6 +872,58 @@ func (q *Queries) UpdateAutomationLastRun(ctx context.Context, arg UpdateAutomat
 		arg.LastRunStatus,
 		arg.ArtifactSummary,
 	)
+	var i Automation
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Prompt,
+		&i.Repos,
+		&i.Status,
+		&i.ConsecutiveFailures,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.TriggerType,
+		&i.TriggerConfig,
+		&i.WebhookTokenHash,
+		&i.LastCronFiredAt,
+		&i.SandboxPathScope,
+		&i.SandboxMockConfigured,
+		&i.SandboxContractsPath,
+		&i.EnvVars,
+		&i.LastRunAt,
+		&i.LastRunStatus,
+		&i.ArtifactSummary,
+		&i.CreatorUnauthorizedSince,
+		&i.SessionSpendCapUsd,
+	)
+	return i, err
+}
+
+const updateAutomationSessionSpendCap = `-- name: UpdateAutomationSessionSpendCap :one
+UPDATE automations
+SET session_spend_cap_usd = $2,
+    updated_at = now()
+WHERE id = $1
+RETURNING id, name, prompt, repos, status, consecutive_failures, created_by, created_at, updated_at, trigger_type, trigger_config, webhook_token_hash, last_cron_fired_at, sandbox_path_scope, sandbox_mock_configured, sandbox_contracts_path, env_vars, last_run_at, last_run_status, artifact_summary, creator_unauthorized_since, session_spend_cap_usd
+`
+
+type UpdateAutomationSessionSpendCapParams struct {
+	ID                 pgtype.UUID    `json:"id"`
+	SessionSpendCapUsd pgtype.Numeric `json:"session_spend_cap_usd"`
+}
+
+// Technical plan §40.1's per-automation session spend cap
+// (automations.session_spend_cap_usd, migrations/000165): the cap of every
+// session the automation creates, ahead of its repositories' caps. Sets,
+// raises, lowers or clears it (NULL: no cap), touching no other column but
+// updated_at. Written only under LockAutomationForUpdate's lock, in the
+// same transaction as the session_spend_cap.set audit row. A cap of zero or
+// less, or no number at all, is refused before it reaches here
+// (sessionguard.ValidateSessionSpendCap, a 400) and by the column's CHECK
+// constraint behind it. pgx.ErrNoRows when the automation does not exist.
+func (q *Queries) UpdateAutomationSessionSpendCap(ctx context.Context, arg UpdateAutomationSessionSpendCapParams) (Automation, error) {
+	row := q.db.QueryRow(ctx, updateAutomationSessionSpendCap, arg.ID, arg.SessionSpendCapUsd)
 	var i Automation
 	err := row.Scan(
 		&i.ID,

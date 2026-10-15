@@ -1267,6 +1267,10 @@ export interface RepoSettings {
    * §26.4, §26.7: this repo's own deep-path per-review cost ceiling, in USD. Null means 'not configured -- the engine's own built-in default applies' (internal/domain/reviewtriage.DefaultCostBudget, $5.00). Gated by authz.ActionConfigureReviewCostBudget, same row as reviewCostBudgetLightUsd -- see that field's own description for how this ceiling is checked as of §26.5 (a real GET to this sandbox's own loopback review-cost-budget endpoint, answered from a real running spend total, not a self-estimate).
    */
   reviewCostBudgetDeepUsd: number | null;
+  /**
+   * §40.1: the session spend cap of every session that names this repository, in USD, at most two decimal places. A session whose recorded spend -- the sum of its dispatched turns' cost, a lower bound of the bill -- is at or past its cap takes no new turn, whoever asks; the turn already running is left to finish, so the spend can pass the cap by that one turn's cost. A session naming several repositories takes the strictest of their caps, and a session an automation created takes the automation's cap instead when the automation sets one (Automation.sessionSpendCapUsd). Null means no cap. Set, raised or cleared only through PUT /api/repos/{owner}/{repo}/session-spend-cap (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as session_spend_cap.set; a raise lets a refused session take its next turn.
+   */
+  sessionSpendCapUsd: number | null;
 }
 /**
  * Request body for PUT /api/repos/{owner}/{repo}/settings -- always the full, current desired state (never a partial patch), matching RepoSettings' own shape. sentinelAutofixEnabled (§8.2 is deliberately OPTIONAL, not required, exactly like every other additive field this schema has ever grown (e.g. CreateSessionRequest.buildModelId) -- an old caller that only ever knew about blockOnHighRisk keeps compiling/working unchanged; PutRepoSettings' own 'always the full desired state' semantics mean an old caller that omits this key simply (re)sets it to its own safe default (false) alongside whatever it DOES specify, never a partial-patch surprise. §21's own §21.2 fields (autoMergeEnabled/maxAutoApproveFilesChanged/sensitiveBlastRadiusTags) are DELIBERATELY NOT on this shared request: this endpoint's own handler requires EVERY permission its fields collectively need (PutRepoSettings' own doc comment, httpapi/reposettings.go), which would force a maintainer authorized only for the auto-approval-config row (§13.3 row 5) through this endpoint's admin-only gates (row 6) too -- see UpdateAutoApprovalSettingsRequest/UpdateAutoMergeToggleRequest below, each its own endpoint with its own single, correctly-scoped gate.
@@ -1353,6 +1357,18 @@ export interface UpdateReviewCostBudgetRequest {
    * Null means 'use the engine's own built-in default ($5.00)'. Validated application-side as strictly positive, the SAME 'zero collides with the unconfigured sentinel' reasoning as lightUsd above.
    */
   deepUsd: number | null;
+}
+/**
+ * Request body for PUT /api/repos/{owner}/{repo}/session-spend-cap and PUT /api/automations/{automationID}/session-spend-cap (§40.1): sets, raises, lowers or clears the session spend cap of a repository or of an automation. Admin only (authz.ActionSetSessionSpendCap, §13.3); each write and its session_spend_cap.set audit row, naming the previous and the new cap, commit together. The repository route answers RepoSettings, the automation route Automation.
+ *
+ * This interface was referenced by `RestDtos`'s JSON-Schema
+ * via the `definition` "UpdateSessionSpendCapRequest".
+ */
+export interface UpdateSessionSpendCapRequest {
+  /**
+   * The cap in USD, or null to clear it -- the only spelling of 'no cap'. Validated application-side (§37: a value that cannot function is refused when written), a 400 otherwise: above zero, since a cap of zero or less permits nothing; at most two decimal places; at most 99999999.99. The database's CHECK constraint backs the first rule.
+   */
+  capUsd: number | null;
 }
 /**
  * GET /api/repos/{owner}/{repo}/review-analytics response body (§21.1) -- the three analytics rollups named in that section's own scope, each bounded to platform.Timeouts.ReviewVerdictAnalyticsWindow (never an unbounded scan) and carrying its OWN independent 'not yet computed' sentinel: 'a repo with a real 0% dismiss rate and a repo with no data yet must never render identically' (§21.1). §26.4, §26.5 adds a fourth rollup, digestContestationRatePercent -- the 'digest precision (contestation rate)' KPI that section names, the SAME 'own independent not-yet-computed sentinel' discipline as the original three. Gated by the existing authz.ActionViewAnalytics (§13.3 row 1) -- every role including viewer.
@@ -1671,6 +1687,10 @@ export interface Automation {
    * W7 audit fix (confirmed MEDIUM finding: "the column added to end a silent failure is itself unread"): set the moment a machine-originated GitHub (check_run/status) dispatch is denied because this automation's own creator is not a linked, non-disabled account holding authz.ActionCreateSession (migrations/000138_automations_creator_unauthorized.up.sql); cleared back to null the moment a machine-originated GitHub dispatch for this same automation is authorized again. A machine-originated Linear dispatch never sets or clears this field: that actor is denied outright, upstream of any per-automation creator check (see docs/DECISIONS.md's D-07 entry). Preserves the FIRST denial's own timestamp across repeated denials. Null means never denied for this reason, or has since recovered. An automation can be 'active' in the status column above and still be structurally incapable of ever firing because of this -- the product's own state was a lie about that until this field existed on the wire.
    */
   creatorUnauthorizedSince: string | null;
+  /**
+   * §40.1: the session spend cap of every session this automation creates, in USD, at most two decimal places. When set it takes precedence over the caps of the session's repositories (RepoSettings.sessionSpendCapUsd), above or below them. A session whose recorded spend -- the sum of its dispatched turns' cost, a lower bound of the bill -- is at or past its cap takes no new turn, whoever asks; the turn already running is left to finish. Null means the automation sets no cap of its own. Set, raised or cleared only through PUT /api/automations/{automationID}/session-spend-cap (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as session_spend_cap.set -- never at creation, which a maintainer may do.
+   */
+  sessionSpendCapUsd: number | null;
   /**
    * §12.2 item 4's own health-column success ratio ("12/12 ok", "47/48 ok") -- an ALL-TIME count over automation_runs (postgres.AutomationRunStore.ListRunHealth), computed fresh on every read, never a persisted counter. Null when this automation has never had a terminal (succeeded/failed) run -- an honest "no runs yet", never a fabricated 0/0.
    */
@@ -3675,7 +3695,7 @@ export interface SessionActivity {
     since: string;
   } | null;
   /**
-   * The most recently created turn that reached a terminal state, leaving aside a turn that ended without ever running, for a reason of its own: a queued automatic review whose pull request moved before it started (technical plan §24.9), which is no run of the session's; null when none has.
+   * The most recently created turn that reached a terminal state, leaving aside a turn that ended without ever running, for a reason of its own -- a queued automatic review whose pull request moved before it started (technical plan §24.9), or a queued turn ended before its dispatch because the session guard refuses the session new turns, as it does once the session has spent its cap (technical plan §40.1) -- which is no run of the session's; null when none has.
    */
   lastRun: {
     turnId: string;
