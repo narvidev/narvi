@@ -2,6 +2,7 @@ package platform_test
 
 import (
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -3531,7 +3532,12 @@ func TestValidate_SandboxLifetime(t *testing.T) {
 		{name: "NotAboveBootFallback", mutate: func(to *platform.Timeouts) {
 			to.ReviewSandboxLifetime = 100 * time.Minute
 			to.BootEvidenceFallback = to.ReviewSandboxLifetime - to.FirstConnectBudget
-		}, want: []string{"SandboxLifetimeFor(review) > FirstConnectBudget + BootEvidenceFallback"}},
+		}, want: []string{
+			"SandboxLifetimeFor(review) > FirstConnectBudget + BootEvidenceFallback",
+			// Too short for the slowest boot is too short for it on top of
+			// the rotation threshold (TestValidate_RotationRunwayFloor).
+			"SandboxLifetimeFor(review) > RotationThreshold(review) + FirstConnectBudget + BootEvidenceFallback",
+		}},
 		{name: "FractionalSeconds", mutate: func(to *platform.Timeouts) {
 			to.ReviewSandboxLifetime = 100*time.Minute + 500*time.Millisecond
 		}, want: []string{"whole seconds: SandboxLifetimeFor(review)"}},
@@ -3541,6 +3547,7 @@ func TestValidate_SandboxLifetime(t *testing.T) {
 			"positive: SandboxLifetimeFor(default)",
 			"SandboxLifetimeFor(default) > SupervisorTurnCap",
 			"SandboxLifetimeFor(default) > FirstConnectBudget + BootEvidenceFallback",
+			"SandboxLifetimeFor(default) > RotationThreshold(default) + FirstConnectBudget + BootEvidenceFallback",
 		}},
 		{name: "negative", mutate: func(to *platform.Timeouts) {
 			to.ReviewSandboxLifetime = -time.Hour
@@ -3548,6 +3555,7 @@ func TestValidate_SandboxLifetime(t *testing.T) {
 			"positive: SandboxLifetimeFor(review)",
 			"SandboxLifetimeFor(review) > SupervisorTurnCap",
 			"SandboxLifetimeFor(review) > FirstConnectBudget + BootEvidenceFallback",
+			"SandboxLifetimeFor(review) > RotationThreshold(review) + FirstConnectBudget + BootEvidenceFallback",
 		}},
 	}
 	for _, tc := range tests {
@@ -3567,6 +3575,168 @@ func TestValidate_SandboxLifetime(t *testing.T) {
 	}
 }
 
+// assertViolations runs Validate on the defaults as mutate changes them and
+// fails unless it reports exactly want (timeoutViolations' strings).
+func assertViolations(t *testing.T, mutate func(*platform.Timeouts), want []string) {
+	t.Helper()
+	to := platform.DefaultTimeouts()
+	mutate(&to)
+	got := timeoutViolations(t, to.Validate())
+	wantSet := map[string]bool{}
+	for _, w := range want {
+		wantSet[w] = true
+	}
+	if !maps.Equal(got, wantSet) {
+		t.Errorf("Validate() violations = %v, want %v", slices.Sorted(maps.Keys(got)), want)
+	}
+}
+
+// TestValidate_RotationRunwayFloor covers every Validate link of the
+// runway gate's floor (technical plan §35.3): the shipped 13 minutes;
+// positive; above an open delivery and then the rotation's snapshot wait
+// by MinTimeoutMargin, and so is each kind's threshold, the floor or a
+// sixth of the kind's lifetime, whichever is less; and each kind's
+// lifetime above its threshold and the slowest boot allowed, so a
+// replacement starts above its own threshold. Each case reports exactly
+// the violations listed, so a link that is dropped or that fires on its
+// neighbour's value fails here.
+func TestValidate_RotationRunwayFloor(t *testing.T) {
+	t.Parallel()
+
+	if got := platform.DefaultTimeouts().RotationRunwayFloor; got != 13*time.Minute {
+		t.Fatalf("DefaultTimeouts().RotationRunwayFloor = %v, want 13m", got)
+	}
+	const floorLink = "RotationRunwayFloor > MCPStatusDeliveryWindow + RotationSnapshotWait"
+	thresholdLink := func(kind sandbox.LifetimeKind) string {
+		return "RotationThreshold(" + string(kind) + ") > MCPStatusDeliveryWindow + RotationSnapshotWait"
+	}
+	tests := []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		want   []string
+	}{
+		{name: "the defaults", mutate: func(*platform.Timeouts) {}},
+		{name: "Zero", mutate: func(to *platform.Timeouts) {
+			to.RotationRunwayFloor = 0
+		}, want: []string{
+			"positive: RotationRunwayFloor", floorLink,
+			thresholdLink(sandbox.LifetimeKindDefault), thresholdLink(sandbox.LifetimeKindReview),
+		}},
+		{name: "NotAboveDeliveryPlusSnapshotWait", mutate: func(to *platform.Timeouts) {
+			to.RotationRunwayFloor = to.MCPStatusDeliveryWindow + to.RotationSnapshotWait + platform.MinTimeoutMargin - time.Second
+		}, want: []string{floorLink, thresholdLink(sandbox.LifetimeKindDefault), thresholdLink(sandbox.LifetimeKindReview)}},
+		{name: "exactly the margin above the delivery and the wait", mutate: func(to *platform.Timeouts) {
+			to.RotationRunwayFloor = to.MCPStatusDeliveryWindow + to.RotationSnapshotWait + platform.MinTimeoutMargin
+		}},
+		{name: "a delivery window raised past the floor", mutate: func(to *platform.Timeouts) {
+			to.MCPStatusDeliveryWindow = to.RotationRunwayFloor
+		}, want: []string{floorLink, thresholdLink(sandbox.LifetimeKindDefault), thresholdLink(sandbox.LifetimeKindReview)}},
+		{name: "a floor above a sixth of the lifetime is capped there, and the cap is feasible", mutate: func(to *platform.Timeouts) {
+			to.RotationRunwayFloor = 25 * time.Minute
+		}},
+		// The floor clears the delivery and the wait, but a sixth of the
+		// review kind's shorter lifetime, its threshold, does not.
+		{name: "ThresholdPerKindInfeasible", mutate: func(to *platform.Timeouts) {
+			to.ReviewSandboxLifetime = 110 * time.Minute // a sixth: 18m20s
+			to.MCPStatusDeliveryWindow = 16 * time.Minute
+			to.RotationRunwayFloor = 19 * time.Minute
+		}, want: []string{thresholdLink(sandbox.LifetimeKindReview)}},
+		// The review kind's lifetime clears the slowest boot allowed, but not
+		// that boot on top of its threshold: its replacement would start
+		// below its own threshold and rotate at once.
+		{name: "RotationLoop", mutate: func(to *platform.Timeouts) {
+			to.ReviewSandboxLifetime = 100 * time.Minute
+			to.BootEvidenceFallback = 85 * time.Minute
+		}, want: []string{"SandboxLifetimeFor(review) > RotationThreshold(review) + FirstConnectBudget + BootEvidenceFallback"}},
+		{name: "RotationLoop, exactly the margin", mutate: func(to *platform.Timeouts) {
+			to.ReviewSandboxLifetime = 100 * time.Minute
+			to.BootEvidenceFallback = to.ReviewSandboxLifetime - to.RotationRunwayFloor - to.FirstConnectBudget - platform.MinTimeoutMargin
+		}},
+		// A floor above a sixth of the review lifetime: the loop link is
+		// measured from the capped threshold, 16m40s, never the 25m floor,
+		// which would refuse the first case of the pair.
+		{name: "RotationLoop, the capped threshold, exactly the margin", mutate: func(to *platform.Timeouts) {
+			to.RotationRunwayFloor = 25 * time.Minute
+			to.ReviewSandboxLifetime = 100 * time.Minute
+			to.BootEvidenceFallback = to.ReviewSandboxLifetime - to.ReviewSandboxLifetime/6 - to.FirstConnectBudget - platform.MinTimeoutMargin
+		}},
+		{name: "RotationLoop, the capped threshold, a second short", mutate: func(to *platform.Timeouts) {
+			to.RotationRunwayFloor = 25 * time.Minute
+			to.ReviewSandboxLifetime = 100 * time.Minute
+			to.BootEvidenceFallback = to.ReviewSandboxLifetime - to.ReviewSandboxLifetime/6 - to.FirstConnectBudget - platform.MinTimeoutMargin + time.Second
+		}, want: []string{"SandboxLifetimeFor(review) > RotationThreshold(review) + FirstConnectBudget + BootEvidenceFallback"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assertViolations(t, tc.mutate, tc.want)
+		})
+	}
+}
+
+// TestValidate_RotationSnapshotWait covers every Validate link of how long
+// a rotation waits for its snapshot (technical plan §35.3): the shipped 2
+// minutes; positive; above the snapshot command's write and the agent's
+// mint call by MinTimeoutMargin; and, through the floor's link, never so
+// long that the floor no longer covers it.
+func TestValidate_RotationSnapshotWait(t *testing.T) {
+	t.Parallel()
+
+	if got := platform.DefaultTimeouts().RotationSnapshotWait; got != 2*time.Minute {
+		t.Fatalf("DefaultTimeouts().RotationSnapshotWait = %v, want 2m", got)
+	}
+	const waitLink = "RotationSnapshotWait > SnapshotMintTimeout + SandboxCommandSendTimeout"
+	tests := []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		want   []string
+	}{
+		{name: "the defaults", mutate: func(*platform.Timeouts) {}},
+		{name: "Zero", mutate: func(to *platform.Timeouts) {
+			to.RotationSnapshotWait = 0
+		}, want: []string{"positive: RotationSnapshotWait", waitLink}},
+		{name: "NotAboveMintPlusSend", mutate: func(to *platform.Timeouts) {
+			to.RotationSnapshotWait = to.SnapshotMintTimeout + to.SandboxCommandSendTimeout + platform.MinTimeoutMargin - time.Second
+		}, want: []string{waitLink}},
+		{name: "exactly the margin above the mint and the send", mutate: func(to *platform.Timeouts) {
+			to.RotationSnapshotWait = to.SnapshotMintTimeout + to.SandboxCommandSendTimeout + platform.MinTimeoutMargin
+		}},
+		{name: "a mint timeout raised past the wait", mutate: func(to *platform.Timeouts) {
+			to.SnapshotMintTimeout = to.RotationSnapshotWait
+		}, want: []string{waitLink}},
+		{name: "raised past the floor's room", mutate: func(to *platform.Timeouts) {
+			to.RotationSnapshotWait = 3 * time.Minute
+		}, want: []string{
+			"RotationRunwayFloor > MCPStatusDeliveryWindow + RotationSnapshotWait",
+			"RotationThreshold(default) > MCPStatusDeliveryWindow + RotationSnapshotWait",
+			"RotationThreshold(review) > MCPStatusDeliveryWindow + RotationSnapshotWait",
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assertViolations(t, tc.mutate, tc.want)
+		})
+	}
+}
+
+// The two read-only rules on Timeouts fields, shared by the module scans
+// below and by TestReadOnlyScans_CatchKnownViolations, which runs each over
+// known violations so a rule widened until it allows them fails.
+var (
+	// lifetimeFields are read only in Timeouts.SandboxLifetimeFor.
+	lifetimeFields      = map[string]bool{"SandboxLifetime": true, "ReviewSandboxLifetime": true}
+	lifetimeReadAllowed = func(_ string, inPlatform bool, fn string) bool {
+		return inPlatform && fn == "Timeouts.SandboxLifetimeFor"
+	}
+	// rotationFields are read only in Timeouts.Validate and in the session
+	// actor's runway gate, internal/app/sessionactor/runway.go.
+	rotationFields      = map[string]bool{"RotationRunwayFloor": true, "RotationSnapshotWait": true}
+	rotationReadAllowed = func(rel string, inPlatform bool, fn string) bool {
+		return (inPlatform && fn == "Timeouts.Validate") || filepath.ToSlash(rel) == "internal/app/sessionactor/runway.go"
+	}
+)
+
 // TestSandboxLifetimeFieldsAreReadOnlyInPlatform is the source half of
 // "the per-session-type lifetime lives in one place" (technical plan
 // §35.2): SandboxLifetime and ReviewSandboxLifetime are read in one
@@ -3578,8 +3748,9 @@ func TestValidate_SandboxLifetime(t *testing.T) {
 //   - a selector naming either field anywhere but inside
 //     SandboxLifetimeFor in internal/platform -- outside the package, or a
 //     second reader inside it, such as another getter;
-//   - a string literal equal to either field's name, the way reflection
-//     reads a field by name (FieldByName);
+//   - a string literal equal to either field's name anywhere but inside
+//     SandboxLifetimeFor, the way reflection reads a field by name
+//     (FieldByName);
 //   - a file that imports reflect and names Timeouts, since reflection
 //     over the struct can read the fields without naming them.
 //
@@ -3590,7 +3761,114 @@ func TestValidate_SandboxLifetime(t *testing.T) {
 func TestSandboxLifetimeFieldsAreReadOnlyInPlatform(t *testing.T) {
 	t.Parallel()
 
-	fields := map[string]bool{"SandboxLifetime": true, "ReviewSandboxLifetime": true}
+	scanned, readWhereAllowed := scanTimeoutFieldReads(t, lifetimeFields, lifetimeReadAllowed,
+		"read a sandbox kind's lifetime through platform.Timeouts.SandboxLifetimeFor only (technical plan §35.2)")
+	// SandboxLifetimeFor reads both fields: a near-empty scan, or a getter
+	// that reads neither, means the scan is broken.
+	if scanned < 500 || !readWhereAllowed["SandboxLifetime"] || !readWhereAllowed["ReviewSandboxLifetime"] {
+		t.Fatalf("scanned %d files, and SandboxLifetimeFor reads %v: the scan is broken", scanned, readWhereAllowed)
+	}
+}
+
+// TestRotationFieldsAreReadOnlyInPlatform is the source half of "the floor
+// lives in platform/timeouts.go and nowhere else" (technical plan §35.3,
+// §11): RotationRunwayFloor and RotationSnapshotWait are read in two
+// places only, Timeouts.Validate, which checks them, and the session
+// actor's runway gate (internal/app/sessionactor/runway.go), which hands
+// them to sandbox.EvaluateRunway. Any other reader fails here: a copy of
+// the floor kept elsewhere, a gate wired elsewhere, and a platform method
+// that would hand either field to another package alike; so do a read by
+// name and reflection over Timeouts (scanTimeoutFieldReads). A further
+// reader is a deliberate change to rotationReadAllowed.
+// TestReadOnlyScans_CatchKnownViolations runs the rule over known
+// violations of each kind.
+func TestRotationFieldsAreReadOnlyInPlatform(t *testing.T) {
+	t.Parallel()
+
+	scanned, readWhereAllowed := scanTimeoutFieldReads(t, rotationFields, rotationReadAllowed,
+		"read the runway gate's floor and snapshot wait only in platform.Timeouts.Validate and the session actor's runway gate, internal/app/sessionactor/runway.go (technical plan §35.3)")
+	// Validate reads both fields: a near-empty scan, or a Validate that
+	// reads neither, means the scan is broken.
+	if scanned < 500 || !readWhereAllowed["RotationRunwayFloor"] || !readWhereAllowed["RotationSnapshotWait"] {
+		t.Fatalf("scanned %d files, and the allowed readers read %v: the scan is broken", scanned, readWhereAllowed)
+	}
+}
+
+// TestReadOnlyScans_CatchKnownViolations runs each read-only rule, through
+// the same per-file check the module scans use (fieldReadViolations), over
+// source parsed here: every known violation is reported, and every
+// sanctioned read is not. A module scan alone only proves the tree is
+// clean, which a rule allowing everything, or a check seeing nothing,
+// would prove too.
+func TestReadOnlyScans_CatchKnownViolations(t *testing.T) {
+	t.Parallel()
+
+	const (
+		platformFile = "internal/platform/fixture.go"
+		actorFile    = "internal/app/sessionactor/fixture.go"
+		gateFile     = "internal/app/sessionactor/runway.go"
+	)
+	type rule struct {
+		fields  map[string]bool
+		allowed func(rel string, inPlatform bool, fn string) bool
+	}
+	rotation := rule{rotationFields, rotationReadAllowed}
+	lifetime := rule{lifetimeFields, lifetimeReadAllowed}
+	tests := []struct {
+		name          string
+		rule          rule
+		rel, src      string
+		wantViolation bool
+	}{
+		{"rotation: a platform method handing the floor to another package", rotation, platformFile,
+			`package platform; func (t Timeouts) RunwayFloor() time.Duration { return t.RotationRunwayFloor }`, true},
+		{"rotation: another platform function reading the wait", rotation, platformFile,
+			`package platform; func wait(t Timeouts) time.Duration { return t.RotationSnapshotWait }`, true},
+		{"rotation: a platform package-level read", rotation, platformFile,
+			`package platform; var floor = DefaultTimeouts().RotationRunwayFloor`, true},
+		{"rotation: a gate wired in another session actor file", rotation, actorFile,
+			`package sessionactor; func (a *Actor) floor() time.Duration { return a.timeouts.RotationRunwayFloor }`, true},
+		{"rotation: the name as a string outside the readers", rotation, actorFile,
+			"package sessionactor; var name = `RotationSnapshotWait`", true},
+		{"rotation: reflection over Timeouts", rotation, "internal/app/fixture/fixture.go",
+			`package fixture; import "reflect"; var v = reflect.ValueOf(platform.Timeouts{})`, true},
+		{"rotation: Validate reads both, by selector and by name", rotation, platformFile,
+			`package platform; func (t Timeouts) Validate() error { _ = t.RotationRunwayFloor; _ = "RotationSnapshotWait"; return nil }`, false},
+		{"rotation: the runway gate reads both", rotation, gateFile,
+			`package sessionactor; func (a *Actor) gate() { _ = a.timeouts.RotationRunwayFloor; _ = a.timeouts.RotationSnapshotWait }`, false},
+		{"lifetime: a second getter in platform", lifetime, platformFile,
+			`package platform; func (t Timeouts) Review() time.Duration { return t.ReviewSandboxLifetime }`, true},
+		{"lifetime: the name as a string in platform outside the getter", lifetime, platformFile,
+			`package platform; var name = "SandboxLifetime"`, true},
+		{"lifetime: a reader in the runway gate", lifetime, gateFile,
+			`package sessionactor; func (a *Actor) gate() { _ = a.timeouts.SandboxLifetime }`, true},
+		{"lifetime: the getter reads both", lifetime, platformFile,
+			`package platform; func (t Timeouts) SandboxLifetimeFor(k string) time.Duration { return min(t.SandboxLifetime, t.ReviewSandboxLifetime) }`, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			file, err := parser.ParseFile(token.NewFileSet(), tc.rel, tc.src, parser.SkipObjectResolution)
+			if err != nil {
+				t.Fatalf("parse the fixture: %v", err)
+			}
+			inPlatform := filepath.Dir(tc.rel) == "internal/platform"
+			got := fieldReadViolations(file, tc.rel, inPlatform, tc.rule.fields, tc.rule.allowed, map[string]bool{})
+			if (len(got) > 0) != tc.wantViolation {
+				t.Errorf("violations = %q, want a violation: %v", got, tc.wantViolation)
+			}
+		})
+	}
+}
+
+// scanTimeoutFieldReads parses every non-test Go file of the module
+// (node_modules, testdata and .git aside) and reports, with rule, every
+// violation fieldReadViolations finds in it. It returns how many files it
+// parsed and which fields a selector read where allowed, for its caller's
+// check that the scan is not broken.
+func scanTimeoutFieldReads(t *testing.T, fields map[string]bool, allowed func(rel string, inPlatform bool, fn string) bool, rule string) (int, map[string]bool) {
+	t.Helper()
+
 	_, self, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("runtime.Caller failed")
@@ -3609,7 +3887,7 @@ func TestSandboxLifetimeFieldsAreReadOnlyInPlatform(t *testing.T) {
 	}
 
 	scanned := 0
-	readInTheGetter := map[string]bool{}
+	readWhereAllowed := map[string]bool{}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
@@ -3630,77 +3908,92 @@ func TestSandboxLifetimeFieldsAreReadOnlyInPlatform(t *testing.T) {
 		}
 		scanned++
 		rel, _ := filepath.Rel(root, path)
-		inPlatform := filepath.Dir(path) == platformDir
-
-		importsReflect := false
-		for _, imp := range file.Imports {
-			if imp.Path.Value == `"reflect"` {
-				importsReflect = true
-			}
-		}
-		namesTimeouts := false
-
-		// inspect walks n, declared in function fn ("" outside any).
-		inspect := func(n ast.Node, fn string) {
-			ast.Inspect(n, func(n ast.Node) bool {
-				switch n := n.(type) {
-				case *ast.SelectorExpr:
-					if n.Sel.Name == "Timeouts" {
-						namesTimeouts = true
-					}
-					if !fields[n.Sel.Name] {
-						return true
-					}
-					if inPlatform && fn == "Timeouts.SandboxLifetimeFor" {
-						readInTheGetter[n.Sel.Name] = true
-						return true
-					}
-					t.Errorf("%s names .%s in %q: read a sandbox kind's lifetime through platform.Timeouts.SandboxLifetimeFor only (technical plan §35.2)", rel, n.Sel.Name, fn)
-				case *ast.Ident:
-					if n.Name == "Timeouts" {
-						namesTimeouts = true
-					}
-				case *ast.BasicLit:
-					if n.Kind == token.STRING {
-						if v, err := strconv.Unquote(n.Value); err == nil && fields[v] {
-							t.Errorf("%s has the string %s: a field read by name, as reflection does, bypasses platform.Timeouts.SandboxLifetimeFor (technical plan §35.2)", rel, n.Value)
-						}
-					}
-				}
-				return true
-			})
-		}
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok {
-				inspect(decl, "")
-				continue
-			}
-			name := fn.Name.Name
-			if fn.Recv != nil && len(fn.Recv.List) == 1 {
-				recv := fn.Recv.List[0].Type
-				if star, ok := recv.(*ast.StarExpr); ok {
-					recv = star.X
-				}
-				if id, ok := recv.(*ast.Ident); ok {
-					name = id.Name + "." + name
-				}
-			}
-			inspect(fn, name)
-		}
-		if importsReflect && namesTimeouts {
-			t.Errorf("%s imports reflect and names Timeouts: reflection over the struct can read a sandbox kind's lifetime around platform.Timeouts.SandboxLifetimeFor (technical plan §35.2)", rel)
+		for _, v := range fieldReadViolations(file, rel, filepath.Dir(path) == platformDir, fields, allowed, readWhereAllowed) {
+			t.Errorf("%s: %s", v, rule)
 		}
 		return nil
 	})
 	if err != nil {
 		t.Fatalf("scan the module: %v", err)
 	}
-	// SandboxLifetimeFor reads both fields: a near-empty scan, or a getter
-	// that reads neither, means the scan is broken.
-	if scanned < 500 || !readInTheGetter["SandboxLifetime"] || !readInTheGetter["ReviewSandboxLifetime"] {
-		t.Fatalf("scanned %d files, and SandboxLifetimeFor reads %v: the scan is broken", scanned, readInTheGetter)
+	return scanned, readWhereAllowed
+}
+
+// fieldReadViolations reports, for one parsed file, each of:
+//
+//   - a selector naming one of fields where allowed(rel, inPlatform, fn)
+//     is false -- rel the file's path from the module root, inPlatform
+//     whether it is in internal/platform, fn the function it is declared
+//     in, "Recv.Name" for a method and "" outside any;
+//   - a string literal equal to a field's name where allowed is false,
+//     the way reflection reads a field by name (FieldByName) -- where a
+//     read is allowed, such a string is an error message naming the field;
+//   - the file importing reflect and naming Timeouts, since reflection
+//     over the struct can read the fields without naming them.
+//
+// It records in readWhereAllowed each field a selector read where allowed.
+func fieldReadViolations(file *ast.File, rel string, inPlatform bool, fields map[string]bool, allowed func(rel string, inPlatform bool, fn string) bool, readWhereAllowed map[string]bool) []string {
+	var violations []string
+	importsReflect := false
+	for _, imp := range file.Imports {
+		if imp.Path.Value == `"reflect"` {
+			importsReflect = true
+		}
 	}
+	namesTimeouts := false
+
+	// inspect walks n, declared in function fn ("" outside any).
+	inspect := func(n ast.Node, fn string) {
+		ast.Inspect(n, func(n ast.Node) bool {
+			switch n := n.(type) {
+			case *ast.SelectorExpr:
+				if n.Sel.Name == "Timeouts" {
+					namesTimeouts = true
+				}
+				if !fields[n.Sel.Name] {
+					return true
+				}
+				if allowed(rel, inPlatform, fn) {
+					readWhereAllowed[n.Sel.Name] = true
+					return true
+				}
+				violations = append(violations, fmt.Sprintf("%s names .%s in %q", rel, n.Sel.Name, fn))
+			case *ast.Ident:
+				if n.Name == "Timeouts" {
+					namesTimeouts = true
+				}
+			case *ast.BasicLit:
+				if n.Kind == token.STRING {
+					if v, err := strconv.Unquote(n.Value); err == nil && fields[v] && !allowed(rel, inPlatform, fn) {
+						violations = append(violations, fmt.Sprintf("%s has the string %s: a field read by name, as reflection does, bypasses the rule", rel, n.Value))
+					}
+				}
+			}
+			return true
+		})
+	}
+	for _, decl := range file.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			inspect(decl, "")
+			continue
+		}
+		name := fn.Name.Name
+		if fn.Recv != nil && len(fn.Recv.List) == 1 {
+			recv := fn.Recv.List[0].Type
+			if star, ok := recv.(*ast.StarExpr); ok {
+				recv = star.X
+			}
+			if id, ok := recv.(*ast.Ident); ok {
+				name = id.Name + "." + name
+			}
+		}
+		inspect(fn, name)
+	}
+	if importsReflect && namesTimeouts {
+		violations = append(violations, fmt.Sprintf("%s imports reflect and names Timeouts: reflection over the struct can read the fields around the rule", rel))
+	}
+	return violations
 }
 
 // TestValidate_SessionGuardNoticeHold pins how long the session guard holds

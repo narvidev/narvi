@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"strconv"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -304,6 +305,27 @@ func (s *EventStore) ListSubTaskFinishesForTurn(ctx context.Context, sessionID p
 		DispatchedEventID:     dispatchedEventID,
 		NextDispatchedEventID: nextDispatchedEventID,
 	})
+}
+
+// SandboxStatusAge reports how many whole seconds, on the database's
+// clock, the session's sandbox has been at gen and status, read from its
+// latest sandbox_status event (GetSandboxStatusAge's doc). ok is false when
+// that event reports another gen or status, or the session has none --
+// a status written before these events were recorded, say -- and then how
+// long is not known.
+func (s *EventStore) SandboxStatusAge(ctx context.Context, sessionID pgtype.UUID, gen int32, status sqlcgen.SandboxStatus) (seconds int64, ok bool, err error) {
+	row, err := s.q.GetSandboxStatusAge(ctx, sqlcgen.GetSandboxStatusAgeParams{
+		SessionID: sessionID,
+		Gen:       strconv.FormatInt(int64(gen), 10),
+		Status:    string(status),
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return row.AgeSeconds, row.ReportsIt, nil
 }
 
 // MaxEventIDForSession returns this session's own events-log high-water

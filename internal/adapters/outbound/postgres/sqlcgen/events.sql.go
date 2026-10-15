@@ -315,6 +315,46 @@ func (q *Queries) GetLatestTokenFrameForPart(ctx context.Context, arg GetLatestT
 	return i, err
 }
 
+const getSandboxStatusAge = `-- name: GetSandboxStatusAge :one
+SELECT ((payload->'sandbox'->>'gen') IS NOT DISTINCT FROM $1::text
+        AND (payload->'sandbox'->>'status') IS NOT DISTINCT FROM $2::text)::boolean AS reports_it,
+       FLOOR(EXTRACT(EPOCH FROM (now() - created_at)))::bigint AS age_seconds
+FROM events
+WHERE session_id = $3 AND type = 'sandbox_status'
+ORDER BY id DESC
+LIMIT 1
+`
+
+type GetSandboxStatusAgeParams struct {
+	Gen       string      `json:"gen"`
+	Status    string      `json:"status"`
+	SessionID pgtype.UUID `json:"session_id"`
+}
+
+type GetSandboxStatusAgeRow struct {
+	ReportsIt  bool  `json:"reports_it"`
+	AgeSeconds int64 `json:"age_seconds"`
+}
+
+// The session's latest sandbox_status event (sessionactor's
+// SandboxStatusEventType, appended in the transaction of every write that
+// changes the sandbox's status or gen): whether it reports the gen and
+// status the caller holds, and how many whole seconds ago it was stored,
+// on the database's clock -- so how long the sandbox has been in that
+// status. The session actor reads it when a turn is held behind a
+// snapshot, to log how long the sandbox has been snapshotting. The
+// payload is compared as text, never cast, so no payload can fail the
+// read and the transaction it runs in. events_session_id_id_idx serves it
+// from the newest event backwards, so it reads only the events stored
+// since the sandbox last changed status or gen. pgx.ErrNoRows when the
+// session has none.
+func (q *Queries) GetSandboxStatusAge(ctx context.Context, arg GetSandboxStatusAgeParams) (GetSandboxStatusAgeRow, error) {
+	row := q.db.QueryRow(ctx, getSandboxStatusAge, arg.Gen, arg.Status, arg.SessionID)
+	var i GetSandboxStatusAgeRow
+	err := row.Scan(&i.ReportsIt, &i.AgeSeconds)
+	return i, err
+}
+
 const listEventPageExtentForSession = `-- name: ListEventPageExtentForSession :many
 WITH RECURSIVE page (id, n, running) AS (
     (

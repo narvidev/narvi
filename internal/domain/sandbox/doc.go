@@ -21,10 +21,15 @@
 //   - The restore decision on a snapshot's recorded provenance
 //     (EvaluateSnapshotRestore, provenance.go; §35.5b): compatible,
 //     incompatible or unknown, against the restore floors.
+//   - The pre-dispatch runway gate (EvaluateRunway and RotationThreshold,
+//     runway.go; §35.3): pass, hold, rotate or retire a live sandbox
+//     against its lifetime deadline.
 //
 // Every function here is pure per §11: no I/O, no time.Now(), no
 // randomness. Anything needing "the current time" takes it as an explicit
-// `now time.Time` parameter — there is no Clock interface here; that
+// `now time.Time` parameter, or, like EvaluateRunway, takes durations the
+// caller already measured on the database's clock and no time at all —
+// there is no Clock interface here; that
 // abstraction (and this package's only caller, the session actor) lands in
 // internal/app/ports and internal/app/sessionactor at §2/§4.1.
 //
