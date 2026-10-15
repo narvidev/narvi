@@ -149,14 +149,23 @@ func EvaluateSpawnDecision(state SpawnState, cfg SpawnConfig, now time.Time, isS
 
 	// Snapshotting is a live sandbox mid-snapshot, and the machine has no
 	// spawn edge out of it: no force-respawn, unlike the boot states above
-	// (state.go). Its own snapshot report returns it to Ready, a watchdog
-	// to Suspect, and the runway gate's deadline row (EvaluateRunway)
-	// retires it once its deadline has passed; a spawn decision must not
-	// race them, so there is no staleness carve-out here either. Without
-	// this row, a pending turn evaluated during a post-turn snapshot fell
-	// through to Spawn once the cooldown had passed -- a decision the
-	// caller could only refuse as an error, every evaluation until the
-	// snapshot ended.
+	// (state.go). Without this row, a pending turn evaluated during a
+	// post-turn snapshot fell through to Spawn once the cooldown had passed
+	// -- a decision the caller could only refuse as an error, backing its
+	// dispatch timer off on every evaluation until the snapshot ended.
+	//
+	// What ends a snapshot is the session actor's, each followed by an
+	// evaluation: the agent's snapshot_ready (back to Ready), that event's
+	// decode-failure revert, the revert when the snapshot command cannot be
+	// sent, and a person's stop retiring the gen. No watchdog leaves
+	// Snapshotting, so there is no staleness carve-out to race. The
+	// residual: a snapshot that never reports -- the agent's mint failed,
+	// which it reports with no frame, or the agent died mid-mint -- holds
+	// the queued turn with nothing left to look again. That was already so
+	// before this row, the turn backing off instead of dispatching; the
+	// caller now logs each such Skip with how long the sandbox has been
+	// snapshotting. Nothing bounds it yet: EvaluateRunway decides one
+	// (its deadline row retires a snapshotting gen), but nothing calls it.
 	if state.Status == StateSnapshotting {
 		return SpawnAction{Kind: SpawnActionSkip, Reason: "snapshot in progress"}
 	}

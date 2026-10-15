@@ -69,8 +69,9 @@ type RunwayFacts struct {
 	// with its provenance, at or after the rotation started.
 	RotationSnapshotTaken bool
 	// DeliveryOpen is true while a completed turn's push and pull request
-	// are still being delivered, and DeliveryRemaining is how long until
-	// the delivery's bound from its start.
+	// are still being delivered, within the delivery's bound from its
+	// start, and DeliveryRemaining is how long until that bound. A push
+	// that outlasts the bound is no longer open here (see EvaluateRunway).
 	DeliveryOpen      bool
 	DeliveryRemaining time.Duration
 }
@@ -164,6 +165,15 @@ type RunwayDecision struct {
 // itself exists because the agent runs push and snapshot one after the
 // other on its read loop, so a rotation's snapshot sent during a push
 // would wait behind it and outrun the snapshot wait.
+//
+// Two holds end later than the work they wait on, each by design. The
+// delivery hold ends with the delivery's bound, not with the push: a
+// session whose repositories push past that bound still delays the
+// rotation's snapshot behind them, and when the snapshot then misses the
+// wait, row 4 retires the gen and the rotation falls back to the previous
+// snapshot (platform.Timeouts.RotationRunwayFloor's doc). And row 7 holds
+// a snapshot that is not a rotation's until the deadline, since the facts
+// carry no start for it: one that never reports is released only by row 2.
 func EvaluateRunway(f RunwayFacts, cfg RunwayConfig) RunwayDecision {
 	threshold := RotationThreshold(cfg.Floor, f.Lifetime)
 	decide := func(action RunwayAction, reason RunwayReason, nextLook time.Duration) RunwayDecision {

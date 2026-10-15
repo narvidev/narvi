@@ -98,14 +98,34 @@ type Timeouts struct {
 	// its lifetime deadline left (sandbox.RotationThreshold); below it the
 	// sandbox is rotated first. Not given a value in the plan; derived from
 	// this file alone: the least runway at which a rotation started at the
-	// threshold still has its snapshot taken before the deadline, in the
-	// worst case Narvi's own bounds allow -- it first waits out a completed
-	// turn's delivery (MCPStatusDeliveryWindow: the agent runs push and
-	// snapshot one after the other, so the gate holds a rotation behind an
-	// open delivery), then its snapshot (RotationSnapshotWait), plus
-	// MinTimeoutMargin: 12m30s, rounded up to the next whole minute, 13
-	// minutes. At the shipped 2h lifetimes lifetime/6 is 20 minutes, so the
-	// floor binds, and raising it brings the rotation forward up to 20.
+	// threshold still has its snapshot taken before the deadline when the
+	// agent's delivery ends within its window. The agent runs push and
+	// snapshot one after the other on one read loop, so the gate holds a
+	// rotation behind a completed turn's open delivery, for at most
+	// MCPStatusDeliveryWindow from its start, then waits
+	// RotationSnapshotWait for the snapshot; plus MinTimeoutMargin, 12m30s,
+	// rounded up to the next whole minute: 13 minutes. At the shipped 2h
+	// lifetimes lifetime/6 is 20 minutes, so the floor binds, and raising
+	// it brings the rotation forward up to 20.
+	//
+	// What that covers, and what it does not. Validate holds the post-turn
+	// mint and one repository's whole push chain inside
+	// MCPStatusDeliveryWindow, so a delivery of one repository, or of
+	// several that push in time, ends before the hold does. A session's
+	// repositories push one after another, with no bound on how many, so
+	// several slow ones can still be pushing when the window ends (that
+	// field's doc says as much), and no fixed floor covers every count: a
+	// larger one would be false one repository later, and would rotate
+	// every session earlier. The gate then starts the rotation behind the
+	// push; its snapshot can miss RotationSnapshotWait, and the rotation
+	// falls back to the previous snapshot, as any rotation whose snapshot
+	// is not reported does (sandbox.EvaluateRunway's rows 3 and 4) --
+	// normally the post-turn one, taken before the push, which a push does
+	// not change. That residual is bounded by the wait and ends before the
+	// deadline, since the floor outlasts the window and the wait; it costs
+	// a fallback, not a turn. A push still running when the gen is then
+	// retired ends with it, leaving the repositories it had not reached
+	// unpushed for that turn.
 	//
 	// It is not §5.4's turn chain: the gate promises a turn at least the
 	// threshold, never its whole TurnDeadline, and a turn that outlives its
@@ -117,7 +137,8 @@ type Timeouts struct {
 	// FirstConnectBudget plus BootEvidenceFallback by MinTimeoutMargin, so
 	// a replacement that boots as slowly as allowed still starts above its
 	// own threshold and a rotation never leads straight into another. Read
-	// only here and by the session actor's runway gate.
+	// only by Validate and the session actor's runway gate
+	// (TestRotationFieldsAreReadOnlyInPlatform).
 	RotationRunwayFloor time.Duration
 
 	// RotationSnapshotWait is how long a rotation waits for its snapshot to
@@ -130,8 +151,9 @@ type Timeouts struct {
 	// snapshot command -- the command's write (SandboxCommandSendTimeout)
 	// and the agent's mint call (SnapshotMintTimeout), plus
 	// MinTimeoutMargin: 100s, rounded up to the next whole minute, 2
-	// minutes. Validate keeps it positive and above that sum. Read only
-	// here and by the session actor's runway gate.
+	// minutes. Validate keeps it positive and above that sum. Read only by
+	// Validate and the session actor's runway gate
+	// (TestRotationFieldsAreReadOnlyInPlatform).
 	RotationSnapshotWait time.Duration
 
 	// SupervisorTurnCap's CURRENT role is an invariant-chain bound ensuring

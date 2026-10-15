@@ -482,6 +482,27 @@ WHERE session_id = $1
   AND (sqlc.narg('next_dispatched_event_id')::bigint IS NULL OR id <= sqlc.narg('next_dispatched_event_id')::bigint)
 ORDER BY id ASC;
 
+-- name: GetSandboxStatusAge :one
+-- The session's latest sandbox_status event (sessionactor's
+-- SandboxStatusEventType, appended in the transaction of every write that
+-- changes the sandbox's status or gen): whether it reports the gen and
+-- status the caller holds, and how many whole seconds ago it was stored,
+-- on the database's clock -- so how long the sandbox has been in that
+-- status. The session actor reads it when a turn is held behind a
+-- snapshot, to log how long the sandbox has been snapshotting. The
+-- payload is compared as text, never cast, so no payload can fail the
+-- read and the transaction it runs in. events_session_id_id_idx serves it
+-- from the newest event backwards, so it reads only the events stored
+-- since the sandbox last changed status or gen. pgx.ErrNoRows when the
+-- session has none.
+SELECT ((payload->'sandbox'->>'gen') IS NOT DISTINCT FROM sqlc.arg(gen)::text
+        AND (payload->'sandbox'->>'status') IS NOT DISTINCT FROM sqlc.arg(status)::text)::boolean AS reports_it,
+       FLOOR(EXTRACT(EPOCH FROM (now() - created_at)))::bigint AS age_seconds
+FROM events
+WHERE session_id = sqlc.arg(session_id) AND type = 'sandbox_status'
+ORDER BY id DESC
+LIMIT 1;
+
 -- name: MaxEventIDForSession :one
 -- The events-log high-water mark for one session, stamped into
 -- turns.dispatched_event_id at dispatch (tryPlanDispatch/tryPlanReenqueue,

@@ -197,6 +197,9 @@ func TestEvaluateRunway(t *testing.T) {
 		// Row 11: suspect, declined: no suspect -> snapshotting edge.
 		{name: "row 11: suspect below the threshold", facts: func(f *sandbox.RunwayFacts) { f.Status, f.Runway = sandbox.StateSuspect, 5*time.Minute },
 			wantAction: sandbox.RunwayPass, wantReason: sandbox.RunwayReasonSuspect},
+		{name: "row 11 precedes row 12: suspect, below the threshold, no snapshot capability", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.Runway, f.CanSnapshot = sandbox.StateSuspect, 5*time.Minute, false
+		}, wantAction: sandbox.RunwayPass, wantReason: sandbox.RunwayReasonSuspect},
 
 		// Row 12: no snapshot capability, declined.
 		{name: "row 12: below the threshold", facts: func(f *sandbox.RunwayFacts) { f.Runway, f.CanSnapshot = 5*time.Minute, false },
@@ -440,5 +443,58 @@ func TestEvaluateRunway_RaisingTheFloorBringsTheRotationForward(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestEvaluateRunway_APushPastItsBoundFallsBackBeforeTheDeadline pins the
+// residual platform.Timeouts.RotationRunwayFloor's doc states. The
+// delivery hold ends with the delivery's bound, not with the push, so a
+// push that outlasts the bound (several slow repositories) delays the
+// rotation's snapshot until it misses the wait. Following each decision's
+// NextLook from the first evaluation below the threshold, with any part of
+// the bound still ahead, the gen is retired as
+// rotation_snapshot_not_reported -- the fallback to the previous snapshot
+// -- with runway left, never by the deadline, within the bound and the
+// wait. Values are the shipped ones: floor 13m, wait 2m, bound 10m.
+func TestEvaluateRunway_APushPastItsBoundFallsBackBeforeTheDeadline(t *testing.T) {
+	t.Parallel()
+
+	const deliveryBound = 10 * time.Minute
+	for _, deliveryLeft := range []time.Duration{0, time.Minute, 5 * time.Minute, deliveryBound} {
+		t.Run(fmt.Sprintf("%v of the bound left", deliveryLeft), func(t *testing.T) {
+			t.Parallel()
+			facts := healthyRunway()
+			facts.Runway = runwayConfig.Floor - 1 // the first evaluation below the threshold
+			var elapsed, rotationStart time.Duration
+			for range 10 {
+				facts.DeliveryOpen = deliveryLeft > elapsed
+				facts.DeliveryRemaining = deliveryLeft - elapsed
+				if facts.Rotating {
+					facts.SinceRotationStart = elapsed - rotationStart
+				}
+				d := sandbox.EvaluateRunway(facts, runwayConfig)
+				switch d.Action {
+				case sandbox.RunwayRetire:
+					if d.Reason != sandbox.RunwayReasonRotationSnapshotNotReported || facts.Runway <= 0 {
+						t.Fatalf("after %v: %+v with %v of runway, want the rotation's fallback with runway left", elapsed, d, facts.Runway)
+					}
+					if elapsed > deliveryLeft+runwayConfig.SnapshotWait {
+						t.Fatalf("fell back after %v, want within the bound left and the wait (%v)", elapsed, deliveryLeft+runwayConfig.SnapshotWait)
+					}
+					return
+				case sandbox.RunwayRotate:
+					facts.Status, facts.Rotating, rotationStart = sandbox.StateSnapshotting, true, elapsed
+				case sandbox.RunwayHold:
+				default:
+					t.Fatalf("after %v: %+v, want hold, rotate or retire", elapsed, d)
+				}
+				if d.NextLook <= 0 {
+					t.Fatalf("after %v: %+v names no next look: nothing would end the hold", elapsed, d)
+				}
+				elapsed += d.NextLook
+				facts.Runway -= d.NextLook
+			}
+			t.Fatal("no retirement after 10 evaluations")
+		})
 	}
 }
