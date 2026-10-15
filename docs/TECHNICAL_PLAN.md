@@ -7438,13 +7438,18 @@ a failed one.
 `PUT /api/repos/{owner}/{repo}/session-spend-cap` or `PUT /api/automations/{automationID}/session-spend-cap`
 (`{"capUsd": <dollars or null>}`), admin only (`set_session_spend_cap`, §13.3). Each write locks the
 row, reads the cap it replaces, writes the new one and records `session_spend_cap.set` with both values,
-all in one transaction, so a cap never changes without its audit row. The guard reads the cap afresh on
-every turn it decides, and every refused turn was either never inserted or ended at dispatch, so nothing
-waits to be woken: the next turn created is admitted and dispatched, a plan still awaiting approval can
-be approved, an escalated workflow run is answered by the next turn a person sends, and the automatic
-re-review resumes at the next push. The automation's cap is not set at creation, which a maintainer may
-do: it takes precedence over its repositories', so a role that could set it could lift a cap an
-administrator set on a repository.
+all in one transaction, so a cap never changes without its audit row. A write re-admits a refused
+session only when it changes the cap the session is held to and the cap that then applies is above what
+the session has spent. Clearing an automation's cap leaves its sessions to the strictest of their
+repositories' caps, and raising one repository's cap changes nothing while the automation's cap or a
+stricter repository's still applies; the refusal names the cap in effect and where it was set. When a
+write does re-admit, it is at once. The guard reads the caps afresh on every turn it decides, and every
+refused turn was either never inserted or ended at dispatch, so nothing waits to be woken: the next turn
+created is admitted and dispatched, a plan still awaiting approval can be approved, an escalated
+workflow run is answered by the next turn a person sends, and the automatic re-review resumes at the
+next push. The automation's cap is not set at creation, which a maintainer may do: it takes precedence
+over its repositories', so a role that could set it could lift a cap an administrator set on a
+repository.
 
 **One warning and one telling per crossing.** A crossing is the session refused after it was last
 admitted a turn, under one cap. Every refusal records a persisted `warning` event at a message id
@@ -7480,8 +7485,10 @@ neither. The asymmetry with §24.6 is intended and is the reason the two are sep
 **A cap of zero is refused at write time.** §37's rule: a value that cannot function is rejected when
 written. A cap of zero or less permits nothing — the same shape as `loopguard.Config.MaxAttempts <= 0`,
 which §25.5 calls a misconfiguration — so the write is refused, and NULL remains the only spelling of
-"no cap". Both routes call one validator, `sessionguard.ValidateSessionSpendCap`, and answer 400 for a
-cap at or below zero, with more than two decimal places (which `NUMERIC(10,2)` would round) or above
+"no cap". Both routes read the cap from the number exactly as the request writes it
+(`sessionguard.ParseSessionSpendCap`, which ends with the one validator,
+`sessionguard.ValidateSessionSpendCap`) and answer 400 for a cap at or below zero, written with more than
+two decimal places (which `NUMERIC(10,2)` would round, and a float64 can round before it) or above
 99999999.99; the columns' CHECK constraints back it.
 
 **What the cap cannot do, stated rather than implied.** It refuses the *next* turn. It lets the one
