@@ -273,6 +273,31 @@ func (s *SandboxStore) ClearStopRetireGen(ctx context.Context, sessionID pgtype.
 	return s.q.ClearSandboxStopRetireGen(ctx, sessionID)
 }
 
+// Runway returns every fact the runway gate decides on (technical plan
+// §35.3), measured on the database's clock -- see GetSandboxRunway's own
+// generated doc comment. Returns pgx.ErrNoRows (unwrapped) when the
+// session has no sandbox.
+func (s *SandboxStore) Runway(ctx context.Context, sessionID pgtype.UUID) (sqlcgen.GetSandboxRunwayRow, error) {
+	return s.q.GetSandboxRunway(ctx, sessionID)
+}
+
+// StartRotation records a rotation of gen, its start and its snapshot
+// command's messageID as the pending snapshot (technical plan §35.3), and
+// reports whether the row was still at gen -- see StartSandboxRotation's
+// own generated doc comment.
+func (s *SandboxStore) StartRotation(ctx context.Context, sessionID pgtype.UUID, gen int32, messageID string) (bool, error) {
+	n, err := s.q.StartSandboxRotation(ctx, sqlcgen.StartSandboxRotationParams{SessionID: sessionID, Gen: gen, MessageID: messageID})
+	return n > 0, err
+}
+
+// StampSnapshotStart gives a snapshot of gen in progress with no start
+// recorded the database's now() as its start, and reports whether it did
+// -- see StampSandboxSnapshotStart's own generated doc comment.
+func (s *SandboxStore) StampSnapshotStart(ctx context.Context, sessionID pgtype.UUID, gen int32) (bool, error) {
+	n, err := s.q.StampSandboxSnapshotStart(ctx, sqlcgen.StampSandboxSnapshotStartParams{SessionID: sessionID, Gen: gen})
+	return n > 0, err
+}
+
 // ListLiveWithSessionRepos returns every live sandbox alongside its
 // owning session's own raw repos JSONB -- the repo-demotion sweep's
 // (internal/app/seed) own input; see ListLiveSandboxesWithSessionRepos's

@@ -926,6 +926,16 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// (previewpr.go's own top comment; previewurl.go).
 		if cmd.Type == "push_complete" && eventInserted {
 			a.createPRBestEffort(ctx, cmd.Raw)
+			// Technical plan §35.3: the evaluation above ran before the
+			// delivery this push_complete ends was recorded over -- that
+			// happens once its pull request is created, just now -- so a
+			// turn the runway gate held behind the delivery is evaluated
+			// again at once, rather than at the hold's bound.
+			if a.heldBehindDelivery {
+				if dispatchErr := a.handleEnsureDispatched(ctx); dispatchErr != nil {
+					a.logger.Warn("sessionactor: ensure-dispatched after a delivery's end failed", "error", dispatchErr)
+				}
+			}
 		}
 
 		// §3.4 ("gitstate in-sandbox"): reply to a just-committed

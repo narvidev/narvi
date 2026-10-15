@@ -2385,6 +2385,9 @@ type Sandbox struct {
 	SnapshotAgentProtocol         *string              `json:"snapshot_agent_protocol"`
 	SnapshotRuntimeVersion        *string              `json:"snapshot_runtime_version"`
 	SnapshotMintedAt              pgtype.Timestamptz   `json:"snapshot_minted_at"`
+	RotationGen                   *int32               `json:"rotation_gen"`
+	RotationStartedAt             pgtype.Timestamptz   `json:"rotation_started_at"`
+	SnapshotStartedAt             pgtype.Timestamptz   `json:"snapshot_started_at"`
 }
 
 type SandboxHistory struct {

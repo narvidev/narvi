@@ -1,0 +1,78 @@
+-- Technical plan §35.3: a sandbox under its runway floor is rotated before
+-- a turn is dispatched to it -- snapshot, stopped, shutdown, restore, over
+-- the machine's existing edges -- and a snapshot that never reports is
+-- given up rather than holding the turn. Neither is a state of its own:
+-- each is data on the sandbox row that every dispatch evaluation reads
+-- (internal/domain/sandbox.EvaluateRunway, on the database's clock).
+--
+-- sandboxes.rotation_gen: the gen the runway gate started a rotation of.
+-- It counts only while it equals gen: the claim that replaces the gen
+-- (UpsertSandboxForSpawn) clears it, and a value left on an older gen
+-- reads "not rotating" whatever it holds.
+--
+-- sandboxes.rotation_started_at: the database's now() when that rotation
+-- started. The rotation waits RotationSnapshotWait from it for its
+-- snapshot, and whether its snapshot was taken is derived from
+-- snapshot_minted_at (000170): recorded, with its provenance, at or after
+-- this instant. So no third rotation column is needed, and the restore that
+-- follows writes the fallback warning when the snapshot it restores
+-- predates the rotation.
+--
+-- sandboxes.snapshot_started_at: the database's now() when the snapshot in
+-- progress started, a rotation's or the post-turn one. Written with
+-- pending_snapshot_message_id, in the statement that sets it, and cleared
+-- with it, so it describes the outstanding snapshot command and nothing
+-- else. A pending turn waits SnapshotReportWait from it; a snapshot that
+-- has not reported by then is given up -- the sandbox back to ready when
+-- its agent is still heard from, the gen retired when it is not. A
+-- snapshot found with no start -- one in progress when this runs, or one
+-- the previous binary started -- is given one by the first evaluation that
+-- reads it, so it waits from then.
+--
+-- No backfill, no index: every read is by session_id, the row's unique key,
+-- and NULL reads "not rotating" and "no start recorded yet".
+--
+-- # Locks
+--
+-- Each ADD COLUMN is nullable with no default, so it is a catalog change
+-- that rewrites nothing. Each takes ACCESS EXCLUSIVE on sandboxes, for the
+-- file's one implicit transaction, for an instant once granted; the file
+-- touches sandboxes alone.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with these columns present:
+--   - Every statement it sends names its columns (sqlc writes each
+--     SELECT * and RETURNING * out as a column list), so it neither reads
+--     nor writes them.
+--   - It never starts a rotation. Its UpsertSandboxForSpawn leaves the
+--     three columns as they were, and the gen it bumps makes a rotation
+--     column left on the gen before read "not rotating".
+--   - A rotation this binary started that the previous binary then meets
+--     reads snapshotting to it, which holds its pending turn as it holds
+--     any snapshot. Once the rotation's snapshot is reported it may
+--     dispatch into that gen; this binary's next evaluation of an idle
+--     moment retires it (the rotation rows need no turn in flight to act).
+--   - A snapshot it starts carries no start, or the start of an earlier
+--     snapshot when the previous binary also recorded that one's report;
+--     the first is given one at this binary's first look, the second is
+--     given up early, which costs that snapshot and never the turn.
+-- migration000171_integration_test.go runs the previous binary's own
+-- statements against the columns.
+--
+-- # Rolling back
+--
+-- Every control-plane boot runs the embedded migrations up
+-- (controlplane/migrate.go), and golang-migrate refuses a database whose
+-- version it has no file for, so the previous binary cannot boot on this
+-- version ("no migration found for version 171"). With the control plane
+-- scaled to zero, either:
+--   - keep the columns: `migrate force 170`, after which the previous
+--     binary boots and works with them present as above, and this file
+--     runs again, keeping their values, when this release is deployed
+--     again; or
+--   - drop them: run this migration's down (goto 170) with this release's
+--     migrations. The down file says what it removes.
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS rotation_gen INTEGER;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS rotation_started_at TIMESTAMPTZ;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_started_at TIMESTAMPTZ;

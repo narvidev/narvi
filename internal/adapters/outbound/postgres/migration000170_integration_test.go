@@ -31,9 +31,9 @@ import (
 // unknown", never the provenance of the snapshot before it; it cannot boot
 // on this version; and it can once the recorded version is forced back
 // with the columns kept, after which this release's migration runs again
-// and keeps their values. This release's own statement is read from the
-// sqlc output (generatedQuery), so it cannot drift from what the store
-// sends.
+// and keeps their values. This release's own statement is copied as that
+// release sent it (provenanceReleaseUpdateSnapshot): a later release's
+// statement names columns this version does not have.
 
 // snapshotProvenanceMigration is the migration's version.
 const snapshotProvenanceMigration = 170
@@ -52,6 +52,23 @@ RETURNING ` + preProvenanceSandboxColumns
 SET snapshot_id = NULL, snapshot_suppressed_in_shadow = false, updated_at = now()
 WHERE session_id = $1 AND snapshot_id IS NOT NULL`
 )
+
+// provenanceReleaseUpdateSnapshot is UpdateSandboxSnapshotID as the
+// release that added this migration sent it, frozen here: a later release
+// changes the statement (migration 000171 clears snapshot_started_at in it,
+// and every RETURNING * names the columns of its own version), and this
+// test runs at this migration's version.
+const provenanceReleaseUpdateSnapshot = `UPDATE sandboxes
+SET snapshot_id = $1,
+    snapshot_suppressed_in_shadow = $2,
+    pending_snapshot_message_id = NULL,
+    snapshot_provenance_id = $1,
+    snapshot_agent_protocol = $3,
+    snapshot_runtime_version = $4,
+    snapshot_minted_at = now(),
+    updated_at = now()
+WHERE session_id = $5
+RETURNING ` + preProvenanceSandboxColumns + `, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at`
 
 // provenanceColumns is the part of a sandbox row the migration is about,
 // read by name, with the snapshot id it is keyed to.
@@ -162,7 +179,7 @@ func TestMigrationSnapshotRuntimeProvenance_UpAndDown(t *testing.T) {
 	}
 
 	// This release records a snapshot with what its agent reported.
-	updateSnapshot := generatedQuery(t, "sandboxes.sql.go", "updateSandboxSnapshotID")
+	updateSnapshot := provenanceReleaseUpdateSnapshot
 	if _, err := db.ExecContext(ctx, updateSnapshot, "snap-1", false, "1.24.0", "1.14.19", sessionID); err != nil {
 		t.Fatalf("this release's UpdateSandboxSnapshotID: %v", err)
 	}

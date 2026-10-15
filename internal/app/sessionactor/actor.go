@@ -237,6 +237,14 @@ type Actor struct {
 	sandboxCommitted *sandboxStatusKey
 	sandboxWritten   *sandboxStatusKey
 
+	// heldBehindDelivery is whether the last dispatch evaluation that
+	// committed held its turn behind a completed turn's open delivery
+	// (technical plan §35.3, runway.go's delivery_open hold): the
+	// push_complete that ends that delivery evaluates again once the pull
+	// request is created, the instant the delivery is recorded over
+	// (handleSandboxEvent). Single-goroutine, like pendingBroadcast.
+	heldBehindDelivery bool
+
 	// turnEnded is whether the CURRENT transact attempt wrote a terminal
 	// turn status through turnWrites (turnstatus.go): transact then wakes
 	// the re-review debounce in the same transaction, before it commits
