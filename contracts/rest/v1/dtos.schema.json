@@ -2152,7 +2152,7 @@
             "number",
             "null"
           ],
-          "description": "§40.1: the session spend cap of every session that names this repository, in USD, at most two decimal places. A session whose recorded spend -- the sum of its dispatched turns' cost, a lower bound of the bill -- is at or past its cap takes no new turn, whoever asks; the turn already running is left to finish, so the spend can pass the cap by that one turn's cost. A session naming several repositories takes the strictest of their caps, and a session an automation created takes the automation's cap instead when the automation sets one (Automation.sessionSpendCapUsd). Null means no cap. Set, raised or cleared only through PUT /api/repos/{owner}/{repo}/session-spend-cap (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as session_spend_cap.set; a raise lets a refused session take its next turn."
+          "description": "§40.1: the session spend cap of every session that names this repository, in USD, at most two decimal places. A session whose recorded spend -- the sum of its dispatched turns' cost, a lower bound of the bill -- is at or past its cap takes no new turn, whoever asks; the turn already running is left to finish, so the spend can pass the cap by that one turn's cost. A session naming several repositories takes the strictest of their caps, and a session an automation created takes the automation's cap instead when the automation sets one (Automation.sessionSpendCapUsd). Null means no cap. Set, raised or cleared only through PUT /api/repos/{owner}/{repo}/session-spend-cap (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as session_spend_cap.set. A change re-admits a session the cap refused only when this is the cap the session is held to -- no automation cap applies to it and no other repository of it sets a stricter one -- and the cap that then applies is above what the session has spent."
         }
       }
     },
@@ -2316,7 +2316,7 @@
             "number",
             "null"
           ],
-          "description": "The cap in USD, or null to clear it -- the only spelling of 'no cap'. Validated application-side (§37: a value that cannot function is refused when written), a 400 otherwise: above zero, since a cap of zero or less permits nothing; at most two decimal places; at most 99999999.99. The database's CHECK constraint backs the first rule."
+          "description": "The cap in USD, or null to clear it -- the only spelling of 'no cap'. Validated application-side (§37: a value that cannot function is refused when written), a 400 otherwise: above zero, since a cap of zero or less permits nothing; at most two decimal places, counted on the number as written, so a literal whose further digits a float would round away is refused too; at most 99999999.99. The database's CHECK constraint backs the first rule."
         }
       }
     },
@@ -2897,7 +2897,7 @@
             "number",
             "null"
           ],
-          "description": "§40.1: the session spend cap of every session this automation creates, in USD, at most two decimal places. When set it takes precedence over the caps of the session's repositories (RepoSettings.sessionSpendCapUsd), above or below them. A session whose recorded spend -- the sum of its dispatched turns' cost, a lower bound of the bill -- is at or past its cap takes no new turn, whoever asks; the turn already running is left to finish. Null means the automation sets no cap of its own. Set, raised or cleared only through PUT /api/automations/{automationID}/session-spend-cap (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as session_spend_cap.set -- never at creation, which a maintainer may do."
+          "description": "§40.1: the session spend cap of every session this automation creates, in USD, at most two decimal places. When set it takes precedence over the caps of the session's repositories (RepoSettings.sessionSpendCapUsd), above or below them. A session whose recorded spend -- the sum of its dispatched turns' cost, a lower bound of the bill -- is at or past its cap takes no new turn, whoever asks; the turn already running is left to finish. Null means the automation sets no cap of its own, and its sessions are held to the strictest of their repositories' caps -- so clearing it re-admits a refused session only when no repository cap at or below the session's spend applies. Set, raised or cleared only through PUT /api/automations/{automationID}/session-spend-cap (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as session_spend_cap.set -- never at creation, which a maintainer may do."
         },
         "runHealth": {
           "type": ["object", "null"],

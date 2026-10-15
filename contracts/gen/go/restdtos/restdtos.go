@@ -432,8 +432,10 @@ type Automation struct {
 	// A session whose recorded spend -- the sum of its dispatched turns' cost, a
 	// lower bound of the bill -- is at or past its cap takes no new turn, whoever
 	// asks; the turn already running is left to finish. Null means the automation
-	// sets no cap of its own. Set, raised or cleared only through PUT
-	// /api/automations/{automationID}/session-spend-cap
+	// sets no cap of its own, and its sessions are held to the strictest of their
+	// repositories' caps -- so clearing it re-admits a refused session only when no
+	// repository cap at or below the session's spend applies. Set, raised or cleared
+	// only through PUT /api/automations/{automationID}/session-spend-cap
 	// (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as
 	// session_spend_cap.set -- never at creation, which a maintainer may do.
 	SessionSpendCapUsd AutomationSessionSpendCapUsd `json:"sessionSpendCapUsd" yaml:"sessionSpendCapUsd" mapstructure:"sessionSpendCapUsd"`
@@ -900,7 +902,9 @@ type AutomationSandboxPathScope []string
 // session whose recorded spend -- the sum of its dispatched turns' cost, a lower
 // bound of the bill -- is at or past its cap takes no new turn, whoever asks; the
 // turn already running is left to finish. Null means the automation sets no cap of
-// its own. Set, raised or cleared only through PUT
+// its own, and its sessions are held to the strictest of their repositories' caps
+// -- so clearing it re-admits a refused session only when no repository cap at or
+// below the session's spend applies. Set, raised or cleared only through PUT
 // /api/automations/{automationID}/session-spend-cap
 // (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as
 // session_spend_cap.set -- never at creation, which a maintainer may do.
@@ -9847,7 +9851,10 @@ type RepoSettings struct {
 	// (Automation.sessionSpendCapUsd). Null means no cap. Set, raised or cleared only
 	// through PUT /api/repos/{owner}/{repo}/session-spend-cap
 	// (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as
-	// session_spend_cap.set; a raise lets a refused session take its next turn.
+	// session_spend_cap.set. A change re-admits a session the cap refused only when
+	// this is the cap the session is held to -- no automation cap applies to it and
+	// no other repository of it sets a stricter one -- and the cap that then applies
+	// is above what the session has spent.
 	SessionSpendCapUsd RepoSettingsSessionSpendCapUsd `json:"sessionSpendCapUsd" yaml:"sessionSpendCapUsd" mapstructure:"sessionSpendCapUsd"`
 }
 
@@ -9970,7 +9977,10 @@ func (j *RepoSettingsSensitiveBlastRadiusTagsElem) UnmarshalJSON(value []byte) e
 // (Automation.sessionSpendCapUsd). Null means no cap. Set, raised or cleared only
 // through PUT /api/repos/{owner}/{repo}/session-spend-cap
 // (authz.ActionSetSessionSpendCap, admin only, §13.3), audited as
-// session_spend_cap.set; a raise lets a refused session take its next turn.
+// session_spend_cap.set. A change re-admits a session the cap refused only when
+// this is the cap the session is held to -- no automation cap applies to it and no
+// other repository of it sets a stricter one -- and the cap that then applies is
+// above what the session has spent.
 type RepoSettingsSessionSpendCapUsd *float64
 
 // UnmarshalJSON implements json.Unmarshaler.
@@ -15504,16 +15514,18 @@ type UpdateSessionSpendCapRequest struct {
 	// The cap in USD, or null to clear it -- the only spelling of 'no cap'. Validated
 	// application-side (§37: a value that cannot function is refused when written), a
 	// 400 otherwise: above zero, since a cap of zero or less permits nothing; at most
-	// two decimal places; at most 99999999.99. The database's CHECK constraint backs
-	// the first rule.
+	// two decimal places, counted on the number as written, so a literal whose
+	// further digits a float would round away is refused too; at most 99999999.99.
+	// The database's CHECK constraint backs the first rule.
 	CapUsd UpdateSessionSpendCapRequestCapUsd `json:"capUsd" yaml:"capUsd" mapstructure:"capUsd"`
 }
 
 // The cap in USD, or null to clear it -- the only spelling of 'no cap'. Validated
 // application-side (§37: a value that cannot function is refused when written), a
 // 400 otherwise: above zero, since a cap of zero or less permits nothing; at most
-// two decimal places; at most 99999999.99. The database's CHECK constraint backs
-// the first rule.
+// two decimal places, counted on the number as written, so a literal whose further
+// digits a float would round away is refused too; at most 99999999.99. The
+// database's CHECK constraint backs the first rule.
 type UpdateSessionSpendCapRequestCapUsd *float64
 
 // UnmarshalJSON implements json.Unmarshaler.

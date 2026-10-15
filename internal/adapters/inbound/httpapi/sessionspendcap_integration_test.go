@@ -349,7 +349,10 @@ func TestPutSessionSpendCap_ZeroOrLessRefused(t *testing.T) {
 }
 
 // TestPutSessionSpendCap_TooManyDecimalsRefused: a cap NUMERIC(10, 2) would
-// round, or cannot hold, is refused rather than silently changed.
+// round, or cannot hold, is refused rather than silently changed -- counted
+// on the number as written, so a literal with seventeen or more significant
+// digits, whose float64 already rounds to two decimal places, is refused
+// too.
 func TestPutSessionSpendCap_TooManyDecimalsRefused(t *testing.T) {
 	ctx := context.Background()
 	rig := newTestRig(t)
@@ -357,7 +360,7 @@ func TestPutSessionSpendCap_TooManyDecimalsRefused(t *testing.T) {
 	const repo = "acme/cap-decimals"
 	rig.markRepoKnown(ctx, t, repo)
 
-	for _, value := range []string{"1.005", "0.001", "24.999", "100000000", "1e9"} {
+	for _, value := range []string{"1.005", "0.001", "24.999", "100000000", "1e9", "99999999.989999999", "1.10000000000000008881784197001", "0.10000000000000000001"} {
 		t.Run(value, func(t *testing.T) {
 			var body map[string]string
 			if status := rig.doJSON(t, http.MethodPut, "/api/repos/"+repo+"/session-spend-cap", capBody(value), &body, token); status != http.StatusBadRequest || body["error"] != "capUsd must be above zero, with at most two decimal places and no larger than 99999999.99, or null to clear the cap" {
@@ -635,7 +638,10 @@ func putCapRaw(ctx context.Context, rig testRig, path, token string, body []byte
 // another transaction is changing the cap waits for it and audits the cap
 // that transaction committed -- on a repository whose row exists, on one
 // whose row that transaction is creating, and on an automation. Read
-// without the lock, it would audit the cap from before.
+// without the lock, it would audit the cap from before. That the lock is
+// held through the write, to its commit, is
+// TestSessionSpendCap_SecondWriterWaitsForTheFirstToCommit's to show: here
+// the other transaction already holds the row when the write begins.
 func TestSessionSpendCap_ConcurrentWriteAuditsTheCapItReplaced(t *testing.T) {
 	const repo = "acme/cap-concurrent"
 	for _, tc := range []struct {
@@ -728,17 +734,21 @@ func TestSessionSpendCap_ConcurrentWriteAuditsTheCapItReplaced(t *testing.T) {
 	}
 }
 
-// TestRepoSettingsResponses_CarryTheSessionSpendCap: every route that
-// answers RepoSettings renders the repository's cap, so no settings write
-// reads as having cleared it.
-func TestRepoSettingsResponses_CarryTheSessionSpendCap(t *testing.T) {
+// TestRepoSettingsResponses_RenderTheWholeRow: every route that answers
+// RepoSettings renders the repository's whole row -- the session spend cap,
+// the sensitive blast-radius tags, the eligibility bound and the armed
+// toggles as stored -- so no settings write reads as having cleared or
+// disarmed what it did not touch.
+func TestRepoSettingsResponses_RenderTheWholeRow(t *testing.T) {
 	ctx := context.Background()
 	rig := newTestRig(t)
 	_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleAdmin)
-	const repo = "acme/cap-everywhere"
+	const repo = "acme/whole-row"
 	rig.markRepoKnown(ctx, t, repo)
-	if status := rig.doJSON(t, http.MethodPut, "/api/repos/"+repo+"/session-spend-cap", capBody("42"), nil, token); status != http.StatusOK {
-		t.Fatalf("set the cap: status %d", status)
+	if _, err := rig.pool.Exec(ctx, `INSERT INTO repo_settings
+		(repo_full_name, session_spend_cap_usd, sensitive_blast_radius_tags, max_auto_approve_files_changed, auto_merge_enabled, auto_retrigger_review_enabled)
+		VALUES ($1, 42, '["auth", "migrations"]'::jsonb, 15, true, true)`, repo); err != nil {
+		t.Fatalf("seed the row: %v", err)
 	}
 
 	for _, tc := range []struct {
@@ -746,12 +756,13 @@ func TestRepoSettingsResponses_CarryTheSessionSpendCap(t *testing.T) {
 	}{
 		{http.MethodGet, "settings", ""},
 		{http.MethodPut, "settings", `{"blockOnHighRisk": true}`},
-		{http.MethodPut, "auto-approval-settings", `{"maxAutoApproveFilesChanged": 15, "sensitiveBlastRadiusTags": null}`},
+		{http.MethodPut, "auto-approval-settings", `{"maxAutoApproveFilesChanged": 15, "sensitiveBlastRadiusTags": ["auth", "migrations"]}`},
 		{http.MethodPut, "auto-merge", `{"enabled": true}`},
 		{http.MethodPut, "auto-retrigger-review", `{"enabled": true}`},
 		{http.MethodPut, "description-autofix", `{"enabled": true}`},
 		{http.MethodPut, "review-depth", `{"mode": "auto", "deepPaths": null}`},
 		{http.MethodPut, "review-cost-budget", `{"lightUsd": 1, "deepUsd": null}`},
+		{http.MethodPut, "session-spend-cap", `{"capUsd": 42}`},
 	} {
 		t.Run(fmt.Sprintf("%s %s", tc.method, tc.route), func(t *testing.T) {
 			var body []byte
@@ -759,8 +770,209 @@ func TestRepoSettingsResponses_CarryTheSessionSpendCap(t *testing.T) {
 				body = []byte(tc.body)
 			}
 			var settings restdtos.RepoSettings
-			if status := rig.doJSON(t, tc.method, "/api/repos/"+repo+"/"+tc.route, body, &settings, token); status != http.StatusOK || usd(settings.SessionSpendCapUsd) != 42 {
-				t.Errorf("status %d, cap %v; want 200 and 42", status, usd(settings.SessionSpendCapUsd))
+			if status := rig.doJSON(t, tc.method, "/api/repos/"+repo+"/"+tc.route, body, &settings, token); status != http.StatusOK {
+				t.Fatalf("status %d, want 200", status)
+			}
+			if usd(settings.SessionSpendCapUsd) != 42 {
+				t.Errorf("cap %v, want 42", usd(settings.SessionSpendCapUsd))
+			}
+			if settings.SensitiveBlastRadiusTags == nil || fmt.Sprint(*settings.SensitiveBlastRadiusTags) != "[auth migrations]" {
+				t.Errorf("sensitiveBlastRadiusTags = %v, want [auth migrations]", settings.SensitiveBlastRadiusTags)
+			}
+			if settings.MaxAutoApproveFilesChanged == nil || *settings.MaxAutoApproveFilesChanged != 15 {
+				t.Errorf("maxAutoApproveFilesChanged = %v, want 15", settings.MaxAutoApproveFilesChanged)
+			}
+			if !settings.AutoMergeEnabled || !settings.AutoRetriggerReviewEnabled {
+				t.Errorf("autoMergeEnabled %v, autoRetriggerReviewEnabled %v; want both armed, as stored", settings.AutoMergeEnabled, settings.AutoRetriggerReviewEnabled)
+			}
+		})
+	}
+}
+
+// TestPutSessionSpendCap_NonAdminOnUnknownRepo403: the role is checked
+// before the repository, so a caller who may not set a cap learns nothing
+// about which repositories this deployment knows -- 403 on an unknown one,
+// as on a known one, never 404.
+func TestPutSessionSpendCap_NonAdminOnUnknownRepo403(t *testing.T) {
+	ctx := context.Background()
+	rig := newTestRig(t)
+	for _, role := range []sqlcgen.UserRole{sqlcgen.UserRoleMaintainer, sqlcgen.UserRoleMember, sqlcgen.UserRoleViewer} {
+		_, token := createUserWithRole(ctx, t, rig, role)
+		if status := rig.doJSON(t, http.MethodPut, "/api/repos/acme/never-onboarded/session-spend-cap", capBody("10"), nil, token); status != http.StatusForbidden {
+			t.Errorf("as %s on an unknown repository: status = %d, want 403", role, status)
+		}
+	}
+}
+
+// TestPutAutomationSessionSpendCap_AnswersRunHealth: the automation the cap
+// write answers carries its run health, read in the write's transaction --
+// the same figure GET answers -- never null for an automation that has run.
+func TestPutAutomationSessionSpendCap_AnswersRunHealth(t *testing.T) {
+	ctx := context.Background()
+	rig := newTestRig(t)
+	_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleAdmin)
+	automationID := createCapTestAutomation(ctx, t, rig, "has-run", "")
+	if _, err := rig.pool.Exec(ctx, `WITH inv AS (
+			INSERT INTO automation_invocations (automation_id, targets, total_runs) VALUES ($1, '[]'::jsonb, 3) RETURNING id)
+		INSERT INTO automation_runs (invocation_id, automation_id, target, status)
+		SELECT inv.id, $1, jsonb_build_object('n', u.n), u.s::automation_run_status
+		FROM inv, unnest(ARRAY['succeeded', 'succeeded', 'failed']) WITH ORDINALITY AS u(s, n)`, automationID); err != nil {
+		t.Fatalf("seed the automation's runs: %v", err)
+	}
+
+	var got restdtos.Automation
+	if status := rig.doJSON(t, http.MethodPut, "/api/automations/"+automationID.String()+"/session-spend-cap", capBody("20"), &got, token); status != http.StatusOK {
+		t.Fatalf("status %d, want 200", status)
+	}
+	if got.RunHealth == nil || got.RunHealth.SucceededRuns != 2 || got.RunHealth.TerminalRuns != 3 {
+		t.Fatalf("runHealth = %+v, want 2 of 3", got.RunHealth)
+	}
+}
+
+// installSpendCapWriteGate makes the first statement whose text names
+// statement pause, before it touches a row, until the test releases the
+// advisory lock key it holds on conn: a statement-level BEFORE trigger on
+// table, which fires ahead of any row lock the statement takes. Statements
+// after the first pass straight through.
+func installSpendCapWriteGate(ctx context.Context, t *testing.T, rig testRig, table, event, statement string, key int64) {
+	t.Helper()
+	for _, stmt := range []string{
+		`CREATE SEQUENCE IF NOT EXISTS spend_cap_test_gate_seq`,
+		`CREATE OR REPLACE FUNCTION spend_cap_test_gate() RETURNS trigger LANGUAGE plpgsql AS $$
+		BEGIN
+			-- Nested, so the gate's one pass is spent only by the statement it names.
+			IF current_query() LIKE '%' || TG_ARGV[0] || '%' THEN
+				IF nextval('spend_cap_test_gate_seq') = 1 THEN
+					PERFORM pg_advisory_xact_lock(TG_ARGV[1]::bigint);
+				END IF;
+			END IF;
+			RETURN NULL;
+		END $$`,
+		fmt.Sprintf(`CREATE TRIGGER spend_cap_test_gate BEFORE %s ON %s FOR EACH STATEMENT EXECUTE FUNCTION spend_cap_test_gate('%s', '%d')`, event, table, statement, key),
+	} {
+		if _, err := rig.pool.Exec(ctx, stmt); err != nil {
+			t.Fatalf("install the write gate: %v", err)
+		}
+	}
+	t.Cleanup(func() {
+		_, _ = rig.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS spend_cap_test_gate ON `+table)
+		_, _ = rig.pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS spend_cap_test_gate()`)
+		_, _ = rig.pool.Exec(context.Background(), `DROP SEQUENCE IF EXISTS spend_cap_test_gate_seq`)
+	})
+}
+
+// TestSessionSpendCap_SecondWriterWaitsForTheFirstToCommit: the lock a write
+// takes on the row is held through the write and its audit row, to the
+// commit. Writer A, setting 9, is paused after its lock and before its
+// write; writer B, setting 7, must then wait for A rather than go ahead,
+// and once A commits B audits A's 9 as the cap it replaced. A lock taken
+// outside the write's transaction is released at once: B would write and
+// audit 3 -> 7 while A is paused, and A would then audit 3 -> 9 over it,
+// the race the lock exists to prevent.
+func TestSessionSpendCap_SecondWriterWaitsForTheFirstToCommit(t *testing.T) {
+	const repo = "acme/cap-second-writer"
+	const gateKey = 914_148
+	for _, tc := range []struct {
+		name                     string
+		automation               bool
+		table, event, write, lck string
+	}{
+		{"a repository", false, "repo_settings", "INSERT", "UpsertSessionSpendCap", "LockRepoSessionSpendCap"},
+		{"an automation", true, "automations", "UPDATE", "UpdateAutomationSessionSpendCap", "LockAutomationForUpdate"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			rig := newTestRig(t)
+			_, token := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleAdmin)
+			path, resourceType, resourceID := "/api/repos/"+repo+"/session-spend-cap", "repo", repo
+			readCap := func() string { return repoCapInDB(ctx, t, rig, repo) }
+			if tc.automation {
+				id := createCapTestAutomation(ctx, t, rig, "second-writer", "3.00")
+				path, resourceType, resourceID = "/api/automations/"+id.String()+"/session-spend-cap", "automation", id.String()
+				readCap = func() string { return automationCapInDB(ctx, t, rig, id) }
+			} else {
+				rig.markRepoKnown(ctx, t, repo)
+				if _, err := rig.pool.Exec(ctx, `INSERT INTO repo_settings (repo_full_name, session_spend_cap_usd) VALUES ($1, 3)`, repo); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			gate, err := rig.pool.Acquire(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer gate.Release()
+			if _, err := gate.Exec(ctx, `SELECT pg_advisory_lock($1)`, int64(gateKey)); err != nil {
+				t.Fatal(err)
+			}
+			unlocked := false
+			unlock := func() {
+				if !unlocked {
+					unlocked = true
+					_, _ = gate.Exec(ctx, `SELECT pg_advisory_unlock($1)`, int64(gateKey))
+				}
+			}
+			installSpendCapWriteGate(ctx, t, rig, tc.table, tc.event, tc.write, gateKey)
+
+			var statusA, statusB int
+			bDone := make(chan struct{})
+			var g errgroup.Group
+			defer func() { unlock(); _ = g.Wait() }()
+			waitFor := func(what, query string, args ...any) {
+				t.Helper()
+				deadline := time.Now().Add(10 * time.Second)
+				for {
+					var n int
+					if err := rig.pool.QueryRow(ctx, query, args...).Scan(&n); err != nil {
+						t.Fatal(err)
+					}
+					if n > 0 {
+						return
+					}
+					select {
+					case <-bDone:
+						t.Fatalf("writer B finished (status %d) while writer A was paused between its lock and its write: the lock was not held to A's commit", statusB)
+					default:
+					}
+					if time.Now().After(deadline) {
+						t.Fatalf("never saw %s", what)
+					}
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+
+			g.Go(func() error {
+				var err error
+				statusA, err = putCapRaw(ctx, rig, path, token, capBody("9"))
+				return err
+			})
+			waitFor("writer A paused before its write", `SELECT count(*) FROM pg_stat_activity
+				WHERE datname = current_database() AND wait_event_type = 'Lock' AND wait_event = 'advisory' AND query LIKE '%' || $1 || '%'`, tc.write)
+
+			g.Go(func() error {
+				defer close(bDone)
+				var err error
+				statusB, err = putCapRaw(ctx, rig, path, token, capBody("7"))
+				return err
+			})
+			waitFor("writer B waiting for writer A's row lock", `SELECT count(*) FROM pg_stat_activity
+				WHERE datname = current_database() AND wait_event_type = 'Lock' AND wait_event <> 'advisory' AND query LIKE '%' || $1 || '%'`, tc.lck)
+
+			unlock()
+			if err := g.Wait(); err != nil {
+				t.Fatal(err)
+			}
+			if statusA != http.StatusOK || statusB != http.StatusOK {
+				t.Fatalf("statuses A %d, B %d; want both 200", statusA, statusB)
+			}
+			if got := readCap(); got != "7.00" {
+				t.Fatalf("stored cap = %s, want 7.00, the later write's", got)
+			}
+			details, _ := spendCapAuditRows(ctx, t, rig, resourceType, resourceID)
+			if len(details) != 2 ||
+				details[0]["previous_usd"] != 3.0 || details[0]["cap_usd"] != 9.0 ||
+				details[1]["previous_usd"] != 9.0 || details[1]["cap_usd"] != 7.0 {
+				t.Fatalf("session_spend_cap.set rows = %v, want 3 -> 9, then 9 -> 7", details)
 			}
 		})
 	}

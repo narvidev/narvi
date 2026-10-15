@@ -11,10 +11,11 @@
 // precedence over its repositories', so the two writes are one decision.
 // The repository route is scoped like every repository-scoped route
 // (resolveKnownRepo). A cap must be a number above zero with at most two
-// decimal places, no larger than NUMERIC(10, 2) holds
-// (sessionguard.ValidateSessionSpendCap, the one check every write makes,
-// §37) -- a 400 otherwise -- and the columns' CHECK constraints back it
-// (migrations/000165).
+// decimal places, no larger than NUMERIC(10, 2) holds -- read from the
+// number exactly as the request writes it (sessionguard.ParseSessionSpendCap,
+// which ends with sessionguard.ValidateSessionSpendCap, the one check every
+// write makes, §37) -- a 400 otherwise -- and the columns' CHECK constraints
+// back it (migrations/000165).
 //
 // Each write and its session_spend_cap.set audit row, naming the previous
 // cap and the new one, commit together (§13.3's "written in the same
@@ -23,13 +24,19 @@
 // write first locks the row and reads the cap it replaces, so of two writes
 // at once the second audits the first one's cap as its previous value.
 //
-// A raise is what re-admits a session the cap refused (technical plan
-// §40.1, internal/domain/sessionguard): the guard reads the cap afresh on
-// every turn it decides, so the next turn created on the session -- a
-// person's prompt, a plan approval, the automatic re-review's next push --
-// is admitted, and its dispatch too. Nothing waits to be woken by the
-// raise: a refused turn was either never inserted or ended at dispatch, so
-// the write touches nothing but the cap.
+// A write re-admits a session the cap refused only when the cap it changes
+// is the one the session is held to and the cap that then applies is above
+// what the session has spent (technical plan §40.1,
+// internal/domain/sessionguard): an automation's cap, when set, applies
+// instead of its repositories' caps, and otherwise the strictest of the
+// session's repositories' caps applies -- so clearing an automation's cap
+// leaves its sessions to that repository cap, and raising one repository's
+// cap changes nothing while a stricter one applies. When it does re-admit,
+// it is at once: the guard reads the caps afresh on every turn it decides,
+// so the next turn created on the session -- a person's prompt, a plan
+// approval, the automatic re-review's next push -- is admitted, and its
+// dispatch too. Nothing waits to be woken: a refused turn was either never
+// inserted or ended at dispatch, so the write touches nothing but the cap.
 
 package httpapi
 
@@ -37,6 +44,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -69,9 +77,12 @@ const (
 // cap cleared. capUsd is required, so a body that leaves it out clears
 // nothing by accident -- decoded by hand rather than through the generated
 // type, whose decoder accepts a bare JSON null as a body with every field
-// null. Writes a 400 and returns ok=false for a malformed body, a missing
-// capUsd, a capUsd that is no number, or a cap
-// sessionguard.ValidateSessionSpendCap refuses.
+// null. The cap is read from its literal, exactly as sent
+// (sessionguard.ParseSessionSpendCap, which ends with
+// sessionguard.ValidateSessionSpendCap), never from a float64 that has
+// already rounded away the digits that make it more than two decimal
+// places. Writes a 400 and returns ok=false for a malformed body, a missing
+// capUsd, a capUsd that is no number, or a cap the parse refuses.
 func decodeSessionSpendCap(w http.ResponseWriter, r *http.Request) (capUSD *float64, ok bool) {
 	r.Body = http.MaxBytesReader(w, r.Body, maxRequestBodyBytes)
 	var body map[string]json.RawMessage
@@ -84,15 +95,17 @@ func decodeSessionSpendCap(w http.ResponseWriter, r *http.Request) (capUSD *floa
 		writeError(w, http.StatusBadRequest, sessionSpendCapRequiredMessage)
 		return nil, false
 	}
-	if err := json.Unmarshal(raw, &capUSD); err != nil {
+	// A json.RawMessage holds the value's own bytes, exactly as sent.
+	literal := strings.TrimSpace(string(raw))
+	if literal == "null" {
+		return nil, true
+	}
+	v, err := sessionguard.ParseSessionSpendCap(literal)
+	if err != nil {
 		writeError(w, http.StatusBadRequest, sessionSpendCapInvalidMessage)
 		return nil, false
 	}
-	if err := sessionguard.ValidateSessionSpendCap(capUSD); err != nil {
-		writeError(w, http.StatusBadRequest, sessionSpendCapInvalidMessage)
-		return nil, false
-	}
-	return capUSD, true
+	return &v, true
 }
 
 // sessionSpendCapUSD renders a stored session spend cap for the wire and

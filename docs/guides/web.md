@@ -835,10 +835,16 @@ session's recorded spend reaches its cap it takes no new turn, whoever
 asks — a prompt, a plan approval, a workflow step, the review button, every
 automatic producer — and it is not failed: the turn already running
 finishes, so the spend can pass the cap by that turn's cost, and the
-session records a warning saying so. A session naming several repositories
-takes the strictest of their caps; an automation's cap, when set, takes
-precedence over its repositories'. Raising or clearing the cap lets the
-session take its next turn. There is no Settings screen for it yet: the
+session records a warning saying so. The cap a session is held to is its
+automation's, when the automation that created it sets one, whether above or
+below its repositories' caps; otherwise the strictest cap among the
+repositories it names. The refusal names that cap and where it was set. A
+change re-admits the session only when it changes that cap and the cap
+that then applies is above what the session has spent: clearing an
+automation's cap leaves its sessions to their repositories' caps, and
+raising one repository's cap changes nothing while a stricter one, or the
+automation's, still applies. When it does, the next turn the session is
+asked for is admitted at once. There is no Settings screen for it yet: the
 repository's cap reads back on `GET /api/repos/{owner}/{repo}/settings`,
 the automation's on `GET /api/automations/{automationID}`.
 
@@ -856,7 +862,8 @@ the cap.
 **Negative.** Both are **admin-only** (`set_session_spend_cap`, §13.3): a
 maintainer, member or viewer gets `403` — a maintainer who manages an
 automation included. A cap of zero or less, with more than two decimal
-places, or above 99999999.99, and a body without `capUsd`, answer `400`. A
+places as written (a long literal a float would round is refused too), or
+above 99999999.99, and a body without `capUsd`, answer `400`. A
 repository this deployment has never seen a pull-request session for, or
 an automation that does not exist, answers `404`. Each write is audited as
 `session_spend_cap.set`, naming the cap it replaced, in its own

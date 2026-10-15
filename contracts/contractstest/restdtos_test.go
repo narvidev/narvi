@@ -1425,6 +1425,50 @@ func TestAutomationRoundTrip(t *testing.T) {
 			ArtifactSummary: nil,
 		})
 	})
+
+	// §40.1: sessionSpendCapUsd is required and nullable -- an automation
+	// with no cap of its own is sent with null, never without the key, so a
+	// client never reads a missing cap as "no cap". The schema and the Go
+	// decoder both refuse a body that leaves it out.
+	t.Run("SessionSpendCapRequired", func(t *testing.T) {
+		full, err := json.Marshal(restdtos.Automation{
+			Id:                    testSandboxID,
+			Name:                  "no-cap",
+			Repos:                 repos,
+			Status:                restdtos.AutomationStatusActive,
+			CreatedAt:             createdAt,
+			UpdatedAt:             createdAt,
+			TriggerType:           restdtos.AutomationTriggerTypeManual,
+			TriggerConfig:         json.RawMessage(`{}`),
+			EnvVars:               []restdtos.AutomationEnvVarElem{},
+			SandboxMockConfigured: false,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(full, &body); err != nil {
+			t.Fatal(err)
+		}
+		if string(body["sessionSpendCapUsd"]) != "null" {
+			t.Fatalf("an automation with no cap marshals sessionSpendCapUsd as %s, want null", body["sessionSpendCapUsd"])
+		}
+		if err := validateJSON(t, sch, full); err != nil {
+			t.Fatalf("the whole body is refused: %v", err)
+		}
+		delete(body, "sessionSpendCapUsd")
+		without, err := json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateJSON(t, sch, without); err == nil {
+			t.Fatal("an Automation without sessionSpendCapUsd validated, want it required")
+		}
+		var decoded restdtos.Automation
+		if err := json.Unmarshal(without, &decoded); err == nil {
+			t.Fatal("an Automation without sessionSpendCapUsd decoded, want the Go decoder to require it")
+		}
+	})
 }
 
 // TestShadowLedgerSummaryRoundTrip covers the second of the two DTOs whose

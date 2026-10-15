@@ -480,18 +480,9 @@ func PutRepoSettings(repoSettings *postgres.RepoSettingsStore, prSessions *postg
 			return
 		}
 
-		mode, deepPaths := reviewDepthFieldsFromRow(settings)
-		costBudgetLight, costBudgetDeep := reviewCostBudgetFieldsFromRow(settings)
-		writeJSON(w, http.StatusOK, restdtos.RepoSettings{
-			RepoFullName:             repoFullName,
-			BlockOnHighRisk:          settings.BlockOnHighRisk,
-			SentinelAutofixEnabled:   settings.SentinelAutofixEnabled,
-			ReviewDepthMode:          mode,
-			ReviewDepthDeepPaths:     deepPaths,
-			ReviewCostBudgetLightUsd: costBudgetLight,
-			ReviewCostBudgetDeepUsd:  costBudgetDeep,
-			SessionSpendCapUsd:       sessionSpendCapUSD(settings.SessionSpendCapUsd),
-		})
+		// The whole upserted row, as every other settings route answers it:
+		// the other admin toggles as stored, never their zero values.
+		writeJSON(w, http.StatusOK, repoSettingsFromRow(repoFullName, settings))
 	}
 }
 
@@ -697,19 +688,28 @@ func PutDescriptionAutofixToggle(repoSettings *postgres.RepoSettingsStore, prSes
 	}
 }
 
-// autoApprovalSettingsToRepoSettingsDTO renders updated (this call's own
-// just-written §21.2 columns) plus a fresh read of blockOnHighRisk/
-// sentinelAutofixEnabled (a DIFFERENT write path, PutRepoSettings above)
-// into one complete restdtos.RepoSettings -- both PutAutoApprovalSettings
-// and PutAutoMergeToggle share this so their own response shape never
-// independently drifts from GetRepoSettings' own field-by-field
-// construction.
+// autoApprovalSettingsToRepoSettingsDTO renders a fresh read of the
+// repository's row (repoSettingsFromRow, as every other settings route
+// renders it) with updated -- this call's own just-written §21.2 columns --
+// laid over it, into one complete restdtos.RepoSettings. Both
+// PutAutoApprovalSettings and PutAutoMergeToggle share this, so their
+// answer never drifts from the other routes'. A read that fails leaves the
+// answer to updated's columns alone, logged.
 func autoApprovalSettingsToRepoSettingsDTO(ctx context.Context, repoSettings *postgres.RepoSettingsStore, repoFullName string, updated appreviewverdict.AutoApprovalSettings) restdtos.RepoSettings {
-	resp := restdtos.RepoSettings{RepoFullName: repoFullName, AutoMergeEnabled: updated.AutoMergeEnabled}
+	resp := restdtos.RepoSettings{RepoFullName: repoFullName}
+	if settings, err := repoSettings.Get(ctx, repoFullName); err == nil {
+		resp = repoSettingsFromRow(repoFullName, settings)
+	} else if !errors.Is(err, pgx.ErrNoRows) {
+		platform.Logger(ctx).Error("httpapi: read back repo settings failed", "error", err)
+	}
+
+	resp.AutoMergeEnabled = updated.AutoMergeEnabled
+	resp.MaxAutoApproveFilesChanged = nil
 	if updated.MaxAutoApproveFilesChanged != nil {
 		v := *updated.MaxAutoApproveFilesChanged
 		resp.MaxAutoApproveFilesChanged = &v
 	}
+	resp.SensitiveBlastRadiusTags = nil
 	if len(updated.SensitiveBlastRadiusTags) > 0 {
 		tags := make(restdtos.RepoSettingsSensitiveBlastRadiusTags, len(updated.SensitiveBlastRadiusTags))
 		for i, t := range updated.SensitiveBlastRadiusTags {
@@ -717,17 +717,6 @@ func autoApprovalSettingsToRepoSettingsDTO(ctx context.Context, repoSettings *po
 		}
 		resp.SensitiveBlastRadiusTags = &tags
 	}
-
-	if settings, err := repoSettings.Get(ctx, repoFullName); err == nil {
-		resp.BlockOnHighRisk = settings.BlockOnHighRisk
-		resp.SentinelAutofixEnabled = settings.SentinelAutofixEnabled
-		resp.ReviewDepthMode, resp.ReviewDepthDeepPaths = reviewDepthFieldsFromRow(settings)
-		resp.ReviewCostBudgetLightUsd, resp.ReviewCostBudgetDeepUsd = reviewCostBudgetFieldsFromRow(settings)
-		resp.SessionSpendCapUsd = sessionSpendCapUSD(settings.SessionSpendCapUsd)
-	} else if !errors.Is(err, pgx.ErrNoRows) {
-		platform.Logger(ctx).Error("httpapi: read back block-on-high-risk/sentinel-autofix fields failed", "error", err)
-	}
-
 	return resp
 }
 
