@@ -234,14 +234,22 @@ choose by what the incident needs:
 - **To keep everything automatic held across the rollback, keep the
   freeze.** Roll back while frozen: the older release honours it. Once the
   incident allows, lift it there with the statement below.
-- **Otherwise, unfreeze before rolling back**: Settings → General →
-  Unfreeze, or `POST /api/autonomy/unfreeze`. Its `autonomy.unfrozen` audit
-  row records what was lifted. First stop every session whose held work must
-  not move: a person's stop drops the session's held workflow advances and
-  cancels their runs, and stopping a pull request's review session makes
-  the sentinel fix it would start skip for good (its fix branch may still
-  be created, unused). Then turn off the toggles and pause the automations
-  the incident needs off.
+- **Otherwise, unfreeze before rolling back**, once everything is ready.
+  First turn off the toggles and pause the automations the incident needs
+  off. Then stop every session whose held work must not move. A person's
+  stop drops the session's held workflow advances and cancels their runs,
+  so they are never applied, even when the session is resumed a moment
+  later. A held sentinel fix is different: the stop leaves its delivery
+  pending, and the delivery, after the unfreeze, is refused only if the
+  stop on the origin pull request's review session still stands.
+  The skip holds only while the stop stands. A person's mention, review
+  label, Re-review click or prompt on that pull request before the held fix
+  is delivered resumes the session, and the fix spawns. A fix refused at
+  delivery is skipped for good, though its fix branch may still be created,
+  unused. When held sentinel fixes must certainly not move, keep the freeze
+  across the rollback (the bullet above). Last, unfreeze: Settings →
+  General → Unfreeze, or `POST /api/autonomy/unfreeze`. Its
+  `autonomy.unfrozen` audit row records what was lifted.
 
 If a rollback already happened with the freeze on, the older release has one
 way to lift it: this statement, on the control plane's database. It is the
