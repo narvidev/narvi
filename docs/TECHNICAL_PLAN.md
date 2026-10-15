@@ -97,6 +97,7 @@ Hard rules:
 - **Two-phase terminalization**: a watchdog never writes `failed` directly. It writes `suspect` and arms `terminal_grace` (default 60s). Any liveness signal during grace returns to previous state. A genuinely late success (e.g. `execution_complete` arriving after terminalization) **reconciles**: turn marked completed, session status re-derived, automation run counters corrected. This narrows the false-failure window rather than eliminating it — see the note just below the list for the residual case and what closing it would require.
 - **Circuit breaker**: 3 permanent spawn failures within 5 min blocks spawning for that session. Unknown provider errors default to **transient**, never permanent — a novel transient failure must not trip the breaker.
 - **A restore is decided on what the snapshot holds** (§35.5b). What the sandbox-agent that minted a snapshot reported about itself — its protocol and its agent runtime's version — is recorded with the snapshot, keyed by the snapshot id, and kept across every restore. Before every restore it reads **compatible** (restored), **incompatible** (refused: the sandbox is spawned fresh, the snapshot cleared, and the refusal persisted as a session `warning`, logged and counted) or **unknown** (restored, and counted as unknown, never as compatible). A restore downgraded to a fresh spawn for another reason (§27.8, §30.4(3)), and a snapshot the review checkout discards with its gen (§3.3), are persisted the same way, once per snapshot.
+- **No turn is dispatched to a sandbox below its runway threshold** (§35.3). Before a turn is dispatched to a live sandbox, a pure decision on its lifetime deadline (`sandbox.EvaluateRunway`) passes it, holds it, rotates the sandbox first — snapshot, retire the gen to `stopped`, `shutdown`, restore under a new gen — or retires a gen past its deadline; a rotation is data on the sandbox row read by each dispatch evaluation, never a state of the machine, and it moves the sandbox only over the edges above. A snapshot in progress holds the turn for at most `SnapshotReportWait`; one never reported is then given up, the sandbox back to `ready` when its agent is still heard from and its gen retired when it is not.
 
 Two-phase terminalization's reconciliation above is scoped to a late signal that still finds the turn `Processing` — true whenever it arrives inside `turn_deadline`'s own, separate, much longer budget (60 min vs. `terminal_grace`'s 60s, `platform/timeouts.go`), the ordinary case. What that scoping makes unrepresentable is the contradiction class — a delivered artifact and a failure message both standing for the same turn at once — since a turn still `Processing` can only ever resolve to one clean terminal write, never a conflicting second one. The residual case stays a known limitation: a real `execution_complete` arriving after the turn has already gone terminal via its own `turn_deadline` timeout is logged and discarded, not reconciled — the user is told the turn failed while the work actually completed. Closing this residual would require late-success reconciliation to enqueue a corrective follow-up notification through the same outbox (§5.1) once the original `failed` transition's own notification has already been dispatched; without that, the contradiction class this design otherwise prevents re-enters through that door.
 
@@ -258,7 +259,7 @@ type AgentRuntime interface {
 ### 5.4 Timeout hierarchy (single source: `platform/timeouts.go`)
 One struct, validated at boot with the invariant chain asserted in a unit test:
 `provider hard cap (2h) > supervisor turn cap > CP turn_deadline > OpenCode SSE inactivity timeout`, each with explicit margin. Also: `providerHTTPClientTimeout > provider worst cold start`; `first_connect_budget > image pull + boot p99`. No timeout literal anywhere else in the codebase.
-**The first term is not a property of the turn.** A provider's hard cap runs from its sandbox's own creation, not from the turn running inside it, so this chain is asserted of a turn dispatched onto a *fresh* sandbox and is simply false of one dispatched onto an old one — the boot-time invariant test cannot see the difference, because at boot there is no sandbox. §35 is what makes the first term true at dispatch rather than only at spawn; `RotationRunwayFloor` is this file's own entry for it. The lifetime each session kind's sandbox is assumed to get (§35.2: `SandboxLifetime`, `ReviewSandboxLifetime`, read through `SandboxLifetimeFor`) is this file's entry for that first term at spawn: nothing sends it to the provider, so it is held at or below the provider hard cap with no margin, and above the supervisor turn cap and `first_connect_budget` plus the boot-evidence fallback with margin, in the same invariant test. On the Kubernetes provider (§42.2) the first term is, for the first time, Narvi's own value: `KubernetesPodActiveDeadline`, set as the pod's `activeDeadlineSeconds`, this file's own entry, asserted in the same chain.
+**The first term is not a property of the turn.** A provider's hard cap runs from its sandbox's own creation, not from the turn running inside it, so this chain is asserted of a turn dispatched onto a *fresh* sandbox and is simply false of one dispatched onto an old one — the boot-time invariant test cannot see the difference, because at boot there is no sandbox. §35.3 guarantees a turn at least `min(RotationRunwayFloor, lifetime/6)` of its sandbox's runway at dispatch — `RotationRunwayFloor` is this file's own entry for it — and the chain holds at dispatch only where that is above `SupervisorTurnCap` with margin, which at the shipped 13-minute floor and 2h lifetimes it is not; below it, a turn that outlives its sandbox is §35.4's interruption, not a failure. The lifetime each session kind's sandbox is assumed to get (§35.2: `SandboxLifetime`, `ReviewSandboxLifetime`, read through `SandboxLifetimeFor`) is this file's entry for that first term at spawn: nothing sends it to the provider, so it is held at or below the provider hard cap with no margin, and above the supervisor turn cap and `first_connect_budget` plus the boot-evidence fallback with margin, in the same invariant test. On the Kubernetes provider (§42.2) the first term is, for the first time, Narvi's own value: `KubernetesPodActiveDeadline`, set as the pod's `activeDeadlineSeconds`, this file's own entry, asserted in the same chain.
 **The ladder has a session-level tier above the turn (§40.3).** `SessionWallClock > turn_deadline`, and `MaxTurnsPerSession` beside it, both with a human-session value and a stricter automation-session value — this file's own entries, asserted in the same invariant test, and the reason a session created by an automation has an end that someone chose.
 
 ## 6. Wire contracts (frontend and sandbox protocol)
@@ -6816,27 +6817,103 @@ new session type adds its kind (`internal/domain/sandbox`) and a field and defau
 
 ### 35.3 Rotation is the existing restore path, given a second trigger
 A rotation is `snapshot → stopped → shutdown → restore`, every step of which §3.2 already
-specifies and this codebase already implements — a restore re-stamps a full fresh lifetime. **What
-is new is the trigger, not the mechanism**: today the only thing that stops a live sandbox is the
-inactivity bound; this adds runway. Nothing is ever timer-driven, and an idle sandbox is still
-stopped by inactivity and restored on the next prompt, exactly as now.
+specifies — a restore re-stamps a full fresh lifetime. **What is new is the trigger, not the
+mechanism**: the other things that stop a live sandbox are the inactivity bound and a person's stop;
+this adds runway. No rotation is ever started by a timer — only a turn about to be dispatched starts
+one, and the dispatch timer only bounds the wait for its snapshot — and an idle sandbox is still
+stopped by inactivity and restored on the next prompt, exactly as before.
 
 - **Pre-dispatch gate**: a turn is never dispatched into a live sandbox with less than
-  `min(RotationRunwayFloor, lifetime/6)` left. The sandbox rotates first and the turn stays
-  `pending` for the replacement. A declined rotation (no provider capability, a spawn or rotation
-  already in flight) falls through to an ordinary dispatch, so the queue can never stall on this.
-- **A sandbox that died idle at its deadline** — abnormal close, status still live — is marked
-  `stopped`, so the next spawn decision restores from the last snapshot instead of waiting on a box
-  that is gone.
+  `min(RotationRunwayFloor, lifetime/6)` left (`sandbox.RotationThreshold`; the lifetime is the one
+  the gen's deadline was stamped from, or the shortest kind's when its deadline came from an agent's
+  report alone). A runway exactly at the threshold passes. The sandbox rotates first and the turn
+  stays `pending` for the replacement. A rotation the gate cannot make is declined, and the turn is
+  dispatched as before, so the queue can never stall on this: no deadline known, a turn in flight
+  (a re-send to a newer gen: nothing is rotated inside a turn's own `turn_deadline`), a suspect
+  sandbox (no edge takes suspect to snapshotting), and no snapshot capability — a provider that
+  takes none, no command channel, or a session that needs a container daemon, which is never
+  snapshotted (§27.8). A spawn in flight never reaches the gate; a rotation in flight is a phase
+  of it, below.
+- **One pure decision**: `sandbox.EvaluateRunway` (`internal/domain/sandbox`, in §9.1's corpus)
+  decides each evaluation from facts the session actor reads in one statement on the database's
+  clock (`GetSandboxRunway`), and takes no `now` of its own. The first row that matches decides:
+
+  | # | Facts | Action | Reason |
+  |---|---|---|---|
+  | 1 | not ready, suspect or snapshotting | pass | `not_steady` |
+  | 2 | deadline known and passed | retire | `deadline_passed` |
+  | 3 | rotating, snapshotting, within `RotationSnapshotWait` | hold | `awaiting_rotation_snapshot` |
+  | 4 | rotating, snapshotting | retire | `rotation_snapshot_not_reported` |
+  | 5 | rotating, its snapshot recorded since the rotation started | retire | `rotation_snapshot_taken` |
+  | 6 | rotating | retire | `rotation_snapshot_failed` |
+  | 7 | snapshotting, within `SnapshotReportWait` | hold | `snapshot_in_progress` |
+  | 7a | snapshotting, its agent silent past `SteadyHeartbeatBudget` | retire | `snapshot_agent_silent` |
+  | 7b | snapshotting | revert | `snapshot_not_reported` |
+  | 8 | deadline unknown | pass (declined) | `deadline_unknown` |
+  | 9 | runway at or above the threshold | pass | `runway_ok` |
+  | 10 | a turn in flight | pass (declined) | `turn_in_flight` |
+  | 11 | suspect | pass (declined) | `suspect` |
+  | 12 | no snapshot capability | pass (declined) | `no_snapshot` |
+  | 13 | a delivery open | hold | `delivery_open` |
+  | 14 | ready, below the threshold | rotate | `below_threshold` |
+
+  A snapshotting sandbox is never passed, so no prompt goes to a sandbox mid-snapshot; the deadline
+  row precedes every rotation row; every hold names when to look again.
+- **A rotation is data on the row, never a state.** `sandboxes.rotation_gen` and
+  `rotation_started_at` record which gen rotates and since when, `snapshot_started_at` when the
+  snapshot in progress started (migration 000171); a rotation counts only while `rotation_gen` is the
+  live gen, and the claim that replaces the gen clears all three. Each step is an ordinary dispatch
+  evaluation, over the machine's existing edges: ready → snapshotting over `snapshot_start`, the
+  rotation and its snapshot command recorded in one commit, the command sent after it, and the
+  dispatch timer armed at `RotationSnapshotWait`; the snapshot's report, or the wait's end, retires
+  the gen — live → suspect → stopped, its pending snapshot command forgotten — and after that commit
+  the gen is sent `shutdown` and its provider object stopped; the next evaluation's ordinary spawn
+  decision then restores the last snapshot recorded, under a new gen with a fresh deadline, through
+  every gate a restore passes (§27.8, §30.4(3), §35.5b), or spawns fresh when there is none. The
+  rotation never restores anything itself, and a gen the gate retired is never resumed: a resume
+  claims the same provider object and carries its deadline forward (§35.2), which would bring the
+  replaced sandbox back.
+- **A delivery holds the start.** The agent runs push and snapshot one after the other on its read
+  loop, so while a completed turn's push and pull request are still being delivered
+  (`pr_delivery_started_at`, within `MCPStatusDeliveryWindow`) a rotation that would start is held,
+  looked at again at the delivery's bound, or at once when the delivery ends — its `push_error`, or
+  its `push_complete` once the pull request is created. A session whose repositories push past that
+  bound can still delay the rotation's snapshot past its wait; the rotation then falls back, below,
+  before the deadline (`RotationRunwayFloor`'s doc).
+- **A sandbox that died idle at its deadline** — status still live: ready, suspect or snapshotting
+  — is retired to `stopped` before anything is sent to it, so the next spawn decision restores from
+  the last snapshot instead of waiting on a box that is gone.
+- **A snapshot in progress holds a turn for a bounded time.** A turn queued behind a snapshot that
+  is not a rotation's — the post-turn one — is held, never sent mid-snapshot, for at most
+  `SnapshotReportWait` from the snapshot's start; a snapshot found with no start recorded is given
+  one at the first look. The agent reports a failed mint with no frame, so silence past the wait
+  gives the snapshot up: when the agent has been silent past `SteadyHeartbeatBudget` too — its
+  heartbeats run apart from the read loop the snapshot blocks — it is gone, and the gen is retired as
+  above, so the turn runs on a replacement instead of being sent into a socket that is gone;
+  otherwise only the snapshot failed, the sandbox goes back to ready with its work, its pending
+  command forgotten, and takes the turn. A snapshot given up early, still queued behind a push,
+  costs that snapshot, never the turn.
 - **Fencing is unchanged and load-bearing**: a rotation increments `sandbox.gen` like any other
-  restore, and the superseded identity is locked out immediately rather than at its natural expiry.
-  §9.3 scenario 6 already covers the stale-gen reconnect this produces.
+  restore, and the superseded identity is locked out immediately rather than at its natural expiry:
+  from the retirement's commit the row is `stopped`, so its handshake, credentials and snapshot mint
+  answer 410, and `shutdown` ends its connection; the restore replaces its gen and token, after which
+  they answer 403 and the gen fence drops its frames unstored. There is no previous-gen grace window
+  (§5.2's is not built). §9.3 scenario 6 already covers the stale-gen reconnect this produces.
 - **A snapshot that finds its sandbox gone keeps the last valid one (amendment).** A rotation
   whose snapshot fails because the sandbox already exited, or is shutting down, restores from the
-  previous valid snapshot and records the failure. The failed attempt never becomes a restore point.
+  previous valid snapshot and records the failure. The control plane hears nothing of a failed mint,
+  so the failure is what it can see: the snapshot command cannot be sent, nothing is reported within
+  `RotationSnapshotWait`, or the deadline passes while it waits. The failed attempt never becomes a
+  restore point, by three guards each enough alone: the retirement forgets the pending command, so a
+  late report matches nothing; a report reaching the stopped gen is not taken as a snapshot; and
+  once the gen is replaced, the gen fence drops the old gen's report unstored.
   An older snapshot rewinds the workspace and the conversation, and that restore succeeds, so §35.5's
   fresh-lineage recap does not fire for it: the rotation records a persisted warning of its own naming
-  the snapshot it fell back to, so the next turn and a reader know that work since then was lost.
+  the snapshot it fell back to, so the next turn and a reader know that work since then was lost. It
+  is written by the restore claim that restores a snapshot recorded before the rotation started, at
+  the new gen, once (`sandbox_rotation_fallback:{retired gen}`), stored for the session's timeline and
+  posted to no channel; a restore downgraded or refused writes only its own warning, and a rotation
+  with no snapshot to restore spawns fresh, a fresh lineage (§35.5).
   Commits already pushed that the older workspace lacks stay on their branch: the next push is the
   ordinary `git push -- <remote> <branch>`, never forced, so git refuses it as non-fast-forward and
   `push_error` stores git's reason. The branch is the refspec, so `reposource.ValidateBranch` accepts
@@ -6849,10 +6926,20 @@ stopped by inactivity and restored on the next prompt, exactly as now.
   secondary one. The runtime's own `HEAD` is checked with git's rule alone
   (`reposource.ValidateBranchName`): it never becomes a refspec, and git lets the runtime check out
   `+wip`.
+- **Composition.** The session spend cap's dispatch-time guard (§40.1) runs before the gate, so a
+  session that has spent its cap never rotates. A rotation is not an automatic action (§40.2: the
+  dispatch of a turn already enqueued is not one), so the autonomy freeze never holds it. The gate
+  runs before a review turn's checkout (§21.1), so no checkout is sent to a gen about to rotate; a
+  checkout is requested per gen, so the new gen is asked again.
+- **Observability.** `sandbox_runway_gate_total{action, reason}` counts every decision but a pass
+  with runway to spare, and `sandbox_rotation_restore_total{outcome}` what each claim that replaced a
+  rotated gen did: `rotated`, `fell_back` or `fresh`. Each is logged with the gen and its runway.
 
-`RotationRunwayFloor` is a new entry in `platform/timeouts.go` and nowhere else (§11), and the gate
-itself is a pure decision function in `internal/domain/sandbox`, added to the exhaustive
-decision-function corpus §9.1 already requires of that package.
+`RotationRunwayFloor` (13 min), `RotationSnapshotWait` (2 min) and `SnapshotReportWait` (2 min) are
+entries in `platform/timeouts.go` and nowhere else (§11), each derived there from timeouts already in
+that file and held by `Validate`; the floor and the rotation's wait are read only by `Validate` and
+the session actor's gate. The gate itself is a pure decision function in `internal/domain/sandbox`,
+added to the exhaustive decision-function corpus §9.1 already requires of that package.
 
 ### 35.4 A deadline stop is an interruption, not a failure
 This is the half that changes an existing state machine rather than adding to it, and it is worth
