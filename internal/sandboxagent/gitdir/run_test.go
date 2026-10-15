@@ -322,6 +322,79 @@ func TestRun_SyncsAgentHeadInBeforeEverySpawn(t *testing.T) {
 	}
 }
 
+// TestRun_RuntimeOnAPlusPrefixedBranch_AgentGitStillRuns: git lets the
+// runtime check out a branch whose name begins with "+" (`git checkout -b
+// +wip`), so a HEAD reading "ref: refs/heads/+wip" is one git itself wrote.
+// SyncHeadIn checks it with git's own branch-name rule
+// (reposource.ValidateBranchName), not with the push rule that refuses a
+// leading "+" -- that name never becomes a refspec here. So with the
+// runtime on +wip, SyncHeadIn copies the HEAD in, Run still runs a
+// `rev-parse HEAD`, a push of the session's own branch and checkouts whose
+// HEAD SyncHeadOut writes back, and Seed, which a repo_image or
+// snapshot_restore boot runs again, still succeeds.
+func TestRun_RuntimeOnAPlusPrefixedBranch_AgentGitStillRuns(t *testing.T) {
+	base := t.TempDir()
+	workspaceDir := filepath.Join(base, "workspace")
+	wt := filepath.Join(workspaceDir, "repo1")
+	initRunTestRepo(t, wt)
+	runGitForRunTest(t, wt, "branch", "session-branch")
+
+	gitDirRoot := filepath.Join(base, "gitdirs")
+	if err := gitdir.EnsureRoot(gitDirRoot); err != nil {
+		t.Fatalf("gitdir.EnsureRoot: %v", err)
+	}
+	repo := gitdir.Layout{Root: gitDirRoot, WorkspaceDir: workspaceDir}.Repo("repo1")
+	sup := supervisor.New()
+	ctx := context.Background()
+	if err := gitdir.Seed(ctx, sup, repo, "https://example.invalid/repo1.git", nil, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed: %v", err)
+	}
+
+	// The runtime checks out a branch of its own, named as git allows.
+	runGitForRunTest(t, wt, "checkout", "-q", "-b", "+wip")
+	if err := os.WriteFile(filepath.Join(wt, "wip.txt"), []byte("wip\n"), 0o644); err != nil {
+		t.Fatalf("write wip.txt: %v", err)
+	}
+	runGitForRunTest(t, wt, "add", ".")
+	runGitForRunTest(t, wt, "commit", "-qm", "wip")
+	wantSHA := strings.TrimSpace(runGitOutputForRunTest(t, wt, "rev-parse", "HEAD"))
+
+	if err := gitdir.SyncHeadIn(repo); err != nil {
+		t.Fatalf("SyncHeadIn with the runtime on +wip: %v", err)
+	}
+	if got := readAgentHead(t, repo); got != "ref: refs/heads/+wip\n" {
+		t.Fatalf("agent HEAD = %q, want the runtime's own %q", got, "ref: refs/heads/+wip\n")
+	}
+
+	if stdout, _ := runHardened(ctx, t, sup, repo, "rev-parse", "HEAD"); strings.TrimSpace(stdout) != wantSHA {
+		t.Fatalf("Run's rev-parse HEAD = %q, want %q", strings.TrimSpace(stdout), wantSHA)
+	}
+
+	// A push of the session's own branch, through Run as pushOneRepo
+	// pushes, to a local bare repository: the file transport is allowed
+	// for this one command only, as the hardening refuses it.
+	bare := filepath.Join(base, "remote.git")
+	runGitForRunTest(t, base, "init", "-q", "--bare", "-b", "main", bare)
+	runHardened(ctx, t, sup, repo, "-c", "protocol.file.allow=always", "push", "--", bare, "session-branch")
+	if got, want := strings.TrimSpace(runGitOutputForRunTest(t, bare, "rev-parse", "refs/heads/session-branch")),
+		strings.TrimSpace(runGitOutputForRunTest(t, wt, "rev-parse", "session-branch")); got != want {
+		t.Fatalf("the remote's session-branch = %q, want the pushed %q", got, want)
+	}
+
+	// An agent-side checkout writes the HEAD it leaves back to the runtime
+	// (SyncHeadOut) under the same rule: away to the session's branch, and
+	// back to the runtime's own +wip.
+	runHardened(ctx, t, sup, repo, "checkout", "-q", "session-branch")
+	runHardened(ctx, t, sup, repo, "checkout", "-q", "+wip")
+	if got := strings.TrimSpace(runGitOutputForRunTest(t, wt, "symbolic-ref", "HEAD")); got != "refs/heads/+wip" {
+		t.Fatalf("the runtime's HEAD = %q after the agent checked +wip back out, want refs/heads/+wip", got)
+	}
+
+	if err := gitdir.Seed(ctx, sup, repo, "https://example.invalid/repo1.git", nil, 10*time.Second, 5*time.Second); err != nil {
+		t.Fatalf("gitdir.Seed again (a repo_image or snapshot_restore boot) with the runtime on +wip: %v", err)
+	}
+}
+
 // TestRun_SyncsADetachedCheckoutOutToTheRuntime pins SyncHeadOut's two
 // shapes through Run: an agent-side `checkout --detach <sha>` leaves the
 // runtime's own HEAD detached at that sha (a pull request review reads its

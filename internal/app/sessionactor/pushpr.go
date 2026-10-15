@@ -253,6 +253,11 @@ type pushSignal struct {
 	// warning event) and a caller should never need to guess which from
 	// a shared value.
 	blockedNoGitHubIdentity bool
+	// blockedRefusedBranch is the same shape of decision again: a repo's
+	// stored branch is one reposource.ValidateBranch refuses (see
+	// refusedPushBranches), so no push command is sent for this cycle and
+	// a session-visible warning naming it was already recorded.
+	blockedRefusedBranch bool
 }
 
 // repoHasExplicitBranch reports whether r names an explicit, non-empty
@@ -570,6 +575,24 @@ func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRo
 		return nil, nil
 	}
 
+	// A stored branch the push rule refuses never reaches a sandbox in a
+	// push command (technical plan §35.3: a push is never forced).
+	// Sessions are validated when they are created, but sessions.repos is
+	// never rewritten, so a session created before the rule tightened can
+	// still name "+main", and a sandbox restored from a snapshot runs the
+	// agent that snapshot was minted with, whose own check may predate the
+	// rule and would push it as a forced refspec. Decided here, before
+	// the egress mode, because it holds in shadow as in live: nothing
+	// would have been pushed either way, so no suppressed-push row is
+	// written. One session-visible warning per completed turn names each
+	// refused branch and why, and no delivery is stamped.
+	if refused := refusedPushBranches(repos); len(refused) > 0 {
+		if err := a.recordSessionWarning(ctx, tx, int(sandboxRow.Gen), refusedPushBranchWarning(refused)); err != nil {
+			return nil, err
+		}
+		return &pushSignal{gen: int(sandboxRow.Gen), repos: repos, blockedRefusedBranch: true}, nil
+	}
+
 	// §30.8's own epoch discipline, applied to this turn's own push/PR
 	// pair: "the push/PR pair resolves its mode ONCE per turn... resolved
 	// at push send, persisted with the signal, and createPRBestEffort
@@ -731,6 +754,38 @@ func (a *Actor) recordPushBlockedNoGitHubIdentity(ctx context.Context, tx pgx.Tx
 // pushBlockedNoGitHubIdentityWarning is recordPushBlockedNoGitHubIdentity's
 // session-visible text.
 const pushBlockedNoGitHubIdentityWarning = "This session's creator has no linked GitHub account, so this push could not be authenticated. Sign in with GitHub (the ordinary GitHub sign-in) to link one, then retry."
+
+// refusedPushBranches lists, for each repo whose explicit branch
+// reposource.ValidateBranch refuses, the repo, the branch and git's reason
+// -- the push-rule gate completeProcessingTurn applies before any push
+// command is sent. A repo with no explicit branch is never pushed
+// (repoHasExplicitBranch), so it is never listed.
+func refusedPushBranches(repos []sessionconfig.SessionConfigReposElem) []string {
+	var refused []string
+	for _, r := range repos {
+		if !repoHasExplicitBranch(r) {
+			continue
+		}
+		err := reposource.ValidateBranch(*r.Branch)
+		if err == nil {
+			continue
+		}
+		reason := err.Error()
+		var refErr *reposource.InvalidRefError
+		if errors.As(err, &refErr) {
+			reason = strings.TrimPrefix(refErr.Reason.Error(), "reposource: ")
+		}
+		refused = append(refused, fmt.Sprintf("repo %q has branch %q (%s)", r.Name, *r.Branch, reason))
+	}
+	return refused
+}
+
+// refusedPushBranchWarning is the session-visible text recorded when
+// refusedPushBranches refuses at least one repo's branch.
+func refusedPushBranchWarning(refused []string) string {
+	return "This turn's push was not sent: " + strings.Join(refused, "; ") +
+		". Narvi never pushes a branch named like that, so nothing was pushed, and the changes stay in this session's sandbox."
+}
 
 // reviewSessionReadOnlyWarning is what a pull request's review session
 // records when a turn that is not a review attempt completes in it
@@ -926,6 +981,14 @@ func (a *Actor) sendPushBestEffort(ctx context.Context, sessionID string, sig *p
 		// call). Nothing to do here but not send a push command certain
 		// to fail against a credential this session's creator cannot
 		// obtain (review round 2, finding P1).
+		return
+	}
+
+	if sig.blockedRefusedBranch {
+		// A repo's stored branch is one the push rule refuses; the
+		// warning naming it was written in completeProcessingTurn's
+		// transaction. No command is sent, whatever agent the sandbox
+		// runs (technical plan §35.3).
 		return
 	}
 

@@ -1946,6 +1946,24 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		r.Get("/", httpapi.GetIntegrations(cfg, outboxStore, webhookDeliveryStore))
 	})
 
+	// /api/autonomy[/freeze|/unfreeze] (technical plan §40.2): the
+	// platform-wide autonomy freeze -- see httpapi/autonomyfreeze.go's own
+	// doc comment. Deployment-wide like /api/members above, gated behind
+	// auth.Middleware only, with each handler rendering its own verdict:
+	// every signed-in role reads the freeze (authz.ActionViewSessions, the
+	// decision inbox shows every role the same banner); freezing and
+	// lifting it are admin only (authz.ActionManageAutonomyFreeze, §13.3),
+	// each audited in its own transaction. platformSettingsStore is the
+	// one row every automatic-action site reads (internal/app/autonomy.Gate
+	// builds its own from the pool) and the decision inbox reads below.
+	platformSettingsStore := postgres.NewPlatformSettingsStore(pool)
+	router.Route("/api/autonomy", func(r chi.Router) {
+		r.Use(auth.Middleware(userSessionStore, userStore))
+		r.Get("/", httpapi.GetAutonomyFreeze(platformSettingsStore))
+		r.Post("/freeze", httpapi.PostFreezeAutonomy(pool, platformSettingsStore, auditLogStore))
+		r.Post("/unfreeze", httpapi.PostUnfreezeAutonomy(pool, platformSettingsStore, auditLogStore))
+	})
+
 	// /api/capabilities (technical plan §34, docs/design/
 	// boundaries-design.md, section 4): the extension & licensing
 	// boundaries surface's own derived read model -- one row per
@@ -2048,7 +2066,12 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		Identities:            identityStore,
 		GitHubPRSessions:      githubPRSessionStore,
 		ReleaseManifestChecks: releaseManifestCheckStore,
-		SCMCache:              decisionInboxSCMCache,
+		// PlatformSettings/Workflows (§40.2): the freeze's banner, the held
+		// mark on armed ready_to_merge rows, and the workflow advances the
+		// freeze holds (internal/app/decisioninbox, freeze.go).
+		PlatformSettings: platformSettingsStore,
+		Workflows:        workflowStore,
+		SCMCache:         decisionInboxSCMCache,
 		// GitHubOutbound: the bot credential the inbox's read model reads a
 		// base branch's required checks with (§21.2). nil with GitHub
 		// outbound off: the inbox then reads none and says so

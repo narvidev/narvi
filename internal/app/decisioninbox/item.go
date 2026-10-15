@@ -211,6 +211,15 @@ type Item struct {
 	// every other row, and whenever GitHub outbound is on.
 	MergeableIfRequiredChecksPass bool
 
+	// HeldByFreeze is true on a ready_to_merge row whose repository has
+	// auto-merge armed while autonomy is frozen (technical plan §40.2,
+	// markHeldByFreeze): the auto-merge worker would merge it, and the
+	// freeze holds that merge. The row stays listed, and a person's own
+	// Merge click still merges it -- the freeze never holds a person. False
+	// on every other row, and on every row when the freeze is not set or
+	// could not be read.
+	HeldByFreeze bool
+
 	// IsRelease is true iff this PR-shaped row is a release cut (§15)
 	// whose §15.2 manifest check has already been computed and persisted
 	// -- see resolveReleaseCut's own doc comment (aggregate.go) for the

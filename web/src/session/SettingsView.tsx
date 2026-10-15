@@ -22,21 +22,26 @@
 //
 // mockups.html's own Settings nav draws 8 entries (General, Environments,
 // Secrets, Members & access, Integrations, Models, Prompt templates,
-// Image builds). Three of those have no backing surface: General/Models/
-// Image builds name no §-cited data model anywhere in this screen's own
-// scope (§14.1, §14.2, §21, §24, §27), and building one would be
-// inventing scope, not implementing it. Integrations (Slack/Linear/GitHub
+// Image builds). Two of those have no backing surface: Models/Image
+// builds name no §-cited data model anywhere in this screen's own scope
+// (§14.1, §14.2, §21, §24, §27), and building one would be inventing
+// scope, not implementing it. General hosts the platform-wide settings,
+// platform_settings' one row (technical plan §40.2): today the autonomy
+// freeze card (AutonomyFreezePanel.tsx). Integrations (Slack/Linear/GitHub
 // ingress, ChatGPT-account linking, cloud-identity signing-key rotation --
 // §12.5, §29.3/§29.9, §27.3/§27.8) DOES have a real surface, on its own
 // screen (IntegrationsPanel.tsx), because those surfaces share one shape
 // -- connect, verify, show liveness, disconnect -- that nothing else on
 // this Settings screen claims. All 8 tabs are still drawn (visual parity
 // with the mockup, which the UI phase's own screenshot-review exit
-// criterion requires), but the 3 without a real surface render an
+// criterion requires), but the 2 without a real surface render an
 // explicit, honest "not built here" notice naming where that surface
 // actually lives -- never a fabricated panel.
 import { useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
 
+import { meQueryOptions } from '../auth/session'
+import { AutonomyFreezePanel } from './AutonomyFreezePanel'
 import { EnvironmentsPanel } from './EnvironmentsPanel'
 import { IntegrationsPanel } from './IntegrationsPanel'
 import { MembersPanel } from './MembersPanel'
@@ -76,6 +81,12 @@ function NotBuiltYet({ note }: { note: string }) {
   )
 }
 
+/** GeneralTab is Settings → General: the platform-wide settings, the autonomy freeze among them (§40.2), every role reading it and an administrator changing it. */
+function GeneralTab() {
+  const meQuery = useQuery(meQueryOptions)
+  return <AutonomyFreezePanel role={meQuery.data?.role} />
+}
+
 export function SettingsView() {
   const [tab, setTab] = useState<SettingsTab>('environments')
 
@@ -91,7 +102,7 @@ export function SettingsView() {
             ))}
           </nav>
           <div className="setbody">
-            {tab === 'general' && <NotBuiltYet note="There are no org-wide general settings. Everything configurable today is scoped to an environment, a repository or a member." />}
+            {tab === 'general' && <GeneralTab />}
             {tab === 'environments' && <EnvironmentsPanel />}
             {tab === 'secrets' && <SecretsPanel />}
             {tab === 'members' && <MembersPanel />}

@@ -139,6 +139,17 @@ type Deps struct {
 	// mirroring GitHubPRSessions above).
 	ReleaseManifestChecks *postgres.ReleaseManifestCheckStore
 
+	// PlatformSettings backs the autonomy freeze's banner and held rows
+	// (technical plan §40.2, freeze.go): Build reads the freeze once per
+	// load, with no cache. nil reads as a freeze that could not be read
+	// (Result.AutonomyFreezeUnread), never as "not frozen".
+	PlatformSettings *postgres.PlatformSettingsStore
+	// Workflows backs Result.HeldWorkflowAdvances (§40.2, §25.9): the
+	// workflow runs whose automatic advance the freeze holds. Optional
+	// (nil-safe, mirroring GitHubPRSessions above): without it, no held
+	// advance is listed.
+	Workflows *postgres.WorkflowStore
+
 	SCMCache *SCMCache
 
 	// GitHubOutbound is §12.5's GitHub outbound axis: the bot credential
@@ -263,6 +274,25 @@ type Result struct {
 	DecisionLatencyMedian     time.Duration
 	DecisionLatencySampleSize int
 	DecisionLatencyComputed   bool
+
+	// AutonomyFreeze is the autonomy freeze as this load read it (technical
+	// plan §40.2, freeze.go), once and with no cache, the same for every
+	// role: a client shows one banner while it is frozen. Its zero value
+	// reads not frozen.
+	AutonomyFreeze sqlcgen.GetAutonomyFreezeRow
+	// AutonomyFreezeUnread is true when the freeze could not be read for
+	// this load: AutonomyFreeze then reads not frozen only because nothing
+	// was read, and a client says the state is unknown -- a failed read
+	// never renders as "not frozen". No row is marked held then
+	// (Item.HeldByFreeze), since nothing says the freeze holds it.
+	AutonomyFreezeUnread bool
+	// HeldWorkflowAdvances are the workflow runs whose automatic advance the
+	// freeze holds (§40.2, §25.9), on sessions the actor may decide
+	// workflow steps on, oldest first, at most maxHeldWorkflowAdvances --
+	// see buildHeldWorkflowAdvances. HeldWorkflowAdvancesTotal is how many
+	// there are: more than the list holds when the bound cut it.
+	HeldWorkflowAdvances      []HeldWorkflowAdvance
+	HeldWorkflowAdvancesTotal int
 }
 
 // Build assembles, ranks, and returns the full decision inbox for
@@ -270,6 +300,10 @@ type Result struct {
 // comment for the full per-kind design.
 func Build(ctx context.Context, deps Deps, actorUserID pgtype.UUID, actorRole authz.Role, now time.Time) (Result, error) {
 	logger := platform.Logger(ctx)
+
+	// The freeze is read once, first, for the whole load (§40.2): the
+	// banner and every row's held mark come from this one read.
+	freeze, freezeUnread := readAutonomyFreeze(ctx, deps)
 
 	var items []Item
 	var scmAsOf *time.Time
@@ -316,6 +350,9 @@ func Build(ctx context.Context, deps Deps, actorUserID pgtype.UUID, actorRole au
 		items = append(items, buildAttentionItems(ctx, deps, now, logger)...)
 	}
 
+	markHeldByFreeze(ctx, deps, items, freeze.AutonomyFrozen)
+	heldAdvances, heldAdvancesTotal := buildHeldWorkflowAdvances(ctx, deps, actorUserID, actorRole, logger)
+
 	items = rank(items)
 
 	median, sampleSize, computed, err := Metrics(ctx, deps, now)
@@ -331,6 +368,10 @@ func Build(ctx context.Context, deps Deps, actorUserID pgtype.UUID, actorRole au
 		DecisionLatencyMedian:     median,
 		DecisionLatencySampleSize: sampleSize,
 		DecisionLatencyComputed:   computed,
+		AutonomyFreeze:            freeze,
+		AutonomyFreezeUnread:      freezeUnread,
+		HeldWorkflowAdvances:      heldAdvances,
+		HeldWorkflowAdvancesTotal: heldAdvancesTotal,
 	}, nil
 }
 

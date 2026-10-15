@@ -904,6 +904,16 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
 		r.Get("/", httpapi.GetIntegrations(rig.cfg, rig.outbox, rig.webhookDeliveries))
 	})
+	// /api/autonomy[/freeze|/unfreeze] (§40.2) -- mounted behind
+	// auth.Middleware, exactly like controlplane/serve.go's own wiring (see
+	// autonomyfreeze.go's own doc comment).
+	router.Route("/api/autonomy", func(r chi.Router) {
+		r.Use(auth.Middleware(rig.userSessions, rig.users))
+		settings := narvipg.NewPlatformSettingsStore(rig.pool)
+		r.Get("/", httpapi.GetAutonomyFreeze(settings))
+		r.Post("/freeze", httpapi.PostFreezeAutonomy(rig.pool, settings, rig.auditLog))
+		r.Post("/unfreeze", httpapi.PostUnfreezeAutonomy(rig.pool, settings, rig.auditLog))
+	})
 	// /api/repos/{owner}/{repo}/false-positive-patterns (§22.4) --
 	// mounted behind auth.Middleware, exactly like cmd/control-plane/
 	// main.go's own wiring (see falsepositivepatterns.go's own doc

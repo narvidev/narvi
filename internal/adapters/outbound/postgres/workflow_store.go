@@ -369,6 +369,19 @@ func (s *WorkflowStore) ReleaseAdvanceHold(ctx context.Context, runID pgtype.UUI
 	return s.q.ReleaseWorkflowAdvanceHold(ctx, runID)
 }
 
+// ListAdvanceHoldsForInbox returns at most limit held advances, oldest
+// first, each with its run's workflow name and its session's title, for the
+// decision inbox (technical plan §40.2, §16): every hold when everySession
+// is true, otherwise only those on sessions actorUserID created or joined.
+// Each row's OwnedOrJoined says which, for the caller's authorization.
+func (s *WorkflowStore) ListAdvanceHoldsForInbox(ctx context.Context, actorUserID pgtype.UUID, everySession bool, limit int32) ([]sqlcgen.ListWorkflowAdvanceHoldsForInboxRow, error) {
+	return s.q.ListWorkflowAdvanceHoldsForInbox(ctx, sqlcgen.ListWorkflowAdvanceHoldsForInboxParams{
+		ActorUserID:  actorUserID,
+		EverySession: everySession,
+		MaxHolds:     limit,
+	})
+}
+
 // DeleteAdvanceHoldsForStopRequest deletes every advance sessionID holds,
 // whatever its held_at -- the stop request's own drop, under the session's
 // actor-epoch lock -- and returns their runs.
