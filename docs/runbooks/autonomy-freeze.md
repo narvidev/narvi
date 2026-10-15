@@ -208,21 +208,40 @@ included.
 
 ## Rolling back
 
-### Rolling back past the admin action: unfreeze first
+### Rolling back past the admin action
 
 The release before the admin action (the Settings card and
-`/api/autonomy`) still reads the freeze at every site, but has no way to
-show it or lift it: no route, no card, no banner. Rolling back to it changes
-nothing in `platform_settings`, so **a freeze in force stays in force**, and
-every automatic action stays held, with nothing in the product to say why or
-to end it.
+`/api/autonomy`) still reads the freeze at every site, the workflow advance
+included, but has no way to show it or lift it: no route, no card, no
+banner. Rolling back to it changes nothing in `platform_settings`, so **a
+freeze in force stays in force**, and every automatic action stays held.
 
-So **unfreeze before rolling back past the admin action**: Settings →
-General → Unfreeze, or `POST /api/autonomy/unfreeze`. Its `autonomy.unfrozen`
-audit row records what was lifted. If the incident still needs everything
-automatic held across the rollback, turn off auto-merge and the other
-automatic toggles per repository, and pause automations, instead of keeping
-the freeze.
+Unfreezing is not the same as turning automatic actions off. **Two kinds of
+held work start again within about a minute of an unfreeze, whatever the
+per-repository toggles say:**
+
+- **Held workflow advances.** No toggle governs a workflow run. The
+  releaser applies each held advance on its next tick and the run's next
+  attempt starts.
+- **Held sentinel auto-fix deliveries.** Their delivery does not read
+  `sentinel_autofix_enabled` again: turning the toggle off after a fix was
+  enqueued does not stop its branch and its fix session.
+
+Auto-merge, the description rewrite and the automatic re-review do read
+their toggles again, and a paused automation neither fires nor fans out. So
+choose by what the incident needs:
+
+- **To keep everything automatic held across the rollback, keep the
+  freeze.** Roll back while frozen: the older release honours it. Once the
+  incident allows, lift it there with the statement below.
+- **Otherwise, unfreeze before rolling back**: Settings → General →
+  Unfreeze, or `POST /api/autonomy/unfreeze`. Its `autonomy.unfrozen` audit
+  row records what was lifted. First stop every session whose held work must
+  not move: a person's stop drops the session's held workflow advances and
+  cancels their runs, and stopping a pull request's review session makes
+  the sentinel fix it would start skip for good (its fix branch may still
+  be created, unused). Then turn off the toggles and pause the automations
+  the incident needs off.
 
 If a rollback already happened with the freeze on, the older release has one
 way to lift it: this statement, on the control plane's database. It is the
