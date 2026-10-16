@@ -2387,6 +2387,8 @@ type Sandbox struct {
 	SnapshotRuntimeVersion        *string              `json:"snapshot_runtime_version"`
 	SnapshotMintedAt              pgtype.Timestamptz   `json:"snapshot_minted_at"`
 	SkipRepoHooksGen              *int32               `json:"skip_repo_hooks_gen"`
+	SkipRepoHooksToldGen          *int32               `json:"skip_repo_hooks_told_gen"`
+	SnapshotSkippedRepoHooks      *bool                `json:"snapshot_skipped_repo_hooks"`
 }
 
 type SandboxHistory struct {

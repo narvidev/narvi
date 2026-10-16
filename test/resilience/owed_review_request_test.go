@@ -123,9 +123,10 @@ func TestOwedReviewRequest_ARestartBetweenTheMoveAndTheReRunLosesNothing(t *test
 	if _, err := h.Sandboxes.Create(ctx, session.ID); err != nil {
 		t.Fatal(err)
 	}
-	// A current agent's gen: its ready advertised it honours
-	// SESSION_CONFIG's skipRepoHooks (technical plan §6.4).
-	if _, err := h.Pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', gen = 1, skip_repo_hooks_gen = 1 WHERE session_id = $1`, session.ID); err != nil {
+	// A gen this release spawned, booted by a current agent: told to skip
+	// the repository's hooks, as the session's unrecorded claim does, and
+	// its ready advertised it honours that (technical plan §6.4).
+	if _, err := h.Pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', gen = 1, skip_repo_hooks_gen = 1, skip_repo_hooks_told_gen = 1 WHERE session_id = $1`, session.ID); err != nil {
 		t.Fatal(err)
 	}
 	// The review the request waited behind: created before it, ended after

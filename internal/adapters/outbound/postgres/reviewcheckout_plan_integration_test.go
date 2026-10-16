@@ -18,8 +18,9 @@ import (
 // checkoutPlanVersion is the migration the review checkout's plan test
 // migrates to: the latest whose columns its statements name -- 000167 and
 // 000168 add the checkout's, and ClearSandboxSnapshot clears the
-// snapshot's provenance too, which snapshotProvenanceMigration adds.
-const checkoutPlanVersion = snapshotProvenanceMigration
+// snapshot's provenance too, which snapshotProvenanceMigration adds and
+// repoHooksLineageMigration extends with snapshot_skipped_repo_hooks.
+const checkoutPlanVersion = repoHooksLineageMigration
 
 // The review checkout's statements, each the only access of its rows in
 // its transaction, read by key alone (technical plan §21.1):

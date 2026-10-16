@@ -323,6 +323,13 @@ func newScenario24Rig(ctx context.Context, t *testing.T) *scenario24Rig {
 	if _, err := h.Sandboxes.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{SessionID: session.ID, Status: sqlcgen.SandboxStatusReady}); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
 	}
+	// A gen this release spawned: its SESSION_CONFIG told it to skip the
+	// repository's hooks, as the session's unrecorded claim has it boot
+	// (technical plan §6.4), which the session actor asks of a review
+	// session's gen before it sends a turn.
+	if _, err := h.Pool.Exec(ctx, `UPDATE sandboxes SET skip_repo_hooks_told_gen = gen WHERE session_id = $1`, session.ID); err != nil {
+		t.Fatalf("record what the gen was told: %v", err)
+	}
 
 	// The boot: a review session's repo carries the pull request's ref, so
 	// the workspace is the base repository at the ref's tip.

@@ -223,6 +223,13 @@ RETURNING *;
 -- read "provenance unknown" rather than the snapshot before it. Never a
 -- version the control plane holds. Named arguments only: sqlc does not
 -- mix them with $n.
+--
+-- snapshot_skipped_repo_hooks (technical plan §6.4, §27.1, migrations/
+-- 000174_sandbox_repo_hooks_lineage.up.sql) is part of that provenance:
+-- whether the gen that minted the snapshot -- the live gen, whose row this
+-- is -- booted without the repository's hooks, read from the row as it is
+-- before this write: it was told to (skip_repo_hooks_told_gen = gen) and
+-- its ready advertised it honours that (skip_repo_hooks_gen = gen).
 UPDATE sandboxes
 SET snapshot_id = sqlc.arg('snapshot_id'),
     snapshot_suppressed_in_shadow = sqlc.arg('snapshot_suppressed_in_shadow'),
@@ -230,6 +237,7 @@ SET snapshot_id = sqlc.arg('snapshot_id'),
     snapshot_provenance_id = sqlc.arg('snapshot_id'),
     snapshot_agent_protocol = sqlc.narg('agent_protocol'),
     snapshot_runtime_version = sqlc.narg('runtime_version'),
+    snapshot_skipped_repo_hooks = COALESCE(skip_repo_hooks_told_gen = gen AND skip_repo_hooks_gen = gen, false),
     snapshot_minted_at = now(),
     updated_at = now()
 WHERE session_id = sqlc.arg('session_id')
@@ -552,6 +560,7 @@ SET snapshot_id = NULL,
     snapshot_provenance_id = NULL,
     snapshot_agent_protocol = NULL,
     snapshot_runtime_version = NULL,
+    snapshot_skipped_repo_hooks = NULL,
     snapshot_minted_at = NULL,
     updated_at = now()
 WHERE session_id = sqlc.arg('session_id') AND snapshot_id = sqlc.arg('snapshot_id')::text;
@@ -631,3 +640,24 @@ UPDATE sandboxes
 SET image_decision_reason = $2, image_decision_fingerprint = $3, updated_at = now()
 WHERE session_id = $1
 RETURNING *;
+
+-- name: RecordSandboxRepoHooksTold :exec
+-- Technical plan §6.4, §27.1 (migrations/000174_sandbox_repo_hooks_lineage.up.sql):
+-- records whether the SESSION_CONFIG the session actor just assembled for
+-- gen $gen told it to boot without the repository's hooks, in the
+-- transaction that spawns or restores that gen, right after the upsert
+-- that bumped it. Guarded on gen, as RecordSandboxReady is.
+UPDATE sandboxes
+SET skip_repo_hooks_told_gen = CASE WHEN sqlc.arg('skip_repo_hooks')::boolean THEN gen ELSE NULL END,
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;
+
+-- name: CarrySandboxRepoHooksTold :exec
+-- Technical plan §6.4, §27.1: a resume boots nothing and delivers no
+-- SESSION_CONFIG, so the resumed gen $gen was told what the gen it
+-- resumes, $from_gen, was told. Run in the resume's claim, after the
+-- upsert that bumped the gen; guarded on it.
+UPDATE sandboxes
+SET skip_repo_hooks_told_gen = CASE WHEN skip_repo_hooks_told_gen = sqlc.arg('from_gen')::integer THEN gen ELSE NULL END,
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;

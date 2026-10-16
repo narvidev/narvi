@@ -395,6 +395,19 @@ func (a *Actor) assembleSessionConfig(
 	ctx context.Context, tx pgx.Tx,
 	sessionRow sqlcgen.Session, gen int, plaintextToken, sandboxID string, bootMode sessionconfig.SessionConfigBootMode,
 ) (sessionconfig.SessionConfig, error) {
+	prSession, claimReadFailed := a.reviewClaim(ctx, tx, sessionRow)
+	return a.assembleSessionConfigWithClaim(ctx, tx, sessionRow, gen, plaintextToken, sandboxID, bootMode, prSession, claimReadFailed)
+}
+
+// assembleSessionConfigWithClaim is assembleSessionConfig once the
+// session's pull request claim is read: prSession, nil for none, and
+// claimReadFailed when the read failed, which skipRepoHooks fails closed
+// on.
+func (a *Actor) assembleSessionConfigWithClaim(
+	ctx context.Context, tx pgx.Tx,
+	sessionRow sqlcgen.Session, gen int, plaintextToken, sandboxID string, bootMode sessionconfig.SessionConfigBootMode,
+	prSession *sqlcgen.GithubPrSession, claimReadFailed bool,
+) (sessionconfig.SessionConfig, error) {
 	wsBase, err := publicWsBaseURL(a.publicBaseURL)
 	if err != nil {
 		return sessionconfig.SessionConfig{}, err
@@ -405,7 +418,6 @@ func (a *Actor) assembleSessionConfig(
 		return sessionconfig.SessionConfig{}, err
 	}
 
-	prSession, claimReadFailed := a.reviewClaim(ctx, tx, sessionRow)
 	if len(repos) > 0 {
 		repos[0].Ref = pullRequestRef(prSession, repos[0])
 	}

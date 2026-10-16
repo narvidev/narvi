@@ -1266,6 +1266,19 @@ func (a *Actor) tryPlanSpawn(
 		}
 	}
 
+	// Technical plan §6.4, §27.1: a restore that is still a restore crosses
+	// no boundary of the repository's hooks -- a session that skips them
+	// never restores a snapshot whose agent or gen ran them, and one that
+	// runs them never restores one whose gen skipped them
+	// (repohooksgate.go). Decided here, before the restored gen boots: the
+	// dispatch gate only sees a gen after its boot.
+	if action.Kind == sandbox.SpawnActionRestore {
+		if hooksRefusal := a.repoHooksRestoreRefusal(ctx, tx, sessionRow, sandboxRow, action.SnapshotImageID); hooksRefusal != nil {
+			refusal, restoreDecision = hooksRefusal, nil
+			action = sandbox.SpawnAction{Kind: sandbox.SpawnActionSpawn}
+		}
+	}
+
 	switch action.Kind {
 	case sandbox.SpawnActionSpawn:
 		plan, err := a.planFreshSpawn(ctx, tx, sessionRow, hasSandbox, sandboxRow, now)
@@ -1851,6 +1864,11 @@ func (a *Actor) planFreshSpawn(
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: assemble session config: %w", err)
 	}
+	// Technical plan §6.4, §27.1: what this gen is told of the
+	// repository's hooks, recorded with the gen (repohooksgate.go).
+	if err := a.stores.sandbox.WithTx(tx).RecordRepoHooksTold(ctx, a.sessionID, row.Gen, cfg.SkipRepoHooks); err != nil {
+		return nil, fmt.Errorf("sessionactor: record what the gen is told of the repository's hooks: %w", err)
+	}
 
 	// Docker/EgressPolicy are threaded from cfg's own just-assembled
 	// fields (§27.5/§27.6) -- the SAME deliberate top-level
@@ -1938,6 +1956,10 @@ func (a *Actor) planRestore(
 	cfg, err := a.assembleSessionConfig(ctx, tx, sessionRow, int(row.Gen), token, row.ID.String(), sessionconfig.SessionConfigBootModeSnapshotRestore)
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: assemble session config: %w", err)
+	}
+	// Technical plan §6.4, §27.1: as planFreshSpawn's.
+	if err := a.stores.sandbox.WithTx(tx).RecordRepoHooksTold(ctx, a.sessionID, row.Gen, cfg.SkipRepoHooks); err != nil {
+		return nil, fmt.Errorf("sessionactor: record what the gen is told of the repository's hooks: %w", err)
 	}
 
 	// Docker/EgressPolicy are threaded from cfg's own just-assembled
@@ -2048,6 +2070,12 @@ func (a *Actor) planResume(
 		// writer, per §2 -- mirroring planRestore's own identical
 		// defensive check.
 		return nil, fmt.Errorf("sessionactor: resume gen mismatch: validated %d, upsert produced %d", newGen, row.Gen)
+	}
+	// Technical plan §6.4, §27.1: a resume boots nothing and delivers no
+	// SESSION_CONFIG, so the resumed gen was told what the gen it resumes
+	// was told of the repository's hooks (repohooksgate.go).
+	if err := a.stores.sandbox.WithTx(tx).CarryRepoHooksTold(ctx, a.sessionID, sandboxRow.Gen, row.Gen); err != nil {
+		return nil, fmt.Errorf("sessionactor: carry what the gen was told of the repository's hooks: %w", err)
 	}
 
 	// Same reasoning as planFreshSpawn/planRestore's own identical call: a

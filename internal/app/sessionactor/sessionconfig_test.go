@@ -320,3 +320,40 @@ func TestPullRequestRef(t *testing.T) {
 		})
 	}
 }
+
+// TestAssembleSessionConfig_SkipRepoHooksFailsClosedOnAClaimReadFailure:
+// SESSION_CONFIG's skipRepoHooks is decided from the session's pull
+// request claim (technical plan §6.4, §27.1), and a claim that could not
+// be read is not known to be in the base, so the session boots without
+// the repository's hooks; with no claim, or a same-repository claim
+// recorded in the base, it boots with them.
+func TestAssembleSessionConfig_SkipRepoHooksFailsClosedOnAClaimReadFailure(t *testing.T) {
+	t.Parallel()
+	inBase, notInBase := true, false
+	sameRepo := sessionRowWithRepos(t, `[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":"feature-x"}]`)
+	for _, tc := range []struct {
+		name       string
+		claim      *sqlcgen.GithubPrSession
+		readFailed bool
+		want       bool
+	}{
+		{name: "no claim", want: false},
+		{name: "a claim read that failed", readFailed: true, want: true},
+		{name: "a same-repository claim recorded in the base", claim: &sqlcgen.GithubPrSession{RepoFullName: "acme/widgets", PrNumber: 7, HeadInBase: &inBase}, want: false},
+		{name: "a claim recorded not in the base", claim: &sqlcgen.GithubPrSession{RepoFullName: "acme/widgets", PrNumber: 7, HeadInBase: &notInBase}, want: true},
+		{name: "a claim nothing has recorded", claim: &sqlcgen.GithubPrSession{RepoFullName: "acme/widgets", PrNumber: 7}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			a := &Actor{publicBaseURL: "https://narvi.example.com"}
+			cfg, err := a.assembleSessionConfigWithClaim(context.Background(), nil, sameRepo, 1, "plaintext-token", uuid.NewString(),
+				sessionconfig.SessionConfigBootModeFresh, tc.claim, tc.readFailed)
+			if err != nil {
+				t.Fatalf("assembleSessionConfigWithClaim() error = %v, want nil", err)
+			}
+			if cfg.SkipRepoHooks != tc.want {
+				t.Errorf("SkipRepoHooks = %v, want %v", cfg.SkipRepoHooks, tc.want)
+			}
+		})
+	}
+}

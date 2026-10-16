@@ -128,9 +128,10 @@ func bootWithRepoHooks(t *testing.T, mode sandboxboot.BootMode, serverURL string
 }
 
 // TestRunBootSequence_AReviewSessionWhoseHeadIsNotInItsBaseRunsNoRepositoryHook:
-// in every boot mode, a fork's pull request's review session -- and a claim
-// nothing has recorded, which reads the same -- runs none of the
-// repository's hooks and starts none of its services; a same-repository
+// in every boot mode, a fork's pull request's review session runs none of
+// the repository's hooks and starts none of its services -- as does every
+// session the control plane tells to skip them, a claim nothing has
+// recorded included (TestReviewSessionSkipsRepoHooks); a same-repository
 // pull request's review session, and a session with no pull request, run
 // what the mode runs.
 func TestRunBootSequence_AReviewSessionWhoseHeadIsNotInItsBaseRunsNoRepositoryHook(t *testing.T) {
@@ -144,7 +145,6 @@ func TestRunBootSequence_AReviewSessionWhoseHeadIsNotInItsBaseRunsNoRepositoryHo
 		wantSkip bool
 	}{
 		{name: "a fork's pull request's review session", skip: reposource.ReviewSessionSkipsRepoHooks(true, claim, &notInBase, []byte(forkSpec)), wantSkip: true},
-		{name: "a review session whose claim nothing has recorded", skip: reposource.ReviewSessionSkipsRepoHooks(true, claim, nil, []byte(sameRepoSpec)), wantSkip: true},
 		{name: "a same-repository pull request's review session", skip: reposource.ReviewSessionSkipsRepoHooks(true, claim, &inBase, []byte(sameRepoSpec))},
 		{name: "a session with no pull request", skip: reposource.ReviewSessionSkipsRepoHooks(false, "", nil, []byte(sameRepoSpec))},
 	}

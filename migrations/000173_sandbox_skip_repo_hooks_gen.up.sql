@@ -38,15 +38,16 @@
 --   - Every statement it sends names its columns, so it neither reads nor
 --     writes it.
 --   - Its RecordSandboxReady counts a ready and leaves skip_repo_hooks_gen
---     as it is. A gen whose every ready it recorded reads as unable here:
---     for a session that boots without the repository's hooks, this
---     release retires that gen once, clearing its snapshot, when it has
---     one, and otherwise refuses the turn, naming the remedy. A gen this
---     release recorded capable keeps that through a ready the previous
---     binary records: the same gen is the same agent.
+--     as it is. A gen whose every ready it recorded reads as unable here.
+--     A gen this release recorded capable keeps that through a ready the
+--     previous binary records: the same gen is the same agent.
 --   - It writes no skipRepoHooks into a SESSION_CONFIG, so a gen it spawns
---     runs the repository's hooks as before; this release then sends that
---     gen a turn of such a session only if its agent advertised the key.
+--     runs the repository's hooks as before, whatever its agent can do.
+--     The capability says nothing of what a boot did; what a gen was told
+--     is recorded apart (migrations/000174_sandbox_repo_hooks_lineage), and
+--     a gen of a session that boots without the hooks is sent a turn only
+--     when it was told to skip them and advertised it honours that -- the
+--     previous binary's gens, told nothing, are retired.
 --
 -- # Rolling back
 --

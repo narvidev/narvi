@@ -60,15 +60,20 @@ const (
 	legacySpec = `[{"url": "https://github.com/contributor/widgets.git", "name": "widgets", "branch": "main"}]`
 )
 
-// TestSpawn_ALegacyForkReviewSessionIsRestoredOntoItsBaseRepository: the
-// session's sandbox stopped with a snapshot; its next gen is a restore,
-// whose SESSION_CONFIG names the base repository and the pull request's
-// ref, and the stored spec is moved in the same transaction, its branch
-// dropped and its name kept. The base repository is live and the fork has
-// no settings: the restore's own egress check, which reads the spec, sees
-// the base -- read before the move, the fork would resolve shadow and turn
-// the restore into a fresh spawn.
-func TestSpawn_ALegacyForkReviewSessionIsRestoredOntoItsBaseRepository(t *testing.T) {
+// TestSpawn_ALegacyForkReviewSessionWithASnapshotSpawnsFreshOntoItsBaseRepository:
+// the session's sandbox stopped with a snapshot; its next gen's
+// SESSION_CONFIG names the base repository and the pull request's ref, and
+// the stored spec is moved in the same transaction, its branch dropped and
+// its name kept. The session boots without the repository's hooks, and the
+// snapshot holds nothing that says its agent does -- a legacy fork
+// session's snapshot never can, since its gens were spawned by the previous
+// binary -- so the next gen spawns fresh, told to skip them, and the
+// snapshot is cleared (technical plan §6.4, §27.1). The base repository is
+// live and the fork has no settings: the egress check, which reads the
+// spec, sees the base -- read before the move, the fork would resolve
+// shadow, and the refusal would be the shadow downgrade's, which keeps the
+// snapshot.
+func TestSpawn_ALegacyForkReviewSessionWithASnapshotSpawnsFreshOntoItsBaseRepository(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
 	sessionID := legacyForkReviewSession(ctx, t, pool, 21)
@@ -78,7 +83,7 @@ func TestSpawn_ALegacyForkReviewSessionIsRestoredOntoItsBaseRepository(t *testin
 	createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, "review the pull request")
 	seedStoppedSandboxWithSnapshot(ctx, t, pool, sessionID, "snap-legacy-fork")
 
-	provider := &fakeSpawnProvider{nextRestoreRef: ports.SandboxRef{ProviderID: "restored-legacy-fork"}}
+	provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "spawned-legacy-fork"}, nextRestoreRef: ports.SandboxRef{ProviderID: "restored-legacy-fork"}}
 	r := newDispatchTestRegistry(t, ctx, pool, provider, nil)
 	t.Cleanup(func() { _ = r.Shutdown() })
 	a, err := r.GetOrSpawn(ctx, sessionID)
@@ -88,28 +93,51 @@ func TestSpawn_ALegacyForkReviewSessionIsRestoredOntoItsBaseRepository(t *testin
 	sendEnsureDispatched(ctx, t, a)
 	waitUntil(t, 5*time.Second, func() bool { return provider.restoreCallCount()+provider.callCount() > 0 })
 
-	if got := provider.restoreCallCount(); got != 1 || provider.callCount() != 0 {
-		t.Fatalf("restores %d, fresh spawns %d; want the snapshot restored once", got, provider.callCount())
+	if provider.restoreCallCount() != 0 || provider.callCount() != 1 {
+		t.Fatalf("restores %d, fresh spawns %d; want one fresh spawn, the snapshot never restored", provider.restoreCallCount(), provider.callCount())
 	}
-	repos := provider.lastRestoreCall().spec.SessionConfig.Repos
+	cfg := provider.lastSpec().SessionConfig
+	repos := cfg.Repos
 	if len(repos) != 1 || repos[0].Url != "https://github.com/acme/widgets.git" || repos[0].Name != "widgets" ||
 		repos[0].Ref == nil || *repos[0].Ref != "refs/pull/21/head" || repos[0].Branch != nil {
-		t.Fatalf("the restore's SESSION_CONFIG repos = %+v, want widgets at the base repository, refs/pull/21/head, no branch", repos)
+		t.Fatalf("the spawn's SESSION_CONFIG repos = %+v, want widgets at the base repository, refs/pull/21/head, no branch", repos)
+	}
+	if !cfg.SkipRepoHooks {
+		t.Fatal("the spawn's SESSION_CONFIG does not set skipRepoHooks")
 	}
 	if got := storedRepos(ctx, t, pool, sessionID); got != movedSpec {
 		t.Errorf("sessions.repos = %s, want %s", got, movedSpec)
 	}
+	sb, err := narvipg.NewSandboxStore(pool).Get(ctx, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.SnapshotID != nil {
+		t.Errorf("snapshot %v kept, want it cleared: the refusal is the repository hooks', not the shadow downgrade's", *sb.SnapshotID)
+	}
+	if n := countRows(ctx, t, pool, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'warning' AND payload::text LIKE '%without the repository''s hooks%'`, sessionID); n != 1 {
+		t.Errorf("%d warnings naming the repository's hooks, want 1", n)
+	}
 }
 
 // TestDispatch_ALegacyForkReviewSessionIsNeverMovedUnderItsLiveGen: the
-// session's gen is live, booted on the fork's spec; its review turn is
-// dispatched as before -- the prompt, no checkout of a ref its clone's
-// origin does not have -- and its spec is left for its next boot.
+// session's gen is live, booted on the fork's spec by the previous binary,
+// which told it nothing of the repository's hooks, so it ran them. Its
+// review turn is never sent there (technical plan §6.4, §27.1): the gen is
+// retired, and the spec moves onto the base only in the transaction that
+// spawns the next gen, fresh and told to skip the hooks -- never under
+// the live gen.
 func TestDispatch_ALegacyForkReviewSessionIsNeverMovedUnderItsLiveGen(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
 	sessionID := legacyForkReviewSession(ctx, t, pool, 22)
 	seedReadySandbox(ctx, t, pool, sessionID)
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET skip_repo_hooks_told_gen = NULL WHERE session_id = $1`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := narvipg.NewRepoSettingsStore(pool).UpsertLiveEgressEnabled(ctx, legacyBase, true); err != nil {
+		t.Fatalf("promote the base repository live: %v", err)
+	}
 	head := coHead
 	prompt := "review the pull request"
 	created, err := narvipg.NewTurnStore(pool).Create(ctx, sqlcgen.CreateTurnParams{
@@ -121,14 +149,21 @@ func TestDispatch_ALegacyForkReviewSessionIsNeverMovedUnderItsLiveGen(t *testing
 	rig := newContextRig(ctx, t, pool, sessionID, nil)
 
 	deliver(ctx, t, rig.actor, checkoutReady(1, true))
-	if got := sentCommandTypes(t, rig.commander); len(got) != 1 || got[0] != "prompt" {
-		t.Fatalf("commands %v, want the prompt alone", got)
+	if got := sentCommandTypes(t, rig.commander); len(got) != 0 {
+		t.Fatalf("commands %v sent to a gen that booted with the repository's hooks, want none", got)
 	}
-	if got, err := narvipg.NewTurnStore(pool).Get(ctx, created.ID); err != nil || got.Status != sqlcgen.TurnStatusProcessing {
-		t.Fatalf("turn %+v (%v), want processing", got.Status, err)
+	if got, err := narvipg.NewTurnStore(pool).Get(ctx, created.ID); err != nil || got.Status != sqlcgen.TurnStatusPending {
+		t.Fatalf("turn %+v (%v), want pending for the fresh gen", got.Status, err)
 	}
-	if got := storedRepos(ctx, t, pool, sessionID); got != legacySpec {
-		t.Errorf("sessions.repos = %s under the live gen, want it unchanged, %s", got, legacySpec)
+	if rig.provider.callCount() != 1 {
+		t.Fatalf("fresh spawns %d, want the next gen spawned", rig.provider.callCount())
+	}
+	cfg := rig.provider.lastSpec().SessionConfig
+	if len(cfg.Repos) != 1 || cfg.Repos[0].Url != "https://github.com/acme/widgets.git" || !cfg.SkipRepoHooks {
+		t.Fatalf("the fresh gen's SESSION_CONFIG repos %+v, skipRepoHooks %v; want the base repository, told to skip", cfg.Repos, cfg.SkipRepoHooks)
+	}
+	if got := storedRepos(ctx, t, pool, sessionID); got != movedSpec {
+		t.Errorf("sessions.repos = %s once the next gen spawned, want %s", got, movedSpec)
 	}
 }
 

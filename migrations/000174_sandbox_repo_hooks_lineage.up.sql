@@ -1,0 +1,59 @@
+-- Technical plan §6.4, §27.1, §30.4: a pull request's review session whose
+-- head is not in its base repository boots without the repository's hooks
+-- (SESSION_CONFIG's skipRepoHooks), so code the pull request brings never
+-- runs at boot. 000173 records what each gen's agent can do; this records
+-- what each gen was told, and what each snapshot's gen did, so the session
+-- actor never takes "this gen's agent can skip the hooks" for "this gen
+-- skipped them".
+--
+-- sandboxes.skip_repo_hooks_told_gen: the gen whose SESSION_CONFIG this
+-- control plane assembled with skipRepoHooks true, written in the
+-- transaction that spawns or restores that gen (RecordSandboxRepoHooksTold),
+-- NULL when it was assembled without it, and carried to the next gen by a
+-- resume, which boots nothing and delivers no SESSION_CONFIG. A gen of a
+-- session that skips the hooks is sent a turn only when it was told to and
+-- its ready advertised it honours that (skip_repo_hooks_gen); a gen that
+-- was not told -- one the previous binary spawned, which never writes the
+-- key -- ran the hooks, and is retired, its snapshot cleared.
+--
+-- sandboxes.snapshot_skipped_repo_hooks: whether the gen that minted the
+-- sandbox's snapshot booted without the repository's hooks -- it was told
+-- to and advertised it honours that -- written by UpdateSandboxSnapshotID
+-- with the rest of the snapshot's provenance, and read only while
+-- snapshot_provenance_id names that snapshot. A session that skips the
+-- hooks restores only a snapshot whose agent is of protocol 1.28.0 or
+-- later and whose gen skipped them; a session that runs them never
+-- restores one whose gen skipped them, whose lineage never ran setup.sh.
+--
+-- Both nullable, with no default and no backfill: every sandbox reads as
+-- told nothing, and every snapshot as not minted without the hooks, which
+-- is what the previous binary's gens and snapshots are.
+--
+-- # Locks
+--
+-- golang-migrate sends this file as one batch, one implicit transaction.
+-- Each ADD COLUMN, nullable with no default, is a catalog change that
+-- rewrites nothing, but takes ACCESS EXCLUSIVE on sandboxes until the file
+-- ends -- an instant once granted. It waits behind any open transaction
+-- that has read or written sandboxes, and every new read and write of
+-- sandboxes queues behind it; controlplane/migrate.go sets no
+-- lock_timeout. The file touches sandboxes alone, so it holds no lock
+-- another table's waiters could need.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with these columns present: every statement
+-- it sends names its columns, so it neither reads nor writes them. A gen
+-- it spawns is told nothing here, so this release retires it before
+-- sending it a turn of a session that skips the hooks; a snapshot it
+-- records reads, by the id key, as provenance not recorded, which such a
+-- session never restores.
+--
+-- # Rolling back
+--
+-- The previous binary cannot boot on 174 ("no migration found for version
+-- 174"). With the control plane scaled to zero, either keep the columns
+-- (`migrate force 173`; this file, run again, keeps their values) or run
+-- the down (goto 173).
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS skip_repo_hooks_told_gen INTEGER;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_skipped_repo_hooks BOOLEAN;

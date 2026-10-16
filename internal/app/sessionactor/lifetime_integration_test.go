@@ -300,6 +300,11 @@ func TestSandboxLifetime_ReviewSessionTakesItsKindsLifetime(t *testing.T) {
 			}
 			if tc.restore {
 				seedStoppedSandboxWithSnapshot(ctx, t, pool, sessionID, "snap-lifetime-kind")
+				// A snapshot the session may restore: a current agent's,
+				// minted by a gen that booted as the session does -- a review
+				// session's unrecorded claim skips the repository's hooks
+				// (technical plan §6.4).
+				setSnapshotProvenance(ctx, t, pool, sessionID, true, "1.28.0", tc.review)
 			}
 
 			timeouts := platform.DefaultTimeouts()

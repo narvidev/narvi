@@ -88,6 +88,25 @@ func (s *SandboxStore) RecordReady(ctx context.Context, sessionID pgtype.UUID, g
 	})
 }
 
+// RecordRepoHooksTold records whether the SESSION_CONFIG assembled for gen
+// told it to boot without the repository's hooks (technical plan §6.4,
+// §27.1), when gen is still the sandbox's live gen -- see
+// RecordSandboxRepoHooksTold's own generated doc comment.
+func (s *SandboxStore) RecordRepoHooksTold(ctx context.Context, sessionID pgtype.UUID, gen int32, skipRepoHooks bool) error {
+	return s.q.RecordSandboxRepoHooksTold(ctx, sqlcgen.RecordSandboxRepoHooksToldParams{
+		SkipRepoHooks: skipRepoHooks, SessionID: sessionID, Gen: gen,
+	})
+}
+
+// CarryRepoHooksTold gives gen, a resume of fromGen, what fromGen was told
+// of the repository's hooks (technical plan §6.4, §27.1) -- see
+// CarrySandboxRepoHooksTold's own generated doc comment.
+func (s *SandboxStore) CarryRepoHooksTold(ctx context.Context, sessionID pgtype.UUID, fromGen, gen int32) error {
+	return s.q.CarrySandboxRepoHooksTold(ctx, sqlcgen.CarrySandboxRepoHooksToldParams{
+		FromGen: fromGen, SessionID: sessionID, Gen: gen,
+	})
+}
+
 // ClearSnapshot forgets the session's sandbox snapshot snapshotID, with
 // the provenance recorded for it, so the next gen boots fresh rather than
 // restoring it, and reports the rows it wrote: 0 when the sandbox holds no
