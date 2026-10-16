@@ -26,4 +26,5 @@
 -- transaction.
 ALTER TABLE sandboxes DROP COLUMN IF EXISTS snapshot_started_at;
 ALTER TABLE sandboxes DROP COLUMN IF EXISTS rotation_started_at;
+ALTER TABLE sandboxes DROP COLUMN IF EXISTS rotation_message_id;
 ALTER TABLE sandboxes DROP COLUMN IF EXISTS rotation_gen;

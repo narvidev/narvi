@@ -2386,6 +2386,7 @@ type Sandbox struct {
 	SnapshotRuntimeVersion        *string              `json:"snapshot_runtime_version"`
 	SnapshotMintedAt              pgtype.Timestamptz   `json:"snapshot_minted_at"`
 	RotationGen                   *int32               `json:"rotation_gen"`
+	RotationMessageID             *string              `json:"rotation_message_id"`
 	RotationStartedAt             pgtype.Timestamptz   `json:"rotation_started_at"`
 	SnapshotStartedAt             pgtype.Timestamptz   `json:"snapshot_started_at"`
 }

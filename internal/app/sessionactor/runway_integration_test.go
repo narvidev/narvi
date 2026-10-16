@@ -54,9 +54,11 @@ type runwayRig struct {
 // with an hour of runway, the shipped timeouts, a provider that snapshots
 // and stops explicitly, and a commander that writes every command.
 type runwayRigOptions struct {
-	pool       *pgxpool.Pool
-	status     sqlcgen.SandboxStatus
-	runway     time.Duration
+	pool   *pgxpool.Pool
+	status sqlcgen.SandboxStatus
+	runway time.Duration
+	// silentFor is how long ago the sandbox was last seen; zero is now.
+	silentFor  time.Duration
 	noDeadline bool
 	timeouts   *platform.Timeouts
 	sessionID  pgtype.UUID
@@ -84,6 +86,12 @@ func newRunwayRig(ctx context.Context, t *testing.T, opts runwayRigOptions) *run
 		opts.runway = time.Hour
 	}
 	seedRunwaySandbox(ctx, t, rig.pool, rig.sessionID, opts.status, opts.runway, !opts.noDeadline)
+	if opts.silentFor > 0 {
+		if _, err := rig.pool.Exec(ctx, `UPDATE sandboxes SET last_seen_at = now() - make_interval(secs => $2::double precision) WHERE session_id = $1`,
+			rig.sessionID, opts.silentFor.Seconds()); err != nil {
+			t.Fatalf("seed the silence: %v", err)
+		}
+	}
 	rig.turnID = createTurnArmingDispatch(ctx, t, rig.pool, rig.sessionID, "the turn queued for the sandbox").ID
 	if opts.beforeActor != nil {
 		opts.beforeActor(rig.pool, rig.sessionID)
@@ -521,17 +529,27 @@ func TestRunwayRotation_Declined_DispatchesAsBefore(t *testing.T) {
 }
 
 // TestRunwayGate_PastItsDeadline_MarkedStoppedAndRestored: a sandbox whose
-// status still reads live past its deadline -- it died idle at its
-// deadline, or is about to -- is retired to stopped before anything is
-// sent to it, ready, snapshotting or suspect alike, and the next
-// evaluation restores its last snapshot. Nothing but `shutdown` goes to the
-// old gen, and no fallback warning is written: it was not rotating.
+// status still reads live past its deadline, its agent silent past the
+// heartbeat budget -- it died idle at its deadline -- is retired to stopped
+// before anything is sent to it, ready, snapshotting or suspect (suspected
+// mid-snapshot, its command still pending) alike, and the next evaluation
+// restores its last snapshot. Nothing but `shutdown` goes to the old gen,
+// its pending snapshot command is forgotten, and no fallback warning is
+// written: it was not rotating.
 func TestRunwayGate_PastItsDeadline_MarkedStoppedAndRestored(t *testing.T) {
 	ctx := context.Background()
 	for _, status := range []sqlcgen.SandboxStatus{sqlcgen.SandboxStatusReady, sqlcgen.SandboxStatusSnapshotting, sqlcgen.SandboxStatusSuspect} {
 		t.Run(string(status), func(t *testing.T) {
 			before := runwayGateCount(ctx, t, sandbox.RunwayRetire, sandbox.RunwayReasonDeadlinePassed)
-			rig := newRunwayRig(ctx, t, runwayRigOptions{runway: -time.Minute, status: status})
+			rig := newRunwayRig(ctx, t, runwayRigOptions{runway: -time.Minute, status: status, silentFor: 3 * time.Minute,
+				beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+					if status != sqlcgen.SandboxStatusSuspect {
+						return
+					}
+					if _, err := pool.Exec(ctx, `UPDATE sandboxes SET pre_suspect_status = 'snapshotting', pending_snapshot_message_id = 'post-turn-snapshot' WHERE session_id = $1`, sessionID); err != nil {
+						t.Fatal(err)
+					}
+				}})
 			settle(ctx, t, rig.actor)
 
 			call := rig.waitRestored(t, 1)
@@ -648,8 +666,9 @@ func TestRunwayRotation_SnapshotNeverReported_FallsBackAtTheWait(t *testing.T) {
 }
 
 // TestRunwayRotation_DeadlinePassesWhileWaiting_FallsBack: the deadline
-// passes while the rotation waits for its snapshot. The deadline row comes
-// first: the gen is retired, and the restore falls back.
+// passes while the rotation waits for its snapshot, and the agent falls
+// silent: it died at its deadline. The deadline row comes first: the gen
+// is retired, and the restore falls back.
 func TestRunwayRotation_DeadlinePassesWhileWaiting_FallsBack(t *testing.T) {
 	ctx := context.Background()
 	before := runwayGateCount(ctx, t, sandbox.RunwayRetire, sandbox.RunwayReasonDeadlinePassed)
@@ -657,7 +676,7 @@ func TestRunwayRotation_DeadlinePassesWhileWaiting_FallsBack(t *testing.T) {
 	settle(ctx, t, rig.actor)
 	onlySnapshotCommand(t, rig.commander)
 
-	if _, err := rig.pool.Exec(ctx, `UPDATE sandboxes SET lifetime_deadline_at = now() - interval '1 second' WHERE session_id = $1`, rig.sessionID); err != nil {
+	if _, err := rig.pool.Exec(ctx, `UPDATE sandboxes SET lifetime_deadline_at = now() - interval '1 second', last_seen_at = now() - interval '3 minutes' WHERE session_id = $1`, rig.sessionID); err != nil {
 		t.Fatal(err)
 	}
 	settle(ctx, t, rig.actor)
@@ -944,8 +963,15 @@ func TestRunwayGate_InFlightReenqueue_NeverRotates_ExpiredIsStopped(t *testing.T
 			t.Fatalf("sandbox_runway_gate_total{pass,turn_in_flight} moved by %d, want 1", got)
 		}
 	})
-	t.Run("past its deadline", func(t *testing.T) {
+	t.Run("past its deadline, heard from: re-sent as before", func(t *testing.T) {
 		rig := newRunwayRig(ctx, t, runwayRigOptions{runway: -time.Minute, beforeActor: inFlightOnGen0})
+		settle(ctx, t, rig.actor)
+		if prompts := sentPromptsOf(t, rig.commander); len(prompts) != 1 || prompts[0].Gen != 1 || len(shutdownGens(t, rig.commander)) != 0 {
+			t.Fatalf("prompts %+v, commands %v; want the re-send to gen 1: a gen that outlived its estimate is not retired", prompts, sentCommandTypes(t, rig.commander))
+		}
+	})
+	t.Run("past its deadline, silent", func(t *testing.T) {
+		rig := newRunwayRig(ctx, t, runwayRigOptions{runway: -time.Minute, silentFor: 3 * time.Minute, beforeActor: inFlightOnGen0})
 		settle(ctx, t, rig.actor)
 		rig.waitRestored(t, 1)
 		if got := sentCommandTypes(t, rig.commander); len(got) != 1 || got[0] != "shutdown" {
@@ -975,7 +1001,7 @@ func TestRunwayRotation_ARotatedGenIsRestoredNeverResumed(t *testing.T) {
 	}{
 		{name: "rotated", opts: runwayRigOptions{runway: 10 * time.Minute,
 			commander: &fakeSendCommander{failTypes: map[string]error{"snapshot": ports.ErrNoLiveSandboxConnection}}}},
-		{name: "past its deadline", opts: runwayRigOptions{runway: -time.Minute}},
+		{name: "past its deadline", opts: runwayRigOptions{runway: -time.Minute, silentFor: 3 * time.Minute}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			tc.opts.provider = &fakeSpawnProvider{explicitStop: true, resumeSupported: true}
@@ -1076,21 +1102,56 @@ func TestHandleEnsureDispatched_PendingTurnWhileSnapshotting_HeldNoErrorNoBackof
 	}
 }
 
+// fireGrace brings the sandbox's terminal_grace due and delivers it, as
+// the pump does once the grace has run out with no sign of life.
+func (r *runwayRig) fireGrace(ctx context.Context, t *testing.T) {
+	t.Helper()
+	tag, err := r.pool.Exec(ctx, `UPDATE session_timers SET fires_at = now() WHERE session_id = $1 AND name = $2`, r.sessionID, TimerTerminalGrace)
+	if err != nil || tag.RowsAffected() != 1 {
+		t.Fatalf("bring terminal_grace due: %v (%d rows): no grace armed", err, tag.RowsAffected())
+	}
+	r.pumpDue(ctx, t)
+}
+
+// assertSuspectedMidSnapshot checks the gate's suspicion of a snapshotting
+// sandbox whose agent fell silent: suspect, snapshotting before it, its
+// snapshot command kept, terminal_grace armed, nothing sent, stopped or
+// restored.
+func (r *runwayRig) assertSuspectedMidSnapshot(ctx context.Context, t *testing.T, cmd string) {
+	t.Helper()
+	row := r.sandbox(ctx, t)
+	if row.Status != sqlcgen.SandboxStatusSuspect || row.PreSuspectStatus == nil || *row.PreSuspectStatus != sqlcgen.SandboxStatusSnapshotting ||
+		row.Gen != 1 || row.PendingSnapshotMessageID == nil || *row.PendingSnapshotMessageID != cmd {
+		t.Fatalf("sandbox %s (before %v) gen %d pending %v; want gen 1 suspect from snapshotting, %s still pending", row.Status, row.PreSuspectStatus, row.Gen, row.PendingSnapshotMessageID, cmd)
+	}
+	if n := countRows(ctx, t, r.pool, `SELECT count(*) FROM session_timers WHERE session_id = $1 AND name = $2`, r.sessionID, TimerTerminalGrace); n != 1 {
+		t.Fatalf("%d terminal_grace timers, want the grace armed", n)
+	}
+	if got := sentCommandTypes(t, r.commander); len(got) != 0 {
+		t.Fatalf("commands = %v, want none: a suspicion sends nothing", got)
+	}
+	if n := r.provider.restoreCallCount() + r.provider.callCount() + len(r.provider.stoppedProviderIDs()); n != 0 {
+		t.Fatalf("provider called %d times, want none during the grace", n)
+	}
+}
+
 // TestRunwayGate_ASnapshotNeverReported_IsBoundedByTheReportWait pins PR
 // 393's round-1 finding F1 and its fix (technical plan §35.3): a post-turn
 // snapshot that never reports -- the agent's mint failed, which it reports
 // with no frame, or the agent died mid-mint -- used to hold the queued turn
 // with nothing left to look again. Now the evaluation holds it for at most
 // SnapshotReportWait from the snapshot's start, with the dispatch timer
-// armed at that bound, and then gives the snapshot up:
+// armed at that bound, and then reads the agent's silence:
 //
 //   - its agent silent past the heartbeat budget (F1's own setup: no start
 //     recorded, created and last seen 3 hours ago, no deadline known): the
-//     agent is gone, so the gen is retired and the turn runs on a
-//     replacement, never sent into a socket that is gone;
-//   - its agent still heard from: only the snapshot failed, so the
-//     sandbox goes back to ready with its work and takes the turn, and the
-//     snapshot's late report matches nothing.
+//     sandbox is suspected through its terminal grace, and a grace that
+//     runs out fails it, so the turn runs on a replacement, never sent into
+//     a socket that is gone;
+//   - its agent not heard from since the wait ended: held, nothing sent,
+//     until a sign of life; the heartbeat that comes is one, so only the
+//     snapshot failed, the sandbox goes back to ready with its work and
+//     takes the turn, and the snapshot's late report matches nothing.
 func TestRunwayGate_ASnapshotNeverReported_IsBoundedByTheReportWait(t *testing.T) {
 	ctx := context.Background()
 	wait := platform.DefaultTimeouts().SnapshotReportWait
@@ -1121,9 +1182,12 @@ func TestRunwayGate_ASnapshotNeverReported_IsBoundedByTheReportWait(t *testing.T
 		if n := len(sentPayloads(rig.commander)); n != 0 {
 			t.Fatalf("%d commands sent within the wait, want none", n)
 		}
-		// The wait runs out: the timer fires.
-		if _, err := rig.pool.Exec(ctx, `UPDATE sandboxes SET snapshot_started_at = snapshot_started_at - make_interval(secs => $2::double precision) WHERE session_id = $1`,
-			rig.sessionID, wait.Seconds()); err != nil {
+		// The wait runs out, ten seconds ago: the timer fires. An agent
+		// that is not silent was last heard twenty seconds ago, before the
+		// wait ended.
+		if _, err := rig.pool.Exec(ctx, `UPDATE sandboxes SET snapshot_started_at = snapshot_started_at - make_interval(secs => $2::double precision),
+			last_seen_at = CASE WHEN $3::boolean THEN last_seen_at ELSE now() - interval '20 seconds' END WHERE session_id = $1`,
+			rig.sessionID, wait.Seconds()+10, silent); err != nil {
 			t.Fatal(err)
 		}
 		if _, err := rig.pool.Exec(ctx, `UPDATE session_timers SET fires_at = now() WHERE session_id = $1 AND name = $2`, rig.sessionID, TimerDispatch); err != nil {
@@ -1133,18 +1197,20 @@ func TestRunwayGate_ASnapshotNeverReported_IsBoundedByTheReportWait(t *testing.T
 		return rig
 	}
 
-	t.Run("its agent silent: retired, the turn runs on a replacement", func(t *testing.T) {
-		before := runwayGateCount(ctx, t, sandbox.RunwayRetire, sandbox.RunwayReasonSnapshotAgentSilent)
+	t.Run("its agent silent: suspected, then failed and replaced", func(t *testing.T) {
+		before := runwayGateCount(ctx, t, sandbox.RunwaySuspect, sandbox.RunwayReasonSnapshotAgentSilent)
 		rig := seed(t, true)
+		rig.assertSuspectedMidSnapshot(ctx, t, "post-turn-snapshot")
+		if got := runwayGateCount(ctx, t, sandbox.RunwaySuspect, sandbox.RunwayReasonSnapshotAgentSilent) - before; got != 1 {
+			t.Fatalf("sandbox_runway_gate_total{suspect,snapshot_agent_silent} moved by %d, want 1", got)
+		}
+		rig.fireGrace(ctx, t)
 		call := rig.waitRestored(t, 1)
 		if call.snapshotID != runwayPreviousSnap || call.spec.Gen != 2 {
 			t.Fatalf("RestoreFromSnapshot(%q) for gen %d, want the last snapshot for gen 2", call.snapshotID, call.spec.Gen)
 		}
-		if got := sentCommandTypes(t, rig.commander); len(got) != 1 || got[0] != "shutdown" {
-			t.Fatalf("commands = %v, want shutdown alone: no prompt to an agent that is gone", got)
-		}
-		if got := runwayGateCount(ctx, t, sandbox.RunwayRetire, sandbox.RunwayReasonSnapshotAgentSilent) - before; got != 1 {
-			t.Fatalf("sandbox_runway_gate_total{retire,snapshot_agent_silent} moved by %d, want 1", got)
+		if n := promptCount(rig.commander); n != 0 {
+			t.Fatalf("%d prompts before the replacement was up, want none: no prompt to an agent that is gone", n)
 		}
 		rig.bootGen(ctx, t, 2)
 		if prompts := sentPromptsOf(t, rig.commander); len(prompts) != 1 || prompts[0].Gen != 2 {
@@ -1152,9 +1218,17 @@ func TestRunwayGate_ASnapshotNeverReported_IsBoundedByTheReportWait(t *testing.T
 		}
 	})
 
-	t.Run("its agent heard from: reverted, the turn runs on the same gen", func(t *testing.T) {
+	t.Run("its agent heard from after the wait: reverted, the turn runs on the same gen", func(t *testing.T) {
 		before := runwayGateCount(ctx, t, sandbox.RunwayRevert, sandbox.RunwayReasonSnapshotNotReported)
+		held := runwayGateCount(ctx, t, sandbox.RunwayHold, sandbox.RunwayReasonAwaitingSignOfLife)
 		rig := seed(t, false)
+		if n := len(sentPayloads(rig.commander)); n != 0 || rig.sandbox(ctx, t).Status != sqlcgen.SandboxStatusSnapshotting {
+			t.Fatalf("%d commands, sandbox %s at the bound, want the turn held until the agent is heard from", n, rig.sandbox(ctx, t).Status)
+		}
+		if got := runwayGateCount(ctx, t, sandbox.RunwayHold, sandbox.RunwayReasonAwaitingSignOfLife) - held; got != 1 {
+			t.Fatalf("sandbox_runway_gate_total{hold,awaiting_sign_of_life} moved by %d, want 1", got)
+		}
+		deliver(ctx, t, rig.actor, receiptHeartbeat(1))
 		waitUntil(t, 5*time.Second, func() bool { return promptCount(rig.commander) == 1 })
 		if prompts := sentPromptsOf(t, rig.commander); prompts[0].Gen != 1 {
 			t.Fatalf("prompt to gen %d, want gen 1: the sandbox keeps its work", prompts[0].Gen)
@@ -1175,4 +1249,466 @@ func TestRunwayGate_ASnapshotNeverReported_IsBoundedByTheReportWait(t *testing.T
 			t.Fatalf("snapshot %v after the late report, want %s kept", row.SnapshotID, runwayPreviousSnap)
 		}
 	})
+}
+
+// TestRunwayGate_PastItsDeadline_HeardFrom_ACompletedTurnKeepsItsWork is
+// PR 397's round-1 F1, first probe: the deadline is the claim's
+// conservative estimate, and a gen outlives it while its agent is heard
+// from. Turn 1 completes 30 seconds past the estimate with turn 2 queued.
+// Its post-turn snapshot and its push go out as on any gen -- [snapshot
+// push], no shutdown -- the queued turn is held behind the snapshot, then
+// behind the delivery, and only once the push has completed is the gen
+// rotated, through its own snapshot, which carries turn 1's work: the
+// replacement is restored from it, not from the snapshot before turn 1.
+func TestRunwayGate_PastItsDeadline_HeardFrom_ACompletedTurnKeepsItsWork(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSessionWithRepos(ctx, t, pool, pgtype.UUID{}, "repo1", "https://github.com/acme/repo1.git", "feature-x")
+	if _, err := narvipg.NewRepoSettingsStore(pool).UpsertLiveEgressEnabled(ctx, "acme/repo1", true); err != nil {
+		t.Fatalf("arm live egress: %v", err)
+	}
+	var first pgtype.UUID
+	rig := newRunwayRig(ctx, t, runwayRigOptions{pool: pool, sessionID: sessionID, runway: -30 * time.Second,
+		beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+			created := createProcessingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID)
+			first = created.ID
+			if _, err := pool.Exec(ctx, `UPDATE turns SET dispatched_at = now(), dispatched_sandbox_gen = 1, created_at = now() - interval '10 minutes' WHERE id = $1`, first); err != nil {
+				t.Fatal(err)
+			}
+		}})
+
+	deliver(ctx, t, rig.actor, SandboxEvent{Type: "execution_complete", Gen: 1,
+		Raw: executionCompleteRaw(t, sessionID.String(), 1, sandboxws.ExecutionCompleteOutcomeCompleted)})
+	if got := sentCommandTypes(t, rig.commander); len(got) != 2 || got[0] != "snapshot" || got[1] != "push" {
+		t.Fatalf("commands = %v, want [snapshot push]: neither the post-turn snapshot nor the push is cut short", got)
+	}
+	if n := len(rig.provider.stoppedProviderIDs()) + rig.provider.restoreCallCount(); n != 0 {
+		t.Fatalf("provider stopped or restored %d times, want none while the gen delivers", n)
+	}
+	if got, err := narvipg.NewTurnStore(pool).Get(ctx, first); err != nil || got.Status != sqlcgen.TurnStatusCompleted {
+		t.Fatalf("turn 1 = %v (%v), want completed", got.Status, err)
+	}
+	if got := rig.turn(ctx, t); got.Status != sqlcgen.TurnStatusPending {
+		t.Fatalf("turn 2 = %s, want pending", got.Status)
+	}
+	postTurn := onlySnapshotCommand(t, rig.commander)
+
+	// The post-turn snapshot reports: the delivery is still open, so the
+	// rotation waits for it.
+	deliver(ctx, t, rig.actor, snapshotReady(1, postTurn.MessageId, "snap-post-turn", ""))
+	if got := sentCommandTypes(t, rig.commander); len(got) != 2 {
+		t.Fatalf("commands = %v after the post-turn snapshot, want none more while the push is delivering", got)
+	}
+
+	// The push completes and its pull request is created: the gen is
+	// rotated through its own snapshot.
+	messageID := "push-complete-" + sessionID.String()
+	deliver(ctx, t, rig.actor, SandboxEvent{Type: "push_complete", Gen: 1, MessageID: messageID,
+		Raw: pushCompleteRawWithMessageID(t, messageID, sessionID.String(), 1, "repo1", "feature-x", "cafef00d00000000000000000000000000000000")})
+	snapshots := commandsOf(t, rig.commander, "snapshot")
+	if len(snapshots) != 2 || !rotating(rig.sandbox(ctx, t)) {
+		t.Fatalf("%d snapshot commands, rotating %v; want the rotation's own snapshot after the delivery", len(snapshots), rotating(rig.sandbox(ctx, t)))
+	}
+	var rotation sandboxws.Snapshot
+	if err := json.Unmarshal(snapshots[1], &rotation); err != nil {
+		t.Fatal(err)
+	}
+	deliver(ctx, t, rig.actor, snapshotReady(1, rotation.MessageId, runwayRotationSnap, ""))
+	call := rig.waitRestored(t, 1)
+	if call.snapshotID != runwayRotationSnap || call.spec.Gen != 2 {
+		t.Fatalf("RestoreFromSnapshot(%q) for gen %d, want the rotation's own snapshot, taken after turn 1, for gen 2", call.snapshotID, call.spec.Gen)
+	}
+	if got := sentCommandTypes(t, rig.commander); len(got) != 4 || got[3] != "shutdown" {
+		t.Fatalf("commands = %v, want [snapshot push snapshot shutdown]", got)
+	}
+	if n := len(fallbackWarnings(ctx, t, pool, sessionID)); n != 0 {
+		t.Fatalf("%d fallback warnings, want none: no work was lost", n)
+	}
+}
+
+// TestRunwayGate_PastItsDeadline_HeardFrom_AnOpenDeliveryIsHeld is PR 397's
+// round-1 F1, second probe: past the estimate, its agent heard from, the
+// gen still delivering a completed turn's push and pull request is not
+// retired: the queued turn is held behind the delivery, looked at again at
+// its bound, and nothing is sent, stopped or restored.
+func TestRunwayGate_PastItsDeadline_HeardFrom_AnOpenDeliveryIsHeld(t *testing.T) {
+	ctx := context.Background()
+	rig := newRunwayRig(ctx, t, runwayRigOptions{runway: -30 * time.Second,
+		beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+			if _, err := pool.Exec(ctx, `UPDATE sandboxes SET pr_delivery_started_at = now() - interval '30 seconds' WHERE session_id = $1`, sessionID); err != nil {
+				t.Fatal(err)
+			}
+		}})
+	settle(ctx, t, rig.actor)
+
+	if got := sentCommandTypes(t, rig.commander); len(got) != 0 {
+		t.Fatalf("commands = %v, want none: an open delivery is never cut short", got)
+	}
+	if n := len(rig.provider.stoppedProviderIDs()) + rig.provider.restoreCallCount(); n != 0 {
+		t.Fatalf("provider stopped or restored %d times, want none", n)
+	}
+	window := platform.DefaultTimeouts().MCPStatusDeliveryWindow
+	if lead, ok := dispatchTimerLead(ctx, t, rig.pool, rig.sessionID); !ok || lead > window-30*time.Second || lead < window-40*time.Second {
+		t.Fatalf("dispatch timer in %s (%v), want at the delivery's bound, %s", lead, ok, window-30*time.Second)
+	}
+	if row := rig.sandbox(ctx, t); row.Status != sqlcgen.SandboxStatusReady || row.Gen != 1 || !row.PrDeliveryStartedAt.Valid {
+		t.Fatalf("sandbox %s gen %d delivery %v, want gen 1 ready, delivering", row.Status, row.Gen, row.PrDeliveryStartedAt.Valid)
+	}
+}
+
+// silentSnapshotRig is PR 397's round-1 F2 reproduction: gen 1 in its
+// post-turn snapshot, started 150 s ago, its agent last seen 100 s ago,
+// just past the heartbeat budget -- as when heartbeats could not be
+// recorded for a while -- and a turn queued. The gate suspects it, through
+// the liveness path, instead of stopping it.
+func silentSnapshotRig(ctx context.Context, t *testing.T, provider *fakeSpawnProvider) *runwayRig {
+	t.Helper()
+	activations := counterByAttrs(ctx, t, "watchdog_activation_total", map[string]string{"watchdog": string(watchdogRunwayGate)})
+	rig := newRunwayRig(ctx, t, runwayRigOptions{provider: provider, beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+		if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'snapshotting', pending_snapshot_message_id = 'post-turn-snapshot',
+			snapshot_started_at = now() - interval '150 seconds', last_seen_at = now() - interval '100 seconds' WHERE session_id = $1`, sessionID); err != nil {
+			t.Fatal(err)
+		}
+	}})
+	settle(ctx, t, rig.actor)
+	rig.assertSuspectedMidSnapshot(ctx, t, "post-turn-snapshot")
+	if got := counterByAttrs(ctx, t, "watchdog_activation_total", map[string]string{"watchdog": string(watchdogRunwayGate)}) - activations; got != 1 {
+		t.Fatalf("watchdog_activation_total{watchdog=runway_gate} moved by %d, want 1: the suspicion is a watchdog's", got)
+	}
+	// During the grace nothing is dispatched to it (row 7d), and the turn
+	// is looked at again when the grace ends.
+	settle(ctx, t, rig.actor)
+	if n := len(sentPayloads(rig.commander)); n != 0 {
+		t.Fatalf("%d commands during the grace, want none: a sandbox suspected mid-snapshot takes no prompt", n)
+	}
+	grace := platform.DefaultTimeouts().TerminalGracePeriod
+	if lead, ok := dispatchTimerLead(ctx, t, rig.pool, rig.sessionID); !ok || lead > grace || lead < grace-10*time.Second {
+		t.Fatalf("dispatch timer in %s (%v), want at the grace's length, %s", lead, ok, grace)
+	}
+	return rig
+}
+
+// TestRunwayGate_ASilentSnapshotAgent_IsSuspectedThroughTheGrace is PR
+// 397's round-1 F2: the gate's silence verdict on a snapshotting sandbox
+// goes through §3.2's two-phase rule like every other liveness verdict.
+// A sign of life during the grace recovers the sandbox -- a heartbeat, after
+// which the snapshot is given up and the turn runs on the same gen, or the
+// snapshot's replayed report, which records the snapshot -- and a grace
+// that runs out with no signal fails it, and it is restored.
+func TestRunwayGate_ASilentSnapshotAgent_IsSuspectedThroughTheGrace(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a heartbeat during the grace recovers it", func(t *testing.T) {
+		rig := silentSnapshotRig(ctx, t, nil)
+		deliver(ctx, t, rig.actor, receiptHeartbeat(1))
+		waitUntil(t, 5*time.Second, func() bool { return promptCount(rig.commander) == 1 })
+		if prompts := sentPromptsOf(t, rig.commander); prompts[0].Gen != 1 {
+			t.Fatalf("prompt to gen %d, want gen 1: recovered, the sandbox keeps its work", prompts[0].Gen)
+		}
+		if row := rig.sandbox(ctx, t); row.Status != sqlcgen.SandboxStatusReady || row.Gen != 1 {
+			t.Fatalf("sandbox %s gen %d, want gen 1 ready", row.Status, row.Gen)
+		}
+		if n := rig.provider.restoreCallCount() + len(rig.provider.stoppedProviderIDs()); n != 0 {
+			t.Fatalf("provider stopped or restored %d times, want none", n)
+		}
+	})
+	t.Run("its replayed report during the grace records the snapshot", func(t *testing.T) {
+		rig := silentSnapshotRig(ctx, t, nil)
+		deliver(ctx, t, rig.actor, snapshotReady(1, "post-turn-snapshot", "snap-post-turn", ""))
+		waitUntil(t, 5*time.Second, func() bool { return promptCount(rig.commander) == 1 })
+		row := rig.sandbox(ctx, t)
+		if row.Status != sqlcgen.SandboxStatusReady || row.Gen != 1 || row.SnapshotID == nil || *row.SnapshotID != "snap-post-turn" {
+			t.Fatalf("sandbox %s gen %d snapshot %v, want gen 1 ready with snap-post-turn recorded", row.Status, row.Gen, row.SnapshotID)
+		}
+	})
+	t.Run("no signal: the grace fails it, and it is restored", func(t *testing.T) {
+		rig := silentSnapshotRig(ctx, t, nil)
+		rig.fireGrace(ctx, t)
+		call := rig.waitRestored(t, 1)
+		if call.snapshotID != runwayPreviousSnap || call.spec.Gen != 2 {
+			t.Fatalf("RestoreFromSnapshot(%q) for gen %d, want the last snapshot for gen 2", call.snapshotID, call.spec.Gen)
+		}
+		if n := promptCount(rig.commander); n != 0 {
+			t.Fatalf("%d prompts to the failed gen, want none", n)
+		}
+	})
+}
+
+// TestRunwayGate_AnAgentThatDiesPartwayThroughTheWait_IsNeverSentTheTurn is
+// PR 397's round-1 F5: silence is read after the report wait, where it
+// matters. An agent that died 60 seconds into its post-turn snapshot has
+// been silent only 61 seconds when the wait ends, under the budget, yet it
+// has not been heard from since: the turn is held, never sent, until its
+// silence reaches the budget, when it is suspected, and once the grace has
+// run out it is replaced and the turn runs on gen 2.
+func TestRunwayGate_AnAgentThatDiesPartwayThroughTheWait_IsNeverSentTheTurn(t *testing.T) {
+	ctx := context.Background()
+	rig := newRunwayRig(ctx, t, runwayRigOptions{beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+		if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'snapshotting', pending_snapshot_message_id = 'post-turn-snapshot',
+			snapshot_started_at = now() - interval '121 seconds', last_seen_at = now() - interval '61 seconds' WHERE session_id = $1`, sessionID); err != nil {
+			t.Fatal(err)
+		}
+	}})
+	settle(ctx, t, rig.actor)
+	if n := len(sentPayloads(rig.commander)); n != 0 {
+		t.Fatalf("%d commands at the bound, want none: an agent not heard from since the wait is not read as alive", n)
+	}
+	if lead, ok := dispatchTimerLead(ctx, t, rig.pool, rig.sessionID); !ok || lead > 29*time.Second || lead < 20*time.Second {
+		t.Fatalf("dispatch timer in %s (%v), want when its silence reaches the budget, about 29s", lead, ok)
+	}
+	if row := rig.sandbox(ctx, t); row.Status != sqlcgen.SandboxStatusSnapshotting {
+		t.Fatalf("sandbox %s, want held snapshotting", row.Status)
+	}
+	// Its silence reaches the budget: suspected.
+	if _, err := rig.pool.Exec(ctx, `UPDATE sandboxes SET last_seen_at = now() - interval '91 seconds' WHERE session_id = $1`, rig.sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rig.pool.Exec(ctx, `UPDATE session_timers SET fires_at = now() WHERE session_id = $1 AND name = $2`, rig.sessionID, TimerDispatch); err != nil {
+		t.Fatal(err)
+	}
+	rig.pumpDue(ctx, t)
+	rig.assertSuspectedMidSnapshot(ctx, t, "post-turn-snapshot")
+	rig.fireGrace(ctx, t)
+	rig.waitRestored(t, 1)
+	rig.bootGen(ctx, t, 2)
+	if prompts := sentPromptsOf(t, rig.commander); len(prompts) != 1 || prompts[0].Gen != 2 {
+		t.Fatalf("prompts %+v, want the turn once, to gen 2", prompts)
+	}
+}
+
+// TestRunwayGate_ASilentSnapshotAgentIsNeverResumed is PR 397's round-1 F4
+// and F7, on a provider that resumes: the gate's suspicion of a silent
+// agent ends, once the grace runs out, in failed, which is never resumed;
+// the replacement is restored. (A rotated gen and one past its deadline
+// are TestRunwayRotation_ARotatedGenIsRestoredNeverResumed's.)
+func TestRunwayGate_ASilentSnapshotAgentIsNeverResumed(t *testing.T) {
+	ctx := context.Background()
+	rig := silentSnapshotRig(ctx, t, &fakeSpawnProvider{explicitStop: true, resumeSupported: true})
+	rig.fireGrace(ctx, t)
+	rig.waitRestored(t, 1)
+	if n := rig.provider.resumeCallCount(); n != 0 {
+		t.Fatalf("ResumeSandbox called %d times, want none", n)
+	}
+}
+
+// TestRunwayRotation_RollingDeploy_APostTurnSnapshotOfARotatingGenIsWaitedFor
+// is PR 397's round-1 F6: during a rolling deploy the previous binary took
+// the rotation's report and dispatched a turn into the rotated gen. When
+// that turn completes with another queued, its post-turn snapshot is not
+// the rotation's own: it is waited for like any other, never cut short,
+// and once it reports the gen is retired and restored from it, so the
+// turn's work is kept and nothing reads as a fallback.
+func TestRunwayRotation_RollingDeploy_APostTurnSnapshotOfARotatingGenIsWaitedFor(t *testing.T) {
+	ctx := context.Background()
+	rotatedBefore := rotationRestoreCount(ctx, t, rotationOutcomeRotated)
+	rig := newRunwayRig(ctx, t, runwayRigOptions{runway: 8 * time.Minute,
+		beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+			if _, err := pool.Exec(ctx, `UPDATE sandboxes SET rotation_gen = 1, rotation_message_id = 'rotation-command',
+				rotation_started_at = now() - interval '4 minutes', snapshot_id = 'snap-rotation-taken', snapshot_provenance_id = 'snap-rotation-taken',
+				snapshot_minted_at = now() - interval '3 minutes' WHERE session_id = $1`, sessionID); err != nil {
+				t.Fatal(err)
+			}
+			running := createProcessingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID)
+			if _, err := pool.Exec(ctx, `UPDATE turns SET dispatched_at = now(), dispatched_sandbox_gen = 1, created_at = now() - interval '10 minutes' WHERE id = $1`, running.ID); err != nil {
+				t.Fatal(err)
+			}
+		}})
+
+	deliver(ctx, t, rig.actor, completedEvent(1))
+	if got := sentCommandTypes(t, rig.commander); len(got) != 1 || got[0] != "snapshot" {
+		t.Fatalf("commands = %v, want the post-turn snapshot alone: it is not cut short", got)
+	}
+	postTurn := onlySnapshotCommand(t, rig.commander)
+	if n := rig.provider.restoreCallCount(); n != 0 {
+		t.Fatalf("%d restores while the post-turn snapshot runs, want none", n)
+	}
+	deliver(ctx, t, rig.actor, snapshotReady(1, postTurn.MessageId, "snap-post-turn", ""))
+	call := rig.waitRestored(t, 1)
+	if call.snapshotID != "snap-post-turn" {
+		t.Fatalf("RestoreFromSnapshot(%q), want the post-turn snapshot, which holds the turn's work", call.snapshotID)
+	}
+	if n := len(fallbackWarnings(ctx, t, rig.pool, rig.sessionID)); n != 0 {
+		t.Fatalf("%d fallback warnings, want none", n)
+	}
+	if got := rotationRestoreCount(ctx, t, rotationOutcomeRotated) - rotatedBefore; got != 1 {
+		t.Fatalf("sandbox_rotation_restore_total{rotated} moved by %d, want 1", got)
+	}
+}
+
+// TestRunwayGate_ReadsEachDurationFromItsOwnField is PR 397's round-1 F9
+// (a) and (b): with the rotation's wait, the report wait and the heartbeat
+// budget all different, each hold is armed at its own field's value and
+// the silence is read against the heartbeat budget.
+func TestRunwayGate_ReadsEachDurationFromItsOwnField(t *testing.T) {
+	ctx := context.Background()
+	to := platform.DefaultTimeouts()
+	to.SnapshotReportWait = 3 * time.Minute
+	to.SteadyHeartbeatBudget = 100 * time.Second
+	if err := to.Validate(); err != nil {
+		t.Fatalf("the distinct timeouts are not a valid configuration: %v", err)
+	}
+	t.Run("the rotation waits RotationSnapshotWait", func(t *testing.T) {
+		rig := newRunwayRig(ctx, t, runwayRigOptions{runway: 10 * time.Minute, timeouts: &to})
+		settle(ctx, t, rig.actor)
+		onlySnapshotCommand(t, rig.commander)
+		if lead, ok := dispatchTimerLead(ctx, t, rig.pool, rig.sessionID); !ok || lead > 2*time.Minute || lead < 2*time.Minute-10*time.Second {
+			t.Fatalf("dispatch timer in %s (%v), want at RotationSnapshotWait, 2m", lead, ok)
+		}
+		// Looked at again during the wait, the rotation's own snapshot is
+		// held for what is left of RotationSnapshotWait, not of the report
+		// wait a post-turn snapshot gets.
+		settle(ctx, t, rig.actor)
+		if lead, ok := dispatchTimerLead(ctx, t, rig.pool, rig.sessionID); !ok || lead > 2*time.Minute || lead < 2*time.Minute-10*time.Second {
+			t.Fatalf("dispatch timer in %s (%v) after a second look, want what is left of RotationSnapshotWait, about 2m", lead, ok)
+		}
+	})
+	t.Run("a post-turn snapshot waits SnapshotReportWait", func(t *testing.T) {
+		rig := newRunwayRig(ctx, t, runwayRigOptions{status: sqlcgen.SandboxStatusSnapshotting, timeouts: &to})
+		settle(ctx, t, rig.actor)
+		if lead, ok := dispatchTimerLead(ctx, t, rig.pool, rig.sessionID); !ok || lead > 3*time.Minute || lead < 3*time.Minute-10*time.Second {
+			t.Fatalf("dispatch timer in %s (%v), want at SnapshotReportWait, 3m", lead, ok)
+		}
+	})
+	t.Run("silence is read against SteadyHeartbeatBudget", func(t *testing.T) {
+		for _, tc := range []struct {
+			silence   string
+			suspected bool
+		}{{"95 seconds", false}, {"105 seconds", true}} {
+			rig := newRunwayRig(ctx, t, runwayRigOptions{timeouts: &to, beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+				if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'snapshotting', pending_snapshot_message_id = 'post-turn-snapshot',
+					snapshot_started_at = now() - interval '200 seconds', last_seen_at = now() - interval '`+tc.silence+`' WHERE session_id = $1`, sessionID); err != nil {
+					t.Fatal(err)
+				}
+			}})
+			settle(ctx, t, rig.actor)
+			if got := rig.sandbox(ctx, t).Status == sqlcgen.SandboxStatusSuspect; got != tc.suspected {
+				t.Fatalf("silent %s against a 100s budget: suspected %v, want %v", tc.silence, got, tc.suspected)
+			}
+		}
+	})
+}
+
+// TestRunwayGate_UnpinnedEdges is PR 397's round-1 F9 (c) to (h): a session
+// that cannot snapshot is dispatched, never held, behind an open delivery;
+// a delivery stamp past its bound holds nothing; an ordinary dispatch is
+// neither counted nor logged; a turn in flight on the current gen is never
+// gated, even past its deadline with its agent silent; a rotation left on
+// an older gen is no rotation; and a report-only deadline's lifetime is the
+// shortest kind's.
+func TestRunwayGate_UnpinnedEdges(t *testing.T) {
+	ctx := context.Background()
+	t.Run("no snapshot capability, a delivery open: dispatched", func(t *testing.T) {
+		rig := newRunwayRig(ctx, t, runwayRigOptions{runway: 5 * time.Minute, provider: &fakeSpawnProvider{explicitStop: true, noSnapshots: true},
+			beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+				if _, err := pool.Exec(ctx, `UPDATE sandboxes SET pr_delivery_started_at = now() - interval '1 minute' WHERE session_id = $1`, sessionID); err != nil {
+					t.Fatal(err)
+				}
+			}})
+		settle(ctx, t, rig.actor)
+		if got := sentCommandTypes(t, rig.commander); len(got) != 1 || got[0] != "prompt" {
+			t.Fatalf("commands = %v, want the prompt: a declined rotation is not held behind a delivery", got)
+		}
+	})
+	t.Run("a delivery stamp past its bound: rotated", func(t *testing.T) {
+		rig := newRunwayRig(ctx, t, runwayRigOptions{runway: 10 * time.Minute,
+			beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+				if _, err := pool.Exec(ctx, `UPDATE sandboxes SET pr_delivery_started_at = now() - interval '30 minutes' WHERE session_id = $1`, sessionID); err != nil {
+					t.Fatal(err)
+				}
+			}})
+		settle(ctx, t, rig.actor)
+		onlySnapshotCommand(t, rig.commander)
+	})
+	t.Run("runway to spare is neither counted nor logged", func(t *testing.T) {
+		before := runwayGateCount(ctx, t, sandbox.RunwayPass, sandbox.RunwayReasonOK)
+		logs := captureDefaultLoggerLocked(t)
+		rig := newRunwayRig(ctx, t, runwayRigOptions{})
+		settle(ctx, t, rig.actor)
+		if n := promptCount(rig.commander); n != 1 {
+			t.Fatalf("%d prompts, want the turn dispatched", n)
+		}
+		if got := runwayGateCount(ctx, t, sandbox.RunwayPass, sandbox.RunwayReasonOK) - before; got != 0 {
+			t.Fatalf("sandbox_runway_gate_total{pass,runway_ok} moved by %d, want 0: an ordinary dispatch is not counted", got)
+		}
+		logs.mu.Lock()
+		logged := strings.Contains(logs.buf.String(), "runway gate")
+		logs.mu.Unlock()
+		if logged {
+			t.Fatal("an ordinary dispatch was logged by the runway gate")
+		}
+	})
+	t.Run("a turn in flight on the current gen is never gated", func(t *testing.T) {
+		rig := newRunwayRig(ctx, t, runwayRigOptions{runway: -time.Minute, silentFor: 3 * time.Minute,
+			beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+				if _, err := pool.Exec(ctx, `UPDATE turns SET status = 'processing', dispatched_at = now(), dispatched_sandbox_gen = 1 WHERE session_id = $1`, sessionID); err != nil {
+					t.Fatal(err)
+				}
+			}})
+		settle(ctx, t, rig.actor)
+		if got := sentCommandTypes(t, rig.commander); len(got) != 0 {
+			t.Fatalf("commands = %v, want none: the turn may be running on that gen", got)
+		}
+		if row := rig.sandbox(ctx, t); row.Gen != 1 || row.Status != sqlcgen.SandboxStatusReady {
+			t.Fatalf("sandbox %s gen %d, want gen 1 ready, not retired", row.Status, row.Gen)
+		}
+	})
+	t.Run("a rotation left on an older gen is no rotation", func(t *testing.T) {
+		rig := newRunwayRig(ctx, t, runwayRigOptions{status: sqlcgen.SandboxStatusStopped,
+			beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+				if _, err := pool.Exec(ctx, `UPDATE sandboxes SET gen = 2, rotation_gen = 1, rotation_started_at = now() - interval '5 minutes' WHERE session_id = $1`, sessionID); err != nil {
+					t.Fatal(err)
+				}
+			}})
+		settle(ctx, t, rig.actor)
+		rig.waitRestored(t, 1)
+		if n := len(fallbackWarnings(ctx, t, rig.pool, rig.sessionID)); n != 0 {
+			t.Fatalf("%d fallback warnings, want none: gen 2 was not rotating", n)
+		}
+	})
+	t.Run("a report-only deadline is measured against the shortest kind's lifetime", func(t *testing.T) {
+		to := platform.DefaultTimeouts()
+		to.RotationRunwayFloor = 19 * time.Minute
+		to.ReviewSandboxLifetime = 96 * time.Minute
+		if err := to.Validate(); err != nil {
+			t.Fatalf("not a valid configuration: %v", err)
+		}
+		// lifetime_seconds is NULL: the deadline came from an agent's
+		// report. The shortest kind, 96m, gives a 16m threshold; 17m of
+		// runway passes. The longest, or none at all, would give 19m.
+		rig := newRunwayRig(ctx, t, runwayRigOptions{runway: 17 * time.Minute, timeouts: &to,
+			beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+				if _, err := pool.Exec(ctx, `UPDATE sandboxes SET lifetime_seconds = NULL WHERE session_id = $1`, sessionID); err != nil {
+					t.Fatal(err)
+				}
+			}})
+		settle(ctx, t, rig.actor)
+		if got := sentCommandTypes(t, rig.commander); len(got) != 1 || got[0] != "prompt" {
+			t.Fatalf("commands = %v, want the prompt: 17m is above the shortest kind's 16m threshold", got)
+		}
+	})
+}
+
+// TestRunwayRotation_ASnapshotThePreviousBinaryRecordedIsNotTheRotations:
+// a rotating gen whose snapshot was recorded without its provenance -- by
+// the previous binary, during a rolling deploy -- has no rotation snapshot
+// taken, in the runway read and in its Go mirror alike: the gen is retired
+// as rotation_snapshot_failed and the restore writes the fallback warning.
+func TestRunwayRotation_ASnapshotThePreviousBinaryRecordedIsNotTheRotations(t *testing.T) {
+	ctx := context.Background()
+	failedBefore := runwayGateCount(ctx, t, sandbox.RunwayRetire, sandbox.RunwayReasonRotationSnapshotFailed)
+	rig := newRunwayRig(ctx, t, runwayRigOptions{runway: 10 * time.Minute,
+		beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+			if _, err := pool.Exec(ctx, `UPDATE sandboxes SET rotation_gen = 1, rotation_message_id = 'rotation-command',
+				rotation_started_at = now() - interval '4 minutes', snapshot_id = 'snap-by-the-previous-binary',
+				snapshot_provenance_id = 'snap-previous', snapshot_minted_at = now() - interval '3 minutes' WHERE session_id = $1`, sessionID); err != nil {
+				t.Fatal(err)
+			}
+		}})
+	settle(ctx, t, rig.actor)
+	rig.waitRestored(t, 1)
+	if got := runwayGateCount(ctx, t, sandbox.RunwayRetire, sandbox.RunwayReasonRotationSnapshotFailed) - failedBefore; got != 1 {
+		t.Fatalf("sandbox_runway_gate_total{retire,rotation_snapshot_failed} moved by %d, want 1", got)
+	}
+	if n := len(fallbackWarnings(ctx, t, rig.pool, rig.sessionID)); n != 1 {
+		t.Fatalf("%d fallback warnings, want 1: the restored snapshot is not known to be the rotation's", n)
+	}
 }

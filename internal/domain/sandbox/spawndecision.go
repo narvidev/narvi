@@ -161,9 +161,12 @@ func EvaluateSpawnDecision(state SpawnState, cfg SpawnConfig, now time.Time, isS
 	// (EvaluateRunway), which the evaluation of a pending turn asks before
 	// this function: it holds the turn for at most the snapshot's report
 	// wait, then gives a snapshot that never reported up -- reverted to
-	// Ready, or the gen retired when its agent has gone silent -- and it
-	// retires a gen past its deadline. No watchdog leaves Snapshotting, so
-	// there is no staleness carve-out to race. This row is reached by a
+	// Ready once its agent is heard from after the wait, or suspected,
+	// through §3.2's terminal grace, once it has been silent the heartbeat
+	// budget -- and it retires a gen past its deadline whose agent is
+	// silent. Only that gate, from the evaluation itself, moves a
+	// snapshotting sandbox to Suspect, so there is no staleness carve-out
+	// to race. This row is reached by a
 	// turn in flight re-sent to a snapshotting gen, which the gate does not
 	// see, and logged by the caller with how long the sandbox has been
 	// snapshotting.

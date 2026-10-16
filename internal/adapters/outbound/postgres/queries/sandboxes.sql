@@ -120,11 +120,12 @@ RETURNING *;
 -- already be past. lifetime_deadline_gen records which gen the deadline is
 -- for; the deadline counts only while it equals gen.
 --
--- rotation_gen, rotation_started_at and snapshot_started_at (technical
--- plan §35.3, migrations/000171) are cleared too: a rotation and a snapshot
--- in progress are the replaced gen's, and the new gen has neither. Hygiene
--- only for the rotation: rotation_gen counts only while it equals gen, so
--- the bump alone makes a value left over read "not rotating".
+-- rotation_gen, rotation_message_id, rotation_started_at and
+-- snapshot_started_at (technical plan §35.3, migrations/000171) are cleared
+-- too: a rotation and a snapshot in progress are the replaced gen's, and
+-- the new gen has neither. Hygiene only for the rotation: rotation_gen
+-- counts only while it equals gen, so the bump alone makes a value left
+-- over read "not rotating".
 --
 -- A NULL lifetime_seconds is a resume's (planResume): the same provider
 -- object, never younger than it was, so a fresh stamp would be later than
@@ -151,6 +152,7 @@ SET gen = sandboxes.gen + 1,
     pr_delivery_started_at = NULL,
     stop_retire_gen = NULL,
     rotation_gen = NULL,
+    rotation_message_id = NULL,
     rotation_started_at = NULL,
     snapshot_started_at = NULL,
     lifetime_deadline_at = CASE
@@ -469,6 +471,8 @@ RETURNING *;
 --     or it has none;
 --   - rotating, since_rotation_nanos: a rotation of the live gen, and how
 --     long since it started;
+--   - rotation_snapshot_pending: the snapshot in progress is that
+--     rotation's own -- its pending command is the one the rotation sent;
 --   - rotation_snapshot_taken: the row's snapshot was recorded, with its
 --     provenance, at or after the rotation started (000170's
 --     snapshot_minted_at) -- the rotation's own snapshot;
@@ -477,6 +481,8 @@ RETURNING *;
 --   - since_last_seen_nanos: how long since the sandbox's last sign of life
 --     (last_seen_at, created_at when it has none yet), on the database's
 --     clock against a stamp the replica that stored the frame wrote;
+--   - suspected_mid_snapshot: suspect, and snapshotting when suspected
+--     (pre_suspect_status), so a recovery takes it back to snapshotting;
 --   - pr_delivery_started_at and observed_at: a completed turn's open
 --     delivery, read as session.PRDeliveryOpen reads it.
 SELECT gen, status,
@@ -484,6 +490,8 @@ SELECT gen, status,
        COALESCE((EXTRACT(EPOCH FROM (lifetime_deadline_at - now())) * 1000000000)::bigint, 0)::bigint AS runway_nanos,
        COALESCE(CASE WHEN lifetime_deadline_gen = gen THEN lifetime_seconds END, 0)::integer AS lifetime_seconds,
        (rotation_gen IS NOT DISTINCT FROM gen)::boolean AS rotating,
+       (rotation_gen IS NOT DISTINCT FROM gen AND status = 'snapshotting' AND pending_snapshot_message_id IS NOT NULL
+          AND pending_snapshot_message_id IS NOT DISTINCT FROM rotation_message_id)::boolean AS rotation_snapshot_pending,
        COALESCE((EXTRACT(EPOCH FROM (now() - rotation_started_at)) * 1000000000)::bigint, 0)::bigint AS since_rotation_nanos,
        (rotation_gen IS NOT DISTINCT FROM gen AND snapshot_id IS NOT NULL AND snapshot_provenance_id IS NOT DISTINCT FROM snapshot_id
           AND snapshot_minted_at IS NOT NULL AND rotation_started_at IS NOT NULL
@@ -491,6 +499,7 @@ SELECT gen, status,
        (snapshot_started_at IS NOT NULL)::boolean AS snapshot_start_known,
        COALESCE((EXTRACT(EPOCH FROM (now() - snapshot_started_at)) * 1000000000)::bigint, 0)::bigint AS since_snapshot_start_nanos,
        COALESCE((EXTRACT(EPOCH FROM (now() - COALESCE(last_seen_at, created_at))) * 1000000000)::bigint, 0)::bigint AS since_last_seen_nanos,
+       (status = 'suspect' AND pre_suspect_status IS NOT DISTINCT FROM 'snapshotting')::boolean AS suspected_mid_snapshot,
        pr_delivery_started_at,
        now()::timestamptz AS observed_at
 FROM sandboxes
@@ -501,12 +510,14 @@ WHERE session_id = $1;
 -- live gen, in the transaction that moves the sandbox ready ->
 -- snapshotting through the session actor's recorder (sandboxWrites): the
 -- gen, the database's now() as its start, and the snapshot command's
--- messageId as the pending snapshot, which the snapshot_ready that
--- completes it must name (handleSnapshotReadyEvent), with
--- snapshot_started_at set as UpdateSandboxPendingSnapshotMessageID sets it.
--- Gen-fenced: 0 rows when the row is no longer at that gen.
+-- messageId, as the rotation's own (rotation_message_id) and as the pending
+-- snapshot, which the snapshot_ready that completes it must name
+-- (handleSnapshotReadyEvent), with snapshot_started_at set as
+-- UpdateSandboxPendingSnapshotMessageID sets it. Gen-fenced: 0 rows when
+-- the row is no longer at that gen.
 UPDATE sandboxes
 SET rotation_gen = gen,
+    rotation_message_id = sqlc.arg('message_id')::text,
     rotation_started_at = now(),
     pending_snapshot_message_id = sqlc.arg('message_id')::text,
     snapshot_started_at = now(),

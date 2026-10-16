@@ -54,6 +54,10 @@ const (
 	watchdogInactivity         watchdogKind = "inactivity"
 	watchdogConnectingDeadline watchdogKind = "connecting_deadline"
 	watchdogLivenessCheck      watchdogKind = "liveness_check"
+	// watchdogRunwayGate is the runway gate's silence check on a
+	// snapshotting sandbox (technical plan §35.3, runway.go): the one
+	// watchdog that covers that state.
+	watchdogRunwayGate watchdogKind = "runway_gate"
 )
 
 // opsMetrics bundles §5.3's five new OTel instruments, constructed
@@ -284,7 +288,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	livenessGap, err := meter.Float64Histogram(
 		"sandbox_liveness_gap_seconds",
-		metric.WithDescription("How long a sandbox had shown no sign of life by the moment a watchdog timer (inactivity/connecting_deadline/liveness_check) suspected it (§5.3: liveness gaps) -- the duration half of watchdog_activation_total's own count. Tagged by watchdog."),
+		metric.WithDescription("How long a sandbox had shown no sign of life by the moment a watchdog (the inactivity/connecting_deadline/liveness_check timers, or the runway gate's silence check on a snapshotting sandbox) suspected it (§5.3: liveness gaps) -- the duration half of watchdog_activation_total's own count. Tagged by watchdog."),
 		metric.WithUnit("s"),
 		metric.WithExplicitBucketBoundaries(livenessGapBuckets...),
 	)
@@ -294,7 +298,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	watchdogActivation, err := meter.Int64Counter(
 		"watchdog_activation_total",
-		metric.WithDescription("Count of every sandbox suspected (transitioned to Suspect) by a liveness/inactivity watchdog (§5.3: watchdog activations). Tagged by watchdog (inactivity/connecting_deadline/liveness_check); excludes recordSpawnFailure's own distinct permanent-provider-error path, which is not a watchdog silence."),
+		metric.WithDescription("Count of every sandbox suspected (transitioned to Suspect) by a liveness/inactivity watchdog (§5.3: watchdog activations). Tagged by watchdog (inactivity/connecting_deadline/liveness_check/runway_gate, the last the pre-dispatch runway gate's silence check on a snapshotting sandbox); excludes recordSpawnFailure's own distinct permanent-provider-error path, which is not a watchdog silence."),
 		metric.WithUnit("{activation}"),
 	)
 	if err != nil {
@@ -451,7 +455,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	runwayGate, err := meter.Int64Counter(
 		"sandbox_runway_gate_total",
-		metric.WithDescription("Decisions of the pre-dispatch runway gate (technical plan §35.3): before a turn is sent to a live sandbox, the gate measures the sandbox's runway -- its lifetime deadline less the database's now -- against min(RotationRunwayFloor, lifetime/6). Every decision but a pass with runway to spare is counted, by action and reason: pass (deadline_unknown, turn_in_flight, suspect, no_snapshot: the rotation was declined and the turn dispatched as before); hold (awaiting_rotation_snapshot, snapshot_in_progress, delivery_open: the turn waits, looked at again at the hold's bound); rotate (below_threshold: the sandbox is snapshotted, then retired and restored, before the turn is sent); retire (deadline_passed: the sandbox's status still read live past its deadline; rotation_snapshot_taken, rotation_snapshot_not_reported, rotation_snapshot_failed: a rotation's gen, retired with its snapshot taken, unreported within RotationSnapshotWait, or never sent; snapshot_agent_silent: a snapshot unreported within SnapshotReportWait whose agent was silent past SteadyHeartbeatBudget); revert (snapshot_not_reported: a snapshot unreported within SnapshotReportWait from an agent still heard from, given up, the sandbox back to ready). The line logged with each names the gen and the runway."),
+		metric.WithDescription("Decisions of the pre-dispatch runway gate (technical plan §35.3): before a turn is sent to a live sandbox, the gate measures the sandbox's runway -- its lifetime deadline less the database's now -- against min(RotationRunwayFloor, lifetime/6). Every decision but a pass with runway to spare is counted, by action and reason: pass (deadline_unknown, turn_in_flight, suspect, no_snapshot: the rotation was declined and the turn dispatched as before, below the threshold); hold (awaiting_rotation_snapshot, snapshot_in_progress, awaiting_sign_of_life, suspected_mid_snapshot, delivery_open: the turn waits, looked at again at the hold's bound); rotate (below_threshold: under the threshold, or past the deadline with the agent heard from, the sandbox is snapshotted, then retired and restored, before the turn is sent); retire (deadline_passed: past its deadline with its agent silent past SteadyHeartbeatBudget; rotation_snapshot_taken, rotation_snapshot_not_reported, rotation_snapshot_failed: a rotation's gen, retired with its snapshot taken, unreported within RotationSnapshotWait, or never sent); suspect (snapshot_agent_silent: a snapshot unreported within SnapshotReportWait whose agent then fell silent past SteadyHeartbeatBudget, suspected through its terminal grace); revert (snapshot_not_reported: a snapshot unreported within SnapshotReportWait from an agent heard from after it, given up, the sandbox back to ready). The line logged with each names the gen and the runway."),
 		metric.WithUnit("{decision}"),
 	)
 	if err != nil {

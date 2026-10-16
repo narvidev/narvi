@@ -1,8 +1,12 @@
 // This file (runway.go) is the session actor's half of the pre-dispatch
-// runway gate (technical plan §35.3): a turn is never dispatched into a
+// runway gate (technical plan §35.3): before a turn is dispatched into a
 // live sandbox with less than min(RotationRunwayFloor, lifetime/6) of its
-// lifetime left. Below it the sandbox is rotated first, and the turn stays
-// pending for the replacement. The decision is the pure
+// lifetime left, the sandbox is rotated, and the turn stays pending for the
+// replacement. That is no guarantee: the rotation is declined, and the turn
+// dispatched below the threshold as before, when no deadline is known, for
+// a re-send of a turn in flight, to a suspect sandbox, and for a session
+// that cannot snapshot (EvaluateRunway's rows 8 and 10 to 12), so the queue
+// never stalls on the gate. The decision is the pure
 // sandbox.EvaluateRunway, over facts this file reads in one statement on
 // the database's clock (GetSandboxRunway); this file only acts on it.
 //
@@ -31,11 +35,16 @@
 //     before the rotation started writes the fallback warning
 //     (recordRotationFallback).
 //
-// A sandbox past its deadline whose status still reads live is retired the
-// same way before anything is sent to it, and a snapshot that is not a
-// rotation's is bounded by SnapshotReportWait: given up, the sandbox back
-// to ready when its agent is still heard from, the gen retired when it is
-// not (EvaluateRunway's rows 7 to 7b).
+// A sandbox past its deadline whose status still reads live, and whose
+// agent is silent, is retired the same way before anything is sent to it;
+// one whose agent is still heard from has outlived the claim's estimate,
+// and is rotated through its own snapshot once its snapshot in progress
+// and its delivery are done. A snapshot that is not a rotation's is
+// bounded by SnapshotReportWait, then read by its agent's silence:
+// suspected through the liveness path when the agent is silent (terminal
+// grace, recovered by any sign of life), given up -- the sandbox back to
+// ready -- when the agent was heard from after the wait, and held
+// otherwise until one or the other (EvaluateRunway's rows 7 to 7d).
 //
 // # What the gate composes with
 //
@@ -120,6 +129,7 @@ func (a *Actor) runwayConfig() sandbox.RunwayConfig {
 		SnapshotWait:    a.timeouts.RotationSnapshotWait,
 		ReportWait:      a.timeouts.SnapshotReportWait,
 		HeartbeatBudget: a.timeouts.SteadyHeartbeatBudget,
+		Grace:           a.timeouts.TerminalGracePeriod,
 	}
 }
 
@@ -142,16 +152,18 @@ func (a *Actor) shortestLifetime() time.Duration {
 // has just stamped it so.
 func (a *Actor) runwayFacts(row sqlcgen.GetSandboxRunwayRow, inFlight bool) sandbox.RunwayFacts {
 	facts := sandbox.RunwayFacts{
-		Status:                sandbox.State(row.Status),
-		DeadlineKnown:         row.DeadlineKnown,
-		Runway:                time.Duration(row.RunwayNanos),
-		Lifetime:              platform.SecondsToDuration(row.LifetimeSeconds),
-		TurnInFlight:          inFlight,
-		CanSnapshot:           true, // provisional: canRotate reads it only when a row below the declines decides
-		Rotating:              row.Rotating,
-		SinceRotationStart:    time.Duration(row.SinceRotationNanos),
-		RotationSnapshotTaken: row.RotationSnapshotTaken,
-		SinceLastSeen:         time.Duration(row.SinceLastSeenNanos),
+		Status:                  sandbox.State(row.Status),
+		DeadlineKnown:           row.DeadlineKnown,
+		Runway:                  time.Duration(row.RunwayNanos),
+		Lifetime:                platform.SecondsToDuration(row.LifetimeSeconds),
+		TurnInFlight:            inFlight,
+		CanSnapshot:             true, // provisional: canRotate reads it only when a row below the declines decides
+		Rotating:                row.Rotating,
+		RotationSnapshotPending: row.RotationSnapshotPending,
+		SinceRotationStart:      time.Duration(row.SinceRotationNanos),
+		RotationSnapshotTaken:   row.RotationSnapshotTaken,
+		SinceLastSeen:           time.Duration(row.SinceLastSeenNanos),
+		SuspectedMidSnapshot:    row.SuspectedMidSnapshot,
 	}
 	if row.LifetimeSeconds <= 0 {
 		facts.Lifetime = a.shortestLifetime()
@@ -203,6 +215,13 @@ func (a *Actor) canRotate(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Ses
 //   - revert: snapshotting -> ready, the pending snapshot command
 //     forgotten, the ready watchdogs armed, and the dispatch timer armed due
 //     at once.
+//   - suspect: snapshotting -> suspect through transitionSandboxToSuspect,
+//     the liveness path every silence takes: terminal_grace armed, the
+//     pending snapshot command kept, so a sign of life during the grace
+//     recovers the sandbox to snapshotting -- and a replayed report then
+//     records its snapshot -- and a grace that runs out fails it, and that
+//     timer's own evaluation restores or spawns the replacement. Nothing is
+//     dispatched meanwhile (EvaluateRunway's row 7d).
 func (a *Actor) applyRunwayGate(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, inFlight bool) (runwayGateResult, error) {
 	sandboxes := a.stores.sandbox.WithTx(tx)
 	row, err := sandboxes.Runway(ctx, a.sessionID)
@@ -280,6 +299,12 @@ func (a *Actor) applyRunwayGate(ctx context.Context, tx pgx.Tx, sessionRow sqlcg
 			return runwayGateResult{}, err
 		}
 		if err := a.armDispatchNow(ctx, tx); err != nil {
+			return runwayGateResult{}, err
+		}
+		return result, nil
+
+	case sandbox.RunwaySuspect:
+		if err := a.transitionSandboxToSuspect(ctx, tx, sandboxRow, time.Now(), watchdogRunwayGate, facts.SinceLastSeen); err != nil {
 			return runwayGateResult{}, err
 		}
 		return result, nil
@@ -468,11 +493,14 @@ func (a *Actor) recordRotationFallback(ctx context.Context, tx pgx.Tx, gen int, 
 }
 
 // runwayRuledOutResume reports whether a resume of row's provider object is
-// ruled out because the gate took its gen out for its runway: a rotation
-// of it, or its deadline passed. A resume claims the same provider object
-// and carries its deadline forward (technical plan §35.2), so it would
-// bring back the sandbox the rotation replaces, and the gate would retire
-// it again. Read only for a provider that resumes, on the database's clock.
+// ruled out because the gate took its gen out: a rotation of it, or its
+// deadline passed. Those are the gate's every retirement (EvaluateRunway:
+// TestEvaluateRunway_Properties pins that no other row retires), and its
+// suspicion of a silent agent ends, when the grace runs out, in failed,
+// which is never resumed. A resume claims the same provider object and
+// carries its deadline forward (technical plan §35.2), so it would bring
+// back the sandbox the gate replaces, and the gate would retire it again.
+// Read only for a provider that resumes, on the database's clock.
 func (a *Actor) runwayRuledOutResume(ctx context.Context, tx pgx.Tx, row sqlcgen.Sandbox) (bool, error) {
 	if rotating(row) {
 		return true, nil
@@ -531,7 +559,7 @@ func (a *Actor) recordRunwayGate(ctx context.Context, note *runwayNote) {
 			"snapshotting_seconds", int64(f.SinceSnapshotStart.Seconds()), "silent_seconds", int64(f.SinceLastSeen.Seconds()))
 	}
 	switch {
-	case d.Action == sandbox.RunwayRetire || d.Action == sandbox.RunwayRevert:
+	case d.Action == sandbox.RunwayRetire || d.Action == sandbox.RunwayRevert || d.Action == sandbox.RunwaySuspect:
 		a.logger.Warn(runwayGateLogMessage(d), fields...)
 	case d.Reason == sandbox.RunwayReasonDeadlineUnknown:
 		a.logger.Debug(runwayGateLogMessage(d), fields...)
@@ -556,6 +584,8 @@ func runwayGateLogMessage(d sandbox.RunwayDecision) string {
 		return "sessionactor: runway gate: the sandbox gen is retired before anything more is sent to it"
 	case sandbox.RunwayRevert:
 		return "sessionactor: runway gate: a snapshot never reported is given up; the sandbox goes back to ready and takes the turn"
+	case sandbox.RunwaySuspect:
+		return "sessionactor: runway gate: the agent of a snapshotting sandbox fell silent; the sandbox is suspected, through its terminal grace"
 	case sandbox.RunwayHold:
 		if d.Reason == sandbox.RunwayReasonSnapshotInProgress {
 			return snapshotHeldLogMessage

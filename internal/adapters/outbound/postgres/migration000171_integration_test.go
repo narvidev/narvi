@@ -16,10 +16,10 @@ import (
 // This file runs the sandbox rotation migration (sandbox_rotation) through
 // golang-migrate against real Postgres, in a database of its own migrated
 // to the version before it first. The up adds what technical plan §35.3's
-// runway gate records on the sandbox row: the gen a rotation is of and when
-// it started (sandboxes.rotation_gen, rotation_started_at), and when the
-// snapshot in progress started (snapshot_started_at); the down removes
-// them.
+// runway gate records on the sandbox row: the gen a rotation is of, the
+// snapshot command it sent and when it started (sandboxes.rotation_gen,
+// rotation_message_id, rotation_started_at), and when the snapshot in
+// progress started (snapshot_started_at); the down removes them.
 //
 // It also pins what the migration's "Rolling deploy" and "Rolling back"
 // sections say of the previous binary: its sandbox statements -- copied
@@ -81,43 +81,47 @@ RETURNING ` + preRotationSandboxColumns
 // rotationColumns is the part of a sandbox row the migration is about,
 // read by name, with the gen the rotation is measured against.
 type rotationColumns struct {
-	gen                           int32
-	rotationGen                   sql.NullInt32
-	rotationStartedAt, snapshotAt sql.NullTime
-	pendingSnapshotMessageID      sql.NullString
+	gen                                         int32
+	rotationGen                                 sql.NullInt32
+	rotationStartedAt, snapshotAt               sql.NullTime
+	rotationMessageID, pendingSnapshotMessageID sql.NullString
 }
 
 func readRotationColumns(ctx context.Context, t *testing.T, db *sql.DB, sessionID string) rotationColumns {
 	t.Helper()
 	var c rotationColumns
-	if err := db.QueryRowContext(ctx, `SELECT gen, rotation_gen, rotation_started_at, snapshot_started_at, pending_snapshot_message_id
-		FROM sandboxes WHERE session_id = $1`, sessionID).Scan(&c.gen, &c.rotationGen, &c.rotationStartedAt, &c.snapshotAt, &c.pendingSnapshotMessageID); err != nil {
+	if err := db.QueryRowContext(ctx, `SELECT gen, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, pending_snapshot_message_id
+		FROM sandboxes WHERE session_id = $1`, sessionID).Scan(&c.gen, &c.rotationGen, &c.rotationMessageID, &c.rotationStartedAt, &c.snapshotAt, &c.pendingSnapshotMessageID); err != nil {
 		t.Fatalf("read the sandbox's rotation columns: %v", err)
 	}
 	return c
 }
 
 func (c rotationColumns) String() string {
-	return fmt.Sprintf("gen %d, rotation_gen %v, rotation_started_at %v, snapshot_started_at %v, pending %v",
-		c.gen, c.rotationGen, c.rotationStartedAt.Valid, c.snapshotAt.Valid, c.pendingSnapshotMessageID)
+	return fmt.Sprintf("gen %d, rotation_gen %v, rotation_message_id %v, rotation_started_at %v, snapshot_started_at %v, pending %v",
+		c.gen, c.rotationGen, c.rotationMessageID, c.rotationStartedAt.Valid, c.snapshotAt.Valid, c.pendingSnapshotMessageID)
 }
 
-// readRunwayFacts runs this release's runway read and returns whether it
-// reads a rotation, and whether it reads the snapshot's start.
-func readRunwayFacts(ctx context.Context, t *testing.T, db *sql.DB, sessionID string) (rotating, startKnown bool) {
+// runwayFacts is what the migration's tests read of this release's runway
+// read: whether it reads a rotation, whether the snapshot in progress is
+// that rotation's own, and whether it reads the snapshot's start.
+type runwayFacts struct{ rotating, ownSnapshot, startKnown bool }
+
+func readRunwayFacts(ctx context.Context, t *testing.T, db *sql.DB, sessionID string) runwayFacts {
 	t.Helper()
 	q := generatedQuery(t, "sandboxes.sql.go", "getSandboxRunway")
+	var f runwayFacts
 	var gen int32
 	var status string
-	var deadlineKnown, taken bool
+	var deadlineKnown, taken, midSnapshot bool
 	var runway, sinceRotation, sinceStart, sinceSeen int64
 	var lifetime int32
 	var delivery, observed sql.NullTime
-	if err := db.QueryRowContext(ctx, q, sessionID).Scan(&gen, &status, &deadlineKnown, &runway, &lifetime, &rotating, &sinceRotation, &taken,
-		&startKnown, &sinceStart, &sinceSeen, &delivery, &observed); err != nil {
+	if err := db.QueryRowContext(ctx, q, sessionID).Scan(&gen, &status, &deadlineKnown, &runway, &lifetime, &f.rotating, &f.ownSnapshot, &sinceRotation, &taken,
+		&f.startKnown, &sinceStart, &sinceSeen, &midSnapshot, &delivery, &observed); err != nil {
 		t.Fatalf("this release's runway read: %v", err)
 	}
-	return rotating, startKnown
+	return f
 }
 
 func TestMigrationSandboxRotation_UpAndDown(t *testing.T) {
@@ -130,7 +134,7 @@ func TestMigrationSandboxRotation_UpAndDown(t *testing.T) {
 		t.Helper()
 		rows, err := db.QueryContext(ctx, `SELECT table_name || '.' || column_name, is_nullable || ' ' || coalesce(column_default, '') || ' ' || data_type
 			FROM information_schema.columns
-			WHERE table_name = 'sandboxes' AND column_name IN ('rotation_gen', 'rotation_started_at', 'snapshot_started_at')`)
+			WHERE table_name = 'sandboxes' AND column_name IN ('rotation_gen', 'rotation_message_id', 'rotation_started_at', 'snapshot_started_at')`)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -172,6 +176,7 @@ func TestMigrationSandboxRotation_UpAndDown(t *testing.T) {
 	}
 	want := map[string]string{
 		"sandboxes.rotation_gen":        "YES  integer",
+		"sandboxes.rotation_message_id": "YES  text",
 		"sandboxes.rotation_started_at": "YES  timestamp with time zone",
 		"sandboxes.snapshot_started_at": "YES  timestamp with time zone",
 	}
@@ -187,11 +192,11 @@ func TestMigrationSandboxRotation_UpAndDown(t *testing.T) {
 
 	// No backfill: nothing reads rotating, and the snapshot in progress has
 	// no start until this release's first look gives it one.
-	if c := readRotationColumns(ctx, t, db, sessionID); c.rotationGen.Valid || c.rotationStartedAt.Valid || c.snapshotAt.Valid {
+	if c := readRotationColumns(ctx, t, db, sessionID); c.rotationGen.Valid || c.rotationMessageID.Valid || c.rotationStartedAt.Valid || c.snapshotAt.Valid {
 		t.Fatalf("a sandbox at the migration reads %v; want nothing recorded", c)
 	}
-	if rotating, startKnown := readRunwayFacts(ctx, t, db, sessionID); rotating || startKnown {
-		t.Fatalf("runway at the migration: rotating %v, start known %v; want neither", rotating, startKnown)
+	if f := readRunwayFacts(ctx, t, db, sessionID); f.rotating || f.ownSnapshot || f.startKnown {
+		t.Fatalf("runway at the migration: %+v; want nothing rotating, no start", f)
 	}
 	stamp := generatedQuery(t, "sandboxes.sql.go", "stampSandboxSnapshotStart")
 	if res, err := db.ExecContext(ctx, stamp, sessionID, 1); err != nil {
@@ -199,7 +204,7 @@ func TestMigrationSandboxRotation_UpAndDown(t *testing.T) {
 	} else if n, _ := res.RowsAffected(); n != 1 {
 		t.Fatalf("StampSandboxSnapshotStart affected %d rows, want 1", n)
 	}
-	if _, startKnown := readRunwayFacts(ctx, t, db, sessionID); !startKnown {
+	if f := readRunwayFacts(ctx, t, db, sessionID); !f.startKnown {
 		t.Fatal("the snapshot in progress has no start after this release's first look")
 	}
 
@@ -213,8 +218,21 @@ func TestMigrationSandboxRotation_UpAndDown(t *testing.T) {
 	} else if n, _ := res.RowsAffected(); n != 1 {
 		t.Fatalf("StartSandboxRotation affected %d rows, want 1", n)
 	}
-	if rotating, _ := readRunwayFacts(ctx, t, db, sessionID); !rotating {
-		t.Fatal("this release's rotation does not read rotating")
+	if c := readRotationColumns(ctx, t, db, sessionID); !c.rotationMessageID.Valid || c.rotationMessageID.String != "cmd-rotation" {
+		t.Fatalf("after this release's rotation: %v; want its snapshot command recorded", c)
+	}
+	if f := readRunwayFacts(ctx, t, db, sessionID); !f.rotating || f.ownSnapshot {
+		t.Fatalf("this release's rotation on a ready row reads %+v; want rotating, no snapshot in progress", f)
+	}
+	// Its snapshot in progress reads as the rotation's own.
+	if _, err := db.ExecContext(ctx, `UPDATE sandboxes SET status = 'snapshotting' WHERE session_id = $1`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if f := readRunwayFacts(ctx, t, db, sessionID); !f.rotating || !f.ownSnapshot {
+		t.Fatalf("the rotation's snapshot in progress reads %+v; want rotating, its own snapshot", f)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE sandboxes SET status = 'ready' WHERE session_id = $1`, sessionID); err != nil {
+		t.Fatal(err)
 	}
 
 	// The previous binary, still running during a rolling deploy: it reads
@@ -226,7 +244,7 @@ func TestMigrationSandboxRotation_UpAndDown(t *testing.T) {
 	if c.gen != 2 || !c.rotationGen.Valid || c.rotationGen.Int32 != 1 || !c.snapshotAt.Valid {
 		t.Fatalf("after the previous binary's claim: %v; want gen 2 with gen 1's rotation and start left", c)
 	}
-	if rotating, _ := readRunwayFacts(ctx, t, db, sessionID); rotating {
+	if f := readRunwayFacts(ctx, t, db, sessionID); f.rotating {
 		t.Fatal("a rotation left on the replaced gen reads rotating")
 	}
 	// A snapshot it starts carries the start left there: given up early,
@@ -235,8 +253,8 @@ func TestMigrationSandboxRotation_UpAndDown(t *testing.T) {
 		t.Fatal(err)
 	}
 	previousRow(ctx, t, db, sandboxColumns, preRotationPendingSnapshot, sessionID, "cmd-previous-binary")
-	if _, startKnown := readRunwayFacts(ctx, t, db, sessionID); !startKnown {
-		t.Fatal("the previous binary's snapshot does not read the start left on the row")
+	if f := readRunwayFacts(ctx, t, db, sessionID); !f.startKnown || f.ownSnapshot {
+		t.Fatalf("the previous binary's snapshot reads %+v; want the start left on the row, and not a rotation's", f)
 	}
 	// This release's claim clears everything the rotation recorded.
 	upsert := generatedQuery(t, "sandboxes.sql.go", "upsertSandboxForSpawn")
@@ -244,7 +262,7 @@ func TestMigrationSandboxRotation_UpAndDown(t *testing.T) {
 		t.Fatalf("this release's UpsertSandboxForSpawn: %v", err)
 	}
 	third := readRotationColumns(ctx, t, db, sessionID)
-	if third.gen != 3 || third.rotationGen.Valid || third.rotationStartedAt.Valid || third.snapshotAt.Valid {
+	if third.gen != 3 || third.rotationGen.Valid || third.rotationMessageID.Valid || third.rotationStartedAt.Valid || third.snapshotAt.Valid {
 		t.Fatalf("after this release's claim: %v; want gen 3 with nothing recorded", third)
 	}
 	// Leave a rotation recorded, to see it kept across a rollback.

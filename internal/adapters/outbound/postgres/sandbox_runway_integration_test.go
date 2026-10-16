@@ -23,6 +23,7 @@ type runwaySeed struct {
 	deadlineGen        *int32
 	lifetimeSeconds    *int32
 	rotationGen        *int32
+	rotationMessageID  *string
 	rotationAgo        *time.Duration
 	snapshotID         *string
 	provenanceID       *string
@@ -32,6 +33,7 @@ type runwaySeed struct {
 	createdAgo         time.Duration
 	deliveryStartedAgo *time.Duration
 	pendingSnapshotID  *string
+	preSuspectStatus   *string
 }
 
 func durp(d time.Duration) *time.Duration { return &d }
@@ -59,11 +61,11 @@ func seedRunwayRow(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessio
 		last_seen_at = now() - make_interval(secs => $13::double precision),
 		created_at = now() - make_interval(secs => $14::double precision),
 		pr_delivery_started_at = now() - make_interval(secs => $15::double precision),
-		pending_snapshot_message_id = $16
+		pending_snapshot_message_id = $16, rotation_message_id = $17, pre_suspect_status = $18::sandbox_status
 		WHERE session_id = $1`,
 		sessionID, s.gen, s.status, secs(s.deadlineFromNow), s.deadlineGen, s.lifetimeSeconds,
 		s.rotationGen, secs(s.rotationAgo), s.snapshotID, s.provenanceID, secs(s.mintedAgo), secs(s.snapshotStartAgo),
-		secs(s.lastSeenAgo), s.createdAgo.Seconds(), secs(s.deliveryStartedAgo), s.pendingSnapshotID); err != nil {
+		secs(s.lastSeenAgo), s.createdAgo.Seconds(), secs(s.deliveryStartedAgo), s.pendingSnapshotID, s.rotationMessageID, s.preSuspectStatus); err != nil {
 		t.Fatalf("seed the sandbox: %v", err)
 	}
 }
@@ -78,10 +80,12 @@ func near(got int64, want time.Duration) bool {
 // TestGetSandboxRunway_ReadsEveryFactOnTheDatabaseClock pins the runway
 // gate's one read (technical plan §35.3): the deadline counts only for the
 // live gen it was stamped for, the lifetime only with it, a rotation only
-// of the live gen, its snapshot taken only when recorded with its
-// provenance at or after the rotation started, a snapshot's start when one
-// is recorded, the last sign of life (created_at when there is none yet),
-// and a delivery's stamp with the database's now.
+// of the live gen, the snapshot in progress the rotation's own only while
+// its pending command is the one the rotation sent, its snapshot taken only
+// when recorded with its provenance at or after the rotation started, a
+// snapshot's start when one is recorded, the last sign of life (created_at
+// when there is none yet), a suspect sandbox suspected mid-snapshot only
+// when it was snapshotting, and a delivery's stamp with the database's now.
 func TestGetSandboxRunway_ReadsEveryFactOnTheDatabaseClock(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -100,7 +104,8 @@ func TestGetSandboxRunway_ReadsEveryFactOnTheDatabaseClock(t *testing.T) {
 			if r.Gen != 2 || r.Status != sqlcgen.SandboxStatusReady || !r.DeadlineKnown || !near(r.RunwayNanos, 30*time.Minute) || r.LifetimeSeconds != 7200 {
 				t.Fatalf("%+v: want gen 2 ready, 30m of runway known, lifetime 7200", r)
 			}
-			if r.Rotating || r.RotationSnapshotTaken || r.SnapshotStartKnown || !near(r.SinceLastSeenNanos, 10*time.Second) || r.PrDeliveryStartedAt.Valid || !r.ObservedAt.Valid {
+			if r.Rotating || r.RotationSnapshotPending || r.RotationSnapshotTaken || r.SnapshotStartKnown || r.SuspectedMidSnapshot ||
+				!near(r.SinceLastSeenNanos, 10*time.Second) || r.PrDeliveryStartedAt.Valid || !r.ObservedAt.Valid {
 				t.Fatalf("%+v: want nothing rotating or snapshotting, seen 10s ago, no delivery, the database's now", r)
 			}
 		}},
@@ -156,6 +161,52 @@ func TestGetSandboxRunway_ReadsEveryFactOnTheDatabaseClock(t *testing.T) {
 				t.Fatalf("%+v: want not rotating", r)
 			}
 		}},
+		{name: "the rotation's own snapshot in progress", seed: func(s *runwaySeed) {
+			s.rotationGen, s.rotationMessageID, s.rotationAgo = i32p(2), strpRunway("cmd-rotation"), durp(30*time.Second)
+			s.status, s.pendingSnapshotID, s.snapshotStartAgo = "snapshotting", strpRunway("cmd-rotation"), durp(30*time.Second)
+		}, check: func(t *testing.T, r sqlcgen.GetSandboxRunwayRow) {
+			if !r.Rotating || !r.RotationSnapshotPending {
+				t.Fatalf("%+v: want rotating, its own snapshot pending", r)
+			}
+		}},
+		{name: "another snapshot in progress on a rotating gen is not the rotation's", seed: func(s *runwaySeed) {
+			s.rotationGen, s.rotationMessageID, s.rotationAgo = i32p(2), strpRunway("cmd-rotation"), durp(4*time.Minute)
+			s.status, s.pendingSnapshotID, s.snapshotStartAgo = "snapshotting", strpRunway("cmd-post-turn"), durp(10*time.Second)
+		}, check: func(t *testing.T, r sqlcgen.GetSandboxRunwayRow) {
+			if !r.Rotating || r.RotationSnapshotPending {
+				t.Fatalf("%+v: want rotating, the snapshot pending not its own", r)
+			}
+		}},
+		{name: "the rotation's command, no longer snapshotting, is not pending", seed: func(s *runwaySeed) {
+			s.rotationGen, s.rotationMessageID, s.rotationAgo = i32p(2), strpRunway("cmd-rotation"), durp(time.Minute)
+			s.pendingSnapshotID = strpRunway("cmd-rotation")
+		}, check: func(t *testing.T, r sqlcgen.GetSandboxRunwayRow) {
+			if !r.Rotating || r.RotationSnapshotPending {
+				t.Fatalf("%+v: want rotating, nothing pending on a ready row", r)
+			}
+		}},
+		{name: "an older gen's rotation command is not the live gen's", seed: func(s *runwaySeed) {
+			s.rotationGen, s.rotationMessageID, s.rotationAgo = i32p(1), strpRunway("cmd-rotation"), durp(time.Minute)
+			s.status, s.pendingSnapshotID = "snapshotting", strpRunway("cmd-rotation")
+		}, check: func(t *testing.T, r sqlcgen.GetSandboxRunwayRow) {
+			if r.Rotating || r.RotationSnapshotPending {
+				t.Fatalf("%+v: want neither rotating nor its snapshot pending", r)
+			}
+		}},
+		{name: "suspected mid-snapshot", seed: func(s *runwaySeed) {
+			s.status, s.preSuspectStatus, s.pendingSnapshotID = "suspect", strpRunway("snapshotting"), strpRunway("cmd")
+		}, check: func(t *testing.T, r sqlcgen.GetSandboxRunwayRow) {
+			if r.Status != sqlcgen.SandboxStatusSuspect || !r.SuspectedMidSnapshot {
+				t.Fatalf("%+v: want suspect, suspected mid-snapshot", r)
+			}
+		}},
+		{name: "suspected while ready is not mid-snapshot", seed: func(s *runwaySeed) {
+			s.status, s.preSuspectStatus = "suspect", strpRunway("ready")
+		}, check: func(t *testing.T, r sqlcgen.GetSandboxRunwayRow) {
+			if r.Status != sqlcgen.SandboxStatusSuspect || r.SuspectedMidSnapshot {
+				t.Fatalf("%+v: want suspect, not mid-snapshot", r)
+			}
+		}},
 		{name: "a snapshot in progress, its start recorded", seed: func(s *runwaySeed) {
 			s.status, s.pendingSnapshotID, s.snapshotStartAgo = "snapshotting", strpRunway("cmd"), durp(45*time.Second)
 		}, check: func(t *testing.T, r sqlcgen.GetSandboxRunwayRow) {
@@ -196,7 +247,8 @@ func TestGetSandboxRunway_ReadsEveryFactOnTheDatabaseClock(t *testing.T) {
 
 // TestStartSandboxRotation_RecordsTheRotationOfTheLiveGen: the rotation's
 // start records the live gen, the database's now, the snapshot command as
-// the pending snapshot, and the snapshot's start; it is gen-fenced.
+// the rotation's and as the pending snapshot, and the snapshot's start; it
+// is gen-fenced.
 func TestStartSandboxRotation_RecordsTheRotationOfTheLiveGen(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -215,16 +267,17 @@ func TestStartSandboxRotation_RecordsTheRotationOfTheLiveGen(t *testing.T) {
 		t.Fatal(err)
 	}
 	if row.RotationGen == nil || *row.RotationGen != 3 || !row.RotationStartedAt.Valid || !row.SnapshotStartedAt.Valid ||
-		row.PendingSnapshotMessageID == nil || *row.PendingSnapshotMessageID != "cmd-rotation" {
-		t.Fatalf("row after the start: rotation %v started %v snapshot start %v pending %v; want gen 3, both starts, cmd-rotation",
-			row.RotationGen, row.RotationStartedAt.Valid, row.SnapshotStartedAt.Valid, row.PendingSnapshotMessageID)
+		row.PendingSnapshotMessageID == nil || *row.PendingSnapshotMessageID != "cmd-rotation" ||
+		row.RotationMessageID == nil || *row.RotationMessageID != "cmd-rotation" {
+		t.Fatalf("row after the start: rotation %v (%v) started %v snapshot start %v pending %v; want gen 3, cmd-rotation, both starts, cmd-rotation pending",
+			row.RotationGen, row.RotationMessageID, row.RotationStartedAt.Valid, row.SnapshotStartedAt.Valid, row.PendingSnapshotMessageID)
 	}
 	r, err := store.Runway(ctx, sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !r.Rotating || !near(r.SinceRotationNanos, 0) || !r.SnapshotStartKnown || !near(r.SinceSnapshotStartNanos, 0) {
-		t.Fatalf("runway after the start: %+v; want rotating and snapshotting since now", r)
+	if !r.Rotating || !r.RotationSnapshotPending || !near(r.SinceRotationNanos, 0) || !r.SnapshotStartKnown || !near(r.SinceSnapshotStartNanos, 0) {
+		t.Fatalf("runway after the start: %+v; want rotating and snapshotting since now, its own snapshot pending", r)
 	}
 }
 
@@ -304,14 +357,16 @@ func TestUpsertSandboxForSpawn_ClearsTheRotation(t *testing.T) {
 	pool := newTestPool(t)
 	store := narvipg.NewSandboxStore(pool)
 	sessionID := createTestSession(ctx, t, pool)
-	seedRunwayRow(ctx, t, pool, sessionID, runwaySeed{gen: 1, status: "stopped", rotationGen: i32p(1), rotationAgo: durp(time.Minute), snapshotStartAgo: durp(time.Minute)})
+	seedRunwayRow(ctx, t, pool, sessionID, runwaySeed{gen: 1, status: "stopped", rotationGen: i32p(1), rotationMessageID: strpRunway("cmd-rotation"),
+		rotationAgo: durp(time.Minute), snapshotStartAgo: durp(time.Minute)})
 
 	hash := "token-hash-gen-2"
 	row, err := store.UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{SessionID: sessionID, TokenHash: &hash, LifetimeSeconds: i32p(7200)})
 	if err != nil {
 		t.Fatalf("UpsertForSpawn: %v", err)
 	}
-	if row.Gen != 2 || row.RotationGen != nil || row.RotationStartedAt.Valid || row.SnapshotStartedAt.Valid {
-		t.Fatalf("after the claim: gen %d rotation %v started %v snapshot start %v; want gen 2 with none", row.Gen, row.RotationGen, row.RotationStartedAt.Valid, row.SnapshotStartedAt.Valid)
+	if row.Gen != 2 || row.RotationGen != nil || row.RotationMessageID != nil || row.RotationStartedAt.Valid || row.SnapshotStartedAt.Valid {
+		t.Fatalf("after the claim: gen %d rotation %v (%v) started %v snapshot start %v; want gen 2 with none",
+			row.Gen, row.RotationGen, row.RotationMessageID, row.RotationStartedAt.Valid, row.SnapshotStartedAt.Valid)
 	}
 }

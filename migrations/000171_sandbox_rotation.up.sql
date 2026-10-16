@@ -10,6 +10,13 @@
 -- (UpsertSandboxForSpawn) clears it, and a value left on an older gen
 -- reads "not rotating" whatever it holds.
 --
+-- sandboxes.rotation_message_id: the messageId of the snapshot command that
+-- rotation sent. The rotation waits on its own snapshot only while the
+-- pending snapshot command is this one: a rotating gen can be taking
+-- another, a post-turn snapshot started after the previous binary
+-- dispatched into it during a rolling deploy, and that one is waited for
+-- like any other, never cut short as if it were the rotation's.
+--
 -- sandboxes.rotation_started_at: the database's now() when that rotation
 -- started. The rotation waits RotationSnapshotWait from it for its
 -- snapshot, and whether its snapshot was taken is derived from
@@ -23,14 +30,16 @@
 -- pending_snapshot_message_id, in the statement that sets it, and cleared
 -- with it, so it describes the outstanding snapshot command and nothing
 -- else. A pending turn waits SnapshotReportWait from it; a snapshot that
--- has not reported by then is given up -- the sandbox back to ready when
--- its agent is still heard from, the gen retired when it is not. A
+-- has not reported by then is given up -- the sandbox back to ready once
+-- its agent is heard from after the wait, suspected (§3.2's two-phase
+-- rule) once it has been silent the heartbeat budget. A
 -- snapshot found with no start -- one in progress when this runs, or one
 -- the previous binary started -- is given one by the first evaluation that
 -- reads it, so it waits from then.
 --
 -- No backfill, no index: every read is by session_id, the row's unique key,
--- and NULL reads "not rotating" and "no start recorded yet".
+-- and NULL reads "not rotating", "no rotation snapshot pending" and "no
+-- start recorded yet".
 --
 -- # Locks
 --
@@ -46,13 +55,15 @@
 --     SELECT * and RETURNING * out as a column list), so it neither reads
 --     nor writes them.
 --   - It never starts a rotation. Its UpsertSandboxForSpawn leaves the
---     three columns as they were, and the gen it bumps makes a rotation
+--     four columns as they were, and the gen it bumps makes a rotation
 --     column left on the gen before read "not rotating".
 --   - A rotation this binary started that the previous binary then meets
 --     reads snapshotting to it, which holds its pending turn as it holds
 --     any snapshot. Once the rotation's snapshot is reported it may
---     dispatch into that gen; this binary's next evaluation of an idle
---     moment retires it (the rotation rows need no turn in flight to act).
+--     dispatch into that gen. This binary leaves a turn running there
+--     alone; a post-turn snapshot that follows it is waited for like any
+--     other -- it is not the rotation's own -- and once it is reported the
+--     gen is retired and restored from it, so the turn's work is kept.
 --   - A snapshot it starts carries no start, or the start of an earlier
 --     snapshot when the previous binary also recorded that one's report;
 --     the first is given one at this binary's first look, the second is
@@ -74,5 +85,6 @@
 --   - drop them: run this migration's down (goto 170) with this release's
 --     migrations. The down file says what it removes.
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS rotation_gen INTEGER;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS rotation_message_id TEXT;
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS rotation_started_at TIMESTAMPTZ;
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_started_at TIMESTAMPTZ;
