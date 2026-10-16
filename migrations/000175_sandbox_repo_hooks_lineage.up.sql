@@ -1,7 +1,7 @@
 -- Technical plan §6.4, §27.1, §30.4: a pull request's review session whose
 -- head is not in its base repository boots without the repository's hooks
 -- (SESSION_CONFIG's skipRepoHooks), so code the pull request brings never
--- runs at boot. 000173 records what each gen's agent can do; this records
+-- runs at boot. 000174 records what each gen's agent can do; this records
 -- what each gen was told, and what each snapshot's gen did, so the session
 -- actor never takes "this gen's agent can skip the hooks" for "this gen
 -- skipped them".
@@ -51,9 +51,9 @@
 --
 -- # Rolling back
 --
--- The previous binary cannot boot on 174 ("no migration found for version
--- 174"). With the control plane scaled to zero, either keep the columns
--- (`migrate force 173`; this file, run again, keeps their values) or run
--- the down (goto 173).
+-- The previous binary cannot boot on 175 ("no migration found for version
+-- 175"). With the control plane scaled to zero, either keep the columns
+-- (`migrate force 174`; this file, run again, keeps their values) or run
+-- the down (goto 174).
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS skip_repo_hooks_told_gen INTEGER;
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_skipped_repo_hooks BOOLEAN;

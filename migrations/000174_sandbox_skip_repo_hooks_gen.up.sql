@@ -44,15 +44,15 @@
 --   - It writes no skipRepoHooks into a SESSION_CONFIG, so a gen it spawns
 --     runs the repository's hooks as before, whatever its agent can do.
 --     The capability says nothing of what a boot did; what a gen was told
---     is recorded apart (migrations/000174_sandbox_repo_hooks_lineage), and
+--     is recorded apart (migrations/000175_sandbox_repo_hooks_lineage), and
 --     a gen of a session that boots without the hooks is sent a turn only
 --     when it was told to skip them and advertised it honours that -- the
 --     previous binary's gens, told nothing, are retired.
 --
 -- # Rolling back
 --
--- The previous binary cannot boot on 173 ("no migration found for version
--- 173"). With the control plane scaled to zero, either keep the column
--- (`migrate force 172`; this file, run again, keeps its values) or run the
--- down (goto 172).
+-- The previous binary cannot boot on 174 ("no migration found for version
+-- 174"). With the control plane scaled to zero, either keep the column
+-- (`migrate force 173`; this file, run again, keeps its values) or run the
+-- down (goto 173).
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS skip_repo_hooks_gen INTEGER;

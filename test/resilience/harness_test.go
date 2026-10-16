@@ -233,6 +233,21 @@ func (h *Harness) NewRegistryWithCommander(ctx context.Context, t *testing.T, co
 	return r
 }
 
+// NewRegistryWithProvider is NewRegistryWithCommander with a
+// ports.SandboxProvider as well, and the public base URL the sandboxes it
+// spawns and restores dial back to (their SessionConfig's
+// controlPlaneWsUrl): scenario #18 (technical plan §35.3) rotates a sandbox,
+// which retires its gen and restores the replacement through the provider.
+func (h *Harness) NewRegistryWithProvider(ctx context.Context, t *testing.T, commander ports.SandboxCommander, provider ports.SandboxProvider, publicBaseURL string) *sessionactor.Registry {
+	t.Helper()
+
+	r, err := sessionactor.NewRegistry(ctx, h.Pool, h.Timeouts, h.Hub, commander, provider, publicBaseURL, nil, nil, "", nil, false)
+	if err != nil {
+		t.Fatalf("sessionactor.NewRegistry (with provider): %v", err)
+	}
+	return r
+}
+
 // waitUntil polls cond every 20ms until it reports true, or fails the test
 // once timeout elapses -- shared by every scenario in this package that
 // needs to observe the eventual effect of an actor's own asynchronous

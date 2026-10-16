@@ -16,9 +16,9 @@ package sessionactor
 //
 // What a gen's agent can do is not what its boot did: a current agent
 // advertises capabilities.skipRepoHooks on every ready
-// (sandboxes.skip_repo_hooks_gen, migrations/000173) whatever its
+// (sandboxes.skip_repo_hooks_gen, migrations/000174) whatever its
 // SESSION_CONFIG said. So each gen also records what it was told
-// (sandboxes.skip_repo_hooks_told_gen, migrations/000174), written in the
+// (sandboxes.skip_repo_hooks_told_gen, migrations/000175), written in the
 // transaction that spawns or restores it and carried by a resume, and a
 // turn of a session that skips the hooks is sent only to a gen that was
 // told to skip them and advertised it honours that (applyRepoHooksGate,
@@ -135,6 +135,15 @@ func (a *Actor) applyRepoHooksGate(ctx context.Context, tx pgx.Tx, sessionRow sq
 		GenCapable:    skipRepoHooksCapable(sandboxRow),
 		HasSnapshot:   sandboxRow.SnapshotID != nil && *sandboxRow.SnapshotID != "",
 	})
+	// A gen mid-snapshot (the runway gate's rotation, or the snapshot after
+	// a turn) is never retired under its snapshot: the turn waits, and the
+	// snapshot's completion evaluates it again, the snapshot then recorded
+	// with what its gen did.
+	if (action == turn.RepoHooksRetireNotTold || action == turn.RepoHooksRetireGen) && sandbox.State(sandboxRow.Status) == sandbox.StateSnapshotting {
+		a.logger.Debug("sessionactor: repository hooks: the gen is to be retired once its snapshot completes",
+			"turn_id", target.ID.String(), "gen", sandboxRow.Gen, "action", string(action))
+		return reviewCheckoutResult{decision: reviewCheckoutHold}, nil
+	}
 	switch action {
 	case turn.RepoHooksProceed:
 		return notNeeded, nil

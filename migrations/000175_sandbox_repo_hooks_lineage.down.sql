@@ -1,18 +1,18 @@
--- Reverses 000174_sandbox_repo_hooks_lineage.up.sql. With the columns go
+-- Reverses 000175_sandbox_repo_hooks_lineage.up.sql. With the columns go
 -- every sandbox's record of whether its gen was told to boot without the
 -- repository's hooks, and every snapshot's record of whether its gen did.
--- A binary without 000174 does not read them; a binary with it that runs
--- 000174 again reads every gen as told nothing -- retired before a turn of
+-- A binary without 000175 does not read them; a binary with it that runs
+-- 000175 again reads every gen as told nothing -- retired before a turn of
 -- a session that skips the hooks -- and every snapshot as not minted
 -- without them.
 --
 -- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
--- 000174. Do not run it against live pods of a binary that carries 000174:
+-- 000175. Do not run it against live pods of a binary that carries 000175:
 -- every query of that binary that returns a whole sandbox row names the
 -- columns (sqlc writes each SELECT * and RETURNING * out as a column list),
 -- so each fails with SQLSTATE 42703 and no sandbox is spawned or read until
 -- the older binary replaces the pod; and a pod that restarts first applies
--- 000174 again at boot, which locks the older binary out again.
+-- 000175 again at boot, which locks the older binary out again.
 -- Guarded: IF EXISTS, so it also runs when the columns are already gone.
 -- The drops are catalog changes: they rewrite nothing, but take ACCESS
 -- EXCLUSIVE on sandboxes for the file's one implicit transaction, and touch

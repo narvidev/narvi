@@ -61,7 +61,7 @@ const (
 // ($1 gen, $2 afterFailure, $3 messageId, $4 readySeq, $5 turn), both read
 // from the sqlc output.
 // thisReleasesRecordReady is RecordSandboxReady as the release that
-// shipped 000168 sent it. The generated text has since gained 000173's
+// shipped 000168 sent it. The generated text has since gained 000174's
 // skip_repo_hooks_gen, a column this database, migrated to 000168, does
 // not have; this test pins 000167 and 000168, so it sends the statement
 // those migrations shipped with.

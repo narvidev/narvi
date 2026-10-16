@@ -135,6 +135,15 @@ type fakeSpawnProvider struct {
 	// nil (the zero value) for every other test, so nothing changes for
 	// them.
 	providerCreated func(context.Context)
+
+	// explicitStop, noSnapshots and stopCalls are technical plan §35.3's
+	// own extension (runway_integration_test.go): Capabilities().
+	// ExplicitStop and Snapshots per test -- false and true, the values
+	// Capabilities() always reported, by default -- and every StopSandbox
+	// call recorded.
+	explicitStop bool
+	noSnapshots  bool
+	stopCalls    []ports.SandboxRef
 }
 
 // fakeRestoreCall records one RestoreFromSnapshot invocation's own
@@ -150,9 +159,9 @@ var _ ports.SandboxProvider = (*fakeSpawnProvider)(nil)
 
 func (f *fakeSpawnProvider) Capabilities() ports.Capabilities {
 	return ports.Capabilities{
-		Snapshots:       true,
+		Snapshots:       !f.noSnapshots,
 		Resume:          f.resumeSupported,
-		ExplicitStop:    false,
+		ExplicitStop:    f.explicitStop,
 		ImageBuilds:     false,
 		DockerInSandbox: f.dockerSupported,
 		EgressPolicy:    f.egressPolicySupported,
@@ -187,7 +196,22 @@ func (f *fakeSpawnProvider) CreateSandbox(ctx context.Context, spec ports.Create
 	return ref, err
 }
 
-func (f *fakeSpawnProvider) StopSandbox(context.Context, ports.SandboxRef) error { return nil }
+func (f *fakeSpawnProvider) StopSandbox(_ context.Context, ref ports.SandboxRef) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.stopCalls = append(f.stopCalls, ref)
+	return nil
+}
+
+func (f *fakeSpawnProvider) stoppedProviderIDs() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, 0, len(f.stopCalls))
+	for _, ref := range f.stopCalls {
+		out = append(out, ref.ProviderID)
+	}
+	return out
+}
 func (f *fakeSpawnProvider) ResumeSandbox(ctx context.Context, ref ports.SandboxRef) error {
 	f.mu.Lock()
 	f.resumeCalls = append(f.resumeCalls, ref)
@@ -294,12 +318,16 @@ func (f *fakeSpawnProvider) lastResumeCall() ports.SandboxRef {
 }
 
 // fakeSendCommander is a test-only ports.SandboxCommander recording every
-// SendCommand call and returning a caller-configured error.
+// SendCommand call and returning a caller-configured error. failTypes, when
+// set, fails every command of a type it names with that error instead
+// (technical plan §35.3's own extension, runway_integration_test.go); the
+// command is recorded either way.
 type fakeSendCommander struct {
-	mu       sync.Mutex
-	sessions []string
-	payloads []json.RawMessage
-	nextErr  error
+	mu        sync.Mutex
+	sessions  []string
+	payloads  []json.RawMessage
+	nextErr   error
+	failTypes map[string]error
 }
 
 var _ ports.SandboxCommander = (*fakeSendCommander)(nil)
@@ -309,6 +337,16 @@ func (f *fakeSendCommander) SendCommand(sessionID string, payload json.RawMessag
 	defer f.mu.Unlock()
 	f.sessions = append(f.sessions, sessionID)
 	f.payloads = append(f.payloads, payload)
+	if len(f.failTypes) > 0 {
+		var env struct {
+			Type string `json:"type"`
+		}
+		if json.Unmarshal(payload, &env) == nil {
+			if err, ok := f.failTypes[env.Type]; ok {
+				return err
+			}
+		}
+	}
 	return f.nextErr
 }
 
@@ -1820,106 +1858,6 @@ func TestHandleEnsureDispatched_HealthySpawning_WithinStuckTimeout_NoChange(t *t
 	}
 	if row.Gen != created.Gen {
 		t.Errorf("sandbox gen = %d, want unchanged %d", row.Gen, created.Gen)
-	}
-}
-
-// TestHandleEnsureDispatched_PendingTurnWhileSnapshotting_HeldNoErrorNoBackoff
-// pins the spawn decision's snapshotting row through the real evaluation
-// (technical plan §35.3; §3.3's "complete turn -> trigger snapshot -> ...
-// -> dispatch next"): a turn queued behind a post-turn snapshot, on a
-// sandbox spawned longer ago than SpawnCooldown -- in production, every
-// one -- is held, not failed. The evaluation commits, deleting the
-// dispatch timer, and spawns, sends and moves nothing; the snapshot's own
-// snapshot_ready then returns the sandbox to Ready and the same gen takes
-// the turn. Before the row, the decision fell through to Spawn, which
-// planFreshSpawn refused (no spawn edge out of snapshotting): the
-// evaluation rolled back and the dispatch timer was backed off, on every
-// evaluation until the snapshot ended. Nothing bounds the hold yet, so
-// each held evaluation logs the gen and how long the sandbox has been
-// snapshotting, read from the sandbox_status event that recorded it.
-func TestHandleEnsureDispatched_PendingTurnWhileSnapshotting_HeldNoErrorNoBackoff(t *testing.T) {
-	ctx := context.Background()
-	pool := newTestPool(t)
-	sessionID := createTestSession(ctx, t, pool)
-
-	// Gen 1, mid post-turn snapshot, spawned and last seen an hour ago:
-	// past SpawnCooldown, SpawnReadyWait and SpawnStuckTimeout alike.
-	seedReadySandbox(ctx, t, pool, sessionID)
-	const snapshotCommandID = "snapshot-command-1"
-	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'snapshotting', pending_snapshot_message_id = $2,
-		created_at = now() - interval '1 hour', last_seen_at = now() - interval '1 hour' WHERE session_id = $1`,
-		sessionID, snapshotCommandID); err != nil {
-		t.Fatalf("seed the snapshotting sandbox: %v", err)
-	}
-	// The sandbox_status event the move to snapshotting stored, 10 minutes ago.
-	if _, err := pool.Exec(ctx, `INSERT INTO events (session_id, type, payload, message_id, created_at)
-		VALUES ($1, $2, '{"sandbox": {"gen": 1, "status": "snapshotting"}}', 'seeded-sandbox-status', now() - interval '10 minutes')`,
-		sessionID, SandboxStatusEventType); err != nil {
-		t.Fatalf("seed the sandbox_status event: %v", err)
-	}
-	queued := createTurnArmingDispatch(ctx, t, pool, sessionID, "the turn queued behind the snapshot")
-	logs := captureDefaultLoggerLocked(t) // before GetOrSpawn: the actor takes its logger at hydrate
-
-	commander := &fakeSendCommander{}
-	provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "provider-object-should-never-be-used"}}
-	r := newDispatchTestRegistry(t, ctx, pool, provider, commander)
-	t.Cleanup(func() { _ = r.Shutdown() })
-	a, err := r.GetOrSpawn(ctx, sessionID)
-	if err != nil {
-		t.Fatalf("GetOrSpawn: %v", err)
-	}
-	sendEnsureDispatched(ctx, t, a)
-
-	// The evaluation either commits, deleting the dispatch timer, or fails,
-	// rolls back and backs the timer off past now: wait for either.
-	waitUntil(t, 5*time.Second, func() bool {
-		row, ok := dispatchTimer(ctx, t, pool, sessionID)
-		return !ok || row.FiresAt.Time.After(time.Now())
-	})
-	if row, ok := dispatchTimer(ctx, t, pool, sessionID); ok {
-		t.Fatalf("dispatch timer still armed, due %v: the evaluation failed and backed off instead of holding the turn", row.FiresAt.Time)
-	}
-	if n := provider.callCount() + provider.restoreCallCount() + provider.resumeCallCount(); n != 0 {
-		t.Errorf("provider called %d times, want none: a snapshotting sandbox is neither respawned nor replaced", n)
-	}
-	if n := commander.callCount(); n != 0 {
-		t.Errorf("SendCommand called %d times, want none while the snapshot is in progress", n)
-	}
-	sandboxRow, err := narvipg.NewSandboxStore(pool).Get(ctx, sessionID)
-	if err != nil {
-		t.Fatalf("get sandbox: %v", err)
-	}
-	if sandboxRow.Status != sqlcgen.SandboxStatusSnapshotting || sandboxRow.Gen != 1 {
-		t.Errorf("sandbox = %s at gen %d, want snapshotting at gen 1, untouched", sandboxRow.Status, sandboxRow.Gen)
-	}
-	turnStore := narvipg.NewTurnStore(pool)
-	if got, err := turnStore.Get(ctx, queued.ID); err != nil || got.Status != sqlcgen.TurnStatusPending {
-		t.Fatalf("queued turn = %v (err %v), want it still pending", got.Status, err)
-	}
-	held := logs.entry(t, "sessionactor: turn held: its sandbox is snapshotting")
-	if held["gen"] != float64(1) || held["pending_snapshot_message_id"] != snapshotCommandID {
-		t.Errorf("held-turn log = %v, want gen 1 and the pending snapshot command", held)
-	}
-	if secs, ok := held["snapshotting_seconds"].(float64); !ok || secs < 600 || secs > 660 {
-		t.Errorf("held-turn log snapshotting_seconds = %v, want about 600 (the sandbox_status event's age)", held["snapshotting_seconds"])
-	}
-
-	// The snapshot's own report ends the hold: the turn goes to the same gen.
-	outcome := sendSandboxEvent(ctx, t, a, SandboxEvent{Type: "snapshot_ready", Gen: 1, Raw: json.RawMessage(
-		`{"type":"snapshot_ready","messageId":"sr-1","sessionId":"s","gen":1,"ackId":"snapshot_ready:sr-1","snapshotId":"snap-1","commandMessageId":"` + snapshotCommandID + `"}`)})
-	if !outcome.Persisted {
-		t.Fatal("snapshot_ready: Persisted = false, want true")
-	}
-	waitUntil(t, 5*time.Second, func() bool { return promptCount(commander) == 1 })
-	got, err := turnStore.Get(ctx, queued.ID)
-	if err != nil {
-		t.Fatalf("get turn: %v", err)
-	}
-	if got.Status != sqlcgen.TurnStatusProcessing || got.DispatchedSandboxGen == nil || *got.DispatchedSandboxGen != 1 {
-		t.Errorf("queued turn = %s on gen %v, want processing on gen 1", got.Status, got.DispatchedSandboxGen)
-	}
-	if n := provider.callCount() + provider.restoreCallCount() + provider.resumeCallCount(); n != 0 {
-		t.Errorf("provider called %d times, want none", n)
 	}
 }
 

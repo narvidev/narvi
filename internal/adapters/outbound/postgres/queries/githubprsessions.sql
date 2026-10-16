@@ -331,7 +331,7 @@ WHERE repo_full_name = $1 AND pr_number = $2 AND session_id IS NOT NULL
 RETURNING *;
 
 -- name: RecordGitHubPRSessionHeadInBase :exec
--- Technical plan §27.1, §30.4, migrations/000172: records whether the pull
+-- Technical plan §27.1, §30.4, migrations/000173: records whether the pull
 -- request's head branch is a branch of its base repository, from the
 -- mention the GitHub ingress is handling. Run inside the claim transaction,
 -- under LockGitHubPRSessionForUpdate's row lock, on every mention that read

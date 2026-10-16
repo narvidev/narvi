@@ -483,7 +483,7 @@ type RecordGitHubPRSessionHeadInBaseParams struct {
 	PrNumber     int32  `json:"pr_number"`
 }
 
-// Technical plan §27.1, §30.4, migrations/000172: records whether the pull
+// Technical plan §27.1, §30.4, migrations/000173: records whether the pull
 // request's head branch is a branch of its base repository, from the
 // mention the GitHub ingress is handling. Run inside the claim transaction,
 // under LockGitHubPRSessionForUpdate's row lock, on every mention that read

@@ -13,7 +13,7 @@ import (
 
 // TestSandboxStore_RepoHooksLineage pins what a gen and its snapshot
 // record of the repository's hooks (technical plan §6.4, §27.1, migrations/
-// 000174): RecordRepoHooksTold writes what the live gen was told, and only
+// 000175): RecordRepoHooksTold writes what the live gen was told, and only
 // for the live gen; CarryRepoHooksTold gives a resumed gen what the gen it
 // resumes was told; and a snapshot's mint records it as minted without the
 // hooks exactly when its gen was told to skip them and its ready advertised

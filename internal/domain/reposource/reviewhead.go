@@ -27,7 +27,7 @@ func URLNamesRepository(rawURL, fullName string) bool {
 // repository (technical plan §27.1, §30.4). Both must hold:
 //
 //   - claimHeadInBase, the session's github_pr_sessions claim's record
-//     (head_in_base, migrations/000172), is true. The GitHub ingress writes
+//     (head_in_base, migrations/000173), is true. The GitHub ingress writes
 //     it on every mention that read the pull request's head, from its
 //     head.repo: true only when the head repository is the claim's, false
 //     for a fork's and a deleted fork's. A mention that read no head writes

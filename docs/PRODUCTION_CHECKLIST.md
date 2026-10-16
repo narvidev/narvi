@@ -412,14 +412,32 @@ own only if the provider really lets every sandbox run at least that
 long, counted from no earlier than its create or restore call. Nothing
 in this repository can read the provider's limit.
 
-Today nothing acts on the recorded deadline: a turn is dispatched as it
-always was, whatever its sandbox's age, so a sandbox near its provider's
-limit can still be ended mid-turn. The pre-dispatch runway gate that
-will read the deadline (§35.3) is Step 137, not yet built. Once it is, a
-provider that ends sandboxes sooner than assumed makes every recorded
-deadline late, and the gate would dispatch onto a sandbox the row says
-has runway -- the failure §35 exists to prevent. Check it now, so the
-deadline is right before anything relies on it.
+The pre-dispatch runway gate (§35.3) acts on the recorded deadline.
+Before a turn is dispatched to a live sandbox with less than
+`min(RotationRunwayFloor, lifetime/6)` of it left (13 minutes at the
+shipped values), the sandbox is rotated -- snapshotted, replaced, and
+restored under a new gen with a fresh deadline -- and one past it whose
+agent has gone silent is suspected, given the terminal grace any silence
+gets, and restored if no sign of life comes. So a provider that ends
+sandboxes sooner than assumed makes every recorded deadline late, and the
+gate dispatches onto a sandbox the row says has runway -- the failure §35
+exists to prevent. The gate relies on the deadline from the first turn,
+so check it before deploying.
+
+A provider that lets a sandbox run longer than `ProviderHardCap` is safe,
+and the longer limit goes unused: the gate reads the recorded deadline,
+not the provider's, so every sandbox that still has turns queued is
+rotated about 13 minutes before its 2-hour estimate, at the first turn
+queued for it after then, and that turn waits for a snapshot, a restore
+and the replacement's boot. A sandbox that outlives its estimate is not
+cut short while its agent is still heard from: a snapshot and a push in
+progress are waited for, then it is rotated through its own snapshot, so
+no work is lost. Only a sandbox past its estimate whose agent has been
+silent `SteadyHeartbeatBudget`, and stays silent through its terminal
+grace, is replaced. Using a longer limit
+means raising `ProviderHardCap`, `SandboxLifetime` and
+`ReviewSandboxLifetime` in `timeouts.go`, in a release, once the provider
+guarantees it.
 
 **Check.** In the provider's own configuration or documentation for the
 account this deployment uses, read the longest a sandbox may run and the

@@ -2,19 +2,23 @@ package sandbox
 
 import "time"
 
-// The pre-dispatch runway gate (technical plan §35.3): a turn is never
+// The pre-dispatch runway gate (technical plan §35.3): before a turn is
 // dispatched into a live sandbox with less than the rotation threshold of
-// its lifetime left. Below it the sandbox rotates first -- snapshot,
-// stopped, shutdown, restore, over the machine's existing edges -- and the
-// turn stays pending for the replacement. A rotation the gate cannot make
-// (no deadline known, a turn in flight, a suspect sandbox, no snapshot
-// capability) is declined, and the turn is dispatched as before, so the
-// queue never stalls on the gate.
+// its lifetime left, the sandbox rotates -- snapshot, stopped, shutdown,
+// restore, over the machine's existing edges -- and the turn stays pending
+// for the replacement. That is no guarantee: a rotation the gate cannot
+// make (no deadline known, a turn in flight, a suspect sandbox, no snapshot
+// capability) is declined, and the turn is dispatched as before, below the
+// threshold, so the queue never stalls on the gate. Nor does a snapshot
+// that never reports: the gate gives one up once it has waited for it, the
+// sandbox kept when its agent is heard from after the wait, and suspected
+// -- the liveness path every silence takes -- when it falls silent.
 //
 // EvaluateRunway decides one dispatch evaluation from the sandbox row's
 // facts. A rotation is not a state of its own: it is data on the row
 // (which gen is rotating, since when, whether its snapshot was recorded)
-// that each evaluation reads, so the decision is the whole of it.
+// that each evaluation reads, so the decision is the whole of it. So is a
+// snapshot in progress: the row records when it started.
 //
 // It takes no now. Every duration in RunwayFacts is computed by the
 // caller on the database's clock, in the statement that reads the row, so
@@ -27,8 +31,9 @@ import "time"
 // its own threshold, so a rotation can never lead straight into another.
 const rotationLifetimeDivisor = 6
 
-// RotationThreshold is the least runway a turn is dispatched with:
-// min(floor, lifetime/6), or floor when lifetime is not positive.
+// RotationThreshold is the runway below which the gate rotates a sandbox
+// before dispatching to it, when it can: min(floor, lifetime/6), or floor
+// when lifetime is not positive.
 // Lifetime is the gen's own when its row records one, otherwise the
 // shortest any kind is given (the caller's choice, the conservative one).
 func RotationThreshold(floor, lifetime time.Duration) time.Duration {
@@ -62,12 +67,38 @@ type RunwayFacts struct {
 	CanSnapshot bool
 	// Rotating is true when the row records a rotation of its current gen.
 	Rotating bool
+	// RotationSnapshotPending is true when the snapshot in progress is the
+	// rotation's own: its command is the one the rotation sent. A rotating
+	// gen can be taking another, a post-turn snapshot a previous binary
+	// started after it dispatched into the gen during a rolling deploy.
+	RotationSnapshotPending bool
 	// SinceRotationStart is the database's now less the rotation's start.
 	// Meaningless unless Rotating.
 	SinceRotationStart time.Duration
 	// RotationSnapshotTaken is true when the row's snapshot was recorded,
 	// with its provenance, at or after the rotation started.
 	RotationSnapshotTaken bool
+	// SinceSnapshotStart is the database's now less the start of the
+	// snapshot in progress, a rotation's or any other. Meaningless unless
+	// the sandbox is snapshotting.
+	SinceSnapshotStart time.Duration
+	// SinceLastSeen is the database's now less the sandbox's last sign of
+	// life (last_seen_at): its agent heartbeats on a loop of its own, so
+	// a long silence says the agent is gone, not that it is busy.
+	SinceLastSeen time.Duration
+	// ReplayPending is true while the frames the agent replays on its
+	// current connection may still be on their way: fewer than two
+	// heartbeats have been recorded since that connection's ready. On
+	// every connection the agent sends ready, then at most one heartbeat,
+	// then replays every critical frame the control plane has not acked --
+	// a snapshot's report among them -- and only then starts the
+	// heartbeat loop (wsbridge's runConnection), so the second heartbeat
+	// after a ready comes after every replayed frame.
+	ReplayPending bool
+	// SuspectedMidSnapshot is true when the sandbox is suspect and was
+	// snapshotting when it was suspected: a recovery takes it back to
+	// snapshotting, so it is no more sent a prompt than a snapshotting one.
+	SuspectedMidSnapshot bool
 	// DeliveryOpen is true while a completed turn's push and pull request
 	// are still being delivered, within the delivery's bound from its
 	// start, and DeliveryRemaining is how long until that bound. A push
@@ -77,13 +108,23 @@ type RunwayFacts struct {
 }
 
 // RunwayConfig is the gate's configuration, populated by the caller from
-// platform.Timeouts (RotationRunwayFloor, RotationSnapshotWait).
+// platform.Timeouts (RotationRunwayFloor, RotationSnapshotWait,
+// SnapshotReportWait, SteadyHeartbeatBudget, TerminalGracePeriod).
 type RunwayConfig struct {
 	// Floor is the most runway the threshold ever asks for.
 	Floor time.Duration
 	// SnapshotWait is how long a rotation waits for its snapshot to be
 	// reported before it falls back to the previous one.
 	SnapshotWait time.Duration
+	// ReportWait is how long a snapshot that is not a rotation's -- the
+	// post-turn one -- holds a turn before the gate gives it up.
+	ReportWait time.Duration
+	// HeartbeatBudget is the silence past which the sandbox's agent is
+	// taken to be gone, as the steady-state liveness watchdog takes it.
+	HeartbeatBudget time.Duration
+	// Grace is the terminal grace a suspected sandbox is given before it is
+	// failed, when it recovers on any sign of life (§3.2).
+	Grace time.Duration
 }
 
 // RunwayAction is what the evaluation does with the sandbox.
@@ -102,6 +143,19 @@ const (
 	// RunwayRetire retires the gen to stopped before anything more is sent
 	// to it; the next evaluation restores or spawns its replacement.
 	RunwayRetire RunwayAction = "retire"
+	// RunwayRevert gives up a snapshot that was never reported: the
+	// sandbox goes back to ready over snapshot_complete, the snapshot's
+	// command forgotten so a late report of it is ignored, and the next
+	// evaluation dispatches to it.
+	RunwayRevert RunwayAction = "revert"
+	// RunwaySuspect suspects a sandbox whose agent has fallen silent,
+	// through the liveness path (§3.2's two-phase rule): suspect, terminal
+	// grace armed, a snapshot's command kept. A sign of life during the
+	// grace recovers it -- an agent that reconnects sends ready and then
+	// replays an unacked report, which is then recorded (ReplayPending) --
+	// and a grace that runs out fails it, and the next evaluation restores
+	// or spawns its replacement.
+	RunwaySuspect RunwayAction = "suspect"
 )
 
 // RunwayReason says which row of the gate decided.
@@ -116,6 +170,10 @@ const (
 	RunwayReasonRotationSnapshotTaken       RunwayReason = "rotation_snapshot_taken"
 	RunwayReasonRotationSnapshotFailed      RunwayReason = "rotation_snapshot_failed"
 	RunwayReasonSnapshotInProgress          RunwayReason = "snapshot_in_progress"
+	RunwayReasonSnapshotAgentSilent         RunwayReason = "snapshot_agent_silent"
+	RunwayReasonSnapshotNotReported         RunwayReason = "snapshot_not_reported"
+	RunwayReasonAwaitingSignOfLife          RunwayReason = "awaiting_sign_of_life"
+	RunwayReasonSuspectedMidSnapshot        RunwayReason = "suspected_mid_snapshot"
 	RunwayReasonDeadlineUnknown             RunwayReason = "deadline_unknown"
 	RunwayReasonOK                          RunwayReason = "runway_ok"
 	RunwayReasonTurnInFlight                RunwayReason = "turn_in_flight"
@@ -133,79 +191,135 @@ type RunwayDecision struct {
 	// set on every decision.
 	Threshold time.Duration
 	// NextLook is when to evaluate again: for a hold, how long it lasts at
-	// most, zero when only an event ends it; for a rotation, the snapshot
-	// wait. Zero for every other decision.
+	// most; for a rotation, the snapshot wait. Zero for every other
+	// decision.
 	NextLook time.Duration
 }
 
 // EvaluateRunway decides what a dispatch evaluation does with the sandbox
-// it would dispatch to. The first row that matches decides:
+// it would dispatch to. "Silent" is SinceLastSeen at or past
+// HeartbeatBudget. The first row that matches decides:
 //
-//	 1  not ready, suspect or snapshotting          pass    not_steady
-//	 2  deadline known and passed                   retire  deadline_passed
-//	 3  rotating, snapshotting, within the wait     hold    awaiting_rotation_snapshot
-//	 4  rotating, snapshotting                      retire  rotation_snapshot_not_reported
-//	 5  rotating, its snapshot taken                retire  rotation_snapshot_taken
-//	 6  rotating                                    retire  rotation_snapshot_failed
-//	 7  snapshotting                                hold    snapshot_in_progress
-//	 8  deadline unknown                            pass    deadline_unknown (declined)
-//	 9  runway at or above the threshold            pass    runway_ok
-//	10  a turn in flight                            pass    turn_in_flight (declined)
-//	11  suspect                                     pass    suspect (declined)
-//	12  no snapshot capability                      pass    no_snapshot (declined)
-//	13  a delivery open                             hold    delivery_open
-//	14  ready, below the threshold                  rotate  below_threshold
+//	 1  not ready, suspect or snapshotting                   pass     not_steady
+//	 2  deadline known and passed, the agent silent          suspect  deadline_passed
+//	2a  the same, already suspect                            hold     deadline_passed
+//	 3  rotating, its own snapshot pending, within the wait  hold     awaiting_rotation_snapshot
+//	 4  rotating, its own snapshot pending                   retire   rotation_snapshot_not_reported
+//	4a  rotating, not mid-snapshot, a delivery open          hold     delivery_open
+//	 5  rotating, not mid-snapshot, its snapshot taken       retire   rotation_snapshot_taken
+//	 6  rotating, not mid-snapshot                           retire   rotation_snapshot_failed
+//	 7  snapshotting, within the report wait                 hold     snapshot_in_progress
+//	7a  snapshotting, the agent silent                       suspect  snapshot_agent_silent
+//	7b  snapshotting, heard from since the wait, no replay   revert   snapshot_not_reported
+//	7c  snapshotting                                         hold     awaiting_sign_of_life
+//	7d  suspected while snapshotting                         hold     suspected_mid_snapshot
+//	 8  deadline unknown                                     pass     deadline_unknown (declined)
+//	 9  runway at or above the threshold                     pass     runway_ok
+//	10  a turn in flight                                     pass     turn_in_flight (declined)
+//	11  suspect                                              pass     suspect (declined)
+//	12  no snapshot capability                               pass     no_snapshot (declined)
+//	13  a delivery open                                      hold     delivery_open
+//	14  ready, below the threshold or past the deadline      rotate   below_threshold
 //
-// A snapshotting sandbox is never passed (rows 2 to 7 take every one), so
-// no prompt goes to a sandbox in the middle of a snapshot. The deadline
-// row precedes every rotation row, so a deadline that passes mid-rotation
-// retires the gen. Equality at the threshold passes: a turn is never
-// dispatched with less than it. The declines precede the delivery hold, so
-// a hold never delays a dispatch that would be declined anyway; the hold
-// itself exists because the agent runs push and snapshot one after the
-// other on its read loop, so a rotation's snapshot sent during a push
-// would wait behind it and outrun the snapshot wait.
+// "Mid-snapshot" is snapshotting, or suspected while snapshotting. A
+// snapshotting sandbox is never passed (rows 2 to 7c take every one), and
+// neither is one suspected mid-snapshot (row 2a or 7d), so no prompt goes
+// to a sandbox in the middle of a snapshot, and no rotation row cuts a
+// suspicion's grace short. Equality at the threshold passes. The declines
+// precede the delivery hold, so a hold never delays a dispatch that would
+// be declined anyway; a declined dispatch has less than the threshold of
+// runway, by design, so the queue never stalls on the gate. The delivery
+// hold exists because the agent runs push and snapshot one after the other
+// on its read loop, so a rotation's snapshot sent during a push would wait
+// behind it and outrun the snapshot wait. A rotating gen's own retirement
+// waits for an open delivery too (row 4a): stopping it would kill the
+// push.
 //
-// Two holds end later than the work they wait on, each by design. The
-// delivery hold ends with the delivery's bound, not with the push: a
-// session whose repositories push past that bound still delays the
+// The deadline is the claim's conservative estimate, which a provider
+// that gives a sandbox longer outlives. So a gen past it is given up only
+// when its agent is silent too, and then through the liveness path, as
+// any silence is: suspected (row 2), its grace run (row 2a), so a sign of
+// life recovers it -- silence can be frames that could not be recorded --
+// and a grace that runs out fails it. A gen past its deadline whose agent
+// is still heard from is treated as one below the threshold: a snapshot in
+// progress and an open delivery are waited for, never cut short, and then
+// it is rotated through its own snapshot, which keeps its work. Its holds
+// are then bounded by their own waits alone, since the deadline is behind
+// them.
+//
+// Rows 7 to 7d bound a snapshot that is not a rotation's. The agent
+// reports a failed mint with no frame at all, and one that dies mid-mint
+// reports nothing either, so silence is the only signal, and it is read
+// once the report wait has run from the snapshot's start. An agent silent
+// past the heartbeat budget is suspected (row 7a) through the liveness
+// path, so a sign of life during its grace recovers it. Otherwise the
+// snapshot is given up (row 7b) only for an agent heard from after the
+// wait ended, and past its connection's replay: an agent that reconnects
+// sends ready before it replays the report it could not deliver, so the
+// ready is not yet a sign that no report is coming, and the revert waits
+// for the second heartbeat after it (ReplayPending). An agent not heard
+// from since the wait, or whose replay may still be coming, is held (row
+// 7c) until that is settled or its silence reaches the budget, so one that
+// died partway through the wait is suspected, never sent the turn. A
+// rotation's own snapshot is the rotation's (rows 3 and 4); another
+// snapshot a rotating gen takes is waited for like any other, and its
+// report then retires the gen (row 5) with that snapshot.
+//
+// Every retirement is of a rotating gen, which a resume is ruled out for
+// (a resume carries the deadline forward, technical plan §35.2), and every
+// suspicion ends, when its grace runs out, in a failed sandbox, which is
+// never resumed. Every hold names a positive next look, so a hold always
+// ends. The delivery hold ends with the delivery's bound, not with the
+// push: a session whose repositories push past that bound still delays the
 // rotation's snapshot behind them, and when the snapshot then misses the
 // wait, row 4 retires the gen and the rotation falls back to the previous
-// snapshot (platform.Timeouts.RotationRunwayFloor's doc). And row 7 holds
-// a snapshot that is not a rotation's until the deadline, since the facts
-// carry no start for it: one that never reports is released only by row 2.
+// snapshot (platform.Timeouts.RotationRunwayFloor's doc).
 func EvaluateRunway(f RunwayFacts, cfg RunwayConfig) RunwayDecision {
 	threshold := RotationThreshold(cfg.Floor, f.Lifetime)
 	decide := func(action RunwayAction, reason RunwayReason, nextLook time.Duration) RunwayDecision {
 		return RunwayDecision{Action: action, Reason: reason, Threshold: threshold, NextLook: nextLook}
 	}
-	// runwayOr bounds a hold by the deadline, when one is known.
+	// runwayOr bounds a hold by the deadline while it is still ahead; one
+	// behind a passed deadline is bounded by its own wait.
 	runwayOr := func(d time.Duration) time.Duration {
-		if f.DeadlineKnown {
+		if f.DeadlineKnown && f.Runway > 0 {
 			return min(d, f.Runway)
 		}
 		return d
 	}
 	snapshotting := f.Status == StateSnapshotting
+	midSnapshot := snapshotting || (f.Status == StateSuspect && f.SuspectedMidSnapshot)
+	silent := f.SinceLastSeen >= cfg.HeartbeatBudget
+	pastDeadline := f.DeadlineKnown && f.Runway <= 0
+	ownSnapshot := f.Rotating && f.RotationSnapshotPending && snapshotting
 
 	switch {
 	case f.Status != StateReady && f.Status != StateSuspect && !snapshotting:
 		return decide(RunwayPass, RunwayReasonNotSteady, 0)
-	case f.DeadlineKnown && f.Runway <= 0:
-		return decide(RunwayRetire, RunwayReasonDeadlinePassed, 0)
-	case f.Rotating && snapshotting && f.SinceRotationStart < cfg.SnapshotWait:
+	case pastDeadline && silent && f.Status == StateSuspect:
+		return decide(RunwayHold, RunwayReasonDeadlinePassed, cfg.Grace)
+	case pastDeadline && silent:
+		return decide(RunwaySuspect, RunwayReasonDeadlinePassed, 0)
+	case ownSnapshot && f.SinceRotationStart < cfg.SnapshotWait:
 		return decide(RunwayHold, RunwayReasonAwaitingRotationSnapshot, runwayOr(cfg.SnapshotWait-f.SinceRotationStart))
-	case f.Rotating && snapshotting:
+	case ownSnapshot:
 		return decide(RunwayRetire, RunwayReasonRotationSnapshotNotReported, 0)
-	case f.Rotating && f.RotationSnapshotTaken:
+	case f.Rotating && !midSnapshot && f.DeliveryOpen:
+		return decide(RunwayHold, RunwayReasonDeliveryOpen, runwayOr(f.DeliveryRemaining))
+	case f.Rotating && !midSnapshot && f.RotationSnapshotTaken:
 		return decide(RunwayRetire, RunwayReasonRotationSnapshotTaken, 0)
-	case f.Rotating:
+	case f.Rotating && !midSnapshot:
 		return decide(RunwayRetire, RunwayReasonRotationSnapshotFailed, 0)
+	case snapshotting && f.SinceSnapshotStart < cfg.ReportWait:
+		return decide(RunwayHold, RunwayReasonSnapshotInProgress, runwayOr(cfg.ReportWait-f.SinceSnapshotStart))
+	case snapshotting && silent:
+		return decide(RunwaySuspect, RunwayReasonSnapshotAgentSilent, 0)
+	case snapshotting && !f.ReplayPending && f.SinceLastSeen < f.SinceSnapshotStart-cfg.ReportWait:
+		return decide(RunwayRevert, RunwayReasonSnapshotNotReported, 0)
 	case snapshotting:
-		if f.DeadlineKnown {
-			return decide(RunwayHold, RunwayReasonSnapshotInProgress, f.Runway)
-		}
-		return decide(RunwayHold, RunwayReasonSnapshotInProgress, 0)
+		return decide(RunwayHold, RunwayReasonAwaitingSignOfLife, runwayOr(cfg.HeartbeatBudget-f.SinceLastSeen))
+	case f.Status == StateSuspect && f.SuspectedMidSnapshot:
+		return decide(RunwayHold, RunwayReasonSuspectedMidSnapshot, runwayOr(cfg.Grace))
 	case !f.DeadlineKnown:
 		return decide(RunwayPass, RunwayReasonDeadlineUnknown, 0)
 	case f.Runway >= threshold:
@@ -217,7 +331,7 @@ func EvaluateRunway(f RunwayFacts, cfg RunwayConfig) RunwayDecision {
 	case !f.CanSnapshot:
 		return decide(RunwayPass, RunwayReasonNoSnapshot, 0)
 	case f.DeliveryOpen:
-		return decide(RunwayHold, RunwayReasonDeliveryOpen, min(f.DeliveryRemaining, f.Runway))
+		return decide(RunwayHold, RunwayReasonDeliveryOpen, runwayOr(f.DeliveryRemaining))
 	default:
 		return decide(RunwayRotate, RunwayReasonBelowThreshold, cfg.SnapshotWait)
 	}

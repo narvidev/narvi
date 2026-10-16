@@ -59,7 +59,7 @@ func TestSandboxStore_RecordReady_GuardedOnGen(t *testing.T) {
 		{name: "the live gen's ready that can check out", gen: 1, promptReceipt: true, reviewCheckout: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 7, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1), wantCheckoutGen: ptrInt32(1)},
 		{name: "a later ready that cannot clears it", gen: 1, promptReceipt: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 8, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1)},
 		{name: "able to check out again", gen: 1, promptReceipt: true, reviewCheckout: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 9, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1), wantCheckoutGen: ptrInt32(1)},
-		// capabilities.skipRepoHooks (migrations/000173), recorded by the
+		// capabilities.skipRepoHooks (migrations/000174), recorded by the
 		// same rule.
 		{name: "another gen's ready that honours skipRepoHooks", gen: 2, skipRepoHooks: true, wantSeq: 9, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1), wantCheckoutGen: ptrInt32(1)},
 		{name: "the live gen's ready that honours skipRepoHooks", gen: 1, promptReceipt: true, reviewCheckout: true, skipRepoHooks: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 10, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1), wantCheckoutGen: ptrInt32(1), wantSkipGen: ptrInt32(1)},
