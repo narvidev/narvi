@@ -275,7 +275,7 @@ func TestMigrationSandboxRotation_UpAndDown(t *testing.T) {
 		t.Fatal("the previous binary's snapshot has no start after this release's first look")
 	}
 	// This release's claim clears everything the rotation recorded.
-	upsert := generatedQuery(t, "sandboxes.sql.go", "upsertSandboxForSpawn")
+	upsert := rotationReleaseUpsertSandboxForSpawn
 	if _, err := db.ExecContext(ctx, upsert, sessionID, "hash-3", 7200); err != nil {
 		t.Fatalf("this release's UpsertSandboxForSpawn: %v", err)
 	}
@@ -357,3 +357,50 @@ func TestMigrationSandboxRotation_UpAndDown(t *testing.T) {
 		t.Fatalf("columns after up again = %v, want %v", got, want)
 	}
 }
+
+// rotationReleaseUpsertSandboxForSpawn is UpsertSandboxForSpawn as the
+// release that added this migration sent it, frozen here: its RETURNING
+// list has since gained later migrations' sandboxes columns
+// (skip_repo_hooks_gen, 000174; skip_repo_hooks_told_gen and
+// snapshot_skipped_repo_hooks, 000175), which this database, migrated to
+// 000171, does not have.
+const rotationReleaseUpsertSandboxForSpawn = `-- name: UpsertSandboxForSpawn :one
+INSERT INTO sandboxes (session_id, gen, status, token_hash,
+                       lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen)
+VALUES ($1, 1, 'spawning', $2,
+        now() + make_interval(secs => $3::integer),
+        $3::integer,
+        CASE WHEN $3::integer IS NULL THEN NULL ELSE 1 END)
+ON CONFLICT (session_id) DO UPDATE
+SET gen = sandboxes.gen + 1,
+    status = 'spawning',
+    token_hash = EXCLUDED.token_hash,
+    last_seen_at = now(),
+    agent_version = NULL,
+    image_digest = NULL,
+    image_decision_reason = NULL,
+    image_decision_fingerprint = NULL,
+    pr_delivery_started_at = NULL,
+    stop_retire_gen = NULL,
+    rotation_gen = NULL,
+    rotation_message_id = NULL,
+    rotation_started_at = NULL,
+    snapshot_started_at = NULL,
+    snapshot_start_message_id = NULL,
+    heartbeat_ready_seq = NULL,
+    heartbeats_since_ready = NULL,
+    lifetime_deadline_at = CASE
+        WHEN $3::integer IS NOT NULL THEN EXCLUDED.lifetime_deadline_at
+        WHEN sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.lifetime_deadline_at
+    END,
+    lifetime_seconds = CASE
+        WHEN $3::integer IS NOT NULL THEN EXCLUDED.lifetime_seconds
+        WHEN sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.lifetime_seconds
+    END,
+    lifetime_deadline_gen = CASE
+        WHEN $3::integer IS NOT NULL
+          OR sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.gen + 1
+    END,
+    updated_at = now()
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
+`

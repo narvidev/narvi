@@ -31,7 +31,7 @@ func TestSandboxStore_RepoHooksLineage(t *testing.T) {
 	}{
 		{name: "told, capable", told: true, capable: true, want: true},
 		{name: "told, an agent that predates the key", told: true},
-		{name: "not told, capable"},
+		{name: "not told, capable", capable: true},
 		{name: "neither"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

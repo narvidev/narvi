@@ -895,7 +895,10 @@ func TestRunwayRotation_ReviewTurn_NoCheckoutToAGenAboutToRotate_ChecksOutOnTheN
 		t.Fatal(err)
 	}
 	seedRunwaySandbox(ctx, t, pool, f.sessionID, sqlcgen.SandboxStatusReady, 10*time.Minute, true)
-	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET review_checkout_gen = 1 WHERE session_id = $1`, f.sessionID); err != nil {
+	// A current agent's gen this release spawned: it can check out, and it
+	// was told to skip the repository's hooks, as the session's unrecorded
+	// claim has it boot, and honours that (technical plan §6.4).
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET review_checkout_gen = 1, skip_repo_hooks_gen = 1, skip_repo_hooks_told_gen = 1 WHERE session_id = $1`, f.sessionID); err != nil {
 		t.Fatal(err)
 	}
 	reviewTurn := seedReviewTurn(ctx, t, f, coHead, nil, false)
@@ -908,13 +911,15 @@ func TestRunwayRotation_ReviewTurn_NoCheckoutToAGenAboutToRotate_ChecksOutOnTheN
 		t.Fatalf("commands = %v, want the rotation's snapshot alone: no checkout to a gen about to rotate", got)
 	}
 	cmd := onlySnapshotCommand(t, rig.commander)
-	deliver(ctx, t, rig.actor, snapshotReady(1, cmd.MessageId, runwayRotationSnap, ""))
+	// A current agent reports its protocol with the snapshot, which a
+	// session that skips the repository's hooks needs to restore it.
+	deliver(ctx, t, rig.actor, snapshotReady(1, cmd.MessageId, runwayRotationSnap, `{"agentProtocol":"1.28.0"}`))
 	waitUntil(t, 5*time.Second, func() bool { return rig.provider.restoreCallCount() == 1 })
 	if n := len(sentCheckouts(t, rig.commander)); n != 0 {
 		t.Fatalf("%d checkouts sent before the new gen was up, want none", n)
 	}
 
-	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', review_checkout_gen = 2 WHERE session_id = $1 AND gen = 2`, f.sessionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', review_checkout_gen = 2, skip_repo_hooks_gen = 2 WHERE session_id = $1 AND gen = 2`, f.sessionID); err != nil {
 		t.Fatal(err)
 	}
 	settle(ctx, t, rig.actor)

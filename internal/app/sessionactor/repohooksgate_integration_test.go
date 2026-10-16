@@ -628,3 +628,110 @@ func TestRepoHooksRestore_ASessionThatNowRunsTheHooksNeverRestoresAHooklessSnaps
 		})
 	}
 }
+
+// TestRepoHooksRestore_ARotationOfASkippingSessionNeverRestoresASnapshotTheRuleRefuses:
+// the runway gate's rotation (technical plan §35.3) replaces a gen through
+// tryPlanSpawn's ordinary decision, the hooks' restore check included. The
+// rotating gen was told to skip the repository's hooks and honours that,
+// but its snapshot reports no agent protocol, which a session that skips
+// them never restores: the replacement spawns fresh, told, and the
+// snapshot is cleared. With the protocol reported, the rotation restores
+// its own snapshot.
+func TestRepoHooksRestore_ARotationOfASkippingSessionNeverRestoresASnapshotTheRuleRefuses(t *testing.T) {
+	for i, provenance := range []string{"", `{"agentProtocol":"1.28.0"}`} {
+		restore := provenance != ""
+		t.Run(map[bool]string{false: "no protocol reported", true: "a current agent's protocol"}[restore], func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			repo := fmt.Sprintf("acme/hooks-rotation-%d", i)
+			f := newHoldFixture(ctx, t, pool, repo, int32(170+i), pgtype.UUID{})
+			if _, err := f.prSessions.ClearPendingRetriggerHeadSHA(ctx, repo, int32(170+i), holdPushedHead); err != nil {
+				t.Fatal(err)
+			}
+			seedRunwaySandbox(ctx, t, pool, f.sessionID, sqlcgen.SandboxStatusReady, 10*time.Minute, true)
+			if _, err := pool.Exec(ctx, `UPDATE sandboxes SET review_checkout_gen = 1, skip_repo_hooks_gen = 1, skip_repo_hooks_told_gen = 1 WHERE session_id = $1`, f.sessionID); err != nil {
+				t.Fatal(err)
+			}
+			createPendingTurn(ctx, t, f.turns, f.sessionID, "a question about the pull request")
+			rig := newContextRig(ctx, t, pool, f.sessionID, nil)
+			rig.provider.explicitStop = true
+			rig.provider.nextRestoreRef = ports.SandboxRef{ProviderID: runwayRestoredObject}
+
+			settle(ctx, t, rig.actor)
+			if got := sentCommandTypes(t, rig.commander); len(got) != 1 || got[0] != "snapshot" {
+				t.Fatalf("commands = %v, want the rotation's snapshot alone", got)
+			}
+			cmd := onlySnapshotCommand(t, rig.commander)
+			deliver(ctx, t, rig.actor, snapshotReady(1, cmd.MessageId, runwayRotationSnap, provenance))
+			waitUntil(t, 5*time.Second, func() bool { return rig.provider.restoreCallCount()+rig.provider.callCount() == 1 })
+
+			if restore {
+				if rig.provider.restoreCallCount() != 1 {
+					t.Fatalf("restores %d, fresh spawns %d; want the rotation's snapshot restored", rig.provider.restoreCallCount(), rig.provider.callCount())
+				}
+				return
+			}
+			if rig.provider.restoreCallCount() != 0 || rig.provider.callCount() != 1 {
+				t.Fatalf("restores %d, fresh spawns %d; want no RestoreFromSnapshot, one fresh spawn", rig.provider.restoreCallCount(), rig.provider.callCount())
+			}
+			if !rig.provider.lastSpec().SessionConfig.SkipRepoHooks {
+				t.Fatal("the replacement's SESSION_CONFIG does not set skipRepoHooks")
+			}
+			sb, err := narvipg.NewSandboxStore(pool).Get(ctx, f.sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sb.SnapshotID != nil {
+				t.Fatalf("snapshot %v kept, want the refused one cleared", *sb.SnapshotID)
+			}
+		})
+	}
+}
+
+// TestRepoHooksGate_AResumeCarriesWhatTheGenWasTold: a resume boots nothing
+// and delivers no SESSION_CONFIG, so the resumed gen was told what the gen
+// it resumes was told -- one told to skip the repository's hooks stays
+// told, one told nothing stays told nothing, and the gate retires it.
+func TestRepoHooksGate_AResumeCarriesWhatTheGenWasTold(t *testing.T) {
+	for i, told := range []bool{true, false} {
+		t.Run(map[bool]string{true: "a told gen", false: "a gen told nothing"}[told], func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			fork := repoHooksSessionCases()[2]
+			name := fmt.Sprintf("hooks-resume-%d", i)
+			sessionID := seedRepoHooksSession(ctx, t, pool, fork, name, int32(180+i))
+			if _, err := narvipg.NewRepoSettingsStore(pool).UpsertLiveEgressEnabled(ctx, "acme/"+name, true); err != nil {
+				t.Fatal(err)
+			}
+			createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, "a question about the pull request")
+			sandboxStore := seedStoppedSandboxWithProviderID(ctx, t, pool, sessionID, "resume-"+name)
+			if _, err := pool.Exec(ctx, `UPDATE sandboxes SET skip_repo_hooks_told_gen = CASE WHEN $2::boolean THEN gen END WHERE session_id = $1`, sessionID, told); err != nil {
+				t.Fatal(err)
+			}
+			before, err := sandboxStore.Get(ctx, sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			provider := &fakeSpawnProvider{resumeSupported: true}
+			r := newDispatchTestRegistry(t, ctx, pool, provider, nil)
+			t.Cleanup(func() { _ = r.Shutdown() })
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+			sendEnsureDispatched(ctx, t, a)
+			waitUntil(t, 5*time.Second, func() bool { return provider.resumeCallCount() == 1 })
+
+			row, err := sandboxStore.Get(ctx, sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.Gen != before.Gen+1 {
+				t.Fatalf("gen %d after the resume, want %d", row.Gen, before.Gen+1)
+			}
+			if got := skipRepoHooksTold(row); got != told {
+				t.Fatalf("the resumed gen reads told %v (skip_repo_hooks_told_gen %v), want %v", got, row.SkipRepoHooksToldGen, told)
+			}
+		})
+	}
+}
