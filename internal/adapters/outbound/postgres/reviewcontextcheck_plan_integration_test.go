@@ -67,7 +67,14 @@ var contextWritesTurns = map[string]bool{"UpdateTurnStatus": true, "SetTurnConte
 // runs once unmeasured first, and a leaf its entries do not fit splits
 // then; and each measure runs on turns vacuumed with INDEX_CLEANUP ON,
 // which removes every dead entry, so each leaf it reaches has room for
-// the nine entries it took in the unmeasured run.
+// the nine entries it took in the unmeasured run. The vacuum also empties
+// the turn's heap page of the measures' versions: unvacuumed, the page
+// fills with them until a prune frees it -- which any snapshot open in
+// the database defers -- and a write meeting it full puts its version on
+// another page, reading the free space map for it. turn_step_costs, where
+// RecordTurnStepCost claims the step beside its write of the turn, is
+// vacuumed with turns: its page fills with the measures' rolled-back
+// claims the same way.
 func measureTurnWrites(ctx context.Context, t *testing.T, pool *pgxpool.Pool, probe holdPlanProbe, mode string, statements ...holdPlanStatement) []holdPlanMeasurement {
 	t.Helper()
 	for _, s := range statements {
@@ -75,8 +82,8 @@ func measureTurnWrites(ctx context.Context, t *testing.T, pool *pgxpool.Pool, pr
 	}
 	out := make([]holdPlanMeasurement, len(statements))
 	for i, s := range statements {
-		if _, err := pool.Exec(ctx, `VACUUM (INDEX_CLEANUP ON) turns`); err != nil {
-			t.Fatalf("vacuum turns: %v", err)
+		if _, err := pool.Exec(ctx, `VACUUM (INDEX_CLEANUP ON) turns, turn_step_costs`); err != nil {
+			t.Fatalf("vacuum turns and turn_step_costs: %v", err)
 		}
 		out[i] = measureHoldPlan(ctx, t, pool, s, probe, mode)
 	}
