@@ -60,9 +60,26 @@ const (
 // session, $5 gen), and thisReleasesCheckoutRequest RecordTurnCheckoutRequest
 // ($1 gen, $2 afterFailure, $3 messageId, $4 readySeq, $5 turn), both read
 // from the sqlc output.
+// thisReleasesRecordReady is RecordSandboxReady as the release that
+// shipped 000168 sent it. The generated text has since gained 000173's
+// skip_repo_hooks_gen, a column this database, migrated to 000168, does
+// not have; this test pins 000167 and 000168, so it sends the statement
+// those migrations shipped with.
 func thisReleasesRecordReady(t *testing.T) string {
-	return generatedQuery(t, "sandboxes.sql.go", "recordSandboxReady")
+	t.Helper()
+	return recordSandboxReady168
 }
+
+const recordSandboxReady168 = `-- name: RecordSandboxReady :exec
+UPDATE sandboxes
+SET ready_seq = ready_seq + 1,
+    prompt_receipt_gen = CASE WHEN $1::boolean THEN gen ELSE NULL END,
+    review_checkout_gen = CASE WHEN $2::boolean THEN gen ELSE NULL END,
+    agent_max_frame_bytes = $3::integer,
+    agent_max_frame_bytes_gen = CASE WHEN $3::integer IS NULL THEN NULL ELSE gen END,
+    updated_at = now()
+WHERE session_id = $4 AND gen = $5::integer
+`
 
 func thisReleasesCheckoutRequest(t *testing.T) string {
 	return generatedQuery(t, "turns.sql.go", "recordTurnCheckoutRequest")

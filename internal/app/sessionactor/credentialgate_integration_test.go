@@ -150,6 +150,7 @@ func TestDispatchGate_PersonalLinkOnly(t *testing.T) {
 			if _, err := sandboxStore.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{SessionID: session.ID, Status: sqlcgen.SandboxStatusReady}); err != nil {
 				t.Fatalf("move sandbox to ready: %v", err)
 			}
+			markRepoHooksCapable(ctx, t, pool, session.ID)
 
 			commander := &fakeSendCommander{}
 			r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
@@ -322,6 +323,7 @@ func gatedReviewSession(ctx context.Context, t *testing.T, pool *pgxpool.Pool, p
 	if _, err := sandboxStore.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{SessionID: session.ID, Status: sqlcgen.SandboxStatusReady}); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
 	}
+	markRepoHooksCapable(ctx, t, pool, session.ID)
 	return session
 }
 

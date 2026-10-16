@@ -366,6 +366,7 @@ func TestSpendCap_ReenqueueOfTheInFlightTurnIsNotGated(t *testing.T) {
 	if _, err := sandboxStore.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{SessionID: sessionID, Status: sqlcgen.SandboxStatusReady}); err != nil {
 		t.Fatal(err)
 	}
+	markRepoHooksCapable(ctx, t, pool, sessionID)
 
 	commander := &fakeSendCommander{}
 	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)

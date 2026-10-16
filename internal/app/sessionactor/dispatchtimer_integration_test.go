@@ -61,7 +61,9 @@ func dispatchTimer(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessio
 	return row, true
 }
 
-// seedReadySandbox gives sessionID a ready sandbox at gen 1.
+// seedReadySandbox gives sessionID a ready sandbox at gen 1, its agent a
+// current one: its ready advertised it honours SESSION_CONFIG's
+// skipRepoHooks (markRepoHooksCapable).
 func seedReadySandbox(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID) {
 	t.Helper()
 	sandboxes := narvipg.NewSandboxStore(pool)
@@ -70,6 +72,20 @@ func seedReadySandbox(ctx context.Context, t *testing.T, pool *pgxpool.Pool, ses
 	}
 	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', gen = 1 WHERE session_id = $1`, sessionID); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
+	}
+	markRepoHooksCapable(ctx, t, pool, sessionID)
+}
+
+// markRepoHooksCapable records that sessionID's live gen's ready advertised
+// capabilities.skipRepoHooks, as every current agent's does (technical plan
+// §6.4, §27.1): a test that moves a sandbox to ready without a ready event
+// models a current agent, so a review session's turn is not held by the
+// repository-hooks gate (repohooksgate.go) for a capability no ready of
+// this test ever had the chance to state.
+func markRepoHooksCapable(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID) {
+	t.Helper()
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET skip_repo_hooks_gen = gen WHERE session_id = $1`, sessionID); err != nil {
+		t.Fatalf("record the gen's skipRepoHooks capability: %v", err)
 	}
 }
 

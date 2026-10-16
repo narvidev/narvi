@@ -364,10 +364,20 @@ func TestResilience_Scenario24_PrivateForkWithoutTheApp_ReviewedAtItsRecordedHea
 	group := &errgroup.Group{}
 	agent := &checkoutAgent{ctx: runCtx, group: group, layout: layout, repo: repos[0], worktree: worktree, timeouts: h.Timeouts}
 	sc := spec.SessionConfig
+	// The fork's pull request's review session boots without the
+	// repository's hooks, so code the pull request brings never runs at
+	// boot (technical plan §6.4): the control plane says so in the
+	// SESSION_CONFIG it handed the provider.
+	if !sc.SkipRepoHooks {
+		t.Fatal("the fork's review session's SESSION_CONFIG does not set skipRepoHooks")
+	}
 	sc.ControlPlaneWsUrl = "ws" + strings.TrimPrefix(controlPlane.URL, "http") + "/sessions/" + sessionID.String() + "/ws?type=sandbox"
 	sc.Repos = []sessionconfig.SessionConfigReposElem{repos[0]}
 	agent.bridge = wsbridge.New(sc, "sbx-scenario24-fork", "test-agent-version", "test-image-digest", agent,
 		ackTestDialTimeout, ackTestHeartbeat, ackTestMinBackoff, ackTestMaxBackoff)
+	// A current agent honours it, and says so on its ready, as
+	// cmd/sandbox-agent's does.
+	agent.bridge.AdvertiseSkipRepoHooks()
 	agent.bridge.ReportBootStarted()
 	group.Go(func() error { return agent.bridge.Run(runCtx) })
 	t.Cleanup(func() {

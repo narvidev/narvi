@@ -162,7 +162,7 @@ func TestMigrationSnapshotRuntimeProvenance_UpAndDown(t *testing.T) {
 	}
 
 	// This release records a snapshot with what its agent reported.
-	updateSnapshot := generatedQuery(t, "sandboxes.sql.go", "updateSandboxSnapshotID")
+	updateSnapshot := updateSandboxSnapshotID170
 	if _, err := db.ExecContext(ctx, updateSnapshot, "snap-1", false, "1.24.0", "1.14.19", sessionID); err != nil {
 		t.Fatalf("this release's UpdateSandboxSnapshotID: %v", err)
 	}
@@ -268,3 +268,22 @@ func TestMigrationSnapshotRuntimeProvenance_UpAndDown(t *testing.T) {
 		t.Fatalf("columns after up again = %v, want %v", got, want)
 	}
 }
+
+// updateSandboxSnapshotID170 is UpdateSandboxSnapshotID as the release
+// that shipped 000170 sent it. The generated text's RETURNING list has
+// since gained 000173's skip_repo_hooks_gen, a column this database,
+// migrated to 000170, does not have; this test pins 000170, so it sends the
+// statement that migration shipped with.
+const updateSandboxSnapshotID170 = `-- name: UpdateSandboxSnapshotID :one
+UPDATE sandboxes
+SET snapshot_id = $1,
+    snapshot_suppressed_in_shadow = $2,
+    pending_snapshot_message_id = NULL,
+    snapshot_provenance_id = $1,
+    snapshot_agent_protocol = $3,
+    snapshot_runtime_version = $4,
+    snapshot_minted_at = now(),
+    updated_at = now()
+WHERE session_id = $5
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at
+`

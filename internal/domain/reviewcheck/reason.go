@@ -54,6 +54,13 @@ const (
 	// the pull request's ref could not be fetched or no longer holds that
 	// commit, or the checkout kept failing.
 	NotAssessedReviewCheckoutFailed NotAssessedReason = "review_checkout_failed"
+
+	// NotAssessedRepoHooksUnsupported means the review was not run because
+	// its sandbox's agent cannot boot without the repository's hooks, which
+	// a review of a pull request whose head is not in its base repository
+	// requires (technical plan §6.4, §27.1): the agent predates that, so the
+	// sandbox image needs rebuilding with a current one.
+	NotAssessedRepoHooksUnsupported NotAssessedReason = "repo_hooks_unsupported"
 )
 
 // notAssessedExplanations is the sentence each named reason adds to a
@@ -78,6 +85,9 @@ var notAssessedExplanations = map[NotAssessedReason]string{
 	NotAssessedReviewCheckoutFailed: "The review's sandbox did not check out the commit the review was asked about, " +
 		"so the review was not run on another tree. The session names what the sandbox reported; requesting the " +
 		"review again checks the commit out anew.",
+	NotAssessedRepoHooksUnsupported: "The review's sandbox runs an agent too old to boot without the repository's hooks, " +
+		"which a review of a pull request whose head is not in its base repository requires, so the review was not run. " +
+		"Rebuild the sandbox image so it carries a current agent, then request the review again.",
 }
 
 // ComputeOutputWithReason is ComputeOutput, with a not-assessed check's

@@ -492,6 +492,7 @@ func TestHandleEnsureDispatched_SandboxReady_DispatchesTurn(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
 	}
+	markRepoHooksCapable(ctx, t, pool, sessionID)
 
 	commander := &fakeSendCommander{}
 	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
@@ -619,6 +620,7 @@ func TestHandleEnsureDispatched_GitHubOrigin_OrdinaryFollowUp_NeverEnqueuesRevie
 	}); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
 	}
+	markRepoHooksCapable(ctx, t, pool, sessionID)
 
 	commander := &fakeSendCommander{}
 	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
@@ -697,6 +699,7 @@ func TestHandleEnsureDispatched_GitHubOrigin_ReviewAttempt_EnqueuesRunning(t *te
 	}); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
 	}
+	markRepoHooksCapable(ctx, t, pool, sessionID)
 
 	commander := &fakeSendCommander{}
 	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
@@ -768,6 +771,7 @@ func TestHandleEnsureDispatched_SendCommandNoLiveConnection_FailsTurnForward(t *
 	}); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
 	}
+	markRepoHooksCapable(ctx, t, pool, sessionID)
 
 	commander := &fakeSendCommander{nextErr: ports.ErrNoLiveSandboxConnection}
 	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
@@ -1528,6 +1532,7 @@ func TestTryPlanSpawn_ReadyPastReadyWait_UsesForceRespawnTrigger(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
 	}
+	markRepoHooksCapable(ctx, t, pool, sessionID)
 
 	readySince := time.Now().Add(-2 * platform.DefaultTimeouts().SpawnReadyWait)
 	if _, err := pool.Exec(ctx,
@@ -2748,6 +2753,7 @@ func TestHandleEnsureDispatched_ProcessingOnCurrentGenSandbox_NeverReDispatched(
 	}); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
 	}
+	markRepoHooksCapable(ctx, t, pool, sessionID)
 
 	commander := &fakeSendCommander{}
 	r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
@@ -2858,6 +2864,7 @@ func TestHandleEnsureDispatched_ProcessingOnStaleGenReadySandbox_Reenqueues(t *t
 	}); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
 	}
+	markRepoHooksCapable(ctx, t, pool, sessionID)
 	preReenqueue, err := sandboxStore.Get(ctx, sessionID)
 	if err != nil {
 		t.Fatalf("get sandbox: %v", err)

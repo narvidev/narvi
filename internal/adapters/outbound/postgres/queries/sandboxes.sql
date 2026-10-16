@@ -310,7 +310,11 @@ WHERE session_id = $1
 -- It records capabilities.reviewCheckout against the gen by the same rule
 -- (review_checkout_gen, migrations/000168_sandbox_review_checkout_gen.up.sql):
 -- the session actor sends a review turn's checkout only to a gen whose
--- latest ready advertised it (reviewcheckout.go).
+-- latest ready advertised it (reviewcheckout.go). And it records
+-- capabilities.skipRepoHooks the same way (skip_repo_hooks_gen,
+-- migrations/000173_sandbox_skip_repo_hooks_gen.up.sql): the session actor
+-- sends a turn of a session that boots without the repository's hooks
+-- only to a gen whose latest ready advertised it (repohooksgate.go).
 -- Guarded on gen like MarkSandboxBootEvidence: a ready of any other gen
 -- counts nothing and records nothing, so the capability can only ever be
 -- recorded for the gen that is live.
@@ -318,6 +322,7 @@ UPDATE sandboxes
 SET ready_seq = ready_seq + 1,
     prompt_receipt_gen = CASE WHEN sqlc.arg('prompt_receipt')::boolean THEN gen ELSE NULL END,
     review_checkout_gen = CASE WHEN sqlc.arg('review_checkout')::boolean THEN gen ELSE NULL END,
+    skip_repo_hooks_gen = CASE WHEN sqlc.arg('skip_repo_hooks')::boolean THEN gen ELSE NULL END,
     agent_max_frame_bytes = sqlc.narg('max_frame_bytes')::integer,
     agent_max_frame_bytes_gen = CASE WHEN sqlc.narg('max_frame_bytes')::integer IS NULL THEN NULL ELSE gen END,
     updated_at = now()

@@ -500,10 +500,13 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		// The same statement records whether the ready advertised the
 		// review-checkout capability (technical plan §21.1,
 		// reviewcheckout.go): a review turn's checkout is sent only to a
-		// gen whose latest ready did.
+		// gen whose latest ready did; and whether it advertised it honours
+		// SESSION_CONFIG's skipRepoHooks (§6.4, §27.1, repohooksgate.go): a
+		// turn of a session that boots without the repository's hooks is
+		// sent only to a gen whose latest ready did.
 		if cmd.Type == "ready" {
 			if err := a.stores.sandbox.WithTx(tx).RecordReady(ctx, a.sessionID, row.Gen,
-				readyAdvertisesPromptReceipt(cmd.Raw), readyAdvertisesReviewCheckout(cmd.Raw), readyStatedMaxFrameBytes(cmd.Raw)); err != nil {
+				readyAdvertisesPromptReceipt(cmd.Raw), readyAdvertisesReviewCheckout(cmd.Raw), readyAdvertisesSkipRepoHooks(cmd.Raw), readyStatedMaxFrameBytes(cmd.Raw)); err != nil {
 				return fmt.Errorf("sessionactor: record the ready: %w", err)
 			}
 		}

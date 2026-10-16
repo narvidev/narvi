@@ -383,11 +383,12 @@ type Config struct {
 // only for a claim recorded in the base and a spec naming the claim's
 // repository with a branch. The sandbox secrets delivery then hands the
 // session no secret, the provider-credential scope resolves none of the
-// base repository's repository-scoped credentials -- the head's setup.sh,
-// start.sh and the tools the agent runs over it are code a person outside
-// the base repository may have written -- and apply-suggestion and the
-// sentinel auto-fix, which act on the base repository at the spec's
-// branch, refuse it. A same-repository pull request's session opened while
+// base repository's repository-scoped credentials -- the head and the
+// tools the agent runs over it are code a person outside the base
+// repository may have written -- its sandbox boots without the
+// repository's hooks (SESSION_CONFIG's skipRepoHooks), and apply-suggestion
+// and the sentinel auto-fix, which act on the base repository at the
+// spec's branch, refuse it. A same-repository pull request's session opened while
 // its head could not be read gets its branch from the next mention that
 // reads the head in the base (SessionCoalescer.repairHeadBranch).
 func reviewSessionRepo(m mention) restdtos.CreateSessionRequestReposElem {

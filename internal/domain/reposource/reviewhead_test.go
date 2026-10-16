@@ -123,3 +123,34 @@ func TestReviewSpecAwaitsHeadBranch(t *testing.T) {
 		})
 	}
 }
+
+// TestReviewSessionSkipsRepoHooks pins which sessions boot without their
+// repository's hooks: exactly a claimed session whose head is not known to
+// be a branch of its base repository.
+func TestReviewSessionSkipsRepoHooks(t *testing.T) {
+	const claim = "acme/widgets"
+	yes, no := true, false
+	const sameRepo = `[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":"feature-x"}]`
+	const fork = `[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":null}]`
+	for _, tc := range []struct {
+		name    string
+		claimed bool
+		record  *bool
+		repos   string
+		want    bool
+	}{
+		{name: "no claim", repos: sameRepo},
+		{name: "no claim, a branchless spec", repos: fork},
+		{name: "a same-repository pull request, recorded in the base", claimed: true, record: &yes, repos: sameRepo},
+		{name: "a fork's pull request", claimed: true, record: &no, repos: fork, want: true},
+		{name: "a deleted fork's legacy spec", claimed: true, record: &no, repos: `[{"name":"widgets","url":"https://github.com/acme/widgets.git","branch":"main"}]`, want: true},
+		{name: "a claim nothing has recorded", claimed: true, repos: sameRepo, want: true},
+		{name: "a same-repository session opened while its head could not be read", claimed: true, record: &yes, repos: fork, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ReviewSessionSkipsRepoHooks(tc.claimed, claim, tc.record, []byte(tc.repos)); got != tc.want {
+				t.Errorf("ReviewSessionSkipsRepoHooks(%v, %q, %v, %s) = %v, want %v", tc.claimed, claim, tc.record, tc.repos, got, tc.want)
+			}
+		})
+	}
+}

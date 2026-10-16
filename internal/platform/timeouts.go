@@ -3334,6 +3334,17 @@ type Timeouts struct {
 	// the plan; 10 seconds.
 	ReviewCheckoutRefetchInterval time.Duration
 
+	// RepoHooksReadyRecheckInterval is how far ahead the session actor arms
+	// its dispatch timer while a turn of a session that boots without the
+	// repository's hooks waits for its gen's first ready, which says
+	// whether the gen's agent honours SESSION_CONFIG's skipRepoHooks
+	// (technical plan §6.4, §27.1, internal/app/sessionactor's
+	// repohooksgate.go). The ready itself evaluates the turn again at once;
+	// the timer only keeps a waiting turn looked at when no event comes.
+	// Validate keeps it positive. Not specified in the plan; 10 seconds,
+	// ReviewCheckoutRefetchInterval's value for the same wait.
+	RepoHooksReadyRecheckInterval time.Duration
+
 	// ReviewCheckoutFailuresBeforeRetire is how many checkouts of one
 	// review turn on one gen may answer failed before the session actor
 	// retires the gen and clears its snapshot, so the next gen boots fresh
@@ -4712,6 +4723,7 @@ func DefaultTimeouts() Timeouts {
 		ReviewCheckoutRefLagWindow:         1 * time.Minute,  // §21.1; not specified, chosen -- how long a ref may lag a push, see field doc comment
 		ReviewCheckoutRefetchInterval:      10 * time.Second, // §21.1; not specified, chosen -- the spacing of a re-fetch, doubled for each failed send, see field doc comment
 		ReviewCheckoutFailuresBeforeRetire: 3,                // §21.1; not specified, chosen -- a count of failed checkouts of one turn on one gen, see field doc comment
+		RepoHooksReadyRecheckInterval:      10 * time.Second, // §6.4, §27.1; not specified, chosen -- the look-again of a turn waiting for its gen's first ready, see field doc comment
 
 		ReviewCostBudgetServerReadHeaderTimeout: 5 * time.Second, // §26.7/§26.9; not specified, chosen -- matches RepoSHADiscoveryTimeout/CredentialFetchTimeout's own "lightweight, purely local" precedent, see field doc comment
 
@@ -5185,6 +5197,8 @@ func (t Timeouts) Validate() error {
 	mustBePositive("ReviewCheckoutRefLagWindow", t.ReviewCheckoutRefLagWindow)
 	mustBePositive("ReviewCheckoutRefetchInterval", t.ReviewCheckoutRefetchInterval)
 	countMustBePositive("ReviewCheckoutFailuresBeforeRetire", t.ReviewCheckoutFailuresBeforeRetire)
+	// See RepoHooksReadyRecheckInterval's own doc comment.
+	mustBePositive("RepoHooksReadyRecheckInterval", t.RepoHooksReadyRecheckInterval)
 	check("ReviewCheckoutTimeout > ReviewCheckoutAttemptCeiling + ReviewCheckoutRefetchInterval",
 		"ReviewCheckoutTimeout", t.ReviewCheckoutTimeout,
 		"ReviewCheckoutAttemptCeiling + ReviewCheckoutRefetchInterval", t.ReviewCheckoutAttemptCeiling()+t.ReviewCheckoutRefetchInterval)

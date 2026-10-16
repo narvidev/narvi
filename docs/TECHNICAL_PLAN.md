@@ -285,6 +285,8 @@ Boot modes: `build | fresh | repo_image | snapshot_restore` (env `NARVI_BOOT_MOD
 
 **Amendment (§19.4, warm-boot shared images, Step 42):** under `repo_image`, `setup.sh`'s `ShouldRun` is no longer a flat "never" — it reruns, non-fatally, whenever the boot-time workspace has moved from the image's own built SHA. This is a breaking change to the contract as stated above (Conventional-Commits `!` marker required on the landing PR) — see §19.4 for the full redefinition and rationale.
 
+**Amendment (Step 204): a review session whose head is not in its base repository boots without the repository's hooks, so code the pull request brings never runs at boot.** SESSION_CONFIG's `skipRepoHooks` (contracts 1.28.0) is true for a pull request's review session whose head is not known to be a branch of its base repository (`reposource.ReviewSessionSkipsRepoHooks`: the claim's `head_in_base` record and the spec, §27.1, §30.4), decided from the claim each time the control plane assembles the document for a spawn or a restore; a claim that cannot be read counts as not in the base. The sandbox agent then runs, in every boot mode, nothing the checked-out tree provides: none of `setup.sh`, `sync.sh` and `start.sh`, and none of the services `.narvi/services.yml` declares, for every repo; its `AGENTS.md` says so, so the agent does not take a missing dependency or service for one the repository never declared. Those are everything the agent executes from the tree at boot: git runs hardened (no hooks, no repository-configured filter or merge driver, no fsmonitor), the dependency-digest ladder only reads lockfiles and runs git, `dockerd` is the image's binary, and `opencode serve` runs from the workspace root, outside every repo, with its configuration only in the slots the agent writes (§27.2), so it loads no configuration from a repo's tree. A same-repository pull request's review session, and every other session, run the hooks as before. An agent that predates the key ignores it, so every ready of a current agent advertises `capabilities.skipRepoHooks` (`sandboxes.skip_repo_hooks_gen`, migration `000173`), and the session actor sends no turn of such a session to a gen whose ready did not: one with a snapshot that could restore that agent is retired once and the snapshot cleared, so the next gen boots fresh, and a fresh gen that lacks it too has its turn refused, naming the remedy -- rebuild the sandbox image (`turn.DecideRepoHooksGate`, the review checkout's own order; a gen that has sent no ready yet is waited for, `RepoHooksReadyRecheckInterval`). Deploy prerequisite: the sandbox image and every repo image carry an agent built since this release before it deploys.
+
 ## 7. OpenCode integration (`adapters/outbound/opencode`)
 
 The most delicate area of the system — budget real care here.
@@ -3352,7 +3354,10 @@ sandbox_secrets(id, scope sandbox_secret_scope ENUM('automation','environment','
   the base. The cost of failing closed: a same-repository pull request's review session opened
   before the record existed gets no secret, no repository-scoped provider credential, no
   apply-suggestion and no sentinel auto-fix until someone mentions the bot on the pull request again,
-  and so does one opened while its head could not be read. That mention updates the record, and the
+  and so does one opened while its head could not be read; it also boots without the repository's
+  hooks (§6.4's Step 204 amendment), so code the pull request brings never runs at boot. The hooks
+  are decided at each spawn and restore from the claim as it is then, so a mention that records the
+  head in the base takes effect at the session's next boot. That mention updates the record, and the
   spec when it has no branch; it pushes nothing into a sandbox already running. The sandbox agent
   fetches the secrets and the provider credentials once, at boot (Injection, below), so both reach
   the session's sandbox at its next boot: one already running keeps what it booted with, for this
@@ -3360,9 +3365,8 @@ sandbox_secrets(id, scope sandbox_secret_scope ENUM('automation','environment','
   record and the spec on every use, so they work from the mention's own turn on. An operator who
   needs them mentions the bot.
   Such a session's spec names the base repository for a pull request from a fork too (§30.4), and
-  its sandbox boots on the pull request's head and runs that head's `setup.sh` and `start.sh` with
-  every delivered secret in their environment -- code a person outside the base repository may have
-  written. So a fork's pull request, a deleted fork's, one opened while its head could not be read
+  its sandbox boots on the pull request's head -- code a person outside the base repository may have
+  written -- without the repository's hooks (§6.4's Step 204 amendment). So a fork's pull request, a deleted fork's, one opened while its head could not be read
   and not yet given its branch, a legacy session still naming the fork, and a claim not yet recorded
   are answered as a session with no secrets is: an empty map, global, environment and repository scopes alike, the table never read,
   logged at Info. This is the rule a CI system applies to a pull request from a fork: its code runs,
@@ -4698,7 +4702,8 @@ recommendation:**
    apply-suggestion — which commits to the claim's repository at the spec's branch, a fork's branch
    name often being the base's own `main` — answers 409 naming the fork, and saying that a mention
    records a same-repository head, after which a retry applies the suggestion, instead of committing
-   to the base. A review session opened before the spec named the base names
+   to the base. And such a session's sandbox boots without the repository's hooks (§6.4's Step 204
+   amendment), so code the pull request brings never runs at boot. A review session opened before the spec named the base names
    the fork, and its gens cloned the fork, whose origin holds no pull ref; it moves onto the base
    only when no gen holds its old spec — migration `000171` moved every such session with no live gen,
    and the actor moves the rest in the transaction that spawns or restores the next gen, before that

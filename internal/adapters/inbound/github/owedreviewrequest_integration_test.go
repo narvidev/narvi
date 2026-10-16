@@ -181,7 +181,10 @@ func newOwedLabelFixture(ctx context.Context, t *testing.T) owedLabelFixture {
 	if _, err := narvipg.NewSandboxStore(pool).Create(ctx, sess.ID); err != nil {
 		t.Fatalf("create the sandbox: %v", err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', gen = 1 WHERE session_id = $1`, sess.ID); err != nil {
+	// A current agent's gen: its ready advertised it honours
+	// SESSION_CONFIG's skipRepoHooks (technical plan §6.4), which the
+	// session actor asks of a review session's gen before it sends a turn.
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', gen = 1, skip_repo_hooks_gen = 1 WHERE session_id = $1`, sess.ID); err != nil {
 		t.Fatal(err)
 	}
 	head := "sha-under-review"

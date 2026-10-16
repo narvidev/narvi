@@ -699,6 +699,22 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 			if !ok {
 				return fmt.Errorf("sessionactor: dispatch turn: turn %s not found among loaded turns", pendingID.String())
 			}
+			// Technical plan §6.4, §27.1: a session that boots without the
+			// repository's hooks is sent only to a gen whose agent honours
+			// that (repohooksgate.go). First of all: nothing else may be
+			// asked of a gen that may have run them.
+			hooks, err := a.applyRepoHooksGate(ctx, tx, sessionRow, sandboxRow, turns, target, now)
+			if err != nil {
+				return err
+			}
+			switch hooks.decision {
+			case reviewCheckoutHold, reviewCheckoutFailForward:
+				dispatch = hooks.plan
+				return nil
+			case reviewCheckoutEnded:
+				repick = true
+				return nil
+			}
 			// Technical plan §21.1: a review turn that records a head is
 			// sent only once its sandbox reports holding that head
 			// (reviewcheckout.go). First, so §24.9's check below reads the
@@ -883,6 +899,16 @@ func (a *Actor) planReenqueueOrRespawn(
 			// gen's turn is never re-sent.
 			d, err := a.tryPlanReceiptResend(ctx, tx, sessionRow, sandboxRow, target)
 			return nil, d, "", err
+		}
+		// Technical plan §6.4, §27.1: as planDispatch's own gate
+		// (repohooksgate.go), first.
+		hooks, err := a.applyRepoHooksGate(ctx, tx, sessionRow, sandboxRow, turns, target, now)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		switch hooks.decision {
+		case reviewCheckoutHold, reviewCheckoutFailForward, reviewCheckoutEnded:
+			return nil, hooks.plan, "", nil
 		}
 		checkout, err := a.applyReviewCheckout(ctx, tx, sessionRow, sandboxRow, turns, target, now)
 		if err != nil {

@@ -319,6 +319,7 @@ func readySandbox(ctx context.Context, t *testing.T, pool *pgxpool.Pool, session
 	if _, err := sandboxes.UpdateStatus(ctx, sqlcgen.UpdateSandboxStatusParams{SessionID: sessionID, Status: sqlcgen.SandboxStatusReady}); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
 	}
+	markRepoHooksCapable(ctx, t, pool, sessionID)
 }
 
 // waitForTurnStatus waits until turnID reaches want.

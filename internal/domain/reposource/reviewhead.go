@@ -107,3 +107,15 @@ func ReviewSpecAwaitsHeadBranch(claimRepoFullName string, sessionRepos []byte) (
 	}
 	return primary.URL, true
 }
+
+// ReviewSessionSkipsRepoHooks reports whether a session boots without its
+// repository's hooks (technical plan §6.4, §27.1, §30.4): exactly a pull
+// request's review session -- one with a github_pr_sessions claim,
+// claimed -- whose head is not known to be a branch of its base repository
+// (ReviewHeadInBaseRepository, so a claim nothing has recorded, a fork and
+// a deleted fork all skip them), so code the pull request brings never
+// runs at boot. A session with no claim, and a review session of a pull
+// request opened from a branch of its base repository, run them.
+func ReviewSessionSkipsRepoHooks(claimed bool, claimRepoFullName string, claimHeadInBase *bool, sessionRepos []byte) bool {
+	return claimed && !ReviewHeadInBaseRepository(claimRepoFullName, claimHeadInBase, sessionRepos)
+}

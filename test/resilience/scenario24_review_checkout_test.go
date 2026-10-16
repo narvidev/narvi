@@ -379,6 +379,9 @@ func (r *scenario24Rig) startAgent(ctx context.Context, t *testing.T) *checkoutA
 	}
 	agent.bridge = wsbridge.New(sc, "sbx-scenario24", "test-agent-version", "test-image-digest", agent,
 		ackTestDialTimeout, ackTestHeartbeat, ackTestMinBackoff, ackTestMaxBackoff)
+	// A current agent honours SESSION_CONFIG's skipRepoHooks, and says so
+	// on its ready (technical plan §6.4), as cmd/sandbox-agent's does.
+	agent.bridge.AdvertiseSkipRepoHooks()
 	group.Go(func() error { return agent.bridge.Run(runCtx) })
 	t.Cleanup(func() {
 		cancel()

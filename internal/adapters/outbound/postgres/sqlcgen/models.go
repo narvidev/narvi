@@ -2386,6 +2386,7 @@ type Sandbox struct {
 	SnapshotAgentProtocol         *string              `json:"snapshot_agent_protocol"`
 	SnapshotRuntimeVersion        *string              `json:"snapshot_runtime_version"`
 	SnapshotMintedAt              pgtype.Timestamptz   `json:"snapshot_minted_at"`
+	SkipRepoHooksGen              *int32               `json:"skip_repo_hooks_gen"`
 }
 
 type SandboxHistory struct {
