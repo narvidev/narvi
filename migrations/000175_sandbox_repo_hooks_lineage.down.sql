@@ -3,8 +3,8 @@
 -- repository's hooks, and every snapshot's record of whether its gen did.
 -- A binary without 000175 does not read them; a binary with it that runs
 -- 000175 again reads every gen as told nothing -- retired before a turn of
--- a session that skips the hooks -- and every snapshot as not minted
--- without them.
+-- a session that skips the hooks -- and every snapshot as minted with
+-- them.
 --
 -- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
 -- 000175. Do not run it against live pods of a binary that carries 000175:
@@ -17,5 +17,5 @@
 -- The drops are catalog changes: they rewrite nothing, but take ACCESS
 -- EXCLUSIVE on sandboxes for the file's one implicit transaction, and touch
 -- no other table.
-ALTER TABLE sandboxes DROP COLUMN IF EXISTS snapshot_skipped_repo_hooks;
+ALTER TABLE sandboxes DROP COLUMN IF EXISTS snapshot_skipped_repo_hooks_id;
 ALTER TABLE sandboxes DROP COLUMN IF EXISTS skip_repo_hooks_told_gen;

@@ -2395,7 +2395,7 @@ type Sandbox struct {
 	HeartbeatsSinceReady          *int16               `json:"heartbeats_since_ready"`
 	SkipRepoHooksGen              *int32               `json:"skip_repo_hooks_gen"`
 	SkipRepoHooksToldGen          *int32               `json:"skip_repo_hooks_told_gen"`
-	SnapshotSkippedRepoHooks      *bool                `json:"snapshot_skipped_repo_hooks"`
+	SnapshotSkippedRepoHooksID    *string              `json:"snapshot_skipped_repo_hooks_id"`
 }
 
 type SandboxHistory struct {

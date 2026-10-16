@@ -16,18 +16,22 @@
 -- was not told -- one the previous binary spawned, which never writes the
 -- key -- ran the hooks, and is retired, its snapshot cleared.
 --
--- sandboxes.snapshot_skipped_repo_hooks: whether the gen that minted the
--- sandbox's snapshot booted without the repository's hooks -- it was told
--- to and advertised it honours that -- written by UpdateSandboxSnapshotID
--- with the rest of the snapshot's provenance, and read only while
--- snapshot_provenance_id names that snapshot. A session that skips the
--- hooks restores only a snapshot whose agent is of protocol 1.28.0 or
--- later and whose gen skipped them; a session that runs them never
--- restores one whose gen skipped them, whose lineage never ran setup.sh.
+-- sandboxes.snapshot_skipped_repo_hooks_id: the id of the snapshot whose
+-- gen booted without the repository's hooks -- it was told to and
+-- advertised it honours that -- written by UpdateSandboxSnapshotID with the
+-- rest of the snapshot's provenance, NULL when that gen did not. A
+-- snapshot reads as minted without the hooks only while this names it
+-- (snapshot_skipped_repo_hooks_id = snapshot_id), the way
+-- snapshot_provenance_id keys the rest of its provenance (000170): a
+-- snapshot a binary that does not write this column mints never inherits
+-- an earlier snapshot's record. A session that skips the hooks restores
+-- only a snapshot whose agent is of protocol 1.28.0 or later and whose gen
+-- skipped them; a session that runs them never restores one whose gen
+-- skipped them, whose lineage never ran setup.sh.
 --
 -- Both nullable, with no default and no backfill: every sandbox reads as
--- told nothing, and every snapshot as not minted without the hooks, which
--- is what the previous binary's gens and snapshots are.
+-- told nothing, and every snapshot as minted with the hooks, which is what
+-- the previous binary's gens and snapshots are.
 --
 -- # Locks
 --
@@ -45,15 +49,19 @@
 -- The previous binary works with these columns present: every statement
 -- it sends names its columns, so it neither reads nor writes them. A gen
 -- it spawns is told nothing here, so this release retires it before
--- sending it a turn of a session that skips the hooks; a snapshot it
--- records reads, by the id key, as provenance not recorded, which such a
--- session never restores.
+-- sending it a turn of a session that skips the hooks. A snapshot it mints
+-- has its provenance recorded under its own id (snapshot_provenance_id,
+-- 000170), but snapshot_skipped_repo_hooks_id keeps naming an earlier
+-- snapshot or nothing, never the new one: it reads as minted with the
+-- hooks, which such a session never restores.
 --
 -- # Rolling back
 --
 -- The previous binary cannot boot on 175 ("no migration found for version
 -- 175"). With the control plane scaled to zero, either keep the columns
 -- (`migrate force 174`; this file, run again, keeps their values) or run
--- the down (goto 174).
+-- the down (goto 174). A value kept names only the snapshot it was
+-- written for, so the previous binary's snapshots meanwhile read, after the
+-- redeploy, as minted with the hooks.
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS skip_repo_hooks_told_gen INTEGER;
-ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_skipped_repo_hooks BOOLEAN;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_skipped_repo_hooks_id TEXT;

@@ -20,8 +20,9 @@ import (
 // golang-migrate against real Postgres, in a database of its own migrated
 // to the version before it. The up adds two nullable columns to every
 // sandbox with no backfill -- skip_repo_hooks_told_gen, an integer, and
-// snapshot_skipped_repo_hooks, a boolean -- so a sandbox that exists when
-// it runs reads told nothing and its snapshot not minted without the hooks
+// snapshot_skipped_repo_hooks_id, text, the id of the snapshot minted
+// without the hooks -- so a sandbox that exists when it runs reads told
+// nothing and its snapshot minted with the hooks
 // (technical plan §6.4, §27.1); the down drops them, guarded, and runs
 // again once they are gone. It also pins what the file's "Rolling back"
 // section says: the previous binary cannot boot on it, and forcing the
@@ -56,10 +57,10 @@ func TestMigrationSandboxRepoHooksLineage_UpAndDown(t *testing.T) {
 	if _, err := db.ExecContext(ctx, `INSERT INTO sandboxes (session_id) VALUES ($1::uuid)`, sessionID); err != nil {
 		t.Fatalf("insert a sandbox: %v", err)
 	}
-	columns := map[string]string{"skip_repo_hooks_told_gen": "integer", "snapshot_skipped_repo_hooks": "boolean"}
-	value := func() (told sql.NullInt64, skipped sql.NullBool) {
+	columns := map[string]string{"skip_repo_hooks_told_gen": "integer", "snapshot_skipped_repo_hooks_id": "text"}
+	value := func() (told sql.NullInt64, skipped sql.NullString) {
 		t.Helper()
-		if err := db.QueryRowContext(ctx, `SELECT skip_repo_hooks_told_gen, snapshot_skipped_repo_hooks FROM sandboxes WHERE session_id = $1::uuid`, sessionID).Scan(&told, &skipped); err != nil {
+		if err := db.QueryRowContext(ctx, `SELECT skip_repo_hooks_told_gen, snapshot_skipped_repo_hooks_id FROM sandboxes WHERE session_id = $1::uuid`, sessionID).Scan(&told, &skipped); err != nil {
 			t.Fatalf("read the sandbox's lineage columns: %v", err)
 		}
 		return told, skipped
@@ -83,7 +84,7 @@ func TestMigrationSandboxRepoHooksLineage_UpAndDown(t *testing.T) {
 	if told, skipped := value(); told.Valid || skipped.Valid {
 		t.Fatalf("an existing sandbox's lineage after the up = %v, %v; want NULL, NULL: nothing is backfilled", told, skipped)
 	}
-	if _, err := db.ExecContext(ctx, `UPDATE sandboxes SET skip_repo_hooks_told_gen = gen, snapshot_skipped_repo_hooks = true WHERE session_id = $1::uuid`, sessionID); err != nil {
+	if _, err := db.ExecContext(ctx, `UPDATE sandboxes SET skip_repo_hooks_told_gen = gen, snapshot_skipped_repo_hooks_id = 'snap-kept' WHERE session_id = $1::uuid`, sessionID); err != nil {
 		t.Fatalf("record the lineage: %v", err)
 	}
 
@@ -102,7 +103,7 @@ func TestMigrationSandboxRepoHooksLineage_UpAndDown(t *testing.T) {
 	if err := m.Migrate(repoHooksLineageMigration); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		t.Fatalf("up to %d again: %v", repoHooksLineageMigration, err)
 	}
-	if told, skipped := value(); !told.Valid || !skipped.Valid || !skipped.Bool {
+	if told, skipped := value(); !told.Valid || !skipped.Valid || skipped.String != "snap-kept" {
 		t.Fatalf("the sandbox's lineage after the up ran again = %v, %v; want the values kept", told, skipped)
 	}
 

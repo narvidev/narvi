@@ -243,12 +243,15 @@ RETURNING *;
 -- migrations/000171) go with pending_snapshot_message_id: the snapshot they
 -- timed is the one recorded here, and none is in progress any more.
 --
--- snapshot_skipped_repo_hooks (technical plan §6.4, §27.1, migrations/
+-- snapshot_skipped_repo_hooks_id (technical plan §6.4, §27.1, migrations/
 -- 000175_sandbox_repo_hooks_lineage.up.sql) is part of that provenance:
--- whether the gen that minted the snapshot -- the live gen, whose row this
--- is -- booted without the repository's hooks, read from the row as it is
--- before this write: it was told to (skip_repo_hooks_told_gen = gen) and
--- its ready advertised it honours that (skip_repo_hooks_gen = gen).
+-- the snapshot's own id when the gen that minted it -- the live gen, whose
+-- row this is -- booted without the repository's hooks, read from the row
+-- as it is before this write: it was told to (skip_repo_hooks_told_gen =
+-- gen) and its ready advertised it honours that (skip_repo_hooks_gen =
+-- gen); NULL otherwise. Keyed by the id, as the rest of the provenance is,
+-- so a snapshot a binary that does not write it mints never reads an
+-- earlier snapshot's record as its own.
 UPDATE sandboxes
 SET snapshot_id = sqlc.arg('snapshot_id'),
     snapshot_suppressed_in_shadow = sqlc.arg('snapshot_suppressed_in_shadow'),
@@ -258,7 +261,7 @@ SET snapshot_id = sqlc.arg('snapshot_id'),
     snapshot_provenance_id = sqlc.arg('snapshot_id'),
     snapshot_agent_protocol = sqlc.narg('agent_protocol'),
     snapshot_runtime_version = sqlc.narg('runtime_version'),
-    snapshot_skipped_repo_hooks = COALESCE(skip_repo_hooks_told_gen = gen AND skip_repo_hooks_gen = gen, false),
+    snapshot_skipped_repo_hooks_id = CASE WHEN skip_repo_hooks_told_gen = gen AND skip_repo_hooks_gen = gen THEN sqlc.arg('snapshot_id') END,
     snapshot_minted_at = now(),
     updated_at = now()
 WHERE session_id = sqlc.arg('session_id')
@@ -704,7 +707,7 @@ SET snapshot_id = NULL,
     snapshot_provenance_id = NULL,
     snapshot_agent_protocol = NULL,
     snapshot_runtime_version = NULL,
-    snapshot_skipped_repo_hooks = NULL,
+    snapshot_skipped_repo_hooks_id = NULL,
     snapshot_minted_at = NULL,
     updated_at = now()
 WHERE session_id = sqlc.arg('session_id') AND snapshot_id = sqlc.arg('snapshot_id')::text;

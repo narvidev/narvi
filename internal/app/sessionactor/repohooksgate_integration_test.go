@@ -84,9 +84,11 @@ func seedRepoHooksSession(ctx context.Context, t *testing.T, pool *pgxpool.Pool,
 
 // setSnapshotProvenance records sessionID's sandbox snapshot's provenance
 // as this release's mint does: the agent protocol it reported, "" for
-// none, and whether its gen booted without the repository's hooks; with
-// recorded false, as the previous binary's mint leaves it -- nothing
-// recorded for that snapshot.
+// none, and, when its gen booted without the repository's hooks, the
+// snapshot's own id as minted without them. With recorded false, nothing
+// is recorded for that snapshot, as for one minted before migration
+// 000170; the previous binary records the provenance under the snapshot's
+// id but never the hooks record (previousReleaseMintSnapshot).
 func setSnapshotProvenance(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, recorded bool, protocol string, mintedWithoutHooks bool) {
 	t.Helper()
 	var protocolArg *string
@@ -94,12 +96,12 @@ func setSnapshotProvenance(ctx context.Context, t *testing.T, pool *pgxpool.Pool
 		protocolArg = &protocol
 	}
 	if !recorded {
-		if _, err := pool.Exec(ctx, `UPDATE sandboxes SET snapshot_provenance_id = NULL, snapshot_agent_protocol = NULL, snapshot_skipped_repo_hooks = NULL WHERE session_id = $1`, sessionID); err != nil {
+		if _, err := pool.Exec(ctx, `UPDATE sandboxes SET snapshot_provenance_id = NULL, snapshot_agent_protocol = NULL, snapshot_skipped_repo_hooks_id = NULL WHERE session_id = $1`, sessionID); err != nil {
 			t.Fatal(err)
 		}
 		return
 	}
-	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET snapshot_provenance_id = snapshot_id, snapshot_agent_protocol = $2, snapshot_skipped_repo_hooks = $3 WHERE session_id = $1`,
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET snapshot_provenance_id = snapshot_id, snapshot_agent_protocol = $2, snapshot_skipped_repo_hooks_id = CASE WHEN $3::boolean THEN snapshot_id END WHERE session_id = $1`,
 		sessionID, protocolArg, mintedWithoutHooks); err != nil {
 		t.Fatal(err)
 	}
@@ -304,7 +306,7 @@ func TestRepoHooksGate_AGenNotToldIsRetiredWithItsSnapshot(t *testing.T) {
 	pool := newTestPool(t)
 	fork := repoHooksSessionCases()[2]
 	sessionID, pending, rig := seedRepoHooksReadySession(ctx, t, pool, fork, "hooks-not-told-snapshot", 91, false)
-	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET snapshot_id = 'snap-hooks-ran', snapshot_provenance_id = 'snap-hooks-ran', snapshot_agent_protocol = '1.28.0', snapshot_skipped_repo_hooks = false WHERE session_id = $1`, sessionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET snapshot_id = 'snap-hooks-ran', snapshot_provenance_id = 'snap-hooks-ran', snapshot_agent_protocol = '1.28.0', snapshot_skipped_repo_hooks_id = NULL WHERE session_id = $1`, sessionID); err != nil {
 		t.Fatal(err)
 	}
 
@@ -735,3 +737,254 @@ func TestRepoHooksGate_AResumeCarriesWhatTheGenWasTold(t *testing.T) {
 		})
 	}
 }
+
+// TestRepoHooksRestore_ASnapshotThePreviousBinaryMintsNeverInheritsTheRecord:
+// the record that a snapshot's gen booted without the repository's hooks
+// names that snapshot. This release's gen 1, told and capable, mints S1,
+// recorded as minted without them. The previous binary then spawns gen 2
+// and mints S2, each with its own statement sent as it sends it: S2's
+// provenance is recorded under its id, a 1.28.0 agent, but the hooks
+// record still names S1. The stopped sandbox of the fork's pull request's
+// review session is not restored from S2: one fresh spawn, told to skip
+// the hooks, one warning, the snapshot cleared. With S1 itself the live
+// snapshot, it is restored.
+func TestRepoHooksRestore_ASnapshotThePreviousBinaryMintsNeverInheritsTheRecord(t *testing.T) {
+	for i, previousBinary := range []bool{true, false} {
+		t.Run(map[bool]string{true: "the previous binary's snapshot after this release's", false: "this release's snapshot"}[previousBinary], func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			name := fmt.Sprintf("hooks-previous-mint-%d", i)
+			sessionID := seedRepoHooksSession(ctx, t, pool, repoHooksSessionCases()[2], name, int32(190+i))
+			if _, err := narvipg.NewRepoSettingsStore(pool).UpsertLiveEgressEnabled(ctx, "acme/"+name, true); err != nil {
+				t.Fatal(err)
+			}
+			sandboxes := narvipg.NewSandboxStore(pool)
+			if _, err := sandboxes.Create(ctx, sessionID); err != nil {
+				t.Fatal(err)
+			}
+			if err := sandboxes.RecordRepoHooksTold(ctx, sessionID, 1, true); err != nil {
+				t.Fatal(err)
+			}
+			if err := sandboxes.RecordReady(ctx, sessionID, 1, false, false, true, nil); err != nil {
+				t.Fatal(err)
+			}
+			first, protocol := "snap-this-release", "1.28.0"
+			row, err := sandboxes.UpdateSnapshotID(ctx, sqlcgen.UpdateSandboxSnapshotIDParams{SessionID: sessionID, SnapshotID: &first, AgentProtocol: &protocol})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if row.SnapshotSkippedRepoHooksID == nil || *row.SnapshotSkippedRepoHooksID != first {
+				t.Fatalf("snapshot_skipped_repo_hooks_id = %v, want %s", row.SnapshotSkippedRepoHooksID, first)
+			}
+			if previousBinary {
+				if _, err := pool.Exec(ctx, previousReleaseUpsertSandboxForSpawn, sessionID, "token-hash-previous-binary", nil); err != nil {
+					t.Fatalf("the previous binary's UpsertSandboxForSpawn: %v", err)
+				}
+				if _, err := pool.Exec(ctx, previousReleaseUpdateSandboxSnapshotID, "snap-previous-binary", false, protocol, nil, sessionID); err != nil {
+					t.Fatalf("the previous binary's UpdateSandboxSnapshotID: %v", err)
+				}
+			}
+			if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'stopped' WHERE session_id = $1`, sessionID); err != nil {
+				t.Fatal(err)
+			}
+			createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, "review the pull request")
+			provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "spawned-" + name}, nextRestoreRef: ports.SandboxRef{ProviderID: "restored-" + name}}
+			r := newDispatchTestRegistry(t, ctx, pool, provider, nil)
+			t.Cleanup(func() { _ = r.Shutdown() })
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+			sendEnsureDispatched(ctx, t, a)
+			waitUntil(t, 5*time.Second, func() bool { return provider.restoreCallCount()+provider.callCount() > 0 })
+
+			if !previousBinary {
+				if provider.restoreCallCount() != 1 || provider.callCount() != 0 || string(provider.lastRestoreCall().snapshotID) != first {
+					t.Fatalf("restores %d, fresh spawns %d; want %s restored", provider.restoreCallCount(), provider.callCount(), first)
+				}
+				return
+			}
+			if provider.restoreCallCount() != 0 || provider.callCount() != 1 {
+				t.Fatalf("restores %d, fresh spawns %d; want no RestoreFromSnapshot, one fresh spawn", provider.restoreCallCount(), provider.callCount())
+			}
+			if !provider.lastSpec().SessionConfig.SkipRepoHooks {
+				t.Fatal("the fresh spawn's SESSION_CONFIG does not set skipRepoHooks")
+			}
+			sb, err := sandboxes.Get(ctx, sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sb.SnapshotID != nil {
+				t.Fatalf("snapshot %v kept, want it cleared", *sb.SnapshotID)
+			}
+			if n := countRows(ctx, t, pool, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'warning' AND payload::text LIKE '%snap-previous-binary%' AND payload::text LIKE '%taken by a sandbox that booted with them%'`, sessionID); n != 1 {
+				t.Fatalf("%d warnings saying why the snapshot was not restored, want 1", n)
+			}
+		})
+	}
+}
+
+// TestRepoHooksGate_AGenMidSnapshotIsRetiredAtOnce: a gen the gate
+// retires is retired even while its snapshot after a turn is in progress
+// -- one that never reports would otherwise hold the session for good,
+// since the runway gate's bound on it runs after this gate -- and that
+// snapshot is forgotten: the next gen boots fresh within the same
+// dispatch, nothing is sent to the retired gen, and the snapshot's late
+// report matches nothing. Turn 1 completes on gen 1 of the fork's pull
+// request's review session, with turn 2 queued; gen 1 was not told to
+// skip the repository's hooks, or was told with an agent that predates
+// the key and holds a snapshot.
+func TestRepoHooksGate_AGenMidSnapshotIsRetiredAtOnce(t *testing.T) {
+	for i, gen := range []repoHooksGen{
+		{name: "not told, a current agent", capable: true},
+		{name: "told, an agent that predates the key", told: true},
+	} {
+		t.Run(gen.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			name := fmt.Sprintf("hooks-mid-snapshot-%d", i)
+			sessionID := seedRepoHooksSession(ctx, t, pool, repoHooksSessionCases()[2], name, int32(200+i))
+			if _, err := narvipg.NewRepoSettingsStore(pool).UpsertLiveEgressEnabled(ctx, "acme/"+name, true); err != nil {
+				t.Fatal(err)
+			}
+			rig := newRunwayRig(ctx, t, runwayRigOptions{pool: pool, sessionID: sessionID, beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+				if _, err := pool.Exec(ctx, `UPDATE turns SET status = 'processing', dispatched_at = now(), dispatched_sandbox_gen = 1 WHERE session_id = $1`, sessionID); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := pool.Exec(ctx, `UPDATE sandboxes SET skip_repo_hooks_told_gen = CASE WHEN $2::boolean THEN gen END,
+					skip_repo_hooks_gen = CASE WHEN $3::boolean THEN gen END WHERE session_id = $1`, sessionID, gen.told, gen.capable); err != nil {
+					t.Fatal(err)
+				}
+			}})
+			queued := createTurnArmingDispatch(ctx, t, pool, sessionID, "a question queued behind the first")
+
+			deliver(ctx, t, rig.actor, completedEvent(1))
+			cmd := onlySnapshotCommand(t, rig.commander)
+			waitUntil(t, 5*time.Second, func() bool { return rig.provider.callCount() == 1 })
+
+			if n := promptCount(rig.commander); n != 0 {
+				t.Fatalf("%d prompts sent, want none to the retired gen", n)
+			}
+			if rig.provider.restoreCallCount() != 0 {
+				t.Fatalf("restores %d, want none: the gen's snapshots are discarded with it", rig.provider.restoreCallCount())
+			}
+			if stopped := rig.provider.stoppedProviderIDs(); len(stopped) != 1 || stopped[0] != runwayProviderGen1 {
+				t.Fatalf("stopped %v, want the retired gen's object, %s", stopped, runwayProviderGen1)
+			}
+			if !rig.provider.lastSpec().SessionConfig.SkipRepoHooks {
+				t.Fatal("the fresh gen's SESSION_CONFIG does not set skipRepoHooks")
+			}
+			row := rig.sandbox(ctx, t)
+			if row.Gen != 2 || row.PendingSnapshotMessageID != nil || row.SnapshotID != nil {
+				t.Fatalf("sandbox gen %d, pending snapshot %v, snapshot %v; want gen 2, nothing pending, nothing to restore", row.Gen, row.PendingSnapshotMessageID, row.SnapshotID)
+			}
+			if got, err := narvipg.NewTurnStore(pool).Get(ctx, queued.ID); err != nil || got.Status != sqlcgen.TurnStatusPending {
+				t.Fatalf("the queued turn: %v, %v; want pending for the fresh gen", got.Status, err)
+			}
+
+			// The forgotten snapshot's late report matches nothing.
+			deliver(ctx, t, rig.actor, snapshotReady(1, cmd.MessageId, "snap-late", `{"agentProtocol":"1.28.0"}`))
+			if row := rig.sandbox(ctx, t); row.SnapshotID != nil {
+				t.Fatalf("snapshot %s recorded from the retired gen's late report, want none", *row.SnapshotID)
+			}
+		})
+	}
+}
+
+// TestRepoHooksGate_AGenAfterTheToldOneIsNotTold: what a gen was told is
+// keyed by the gen. Gen 1 was told to skip the repository's hooks; gen 2
+// was then spawned with nothing recorded -- the previous binary's spawn --
+// so the record still names gen 1. Gen 2's ready advertises the
+// capability, but gen 2 was told nothing: it is retired, never sent the
+// turn, and a fresh gen spawned, told.
+func TestRepoHooksGate_AGenAfterTheToldOneIsNotTold(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID, pending, rig := seedRepoHooksReadySession(ctx, t, pool, repoHooksSessionCases()[2], "hooks-told-earlier", 210, true)
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET gen = 2 WHERE session_id = $1`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+
+	deliver(ctx, t, rig.actor, hooksReady(2, true))
+
+	if prompts := sentPromptsOf(t, rig.commander); len(prompts) != 0 {
+		t.Fatalf("prompts %+v sent to a gen that was told nothing, want none", prompts)
+	}
+	if rig.provider.callCount() != 1 || rig.provider.restoreCallCount() != 0 {
+		t.Fatalf("fresh spawns %d, restores %d; want the gen retired and one fresh spawn", rig.provider.callCount(), rig.provider.restoreCallCount())
+	}
+	sb, err := narvipg.NewSandboxStore(pool).Get(ctx, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sb.Gen != 3 || sb.SkipRepoHooksToldGen == nil || *sb.SkipRepoHooksToldGen != 3 {
+		t.Fatalf("sandbox gen %d, told gen %v; want gen 3, told", sb.Gen, sb.SkipRepoHooksToldGen)
+	}
+	if got, err := narvipg.NewTurnStore(pool).Get(ctx, pending.ID); err != nil || got.Status != sqlcgen.TurnStatusPending {
+		t.Fatalf("the turn: %v, %v; want pending for the fresh gen", got.Status, err)
+	}
+}
+
+// previousReleaseUpsertSandboxForSpawn and
+// previousReleaseUpdateSandboxSnapshotID are the previous release's own
+// UpsertSandboxForSpawn and UpdateSandboxSnapshotID, copied byte for byte
+// from main's generated sqlcgen (8c6a438f): they name none of migration
+// 000175's columns, so a gen the first spawns is told nothing here, and a
+// snapshot the second mints has its provenance recorded under its id but
+// no record of the repository's hooks.
+const previousReleaseUpsertSandboxForSpawn = `-- name: UpsertSandboxForSpawn :one
+INSERT INTO sandboxes (session_id, gen, status, token_hash,
+                       lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen)
+VALUES ($1, 1, 'spawning', $2,
+        now() + make_interval(secs => $3::integer),
+        $3::integer,
+        CASE WHEN $3::integer IS NULL THEN NULL ELSE 1 END)
+ON CONFLICT (session_id) DO UPDATE
+SET gen = sandboxes.gen + 1,
+    status = 'spawning',
+    token_hash = EXCLUDED.token_hash,
+    last_seen_at = now(),
+    agent_version = NULL,
+    image_digest = NULL,
+    image_decision_reason = NULL,
+    image_decision_fingerprint = NULL,
+    pr_delivery_started_at = NULL,
+    stop_retire_gen = NULL,
+    rotation_gen = NULL,
+    rotation_message_id = NULL,
+    rotation_started_at = NULL,
+    snapshot_started_at = NULL,
+    snapshot_start_message_id = NULL,
+    heartbeat_ready_seq = NULL,
+    heartbeats_since_ready = NULL,
+    lifetime_deadline_at = CASE
+        WHEN $3::integer IS NOT NULL THEN EXCLUDED.lifetime_deadline_at
+        WHEN sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.lifetime_deadline_at
+    END,
+    lifetime_seconds = CASE
+        WHEN $3::integer IS NOT NULL THEN EXCLUDED.lifetime_seconds
+        WHEN sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.lifetime_seconds
+    END,
+    lifetime_deadline_gen = CASE
+        WHEN $3::integer IS NOT NULL
+          OR sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.gen + 1
+    END,
+    updated_at = now()
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
+`
+
+const previousReleaseUpdateSandboxSnapshotID = `-- name: UpdateSandboxSnapshotID :one
+UPDATE sandboxes
+SET snapshot_id = $1,
+    snapshot_suppressed_in_shadow = $2,
+    pending_snapshot_message_id = NULL,
+    snapshot_started_at = NULL,
+    snapshot_start_message_id = NULL,
+    snapshot_provenance_id = $1,
+    snapshot_agent_protocol = $3,
+    snapshot_runtime_version = $4,
+    snapshot_minted_at = now(),
+    updated_at = now()
+WHERE session_id = $5
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
+`

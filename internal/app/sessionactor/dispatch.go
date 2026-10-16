@@ -748,7 +748,9 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 			// them (repohooksgate.go). First of all, before the runway gate
 			// below: a gen that ran them is retired, never rotated -- a
 			// rotation would snapshot what they wrote and carry it into the
-			// next gen -- and nothing else may be asked of it.
+			// next gen -- and nothing else may be asked of it. One
+			// mid-snapshot is retired at once too, its snapshot forgotten,
+			// so the runway gate's wait on that snapshot is never needed.
 			hooks, err := a.applyRepoHooksGate(ctx, tx, sessionRow, sandboxRow, turns, target, now)
 			if err != nil {
 				return err

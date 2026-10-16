@@ -38,8 +38,9 @@ package sessionactor
 // The gate only ever sees a gen after its boot, so a restore is decided
 // before it (repoHooksRestoreRefusal, in tryPlanSpawn): each snapshot
 // records whether the gen that minted it skipped the hooks
-// (sandboxes.snapshot_skipped_repo_hooks, with the rest of its
-// provenance), and a restore crosses no boundary of the hooks
+// (sandboxes.snapshot_skipped_repo_hooks_id, its own id when it did, with
+// the rest of its provenance), and a restore crosses no boundary of the
+// hooks
 // (sandbox.DecideRepoHooksRestore). A session that skips them restores
 // only a snapshot of an agent of protocol 1.28.0 or later whose gen
 // skipped them -- an older or unknown agent would run them at the restored
@@ -97,6 +98,15 @@ func skipRepoHooksTold(row sqlcgen.Sandbox) bool {
 	return row.SkipRepoHooksToldGen != nil && *row.SkipRepoHooksToldGen == row.Gen
 }
 
+// snapshotMintedWithoutRepoHooks reports whether row records snapshotID as
+// minted by a gen that booted without the repository's hooks: the record
+// names that snapshot (snapshot_skipped_repo_hooks_id). A record that names
+// another snapshot is that snapshot's -- the previous binary mints without
+// writing it -- so it says nothing of this one.
+func snapshotMintedWithoutRepoHooks(row sqlcgen.Sandbox, snapshotID string) bool {
+	return snapshotID != "" && row.SnapshotSkippedRepoHooksID != nil && *row.SnapshotSkippedRepoHooksID == snapshotID
+}
+
 // sessionSkipsRepoHooks reports whether a session whose pull request claim
 // is claim -- nil for none -- and whose spec is sessionRepos boots without
 // the repository's hooks (reposource.ReviewSessionSkipsRepoHooks).
@@ -135,15 +145,6 @@ func (a *Actor) applyRepoHooksGate(ctx context.Context, tx pgx.Tx, sessionRow sq
 		GenCapable:    skipRepoHooksCapable(sandboxRow),
 		HasSnapshot:   sandboxRow.SnapshotID != nil && *sandboxRow.SnapshotID != "",
 	})
-	// A gen mid-snapshot (the runway gate's rotation, or the snapshot after
-	// a turn) is never retired under its snapshot: the turn waits, and the
-	// snapshot's completion evaluates it again, the snapshot then recorded
-	// with what its gen did.
-	if (action == turn.RepoHooksRetireNotTold || action == turn.RepoHooksRetireGen) && sandbox.State(sandboxRow.Status) == sandbox.StateSnapshotting {
-		a.logger.Debug("sessionactor: repository hooks: the gen is to be retired once its snapshot completes",
-			"turn_id", target.ID.String(), "gen", sandboxRow.Gen, "action", string(action))
-		return reviewCheckoutResult{decision: reviewCheckoutHold}, nil
-	}
 	switch action {
 	case turn.RepoHooksProceed:
 		return notNeeded, nil
@@ -159,6 +160,9 @@ func (a *Actor) applyRepoHooksGate(ctx context.Context, tx pgx.Tx, sessionRow sq
 	case turn.RepoHooksRetireNotTold:
 		retired, err := a.retireGenClearingSnapshot(ctx, tx, sandboxRow, repoHooksNotToldSnapshotWarning)
 		if err != nil {
+			return reviewCheckoutResult{}, err
+		}
+		if err := a.forgetRetiredGensSnapshot(ctx, tx, sandboxRow); err != nil {
 			return reviewCheckoutResult{}, err
 		}
 		if sandboxRow.SnapshotID == nil || *sandboxRow.SnapshotID == "" {
@@ -179,6 +183,9 @@ func (a *Actor) applyRepoHooksGate(ctx context.Context, tx pgx.Tx, sessionRow sq
 	case turn.RepoHooksRetireGen:
 		retired, err := a.retireGenClearingSnapshot(ctx, tx, sandboxRow, repoHooksRetirementWarning)
 		if err != nil {
+			return reviewCheckoutResult{}, err
+		}
+		if err := a.forgetRetiredGensSnapshot(ctx, tx, sandboxRow); err != nil {
 			return reviewCheckoutResult{}, err
 		}
 		if err := a.armDispatchNow(ctx, tx); err != nil {
@@ -213,6 +220,28 @@ func (a *Actor) applyRepoHooksGate(ctx context.Context, tx pgx.Tx, sessionRow sq
 	default:
 		return reviewCheckoutResult{}, fmt.Errorf("sessionactor: repository hooks: unhandled gate action %s", action)
 	}
+}
+
+// forgetRetiredGensSnapshot forgets, in tx, the snapshot sandboxRow's gen
+// -- which the gate has just retired -- had in progress, if any: the
+// snapshot after a turn, or a rotation's. The gate retires such a gen at
+// once rather than waiting on that snapshot: what it would record is
+// discarded with the gen anyway (its gen booted with the hooks, or its
+// agent predates the key), and a snapshot that never reports would hold
+// the session for good, since the runway gate's bound on it
+// (SnapshotReportWait) runs after this gate. Its report, should it come
+// late, then matches nothing (handleSnapshotReadyEvent), as with the
+// runway gate's own retirement.
+func (a *Actor) forgetRetiredGensSnapshot(ctx context.Context, tx pgx.Tx, sandboxRow sqlcgen.Sandbox) error {
+	if sandbox.State(sandboxRow.Status) != sandbox.StateSnapshotting && sandboxRow.PendingSnapshotMessageID == nil {
+		return nil
+	}
+	if _, err := a.stores.sandbox.WithTx(tx).UpdatePendingSnapshotMessageID(ctx, sqlcgen.UpdateSandboxPendingSnapshotMessageIDParams{
+		SessionID: a.sessionID, PendingSnapshotMessageID: nil,
+	}); err != nil {
+		return fmt.Errorf("sessionactor: repository hooks: forget the retired gen's snapshot in progress: %w", err)
+	}
+	return nil
 }
 
 // repoHooksRefusal is the texts of a turn the gate refuses.
@@ -252,7 +281,7 @@ func (a *Actor) repoHooksRestoreRefusal(ctx context.Context, tx pgx.Tx, sessionR
 	claim, claimReadFailed := a.reviewClaim(ctx, tx, sessionRow)
 	skips := claimReadFailed || sessionSkipsRepoHooks(claim, sessionRow.Repos)
 	provenance := snapshotProvenance(sandboxRow)
-	mintedWithoutHooks := sandboxRow.SnapshotSkippedRepoHooks != nil && *sandboxRow.SnapshotSkippedRepoHooks
+	mintedWithoutHooks := snapshotMintedWithoutRepoHooks(sandboxRow, snapshotID)
 	reason := sandbox.DecideRepoHooksRestore(skips, provenance, mintedWithoutHooks)
 	if reason == sandbox.RepoHooksRestoreAllowed {
 		return nil

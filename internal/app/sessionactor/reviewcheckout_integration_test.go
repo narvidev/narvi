@@ -1424,7 +1424,7 @@ func slowRestoreFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool, r
 	// A snapshot the review session may restore: minted by a current
 	// agent's gen that booted without the repository's hooks, as the
 	// session's unrecorded claim has it boot (technical plan §6.4).
-	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'stopped', snapshot_id = $2, snapshot_provenance_id = $2, snapshot_agent_protocol = '1.28.0', snapshot_skipped_repo_hooks = true WHERE session_id = $1`, f.sessionID, snapshotID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'stopped', snapshot_id = $2, snapshot_provenance_id = $2, snapshot_agent_protocol = '1.28.0', snapshot_skipped_repo_hooks_id = $2 WHERE session_id = $1`, f.sessionID, snapshotID); err != nil {
 		t.Fatal(err)
 	}
 	reviewTurn := seedReviewTurn(ctx, t, f, coHead, nil, true)

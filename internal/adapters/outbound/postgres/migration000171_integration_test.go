@@ -362,7 +362,7 @@ func TestMigrationSandboxRotation_UpAndDown(t *testing.T) {
 // release that added this migration sent it, frozen here: its RETURNING
 // list has since gained later migrations' sandboxes columns
 // (skip_repo_hooks_gen, 000174; skip_repo_hooks_told_gen and
-// snapshot_skipped_repo_hooks, 000175), which this database, migrated to
+// snapshot_skipped_repo_hooks_id, 000175), which this database, migrated to
 // 000171, does not have.
 const rotationReleaseUpsertSandboxForSpawn = `-- name: UpsertSandboxForSpawn :one
 INSERT INTO sandboxes (session_id, gen, status, token_hash,
