@@ -42,6 +42,7 @@ function baseAutomation(overrides: Partial<Automation> = {}): Automation {
     lastRunStatus: null,
     artifactSummary: null,
     creatorUnauthorizedSince: null,
+    sessionSpendCapUsd: null,
     ...overrides,
   }
 }

@@ -36,6 +36,7 @@ function baseSettings(overrides: Partial<RepoSettings> = {}): RepoSettings {
     reviewDepthDeepPaths: null,
     reviewCostBudgetLightUsd: null,
     reviewCostBudgetDeepUsd: null,
+    sessionSpendCapUsd: null,
     ...overrides,
   }
 }

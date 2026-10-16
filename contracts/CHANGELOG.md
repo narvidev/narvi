@@ -10,6 +10,67 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.27.0]
+
+### rest/v1/dtos.schema.json
+
+- Added: `UpdateSessionSpendCapRequest` (`capUsd`, a number or null,
+  required; `additionalProperties: false`), the body of the two session
+  spend cap routes below (technical plan §40.1): the cap in USD, or null
+  to clear it -- the only spelling of "no cap". `capUsd` is required, so
+  an empty body never clears a cap. The rules a cap must meet are the
+  handler's, stated in the `description` and answered `400`, as for
+  `UpdateReviewCostBudgetRequest`: above zero, at most two decimal places
+  counted on the number as written (a literal whose further digits a
+  float would round away is refused too), at most 99999999.99; the
+  database's CHECK constraint backs the first. No `minimum` in the schema.
+  A new `$def` grades MINOR (row 32).
+- Added: required `RepoSettings.sessionSpendCapUsd` (a number or null):
+  the session spend cap of every session that names the repository, null
+  for none. A session whose recorded spend is at or past its cap takes no
+  new turn, whoever asks; a session naming several repositories takes the
+  strictest of their caps, and a session an automation created takes the
+  automation's cap instead when it sets one. A change to this cap
+  re-admits a refused session only when it is the cap the session is held
+  to and the cap that then applies is above what the session has spent.
+  Answered by every route that answers `RepoSettings`. Platform-to-client only: no `*Request` root reaches this
+  def. A required property added grades MINOR on the platform-to-client
+  side (row 3).
+- Added: required `Automation.sessionSpendCapUsd` (a number or null): the
+  cap of every session the automation creates, which takes precedence
+  over the caps of the session's repositories, above or below them; null
+  for none, when the strictest of the session's repositories' caps applies
+  instead -- so clearing it re-admits a refused session only when no
+  repository cap at or below the session's spend applies. Written only by
+  the route below, never by
+  `CreateAutomationRequest`, which a maintainer may send. Platform-to-client
+  only. A required property added grades MINOR on the platform-to-client
+  side (row 3).
+- Changed: `SessionActivity.lastRun`'s `description` also leaves aside a
+  queued turn ended before its dispatch because the session guard refuses
+  the session new turns, as it does once the session has spent its cap
+  (§40.1) -- such a turn never ran, so it is no run of the session's, as
+  the queued review whose pull request moved already is not. A
+  `description` change grades PATCH (row 35).
+- Unchanged: no existing property, no enum.
+
+### controlplane/testdata/routes.golden
+
+- Added: `PUT /api/repos/{owner}/{repo}/session-spend-cap` (answers
+  `RepoSettings`) and `PUT /api/automations/{automationID}/session-spend-cap`
+  (answers `Automation`), each taking `UpdateSessionSpendCapRequest`. Both
+  are admin only (`authz.ActionSetSessionSpendCap`, §13.3) -- the
+  automation route stricter than the automation's other writes, which a
+  maintainer may make -- and each write commits with its
+  `session_spend_cap.set` audit row, naming the cap it replaced and the
+  cap it set. `400` for a cap that is not above zero, is written with more
+  than two decimal places or is above 99999999.99, or a body without
+  `capUsd`; `404` for a repository this deployment does not know or an
+  automation that does not exist. A write re-admits a session the cap
+  refused only when it changes the cap the session is held to and the cap
+  that then applies is above what the session has spent. Two routes added
+  grade MINOR (row 41).
+
 ## [1.26.0]
 
 ### rest/v1/dtos.schema.json

@@ -166,10 +166,30 @@ RETURNING *;
 -- so two invocations belonging to the SAME automation that close (fail)
 -- concurrently apply their own automation.EvaluateFailureStrike
 -- consequence one at a time, never as a lost update racing against each
--- other's own read-then-write of consecutive_failures.
+-- other's own read-then-write of consecutive_failures. Also the first
+-- statement of a session spend cap write (httpapi's
+-- PutAutomationSessionSpendCap): the cap it reads is the
+-- session_spend_cap.set audit row's previous value, and of two writes at
+-- once the second waits and reads the first one's cap.
 SELECT * FROM automations
 WHERE id = $1
 FOR UPDATE;
+
+-- name: UpdateAutomationSessionSpendCap :one
+-- Technical plan §40.1's per-automation session spend cap
+-- (automations.session_spend_cap_usd, migrations/000165): the cap of every
+-- session the automation creates, ahead of its repositories' caps. Sets,
+-- raises, lowers or clears it (NULL: no cap), touching no other column but
+-- updated_at. Written only under LockAutomationForUpdate's lock, in the
+-- same transaction as the session_spend_cap.set audit row. A cap of zero or
+-- less, or no number at all, is refused before it reaches here
+-- (sessionguard.ValidateSessionSpendCap, a 400) and by the column's CHECK
+-- constraint behind it. pgx.ErrNoRows when the automation does not exist.
+UPDATE automations
+SET session_spend_cap_usd = $2,
+    updated_at = now()
+WHERE id = $1
+RETURNING *;
 
 -- name: ApplyFailureStrike :one
 -- Records automation.EvaluateFailureStrike's own verdict -- called only

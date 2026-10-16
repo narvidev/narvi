@@ -766,6 +766,8 @@ Revoking a repository's eligibility and restoring it are one admin-only action (
 
 Freezing autonomy platform-wide and lifting the freeze (§40.2) are one admin-only action (`manage_autonomy_freeze`), audited as `autonomy.frozen` and `autonomy.unfrozen` in the change's own transaction. Reading the freeze is not: every role reads it (`view_sessions`), since the decision inbox shows every role the same banner (§16.1).
 
+Setting, raising, lowering and clearing a session spend cap (§40.1) are one admin-only action (`set_session_spend_cap`), for a repository's cap (`PUT /api/repos/{owner}/{repo}/session-spend-cap`) and an automation's (`PUT /api/automations/{automationID}/session-spend-cap`) alike, each write audited as `session_spend_cap.set`, naming the cap it replaced, in its own transaction. The automation's cap is stricter than the automation's other writes, which a maintainer may make: it takes precedence over its repositories' caps, so a maintainer who could set it could lift a cap an administrator set.
+
 Stopping on own/joined sessions is owner decision O1 (default taken 2026-09-29, open to revision): a member can already start and prompt that work, and a stop only ever reduces what runs. Stopping a session also stops every session it started (§3.3), authorized by the one check on the session named. Resuming stays admin/maintainer only; in practice a person resumes a stopped session by prompting it, approving its plan, or approving or revising a workflow step awaiting their decision, each under its own permission (§3.3).
 
 O1 does not reach a pull request's review session — a session a `github_pr_sessions` row points at (decided 2026-09-29, review of Step 217). That session is shared: every review attempt on the pull request runs in it, a maintainer's label re-trigger and the automatic re-review included, and the sentinel auto-fix sessions it starts are its descendants. Its creator is only whoever first mentioned the bot on the pull request. A stop would let that member end work they could not have started, so stopping a review session needs admin or maintainer, as before O1, whoever created or joined it.
@@ -7516,8 +7518,25 @@ pushed head for the next push; the freeze (40.2) is read before the guard there,
 skipped, consuming nothing, before the cap is asked. An owed review request is dropped before anything is read for it (the
 requester's authorization, the pull request, the composed prompt), and its requester is told once. The
 composition review is declined for the cycle. The session keeps whatever sandbox it has under §2's
-ordinary idle rules, and an admin or maintainer raising the cap (an audited write) re-admits the next
-turn. §3.1's taxonomy is preserved: a capped session is a session waiting on a human, not a failed one.
+ordinary idle rules. §3.1's taxonomy is preserved: a capped session is a session waiting on a human, not
+a failed one.
+
+**The raise that re-admits.** An administrator raises, lowers or clears a cap through
+`PUT /api/repos/{owner}/{repo}/session-spend-cap` or `PUT /api/automations/{automationID}/session-spend-cap`
+(`{"capUsd": <dollars or null>}`), admin only (`set_session_spend_cap`, §13.3). Each write locks the
+row, reads the cap it replaces, writes the new one and records `session_spend_cap.set` with both values,
+all in one transaction, so a cap never changes without its audit row. A write re-admits a refused
+session only when it changes the cap the session is held to and the cap that then applies is above what
+the session has spent. Clearing an automation's cap leaves its sessions to the strictest of their
+repositories' caps, and raising one repository's cap changes nothing while the automation's cap or a
+stricter repository's still applies; the refusal names the cap in effect and where it was set. When a
+write does re-admit, it is at once. The guard reads the caps afresh on every turn it decides, and every
+refused turn was either never inserted or ended at dispatch, so nothing waits to be woken: the next turn
+created is admitted and dispatched, a plan still awaiting approval can be approved, an escalated
+workflow run is answered by the next turn a person sends, and the automatic re-review resumes at the
+next push. The automation's cap is not set at creation, which a maintainer may do: it takes precedence
+over its repositories', so a role that could set it could lift a cap an administrator set on a
+repository.
 
 **One warning and one telling per crossing.** A crossing is the session refused after it was last
 admitted a turn, under one cap. Every refusal records a persisted `warning` event at a message id
@@ -7553,7 +7572,11 @@ neither. The asymmetry with §24.6 is intended and is the reason the two are sep
 **A cap of zero is refused at write time.** §37's rule: a value that cannot function is rejected when
 written. A cap of zero or less permits nothing — the same shape as `loopguard.Config.MaxAttempts <= 0`,
 which §25.5 calls a misconfiguration — so the write is refused, and NULL remains the only spelling of
-"no cap".
+"no cap". Both routes read the cap from the number exactly as the request writes it
+(`sessionguard.ParseSessionSpendCap`, which ends with the one validator,
+`sessionguard.ValidateSessionSpendCap`) and answer 400 for a cap at or below zero, written with more than
+two decimal places (which `NUMERIC(10,2)` would round, and a float64 can round before it) or above
+99999999.99; the columns' CHECK constraints back it.
 
 **What the cap cannot do, stated rather than implied.** It refuses the *next* turn. It lets the one
 in flight finish, by choice rather than for want of a channel: the stop (§3.3, §43.22) can reach a
