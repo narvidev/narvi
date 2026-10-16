@@ -321,6 +321,11 @@ func TestHandleCheckout_PrivateForkWithoutTheApp_ReadFromTheBasePullRef(t *testi
 		if err := json.Unmarshal(ready, &r); err != nil || r.Capabilities == nil || r.Capabilities.ReviewCheckout == nil || !*r.Capabilities.ReviewCheckout {
 			t.Errorf("ready = %s (%v), want capabilities.reviewCheckout true", ready, err)
 		}
+		// The real binary also says it honours SESSION_CONFIG's
+		// skipRepoHooks (technical plan §6.4, §27.1).
+		if r.Capabilities == nil || r.Capabilities.SkipRepoHooks == nil || !*r.Capabilities.SkipRepoHooks {
+			t.Errorf("ready = %s, want capabilities.skipRepoHooks true", ready)
+		}
 	case <-time.After(pushTestTimeout):
 		t.Fatalf("no ready; sandbox-agent output:\n%s", out.String())
 	}

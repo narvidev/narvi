@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -565,5 +566,34 @@ func TestNewSessionCommands_StatesTheProvidersDeadline(t *testing.T) {
 				t.Errorf("logged %s, want one %s line naming %q", lines[0], tc.wantLevel, tc.wantAttr)
 			}
 		})
+	}
+}
+
+// TestNewSessionCommands_TheReadyAdvertisesSkipRepoHooks: the agent's own
+// wiring makes every ready it sends advertise capabilities.skipRepoHooks --
+// runBootSequence honours SESSION_CONFIG's skipRepoHooks in every boot mode
+// (technical plan §6.4, §27.1) -- so the control plane sends this agent's
+// gens the turns of a review session that boots without the repository's
+// hooks. Built through newSessionCommands, the bridge the real binary uses.
+func TestNewSessionCommands_TheReadyAdvertisesSkipRepoHooks(t *testing.T) {
+	fcp := newFakeSnapshotCP(t, "session-skip-repo-hooks")
+	startSessionCommands(t, fcp, boot.Config{}, slog.New(slog.NewJSONHandler(io.Discard, nil)), newVersionedTestAdapter(t, ""))
+
+	var ready json.RawMessage
+	select {
+	case ready = <-fcp.ready:
+	case <-time.After(snapshotTestWait):
+		t.Fatal("no ready arrived")
+	}
+	var frame struct {
+		Capabilities *struct {
+			SkipRepoHooks *bool `json:"skipRepoHooks"`
+		} `json:"capabilities"`
+	}
+	if err := json.Unmarshal(ready, &frame); err != nil {
+		t.Fatalf("malformed ready %s: %v", ready, err)
+	}
+	if frame.Capabilities == nil || frame.Capabilities.SkipRepoHooks == nil || !*frame.Capabilities.SkipRepoHooks {
+		t.Fatalf("ready = %s, want capabilities.skipRepoHooks true", ready)
 	}
 }

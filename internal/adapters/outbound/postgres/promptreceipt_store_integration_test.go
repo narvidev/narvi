@@ -38,12 +38,14 @@ func TestSandboxStore_RecordReady_GuardedOnGen(t *testing.T) {
 		gen             int32
 		promptReceipt   bool
 		reviewCheckout  bool
+		skipRepoHooks   bool
 		maxFrameBytes   *int32
 		wantSeq         int32
 		wantGen         *int32
 		wantFrame       *int32
 		wantFrameGen    *int32
 		wantCheckoutGen *int32
+		wantSkipGen     *int32
 	}{
 		{name: "another gen's capable ready", gen: 2, promptReceipt: true, maxFrameBytes: ptrInt32(65536), wantSeq: 0},
 		{name: "the live gen's capable ready", gen: 1, promptReceipt: true, maxFrameBytes: ptrInt32(65536), wantSeq: 1, wantGen: ptrInt32(1), wantFrame: ptrInt32(65536), wantFrameGen: ptrInt32(1)},
@@ -57,9 +59,15 @@ func TestSandboxStore_RecordReady_GuardedOnGen(t *testing.T) {
 		{name: "the live gen's ready that can check out", gen: 1, promptReceipt: true, reviewCheckout: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 7, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1), wantCheckoutGen: ptrInt32(1)},
 		{name: "a later ready that cannot clears it", gen: 1, promptReceipt: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 8, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1)},
 		{name: "able to check out again", gen: 1, promptReceipt: true, reviewCheckout: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 9, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1), wantCheckoutGen: ptrInt32(1)},
+		// capabilities.skipRepoHooks (migrations/000174), recorded by the
+		// same rule.
+		{name: "another gen's ready that honours skipRepoHooks", gen: 2, skipRepoHooks: true, wantSeq: 9, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1), wantCheckoutGen: ptrInt32(1)},
+		{name: "the live gen's ready that honours skipRepoHooks", gen: 1, promptReceipt: true, reviewCheckout: true, skipRepoHooks: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 10, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1), wantCheckoutGen: ptrInt32(1), wantSkipGen: ptrInt32(1)},
+		{name: "a later ready that does not clears it", gen: 1, promptReceipt: true, reviewCheckout: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 11, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1), wantCheckoutGen: ptrInt32(1)},
+		{name: "honouring skipRepoHooks again", gen: 1, promptReceipt: true, reviewCheckout: true, skipRepoHooks: true, maxFrameBytes: ptrInt32(32 << 20), wantSeq: 12, wantGen: ptrInt32(1), wantFrame: ptrInt32(32 << 20), wantFrameGen: ptrInt32(1), wantCheckoutGen: ptrInt32(1), wantSkipGen: ptrInt32(1)},
 	}
 	for _, step := range steps {
-		if err := store.RecordReady(ctx, sessionID, step.gen, step.promptReceipt, step.reviewCheckout, step.maxFrameBytes); err != nil {
+		if err := store.RecordReady(ctx, sessionID, step.gen, step.promptReceipt, step.reviewCheckout, step.skipRepoHooks, step.maxFrameBytes); err != nil {
 			t.Fatalf("%s: RecordReady: %v", step.name, err)
 		}
 		row, err := store.Get(ctx, sessionID)
@@ -68,10 +76,10 @@ func TestSandboxStore_RecordReady_GuardedOnGen(t *testing.T) {
 		}
 		if row.ReadySeq != step.wantSeq || !equalInt32Ptr(row.PromptReceiptGen, step.wantGen) ||
 			!equalInt32Ptr(row.AgentMaxFrameBytes, step.wantFrame) || !equalInt32Ptr(row.AgentMaxFrameBytesGen, step.wantFrameGen) ||
-			!equalInt32Ptr(row.ReviewCheckoutGen, step.wantCheckoutGen) {
-			t.Fatalf("%s: ready_seq %d, prompt_receipt_gen %v, agent_max_frame_bytes %v at gen %v, review_checkout_gen %v; want %d, %v, %v at gen %v, %v", step.name,
-				row.ReadySeq, derefInt32(row.PromptReceiptGen), derefInt32(row.AgentMaxFrameBytes), derefInt32(row.AgentMaxFrameBytesGen), derefInt32(row.ReviewCheckoutGen),
-				step.wantSeq, derefInt32(step.wantGen), derefInt32(step.wantFrame), derefInt32(step.wantFrameGen), derefInt32(step.wantCheckoutGen))
+			!equalInt32Ptr(row.ReviewCheckoutGen, step.wantCheckoutGen) || !equalInt32Ptr(row.SkipRepoHooksGen, step.wantSkipGen) {
+			t.Fatalf("%s: ready_seq %d, prompt_receipt_gen %v, agent_max_frame_bytes %v at gen %v, review_checkout_gen %v, skip_repo_hooks_gen %v; want %d, %v, %v at gen %v, %v, %v", step.name,
+				row.ReadySeq, derefInt32(row.PromptReceiptGen), derefInt32(row.AgentMaxFrameBytes), derefInt32(row.AgentMaxFrameBytesGen), derefInt32(row.ReviewCheckoutGen), derefInt32(row.SkipRepoHooksGen),
+				step.wantSeq, derefInt32(step.wantGen), derefInt32(step.wantFrame), derefInt32(step.wantFrameGen), derefInt32(step.wantCheckoutGen), derefInt32(step.wantSkipGen))
 		}
 	}
 
@@ -81,18 +89,18 @@ func TestSandboxStore_RecordReady_GuardedOnGen(t *testing.T) {
 	if _, err := store.UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{SessionID: sessionID, TokenHash: &token}); err != nil {
 		t.Fatalf("respawn: %v", err)
 	}
-	if err := store.RecordReady(ctx, sessionID, 1, true, false, ptrInt32(4096)); err != nil {
+	if err := store.RecordReady(ctx, sessionID, 1, true, false, false, ptrInt32(4096)); err != nil {
 		t.Fatalf("RecordReady: %v", err)
 	}
 	row, err := store.Get(ctx, sessionID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if row.Gen != 2 || row.ReadySeq != 9 || !equalInt32Ptr(row.PromptReceiptGen, ptrInt32(1)) ||
+	if row.Gen != 2 || row.ReadySeq != 12 || !equalInt32Ptr(row.PromptReceiptGen, ptrInt32(1)) ||
 		!equalInt32Ptr(row.AgentMaxFrameBytes, ptrInt32(32<<20)) || !equalInt32Ptr(row.AgentMaxFrameBytesGen, ptrInt32(1)) ||
-		!equalInt32Ptr(row.ReviewCheckoutGen, ptrInt32(1)) {
-		t.Fatalf("after a respawn and a stale ready: gen %d, ready_seq %d, prompt_receipt_gen %v, agent_max_frame_bytes %v at gen %v, review_checkout_gen %v; want 2, 9, 1, %d at gen 1, 1 (stale, not matching)",
-			row.Gen, row.ReadySeq, derefInt32(row.PromptReceiptGen), derefInt32(row.AgentMaxFrameBytes), derefInt32(row.AgentMaxFrameBytesGen), derefInt32(row.ReviewCheckoutGen), 32<<20)
+		!equalInt32Ptr(row.ReviewCheckoutGen, ptrInt32(1)) || !equalInt32Ptr(row.SkipRepoHooksGen, ptrInt32(1)) {
+		t.Fatalf("after a respawn and a stale ready: gen %d, ready_seq %d, prompt_receipt_gen %v, agent_max_frame_bytes %v at gen %v, review_checkout_gen %v, skip_repo_hooks_gen %v; want 2, 12, 1, %d at gen 1, 1, 1 (stale, not matching)",
+			row.Gen, row.ReadySeq, derefInt32(row.PromptReceiptGen), derefInt32(row.AgentMaxFrameBytes), derefInt32(row.AgentMaxFrameBytesGen), derefInt32(row.ReviewCheckoutGen), derefInt32(row.SkipRepoHooksGen), 32<<20)
 	}
 }
 

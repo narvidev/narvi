@@ -1876,6 +1876,7 @@ type GithubPrSession struct {
 	AutoRetriggerContextMoves       int32              `json:"auto_retrigger_context_moves"`
 	AutoRetriggerDroppedAt          pgtype.Timestamptz `json:"auto_retrigger_dropped_at"`
 	AutoRetriggerDroppedHeadSha     *string            `json:"auto_retrigger_dropped_head_sha"`
+	HeadInBase                      *bool              `json:"head_in_base"`
 }
 
 type HandoffSentinelRun struct {
@@ -2392,6 +2393,9 @@ type Sandbox struct {
 	SnapshotStartMessageID        *string              `json:"snapshot_start_message_id"`
 	HeartbeatReadySeq             *int32               `json:"heartbeat_ready_seq"`
 	HeartbeatsSinceReady          *int16               `json:"heartbeats_since_ready"`
+	SkipRepoHooksGen              *int32               `json:"skip_repo_hooks_gen"`
+	SkipRepoHooksToldGen          *int32               `json:"skip_repo_hooks_told_gen"`
+	SnapshotSkippedRepoHooksID    *string              `json:"snapshot_skipped_repo_hooks_id"`
 }
 
 type SandboxHistory struct {

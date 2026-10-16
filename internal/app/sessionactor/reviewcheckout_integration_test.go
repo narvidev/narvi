@@ -74,12 +74,13 @@ func i32(p *int32) int32 {
 }
 
 // checkoutReady is a ready of gen, advertising reviewCheckout when
-// capable.
+// capable, from an agent that honours SESSION_CONFIG's skipRepoHooks: the
+// checkout's capability is this file's question, not the hooks'.
 func checkoutReady(gen int, capable bool) SandboxEvent {
 	id := "ready-" + uuid.NewString()
-	caps := ""
+	caps := `,"capabilities":{"skipRepoHooks":true}`
 	if capable {
-		caps = `,"capabilities":{"reviewCheckout":true}`
+		caps = `,"capabilities":{"reviewCheckout":true,"skipRepoHooks":true}`
 	}
 	agentVersion, imageDigest := "dev", "unknown"
 	return SandboxEvent{Type: "ready", Gen: gen, MessageID: id, AgentVersion: &agentVersion, ImageDigest: &imageDigest,
@@ -565,7 +566,7 @@ func TestReviewCheckout_AGenChangeAsksTheNewGen(t *testing.T) {
 		t.Fatalf("store the old gen's reply: %v", err)
 	}
 	backdateCheckout(ctx, t, pool, reviewTurn.ID, 5*time.Minute, 5*time.Minute)
-	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET gen = 2, review_checkout_gen = 2 WHERE session_id = $1`, f.sessionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET gen = 2, review_checkout_gen = 2, skip_repo_hooks_gen = 2, skip_repo_hooks_told_gen = 2 WHERE session_id = $1`, f.sessionID); err != nil {
 		t.Fatal(err)
 	}
 	settle(ctx, t, rig.actor)
@@ -1033,7 +1034,7 @@ func TestReviewCheckout_AReEnqueuedTurnChecksOutOnTheNewGen(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET gen = 2 WHERE session_id = $1`, f.sessionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET gen = 2, skip_repo_hooks_told_gen = 2 WHERE session_id = $1`, f.sessionID); err != nil {
 		t.Fatal(err)
 	}
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
@@ -1079,7 +1080,7 @@ func TestReviewCheckout_ARefusedReEnqueueIsFailedForward(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET gen = 2 WHERE session_id = $1`, f.sessionID); err != nil {
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET gen = 2, skip_repo_hooks_told_gen = 2 WHERE session_id = $1`, f.sessionID); err != nil {
 		t.Fatal(err)
 	}
 	rig := newContextRig(ctx, t, pool, f.sessionID, nil)
@@ -1420,7 +1421,10 @@ func slowRestoreFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool, r
 	if snapshot {
 		snapshotID = "snap-good"
 	}
-	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'stopped', snapshot_id = $2 WHERE session_id = $1`, f.sessionID, snapshotID); err != nil {
+	// A snapshot the review session may restore: minted by a current
+	// agent's gen that booted without the repository's hooks, as the
+	// session's unrecorded claim has it boot (technical plan §6.4).
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'stopped', snapshot_id = $2, snapshot_provenance_id = $2, snapshot_agent_protocol = '1.28.0', snapshot_skipped_repo_hooks_id = $2 WHERE session_id = $1`, f.sessionID, snapshotID); err != nil {
 		t.Fatal(err)
 	}
 	reviewTurn := seedReviewTurn(ctx, t, f, coHead, nil, true)

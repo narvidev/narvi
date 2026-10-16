@@ -766,9 +766,28 @@ func PostReviewVerdict(
 				// eligible to trigger another, regardless of what its own
 				// verdict finds.
 				autoFixCandidate = false
-			case reposErr != nil || len(repos) == 0 || repos[0].Branch == nil || *repos[0].Branch == "":
-				logger.Warn("httpapi: review-verdict: could not determine origin head branch from session repos, skipping sentinel-auto-fix trigger",
+			case reposErr != nil || len(repos) == 0:
+				logger.Warn("httpapi: review-verdict: could not read the session's repos, skipping sentinel-auto-fix trigger",
 					"error", reposErr)
+				autoFixCandidate = false
+			case !reposource.ReviewHeadInBaseRepository(prSession.RepoFullName, prSession.HeadInBase, sessionRow.Repos):
+				// The fix is cut from the spec's branch, in the spec's
+				// repository -- so only when that branch is the pull
+				// request's head in its base repository (technical plan
+				// §30.4): the claim records the head in the base, and the
+				// spec's primary repo names the claim's repository and
+				// carries a branch. A pull request from a fork keeps its
+				// head in the fork; its spec names no branch, and neither
+				// does one whose head could not be read when its review
+				// started. A legacy session not yet moved still names the
+				// fork and the fork's branch, and a fix child would act on
+				// the fork; one whose fork was already deleted names the
+				// base's url with the fork's branch, which only the claim's
+				// record tells from a branch of the base. A claim no mention
+				// has recorded yet is unknown until a mention reads the
+				// head. Expected, so not a warning.
+				logger.Info("httpapi: review-verdict: the review session's head is not known to be a branch of its base repository (a pull request from a fork, a legacy session, a session opened while its head could not be read, or a claim not yet recorded), skipping sentinel-auto-fix trigger",
+					"repo", prSession.RepoFullName, "pr_number", prSession.PrNumber)
 				autoFixCandidate = false
 			default:
 				originHeadBranch = *repos[0].Branch

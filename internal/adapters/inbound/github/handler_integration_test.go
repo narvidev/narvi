@@ -320,7 +320,10 @@ func pullRequestLabeledBody(repoFullName, cloneRepoName, cloneURL string, prNumb
 			},
 			"base": map[string]any{"ref": "main"},
 		},
-		"repository": map[string]any{"full_name": repoFullName, "default_branch": "main"},
+		// name/clone_url: the base repository a review session clones
+		// (payload.go's mention.RepoName), as a real delivery carries
+		// them; the pull request's head lives in the same repository here.
+		"repository": map[string]any{"full_name": repoFullName, "name": cloneRepoName, "clone_url": cloneURL, "default_branch": "main"},
 	})
 	if err != nil {
 		panic(err)
@@ -1190,8 +1193,7 @@ func TestGitHubIntegration_IssueCommentResolvesRealHeadBranch(t *testing.T) {
 	resolver := &fakePullRequestResolver{
 		pr: githubapi.PullRequest{
 			HeadRef:          "feature-real-branch",
-			HeadRepoName:     "widgets",
-			HeadRepoCloneURL: "https://github.com/acme/widgets.git",
+			HeadRepoFullName: "acme/widgets",
 		},
 	}
 	rig := newTestRig(t, func(cfg *githubingress.Config) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -396,6 +397,15 @@ type SessionCoalescer struct {
 // avoid. Reused verbatim, never recaptured: both categories classify the
 // EXACT same raw mention text.
 //
+// headInBase is what this mention read of whether its pull request's head
+// is a branch of its base repository (handler.go's headInBaseRecord): nil
+// when it read no head -- an issue_comment whose pull request lookup failed
+// -- else true or false, recorded on the claim row before the two branches
+// below split (github_pr_sessions.head_in_base, §27.1). headBranch is the
+// head branch it read (head.ref), nil when it read none: the REUSE branch
+// gives it to an existing session whose spec names the base with no branch
+// when headInBase is true (repairHeadBranch).
+//
 // reviewHeadSHA is the commit
 // SHA handler.go's own reviewcontext.Fetch call just anchored req.Prompt's
 // own pre-fetched diff to (empty when that fetch failed/never ran) --
@@ -441,7 +451,7 @@ type SessionCoalescer struct {
 // reviewing agent will read, block and all, so the record of what that
 // block actually contained must be captured from the SAME resolution,
 // never recomputed here.
-func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string, prNumber int32, req restdtos.CreateSessionRequest, actor pgtype.UUID, isLabelRetrigger bool, classifyText string, reviewHeadSHA string, reviewDepth *string, triageModelID *string, triageEffort *string, triageRecordJSON []byte, knowledgeMode *string, knowledgeDecisionJSON []byte, reviewVerdictContextJSON []byte) (session sqlcgen.Session, turn sqlcgen.Turn, isNewSession bool, err error) {
+func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string, prNumber int32, headInBase *bool, headBranch *string, req restdtos.CreateSessionRequest, actor pgtype.UUID, isLabelRetrigger bool, classifyText string, reviewHeadSHA string, reviewDepth *string, triageModelID *string, triageEffort *string, triageRecordJSON []byte, knowledgeMode *string, knowledgeDecisionJSON []byte, reviewVerdictContextJSON []byte) (session sqlcgen.Session, turn sqlcgen.Turn, isNewSession bool, err error) {
 	var reviewHeadSHAPtr *string
 	if reviewHeadSHA != "" {
 		reviewHeadSHAPtr = &reviewHeadSHA
@@ -485,8 +495,9 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	// package ever builds, so this is exempt from the "known" half of the
 	// predicate -- see ResolveRepoEntitlement's own doc comment for exactly
 	// why re-deriving it from req.Repos[0].Url would be actively WRONG here
-	// (a cross-repo/fork PR's own clone URL is deliberately the fork, never
-	// repoFullName's own base-repository claim key) -- but not from an
+	// (the claim key, repoFullName, is the pull request's identity; a fork
+	// pull request's review session created before its spec named the base
+	// repository, technical plan §30.4, clones the fork) -- but not from an
 	// administrator's revocation (§31.4, "Un-entitlement"), read here for
 	// repoFullName, the pull request's base repository, and for the clone
 	// URL. A refusal stops BOTH branches below: a new mention, a follow-up
@@ -533,6 +544,26 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 		return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: lock claim row: %w", err)
 	}
 
+	// Technical plan §27.1, §30.4: record, under the claim's own row lock
+	// and before the two branches split, whether this pull request's head
+	// is a branch of its base repository, from this delivery's head.repo
+	// (headInBaseRecord). Every mention that read the head writes it -- a
+	// new review session's and one joining an existing session alike, the
+	// second committed with this transaction's early commit below -- so a
+	// claim the previous ingress left unrecorded (NULL, read as not in the
+	// base) is recorded by its pull request's next such mention. A mention
+	// that read no head writes nothing: a pull request's head repository
+	// never changes, so what an earlier read recorded stays true, and a new
+	// claim stays NULL, which fails closed. The fact comes from GitHub's
+	// signed delivery or the bot's own lookup, never from the commenter, so
+	// a mention this function goes on to refuse records it too, when its
+	// branch commits.
+	if headInBase != nil {
+		if err := txPRSessions.RecordHeadInBase(ctx, repoFullName, prNumber, *headInBase); err != nil {
+			return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: record whether the head is in the base repository: %w", err)
+		}
+	}
+
 	if existing.Valid {
 		// Reuse case: this PR already has a review session. Commit now
 		// (releasing the lock, and this transaction's own connection, for
@@ -569,6 +600,21 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 		existingSession, err := c.Sessions.Get(ctx, existing)
 		if err != nil {
 			return sqlcgen.Session{}, sqlcgen.Turn{}, false, fmt.Errorf("github: get existing session: %w", err)
+		}
+
+		// Technical plan §27.1, §30.4: a session opened while its pull
+		// request's head could not be read names the base with no branch,
+		// which the review-head rule never reads as the base's own. This
+		// mention read the head in the base, so the session gets the head's
+		// branch now -- before the turn below is created, so the gen that
+		// turn may spawn or restore boots with it -- as a first mention that
+		// read the head would have opened it. Like the record, a fact from
+		// GitHub, written whatever this function decides about the
+		// commenter below.
+		if headInBase != nil && *headInBase && headBranch != nil && *headBranch != "" {
+			if err := c.repairHeadBranch(ctx, logger, existingSession, repoFullName, prNumber, *headBranch); err != nil {
+				return sqlcgen.Session{}, sqlcgen.Turn{}, false, err
+			}
 		}
 
 		// actorauthz.AuthorizeLinkedActor is now called UNCONDITIONALLY --
@@ -958,4 +1004,35 @@ func (c *SessionCoalescer) CreateOrJoin(ctx context.Context, repoFullName string
 	logger.Info("github: created new review session for mention",
 		"session_id", created.ID, "turn_id", createdTurn.ID, "repo", repoFullName, "pr_number", prNumber)
 	return created, createdTurn, true, nil
+}
+
+// repairHeadBranch gives session -- the review session of repoFullName's
+// pull request prNumber, which a mention just read as a branch of its base
+// repository, branch -- that branch when its spec names the base with no
+// branch (reposource.ReviewSpecAwaitsHeadBranch): the spec the ingress
+// writes when it could not read the head. Run after the claim transaction
+// commits, never under the claim's row lock (the statement's own comment
+// says why), and guarded on the claim's record, the session's only claim
+// and the url it read here, so a concurrent writer never has a branch
+// replaced. A branch reposource.ValidateBranch refuses is left out, as the
+// session-create path would refuse it.
+func (c *SessionCoalescer) repairHeadBranch(ctx context.Context, logger *slog.Logger, session sqlcgen.Session, repoFullName string, prNumber int32, branch string) error {
+	url, ok := reposource.ReviewSpecAwaitsHeadBranch(repoFullName, session.Repos)
+	if !ok {
+		return nil
+	}
+	if err := reposource.ValidateBranch(branch); err != nil {
+		logger.Warn("github: the pull request's head branch is not a valid branch name; the review session's spec keeps no branch",
+			"session_id", session.ID, "repo", repoFullName, "pr_number", prNumber, "error", err)
+		return nil
+	}
+	set, err := c.Sessions.SetReviewSessionHeadBranch(ctx, session.ID, repoFullName, prNumber, url, branch)
+	if err != nil {
+		return fmt.Errorf("github: give the review session its head branch: %w", err)
+	}
+	if set {
+		logger.Info("github: the review session's spec names its head branch, read in the base repository by this mention",
+			"session_id", session.ID, "repo", repoFullName, "pr_number", prNumber, "branch", branch)
+	}
+	return nil
 }

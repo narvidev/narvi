@@ -1,0 +1,58 @@
+-- Technical plan §6.4, §27.1, §30.4: a pull request's review session whose
+-- head is not in its base repository boots without the repository's hooks
+-- (SESSION_CONFIG's skipRepoHooks), so code the pull request brings never
+-- runs at boot. An agent that predates the key runs them whatever it says,
+-- so the session actor sends no turn of such a session to a gen whose
+-- agent has not said it honours the key
+-- (internal/app/sessionactor/repohooksgate.go).
+--
+-- sandboxes.skip_repo_hooks_gen: the gen whose latest ready advertised
+-- capabilities.skipRepoHooks, recorded the way review_checkout_gen is
+-- (migrations/000168_sandbox_review_checkout_gen.up.sql): written only for
+-- the live gen, by RecordSandboxReady, NULL when that ready did not
+-- advertise it -- the latest ready decides. Never reset: a spawn, restore
+-- or resume bumps the gen, and the value stops matching. A gen that has
+-- sent no ready yet is waited for rather than read as unable.
+--
+-- No backfill, no index, no default. Every sandbox reads as unable until
+-- its next ready; only a session that boots without the repository's hooks
+-- reads the column.
+--
+-- # Locks
+--
+-- golang-migrate sends this file as one batch, one implicit transaction,
+-- of its own: the ADD COLUMN, nullable with no default, is a catalog
+-- change that rewrites nothing, but takes ACCESS EXCLUSIVE on sandboxes
+-- until the file ends -- an instant once granted. The migration waits
+-- behind any open transaction that has read or written sandboxes (every
+-- session actor's dispatch evaluation and sandbox event reads it), and
+-- while it waits, every new read and write of sandboxes queues behind it.
+-- controlplane/migrate.go sets no lock_timeout. The file touches sandboxes
+-- alone, so it holds no lock another table's waiters could need and cannot
+-- close a cycle with a transaction that reads sandboxes after another
+-- table.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with this column present:
+--   - Every statement it sends names its columns, so it neither reads nor
+--     writes it.
+--   - Its RecordSandboxReady counts a ready and leaves skip_repo_hooks_gen
+--     as it is. A gen whose every ready it recorded reads as unable here.
+--     A gen this release recorded capable keeps that through a ready the
+--     previous binary records: the same gen is the same agent.
+--   - It writes no skipRepoHooks into a SESSION_CONFIG, so a gen it spawns
+--     runs the repository's hooks as before, whatever its agent can do.
+--     The capability says nothing of what a boot did; what a gen was told
+--     is recorded apart (migrations/000175_sandbox_repo_hooks_lineage), and
+--     a gen of a session that boots without the hooks is sent a turn only
+--     when it was told to skip them and advertised it honours that -- the
+--     previous binary's gens, told nothing, are retired.
+--
+-- # Rolling back
+--
+-- The previous binary cannot boot on 174 ("no migration found for version
+-- 174"). With the control plane scaled to zero, either keep the column
+-- (`migrate force 173`; this file, run again, keeps its values) or run the
+-- down (goto 173).
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS skip_repo_hooks_gen INTEGER;

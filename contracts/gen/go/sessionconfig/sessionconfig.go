@@ -107,6 +107,21 @@ type SessionConfig struct {
 
 	// SessionId corresponds to the JSON schema field "sessionId".
 	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
+
+	// Technical plan §6.4, §27.1, §30.4: true when the sandbox boots without the
+	// repository's hooks -- a pull request's review session whose head is not known
+	// to be a branch of its base repository, so code the pull request brings never
+	// runs at boot. The sandbox-agent then runs, in every boot mode, none of
+	// setup.sh, sync.sh and start.sh, and starts none of the services
+	// .narvi/services.yml declares, for every repo. The control plane decides it from
+	// the session's pull request claim each time it assembles the document for a
+	// spawn or a restore; a later change reaches the next boot. Genuinely OPTIONAL:
+	// absent/false is today's unchanged behavior -- the hooks run -- for every
+	// session that is not such a review session, and for every document an older
+	// control plane writes. An agent that predates it ignores the key, so the control
+	// plane sends no turn of such a session to a gen whose ready did not advertise
+	// capabilities.skipRepoHooks.
+	SkipRepoHooks bool `json:"skipRepoHooks,omitempty,omitzero" yaml:"skipRepoHooks,omitempty" mapstructure:"skipRepoHooks,omitempty"`
 }
 
 type SessionConfigBootMode string
@@ -351,6 +366,9 @@ func (j *SessionConfig) UnmarshalJSON(value []byte) error {
 	}
 	if plain.Repos != nil && len(plain.Repos) < 1 {
 		return fmt.Errorf("field %s length: must be >= %d", "repos", 1)
+	}
+	if v, ok := raw["skipRepoHooks"]; !ok || v == nil {
+		plain.SkipRepoHooks = false
 	}
 	*j = SessionConfig(plain)
 	return nil

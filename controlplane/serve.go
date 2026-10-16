@@ -1355,7 +1355,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// httpapi/sandboxsecretsdelivery.go's own doc comment) -- two more
 	// sandbox-bearer-token-authenticated routes, not browser-facing ones.
 	router.Post("/sessions/{sessionID}/sandbox-secrets",
-		httpapi.SandboxSecretsDelivery(sessionStore, sandboxStore, sandboxSecretStore, cfg.TokenEncryptionKey))
+		httpapi.SandboxSecretsDelivery(sessionStore, sandboxStore, githubPRSessionStore, sandboxSecretStore, cfg.TokenEncryptionKey))
 	router.Post("/sessions/{sessionID}/opencode-config",
 		httpapi.OpenCodeConfigDelivery(sessionStore, sandboxStore, openCodeConfigStore))
 

@@ -25,9 +25,11 @@ import (
 )
 
 // forkReviewCommentBody is a "pull_request_review_comment" mention on
-// baseFullName's pull request prNumber whose head lives in a fork at
-// forkCloneURL -- the payload names the fork as the repository to clone,
-// and the base repository as the pull request's own.
+// baseFullName's pull request prNumber whose head lives in a fork,
+// contributor/<baseName>, cloned from forkCloneURL -- head.repo.full_name
+// names the fork as the head's repository, and the top-level repository
+// the base as the pull request's own, the one a review session clones
+// (technical plan §30.4).
 func forkReviewCommentBody(baseFullName, baseName, forkCloneURL string, prNumber int, label string, commenterID int64, commenterLogin string) []byte {
 	body, err := json.Marshal(map[string]any{
 		"action": "created",
@@ -39,9 +41,11 @@ func forkReviewCommentBody(baseFullName, baseName, forkCloneURL string, prNumber
 		"pull_request": map[string]any{
 			"number": prNumber,
 			"head": map[string]any{
-				"ref":  "contributor-patch",
-				"sha":  "sha-fork-head",
-				"repo": map[string]any{"name": baseName, "clone_url": forkCloneURL},
+				"ref": "contributor-patch",
+				"sha": "sha-fork-head",
+				// full_name is what the ingress reads to tell a fork's
+				// head from a branch of the base (reviewSessionRepo).
+				"repo": map[string]any{"name": baseName, "full_name": "contributor/" + baseName, "clone_url": forkCloneURL},
 			},
 		},
 		"repository": map[string]any{
@@ -163,8 +167,8 @@ func TestGitHubIntegration_RevokedRepo_FollowUpMentionCreatesNoTurn(t *testing.T
 }
 
 // TestGitHubIntegration_RevokedRepo_ForkPRMentionRefused: a fork pull
-// request's mention names the fork as the repository to clone; the
-// revocation of its base repository still refuses it.
+// request's mention names the fork as its head's repository; the
+// revocation of its base repository refuses it.
 func TestGitHubIntegration_RevokedRepo_ForkPRMentionRefused(t *testing.T) {
 	ctx := context.Background()
 	rig, _, poster := newRolloutTestRig(t, platform.RolloutModeOpen)
@@ -186,13 +190,17 @@ func TestGitHubIntegration_RevokedRepo_ForkPRMentionRefused(t *testing.T) {
 	assertSilentRefusal(ctx, t, rig, poster, deliveryID, baseFullName, 1)
 
 	// The positive control: the same fork pull request on a base repository
-	// nobody revoked creates its review session, cloning the fork.
+	// nobody revoked creates its review session, cloning the base, never
+	// the fork (technical plan §30.4).
 	const openBase = "acme/open-fork-base"
 	open := forkReviewCommentBody(openBase, "open-fork-base", "https://github.com/contributor/open-fork-base.git", prNumber+1, "fork-open", commenterID, "fork-reviewer")
 	if status := postWebhookEventType(t, rig, open, "delivery-open-fork-1", "pull_request_review_comment"); status != http.StatusOK {
 		t.Fatalf("open fork status = %d, want 200", status)
 	}
-	if n := countRows(ctx, t, rig, `SELECT count(*) FROM sessions WHERE spawn_source = 'github' AND repos::text LIKE '%contributor/open-fork-base%'`); n != 1 {
-		t.Errorf("sessions cloning the fork = %d, want 1 for a base repository nobody revoked", n)
+	if n := countRows(ctx, t, rig, `SELECT count(*) FROM sessions WHERE spawn_source = 'github' AND repos->0->>'url' = 'https://github.com/acme/open-fork-base.git' AND repos->0->'branch' = 'null'::jsonb`); n != 1 {
+		t.Errorf("sessions cloning the base, with no branch = %d, want 1 for a base repository nobody revoked", n)
+	}
+	if n := countRows(ctx, t, rig, `SELECT count(*) FROM sessions WHERE repos::text LIKE '%contributor/%'`); n != 0 {
+		t.Errorf("sessions naming the fork = %d, want none", n)
 	}
 }

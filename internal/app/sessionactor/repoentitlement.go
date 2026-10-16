@@ -61,7 +61,8 @@
 // sessions.repos, and the pull-request claims keyed to the session -- a
 // review session's github_pr_sessions row and a sentinel auto-fix child's
 // sentinel_fixes row. The claims name the pull request's base repository,
-// which a fork pull request's clone URL does not.
+// which a fork pull request's review session created before its spec named
+// the base repository (technical plan §30.4), until it is moved, does not.
 
 package sessionactor
 

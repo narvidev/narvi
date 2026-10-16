@@ -89,6 +89,11 @@
             }
           },
           "description": "§27.5 (§27.6): this session's own Environment.egress_policy, enforced at the provider substrate (Modal's own sandbox network controls). Carried here AND, like docker above, also as a top-level ports.CreateSpec field. When mode is \"allowlist\", allowlist ALWAYS already includes the non-negotiable, server-appended floor (the control plane's own WS/API host plus this session's own actual git hosts, internal/domain/environment.AppendAllowlistFloor) -- appended fresh at assembly time, every time, never merely validated once at input, so a customer allowlist that omits either can never reach the wire without both being added back in. Genuinely OPTIONAL (may be absent from the document entirely), NOT required-nullable like most fields above, matching pathScope's own convention exactly: absent or null both mean no egress policy is attached to this Environment -- today's exact unchanged, unrestricted behavior."
+        },
+        "skipRepoHooks": {
+          "type": "boolean",
+          "default": false,
+          "description": "Technical plan §6.4, §27.1, §30.4: true when the sandbox boots without the repository's hooks -- a pull request's review session whose head is not known to be a branch of its base repository, so code the pull request brings never runs at boot. The sandbox-agent then runs, in every boot mode, none of setup.sh, sync.sh and start.sh, and starts none of the services .narvi/services.yml declares, for every repo. The control plane decides it from the session's pull request claim each time it assembles the document for a spawn or a restore; a later change reaches the next boot. Genuinely OPTIONAL: absent/false is today's unchanged behavior -- the hooks run -- for every session that is not such a review session, and for every document an older control plane writes. An agent that predates it ignores the key, so the control plane sends no turn of such a session to a gen whose ready did not advertise capabilities.skipRepoHooks."
         }
       }
     }

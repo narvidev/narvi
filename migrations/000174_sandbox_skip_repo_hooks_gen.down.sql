@@ -1,0 +1,18 @@
+-- Reverses 000174_sandbox_skip_repo_hooks_gen.up.sql. With the column goes
+-- every sandbox's record of the gen whose agent honours SESSION_CONFIG's
+-- skipRepoHooks. A binary without 000174 does not read it; a binary with
+-- it that runs 000174 again reads every sandbox as unable until its next
+-- ready.
+--
+-- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
+-- 000174. Do not run it against live pods of a binary that carries 000174:
+-- every query of that binary that returns a whole sandbox row names the
+-- column (sqlc writes each SELECT * and RETURNING * out as a column list),
+-- so each fails with SQLSTATE 42703 and no sandbox is spawned or read until
+-- the older binary replaces the pod; and a pod that restarts first applies
+-- 000174 again at boot, which locks the older binary out again.
+-- Guarded: IF EXISTS, so it also runs when the column is already gone. The
+-- drop is a catalog change: it rewrites nothing, but takes ACCESS EXCLUSIVE
+-- on sandboxes for the file's one implicit transaction, and touches no
+-- other table.
+ALTER TABLE sandboxes DROP COLUMN IF EXISTS skip_repo_hooks_gen;

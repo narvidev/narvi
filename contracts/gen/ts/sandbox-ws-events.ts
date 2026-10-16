@@ -66,6 +66,10 @@ export interface Ready {
      * True when the agent runs the checkout command, answering each with a checkout_result (technical plan §21.1, §30.4). Absent: the agent does not know the command, and skips it as an unknown one.
      */
     reviewCheckout?: boolean;
+    /**
+     * True when the agent honours SESSION_CONFIG's skipRepoHooks in every boot mode, booting without the repository's hooks when it is true (technical plan §6.4, §27.1, §30.4). Absent: the agent predates the key and runs the hooks whatever it says, so the control plane sends this gen no turn of a session whose SESSION_CONFIG sets it.
+     */
+    skipRepoHooks?: boolean;
   };
   /**
    * Whole seconds, counted when this event was written, that the sandbox's provider will still let this sandbox run, as the provider stated it to the sandbox. Never negative. Absent when the provider stated nothing. The control plane keeps the earlier of now plus this and its own estimate (technical plan §35.2).

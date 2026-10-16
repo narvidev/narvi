@@ -896,6 +896,56 @@ func (q *Queries) ListSessions(ctx context.Context, arg ListSessionsParams) ([]L
 	return items, nil
 }
 
+const moveReviewSessionToBaseRepository = `-- name: MoveReviewSessionToBaseRepository :one
+UPDATE sessions s
+SET repos = jsonb_set(
+        jsonb_set(s.repos, '{0,url}',
+            to_jsonb(substring(s.repos->0->>'url' from '^(https://[^/]+/)') || g.repo_full_name || '.git')),
+        '{0,branch}', 'null'::jsonb)
+FROM github_pr_sessions g
+WHERE s.id = $1
+  AND g.session_id = s.id
+  AND (SELECT count(*) FROM github_pr_sessions c WHERE c.session_id = s.id) = 1
+  AND g.repo_full_name ~ '^[^/]+/[^/]+$'
+  AND CASE WHEN jsonb_typeof(s.repos) = 'array' THEN jsonb_array_length(s.repos) END = 1
+  AND s.repos->0->>'url' ~ '^https://[^/]+/[^/]+/[^/]+$'
+  AND lower(regexp_replace(substring(s.repos->0->>'url' from '^https://[^/]+/(.*)$'), '\.git$', ''))
+      <> lower(g.repo_full_name)
+RETURNING s.repos
+`
+
+// Technical plan §21.1, §30.4: a pull request's review session clones the
+// pull request's base repository, and reads the head from the base's
+// refs/pull/<number>/head. A review session created before its spec named
+// the base repository names its pull request's head repository -- for a
+// pull request from a fork, the fork -- with the fork's branch. This moves
+// one such session's primary repo onto the base repository its claim names
+// (github_pr_sessions.repo_full_name), on the same host, with no branch
+// (a fork's branch names nothing in the base); the name is kept, so a
+// restored workspace keeps its directory.
+//
+// The session actor runs it in the transaction that is about to spawn or
+// restore the session's next gen, before that gen's SESSION_CONFIG is
+// assembled (tryPlanSpawn): the spec moves only when no gen holds the old
+// one, since a gen keeps the spec it booted with and its clone's origin
+// is the fork's -- a checkout of the base's pull ref there would fail
+// (sessionactor's reviewCheckoutTargetFor reads the spec as the one the
+// live gen booted with). The review_sessions_base_repository migration
+// moved, the same way, every such session that held no live gen when it
+// ran; this statement is its expression, for one session.
+//
+// RETURNING the moved repos; pgx.ErrNoRows when there is nothing to move:
+// no claim, more than one claim, a spec that is not one https repo in
+// owner/name shape, a claim that is not, or a spec already naming the
+// claim's repository (compared without regard to case or a ".git" suffix,
+// as sessionactor's pullRequestRef compares them). Idempotent.
+func (q *Queries) MoveReviewSessionToBaseRepository(ctx context.Context, sessionID pgtype.UUID) ([]byte, error) {
+	row := q.db.QueryRow(ctx, moveReviewSessionToBaseRepository, sessionID)
+	var repos []byte
+	err := row.Scan(&repos)
+	return repos, err
+}
+
 const requestSessionStop = `-- name: RequestSessionStop :one
 UPDATE sessions
 SET stop_requested_at = GREATEST(stop_requested_at, now())
@@ -919,6 +969,62 @@ func (q *Queries) RequestSessionStop(ctx context.Context, id pgtype.UUID) (pgtyp
 	var stop_requested_at pgtype.Timestamptz
 	err := row.Scan(&stop_requested_at)
 	return stop_requested_at, err
+}
+
+const setReviewSessionHeadBranch = `-- name: SetReviewSessionHeadBranch :execrows
+UPDATE sessions s
+SET repos = jsonb_set(s.repos, '{0,branch}', to_jsonb($1::text))
+FROM github_pr_sessions g
+WHERE s.id = $2
+  AND g.session_id = s.id
+  AND g.repo_full_name = $3
+  AND g.pr_number = $4
+  AND g.head_in_base
+  AND (SELECT count(*) FROM github_pr_sessions c WHERE c.session_id = s.id) = 1
+  AND jsonb_typeof(s.repos) = 'array'
+  AND s.repos->0->>'url' = $5::text
+  AND coalesce(s.repos->0->>'branch', '') = ''
+`
+
+type SetReviewSessionHeadBranchParams struct {
+	Branch       string      `json:"branch"`
+	SessionID    pgtype.UUID `json:"session_id"`
+	RepoFullName string      `json:"repo_full_name"`
+	PrNumber     int32       `json:"pr_number"`
+	Url          string      `json:"url"`
+}
+
+// Technical plan §27.1, §30.4: a pull request's review session opened by a
+// mention that could not read the pull request's head (an issue_comment
+// whose pull request lookup failed) has a spec naming the base repository
+// with no branch, which the review-head rule reads as not the base's own
+// whatever the claim records. A later mention that reads the head in the
+// base gives the spec that head's branch here, so the session is what a
+// first mention that read the head would have opened.
+//
+// The GitHub ingress runs it after the mention's claim transaction has
+// committed the record, never under the claim's row lock: every session
+// actor transaction locks its session's row before it writes the claim
+// (the automatic re-review's counters), so taking the session's row under
+// the claim's would invert that order. It needs no other lock: it writes
+// only when the claim still records the head in the base, the session is
+// that claim's only one, and its primary repo is still the url the ingress
+// read, with no branch -- so it never replaces a branch, never acts for a
+// fork's pull request, and running it twice writes once. A live gen keeps
+// the SESSION_CONFIG it booted with; the spec's branch reaches the next one.
+// 0 rows: nothing to repair.
+func (q *Queries) SetReviewSessionHeadBranch(ctx context.Context, arg SetReviewSessionHeadBranchParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setReviewSessionHeadBranch,
+		arg.Branch,
+		arg.SessionID,
+		arg.RepoFullName,
+		arg.PrNumber,
+		arg.Url,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const updateSessionConversationID = `-- name: UpdateSessionConversationID :one

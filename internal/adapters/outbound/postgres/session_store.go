@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -168,4 +169,45 @@ func (s *SessionStore) StopRequestedAtForShare(ctx context.Context, id pgtype.UU
 // ListChildIDs returns the direct children of the session, oldest first.
 func (s *SessionStore) ListChildIDs(ctx context.Context, parentID pgtype.UUID) ([]pgtype.UUID, error) {
 	return s.q.ListChildSessionIDs(ctx, parentID)
+}
+
+// SetReviewSessionHeadBranch gives a pull request's review session whose
+// spec names its base repository with no branch -- opened by a mention
+// that could not read the pull request's head -- the head branch a later
+// mention read in the base (technical plan §27.1, §30.4; see the query's
+// own comment). It writes only when the (repoFullName, prNumber) claim is
+// the session's only one and records the head in the base, and the
+// primary repo is still url with no branch; set is false, with a nil
+// error, when there is nothing to repair. Run on the pool, never under the
+// claim's row lock.
+func (s *SessionStore) SetReviewSessionHeadBranch(ctx context.Context, id pgtype.UUID, repoFullName string, prNumber int32, url, branch string) (set bool, err error) {
+	n, err := s.q.SetReviewSessionHeadBranch(ctx, sqlcgen.SetReviewSessionHeadBranchParams{
+		Branch:       branch,
+		SessionID:    id,
+		RepoFullName: repoFullName,
+		PrNumber:     prNumber,
+		Url:          url,
+	})
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
+}
+
+// MoveReviewSessionToBaseRepository moves a pull request's review session
+// whose spec still names its pull request's head repository onto the base
+// repository its claim names (technical plan §30.4; see the query's own
+// comment) and returns the moved repos. moved is false, with a nil error,
+// when there is nothing to move. Meaningful only on a store built via
+// WithTx, under GetActorEpochForUpdate's lock, in the transaction that
+// spawns or restores the session's next gen.
+func (s *SessionStore) MoveReviewSessionToBaseRepository(ctx context.Context, id pgtype.UUID) (repos []byte, moved bool, err error) {
+	repos, err = s.q.MoveReviewSessionToBaseRepository(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	return repos, true, nil
 }

@@ -10,6 +10,33 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.28.0]
+
+### session-config/v1/session-config.schema.json
+
+- Added: optional boolean `skipRepoHooks`, default `false` (technical plan
+  §6.4, §27.1, §30.4): true when the sandbox boots without the
+  repository's hooks -- a pull request's review session whose head is not
+  known to be a branch of its base repository, so code the pull request
+  brings never runs at boot. The sandbox-agent then runs, in every boot
+  mode, none of `setup.sh`, `sync.sh` and `start.sh`, and starts none of
+  the services `.narvi/services.yml` declares, for every repo. The control
+  plane decides it from the session's pull request claim each time it
+  assembles the document for a spawn or a restore. Absent or false is the
+  previous behavior, the hooks run; an older control plane never writes
+  it. An agent that predates it ignores the key and runs the hooks, so the
+  control plane sends no turn of a session whose document sets it to a gen
+  whose `ready` did not advertise `capabilities.skipRepoHooks`. A property
+  added, not required, grades MINOR (row 2).
+
+### sandbox-ws/v1/events.schema.json
+
+- Added: optional boolean `Ready.capabilities.skipRepoHooks`: the agent
+  honours SESSION_CONFIG's `skipRepoHooks` in every boot mode. Absent
+  means it predates the key. A property added, not required, grades MINOR
+  (row 2); the `ready` union member changes only by that property (row 30,
+  recursing into row 2).
+
 ## [1.27.0]
 
 ### rest/v1/dtos.schema.json

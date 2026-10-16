@@ -1,0 +1,19 @@
+-- Reverses github_pr_sessions_head_in_base.up.sql. With the column goes
+-- every claim's record of whether its pull request's head is a branch of
+-- its base repository. A binary without this migration does not read it;
+-- a binary with it that runs the up again reads every claim as unknown --
+-- not in the base, fail closed -- until a mention reads its head.
+--
+-- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
+-- this migration. Do not run it against live pods of a binary that carries
+-- it: every query of that binary that returns a whole github_pr_sessions
+-- row names the column (sqlc writes each SELECT * and RETURNING * out as a
+-- column list), so each fails with SQLSTATE 42703 -- no mention is
+-- claimed and no review session's claim is read -- until the older binary
+-- replaces the pod; and a pod that restarts first applies the up again at
+-- boot, which locks the older binary out again.
+-- Guarded: IF EXISTS, so it also runs when the column is already gone. The
+-- drop is a catalog change: it rewrites nothing, but takes ACCESS EXCLUSIVE
+-- on github_pr_sessions for the file's one implicit transaction, and
+-- touches no other table.
+ALTER TABLE github_pr_sessions DROP COLUMN IF EXISTS head_in_base;

@@ -77,13 +77,33 @@ func (s *SandboxStore) MarkBootEvidence(ctx context.Context, sessionID pgtype.UU
 
 // RecordReady counts a ready of gen and records whether it advertised the
 // prompt-receipt capability (technical plan §3.3, prompt receipts), whether
-// it advertised the review-checkout capability (§21.1, §30.4), and the
+// it advertised the review-checkout capability (§21.1, §30.4), whether it
+// advertised it honours SESSION_CONFIG's skipRepoHooks (§6.4, §27.1), and the
 // read limit it stated, maxFrameBytes, nil when it stated none, when gen
 // is still the sandbox's live gen, and does nothing otherwise -- see
 // RecordSandboxReady's own generated doc comment.
-func (s *SandboxStore) RecordReady(ctx context.Context, sessionID pgtype.UUID, gen int32, promptReceipt, reviewCheckout bool, maxFrameBytes *int32) error {
+func (s *SandboxStore) RecordReady(ctx context.Context, sessionID pgtype.UUID, gen int32, promptReceipt, reviewCheckout, skipRepoHooks bool, maxFrameBytes *int32) error {
 	return s.q.RecordSandboxReady(ctx, sqlcgen.RecordSandboxReadyParams{
-		PromptReceipt: promptReceipt, ReviewCheckout: reviewCheckout, MaxFrameBytes: maxFrameBytes, SessionID: sessionID, Gen: gen,
+		PromptReceipt: promptReceipt, ReviewCheckout: reviewCheckout, SkipRepoHooks: skipRepoHooks, MaxFrameBytes: maxFrameBytes, SessionID: sessionID, Gen: gen,
+	})
+}
+
+// RecordRepoHooksTold records whether the SESSION_CONFIG assembled for gen
+// told it to boot without the repository's hooks (technical plan §6.4,
+// §27.1), when gen is still the sandbox's live gen -- see
+// RecordSandboxRepoHooksTold's own generated doc comment.
+func (s *SandboxStore) RecordRepoHooksTold(ctx context.Context, sessionID pgtype.UUID, gen int32, skipRepoHooks bool) error {
+	return s.q.RecordSandboxRepoHooksTold(ctx, sqlcgen.RecordSandboxRepoHooksToldParams{
+		SkipRepoHooks: skipRepoHooks, SessionID: sessionID, Gen: gen,
+	})
+}
+
+// CarryRepoHooksTold gives gen, a resume of fromGen, what fromGen was told
+// of the repository's hooks (technical plan §6.4, §27.1) -- see
+// CarrySandboxRepoHooksTold's own generated doc comment.
+func (s *SandboxStore) CarryRepoHooksTold(ctx context.Context, sessionID pgtype.UUID, fromGen, gen int32) error {
+	return s.q.CarrySandboxRepoHooksTold(ctx, sqlcgen.CarrySandboxRepoHooksToldParams{
+		FromGen: fromGen, SessionID: sessionID, Gen: gen,
 	})
 }
 

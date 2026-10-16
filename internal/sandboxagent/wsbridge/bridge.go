@@ -69,6 +69,10 @@ var ErrShutdownRequested = errors.New("wsbridge: shutdown requested by control p
 // the ack-protocol outbound buffer, heartbeat/boot_progress reporting, and
 // inbound command dispatch. Build one with New; drive it with Run.
 type Bridge struct {
+	// skipRepoHooks: every ready advertises capabilities.skipRepoHooks
+	// (AdvertiseSkipRepoHooks).
+	skipRepoHooks bool
+
 	dialURL      string
 	sandboxToken string
 	sandboxID    string
@@ -187,6 +191,16 @@ type Bridge struct {
 	// timestamp, and the instant its lifetimeRemainingSeconds counts from.
 	// time.Now, replaced only through export_test.go, before Run.
 	now func() time.Time
+}
+
+// AdvertiseSkipRepoHooks makes every ready this Bridge sends advertise
+// capabilities.skipRepoHooks: the agent it serves honours SESSION_CONFIG's
+// skipRepoHooks in every boot mode, booting without the repository's
+// hooks when it is set (technical plan §6.4, §27.1, §30.4). The control
+// plane sends no turn of a session whose SESSION_CONFIG sets it to a gen
+// whose ready does not. Call it once, before Run.
+func (b *Bridge) AdvertiseSkipRepoHooks() {
+	b.skipRepoHooks = true
 }
 
 // SetLifetimeDeadline records the instant the sandbox's provider stated it

@@ -281,7 +281,8 @@ type ReadOnlyMinter interface {
 //     ledger (readonlymint.MintUnrecorded; each outcome is logged
 //     instead), and a ledger failure cannot fail it. A repository the
 //     GitHub App is not installed on (githubapp.InstallationNotFoundError
-//     -- for a pull request from a fork, the fork owner's account) is
+//     -- for a review session, the pull request's base repository, which
+//     its spec names for a pull request from a fork too, §30.4) is
 //     refused like any failed mint, but as a 403, with a session-visible
 //     warning naming the repository and the remedy, once per session and
 //     repository (a shadow or build-boot mint gets the same). The
@@ -606,8 +607,10 @@ func ScmCredentials(
 			switch {
 			case errors.As(mintErr, &notInstalled):
 				// The GitHub App is not installed on the repository this
-				// sandbox clones -- for a pull request from a fork, the
-				// fork's owner's account. Still a refusal, never a
+				// sandbox clones -- for a review session, the pull
+				// request's base repository, a fork's pull request's too
+				// (§30.4); a fork owner's installation is never asked
+				// for. Still a refusal, never a
 				// fallback to any other credential; but a configuration
 				// state someone can fix, not an outage, so it is named
 				// where the session is read (a warning, once per session
@@ -930,7 +933,7 @@ func hostReposUnparseable(rawRepos []byte, host string) bool {
 // recordGitHubAppNotInstalledWarning records for repoFullName.
 func githubAppNotInstalledWarning(repoFullName string) string {
 	return fmt.Sprintf("Narvi's GitHub App is not installed on %s, so this session's sandbox has no read-only credential to clone it. "+
-		"Install the GitHub App on %s with read access (for a pull request from a fork, on the fork owner's account), then retry.",
+		"Install the GitHub App on %s with read access, then retry.",
 		repoFullName, repoFullName)
 }
 

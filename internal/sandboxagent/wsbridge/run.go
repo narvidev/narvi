@@ -217,7 +217,8 @@ func (b *Bridge) runConnection(ctx context.Context, conn *websocket.Conn, writeB
 // open (EnablePromptReceipts) and no append to it has failed; otherwise
 // that key is absent, as from an agent that predates it. It advertises
 // capabilities.reviewCheckout exactly when the handler implements
-// CheckoutHandler, the one way a checkout command is ever run.
+// CheckoutHandler, the one way a checkout command is ever run, and
+// capabilities.skipRepoHooks once AdvertiseSkipRepoHooks was called.
 //
 // It carries lifetimeRemainingSeconds when the provider stated a deadline
 // (SetLifetimeDeadline), counted at the ready's own timestamp, and
@@ -244,6 +245,10 @@ func (b *Bridge) sendReady(ctx context.Context, conn *websocket.Conn) error {
 	if _, ok := b.handler.(CheckoutHandler); ok {
 		reviewCheckout := true
 		msg.Capabilities.ReviewCheckout = &reviewCheckout
+	}
+	if b.skipRepoHooks {
+		skipRepoHooks := true
+		msg.Capabilities.SkipRepoHooks = &skipRepoHooks
 	}
 	payload, err := json.Marshal(msg)
 	if err != nil {

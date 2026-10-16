@@ -242,6 +242,18 @@ RETURNING *;
 -- snapshot_started_at and snapshot_start_message_id (technical plan §35.3,
 -- migrations/000171) go with pending_snapshot_message_id: the snapshot they
 -- timed is the one recorded here, and none is in progress any more.
+--
+-- snapshot_skipped_repo_hooks_id (technical plan §6.4, §27.1, migrations/
+-- 000175_sandbox_repo_hooks_lineage.up.sql) is part of that provenance:
+-- the snapshot's own id when the gen that minted it -- the live gen, whose
+-- row this is -- booted without the repository's hooks, read from the row
+-- as it is before this write: it was told to (skip_repo_hooks_told_gen =
+-- gen) and its ready advertised it honours that (skip_repo_hooks_gen =
+-- gen); NULL otherwise. Keyed by the id, as the rest of the provenance is,
+-- so a snapshot a binary that does not write it mints never reads an
+-- earlier snapshot's record as its own; a session that runs the hooks reads
+-- any value as a lineage that may not have run setup.sh
+-- (sandbox.DecideRepoHooksRestore).
 UPDATE sandboxes
 SET snapshot_id = sqlc.arg('snapshot_id'),
     snapshot_suppressed_in_shadow = sqlc.arg('snapshot_suppressed_in_shadow'),
@@ -251,6 +263,7 @@ SET snapshot_id = sqlc.arg('snapshot_id'),
     snapshot_provenance_id = sqlc.arg('snapshot_id'),
     snapshot_agent_protocol = sqlc.narg('agent_protocol'),
     snapshot_runtime_version = sqlc.narg('runtime_version'),
+    snapshot_skipped_repo_hooks_id = CASE WHEN skip_repo_hooks_told_gen = gen AND skip_repo_hooks_gen = gen THEN sqlc.arg('snapshot_id') END,
     snapshot_minted_at = now(),
     updated_at = now()
 WHERE session_id = sqlc.arg('session_id')
@@ -331,7 +344,11 @@ WHERE session_id = $1
 -- It records capabilities.reviewCheckout against the gen by the same rule
 -- (review_checkout_gen, migrations/000168_sandbox_review_checkout_gen.up.sql):
 -- the session actor sends a review turn's checkout only to a gen whose
--- latest ready advertised it (reviewcheckout.go).
+-- latest ready advertised it (reviewcheckout.go). And it records
+-- capabilities.skipRepoHooks the same way (skip_repo_hooks_gen,
+-- migrations/000174_sandbox_skip_repo_hooks_gen.up.sql): the session actor
+-- sends a turn of a session that boots without the repository's hooks
+-- only to a gen whose latest ready advertised it (repohooksgate.go).
 -- Guarded on gen like MarkSandboxBootEvidence: a ready of any other gen
 -- counts nothing and records nothing, so the capability can only ever be
 -- recorded for the gen that is live.
@@ -339,6 +356,7 @@ UPDATE sandboxes
 SET ready_seq = ready_seq + 1,
     prompt_receipt_gen = CASE WHEN sqlc.arg('prompt_receipt')::boolean THEN gen ELSE NULL END,
     review_checkout_gen = CASE WHEN sqlc.arg('review_checkout')::boolean THEN gen ELSE NULL END,
+    skip_repo_hooks_gen = CASE WHEN sqlc.arg('skip_repo_hooks')::boolean THEN gen ELSE NULL END,
     agent_max_frame_bytes = sqlc.narg('max_frame_bytes')::integer,
     agent_max_frame_bytes_gen = CASE WHEN sqlc.narg('max_frame_bytes')::integer IS NULL THEN NULL ELSE gen END,
     updated_at = now()
@@ -691,6 +709,7 @@ SET snapshot_id = NULL,
     snapshot_provenance_id = NULL,
     snapshot_agent_protocol = NULL,
     snapshot_runtime_version = NULL,
+    snapshot_skipped_repo_hooks_id = NULL,
     snapshot_minted_at = NULL,
     updated_at = now()
 WHERE session_id = sqlc.arg('session_id') AND snapshot_id = sqlc.arg('snapshot_id')::text;
@@ -770,3 +789,24 @@ UPDATE sandboxes
 SET image_decision_reason = $2, image_decision_fingerprint = $3, updated_at = now()
 WHERE session_id = $1
 RETURNING *;
+
+-- name: RecordSandboxRepoHooksTold :exec
+-- Technical plan §6.4, §27.1 (migrations/000175_sandbox_repo_hooks_lineage.up.sql):
+-- records whether the SESSION_CONFIG the session actor just assembled for
+-- gen $gen told it to boot without the repository's hooks, in the
+-- transaction that spawns or restores that gen, right after the upsert
+-- that bumped it. Guarded on gen, as RecordSandboxReady is.
+UPDATE sandboxes
+SET skip_repo_hooks_told_gen = CASE WHEN sqlc.arg('skip_repo_hooks')::boolean THEN gen ELSE NULL END,
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;
+
+-- name: CarrySandboxRepoHooksTold :exec
+-- Technical plan §6.4, §27.1: a resume boots nothing and delivers no
+-- SESSION_CONFIG, so the resumed gen $gen was told what the gen it
+-- resumes, $from_gen, was told. Run in the resume's claim, after the
+-- upsert that bumped the gen; guarded on it.
+UPDATE sandboxes
+SET skip_repo_hooks_told_gen = CASE WHEN skip_repo_hooks_told_gen = sqlc.arg('from_gen')::integer THEN gen ELSE NULL END,
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;

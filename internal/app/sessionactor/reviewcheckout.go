@@ -35,9 +35,12 @@
 // (github_pr_sessions), whose recorded head is a full commit id, and whose
 // primary repo's url names the claim's repository -- the rule
 // SESSION_CONFIG's ref is set by (pullRequestRef), so the ref a checkout
-// names is the one the sandbox booted with. A review session whose spec
-// still names a fork dispatches as before until its spec names the base
-// repository. Every other turn dispatches exactly as before.
+// names is the one the sandbox booted with. The GitHub ingress writes the
+// base repository for every pull request, a fork's included; a session
+// created before it did names the fork, and is moved onto the base only
+// when no gen holds its old spec (reviewbaserepository.go) -- until then,
+// on the gen that cloned the fork, it dispatches as before. Every other
+// turn dispatches exactly as before.
 //
 // # What ends the wait
 //
@@ -600,6 +603,18 @@ func fetchRefusedAccess(errText string) bool {
 // the trigger of the rest of the queue, which planDispatch evaluates again
 // at once. refusePersonalLinkOnly's shape (credentialgate.go).
 func (a *Actor) refuseReviewCheckout(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, turns []sqlcgen.Turn, target sqlcgen.Turn, refusal reviewCheckoutRefusalText, gen int, now time.Time) error {
+	if err := a.refusePendingTurn(ctx, tx, sessionRow, turns, target, refusal, gen, now); err != nil {
+		return err
+	}
+	a.logger.Warn("sessionactor: review checkout: the turn is refused: its sandbox did not check out the head it recorded",
+		"turn_id", target.ID.String(), "gen", gen, "reason", refusal.reason)
+	return nil
+}
+
+// refusePendingTurn is refuseReviewCheckout's refusal, shared with the
+// repository-hooks gate (repohooksgate.go): everything that doc comment
+// lists, but the log line, which each caller writes for its own cause.
+func (a *Actor) refusePendingTurn(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, turns []sqlcgen.Turn, target sqlcgen.Turn, refusal reviewCheckoutRefusalText, gen int, now time.Time) error {
 	from := turn.State(target.Status)
 	to, err := turn.Transition(from, turn.TriggerAbandon)
 	if err != nil {
@@ -630,8 +645,6 @@ func (a *Actor) refuseReviewCheckout(ctx context.Context, tx pgx.Tx, sessionRow 
 	if err := a.persistDerivedSessionStatus(ctx, tx, summariesWithOverride(turns, target.ID, to, failureReason)); err != nil {
 		return err
 	}
-	a.logger.Warn("sessionactor: review checkout: the turn is refused: its sandbox did not check out the head it recorded",
-		"turn_id", target.ID.String(), "gen", gen, "reason", refusal.reason)
 	return a.armDispatchNow(ctx, tx)
 }
 
@@ -652,16 +665,9 @@ func (a *Actor) refuseReviewCheckout(ctx context.Context, tx pgx.Tx, sessionRow 
 // §35.5b): one persisted session warning, at the retired gen, through
 // recordSnapshotRefusal, naming the snapshot and why it was discarded.
 func (a *Actor) retireGenForCheckout(ctx context.Context, tx pgx.Tx, sandboxRow sqlcgen.Sandbox, target sqlcgen.Turn, verdict turn.CheckoutVerdict) (*retiredGen, error) {
-	if sandboxRow.SnapshotID != nil && *sandboxRow.SnapshotID != "" {
-		snapshotID := *sandboxRow.SnapshotID
-		if err := a.recordSnapshotRefusal(ctx, tx, int(sandboxRow.Gen), snapshotID, checkoutRetirementWarning(sandboxRow, snapshotID, verdict)); err != nil {
-			return nil, err
-		}
-		if _, err := a.stores.sandbox.WithTx(tx).ClearSnapshot(ctx, a.sessionID, snapshotID); err != nil {
-			return nil, fmt.Errorf("sessionactor: review checkout: clear the sandbox's snapshot: %w", err)
-		}
-	}
-	retired, err := a.retireLiveGen(ctx, tx, sandboxRow)
+	retired, err := a.retireGenClearingSnapshot(ctx, tx, sandboxRow, func(snapshotID string) string {
+		return checkoutRetirementWarning(sandboxRow, snapshotID, verdict)
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -681,6 +687,24 @@ func (a *Actor) retireGenForCheckout(ctx context.Context, tx pgx.Tx, sandboxRow 
 		"turn_id", target.ID.String(), "gen", sandboxRow.Gen, "retirement", string(verdict.Retirement),
 		"snapshot_id", snapshotID, "outcome", string(verdict.Outcome), "error", verdict.Error, "provider_id", retired.providerID)
 	return retired, nil
+}
+
+// retireGenClearingSnapshot retires sandboxRow's live gen in tx and, when
+// the sandbox has a snapshot, clears it first, recording warning(snapshotID)
+// as the session warning its discarding owes (recordSnapshotRefusal), so
+// the next gen boots fresh. retireGenForCheckout's and the repository-hooks
+// gate's retirement (repohooksgate.go).
+func (a *Actor) retireGenClearingSnapshot(ctx context.Context, tx pgx.Tx, sandboxRow sqlcgen.Sandbox, warning func(snapshotID string) string) (*retiredGen, error) {
+	if sandboxRow.SnapshotID != nil && *sandboxRow.SnapshotID != "" {
+		snapshotID := *sandboxRow.SnapshotID
+		if err := a.recordSnapshotRefusal(ctx, tx, int(sandboxRow.Gen), snapshotID, warning(snapshotID)); err != nil {
+			return nil, err
+		}
+		if _, err := a.stores.sandbox.WithTx(tx).ClearSnapshot(ctx, a.sessionID, snapshotID); err != nil {
+			return nil, fmt.Errorf("sessionactor: clear the sandbox's snapshot: %w", err)
+		}
+	}
+	return a.retireLiveGen(ctx, tx, sandboxRow)
 }
 
 // checkoutRetirementWarning is the session warning of a snapshot,

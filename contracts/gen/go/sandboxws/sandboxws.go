@@ -1634,6 +1634,13 @@ type ReadyCapabilities struct {
 	// checkout_result (technical plan §21.1, §30.4). Absent: the agent does not know
 	// the command, and skips it as an unknown one.
 	ReviewCheckout *bool `json:"reviewCheckout,omitempty,omitzero" yaml:"reviewCheckout,omitempty" mapstructure:"reviewCheckout,omitempty"`
+
+	// True when the agent honours SESSION_CONFIG's skipRepoHooks in every boot mode,
+	// booting without the repository's hooks when it is true (technical plan §6.4,
+	// §27.1, §30.4). Absent: the agent predates the key and runs the hooks whatever
+	// it says, so the control plane sends this gen no turn of a session whose
+	// SESSION_CONFIG sets it.
+	SkipRepoHooks *bool `json:"skipRepoHooks,omitempty,omitzero" yaml:"skipRepoHooks,omitempty" mapstructure:"skipRepoHooks,omitempty"`
 }
 
 // UnmarshalJSON implements json.Unmarshaler.

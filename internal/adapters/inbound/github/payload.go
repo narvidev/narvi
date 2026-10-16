@@ -36,28 +36,41 @@ type mention struct {
 	// branch lives in, since this is exactly what github_pr_sessions'
 	// (repo_full_name, pr_number) coalescing key is keyed on.
 	RepoFullName string
-	// RepoName/RepoCloneURL are the repo to actually CLONE for the
-	// session -- the PR's own HEAD repo (may be a fork), when the event
-	// type carries it directly (pull_request_review_comment); falls back
-	// to the base repo for issue_comment, which does not (see
-	// parseIssueComment's own doc comment for why).
+	// RepoName/RepoCloneURL are the repository the review session clones:
+	// always the pull request's base repository, the webhook's own
+	// top-level "repository", for every event type and for a pull request
+	// from a fork too (technical plan §21.1, §30.4). A code host keeps
+	// every pull request's head in its base repository as
+	// refs/pull/<number>/head, which the session's SESSION_CONFIG names
+	// (sessionactor's pullRequestRef), so the head is read from there,
+	// with the base repository's own installation -- never from the fork,
+	// whose owner may never have installed the App.
 	RepoName     string
 	RepoCloneURL string
-	PRNumber     int32
-	// HeadBranch is nil straight out of parseIssueComment (issue_comment's
-	// own payload never carries the PR's head ref directly -- see
-	// issueCommentPayload's own doc comment) or parsePullRequestReviewComment
-	// (which always sets it, that event's payload embeds head.ref
-	// directly) -- nil means "use the repo's own default branch" per
-	// restdtos.CreateSessionRequestReposElemBranch's own documented
-	// convention, exactly like every other ingress caller of that same
-	// field. handler.go's own resolveIssueCommentHead (headresolve.go)
-	// resolves this to the PR's REAL head branch for an issue_comment
-	// mention via a real GitHub API call BEFORE building the session's
-	// repo spec (H5 audit fix) -- a nil HeadBranch reaching that repo spec
-	// therefore only ever means "that resolution itself failed" (logged,
-	// falls back to today's pre-fix behavior), never "issue_comment can't
-	// carry this".
+	// HeadRepoFullName is the "owner/name" of the repository the pull
+	// request's head branch lives in (head.repo.full_name): RepoFullName
+	// for a pull request opened from a branch of the base repository, a
+	// fork's otherwise. Empty when it is not known: an issue_comment
+	// mention before, or without, its head resolution
+	// (resolveIssueCommentHead), and a pull request whose head repository
+	// was deleted (head.repo null). It decides one thing only: whether the
+	// session's spec may carry HeadBranch (reviewSessionRepo), a branch
+	// that exists in the repository the spec names.
+	HeadRepoFullName string
+	PRNumber         int32
+	// HeadBranch is the pull request's head branch name (head.ref): nil
+	// straight out of parseIssueComment (issue_comment's own payload never
+	// carries it -- see issueCommentPayload's own doc comment) until
+	// handler.go's own resolveIssueCommentHead (headresolve.go) resolves it
+	// via a real GitHub API call (H5 audit fix), and set by
+	// parsePullRequestReviewComment and parsePullRequestLabeled, whose
+	// payloads embed head.ref. A nil HeadBranch after that resolution only
+	// ever means "the resolution itself failed" (logged). The session's
+	// spec carries it only when the branch is in the base repository the
+	// spec names (reviewSessionRepo, handler.go): a fork's branch name
+	// names nothing there, and the session's readers that act on the
+	// spec's branch -- the sentinel auto-fix and apply-suggestion -- act
+	// on the spec's repository.
 	HeadBranch *string
 	// HeadSHA (§21.1) is the PR's head commit SHA AT THE MOMENT
 	// this mention's own event carried/resolved it -- nil exactly when
@@ -175,9 +188,10 @@ func parseMention(eventType string, body []byte, mentionRE *regexp.Regexp, reRev
 // Unlike pull_request_review_comment below, this payload does NOT embed
 // the PR's own head repo/branch anywhere -- only a `pull_request.url` link.
 // parseIssueComment below therefore always leaves HeadBranch nil and
-// RepoName/RepoCloneURL set to the base repo; handler.go's own
-// resolveIssueCommentHead (headresolve.go) is what actually resolves the
-// PR's REAL head branch/repo, via one authenticated GitHub REST API call
+// HeadRepoFullName empty, and sets RepoName/RepoCloneURL to the base repo
+// as every event type does; handler.go's own resolveIssueCommentHead
+// (headresolve.go) is what actually resolves the PR's REAL head
+// branch/repo, via one authenticated GitHub REST API call
 // (GET /repos/{owner}/{repo}/pulls/{number}), AFTER parseMention returns
 // and BEFORE the mention is turned into the session's own repo spec (H5
 // audit fix, batch fix/audit-github-pr-payload-correctness) -- §8.2's
@@ -283,24 +297,23 @@ type pullRequestReviewCommentPayload struct {
 			// head repository has been deleted (e.g. a fork removed after
 			// the PR was opened). A plain, non-pointer struct would
 			// silently unmarshal a JSON null into an empty-valued struct
-			// (empty Name/CloneURL) rather than letting
-			// parsePullRequestReviewComment below detect "no head repo"
-			// and fall back to the base repo -- mirroring
+			// rather than letting parsePullRequestReviewComment below tell
+			// "no head repo" apart -- mirroring
 			// issueCommentPayload.Issue.PullRequest's own identical
 			// nullable-pointer convention (that field's own doc comment)
-			// for the same "GitHub genuinely omits/nulls this" reason.
+			// for the same "GitHub genuinely omits/nulls this" reason. Only
+			// its full_name is read: it says whether the head branch is
+			// in the base repository (mention.HeadRepoFullName).
 			Repo *struct {
-				Name     string `json:"name"`
-				CloneURL string `json:"clone_url"`
+				FullName string `json:"full_name"`
 			} `json:"repo"`
 		} `json:"head"`
 	} `json:"pull_request"`
 	Repository struct {
 		FullName string `json:"full_name"`
-		// Name/CloneURL back parsePullRequestReviewComment's own base-repo
-		// fallback below (L15 audit fix) when Head.Repo is nil -- mirrors
-		// issueCommentPayload.Repository's own identical Name/CloneURL
-		// fields, used for exactly the same "clone the base repo" purpose.
+		// Name/CloneURL are the base repository's, the repository every
+		// review session clones -- mirrors issueCommentPayload.Repository's
+		// own identical fields.
 		Name     string `json:"name"`
 		CloneURL string `json:"clone_url"`
 	} `json:"repository"`
@@ -320,6 +333,8 @@ func parsePullRequestReviewComment(body []byte, mentionRE *regexp.Regexp) (menti
 	headBranch := p.PullRequest.Head.Ref
 	m := mention{
 		RepoFullName:   p.Repository.FullName, // base/upstream repo -- the claim key (see mention.RepoFullName's own doc comment).
+		RepoName:       p.Repository.Name,     // the base repository, cloned for a fork's pull request too (mention.RepoName's doc comment).
+		RepoCloneURL:   p.Repository.CloneURL,
 		PRNumber:       p.PullRequest.Number,
 		HeadBranch:     &headBranch,
 		HeadSHA:        nonEmptyStringPtr(p.PullRequest.Head.SHA),
@@ -327,18 +342,11 @@ func parsePullRequestReviewComment(body []byte, mentionRE *regexp.Regexp) (menti
 		CommenterID:    p.Comment.User.ID,
 		CommenterLogin: p.Comment.User.Login,
 	}
+	// L15 audit fix: head.repo is null once the head repository is deleted
+	// (a fork removed after the PR was opened); HeadRepoFullName then stays
+	// empty, unknown, and the spec carries no head branch.
 	if p.PullRequest.Head.Repo != nil {
-		m.RepoName = p.PullRequest.Head.Repo.Name // head repo -- may be a fork; the repo to actually clone.
-		m.RepoCloneURL = p.PullRequest.Head.Repo.CloneURL
-	} else {
-		// L15 audit fix: GitHub's own head.repo was null (the head/fork
-		// repo has since been deleted) -- fall back to the base repo,
-		// exactly like parseIssueComment's own existing fallback for the
-		// analogous "no real head repo info available" situation, rather
-		// than silently proceeding with an empty RepoName/RepoCloneURL
-		// that would make the session try to clone an empty repo spec.
-		m.RepoName = p.Repository.Name
-		m.RepoCloneURL = p.Repository.CloneURL
+		m.HeadRepoFullName = p.PullRequest.Head.Repo.FullName
 	}
 	return m, true, nil
 }
@@ -395,10 +403,11 @@ type pullRequestPayload struct {
 			// commit -- carried inline on this SAME payload, exactly
 			// like Ref/Stack below, so no separate GetPullRequest
 			// call is needed for it either.
-			SHA  string `json:"sha"`
+			SHA string `json:"sha"`
+			// Repo mirrors pullRequestReviewCommentPayload's own nullable
+			// head.repo exactly: only its full_name is read.
 			Repo *struct {
-				Name     string `json:"name"`
-				CloneURL string `json:"clone_url"`
+				FullName string `json:"full_name"`
 			} `json:"repo"`
 		} `json:"head"`
 		// Stack mirrors internal/adapters/outbound/githubapi's own
@@ -455,6 +464,8 @@ func parsePullRequestLabeled(body []byte, reReviewLabel string) (mention, bool, 
 	headBranch := p.PullRequest.Head.Ref
 	m := mention{
 		RepoFullName:     p.Repository.FullName, // base/upstream repo -- the claim key (see mention.RepoFullName's own doc comment).
+		RepoName:         p.Repository.Name,     // the base repository, cloned for a fork's pull request too (mention.RepoName's doc comment).
+		RepoCloneURL:     p.Repository.CloneURL,
 		PRNumber:         p.PullRequest.Number,
 		HeadBranch:       &headBranch,
 		HeadSHA:          nonEmptyStringPtr(p.PullRequest.Head.SHA),
@@ -463,15 +474,11 @@ func parsePullRequestLabeled(body []byte, reReviewLabel string) (mention, bool, 
 		CommenterLogin:   p.Sender.Login,
 		IsLabelRetrigger: true,
 	}
+	// Mirrors parsePullRequestReviewComment's own L15-style handling: a
+	// null head.repo (the head repository deleted) leaves HeadRepoFullName
+	// empty.
 	if p.PullRequest.Head.Repo != nil {
-		m.RepoName = p.PullRequest.Head.Repo.Name // head repo -- may be a fork; the repo to actually clone.
-		m.RepoCloneURL = p.PullRequest.Head.Repo.CloneURL
-	} else {
-		// Mirrors parsePullRequestReviewComment's own identical L15-style
-		// fallback: GitHub's own head.repo was null (the head/fork repo has
-		// since been deleted) -- fall back to the base repo.
-		m.RepoName = p.Repository.Name
-		m.RepoCloneURL = p.Repository.CloneURL
+		m.HeadRepoFullName = p.PullRequest.Head.Repo.FullName
 	}
 	if p.PullRequest.Stack != nil {
 		m.Stack = &review.StackContext{

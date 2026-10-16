@@ -1251,6 +1251,9 @@ func newSessionCommands(ctx context.Context, logger *slog.Logger, cfg boot.Confi
 		timeouts.SandboxWSDialTimeout, timeouts.SandboxWSHeartbeatInterval,
 		timeouts.SandboxWSReconnectMinBackoff, timeouts.SandboxWSReconnectMaxBackoff)
 	handler.bridge = bridge
+	// runBootSequence honours SESSION_CONFIG's skipRepoHooks in every boot
+	// mode (technical plan §6.4, §27.1, §30.4), which every ready says.
+	bridge.AdvertiseSkipRepoHooks()
 	stateSandboxDeadline(logger, bridge, cfg)
 	return handler, bridge
 }
@@ -2863,6 +2866,13 @@ func runBootSequence(
 			}
 		}
 
+		// A session that boots without the repository's hooks says so in
+		// AGENTS.md, so the agent does not take a dependency setup.sh would
+		// have installed, or a service it would have started, for one the
+		// repository never declared.
+		if skipRepoHooks(cfg) {
+			degradeNotes = append(append([]string(nil), degradeNotes...), repoHooksSkippedNote)
+		}
 		if err := gitclone.WriteAgentsManifest(cfg.WorkspaceDir, manifestInput, degradeNotes); err != nil {
 			return fmt.Errorf("write AGENTS.md: %w", err)
 		}
@@ -2958,7 +2968,18 @@ func runBootSequence(
 	// package-registry reinstall inside the boot sequence, which has its
 	// own separate budget and a slower, network-bound failure profile.
 	// Equal values today are a coincidence of tuning, not one concept.
-	if err := boot.RunBoot(ctx, sup, cfg.WorkspaceDir, repos, cfg.BootMode, workspaceMoved, setupRerunLadder, secretEnv, reportBootProgress, onHookRerunTiming,
+	//
+	// skipRepoHooks (technical plan §6.4, §27.1, §30.4): a session whose
+	// SESSION_CONFIG sets it boots without the repository's hooks -- a pull
+	// request's review session whose head is not in its base repository,
+	// so code the pull request brings never runs at boot. RunBoot is the
+	// one place this agent runs anything the checked-out tree provides --
+	// setup.sh, sync.sh and start.sh, or the services .narvi/services.yml
+	// declares in their place -- so none of it runs, in any boot mode.
+	if skipRepoHooks(cfg) {
+		slog.Info("sandbox-agent: booting without the repository's hooks: the session's head is not in its base repository",
+			"boot_mode", string(cfg.BootMode), "repos", len(repos))
+	} else if err := boot.RunBoot(ctx, sup, cfg.WorkspaceDir, repos, cfg.BootMode, workspaceMoved, setupRerunLadder, secretEnv, reportBootProgress, onHookRerunTiming,
 		timeouts.HookTimeout, timeouts.ProcessStopGracePeriod,
 		timeouts.ServiceReadinessTimeout, timeouts.ServiceReadinessPollInterval,
 		timeouts.SetupRerunRetryBackoff, cred,
@@ -3003,6 +3024,19 @@ func runBootSequence(
 
 	return nil
 }
+
+// skipRepoHooks reports whether cfg's SESSION_CONFIG asks this boot to run
+// none of the repository's hooks (technical plan §6.4, §27.1, §30.4). A
+// boot with no SESSION_CONFIG has no repository to run them from.
+func skipRepoHooks(cfg boot.Config) bool {
+	return cfg.SessionConfig != nil && cfg.SessionConfig.SkipRepoHooks
+}
+
+// repoHooksSkippedNote is the AGENTS.md notice of a boot without the
+// repository's hooks.
+const repoHooksSkippedNote = "repository hooks: this session booted without the repository's hooks -- setup.sh, sync.sh and start.sh did not run, " +
+	"and no service .narvi/services.yml declares was started -- because its pull request's head is not in its base repository, " +
+	"so code the pull request brings never runs at boot. Dependencies they would install and services they would start are absent."
 
 // runtimeCredentialFor builds the identity every customer-influenced
 // process runs under (§30.5): the agent runtime itself, and the

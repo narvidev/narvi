@@ -280,13 +280,14 @@ func TestScmCredentials_SentinelFixChild_IsNotServedAsAReviewSession(t *testing.
 }
 
 // TestScmCredentials_ReviewSession_GitHubAppNotInstalled: when the GitHub
-// App is not installed on the repository a review sandbox clones (for a
-// pull request from a fork, the fork owner's account), the credential is
-// still refused -- never another credential in its place -- but the
-// refusal is explicit: a 403, not a bare 500, and a session-visible
-// warning naming the repository and that the App must be installed on it
-// with read access. git asks again on every fetch, so the warning is
-// recorded once per session and repository, and broadcast once.
+// App is not installed on the repository a review sandbox clones -- the
+// pull request's base repository, for a pull request from a fork too
+// (technical plan §30.4) -- the credential is still refused -- never
+// another credential in its place -- but the refusal is explicit: a 403,
+// not a bare 500, and a session-visible warning naming the repository and
+// that the App must be installed on it with read access. git asks again on
+// every fetch, so the warning is recorded once per session and repository,
+// and broadcast once.
 func TestScmCredentials_ReviewSession_GitHubAppNotInstalled(t *testing.T) {
 	minter := newFakeReadOnlyMinter()
 	broadcaster := &recordingBroadcaster{}
@@ -297,10 +298,10 @@ func TestScmCredentials_ReviewSession_GitHubAppNotInstalled(t *testing.T) {
 	ctx := context.Background()
 
 	repoName := fmt.Sprintf("not-installed-%d", time.Now().UnixNano())
-	repoFullName := "fork-owner/" + repoName
-	minter.Err = &githubapp.InstallationNotFoundError{Owner: "fork-owner", Repo: repoName}
-	reposJSON := `[{"name":"` + repoName + `","url":"https://github.com/` + repoFullName + `.git","branch":"feature-x"}]`
-	session := rig.createOwnedGitHubReviewSessionWithRepos(ctx, t, pgtype.UUID{}, "base-owner/"+repoName, 51, reposJSON)
+	repoFullName := "base-owner/" + repoName
+	minter.Err = &githubapp.InstallationNotFoundError{Owner: "base-owner", Repo: repoName}
+	reposJSON := `[{"name":"` + repoName + `","url":"https://github.com/` + repoFullName + `.git","branch":null}]`
+	session := rig.createOwnedGitHubReviewSessionWithRepos(ctx, t, pgtype.UUID{}, repoFullName, 51, reposJSON)
 	createSandboxWithToken(ctx, t, rig, session.ID, "sandbox-bearer-token")
 
 	for i := 0; i < 2; i++ {
@@ -338,10 +339,13 @@ func TestScmCredentials_ReviewSession_GitHubAppNotInstalled(t *testing.T) {
 	if w.SessionId != session.ID.String() || w.Gen != 1 {
 		t.Errorf("warning session/gen = %s/%d, want %s/1", w.SessionId, w.Gen, session.ID)
 	}
-	for _, want := range []string{repoFullName, "GitHub App", "read access", "fork"} {
+	for _, want := range []string{repoFullName, "GitHub App", "read access"} {
 		if !strings.Contains(w.Message, want) {
 			t.Errorf("warning %q does not mention %q", w.Message, want)
 		}
+	}
+	if strings.Contains(w.Message, "fork") {
+		t.Errorf("warning %q sends the reader to a fork owner's account; a review session's credential is the base repository's", w.Message)
 	}
 	if got := broadcaster.all(); len(got) != 1 || !strings.Contains(got[0], repoFullName) {
 		t.Errorf("broadcasts = %v, want exactly the one warning", got)

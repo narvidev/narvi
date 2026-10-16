@@ -227,26 +227,29 @@ func (a *Actor) reviewCounterReviewerModel(ctx context.Context, tx pgx.Tx, sessi
 }
 
 // reviewClaim reads sessionRow's pull request claim (github_pr_sessions),
-// the one read assembleSessionConfig makes for both the pull request ref
-// (pullRequestRef) and the counter-reviewer override
-// (reviewCounterReviewerModel). nil for a session that is not a pull
-// request's review session (pgx.ErrNoRows, the overwhelming common case),
-// and nil, logged, on any other failure: both readers are best-effort and
-// never block a spawn (§10-P2), and a review session assembled without its
-// ref boots exactly as one did before the ref existed.
-func (a *Actor) reviewClaim(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session) *sqlcgen.GithubPrSession {
+// the one read assembleSessionConfig makes for the pull request ref
+// (pullRequestRef), the counter-reviewer override
+// (reviewCounterReviewerModel) and skipRepoHooks (repohooksgate.go). nil
+// for a session that is not a pull request's review session
+// (pgx.ErrNoRows, the overwhelming common case), and nil, logged, with
+// readFailed true, on any other failure: the ref and the override are
+// best-effort and never block a spawn (§10-P2), and a review session
+// assembled without its ref boots exactly as one did before the ref
+// existed; skipRepoHooks fails closed on it instead.
+func (a *Actor) reviewClaim(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session) (claim *sqlcgen.GithubPrSession, readFailed bool) {
 	if a.stores.githubPRSession == nil {
-		return nil
+		return nil, false
 	}
 	prSession, err := a.stores.githubPRSession.WithTx(tx).GetBySessionID(ctx, sessionRow.ID)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
-			platform.Logger(ctx).Warn("sessionactor: read the session's pull request claim for its session config failed, assembling it without",
+			platform.Logger(ctx).Warn("sessionactor: read the session's pull request claim for its session config failed, assembling it without, and without the repository's hooks",
 				"error", err)
+			return nil, true
 		}
-		return nil
+		return nil, false
 	}
-	return &prSession
+	return &prSession, false
 }
 
 // pullRequestRef is the ref a review session's primary repo is checked out
@@ -255,15 +258,18 @@ func (a *Actor) reviewClaim(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.S
 // here, each time a SESSION_CONFIG is assembled, from the session's claim,
 // and never stored. nil when there is no claim, when the claim's number
 // makes no valid ref, or when repo's url does not name the claim's
-// repository: such a ref is not in the repository cloned -- a review
-// session opened before its spec named the base repository names the
-// fork's -- and that session boots on its branch as before.
+// repository: such a ref is not in the repository cloned. The GitHub
+// ingress writes the base repository for every pull request; a session
+// created before it did names the fork, and is moved onto the base in the
+// transaction that spawns or restores its next gen, before this runs
+// (reviewbaserepository.go). A spec the move cannot read -- not one https
+// repo in owner/name shape -- is left as it is, and that session boots on
+// its branch as before.
 func pullRequestRef(prSession *sqlcgen.GithubPrSession, repo sessionconfig.SessionConfigReposElem) *string {
 	if prSession == nil {
 		return nil
 	}
-	owner, name, err := reposource.ParseOwnerRepo(repo.Url)
-	if err != nil || !strings.EqualFold(owner+"/"+name, prSession.RepoFullName) {
+	if !reposource.URLNamesRepository(repo.Url, prSession.RepoFullName) {
 		return nil
 	}
 	ref := reposource.PullHeadRef(prSession.PrNumber)
@@ -389,6 +395,19 @@ func (a *Actor) assembleSessionConfig(
 	ctx context.Context, tx pgx.Tx,
 	sessionRow sqlcgen.Session, gen int, plaintextToken, sandboxID string, bootMode sessionconfig.SessionConfigBootMode,
 ) (sessionconfig.SessionConfig, error) {
+	prSession, claimReadFailed := a.reviewClaim(ctx, tx, sessionRow)
+	return a.assembleSessionConfigWithClaim(ctx, tx, sessionRow, gen, plaintextToken, sandboxID, bootMode, prSession, claimReadFailed)
+}
+
+// assembleSessionConfigWithClaim is assembleSessionConfig once the
+// session's pull request claim is read: prSession, nil for none, and
+// claimReadFailed when the read failed, which skipRepoHooks fails closed
+// on.
+func (a *Actor) assembleSessionConfigWithClaim(
+	ctx context.Context, tx pgx.Tx,
+	sessionRow sqlcgen.Session, gen int, plaintextToken, sandboxID string, bootMode sessionconfig.SessionConfigBootMode,
+	prSession *sqlcgen.GithubPrSession, claimReadFailed bool,
+) (sessionconfig.SessionConfig, error) {
 	wsBase, err := publicWsBaseURL(a.publicBaseURL)
 	if err != nil {
 		return sessionconfig.SessionConfig{}, err
@@ -399,7 +418,6 @@ func (a *Actor) assembleSessionConfig(
 		return sessionconfig.SessionConfig{}, err
 	}
 
-	prSession := a.reviewClaim(ctx, tx, sessionRow)
 	if len(repos) > 0 {
 		repos[0].Ref = pullRequestRef(prSession, repos[0])
 	}
@@ -474,5 +492,13 @@ func (a *Actor) assembleSessionConfig(
 		// above, for the full "why nil is the common case, not a
 		// degradation".
 		ReviewCounterReviewerModel: sessionconfig.SessionConfigReviewCounterReviewerModel(a.reviewCounterReviewerModel(ctx, tx, sessionRow, prSession)),
+		// SkipRepoHooks (technical plan §6.4, §27.1, §30.4): a pull
+		// request's review session whose head is not in its base
+		// repository boots without the repository's hooks, so code the
+		// pull request brings never runs at boot -- decided from the claim
+		// as it is at this spawn or restore (repohooksgate.go). A claim
+		// that could not be read is not known to be in the base: fail
+		// closed.
+		SkipRepoHooks: claimReadFailed || sessionSkipsRepoHooks(prSession, sessionRow.Repos),
 	}, nil
 }

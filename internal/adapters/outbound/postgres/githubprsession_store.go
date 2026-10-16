@@ -72,6 +72,22 @@ func (s *GitHubPRSessionStore) SetSessionID(ctx context.Context, repoFullName st
 	})
 }
 
+// RecordHeadInBase records, on the (repoFullName, prNumber) claim row,
+// whether the pull request's head branch is a branch of its base repository
+// (technical plan §27.1, §30.4): the GitHub ingress calls it for every
+// mention that read its pull request's head, inside the claim transaction,
+// under LockForUpdate's row lock -- never for one that read none, which
+// would only lose what an earlier read recorded.
+// reposource.ReviewHeadInBaseRepository reads the record; NULL, never
+// recorded, reads as not in the base.
+func (s *GitHubPRSessionStore) RecordHeadInBase(ctx context.Context, repoFullName string, prNumber int32, headInBase bool) error {
+	return s.q.RecordGitHubPRSessionHeadInBase(ctx, sqlcgen.RecordGitHubPRSessionHeadInBaseParams{
+		HeadInBase:   headInBase,
+		RepoFullName: repoFullName,
+		PrNumber:     prNumber,
+	})
+}
+
 // GetBySessionID is the REVERSE lookup §5.1 ("outbox delivery") needs:
 // given a session_id, which (repoFullName, prNumber) PR does it back?
 // Returns pgx.ErrNoRows (unwrapped) when sessionID was never created via a

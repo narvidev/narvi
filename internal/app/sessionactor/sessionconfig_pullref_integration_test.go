@@ -17,10 +17,12 @@ import (
 // reads the SESSION_CONFIG the provider was handed (technical plan §21.1,
 // §30.4): a pull request's review session whose primary repo names the
 // pull request's base repository carries refs/pull/<number>/head, derived
-// from its github_pr_sessions claim at assembly; one that still names the
-// fork carries no ref, since the fork does not hold it; and a session with
-// no pull request carries none. The claim is never written into the
-// session's own repos.
+// from its github_pr_sessions claim at assembly; one created while its spec
+// named the fork is moved onto the base repository in the spawn's own
+// transaction, before its SESSION_CONFIG is assembled, and so carries the
+// base and the ref too (reviewbaserepository.go); and a session with no
+// pull request carries none, its spec as it was. The ref is never written
+// into the session's own repos.
 func TestAssembleSessionConfig_ReviewSessionCarriesItsPullRef(t *testing.T) {
 	const repoFullName = "acme/widgets"
 	const prNumber int32 = 11
@@ -29,10 +31,14 @@ func TestAssembleSessionConfig_ReviewSessionCarriesItsPullRef(t *testing.T) {
 		repoURL string
 		claimed bool
 		wantRef string // "" means no ref
+		// wantURL is the url the spawn boots and stores; repoURL when "".
+		wantURL string
 	}{
 		{name: "review session on its base repository", repoURL: "https://github.com/Acme/Widgets.git", claimed: true, wantRef: "refs/pull/11/head"},
-		{name: "review session still naming the fork", repoURL: "https://github.com/contributor/widgets.git", claimed: true},
+		{name: "review session still naming the fork is moved onto its base", repoURL: "https://github.com/contributor/widgets.git", claimed: true,
+			wantRef: "refs/pull/11/head", wantURL: "https://github.com/acme/widgets.git"},
 		{name: "session with no pull request", repoURL: "https://github.com/acme/widgets.git"},
+		{name: "session with no pull request naming another repository is left alone", repoURL: "https://github.com/contributor/widgets.git"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -79,16 +85,20 @@ func TestAssembleSessionConfig_ReviewSessionCarriesItsPullRef(t *testing.T) {
 			if got != tc.wantRef {
 				t.Errorf("SessionConfig.Repos[0].Ref = %q, want %q", got, tc.wantRef)
 			}
-			if repos[0].Url != tc.repoURL {
-				t.Errorf("SessionConfig.Repos[0].Url = %q, want the session's own %q", repos[0].Url, tc.repoURL)
+			wantURL := tc.repoURL
+			if tc.wantURL != "" {
+				wantURL = tc.wantURL
+			}
+			if repos[0].Url != wantURL {
+				t.Errorf("SessionConfig.Repos[0].Url = %q, want %q", repos[0].Url, wantURL)
 			}
 
 			var stored string
 			if err := pool.QueryRow(ctx, `SELECT repos::text FROM sessions WHERE id = $1`, session.ID).Scan(&stored); err != nil {
 				t.Fatalf("read the session's repos: %v", err)
 			}
-			if stored != `[{"url": "`+tc.repoURL+`", "name": "widgets", "branch": null}]` {
-				t.Errorf("sessions.repos = %s after the spawn, want it unchanged: the ref is never stored", stored)
+			if stored != `[{"url": "`+wantURL+`", "name": "widgets", "branch": null}]` {
+				t.Errorf("sessions.repos = %s after the spawn, want the url the spawn booted, %s, and no ref: the ref is never stored", stored, wantURL)
 			}
 		})
 	}

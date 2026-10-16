@@ -743,6 +743,26 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 			if !ok {
 				return fmt.Errorf("sessionactor: dispatch turn: turn %s not found among loaded turns", pendingID.String())
 			}
+			// Technical plan §6.4, §27.1: a session that boots without the
+			// repository's hooks is sent only to a gen that booted without
+			// them (repohooksgate.go). First of all, before the runway gate
+			// below: a gen that ran them is retired, never rotated -- a
+			// rotation would snapshot what they wrote and carry it into the
+			// next gen -- and nothing else may be asked of it. One
+			// mid-snapshot is retired at once too, its snapshot forgotten,
+			// so the runway gate's wait on that snapshot is never needed.
+			hooks, err := a.applyRepoHooksGate(ctx, tx, sessionRow, sandboxRow, turns, target, now)
+			if err != nil {
+				return err
+			}
+			switch hooks.decision {
+			case reviewCheckoutHold, reviewCheckoutFailForward:
+				dispatch = hooks.plan
+				return nil
+			case reviewCheckoutEnded:
+				repick = true
+				return nil
+			}
 			// Technical plan §35.3: no turn is sent to a sandbox with less
 			// than its rotation threshold of runway left, past its
 			// deadline, or mid-snapshot (runway.go). After the spend cap's
@@ -959,6 +979,17 @@ func (a *Actor) planReenqueueOrRespawn(
 			// gen's turn is never re-sent.
 			d, err := a.tryPlanReceiptResend(ctx, tx, sessionRow, sandboxRow, target)
 			return nil, d, "", nil, err
+		}
+		// Technical plan §6.4, §27.1: as planDispatch's own gate
+		// (repohooksgate.go), first, before the runway gate below, for the
+		// same reason: a gen that ran the hooks is retired, never rotated.
+		hooks, err := a.applyRepoHooksGate(ctx, tx, sessionRow, sandboxRow, turns, target, now)
+		if err != nil {
+			return nil, nil, "", nil, err
+		}
+		switch hooks.decision {
+		case reviewCheckoutHold, reviewCheckoutFailForward, reviewCheckoutEnded:
+			return nil, hooks.plan, "", nil, nil
 		}
 		// Technical plan §35.3: the gate, with a turn in flight
 		// (runway.go). Nothing is rotated under it (row 10), so it consumes
@@ -1238,6 +1269,20 @@ func (a *Actor) tryPlanSpawn(
 	var refusal *snapshotRefusal
 	var restoreDecision *snapshotRestoreDecision
 	if action.Kind == sandbox.SpawnActionSpawn || action.Kind == sandbox.SpawnActionRestore || action.Kind == sandbox.SpawnActionResume {
+		// §30.4: a review session whose spec still names its pull
+		// request's head repository moves onto its base repository here,
+		// before anything below reads the spec, and before the new gen's
+		// SESSION_CONFIG is assembled -- the one moment no gen holds the
+		// old spec (reviewbaserepository.go). Never on a resume, which
+		// delivers no new SESSION_CONFIG.
+		if action.Kind != sandbox.SpawnActionResume {
+			movedRow, err := a.moveReviewSessionToBaseRepository(ctx, tx, sessionRow)
+			if err != nil {
+				return nil, err
+			}
+			sessionRow = movedRow
+		}
+
 		// §31.4's spawn-time re-read of an administrator's revocation --
 		// first, and in every rollout mode: see refuseIfRepoRevoked's own
 		// doc comment (repoentitlement.go).
@@ -1334,6 +1379,21 @@ func (a *Actor) tryPlanSpawn(
 	if action.Kind == sandbox.SpawnActionRestore {
 		restoreDecision, refusal = evaluateSnapshotRestore(sandboxRow, action.SnapshotImageID)
 		if refusal != nil {
+			action = sandbox.SpawnAction{Kind: sandbox.SpawnActionSpawn}
+		}
+	}
+
+	// Technical plan §6.4, §27.1: a restore that is still a restore crosses
+	// no boundary of the repository's hooks -- a session that skips them
+	// never restores a snapshot whose agent or gen ran them, and one that
+	// runs them never restores one whose gen skipped them
+	// (repohooksgate.go). Decided here, before the restored gen boots: the
+	// dispatch gate only sees a gen after its boot. A rotation's restore is
+	// this one too, so a rotation of such a session never restores a
+	// snapshot this refuses; it spawns fresh instead.
+	if action.Kind == sandbox.SpawnActionRestore {
+		if hooksRefusal := a.repoHooksRestoreRefusal(ctx, tx, sessionRow, sandboxRow, action.SnapshotImageID); hooksRefusal != nil {
+			refusal, restoreDecision = hooksRefusal, nil
 			action = sandbox.SpawnAction{Kind: sandbox.SpawnActionSpawn}
 		}
 	}
@@ -1948,6 +2008,11 @@ func (a *Actor) planFreshSpawn(
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: assemble session config: %w", err)
 	}
+	// Technical plan §6.4, §27.1: what this gen is told of the
+	// repository's hooks, recorded with the gen (repohooksgate.go).
+	if err := a.stores.sandbox.WithTx(tx).RecordRepoHooksTold(ctx, a.sessionID, row.Gen, cfg.SkipRepoHooks); err != nil {
+		return nil, fmt.Errorf("sessionactor: record what the gen is told of the repository's hooks: %w", err)
+	}
 
 	// Docker/EgressPolicy are threaded from cfg's own just-assembled
 	// fields (§27.5/§27.6) -- the SAME deliberate top-level
@@ -2035,6 +2100,10 @@ func (a *Actor) planRestore(
 	cfg, err := a.assembleSessionConfig(ctx, tx, sessionRow, int(row.Gen), token, row.ID.String(), sessionconfig.SessionConfigBootModeSnapshotRestore)
 	if err != nil {
 		return nil, fmt.Errorf("sessionactor: assemble session config: %w", err)
+	}
+	// Technical plan §6.4, §27.1: as planFreshSpawn's.
+	if err := a.stores.sandbox.WithTx(tx).RecordRepoHooksTold(ctx, a.sessionID, row.Gen, cfg.SkipRepoHooks); err != nil {
+		return nil, fmt.Errorf("sessionactor: record what the gen is told of the repository's hooks: %w", err)
 	}
 
 	// Docker/EgressPolicy are threaded from cfg's own just-assembled
@@ -2145,6 +2214,12 @@ func (a *Actor) planResume(
 		// writer, per §2 -- mirroring planRestore's own identical
 		// defensive check.
 		return nil, fmt.Errorf("sessionactor: resume gen mismatch: validated %d, upsert produced %d", newGen, row.Gen)
+	}
+	// Technical plan §6.4, §27.1: a resume boots nothing and delivers no
+	// SESSION_CONFIG, so the resumed gen was told what the gen it resumes
+	// was told of the repository's hooks (repohooksgate.go).
+	if err := a.stores.sandbox.WithTx(tx).CarryRepoHooksTold(ctx, a.sessionID, sandboxRow.Gen, row.Gen); err != nil {
+		return nil, fmt.Errorf("sessionactor: carry what the gen was told of the repository's hooks: %w", err)
 	}
 
 	// Same reasoning as planFreshSpawn/planRestore's own identical call: a

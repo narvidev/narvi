@@ -479,7 +479,7 @@ func TestCountSandboxHeartbeat_CountsTwoSinceTheReady(t *testing.T) {
 
 	// A reconnect: this release's ready, then the previous binary's, which
 	// moves ready_seq alone.
-	if err := store.RecordReady(ctx, sessionID, 3, false, false, nil); err != nil {
+	if err := store.RecordReady(ctx, sessionID, 3, false, false, false, nil); err != nil {
 		t.Fatal(err)
 	}
 	pending(true, "a ready since")

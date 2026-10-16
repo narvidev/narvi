@@ -61,7 +61,9 @@ func dispatchTimer(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessio
 	return row, true
 }
 
-// seedReadySandbox gives sessionID a ready sandbox at gen 1.
+// seedReadySandbox gives sessionID a ready sandbox at gen 1, its agent a
+// current one: its ready advertised it honours SESSION_CONFIG's
+// skipRepoHooks (markRepoHooksCapable).
 func seedReadySandbox(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID) {
 	t.Helper()
 	sandboxes := narvipg.NewSandboxStore(pool)
@@ -70,6 +72,32 @@ func seedReadySandbox(ctx context.Context, t *testing.T, pool *pgxpool.Pool, ses
 	}
 	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', gen = 1 WHERE session_id = $1`, sessionID); err != nil {
 		t.Fatalf("move sandbox to ready: %v", err)
+	}
+	markRepoHooksCapable(ctx, t, pool, sessionID)
+}
+
+// markRepoHooksCapable records that sessionID's live gen was spawned by
+// this release and booted by a current agent (technical plan §6.4, §27.1):
+// its SESSION_CONFIG told it what this release tells the session now
+// (sessionSkipsRepoHooks over its claim and spec), and its ready advertised
+// capabilities.skipRepoHooks, as every current agent's does. A test that
+// moves a sandbox to ready without a spawn or a ready event models that
+// gen, so a review session's turn is not held by the repository-hooks gate
+// (repohooksgate.go) for facts this test never had the chance to record.
+func markRepoHooksCapable(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID) {
+	t.Helper()
+	session, err := narvipg.NewSessionStore(pool).Get(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("read the session: %v", err)
+	}
+	var claim *sqlcgen.GithubPrSession
+	if c, err := narvipg.NewGitHubPRSessionStore(pool).GetBySessionID(ctx, sessionID); err == nil {
+		claim = &c
+	}
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET skip_repo_hooks_gen = gen,
+		skip_repo_hooks_told_gen = CASE WHEN $2::boolean THEN gen ELSE NULL END WHERE session_id = $1`,
+		sessionID, sessionSkipsRepoHooks(claim, session.Repos)); err != nil {
+		t.Fatalf("record the gen's skipRepoHooks capability and what it was told: %v", err)
 	}
 }
 

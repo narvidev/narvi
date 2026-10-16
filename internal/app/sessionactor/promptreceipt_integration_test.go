@@ -143,11 +143,14 @@ func (p sentPrompt) asksReceipt(t *testing.T) bool {
 
 // Wire frames for gen, as a sandbox-agent sends them.
 
+// receiptReady is a ready of gen, advertising promptReceipt when capable,
+// from an agent that honours SESSION_CONFIG's skipRepoHooks: the receipt's
+// capability is this file's question, not the hooks'.
 func receiptReady(gen int, capable bool) SandboxEvent {
 	id := "ready-" + uuid.NewString()
-	caps := ""
+	caps := `,"capabilities":{"skipRepoHooks":true}`
 	if capable {
-		caps = `,"capabilities":{"promptReceipt":true}`
+		caps = `,"capabilities":{"promptReceipt":true,"skipRepoHooks":true}`
 	}
 	agentVersion, imageDigest := "dev", "unknown"
 	return SandboxEvent{Type: "ready", Gen: gen, MessageID: id, AgentVersion: &agentVersion, ImageDigest: &imageDigest,

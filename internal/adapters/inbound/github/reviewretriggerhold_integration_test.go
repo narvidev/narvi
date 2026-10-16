@@ -75,7 +75,12 @@ func newHoldStatusFixture(ctx context.Context, t *testing.T) holdStatusFixture {
 	if _, err := sandboxes.Create(ctx, f.sessionID); err != nil {
 		t.Fatalf("create the sandbox: %v", err)
 	}
-	if _, err := f.rig.pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', gen = 1 WHERE session_id = $1`, f.sessionID); err != nil {
+	// A gen this release spawned, booted by a current agent: its
+	// SESSION_CONFIG told it to skip the repository's hooks, as the
+	// session's unrecorded claim does, and its ready advertised it honours
+	// that (technical plan §6.4), which the session actor asks of a review
+	// session's gen before it sends a turn.
+	if _, err := f.rig.pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', gen = 1, skip_repo_hooks_gen = 1, skip_repo_hooks_told_gen = 1 WHERE session_id = $1`, f.sessionID); err != nil {
 		t.Fatalf("move the sandbox to ready: %v", err)
 	}
 	head := "sha-under-review"
