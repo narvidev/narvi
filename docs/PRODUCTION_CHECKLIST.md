@@ -417,7 +417,8 @@ Before a turn is dispatched to a live sandbox with less than
 `min(RotationRunwayFloor, lifetime/6)` of it left (13 minutes at the
 shipped values), the sandbox is rotated -- snapshotted, replaced, and
 restored under a new gen with a fresh deadline -- and one past it whose
-agent has gone silent is retired and restored. So a provider that ends
+agent has gone silent is suspected, given the terminal grace any silence
+gets, and restored if no sign of life comes. So a provider that ends
 sandboxes sooner than assumed makes every recorded deadline late, and the
 gate dispatches onto a sandbox the row says has runway -- the failure §35
 exists to prevent. The gate relies on the deadline from the first turn,
@@ -432,7 +433,8 @@ and the replacement's boot. A sandbox that outlives its estimate is not
 cut short while its agent is still heard from: a snapshot and a push in
 progress are waited for, then it is rotated through its own snapshot, so
 no work is lost. Only a sandbox past its estimate whose agent has been
-silent `SteadyHeartbeatBudget` is retired at once. Using a longer limit
+silent `SteadyHeartbeatBudget`, and stays silent through its terminal
+grace, is replaced. Using a longer limit
 means raising `ProviderHardCap`, `SandboxLifetime` and
 `ReviewSandboxLifetime` in `timeouts.go`, in a release, once the provider
 guarantees it.

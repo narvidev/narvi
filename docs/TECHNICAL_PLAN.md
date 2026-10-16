@@ -97,7 +97,7 @@ Hard rules:
 - **Two-phase terminalization**: a watchdog never writes `failed` directly. It writes `suspect` and arms `terminal_grace` (default 60s). Any liveness signal during grace returns to previous state. A genuinely late success (e.g. `execution_complete` arriving after terminalization) **reconciles**: turn marked completed, session status re-derived, automation run counters corrected. This narrows the false-failure window rather than eliminating it — see the note just below the list for the residual case and what closing it would require.
 - **Circuit breaker**: 3 permanent spawn failures within 5 min blocks spawning for that session. Unknown provider errors default to **transient**, never permanent — a novel transient failure must not trip the breaker.
 - **A restore is decided on what the snapshot holds** (§35.5b). What the sandbox-agent that minted a snapshot reported about itself — its protocol and its agent runtime's version — is recorded with the snapshot, keyed by the snapshot id, and kept across every restore. Before every restore it reads **compatible** (restored), **incompatible** (refused: the sandbox is spawned fresh, the snapshot cleared, and the refusal persisted as a session `warning`, logged and counted) or **unknown** (restored, and counted as unknown, never as compatible). A restore downgraded to a fresh spawn for another reason (§27.8, §30.4(3)), and a snapshot the review checkout discards with its gen (§3.3), are persisted the same way, once per snapshot.
-- **A sandbox below its runway threshold is rotated before a turn is dispatched to it, when it can be** (§35.3). Before a turn is dispatched to a live sandbox, a pure decision on its lifetime deadline (`sandbox.EvaluateRunway`) passes it, holds it, rotates the sandbox first — snapshot, retire the gen to `stopped`, `shutdown`, restore under a new gen — or retires a gen past its deadline whose agent is silent; a rotation is data on the sandbox row read by each dispatch evaluation, never a state of the machine, and it moves the sandbox only over the edges above. This is not a floor at every dispatch: the rotation is declined, and the turn dispatched below the threshold as before, when no deadline is known, for a re-send of a turn in flight, to a suspect sandbox, and for a session that cannot snapshot (no provider snapshots, no command channel, or a session that needs a container daemon, §27.8). A snapshot in progress holds the turn for `SnapshotReportWait`; one never reported is then given up by its agent's silence: the sandbox back to `ready` once its agent is heard from after the wait, suspected through the two-phase rule above once it has been silent `SteadyHeartbeatBudget`, and held in between.
+- **A sandbox below its runway threshold is rotated before a turn is dispatched to it, when it can be** (§35.3). Before a turn is dispatched to a live sandbox, a pure decision on its lifetime deadline (`sandbox.EvaluateRunway`) passes it, holds it, rotates the sandbox first — snapshot, retire the gen to `stopped`, `shutdown`, restore under a new gen — or suspects a gen past its deadline whose agent is silent, through the two-phase rule above; a rotation is data on the sandbox row read by each dispatch evaluation, never a state of the machine, and it moves the sandbox only over the edges above. This is not a floor at every dispatch: the rotation is declined, and the turn dispatched below the threshold as before, when no deadline is known, for a re-send of a turn in flight, to a suspect sandbox, and for a session that cannot snapshot (no provider snapshots, no command channel, or a session that needs a container daemon, §27.8). A snapshot in progress holds the turn for `SnapshotReportWait`; one never reported is then given up by its agent's silence: the sandbox back to `ready` once its agent is heard from after the wait and past its connection's replay of unacked frames, suspected through the two-phase rule above once it has been silent `SteadyHeartbeatBudget`, and held in between.
 
 Two-phase terminalization's reconciliation above is scoped to a late signal that still finds the turn `Processing` — true whenever it arrives inside `turn_deadline`'s own, separate, much longer budget (60 min vs. `terminal_grace`'s 60s, `platform/timeouts.go`), the ordinary case. What that scoping makes unrepresentable is the contradiction class — a delivered artifact and a failure message both standing for the same turn at once — since a turn still `Processing` can only ever resolve to one clean terminal write, never a conflicting second one. The residual case stays a known limitation: a real `execution_complete` arriving after the turn has already gone terminal via its own `turn_deadline` timeout is logged and discarded, not reconciled — the user is told the turn failed while the work actually completed. Closing this residual would require late-success reconciliation to enqueue a corrective follow-up notification through the same outbox (§5.1) once the original `failed` transition's own notification has already been dispatched; without that, the contradiction class this design otherwise prevents re-enters through that door.
 
@@ -6844,14 +6844,16 @@ stopped by inactivity and restored on the next prompt, exactly as before.
   | # | Facts | Action | Reason |
   |---|---|---|---|
   | 1 | not ready, suspect or snapshotting | pass | `not_steady` |
-  | 2 | deadline known and passed, its agent silent past `SteadyHeartbeatBudget` | retire | `deadline_passed` |
+  | 2 | deadline known and passed, its agent silent past `SteadyHeartbeatBudget` | suspect | `deadline_passed` |
+  | 2a | the same, already suspect | hold | `deadline_passed` |
   | 3 | rotating, its own snapshot in progress, within `RotationSnapshotWait` | hold | `awaiting_rotation_snapshot` |
   | 4 | rotating, its own snapshot in progress | retire | `rotation_snapshot_not_reported` |
+  | 4a | rotating, not mid-snapshot, a delivery open | hold | `delivery_open` |
   | 5 | rotating, not mid-snapshot, its snapshot recorded since the rotation started | retire | `rotation_snapshot_taken` |
   | 6 | rotating, not mid-snapshot | retire | `rotation_snapshot_failed` |
   | 7 | snapshotting, within `SnapshotReportWait` | hold | `snapshot_in_progress` |
   | 7a | snapshotting, its agent silent past `SteadyHeartbeatBudget` | suspect | `snapshot_agent_silent` |
-  | 7b | snapshotting, its agent heard from since the wait ended | revert | `snapshot_not_reported` |
+  | 7b | snapshotting, its agent heard from since the wait ended, past its connection's replay | revert | `snapshot_not_reported` |
   | 7c | snapshotting | hold | `awaiting_sign_of_life` |
   | 7d | suspected mid-snapshot | hold | `suspected_mid_snapshot` |
   | 8 | deadline unknown | pass (declined) | `deadline_unknown` |
@@ -6865,16 +6867,19 @@ stopped by inactivity and restored on the next prompt, exactly as before.
   Mid-snapshot is snapshotting, or suspect after snapshotting. A sandbox mid-snapshot is never
   passed, so no prompt goes to a sandbox mid-snapshot, and no rotation row cuts a suspicion's grace
   short. Every hold names when to look again, bounded by the deadline while it is still ahead. Every
-  retirement is of a rotating gen or of one past its deadline.
+  retirement is of a rotating gen, and every silence the gate reads is suspected, never retired.
 - **A rotation is data on the row, never a state.** `sandboxes.rotation_gen`,
   `rotation_message_id` and `rotation_started_at` record which gen rotates, the snapshot command it
-  sent and since when, `snapshot_started_at` when the snapshot in progress started (migration
-  000171); a rotation counts only while `rotation_gen` is the live gen, and the claim that replaces
-  the gen clears all four. The rotation waits on its own snapshot only while the pending command is
-  the one it sent: another snapshot a rotating gen takes — a post-turn one, after a previous binary
-  dispatched into it during a rolling deploy — is waited for like any other, never cut short, and
-  its report then retires the gen with that snapshot, so the turn's work is kept. Each step is an
-  ordinary dispatch evaluation, over the machine's existing edges: ready → snapshotting over `snapshot_start`, the
+  sent and since when, `snapshot_started_at` and `snapshot_start_message_id` when the snapshot in
+  progress started and for which command, and `heartbeat_ready_seq` with `heartbeats_since_ready`
+  the heartbeats since a connection's ready (migration 000171); a rotation counts only while
+  `rotation_gen` is the live gen, a start only for the command it was stamped for, and the claim that
+  replaces the gen clears them all. The rotation waits on its own snapshot only while the pending
+  command is the one it sent: another snapshot a rotating gen takes — a post-turn one, after a
+  previous binary dispatched into it during a rolling deploy — is waited for like any other, never
+  cut short, from a start of its own even when the previous binary left the rotation's start on the
+  row, and its report then retires the gen with that snapshot, once that turn's delivery is over
+  (row 4a), so the turn's work and its push are kept. Each step is an ordinary dispatch evaluation, over the machine's existing edges: ready → snapshotting over `snapshot_start`, the
   rotation and its snapshot command recorded in one commit, the command sent after it, and the
   dispatch timer armed at `RotationSnapshotWait`; the snapshot's report, or the wait's end, retires
   the gen — live → suspect → stopped, its pending snapshot command forgotten — and after that commit
@@ -6883,23 +6888,27 @@ stopped by inactivity and restored on the next prompt, exactly as before.
   every gate a restore passes (§27.8, §30.4(3), §35.5b), or spawns fresh when there is none. The
   rotation never restores anything itself, and a gen the gate retired is never resumed: a resume
   claims the same provider object and carries its deadline forward (§35.2), which would bring the
-  replaced sandbox back. Every retirement is of a rotating gen or of one past its deadline, and the
-  spawn decision rules a resume out for both; a gen the gate suspects (below) whose grace runs out
-  ends `failed`, which is never resumed.
+  replaced sandbox back. Every retirement is of a rotating gen, which the spawn decision rules a
+  resume out for, as it does a gen past its deadline; a gen the gate suspects (below) whose grace
+  runs out ends `failed`, which is never resumed.
 - **A delivery holds the start.** The agent runs push and snapshot one after the other on its read
   loop, so while a completed turn's push and pull request are still being delivered
   (`pr_delivery_started_at`, within `MCPStatusDeliveryWindow`) a rotation that would start is held,
   looked at again at the delivery's bound, or at once when the delivery ends — its `push_error`, or
   its `push_complete` once the pull request is created. A session whose repositories push past that
   bound can still delay the rotation's snapshot past its wait; the rotation then falls back, below,
-  before the deadline (`RotationRunwayFloor`'s doc).
+  before the deadline (`RotationRunwayFloor`'s doc). A rotating gen's retirement waits for an open
+  delivery the same way (row 4a): retiring it stops its sandbox, which would kill the push.
 - **The deadline is an estimate.** The recorded deadline is the claim's conservative estimate
   (§35.2): stamped before the provider call, from a lifetime the provider is only required to allow
   at least (`PRODUCTION_CHECKLIST.md` item 14), so a gen routinely outlives it. A gen past it is
-  retired at once only when its agent is silent past `SteadyHeartbeatBudget` too — a sandbox that
-  died idle at its deadline, status still live: ready, suspect or snapshotting — before anything is
-  sent to it, so the next spawn decision restores from the last snapshot instead of waiting on a box
-  that is gone. A gen past it whose agent is still heard from is treated as one below the threshold:
+  given up only when its agent is silent past `SteadyHeartbeatBudget` too, and then through §3.2's
+  two-phase rule like any other silence, since silence can be frames that could not be recorded:
+  ready or snapshotting, it is suspected before anything is sent to it, `terminal_grace` armed and
+  a pending snapshot command kept; already suspect, it is held through its grace. A sign of life
+  during the grace recovers it; a grace that runs out with no signal ends it `failed`, and the next
+  spawn decision restores from the last snapshot instead of waiting on a box that is gone. A gen
+  past it whose agent is still heard from is treated as one below the threshold:
   a snapshot in progress and an open delivery are waited for, never cut short, and it is then rotated
   through its own snapshot, so a turn that completed past the estimate keeps its work.
 - **A snapshot in progress holds a turn for a bounded time.** A turn queued behind a snapshot that
@@ -6908,17 +6917,23 @@ stopped by inactivity and restored on the next prompt, exactly as before.
   The agent reports a failed mint with no frame, and one that dies mid-mint reports nothing either,
   so once the wait has run the agent's silence decides, read from then on, not at the bound alone —
   its heartbeats run apart from the read loop the snapshot blocks, so a live agent is heard within a
-  heartbeat interval. An agent heard from after the wait ended is alive and only the snapshot
-  failed: the sandbox goes back to ready with its work, its pending command forgotten, and takes the
-  turn. One silent past `SteadyHeartbeatBudget` is suspected through §3.2's two-phase rule like any
-  other silence — live → suspect with `pre_suspect_status` snapshotting, its pending command kept, a
-  `terminal_grace` timer armed — so any sign of life during the grace recovers it (a heartbeat, or
-  the snapshot's replayed report, which is then recorded), and a grace that runs out with no signal
-  ends it `failed`, and the turn runs on a replacement restored from the last snapshot. One not
-  heard from since the wait ended, silent less than the budget — an agent that died partway through
-  the wait — is held until it is heard from or its silence reaches the budget, never sent the turn.
-  A sandbox suspected mid-snapshot takes no turn during its grace. A snapshot given up early, still
-  queued behind a push, costs that snapshot, never the turn.
+  heartbeat interval. A start counts only for the command it was stamped for, so a snapshot the
+  previous binary started, which carries an earlier snapshot's start, is given its own. An agent
+  heard from after the wait ended is alive and only the snapshot failed — once its connection's
+  replay has been read: an agent that reconnects sends `ready`, then at most one heartbeat, then
+  replays every critical frame not yet acked, a `snapshot_ready` among them, and only then starts its
+  heartbeat loop (wsbridge's `runConnection`), so the snapshot is given up only from the second
+  heartbeat after a `ready`, and a replayed report is recorded first. Given up, the sandbox goes back
+  to ready with its work, its pending command forgotten, and takes the turn. One silent past
+  `SteadyHeartbeatBudget` is suspected through §3.2's two-phase rule like any other silence — live
+  → suspect with `pre_suspect_status` snapshotting, its pending command kept, a `terminal_grace`
+  timer armed — so any sign of life during the grace recovers it: a heartbeat, or a reconnect, whose
+  replayed report is then recorded. A grace that runs out with no signal ends it `failed`, and the
+  turn runs on a replacement restored from the last snapshot. One not heard from since the wait
+  ended, silent less than the budget — an agent that died partway through the wait — or whose
+  connection's replay may still be coming, is held until that is settled or its silence reaches the
+  budget, never sent the turn. A sandbox suspected mid-snapshot takes no turn during its grace. A
+  snapshot given up early, still queued behind a push, costs that snapshot, never the turn.
 - **Fencing is unchanged and load-bearing**: a rotation increments `sandbox.gen` like any other
   restore, and the superseded identity is locked out immediately rather than at its natural expiry:
   from the retirement's commit the row is `stopped`, so its handshake, credentials and snapshot mint
