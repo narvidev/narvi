@@ -156,6 +156,7 @@ POST /webhooks/github
 POST /webhooks/linear
 POST /webhooks/slack
 POST /webhooks/slack/interactive
+PUT /api/automations/{automationID}/session-spend-cap
 PUT /api/cloud-identity-bindings/{bindingID}
 PUT /api/environments/{environmentID}/cloud-identity-bindings/{bindingID}
 PUT /api/environments/{environmentID}/cluster-binding
@@ -173,6 +174,7 @@ PUT /api/repos/{owner}/{repo}/provider-credentials/{credentialID}
 PUT /api/repos/{owner}/{repo}/review-cost-budget
 PUT /api/repos/{owner}/{repo}/review-depth
 PUT /api/repos/{owner}/{repo}/sandbox-secrets/{secretID}
+PUT /api/repos/{owner}/{repo}/session-spend-cap
 PUT /api/repos/{owner}/{repo}/settings
 PUT /api/sandbox-secrets/{secretID}
 PUT /api/workflow-bindings

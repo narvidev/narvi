@@ -972,6 +972,13 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Use(auth.Middleware(rig.userSessions, rig.users))
 		r.Put("/", httpapi.PutReviewCostBudget(rig.repoSettings, rig.prSessions))
 	})
+	// /api/repos/{owner}/{repo}/session-spend-cap (§40.1) -- mounted
+	// behind auth.Middleware, exactly like controlplane/serve.go's own
+	// wiring (see sessionspendcap.go's own doc comment).
+	router.Route("/api/repos/{owner}/{repo}/session-spend-cap", func(r chi.Router) {
+		r.Use(auth.Middleware(rig.userSessions, rig.users))
+		r.Put("/", httpapi.PutSessionSpendCap(rig.pool, rig.repoSettings, rig.auditLog, rig.prSessions))
+	})
 	// /api/repos/{owner}/{repo}/review-analytics (§21.1) --
 	// mounted behind auth.Middleware exactly like cmd/control-plane/
 	// main.go's own wiring (see reviewanalytics.go's own doc comment).
@@ -1133,6 +1140,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Post("/{automationID}/resume", httpapi.ResumeAutomation(rig.automations, rig.automationRuns))
 		r.Post("/{automationID}/webhook-token", httpapi.RotateAutomationWebhookToken(rig.automations, rig.automationRuns))
 		r.Delete("/{automationID}/webhook-token", httpapi.RevokeAutomationWebhookToken(rig.automations, rig.automationRuns))
+		r.Put("/{automationID}/session-spend-cap", httpapi.PutAutomationSessionSpendCap(rig.pool, rig.automations, rig.automationRuns, rig.auditLog))
 	})
 	// /webhooks/automations/{automationID} -- mounted OUTSIDE auth.Middleware
 	// entirely, exactly like cmd/control-plane/main.go's own real wiring

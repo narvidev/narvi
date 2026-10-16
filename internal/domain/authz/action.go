@@ -519,6 +519,22 @@ const (
 	// unattended, on every future PR, never a per-PR maintainer judgment
 	// call the way row 5's actions are.
 	ActionConfigureReviewCostBudget Action = "configure_review_cost_budget"
+	// ActionSetSessionSpendCap covers technical plan §40.1's session spend
+	// cap: setting, raising, lowering and clearing a repository's
+	// (PUT /api/repos/{owner}/{repo}/session-spend-cap,
+	// repo_settings.session_spend_cap_usd) and an automation's
+	// (PUT /api/automations/{automationID}/session-spend-cap,
+	// automations.session_spend_cap_usd), both in migrations/000165. One
+	// action for both, since an automation's cap takes precedence over its
+	// repositories' (sessionguard.Facts.EffectiveCap): a role allowed one
+	// but not the other could lift a cap through the one it holds. Admin
+	// only, this SAME row as ActionConfigureReviewCostBudget immediately
+	// above -- §13.3's admin row names the spend cap itself -- and stricter
+	// than ActionManageAutomations (admin and maintainer), which is why
+	// CreateAutomation takes no cap: raising a cap is the one remedy for a
+	// session the cap refuses, and that remedy is an administrator's,
+	// audited (session_spend_cap.set), never a bypass.
+	ActionSetSessionSpendCap Action = "set_session_spend_cap"
 	// ActionConfigurePreviewLinks covers §4.1.2 amendment's own new
 	// PUT /api/repos/{owner}/{repo}/preview-config endpoint
 	// (internal/adapters/inbound/httpapi/previewconfig.go) --
@@ -715,6 +731,7 @@ var AllActions = []Action{
 	ActionToggleDescriptionAutofix,
 	ActionConfigureReviewDepth,
 	ActionConfigureReviewCostBudget,
+	ActionSetSessionSpendCap,
 	ActionConfigurePreviewLinks,
 	ActionAcknowledgeReleaseComposition,
 	ActionUnblockReleaseComposition,

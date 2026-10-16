@@ -241,6 +241,11 @@ var matrix = map[Action]actionRule{
 	// ActionConfigureReviewDepth immediately above (action.go's own doc
 	// comment).
 	ActionConfigureReviewCostBudget: {allow: roles(RoleAdmin)},
+	// (§40.1): setting or raising a repository's or an automation's
+	// session spend cap -- §13.3's admin row names the spend cap; no
+	// own/joined carve-out (a repository or an automation is not a session
+	// anyone owns), and no maintainer (action.go's own doc comment).
+	ActionSetSessionSpendCap: {allow: roles(RoleAdmin)},
 	// (§4.1.2 amendment): configuring a repo's own RWX preview-link
 	// dispatch (dispatchKey/endpointTemplate/orgSlug) -- same row, same
 	// reasoning as ActionConfigureReviewCostBudget/ActionConfigureReviewDepth/

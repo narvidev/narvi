@@ -2499,6 +2499,18 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		r.Put("/", httpapi.PutReviewCostBudget(repoSettingsStore, githubPRSessionStore))
 	})
 
+	// /api/repos/{owner}/{repo}/session-spend-cap (§40.1): an
+	// administrator sets, raises or clears the repository's session spend
+	// cap, the write and its session_spend_cap.set audit row in one
+	// transaction -- see httpapi/sessionspendcap.go's own doc comment. Gated
+	// by the admin-only authz.ActionSetSessionSpendCap (§13.3) and scoped
+	// like every other repository-scoped route. The automation's cap is the
+	// same handler family's, under /api/automations below.
+	router.Route("/api/repos/{owner}/{repo}/session-spend-cap", func(r chi.Router) {
+		r.Use(auth.Middleware(userSessionStore, userStore))
+		r.Put("/", httpapi.PutSessionSpendCap(pool, repoSettingsStore, auditLogStore, githubPRSessionStore))
+	})
+
 	// /api/repos/{owner}/{repo}/review-analytics (§21.1):
 	// read-only GET over the three analytics rollups (timeseries,
 	// top-risk-driver breakdown, "Review finding outcomes" KPI) -- see
@@ -2729,6 +2741,12 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		r.Post("/{automationID}/resume", httpapi.ResumeAutomation(automationStore, automationRunStore))
 		r.Post("/{automationID}/webhook-token", httpapi.RotateAutomationWebhookToken(automationStore, automationRunStore))
 		r.Delete("/{automationID}/webhook-token", httpapi.RevokeAutomationWebhookToken(automationStore, automationRunStore))
+		// session-spend-cap (§40.1): the automation's session spend cap,
+		// ahead of its repositories' -- admin only
+		// (authz.ActionSetSessionSpendCap, stricter than
+		// ActionManageAutomations above), audited as session_spend_cap.set in
+		// the write's own transaction; see httpapi/sessionspendcap.go.
+		r.Put("/{automationID}/session-spend-cap", httpapi.PutAutomationSessionSpendCap(pool, automationStore, automationRunStore, auditLogStore))
 	})
 
 	// /webhooks/automations/{automationID} (§8.4's own "webhook-

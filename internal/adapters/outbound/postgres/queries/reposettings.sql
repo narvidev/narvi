@@ -137,6 +137,41 @@ ON CONFLICT (repo_full_name)
 DO UPDATE SET review_cost_budget_light_usd = EXCLUDED.review_cost_budget_light_usd, review_cost_budget_deep_usd = EXCLUDED.review_cost_budget_deep_usd, updated_at = now()
 RETURNING *;
 
+-- name: LockRepoSessionSpendCap :one
+-- The first statement of a session spend cap write (technical plan §40.1,
+-- httpapi's PutSessionSpendCap): row-locks the repository's settings row
+-- and returns its cap as it stands, NULL for none, for the
+-- session_spend_cap.set audit row's previous value. The row is created,
+-- with every column at its default, when the repository has none yet --
+-- as any column-scoped upsert of this table creates it -- so there is
+-- always a row to lock: a SELECT ... FOR UPDATE of a missing row locks
+-- nothing, and two first writes at once would each audit "no previous
+-- cap". The conflict arm rewrites updated_at with its own value, a write
+-- that changes nothing but takes the row's lock; under READ COMMITTED it
+-- acts on the row's latest committed version, so of two writes at once
+-- the second waits for the first and reads the cap the first wrote.
+INSERT INTO repo_settings (repo_full_name, updated_at)
+VALUES ($1, now())
+ON CONFLICT (repo_full_name)
+DO UPDATE SET updated_at = repo_settings.updated_at
+RETURNING session_spend_cap_usd;
+
+-- name: UpsertSessionSpendCap :one
+-- Technical plan §40.1's per-repo session spend cap
+-- (repo_settings.session_spend_cap_usd, migrations/000165): sets, raises,
+-- lowers or clears it (NULL: no cap), mirroring UpsertReviewCostBudget's
+-- column-scoped shape immediately above -- every other repo_settings
+-- column is left untouched. Written only after LockRepoSessionSpendCap in
+-- the same transaction, with the session_spend_cap.set audit row. A cap of
+-- zero or less, or no number at all, is refused before it reaches here
+-- (sessionguard.ValidateSessionSpendCap, a 400) and by the column's CHECK
+-- constraint behind it.
+INSERT INTO repo_settings (repo_full_name, session_spend_cap_usd, updated_at)
+VALUES ($1, $2, now())
+ON CONFLICT (repo_full_name)
+DO UPDATE SET session_spend_cap_usd = EXCLUDED.session_spend_cap_usd, updated_at = now()
+RETURNING *;
+
 -- name: UpsertSessionsEnabled :one
 -- §10's own cohort-rollout enrollment gate (§10 Phase 6, §32) --
 -- idempotent create-or-update of ONLY sessions_enabled, mirroring

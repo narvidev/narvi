@@ -2,6 +2,8 @@ package postgres
 
 import (
 	"context"
+	"fmt"
+	"math"
 	"strconv"
 
 	"github.com/jackc/pgx/v5"
@@ -39,6 +41,26 @@ func Float64ToNumeric(v *float64) pgtype.Numeric {
 		return pgtype.Numeric{}
 	}
 	return n
+}
+
+// sessionSpendCapNumeric is Float64ToNumeric for a session spend cap
+// (technical plan §40.1), with one difference: a value it cannot convert is
+// an error, never NULL. NULL is "no cap", so a conversion that degraded to
+// it would lift the cap the caller meant to set. nil is NULL, the caller
+// clearing the cap. The caller has already validated the value
+// (sessionguard.ValidateSessionSpendCap), so the error is a defense.
+func sessionSpendCapNumeric(capUSD *float64) (pgtype.Numeric, error) {
+	if capUSD == nil {
+		return pgtype.Numeric{}, nil
+	}
+	if math.IsNaN(*capUSD) || math.IsInf(*capUSD, 0) {
+		return pgtype.Numeric{}, fmt.Errorf("postgres: session spend cap %v is not a number of dollars", *capUSD)
+	}
+	var n pgtype.Numeric
+	if err := n.ScanScientific(strconv.FormatFloat(*capUSD, 'f', -1, 64)); err != nil {
+		return pgtype.Numeric{}, fmt.Errorf("postgres: session spend cap %v: %w", *capUSD, err)
+	}
+	return n, nil
 }
 
 // RepoSettingsStore is a thin, pass-through wrapper around the
@@ -189,6 +211,33 @@ func (s *RepoSettingsStore) UpsertReviewCostBudget(ctx context.Context, repoFull
 		RepoFullName:             repoFullName,
 		ReviewCostBudgetLightUsd: Float64ToNumeric(lightUSD),
 		ReviewCostBudgetDeepUsd:  Float64ToNumeric(deepUSD),
+	})
+}
+
+// LockSessionSpendCap row-locks repoFullName's settings row, creating it
+// with every column at its default when there is none, and returns its
+// session spend cap as it stands -- invalid (SQL NULL) for no cap. The
+// first statement of a cap write: its value is the audit row's previous
+// cap, and the lock holds until the caller's transaction ends, so a
+// concurrent write waits and then reads this one's cap (queries/
+// reposettings.sql, LockRepoSessionSpendCap). Run it on a WithTx store.
+func (s *RepoSettingsStore) LockSessionSpendCap(ctx context.Context, repoFullName string) (pgtype.Numeric, error) {
+	return s.q.LockRepoSessionSpendCap(ctx, repoFullName)
+}
+
+// UpsertSessionSpendCap writes repoFullName's session spend cap (technical
+// plan §40.1) and returns the whole row; nil clears it. Column-scoped, as
+// UpsertReviewCostBudget is. The caller validates the cap first
+// (sessionguard.ValidateSessionSpendCap); a value that cannot convert is
+// an error here, never a NULL that would lift the cap.
+func (s *RepoSettingsStore) UpsertSessionSpendCap(ctx context.Context, repoFullName string, capUSD *float64) (sqlcgen.RepoSetting, error) {
+	limit, err := sessionSpendCapNumeric(capUSD)
+	if err != nil {
+		return sqlcgen.RepoSetting{}, err
+	}
+	return s.q.UpsertSessionSpendCap(ctx, sqlcgen.UpsertSessionSpendCapParams{
+		RepoFullName:       repoFullName,
+		SessionSpendCapUsd: limit,
 	})
 }
 
