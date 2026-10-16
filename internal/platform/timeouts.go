@@ -170,10 +170,12 @@ type Timeouts struct {
 	// where it matters, after the wait: an agent silent for
 	// SteadyHeartbeatBudget is suspected through the liveness path
 	// (terminal grace, recovered by any sign of life); one heard from
-	// after the wait ended is alive, only its snapshot failed, and the
-	// sandbox goes back to ready with its work and takes the turn; one
-	// not heard from since is held until it is, or until its silence
-	// reaches the budget -- its heartbeats run apart from the read loop
+	// after the wait ended, past its connection's replay (an agent that
+	// reconnects sends ready, then replays an unacked report, so the gate
+	// waits for the second heartbeat after the ready), is alive, only its
+	// snapshot failed, and the sandbox goes back to ready with its work
+	// and takes the turn; one not heard from since is held until it is,
+	// or until its silence reaches the budget -- its heartbeats run apart from the read loop
 	// the snapshot blocks, so a live agent is heard within a heartbeat
 	// interval, and one that died partway through the wait is never read
 	// as alive. Not given a value in the plan; derived from this file

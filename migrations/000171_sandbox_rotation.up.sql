@@ -25,21 +25,36 @@
 -- follows writes the fallback warning when the snapshot it restores
 -- predates the rotation.
 --
--- sandboxes.snapshot_started_at: the database's now() when the snapshot in
--- progress started, a rotation's or the post-turn one. Written with
--- pending_snapshot_message_id, in the statement that sets it, and cleared
--- with it, so it describes the outstanding snapshot command and nothing
--- else. A pending turn waits SnapshotReportWait from it; a snapshot that
--- has not reported by then is given up -- the sandbox back to ready once
--- its agent is heard from after the wait, suspected (§3.2's two-phase
--- rule) once it has been silent the heartbeat budget. A
--- snapshot found with no start -- one in progress when this runs, or one
--- the previous binary started -- is given one by the first evaluation that
--- reads it, so it waits from then.
+-- sandboxes.snapshot_started_at and snapshot_start_message_id: the
+-- database's now() when the snapshot in progress started, a rotation's or
+-- the post-turn one, and the pending snapshot command that start was
+-- stamped for. Written with pending_snapshot_message_id, in the statement
+-- that sets it, and cleared with it. A start counts only while the pending
+-- command is the one it was stamped for, so it describes the outstanding
+-- snapshot and nothing else, whoever started that snapshot. A pending
+-- turn waits SnapshotReportWait from it; a snapshot that has not reported
+-- by then is given up -- the sandbox back to ready once its agent is
+-- heard from after the wait and past its connection's replay, suspected
+-- (§3.2's two-phase rule) once it has been silent the heartbeat budget. A
+-- snapshot found with no start, or with a start stamped for another
+-- command -- one in progress when this runs, or one the previous binary
+-- started -- is given one by the first evaluation that reads it, so it
+-- waits from then.
+--
+-- sandboxes.heartbeat_ready_seq and heartbeats_since_ready: how many
+-- heartbeats this release has recorded since the ready whose ready_seq
+-- (000155) is heartbeat_ready_seq, counted up to two. On every connection
+-- the agent sends ready, then at most one heartbeat, then replays the
+-- critical frames the control plane has not acked, and only then starts
+-- its heartbeat loop (wsbridge's runConnection), so the second heartbeat
+-- after a ready comes after every frame that connection replays. Until
+-- then a snapshot's report may still be on its way, and the gate does not
+-- give the snapshot up. A ready moves ready_seq, so the count starts again
+-- from the next heartbeat, whichever binary recorded the ready.
 --
 -- No backfill, no index: every read is by session_id, the row's unique key,
--- and NULL reads "not rotating", "no rotation snapshot pending" and "no
--- start recorded yet".
+-- and NULL reads "not rotating", "no rotation snapshot pending", "no start
+-- recorded yet" and "the replay not known to be read".
 --
 -- # Locks
 --
@@ -55,8 +70,8 @@
 --     SELECT * and RETURNING * out as a column list), so it neither reads
 --     nor writes them.
 --   - It never starts a rotation. Its UpsertSandboxForSpawn leaves the
---     four columns as they were, and the gen it bumps makes a rotation
---     column left on the gen before read "not rotating".
+--     columns as they were, and the gen it bumps makes a rotation column
+--     left on the gen before read "not rotating".
 --   - A rotation this binary started that the previous binary then meets
 --     reads snapshotting to it, which holds its pending turn as it holds
 --     any snapshot. Once the rotation's snapshot is reported it may
@@ -65,9 +80,14 @@
 --     other -- it is not the rotation's own -- and once it is reported the
 --     gen is retired and restored from it, so the turn's work is kept.
 --   - A snapshot it starts carries no start, or the start of an earlier
---     snapshot when the previous binary also recorded that one's report;
---     the first is given one at this binary's first look, the second is
---     given up early, which costs that snapshot and never the turn.
+--     snapshot, stamped for another command, when the previous binary also
+--     recorded that one's report. Either is given a start at this binary's
+--     first look, so it is waited for like any other, a post-turn snapshot
+--     of a rotating gen included.
+--   - It neither counts heartbeats nor resets the count, but every ready
+--     it records moves ready_seq, so a connection it saw the ready of is
+--     counted afresh from this binary's next heartbeat: the replay is read
+--     as pending a little longer, never as done too soon.
 -- migration000171_integration_test.go runs the previous binary's own
 -- statements against the columns.
 --
@@ -88,3 +108,6 @@ ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS rotation_gen INTEGER;
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS rotation_message_id TEXT;
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS rotation_started_at TIMESTAMPTZ;
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_started_at TIMESTAMPTZ;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_start_message_id TEXT;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS heartbeat_ready_seq INTEGER;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS heartbeats_since_ready SMALLINT;

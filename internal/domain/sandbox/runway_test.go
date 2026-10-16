@@ -102,30 +102,41 @@ func TestEvaluateRunway(t *testing.T) {
 		{name: "row 1: stopped", facts: func(f *sandbox.RunwayFacts) { f.Status, f.Runway = sandbox.StateStopped, -time.Hour },
 			wantAction: sandbox.RunwayPass, wantReason: sandbox.RunwayReasonNotSteady},
 
-		// Row 2: the deadline has passed and the agent is silent: the
-		// sandbox died at its deadline.
+		// Rows 2 and 2a: the deadline has passed and the agent is silent:
+		// the sandbox may have died at its deadline, or its frames could
+		// not be recorded. Suspected, through the liveness path, and held
+		// through the grace once suspect.
 		{name: "row 2: ready, runway exactly zero, silent exactly the budget", facts: func(f *sandbox.RunwayFacts) { f.Runway, f.SinceLastSeen = 0, 90*time.Second },
-			wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonDeadlinePassed},
+			wantAction: sandbox.RunwaySuspect, wantReason: sandbox.RunwayReasonDeadlinePassed},
 		{name: "row 2: ready, a nanosecond past", facts: func(f *sandbox.RunwayFacts) { f.Runway, f.SinceLastSeen = -1, time.Hour },
-			wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonDeadlinePassed},
-		{name: "row 2: suspect", facts: func(f *sandbox.RunwayFacts) {
+			wantAction: sandbox.RunwaySuspect, wantReason: sandbox.RunwayReasonDeadlinePassed},
+		{name: "row 2a: already suspect, held through its grace", facts: func(f *sandbox.RunwayFacts) {
 			f.Status, f.Runway, f.SinceLastSeen = sandbox.StateSuspect, -time.Minute, 2*time.Minute
-		}, wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonDeadlinePassed},
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonDeadlinePassed, wantNextLook: time.Minute},
+		{name: "row 2a reads the grace", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.Runway, f.SinceLastSeen = sandbox.StateSuspect, -time.Minute, 2*time.Minute
+		}, cfg: &distinctConfig, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonDeadlinePassed, wantNextLook: 70 * time.Second},
+		{name: "row 2a: suspected mid-snapshot", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.SuspectedMidSnapshot, f.Runway, f.SinceLastSeen = sandbox.StateSuspect, true, -time.Minute, 2*time.Minute
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonDeadlinePassed, wantNextLook: time.Minute},
+		{name: "row 2a before rows 5 and 6: a rotating gen already suspect keeps its grace", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.Runway, f.Rotating, f.RotationSnapshotTaken, f.SinceLastSeen = sandbox.StateSuspect, -time.Minute, true, true, 2*time.Minute
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonDeadlinePassed, wantNextLook: time.Minute},
 		{name: "row 2: snapshotting, not rotating, before the report wait", facts: func(f *sandbox.RunwayFacts) {
 			f.Status, f.Runway, f.SinceLastSeen = sandbox.StateSnapshotting, -time.Minute, 2*time.Minute
-		}, wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonDeadlinePassed},
+		}, wantAction: sandbox.RunwaySuspect, wantReason: sandbox.RunwayReasonDeadlinePassed},
 		{name: "row 2 precedes row 3: the deadline passes while the rotation waits, its agent silent", facts: func(f *sandbox.RunwayFacts) {
 			f.Status, f.Runway, f.Rotating, f.RotationSnapshotPending, f.SinceRotationStart, f.SinceLastSeen = sandbox.StateSnapshotting, 0, true, true, 30*time.Second, 2*time.Minute
-		}, wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonDeadlinePassed},
+		}, wantAction: sandbox.RunwaySuspect, wantReason: sandbox.RunwayReasonDeadlinePassed},
 		{name: "row 2 precedes row 5: the rotation's snapshot taken, the deadline passed, silent", facts: func(f *sandbox.RunwayFacts) {
 			f.Runway, f.Rotating, f.RotationSnapshotTaken, f.SinceLastSeen = -time.Second, true, true, 2*time.Minute
-		}, wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonDeadlinePassed},
+		}, wantAction: sandbox.RunwaySuspect, wantReason: sandbox.RunwayReasonDeadlinePassed},
 		{name: "row 2: with a turn in flight", facts: func(f *sandbox.RunwayFacts) {
 			f.Runway, f.TurnInFlight, f.SinceLastSeen = -time.Minute, true, 2*time.Minute
-		}, wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonDeadlinePassed},
+		}, wantAction: sandbox.RunwaySuspect, wantReason: sandbox.RunwayReasonDeadlinePassed},
 		{name: "row 2: with no snapshot capability", facts: func(f *sandbox.RunwayFacts) {
 			f.Runway, f.CanSnapshot, f.SinceLastSeen = -time.Minute, false, 2*time.Minute
-		}, wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonDeadlinePassed},
+		}, wantAction: sandbox.RunwaySuspect, wantReason: sandbox.RunwayReasonDeadlinePassed},
 		{name: "row 2 needs the deadline known: a stale runway is row 8", facts: func(f *sandbox.RunwayFacts) {
 			f.DeadlineKnown, f.Runway, f.SinceLastSeen = false, -time.Minute, 2*time.Minute
 		}, wantAction: sandbox.RunwayPass, wantReason: sandbox.RunwayReasonDeadlineUnknown},
@@ -181,6 +192,28 @@ func TestEvaluateRunway(t *testing.T) {
 		{name: "row 4 needs its own snapshot: another snapshot of a rotating gen is waited for", facts: func(f *sandbox.RunwayFacts) {
 			f.Status, f.Runway, f.Rotating, f.RotationSnapshotTaken, f.SinceRotationStart, f.SinceSnapshotStart = sandbox.StateSnapshotting, 8*time.Minute, true, true, 4*time.Minute, 0
 		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSnapshotInProgress, wantNextLook: 2 * time.Minute},
+
+		// Row 4a: a rotating gen's retirement waits for an open delivery,
+		// as a rotation's start does (row 13): stopping it would kill the
+		// push.
+		{name: "row 4a: the rotation's snapshot taken, a delivery open", facts: func(f *sandbox.RunwayFacts) {
+			f.Runway, f.Rotating, f.RotationSnapshotTaken, f.DeliveryOpen, f.DeliveryRemaining = 8*time.Minute, true, true, true, 9*time.Minute
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonDeliveryOpen, wantNextLook: 8 * time.Minute},
+		{name: "row 4a: the delivery's bound comes first", facts: func(f *sandbox.RunwayFacts) {
+			f.Runway, f.Rotating, f.DeliveryOpen, f.DeliveryRemaining = 8*time.Minute, true, true, 3*time.Minute
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonDeliveryOpen, wantNextLook: 3 * time.Minute},
+		{name: "row 4a: past the deadline, heard from: held by the delivery alone", facts: func(f *sandbox.RunwayFacts) {
+			f.Runway, f.Rotating, f.RotationSnapshotTaken, f.DeliveryOpen, f.DeliveryRemaining = -time.Minute, true, true, true, 4*time.Minute
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonDeliveryOpen, wantNextLook: 4 * time.Minute},
+		{name: "row 4a: suspect since, a delivery open", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.Runway, f.Rotating, f.DeliveryOpen, f.DeliveryRemaining = sandbox.StateSuspect, 8*time.Minute, true, true, time.Minute
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonDeliveryOpen, wantNextLook: time.Minute},
+		{name: "row 4a follows row 4: the rotation's own snapshot past its wait is not held", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.Runway, f.Rotating, f.RotationSnapshotPending, f.SinceRotationStart, f.DeliveryOpen, f.DeliveryRemaining = sandbox.StateSnapshotting, 8*time.Minute, true, true, 3*time.Minute, true, time.Minute
+		}, wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonRotationSnapshotNotReported},
+		{name: "row 4a: no snapshot capability changes nothing", facts: func(f *sandbox.RunwayFacts) {
+			f.Runway, f.Rotating, f.CanSnapshot, f.DeliveryOpen, f.DeliveryRemaining = 8*time.Minute, true, false, true, 2*time.Minute
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonDeliveryOpen, wantNextLook: 2 * time.Minute},
 
 		// Row 5: the rotation's snapshot was recorded.
 		{name: "row 5: ready", facts: func(f *sandbox.RunwayFacts) {
@@ -257,6 +290,25 @@ func TestEvaluateRunway(t *testing.T) {
 			f.Status, f.Runway, f.SinceSnapshotStart, f.SinceLastSeen = sandbox.StateSnapshotting, -time.Second, 10*time.Minute, 5*time.Second
 		}, wantAction: sandbox.RunwayRevert, wantReason: sandbox.RunwayReasonSnapshotNotReported},
 
+		// Row 7b waits for its connection's replay: an agent that
+		// reconnects sends ready, then replays its unacked report. Until
+		// the second heartbeat after that ready, a sign of life is no sign
+		// that no report is coming.
+		{name: "row 7b needs the replay read: a reconnect's ready alone is 7c", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.SinceSnapshotStart, f.ReplayPending = sandbox.StateSnapshotting, 3*time.Minute, true
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonAwaitingSignOfLife, wantNextLook: 90 * time.Second},
+		{name: "row 7c: the replay pending, heard from 30s ago", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.SinceSnapshotStart, f.SinceLastSeen, f.ReplayPending = sandbox.StateSnapshotting, 10*time.Minute, 30*time.Second, true
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonAwaitingSignOfLife, wantNextLook: time.Minute},
+		{name: "row 7a reads silence whatever the replay", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.SinceSnapshotStart, f.SinceLastSeen, f.ReplayPending = sandbox.StateSnapshotting, 10*time.Minute, 90*time.Second, true
+		}, wantAction: sandbox.RunwaySuspect, wantReason: sandbox.RunwayReasonSnapshotAgentSilent},
+		{name: "row 7 reads nothing of the replay", facts: func(f *sandbox.RunwayFacts) {
+			f.Status, f.SinceSnapshotStart, f.ReplayPending = sandbox.StateSnapshotting, time.Minute, true
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSnapshotInProgress, wantNextLook: time.Minute},
+		{name: "row 9 reads nothing of the replay: a ready sandbox with runway passes", facts: func(f *sandbox.RunwayFacts) { f.ReplayPending = true },
+			wantAction: sandbox.RunwayPass, wantReason: sandbox.RunwayReasonOK},
+
 		// Row 7c: the wait has run and the agent has not been heard from
 		// since: one that died partway through the wait is not read as
 		// alive. Held until it is heard from or its silence reaches the
@@ -281,9 +333,9 @@ func TestEvaluateRunway(t *testing.T) {
 			wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSuspectedMidSnapshot, wantNextLook: time.Minute},
 		{name: "row 7d reads the grace", facts: func(f *sandbox.RunwayFacts) { f.Status, f.SuspectedMidSnapshot = sandbox.StateSuspect, true },
 			cfg: &distinctConfig, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSuspectedMidSnapshot, wantNextLook: 70 * time.Second},
-		{name: "row 2 precedes row 7d: past the deadline, silent", facts: func(f *sandbox.RunwayFacts) {
+		{name: "row 2a precedes row 7d: past the deadline, silent", facts: func(f *sandbox.RunwayFacts) {
 			f.Status, f.SuspectedMidSnapshot, f.Runway, f.SinceLastSeen = sandbox.StateSuspect, true, -time.Minute, 3*time.Minute
-		}, wantAction: sandbox.RunwayRetire, wantReason: sandbox.RunwayReasonDeadlinePassed},
+		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonDeadlinePassed, wantNextLook: time.Minute},
 		{name: "row 7d before rows 5 and 6: a rotating gen suspected mid-snapshot keeps its grace", facts: func(f *sandbox.RunwayFacts) {
 			f.Status, f.SuspectedMidSnapshot, f.Rotating, f.RotationSnapshotTaken, f.SinceRotationStart = sandbox.StateSuspect, true, true, true, 5*time.Minute
 		}, wantAction: sandbox.RunwayHold, wantReason: sandbox.RunwayReasonSuspectedMidSnapshot, wantNextLook: time.Minute},
@@ -383,7 +435,7 @@ func TestEvaluateRunway(t *testing.T) {
 // deadline known or not, runways on either side of zero and the
 // threshold, rotation and snapshot ages on either side of the waits, an
 // agent heard from just now, between heartbeats, or silent past the
-// budget, and every boolean.
+// budget, a connection's replay read or not, and every boolean.
 func runwaySweep(visit func(sandbox.RunwayFacts)) {
 	runways := []time.Duration{-time.Hour, -1, 0, 1, time.Minute, 13*time.Minute - 1, 13 * time.Minute, time.Hour}
 	sinces := []time.Duration{0, time.Minute, 2*time.Minute - 1, 2 * time.Minute, time.Hour}
@@ -403,13 +455,15 @@ func runwaySweep(visit func(sandbox.RunwayFacts)) {
 											for _, delivery := range bools {
 												for _, silence := range silences {
 													for _, midSnapshot := range bools {
-														visit(sandbox.RunwayFacts{
-															Status: status, DeadlineKnown: known, Runway: runway, Lifetime: lifetime,
-															TurnInFlight: inFlight, CanSnapshot: canSnapshot,
-															Rotating: rotating, RotationSnapshotPending: own, SinceRotationStart: since, RotationSnapshotTaken: taken,
-															SinceSnapshotStart: since, SinceLastSeen: silence, SuspectedMidSnapshot: midSnapshot,
-															DeliveryOpen: delivery, DeliveryRemaining: 3 * time.Minute,
-														})
+														for _, replay := range bools {
+															visit(sandbox.RunwayFacts{
+																Status: status, DeadlineKnown: known, Runway: runway, Lifetime: lifetime,
+																TurnInFlight: inFlight, CanSnapshot: canSnapshot,
+																Rotating: rotating, RotationSnapshotPending: own, SinceRotationStart: since, RotationSnapshotTaken: taken,
+																SinceSnapshotStart: since, SinceLastSeen: silence, SuspectedMidSnapshot: midSnapshot,
+																ReplayPending: replay, DeliveryOpen: delivery, DeliveryRemaining: 3 * time.Minute,
+															})
+														}
 													}
 												}
 											}
@@ -433,21 +487,24 @@ func runwaySweep(visit func(sandbox.RunwayFacts)) {
 //   - a snapshotting sandbox, or one suspected mid-snapshot, is never
 //     passed, so no prompt goes to a sandbox mid-snapshot, and never
 //     rotated, as it is snapshotting already;
-//   - a known deadline that has passed retires a live sandbox at once when
-//     its agent is silent, and never by the deadline row when it is heard
-//     from: a gen that outlives its estimate keeps its snapshot in
-//     progress and its delivery;
-//   - every retirement is of a rotating gen or of one past its deadline,
-//     the two a resume is ruled out for;
+//   - a known deadline that has passed, with the agent silent, suspects a
+//     ready or snapshotting sandbox and holds a suspect one through its
+//     grace, and never acts by the deadline row when the agent is heard
+//     from: a gen that outlives its estimate keeps its snapshot in progress
+//     and its delivery, and a silence is given the grace any silence is;
+//   - every retirement is of a rotating gen, which a resume is ruled out
+//     for, and never while a delivery is open unless the rotation's own
+//     snapshot missed its wait;
 //   - nothing is rotated with a turn in flight;
 //   - a rotation starts only from ready, over ready -> snapshotting;
 //   - a retirement starts only from a state the machine can take to
 //     stopped, through suspect;
-//   - a suspicion starts only from snapshotting, over snapshotting ->
-//     suspect, once the report wait has run, with the agent silent, and
-//     never of a rotation's own snapshot;
+//   - a suspicion starts only from ready or snapshotting, over the edge to
+//     suspect, with the agent silent: past the deadline, or once the report
+//     wait has run on a snapshot that is not a rotation's own;
 //   - a revert starts only from snapshotting, over snapshotting -> ready,
-//     once the report wait has run and the agent was heard from after it;
+//     once the report wait has run, the agent was heard from after it, and
+//     its connection's replay has been read;
 //   - a passed dispatch has at least the threshold of runway, unless the
 //     gate declined;
 //   - every hold or rotation names a positive next look: a hold always
@@ -477,17 +534,29 @@ func TestEvaluateRunway_Properties(t *testing.T) {
 		if midSnapshot && (d.Action == sandbox.RunwayPass || d.Action == sandbox.RunwayRotate) {
 			fail("a sandbox mid-snapshot is only held, retired, suspected or reverted")
 		}
-		if f.Status == sandbox.StateSuspect && f.SuspectedMidSnapshot && d.Action == sandbox.RunwayRetire && d.Reason != sandbox.RunwayReasonDeadlinePassed {
+		if f.Status == sandbox.StateSuspect && f.SuspectedMidSnapshot && d.Action == sandbox.RunwayRetire {
 			fail("a suspicion's grace cut short by a rotation row")
 		}
-		if live[f.Status] && pastDeadline && silent && (d.Action != sandbox.RunwayRetire || d.Reason != sandbox.RunwayReasonDeadlinePassed) {
-			fail("a live sandbox past its deadline with its agent silent is retired as such")
+		if f.Status == sandbox.StateSuspect && pastDeadline && silent && d.Action != sandbox.RunwayHold {
+			fail("a suspicion's grace cut short past the deadline")
 		}
-		if d.Reason == sandbox.RunwayReasonDeadlinePassed && !silent {
-			fail("retired at its deadline with its agent heard from")
+		if live[f.Status] && pastDeadline && silent {
+			want := sandbox.RunwaySuspect
+			if f.Status == sandbox.StateSuspect {
+				want = sandbox.RunwayHold
+			}
+			if d.Action != want || d.Reason != sandbox.RunwayReasonDeadlinePassed {
+				fail("a live sandbox past its deadline with its agent silent is suspected, or held through its grace")
+			}
 		}
-		if d.Action == sandbox.RunwayRetire && !f.Rotating && !pastDeadline {
-			fail("retired a gen neither rotating nor past its deadline: a resume is not ruled out for it")
+		if d.Reason == sandbox.RunwayReasonDeadlinePassed && (!silent || !pastDeadline) {
+			fail("acted at its deadline with its agent heard from")
+		}
+		if d.Action == sandbox.RunwayRetire && !f.Rotating {
+			fail("retired a gen not rotating: a resume is not ruled out for it")
+		}
+		if d.Action == sandbox.RunwayRetire && f.DeliveryOpen && d.Reason != sandbox.RunwayReasonRotationSnapshotNotReported {
+			fail("retired a gen while a delivery is open")
 		}
 		if f.TurnInFlight && d.Action == sandbox.RunwayRotate {
 			fail("rotated with a turn in flight")
@@ -513,19 +582,22 @@ func TestEvaluateRunway_Properties(t *testing.T) {
 				fail("no edge to stopped: %v", err)
 			}
 		case sandbox.RunwaySuspect:
-			if _, err := sandbox.Transition(f.Status, 1, sandbox.SuspectTrigger()); err != nil || f.Status != sandbox.StateSnapshotting {
+			if _, err := sandbox.Transition(f.Status, 1, sandbox.SuspectTrigger()); err != nil || (f.Status != sandbox.StateSnapshotting && f.Status != sandbox.StateReady) {
 				fail("a suspicion starts from %s: %v", f.Status, err)
 			}
-			if !silent || f.SinceSnapshotStart < runwayConfig.ReportWait || (f.Rotating && f.RotationSnapshotPending) {
-				fail("suspected within the report wait, with its agent heard from, or a rotation's own snapshot")
+			if !silent {
+				fail("suspected with its agent heard from")
+			}
+			if !pastDeadline && (f.Status != sandbox.StateSnapshotting || f.SinceSnapshotStart < runwayConfig.ReportWait || (f.Rotating && f.RotationSnapshotPending)) {
+				fail("suspected before its deadline, other than a snapshot past its report wait that is not a rotation's own")
 			}
 		case sandbox.RunwayRevert:
 			if _, err := sandbox.Transition(f.Status, 1, sandbox.SnapshotCompleteTrigger()); err != nil || f.Status != sandbox.StateSnapshotting {
 				fail("a revert starts from %s: %v", f.Status, err)
 			}
 			if (f.Rotating && f.RotationSnapshotPending) || f.SinceSnapshotStart < runwayConfig.ReportWait || silent ||
-				f.SinceLastSeen >= f.SinceSnapshotStart-runwayConfig.ReportWait {
-				fail("reverted a rotation's own snapshot, within the report wait, or with its agent not heard from since the wait")
+				f.SinceLastSeen >= f.SinceSnapshotStart-runwayConfig.ReportWait || f.ReplayPending {
+				fail("reverted a rotation's own snapshot, within the report wait, with its agent not heard from since the wait, or before its connection's replay was read")
 			}
 			if d.NextLook != 0 {
 				fail("a revert names no next look")

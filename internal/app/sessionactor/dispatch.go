@@ -963,9 +963,10 @@ func (a *Actor) planReenqueueOrRespawn(
 		// Technical plan §35.3: the gate, with a turn in flight
 		// (runway.go). Nothing is rotated under it (row 10), so it consumes
 		// none of the turn's turn_deadline; a gen past its deadline whose
-		// agent is silent, or one a rotation is already under way on, is
-		// retired before the prompt is sent to it, and the next evaluation
-		// re-sends it to the replacement. Before the checkout, as for a pending turn. The
+		// agent is silent is suspected, through its terminal grace, and one
+		// a rotation is already under way on is retired, before the prompt
+		// is sent to it, and the evaluation after either re-sends it to the
+		// replacement. Before the checkout, as for a pending turn. The
 		// receipt re-send above is never gated: the turn may be running on
 		// that gen.
 		runway, err := a.applyRunwayGate(ctx, tx, sessionRow, sandboxRow, true)

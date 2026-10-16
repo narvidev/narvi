@@ -34,6 +34,12 @@ type runwaySeed struct {
 	deliveryStartedAgo *time.Duration
 	pendingSnapshotID  *string
 	preSuspectStatus   *string
+	// startForAnother stamps the snapshot's start for another command
+	// than the pending one; by default it is stamped for the pending one.
+	startForAnother bool
+	// heartbeats is how many heartbeats are counted since the latest
+	// ready; nil for none recorded (a NULL count).
+	heartbeats *int32
 }
 
 func durp(d time.Duration) *time.Duration { return &d }
@@ -61,11 +67,14 @@ func seedRunwayRow(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessio
 		last_seen_at = now() - make_interval(secs => $13::double precision),
 		created_at = now() - make_interval(secs => $14::double precision),
 		pr_delivery_started_at = now() - make_interval(secs => $15::double precision),
-		pending_snapshot_message_id = $16, rotation_message_id = $17, pre_suspect_status = $18::sandbox_status
+		pending_snapshot_message_id = $16, rotation_message_id = $17, pre_suspect_status = $18::sandbox_status,
+		snapshot_start_message_id = CASE WHEN $19::boolean THEN 'another-command' ELSE $16 END,
+		heartbeat_ready_seq = CASE WHEN $20::integer IS NULL THEN NULL ELSE ready_seq END, heartbeats_since_ready = $20
 		WHERE session_id = $1`,
 		sessionID, s.gen, s.status, secs(s.deadlineFromNow), s.deadlineGen, s.lifetimeSeconds,
 		s.rotationGen, secs(s.rotationAgo), s.snapshotID, s.provenanceID, secs(s.mintedAgo), secs(s.snapshotStartAgo),
-		secs(s.lastSeenAgo), s.createdAgo.Seconds(), secs(s.deliveryStartedAgo), s.pendingSnapshotID, s.rotationMessageID, s.preSuspectStatus); err != nil {
+		secs(s.lastSeenAgo), s.createdAgo.Seconds(), secs(s.deliveryStartedAgo), s.pendingSnapshotID, s.rotationMessageID, s.preSuspectStatus,
+		s.startForAnother, s.heartbeats); err != nil {
 		t.Fatalf("seed the sandbox: %v", err)
 	}
 }
@@ -83,9 +92,11 @@ func near(got int64, want time.Duration) bool {
 // of the live gen, the snapshot in progress the rotation's own only while
 // its pending command is the one the rotation sent, its snapshot taken only
 // when recorded with its provenance at or after the rotation started, a
-// snapshot's start when one is recorded, the last sign of life (created_at
-// when there is none yet), a suspect sandbox suspected mid-snapshot only
-// when it was snapshotting, and a delivery's stamp with the database's now.
+// snapshot's start when one is recorded for the pending command, the last
+// sign of life (created_at when there is none yet), a suspect sandbox
+// suspected mid-snapshot only when it was snapshotting, the replay read
+// only once two heartbeats are counted since the latest ready, and a
+// delivery's stamp with the database's now.
 func TestGetSandboxRunway_ReadsEveryFactOnTheDatabaseClock(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -93,7 +104,7 @@ func TestGetSandboxRunway_ReadsEveryFactOnTheDatabaseClock(t *testing.T) {
 
 	base := func() runwaySeed {
 		return runwaySeed{gen: 2, status: "ready", deadlineFromNow: durp(30 * time.Minute), deadlineGen: i32p(2), lifetimeSeconds: i32p(7200),
-			lastSeenAgo: durp(10 * time.Second), createdAgo: time.Hour}
+			lastSeenAgo: durp(10 * time.Second), createdAgo: time.Hour, heartbeats: i32p(2)}
 	}
 	tests := []struct {
 		name  string
@@ -104,7 +115,7 @@ func TestGetSandboxRunway_ReadsEveryFactOnTheDatabaseClock(t *testing.T) {
 			if r.Gen != 2 || r.Status != sqlcgen.SandboxStatusReady || !r.DeadlineKnown || !near(r.RunwayNanos, 30*time.Minute) || r.LifetimeSeconds != 7200 {
 				t.Fatalf("%+v: want gen 2 ready, 30m of runway known, lifetime 7200", r)
 			}
-			if r.Rotating || r.RotationSnapshotPending || r.RotationSnapshotTaken || r.SnapshotStartKnown || r.SuspectedMidSnapshot ||
+			if r.Rotating || r.RotationSnapshotPending || r.RotationSnapshotTaken || r.SnapshotStartKnown || r.SuspectedMidSnapshot || r.ReplayPending ||
 				!near(r.SinceLastSeenNanos, 10*time.Second) || r.PrDeliveryStartedAt.Valid || !r.ObservedAt.Valid {
 				t.Fatalf("%+v: want nothing rotating or snapshotting, seen 10s ago, no delivery, the database's now", r)
 			}
@@ -219,6 +230,23 @@ func TestGetSandboxRunway_ReadsEveryFactOnTheDatabaseClock(t *testing.T) {
 				t.Fatalf("%+v: want no start known", r)
 			}
 		}},
+		{name: "a start stamped for another command times no other snapshot", seed: func(s *runwaySeed) {
+			s.status, s.pendingSnapshotID, s.snapshotStartAgo, s.startForAnother = "snapshotting", strpRunway("cmd"), durp(6*time.Minute), true
+		}, check: func(t *testing.T, r sqlcgen.GetSandboxRunwayRow) {
+			if r.SnapshotStartKnown {
+				t.Fatalf("%+v: want no start known for the pending command", r)
+			}
+		}},
+		{name: "no heartbeat counted: the replay is pending", seed: func(s *runwaySeed) { s.heartbeats = nil }, check: func(t *testing.T, r sqlcgen.GetSandboxRunwayRow) {
+			if !r.ReplayPending {
+				t.Fatalf("%+v: want the replay pending", r)
+			}
+		}},
+		{name: "one heartbeat since the ready: the replay is pending", seed: func(s *runwaySeed) { s.heartbeats = i32p(1) }, check: func(t *testing.T, r sqlcgen.GetSandboxRunwayRow) {
+			if !r.ReplayPending {
+				t.Fatalf("%+v: want the replay pending", r)
+			}
+		}},
 		{name: "never seen: since its creation", seed: func(s *runwaySeed) { s.lastSeenAgo = nil }, check: func(t *testing.T, r sqlcgen.GetSandboxRunwayRow) {
 			if !near(r.SinceLastSeenNanos, time.Hour) {
 				t.Fatalf("%+v: want silent since its creation, an hour", r)
@@ -268,7 +296,8 @@ func TestStartSandboxRotation_RecordsTheRotationOfTheLiveGen(t *testing.T) {
 	}
 	if row.RotationGen == nil || *row.RotationGen != 3 || !row.RotationStartedAt.Valid || !row.SnapshotStartedAt.Valid ||
 		row.PendingSnapshotMessageID == nil || *row.PendingSnapshotMessageID != "cmd-rotation" ||
-		row.RotationMessageID == nil || *row.RotationMessageID != "cmd-rotation" {
+		row.RotationMessageID == nil || *row.RotationMessageID != "cmd-rotation" ||
+		row.SnapshotStartMessageID == nil || *row.SnapshotStartMessageID != "cmd-rotation" {
 		t.Fatalf("row after the start: rotation %v (%v) started %v snapshot start %v pending %v; want gen 3, cmd-rotation, both starts, cmd-rotation pending",
 			row.RotationGen, row.RotationMessageID, row.RotationStartedAt.Valid, row.SnapshotStartedAt.Valid, row.PendingSnapshotMessageID)
 	}
@@ -332,20 +361,22 @@ func TestUpdateSandboxPendingSnapshotMessageID_StartsAndForgetsTheSnapshot(t *te
 
 	cmd := "cmd-1"
 	row, err := store.UpdatePendingSnapshotMessageID(ctx, sqlcgen.UpdateSandboxPendingSnapshotMessageIDParams{SessionID: sessionID, PendingSnapshotMessageID: &cmd})
-	if err != nil || !row.SnapshotStartedAt.Valid || row.PendingSnapshotMessageID == nil || *row.PendingSnapshotMessageID != cmd {
-		t.Fatalf("after setting the pending command: start %v pending %v (%v); want both set", row.SnapshotStartedAt.Valid, row.PendingSnapshotMessageID, err)
+	if err != nil || !row.SnapshotStartedAt.Valid || row.PendingSnapshotMessageID == nil || *row.PendingSnapshotMessageID != cmd ||
+		row.SnapshotStartMessageID == nil || *row.SnapshotStartMessageID != cmd {
+		t.Fatalf("after setting the pending command: start %v (for %v) pending %v (%v); want all set, the start stamped for it",
+			row.SnapshotStartedAt.Valid, row.SnapshotStartMessageID, row.PendingSnapshotMessageID, err)
 	}
 	row, err = store.UpdatePendingSnapshotMessageID(ctx, sqlcgen.UpdateSandboxPendingSnapshotMessageIDParams{SessionID: sessionID})
-	if err != nil || row.SnapshotStartedAt.Valid || row.PendingSnapshotMessageID != nil {
-		t.Fatalf("after clearing the pending command: start %v pending %v (%v); want both cleared", row.SnapshotStartedAt.Valid, row.PendingSnapshotMessageID, err)
+	if err != nil || row.SnapshotStartedAt.Valid || row.PendingSnapshotMessageID != nil || row.SnapshotStartMessageID != nil {
+		t.Fatalf("after clearing the pending command: start %v (for %v) pending %v (%v); want all cleared", row.SnapshotStartedAt.Valid, row.SnapshotStartMessageID, row.PendingSnapshotMessageID, err)
 	}
 	if _, err := store.UpdatePendingSnapshotMessageID(ctx, sqlcgen.UpdateSandboxPendingSnapshotMessageIDParams{SessionID: sessionID, PendingSnapshotMessageID: &cmd}); err != nil {
 		t.Fatal(err)
 	}
 	snapshot := "snap-1"
 	row, err = store.UpdateSnapshotID(ctx, sqlcgen.UpdateSandboxSnapshotIDParams{SessionID: sessionID, SnapshotID: &snapshot})
-	if err != nil || row.SnapshotStartedAt.Valid || row.PendingSnapshotMessageID != nil {
-		t.Fatalf("after the snapshot's record: start %v pending %v (%v); want both cleared", row.SnapshotStartedAt.Valid, row.PendingSnapshotMessageID, err)
+	if err != nil || row.SnapshotStartedAt.Valid || row.PendingSnapshotMessageID != nil || row.SnapshotStartMessageID != nil {
+		t.Fatalf("after the snapshot's record: start %v (for %v) pending %v (%v); want all cleared", row.SnapshotStartedAt.Valid, row.SnapshotStartMessageID, row.PendingSnapshotMessageID, err)
 	}
 }
 
@@ -358,15 +389,107 @@ func TestUpsertSandboxForSpawn_ClearsTheRotation(t *testing.T) {
 	store := narvipg.NewSandboxStore(pool)
 	sessionID := createTestSession(ctx, t, pool)
 	seedRunwayRow(ctx, t, pool, sessionID, runwaySeed{gen: 1, status: "stopped", rotationGen: i32p(1), rotationMessageID: strpRunway("cmd-rotation"),
-		rotationAgo: durp(time.Minute), snapshotStartAgo: durp(time.Minute)})
+		rotationAgo: durp(time.Minute), snapshotStartAgo: durp(time.Minute), startForAnother: true, heartbeats: i32p(2)})
 
 	hash := "token-hash-gen-2"
 	row, err := store.UpsertForSpawn(ctx, sqlcgen.UpsertSandboxForSpawnParams{SessionID: sessionID, TokenHash: &hash, LifetimeSeconds: i32p(7200)})
 	if err != nil {
 		t.Fatalf("UpsertForSpawn: %v", err)
 	}
-	if row.Gen != 2 || row.RotationGen != nil || row.RotationMessageID != nil || row.RotationStartedAt.Valid || row.SnapshotStartedAt.Valid {
-		t.Fatalf("after the claim: gen %d rotation %v (%v) started %v snapshot start %v; want gen 2 with none",
-			row.Gen, row.RotationGen, row.RotationMessageID, row.RotationStartedAt.Valid, row.SnapshotStartedAt.Valid)
+	if row.Gen != 2 || row.RotationGen != nil || row.RotationMessageID != nil || row.RotationStartedAt.Valid || row.SnapshotStartedAt.Valid ||
+		row.SnapshotStartMessageID != nil || row.HeartbeatReadySeq != nil || row.HeartbeatsSinceReady != nil {
+		t.Fatalf("after the claim: gen %d rotation %v (%v) started %v snapshot start %v (for %v) heartbeats %v since ready %v; want gen 2 with none",
+			row.Gen, row.RotationGen, row.RotationMessageID, row.RotationStartedAt.Valid, row.SnapshotStartedAt.Valid, row.SnapshotStartMessageID,
+			row.HeartbeatsSinceReady, row.HeartbeatReadySeq)
 	}
+}
+
+// TestStampSandboxSnapshotStart_AStartStampedForAnotherCommandIsReplaced:
+// the previous binary starts a snapshot by setting the pending command
+// alone, so the row can carry the start of an earlier snapshot (technical
+// plan §35.3, round-2 F2). That start is not the pending snapshot's: the
+// first look stamps one of its own, for its command, and the runway read
+// then knows it.
+func TestStampSandboxSnapshotStart_AStartStampedForAnotherCommandIsReplaced(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	store := narvipg.NewSandboxStore(pool)
+	sessionID := createTestSession(ctx, t, pool)
+	seedRunwayRow(ctx, t, pool, sessionID, runwaySeed{gen: 1, status: "snapshotting", pendingSnapshotID: strpRunway("post-turn-by-previous"),
+		snapshotStartAgo: durp(6 * time.Minute), startForAnother: true, heartbeats: i32p(2)})
+
+	stamped, err := store.StampSnapshotStart(ctx, sessionID, 1)
+	if err != nil || !stamped {
+		t.Fatalf("StampSnapshotStart = %v, %v; want the start replaced", stamped, err)
+	}
+	r, err := store.Runway(ctx, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !r.SnapshotStartKnown || !near(r.SinceSnapshotStartNanos, 0) {
+		t.Fatalf("start known %v, %v ago; want a start of its own, now", r.SnapshotStartKnown, time.Duration(r.SinceSnapshotStartNanos))
+	}
+	row, err := store.Get(ctx, sessionID)
+	if err != nil || row.SnapshotStartMessageID == nil || *row.SnapshotStartMessageID != "post-turn-by-previous" {
+		t.Fatalf("start stamped for %v (%v), want post-turn-by-previous", row.SnapshotStartMessageID, err)
+	}
+	if again, err := store.StampSnapshotStart(ctx, sessionID, 1); err != nil || again {
+		t.Fatalf("a second StampSnapshotStart = %v, %v; want nothing: the start is its own now", again, err)
+	}
+}
+
+// TestCountSandboxHeartbeat_CountsTwoSinceTheReady: the runway read's
+// replay_pending (technical plan §35.3, round-2 F1) holds until two
+// heartbeats of the live gen are counted since its latest ready, whichever
+// binary recorded that ready: a ready moves ready_seq, and the count
+// starts again at the next heartbeat. Another gen's heartbeat counts
+// nothing.
+func TestCountSandboxHeartbeat_CountsTwoSinceTheReady(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	store := narvipg.NewSandboxStore(pool)
+	sessionID := createTestSession(ctx, t, pool)
+	seedRunwayRow(ctx, t, pool, sessionID, runwaySeed{gen: 3, status: "snapshotting", lastSeenAgo: durp(time.Second)})
+
+	pending := func(want bool, when string) {
+		t.Helper()
+		r, err := store.Runway(ctx, sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if r.ReplayPending != want {
+			t.Fatalf("%s: replay pending %v, want %v", when, r.ReplayPending, want)
+		}
+	}
+	heartbeat := func(gen int32) {
+		t.Helper()
+		if err := store.CountHeartbeat(ctx, sessionID, gen); err != nil {
+			t.Fatalf("CountHeartbeat: %v", err)
+		}
+	}
+	pending(true, "no heartbeat counted yet")
+	heartbeat(3)
+	pending(true, "one heartbeat")
+	heartbeat(2)
+	pending(true, "one heartbeat and another gen's")
+	heartbeat(3)
+	pending(false, "two heartbeats")
+	heartbeat(3)
+	pending(false, "three heartbeats")
+
+	// A reconnect: this release's ready, then the previous binary's, which
+	// moves ready_seq alone.
+	if err := store.RecordReady(ctx, sessionID, 3, false, false, nil); err != nil {
+		t.Fatal(err)
+	}
+	pending(true, "a ready since")
+	heartbeat(3)
+	pending(true, "one heartbeat since the ready")
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET ready_seq = ready_seq + 1 WHERE session_id = $1`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	heartbeat(3)
+	pending(true, "one heartbeat since a ready the previous binary recorded")
+	heartbeat(3)
+	pending(false, "two heartbeats since it")
 }

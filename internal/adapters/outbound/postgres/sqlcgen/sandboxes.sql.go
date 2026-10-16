@@ -15,7 +15,7 @@ const cancelSandboxPendingPush = `-- name: CancelSandboxPendingPush :one
 UPDATE sandboxes
 SET pending_push_cancelled = true, updated_at = now()
 WHERE session_id = $1 AND pending_push_suppressed_in_shadow IS NOT NULL
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 // §30.4's own "demotion ... must cancel in-flight push signals" -- sets
@@ -74,6 +74,9 @@ func (q *Queries) CancelSandboxPendingPush(ctx context.Context, sessionID pgtype
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -82,7 +85,7 @@ const clearSandboxDemotionTerminationRequested = `-- name: ClearSandboxDemotionT
 UPDATE sandboxes
 SET demotion_terminate_requested_at = NULL, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 // Consumes a sandbox's own demotion-termination request once
@@ -137,6 +140,9 @@ func (q *Queries) ClearSandboxDemotionTerminationRequested(ctx context.Context, 
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -145,7 +151,7 @@ const clearSandboxPendingPush = `-- name: ClearSandboxPendingPush :one
 UPDATE sandboxes
 SET pending_push_suppressed_in_shadow = NULL, pending_push_cancelled = false, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 // Consumes this sandbox's own persisted push/PR decision -- called by
@@ -202,6 +208,9 @@ func (q *Queries) ClearSandboxPendingPush(ctx context.Context, sessionID pgtype.
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -264,11 +273,40 @@ func (q *Queries) ClearSandboxStopRetireGen(ctx context.Context, sessionID pgtyp
 	return err
 }
 
+const countSandboxHeartbeat = `-- name: CountSandboxHeartbeat :exec
+UPDATE sandboxes
+SET heartbeats_since_ready = CASE WHEN heartbeat_ready_seq IS NOT DISTINCT FROM ready_seq
+                                  THEN COALESCE(heartbeats_since_ready, 0) + 1 ELSE 1 END,
+    heartbeat_ready_seq = ready_seq,
+    updated_at = now()
+WHERE session_id = $1 AND gen = $2::integer
+  AND (heartbeat_ready_seq IS DISTINCT FROM ready_seq OR COALESCE(heartbeats_since_ready, 0) < 2)
+`
+
+type CountSandboxHeartbeatParams struct {
+	SessionID pgtype.UUID `json:"session_id"`
+	Gen       int32       `json:"gen"`
+}
+
+// Technical plan §35.3: counts a heartbeat of gen $gen since the latest
+// ready (migrations/000171), up to two, which is all the runway gate reads
+// (GetSandboxRunway's replay_pending): the agent sends at most one
+// heartbeat between a connection's ready and its replay of unacked frames,
+// so the second comes after the replay. A ready moves ready_seq, and the
+// count then starts again at this heartbeat. handleSandboxEvent calls it in
+// the transaction that stores the heartbeat. Once two are counted for the
+// current ready the row no longer matches, so a steady heartbeat writes
+// nothing. Gen-fenced, like RecordSandboxReady.
+func (q *Queries) CountSandboxHeartbeat(ctx context.Context, arg CountSandboxHeartbeatParams) error {
+	_, err := q.db.Exec(ctx, countSandboxHeartbeat, arg.SessionID, arg.Gen)
+	return err
+}
+
 const createSandbox = `-- name: CreateSandbox :one
 
 INSERT INTO sandboxes (session_id)
 VALUES ($1)
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 // Queries backing SandboxStore (§4.3). Just enough to prove the pipeline
@@ -321,6 +359,9 @@ func (q *Queries) CreateSandbox(ctx context.Context, sessionID pgtype.UUID) (San
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -341,7 +382,7 @@ func (q *Queries) EndSandboxPRDelivery(ctx context.Context, sessionID pgtype.UUI
 }
 
 const getSandbox = `-- name: GetSandbox :one
-SELECT id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at FROM sandboxes
+SELECT id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready FROM sandboxes
 WHERE session_id = $1
 `
 
@@ -392,6 +433,9 @@ func (q *Queries) GetSandbox(ctx context.Context, sessionID pgtype.UUID) (Sandbo
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -469,10 +513,12 @@ SELECT gen, status,
        (rotation_gen IS NOT DISTINCT FROM gen AND snapshot_id IS NOT NULL AND snapshot_provenance_id IS NOT DISTINCT FROM snapshot_id
           AND snapshot_minted_at IS NOT NULL AND rotation_started_at IS NOT NULL
           AND snapshot_minted_at >= rotation_started_at)::boolean AS rotation_snapshot_taken,
-       (snapshot_started_at IS NOT NULL)::boolean AS snapshot_start_known,
+       (snapshot_started_at IS NOT NULL
+          AND snapshot_start_message_id IS NOT DISTINCT FROM pending_snapshot_message_id)::boolean AS snapshot_start_known,
        COALESCE((EXTRACT(EPOCH FROM (now() - snapshot_started_at)) * 1000000000)::bigint, 0)::bigint AS since_snapshot_start_nanos,
        COALESCE((EXTRACT(EPOCH FROM (now() - COALESCE(last_seen_at, created_at))) * 1000000000)::bigint, 0)::bigint AS since_last_seen_nanos,
        (status = 'suspect' AND pre_suspect_status IS NOT DISTINCT FROM 'snapshotting')::boolean AS suspected_mid_snapshot,
+       (heartbeat_ready_seq IS DISTINCT FROM ready_seq OR COALESCE(heartbeats_since_ready, 0) < 2)::boolean AS replay_pending,
        pr_delivery_started_at,
        now()::timestamptz AS observed_at
 FROM sandboxes
@@ -493,6 +539,7 @@ type GetSandboxRunwayRow struct {
 	SinceSnapshotStartNanos int64              `json:"since_snapshot_start_nanos"`
 	SinceLastSeenNanos      int64              `json:"since_last_seen_nanos"`
 	SuspectedMidSnapshot    bool               `json:"suspected_mid_snapshot"`
+	ReplayPending           bool               `json:"replay_pending"`
 	PrDeliveryStartedAt     pgtype.Timestamptz `json:"pr_delivery_started_at"`
 	ObservedAt              pgtype.Timestamptz `json:"observed_at"`
 }
@@ -516,12 +563,17 @@ type GetSandboxRunwayRow struct {
 //     provenance, at or after the rotation started (000170's
 //     snapshot_minted_at) -- the rotation's own snapshot;
 //   - snapshot_start_known, since_snapshot_start_nanos: the start of the
-//     snapshot in progress (000171), and how long since;
+//     snapshot in progress (000171), and how long since -- known only when
+//     it was stamped for the pending command, so a start left by an
+//     earlier snapshot never times a later one;
 //   - since_last_seen_nanos: how long since the sandbox's last sign of life
 //     (last_seen_at, created_at when it has none yet), on the database's
 //     clock against a stamp the replica that stored the frame wrote;
 //   - suspected_mid_snapshot: suspect, and snapshotting when suspected
 //     (pre_suspect_status), so a recovery takes it back to snapshotting;
+//   - replay_pending: fewer than two heartbeats recorded since the latest
+//     ready (heartbeat_ready_seq against ready_seq), so the frames the
+//     agent replays on that connection may still be on their way;
 //   - pr_delivery_started_at and observed_at: a completed turn's open
 //     delivery, read as session.PRDeliveryOpen reads it.
 func (q *Queries) GetSandboxRunway(ctx context.Context, sessionID pgtype.UUID) (GetSandboxRunwayRow, error) {
@@ -541,6 +593,7 @@ func (q *Queries) GetSandboxRunway(ctx context.Context, sessionID pgtype.UUID) (
 		&i.SinceSnapshotStartNanos,
 		&i.SinceLastSeenNanos,
 		&i.SuspectedMidSnapshot,
+		&i.ReplayPending,
 		&i.PrDeliveryStartedAt,
 		&i.ObservedAt,
 	)
@@ -637,7 +690,7 @@ func (q *Queries) ListLiveSandboxesWithSessionRepos(ctx context.Context) ([]List
 }
 
 const listSandboxesPendingDemotionTermination = `-- name: ListSandboxesPendingDemotionTermination :many
-SELECT id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at FROM sandboxes WHERE demotion_terminate_requested_at IS NOT NULL
+SELECT id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready FROM sandboxes WHERE demotion_terminate_requested_at IS NOT NULL
 `
 
 // app/reconciler.Reconciler's own new demotion-sweep tick reads every
@@ -699,6 +752,9 @@ func (q *Queries) ListSandboxesPendingDemotionTermination(ctx context.Context) (
 			&i.RotationMessageID,
 			&i.RotationStartedAt,
 			&i.SnapshotStartedAt,
+			&i.SnapshotStartMessageID,
+			&i.HeartbeatReadySeq,
+			&i.HeartbeatsSinceReady,
 		); err != nil {
 			return nil, err
 		}
@@ -766,7 +822,7 @@ const markSandboxDemotionTerminationRequested = `-- name: MarkSandboxDemotionTer
 UPDATE sandboxes
 SET demotion_terminate_requested_at = now(), updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 // §30.4's own "demotion ... must terminate (or respawn) every sandbox of
@@ -821,6 +877,9 @@ func (q *Queries) MarkSandboxDemotionTerminationRequested(ctx context.Context, s
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -879,7 +938,7 @@ SET status = $2,
     last_seen_at = $3,
     updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 type RecoverSandboxFromSuspectParams struct {
@@ -953,6 +1012,9 @@ func (q *Queries) RecoverSandboxFromSuspect(ctx context.Context, arg RecoverSand
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -961,7 +1023,7 @@ const setSandboxPendingPush = `-- name: SetSandboxPendingPush :one
 UPDATE sandboxes
 SET pending_push_suppressed_in_shadow = $2, pending_push_cancelled = false, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 type SetSandboxPendingPushParams struct {
@@ -1026,6 +1088,9 @@ func (q *Queries) SetSandboxPendingPush(ctx context.Context, arg SetSandboxPendi
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -1053,9 +1118,12 @@ func (q *Queries) SetSandboxStopRetireGen(ctx context.Context, arg SetSandboxSto
 
 const stampSandboxSnapshotStart = `-- name: StampSandboxSnapshotStart :execrows
 UPDATE sandboxes
-SET snapshot_started_at = now(), updated_at = now()
+SET snapshot_started_at = now(),
+    snapshot_start_message_id = pending_snapshot_message_id,
+    updated_at = now()
 WHERE session_id = $1 AND gen = $2::integer
-  AND status = 'snapshotting' AND snapshot_started_at IS NULL
+  AND status = 'snapshotting'
+  AND (snapshot_started_at IS NULL OR snapshot_start_message_id IS DISTINCT FROM pending_snapshot_message_id)
 `
 
 type StampSandboxSnapshotStartParams struct {
@@ -1063,11 +1131,13 @@ type StampSandboxSnapshotStartParams struct {
 	Gen       int32       `json:"gen"`
 }
 
-// Technical plan §35.3: gives a snapshot in progress that has no start --
-// one that was in progress when migration 000171 ran, or one the previous
-// binary started during a rolling deploy -- the database's now() as its
-// start, so the runway gate's wait for it runs from the first look. Only a
-// snapshotting row of the live gen with none recorded; 0 rows otherwise.
+// Technical plan §35.3: gives a snapshot in progress that has no start of
+// its own -- one that was in progress when migration 000171 ran, or one the
+// previous binary started during a rolling deploy, which carries no start
+// or the start of an earlier snapshot -- the database's now() as its start,
+// stamped for its pending command, so the runway gate's wait for it runs
+// from the first look. Only a snapshotting row of the live gen whose start
+// is missing or was stamped for another command; 0 rows otherwise.
 func (q *Queries) StampSandboxSnapshotStart(ctx context.Context, arg StampSandboxSnapshotStartParams) (int64, error) {
 	result, err := q.db.Exec(ctx, stampSandboxSnapshotStart, arg.SessionID, arg.Gen)
 	if err != nil {
@@ -1101,6 +1171,7 @@ SET rotation_gen = gen,
     rotation_started_at = now(),
     pending_snapshot_message_id = $1::text,
     snapshot_started_at = now(),
+    snapshot_start_message_id = $1::text,
     updated_at = now()
 WHERE session_id = $2 AND gen = $3::integer
 `
@@ -1117,9 +1188,9 @@ type StartSandboxRotationParams struct {
 // gen, the database's now() as its start, and the snapshot command's
 // messageId, as the rotation's own (rotation_message_id) and as the pending
 // snapshot, which the snapshot_ready that completes it must name
-// (handleSnapshotReadyEvent), with snapshot_started_at set as
-// UpdateSandboxPendingSnapshotMessageID sets it. Gen-fenced: 0 rows when
-// the row is no longer at that gen.
+// (handleSnapshotReadyEvent), with snapshot_started_at and
+// snapshot_start_message_id set as UpdateSandboxPendingSnapshotMessageID
+// sets them. Gen-fenced: 0 rows when the row is no longer at that gen.
 func (q *Queries) StartSandboxRotation(ctx context.Context, arg StartSandboxRotationParams) (int64, error) {
 	result, err := q.db.Exec(ctx, startSandboxRotation, arg.MessageID, arg.SessionID, arg.Gen)
 	if err != nil {
@@ -1184,7 +1255,7 @@ const updateSandboxCircuitBreaker = `-- name: UpdateSandboxCircuitBreaker :one
 UPDATE sandboxes
 SET spawn_failure_count = $2, last_spawn_failure_at = $3, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 type UpdateSandboxCircuitBreakerParams struct {
@@ -1248,6 +1319,9 @@ func (q *Queries) UpdateSandboxCircuitBreaker(ctx context.Context, arg UpdateSan
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -1256,7 +1330,7 @@ const updateSandboxImageDecision = `-- name: UpdateSandboxImageDecision :one
 UPDATE sandboxes
 SET image_decision_reason = $2, image_decision_fingerprint = $3, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 type UpdateSandboxImageDecisionParams struct {
@@ -1326,6 +1400,9 @@ func (q *Queries) UpdateSandboxImageDecision(ctx context.Context, arg UpdateSand
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -1334,9 +1411,10 @@ const updateSandboxPendingSnapshotMessageID = `-- name: UpdateSandboxPendingSnap
 UPDATE sandboxes
 SET pending_snapshot_message_id = $1::text,
     snapshot_started_at = CASE WHEN $1::text IS NULL THEN NULL ELSE now() END,
+    snapshot_start_message_id = $1::text,
     updated_at = now()
 WHERE session_id = $2
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 type UpdateSandboxPendingSnapshotMessageIDParams struct {
@@ -1362,8 +1440,12 @@ type UpdateSandboxPendingSnapshotMessageIDParams struct {
 // with it, in this statement, to the database's now() when an id is set,
 // and cleared with it when NULL: the start of the snapshot the id names,
 // which the runway gate bounds a pending turn's wait by
-// (SnapshotReportWait). Every snapshot start sets an id -- a report is
-// accepted only against one -- so every snapshot gets a start.
+// (SnapshotReportWait). snapshot_start_message_id records that id, so the
+// start counts only for it: a snapshot the previous binary starts sets the
+// id alone, and reads as having no start until the gate's first look
+// stamps one (StampSandboxSnapshotStart). Every snapshot start sets an id
+// -- a report is accepted only against one -- so every snapshot gets a
+// start.
 func (q *Queries) UpdateSandboxPendingSnapshotMessageID(ctx context.Context, arg UpdateSandboxPendingSnapshotMessageIDParams) (Sandbox, error) {
 	row := q.db.QueryRow(ctx, updateSandboxPendingSnapshotMessageID, arg.PendingSnapshotMessageID, arg.SessionID)
 	var i Sandbox
@@ -1411,6 +1493,9 @@ func (q *Queries) UpdateSandboxPendingSnapshotMessageID(ctx context.Context, arg
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -1419,7 +1504,7 @@ const updateSandboxProviderID = `-- name: UpdateSandboxProviderID :one
 UPDATE sandboxes
 SET provider_id = $2, updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 type UpdateSandboxProviderIDParams struct {
@@ -1479,6 +1564,9 @@ func (q *Queries) UpdateSandboxProviderID(ctx context.Context, arg UpdateSandbox
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -1489,13 +1577,14 @@ SET snapshot_id = $1,
     snapshot_suppressed_in_shadow = $2,
     pending_snapshot_message_id = NULL,
     snapshot_started_at = NULL,
+    snapshot_start_message_id = NULL,
     snapshot_provenance_id = $1,
     snapshot_agent_protocol = $3,
     snapshot_runtime_version = $4,
     snapshot_minted_at = now(),
     updated_at = now()
 WHERE session_id = $5
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 type UpdateSandboxSnapshotIDParams struct {
@@ -1545,9 +1634,9 @@ type UpdateSandboxSnapshotIDParams struct {
 // version the control plane holds. Named arguments only: sqlc does not
 // mix them with $n.
 //
-// snapshot_started_at (technical plan §35.3, migrations/000171) goes with
-// pending_snapshot_message_id: the snapshot it timed is the one recorded
-// here, and none is in progress any more.
+// snapshot_started_at and snapshot_start_message_id (technical plan §35.3,
+// migrations/000171) go with pending_snapshot_message_id: the snapshot they
+// timed is the one recorded here, and none is in progress any more.
 func (q *Queries) UpdateSandboxSnapshotID(ctx context.Context, arg UpdateSandboxSnapshotIDParams) (Sandbox, error) {
 	row := q.db.QueryRow(ctx, updateSandboxSnapshotID,
 		arg.SnapshotID,
@@ -1601,6 +1690,9 @@ func (q *Queries) UpdateSandboxSnapshotID(ctx context.Context, arg UpdateSandbox
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -1613,7 +1705,7 @@ SET status = $2,
     image_digest = COALESCE($5, image_digest),
     updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 type UpdateSandboxStatusParams struct {
@@ -1690,6 +1782,9 @@ func (q *Queries) UpdateSandboxStatus(ctx context.Context, arg UpdateSandboxStat
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -1700,7 +1795,7 @@ SET status = 'suspect',
     pre_suspect_status = $2,
     updated_at = now()
 WHERE session_id = $1
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 type UpdateSandboxStatusToSuspectParams struct {
@@ -1768,6 +1863,9 @@ func (q *Queries) UpdateSandboxStatusToSuspect(ctx context.Context, arg UpdateSa
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }
@@ -1794,6 +1892,9 @@ SET gen = sandboxes.gen + 1,
     rotation_message_id = NULL,
     rotation_started_at = NULL,
     snapshot_started_at = NULL,
+    snapshot_start_message_id = NULL,
+    heartbeat_ready_seq = NULL,
+    heartbeats_since_ready = NULL,
     lifetime_deadline_at = CASE
         WHEN $3::integer IS NOT NULL THEN EXCLUDED.lifetime_deadline_at
         WHEN sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.lifetime_deadline_at
@@ -1807,7 +1908,7 @@ SET gen = sandboxes.gen + 1,
           OR sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.gen + 1
     END,
     updated_at = now()
-RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at
+RETURNING id, session_id, gen, status, last_seen_at, created_at, updated_at, token_hash, provider_id, spawn_failure_count, last_spawn_failure_at, snapshot_id, pending_snapshot_message_id, pre_suspect_status, snapshot_suppressed_in_shadow, pending_push_suppressed_in_shadow, pending_push_cancelled, demotion_terminate_requested_at, agent_version, image_digest, image_decision_reason, image_decision_fingerprint, pr_delivery_started_at, boot_evidence_gen, booting_since, booting_since_gen, stop_retire_gen, prompt_receipt_gen, ready_seq, agent_max_frame_bytes, agent_max_frame_bytes_gen, lifetime_deadline_at, lifetime_seconds, lifetime_deadline_gen, review_checkout_gen, snapshot_provenance_id, snapshot_agent_protocol, snapshot_runtime_version, snapshot_minted_at, rotation_gen, rotation_message_id, rotation_started_at, snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq, heartbeats_since_ready
 `
 
 type UpsertSandboxForSpawnParams struct {
@@ -1901,12 +2002,13 @@ type UpsertSandboxForSpawnParams struct {
 // already be past. lifetime_deadline_gen records which gen the deadline is
 // for; the deadline counts only while it equals gen.
 //
-// rotation_gen, rotation_message_id, rotation_started_at and
-// snapshot_started_at (technical plan §35.3, migrations/000171) are cleared
-// too: a rotation and a snapshot in progress are the replaced gen's, and
-// the new gen has neither. Hygiene only for the rotation: rotation_gen
-// counts only while it equals gen, so the bump alone makes a value left
-// over read "not rotating".
+// rotation_gen, rotation_message_id, rotation_started_at,
+// snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq and
+// heartbeats_since_ready (technical plan §35.3, migrations/000171) are
+// cleared too: a rotation, a snapshot in progress and a connection's
+// heartbeats are the replaced gen's, and the new gen has none. Hygiene
+// only for the rotation: rotation_gen counts only while it equals gen, so
+// the bump alone makes a value left over read "not rotating".
 //
 // A NULL lifetime_seconds is a resume's (planResume): the same provider
 // object, never younger than it was, so a fresh stamp would be later than
@@ -1962,6 +2064,9 @@ func (q *Queries) UpsertSandboxForSpawn(ctx context.Context, arg UpsertSandboxFo
 		&i.RotationMessageID,
 		&i.RotationStartedAt,
 		&i.SnapshotStartedAt,
+		&i.SnapshotStartMessageID,
+		&i.HeartbeatReadySeq,
+		&i.HeartbeatsSinceReady,
 	)
 	return i, err
 }

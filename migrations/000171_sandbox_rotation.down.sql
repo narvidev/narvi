@@ -1,9 +1,11 @@
 -- Reverses 000171_sandbox_rotation.up.sql. With the columns go any rotation
--- in progress and the start of any snapshot in progress. Nothing a binary
+-- in progress, the start of any snapshot in progress, and the count of
+-- heartbeats since a connection's ready. Nothing a binary
 -- without 000171 reads; a binary with it that runs 000171 again finds no
 -- rotation in progress -- a gen that was rotating is then rotated afresh
--- once it is ready again -- and gives a snapshot in progress a start at its
--- first look.
+-- once it is ready again -- gives a snapshot in progress a start at its
+-- first look, and counts heartbeats afresh, holding a give-up until the
+-- second.
 --
 -- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
 -- 000171. Do not run it against live pods of a binary that carries 000171,
@@ -24,6 +26,9 @@
 -- down runs again. Each drop is a catalog change: it rewrites nothing, but
 -- takes ACCESS EXCLUSIVE on sandboxes for the file's one implicit
 -- transaction.
+ALTER TABLE sandboxes DROP COLUMN IF EXISTS heartbeats_since_ready;
+ALTER TABLE sandboxes DROP COLUMN IF EXISTS heartbeat_ready_seq;
+ALTER TABLE sandboxes DROP COLUMN IF EXISTS snapshot_start_message_id;
 ALTER TABLE sandboxes DROP COLUMN IF EXISTS snapshot_started_at;
 ALTER TABLE sandboxes DROP COLUMN IF EXISTS rotation_started_at;
 ALTER TABLE sandboxes DROP COLUMN IF EXISTS rotation_message_id;

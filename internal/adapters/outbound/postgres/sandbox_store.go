@@ -290,12 +290,20 @@ func (s *SandboxStore) StartRotation(ctx context.Context, sessionID pgtype.UUID,
 	return n > 0, err
 }
 
-// StampSnapshotStart gives a snapshot of gen in progress with no start
-// recorded the database's now() as its start, and reports whether it did
-// -- see StampSandboxSnapshotStart's own generated doc comment.
+// StampSnapshotStart gives a snapshot of gen in progress with no start of
+// its own -- none recorded, or one stamped for another command -- the
+// database's now() as its start, and reports whether it did -- see
+// StampSandboxSnapshotStart's own generated doc comment.
 func (s *SandboxStore) StampSnapshotStart(ctx context.Context, sessionID pgtype.UUID, gen int32) (bool, error) {
 	n, err := s.q.StampSandboxSnapshotStart(ctx, sqlcgen.StampSandboxSnapshotStartParams{SessionID: sessionID, Gen: gen})
 	return n > 0, err
+}
+
+// CountHeartbeat counts a heartbeat of gen since the latest ready, up to
+// two (technical plan §35.3), when gen is still the sandbox's live gen --
+// see CountSandboxHeartbeat's own generated doc comment.
+func (s *SandboxStore) CountHeartbeat(ctx context.Context, sessionID pgtype.UUID, gen int32) error {
+	return s.q.CountSandboxHeartbeat(ctx, sqlcgen.CountSandboxHeartbeatParams{SessionID: sessionID, Gen: gen})
 }
 
 // ListLiveWithSessionRepos returns every live sandbox alongside its

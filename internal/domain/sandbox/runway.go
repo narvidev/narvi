@@ -86,6 +86,15 @@ type RunwayFacts struct {
 	// life (last_seen_at): its agent heartbeats on a loop of its own, so
 	// a long silence says the agent is gone, not that it is busy.
 	SinceLastSeen time.Duration
+	// ReplayPending is true while the frames the agent replays on its
+	// current connection may still be on their way: fewer than two
+	// heartbeats have been recorded since that connection's ready. On
+	// every connection the agent sends ready, then at most one heartbeat,
+	// then replays every critical frame the control plane has not acked --
+	// a snapshot's report among them -- and only then starts the
+	// heartbeat loop (wsbridge's runConnection), so the second heartbeat
+	// after a ready comes after every replayed frame.
+	ReplayPending bool
 	// SuspectedMidSnapshot is true when the sandbox is suspect and was
 	// snapshotting when it was suspected: a recovery takes it back to
 	// snapshotting, so it is no more sent a prompt than a snapshotting one.
@@ -139,12 +148,13 @@ const (
 	// command forgotten so a late report of it is ignored, and the next
 	// evaluation dispatches to it.
 	RunwayRevert RunwayAction = "revert"
-	// RunwaySuspect suspects a snapshotting sandbox whose agent has fallen
-	// silent, through the liveness path (§3.2's two-phase rule): suspect,
-	// terminal grace armed, the snapshot's command kept. A sign of life
-	// during the grace recovers it to snapshotting -- a replayed report
-	// then records the snapshot -- and a grace that runs out fails it, and
-	// the next evaluation restores or spawns its replacement.
+	// RunwaySuspect suspects a sandbox whose agent has fallen silent,
+	// through the liveness path (§3.2's two-phase rule): suspect, terminal
+	// grace armed, a snapshot's command kept. A sign of life during the
+	// grace recovers it -- an agent that reconnects sends ready and then
+	// replays an unacked report, which is then recorded (ReplayPending) --
+	// and a grace that runs out fails it, and the next evaluation restores
+	// or spawns its replacement.
 	RunwaySuspect RunwayAction = "suspect"
 )
 
@@ -191,14 +201,16 @@ type RunwayDecision struct {
 // HeartbeatBudget. The first row that matches decides:
 //
 //	 1  not ready, suspect or snapshotting                   pass     not_steady
-//	 2  deadline known and passed, the agent silent          retire   deadline_passed
+//	 2  deadline known and passed, the agent silent          suspect  deadline_passed
+//	2a  the same, already suspect                            hold     deadline_passed
 //	 3  rotating, its own snapshot pending, within the wait  hold     awaiting_rotation_snapshot
 //	 4  rotating, its own snapshot pending                   retire   rotation_snapshot_not_reported
+//	4a  rotating, not mid-snapshot, a delivery open          hold     delivery_open
 //	 5  rotating, not mid-snapshot, its snapshot taken       retire   rotation_snapshot_taken
 //	 6  rotating, not mid-snapshot                           retire   rotation_snapshot_failed
 //	 7  snapshotting, within the report wait                 hold     snapshot_in_progress
 //	7a  snapshotting, the agent silent                       suspect  snapshot_agent_silent
-//	7b  snapshotting, the agent heard from since the wait    revert   snapshot_not_reported
+//	7b  snapshotting, heard from since the wait, no replay   revert   snapshot_not_reported
 //	7c  snapshotting                                         hold     awaiting_sign_of_life
 //	7d  suspected while snapshotting                         hold     suspected_mid_snapshot
 //	 8  deadline unknown                                     pass     deadline_unknown (declined)
@@ -211,24 +223,29 @@ type RunwayDecision struct {
 //
 // "Mid-snapshot" is snapshotting, or suspected while snapshotting. A
 // snapshotting sandbox is never passed (rows 2 to 7c take every one), and
-// neither is one suspected mid-snapshot (row 2 or 7d), so no prompt goes to
-// a sandbox in the middle of a snapshot, and no rotation row cuts a
+// neither is one suspected mid-snapshot (row 2a or 7d), so no prompt goes
+// to a sandbox in the middle of a snapshot, and no rotation row cuts a
 // suspicion's grace short. Equality at the threshold passes. The declines
 // precede the delivery hold, so a hold never delays a dispatch that would
 // be declined anyway; a declined dispatch has less than the threshold of
 // runway, by design, so the queue never stalls on the gate. The delivery
 // hold exists because the agent runs push and snapshot one after the other
 // on its read loop, so a rotation's snapshot sent during a push would wait
-// behind it and outrun the snapshot wait.
+// behind it and outrun the snapshot wait. A rotating gen's own retirement
+// waits for an open delivery too (row 4a): stopping it would kill the
+// push.
 //
 // The deadline is the claim's conservative estimate, which a provider
-// that gives a sandbox longer outlives. So a passed deadline retires a gen
-// at once only when its agent is silent too -- the sandbox died at its
-// deadline. A gen past its deadline whose agent is still heard from is
-// treated as one below the threshold: a snapshot in progress and an open
-// delivery are waited for, never cut short, and then it is rotated through
-// its own snapshot, which keeps its work. Its holds are then bounded by
-// their own waits alone, since the deadline is behind them.
+// that gives a sandbox longer outlives. So a gen past it is given up only
+// when its agent is silent too, and then through the liveness path, as
+// any silence is: suspected (row 2), its grace run (row 2a), so a sign of
+// life recovers it -- silence can be frames that could not be recorded --
+// and a grace that runs out fails it. A gen past its deadline whose agent
+// is still heard from is treated as one below the threshold: a snapshot in
+// progress and an open delivery are waited for, never cut short, and then
+// it is rotated through its own snapshot, which keeps its work. Its holds
+// are then bounded by their own waits alone, since the deadline is behind
+// them.
 //
 // Rows 7 to 7d bound a snapshot that is not a rotation's. The agent
 // reports a failed mint with no frame at all, and one that dies mid-mint
@@ -237,23 +254,26 @@ type RunwayDecision struct {
 // past the heartbeat budget is suspected (row 7a) through the liveness
 // path, so a sign of life during its grace recovers it. Otherwise the
 // snapshot is given up (row 7b) only for an agent heard from after the
-// wait ended -- its heartbeats run apart from the read loop the snapshot
-// blocks, so a live one is heard within a heartbeat interval -- and an
-// agent not heard from since is held (row 7c) until it is, or until its
-// silence reaches the budget, so one that died partway through the wait
-// is suspected, never sent the turn. A rotation's own snapshot is the
-// rotation's (rows 3 and 4); another snapshot a rotating gen takes is
-// waited for like any other, and its report then retires the gen (row 5)
-// with that snapshot.
+// wait ended, and past its connection's replay: an agent that reconnects
+// sends ready before it replays the report it could not deliver, so the
+// ready is not yet a sign that no report is coming, and the revert waits
+// for the second heartbeat after it (ReplayPending). An agent not heard
+// from since the wait, or whose replay may still be coming, is held (row
+// 7c) until that is settled or its silence reaches the budget, so one that
+// died partway through the wait is suspected, never sent the turn. A
+// rotation's own snapshot is the rotation's (rows 3 and 4); another
+// snapshot a rotating gen takes is waited for like any other, and its
+// report then retires the gen (row 5) with that snapshot.
 //
-// Every retirement is of a rotating gen or of one past its deadline, the
-// two a resume is ruled out for (a resume carries the deadline forward,
-// technical plan §35.2). Every hold names a positive next look, so a hold
-// always ends. The delivery hold ends with the delivery's bound, not with
-// the push: a session whose repositories push past that bound still delays
-// the rotation's snapshot behind them, and when the snapshot then misses
-// the wait, row 4 retires the gen and the rotation falls back to the
-// previous snapshot (platform.Timeouts.RotationRunwayFloor's doc).
+// Every retirement is of a rotating gen, which a resume is ruled out for
+// (a resume carries the deadline forward, technical plan §35.2), and every
+// suspicion ends, when its grace runs out, in a failed sandbox, which is
+// never resumed. Every hold names a positive next look, so a hold always
+// ends. The delivery hold ends with the delivery's bound, not with the
+// push: a session whose repositories push past that bound still delays the
+// rotation's snapshot behind them, and when the snapshot then misses the
+// wait, row 4 retires the gen and the rotation falls back to the previous
+// snapshot (platform.Timeouts.RotationRunwayFloor's doc).
 func EvaluateRunway(f RunwayFacts, cfg RunwayConfig) RunwayDecision {
 	threshold := RotationThreshold(cfg.Floor, f.Lifetime)
 	decide := func(action RunwayAction, reason RunwayReason, nextLook time.Duration) RunwayDecision {
@@ -270,17 +290,22 @@ func EvaluateRunway(f RunwayFacts, cfg RunwayConfig) RunwayDecision {
 	snapshotting := f.Status == StateSnapshotting
 	midSnapshot := snapshotting || (f.Status == StateSuspect && f.SuspectedMidSnapshot)
 	silent := f.SinceLastSeen >= cfg.HeartbeatBudget
+	pastDeadline := f.DeadlineKnown && f.Runway <= 0
 	ownSnapshot := f.Rotating && f.RotationSnapshotPending && snapshotting
 
 	switch {
 	case f.Status != StateReady && f.Status != StateSuspect && !snapshotting:
 		return decide(RunwayPass, RunwayReasonNotSteady, 0)
-	case f.DeadlineKnown && f.Runway <= 0 && silent:
-		return decide(RunwayRetire, RunwayReasonDeadlinePassed, 0)
+	case pastDeadline && silent && f.Status == StateSuspect:
+		return decide(RunwayHold, RunwayReasonDeadlinePassed, cfg.Grace)
+	case pastDeadline && silent:
+		return decide(RunwaySuspect, RunwayReasonDeadlinePassed, 0)
 	case ownSnapshot && f.SinceRotationStart < cfg.SnapshotWait:
 		return decide(RunwayHold, RunwayReasonAwaitingRotationSnapshot, runwayOr(cfg.SnapshotWait-f.SinceRotationStart))
 	case ownSnapshot:
 		return decide(RunwayRetire, RunwayReasonRotationSnapshotNotReported, 0)
+	case f.Rotating && !midSnapshot && f.DeliveryOpen:
+		return decide(RunwayHold, RunwayReasonDeliveryOpen, runwayOr(f.DeliveryRemaining))
 	case f.Rotating && !midSnapshot && f.RotationSnapshotTaken:
 		return decide(RunwayRetire, RunwayReasonRotationSnapshotTaken, 0)
 	case f.Rotating && !midSnapshot:
@@ -289,7 +314,7 @@ func EvaluateRunway(f RunwayFacts, cfg RunwayConfig) RunwayDecision {
 		return decide(RunwayHold, RunwayReasonSnapshotInProgress, runwayOr(cfg.ReportWait-f.SinceSnapshotStart))
 	case snapshotting && silent:
 		return decide(RunwaySuspect, RunwayReasonSnapshotAgentSilent, 0)
-	case snapshotting && f.SinceLastSeen < f.SinceSnapshotStart-cfg.ReportWait:
+	case snapshotting && !f.ReplayPending && f.SinceLastSeen < f.SinceSnapshotStart-cfg.ReportWait:
 		return decide(RunwayRevert, RunwayReasonSnapshotNotReported, 0)
 	case snapshotting:
 		return decide(RunwayHold, RunwayReasonAwaitingSignOfLife, runwayOr(cfg.HeartbeatBudget-f.SinceLastSeen))

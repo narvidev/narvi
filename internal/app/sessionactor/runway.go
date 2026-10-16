@@ -36,15 +36,22 @@
 //     (recordRotationFallback).
 //
 // A sandbox past its deadline whose status still reads live, and whose
-// agent is silent, is retired the same way before anything is sent to it;
-// one whose agent is still heard from has outlived the claim's estimate,
-// and is rotated through its own snapshot once its snapshot in progress
-// and its delivery are done. A snapshot that is not a rotation's is
-// bounded by SnapshotReportWait, then read by its agent's silence:
-// suspected through the liveness path when the agent is silent (terminal
-// grace, recovered by any sign of life), given up -- the sandbox back to
-// ready -- when the agent was heard from after the wait, and held
-// otherwise until one or the other (EvaluateRunway's rows 7 to 7d).
+// agent is silent, is suspected through the liveness path before anything
+// is sent to it -- terminal grace, recovered by any sign of life, failed and
+// replaced when the grace runs out -- since silence can be frames that
+// could not be recorded; one whose agent is still heard from has outlived
+// the claim's estimate, and is rotated through its own snapshot once its
+// snapshot in progress and its delivery are done. A rotating gen's
+// retirement waits for an open delivery too. A snapshot that is not a
+// rotation's is bounded by SnapshotReportWait, then read by its agent's
+// silence: suspected through the liveness path when the agent is silent,
+// given up -- the sandbox back to ready -- when the agent was heard from
+// after the wait and past its connection's replay, and held otherwise
+// until one or the other (EvaluateRunway's rows 7 to 7d). An agent that
+// reconnects sends ready, then replays its unacked report, so a ready is
+// no sign that no report is coming: the give-up waits for the second
+// heartbeat after it (handleSandboxEvent counts them), and a replayed
+// report is recorded.
 //
 // # What the gate composes with
 //
@@ -164,6 +171,7 @@ func (a *Actor) runwayFacts(row sqlcgen.GetSandboxRunwayRow, inFlight bool) sand
 		RotationSnapshotTaken:   row.RotationSnapshotTaken,
 		SinceLastSeen:           time.Duration(row.SinceLastSeenNanos),
 		SuspectedMidSnapshot:    row.SuspectedMidSnapshot,
+		ReplayPending:           row.ReplayPending,
 	}
 	if row.LifetimeSeconds <= 0 {
 		facts.Lifetime = a.shortestLifetime()
@@ -202,26 +210,30 @@ func (a *Actor) canRotate(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Ses
 // or snapshotting -- before a turn is sent to it, and acts on the
 // decision (this file's top comment). inFlight is true when the turn to
 // send is already processing, re-sent to a newer gen: nothing is rotated
-// then (row 10), and only the expiry and a rotation already under way act.
+// then (row 10), and only a silence past the deadline and a rotation
+// already under way act.
 //
 //   - pass: nothing; the evaluation goes on.
 //   - hold: the dispatch timer armed at the decision's next look.
 //   - rotate: ready -> snapshotting, the rotation recorded, the dispatch
 //     timer armed at the snapshot wait; the snapshot command is sent after
 //     the commit.
-//   - retire: the gen retired to stopped, its pending snapshot command
-//     forgotten, so a late report of it is ignored, and the dispatch timer
-//     armed due at once, which the caller's next evaluation takes.
+//   - retire: a rotating gen retired to stopped, its pending snapshot
+//     command forgotten, so a late report of it is ignored, and the
+//     dispatch timer armed due at once, which the caller's next evaluation
+//     takes.
 //   - revert: snapshotting -> ready, the pending snapshot command
 //     forgotten, the ready watchdogs armed, and the dispatch timer armed due
 //     at once.
-//   - suspect: snapshotting -> suspect through transitionSandboxToSuspect,
-//     the liveness path every silence takes: terminal_grace armed, the
-//     pending snapshot command kept, so a sign of life during the grace
-//     recovers the sandbox to snapshotting -- and a replayed report then
-//     records its snapshot -- and a grace that runs out fails it, and that
-//     timer's own evaluation restores or spawns the replacement. Nothing is
-//     dispatched meanwhile (EvaluateRunway's row 7d).
+//   - suspect: ready or snapshotting -> suspect through
+//     transitionSandboxToSuspect, the liveness path every silence takes:
+//     terminal_grace armed, a pending snapshot command kept, so a sign of
+//     life during the grace recovers the sandbox -- an agent that
+//     reconnects sends ready, then replays its unacked report, which is
+//     recorded, since the give-up waits for the connection's replay -- and
+//     a grace that runs out fails it, and that timer's own evaluation
+//     restores or spawns the replacement. Nothing is dispatched meanwhile
+//     (EvaluateRunway's rows 2a and 7d).
 func (a *Actor) applyRunwayGate(ctx context.Context, tx pgx.Tx, sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, inFlight bool) (runwayGateResult, error) {
 	sandboxes := a.stores.sandbox.WithTx(tx)
 	row, err := sandboxes.Runway(ctx, a.sessionID)
@@ -493,14 +505,16 @@ func (a *Actor) recordRotationFallback(ctx context.Context, tx pgx.Tx, gen int, 
 }
 
 // runwayRuledOutResume reports whether a resume of row's provider object is
-// ruled out because the gate took its gen out: a rotation of it, or its
-// deadline passed. Those are the gate's every retirement (EvaluateRunway:
-// TestEvaluateRunway_Properties pins that no other row retires), and its
-// suspicion of a silent agent ends, when the grace runs out, in failed,
-// which is never resumed. A resume claims the same provider object and
-// carries its deadline forward (technical plan §35.2), so it would bring
-// back the sandbox the gate replaces, and the gate would retire it again.
-// Read only for a provider that resumes, on the database's clock.
+// ruled out because the gate took its gen out, or would: a rotation of it,
+// the gate's every retirement (EvaluateRunway:
+// TestEvaluateRunway_Properties pins that no other row retires), or its
+// deadline passed. The gate's suspicion of a silent agent ends, when the
+// grace runs out, in failed, which is never resumed; a gen past its
+// deadline that another watchdog ended stale is ruled out here too. A
+// resume claims the same provider object and carries its deadline forward
+// (technical plan §35.2), so it would bring back the sandbox the gate
+// replaces, and the gate would take it out again. Read only for a provider
+// that resumes, on the database's clock.
 func (a *Actor) runwayRuledOutResume(ctx context.Context, tx pgx.Tx, row sqlcgen.Sandbox) (bool, error) {
 	if rotating(row) {
 		return true, nil
@@ -556,7 +570,10 @@ func (a *Actor) recordRunwayGate(ctx context.Context, note *runwayNote) {
 	}
 	if f.Status == sandbox.StateSnapshotting {
 		fields = append(fields, "pending_snapshot_message_id", note.pendingSnapshot,
-			"snapshotting_seconds", int64(f.SinceSnapshotStart.Seconds()), "silent_seconds", int64(f.SinceLastSeen.Seconds()))
+			"snapshotting_seconds", int64(f.SinceSnapshotStart.Seconds()), "silent_seconds", int64(f.SinceLastSeen.Seconds()),
+			"replay_pending", f.ReplayPending)
+	} else if d.Reason == sandbox.RunwayReasonDeadlinePassed {
+		fields = append(fields, "silent_seconds", int64(f.SinceLastSeen.Seconds()))
 	}
 	switch {
 	case d.Action == sandbox.RunwayRetire || d.Action == sandbox.RunwayRevert || d.Action == sandbox.RunwaySuspect:
@@ -585,7 +602,7 @@ func runwayGateLogMessage(d sandbox.RunwayDecision) string {
 	case sandbox.RunwayRevert:
 		return "sessionactor: runway gate: a snapshot never reported is given up; the sandbox goes back to ready and takes the turn"
 	case sandbox.RunwaySuspect:
-		return "sessionactor: runway gate: the agent of a snapshotting sandbox fell silent; the sandbox is suspected, through its terminal grace"
+		return "sessionactor: runway gate: the sandbox's agent fell silent, past its deadline or mid-snapshot; the sandbox is suspected, through its terminal grace"
 	case sandbox.RunwayHold:
 		if d.Reason == sandbox.RunwayReasonSnapshotInProgress {
 			return snapshotHeldLogMessage

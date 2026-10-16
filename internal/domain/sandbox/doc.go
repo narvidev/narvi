@@ -22,9 +22,10 @@
 //     (EvaluateSnapshotRestore, provenance.go; §35.5b): compatible,
 //     incompatible or unknown, against the restore floors.
 //   - The pre-dispatch runway gate (EvaluateRunway and RotationThreshold,
-//     runway.go; §35.3): pass, hold, rotate or retire a live sandbox
-//     against its lifetime deadline, and give up a snapshot that is never
-//     reported (revert it, or suspect a sandbox whose agent is silent).
+//     runway.go; §35.3): pass, hold, rotate, retire or suspect a live
+//     sandbox against its lifetime deadline, and give up a snapshot that is
+//     never reported (revert it, or suspect a sandbox whose agent is
+//     silent).
 //
 // Every function here is pure per §11: no I/O, no time.Now(), no
 // randomness. Anything needing "the current time" takes it as an explicit

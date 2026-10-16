@@ -508,6 +508,21 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 			}
 		}
 
+		// Technical plan §35.3 (runway.go): a heartbeat of the live gen is
+		// counted since the latest ready, up to two. On each connection the
+		// agent sends ready, at most one heartbeat, then replays its unacked
+		// critical frames, and only then starts its heartbeat loop
+		// (wsbridge's runConnection), so the second heartbeat after a ready
+		// follows every frame that connection replays: until then the
+		// runway gate does not give up a snapshot whose report may be among
+		// them (EvaluateRunway's row 7b, ReplayPending). Not gated on
+		// `inserted`: a heartbeat is never buffered or replayed.
+		if cmd.Type == "heartbeat" {
+			if err := a.stores.sandbox.WithTx(tx).CountHeartbeat(ctx, a.sessionID, row.Gen); err != nil {
+				return fmt.Errorf("sessionactor: count the heartbeat: %w", err)
+			}
+		}
+
 		// Technical plan §35.2 (lifetimereport.go): a ready or heartbeat
 		// that reports how long the provider will still let the sandbox run
 		// brings the gen's deadline earlier when it is earlier than the
