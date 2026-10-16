@@ -382,6 +382,16 @@ func TestAuthorize_ExhaustiveMatrix(t *testing.T) {
 		{"member cannot configure preview links", authz.RoleMember, authz.ActionConfigurePreviewLinks, false, false},
 		{"viewer cannot configure preview links", authz.RoleViewer, authz.ActionConfigurePreviewLinks, false, false},
 
+		// (§40.1): setting or raising a session spend cap, on a repository
+		// or an automation -- admin only, never widened by ownership.
+		{"admin sets a session spend cap", authz.RoleAdmin, authz.ActionSetSessionSpendCap, false, true},
+		{"maintainer cannot set a session spend cap", authz.RoleMaintainer, authz.ActionSetSessionSpendCap, false, false},
+		{"maintainer cannot set a session spend cap even if ownedOrJoined", authz.RoleMaintainer, authz.ActionSetSessionSpendCap, true, false},
+		{"member cannot set a session spend cap", authz.RoleMember, authz.ActionSetSessionSpendCap, false, false},
+		{"member cannot set a session spend cap even if ownedOrJoined", authz.RoleMember, authz.ActionSetSessionSpendCap, true, false},
+		{"viewer cannot set a session spend cap", authz.RoleViewer, authz.ActionSetSessionSpendCap, false, false},
+		{"viewer cannot set a session spend cap even if ownedOrJoined", authz.RoleViewer, authz.ActionSetSessionSpendCap, true, false},
+
 		// Row 7 (§31.4): revoking and restoring a repository's eligibility
 		// for new sessions, and reading its status -- admin only, never
 		// widened by ownership.

@@ -828,6 +828,47 @@ that is not, answers `409`, and a second revoke keeps the first one's who,
 when and why. Restoring never makes a repository eligible that was not
 already: it only lifts the revocation.
 
+**Session spend cap** — an administrator can cap what any one session may
+spend (technical plan §40.1): on a repository, for every session that
+names it, and on an automation, for every session it creates. Once a
+session's recorded spend reaches its cap it takes no new turn, whoever
+asks — a prompt, a plan approval, a workflow step, the review button, every
+automatic producer — and it is not failed: the turn already running
+finishes, so the spend can pass the cap by that turn's cost, and the
+session records a warning saying so. The cap a session is held to is its
+automation's, when the automation that created it sets one, whether above or
+below its repositories' caps; otherwise the strictest cap among the
+repositories it names. The refusal names that cap and where it was set. A
+change re-admits the session only when it changes that cap and the cap
+that then applies is above what the session has spent: clearing an
+automation's cap leaves its sessions to their repositories' caps, and
+raising one repository's cap changes nothing while a stricter one, or the
+automation's, still applies. When it does, the next turn the session is
+asked for is admitted at once. There is no Settings screen for it yet: the
+repository's cap reads back on `GET /api/repos/{owner}/{repo}/settings`,
+the automation's on `GET /api/automations/{automationID}`.
+
+```json narvi-command
+{"name": "Set a repo's session spend cap", "route": "PUT /api/repos/{owner}/{repo}/session-spend-cap"}
+```
+
+```json narvi-command
+{"name": "Set an automation's session spend cap", "route": "PUT /api/automations/{automationID}/session-spend-cap"}
+```
+
+The body is `{"capUsd": 25}`, in dollars, or `{"capUsd": null}` to clear
+the cap.
+
+**Negative.** Both are **admin-only** (`set_session_spend_cap`, §13.3): a
+maintainer, member or viewer gets `403` — a maintainer who manages an
+automation included. A cap of zero or less, with more than two decimal
+places as written (a long literal a float would round is refused too), or
+above 99999999.99, and a body without `capUsd`, answer `400`. A
+repository this deployment has never seen a pull-request session for, or
+an automation that does not exist, answers `404`. Each write is audited as
+`session_spend_cap.set`, naming the cap it replaced, in its own
+transaction.
+
 **Per-repo, per-environment, and global provider credentials / sandbox
 secrets** — the SAME four-verb CRUD shape at three different scopes
 (§27.1/§27.2); a value set at a narrower scope always wins over a wider

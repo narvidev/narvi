@@ -29,6 +29,10 @@
 //   - POST   /api/automations/{automationID}/webhook-token    RotateAutomationWebhookToken
 //   - DELETE /api/automations/{automationID}/webhook-token    RevokeAutomationWebhookToken
 //
+// An eighth, PUT /api/automations/{automationID}/session-spend-cap, is
+// sessionspendcap.go's: the automation's session spend cap (§40.1), admin
+// only and audited, which CreateAutomation deliberately does not take.
+//
 // Create/Pause/Resume/RotateAutomationWebhookToken/
 // RevokeAutomationWebhookToken are gated by authz.ActionManageAutomations
 // (admin/maintainer only, internal/domain/authz/authorize.go's own
@@ -185,6 +189,9 @@ func automationToDTO(a sqlcgen.Automation, runHealth *restdtos.AutomationRunHeal
 		ArtifactSummary:          a.ArtifactSummary,
 		RunHealth:                runHealth,
 		CreatorUnauthorizedSince: creatorUnauthorizedSince,
+		// §40.1: written by PutAutomationSessionSpendCap alone
+		// (sessionspendcap.go), never at creation.
+		SessionSpendCapUsd: sessionSpendCapUSD(a.SessionSpendCapUsd),
 	}
 }
 
