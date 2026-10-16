@@ -13,8 +13,8 @@ const MinSkipRepoHooksAgentProtocol = "1.28.0"
 type RepoHooksRestoreReason string
 
 const (
-	// RepoHooksRestoreAllowed: nothing about the repository's hooks stands
-	// in the restore's way.
+	// RepoHooksRestoreAllowed means nothing about the repository's hooks
+	// stands in the restore's way.
 	RepoHooksRestoreAllowed RepoHooksRestoreReason = ""
 	// RepoHooksRestoreAgentUnknown means the session boots without the
 	// repository's hooks and nothing readable is recorded of the agent the
