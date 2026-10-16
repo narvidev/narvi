@@ -228,6 +228,10 @@ type holdPlanStatement struct {
 	name string
 	run  func(ctx context.Context, q pgx.Tx, probe holdPlanProbe) error
 	args func(probe holdPlanProbe) string
+	// writesTurns is a write of the session's turns, measured on turns
+	// settled for it (measureTurnWrites): what an unsettled write reads
+	// turns on the row versions the measures before it left behind.
+	writesTurns bool
 	// writesOpenTurn is a write of an open turn that is never heap-only:
 	// once 000158 is in, its new row version also gets an entry in
 	// turns_open_session_id_idx, which it may read up to
@@ -307,7 +311,23 @@ func measureHoldPlan(ctx context.Context, t *testing.T, pool *pgxpool.Pool, stat
 // openTurnIndexEntryMaxBuffers more: its update of a processing turn's
 // cost is never heap-only (cost_usd is in turns_cost_created_at_idx's
 // predicate), so the new version also gets an entry in the new index --
-// a write, not a read the index changed. After 000158, the hold's read
+// a write, not a read the index changed.
+//
+// The two of them that write a turn, RequestStopOpenTurns and
+// RecordTurnStepCost, are measured last, the index taken away and built
+// again once more, each measure on turns settled for it
+// (measureTurnWrites). Every measure leaves the turn's rolled-back row
+// versions behind, and unsettled, what the next write reads turns on
+// them: whether the turn's heap page was pruned in time to hold the new
+// version, and whether a leaf the version's index entries go to is full,
+// so the write first deletes the dead entries there, reading their heap
+// page. Measured one after the other, the same write of the same turn
+// read 39, 40 or 41 buffers, and 39 then 42 with a snapshot held open in
+// the database, which keeps the page from being pruned. The reads are
+// measured first, on turns as the shape stored them: settling vacuums
+// turns, which sets the visibility map they are measured without.
+//
+// After 000158, the hold's read
 // must read at most holdReadMaxBuffers, its only scan of turns on
 // turns_open_session_id_idx -- never a sequential or bitmap heap scan of
 // turns -- and the hold's re-arm and the wake-up at most
@@ -331,7 +351,7 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 			args: func(p holdPlanProbe) string { return fmt.Sprintf("%d, '%s'::uuid", budget, p.sessionID.String()) },
 		},
 		{
-			name: "RequestStopOpenTurns",
+			name: "RequestStopOpenTurns", writesTurns: true,
 			run: func(ctx context.Context, tx pgx.Tx, p holdPlanProbe) error {
 				_, err := narvipg.NewTurnStore(nil).WithTx(tx).RequestStopOpen(ctx, p.sessionID)
 				return err
@@ -357,7 +377,7 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 		{
 			// Every step_finish of a processing turn: a step id never
 			// counted before, so the cost is added.
-			name: "RecordTurnStepCost", writesOpenTurn: true,
+			name: "RecordTurnStepCost", writesTurns: true, writesOpenTurn: true,
 			run: func(ctx context.Context, tx pgx.Tx, p holdPlanProbe) error {
 				_, err := narvipg.NewTurnStore(nil).WithTx(tx).RecordStepCostUSD(ctx, p.sessionID, freshStepID(), 0.01)
 				return err
@@ -411,46 +431,69 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 		t.Run(shape.name, func(t *testing.T) {
 			ctx := context.Background()
 			pool, _ := holdPlanDatabase(ctx, t, holdPlanLatestVersion)
-			if _, err := pool.Exec(ctx, `DROP INDEX turns_open_session_id_idx`); err != nil {
-				t.Fatalf("take away 000158's index: %v", err)
-			}
-			probes := storeHoldPlanShape(ctx, t, pool, shape)
-
-			before := map[string]holdPlanMeasurement{}
-			for _, statement := range unchanged {
-				for _, probe := range probes {
-					for _, mode := range modes {
-						key := statement.name + ", " + probe.name + ", " + mode
-						before[key] = measureHoldPlan(ctx, t, pool, statement, probe, mode)
-					}
+			dropIndex := func() {
+				t.Helper()
+				if _, err := pool.Exec(ctx, `DROP INDEX turns_open_session_id_idx`); err != nil {
+					t.Fatalf("take away 000158's index: %v", err)
 				}
 			}
-
 			up, err := fs.ReadFile(migrations.FS, "000158_turns_open_session_id_idx.up.sql")
 			if err != nil {
 				t.Fatalf("read 000158: %v", err)
 			}
-			if _, err := pool.Exec(ctx, string(up)); err != nil {
-				t.Fatalf("build 000158's index again: %v", err)
+			buildIndex := func() {
+				t.Helper()
+				if _, err := pool.Exec(ctx, string(up)); err != nil {
+					t.Fatalf("build 000158's index again: %v", err)
+				}
 			}
+			dropIndex()
+			probes := storeHoldPlanShape(ctx, t, pool, shape)
 
+			// cells are every statement's measures, one a probe and mode,
+			// each taken before 000158 and after it and held by compare.
+			type measured struct {
+				statement holdPlanStatement
+				probe     holdPlanProbe
+				mode      string
+			}
+			var cells []measured
 			for _, statement := range unchanged {
 				for _, probe := range probes {
 					for _, mode := range modes {
-						key := statement.name + ", " + probe.name + ", " + mode
-						after := measureHoldPlan(ctx, t, pool, statement, probe, mode)
-						t.Logf("%s: before 000158 %v; after %v", key, before[key], after)
-						allowance := 0.0
-						if statement.writesOpenTurn {
-							allowance = openTurnIndexEntryMaxBuffers
-						}
-						if after.buffers > before[key].buffers+allowance {
-							t.Errorf("%s: read %.0f buffers after 000158, %.0f before: the open-turn index made it worse", key, after.buffers, before[key].buffers)
-						}
-						if limit := holdPlanMaxBuffers(probe.turns); after.buffers > limit {
-							t.Errorf("%s: read %.0f buffers, over %.0f for %d turns of its own: it reads other sessions' turns", key, after.buffers, limit, probe.turns)
-						}
+						cells = append(cells, measured{statement, probe, mode})
 					}
+				}
+			}
+			key := func(c measured) string { return c.statement.name + ", " + c.probe.name + ", " + c.mode }
+			compare := func(c measured, before, after holdPlanMeasurement) {
+				t.Helper()
+				t.Logf("%s: before 000158 %v; after %v", key(c), before, after)
+				allowance := 0.0
+				if c.statement.writesOpenTurn {
+					allowance = openTurnIndexEntryMaxBuffers
+				}
+				if after.buffers > before.buffers+allowance {
+					t.Errorf("%s: read %.0f buffers after 000158, %.0f before: the open-turn index made it worse", key(c), after.buffers, before.buffers)
+				}
+				if limit := holdPlanMaxBuffers(c.probe.turns); after.buffers > limit {
+					t.Errorf("%s: read %.0f buffers, over %.0f for %d turns of its own: it reads other sessions' turns", key(c), after.buffers, limit, c.probe.turns)
+				}
+			}
+
+			// The reads first, on turns as the shape stored them: settling a
+			// write of a turn vacuums turns, which would set the visibility
+			// map the reads are measured without.
+			before := map[string]holdPlanMeasurement{}
+			for _, c := range cells {
+				if !c.statement.writesTurns {
+					before[key(c)] = measureHoldPlan(ctx, t, pool, c.statement, c.probe, c.mode)
+				}
+			}
+			buildIndex()
+			for _, c := range cells {
+				if !c.statement.writesTurns {
+					compare(c, before[key(c)], measureHoldPlan(ctx, t, pool, c.statement, c.probe, c.mode))
 				}
 			}
 
@@ -472,6 +515,22 @@ func TestReviewRetriggerHold_PlansReadTheSessionsOwnTurns(t *testing.T) {
 							t.Errorf("%s, %s, %s: %s", statement.name, probe.name, mode, problem)
 						}
 					}
+				}
+			}
+
+			// The writes of a turn last, without 000158's index and with it,
+			// each measure on turns settled for it (measureTurnWrites), so
+			// the two differ by the index alone.
+			dropIndex()
+			for _, c := range cells {
+				if c.statement.writesTurns {
+					before[key(c)] = measureTurnWrites(ctx, t, pool, c.probe, c.mode, c.statement)[0]
+				}
+			}
+			buildIndex()
+			for _, c := range cells {
+				if c.statement.writesTurns {
+					compare(c, before[key(c)], measureTurnWrites(ctx, t, pool, c.probe, c.mode, c.statement)[0])
 				}
 			}
 		})
