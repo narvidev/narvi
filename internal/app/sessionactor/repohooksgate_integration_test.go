@@ -824,6 +824,94 @@ func TestRepoHooksRestore_ASnapshotThePreviousBinaryMintsNeverInheritsTheRecord(
 	}
 }
 
+// TestRepoHooksRestore_ASessionThatNowRunsTheHooksRestoresNoSnapshotOfAHooklessLineage:
+// a session that runs the repository's hooks restores no snapshot while the
+// record names one minted without them. The review session's unrecorded
+// claim has it skip the hooks: this release's gen 1, told, mints S1. The
+// previous binary then spawns gen 2 -- a restore of S1, which runs no
+// setup.sh -- and mints S2, each with its own statement, which never moves
+// the record off S1. A mention then records the head in the base, so the
+// session runs the hooks: the stopped sandbox is not restored from S2, which
+// may descend from S1, but spawns fresh, so setup.sh runs; one warning, the
+// snapshot and the record cleared. Control: when gen 1 ran the hooks, the
+// record is NULL and S2 is restored -- only a hookless lineage pays the
+// fresh spawn.
+func TestRepoHooksRestore_ASessionThatNowRunsTheHooksRestoresNoSnapshotOfAHooklessLineage(t *testing.T) {
+	for i, hookless := range []bool{true, false} {
+		t.Run(map[bool]string{true: "after a snapshot minted without the hooks", false: "after a snapshot minted with them"}[hookless], func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			name := fmt.Sprintf("hooks-lineage-%d", i)
+			tc := repoHooksSessionCases()[3]
+			prNumber := int32(220 + i)
+			sessionID := seedRepoHooksSession(ctx, t, pool, tc, name, prNumber)
+			if _, err := narvipg.NewRepoSettingsStore(pool).UpsertLiveEgressEnabled(ctx, "acme/"+name, true); err != nil {
+				t.Fatal(err)
+			}
+			sandboxes := narvipg.NewSandboxStore(pool)
+			if _, err := sandboxes.Create(ctx, sessionID); err != nil {
+				t.Fatal(err)
+			}
+			if err := sandboxes.RecordRepoHooksTold(ctx, sessionID, 1, hookless); err != nil {
+				t.Fatal(err)
+			}
+			if err := sandboxes.RecordReady(ctx, sessionID, 1, false, false, true, nil); err != nil {
+				t.Fatal(err)
+			}
+			first, protocol := "snap-S1", "1.28.0"
+			if _, err := sandboxes.UpdateSnapshotID(ctx, sqlcgen.UpdateSandboxSnapshotIDParams{SessionID: sessionID, SnapshotID: &first, AgentProtocol: &protocol}); err != nil {
+				t.Fatal(err)
+			}
+			second := "snap-S2"
+			if _, err := pool.Exec(ctx, previousReleaseUpsertSandboxForSpawn, sessionID, "token-hash-previous-binary", nil); err != nil {
+				t.Fatalf("the previous binary's UpsertSandboxForSpawn: %v", err)
+			}
+			if _, err := pool.Exec(ctx, previousReleaseUpdateSandboxSnapshotID, second, false, protocol, nil, sessionID); err != nil {
+				t.Fatalf("the previous binary's UpdateSandboxSnapshotID: %v", err)
+			}
+			if err := narvipg.NewGitHubPRSessionStore(pool).RecordHeadInBase(ctx, "acme/"+name, prNumber, true); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'stopped' WHERE session_id = $1`, sessionID); err != nil {
+				t.Fatal(err)
+			}
+			createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, "review the pull request")
+			provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "spawned-" + name}, nextRestoreRef: ports.SandboxRef{ProviderID: "restored-" + name}}
+			r := newDispatchTestRegistry(t, ctx, pool, provider, nil)
+			t.Cleanup(func() { _ = r.Shutdown() })
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+			sendEnsureDispatched(ctx, t, a)
+			waitUntil(t, 5*time.Second, func() bool { return provider.restoreCallCount()+provider.callCount() > 0 })
+
+			if !hookless {
+				if provider.restoreCallCount() != 1 || provider.callCount() != 0 || string(provider.lastRestoreCall().snapshotID) != second {
+					t.Fatalf("restores %d, fresh spawns %d; want %s restored", provider.restoreCallCount(), provider.callCount(), second)
+				}
+				return
+			}
+			if provider.restoreCallCount() != 0 || provider.callCount() != 1 {
+				t.Fatalf("restores %d, fresh spawns %d; want no RestoreFromSnapshot, one fresh spawn", provider.restoreCallCount(), provider.callCount())
+			}
+			if spec := provider.lastSpec(); spec.SessionConfig.SkipRepoHooks || spec.SessionConfig.BootMode != "fresh" {
+				t.Fatalf("the fresh spawn's SESSION_CONFIG: skipRepoHooks %v, boot mode %s; want the hooks run, fresh -- setup.sh runs", spec.SessionConfig.SkipRepoHooks, spec.SessionConfig.BootMode)
+			}
+			sb, err := sandboxes.Get(ctx, sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if sb.SnapshotID != nil || sb.SnapshotSkippedRepoHooksID != nil {
+				t.Fatalf("snapshot %v, record %v kept; want both cleared", sb.SnapshotID, sb.SnapshotSkippedRepoHooksID)
+			}
+			if n := countRows(ctx, t, pool, `SELECT count(*) FROM events WHERE session_id = $1 AND type = 'warning' AND payload::text LIKE '%snap-S2%' AND payload::text LIKE '%now runs the repository''s hooks%'`, sessionID); n != 1 {
+				t.Fatalf("%d warnings saying why the snapshot was not restored, want 1", n)
+			}
+		})
+	}
+}
+
 // TestRepoHooksGate_AGenMidSnapshotIsRetiredAtOnce: a gen the gate
 // retires is retired even while its snapshot after a turn is in progress
 // -- one that never reports would otherwise hold the session for good,

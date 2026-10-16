@@ -40,13 +40,14 @@ package sessionactor
 // records whether the gen that minted it skipped the hooks
 // (sandboxes.snapshot_skipped_repo_hooks_id, its own id when it did, with
 // the rest of its provenance), and a restore crosses no boundary of the
-// hooks
-// (sandbox.DecideRepoHooksRestore). A session that skips them restores
-// only a snapshot of an agent of protocol 1.28.0 or later whose gen
-// skipped them -- an older or unknown agent would run them at the restored
-// boot -- and a session that runs them never restores one whose gen
-// skipped them, whose lineage never ran setup.sh. Either way the sandbox
-// spawns fresh and the snapshot is cleared.
+// hooks (sandbox.DecideRepoHooksRestore). A session that skips them
+// restores only a snapshot of an agent of protocol 1.28.0 or later whose
+// gen skipped them -- the record names that snapshot; an older or unknown
+// agent would run them at the restored boot -- and a session that runs
+// them restores none while the record names any snapshot: one whose gen
+// skipped them never ran setup.sh, and one the previous binary minted from
+// a restore of it may descend from it. Either way the sandbox spawns fresh
+// and the snapshot is cleared.
 //
 // The gate reads the claim as it is at dispatch. The decision only ever
 // moves from skipping the hooks to running them -- a claim's record is
@@ -102,7 +103,9 @@ func skipRepoHooksTold(row sqlcgen.Sandbox) bool {
 // minted by a gen that booted without the repository's hooks: the record
 // names that snapshot (snapshot_skipped_repo_hooks_id). A record that names
 // another snapshot is that snapshot's -- the previous binary mints without
-// writing it -- so it says nothing of this one.
+// writing it -- so it never lets a session that skips the hooks restore
+// this one; a session that runs them reads it as a lineage that may not
+// have run setup.sh (sandbox.RepoHooksSnapshotRecord).
 func snapshotMintedWithoutRepoHooks(row sqlcgen.Sandbox, snapshotID string) bool {
 	return snapshotID != "" && row.SnapshotSkippedRepoHooksID != nil && *row.SnapshotSkippedRepoHooksID == snapshotID
 }
@@ -281,15 +284,19 @@ func (a *Actor) repoHooksRestoreRefusal(ctx context.Context, tx pgx.Tx, sessionR
 	claim, claimReadFailed := a.reviewClaim(ctx, tx, sessionRow)
 	skips := claimReadFailed || sessionSkipsRepoHooks(claim, sessionRow.Repos)
 	provenance := snapshotProvenance(sandboxRow)
-	mintedWithoutHooks := snapshotMintedWithoutRepoHooks(sandboxRow, snapshotID)
-	reason := sandbox.DecideRepoHooksRestore(skips, provenance, mintedWithoutHooks)
+	record := sandbox.RepoHooksSnapshotRecord{
+		MintedWithoutHooks: snapshotMintedWithoutRepoHooks(sandboxRow, snapshotID),
+		Set:                sandboxRow.SnapshotSkippedRepoHooksID != nil,
+	}
+	reason := sandbox.DecideRepoHooksRestore(skips, provenance, record)
 	if reason == sandbox.RepoHooksRestoreAllowed {
 		return nil
 	}
 	a.logger.Warn("sessionactor: refusing a snapshot restore across a boundary of the repository's hooks; spawning fresh",
 		"session_id", a.sessionID.String(), "snapshot_id", snapshotID, "session_skips_repo_hooks", skips,
 		"snapshot_agent_protocol", provenance.AgentProtocol, "snapshot_provenance_recorded", provenance.Recorded,
-		"snapshot_skipped_repo_hooks", mintedWithoutHooks, "reason", string(reason))
+		"snapshot_skipped_repo_hooks", record.MintedWithoutHooks, "snapshot_skipped_repo_hooks_id", stringOrEmpty(sandboxRow.SnapshotSkippedRepoHooksID),
+		"reason", string(reason))
 	return &snapshotRefusal{
 		snapshotID: snapshotID,
 		warning:    repoHooksRestoreRefusalWarning(snapshotID, snapshotMintedAt(sandboxRow), provenance, reason),
@@ -304,6 +311,8 @@ func repoHooksRestoreRefusalWarning(snapshotID string, mintedAt pgtype.Timestamp
 	switch reason {
 	case sandbox.RepoHooksRestoreMintedWithoutHooks:
 		why = "this session now runs the repository's hooks, and that snapshot was taken by a sandbox that booted without them, so a fresh sandbox runs them from the start."
+	case sandbox.RepoHooksRestoreHooklessLineage:
+		why = "this session now runs the repository's hooks, and that snapshot may come from a sandbox restored from one that booted without them, so a fresh sandbox runs them from the start."
 	case sandbox.RepoHooksRestoreAgentTooOld:
 		why = "this session boots without the repository's hooks, and the sandbox agent that snapshot holds, built for protocol " + p.AgentProtocol + ", does not."
 	case sandbox.RepoHooksRestoreMintedWithHooks:

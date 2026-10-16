@@ -1739,7 +1739,9 @@ type UpdateSandboxSnapshotIDParams struct {
 // gen) and its ready advertised it honours that (skip_repo_hooks_gen =
 // gen); NULL otherwise. Keyed by the id, as the rest of the provenance is,
 // so a snapshot a binary that does not write it mints never reads an
-// earlier snapshot's record as its own.
+// earlier snapshot's record as its own; a session that runs the hooks reads
+// any value as a lineage that may not have run setup.sh
+// (sandbox.DecideRepoHooksRestore).
 func (q *Queries) UpdateSandboxSnapshotID(ctx context.Context, arg UpdateSandboxSnapshotIDParams) (Sandbox, error) {
 	row := q.db.QueryRow(ctx, updateSandboxSnapshotID,
 		arg.SnapshotID,

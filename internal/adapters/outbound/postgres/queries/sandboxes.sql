@@ -251,7 +251,9 @@ RETURNING *;
 -- gen) and its ready advertised it honours that (skip_repo_hooks_gen =
 -- gen); NULL otherwise. Keyed by the id, as the rest of the provenance is,
 -- so a snapshot a binary that does not write it mints never reads an
--- earlier snapshot's record as its own.
+-- earlier snapshot's record as its own; a session that runs the hooks reads
+-- any value as a lineage that may not have run setup.sh
+-- (sandbox.DecideRepoHooksRestore).
 UPDATE sandboxes
 SET snapshot_id = sqlc.arg('snapshot_id'),
     snapshot_suppressed_in_shadow = sqlc.arg('snapshot_suppressed_in_shadow'),

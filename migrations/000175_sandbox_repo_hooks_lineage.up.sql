@@ -24,10 +24,17 @@
 -- (snapshot_skipped_repo_hooks_id = snapshot_id), the way
 -- snapshot_provenance_id keys the rest of its provenance (000170): a
 -- snapshot a binary that does not write this column mints never inherits
--- an earlier snapshot's record. A session that skips the hooks restores
--- only a snapshot whose agent is of protocol 1.28.0 or later and whose gen
--- skipped them; a session that runs them never restores one whose gen
--- skipped them, whose lineage never ran setup.sh.
+-- an earlier snapshot's record. The record is read in the direction that
+-- fails toward the hooks' boundary. A session that skips the hooks
+-- restores only a snapshot whose agent is of protocol 1.28.0 or later and
+-- whose gen skipped them -- the record names that snapshot. A session that
+-- runs them restores no snapshot while the record names any: one whose gen
+-- skipped them never ran setup.sh, and one the record does not name may
+-- descend from the one it does, minted from a restore of it by a binary
+-- that does not write the record. This release's mint writes the record
+-- for every snapshot (NULL for one whose gen ran the hooks) and its clear
+-- nulls it, so a record naming another snapshot is left only by such a
+-- binary.
 --
 -- Both nullable, with no default and no backfill: every sandbox reads as
 -- told nothing, and every snapshot as minted with the hooks, which is what
@@ -53,7 +60,10 @@
 -- has its provenance recorded under its own id (snapshot_provenance_id,
 -- 000170), but snapshot_skipped_repo_hooks_id keeps naming an earlier
 -- snapshot or nothing, never the new one: it reads as minted with the
--- hooks, which such a session never restores.
+-- hooks, which a session that skips them never restores. When the record
+-- names an earlier snapshot, the new one may have been minted from a
+-- restore of it, which runs no setup.sh, so a session that runs the hooks
+-- does not restore it either: it spawns fresh, and setup.sh runs.
 --
 -- # Rolling back
 --
@@ -62,6 +72,9 @@
 -- (`migrate force 174`; this file, run again, keeps their values) or run
 -- the down (goto 174). A value kept names only the snapshot it was
 -- written for, so the previous binary's snapshots meanwhile read, after the
--- redeploy, as minted with the hooks.
+-- redeploy, as minted with the hooks to a session that skips them, and as
+-- of a lineage that may not have run setup.sh to one that runs them while
+-- the value is kept: either way such a snapshot is not restored, and the
+-- sandbox spawns fresh.
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS skip_repo_hooks_told_gen INTEGER;
 ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_skipped_repo_hooks_id TEXT;
