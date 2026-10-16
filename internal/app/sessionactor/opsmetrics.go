@@ -54,6 +54,10 @@ const (
 	watchdogInactivity         watchdogKind = "inactivity"
 	watchdogConnectingDeadline watchdogKind = "connecting_deadline"
 	watchdogLivenessCheck      watchdogKind = "liveness_check"
+	// watchdogRunwayGate is the runway gate's silence check (technical
+	// plan §35.3, runway.go) on a snapshotting sandbox, the one watchdog
+	// that covers that state, and on a sandbox past its deadline.
+	watchdogRunwayGate watchdogKind = "runway_gate"
 )
 
 // opsMetrics bundles §5.3's five new OTel instruments, constructed
@@ -249,6 +253,18 @@ type opsMetrics struct {
 	// refused. A restore downgraded to a fresh spawn before the decision
 	// (§27.8, §30.4(3)) is not counted.
 	snapshotRestore metric.Int64Counter
+
+	// runwayGate is sandbox_runway_gate_total: one per decision of the
+	// pre-dispatch runway gate (technical plan §35.3, runway.go) other than
+	// a pass with runway to spare, once the evaluation that made it has
+	// committed, tagged action=pass|hold|rotate|retire|revert and reason,
+	// sandbox.RunwayReason.
+	runwayGate metric.Int64Counter
+
+	// rotationRestore is sandbox_rotation_restore_total: one per claim that
+	// replaced a gen the runway gate rotated, once it has committed, tagged
+	// outcome=rotated|fell_back|fresh.
+	rotationRestore metric.Int64Counter
 }
 
 // newOpsMetrics constructs all five instruments against meter -- the SAME
@@ -272,7 +288,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	livenessGap, err := meter.Float64Histogram(
 		"sandbox_liveness_gap_seconds",
-		metric.WithDescription("How long a sandbox had shown no sign of life by the moment a watchdog timer (inactivity/connecting_deadline/liveness_check) suspected it (§5.3: liveness gaps) -- the duration half of watchdog_activation_total's own count. Tagged by watchdog."),
+		metric.WithDescription("How long a sandbox had shown no sign of life by the moment a watchdog (the inactivity/connecting_deadline/liveness_check timers, or the runway gate's silence check on a snapshotting sandbox or one past its deadline) suspected it (§5.3: liveness gaps) -- the duration half of watchdog_activation_total's own count. Tagged by watchdog."),
 		metric.WithUnit("s"),
 		metric.WithExplicitBucketBoundaries(livenessGapBuckets...),
 	)
@@ -282,7 +298,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	watchdogActivation, err := meter.Int64Counter(
 		"watchdog_activation_total",
-		metric.WithDescription("Count of every sandbox suspected (transitioned to Suspect) by a liveness/inactivity watchdog (§5.3: watchdog activations). Tagged by watchdog (inactivity/connecting_deadline/liveness_check); excludes recordSpawnFailure's own distinct permanent-provider-error path, which is not a watchdog silence."),
+		metric.WithDescription("Count of every sandbox suspected (transitioned to Suspect) by a liveness/inactivity watchdog (§5.3: watchdog activations). Tagged by watchdog (inactivity/connecting_deadline/liveness_check/runway_gate, the last the pre-dispatch runway gate's silence check on a snapshotting sandbox or one past its deadline); excludes recordSpawnFailure's own distinct permanent-provider-error path, which is not a watchdog silence."),
 		metric.WithUnit("{activation}"),
 	)
 	if err != nil {
@@ -437,6 +453,24 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		return opsMetrics{}, fmt.Errorf("sessionactor: construct sandbox_snapshot_restore_total counter: %w", err)
 	}
 
+	runwayGate, err := meter.Int64Counter(
+		"sandbox_runway_gate_total",
+		metric.WithDescription("Decisions of the pre-dispatch runway gate (technical plan §35.3): before a turn is sent to a live sandbox, the gate measures the sandbox's runway -- its lifetime deadline less the database's now -- against min(RotationRunwayFloor, lifetime/6). Every decision but a pass with runway to spare is counted, by action and reason: pass (deadline_unknown, turn_in_flight, suspect, no_snapshot: the rotation was declined and the turn dispatched as before, below the threshold); hold (awaiting_rotation_snapshot, snapshot_in_progress, awaiting_sign_of_life -- including a reconnected agent whose replayed frames may still be coming --, suspected_mid_snapshot, delivery_open -- a rotation's start, or a rotating gen's retirement --, deadline_passed -- a suspect sandbox past its deadline, through its grace: the turn waits, looked at again at the hold's bound); rotate (below_threshold: under the threshold, or past the deadline with the agent heard from, the sandbox is snapshotted, then retired and restored, before the turn is sent); retire (rotation_snapshot_taken, rotation_snapshot_not_reported, rotation_snapshot_failed: a rotation's gen, retired with its snapshot taken, unreported within RotationSnapshotWait, or never sent); suspect (deadline_passed: past its deadline with its agent silent past SteadyHeartbeatBudget; snapshot_agent_silent: a snapshot unreported within SnapshotReportWait whose agent then fell silent past SteadyHeartbeatBudget; each suspected through its terminal grace); revert (snapshot_not_reported: a snapshot unreported within SnapshotReportWait from an agent heard from after it and past its connection's replay, given up, the sandbox back to ready). The line logged with each names the gen and the runway."),
+		metric.WithUnit("{decision}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct sandbox_runway_gate_total counter: %w", err)
+	}
+
+	rotationRestore, err := meter.Int64Counter(
+		"sandbox_rotation_restore_total",
+		metric.WithDescription("Claims that replaced a sandbox gen the runway gate rotated (technical plan §35.3), by outcome: rotated (restored from the rotation's own snapshot); fell_back (the rotation's snapshot was not taken, and the sandbox was restored from the snapshot before it, with a persisted warning naming it); fresh (no snapshot to restore, or its restore refused or downgraded: spawned fresh). Counted once the claim has committed."),
+		metric.WithUnit("{claim}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct sandbox_rotation_restore_total counter: %w", err)
+	}
+
 	return opsMetrics{
 		actorsLive:            actorsLive,
 		hydrations:            hydrations,
@@ -457,6 +491,8 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		promptResend:          promptResend,
 		reviewCheckout:        reviewCheckout,
 		snapshotRestore:       snapshotRestore,
+		runwayGate:            runwayGate,
+		rotationRestore:       rotationRestore,
 	}, nil
 }
 

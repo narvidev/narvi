@@ -120,6 +120,14 @@ RETURNING *;
 -- already be past. lifetime_deadline_gen records which gen the deadline is
 -- for; the deadline counts only while it equals gen.
 --
+-- rotation_gen, rotation_message_id, rotation_started_at,
+-- snapshot_started_at, snapshot_start_message_id, heartbeat_ready_seq and
+-- heartbeats_since_ready (technical plan §35.3, migrations/000171) are
+-- cleared too: a rotation, a snapshot in progress and a connection's
+-- heartbeats are the replaced gen's, and the new gen has none. Hygiene
+-- only for the rotation: rotation_gen counts only while it equals gen, so
+-- the bump alone makes a value left over read "not rotating".
+--
 -- A NULL lifetime_seconds is a resume's (planResume): the same provider
 -- object, never younger than it was, so a fresh stamp would be later than
 -- the provider's own deadline. It carries the deadline forward to the new
@@ -144,6 +152,13 @@ SET gen = sandboxes.gen + 1,
     image_decision_fingerprint = NULL,
     pr_delivery_started_at = NULL,
     stop_retire_gen = NULL,
+    rotation_gen = NULL,
+    rotation_message_id = NULL,
+    rotation_started_at = NULL,
+    snapshot_started_at = NULL,
+    snapshot_start_message_id = NULL,
+    heartbeat_ready_seq = NULL,
+    heartbeats_since_ready = NULL,
     lifetime_deadline_at = CASE
         WHEN sqlc.narg('lifetime_seconds')::integer IS NOT NULL THEN EXCLUDED.lifetime_deadline_at
         WHEN sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.lifetime_deadline_at
@@ -223,10 +238,16 @@ RETURNING *;
 -- read "provenance unknown" rather than the snapshot before it. Never a
 -- version the control plane holds. Named arguments only: sqlc does not
 -- mix them with $n.
+--
+-- snapshot_started_at and snapshot_start_message_id (technical plan §35.3,
+-- migrations/000171) go with pending_snapshot_message_id: the snapshot they
+-- timed is the one recorded here, and none is in progress any more.
 UPDATE sandboxes
 SET snapshot_id = sqlc.arg('snapshot_id'),
     snapshot_suppressed_in_shadow = sqlc.arg('snapshot_suppressed_in_shadow'),
     pending_snapshot_message_id = NULL,
+    snapshot_started_at = NULL,
+    snapshot_start_message_id = NULL,
     snapshot_provenance_id = sqlc.arg('snapshot_id'),
     snapshot_agent_protocol = sqlc.narg('agent_protocol'),
     snapshot_runtime_version = sqlc.narg('runtime_version'),
@@ -427,10 +448,133 @@ WHERE status IN ('spawning', 'connecting', 'booting', 'ready', 'snapshotting', '
 -- SET, mirroring UpdateSandboxProviderID's own precedent exactly (never
 -- COALESCE-guarded -- every call here carries the caller's own
 -- deliberately computed value, including NULL).
+--
+-- snapshot_started_at (technical plan §35.3, migrations/000171) is set
+-- with it, in this statement, to the database's now() when an id is set,
+-- and cleared with it when NULL: the start of the snapshot the id names,
+-- which the runway gate bounds a pending turn's wait by
+-- (SnapshotReportWait). snapshot_start_message_id records that id, so the
+-- start counts only for it: a snapshot the previous binary starts sets the
+-- id alone, and reads as having no start until the gate's first look
+-- stamps one (StampSandboxSnapshotStart). Every snapshot start sets an id
+-- -- a report is accepted only against one -- so every snapshot gets a
+-- start.
 UPDATE sandboxes
-SET pending_snapshot_message_id = $2, updated_at = now()
-WHERE session_id = $1
+SET pending_snapshot_message_id = sqlc.narg('pending_snapshot_message_id')::text,
+    snapshot_started_at = CASE WHEN sqlc.narg('pending_snapshot_message_id')::text IS NULL THEN NULL ELSE now() END,
+    snapshot_start_message_id = sqlc.narg('pending_snapshot_message_id')::text,
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id')
 RETURNING *;
+
+-- name: GetSandboxRunway :one
+-- Technical plan §35.3: every fact the runway gate decides on
+-- (internal/domain/sandbox.EvaluateRunway, the session actor's runway.go),
+-- read in one statement and measured on the database's clock, as
+-- GetTurnCheckoutState's *_nanos are, so the gate and the deadline it is
+-- measured against never disagree on what time it is:
+--   - deadline_known and runway_nanos: the lifetime deadline, when it was
+--     stamped for the live gen (lifetime_deadline_gen, 000162), less now();
+--     negative once past;
+--   - lifetime_seconds: the lifetime the gen's deadline was stamped from,
+--     0 when none was -- its deadline came from an agent's report alone,
+--     or it has none;
+--   - rotating, since_rotation_nanos: a rotation of the live gen, and how
+--     long since it started;
+--   - rotation_snapshot_pending: the snapshot in progress is that
+--     rotation's own -- its pending command is the one the rotation sent;
+--   - rotation_snapshot_taken: the row's snapshot was recorded, with its
+--     provenance, at or after the rotation started (000170's
+--     snapshot_minted_at) -- the rotation's own snapshot;
+--   - snapshot_start_known, since_snapshot_start_nanos: the start of the
+--     snapshot in progress (000171), and how long since -- known only when
+--     it was stamped for the pending command, so a start left by an
+--     earlier snapshot never times a later one;
+--   - since_last_seen_nanos: how long since the sandbox's last sign of life
+--     (last_seen_at, created_at when it has none yet), on the database's
+--     clock against a stamp the replica that stored the frame wrote;
+--   - suspected_mid_snapshot: suspect, and snapshotting when suspected
+--     (pre_suspect_status), so a recovery takes it back to snapshotting;
+--   - replay_pending: fewer than two heartbeats recorded since the latest
+--     ready (heartbeat_ready_seq against ready_seq), so the frames the
+--     agent replays on that connection may still be on their way;
+--   - pr_delivery_started_at and observed_at: a completed turn's open
+--     delivery, read as session.PRDeliveryOpen reads it.
+SELECT gen, status,
+       (lifetime_deadline_gen IS NOT DISTINCT FROM gen AND lifetime_deadline_at IS NOT NULL)::boolean AS deadline_known,
+       COALESCE((EXTRACT(EPOCH FROM (lifetime_deadline_at - now())) * 1000000000)::bigint, 0)::bigint AS runway_nanos,
+       COALESCE(CASE WHEN lifetime_deadline_gen = gen THEN lifetime_seconds END, 0)::integer AS lifetime_seconds,
+       (rotation_gen IS NOT DISTINCT FROM gen)::boolean AS rotating,
+       (rotation_gen IS NOT DISTINCT FROM gen AND status = 'snapshotting' AND pending_snapshot_message_id IS NOT NULL
+          AND pending_snapshot_message_id IS NOT DISTINCT FROM rotation_message_id)::boolean AS rotation_snapshot_pending,
+       COALESCE((EXTRACT(EPOCH FROM (now() - rotation_started_at)) * 1000000000)::bigint, 0)::bigint AS since_rotation_nanos,
+       (rotation_gen IS NOT DISTINCT FROM gen AND snapshot_id IS NOT NULL AND snapshot_provenance_id IS NOT DISTINCT FROM snapshot_id
+          AND snapshot_minted_at IS NOT NULL AND rotation_started_at IS NOT NULL
+          AND snapshot_minted_at >= rotation_started_at)::boolean AS rotation_snapshot_taken,
+       (snapshot_started_at IS NOT NULL
+          AND snapshot_start_message_id IS NOT DISTINCT FROM pending_snapshot_message_id)::boolean AS snapshot_start_known,
+       COALESCE((EXTRACT(EPOCH FROM (now() - snapshot_started_at)) * 1000000000)::bigint, 0)::bigint AS since_snapshot_start_nanos,
+       COALESCE((EXTRACT(EPOCH FROM (now() - COALESCE(last_seen_at, created_at))) * 1000000000)::bigint, 0)::bigint AS since_last_seen_nanos,
+       (status = 'suspect' AND pre_suspect_status IS NOT DISTINCT FROM 'snapshotting')::boolean AS suspected_mid_snapshot,
+       (heartbeat_ready_seq IS DISTINCT FROM ready_seq OR COALESCE(heartbeats_since_ready, 0) < 2)::boolean AS replay_pending,
+       pr_delivery_started_at,
+       now()::timestamptz AS observed_at
+FROM sandboxes
+WHERE session_id = $1;
+
+-- name: StartSandboxRotation :execrows
+-- Technical plan §35.3: records the rotation the runway gate starts of the
+-- live gen, in the transaction that moves the sandbox ready ->
+-- snapshotting through the session actor's recorder (sandboxWrites): the
+-- gen, the database's now() as its start, and the snapshot command's
+-- messageId, as the rotation's own (rotation_message_id) and as the pending
+-- snapshot, which the snapshot_ready that completes it must name
+-- (handleSnapshotReadyEvent), with snapshot_started_at and
+-- snapshot_start_message_id set as UpdateSandboxPendingSnapshotMessageID
+-- sets them. Gen-fenced: 0 rows when the row is no longer at that gen.
+UPDATE sandboxes
+SET rotation_gen = gen,
+    rotation_message_id = sqlc.arg('message_id')::text,
+    rotation_started_at = now(),
+    pending_snapshot_message_id = sqlc.arg('message_id')::text,
+    snapshot_started_at = now(),
+    snapshot_start_message_id = sqlc.arg('message_id')::text,
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;
+
+-- name: StampSandboxSnapshotStart :execrows
+-- Technical plan §35.3: gives a snapshot in progress that has no start of
+-- its own -- one that was in progress when migration 000171 ran, or one the
+-- previous binary started during a rolling deploy, which carries no start
+-- or the start of an earlier snapshot -- the database's now() as its start,
+-- stamped for its pending command, so the runway gate's wait for it runs
+-- from the first look. Only a snapshotting row of the live gen whose start
+-- is missing or was stamped for another command; 0 rows otherwise.
+UPDATE sandboxes
+SET snapshot_started_at = now(),
+    snapshot_start_message_id = pending_snapshot_message_id,
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer
+  AND status = 'snapshotting'
+  AND (snapshot_started_at IS NULL OR snapshot_start_message_id IS DISTINCT FROM pending_snapshot_message_id);
+
+-- name: CountSandboxHeartbeat :exec
+-- Technical plan §35.3: counts a heartbeat of gen $gen since the latest
+-- ready (migrations/000171), up to two, which is all the runway gate reads
+-- (GetSandboxRunway's replay_pending): the agent sends at most one
+-- heartbeat between a connection's ready and its replay of unacked frames,
+-- so the second comes after the replay. A ready moves ready_seq, and the
+-- count then starts again at this heartbeat. handleSandboxEvent calls it in
+-- the transaction that stores the heartbeat. Once two are counted for the
+-- current ready the row no longer matches, so a steady heartbeat writes
+-- nothing. Gen-fenced, like RecordSandboxReady.
+UPDATE sandboxes
+SET heartbeats_since_ready = CASE WHEN heartbeat_ready_seq IS NOT DISTINCT FROM ready_seq
+                                  THEN COALESCE(heartbeats_since_ready, 0) + 1 ELSE 1 END,
+    heartbeat_ready_seq = ready_seq,
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer
+  AND (heartbeat_ready_seq IS DISTINCT FROM ready_seq OR COALESCE(heartbeats_since_ready, 0) < 2);
 
 -- name: SetSandboxPendingPush :one
 -- §30.8's own "the push/PR pair resolves its mode ONCE per turn"

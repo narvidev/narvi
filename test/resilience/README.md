@@ -537,6 +537,44 @@ generally — nothing to replay here.
   (the companion snapshot-creation-side guard and its own positive
   control) — same file
 
+## Scenario #18, the rotation half (Step 137, §35.3)
+
+### #18 — a turn dispatched onto a sandbox past its runway floor
+
+> Turn dispatched onto a sandbox past its runway floor → rotation first,
+> turn runs on the replacement, never a failure; and a deadline reached
+> mid-turn → [the interruption half, Step 140's] (§35.3, §35.4).
+
+**Status: the rotation half is covered; the interruption half waits on
+Step 140.** One database and the control plane's components: a registry
+with a real wshub commander, the real sandbox handler and the real
+snapshot-mint endpoint behind a test server. Each sandbox gen is a real
+`wsbridge.Bridge` dialling that server with its gen's SessionConfig; it
+answers a snapshot at once and completes a prompt. The provider is a
+stand-in whose `RestoreFromSnapshot` starts the new gen's agent with the
+SessionConfig the restore claim minted -- its token, its gen -- once the
+claim has recorded the provider object.
+
+- `TestResilience_Scenario18_TurnPastTheRunwayFloor_RotatesFirstAndRunsOnTheReplacement`:
+  gen 1 is ready with ten minutes left before its deadline, under the
+  13-minute floor, when a turn is queued. The turn is never sent to gen 1:
+  its snapshot is taken, it is sent `shutdown` (its agent ends with
+  `ErrShutdownRequested`) and its provider object is stopped, gen 2 is
+  restored from that snapshot with a fresh 2h deadline, boots, and runs
+  the turn to completion. No turn failed, no `execution_complete` reports a
+  failure, and no warning is written.
+- `TestRunwayRotation_SupersededGenLockedOutAtOnce`: the same, with the
+  restore held back by the spawn circuit breaker: from the retirement's
+  commit gen 1's handshake and snapshot mint answer 410; once the restore
+  has replaced the gen and its token they answer 403, and a frame gen 1
+  still sends is fenced off by gen, not stored.
+  — both in `scenario18_rotation_test.go`
+
+The gate's every row, the fallback to the previous snapshot, the bound on
+a snapshot that never reports and the composition with the spend cap, the
+freeze and the review checkout are pinned on the actor in
+`internal/app/sessionactor`'s `runway_integration_test.go`.
+
 ## Scenario #20, the freeze half (Step 149, §40.2)
 
 ### #20 — the freeze flipped with candidates pending

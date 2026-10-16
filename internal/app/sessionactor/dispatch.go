@@ -287,6 +287,13 @@ type spawnPlan struct {
 	// no such decision was made. executePlans logs and counts it once the
 	// claim has committed (logSnapshotRestore).
 	restoreDecision *snapshotRestoreDecision
+
+	// rotation is what this claim did for a gen the runway gate rotated
+	// (technical plan §35.3, runway.go): restored the rotation's own
+	// snapshot, fell back to the one before it, or spawned fresh. nil when
+	// the gen it replaces was not rotating. executePlans logs and counts it
+	// once the claim has committed (logRotationRestore).
+	rotation *rotationOutcome
 }
 
 // dispatchPlan is what planDispatch's own transact hands back to
@@ -339,6 +346,15 @@ type dispatchPlan struct {
 	checkout        *checkoutPlan
 	checkoutRetire  *retiredGen
 	checkoutFailure *dispatchFailure
+
+	// rotationSnapshot and rotationRetire are the runway gate's (technical
+	// plan §35.3, runway.go), at most one set, payload nil with each, and
+	// the turn left as it was: the snapshot command of a rotation the
+	// evaluation started, which handleEnsureDispatched sends; or a gen the
+	// evaluation retired, which it sends `shutdown` and stops before it
+	// evaluates again.
+	rotationSnapshot *rotationSnapshotPlan
+	rotationRetire   *rotationRetirement
 }
 
 // handleEnsureDispatched implements the EnsureDispatched command
@@ -387,6 +403,15 @@ type dispatchPlan struct {
 // retires its sandbox's gen evaluates again too, once the gen's provider
 // object is stopped: the next evaluation finds the sandbox dead and spawns
 // a fresh one, so it runs once.
+//
+// So does the runway gate (technical plan §35.3, runway.go): a gen it
+// retired is sent `shutdown` and its provider object stopped, and the next
+// evaluation restores or spawns its replacement; a snapshot it gave up
+// left the sandbox ready, and the next evaluation dispatches to it. A
+// rotation it started is sent its snapshot command, and the turn waits; a
+// command that cannot be sent reverts the sandbox to ready, and the next
+// evaluation retires the gen. Each of these moves the sandbox out of the
+// state that decided it, so the loop ends.
 func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 	for {
 		check := a.preReadReviewContext(ctx)
@@ -402,6 +427,16 @@ func (a *Actor) handleEnsureDispatched(ctx context.Context) error {
 			a.stopSandboxOfRetiredGen(ctx, *dispatch.checkoutRetire)
 			continue
 		}
+		if dispatch != nil && dispatch.rotationRetire != nil {
+			a.finishRotationRetirement(ctx, *dispatch.rotationRetire)
+			continue
+		}
+		if dispatch != nil && dispatch.rotationSnapshot != nil {
+			if a.sendRotationSnapshot(ctx, *dispatch.rotationSnapshot) {
+				return nil
+			}
+			continue
+		}
 		return a.executePlans(ctx, spawn, dispatch, deleted)
 	}
 }
@@ -413,6 +448,7 @@ func (a *Actor) executePlans(ctx context.Context, spawn *spawnPlan, dispatch *di
 	if spawn != nil {
 		a.logLifetimeDeadline(spawn)
 		a.logSnapshotRestore(ctx, spawn)
+		a.logRotationRestore(ctx, spawn)
 	}
 	switch {
 	case spawn != nil && spawn.resume:
@@ -505,7 +541,9 @@ func (a *Actor) backOffDispatchTimer(ctx context.Context, cause error, deleted s
 // read none. A turn the check applies to is dispatched only on an answer
 // for that very turn (applyReviewContextCheck); repick is true when that
 // answer ended it context_moved, in this transaction, which then commits,
-// and the caller evaluates the next turn at once.
+// and the caller evaluates the next turn at once. It is true too when the
+// runway gate gave up a snapshot that never reported (runway.go): the
+// sandbox is ready again, and the caller evaluates again at once.
 func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*spawnPlan, *dispatchPlan, sqlcgen.DeleteSessionDispatchTimerRow, bool, error) {
 	var spawn *spawnPlan
 	var dispatch *dispatchPlan
@@ -515,11 +553,14 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 	// checkout decided in this evaluation (reviewcheckout.go), counted only
 	// once the evaluation has committed.
 	var checkoutCounted string
+	// gate is the runway gate's decision in this evaluation (runway.go),
+	// logged and counted only once the evaluation has committed.
+	var gate *runwayNote
 
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		now := time.Now()
 		repick = false
-		spawn, dispatch, checkoutCounted = nil, nil, ""
+		spawn, dispatch, checkoutCounted, gate = nil, nil, "", nil
 
 		// The durable dispatch trigger (technical plan §2, §3.3): the
 		// transaction that created a turn armed the dispatch timer, and
@@ -627,13 +668,14 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 			// the SAME HasInFlightTurn predicate), so this branch and the
 			// three below it never both fire for the same planDispatch
 			// call.
-			sp, d, counted, err := a.planReenqueueOrRespawn(ctx, tx, sessionRow, sandboxRow, hasSandbox, entries, turns, now)
+			sp, d, counted, gateNote, err := a.planReenqueueOrRespawn(ctx, tx, sessionRow, sandboxRow, hasSandbox, entries, turns, now)
 			if err != nil {
 				return err
 			}
 			spawn = sp
 			dispatch = d
 			checkoutCounted = counted
+			gate = gateNote
 			return nil
 		}
 
@@ -649,8 +691,10 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 			return nil
 		}
 
-		// Branch (b): a live sandbox already exists and is Ready or Suspect
-		// -- the turn can be dispatched to it right now. Suspect is
+		// Branch (b): a live sandbox already exists and is Ready, Suspect or
+		// Snapshotting -- the turn can be dispatched to it right now, unless
+		// the runway gate below holds it, which it always does for a
+		// Snapshotting one (technical plan §35.3). Suspect is
 		// deliberately included here, not just Ready: a Suspect sandbox is
 		// still within its terminal_grace window and may yet recover (§3.2,
 		// "two-phase terminalization", sandboxevent.go's own
@@ -682,7 +726,7 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 		// gaps) of naming a real, known-open limitation rather than
 		// silently leaving it unstated or attempting a half-solution.
 		status := sandbox.State(sandboxRow.Status)
-		if status == sandbox.StateReady || status == sandbox.StateSuspect {
+		if status == sandbox.StateReady || status == sandbox.StateSuspect || status == sandbox.StateSnapshotting {
 			// Technical plan §3.3's stop: a gen a person's stop has still
 			// to retire (retireOrHold) takes nothing more. The agent may
 			// still be running the stopped work there, and its late
@@ -698,6 +742,29 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 			target, ok := findTurnByID(turns, pendingID)
 			if !ok {
 				return fmt.Errorf("sessionactor: dispatch turn: turn %s not found among loaded turns", pendingID.String())
+			}
+			// Technical plan §35.3: no turn is sent to a sandbox with less
+			// than its rotation threshold of runway left, past its
+			// deadline, or mid-snapshot (runway.go). After the spend cap's
+			// guard above, so a capped session never rotates; before the
+			// review checkout below, so no checkout goes to a gen about to
+			// rotate, and the new gen is asked again. The autonomy freeze
+			// is not consulted: a rotation is not an automatic action. A
+			// pass leaves the sandbox ready or suspect, never snapshotting.
+			runway, err := a.applyRunwayGate(ctx, tx, sessionRow, sandboxRow, false)
+			if err != nil {
+				return err
+			}
+			gate = runway.note
+			switch runway.action {
+			case sandbox.RunwayHold, sandbox.RunwaySuspect:
+				return nil
+			case sandbox.RunwayRevert:
+				repick = true
+				return nil
+			case sandbox.RunwayRotate, sandbox.RunwayRetire:
+				dispatch = &dispatchPlan{turnID: pendingID, sessionRow: sessionRow, rotationSnapshot: runway.snapshot, rotationRetire: runway.retire}
+				return nil
 			}
 			// Technical plan §21.1: a review turn that records a head is
 			// sent only once its sandbox reports holding that head
@@ -764,6 +831,10 @@ func (a *Actor) planDispatch(ctx context.Context, check *reviewContextCheck) (*s
 	if err == nil && checkoutCounted != "" {
 		a.recordReviewCheckout(ctx, checkoutCounted)
 	}
+	if err == nil {
+		a.recordRunwayGate(ctx, gate)
+		a.heldBehindDelivery = gate != nil && gate.decision.Reason == sandbox.RunwayReasonDeliveryOpen
+	}
 
 	return spawn, dispatch, deleted, repick, err
 }
@@ -826,18 +897,23 @@ func (a *Actor) recordCheckedOut(ctx context.Context, tx pgx.Tx, d *dispatchPlan
 // re-sent only once the new gen holds that head -- a moved head never
 // ends it -- and a checkout refused fails it forward. counted is the
 // review_checkout_total outcome that checkout decided, "" for none.
+//
+// Before that checkout, a turn re-sent to a new gen passes the runway gate
+// (technical plan §35.3, runway.go) with its turn in flight: a gen past
+// its deadline, or one a rotation is under way on, is retired first, and
+// nothing is rotated. gate is its decision, nil when it was not asked.
 func (a *Actor) planReenqueueOrRespawn(
 	ctx context.Context, tx pgx.Tx,
 	sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, hasSandbox bool,
 	entries []turn.QueueEntry[pgtype.UUID], turns []sqlcgen.Turn,
 	now time.Time,
-) (*spawnPlan, *dispatchPlan, string, error) {
+) (*spawnPlan, *dispatchPlan, string, *runwayNote, error) {
 	inFlightID, hasInFlight := turn.InFlightTurn(entries)
 	if !hasInFlight {
 		// No turn at all, or every turn is already terminal -- nothing
 		// for this session to do this round, exactly like planDispatch's
 		// own pre-existing early return.
-		return nil, nil, "", nil
+		return nil, nil, "", nil, nil
 	}
 
 	// Technical plan §3.3's stop: a turn in flight that a person's stop
@@ -848,17 +924,17 @@ func (a *Actor) planReenqueueOrRespawn(
 	// that retirement is owed).
 	if target, ok := findTurnByID(turns, inFlightID); ok && target.StopRequestedAt.Valid {
 		a.logger.Info("sessionactor: in-flight turn flagged by a stop; not re-sent", "turn_id", inFlightID.String())
-		return nil, nil, "", nil
+		return nil, nil, "", nil, nil
 	}
 
 	if !hasSandbox || sandbox.IsDeadSandboxStatus(sandbox.State(sandboxRow.Status)) {
 		sp, err := a.tryPlanSpawn(ctx, tx, sessionRow, sandboxRow, hasSandbox, now)
-		return sp, nil, "", err
+		return sp, nil, "", nil, err
 	}
 
 	target, ok := findTurnByID(turns, inFlightID)
 	if !ok {
-		return nil, nil, "", fmt.Errorf("sessionactor: in-flight turn %s not found among loaded turns", inFlightID.String())
+		return nil, nil, "", nil, fmt.Errorf("sessionactor: in-flight turn %s not found among loaded turns", inFlightID.String())
 	}
 
 	status := sandbox.State(sandboxRow.Status)
@@ -882,32 +958,54 @@ func (a *Actor) planReenqueueOrRespawn(
 			// comment above for the regression test proving an incapable
 			// gen's turn is never re-sent.
 			d, err := a.tryPlanReceiptResend(ctx, tx, sessionRow, sandboxRow, target)
-			return nil, d, "", err
+			return nil, d, "", nil, err
+		}
+		// Technical plan §35.3: the gate, with a turn in flight
+		// (runway.go). Nothing is rotated under it (row 10), so it consumes
+		// none of the turn's turn_deadline; a gen past its deadline whose
+		// agent is silent is suspected, through its terminal grace, and one
+		// a rotation is already under way on is retired, before the prompt
+		// is sent to it, and the evaluation after either re-sends it to the
+		// replacement. Before the checkout, as for a pending turn. The
+		// receipt re-send above is never gated: the turn may be running on
+		// that gen.
+		runway, err := a.applyRunwayGate(ctx, tx, sessionRow, sandboxRow, true)
+		if err != nil {
+			return nil, nil, "", nil, err
+		}
+		switch runway.action {
+		case sandbox.RunwayHold, sandbox.RunwaySuspect:
+			return nil, nil, "", runway.note, nil
+		case sandbox.RunwayRotate, sandbox.RunwayRetire, sandbox.RunwayRevert:
+			// A rotation needs no turn in flight (row 10), and a revert a
+			// snapshotting sandbox, which (b') never reaches: only a
+			// retirement can come here.
+			return nil, &dispatchPlan{turnID: target.ID, sessionRow: sessionRow, rotationSnapshot: runway.snapshot, rotationRetire: runway.retire}, "", runway.note, nil
 		}
 		checkout, err := a.applyReviewCheckout(ctx, tx, sessionRow, sandboxRow, turns, target, now)
 		if err != nil {
-			return nil, nil, "", err
+			return nil, nil, "", runway.note, err
 		}
 		switch checkout.decision {
 		case reviewCheckoutHold, reviewCheckoutFailForward, reviewCheckoutEnded:
 			// A processing turn is never ended here (applyReviewCheckout
 			// fails it forward instead), so reviewCheckoutEnded is listed
 			// only so no decision falls through to a re-send.
-			return nil, checkout.plan, checkout.counted, nil
+			return nil, checkout.plan, checkout.counted, runway.note, nil
 		}
 		d, err := a.tryPlanReenqueue(ctx, tx, sessionRow, sandboxRow, target, now)
 		if err != nil {
-			return nil, nil, "", err
+			return nil, nil, "", nil, err
 		}
 		counted, err := a.recordCheckedOut(ctx, tx, d, checkout)
 		if err != nil {
-			return nil, nil, "", err
+			return nil, nil, "", nil, err
 		}
-		return nil, d, counted, nil
+		return nil, d, counted, runway.note, nil
 	}
 
 	sp, err := a.tryPlanSpawn(ctx, tx, sessionRow, sandboxRow, hasSandbox, now)
-	return sp, nil, "", err
+	return sp, nil, "", nil, err
 }
 
 // tryPlanReenqueue implements §3.3's ("turn recovery") own re-enqueue
@@ -1098,11 +1196,25 @@ func (a *Actor) tryPlanSpawn(
 	}
 
 	caps := a.provider.Capabilities()
+	// Technical plan §35.3: a gen the runway gate took out for its runway
+	// -- rotated, or past its deadline -- is never resumed. A resume claims
+	// the same provider object and carries its deadline forward (§35.2),
+	// so it would bring back the very sandbox the rotation replaces; the
+	// restore or fresh spawn below gets a new object and a fresh deadline.
+	// Read only for a provider that resumes.
+	resume := caps.Resume
+	if resume && hasSandbox {
+		ruledOut, err := a.runwayRuledOutResume(ctx, tx, sandboxRow)
+		if err != nil {
+			return nil, err
+		}
+		resume = !ruledOut
+	}
 	action := sandbox.EvaluateSpawnDecision(spawnState, sandbox.SpawnConfig{
 		Cooldown:        a.timeouts.SpawnCooldown,
 		ReadyWait:       a.timeouts.SpawnReadyWait,
 		SpawningTimeout: a.timeouts.SpawnStuckTimeout,
-	}, now, false, caps.Resume)
+	}, now, false, resume)
 
 	// §27.5's own dispatch-time half of the "fail-closed, twice" rule
 	// (§27.5/§27.6, brief point A) -- deliberately gated to ONLY the
@@ -1226,11 +1338,26 @@ func (a *Actor) tryPlanSpawn(
 		}
 	}
 
+	// Technical plan §35.3: the claim that replaces a gen the runway gate
+	// rotated (runway.go) is this ordinary decision's, and says what it did:
+	// a restore of the rotation's own snapshot, a restore of the one before
+	// it -- the rotation's was never recorded -- which writes the fallback
+	// warning in this claim's transaction, or a fresh spawn, which writes
+	// none (a refused restore writes its own above). Read off the replaced
+	// row, before the claim's upsert clears its rotation.
+	wasRotating := hasSandbox && rotating(sandboxRow)
+
 	switch action.Kind {
 	case sandbox.SpawnActionSpawn:
 		plan, err := a.planFreshSpawn(ctx, tx, sessionRow, hasSandbox, sandboxRow, now)
-		if err != nil || plan == nil || refusal == nil {
+		if err != nil || plan == nil {
 			return plan, err
+		}
+		if wasRotating {
+			plan.rotation = &rotationOutcome{outcome: rotationOutcomeFresh, retiredGen: sandboxRow.Gen}
+		}
+		if refusal == nil {
+			return plan, nil
 		}
 		if err := a.applySnapshotRefusal(ctx, tx, plan, refusal); err != nil {
 			return nil, err
@@ -1248,6 +1375,16 @@ func (a *Actor) tryPlanSpawn(
 			return nil, err
 		}
 		plan.restoreDecision = restoreDecision
+		if wasRotating {
+			outcome := rotationOutcomeRotated
+			if !rotationSnapshotTaken(sandboxRow) {
+				outcome = rotationOutcomeFellBack
+				if err := a.recordRotationFallback(ctx, tx, plan.gen, sandboxRow.Gen, action.SnapshotImageID, snapshotMintedAt(sandboxRow)); err != nil {
+					return nil, err
+				}
+			}
+			plan.rotation = &rotationOutcome{outcome: outcome, retiredGen: sandboxRow.Gen, snapshotID: action.SnapshotImageID}
+		}
 		return plan, nil
 	case sandbox.SpawnActionResume:
 		// Only reachable when hasSandbox is true (EvaluateSpawnDecision's
@@ -1275,12 +1412,12 @@ func (a *Actor) tryPlanSpawn(
 // logHeldBehindSnapshot logs a turn held behind its sandbox's snapshot
 // (EvaluateSpawnDecision's snapshotting Skip), with the gen and how long
 // the sandbox has been snapshotting, read from the sandbox_status event
-// that recorded the change (postgres.EventStore.SandboxStatusAge). Nothing
-// bounds that hold yet: a snapshot the agent never reports keeps the turn
-// pending, and this line, repeated at each evaluation with a growing age,
-// is what shows it -- where each such evaluation used to fail and back the
-// dispatch timer off. A failed read fails the evaluation, as any read in
-// it does.
+// that recorded the change (postgres.EventStore.SandboxStatusAge). Since
+// the runway gate (runway.go) decides a pending turn's evaluation of a
+// snapshotting sandbox, and bounds it by SnapshotReportWait, only a turn in
+// flight re-sent to a snapshotting gen reaches this Skip; such a turn is
+// still bounded by its own turn_deadline. A failed read fails the
+// evaluation, as any read in it does.
 func (a *Actor) logHeldBehindSnapshot(ctx context.Context, tx pgx.Tx, row sqlcgen.Sandbox) error {
 	seconds, known, err := a.stores.event.WithTx(tx).SandboxStatusAge(ctx, a.sessionID, row.Gen, row.Status)
 	if err != nil {
@@ -1292,7 +1429,7 @@ func (a *Actor) logHeldBehindSnapshot(ctx context.Context, tx pgx.Tx, row sqlcge
 	} else {
 		attrs = append(attrs, "snapshotting_seconds_unknown", true)
 	}
-	a.logger.Info("sessionactor: turn held: its sandbox is snapshotting", attrs...)
+	a.logger.Info(snapshotHeldLogMessage, attrs...)
 	return nil
 }
 
