@@ -60,6 +60,7 @@ func TestSentinelAutoFixNotifier_RevokedRepo_SkipsTerminallyNeverRetried(t *test
 		t.Fatalf("revoke: %v", err)
 	}
 
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, prNumber, originSession.ID, "feature-fix-me")
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)

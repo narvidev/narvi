@@ -14,6 +14,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/app/auditlog"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowledger"
@@ -154,7 +155,8 @@ type sentinelAutoFixNotifier struct {
 	// doc comment for how a rollout refusal here maps to the existing
 	// "confirmed negative -> nil, never retried" terminal-skip precedent
 	// (descriptionautofix.go), never the outbox's ordinary backoff/retry/
-	// dead-letter path.
+	// dead-letter path. repoSettings also serves Deliver's own read of the
+	// repository's sentinel_autofix_enabled toggle at delivery (§17.2).
 	rolloutMode  platform.RolloutMode
 	repoSettings *postgres.RepoSettingsStore
 	// prSessions (§31.4) is the SAME further REQUIRED dependency every
@@ -273,7 +275,9 @@ func sentinelAutoFixPromptText(descriptions []string) string {
 // Deliver implements ports.Notifier: unmarshals payload, checks the
 // cheap, non-atomic idempotency fast path (a child session already
 // spawned for this claim -- skip straight to the MarkFixPending tail,
-// never re-spawn), otherwise atomically claims the sentinel_fixes row and
+// never re-spawn), otherwise -- once the egress check and the repository's
+// sentinel auto-fix toggle, read again here, both let it through --
+// atomically claims the sentinel_fixes row and
 // spawns the child session together (spawnClaimedChildSession), then
 // records the winning child session back onto every finding this
 // delivery's own payload addresses (markFindingsFixPending).
@@ -389,6 +393,15 @@ func (n *sentinelAutoFixNotifier) Deliver(ctx context.Context, notification port
 	}
 
 	fix, err := n.sentinelFixes.GetByID(ctx, fixID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The claim is gone: another delivery for it skipped it because
+		// the repository turned the auto-fix off, and released it
+		// (endWithoutSpawn), or its origin session was deleted. No
+		// redelivery can bring this id back, so this row ends here, for
+		// good, like that skip, with its own skip record naming its own
+		// findings; the next qualifying verdict claims afresh.
+		return n.endWithoutSpawn(ctx, payload, fixID, skipReasonClaimReleasedEarlier)
+	}
 	if err != nil {
 		return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: get sentinel_fixes row: %w", err)
 	}
@@ -456,6 +469,42 @@ func (n *sentinelAutoFixNotifier) Deliver(ctx context.Context, notification port
 		// end in the ledger".
 		if notification.SuppressedInShadow || !n.isLive(ctx, payload.RepoFullName) {
 			return n.recordShortCircuit(ctx, payload)
+		}
+
+		// §17.1's per-repository toggle, read again here (§17.2): the
+		// trigger read it when the verdict landed, and an administrator
+		// may have turned it off since -- while the autonomy freeze held
+		// this row (§40.2), or while it waited out a retry back-off. Read
+		// the way descriptionAutofixNotifier.Deliver reads its own flag,
+		// at the same point: after the egress decision (that notifier's
+		// shadow divert runs in the builder, before Deliver; this kind's
+		// runs just above) and before anything else -- spawnClaimedChildSession
+		// below makes the first GitHub call and creates the branch.
+		//
+		// A missing row is a confirmed off, like a row with the toggle
+		// off: endWithoutSpawn ends this row for good -- no branch
+		// created, no session, every addressed finding left 'open', the
+		// claim released so nothing reads as a fix in flight. Turning the
+		// toggle back on does not revive it; the next qualifying verdict
+		// claims afresh (reviewverdict.go). Any other read error is
+		// uncertain, never taken for either answer: returned, so the
+		// outbox retries the delivery.
+		//
+		// Read on the not-yet-claimed path only, for the reason the
+		// egress check above is: a claim that already has a child has a
+		// real branch and a real session at work, and the bookkeeping
+		// below records that work on its findings, whatever the toggle
+		// says now.
+		settings, err := n.repoSettings.Get(ctx, payload.RepoFullName)
+		switch {
+		case err == nil:
+			if !settings.SentinelAutofixEnabled {
+				return n.endWithoutSpawn(ctx, payload, fix.ID, skipReasonAutoFixDisabled)
+			}
+		case errors.Is(err, pgx.ErrNoRows):
+			return n.endWithoutSpawn(ctx, payload, fix.ID, skipReasonAutoFixDisabled)
+		default:
+			return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: read repo settings: %w", err)
 		}
 
 		// Cheap, non-atomic fast path: skips createFixBranch's two GitHub
@@ -550,6 +599,123 @@ func (n *sentinelAutoFixNotifier) recordShortCircuit(ctx context.Context, payloa
 
 	platform.Logger(ctx).Info("outboxworker: sentinelAutoFixNotifier: repository egress is suppressed; recording would-have-created-branch and would-have-spawned-fix-session, never claiming (§30.7/§30.9)",
 		"repo_full_name", payload.RepoFullName, "origin_pr_number", payload.OriginPRNumber, "would_create_branch", branch)
+	return nil
+}
+
+// The reasons a sentinel auto-fix delivery ends without a spawn, as its
+// sentinel_fix.spawn_skipped audit row names them ("reason").
+const (
+	// skipReasonAutoFixDisabled: the repository has the sentinel auto-fix
+	// turned off, or no settings row (Deliver's toggle read).
+	skipReasonAutoFixDisabled = "sentinel_autofix_disabled"
+	// skipReasonClaimReleasedEarlier: the delivery's claim no longer exists
+	// when it is read -- another delivery for it skipped and released it.
+	skipReasonClaimReleasedEarlier = "claim_released_earlier"
+)
+
+// What became of the claim, as a skip record names it ("claim").
+const (
+	// claimReleased: this delivery released it.
+	claimReleased = "released"
+	// claimReleasedEarlier: it was gone before this delivery could release
+	// it -- another delivery for it released it first, possibly while
+	// this one waited on that delivery's lock.
+	claimReleasedEarlier = "released_earlier"
+	// claimKept: it was not released, since a fix went ahead under it -- a
+	// concurrent delivery spawned under it while this one waited on that
+	// delivery's lock.
+	claimKept = "kept"
+)
+
+// endWithoutSpawn ends a delivery that spawns nothing, for reason, in one
+// transaction:
+//
+//   - for skipReasonAutoFixDisabled, it releases the claim
+//     (SentinelFixStore.ReleaseUnspawned): a claim left 'pending' with
+//     nothing coming would read as a fix in flight on the review readout
+//     for as long as the pull request is open, while every finding it
+//     names stays 'open' and its manual apply-suggestion action available
+//     (§17.3). Only a claim still unspawned is released. When nothing is
+//     released, the claim is read again on the same transaction -- after
+//     any concurrent delivery whose lock the release waited on has
+//     committed -- to tell a claim another delivery released first
+//     (claimReleasedEarlier) from one a concurrent delivery spawned under
+//     (claimKept), which that delivery records on the findings it names;
+//   - it writes one audit_log row, sentinel_fix.spawn_skipped on the
+//     claim, actor NULL -- the record the sentinel path already keeps for
+//     the merge gate's own decisions (sentinel_fix.merge_gate_evaluated,
+//     §17.5), so a person reading the audit log sees why no fix followed
+//     each finding: every delivery that ends here writes its own, naming
+//     its own findings, its reason and what became of the claim. It names
+//     the fix branch sentinelFixBranchName derives for the claim: this
+//     attempt creates none, but an earlier attempt of the same delivery
+//     that failed after createFixBranch left it in the repository,
+//     unused, and nothing here can tell that from a first attempt without
+//     asking GitHub, which this path never does. The branch is not
+//     deleted: nothing records the commit this system created it at, so
+//     nothing could tell it from a branch a person has since pushed to.
+//
+// Then one Info line, and nil, so the outbox marks the row delivered and
+// never retries it. That mark is the builder's own write, made after
+// Deliver returns, so it cannot share this transaction; instead a failure
+// of any write here rolls them all back and is returned, as
+// recordShortCircuit returns a failed ledger write: the outbox retries the
+// whole delivery, which reads the claim and the toggle again, and nothing
+// has happened yet.
+func (n *sentinelAutoFixNotifier) endWithoutSpawn(ctx context.Context, payload ports.SentinelAutoFixPayload, sentinelFixID pgtype.UUID, reason string) error {
+	branch := sentinelFixBranchName(sentinelFixID.String())
+
+	tx, err := n.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: begin the skip's transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	claim := claimReleasedEarlier
+	if reason == skipReasonAutoFixDisabled {
+		txFixes := n.sentinelFixes.WithTx(tx)
+		released, err := txFixes.ReleaseUnspawned(ctx, sentinelFixID)
+		if err != nil {
+			return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: release the skipped fix's claim: %w", err)
+		}
+		if released > 0 {
+			claim = claimReleased
+		} else {
+			switch _, readErr := txFixes.GetByID(ctx, sentinelFixID); {
+			case readErr == nil:
+				claim = claimKept
+			case !errors.Is(readErr, pgx.ErrNoRows):
+				return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: read the claim the skip could not release: %w", readErr)
+			}
+		}
+	}
+
+	if err := auditlog.Record(ctx, n.auditLog.WithTx(tx), pgtype.UUID{}, "sentinel_fix.spawn_skipped", "sentinel_fix", sentinelFixID.String(), map[string]any{
+		"repo_full_name":          payload.RepoFullName,
+		"origin_pr_number":        payload.OriginPRNumber,
+		"origin_session":          payload.OriginReviewSessionID,
+		"reason":                  reason,
+		"finding_identity_hashes": payload.FindingIdentityHashes,
+		"claim":                   claim,
+		// Present in the repository only if an earlier, failed attempt of
+		// this delivery created it (this function's doc comment).
+		"fix_branch": branch,
+	}); err != nil {
+		return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: record the skipped fix in the audit log: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: commit the skip's transaction: %w", err)
+	}
+	committed = true
+
+	platform.Logger(ctx).Info("outboxworker: sentinelAutoFixNotifier: the fix will not be spawned; skipping, never retried",
+		"reason", reason, "repo", payload.RepoFullName, "origin_pr_number", payload.OriginPRNumber, "sentinel_fix_id", sentinelFixID.String(),
+		"claim", claim, "fix_branch_if_an_earlier_attempt_created_it", branch)
 	return nil
 }
 
