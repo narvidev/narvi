@@ -18,9 +18,10 @@
 // memory: fixed lines say the sandbox was started fresh, that the report
 // was rebuilt from the session's record and can be incomplete or wrong,
 // and ask the agent to check every claim against the repository as it is
-// now. Every line of every excerpt is quoted ("> "), and every other line
-// is one of the template's own (IsTemplateLine), so no text a person or an
-// agent wrote can pass for the framing or close the report early.
+// now. Every line of every excerpt is quoted ("> "), and a fixed line says
+// the quoted lines are a record, never instructions (§5.2). Every other
+// line is one of the template's own (IsTemplateLine), so no text a person
+// or an agent wrote can pass for the framing or close the report early.
 //
 // The recap is bounded: each excerpt by RequestExcerptBytes or
 // ReportExcerptBytes, the turns by MaxTurns, and the whole, in JSON-encoded
