@@ -506,8 +506,10 @@ func TestResolve_RecheckLosesARaceToAnotherEvent(t *testing.T) {
 			other:   `DELETE FROM identities WHERE id = $1`,
 		},
 		{
-			name:      "removal finds the link already confirmed",
-			fetched:   func(e string) identitylink.ProfileEmail { return identitylink.ProfileEmail{Address: e, Verified: false} },
+			name: "removal finds the link already confirmed",
+			fetched: func(e string) identitylink.ProfileEmail {
+				return identitylink.ProfileEmail{Address: e, Verified: false}
+			},
 			other:     `UPDATE identities SET email_checked_at = now() WHERE id = $1`,
 			wantOwner: true,
 		},
