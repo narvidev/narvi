@@ -41,11 +41,16 @@
 // call to resolve an actor, resolveSlackActor, against a real slackapi
 // client and a real database. A full HTTP request per shape would spend a
 // handler rig, and for a linked member a session and its actor, on each of
-// them, to reach the same call; the bridge reaches it directly.
+// them, to reach the same call; the bridge reaches it directly. The same
+// file's TestResolveSlackActor_SlowSlackLinksOnTheFirstEvent times a cold
+// client against a slow Slack through both resolution paths -- the Events
+// API's retried one and a click's single attempt
+// (resolveSlackActorSingleAttempt) -- under the shipped budgets.
 package slack
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -79,4 +84,11 @@ func RequestChangesRefusalTextForTest(cerr *httpapi.CreateTurnError) string {
 // this file's own top doc comment. A pure pass-through.
 func ResolveSlackActorForTest(ctx context.Context, slackClient shadowslack.Client, identityLinkDeps identitylink.Deps, timeouts platform.Timeouts, slackUserID string) (pgtype.UUID, string) {
 	return resolveSlackActor(ctx, platform.Logger(ctx), slackClient, identityLinkDeps, timeouts, slackUserID)
+}
+
+// ResolveSlackActorSingleAttemptForTest bridges
+// resolveSlackActorSingleAttempt (identity.go) -- see this file's own top
+// doc comment. A pure pass-through.
+func ResolveSlackActorSingleAttemptForTest(ctx context.Context, slackClient shadowslack.Client, identityLinkDeps identitylink.Deps, fetchTimeout time.Duration, slackUserID string) (pgtype.UUID, string, error) {
+	return resolveSlackActorSingleAttempt(ctx, platform.Logger(ctx), slackClient, identityLinkDeps, fetchTimeout, slackUserID)
 }

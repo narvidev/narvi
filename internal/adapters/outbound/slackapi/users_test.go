@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 )
@@ -17,8 +18,9 @@ import (
 const installationTeam = "T0HOME"
 
 // fakeSlackUsers is a fake Slack Web API answering users.info with user
-// (Slack's user object) and auth.test with authTest, recording every
-// request's path, Authorization header and users.info user parameter.
+// (Slack's user object) and auth.test with authTest, each after its own
+// delay, recording every request's path, Authorization header and
+// users.info user parameter.
 type fakeSlackUsers struct {
 	mu       sync.Mutex
 	paths    []string
@@ -26,11 +28,19 @@ type fakeSlackUsers struct {
 	userIDs  []string
 	user     map[string]any
 	authTest map[string]any
+
+	usersInfoDelay time.Duration
+	authTestDelay  time.Duration
 }
 
 func newFakeSlackUsers(t *testing.T, user, authTest map[string]any) (*fakeSlackUsers, *slackapi.Client) {
 	t.Helper()
-	f := &fakeSlackUsers{user: user, authTest: authTest}
+	return newSlowFakeSlackUsers(t, user, authTest, 0, 0)
+}
+
+func newSlowFakeSlackUsers(t *testing.T, user, authTest map[string]any, usersInfoDelay, authTestDelay time.Duration) (*fakeSlackUsers, *slackapi.Client) {
+	t.Helper()
+	f := &fakeSlackUsers{user: user, authTest: authTest, usersInfoDelay: usersInfoDelay, authTestDelay: authTestDelay}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.paths = append(f.paths, r.URL.Path)
@@ -39,6 +49,15 @@ func newFakeSlackUsers(t *testing.T, user, authTest map[string]any) (*fakeSlackU
 			f.userIDs = append(f.userIDs, r.URL.Query().Get("user"))
 		}
 		f.mu.Unlock()
+		delay := f.usersInfoDelay
+		if r.URL.Path == "/auth.test" {
+			delay = f.authTestDelay
+		}
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/users.info":
@@ -202,11 +221,11 @@ func TestGetUserEmail_Success(t *testing.T) {
 		t.Errorf("email = %q, want %q", user.Email, "ada@example.com")
 	}
 
+	if fake.count("/users.info") != 1 || fake.count("/auth.test") != 1 {
+		t.Errorf("users.info calls = %d, auth.test calls = %d, want 1 each", fake.count("/users.info"), fake.count("/auth.test"))
+	}
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	if len(fake.paths) != 2 || fake.paths[0] != "/users.info" || fake.paths[1] != "/auth.test" {
-		t.Errorf("request paths = %v, want [/users.info /auth.test]", fake.paths)
-	}
 	for i, auth := range fake.auths {
 		if auth != "Bearer xoxb-test-token" {
 			t.Errorf("request %d Authorization header = %q, want %q", i, auth, "Bearer xoxb-test-token")
@@ -282,8 +301,10 @@ func TestGetUserEmail_NoEmailVisible(t *testing.T) {
 	if user.Email != "" || user.Verified() {
 		t.Errorf("user = %+v, want no email, not verified", user)
 	}
-	if n := fake.count("/auth.test"); n != 0 {
-		t.Errorf("auth.test calls = %d, want 0 (nothing to judge without an email)", n)
+	// The lookup starts alongside users.info, before the member is known,
+	// so it may run; it is never asked twice.
+	if n := fake.count("/auth.test"); n > 1 {
+		t.Errorf("auth.test calls = %d, want at most 1", n)
 	}
 }
 

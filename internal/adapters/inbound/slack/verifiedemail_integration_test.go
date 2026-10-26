@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/inbound/slack"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
@@ -38,8 +39,24 @@ import (
 // and auth.test with testSlackTeam. It counts users.info calls.
 func newFakeSlackMember(t *testing.T, member map[string]any) (*slackapi.Client, *int32) {
 	t.Helper()
-	var usersInfoCalls int32
+	client, usersInfoCalls, _ := newSlowFakeSlackMember(t, member, 0)
+	return client, usersInfoCalls
+}
+
+// newSlowFakeSlackMember is newFakeSlackMember answering every call after
+// delay, and counting auth.test calls too.
+func newSlowFakeSlackMember(t *testing.T, member map[string]any, delay time.Duration) (*slackapi.Client, *int32, *int32) {
+	t.Helper()
+	var usersInfoCalls, authTestCalls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-time.After(delay):
+		case <-r.Context().Done():
+			return
+		}
+		if r.URL.Path == "/auth.test" {
+			atomic.AddInt32(&authTestCalls, 1)
+		}
 		if answerSlackAuthTest(w, r) {
 			return
 		}
@@ -56,7 +73,7 @@ func newFakeSlackMember(t *testing.T, member map[string]any) (*slackapi.Client, 
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	}))
 	t.Cleanup(server.Close)
-	return slackapi.New(server.Client(), server.URL, "test-bot-token"), &usersInfoCalls
+	return slackapi.New(server.Client(), server.URL, "test-bot-token"), &usersInfoCalls, &authTestCalls
 }
 
 // fastIdentityFetchTimeouts is DefaultTimeouts with a short profile-email
@@ -257,6 +274,60 @@ func TestResolveSlackActor_RechecksAnAutoLinkMadeBeforeTheConfirmedEmailRule(t *
 			}
 			if want := map[bool]int{true: 1, false: 0}[tt.wantRevoke]; revokes != want {
 				t.Errorf("identity.auto_link_revoked entries = %d, want %d", revokes, want)
+			}
+		})
+	}
+}
+
+// TestResolveSlackActor_SlowSlackLinksOnTheFirstEvent proves a cold client
+// links a confirmed full member on the member's first event when Slack
+// answers every call in 450ms -- the latency the shipped per-attempt
+// budgets call healthy -- under platform.DefaultTimeouts(), through both
+// resolution paths: the Events API's (identitylink.FetchEmailWithRetry,
+// IdentityEmailFetchTimeout) and a click's single attempt
+// (SlackInteractivityIdentityFetchTimeout). auth.test runs alongside
+// users.info on its own budget, so the first attempt is enough.
+func TestResolveSlackActor_SlowSlackLinksOnTheFirstEvent(t *testing.T) {
+	pool := newTestPool(t)
+	ctx := context.Background()
+	deps := newIdentityLinkDepsForTest(pool, narvipg.NewAuditLogStore(pool))
+	timeouts := platform.DefaultTimeouts()
+	const latency = 450 * time.Millisecond
+
+	tests := []struct {
+		name    string
+		resolve func(client *slackapi.Client, slackUserID string) (pgtype.UUID, string, error)
+	}{
+		{"Events API, retried fetch", func(client *slackapi.Client, slackUserID string) (pgtype.UUID, string, error) {
+			userID, notice := slack.ResolveSlackActorForTest(ctx, client, deps, timeouts, slackUserID)
+			return userID, notice, nil
+		}},
+		{"click, single attempt", func(client *slackapi.Client, slackUserID string) (pgtype.UUID, string, error) {
+			return slack.ResolveSlackActorSingleAttemptForTest(ctx, client, deps, timeouts.SlackInteractivityIdentityFetchTimeout, slackUserID)
+		}},
+	}
+	for i, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			slackUserID := fmt.Sprintf("U-SLOW-%02d", i)
+			email := fmt.Sprintf("slow-member-%02d@example.com", i)
+			user, err := deps.Users.Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: email, DisplayName: email, Role: sqlcgen.UserRoleMember})
+			if err != nil {
+				t.Fatalf("create fixture user: %v", err)
+			}
+			client, usersInfoCalls, authTestCalls := newSlowFakeSlackMember(t, confirmedSlackMember(email), latency)
+
+			gotUser, notice, err := tt.resolve(client, slackUserID)
+			if err != nil {
+				t.Fatalf("resolve: %v", err)
+			}
+			if gotUser != user.ID || notice != autoLinkedNotice {
+				t.Fatalf("first event resolved to (%v, %q), want (%v, %q)", gotUser, notice, user.ID, autoLinkedNotice)
+			}
+			if got := atomic.LoadInt32(usersInfoCalls); got != 1 {
+				t.Errorf("users.info calls = %d, want 1: the first attempt must succeed", got)
+			}
+			if got := atomic.LoadInt32(authTestCalls); got != 1 {
+				t.Errorf("auth.test calls = %d, want 1", got)
 			}
 		})
 	}

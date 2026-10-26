@@ -17,10 +17,15 @@
 -- against Slack: kept, and stamped, when Slack reports the same email as
 -- confirmed for a full member of this workspace; otherwise removed, with an
 -- identity.auto_link_revoked audit entry written in the same transaction,
--- and the member is offered the account-link flow. A link made any other
--- way (linked_via prompt or admin) carries no stamp and needs none: the
--- re-check never reads or removes it. Other providers' automatic links are
--- unaffected: their definition of a verified email did not change.
+-- and the identity goes through the matching steps again on the email just
+-- fetched -- linked automatically to the one user a verified email matches,
+-- who may be another user when the email changed, and otherwise sent the
+-- link prompt. A fetch that learns nothing leaves the link as it is,
+-- unused. A link made any other way (linked_via prompt or admin) carries
+-- no stamp and needs none: the re-check never reads or removes it, and an
+-- admin's force-link of an unchecked one to the same user turns it into an
+-- admin link. Other providers' automatic links are unaffected: their
+-- definition of a verified email did not change.
 --
 -- No backfill: whether Slack confirms an email is not in the database. No
 -- index: the column is read with the identity row, by the row's existing

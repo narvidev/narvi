@@ -59,7 +59,7 @@ type CreateIdentityParams struct {
 // don't expire, but re-storing on each login is harmless and keeps the
 // stored token fresh if the user ever re-authorized with different
 // scopes).
-// email_checked_at (migrations/000176) is set only by an automatic link on
+// email_checked_at (migrations/000177) is set only by an automatic link on
 // an email its caller reports verified (internal/app/identitylink.AutoLink);
 // every other caller leaves it NULL.
 func (q *Queries) CreateIdentity(ctx context.Context, arg CreateIdentityParams) (Identity, error) {
@@ -246,7 +246,7 @@ WHERE email_verified = true AND lower(email) = lower($1)
 // result must dedupe by user_id regardless; DISTINCT here just avoids
 // handing back an already-known duplicate in the common case.
 //
-// A Slack automatic link nothing has checked since migrations/000176 (the
+// A Slack automatic link nothing has checked since migrations/000177 (the
 // previous binary took any Slack profile email as verified) is left out
 // until identitylink.Resolve re-checks it against Slack -- the same rows
 // identitylink's autoLinkUnchecked names, and DeleteUncheckedAutoLinkedIdentity
@@ -269,6 +269,40 @@ func (q *Queries) ListVerifiedIdentityUserIDsByEmail(ctx context.Context, lower 
 		return nil, err
 	}
 	return items, nil
+}
+
+const promoteUncheckedAutoLinkToAdmin = `-- name: PromoteUncheckedAutoLinkToAdmin :one
+UPDATE identities
+SET linked_via = 'admin', email_verified = false
+WHERE id = $1 AND linked_via = 'auto_email'
+  AND (NOT email_verified OR (provider = 'slack' AND email_checked_at IS NULL))
+RETURNING id, user_id, provider, external_id, email, email_verified, linked_via, created_at, access_token_encrypted, email_checked_at
+`
+
+// An admin force-links (provider, external_id) to the user an automatic
+// link nothing has confirmed already names (internal/adapters/inbound/
+// httpapi's LinkMemberIdentity): the link becomes the admin's, so the
+// re-check never reads or removes it again. email_verified goes false: the
+// admin vouches for the link, not for an email the provider never
+// confirmed, so it is no evidence for matching another identity. Matches
+// only the rows DeleteUncheckedAutoLinkedIdentity would; pgx.ErrNoRows
+// when the row is anything else.
+func (q *Queries) PromoteUncheckedAutoLinkToAdmin(ctx context.Context, id pgtype.UUID) (Identity, error) {
+	row := q.db.QueryRow(ctx, promoteUncheckedAutoLinkToAdmin, id)
+	var i Identity
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Provider,
+		&i.ExternalID,
+		&i.Email,
+		&i.EmailVerified,
+		&i.LinkedVia,
+		&i.CreatedAt,
+		&i.AccessTokenEncrypted,
+		&i.EmailCheckedAt,
+	)
+	return i, err
 }
 
 const updateIdentityAccessToken = `-- name: UpdateIdentityAccessToken :one

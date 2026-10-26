@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -113,4 +114,20 @@ func (s *IdentityStore) ConfirmAutoLinkEmail(ctx context.Context, id pgtype.UUID
 // number of rows deleted (0 when there was nothing of that kind left).
 func (s *IdentityStore) DeleteUncheckedAutoLink(ctx context.Context, id pgtype.UUID) (int64, error) {
 	return s.q.DeleteUncheckedAutoLinkedIdentity(ctx, id)
+}
+
+// PromoteUncheckedAutoLinkToAdmin turns id, an automatic link nothing has
+// confirmed (the rows DeleteUncheckedAutoLink deletes), into an admin link
+// with no verified email -- an admin's force-link of the same identity to
+// the same user (internal/adapters/inbound/httpapi's LinkMemberIdentity).
+// promoted is false, with a nil error, when id is not such a row.
+func (s *IdentityStore) PromoteUncheckedAutoLinkToAdmin(ctx context.Context, id pgtype.UUID) (identity sqlcgen.Identity, promoted bool, err error) {
+	identity, err = s.q.PromoteUncheckedAutoLinkToAdmin(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return sqlcgen.Identity{}, false, nil
+	}
+	if err != nil {
+		return sqlcgen.Identity{}, false, err
+	}
+	return identity, true, nil
 }

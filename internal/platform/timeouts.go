@@ -1788,10 +1788,16 @@ type Timeouts struct {
 	// own precedent -- plain fields with sensible defaults, not wired into
 	// a fake invariant link.
 
-	// IdentityEmailFetchTimeout bounds ONE outbound provider profile-email
-	// API call (Slack users.info / Linear's `user(id) { email }` query,
+	// IdentityEmailFetchTimeout bounds ONE profile-email fetch attempt
+	// (Slack users.info / Linear's `user(id) { email }` query,
 	// internal/app/identitylink's own Resolve) -- a single attempt's own
-	// budget.
+	// budget, sized for one outbound call. A Slack attempt also needs the
+	// installation's own workspace (§13.2's definition of a verified Slack
+	// email) until the client has learned it; that auth.test call runs
+	// ALONGSIDE users.info, on its own budget (SlackInstallationTeamLookupTimeout,
+	// never derived from this one), and is shared by every attempt that
+	// waits on it, so the attempt still costs one call's latency, and an
+	// attempt that gives up leaves the lookup running for the next one.
 	//
 	// Audit fix (L5, "the retry timing doc is wrong, and the real worst
 	// case blocks Slack's actual ~3s webhook ack window"): this used to be
@@ -1985,7 +1991,33 @@ type Timeouts struct {
 	// shares a looser ~3s window but is spent across up to
 	// IdentityEmailFetchMaxAttempts attempts) -- they now simply agree on
 	// what a single realistic attempt at this call costs.
+	//
+	// Like IdentityEmailFetchTimeout, this budget is sized for one call:
+	// the auth.test call that learns the installation's own workspace runs
+	// alongside users.info on its own budget (SlackInstallationTeamLookupTimeout)
+	// and is never bounded by this one.
 	SlackInteractivityIdentityFetchTimeout time.Duration
+
+	// SlackInstallationTeamLookupTimeout bounds the one auth.test call
+	// internal/adapters/outbound/slackapi makes to learn the workspace its
+	// bot token belongs to -- the installation's own workspace, which
+	// §13.2's definition of a verified Slack email compares each member's
+	// team_id against. The client asks once, keeps the answer for its
+	// lifetime, and shares one call in flight between every caller that
+	// needs it. The call runs on its own context, bounded by this value and
+	// never derived from a caller's: a profile-email attempt
+	// (IdentityEmailFetchTimeout, SlackInteractivityIdentityFetchTimeout)
+	// that gives up waiting leaves it running, so a slow first answer is
+	// still cached for the next attempt instead of being cut off with every
+	// attempt in turn. Started alongside users.info, and warmed once at
+	// startup without blocking boot.
+	//
+	// Not specified in the plan; chosen as 10s, SlackAckTimeout's figure
+	// for a single Slack Web API call. Validate keeps it strictly longer
+	// than either per-attempt budget: a lookup no longer than an attempt
+	// would fail at exactly the latency the attempt itself tolerates, and
+	// the workspace would never be learned.
+	SlackInstallationTeamLookupTimeout time.Duration
 
 	// IdentityLinkPromptTTL is how long a magic-link identity_link_prompts
 	// row (§13.2 step 4: "a short-lived magic link") stays valid before
@@ -4656,6 +4688,7 @@ func DefaultTimeouts() Timeouts {
 		IdentityEmailFetchRetryBaseDelay:       100 * time.Millisecond, // audit fix L5 -- was 200ms; see IdentityEmailFetchRetryMaxDelay's own doc comment
 		IdentityEmailFetchRetryMaxDelay:        150 * time.Millisecond, // audit fix L5 -- was 1s; see field doc comment for the full worst-case timing budget
 		SlackInteractivityIdentityFetchTimeout: 800 * time.Millisecond, // not specified; chosen, inside the decision's share SlackInteractivityDecisionTimeout() (Validate) with margin for the authorization check and DecidePlan
+		SlackInstallationTeamLookupTimeout:     10 * time.Second,       // §13.2, not specified; chosen, SlackAckTimeout's figure for one Slack Web API call, longer than either per-attempt fetch budget (Validate) -- see field doc comment
 		IdentityLinkPromptTTL:                  24 * time.Hour,         // not specified beyond "short-lived"; chosen
 
 		GitHubGetPRTimeout: 10 * time.Second, // not specified (fix postdates the plan); chosen, generous for a single GitHub REST GET, mirrors PRCreateTimeout/SlackAckTimeout's own reasoning
@@ -5532,6 +5565,19 @@ func (t Timeouts) Validate() error {
 	strictlyBelow("SlackInteractivityAckTimeout - SlackInteractivityReplyTimeout > SlackInteractivityIdentityFetchTimeout",
 		"SlackInteractivityIdentityFetchTimeout", t.SlackInteractivityIdentityFetchTimeout,
 		"SlackInteractivityAckTimeout-SlackInteractivityReplyTimeout", t.SlackInteractivityDecisionTimeout())
+
+	// §13.2: the installation's own workspace is learned by one auth.test
+	// call on its own budget, which a profile-email attempt waits on but
+	// never bounds. It must outlast either attempt's budget, or it fails at
+	// the very latency the attempt tolerates and is never learned -- every
+	// Slack email then reads as unverified. See
+	// SlackInstallationTeamLookupTimeout's own doc comment.
+	strictlyBelow("SlackInstallationTeamLookupTimeout > IdentityEmailFetchTimeout",
+		"IdentityEmailFetchTimeout", t.IdentityEmailFetchTimeout,
+		"SlackInstallationTeamLookupTimeout", t.SlackInstallationTeamLookupTimeout)
+	strictlyBelow("SlackInstallationTeamLookupTimeout > SlackInteractivityIdentityFetchTimeout",
+		"SlackInteractivityIdentityFetchTimeout", t.SlackInteractivityIdentityFetchTimeout,
+		"SlackInstallationTeamLookupTimeout", t.SlackInstallationTeamLookupTimeout)
 
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three

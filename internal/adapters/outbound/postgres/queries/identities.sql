@@ -11,7 +11,7 @@
 -- scopes).
 
 -- name: CreateIdentity :one
--- email_checked_at (migrations/000176) is set only by an automatic link on
+-- email_checked_at (migrations/000177) is set only by an automatic link on
 -- an email its caller reports verified (internal/app/identitylink.AutoLink);
 -- every other caller leaves it NULL.
 INSERT INTO identities (user_id, provider, external_id, email, email_verified, linked_via, access_token_encrypted, email_checked_at)
@@ -52,7 +52,7 @@ RETURNING *;
 -- result must dedupe by user_id regardless; DISTINCT here just avoids
 -- handing back an already-known duplicate in the common case.
 --
--- A Slack automatic link nothing has checked since migrations/000176 (the
+-- A Slack automatic link nothing has checked since migrations/000177 (the
 -- previous binary took any Slack profile email as verified) is left out
 -- until identitylink.Resolve re-checks it against Slack -- the same rows
 -- identitylink's autoLinkUnchecked names, and DeleteUncheckedAutoLinkedIdentity
@@ -96,3 +96,18 @@ WHERE id = $1 AND linked_via = 'auto_email';
 DELETE FROM identities
 WHERE id = $1 AND linked_via = 'auto_email'
   AND (NOT email_verified OR (provider = 'slack' AND email_checked_at IS NULL));
+
+-- name: PromoteUncheckedAutoLinkToAdmin :one
+-- An admin force-links (provider, external_id) to the user an automatic
+-- link nothing has confirmed already names (internal/adapters/inbound/
+-- httpapi's LinkMemberIdentity): the link becomes the admin's, so the
+-- re-check never reads or removes it again. email_verified goes false: the
+-- admin vouches for the link, not for an email the provider never
+-- confirmed, so it is no evidence for matching another identity. Matches
+-- only the rows DeleteUncheckedAutoLinkedIdentity would; pgx.ErrNoRows
+-- when the row is anything else.
+UPDATE identities
+SET linked_via = 'admin', email_verified = false
+WHERE id = $1 AND linked_via = 'auto_email'
+  AND (NOT email_verified OR (provider = 'slack' AND email_checked_at IS NULL))
+RETURNING *;

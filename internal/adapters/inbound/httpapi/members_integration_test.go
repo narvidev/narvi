@@ -30,7 +30,9 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/sync/errgroup"
 
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/identitylink"
 )
 
 // --- Local wire-shape mirrors ---
@@ -250,6 +252,119 @@ func TestLinkMemberIdentity_AlreadyLinkedSameUser_Idempotent_Returns200(t *testi
 	}
 	if count != 1 {
 		t.Errorf("identities rows = %d, want exactly 1 (idempotent relink must not create a second row)", count)
+	}
+}
+
+// TestLinkMemberIdentity_UncheckedAutoLinkBecomesAdminLink proves the
+// same-user, already-linked answer stays true for an automatic Slack link
+// nothing has confirmed under §13.2's Slack rule (no email_checked_at): the
+// force-link turns it into the admin link asked for -- in place, audited as
+// a force-link, with no verified email left to count as evidence -- so it
+// resolves to the member at once and a later re-check never removes it.
+// Any other existing link answers 200 unchanged, nothing written.
+func TestLinkMemberIdentity_UncheckedAutoLinkBecomesAdminLink(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	actor, adminToken := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleAdmin)
+	linkDeps := identitylink.Deps{
+		Pool: rig.pool, Users: rig.users, Identities: rig.identities,
+		LinkPrompts: narvipg.NewIdentityLinkPromptStore(rig.pool), AuditLog: narvipg.NewAuditLogStore(rig.pool),
+		PublicBaseURL: "https://narvi.example.com", PromptTTL: time.Hour,
+	}
+
+	for i, tc := range []struct {
+		name          string
+		via           sqlcgen.IdentityLinkedVia
+		verified      bool
+		stamped       bool
+		wantLinkedVia string
+	}{
+		{"unchecked Slack automatic link", sqlcgen.IdentityLinkedViaAutoEmail, true, false, "admin"},
+		{"stamped Slack automatic link", sqlcgen.IdentityLinkedViaAutoEmail, true, true, "auto_email"},
+		{"Slack link via the link prompt", sqlcgen.IdentityLinkedViaPrompt, false, false, "prompt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target, _ := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
+			externalID := "U-FORCE-" + string(rune('A'+i))
+			email := "force-" + string(rune('a'+i)) + "@example.com"
+			seed := sqlcgen.CreateIdentityParams{
+				UserID: target.ID, Provider: sqlcgen.IdentityProviderSlack, ExternalID: externalID,
+				Email: &email, EmailVerified: tc.verified, LinkedVia: tc.via,
+			}
+			if tc.stamped {
+				seed.EmailCheckedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+			}
+			seeded, err := rig.identities.Create(ctx, seed)
+			if err != nil {
+				t.Fatalf("seed identity: %v", err)
+			}
+
+			var got identityDTOForTest
+			body := []byte(`{"provider":"slack","externalId":"` + externalID + `"}`)
+			status := rig.doJSON(t, http.MethodPost, "/api/members/"+target.ID.String()+"/identities", body, &got, adminToken)
+			if status != http.StatusOK {
+				t.Fatalf("force-link status = %d, want %d (already linked to this member)", status, http.StatusOK)
+			}
+			if got.ID != seeded.ID.String() || got.LinkedVia != tc.wantLinkedVia {
+				t.Errorf("force-link answered %+v, want id %s, linkedVia %q", got, seeded.ID, tc.wantLinkedVia)
+			}
+
+			row, err := rig.identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderSlack, externalID)
+			if err != nil {
+				t.Fatalf("GetByProviderAndExternalID: %v", err)
+			}
+			if string(row.LinkedVia) != tc.wantLinkedVia {
+				t.Errorf("stored linked_via = %q, want %q", row.LinkedVia, tc.wantLinkedVia)
+			}
+			converted := tc.wantLinkedVia == "admin"
+			if converted && row.EmailVerified {
+				t.Error("stored email_verified = true, want false: the admin vouches for the link, not the email")
+			}
+
+			var entries int
+			if err := rig.pool.QueryRow(ctx,
+				`SELECT count(*) FROM audit_log WHERE action = 'identity.force_linked' AND resource_id = $1`, seeded.ID.String(),
+			).Scan(&entries); err != nil {
+				t.Fatalf("count audit entries: %v", err)
+			}
+			if want := map[bool]int{true: 1, false: 0}[converted]; entries != want {
+				t.Fatalf("identity.force_linked entries = %d, want %d", entries, want)
+			}
+			if converted {
+				var actorID pgtype.UUID
+				if err := rig.pool.QueryRow(ctx,
+					`SELECT actor_user_id FROM audit_log WHERE action = 'identity.force_linked' AND resource_id = $1`, seeded.ID.String(),
+				).Scan(&actorID); err != nil {
+					t.Fatalf("read audit actor: %v", err)
+				}
+				if actorID != actor.ID {
+					t.Errorf("audit actor = %v, want the admin %v", actorID, actor.ID)
+				}
+				detail := auditLogDetailFor(ctx, t, rig, "identity.force_linked", seeded.ID.String())
+				if detail["converted_from"] != "auto_email" || detail["user_id"] != target.ID.String() || detail["external_id"] != externalID {
+					t.Errorf("audit detail = %v, want converted_from auto_email, user_id %v, external_id %q", detail, target.ID, externalID)
+				}
+				if ids, err := identitylink.MatchUserIDs(ctx, linkDeps, email); err != nil || len(ids) != 0 {
+					t.Errorf("MatchUserIDs(%q) = (%v, %v), want no match: the email was never confirmed", email, ids, err)
+				}
+			}
+
+			// Resolves to the member, and an unconfirmed email on the
+			// member's next event removes nothing.
+			if userID, linked, err := identitylink.LookupLinkedUserID(ctx, linkDeps, sqlcgen.IdentityProviderSlack, externalID); err != nil || !linked || userID != target.ID {
+				t.Errorf("LookupLinkedUserID = (%v, %v, %v), want linked to %v", userID, linked, err, target.ID)
+			}
+			res, err := identitylink.Resolve(ctx, linkDeps, sqlcgen.IdentityProviderSlack, externalID, identitylink.ProfileEmail{Address: email, Verified: false}, true)
+			if err != nil {
+				t.Fatalf("Resolve: %v", err)
+			}
+			if res.UserID != target.ID {
+				t.Errorf("Resolve on an unconfirmed email = %+v, want the link to %v", res, target.ID)
+			}
+			if _, err := rig.identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderSlack, externalID); err != nil {
+				t.Errorf("identity after the next event: %v, want it kept", err)
+			}
+		})
 	}
 }
 

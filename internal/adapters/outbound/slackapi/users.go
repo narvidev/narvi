@@ -14,7 +14,7 @@
 // for a full member of this installation's own workspace. users.info's
 // user object carries the facts that decide it (UserEmail below), auth.test
 // names the workspace this client's bot token belongs to
-// (installationTeam), and UserEmail.Verified applies the definition.
+// (installationteam.go), and UserEmail.Verified applies the definition.
 //
 // Called from internal/adapters/inbound/slack's own identity auto-linking
 // (resolveSlackActor/resolveSlackActorSingleAttempt, identity.go), NEVER
@@ -135,17 +135,24 @@ var ErrSlackUserNotFound = errors.New("slackapi: user_not_found")
 // users:read.email scope -- indistinguishable from this response alone,
 // and both mean the SAME thing to this call's own caller: no email to
 // match against, do not guess). When there is an email, GetUserEmail also
-// learns the installation's own workspace (installationTeam: auth.test,
-// cached per Client) into UserEmail.InstallationTeamID, so the result
-// carries everything UserEmail.Verified reads.
+// sets UserEmail.InstallationTeamID, the installation's own workspace
+// (installationteam.go: auth.test, asked alongside users.info on its own
+// budget and cached per Client), so the result carries everything
+// UserEmail.Verified reads.
 //
 // A non-nil error means a call itself failed -- ErrSlackUserNotFound for
 // Slack's own "no such user" response (see that sentinel's own doc comment
 // for why this is the one case NOT meant to be retried), any other error
 // for everything else (network failure, an unexpected non-ok response, a
-// malformed response body, auth.test failing), all of which the caller
-// should treat as retryable.
+// malformed response body, auth.test failing, or ctx ending before
+// auth.test has answered), all of which the caller should treat as
+// retryable.
 func (c *Client) GetUserEmail(ctx context.Context, userID string) (user UserEmail, ok bool, err error) {
+	// Until the installation's workspace is known, ask for it alongside
+	// users.info rather than after it: the lookup runs on its own budget
+	// (installationteam.go), so this attempt still costs one call's latency.
+	teamLookup := c.startTeamLookupIfUnknown()
+
 	var parsed usersInfoResponse
 	if err := c.getJSON(ctx, "users.info", url.Values{"user": {userID}}, &parsed); err != nil {
 		return UserEmail{}, false, err
@@ -160,7 +167,7 @@ func (c *Client) GetUserEmail(ctx context.Context, userID string) (user UserEmai
 		return UserEmail{}, false, nil
 	}
 
-	installationTeamID, err := c.installationTeam(ctx)
+	installationTeamID, err := c.awaitInstallationTeam(ctx, teamLookup)
 	if err != nil {
 		return UserEmail{}, false, err
 	}
@@ -175,45 +182,6 @@ func (c *Client) GetUserEmail(ctx context.Context, userID string) (user UserEmai
 		TeamID:             parsed.User.TeamID,
 		InstallationTeamID: installationTeamID,
 	}, true, nil
-}
-
-// authTestResponse is the subset of Slack's auth.test response this client
-// reads: team_id, the workspace the calling token belongs to.
-type authTestResponse struct {
-	Ok     bool   `json:"ok"`
-	Error  string `json:"error"`
-	TeamID string `json:"team_id"`
-}
-
-// installationTeam returns the workspace this client's bot token belongs
-// to, from auth.test, and keeps the first non-empty answer for the
-// Client's lifetime: a bot token never changes workspace. teamMu guards
-// only the cache, never the request, so a slow auth.test holds no other
-// caller past its own deadline; two first calls at once may both ask, and
-// get the same answer. An auth.test that answers ok with no team_id is
-// returned as "" and not kept -- UserEmail.Verified then fails closed, and
-// the next call asks again.
-func (c *Client) installationTeam(ctx context.Context) (string, error) {
-	c.teamMu.Lock()
-	cached := c.installationTeamID
-	c.teamMu.Unlock()
-	if cached != "" {
-		return cached, nil
-	}
-
-	var parsed authTestResponse
-	if err := c.getJSON(ctx, "auth.test", nil, &parsed); err != nil {
-		return "", err
-	}
-	if !parsed.Ok {
-		return "", fmt.Errorf("slackapi: auth.test failed: %s", parsed.Error)
-	}
-	if parsed.TeamID != "" {
-		c.teamMu.Lock()
-		c.installationTeamID = parsed.TeamID
-		c.teamMu.Unlock()
-	}
-	return parsed.TeamID, nil
 }
 
 // getJSON calls the read-only Web API method with query, authenticated with
