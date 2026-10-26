@@ -1,0 +1,50 @@
+-- Technical plan §3.3's turn recovery, §35.4: a turn in flight re-sent to a
+-- newer sandbox gen keeps the turn_deadline its first dispatch armed. When
+-- that deadline fails it, the agent of the gen it was re-sent to may still
+-- be running the re-sent work, and an execution_complete names a gen, never
+-- a turn: left live, that gen would be sent the next turn, run both at
+-- once, and book the re-sent work's late end against it. So the deadline
+-- retires the gen a turn was re-sent to (sessionactor's
+-- handleTurnDeadlineTimer), as a person's stop retires the gen of a turn
+-- it cancels. A turn that ran out its deadline on the gen of its first
+-- dispatch keeps that gen, as before: §3.3's stated limit.
+--
+-- turns.reenqueued_sandbox_gen: the gen a re-send (sessionactor's
+-- tryPlanReenqueue) last sent the turn to, written in the same
+-- UpdateTurnStatus write that stamps dispatched_sandbox_gen, NULL for a
+-- turn no re-send of this release reached. The turn was re-sent to its
+-- current gen when it equals dispatched_sandbox_gen.
+--
+-- No backfill, no index, no default. Every turn that exists when this runs
+-- reads as never re-sent, so its deadline keeps its gen, as before.
+--
+-- # Locks
+--
+-- golang-migrate sends this file as one batch, one implicit transaction,
+-- of its own: the ADD COLUMN, nullable with no default, is a catalog
+-- change that rewrites nothing, but takes ACCESS EXCLUSIVE on turns until
+-- the file ends -- an instant once granted. The migration waits behind any
+-- open transaction that has read or written turns, and while it waits,
+-- every new read and write of turns queues behind it. The file touches
+-- turns alone, so it holds no lock another table's waiters could need.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with this column present:
+--   - Every statement it sends names its columns (sqlc writes each
+--     SELECT * and RETURNING * out as a column list), so it neither reads
+--     nor writes it.
+--   - Its re-send stamps dispatched_sandbox_gen and leaves this column as
+--     it is, so a turn it re-sent reads here as not re-sent to its current
+--     gen; it also armed that turn a fresh deadline, as it always did.
+--   - Its deadline never retires a gen, so a turn this release re-sent and
+--     the previous binary times out keeps its gen, as every timed-out turn
+--     did before.
+--
+-- # Rolling back
+--
+-- The previous binary cannot boot on 176 ("no migration found for version
+-- 176"). With the control plane scaled to zero, either keep the column
+-- (`migrate force 175`; this file, run again, keeps its values) or run the
+-- down (goto 175).
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS reenqueued_sandbox_gen INTEGER;
