@@ -3042,7 +3042,10 @@ func TestValidate_StopGrace(t *testing.T) {
 // refused unless it exceeds, by MinTimeoutMargin, the slowest path from a
 // replica that died after its dispatch commit to a same-gen ready on
 // another replica: ActorLockServerReapTime plus
-// SandboxWSReconnectMaxBackoff plus ActorHydrateTimeout.
+// SandboxWSReconnectMaxBackoff plus ActorHydrateTimeout. Since
+// ReenqueueBudgetFloor sits between it and TurnDeadline, a window raised
+// to TurnDeadline's margin is refused through the floor unless the floor
+// is raised with it.
 func TestValidate_PromptResendWindow(t *testing.T) {
 	t.Parallel()
 
@@ -3057,6 +3060,7 @@ func TestValidate_PromptResendWindow(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		window    func(platform.Timeouts) time.Duration
+		floor     func(platform.Timeouts) time.Duration
 		wantField string
 		wantChain string
 	}{
@@ -3070,7 +3074,12 @@ func TestValidate_PromptResendWindow(t *testing.T) {
 		{name: "within the margin above the takeover path", window: func(to platform.Timeouts) time.Duration {
 			return takeover(to) + platform.MinTimeoutMargin - time.Second
 		}, wantChain: takeoverChain},
-		{name: "exactly the margin below TurnDeadline", window: func(to platform.Timeouts) time.Duration {
+		{name: "exactly the margin below TurnDeadline, the floor left below it", window: func(to platform.Timeouts) time.Duration {
+			return to.TurnDeadline - platform.MinTimeoutMargin
+		}, wantChain: "ReenqueueBudgetFloor > PromptResendWindow"},
+		{name: "exactly the margin below a floor exactly the margin below TurnDeadline", window: func(to platform.Timeouts) time.Duration {
+			return to.TurnDeadline - 2*platform.MinTimeoutMargin
+		}, floor: func(to platform.Timeouts) time.Duration {
 			return to.TurnDeadline - platform.MinTimeoutMargin
 		}},
 		{name: "exactly the margin above the takeover path", window: func(to platform.Timeouts) time.Duration {
@@ -3082,6 +3091,9 @@ func TestValidate_PromptResendWindow(t *testing.T) {
 
 			to := platform.DefaultTimeouts()
 			to.PromptResendWindow = tc.window(to)
+			if tc.floor != nil {
+				to.ReenqueueBudgetFloor = tc.floor(to)
+			}
 			err := to.Validate()
 			switch {
 			case tc.wantField != "":
@@ -3099,6 +3111,69 @@ func TestValidate_PromptResendWindow(t *testing.T) {
 					t.Fatalf("Validate() = %v, want nil", err)
 				}
 			}
+		})
+	}
+}
+
+// TestValidate_ReenqueueBudgetFloor covers every Validate link of the
+// least budget a turn in flight must have left to be re-sent to a newer
+// gen (technical plan §3.3's turn recovery, §35.4): the shipped 11
+// minutes, PromptResendWindow plus MinTimeoutMargin rounded up to the
+// next whole minute; positive; above PromptResendWindow by
+// MinTimeoutMargin; and below TurnDeadline by MinTimeoutMargin. Each case
+// reports exactly the violations listed, so a link that is dropped or
+// that fires on its neighbour's value fails here.
+func TestValidate_ReenqueueBudgetFloor(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+	if got := to.ReenqueueBudgetFloor; got != 11*time.Minute {
+		t.Fatalf("DefaultTimeouts().ReenqueueBudgetFloor = %v, want 11m", got)
+	}
+	if derived := (to.PromptResendWindow + platform.MinTimeoutMargin + time.Minute - 1).Truncate(time.Minute); to.ReenqueueBudgetFloor != derived {
+		t.Fatalf("ReenqueueBudgetFloor = %v, want %v: PromptResendWindow plus MinTimeoutMargin, rounded up to the next whole minute", to.ReenqueueBudgetFloor, derived)
+	}
+	const (
+		windowLink   = "ReenqueueBudgetFloor > PromptResendWindow"
+		deadlineLink = "TurnDeadline > ReenqueueBudgetFloor"
+	)
+	for _, tc := range []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		want   []string
+	}{
+		{name: "the defaults", mutate: func(*platform.Timeouts) {}},
+		{name: "zero", mutate: func(to *platform.Timeouts) {
+			to.ReenqueueBudgetFloor = 0
+		}, want: []string{"positive: ReenqueueBudgetFloor", windowLink}},
+		{name: "negative", mutate: func(to *platform.Timeouts) {
+			to.ReenqueueBudgetFloor = -time.Second
+		}, want: []string{"positive: ReenqueueBudgetFloor", windowLink}},
+		{name: "at PromptResendWindow", mutate: func(to *platform.Timeouts) {
+			to.ReenqueueBudgetFloor = to.PromptResendWindow
+		}, want: []string{windowLink}},
+		{name: "within the margin above PromptResendWindow", mutate: func(to *platform.Timeouts) {
+			to.ReenqueueBudgetFloor = to.PromptResendWindow + platform.MinTimeoutMargin - time.Second
+		}, want: []string{windowLink}},
+		{name: "exactly the margin above PromptResendWindow", mutate: func(to *platform.Timeouts) {
+			to.ReenqueueBudgetFloor = to.PromptResendWindow + platform.MinTimeoutMargin
+		}},
+		{name: "a window raised past the floor", mutate: func(to *platform.Timeouts) {
+			to.PromptResendWindow = to.ReenqueueBudgetFloor
+		}, want: []string{windowLink}},
+		{name: "at TurnDeadline", mutate: func(to *platform.Timeouts) {
+			to.ReenqueueBudgetFloor = to.TurnDeadline
+		}, want: []string{deadlineLink}},
+		{name: "within the margin below TurnDeadline", mutate: func(to *platform.Timeouts) {
+			to.ReenqueueBudgetFloor = to.TurnDeadline - platform.MinTimeoutMargin + time.Second
+		}, want: []string{deadlineLink}},
+		{name: "exactly the margin below TurnDeadline", mutate: func(to *platform.Timeouts) {
+			to.ReenqueueBudgetFloor = to.TurnDeadline - platform.MinTimeoutMargin
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assertViolations(t, tc.mutate, tc.want)
 		})
 	}
 }

@@ -1,0 +1,18 @@
+-- Reverses 000176_turns_reenqueued_sandbox_gen.up.sql. With the column goes
+-- every turn's record of the gen a re-send last sent it to. A binary
+-- without 000176 does not read it; a binary with it that runs 000176 again
+-- reads every turn as never re-sent, so a turn in flight then keeps its gen
+-- when its deadline fails it.
+--
+-- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
+-- 000176. Do not run it against live pods of a binary that carries 000176:
+-- every query of that binary that returns a whole turn row names the column
+-- (sqlc writes each SELECT * and RETURNING * out as a column list), so each
+-- fails with SQLSTATE 42703 and no turn is created, dispatched or completed
+-- until the older binary replaces the pod; and a pod that restarts first
+-- applies 000176 again at boot, which locks the older binary out again.
+-- Guarded: IF EXISTS, so it also runs when the column is already gone. The
+-- drop is a catalog change: it rewrites nothing, but takes ACCESS EXCLUSIVE
+-- on turns for the file's one implicit transaction, and touches no other
+-- table.
+ALTER TABLE turns DROP COLUMN IF EXISTS reenqueued_sandbox_gen;

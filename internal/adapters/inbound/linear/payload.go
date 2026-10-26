@@ -51,8 +51,10 @@ type agentSessionEventWebhookPayload struct {
 
 	// PromptContext is present only for `created` events -- "A formatted
 	// prompt string containing the relevant context for the agent
-	// session, including issue details, comments, and guidance." Used
-	// directly as this Step's own initial Turn prompt text.
+	// session, including issue details, comments, and guidance." Text
+	// anyone who can write on the issue wrote, so delegationPrompt
+	// (prompt.go) quotes it whole as data (§5.2), never as the session's
+	// instruction.
 	PromptContext *string `json:"promptContext"`
 }
 
@@ -90,6 +92,25 @@ type agentSessionWebhookPayload struct {
 	// unconditionally, with no identity lookup attempted (there is no
 	// external id to look up).
 	CreatorID *string `json:"creatorId"`
+
+	// Comment is the comment the session was started from (Linear's
+	// AgentSessionWebhookPayload.comment, a CommentChildWebhookPayload):
+	// set when someone mentioned the agent in a comment, nil when the
+	// issue was delegated without one. delegatorRequest (prompt.go) takes
+	// its body as the session's instruction only when its UserID equals
+	// CreatorID.
+	Comment *commentChildWebhookPayload `json:"comment"`
+}
+
+// commentChildWebhookPayload mirrors Linear's own CommentChildWebhookPayload
+// -- only the two fields delegatorRequest reads.
+type commentChildWebhookPayload struct {
+	Body string `json:"body"`
+
+	// UserID is Linear's "ID of the user who created this comment",
+	// nullable there (empty here): a comment with no user id is never
+	// attributed to anyone.
+	UserID string `json:"userId"`
 }
 
 // issueChildWebhookPayload mirrors Linear's own
