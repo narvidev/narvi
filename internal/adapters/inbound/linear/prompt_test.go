@@ -2,6 +2,7 @@ package linear
 
 import (
 	"encoding/json"
+	"html"
 	"strings"
 	"testing"
 
@@ -148,6 +149,40 @@ func TestDelegationPrompt(t *testing.T) {
 			wantHead:      workIssueInstruction,
 		},
 		{
+			name:          "a bare mention is no request",
+			agentSession:  `{"id":"as-1","creatorId":"user-ada","comment":{"id":"c-1","userId":"user-ada","body":"@narvi"}}`,
+			promptContext: promptContextFixture,
+			wantHead:      workIssueInstruction,
+		},
+		{
+			name:          "a mention with trailing space is no request",
+			agentSession:  `{"id":"as-1","creatorId":"user-ada","comment":{"id":"c-1","userId":"user-ada","body":"@narvi "}}`,
+			promptContext: promptContextFixture,
+			wantHead:      workIssueInstruction,
+		},
+		{
+			name:          "a markdown profile-link mention alone is no request",
+			agentSession:  `{"id":"as-1","creatorId":"user-ada","comment":{"id":"c-1","userId":"user-ada","body":"[@Narvi](https://linear.app/example/profiles/narvi)"}}`,
+			promptContext: promptContextFixture,
+			wantHead:      workIssueInstruction,
+		},
+		{
+			name:          "a markdown profile-link mention with a request is the instruction",
+			agentSession:  `{"id":"as-1","creatorId":"user-ada","comment":{"id":"c-1","userId":"user-ada","body":"[@Narvi](https://linear.app/example/profiles/narvi) add a retry"}}`,
+			promptContext: promptContextFixture,
+			wantHead:      "[@Narvi](https://linear.app/example/profiles/narvi) add a retry\n\n" + requestContextLead,
+		},
+		{
+			name:          "text already holding entities round-trips unambiguously",
+			agentSession:  `{"id":"as-1","creatorId":"user-ada","comment":{"id":"c-1","userId":"user-ada","body":` + jsonString(request) + `}}`,
+			promptContext: "<description>The page shows `&lt;b&gt;` literally instead of rendering `<b>`.\n```go\nif len(xs) < 2 && f(x) > 0 { ch <- x }\n```\n</description>",
+			wantHead:      request + "\n\n" + requestContextLead,
+			wantInside: []string{
+				"`&amp;lt;b&amp;gt;` literally instead of rendering `&lt;b&gt;`",
+				"if len(xs) &lt; 2 &amp;&amp; f(x) &gt; 0 { ch &lt;- x }",
+			},
+		},
+		{
 			name:         "the delegator's request alone when there is no promptContext",
 			agentSession: `{"id":"as-1","creatorId":"user-ada","comment":{"id":"c-1","userId":"user-ada","body":` + jsonString(request) + `}}`,
 			wantPrompt:   request,
@@ -193,6 +228,18 @@ func TestDelegationPrompt(t *testing.T) {
 			}
 			if strings.Contains(prompt, review.VerdictToolBearerPlaceholder) {
 				t.Errorf("prompt carries the placeholder token %q", review.VerdictToolBearerPlaceholder)
+			}
+			// The escaping reverses: unescaped, the block gives back the
+			// promptContext it quotes (a case whose placeholder token was
+			// removed aside).
+			if !strings.Contains(tc.promptContext, "{{") {
+				want := tc.promptContext
+				if !strings.HasSuffix(want, "\n") {
+					want += "\n"
+				}
+				if got := html.UnescapeString(inside); got != want {
+					t.Errorf("unescaped block = %q, want the promptContext %q", got, want)
+				}
 			}
 		})
 	}
