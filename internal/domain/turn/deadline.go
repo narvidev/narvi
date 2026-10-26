@@ -10,6 +10,11 @@ type DeadlineConfig struct {
 	// Deadline is the maximum time a turn may spend in Processing before
 	// it is timed out.
 	Deadline time.Duration
+	// ReenqueueFloor is the least of that budget a turn must have left to
+	// be re-sent to a newer sandbox gen (ReenqueueBound), from
+	// platform.Timeouts.ReenqueueBudgetFloor. EvaluateTurnDeadline does not
+	// read it.
+	ReenqueueFloor time.Duration
 }
 
 // DeadlineResult is EvaluateTurnDeadline's verdict.
@@ -41,4 +46,32 @@ func EvaluateTurnDeadline(dispatchedAt, now time.Time, cfg DeadlineConfig) Deadl
 		IsTimedOut: elapsed >= cfg.Deadline,
 		Elapsed:    elapsed,
 	}
+}
+
+// ReenqueueBound is when a turn re-sent to a newer sandbox gen must have
+// ended (technical plan §3.3, §35.4): the turn_deadline its first
+// dispatch armed, dispatchedAt plus cfg.Deadline, whatever happened to
+// the gens it ran on since. A re-send never re-arms the budget: a gen
+// lost, rotated or replaced at its lifetime is the same turn still
+// running, and a fresh budget per re-send would leave the number of
+// re-runs, and their spend, with no bound at all.
+//
+// spent reports that no more than cfg.ReenqueueFloor of the budget is
+// left: such a turn is not re-sent, and its deadline ends it at bound. The
+// floor keeps a re-sent prompt's receipt window, which the re-send starts
+// again, inside the deadline; it is no bound on how long the re-sent work
+// runs, which the deadline ends like any other. With a zero floor, spent
+// is exactly EvaluateTurnDeadline's timed out (the same >= boundary); with
+// any floor, it is EvaluateTurnDeadline's verdict at now plus the floor.
+//
+// A zero dispatchedAt -- a turn whose dispatch time was never recorded --
+// falls back to a full deadline from now, never spent: with no first
+// dispatch to count from, the re-send's own instant is the only one
+// there is.
+func ReenqueueBound(dispatchedAt, now time.Time, cfg DeadlineConfig) (bound time.Time, spent bool) {
+	if dispatchedAt.IsZero() {
+		return now.Add(cfg.Deadline), false
+	}
+	bound = dispatchedAt.Add(cfg.Deadline)
+	return bound, bound.Sub(now) <= cfg.ReenqueueFloor
 }

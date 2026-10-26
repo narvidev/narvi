@@ -58,8 +58,10 @@ const (
 //   - turn_deadline (armed at dispatch, deleted at completion): times out
 //     the turn that is processing -- whose OnTurnCompleted can queue the
 //     workflow's next step in the same transaction -- and otherwise deletes
-//     itself. The turn it acts on is in flight, so the session already
-//     reads running whenever it can do anything.
+//     itself. When the turn ran on a gen it was re-sent to, it retires that
+//     gen and dispatches a turn that is already pending, on a new gen. The
+//     turn it acts on is in flight, so the session already reads running
+//     whenever it can do anything.
 //   - stop (armed by POST /api/sessions/{sessionID}/stop, re-armed by its
 //     own handler while a flagged turn is in flight, or while the
 //     retirement of a stopped turn's sandbox gen waits for a delivery;
