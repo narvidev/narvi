@@ -12,6 +12,9 @@ import (
 
 	"github.com/coder/websocket"
 
+	"github.com/narvidev/narvi/internal/domain/continuity"
+	"github.com/narvidev/narvi/internal/domain/plan"
+	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -107,6 +110,47 @@ func TestWireLimits_Ordered(t *testing.T) {
 			t.Parallel()
 			if tc.larger < tc.smaller {
 				t.Fatalf("%s = %d is below %s = %d", tc.largerName, tc.larger, tc.smallerName, tc.smaller)
+			}
+		})
+	}
+}
+
+// TestContinuityRecapMaxBytes pins the recap's budget (technical plan
+// §35.5) between its two bounds: at or below half of
+// DefaultFrameReadLimitBytes, so a gen whose agent states no read limit
+// keeps at least half its prompt bound for the prompt itself, and large
+// enough for a recap's frame and one turn whose request and final text
+// both fill their excerpt caps, kept whole.
+func TestContinuityRecapMaxBytes(t *testing.T) {
+	t.Parallel()
+
+	wholeTurn := continuity.Input{
+		Turns: []continuity.Turn{{
+			Number: 1, Status: turn.StateCompleted,
+			Request:  strings.Repeat("r", continuity.RequestExcerptBytes),
+			Report:   plan.Final{Text: strings.Repeat("f", continuity.ReportExcerptBytes)},
+			Reported: true,
+		}},
+		Earlier: 1,
+	}
+	for _, tc := range []struct {
+		name string
+		ok   func() bool
+	}{
+		{name: "positive", ok: func() bool { return platform.ContinuityRecapMaxBytes > 0 }},
+		{name: "at or below half of the smallest prompt bound", ok: func() bool {
+			return platform.ContinuityRecapMaxBytes <= platform.DefaultFrameReadLimitBytes/2
+		}},
+		{name: "holds the frame and one turn at its excerpt caps, whole", ok: func() bool {
+			recap, ok := continuity.Build(wholeTurn, platform.ContinuityRecapMaxBytes)
+			return ok && recap.Turns == 1 && !recap.Trimmed
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if !tc.ok() {
+				t.Errorf("ContinuityRecapMaxBytes = %d: not %s (DefaultFrameReadLimitBytes = %d)",
+					platform.ContinuityRecapMaxBytes, tc.name, platform.DefaultFrameReadLimitBytes)
 			}
 		})
 	}

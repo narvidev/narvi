@@ -26,6 +26,11 @@
 //     sandbox against its lifetime deadline, and give up a snapshot that is
 //     never reported (revert it, or suspect a sandbox whose agent is
 //     silent).
+//   - The fresh-lineage decision (DecideFreshLineage, lineage.go; §35.5):
+//     whether the claim that creates a gen starts a fresh lineage -- a
+//     fresh spawn replacing a gen of a session that had a turn dispatched,
+//     never a restore, a resume or a first spawn -- and whether its loss is
+//     announced or carried from a replaced gen still awaiting its recap.
 //
 // Every function here is pure per §11: no I/O, no time.Now(), no
 // randomness. Anything needing "the current time" takes it as an explicit
