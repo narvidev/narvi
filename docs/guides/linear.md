@@ -55,6 +55,22 @@ Narvi acknowledges within Linear's own required 10-second window with a
 single `AgentActivity` "thought" — synchronous, not queued or retried,
 mirroring [slack.md](slack.md)'s own in-thread ack precedent exactly.
 
+**What the agent is told.** A delegation's issue text and other people's
+comments reach the agent as quoted data; only your own request is an
+instruction. When you mention Narvi in a comment, that comment is your
+request — matched to you by your Linear user id, never by your name — and
+the issue's title, description and the rest of its discussion follow it,
+quoted as context. Delegating an issue without a comment, or with a
+comment that only mentions Narvi, gives the agent no request of yours: it
+is asked to work the issue as described, with the issue's text quoted the
+same way.
+
+**Negative — Linear's agent guidance is quoted, not followed.** Everything
+else Linear includes with a delegation, agent guidance configured in
+Linear among it, reaches the agent in the same quoted context, as data
+rather than instructions. Standing instructions for the agent belong in
+Narvi's own configuration, not in Linear's guidance field.
+
 **Negative — same shadow-classification caveat as every other surface.**
 A `created` event's own initiating text IS classified and recorded via
 §18.4 — but §18.5's shadow gate has no production consumer yet, so the

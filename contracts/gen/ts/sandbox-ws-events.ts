@@ -315,6 +315,10 @@ export interface ExecutionComplete {
   outcome: 'completed' | 'failed' | 'cancelled';
   reason: string | null;
   /**
+   * Technical plan §35.4: present only when the turn did not end on its own account but because the sandbox running it is stopping -- the agent's process was told to stop while the turn ran. Set only on the turn's own end (subTaskId absent or null), never on a sub-task's; outcome is then failed or cancelled, never completed, and reason is the runtime's own. A control plane keeps the turn processing and sends it again to the sandbox that replaces this one. Absent: the turn ended on its own account. An OPEN enum (manifest.json's openEnums): a control plane reads any value as an interruption and never refuses a frame over one it does not know.
+   */
+  interruption?: 'sandbox_stopping';
+  /**
    * §6.1/§7.1 sub-task fan-out: OPTIONAL — absent or null means this event belongs to the turn's main lane; a non-null value is the subTaskId (same id sub_task_start/sub_task_finish carry) of the sub-task lane this event belongs to.
    */
   subTaskId?: string | null;
