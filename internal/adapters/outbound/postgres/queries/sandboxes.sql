@@ -254,6 +254,17 @@ RETURNING *;
 -- earlier snapshot's record as its own; a session that runs the hooks reads
 -- any value as a lineage that may not have run setup.sh
 -- (sandbox.DecideRepoHooksRestore).
+--
+-- snapshot_conversation_id and snapshot_conversation_recorded_id
+-- (technical plan §35.5, migrations/000176_snapshot_conversation.up.sql)
+-- record the conversation the snapshot was minted under: the session's
+-- opencode_conversation_id as this statement reads it -- the one the
+-- runtime last reported, NULL when none was -- keyed by the snapshot's id,
+-- like the provenance, so a snapshot a binary that does not write them
+-- mints reads "not recorded" rather than an earlier snapshot's
+-- conversation. A restore compares it with the conversation its prompt
+-- will name, and only counts the outcome
+-- (sandbox.ClassifyRestoreConversation).
 UPDATE sandboxes
 SET snapshot_id = sqlc.arg('snapshot_id'),
     snapshot_suppressed_in_shadow = sqlc.arg('snapshot_suppressed_in_shadow'),
@@ -264,6 +275,8 @@ SET snapshot_id = sqlc.arg('snapshot_id'),
     snapshot_agent_protocol = sqlc.narg('agent_protocol'),
     snapshot_runtime_version = sqlc.narg('runtime_version'),
     snapshot_skipped_repo_hooks_id = CASE WHEN skip_repo_hooks_told_gen = gen AND skip_repo_hooks_gen = gen THEN sqlc.arg('snapshot_id') END,
+    snapshot_conversation_id = (SELECT s.opencode_conversation_id FROM sessions s WHERE s.id = sandboxes.session_id),
+    snapshot_conversation_recorded_id = sqlc.arg('snapshot_id'),
     snapshot_minted_at = now(),
     updated_at = now()
 WHERE session_id = sqlc.arg('session_id')
@@ -700,9 +713,10 @@ WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;
 -- fresh instead (snapshotrestore.go): a floor only rises, so a refused
 -- snapshot never becomes restorable, and a later death of the new gen must
 -- not offer it again. The provenance describes the snapshot as well
--- (migrations/000170), so it goes with it. Guarded on the snapshot the
--- caller decided on, so a snapshot recorded since that decision is never
--- cleared.
+-- (migrations/000170), so it goes with it, and so does the conversation it
+-- was minted under (technical plan §35.5, migrations/000176). Guarded on
+-- the snapshot the caller decided on, so a snapshot recorded since that
+-- decision is never cleared.
 UPDATE sandboxes
 SET snapshot_id = NULL,
     snapshot_suppressed_in_shadow = false,
@@ -710,6 +724,8 @@ SET snapshot_id = NULL,
     snapshot_agent_protocol = NULL,
     snapshot_runtime_version = NULL,
     snapshot_skipped_repo_hooks_id = NULL,
+    snapshot_conversation_id = NULL,
+    snapshot_conversation_recorded_id = NULL,
     snapshot_minted_at = NULL,
     updated_at = now()
 WHERE session_id = sqlc.arg('session_id') AND snapshot_id = sqlc.arg('snapshot_id')::text;
