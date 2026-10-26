@@ -10,6 +10,7 @@ package sessionactor
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -284,23 +286,134 @@ func TestReenqueue_SecondReenqueue_SameBound(t *testing.T) {
 	}
 }
 
+// pumpUntilTurnStatus delivers every due timer, as the pump does, until
+// turnID reaches want.
+func pumpUntilTurnStatus(ctx context.Context, t *testing.T, r *Registry, a *Actor, pool *pgxpool.Pool, turnID pgtype.UUID, want sqlcgen.TurnStatus, within time.Duration) {
+	t.Helper()
+	waitUntil(t, within, func() bool {
+		if err := r.PumpOnce(ctx); err != nil {
+			t.Fatalf("PumpOnce: %v", err)
+		}
+		barrier(ctx, t, a)
+		return getTurnRow(ctx, t, pool, turnID).Status == want
+	})
+}
+
+// turnEnds counts the execution_complete events stored for turnID, and the
+// synthetic timeouts among them.
+func turnEnds(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID, turnID pgtype.UUID) (ends, timeouts int) {
+	t.Helper()
+	if err := pool.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE payload->>'reason' = 'timeout' AND payload ? 'synthetic')
+		FROM events WHERE session_id = $1 AND type = 'execution_complete' AND payload->>'turn_id' = $2`, sessionID, turnID.String()).Scan(&ends, &timeouts); err != nil {
+		t.Fatalf("count execution_complete events: %v", err)
+	}
+	return ends, timeouts
+}
+
+// assertNotResentDueNow checks a spent turn was left as its first dispatch
+// left it -- processing on gen 1, its messageId kept, no checkout asked
+// for, no end reason -- and its turn_deadline is due.
+func assertNotResentDueNow(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, first sqlcgen.Turn, commander *fakeSendCommander) {
+	t.Helper()
+	if got := sentCommandTypes(t, commander); len(got) != 0 {
+		t.Fatalf("commands = %v, want none: a turn whose budget is spent is not re-sent, and no gate acts for it", got)
+	}
+	got := getTurnRow(ctx, t, pool, first.ID)
+	if got.Status != sqlcgen.TurnStatusProcessing || got.DispatchedSandboxGen == nil || *got.DispatchedSandboxGen != 1 ||
+		got.DispatchedMessageID == nil || *got.DispatchedMessageID != *first.DispatchedMessageID ||
+		got.CheckoutMessageID != nil || got.EndReason != nil {
+		t.Fatalf("turn %s on gen %v, messageId %v, checkout %v, end reason %v; want it untouched until its deadline ends it",
+			got.Status, got.DispatchedSandboxGen, got.DispatchedMessageID, got.CheckoutMessageID, got.EndReason)
+	}
+	firesAt, ok := turnDeadlineOf(ctx, t, pool, sessionID)
+	if !ok || firesAt.After(time.Now()) {
+		t.Fatalf("turn_deadline at %v (armed %v), want due now", firesAt, ok)
+	}
+}
+
 // TestReenqueue_BudgetSpent_NotResent_EndsAtItsDeadline: a turn whose
 // turn_deadline, counted from its first dispatch, has run out by the time
-// its replacement gen is ready is not re-sent there. Its deadline is
-// armed due -- here over a timer a previous binary's re-send had pushed
-// later -- and the timer's handler ends it as any timed-out turn ends:
-// failed, one synthetic end with reason timeout, one notification.
+// its replacement gen is ready -- or suspect, which a re-send reaches as
+// well -- is not re-sent there. Its deadline is armed due -- here over a
+// timer a previous binary's re-send had pushed later -- and the timer's
+// handler ends it as any timed-out turn ends: failed, one synthetic end
+// with reason timeout, one notification.
 func TestReenqueue_BudgetSpent_NotResent_EndsAtItsDeadline(t *testing.T) {
 	ctx := context.Background()
-	pool := newTestPool(t)
-	sessionID := createTestSessionWithSpawnSource(ctx, t, pool, sqlcgen.SessionSpawnSourceSlack)
-	if _, ok, err := narvipg.NewSlackThreadSessionStore(pool).Claim(ctx, "C140", "1700000000.000140", sessionID); err != nil || !ok {
-		t.Fatalf("claim the slack thread: ok=%v err=%v", ok, err)
+	for _, tc := range []struct {
+		name    string
+		suspect bool
+	}{
+		{name: "the replacement gen ready"},
+		{name: "the replacement gen suspect", suspect: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newTestPool(t)
+			sessionID := createTestSessionWithSpawnSource(ctx, t, pool, sqlcgen.SessionSpawnSourceSlack)
+			if _, ok, err := narvipg.NewSlackThreadSessionStore(pool).Claim(ctx, "C140", "1700000000.000140", sessionID); err != nil || !ok {
+				t.Fatalf("claim the slack thread: ok=%v err=%v", ok, err)
+			}
+			deadline := platform.DefaultTimeouts().TurnDeadline
+			dispatchedAt := time.Now().Add(-deadline - time.Minute).Truncate(time.Microsecond)
+			first := seedTurnInFlight(ctx, t, pool, sessionID, 1, dispatchedAt)
+			armTurnDeadlineAt(ctx, t, pool, sessionID, time.Now().Add(30*time.Minute))
+			respawnToGen(ctx, t, pool, sessionID, 2)
+			if tc.suspect {
+				preSuspect := sqlcgen.SandboxStatusReady
+				if _, err := narvipg.NewSandboxStore(pool).UpdateStatusToSuspect(ctx, sqlcgen.UpdateSandboxStatusToSuspectParams{
+					SessionID: sessionID, PreSuspectStatus: &preSuspect,
+				}); err != nil {
+					t.Fatalf("move gen 2 to suspect: %v", err)
+				}
+			}
+
+			commander := &fakeSendCommander{}
+			r := newDispatchTestRegistry(t, ctx, pool, nil, commander)
+			t.Cleanup(func() { _ = r.Shutdown() })
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+			settle(ctx, t, a)
+			assertNotResentDueNow(ctx, t, pool, sessionID, first, commander)
+
+			// The timer pump delivers it, as it does any due timer.
+			pumpUntilTurnStatus(ctx, t, r, a, pool, first.ID, sqlcgen.TurnStatusFailed, 5*time.Second)
+
+			if got := sentCommandTypes(t, commander); len(got) != 0 {
+				t.Fatalf("commands = %v, want none", got)
+			}
+			if ends, timeouts := turnEnds(ctx, t, pool, sessionID, first.ID); ends != 1 || timeouts != 1 {
+				t.Fatalf("%d execution_complete events, %d of them a synthetic timeout; want exactly one, the timeout", ends, timeouts)
+			}
+			if n := countOutboxRowsForSession(ctx, t, pool, sessionID); n != 1 {
+				t.Fatalf("outbox rows = %d, want one notification", n)
+			}
+			if _, ok := turnDeadlineOf(ctx, t, pool, sessionID); ok {
+				t.Fatal("turn_deadline still armed after it ended the turn")
+			}
+		})
 	}
+}
+
+// TestReenqueue_SecondsLeft_NotResent_TheQueuedTurnKeepsItsOwnEnd: a turn
+// with seconds of its first dispatch's turn_deadline left when its
+// replacement gen is ready -- less than ReenqueueBudgetFloor -- is not
+// re-sent there, with a follow-up queued behind it. Re-sent, the agent
+// would still be running it when the deadline failed it, and the follow-up
+// sent next to the same gen would be completed by that run's end. Instead
+// its deadline, armed at its bound, ends it; the follow-up is then the
+// first prompt the gen gets, and the gen's end is the follow-up's own.
+func TestReenqueue_SecondsLeft_NotResent_TheQueuedTurnKeepsItsOwnEnd(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessionID := createTestSession(ctx, t, pool)
 	deadline := platform.DefaultTimeouts().TurnDeadline
-	dispatchedAt := time.Now().Add(-deadline - time.Minute).Truncate(time.Microsecond)
+	dispatchedAt := time.Now().Add(-deadline + 3*time.Second).Truncate(time.Microsecond)
 	first := seedTurnInFlight(ctx, t, pool, sessionID, 1, dispatchedAt)
-	armTurnDeadlineAt(ctx, t, pool, sessionID, time.Now().Add(30*time.Minute))
+	armTurnDeadlineAt(ctx, t, pool, sessionID, dispatchedAt.Add(deadline))
+	const followUpPrompt = "the follow-up queued behind the turn in flight"
+	followUp := createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, followUpPrompt)
 	respawnToGen(ctx, t, pool, sessionID, 2)
 
 	commander := &fakeSendCommander{}
@@ -313,42 +426,89 @@ func TestReenqueue_BudgetSpent_NotResent_EndsAtItsDeadline(t *testing.T) {
 	settle(ctx, t, a)
 
 	if got := sentCommandTypes(t, commander); len(got) != 0 {
-		t.Fatalf("commands = %v, want none: a turn whose budget is spent is not re-sent", got)
+		t.Fatalf("commands = %v, want none: a turn with seconds of its budget left is not re-sent", got)
 	}
-	got := getTurnRow(ctx, t, pool, first.ID)
-	if got.Status != sqlcgen.TurnStatusProcessing || got.DispatchedSandboxGen == nil || *got.DispatchedSandboxGen != 1 ||
-		got.DispatchedMessageID == nil || *got.DispatchedMessageID != *first.DispatchedMessageID {
-		t.Fatalf("turn %s on gen %v, messageId %v; want it untouched until its deadline ends it", got.Status, got.DispatchedSandboxGen, got.DispatchedMessageID)
+	if firesAt, ok := turnDeadlineOf(ctx, t, pool, sessionID); !ok || !firesAt.Equal(dispatchedAt.Add(deadline)) {
+		t.Fatalf("turn_deadline at %v (armed %v), want its first dispatch's bound %v", firesAt, ok, dispatchedAt.Add(deadline))
 	}
-	firesAt, ok := turnDeadlineOf(ctx, t, pool, sessionID)
-	if !ok || firesAt.After(time.Now()) {
-		t.Fatalf("turn_deadline at %v (armed %v), want due now", firesAt, ok)
+	if got := getTurnRow(ctx, t, pool, followUp.ID); got.Status != sqlcgen.TurnStatusPending {
+		t.Fatalf("follow-up %s, want pending behind the turn in flight", got.Status)
 	}
 
-	// The timer pump delivers it, as it does any due timer.
-	waitUntil(t, 5*time.Second, func() bool {
-		if err := r.PumpOnce(ctx); err != nil {
-			t.Fatalf("PumpOnce: %v", err)
-		}
-		barrier(ctx, t, a)
-		return getTurnRow(ctx, t, pool, first.ID).Status == sqlcgen.TurnStatusFailed
-	})
+	// Its deadline ends it at its bound.
+	pumpUntilTurnStatus(ctx, t, r, a, pool, first.ID, sqlcgen.TurnStatusFailed, 15*time.Second)
+	if ends, timeouts := turnEnds(ctx, t, pool, sessionID, first.ID); ends != 1 || timeouts != 1 {
+		t.Fatalf("turn in flight: %d execution_complete events, %d of them a synthetic timeout; want exactly the timeout", ends, timeouts)
+	}
 
-	if got := sentCommandTypes(t, commander); len(got) != 0 {
-		t.Fatalf("commands = %v, want none", got)
+	// The follow-up is the first prompt gen 2 gets, and gen 2's end is its own.
+	settle(ctx, t, a)
+	prompts := sentPromptsOf(t, commander)
+	got := getTurnRow(ctx, t, pool, followUp.ID)
+	if len(prompts) != 1 || prompts[0].Gen != 2 || prompts[0].Text != followUpPrompt ||
+		got.DispatchedMessageID == nil || prompts[0].MessageId != *got.DispatchedMessageID {
+		t.Fatalf("prompts %+v, follow-up messageId %v; want the follow-up alone, to gen 2", prompts, got.DispatchedMessageID)
 	}
-	var ends, timeouts int
-	if err := pool.QueryRow(ctx, `SELECT count(*), count(*) FILTER (WHERE payload->>'reason' = 'timeout' AND payload ? 'synthetic')
-		FROM events WHERE session_id = $1 AND type = 'execution_complete'`, sessionID).Scan(&ends, &timeouts); err != nil {
-		t.Fatalf("count execution_complete events: %v", err)
+	deliver(ctx, t, a, completedEvent(2))
+	if got := getTurnRow(ctx, t, pool, followUp.ID); got.Status != sqlcgen.TurnStatusCompleted {
+		t.Fatalf("follow-up %s after gen 2's end, want completed by its own end", got.Status)
 	}
-	if ends != 1 || timeouts != 1 {
-		t.Fatalf("%d execution_complete events, %d of them a synthetic timeout; want exactly one, the timeout", ends, timeouts)
+	if got := getTurnRow(ctx, t, pool, first.ID); got.Status != sqlcgen.TurnStatusFailed {
+		t.Fatalf("turn in flight %s, want still failed by its deadline", got.Status)
 	}
-	if n := countOutboxRowsForSession(ctx, t, pool, sessionID); n != 1 {
-		t.Fatalf("outbox rows = %d, want one notification", n)
-	}
-	if _, ok := turnDeadlineOf(ctx, t, pool, sessionID); ok {
-		t.Fatal("turn_deadline still armed after it ended the turn")
+}
+
+// TestReenqueue_BudgetSpent_ReviewTurn_NoGateActs: a spent review turn of a
+// pull request's review session meets no gate on the replacement gen --
+// neither the review checkout, which would send that gen a checkout or
+// fail the turn forward as refused, nor the repository-hooks gate, which
+// would retire a gen not told to skip the hooks. Nothing is sent, the gen
+// is left as it is, and the turn's own deadline ends it as a timeout.
+func TestReenqueue_BudgetSpent_ReviewTurn_NoGateActs(t *testing.T) {
+	ctx := context.Background()
+	for i, tc := range []struct {
+		name    string
+		told    bool
+		capable bool
+	}{
+		{name: "the checkout gate would send a checkout", told: true, capable: true},
+		{name: "the checkout gate would fail it forward, refused", told: true},
+		{name: "the hooks gate would retire the gen", capable: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newTestPool(t)
+			f := checkoutFixture(ctx, t, pool, fmt.Sprintf("acme/spent-review-%d", i), int32(1400+i))
+			reviewTurn := seedReviewTurn(ctx, t, f, coHead, triggerOf(turn.RequestTriggerAuto), true)
+			deadline := platform.DefaultTimeouts().TurnDeadline
+			gen1, firstMessage := int32(1), "msg-gen-1"
+			first, err := f.turns.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
+				ID: reviewTurn.ID, Status: sqlcgen.TurnStatusProcessing,
+				DispatchedAt:         pgtype.Timestamptz{Time: time.Now().Add(-deadline - time.Minute), Valid: true},
+				DispatchedSandboxGen: &gen1, DispatchedMessageID: &firstMessage,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			armTurnDeadlineAt(ctx, t, pool, f.sessionID, time.Now().Add(30*time.Minute))
+			if _, err := pool.Exec(ctx, `UPDATE sandboxes SET gen = 2,
+				skip_repo_hooks_told_gen = CASE WHEN $2::boolean THEN 2 END WHERE session_id = $1`, f.sessionID, tc.told); err != nil {
+				t.Fatal(err)
+			}
+			rig := newContextRig(ctx, t, pool, f.sessionID, nil)
+
+			deliver(ctx, t, rig.actor, checkoutReady(2, tc.capable))
+			assertNotResentDueNow(ctx, t, pool, f.sessionID, first, rig.commander)
+			if row, err := narvipg.NewSandboxStore(pool).Get(ctx, f.sessionID); err != nil || row.Gen != 2 || row.Status != sqlcgen.SandboxStatusReady {
+				t.Fatalf("sandbox gen %d %s (%v), want gen 2 left ready", row.Gen, row.Status, err)
+			}
+
+			pumpUntilTurnStatus(ctx, t, rig.registry, rig.actor, pool, reviewTurn.ID, sqlcgen.TurnStatusFailed, 5*time.Second)
+			if got := sentCommandTypes(t, rig.commander); len(got) != 0 {
+				t.Fatalf("commands = %v, want none", got)
+			}
+			if ends, timeouts := turnEnds(ctx, t, pool, f.sessionID, reviewTurn.ID); ends != 1 || timeouts != 1 {
+				t.Fatalf("%d execution_complete events, %d of them a synthetic timeout; want exactly one, the timeout", ends, timeouts)
+			}
+		})
 	}
 }

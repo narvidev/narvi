@@ -926,11 +926,14 @@ func (a *Actor) recordCheckedOut(ctx context.Context, tx pgx.Tx, d *dispatchPlan
 // Before every gate, a turn that would be re-sent to a new gen is checked
 // against its turn_deadline (technical plan §3.3, §35.4), which bounds the
 // whole turn, rotations and re-sends included: counted from its first
-// dispatch (turn.ReenqueueBound), never from a re-send. A turn whose bound
-// is already reached is not re-sent -- no gate, no checkout, no prompt --
-// and its turn_deadline is armed due now, so the timer's own handler ends
-// it as any timed-out turn ends: failed with timeout, one synthetic end,
-// one notification.
+// dispatch (turn.ReenqueueBound), never from a re-send. A turn with no
+// more than ReenqueueBudgetFloor of it left is not re-sent -- no gate, no
+// checkout, no prompt, on a ready or a suspect gen alike -- and its
+// turn_deadline is armed at its bound, so the timer's own handler ends it
+// there as any timed-out turn ends: failed with timeout, one synthetic
+// end, one notification. Re-sent with less, the work it would start on
+// the new gen would still be running when the deadline failed the turn,
+// and its late end would be booked against the next turn sent there.
 func (a *Actor) planReenqueueOrRespawn(
 	ctx context.Context, tx pgx.Tx,
 	sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, hasSandbox bool,
@@ -990,19 +993,26 @@ func (a *Actor) planReenqueueOrRespawn(
 			return nil, d, "", nil, err
 		}
 		// Technical plan §3.3, §35.4: turn_deadline bounds the whole turn,
-		// re-sends included, counted from its first dispatch. A turn whose
-		// budget is already spent is not re-sent: nothing below is asked
-		// for it, and its deadline, armed due now, ends it through the
-		// timer's own handler. Armed explicitly even though the first
+		// re-sends included, counted from its first dispatch. A turn with no
+		// more than ReenqueueBudgetFloor of that budget left is not re-sent:
+		// nothing below is asked for it, nothing is sent to this gen, and
+		// its deadline, armed at its bound -- due now once the bound has
+		// passed -- ends it through the timer's own handler. Not armed
+		// earlier than the bound: that handler re-arms a deadline that fires
+		// before its turn is timed out to the time remaining, so an earlier
+		// arm ends the turn no sooner, and each evaluation until then would
+		// arm it early again. Armed explicitly even though the first
 		// dispatch's timer is normally still there: a previous binary's
 		// re-send may have pushed it later, and arming is an upsert.
-		deadline, spent := turn.ReenqueueBound(pgTimeOrZero(target.DispatchedAt), now, turn.DeadlineConfig{Deadline: a.timeouts.TurnDeadline})
+		deadline, spent := turn.ReenqueueBound(pgTimeOrZero(target.DispatchedAt), now, turn.DeadlineConfig{
+			Deadline: a.timeouts.TurnDeadline, ReenqueueFloor: a.timeouts.ReenqueueBudgetFloor,
+		})
 		if spent {
-			if err := a.armTimer(ctx, tx, TimerTurnDeadline, now); err != nil {
+			if err := a.armTimer(ctx, tx, TimerTurnDeadline, deadline); err != nil {
 				return nil, nil, "", nil, err
 			}
-			a.logger.Info("sessionactor: in-flight turn not re-sent: its turn_deadline, counted from its first dispatch, has run out",
-				"turn_id", target.ID.String(), "gen", sandboxRow.Gen, "turn_deadline", deadline)
+			a.logger.Info("sessionactor: in-flight turn not re-sent: its turn_deadline, counted from its first dispatch, leaves no more than the re-send floor",
+				"turn_id", target.ID.String(), "gen", sandboxRow.Gen, "turn_deadline", deadline, "budget_left", deadline.Sub(now))
 			return nil, nil, "", nil, nil
 		}
 		// Technical plan §6.4, §27.1: as planDispatch's own gate
@@ -1075,7 +1085,8 @@ func (a *Actor) planReenqueueOrRespawn(
 // turn/state.go's own top comment for that precedent's full writeup).
 //
 // Arms turn_deadline at deadline, the turn's first dispatch's bound
-// (turn.ReenqueueBound, which the caller has already found unspent):
+// (turn.ReenqueueBound, which the caller has already found more than
+// ReenqueueBudgetFloor away):
 // technical plan §3.3 and §35.4 have turn_deadline bound the whole turn,
 // rotations and re-sends included, so a re-send never buys a new budget.
 // A fresh budget per re-send would let a turn whose sandboxes keep dying

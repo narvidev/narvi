@@ -10,6 +10,11 @@ type DeadlineConfig struct {
 	// Deadline is the maximum time a turn may spend in Processing before
 	// it is timed out.
 	Deadline time.Duration
+	// ReenqueueFloor is the least of that budget a turn must have left to
+	// be re-sent to a newer sandbox gen (ReenqueueBound), from
+	// platform.Timeouts.ReenqueueBudgetFloor. EvaluateTurnDeadline does not
+	// read it.
+	ReenqueueFloor time.Duration
 }
 
 // DeadlineResult is EvaluateTurnDeadline's verdict.
@@ -49,10 +54,16 @@ func EvaluateTurnDeadline(dispatchedAt, now time.Time, cfg DeadlineConfig) Deadl
 // the gens it ran on since. A re-send never re-arms the budget: a gen
 // lost, rotated or replaced at its lifetime is the same turn still
 // running, and a fresh budget per re-send would leave the number of
-// re-runs, and their spend, with no bound at all. spent reports that the
-// bound is already reached (the same >= boundary EvaluateTurnDeadline
-// times a turn out at): such a turn is not re-sent, and its deadline ends
-// it.
+// re-runs, and their spend, with no bound at all.
+//
+// spent reports that no more than cfg.ReenqueueFloor of the budget is
+// left: such a turn is not re-sent, and its deadline ends it at bound. A
+// re-send with seconds left would start work on the new gen that the
+// deadline fails moments later without stopping that gen, whose late end
+// would then be booked against the next turn sent there. With a zero
+// floor, spent is exactly EvaluateTurnDeadline's timed out (the same >=
+// boundary); with any floor, it is EvaluateTurnDeadline's verdict at now
+// plus the floor.
 //
 // A zero dispatchedAt -- a turn whose dispatch time was never recorded --
 // falls back to a full deadline from now, never spent: with no first
@@ -63,5 +74,5 @@ func ReenqueueBound(dispatchedAt, now time.Time, cfg DeadlineConfig) (bound time
 		return now.Add(cfg.Deadline), false
 	}
 	bound = dispatchedAt.Add(cfg.Deadline)
-	return bound, !now.Before(bound)
+	return bound, bound.Sub(now) <= cfg.ReenqueueFloor
 }

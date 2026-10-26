@@ -246,14 +246,23 @@ type Timeouts struct {
 	// (turn_prompt_resend_total{outcome="window_expired"}), and the turn ends as
 	// it did before receipts existed, at turn_deadline or by a person's stop --
 	// no new failure path. Validate keeps it positive; below TurnDeadline by
-	// MinTimeoutMargin, so a prompt re-sent at the last moment starts before its
-	// deadline with at least TurnDeadline minus this left to run (the deadline is
-	// never re-armed by a re-send); and above ActorLockServerReapTime plus
-	// SandboxWSReconnectMaxBackoff plus ActorHydrateTimeout by MinTimeoutMargin,
-	// the slowest path from a dispatching replica that died after its commit to a
-	// same-gen ready on another replica -- the server reaping the dead lock
-	// backend, the agent's next dial, the hydration -- so that path still lands
-	// inside the window.
+	// MinTimeoutMargin, so a first dispatch's prompt re-sent at the last moment
+	// starts before its deadline with at least TurnDeadline minus this left to
+	// run (the deadline is never re-armed by a re-send); and above
+	// ActorLockServerReapTime plus SandboxWSReconnectMaxBackoff plus
+	// ActorHydrateTimeout by MinTimeoutMargin, the slowest path from a
+	// dispatching replica that died after its commit to a same-gen ready on
+	// another replica -- the server reaping the dead lock backend, the agent's
+	// next dial, the hydration -- so that path still lands inside the window.
+	//
+	// A turn re-sent to a newer gen (technical plan §3.3's turn recovery) asks
+	// that gen for a receipt in turn, so the window starts again at the
+	// re-send, while the deadline stays the first dispatch's
+	// (turn.ReenqueueBound). There the guarantee comes from
+	// ReenqueueBudgetFloor instead: a turn is re-sent only with more than the
+	// floor left, and the floor exceeds this window by MinTimeoutMargin, so
+	// the re-sent prompt re-sent at the last moment still starts with at least
+	// the floor minus this left to run.
 	PromptResendWindow time.Duration
 
 	// PromptResendMaxPerTurn: how many times, at most, the session actor
@@ -272,6 +281,28 @@ type Timeouts struct {
 	// re-send exists for, and three in a row on one turn is no accident.
 	// Validate keeps it positive: zero would never re-send at all.
 	PromptResendMaxPerTurn int
+
+	// ReenqueueBudgetFloor is the least of its turn_deadline a turn in
+	// flight must have left to be re-sent to a newer sandbox gen (technical
+	// plan §3.3's turn recovery, §35.4; turn.ReenqueueBound). A re-send keeps
+	// the deadline its first dispatch armed, so a turn re-sent with seconds
+	// left would start work on the new gen that its deadline fails moments
+	// later without stopping that gen -- and the agent's late end of that
+	// work would be booked against the next turn sent to the same gen
+	// (§3.3's limit: "turn_deadline is not covered"). A turn with no more
+	// than this left is not re-sent: nothing is sent to the new gen, and its
+	// turn_deadline ends it at its bound.
+	//
+	// Not given a value in the plan; derived from this file. A re-send asks
+	// the new gen for a prompt receipt, so PromptResendWindow starts again
+	// at the re-send while the deadline does not; the floor is that window
+	// plus MinTimeoutMargin, so the re-sent prompt re-sent once more at the
+	// window's last moment still starts before the deadline with at least
+	// the margin to run: 10m30s, rounded up to the next whole minute, 11
+	// minutes. Validate keeps it positive, above PromptResendWindow by
+	// MinTimeoutMargin, and below TurnDeadline by MinTimeoutMargin -- at or
+	// above it no turn could ever be re-sent.
+	ReenqueueBudgetFloor time.Duration
 
 	// StopDescendantWalkTimeout bounds what a stop request does after the
 	// named session's own request has committed (technical plan §3.3,
@@ -4514,6 +4545,7 @@ func DefaultTimeouts() Timeouts {
 		StopGrace:                 30 * time.Second,  // not specified; chosen (§3.3's stop)
 		PromptResendWindow:        10 * time.Minute,  // not specified; chosen (§3.3's prompt receipts)
 		PromptResendMaxPerTurn:    3,                 // not specified; chosen (§3.3's prompt receipts)
+		ReenqueueBudgetFloor:      11 * time.Minute,  // §3.3, §35.4; not specified, derived -- see field doc comment
 		StopDescendantWalkTimeout: 8 * time.Second,   // not specified; chosen (§3.3's stop)
 		SSEInactivityTimeout:      120 * time.Second, // §7, explicit
 		ProviderHTTPClientTimeout: 5 * time.Minute,   // not specified; must clear ProviderWorstColdStart (§4.1) with margin
@@ -5118,6 +5150,19 @@ func (t Timeouts) Validate() error {
 		"PromptResendWindow", t.PromptResendWindow,
 		"ActorLockServerReapTime + SandboxWSReconnectMaxBackoff + ActorHydrateTimeout",
 		t.ActorLockServerReapTime()+t.SandboxWSReconnectMaxBackoff+t.ActorHydrateTimeout)
+
+	// §3.3's turn recovery, §35.4: a turn in flight is re-sent to a newer
+	// gen only with more than this floor of its first dispatch's deadline
+	// left. A zero floor re-sends a turn with any budget left, even
+	// seconds; one no longer than PromptResendWindow lets a re-sent prompt's
+	// own same-gen re-send start at or after the deadline; and one at or
+	// past TurnDeadline would never re-send a turn at all. See
+	// ReenqueueBudgetFloor's own doc comment.
+	mustBePositive("ReenqueueBudgetFloor", t.ReenqueueBudgetFloor)
+	check("ReenqueueBudgetFloor > PromptResendWindow",
+		"ReenqueueBudgetFloor", t.ReenqueueBudgetFloor, "PromptResendWindow", t.PromptResendWindow)
+	check("TurnDeadline > ReenqueueBudgetFloor",
+		"TurnDeadline", t.TurnDeadline, "ReenqueueBudgetFloor", t.ReenqueueBudgetFloor)
 
 	// §2, a timer kind this binary does not know: kept at the claim cadence
 	// for longer than a rolling deploy is assumed to run, so a newer
