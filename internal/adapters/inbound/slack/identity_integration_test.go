@@ -34,20 +34,55 @@ import (
 	"github.com/narvidev/narvi/internal/platform"
 )
 
+// testSlackTeam is the workspace these tests' fake Slack APIs name as the
+// installation's own (auth.test) and as every member's (users.info).
+const testSlackTeam = "T0TEST"
+
+// confirmedSlackMember is users.info's user object for a full member of
+// testSlackTeam whose profile email Slack reports as confirmed -- the only
+// kind §13.2 links automatically (slackapi.UserEmail.Verified).
+func confirmedSlackMember(email string) map[string]any {
+	return map[string]any{
+		"team_id":             testSlackTeam,
+		"deleted":             false,
+		"is_bot":              false,
+		"is_restricted":       false,
+		"is_ultra_restricted": false,
+		"is_email_confirmed":  true,
+		"profile":             map[string]any{"email": email},
+	}
+}
+
+// answerSlackAuthTest answers r if it is auth.test, naming testSlackTeam
+// as the installation's workspace, and reports whether it did -- so a
+// fake that records the calls a test asserts on never records this one.
+func answerSlackAuthTest(w http.ResponseWriter, r *http.Request) bool {
+	if r.URL.Path != "/auth.test" {
+		return false
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write([]byte(`{"ok":true,"team_id":"` + testSlackTeam + `"}`))
+	return true
+}
+
 // newFakeSlackWithUsersInfo builds a fake Slack API server answering
 // EVERY path (chat.postMessage/chat.update/views.open) with a bare
-// {"ok":true} -- EXCEPT /users.info, which answers with a real profile
-// email for userID, any other user id getting {"ok":true} with no email
-// at all (mirrors newLinearGraphQLStub's own "one email, any id" simplicity
-// for these tests' own purposes).
+// {"ok":true} -- EXCEPT /users.info, which answers for userID with a full
+// member of testSlackTeam and a confirmed profile email, any other user id
+// getting {"ok":true} with no email at all (mirrors newLinearGraphQLStub's
+// own "one email, any id" simplicity for these tests' own purposes), and
+// /auth.test (answerSlackAuthTest).
 func newFakeSlackWithUsersInfo(t *testing.T, userID, email string) *httptest.Server {
 	t.Helper()
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if answerSlackAuthTest(w, r) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/users.info" && r.URL.Query().Get("user") == userID {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"ok":   true,
-				"user": map[string]any{"profile": map[string]any{"email": email}},
+				"user": confirmedSlackMember(email),
 			})
 			return
 		}
@@ -93,11 +128,14 @@ func newFakeSlackRecordingWithUsersInfo(t *testing.T, userID, email string) (*ht
 	t.Helper()
 	requests := make(chan recordedIdentityRequest, 16)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if answerSlackAuthTest(w, r) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/users.info" && r.URL.Query().Get("user") == userID {
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"ok":   true,
-				"user": map[string]any{"profile": map[string]any{"email": email}},
+				"user": confirmedSlackMember(email),
 			})
 			return
 		}

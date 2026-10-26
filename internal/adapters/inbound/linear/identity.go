@@ -80,7 +80,7 @@ func (deps Deps) resolveActor(ctx context.Context, logger *slog.Logger, organiza
 		return pgtype.UUID{}, ""
 	}
 
-	email, emailOK := identitylink.FetchEmailWithRetry(ctx, logger, deps.Timeouts, sqlcgen.IdentityProviderLinear, func(attemptCtx context.Context) (string, bool, error) {
+	email, emailOK := identitylink.FetchEmailWithRetry(ctx, logger, deps.Timeouts, sqlcgen.IdentityProviderLinear, func(attemptCtx context.Context) (identitylink.ProfileEmail, bool, error) {
 		e, err := deps.LinearClient.GetUserEmail(attemptCtx, accessToken, externalID)
 		if err != nil {
 			if errors.Is(err, linearapi.ErrLinearUserNotFound) {
@@ -88,14 +88,17 @@ func (deps Deps) resolveActor(ctx context.Context, logger *slog.Logger, organiza
 				// retryable (see that sentinel's own doc comment),
 				// mirroring slack/identity.go's own identical
 				// ErrSlackUserNotFound handling.
-				return "", false, platform.Permanent(err)
+				return identitylink.ProfileEmail{}, false, platform.Permanent(err)
 			}
-			return "", false, err
+			return identitylink.ProfileEmail{}, false, err
 		}
 		if e == "" {
-			return "", false, nil
+			return identitylink.ProfileEmail{}, false, nil
 		}
-		return e, true, nil
+		// §13.2's definition of a verified Linear email: the email Linear
+		// returns for the user, read with the organization's own
+		// installation token.
+		return identitylink.ProfileEmail{Address: e, Verified: true}, true, nil
 	})
 
 	res, err := identitylink.Resolve(ctx, deps.IdentityLink, sqlcgen.IdentityProviderLinear, externalID, email, emailOK)

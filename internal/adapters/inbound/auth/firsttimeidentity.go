@@ -199,7 +199,10 @@ func resolveFirstTimeIdentity(
 		// identitylink.AutoLink's own accessTokenEncrypted doc comment for
 		// why omitting this would silently leave a merged GitHub identity
 		// with no usable git credential.
-		res, err := identitylink.AutoLink(ctx, linkDeps, provider, externalID, verifiedEmail, matchedUserIDStr, encryptedToken)
+		// Verified: true -- verifiedEmail is the provider-verified email
+		// both callers pass (GitHub's verified primary email, the OIDC ID
+		// token's email with email_verified true).
+		res, err := identitylink.AutoLink(ctx, linkDeps, provider, externalID, identitylink.ProfileEmail{Address: verifiedEmail, Verified: true}, matchedUserIDStr, encryptedToken)
 		if err != nil {
 			return pgtype.UUID{}, 0, fmt.Errorf("auth: auto-link first-time identity: %w", err)
 		}
