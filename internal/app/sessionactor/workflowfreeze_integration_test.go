@@ -150,7 +150,12 @@ func (f *workflowFreezeFixture) completeFirstAttempt(ctx context.Context, t *tes
 
 // finishSnapshot answers the post-turn snapshot the first attempt's end
 // sent the sandbox with its snapshot_ready, so the sandbox is ready again
-// for the next turn.
+// for the next turn, and returns once the actor is idle. The actor
+// replies to the event before the dispatch evaluation it runs after its
+// commit (handleSandboxEvent), so the sandbox reads ready while that
+// evaluation may still be on its way; left running, it would take a
+// dispatch timer a release arms meanwhile and dispatch the turn itself,
+// before the timer pump is ever asked.
 func (f *workflowFreezeFixture) finishSnapshot(ctx context.Context, t *testing.T, rig *holdRig) {
 	t.Helper()
 	var snapshotCmd sandboxws.Snapshot
@@ -175,6 +180,7 @@ func (f *workflowFreezeFixture) finishSnapshot(ctx context.Context, t *testing.T
 		var status string
 		return f.pool.QueryRow(ctx, `SELECT status::text FROM sandboxes WHERE session_id = $1`, f.sessionID).Scan(&status) == nil && status == string(sqlcgen.SandboxStatusReady)
 	})
+	barrier(ctx, t, rig.actor)
 }
 
 // state reads the run's status, its step runs, the session's turns, and
