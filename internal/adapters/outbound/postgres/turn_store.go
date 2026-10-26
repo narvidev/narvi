@@ -416,6 +416,21 @@ func (s *TurnStore) SetPromptReceiptRequest(ctx context.Context, id pgtype.UUID,
 	})
 }
 
+// SetContinuityRecap records recap as the recap id's prompt carries to gen,
+// a fresh lineage (technical plan §35.5), in the transaction of the
+// dispatch that sends it. See SetTurnContinuityRecap's own generated doc
+// comment.
+func (s *TurnStore) SetContinuityRecap(ctx context.Context, id pgtype.UUID, recap string, gen int32) error {
+	return s.q.SetTurnContinuityRecap(ctx, sqlcgen.SetTurnContinuityRecapParams{Recap: recap, Gen: gen, ID: id})
+}
+
+// HasTurnDispatchedBeforeGen reports whether any turn of sessionID was
+// dispatched to a sandbox gen below gen (technical plan §35.5). See
+// HasTurnDispatchedBeforeGen's own generated doc comment.
+func (s *TurnStore) HasTurnDispatchedBeforeGen(ctx context.Context, sessionID pgtype.UUID, gen int32) (bool, error) {
+	return s.q.HasTurnDispatchedBeforeGen(ctx, sqlcgen.HasTurnDispatchedBeforeGenParams{SessionID: sessionID, Gen: gen})
+}
+
 // RecordCheckoutRequest records, in the dispatch evaluation's own
 // transaction, the checkout command about to be sent to id's sandbox gen
 // (technical plan §21.1, §30.4): messageID, gen, and the gen's ready_seq at

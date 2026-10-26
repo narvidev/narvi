@@ -1,0 +1,50 @@
+-- Technical plan §35.5: a fresh lineage is a sandbox spawned fresh in place
+-- of an earlier gen of a session that had a turn dispatched to one. The
+-- repository is cloned again and the agent runtime opens an empty
+-- conversation, so the agent has neither its context nor any work that was
+-- not pushed. The first turn dispatched to such a gen carries a recap of
+-- the session's earlier turns (turns.continuity_recap, the next migration),
+-- and this column is what says the gen still owes one.
+--
+-- sandboxes.fresh_lineage_gen: the gen whose loss of context was announced
+-- and has not yet been recapped. It counts only while it equals gen. The
+-- claim that spawns a fresh lineage writes it, in the claim's own
+-- transaction (MarkSandboxFreshLineage, decided by
+-- sandbox.DecideFreshLineage); every claim's upsert clears it
+-- (UpsertSandboxForSpawn), so a restore or a resume never carries one; and
+-- it is cleared once the prompt that carries the recap reaches that gen
+-- (ClearSandboxFreshLineageOnReach): its prompt_received, or the first
+-- event of the turn it opens.
+--
+-- Nullable, with no default and no backfill: no existing gen is marked.
+--
+-- # Locks
+--
+-- golang-migrate sends this file as one batch, one implicit transaction.
+-- The ADD COLUMN, nullable with no default, is a catalog change that
+-- rewrites nothing, but takes ACCESS EXCLUSIVE on sandboxes until the file
+-- ends -- an instant once granted. It waits behind any open transaction
+-- that has read or written sandboxes, and every new read and write of
+-- sandboxes queues behind it; controlplane/migrate.go sets no
+-- lock_timeout. The file touches sandboxes alone, so it holds no lock
+-- another table's waiters could need.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with this column present: every statement it
+-- sends names its columns, so it neither reads nor writes it.
+--   - Its upsert does not clear the column. A value it leaves counts only
+--     while it equals gen, and that binary's claims bump gen, so it is
+--     never read as a mark of the gen it created.
+--   - A gen this release marked, which the previous binary then dispatches
+--     to, gets no recap and keeps its mark: this release's next dispatch to
+--     that gen carries the recap.
+--
+-- # Rolling back
+--
+-- The previous binary cannot boot on this version ("no migration found for
+-- version N"). With the control plane scaled to zero, either keep the
+-- column (`migrate force` to the version before; this file, run again,
+-- keeps its values) or run the down. A value kept is read again only by a
+-- release that knows it, and only while it equals its row's gen.
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS fresh_lineage_gen INTEGER;

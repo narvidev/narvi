@@ -1,0 +1,18 @@
+-- Reverses the sandbox_fresh_lineage up. With the column goes every
+-- sandbox's record of a fresh lineage whose recap has not yet reached it. A
+-- binary without it does not read it; a binary with it that runs the up
+-- again reads every gen as unmarked, so a gen marked before the down gets
+-- no recap.
+--
+-- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary
+-- without it. Do not run it against live pods of a binary that carries it:
+-- every query of that binary that returns a whole sandbox row names the
+-- column (sqlc writes each SELECT * and RETURNING * out as a column list),
+-- so each fails with SQLSTATE 42703 and no sandbox is spawned or read until
+-- the older binary replaces the pod; and a pod that restarts first applies
+-- the up again at boot, which locks the older binary out again.
+-- Guarded: IF EXISTS, so it also runs when the column is already gone. The
+-- drop is a catalog change: it rewrites nothing, but takes ACCESS EXCLUSIVE
+-- on sandboxes for the file's one implicit transaction, and touches no
+-- other table.
+ALTER TABLE sandboxes DROP COLUMN IF EXISTS fresh_lineage_gen;

@@ -75,6 +75,25 @@ func (s *SandboxStore) MarkBootEvidence(ctx context.Context, sessionID pgtype.UU
 	return s.q.MarkSandboxBootEvidence(ctx, sqlcgen.MarkSandboxBootEvidenceParams{SessionID: sessionID, Gen: gen})
 }
 
+// MarkFreshLineage marks gen, when it is still the sandbox's live gen, as a
+// fresh lineage whose recap is still owed (technical plan §35.5) -- see
+// MarkSandboxFreshLineage's own generated doc comment.
+func (s *SandboxStore) MarkFreshLineage(ctx context.Context, sessionID pgtype.UUID, gen int32) error {
+	return s.q.MarkSandboxFreshLineage(ctx, sqlcgen.MarkSandboxFreshLineageParams{SessionID: sessionID, Gen: gen})
+}
+
+// ClearFreshLineageOnReach clears gen's fresh-lineage mark once the prompt
+// that carries its recap has reached it (technical plan §35.5), and reports
+// the rows it wrote: 1 when it cleared the mark. promptMessageID is a
+// prompt_received's promptMessageId, nil for an event of the turn the
+// prompt opened. See ClearSandboxFreshLineageOnReach's own generated doc
+// comment.
+func (s *SandboxStore) ClearFreshLineageOnReach(ctx context.Context, sessionID pgtype.UUID, gen int32, promptMessageID *string) (int64, error) {
+	return s.q.ClearSandboxFreshLineageOnReach(ctx, sqlcgen.ClearSandboxFreshLineageOnReachParams{
+		SessionID: sessionID, Gen: gen, PromptMessageID: promptMessageID,
+	})
+}
+
 // RecordReady counts a ready of gen and records whether it advertised the
 // prompt-receipt capability (technical plan §3.3, prompt receipts), whether
 // it advertised the review-checkout capability (§21.1, §30.4), whether it

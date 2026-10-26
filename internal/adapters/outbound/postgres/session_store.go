@@ -76,6 +76,15 @@ func (s *SessionStore) UpdateConversationID(ctx context.Context, arg sqlcgen.Upd
 	return s.q.UpdateSessionConversationID(ctx, arg)
 }
 
+// ClearConversationID forgets the session's agent-runtime conversation id
+// when a sandbox is spawned fresh (technical plan §35.5), leaving
+// updated_at as it is, and reports whether it had one. See
+// ClearSessionConversationID's own generated doc comment.
+func (s *SessionStore) ClearConversationID(ctx context.Context, id pgtype.UUID) (bool, error) {
+	n, err := s.q.ClearSessionConversationID(ctx, id)
+	return n > 0, err
+}
+
 // UpdateIntentDecisionIfNull persists decisionJSON (a marshaled
 // intent.IntentDecisionRecord) via the §18.4 write-once guarded update --
 // "UPDATE sessions SET intent_decision = ... WHERE intent_decision IS

@@ -381,6 +381,32 @@ SET receipt_requested_message_id = sqlc.narg('message_id'),
     receipt_resend_count = 0
 WHERE id = sqlc.arg('id');
 
+-- name: SetTurnContinuityRecap :exec
+-- Technical plan §35.5 (the turn_continuity_recap migration): records the
+-- recap the turn's prompt carries to gen, a fresh lineage, in the
+-- transaction of the dispatch that sends it (tryPlanDispatch,
+-- tryPlanReenqueue), so a receipt re-send of the same prompt to the same
+-- gen sends the same bytes. A recap built for another gen is replaced: a
+-- prompt carries the recap only to the gen it was built for.
+UPDATE turns
+SET continuity_recap = sqlc.arg('recap')::text,
+    continuity_recap_gen = sqlc.arg('gen')::integer
+WHERE id = sqlc.arg('id');
+
+-- name: HasTurnDispatchedBeforeGen :one
+-- Technical plan §35.5: whether any turn of the session was dispatched to a
+-- sandbox gen below gen -- the claim that creates gen spawns a fresh
+-- lineage only when one was, since otherwise there is no context to lose
+-- (sandbox.DecideFreshLineage). Read in the claim's transaction. A turn
+-- re-sent to a later gen counts at the gen it was last sent to, which is
+-- still below the gen a later claim creates.
+SELECT EXISTS (
+    SELECT 1 FROM turns
+    WHERE session_id = sqlc.arg('session_id')
+      AND dispatched_sandbox_gen IS NOT NULL
+      AND dispatched_sandbox_gen < sqlc.arg('gen')::integer
+) AS dispatched;
+
 -- name: GetTurnPromptReceiptState :one
 -- Technical plan §3.3, prompt receipts: whether the receipt of the turn's
 -- current dispatch is stored, and how long ago that dispatch asked for it,

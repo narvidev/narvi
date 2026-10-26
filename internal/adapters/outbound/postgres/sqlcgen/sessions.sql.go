@@ -29,6 +29,30 @@ func (q *Queries) BumpActorEpoch(ctx context.Context, id pgtype.UUID) (int64, er
 	return actor_epoch, err
 }
 
+const clearSessionConversationID = `-- name: ClearSessionConversationID :execrows
+UPDATE sessions
+SET opencode_conversation_id = NULL
+WHERE id = $1
+  AND opencode_conversation_id IS NOT NULL
+`
+
+// Forgets the session's agent-runtime conversation id (technical plan
+// §35.5): the claim that spawns a sandbox fresh, rather than restoring or
+// resuming one, calls it in its own transaction, since the new box holds
+// no runtime conversation and a prompt naming the old one would name a
+// conversation that does not exist there. The first prompt to the new gen
+// then names none, the agent opens one, and its heartbeat records it
+// (UpdateSessionConversationID). updated_at is left as it is: nothing about
+// the session a person sees changed, and the decision inbox orders failed
+// sessions by it. Reports the rows it wrote: 0 when the session had none.
+func (q *Queries) ClearSessionConversationID(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, clearSessionConversationID, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const clearSessionStopRequest = `-- name: ClearSessionStopRequest :execrows
 UPDATE sessions
 SET stop_requested_at = NULL

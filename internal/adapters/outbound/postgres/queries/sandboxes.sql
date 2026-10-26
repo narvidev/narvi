@@ -128,6 +128,13 @@ RETURNING *;
 -- only for the rotation: rotation_gen counts only while it equals gen, so
 -- the bump alone makes a value left over read "not rotating".
 --
+-- fresh_lineage_gen (technical plan §35.5, the sandbox_fresh_lineage
+-- migration) is cleared too, so every claim starts unmarked: a restore or
+-- a resume never carries a mark, and the claim that spawns a fresh lineage
+-- marks its new gen afterwards, in its own transaction
+-- (MarkSandboxFreshLineage). Like the rotation, the mark counts only while
+-- it equals gen, so this is hygiene as well.
+--
 -- A NULL lifetime_seconds is a resume's (planResume): the same provider
 -- object, never younger than it was, so a fresh stamp would be later than
 -- the provider's own deadline. It carries the deadline forward to the new
@@ -159,6 +166,7 @@ SET gen = sandboxes.gen + 1,
     snapshot_start_message_id = NULL,
     heartbeat_ready_seq = NULL,
     heartbeats_since_ready = NULL,
+    fresh_lineage_gen = NULL,
     lifetime_deadline_at = CASE
         WHEN sqlc.narg('lifetime_seconds')::integer IS NOT NULL THEN EXCLUDED.lifetime_deadline_at
         WHEN sandboxes.lifetime_deadline_gen = sandboxes.gen THEN sandboxes.lifetime_deadline_at
@@ -329,6 +337,46 @@ SET boot_evidence_gen = gen,
     updated_at = now()
 WHERE session_id = $1
   AND gen = $2;
+
+-- name: MarkSandboxFreshLineage :exec
+-- Technical plan §35.5 (the sandbox_fresh_lineage migration): marks gen as
+-- a fresh lineage whose recap is still owed. The claim that spawns it calls
+-- it in its own transaction, after UpsertSandboxForSpawn created the gen,
+-- when sandbox.DecideFreshLineage says Mark. Guarded on gen, so a mark is
+-- only ever written for the gen that is live; it counts only while it
+-- equals gen.
+UPDATE sandboxes
+SET fresh_lineage_gen = gen,
+    updated_at = now()
+WHERE session_id = sqlc.arg('session_id')
+  AND gen = sqlc.arg('gen');
+
+-- name: ClearSandboxFreshLineageOnReach :execrows
+-- Technical plan §35.5: clears gen's mark once the prompt that carries its
+-- recap has reached it -- evidence the control plane stores, never the
+-- dispatch's commit or a send that returned. handleSandboxEvent
+-- (sandboxevent.go) calls it, in the transaction that stores the event,
+-- for an event of gen that is that evidence: a prompt_received, whose
+-- promptMessageId must then be the recap turn's dispatched_message_id, or
+-- an event of the turn the prompt opened (prompt_message_id NULL). Either
+-- way it clears only while a turn is processing on gen with a recap built
+-- for gen, so an event of a turn that carried no recap -- one dispatched
+-- with no room for it -- leaves the mark for the next turn. Reports the
+-- rows it wrote: 1 when it cleared the mark.
+UPDATE sandboxes
+SET fresh_lineage_gen = NULL,
+    updated_at = now()
+WHERE sandboxes.session_id = sqlc.arg('session_id')
+  AND sandboxes.gen = sqlc.arg('gen')
+  AND sandboxes.fresh_lineage_gen = sqlc.arg('gen')
+  AND EXISTS (
+      SELECT 1 FROM turns t
+      WHERE t.session_id = sqlc.arg('session_id')
+        AND t.status = 'processing'
+        AND t.dispatched_sandbox_gen = sqlc.arg('gen')
+        AND t.continuity_recap_gen = sqlc.arg('gen')
+        AND (sqlc.narg('prompt_message_id')::text IS NULL
+             OR t.dispatched_message_id = sqlc.narg('prompt_message_id')::text));
 
 -- name: RecordSandboxReady :exec
 -- Technical plan §3.3, prompt receipts (migrations/000155_prompt_receipts.up.sql):

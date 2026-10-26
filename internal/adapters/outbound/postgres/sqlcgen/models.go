@@ -2396,6 +2396,7 @@ type Sandbox struct {
 	SkipRepoHooksGen              *int32               `json:"skip_repo_hooks_gen"`
 	SkipRepoHooksToldGen          *int32               `json:"skip_repo_hooks_told_gen"`
 	SnapshotSkippedRepoHooksID    *string              `json:"snapshot_skipped_repo_hooks_id"`
+	FreshLineageGen               *int32               `json:"fresh_lineage_gen"`
 }
 
 type SandboxHistory struct {
@@ -2536,6 +2537,8 @@ type Turn struct {
 	CheckoutRetiredGen        *int32                `json:"checkout_retired_gen"`
 	CheckedOutSha             *string               `json:"checked_out_sha"`
 	ReenqueuedSandboxGen      *int32                `json:"reenqueued_sandbox_gen"`
+	ContinuityRecap           *string               `json:"continuity_recap"`
+	ContinuityRecapGen        *int32                `json:"continuity_recap_gen"`
 }
 
 type TurnStepCost struct {
