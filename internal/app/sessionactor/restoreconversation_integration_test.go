@@ -304,3 +304,127 @@ func TestRestoreConversation_NeverMarksNorWarns(t *testing.T) {
 		t.Errorf("%d differs lines, want 1", n)
 	}
 }
+
+// TestRestoreConversation_RotationRestoresAreCounted: the claim that
+// replaces a gen the runway gate rotated (technical plan §35.3) is a
+// restore like any other, and is counted like one. A restore of the
+// rotation's own snapshot, minted under the conversation the session still
+// names, is held. The fallback to the snapshot before it, recorded under
+// another conversation, is differs: what is read is the record of the
+// snapshot actually restored.
+func TestRestoreConversation_RotationRestoresAreCounted(t *testing.T) {
+	t.Run("Rotated", func(t *testing.T) {
+		ctx := context.Background()
+		before := restoreConversationCounts(ctx, t)
+		rotatedBefore := rotationRestoreCount(ctx, t, rotationOutcomeRotated)
+		rig := newRunwayRig(ctx, t, runwayRigOptions{runway: 10 * time.Minute,
+			beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+				setConversation(ctx, t, pool, sessionID, "conv-rotated")
+			}})
+		settle(ctx, t, rig.actor)
+		cmd := onlySnapshotCommand(t, rig.commander)
+		deliver(ctx, t, rig.actor, snapshotReady(1, cmd.MessageId, runwayRotationSnap, ""))
+
+		if call := rig.waitRestored(t, 1); call.snapshotID != runwayRotationSnap || call.spec.Gen != 2 {
+			t.Fatalf("RestoreFromSnapshot(%q) for gen %d, want the rotation's own %q for gen 2", call.snapshotID, call.spec.Gen, runwayRotationSnap)
+		}
+		if got := rotationRestoreCount(ctx, t, rotationOutcomeRotated) - rotatedBefore; got != 1 {
+			t.Fatalf("sandbox_rotation_restore_total{rotated} moved by %d, want 1", got)
+		}
+		if got := countDelta(before, restoreConversationCounts(ctx, t)); len(got) != 1 || got[string(sandbox.RestoreConversationHeld)] != 1 {
+			t.Errorf("sandbox_restore_conversation_total moved by %v, want held by 1 alone", got)
+		}
+	})
+	t.Run("FellBack", func(t *testing.T) {
+		ctx := context.Background()
+		before := restoreConversationCounts(ctx, t)
+		fellBackBefore := rotationRestoreCount(ctx, t, rotationOutcomeFellBack)
+		rig := newRunwayRig(ctx, t, runwayRigOptions{runway: 10 * time.Minute,
+			commander: &fakeSendCommander{failTypes: map[string]error{"snapshot": ports.ErrNoLiveSandboxConnection}},
+			beforeActor: func(pool *pgxpool.Pool, sessionID pgtype.UUID) {
+				setConversation(ctx, t, pool, sessionID, "conv-now")
+				if _, err := pool.Exec(ctx, `UPDATE sandboxes SET snapshot_conversation_id = 'conv-then',
+					snapshot_conversation_recorded_id = snapshot_id WHERE session_id = $1`, sessionID); err != nil {
+					t.Fatalf("record the previous snapshot's conversation: %v", err)
+				}
+			}})
+		settle(ctx, t, rig.actor)
+
+		if call := rig.waitRestored(t, 1); call.snapshotID != runwayPreviousSnap || call.spec.Gen != 2 {
+			t.Fatalf("RestoreFromSnapshot(%q) for gen %d, want the previous snapshot %q for gen 2", call.snapshotID, call.spec.Gen, runwayPreviousSnap)
+		}
+		if got := rotationRestoreCount(ctx, t, rotationOutcomeFellBack) - fellBackBefore; got != 1 {
+			t.Fatalf("sandbox_rotation_restore_total{fell_back} moved by %d, want 1", got)
+		}
+		if got := countDelta(before, restoreConversationCounts(ctx, t)); len(got) != 1 || got[string(sandbox.RestoreConversationDiffers)] != 1 {
+			t.Errorf("sandbox_restore_conversation_total moved by %v, want differs by 1 alone", got)
+		}
+	})
+}
+
+// TestRestoreConversation_RefusedRestoresAreNotCounted: a restore turned
+// into a fresh spawn restores nothing, so it is not counted. That holds
+// whether it was refused on the snapshot's provenance (§35.5b) or
+// downgraded for a session that runs a container daemon (§27.8) or a
+// shadow session (§30.4(3)), and even though the snapshot it did not
+// restore records the very conversation the session names.
+func TestRestoreConversation_RefusedRestoresAreNotCounted(t *testing.T) {
+	tests := []struct {
+		name     string
+		session  func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) pgtype.UUID
+		protocol string
+		docker   bool
+	}{
+		{"ProvenanceRefused", createTestSession, "1.24.0", false},
+		{"ContainerDaemonDowngrade", func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) pgtype.UUID {
+			return createTestSessionWithEnvironment(ctx, t, pool, createTestEnvironmentWithDocker(ctx, t, pool))
+		}, contracts.Version, true},
+		{"ShadowDowngrade", func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) pgtype.UUID {
+			return createTestSessionWithRepos(ctx, t, pool, pgtype.UUID{}, "repo", "https://github.com/example/restore-conversation-shadow.git", "main")
+		}, contracts.Version, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			pool := newTestPool(t)
+			sessionID := tc.session(ctx, t, pool)
+			setConversation(ctx, t, pool, sessionID, "conv-a")
+			createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, "refused restore")
+			const snapshotID = "snap-not-restored"
+			seedStoppedSandboxWithProvenance(ctx, t, pool, sessionID, snapshotID, strPtr(tc.protocol), nil)
+			row, err := narvipg.NewSandboxStore(pool).Get(ctx, sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stringOrEmpty(row.SnapshotConversationID) != "conv-a" || stringOrEmpty(row.SnapshotConversationRecordedID) != snapshotID {
+				t.Fatalf("seeded conversation %q recorded for %q, want conv-a recorded for %s", stringOrEmpty(row.SnapshotConversationID),
+					stringOrEmpty(row.SnapshotConversationRecordedID), snapshotID)
+			}
+
+			logs := captureDefaultLoggerJSONSync(t)
+			before := restoreConversationCounts(ctx, t)
+			provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "fresh-instead"}, dockerSupported: tc.docker}
+			r := newDispatchTestRegistry(t, ctx, pool, provider, nil)
+			t.Cleanup(func() { _ = r.Shutdown() })
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+			sendEnsureDispatched(ctx, t, a)
+			waitUntil(t, 5*time.Second, func() bool { return provider.callCount() == 1 })
+			waitForConnecting(ctx, t, pool, sessionID)
+
+			if n := provider.restoreCallCount(); n != 0 {
+				t.Fatalf("RestoreFromSnapshot called %d times, want 0: the restore was turned into a fresh spawn", n)
+			}
+			if got := countDelta(before, restoreConversationCounts(ctx, t)); len(got) != 0 {
+				t.Errorf("sandbox_restore_conversation_total moved by %v for a fresh spawn, want nothing", got)
+			}
+			for _, msg := range []string{restoreConversationDiffersLogMessage, restoreConversationUnknownLogMessage} {
+				if n := countLogLines(t, logs, msg); n != 0 {
+					t.Errorf("%d lines %q for a fresh spawn, want none", n, msg)
+				}
+			}
+		})
+	}
+}
