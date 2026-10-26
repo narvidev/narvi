@@ -221,7 +221,7 @@ export interface CreateTurnResponse {
   status: 'pending' | 'dispatched' | 'processing' | 'completed' | 'failed' | 'cancelled';
 }
 /**
- * §6.2: per-participant, hashed at rest, 24h TTL, minted via POST /api/sessions/:id/ws-token.
+ * §6.2: per-participant, hashed at rest, short-lived (expiresAt states when; mint one right before each connection), minted via POST /api/sessions/:id/ws-token.
  *
  * This interface was referenced by `RestDtos`'s JSON-Schema
  * via the `definition` "WSTokenResponse".

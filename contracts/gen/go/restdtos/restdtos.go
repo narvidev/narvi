@@ -15633,8 +15633,8 @@ func (j *UpsertIntentTemplateRequest) UnmarshalJSON(value []byte) error {
 	return nil
 }
 
-// §6.2: per-participant, hashed at rest, 24h TTL, minted via POST
-// /api/sessions/:id/ws-token.
+// §6.2: per-participant, hashed at rest, short-lived (expiresAt states when; mint
+// one right before each connection), minted via POST /api/sessions/:id/ws-token.
 type WSTokenResponse struct {
 	// ExpiresAt corresponds to the JSON schema field "expiresAt".
 	ExpiresAt time.Time `json:"expiresAt" yaml:"expiresAt" mapstructure:"expiresAt"`

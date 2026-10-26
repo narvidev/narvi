@@ -7,7 +7,7 @@
  */
 
 /**
- * Browser <-> control-plane WS protocol (§6.2). These 4 shapes are independent named payloads, not a discriminated union, so (per the PR-05 spec) there is deliberately no top-level oneOf here — each is emitted as its own top-level $def. Connect -> subscribe{token, clientId} within 30s (timeout lives in a later PR's platform/timeouts.go) -> a single 'subscribed' reply (SubscribedPayload: full state + event replay + artifacts + participants) -> broadcast stream. fetch_history is cursor-paginated. Close codes 4001 (re-auth) / 4002 (token expired) are connection-level, not part of these payload shapes. Field nullability convention: 'nullable' means a required key whose value may be JSON null.
+ * Browser <-> control-plane WS protocol (§6.2). These 4 shapes are independent named payloads, not a discriminated union, so (per the PR-05 spec) there is deliberately no top-level oneOf here — each is emitted as its own top-level $def. Connect -> subscribe{token, clientId} within 30s (timeout lives in a later PR's platform/timeouts.go) -> a single 'subscribed' reply (SubscribedPayload: full state + event replay + artifacts + participants) -> broadcast stream. fetch_history is cursor-paginated. Close codes 4001 (re-auth) / 4002 (token expired) are connection-level, not part of these payload shapes. 4001 may also close an open socket after `subscribed`: the server re-checks the subscriber's access at subscribe and periodically; a client mints a token again and reconnects, as for 4001 at the handshake. Field nullability convention: 'nullable' means a required key whose value may be JSON null.
  */
 export interface ClientWSProtocol {
   [k: string]: unknown;

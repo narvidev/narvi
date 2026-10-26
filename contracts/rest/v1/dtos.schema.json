@@ -365,7 +365,7 @@
     "WSTokenResponse": {
       "type": "object",
       "additionalProperties": false,
-      "description": "\u00a76.2: per-participant, hashed at rest, 24h TTL, minted via POST /api/sessions/:id/ws-token.",
+      "description": "\u00a76.2: per-participant, hashed at rest, short-lived (expiresAt states when; mint one right before each connection), minted via POST /api/sessions/:id/ws-token.",
       "required": [
         "token",
         "expiresAt"
