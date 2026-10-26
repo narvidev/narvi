@@ -2537,6 +2537,7 @@ type Turn struct {
 	CheckoutFailures          *int32                `json:"checkout_failures"`
 	CheckoutRetiredGen        *int32                `json:"checkout_retired_gen"`
 	CheckedOutSha             *string               `json:"checked_out_sha"`
+	ReenqueuedSandboxGen      *int32                `json:"reenqueued_sandbox_gen"`
 }
 
 type TurnStepCost struct {

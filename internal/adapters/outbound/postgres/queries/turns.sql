@@ -315,6 +315,14 @@ SELECT (EXISTS (
 -- recorder every status write goes through, so that end wakes a held
 -- re-review like any other. The same sqlc.narg + COALESCE convention:
 -- every other write leaves it as it is.
+--
+-- reenqueued_sandbox_gen (migrations/000176, technical plan §3.3's turn
+-- recovery, §35.4) is stamped by tryPlanReenqueue alone, in the same write
+-- and with the same value as dispatched_sandbox_gen: the gen a re-send last
+-- sent the turn to. handleTurnDeadlineTimer retires that gen when the
+-- turn's deadline fails it while it still names the turn's current gen.
+-- The same sqlc.narg + COALESCE convention: every other write leaves it as
+-- it is.
 UPDATE turns
 SET status = $2,
     dispatched_at = COALESCE(sqlc.narg('dispatched_at'), dispatched_at),
@@ -322,7 +330,8 @@ SET status = $2,
     dispatched_sandbox_gen = COALESCE(sqlc.narg('dispatched_sandbox_gen'), dispatched_sandbox_gen),
     dispatched_event_id = COALESCE(sqlc.narg('dispatched_event_id'), dispatched_event_id),
     dispatched_message_id = COALESCE(sqlc.narg('dispatched_message_id'), dispatched_message_id),
-    end_reason = COALESCE(sqlc.narg('end_reason'), end_reason)
+    end_reason = COALESCE(sqlc.narg('end_reason'), end_reason),
+    reenqueued_sandbox_gen = COALESCE(sqlc.narg('reenqueued_sandbox_gen'), reenqueued_sandbox_gen)
 WHERE id = $1
 RETURNING *;
 
