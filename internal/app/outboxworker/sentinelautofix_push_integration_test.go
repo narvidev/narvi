@@ -107,6 +107,7 @@ func TestSentinelAutoFixChild_IsNotAReviewSessionSoItsPushIsSent(t *testing.T) {
 		t.Fatalf("promote repo to live egress: %v", err)
 	}
 
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, prNumber, origin.ID, originHeadBranch)
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)

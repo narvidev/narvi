@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -79,8 +80,8 @@ func assertHeldByTheFreeze(ctx context.Context, t *testing.T, pool *pgxpool.Pool
 }
 
 // sentinelAutoFixFreezeFixture is one sentinel auto-fix outbox row, its
-// claim and finding, and a Builder delivering its kind through the real
-// notifier.
+// claim and finding, in a repository with the sentinel auto-fix on, and a
+// Builder delivering its kind through the real notifier.
 type sentinelAutoFixFreezeFixture struct {
 	pool          *pgxpool.Pool
 	builder       *outboxworker.Builder
@@ -91,6 +92,15 @@ type sentinelAutoFixFreezeFixture struct {
 	row           sqlcgen.Outbox
 	repoFullName  string
 	identityHash  string
+	// payload is the row's payload; enqueue derives further rows from it.
+	payload ports.SentinelAutoFixPayload
+	// notifier is the real notifier the builder delivers through, for a
+	// test that delivers rows itself.
+	notifier ports.Notifier
+	// builderReading builds another Builder over the same row, stores and
+	// code host, whose notifier reads the repository's settings from
+	// repoSettings.
+	builderReading func(repoSettings *narvipg.RepoSettingsStore) *outboxworker.Builder
 }
 
 func newSentinelAutoFixFreezeFixture(ctx context.Context, t *testing.T) *sentinelAutoFixFreezeFixture {
@@ -114,6 +124,7 @@ func newSentinelAutoFixFreezeFixture(ctx context.Context, t *testing.T) *sentine
 		t.Fatalf("create origin session: %v", err)
 	}
 	originSession := origin.ID
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, 91, originSession, "feature-fix-me")
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)
@@ -126,36 +137,102 @@ func newSentinelAutoFixFreezeFixture(ctx context.Context, t *testing.T) *sentine
 		t.Fatalf("upsert review finding: %v", err)
 	}
 
-	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
-	notifier := mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, sessions, narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), registry, sentinelFixes, reviewFindings,
-		sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts(), false, platform.RolloutModeOpen, narvipg.NewRepoSettingsStore(pool), narvipg.NewGitHubPRSessionStore(pool),
-		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool)))
-
-	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
+	payload := ports.SentinelAutoFixPayload{
 		SentinelFixID: fix.ID.String(), RepoFullName: repoFullName, OriginPRNumber: 91,
 		OriginReviewSessionID: originSession.String(), OriginHeadBranch: "feature-fix-me",
 		RepoName: "widgets", RepoCloneURL: "https://github.com/acme/widgets.git",
 		FindingIdentityHashes: []string{identityHash}, FindingDescriptions: []string{"Missing test coverage."},
-	})
+	}
+	store := narvipg.NewOutboxStore(pool, false)
+	row := enqueueSentinelAutoFix(ctx, t, store, originSession, payload)
+
+	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
+	notifierReading := func(repoSettings *narvipg.RepoSettingsStore) ports.Notifier {
+		return mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, sessions, narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), registry, sentinelFixes, reviewFindings,
+			sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, narvipg.NewGitHubPRSessionStore(pool),
+			func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool)))
+	}
+	builderReading := func(repoSettings *narvipg.RepoSettingsStore) *outboxworker.Builder {
+		builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
+			ports.NotificationKindSentinelAutoFix: notifierReading(repoSettings),
+		}, platform.DefaultTimeouts(), &platform.ShutdownState{})
+		if err != nil {
+			t.Fatalf("NewBuilder: %v", err)
+		}
+		return builder
+	}
+	return &sentinelAutoFixFreezeFixture{
+		pool: pool, builder: builderReading(narvipg.NewRepoSettingsStore(pool)), sourceControl: sourceControl, sentinelFixes: sentinelFixes, findings: reviewFindings,
+		fix: fix, row: row, repoFullName: repoFullName, identityHash: identityHash, payload: payload,
+		notifier: notifierReading(narvipg.NewRepoSettingsStore(pool)), builderReading: builderReading,
+	}
+}
+
+// enqueueSentinelAutoFix enqueues one sentinel auto-fix delivery of payload
+// for the origin session, as the review verdict does.
+func enqueueSentinelAutoFix(ctx context.Context, t *testing.T, store *narvipg.OutboxStore, originSession pgtype.UUID, payload ports.SentinelAutoFixPayload) sqlcgen.Outbox {
+	t.Helper()
+	raw, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
-	store := narvipg.NewOutboxStore(pool, false)
-	row, err := store.Create(ctx, sqlcgen.CreateOutboxEntryParams{SessionID: originSession, Kind: string(ports.NotificationKindSentinelAutoFix), Payload: payload})
+	row, err := store.Create(ctx, sqlcgen.CreateOutboxEntryParams{SessionID: originSession, Kind: string(ports.NotificationKindSentinelAutoFix), Payload: raw})
 	if err != nil {
 		t.Fatalf("enqueue the sentinel auto-fix: %v", err)
 	}
+	return row
+}
 
-	builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
-		ports.NotificationKindSentinelAutoFix: notifier,
-	}, platform.DefaultTimeouts(), &platform.ShutdownState{})
+// enqueueForFinding records one more open sentinel finding on the pull
+// request and enqueues a further delivery naming only it, against the
+// fixture's claim -- what a later verdict on the same pull request
+// enqueues while the claim has no child yet.
+func (f *sentinelAutoFixFreezeFixture) enqueueForFinding(ctx context.Context, t *testing.T, identityHash string) sqlcgen.Outbox {
+	t.Helper()
+	if _, err := f.findings.Upsert(ctx, sqlcgen.UpsertReviewFindingParams{
+		RepoFullName: f.repoFullName, PrNumber: 91, IdentityHash: identityHash,
+		Severity: "medium", FilePath: "docs/guide.md", Description: "Stale documentation.",
+	}); err != nil {
+		t.Fatalf("upsert review finding: %v", err)
+	}
+	var origin pgtype.UUID
+	if err := origin.Scan(f.payload.OriginReviewSessionID); err != nil {
+		t.Fatalf("origin session id: %v", err)
+	}
+	payload := f.payload
+	payload.FindingIdentityHashes = []string{identityHash}
+	payload.FindingDescriptions = []string{"Stale documentation."}
+	return enqueueSentinelAutoFix(ctx, t, narvipg.NewOutboxStore(f.pool, false), origin, payload)
+}
+
+// findingOf reads one finding on the fixture's pull request.
+func (f *sentinelAutoFixFreezeFixture) findingOf(ctx context.Context, t *testing.T, identityHash string) sqlcgen.ReviewFinding {
+	t.Helper()
+	finding, err := f.findings.Get(ctx, f.repoFullName, 91, identityHash)
 	if err != nil {
-		t.Fatalf("NewBuilder: %v", err)
+		t.Fatalf("get review finding: %v", err)
 	}
-	return &sentinelAutoFixFreezeFixture{
-		pool: pool, builder: builder, sourceControl: sourceControl, sentinelFixes: sentinelFixes, findings: reviewFindings,
-		fix: fix, row: row, repoFullName: repoFullName, identityHash: identityHash,
+	return finding
+}
+
+// failSkipAudits makes every insert of a sentinel_fix.spawn_skipped audit
+// row fail, until the returned function (also run at cleanup) lifts it.
+func failSkipAudits(ctx context.Context, t *testing.T, pool *pgxpool.Pool) (lift func()) {
+	t.Helper()
+	for _, stmt := range []string{
+		`CREATE OR REPLACE FUNCTION sentinel_autofix_test_fail_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected audit failure'; END $$`,
+		`CREATE TRIGGER sentinel_autofix_test_fail_audit BEFORE INSERT ON audit_log FOR EACH ROW WHEN (NEW.action = 'sentinel_fix.spawn_skipped') EXECUTE FUNCTION sentinel_autofix_test_fail_audit()`,
+	} {
+		if _, err := pool.Exec(ctx, stmt); err != nil {
+			t.Fatalf("inject the audit failure: %v", err)
+		}
 	}
+	lift = func() {
+		_, _ = pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS sentinel_autofix_test_fail_audit ON audit_log`)
+		_, _ = pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS sentinel_autofix_test_fail_audit()`)
+	}
+	t.Cleanup(lift)
+	return lift
 }
 
 // fixSessions counts the sentinel auto-fix child sessions.
@@ -175,6 +252,188 @@ func (f *sentinelAutoFixFreezeFixture) findingStatus(ctx context.Context, t *tes
 		t.Fatalf("get review finding: %v", err)
 	}
 	return finding.Status
+}
+
+// setAutoFix turns the repository's sentinel auto-fix toggle on or off, as
+// an administrator does in its settings.
+func (f *sentinelAutoFixFreezeFixture) setAutoFix(ctx context.Context, t *testing.T, on bool) {
+	t.Helper()
+	if _, err := narvipg.NewRepoSettingsStore(f.pool).Upsert(ctx, f.repoFullName, false, on); err != nil {
+		t.Fatalf("set the sentinel auto-fix toggle to %v: %v", on, err)
+	}
+}
+
+// skipRecords counts the audit rows recording this fix as skipped because
+// its repository has the sentinel auto-fix off: system-attributed (no
+// actor), on the claim, naming the reason, the claim released by this
+// delivery, and the fix branch an earlier attempt would have left behind.
+func (f *sentinelAutoFixFreezeFixture) skipRecords(ctx context.Context, t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM audit_log
+		WHERE action = 'sentinel_fix.spawn_skipped' AND resource_type = 'sentinel_fix' AND resource_id = $1
+		  AND actor_user_id IS NULL AND detail_json->>'reason' = 'sentinel_autofix_disabled'
+		  AND detail_json->>'repo_full_name' = $2 AND detail_json->>'claim' = 'released'
+		  AND detail_json->>'fix_branch' = $3`, f.fix.ID.String(), f.repoFullName, "narvi/sentinel-fix/"+f.fix.ID.String()).Scan(&n); err != nil {
+		t.Fatalf("count skip records: %v", err)
+	}
+	return n
+}
+
+// skipRecord is one sentinel_fix.spawn_skipped audit row's reason, what
+// it says became of the claim, and the findings it names.
+type skipRecord struct {
+	reason string
+	claim  string
+	hashes []string
+}
+
+// skipRecordsByFinding reads every skip record on the fixture's claim that
+// is system-attributed and names the claim's fix branch, keyed by the
+// first finding each names.
+func (f *sentinelAutoFixFreezeFixture) skipRecordsByFinding(ctx context.Context, t *testing.T) map[string]skipRecord {
+	t.Helper()
+	rows, err := f.pool.Query(ctx, `SELECT detail_json->>'reason', detail_json->>'claim', detail_json->'finding_identity_hashes'
+		FROM audit_log
+		WHERE action = 'sentinel_fix.spawn_skipped' AND resource_type = 'sentinel_fix' AND resource_id = $1
+		  AND actor_user_id IS NULL AND detail_json->>'fix_branch' = $2`, f.fix.ID.String(), "narvi/sentinel-fix/"+f.fix.ID.String())
+	if err != nil {
+		t.Fatalf("read skip records: %v", err)
+	}
+	var records []skipRecord
+	var scanErr error
+	for rows.Next() {
+		var r skipRecord
+		var reason, claim *string
+		if err := rows.Scan(&reason, &claim, &r.hashes); err != nil {
+			scanErr = err
+			break
+		}
+		if reason != nil {
+			r.reason = *reason
+		}
+		if claim != nil {
+			r.claim = *claim
+		}
+		records = append(records, r)
+	}
+	rows.Close()
+	if scanErr != nil || rows.Err() != nil {
+		t.Fatalf("scan skip records: %v %v", scanErr, rows.Err())
+	}
+	byFinding := make(map[string]skipRecord, len(records))
+	for _, r := range records {
+		if len(r.hashes) != 1 {
+			t.Fatalf("skip record names %d findings, want 1: %+v", len(r.hashes), r)
+		}
+		if _, dup := byFinding[r.hashes[0]]; dup {
+			t.Fatalf("two skip records name finding %s", r.hashes[0])
+		}
+		byFinding[r.hashes[0]] = r
+	}
+	return byFinding
+}
+
+// anySkipRecords counts every sentinel_fix.spawn_skipped audit row,
+// whatever it names.
+func (f *sentinelAutoFixFreezeFixture) anySkipRecords(ctx context.Context, t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM audit_log WHERE action = 'sentinel_fix.spawn_skipped'`).Scan(&n); err != nil {
+		t.Fatalf("count skip records: %v", err)
+	}
+	return n
+}
+
+// outboxRow reads the fixture's outbox row.
+func (f *sentinelAutoFixFreezeFixture) outboxRow(ctx context.Context, t *testing.T) sqlcgen.Outbox {
+	t.Helper()
+	row, err := narvipg.NewOutboxStore(f.pool, false).Get(ctx, f.row.ID)
+	if err != nil {
+		t.Fatalf("get outbox row: %v", err)
+	}
+	return row
+}
+
+// assertNothingStarted checks the delivery started nothing: no call to
+// the code host, no fix branch, no fix session, the finding still open,
+// and the claim either released (gone) or untouched with no child.
+func (f *sentinelAutoFixFreezeFixture) assertNothingStarted(ctx context.Context, t *testing.T, claimReleased bool) {
+	t.Helper()
+	if got := f.sourceControl.shaCallCount(); got != 0 {
+		t.Errorf("ResolveBranchSHA calls = %d, want 0", got)
+	}
+	if got := f.sourceControl.createBranchCallCount(); got != 0 {
+		t.Errorf("CreateBranch calls = %d, want 0", got)
+	}
+	if got := f.fixSessions(ctx, t); got != 0 {
+		t.Errorf("fix sessions = %d, want 0", got)
+	}
+	fix, err := f.sentinelFixes.GetByID(ctx, f.fix.ID)
+	switch {
+	case claimReleased:
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Errorf("claim read = (status %q, err %v), want it released: a claim left pending reads as a fix in flight", fix.Status, err)
+		}
+	case err != nil:
+		t.Fatalf("get sentinel_fixes: %v", err)
+	case fix.FixChildSessionID.Valid || fix.Status != f.fix.Status:
+		t.Errorf("claim = (status %q, child %v), want it untouched at %q with no child", fix.Status, fix.FixChildSessionID.Valid, f.fix.Status)
+	}
+	if got := f.findingStatus(ctx, t); got != "open" {
+		t.Errorf("finding status = %q, want open", got)
+	}
+}
+
+// assertSkipped checks the row ended for good, on its wantAttempts-th
+// counted attempt, without starting anything, its claim released, and
+// with one skip record.
+func (f *sentinelAutoFixFreezeFixture) assertSkipped(ctx context.Context, t *testing.T, wantAttempts int32) {
+	t.Helper()
+	row := f.outboxRow(ctx, t)
+	if row.Status != sqlcgen.OutboxStatusDelivered || row.DeliveredToLedger {
+		t.Errorf("row status %s (to ledger %v), want delivered, never to the ledger: a skip is terminal", row.Status, row.DeliveredToLedger)
+	}
+	if row.Attempts != wantAttempts {
+		t.Errorf("attempts = %d, want %d", row.Attempts, wantAttempts)
+	}
+	f.assertNothingStarted(ctx, t, true)
+	if got := f.skipRecords(ctx, t); got != 1 {
+		t.Errorf("skip audit rows = %d, want 1", got)
+	}
+}
+
+// assertSpawnedOnce checks the row was delivered on its wantAttempts-th
+// attempt, creating one branch and one fix session, recorded on the claim
+// and on the finding, with no skip record.
+func (f *sentinelAutoFixFreezeFixture) assertSpawnedOnce(ctx context.Context, t *testing.T, wantAttempts int32) {
+	t.Helper()
+	row := f.outboxRow(ctx, t)
+	if row.Status != sqlcgen.OutboxStatusDelivered || row.DeliveredToLedger {
+		t.Fatalf("row status %s (to ledger %v), want delivered to the world", row.Status, row.DeliveredToLedger)
+	}
+	if row.Attempts != wantAttempts {
+		t.Errorf("attempts = %d, want %d", row.Attempts, wantAttempts)
+	}
+	if got := f.fixSessions(ctx, t); got != 1 {
+		t.Errorf("fix sessions = %d, want 1", got)
+	}
+	if got := f.sourceControl.createBranchCallCount(); got != 1 {
+		t.Errorf("CreateBranch calls = %d, want 1", got)
+	}
+	fix, err := f.sentinelFixes.GetByID(ctx, f.fix.ID)
+	if err != nil {
+		t.Fatalf("get sentinel_fixes: %v", err)
+	}
+	if !fix.FixChildSessionID.Valid {
+		t.Error("the claim has no child session")
+	}
+	if got := f.findingStatus(ctx, t); got != "fix_pending" {
+		t.Errorf("finding status = %q, want fix_pending", got)
+	}
+	if got := f.skipRecords(ctx, t); got != 0 {
+		t.Errorf("skip audit rows = %d, want 0", got)
+	}
 }
 
 // TestSentinelAutoFix_Frozen_RowHeldAttemptNotCounted: while autonomy is
@@ -263,6 +522,41 @@ func TestSentinelAutoFix_Unfreeze_SpawnsOnce(t *testing.T) {
 	if got := f.findingStatus(ctx, t); got != "fix_pending" {
 		t.Errorf("finding status = %q, want fix_pending", got)
 	}
+}
+
+// TestSentinelAutoFix_HeldThenToggledOff_UnfreezeSkips: an administrator
+// turns the sentinel auto-fix off while the freeze holds a delivery. The
+// freeze still holds it, toggle or not: a frozen tick after the change
+// gives its attempt back like the first. Once the freeze lifts, the next
+// due tick reads the toggle and skips the row for good -- no branch, no
+// session, the finding still open, one counted attempt and one skip
+// record -- rather than releasing it.
+func TestSentinelAutoFix_HeldThenToggledOff_UnfreezeSkips(t *testing.T) {
+	ctx := context.Background()
+	f := newSentinelAutoFixFreezeFixture(ctx, t)
+	freezeAutonomy(t, f.pool)
+
+	for tick := 1; tick <= 2; tick++ {
+		if tick == 2 {
+			f.setAutoFix(ctx, t, false)
+			makeDue(t, f.pool, f.row.ID)
+		}
+		tickAt := time.Now()
+		if err := f.builder.PumpOnce(ctx); err != nil {
+			t.Fatalf("frozen tick %d: PumpOnce: %v", tick, err)
+		}
+		assertHeldByTheFreeze(ctx, t, f.pool, f.row.ID, tickAt, 0, 0, "frozen")
+	}
+	if got := f.skipRecords(ctx, t); got != 0 {
+		t.Fatalf("skip audit rows while frozen = %d, want 0: the freeze holds the row before its delivery reads the toggle", got)
+	}
+
+	unfreezeAutonomy(t, f.pool)
+	makeDue(t, f.pool, f.row.ID)
+	if err := f.builder.PumpOnce(ctx); err != nil {
+		t.Fatalf("PumpOnce after the unfreeze: %v", err)
+	}
+	f.assertSkipped(ctx, t, 1)
 }
 
 // descriptionAutofixFreezeRow enqueues a description rewrite of an opted-in,

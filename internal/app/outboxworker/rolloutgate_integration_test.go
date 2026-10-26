@@ -65,6 +65,7 @@ func TestSentinelAutoFixNotifier_RolloutRefusal_SkipsTerminallyNeverRetried(t *t
 
 	// Deliberately NEVER enrolled.
 	repoFullName := "acme/rollout-refused-autofix-repo"
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, 78, originSession.ID, "feature-fix-me")
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)
@@ -173,6 +174,7 @@ func TestSentinelAutoFixNotifier_RolloutGate_EnrolledRepoStillSpawns(t *testing.
 		t.Fatalf("seed enrollment: %v", err)
 	}
 
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, 79, originSession.ID, "feature-fix-me")
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)

@@ -916,6 +916,8 @@ Registering the pair is **not**, however, a cosmetic layer on top of an otherwis
 
 **The fix PR's base is never resolved, only assigned (amendment).** `resolvePRBaseBranch` (`internal/app/sessionactor/pushpr.go`) resolves a repository's real current default branch for the ordinary happy-path PR (Step 21) — called unconditionally, for every repo that reaches PR creation, to compute `CreatePRSpec.Base` (`createPRBestEffort`'s per-repo loop calls it for each pushed repo, with no branch-based condition at all). `repos[].branch` is not a base-branch override — it names the session's own head branch to check out and push (`restdtos.CreateSessionRequestReposElem`'s own doc comment: null means "create the session branch from the repo's default base branch"), and a repo whose `repos[].branch` is left null is skipped before PR creation ever runs (`sendPushBestEffort`'s own doc comment) — it never reaches `resolvePRBaseBranch` at all. There is no session-config field that supplies a PR base today. Whichever code opens the fix PR (Step 48) must never route through that same resolution for this one call site: the fix PR's base is fixed by design to the origin PR's own head branch (this section's opening paragraph), because a stacked PR's base is its parent's head branch, not the repository's default — reusing `resolvePRBaseBranch` unmodified here would silently retarget the fix PR at, say, `main`, undoing the entire point of stacking it on the origin. Default-branch resolution and stacked-parent assignment are two disjoint code paths keyed on whether a deliberate parent is in play, never a single path that happens to fall back correctly.
 
+**The toggle is read again when the fix is delivered (amendment).** The trigger reads the per-repo toggle (§17.1) when the verdict lands, claims the fix and enqueues it as an outbox row; the branch and the child session are made later, when that row is delivered (`internal/app/outboxworker/sentinelautofix.go`), and an administrator may have turned the toggle off in between — while the autonomy freeze held the row (§40.2), or while it waited out a retry back-off. So the delivery reads `repo_settings.sentinel_autofix_enabled` again, the way the description autofix reads its own flag at delivery (§26.2): after the egress decision — a row born in shadow, or one whose repository is in shadow, still ends in the suppression ledger (§30.8) — and before anything else: the entitlement read, the first GitHub call, the fix branch, the claim's child. A toggle that is off, or a repository with no settings row, ends the row for good: it creates no branch and spawns nothing, every addressed finding stays `open` with its manual apply-suggestion action (§17.3), and the claim is released — deleted while still unspawned, so the review readout shows no fix in flight that never will be; a claim a concurrent delivery spawned under meanwhile is kept. A fix branch an earlier, failed attempt of the same delivery already created stays in the repository, unused: nothing records the commit it was created at, so nothing could tell it from a branch a person has since pushed to, and the skip never calls GitHub. Every delivery that ends this way records its own `sentinel_fix.spawn_skipped` row in `audit_log` on the claim, `actor_user_id` NULL (§17.5's allowance), with the repository, the origin PR, its own findings, its reason, what became of the claim — released by it, released earlier by another delivery, or kept because a concurrent delivery spawned under it — and that fix branch, in the release's own transaction, and logs it. Another pending delivery for the released claim ends too, like any delivery whose claim no longer exists, with its own row giving the claim's earlier release as its reason. Turning the toggle back on does not revive a skipped row; the next qualifying verdict claims afresh. A read or a record that fails is no skip: the delivery fails and the outbox retries it. A claim that already has its child is not read again: a redelivery still records that child on its findings (§17.3), since its branch and its session already exist.
+
 ### 17.3 Verdict update
 Once the fix PR exists, the original verdict is updated (via the same server-side verdict-posting tool, §5.2 — never a raw comment) to reference it: which finding(s) it addresses, and that it will merge automatically once the origin PR merges. From this point, the finding's manual Apply-suggestion action (§12.2 item 2) is suppressed — the two remediation paths are mutually exclusive per finding, so a human and the automation can never both act on the same finding.
 
@@ -7140,7 +7142,17 @@ nothing was ever in progress. Nothing tells the user that anything was lost.
 
 Coverage is deliberately narrow: only a fresh lineage ships a recap. A restore whose snapshot did
 not carry a usable runtime session loses context too and ships none yet — that case is instrumented
-first, so the decision to widen rests on how often it actually happens.
+first, so the decision to widen rests on how often it actually happens. The statement that records
+a snapshot also records the conversation the session held at that moment, keyed by the snapshot's
+id like its provenance (`sandboxes.snapshot_conversation_id`, `snapshot_conversation_recorded_id`,
+migration 000177), and the clear that forgets the snapshot forgets it. Every restore compares it
+with the conversation its prompts will name (`sandbox.ClassifyRestoreConversation`), and once the
+claim has committed counts the outcome on `sandbox_restore_conversation_total{outcome}`:
+`held` (the same conversation); `differs` (another one, or one on only one side — logged at WARN
+with the snapshot and both ids); `none` (neither names one); `unknown` (nothing recorded for that
+snapshot: one recorded before the record, or by a control plane without it — logged at INFO). No
+outcome refuses, marks, announces or recaps a restore. `held` is evidence, not proof: whether a
+provider's snapshot captures the runtime's session storage is not established from code.
 
 ### 35.5b The snapshot carries the runtime it was minted under (amendment)
 
@@ -7211,7 +7223,8 @@ provenance before contracts 1.25.0 and nothing recorded one before that migratio
 snapshot that exists at that deploy is unknown, and stays so for as long as its lineage is restored.
 Refusing them would cost every such session its context at once, so they restore; whether to stage
 their refusal is decided once §35.5's recap exists, from
-`sandbox_snapshot_restore_total{provenance="unknown"}` and `snapshot_minted_at`. Steps 136 and 139
+`sandbox_snapshot_restore_total{provenance="unknown"}`, `snapshot_minted_at` and
+`sandbox_restore_conversation_total`. Steps 136 and 139
 carry this.
 
 ### 35.6 One stored row per distinct frame of a text part

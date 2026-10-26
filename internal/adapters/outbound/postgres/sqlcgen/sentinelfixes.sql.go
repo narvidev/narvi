@@ -263,6 +263,28 @@ func (q *Queries) MarkSentinelFixMerged(ctx context.Context, id pgtype.UUID) (Se
 	return i, err
 }
 
+const releaseUnspawnedSentinelFix = `-- name: ReleaseUnspawnedSentinelFix :execrows
+DELETE FROM sentinel_fixes
+WHERE id = $1 AND status = 'pending' AND fix_child_session_id IS NULL
+`
+
+// The sentinel auto-fix delivery's own release of a claim it skips
+// because the repository turned the auto-fix off (§17.2): deletes the row
+// only while it is still 'pending' with no child session recorded, so a
+// claim a concurrent delivery spawned under is never released -- that
+// delivery holds GetSentinelFixForUpdate's lock until it commits, and
+// this DELETE re-checks the row once the lock is released. Releasing the
+// claim, rather than leaving it 'pending' with nothing coming, keeps the
+// review readout from showing a fix in flight that never will be; the
+// next qualifying verdict claims afresh (InsertSentinelFixIfAbsent).
+func (q *Queries) ReleaseUnspawnedSentinelFix(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseUnspawnedSentinelFix, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const updateSentinelFixChildSession = `-- name: UpdateSentinelFixChildSession :one
 UPDATE sentinel_fixes
 SET fix_child_session_id = $2, status = 'spawned', updated_at = now()

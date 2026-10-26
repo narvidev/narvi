@@ -18,12 +18,17 @@ package httpapi_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"testing"
 
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/outbound/githubapi"
+	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/outboxworker"
+	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // TestGetReviewReadout_NotFound proves a nonexistent session id 404s,
@@ -212,6 +217,88 @@ func TestGetReviewReadout_SentinelFix_ReflectsRealRow(t *testing.T) {
 	}
 	if got.SentinelFix.StackRegistered {
 		t.Error("SentinelFix.StackRegistered = true, want false (never registered in this test)")
+	}
+}
+
+// TestGetReviewReadout_SentinelFixSkippedForToggleOff_NotInFlight: a
+// verdict claimed a sentinel auto-fix while the repository had it on, and
+// the repository turned it off before the fix was delivered. Before the
+// delivery the readout shows the claim pending -- the rail's "fix
+// pending". The delivery, through the real notifier, skips the fix and
+// releases the claim, so the readout shows no sentinel fix at all rather
+// than one in flight that never will be, and the finding is still open,
+// its manual apply-suggestion action available (§17.3).
+func TestGetReviewReadout_SentinelFixSkippedForToggleOff_NotInFlight(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	owner, token := rig.createAuthenticatedUser(ctx, t)
+	const repoFullName, prNumber = "acme/sentinel-fix-skipped-repo", 12
+	session := rig.createOwnedGitHubReviewSession(ctx, t, owner.ID, repoFullName, prNumber)
+
+	if _, err := rig.repoSettings.Upsert(ctx, repoFullName, false, true); err != nil {
+		t.Fatalf("turn the sentinel auto-fix on: %v", err)
+	}
+	claim, err := rig.sentinelFixes.Claim(ctx, repoFullName, prNumber, session.ID, "agent/origin-branch")
+	if err != nil {
+		t.Fatalf("claim sentinel fix: %v", err)
+	}
+	const identityHash = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+	if _, err := rig.reviewFindings.Upsert(ctx, sqlcgen.UpsertReviewFindingParams{
+		RepoFullName: repoFullName, PrNumber: prNumber, IdentityHash: identityHash,
+		Severity: "medium", FilePath: "internal/foo/bar.go", Description: "Missing test coverage.",
+	}); err != nil {
+		t.Fatalf("upsert review finding: %v", err)
+	}
+
+	readout := func() restdtos.ReviewReadout {
+		t.Helper()
+		var got restdtos.ReviewReadout
+		if status := rig.doJSON(t, http.MethodGet, "/api/sessions/"+session.ID.String()+"/review", nil, &got, token); status != http.StatusOK {
+			t.Fatalf("status = %d, want %d", status, http.StatusOK)
+		}
+		return got
+	}
+	if before := readout(); before.SentinelFix == nil || before.SentinelFix.Status != "pending" {
+		t.Fatalf("SentinelFix before the delivery = %+v, want the pending claim", before.SentinelFix)
+	}
+
+	if _, err := rig.repoSettings.Upsert(ctx, repoFullName, false, false); err != nil {
+		t.Fatalf("turn the sentinel auto-fix off: %v", err)
+	}
+	notifier, err := outboxworker.NewSentinelAutoFixNotifier(rig.pool, rig.sessions, rig.turns, rig.environments, rig.auditLog, rig.registry, rig.sentinelFixes, rig.reviewFindings,
+		nil, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts(), false, rig.rolloutMode, rig.repoSettings, rig.prSessions,
+		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(rig.pool))
+	if err != nil {
+		t.Fatalf("NewSentinelAutoFixNotifier: %v", err)
+	}
+	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
+		SentinelFixID: claim.ID.String(), RepoFullName: repoFullName, OriginPRNumber: prNumber,
+		OriginReviewSessionID: session.ID.String(), OriginHeadBranch: "agent/origin-branch",
+		RepoName: "sentinel-fix-skipped-repo", RepoCloneURL: "https://github.com/" + repoFullName + ".git",
+		FindingIdentityHashes: []string{identityHash}, FindingDescriptions: []string{"Missing test coverage."},
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if err := notifier.Deliver(ctx, ports.Notification{Kind: ports.NotificationKindSentinelAutoFix, Payload: payload}); err != nil {
+		t.Fatalf("Deliver() = %v, want nil: a repository with the auto-fix off is a terminal skip", err)
+	}
+
+	after := readout()
+	if after.SentinelFix != nil {
+		t.Errorf("SentinelFix after the skip = %+v, want nil: no fix is coming, so none may read as in flight", after.SentinelFix)
+	}
+	var found bool
+	for _, f := range after.Findings {
+		if f.IdentityHash == identityHash {
+			found = true
+			if f.Status != "open" {
+				t.Errorf("finding status = %q, want open: the manual apply-suggestion action stays available", f.Status)
+			}
+		}
+	}
+	if !found {
+		t.Errorf("the finding %s is missing from the readout", identityHash)
 	}
 }
 

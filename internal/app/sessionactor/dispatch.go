@@ -288,6 +288,14 @@ type spawnPlan struct {
 	// claim has committed (logSnapshotRestore).
 	restoreDecision *snapshotRestoreDecision
 
+	// restoreConversation is how the conversation the restored snapshot
+	// was minted under compares with the one the session's prompts name
+	// (technical plan §35.5, classifyRestoreConversation), set on every
+	// restore plan and nil on every other. executePlans logs and counts it
+	// once the claim has committed (logRestoreConversation); nothing else
+	// reads it.
+	restoreConversation *restoreConversationCheck
+
 	// rotation is what this claim did for a gen the runway gate rotated
 	// (technical plan §35.3, runway.go): restored the rotation's own
 	// snapshot, fell back to the one before it, or spawned fresh. nil when
@@ -448,6 +456,7 @@ func (a *Actor) executePlans(ctx context.Context, spawn *spawnPlan, dispatch *di
 	if spawn != nil {
 		a.logLifetimeDeadline(spawn)
 		a.logSnapshotRestore(ctx, spawn)
+		a.logRestoreConversation(ctx, spawn)
 		a.logRotationRestore(ctx, spawn)
 	}
 	switch {
@@ -1487,6 +1496,10 @@ func (a *Actor) tryPlanSpawn(
 			return nil, err
 		}
 		plan.restoreDecision = restoreDecision
+		// Technical plan §35.5: whether the snapshot was minted under the
+		// conversation the restored gen's prompts will name. Counted only:
+		// a restore is never marked, announced or recapped on it.
+		plan.restoreConversation = classifyRestoreConversation(sandboxRow, action.SnapshotImageID, sessionRow)
 		if wasRotating {
 			outcome := rotationOutcomeRotated
 			if !rotationSnapshotTaken(sandboxRow) {

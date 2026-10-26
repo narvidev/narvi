@@ -94,6 +94,19 @@ SET status = 'abandoned', updated_at = now()
 WHERE id = $1
 RETURNING *;
 
+-- name: ReleaseUnspawnedSentinelFix :execrows
+-- The sentinel auto-fix delivery's own release of a claim it skips
+-- because the repository turned the auto-fix off (§17.2): deletes the row
+-- only while it is still 'pending' with no child session recorded, so a
+-- claim a concurrent delivery spawned under is never released -- that
+-- delivery holds GetSentinelFixForUpdate's lock until it commits, and
+-- this DELETE re-checks the row once the lock is released. Releasing the
+-- claim, rather than leaving it 'pending' with nothing coming, keeps the
+-- review readout from showing a fix in flight that never will be; the
+-- next qualifying verdict claims afresh (InsertSentinelFixIfAbsent).
+DELETE FROM sentinel_fixes
+WHERE id = $1 AND status = 'pending' AND fix_child_session_id IS NULL;
+
 -- name: ExistsSentinelFixByFixPRNumber :one
 -- §16 ("decision inbox: read model + API")'s own §17 structural
 -- exclusion: "sentinel auto-fix follow-up PRs must never appear as inbox

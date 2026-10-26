@@ -45,6 +45,7 @@ func TestSentinelAutoFixNotifier_ParentStopped_SkipsTerminallyNeverRetried(t *te
 	}
 
 	repoFullName := "example-org/stopped-parent-repo"
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, 79, origin.ID, "feature-stopped")
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)
