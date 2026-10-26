@@ -15,7 +15,7 @@ const createTurn = `-- name: CreateTurn :one
 
 INSERT INTO turns (session_id, status, prompt, model_id, plan_mode, effort, review_head_sha, answer_only, review_depth, review_depth_decision, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, is_review_attempt, request_trigger, requested_by, request_text, context_moves)
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha, reenqueued_sandbox_gen
 `
 
 type CreateTurnParams struct {
@@ -210,6 +210,7 @@ func (q *Queries) CreateTurn(ctx context.Context, arg CreateTurnParams) (Turn, e
 		&i.CheckoutFailures,
 		&i.CheckoutRetiredGen,
 		&i.CheckedOutSha,
+		&i.ReenqueuedSandboxGen,
 	)
 	return i, err
 }
@@ -457,7 +458,7 @@ func (q *Queries) GetPlatformCostSummaryInWindow(ctx context.Context, createdAt 
 }
 
 const getProcessingTurnForSession = `-- name: GetProcessingTurnForSession :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha, reenqueued_sandbox_gen FROM turns
 WHERE session_id = $1 AND status = 'processing'
 `
 
@@ -520,6 +521,7 @@ func (q *Queries) GetProcessingTurnForSession(ctx context.Context, sessionID pgt
 		&i.CheckoutFailures,
 		&i.CheckoutRetiredGen,
 		&i.CheckedOutSha,
+		&i.ReenqueuedSandboxGen,
 	)
 	return i, err
 }
@@ -615,7 +617,7 @@ func (q *Queries) GetReviewAttemptToCheck(ctx context.Context, sessionID pgtype.
 }
 
 const getTurn = `-- name: GetTurn :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha, reenqueued_sandbox_gen FROM turns
 WHERE id = $1
 `
 
@@ -669,12 +671,13 @@ func (q *Queries) GetTurn(ctx context.Context, id pgtype.UUID) (Turn, error) {
 		&i.CheckoutFailures,
 		&i.CheckoutRetiredGen,
 		&i.CheckedOutSha,
+		&i.ReenqueuedSandboxGen,
 	)
 	return i, err
 }
 
 const getTurnByDispatchedMessageID = `-- name: GetTurnByDispatchedMessageID :one
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha, reenqueued_sandbox_gen FROM turns
 WHERE session_id = $1 AND dispatched_message_id = $2
 `
 
@@ -763,6 +766,7 @@ func (q *Queries) GetTurnByDispatchedMessageID(ctx context.Context, arg GetTurnB
 		&i.CheckoutFailures,
 		&i.CheckoutRetiredGen,
 		&i.CheckedOutSha,
+		&i.ReenqueuedSandboxGen,
 	)
 	return i, err
 }
@@ -1036,7 +1040,7 @@ func (q *Queries) ListStopRequestedOpenTurns(ctx context.Context, arg ListStopRe
 }
 
 const listTurnsForSession = `-- name: ListTurnsForSession :many
-SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha FROM turns
+SELECT id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha, reenqueued_sandbox_gen FROM turns
 WHERE session_id = $1
 ORDER BY created_at ASC, id ASC
 `
@@ -1104,6 +1108,7 @@ func (q *Queries) ListTurnsForSession(ctx context.Context, sessionID pgtype.UUID
 			&i.CheckoutFailures,
 			&i.CheckoutRetiredGen,
 			&i.CheckedOutSha,
+			&i.ReenqueuedSandboxGen,
 		); err != nil {
 			return nil, err
 		}
@@ -1545,9 +1550,10 @@ SET status = $2,
     dispatched_sandbox_gen = COALESCE($5, dispatched_sandbox_gen),
     dispatched_event_id = COALESCE($6, dispatched_event_id),
     dispatched_message_id = COALESCE($7, dispatched_message_id),
-    end_reason = COALESCE($8, end_reason)
+    end_reason = COALESCE($8, end_reason),
+    reenqueued_sandbox_gen = COALESCE($9, reenqueued_sandbox_gen)
 WHERE id = $1
-RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha
+RETURNING id, session_id, status, conversation_id, created_at, dispatched_at, completed_at, prompt, model_id, plan_mode, dispatched_sandbox_gen, progress_notified_at, effort, epistemic_outcome, review_head_sha, answer_only, review_depth, review_depth_decision, dispatched_event_id, cost_usd, review_knowledge_mode, review_knowledge_decision, correlation_id, review_verdict_context, dispatched_message_id, is_review_attempt, stop_requested_at, receipt_requested_message_id, receipt_requested_at, receipt_checked_ready_seq, receipt_resend_count, end_reason, context_unconfirmed_at, request_trigger, requested_by, request_text, context_moves, checkout_message_id, checkout_gen, checkout_requested_at, checkout_sent_at, checkout_sent_ready_seq, checkout_sends, checkout_failures, checkout_retired_gen, checked_out_sha, reenqueued_sandbox_gen
 `
 
 type UpdateTurnStatusParams struct {
@@ -1559,6 +1565,7 @@ type UpdateTurnStatusParams struct {
 	DispatchedEventID    *int64             `json:"dispatched_event_id"`
 	DispatchedMessageID  *string            `json:"dispatched_message_id"`
 	EndReason            *string            `json:"end_reason"`
+	ReenqueuedSandboxGen *int32             `json:"reenqueued_sandbox_gen"`
 }
 
 // Sets a turn's status, plus dispatched_at/completed_at/
@@ -1602,6 +1609,14 @@ type UpdateTurnStatusParams struct {
 // recorder every status write goes through, so that end wakes a held
 // re-review like any other. The same sqlc.narg + COALESCE convention:
 // every other write leaves it as it is.
+//
+// reenqueued_sandbox_gen (migrations/000176, technical plan §3.3's turn
+// recovery, §35.4) is stamped by tryPlanReenqueue alone, in the same write
+// and with the same value as dispatched_sandbox_gen: the gen a re-send last
+// sent the turn to. handleTurnDeadlineTimer retires that gen when the
+// turn's deadline fails it while it still names the turn's current gen.
+// The same sqlc.narg + COALESCE convention: every other write leaves it as
+// it is.
 func (q *Queries) UpdateTurnStatus(ctx context.Context, arg UpdateTurnStatusParams) (Turn, error) {
 	row := q.db.QueryRow(ctx, updateTurnStatus,
 		arg.ID,
@@ -1612,6 +1627,7 @@ func (q *Queries) UpdateTurnStatus(ctx context.Context, arg UpdateTurnStatusPara
 		arg.DispatchedEventID,
 		arg.DispatchedMessageID,
 		arg.EndReason,
+		arg.ReenqueuedSandboxGen,
 	)
 	var i Turn
 	err := row.Scan(
@@ -1661,6 +1677,7 @@ func (q *Queries) UpdateTurnStatus(ctx context.Context, arg UpdateTurnStatusPara
 		&i.CheckoutFailures,
 		&i.CheckoutRetiredGen,
 		&i.CheckedOutSha,
+		&i.ReenqueuedSandboxGen,
 	)
 	return i, err
 }

@@ -25,6 +25,12 @@ const (
 	// snapshotProvenanceKey is snapshot_ready's provenance, read by
 	// reportedSnapshotProvenance (snapshotrestore.go).
 	snapshotProvenanceKey = "provenance"
+	// interruptionKey is execution_complete's interruption (contracts
+	// 1.30.0, technical plan §35.4), read by reportedInterruption. The
+	// generated type names it as an enum of one value, so a generated
+	// decode refuses any value a later agent sends, and the whole frame
+	// with it; decodeExecutionComplete decodes without it.
+	interruptionKey = "interruption"
 )
 
 // frameWithout returns raw without its top-level key, for a decode through
@@ -98,4 +104,37 @@ func decodeReady(raw json.RawMessage) (sandboxws.Ready, error) {
 	var evt sandboxws.Ready
 	err := json.Unmarshal(frameWithout(raw, lifetimeReportKey), &evt)
 	return evt, err
+}
+
+// decodeExecutionComplete decodes an execution_complete event through the
+// generated type, without its interruption: reportedInterruption reads
+// that on its own, and no value an agent reports there -- one a later
+// release adds, or one of the wrong type -- may cost the turn its end, as
+// none could before the generated type named the key (technical plan
+// §35.4). Every other field decodes as it always has.
+func decodeExecutionComplete(raw json.RawMessage) (sandboxws.ExecutionComplete, error) {
+	var evt sandboxws.ExecutionComplete
+	err := json.Unmarshal(frameWithout(raw, interruptionKey), &evt)
+	return evt, err
+}
+
+// reportedInterruption returns the interruption an execution_complete
+// reports, read leniently and on its own: any non-empty JSON string, the
+// one value this release knows or a value a later one adds, and false for
+// a key that is absent, null, empty or not a string. The key is matched as
+// the generated decode matches a field, its name in any case, the last
+// such member winning; a frame that does not decode as an object reports
+// none. Nothing here reads the frame's reason or diagnostic.
+func reportedInterruption(raw json.RawMessage) (string, bool) {
+	var frame struct {
+		Interruption json.RawMessage `json:"interruption"`
+	}
+	if err := json.Unmarshal(raw, &frame); err != nil {
+		return "", false
+	}
+	value := reportedString(frame.Interruption)
+	if value == nil {
+		return "", false
+	}
+	return *value, true
 }

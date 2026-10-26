@@ -922,6 +922,21 @@ func (a *Actor) recordCheckedOut(ctx context.Context, tx pgx.Tx, d *dispatchPlan
 // (technical plan §35.3, runway.go) with its turn in flight: a gen past
 // its deadline, or one a rotation is under way on, is retired first, and
 // nothing is rotated. gate is its decision, nil when it was not asked.
+//
+// Before every gate, a turn that would be re-sent to a new gen is checked
+// against its turn_deadline (technical plan §3.3, §35.4), which bounds the
+// whole turn, rotations and re-sends included: counted from its first
+// dispatch (turn.ReenqueueBound), never from a re-send. A turn with no
+// more than ReenqueueBudgetFloor of it left is not re-sent -- no gate, no
+// checkout, no prompt, on a ready or a suspect gen alike -- and its
+// turn_deadline is armed at its bound, so the timer's own handler ends it
+// there as any timed-out turn ends: failed with timeout, one synthetic
+// end, one notification. The floor keeps a re-sent prompt's receipt
+// window (PromptResendWindow, which a re-send starts again) inside the
+// deadline; it says nothing of how long the re-sent work runs. Work that
+// outlasts the deadline is the deadline's to end: handleTurnDeadlineTimer
+// then retires the gen the turn was re-sent to (retireGenOfResentTurn), so
+// that work's late end can no longer reach the next turn.
 func (a *Actor) planReenqueueOrRespawn(
 	ctx context.Context, tx pgx.Tx,
 	sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, hasSandbox bool,
@@ -980,6 +995,29 @@ func (a *Actor) planReenqueueOrRespawn(
 			d, err := a.tryPlanReceiptResend(ctx, tx, sessionRow, sandboxRow, target)
 			return nil, d, "", nil, err
 		}
+		// Technical plan §3.3, §35.4: turn_deadline bounds the whole turn,
+		// re-sends included, counted from its first dispatch. A turn with no
+		// more than ReenqueueBudgetFloor of that budget left is not re-sent:
+		// nothing below is asked for it, nothing is sent to this gen, and
+		// its deadline, armed at its bound -- due now once the bound has
+		// passed -- ends it through the timer's own handler. Not armed
+		// earlier than the bound: that handler re-arms a deadline that fires
+		// before its turn is timed out to the time remaining, so an earlier
+		// arm ends the turn no sooner, and each evaluation until then would
+		// arm it early again. Armed explicitly even though the first
+		// dispatch's timer is normally still there: a previous binary's
+		// re-send may have pushed it later, and arming is an upsert.
+		deadline, spent := turn.ReenqueueBound(pgTimeOrZero(target.DispatchedAt), now, turn.DeadlineConfig{
+			Deadline: a.timeouts.TurnDeadline, ReenqueueFloor: a.timeouts.ReenqueueBudgetFloor,
+		})
+		if spent {
+			if err := a.armTimer(ctx, tx, TimerTurnDeadline, deadline); err != nil {
+				return nil, nil, "", nil, err
+			}
+			a.logger.Info("sessionactor: in-flight turn not re-sent: its turn_deadline, counted from its first dispatch, leaves no more than the re-send floor",
+				"turn_id", target.ID.String(), "gen", sandboxRow.Gen, "turn_deadline", deadline, "budget_left", deadline.Sub(now))
+			return nil, nil, "", nil, nil
+		}
 		// Technical plan §6.4, §27.1: as planDispatch's own gate
 		// (repohooksgate.go), first, before the runway gate below, for the
 		// same reason: a gen that ran the hooks is retired, never rotated.
@@ -1024,7 +1062,7 @@ func (a *Actor) planReenqueueOrRespawn(
 			// only so no decision falls through to a re-send.
 			return nil, checkout.plan, checkout.counted, runway.note, nil
 		}
-		d, err := a.tryPlanReenqueue(ctx, tx, sessionRow, sandboxRow, target, now)
+		d, err := a.tryPlanReenqueue(ctx, tx, sessionRow, sandboxRow, target, deadline)
 		if err != nil {
 			return nil, nil, "", nil, err
 		}
@@ -1049,13 +1087,23 @@ func (a *Actor) planReenqueueOrRespawn(
 // edge" precedent, per this Step's own brief -- see internal/domain/
 // turn/state.go's own top comment for that precedent's full writeup).
 //
-// Re-arms turn_deadline fresh from now -- a fair, full new budget on the
-// new sandbox, rather than leaving a stale deadline still ticking down
-// from the turn's ORIGINAL dispatch attempt (now irrelevant: that
-// sandbox incarnation is gone). Stamps dispatched_sandbox_gen to
-// sandboxRow's own current gen (the SAME UpdateTurnStatus query
-// tryPlanDispatch uses, passing target's own CURRENT status back
-// unchanged -- never Transition's output, since none was computed).
+// Arms turn_deadline at deadline, the turn's first dispatch's bound
+// (turn.ReenqueueBound, which the caller has already found more than
+// ReenqueueBudgetFloor away):
+// technical plan §3.3 and §35.4 have turn_deadline bound the whole turn,
+// rotations and re-sends included, so a re-send never buys a new budget.
+// A fresh budget per re-send would let a turn whose sandboxes keep dying
+// under it run, and spend, without end. dispatched_at is not moved
+// either, and the timer's handler measures from it
+// (turn.EvaluateTurnDeadline); arming the bound explicitly, though the
+// first dispatch's timer is normally still there, brings back one a
+// previous binary's re-send pushed later, or one that was lost, and
+// re-arming the same instant is idempotent.
+//
+// Stamps dispatched_sandbox_gen to sandboxRow's own current gen (the
+// SAME UpdateTurnStatus query tryPlanDispatch uses, passing target's own
+// CURRENT status back unchanged -- never Transition's output, since none
+// was computed).
 // Builds the SAME BuildPromptPayload tryPlanDispatch uses, which
 // automatically carries sessionRow.OpencodeConversationID (§3.3) -- so
 // the re-enqueued turn resumes the SAME OpenCode conversation with no
@@ -1063,7 +1111,7 @@ func (a *Actor) planReenqueueOrRespawn(
 func (a *Actor) tryPlanReenqueue(
 	ctx context.Context, tx pgx.Tx,
 	sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, target sqlcgen.Turn,
-	now time.Time,
+	deadline time.Time,
 ) (*dispatchPlan, error) {
 	if a.commander == nil {
 		// Defensive: mirrors tryPlanDispatch's own identical nil-commander
@@ -1073,7 +1121,7 @@ func (a *Actor) tryPlanReenqueue(
 		return nil, nil
 	}
 
-	if err := a.armTimer(ctx, tx, TimerTurnDeadline, now.Add(a.timeouts.TurnDeadline)); err != nil {
+	if err := a.armTimer(ctx, tx, TimerTurnDeadline, deadline); err != nil {
 		return nil, err
 	}
 
@@ -1124,6 +1172,10 @@ func (a *Actor) tryPlanReenqueue(
 		DispatchedSandboxGen: &dispatchedGen,
 		DispatchedEventID:    &dispatchedEventID,
 		DispatchedMessageID:  &messageID,
+		// The gen this re-send sends the turn to (migrations/000176): if
+		// the turn's deadline fails it while it still runs here, this gen
+		// is retired with it (handleTurnDeadlineTimer).
+		ReenqueuedSandboxGen: &dispatchedGen,
 	}); err != nil {
 		return nil, fmt.Errorf("sessionactor: stamp dispatched_sandbox_gen for reenqueue: %w", err)
 	}

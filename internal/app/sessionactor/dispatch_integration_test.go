@@ -2754,8 +2754,11 @@ func TestHandleEnsureDispatched_ProcessingOnCurrentGenSandbox_NeverReDispatched(
 // Processing turn whose dispatched_sandbox_gen (1) does not match the
 // CURRENT live sandbox's own gen (2, simulating a respawn that already
 // happened) gets RE-dispatched -- via tryPlanReenqueue, never
-// turn.Transition (the turn stays Processing throughout) -- with a fresh
-// turn_deadline and dispatched_sandbox_gen updated to 2.
+// turn.Transition (the turn stays Processing throughout) -- with its
+// turn_deadline armed and dispatched_sandbox_gen updated to 2. This turn
+// records no dispatch time, so its deadline counts a full TurnDeadline
+// from the re-send; one that records it keeps its first dispatch's bound
+// (reenqueuedeadline_integration_test.go).
 func TestHandleEnsureDispatched_ProcessingOnStaleGenReadySandbox_Reenqueues(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -2844,7 +2847,7 @@ func TestHandleEnsureDispatched_ProcessingOnStaleGenReadySandbox_Reenqueues(t *t
 		t.Fatalf("count turn_deadline timers: %v", err)
 	}
 	if n != 1 {
-		t.Errorf("turn_deadline timer count = %d, want 1 (re-armed fresh)", n)
+		t.Errorf("turn_deadline timer count = %d, want 1 (armed for the re-send)", n)
 	}
 
 	var prompt sandboxws.Prompt

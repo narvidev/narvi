@@ -223,7 +223,7 @@ type Deps struct {
 	// + record runs ONCE, right after a `created` AgentSessionEvent's own
 	// winning claim creates the backing session (decided_at_stage="create"
 	// -- the full prompt text is already available at that point, via
-	// payload.PromptContext). A `prompted` event on an already-backed
+	// delegationPrompt). A `prompted` event on an already-backed
 	// session never re-classifies. Optional (nil-safe): a nil
 	// IntentClassifier simply skips classification entirely.
 	IntentClassifier *intentclassifier.Service
@@ -524,14 +524,10 @@ func (deps Deps) handleCreated(ctx context.Context, payload agentSessionEventWeb
 		title = &t
 	}
 
-	// promptContext is documented as present for every `created` event
-	// (payload.go's own doc comment); defended against a nil value anyway
-	// (never a naked nil-deref) with a short, honest fallback rather than
-	// silently creating a session with no prompt at all.
-	prompt := "Linear delegated or mentioned this agent session; no promptContext was supplied."
-	if payload.PromptContext != nil {
-		prompt = *payload.PromptContext
-	}
+	// §5.2: the issue's text and other people's comments reach the agent
+	// as quoted data; only the delegator's own request is an instruction
+	// (delegationPrompt, prompt.go).
+	prompt := delegationPrompt(payload)
 
 	// Repos: see internal/platform/config.go's own
 	// linearDefaultRepoNameEnvVarName doc comment for the full scope note

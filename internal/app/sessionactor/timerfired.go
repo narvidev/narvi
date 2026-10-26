@@ -523,9 +523,15 @@ func (a *Actor) handleTerminalGraceTimer(ctx context.Context) error {
 }
 
 // handleTurnDeadlineTimer implements the `turn_deadline` named timer (§2,
-// §3.3).
+// §3.3). A turn its deadline fails after a re-send to the gen it still runs
+// on (technical plan §3.3's turn recovery, §35.4) also has that gen
+// retired, in the same transaction (retireGenOfResentTurn); the gen's
+// provider object is stopped after the commit, and the next turn is
+// evaluated at once, for a new gen.
 func (a *Actor) handleTurnDeadlineTimer(ctx context.Context) error {
-	return a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
+	var retired *retiredGen
+	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		retired = nil
 		now := time.Now()
 
 		turns, err := a.stores.turn.WithTx(tx).ListForSession(ctx, a.sessionID)
@@ -632,8 +638,79 @@ func (a *Actor) handleTurnDeadlineTimer(ctx context.Context) error {
 			return err
 		}
 
+		if retired, err = a.retireGenOfResentTurn(ctx, tx, processing); err != nil {
+			return err
+		}
+
 		return a.deleteTimer(ctx, tx, TimerTurnDeadline)
 	})
+	if err != nil {
+		return err
+	}
+	if retired != nil {
+		a.stopSandboxOfRetiredGen(ctx, *retired)
+		// §3.3: "on terminal event ... dispatch next pending" -- on a new
+		// gen, since this one is retired and sends nothing more that could
+		// ask for it. The dispatch timer the transaction armed stands for
+		// this evaluation if it fails.
+		if dispatchErr := a.handleEnsureDispatched(ctx); dispatchErr != nil {
+			a.logger.Warn("sessionactor: ensure-dispatched after a re-sent turn's deadline failed", "error", dispatchErr)
+		}
+	}
+	return nil
+}
+
+// retireGenOfResentTurn retires the sandbox gen timedOut -- the turn
+// handleTurnDeadlineTimer has just failed -- was re-sent to and still ran
+// on (technical plan §3.3's turn recovery, §35.4), in tx, as a person's
+// stop retires the gen of a turn it cancels (retireStoppedGen). A re-send
+// keeps the deadline of the turn's first dispatch, so the re-sent work can
+// still be running there when that deadline ends the turn; the agent runs
+// each prompt on its own, and an execution_complete names a gen, never a
+// turn. Left live, the gen would be sent the next turn, run both at once,
+// and book the re-sent work's late end against the next turn
+// (completeProcessingTurn). Retired, it takes nothing more: the next
+// dispatch restores or respawns the session under a new gen, and the gen
+// fence drops whatever the old one still sends. The dispatch timer is
+// armed due now in tx, so that dispatch is owed even if the caller's
+// evaluation after the commit fails. No delivery is waited for, as a stop
+// does (deliveryHold): a turn re-sent to a gen is the first that gen runs,
+// and it is still processing, so no completed turn's push and pull request
+// can be under way there.
+//
+// Returns nil when there is nothing to retire:
+//   - a turn its first dispatch's gen ran to its deadline, never re-sent
+//     there (turns.reenqueued_sandbox_gen, migrations/000176) -- that gen
+//     is kept, as before, §3.3's stated limit ("turn_deadline is not
+//     covered");
+//   - no sandbox, one already dead, or one whose gen has moved past the
+//     turn's -- a later re-send would have moved the turn with it.
+func (a *Actor) retireGenOfResentTurn(ctx context.Context, tx pgx.Tx, timedOut sqlcgen.Turn) (*retiredGen, error) {
+	if timedOut.ReenqueuedSandboxGen == nil || timedOut.DispatchedSandboxGen == nil ||
+		*timedOut.ReenqueuedSandboxGen != *timedOut.DispatchedSandboxGen {
+		return nil, nil
+	}
+	row, err := a.stores.sandbox.WithTx(tx).Get(ctx, a.sessionID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("sessionactor: get sandbox: %w", err)
+	}
+	from := sandbox.State(row.Status)
+	if sandbox.IsDeadSandboxStatus(from) || row.Gen != *timedOut.DispatchedSandboxGen {
+		return nil, nil
+	}
+	retired, err := a.retireLiveGen(ctx, tx, row)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.armDispatchNow(ctx, tx); err != nil {
+		return nil, err
+	}
+	a.logger.Warn("sessionactor: a re-sent turn's deadline ended it on the gen it was re-sent to; that gen is retired, and the next turn runs on a new one",
+		"turn_id", timedOut.ID.String(), "gen", row.Gen, "from", string(from), "provider_id", retired.providerID)
+	return retired, nil
 }
 
 // transitionSandboxToSuspect is the shared Suspect-transition + arm-grace
