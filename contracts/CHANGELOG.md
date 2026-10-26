@@ -10,6 +10,22 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.29.0]
+
+### sandbox-ws/v1/events.schema.json
+
+- Added: optional string `Warning.scope`: what the warning is about, for a
+  reader that groups warnings (technical plan §35.5). `continuity` marks a
+  warning that tells a reader the agent's working context was lost or
+  rewound; every other warning carries none. A plain string, not an enum,
+  so a later value is no contract change; a reader treats a value it does
+  not know as absent. Nothing writes or reads it yet: the control plane
+  will set it on the continuity notices it stores itself. The generated
+  decoders ignore a key they do not know, so a reader built before this
+  release reads such a warning as it did, without the scope. A property
+  added, not required, grades MINOR (row 2); the `warning` union member
+  changes only by that property (row 30, recursing into row 2).
+
 ## [1.28.0]
 
 ### session-config/v1/session-config.schema.json

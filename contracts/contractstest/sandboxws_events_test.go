@@ -436,14 +436,51 @@ func TestSandboxEventsRoundTrip(t *testing.T) {
 		})
 	})
 
+	// Technical plan §35.5: scope is optional and a plain string, not an
+	// enum. A warning without one carries no key, so it reads as it did
+	// before the key existed; a value this release does not know still
+	// validates and decodes, so a reader can treat it as absent rather than
+	// lose the warning.
 	t.Run("Warning", func(t *testing.T) {
-		roundTrip(t, sch, sandboxws.Warning{
-			Type:      "warning",
-			MessageId: "e15",
-			SessionId: testSessionID,
-			Gen:       1,
-			Message:   "model catalog fallback in use",
-		})
+		continuity := "continuity"
+		unknown := "a_scope_a_later_release_adds"
+		for _, tc := range []struct {
+			name  string
+			scope *string
+		}{
+			{name: "NoScope", scope: nil},
+			{name: "Continuity", scope: &continuity},
+			{name: "UnknownValue", scope: &unknown},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				warning := sandboxws.Warning{
+					Type:      "warning",
+					MessageId: "e15",
+					SessionId: testSessionID,
+					Gen:       1,
+					Message:   "model catalog fallback in use",
+					Scope:     tc.scope,
+				}
+				roundTrip(t, sch, warning)
+				data, err := json.Marshal(warning)
+				if err != nil {
+					t.Fatalf("marshal: %v", err)
+				}
+				if got, want := bytes.Contains(data, []byte(`"scope"`)), tc.scope != nil; got != want {
+					t.Fatalf("warning marshals as %s: scope key present = %v, want %v", data, got, want)
+				}
+			})
+		}
+	})
+
+	t.Run("Warning_NonStringScopeRejected", func(t *testing.T) {
+		for _, value := range []string{"1", "null", `{"kind":"continuity"}`} {
+			payload := []byte(`{"type":"warning","messageId":"e15n","sessionId":"` + testSessionID +
+				`","gen":1,"message":"m","scope":` + value + `}`)
+			if err := validateJSON(t, sch, payload); err == nil {
+				t.Fatalf("expected scope %s to fail validation, got nil error", value)
+			}
+		}
 	})
 
 	t.Run("Error", func(t *testing.T) {
