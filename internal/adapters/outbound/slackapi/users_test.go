@@ -6,75 +6,284 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 )
 
+// installationTeam is the workspace the fake auth.test below names as the
+// bot token's own.
+const installationTeam = "T0HOME"
+
+// fakeSlackUsers is a fake Slack Web API answering users.info with user
+// (Slack's user object) and auth.test with authTest, recording every
+// request's path, Authorization header and users.info user parameter.
+type fakeSlackUsers struct {
+	mu       sync.Mutex
+	paths    []string
+	auths    []string
+	userIDs  []string
+	user     map[string]any
+	authTest map[string]any
+}
+
+func newFakeSlackUsers(t *testing.T, user, authTest map[string]any) (*fakeSlackUsers, *slackapi.Client) {
+	t.Helper()
+	f := &fakeSlackUsers{user: user, authTest: authTest}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.paths = append(f.paths, r.URL.Path)
+		f.auths = append(f.auths, r.Header.Get("Authorization"))
+		if r.URL.Path == "/users.info" {
+			f.userIDs = append(f.userIDs, r.URL.Query().Get("user"))
+		}
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/users.info":
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "user": f.user})
+		case "/auth.test":
+			_ = json.NewEncoder(w).Encode(f.authTest)
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(server.Close)
+	return f, slackapi.New(server.Client(), server.URL, "xoxb-test-token")
+}
+
+func (f *fakeSlackUsers) count(path string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, p := range f.paths {
+		if p == path {
+			n++
+		}
+	}
+	return n
+}
+
+// fullMember is users.info's user object for a full member of the
+// installation's own workspace whose email Slack reports as confirmed.
+// Every case below starts from it and changes one thing.
+func fullMember() map[string]any {
+	return map[string]any{
+		"id":                  "U123",
+		"team_id":             installationTeam,
+		"deleted":             false,
+		"is_bot":              false,
+		"is_restricted":       false,
+		"is_ultra_restricted": false,
+		"is_email_confirmed":  true,
+		"profile":             map[string]any{"email": "ada@example.com"},
+	}
+}
+
+func memberWith(key string, value any) map[string]any {
+	u := fullMember()
+	u[key] = value
+	return u
+}
+
+func memberWithout(keys ...string) map[string]any {
+	u := fullMember()
+	for _, k := range keys {
+		delete(u, k)
+	}
+	return u
+}
+
+// TestGetUserEmail_Verified is the table test of §13.2's definition of a
+// verified Slack email (slackapi.UserEmail.Verified): Slack reports it as
+// confirmed, for a full member of this installation's own workspace. Each
+// case runs the real decoder on a users.info payload, so an absent field
+// reads exactly as Slack's leaving it out would.
+func TestGetUserEmail_Verified(t *testing.T) {
+	t.Parallel()
+
+	homeTeam := map[string]any{"ok": true, "team_id": installationTeam}
+	tests := []struct {
+		name         string
+		user         map[string]any
+		authTest     map[string]any
+		wantVerified bool
+	}{
+		{"full member, confirmed email", fullMember(), homeTeam, true},
+		{"every exclusion flag absent", memberWithout("deleted", "is_bot", "is_restricted", "is_ultra_restricted", "is_stranger"), homeTeam, true},
+		{"is_stranger false", memberWith("is_stranger", false), homeTeam, true},
+		{"email not confirmed", memberWith("is_email_confirmed", false), homeTeam, false},
+		{"is_email_confirmed absent", memberWithout("is_email_confirmed"), homeTeam, false},
+		{"deleted", memberWith("deleted", true), homeTeam, false},
+		{"bot", memberWith("is_bot", true), homeTeam, false},
+		{"guest (restricted)", memberWith("is_restricted", true), homeTeam, false},
+		{"single-channel guest (ultra restricted)", memberWith("is_ultra_restricted", true), homeTeam, false},
+		{"stranger", memberWith("is_stranger", true), homeTeam, false},
+		{"another team's member", memberWith("team_id", "T0OTHER"), homeTeam, false},
+		{"team_id absent", memberWithout("team_id"), homeTeam, false},
+		{"team_id empty", memberWith("team_id", ""), homeTeam, false},
+		{"auth.test names no team", fullMember(), map[string]any{"ok": true}, false},
+		{"no team on either side", memberWithout("team_id"), map[string]any{"ok": true}, false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, client := newFakeSlackUsers(t, tt.user, tt.authTest)
+
+			got, ok, err := client.GetUserEmail(context.Background(), "U123")
+			if err != nil {
+				t.Fatalf("GetUserEmail() error = %v, want nil", err)
+			}
+			if !ok {
+				t.Fatal("GetUserEmail() ok = false, want true (the member has an email)")
+			}
+			if got.Email != "ada@example.com" {
+				t.Errorf("Email = %q, want %q", got.Email, "ada@example.com")
+			}
+			if v := got.Verified(); v != tt.wantVerified {
+				t.Errorf("Verified() = %v, want %v (decoded %+v)", v, tt.wantVerified, got)
+			}
+		})
+	}
+}
+
+// TestGetUserEmail_DecodesEveryField proves each users.info field lands in
+// the UserEmail field named for it, and auth.test's team_id in
+// InstallationTeamID.
+func TestGetUserEmail_DecodesEveryField(t *testing.T) {
+	t.Parallel()
+
+	_, client := newFakeSlackUsers(t, map[string]any{
+		"team_id":             "T0OTHER",
+		"deleted":             true,
+		"is_bot":              true,
+		"is_restricted":       true,
+		"is_ultra_restricted": true,
+		"is_stranger":         true,
+		"is_email_confirmed":  true,
+		"profile":             map[string]any{"email": "ada@example.com"},
+	}, map[string]any{"ok": true, "team_id": installationTeam})
+
+	got, ok, err := client.GetUserEmail(context.Background(), "U123")
+	if err != nil || !ok {
+		t.Fatalf("GetUserEmail() = (_, %v, %v), want (_, true, nil)", ok, err)
+	}
+	want := slackapi.UserEmail{
+		Email:              "ada@example.com",
+		EmailConfirmed:     true,
+		Deleted:            true,
+		Bot:                true,
+		Restricted:         true,
+		UltraRestricted:    true,
+		Stranger:           true,
+		TeamID:             "T0OTHER",
+		InstallationTeamID: installationTeam,
+	}
+	if got != want {
+		t.Errorf("GetUserEmail() = %+v, want %+v", got, want)
+	}
+}
+
 func TestGetUserEmail_Success(t *testing.T) {
 	t.Parallel()
 
-	var gotPath, gotAuth, gotUser string
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotPath = r.URL.Path
-		gotAuth = r.Header.Get("Authorization")
-		gotUser = r.URL.Query().Get("user")
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok": true,
-			"user": map[string]any{
-				"profile": map[string]any{"email": "ada@example.com"},
-			},
-		})
-	}))
-	defer server.Close()
+	fake, client := newFakeSlackUsers(t, fullMember(), map[string]any{"ok": true, "team_id": installationTeam})
 
-	client := slackapi.New(server.Client(), server.URL, "xoxb-test-token")
-
-	email, ok, err := client.GetUserEmail(context.Background(), "U123")
+	user, ok, err := client.GetUserEmail(context.Background(), "U123")
 	if err != nil {
 		t.Fatalf("GetUserEmail() error = %v, want nil", err)
 	}
 	if !ok {
 		t.Fatal("GetUserEmail() ok = false, want true")
 	}
-	if email != "ada@example.com" {
-		t.Errorf("email = %q, want %q", email, "ada@example.com")
+	if user.Email != "ada@example.com" {
+		t.Errorf("email = %q, want %q", user.Email, "ada@example.com")
 	}
-	if gotPath != "/users.info" {
-		t.Errorf("request path = %q, want %q", gotPath, "/users.info")
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	if len(fake.paths) != 2 || fake.paths[0] != "/users.info" || fake.paths[1] != "/auth.test" {
+		t.Errorf("request paths = %v, want [/users.info /auth.test]", fake.paths)
 	}
-	if gotAuth != "Bearer xoxb-test-token" {
-		t.Errorf("Authorization header = %q, want %q", gotAuth, "Bearer xoxb-test-token")
+	for i, auth := range fake.auths {
+		if auth != "Bearer xoxb-test-token" {
+			t.Errorf("request %d Authorization header = %q, want %q", i, auth, "Bearer xoxb-test-token")
+		}
 	}
-	if gotUser != "U123" {
-		t.Errorf("user query param = %q, want %q", gotUser, "U123")
+	if len(fake.userIDs) != 1 || fake.userIDs[0] != "U123" {
+		t.Errorf("users.info user params = %v, want [U123]", fake.userIDs)
+	}
+}
+
+// TestGetUserEmail_AsksAuthTestOnce proves the installation's workspace is
+// learned once per Client and kept -- but only once auth.test has named
+// one: an answer with no team_id is asked again the next time.
+func TestGetUserEmail_AsksAuthTestOnce(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name         string
+		authTest     map[string]any
+		wantAuthTest int
+	}{
+		{"a named team is kept", map[string]any{"ok": true, "team_id": installationTeam}, 1},
+		{"no team is asked again", map[string]any{"ok": true}, 3},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fake, client := newFakeSlackUsers(t, fullMember(), tt.authTest)
+			for i := 0; i < 3; i++ {
+				if _, _, err := client.GetUserEmail(context.Background(), "U123"); err != nil {
+					t.Fatalf("GetUserEmail() #%d error = %v", i, err)
+				}
+			}
+			if n := fake.count("/auth.test"); n != tt.wantAuthTest {
+				t.Errorf("auth.test calls = %d, want %d", n, tt.wantAuthTest)
+			}
+		})
+	}
+}
+
+// TestGetUserEmail_AuthTestFailureIsRetryable proves a failing auth.test
+// fails the fetch with an ordinary (retryable) error -- never a verdict on
+// the member, and never ErrSlackUserNotFound.
+func TestGetUserEmail_AuthTestFailureIsRetryable(t *testing.T) {
+	t.Parallel()
+
+	_, client := newFakeSlackUsers(t, fullMember(), map[string]any{"ok": false, "error": "ratelimited"})
+
+	user, ok, err := client.GetUserEmail(context.Background(), "U123")
+	if err == nil {
+		t.Fatal("GetUserEmail() error = nil, want non-nil")
+	}
+	if errors.Is(err, slackapi.ErrSlackUserNotFound) {
+		t.Error("GetUserEmail() error should NOT be ErrSlackUserNotFound for an auth.test failure")
+	}
+	if ok || user != (slackapi.UserEmail{}) {
+		t.Errorf("GetUserEmail() = (%+v, %v), want the zero UserEmail and ok=false", user, ok)
 	}
 }
 
 func TestGetUserEmail_NoEmailVisible(t *testing.T) {
 	t.Parallel()
 
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":   true,
-			"user": map[string]any{"profile": map[string]any{}},
-		})
-	}))
-	defer server.Close()
+	fake, client := newFakeSlackUsers(t, map[string]any{"profile": map[string]any{}}, map[string]any{"ok": true, "team_id": installationTeam})
 
-	client := slackapi.New(server.Client(), server.URL, "xoxb-test-token")
-
-	email, ok, err := client.GetUserEmail(context.Background(), "U123")
+	user, ok, err := client.GetUserEmail(context.Background(), "U123")
 	if err != nil {
 		t.Fatalf("GetUserEmail() error = %v, want nil", err)
 	}
 	if ok {
 		t.Fatal("GetUserEmail() ok = true, want false (no email visible)")
 	}
-	if email != "" {
-		t.Errorf("email = %q, want empty", email)
+	if user.Email != "" || user.Verified() {
+		t.Errorf("user = %+v, want no email, not verified", user)
+	}
+	if n := fake.count("/auth.test"); n != 0 {
+		t.Errorf("auth.test calls = %d, want 0 (nothing to judge without an email)", n)
 	}
 }
 

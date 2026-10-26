@@ -37,6 +37,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/inbound/auth"
@@ -598,6 +599,9 @@ func TestOIDCCallback_AmbiguousMatch_Refused(t *testing.T) {
 		Email:         &ambiguousEmail,
 		EmailVerified: true,
 		LinkedVia:     sqlcgen.IdentityLinkedViaAutoEmail,
+		// Checked under §13.2's Slack definition: an automatic Slack link
+		// without email_checked_at is no evidence (migrations/000176).
+		EmailCheckedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}); err != nil {
 		t.Fatalf("create identity for userA: %v", err)
 	}
@@ -608,6 +612,9 @@ func TestOIDCCallback_AmbiguousMatch_Refused(t *testing.T) {
 		Email:         &ambiguousEmail,
 		EmailVerified: true,
 		LinkedVia:     sqlcgen.IdentityLinkedViaAutoEmail,
+		// Checked under §13.2's Slack definition: an automatic Slack link
+		// without email_checked_at is no evidence (migrations/000176).
+		EmailCheckedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}); err != nil {
 		t.Fatalf("create identity for userB: %v", err)
 	}

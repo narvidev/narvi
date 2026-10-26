@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 
+	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 	"github.com/narvidev/narvi/internal/app/shadowledger"
 )
 
@@ -24,8 +25,10 @@ import (
 // *Decorator satisfies it too, decorating every write.
 type Client interface {
 	// GetUserEmail is a read, forwarded to the live client unchanged --
-	// see doc.go's own "what is decorated, and what is not".
-	GetUserEmail(ctx context.Context, userID string) (email string, ok bool, err error)
+	// see doc.go's own "what is decorated, and what is not". It returns
+	// users.info's profile email with the membership facts that decide
+	// whether it is verified (slackapi.UserEmail.Verified, §13.2).
+	GetUserEmail(ctx context.Context, userID string) (user slackapi.UserEmail, ok bool, err error)
 
 	// PostAck posts a plain-text chat.postMessage reply, threaded under
 	// threadTS -- internal/adapters/inbound/slack's own in-thread ack
@@ -101,7 +104,7 @@ func (d *Decorator) record(ctx context.Context, e shadowledger.Entry) error {
 }
 
 // GetUserEmail is a read and is forwarded unchanged.
-func (d *Decorator) GetUserEmail(ctx context.Context, userID string) (string, bool, error) {
+func (d *Decorator) GetUserEmail(ctx context.Context, userID string) (slackapi.UserEmail, bool, error) {
 	return d.live.GetUserEmail(ctx, userID)
 }
 

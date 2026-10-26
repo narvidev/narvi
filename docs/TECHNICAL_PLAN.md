@@ -735,17 +735,26 @@ Schema:
 ```
 users(id, primary_email, display_name, role, disabled, created_at)
 identities(user_id, provider ENUM(github,slack,linear,google), external_id,
-           email, email_verified, linked_via ENUM(auto_email, prompt, admin),
+           email, email_verified, email_checked_at,
+           linked_via ENUM(auto_email, prompt, admin),
            created_at, UNIQUE(provider, external_id))
 identity_link_prompts(provider, external_id, nonce, expires_at)  -- pending links
 ```
 
 Auto-link algorithm (runs on first event from an unknown provider identity — Slack mention, Linear webhook):
 1. Fetch the actor's profile email from the provider API.
-2. Match against `users.primary_email` and verified identity emails.
+2. Only a **verified email** (defined per provider below) goes on: match it against `users.primary_email` and verified identity emails. Any other email goes to step 4, never matched.
 3. Exactly **one** verified match → auto-link (`linked_via=auto_email`), notify the user in-channel and in-app.
 4. Zero or multiple matches → **never guess**: create a link prompt and reply in-channel with a short-lived magic link ("connect your account"). A state-changing action from this not-yet-linked identity is **denied** (audit-fix batch "block unlinked actor state changes" — hardened from an earlier version of this section, which let the action proceed under bot attribution while the prompt was pending; that was a confirmed audit finding, not a design that survived review) — the magic-link prompt is still sent exactly as before, and the actor simply retries the identical action once they've clicked it and linked.
 5. Manual link/unlink in Settings → Members; admin can force-link.
+
+A **verified email** is one the provider vouches for; the identity stores `email_verified` exactly as the provider attested it, and only a verified one counts in step 2:
+- **GitHub** — the primary email `/user/emails` marks verified.
+- **OIDC** — the ID token's `email`, with `email_verified` true (§41.3).
+- **Slack** — the profile email `users.info` returns, only when Slack reports it as confirmed (`is_email_confirmed`), for a full member of this installation's own workspace: not `deleted`, not a bot (`is_bot`), not a guest (`is_restricted`, `is_ultra_restricted`), not a stranger (`is_stranger`), and with `team_id` equal to the workspace `auth.test` names for the bot token. A field Slack leaves out counts as not confirmed (`is_email_confirmed`) and as another workspace (`team_id`). Any other Slack member is never linked automatically; the link prompt of step 4 still links them.
+- **Linear** — the email Linear's API returns for the user, read with the organization's installation token.
+
+`email_checked_at` records when a verified email was last checked under this definition. A Slack automatic link without it — made before Slack's rule existed — resolves to no one and is no evidence in step 2 until the member's next event re-checks it against Slack: kept and stamped when Slack reports the same email as confirmed for a full member of this workspace, otherwise removed, with an `identity.auto_link_revoked` audit entry in the same transaction, and the member gets the link prompt. A link made through the prompt or by an admin is never re-checked, and never removed by a re-check.
 
 Failure rules: a provider email-API failure is a **retryable error, not an empty identity** — retry with backoff and keep the last known value; never null-out an email on transient failure (nulling it breaks both sign-in and identity linking).
 

@@ -248,7 +248,7 @@ func TestConsumeHandler_Authenticated_LinksIdentity(t *testing.T) {
 		AuditLog:      narvipg.NewAuditLogStore(rig.pool),
 		PublicBaseURL: "https://narvi.example.com",
 		PromptTTL:     time.Hour,
-	}, sqlcgen.IdentityProviderSlack, "U-CONSUME-HTTP", "nobody-matches@example.com", true)
+	}, sqlcgen.IdentityProviderSlack, "U-CONSUME-HTTP", appidentitylink.ProfileEmail{Address: "nobody-matches@example.com", Verified: true}, true)
 	if err != nil {
 		t.Fatalf("Resolve (seed link prompt): %v", err)
 	}

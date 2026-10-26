@@ -953,6 +953,9 @@ func TestCallback_AmbiguousMatch_Refused(t *testing.T) {
 		Email:         &ambiguousEmail,
 		EmailVerified: true,
 		LinkedVia:     sqlcgen.IdentityLinkedViaAutoEmail,
+		// Checked under §13.2's Slack definition: an automatic Slack link
+		// without email_checked_at is no evidence (migrations/000176).
+		EmailCheckedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}); err != nil {
 		t.Fatalf("create identity for userA: %v", err)
 	}
@@ -963,6 +966,9 @@ func TestCallback_AmbiguousMatch_Refused(t *testing.T) {
 		Email:         &ambiguousEmail,
 		EmailVerified: true,
 		LinkedVia:     sqlcgen.IdentityLinkedViaAutoEmail,
+		// Checked under §13.2's Slack definition: an automatic Slack link
+		// without email_checked_at is no evidence (migrations/000176).
+		EmailCheckedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}); err != nil {
 		t.Fatalf("create identity for userB: %v", err)
 	}

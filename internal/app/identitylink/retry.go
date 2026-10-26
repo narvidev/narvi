@@ -116,13 +116,16 @@ func newEmailFetchFailuresCounter() metric.Int64Counter {
 // observability below -- they change nothing about the retry behavior
 // itself.
 //
-// email/ok mirrors Resolve's own (email string, emailOK bool) parameter
-// shape exactly: ok=false covers BOTH "every retry attempt failed" and "a
-// retry succeeded but reported no email at all" (fetch's own second
-// return value) -- Resolve treats both identically (§13.2's own "never
-// null-out an email on transient failure" rule means neither case should
-// ever be treated as a confirmed empty identity, just "we don't know
-// right now").
+// email/ok mirrors Resolve's own (email ProfileEmail, emailOK bool)
+// parameter shape exactly -- the fetch closure reports whether the
+// provider vouches for the address (ProfileEmail.Verified, §13.2's
+// per-provider definition), and this function hands that on unchanged:
+// retrying decides nothing about it. ok=false covers BOTH "every retry
+// attempt failed" and "a retry succeeded but reported no email at all"
+// (fetch's own second return value) -- Resolve treats both identically
+// (§13.2's own "never null-out an email on transient failure" rule means
+// neither case should ever be treated as a confirmed empty identity, just
+// "we don't know right now").
 //
 // M19 audit fix ("a permanently broken provider email-fetch API disables
 // auto-link platform-wide in total silence"): ok=false's two cases above
@@ -161,7 +164,7 @@ func newEmailFetchFailuresCounter() metric.Int64Counter {
 //     must be checked there and not on Retry's own return value). Routine
 //     workspace member churn, not evidence the fetch API is broken --
 //     deliberately NEITHER logged NOR counted, exactly like case 2.
-func FetchEmailWithRetry(ctx context.Context, logger *slog.Logger, timeouts platform.Timeouts, provider sqlcgen.IdentityProvider, fetch func(ctx context.Context) (email string, ok bool, err error)) (email string, ok bool) {
+func FetchEmailWithRetry(ctx context.Context, logger *slog.Logger, timeouts platform.Timeouts, provider sqlcgen.IdentityProvider, fetch func(ctx context.Context) (email ProfileEmail, ok bool, err error)) (email ProfileEmail, ok bool) {
 	permanent := false
 	err := platform.Retry(ctx, timeouts.IdentityEmailFetchMaxAttempts, timeouts.IdentityEmailFetchRetryBaseDelay, timeouts.IdentityEmailFetchRetryMaxDelay, func() error {
 		attemptCtx, cancel := context.WithTimeout(ctx, timeouts.IdentityEmailFetchTimeout)
@@ -207,7 +210,7 @@ func FetchEmailWithRetry(ctx context.Context, logger *slog.Logger, timeouts plat
 			logger.Warn("identitylink: profile-email fetch exhausted every retry attempt", "provider", string(provider), "error", err)
 			emailFetchFailures.Add(ctx, 1, metric.WithAttributes(attribute.String("provider", string(provider))))
 		}
-		return "", false
+		return ProfileEmail{}, false
 	}
 	return email, ok
 }

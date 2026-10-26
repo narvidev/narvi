@@ -4,7 +4,7 @@
 // package's own unexported symbols to its external (slack_test)
 // integration test suite -- the standard Go "export_test.go" pattern.
 //
-// Needed for two tests. The first is textverdict_integration_test.go's own
+// Needed for three tests. The first is textverdict_integration_test.go's own
 // TestHandlePlanVerdict_UnauthorizedActor_DeniedByOwnAuthorizationCheck.
 // That test proves handlePlanVerdict's own authorizeSessionAction(...,
 // authz.ActionApprovePlan) call (this batch's own addition, "honour a
@@ -32,6 +32,16 @@
 // type from a check on the text; the test feeds the real refusal, and
 // copies of it with the text or the type changed, to
 // requestChangesRefusalText directly.
+//
+// The third is verifiedemail_integration_test.go's
+// TestResolveSlackActor_LinksOnlyOnAVerifiedEmail: §13.2 links a Slack
+// identity automatically only on an email Slack reports as confirmed, for a
+// full member of this workspace, and the test walks every shape of member
+// users.info can describe through the one function both ingress routes
+// call to resolve an actor, resolveSlackActor, against a real slackapi
+// client and a real database. A full HTTP request per shape would spend a
+// handler rig, and for a linked member a session and its actor, on each of
+// them, to reach the same call; the bridge reaches it directly.
 package slack
 
 import (
@@ -40,6 +50,8 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
+	"github.com/narvidev/narvi/internal/app/identitylink"
+	"github.com/narvidev/narvi/internal/app/shadowslack"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -61,4 +73,10 @@ func (deps Deps) HandlePlanVerdictForTest(ctx context.Context, channel, key stri
 // pass-through.
 func RequestChangesRefusalTextForTest(cerr *httpapi.CreateTurnError) string {
 	return requestChangesRefusalText(cerr)
+}
+
+// ResolveSlackActorForTest bridges resolveSlackActor (identity.go) -- see
+// this file's own top doc comment. A pure pass-through.
+func ResolveSlackActorForTest(ctx context.Context, slackClient shadowslack.Client, identityLinkDeps identitylink.Deps, timeouts platform.Timeouts, slackUserID string) (pgtype.UUID, string) {
+	return resolveSlackActor(ctx, platform.Logger(ctx), slackClient, identityLinkDeps, timeouts, slackUserID)
 }

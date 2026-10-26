@@ -1,0 +1,61 @@
+-- Technical plan §13.2: a Slack identity links automatically only on an
+-- email Slack reports as confirmed, for a full member of this workspace.
+--
+-- identities.email_checked_at: when this release last found that the
+-- provider vouches for the identity's email under §13.2's definition of a
+-- verified email for that provider. Written by the automatic link that
+-- creates the row (internal/app/identitylink.AutoLink, only for an email
+-- its caller reports verified) and by the re-check of an older automatic
+-- link (identitylink.Resolve); NULL when nothing has checked it.
+--
+-- A Slack automatic link (provider slack, linked_via auto_email) whose
+-- column is NULL was made by a binary that took any profile email Slack
+-- returned as verified. It is not used until it is re-checked: the link
+-- resolves to nobody (identitylink.LookupLinkedUserID), and its email is not
+-- evidence for matching another identity (ListVerifiedIdentityUserIDsByEmail
+-- leaves it out). The next event from that Slack member re-checks it
+-- against Slack: kept, and stamped, when Slack reports the same email as
+-- confirmed for a full member of this workspace; otherwise removed, with an
+-- identity.auto_link_revoked audit entry written in the same transaction,
+-- and the member is offered the account-link flow. A link made any other
+-- way (linked_via prompt or admin) carries no stamp and needs none: the
+-- re-check never reads or removes it. Other providers' automatic links are
+-- unaffected: their definition of a verified email did not change.
+--
+-- No backfill: whether Slack confirms an email is not in the database. No
+-- index: the column is read with the identity row, by the row's existing
+-- keys, and in ListVerifiedIdentityUserIDsByEmail's filter on rows already
+-- matched by email.
+--
+-- # Locks
+--
+-- golang-migrate sends this file as one batch, one implicit transaction.
+-- The ADD COLUMN, nullable with no default, is a catalog change that
+-- rewrites nothing, but takes ACCESS EXCLUSIVE on identities until the file
+-- ends -- an instant once granted. It waits behind any open transaction
+-- that has read or written identities (a sign-in, an automatic link, a link
+-- prompt being consumed, the members API), and while it waits every new
+-- read and write of identities queues behind it; controlplane/migrate.go
+-- sets no lock_timeout. The file touches identities alone, so it holds no
+-- lock another table's waiters could need.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with this column present: every statement it
+-- sends names its columns (sqlc writes each SELECT * and RETURNING * out as
+-- a column list), so it neither reads nor writes it. A Slack automatic link
+-- it makes during the rollout carries no stamp, so this release re-checks
+-- it at its next use, like every link made before this release. Until it is
+-- replaced, the previous binary still uses every link and counts every
+-- verified email, as it did before.
+--
+-- # Rolling back
+--
+-- The previous binary cannot boot on this version: golang-migrate finds no
+-- file for it. With the control plane scaled to zero, either `migrate
+-- force` the previous version, keeping the column and its values (the
+-- previous binary ignores it; this file, run again, keeps them), or run the
+-- down (goto the previous version), which drops the column; this release,
+-- deployed again, then re-checks every Slack automatic link at its next
+-- use, the ones it had already stamped included.
+ALTER TABLE identities ADD COLUMN IF NOT EXISTS email_checked_at TIMESTAMPTZ;

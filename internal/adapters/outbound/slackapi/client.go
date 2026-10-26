@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 
 	"github.com/narvidev/narvi/internal/app/ports"
 )
@@ -44,6 +45,13 @@ type Client struct {
 	httpClient *http.Client
 	apiBaseURL string
 	botToken   string
+
+	// installationTeamID caches auth.test's team_id for botToken: the
+	// workspace this installation belongs to, which a bot token never
+	// changes (users.go's installationTeam). Empty until a call has learned
+	// it; guarded by teamMu, which is never held across a request.
+	teamMu             sync.Mutex
+	installationTeamID string
 }
 
 // var _ ports.Notifier = (*Client)(nil) makes a Notifier signature drift a

@@ -11,21 +11,41 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const confirmAutoLinkedIdentityEmail = `-- name: ConfirmAutoLinkedIdentityEmail :execrows
+UPDATE identities
+SET email_verified = true, email_checked_at = now()
+WHERE id = $1 AND linked_via = 'auto_email'
+`
+
+// The re-check of an automatic link found that the provider vouches for its
+// email under §13.2's definition (internal/app/identitylink.Resolve): the
+// email is verified, as of now. Scoped to linked_via auto_email, so it never
+// touches a link a person or an admin made. 0 rows means the row is gone or
+// is no longer an automatic link: the caller looks it up again.
+func (q *Queries) ConfirmAutoLinkedIdentityEmail(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, confirmAutoLinkedIdentityEmail, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const createIdentity = `-- name: CreateIdentity :one
 
-INSERT INTO identities (user_id, provider, external_id, email, email_verified, linked_via, access_token_encrypted)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
-RETURNING id, user_id, provider, external_id, email, email_verified, linked_via, created_at, access_token_encrypted
+INSERT INTO identities (user_id, provider, external_id, email, email_verified, linked_via, access_token_encrypted, email_checked_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+RETURNING id, user_id, provider, external_id, email, email_verified, linked_via, created_at, access_token_encrypted, email_checked_at
 `
 
 type CreateIdentityParams struct {
-	UserID               pgtype.UUID       `json:"user_id"`
-	Provider             IdentityProvider  `json:"provider"`
-	ExternalID           string            `json:"external_id"`
-	Email                *string           `json:"email"`
-	EmailVerified        bool              `json:"email_verified"`
-	LinkedVia            IdentityLinkedVia `json:"linked_via"`
-	AccessTokenEncrypted []byte            `json:"access_token_encrypted"`
+	UserID               pgtype.UUID        `json:"user_id"`
+	Provider             IdentityProvider   `json:"provider"`
+	ExternalID           string             `json:"external_id"`
+	Email                *string            `json:"email"`
+	EmailVerified        bool               `json:"email_verified"`
+	LinkedVia            IdentityLinkedVia  `json:"linked_via"`
+	AccessTokenEncrypted []byte             `json:"access_token_encrypted"`
+	EmailCheckedAt       pgtype.Timestamptz `json:"email_checked_at"`
 }
 
 // Queries backing IdentityStore (§13.2 identity graph,
@@ -39,6 +59,9 @@ type CreateIdentityParams struct {
 // don't expire, but re-storing on each login is harmless and keeps the
 // stored token fresh if the user ever re-authorized with different
 // scopes).
+// email_checked_at (migrations/000176) is set only by an automatic link on
+// an email its caller reports verified (internal/app/identitylink.AutoLink);
+// every other caller leaves it NULL.
 func (q *Queries) CreateIdentity(ctx context.Context, arg CreateIdentityParams) (Identity, error) {
 	row := q.db.QueryRow(ctx, createIdentity,
 		arg.UserID,
@@ -48,6 +71,7 @@ func (q *Queries) CreateIdentity(ctx context.Context, arg CreateIdentityParams) 
 		arg.EmailVerified,
 		arg.LinkedVia,
 		arg.AccessTokenEncrypted,
+		arg.EmailCheckedAt,
 	)
 	var i Identity
 	err := row.Scan(
@@ -60,6 +84,7 @@ func (q *Queries) CreateIdentity(ctx context.Context, arg CreateIdentityParams) 
 		&i.LinkedVia,
 		&i.CreatedAt,
 		&i.AccessTokenEncrypted,
+		&i.EmailCheckedAt,
 	)
 	return i, err
 }
@@ -82,8 +107,29 @@ func (q *Queries) DeleteIdentity(ctx context.Context, id pgtype.UUID) (int64, er
 	return result.RowsAffected(), nil
 }
 
+const deleteUncheckedAutoLinkedIdentity = `-- name: DeleteUncheckedAutoLinkedIdentity :execrows
+DELETE FROM identities
+WHERE id = $1 AND linked_via = 'auto_email'
+  AND (NOT email_verified OR (provider = 'slack' AND email_checked_at IS NULL))
+`
+
+// The re-check of an automatic link found that the provider does not vouch
+// for its email (internal/app/identitylink.Resolve): the link goes. Deletes
+// only a row that is still an automatic link nothing has confirmed -- one
+// whose email is not verified, or a Slack one with no email_checked_at --
+// so it never removes a link a person or an admin made (linked_via prompt or
+// admin), nor one a concurrent re-check has just confirmed. 0 rows means
+// there was nothing of that kind left to delete.
+func (q *Queries) DeleteUncheckedAutoLinkedIdentity(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteUncheckedAutoLinkedIdentity, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getIdentityByProviderAndExternalID = `-- name: GetIdentityByProviderAndExternalID :one
-SELECT id, user_id, provider, external_id, email, email_verified, linked_via, created_at, access_token_encrypted FROM identities
+SELECT id, user_id, provider, external_id, email, email_verified, linked_via, created_at, access_token_encrypted, email_checked_at FROM identities
 WHERE provider = $1 AND external_id = $2
 `
 
@@ -105,12 +151,13 @@ func (q *Queries) GetIdentityByProviderAndExternalID(ctx context.Context, arg Ge
 		&i.LinkedVia,
 		&i.CreatedAt,
 		&i.AccessTokenEncrypted,
+		&i.EmailCheckedAt,
 	)
 	return i, err
 }
 
 const getIdentityByUserAndProvider = `-- name: GetIdentityByUserAndProvider :one
-SELECT id, user_id, provider, external_id, email, email_verified, linked_via, created_at, access_token_encrypted FROM identities
+SELECT id, user_id, provider, external_id, email, email_verified, linked_via, created_at, access_token_encrypted, email_checked_at FROM identities
 WHERE user_id = $1 AND provider = $2
 `
 
@@ -136,12 +183,13 @@ func (q *Queries) GetIdentityByUserAndProvider(ctx context.Context, arg GetIdent
 		&i.LinkedVia,
 		&i.CreatedAt,
 		&i.AccessTokenEncrypted,
+		&i.EmailCheckedAt,
 	)
 	return i, err
 }
 
 const listIdentitiesForUser = `-- name: ListIdentitiesForUser :many
-SELECT id, user_id, provider, external_id, email, email_verified, linked_via, created_at, access_token_encrypted FROM identities
+SELECT id, user_id, provider, external_id, email, email_verified, linked_via, created_at, access_token_encrypted, email_checked_at FROM identities
 WHERE user_id = $1
 ORDER BY created_at ASC
 `
@@ -165,6 +213,7 @@ func (q *Queries) ListIdentitiesForUser(ctx context.Context, userID pgtype.UUID)
 			&i.LinkedVia,
 			&i.CreatedAt,
 			&i.AccessTokenEncrypted,
+			&i.EmailCheckedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -180,6 +229,7 @@ const listVerifiedIdentityUserIDsByEmail = `-- name: ListVerifiedIdentityUserIDs
 
 SELECT DISTINCT user_id FROM identities
 WHERE email_verified = true AND lower(email) = lower($1)
+  AND NOT (provider = 'slack' AND linked_via = 'auto_email' AND email_checked_at IS NULL)
 `
 
 // §13.2 ("identities + full RBAC", §13.2/§13.3) additions --
@@ -195,6 +245,12 @@ WHERE email_verified = true AND lower(email) = lower($1)
 // so a caller combining this with GetUserByPrimaryEmail's own single
 // result must dedupe by user_id regardless; DISTINCT here just avoids
 // handing back an already-known duplicate in the common case.
+//
+// A Slack automatic link nothing has checked since migrations/000176 (the
+// previous binary took any Slack profile email as verified) is left out
+// until identitylink.Resolve re-checks it against Slack -- the same rows
+// identitylink's autoLinkUnchecked names, and DeleteUncheckedAutoLinkedIdentity
+// deletes.
 func (q *Queries) ListVerifiedIdentityUserIDsByEmail(ctx context.Context, lower string) ([]pgtype.UUID, error) {
 	rows, err := q.db.Query(ctx, listVerifiedIdentityUserIDsByEmail, lower)
 	if err != nil {
@@ -219,7 +275,7 @@ const updateIdentityAccessToken = `-- name: UpdateIdentityAccessToken :one
 UPDATE identities
 SET access_token_encrypted = $2
 WHERE id = $1
-RETURNING id, user_id, provider, external_id, email, email_verified, linked_via, created_at, access_token_encrypted
+RETURNING id, user_id, provider, external_id, email, email_verified, linked_via, created_at, access_token_encrypted, email_checked_at
 `
 
 type UpdateIdentityAccessTokenParams struct {
@@ -240,6 +296,7 @@ func (q *Queries) UpdateIdentityAccessToken(ctx context.Context, arg UpdateIdent
 		&i.LinkedVia,
 		&i.CreatedAt,
 		&i.AccessTokenEncrypted,
+		&i.EmailCheckedAt,
 	)
 	return i, err
 }

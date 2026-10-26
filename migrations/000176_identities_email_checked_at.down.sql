@@ -1,0 +1,18 @@
+-- Reverses 000176_identities_email_checked_at.up.sql. With the column goes
+-- every identity's record of when its email was last checked under §13.2's
+-- definition of a verified email. A binary without 000176 does not read it;
+-- a binary with it that runs 000176 again reads every Slack automatic link
+-- as never checked, and re-checks each against Slack at its next use.
+--
+-- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
+-- 000176. Do not run it against live pods of a binary that carries 000176:
+-- every query of that binary that returns a whole identity row names the
+-- column (sqlc writes each SELECT * and RETURNING * out as a column list),
+-- so each fails with SQLSTATE 42703 and no sign-in or identity link
+-- resolves until the older binary replaces the pod; and a pod that restarts
+-- first applies 000176 again at boot.
+-- Guarded: IF EXISTS, so it also runs when the column is already gone. The
+-- drop is a catalog change: it rewrites nothing, but takes ACCESS EXCLUSIVE
+-- on identities for the file's one implicit transaction, and touches no
+-- other table.
+ALTER TABLE identities DROP COLUMN IF EXISTS email_checked_at;

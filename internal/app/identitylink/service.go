@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -102,6 +103,40 @@ func (r Resolution) NotificationText() string {
 	}
 }
 
+// ProfileEmail is one provider profile-email fetch's answer: the address
+// the provider holds for the identity, and whether the provider vouches for
+// it under §13.2's definition of a verified email for that provider.
+type ProfileEmail struct {
+	// Address is the email; "" when the provider reported none.
+	Address string
+
+	// Verified is true only when the provider vouches for Address under
+	// §13.2's definition for that provider. For Slack that is
+	// slackapi.UserEmail.Verified: Slack reports the email as confirmed,
+	// for a full member of this installation's own workspace. For Linear
+	// it is any email Linear returns for the user. Resolve links an
+	// identity automatically only on a Verified email, and AutoLink stores
+	// Verified as identities.email_verified, never more.
+	Verified bool
+}
+
+// autoLinkUnchecked reports whether i is an automatic link
+// (linked_via=auto_email) that nothing has confirmed under §13.2's
+// definition of a verified email: one whose email is not verified, or a
+// Slack one with no email_checked_at -- made by a binary that took any
+// Slack profile email as verified (migrations/000176). Such a link is not
+// used: LookupLinkedUserID reads it as not linked, Resolve re-checks it
+// before resolving it to anyone, and its email is not evidence for
+// MatchUserIDs (queries/identities.sql's ListVerifiedIdentityUserIDsByEmail
+// and DeleteUncheckedAutoLinkedIdentity name the same rows). A link a
+// person or an admin made (linked_via prompt or admin) is never unchecked.
+func autoLinkUnchecked(i sqlcgen.Identity) bool {
+	if i.LinkedVia != sqlcgen.IdentityLinkedViaAutoEmail {
+		return false
+	}
+	return !i.EmailVerified || (i.Provider == sqlcgen.IdentityProviderSlack && !i.EmailCheckedAt.Valid)
+}
+
 // LookupLinkedUserID performs the SAME existing-identity lookup Resolve's
 // own internal fast path (below) does, but is EXPORTED for a caller that
 // wants to pre-check BEFORE spending a provider profile-email fetch it
@@ -114,7 +149,9 @@ func (r Resolution) NotificationText() string {
 // Returns (userID, true, nil) on a hit (this (provider, externalID) is
 // already linked -- userID is who to), (pgtype.UUID{}, false, nil) on a
 // definitive miss (pgx.ErrNoRows -- not linked, the caller should proceed
-// with its own fetch+Resolve exactly as before this pre-check existed), or
+// with its own fetch+Resolve exactly as before this pre-check existed) and
+// on an automatic link awaiting its re-check (autoLinkUnchecked: not used
+// until Resolve, given the email the caller then fetches, confirms it), or
 // (pgtype.UUID{}, false, err) on any OTHER lookup error -- deliberately NOT
 // collapsed into "not linked": a transient DB error is not evidence of
 // anything about this identity's link state, so every current caller
@@ -126,7 +163,10 @@ func LookupLinkedUserID(ctx context.Context, deps Deps, provider sqlcgen.Identit
 	if err != nil {
 		return pgtype.UUID{}, false, err
 	}
-	return existing.UserID, found, nil
+	if !found || autoLinkUnchecked(existing) {
+		return pgtype.UUID{}, false, nil
+	}
+	return existing.UserID, true, nil
 }
 
 // lookupExistingIdentity is Resolve's own fast-path lookup AND
@@ -150,19 +190,35 @@ func lookupExistingIdentity(ctx context.Context, deps Deps, provider sqlcgen.Ide
 // already-fetched-and-retried provider profile email (see that doc
 // comment for why fetching itself is not this function's job).
 //
+// Only a Verified email links an identity automatically: an email the
+// provider does not vouch for (for Slack, one Slack does not report as
+// confirmed for a full member of this workspace) skips the match entirely
+// and gets the link prompt, the account-link flow, exactly as zero matches
+// do. An already-linked identity resolves at once, unless it is an
+// automatic link awaiting its re-check (autoLinkUnchecked), which
+// recheckAutoLink settles first on this same email.
+//
 // Kept as a SAFETY NET even though every current caller now pre-checks via
 // LookupLinkedUserID above before ever fetching (see that function's own
 // doc comment): a future caller that forgets to pre-check still gets the
 // exact same correct fast-path outcome here, just without the fetch having
 // been skipped -- belt and braces, one indexed lookup, deliberately never
 // removed.
-func Resolve(ctx context.Context, deps Deps, provider sqlcgen.IdentityProvider, externalID, email string, emailOK bool) (Resolution, error) {
+func Resolve(ctx context.Context, deps Deps, provider sqlcgen.IdentityProvider, externalID string, email ProfileEmail, emailOK bool) (Resolution, error) {
 	existing, found, err := lookupExistingIdentity(ctx, deps, provider, externalID)
 	if err != nil {
 		return Resolution{}, fmt.Errorf("identitylink: look up existing identity: %w", err)
 	}
 	if found {
-		return Resolution{UserID: existing.UserID}, nil
+		if !autoLinkUnchecked(existing) {
+			return Resolution{UserID: existing.UserID}, nil
+		}
+		res, settled, err := recheckAutoLink(ctx, deps, existing, email, emailOK)
+		if err != nil || settled {
+			return res, err
+		}
+		// The unchecked link is gone: this identity is unlinked, and the
+		// algorithm below runs on the email just fetched.
 	}
 
 	if !emailOK {
@@ -174,7 +230,15 @@ func Resolve(ctx context.Context, deps Deps, provider sqlcgen.IdentityProvider, 
 		return Resolution{}, nil
 	}
 
-	matchedUserIDs, err := MatchUserIDs(ctx, deps, email)
+	if !email.Verified {
+		// §13.2: an email the provider does not vouch for links nothing
+		// automatically -- never matched, never stored as verified. The
+		// link prompt is the way to link it, the same outcome (and the
+		// same notice) as an email that matches no one.
+		return createOrReuseLinkPrompt(ctx, deps, provider, externalID)
+	}
+
+	matchedUserIDs, err := MatchUserIDs(ctx, deps, email.Address)
 	if err != nil {
 		return Resolution{}, fmt.Errorf("identitylink: match user ids: %w", err)
 	}
@@ -189,6 +253,109 @@ func Resolve(ctx context.Context, deps Deps, provider sqlcgen.IdentityProvider, 
 	}
 
 	return createOrReuseLinkPrompt(ctx, deps, provider, externalID)
+}
+
+// recheckAutoLink settles existing, an automatic link awaiting its re-check
+// (autoLinkUnchecked), on the email the caller has just fetched for it.
+// settled=false means the link is gone and Resolve carries on as for an
+// unlinked identity; otherwise res is Resolve's answer.
+//
+//   - No email learned (emailOK false: the fetch failed, or the provider
+//     showed none): nothing is decided. The link is neither kept nor
+//     removed, and resolves to no one for this event; the next event
+//     re-checks it.
+//   - The provider vouches for the same email (Verified, equal regardless
+//     of case, as matching compares it): the link is kept and stamped
+//     (ConfirmAutoLinkEmail), and resolves as before.
+//   - Anything else -- the email is not verified, or it is no longer the
+//     email the link was made on: the link is removed (revokeAutoLink),
+//     audited, and the identity goes through the algorithm again, which
+//     links it automatically only on a verified email that matches
+//     exactly one user, and otherwise sends the link prompt.
+//
+// Only an automatic link is ever re-checked or removed: a link a person
+// confirmed through the link prompt, or one an admin made, is never
+// unchecked (autoLinkUnchecked), and both store calls are scoped to
+// linked_via auto_email in SQL too. When either store call finds the row
+// already changed by a concurrent event, the identity is looked up again:
+// a confirmed link resolves, one still unchecked resolves to no one for
+// this event, and a removed one leaves the identity unlinked.
+func recheckAutoLink(ctx context.Context, deps Deps, existing sqlcgen.Identity, email ProfileEmail, emailOK bool) (Resolution, bool, error) {
+	if !emailOK {
+		return Resolution{}, true, nil
+	}
+
+	if email.Verified && existing.Email != nil && strings.EqualFold(*existing.Email, email.Address) {
+		confirmed, err := deps.Identities.ConfirmAutoLinkEmail(ctx, existing.ID)
+		if err != nil {
+			return Resolution{}, true, fmt.Errorf("identitylink: confirm automatic link: %w", err)
+		}
+		if confirmed == 1 {
+			return Resolution{UserID: existing.UserID}, true, nil
+		}
+	} else {
+		reason := "email_not_verified"
+		if email.Verified {
+			reason = "email_changed"
+		}
+		revoked, err := revokeAutoLink(ctx, deps, existing, reason)
+		if err != nil {
+			return Resolution{}, true, err
+		}
+		if revoked {
+			return Resolution{}, false, nil
+		}
+	}
+
+	again, found, err := lookupExistingIdentity(ctx, deps, existing.Provider, existing.ExternalID)
+	if err != nil {
+		return Resolution{}, true, fmt.Errorf("identitylink: look up identity again after re-check: %w", err)
+	}
+	switch {
+	case !found:
+		return Resolution{}, false, nil
+	case autoLinkUnchecked(again):
+		return Resolution{}, true, nil
+	default:
+		return Resolution{UserID: again.UserID}, true, nil
+	}
+}
+
+// revokeAutoLink removes existing, an automatic link whose re-check failed,
+// with its identity.auto_link_revoked audit entry, in ONE transaction
+// (§13.3) -- the entry names the user the identity was linked to and why
+// (reason), so the removal is never silent. Reports whether it removed the
+// row: DeleteUncheckedAutoLink deletes only a row that is still an
+// unchecked automatic link, so a concurrent event that confirmed or
+// removed it first leaves nothing here to remove, and no entry is written.
+func revokeAutoLink(ctx context.Context, deps Deps, existing sqlcgen.Identity, reason string) (bool, error) {
+	tx, err := deps.Pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("identitylink: begin revoke tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	deleted, err := deps.Identities.WithTx(tx).DeleteUncheckedAutoLink(ctx, existing.ID)
+	if err != nil {
+		return false, fmt.Errorf("identitylink: delete unchecked automatic link: %w", err)
+	}
+	if deleted == 0 {
+		return false, nil
+	}
+
+	if err := auditlog.Record(ctx, deps.AuditLog.WithTx(tx), pgtype.UUID{}, "identity.auto_link_revoked", "identity", existing.ID.String(), map[string]any{
+		"provider":    string(existing.Provider),
+		"external_id": existing.ExternalID,
+		"user_id":     existing.UserID.String(),
+		"reason":      reason,
+	}); err != nil {
+		return false, fmt.Errorf("identitylink: record audit log: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return false, fmt.Errorf("identitylink: commit revoke tx: %w", err)
+	}
+	return true, nil
 }
 
 // MatchUserIDs runs §13.2 step 2's own two lookups (users.primary_email,
@@ -228,6 +395,8 @@ func MatchUserIDs(ctx context.Context, deps Deps, email string) ([]string, error
 		return nil, fmt.Errorf("get user by primary email: %w", err)
 	}
 
+	// An automatic link awaiting its re-check (autoLinkUnchecked) is left
+	// out by the query itself: its email is no evidence until confirmed.
 	byVerifiedIdentity, err := deps.Identities.ListVerifiedUserIDsByEmail(ctx, email)
 	if err != nil {
 		return nil, fmt.Errorf("list verified identity user ids by email: %w", err)
@@ -255,19 +424,20 @@ func MatchUserIDs(ctx context.Context, deps Deps, email string) ([]string, error
 // a verified email merges onto the same user row exactly like an
 // unrecognized Slack/Linear identity already does (§13.2 step 3).
 //
-// email_verified=true: unlike GitHub's /user/emails (githubUser's own doc
-// comment, internal/adapters/inbound/auth/callback.go), Slack/Linear's own
-// profile-email APIs carry no separate "verified" flag at all -- both
-// require the REQUESTING workspace/app's own already-authenticated
-// installation to read them in the first place (never attacker-supplied,
-// unlike e.g. a user-entered email field), so this codebase treats a
-// value fetched this way as verified for identities.email_verified's own
-// purpose ("attested by the provider", not "independently re-verified by
-// this codebase") -- the SAME standard GetByProviderAndExternalID's own
-// GitHub-originated rows already apply. The OIDC caller's own email is
-// ALREADY independently verified (the ID token's own email_verified
-// claim, checked before this is ever called) -- so this parameter is
-// correct for that caller too, not merely reused loosely.
+// email.Verified is stored as identities.email_verified exactly as the
+// caller attests it, never assumed: "verified" means the provider vouches
+// for the email under §13.2's definition for that provider, and only a
+// verified email is evidence for matching another identity (MatchUserIDs)
+// or leaves this link usable (autoLinkUnchecked). Resolve passes only a
+// Verified email -- for Slack, one Slack reports as confirmed, for a full
+// member of this workspace (slackapi.UserEmail.Verified); for Linear, the
+// email Linear returns for the user. The GitHub callback passes its
+// verified primary email (githubUser's own doc comment, internal/adapters/
+// inbound/auth/callback.go), the OIDC callback an email whose ID token
+// carries email_verified true (checked before this is ever called). A
+// Verified email is also stamped email_checked_at, which tells a Slack
+// automatic link made under §13.2's Slack definition from one an older
+// binary made without it (migrations/000176).
 //
 // accessTokenEncrypted is nil for every caller except the GitHub-side
 // first-time merge (resolveFirstTimeIdentity's own encryptedToken
@@ -291,10 +461,15 @@ func MatchUserIDs(ctx context.Context, deps Deps, email string) ([]string, error
 // fabricated "system user" row; the matched user's own id is still
 // recorded, in detail_json, for a reader of the audit log to see exactly
 // who was linked.
-func AutoLink(ctx context.Context, deps Deps, provider sqlcgen.IdentityProvider, externalID, email, matchedUserIDStr string, accessTokenEncrypted []byte) (Resolution, error) {
+func AutoLink(ctx context.Context, deps Deps, provider sqlcgen.IdentityProvider, externalID string, email ProfileEmail, matchedUserIDStr string, accessTokenEncrypted []byte) (Resolution, error) {
 	var matchedUserID pgtype.UUID
 	if err := matchedUserID.Scan(matchedUserIDStr); err != nil {
 		return Resolution{}, fmt.Errorf("identitylink: parse matched user id: %w", err)
+	}
+
+	var emailCheckedAt pgtype.Timestamptz
+	if email.Verified {
+		emailCheckedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
 	}
 
 	tx, err := deps.Pool.Begin(ctx)
@@ -307,10 +482,11 @@ func AutoLink(ctx context.Context, deps Deps, provider sqlcgen.IdentityProvider,
 		UserID:               matchedUserID,
 		Provider:             provider,
 		ExternalID:           externalID,
-		Email:                &email,
-		EmailVerified:        true,
+		Email:                &email.Address,
+		EmailVerified:        email.Verified,
 		LinkedVia:            sqlcgen.IdentityLinkedViaAutoEmail,
 		AccessTokenEncrypted: accessTokenEncrypted,
+		EmailCheckedAt:       emailCheckedAt,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -325,6 +501,12 @@ func AutoLink(ctx context.Context, deps Deps, provider sqlcgen.IdentityProvider,
 			winner, getErr := deps.Identities.GetByProviderAndExternalID(ctx, provider, externalID)
 			if getErr != nil {
 				return Resolution{}, fmt.Errorf("identitylink: resolve winner after lost auto-link race: %w", getErr)
+			}
+			if autoLinkUnchecked(winner) {
+				// The winner is an automatic link nothing has confirmed
+				// (an older binary's, during a rollout): not used until a
+				// later event re-checks it.
+				return Resolution{}, nil
 			}
 			return Resolution{UserID: winner.UserID}, nil
 		}
