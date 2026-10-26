@@ -125,6 +125,22 @@ SET opencode_conversation_id = NULL
 WHERE id = $1
   AND opencode_conversation_id IS NOT NULL;
 
+-- name: ReseatSessionConversationID :execrows
+-- Names, for the session's next prompts, the agent-runtime conversation a
+-- restored snapshot holds (technical plan §35.5): the claim that restores
+-- a snapshot whose conversation was recorded at its mint
+-- (sandboxes.snapshot_conversation_id, keyed by the snapshot's id) calls
+-- it in its own transaction, so a restore after a fresh spawn forgot the
+-- id -- or after a fresh lineage recorded one of its own -- names the
+-- conversation the restored runtime holds. NULL when the snapshot was
+-- minted under none. updated_at is left as it is, as
+-- ClearSessionConversationID leaves it. Reports the rows it wrote: 0 when
+-- the session already named that conversation.
+UPDATE sessions
+SET opencode_conversation_id = sqlc.narg('conversation_id')
+WHERE id = sqlc.arg('id')
+  AND opencode_conversation_id IS DISTINCT FROM sqlc.narg('conversation_id');
+
 -- name: UpdateSessionIntentDecisionIfNull :execrows
 -- §8.3's ("intent classifier", §18.4) write-once guarded update:
 -- "UPDATE sessions SET intent_decision = ... WHERE intent_decision IS

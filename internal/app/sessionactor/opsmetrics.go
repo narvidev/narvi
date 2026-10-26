@@ -257,8 +257,10 @@ type opsMetrics struct {
 	// restoreConversation is sandbox_restore_conversation_total: one per
 	// restore, once its claim has committed, tagged outcome=held|differs|
 	// none|unknown -- how the conversation its snapshot was minted under
-	// compares with the one its prompts name (technical plan §35.5,
-	// snapshotrestore.go). Counted, never acted on.
+	// compares with the one its prompts named when the claim began
+	// (technical plan §35.5, snapshotrestore.go). The claim then makes
+	// them name the snapshot's when one was recorded for it; no outcome is
+	// otherwise acted on.
 	restoreConversation metric.Int64Counter
 
 	// runwayGate is sandbox_runway_gate_total: one per decision of the
@@ -475,7 +477,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	restoreConversation, err := meter.Int64Counter(
 		"sandbox_restore_conversation_total",
-		metric.WithDescription("Restores of a sandbox snapshot (technical plan §35.5), by how the agent runtime conversation the session held when the snapshot was recorded compares with the one the restored sandbox's prompts name: held (the same conversation); differs (another one, one while the prompts name none, or none while they name one -- the agent may not hold its context, and the WARN line logged with it names the snapshot and both ids); none (neither names one); unknown (nothing recorded for the snapshot: one recorded before the record existed, or by a control plane that predates it; logged at INFO). Counted once the claim has committed. Instrumented only: no outcome refuses a restore, writes a warning or carries a recap."),
+		metric.WithDescription("Restores of a sandbox snapshot (technical plan §35.5), by how the agent runtime conversation the session held when the snapshot was recorded compares with the one the restored sandbox's prompts name: held (the same conversation); differs (another one, one while the prompts name none, or none while they name one -- the claim then makes the prompts name the snapshot's conversation, and the WARN line logged with it names the snapshot and both ids); none (neither names one); unknown (nothing recorded for the snapshot: one recorded before the record existed, or by a control plane that predates it; logged at INFO). Every outcome but unknown leaves the prompts naming the conversation recorded for the snapshot. Counted once the claim has committed. No outcome refuses a restore, writes a warning or carries a recap."),
 		metric.WithUnit("{restore}"),
 	)
 	if err != nil {

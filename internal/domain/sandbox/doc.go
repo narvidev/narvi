@@ -33,8 +33,9 @@
 //     announced or carried from a replaced gen still awaiting its recap.
 //   - The restore-conversation classification (ClassifyRestoreConversation,
 //     restoreconversation.go; §35.5): whether a restored snapshot was
-//     minted under the conversation its prompt will name -- held, differs,
-//     none or unknown -- counted, never acted on.
+//     minted under the conversation the session's prompts named -- held,
+//     differs, none or unknown -- counted; the caller then names the
+//     snapshot's conversation whenever one was recorded for it.
 //
 // Every function here is pure per §11: no I/O, no time.Now(), no
 // randomness. Anything needing "the current time" takes it as an explicit

@@ -1,15 +1,16 @@
 package sandbox
 
 // A restore brings back the snapshot's filesystem, the agent runtime's own
-// session storage among it, and the prompt the restored gen is sent names
-// the conversation the session recorded last (technical plan §3.3, §35.5).
-// Nothing checks that the snapshot holds that conversation: the runtime
-// adapter echoes the id it is sent. A restore whose snapshot was minted
-// under another conversation, or under none, loses the agent's context as
-// a fresh lineage does, yet keeps its filesystem, so it is not one, and
-// ships no recap. §35.5 instruments that case before any decision to widen
-// the recap to it: ClassifyRestoreConversation says which case a restore
-// is, and its caller only counts it.
+// session storage among it (technical plan §3.3, §35.5). Nothing checks
+// that the snapshot holds the conversation the session recorded last: the
+// runtime adapter echoes the id it is sent. ClassifyRestoreConversation
+// says how the two compare when the restore is claimed, and its caller
+// counts it; when the snapshot's own conversation was recorded at its
+// mint, the caller then makes the restored gen's prompts name that one,
+// the conversation the restored runtime holds. A restore whose snapshot's
+// conversation was not recorded keeps naming the session's, and ships no
+// recap: it keeps its filesystem, so it is no fresh lineage. §35.5
+// instruments it before any decision to widen the recap to it.
 
 // RestoreConversation is how the conversation a restored snapshot was
 // minted under compares with the one the session's next prompt names. The

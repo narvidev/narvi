@@ -25,8 +25,10 @@ import (
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/continuity"
 	plandomain "github.com/narvidev/narvi/internal/domain/plan"
+	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/sandbox"
 	"github.com/narvidev/narvi/internal/domain/turn"
+	domainupload "github.com/narvidev/narvi/internal/domain/upload"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -920,6 +922,104 @@ func TestFreshLineage_ReenqueuedTurnCarriesItsOwnEarlierAttempt(t *testing.T) {
 	}
 }
 
+// sandboxAgentPlaceholderTokens are the tokens the sandbox agent replaces
+// with live values over a prompt's whole text, one per replacement of each
+// of its render passes (cmd/sandbox-agent: renderVerdictToolPromptText,
+// renderUploadToolPromptText, renderEpistemicOutcomeToolPromptText,
+// renderReviewCostBudgetToolPromptText,
+// renderCompositionFindingsToolPromptText).
+var sandboxAgentPlaceholderTokens = []string{
+	review.VerdictToolURLPlaceholder, review.VerdictToolBearerPlaceholder, review.VerdictToolGenPlaceholder,
+	review.VerdictToolDispatchMessageIDPlaceholder,
+	domainupload.BaseURLPlaceholder, domainupload.BearerPlaceholder, domainupload.GenPlaceholder,
+	turn.EpistemicOutcomeToolURLPlaceholder, turn.EpistemicOutcomeToolBearerPlaceholder, turn.EpistemicOutcomeToolGenPlaceholder,
+	review.ReviewCostBudgetToolURLPlaceholder,
+	review.CompositionFindingsToolURLPlaceholder, review.CompositionFindingsToolBearerPlaceholder, review.CompositionFindingsToolGenPlaceholder,
+}
+
+// TestFreshLineage_RecapCarriesNoPlaceholderToken: the recap strips every
+// placeholder token the sandbox agent substitutes from every excerpt it
+// quotes -- an earlier request, an earlier report and the interrupted
+// attempt -- like every other path that quotes text into a prompt, so the
+// prompt the fresh gen is sent carries none of them for the agent to
+// replace with live values.
+func TestFreshLineage_RecapCarriesNoPlaceholderToken(t *testing.T) {
+	ctx := context.Background()
+	carrying := func(what string) string {
+		var b strings.Builder
+		for _, tok := range sandboxAgentPlaceholderTokens {
+			b.WriteString(what + " mentions " + tok + ".\n")
+		}
+		return b.String()
+	}
+	rig := newLineageRig(ctx, t, lineageRigOptions{})
+	rig.runTurn(ctx, t, 1, carrying("The request"), carrying("The report"))
+	inFlight := rig.queue(ctx, t, "carry on with the review")
+	rig.stream(ctx, t, 1, carrying("The attempt"))
+	rig.setStatus(ctx, t, sqlcgen.SandboxStatusFailed)
+	settle(ctx, t, rig.actor)
+	waitForConnecting(ctx, t, rig.pool, rig.sessionID)
+	rig.bootGen(ctx, t, 2, false)
+
+	p := rig.commander.lastPrompt(t)
+	recap := recapOf(t, p, "carry on with the review")
+	for _, what := range []string{"> The request mentions .", "> The report mentions .", "> The attempt mentions ."} {
+		if !strings.Contains(recap, what) {
+			t.Errorf("recap:\n%s\nwant the excerpt %q kept, its token stripped", recap, what)
+		}
+	}
+	for _, tok := range sandboxAgentPlaceholderTokens {
+		if strings.Contains(p.Text, tok) {
+			t.Errorf("the prompt to the fresh gen carries %s", tok)
+		}
+	}
+	if stored := rig.turn(ctx, t, inFlight.ID); strings.Contains(stringOrEmpty(stored.ContinuityRecap), "{{") {
+		t.Errorf("the stored recap carries a token: %q", shortened(stringOrEmpty(stored.ContinuityRecap)))
+	}
+}
+
+// TestFreshLineage_RecapQuotesThePersonsRequest: a turn's stored prompt
+// can open with the control plane's own instructions -- the
+// structured-plan instruction on a plan-mode turn, the epistemic preamble
+// on a build turn when the check is on, each longer than a request
+// excerpt -- or wrap a lane's own text in the review context composed
+// around it; the recap quotes the request the person made, never the
+// instructions or the context.
+func TestFreshLineage_RecapQuotesThePersonsRequest(t *testing.T) {
+	const asked = "Design a retry for the CSV importer: at most 3 attempts, never retry a 4xx."
+	for _, tc := range []struct {
+		name, prompt, injected, requestText string
+	}{
+		{name: "a plan-mode turn", prompt: plandomain.MaybeInjectStructureInstruction(true, asked), injected: plandomain.RenderStructureInstruction()},
+		{name: "a build turn with the epistemic check on", prompt: turn.MaybeInjectEpistemicPreamble(true, nil, false, asked), injected: turn.RenderEpistemicPreamble()},
+		{name: "a lane's own text", prompt: "Review context composed around the request.\n" + asked, injected: "Review context composed around the request.", requestText: asked},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			rig := newLineageRig(ctx, t, lineageRigOptions{})
+			earlier := rig.runTurn(ctx, t, 1, tc.prompt, "Proposed a retry with a capped backoff.")
+			if tc.requestText != "" {
+				if _, err := rig.pool.Exec(ctx, `UPDATE turns SET request_text = $2 WHERE id = $1`, earlier.ID, tc.requestText); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rig.setStatus(ctx, t, sqlcgen.SandboxStatusFailed)
+			rig.respawn(ctx, t, "add a test for the 4xx case")
+			rig.bootGen(ctx, t, 2, false)
+
+			recap := recapOf(t, rig.commander.lastPrompt(t), "add a test for the 4xx case")
+			want := "\nTurn 1 (completed)\n" + continuity.LineRequest + "\n> " + asked + "\n" + continuity.LineReport + "\n"
+			if !strings.Contains(recap, want) {
+				t.Fatalf("recap:\n%s\nwant the person's request quoted whole: %q", recap, want)
+			}
+			first, _, _ := strings.Cut(tc.injected, "\n")
+			if strings.Contains(recap, first) {
+				t.Fatalf("recap quotes the injected instructions:\n%s", recap)
+			}
+		})
+	}
+}
+
 // TestFreshLineage_ReenqueueToARestoredGen_NoRecap: a turn that carried a
 // recap to a fresh gen, re-sent to a gen restored after it, carries none:
 // the stored recap was built for the gen it was sent to, and the restored
@@ -1106,6 +1206,27 @@ func TestFreshLineage_MarkClearedOnlyWhenThePromptReachesTheSandbox(t *testing.T
 		rig.assertUnmarked(ctx, t, 2)
 	})
 
+	// The agent's own execution_complete is evidence too, cleared before
+	// it completes the turn: a prompt the runtime ends at once sends
+	// nothing else.
+	t.Run("IncapableGen_ClearedByAnExecutionCompleteAlone", func(t *testing.T) {
+		ctx := context.Background()
+		rig := setUp(ctx, t)
+		third := rig.respawn(ctx, t, "and add a jitter")
+		rig.bootGen(ctx, t, 2, false)
+		recapOf(t, rig.commander.lastPrompt(t), "and add a jitter")
+		rig.assertMarked(ctx, t, 2)
+		deliver(ctx, t, rig.actor, completedEvent(2))
+		rig.assertUnmarked(ctx, t, 2)
+		if stored := rig.turn(ctx, t, third.ID); stored.Status != sqlcgen.TurnStatusCompleted {
+			t.Fatalf("recap turn %s after its execution_complete, want completed", stored.Status)
+		}
+		rig.queue(ctx, t, "and document it")
+		if p := rig.commander.lastPrompt(t); p.Text != "and document it" {
+			t.Fatalf("the next turn's prompt text %q, want the request alone: no second recap", shortened(p.Text))
+		}
+	})
+
 	t.Run("BootFramesNeverClearIt", func(t *testing.T) {
 		ctx := context.Background()
 		rig := setUp(ctx, t)
@@ -1163,6 +1284,156 @@ func TestFreshLineage_MarkClearedOnlyWhenThePromptReachesTheSandbox(t *testing.T
 
 		rig.queue(ctx, t, "carry on instead")
 		recapOf(t, rig.commander.lastPrompt(t), "carry on instead")
+	})
+}
+
+// TestFreshLineage_RestoreAfterAFreshSpawnNamesTheSnapshotsConversation: a
+// fresh spawn forgets the session's conversation but can keep the snapshot
+// it did not restore -- a slow restore given up on, a restore downgraded
+// -- and a later claim can restore that snapshot after all. The restored
+// runtime holds the conversation the snapshot was minted under, recorded
+// with it, and the restored gen's prompts name it: never none, and never
+// one the fresh lineage opened. The restore is not marked and carries no
+// recap. A snapshot whose conversation was not recorded leaves the
+// session naming what it named, none here: nothing says what it holds.
+func TestFreshLineage_RestoreAfterAFreshSpawnNamesTheSnapshotsConversation(t *testing.T) {
+	const (
+		snapshotID   = "snap-of-gen-1"
+		conversation = "conv-of-gen-1"
+	)
+	stuckRestore := `UPDATE sandboxes SET status = 'spawning', snapshot_id = '` + snapshotID + `',
+		created_at = now() - interval '10 minutes', last_seen_at = now() - interval '10 minutes' WHERE session_id = $1`
+	recorded := `UPDATE sandboxes SET snapshot_conversation_id = '` + conversation + `', snapshot_conversation_recorded_id = snapshot_id WHERE session_id = $1`
+	seedWith := func(sqls ...string) func(ctx context.Context, t *testing.T, rig *lineageRig) {
+		return func(ctx context.Context, t *testing.T, rig *lineageRig) {
+			rig.seedEarlierTurn(ctx, t, 1, sqlcgen.TurnStatusCompleted)
+			rig.setConversationID(ctx, t, conversation)
+			for _, sql := range sqls {
+				rig.exec(ctx, t, sql)
+			}
+		}
+	}
+	// restoreGen3 loses gen 2 and lets the next evaluation restore the
+	// kept snapshot as gen 3, then boots it.
+	restoreGen3 := func(ctx context.Context, t *testing.T, rig *lineageRig) {
+		t.Helper()
+		rig.setStatus(ctx, t, sqlcgen.SandboxStatusFailed)
+		settle(ctx, t, rig.actor)
+		waitForConnecting(ctx, t, rig.pool, rig.sessionID)
+		if rig.provider.restoreCallCount() != 1 || string(rig.provider.lastRestoreCall().snapshotID) != snapshotID {
+			t.Fatalf("restores %d, want %s restored once", rig.provider.restoreCallCount(), snapshotID)
+		}
+		rig.assertUnmarked(ctx, t, 3)
+	}
+
+	t.Run("StuckRespawnThenRestore", func(t *testing.T) {
+		ctx := context.Background()
+		rig := newLineageRig(ctx, t, lineageRigOptions{
+			provider: &fakeSpawnProvider{nextErr: &ports.ProviderError{Transient: false, Code: "INVALID_IMAGE", Op: ports.OpCreateSandbox, Err: errors.New("boom")}},
+			seed:     seedWith(stuckRestore, recorded),
+		})
+		rig.queue(ctx, t, "carry on")
+		waitUntil(t, 5*time.Second, func() bool { return rig.sandbox(ctx, t).Status == sqlcgen.SandboxStatusSuspect })
+		rig.assertMarked(ctx, t, 2)
+		if id := rig.conversationID(ctx, t); id != nil {
+			t.Fatalf("conversation %q after the fresh spawn, want none", *id)
+		}
+		rig.provider.mu.Lock()
+		rig.provider.nextErr = nil
+		rig.provider.mu.Unlock()
+
+		restoreGen3(ctx, t, rig)
+		if id := rig.conversationID(ctx, t); stringOrEmpty(id) != conversation {
+			t.Fatalf("the session names %v after the restore, want %s, the snapshot's", id, conversation)
+		}
+		rig.bootGen(ctx, t, 3, false)
+		if p := rig.commander.lastPrompt(t); p.Gen != 3 || stringOrEmpty(p.ConversationId) != conversation || p.Text != "carry on" {
+			t.Fatalf("prompt to gen %d names %v with text %q, want gen 3 naming %s with the request alone", p.Gen, p.ConversationId, shortened(p.Text), conversation)
+		}
+	})
+
+	t.Run("RecapLostThenRestore", func(t *testing.T) {
+		ctx := context.Background()
+		rig := newLineageRig(ctx, t, lineageRigOptions{seed: seedWith(stuckRestore, recorded)})
+		inFlight := rig.respawn(ctx, t, "carry on")
+		rig.bootGen(ctx, t, 2, false)
+		if p := rig.commander.lastPrompt(t); p.ConversationId != nil {
+			t.Fatalf("the fresh gen's prompt names %q, want none", *p.ConversationId)
+		}
+		recapOf(t, rig.commander.lastPrompt(t), "carry on")
+
+		// Gen 2 is lost before any event of the turn: the restore re-sends it.
+		restoreGen3(ctx, t, rig)
+		rig.bootGen(ctx, t, 3, false)
+		p := rig.commander.lastPrompt(t)
+		if p.Gen != 3 || stringOrEmpty(p.ConversationId) != conversation || p.Text != "carry on" {
+			t.Fatalf("re-sent prompt to gen %d names %v with text %q, want gen 3 naming %s with the request alone", p.Gen, p.ConversationId, shortened(p.Text), conversation)
+		}
+		if stored := rig.turn(ctx, t, inFlight.ID); stored.Status != sqlcgen.TurnStatusProcessing || stringOrEmpty(stored.DispatchedMessageID) != p.MessageId {
+			t.Fatalf("turn %s, want processing, re-sent to gen 3", stored.Status)
+		}
+	})
+
+	t.Run("DowngradeThenRestore", func(t *testing.T) {
+		ctx := context.Background()
+		rig := newLineageRig(ctx, t, lineageRigOptions{
+			session: func(ctx context.Context, t *testing.T, pool *pgxpool.Pool) pgtype.UUID {
+				// A repository with no settings resolves shadow (§30.4).
+				return createTestSessionWithRepos(ctx, t, pool, pgtype.UUID{}, "repo", "https://github.com/acme/repo.git", "main")
+			},
+			seed: seedWith(`UPDATE sandboxes SET status = 'stopped', snapshot_id = '`+snapshotID+`' WHERE session_id = $1`, recorded),
+		})
+		// The shadow session's restore is downgraded: gen 2 spawns fresh,
+		// the snapshot kept, and runs a turn under a conversation of its own.
+		rig.respawn(ctx, t, "carry on")
+		if rig.provider.callCount() != 1 || rig.provider.restoreCallCount() != 0 {
+			t.Fatalf("fresh spawns %d, restores %d; want the restore downgraded", rig.provider.callCount(), rig.provider.restoreCallCount())
+		}
+		rig.bootGen(ctx, t, 2, false)
+		opened := "conv-of-gen-2"
+		deliver(ctx, t, rig.actor, SandboxEvent{Type: "heartbeat", Gen: 2, MessageID: "hb-" + uuid.NewString(), ConversationID: &opened,
+			Raw: json.RawMessage(`{"type":"heartbeat","messageId":"hb","sessionId":"s","gen":2,"conversationId":"conv-of-gen-2","lastBootPhase":null}`)})
+		rig.stream(ctx, t, 2, "Carried on.")
+		deliver(ctx, t, rig.actor, completedEvent(2))
+		if id := rig.conversationID(ctx, t); stringOrEmpty(id) != opened {
+			t.Fatalf("the session names %v, want %s, the fresh gen's", id, opened)
+		}
+
+		// The session leaves shadow mode, and gen 2 is lost with no snapshot
+		// of its own: the kept snapshot is restored after all.
+		if _, err := narvipg.NewRepoSettingsStore(rig.pool).UpsertLiveEgressEnabled(ctx, "acme/repo", true); err != nil {
+			t.Fatal(err)
+		}
+		createTurnArmingDispatch(ctx, t, rig.pool, rig.sessionID, "and next")
+		restoreGen3(ctx, t, rig)
+		if id := rig.conversationID(ctx, t); stringOrEmpty(id) != conversation {
+			t.Fatalf("the session names %v after the restore, want %s, the snapshot's", id, conversation)
+		}
+		rig.bootGen(ctx, t, 3, false)
+		if p := rig.commander.lastPrompt(t); p.Gen != 3 || stringOrEmpty(p.ConversationId) != conversation || p.Text != "and next" {
+			t.Fatalf("prompt to gen %d names %v with text %q, want gen 3 naming %s with the request alone", p.Gen, p.ConversationId, shortened(p.Text), conversation)
+		}
+	})
+
+	t.Run("UnrecordedSnapshotNamesWhatTheSessionNames", func(t *testing.T) {
+		ctx := context.Background()
+		rig := newLineageRig(ctx, t, lineageRigOptions{
+			provider: &fakeSpawnProvider{nextErr: &ports.ProviderError{Transient: false, Code: "INVALID_IMAGE", Op: ports.OpCreateSandbox, Err: errors.New("boom")}},
+			seed:     seedWith(stuckRestore),
+		})
+		rig.queue(ctx, t, "carry on")
+		waitUntil(t, 5*time.Second, func() bool { return rig.sandbox(ctx, t).Status == sqlcgen.SandboxStatusSuspect })
+		rig.provider.mu.Lock()
+		rig.provider.nextErr = nil
+		rig.provider.mu.Unlock()
+		restoreGen3(ctx, t, rig)
+		if id := rig.conversationID(ctx, t); id != nil {
+			t.Fatalf("the session names %q after restoring a snapshot with no record, want none, as the fresh spawn left it", *id)
+		}
+		rig.bootGen(ctx, t, 3, false)
+		if p := rig.commander.lastPrompt(t); p.ConversationId != nil || p.Text != "carry on" {
+			t.Fatalf("prompt names %v with text %q, want none and the request alone", p.ConversationId, shortened(p.Text))
+		}
 	})
 }
 

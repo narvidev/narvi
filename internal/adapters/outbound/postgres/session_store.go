@@ -85,6 +85,16 @@ func (s *SessionStore) ClearConversationID(ctx context.Context, id pgtype.UUID) 
 	return n > 0, err
 }
 
+// ReseatConversationID names conversationID -- nil for none -- as the
+// session's agent-runtime conversation when a claim restores a snapshot
+// recorded under it (technical plan §35.5), leaving updated_at as it is,
+// and reports whether it changed. See ReseatSessionConversationID's own
+// generated doc comment.
+func (s *SessionStore) ReseatConversationID(ctx context.Context, id pgtype.UUID, conversationID *string) (bool, error) {
+	n, err := s.q.ReseatSessionConversationID(ctx, sqlcgen.ReseatSessionConversationIDParams{ConversationID: conversationID, ID: id})
+	return n > 0, err
+}
+
 // UpdateIntentDecisionIfNull persists decisionJSON (a marshaled
 // intent.IntentDecisionRecord) via the §18.4 write-once guarded update --
 // "UPDATE sessions SET intent_decision = ... WHERE intent_decision IS
