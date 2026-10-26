@@ -393,6 +393,16 @@ func (n *sentinelAutoFixNotifier) Deliver(ctx context.Context, notification port
 	}
 
 	fix, err := n.sentinelFixes.GetByID(ctx, fixID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The claim is gone: another delivery for it skipped it because
+		// the repository turned the auto-fix off, and released it
+		// (releaseAutoFixClaim), or its origin session was deleted. No
+		// redelivery can bring this id back, so this row ends here, for
+		// good, like that skip; the next qualifying verdict claims afresh.
+		platform.Logger(ctx).Info("outboxworker: sentinelAutoFixNotifier: the fix's claim was released; skipping, never retried",
+			"repo", payload.RepoFullName, "origin_pr_number", payload.OriginPRNumber, "sentinel_fix_id", payload.SentinelFixID)
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: get sentinel_fixes row: %w", err)
 	}
@@ -473,11 +483,11 @@ func (n *sentinelAutoFixNotifier) Deliver(ctx context.Context, notification port
 		// below makes the first GitHub call and creates the branch.
 		//
 		// A missing row is a confirmed off, like a row with the toggle
-		// off: recordAutoFixDisabled ends this row for good, consuming
-		// nothing -- no branch, no session, no claim, every addressed
-		// finding left 'open'. Turning the toggle back on does not revive
-		// it; the next qualifying verdict enqueues a fresh row against the
-		// same unspawned claim (reviewverdict.go). Any other read error is
+		// off: releaseAutoFixClaim ends this row for good -- no branch
+		// created, no session, every addressed finding left 'open', the
+		// claim released so nothing reads as a fix in flight. Turning the
+		// toggle back on does not revive it; the next qualifying verdict
+		// claims afresh (reviewverdict.go). Any other read error is
 		// uncertain, never taken for either answer: returned, so the
 		// outbox retries the delivery.
 		//
@@ -490,10 +500,10 @@ func (n *sentinelAutoFixNotifier) Deliver(ctx context.Context, notification port
 		switch {
 		case err == nil:
 			if !settings.SentinelAutofixEnabled {
-				return n.recordAutoFixDisabled(ctx, payload, fix.ID.String())
+				return n.releaseAutoFixClaim(ctx, payload, fix.ID)
 			}
 		case errors.Is(err, pgx.ErrNoRows):
-			return n.recordAutoFixDisabled(ctx, payload, fix.ID.String())
+			return n.releaseAutoFixClaim(ctx, payload, fix.ID)
 		default:
 			return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: read repo settings: %w", err)
 		}
@@ -593,31 +603,73 @@ func (n *sentinelAutoFixNotifier) recordShortCircuit(ctx context.Context, payloa
 	return nil
 }
 
-// recordAutoFixDisabled ends a delivery whose repository has the sentinel
-// auto-fix turned off (Deliver's toggle read): one audit_log row,
-// sentinel_fix.spawn_skipped on the claim (sentinelFixID, the
-// sentinel_fixes row the payload names), actor NULL -- the record the
-// sentinel path already keeps for the merge gate's own decisions
-// (sentinel_fix.merge_gate_evaluated, §17.5), so a person reading the
-// audit log sees why no fix followed the finding -- and one Info line.
+// releaseAutoFixClaim ends a delivery whose repository has the sentinel
+// auto-fix turned off (Deliver's toggle read), in one transaction:
 //
-// Returns nil on a recorded skip, so the outbox marks the row delivered
-// and never retries it. A failed audit write is returned instead, as
-// recordShortCircuit returns a failed ledger write: the outbox retries the
-// whole delivery, which reads the toggle again, and nothing has happened
-// yet.
-func (n *sentinelAutoFixNotifier) recordAutoFixDisabled(ctx context.Context, payload ports.SentinelAutoFixPayload, sentinelFixID string) error {
-	if err := auditlog.Record(ctx, n.auditLog, pgtype.UUID{}, "sentinel_fix.spawn_skipped", "sentinel_fix", sentinelFixID, map[string]any{
+//   - it releases the claim (SentinelFixStore.ReleaseUnspawned): a claim
+//     left 'pending' with nothing coming would read as a fix in flight on
+//     the review readout for as long as the pull request is open, while
+//     every finding it names stays 'open' and its manual apply-suggestion
+//     action available (§17.3). Only a claim still unspawned is released:
+//     one a concurrent delivery spawned under meanwhile keeps its child,
+//     which that delivery records on the findings it names;
+//   - it writes one audit_log row, sentinel_fix.spawn_skipped on the
+//     claim, actor NULL -- the record the sentinel path already keeps for
+//     the merge gate's own decisions (sentinel_fix.merge_gate_evaluated,
+//     §17.5), so a person reading the audit log sees why no fix followed
+//     the finding. It names the fix branch sentinelFixBranchName derives
+//     for the claim: this attempt creates none, but an earlier attempt of
+//     the same delivery that failed after createFixBranch left it in the
+//     repository, unused, and nothing here can tell that from a first
+//     attempt without asking GitHub, which this skip never does. The
+//     branch is not deleted: nothing records the commit this system
+//     created it at, so nothing could tell it from a branch a person has
+//     since pushed to.
+//
+// Then one Info line, and nil, so the outbox marks the row delivered and
+// never retries it. A failure of either write rolls both back and is
+// returned, as recordShortCircuit returns a failed ledger write: the
+// outbox retries the whole delivery, which reads the toggle again, and
+// nothing has happened yet.
+func (n *sentinelAutoFixNotifier) releaseAutoFixClaim(ctx context.Context, payload ports.SentinelAutoFixPayload, sentinelFixID pgtype.UUID) error {
+	branch := sentinelFixBranchName(sentinelFixID.String())
+
+	tx, err := n.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: begin the skip's transaction: %w", err)
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback(ctx)
+		}
+	}()
+
+	released, err := n.sentinelFixes.WithTx(tx).ReleaseUnspawned(ctx, sentinelFixID)
+	if err != nil {
+		return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: release the skipped fix's claim: %w", err)
+	}
+	if err := auditlog.Record(ctx, n.auditLog.WithTx(tx), pgtype.UUID{}, "sentinel_fix.spawn_skipped", "sentinel_fix", sentinelFixID.String(), map[string]any{
 		"repo_full_name":          payload.RepoFullName,
 		"origin_pr_number":        payload.OriginPRNumber,
 		"origin_session":          payload.OriginReviewSessionID,
 		"reason":                  "sentinel_autofix_disabled",
 		"finding_identity_hashes": payload.FindingIdentityHashes,
+		"claim_released":          released > 0,
+		// Present in the repository only if an earlier, failed attempt of
+		// this delivery created it (this function's doc comment).
+		"fix_branch": branch,
 	}); err != nil {
 		return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: record the skipped fix in the audit log: %w", err)
 	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: commit the skip's transaction: %w", err)
+	}
+	committed = true
+
 	platform.Logger(ctx).Info("outboxworker: sentinelAutoFixNotifier: the repository has the sentinel auto-fix turned off; skipping, never retried",
-		"repo", payload.RepoFullName, "origin_pr_number", payload.OriginPRNumber, "sentinel_fix_id", sentinelFixID)
+		"repo", payload.RepoFullName, "origin_pr_number", payload.OriginPRNumber, "sentinel_fix_id", sentinelFixID.String(),
+		"claim_released", released > 0, "fix_branch_if_an_earlier_attempt_created_it", branch)
 	return nil
 }
 
