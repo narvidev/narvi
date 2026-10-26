@@ -402,6 +402,74 @@ func TestSandboxEventsRoundTrip(t *testing.T) {
 		})
 	})
 
+	// Technical plan §35.4: interruption is optional. An end without it
+	// carries no key, so it marshals exactly as before the key existed; an
+	// end the sandbox's stop interrupted carries sandbox_stopping beside
+	// the runtime's own outcome and reason.
+	t.Run("ExecutionComplete_Interruption", func(t *testing.T) {
+		stopping := sandboxws.ExecutionCompleteInterruptionSandboxStopping
+		canceled := "opencode: turn context canceled before completion"
+		failed := "opencode: APIError"
+		for _, tc := range []struct {
+			name         string
+			outcome      sandboxws.ExecutionCompleteOutcome
+			reason       *string
+			interruption *sandboxws.ExecutionCompleteInterruption
+		}{
+			{name: "Absent", outcome: sandboxws.ExecutionCompleteOutcomeCancelled, reason: &canceled},
+			{name: "SandboxStopping_Cancelled", outcome: sandboxws.ExecutionCompleteOutcomeCancelled, reason: &canceled, interruption: &stopping},
+			{name: "SandboxStopping_Failed", outcome: sandboxws.ExecutionCompleteOutcomeFailed, reason: &failed, interruption: &stopping},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				end := sandboxws.ExecutionComplete{
+					Type:         "execution_complete",
+					MessageId:    "e11i",
+					SessionId:    testSessionID,
+					Gen:          2,
+					AckId:        "execution_complete:e11i",
+					Outcome:      tc.outcome,
+					Reason:       tc.reason,
+					Interruption: tc.interruption,
+				}
+				roundTrip(t, sch, end)
+				data, err := json.Marshal(end)
+				if err != nil {
+					t.Fatalf("marshal: %v", err)
+				}
+				if got, want := bytes.Contains(data, []byte(`"interruption"`)), tc.interruption != nil; got != want {
+					t.Fatalf("execution_complete marshals as %s: interruption key present = %v, want %v", data, got, want)
+				}
+			})
+		}
+	})
+
+	// interruption is an open enum for the compatibility grade (contracts/
+	// manifest.json): a later value grades MINOR. This release's schema, and
+	// the decoder generated from it, still know exactly one, which is why the
+	// control plane decodes an execution_complete without the key and reads
+	// it on its own (sessionactor's decodeExecutionComplete and
+	// reportedInterruption): a value a later agent sends must never cost the
+	// frame.
+	t.Run("ExecutionComplete_InterruptionUnknownValueRejectedByThisRelease", func(t *testing.T) {
+		for _, value := range []string{`"sandbox_lifetime"`, `""`, `null`, `1`} {
+			payload := []byte(`{"type":"execution_complete","messageId":"e11u","sessionId":"` + testSessionID +
+				`","gen":2,"ackId":"execution_complete:e11u","outcome":"cancelled","reason":null,"interruption":` + value + `}`)
+			if err := validateJSON(t, sch, payload); err == nil {
+				t.Fatalf("expected interruption %s to fail validation, got nil error", value)
+			}
+			if value == `null` {
+				// encoding/json leaves a pointer nil on a null without
+				// calling the generated UnmarshalJSON, so only the schema
+				// refuses this one.
+				continue
+			}
+			var event sandboxws.ExecutionComplete
+			if err := json.Unmarshal(payload, &event); err == nil {
+				t.Fatalf("expected interruption %s to fail the generated decode, got nil error", value)
+			}
+		}
+	})
+
 	t.Run("PushComplete", func(t *testing.T) {
 		roundTrip(t, sch, sandboxws.PushComplete{
 			Type:      "push_complete",
