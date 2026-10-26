@@ -3402,10 +3402,11 @@ sandbox_secrets(id, scope sandbox_secret_scope ENUM('automation','environment','
   through the provider API; never written inside any repo working tree (so never committable);
   never logged. The residual risk that an agent *writes* a secret value into code it then pushes
   is shared with every secrets mechanism in every CI system; output redaction is possible future
-  work, not claimed here. **Amended (Step 256):** reopened for the stored transcript only: the
-  sandbox agent masks every value it injected in the events it sends, so a secret the agent prints
-  or reads never reaches the timeline or a transcript; what the agent writes into code it pushes is
-  unchanged.
+  work, not claimed here. **Amended (Step 256):** reopened for the stored transcript only, and
+  best-effort: the sandbox agent masks, in the events it sends, the exact values it injected, and
+  each line of a multi-line value above a line floor. A transformed, partial or short form of a
+  value (encoded, split, cut below the floor) is not recognized and can still reach the timeline
+  and a transcript. What the agent writes into code it pushes is unchanged.
 - **A third source landed on this same injection path** (§8 item 4, "automation env vars reach
   the process, not just the prompt"): `automations.env_vars` — plain, non-secret config a
   maintainer typed, distinct from this section's own `sandbox_secrets` table — is now ALSO
