@@ -9,6 +9,7 @@ import (
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/turn"
 )
 
 // These three tests exercise Finding 5's own three real return paths that
@@ -137,7 +138,10 @@ func TestStartTurn_WaitForTurnCtxDoneEmitsCancelledTerminalEvent(t *testing.T) {
 // assertSingleCancelledExecutionComplete asserts events contains EXACTLY
 // one ExecutionComplete, that it is the LAST event, that its outcome is
 // Cancelled, and that it carries a non-nil, non-empty reason (Finding 5's
-// own "clear, honest reason string" requirement).
+// own "clear, honest reason string" requirement) -- exactly
+// turn.LegacyInterruptionReason, the text the control plane reads as an
+// older agent's report that its process was told to stop (technical plan
+// §35.4), on every one of the three paths.
 func assertSingleCancelledExecutionComplete(t *testing.T, events []ports.AgentEvent) {
 	t.Helper()
 
@@ -164,5 +168,67 @@ func assertSingleCancelledExecutionComplete(t *testing.T, events []ports.AgentEv
 	}
 	if final.Reason == nil || *final.Reason == "" {
 		t.Error("execution_complete.Reason is nil/empty, want a clear, honest reason string")
+	} else if *final.Reason != turn.LegacyInterruptionReason {
+		t.Errorf("execution_complete.Reason = %q, want turn.LegacyInterruptionReason %q", *final.Reason, turn.LegacyInterruptionReason)
+	}
+}
+
+// TestFinalizeCanceled_ReasonIsTheLegacyInterruptionText pins the runtime
+// adapter's cancellation text to the one the control plane compares whole
+// (turn.LegacyInterruptionReason, technical plan §35.4): finalizeCanceled
+// writes it on every path that ends a turn because the context it was
+// started with -- the agent process's -- was cancelled, and an agent that
+// predates the typed interruption key reports a stop by this text alone.
+// Snapshots keep such agents alive for as long as their lineage is
+// restored, so the text may never drift from the reader's. The adapter
+// sets no interruption key itself: the agent's sink adds it, so a second
+// runtime adapter gets it without change.
+func TestFinalizeCanceled_ReasonIsTheLegacyInterruptionText(t *testing.T) {
+	t.Parallel()
+	existing := "ses_already_resolved"
+	tests := []struct {
+		name string
+		run  func(a *Adapter, sink ports.EventSink)
+	}{
+		{name: "finalizeCanceled", run: func(a *Adapter, sink ports.EventSink) {
+			a.finalizeCanceled(newTurnState(sandboxws.Prompt{Type: "prompt", MessageId: "m1", SessionId: "sess-1", Gen: 1}, sink))
+		}},
+		{name: "cancelled before the conversation resolves", run: func(a *Adapter, sink ports.EventSink) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_, _ = a.StartTurn(ctx, sandboxws.Prompt{Type: "prompt", MessageId: "m1", SessionId: "sess-1", Gen: 1, Text: "hi"}, sink, nil)
+		}},
+		{name: "cancelled before the prompt is posted", run: func(a *Adapter, sink ports.EventSink) {
+			ctx, cancel := context.WithCancel(context.Background())
+			cancel()
+			_, _ = a.StartTurn(ctx, sandboxws.Prompt{Type: "prompt", MessageId: "m1", SessionId: "sess-1", Gen: 1, Text: "hi", ConversationId: &existing}, sink, nil)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			a := newDispatchTestAdapter(t)
+			sink, events := spyEventSink(t)
+			tc.run(a, sink)
+			var ends []sandboxws.ExecutionComplete
+			for _, e := range events() {
+				if end, ok := e.Payload.(sandboxws.ExecutionComplete); ok {
+					ends = append(ends, end)
+				}
+			}
+			if len(ends) != 1 {
+				t.Fatalf("observed %d execution_complete events, want exactly 1", len(ends))
+			}
+			end := ends[0]
+			if end.Outcome != sandboxws.ExecutionCompleteOutcomeCancelled || end.Reason == nil || *end.Reason != turn.LegacyInterruptionReason {
+				t.Errorf("execution_complete = outcome %q reason %v, want cancelled with turn.LegacyInterruptionReason %q", end.Outcome, end.Reason, turn.LegacyInterruptionReason)
+			}
+			if end.Interruption != nil {
+				t.Errorf("execution_complete.Interruption = %q, want none: the agent's sink sets the key, never the runtime adapter", *end.Interruption)
+			}
+			if got := turn.ReadAgentEnd(turn.AgentEnd{Outcome: string(end.Outcome), Reason: end.Reason}); !got.Interrupted || got.Source != turn.InterruptionSourceLegacyText {
+				t.Errorf("ReadAgentEnd of this end = %+v, want an interruption read from the legacy text", got)
+			}
+		})
 	}
 }
