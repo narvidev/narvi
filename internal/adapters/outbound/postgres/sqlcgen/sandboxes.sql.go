@@ -289,7 +289,7 @@ type ClearSandboxSnapshotParams struct {
 // snapshot never becomes restorable, and a later death of the new gen must
 // not offer it again. The provenance describes the snapshot as well
 // (migrations/000170), so it goes with it, and so does the conversation it
-// was minted under (technical plan §35.5, migrations/000176). Guarded on
+// was minted under (technical plan §35.5, migrations/000177). Guarded on
 // the snapshot the caller decided on, so a snapshot recorded since that
 // decision is never cleared.
 func (q *Queries) ClearSandboxSnapshot(ctx context.Context, arg ClearSandboxSnapshotParams) (int64, error) {
@@ -1775,7 +1775,7 @@ type UpdateSandboxSnapshotIDParams struct {
 // (sandbox.DecideRepoHooksRestore).
 //
 // snapshot_conversation_id and snapshot_conversation_recorded_id
-// (technical plan §35.5, migrations/000176_snapshot_conversation.up.sql)
+// (technical plan §35.5, migrations/000177_snapshot_conversation.up.sql)
 // record the conversation the snapshot was minted under: the session's
 // opencode_conversation_id as this statement reads it -- the one the
 // runtime last reported, NULL when none was -- keyed by the snapshot's id,

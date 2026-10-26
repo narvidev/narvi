@@ -52,10 +52,10 @@
 --
 -- # Rolling back
 --
--- The previous binary cannot boot on 176 ("no migration found for version
--- 176"). With the control plane scaled to zero, either keep the columns
--- (`migrate force 175`; this file, run again, keeps their values) or run
--- the down (goto 175). A value kept names only the snapshot it was
+-- The previous binary cannot boot on 177 ("no migration found for version
+-- 177"). With the control plane scaled to zero, either keep the columns
+-- (`migrate force 176`; this file, run again, keeps their values) or run
+-- the down (goto 176). A value kept names only the snapshot it was
 -- written for, so a snapshot the previous binary records meanwhile reads,
 -- after the redeploy, as not recorded. Either way nothing but a count
 -- moves: no restore depends on these columns.

@@ -31,7 +31,7 @@ import (
 // the columns and their values for this release's next deploy.
 
 // snapshotConversationMigration is this migration's version.
-const snapshotConversationMigration = 176
+const snapshotConversationMigration = 177
 
 // preConversationUpdateSnapshot is UpdateSandboxSnapshotID as the previous
 // binary sends it, without its RETURNING list: snapshot_id and its

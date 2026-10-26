@@ -34,7 +34,7 @@ import (
 var compatibleProvenance = fmt.Sprintf(`{"agentProtocol":%q}`, contracts.Version)
 
 // previousBinaryUpdateSnapshot is UpdateSandboxSnapshotID as the control
-// plane before migration 000176 sends it, without its RETURNING list: the
+// plane before migration 000177 sends it, without its RETURNING list: the
 // snapshot and its provenance move, the conversation record does not.
 const previousBinaryUpdateSnapshot = `UPDATE sandboxes
 SET snapshot_id = $1,
@@ -195,7 +195,7 @@ func TestRestoreConversation_Counted(t *testing.T) {
 }
 
 // TestRestoreConversation_PreviousBinarysSnapshotIsUnknown: a snapshot the
-// control plane before migration 000176 records moves snapshot_id alone,
+// control plane before migration 000177 records moves snapshot_id alone,
 // leaving the record on the snapshot before it -- here minted under the
 // very conversation the session still names. The record is keyed by the
 // snapshot's id, so the new snapshot's restore is unknown, never held.

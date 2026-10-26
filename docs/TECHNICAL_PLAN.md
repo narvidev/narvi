@@ -7127,7 +7127,7 @@ not carry a usable runtime session loses context too and ships none yet — that
 first, so the decision to widen rests on how often it actually happens. The statement that records
 a snapshot also records the conversation the session held at that moment, keyed by the snapshot's
 id like its provenance (`sandboxes.snapshot_conversation_id`, `snapshot_conversation_recorded_id`,
-migration 000176), and the clear that forgets the snapshot forgets it. Every restore compares it
+migration 000177), and the clear that forgets the snapshot forgets it. Every restore compares it
 with the conversation its prompts will name (`sandbox.ClassifyRestoreConversation`), and once the
 claim has committed counts the outcome on `sandbox_restore_conversation_total{outcome}`:
 `held` (the same conversation); `differs` (another one, or one on only one side — logged at WARN

@@ -1,17 +1,17 @@
--- Reverses 000176_snapshot_conversation.up.sql. With the columns goes
+-- Reverses 000177_snapshot_conversation.up.sql. With the columns goes
 -- every snapshot's record of the conversation the session held when it
--- was minted. A binary without 000176 does not read them; a binary with it
--- that runs 000176 again counts every snapshot's restore as unknown until
+-- was minted. A binary without 000177 does not read them; a binary with it
+-- that runs 000177 again counts every snapshot's restore as unknown until
 -- the sandbox's next snapshot.
 --
 -- RUN IT WITH THE CONTROL PLANE SCALED TO ZERO, then deploy a binary without
--- 000176. Do not run it against live pods of a binary that carries 000176:
+-- 000177. Do not run it against live pods of a binary that carries 000177:
 -- every query of that binary that returns a whole sandbox row names the
 -- columns (sqlc writes each SELECT * and RETURNING * out as a column list),
 -- and its UpdateSandboxSnapshotID and ClearSandboxSnapshot write them, so
 -- each fails with SQLSTATE 42703 and no sandbox is spawned, read or
 -- snapshotted until the older binary replaces the pod; and a pod that
--- restarts first applies 000176 again at boot, which locks the older binary
+-- restarts first applies 000177 again at boot, which locks the older binary
 -- out again.
 -- Guarded: IF EXISTS, so it also runs when the columns are already gone.
 -- The drops are catalog changes: they rewrite nothing, but take ACCESS

@@ -14,7 +14,7 @@ import (
 )
 
 // This file pins the record technical plan §35.5's restore instrumentation
-// reads (migrations/000176): the statement that records a snapshot records
+// reads (migrations/000177): the statement that records a snapshot records
 // the conversation the session held at that moment, keyed by the
 // snapshot's id, and the statement that clears the snapshot clears it.
 
