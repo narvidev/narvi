@@ -4,7 +4,7 @@
 // identity graph: Resolve links an identity automatically only on an email
 // the provider vouches for, AutoLink stores exactly the attestation it is
 // given, and a Slack automatic link made before Slack's confirmed-email
-// rule (no email_checked_at, migrations/000177) is re-checked at its next
+// rule (no email_checked_at, migrations/000178) is re-checked at its next
 // use -- kept when the provider confirms it, removed and audited when not,
 // and never confused with a link a person or an admin made.
 package identitylink_test
@@ -380,7 +380,7 @@ func TestResolve_RechecksAnAutoLinkMadeBeforeTheConfirmedEmailRule(t *testing.T)
 // removes only a Slack automatic link nothing has confirmed: a link a
 // person confirmed through the link prompt, one an admin made, a stamped
 // Slack automatic link, and another provider's automatic link (unstamped,
-// as every one made before migrations/000177 is) all resolve as they are,
+// as every one made before migrations/000178 is) all resolve as they are,
 // on an email the provider does not vouch for, and the store refuses to
 // delete any of them as unchecked. Another provider's verified email still
 // counts as evidence without the stamp.

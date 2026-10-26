@@ -31,7 +31,7 @@
 //  2. Match against users.primary_email (postgres.UserStore.
 //     GetByPrimaryEmail) and verified identities.email (postgres.
 //     IdentityStore.ListVerifiedUserIDsByEmail), deduplicated by user id.
-//     A Slack automatic link nothing has confirmed since migrations/000177
+//     A Slack automatic link nothing has confirmed since migrations/000178
 //     is not evidence here.
 //  3. internal/domain/identitylink.Decide renders the pure verdict.
 //  4. Exactly one match: INSERT the identities row (linked_via=auto_email,

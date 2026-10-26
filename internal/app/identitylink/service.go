@@ -124,7 +124,7 @@ type ProfileEmail struct {
 // (linked_via=auto_email) that nothing has confirmed under §13.2's
 // definition of a verified email: one whose email is not verified, or a
 // Slack one with no email_checked_at -- made by a binary that took any
-// Slack profile email as verified (migrations/000177). Such a link is not
+// Slack profile email as verified (migrations/000178). Such a link is not
 // used: LookupLinkedUserID reads it as not linked, Resolve re-checks it
 // before resolving it to anyone, and its email is not evidence for
 // MatchUserIDs (queries/identities.sql's ListVerifiedIdentityUserIDsByEmail
@@ -437,7 +437,7 @@ func MatchUserIDs(ctx context.Context, deps Deps, email string) ([]string, error
 // carries email_verified true (checked before this is ever called). A
 // Verified email is also stamped email_checked_at, which tells a Slack
 // automatic link made under §13.2's Slack definition from one an older
-// binary made without it (migrations/000177).
+// binary made without it (migrations/000178).
 //
 // accessTokenEncrypted is nil for every caller except the GitHub-side
 // first-time merge (resolveFirstTimeIdentity's own encryptedToken

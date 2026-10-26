@@ -59,7 +59,7 @@ type CreateIdentityParams struct {
 // don't expire, but re-storing on each login is harmless and keeps the
 // stored token fresh if the user ever re-authorized with different
 // scopes).
-// email_checked_at (migrations/000177) is set only by an automatic link on
+// email_checked_at (migrations/000178) is set only by an automatic link on
 // an email its caller reports verified (internal/app/identitylink.AutoLink);
 // every other caller leaves it NULL.
 func (q *Queries) CreateIdentity(ctx context.Context, arg CreateIdentityParams) (Identity, error) {
@@ -246,7 +246,7 @@ WHERE email_verified = true AND lower(email) = lower($1)
 // result must dedupe by user_id regardless; DISTINCT here just avoids
 // handing back an already-known duplicate in the common case.
 //
-// A Slack automatic link nothing has checked since migrations/000177 (the
+// A Slack automatic link nothing has checked since migrations/000178 (the
 // previous binary took any Slack profile email as verified) is left out
 // until identitylink.Resolve re-checks it against Slack -- the same rows
 // identitylink's autoLinkUnchecked names, and DeleteUncheckedAutoLinkedIdentity

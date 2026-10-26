@@ -11,7 +11,7 @@
 -- scopes).
 
 -- name: CreateIdentity :one
--- email_checked_at (migrations/000177) is set only by an automatic link on
+-- email_checked_at (migrations/000178) is set only by an automatic link on
 -- an email its caller reports verified (internal/app/identitylink.AutoLink);
 -- every other caller leaves it NULL.
 INSERT INTO identities (user_id, provider, external_id, email, email_verified, linked_via, access_token_encrypted, email_checked_at)
@@ -52,7 +52,7 @@ RETURNING *;
 -- result must dedupe by user_id regardless; DISTINCT here just avoids
 -- handing back an already-known duplicate in the common case.
 --
--- A Slack automatic link nothing has checked since migrations/000177 (the
+-- A Slack automatic link nothing has checked since migrations/000178 (the
 -- previous binary took any Slack profile email as verified) is left out
 -- until identitylink.Resolve re-checks it against Slack -- the same rows
 -- identitylink's autoLinkUnchecked names, and DeleteUncheckedAutoLinkedIdentity

@@ -30,7 +30,7 @@ import (
 // deploy.
 
 // emailCheckedAtMigration is this migration's version.
-const emailCheckedAtMigration = 177
+const emailCheckedAtMigration = 178
 
 func TestMigrationIdentitiesEmailCheckedAt_UpAndDown(t *testing.T) {
 	ctx := context.Background()
