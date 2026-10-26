@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
@@ -154,6 +155,17 @@ func (f *fakeSentinelAutoFixSourceControl) MergePR(context.Context, ports.MergeP
 	return "", errors.New("fakeSentinelAutoFixSourceControl: MergePR not implemented")
 }
 
+// enableSentinelAutoFix turns repoFullName's sentinel auto-fix toggle on,
+// as the trigger found it when it enqueued the fix: Deliver reads the
+// toggle again before it creates the branch, and skips a repository whose
+// toggle is off or was never set (§17.2).
+func enableSentinelAutoFix(ctx context.Context, t *testing.T, pool *pgxpool.Pool, repoFullName string) {
+	t.Helper()
+	if _, err := narvipg.NewRepoSettingsStore(pool).Upsert(ctx, repoFullName, false, true); err != nil {
+		t.Fatalf("turn the sentinel auto-fix on for %s: %v", repoFullName, err)
+	}
+}
+
 // TestSentinelAutoFixNotifier_SpawnsChildSessionAndUpdatesStores proves
 // the notifier's own real Deliver: a real child session is spawned
 // (httpapi.SpawnChildSession), sentinel_fixes.fix_child_session_id is
@@ -181,6 +193,7 @@ func TestSentinelAutoFixNotifier_SpawnsChildSessionAndUpdatesStores(t *testing.T
 	}
 
 	repoFullName := "acme/notifier-test-repo"
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, 77, originSession.ID, "feature-fix-me")
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)
@@ -364,6 +377,7 @@ func TestSentinelAutoFixNotifier_ResolveBranchSHAFails_NeverSpawnsChildSession(t
 	}
 
 	repoFullName := "acme/notifier-resolve-sha-fails-repo"
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, 88, originSession.ID, "feature-fix-me-2")
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)
@@ -432,6 +446,7 @@ func TestSentinelAutoFixNotifier_CreateBranchFails_NeverSpawnsChildSession(t *te
 	}
 
 	repoFullName := "acme/notifier-create-branch-fails-repo"
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, 89, originSession.ID, "feature-fix-me-3")
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)
@@ -521,6 +536,7 @@ func TestSentinelAutoFixNotifier_ConcurrentDeliver_NeverDoubleSpawnsChildSession
 	}
 
 	repoFullName := "acme/notifier-concurrent-repo"
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, 111, originSession.ID, "feature-concurrent-fix")
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)
@@ -664,6 +680,7 @@ func TestSentinelAutoFixNotifier_SecondOutboxRowForSameClaim_ReusesWinningSessio
 	}
 
 	repoFullName := "acme/notifier-sequential-second-row-repo"
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, 112, originSession.ID, "feature-sequential-fix")
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)
@@ -851,6 +868,7 @@ func TestSentinelAutoFixNotifier_MissingFindingRow_IsBenignNoOp(t *testing.T) {
 	}
 
 	repoFullName := "acme/notifier-missing-finding-repo"
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, 114, originSession.ID, "feature-missing-finding-fix")
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)
@@ -891,5 +909,116 @@ func TestSentinelAutoFixNotifier_MissingFindingRow_IsBenignNoOp(t *testing.T) {
 	}
 	if !updatedFix.FixChildSessionID.Valid {
 		t.Error("FixChildSessionID is still invalid, want the child session to have been spawned normally despite the missing finding row")
+	}
+}
+
+// brokenRepoSettings returns a RepoSettingsStore whose every read fails: it
+// is bound to a transaction already rolled back, the fault injection
+// TestDescriptionAutofixNotifier_RepoSettingsReadError_ReturnsErrorForRetry
+// uses for the same read.
+func brokenRepoSettings(ctx context.Context, t *testing.T, pool *pgxpool.Pool) *narvipg.RepoSettingsStore {
+	t.Helper()
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin tx: %v", err)
+	}
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("rollback tx: %v", err)
+	}
+	return narvipg.NewRepoSettingsStore(pool).WithTx(tx)
+}
+
+// TestSentinelAutoFix_ToggleReadAgainAtDelivery: the trigger enqueued the
+// fix with the repository's sentinel auto-fix on, and the delivery reads
+// the toggle again before it calls the code host (§17.2).
+//   - Still on, it delivers as before: one branch, one fix session.
+//   - Turned off since, or its settings row gone, the row ends for good on
+//     its first attempt: no code-host call, no branch, no session, the
+//     claim with no child, the finding open, one skip record. Turning the
+//     toggle back on afterwards revives nothing.
+//   - A read that fails is neither answer: nothing starts, the attempt
+//     counts as failed and the row stays pending, so the outbox retries
+//     it; the retry, once the read succeeds, delivers.
+func TestSentinelAutoFix_ToggleReadAgainAtDelivery(t *testing.T) {
+	tests := []struct {
+		name string
+		// arrange changes the repository's settings after the enqueue.
+		arrange func(ctx context.Context, t *testing.T, f *sentinelAutoFixFreezeFixture)
+		// readFails delivers through a notifier whose settings read fails.
+		readFails   bool
+		wantSkipped bool
+	}{
+		{
+			name:    "toggle still on",
+			arrange: func(context.Context, *testing.T, *sentinelAutoFixFreezeFixture) {},
+		},
+		{
+			name: "toggle turned off after the enqueue",
+			arrange: func(ctx context.Context, t *testing.T, f *sentinelAutoFixFreezeFixture) {
+				f.setAutoFix(ctx, t, false)
+			},
+			wantSkipped: true,
+		},
+		{
+			name: "settings row gone",
+			arrange: func(ctx context.Context, t *testing.T, f *sentinelAutoFixFreezeFixture) {
+				if _, err := f.pool.Exec(ctx, `DELETE FROM repo_settings WHERE repo_full_name = $1`, f.repoFullName); err != nil {
+					t.Fatalf("delete the settings row: %v", err)
+				}
+			},
+			wantSkipped: true,
+		},
+		{
+			name:      "settings read fails",
+			arrange:   func(context.Context, *testing.T, *sentinelAutoFixFreezeFixture) {},
+			readFails: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newSentinelAutoFixFreezeFixture(ctx, t)
+			tc.arrange(ctx, t, f)
+
+			builder := f.builder
+			if tc.readFails {
+				builder = f.builderReading(brokenRepoSettings(ctx, t, f.pool))
+			}
+			if err := builder.PumpOnce(ctx); err != nil {
+				t.Fatalf("PumpOnce: %v", err)
+			}
+
+			switch {
+			case tc.readFails:
+				row := f.outboxRow(ctx, t)
+				if row.Status != sqlcgen.OutboxStatusPending || row.Attempts != 1 {
+					t.Fatalf("row status %s, attempts %d; want pending after one failed attempt, due for a retry", row.Status, row.Attempts)
+				}
+				if row.LastError == nil || !strings.Contains(*row.LastError, "read repo settings") {
+					t.Errorf("last_error = %v, want the failed settings read", row.LastError)
+				}
+				f.assertNothingStarted(ctx, t)
+				if got := f.skipRecords(ctx, t); got != 0 {
+					t.Errorf("skip audit rows = %d, want 0: a failed read is not a confirmed off", got)
+				}
+
+				makeDue(t, f.pool, f.row.ID)
+				if err := f.builder.PumpOnce(ctx); err != nil {
+					t.Fatalf("retry PumpOnce: %v", err)
+				}
+				f.assertSpawnedOnce(ctx, t, 2)
+			case tc.wantSkipped:
+				f.assertSkipped(ctx, t)
+
+				f.setAutoFix(ctx, t, true)
+				makeDue(t, f.pool, f.row.ID)
+				if err := f.builder.PumpOnce(ctx); err != nil {
+					t.Fatalf("PumpOnce after the toggle is back on: %v", err)
+				}
+				f.assertSkipped(ctx, t)
+			default:
+				f.assertSpawnedOnce(ctx, t, 1)
+			}
+		})
 	}
 }

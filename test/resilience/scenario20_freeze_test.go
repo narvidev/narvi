@@ -492,13 +492,17 @@ func (s *scenario20) armedMergeCandidate(ctx context.Context, t *testing.T) *sce
 }
 
 // sentinelAutoFixDelivery enqueues a sentinel auto-fix delivery for a
-// claimed fix and an open finding, and returns its row.
+// claimed fix and an open finding, in a repository with the sentinel
+// auto-fix on, and returns its row.
 func (s *scenario20) sentinelAutoFixDelivery(ctx context.Context, t *testing.T) sqlcgen.Outbox {
 	t.Helper()
 	const repoFullName, prNumber = "acme/s20-fix", 7
 	origin, err := s.h.Sessions.Create(ctx, sqlcgen.CreateSessionParams{SpawnSource: sqlcgen.SessionSpawnSourceGithub})
 	if err != nil {
 		t.Fatalf("create the origin session: %v", err)
+	}
+	if _, err := narvipg.NewRepoSettingsStore(s.h.Pool).Upsert(ctx, repoFullName, false, true); err != nil {
+		t.Fatalf("turn the sentinel auto-fix on: %v", err)
 	}
 	fix, err := narvipg.NewSentinelFixStore(s.h.Pool).Claim(ctx, repoFullName, prNumber, origin.ID, "feature-s20")
 	if err != nil {

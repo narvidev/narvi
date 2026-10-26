@@ -155,7 +155,10 @@ Every held candidate is still a candidate:
   invocations fan out in the order they were created.
 - the outbox and the automatic re-review: within a minute and five seconds
   (`AutonomyFreezeRecheckInterval` plus the pump's interval). The
-  re-review reviews the head pushed last.
+  re-review reviews the head pushed last. A held sentinel auto-fix or
+  description rewrite reads its repository's toggle when it is delivered:
+  one whose toggle was turned off meanwhile is skipped for good, and
+  turning the toggle back on does not revive it.
 - workflow advances: within a minute (`AutonomyFreezeRecheckInterval`, the
   releaser's tick; a replica that starts releases at once), oldest first,
   each exactly once -- every held advance in that one tick, however many a
@@ -216,40 +219,50 @@ included, but has no way to show it or lift it: no route, no card, no
 banner. Rolling back to it changes nothing in `platform_settings`, so **a
 freeze in force stays in force**, and every automatic action stays held.
 
-Unfreezing is not the same as turning automatic actions off. **Two kinds of
-held work start again within about a minute of an unfreeze, whatever the
-per-repository toggles say:**
+Unfreezing is not the same as turning automatic actions off. **Held
+workflow advances start again within about a minute of an unfreeze,
+whatever the per-repository toggles say:** no toggle governs a workflow
+run. The releaser applies each held advance on its next tick and the run's
+next attempt starts.
 
-- **Held workflow advances.** No toggle governs a workflow run. The
-  releaser applies each held advance on its next tick and the run's next
-  attempt starts.
-- **Held sentinel auto-fix deliveries.** Their delivery does not read
-  `sentinel_autofix_enabled` again: turning the toggle off after a fix was
-  enqueued does not stop its branch and its fix session.
-
-Auto-merge, the description rewrite and the automatic re-review do read
-their toggles again, and a paused automation neither fires nor fans out. So
-choose by what the incident needs:
+Auto-merge, the description rewrite, the automatic re-review and the
+sentinel auto-fix read their toggles again, and a paused automation neither
+fires nor fans out. A held sentinel auto-fix reads `sentinel_autofix_enabled`
+when it is delivered: with the toggle off it is skipped for good -- no fix
+branch, no fix session, an audit row `sentinel_fix.spawn_skipped` -- and
+turning the toggle back on does not revive it. **The release this section
+rolls back to does not read it again:** there, a held sentinel auto-fix
+creates its branch and its fix session whatever the toggle says. So choose
+by what the incident needs:
 
 - **To keep everything automatic held across the rollback, keep the
   freeze.** Roll back while frozen: the older release honours it. Once the
-  incident allows, lift it there with the statement below.
+  incident allows, lift it there with the statement below. Every held
+  sentinel auto-fix then spawns, whatever the toggles say; when they must
+  not, take the second path, which ends them.
 - **Otherwise, unfreeze before rolling back**, once everything is ready.
   First turn off the toggles and pause the automations the incident needs
-  off. Then stop every session whose held work must not move. A person's
-  stop drops the session's held workflow advances and cancels their runs,
-  so they are never applied, even when the session is resumed a moment
-  later. A held sentinel fix is different: the stop leaves its delivery
-  pending, and the delivery, after the unfreeze, is refused only if the
-  stop on the origin pull request's review session still stands.
-  The skip holds only while the stop stands. A person's mention, review
-  label, Re-review click or prompt on that pull request before the held fix
-  is delivered resumes the session, and the fix spawns. A fix refused at
-  delivery is skipped for good, though its fix branch may still be created,
-  unused. When held sentinel fixes must certainly not move, keep the freeze
-  across the rollback (the bullet above). Last, unfreeze: Settings →
-  General → Unfreeze, or `POST /api/autonomy/unfreeze`. Its
-  `autonomy.unfrozen` audit row records what was lifted.
+  off. Then stop every session whose held workflow advances must not move.
+  A person's stop drops the session's held workflow advances and cancels
+  their runs, so they are never applied, even when the session is resumed a
+  moment later. Then unfreeze: Settings → General → Unfreeze, or
+  `POST /api/autonomy/unfreeze`. Its `autonomy.unfrozen` audit row records
+  what was lifted. Last, before rolling back, wait until no sentinel
+  auto-fix of a repository with the toggle off is still pending. This
+  release skips each one within about a minute of the unfreeze -- one
+  waiting out a retry back-off once it is due again, within
+  `OutboxBackoffMax` (five minutes) -- but one still pending when the
+  older release takes over is delivered there, whatever the toggle says.
+  On the control plane's database, this lists the ones left, and must
+  return no row before the rollback:
+
+  ```sql
+  SELECT o.id, o.payload->>'repoFullName' AS repo, o.attempts, o.last_error
+  FROM outbox o
+  LEFT JOIN repo_settings r ON r.repo_full_name = o.payload->>'repoFullName'
+  WHERE o.kind = 'sentinel_auto_fix' AND o.status = 'pending'
+    AND NOT COALESCE(r.sentinel_autofix_enabled, false);
+  ```
 
 If a rollback already happened with the freeze on, the older release has one
 way to lift it: this statement, on the control plane's database. It is the
@@ -278,7 +291,9 @@ A binary without the freeze reads no freeze. Rolling back past it lifts any
 freeze in force, whatever the row says: turn off auto-merge and the other
 automatic toggles per repository, and pause automations, before rolling back
 during an incident. A paused automation's invocations wait, and fan out when
-it is resumed (above).
+it is resumed (above). Such a binary does not read the sentinel auto-fix
+toggle when it delivers a fix either: with the freeze lifted, wait until the
+query above returns no row before rolling back.
 
 A binary without the held workflow advance reads the freeze at the other
 sites but **advances every workflow run whose step's turn ends while frozen**,

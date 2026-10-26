@@ -14,6 +14,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/restdtos"
 	"github.com/narvidev/narvi/internal/adapters/inbound/httpapi"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
+	"github.com/narvidev/narvi/internal/app/auditlog"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/app/shadowledger"
@@ -154,7 +155,8 @@ type sentinelAutoFixNotifier struct {
 	// doc comment for how a rollout refusal here maps to the existing
 	// "confirmed negative -> nil, never retried" terminal-skip precedent
 	// (descriptionautofix.go), never the outbox's ordinary backoff/retry/
-	// dead-letter path.
+	// dead-letter path. repoSettings also serves Deliver's own read of the
+	// repository's sentinel_autofix_enabled toggle at delivery (§17.2).
 	rolloutMode  platform.RolloutMode
 	repoSettings *postgres.RepoSettingsStore
 	// prSessions (§31.4) is the SAME further REQUIRED dependency every
@@ -273,7 +275,9 @@ func sentinelAutoFixPromptText(descriptions []string) string {
 // Deliver implements ports.Notifier: unmarshals payload, checks the
 // cheap, non-atomic idempotency fast path (a child session already
 // spawned for this claim -- skip straight to the MarkFixPending tail,
-// never re-spawn), otherwise atomically claims the sentinel_fixes row and
+// never re-spawn), otherwise -- once the egress check and the repository's
+// sentinel auto-fix toggle, read again here, both let it through --
+// atomically claims the sentinel_fixes row and
 // spawns the child session together (spawnClaimedChildSession), then
 // records the winning child session back onto every finding this
 // delivery's own payload addresses (markFindingsFixPending).
@@ -458,6 +462,42 @@ func (n *sentinelAutoFixNotifier) Deliver(ctx context.Context, notification port
 			return n.recordShortCircuit(ctx, payload)
 		}
 
+		// §17.1's per-repository toggle, read again here (§17.2): the
+		// trigger read it when the verdict landed, and an administrator
+		// may have turned it off since -- while the autonomy freeze held
+		// this row (§40.2), or while it waited out a retry back-off. Read
+		// the way descriptionAutofixNotifier.Deliver reads its own flag,
+		// at the same point: after the egress decision (that notifier's
+		// shadow divert runs in the builder, before Deliver; this kind's
+		// runs just above) and before anything else -- spawnClaimedChildSession
+		// below makes the first GitHub call and creates the branch.
+		//
+		// A missing row is a confirmed off, like a row with the toggle
+		// off: recordAutoFixDisabled ends this row for good, consuming
+		// nothing -- no branch, no session, no claim, every addressed
+		// finding left 'open'. Turning the toggle back on does not revive
+		// it; the next qualifying verdict enqueues a fresh row against the
+		// same unspawned claim (reviewverdict.go). Any other read error is
+		// uncertain, never taken for either answer: returned, so the
+		// outbox retries the delivery.
+		//
+		// Read on the not-yet-claimed path only, for the reason the
+		// egress check above is: a claim that already has a child has a
+		// real branch and a real session at work, and the bookkeeping
+		// below records that work on its findings, whatever the toggle
+		// says now.
+		settings, err := n.repoSettings.Get(ctx, payload.RepoFullName)
+		switch {
+		case err == nil:
+			if !settings.SentinelAutofixEnabled {
+				return n.recordAutoFixDisabled(ctx, payload, fix.ID.String())
+			}
+		case errors.Is(err, pgx.ErrNoRows):
+			return n.recordAutoFixDisabled(ctx, payload, fix.ID.String())
+		default:
+			return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: read repo settings: %w", err)
+		}
+
 		// Cheap, non-atomic fast path: skips createFixBranch's two GitHub
 		// round trips and the claim transaction entirely on the common
 		// "nothing left to do" redelivery. NOT the correctness guard --
@@ -550,6 +590,34 @@ func (n *sentinelAutoFixNotifier) recordShortCircuit(ctx context.Context, payloa
 
 	platform.Logger(ctx).Info("outboxworker: sentinelAutoFixNotifier: repository egress is suppressed; recording would-have-created-branch and would-have-spawned-fix-session, never claiming (§30.7/§30.9)",
 		"repo_full_name", payload.RepoFullName, "origin_pr_number", payload.OriginPRNumber, "would_create_branch", branch)
+	return nil
+}
+
+// recordAutoFixDisabled ends a delivery whose repository has the sentinel
+// auto-fix turned off (Deliver's toggle read): one audit_log row,
+// sentinel_fix.spawn_skipped on the claim (sentinelFixID, the
+// sentinel_fixes row the payload names), actor NULL -- the record the
+// sentinel path already keeps for the merge gate's own decisions
+// (sentinel_fix.merge_gate_evaluated, §17.5), so a person reading the
+// audit log sees why no fix followed the finding -- and one Info line.
+//
+// Returns nil on a recorded skip, so the outbox marks the row delivered
+// and never retries it. A failed audit write is returned instead, as
+// recordShortCircuit returns a failed ledger write: the outbox retries the
+// whole delivery, which reads the toggle again, and nothing has happened
+// yet.
+func (n *sentinelAutoFixNotifier) recordAutoFixDisabled(ctx context.Context, payload ports.SentinelAutoFixPayload, sentinelFixID string) error {
+	if err := auditlog.Record(ctx, n.auditLog, pgtype.UUID{}, "sentinel_fix.spawn_skipped", "sentinel_fix", sentinelFixID, map[string]any{
+		"repo_full_name":          payload.RepoFullName,
+		"origin_pr_number":        payload.OriginPRNumber,
+		"origin_session":          payload.OriginReviewSessionID,
+		"reason":                  "sentinel_autofix_disabled",
+		"finding_identity_hashes": payload.FindingIdentityHashes,
+	}); err != nil {
+		return fmt.Errorf("outboxworker: sentinelAutoFixNotifier: record the skipped fix in the audit log: %w", err)
+	}
+	platform.Logger(ctx).Info("outboxworker: sentinelAutoFixNotifier: the repository has the sentinel auto-fix turned off; skipping, never retried",
+		"repo", payload.RepoFullName, "origin_pr_number", payload.OriginPRNumber, "sentinel_fix_id", sentinelFixID)
 	return nil
 }
 

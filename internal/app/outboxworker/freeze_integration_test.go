@@ -79,8 +79,8 @@ func assertHeldByTheFreeze(ctx context.Context, t *testing.T, pool *pgxpool.Pool
 }
 
 // sentinelAutoFixFreezeFixture is one sentinel auto-fix outbox row, its
-// claim and finding, and a Builder delivering its kind through the real
-// notifier.
+// claim and finding, in a repository with the sentinel auto-fix on, and a
+// Builder delivering its kind through the real notifier.
 type sentinelAutoFixFreezeFixture struct {
 	pool          *pgxpool.Pool
 	builder       *outboxworker.Builder
@@ -91,6 +91,10 @@ type sentinelAutoFixFreezeFixture struct {
 	row           sqlcgen.Outbox
 	repoFullName  string
 	identityHash  string
+	// builderReading builds another Builder over the same row, stores and
+	// code host, whose notifier reads the repository's settings from
+	// repoSettings.
+	builderReading func(repoSettings *narvipg.RepoSettingsStore) *outboxworker.Builder
 }
 
 func newSentinelAutoFixFreezeFixture(ctx context.Context, t *testing.T) *sentinelAutoFixFreezeFixture {
@@ -114,6 +118,7 @@ func newSentinelAutoFixFreezeFixture(ctx context.Context, t *testing.T) *sentine
 		t.Fatalf("create origin session: %v", err)
 	}
 	originSession := origin.ID
+	enableSentinelAutoFix(ctx, t, pool, repoFullName)
 	fix, err := sentinelFixes.Claim(ctx, repoFullName, 91, originSession, "feature-fix-me")
 	if err != nil {
 		t.Fatalf("claim sentinel_fixes: %v", err)
@@ -125,11 +130,6 @@ func newSentinelAutoFixFreezeFixture(ctx context.Context, t *testing.T) *sentine
 	}); err != nil {
 		t.Fatalf("upsert review finding: %v", err)
 	}
-
-	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
-	notifier := mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, sessions, narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), registry, sentinelFixes, reviewFindings,
-		sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts(), false, platform.RolloutModeOpen, narvipg.NewRepoSettingsStore(pool), narvipg.NewGitHubPRSessionStore(pool),
-		func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool)))
 
 	payload, err := json.Marshal(ports.SentinelAutoFixPayload{
 		SentinelFixID: fix.ID.String(), RepoFullName: repoFullName, OriginPRNumber: 91,
@@ -146,15 +146,22 @@ func newSentinelAutoFixFreezeFixture(ctx context.Context, t *testing.T) *sentine
 		t.Fatalf("enqueue the sentinel auto-fix: %v", err)
 	}
 
-	builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
-		ports.NotificationKindSentinelAutoFix: notifier,
-	}, platform.DefaultTimeouts(), &platform.ShutdownState{})
-	if err != nil {
-		t.Fatalf("NewBuilder: %v", err)
+	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
+	builderReading := func(repoSettings *narvipg.RepoSettingsStore) *outboxworker.Builder {
+		notifier := mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, sessions, narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), registry, sentinelFixes, reviewFindings,
+			sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, narvipg.NewGitHubPRSessionStore(pool),
+			func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool)))
+		builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
+			ports.NotificationKindSentinelAutoFix: notifier,
+		}, platform.DefaultTimeouts(), &platform.ShutdownState{})
+		if err != nil {
+			t.Fatalf("NewBuilder: %v", err)
+		}
+		return builder
 	}
 	return &sentinelAutoFixFreezeFixture{
-		pool: pool, builder: builder, sourceControl: sourceControl, sentinelFixes: sentinelFixes, findings: reviewFindings,
-		fix: fix, row: row, repoFullName: repoFullName, identityHash: identityHash,
+		pool: pool, builder: builderReading(narvipg.NewRepoSettingsStore(pool)), sourceControl: sourceControl, sentinelFixes: sentinelFixes, findings: reviewFindings,
+		fix: fix, row: row, repoFullName: repoFullName, identityHash: identityHash, builderReading: builderReading,
 	}
 }
 
@@ -175,6 +182,116 @@ func (f *sentinelAutoFixFreezeFixture) findingStatus(ctx context.Context, t *tes
 		t.Fatalf("get review finding: %v", err)
 	}
 	return finding.Status
+}
+
+// setAutoFix turns the repository's sentinel auto-fix toggle on or off, as
+// an administrator does in its settings.
+func (f *sentinelAutoFixFreezeFixture) setAutoFix(ctx context.Context, t *testing.T, on bool) {
+	t.Helper()
+	if _, err := narvipg.NewRepoSettingsStore(f.pool).Upsert(ctx, f.repoFullName, false, on); err != nil {
+		t.Fatalf("set the sentinel auto-fix toggle to %v: %v", on, err)
+	}
+}
+
+// skipRecords counts the audit rows recording this fix as skipped because
+// its repository has the sentinel auto-fix off: system-attributed (no
+// actor), on the claim, naming the reason.
+func (f *sentinelAutoFixFreezeFixture) skipRecords(ctx context.Context, t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM audit_log
+		WHERE action = 'sentinel_fix.spawn_skipped' AND resource_type = 'sentinel_fix' AND resource_id = $1
+		  AND actor_user_id IS NULL AND detail_json->>'reason' = 'sentinel_autofix_disabled'
+		  AND detail_json->>'repo_full_name' = $2`, f.fix.ID.String(), f.repoFullName).Scan(&n); err != nil {
+		t.Fatalf("count skip records: %v", err)
+	}
+	return n
+}
+
+// outboxRow reads the fixture's outbox row.
+func (f *sentinelAutoFixFreezeFixture) outboxRow(ctx context.Context, t *testing.T) sqlcgen.Outbox {
+	t.Helper()
+	row, err := narvipg.NewOutboxStore(f.pool, false).Get(ctx, f.row.ID)
+	if err != nil {
+		t.Fatalf("get outbox row: %v", err)
+	}
+	return row
+}
+
+// assertNothingStarted checks the delivery consumed nothing: no call to
+// the code host, no fix branch, no fix session, the claim with no child,
+// the finding still open.
+func (f *sentinelAutoFixFreezeFixture) assertNothingStarted(ctx context.Context, t *testing.T) {
+	t.Helper()
+	if got := f.sourceControl.shaCallCount(); got != 0 {
+		t.Errorf("ResolveBranchSHA calls = %d, want 0", got)
+	}
+	if got := f.sourceControl.createBranchCallCount(); got != 0 {
+		t.Errorf("CreateBranch calls = %d, want 0", got)
+	}
+	if got := f.fixSessions(ctx, t); got != 0 {
+		t.Errorf("fix sessions = %d, want 0", got)
+	}
+	fix, err := f.sentinelFixes.GetByID(ctx, f.fix.ID)
+	if err != nil {
+		t.Fatalf("get sentinel_fixes: %v", err)
+	}
+	if fix.FixChildSessionID.Valid || fix.Status != f.fix.Status {
+		t.Errorf("claim = (status %q, child %v), want it untouched at %q with no child", fix.Status, fix.FixChildSessionID.Valid, f.fix.Status)
+	}
+	if got := f.findingStatus(ctx, t); got != "open" {
+		t.Errorf("finding status = %q, want open", got)
+	}
+}
+
+// assertSkipped checks the row ended for good, on its first counted
+// attempt, without starting anything, and with one skip record.
+func (f *sentinelAutoFixFreezeFixture) assertSkipped(ctx context.Context, t *testing.T) {
+	t.Helper()
+	row := f.outboxRow(ctx, t)
+	if row.Status != sqlcgen.OutboxStatusDelivered || row.DeliveredToLedger {
+		t.Errorf("row status %s (to ledger %v), want delivered, never to the ledger: a skip is terminal", row.Status, row.DeliveredToLedger)
+	}
+	if row.Attempts != 1 {
+		t.Errorf("attempts = %d, want 1", row.Attempts)
+	}
+	f.assertNothingStarted(ctx, t)
+	if got := f.skipRecords(ctx, t); got != 1 {
+		t.Errorf("skip audit rows = %d, want 1", got)
+	}
+}
+
+// assertSpawnedOnce checks the row was delivered on its wantAttempts-th
+// attempt, creating one branch and one fix session, recorded on the claim
+// and on the finding, with no skip record.
+func (f *sentinelAutoFixFreezeFixture) assertSpawnedOnce(ctx context.Context, t *testing.T, wantAttempts int32) {
+	t.Helper()
+	row := f.outboxRow(ctx, t)
+	if row.Status != sqlcgen.OutboxStatusDelivered || row.DeliveredToLedger {
+		t.Fatalf("row status %s (to ledger %v), want delivered to the world", row.Status, row.DeliveredToLedger)
+	}
+	if row.Attempts != wantAttempts {
+		t.Errorf("attempts = %d, want %d", row.Attempts, wantAttempts)
+	}
+	if got := f.fixSessions(ctx, t); got != 1 {
+		t.Errorf("fix sessions = %d, want 1", got)
+	}
+	if got := f.sourceControl.createBranchCallCount(); got != 1 {
+		t.Errorf("CreateBranch calls = %d, want 1", got)
+	}
+	fix, err := f.sentinelFixes.GetByID(ctx, f.fix.ID)
+	if err != nil {
+		t.Fatalf("get sentinel_fixes: %v", err)
+	}
+	if !fix.FixChildSessionID.Valid {
+		t.Error("the claim has no child session")
+	}
+	if got := f.findingStatus(ctx, t); got != "fix_pending" {
+		t.Errorf("finding status = %q, want fix_pending", got)
+	}
+	if got := f.skipRecords(ctx, t); got != 0 {
+		t.Errorf("skip audit rows = %d, want 0", got)
+	}
 }
 
 // TestSentinelAutoFix_Frozen_RowHeldAttemptNotCounted: while autonomy is
@@ -263,6 +380,41 @@ func TestSentinelAutoFix_Unfreeze_SpawnsOnce(t *testing.T) {
 	if got := f.findingStatus(ctx, t); got != "fix_pending" {
 		t.Errorf("finding status = %q, want fix_pending", got)
 	}
+}
+
+// TestSentinelAutoFix_HeldThenToggledOff_UnfreezeSkips: an administrator
+// turns the sentinel auto-fix off while the freeze holds a delivery. The
+// freeze still holds it, toggle or not: a frozen tick after the change
+// gives its attempt back like the first. Once the freeze lifts, the next
+// due tick reads the toggle and skips the row for good -- no branch, no
+// session, the finding still open, one counted attempt and one skip
+// record -- rather than releasing it.
+func TestSentinelAutoFix_HeldThenToggledOff_UnfreezeSkips(t *testing.T) {
+	ctx := context.Background()
+	f := newSentinelAutoFixFreezeFixture(ctx, t)
+	freezeAutonomy(t, f.pool)
+
+	for tick := 1; tick <= 2; tick++ {
+		if tick == 2 {
+			f.setAutoFix(ctx, t, false)
+			makeDue(t, f.pool, f.row.ID)
+		}
+		tickAt := time.Now()
+		if err := f.builder.PumpOnce(ctx); err != nil {
+			t.Fatalf("frozen tick %d: PumpOnce: %v", tick, err)
+		}
+		assertHeldByTheFreeze(ctx, t, f.pool, f.row.ID, tickAt, 0, 0, "frozen")
+	}
+	if got := f.skipRecords(ctx, t); got != 0 {
+		t.Fatalf("skip audit rows while frozen = %d, want 0: the freeze holds the row before its delivery reads the toggle", got)
+	}
+
+	unfreezeAutonomy(t, f.pool)
+	makeDue(t, f.pool, f.row.ID)
+	if err := f.builder.PumpOnce(ctx); err != nil {
+		t.Fatalf("PumpOnce after the unfreeze: %v", err)
+	}
+	f.assertSkipped(ctx, t)
 }
 
 // descriptionAutofixFreezeRow enqueues a description rewrite of an opted-in,
