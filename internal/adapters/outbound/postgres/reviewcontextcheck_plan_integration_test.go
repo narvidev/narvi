@@ -505,11 +505,16 @@ func TestReviewContextCheck_PlansReadTheSessionsOwnTurns(t *testing.T) {
 					return err
 				},
 				args: func(p holdPlanProbe) string {
-					return turnArg(p) + ", 'failed', NULL, now(), NULL, NULL, NULL, 'context_moved'"
+					return turnArg(p) + ", 'failed', NULL, now(), NULL, NULL, NULL, 'context_moved', NULL"
 				},
 			},
 			before: preparedStatement("UpdateTurnStatus",
-				before159(t, updateStatus, "UpdateTurnStatus", map[string]int{",\n    end_reason = COALESCE($8, end_reason)": 1}),
+				before159(t, updateStatus, "UpdateTurnStatus", map[string]int{
+					",\n    end_reason = COALESCE($8, end_reason)": 1,
+					// migrations/000176's column, which main's text before
+					// 159 did not name either.
+					",\n    reenqueued_sandbox_gen = COALESCE($9, reenqueued_sandbox_gen)": 1,
+				}),
 				func(p holdPlanProbe) []any {
 					return []any{newestTurn(p), "failed", nil, pgtype.Timestamptz{Time: time.Now(), Valid: true}, nil, nil, nil}
 				},

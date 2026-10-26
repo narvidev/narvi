@@ -57,13 +57,12 @@ func EvaluateTurnDeadline(dispatchedAt, now time.Time, cfg DeadlineConfig) Deadl
 // re-runs, and their spend, with no bound at all.
 //
 // spent reports that no more than cfg.ReenqueueFloor of the budget is
-// left: such a turn is not re-sent, and its deadline ends it at bound. A
-// re-send with seconds left would start work on the new gen that the
-// deadline fails moments later without stopping that gen, whose late end
-// would then be booked against the next turn sent there. With a zero
-// floor, spent is exactly EvaluateTurnDeadline's timed out (the same >=
-// boundary); with any floor, it is EvaluateTurnDeadline's verdict at now
-// plus the floor.
+// left: such a turn is not re-sent, and its deadline ends it at bound. The
+// floor keeps a re-sent prompt's receipt window, which the re-send starts
+// again, inside the deadline; it is no bound on how long the re-sent work
+// runs, which the deadline ends like any other. With a zero floor, spent
+// is exactly EvaluateTurnDeadline's timed out (the same >= boundary); with
+// any floor, it is EvaluateTurnDeadline's verdict at now plus the floor.
 //
 // A zero dispatchedAt -- a turn whose dispatch time was never recorded --
 // falls back to a full deadline from now, never spent: with no first

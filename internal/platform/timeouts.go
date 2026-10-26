@@ -285,13 +285,18 @@ type Timeouts struct {
 	// ReenqueueBudgetFloor is the least of its turn_deadline a turn in
 	// flight must have left to be re-sent to a newer sandbox gen (technical
 	// plan §3.3's turn recovery, §35.4; turn.ReenqueueBound). A re-send keeps
-	// the deadline its first dispatch armed, so a turn re-sent with seconds
-	// left would start work on the new gen that its deadline fails moments
-	// later without stopping that gen -- and the agent's late end of that
-	// work would be booked against the next turn sent to the same gen
-	// (§3.3's limit: "turn_deadline is not covered"). A turn with no more
+	// the deadline its first dispatch armed but asks the new gen for a
+	// prompt receipt, which starts PromptResendWindow again; the floor keeps
+	// that window inside the deadline, so a re-sent prompt that is lost and
+	// sent once more still starts before the deadline. A turn with no more
 	// than this left is not re-sent: nothing is sent to the new gen, and its
 	// turn_deadline ends it at its bound.
+	//
+	// It is no bound on how long the re-sent work runs: work that outlasts
+	// what is left is ended by the deadline, which then retires the gen the
+	// turn was re-sent to (sessionactor's handleTurnDeadlineTimer), so the
+	// work's late end, which names a gen and never a turn, cannot be booked
+	// against the next turn.
 	//
 	// Not given a value in the plan; derived from this file. A re-send asks
 	// the new gen for a prompt receipt, so PromptResendWindow starts again

@@ -931,9 +931,12 @@ func (a *Actor) recordCheckedOut(ctx context.Context, tx pgx.Tx, d *dispatchPlan
 // checkout, no prompt, on a ready or a suspect gen alike -- and its
 // turn_deadline is armed at its bound, so the timer's own handler ends it
 // there as any timed-out turn ends: failed with timeout, one synthetic
-// end, one notification. Re-sent with less, the work it would start on
-// the new gen would still be running when the deadline failed the turn,
-// and its late end would be booked against the next turn sent there.
+// end, one notification. The floor keeps a re-sent prompt's receipt
+// window (PromptResendWindow, which a re-send starts again) inside the
+// deadline; it says nothing of how long the re-sent work runs. Work that
+// outlasts the deadline is the deadline's to end: handleTurnDeadlineTimer
+// then retires the gen the turn was re-sent to (retireGenOfResentTurn), so
+// that work's late end can no longer reach the next turn.
 func (a *Actor) planReenqueueOrRespawn(
 	ctx context.Context, tx pgx.Tx,
 	sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, hasSandbox bool,
@@ -1169,6 +1172,10 @@ func (a *Actor) tryPlanReenqueue(
 		DispatchedSandboxGen: &dispatchedGen,
 		DispatchedEventID:    &dispatchedEventID,
 		DispatchedMessageID:  &messageID,
+		// The gen this re-send sends the turn to (migrations/000176): if
+		// the turn's deadline fails it while it still runs here, this gen
+		// is retired with it (handleTurnDeadlineTimer).
+		ReenqueuedSandboxGen: &dispatchedGen,
 	}); err != nil {
 		return nil, fmt.Errorf("sessionactor: stamp dispatched_sandbox_gen for reenqueue: %w", err)
 	}

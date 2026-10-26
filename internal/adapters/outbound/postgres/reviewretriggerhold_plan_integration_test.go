@@ -27,10 +27,11 @@ import (
 // row, which names github_pr_sessions.head_in_base (headInBaseMigration),
 // after workflow_advance_holds, which GetSessionActivityFacts reads, and
 // the review checkout's columns (reviewCheckoutGenMigration) -- and set to
-// the latest sandboxes migration (repoHooksLineageMigration), so a
-// statement that comes to return a whole sandbox row names only columns
-// that exist.
-const holdPlanLatestVersion = repoHooksLineageMigration
+// the latest migration of turns (reenqueuedGenMigration), past the latest
+// of sandboxes (repoHooksLineageMigration), so a statement that returns a
+// whole turn row, as ListTurnsForSession does, or comes to return a whole
+// sandbox row, names only columns that exist.
+const holdPlanLatestVersion = reenqueuedGenMigration
 
 const (
 	// holdReadMaxBuffers bounds what the re-review hold's read

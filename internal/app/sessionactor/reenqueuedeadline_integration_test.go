@@ -19,6 +19,7 @@ import (
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -399,11 +400,10 @@ func TestReenqueue_BudgetSpent_NotResent_EndsAtItsDeadline(t *testing.T) {
 // TestReenqueue_SecondsLeft_NotResent_TheQueuedTurnKeepsItsOwnEnd: a turn
 // with seconds of its first dispatch's turn_deadline left when its
 // replacement gen is ready -- less than ReenqueueBudgetFloor -- is not
-// re-sent there, with a follow-up queued behind it. Re-sent, the agent
-// would still be running it when the deadline failed it, and the follow-up
-// sent next to the same gen would be completed by that run's end. Instead
-// its deadline, armed at its bound, ends it; the follow-up is then the
-// first prompt the gen gets, and the gen's end is the follow-up's own.
+// re-sent there, with a follow-up queued behind it: nothing is sent for a
+// run its deadline would end at once. Its deadline, armed at its bound,
+// ends it; the follow-up is then the first prompt the gen gets, and the
+// gen's end is the follow-up's own.
 func TestReenqueue_SecondsLeft_NotResent_TheQueuedTurnKeepsItsOwnEnd(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -508,6 +508,135 @@ func TestReenqueue_BudgetSpent_ReviewTurn_NoGateActs(t *testing.T) {
 			}
 			if ends, timeouts := turnEnds(ctx, t, pool, f.sessionID, reviewTurn.ID); ends != 1 || timeouts != 1 {
 				t.Fatalf("%d execution_complete events, %d of them a synthetic timeout; want exactly one, the timeout", ends, timeouts)
+			}
+		})
+	}
+}
+
+// TestReenqueue_DeadlineOfAResentTurn_RetiresItsGen: a turn re-sent with
+// 12 minutes of its first dispatch's deadline left -- more than
+// ReenqueueBudgetFloor -- whose re-run outlasts them, with a follow-up
+// queued behind it. The deadline fails it on the gen it was re-sent to,
+// and retires that gen in the same transaction: the gen is stopped at the
+// provider, the follow-up runs on a new gen, the re-run's late end on the
+// retired gen is dropped by the gen fence, and the follow-up's own end
+// completes it. A turn that runs out its deadline on its first dispatch's
+// gen keeps that gen, as before (§3.3's stated limit), and the follow-up
+// goes to it.
+func TestReenqueue_DeadlineOfAResentTurn_RetiresItsGen(t *testing.T) {
+	ctx := context.Background()
+	deadline := platform.DefaultTimeouts().TurnDeadline
+	const followUpPrompt = "the follow-up queued behind the turn in flight"
+	for _, tc := range []struct {
+		name    string
+		resent  bool
+		turnGen int32 // the gen the turn's prompt runs on
+	}{
+		{name: "re-sent with more than the floor left: its gen is retired", resent: true, turnGen: 2},
+		{name: "never re-sent: its first dispatch's gen is kept, the stated limit", turnGen: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := newTestPool(t)
+			sessionID := createTestSession(ctx, t, pool)
+			dispatchedAt := time.Now().Add(-deadline + 12*time.Minute).Truncate(time.Microsecond)
+			first := seedTurnInFlight(ctx, t, pool, sessionID, 1, dispatchedAt)
+			armTurnDeadlineAt(ctx, t, pool, sessionID, dispatchedAt.Add(deadline))
+			followUp := createPendingTurn(ctx, t, narvipg.NewTurnStore(pool), sessionID, followUpPrompt)
+			respawnToGen(ctx, t, pool, sessionID, tc.turnGen)
+			providerID := fmt.Sprintf("provider-gen-%d", tc.turnGen)
+			if _, err := pool.Exec(ctx, `UPDATE sandboxes SET provider_id = $2 WHERE session_id = $1`, sessionID, providerID); err != nil {
+				t.Fatalf("record gen %d's provider object: %v", tc.turnGen, err)
+			}
+
+			provider := &fakeSpawnProvider{explicitStop: true, nextRef: ports.SandboxRef{ProviderID: "provider-fresh"}}
+			commander := &fakeSendCommander{}
+			r := newDispatchTestRegistry(t, ctx, pool, provider, commander)
+			t.Cleanup(func() { _ = r.Shutdown() })
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+			settle(ctx, t, a)
+			wantPrompts := 0
+			if tc.resent {
+				wantPrompts = 1
+				if prompts := sentPromptsOf(t, commander); len(prompts) != 1 || prompts[0].Gen != 2 {
+					t.Fatalf("prompts %+v, want the turn re-sent once, to gen 2, with 12 minutes left", prompts)
+				}
+				if got := getTurnRow(ctx, t, pool, first.ID); got.ReenqueuedSandboxGen == nil || *got.ReenqueuedSandboxGen != 2 {
+					t.Fatalf("reenqueued_sandbox_gen = %v, want 2: the gen the re-send sent it to", got.ReenqueuedSandboxGen)
+				}
+			} else if n := len(sentPromptsOf(t, commander)); n != 0 {
+				t.Fatalf("%d prompts, want none: the turn runs on its first dispatch's gen", n)
+			}
+
+			// The 12 minutes pass with the run still going: its deadline fails it.
+			const shift = "12 minutes 5 seconds"
+			if _, err := pool.Exec(ctx, `UPDATE turns SET dispatched_at = dispatched_at - $2::interval WHERE id = $1`, first.ID, shift); err != nil {
+				t.Fatalf("move the dispatch back: %v", err)
+			}
+			if _, err := pool.Exec(ctx, `UPDATE session_timers SET fires_at = fires_at - $3::interval WHERE session_id = $1 AND name = $2`,
+				sessionID, TimerTurnDeadline, shift); err != nil {
+				t.Fatalf("move the deadline back: %v", err)
+			}
+			pumpUntilTurnStatus(ctx, t, r, a, pool, first.ID, sqlcgen.TurnStatusFailed, 5*time.Second)
+			if ends, timeouts := turnEnds(ctx, t, pool, sessionID, first.ID); ends != 1 || timeouts != 1 {
+				t.Fatalf("turn in flight: %d execution_complete events, %d of them a synthetic timeout; want exactly the timeout", ends, timeouts)
+			}
+
+			row, err := narvipg.NewSandboxStore(pool).Get(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("get sandbox: %v", err)
+			}
+			if !tc.resent {
+				if row.Gen != 1 || row.Status != sqlcgen.SandboxStatusReady || len(provider.stoppedProviderIDs()) != 0 || provider.callCount() != 0 {
+					t.Fatalf("sandbox gen %d %s, provider stops %v, spawns %d; want gen 1 kept ready, nothing stopped or spawned",
+						row.Gen, row.Status, provider.stoppedProviderIDs(), provider.callCount())
+				}
+				settle(ctx, t, a)
+				prompts := sentPromptsOf(t, commander)
+				if len(prompts) != 1 || prompts[0].Gen != 1 || prompts[0].Text != followUpPrompt {
+					t.Fatalf("prompts %+v, want the follow-up sent to gen 1, as before", prompts)
+				}
+				return
+			}
+
+			// Gen 2 is retired, stopped at the provider, and the follow-up's
+			// gen is spawned at once.
+			if stopped := provider.stoppedProviderIDs(); len(stopped) != 1 || stopped[0] != providerID {
+				t.Fatalf("provider stops %v, want gen 2's object %q stopped", stopped, providerID)
+			}
+			if provider.callCount() != 1 || row.Gen != 3 {
+				t.Fatalf("spawns %d, sandbox gen %d %s; want one spawn, gen 3, for the follow-up", provider.callCount(), row.Gen, row.Status)
+			}
+			if n := len(sentPromptsOf(t, commander)); n != wantPrompts {
+				t.Fatalf("%d prompts before gen 3 is ready, want %d: nothing goes to the retired gen", n, wantPrompts)
+			}
+
+			// Gen 3 boots and takes the follow-up.
+			if tag, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', last_seen_at = now() WHERE session_id = $1 AND gen = 3`, sessionID); err != nil || tag.RowsAffected() != 1 {
+				t.Fatalf("boot gen 3: %v (%d rows)", err, tag.RowsAffected())
+			}
+			settle(ctx, t, a)
+			prompts := sentPromptsOf(t, commander)
+			got := getTurnRow(ctx, t, pool, followUp.ID)
+			if len(prompts) != 2 || prompts[1].Gen != 3 || prompts[1].Text != followUpPrompt ||
+				got.DispatchedMessageID == nil || prompts[1].MessageId != *got.DispatchedMessageID {
+				t.Fatalf("prompts %+v, follow-up messageId %v; want the follow-up sent to gen 3", prompts, got.DispatchedMessageID)
+			}
+
+			// The re-run's late end on gen 2 completes nothing; the
+			// follow-up's own end on gen 3 completes it.
+			deliver(ctx, t, a, completedEvent(2))
+			if got := getTurnRow(ctx, t, pool, followUp.ID); got.Status != sqlcgen.TurnStatusProcessing {
+				t.Fatalf("follow-up %s after the retired gen's late end, want still processing", got.Status)
+			}
+			deliver(ctx, t, a, completedEvent(3))
+			if got := getTurnRow(ctx, t, pool, followUp.ID); got.Status != sqlcgen.TurnStatusCompleted {
+				t.Fatalf("follow-up %s after its own end on gen 3, want completed", got.Status)
+			}
+			if got := getTurnRow(ctx, t, pool, first.ID); got.Status != sqlcgen.TurnStatusFailed {
+				t.Fatalf("turn in flight %s, want still failed by its deadline", got.Status)
 			}
 		})
 	}
