@@ -31,6 +31,10 @@
 //     fresh spawn replacing a gen of a session that had a turn dispatched,
 //     never a restore, a resume or a first spawn -- and whether its loss is
 //     announced or carried from a replaced gen still awaiting its recap.
+//   - The restore-conversation classification (ClassifyRestoreConversation,
+//     restoreconversation.go; §35.5): whether a restored snapshot was
+//     minted under the conversation its prompt will name -- held, differs,
+//     none or unknown -- counted, never acted on.
 //
 // Every function here is pure per §11: no I/O, no time.Now(), no
 // randomness. Anything needing "the current time" takes it as an explicit

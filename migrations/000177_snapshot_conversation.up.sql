@@ -1,0 +1,63 @@
+-- Technical plan §35.5: a restore brings back the snapshot's filesystem,
+-- the agent runtime's own session storage among it, and the prompt the
+-- restored gen is sent names the conversation the session recorded last
+-- (sessions.opencode_conversation_id). Nothing checks that the snapshot
+-- holds that conversation. A restore whose snapshot was minted under
+-- another conversation, or under none, loses the agent's context as a fresh
+-- spawn does, and ships no recap: the plan instruments that case before
+-- deciding whether to widen the recap to it. This records what the count
+-- needs.
+--
+-- sandboxes.snapshot_conversation_id: the session's conversation id when
+-- the snapshot was recorded, the one its runtime last reported, NULL when
+-- the session had none. Written by UpdateSandboxSnapshotID with the rest
+-- of the snapshot's record, read from sessions in the same statement.
+--
+-- sandboxes.snapshot_conversation_recorded_id: the snapshot id the column
+-- above describes, written in that same statement, so it counts only while
+-- it equals snapshot_id, the way snapshot_provenance_id keys the
+-- provenance (000170): a snapshot whose conversation was not recorded --
+-- one the previous binary recorded, or one taken before this file -- reads
+-- "not recorded", never another snapshot's conversation. Its own column,
+-- because a NULL snapshot_conversation_id is a recorded "no conversation".
+--
+-- Before every restore the session actor compares the two
+-- (sandbox.ClassifyRestoreConversation): held, differs, none or unknown,
+-- logged and counted on sandbox_restore_conversation_total. Nothing else
+-- reads them: no restore is refused, marked or recapped on them.
+--
+-- Both nullable, with no default and no backfill: every snapshot that
+-- exists when this runs reads "not recorded", counted as unknown.
+--
+-- # Locks
+--
+-- golang-migrate sends this file as one batch, one implicit transaction.
+-- Each ADD COLUMN, nullable with no default, is a catalog change that
+-- rewrites nothing, but takes ACCESS EXCLUSIVE on sandboxes until the file
+-- ends -- an instant once granted. It waits behind any open transaction
+-- that has read or written sandboxes, and every new read and write of
+-- sandboxes queues behind it; controlplane/migrate.go sets no
+-- lock_timeout. The file touches sandboxes alone, so it holds no lock
+-- another table's waiters could need.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with these columns present: every statement
+-- it sends names its columns, so it neither reads nor writes them. A
+-- snapshot it records moves snapshot_id alone, so the record keeps naming
+-- an earlier snapshot or nothing, never the new one, and the new one's
+-- restore by this release is counted as unknown. A snapshot it clears
+-- leaves the record naming an id that is no longer snapshot_id, which
+-- counts for nothing.
+--
+-- # Rolling back
+--
+-- The previous binary cannot boot on 177 ("no migration found for version
+-- 177"). With the control plane scaled to zero, either keep the columns
+-- (`migrate force 176`; this file, run again, keeps their values) or run
+-- the down (goto 176). A value kept names only the snapshot it was
+-- written for, so a snapshot the previous binary records meanwhile reads,
+-- after the redeploy, as not recorded. Either way nothing but a count
+-- moves: no restore depends on these columns.
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_conversation_id TEXT;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_conversation_recorded_id TEXT;

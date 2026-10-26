@@ -254,6 +254,13 @@ type opsMetrics struct {
 	// (§27.8, §30.4(3)) is not counted.
 	snapshotRestore metric.Int64Counter
 
+	// restoreConversation is sandbox_restore_conversation_total: one per
+	// restore, once its claim has committed, tagged outcome=held|differs|
+	// none|unknown -- how the conversation its snapshot was minted under
+	// compares with the one its prompts name (technical plan §35.5,
+	// snapshotrestore.go). Counted, never acted on.
+	restoreConversation metric.Int64Counter
+
 	// runwayGate is sandbox_runway_gate_total: one per decision of the
 	// pre-dispatch runway gate (technical plan §35.3, runway.go) other than
 	// a pass with runway to spare, once the evaluation that made it has
@@ -453,6 +460,15 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		return opsMetrics{}, fmt.Errorf("sessionactor: construct sandbox_snapshot_restore_total counter: %w", err)
 	}
 
+	restoreConversation, err := meter.Int64Counter(
+		"sandbox_restore_conversation_total",
+		metric.WithDescription("Restores of a sandbox snapshot (technical plan §35.5), by how the agent runtime conversation the session held when the snapshot was recorded compares with the one the restored sandbox's prompts name: held (the same conversation); differs (another one, one while the prompts name none, or none while they name one -- the agent may not hold its context, and the WARN line logged with it names the snapshot and both ids); none (neither names one); unknown (nothing recorded for the snapshot: one recorded before the record existed, or by a control plane that predates it; logged at INFO). Counted once the claim has committed. Instrumented only: no outcome refuses a restore, writes a warning or carries a recap."),
+		metric.WithUnit("{restore}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct sandbox_restore_conversation_total counter: %w", err)
+	}
+
 	runwayGate, err := meter.Int64Counter(
 		"sandbox_runway_gate_total",
 		metric.WithDescription("Decisions of the pre-dispatch runway gate (technical plan §35.3): before a turn is sent to a live sandbox, the gate measures the sandbox's runway -- its lifetime deadline less the database's now -- against min(RotationRunwayFloor, lifetime/6). Every decision but a pass with runway to spare is counted, by action and reason: pass (deadline_unknown, turn_in_flight, suspect, no_snapshot: the rotation was declined and the turn dispatched as before, below the threshold); hold (awaiting_rotation_snapshot, snapshot_in_progress, awaiting_sign_of_life -- including a reconnected agent whose replayed frames may still be coming --, suspected_mid_snapshot, delivery_open -- a rotation's start, or a rotating gen's retirement --, deadline_passed -- a suspect sandbox past its deadline, through its grace: the turn waits, looked at again at the hold's bound); rotate (below_threshold: under the threshold, or past the deadline with the agent heard from, the sandbox is snapshotted, then retired and restored, before the turn is sent); retire (rotation_snapshot_taken, rotation_snapshot_not_reported, rotation_snapshot_failed: a rotation's gen, retired with its snapshot taken, unreported within RotationSnapshotWait, or never sent); suspect (deadline_passed: past its deadline with its agent silent past SteadyHeartbeatBudget; snapshot_agent_silent: a snapshot unreported within SnapshotReportWait whose agent then fell silent past SteadyHeartbeatBudget; each suspected through its terminal grace); revert (snapshot_not_reported: a snapshot unreported within SnapshotReportWait from an agent heard from after it and past its connection's replay, given up, the sandbox back to ready). The line logged with each names the gen and the runway."),
@@ -491,6 +507,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		promptResend:          promptResend,
 		reviewCheckout:        reviewCheckout,
 		snapshotRestore:       snapshotRestore,
+		restoreConversation:   restoreConversation,
 		runwayGate:            runwayGate,
 		rotationRestore:       rotationRestore,
 	}, nil

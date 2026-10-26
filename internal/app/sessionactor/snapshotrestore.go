@@ -35,6 +35,14 @@ import (
 //     §30.4(3)'s restore downgrades, and the review checkout's retirement
 //     of a gen whose snapshot it clears (reviewcheckout.go) -- writes its
 //     warning through the same helper, once per snapshot.
+//
+// It also counts technical plan §35.5's restore whose snapshot may not hold
+// the session's conversation: the same statement records, keyed by the
+// snapshot's id, the conversation the session held at mint, and every
+// restore compares it with the one its prompts will name
+// (classifyRestoreConversation), logged and counted once the claim has
+// committed (logRestoreConversation). Instrumented, not acted on: such a
+// restore gets no warning, no mark and no recap.
 
 // reportedSnapshotProvenance returns the provenance a snapshot_ready
 // reports -- the protocol the minting agent's binary was compiled with and
@@ -295,4 +303,66 @@ func (a *Actor) logSnapshotRestore(ctx context.Context, plan *spawnPlan) {
 		attribute.String("provenance", string(d.verdict.State)),
 		attribute.String("outcome", outcome),
 	))
+}
+
+// restoreConversationCheck is how a restore's snapshot compares with the
+// conversation the session's prompts name (technical plan §35.5), carried
+// on its spawnPlan so it is logged and counted only once the claim has
+// committed (logRestoreConversation). snapshotConversation is empty when
+// none was recorded, or the snapshot was minted under none;
+// sessionConversation is empty when the session names none.
+type restoreConversationCheck struct {
+	outcome                                   sandbox.RestoreConversation
+	snapshotConversation, sessionConversation string
+}
+
+// classifyRestoreConversation compares the conversation row records for its
+// snapshot snapshotID -- recorded only while
+// snapshot_conversation_recorded_id names that snapshot, so one the
+// previous control-plane binary recorded reads as not recorded -- with the
+// conversation session's prompts name, sessions.opencode_conversation_id
+// (BuildPromptPayload).
+func classifyRestoreConversation(row sqlcgen.Sandbox, snapshotID string, session sqlcgen.Session) *restoreConversationCheck {
+	recorded := row.SnapshotConversationRecordedID != nil && *row.SnapshotConversationRecordedID == snapshotID
+	check := &restoreConversationCheck{sessionConversation: stringOrEmpty(session.OpencodeConversationID)}
+	if recorded {
+		check.snapshotConversation = stringOrEmpty(row.SnapshotConversationID)
+	}
+	check.outcome = sandbox.ClassifyRestoreConversation(recorded, check.snapshotConversation, check.sessionConversation)
+	return check
+}
+
+// restoreConversationDiffersLogMessage and
+// restoreConversationUnknownLogMessage are logRestoreConversation's
+// messages.
+const (
+	restoreConversationDiffersLogMessage = "sessionactor: restoring a snapshot minted under another conversation than the one the session's prompts name; the agent may not hold its context"
+	restoreConversationUnknownLogMessage = "sessionactor: restoring a snapshot whose conversation was not recorded"
+)
+
+// logRestoreConversation logs and counts the restore-conversation check
+// plan's claim made, after that claim committed (executePlans), never
+// inside it: differs at WARN, unknown at INFO, held and none unlogged, and
+// every outcome on sandbox_restore_conversation_total. A plan that is not a
+// restore records nothing.
+func (a *Actor) logRestoreConversation(ctx context.Context, plan *spawnPlan) {
+	c := plan.restoreConversation
+	if c == nil {
+		return
+	}
+	fields := []any{
+		"session_id", a.sessionID.String(), "gen", plan.gen, "snapshot_id", string(plan.snapshotID),
+		"outcome", string(c.outcome),
+		"snapshot_conversation_id", c.snapshotConversation, "session_conversation_id", c.sessionConversation,
+	}
+	switch c.outcome {
+	case sandbox.RestoreConversationDiffers:
+		a.logger.Warn(restoreConversationDiffersLogMessage, fields...)
+	case sandbox.RestoreConversationUnknown:
+		a.logger.Info(restoreConversationUnknownLogMessage, fields...)
+	}
+	if a.opsMetrics.restoreConversation == nil {
+		return
+	}
+	a.opsMetrics.restoreConversation.Add(ctx, 1, metric.WithAttributes(attribute.String("outcome", string(c.outcome))))
 }
