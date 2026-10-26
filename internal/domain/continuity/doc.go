@@ -14,6 +14,13 @@
 // disagree with the notification surfaces about which text a turn ended
 // on.
 //
+// Each request is quoted as the person asked it (PersonsRequest), never the
+// fixed instructions the control plane opens some stored prompts with.
+// Every placeholder token the sandbox agent substitutes is stripped from
+// every excerpt before it is measured or cut, as from every other text
+// quoted into a prompt (review.StripPlaceholderTokens): the agent replaces
+// them over the whole prompt text, quoted lines included.
+//
 // The recap is framed as a third party's report, never as the agent's own
 // memory: fixed lines say the sandbox was started fresh, that the report
 // was rebuilt from the session's record and can be incomplete or wrong,

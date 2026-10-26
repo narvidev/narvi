@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/narvidev/narvi/internal/domain/plan"
+	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/turn"
 )
 
@@ -117,7 +118,9 @@ type Turn struct {
 	// EndReason is the turn's end reason (turns.end_reason); empty when it
 	// has none.
 	EndReason string
-	// Request is the turn's request: its prompt.
+	// Request is the turn's request: the text a person or a lane asked
+	// it with, or its stored prompt. Build reads it as the person's own
+	// request (PersonsRequest).
 	Request string
 	// Report is the turn's final text as plan.FinalText reads it over the
 	// turn's window of the log, and Reported is FinalText's ok: false when
@@ -183,7 +186,16 @@ func EncodedLen(s string) int {
 // shortened to the room left when only some of it does, and none from the
 // first that does not fit at all. Turns are rendered oldest first, then
 // the interrupted attempt.
+//
+// Every excerpt is made fit to quote into a prompt before anything is
+// measured or cut (quotable): each request is read as the person's own
+// (PersonsRequest), and every placeholder token the sandbox agent
+// substitutes is stripped from every request and report, as from every
+// other text quoted into a prompt (review.StripPlaceholderTokens). The
+// agent's substitution runs over the whole prompt text, quoted lines
+// included, so the quoting alone does not keep a token inert.
 func Build(in Input, budget int) (Recap, bool) {
+	in = quotable(in)
 	turns := in.Turns
 	if len(turns) > MaxTurns {
 		turns = turns[len(turns)-MaxTurns:]
@@ -234,6 +246,41 @@ func Build(in Input, budget int) (Recap, bool) {
 		Omitted: omitted,
 		Trimmed: omitted > 0 || interruptedLeftOut || slices.ContainsFunc(all, isExcerptCutLine),
 	}, true
+}
+
+// quotable is in with every excerpt fit to quote into a prompt: each
+// request read as the person's own, and every placeholder token the
+// sandbox agent substitutes stripped from every request and report, the
+// interrupted attempt's included. in itself is left as it is.
+func quotable(in Input) Input {
+	out := in
+	out.Turns = make([]Turn, len(in.Turns))
+	for i, t := range in.Turns {
+		t.Request = review.StripPlaceholderTokens(PersonsRequest(t.Request))
+		t.Report.Text = review.StripPlaceholderTokens(t.Report.Text)
+		out.Turns[i] = t
+	}
+	if in.Interrupted != nil {
+		a := *in.Interrupted
+		a.Report.Text = review.StripPlaceholderTokens(a.Report.Text)
+		out.Interrupted = &a
+	}
+	return out
+}
+
+// PersonsRequest reads the request a person wrote out of a turn's stored
+// prompt. The control plane opens some prompts with fixed instructions of
+// its own before storing them: the structured-plan instruction on a
+// plan-mode turn (plan.MaybeInjectStructureInstruction), and the epistemic
+// preamble on a build turn when the check is on
+// (turn.MaybeInjectEpistemicPreamble). A recap quotes what was asked,
+// never those, so each is taken off the front of prompt when prompt opens
+// with it. A prompt that opens with neither is returned as it is.
+func PersonsRequest(prompt string) string {
+	for _, injected := range []string{plan.RenderStructureInstruction(), turn.RenderEpistemicPreamble()} {
+		prompt = strings.TrimPrefix(prompt, injected)
+	}
+	return prompt
 }
 
 // fit returns the lines block gives at the excerpt caps when they fit in

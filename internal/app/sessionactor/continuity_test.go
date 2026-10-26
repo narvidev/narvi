@@ -150,3 +150,28 @@ func TestFreshLineageFacts(t *testing.T) {
 		}
 	})
 }
+
+// TestRecapRequest: a recap quotes the text a lane sent for a person
+// (turns.request_text) when the turn has one, its stored prompt otherwise.
+func TestRecapRequest(t *testing.T) {
+	t.Parallel()
+	text := func(s string) *string { return &s }
+	tests := []struct {
+		name string
+		row  sqlcgen.Turn
+		want string
+	}{
+		{"a lane's own text", sqlcgen.Turn{Prompt: text("the composed review prompt"), RequestText: text("Re-review this pull request.")}, "Re-review this pull request."},
+		{"no lane text", sqlcgen.Turn{Prompt: text("fix the parser")}, "fix the parser"},
+		{"an empty lane text", sqlcgen.Turn{Prompt: text("fix the parser"), RequestText: text("")}, "fix the parser"},
+		{"neither", sqlcgen.Turn{}, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := recapRequest(tc.row); got != tc.want {
+				t.Errorf("recapRequest = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

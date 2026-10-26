@@ -330,7 +330,7 @@ func (a *Actor) recapTurns(
 		}
 		newestFirst = append(newestFirst, continuity.Turn{
 			Number: i + 1, Status: turn.State(t.Status), EndReason: stringOrEmpty(t.EndReason),
-			Request: stringOrEmpty(t.Prompt), Report: final, Reported: found,
+			Request: recapRequest(t), Report: final, Reported: found,
 		})
 		in.Turns = oldestFirst(newestFirst)
 		if recap, ok := continuity.Build(in, budget); !ok || recap.Turns < len(newestFirst) {
@@ -338,6 +338,18 @@ func (a *Actor) recapTurns(
 		}
 	}
 	return in, nil
+}
+
+// recapRequest is what t was asked with, as a recap quotes it: the lane's
+// own text a person's label or button sent (turns.request_text), before the
+// review context was folded into the prompt around it, or else the stored
+// prompt, which continuity.Build reads as the person's own request
+// (continuity.PersonsRequest).
+func recapRequest(t sqlcgen.Turn) string {
+	if text := stringOrEmpty(t.RequestText); text != "" {
+		return text
+	}
+	return stringOrEmpty(t.Prompt)
 }
 
 // oldestFirst is turns, read newest first, in the order a recap takes them.
