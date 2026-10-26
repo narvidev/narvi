@@ -20,6 +20,7 @@ package httpapi_test
 // reused as-is since this file lives in the SAME httpapi_test package).
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -27,12 +28,14 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"golang.org/x/sync/errgroup"
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/identitylink"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // --- Local wire-shape mirrors ---
@@ -363,6 +366,168 @@ func TestLinkMemberIdentity_UncheckedAutoLinkBecomesAdminLink(t *testing.T) {
 			}
 			if _, err := rig.identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderSlack, externalID); err != nil {
 				t.Errorf("identity after the next event: %v, want it kept", err)
+			}
+		})
+	}
+}
+
+// TestLinkMemberIdentity_UncheckedAutoLinkChangedMeanwhile proves the
+// force-link answers with the identity as it is once its own promotion has
+// run, never the row it read first. A concurrent event -- the member's
+// re-check removing the unchecked automatic link, or settling it some other
+// way -- holds the row's lock while the handler's promotion waits; when it
+// commits, the promotion matches nothing, and the handler reads the row
+// again: gone, it links the identity anew as an admin link (201); now
+// another member's, 409; confirmed for this member, 200 with that row.
+// Deterministic: the test holds the concurrent event's transaction open
+// until pg_stat_activity shows the promotion waiting on it.
+func TestLinkMemberIdentity_UncheckedAutoLinkChangedMeanwhile(t *testing.T) {
+	rig := newTestRig(t)
+	ctx := context.Background()
+	_, adminToken := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleAdmin)
+
+	for i, tc := range []struct {
+		name string
+		// meanwhile is the concurrent event, run in its own transaction
+		// while the handler's promotion waits on the row.
+		meanwhile  func(t *testing.T, tx pgx.Tx, seeded sqlcgen.Identity, other sqlcgen.User)
+		wantStatus int
+		wantOwner  string // "target", "other", or "" for none checked
+		wantVia    string
+		wantSameID bool
+	}{
+		{
+			name: "removed by the re-check",
+			meanwhile: func(t *testing.T, tx pgx.Tx, seeded sqlcgen.Identity, _ sqlcgen.User) {
+				if n, err := rig.identities.WithTx(tx).DeleteUncheckedAutoLink(ctx, seeded.ID); err != nil || n != 1 {
+					t.Fatalf("DeleteUncheckedAutoLink = (%d, %v), want (1, nil)", n, err)
+				}
+			},
+			wantStatus: http.StatusCreated, wantOwner: "target", wantVia: "admin",
+		},
+		{
+			name: "removed and linked to another member",
+			meanwhile: func(t *testing.T, tx pgx.Tx, seeded sqlcgen.Identity, other sqlcgen.User) {
+				if n, err := rig.identities.WithTx(tx).DeleteUncheckedAutoLink(ctx, seeded.ID); err != nil || n != 1 {
+					t.Fatalf("DeleteUncheckedAutoLink = (%d, %v), want (1, nil)", n, err)
+				}
+				email := "changed-meanwhile-other@example.com"
+				if _, err := rig.identities.WithTx(tx).Create(ctx, sqlcgen.CreateIdentityParams{
+					UserID: other.ID, Provider: sqlcgen.IdentityProviderSlack, ExternalID: seeded.ExternalID,
+					Email: &email, EmailVerified: true, LinkedVia: sqlcgen.IdentityLinkedViaAutoEmail,
+					EmailCheckedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+				}); err != nil {
+					t.Fatalf("link to another member: %v", err)
+				}
+			},
+			wantStatus: http.StatusConflict, wantOwner: "other", wantVia: "auto_email",
+		},
+		{
+			name: "confirmed by the re-check",
+			meanwhile: func(t *testing.T, tx pgx.Tx, seeded sqlcgen.Identity, _ sqlcgen.User) {
+				if n, err := rig.identities.WithTx(tx).ConfirmAutoLinkEmail(ctx, seeded.ID); err != nil || n != 1 {
+					t.Fatalf("ConfirmAutoLinkEmail = (%d, %v), want (1, nil)", n, err)
+				}
+			},
+			wantStatus: http.StatusOK, wantOwner: "target", wantVia: "auto_email", wantSameID: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			target, _ := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
+			other, _ := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMember)
+			externalID := "U-MEANWHILE-" + string(rune('A'+i))
+			email := "meanwhile-" + string(rune('a'+i)) + "@example.com"
+			seeded, err := rig.identities.Create(ctx, sqlcgen.CreateIdentityParams{
+				UserID: target.ID, Provider: sqlcgen.IdentityProviderSlack, ExternalID: externalID,
+				Email: &email, EmailVerified: true, LinkedVia: sqlcgen.IdentityLinkedViaAutoEmail,
+			})
+			if err != nil {
+				t.Fatalf("seed identity: %v", err)
+			}
+
+			event, err := rig.pool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin the concurrent event: %v", err)
+			}
+			defer func() { _ = event.Rollback(ctx) }()
+			tc.meanwhile(t, event, seeded, other)
+
+			var status int
+			var got identityDTOForTest
+			var request errgroup.Group
+			request.Go(func() error {
+				req, err := http.NewRequest(http.MethodPost, rig.server.URL+"/api/members/"+target.ID.String()+"/identities",
+					bytes.NewReader([]byte(`{"provider":"slack","externalId":"`+externalID+`"}`)))
+				if err != nil {
+					return err
+				}
+				req.Header.Set("Content-Type", "application/json")
+				req.AddCookie(&http.Cookie{Name: platform.AuthSessionCookieName, Value: adminToken})
+				resp, err := http.DefaultClient.Do(req)
+				if err != nil {
+					return err
+				}
+				defer func() { _ = resp.Body.Close() }()
+				status = resp.StatusCode
+				if status == http.StatusOK || status == http.StatusCreated {
+					return json.NewDecoder(resp.Body).Decode(&got)
+				}
+				return nil
+			})
+
+			// The handler read the row before the event committed; its
+			// promotion now waits on the event's row lock.
+			deadline := time.Now().Add(30 * time.Second)
+			for {
+				var waiting int
+				if err := rig.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+					WHERE wait_event_type = 'Lock' AND query LIKE '%PromoteUncheckedAutoLinkToAdmin%'`).Scan(&waiting); err != nil {
+					t.Fatalf("read pg_stat_activity: %v", err)
+				}
+				if waiting > 0 {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("the force-link's promotion never waited on the concurrent event")
+				}
+				time.Sleep(10 * time.Millisecond)
+			}
+			if err := event.Commit(ctx); err != nil {
+				t.Fatalf("commit the concurrent event: %v", err)
+			}
+			if err := request.Wait(); err != nil {
+				t.Fatalf("force-link request: %v", err)
+			}
+
+			if status != tc.wantStatus {
+				t.Fatalf("force-link status = %d, want %d", status, tc.wantStatus)
+			}
+			row, err := rig.identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderSlack, externalID)
+			if err != nil {
+				t.Fatalf("GetByProviderAndExternalID: %v", err)
+			}
+			wantOwnerID := target.ID
+			if tc.wantOwner == "other" {
+				wantOwnerID = other.ID
+			}
+			if row.UserID != wantOwnerID || string(row.LinkedVia) != tc.wantVia {
+				t.Errorf("stored identity = user %v, linked_via %q; want user %v, %q", row.UserID, row.LinkedVia, wantOwnerID, tc.wantVia)
+			}
+			if (row.ID == seeded.ID) != tc.wantSameID {
+				t.Errorf("stored identity id %v, seeded %v: same = %v, want %v", row.ID, seeded.ID, row.ID == seeded.ID, tc.wantSameID)
+			}
+			if tc.wantStatus != http.StatusConflict && (got.ID != row.ID.String() || got.LinkedVia != tc.wantVia) {
+				t.Errorf("force-link answered %+v, want the identity as it is now: id %v, linkedVia %q", got, row.ID, tc.wantVia)
+			}
+
+			var forceLinked int
+			if err := rig.pool.QueryRow(ctx,
+				`SELECT count(*) FROM audit_log WHERE action = 'identity.force_linked' AND resource_id = $1`, row.ID.String(),
+			).Scan(&forceLinked); err != nil {
+				t.Fatalf("count audit entries: %v", err)
+			}
+			if want := map[bool]int{true: 1, false: 0}[tc.wantStatus == http.StatusCreated]; forceLinked != want {
+				t.Errorf("identity.force_linked entries for the stored identity = %d, want %d", forceLinked, want)
 			}
 		})
 	}

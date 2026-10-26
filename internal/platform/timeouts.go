@@ -2046,7 +2046,7 @@ type Timeouts struct {
 	// that gives up waiting leaves it running, so a slow first answer is
 	// still cached for the next attempt instead of being cut off with every
 	// attempt in turn. Started alongside users.info, and warmed once at
-	// startup without blocking boot.
+	// startup without blocking boot, outside the development stage.
 	//
 	// Not specified in the plan; chosen as 10s, SlackAckTimeout's figure
 	// for a single Slack Web API call. Validate keeps it strictly longer

@@ -324,7 +324,10 @@ var validProviders = map[string]sqlcgen.IdentityProvider{
 // nothing has confirmed under §13.2's definition of a verified email (a
 // Slack one made before Slack's confirmed-email rule) is first turned into
 // the admin link asked for, audited, and returned with that 200
-// (promoteUncheckedAutoLink). Else 201 with the new restdtos.Identity.
+// (promoteUncheckedAutoLink). The answer always reflects the row as it is
+// after that step: one a concurrent event removed meanwhile is linked anew
+// (201), one that now names another member is a 409. Else 201 with the new
+// restdtos.Identity.
 //
 // The already-linked check (identities.GetByProviderAndExternalID) and
 // the subsequent Create both run INSIDE the same transaction (an audit
@@ -394,12 +397,21 @@ func LinkMemberIdentity(pool *pgxpool.Pool, users *postgres.UserStore, identitie
 				writeError(w, http.StatusConflict, "this identity is already linked to a different member")
 				return
 			}
-			promoted, ok := promoteUncheckedAutoLink(ctx, w, tx, identities, auditLog, actorUserID, existing)
+			current, stillThere, ok := promoteUncheckedAutoLink(ctx, w, tx, identities, auditLog, actorUserID, existing)
 			if !ok {
 				return
 			}
-			writeJSON(w, http.StatusOK, identityToDTO(promoted))
-			return
+			if stillThere {
+				if current.UserID != targetUserID {
+					writeError(w, http.StatusConflict, "this identity is already linked to a different member")
+					return
+				}
+				writeJSON(w, http.StatusOK, identityToDTO(current))
+				return
+			}
+			// Removed since the read above (a concurrent re-check revoked
+			// it): nothing is linked, so this is a new admin link, below.
+			err = pgx.ErrNoRows
 		}
 		if !errors.Is(err, pgx.ErrNoRows) {
 			logger.Error("httpapi: link member identity: lookup existing identity failed", "error", err)
@@ -471,19 +483,37 @@ func LinkMemberIdentity(pool *pgxpool.Pool, users *postgres.UserStore, identitie
 // and might remove it, so "already linked" would be wrong. Inside the
 // handler's own transaction it becomes an admin link with no verified
 // email (IdentityStore.PromoteUncheckedAutoLinkToAdmin) and is audited as
-// a force-link, like a new one, then committed. Any other row is returned
-// as it is, nothing written. ok=false means an error response was written.
-func promoteUncheckedAutoLink(ctx context.Context, w http.ResponseWriter, tx pgx.Tx, identities *postgres.IdentityStore, auditLog *postgres.AuditLogStore, actorUserID pgtype.UUID, existing sqlcgen.Identity) (sqlcgen.Identity, bool) {
+// a force-link, like a new one, then committed.
+//
+// When the promotion matches nothing -- existing was never an unchecked
+// automatic link, or a concurrent event changed or removed it after the
+// handler read it -- the row is read again in the same transaction, and
+// that fresh row is the answer, never the stale one: stillThere=false when
+// it is gone (the caller then creates the admin link as for an identity
+// never linked), otherwise the row as it is now, whoever it names. A
+// concurrent re-check's removal holds the row lock until it commits, so
+// the promotion waits for it and then matches nothing. ok=false means an
+// error response was written.
+func promoteUncheckedAutoLink(ctx context.Context, w http.ResponseWriter, tx pgx.Tx, identities *postgres.IdentityStore, auditLog *postgres.AuditLogStore, actorUserID pgtype.UUID, existing sqlcgen.Identity) (current sqlcgen.Identity, stillThere, ok bool) {
 	logger := platform.Logger(ctx)
 
 	promoted, wasUnchecked, err := identities.WithTx(tx).PromoteUncheckedAutoLinkToAdmin(ctx, existing.ID)
 	if err != nil {
 		logger.Error("httpapi: link member identity: promote unchecked automatic link failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
-		return sqlcgen.Identity{}, false
+		return sqlcgen.Identity{}, false, false
 	}
 	if !wasUnchecked {
-		return existing, true
+		fresh, err := identities.WithTx(tx).GetByProviderAndExternalID(ctx, existing.Provider, existing.ExternalID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return sqlcgen.Identity{}, false, true
+		}
+		if err != nil {
+			logger.Error("httpapi: link member identity: read identity again failed", "error", err)
+			writeError(w, http.StatusInternalServerError, "internal error")
+			return sqlcgen.Identity{}, false, false
+		}
+		return fresh, true, true
 	}
 
 	if err := auditlog.Record(ctx, auditLog.WithTx(tx), actorUserID, "identity.force_linked", "identity", promoted.ID.String(), map[string]any{
@@ -494,14 +524,14 @@ func promoteUncheckedAutoLink(ctx context.Context, w http.ResponseWriter, tx pgx
 	}); err != nil {
 		logger.Error("httpapi: link member identity: record audit log failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
-		return sqlcgen.Identity{}, false
+		return sqlcgen.Identity{}, false, false
 	}
 	if err := tx.Commit(ctx); err != nil {
 		logger.Error("httpapi: link member identity: commit tx failed", "error", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
-		return sqlcgen.Identity{}, false
+		return sqlcgen.Identity{}, false, false
 	}
-	return promoted, true
+	return promoted, true, true
 }
 
 // UnlinkMemberIdentity backs DELETE

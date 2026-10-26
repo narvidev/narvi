@@ -20,7 +20,10 @@
 //   - alongside users.info (GetUserEmail starts it before reading the
 //     member), so an attempt costs one call's latency, not two.
 //   - once at startup, best effort and without blocking boot
-//     (WarmInstallationTeam).
+//     (WarmInstallationTeam), outside the development stage: the control
+//     plane's serve() skips it there, where this repository's own targets
+//     boot with placeholder credentials, and the lookup waits for the first
+//     real event.
 //
 // A failed lookup is never silent: it logs a Warn and counts in
 // slack_installation_team_lookup_failures_total. It also fails closed --
