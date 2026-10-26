@@ -12,6 +12,7 @@ package slack_test
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -35,11 +36,14 @@ func newFakeSlackCountingUsersInfo(t *testing.T, userID, email string) (*httptes
 	t.Helper()
 	var usersInfoCalls int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if answerSlackAuthTest(w, r) {
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		if r.URL.Path == "/users.info" {
 			atomic.AddInt32(&usersInfoCalls, 1)
 			if r.URL.Query().Get("user") == userID {
-				_, _ = w.Write([]byte(`{"ok":true,"user":{"profile":{"email":"` + email + `"}}}`))
+				_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "user": confirmedSlackMember(email)})
 				return
 			}
 		}

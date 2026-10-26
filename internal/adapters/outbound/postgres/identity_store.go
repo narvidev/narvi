@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -95,4 +96,38 @@ func (s *IdentityStore) ListForUser(ctx context.Context, userID pgtype.UUID) ([]
 // by user).
 func (s *IdentityStore) Delete(ctx context.Context, id pgtype.UUID) (int64, error) {
 	return s.q.DeleteIdentity(ctx, id)
+}
+
+// ConfirmAutoLinkEmail records that the re-check of an automatic link found
+// its email verified under §13.2's definition for its provider, as of now
+// (internal/app/identitylink.Resolve). Touches only a linked_via auto_email
+// row; returns the number of rows updated (0 if id is gone or is not an
+// automatic link).
+func (s *IdentityStore) ConfirmAutoLinkEmail(ctx context.Context, id pgtype.UUID) (int64, error) {
+	return s.q.ConfirmAutoLinkedIdentityEmail(ctx, id)
+}
+
+// DeleteUncheckedAutoLink removes an automatic link whose re-check failed
+// (internal/app/identitylink.Resolve) -- only while it is still an
+// automatic link nothing has confirmed, so never a link a person or an
+// admin made, nor one a concurrent re-check has just confirmed. Returns the
+// number of rows deleted (0 when there was nothing of that kind left).
+func (s *IdentityStore) DeleteUncheckedAutoLink(ctx context.Context, id pgtype.UUID) (int64, error) {
+	return s.q.DeleteUncheckedAutoLinkedIdentity(ctx, id)
+}
+
+// PromoteUncheckedAutoLinkToAdmin turns id, an automatic link nothing has
+// confirmed (the rows DeleteUncheckedAutoLink deletes), into an admin link
+// with no verified email -- an admin's force-link of the same identity to
+// the same user (internal/adapters/inbound/httpapi's LinkMemberIdentity).
+// promoted is false, with a nil error, when id is not such a row.
+func (s *IdentityStore) PromoteUncheckedAutoLinkToAdmin(ctx context.Context, id pgtype.UUID) (identity sqlcgen.Identity, promoted bool, err error) {
+	identity, err = s.q.PromoteUncheckedAutoLinkToAdmin(ctx, id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return sqlcgen.Identity{}, false, nil
+	}
+	if err != nil {
+		return sqlcgen.Identity{}, false, err
+	}
+	return identity, true, nil
 }

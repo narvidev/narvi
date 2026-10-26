@@ -54,7 +54,10 @@ const authzSurface = "slack"
 // network call on every single message. The pre-check is the SAME indexed
 // lookup Resolve itself still performs internally (kept there as a safety
 // net, see that function's own doc comment) -- this just does it BEFORE
-// spending a fetch whose result would be thrown away.
+// spending a fetch whose result would be thrown away. An automatic link
+// made before §13.2's Slack definition of a verified email existed reads as
+// not linked to the pre-check until Resolve has re-checked it against the
+// email fetched here (identitylink.Resolve's own doc comment).
 //
 // Returns (actorUserID, notice): actorUserID is Valid iff this identity is
 // now known to belong to a real user (already linked, or auto-linked THIS
@@ -90,17 +93,17 @@ func resolveSlackActor(ctx context.Context, logger *slog.Logger, slackClient sha
 		return userID, ""
 	}
 
-	email, ok := identitylink.FetchEmailWithRetry(ctx, logger, timeouts, sqlcgen.IdentityProviderSlack, func(attemptCtx context.Context) (string, bool, error) {
-		e, o, err := slackClient.GetUserEmail(attemptCtx, slackUserID)
+	email, ok := identitylink.FetchEmailWithRetry(ctx, logger, timeouts, sqlcgen.IdentityProviderSlack, func(attemptCtx context.Context) (identitylink.ProfileEmail, bool, error) {
+		u, o, err := slackClient.GetUserEmail(attemptCtx, slackUserID)
 		if err != nil {
 			if errors.Is(err, slackapi.ErrSlackUserNotFound) {
 				// Slack's own definitive "no such user" -- never
 				// retryable (see that sentinel's own doc comment).
-				return "", false, platform.Permanent(err)
+				return identitylink.ProfileEmail{}, false, platform.Permanent(err)
 			}
-			return "", false, err
+			return identitylink.ProfileEmail{}, false, err
 		}
-		return e, o, nil
+		return slackProfileEmail(u), o, nil
 	})
 
 	res, err := identitylink.Resolve(ctx, identityLinkDeps, sqlcgen.IdentityProviderSlack, slackUserID, email, ok)
@@ -109,6 +112,15 @@ func resolveSlackActor(ctx context.Context, logger *slog.Logger, slackClient sha
 		return pgtype.UUID{}, ""
 	}
 	return res.UserID, res.NotificationText()
+}
+
+// slackProfileEmail hands identitylink what users.info reported: the
+// address, and whether it is a verified email under §13.2's definition for
+// Slack (slackapi.UserEmail.Verified: Slack reports it as confirmed, for a
+// full member of this installation's own workspace). Only a verified one
+// links an identity automatically; any other gets the link prompt.
+func slackProfileEmail(u slackapi.UserEmail) identitylink.ProfileEmail {
+	return identitylink.ProfileEmail{Address: u.Email, Verified: u.Verified()}
 }
 
 // resolveSlackActorSingleAttempt is resolveSlackActor's own deliberately
@@ -167,9 +179,10 @@ func resolveSlackActorSingleAttempt(ctx context.Context, logger *slog.Logger, sl
 	fetchCtx, cancel := context.WithTimeout(ctx, fetchTimeout)
 	defer cancel()
 
-	email, ok, fetchErr := slackClient.GetUserEmail(fetchCtx, slackUserID)
+	user, ok, fetchErr := slackClient.GetUserEmail(fetchCtx, slackUserID)
+	email := slackProfileEmail(user)
 	if fetchErr != nil {
-		email, ok = "", false
+		email, ok = identitylink.ProfileEmail{}, false
 	}
 
 	res, err := identitylink.Resolve(ctx, identityLinkDeps, sqlcgen.IdentityProviderSlack, slackUserID, email, ok)

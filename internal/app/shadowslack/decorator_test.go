@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/adapters/outbound/slackapi"
 )
 
 type fakeStore struct {
@@ -34,9 +35,9 @@ type liveSpy struct {
 	writeCalls  int
 }
 
-func (l *liveSpy) GetUserEmail(context.Context, string) (string, bool, error) {
+func (l *liveSpy) GetUserEmail(context.Context, string) (slackapi.UserEmail, bool, error) {
 	l.readCalls++
-	return "actor@example.com", true, nil
+	return slackapi.UserEmail{Email: "actor@example.com"}, true, nil
 }
 func (l *liveSpy) PostAck(context.Context, string, string, string) error {
 	l.writeCalls++

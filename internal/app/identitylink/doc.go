@@ -21,12 +21,21 @@
 //     means every retry already failed; Resolve does nothing further at
 //     all in that case (no guess, no prompt -- §13.2's own failure rule:
 //     "never null-out an email on transient failure" -- this simply skips
-//     the whole attempt rather than writing anything).
+//     the whole attempt rather than writing anything). The pair is a
+//     ProfileEmail: the address, and whether the provider vouches for it
+//     under §13.2's definition of a verified email for that provider (for
+//     Slack, the email is confirmed and the member is a full member of
+//     this workspace -- slackapi.UserEmail.Verified). An email the provider
+//     does not vouch for is never matched: it goes straight to the link
+//     prompt of step 4.
 //  2. Match against users.primary_email (postgres.UserStore.
 //     GetByPrimaryEmail) and verified identities.email (postgres.
 //     IdentityStore.ListVerifiedUserIDsByEmail), deduplicated by user id.
+//     A Slack automatic link nothing has confirmed since migrations/000178
+//     is not evidence here.
 //  3. internal/domain/identitylink.Decide renders the pure verdict.
-//  4. Exactly one match: INSERT the identities row (linked_via=auto_email)
+//  4. Exactly one match: INSERT the identities row (linked_via=auto_email,
+//     email_verified and email_checked_at as the provider attested)
 //     and an audit_log row, in ONE transaction, then delete any
 //     still-pending link prompt for this same identity (a later,
 //     resolved auto-link supersedes an earlier "we couldn't tell"
@@ -37,6 +46,16 @@
 //     for the concrete policy), otherwise mint a fresh nonce
 //     (platform.GenerateToken, hashed at rest exactly like user_sessions/
 //     ws_tokens already do) and persist it.
+//
+// An identity that is already linked resolves at once -- except a Slack
+// automatic link made before §13.2's Slack definition existed (no
+// email_checked_at), which resolves to no one until the member's next event
+// re-checks it on the email then fetched: kept and stamped when Slack
+// confirms the same email for a full member of this workspace, otherwise
+// removed with an identity.auto_link_revoked audit entry, and the identity
+// goes through steps 2-4 again. A link made through the link prompt or by an
+// admin is never re-checked (service.go's autoLinkUnchecked and
+// recheckAutoLink).
 //
 // Either way, Resolve NEVER blocks the calling ingress flow on any of
 // this (§13.2's own explicit "the action proceeds with bot attribution

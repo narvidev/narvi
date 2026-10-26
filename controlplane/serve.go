@@ -185,6 +185,12 @@ type App struct {
 	// kept so a test can see how it was configured (its App-id TTL).
 	liveSourceControl *githubapi.Adapter
 
+	// slackClient is the one Slack client, kept only when serve() should
+	// warm the installation's workspace at boot (slackInstallationTeamToWarm:
+	// Slack ingress on, outside the development stage), for
+	// warmSlackInstallationTeam; nil otherwise.
+	slackClient *slackapi.Client
+
 	// sessionWaiter is the replica's one bounded-wait service (technical
 	// plan §43.20, row 182's piece (b)), shared by the status route and
 	// its MCP twin; Run hands it to newHTTPServer, which interrupts it
@@ -418,7 +424,41 @@ func serve(modules ...extension.Module) error {
 	if err != nil {
 		return err
 	}
+	app.warmSlackInstallationTeam()
 	return app.Run(ctx, cfg.HTTPAddr)
+}
+
+// warmSlackInstallationTeam starts, best effort, the auth.test lookup that
+// learns the Slack installation's own workspace (§13.2's definition of a
+// verified Slack email), when slackInstallationTeamToWarm kept a client to
+// warm. It returns at once: the lookup runs on its own bounded context
+// (platform.Timeouts.SlackInstallationTeamLookupTimeout), so boot never
+// waits on Slack, and a failure is logged and counted by slackapi while the
+// first profile-email fetch asks again. Called from serve() only, never
+// from Build or Run, which the integration tests drive against Slack's
+// real, unconfigurable host (slackAPIBaseURL).
+func (a *App) warmSlackInstallationTeam() {
+	if a.slackClient != nil {
+		a.slackClient.WarmInstallationTeam()
+	}
+}
+
+// slackInstallationTeamToWarm decides which Slack client, if any, serve()
+// warms at boot: client when Slack ingress is on, outside the development
+// stage; nil otherwise. The development stage is where this repository's
+// own targets run serve() with placeholder Slack credentials and no Slack
+// to talk to -- `make dev`, and the control-plane image check
+// (`make verify-control-plane-image`, run by CI on every pull request) --
+// so a warm-up there would send auth.test to Slack's real host
+// (slackAPIBaseURL, not configurable) on every boot. Skipping it changes
+// nothing else: Slack ingress still mounts, and the lookup runs on a
+// member's first real event instead, alongside users.info, so no request
+// to Slack leaves a development boot.
+func slackInstallationTeamToWarm(stage platform.Stage, slackIngressEnabled bool, client *slackapi.Client) *slackapi.Client {
+	if !slackIngressEnabled || stage == platform.StageDevelopment {
+		return nil
+	}
+	return client
 }
 
 // Build is serve()'s own former wiring, with the boot pre-flights that are
@@ -887,7 +927,14 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// synchronous methods are never called directly by any ingress
 	// handler any more -- every one of those calls goes through
 	// slackDecorated below instead (§30.3's "one client per provider").
-	slackNotifier := slackapi.New(http.DefaultClient, slackAPIBaseURL, cfg.SlackBotToken)
+	//
+	// WithInstallationTeamLookupTimeout bounds the one auth.test call that
+	// learns the installation's own workspace (§13.2's definition of a
+	// verified Slack email), on its own budget rather than a profile-email
+	// attempt's -- see that field's own doc comment.
+	slackNotifier := slackapi.New(http.DefaultClient, slackAPIBaseURL, cfg.SlackBotToken).
+		WithInstallationTeamLookupTimeout(cfg.Timeouts.SlackInstallationTeamLookupTimeout)
+	slackClientToWarm := slackInstallationTeamToWarm(cfg.Stage, slackIngressEnabled, slackNotifier)
 	planSlackNotifier := outboxworker.NewPlanSlackNotifier(slackNotifier, planStore)
 
 	// slackDecorated is §30.3's second compensating control for Slack: the
@@ -3283,6 +3330,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		chatGPTDeviceFlow:       chatGPTDeviceFlow,
 		sessionWaiter:           sessionWaiter,
 		shutdown:                shutdown,
+		slackClient:             slackClientToWarm,
 
 		capabilities:    capabilities,
 		knowledgeRanker: knowledgeRanker,
