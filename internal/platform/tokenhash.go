@@ -1,6 +1,7 @@
 // This file (tokenhash.go) implements the hash/mint helpers backing
 // §6.2's ws-token mechanism: "WS token: per-participant, hashed at rest,
-// 24h TTL, minted via REST (/api/sessions/:id/ws-token)." Used by BOTH
+// minted via REST (/api/sessions/:id/ws-token) right before each
+// connection, and valid for WSTokenTTL." Used by BOTH
 // internal/adapters/inbound/httpapi's minting handler (GenerateToken +
 // HashToken, writing ws_tokens.token_hash) and internal/adapters/inbound/
 // wshub's client-subscribe verification (HashToken only, comparing against

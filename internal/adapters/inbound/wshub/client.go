@@ -39,6 +39,14 @@
 //     (both are treated as "not a valid credential for THIS session",
 //     never leaking which case it was). Found, for this session, but
 //     expired (expires_at before now) -> close 4002 ("token expired").
+//     5b. The session read check (§6.2, §13.3; actorauthz.
+//     AuthorizeSessionRead, the check the ws-token mint makes too): the
+//     token's user exists and is not disabled, its role holds
+//     view_sessions, the session exists. A token with no user (its
+//     minting user was deleted) is refused here too. A "no" -> close 4001
+//     ("re-auth required"), indistinguishable from an unknown token; a
+//     check that cannot be made -> close 1011. Before step 6, so a refused
+//     connection is never registered and is sent nothing.
 //  6. Otherwise: insert the connection into the shared *Hub's session-keyed
 //     map FIRST (Hub.Register), THEN assemble and write the single
 //     `subscribed` reply (SubscribedPayload), and only AFTER that write
@@ -86,10 +94,14 @@
 //     Hub.StartDelivery's own doc comments for the full mechanics.
 //
 //     Then: start the idle-liveness ping loop (see pingClientLoop's own
-//     doc comment -- an unanswered ping closes 4003 "idle timeout"), then
-//     run the post-subscribe read loop (fetch_history, rate-limited
-//     per-connection via platform.Timeouts.ClientFetchHistoryMinInterval)
-//     until the connection errs or closes.
+//     doc comment -- an unanswered ping closes 4003 "idle timeout") and
+//     the access re-check (recheckClientAccessLoop: step 5b's check again
+//     every ClientWSAccessRecheckInterval; a "no" unregisters the
+//     connection and closes it 4001, a check that cannot be made closes
+//     it 1011), then run the post-subscribe read loop (fetch_history,
+//     rate-limited per-connection via
+//     platform.Timeouts.ClientFetchHistoryMinInterval) until the
+//     connection errs or closes.
 //
 // No registry.GetOrSpawn call belongs anywhere in this handshake: every
 // step above is a plain store read (session/ws-token/turns/sandbox/
@@ -120,6 +132,7 @@ import (
 	"github.com/narvidev/narvi/contracts/gen/go/clientws"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
+	"github.com/narvidev/narvi/internal/app/actorauthz"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/sessionactor"
 	"github.com/narvidev/narvi/internal/platform"
@@ -293,6 +306,18 @@ func NewClientHandler(
 			return // verifyClientToken already closed the connection (4001/4002).
 		}
 
+		// (5b) the session read check, before the connection is registered,
+		// so a connection refused here is never registered and never sent
+		// anything. The open socket repeats the same check every
+		// ClientWSAccessRecheckInterval (recheckClientAccessLoop, below).
+		accessLogger := logger.With("user_id", userID.String())
+		checkAccess := func(checkCtx context.Context) actorauthz.LinkedActorVerdict {
+			return actorauthz.AuthorizeSessionRead(checkCtx, accessLogger, "wshub", users, sessions, userID, sessionID)
+		}
+		if !enforceAccessVerdict(ctx, conn, accessCheckPhaseSubscribe, checkAccess(ctx), func() {}, accessLogger) {
+			return // enforceAccessVerdict already closed the connection (4001/1011).
+		}
+
 		// (6) insert conn into the shared Hub's map BEFORE the client can
 		// ever observe the "subscribed" reply below -- see this file's own
 		// top comment for why this ordering, not the reverse, is required.
@@ -306,21 +331,22 @@ func NewClientHandler(
 		// on every early-return path below), so no goroutine outlives the
 		// connection it serves.
 		//
-		// registerUserID is "" for a connection whose ws_tokens row carries
-		// no user (userID.Valid false -- a deleted minting user,
-		// migrations/000016's own nullable-user_id doc comment): Hub.
-		// Register/Participants treat an empty string as "not a presence
-		// participant", never as a real, anonymous user id.
-		var registerUserID string
-		if userID.Valid {
-			registerUserID = userID.String()
-		}
+		// userID is always a real user here: step (5b) refused a token
+		// whose ws_tokens row carries none (a deleted minting user,
+		// migrations/000016's nullable user_id).
+		//
+		// revoke is the one unregister: the access re-check calls it before
+		// it closes the socket, so the Hub stops queuing for a connection
+		// whose subscriber lost access before its close frame is written;
+		// the deferred cleanup calls it too, and the second call does
+		// nothing.
 		writerCtx, cancelWriter := context.WithCancel(ctx)
 		defer cancelWriter()
 		var writerGroup errgroup.Group
-		ch, unregister := hub.Register(sessionID.String(), conn, registerUserID)
+		ch, unregister := hub.Register(sessionID.String(), conn, userID.String())
+		revoke := sync.OnceFunc(unregister)
 		defer func() {
-			unregister()
+			revoke()
 			cancelWriter()
 			_ = writerGroup.Wait()
 		}()
@@ -375,6 +401,14 @@ func NewClientHandler(
 		// pingClientLoop's own doc comment.
 		writerGroup.Go(func() error {
 			pingClientLoop(writerCtx, conn, timeouts.ClientWSPingInterval, logger)
+			return nil
+		})
+
+		// The session read check again, on the open socket (§6.2, §13.3),
+		// on the same writerGroup/writerCtx. See recheckClientAccessLoop's
+		// own doc comment.
+		writerGroup.Go(func() error {
+			recheckClientAccessLoop(writerCtx, conn, timeouts.ClientWSAccessRecheckInterval, checkAccess, revoke, accessLogger)
 			return nil
 		})
 
@@ -453,10 +487,9 @@ func readSubscribeRequest(ctx context.Context, conn *websocket.Conn, timeouts pl
 //
 // userID is row.UserID verbatim -- ws_tokens.user_id is nullable (SET
 // NULL if the minting user is later deleted, migrations/000016's own doc
-// comment), so a caller must check userID.Valid before treating this
-// connection as belonging to a real, presence-worthy participant (§8's
-// own "multiplayer presence" -- Hub.Register, below, is this method's
-// one real caller that does exactly that).
+// comment). This function checks the token only (hash, session, expiry);
+// the caller's step 5b (actorauthz.AuthorizeSessionRead) checks the user,
+// and refuses a token with no user.
 func verifyClientToken(ctx context.Context, conn *websocket.Conn, wsTokens *postgres.WSTokenStore, sessionID pgtype.UUID, token string, logger *slog.Logger) (userID pgtype.UUID, ok bool) {
 	row, err := wsTokens.GetByHash(ctx, platform.HashToken(token))
 	if err != nil {
@@ -854,6 +887,73 @@ func pingClientLoop(ctx context.Context, conn *websocket.Conn, interval time.Dur
 	}
 }
 
+// enforceAccessVerdict counts v under phase (recordAccessCheck) and acts on
+// it: Allowed leaves conn open and returns true. Anything else calls revoke
+// and then closes conn, and returns false -- Denied with 4001 ("re-auth
+// required"), the code and reason an unknown token gets at subscribe, so a
+// client is never told which check said no; Error (the check could not be
+// made) with 1011, as a failed token lookup does (verifyClientToken). At
+// subscribe the connection is not registered yet and revoke does nothing.
+func enforceAccessVerdict(ctx context.Context, conn *websocket.Conn, phase string, v actorauthz.LinkedActorVerdict, revoke func(), logger *slog.Logger) bool {
+	recordAccessCheck(ctx, phase, v)
+	switch v {
+	case actorauthz.LinkedActorAllowed:
+		return true
+	case actorauthz.LinkedActorDenied:
+		logger.Warn("wshub: client access check denied; closing 4001", "phase", phase)
+		revoke()
+		_ = conn.Close(websocket.StatusCode(4001), "re-auth required")
+	default:
+		logger.Error("wshub: client access check could not be made; closing 1011", "phase", phase)
+		revoke()
+		_ = conn.Close(websocket.StatusInternalError, "internal error")
+	}
+	return false
+}
+
+// recheckClientAccessLoop repeats, every interval, the session read check
+// the socket made at subscribe (technical plan §6.2, §13.3; check is
+// actorauthz.AuthorizeSessionRead for this connection's user and
+// session), until ctx is done or a check other than Allowed closes conn
+// (enforceAccessVerdict: revoke first, then 4001 or 1011). Modelled on
+// pingClientLoop and run on the same writerGroup/writerCtx.
+//
+// Each check is bounded by interval itself, as pingClientLoop bounds its
+// ping; one that cannot finish in time is an Error and closes 1011. So
+// once a subscriber loses access at T, its socket gets no frame after
+// T + 2*interval: revoke stops the Hub queuing for it, and once the close
+// frame is written, coder/websocket refuses every later data write. Each
+// socket's ticker starts at its own subscribe, so the checks spread out
+// and a short Postgres outage closes only the sockets whose check falls
+// inside it; the client reconnects as after any close. Each replica reads
+// Postgres for the sockets it holds, so this needs no cross-replica
+// fan-out.
+//
+// A check that returns after ctx is done says nothing about access -- the
+// connection is already ending (its read loop exited) -- so it is neither
+// counted nor acted on.
+func recheckClientAccessLoop(ctx context.Context, conn *websocket.Conn, interval time.Duration, check func(context.Context) actorauthz.LinkedActorVerdict, revoke func(), logger *slog.Logger) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			checkCtx, cancel := context.WithTimeout(ctx, interval)
+			v := check(checkCtx)
+			cancel()
+			if ctx.Err() != nil {
+				return
+			}
+			if !enforceAccessVerdict(ctx, conn, accessCheckPhaseRecheck, v, revoke, logger) {
+				return
+			}
+		}
+	}
+}
+
 // clientEnvelope peeks just the "type" discriminator every post-subscribe
 // client->CP frame carries (mirroring dispatch.go's own envelope-peek
 // convention for the sandbox side). This Step's own protocol defines
@@ -1045,10 +1145,10 @@ type Hub struct {
 
 // hubConn is one registered connection's own bookkeeping: its broadcast
 // delivery channel (the ONLY thing this type carried before §8's
-// "multiplayer presence") plus the real user id it authenticated as --
-// "" for a connection whose ws_tokens row named no user (verifyClientToken's
-// own doc comment: a deleted minting user), which Participants below
-// never counts as a presence participant.
+// "multiplayer presence") plus the real user id it authenticated as.
+// NewClientHandler registers only a connection whose session read check
+// passed, so it always has one; Participants below still never counts a
+// "" user id as a presence participant.
 type hubConn struct {
 	ch     chan []byte
 	userID string
@@ -1086,10 +1186,11 @@ var _ ports.EventBroadcaster = (*Hub)(nil)
 // Hub stops tracking a connection that is going away.
 //
 // userID (§8's "multiplayer presence") is this connection's own
-// authenticated user id, or "" for one that has none (verifyClientToken's
-// own doc comment) -- recorded alongside ch purely so Participants below
-// can report who is live for sessionID; Register itself does nothing
-// else with it.
+// authenticated user id ("" is accepted and never counted as a
+// participant, though NewClientHandler's session read check refuses a
+// connection with no user before it registers) -- recorded alongside ch
+// purely so Participants below can report who is live for sessionID;
+// Register itself does nothing else with it.
 func (h *Hub) Register(sessionID string, conn *websocket.Conn, userID string) (ch chan []byte, unregister func()) {
 	ch = make(chan []byte, hubConnBufferSize)
 

@@ -54,9 +54,11 @@
 //     ListArtifacts: 404 if the session doesn't exist, else 200 with
 //     restdtos.ArtifactsResponse.
 //   - POST /api/sessions/{sessionID}/ws-token -- wstoken.go's MintWSToken:
-//     404 if the session doesn't exist, else mints a fresh token
-//     (platform.GenerateToken), stores only its hash
-//     (platform.HashToken), and responds 200 with
+//     404 if the session doesn't exist, 403 if the caller may not read it
+//     (actorauthz.AuthorizeSessionRead, the check the client socket makes
+//     at subscribe and on every open socket), else mints a fresh,
+//     short-lived token (platform.GenerateToken, WSTokenTTL), stores only
+//     its hash (platform.HashToken), and responds 200 with
 //     restdtos.WSTokenResponse{Token: <plaintext>, ExpiresAt}.
 //
 // # The auth gap -- resolved (§13.1, "auth v1")

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -182,39 +183,43 @@ func newDispatcherTestServer(
 
 // createTestWSToken mints a fresh plaintext ws-token via the SAME
 // production helpers the real mint endpoint uses
-// (platform.GenerateToken/HashToken), persists only its hash with the
+// (platform.GenerateToken/HashToken), for a fresh, active member user of
+// its own (the client socket's session read check refuses a token with
+// no user, technical plan §6.2, §13.3), persists only its hash with the
 // given expiresAt, and returns the plaintext -- exactly what a real
 // client would have received from POST /api/sessions/:id/ws-token.
 func createTestWSToken(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID, expiresAt time.Time) string {
 	t.Helper()
 
-	token, err := platform.GenerateToken()
-	if err != nil {
-		t.Fatalf("generate test ws-token: %v", err)
-	}
-	if _, err := narvipg.NewWSTokenStore(pool).Create(ctx, sqlcgen.CreateWSTokenParams{
-		SessionID: sessionID,
-		TokenHash: platform.HashToken(token),
-		ExpiresAt: pgtype.Timestamptz{Time: expiresAt, Valid: true},
-	}); err != nil {
-		t.Fatalf("create test ws-token: %v", err)
-	}
-	return token
+	userID := createTestUserWithRole(ctx, t, pool, uniqueTestEmail("ws-subscriber"), "WS Subscriber", sqlcgen.UserRoleMember)
+	return createTestWSTokenForUser(ctx, t, pool, sessionID, userID, expiresAt)
 }
 
-// createTestUser inserts a minimal, real users row (§8.11 "multiplayer
-// presence" needs a real user for resolveParticipants to resolve back to
-// a display name) and returns its id. email is namespaced by the caller
-// to avoid colliding with any other test sharing this package's own
-// shared Postgres pool (users.primary_email has no uniqueness constraint
-// today, but a distinct value per test keeps failures easy to attribute).
+// uniqueTestEmail returns an email no other users row holds:
+// users.primary_email is UNIQUE (migrations/000002_users.up.sql).
+func uniqueTestEmail(prefix string) string {
+	return prefix + "-" + uuid.NewString() + "@example.com"
+}
+
+// createTestUser inserts a minimal, real member users row (§8.11
+// "multiplayer presence" needs a real user for resolveParticipants to
+// resolve back to a display name) and returns its id. email must be
+// unique across the rows the test creates: users.primary_email is UNIQUE
+// (migrations/000002_users.up.sql); the shared database is reset between
+// tests.
 func createTestUser(ctx context.Context, t *testing.T, pool *pgxpool.Pool, email, displayName string) pgtype.UUID {
+	t.Helper()
+	return createTestUserWithRole(ctx, t, pool, email, displayName, sqlcgen.UserRoleMember)
+}
+
+// createTestUserWithRole is createTestUser for a given role.
+func createTestUserWithRole(ctx context.Context, t *testing.T, pool *pgxpool.Pool, email, displayName string, role sqlcgen.UserRole) pgtype.UUID {
 	t.Helper()
 
 	created, err := narvipg.NewUserStore(pool).Create(ctx, sqlcgen.CreateUserParams{
 		PrimaryEmail: email,
 		DisplayName:  displayName,
-		Role:         sqlcgen.UserRoleMember,
+		Role:         role,
 	})
 	if err != nil {
 		t.Fatalf("create test user: %v", err)
@@ -222,13 +227,9 @@ func createTestUser(ctx context.Context, t *testing.T, pool *pgxpool.Pool, email
 	return created.ID
 }
 
-// createTestWSTokenForUser mirrors createTestWSToken exactly, except the
-// minted ws_tokens row carries a real user_id -- §8.11's own "multiplayer
-// presence" needs a connection to authenticate as an ACTUAL user before
-// Hub.Participants/resolveParticipants have anything to report; every
-// OTHER existing caller of createTestWSToken deliberately leaves user_id
-// NULL (a legitimate, pre-auth-v1-shaped row, migrations/000016's own
-// nullable column) and is unaffected by this addition.
+// createTestWSTokenForUser mints a ws-token whose ws_tokens row carries
+// userID -- §8.11's own "multiplayer presence" tests name the user
+// themselves, to see it in Hub.Participants/resolveParticipants.
 func createTestWSTokenForUser(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID, userID pgtype.UUID, expiresAt time.Time) string {
 	t.Helper()
 

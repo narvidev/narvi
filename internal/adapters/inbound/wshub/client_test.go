@@ -324,17 +324,18 @@ func TestClientHandler_TokenLookupBackendError(t *testing.T) {
 }
 
 // TestClientHandler_ValidHandshakeSubscribes proves a fully valid
-// handshake replies with a single `subscribed` payload of the right
-// shape: sessionId matches, participants is an empty array (this token
-// carries no user_id -- createTestWSToken's own established convention,
-// mirroring a pre-auth-v1 or since-deleted-user row -- so there is no
-// real user for §8.11's presence tracking to report; see
-// TestClientHandler_ParticipantsReflectsLiveConnections below for the
-// real-user case), and events/artifacts/state are present.
+// handshake -- a token for this session, unexpired, whose user is an
+// active member -- replies with a single `subscribed` payload of the
+// right shape: sessionId matches, participants holds exactly the
+// subscribing user (§8.11's presence; see
+// TestClientHandler_ParticipantsReflectsLiveConnections below for several
+// users), and events/artifacts/state are present. A token with no user is
+// refused instead (TestClientHandler_SubscribeAccessGate).
 func TestClientHandler_ValidHandshakeSubscribes(t *testing.T) {
 	rig, sessionRow := newClientTestRig(t, platform.DefaultTimeouts())
 	ctx := context.Background()
-	token := createTestWSToken(ctx, t, rig.pool, sessionRow.ID, time.Now().Add(24*time.Hour))
+	user := createTestUser(ctx, t, rig.pool, uniqueTestEmail("valid-handshake"), "Valid Handshake User")
+	token := createTestWSTokenForUser(ctx, t, rig.pool, sessionRow.ID, user, time.Now().Add(24*time.Hour))
 
 	conn, _, err := websocket.Dial(ctx, rig.wsURL+"/sessions/"+sessionRow.ID.String()+"/ws?type=client", nil)
 	if err != nil {
@@ -366,8 +367,8 @@ func TestClientHandler_ValidHandshakeSubscribes(t *testing.T) {
 	if payload.SessionId != sessionRow.ID.String() {
 		t.Errorf("SessionId = %q, want %q", payload.SessionId, sessionRow.ID.String())
 	}
-	if len(payload.Participants) != 0 {
-		t.Errorf("Participants = %v, want an empty array (untouched this Step)", payload.Participants)
+	if got, want := participantNames(t, payload), []string{"Valid Handshake User"}; !equalUnordered(got, want) {
+		t.Errorf("Participants = %v, want %v (the subscribing user alone)", got, want)
 	}
 	if payload.Events == nil {
 		t.Error("Events = nil, want a (possibly empty) array")

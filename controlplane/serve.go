@@ -2254,7 +2254,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 		r.Post("/{sessionID}/uploads", httpapi.MintUploadAPI(sessionStore, participantStore, artifactStore, blobStore, cfg.ObjectStorage, cfg.Timeouts))
 		r.Post("/{sessionID}/uploads/{uploadID}/complete", httpapi.ConfirmUploadAPI(sessionStore, participantStore, pool, artifactStore, eventStore, outboxStore, sandboxStore, hub, blobStore, cfg.ObjectStorage))
 		r.Get("/{sessionID}/uploads/{uploadID}/content", httpapi.UploadContentAPI(sessionStore, artifactStore, blobStore, cfg.ObjectStorage, cfg.Timeouts))
-		r.Post("/{sessionID}/ws-token", httpapi.MintWSToken(sessionStore, wsTokenStore, cfg.Timeouts))
+		r.Post("/{sessionID}/ws-token", httpapi.MintWSToken(sessionStore, wsTokenStore, userStore, cfg.Timeouts))
 		// turns ("turn recovery", §8.7): the relaunch-and-resume
 		// REST API -- enqueues a new turn on an existing session, 409 if
 		// one is already in flight. See httpapi/turn.go's own doc comment.
