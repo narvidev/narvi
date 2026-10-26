@@ -10,6 +10,34 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.30.0]
+
+### sandbox-ws/v1/events.schema.json
+
+- Added: optional `ExecutionComplete.interruption`, an enum with one
+  value, `sandbox_stopping` (technical plan §35.4): the turn did not end
+  on its own account but because the sandbox running it is stopping --
+  the agent's process was told to stop while the turn ran. An agent sets
+  it only on the turn's own end (`subTaskId` absent or null), never on a
+  sub-task's, and only when the outcome is not `completed`; `reason` and
+  `diagnostic` stay the runtime's own. It says what the agent saw, never
+  why the sandbox stopped: whether that was the sandbox's lifetime
+  deadline is the control plane's call, from the deadline it persisted
+  (§35.2). Absent: the turn ended on its own account, as every end did
+  before. Nothing sets it yet, and nothing acts on it yet. A control
+  plane built before this release ignores the key. This release's control
+  plane decodes an `execution_complete` without the key and reads the key
+  on its own, leniently, any non-empty string counting as an
+  interruption, so no value it holds can cost the frame. A property
+  added, not required, grades MINOR (row 2) under both of the events
+  file's directions; the `execution_complete` union member changes only
+  by that property (row 30, recursing into row 2).
+- Added: `sandbox-ws/v1/events.schema.json#/$defs/ExecutionComplete/properties/interruption`
+  to `manifest.json`'s `openEnums`, so a later value grades MINOR: a
+  reader MUST read a value it does not recognise as an interruption,
+  never refuse the frame over it. The entry is not itself a graded
+  finding; read from the merge base, it applies from the next release.
+
 ## [1.29.0]
 
 ### sandbox-ws/v1/events.schema.json

@@ -770,6 +770,17 @@ type ExecutionComplete struct {
 	// Gen corresponds to the JSON schema field "gen".
 	Gen int `json:"gen" yaml:"gen" mapstructure:"gen"`
 
+	// Technical plan §35.4: present only when the turn did not end on its own account
+	// but because the sandbox running it is stopping -- the agent's process was told
+	// to stop while the turn ran. Set only on the turn's own end (subTaskId absent or
+	// null), never on a sub-task's; outcome is then failed or cancelled, never
+	// completed, and reason is the runtime's own. A control plane keeps the turn
+	// processing and sends it again to the sandbox that replaces this one. Absent:
+	// the turn ended on its own account. An OPEN enum (manifest.json's openEnums): a
+	// control plane reads any value as an interruption and never refuses a frame over
+	// one it does not know.
+	Interruption *ExecutionCompleteInterruption `json:"interruption,omitempty,omitzero" yaml:"interruption,omitempty" mapstructure:"interruption,omitempty"`
+
 	// MessageId corresponds to the JSON schema field "messageId".
 	MessageId string `json:"messageId" yaml:"messageId" mapstructure:"messageId"`
 
@@ -837,6 +848,34 @@ type ExecutionCompleteDiagnostic struct {
 	// OpenCode's own tagged-union error-kind name, e.g. "APIError" -- purely
 	// descriptive, never itself a classification input.
 	UnionMember *string `json:"unionMember,omitempty,omitzero" yaml:"unionMember,omitempty" mapstructure:"unionMember,omitempty"`
+}
+
+type ExecutionCompleteInterruption string
+
+const ExecutionCompleteInterruptionSandboxStopping ExecutionCompleteInterruption = "sandbox_stopping"
+
+var enumValues_ExecutionCompleteInterruption = []interface{}{
+	"sandbox_stopping",
+}
+
+// UnmarshalJSON implements json.Unmarshaler.
+func (j *ExecutionCompleteInterruption) UnmarshalJSON(value []byte) error {
+	var v string
+	if err := json.Unmarshal(value, &v); err != nil {
+		return err
+	}
+	var ok bool
+	for _, expected := range enumValues_ExecutionCompleteInterruption {
+		if reflect.DeepEqual(v, expected) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
+		return fmt.Errorf("invalid value (expected one of %#v): %#v", enumValues_ExecutionCompleteInterruption, v)
+	}
+	*j = ExecutionCompleteInterruption(v)
+	return nil
 }
 
 type ExecutionCompleteOutcome string
