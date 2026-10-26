@@ -308,7 +308,11 @@
         "messageId": { "type": "string" },
         "sessionId": { "type": "string", "format": "uuid" },
         "gen": { "type": "integer" },
-        "message": { "type": "string" }
+        "message": { "type": "string" },
+        "scope": {
+          "type": "string",
+          "description": "What the warning is about, for a reader that groups warnings. 'continuity': the agent's working context was lost or rewound (technical plan §35.5). Absent on every other warning. A reader treats a value it does not know as absent."
+        }
       }
     },
     "SandboxErrorEvent": {

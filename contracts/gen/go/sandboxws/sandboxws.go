@@ -2836,6 +2836,11 @@ type Warning struct {
 	// MessageId corresponds to the JSON schema field "messageId".
 	MessageId string `json:"messageId" yaml:"messageId" mapstructure:"messageId"`
 
+	// What the warning is about, for a reader that groups warnings. 'continuity': the
+	// agent's working context was lost or rewound (technical plan §35.5). Absent on
+	// every other warning. A reader treats a value it does not know as absent.
+	Scope *string `json:"scope,omitempty,omitzero" yaml:"scope,omitempty" mapstructure:"scope,omitempty"`
+
 	// SessionId corresponds to the JSON schema field "sessionId".
 	SessionId string `json:"sessionId" yaml:"sessionId" mapstructure:"sessionId"`
 

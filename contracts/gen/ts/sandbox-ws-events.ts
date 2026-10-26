@@ -397,6 +397,10 @@ export interface Warning {
   sessionId: string;
   gen: number;
   message: string;
+  /**
+   * What the warning is about, for a reader that groups warnings. 'continuity': the agent's working context was lost or rewound (technical plan §35.5). Absent on every other warning. A reader treats a value it does not know as absent.
+   */
+  scope?: string;
 }
 /**
  * CRITICAL (requires ackId). Named SandboxErrorEvent rather than Error in this schema — a $def literally named Error generates a TS interface that shadows the built-in Error class for any consumer that imports it unaliased.
