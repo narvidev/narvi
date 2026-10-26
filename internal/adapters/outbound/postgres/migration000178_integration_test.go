@@ -16,30 +16,29 @@ import (
 	"github.com/narvidev/narvi/migrations"
 )
 
-// This file runs the turn_continuity_recap migration through
+// This file runs the sandbox_fresh_lineage migration through
 // golang-migrate against real Postgres, in a database of its own migrated
-// to the version before it. The up adds two nullable columns to every turn
-// with no backfill -- continuity_recap, text, and continuity_recap_gen, an
-// integer -- so a turn that exists when it runs reads as having carried no
-// recap (technical plan §35.5); the down drops them, guarded, and runs
-// again once they are gone. It also pins what the file's "Rolling back"
-// section says: the previous binary cannot boot on it, and forcing the
-// version back keeps the columns and their values for this release's next
-// deploy.
+// to the version before it. The up adds a nullable integer to every
+// sandbox with no backfill, so a sandbox that exists when it runs reads
+// unmarked -- no fresh lineage owes a recap (technical plan §35.5); the
+// down drops it, guarded, and runs again once it is gone. It also pins what
+// the file's "Rolling back" section says: the previous binary cannot boot
+// on it, and forcing the version back keeps the column and its value for
+// this release's next deploy.
 
-// continuityRecapMigration is this migration's version.
-const continuityRecapMigration = 178
+// freshLineageMigration is this migration's version.
+const freshLineageMigration = 178
 
-func TestMigrationTurnContinuityRecap_UpAndDown(t *testing.T) {
+func TestMigrationSandboxFreshLineage_UpAndDown(t *testing.T) {
 	ctx := context.Background()
-	previousVersion := versionBefore(t, continuityRecapMigration)
+	previousVersion := versionBefore(t, freshLineageMigration)
 	connStr, db := migrationTestDatabase(ctx, t, previousVersion)
 
-	column := func(name string) (exists, nullable bool, dataType string) {
+	column := func() (exists, nullable bool, dataType string) {
 		t.Helper()
 		var isNullable string
 		err := db.QueryRowContext(ctx, `SELECT is_nullable, data_type FROM information_schema.columns
-			WHERE table_name = 'turns' AND column_name = $1`, name).Scan(&isNullable, &dataType)
+			WHERE table_name = 'sandboxes' AND column_name = 'fresh_lineage_gen'`).Scan(&isNullable, &dataType)
 		if errors.Is(err, sql.ErrNoRows) {
 			return false, false, ""
 		}
@@ -52,80 +51,73 @@ func TestMigrationTurnContinuityRecap_UpAndDown(t *testing.T) {
 	if err := db.QueryRowContext(ctx, `INSERT INTO sessions (spawn_source, repos) VALUES ('web', '[]'::jsonb) RETURNING id::text`).Scan(&sessionID); err != nil {
 		t.Fatalf("insert a session: %v", err)
 	}
-	var turnID string
-	if err := db.QueryRowContext(ctx, `INSERT INTO turns (session_id, status, dispatched_sandbox_gen) VALUES ($1::uuid, 'processing', 2) RETURNING id::text`, sessionID).Scan(&turnID); err != nil {
-		t.Fatalf("insert a turn: %v", err)
+	if _, err := db.ExecContext(ctx, `INSERT INTO sandboxes (session_id) VALUES ($1::uuid)`, sessionID); err != nil {
+		t.Fatalf("insert a sandbox: %v", err)
 	}
-	columns := map[string]string{"continuity_recap": "text", "continuity_recap_gen": "integer"}
-	value := func() (recap sql.NullString, gen sql.NullInt64) {
+	value := func() sql.NullInt64 {
 		t.Helper()
-		if err := db.QueryRowContext(ctx, `SELECT continuity_recap, continuity_recap_gen FROM turns WHERE id = $1::uuid`, turnID).Scan(&recap, &gen); err != nil {
-			t.Fatalf("read the turn's recap columns: %v", err)
+		var got sql.NullInt64
+		if err := db.QueryRowContext(ctx, `SELECT fresh_lineage_gen FROM sandboxes WHERE session_id = $1::uuid`, sessionID).Scan(&got); err != nil {
+			t.Fatalf("read the sandbox's fresh_lineage_gen: %v", err)
 		}
-		return recap, gen
+		return got
 	}
-	for name := range columns {
-		if exists, _, _ := column(name); exists {
-			t.Fatalf("%s exists at %d, want it absent", name, previousVersion)
-		}
+	if exists, _, _ := column(); exists {
+		t.Fatalf("fresh_lineage_gen exists at %d, want it absent", previousVersion)
 	}
 
 	m, mdb := newMigrate(t, connStr)
 	defer func() { _ = mdb.Close() }()
-	if err := m.Migrate(continuityRecapMigration); err != nil {
-		t.Fatalf("up to %d: %v", continuityRecapMigration, err)
+	if err := m.Migrate(freshLineageMigration); err != nil {
+		t.Fatalf("up to %d: %v", freshLineageMigration, err)
 	}
-	for name, want := range columns {
-		if exists, nullable, dataType := column(name); !exists || !nullable || dataType != want {
-			t.Fatalf("%s after the up: exists %v, nullable %v, type %q; want a nullable %s", name, exists, nullable, dataType, want)
-		}
+	if exists, nullable, dataType := column(); !exists || !nullable || dataType != "integer" {
+		t.Fatalf("fresh_lineage_gen after the up: exists %v, nullable %v, type %q; want a nullable integer", exists, nullable, dataType)
 	}
-	if recap, gen := value(); recap.Valid || gen.Valid {
-		t.Fatalf("an existing turn's recap after the up = %v, %v; want NULL, NULL: nothing is backfilled", recap, gen)
+	if got := value(); got.Valid {
+		t.Fatalf("an existing sandbox's fresh_lineage_gen = %d after the up, want NULL: nothing is backfilled", got.Int64)
 	}
-	if _, err := db.ExecContext(ctx, `UPDATE turns SET continuity_recap = 'the recap kept', continuity_recap_gen = 2 WHERE id = $1::uuid`, turnID); err != nil {
-		t.Fatalf("record a recap: %v", err)
+	if _, err := db.ExecContext(ctx, `UPDATE sandboxes SET fresh_lineage_gen = gen WHERE session_id = $1::uuid`, sessionID); err != nil {
+		t.Fatalf("mark the sandbox: %v", err)
 	}
 
 	// The previous binary cannot boot on this version.
 	previous, pdb := previousBinaryMigrate(t, connStr, int(previousVersion))
-	if err := previous.Up(); err == nil || !strings.Contains(err.Error(), fmt.Sprint(continuityRecapMigration)) {
-		t.Fatalf("the previous binary's boot on %d = %v, want a refusal naming %d", continuityRecapMigration, err, continuityRecapMigration)
+	if err := previous.Up(); err == nil || !strings.Contains(err.Error(), fmt.Sprint(freshLineageMigration)) {
+		t.Fatalf("the previous binary's boot on %d = %v, want a refusal naming %d", freshLineageMigration, err, freshLineageMigration)
 	}
 	_ = pdb.Close()
 
-	// Rolling back with the columns kept: force the previous version; this
-	// release's migration, run again, keeps the columns and their values.
+	// Rolling back with the column kept: force the previous version; this
+	// release's migration, run again, keeps the column and its value.
 	if err := m.Force(int(previousVersion)); err != nil {
 		t.Fatalf("force %d: %v", previousVersion, err)
 	}
-	if err := m.Migrate(continuityRecapMigration); err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		t.Fatalf("up to %d again: %v", continuityRecapMigration, err)
+	if err := m.Migrate(freshLineageMigration); err != nil && !errors.Is(err, migrate.ErrNoChange) {
+		t.Fatalf("up to %d again: %v", freshLineageMigration, err)
 	}
-	if recap, gen := value(); recap.String != "the recap kept" || !gen.Valid || gen.Int64 != 2 {
-		t.Fatalf("the turn's recap after the up ran again = %v, %v; want the values kept", recap, gen)
+	if got := value(); !got.Valid {
+		t.Fatal("the sandbox's fresh_lineage_gen after the up ran again = NULL, want its value kept")
 	}
 
-	// The down drops the columns, and runs again once they are gone.
+	// The down drops the column, and runs again once it is gone.
 	if err := m.Migrate(previousVersion); err != nil {
 		t.Fatalf("down to %d: %v", previousVersion, err)
 	}
-	for name := range columns {
-		if exists, _, _ := column(name); exists {
-			t.Fatalf("%s still exists after the down", name)
-		}
+	if exists, _, _ := column(); exists {
+		t.Fatal("fresh_lineage_gen still exists after the down")
 	}
-	down, err := fs.ReadFile(migrations.FS, fmt.Sprintf("%06d_turn_continuity_recap.down.sql", continuityRecapMigration))
+	down, err := fs.ReadFile(migrations.FS, fmt.Sprintf("%06d_sandbox_fresh_lineage.down.sql", freshLineageMigration))
 	if err != nil {
 		t.Fatalf("read the down: %v", err)
 	}
 	if _, err := db.ExecContext(ctx, string(down)); err != nil {
-		t.Fatalf("the down, run again once the columns are gone: %v", err)
+		t.Fatalf("the down, run again once the column is gone: %v", err)
 	}
-	if err := m.Migrate(continuityRecapMigration); err != nil {
-		t.Fatalf("up to %d after the down: %v", continuityRecapMigration, err)
+	if err := m.Migrate(freshLineageMigration); err != nil {
+		t.Fatalf("up to %d after the down: %v", freshLineageMigration, err)
 	}
-	if recap, gen := value(); recap.Valid || gen.Valid {
-		t.Fatalf("the turn's recap after a down and an up = %v, %v; want NULL, NULL", recap, gen)
+	if got := value(); got.Valid {
+		t.Fatalf("the sandbox's fresh_lineage_gen after a down and an up = %d, want NULL", got.Int64)
 	}
 }

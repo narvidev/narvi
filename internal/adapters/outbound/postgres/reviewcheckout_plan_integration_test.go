@@ -20,7 +20,8 @@ import (
 // 000168 add the checkout's, and ClearSandboxSnapshot clears the
 // snapshot's provenance too, which snapshotProvenanceMigration adds and
 // repoHooksLineageMigration extends with snapshot_skipped_repo_hooks_id,
-// and it returns the whole sandbox row, which names fresh_lineage_gen
+// and the conversation snapshotConversationMigration records for it, and
+// it returns the whole sandbox row, which names fresh_lineage_gen
 // (freshLineageMigration).
 const checkoutPlanVersion = freshLineageMigration
 

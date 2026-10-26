@@ -7128,7 +7128,17 @@ nothing was ever in progress. Nothing tells the user that anything was lost.
 
 Coverage is deliberately narrow: only a fresh lineage ships a recap. A restore whose snapshot did
 not carry a usable runtime session loses context too and ships none yet — that case is instrumented
-first, so the decision to widen rests on how often it actually happens.
+first, so the decision to widen rests on how often it actually happens. The statement that records
+a snapshot also records the conversation the session held at that moment, keyed by the snapshot's
+id like its provenance (`sandboxes.snapshot_conversation_id`, `snapshot_conversation_recorded_id`,
+migration 000177), and the clear that forgets the snapshot forgets it. Every restore compares it
+with the conversation its prompts will name (`sandbox.ClassifyRestoreConversation`), and once the
+claim has committed counts the outcome on `sandbox_restore_conversation_total{outcome}`:
+`held` (the same conversation); `differs` (another one, or one on only one side — logged at WARN
+with the snapshot and both ids); `none` (neither names one); `unknown` (nothing recorded for that
+snapshot: one recorded before the record, or by a control plane without it — logged at INFO). No
+outcome refuses, marks, announces or recaps a restore. `held` is evidence, not proof: whether a
+provider's snapshot captures the runtime's session storage is not established from code.
 
 ### 35.5b The snapshot carries the runtime it was minted under (amendment)
 
@@ -7199,7 +7209,8 @@ provenance before contracts 1.25.0 and nothing recorded one before that migratio
 snapshot that exists at that deploy is unknown, and stays so for as long as its lineage is restored.
 Refusing them would cost every such session its context at once, so they restore; whether to stage
 their refusal is decided once §35.5's recap exists, from
-`sandbox_snapshot_restore_total{provenance="unknown"}` and `snapshot_minted_at`. Steps 136 and 139
+`sandbox_snapshot_restore_total{provenance="unknown"}`, `snapshot_minted_at` and
+`sandbox_restore_conversation_total`. Steps 136 and 139
 carry this.
 
 ### 35.6 One stored row per distinct frame of a text part
