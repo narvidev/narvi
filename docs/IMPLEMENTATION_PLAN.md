@@ -98,7 +98,7 @@ TECHNICAL_PLAN.md §12), never invented independently of it.
 | 31 | webhook toolkit | Signature verify, dedupe/claims `INSERT ON CONFLICT`, single `CreateSessionRequest` | §5.1 |
 | 32 ∥ | GitHub ingress | PR mentions, per-PR coalescing (see note below on "events → automations") | §8.2 |
 | 33 ∥ | Slack ingress | Thread↔session in Postgres, bidirectional mrkdwn contract, in-thread acks | §8.10 |
-| 34 ∥ | Linear ingress | AgentSession webhooks, progressive AgentActivity, OAuth | §8.10 |
+| 34 ∥ | Linear ingress | AgentSession webhooks, progressive AgentActivity, OAuth. Note (amendment): a delegation's issue text and other people's comments reach the agent as quoted data; only the delegator's own request is an instruction (§5.2) | §8.10, §5.2 |
 | 35 | outbox delivery | Slack/Linear/GitHub delivery workers, retry backoff, dead-letter, outbox-lag metric | §5.1 |
 | 36 | intent classifier | Domain + DB-editable templates + assembled-prompt preview, **shadow mode** + decision logs, deterministic fail-open (any re-run phrasing a posted verdict recommends must be routable by this same fallback, not only the model path, §5.2) | §8.3, §5.2 |
 | 37 | plan mode (web) | Persistent versioned plan, approval, **server-side implementation dispatch**, plan/build model split | §8.1 |
