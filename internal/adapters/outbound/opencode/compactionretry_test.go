@@ -559,7 +559,6 @@ func TestCompactionRetry_StepFinishCostDuringCompactionIsCounted(t *testing.T) {
 	// here has no ordering ambiguity at all.
 	const stepID = "prt_stepfinish_guard"
 	const compactionCost = 0.0042
-	before := ts.lastActivityTime()
 	stepFinish := struct {
 		ID        string  `json:"id"`
 		MessageID string  `json:"messageID"`
@@ -572,23 +571,23 @@ func TestCompactionRetry_StepFinishCostDuringCompactionIsCounted(t *testing.T) {
 	}
 	f.broadcast(sseLine(t, "message.part.updated", messagePartUpdatedProps{SessionID: "ses_fake", Part: raw}))
 
-	// touch() runs unconditionally as the very first thing dispatchEvent's
-	// own message.part.updated case does (sse.go), strictly before its
-	// isCompacting check -- polling for lastActivityTime to advance past
-	// `before` is a deterministic proxy for "this exact broadcast has now
-	// been fully dispatched" (guard included).
+	// Wait for the cost itself, never for lastActivityTime: touch() is the
+	// first thing dispatchEvent's message.part.updated case does (sse.go),
+	// and it releases ts.mu before the isCompacting guard decodes the part
+	// and calls addCost -- so a moved lastActivityTime says the part
+	// reached the turn, not that its cost was added. addCost is the
+	// guard's last call before it returns, so once the total moves, the
+	// part is fully dispatched and the suppression checks below read its
+	// final effect. A total still 0 at testWait is the D1 regression.
 	deadline := time.Now().Add(testWait)
-	for !ts.lastActivityTime().After(before) {
-		if time.Now().After(deadline) {
-			t.Fatal("the broadcast step-finish part was never dispatched (ts.lastActivityTime never advanced) within testWait")
-		}
+	for ts.spentUSDTotal() == 0 && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
 	}
 
 	// D1's own fix: the compaction wave's own step-finish cost MUST still
 	// be counted, even though this part is otherwise fully suppressed.
 	if got := ts.spentUSDTotal(); got != compactionCost {
-		t.Errorf("spentUSDTotal() = %v after a compaction-internal step-finish broadcast while gated, want %v -- "+
+		t.Errorf("spentUSDTotal() = %v within testWait of a compaction-internal step-finish broadcast while gated, want %v -- "+
 			"dispatchEvent's own isCompacting guard (sse.go, the \"message.part.updated\" case) must still count "+
 			"cost even while suppressing every other effect of the part", got, compactionCost)
 	}
