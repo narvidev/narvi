@@ -94,6 +94,9 @@ type sentinelAutoFixFreezeFixture struct {
 	identityHash  string
 	// payload is the row's payload; enqueue derives further rows from it.
 	payload ports.SentinelAutoFixPayload
+	// notifier is the real notifier the builder delivers through, for a
+	// test that delivers rows itself.
+	notifier ports.Notifier
 	// builderReading builds another Builder over the same row, stores and
 	// code host, whose notifier reads the repository's settings from
 	// repoSettings.
@@ -144,12 +147,14 @@ func newSentinelAutoFixFreezeFixture(ctx context.Context, t *testing.T) *sentine
 	row := enqueueSentinelAutoFix(ctx, t, store, originSession, payload)
 
 	sourceControl := &fakeSentinelAutoFixSourceControl{nextSHA: "deadbeef"}
-	builderReading := func(repoSettings *narvipg.RepoSettingsStore) *outboxworker.Builder {
-		notifier := mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, sessions, narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), registry, sentinelFixes, reviewFindings,
+	notifierReading := func(repoSettings *narvipg.RepoSettingsStore) ports.Notifier {
+		return mustNotifier(outboxworker.NewSentinelAutoFixNotifier(pool, sessions, narvipg.NewTurnStore(pool), narvipg.NewEnvironmentStore(pool), narvipg.NewAuditLogStore(pool), registry, sentinelFixes, reviewFindings,
 			sourceControl, platform.MustNewGitHubOutboundConfig("gh-fake-bot-token"), platform.DefaultTimeouts(), false, platform.RolloutModeOpen, repoSettings, narvipg.NewGitHubPRSessionStore(pool),
 			func(context.Context, string) bool { return true }, narvipg.NewShadowSCMWriteStore(pool)))
+	}
+	builderReading := func(repoSettings *narvipg.RepoSettingsStore) *outboxworker.Builder {
 		builder, err := outboxworker.NewBuilder(store, pool, map[ports.NotificationKind]ports.Notifier{
-			ports.NotificationKindSentinelAutoFix: notifier,
+			ports.NotificationKindSentinelAutoFix: notifierReading(repoSettings),
 		}, platform.DefaultTimeouts(), &platform.ShutdownState{})
 		if err != nil {
 			t.Fatalf("NewBuilder: %v", err)
@@ -158,7 +163,8 @@ func newSentinelAutoFixFreezeFixture(ctx context.Context, t *testing.T) *sentine
 	}
 	return &sentinelAutoFixFreezeFixture{
 		pool: pool, builder: builderReading(narvipg.NewRepoSettingsStore(pool)), sourceControl: sourceControl, sentinelFixes: sentinelFixes, findings: reviewFindings,
-		fix: fix, row: row, repoFullName: repoFullName, identityHash: identityHash, payload: payload, builderReading: builderReading,
+		fix: fix, row: row, repoFullName: repoFullName, identityHash: identityHash, payload: payload,
+		notifier: notifierReading(narvipg.NewRepoSettingsStore(pool)), builderReading: builderReading,
 	}
 }
 
@@ -259,19 +265,73 @@ func (f *sentinelAutoFixFreezeFixture) setAutoFix(ctx context.Context, t *testin
 
 // skipRecords counts the audit rows recording this fix as skipped because
 // its repository has the sentinel auto-fix off: system-attributed (no
-// actor), on the claim, naming the reason, the claim released, and the
-// fix branch an earlier attempt would have left behind.
+// actor), on the claim, naming the reason, the claim released by this
+// delivery, and the fix branch an earlier attempt would have left behind.
 func (f *sentinelAutoFixFreezeFixture) skipRecords(ctx context.Context, t *testing.T) int {
 	t.Helper()
 	var n int
 	if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM audit_log
 		WHERE action = 'sentinel_fix.spawn_skipped' AND resource_type = 'sentinel_fix' AND resource_id = $1
 		  AND actor_user_id IS NULL AND detail_json->>'reason' = 'sentinel_autofix_disabled'
-		  AND detail_json->>'repo_full_name' = $2 AND detail_json->>'claim_released' = 'true'
+		  AND detail_json->>'repo_full_name' = $2 AND detail_json->>'claim' = 'released'
 		  AND detail_json->>'fix_branch' = $3`, f.fix.ID.String(), f.repoFullName, "narvi/sentinel-fix/"+f.fix.ID.String()).Scan(&n); err != nil {
 		t.Fatalf("count skip records: %v", err)
 	}
 	return n
+}
+
+// skipRecord is one sentinel_fix.spawn_skipped audit row's reason, what
+// it says became of the claim, and the findings it names.
+type skipRecord struct {
+	reason string
+	claim  string
+	hashes []string
+}
+
+// skipRecordsByFinding reads every skip record on the fixture's claim that
+// is system-attributed and names the claim's fix branch, keyed by the
+// first finding each names.
+func (f *sentinelAutoFixFreezeFixture) skipRecordsByFinding(ctx context.Context, t *testing.T) map[string]skipRecord {
+	t.Helper()
+	rows, err := f.pool.Query(ctx, `SELECT detail_json->>'reason', detail_json->>'claim', detail_json->'finding_identity_hashes'
+		FROM audit_log
+		WHERE action = 'sentinel_fix.spawn_skipped' AND resource_type = 'sentinel_fix' AND resource_id = $1
+		  AND actor_user_id IS NULL AND detail_json->>'fix_branch' = $2`, f.fix.ID.String(), "narvi/sentinel-fix/"+f.fix.ID.String())
+	if err != nil {
+		t.Fatalf("read skip records: %v", err)
+	}
+	var records []skipRecord
+	var scanErr error
+	for rows.Next() {
+		var r skipRecord
+		var reason, claim *string
+		if err := rows.Scan(&reason, &claim, &r.hashes); err != nil {
+			scanErr = err
+			break
+		}
+		if reason != nil {
+			r.reason = *reason
+		}
+		if claim != nil {
+			r.claim = *claim
+		}
+		records = append(records, r)
+	}
+	rows.Close()
+	if scanErr != nil || rows.Err() != nil {
+		t.Fatalf("scan skip records: %v %v", scanErr, rows.Err())
+	}
+	byFinding := make(map[string]skipRecord, len(records))
+	for _, r := range records {
+		if len(r.hashes) != 1 {
+			t.Fatalf("skip record names %d findings, want 1: %+v", len(r.hashes), r)
+		}
+		if _, dup := byFinding[r.hashes[0]]; dup {
+			t.Fatalf("two skip records name finding %s", r.hashes[0])
+		}
+		byFinding[r.hashes[0]] = r
+	}
+	return byFinding
 }
 
 // anySkipRecords counts every sentinel_fix.spawn_skipped audit row,

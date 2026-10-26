@@ -13,10 +13,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/sync/errgroup"
 
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
@@ -1107,10 +1109,12 @@ func TestSentinelAutoFix_ClaimedFix_IgnoresToggle(t *testing.T) {
 }
 
 // TestSentinelAutoFix_SkipReleasesClaim: two deliveries wait on one
-// unspawned claim when the repository turns the auto-fix off. The first
-// skips and releases the claim; the second finds it gone and ends too,
-// with no second skip record. Neither starts anything, and both findings
-// stay open. A later verdict claims afresh.
+// unspawned claim when the repository turns the auto-fix off, each naming
+// its own finding. The first skips and releases the claim; the second
+// finds it gone and ends too. Each leaves its own skip record naming its
+// own finding: the first's reason is the toggle, with the claim released;
+// the second's, the claim released earlier. Neither starts anything, and
+// both findings stay open. A later verdict claims afresh.
 func TestSentinelAutoFix_SkipReleasesClaim(t *testing.T) {
 	ctx := context.Background()
 	f := newSentinelAutoFixFreezeFixture(ctx, t)
@@ -1132,9 +1136,10 @@ func TestSentinelAutoFix_SkipReleasesClaim(t *testing.T) {
 	if got := f.findingOf(ctx, t, secondHash).Status; got != "open" {
 		t.Errorf("second finding status = %q, want open", got)
 	}
-	if got := f.anySkipRecords(ctx, t); got != 1 {
-		t.Errorf("skip audit rows = %d, want 1", got)
-	}
+	assertSkipRecords(t, f.skipRecordsByFinding(ctx, t), map[string]skipRecord{
+		f.identityHash: {reason: "sentinel_autofix_disabled", claim: "released"},
+		secondHash:     {reason: "claim_released_earlier", claim: "released_earlier"},
+	})
 
 	var origin pgtype.UUID
 	if err := origin.Scan(f.payload.OriginReviewSessionID); err != nil {
@@ -1146,6 +1151,166 @@ func TestSentinelAutoFix_SkipReleasesClaim(t *testing.T) {
 	}
 	if again.ID == f.fix.ID || again.Status != "pending" || again.FixChildSessionID.Valid {
 		t.Errorf("fresh claim = (id %v, status %q, child %v), want a new pending claim with no child", again.ID, again.Status, again.FixChildSessionID.Valid)
+	}
+}
+
+// assertSkipRecords checks the skip records, keyed by the finding each
+// names, are exactly want: one per finding, each with its reason and what
+// it says became of the claim.
+func assertSkipRecords(t *testing.T, got, want map[string]skipRecord) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Errorf("skip records = %+v, want one per finding: %+v", got, want)
+	}
+	for hash, w := range want {
+		g, ok := got[hash]
+		if !ok {
+			t.Errorf("no skip record names finding %s", hash)
+			continue
+		}
+		if g.reason != w.reason || g.claim != w.claim {
+			t.Errorf("skip record for finding %s = (reason %q, claim %q), want (reason %q, claim %q)", hash, g.reason, g.claim, w.reason, w.claim)
+		}
+	}
+}
+
+// TestSentinelAutoFix_ConcurrentDeliveries_EachRecordsWhatBecameOfTheClaim:
+// two deliveries for one unspawned claim run at once, on two replicas,
+// and the second reads the claim before the first's transaction commits.
+// The first is held mid-transaction -- by a trigger that waits on an
+// advisory lock the test holds -- until the second waits on its lock. The
+// second's skip then finds nothing to release, and its record says why,
+// truly:
+//   - the first skipped too, and released the claim: released_earlier;
+//   - the first spawned a fix under the claim (the toggle went off after it
+//     read it): kept, and the fix session runs.
+func TestSentinelAutoFix_ConcurrentDeliveries_EachRecordsWhatBecameOfTheClaim(t *testing.T) {
+	const secondHash = "b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4b4"
+	const gateKey = 40717
+	tests := []struct {
+		name string
+		// firstReadsToggleOn turns the toggle off only once the first
+		// delivery is held, after it read the toggle on.
+		firstReadsToggleOn bool
+		// gate holds the first delivery's transaction: a trigger, on table,
+		// for rows matching when, waiting on the test's advisory lock.
+		gateTable, gateWhen string
+		wantRecords         func(firstHash string) map[string]skipRecord
+		wantFixSessions     int
+	}{
+		{
+			name:      "the first released the claim",
+			gateTable: "audit_log",
+			gateWhen:  "NEW.action = 'sentinel_fix.spawn_skipped' AND NEW.detail_json::text NOT LIKE '%" + secondHash + "%'",
+			wantRecords: func(firstHash string) map[string]skipRecord {
+				return map[string]skipRecord{
+					firstHash:  {reason: "sentinel_autofix_disabled", claim: "released"},
+					secondHash: {reason: "sentinel_autofix_disabled", claim: "released_earlier"},
+				}
+			},
+		},
+		{
+			name:               "the first spawned under the claim",
+			firstReadsToggleOn: true,
+			gateTable:          "sessions",
+			gateWhen:           "NEW.provenance_tag = 'sentinel_auto_fix'",
+			wantRecords: func(string) map[string]skipRecord {
+				return map[string]skipRecord{
+					secondHash: {reason: "sentinel_autofix_disabled", claim: "kept"},
+				}
+			},
+			wantFixSessions: 1,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			f := newSentinelAutoFixFreezeFixture(ctx, t)
+			second := f.enqueueForFinding(ctx, t, secondHash)
+			if !tc.firstReadsToggleOn {
+				f.setAutoFix(ctx, t, false)
+			}
+
+			// The test's own connection, outside the pool the deliveries
+			// share: it holds the gate's lock and watches the waits.
+			conn, err := pgx.Connect(ctx, sharedConnStr)
+			if err != nil {
+				t.Fatalf("connect: %v", err)
+			}
+			t.Cleanup(func() { _ = conn.Close(context.Background()) })
+			for _, stmt := range []string{
+				`CREATE OR REPLACE FUNCTION sentinel_autofix_test_gate() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_advisory_xact_lock(40717); RETURN NEW; END $$`,
+				`CREATE TRIGGER sentinel_autofix_test_gate BEFORE INSERT ON ` + tc.gateTable + ` FOR EACH ROW WHEN (` + tc.gateWhen + `) EXECUTE FUNCTION sentinel_autofix_test_gate()`,
+			} {
+				if _, err := conn.Exec(ctx, stmt); err != nil {
+					t.Fatalf("install the gate: %v", err)
+				}
+			}
+			t.Cleanup(func() {
+				_, _ = f.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS sentinel_autofix_test_gate ON `+tc.gateTable)
+				_, _ = f.pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS sentinel_autofix_test_gate()`)
+			})
+			if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, gateKey); err != nil {
+				t.Fatalf("hold the gate: %v", err)
+			}
+			gateOpen := false
+			openGate := func() {
+				if !gateOpen {
+					gateOpen = true
+					if _, err := conn.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, gateKey); err != nil {
+						t.Errorf("open the gate: %v", err)
+					}
+				}
+			}
+			t.Cleanup(openGate)
+
+			deliverCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			defer cancel()
+			g, gctx := errgroup.WithContext(deliverCtx)
+			deliver := func(payload []byte) func() error {
+				return func() error {
+					return f.notifier.Deliver(gctx, ports.Notification{Kind: ports.NotificationKindSentinelAutoFix, Payload: payload})
+				}
+			}
+			g.Go(deliver(f.row.Payload))
+			waitForWaiters(ctx, t, conn, `SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`, "the first delivery to wait at the gate")
+			if tc.firstReadsToggleOn {
+				f.setAutoFix(ctx, t, false)
+			}
+			g.Go(deliver(second.Payload))
+			waitForWaiters(ctx, t, conn, `SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%DELETE FROM sentinel_fixes%'`, "the second delivery's release to wait on the first's lock")
+			openGate()
+			if err := g.Wait(); err != nil {
+				t.Fatalf("Deliver: %v", err)
+			}
+
+			assertSkipRecords(t, f.skipRecordsByFinding(ctx, t), tc.wantRecords(f.identityHash))
+			if got := f.fixSessions(ctx, t); got != tc.wantFixSessions {
+				t.Errorf("fix sessions = %d, want %d", got, tc.wantFixSessions)
+			}
+			if got := f.findingOf(ctx, t, secondHash).Status; got != "open" {
+				t.Errorf("second finding status = %q, want open: its delivery spawned nothing", got)
+			}
+		})
+	}
+}
+
+// waitForWaiters polls query, a count, on conn until it is positive.
+func waitForWaiters(ctx context.Context, t *testing.T, conn *pgx.Conn, query, what string) {
+	t.Helper()
+	deadline := time.Now().Add(15 * time.Second)
+	for {
+		var n int
+		if err := conn.QueryRow(ctx, query).Scan(&n); err != nil {
+			t.Fatalf("waiting for %s: %v", what, err)
+		}
+		if n > 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 }
 
