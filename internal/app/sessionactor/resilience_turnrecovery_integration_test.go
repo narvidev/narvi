@@ -131,10 +131,10 @@ func killSandboxMidTurn(ctx context.Context, t *testing.T, snapshotID string) ki
 	sessionID := createTestSession(ctx, t, pool)
 
 	// §3.3: "the turn records the OpenCode conversation id at turn
-	// start... so follow-up prompts on a fresh sandbox resume the same
+	// start... so follow-up prompts on a restored sandbox resume the same
 	// conversation" -- seeded as already-recorded from a PRIOR turn/
-	// heartbeat, exactly the precondition this scenario's own "resume with
-	// same conversation id" half needs.
+	// heartbeat, the precondition of the restore's "resume with same
+	// conversation id"; a fresh spawn forgets it (§35.5).
 	sessionStore := narvipg.NewSessionStore(pool)
 	existingConversationID := "conv-scenario-2-resilience"
 	if _, err := sessionStore.UpdateConversationID(ctx, sqlcgen.UpdateSessionConversationIDParams{

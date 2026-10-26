@@ -7136,9 +7136,16 @@ with the conversation its prompts will name (`sandbox.ClassifyRestoreConversatio
 claim has committed counts the outcome on `sandbox_restore_conversation_total{outcome}`:
 `held` (the same conversation); `differs` (another one, or one on only one side — logged at WARN
 with the snapshot and both ids); `none` (neither names one); `unknown` (nothing recorded for that
-snapshot: one recorded before the record, or by a control plane without it — logged at INFO). No
-outcome refuses, marks, announces or recaps a restore. `held` is evidence, not proof: whether a
-provider's snapshot captures the runtime's session storage is not established from code.
+snapshot: one recorded before the record, or by a control plane without it — logged at INFO). The
+comparison reads what the session named when the claim began. When a conversation was recorded
+for the restored snapshot, the claim then makes the session name that one (none, for a snapshot
+minted under none), since it is the conversation the restored runtime holds: a fresh spawn may
+have forgotten the session's id since, keeping the snapshot it did not restore (a slow restore
+given up on, a downgrade), or a fresh lineage may have named its own. When nothing was recorded,
+the session keeps naming what it named — none, after a fresh spawn forgot it — since nothing says
+which conversation the snapshot holds. No outcome refuses, marks, announces or recaps a restore.
+`held` is evidence, not proof: whether a provider's snapshot captures the runtime's session
+storage is not established from code.
 
 ### 35.5b The snapshot carries the runtime it was minted under (amendment)
 

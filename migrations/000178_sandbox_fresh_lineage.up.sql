@@ -39,6 +39,14 @@
 --   - A gen this release marked, which the previous binary then dispatches
 --     to, gets no recap and keeps its mark: this release's next dispatch to
 --     that gen carries the recap.
+--   - The previous binary never clears a mark either. When this release
+--     sends the recap and the session's actor then moves to a previous
+--     binary's replica, that replica stores the recap turn's
+--     prompt_received and events without clearing the gen's mark, so this
+--     release's next dispatch to the same gen sends a second recap, which
+--     reports the turn the agent just ran as an earlier instance's. Bounded
+--     to the deploy window: once every replica runs this release, the first
+--     evidence of a recap's arrival clears its mark.
 --
 -- # Rolling back
 --

@@ -10,6 +10,18 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.30.1]
+
+### rest/v1/dtos.schema.json
+
+- Changed (descriptions only, annotation-only PATCH):
+  `CreateTurnRequest` no longer says every new turn continues the
+  session's conversation. It does on a live or restored sandbox; a
+  sandbox spawned fresh in place of a lost one holds no such conversation
+  (technical plan §35.5), so its first prompt names none and opens with a
+  recap of the session's earlier turns instead. No field, type, enum
+  value or requiredness changed. A description grades PATCH (row 35).
+
 ## [1.30.0]
 
 ### sandbox-ws/v1/events.schema.json

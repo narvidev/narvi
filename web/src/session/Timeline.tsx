@@ -28,9 +28,11 @@ import type { StepNode, SubTaskNode, ToolCallNode, TurnNode } from './timelineMo
 // a prompt from, so it sends this fixed, honestly-generic continuation
 // instead -- CreateTurnRequest.prompt is required/non-null (unlike
 // CreateSessionRequest.prompt), and the OpenCode conversation itself is
-// what actually carries context forward (sessions.opencode_conversation_id,
-// threaded automatically server-side, CreateTurnRequest's own doc
-// comment) -- this string only needs to nudge the model to continue, not
+// what actually carries context forward on a live or restored sandbox
+// (sessions.opencode_conversation_id, threaded automatically server-side,
+// CreateTurnRequest's own doc comment), or, on a sandbox spawned fresh, the
+// recap of the session's earlier turns the server prepends (technical plan
+// §35.5) -- this string only needs to nudge the model to continue, not
 // restate anything. Exported so DecisionInboxView.tsx's own needs_attention
 // "Resume" action (a failed-session row, decision inbox §16.1) sends the
 // exact same createTurn call this file's own FailureCard does, rather than
