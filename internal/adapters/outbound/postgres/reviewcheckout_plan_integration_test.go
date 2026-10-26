@@ -19,8 +19,9 @@ import (
 // migrates to: the latest whose columns its statements name -- 000167 and
 // 000168 add the checkout's, and ClearSandboxSnapshot clears the
 // snapshot's provenance too, which snapshotProvenanceMigration adds and
-// repoHooksLineageMigration extends with snapshot_skipped_repo_hooks_id.
-const checkoutPlanVersion = repoHooksLineageMigration
+// repoHooksLineageMigration extends with snapshot_skipped_repo_hooks_id,
+// and the conversation snapshotConversationMigration records for it.
+const checkoutPlanVersion = snapshotConversationMigration
 
 // The review checkout's statements, each the only access of its rows in
 // its transaction, read by key alone (technical plan §21.1):
