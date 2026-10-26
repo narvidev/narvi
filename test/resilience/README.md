@@ -94,14 +94,22 @@ its turn still fails with a reason, at `turn_deadline`.
 > conversation id.
 
 **Status: covered**, end to end, literally as described: dispatch onto a
-Ready sandbox at gen 1, force it through `Suspect`, let `terminal_grace`
-elapse without recovery (`Suspect` → `Failed` → immediate respawn at gen
-2), the new sandbox connects and boots, and the SAME still-`Processing`
-turn is re-dispatched to gen 2 carrying the session's own recorded
-`opencode_conversation_id`.
+Ready sandbox at gen 1 that has a snapshot recorded, force it through
+`Suspect`, let `terminal_grace` elapse without recovery (`Suspect` →
+`Failed` → immediate respawn at gen 2, restoring the snapshot), the new
+sandbox connects and boots, and the SAME still-`Processing` turn is
+re-dispatched to gen 2 carrying the session's own recorded
+`opencode_conversation_id`. The same conversation holds only for a
+restore, whose snapshot carries the agent runtime's session storage. The
+same sequence with no snapshot is a fresh lineage (technical plan §35.5):
+the respawn spawns fresh, its claim forgets the conversation id, and the
+re-sent prompt names none and opens with a recap of the session's earlier
+work, the turn's own attempt on the lost gen included.
 
 - `TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversation`
   — `internal/app/sessionactor/resilience_turnrecovery_integration_test.go`
+- `TestResilience_KillSandboxMidTurn_NoSnapshot_FreshLineageNamesNoConversationAndCarriesARecap`
+  — the same file
 
 ### #3 — slow boot
 

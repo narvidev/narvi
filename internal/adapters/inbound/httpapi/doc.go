@@ -127,7 +127,8 @@
 //     across turns, and dispatch.go's own buildPromptPayload already
 //     carries it on every Prompt automatically -- so the new turn
 //     transparently continues whatever OpenCode conversation the session
-//     already has, the instant it dispatches.
+//     already has, the instant it dispatches, on a live or a restored
+//     sandbox (a fresh spawn forgets the id and recaps instead, §35.5).
 //
 // Wiring participants/presence (§8.11) is still untouched -- a distinct,
 // not-yet-scoped concern.

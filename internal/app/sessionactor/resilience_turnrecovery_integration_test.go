@@ -6,6 +6,15 @@
 // make real -- see dispatch.go's own planReenqueueOrRespawn/
 // tryPlanReenqueue for the mechanism this test proves end to end.
 //
+// "Same conversation id" holds for a respawn that restores the sandbox's
+// snapshot, which carries the agent runtime's own session storage, so the
+// scenario's test seeds a recorded snapshot and the respawn is a restore.
+// A respawn with no snapshot is a fresh lineage (technical plan §35.5):
+// the new box holds no runtime conversation, so its claim forgets the id,
+// and the re-sent prompt names none and opens with a recap of the
+// session's earlier work instead -- this file's second test, the same
+// sequence with no snapshot.
+//
 // A genuinely self-contained integration test using this codebase's own
 // already-established testcontainers-Postgres pattern (matching every
 // prior Step's own *_integration_test.go convention exactly), mirroring
@@ -24,20 +33,100 @@ package sessionactor
 import (
 	"context"
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/contracts/gen/go/sandboxws"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/continuity"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
 func TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversation(t *testing.T) {
 	ctx := context.Background()
+	const snapshotID = "snap-scenario-2-resilience"
+	run := killSandboxMidTurn(ctx, t, snapshotID)
+
+	if run.provider.restoreCallCount() != 1 || run.provider.callCount() != 0 {
+		t.Fatalf("restores %d, fresh spawns %d; want the respawn to restore the recorded snapshot",
+			run.provider.restoreCallCount(), run.provider.callCount())
+	}
+	if call := run.provider.lastRestoreCall(); string(call.snapshotID) != snapshotID {
+		t.Fatalf("restored %q, want %q", call.snapshotID, snapshotID)
+	}
+	if run.prompt.ConversationId == nil || *run.prompt.ConversationId != run.conversationID {
+		t.Errorf("Prompt.ConversationId = %v, want %q (§9.3 scenario #2: 'respawn+resume with same conversation id')",
+			run.prompt.ConversationId, run.conversationID)
+	}
+	if run.prompt.Text != run.request {
+		t.Errorf("Prompt.Text = %q, want %q (a restore carries no recap)", run.prompt.Text, run.request)
+	}
+	if run.sandbox.FreshLineageGen != nil {
+		t.Errorf("fresh_lineage_gen = %d after a restore, want none", *run.sandbox.FreshLineageGen)
+	}
+}
+
+// TestResilience_KillSandboxMidTurn_NoSnapshot_FreshLineageNamesNoConversationAndCarriesARecap
+// is scenario #2's sequence with no snapshot to restore: the respawn is a
+// fresh lineage (technical plan §35.5). Its claim marks the new gen and
+// forgets the session's conversation id, so the re-sent prompt names no
+// conversation -- the agent opens a new one -- and opens with the recap,
+// whose interrupted block says what the turn's own attempt on the lost gen
+// had reported, before the request.
+func TestResilience_KillSandboxMidTurn_NoSnapshot_FreshLineageNamesNoConversationAndCarriesARecap(t *testing.T) {
+	ctx := context.Background()
+	run := killSandboxMidTurn(ctx, t, "")
+
+	if run.provider.callCount() != 1 || run.provider.restoreCallCount() != 0 {
+		t.Fatalf("fresh spawns %d, restores %d; want one fresh spawn", run.provider.callCount(), run.provider.restoreCallCount())
+	}
+	if run.prompt.ConversationId != nil {
+		t.Errorf("Prompt.ConversationId = %q, want none: the fresh sandbox holds no runtime conversation", *run.prompt.ConversationId)
+	}
+	recap, request, ok := strings.Cut(run.prompt.Text, continuity.Separator+run.request)
+	if !ok || request != "" || !strings.HasPrefix(recap, continuity.LineHeader+"\n") || !strings.HasSuffix(recap, "\n"+continuity.LineClosing) {
+		t.Fatalf("Prompt.Text = %q, want the recap, then the request", run.prompt.Text)
+	}
+	if !strings.Contains(recap, continuity.LineInterruptedNothing) {
+		t.Errorf("recap %q, want its interrupted block: the attempt on the lost gen reported nothing", recap)
+	}
+	if run.sandbox.FreshLineageGen == nil || *run.sandbox.FreshLineageGen != 2 {
+		t.Errorf("fresh_lineage_gen = %v, want 2: no evidence yet that the prompt reached the sandbox", run.sandbox.FreshLineageGen)
+	}
+	session, err := narvipg.NewSessionStore(run.pool).Get(ctx, run.sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.OpencodeConversationID != nil {
+		t.Errorf("sessions.opencode_conversation_id = %q after the fresh spawn, want it forgotten", *session.OpencodeConversationID)
+	}
+}
+
+// killedMidTurn is what scenario #2's sequence leaves: the prompt the turn
+// was re-sent with, and the rows as they then stand.
+type killedMidTurn struct {
+	pool           *pgxpool.Pool
+	sessionID      pgtype.UUID
+	provider       *fakeSpawnProvider
+	prompt         sandboxws.Prompt
+	sandbox        sqlcgen.Sandbox
+	request        string
+	conversationID string
+}
+
+// killSandboxMidTurn runs scenario #2's sequence: a turn dispatched to gen
+// 1, the sandbox suspected and failed through terminal_grace, gen 2
+// claimed -- restored from snapshotID when it is set, spawned fresh
+// otherwise -- connected and booted, and the same turn, still processing,
+// re-sent to it. It asserts what both kinds of respawn share.
+func killSandboxMidTurn(ctx context.Context, t *testing.T, snapshotID string) killedMidTurn {
+	t.Helper()
 	pool := newTestPool(t)
 	sessionID := createTestSession(ctx, t, pool)
 
@@ -63,6 +152,15 @@ func TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversat
 		SessionID: sessionID, Status: sqlcgen.SandboxStatusReady,
 	}); err != nil {
 		t.Fatalf("move sandbox to ready (gen 1): %v", err)
+	}
+	// Gen 1's snapshot, recorded before the turn, when there is one: the
+	// respawn restores it.
+	if snapshotID != "" {
+		if _, err := sandboxStore.UpdateSnapshotID(ctx, sqlcgen.UpdateSandboxSnapshotIDParams{
+			SessionID: sessionID, SnapshotID: &snapshotID,
+		}); err != nil {
+			t.Fatalf("record gen 1's snapshot: %v", err)
+		}
 	}
 
 	turnStore := narvipg.NewTurnStore(pool)
@@ -107,7 +205,10 @@ func TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversat
 		t.Fatalf("arm overdue terminal_grace timer: %v", err)
 	}
 
-	provider := &fakeSpawnProvider{nextRef: ports.SandboxRef{ProviderID: "resilience-scenario-2-gen2-object"}}
+	provider := &fakeSpawnProvider{
+		nextRef:        ports.SandboxRef{ProviderID: "resilience-scenario-2-gen2-object"},
+		nextRestoreRef: ports.SandboxRef{ProviderID: "resilience-scenario-2-gen2-restored"},
+	}
 	commander := &fakeSendCommander{}
 	r := newDispatchTestRegistry(t, ctx, pool, provider, commander)
 	t.Cleanup(func() { _ = r.Shutdown() })
@@ -128,10 +229,10 @@ func TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversat
 	}
 
 	waitUntil(t, 5*time.Second, func() bool {
-		return provider.callCount() == 1
+		return provider.callCount()+provider.restoreCallCount() == 1
 	})
 
-	// --- Confirm a NEW sandbox (gen 2) gets spawned. ---
+	// --- Confirm a NEW sandbox (gen 2) gets spawned or restored. ---
 	waitUntil(t, 5*time.Second, func() bool {
 		got, err := sandboxStore.Get(ctx, sessionID)
 		return err == nil && got.Status == sqlcgen.SandboxStatusConnecting
@@ -141,7 +242,7 @@ func TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversat
 		t.Fatalf("get sandbox after respawn: %v", err)
 	}
 	if gotAfterRespawn.Gen != 2 {
-		t.Fatalf("sandbox gen = %d, want 2 (a genuinely fresh respawn)", gotAfterRespawn.Gen)
+		t.Fatalf("sandbox gen = %d, want 2 (a new gen)", gotAfterRespawn.Gen)
 	}
 
 	// The turn was NEVER transitioned to Failed at any point in this
@@ -230,13 +331,6 @@ func TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversat
 	if prompt2.Gen != 2 {
 		t.Errorf("Prompt.Gen = %d, want 2 (the CURRENT, respawned sandbox)", prompt2.Gen)
 	}
-	if prompt2.ConversationId == nil || *prompt2.ConversationId != existingConversationID {
-		t.Errorf("Prompt.ConversationId = %v, want %q (§9.3 scenario #2: 'respawn+resume with same conversation id')",
-			prompt2.ConversationId, existingConversationID)
-	}
-	if prompt2.Text != prompt {
-		t.Errorf("Prompt.Text = %q, want %q", prompt2.Text, prompt)
-	}
 
 	// Technical plan §3.3, §35.4: the re-send keeps the turn_deadline of
 	// the turn's first dispatch -- dispatched_at plus TurnDeadline -- never
@@ -268,5 +362,10 @@ func TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversat
 	}
 	if terminalGraceCount != 0 {
 		t.Errorf("terminal_grace timer count = %d, want 0 (deleted once handled by handleTerminalGraceTimer)", terminalGraceCount)
+	}
+
+	return killedMidTurn{
+		pool: pool, sessionID: sessionID, provider: provider, prompt: prompt2, sandbox: gotSandbox,
+		request: prompt, conversationID: existingConversationID,
 	}
 }

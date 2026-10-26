@@ -341,10 +341,15 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 	// and logged only once transact has committed, so a rolled-back pass is
 	// never logged as a tightening.
 	var lifetimeTightened *lifetimeTightening
+	// recapDelivered is set when this event cleared its gen's fresh-lineage
+	// mark (technical plan §35.5, continuity.go), and logged and counted
+	// only once transact has committed.
+	var recapDelivered bool
 
 	err := a.transact(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		staleGen = false
 		lifetimeTightened = nil
+		recapDelivered = false
 		now := time.Now()
 
 		row, err := a.stores.sandbox.WithTx(tx).Get(ctx, a.sessionID)
@@ -484,6 +489,15 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 			if err := a.stores.sandbox.WithTx(tx).MarkBootEvidence(ctx, a.sessionID, row.Gen); err != nil {
 				return fmt.Errorf("sessionactor: record boot evidence: %w", err)
 			}
+		}
+
+		// Technical plan §35.5 (continuity.go): a fresh lineage's mark is
+		// cleared once the prompt carrying its recap has reached the gen --
+		// this event being the evidence, before the type switch below can
+		// complete the turn it is about. Not gated on `inserted`: a replayed
+		// frame is evidence too.
+		if recapDelivered, err = a.clearFreshLineageOnReach(ctx, tx, row, cmd); err != nil {
+			return err
 		}
 
 		// Technical plan §3.3's prompt receipts (promptreceipt.go): count
@@ -832,6 +846,9 @@ func (a *Actor) handleSandboxEvent(ctx context.Context, cmd SandboxEvent) error 
 		}
 		if lifetimeTightened != nil {
 			a.logLifetimeTightened(lifetimeTightened)
+		}
+		if recapDelivered {
+			a.logContinuityRecapDelivered(ctx, int32(cmd.Gen), cmd.Type)
 		}
 
 		// §3.2 ("snapshots & restore"), design decision 1 -- CORRECTED

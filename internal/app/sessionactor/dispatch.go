@@ -127,6 +127,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
 	"github.com/narvidev/narvi/internal/app/workflowengine"
+	"github.com/narvidev/narvi/internal/domain/continuity"
 	"github.com/narvidev/narvi/internal/domain/environment"
 	"github.com/narvidev/narvi/internal/domain/reposource"
 	"github.com/narvidev/narvi/internal/domain/reviewcheck"
@@ -294,6 +295,13 @@ type spawnPlan struct {
 	// the gen it replaces was not rotating. executePlans logs and counts it
 	// once the claim has committed (logRotationRestore).
 	rotation *rotationOutcome
+
+	// lineage is what a fresh-spawn claim decided about the fresh lineage
+	// it may start (technical plan §35.5, continuity.go): whether it marked
+	// its gen, why, and whether the mark was carried over. nil on every
+	// restore and resume plan, which never start one. executePlans logs and
+	// counts it once the claim has committed (logFreshLineage).
+	lineage *freshLineageNote
 }
 
 // dispatchPlan is what planDispatch's own transact hands back to
@@ -355,6 +363,13 @@ type dispatchPlan struct {
 	// evaluates again.
 	rotationSnapshot *rotationSnapshotPlan
 	rotationRetire   *rotationRetirement
+
+	// recap is what the dispatch did about the continuity recap a fresh
+	// lineage owes (technical plan §35.5, continuity.go): attached, trimmed
+	// to fit, or left out for want of room. nil when the gen owed none.
+	// executePlans logs and counts it once the dispatch has committed
+	// (logContinuityRecap).
+	recap *recapNote
 }
 
 // handleEnsureDispatched implements the EnsureDispatched command
@@ -449,6 +464,10 @@ func (a *Actor) executePlans(ctx context.Context, spawn *spawnPlan, dispatch *di
 		a.logLifetimeDeadline(spawn)
 		a.logSnapshotRestore(ctx, spawn)
 		a.logRotationRestore(ctx, spawn)
+		a.logFreshLineage(ctx, spawn)
+	}
+	if dispatch != nil {
+		a.logContinuityRecap(ctx, dispatch.recap)
 	}
 	switch {
 	case spawn != nil && spawn.resume:
@@ -1062,7 +1081,7 @@ func (a *Actor) planReenqueueOrRespawn(
 			// only so no decision falls through to a re-send.
 			return nil, checkout.plan, checkout.counted, runway.note, nil
 		}
-		d, err := a.tryPlanReenqueue(ctx, tx, sessionRow, sandboxRow, target, deadline)
+		d, err := a.tryPlanReenqueue(ctx, tx, sessionRow, sandboxRow, turns, target, deadline)
 		if err != nil {
 			return nil, nil, "", nil, err
 		}
@@ -1106,11 +1125,19 @@ func (a *Actor) planReenqueueOrRespawn(
 // was computed).
 // Builds the SAME BuildPromptPayload tryPlanDispatch uses, which
 // automatically carries sessionRow.OpencodeConversationID (§3.3) -- so
-// the re-enqueued turn resumes the SAME OpenCode conversation with no
-// special-cased "resume" logic needed here at all.
+// the re-enqueued turn resumes the SAME OpenCode conversation on a
+// restored gen with no special-cased "resume" logic needed here at all. A
+// fresh spawn cleared that id in its claim (technical plan §35.5), so a
+// re-send to a fresh gen names none.
+//
+// A re-send to a fresh lineage whose recap is still owed carries it
+// (attachContinuityRecap, continuity.go), as tryPlanDispatch's first send
+// does: whichever prompt first reaches such a gen opens with it, and this
+// one's recap also says what the turn's own attempt on the lost gen had
+// reported. turns is what planDispatch loaded, the recap's source.
 func (a *Actor) tryPlanReenqueue(
 	ctx context.Context, tx pgx.Tx,
-	sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, target sqlcgen.Turn,
+	sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, turns []sqlcgen.Turn, target sqlcgen.Turn,
 	deadline time.Time,
 ) (*dispatchPlan, error) {
 	if a.commander == nil {
@@ -1190,15 +1217,28 @@ func (a *Actor) tryPlanReenqueue(
 		return nil, err
 	}
 
-	payload, err := BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, target, messageID, receiptRequested)
+	build := func(t sqlcgen.Turn) (json.RawMessage, error) {
+		payload, err := BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, t, messageID, receiptRequested)
+		if err != nil {
+			return nil, fmt.Errorf("sessionactor: build prompt payload (reenqueue): %w", err)
+		}
+		return payload, nil
+	}
+	payload, err := build(target)
 	if err != nil {
-		return nil, fmt.Errorf("sessionactor: build prompt payload (reenqueue): %w", err)
+		return nil, err
+	}
+	// Technical plan §35.5: the turn's own attempt on the lost gen is the
+	// recap's interrupted block.
+	payload, recap, err := a.attachContinuityRecap(ctx, tx, sandboxRow, turns, target, true, payload, build)
+	if err != nil {
+		return nil, err
 	}
 
 	a.logger.Info("sessionactor: re-enqueuing in-flight turn to a respawned sandbox incarnation",
 		"turn_id", target.ID.String(), "gen", sandboxRow.Gen)
 
-	return &dispatchPlan{turnID: target.ID, payload: payload, sessionRow: sessionRow, frameBound: promptFrameBound(sandboxRow)}, nil
+	return &dispatchPlan{turnID: target.ID, payload: payload, sessionRow: sessionRow, frameBound: promptFrameBound(sandboxRow), recap: recap}, nil
 }
 
 // tryPlanSpawn implements design decision 3a's own circuit-breaker-then-
@@ -1318,8 +1358,13 @@ func (a *Actor) tryPlanSpawn(
 	// transaction (applySnapshotRefusal); restoreDecision is the decision
 	// on the snapshot's provenance, logged and counted once the claim has
 	// committed.
+	//
+	// dockerRequired is whether the session's environment runs a container
+	// daemon, read once below: a session that does is never snapshotted
+	// (§27.8), which the fresh-lineage note says (technical plan §35.5).
 	var refusal *snapshotRefusal
 	var restoreDecision *snapshotRestoreDecision
+	var dockerRequired bool
 	if action.Kind == sandbox.SpawnActionSpawn || action.Kind == sandbox.SpawnActionRestore || action.Kind == sandbox.SpawnActionResume {
 		// §30.4: a review session whose spec still names its pull
 		// request's head repository moves onto its base repository here,
@@ -1342,7 +1387,8 @@ func (a *Actor) tryPlanSpawn(
 			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, sandboxGen(sandboxRow, hasSandbox), err, now)
 		}
 
-		dockerRequired, err := a.refuseIfSubstrateUnsupported(ctx, tx, sessionRow, caps)
+		var err error
+		dockerRequired, err = a.refuseIfSubstrateUnsupported(ctx, tx, sessionRow, caps)
 		if err != nil {
 			return nil, a.endTurnsOnSpawnRefusal(ctx, tx, sessionRow, sandboxGen(sandboxRow, hasSandbox), err, now)
 		}
@@ -1467,6 +1513,13 @@ func (a *Actor) tryPlanSpawn(
 		}
 		if wasRotating {
 			plan.rotation = &rotationOutcome{outcome: rotationOutcomeFresh, retiredGen: sandboxRow.Gen}
+		}
+		// Technical plan §35.5: a fresh spawn holds no runtime
+		// conversation, so the session's recorded id is forgotten, and the
+		// claim decides, on the row it replaces, whether it starts a fresh
+		// lineage, marking its gen when it does (continuity.go).
+		if plan.lineage, err = a.decideFreshLineage(ctx, tx, sandboxRow, hasSandbox, plan.gen, refusal, wasRotating, dockerRequired); err != nil {
+			return nil, err
 		}
 		if refusal == nil {
 			return plan, nil
@@ -2700,9 +2753,22 @@ func (a *Actor) tryPlanDispatch(
 		return nil, err
 	}
 
-	payload, err := BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, target, messageID, receiptRequested)
+	build := func(t sqlcgen.Turn) (json.RawMessage, error) {
+		payload, err := BuildPromptPayload(a.sessionID.String(), sessionRow, sandboxRow, t, messageID, receiptRequested)
+		if err != nil {
+			return nil, fmt.Errorf("sessionactor: build prompt payload: %w", err)
+		}
+		return payload, nil
+	}
+	payload, err := build(target)
 	if err != nil {
-		return nil, fmt.Errorf("sessionactor: build prompt payload: %w", err)
+		return nil, err
+	}
+	// Technical plan §35.5: the first turn sent to a fresh lineage opens
+	// with the recap of the session's earlier turns (continuity.go).
+	payload, recap, err := a.attachContinuityRecap(ctx, tx, sandboxRow, turns, target, false, payload, build)
+	if err != nil {
+		return nil, err
 	}
 
 	// The review's own GitHub-native result surface (§8.2/§21.1/§21.1b):
@@ -2733,7 +2799,7 @@ func (a *Actor) tryPlanDispatch(
 		}
 	}
 
-	return &dispatchPlan{turnID: turnID, payload: payload, sessionRow: sessionRow, frameBound: promptFrameBound(sandboxRow)}, nil
+	return &dispatchPlan{turnID: turnID, payload: payload, sessionRow: sessionRow, frameBound: promptFrameBound(sandboxRow), recap: recap}, nil
 }
 
 // executeDispatch performs the actual SandboxCommander.SendCommand call
@@ -3209,17 +3275,23 @@ const syntheticUndeliveredKey = "delivered"
 // without receipts sends. Every caller passes the value it recorded in the
 // same transaction (promptreceipt.go's recordPromptReceiptRequest), or true
 // for a receipt re-send.
+//
+// The text is the turn's request, opened by the continuity recap stored on
+// the turn when it was built for sandboxRow's gen (technical plan §35.5,
+// promptText): a prompt carries a recap only to the gen it was built for,
+// and a receipt re-send, rebuilt from the same row, carries the same one.
 func BuildPromptPayload(sessionID string, sessionRow sqlcgen.Session, sandboxRow sqlcgen.Sandbox, target sqlcgen.Turn, messageID string, receiptRequested bool) (json.RawMessage, error) {
 	prompt := sandboxws.Prompt{
 		Type:      "prompt",
 		MessageId: messageID,
 		SessionId: sessionID,
 		Gen:       int(sandboxRow.Gen),
-		// nil (first turn) or the session's own previously-recorded
+		// nil (first turn, or the first after a fresh spawn cleared it,
+		// technical plan §35.5) or the session's own previously-recorded
 		// conversation id (§3.3) -- sessions.opencode_conversation_id is
-		// nil until the first heartbeat ever reports one.
+		// nil until a heartbeat reports one.
 		ConversationId: sessionRow.OpencodeConversationID,
-		Text:           stringOrEmpty(target.Prompt),
+		Text:           promptText(target, sandboxRow.Gen),
 		Model:          target.ModelID,
 		// (§29.8): turns.effort mirrors turns.model_id's own
 		// dispatch-time threading exactly -- this was the ONE remaining
@@ -3235,6 +3307,17 @@ func BuildPromptPayload(sessionID string, sessionRow sqlcgen.Session, sandboxRow
 		prompt.ReceiptRequested = &receiptRequested
 	}
 	return json.Marshal(prompt)
+}
+
+// promptText is the text of target's prompt to gen: its request, opened by
+// the continuity recap stored on it (technical plan §35.5) when that recap
+// was built for gen, and joined to it by continuity.Separator.
+func promptText(target sqlcgen.Turn, gen int32) string {
+	text := stringOrEmpty(target.Prompt)
+	if target.ContinuityRecap == nil || target.ContinuityRecapGen == nil || *target.ContinuityRecapGen != gen {
+		return text
+	}
+	return *target.ContinuityRecap + continuity.Separator + text
 }
 
 // toQueueEntries adapts stored turn rows into the generic
