@@ -129,16 +129,16 @@ func TestFetchEmailWithRetry_AllAttemptsFail_LogsWarnAndIncrementsCounter(t *tes
 
 	wantErr := errors.New("provider API is down")
 	callCount := 0
-	email, ok := identitylink.FetchEmailWithRetry(ctx, logger, to, provider, func(context.Context) (string, bool, error) {
+	email, ok := identitylink.FetchEmailWithRetry(ctx, logger, to, provider, func(context.Context) (identitylink.ProfileEmail, bool, error) {
 		callCount++
-		return "", false, wantErr
+		return identitylink.ProfileEmail{}, false, wantErr
 	})
 
 	if ok {
 		t.Errorf("ok = true, want false (every attempt failed)")
 	}
-	if email != "" {
-		t.Errorf("email = %q, want empty", email)
+	if email != (identitylink.ProfileEmail{}) {
+		t.Errorf("email = %+v, want empty", email)
 	}
 	if callCount != to.IdentityEmailFetchMaxAttempts {
 		t.Errorf("call count = %d, want %d (every attempt exhausted)", callCount, to.IdentityEmailFetchMaxAttempts)
@@ -184,16 +184,16 @@ func TestFetchEmailWithRetry_PermanentError_LogsNothingAndDoesNotIncrementCounte
 
 	wantErr := errors.New("slackapi: user_not_found")
 	callCount := 0
-	email, ok := identitylink.FetchEmailWithRetry(ctx, logger, to, provider, func(context.Context) (string, bool, error) {
+	email, ok := identitylink.FetchEmailWithRetry(ctx, logger, to, provider, func(context.Context) (identitylink.ProfileEmail, bool, error) {
 		callCount++
-		return "", false, platform.Permanent(wantErr)
+		return identitylink.ProfileEmail{}, false, platform.Permanent(wantErr)
 	})
 
 	if ok {
 		t.Errorf("ok = true, want false (a permanent error never resolves to a real email)")
 	}
-	if email != "" {
-		t.Errorf("email = %q, want empty", email)
+	if email != (identitylink.ProfileEmail{}) {
+		t.Errorf("email = %+v, want empty", email)
 	}
 	if callCount != 1 {
 		t.Errorf("call count = %d, want 1 (a Permanent error must stop retrying immediately)", callCount)
@@ -237,17 +237,17 @@ func TestFetchEmailWithRetry_ParentContextEnds_LogsNothingAndDoesNotIncrementCou
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	callCount := 0
-	email, ok := identitylink.FetchEmailWithRetry(ctx, logger, to, provider, func(context.Context) (string, bool, error) {
+	email, ok := identitylink.FetchEmailWithRetry(ctx, logger, to, provider, func(context.Context) (identitylink.ProfileEmail, bool, error) {
 		callCount++
 		cancel()
-		return "", false, errors.New("slackapi: transient network error")
+		return identitylink.ProfileEmail{}, false, errors.New("slackapi: transient network error")
 	})
 
 	if ok {
 		t.Errorf("ok = true, want false (the caller's own context ended before a real answer)")
 	}
-	if email != "" {
-		t.Errorf("email = %q, want empty", email)
+	if email != (identitylink.ProfileEmail{}) {
+		t.Errorf("email = %+v, want empty", email)
 	}
 	if callCount != 1 {
 		t.Errorf("call count = %d, want 1 (the canceled context must stop retrying during the backoff sleep, before a second attempt)", callCount)
@@ -279,19 +279,19 @@ func TestFetchEmailWithRetry_NoEmailOnFile_LogsNothingAndDoesNotIncrementCounter
 	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
 
 	callCount := 0
-	email, ok := identitylink.FetchEmailWithRetry(ctx, logger, to, provider, func(context.Context) (string, bool, error) {
+	email, ok := identitylink.FetchEmailWithRetry(ctx, logger, to, provider, func(context.Context) (identitylink.ProfileEmail, bool, error) {
 		callCount++
 		// The provider's own API call SUCCEEDED (nil error) -- it simply
 		// has no email on file for this user. Never retried: platform.Retry
 		// treats a nil error as success on the first attempt.
-		return "", false, nil
+		return identitylink.ProfileEmail{}, false, nil
 	})
 
 	if ok {
 		t.Errorf("ok = true, want false (provider reported no email)")
 	}
-	if email != "" {
-		t.Errorf("email = %q, want empty", email)
+	if email != (identitylink.ProfileEmail{}) {
+		t.Errorf("email = %+v, want empty", email)
 	}
 	if callCount != 1 {
 		t.Errorf("call count = %d, want 1 (a successful fetch, even one reporting no email, is never retried)", callCount)
@@ -309,34 +309,46 @@ func TestFetchEmailWithRetry_NoEmailOnFile_LogsNothingAndDoesNotIncrementCounter
 
 // TestFetchEmailWithRetry_Success_LogsNothingAndDoesNotIncrementCounter
 // rounds out the happy path: a genuinely successful fetch (a real email)
-// returns it unchanged and triggers neither the Warn log nor the counter.
+// returns it unchanged -- its Verified attestation included, whichever way
+// the provider answered -- and triggers neither the Warn log nor the
+// counter.
 func TestFetchEmailWithRetry_Success_LogsNothingAndDoesNotIncrementCounter(t *testing.T) {
-	ctx := context.Background()
-	const provider = sqlcgen.IdentityProviderSlack
-	to := fastRetryTimeouts()
-
-	before := readEmailFetchFailureCount(ctx, t, provider)
-
-	var logBuf strings.Builder
-	logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
-
-	const wantEmail = "person@example.com"
-	email, ok := identitylink.FetchEmailWithRetry(ctx, logger, to, provider, func(context.Context) (string, bool, error) {
-		return wantEmail, true, nil
-	})
-
-	if !ok {
-		t.Errorf("ok = false, want true (fetch succeeded with a real email)")
+	tests := []struct {
+		name string
+		want identitylink.ProfileEmail
+	}{
+		{"verified email", identitylink.ProfileEmail{Address: "person@example.com", Verified: true}},
+		{"unverified email", identitylink.ProfileEmail{Address: "person@example.com", Verified: false}},
 	}
-	if email != wantEmail {
-		t.Errorf("email = %q, want %q", email, wantEmail)
-	}
-	if logOut := logBuf.String(); logOut != "" {
-		t.Errorf("expected NO log output for a successful fetch, got: %s", logOut)
-	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ctx := context.Background()
+			const provider = sqlcgen.IdentityProviderSlack
+			to := fastRetryTimeouts()
 
-	after := readEmailFetchFailureCount(ctx, t, provider)
-	if delta := after - before; delta != 0 {
-		t.Errorf("identity_email_fetch_failures_total delta = %d, want 0", delta)
+			before := readEmailFetchFailureCount(ctx, t, provider)
+
+			var logBuf strings.Builder
+			logger := slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+			email, ok := identitylink.FetchEmailWithRetry(ctx, logger, to, provider, func(context.Context) (identitylink.ProfileEmail, bool, error) {
+				return tt.want, true, nil
+			})
+
+			if !ok {
+				t.Errorf("ok = false, want true (fetch succeeded with a real email)")
+			}
+			if email != tt.want {
+				t.Errorf("email = %+v, want %+v", email, tt.want)
+			}
+			if logOut := logBuf.String(); logOut != "" {
+				t.Errorf("expected NO log output for a successful fetch, got: %s", logOut)
+			}
+
+			after := readEmailFetchFailureCount(ctx, t, provider)
+			if delta := after - before; delta != 0 {
+				t.Errorf("identity_email_fetch_failures_total delta = %d, want 0", delta)
+			}
+		})
 	}
 }

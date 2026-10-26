@@ -1,7 +1,7 @@
 // Package slackapi holds the single production Slack Web API client
 // (§30.3's own "one client per provider" compensating control) -- a real
 // HTTP client against chat.postMessage/chat.postEphemeral/chat.update/
-// views.open/users.info, implementing ports.Notifier (called by the
+// views.open/users.info/auth.test, implementing ports.Notifier (called by the
 // outbox delivery worker, internal/app/outboxworker) AND providing the
 // narrow surface internal/app/shadowslack's Decorator wraps for
 // internal/adapters/inbound/slack's own synchronous ack/interactivity

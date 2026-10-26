@@ -180,7 +180,7 @@ func TestResolve_AlreadyLinkedIsFastPath(t *testing.T) {
 		t.Fatalf("create fixture identity: %v", err)
 	}
 
-	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-ALREADY", "", false)
+	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-ALREADY", identitylink.ProfileEmail{}, false)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestResolve_EmailFetchFailedDoesNothing(t *testing.T) {
 	pool := newTestPool(t)
 	deps := newDeps(pool)
 
-	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-NOFETCH", "", false)
+	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-NOFETCH", identitylink.ProfileEmail{}, false)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -230,7 +230,7 @@ func TestResolve_ExactlyOneMatchAutoLinks(t *testing.T) {
 
 	user := createFixtureUser(ctx, t, deps.Users, "unique-match@example.com")
 
-	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-UNIQUE", "unique-match@example.com", true)
+	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-UNIQUE", identitylink.ProfileEmail{Address: "unique-match@example.com", Verified: true}, true)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -253,6 +253,9 @@ func TestResolve_ExactlyOneMatchAutoLinks(t *testing.T) {
 	}
 	if !linked.EmailVerified {
 		t.Error("EmailVerified = false, want true")
+	}
+	if !linked.EmailCheckedAt.Valid {
+		t.Error("EmailCheckedAt not set, want the time the verified email was checked")
 	}
 
 	entries, err := deps.AuditLog.List(ctx, 10, 0)
@@ -277,7 +280,7 @@ func TestResolve_ZeroMatchesCreatesLinkPrompt(t *testing.T) {
 	pool := newTestPool(t)
 	deps := newDeps(pool)
 
-	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderLinear, "L-NOBODY", "nobody@example.com", true)
+	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderLinear, "L-NOBODY", identitylink.ProfileEmail{Address: "nobody@example.com", Verified: true}, true)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -327,7 +330,7 @@ func TestResolve_MultipleMatchesCreatesLinkPrompt(t *testing.T) {
 		}
 	}
 
-	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-AMBIGUOUS", email, true)
+	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-AMBIGUOUS", identitylink.ProfileEmail{Address: email, Verified: true}, true)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -348,7 +351,7 @@ func TestResolve_ReusesStillLiveLinkPrompt(t *testing.T) {
 	pool := newTestPool(t)
 	deps := newDeps(pool)
 
-	first, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-REPEAT", "still-nobody@example.com", true)
+	first, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-REPEAT", identitylink.ProfileEmail{Address: "still-nobody@example.com", Verified: true}, true)
 	if err != nil {
 		t.Fatalf("Resolve (first): %v", err)
 	}
@@ -356,7 +359,7 @@ func TestResolve_ReusesStillLiveLinkPrompt(t *testing.T) {
 		t.Fatal("first.MagicLinkURL = empty, want a real magic link")
 	}
 
-	second, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-REPEAT", "still-nobody@example.com", true)
+	second, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-REPEAT", identitylink.ProfileEmail{Address: "still-nobody@example.com", Verified: true}, true)
 	if err != nil {
 		t.Fatalf("Resolve (second): %v", err)
 	}
@@ -388,7 +391,7 @@ func TestConsume_LinksIdentityAndDeletesPrompt(t *testing.T) {
 	pool := newTestPool(t)
 	deps := newDeps(pool)
 
-	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderLinear, "L-CONSUME", "consume-me@example.com", true)
+	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderLinear, "L-CONSUME", identitylink.ProfileEmail{Address: "consume-me@example.com", Verified: true}, true)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -456,7 +459,7 @@ func TestConsume_ExpiredPromptReturnsExpiredAndCleansUp(t *testing.T) {
 	// already expired the instant it's created.
 	deps.PromptTTL = -time.Hour
 
-	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-EXPIRED", "expired@example.com", true)
+	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-EXPIRED", identitylink.ProfileEmail{Address: "expired@example.com", Verified: true}, true)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}
@@ -483,7 +486,7 @@ func TestConsume_AlreadyLinkedElsewhereReturnsConflict(t *testing.T) {
 	pool := newTestPool(t)
 	deps := newDeps(pool)
 
-	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-RACE", "racer@example.com", true)
+	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-RACE", identitylink.ProfileEmail{Address: "racer@example.com", Verified: true}, true)
 	if err != nil {
 		t.Fatalf("Resolve: %v", err)
 	}

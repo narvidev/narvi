@@ -424,21 +424,26 @@ func TestSlackInteractive_RefusedClick_FailingReply_MessageLeftAsItWas(t *testin
 }
 
 // fakeSlackForPlanClick is a fake Slack Web API for one click: it answers
-// users.info with email for any user when email is set (with no email
-// otherwise), records every other call on the returned channel, and holds
+// users.info with email for any user when email is set -- a full member of
+// testSlackTeam with the email confirmed -- (with no email otherwise),
+// answers auth.test (answerSlackAuthTest), records every other call on the
+// returned channel, and holds
 // a request to a path in hang -- its body read, so the server notices the
 // client giving up -- until the client gives up.
 func fakeSlackForPlanClick(t *testing.T, email string, hang ...string) (*httptest.Server, chan recordedSlackRequest) {
 	t.Helper()
 	requests := make(chan recordedSlackRequest, 32)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if answerSlackAuthTest(w, r) {
+			return
+		}
 		if r.URL.Path == "/users.info" {
 			w.Header().Set("Content-Type", "application/json")
 			if email == "" {
 				_, _ = w.Write([]byte(`{"ok":true}`))
 				return
 			}
-			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "user": map[string]any{"profile": map[string]any{"email": email}}})
+			_ = json.NewEncoder(w).Encode(map[string]any{"ok": true, "user": confirmedSlackMember(email)})
 			return
 		}
 		var body map[string]any
@@ -773,7 +778,8 @@ type slackCallContext struct {
 // contextRecordingSlack is a Slack client that answers every call at once
 // and records the context each was made on -- so a test can read which
 // budget a reply or a notice ran on, and whether it kept the request's
-// values. GetUserEmail answers email, matching no account.
+// values. GetUserEmail answers email, matching no account, as a confirmed
+// email of a full member of testSlackTeam.
 type contextRecordingSlack struct {
 	email string
 
@@ -802,8 +808,13 @@ func (c *contextRecordingSlack) callsTo(method string) []slackCallContext {
 	return out
 }
 
-func (c *contextRecordingSlack) GetUserEmail(context.Context, string) (string, bool, error) {
-	return c.email, c.email != "", nil
+func (c *contextRecordingSlack) GetUserEmail(context.Context, string) (slackapi.UserEmail, bool, error) {
+	if c.email == "" {
+		return slackapi.UserEmail{}, false, nil
+	}
+	return slackapi.UserEmail{
+		Email: c.email, EmailConfirmed: true, TeamID: testSlackTeam, InstallationTeamID: testSlackTeam,
+	}, true, nil
 }
 
 func (c *contextRecordingSlack) PostAck(ctx context.Context, _, _, text string) error {

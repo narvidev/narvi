@@ -1899,6 +1899,7 @@ type Identity struct {
 	LinkedVia            IdentityLinkedVia  `json:"linked_via"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	AccessTokenEncrypted []byte             `json:"access_token_encrypted"`
+	EmailCheckedAt       pgtype.Timestamptz `json:"email_checked_at"`
 }
 
 type IdentityLinkPrompt struct {

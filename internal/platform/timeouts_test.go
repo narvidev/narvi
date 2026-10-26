@@ -2722,6 +2722,68 @@ func TestValidate_SlackInteractivityReplyTimeout(t *testing.T) {
 	}
 }
 
+// TestValidate_SlackInstallationTeamLookupTimeout pins §13.2's lookup of
+// the installation's own Slack workspace: the shipped 10s budget, strictly
+// longer than either profile-email attempt's budget (the Events API's
+// retried one and the click's single one), each broken link reported alone.
+// A lookup no longer than an attempt would fail at exactly the latency the
+// attempt tolerates, and no Slack email would ever read as verified.
+func TestValidate_SlackInstallationTeamLookupTimeout(t *testing.T) {
+	t.Parallel()
+
+	if got, want := platform.DefaultTimeouts().SlackInstallationTeamLookupTimeout, 10*time.Second; got != want {
+		t.Errorf("SlackInstallationTeamLookupTimeout = %v, want %v", got, want)
+	}
+
+	const (
+		eventsLink = "SlackInstallationTeamLookupTimeout > IdentityEmailFetchTimeout"
+		clickLink  = "SlackInstallationTeamLookupTimeout > SlackInteractivityIdentityFetchTimeout"
+	)
+	for _, tc := range []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		chains []string // the *TimeoutInvariantError chains Validate must report, and no other error
+	}{
+		{name: "the shipped defaults hold", mutate: func(*platform.Timeouts) {}},
+		{name: "a lookup just longer than both attempts is accepted", mutate: func(to *platform.Timeouts) {
+			to.SlackInstallationTeamLookupTimeout = max(to.IdentityEmailFetchTimeout, to.SlackInteractivityIdentityFetchTimeout) + time.Millisecond
+		}},
+		{name: "a lookup as long as an Events API attempt", mutate: func(to *platform.Timeouts) {
+			to.SlackInteractivityIdentityFetchTimeout = to.IdentityEmailFetchTimeout - time.Millisecond
+			to.SlackInstallationTeamLookupTimeout = to.IdentityEmailFetchTimeout
+		}, chains: []string{eventsLink}},
+		{name: "a lookup as long as a click's attempt", mutate: func(to *platform.Timeouts) {
+			to.IdentityEmailFetchTimeout = to.SlackInteractivityIdentityFetchTimeout - time.Millisecond
+			to.SlackInstallationTeamLookupTimeout = to.SlackInteractivityIdentityFetchTimeout
+		}, chains: []string{clickLink}},
+		{name: "a zero lookup budget", mutate: func(to *platform.Timeouts) {
+			to.SlackInstallationTeamLookupTimeout = 0
+		}, chains: []string{eventsLink, clickLink}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			var errs []error
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				errs = joined.Unwrap()
+			} else if err != nil {
+				errs = []error{err}
+			}
+			if len(errs) != len(tc.chains) {
+				t.Fatalf("Validate() reported %d errors, want %d (%v): %v", len(errs), len(tc.chains), tc.chains, err)
+			}
+			for i, chain := range tc.chains {
+				var inv *platform.TimeoutInvariantError
+				if !errors.As(errs[i], &inv) || inv.Chain != chain {
+					t.Errorf("Validate() error %d = %v, want the broken link %q", i, errs[i], chain)
+				}
+			}
+		})
+	}
+}
+
 // TestDefaultTimeouts_GitHubAppMintFinishesBeforeCredentialFetch pins the
 // order of two bounds on one request. The sandbox's credential helper
 // (internal/sandboxagent/credentials.CPClient) gives up on the control

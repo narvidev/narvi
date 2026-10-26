@@ -9,8 +9,13 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
+
+	"golang.org/x/sync/singleflight"
 
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // defaultAPIBaseURL is Slack's own real Web API base -- the ONLY place
@@ -44,6 +49,17 @@ type Client struct {
 	httpClient *http.Client
 	apiBaseURL string
 	botToken   string
+
+	// installationTeamID caches auth.test's team_id for botToken: the
+	// workspace this installation belongs to, which a bot token never
+	// changes (installationteam.go). Empty until a lookup has learned it;
+	// guarded by teamMu, which is never held across a request. teamLookups
+	// keeps one auth.test call in flight at a time, on its own context
+	// bounded by teamLookupTimeout.
+	teamMu             sync.Mutex
+	installationTeamID string
+	teamLookups        singleflight.Group
+	teamLookupTimeout  time.Duration
 }
 
 // var _ ports.Notifier = (*Client)(nil) makes a Notifier signature drift a
@@ -83,9 +99,10 @@ func New(httpClient *http.Client, apiBaseURL, botToken string) *Client {
 		apiBaseURL = defaultAPIBaseURL
 	}
 	return &Client{
-		httpClient: httpClient,
-		apiBaseURL: strings.TrimSuffix(apiBaseURL, "/"),
-		botToken:   botToken,
+		httpClient:        httpClient,
+		apiBaseURL:        strings.TrimSuffix(apiBaseURL, "/"),
+		botToken:          botToken,
+		teamLookupTimeout: platform.DefaultTimeouts().SlackInstallationTeamLookupTimeout,
 	}
 }
 

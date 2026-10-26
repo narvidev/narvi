@@ -53,6 +53,7 @@ import (
 	"github.com/narvidev/narvi/extension"
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/integrations"
 	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/migrations"
 )
@@ -199,6 +200,17 @@ func TestBuild_RouteTableMatchesGolden(t *testing.T) {
 	app, err := Build(context.Background(), cfg, pool)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
+	}
+
+	// The development stage, Slack ingress on (NARVI_INGRESS_ENABLED
+	// unset), as `make dev` and the image check boot: serve() must have
+	// nothing to warm, so no boot sends auth.test to Slack's real host
+	// (slackInstallationTeamToWarm).
+	if !cfg.IngressEnabled[integrations.ProviderSlack] || cfg.Stage != platform.StageDevelopment {
+		t.Fatalf("test config: Slack ingress %v, stage %q; want on, development", cfg.IngressEnabled[integrations.ProviderSlack], cfg.Stage)
+	}
+	if app.slackClient != nil {
+		t.Error("a development-stage Build kept a Slack client to warm at boot, want none")
 	}
 
 	goldenBytes, err := os.ReadFile(filepath.Join("testdata", "routes.golden"))
