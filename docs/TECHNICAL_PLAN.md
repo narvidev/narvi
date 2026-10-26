@@ -527,6 +527,12 @@ Review quality measured with stated populations, a second agent runtime with pro
 scope and publication decisions of the same day, and the unresolved-conversation gate.
 *Exit: as the implementation plan's Phase 21 milestone states.*
 
+**Phase 22: Adopted on 2026-10-26 (Steps 233-265; additive)**
+Rules adopted on 2026-10-26 for a review verdict and its findings, the GitHub ingress and the reads
+it depends on, the sandbox's boot, runtime and stored transcript, and the inbox, the chat surfaces
+and automations.
+*Exit: as the implementation plan's Phase 22 milestone states.*
+
 ## 11. Working conventions for the implementing agent
 
 - Never put I/O, `time.Now()`, or randomness in `/internal/domain` — inject `Clock`/`IDGen`.
@@ -3395,7 +3401,10 @@ sandbox_secrets(id, scope sandbox_secret_scope ENUM('automation','environment','
   through the provider API; never written inside any repo working tree (so never committable);
   never logged. The residual risk that an agent *writes* a secret value into code it then pushes
   is shared with every secrets mechanism in every CI system; output redaction is possible future
-  work, not claimed here.
+  work, not claimed here. **Amended (Step 256):** reopened for the stored transcript only: the
+  sandbox agent masks every value it injected in the events it sends, so a secret the agent prints
+  or reads never reaches the timeline or a transcript; what the agent writes into code it pushes is
+  unchanged.
 - **A third source landed on this same injection path** (§8 item 4, "automation env vars reach
   the process, not just the prompt"): `automations.env_vars` — plain, non-secret config a
   maintainer typed, distinct from this section's own `sandbox_secrets` table — is now ALSO
@@ -6414,8 +6423,10 @@ posted a permanent denial, GitHub stayed silent while keeping its claim, and the
 outbox skipped terminally, all four PERMANENTLY dropping legitimate work for a repo that may be
 fully enrolled, with no retry ever attempted. With the two properties separated, a transient read
 failure instead takes each channel's own **existing, ordinary non-refusal path** in the table
-above — Linear/Slack/the sentinel-autofix outbox retry; GitHub releases its claim for a real
-redelivery — so the work is picked up again once Postgres recovers.
+above — Linear/Slack/the sentinel-autofix outbox retry, so that work is picked up again once Postgres
+recovers; GitHub releases its claim, but GitHub redelivers a delivery only when a person asks it
+to, so a GitHub event that meets such a failure is lost until Step 245 records each delivery before
+processing it.
 
 ### 32.6 Enrollment is seed-manifest-only in v1
 
