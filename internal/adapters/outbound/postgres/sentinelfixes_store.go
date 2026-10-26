@@ -160,6 +160,14 @@ func (s *SentinelFixStore) MarkAbandoned(ctx context.Context, id pgtype.UUID) (s
 	return s.q.MarkSentinelFixAbandoned(ctx, id)
 }
 
+// ReleaseUnspawned deletes claim id while it is still 'pending' with no
+// child session (ReleaseUnspawnedSentinelFix's own doc comment), returning
+// the rows deleted: 0 when a child was recorded on it meanwhile, or the
+// row is already gone.
+func (s *SentinelFixStore) ReleaseUnspawned(ctx context.Context, id pgtype.UUID) (int64, error) {
+	return s.q.ReleaseUnspawnedSentinelFix(ctx, id)
+}
+
 // ExistsByFixPRNumber reports whether (repoFullName, fixPRNumber) is a
 // registered sentinel-auto-fix follow-up PR -- §16's own §17
 // structural exclusion (see ExistsSentinelFixByFixPRNumber's own generated

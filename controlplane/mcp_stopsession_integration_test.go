@@ -758,13 +758,16 @@ func newExitRouterRig(t *testing.T, connStr string) (*oauthRouterRig, *fakeProvi
 // auto-fix notifier -- the one path in this codebase that starts a child
 // session -- built as controlplane builds it, on the router's own stores
 // and session registry, with a fake code host for the fix branch and the
-// repository live. Its Deliver claims the fix, creates the child with its
-// first turn queued, in one transaction that reads the parent FOR SHARE,
-// and asks the child's actor to dispatch.
+// repository live, its sentinel auto-fix on. Its Deliver claims the fix,
+// creates the child with its first turn queued, in one transaction that
+// reads the parent FOR SHARE, and asks the child's actor to dispatch.
 func spawnFixChild(ctx context.Context, t *testing.T, rig *oauthRouterRig, parentID pgtype.UUID) pgtype.UUID {
 	t.Helper()
 	pool := rig.pool
 	const repoFullName, prNumber, headBranch = "example-org/stop-exit", 7, "feature/stop-exit"
+	if _, err := narvipg.NewRepoSettingsStore(pool).Upsert(ctx, repoFullName, false, true); err != nil {
+		t.Fatalf("turn the sentinel auto-fix on: %v", err)
+	}
 	fixes, findings := narvipg.NewSentinelFixStore(pool), narvipg.NewReviewFindingStore(pool)
 	fix, err := fixes.Claim(ctx, repoFullName, prNumber, parentID, headBranch)
 	if err != nil {
