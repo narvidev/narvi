@@ -33,6 +33,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 func TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversation(t *testing.T) {
@@ -75,8 +76,13 @@ func TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversat
 		t.Fatalf("create processing turn: %v", err)
 	}
 	gen1 := int32(1)
+	// Dispatched to gen 1 a while ago: technical plan §35.4's
+	// turn_deadline, counted from this first dispatch, still bounds the
+	// turn once it is re-sent to gen 2 below.
+	dispatchedAt := time.Now().Add(-10 * time.Minute).Truncate(time.Microsecond)
 	if _, err := turnStore.UpdateStatus(ctx, sqlcgen.UpdateTurnStatusParams{
 		ID: created.ID, Status: sqlcgen.TurnStatusProcessing, DispatchedSandboxGen: &gen1,
+		DispatchedAt: pgtype.Timestamptz{Time: dispatchedAt, Valid: true},
 	}); err != nil {
 		t.Fatalf("stamp dispatched_sandbox_gen=1: %v", err)
 	}
@@ -232,15 +238,25 @@ func TestResilience_KillSandboxMidTurn_SuspectGraceRespawnReenqueueSameConversat
 		t.Errorf("Prompt.Text = %q, want %q", prompt2.Text, prompt)
 	}
 
+	// Technical plan §3.3, §35.4: the re-send keeps the turn_deadline of
+	// the turn's first dispatch -- dispatched_at plus TurnDeadline -- never
+	// a fresh budget from the re-send.
 	var turnDeadlineCount int
+	var turnDeadlineAt time.Time
 	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM session_timers WHERE session_id = $1 AND name = $2`,
+		`SELECT count(*), coalesce(max(fires_at), 'epoch') FROM session_timers WHERE session_id = $1 AND name = $2`,
 		sessionID, TimerTurnDeadline,
-	).Scan(&turnDeadlineCount); err != nil {
-		t.Fatalf("count turn_deadline timers: %v", err)
+	).Scan(&turnDeadlineCount, &turnDeadlineAt); err != nil {
+		t.Fatalf("read turn_deadline timers: %v", err)
 	}
 	if turnDeadlineCount != 1 {
-		t.Errorf("turn_deadline timer count = %d, want 1 (a fresh, full budget re-armed for the new sandbox)", turnDeadlineCount)
+		t.Errorf("turn_deadline timer count = %d, want 1 (armed for the re-send to the new sandbox)", turnDeadlineCount)
+	}
+	if !gotTurn.DispatchedAt.Time.Equal(dispatchedAt) {
+		t.Errorf("dispatched_at = %v, want still %v (a re-send never moves it)", gotTurn.DispatchedAt.Time, dispatchedAt)
+	}
+	if want := dispatchedAt.Add(platform.DefaultTimeouts().TurnDeadline); !turnDeadlineAt.Equal(want) {
+		t.Errorf("turn_deadline fires_at = %v, want %v (dispatched_at + TurnDeadline: the first dispatch's bound, not a fresh budget)", turnDeadlineAt, want)
 	}
 
 	var terminalGraceCount int

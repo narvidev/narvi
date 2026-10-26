@@ -27,6 +27,9 @@
 //   - EvaluateTurnDeadline (deadline.go): the turn_deadline named
 //     persistent timer (§2, §5.4 Chain A), using
 //     platform.Timeouts.TurnDeadline (already defined at §5.4).
+//     ReenqueueBound beside it: a turn re-sent to a newer sandbox gen
+//     keeps its first dispatch's bound, and one whose bound is reached
+//     is not re-sent (§3.3, §35.4).
 //   - Summary (summary.go): the minimal per-turn view internal/domain/
 //     session's status derivation needs.
 //   - EpistemicOutcome (epistemicoutcome.go) and the devil's-advocate
