@@ -63,6 +63,22 @@ const MaxPromptFrameBytes = 32 << 20
 // there.
 const DefaultFrameReadLimitBytes = 32768
 
+// ContinuityRecapMaxBytes is the most a fresh lineage's recap adds to the
+// text of the first prompt its gen is sent, in bytes once JSON-encoded as
+// the prompt encodes it (technical plan §35.5; continuity.EncodedLen). The
+// recap is also held to the room its gen's prompt bound leaves the
+// prompt, and is cut to fit, never a reason to refuse the turn
+// (continuity.Build).
+//
+// 16 KiB: two turns at their excerpt caps (continuity.
+// RequestExcerptBytes, 1 KiB of a request, and ReportExcerptBytes, 4 KiB
+// of a final text) and most of a third, or many more short ones, up to
+// continuity.MaxTurns. TestContinuityRecapMaxBytes holds it at or below
+// half of DefaultFrameReadLimitBytes, so a gen whose agent states no read
+// limit keeps at least half its bound for the prompt itself, and above a
+// recap's frame and one turn at those caps.
+const ContinuityRecapMaxBytes = 16 << 10
+
 // MaxEventFrameBytes is the largest agent event, encoded, the control plane
 // reads on a sandbox's WebSocket, and the largest entry a sandbox agent
 // keeps in its outbound buffer (technical plan §6.1). The control plane
