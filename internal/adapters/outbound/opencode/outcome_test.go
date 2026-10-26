@@ -197,6 +197,47 @@ func TestIsTransientAPIError(t *testing.T) {
 
 func intPtr(i int) *int { return &i }
 
+// TestIsTransientAPIError_DeadlineMessageWithElapsedSecondsIsNotTransient
+// pins the trap technical plan §35.4 names, at the agent runtime's one
+// turn-level retry classifier: a deadline message that embeds its own
+// elapsed seconds, with a gateway or request timeout status, is not a
+// transient provider error -- retrying it would re-submit the turn into a
+// sandbox that is stopping. Only the runtime's tagged isRetryable decides:
+// never the message's digits or words, and never a 5xx or 408 status.
+func TestIsTransientAPIError_DeadlineMessageWithElapsedSecondsIsNotTransient(t *testing.T) {
+	t.Parallel()
+	messages := []string{
+		"request timed out after 3600 seconds",
+		"deadline exceeded: 7199.8s elapsed",
+		"Gateway Timeout (504) after 3599 s",
+		"the sandbox's lifetime of 7200 seconds was reached; turn context canceled before completion",
+		"timed out",
+		"504",
+	}
+	statuses := []*int{nil, intPtr(504), intPtr(408), intPtr(500), intPtr(502), intPtr(503), intPtr(529), intPtr(429)}
+	for _, message := range messages {
+		for _, status := range statuses {
+			for _, name := range []string{"APIError", "UnknownError", "MessageAbortedError", "ProviderAuthError"} {
+				for _, retryable := range []bool{false, true} {
+					err := &openCodeTaggedError{Name: name, Data: &openCodeErrorData{Message: message, StatusCode: status, IsRetryable: retryable}}
+					want := name == "APIError" && retryable
+					if got := isTransientAPIError(err); got != want {
+						t.Errorf("isTransientAPIError(%s, message %q, status %v, isRetryable %v) = %v, want %v: only an APIError's isRetryable decides",
+							name, message, derefInt(status), retryable, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+func derefInt(i *int) any {
+	if i == nil {
+		return nil
+	}
+	return *i
+}
+
 // TestEnrichReasonForFailedRecovery proves the reason-enrichment logic
 // used when a compaction/retry recovery attempt itself failed
 // (Adapter.attemptCompactionRetry, adapter.go): the result must reference

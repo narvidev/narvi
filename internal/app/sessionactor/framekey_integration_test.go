@@ -70,3 +70,51 @@ func TestHandleSnapshotReadyEvent_AnyProvenanceKeepsTheSnapshot(t *testing.T) {
 		})
 	}
 }
+
+// TestHandleExecutionCompleteEvent_AnyInterruptionValueCompletesTheTurn is
+// the event-path half of
+// TestDecodeExecutionComplete_AnyInterruptionValueKeepsTheFrame (technical
+// plan §35.4): whatever a completed execution_complete's interruption
+// holds -- the value this release knows, one a later release adds, or one
+// of the wrong type -- the turn it ends is completed, as it was before the
+// generated ExecutionComplete named the key. A decode that kept the key
+// would refuse all but the first, and leave the turn processing.
+func TestHandleExecutionCompleteEvent_AnyInterruptionValueCompletesTheTurn(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sandboxStore := narvipg.NewSandboxStore(pool)
+	turnStore := narvipg.NewTurnStore(pool)
+
+	for _, value := range []string{`"sandbox_stopping"`, `"sandbox_lifetime"`, `1`} {
+		t.Run(value, func(t *testing.T) {
+			sessionID := createTestSession(ctx, t, pool)
+			if _, err := sandboxStore.Create(ctx, sessionID); err != nil {
+				t.Fatalf("create sandbox: %v", err)
+			}
+			created := createProcessingTurn(ctx, t, turnStore, sessionID)
+			r, err := NewRegistry(ctx, pool, platform.DefaultTimeouts(), nil, nil, nil, "", nil, nil, "", nil, false)
+			if err != nil {
+				t.Fatalf("NewRegistry: %v", err)
+			}
+			defer func() { _ = r.Shutdown() }()
+			a, err := r.GetOrSpawn(ctx, sessionID)
+			if err != nil {
+				t.Fatalf("GetOrSpawn: %v", err)
+			}
+
+			raw := json.RawMessage(`{"type":"execution_complete","messageId":"ec-i","sessionId":"` + sessionID.String() +
+				`","gen":1,"ackId":"execution_complete:ec-i","outcome":"completed","reason":null,"interruption":` + value + `}`)
+			outcome := sendSandboxEvent(ctx, t, a, SandboxEvent{Type: "execution_complete", Gen: 1, Raw: raw})
+			if !outcome.Persisted || outcome.AckID == "" {
+				t.Errorf("execution_complete: Persisted %v, AckID %q; want it persisted and acknowledged", outcome.Persisted, outcome.AckID)
+			}
+			got, err := turnStore.Get(ctx, created.ID)
+			if err != nil {
+				t.Fatalf("get turn: %v", err)
+			}
+			if got.Status != sqlcgen.TurnStatusCompleted {
+				t.Errorf("after a completed execution_complete with interruption %s: turn %s, want completed", value, got.Status)
+			}
+		})
+	}
+}

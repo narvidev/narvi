@@ -331,8 +331,11 @@ func anyRepoHasExplicitBranch(repos []sessionconfig.SessionConfigReposElem) bool
 // gating idiom this mirrors (maybeEnqueueLinearProgress's own inserted
 // parameter).
 func (a *Actor) completeProcessingTurn(ctx context.Context, tx pgx.Tx, sandboxRow sqlcgen.Sandbox, raw json.RawMessage, inserted bool) (*pushSignal, error) {
-	var evt sandboxws.ExecutionComplete
-	if err := json.Unmarshal(raw, &evt); err != nil {
+	// Decoded without its interruption key (decodeExecutionComplete,
+	// framekey.go), so no value an agent reports there can cost the turn
+	// its end (technical plan §35.4).
+	evt, err := decodeExecutionComplete(raw)
+	if err != nil {
 		// Defensive, not fatal -- mirrors peekAckID's own doc comment
 		// exactly ("a decode failure here is defensive, not expected"):
 		// wshub's own read loop (internal/adapters/inbound/wshub/
