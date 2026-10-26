@@ -37,6 +37,17 @@
 //     check is enabled, and the two small pure functions deciding
 //     enabled/injected (session-override-wins-over-platform-default,
 //     never for a plan-mode turn).
+//   - The interruption readers and texts (interruption.go; §35.4): a turn
+//     its sandbox's stop interrupted has not failed. ReadAgentEnd reads an
+//     agent's execution_complete -- its typed interruption key first, an
+//     older agent's cancellation text compared whole as the permanent
+//     fallback -- and never reads a reason's digits or a diagnostic;
+//     AttributeInterruption names the cause from the gen's persisted
+//     deadline; DecideSilentInterruption decides a gen lost in silence
+//     under its turn; and RenderInterruptedTurnContext,
+//     PromptWithInterruptionContext and InterruptionWarning write the
+//     agent-facing context and the neutral warning, with no failure word
+//     and no duration.
 //
 // Every function here is pure per §11: no I/O, no time.Now(), no
 // randomness — anything needing "the current time" takes it as an
