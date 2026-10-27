@@ -259,6 +259,8 @@ the connection is open, the server checks again that the token's user
 may still read the session: a no closes the connection with `4001`
 ("re-auth required"), even after `subscribed`, and a check the server
 cannot make closes it with `1011`; either way, mint again and reconnect.
+A client that has not read the whole `subscribed` reply within
+`platform.Timeouts.ClientSubscribedWriteTimeout` (60s) is dropped.
 The server pings every
 `platform.Timeouts.ClientWSPingInterval` (30s); an unanswered ping closes
 the connection (code `4003`, "idle timeout"). A `fetch_history` frame

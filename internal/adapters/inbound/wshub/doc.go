@@ -129,10 +129,13 @@
 //     actorauthz.AuthorizeSessionRead, the check the mint makes too): the
 //     token's user exists and is not disabled, its role holds
 //     view_sessions, the session exists. A token with no user is refused.
-//     The open socket repeats that check every
+//     From the moment it is registered -- before the subscribed reply is
+//     written, so a client that stops reading during it is covered too --
+//     the connection repeats that check every
 //     ClientWSAccessRecheckInterval (recheckClientAccessLoop): a "no"
 //     unregisters the connection and closes it 4001, a check that cannot
-//     be made closes it 1011.
+//     be made closes it 1011. The subscribed reply's write is bounded by
+//     ClientSubscribedWriteTimeout.
 //   - UPDATE (§8.11, "multiplayer presence"): subscribe used to leave
 //     participants untouched (SubscribedPayload.participants was always
 //     an empty array); that gap is closed for LIVE presence specifically.

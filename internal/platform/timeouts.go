@@ -1173,16 +1173,38 @@ type Timeouts struct {
 	// the session (§6.2, §13.3; actorauthz.AuthorizeSessionRead, the check
 	// the socket made at subscribe): the user exists and is not disabled,
 	// its role holds view_sessions, the session exists. A "no" closes the
-	// socket 4001, a check that cannot be made closes it 1011. Each check
-	// is bounded by this same duration, as ClientWSPingInterval bounds its
-	// ping, so a socket whose subscriber loses access at T gets no frame
-	// after T plus twice this interval (about one interval in the usual
-	// case). Each replica re-reads Postgres for the sockets it holds, so
-	// the bound needs no cross-replica fan-out. Not specified in the plan;
-	// chosen as 60s: two primary-key reads per socket per minute.
-	// Validate requires it to be positive: time.NewTicker panics at zero,
-	// inside a per-connection goroutine.
+	// socket 4001, a check that cannot be made closes it 1011. The checks
+	// start when the connection is registered, before the subscribed reply
+	// is written. Each check is bounded by this same duration, as
+	// ClientWSPingInterval bounds its ping, so a socket whose subscriber
+	// loses access at T is sent nothing read or broadcast after T plus
+	// twice this interval (about one interval in the usual case): a frame
+	// already being written may finish first, and when a client that
+	// stopped reading holds it back, the close drops the connection after
+	// coder/websocket's 5s close-write limit. Each replica re-reads
+	// Postgres for the sockets it holds, so the bound needs no
+	// cross-replica fan-out. Not specified in the plan; chosen as 60s: two
+	// primary-key reads per socket per minute. Validate requires it to be
+	// positive: time.NewTicker panics at zero, inside a per-connection
+	// goroutine.
 	ClientWSAccessRecheckInterval time.Duration
+
+	// ClientSubscribedWriteTimeout bounds the client-WS handler's write of
+	// the single subscribed reply (client.go, NewClientHandler, §6.2): a
+	// client that stops reading partway through it is dropped when this
+	// elapses (coder/websocket closes the connection when a write's
+	// context expires), so it cannot hold the handler, its Hub
+	// registration and its queued broadcasts for as long as it likes while
+	// its access stands. (Access lost during the write is handled by
+	// ClientWSAccessRecheckInterval's re-check, which runs alongside it.)
+	// The reply carries the session, its turns, its artifacts and up to
+	// 16 KiB of events, and turns and artifacts grow with the session.
+	// Not specified in the plan; chosen as 60s: about 1.9 MB at 256 kbit/s,
+	// a reply far larger than a long session's on a slow mobile link.
+	// Validate requires it to be positive: a zero deadline would fail
+	// every subscribe at once. No pairwise link: nothing else waits on
+	// this write, and the ping loop only starts once it has returned.
+	ClientSubscribedWriteTimeout time.Duration
 
 	// ClientFetchHistoryMinInterval is the minimum time internal/adapters/
 	// inbound/wshub's client-WS read loop (client.go, readClientLoop)
@@ -4700,6 +4722,7 @@ func DefaultTimeouts() Timeouts {
 
 		ClientWSPingInterval:          30 * time.Second,       // not specified; chosen, matches SandboxWSHeartbeatInterval's own 30s cadence (§6.1)
 		ClientWSAccessRecheckInterval: 60 * time.Second,       // not specified; chosen: how long an open socket may outlive its subscriber's read access
+		ClientSubscribedWriteTimeout:  60 * time.Second,       // not specified; chosen: a large subscribed reply on a slow link
 		ClientFetchHistoryMinInterval: 250 * time.Millisecond, // not specified; chosen, generous for real pagination while blocking a tight-loop hammer
 
 		ExpiredCredentialCleanupInterval: time.Hour, // not specified; chosen, bounds only table size: an expired ws_tokens/user_sessions row is refused at verify time anyway
@@ -5770,6 +5793,10 @@ func (t Timeouts) Validate() error {
 	// same assertion, made here so a bad value fails at startup instead.
 	// See ClientWSAccessRecheckInterval's doc comment.
 	mustBePositive("ClientWSAccessRecheckInterval", t.ClientWSAccessRecheckInterval)
+	// The subscribed reply's write deadline: at zero or less every
+	// subscribe's write would expire at once and every client socket
+	// would fail. See ClientSubscribedWriteTimeout's doc comment.
+	mustBePositive("ClientSubscribedWriteTimeout", t.ClientSubscribedWriteTimeout)
 
 	return errors.Join(errs...)
 }

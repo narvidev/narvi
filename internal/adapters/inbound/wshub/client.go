@@ -93,15 +93,19 @@
 //     against the drain goroutine. See Hub.Register's and
 //     Hub.StartDelivery's own doc comments for the full mechanics.
 //
-//     Then: start the idle-liveness ping loop (see pingClientLoop's own
-//     doc comment -- an unanswered ping closes 4003 "idle timeout") and
-//     the access re-check (recheckClientAccessLoop: step 5b's check again
+//     The access re-check (recheckClientAccessLoop: step 5b's check again
 //     every ClientWSAccessRecheckInterval; a "no" unregisters the
 //     connection and closes it 4001, a check that cannot be made closes
-//     it 1011), then run the post-subscribe read loop (fetch_history,
-//     rate-limited per-connection via
-//     platform.Timeouts.ClientFetchHistoryMinInterval) until the
-//     connection errs or closes.
+//     it 1011) starts right after Hub.Register, before the subscribed
+//     reply is assembled and written, so a client that stops reading
+//     during that write is re-checked too. The subscribed write itself is
+//     bounded by ClientSubscribedWriteTimeout.
+//
+//     Then: start the idle-liveness ping loop (see pingClientLoop's own
+//     doc comment -- an unanswered ping closes 4003 "idle timeout"), then
+//     run the post-subscribe read loop (fetch_history, rate-limited
+//     per-connection via platform.Timeouts.ClientFetchHistoryMinInterval)
+//     until the connection errs or closes.
 //
 // No registry.GetOrSpawn call belongs anywhere in this handshake: every
 // step above is a plain store read (session/ws-token/turns/sandbox/
@@ -351,6 +355,21 @@ func NewClientHandler(
 			_ = writerGroup.Wait()
 		}()
 
+		// (6b) the session read check again, from the moment the connection
+		// is registered (§6.2, §13.3) -- before the subscribed reply is
+		// assembled and written, not after: that write can stall for as long
+		// as the client stops reading, and the connection is registered (the
+		// Hub queues for it) all that while. A "no" during the stall
+		// unregisters the connection and closes it; coder/websocket queues
+		// the close frame behind the stalled frame and, when that frame does
+		// not finish within its 5s close-write limit, drops the connection,
+		// which ends the stalled write too. See recheckClientAccessLoop's own
+		// doc comment.
+		writerGroup.Go(func() error {
+			recheckClientAccessLoop(writerCtx, conn, timeouts.ClientWSAccessRecheckInterval, checkAccess, revoke, accessLogger)
+			return nil
+		})
+
 		// Test-only synchronization seam: see subscribeDBReadHook's own doc
 		// comment. Always nil in production.
 		if hook := subscribeDBReadHook.Load(); hook != nil {
@@ -377,7 +396,15 @@ func NewClientHandler(
 			_ = conn.Close(websocket.StatusInternalError, "internal error")
 			return
 		}
-		if err := conn.Write(ctx, websocket.MessageText, raw); err != nil {
+		// The subscribed write is bounded by ClientSubscribedWriteTimeout: a
+		// client that stops reading partway through its reply is dropped
+		// (coder/websocket closes the connection when a write's context
+		// expires) even while its access stands, so it cannot hold this
+		// handler, its Hub registration and its queued broadcasts for good.
+		writeCtx, cancelWrite := context.WithTimeout(ctx, timeouts.ClientSubscribedWriteTimeout)
+		err = conn.Write(writeCtx, websocket.MessageText, raw)
+		cancelWrite()
+		if err != nil {
 			logger.Warn("wshub: write subscribed payload failed", "error", err)
 			return
 		}
@@ -398,17 +425,12 @@ func NewClientHandler(
 		// periodic server-initiated ping, run on the SAME writerGroup/
 		// writerCtx as the Hub's own writer goroutine above -- both torn
 		// down together by this handler's own deferred cleanup. See
-		// pingClientLoop's own doc comment.
+		// pingClientLoop's own doc comment. It starts here, after the
+		// subscribed write, not at registration like the access re-check:
+		// a pong is only read by readClientLoop, which starts below, and
+		// the subscribed write already has its own bound.
 		writerGroup.Go(func() error {
 			pingClientLoop(writerCtx, conn, timeouts.ClientWSPingInterval, logger)
-			return nil
-		})
-
-		// The session read check again, on the open socket (§6.2, §13.3),
-		// on the same writerGroup/writerCtx. See recheckClientAccessLoop's
-		// own doc comment.
-		writerGroup.Go(func() error {
-			recheckClientAccessLoop(writerCtx, conn, timeouts.ClientWSAccessRecheckInterval, checkAccess, revoke, accessLogger)
 			return nil
 		})
 
@@ -916,14 +938,23 @@ func enforceAccessVerdict(ctx context.Context, conn *websocket.Conn, phase strin
 // actorauthz.AuthorizeSessionRead for this connection's user and
 // session), until ctx is done or a check other than Allowed closes conn
 // (enforceAccessVerdict: revoke first, then 4001 or 1011). Modelled on
-// pingClientLoop and run on the same writerGroup/writerCtx.
+// pingClientLoop and run on the same writerGroup/writerCtx, but started
+// as soon as the connection is registered, before the subscribed reply is
+// written: a client that stops reading during that reply is checked like
+// any other.
 //
 // Each check is bounded by interval itself, as pingClientLoop bounds its
 // ping; one that cannot finish in time is an Error and closes 1011. So
-// once a subscriber loses access at T, its socket gets no frame after
-// T + 2*interval: revoke stops the Hub queuing for it, and once the close
-// frame is written, coder/websocket refuses every later data write. Each
-// socket's ticker starts at its own subscribe, so the checks spread out
+// once a subscriber loses access at T, nothing read or broadcast after
+// T + 2*interval reaches its socket: by then a check has said no, revoke
+// has stopped the Hub queuing for it, and the close has been asked for.
+// coder/websocket writes one frame at a time and queues the close frame
+// behind a frame already being written; that frame may still finish
+// first, and every later data write is refused once the close frame is
+// out. If a client that stopped reading holds that frame back, the close
+// gives up after coder/websocket's 5s close-write limit and drops the
+// connection, which ends the stalled write: nothing follows it either.
+// Each socket's ticker starts at its own registration, so the checks spread out
 // and a short Postgres outage closes only the sockets whose check falls
 // inside it; the client reconnects as after any close. Each replica reads
 // Postgres for the sockets it holds, so this needs no cross-replica
