@@ -77,6 +77,63 @@ func TestUpsertSandboxForSpawn_ClearsTheFreshLineageMark(t *testing.T) {
 	}
 }
 
+// TestUpdateSandboxSnapshotID_RecordsAnOwedRecapKeyedToTheSnapshot: the
+// statement that records a snapshot records it as owing a recap exactly
+// when the gen that minted it -- the live gen -- is a fresh lineage whose
+// recap has not reached it, keyed by the snapshot's id; a later snapshot
+// of an unmarked gen owes none, and the clear that forgets a snapshot
+// forgets it.
+func TestUpdateSandboxSnapshotID_RecordsAnOwedRecapKeyedToTheSnapshot(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	store := narvipg.NewSandboxStore(pool)
+	sessionID := createTestSession(ctx, t, pool)
+	if _, err := store.Create(ctx, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	record := func(snapshotID string) *string {
+		t.Helper()
+		row, err := store.UpdateSnapshotID(ctx, sqlcgen.UpdateSandboxSnapshotIDParams{SessionID: sessionID, SnapshotID: &snapshotID})
+		if err != nil {
+			t.Fatalf("UpdateSnapshotID: %v", err)
+		}
+		return row.SnapshotRecapOwedID
+	}
+	if got := record("snap-unmarked"); got != nil {
+		t.Fatalf("an unmarked gen's snapshot owes a recap: %q, want NULL", *got)
+	}
+	if err := store.MarkFreshLineage(ctx, sessionID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if got := record("snap-owed"); got == nil || *got != "snap-owed" {
+		t.Fatalf("a marked gen's snapshot records %v, want snap-owed: it owes the recap", got)
+	}
+	// The mark of an earlier gen counts for none: a later gen's snapshot
+	// owes nothing.
+	if _, err := pool.Exec(ctx, `UPDATE sandboxes SET gen = gen + 1 WHERE session_id = $1`, sessionID); err != nil {
+		t.Fatal(err)
+	}
+	if got := record("snap-later-gen"); got != nil {
+		t.Fatalf("a snapshot of a gen past its mark records %q, want NULL", *got)
+	}
+	if err := store.MarkFreshLineage(ctx, sessionID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if got := record("snap-owed-2"); got == nil || *got != "snap-owed-2" {
+		t.Fatalf("the marked gen's snapshot records %v, want snap-owed-2", got)
+	}
+	if n, err := store.ClearSnapshot(ctx, sessionID, "snap-owed-2"); err != nil || n != 1 {
+		t.Fatalf("ClearSnapshot = %d, %v", n, err)
+	}
+	row, err := store.Get(ctx, sessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.SnapshotRecapOwedID != nil {
+		t.Fatalf("snapshot_recap_owed_id %q after the clear, want NULL", *row.SnapshotRecapOwedID)
+	}
+}
+
 // TestClearSandboxFreshLineageOnReach_OnlyTheRecapTurnOnTheMarkedGen: the
 // mark is cleared only for the gen it names, by evidence of that gen,
 // while a turn is processing there with a recap built for it -- and, for a
@@ -266,6 +323,52 @@ func TestClearSessionConversationID_LeavesUpdatedAt(t *testing.T) {
 			t.Fatalf("updated_at moved from %v to %v, want it left as it was", updatedAt, got)
 		}
 	}
+}
+
+// TestReseatSessionConversationID_LeavesUpdatedAt: a restore makes the
+// session name the conversation its snapshot holds, none included, reports
+// whether that changed anything, and leaves updated_at as it was -- the
+// decision inbox orders failed sessions by it.
+func TestReseatSessionConversationID_LeavesUpdatedAt(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	sessions := narvipg.NewSessionStore(pool)
+	sessionID := createTestSession(ctx, t, pool)
+	current := "conv-of-the-fresh-lineage"
+	if _, err := sessions.UpdateConversationID(ctx, sqlcgen.UpdateSessionConversationIDParams{ID: sessionID, OpencodeConversationID: &current}); err != nil {
+		t.Fatal(err)
+	}
+	updatedAt := sessionUpdatedAt(ctx, t, pool, sessionID)
+	snapshots := "conv-the-snapshot-holds"
+	for i, step := range []struct {
+		conversation *string
+		changed      bool
+	}{{&snapshots, true}, {&snapshots, false}, {nil, true}, {nil, false}} {
+		changed, err := sessions.ReseatConversationID(ctx, sessionID, step.conversation)
+		if err != nil {
+			t.Fatalf("step %d: ReseatConversationID: %v", i, err)
+		}
+		if changed != step.changed {
+			t.Fatalf("step %d: ReseatConversationID reported %v, want %v", i, changed, step.changed)
+		}
+		row, err := sessions.Get(ctx, sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if stringOrEmptyForTest(row.OpencodeConversationID) != stringOrEmptyForTest(step.conversation) {
+			t.Fatalf("step %d: the session names %v, want %v", i, row.OpencodeConversationID, step.conversation)
+		}
+		if got := sessionUpdatedAt(ctx, t, pool, sessionID); !got.Equal(updatedAt) {
+			t.Fatalf("step %d: updated_at moved from %v to %v, want it left as it was", i, updatedAt, got)
+		}
+	}
+}
+
+func stringOrEmptyForTest(s *string) string {
+	if s == nil {
+		return ""
+	}
+	return *s
 }
 
 func sessionUpdatedAt(ctx context.Context, t *testing.T, pool *pgxpool.Pool, sessionID pgtype.UUID) time.Time {

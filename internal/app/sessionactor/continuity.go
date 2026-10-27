@@ -14,11 +14,16 @@
 // claim's upsert. Every fresh spawn also forgets the session's
 // agent-runtime conversation id: the new box holds no runtime
 // conversation, so its first prompt names none, and the agent's heartbeat
-// records the one it opens. A restore or resume keeps the id, and is never
-// marked. A claim that starts a fresh lineage marks its gen
+// records the one it opens. A restore makes the session name the
+// conversation recorded for the snapshot it restores, when one was
+// (reseatRestoredConversation, snapshotrestore.go), and a resume leaves the
+// id as it is. A claim that starts a fresh lineage marks its gen
 // (sandboxes.fresh_lineage_gen); every claim's upsert clears the mark, so it
 // counts only for the gen it names, and a later fresh claim that replaces a
-// gen whose mark is still pending carries it over.
+// gen whose mark is still pending carries it over. A restore carries it too
+// when the snapshot it restores was minted before that recap arrived
+// (decideRestoreLineage): that runtime never received it. Any other restore,
+// and a resume, is never marked.
 //
 // # The recap
 //
@@ -170,6 +175,40 @@ func (a *Actor) decideFreshLineage(
 	return note, nil
 }
 
+// snapshotUnrecapped reports whether row records snapshotID as minted by a
+// gen whose fresh-lineage recap had not reached it
+// (sandboxes.snapshot_recap_owed_id, keyed by the snapshot's id).
+func snapshotUnrecapped(row sqlcgen.Sandbox, snapshotID string) bool {
+	return row.SnapshotRecapOwedID != nil && *row.SnapshotRecapOwedID == snapshotID
+}
+
+// decideRestoreLineage settles, in a restore claim's own transaction, the
+// one case in which a restore is marked (technical plan §35.5,
+// sandbox.DecideFreshLineage's row 0): the gen sandboxRow replaces is a
+// fresh lineage whose recap is still owed, and the snapshot the claim
+// restores, snapshotID, was minted by such a gen before its recap arrived.
+// The restored runtime then holds neither the earlier conversation nor the
+// recap, so the pending mark is carried to newGen, never announced again.
+// A restore of a snapshot minted before the fresh lineage, or after its
+// recap arrived, is not marked.
+func (a *Actor) decideRestoreLineage(ctx context.Context, tx pgx.Tx, sandboxRow sqlcgen.Sandbox, newGen int, snapshotID string) (*freshLineageNote, error) {
+	note := &freshLineageNote{
+		gen: newGen, replacedGen: sandboxRow.Gen, replacedStatus: string(sandboxRow.Status), snapshotID: snapshotID,
+	}
+	note.decision = sandbox.DecideFreshLineage(sandbox.LineageFacts{
+		Claim:                      sandbox.LineageClaimRestore,
+		ReplacedMarkPending:        freshLineagePending(sandboxRow),
+		Rotating:                   rotating(sandboxRow),
+		RestoredSnapshotUnrecapped: snapshotUnrecapped(sandboxRow, snapshotID),
+	})
+	if note.decision.Mark {
+		if err := a.stores.sandbox.WithTx(tx).MarkFreshLineage(ctx, a.sessionID, int32(newGen)); err != nil {
+			return nil, fmt.Errorf("sessionactor: carry the fresh-lineage mark into the restored gen: %w", err)
+		}
+	}
+	return note, nil
+}
+
 // freshLineageLogMessage and freshLineageCarriedLogMessage are
 // logFreshLineage's messages.
 const (
@@ -180,9 +219,9 @@ const (
 // logFreshLineage logs and counts what plan's claim decided about the fresh
 // lineage, after the claim committed (executePlans), never inside it: a
 // marked gen at WARN, or at INFO when its mark was carried over, and on
-// sandbox_fresh_lineage_total. A claim that marked nothing -- a restore, a
-// resume, a session's first spawn, one before any turn was dispatched --
-// records nothing.
+// sandbox_fresh_lineage_total. A claim that marked nothing -- a restore of
+// any other snapshot, a resume, a session's first spawn, one before any
+// turn was dispatched -- records nothing.
 func (a *Actor) logFreshLineage(ctx context.Context, plan *spawnPlan) {
 	n := plan.lineage
 	if n == nil || !n.decision.Mark {
@@ -318,7 +357,8 @@ func (a *Actor) recapTurns(
 		if err != nil {
 			return continuity.Input{}, err
 		}
-		in.Interrupted = &continuity.Attempt{Report: final, Reported: found}
+		attempt := continuity.Attempt{Report: final, Reported: found}.Quotable()
+		in.Interrupted = &attempt
 	}
 	var newestFirst []continuity.Turn
 	for i := len(earlier) - 1; i >= 0 && len(newestFirst) < continuity.MaxTurns; i-- {
@@ -328,10 +368,11 @@ func (a *Actor) recapTurns(
 		if err != nil {
 			return continuity.Input{}, err
 		}
+		// Prepared once, here: the Builds below quote it as it stands.
 		newestFirst = append(newestFirst, continuity.Turn{
 			Number: i + 1, Status: turn.State(t.Status), EndReason: stringOrEmpty(t.EndReason),
 			Request: recapRequest(t), Report: final, Reported: found,
-		})
+		}.Quotable())
 		in.Turns = oldestFirst(newestFirst)
 		if recap, ok := continuity.Build(in, budget); !ok || recap.Turns < len(newestFirst) {
 			break

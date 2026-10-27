@@ -6,7 +6,10 @@ package sandbox
 // again and the agent runtime opens an empty conversation, so the agent has
 // neither its context nor any work that was not pushed. A restore keeps the
 // snapshot's filesystem and the runtime's session storage, and a resume
-// keeps the provider's own object, so neither starts one.
+// keeps the provider's own object, so neither starts one. A restore of a
+// snapshot a fresh lineage minted before its recap reached it brings back
+// that fresh lineage's runtime, which never received the recap: it carries
+// the pending mark of the gen it replaces.
 //
 // DecideFreshLineage is the one place that tells them apart. Its caller is
 // the claim that creates the gen, in the claim's own transaction: every
@@ -54,6 +57,10 @@ type LineageCause string
 const (
 	// LineageCauseNone is the cause of a claim that is not marked.
 	LineageCauseNone LineageCause = ""
+	// LineageCauseUnrecappedSnapshot: a restore of a snapshot minted by a
+	// gen whose recap had not reached it, replacing a gen whose mark is
+	// still pending. Always carried.
+	LineageCauseUnrecappedSnapshot LineageCause = "unrecapped_snapshot"
 	// LineageCauseRestoreRefused: a restore refused, its snapshot cleared.
 	LineageCauseRestoreRefused LineageCause = "restore_refused"
 	// LineageCauseRestoreDowngraded: a restore downgraded, its snapshot kept.
@@ -92,6 +99,12 @@ type LineageFacts struct {
 	// ReplacedLive is true when the replaced gen was spawning, connecting,
 	// booting or ready.
 	ReplacedLive bool
+	// RestoredSnapshotUnrecapped is true, for a restore, when the snapshot
+	// it restores was minted by a gen that was a fresh lineage whose recap
+	// had not reached it (sandboxes.snapshot_recap_owed_id names it): the
+	// restored runtime holds neither the earlier conversation nor the
+	// recap.
+	RestoredSnapshotUnrecapped bool
 }
 
 // LineageDecision is DecideFreshLineage's answer.
@@ -113,6 +126,9 @@ type LineageDecision struct {
 // DecideFreshLineage decides whether the claim f describes starts a fresh
 // lineage (technical plan §35.5). The first row that matches decides:
 //
+//  0. a restore of a snapshot minted before its fresh lineage's recap
+//     reached it, replacing a gen whose mark is pending: marked and
+//     carried, unrecapped_snapshot;
 //  1. a restore: not marked;
 //  2. a resume: not marked;
 //  3. the session's first gen: not marked, there is nothing to lose;
@@ -126,8 +142,13 @@ type LineageDecision struct {
 //  10. otherwise: no_snapshot.
 //
 // Rows 6 to 10 are marked and announced. A claim that is none of spawn,
-// restore and resume is never marked.
+// restore and resume is never marked. A restore is marked only by row 0,
+// and only ever carries a mark: the loss was announced when the fresh
+// lineage began.
 func DecideFreshLineage(f LineageFacts) LineageDecision {
+	if f.Claim == LineageClaimRestore && f.ReplacedMarkPending && f.RestoredSnapshotUnrecapped {
+		return LineageDecision{Mark: true, Carried: true, Cause: LineageCauseUnrecappedSnapshot}
+	}
 	if f.Claim != LineageClaimSpawn || f.FirstGen || !f.PriorTurnDispatched {
 		return LineageDecision{}
 	}

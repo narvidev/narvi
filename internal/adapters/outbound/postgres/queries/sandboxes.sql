@@ -129,11 +129,12 @@ RETURNING *;
 -- the bump alone makes a value left over read "not rotating".
 --
 -- fresh_lineage_gen (technical plan §35.5, the sandbox_fresh_lineage
--- migration) is cleared too, so every claim starts unmarked: a restore or
--- a resume never carries a mark, and the claim that spawns a fresh lineage
--- marks its new gen afterwards, in its own transaction
--- (MarkSandboxFreshLineage). Like the rotation, the mark counts only while
--- it equals gen, so this is hygiene as well.
+-- migration) is cleared too, so every claim starts unmarked: a resume never
+-- carries a mark, and the claim that spawns a fresh lineage -- or restores
+-- a snapshot minted before its recap arrived -- marks its new gen
+-- afterwards, in its own transaction (MarkSandboxFreshLineage). Like the
+-- rotation, the mark counts only while it equals gen, so this is hygiene
+-- as well.
 --
 -- A NULL lifetime_seconds is a resume's (planResume): the same provider
 -- object, never younger than it was, so a fresh stamp would be later than
@@ -270,9 +271,20 @@ RETURNING *;
 -- runtime last reported, NULL when none was -- keyed by the snapshot's id,
 -- like the provenance, so a snapshot a binary that does not write them
 -- mints reads "not recorded" rather than an earlier snapshot's
--- conversation. A restore compares it with the conversation its prompt
--- will name, and only counts the outcome
--- (sandbox.ClassifyRestoreConversation).
+-- conversation. A restore counts how it compares with the conversation the
+-- session names (sandbox.ClassifyRestoreConversation), then makes the
+-- session name the one recorded here, NULL included (technical plan
+-- §35.5, ReseatSessionConversationID).
+--
+-- snapshot_recap_owed_id (technical plan §35.5, the sandbox_fresh_lineage
+-- migration) is the snapshot's own id when the gen that minted it -- the
+-- live gen, whose row this is -- was a fresh lineage whose recap had not
+-- reached it (fresh_lineage_gen = gen, read from the row as it is before
+-- this write); NULL otherwise. The restored runtime then holds neither the
+-- earlier conversation nor the recap, so a restore of that snapshot
+-- carries the replaced gen's pending mark (sandbox.DecideFreshLineage).
+-- Keyed by the id, as the rest of the provenance is, so a snapshot a binary
+-- that does not write it mints reads as owing nothing.
 UPDATE sandboxes
 SET snapshot_id = sqlc.arg('snapshot_id'),
     snapshot_suppressed_in_shadow = sqlc.arg('snapshot_suppressed_in_shadow'),
@@ -285,6 +297,7 @@ SET snapshot_id = sqlc.arg('snapshot_id'),
     snapshot_skipped_repo_hooks_id = CASE WHEN skip_repo_hooks_told_gen = gen AND skip_repo_hooks_gen = gen THEN sqlc.arg('snapshot_id') END,
     snapshot_conversation_id = (SELECT s.opencode_conversation_id FROM sessions s WHERE s.id = sandboxes.session_id),
     snapshot_conversation_recorded_id = sqlc.arg('snapshot_id'),
+    snapshot_recap_owed_id = CASE WHEN fresh_lineage_gen = gen THEN sqlc.arg('snapshot_id') END,
     snapshot_minted_at = now(),
     updated_at = now()
 WHERE session_id = sqlc.arg('session_id')
@@ -761,8 +774,9 @@ WHERE session_id = sqlc.arg('session_id') AND gen = sqlc.arg('gen')::integer;
 -- fresh instead (snapshotrestore.go): a floor only rises, so a refused
 -- snapshot never becomes restorable, and a later death of the new gen must
 -- not offer it again. The provenance describes the snapshot as well
--- (migrations/000170), so it goes with it, and so does the conversation it
--- was minted under (technical plan §35.5, migrations/000177). Guarded on
+-- (migrations/000170), so it goes with it, and so do the conversation it
+-- was minted under (technical plan §35.5, migrations/000177) and whether
+-- its gen still owed a recap (the sandbox_fresh_lineage migration). Guarded on
 -- the snapshot the caller decided on, so a snapshot recorded since that
 -- decision is never cleared.
 UPDATE sandboxes
@@ -774,6 +788,7 @@ SET snapshot_id = NULL,
     snapshot_skipped_repo_hooks_id = NULL,
     snapshot_conversation_id = NULL,
     snapshot_conversation_recorded_id = NULL,
+    snapshot_recap_owed_id = NULL,
     snapshot_minted_at = NULL,
     updated_at = now()
 WHERE session_id = sqlc.arg('session_id') AND snapshot_id = sqlc.arg('snapshot_id')::text;

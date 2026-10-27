@@ -2400,6 +2400,7 @@ type Sandbox struct {
 	SnapshotConversationID         *string              `json:"snapshot_conversation_id"`
 	SnapshotConversationRecordedID *string              `json:"snapshot_conversation_recorded_id"`
 	FreshLineageGen                *int32               `json:"fresh_lineage_gen"`
+	SnapshotRecapOwedID            *string              `json:"snapshot_recap_owed_id"`
 }
 
 type SandboxHistory struct {

@@ -45,12 +45,13 @@ import (
 // lineageCommander records every command it is asked to send. A snapshot
 // command finds no connection, so the sandbox goes back to ready after
 // each turn (triggerSnapshotBestEffort's revert) and no snapshot is ever
-// recorded unless a test records one; a prompt fails with promptErr when
-// it is set.
+// recorded unless a test records one -- or lets snapshot commands through
+// (letSnapshotsThrough); a prompt fails with promptErr when it is set.
 type lineageCommander struct {
-	mu        sync.Mutex
-	payloads  []json.RawMessage
-	promptErr error
+	mu               sync.Mutex
+	payloads         []json.RawMessage
+	promptErr        error
+	snapshotsThrough bool
 }
 
 var _ ports.SandboxCommander = (*lineageCommander)(nil)
@@ -65,11 +66,36 @@ func (c *lineageCommander) SendCommand(_ string, payload json.RawMessage) error 
 	_ = json.Unmarshal(payload, &head)
 	switch head.Type {
 	case "snapshot":
+		if c.snapshotsThrough {
+			return nil
+		}
 		return ports.ErrNoLiveSandboxConnection
 	case "prompt":
 		return c.promptErr
 	}
 	return nil
+}
+
+// letSnapshotsThrough makes every later snapshot command succeed.
+func (c *lineageCommander) letSnapshotsThrough() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.snapshotsThrough = true
+}
+
+// lastSnapshotCommand is the latest snapshot command sent.
+func (c *lineageCommander) lastSnapshotCommand(t *testing.T) sandboxws.Snapshot {
+	t.Helper()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for i := len(c.payloads) - 1; i >= 0; i-- {
+		var cmd sandboxws.Snapshot
+		if json.Unmarshal(c.payloads[i], &cmd) == nil && cmd.Type == "snapshot" {
+			return cmd
+		}
+	}
+	t.Fatal("no snapshot command was sent")
+	return sandboxws.Snapshot{}
 }
 
 func (c *lineageCommander) setPromptErr(err error) {
@@ -411,7 +437,8 @@ func freshLineageCounts(ctx context.Context, t *testing.T) map[string]int64 {
 	t.Helper()
 	out := map[string]int64{}
 	for _, cause := range []sandbox.LineageCause{sandbox.LineageCauseNoSnapshot, sandbox.LineageCauseRotationNoSnapshot,
-		sandbox.LineageCauseRestoreRefused, sandbox.LineageCauseRestoreDowngraded, sandbox.LineageCauseStuckRespawn} {
+		sandbox.LineageCauseRestoreRefused, sandbox.LineageCauseRestoreDowngraded, sandbox.LineageCauseStuckRespawn,
+		sandbox.LineageCauseUnrecappedSnapshot} {
 		for _, carried := range []bool{false, true} {
 			key := string(cause)
 			if carried {
@@ -1415,6 +1442,53 @@ func TestFreshLineage_RestoreAfterAFreshSpawnNamesTheSnapshotsConversation(t *te
 		}
 	})
 
+	// A rotation whose own snapshot was not taken falls back to the one
+	// before it -- here the snapshot a fresh spawn kept -- after the fresh
+	// lineage opened a conversation of its own: the restore names the
+	// snapshot's.
+	t.Run("RotationFallbackThenRestore", func(t *testing.T) {
+		ctx := context.Background()
+		rig := newLineageRig(ctx, t, lineageRigOptions{
+			provider: &fakeSpawnProvider{explicitStop: true},
+			seed:     seedWith(stuckRestore, recorded),
+		})
+		rig.respawn(ctx, t, "carry on")
+		rig.bootGen(ctx, t, 2, false)
+		opened := "conv-of-gen-2"
+		deliver(ctx, t, rig.actor, SandboxEvent{Type: "heartbeat", Gen: 2, MessageID: "hb-" + uuid.NewString(), ConversationID: &opened,
+			Raw: json.RawMessage(`{"type":"heartbeat","messageId":"hb","sessionId":"s","gen":2,"conversationId":"conv-of-gen-2","lastBootPhase":null}`)})
+		rig.stream(ctx, t, 2, "Carried on.")
+		deliver(ctx, t, rig.actor, completedEvent(2))
+		rig.assertUnmarked(ctx, t, 2)
+		if id := rig.conversationID(ctx, t); stringOrEmpty(id) != opened {
+			t.Fatalf("the session names %v, want %s, the fresh gen's", id, opened)
+		}
+
+		// Gen 2 nears its deadline: the next turn rotates it, its snapshot
+		// command finds no connection, and the gen is retired and replaced by
+		// a restore of the snapshot before it -- the kept one.
+		rig.exec(ctx, t, `UPDATE sandboxes SET lifetime_deadline_at = now() + interval '10 minutes', lifetime_seconds = 7200,
+			lifetime_deadline_gen = gen WHERE session_id = $1`)
+		createTurnArmingDispatch(ctx, t, rig.pool, rig.sessionID, "and next")
+		settle(ctx, t, rig.actor)
+		waitUntil(t, 5*time.Second, func() bool { return rig.provider.restoreCallCount() == 1 })
+		waitForConnecting(ctx, t, rig.pool, rig.sessionID)
+		if call := rig.provider.lastRestoreCall(); string(call.snapshotID) != snapshotID || call.spec.Gen != 3 {
+			t.Fatalf("restored %q for gen %d, want %s for gen 3: the rotation's fallback", call.snapshotID, call.spec.Gen, snapshotID)
+		}
+		if n := len(fallbackWarnings(ctx, t, rig.pool, rig.sessionID)); n != 1 {
+			t.Fatalf("%d fallback warnings, want 1: the rotation fell back", n)
+		}
+		rig.assertUnmarked(ctx, t, 3)
+		if id := rig.conversationID(ctx, t); stringOrEmpty(id) != conversation {
+			t.Fatalf("the session names %v after the rotation's restore, want %s, the snapshot's", id, conversation)
+		}
+		rig.bootGen(ctx, t, 3, false)
+		if p := rig.commander.lastPrompt(t); p.Gen != 3 || stringOrEmpty(p.ConversationId) != conversation || p.Text != "and next" {
+			t.Fatalf("prompt to gen %d names %v with text %q, want gen 3 naming %s with the request alone", p.Gen, p.ConversationId, shortened(p.Text), conversation)
+		}
+	})
+
 	t.Run("UnrecordedSnapshotNamesWhatTheSessionNames", func(t *testing.T) {
 		ctx := context.Background()
 		rig := newLineageRig(ctx, t, lineageRigOptions{
@@ -1435,6 +1509,68 @@ func TestFreshLineage_RestoreAfterAFreshSpawnNamesTheSnapshotsConversation(t *te
 			t.Fatalf("prompt names %v with text %q, want none and the request alone", p.ConversationId, shortened(p.Text))
 		}
 	})
+}
+
+// TestFreshLineage_RestoreOfAnUnrecappedSnapshotCarriesTheMark: a fresh
+// lineage whose recap has not reached it can be snapshotted -- here by the
+// runway gate's rotation, its first turn stopped before it was sent -- and
+// that snapshot restored. The restored runtime holds neither the earlier
+// conversation nor the recap, so the restore carries the pending mark,
+// never announcing the loss again, and the restored gen's first prompt
+// opens with the recap.
+func TestFreshLineage_RestoreOfAnUnrecappedSnapshotCarriesTheMark(t *testing.T) {
+	ctx := context.Background()
+	logs := captureDefaultLoggerLocked(t)
+	carriedBefore := freshLineageCount(ctx, t, sandbox.LineageCauseUnrecappedSnapshot, true)
+	rig := newLineageRig(ctx, t, lineageRigOptions{provider: &fakeSpawnProvider{explicitStop: true}})
+	rig.runTurn(ctx, t, 1, "add the retry to the importer", "Added the retry.")
+	rig.setStatus(ctx, t, sqlcgen.SandboxStatusFailed)
+
+	// Gen 2 is a fresh lineage; its first turn is stopped before it is sent.
+	stopped := rig.respawn(ctx, t, "carry on")
+	if _, err := rig.pool.Exec(ctx, `UPDATE turns SET stop_requested_at = now() WHERE id = $1`, stopped.ID); err != nil {
+		t.Fatal(err)
+	}
+	rig.bootGen(ctx, t, 2, false)
+	if got := rig.turn(ctx, t, stopped.ID).Status; got != sqlcgen.TurnStatusCancelled {
+		t.Fatalf("stopped turn %s, want cancelled", got)
+	}
+	rig.assertMarked(ctx, t, 2)
+
+	// Gen 2 nears its deadline; the next turn rotates it, and its snapshot
+	// is recorded while its recap is still owed.
+	rig.exec(ctx, t, `UPDATE sandboxes SET lifetime_deadline_at = now() + interval '10 minutes', lifetime_seconds = 7200,
+		lifetime_deadline_gen = gen WHERE session_id = $1`)
+	deliver(ctx, t, rig.actor, receiptHeartbeat(2))
+	rig.commander.letSnapshotsThrough()
+	rig.queue(ctx, t, "and next")
+	if row := rig.sandbox(ctx, t); row.Status != sqlcgen.SandboxStatusSnapshotting || !rotating(row) {
+		t.Fatalf("sandbox %s, rotating %v; want gen 2 snapshotting for its rotation", row.Status, rotating(row))
+	}
+	cmd := rig.commander.lastSnapshotCommand(t)
+	deliver(ctx, t, rig.actor, snapshotReady(2, cmd.MessageId, "snap-of-gen-2", compatibleProvenance))
+	waitUntil(t, 5*time.Second, func() bool { return rig.provider.restoreCallCount() == 1 })
+	waitForConnecting(ctx, t, rig.pool, rig.sessionID)
+	if call := rig.provider.lastRestoreCall(); call.snapshotID != "snap-of-gen-2" {
+		t.Fatalf("restored %q, want snap-of-gen-2", call.snapshotID)
+	}
+
+	rig.assertMarked(ctx, t, 3)
+	if got := freshLineageCount(ctx, t, sandbox.LineageCauseUnrecappedSnapshot, true) - carriedBefore; got != 1 {
+		t.Fatalf("sandbox_fresh_lineage_total{unrecapped_snapshot, carried} moved by %d, want 1", got)
+	}
+	if line := logs.entry(t, freshLineageCarriedLogMessage); line["gen"] != float64(3) || line["cause"] != string(sandbox.LineageCauseUnrecappedSnapshot) {
+		t.Fatalf("carried line = %v, want gen 3, cause unrecapped_snapshot", line)
+	}
+	rig.bootGen(ctx, t, 3, false)
+	p := rig.commander.lastPrompt(t)
+	if p.Gen != 3 || p.ConversationId != nil {
+		t.Fatalf("prompt to gen %d names %v, want gen 3 naming none", p.Gen, p.ConversationId)
+	}
+	recap := recapOf(t, p, "and next")
+	if !strings.Contains(recap, "> add the retry to the importer") || !strings.Contains(recap, "> Added the retry.") {
+		t.Fatalf("recap %q, want the turn gen 1 ran", recap)
+	}
 }
 
 // TestFreshLineage_ReceiptResendCarriesTheSameRecap: a receipt re-send of

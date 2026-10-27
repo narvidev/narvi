@@ -23,11 +23,13 @@ import (
 // This file proves technical plan §35.5's instrumentation on the real
 // actor and real Postgres: a snapshot records, at mint, the conversation
 // the session held, keyed by its id; every restore compares it with the
-// conversation the restored gen's prompts will name, and counts the
-// outcome on sandbox_restore_conversation_total once the claim has
-// committed -- a WARN line for differs, an INFO line for unknown. Nothing
-// else: such a restore writes no warning, keeps the session's conversation
-// and sends the request as it is, with no recap.
+// conversation the session's prompts name when the claim begins, and
+// counts the outcome on sandbox_restore_conversation_total once the claim
+// has committed -- a WARN line for differs, an INFO line for unknown. The
+// claim then makes the session name the conversation recorded for the
+// snapshot, none included, and leaves it as it is when nothing was
+// recorded. Nothing else: such a restore writes no warning and sends the
+// request as it is, with no recap.
 
 // compatibleProvenance is a snapshot_ready provenance this control plane
 // restores without a line of its own.

@@ -305,11 +305,12 @@ type spawnPlan struct {
 	// once the claim has committed (logRotationRestore).
 	rotation *rotationOutcome
 
-	// lineage is what a fresh-spawn claim decided about the fresh lineage
-	// it may start (technical plan §35.5, continuity.go): whether it marked
-	// its gen, why, and whether the mark was carried over. nil on every
-	// restore and resume plan, which never start one. executePlans logs and
-	// counts it once the claim has committed (logFreshLineage).
+	// lineage is what a fresh-spawn or restore claim decided about the
+	// fresh lineage (technical plan §35.5, continuity.go): whether it marked
+	// its gen, why, and whether the mark was carried over -- a restore only
+	// ever carries one, into a snapshot minted before its recap arrived.
+	// nil on a resume plan. executePlans logs and counts it once the claim
+	// has committed (logFreshLineage).
 	lineage *freshLineageNote
 }
 
@@ -1555,9 +1556,15 @@ func (a *Actor) tryPlanSpawn(
 		// session then names the conversation the snapshot holds when
 		// that was recorded for it (reseatRestoredConversation): a fresh
 		// spawn since may have forgotten it, or a fresh lineage named its
-		// own. A restore is never marked, announced or recapped.
+		// own. The outcome itself never marks, announces or recaps.
 		plan.restoreConversation = classifyRestoreConversation(sandboxRow, action.SnapshotImageID, sessionRow)
 		if err := a.reseatRestoredConversation(ctx, tx, plan.restoreConversation); err != nil {
+			return nil, err
+		}
+		// A snapshot a fresh lineage minted before its recap reached it
+		// brings back a runtime that never received the recap: the
+		// replaced gen's pending mark is carried (continuity.go).
+		if plan.lineage, err = a.decideRestoreLineage(ctx, tx, sandboxRow, plan.gen, action.SnapshotImageID); err != nil {
 			return nil, err
 		}
 		if wasRotating {

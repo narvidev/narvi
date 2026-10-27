@@ -7172,6 +7172,13 @@ have forgotten the session's id since, keeping the snapshot it did not restore (
 given up on, a downgrade), or a fresh lineage may have named its own. When nothing was recorded,
 the session keeps naming what it named — none, after a fresh spawn forgot it — since nothing says
 which conversation the snapshot holds. No outcome refuses, marks, announces or recaps a restore.
+A restore is marked in one case only, whatever its outcome: the snapshot it restores was minted by a
+gen that was a fresh lineage whose recap had not reached it — recorded with the snapshot, keyed by
+its id (`sandboxes.snapshot_recap_owed_id`) — and the gen it replaces still owes that recap. The
+restored runtime then holds neither the earlier conversation nor the recap, so the claim carries
+the pending mark to the new gen (cause `unrecapped_snapshot`, never announced again), and its first
+turn carries the recap. A restore of a snapshot minted before the fresh lineage, or after its recap
+arrived, is not marked.
 `held` is evidence, not proof: whether a provider's snapshot captures the runtime's session
 storage is not established from code.
 

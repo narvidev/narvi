@@ -29,8 +29,10 @@
 //   - The fresh-lineage decision (DecideFreshLineage, lineage.go; §35.5):
 //     whether the claim that creates a gen starts a fresh lineage -- a
 //     fresh spawn replacing a gen of a session that had a turn dispatched,
-//     never a restore, a resume or a first spawn -- and whether its loss is
-//     announced or carried from a replaced gen still awaiting its recap.
+//     never a resume or a first spawn, and a restore only to carry a
+//     pending mark into a snapshot minted before its recap arrived -- and
+//     whether its loss is announced or carried from a replaced gen still
+//     awaiting its recap.
 //   - The restore-conversation classification (ClassifyRestoreConversation,
 //     restoreconversation.go; §35.5): whether a restored snapshot was
 //     minted under the conversation the session's prompts named -- held,
