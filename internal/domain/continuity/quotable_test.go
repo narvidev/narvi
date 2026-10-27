@@ -1,8 +1,10 @@
 package continuity_test
 
 import (
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/narvidev/narvi/internal/domain/continuity"
 	"github.com/narvidev/narvi/internal/domain/plan"
@@ -143,5 +145,134 @@ func TestBuild_QuotesThePersonsRequestNotTheInjectedInstructions(t *testing.T) {
 				t.Fatalf("recap quotes the injected instructions or was cut:\n%s", recap.Text)
 			}
 		})
+	}
+}
+
+// reviewShapedPrompt is a review turn's stored prompt at the size the
+// GitHub adapter allows a pull request's diff: its verdict tool's tokens up
+// front, then size bytes of diff carrying tokens of its own.
+func reviewShapedPrompt(size int) string {
+	var b strings.Builder
+	b.WriteString("Review this pull request. Post the verdict to " + review.VerdictToolURLPlaceholder +
+		" with " + review.VerdictToolBearerPlaceholder + ".\n```diff\n")
+	line := "+ a changed line quoting " + upload.BearerPlaceholder + "\n"
+	for b.Len() < size {
+		b.WriteString(line)
+	}
+	b.WriteString("```\n")
+	return b.String()
+}
+
+// TestTurnQuotable_HoldsEachTextToWhatAnExcerptQuotes: preparing a turn
+// keeps of its request and report only the head an excerpt can quote,
+// however long they are stored, and the recap's cut lines still name their
+// whole lengths.
+func TestTurnQuotable_HoldsEachTextToWhatAnExcerptQuotes(t *testing.T) {
+	t.Parallel()
+	prompt := reviewShapedPrompt(4 << 20)
+	report := strings.Repeat("A finding, quoted: "+review.VerdictToolGenPlaceholder+".\n", 4<<20/40)
+	prepared := completed(1, prompt, report).Quotable()
+	if len(prepared.Request) >= 2*continuity.RequestExcerptBytes || len(prepared.Report.Text) >= 2*continuity.ReportExcerptBytes {
+		t.Fatalf("prepared request %d bytes, report %d bytes; want each held near its excerpt's cap, %d and %d",
+			len(prepared.Request), len(prepared.Report.Text), continuity.RequestExcerptBytes, continuity.ReportExcerptBytes)
+	}
+	again := prepared.Quotable()
+	if again.Request != prepared.Request || again.Report.Text != prepared.Report.Text {
+		t.Fatal("a prepared turn prepared again changed")
+	}
+	recap, ok := continuity.Build(continuity.Input{Turns: []continuity.Turn{prepared}}, unbounded)
+	if !ok {
+		t.Fatal("Build is not ok with an unbounded budget")
+	}
+	for _, want := range []string{" of " + strconv.Itoa(len(prompt)) + " bytes.]", " of " + strconv.Itoa(len(report)) + " bytes.]"} {
+		if !strings.Contains(recap.Text, want) {
+			t.Errorf("recap:\n%s\nwant a cut line naming the whole length: %q", recap.Text, want)
+		}
+	}
+	if strings.Contains(recap.Text, "{{") {
+		t.Errorf("recap carries a token:\n%s", recap.Text)
+	}
+}
+
+// TestBuild_ManyMiBReviewPromptsBuildWithinABound: a recap over the most
+// earlier turns it reads, each a review turn whose stored prompt carries a
+// 4 MiB diff and whose report is as long, built the way its caller builds
+// it -- each turn prepared once as it is read, a Build after each, and a
+// last Build -- or built once from turns no one prepared, costs what the
+// excerpt caps allow, not what the stored texts weigh.
+func TestBuild_ManyMiBReviewPromptsBuildWithinABound(t *testing.T) {
+	t.Parallel()
+	prompt := reviewShapedPrompt(4 << 20)
+	report := strings.Repeat("A finding, quoted: "+review.VerdictToolGenPlaceholder+".\n", 4<<20/40)
+	const bound = 2 * time.Second
+
+	start := time.Now()
+	var read []continuity.Turn // newest first
+	for i := continuity.MaxTurns; i >= 1; i-- {
+		read = append(read, completed(i, prompt, report).Quotable())
+		oldestFirst := make([]continuity.Turn, len(read))
+		for j, turn := range read {
+			oldestFirst[len(read)-1-j] = turn
+		}
+		if _, ok := continuity.Build(continuity.Input{Turns: oldestFirst, Earlier: continuity.MaxTurns}, 16<<10); !ok {
+			t.Fatal("Build is not ok")
+		}
+	}
+	if elapsed := time.Since(start); elapsed > bound {
+		t.Fatalf("the caller's Builds over %d prepared 4 MiB turns took %s, want under %s", continuity.MaxTurns, elapsed, bound)
+	}
+
+	raw := make([]continuity.Turn, continuity.MaxTurns)
+	for i := range raw {
+		raw[i] = completed(i+1, prompt, report)
+	}
+	start = time.Now()
+	recap, ok := continuity.Build(continuity.Input{Turns: raw}, 16<<10)
+	if elapsed := time.Since(start); elapsed > bound {
+		t.Fatalf("one Build over %d unprepared 4 MiB turns took %s, want under %s", continuity.MaxTurns, elapsed, bound)
+	}
+	if !ok || strings.Contains(recap.Text, "{{") {
+		t.Fatalf("recap ok %v, carrying a token: %v", ok, strings.Contains(recap.Text, "{{"))
+	}
+}
+
+// TestBuild_StripsATokenThatStraddlesTheExcerptCap: a token that starts
+// inside a request excerpt's cap and ends past it is still stripped whole,
+// so no part of it is quoted.
+func TestBuild_StripsATokenThatStraddlesTheExcerptCap(t *testing.T) {
+	t.Parallel()
+	for _, tok := range sandboxAgentTokens {
+		request := strings.Repeat("x", continuity.RequestExcerptBytes-len(tok)/2) + tok + " and the rest of the request."
+		recap, ok := continuity.Build(continuity.Input{Turns: []continuity.Turn{completed(1, request, "Done.")}}, unbounded)
+		if !ok {
+			t.Fatal("Build is not ok with an unbounded budget")
+		}
+		if strings.Contains(recap.Text, "{{") || strings.Contains(recap.Text, tok[2:len(tok)/2]) {
+			t.Errorf("recap quotes part of %s straddling the cap:\n%s", tok, recap.Text)
+		}
+	}
+}
+
+// TestBuild_StripsWhatItsCallerLeftInAPreparedTurn: the built recap is
+// stripped as a whole, so a token a caller puts into a turn after
+// preparing it still never reaches the recap.
+func TestBuild_StripsWhatItsCallerLeftInAPreparedTurn(t *testing.T) {
+	t.Parallel()
+	prepared := completed(1, "Fix the parser.", "Fixed it.").Quotable()
+	prepared.Request = "Fix the parser, then call " + review.VerdictToolURLPlaceholder + "."
+	prepared.Report.Text = "Fixed it with " + upload.BearerPlaceholder + "."
+	interrupted := continuity.Attempt{Report: plan.Final{Text: "Halfway."}, Reported: true}.Quotable()
+	interrupted.Report.Text = "Halfway, with " + turn.EpistemicOutcomeToolBearerPlaceholder + "."
+	recap, ok := continuity.Build(continuity.Input{Turns: []continuity.Turn{prepared}, Interrupted: &interrupted}, unbounded)
+	if !ok {
+		t.Fatal("Build is not ok with an unbounded budget")
+	}
+	for _, tok := range sandboxAgentTokens {
+		if strings.Contains(recap.Text, tok) {
+			t.Errorf("recap carries %s:\n%s", tok, recap.Text)
+		}
+	}
+	if !strings.Contains(recap.Text, "> Fix the parser, then call .") {
+		t.Errorf("recap:\n%s\nwant the request kept, its token stripped", recap.Text)
 	}
 }
