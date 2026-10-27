@@ -119,13 +119,14 @@ func newSlackAckTestRig(t *testing.T, pool *pgxpool.Pool) *slackAckTestRig {
 		SlackClient:     slackapi.New(ackServer.Client(), ackServer.URL, "test-bot-token"),
 		Timeouts:        platform.DefaultTimeouts(),
 		IdentityLink: identitylink.Deps{
-			Pool:          pool,
-			Users:         narvipg.NewUserStore(pool),
-			Identities:    narvipg.NewIdentityStore(pool),
-			LinkPrompts:   narvipg.NewIdentityLinkPromptStore(pool),
-			AuditLog:      auditLog,
-			PublicBaseURL: "https://narvi.example.com",
-			PromptTTL:     time.Hour,
+			Pool:           pool,
+			Users:          narvipg.NewUserStore(pool),
+			Identities:     narvipg.NewIdentityStore(pool),
+			LinkPrompts:    narvipg.NewIdentityLinkPromptStore(pool),
+			AuditLog:       auditLog,
+			PublicBaseURL:  "https://narvi.example.com",
+			PromptTTL:      time.Hour,
+			EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 		},
 	})
 

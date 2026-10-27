@@ -32,11 +32,12 @@ type CreateUserParams struct {
 // the auth middleware's own per-request lookup.
 //
 // §13.2 ("identities + full RBAC", §13.2/§13.3) additions --
-// ListUsersOrderedByCreatedAt/UpdateUserRole/GetUserByPrimaryEmail back the
-// members API (internal/adapters/inbound/httpapi/members.go) and the
-// auto-link algorithm's own email-match step
-// (internal/app/identitylink.Resolve): the ONLY writes to an existing
-// user's own row this codebase makes past creation time.
+// ListUsersOrderedByCreatedAt/UpdateUserRole back the members API
+// (internal/adapters/inbound/httpapi/members.go); GetUserByPrimaryEmail
+// backs a first sign-in's check that no member already holds its email
+// (internal/adapters/inbound/auth). UpdateUserRole and
+// FollowUserPrimaryEmail are the ONLY writes to an existing user's own row
+// this codebase makes past creation time.
 func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, error) {
 	row := q.db.QueryRow(ctx, createUser, arg.PrimaryEmail, arg.DisplayName, arg.Role)
 	var i User
@@ -49,6 +50,41 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 		&i.CreatedAt,
 	)
 	return i, err
+}
+
+const followUserPrimaryEmail = `-- name: FollowUserPrimaryEmail :execrows
+UPDATE users AS u
+SET primary_email = $1::text
+WHERE u.id = $2
+  AND lower(u.primary_email) = lower($3::text)
+  AND lower(u.primary_email) <> lower($1::text)
+  AND NOT EXISTS (
+    SELECT 1 FROM users AS o
+    WHERE o.id <> u.id AND lower(o.primary_email) = lower($1::text)
+  )
+`
+
+type FollowUserPrimaryEmailParams struct {
+	NewEmail      string      `json:"new_email"`
+	ID            pgtype.UUID `json:"id"`
+	PreviousEmail string      `json:"previous_email"`
+}
+
+// A user's primary email follows the sign-in identity it came from (§13.2,
+// internal/app/identitylink.RefreshSignInEvidence): when that identity's
+// provider presents a new email, primary_email moves to it -- only while
+// primary_email still is the identity's previous email (so a user with two
+// sign-in identities does not flip between them), only when the address
+// really changes, and only when no OTHER user holds the new one, ignoring
+// case. 0 rows means it did not move. users.primary_email's own UNIQUE is
+// case-sensitive, so a concurrent exact-case insert can still raise 23505,
+// which the caller absorbs.
+func (q *Queries) FollowUserPrimaryEmail(ctx context.Context, arg FollowUserPrimaryEmailParams) (int64, error) {
+	result, err := q.db.Exec(ctx, followUserPrimaryEmail, arg.NewEmail, arg.ID, arg.PreviousEmail)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const getUserByID = `-- name: GetUserByID :one
@@ -78,13 +114,12 @@ WHERE lower(primary_email) = lower($1)
 // Case-insensitive: email addresses are conventionally
 // case-insensitive (at least in the local-part-plus-domain sense every
 // real mail provider actually applies), and this is ONLY ever compared
-// against an email another provider (GitHub/Slack/Linear) already
-// independently attests to, never user-supplied free text -- matching
-// lower(email) on both sides is the same convention
-// ListVerifiedIdentityUserIDsByEmail (identities.sql) uses for its own
-// verified-identity-email match, so the two halves of §13.2's own "match
-// against primary_email AND verified identity emails" never disagree on
-// case sensitivity.
+// against an email a provider (GitHub/OIDC) already independently attests
+// to, never user-supplied free text -- matching lower(email) on both sides
+// is the same convention ListVerifiedIdentityUserIDsByEmail
+// (identities.sql) uses for its own verified-identity-email match. Not
+// evidence for linking (§13.2 step 2): a first sign-in uses it only to
+// refuse an email some member already holds.
 func (q *Queries) GetUserByPrimaryEmail(ctx context.Context, lower string) (User, error) {
 	row := q.db.QueryRow(ctx, getUserByPrimaryEmail, lower)
 	var i User
@@ -187,8 +222,8 @@ type UpdateUserRoleParams struct {
 }
 
 // Backs the admin-only role-change endpoint (§13.3's own "members & roles:
-// admin only" row) -- the ONLY column of an existing user's row this
-// codebase ever mutates past creation time.
+// admin only" row). With FollowUserPrimaryEmail below, the only columns of
+// an existing user's row this codebase mutates past creation time.
 func (q *Queries) UpdateUserRole(ctx context.Context, arg UpdateUserRoleParams) (User, error) {
 	row := q.db.QueryRow(ctx, updateUserRole, arg.ID, arg.Role)
 	var i User

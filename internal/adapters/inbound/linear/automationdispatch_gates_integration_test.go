@@ -32,6 +32,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/identitylink"
 	domainautomation "github.com/narvidev/narvi/internal/domain/automation"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // issueEventPayloadWithActorType is issueEventPayloadWithActor's own
@@ -113,22 +114,25 @@ func TestWebhookHandler_AutomationDispatchDeniesUnlinkedActorWithoutAutoLinkingO
 	// gate still ran, this is exactly the shape that auto-links AND
 	// authorizes on this one request.
 	users := narvipg.NewUserStore(pool)
-	if _, err := users.Create(ctx, sqlcgen.CreateUserParams{
+	evidenceUser, err := users.Create(ctx, sqlcgen.CreateUserParams{
 		PrimaryEmail: matchingEmail, DisplayName: "Would Auto Link", Role: sqlcgen.UserRoleMaintainer,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, evidenceUser.ID, matchingEmail)
 
 	graphqlStub, calls := newLinearGraphQLStubCounting(t, matchingEmail)
 	deps.LinearClient = linearapi.New(graphqlStub.Client(), graphqlStub.URL)
 	deps.IdentityLink = identitylink.Deps{
-		Pool:          pool,
-		Users:         users,
-		Identities:    narvipg.NewIdentityStore(pool),
-		LinkPrompts:   narvipg.NewIdentityLinkPromptStore(pool),
-		AuditLog:      deps.AuditLog,
-		PublicBaseURL: "https://narvi.example.com",
-		PromptTTL:     time.Hour,
+		Pool:           pool,
+		Users:          users,
+		Identities:     narvipg.NewIdentityStore(pool),
+		LinkPrompts:    narvipg.NewIdentityLinkPromptStore(pool),
+		AuditLog:       deps.AuditLog,
+		PublicBaseURL:  "https://narvi.example.com",
+		PromptTTL:      time.Hour,
+		EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 	}
 
 	handler := linear.NewWebhookHandler(deps)
@@ -245,6 +249,7 @@ func TestWebhookHandler_AutomationDispatchDeniesNonUserActorEvenWithAuthorizedCr
 		Pool: pool, Users: users, Identities: narvipg.NewIdentityStore(pool),
 		LinkPrompts: narvipg.NewIdentityLinkPromptStore(pool), AuditLog: deps.AuditLog,
 		PublicBaseURL: "https://narvi.example.com", PromptTTL: time.Hour,
+		EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 	}
 	handler := linear.NewWebhookHandler(deps)
 
@@ -306,6 +311,7 @@ func TestWebhookHandler_AutomationDispatchDeniesNonUserActorWithUnauthorizedCrea
 		Pool: pool, Users: narvipg.NewUserStore(pool), Identities: narvipg.NewIdentityStore(pool),
 		LinkPrompts: narvipg.NewIdentityLinkPromptStore(pool), AuditLog: deps.AuditLog,
 		PublicBaseURL: "https://narvi.example.com", PromptTTL: time.Hour,
+		EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 	}
 	handler := linear.NewWebhookHandler(deps)
 

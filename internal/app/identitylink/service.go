@@ -56,6 +56,12 @@ type Deps struct {
 
 	PublicBaseURL string
 	PromptTTL     time.Duration
+
+	// EvidenceMaxAge is platform.Timeouts.IdentityEmailEvidenceMaxAge: how
+	// long an identity's verified email counts as evidence for MatchUserIDs
+	// after its provider last confirmed it. MatchUserIDs refuses a zero or
+	// negative value with an error rather than matching no one.
+	EvidenceMaxAge time.Duration
 }
 
 // Resolution is Resolve's own verdict for one inbound event from
@@ -125,11 +131,14 @@ type ProfileEmail struct {
 // definition of a verified email: one whose email is not verified, or a
 // Slack one with no email_checked_at -- made by a binary that took any
 // Slack profile email as verified (migrations/000178). Such a link is not
-// used: LookupLinkedUserID reads it as not linked, Resolve re-checks it
-// before resolving it to anyone, and its email is not evidence for
-// MatchUserIDs (queries/identities.sql's ListVerifiedIdentityUserIDsByEmail
-// and DeleteUncheckedAutoLinkedIdentity name the same rows). A link a
-// person or an admin made (linked_via prompt or admin) is never unchecked.
+// used: LookupLinkedUserID reads it as not linked, and Resolve re-checks it
+// before resolving it to anyone (queries/identities.sql's
+// DeleteUncheckedAutoLinkedIdentity names the same rows). Its email is no
+// evidence for MatchUserIDs either, which counts only an email stamped
+// within EvidenceMaxAge. A link a person or an admin made (linked_via
+// prompt or admin) is never unchecked. Age alone never makes a link
+// unchecked: an automatic link whose email has aged past EvidenceMaxAge
+// still resolves; only its email stops counting as evidence.
 func autoLinkUnchecked(i sqlcgen.Identity) bool {
 	if i.LinkedVia != sqlcgen.IdentityLinkedViaAutoEmail {
 		return false
@@ -358,53 +367,48 @@ func revokeAutoLink(ctx context.Context, deps Deps, existing sqlcgen.Identity, r
 	return true, nil
 }
 
-// MatchUserIDs runs §13.2 step 2's own two lookups (users.primary_email,
-// verified identities.email) and returns the DEDUPLICATED union of user
-// ids either matched -- the same user matching both ways at once (e.g.
-// their GitHub-derived primary_email happens to equal their own Slack
-// profile email, which is ALSO independently verified on some other
-// identity) must still count as exactly one match, never two.
+// MatchUserIDs runs §13.2 step 2: the users whose identity carries email,
+// verified, and confirmed by its provider within deps.EvidenceMaxAge of
+// the database clock (queries/identities.sql's
+// ListVerifiedIdentityUserIDsByEmail, the one place that rule lives),
+// deduplicated by user id -- one user matching through two identities is
+// still exactly one match. users.primary_email is not evidence on its
+// own: an address a provider confirmed long ago, or one seeded from a
+// manifest, links nothing. An automatic link awaiting its re-check
+// (autoLinkUnchecked) carries no stamp until it is confirmed, so the query
+// leaves it out too.
+//
+// A zero or negative deps.EvidenceMaxAge is a configuration mistake, and
+// an error here, never a silent "no match": Slack and Linear then leave
+// the actor unlinked, and a sign-in answers 500.
 //
 // Exported (capital M) so internal/adapters/inbound/auth's own OIDC
 // callback (§41.3) can run the EXACT SAME email-based graph
 // merge Resolve's own zero-match branch below does for Slack/Linear,
-// rather than a second, drifting copy of these two lookups -- that
+// rather than a second, drifting copy of this lookup -- that
 // caller's own "zero matches" case differs from Resolve's (a brand new
 // sign-in creates a user instead of minting a link prompt), so it cannot
 // just call Resolve itself, but the MATCHING half is identical either
 // way.
 func MatchUserIDs(ctx context.Context, deps Deps, email string) ([]string, error) {
-	seen := make(map[string]struct{}, 2)
+	if deps.EvidenceMaxAge <= 0 {
+		return nil, fmt.Errorf("identitylink: email evidence max age is %v, want > 0 (platform.Timeouts.IdentityEmailEvidenceMaxAge)", deps.EvidenceMaxAge)
+	}
+
+	ids, err := deps.Identities.ListVerifiedUserIDsByEmail(ctx, email, deps.EvidenceMaxAge)
+	if err != nil {
+		return nil, fmt.Errorf("list verified identity user ids by email: %w", err)
+	}
+
+	seen := make(map[string]struct{}, len(ids))
 	var out []string
-	add := func(id pgtype.UUID) {
+	for _, id := range ids {
 		s := id.String()
 		if _, ok := seen[s]; !ok {
 			seen[s] = struct{}{}
 			out = append(out, s)
 		}
 	}
-
-	byPrimaryEmail, err := deps.Users.GetByPrimaryEmail(ctx, email)
-	switch {
-	case err == nil:
-		add(byPrimaryEmail.ID)
-	case errors.Is(err, pgx.ErrNoRows):
-		// no primary_email match -- fine, the verified-identity-email
-		// half below might still match.
-	default:
-		return nil, fmt.Errorf("get user by primary email: %w", err)
-	}
-
-	// An automatic link awaiting its re-check (autoLinkUnchecked) is left
-	// out by the query itself: its email is no evidence until confirmed.
-	byVerifiedIdentity, err := deps.Identities.ListVerifiedUserIDsByEmail(ctx, email)
-	if err != nil {
-		return nil, fmt.Errorf("list verified identity user ids by email: %w", err)
-	}
-	for _, id := range byVerifiedIdentity {
-		add(id)
-	}
-
 	return out, nil
 }
 

@@ -105,7 +105,8 @@ const autoLinkedNotice = "I've connected this to your Narvi account."
 // automatically only when Slack reports the email as confirmed and the
 // member is a full member of this workspace -- and that the stored
 // identity's email_verified says so. Every other member gets the link
-// prompt, and no identity.
+// prompt, and no identity -- and so does a confirmed full member whose
+// email only evidence older than IdentityEmailEvidenceMaxAge names.
 func TestResolveSlackActor_LinksOnlyOnAVerifiedEmail(t *testing.T) {
 	pool := newTestPool(t)
 	ctx := context.Background()
@@ -114,18 +115,20 @@ func TestResolveSlackActor_LinksOnlyOnAVerifiedEmail(t *testing.T) {
 	tests := []struct {
 		name       string
 		change     memberChange
+		agedOut    bool
 		wantLinked bool
 	}{
-		{"full member, confirmed email", nil, true},
-		{"email not confirmed", setField("is_email_confirmed", false), false},
-		{"is_email_confirmed absent", dropField("is_email_confirmed"), false},
-		{"deleted", setField("deleted", true), false},
-		{"bot", setField("is_bot", true), false},
-		{"guest", setField("is_restricted", true), false},
-		{"single-channel guest", setField("is_ultra_restricted", true), false},
-		{"stranger", setField("is_stranger", true), false},
-		{"another team's member", setField("team_id", "T0OTHER"), false},
-		{"team_id absent", dropField("team_id"), false},
+		{"full member, confirmed email", nil, false, true},
+		{"full member, confirmed email, evidence aged out", nil, true, false},
+		{"email not confirmed", setField("is_email_confirmed", false), false, false},
+		{"is_email_confirmed absent", dropField("is_email_confirmed"), false, false},
+		{"deleted", setField("deleted", true), false, false},
+		{"bot", setField("is_bot", true), false, false},
+		{"guest", setField("is_restricted", true), false, false},
+		{"single-channel guest", setField("is_ultra_restricted", true), false, false},
+		{"stranger", setField("is_stranger", true), false, false},
+		{"another team's member", setField("team_id", "T0OTHER"), false, false},
+		{"team_id absent", dropField("team_id"), false, false},
 	}
 	for i, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -134,6 +137,10 @@ func TestResolveSlackActor_LinksOnlyOnAVerifiedEmail(t *testing.T) {
 			user, err := deps.Users.Create(ctx, sqlcgen.CreateUserParams{PrimaryEmail: email, DisplayName: email, Role: sqlcgen.UserRoleMember})
 			if err != nil {
 				t.Fatalf("create fixture user: %v", err)
+			}
+			evidence := addEmailEvidenceForTest(t, pool, user.ID, email)
+			if tt.agedOut {
+				ageEmailEvidenceForTest(t, pool, evidence.ID)
 			}
 			member := confirmedSlackMember(email)
 			if tt.change != nil {
@@ -314,6 +321,7 @@ func TestResolveSlackActor_SlowSlackLinksOnTheFirstEvent(t *testing.T) {
 			if err != nil {
 				t.Fatalf("create fixture user: %v", err)
 			}
+			addEmailEvidenceForTest(t, pool, user.ID, email)
 			client, usersInfoCalls, authTestCalls := newSlowFakeSlackMember(t, confirmedSlackMember(email), latency)
 
 			gotUser, notice, err := tt.resolve(client, slackUserID)

@@ -325,6 +325,7 @@ func TestHandler_DualDelivery_FailedFirstAttemptReleasesBothClaimsForRedelivery(
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "dual-backend-error@example.com")
 
 	const slackUserID = "U-DUAL-BACKEND-ERROR"
 	fakeSlack := newFakeSlackWithUsersInfo(t, slackUserID, "dual-backend-error@example.com")
@@ -694,13 +695,14 @@ func newSlackAckTestRigWithRepo(t *testing.T, pool *pgxpool.Pool, defaultRepoNam
 		SlackClient:     slackapi.New(ackServer.Client(), ackServer.URL, "test-bot-token"),
 		Timeouts:        platform.DefaultTimeouts(),
 		IdentityLink: identitylink.Deps{
-			Pool:          pool,
-			Users:         narvipg.NewUserStore(pool),
-			Identities:    narvipg.NewIdentityStore(pool),
-			LinkPrompts:   narvipg.NewIdentityLinkPromptStore(pool),
-			AuditLog:      auditLog,
-			PublicBaseURL: "https://narvi.example.com",
-			PromptTTL:     time.Hour,
+			Pool:           pool,
+			Users:          narvipg.NewUserStore(pool),
+			Identities:     narvipg.NewIdentityStore(pool),
+			LinkPrompts:    narvipg.NewIdentityLinkPromptStore(pool),
+			AuditLog:       auditLog,
+			PublicBaseURL:  "https://narvi.example.com",
+			PromptTTL:      time.Hour,
+			EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 		},
 	})
 

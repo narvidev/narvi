@@ -2,13 +2,12 @@ package identitylink
 
 // Decide renders §13.2's own auto-link step-2/3/4 verdict given
 // matchedUserIDs -- the caller's own already-deduplicated set of user ids
-// found to match a fetched provider profile email, by EITHER
-// users.primary_email OR any of that user's own verified identities.email
-// (a caller that queries both separately must dedupe the union itself
-// before calling Decide -- this function trusts the input is already
+// found to match a fetched provider profile email through a verified
+// identities.email its provider confirmed recently (users.primary_email is
+// no evidence on its own) -- this function trusts the input is already
 // deduplicated and does not re-check for duplicates, since "the same user
 // id appears twice" is a caller-side query-shape question this package
-// has no way to detect from a plain slice of opaque id strings alone).
+// has no way to detect from a plain slice of opaque id strings alone.
 //
 // Exactly one distinct id -> (that id, true): auto-link it. Zero, or more
 // than one -> ("", false): never guess -- §13.2's own explicit rule,

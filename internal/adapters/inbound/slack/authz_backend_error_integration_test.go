@@ -55,6 +55,7 @@ func TestHandler_ReplyOnMappedThread_AuthzBackendErrorReleasesClaim(t *testing.T
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "backend-error-replier@example.com")
 
 	fakeSlack := newFakeSlackWithUsersInfo(t, "U-BACKEND-ERROR", "backend-error-replier@example.com")
 	auditLog := narvipg.NewAuditLogStore(pool)
@@ -170,11 +171,13 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_AuthzBackendError(t *test
 	ctx := context.Background()
 
 	users := narvipg.NewUserStore(pool)
-	if _, err := users.Create(ctx, sqlcgen.CreateUserParams{
+	evidenceUser, err := users.Create(ctx, sqlcgen.CreateUserParams{
 		PrimaryEmail: "ix-backend-error-decider@example.com", DisplayName: "Interactivity Backend Error Decider", Role: sqlcgen.UserRoleMember,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, evidenceUser.ID, "ix-backend-error-decider@example.com")
 
 	fakeSlack, requests := newFakeSlackRecordingWithUsersInfo(t, "U-IX-BACKEND-ERROR", "ix-backend-error-decider@example.com")
 	slackClient := slackapi.New(fakeSlack.Client(), fakeSlack.URL, "test-bot-token")
@@ -304,11 +307,13 @@ func TestInteractivityHandler_ViewSubmission_AuthzBackendError(t *testing.T) {
 	ctx := context.Background()
 
 	users := narvipg.NewUserStore(pool)
-	if _, err := users.Create(ctx, sqlcgen.CreateUserParams{
+	evidenceUser, err := users.Create(ctx, sqlcgen.CreateUserParams{
 		PrimaryEmail: "ix-backend-error-submitter@example.com", DisplayName: "Interactivity Backend Error Submitter", Role: sqlcgen.UserRoleMember,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, evidenceUser.ID, "ix-backend-error-submitter@example.com")
 
 	fakeSlack := newFakeSlackWithUsersInfo(t, "U-IX-VS-BACKEND-ERROR", "ix-backend-error-submitter@example.com")
 	slackClient := slackapi.New(fakeSlack.Client(), fakeSlack.URL, "test-bot-token")

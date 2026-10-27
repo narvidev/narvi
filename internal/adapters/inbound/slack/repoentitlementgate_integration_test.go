@@ -104,13 +104,14 @@ func newSlackAckTestRigWithoutEntitlement(t *testing.T, pool *pgxpool.Pool) *sla
 		Timeouts:        platform.DefaultTimeouts(),
 		RolloutMode:     platform.RolloutModeOpen,
 		IdentityLink: identitylink.Deps{
-			Pool:          pool,
-			Users:         narvipg.NewUserStore(pool),
-			Identities:    narvipg.NewIdentityStore(pool),
-			LinkPrompts:   narvipg.NewIdentityLinkPromptStore(pool),
-			AuditLog:      auditLog,
-			PublicBaseURL: "https://narvi.example.com",
-			PromptTTL:     time.Hour,
+			Pool:           pool,
+			Users:          narvipg.NewUserStore(pool),
+			Identities:     narvipg.NewIdentityStore(pool),
+			LinkPrompts:    narvipg.NewIdentityLinkPromptStore(pool),
+			AuditLog:       auditLog,
+			PublicBaseURL:  "https://narvi.example.com",
+			PromptTTL:      time.Hour,
+			EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 		},
 	})
 

@@ -525,7 +525,9 @@ func TestSlackInteractive_IdentityNotResolved_TryAgainPrivately_UnlinkedStillTol
 			name:    "an unlinked clicker whose resolution fails",
 			clicker: unlinkedClicker,
 			breakIt: func(ctx context.Context, t *testing.T, pool *pgxpool.Pool, deps *slack.InteractiveDeps) {
-				deps.IdentityLink.Users = narvipg.NewUserStore(closedPoolForTest(ctx, t, pool))
+				// The link prompt the unmatched clicker is owed cannot be
+				// stored: the resolution fails after its match step.
+				deps.IdentityLink.LinkPrompts = narvipg.NewIdentityLinkPromptStore(closedPoolForTest(ctx, t, pool))
 			},
 			wantText: wantPlanDecisionErrorText,
 		},

@@ -55,11 +55,13 @@ func TestWebhookHandler_Prompted_AuthzBackendErrorReleasesClaim(t *testing.T) {
 	deps.LinearClient = linearapi.New(graphqlStub.Client(), graphqlStub.URL)
 
 	users := narvipg.NewUserStore(pool)
-	if _, err := users.Create(ctx, sqlcgen.CreateUserParams{
+	evidenceUser, err := users.Create(ctx, sqlcgen.CreateUserParams{
 		PrimaryEmail: "backend-error-prompter@example.com", DisplayName: "Backend Error Prompter", Role: sqlcgen.UserRoleMember,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, evidenceUser.ID, "backend-error-prompter@example.com")
 
 	auditLog := narvipg.NewAuditLogStore(pool)
 	deps.AuditLog = auditLog
@@ -163,11 +165,13 @@ func TestWebhookHandler_PlanVerdict_AuthzBackendErrorReleasesClaim(t *testing.T)
 	deps.LinearClient = linearapi.New(graphqlStub.Client(), graphqlStub.URL)
 
 	users := narvipg.NewUserStore(pool)
-	if _, err := users.Create(ctx, sqlcgen.CreateUserParams{
+	evidenceUser, err := users.Create(ctx, sqlcgen.CreateUserParams{
 		PrimaryEmail: "backend-error-decider@example.com", DisplayName: "Backend Error Decider", Role: sqlcgen.UserRoleMember,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, evidenceUser.ID, "backend-error-decider@example.com")
 
 	auditLog := narvipg.NewAuditLogStore(pool)
 	deps.AuditLog = auditLog

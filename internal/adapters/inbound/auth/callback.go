@@ -19,6 +19,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/auditlog"
+	"github.com/narvidev/narvi/internal/app/identitylink"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -60,6 +61,7 @@ const (
 	OutcomeFirstTimeDenied      CallbackOutcome = "first_time_denied"
 	OutcomeAmbiguousMatch       CallbackOutcome = "ambiguous_match"
 	OutcomeSameProviderConflict CallbackOutcome = "same_provider_conflict"
+	OutcomeEmailHeld            CallbackOutcome = "email_held"
 	OutcomeNoVerifiedEmail      CallbackOutcome = "no_verified_email"
 	OutcomeStateMismatch        CallbackOutcome = "state_mismatch"
 	OutcomeExchangeFailed       CallbackOutcome = "exchange_failed"
@@ -81,6 +83,13 @@ const auditActionGitHubAmbiguousMatch = "identity.github_ambiguous_match"
 // resolveFirstTimeIdentity's own identityConflictsWithExistingProvider
 // doc comment.
 const auditActionGitHubSameProviderConflict = "identity.github_already_linked"
+
+// auditActionGitHubEmailHeld is the audit_log action recorded when a
+// first-time GitHub sign-in's verified email matches no user's recently
+// confirmed evidence but is some member's primary email (§13.2) -- refused
+// rather than merged, see resolveFirstTimeIdentity's own "Recent evidence
+// only" doc comment.
+const auditActionGitHubEmailHeld = "identity.github_email_held"
 
 // NewCallbackHandler backs GET /auth/github/callback (§13.1/§13.2/§13.4).
 // See doc.go for the complete outcome table this flow implements.
@@ -223,6 +232,15 @@ func NewCallbackHandler(
 
 		externalID := strconv.FormatInt(ghUser.ID, 10)
 
+		firstTimeDeps := firstTimeIdentityDeps{
+			pool:           pool,
+			users:          users,
+			identities:     identities,
+			auditLog:       auditLog,
+			linkPrompts:    linkPrompts,
+			evidenceMaxAge: timeouts.IdentityEmailEvidenceMaxAge,
+		}
+
 		var userID pgtype.UUID
 		existing, err := identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderGithub, externalID)
 		switch {
@@ -231,16 +249,19 @@ func NewCallbackHandler(
 			// "evaluated at first sign-in" -- re-checking every login would
 			// let a later allowlist tightening silently lock out an
 			// already-provisioned user mid-session, which is not what
-			// "at first sign-in" means).
-			if _, updateErr := identities.UpdateAccessToken(ctx, sqlcgen.UpdateIdentityAccessTokenParams{
-				ID:                   existing.ID,
-				AccessTokenEncrypted: encryptedToken,
-			}); updateErr != nil {
-				logger.Error("auth: update access token failed", "error", updateErr)
+			// "at first sign-in" means). §13.2: record the verified primary
+			// email GitHub just presented for this identity, stamped now,
+			// with the fresh token, in one transaction -- the email is
+			// evidence for linking only while recently confirmed. The
+			// session goes to the row as it stands after that write.
+			refreshed, refreshErr := identitylink.RefreshSignInEvidence(ctx, firstTimeDeps.linkDeps(), existing.ID,
+				identitylink.ProfileEmail{Address: verifiedEmail, Verified: true}, encryptedToken)
+			if refreshErr != nil {
+				logger.Error("auth: refresh sign-in evidence failed", "error", refreshErr)
 				http.Error(w, "internal error", http.StatusInternalServerError)
 				return
 			}
-			userID = existing.UserID
+			userID = refreshed.UserID
 			logger.Info("auth: oauth callback", "outcome", OutcomeReturningUser)
 
 		case errors.Is(err, pgx.ErrNoRows):
@@ -272,14 +293,7 @@ func NewCallbackHandler(
 				})
 			}
 
-			firstTimeDeps := firstTimeIdentityDeps{
-				pool:        pool,
-				users:       users,
-				identities:  identities,
-				auditLog:    auditLog,
-				linkPrompts: linkPrompts,
-			}
-			resolvedUserID, outcome, resolveErr := resolveFirstTimeIdentity(ctx, firstTimeDeps, sqlcgen.IdentityProviderGithub, externalID, verifiedEmail, encryptedToken, auditActionGitHubAmbiguousMatch, auditActionGitHubSameProviderConflict, checkAllowed, createFirstTime)
+			resolvedUserID, outcome, resolveErr := resolveFirstTimeIdentity(ctx, firstTimeDeps, sqlcgen.IdentityProviderGithub, externalID, verifiedEmail, encryptedToken, auditActionGitHubAmbiguousMatch, auditActionGitHubSameProviderConflict, auditActionGitHubEmailHeld, checkAllowed, createFirstTime)
 			if resolveErr != nil {
 				logger.Error("auth: create user+identity failed", "error", resolveErr)
 				http.Error(w, "internal error", http.StatusInternalServerError)
@@ -307,6 +321,12 @@ func NewCallbackHandler(
 				// same generic public body as every other refusal in this
 				// class, never distinguishing WHY.
 				logger.Warn("auth: oauth callback rejected", "outcome", OutcomeSameProviderConflict)
+				http.Error(w, "not authorized to sign up", http.StatusForbidden)
+				return
+			case firstTimeEmailHeld:
+				// §13.2: already audited (its own action string) inside
+				// resolveFirstTimeIdentity -- the same generic public body.
+				logger.Warn("auth: oauth callback rejected", "outcome", OutcomeEmailHeld)
 				http.Error(w, "not authorized to sign up", http.StatusForbidden)
 				return
 			default: // firstTimeAmbiguous
@@ -434,6 +454,10 @@ func createUserAndIdentity(ctx context.Context, pool *pgxpool.Pool, users *postg
 	// own auto-linking algorithm, not built yet); prompt
 	// means a human was asked to confirm a link (the same job). This is a
 	// deliberate, documented hand-off note, not a silent choice.
+	//
+	// EmailCheckedAt: GitHub has just presented this verified primary
+	// email, so the identity is §13.2 evidence from its creation, until
+	// IdentityEmailEvidenceMaxAge passes without another sign-in.
 	if _, err := identities.WithTx(tx).Create(ctx, sqlcgen.CreateIdentityParams{
 		UserID:               createdUser.ID,
 		Provider:             sqlcgen.IdentityProviderGithub,
@@ -442,6 +466,7 @@ func createUserAndIdentity(ctx context.Context, pool *pgxpool.Pool, users *postg
 		EmailVerified:        true,
 		LinkedVia:            sqlcgen.IdentityLinkedViaAdmin,
 		AccessTokenEncrypted: p.encryptedToken,
+		EmailCheckedAt:       pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}); err != nil {
 		return pgtype.UUID{}, fmt.Errorf("auth: create identity: %w", err)
 	}

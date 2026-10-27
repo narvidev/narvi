@@ -531,6 +531,20 @@ func TestOIDCCallback_GraphMergesOnVerifiedEmail_AutoLinksExistingUser(t *testin
 	if err != nil {
 		t.Fatalf("create existing user: %v", err)
 	}
+	// The existing user's GitHub sign-in identity, which GitHub confirmed
+	// recently: that, not the primary email, is the evidence (§13.2).
+	sharedEmail := "shared@example.com"
+	if _, err := rig.identities.Create(ctx, sqlcgen.CreateIdentityParams{
+		UserID:         existingUser.ID,
+		Provider:       sqlcgen.IdentityProviderGithub,
+		ExternalID:     "github-merge-existing",
+		Email:          &sharedEmail,
+		EmailVerified:  true,
+		LinkedVia:      sqlcgen.IdentityLinkedViaAdmin,
+		EmailCheckedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+	}); err != nil {
+		t.Fatalf("create existing user's github identity: %v", err)
+	}
 
 	client := newClient(t)
 	state, nonce := doOIDCLogin(t, client, rig.server.URL)

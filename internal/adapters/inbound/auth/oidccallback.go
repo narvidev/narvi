@@ -16,6 +16,7 @@ import (
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/auditlog"
+	"github.com/narvidev/narvi/internal/app/identitylink"
 	"github.com/narvidev/narvi/internal/platform"
 )
 
@@ -36,6 +37,7 @@ const (
 	OIDCOutcomeFirstTimeDenied      OIDCCallbackOutcome = "oidc_first_time_denied"
 	OIDCOutcomeAmbiguousMatch       OIDCCallbackOutcome = "oidc_ambiguous_match"
 	OIDCOutcomeSameProviderConflict OIDCCallbackOutcome = "oidc_same_provider_conflict"
+	OIDCOutcomeEmailHeld            OIDCCallbackOutcome = "oidc_email_held"
 	OIDCOutcomeStateMismatch        OIDCCallbackOutcome = "oidc_state_mismatch"
 	OIDCOutcomeExchangeFailed       OIDCCallbackOutcome = "oidc_exchange_failed"
 	OIDCOutcomeMissingIDToken       OIDCCallbackOutcome = "oidc_missing_id_token"
@@ -123,18 +125,26 @@ func auditOIDCRefusal(ctx context.Context, auditLog *postgres.AuditLogStore, out
 //     (OIDCOutcomeEmailNotVerified), audited -- §41.3: "Never fall back to
 //     an unverified email... refused with the audited reason."
 //   - Identity already linked (GetByProviderAndExternalID hits) ->
-//     "returning user" (OIDCOutcomeReturningUser) -- a fresh session is
-//     minted, 302 to "/". The allowlist is skipped entirely, exactly like
-//     GitHub's own returning-user branch.
+//     "returning user" (OIDCOutcomeReturningUser) -- the verified email the
+//     ID token presents is recorded on the identity, stamped now
+//     (identitylink.RefreshSignInEvidence, §13.2; a failure answers 500),
+//     then a fresh session is minted for the identity's user, 302 to "/".
+//     The allowlist is skipped entirely, exactly like GitHub's own
+//     returning-user branch.
 //   - Identity not linked, but the verified email matches EXACTLY ONE
-//     existing user (by primary_email or another verified identity's own
-//     email) -> auto-linked onto that SAME user (OIDCOutcomeAutoLinked,
+//     existing user (by another identity's recently confirmed email,
+//     §13.2) -> auto-linked onto that SAME user (OIDCOutcomeAutoLinked,
 //     identitylink.AutoLink) -- §41.3: "the graph merges on verified email
 //     exactly as §13.2 step 3 does for Slack and Linear." The allowlist is
 //     skipped here too: this user already passed it once, under whichever
 //     identity first created their account.
+//   - Identity not linked, zero existing users match, but the verified
+//     email is some member's primary email -> 403 (OIDCOutcomeEmailHeld),
+//     audited as identity.oidc_email_held, no row ever created: a primary
+//     email is no evidence on its own (§13.2), so it is never merged onto.
 //   - Identity not linked, zero existing users match the verified email,
-//     allowlist passes -> a BRAND NEW user+identity is created
+//     no member holds it, allowlist passes -> a BRAND NEW user+identity is
+//     created
 //     (OIDCOutcomeFirstTimeAllowed, createOIDCUserAndIdentity) -- the same
 //     users row model, default-role assignment, and allowlist gate as
 //     GitHub's own first-time-sign-in branch.
@@ -353,6 +363,7 @@ func NewOIDCCallbackHandler(
 			linkPrompts:        linkPrompts,
 			allowlist:          allowlist,
 			initialAdminEmails: initialAdminEmails,
+			evidenceMaxAge:     timeouts.IdentityEmailEvidenceMaxAge,
 		}, externalID, email, claims)
 		if httpStatus != 0 {
 			logger.Warn("auth: oidc callback rejected", "outcome", outcome)
@@ -436,6 +447,7 @@ func verifiedOIDCEmail(claims map[string]any) (string, bool) {
 }
 
 // oidcResolveDeps bundles resolveOIDCUser's own store/config dependencies.
+// evidenceMaxAge is platform.Timeouts.IdentityEmailEvidenceMaxAge (§13.2).
 type oidcResolveDeps struct {
 	pool               *pgxpool.Pool
 	users              *postgres.UserStore
@@ -444,6 +456,7 @@ type oidcResolveDeps struct {
 	linkPrompts        *postgres.IdentityLinkPromptStore
 	allowlist          AllowlistConfig
 	initialAdminEmails []string
+	evidenceMaxAge     time.Duration
 }
 
 // auditActionOIDCAmbiguousMatch is the audit_log action recorded when a
@@ -469,6 +482,14 @@ const auditActionOIDCAmbiguousMatch = "identity.oidc_ambiguous_match"
 // no-op for this outcome to avoid a second, duplicate row.
 const auditActionOIDCSameProviderConflict = "identity.oidc_already_linked"
 
+// auditActionOIDCEmailHeld is the audit_log action recorded when a
+// first-time OIDC sign-in's verified email matches no user's recently
+// confirmed evidence but is some member's primary email (§13.2) -- refused
+// rather than merged. Like auditActionOIDCSameProviderConflict, written
+// inside resolveFirstTimeIdentity itself and deliberately NOT in
+// auditActionForOIDCOutcome, so auditOIDCRefusal stays a no-op for it.
+const auditActionOIDCEmailHeld = "identity.oidc_email_held"
+
 // resolveOIDCUser implements this file's own steps after the ID token is
 // fully verified: returning-user fast path, then -- for a genuinely new
 // identity -- resolveFirstTimeIdentity's own shared §13.2 step 3 graph
@@ -483,21 +504,35 @@ const auditActionOIDCSameProviderConflict = "identity.oidc_already_linked"
 // outcome, httpStatus, publicMsg) on any refusal -- mirrors this file's
 // own outcome-table doc comment on NewOIDCCallbackHandler.
 func resolveOIDCUser(ctx context.Context, deps oidcResolveDeps, externalID, email string, claims map[string]any) (pgtype.UUID, OIDCCallbackOutcome, int, string) {
+	firstTimeDeps := firstTimeIdentityDeps{
+		pool:           deps.pool,
+		users:          deps.users,
+		identities:     deps.identities,
+		auditLog:       deps.auditLog,
+		linkPrompts:    deps.linkPrompts,
+		evidenceMaxAge: deps.evidenceMaxAge,
+	}
+
 	existing, err := deps.identities.GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderOidc, externalID)
 	if err == nil {
-		return existing.UserID, OIDCOutcomeReturningUser, 0, ""
+		// §13.2: record the verified email the ID token just presented for
+		// this identity, stamped now -- the email is evidence for linking
+		// only while recently confirmed. No token: this package never
+		// stores an OIDC provider token, and nil keeps the stored column
+		// as it is. The session goes to the row as it stands after that
+		// write.
+		refreshed, refreshErr := identitylink.RefreshSignInEvidence(ctx, firstTimeDeps.linkDeps(), existing.ID,
+			identitylink.ProfileEmail{Address: email, Verified: true}, nil)
+		if refreshErr != nil {
+			platform.Logger(ctx).Error("auth: oidc refresh sign-in evidence failed", "error", refreshErr)
+			return pgtype.UUID{}, "", http.StatusInternalServerError, "internal error"
+		}
+		return refreshed.UserID, OIDCOutcomeReturningUser, 0, ""
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
 		return pgtype.UUID{}, "", http.StatusInternalServerError, "internal error"
 	}
 
-	firstTimeDeps := firstTimeIdentityDeps{
-		pool:        deps.pool,
-		users:       deps.users,
-		identities:  deps.identities,
-		auditLog:    deps.auditLog,
-		linkPrompts: deps.linkPrompts,
-	}
 	// checkAllowed mirrors this file's own pre-existing zero-match check
 	// exactly: OIDC has no org-membership mechanism to check (that is a
 	// GitHub-specific concept), so this is the email/domain allowlist
@@ -514,7 +549,7 @@ func resolveOIDCUser(ctx context.Context, deps oidcResolveDeps, externalID, emai
 		})
 	}
 
-	userID, outcome, err := resolveFirstTimeIdentity(ctx, firstTimeDeps, sqlcgen.IdentityProviderOidc, externalID, email, nil, auditActionOIDCAmbiguousMatch, auditActionOIDCSameProviderConflict, checkAllowed, createFirstTime)
+	userID, outcome, err := resolveFirstTimeIdentity(ctx, firstTimeDeps, sqlcgen.IdentityProviderOidc, externalID, email, nil, auditActionOIDCAmbiguousMatch, auditActionOIDCSameProviderConflict, auditActionOIDCEmailHeld, checkAllowed, createFirstTime)
 	if err != nil {
 		return pgtype.UUID{}, "", http.StatusInternalServerError, "internal error"
 	}
@@ -532,6 +567,11 @@ func resolveOIDCUser(ctx context.Context, deps oidcResolveDeps, externalID, emai
 		// auditActionOIDCSameProviderConflict's own doc comment for why
 		// auditOIDCRefusal must stay a no-op for this outcome.
 		return pgtype.UUID{}, OIDCOutcomeSameProviderConflict, http.StatusForbidden, "not authorized to sign up"
+	case firstTimeEmailHeld:
+		// §13.2: already audited (its own action string) inside
+		// resolveFirstTimeIdentity -- see auditActionOIDCEmailHeld's own
+		// doc comment for why auditOIDCRefusal stays a no-op here.
+		return pgtype.UUID{}, OIDCOutcomeEmailHeld, http.StatusForbidden, "not authorized to sign up"
 	default: // firstTimeAmbiguous
 		// §13.2's own "never guess" rule, and (unlike Slack/Linear) this
 		// live sign-in has no bot-attribution fallback to defer to; see
@@ -600,14 +640,17 @@ func createOIDCUserAndIdentity(ctx context.Context, pool *pgxpool.Pool, users *p
 	// linked_via="admin" mirrors createUserAndIdentity's own identical,
 	// deliberate overload -- see that function's own doc comment for the
 	// full "least-wrong of the 3 existing enum values" reasoning; it
-	// applies identically here.
+	// applies identically here. EmailCheckedAt: the ID token has just
+	// presented this verified email, so the identity is §13.2 evidence
+	// from its creation, as createUserAndIdentity's is.
 	if _, err := identities.WithTx(tx).Create(ctx, sqlcgen.CreateIdentityParams{
-		UserID:        createdUser.ID,
-		Provider:      sqlcgen.IdentityProviderOidc,
-		ExternalID:    p.externalID,
-		Email:         &p.verifiedEmail,
-		EmailVerified: true,
-		LinkedVia:     sqlcgen.IdentityLinkedViaAdmin,
+		UserID:         createdUser.ID,
+		Provider:       sqlcgen.IdentityProviderOidc,
+		ExternalID:     p.externalID,
+		Email:          &p.verifiedEmail,
+		EmailVerified:  true,
+		LinkedVia:      sqlcgen.IdentityLinkedViaAdmin,
+		EmailCheckedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}); err != nil {
 		return pgtype.UUID{}, fmt.Errorf("auth: create oidc identity: %w", err)
 	}

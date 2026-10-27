@@ -16,6 +16,9 @@ import (
 	"context"
 	"net/http"
 	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 )
@@ -198,6 +201,8 @@ func TestOIDCCallback_SameIssuerConflict_RefusedEvenWithEarlierIssuerIdentity(t 
 		Email:         &oldIdentityEmail,
 		EmailVerified: true,
 		LinkedVia:     sqlcgen.IdentityLinkedViaAutoEmail,
+		// Confirmed recently by the old issuer, so it is §13.2 evidence.
+		EmailCheckedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 	}); err != nil {
 		t.Fatalf("seed old-issuer identity: %v", err)
 	}
