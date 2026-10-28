@@ -250,9 +250,16 @@ never carries the session's events.
 **Negatives.** The WS connection must send its own `subscribe{token,
 clientId}` frame within `platform.Timeouts.ClientSubscribeTimeout` (30s)
 of connecting, or the server closes it (code `4001`, "re-auth required").
-The minted token expires after `platform.Timeouts.WSTokenTTL` (24h) — a
-tab left open across that boundary gets closed (code `4002`, "token
-expired") and needs a fresh mint. The server pings every
+The minted token expires after `platform.Timeouts.WSTokenTTL` (2 min):
+mint one right before each connection; a token presented after that is
+refused (code `4002`, "token expired") and needs a fresh mint. The mint
+answers `403` to a caller who may not read the session. At `subscribe`,
+and every `platform.Timeouts.ClientWSAccessRecheckInterval` (60s) while
+the connection is open, the server checks again that the token's user
+may still read the session: a no closes the connection with `4001`
+("re-auth required"), even after `subscribed`, and a check the server
+cannot make closes it with `1011`; either way, mint again and reconnect.
+The server pings every
 `platform.Timeouts.ClientWSPingInterval` (30s); an unanswered ping closes
 the connection (code `4003`, "idle timeout"). A `fetch_history` frame
 sent more than once per `platform.Timeouts.ClientFetchHistoryMinInterval`

@@ -196,6 +196,13 @@ func TestValidate_CatchesEachBrokenLink(t *testing.T) {
 			},
 			wantChain: "GitHubAppIDCacheTTL > AutoMergePumpInterval",
 		},
+		{
+			name: "WSTokenTTL not > ClientSubscribeTimeout",
+			mutate: func(to *platform.Timeouts) {
+				to.WSTokenTTL = to.ClientSubscribeTimeout
+			},
+			wantChain: "WSTokenTTL > ClientSubscribeTimeout",
+		},
 	}
 
 	for _, tc := range tests {
@@ -552,6 +559,35 @@ func TestDefaultTimeouts_OpenCodeTransientRetryBackoffStandaloneField(t *testing
 
 	if err := to.Validate(); err != nil {
 		t.Fatalf("Validate() = %v, want nil (this field must not disturb either invariant chain)", err)
+	}
+}
+
+// TestDefaultTimeouts_ClientSocketAccessFields pins the client socket's
+// credential and re-check defaults (technical plan §6.2, amended): a
+// ws-token lives 2 minutes, enough to reach its subscribe frame, and a
+// socket re-checks its subscriber's read access every 60s. Both must
+// leave Validate clean.
+func TestDefaultTimeouts_ClientSocketAccessFields(t *testing.T) {
+	t.Parallel()
+
+	to := platform.DefaultTimeouts()
+
+	tests := []struct {
+		name string
+		got  time.Duration
+		want time.Duration
+	}{
+		{"WSTokenTTL", to.WSTokenTTL, 2 * time.Minute},
+		{"ClientWSAccessRecheckInterval", to.ClientWSAccessRecheckInterval, 60 * time.Second},
+	}
+	for _, tc := range tests {
+		if tc.got != tc.want {
+			t.Errorf("%s = %v, want %v", tc.name, tc.got, tc.want)
+		}
+	}
+
+	if err := to.Validate(); err != nil {
+		t.Fatalf("Validate() = %v, want nil", err)
 	}
 }
 
@@ -1644,6 +1680,11 @@ func TestValidate_RequiresPositiveFields(t *testing.T) {
 			name:      "GitHubAppIDCacheTTL == 0",
 			mutate:    func(to *platform.Timeouts) { to.GitHubAppIDCacheTTL = 0 },
 			wantField: "GitHubAppIDCacheTTL",
+		},
+		{
+			name:      "ClientWSAccessRecheckInterval == 0",
+			mutate:    func(to *platform.Timeouts) { to.ClientWSAccessRecheckInterval = 0 },
+			wantField: "ClientWSAccessRecheckInterval",
 		},
 		{
 			// A negative value is exactly as permissive as zero for every

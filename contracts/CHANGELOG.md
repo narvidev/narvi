@@ -10,6 +10,31 @@ what counts as a breaking (MAJOR), additive (MINOR), or annotation-only
 `make contracts-compat` enforces on every PR that touches a schema,
 `manifest.json`, or `controlplane/testdata/routes.golden`.
 
+## [1.30.1]
+
+### rest/v1/dtos.schema.json
+
+- Changed (descriptions only, annotation-only PATCH): `WSTokenResponse`
+  says a ws-token is short-lived, `expiresAt` stating when, and is minted
+  right before each connection (technical plan §6.2, amended); it no
+  longer states a 24h TTL. The lifetime itself is now 2 minutes: the
+  token's only use is its connection's `subscribe` frame. A client that
+  mints right before it dials, as the web client does, sees no
+  difference; one that kept a token for later connections mints again.
+  No field, type, enum value or requiredness changed. A description
+  grades PATCH (row 35).
+
+### client-ws/v1/protocol.schema.json
+
+- Changed (descriptions only, annotation-only PATCH): the protocol
+  description says 4001 may also close an open socket after `subscribed`
+  -- the server re-checks the subscriber's access at subscribe and
+  periodically (technical plan §6.2, §13.3) -- and that a client then
+  mints a token again and reconnects, as for 4001 at the handshake. No
+  close code is added: a check that cannot be made closes with the
+  standard 1011. No field, type, enum value or requiredness changed. A
+  description grades PATCH (row 35).
+
 ## [1.30.0]
 
 ### sandbox-ws/v1/events.schema.json

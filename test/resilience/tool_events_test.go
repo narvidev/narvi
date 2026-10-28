@@ -188,8 +188,19 @@ func subscribePage(ctx context.Context, t *testing.T, rig *eventFrameRig, group 
 	if err != nil {
 		t.Fatalf("generate ws token: %v", err)
 	}
+	// The client socket reads the token's user at subscribe: a real,
+	// active member's.
+	user, err := narvipg.NewUserStore(rig.h.Pool).Create(ctx, sqlcgen.CreateUserParams{
+		PrimaryEmail: "tool-events-page-" + rig.sessionID.String() + "@example.com",
+		DisplayName:  "Tool Events Page",
+		Role:         sqlcgen.UserRoleMember,
+	})
+	if err != nil {
+		t.Fatalf("create the page's user: %v", err)
+	}
 	if _, err := narvipg.NewWSTokenStore(rig.h.Pool).Create(ctx, sqlcgen.CreateWSTokenParams{
 		SessionID: rig.sessionID,
+		UserID:    user.ID,
 		TokenHash: platform.HashToken(token),
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true},
 	}); err != nil {

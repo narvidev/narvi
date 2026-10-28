@@ -971,8 +971,16 @@ type Timeouts struct {
 	// WSTokenTTL is how long a minted ws-token (internal/platform.
 	// GenerateToken, POST /api/sessions/:id/ws-token) remains valid before
 	// the client hub's own subscribe-time verification rejects it with
-	// close code 4002 ("token expired"). §6.2 gives this explicitly: "24h
-	// TTL".
+	// close code 4002 ("token expired"). §6.2 (amended): a client mints one
+	// right before each connection, and the token's only use is that
+	// connection's subscribe frame, so it only has to outlive
+	// ClientSubscribeTimeout and the delay between the mint and the dial.
+	// Chosen as 2 minutes (it was 24h). Validate requires it to exceed
+	// ClientSubscribeTimeout by MinTimeoutMargin, so a token minted just
+	// before dialling cannot expire while the server may still wait for
+	// its subscribe frame. An open socket's right to go on is not the
+	// token's lifetime but the read check it repeats every
+	// ClientWSAccessRecheckInterval.
 	WSTokenTTL time.Duration
 
 	// --- §13.1 standalone additions: no ordering relationship with
@@ -1159,6 +1167,28 @@ type Timeouts struct {
 	// precedent (§6.1) for the analogous sandbox-side mechanism.
 	ClientWSPingInterval time.Duration
 
+	// ClientWSAccessRecheckInterval is how often internal/adapters/inbound/
+	// wshub's client-WS handler (client.go, recheckClientAccessLoop) reads
+	// again, for each open socket, whether its subscriber may still read
+	// the session (§6.2, §13.3; actorauthz.AuthorizeSessionRead, the check
+	// the socket made at subscribe): the user exists and is not disabled,
+	// its role holds view_sessions, the session exists. A "no" closes the
+	// socket 4001, a check that cannot be made closes it 1011. The checks
+	// start when the connection is registered, before the subscribed reply
+	// is written. Each check is bounded by this same duration, as
+	// ClientWSPingInterval bounds its ping, so a socket whose subscriber
+	// loses access at T is sent nothing read or broadcast after T plus
+	// twice this interval (about one interval in the usual case): a frame
+	// already being written may finish first, and when a client that
+	// stopped reading holds it back, the close drops the connection after
+	// coder/websocket's 5s close-write limit. Each replica re-reads
+	// Postgres for the sockets it holds, so the bound needs no
+	// cross-replica fan-out. Not specified in the plan; chosen as 60s: two
+	// primary-key reads per socket per minute. Validate requires it to be
+	// positive: time.NewTicker panics at zero, inside a per-connection
+	// goroutine.
+	ClientWSAccessRecheckInterval time.Duration
+
 	// ClientFetchHistoryMinInterval is the minimum time internal/adapters/
 	// inbound/wshub's client-WS read loop (client.go, readClientLoop)
 	// requires between two successive fetch_history requests it actually
@@ -1184,10 +1214,11 @@ type Timeouts struct {
 	// passed (migrations/000016_ws_tokens.up.sql,
 	// migrations/000017_auth_v1.up.sql -- both tables check expires_at
 	// only at read/verify time; nothing else ever purges an expired row,
-	// so left alone table growth is unbounded). Both tables' own TTLs
-	// (WSTokenTTL 24h, UserSessionTTL 30 days) are on the order of
-	// hours/days, so hourly cleanup is more than frequent enough. Not
-	// specified in the plan; chosen as 1h.
+	// so left alone table growth is unbounded). An expired row is refused
+	// at verify time whenever it is purged, so the interval bounds only
+	// table size: with WSTokenTTL at 2 minutes a ws_tokens row lives about
+	// an hour at most, and UserSessionTTL is 30 days, so hourly cleanup is
+	// more than frequent enough. Not specified in the plan; chosen as 1h.
 	ExpiredCredentialCleanupInterval time.Duration
 
 	// --- §3.2 standalone additions ("snapshots & restore"): no
@@ -4654,7 +4685,7 @@ func DefaultTimeouts() Timeouts {
 		SandboxEventAckTimeout: 5 * time.Second, // not specified; chosen
 
 		ClientSubscribeTimeout: 30 * time.Second, // §6.2, explicit
-		WSTokenTTL:             24 * time.Hour,   // §6.2, explicit
+		WSTokenTTL:             2 * time.Minute,  // §6.2 (amended): only has to reach its subscribe frame
 
 		OAuthStateTTL:  10 * time.Minute,    // not specified; chosen
 		UserSessionTTL: 30 * 24 * time.Hour, // not specified; chosen ("stay signed in" duration)
@@ -4673,9 +4704,10 @@ func DefaultTimeouts() Timeouts {
 		SetupRerunRetryBackoff: 2 * time.Second, // not specified; chosen, short pause before the ONE setup.sh rerun retry (§19.6) -- same value as the OpenCode pause today, deliberately a separate field (see its doc comment)
 
 		ClientWSPingInterval:          30 * time.Second,       // not specified; chosen, matches SandboxWSHeartbeatInterval's own 30s cadence (§6.1)
+		ClientWSAccessRecheckInterval: 60 * time.Second,       // not specified; chosen: how long an open socket may outlive its subscriber's read access
 		ClientFetchHistoryMinInterval: 250 * time.Millisecond, // not specified; chosen, generous for real pagination while blocking a tight-loop hammer
 
-		ExpiredCredentialCleanupInterval: time.Hour, // not specified; chosen, comfortably frequent relative to both WSTokenTTL (24h) and UserSessionTTL (30 days)
+		ExpiredCredentialCleanupInterval: time.Hour, // not specified; chosen, bounds only table size: an expired ws_tokens/user_sessions row is refused at verify time anyway
 
 		SnapshotMintTimeout: 60 * time.Second, // not specified; chosen (a real provider TakeSnapshot round trip, more generous than CredentialFetchTimeout)
 
@@ -5729,6 +5761,20 @@ func (t Timeouts) Validate() error {
 			lifetimeField, lifetime,
 			thresholdField+"+FirstConnectBudget+BootEvidenceFallback", threshold+t.FirstConnectBudget+t.BootEvidenceFallback)
 	}
+
+	// §6.2's client socket. A ws-token minted right before dialling must
+	// not expire while the server may still wait for its subscribe frame,
+	// or a client that mints, dials and subscribes on time is refused
+	// 4002. See WSTokenTTL's doc comment.
+	check("WSTokenTTL > ClientSubscribeTimeout",
+		"WSTokenTTL", t.WSTokenTTL, "ClientSubscribeTimeout", t.ClientSubscribeTimeout)
+	// The open socket's read re-check runs on a time.NewTicker, which
+	// panics at an interval of zero or less: inside a per-connection
+	// goroutine, at the first subscribe. Not the vacuous-at-zero window the
+	// mustBePositive block above is about, but a positive interval is the
+	// same assertion, made here so a bad value fails at startup instead.
+	// See ClientWSAccessRecheckInterval's doc comment.
+	mustBePositive("ClientWSAccessRecheckInterval", t.ClientWSAccessRecheckInterval)
 
 	return errors.Join(errs...)
 }

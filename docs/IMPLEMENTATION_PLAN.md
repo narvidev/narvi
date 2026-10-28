@@ -69,7 +69,7 @@ TECHNICAL_PLAN.md §12), never invented independently of it.
 | 16 ∥ | sandbox-agent: WS bridge | WS client + **ack protocol** (6 critical types, 1000 buffer, re-send), 30s heartbeats + boot_progress, 401/403/404/410 fatal | §6.1 |
 | 17 ∥ | OpenCode adapter | ACL: start server, prompt_async, SSE→AgentEvent translation (quirks §7), **CI contract tests against the pinned binary**, empty-catalog fallback | §7 |
 | 18 | wshub: sandbox socket | Control-plane side: gen check, ack receipt, event persistence, liveness `last_seen_at` = max(signals) | §3.2, §6.1 |
-| 19 | wshub: clients + session REST | subscribe/replay/fetch_history, close codes 4001/4002, 24h hashed ws-token; REST endpoints the UI needs (create/get/events/artifacts) | §6.2, §6.3 |
+| 19 | wshub: clients + session REST | subscribe/replay/fetch_history, close codes 4001/4002, 24h hashed ws-token; REST endpoints the UI needs (create/get/events/artifacts); the ws-token's lifetime later cut to 2 minutes, a client minting one right before each connection, and the session read check (`actorauthz.AuthorizeSessionRead`: the user exists and is not disabled, its role holds `view_sessions`, the session exists) made at the mint (403), at `subscribe` before the socket is registered, and on every open socket every `ClientWSAccessRecheckInterval` (60 s): a no closes it 4001, a check that cannot be made 1011 (**fix**, §6.2, §13.3) | §6.2, §6.3, §13.3 |
 | 20 | auth v1 | GitHub OAuth (token = PR attribution), backend-issued host-scoped cookies, allowlist, admin/member role skeleton, route middleware | §13.1, §13.4 |
 | 21 | e2e happy path | GitHub SourceControl adapter (createPR, credential minting, push spec), scm-credentials endpoint, end-to-end wiring; resilience test #1 (kill pod mid-turn) | §9.3 |
 

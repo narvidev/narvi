@@ -58,7 +58,7 @@ func TestEvents_ToolEventsOfOneMessage_ReturnedByEventsAndHistory(t *testing.T) 
 	ctx := context.Background()
 	session := rig.createSession(ctx, t)
 	sid := session.ID.String()
-	_, cookie := rig.createAuthenticatedUser(ctx, t)
+	user, cookie := rig.createAuthenticatedUser(ctx, t)
 	if _, err := rig.sandboxes.Create(ctx, session.ID); err != nil {
 		t.Fatalf("create sandbox: %v", err)
 	}
@@ -172,7 +172,7 @@ func TestEvents_ToolEventsOfOneMessage_ReturnedByEventsAndHistory(t *testing.T) 
 	if err != nil {
 		t.Fatalf("generate ws token: %v", err)
 	}
-	if _, err := rig.wsTokens.Create(ctx, sqlcgen.CreateWSTokenParams{SessionID: session.ID, TokenHash: platform.HashToken(token),
+	if _, err := rig.wsTokens.Create(ctx, sqlcgen.CreateWSTokenParams{SessionID: session.ID, UserID: user.ID, TokenHash: platform.HashToken(token),
 		ExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}}); err != nil {
 		t.Fatalf("store ws token: %v", err)
 	}

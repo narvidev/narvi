@@ -44,4 +44,15 @@
 // ALREADY-RESOLVED actorUserID and answers only "is this specific actor
 // allowed to do this specific thing" -- it is deliberately blind to how
 // that actorUserID was obtained.
+//
+// # The session read check
+//
+// AuthorizeSessionRead (sessionread.go) answers a read question rather
+// than a state-changing one: may this user read this session right now.
+// The ws-token mint and the client socket both call it (technical plan
+// §6.2, §13.3), at mint, at subscribe and periodically on an open
+// socket. It reuses the disabled-then-role verdict AuthorizeResolvedActor
+// renders (verdictForUser), with ActionViewSessions, and adds what a read
+// needs: a token with no user and a user or session that no longer exists
+// are each a denial.
 package actorauthz

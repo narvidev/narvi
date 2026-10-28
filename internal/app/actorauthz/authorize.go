@@ -108,13 +108,23 @@ func AuthorizeResolvedActorVerdict(ctx context.Context, logger *slog.Logger, sur
 		logger.Error(surface+": authz: look up resolved actor's role failed", "error", err, "user_id", actorUserID.String(), "action", string(action))
 		return LinkedActorError
 	}
+	return verdictForUser(logger, surface, user, action, resource)
+}
 
+// verdictForUser is the verdict for a user row already read: Denied for a
+// disabled account, checked before the role (see AuthorizeResolvedActor's
+// doc comment), then domain/authz.Authorize's verdict for the role --
+// Denied for ErrForbidden, Error for anything else (a caller bug, never a
+// "no"). AuthorizeResolvedActorVerdict and AuthorizeSessionRead share it;
+// they differ only in how they read the row and in what a missing row
+// means.
+func verdictForUser(logger *slog.Logger, surface string, user sqlcgen.User, action authz.Action, resource authz.Resource) LinkedActorVerdict {
 	if user.Disabled {
-		logger.Warn(surface+": authz: resolved actor's linked account is disabled, denying", "user_id", actorUserID.String(), "action", string(action))
+		logger.Warn(surface+": authz: resolved actor's linked account is disabled, denying", "user_id", user.ID.String(), "action", string(action))
 		return LinkedActorDenied
 	}
 
-	actor := authz.Actor{UserID: actorUserID.String(), Role: authz.Role(user.Role)}
+	actor := authz.Actor{UserID: user.ID.String(), Role: authz.Role(user.Role)}
 	if err := authz.Authorize(actor, action, resource); err != nil {
 		if !errors.Is(err, authz.ErrForbidden) {
 			logger.Error(surface+": authz.Authorize failed", "error", err, "action", string(action))

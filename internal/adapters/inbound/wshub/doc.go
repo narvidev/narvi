@@ -72,7 +72,9 @@
 // server-initiated ping (pingClientLoop, ClientWSPingInterval) is this
 // same handler's own idle-liveness check -- an unanswered ping closes the
 // connection with 4003 ("idle timeout"), the third custom close code
-// alongside 4001/4002.
+// alongside 4001/4002. Beside it, recheckClientAccessLoop
+// (ClientWSAccessRecheckInterval) repeats the subscribe-time session read
+// check on the open socket and closes it 4001 when the answer is no.
 //
 // # Honest gaps this package documents rather than papers over
 //
@@ -122,14 +124,21 @@
 //     ws-token minting (internal/adapters/inbound/httpapi's own
 //     MintWSToken) is gated behind internal/adapters/inbound/auth.
 //     Middleware and scopes ws_tokens.user_id to the real authenticated
-//     caller. This package's own client-WS subscribe-time verification
-//     (client.go) was UNCHANGED by that Step: it only checked the
-//     presented ws-token's hash against ws_tokens, nothing
-//     per-participant beyond that -- participants stayed completely
-//     untouched (SubscribedPayload.participants was always an empty
-//     array).
-//   - UPDATE (§8.11, "multiplayer presence"): the gap immediately above
-//     is closed for LIVE presence specifically. verifyClientToken now
+//     caller. The client socket's subscribe checks the token (hash,
+//     session, expiry) and then the session read check (§6.2, §13.3;
+//     actorauthz.AuthorizeSessionRead, the check the mint makes too): the
+//     token's user exists and is not disabled, its role holds
+//     view_sessions, the session exists. A token with no user is refused.
+//     From the moment it is registered -- before the subscribed reply is
+//     written, so a client that stops reading during it is covered too --
+//     the connection repeats that check every
+//     ClientWSAccessRecheckInterval (recheckClientAccessLoop): a "no"
+//     unregisters the connection and closes it 4001, a check that cannot
+//     be made closes it 1011.
+//   - UPDATE (§8.11, "multiplayer presence"): subscribe used to leave
+//     participants untouched (SubscribedPayload.participants was always
+//     an empty array); that gap is closed for LIVE presence specifically.
+//     verifyClientToken now
 //     returns row.UserID alongside its bool, threaded into Hub.Register
 //     as a new userID parameter Hub tracks per connection; Hub.
 //     Participants(sessionID) reports the distinct set of real users
@@ -158,5 +167,9 @@
 //     reaches connections registered in the SAME process as the actor
 //     that persisted the event -- the same class of honest gap as
 //     ErrSessionActorElsewhere/503 above, not a Postgres LISTEN/NOTIFY or
-//     message-bus solution, genuinely out of scope for this Step.
+//     message-bus solution, genuinely out of scope for this Step. The
+//     access re-check needs no such fan-out: each process re-reads
+//     Postgres for the sockets it holds, so a change made through any
+//     replica, or straight in SQL, reaches every open socket within the
+//     re-check's bound.
 package wshub

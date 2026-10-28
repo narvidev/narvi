@@ -635,7 +635,7 @@ func newTestRig(t *testing.T, mutate ...func(*testRig)) testRig {
 		r.Post("/{sessionID}/uploads", httpapi.MintUploadAPI(rig.sessions, rig.participants, rig.artifacts, rig.blobStore, rig.objCfg, platform.DefaultTimeouts()))
 		r.Post("/{sessionID}/uploads/{uploadID}/complete", httpapi.ConfirmUploadAPI(rig.sessions, rig.participants, rig.pool, rig.artifacts, rig.events, rig.outbox, rig.sandboxes, rig.broadcaster, rig.blobStore, rig.objCfg))
 		r.Get("/{sessionID}/uploads/{uploadID}/content", httpapi.UploadContentAPI(rig.sessions, rig.artifacts, rig.blobStore, rig.objCfg, platform.DefaultTimeouts()))
-		r.Post("/{sessionID}/ws-token", httpapi.MintWSToken(rig.sessions, rig.wsTokens, platform.DefaultTimeouts()))
+		r.Post("/{sessionID}/ws-token", httpapi.MintWSToken(rig.sessions, rig.wsTokens, rig.users, platform.DefaultTimeouts()))
 		r.Post("/{sessionID}/turns", httpapi.CreateTurn(rig.pool, rig.sessions, rig.turns, rig.plans, rig.participants, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), nil, rig.objCfg, false))
 		r.Post("/{sessionID}/plans/{planId}/approve", httpapi.ApprovePlan(rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.participants, rig.outbox, rig.linearAgentSessions, rig.auditLog, rig.registry, turnguard.New(rig.pool, nil, false), false))
 		r.Post("/{sessionID}/plans/{planId}/reject", httpapi.RejectPlan(rig.pool, rig.sessions, rig.turns, rig.plans, rig.events, rig.planDocuments, rig.participants, rig.outbox, rig.linearAgentSessions, rig.auditLog, false))
@@ -2774,8 +2774,8 @@ func TestMintWSToken_HappyPath(t *testing.T) {
 	}
 
 	wantExpiry := before.Add(platform.DefaultTimeouts().WSTokenTTL)
-	if got.ExpiresAt.Sub(wantExpiry).Abs() > time.Minute {
-		t.Errorf("ExpiresAt = %v, want close to %v", got.ExpiresAt, wantExpiry)
+	if got.ExpiresAt.Sub(wantExpiry).Abs() > 5*time.Second {
+		t.Errorf("ExpiresAt = %v, want within 5s of %v", got.ExpiresAt, wantExpiry)
 	}
 
 	// The stored row holds only the HASH, never the plaintext, is scoped
