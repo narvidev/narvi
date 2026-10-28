@@ -1885,9 +1885,9 @@ type UpdateSandboxSnapshotIDParams struct {
 // migration) is the snapshot's own id when the gen that minted it -- the
 // live gen, whose row this is -- was a fresh lineage whose recap had not
 // reached it (fresh_lineage_gen = gen, read from the row as it is before
-// this write); NULL otherwise. The restored runtime then holds neither the
-// earlier conversation nor the recap, so a restore of that snapshot
-// carries the replaced gen's pending mark (sandbox.DecideFreshLineage).
+// this write); NULL otherwise. A runtime restored from that snapshot holds
+// neither the earlier conversation nor the recap, whatever later gens
+// received, so every restore of it is marked (sandbox.DecideFreshLineage).
 // Keyed by the id, as the rest of the provenance is, so a snapshot a binary
 // that does not write it mints reads as owing nothing.
 func (q *Queries) UpdateSandboxSnapshotID(ctx context.Context, arg UpdateSandboxSnapshotIDParams) (Sandbox, error) {

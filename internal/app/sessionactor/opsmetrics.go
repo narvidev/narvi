@@ -277,8 +277,8 @@ type opsMetrics struct {
 
 	// freshLineage is sandbox_fresh_lineage_total: one per claim that marked
 	// its gen a fresh lineage (technical plan §35.5, continuity.go) -- a
-	// fresh spawn, or a restore carrying a pending mark into a snapshot
-	// minted before its recap arrived -- once it has committed, tagged
+	// fresh spawn, or a restore of a snapshot minted before its recap
+	// arrived -- once it has committed, tagged
 	// cause=sandbox.LineageCause and carried=true|false.
 	freshLineage metric.Int64Counter
 
@@ -505,7 +505,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	freshLineage, err := meter.Int64Counter(
 		"sandbox_fresh_lineage_total",
-		metric.WithDescription("Claims that spawned a sandbox fresh in place of an earlier gen of a session that had a turn dispatched to one, and marked it a fresh lineage (technical plan §35.5): the agent there has neither its conversation nor any work that was not pushed, and the first turn sent to it carries a recap of the session's earlier turns. By cause: no_snapshot (nothing to restore or resume), rotation_no_snapshot (a rotation with no snapshot to restore), restore_refused (a restore refused on its snapshot's provenance or across the repository-hooks boundary, the snapshot cleared), restore_downgraded (a restore downgraded for a session that runs a container daemon, or a shadow session, the snapshot kept), stuck_respawn (a gen still starting, a slow restore among them, given up on), unrecapped_snapshot (a restore of a snapshot a fresh lineage minted before its recap reached it, always carried); and carried=true when the gen it replaced was itself a fresh lineage its recap never reached, whose mark it carries. Any other restore, a resume, a session's first spawn and a spawn before any turn was dispatched are never counted. Counted once the claim has committed; the line logged with each names both gens."),
+		metric.WithDescription("Claims that spawned a sandbox fresh in place of an earlier gen of a session that had a turn dispatched to one, and marked it a fresh lineage (technical plan §35.5): the agent there has neither its conversation nor any work that was not pushed, and the first turn sent to it carries a recap of the session's earlier turns. By cause: no_snapshot (nothing to restore or resume), rotation_no_snapshot (a rotation with no snapshot to restore), restore_refused (a restore refused on its snapshot's provenance or across the repository-hooks boundary, the snapshot cleared), restore_downgraded (a restore downgraded for a session that runs a container daemon, or a shadow session, the snapshot kept), stuck_respawn (a gen still starting, a slow restore among them, given up on), unrecapped_snapshot (a restore of a snapshot a fresh lineage minted before its recap reached it, carried when the gen it replaces still owes the recap, marked again otherwise, never announced); and carried=true when the gen it replaced was itself a fresh lineage its recap never reached, whose mark it carries. Any other restore, a resume, a session's first spawn and a spawn before any turn was dispatched are never counted. Counted once the claim has committed; the line logged with each names both gens."),
 		metric.WithUnit("{claim}"),
 	)
 	if err != nil {

@@ -22,10 +22,10 @@
 -- stood); NULL when its gen owed none. A snapshot reads as owing a recap
 -- only while this names it (snapshot_recap_owed_id = snapshot_id), the way
 -- snapshot_provenance_id keys the rest of its provenance (000170). Its
--- runtime holds neither the earlier conversation nor the recap, so the
--- claim that restores it carries the replaced gen's pending mark to the
--- restored gen; a restore of any other snapshot is never marked. The clear
--- that forgets a snapshot forgets it.
+-- runtime holds neither the earlier conversation nor the recap, whatever
+-- later gens received, so every claim that restores it marks the restored
+-- gen; a restore of any other snapshot is never marked. The clear that
+-- forgets a snapshot forgets it.
 --
 -- Both nullable, with no default and no backfill: no existing gen is
 -- marked, and no existing snapshot owes a recap.

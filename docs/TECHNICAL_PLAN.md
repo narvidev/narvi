@@ -7171,16 +7171,14 @@ minted under none), since it is the conversation the restored runtime holds: a f
 have forgotten the session's id since, keeping the snapshot it did not restore (a slow restore
 given up on, a downgrade), or a fresh lineage may have named its own. When nothing was recorded,
 the session keeps naming what it named — none, after a fresh spawn forgot it — since nothing says
-which conversation the snapshot holds. No outcome refuses, marks, announces or recaps a restore.
-A restore is marked in one case only, whatever its outcome: the snapshot it restores was minted by a
-gen that was a fresh lineage whose recap had not reached it — recorded with the snapshot, keyed by
-its id (`sandboxes.snapshot_recap_owed_id`) — and the gen it replaces still owes that recap. The
-restored runtime then holds neither the earlier conversation nor the recap, so the claim carries
-the pending mark to the new gen (cause `unrecapped_snapshot`, never announced again), and its first
-turn carries the recap. A restore of a snapshot minted before the fresh lineage, or after its recap
-arrived, is not marked.
-`held` is evidence, not proof: whether a provider's snapshot captures the runtime's session
-storage is not established from code.
+which conversation the snapshot holds. No outcome of that comparison refuses, marks, announces or
+recaps a restore. A restore is marked exactly when its snapshot was minted by a fresh lineage before
+that lineage's recap reached it (`sandboxes.snapshot_recap_owed_id` names it), because that runtime
+never holds the recap whatever later gens received: carried when the gen it replaces still owes the
+recap, marked again otherwise, never announced again (cause `unrecapped_snapshot`), and its first
+turn carries the recap; a restore of any other snapshot is not marked. `held` is evidence, not
+proof: whether a provider's snapshot captures the runtime's session storage is not established from
+code.
 
 ### 35.5b The snapshot carries the runtime it was minted under (amendment)
 

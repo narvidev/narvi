@@ -1511,22 +1511,19 @@ func TestFreshLineage_RestoreAfterAFreshSpawnNamesTheSnapshotsConversation(t *te
 	})
 }
 
-// TestFreshLineage_RestoreOfAnUnrecappedSnapshotCarriesTheMark: a fresh
-// lineage whose recap has not reached it can be snapshotted -- here by the
-// runway gate's rotation, its first turn stopped before it was sent -- and
-// that snapshot restored. The restored runtime holds neither the earlier
-// conversation nor the recap, so the restore carries the pending mark,
-// never announcing the loss again, and the restored gen's first prompt
-// opens with the recap.
-func TestFreshLineage_RestoreOfAnUnrecappedSnapshotCarriesTheMark(t *testing.T) {
-	ctx := context.Background()
-	logs := captureDefaultLoggerLocked(t)
-	carriedBefore := freshLineageCount(ctx, t, sandbox.LineageCauseUnrecappedSnapshot, true)
+// restoreAnUnrecappedRotation runs a fresh lineage whose recap has not
+// reached it into a restore of its own snapshot: gen 1 runs a turn and is
+// lost with no snapshot; gen 2 is a fresh lineage whose first turn is
+// stopped before it is sent; gen 2 nears its deadline, so the next turn,
+// "and next", rotates it, and its snapshot, snap-of-gen-2, is recorded
+// while its recap is still owed; the claim restores it as gen 3, which is
+// left connecting.
+func restoreAnUnrecappedRotation(ctx context.Context, t *testing.T) *lineageRig {
+	t.Helper()
 	rig := newLineageRig(ctx, t, lineageRigOptions{provider: &fakeSpawnProvider{explicitStop: true}})
 	rig.runTurn(ctx, t, 1, "add the retry to the importer", "Added the retry.")
 	rig.setStatus(ctx, t, sqlcgen.SandboxStatusFailed)
 
-	// Gen 2 is a fresh lineage; its first turn is stopped before it is sent.
 	stopped := rig.respawn(ctx, t, "carry on")
 	if _, err := rig.pool.Exec(ctx, `UPDATE turns SET stop_requested_at = now() WHERE id = $1`, stopped.ID); err != nil {
 		t.Fatal(err)
@@ -1537,8 +1534,6 @@ func TestFreshLineage_RestoreOfAnUnrecappedSnapshotCarriesTheMark(t *testing.T) 
 	}
 	rig.assertMarked(ctx, t, 2)
 
-	// Gen 2 nears its deadline; the next turn rotates it, and its snapshot
-	// is recorded while its recap is still owed.
 	rig.exec(ctx, t, `UPDATE sandboxes SET lifetime_deadline_at = now() + interval '10 minutes', lifetime_seconds = 7200,
 		lifetime_deadline_gen = gen WHERE session_id = $1`)
 	deliver(ctx, t, rig.actor, receiptHeartbeat(2))
@@ -1554,6 +1549,21 @@ func TestFreshLineage_RestoreOfAnUnrecappedSnapshotCarriesTheMark(t *testing.T) 
 	if call := rig.provider.lastRestoreCall(); call.snapshotID != "snap-of-gen-2" {
 		t.Fatalf("restored %q, want snap-of-gen-2", call.snapshotID)
 	}
+	return rig
+}
+
+// TestFreshLineage_RestoreOfAnUnrecappedSnapshotCarriesTheMark: a fresh
+// lineage whose recap has not reached it can be snapshotted -- here by the
+// runway gate's rotation, its first turn stopped before it was sent -- and
+// that snapshot restored. The restored runtime holds neither the earlier
+// conversation nor the recap, so the restore carries the pending mark,
+// never announcing the loss again, and the restored gen's first prompt
+// opens with the recap.
+func TestFreshLineage_RestoreOfAnUnrecappedSnapshotCarriesTheMark(t *testing.T) {
+	ctx := context.Background()
+	logs := captureDefaultLoggerLocked(t)
+	carriedBefore := freshLineageCount(ctx, t, sandbox.LineageCauseUnrecappedSnapshot, true)
+	rig := restoreAnUnrecappedRotation(ctx, t)
 
 	rig.assertMarked(ctx, t, 3)
 	if got := freshLineageCount(ctx, t, sandbox.LineageCauseUnrecappedSnapshot, true) - carriedBefore; got != 1 {
@@ -1570,6 +1580,59 @@ func TestFreshLineage_RestoreOfAnUnrecappedSnapshotCarriesTheMark(t *testing.T) 
 	recap := recapOf(t, p, "and next")
 	if !strings.Contains(recap, "> add the retry to the importer") || !strings.Contains(recap, "> Added the retry.") {
 		t.Fatalf("recap %q, want the turn gen 1 ran", recap)
+	}
+}
+
+// TestFreshLineage_RestoringAnUnrecappedSnapshotAgainMarksItAgain: the
+// recap reaching a gen restored from an unrecapped snapshot changes nothing
+// in that snapshot. When the gen is lost mid-turn before it records a
+// snapshot of its own, the next claim restores the same snapshot, whose
+// runtime still never received the recap: the restored gen is marked
+// again -- not carried, the replaced gen owes nothing, and not announced,
+// the lineage's loss was announced when it began -- and the re-sent turn
+// opens with the recap, the interrupted attempt in it.
+func TestFreshLineage_RestoringAnUnrecappedSnapshotAgainMarksItAgain(t *testing.T) {
+	ctx := context.Background()
+	logs := captureDefaultLoggerLocked(t)
+	remarkedBefore := freshLineageCount(ctx, t, sandbox.LineageCauseUnrecappedSnapshot, false)
+	rig := restoreAnUnrecappedRotation(ctx, t)
+	rig.bootGen(ctx, t, 3, false)
+	recapOf(t, rig.commander.lastPrompt(t), "and next")
+
+	// The recap reaches gen 3, and its turn starts.
+	rig.stream(ctx, t, 3, "Started the next part.")
+	rig.assertUnmarked(ctx, t, 3)
+
+	// Gen 3 is lost mid-turn, before it records a snapshot of its own.
+	rig.setStatus(ctx, t, sqlcgen.SandboxStatusFailed)
+	settle(ctx, t, rig.actor)
+	waitUntil(t, 5*time.Second, func() bool { return rig.provider.restoreCallCount() == 2 })
+	waitForConnecting(ctx, t, rig.pool, rig.sessionID)
+	if call := rig.provider.lastRestoreCall(); call.snapshotID != "snap-of-gen-2" || call.spec.Gen != 4 {
+		t.Fatalf("restored %q for gen %d, want snap-of-gen-2 again for gen 4", call.snapshotID, call.spec.Gen)
+	}
+	rig.assertMarked(ctx, t, 4)
+	if got := freshLineageCount(ctx, t, sandbox.LineageCauseUnrecappedSnapshot, false) - remarkedBefore; got != 1 {
+		t.Fatalf("sandbox_fresh_lineage_total{unrecapped_snapshot, not carried} moved by %d, want 1", got)
+	}
+	if line := logs.entry(t, freshLineageRemarkedLogMessage); line["gen"] != float64(4) || line["carried"] != false {
+		t.Fatalf("marked-again line = %v, want gen 4, not carried", line)
+	}
+	if n := lockedLogCount(logs, freshLineageLogMessage); n != 1 {
+		t.Fatalf("%d announced fresh-lineage lines, want 1: the lineage's loss is announced once", n)
+	}
+
+	rig.bootGen(ctx, t, 4, false)
+	p := rig.commander.lastPrompt(t)
+	if p.Gen != 4 || p.ConversationId != nil {
+		t.Fatalf("re-sent prompt to gen %d names %v, want gen 4 naming none", p.Gen, p.ConversationId)
+	}
+	recap := recapOf(t, p, "and next")
+	for _, want := range []string{"> add the retry to the importer", "> Added the retry.",
+		"\n" + continuity.LineInterrupted + "\n> Started the next part.\n"} {
+		if !strings.Contains(recap, want) {
+			t.Fatalf("recap %q, want it to hold %q", recap, want)
+		}
 	}
 }
 

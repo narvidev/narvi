@@ -41,9 +41,6 @@ func TestDecideFreshLineage(t *testing.T) {
 		{name: "row 1: a restore replacing a gen whose mark is pending", facts: func(f *sandbox.LineageFacts) {
 			f.Claim, f.ReplacedMarkPending = sandbox.LineageClaimRestore, true
 		}},
-		{name: "row 1: a restore of an unrecapped snapshot, no mark pending", facts: func(f *sandbox.LineageFacts) {
-			f.Claim, f.RestoredSnapshotUnrecapped = sandbox.LineageClaimRestore, true
-		}},
 		{name: "row 2: a resume replacing a gen whose mark is pending, its snapshot unrecapped", facts: func(f *sandbox.LineageFacts) {
 			f.Claim, f.ReplacedMarkPending, f.RestoredSnapshotUnrecapped = sandbox.LineageClaimResume, true, true
 		}},
@@ -59,6 +56,9 @@ func TestDecideFreshLineage(t *testing.T) {
 		{name: "row 0: a rotation's restore of its own unrecapped snapshot", facts: func(f *sandbox.LineageFacts) {
 			f.Claim, f.ReplacedMarkPending, f.RestoredSnapshotUnrecapped, f.Rotating = sandbox.LineageClaimRestore, true, true, true
 		}, want: carried(sandbox.LineageCauseUnrecappedSnapshot)},
+		{name: "row 0: an unrecapped snapshot restored again after the recap reached a later gen", facts: func(f *sandbox.LineageFacts) {
+			f.Claim, f.RestoredSnapshotUnrecapped = sandbox.LineageClaimRestore, true
+		}, want: sandbox.LineageDecision{Mark: true, Cause: sandbox.LineageCauseUnrecappedSnapshot}},
 		{name: "row 2: a resume", facts: func(f *sandbox.LineageFacts) { f.Claim = sandbox.LineageClaimResume }},
 		{name: "row 2: a resume replacing a gen whose mark is pending", facts: func(f *sandbox.LineageFacts) {
 			f.Claim, f.ReplacedMarkPending = sandbox.LineageClaimResume, true
@@ -131,13 +131,14 @@ func TestDecideFreshLineage(t *testing.T) {
 
 // TestDecideFreshLineage_Properties sweeps every combination of the facts
 // and holds the decision to what §35.5 requires of it, whatever the row
-// order: a resume never marks, and a restore only carries a pending mark
-// into a snapshot minted before its recap arrived; any other mark is a
-// spawn of an existing session that had a turn dispatched before, and
-// every such spawn is marked; a mark is announced exactly when it is not
-// carried, and carried exactly when the replaced gen's mark is pending;
-// and a spawn's cause is the claim's own, the same whether the mark is
-// carried or not.
+// order: a resume never marks; a restore is marked exactly when its
+// snapshot was minted before its fresh lineage's recap arrived, never
+// announced, and carried exactly when the replaced gen's mark is pending;
+// any other mark is a spawn of an existing session that had a turn
+// dispatched before, every such spawn is marked, announced exactly when it
+// is not carried, and carried exactly when the replaced gen's mark is
+// pending; and a spawn's cause is the claim's own, the same whether the
+// mark is carried or not.
 func TestDecideFreshLineage_Properties(t *testing.T) {
 	t.Parallel()
 
@@ -164,24 +165,24 @@ func TestDecideFreshLineage_Properties(t *testing.T) {
 										t.Errorf("DecideFreshLineage(%+v) = %+v: %s", f, d, why)
 									}
 									freshLineage := claim == sandbox.LineageClaimSpawn && !firstGen && prior
-									unrecappedRestore := claim == sandbox.LineageClaimRestore && pending && unrecapped
+									unrecappedRestore := claim == sandbox.LineageClaimRestore && unrecapped
 									if claim == sandbox.LineageClaimResume && (d.Mark || d.Announce || d.Carried) {
 										fail("a resume is marked")
 									}
 									if claim == sandbox.LineageClaimRestore && d.Mark != unrecappedRestore {
-										fail("a restore is marked exactly when it restores an unrecapped snapshot over a pending mark")
+										fail("a restore is marked exactly when it restores an unrecapped snapshot")
 									}
 									if claim == sandbox.LineageClaimRestore && d.Announce {
 										fail("a restore announces a loss")
 									}
 									if d.Mark != (freshLineage || unrecappedRestore) {
-										fail("marked exactly when a spawn of an existing session follows a dispatched turn, or a restore carries an unrecapped snapshot's mark")
+										fail("marked exactly when a spawn of an existing session follows a dispatched turn, or a restore restores an unrecapped snapshot")
 									}
 									if d.Announce && (!d.Mark || d.Carried) {
 										fail("announced without a mark, or carried and announced again")
 									}
-									if d.Mark && d.Announce == d.Carried {
-										fail("a mark is either announced or carried")
+									if d.Mark && claim == sandbox.LineageClaimSpawn && d.Announce == d.Carried {
+										fail("a spawn's mark is either announced or carried")
 									}
 									if d.Carried != (d.Mark && pending) {
 										fail("carried exactly when a mark replaces a gen whose own is pending")
@@ -197,7 +198,7 @@ func TestDecideFreshLineage_Properties(t *testing.T) {
 										}
 									}
 									if (d.Cause == sandbox.LineageCauseUnrecappedSnapshot) != unrecappedRestore {
-										fail("unrecapped_snapshot is the cause of exactly a restore carrying an unrecapped snapshot's mark")
+										fail("unrecapped_snapshot is the cause of exactly a restore of an unrecapped snapshot")
 									}
 								}
 							}

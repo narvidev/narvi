@@ -20,10 +20,10 @@
 // id as it is. A claim that starts a fresh lineage marks its gen
 // (sandboxes.fresh_lineage_gen); every claim's upsert clears the mark, so it
 // counts only for the gen it names, and a later fresh claim that replaces a
-// gen whose mark is still pending carries it over. A restore carries it too
-// when the snapshot it restores was minted before that recap arrived
-// (decideRestoreLineage): that runtime never received it. Any other restore,
-// and a resume, is never marked.
+// gen whose mark is still pending carries it over. A restore of a snapshot a
+// fresh lineage minted before its recap arrived is always marked
+// (decideRestoreLineage): that runtime never holds the recap, whatever later
+// gens received. Any other restore, and a resume, is never marked.
 //
 // # The recap
 //
@@ -184,13 +184,13 @@ func snapshotUnrecapped(row sqlcgen.Sandbox, snapshotID string) bool {
 
 // decideRestoreLineage settles, in a restore claim's own transaction, the
 // one case in which a restore is marked (technical plan §35.5,
-// sandbox.DecideFreshLineage's row 0): the gen sandboxRow replaces is a
-// fresh lineage whose recap is still owed, and the snapshot the claim
-// restores, snapshotID, was minted by such a gen before its recap arrived.
-// The restored runtime then holds neither the earlier conversation nor the
-// recap, so the pending mark is carried to newGen, never announced again.
-// A restore of a snapshot minted before the fresh lineage, or after its
-// recap arrived, is not marked.
+// sandbox.DecideFreshLineage's row 0): the snapshot the claim restores,
+// snapshotID, was minted by a fresh lineage before its recap arrived. That
+// runtime holds neither the earlier conversation nor the recap, whatever
+// later gens received, so newGen is marked: the replaced gen's pending
+// mark carried, or marked again when the recap had since reached a later
+// gen, never announced again either way. A restore of any other snapshot
+// is not marked.
 func (a *Actor) decideRestoreLineage(ctx context.Context, tx pgx.Tx, sandboxRow sqlcgen.Sandbox, newGen int, snapshotID string) (*freshLineageNote, error) {
 	note := &freshLineageNote{
 		gen: newGen, replacedGen: sandboxRow.Gen, replacedStatus: string(sandboxRow.Status), snapshotID: snapshotID,
@@ -209,16 +209,21 @@ func (a *Actor) decideRestoreLineage(ctx context.Context, tx pgx.Tx, sandboxRow 
 	return note, nil
 }
 
-// freshLineageLogMessage and freshLineageCarriedLogMessage are
-// logFreshLineage's messages.
+// freshLineageLogMessage, freshLineageCarriedLogMessage and
+// freshLineageRemarkedLogMessage are logFreshLineage's messages.
 const (
 	freshLineageLogMessage        = "sessionactor: a fresh lineage: the sandbox was spawned fresh in place of an earlier gen, without the agent's conversation or any work that was not pushed; its first turn carries a recap"
 	freshLineageCarriedLogMessage = "sessionactor: a fresh lineage carried over: the gen it replaces never received its recap, so this one owes it"
+	// freshLineageRemarkedLogMessage is a restore of a snapshot minted
+	// before its fresh lineage's recap arrived, after the recap reached a
+	// later gen: the restored runtime owes it again.
+	freshLineageRemarkedLogMessage = "sessionactor: a fresh lineage's unrecapped snapshot restored: the restored runtime never received the recap, so this gen owes it again"
 )
 
 // logFreshLineage logs and counts what plan's claim decided about the fresh
-// lineage, after the claim committed (executePlans), never inside it: a
-// marked gen at WARN, or at INFO when its mark was carried over, and on
+// lineage, after the claim committed (executePlans), never inside it: an
+// announced mark at WARN, a carried one at INFO, and a restore of an
+// unrecapped snapshot marked again at INFO, each on
 // sandbox_fresh_lineage_total. A claim that marked nothing -- a restore of
 // any other snapshot, a resume, a session's first spawn, one before any
 // turn was dispatched -- records nothing.
@@ -232,10 +237,13 @@ func (a *Actor) logFreshLineage(ctx context.Context, plan *spawnPlan) {
 		"replaced_gen", n.replacedGen, "replaced_status", n.replacedStatus, "snapshot_id", n.snapshotID,
 		"docker_required", n.dockerRequired, "conversation_cleared", n.conversationCleared,
 	}
-	if n.decision.Carried {
-		a.logger.Info(freshLineageCarriedLogMessage, fields...)
-	} else {
+	switch {
+	case n.decision.Announce:
 		a.logger.Warn(freshLineageLogMessage, fields...)
+	case n.decision.Carried:
+		a.logger.Info(freshLineageCarriedLogMessage, fields...)
+	default:
+		a.logger.Info(freshLineageRemarkedLogMessage, fields...)
 	}
 	if a.opsMetrics.freshLineage == nil {
 		return

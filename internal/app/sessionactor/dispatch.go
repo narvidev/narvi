@@ -307,8 +307,8 @@ type spawnPlan struct {
 
 	// lineage is what a fresh-spawn or restore claim decided about the
 	// fresh lineage (technical plan §35.5, continuity.go): whether it marked
-	// its gen, why, and whether the mark was carried over -- a restore only
-	// ever carries one, into a snapshot minted before its recap arrived.
+	// its gen, why, and whether the mark was carried over -- a restore marks
+	// only when its snapshot was minted before its recap arrived.
 	// nil on a resume plan. executePlans logs and counts it once the claim
 	// has committed (logFreshLineage).
 	lineage *freshLineageNote
@@ -1563,7 +1563,7 @@ func (a *Actor) tryPlanSpawn(
 		}
 		// A snapshot a fresh lineage minted before its recap reached it
 		// brings back a runtime that never received the recap: the
-		// replaced gen's pending mark is carried (continuity.go).
+		// restored gen is marked (continuity.go).
 		if plan.lineage, err = a.decideRestoreLineage(ctx, tx, sandboxRow, plan.gen, action.SnapshotImageID); err != nil {
 			return nil, err
 		}
