@@ -134,8 +134,7 @@
 //     the connection repeats that check every
 //     ClientWSAccessRecheckInterval (recheckClientAccessLoop): a "no"
 //     unregisters the connection and closes it 4001, a check that cannot
-//     be made closes it 1011. The subscribed reply's write is bounded by
-//     ClientSubscribedWriteTimeout.
+//     be made closes it 1011.
 //   - UPDATE (§8.11, "multiplayer presence"): subscribe used to leave
 //     participants untouched (SubscribedPayload.participants was always
 //     an empty array); that gap is closed for LIVE presence specifically.

@@ -563,11 +563,10 @@ func TestDefaultTimeouts_OpenCodeTransientRetryBackoffStandaloneField(t *testing
 }
 
 // TestDefaultTimeouts_ClientSocketAccessFields pins the client socket's
-// credential, re-check and handshake-write defaults (technical plan §6.2,
-// amended): a ws-token lives 2 minutes, enough to reach its subscribe
-// frame; a socket re-checks its subscriber's read access every 60s; and
-// the subscribed reply's write is dropped after 60s. All must leave
-// Validate clean.
+// credential and re-check defaults (technical plan §6.2, amended): a
+// ws-token lives 2 minutes, enough to reach its subscribe frame, and a
+// socket re-checks its subscriber's read access every 60s. Both must
+// leave Validate clean.
 func TestDefaultTimeouts_ClientSocketAccessFields(t *testing.T) {
 	t.Parallel()
 
@@ -580,7 +579,6 @@ func TestDefaultTimeouts_ClientSocketAccessFields(t *testing.T) {
 	}{
 		{"WSTokenTTL", to.WSTokenTTL, 2 * time.Minute},
 		{"ClientWSAccessRecheckInterval", to.ClientWSAccessRecheckInterval, 60 * time.Second},
-		{"ClientSubscribedWriteTimeout", to.ClientSubscribedWriteTimeout, 60 * time.Second},
 	}
 	for _, tc := range tests {
 		if tc.got != tc.want {
@@ -1687,11 +1685,6 @@ func TestValidate_RequiresPositiveFields(t *testing.T) {
 			name:      "ClientWSAccessRecheckInterval == 0",
 			mutate:    func(to *platform.Timeouts) { to.ClientWSAccessRecheckInterval = 0 },
 			wantField: "ClientWSAccessRecheckInterval",
-		},
-		{
-			name:      "ClientSubscribedWriteTimeout == 0",
-			mutate:    func(to *platform.Timeouts) { to.ClientSubscribedWriteTimeout = 0 },
-			wantField: "ClientSubscribedWriteTimeout",
 		},
 		{
 			// A negative value is exactly as permissive as zero for every

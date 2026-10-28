@@ -2,7 +2,7 @@
 
 // A client that stops reading during the subscribed reply (technical plan
 // §6.2, §13.3): the access re-check runs while that write is stalled, and
-// the write itself is bounded by ClientSubscribedWriteTimeout.
+// a "no" ends the write.
 package wshub_test
 
 import (
@@ -129,13 +129,12 @@ func seedLargeSubscribedReply(ctx context.Context, t *testing.T, rig clientTestR
 //   - A client that never reads again is dropped: coder/websocket gives
 //     up writing the close frame behind the stalled frame after 5s and
 //     closes the connection, which unblocks the stalled write, and the
-//     handler returns -- within 2*interval plus that 5s, long before
-//     ClientSubscribedWriteTimeout (set to a minute here) could end it.
+//     handler returns within 2*interval plus that 5s. The subscribed write
+//     has no deadline of its own, so only the re-check's close ends it.
 func TestClientHandler_RecheckEndsAStalledSubscribedWrite(t *testing.T) {
 	timeouts := platform.DefaultTimeouts()
 	timeouts.ClientWSAccessRecheckInterval = 100 * time.Millisecond
 	timeouts.ClientWSPingInterval = time.Hour
-	timeouts.ClientSubscribedWriteTimeout = time.Minute
 	// closeWriteLimit is coder/websocket's own bound on writing a close
 	// frame (writeClose), after which it closes the connection.
 	const closeWriteLimit = 5 * time.Second
@@ -235,52 +234,5 @@ func TestClientHandler_RecheckEndsAStalledSubscribedWrite(t *testing.T) {
 				t.Fatalf("close code = %d (%v), want 4001", got, err)
 			}
 		})
-	}
-}
-
-// TestClientHandler_StalledSubscribedWriteIsDropped pins the subscribed
-// write's own bound: a client that stops reading during the subscribed
-// reply is dropped after ClientSubscribedWriteTimeout even though its
-// access stands (the re-check is set out of the way), and never gets the
-// whole reply.
-func TestClientHandler_StalledSubscribedWriteIsDropped(t *testing.T) {
-	timeouts := platform.DefaultTimeouts()
-	timeouts.ClientWSAccessRecheckInterval = time.Hour
-	timeouts.ClientWSPingInterval = time.Hour
-	timeouts.ClientSubscribedWriteTimeout = 500 * time.Millisecond
-	rig, sessionRow := newClientTestRig(t, timeouts)
-	ctx := context.Background()
-	sid := sessionRow.ID.String()
-
-	seedLargeSubscribedReply(ctx, t, rig, sessionRow.ID)
-	user := createTestUser(ctx, t, rig.pool, uniqueTestEmail("dropped"), "Dropped Reader")
-	token := createTestWSTokenForUser(ctx, t, rig.pool, sessionRow.ID, user, time.Now().Add(time.Hour))
-	wsURL, handlerReturned := newStallTestServer(t, rig, timeouts)
-
-	conn := dialStalling(ctx, t, wsURL, sid, token)
-	defer func() { _ = conn.CloseNow() }()
-
-	waitUntil(t, 5*time.Second, func() bool { return slices.Contains(rig.hub.Participants(sid), user.String()) })
-	registeredAt := time.Now()
-	// The handler gives up on the write and returns; its deferred cleanup
-	// unregisters the connection.
-	select {
-	case <-handlerReturned:
-	case <-time.After(10 * time.Second):
-		t.Fatalf("the handler was still in its stalled write after 10s, want it ended at the %v write bound", timeouts.ClientSubscribedWriteTimeout)
-	}
-	t.Logf("the stalled connection was dropped %v after it registered (write bound %v)", time.Since(registeredAt), timeouts.ClientSubscribedWriteTimeout)
-	if got := rig.hub.Participants(sid); slices.Contains(got, user.String()) {
-		t.Errorf("Hub.Participants after the handler returned = %v, want the user gone", got)
-	}
-
-	readCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	_, data, err := conn.Read(readCtx)
-	if err == nil {
-		t.Fatalf("Read = %d bytes, want the connection dropped before the whole reply", len(data))
-	}
-	if got := websocket.CloseStatus(err); got != -1 {
-		t.Errorf("close code = %d, want none: the connection is dropped, not closed with a code", got)
 	}
 }

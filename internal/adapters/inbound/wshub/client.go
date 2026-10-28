@@ -98,8 +98,7 @@
 //     connection and closes it 4001, a check that cannot be made closes
 //     it 1011) starts right after Hub.Register, before the subscribed
 //     reply is assembled and written, so a client that stops reading
-//     during that write is re-checked too. The subscribed write itself is
-//     bounded by ClientSubscribedWriteTimeout.
+//     during that write is re-checked too.
 //
 //     Then: start the idle-liveness ping loop (see pingClientLoop's own
 //     doc comment -- an unanswered ping closes 4003 "idle timeout"), then
@@ -396,15 +395,13 @@ func NewClientHandler(
 			_ = conn.Close(websocket.StatusInternalError, "internal error")
 			return
 		}
-		// The subscribed write is bounded by ClientSubscribedWriteTimeout: a
-		// client that stops reading partway through its reply is dropped
-		// (coder/websocket closes the connection when a write's context
-		// expires) even while its access stands, so it cannot hold this
-		// handler, its Hub registration and its queued broadcasts for good.
-		writeCtx, cancelWrite := context.WithTimeout(ctx, timeouts.ClientSubscribedWriteTimeout)
-		err = conn.Write(writeCtx, websocket.MessageText, raw)
-		cancelWrite()
-		if err != nil {
+		// No deadline on this write: the reply has no size bound (every
+		// turn's prompt, a review turn's whole diff included), so a total
+		// deadline would cut an authorized client on a slow link for good. A
+		// client that stops reading here holds the connection until it reads
+		// again or disconnects; if its subscriber loses access meanwhile, the
+		// access re-check started at step (6b) ends this write.
+		if err := conn.Write(ctx, websocket.MessageText, raw); err != nil {
 			logger.Warn("wshub: write subscribed payload failed", "error", err)
 			return
 		}
@@ -427,8 +424,9 @@ func NewClientHandler(
 		// down together by this handler's own deferred cleanup. See
 		// pingClientLoop's own doc comment. It starts here, after the
 		// subscribed write, not at registration like the access re-check:
-		// a pong is only read by readClientLoop, which starts below, and
-		// the subscribed write already has its own bound.
+		// a pong is only read by readClientLoop, which starts below, so a
+		// ping sent during a long subscribed write could not be answered
+		// and would end a healthy connection.
 		writerGroup.Go(func() error {
 			pingClientLoop(writerCtx, conn, timeouts.ClientWSPingInterval, logger)
 			return nil

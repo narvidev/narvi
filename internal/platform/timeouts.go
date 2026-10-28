@@ -1189,23 +1189,6 @@ type Timeouts struct {
 	// goroutine.
 	ClientWSAccessRecheckInterval time.Duration
 
-	// ClientSubscribedWriteTimeout bounds the client-WS handler's write of
-	// the single subscribed reply (client.go, NewClientHandler, §6.2): a
-	// client that stops reading partway through it is dropped when this
-	// elapses (coder/websocket closes the connection when a write's
-	// context expires), so it cannot hold the handler, its Hub
-	// registration and its queued broadcasts for as long as it likes while
-	// its access stands. (Access lost during the write is handled by
-	// ClientWSAccessRecheckInterval's re-check, which runs alongside it.)
-	// The reply carries the session, its turns, its artifacts and up to
-	// 16 KiB of events, and turns and artifacts grow with the session.
-	// Not specified in the plan; chosen as 60s: about 1.9 MB at 256 kbit/s,
-	// a reply far larger than a long session's on a slow mobile link.
-	// Validate requires it to be positive: a zero deadline would fail
-	// every subscribe at once. No pairwise link: nothing else waits on
-	// this write, and the ping loop only starts once it has returned.
-	ClientSubscribedWriteTimeout time.Duration
-
 	// ClientFetchHistoryMinInterval is the minimum time internal/adapters/
 	// inbound/wshub's client-WS read loop (client.go, readClientLoop)
 	// requires between two successive fetch_history requests it actually
@@ -4722,7 +4705,6 @@ func DefaultTimeouts() Timeouts {
 
 		ClientWSPingInterval:          30 * time.Second,       // not specified; chosen, matches SandboxWSHeartbeatInterval's own 30s cadence (§6.1)
 		ClientWSAccessRecheckInterval: 60 * time.Second,       // not specified; chosen: how long an open socket may outlive its subscriber's read access
-		ClientSubscribedWriteTimeout:  60 * time.Second,       // not specified; chosen: a large subscribed reply on a slow link
 		ClientFetchHistoryMinInterval: 250 * time.Millisecond, // not specified; chosen, generous for real pagination while blocking a tight-loop hammer
 
 		ExpiredCredentialCleanupInterval: time.Hour, // not specified; chosen, bounds only table size: an expired ws_tokens/user_sessions row is refused at verify time anyway
@@ -5793,10 +5775,6 @@ func (t Timeouts) Validate() error {
 	// same assertion, made here so a bad value fails at startup instead.
 	// See ClientWSAccessRecheckInterval's doc comment.
 	mustBePositive("ClientWSAccessRecheckInterval", t.ClientWSAccessRecheckInterval)
-	// The subscribed reply's write deadline: at zero or less every
-	// subscribe's write would expire at once and every client socket
-	// would fail. See ClientSubscribedWriteTimeout's doc comment.
-	mustBePositive("ClientSubscribedWriteTimeout", t.ClientSubscribedWriteTimeout)
 
 	return errors.Join(errs...)
 }
