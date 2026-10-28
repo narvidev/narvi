@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -60,24 +61,39 @@ func (s *IdentityStore) GetByUserAndProvider(ctx context.Context, userID pgtype.
 	})
 }
 
-// UpdateAccessToken re-encrypts and stores a fresh provider access token on
-// an already-linked identity -- called on every successful sign-in of a
-// RETURNING user (GitHub's own classic OAuth tokens don't expire, but
-// re-storing on each login is harmless and keeps the stored token fresh if
-// the user ever re-authorized with different scopes).
-func (s *IdentityStore) UpdateAccessToken(ctx context.Context, arg sqlcgen.UpdateIdentityAccessTokenParams) (sqlcgen.Identity, error) {
-	return s.q.UpdateIdentityAccessToken(ctx, arg)
+// GetByIDForUpdate fetches one identities row by id and locks it for the
+// rest of the transaction this store runs on (WithTx) -- the read
+// internal/app/identitylink.RefreshSignInEvidence makes before it replaces
+// the row's email. pgx.ErrNoRows when the row is gone.
+func (s *IdentityStore) GetByIDForUpdate(ctx context.Context, id pgtype.UUID) (sqlcgen.Identity, error) {
+	return s.q.GetIdentityByIDForUpdate(ctx, id)
 }
 
-// ListVerifiedUserIDsByEmail is the auto-link algorithm's own "match
-// against ... verified identity emails" half (§13.2 step 2) -- the OTHER
-// half, users.primary_email, is UserStore.GetByPrimaryEmail. Always
-// deduplicated by user_id (see queries/identities.sql's own doc comment)
-// but a caller combining this with GetByPrimaryEmail's own separate
-// result must still dedupe the UNION of both, since the same user could
-// match both ways at once.
-func (s *IdentityStore) ListVerifiedUserIDsByEmail(ctx context.Context, email string) ([]pgtype.UUID, error) {
-	return s.q.ListVerifiedIdentityUserIDsByEmail(ctx, email)
+// RefreshSignInEmail records, on an already-linked identity, the verified
+// email a GitHub or OIDC sign-in just presented for it, stamped now
+// (§13.2), and the sign-in's fresh provider access token when it has one:
+// a nil accessTokenEncrypted keeps the stored token. Never changes the
+// row's user_id or linked_via. Called only by internal/app/identitylink.
+// RefreshSignInEvidence, inside its transaction.
+func (s *IdentityStore) RefreshSignInEmail(ctx context.Context, id pgtype.UUID, email string, accessTokenEncrypted []byte) (sqlcgen.Identity, error) {
+	return s.q.RefreshSignInIdentityEmail(ctx, sqlcgen.RefreshSignInIdentityEmailParams{
+		ID:                   id,
+		Email:                email,
+		AccessTokenEncrypted: accessTokenEncrypted,
+	})
+}
+
+// ListVerifiedUserIDsByEmail is the auto-link algorithm's match step
+// (§13.2 step 2): the users whose identity carries email, verified, and
+// confirmed by its provider within maxAge of the database clock (see
+// queries/identities.sql's own doc comment). Deduplicated by user_id.
+// maxAge is platform.Timeouts.IdentityEmailEvidenceMaxAge; the caller
+// refuses a non-positive one before it gets here.
+func (s *IdentityStore) ListVerifiedUserIDsByEmail(ctx context.Context, email string, maxAge time.Duration) ([]pgtype.UUID, error) {
+	return s.q.ListVerifiedIdentityUserIDsByEmail(ctx, sqlcgen.ListVerifiedIdentityUserIDsByEmailParams{
+		Email:  email,
+		MaxAge: pgtype.Interval{Microseconds: maxAge.Microseconds(), Valid: true},
+	})
 }
 
 // ListForUser returns every identity linked to userID, oldest-first --

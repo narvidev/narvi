@@ -445,10 +445,11 @@ func setupFindingWithSuggestedFix(ctx context.Context, t *testing.T, rig testRig
 // round-trippable encrypted GitHub access token -- ApplySuggestion's own
 // acting-maintainer credential. createUserWithRole (planapprove_
 // integration_test.go) already creates this user's own github identity
-// (with no access token) -- this function UPDATES that SAME row via
-// UpdateAccessToken, rather than inserting a second (user_id, provider)
-// row, which GetByUserAndProvider (identities are looked up by exactly
-// that pair) would otherwise have to arbitrarily choose between.
+// (with no access token) -- this function UPDATES that SAME row's
+// access_token_encrypted directly, rather than inserting a second
+// (user_id, provider) row, which GetByUserAndProvider (identities are
+// looked up by exactly that pair) would otherwise have to arbitrarily
+// choose between.
 func createMaintainerWithGitHubToken(ctx context.Context, t *testing.T, rig testRig, plaintextToken string) (sqlcgen.User, string) {
 	t.Helper()
 	user, sessionToken := createUserWithRole(ctx, t, rig, sqlcgen.UserRoleMaintainer)
@@ -462,10 +463,7 @@ func createMaintainerWithGitHubToken(ctx context.Context, t *testing.T, rig test
 	if err != nil {
 		t.Fatalf("EncryptToken: %v", err)
 	}
-	if _, err := rig.identities.UpdateAccessToken(ctx, sqlcgen.UpdateIdentityAccessTokenParams{
-		ID:                   identity.ID,
-		AccessTokenEncrypted: encrypted,
-	}); err != nil {
+	if _, err := rig.pool.Exec(ctx, `UPDATE identities SET access_token_encrypted = $2 WHERE id = $1`, identity.ID, encrypted); err != nil {
 		t.Fatalf("update github identity access token: %v", err)
 	}
 	return user, sessionToken

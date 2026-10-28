@@ -164,13 +164,14 @@ func newTestRig(t *testing.T) *testRig {
 		UserSessions: userSessions,
 		Users:        users,
 		AppIdentityLink: appidentitylink.Deps{
-			Pool:          pool,
-			Users:         users,
-			Identities:    identities,
-			LinkPrompts:   linkPrompts,
-			AuditLog:      auditLog,
-			PublicBaseURL: "https://narvi.example.com",
-			PromptTTL:     time.Hour,
+			Pool:           pool,
+			Users:          users,
+			Identities:     identities,
+			LinkPrompts:    linkPrompts,
+			AuditLog:       auditLog,
+			PublicBaseURL:  "https://narvi.example.com",
+			PromptTTL:      time.Hour,
+			EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 		},
 	})
 
@@ -241,13 +242,14 @@ func TestConsumeHandler_Authenticated_LinksIdentity(t *testing.T) {
 	ctx := context.Background()
 
 	res, err := appidentitylink.Resolve(ctx, appidentitylink.Deps{
-		Pool:          rig.pool,
-		Users:         rig.users,
-		Identities:    rig.identities,
-		LinkPrompts:   rig.linkPrompts,
-		AuditLog:      narvipg.NewAuditLogStore(rig.pool),
-		PublicBaseURL: "https://narvi.example.com",
-		PromptTTL:     time.Hour,
+		Pool:           rig.pool,
+		Users:          rig.users,
+		Identities:     rig.identities,
+		LinkPrompts:    rig.linkPrompts,
+		AuditLog:       narvipg.NewAuditLogStore(rig.pool),
+		PublicBaseURL:  "https://narvi.example.com",
+		PromptTTL:      time.Hour,
+		EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 	}, sqlcgen.IdentityProviderSlack, "U-CONSUME-HTTP", appidentitylink.ProfileEmail{Address: "nobody-matches@example.com", Verified: true}, true)
 	if err != nil {
 		t.Fatalf("Resolve (seed link prompt): %v", err)

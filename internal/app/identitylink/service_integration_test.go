@@ -18,6 +18,7 @@ import (
 	migratepg "github.com/golang-migrate/migrate/v4/database/postgres"
 	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 	_ "github.com/jackc/pgx/v5/stdlib" // registers the "pgx" database/sql driver
 	"github.com/testcontainers/testcontainers-go"
@@ -27,6 +28,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/identitylink"
+	"github.com/narvidev/narvi/internal/platform"
 	"github.com/narvidev/narvi/migrations"
 )
 
@@ -142,13 +144,14 @@ func newTestPool(t *testing.T) *pgxpool.Pool {
 
 func newDeps(pool *pgxpool.Pool) identitylink.Deps {
 	return identitylink.Deps{
-		Pool:          pool,
-		Users:         narvipg.NewUserStore(pool),
-		Identities:    narvipg.NewIdentityStore(pool),
-		LinkPrompts:   narvipg.NewIdentityLinkPromptStore(pool),
-		AuditLog:      narvipg.NewAuditLogStore(pool),
-		PublicBaseURL: "https://narvi.example.com",
-		PromptTTL:     24 * time.Hour,
+		Pool:           pool,
+		Users:          narvipg.NewUserStore(pool),
+		Identities:     narvipg.NewIdentityStore(pool),
+		LinkPrompts:    narvipg.NewIdentityLinkPromptStore(pool),
+		AuditLog:       narvipg.NewAuditLogStore(pool),
+		PublicBaseURL:  "https://narvi.example.com",
+		PromptTTL:      24 * time.Hour,
+		EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 	}
 }
 
@@ -159,6 +162,36 @@ func createFixtureUser(ctx context.Context, t *testing.T, users *narvipg.UserSto
 		t.Fatalf("create fixture user %q: %v", email, err)
 	}
 	return u
+}
+
+// createFixtureUserWithEvidence is createFixtureUser plus what makes the
+// user's email count for §13.2's match step: a GitHub sign-in identity
+// carrying it, verified and confirmed just now. A primary email alone is
+// no evidence.
+func createFixtureUserWithEvidence(ctx context.Context, t *testing.T, deps identitylink.Deps, email string) sqlcgen.User {
+	t.Helper()
+	u := createFixtureUser(ctx, t, deps.Users, email)
+	addCurrentEvidence(ctx, t, deps, u, email)
+	return u
+}
+
+// addCurrentEvidence gives user a GitHub sign-in identity carrying email,
+// verified and confirmed just now -- evidence MatchUserIDs counts.
+func addCurrentEvidence(ctx context.Context, t *testing.T, deps identitylink.Deps, user sqlcgen.User, email string) sqlcgen.Identity {
+	t.Helper()
+	row, err := deps.Identities.Create(ctx, sqlcgen.CreateIdentityParams{
+		UserID:         user.ID,
+		Provider:       sqlcgen.IdentityProviderGithub,
+		ExternalID:     "evidence-" + user.ID.String(),
+		Email:          &email,
+		EmailVerified:  true,
+		LinkedVia:      sqlcgen.IdentityLinkedViaAdmin,
+		EmailCheckedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("create evidence identity for %q: %v", email, err)
+	}
+	return row
 }
 
 // TestResolve_AlreadyLinkedIsFastPath proves an already-linked identity
@@ -228,7 +261,7 @@ func TestResolve_ExactlyOneMatchAutoLinks(t *testing.T) {
 	pool := newTestPool(t)
 	deps := newDeps(pool)
 
-	user := createFixtureUser(ctx, t, deps.Users, "unique-match@example.com")
+	user := createFixtureUserWithEvidence(ctx, t, deps, "unique-match@example.com")
 
 	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-UNIQUE", identitylink.ProfileEmail{Address: "unique-match@example.com", Verified: true}, true)
 	if err != nil {
@@ -319,15 +352,19 @@ func TestResolve_MultipleMatchesCreatesLinkPrompt(t *testing.T) {
 	for i, u := range []sqlcgen.User{first, second} {
 		e := email
 		if _, err := deps.Identities.Create(ctx, sqlcgen.CreateIdentityParams{
-			UserID:        u.ID,
-			Provider:      sqlcgen.IdentityProviderGithub,
-			ExternalID:    "gh-shared-" + string(rune('a'+i)),
-			Email:         &e,
-			EmailVerified: true,
-			LinkedVia:     sqlcgen.IdentityLinkedViaAdmin,
+			UserID:         u.ID,
+			Provider:       sqlcgen.IdentityProviderGithub,
+			ExternalID:     "gh-shared-" + string(rune('a'+i)),
+			Email:          &e,
+			EmailVerified:  true,
+			LinkedVia:      sqlcgen.IdentityLinkedViaAdmin,
+			EmailCheckedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
 		}); err != nil {
 			t.Fatalf("create fixture identity #%d: %v", i, err)
 		}
+	}
+	if matched, err := identitylink.MatchUserIDs(ctx, deps, email); err != nil || len(matched) != 2 {
+		t.Fatalf("MatchUserIDs(%q) = (%v, %v), want both users: the fixture must be ambiguous", email, matched, err)
 	}
 
 	res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, "U-AMBIGUOUS", identitylink.ProfileEmail{Address: email, Verified: true}, true)

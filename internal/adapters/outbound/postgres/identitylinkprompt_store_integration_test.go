@@ -185,9 +185,10 @@ func TestUserStore_ListAndUpdateRole(t *testing.T) {
 
 // TestIdentityStore_ListVerifiedUserIDsByEmail_DeduplicatesAndFiltersUnverified
 // proves: (a) only email_verified=true rows count, (b) the same user
-// linked twice with the same email counts once (DISTINCT), and (c) the
+// linked twice with the same email counts once (DISTINCT), (c) the
 // match is case-insensitive, matching GetByPrimaryEmail's own identical
-// convention.
+// convention, and (d) only a row whose email_checked_at lies within maxAge
+// counts -- an older stamp and no stamp at all never do (§13.2).
 func TestIdentityStore_ListVerifiedUserIDsByEmail_DeduplicatesAndFiltersUnverified(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -196,49 +197,58 @@ func TestIdentityStore_ListVerifiedUserIDsByEmail_DeduplicatesAndFiltersUnverifi
 
 	user := createTestUser(ctx, t, users, "user-only@example.com", "User", sqlcgen.UserRoleMember)
 	otherUser := createTestUser(ctx, t, users, "other@example.com", "Other", sqlcgen.UserRoleMember)
+	staleUser := createTestUser(ctx, t, users, "stale@example.com", "Stale", sqlcgen.UserRoleMember)
+	unstampedUser := createTestUser(ctx, t, users, "unstamped@example.com", "Unstamped", sqlcgen.UserRoleMember)
 
 	email := "shared@example.com"
 	upperEmail := "SHARED@EXAMPLE.COM"
+	const maxAge = time.Hour
 
-	mustCreateIdentity := func(externalID string, provider sqlcgen.IdentityProvider, u sqlcgen.User, verified bool) {
+	mustCreateIdentity := func(externalID string, provider sqlcgen.IdentityProvider, u sqlcgen.User, verified bool, checkedAt pgtype.Timestamptz) {
 		t.Helper()
 		e := email
 		if _, err := identities.Create(ctx, sqlcgen.CreateIdentityParams{
-			UserID:        u.ID,
-			Provider:      provider,
-			ExternalID:    externalID,
-			Email:         &e,
-			EmailVerified: verified,
-			LinkedVia:     sqlcgen.IdentityLinkedViaAdmin,
+			UserID:         u.ID,
+			Provider:       provider,
+			ExternalID:     externalID,
+			Email:          &e,
+			EmailVerified:  verified,
+			LinkedVia:      sqlcgen.IdentityLinkedViaAdmin,
+			EmailCheckedAt: checkedAt,
 		}); err != nil {
 			t.Fatalf("create fixture identity %q: %v", externalID, err)
 		}
 	}
+	now := pgtype.Timestamptz{Time: time.Now(), Valid: true}
 
 	// user has TWO verified identities sharing the same email -- must
 	// still count as ONE match.
-	mustCreateIdentity("slack-1", sqlcgen.IdentityProviderSlack, user, true)
-	mustCreateIdentity("linear-1", sqlcgen.IdentityProviderLinear, user, true)
+	mustCreateIdentity("slack-1", sqlcgen.IdentityProviderSlack, user, true, now)
+	mustCreateIdentity("linear-1", sqlcgen.IdentityProviderLinear, user, true, now)
 	// otherUser has an UNVERIFIED identity with the same email -- must
 	// never count as a match at all.
-	mustCreateIdentity("slack-2", sqlcgen.IdentityProviderSlack, otherUser, false)
+	mustCreateIdentity("slack-2", sqlcgen.IdentityProviderSlack, otherUser, false, now)
+	// staleUser's verified email was confirmed longer than maxAge ago, and
+	// unstampedUser's never -- neither is evidence.
+	mustCreateIdentity("slack-3", sqlcgen.IdentityProviderSlack, staleUser, true, pgtype.Timestamptz{Time: time.Now().Add(-2 * maxAge), Valid: true})
+	mustCreateIdentity("github-4", sqlcgen.IdentityProviderGithub, unstampedUser, true, pgtype.Timestamptz{})
 
 	// Nobody else has a fixture with no matching identity -- irrelevant
 	// user, unused email.
 	_ = createTestUser(ctx, t, users, "unrelated@example.com", "Unrelated", sqlcgen.UserRoleMember)
 
-	matches, err := identities.ListVerifiedUserIDsByEmail(ctx, upperEmail)
+	matches, err := identities.ListVerifiedUserIDsByEmail(ctx, upperEmail, maxAge)
 	if err != nil {
 		t.Fatalf("ListVerifiedUserIDsByEmail: %v", err)
 	}
 	if len(matches) != 1 {
-		t.Fatalf("len(matches) = %d, want 1 (deduplicated, unverified excluded); got %v", len(matches), matches)
+		t.Fatalf("len(matches) = %d, want 1 (deduplicated, unverified, stale and unstamped excluded); got %v", len(matches), matches)
 	}
 	if matches[0] != user.ID {
 		t.Errorf("matches[0] = %v, want %v", matches[0], user.ID)
 	}
 
-	noMatches, err := identities.ListVerifiedUserIDsByEmail(ctx, "nobody-has-this@example.com")
+	noMatches, err := identities.ListVerifiedUserIDsByEmail(ctx, "nobody-has-this@example.com", maxAge)
 	if err != nil {
 		t.Fatalf("ListVerifiedUserIDsByEmail(no match): %v", err)
 	}

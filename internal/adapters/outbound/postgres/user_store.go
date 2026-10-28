@@ -35,9 +35,8 @@ func (s *UserStore) WithTx(tx pgx.Tx) *UserStore {
 }
 
 // Create inserts a new user row and returns it. Called exactly once per
-// user, at first-sign-in time -- no Update/List exists yet because nothing
-// changes a user's own row after creation in this Step (role/disabled
-// editing is §13.2's "members API" job).
+// user, at first-sign-in time (or by seeding). UpdateRole and
+// FollowPrimaryEmail are the only later writes to it.
 func (s *UserStore) Create(ctx context.Context, arg sqlcgen.CreateUserParams) (sqlcgen.User, error) {
 	return s.q.CreateUser(ctx, arg)
 }
@@ -49,9 +48,9 @@ func (s *UserStore) GetByID(ctx context.Context, id pgtype.UUID) (sqlcgen.User, 
 
 // GetByPrimaryEmail fetches a user by primary_email (case-insensitive --
 // see queries/users.sql's own doc comment on GetUserByPrimaryEmail).
-// pgx.ErrNoRows means no user has this email as their primary_email --
-// the auto-link algorithm's own caller (internal/app/identitylink.Resolve)
-// treats that as "zero matches from this half", not an error.
+// pgx.ErrNoRows means no user has this email as their primary_email. Not
+// evidence for linking (§13.2 step 2): internal/adapters/inbound/auth's
+// first sign-in uses it only to refuse an email a member already holds.
 func (s *UserStore) GetByPrimaryEmail(ctx context.Context, email string) (sqlcgen.User, error) {
 	return s.q.GetUserByPrimaryEmail(ctx, email)
 }
@@ -62,13 +61,28 @@ func (s *UserStore) List(ctx context.Context) ([]sqlcgen.User, error) {
 	return s.q.ListUsersOrderedByCreatedAt(ctx)
 }
 
-// UpdateRole changes a user's role -- the ONLY column of an existing
-// user's own row this codebase mutates past creation time. Backs the
-// admin-only role-change endpoint (§13.3's own "members & roles: admin
-// only" row) -- callers gate this behind domain/authz.Authorize
-// themselves; this store performs no authorization of its own.
+// UpdateRole changes a user's role. Backs the admin-only role-change
+// endpoint (§13.3's own "members & roles: admin only" row) -- callers gate
+// this behind domain/authz.Authorize themselves; this store performs no
+// authorization of its own.
 func (s *UserStore) UpdateRole(ctx context.Context, id pgtype.UUID, role sqlcgen.UserRole) (sqlcgen.User, error) {
 	return s.q.UpdateUserRole(ctx, sqlcgen.UpdateUserRoleParams{ID: id, Role: role})
+}
+
+// FollowPrimaryEmail moves user id's primary_email from previous to next
+// (§13.2: a user's primary email follows the sign-in identity it came
+// from), only while it still is previous, only when next really differs,
+// and only when no other user holds next, all ignoring case. Returns the
+// number of rows updated: 0 when it did not move. A concurrent exact-case
+// insert of next can still raise a unique violation (23505); the caller,
+// internal/app/identitylink.RefreshSignInEvidence, runs it in a savepoint
+// and absorbs that.
+func (s *UserStore) FollowPrimaryEmail(ctx context.Context, id pgtype.UUID, previous, next string) (int64, error) {
+	return s.q.FollowUserPrimaryEmail(ctx, sqlcgen.FollowUserPrimaryEmailParams{
+		ID:            id,
+		PreviousEmail: previous,
+		NewEmail:      next,
+	})
 }
 
 // ListActiveAdminIDsForUpdate returns the id of every currently

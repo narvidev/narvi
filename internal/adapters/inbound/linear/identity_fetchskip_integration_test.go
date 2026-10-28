@@ -26,6 +26,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/identitylink"
+	"github.com/narvidev/narvi/internal/platform"
 )
 
 // narviGetUserEmailQueryMarker is the operation name linearapi's own
@@ -99,13 +100,14 @@ func TestWebhookHandler_Created_AlreadyLinkedIdentity_SkipsUserEmailFetch(t *tes
 
 	const linearCreatorID = "linear-already-linked-1"
 	deps.IdentityLink = identitylink.Deps{
-		Pool:          pool,
-		Users:         users,
-		Identities:    narvipg.NewIdentityStore(pool),
-		LinkPrompts:   narvipg.NewIdentityLinkPromptStore(pool),
-		AuditLog:      deps.AuditLog,
-		PublicBaseURL: "https://narvi.example.com",
-		PromptTTL:     time.Hour,
+		Pool:           pool,
+		Users:          users,
+		Identities:     narvipg.NewIdentityStore(pool),
+		LinkPrompts:    narvipg.NewIdentityLinkPromptStore(pool),
+		AuditLog:       deps.AuditLog,
+		PublicBaseURL:  "https://narvi.example.com",
+		PromptTTL:      time.Hour,
+		EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 	}
 	if _, err := narvipg.NewIdentityStore(pool).Create(ctx, sqlcgen.CreateIdentityParams{
 		UserID: linkedUser.ID, Provider: sqlcgen.IdentityProviderLinear, ExternalID: linearCreatorID,
@@ -161,15 +163,17 @@ func TestWebhookHandler_Created_UnlinkedIdentity_CallsUserEmailFetch(t *testing.
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "unlinked@example.com")
 
 	deps.IdentityLink = identitylink.Deps{
-		Pool:          pool,
-		Users:         users,
-		Identities:    narvipg.NewIdentityStore(pool),
-		LinkPrompts:   narvipg.NewIdentityLinkPromptStore(pool),
-		AuditLog:      deps.AuditLog,
-		PublicBaseURL: "https://narvi.example.com",
-		PromptTTL:     time.Hour,
+		Pool:           pool,
+		Users:          users,
+		Identities:     narvipg.NewIdentityStore(pool),
+		LinkPrompts:    narvipg.NewIdentityLinkPromptStore(pool),
+		AuditLog:       deps.AuditLog,
+		PublicBaseURL:  "https://narvi.example.com",
+		PromptTTL:      time.Hour,
+		EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 	}
 
 	handler := linear.NewWebhookHandler(deps)

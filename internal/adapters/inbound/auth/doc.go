@@ -34,9 +34,22 @@
 //     created.
 //   - Identity already linked (GetByProviderAndExternalID hits) ->
 //     "returning user" (OutcomeReturningUser): the allowlist is SKIPPED
-//     entirely (§13.1: "evaluated at first sign-in"), the stored
-//     access_token_encrypted is refreshed, a fresh session is minted --
-//     302 to "/".
+//     entirely (§13.1: "evaluated at first sign-in"); the verified primary
+//     email GitHub just presented is recorded on the identity, stamped
+//     now, with the refreshed access_token_encrypted, in one transaction
+//     (identitylink.RefreshSignInEvidence, §13.2 -- a failure answers 500
+//     and mints nothing); a fresh session is minted for the identity's
+//     user -- 302 to "/".
+//   - Identity not linked, the verified email matches exactly one user's
+//     recently confirmed identity email -> merged onto that user
+//     (OutcomeAutoLinked), unless that user already has a GitHub identity
+//     (OutcomeSameProviderConflict, 403, audited); more than one match ->
+//     403 (OutcomeAmbiguousMatch), audited. See firsttimeidentity.go.
+//   - Identity not linked, no recent match, but the verified email is some
+//     member's primary email -> 403 (OutcomeEmailHeld), audited as
+//     identity.github_email_held: a primary email is no evidence on its
+//     own (§13.2), so it is never merged onto, and never given to a second
+//     user either.
 //   - Identity not linked, allowlist check fails on ALL 3 mechanisms
 //     (exact email, email domain, GitHub org membership) -> 403
 //     (OutcomeFirstTimeDenied); no user/identity/session row is ever
@@ -48,9 +61,10 @@
 //     callback.go) -- role = admin iff the verified email is in
 //     InitialAdminEmails, else member; linked_via = "admin", a deliberate,
 //     documented overload (see that function's own comment, a §13.2
-//     hand-off note) -- then a session is minted -- 302 to "/".
+//     hand-off note); the identity's email is stamped email_checked_at --
+//     then a session is minted -- 302 to "/".
 //
-// Either of the last two branches then mints a fresh user_sessions row
+// Every branch that signs someone in then mints a fresh user_sessions row
 // (platform.GenerateToken + HashToken, expires_at = now +
 // timeouts.UserSessionTTL), sets the narvi_auth_session cookie
 // (platform.WithAuthSessionCookie) to the PLAINTEXT token, and redirects
@@ -110,8 +124,8 @@
 //     flow and land back on the magic-link URL afterward.
 //
 // The actual identity auto-linking ALGORITHM (matching a fetched provider
-// profile email against users.primary_email/verified identities.email,
-// auto-linking or creating a magic-link prompt) and the members API both
+// profile email against recently confirmed identity emails, auto-linking
+// or creating a magic-link prompt) and the members API both
 // still live OUTSIDE this package -- internal/app/identitylink and
 // internal/adapters/inbound/{identitylink,httpapi} respectively; this
 // package still only ever links a user to a provider identity at
@@ -174,4 +188,17 @@
 // Slack/Linear algorithm, §13.2 step 3) rather than creating a duplicate
 // account -- oidccallback.go's own NewOIDCCallbackHandler doc comment has
 // the complete outcome table.
+//
+// # §13.2 email evidence
+//
+// An identity's verified email counts as evidence for linking another
+// identity only while its provider confirmed it within
+// IdentityEmailEvidenceMaxAge. Every sign-in through either provider
+// therefore records the email its provider presents for the identity it
+// authenticated, never changing the link (identitylink.
+// RefreshSignInEvidence), and the user's primary email follows it unless
+// another member holds that address. A first sign-in whose email is a
+// member's primary email with no recent confirmation behind it is refused
+// and audited (OutcomeEmailHeld, OIDCOutcomeEmailHeld), never merged; the
+// holder recovers by signing in once through their own provider.
 package auth

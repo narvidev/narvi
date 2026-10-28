@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -20,15 +21,30 @@ import (
 // firstTimeIdentityDeps bundles resolveFirstTimeIdentity's own store
 // dependencies -- the shared subset of NewCallbackHandler's/
 // NewOIDCCallbackHandler's own params this merge logic needs
-// (pool/users/identities/auditLog/linkPrompts). Allowlist evaluation is
-// deliberately NOT included here -- see resolveFirstTimeIdentity's own
-// checkAllowed parameter.
+// (pool/users/identities/auditLog/linkPrompts), plus evidenceMaxAge,
+// platform.Timeouts.IdentityEmailEvidenceMaxAge, which MatchUserIDs counts
+// evidence within. Allowlist evaluation is deliberately NOT included here
+// -- see resolveFirstTimeIdentity's own checkAllowed parameter.
 type firstTimeIdentityDeps struct {
-	pool        *pgxpool.Pool
-	users       *postgres.UserStore
-	identities  *postgres.IdentityStore
-	auditLog    *postgres.AuditLogStore
-	linkPrompts *postgres.IdentityLinkPromptStore
+	pool           *pgxpool.Pool
+	users          *postgres.UserStore
+	identities     *postgres.IdentityStore
+	auditLog       *postgres.AuditLogStore
+	linkPrompts    *postgres.IdentityLinkPromptStore
+	evidenceMaxAge time.Duration
+}
+
+// linkDeps builds the identitylink.Deps the first-time merge and the
+// returning-user refresh share, from the SAME stores the callback holds.
+func (d firstTimeIdentityDeps) linkDeps() identitylink.Deps {
+	return identitylink.Deps{
+		Pool:           d.pool,
+		Users:          d.users,
+		Identities:     d.identities,
+		AuditLog:       d.auditLog,
+		LinkPrompts:    d.linkPrompts,
+		EvidenceMaxAge: d.evidenceMaxAge,
+	}
 }
 
 // firstTimeOutcome is resolveFirstTimeIdentity's own generic verdict.
@@ -56,6 +72,11 @@ const (
 	// pinned to whichever row Postgres happens to scan first -- often
 	// the OLDER one, never the account that just signed in.
 	firstTimeSameProviderConflict
+	// firstTimeEmailHeld (§13.2): no user's evidence matched recently, but
+	// the email is some member's primary email. Refused, never merged --
+	// that primary email is no evidence on its own -- and never created
+	// either, since users.primary_email is UNIQUE.
+	firstTimeEmailHeld
 )
 
 // resolveFirstTimeIdentity implements §13.2 step 3's own email-based graph
@@ -84,16 +105,30 @@ const (
 // ordinary GitHub flow"). Sharing this ONE function between both
 // callbacks is what makes that structurally impossible now: neither
 // caller ever reaches its own createFirstTime closure without first
-// proving (via MatchUserIDs) that no existing user's primary_email or
-// verified identity email matches, case-insensitively -- so
-// createUserAndIdentity/createOIDCUserAndIdentity can never again attempt
-// to INSERT a users row whose lower(primary_email) collides with an
-// existing one.
+// proving that no existing user's recently confirmed identity email
+// matches (MatchUserIDs) and that no existing user holds the email as
+// their primary_email (GetByPrimaryEmail, the held check below), both
+// case-insensitively -- so createUserAndIdentity/createOIDCUserAndIdentity
+// can never again attempt to INSERT a users row whose lower(primary_email)
+// collides with an existing one.
 //
-// # The four branches
+// # Recent evidence only (§13.2)
 //
-//   - Exactly one existing user matches verifiedEmail (by primary_email
-//     or another verified identity's own email, case-insensitively,
+// MatchUserIDs counts only an identity email its provider confirmed within
+// IdentityEmailEvidenceMaxAge; users.primary_email is not evidence on its
+// own. So an email whose only trace is old -- a primary email seeded from
+// a manifest, or left behind by a sign-in identity an admin has since
+// unlinked, or an identity nobody has signed in with for longer than the
+// limit -- merges onto no one. When such an email is still some member's
+// primary email, the sign-in is refused (firstTimeEmailHeld) rather than
+// merged or created; the holder recovers by signing in once through their
+// own provider, which refreshes their evidence (identitylink.
+// RefreshSignInEvidence) and moves their primary email if it changed.
+//
+// # The five branches
+//
+//   - Exactly one existing user matches verifiedEmail (by another
+//     identity's recently confirmed email, case-insensitively,
 //     domain/identitylink.Decide) AND that user has no CONFLICTING
 //     identity for THIS SAME provider already (identityConflictsWithExistingProvider)
 //     -> identitylink.AutoLink's onto that SAME account
@@ -108,7 +143,12 @@ const (
 //     audited under sameProviderAuditAction -- see
 //     identityConflictsWithExistingProvider's own doc comment for what
 //     "conflicting" means per provider.
-//   - Zero existing users match -> checkAllowed() decides between
+//   - Zero existing users match, but verifiedEmail is some member's
+//     primary email, ignoring case -> refused (firstTimeEmailHeld),
+//     audited under heldAuditAction with the holder's id, best effort like
+//     the ambiguous-match refusal below. checkAllowed is never called.
+//   - Zero existing users match and no member holds verifiedEmail ->
+//     checkAllowed() decides between
 //     createFirstTime (a brand-new user+identity, firstTimeCreated) and a
 //     denial (firstTimeDenied, no row ever created). checkAllowed is a
 //     func, called LAZILY -- exactly once, only on this branch -- so a
@@ -126,10 +166,11 @@ const (
 //
 // (userID, firstTimeAutoLinked/firstTimeCreated, nil) on a success the
 // caller should mint a session for; (pgtype.UUID{}, firstTimeDenied/
-// firstTimeAmbiguous/firstTimeSameProviderConflict, nil) on a clean,
-// already-handled refusal -- err is nil here on purpose, exactly like
-// resolveOIDCUser's own pre-existing httpStatus!=0 convention: these are
-// not failures, they are this function's OWN considered verdicts, and the
+// firstTimeAmbiguous/firstTimeSameProviderConflict/firstTimeEmailHeld,
+// nil) on a clean, already-handled refusal -- err is nil here on
+// purpose, exactly like resolveOIDCUser's own pre-existing httpStatus!=0
+// convention: these are not failures, they are this function's OWN
+// considered verdicts, and the
 // caller's only job is to translate the outcome into the right HTTP
 // response; or (pgtype.UUID{}, 0, err) on a genuine failure (a DB error, a
 // broken invariant) the caller must turn into a 500.
@@ -141,15 +182,11 @@ func resolveFirstTimeIdentity(
 	encryptedToken []byte,
 	auditAction string,
 	sameProviderAuditAction string,
+	heldAuditAction string,
 	checkAllowed func() bool,
 	createFirstTime func(ctx context.Context) (pgtype.UUID, error),
 ) (pgtype.UUID, firstTimeOutcome, error) {
-	linkDeps := identitylink.Deps{
-		Pool:       deps.pool,
-		Users:      deps.users,
-		Identities: deps.identities,
-		AuditLog:   deps.auditLog,
-	}
+	linkDeps := deps.linkDeps()
 
 	matched, err := identitylink.MatchUserIDs(ctx, linkDeps, verifiedEmail)
 	if err != nil {
@@ -192,7 +229,6 @@ func resolveFirstTimeIdentity(
 			return pgtype.UUID{}, firstTimeSameProviderConflict, nil
 		}
 
-		linkDeps.LinkPrompts = deps.linkPrompts
 		// encryptedToken (review round 1, O1/O2/O9 follow-on): nil for
 		// OIDC (never stores a provider token), the caller-supplied,
 		// just-obtained GitHub OAuth token for a GitHub merge -- see
@@ -211,6 +247,28 @@ func resolveFirstTimeIdentity(
 
 	switch len(matched) {
 	case 0:
+		// §13.2: no recent evidence names anyone, but an address some
+		// member holds as their primary email is never merged onto them
+		// (it is no evidence on its own) nor given to a second user (it
+		// is UNIQUE). Checked after matching, so a holder whose evidence is
+		// recent still merges above. Audited best effort, exactly like the
+		// ambiguous-match refusal below: the refusal is the safe direction.
+		holder, err := deps.users.GetByPrimaryEmail(ctx, verifiedEmail)
+		switch {
+		case err == nil:
+			auditErr := auditlog.Record(ctx, deps.auditLog, pgtype.UUID{}, heldAuditAction, "identity", externalID, map[string]any{
+				"provider":        string(provider),
+				"external_id":     externalID,
+				"held_by_user_id": holder.ID.String(),
+			})
+			if auditErr != nil {
+				_ = auditErr
+			}
+			return pgtype.UUID{}, firstTimeEmailHeld, nil
+		case !errors.Is(err, pgx.ErrNoRows):
+			return pgtype.UUID{}, 0, fmt.Errorf("auth: look up the holder of the email: %w", err)
+		}
+
 		if !checkAllowed() {
 			return pgtype.UUID{}, firstTimeDenied, nil
 		}

@@ -2099,6 +2099,25 @@ type Timeouts struct {
 	// not how long a one-time linking action stays offered).
 	IdentityLinkPromptTTL time.Duration
 
+	// IdentityEmailEvidenceMaxAge is how long an identity's verified email
+	// counts as evidence for linking another identity automatically
+	// (§13.2 step 2): only an identities row with email_verified whose
+	// email_checked_at lies within this age of the database clock is
+	// matched (internal/app/identitylink.MatchUserIDs, queries/
+	// identities.sql's ListVerifiedIdentityUserIDsByEmail). Every GitHub or
+	// OIDC sign-in stamps the email its provider presents for that identity
+	// (identitylink.RefreshSignInEvidence), and Slack and Linear stamp theirs
+	// when they link or re-check. Age never removes a link or stops it
+	// resolving; it only stops its email counting as evidence.
+	//
+	// Not specified in the plan; chosen as 45 days, one UserSessionTTL plus
+	// 15 days. Validate keeps it positive and longer than UserSessionTTL by
+	// MinTimeoutMargin: someone who keeps using the web app signs in again
+	// at least once per session, so their sign-in evidence never lapses. A
+	// non-positive value would match nothing, so MatchUserIDs refuses it
+	// with an error rather than silently matching no one.
+	IdentityEmailEvidenceMaxAge time.Duration
+
 	// --- Audit-remediation (completeness-vs-plan lens, GitHub PR-payload-
 	// correctness batch): no ordering relationship with either invariant
 	// chain above (or with any prior standalone addition), so -- per those
@@ -4759,6 +4778,7 @@ func DefaultTimeouts() Timeouts {
 		SlackInteractivityIdentityFetchTimeout: 800 * time.Millisecond, // not specified; chosen, inside the decision's share SlackInteractivityDecisionTimeout() (Validate) with margin for the authorization check and DecidePlan
 		SlackInstallationTeamLookupTimeout:     10 * time.Second,       // §13.2, not specified; chosen, SlackAckTimeout's figure for one Slack Web API call, longer than either per-attempt fetch budget (Validate) -- see field doc comment
 		IdentityLinkPromptTTL:                  24 * time.Hour,         // not specified beyond "short-lived"; chosen
+		IdentityEmailEvidenceMaxAge:            45 * 24 * time.Hour,    // §13.2, not specified; chosen, one UserSessionTTL plus 15 days (Validate) -- see field doc comment
 
 		GitHubGetPRTimeout: 10 * time.Second, // not specified (fix postdates the plan); chosen, generous for a single GitHub REST GET, mirrors PRCreateTimeout/SlackAckTimeout's own reasoning
 
@@ -5660,6 +5680,16 @@ func (t Timeouts) Validate() error {
 	strictlyBelow("SlackInstallationTeamLookupTimeout > SlackInteractivityIdentityFetchTimeout",
 		"SlackInteractivityIdentityFetchTimeout", t.SlackInteractivityIdentityFetchTimeout,
 		"SlackInstallationTeamLookupTimeout", t.SlackInstallationTeamLookupTimeout)
+
+	// §13.2: an identity's verified email counts as evidence only while it
+	// was confirmed within IdentityEmailEvidenceMaxAge. A zero or negative
+	// age matches nothing, and an age no longer than a sign-in session
+	// would let the evidence of someone who keeps using the web app lapse
+	// before they next sign in. See IdentityEmailEvidenceMaxAge's own doc
+	// comment.
+	mustBePositive("IdentityEmailEvidenceMaxAge", t.IdentityEmailEvidenceMaxAge)
+	check("IdentityEmailEvidenceMaxAge > UserSessionTTL",
+		"IdentityEmailEvidenceMaxAge", t.IdentityEmailEvidenceMaxAge, "UserSessionTTL", t.UserSessionTTL)
 
 	// U1 audit fix, HIGH (confirmed finding: "the total budget is smaller
 	// than the retry chain it contains"). Derived from the SAME three

@@ -87,7 +87,7 @@ func TestResolve_AutoLinksOnlyOnAVerifiedEmail(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			user := createFixtureUser(ctx, t, deps.Users, tt.email)
+			user := createFixtureUserWithEvidence(ctx, t, deps, tt.email)
 
 			res, err := identitylink.Resolve(ctx, deps, sqlcgen.IdentityProviderSlack, tt.externalID, identitylink.ProfileEmail{Address: tt.email, Verified: tt.verified}, true)
 			if err != nil {
@@ -284,7 +284,7 @@ func TestResolve_RechecksAnAutoLinkMadeBeforeTheConfirmedEmailRule(t *testing.T)
 		t.Run(tt.name, func(t *testing.T) {
 			suffix := string(rune('a' + i))
 			holder := createFixtureUser(ctx, t, deps.Users, "recheck-holder-"+suffix+"@example.com")
-			other := createFixtureUser(ctx, t, deps.Users, "recheck-other-"+suffix+"@example.com")
+			other := createFixtureUserWithEvidence(ctx, t, deps, "recheck-other-"+suffix+"@example.com")
 			// The linked email is not the holder's primary email, so only
 			// the identity row can make it match.
 			linkedEmail := "recheck-linked-" + suffix + "@example.com"
@@ -382,8 +382,9 @@ func TestResolve_RechecksAnAutoLinkMadeBeforeTheConfirmedEmailRule(t *testing.T)
 // Slack automatic link, and another provider's automatic link (unstamped,
 // as every one made before migrations/000178 is) all resolve as they are,
 // on an email the provider does not vouch for, and the store refuses to
-// delete any of them as unchecked. Another provider's verified email still
-// counts as evidence without the stamp.
+// delete any of them as unchecked. Only a stamped verified email counts as
+// evidence (§13.2's time limit): an unstamped one resolves its own link but
+// matches no one, whatever its provider.
 func TestResolve_RecheckLeavesOtherLinksAlone(t *testing.T) {
 	ctx := context.Background()
 	pool := newTestPool(t)
@@ -422,15 +423,16 @@ func TestResolve_RecheckLeavesOtherLinksAlone(t *testing.T) {
 			if gotUser, linked, err := identitylink.LookupLinkedUserID(ctx, deps, tt.provider, externalID); err != nil || !linked || gotUser != user.ID {
 				t.Errorf("LookupLinkedUserID = (%v, %v, %v), want linked to %v", gotUser, linked, err, user.ID)
 			}
-			// A verified email here is evidence, stamped or not: only a
-			// Slack automatic link needs the stamp. (The email is not the
-			// user's primary email, so only this row can match it.)
+			// Only a verified email stamped recently is evidence, whatever
+			// its provider. (The email is not the user's primary email, so
+			// only this row could match it.)
 			matched := matchedUserIDs(ctx, t, deps, email)
-			if tt.verified && (len(matched) != 1 || matched[0] != user.ID.String()) {
-				t.Errorf("MatchUserIDs(%q) = %v, want [%v]: a verified %s email is evidence", email, matched, user.ID, tt.provider)
+			evidence := tt.verified && tt.stamp.Valid
+			if evidence && (len(matched) != 1 || matched[0] != user.ID.String()) {
+				t.Errorf("MatchUserIDs(%q) = %v, want [%v]: a verified, stamped %s email is evidence", email, matched, user.ID, tt.provider)
 			}
-			if !tt.verified && len(matched) != 0 {
-				t.Errorf("MatchUserIDs(%q) = %v, want none: the email is not verified", email, matched)
+			if !evidence && len(matched) != 0 {
+				t.Errorf("MatchUserIDs(%q) = %v, want none: the email is not verified, or never stamped", email, matched)
 			}
 
 			res, err := identitylink.Resolve(ctx, deps, tt.provider, externalID, identitylink.ProfileEmail{Address: email, Verified: false}, true)

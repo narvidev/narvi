@@ -461,6 +461,26 @@ func slackInstallationTeamToWarm(stage platform.Stage, slackIngressEnabled bool,
 	return client
 }
 
+// newAppIdentityLinkDeps builds the one identitylink.Deps value Build
+// threads into every Slack/Linear ingress and the magic-link consume route
+// (§13.2), from the SAME stores every other §13.1/§13.2 caller uses. It
+// carries the link prompt's lifetime and IdentityEmailEvidenceMaxAge, how
+// long an identity email counts as evidence for automatic linking:
+// identitylink.MatchUserIDs refuses a zero one, so a field left unset here
+// would leave every Slack and Linear actor unlinked.
+func newAppIdentityLinkDeps(cfg *platform.Config, pool *pgxpool.Pool, users *postgres.UserStore, identities *postgres.IdentityStore, linkPrompts *postgres.IdentityLinkPromptStore, auditLog *postgres.AuditLogStore) identitylink.Deps {
+	return identitylink.Deps{
+		Pool:           pool,
+		Users:          users,
+		Identities:     identities,
+		LinkPrompts:    linkPrompts,
+		AuditLog:       auditLog,
+		PublicBaseURL:  cfg.PublicBaseURL,
+		PromptTTL:      cfg.Timeouts.IdentityLinkPromptTTL,
+		EvidenceMaxAge: cfg.Timeouts.IdentityEmailEvidenceMaxAge,
+	}
+}
+
 // Build is serve()'s own former wiring, with the boot pre-flights that are
 // not wiring (migrations, the GitHub App scope check) and the listening/
 // signal-handling removed to Main/serve and Run respectively: every store,
@@ -1250,15 +1270,7 @@ func Build(ctx context.Context, cfg *platform.Config, pool *pgxpool.Pool, module
 	// uses -- never a second, independently-constructed copy of any of
 	// them.
 	identityLinkPromptStore := postgres.NewIdentityLinkPromptStore(pool)
-	appIdentityLinkDeps := identitylink.Deps{
-		Pool:          pool,
-		Users:         userStore,
-		Identities:    identityStore,
-		LinkPrompts:   identityLinkPromptStore,
-		AuditLog:      auditLogStore,
-		PublicBaseURL: cfg.PublicBaseURL,
-		PromptTTL:     cfg.Timeouts.IdentityLinkPromptTTL,
-	}
+	appIdentityLinkDeps := newAppIdentityLinkDeps(cfg, pool, userStore, identityStore, identityLinkPromptStore, auditLogStore)
 
 	oauthConfig := auth.NewGitHubOAuthConfig(*cfg)
 	allowlist := auth.AllowlistConfig{

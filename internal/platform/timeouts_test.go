@@ -2825,6 +2825,79 @@ func TestValidate_SlackInstallationTeamLookupTimeout(t *testing.T) {
 	}
 }
 
+// TestValidate_IdentityEmailEvidenceMaxAge pins how long §13.2's email
+// evidence counts: the shipped 45 days, positive, and longer than a sign-in
+// session by MinTimeoutMargin, so the evidence of someone who keeps using
+// the web app never lapses before their next sign-in. Each broken rule is
+// reported, and nothing else.
+func TestValidate_IdentityEmailEvidenceMaxAge(t *testing.T) {
+	t.Parallel()
+
+	if got, want := platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge, 45*24*time.Hour; got != want {
+		t.Errorf("IdentityEmailEvidenceMaxAge = %v, want %v", got, want)
+	}
+
+	const (
+		sessionLink = "IdentityEmailEvidenceMaxAge > UserSessionTTL"
+		positive    = "IdentityEmailEvidenceMaxAge"
+	)
+	type want struct {
+		chain string // a *TimeoutInvariantError with this chain
+		field string // a *TimeoutMustBePositiveError for this field
+	}
+	for _, tc := range []struct {
+		name   string
+		mutate func(*platform.Timeouts)
+		want   []want
+	}{
+		{name: "the shipped defaults hold", mutate: func(*platform.Timeouts) {}},
+		{name: "a limit one margin longer than a session is accepted", mutate: func(to *platform.Timeouts) {
+			to.IdentityEmailEvidenceMaxAge = to.UserSessionTTL + platform.MinTimeoutMargin
+		}},
+		{name: "a limit just short of one margin longer than a session", mutate: func(to *platform.Timeouts) {
+			to.IdentityEmailEvidenceMaxAge = to.UserSessionTTL + platform.MinTimeoutMargin - time.Nanosecond
+		}, want: []want{{chain: sessionLink}}},
+		{name: "a limit as long as a session", mutate: func(to *platform.Timeouts) {
+			to.IdentityEmailEvidenceMaxAge = to.UserSessionTTL
+		}, want: []want{{chain: sessionLink}}},
+		{name: "a session longer than the limit", mutate: func(to *platform.Timeouts) {
+			to.UserSessionTTL = to.IdentityEmailEvidenceMaxAge + time.Hour
+		}, want: []want{{chain: sessionLink}}},
+		{name: "a zero limit", mutate: func(to *platform.Timeouts) {
+			to.IdentityEmailEvidenceMaxAge = 0
+		}, want: []want{{field: positive}, {chain: sessionLink}}},
+		{name: "a negative limit", mutate: func(to *platform.Timeouts) {
+			to.IdentityEmailEvidenceMaxAge = -time.Hour
+		}, want: []want{{field: positive}, {chain: sessionLink}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			to := platform.DefaultTimeouts()
+			tc.mutate(&to)
+			err := to.Validate()
+			var errs []error
+			if joined, ok := err.(interface{ Unwrap() []error }); ok {
+				errs = joined.Unwrap()
+			} else if err != nil {
+				errs = []error{err}
+			}
+			if len(errs) != len(tc.want) {
+				t.Fatalf("Validate() reported %d errors, want %d (%+v): %v", len(errs), len(tc.want), tc.want, err)
+			}
+			for i, w := range tc.want {
+				var inv *platform.TimeoutInvariantError
+				var pos *platform.TimeoutMustBePositiveError
+				switch {
+				case w.chain != "" && errors.As(errs[i], &inv) && inv.Chain == w.chain:
+				case w.field != "" && errors.As(errs[i], &pos) && pos.Field == w.field:
+				default:
+					t.Errorf("Validate() error %d = %v, want %+v", i, errs[i], w)
+				}
+			}
+		})
+	}
+}
+
 // TestDefaultTimeouts_GitHubAppMintFinishesBeforeCredentialFetch pins the
 // order of two bounds on one request. The sandbox's credential helper
 // (internal/sandboxagent/credentials.CPClient) gives up on the control

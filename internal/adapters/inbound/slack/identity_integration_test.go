@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/narvidev/narvi/internal/adapters/inbound/slack"
@@ -148,15 +149,48 @@ func newFakeSlackRecordingWithUsersInfo(t *testing.T, userID, email string) (*ht
 	return server, requests
 }
 
+// addEmailEvidenceForTest gives userID what makes email count for §13.2's
+// match step: a GitHub sign-in identity carrying it, verified and
+// confirmed just now. A primary email alone is no evidence, so a fixture
+// user whose email an event is meant to auto-link needs this.
+func addEmailEvidenceForTest(t *testing.T, pool *pgxpool.Pool, userID pgtype.UUID, email string) sqlcgen.Identity {
+	t.Helper()
+	row, err := narvipg.NewIdentityStore(pool).Create(context.Background(), sqlcgen.CreateIdentityParams{
+		UserID:         userID,
+		Provider:       sqlcgen.IdentityProviderGithub,
+		ExternalID:     "evidence-" + userID.String(),
+		Email:          &email,
+		EmailVerified:  true,
+		LinkedVia:      sqlcgen.IdentityLinkedViaAdmin,
+		EmailCheckedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("add email evidence for %q: %v", email, err)
+	}
+	return row
+}
+
+// ageEmailEvidenceForTest moves identityID's email_checked_at past the
+// shipped IdentityEmailEvidenceMaxAge, by the database clock: its email no
+// longer counts as evidence.
+func ageEmailEvidenceForTest(t *testing.T, pool *pgxpool.Pool, identityID pgtype.UUID) {
+	t.Helper()
+	age := platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge + 24*time.Hour
+	if _, err := pool.Exec(context.Background(), `UPDATE identities SET email_checked_at = now() - make_interval(secs => $2) WHERE id = $1`, identityID, age.Seconds()); err != nil {
+		t.Fatalf("age email evidence: %v", err)
+	}
+}
+
 func newIdentityLinkDepsForTest(pool *pgxpool.Pool, auditLog *narvipg.AuditLogStore) identitylink.Deps {
 	return identitylink.Deps{
-		Pool:          pool,
-		Users:         narvipg.NewUserStore(pool),
-		Identities:    narvipg.NewIdentityStore(pool),
-		LinkPrompts:   narvipg.NewIdentityLinkPromptStore(pool),
-		AuditLog:      auditLog,
-		PublicBaseURL: "https://narvi.example.com",
-		PromptTTL:     time.Hour,
+		Pool:           pool,
+		Users:          narvipg.NewUserStore(pool),
+		Identities:     narvipg.NewIdentityStore(pool),
+		LinkPrompts:    narvipg.NewIdentityLinkPromptStore(pool),
+		AuditLog:       auditLog,
+		PublicBaseURL:  "https://narvi.example.com",
+		PromptTTL:      time.Hour,
+		EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 	}
 }
 
@@ -176,6 +210,7 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_AutoLinksUniqueMatch(t *t
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "slack-clicker@example.com")
 
 	fakeSlack := newFakeSlackWithUsersInfo(t, "U-CLICKER", "slack-clicker@example.com")
 	slackClient := slackapi.New(fakeSlack.Client(), fakeSlack.URL, "test-bot-token")
@@ -282,6 +317,7 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_DeniedForUnownedMember(t 
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "unowned-member@example.com")
 
 	fakeSlack := newFakeSlackWithUsersInfo(t, "U-UNOWNED", "unowned-member@example.com")
 	slackClient := slackapi.New(fakeSlack.Client(), fakeSlack.URL, "test-bot-token")
@@ -381,6 +417,7 @@ func TestInteractivityHandler_BlockActions_ApprovePlan_DeniedForViewerEvenIfOwne
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "owner-viewer@example.com")
 
 	fakeSlack := newFakeSlackWithUsersInfo(t, "U-VIEWER", "owner-viewer@example.com")
 	slackClient := slackapi.New(fakeSlack.Client(), fakeSlack.URL, "test-bot-token")
@@ -467,12 +504,13 @@ func TestInteractivityHandler_ViewSubmission_DeniedForUnownedMember(t *testing.T
 	ctx := context.Background()
 
 	users := narvipg.NewUserStore(pool)
-	_, err := users.Create(ctx, sqlcgen.CreateUserParams{
+	evidenceUser, err := users.Create(ctx, sqlcgen.CreateUserParams{
 		PrimaryEmail: "unowned-submitter@example.com", DisplayName: "Unowned Submitter", Role: sqlcgen.UserRoleMember,
 	})
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, evidenceUser.ID, "unowned-submitter@example.com")
 
 	fakeSlack := newFakeSlackWithUsersInfo(t, "U-SUBMITTER", "unowned-submitter@example.com")
 	slackClient := slackapi.New(fakeSlack.Client(), fakeSlack.URL, "test-bot-token")
@@ -686,6 +724,7 @@ func TestHandler_AppMention_CreateSessionDeniedForViewer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "viewer-mentioner@example.com")
 
 	fakeSlack := newFakeSlackWithUsersInfo(t, "U-VIEWER-MENTION", "viewer-mentioner@example.com")
 	auditLog := narvipg.NewAuditLogStore(pool)
@@ -829,6 +868,7 @@ func TestHandler_ReplyOnMappedThread_DeniedForUnownedMember(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "unowned-replier@example.com")
 
 	fakeSlack := newFakeSlackWithUsersInfo(t, "U-UNOWNED-REPLY", "unowned-replier@example.com")
 	auditLog := narvipg.NewAuditLogStore(pool)
@@ -906,6 +946,7 @@ func TestHandler_ReplyOnMappedThread_AllowedForOwningMember(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "owning-replier@example.com")
 
 	fakeSlack := newFakeSlackWithUsersInfo(t, "U-OWNING-REPLY", "owning-replier@example.com")
 	auditLog := narvipg.NewAuditLogStore(pool)
@@ -958,6 +999,7 @@ func TestHandler_AppMention_CreateSessionDeniedForDisabledUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "disabled-mentioner@example.com")
 	// No UserStore mutation exists for Disabled today (only ListMembers'
 	// own read exposure, httpapi/members.go) -- set it directly, mirroring
 	// this file's own established precedent of a raw SQL statement where

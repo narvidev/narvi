@@ -130,15 +130,17 @@ func TestWebhookHandler_Created_AutoLinksUniqueEmailMatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "matched@example.com")
 
 	deps.IdentityLink = identitylink.Deps{
-		Pool:          pool,
-		Users:         users,
-		Identities:    narvipg.NewIdentityStore(pool),
-		LinkPrompts:   narvipg.NewIdentityLinkPromptStore(pool),
-		AuditLog:      deps.AuditLog,
-		PublicBaseURL: "https://narvi.example.com",
-		PromptTTL:     time.Hour,
+		Pool:           pool,
+		Users:          users,
+		Identities:     narvipg.NewIdentityStore(pool),
+		LinkPrompts:    narvipg.NewIdentityLinkPromptStore(pool),
+		AuditLog:       deps.AuditLog,
+		PublicBaseURL:  "https://narvi.example.com",
+		PromptTTL:      time.Hour,
+		EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 	}
 
 	handler := linear.NewWebhookHandler(deps)
@@ -193,13 +195,14 @@ func TestWebhookHandler_Prompted_UnknownUserCreatesLinkPromptAndIsDenied(t *test
 	deps.LinearClient = linearapi.New(graphqlStub.Client(), graphqlStub.URL)
 
 	deps.IdentityLink = identitylink.Deps{
-		Pool:          pool,
-		Users:         narvipg.NewUserStore(pool),
-		Identities:    narvipg.NewIdentityStore(pool),
-		LinkPrompts:   narvipg.NewIdentityLinkPromptStore(pool),
-		AuditLog:      deps.AuditLog,
-		PublicBaseURL: "https://narvi.example.com",
-		PromptTTL:     time.Hour,
+		Pool:           pool,
+		Users:          narvipg.NewUserStore(pool),
+		Identities:     narvipg.NewIdentityStore(pool),
+		LinkPrompts:    narvipg.NewIdentityLinkPromptStore(pool),
+		AuditLog:       deps.AuditLog,
+		PublicBaseURL:  "https://narvi.example.com",
+		PromptTTL:      time.Hour,
+		EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 	}
 
 	handler := linear.NewWebhookHandler(deps)
@@ -274,52 +277,111 @@ func TestWebhookHandler_Prompted_UnknownUserCreatesLinkPromptAndIsDenied(t *test
 // ever created, the identity itself is NOT linked (there was nothing to
 // link it to), and the magic-link prompt is still minted so the same
 // delegation can be retried once a real Narvi account is linked.
+//
+// The second row is §13.2's email evidence: a creator whose email names a
+// user only through evidence confirmed longer ago than
+// IdentityEmailEvidenceMaxAge is just as unresolved -- denied, unlinked,
+// and sent the link prompt.
 func TestWebhookHandler_Created_UnknownActorDeniedWithNoSessionCreated(t *testing.T) {
-	pool := newTestPool(t)
-	deps := newHandlerDeps(t, pool)
+	for i, tt := range []struct {
+		name  string
+		email string
+		// agedOwner seeds a user whose only evidence for email has aged out.
+		agedOwner bool
+	}{
+		{name: "an email that matches no one", email: "nobody-matches@example.com"},
+		{name: "an email only aged-out evidence names", email: "aged-owner@example.com", agedOwner: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			pool := newTestPool(t)
+			deps := newHandlerDeps(t, pool)
 
-	organizationID := "org-created-unknown-1"
-	installLinearFixture(context.Background(), t, pool, organizationID, deps.TokenEncryptionKey)
+			organizationID := fmt.Sprintf("org-created-unknown-%d", i+1)
+			installLinearFixture(context.Background(), t, pool, organizationID, deps.TokenEncryptionKey)
 
-	graphqlStub := newLinearGraphQLStub(t, "nobody-matches@example.com")
-	deps.LinearClient = linearapi.New(graphqlStub.Client(), graphqlStub.URL)
+			graphqlStub := newLinearGraphQLStub(t, tt.email)
+			deps.LinearClient = linearapi.New(graphqlStub.Client(), graphqlStub.URL)
 
-	auditLog := narvipg.NewAuditLogStore(pool)
-	deps.AuditLog = auditLog
-	deps.IdentityLink = newIdentityLinkDepsForTest(pool, auditLog)
+			if tt.agedOwner {
+				owner, err := narvipg.NewUserStore(pool).Create(context.Background(), sqlcgen.CreateUserParams{
+					PrimaryEmail: tt.email, DisplayName: "Aged Owner", Role: sqlcgen.UserRoleMember,
+				})
+				if err != nil {
+					t.Fatalf("create fixture user: %v", err)
+				}
+				ageEmailEvidenceForTest(t, pool, addEmailEvidenceForTest(t, pool, owner.ID, tt.email).ID)
+			}
 
-	handler := linear.NewWebhookHandler(deps)
+			auditLog := narvipg.NewAuditLogStore(pool)
+			deps.AuditLog = auditLog
+			deps.IdentityLink = newIdentityLinkDepsForTest(pool, auditLog)
 
-	agentSessionID := "agent-session-created-unknown-1"
-	const creatorID = "linear-created-unknown-1"
-	body := agentSessionCreatedPayloadWithCreator(agentSessionID, organizationID, creatorID)
+			handler := linear.NewWebhookHandler(deps)
 
-	rec := postWebhook(t, handler, body, "delivery-created-unknown-1")
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+			agentSessionID := fmt.Sprintf("agent-session-created-unknown-%d", i+1)
+			creatorID := fmt.Sprintf("linear-created-unknown-%d", i+1)
+			body := agentSessionCreatedPayloadWithCreator(agentSessionID, organizationID, creatorID)
+
+			rec := postWebhook(t, handler, body, fmt.Sprintf("delivery-created-unknown-%d", i+1))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, want %d; body = %s", rec.Code, http.StatusOK, rec.Body.String())
+			}
+
+			ctx := context.Background()
+			var sessionCount int
+			if err := pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE spawn_source = 'linear'`).Scan(&sessionCount); err != nil {
+				t.Fatalf("count sessions: %v", err)
+			}
+			if sessionCount != 0 {
+				t.Errorf("session count = %d, want 0 (a genuinely never-resolved actor must never create a session)", sessionCount)
+			}
+
+			// Unlike TestWebhookHandler_Created_DeniedForViewer (a RESOLVED but
+			// insufficiently-privileged actor, whose identity still auto-links),
+			// this actor never resolved at all -- there is no identities row.
+			if _, err := narvipg.NewIdentityStore(pool).GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderLinear, creatorID); !errors.Is(err, pgx.ErrNoRows) {
+				t.Errorf("GetByProviderAndExternalID = %v, want pgx.ErrNoRows (never resolved, nothing to link)", err)
+			}
+
+			// The magic-link prompt is still sent exactly as before -- only the
+			// state-changing effect (the session) is refused.
+			linkPrompts := narvipg.NewIdentityLinkPromptStore(pool)
+			if _, err := linkPrompts.GetLatestForProviderAndExternalID(ctx, sqlcgen.IdentityProviderLinear, creatorID); err != nil {
+				t.Errorf("GetLatestForProviderAndExternalID = %v, want a real link-prompt row", err)
+			}
+		})
 	}
+}
 
-	ctx := context.Background()
-	var sessionCount int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM sessions WHERE spawn_source = 'linear'`).Scan(&sessionCount); err != nil {
-		t.Fatalf("count sessions: %v", err)
+// addEmailEvidenceForTest gives userID what makes email count for §13.2's
+// match step: a GitHub sign-in identity carrying it, verified and
+// confirmed just now. A primary email alone is no evidence, so a fixture
+// user whose email an event is meant to auto-link needs this.
+func addEmailEvidenceForTest(t *testing.T, pool *pgxpool.Pool, userID pgtype.UUID, email string) sqlcgen.Identity {
+	t.Helper()
+	row, err := narvipg.NewIdentityStore(pool).Create(context.Background(), sqlcgen.CreateIdentityParams{
+		UserID:         userID,
+		Provider:       sqlcgen.IdentityProviderGithub,
+		ExternalID:     "evidence-" + userID.String(),
+		Email:          &email,
+		EmailVerified:  true,
+		LinkedVia:      sqlcgen.IdentityLinkedViaAdmin,
+		EmailCheckedAt: pgtype.Timestamptz{Time: time.Now(), Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("add email evidence for %q: %v", email, err)
 	}
-	if sessionCount != 0 {
-		t.Errorf("session count = %d, want 0 (a genuinely never-resolved actor must never create a session)", sessionCount)
-	}
+	return row
+}
 
-	// Unlike TestWebhookHandler_Created_DeniedForViewer (a RESOLVED but
-	// insufficiently-privileged actor, whose identity still auto-links),
-	// this actor never resolved at all -- there is no identities row.
-	if _, err := narvipg.NewIdentityStore(pool).GetByProviderAndExternalID(ctx, sqlcgen.IdentityProviderLinear, creatorID); !errors.Is(err, pgx.ErrNoRows) {
-		t.Errorf("GetByProviderAndExternalID = %v, want pgx.ErrNoRows (never resolved, nothing to link)", err)
-	}
-
-	// The magic-link prompt is still sent exactly as before -- only the
-	// state-changing effect (the session) is refused.
-	linkPrompts := narvipg.NewIdentityLinkPromptStore(pool)
-	if _, err := linkPrompts.GetLatestForProviderAndExternalID(ctx, sqlcgen.IdentityProviderLinear, creatorID); err != nil {
-		t.Errorf("GetLatestForProviderAndExternalID = %v, want a real link-prompt row", err)
+// ageEmailEvidenceForTest moves identityID's email_checked_at past the
+// shipped IdentityEmailEvidenceMaxAge, by the database clock: its email no
+// longer counts as evidence.
+func ageEmailEvidenceForTest(t *testing.T, pool *pgxpool.Pool, identityID pgtype.UUID) {
+	t.Helper()
+	age := platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge + 24*time.Hour
+	if _, err := pool.Exec(context.Background(), `UPDATE identities SET email_checked_at = now() - make_interval(secs => $2) WHERE id = $1`, identityID, age.Seconds()); err != nil {
+		t.Fatalf("age email evidence: %v", err)
 	}
 }
 
@@ -329,13 +391,14 @@ func TestWebhookHandler_Created_UnknownActorDeniedWithNoSessionCreated(t *testin
 // equivalent identitylink.Deps value inline instead.
 func newIdentityLinkDepsForTest(pool *pgxpool.Pool, auditLog *narvipg.AuditLogStore) identitylink.Deps {
 	return identitylink.Deps{
-		Pool:          pool,
-		Users:         narvipg.NewUserStore(pool),
-		Identities:    narvipg.NewIdentityStore(pool),
-		LinkPrompts:   narvipg.NewIdentityLinkPromptStore(pool),
-		AuditLog:      auditLog,
-		PublicBaseURL: "https://narvi.example.com",
-		PromptTTL:     time.Hour,
+		Pool:           pool,
+		Users:          narvipg.NewUserStore(pool),
+		Identities:     narvipg.NewIdentityStore(pool),
+		LinkPrompts:    narvipg.NewIdentityLinkPromptStore(pool),
+		AuditLog:       auditLog,
+		PublicBaseURL:  "https://narvi.example.com",
+		PromptTTL:      time.Hour,
+		EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 	}
 }
 
@@ -405,6 +468,7 @@ func TestWebhookHandler_Created_DeniedForViewer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "viewer-creator@example.com")
 
 	auditLog := narvipg.NewAuditLogStore(pool)
 	deps.AuditLog = auditLog
@@ -469,11 +533,13 @@ func TestWebhookHandler_PlanVerdict_DeniedForUnownedMember(t *testing.T) {
 	deps.LinearClient = linearapi.New(graphqlStub.Client(), graphqlStub.URL)
 
 	users := narvipg.NewUserStore(pool)
-	if _, err := users.Create(context.Background(), sqlcgen.CreateUserParams{
+	evidenceUser, err := users.Create(context.Background(), sqlcgen.CreateUserParams{
 		PrimaryEmail: "unowned-decider@example.com", DisplayName: "Unowned Decider", Role: sqlcgen.UserRoleMember,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, evidenceUser.ID, "unowned-decider@example.com")
 
 	auditLog := narvipg.NewAuditLogStore(pool)
 	deps.AuditLog = auditLog
@@ -570,11 +636,13 @@ func TestWebhookHandler_Prompted_DeniedForUnownedMember(t *testing.T) {
 	deps.LinearClient = linearapi.New(graphqlStub.Client(), graphqlStub.URL)
 
 	users := narvipg.NewUserStore(pool)
-	if _, err := users.Create(context.Background(), sqlcgen.CreateUserParams{
+	evidenceUser, err := users.Create(context.Background(), sqlcgen.CreateUserParams{
 		PrimaryEmail: "unowned-prompter@example.com", DisplayName: "Unowned Prompter", Role: sqlcgen.UserRoleMember,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, evidenceUser.ID, "unowned-prompter@example.com")
 
 	auditLog := narvipg.NewAuditLogStore(pool)
 	deps.AuditLog = auditLog
@@ -666,6 +734,7 @@ func TestWebhookHandler_Created_DeniedForDisabledUser(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "disabled-creator@example.com")
 	// No UserStore mutation exists for Disabled today (only ListMembers'
 	// own read exposure, httpapi/members.go) -- set it directly, mirroring
 	// this file's own established precedent of a raw SQL statement where

@@ -273,6 +273,7 @@ func TestLinkMemberIdentity_UncheckedAutoLinkBecomesAdminLink(t *testing.T) {
 		Pool: rig.pool, Users: rig.users, Identities: rig.identities,
 		LinkPrompts: narvipg.NewIdentityLinkPromptStore(rig.pool), AuditLog: narvipg.NewAuditLogStore(rig.pool),
 		PublicBaseURL: "https://narvi.example.com", PromptTTL: time.Hour,
+		EvidenceMaxAge: platform.DefaultTimeouts().IdentityEmailEvidenceMaxAge,
 	}
 
 	for i, tc := range []struct {

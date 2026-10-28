@@ -127,6 +127,7 @@ func TestHandler_AppMention_UnlinkedIdentity_CallsUsersInfoFetch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "unlinked-mention@example.com")
 
 	fakeSlack, usersInfoCalls := newFakeSlackCountingUsersInfo(t, slackUserID, "unlinked-mention@example.com")
 	auditLog := narvipg.NewAuditLogStore(pool)
@@ -267,6 +268,7 @@ func TestInteractivityHandler_BlockActions_UnlinkedIdentity_CallsUsersInfoFetch(
 	if err != nil {
 		t.Fatalf("create fixture user: %v", err)
 	}
+	addEmailEvidenceForTest(t, pool, matchedUser.ID, "unlinked-click@example.com")
 
 	fakeSlack, usersInfoCalls := newFakeSlackCountingUsersInfo(t, slackUserID, "unlinked-click@example.com")
 	slackClient := slackapi.New(fakeSlack.Client(), fakeSlack.URL, "test-bot-token")

@@ -28,11 +28,14 @@
 //     this workspace -- slackapi.UserEmail.Verified). An email the provider
 //     does not vouch for is never matched: it goes straight to the link
 //     prompt of step 4.
-//  2. Match against users.primary_email (postgres.UserStore.
-//     GetByPrimaryEmail) and verified identities.email (postgres.
-//     IdentityStore.ListVerifiedUserIDsByEmail), deduplicated by user id.
-//     A Slack automatic link nothing has confirmed since migrations/000178
-//     is not evidence here.
+//  2. Match against identity emails a provider confirmed recently
+//     (MatchUserIDs, postgres.IdentityStore.ListVerifiedUserIDsByEmail):
+//     verified, with email_checked_at within Deps.EvidenceMaxAge
+//     (platform.Timeouts.IdentityEmailEvidenceMaxAge) of the database
+//     clock, deduplicated by user id. users.primary_email is not evidence
+//     on its own, and neither is a row with no email_checked_at -- a Slack
+//     automatic link nothing has confirmed since migrations/000178, or a
+//     sign-in row from before sign-ins stamped theirs.
 //  3. internal/domain/identitylink.Decide renders the pure verdict.
 //  4. Exactly one match: INSERT the identities row (linked_via=auto_email,
 //     email_verified and email_checked_at as the provider attested)
@@ -81,6 +84,36 @@
 // building one from scratch is explicitly out of THIS Step's scope; the
 // audit trail is the one "in-app, durable, queryable" surface that
 // already exists and already needs an auto-link entry regardless.
+//
+// # Sign-in evidence -- RefreshSignInEvidence
+//
+// Evidence ages: an email counts only while its provider confirmed it
+// within Deps.EvidenceMaxAge, because a previous owner of an address who
+// never signs in again never presents anything that could retire it. So
+// every presentation re-stamps it:
+//
+//   - Every returning GitHub or OIDC sign-in (internal/adapters/inbound/
+//     auth) calls RefreshSignInEvidence with the verified email its
+//     provider just presented: one transaction, on the identity row locked
+//     FOR UPDATE, writes that email as verified with email_checked_at
+//     now, audits a changed email (identity.email_updated), and never
+//     touches user_id or linked_via, whoever made the link. A sign-in
+//     creating its user stamps the identity when it inserts it, and a
+//     first sign-in that merges onto an existing user goes through
+//     AutoLink, which stamps too.
+//   - The user's primary email follows the sign-in identity it came from,
+//     in a savepoint of the same transaction, unless another member holds
+//     the new address (user.primary_email_changed). It is what Members,
+//     /api/me and MCP consent display, never evidence.
+//   - Slack and Linear fetch no more than before: AutoLink stamps a new
+//     link, and Resolve's re-check stamps a confirmed one.
+//
+// Age never removes a link and never stops it resolving: Resolve's
+// re-check of an unchecked Slack automatic link stays the only thing that
+// removes one. Aged evidence simply stops matching; the identity then gets
+// the link prompt (Slack, Linear), or a first sign-in creates a new user
+// behind the allowlist -- or is refused when its email is a member's
+// primary email (internal/adapters/inbound/auth's resolveFirstTimeIdentity).
 //
 // # Consume -- the magic-link counterpart (§13.2 step 4's own "connect
 // your account" link)
