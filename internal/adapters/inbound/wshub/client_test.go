@@ -388,6 +388,43 @@ func TestClientHandler_ValidHandshakeSubscribes(t *testing.T) {
 	}
 }
 
+// TestClientHandler_SubscribedTurnsCarryNoContinuityRecap: the recap a
+// fresh lineage's first turn carried to its agent (technical plan §35.5)
+// is never shown to people, so a page's subscribed state carries the turn
+// without it, every other column as it is.
+func TestClientHandler_SubscribedTurnsCarryNoContinuityRecap(t *testing.T) {
+	rig, sessionRow := newClientTestRig(t, platform.DefaultTimeouts())
+	ctx := context.Background()
+	request := "carry on with the migration"
+	created, err := rig.turns.Create(ctx, sqlcgen.CreateTurnParams{SessionID: sessionRow.ID, Status: sqlcgen.TurnStatusProcessing, Prompt: &request})
+	if err != nil {
+		t.Fatal(err)
+	}
+	const recap = "[Narvi: report on this session's earlier work] a recap only the agent reads"
+	if err := rig.turns.SetContinuityRecap(ctx, created.ID, recap, 2); err != nil {
+		t.Fatalf("SetContinuityRecap: %v", err)
+	}
+	token := createTestWSToken(ctx, t, rig.pool, sessionRow.ID, time.Now().Add(24*time.Hour))
+
+	conn, payload := dialAndSubscribe(ctx, t, rig.wsURL, sessionRow.ID.String(), token)
+	defer func() { _ = conn.CloseNow() }()
+
+	raw, err := json.Marshal(payload.State["turns"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var turns []map[string]any
+	if err := json.Unmarshal(raw, &turns); err != nil {
+		t.Fatalf("decode the subscribed turns: %v (%s)", err, raw)
+	}
+	if len(turns) != 1 || turns[0]["prompt"] != request {
+		t.Fatalf("subscribed turns = %v, want the one turn with its request", turns)
+	}
+	if strings.Contains(string(raw), "a recap only the agent reads") || turns[0]["continuity_recap"] != nil {
+		t.Fatalf("subscribed turn carries the recap: %s", raw)
+	}
+}
+
 // TestClientHandler_ParticipantsReflectsLiveConnections is §8.11's own
 // ("multiplayer presence") end-to-end proof that Participants is now a
 // REAL, live signal rather than the permanently-empty array it used to

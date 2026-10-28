@@ -257,8 +257,10 @@ type opsMetrics struct {
 	// restoreConversation is sandbox_restore_conversation_total: one per
 	// restore, once its claim has committed, tagged outcome=held|differs|
 	// none|unknown -- how the conversation its snapshot was minted under
-	// compares with the one its prompts name (technical plan §35.5,
-	// snapshotrestore.go). Counted, never acted on.
+	// compares with the one its prompts named when the claim began
+	// (technical plan §35.5, snapshotrestore.go). The claim then makes
+	// them name the snapshot's when one was recorded for it; no outcome is
+	// otherwise acted on.
 	restoreConversation metric.Int64Counter
 
 	// runwayGate is sandbox_runway_gate_total: one per decision of the
@@ -272,6 +274,20 @@ type opsMetrics struct {
 	// replaced a gen the runway gate rotated, once it has committed, tagged
 	// outcome=rotated|fell_back|fresh.
 	rotationRestore metric.Int64Counter
+
+	// freshLineage is sandbox_fresh_lineage_total: one per claim that marked
+	// its gen a fresh lineage (technical plan §35.5, continuity.go) -- a
+	// fresh spawn, or a restore of a snapshot minted before its recap
+	// arrived -- once it has committed, tagged
+	// cause=sandbox.LineageCause and carried=true|false.
+	freshLineage metric.Int64Counter
+
+	// continuityRecap is turn_continuity_recap_total: one per dispatch to a
+	// fresh lineage whose recap was still owed, once it has committed,
+	// tagged outcome=attached|trimmed|no_room, and one per recap that
+	// reached its sandbox, outcome=delivered (technical plan §35.5,
+	// continuity.go).
+	continuityRecap metric.Int64Counter
 }
 
 // newOpsMetrics constructs all five instruments against meter -- the SAME
@@ -462,7 +478,7 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 
 	restoreConversation, err := meter.Int64Counter(
 		"sandbox_restore_conversation_total",
-		metric.WithDescription("Restores of a sandbox snapshot (technical plan §35.5), by how the agent runtime conversation the session held when the snapshot was recorded compares with the one the restored sandbox's prompts name: held (the same conversation); differs (another one, one while the prompts name none, or none while they name one -- the agent may not hold its context, and the WARN line logged with it names the snapshot and both ids); none (neither names one); unknown (nothing recorded for the snapshot: one recorded before the record existed, or by a control plane that predates it; logged at INFO). Counted once the claim has committed. Instrumented only: no outcome refuses a restore, writes a warning or carries a recap."),
+		metric.WithDescription("Restores of a sandbox snapshot (technical plan §35.5), by how the agent runtime conversation the session held when the snapshot was recorded compares with the one the restored sandbox's prompts name: held (the same conversation); differs (another one, one while the prompts name none, or none while they name one -- the claim then makes the prompts name the snapshot's conversation, and the WARN line logged with it names the snapshot and both ids); none (neither names one); unknown (nothing recorded for the snapshot: one recorded before the record existed, or by a control plane that predates it; logged at INFO). Every outcome but unknown leaves the prompts naming the conversation recorded for the snapshot. Counted once the claim has committed. No outcome refuses a restore, writes a warning or carries a recap."),
 		metric.WithUnit("{restore}"),
 	)
 	if err != nil {
@@ -485,6 +501,24 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 	)
 	if err != nil {
 		return opsMetrics{}, fmt.Errorf("sessionactor: construct sandbox_rotation_restore_total counter: %w", err)
+	}
+
+	freshLineage, err := meter.Int64Counter(
+		"sandbox_fresh_lineage_total",
+		metric.WithDescription("Claims that spawned a sandbox fresh in place of an earlier gen of a session that had a turn dispatched to one, and marked it a fresh lineage (technical plan §35.5): the agent there has neither its conversation nor any work that was not pushed, and the first turn sent to it carries a recap of the session's earlier turns. By cause: no_snapshot (nothing to restore or resume), rotation_no_snapshot (a rotation with no snapshot to restore), restore_refused (a restore refused on its snapshot's provenance or across the repository-hooks boundary, the snapshot cleared), restore_downgraded (a restore downgraded for a session that runs a container daemon, or a shadow session, the snapshot kept), stuck_respawn (a gen still starting, a slow restore among them, given up on), unrecapped_snapshot (a restore of a snapshot a fresh lineage minted before its recap reached it, carried when the gen it replaces still owes the recap, marked again otherwise, never announced); and carried=true when the gen it replaced was itself a fresh lineage its recap never reached, whose mark it carries. Any other restore, a resume, a session's first spawn and a spawn before any turn was dispatched are never counted. Counted once the claim has committed; the line logged with each names both gens."),
+		metric.WithUnit("{claim}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct sandbox_fresh_lineage_total counter: %w", err)
+	}
+
+	continuityRecap, err := meter.Int64Counter(
+		"turn_continuity_recap_total",
+		metric.WithDescription("The recap a fresh lineage owes (technical plan §35.5): the first turn sent to a sandbox spawned fresh in place of an earlier one opens with a report of the session's earlier turns, framed as an earlier instance's, for the agent to check against the repository. By outcome: attached (the whole recap, in a dispatch that committed); trimmed (attached, with an earlier turn left out or an excerpt cut, to fit the gen's prompt bound or the recap's own budget); no_room (not even the recap's frame fit the room the gen's prompt bound left: the turn was sent without it, and the next turn carries it, logged at WARN); delivered (the sandbox showed the prompt carrying it arrived -- its receipt, or an event of the turn -- and the gen's mark was cleared)."),
+		metric.WithUnit("{recap}"),
+	)
+	if err != nil {
+		return opsMetrics{}, fmt.Errorf("sessionactor: construct turn_continuity_recap_total counter: %w", err)
 	}
 
 	return opsMetrics{
@@ -510,6 +544,8 @@ func newOpsMetrics(meter metric.Meter) (opsMetrics, error) {
 		restoreConversation:   restoreConversation,
 		runwayGate:            runwayGate,
 		rotationRestore:       rotationRestore,
+		freshLineage:          freshLineage,
+		continuityRecap:       continuityRecap,
 	}, nil
 }
 

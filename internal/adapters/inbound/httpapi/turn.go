@@ -58,9 +58,12 @@ func hasOpenTurn(turns []sqlcgen.Turn) bool {
 // (§3.3) and internal/app/sessionactor/dispatch.go's own buildPromptPayload
 // already includes it automatically in every Prompt it builds, the new
 // turn created here automatically resumes the SAME OpenCode conversation
-// the moment it dispatches -- no separate "resume" flag or branch is
-// needed in either the request DTO (CreateTurnRequest has no
-// conversationId field at all) or this handler.
+// the moment it dispatches, on a live or a restored sandbox -- no separate
+// "resume" flag or branch is needed in either the request DTO
+// (CreateTurnRequest has no conversationId field at all) or this handler.
+// A sandbox spawned fresh holds no such conversation: its claim forgets the
+// id, and the first turn sent to it carries a recap of the session's
+// earlier turns instead (technical plan §35.5).
 //
 // The precondition check below (hasOpenTurn) is deliberately stricter than
 // turn.NextToDispatch's own "in flight" concept (Dispatched/Processing

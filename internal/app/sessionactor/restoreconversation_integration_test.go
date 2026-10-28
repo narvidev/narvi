@@ -23,11 +23,13 @@ import (
 // This file proves technical plan §35.5's instrumentation on the real
 // actor and real Postgres: a snapshot records, at mint, the conversation
 // the session held, keyed by its id; every restore compares it with the
-// conversation the restored gen's prompts will name, and counts the
-// outcome on sandbox_restore_conversation_total once the claim has
-// committed -- a WARN line for differs, an INFO line for unknown. Nothing
-// else: such a restore writes no warning, keeps the session's conversation
-// and sends the request as it is, with no recap.
+// conversation the session's prompts name when the claim begins, and
+// counts the outcome on sandbox_restore_conversation_total once the claim
+// has committed -- a WARN line for differs, an INFO line for unknown. The
+// claim then makes the session name the conversation recorded for the
+// snapshot, none included, and leaves it as it is when nothing was
+// recorded. Nothing else: such a restore writes no warning and sends the
+// request as it is, with no recap.
 
 // compatibleProvenance is a snapshot_ready provenance this control plane
 // restores without a line of its own.
@@ -171,6 +173,19 @@ func TestRestoreConversation_Counted(t *testing.T) {
 			if got := countDelta(before, restoreConversationCounts(ctx, t)); len(got) != 1 || got[string(tc.want)] != 1 {
 				t.Errorf("sandbox_restore_conversation_total moved by %v, want %s by 1 alone", got, tc.want)
 			}
+			// The session then names the conversation recorded for the
+			// snapshot, none included; with nothing recorded, its own.
+			named := tc.atMint
+			if tc.want == sandbox.RestoreConversationUnknown {
+				named = tc.atRestore
+			}
+			session, err := narvipg.NewSessionStore(rig.pool).Get(ctx, rig.sessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got := stringOrEmpty(session.OpencodeConversationID); got != named {
+				t.Errorf("the session names %q after the restore, want %q", got, named)
+			}
 			for _, msg := range []string{restoreConversationDiffersLogMessage, restoreConversationUnknownLogMessage} {
 				want := 0
 				if msg == tc.wantLine {
@@ -186,7 +201,8 @@ func TestRestoreConversation_Counted(t *testing.T) {
 			line := waitForLogEntry(t, rig.logs, 5*time.Second, tc.wantLine)
 			if line["level"] != tc.wantLvl || line["outcome"] != string(tc.want) || line["snapshot_id"] != restoreConversationSnapshot ||
 				line["gen"] != float64(2) || line["session_id"] != rig.sessionID.String() ||
-				line["snapshot_conversation_id"] != tc.snapshotConvLogged || line["session_conversation_id"] != tc.atRestore {
+				line["snapshot_conversation_id"] != tc.snapshotConvLogged || line["session_conversation_id"] != tc.atRestore ||
+				line["conversation_reseated"] != (tc.want == sandbox.RestoreConversationDiffers) {
 				t.Errorf("logged %v, want %s naming %s, gen 2, %s, snapshot conversation %q and session conversation %q",
 					line, tc.wantLvl, restoreConversationSnapshot, tc.want, tc.snapshotConvLogged, tc.atRestore)
 			}
@@ -231,10 +247,11 @@ func TestRestoreConversation_PreviousBinarysSnapshotIsUnknown(t *testing.T) {
 }
 
 // TestRestoreConversation_NeverMarksNorWarns: a restore whose snapshot was
-// minted under another conversation is counted and logged, and nothing
-// else. It restores; it writes no warning and enqueues nothing; the session
-// keeps its conversation; and the restored gen's first prompt names that
-// conversation and carries the request exactly, with no recap.
+// minted under another conversation is counted and logged, and is neither
+// marked nor announced. It restores; it writes no warning and enqueues
+// nothing; the session then names the conversation the snapshot holds,
+// recorded for it at the mint; and the restored gen's first prompt names
+// that conversation and carries the request exactly, with no recap.
 func TestRestoreConversation_NeverMarksNorWarns(t *testing.T) {
 	ctx := context.Background()
 	commander := &fakeSendCommander{}
@@ -269,8 +286,8 @@ func TestRestoreConversation_NeverMarksNorWarns(t *testing.T) {
 	if err := json.Unmarshal(commander.lastPayload(), &prompt); err != nil {
 		t.Fatalf("decode the dispatched prompt: %v", err)
 	}
-	if prompt.Type != "prompt" || prompt.Gen != 2 || prompt.Text != request || prompt.ConversationId == nil || *prompt.ConversationId != "conv-now" {
-		t.Fatalf("dispatched %s gen %d, text %q, conversation %v; want a prompt to gen 2 naming conv-now with the request exactly", prompt.Type, prompt.Gen, prompt.Text, prompt.ConversationId)
+	if prompt.Type != "prompt" || prompt.Gen != 2 || prompt.Text != request || prompt.ConversationId == nil || *prompt.ConversationId != "conv-then" {
+		t.Fatalf("dispatched %s gen %d, text %q, conversation %v; want a prompt to gen 2 naming conv-then, the snapshot's, with the request exactly", prompt.Type, prompt.Gen, prompt.Text, prompt.ConversationId)
 	}
 	got, err := narvipg.NewTurnStore(rig.pool).Get(ctx, turn.ID)
 	if err != nil {
@@ -284,8 +301,8 @@ func TestRestoreConversation_NeverMarksNorWarns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if stringOrEmpty(session.OpencodeConversationID) != "conv-now" {
-		t.Errorf("the session's conversation = %q, want conv-now, kept", stringOrEmpty(session.OpencodeConversationID))
+	if stringOrEmpty(session.OpencodeConversationID) != "conv-then" {
+		t.Errorf("the session's conversation = %q, want conv-then, the restored snapshot's", stringOrEmpty(session.OpencodeConversationID))
 	}
 	if w := storedWarnings(ctx, t, rig.pool, rig.sessionID); len(w) != 0 {
 		t.Errorf("warnings %+v, want none: the restore is counted, never announced", w)

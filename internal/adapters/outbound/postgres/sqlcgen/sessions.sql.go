@@ -29,6 +29,30 @@ func (q *Queries) BumpActorEpoch(ctx context.Context, id pgtype.UUID) (int64, er
 	return actor_epoch, err
 }
 
+const clearSessionConversationID = `-- name: ClearSessionConversationID :execrows
+UPDATE sessions
+SET opencode_conversation_id = NULL
+WHERE id = $1
+  AND opencode_conversation_id IS NOT NULL
+`
+
+// Forgets the session's agent-runtime conversation id (technical plan
+// §35.5): the claim that spawns a sandbox fresh, rather than restoring or
+// resuming one, calls it in its own transaction, since the new box holds
+// no runtime conversation and a prompt naming the old one would name a
+// conversation that does not exist there. The first prompt to the new gen
+// then names none, the agent opens one, and its heartbeat records it
+// (UpdateSessionConversationID). updated_at is left as it is: nothing about
+// the session a person sees changed, and the decision inbox orders failed
+// sessions by it. Reports the rows it wrote: 0 when the session had none.
+func (q *Queries) ClearSessionConversationID(ctx context.Context, id pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, clearSessionConversationID, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const clearSessionStopRequest = `-- name: ClearSessionStopRequest :execrows
 UPDATE sessions
 SET stop_requested_at = NULL
@@ -969,6 +993,36 @@ func (q *Queries) RequestSessionStop(ctx context.Context, id pgtype.UUID) (pgtyp
 	var stop_requested_at pgtype.Timestamptz
 	err := row.Scan(&stop_requested_at)
 	return stop_requested_at, err
+}
+
+const reseatSessionConversationID = `-- name: ReseatSessionConversationID :execrows
+UPDATE sessions
+SET opencode_conversation_id = $1
+WHERE id = $2
+  AND opencode_conversation_id IS DISTINCT FROM $1
+`
+
+type ReseatSessionConversationIDParams struct {
+	ConversationID *string     `json:"conversation_id"`
+	ID             pgtype.UUID `json:"id"`
+}
+
+// Names, for the session's next prompts, the agent-runtime conversation a
+// restored snapshot holds (technical plan §35.5): the claim that restores
+// a snapshot whose conversation was recorded at its mint
+// (sandboxes.snapshot_conversation_id, keyed by the snapshot's id) calls
+// it in its own transaction, so a restore after a fresh spawn forgot the
+// id -- or after a fresh lineage recorded one of its own -- names the
+// conversation the restored runtime holds. NULL when the snapshot was
+// minted under none. updated_at is left as it is, as
+// ClearSessionConversationID leaves it. Reports the rows it wrote: 0 when
+// the session already named that conversation.
+func (q *Queries) ReseatSessionConversationID(ctx context.Context, arg ReseatSessionConversationIDParams) (int64, error) {
+	result, err := q.db.Exec(ctx, reseatSessionConversationID, arg.ConversationID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setReviewSessionHeadBranch = `-- name: SetReviewSessionHeadBranch :execrows

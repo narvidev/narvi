@@ -2781,8 +2781,10 @@ func (j *CreateSessionToolRequest) UnmarshalJSON(value []byte) error {
 // 'resume'/'conversationId' field of its own: sessions.opencode_conversation_id
 // (already persisted across turns, §3.3) is threaded into every dispatched Prompt
 // automatically by the control plane's own dispatch logic, so a new turn on a
-// session that already has one continues that same OpenCode conversation with no
-// separate request field needed.
+// session that already has one continues that same OpenCode conversation on a live
+// or restored sandbox with no separate request field needed. A sandbox spawned
+// fresh in place of a lost one holds no such conversation (§35.5): its first
+// prompt names none and opens with a recap of the session's earlier turns instead.
 type CreateTurnRequest struct {
 	// Optional ('uploads, blob storage & the in-sandbox download_file tool', §28.5).
 	// Genuinely OPTIONAL -- may be absent from the request body entirely, matching

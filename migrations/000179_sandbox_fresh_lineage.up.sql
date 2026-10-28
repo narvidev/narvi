@@ -1,0 +1,75 @@
+-- Technical plan §35.5: a fresh lineage is a sandbox spawned fresh in place
+-- of an earlier gen of a session that had a turn dispatched to one. The
+-- repository is cloned again and the agent runtime opens an empty
+-- conversation, so the agent has neither its context nor any work that was
+-- not pushed. The first turn dispatched to such a gen carries a recap of
+-- the session's earlier turns (turns.continuity_recap, the next migration),
+-- and fresh_lineage_gen is what says the gen still owes one.
+--
+-- sandboxes.fresh_lineage_gen: the gen whose loss of context was announced
+-- and has not yet been recapped. It counts only while it equals gen. The
+-- claim that spawns a fresh lineage writes it, in the claim's own
+-- transaction (MarkSandboxFreshLineage, decided by
+-- sandbox.DecideFreshLineage); every claim's upsert clears it
+-- (UpsertSandboxForSpawn), so a claim starts unmarked; and it is cleared
+-- once the prompt that carries the recap reaches that gen
+-- (ClearSandboxFreshLineageOnReach): its prompt_received, or the first
+-- event of the turn it opens.
+--
+-- sandboxes.snapshot_recap_owed_id: the id of the snapshot whose gen was
+-- such a fresh lineage, its recap still owed, when the snapshot was
+-- recorded (UpdateSandboxSnapshotID, fresh_lineage_gen = gen as the row
+-- stood); NULL when its gen owed none. A snapshot reads as owing a recap
+-- only while this names it (snapshot_recap_owed_id = snapshot_id), the way
+-- snapshot_provenance_id keys the rest of its provenance (000170). Its
+-- runtime holds neither the earlier conversation nor the recap, whatever
+-- later gens received, so every claim that restores it marks the restored
+-- gen; a restore of any other snapshot is never marked. The clear that
+-- forgets a snapshot forgets it.
+--
+-- Both nullable, with no default and no backfill: no existing gen is
+-- marked, and no existing snapshot owes a recap.
+--
+-- # Locks
+--
+-- golang-migrate sends this file as one batch, one implicit transaction.
+-- Each ADD COLUMN, nullable with no default, is a catalog change that
+-- rewrites nothing, but takes ACCESS EXCLUSIVE on sandboxes until the file
+-- ends -- an instant once granted. It waits behind any open transaction
+-- that has read or written sandboxes, and every new read and write of
+-- sandboxes queues behind it; controlplane/migrate.go sets no
+-- lock_timeout. The file touches sandboxes alone, so it holds no lock
+-- another table's waiters could need.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with these columns present: every statement it
+-- sends names its columns, so it neither reads nor writes them.
+--   - Its upsert does not clear fresh_lineage_gen. A value it leaves counts only
+--     while it equals gen, and that binary's claims bump gen, so it is
+--     never read as a mark of the gen it created.
+--   - A gen this release marked, which the previous binary then dispatches
+--     to, gets no recap and keeps its mark: this release's next dispatch to
+--     that gen carries the recap.
+--   - Its snapshot record leaves snapshot_recap_owed_id as it is, naming
+--     an earlier snapshot or nothing, so a snapshot it records reads as
+--     owing no recap, and a restore of it is not marked, as before.
+--   - The previous binary never clears a mark either. When this release
+--     sends the recap and the session's actor then moves to a previous
+--     binary's replica, that replica stores the recap turn's
+--     prompt_received and events without clearing the gen's mark, so this
+--     release's next dispatch to the same gen sends a second recap, which
+--     reports the turn the agent just ran as an earlier instance's. Bounded
+--     to the deploy window: once every replica runs this release, the first
+--     evidence of a recap's arrival clears its mark.
+--
+-- # Rolling back
+--
+-- The previous binary cannot boot on this version ("no migration found for
+-- version N"). With the control plane scaled to zero, either keep the
+-- columns (`migrate force` to the version before; this file, run again,
+-- keeps their values) or run the down. A value kept is read again only by
+-- a release that knows it: a mark only while it equals its row's gen, a
+-- snapshot's record only while it names that row's snapshot.
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS fresh_lineage_gen INTEGER;
+ALTER TABLE sandboxes ADD COLUMN IF NOT EXISTS snapshot_recap_owed_id TEXT;

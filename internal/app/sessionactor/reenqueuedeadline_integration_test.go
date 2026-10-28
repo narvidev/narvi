@@ -11,6 +11,7 @@ package sessionactor
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,6 +21,7 @@ import (
 	narvipg "github.com/narvidev/narvi/internal/adapters/outbound/postgres"
 	"github.com/narvidev/narvi/internal/adapters/outbound/postgres/sqlcgen"
 	"github.com/narvidev/narvi/internal/app/ports"
+	"github.com/narvidev/narvi/internal/domain/continuity"
 	"github.com/narvidev/narvi/internal/domain/turn"
 	"github.com/narvidev/narvi/internal/platform"
 )
@@ -613,14 +615,17 @@ func TestReenqueue_DeadlineOfAResentTurn_RetiresItsGen(t *testing.T) {
 				t.Fatalf("%d prompts before gen 3 is ready, want %d: nothing goes to the retired gen", n, wantPrompts)
 			}
 
-			// Gen 3 boots and takes the follow-up.
+			// Gen 3 boots and takes the follow-up. It was spawned fresh in
+			// place of a gen a turn was sent to, so it is a fresh lineage
+			// (technical plan §35.5): the follow-up opens with the recap.
 			if tag, err := pool.Exec(ctx, `UPDATE sandboxes SET status = 'ready', last_seen_at = now() WHERE session_id = $1 AND gen = 3`, sessionID); err != nil || tag.RowsAffected() != 1 {
 				t.Fatalf("boot gen 3: %v (%d rows)", err, tag.RowsAffected())
 			}
 			settle(ctx, t, a)
 			prompts := sentPromptsOf(t, commander)
 			got := getTurnRow(ctx, t, pool, followUp.ID)
-			if len(prompts) != 2 || prompts[1].Gen != 3 || prompts[1].Text != followUpPrompt ||
+			if len(prompts) != 2 || prompts[1].Gen != 3 ||
+				!strings.HasPrefix(prompts[1].Text, continuity.LineHeader) || !strings.HasSuffix(prompts[1].Text, continuity.Separator+followUpPrompt) ||
 				got.DispatchedMessageID == nil || prompts[1].MessageId != *got.DispatchedMessageID {
 				t.Fatalf("prompts %+v, follow-up messageId %v; want the follow-up sent to gen 3", prompts, got.DispatchedMessageID)
 			}

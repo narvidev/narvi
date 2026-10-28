@@ -6,7 +6,10 @@ package sandbox
 // again and the agent runtime opens an empty conversation, so the agent has
 // neither its context nor any work that was not pushed. A restore keeps the
 // snapshot's filesystem and the runtime's session storage, and a resume
-// keeps the provider's own object, so neither starts one.
+// keeps the provider's own object, so neither starts one. A restore of a
+// snapshot a fresh lineage minted before its recap reached it brings back
+// that fresh lineage's runtime, which never holds the recap whatever later
+// gens received: it is always marked, never announcing the loss again.
 //
 // DecideFreshLineage is the one place that tells them apart. Its caller is
 // the claim that creates the gen, in the claim's own transaction: every
@@ -54,6 +57,11 @@ type LineageCause string
 const (
 	// LineageCauseNone is the cause of a claim that is not marked.
 	LineageCauseNone LineageCause = ""
+	// LineageCauseUnrecappedSnapshot: a restore of a snapshot minted by a
+	// fresh lineage before its recap reached it. Carried when the gen it
+	// replaces still owes the recap, marked again otherwise; never
+	// announced.
+	LineageCauseUnrecappedSnapshot LineageCause = "unrecapped_snapshot"
 	// LineageCauseRestoreRefused: a restore refused, its snapshot cleared.
 	LineageCauseRestoreRefused LineageCause = "restore_refused"
 	// LineageCauseRestoreDowngraded: a restore downgraded, its snapshot kept.
@@ -92,15 +100,25 @@ type LineageFacts struct {
 	// ReplacedLive is true when the replaced gen was spawning, connecting,
 	// booting or ready.
 	ReplacedLive bool
+	// RestoredSnapshotUnrecapped is true, for a restore, when the snapshot
+	// it restores was minted by a gen that was a fresh lineage whose recap
+	// had not reached it (sandboxes.snapshot_recap_owed_id names it): the
+	// restored runtime holds neither the earlier conversation nor the
+	// recap.
+	RestoredSnapshotUnrecapped bool
 }
 
-// LineageDecision is DecideFreshLineage's answer.
+// LineageDecision is DecideFreshLineage's answer. A mark is announced,
+// carried, or -- for a restore of an unrecapped snapshot over a gen that
+// owes nothing -- neither: the lineage's loss was announced when it began,
+// and the restored gen owes its recap again.
 type LineageDecision struct {
-	// Mark is true when the new gen starts a fresh lineage: it is marked,
-	// and the first turn dispatched to it carries a recap.
+	// Mark is true when the new gen starts a fresh lineage, or restores
+	// one's unrecapped runtime: it is marked, and the first turn
+	// dispatched to it carries a recap.
 	Mark bool
 	// Announce is true when the loss is announced by this claim: a marked
-	// claim whose replaced gen's loss was not already announced.
+	// fresh spawn whose replaced gen's loss was not already announced.
 	Announce bool
 	// Carried is true when the mark is carried over from a replaced gen
 	// whose own mark is still pending: its loss was announced once, and no
@@ -113,6 +131,9 @@ type LineageDecision struct {
 // DecideFreshLineage decides whether the claim f describes starts a fresh
 // lineage (technical plan §35.5). The first row that matches decides:
 //
+//  0. a restore of a snapshot minted by a fresh lineage before its recap
+//     reached it: marked, unrecapped_snapshot, never announced -- carried
+//     when the replaced gen's mark is pending, marked again otherwise;
 //  1. a restore: not marked;
 //  2. a resume: not marked;
 //  3. the session's first gen: not marked, there is nothing to lose;
@@ -126,8 +147,14 @@ type LineageDecision struct {
 //  10. otherwise: no_snapshot.
 //
 // Rows 6 to 10 are marked and announced. A claim that is none of spawn,
-// restore and resume is never marked.
+// restore and resume is never marked. A restore is marked only by row 0,
+// whose snapshot's runtime never holds the recap whatever later gens
+// received, and never announces: the loss was announced when the fresh
+// lineage began.
 func DecideFreshLineage(f LineageFacts) LineageDecision {
+	if f.Claim == LineageClaimRestore && f.RestoredSnapshotUnrecapped {
+		return LineageDecision{Mark: true, Carried: f.ReplacedMarkPending, Cause: LineageCauseUnrecappedSnapshot}
+	}
 	if f.Claim != LineageClaimSpawn || f.FirstGen || !f.PriorTurnDispatched {
 		return LineageDecision{}
 	}

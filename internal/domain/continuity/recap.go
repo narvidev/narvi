@@ -10,6 +10,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/narvidev/narvi/internal/domain/plan"
+	"github.com/narvidev/narvi/internal/domain/review"
 	"github.com/narvidev/narvi/internal/domain/turn"
 )
 
@@ -117,13 +118,20 @@ type Turn struct {
 	// EndReason is the turn's end reason (turns.end_reason); empty when it
 	// has none.
 	EndReason string
-	// Request is the turn's request: its prompt.
+	// Request is the turn's request: the text a person or a lane asked
+	// it with, or its stored prompt. Build reads it as the person's own
+	// request (PersonsRequest).
 	Request string
 	// Report is the turn's final text as plan.FinalText reads it over the
 	// turn's window of the log, and Reported is FinalText's ok: false when
 	// the window holds no text. Never read any other way.
 	Report   plan.Final
 	Reported bool
+
+	// quotable is true once Quotable prepared the turn; requestBytes and
+	// reportBytes are then the lengths the cut lines of its excerpts name.
+	quotable                  bool
+	requestBytes, reportBytes int
 }
 
 // Attempt is the current request's own earlier attempt, on the sandbox
@@ -133,6 +141,11 @@ type Turn struct {
 type Attempt struct {
 	Report   plan.Final
 	Reported bool
+
+	// quotable is true once Quotable prepared the attempt; reportBytes is
+	// then the length the cut line of its excerpt names.
+	quotable    bool
+	reportBytes int
 }
 
 // Input is what a recap reports.
@@ -183,7 +196,19 @@ func EncodedLen(s string) int {
 // shortened to the room left when only some of it does, and none from the
 // first that does not fit at all. Turns are rendered oldest first, then
 // the interrupted attempt.
+//
+// Every excerpt is made fit to quote into a prompt before anything is
+// measured or cut (Turn.Quotable, Attempt.Quotable, for any turn its caller
+// did not prepare): each request is read as the person's own
+// (PersonsRequest), and every placeholder token the sandbox agent
+// substitutes is stripped from the head of every request and report an
+// excerpt can quote, as from every other text quoted into a prompt
+// (review.StripPlaceholderTokens). The agent's substitution runs over the
+// whole prompt text, quoted lines included, so the quoting alone does not
+// keep a token inert. The built text is stripped once more as a whole, so
+// no token reaches it whatever its caller prepared.
 func Build(in Input, budget int) (Recap, bool) {
+	in = quotable(in)
 	turns := in.Turns
 	if len(turns) > MaxTurns {
 		turns = turns[len(turns)-MaxTurns:]
@@ -229,11 +254,96 @@ func Build(in Input, budget int) (Recap, bool) {
 	all = append(all, interrupted...)
 	all = append(all, tail(omitted)...)
 	return Recap{
-		Text:    strings.Join(all, "\n"),
+		Text:    review.StripPlaceholderTokens(strings.Join(all, "\n")),
 		Turns:   len(kept),
 		Omitted: omitted,
 		Trimmed: omitted > 0 || interruptedLeftOut || slices.ContainsFunc(all, isExcerptCutLine),
 	}, true
+}
+
+// quotable is in with every turn and the interrupted attempt Quotable, each
+// prepared only when its caller did not prepare it. in itself is left as
+// it is.
+func quotable(in Input) Input {
+	out := in
+	out.Turns = make([]Turn, len(in.Turns))
+	for i, t := range in.Turns {
+		out.Turns[i] = t.Quotable()
+	}
+	if in.Interrupted != nil {
+		a := in.Interrupted.Quotable()
+		out.Interrupted = &a
+	}
+	return out
+}
+
+// placeholderSlack is how far past an excerpt's cap the placeholder tokens
+// in a text are looked for: longer than any token the sandbox agent
+// substitutes, and than any two of them spliced into one another, so a
+// token that straddles the cap is still seen whole and stripped.
+const placeholderSlack = 256
+
+// Quotable returns t prepared for a recap: its request read as the
+// person's own (PersonsRequest), and its request and report each held to
+// the head an excerpt can quote -- its cap and placeholderSlack -- with
+// every placeholder token the sandbox agent substitutes stripped from that
+// head (review.StripPlaceholderTokens). The work is bounded by the caps,
+// however long the stored text: a review turn's prompt carries its pull
+// request's whole diff. Build prepares every turn its caller did not, so a
+// caller that builds over the same turns more than once prepares each once.
+func (t Turn) Quotable() Turn {
+	if t.quotable {
+		return t
+	}
+	t.Request, t.requestBytes = quotableHead(PersonsRequest(t.Request), RequestExcerptBytes)
+	t.Report.Text, t.reportBytes = quotableHead(t.Report.Text, ReportExcerptBytes)
+	t.quotable = true
+	return t
+}
+
+// Quotable returns a prepared for a recap, as Turn.Quotable prepares a
+// turn's report.
+func (a Attempt) Quotable() Attempt {
+	if a.quotable {
+		return a
+	}
+	a.Report.Text, a.reportBytes = quotableHead(a.Report.Text, ReportExcerptBytes)
+	a.quotable = true
+	return a
+}
+
+// quotableHead is the head of text an excerpt capped at limit can quote --
+// limit and placeholderSlack bytes, cut where a character ends -- stripped
+// of every placeholder token, and the length the excerpt's cut line names:
+// text's own when the head is shorter than text, and the stripped head's
+// when the head is all of text. A head shorter than text also loses a
+// token's opening its cut left behind, an unclosed "{{" at its end, so the
+// tokens stripped before it cannot draw a fragment of one into the excerpt.
+func quotableHead(text string, limit int) (head string, whole int) {
+	window := excerptHead(text, limit+placeholderSlack)
+	head = review.StripPlaceholderTokens(window)
+	if len(window) == len(text) {
+		return head, len(head)
+	}
+	if i := strings.LastIndex(head, "{{"); i >= 0 && !strings.Contains(head[i:], "}}") {
+		head = head[:i]
+	}
+	return head, len(text)
+}
+
+// PersonsRequest reads the request a person wrote out of a turn's stored
+// prompt. The control plane opens some prompts with fixed instructions of
+// its own before storing them: the structured-plan instruction on a
+// plan-mode turn (plan.MaybeInjectStructureInstruction), and the epistemic
+// preamble on a build turn when the check is on
+// (turn.MaybeInjectEpistemicPreamble). A recap quotes what was asked,
+// never those, so each is taken off the front of prompt when prompt opens
+// with it. A prompt that opens with neither is returned as it is.
+func PersonsRequest(prompt string) string {
+	for _, injected := range []string{plan.RenderStructureInstruction(), turn.RenderEpistemicPreamble()} {
+		prompt = strings.TrimPrefix(prompt, injected)
+	}
+	return prompt
 }
 
 // fit returns the lines block gives at the excerpt caps when they fit in
@@ -260,12 +370,12 @@ func fit(block func(limit int) []string, room int) (lines []string, ok bool) {
 // turnLines is t's block, its excerpts held to limit and to their caps.
 func turnLines(t Turn, limit int) []string {
 	lines := []string{"", turnHeading(t), LineRequest}
-	lines = appendExcerpt(lines, t.Request, min(limit, RequestExcerptBytes))
+	lines = appendExcerpt(lines, t.Request, t.requestBytes, min(limit, RequestExcerptBytes))
 	if !t.Reported {
 		return append(lines, LineNoReport)
 	}
 	lines = append(lines, LineReport)
-	lines = appendExcerpt(lines, t.Report.Text, min(limit, ReportExcerptBytes))
+	lines = appendExcerpt(lines, t.Report.Text, t.reportBytes, min(limit, ReportExcerptBytes))
 	if t.Report.Cut != nil {
 		lines = append(lines, LineSandboxCut)
 	}
@@ -278,7 +388,7 @@ func attemptLines(a Attempt, limit int) []string {
 	if !a.Reported {
 		return []string{"", LineInterruptedNothing}
 	}
-	lines := appendExcerpt([]string{"", LineInterrupted}, a.Report.Text, min(limit, ReportExcerptBytes))
+	lines := appendExcerpt([]string{"", LineInterrupted}, a.Report.Text, a.reportBytes, min(limit, ReportExcerptBytes))
 	if a.Report.Cut != nil {
 		lines = append(lines, LineSandboxCut)
 	}
@@ -315,14 +425,15 @@ func tail(omitted int) []string {
 }
 
 // appendExcerpt appends text's head, at most limit bytes, quoted line by
-// line, and the line naming the cut when it is shorter than text.
-func appendExcerpt(lines []string, text string, limit int) []string {
+// line, and the line naming the cut, with whole as the text's length, when
+// the head is shorter than text or text than whole.
+func appendExcerpt(lines []string, text string, whole, limit int) []string {
 	kept := excerptHead(text, limit)
 	lines = appendQuoted(lines, kept)
-	if len(kept) == len(text) {
+	if len(kept) == len(text) && whole == len(text) {
 		return lines
 	}
-	return append(lines, "[Cut to its first "+strconv.Itoa(len(kept))+" of "+strconv.Itoa(len(text))+" bytes.]")
+	return append(lines, "[Cut to its first "+strconv.Itoa(len(kept))+" of "+strconv.Itoa(whole)+" bytes.]")
 }
 
 // excerptHead is the longest head of s of at most limit bytes that ends

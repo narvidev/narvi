@@ -1,0 +1,45 @@
+-- Technical plan §35.5: the first turn dispatched to a fresh lineage -- a
+-- gen whose sandboxes.fresh_lineage_gen (the previous migration) still
+-- names it -- carries a recap of the session's earlier turns, prepended to
+-- its prompt's text and framed as a third party's report for the agent to
+-- check against the repository.
+--
+-- turns.continuity_recap: the recap the turn's prompt carries, without the
+-- separator that joins it to the request, written in the transaction that
+-- dispatches the turn (SetTurnContinuityRecap), so a re-send of the same
+-- prompt to the same gen -- a prompt receipt's, technical plan §3.3 --
+-- sends the same bytes rather than a recap rebuilt from a log that moved.
+-- turns.continuity_recap_gen: the gen it was built for. A prompt carries
+-- the recap only to that gen: a turn re-sent to another gen carries a new
+-- recap when that gen is marked, and none otherwise. Never cleared: it is
+-- the record of what that gen was told. Never shown to people.
+--
+-- Both nullable, with no default and no backfill: every existing turn
+-- carried no recap.
+--
+-- # Locks
+--
+-- golang-migrate sends this file as one batch, one implicit transaction.
+-- Each ADD COLUMN, nullable with no default, is a catalog change that
+-- rewrites nothing, but takes ACCESS EXCLUSIVE on turns until the file ends
+-- -- an instant once granted. It waits behind any open transaction that has
+-- read or written turns, and every new read and write of turns queues
+-- behind it. The file touches turns alone, so it holds no lock another
+-- table's waiters could need.
+--
+-- # Rolling deploy
+--
+-- The previous binary works with these columns present: every statement it
+-- sends names its columns, so it neither reads nor writes them. Its
+-- receipt re-send of a turn this release dispatched with a recap rebuilds
+-- the prompt from the turn's request alone and omits the recap; accepted
+-- for the deploy window.
+--
+-- # Rolling back
+--
+-- The previous binary cannot boot on this version ("no migration found for
+-- version N"). With the control plane scaled to zero, either keep the
+-- columns (`migrate force` to the version before; this file, run again,
+-- keeps their values) or run the down.
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS continuity_recap TEXT;
+ALTER TABLE turns ADD COLUMN IF NOT EXISTS continuity_recap_gen INTEGER;

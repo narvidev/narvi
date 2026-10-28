@@ -509,6 +509,13 @@ func buildSubscribedPayload(
 	if turnRows == nil {
 		turnRows = []sqlcgen.Turn{}
 	}
+	// The recap a fresh lineage's first turn carried (technical plan §35.5)
+	// is what that gen's agent was told, framed for the agent, and is never
+	// shown to people: it leaves the control plane only in that prompt.
+	// Every other column of the turn rows goes to the page as it is.
+	for i := range turnRows {
+		turnRows[i].ContinuityRecap = nil
+	}
 
 	var sandboxState any
 	sandboxRow, err := sandboxes.Get(ctx, sessionID)

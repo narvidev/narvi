@@ -29,12 +29,15 @@
 //   - The fresh-lineage decision (DecideFreshLineage, lineage.go; §35.5):
 //     whether the claim that creates a gen starts a fresh lineage -- a
 //     fresh spawn replacing a gen of a session that had a turn dispatched,
-//     never a restore, a resume or a first spawn -- and whether its loss is
-//     announced or carried from a replaced gen still awaiting its recap.
+//     never a resume or a first spawn, and a restore only of a snapshot
+//     minted by a fresh lineage before its recap arrived -- and whether its
+//     loss is announced or carried from a replaced gen still awaiting its
+//     recap.
 //   - The restore-conversation classification (ClassifyRestoreConversation,
 //     restoreconversation.go; §35.5): whether a restored snapshot was
-//     minted under the conversation its prompt will name -- held, differs,
-//     none or unknown -- counted, never acted on.
+//     minted under the conversation the session's prompts named -- held,
+//     differs, none or unknown -- counted; the caller then names the
+//     snapshot's conversation whenever one was recorded for it.
 //
 // Every function here is pure per §11: no I/O, no time.Now(), no
 // randomness. Anything needing "the current time" takes it as an explicit

@@ -14,9 +14,14 @@
 // Neither endpoint re-explains the plan in the new turn's own prompt text
 // -- sessions.opencode_conversation_id already persists across turns and
 // is already threaded into every dispatched Prompt automatically
-// (dispatch.go's buildPromptPayload), so the SAME OpenCode conversation
-// the plan turn ran in continues with full context, no re-statement
-// needed (see this Step's own brief for the precedent this reuses).
+// (dispatch.go's buildPromptPayload), so on a live or restored sandbox the
+// SAME OpenCode conversation the plan turn ran in continues with full
+// context, no re-statement needed (see this Step's own brief for the
+// precedent this reuses). On a sandbox spawned fresh since -- a fresh
+// lineage (technical plan §35.5) -- that conversation is gone: the
+// implementation turn opens with a recap instead, in which the plan turn's
+// final text is quoted only up to its excerpt cap
+// (continuity.ReportExcerptBytes), not in full.
 //
 // ApprovePlan additionally applies CreateTurn's own hasOpenTurn 409 gate
 // (turn.go), via DecidePlanOnTx, before ever touching the plans row: a

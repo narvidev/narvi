@@ -295,7 +295,7 @@
     "CreateTurnRequest": {
       "type": "object",
       "additionalProperties": false,
-      "description": "POST /api/sessions/:id/turns ('turn recovery', \u00a78.7 'relaunch-and-resume: conversation id replay'). Enqueues a new turn on an EXISTING session -- mirrors CreateSessionRequest's own prompt/modelId/planMode fields exactly (same shape, not reinvented) for the turn's own dispatch-time inputs. Deliberately has NO 'resume'/'conversationId' field of its own: sessions.opencode_conversation_id (already persisted across turns, \u00a73.3) is threaded into every dispatched Prompt automatically by the control plane's own dispatch logic, so a new turn on a session that already has one continues that same OpenCode conversation with no separate request field needed.",
+      "description": "POST /api/sessions/:id/turns ('turn recovery', \u00a78.7 'relaunch-and-resume: conversation id replay'). Enqueues a new turn on an EXISTING session -- mirrors CreateSessionRequest's own prompt/modelId/planMode fields exactly (same shape, not reinvented) for the turn's own dispatch-time inputs. Deliberately has NO 'resume'/'conversationId' field of its own: sessions.opencode_conversation_id (already persisted across turns, \u00a73.3) is threaded into every dispatched Prompt automatically by the control plane's own dispatch logic, so a new turn on a session that already has one continues that same OpenCode conversation on a live or restored sandbox with no separate request field needed. A sandbox spawned fresh in place of a lost one holds no such conversation (\u00a735.5): its first prompt names none and opens with a recap of the session's earlier turns instead.",
       "required": [
         "prompt",
         "modelId",

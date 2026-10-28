@@ -306,14 +306,46 @@ func (a *Actor) logSnapshotRestore(ctx context.Context, plan *spawnPlan) {
 }
 
 // restoreConversationCheck is how a restore's snapshot compares with the
-// conversation the session's prompts name (technical plan §35.5), carried
-// on its spawnPlan so it is logged and counted only once the claim has
-// committed (logRestoreConversation). snapshotConversation is empty when
-// none was recorded, or the snapshot was minted under none;
-// sessionConversation is empty when the session names none.
+// conversation the session's prompts named when the claim began (technical
+// plan §35.5), carried on its spawnPlan so it is logged and counted only
+// once the claim has committed (logRestoreConversation).
+// snapshotConversation is empty when none was recorded, or the snapshot was
+// minted under none; sessionConversation is empty when the session named
+// none. reseated is true when the claim then made the session name the
+// snapshot's (reseatRestoredConversation).
 type restoreConversationCheck struct {
 	outcome                                   sandbox.RestoreConversation
 	snapshotConversation, sessionConversation string
+	reseated                                  bool
+}
+
+// reseatRestoredConversation makes the session's prompts name the
+// conversation the restored snapshot holds (technical plan §35.5), in the
+// claim's transaction, whenever one was recorded for that very snapshot
+// (check's outcome is not unknown): the snapshot carries the runtime's
+// session storage as it was at the mint, so the restored runtime holds
+// that conversation, whatever the session named since -- none, when a
+// fresh spawn forgot it and the fresh gen was lost before it opened one, or
+// the one a fresh lineage opened. A snapshot minted under none makes the
+// prompts name none. When nothing was recorded for the snapshot -- one
+// minted before the record existed, or by a control plane that does not
+// write it -- the session keeps naming what it named, since nothing says
+// what the snapshot holds. The restore is not marked either way.
+func (a *Actor) reseatRestoredConversation(ctx context.Context, tx pgx.Tx, check *restoreConversationCheck) error {
+	if check == nil || check.outcome == sandbox.RestoreConversationUnknown {
+		return nil
+	}
+	var conversation *string
+	if check.snapshotConversation != "" {
+		c := check.snapshotConversation
+		conversation = &c
+	}
+	reseated, err := a.stores.session.WithTx(tx).ReseatConversationID(ctx, a.sessionID, conversation)
+	if err != nil {
+		return fmt.Errorf("sessionactor: name the restored snapshot's conversation: %w", err)
+	}
+	check.reseated = reseated
+	return nil
 }
 
 // classifyRestoreConversation compares the conversation row records for its
@@ -336,7 +368,7 @@ func classifyRestoreConversation(row sqlcgen.Sandbox, snapshotID string, session
 // restoreConversationUnknownLogMessage are logRestoreConversation's
 // messages.
 const (
-	restoreConversationDiffersLogMessage = "sessionactor: restoring a snapshot minted under another conversation than the one the session's prompts name; the agent may not hold its context"
+	restoreConversationDiffersLogMessage = "sessionactor: restoring a snapshot minted under another conversation than the one the session's prompts named; they now name the snapshot's"
 	restoreConversationUnknownLogMessage = "sessionactor: restoring a snapshot whose conversation was not recorded"
 )
 
@@ -354,6 +386,7 @@ func (a *Actor) logRestoreConversation(ctx context.Context, plan *spawnPlan) {
 		"session_id", a.sessionID.String(), "gen", plan.gen, "snapshot_id", string(plan.snapshotID),
 		"outcome", string(c.outcome),
 		"snapshot_conversation_id", c.snapshotConversation, "session_conversation_id", c.sessionConversation,
+		"conversation_reseated", c.reseated,
 	}
 	switch c.outcome {
 	case sandbox.RestoreConversationDiffers:
